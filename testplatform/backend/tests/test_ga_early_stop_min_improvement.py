@@ -100,28 +100,36 @@ def test_zero_baseline_counts_any_strict_gain_and_never_an_equal_one():
 
 
 def test_the_first_generation_always_counts():
-    for min_rel in (None, 0.0, 0.01, 0.5):
+    for min_rel in (None, 0.01, 0.5):
         assert early_stop_counts(-3.0, None, min_rel)
 
 
-def test_none_and_zero_are_the_strict_rule():
-    for min_rel in (None, 0.0):
-        assert early_stop_counts(23.8300001, 23.83, min_rel)
-        assert not early_stop_counts(23.83, 23.83, min_rel)
-        assert not early_stop_counts(23.0, 23.83, min_rel)
+def test_none_is_the_strict_rule():
+    assert early_stop_counts(23.8300001, 23.83, None)
+    assert not early_stop_counts(23.83, 23.83, None)
+    assert not early_stop_counts(23.0, 23.83, None)
 
 
-@pytest.mark.parametrize("value,expected", [(None, None), (0, 0.0), (0.0, 0.0), (0.01, 0.01),
-                                            ("0.01", 0.01), (0.999, 0.999)])
+@pytest.mark.parametrize("value,expected", [(None, None), (0.01, 0.01), ("0.01", 0.01),
+                                            (1e-6, 1e-6), (0.999, 0.999)])
 def test_valid_values(value, expected):
     assert validate_early_stop_min_rel(value) == expected
 
 
-@pytest.mark.parametrize("value", [-0.01, -1e-12, 1.0, 1.5, 100, float("nan"), float("inf"),
-                                   float("-inf"), True, False, "abc", "", [0.01], {"x": 1}])
+@pytest.mark.parametrize("value", [0, 0.0, -0.0, "0", -0.01, -1e-12, 1.0, 1.5, 100,
+                                   float("nan"), float("inf"), float("-inf"), True, False, "abc",
+                                   "", [0.01], {"x": 1}])
 def test_invalid_values_are_refused(value):
     with pytest.raises(ValueError, match=EARLY_STOP_MIN_REL_KEY):
         validate_early_stop_min_rel(value)
+
+
+@pytest.mark.parametrize("zero", [0, 0.0, "0"])
+def test_zero_is_refused_with_a_pointer_to_the_legacy_rule(zero):
+    """0 behaves exactly like the legacy rule but would give the job a new name/fingerprint --
+    a legacy-equivalent run under a different identity. Omit the key instead."""
+    with pytest.raises(ValueError, match="omit it"):
+        validate_early_stop_min_rel(zero)
 
 
 def test_the_optimizer_refuses_an_invalid_value_at_construction():
@@ -328,6 +336,67 @@ def test_resume_without_the_rule_is_the_legacy_clock():
     assert resumed._resumed_no_improvement == 0   # 24.0 is a strict record at gen 5
 
 
+def test_resume_replays_the_checkpointed_generation_costing_one_generation_of_patience():
+    """PINS A KNOWN QUIRK (deliberately unfixed 2026-09-26 -- job 1 of stage 1 is running on the
+    legacy rule and a fix would change what a resume of it does).
+
+    The checkpoint is written after a generation is EVALUATED but before it REPRODUCES, and a
+    resume starts at checkpoint.generation + 1 with that same, fully evaluated population. So the
+    first resumed generation evaluates NOTHING: it re-records the checkpointed generation's best
+    under the next generation number, counts as a non-improvement, and only then breeds. Each
+    resume therefore costs exactly ONE generation of the budget and of patience, under either
+    rule. A later fix must update this test on purpose.
+    """
+    for min_rel in (None, 0.01):
+        seq = _CREEP
+        cps, straight_evals = {}, []
+        opt = _optimizer(min_rel, patience=5, seed=21)
+        _run_counting(opt, seq, straight_evals, checkpoints=cps)
+
+        resumed = _optimizer(min_rel, patience=5, seed=21)
+        start, pop, fits = resumed.resume_from_checkpoint(cps[4])
+        clock_at_ckpt = resumed._resumed_no_improvement
+        resumed_evals = []
+        res = _run_counting(resumed, seq, resumed_evals, start_generation=start,
+                            initial_population=pop, restored_fitnesses=fits)
+        hist = res["history"]
+        # the replayed generation: no trials, the checkpointed best re-recorded under gen 5
+        assert dict(resumed_evals)[5] == 0, min_rel
+        assert hist[5]["generation"] == 5 and hist[5]["best_fitness"] == hist[4]["best_fitness"]
+        # ...and it costs one generation of patience
+        assert GeneticOptimizer.no_improvement_from_history(hist[:6], min_rel) == clock_at_ckpt + 1
+        # the uninterrupted run evaluated new offspring at gen 5; the resumed one did not
+        assert dict(straight_evals)[5] > 0
+        after = lambda evals, g0: sum(1 for g, n in evals if g > g0 and n > 0)  # noqa: E731
+        stop_straight = max(g for g, _ in straight_evals)
+        stop_resumed = hist[-1]["generation"]
+        assert (after(resumed_evals, 4), stop_resumed) == (
+            after(straight_evals, 4) - 1, stop_straight), \
+            "the resumed run must do exactly one generation of new trials fewer"
+
+
+def _run_counting(opt, seq, evals, **kw):
+    """_run, also recording (generation, number of individuals evaluated) per generation."""
+    state = {"gen": None}
+
+    def on_start(gen):
+        state["gen"] = gen
+        evals.append((gen, 0))
+
+    def batch(param_dicts):
+        evals[-1] = (state["gen"], len(param_dicts))
+        return [seq[state["gen"]]] * len(param_dicts)
+
+    cps = kw.pop("checkpoints", None)
+
+    def ckpt(gen, population, partial=False):
+        if cps is not None and not partial:
+            cps[gen] = json.loads(json.dumps(opt.get_checkpoint_data(gen, population)))
+
+    return opt.optimize(lambda p: 0.0, checkpoint_callback=ckpt, on_generation_start=on_start,
+                        batch_fitness=batch, **kw)
+
+
 # --------------------------------------------------------------------------------------------
 # 4. Absent flag = the legacy GA, byte for byte
 # --------------------------------------------------------------------------------------------
@@ -427,7 +496,7 @@ def test_the_handler_without_the_key_runs_the_legacy_rule(monkeypatch):
     assert seen["optimizer"]._es_baseline is None, "the legacy loop must not touch the baseline"
 
 
-@pytest.mark.parametrize("bad", [-0.01, 1.0, 2, float("nan"), True, "abc"])
+@pytest.mark.parametrize("bad", [0, 0.0, -0.01, 1.0, 2, float("nan"), True, "abc"])
 def test_the_handler_fails_a_job_with_an_invalid_value(monkeypatch, bad):
     T, H = _handler_env(monkeypatch)
     sid = T._seed_strategy()
@@ -435,6 +504,111 @@ def test_the_handler_fails_a_job_with_an_invalid_value(monkeypatch, bad):
     out = H.handle_strategy_optimization(f"t-minrel-bad-{bad!r}", {"optimization_id": opt_id})
     assert out["status"] == "failed"
     assert EARLY_STOP_MIN_REL_KEY in out["error"]
+
+
+class _PausingQueue:
+    """The real task queue, except ``is_task_paused`` turns True once the watched optimizer has
+    recorded ``pause_at`` generations -- checked by the handler at the END of ga_callback, i.e.
+    before that generation's checkpoint, so the checkpoint left behind is generation
+    ``pause_at - 2``. (fitness_function also asks, but during a generation's evaluation the
+    history is one entry shorter, so it never trips there.)"""
+
+    def __init__(self, real, seen, pause_at):
+        self._real, self._seen, self._pause_at = real, seen, pause_at
+
+    def is_task_paused(self, task_id):
+        opt = self._seen.get("optimizer")
+        return bool(opt is not None and self._pause_at is not None
+                    and len(opt.history) >= self._pause_at)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _seed_named_opt(T, sid, name, config):
+    from app.models.database import SessionLocal
+    from app.models.strategy_optimization import StrategyOptimization
+    db = SessionLocal()
+    try:
+        row = StrategyOptimization(strategy_id=sid, name=name, fitness_metric="sharpe",
+                                   optimization_type="genetic", optimization_config=config,
+                                   status="pending")
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+    finally:
+        db.close()
+
+
+def _handler_run(monkeypatch, H, T, sid, name, config, pause_at, tag):
+    seen, resumed = {}, {}
+    Real = H.GeneticOptimizer
+
+    class _Spy(Real):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            seen["optimizer"] = self
+
+        def resume_from_checkpoint(self, checkpoint):
+            out = super().resume_from_checkpoint(checkpoint)
+            resumed.update(ckpt=checkpoint, start=out[0],
+                           clock=self._resumed_no_improvement, baseline=self._es_baseline)
+            return out
+
+    monkeypatch.setattr(H, "GeneticOptimizer", _Spy)
+    real_q = H.get_task_queue()
+    monkeypatch.setattr(H, "get_task_queue", lambda: _PausingQueue(real_q, seen, pause_at))
+    opt_id = _seed_named_opt(T, sid, name, config)
+    out = H.handle_strategy_optimization(f"t-{tag}", {"optimization_id": opt_id})
+    return out, seen, resumed
+
+
+def test_resume_through_the_handlers_checkpoint_store_restores_the_rule_state(monkeypatch):
+    """END TO END under the rule: a real handler run is paused mid-search, its checkpoint goes
+    through _save_checkpoint/_load_checkpoint (the TaskQueue JSON column), and a relaunch of the
+    same job name resumes with the patience clock AND the baseline derived from that history."""
+    T, H = _handler_env(monkeypatch)
+    name = "minrel-resume-e2e"
+    H._clear_checkpoint(H.checkpoint_task_id(name, 0))
+    sid = T._seed_strategy()
+    cfg = T._ga_config(populationSize=6, generations=10, earlyStoppingGenerations=50,
+                       **{EARLY_STOP_MIN_REL_KEY: 0.01})
+
+    out, _, resumed = _handler_run(monkeypatch, H, T, sid, name, cfg, pause_at=7, tag="p1")
+    assert out["status"] == "paused", out
+    assert not resumed, "the first run must start fresh"
+    stored = H._load_checkpoint(H.checkpoint_task_id(name, 0))
+    assert stored and stored["generation"] == 5 and stored["early_stop_min_rel"] == 0.01
+    expect = GeneticOptimizer.patience_state_from_history(stored["history"], 0.01)
+    assert expect == (stored["no_improvement_count"], stored["early_stop_baseline"])
+    assert expect[0] > 0, "precondition: the pause must land mid-patience"
+
+    out, seen, resumed = _handler_run(monkeypatch, H, T, sid, name, cfg, pause_at=None, tag="p2")
+    assert out["status"] == "completed", out
+    assert resumed["start"] == 6
+    assert (resumed["clock"], resumed["baseline"]) == expect
+    assert seen["optimizer"].history[0]["generation"] == 0, "history was carried over"
+    assert H._load_checkpoint(H.checkpoint_task_id(name, 0)) is None, "cleared on completion"
+
+
+def test_a_legacy_checkpoint_is_discarded_not_resumed_under_the_rule(monkeypatch):
+    """Fingerprint mismatch: the checkpoint of the same job name written under the legacy rule is
+    DISCARDED by _load_checkpoint and the rule-run starts from generation 0."""
+    T, H = _handler_env(monkeypatch)
+    name = "minrel-legacy-ckpt"
+    H._clear_checkpoint(H.checkpoint_task_id(name, 0))
+    sid = T._seed_strategy()
+    legacy = T._ga_config(populationSize=6, generations=10, earlyStoppingGenerations=50)
+    out, _, _ = _handler_run(monkeypatch, H, T, sid, name, legacy, pause_at=7, tag="l1")
+    assert out["status"] == "paused", out
+    assert H._load_checkpoint(H.checkpoint_task_id(name, 0))["generation"] == 5
+
+    rule = {**legacy, EARLY_STOP_MIN_REL_KEY: 0.01}
+    out, seen, resumed = _handler_run(monkeypatch, H, T, sid, name, rule, pause_at=None, tag="l2")
+    assert out["status"] == "completed", out
+    assert not resumed, "a legacy-rule checkpoint must never be resumed under the rule"
+    assert seen["optimizer"].history[0]["generation"] == 0
 
 
 def test_the_fingerprint_is_unchanged_without_the_rule_and_differs_with_it():
@@ -493,7 +667,7 @@ def test_launcher_batch_carries_the_flag(monkeypatch):
     assert EARLY_STOP_MIN_REL_KEY not in cfg
 
 
-@pytest.mark.parametrize("bad", ["-0.01", "1", "1.0", "nan", "inf", "abc"])
+@pytest.mark.parametrize("bad", ["0", "0.0", "-0.01", "1", "1.0", "nan", "inf", "abc"])
 def test_launcher_refuses_an_invalid_value_at_parse_time(bad):
     import test_equity_cap_launcher as E
     with pytest.raises(SystemExit):
@@ -543,7 +717,7 @@ def test_driver_digest_takes_the_flag_and_not_the_strategy_list():
     assert _name_and_cmd(mod, "--early-stop-min-rel", "1e-2")[0] == on
 
 
-@pytest.mark.parametrize("bad", ["-0.01", "1", "1.5", "nan", "inf"])
+@pytest.mark.parametrize("bad", ["0", "0.0", "-0.01", "1", "1.5", "nan", "inf"])
 def test_driver_refuses_invalid_values(bad):
     mod = _driver()
     with pytest.raises(SystemExit):

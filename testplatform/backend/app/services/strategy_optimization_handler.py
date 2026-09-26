@@ -1214,8 +1214,9 @@ def _resolve_early_stop_min_rel(ga: Dict[str, Any]) -> Optional[float]:
     early_stop_counts``), or None for the legacy rule (any strict improvement resets patience).
 
     OPTIONAL key, and absent (or explicitly None) means the legacy rule -- every job persisted
-    before the key existed must stop exactly as it always did. A present value outside [0, 1),
-    NaN, a bool or a non-number is REFUSED (ValueError), never mapped to a default.
+    before the key existed must stop exactly as it always did. A present value outside (0, 1)
+    (0 included: omit the key for the legacy rule), NaN, a bool or a non-number is REFUSED
+    (ValueError), never mapped to a default.
     """
     from app.services.genetic import EARLY_STOP_MIN_REL_KEY, validate_early_stop_min_rel
 
@@ -3019,9 +3020,10 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     The early-stopping minimum relative improvement joins it the same way -- ONLY when set, so a
     legacy-rule job keeps its fingerprint byte for byte. A checkpoint is not unreadable under a
     different stopping rule, but the run it continues would be a different experiment (the
-    patience clock and its baseline are derived under the rule in force), so it is refused like
-    any other identity change rather than silently re-interpreted. (The grid driver's job-name
-    digest carries the flag too, so in practice the checkpoint KEY already differs.)
+    patience clock and its baseline are derived under the rule in force), so -- like any other
+    fingerprint mismatch -- ``_load_checkpoint`` DISCARDS it (with a warning) and the search
+    restarts from generation 0; it is never resumed under the other rule. (The grid driver's
+    job-name digest carries the flag too, so in practice the checkpoint KEY already differs.)
     """
     import hashlib
     import json

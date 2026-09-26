@@ -315,7 +315,8 @@ fi
 # `--early-stop 5` after it on the command line (argparse keeps the last value), e.g. for stage-1
 # jobs 2-16:
 #   STAGE1_EARLY_STOP_MIN_REL=0.01 tools/stage1_run.sh --early-stop 5 --strategies O_LP,...
-# The driver refuses a value that is not a fraction in [0, 1).
+# The driver refuses a value that is not a fraction in (0, 1) -- 0 included: it is the legacy
+# rule under new job names, so leave the variable unset for the legacy rule.
 STAGE1_EARLY_STOP_MIN_REL="${STAGE1_EARLY_STOP_MIN_REL:-}"
 MINREL_ARGS=()
 if [ -n "$STAGE1_EARLY_STOP_MIN_REL" ]; then

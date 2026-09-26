@@ -2776,9 +2776,10 @@ def _apply_lattice_anchor(cfg: dict, kind: str, override: "str | None") -> dict:
     return cfg
 
 def _early_stop_min_rel_arg(value: str) -> float:
-    """argparse ``type`` for ``--early-stop-min-rel``: a FRACTION in [0, 1) (0.01 = 1%).
+    """argparse ``type`` for ``--early-stop-min-rel``: a FRACTION in (0, 1) (0.01 = 1%).
 
-    Refuses NaN/inf, negatives and anything >= 1 at parse time -- the backend refuses them too
+    Refuses 0 (the legacy rule under a new job identity -- omit the flag instead), NaN/inf,
+    negatives and anything >= 1 at parse time -- the backend refuses them too
     (genetic.validate_early_stop_min_rel), but a job that fails after its row is written wastes a
     grid slot and leaves a failed row behind."""
     import math
@@ -2786,9 +2787,13 @@ def _early_stop_min_rel_arg(value: str) -> float:
         v = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
+    if v == 0.0:
+        raise argparse.ArgumentTypeError(
+            "0 is the legacy rule under a new job identity; omit --early-stop-min-rel for the "
+            "legacy rule")
     if not math.isfinite(v) or v < 0.0 or v >= 1.0:
         raise argparse.ArgumentTypeError(
-            f"must be finite and in [0, 1) -- a FRACTION, 0.01 means 1% -- got {value!r}")
+            f"must be finite and in (0, 1) -- a FRACTION, 0.01 means 1% -- got {value!r}")
     return v
 
 

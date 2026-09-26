@@ -344,7 +344,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Generations without improvement before a job stops (spec stage 1: 8). "
                          "Omitted -> launcher default.")
     ap.add_argument("--early-stop-min-rel", type=float, default=None,
-                    help="Minimum RELATIVE improvement (a fraction in [0, 1): 0.01 = 1%%) that "
+                    help="Minimum RELATIVE improvement (a fraction in (0, 1): 0.01 = 1%%) that "
                          "resets the --early-stop patience (launcher --early-stop-min-rel). "
                          "Omitted -> nothing is forwarded and the legacy rule applies (any strict "
                          "improvement resets), so every existing job name is unchanged. When "
@@ -544,9 +544,12 @@ def resolve_args(ap, argv=None):
             ap.error(f"--{key.replace('_', '-')} must be finite and non-negative")
     if not math.isfinite(args.elitism_percent) or not 0 <= args.elitism_percent <= 100:
         ap.error("--elitism-percent must be in [0, 100]")
+    if args.early_stop_min_rel == 0:
+        ap.error("--early-stop-min-rel 0 is the legacy rule under new job names; omit the flag "
+                 "for the legacy rule")
     if args.early_stop_min_rel is not None and (not math.isfinite(args.early_stop_min_rel)
-                                               or not 0 <= args.early_stop_min_rel < 1):
-        ap.error("--early-stop-min-rel must be finite and in [0, 1) (a fraction: 0.01 means 1%)")
+                                               or not 0 < args.early_stop_min_rel < 1):
+        ap.error("--early-stop-min-rel must be finite and in (0, 1) (a fraction: 0.01 means 1%)")
     if args.mutation_prob is not None and (not math.isfinite(args.mutation_prob)
                                           or not 0 <= args.mutation_prob <= 1):
         ap.error("--mutation-prob must be in [0, 1]")

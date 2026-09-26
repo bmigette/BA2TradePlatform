@@ -59,25 +59,30 @@ EARLY_STOP_MIN_REL_KEY = "earlyStoppingMinRelativeImprovement"
 
 
 def validate_early_stop_min_rel(value: Any) -> Optional[float]:
-    """``value`` as a float in ``[0, 1)``, or None when it is None. Anything else RAISES.
+    """``value`` as a float in ``(0, 1)``, or None when it is None. Anything else RAISES.
 
     Refused, never clamped: a bool (``True`` is an int in Python and would read as 1.0), a
     non-number, NaN (every comparison against it is False, so NO generation could ever count and
     the search would stop after exactly ``patience`` generations whatever it found), a negative
-    value (it would count a generation that got WORSE) and anything >= 1 (a 100% gain per counted
-    generation is not a stopping rule, it is a typo for a percentage).
+    value (it would count a generation that got WORSE), anything >= 1 (a 100% gain per counted
+    generation is not a stopping rule, it is a typo for a percentage) -- and 0, which behaves
+    exactly like the legacy rule but would give the job a new name/fingerprint: a legacy-equivalent
+    run under a different identity. Omit the key (the flag) for the legacy rule.
     """
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-        raise ValueError(f"{EARLY_STOP_MIN_REL_KEY} must be a number in [0, 1), got {value!r}")
+        raise ValueError(f"{EARLY_STOP_MIN_REL_KEY} must be a number in (0, 1), got {value!r}")
     try:
         v = float(value)
     except (TypeError, ValueError):
         raise ValueError(
-            f"{EARLY_STOP_MIN_REL_KEY} must be a number in [0, 1), got {value!r}") from None
+            f"{EARLY_STOP_MIN_REL_KEY} must be a number in (0, 1), got {value!r}") from None
+    if v == 0.0:
+        raise ValueError(f"{EARLY_STOP_MIN_REL_KEY}=0 is the legacy rule under a new job identity; "
+                         f"omit it (the flag) for the legacy rule, got {value!r}")
     if not math.isfinite(v) or v < 0.0 or v >= 1.0:
-        raise ValueError(f"{EARLY_STOP_MIN_REL_KEY} must be finite and in [0, 1) "
+        raise ValueError(f"{EARLY_STOP_MIN_REL_KEY} must be finite and in (0, 1) "
                          f"(a FRACTION: 0.01 means 1%), got {value!r}")
     return v
 
@@ -92,7 +97,7 @@ def early_stop_threshold(baseline: float, min_rel: Optional[float]) -> float:
 
     ``baseline + min_rel * |baseline|`` -- i.e. ``baseline * (1 + min_rel)`` for a positive
     baseline, and a move of ``min_rel`` of the MAGNITUDE towards (and past) zero for a negative
-    one (-10 with 1% needs -9.9). ``min_rel`` None or 0 gives ``baseline`` itself. See
+    one (-10 with 1% needs -9.9). ``min_rel`` None gives ``baseline`` itself. See
     ``early_stop_counts`` for how it is compared.
     """
     if not min_rel:
@@ -315,7 +320,7 @@ class GeneticOptimizer:
             elitism_percent: Percentage of best individuals to preserve unchanged (default 10%)
             lattice_anchor: where numeric genes' step lattice is counted from -- "zero"
                 (legacy default) or "min"; see LATTICE_ANCHORS
-            early_stopping_min_rel: minimum RELATIVE improvement (a fraction in [0, 1), 0.01 =
+            early_stopping_min_rel: minimum RELATIVE improvement (a fraction in (0, 1), 0.01 =
                 1%) a generation's best must make over the best at the last counted
                 improvement to reset the patience counter; see ``early_stop_counts``. None
                 (default) is the legacy rule: any strict improvement resets.
@@ -766,7 +771,12 @@ class GeneticOptimizer:
 
     @staticmethod
     def no_improvement_from_history(history: list, min_rel: Optional[float] = None) -> int:
-        """Consecutive generations at the end of ``history`` that did not beat the ALL-TIME best.
+        """Consecutive generations at the end of ``history`` that did not COUNT as an improvement.
+
+        Under the legacy rule (``min_rel`` None) that means "did not beat the all-time best".
+        Under a minimum-improvement rule it means "did not reach ``early_stop_threshold`` over the
+        best at the last counted improvement" (``early_stop_counts``): a generation may set a new
+        all-time best and still extend the streak.
 
         DERIVED, never stored-and-trusted, and that is deliberate. The counter itself is a local
         of ``optimize()`` zeroed on entry, so every resume used to restart the patience clock at 0
@@ -782,11 +792,9 @@ class GeneticOptimizer:
         key existed, resume with the correct streak rather than a zero.
 
         NOTE ``history[i]['best_fitness']`` is the GENERATION best, not the running best, so the
-        running maximum is reconstructed here rather than assuming the series is monotonic --
-        elitism usually makes it so, but nothing in this loop guarantees it.
-
-        ``min_rel`` applies the minimum-improvement rule (``early_stop_counts``); None, the
-        default, is the rule above unchanged.
+        running maximum (legacy) / the counted baseline (under ``min_rel``) is reconstructed here
+        rather than assuming the series is monotonic -- elitism usually makes it so, but nothing
+        in this loop guarantees it.
         """
         return GeneticOptimizer.patience_state_from_history(history, min_rel)[0]
 
@@ -1022,8 +1030,10 @@ class GeneticOptimizer:
 
             # Early stopping: stop if overall best hasn't improved for N generations
             if no_improvement_count >= self.early_stopping_generations:
+                # WARNING in both branches: the handler's logging.disable(INFO) would swallow an
+                # info() line, and the stop is exactly what a monitor needs to see. Level only.
                 if min_rel is None:
-                    logger.info(
+                    logger.warning(
                         f"Early stopping at generation {gen} — no improvement for "
                         f"{no_improvement_count} generations (best={self.best_fitness:.4f})"
                     )
