@@ -55,7 +55,7 @@ These were checked against the code on 2026-09-25:
 |---|---|---|
 | Shared `shared-rel_volume` / `shared-gate_confidence` ids | Already emitted with the SAME id in single-structure jobs and groups (`_option_entry_rule`, `_relative_volume_gate`). Pinned by `test_option_grid_foundations::test_single_and_group_jobs_use_the_SAME_key_for_a_shared_gate`. | Keep. The seeding translation treats `cond:shared-*` as SHARED keys. No key rename. |
 | Selection-weight genes shared per half (`optsel:<half>:<w>`) | Already keyed so a single job and a group emit the same key. | Keep. Treated as SHARED keys. |
-| Wheel's entry gene keys equal O_CSP's | Yes (`o_csp-*`; the market leaves are re-prefixed `o_wheel-market-*`). Pinned by `test_wheel_reuses_O_CSPs_entry_gene_keys_verbatim`. | Keep. The seeder translates a stage-1 O_WHEEL genome by identity on the entry side. |
+| Wheel's entry gene keys equal O_CSP's | Yes (`o_csp-*`; the market leaves are re-prefixed `o_wheel-market-*`). Pinned by `test_wheel_reuses_O_CSPs_entry_gene_keys_verbatim`. | Keep (single builds). **STALE for styles since 2026-09-26:** inside a style the wheel's entry is `o_wheel-o_csp-*`, so a stage-1 O_WHEEL genome translates through the id map, not by identity (see "Tasks 5-6 as built"). |
 | `_hold_assigned_stock` for a group key | Already "any member" over `_OPTION_GROUPS`. Pinned by `tests/backtest/test_wheel_assignment.py::test_a_group_containing_the_wheel_still_holds_its_assigned_stock`. | Extend to `O_STYLE` (Task 7). |
 | "Two live tests assert the opposite" (§7.1) | They assert things about `_OPTION_GROUPS`: the full-notional trio is in no group, and `rel_volume` is shared. This plan does NOT add a key to `_OPTION_GROUPS`/`_OPTION_GROUPS_ALL`, because style groups are spec-driven. Both tests stay TRUE. | Skip the rewrite. Task 7 adds a test that `O_STYLE` never enters `_OPTION_GROUPS`, so those premises keep holding. |
 | `OS_ALL` | Does not exist. It is superseded by the 2-3 style experts. | Not built. |
@@ -1585,6 +1585,9 @@ def test_a_single_members_full_genome_translates_into_the_style_space():
     assert "cond:shared-rel_volume:value" in shared
 
 
+# STALE (2026-09-26, "Tasks 5-6 as built"): inside a style the wheel's o_csp-* entry ids are
+# o_wheel-o_csp-*, so cond:o_csp-iv_rank:value translates to cond:o_wheel-o_csp-iv_rank:value;
+# rewrite this test against the id map when Task 13 is built.
 def test_the_wheel_translates_its_o_csp_entry_by_identity_and_prefixes_its_exits():
     s, src, idm = _pair("premium", "O_WHEEL")
     genes = {k: 1 for k in collect_param_space(src)}
@@ -2329,8 +2332,9 @@ Execution order: Task 0 → Q12 and Q13 fixes → Tasks 1-2 (`entry_tag`) → E1
   `o_csp-entry` becomes `o_wheel-o_csp-entry`, O_CC / O_PP's S2 `buy` / `root` / `gate_*` become
   `o_cc-*` / `o_pp-*`, and every exit id is prefixed (`opt_tp` -> `o_lc-opt_tp`). It depends on
   the member only, never on its siblings, and only a style build applies it: all 37 registered
-  keys build byte-identically (222 digests: 3 market profiles x 2 experts), and every option
-  single's entry ids (so its stage-1 entry genes) are the style's verbatim.
+  keys build byte-identically (3 market profiles x 2 experts = 222 digests: 216 real builds plus
+  6 identical O_CAL phase-gate refusals), and every option single's entry ids (so its stage-1
+  entry genes) are the style's verbatim.
 - **Loader:** the Task 3 entry-id clash refusal is relaxed to what still collides after
   namespacing -- two members owning one id prefix -- checked over entry and exit rule ids and
   every condition node id (group ids included). O_WHEEL + O_CSP and O_CC + O_PP load. The
@@ -2348,7 +2352,47 @@ Execution order: Task 0 → Q12 and Q13 fixes → Tasks 1-2 (`entry_tag`) → E1
   named `<rule>-tag` (unique per rule, not `<member>-tag`); a non-AND root is refused.
   `exit_overrides` move the camelCase mirror too and are refused on an unknown id, a flag leaf,
   a non-searched leaf, or a merged band out of order. `_style_translate_key(gene, id_map,
-  member)` takes the member for its refusal messages.
+  member, style_space=None)` takes the member for its refusal messages (see the review fixes
+  below for `screener` and `style_space`).
 - **Strategy genes** (`collect_param_space`, no expert/schedule genes; profile none /
   `ohlcv-v1,ta-structure-v1`): short 116 / 191, mid 140 / 230, leaps_convex 99 / 174,
   premium (8 members) 216 / 336.
+
+**Review fixes to Tasks 5-6 (2026-09-26)**
+
+- **I1, shared guard.** `rule_builders.rule_triggers_from_tree` refused "leaves but no trigger"
+  (ALWAYS TRUE), but a style exit's `entry_tag` leaf always converts, so a rule whose AUTHORED
+  leaves all dropped became `{entry_tag == N}`: always true for that member, while its single
+  twin was refused. The guard now judges the non-`entry_tag` leaves and triggers; untagged rules
+  compare exactly the lists they always did (goldens, stage-1 pin, all 222 build digests
+  unchanged). The builder test asserts every leaf converts (`len(triggers) == len(leaves)`).
+- **I2, screener genes are refused.** `_style_translate_key` no longer passes `screener:*`
+  through: screener genes are run-level, so one member's gate (a stage-1 O_CSP seed's $100
+  `price_max`) would become the whole style's and pre-empt Q3. Task 13's list of refused keys
+  stands. Identity stays for `optsel:*`, `model:*`, `schedule:*` and `cond:shared-*`.
+- **I3, per-member DTE invariants.** `action_overrides` are refused by name on O_ERN (expiry
+  must clear the earnings entry window; `_assert_option_expiry_clears_event_window` checks the
+  authored table only), O_LEAP and O_PMCC (a LEAPS opens at >= 365 DTE; their own 90-240 DTE
+  exit would close a shorter one at once) and O_CONVEX (`_STYLE_DTE_INVARIANT_MEMBERS`). None
+  of those invariants can be re-run on a merged action today.
+- **M1/M2.** Every builder refusal is prefixed `style '<name>' member <KEY>:` (the exception
+  type is kept). A mixed option+equity entry is refused naming member and rule. The `sell`
+  refusal is checked BEFORE tagging, so a `[buy, sell]` rule is refused (it used to be shadowed).
+- **M3, Task 13 must check against the style space.** `_style_translate_key` now refuses a
+  `cond:` field outside `value / confirmation_bars / enabled / mode`, and takes an optional
+  `style_space` (the built style's `collect_param_space`): a translated key that is not a gene
+  of it is refused. Task 13's translator MUST pass it; a well-formed key naming no gene
+  (`cond:tp:enabled` -> `cond:o_lc-tp:enabled`, a leaf with no toggle) is otherwise accepted.
+- **M4, for Task 8.** Same-symbol isolation between members rests on two engine facts Task 8
+  must pin: the one-position-per-expert-per-symbol entry gate (`daily_engine`
+  `_has_open_or_waiting_position`, ~line 1083; live: `TradeManager` dup-position gate), which
+  means only ONE member can hold a given symbol at a time in a style expert; and the exit pass
+  reading the OLDEST transaction's entry order (`_oldest_entry_order`, ~line 1337), which is
+  whose `entry_tag` every member exit compares against.
+- **M6.** `deploy_parity` will state the first OPTION member's action as the run's
+  `entry_action`. That is informational only: the style's entries are its `entry_rules`, each
+  routed per entry (E1).
+- **OPEN (Q4, taken to the user): premium member order.** First match wins, and O_CSP now
+  precedes O_WHEEL with IDENTICAL entry gates (the wheel's entry is O_CSP's), so the wheel only
+  trades once the GA moves its genes away from O_CSP's or toggles O_CSP off. The order is left
+  as is (O_CSP, O_WHEEL last) pending the user's decision.
