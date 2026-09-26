@@ -411,11 +411,20 @@ def root_history_refetch_reason(symbol: str, expiry: date, manifest: Dict[str, A
     return None
 
 
+def empty_overwrite_ok(symbol: str, old_last_bar: date) -> bool:
+    """An EMPTY re-fetch may replace a partition holding rows only when every one of those rows
+    precedes a None-root cutover: that chain was another company's (ECHO before its listing).
+    Anything else -- a vendor hiccup, a wrong alias -- keeps the old rows."""
+    return any(root is None and old_last_bar < cut for cut, root in ROOT_HISTORY.get(symbol.upper(), ()))
+
+
 def parquet_store_hooks() -> Dict[str, Any]:
     """The ``OptionHistoryParquetStore`` writer hooks of the ThetaData warm: stamp the root
-    history signature, and re-fetch what a root history change makes stale."""
+    history signature, re-fetch what a root history change makes stale, and never let an empty
+    re-fetch erase rows (``empty_overwrite_ok``)."""
     return {"manifest_extra": lambda u: {"root_history": root_history_signature(u)},
-            "stale_reason": root_history_refetch_reason}
+            "stale_reason": root_history_refetch_reason,
+            "empty_overwrite_ok": empty_overwrite_ok}
 
 
 def _root_segments(underlying: str, start: date, end: date) -> List[Tuple[str, date, date]]:

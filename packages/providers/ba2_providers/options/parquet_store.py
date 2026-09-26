@@ -113,21 +113,40 @@ class OptionHistoryParquetStore:
     def __init__(self, root: Optional[str] = None,
                  clock: Optional[Callable[[], datetime]] = None, *,
                  manifest_extra: Optional[Callable[[str], dict]] = None,
-                 stale_reason: Optional[Callable[..., Optional[str]]] = None):
+                 stale_reason: Optional[Callable[..., Optional[str]]] = None,
+                 empty_overwrite_ok: Optional[Callable[[str, date], bool]] = None):
         """``manifest_extra(underlying)`` adds fields to every manifest this store writes, and
         ``stale_reason(underlying, expiry, manifest, first_bar)`` (``first_bar()`` reads the
         partition's earliest bar date lazily, None when it holds no bar) may declare a
         finished partition STALE -- a WRITER's hooks (the ThetaData warm passes the
         root-history ones, ``thetadata.parquet_store_hooks``); a reader passes neither and
-        sees exactly the old behaviour. Reasons are kept in ``stale_reasons``."""
+        sees exactly the old behaviour. Reasons are kept in ``stale_reasons``.
+
+        ``empty_overwrite_ok(underlying, old_last_bar)``: with it, an EMPTY write over a
+        partition that holds rows is refused unless the hook allows it (a None-root cutover the
+        old rows all precede). The old file and manifest stay (not signed) and the partition
+        is listed in ``kept_nonempty`` -- a vendor hiccup or a wrong alias must not erase data."""
         self._root = root
         self._clock = clock or _utcnow
         self._manifest_extra = manifest_extra
         self._stale_reason = stale_reason
+        self._empty_overwrite_ok = empty_overwrite_ok
         self.stale_reasons: Dict[Tuple[str, date], str] = {}
+        self.kept_nonempty: Dict[Tuple[str, date], str] = {}
 
     def manifest_extra(self, underlying: str) -> dict:
         return dict(self._manifest_extra(underlying.upper())) if self._manifest_extra else {}
+
+    def _last_bar_date(self, underlying: str, expiry: date) -> Optional[date]:
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
+        col = pq.read_table(self.bars_path(underlying, expiry), columns=["bar_date"]).column("bar_date")
+        if len(col) == 0:
+            return None
+        v = pc.max(col).as_py()
+        if isinstance(v, str):
+            return date.fromisoformat(v[:10])
+        return v.date() if isinstance(v, datetime) else v
 
     def first_bar_date(self, underlying: str, expiry: date) -> Optional[date]:
         """The earliest ``bar_date`` of a partition, or None when it holds no bar."""
@@ -257,6 +276,15 @@ class OptionHistoryParquetStore:
         underlying = underlying.upper()
         d = self.partition_dir(underlying, expiry)
         os.makedirs(d, exist_ok=True)
+        if not bars and self._empty_overwrite_ok is not None:
+            old = self.read_manifest(underlying, expiry)
+            if old and old.get("status") == "complete" and os.path.exists(self.bars_path(underlying, expiry)):
+                last = self._last_bar_date(underlying, expiry)
+                if last is not None and not self._empty_overwrite_ok(underlying, last):
+                    why = (f"the re-fetch returned no row for a partition holding {old.get('rows')} "
+                           f"row(s) to {last}: kept, not overwritten or signed")
+                    self.kept_nonempty[(underlying, expiry)] = why
+                    return dict(old, kept_old=why)
 
         bars_path = self.bars_path(underlying, expiry)
         if bars:

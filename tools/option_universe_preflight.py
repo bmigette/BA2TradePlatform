@@ -3,9 +3,13 @@
 
 The checks the stage-2 data repair (2026-09-25/26) ran as scratch scripts, committed:
 
-  coverage  ThetaData tree per symbol: partitions, unfinished ones (no manifest), partitions a
-            ROOT_HISTORY entry makes stale (``thetadata.root_history_refetch_reason``), the
-            first/last option bar inside the window; the FMP daily file's first/last bar.
+  coverage  ThetaData tree per symbol: every partition a run over the window would not find
+            COMPLETE or EMPTY (end = min(expiry, window end)): no manifest, a complete manifest
+            whose parquet is gone, another schema, a fetch window narrower than needed, a
+            ROOT_HISTORY change (``thetadata.root_history_refetch_reason``); the first/last
+            option bar inside the window; the FMP daily file's first/last bar; and the longest
+            listing lead (expiry - first bar) of any partition, against
+            ``thetadata.LISTING_HORIZON_DAYS``.
   split     the run's split basis (``option_split_basis._resolve_one``: the cached split
             calendar, the full-fetch marker, the shipped overrides) -- OK or REFUSED.
   guard     the REAL option basis guard (``option_basis_guard.BasisGuard``) replayed over the
@@ -112,17 +116,26 @@ def _coverage(sym, cfg, fmp):
     store = OptionHistoryParquetStore(root=cfg["theta_root"], **T.parquet_store_hooks())
     exps = sorted(date.fromisoformat(x[4:]) for x in os.listdir(tree) if x.startswith("exp="))
     in_window = [e for e in exps if start <= e]
-    unfinished, stale, empty = [], [], 0
+    unfinished, stale, not_final, empty = [], [], [], 0
+    lead_max, lead_expiry = None, None
     for e in in_window:
         m = store.read_manifest(sym, e)
-        if m is None:
-            unfinished.append(e.isoformat())
-            continue
-        store.partition_state(sym, e, start, e)
-        if (sym, e) in store.stale_reasons:
-            stale.append(e.isoformat())
-        if m.get("status") == "empty":
+        # The state a run over the window would see: every state but COMPLETE/EMPTY is reported
+        # (no manifest, a complete manifest whose parquet is gone, another schema, a fetch that
+        # started later or ended earlier than the window needs, a ROOT_HISTORY change).
+        state = store.partition_state(sym, e, start, min(e, end))
+        if state not in (PartitionState.COMPLETE, PartitionState.EMPTY):
+            not_final.append({"expiry": e.isoformat(), "state": state.value,
+                              "reason": _state_reason(store, sym, e, m, start, min(e, end))})
+            if m is None:
+                unfinished.append(e.isoformat())
+            elif (sym, e) in store.stale_reasons:
+                stale.append(e.isoformat())
+        if m is not None and m.get("status") == "empty":
             empty += 1
+        fb = _first_bar_fast(store, sym, e)
+        if fb is not None and (lead_max is None or (e - fb).days > lead_max):
+            lead_max, lead_expiry = (e - fb).days, e
     first = last = None
     # The first bar: the partitions expiring early in the window hold it; only when none of them
     # has a bar (a late listing, a vendor gap) are all of them read.
@@ -136,7 +149,9 @@ def _coverage(sym, cfg, fmp):
         if first is not None:
             break
     out.update(theta=True, partitions=len(exps), partitions_in_window=len(in_window),
-               unfinished=unfinished, root_history_stale=stale,
+               unfinished=unfinished, root_history_stale=stale, not_final=not_final,
+               listing_lead_max_days=lead_max,
+               listing_lead_expiry=lead_expiry.isoformat() if lead_expiry else None,
                root_history_stale_reason=(store.stale_reasons.get((sym, date.fromisoformat(stale[0])))
                                           if stale else None),
                empty_partitions=empty, first_bar=first.isoformat() if first else None)
@@ -154,6 +169,50 @@ def _coverage(sym, cfg, fmp):
     return out
 
 
+def _state_reason(store, sym, e, m, start, needed_end):
+    if m is None:
+        return "no manifest (unfinished)"
+    why = store.stale_reasons.get((sym, e))
+    if why:
+        return why
+    if m.get("schema_version") != store.SCHEMA_VERSION:
+        return f"schema_version {m.get('schema_version')} != {store.SCHEMA_VERSION}"
+    if not m.get("start") or not m.get("end"):
+        return "manifest without a fetched window"
+    if m["start"] > start.isoformat() or m["end"] < needed_end.isoformat():
+        return f"fetched {m['start']}..{m['end']}, the window needs {start}..{needed_end}"
+    if m.get("status") == "complete" and not os.path.exists(store.bars_path(sym, e)):
+        return "manifest says complete but the parquet is gone"
+    return f"status {m.get('status')!r}"
+
+
+def _first_bar_fast(store, sym, e):
+    """A partition's first bar date from the parquet statistics (no data read), else None."""
+    path = store.bars_path(sym, e)
+    if not os.path.exists(path):
+        return None
+    import pyarrow.parquet as pq
+    try:
+        md = pq.ParquetFile(path).metadata
+        col = md.schema.to_arrow_schema().get_field_index("bar_date")
+        lows = []
+        for g in range(md.num_row_groups):
+            st = md.row_group(g).column(col).statistics
+            if st is None or not st.has_min_max:
+                return store.first_bar_date(sym, e)
+            lows.append(st.min)
+    except Exception:  # noqa: BLE001 -- fall back to reading the column
+        return store.first_bar_date(sym, e)
+    if not lows:
+        return None
+    v = min(lows)
+    if isinstance(v, bytes):
+        v = v.decode()
+    if isinstance(v, str):
+        return date.fromisoformat(v[:10])
+    return v.date() if isinstance(v, datetime) else v
+
+
 def _split(sym, path):
     from ba2_common.core.split_basis import SplitBasisRefused
     from app.services.backtest.option_split_basis import _resolve_one
@@ -166,22 +225,20 @@ def _split(sym, path):
 def _guard(sym, cfg, fmp, basis):
     from app.services.backtest import option_basis_guard as G
     from app.services.backtest.option_split_basis import RunSplitBasis
-    from app.services.backtest.options_store import _dividends_of, _split_dates_of
+    from app.services.backtest.options_store import (
+        _dividends_of, _split_dates_of, price_source_spot,
+    )
     from app.services.backtest.parquet_options_provider import _Underlying, _raw_underlying
-    import bisect
 
-    days, closes = fmp
-
-    def spot(_s, day):
-        # options_store.price_source_spot: the close as of the day x the as-traded factor of
-        # the close's OWN date.
-        k = bisect.bisect_right(days, day) - 1
-        return None if k < 0 else closes[k] * basis.factor(days[k])
+    rb = RunSplitBasis({sym: basis})
+    # The run's own spot conversion (options_store.price_source_spot): the close as of the day x
+    # the as-traded factor of the close's OWN date -- over the cached FMP daily closes.
+    spot = price_source_spot(_DailyCloses({sym: fmp}), rb)
 
     u = _Underlying(_raw_underlying(cfg["theta_root"], sym), 0.0)
     if not u.n_rows:
         return {"skipped": "no option rows"}
-    rb = RunSplitBasis({sym: basis})
+    days = fmp[0]
     sd, dv = _split_dates_of(rb), _dividends_of(rb)
     res = {"refusals": [], "runs": 0, "checks": 0, "carry_passed": 0}
     for st in cfg["guard_starts"]:
@@ -199,6 +256,19 @@ def _guard(sym, cfg, fmp, basis):
             res["checks"] += int(s.get("checks", 0))
             res["carry_passed"] += int(s.get("carry_passed", 0))
     return res
+
+
+class _DailyCloses:
+    """The ``close_asof_dated`` of ``AsOfPriceSource`` over cached FMP daily closes."""
+
+    def __init__(self, series):
+        self._s = series                     # {symbol: (sorted days, closes)}
+
+    def close_asof_dated(self, symbol, on):
+        import bisect
+        days, closes = self._s[symbol]
+        k = bisect.bisect_right(days, on) - 1
+        return None if k < 0 else (closes[k], days[k])
 
 
 def scan_symbol(sym, cfg):
@@ -364,17 +434,22 @@ def _findings(rows, ds, gate, cfg):
             if c.get("theta") is None:
                 add("blocking", "coverage", s, "no ThetaData tree")
             else:
-                if c["unfinished"]:
-                    add("blocking", "coverage", s, f"{len(c['unfinished'])} unfinished partition(s) "
-                        f"(no manifest), e.g. {c['unfinished'][0]}: re-run the ThetaData warm")
-                if c["root_history_stale"]:
-                    add("blocking", "coverage", s, f"{len(c['root_history_stale'])} partition(s) "
-                        f"stale under ROOT_HISTORY ({c['root_history_stale_reason']}): re-run the "
-                        f"ThetaData warm")
+                if c.get("not_final"):
+                    nf = c["not_final"]
+                    add("blocking", "coverage", s, f"{len(nf)} partition(s) not complete for the "
+                        f"window ({nf[0]['state']}: {nf[0]['expiry']} {nf[0]['reason']}): re-run "
+                        f"the ThetaData warm")
+                lead = c.get("listing_lead_max_days")
+                if lead is not None and lead > cfg.get("listing_horizon_days", 10 ** 6):
+                    add("review", "coverage", s, f"a contract listed {lead} days before its expiry "
+                        f"{c.get('listing_lead_expiry')}: longer than thetadata.LISTING_HORIZON_DAYS "
+                        f"({cfg['listing_horizon_days']}), so a ROOT_HISTORY change could miss it")
                 if c["first_bar"] is None:
                     add("review", "coverage", s, "no option bar in the window")
                 else:
-                    listed = max(cfg["start"], date.fromisoformat(c["fmp_first"])) if c.get("fmp_first")                         else cfg["start"]
+                    listed = cfg["start"]
+                    if c.get("fmp_first"):
+                        listed = max(listed, date.fromisoformat(c["fmp_first"]))
                     if date.fromisoformat(c["first_bar"]) > listed + timedelta(days=LATE_FIRST_BAR_DAYS):
                         add("review", "coverage", s, f"first option bar {c['first_bar']}, stock "
                             f"history from {c.get('fmp_first')}: a vendor gap or an earlier "
@@ -412,8 +487,10 @@ def run(universe, start, end, sections, *, out_path, guard_starts, guard_phases,
         from ba2_common.config import SCREENER_STORE_DIR
         gate_store = SCREENER_STORE_DIR
     t0 = time.time()
+    from ba2_providers.options.thetadata import LISTING_HORIZON_DAYS
     cfg = {"start": start, "end": end, "sections": list(sections), "cache_root": cache_root,
-           "theta_root": theta_root, "guard_starts": list(guard_starts), "guard_phases": guard_phases}
+           "theta_root": theta_root, "guard_starts": list(guard_starts), "guard_phases": guard_phases,
+           "listing_horizon_days": LISTING_HORIZON_DAYS}
     rows = []
     if {"coverage", "split", "guard"} & set(sections):
         os.environ.setdefault("BT_OPTION_PARQUET_CACHE_MAX", "2")
@@ -447,6 +524,9 @@ def run(universe, start, end, sections, *, out_path, guard_starts, guard_phases,
                                       if (r.get("guard") or {}).get("carry_passed")),
         "no_option_tree": sorted(r["symbol"] for r in rows
                                  if r.get("coverage") and r["coverage"].get("theta") is None),
+        "listing_lead_max_days": max((r["coverage"].get("listing_lead_max_days") or 0
+                                      for r in rows if r.get("coverage")), default=None),
+        "listing_horizon_days": cfg["listing_horizon_days"],
         "ds_distinct_misses": ds["distinct_misses"] if ds else None,
         "gate_absent": gate.get("absent") if gate else None,
         "elapsed_s": round(time.time() - t0, 1),

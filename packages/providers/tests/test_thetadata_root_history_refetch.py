@@ -21,6 +21,7 @@ No network.
 """
 from __future__ import annotations
 
+import os
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -143,3 +144,41 @@ def test_the_store_reads_the_first_bar_for_a_none_root_partition(tmp_path):
     assert hooked.partition_state("ECHO", exp, date(2020, 1, 1), exp) is PartitionState.STALE
     plain.write_partition("ECHO", exp, _bars("ECHO", exp, [date(2026, 6, 1)]), date(2020, 1, 1), exp)
     assert hooked.partition_state("ECHO", exp, date(2020, 1, 1), exp) is PartitionState.COMPLETE
+
+
+# ------------------------------------------------ review: an empty re-fetch never erases rows
+def test_a_stale_partition_whose_refetch_comes_back_empty_keeps_its_rows(tmp_path):
+    """A partition that held rows is not overwritten by an EMPTY re-fetch (a vendor hiccup, a
+    wrong alias) and is not signed: the old file stays, and the store reports it."""
+    root = str(tmp_path / "theta")
+    legacy = OptionHistoryParquetStore(root=root, clock=lambda: datetime(2026, 9, 1, tzinfo=UTC))
+    exp = date(2023, 6, 16)
+    legacy.write_partition("XYZ", exp, _bars("XYZ", exp, [date(2023, 6, 1)]), date(2020, 1, 1), exp)
+    before = open(legacy.bars_path("XYZ", exp), "rb").read()
+    m_before = legacy.read_manifest("XYZ", exp)
+    hooked = OptionHistoryParquetStore(root=root, **T.parquet_store_hooks())
+    got = hooked.write_partition("XYZ", exp, [], date(2020, 1, 1), exp, empty_contracts=["X"])
+    assert open(hooked.bars_path("XYZ", exp), "rb").read() == before
+    assert hooked.read_manifest("XYZ", exp) == m_before and "root_history" not in m_before
+    assert ("XYZ", exp) in hooked.kept_nonempty and got.get("kept_old")
+
+
+def test_a_none_root_cutover_may_empty_a_partition_of_the_old_company(tmp_path):
+    """ECHO: every row of the partition lies before 2026-05-26 (another company's chain), so the
+    empty re-fetch is the correct answer and is written."""
+    root = str(tmp_path / "theta")
+    legacy = OptionHistoryParquetStore(root=root, clock=lambda: datetime(2026, 9, 1, tzinfo=UTC))
+    exp = date(2021, 6, 18)
+    legacy.write_partition("ECHO", exp, _bars("ECHO", exp, [date(2021, 6, 1)]), date(2020, 1, 1), exp)
+    hooked = OptionHistoryParquetStore(root=root, **T.parquet_store_hooks())
+    m = hooked.write_partition("ECHO", exp, [], date(2020, 1, 1), exp, empty_contracts=["X"])
+    assert m["status"] == "empty" and not os.path.exists(hooked.bars_path("ECHO", exp))
+    assert m["root_history"] == T.root_history_signature("ECHO") and not hooked.kept_nonempty
+
+
+def test_a_plain_store_still_writes_empty(tmp_path):
+    root = str(tmp_path / "theta")
+    plain = OptionHistoryParquetStore(root=root)
+    exp = date(2023, 6, 16)
+    plain.write_partition("AAPL", exp, _bars("AAPL", exp, [date(2023, 6, 1)]), date(2020, 1, 1), exp)
+    assert plain.write_partition("AAPL", exp, [], date(2020, 1, 1), exp)["status"] == "empty"

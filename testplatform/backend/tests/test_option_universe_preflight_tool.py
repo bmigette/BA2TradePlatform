@@ -178,3 +178,99 @@ def test_a_late_option_start_is_flagged_only_against_the_stock_s_own_history(too
                         row("EARLY", "2011-06-22", "2020-01-02")], None, None, cfg)
     assert [(x["symbol"], x["severity"]) for x in f] == [("RENAMED", "review")]
     assert "ROOT_HISTORY" in f[0]["what"]
+
+
+# ------------------------------------------------ review of 5178e625..90980f18
+def _parity_chain(store, sym, days, S=100.0):
+    """Two monthly expiries, 9 strikes, calls and puts quoted around intrinsic + time value, so
+    put-call parity gives S on every day (the reviewer's probe_preflight_guard.py)."""
+    for exp in (date(2024, 4, 19), date(2024, 5, 17)):
+        bars = []
+        for K in range(80, 125, 5):
+            for right in ("C", "P"):
+                occ = occ_symbol(sym, exp, right, float(K))
+                for d in days:
+                    tv = 1.0 + 0.02 * (exp - d).days
+                    px = (max(S - K, 0) if right == "C" else max(K - S, 0)) + tv
+                    bars.append(OptionEodBar(occ_symbol=occ, bar_date=d, open=px, high=px, low=px,
+                                             close=px, volume=100, open_interest=10, iv=0.3,
+                                             bid=px - 0.05, ask=px + 0.05))
+        store.write_partition(sym, exp, bars, date(2020, 1, 1), exp)
+
+
+def test_the_real_guard_wiring_passes_a_consistent_chain_and_refuses_a_x2_one(tool, tmp_path,
+                                                                                 monkeypatch):
+    import ba2_common.config as cfg
+    r = tmp_path / "cache"
+    monkeypatch.setattr(cfg, "CACHE_FOLDER", str(r))
+    start, end = date(2024, 1, 2), date(2024, 3, 29)
+    days = [d.date() for d in pd.bdate_range(start, end)]
+    theta = str(r / "ThetaDataOptionsProvider")
+    store = OptionHistoryParquetStore(root=theta, **T.parquet_store_hooks())
+    for sym, close in (("PAR", 100.0), ("BAD", 50.0)):
+        p = r / "FMPOHLCVProvider" / f"{sym}_1d.parquet"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"Date": pd.bdate_range(date(2022, 1, 3), end), "Open": close, "High": close,
+                      "Low": close, "Close": close, "Volume": 1e6}).to_parquet(p, index=False)
+        _split_calendar(r, sym)
+        _parity_chain(store, sym, days)
+    rep = tool.run(["PAR", "BAD"], start, end, ["split", "guard"], out_path=None, guard_starts=[start],
+                   guard_phases=2, procs=1, cache_root=str(r), theta_root=theta, log=lambda m: None)
+    rows = {x["symbol"]: x for x in rep["symbols"]}
+    assert rows["PAR"]["guard"]["refusals"] == [] and rows["PAR"]["guard"]["checks"] > 0
+    assert len(rows["BAD"]["guard"]["refusals"]) == 2
+    assert "basis" in rows["BAD"]["guard"]["refusals"][0]["why"]
+    assert rep["summary"]["guard_refused"] == ["BAD"]
+
+
+def test_the_preflight_spot_is_the_run_s_own_conversion(tool):
+    """_guard hands the guard options_store.price_source_spot over the cached closes, not a copy;
+    the stub price source answers close_asof_dated the way AsOfPriceSource does."""
+    days = [date(2024, 1, 2), date(2024, 1, 3)]
+    src = tool._DailyCloses({"X": (days, [10.0, 11.0])})
+    assert src.close_asof_dated("X", date(2024, 1, 2)) == (10.0, date(2024, 1, 2))
+    assert src.close_asof_dated("X", date(2024, 1, 5)) == (11.0, date(2024, 1, 3))
+    assert src.close_asof_dated("X", date(2023, 12, 29)) is None
+    import inspect
+    assert "price_source_spot(" in inspect.getsource(tool._guard)
+
+
+@pytest.mark.parametrize("damage,state", [("parquet_gone", "missing"), ("schema", "stale"),
+                                          ("later_start", "stale"), ("earlier_end", "stale")])
+def test_every_partition_state_other_than_complete_or_empty_is_reported(tool, root, tmp_path,
+                                                                          damage, state):
+    import json as _j
+    theta = os.path.join(root, "ThetaDataOptionsProvider")
+    exp = date(2024, 12, 20)
+    mpath = os.path.join(theta, "AAA", f"exp={exp.isoformat()}", "_manifest.json")
+    m = _j.load(open(mpath))
+    if damage == "parquet_gone":
+        os.remove(os.path.join(theta, "AAA", f"exp={exp.isoformat()}", f"AAA_{exp.isoformat()}_1d.parquet"))
+    elif damage == "schema":
+        m["schema_version"] = 99
+    elif damage == "later_start":
+        m["start"] = "2024-06-03"
+    else:
+        m["end"] = "2024-11-29"
+    _j.dump(m, open(mpath, "w"))
+    rep = tool.run(["AAA"], START, END, ["coverage"], out_path=None, guard_starts=[START],
+                   guard_phases=1, procs=1, cache_root=root, log=lambda x: None)
+    nf = rep["symbols"][0]["coverage"]["not_final"]
+    got = {x["expiry"]: x for x in nf}
+    assert got[exp.isoformat()]["state"] == state and got[exp.isoformat()]["reason"]
+    assert any(f["severity"] == "blocking" and "not complete for the window" in f["what"]
+               for f in rep["findings"])
+
+
+def test_the_longest_listing_lead_is_measured_and_checked_against_the_horizon(tool, root, monkeypatch):
+    rep = tool.run(["AAA"], START, END, ["coverage"], out_path=None, guard_starts=[START],
+                   guard_phases=1, procs=1, cache_root=root, log=lambda x: None)
+    c = rep["symbols"][0]["coverage"]
+    assert c["listing_lead_max_days"] == (date(2024, 12, 20) - date(2024, 12, 2)).days
+    assert rep["summary"]["listing_lead_max_days"] == c["listing_lead_max_days"]
+    assert rep["summary"]["listing_horizon_days"] == T.LISTING_HORIZON_DAYS
+    assert not any("listed" in f["what"] for f in rep["findings"])
+    monkeypatch.setattr(T, "LISTING_HORIZON_DAYS", 10)
+    rep = tool.run(["AAA"], START, END, ["coverage"], out_path=None, guard_starts=[START],
+                   guard_phases=1, procs=1, cache_root=root, log=lambda x: None)
+    assert any(f["severity"] == "review" and "LISTING_HORIZON_DAYS" in f["what"] for f in rep["findings"])

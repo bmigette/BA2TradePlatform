@@ -1498,9 +1498,17 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
         f"{stats.units_failed} failed, {stats.rows} rows, "
         f"{stats.empty_contracts} empty contracts recorded, "
         f"{_fmt_bytes(store.disk_bytes())} on disk")
+    kept = getattr(store, "kept_nonempty", None) or {}
+    for (u, e), why in sorted(kept.items()):
+        log(f"KEPT {u} {e}: {why}")
     if stats.units_failed:
         log(f"{stats.units_failed} unit(s) did not complete and were NOT written. "
             f"Re-run the same command to retry only those.")
+        return 1
+    if kept:
+        log(f"{len(kept)} partition(s) held rows that the re-fetch did not return; they were "
+            f"KEPT as they were (not signed, so a re-run retries them). Check the vendor or the "
+            f"ROOT_HISTORY entry before trusting them.")
         return 1
     return 0
 

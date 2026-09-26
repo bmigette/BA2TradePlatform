@@ -65,3 +65,26 @@ def test_a_legacy_xyz_tree_is_planned_again_with_its_missing_partitions(tmp_path
     assert sorted(u.expiry for u in plan.units) == sorted(held + missing)
     assert plan.per_symbol["XYZ"]["root_history_stale"] == 2
     assert any("ROOT_HISTORY" in ln and "XYZ" in ln for ln in lines)
+
+
+def test_a_kept_partition_is_reported_and_fails_the_run(tmp_path):
+    """An empty re-fetch over a partition that held rows is kept by the store; the warm names it
+    and exits 1 so the orchestrator stops and a re-run retries it."""
+    from tests.test_warm_options_history import FakeClock, FakeProvider, START, END, _bar, _contract
+    root = str(tmp_path / "opt")
+    exp = date(2023, 1, 20)
+    first = OptionHistoryParquetStore(root=root, clock=lambda: datetime(2026, 3, 1, tzinfo=timezone.utc))
+    first.write_partition("AAPL", exp, [_bar(occ_symbol("AAPL", exp, "C", 150.0), date(2023, 1, 3))],
+                          START, END)
+    store = OptionHistoryParquetStore(root=root, stale_reason=lambda u, e, m, fb: "test: stale",
+                                      empty_overwrite_ok=lambda u, last: False)
+    provider = FakeProvider()
+    provider.contracts["AAPL"] = [_contract("AAPL", exp, 150.0)]
+    lines = []
+    clock = FakeClock()
+    rc = warm.main(["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
+                    "--rate-limit", "0", "--discovery", "rest"], provider=provider, store=store,
+                   clock=clock, sleep=lambda s: clock.advance(s), log=lines.append)
+    assert rc == 1
+    assert any(ln.startswith("KEPT AAPL 2023-01-20") for ln in lines)
+    assert store.read_manifest("AAPL", exp)["status"] == "complete"
