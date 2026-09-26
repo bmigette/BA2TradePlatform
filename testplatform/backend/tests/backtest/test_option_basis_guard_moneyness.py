@@ -285,3 +285,12 @@ def test_the_wide_pair_gate_applies_to_the_carry_term_too():
     u = _Store("MUFG", contracts, quotes)
     assert g.expiry_parities(u, s.toordinal()) == [(e2.toordinal(), pytest.approx(9.5))]
     assert g.parity_spot(u, s.toordinal()) == pytest.approx(9.5)
+
+
+def test_the_term_cache_is_reported():
+    import app.services.backtest.option_basis_guard as g
+
+    s = date(2020, 3, 18)
+    u = _pair_store("MUFG", [(s, date(2020, 4, 17), 3.5, 3.40)])
+    g.expiry_parities(u, s.toordinal())
+    assert g.basis_guard_cache_stats()["term_entries"] == 1
