@@ -81,7 +81,9 @@ def test_credit_kinds_get_the_dte_exit(kind):
 
 
 def test_every_pure_option_strategy_key_gets_it():
-    for kind in sorted(mod._PURE_OPTION_STRATEGIES):
+    # SPEC-DRIVEN keys (O_STYLE) take no exits from _option_exit_rules(kind): each member keeps
+    # its OWN builder's exits, namespaced and tag-scoped (test_option_style_builder pins that).
+    for kind in sorted(mod._PURE_OPTION_STRATEGIES - mod._SPEC_DRIVEN_STRATEGIES):
         _leaf(_rule(kind, DTE_RULE_ID), DTE_COND_ID)
 
 

@@ -142,10 +142,39 @@ def _option_keys(m):
     key audits every member's genes (asserted by ``test_the_audit_covers_every_group_member``)."""
     return sorted(k for k in m._STRATEGY_BUILDERS
                   if k in m._OPTION_STRATEGY_KEYS
-                  and k not in m._PHASE_GATED_OPTION_STRATEGIES)
+                  and k not in m._PHASE_GATED_OPTION_STRATEGIES
+                  # spec-driven: built with a style in the STYLE cases below
+                  and k not in m._SPEC_DRIVEN_STRATEGIES)
 
 
 OPTION_KEYS = _option_keys(_M)
+
+#: The stage-2 STYLE key (``O_STYLE``) builds from a style spec, not from its key alone, so it
+#: is audited once per style of the candidate spec file (plan 2026-09-25 Task 7): every member's
+#: genes, namespaced and tag-scoped, must still land at their own destination in the live export.
+_STYLE_SPEC = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))), "tools", "option_styles.candidates.json")
+
+
+def _candidate_styles():
+    import json
+    with open(_STYLE_SPEC, encoding="utf-8") as fh:
+        return sorted(json.load(fh)["styles"])
+
+
+STYLE_AUDIT_STYLES = _candidate_styles()
+
+
+@contextlib.contextmanager
+def _style(m, name):
+    """Build ``O_STYLE`` from candidate style ``name`` for the duration of a case (the launcher
+    reads the loaded style from a module global, as ``optimize`` sets it from --style)."""
+    saved = m._STYLE_ACTIVE
+    m._STYLE_ACTIVE = m._load_style_spec(_STYLE_SPEC, name)
+    try:
+        yield
+    finally:
+        m._STYLE_ACTIVE = saved
 
 #: (key, expert, screener_on, profiles). Every option key under FMPRating (the grid's default
 #: ranking expert); O_ERN under FMPEarningsEvent as well, because that is the expert grid-2
@@ -221,6 +250,16 @@ def _non_default(domain, choice_index=-1):
     if domain["type"] == "int":
         return int(domain["max"])
     return float(domain["max"])
+
+
+def _low(gene, domain):
+    """The THIRD base (see ``_run_destination_audit``): the bottom of every domain -- the first
+    choice, the minimum -- except toggles, which stay ON (1) so every rule and leaf is present."""
+    if gene.endswith(":enabled"):
+        return _non_default(domain)
+    if domain["type"] == "choice":
+        return domain["choices"][0]
+    return int(domain["min"]) if domain["type"] == "int" else float(domain["min"])
 
 
 def _numeric(v):
@@ -713,6 +752,14 @@ def test_every_gene_lands_at_its_own_destination(key, expert, screener, profiles
 def _run_destination_audit(m, key, expert, screener):
     strat, space = _space(m, key, expert, screener)
     bases = [{g: _non_default(d, choice) for g, d in space.items()} for choice in (-1, 0)]
+    # A THIRD base, every other gene at the BOTTOM of its domain: a STYLE (O_STYLE) carries
+    # several members with the SAME band on the same field (premium: seven members' ``td``),
+    # so on the top-of-domain bases every level of that band is held by a sibling and no
+    # unambiguous sentinel exists. With the siblings at their minimum the sentinel (walked down
+    # from the maximum) is free again. The check itself is unchanged -- the sentinel must still
+    # arrive at THIS gene's own destination -- and a gene that passed on the first two bases
+    # never reaches this one (every single-key case did, before it existed).
+    bases.append({g: _low(g, d) for g, d in space.items()})
 
     # ONE full trial-config build per case: the rules the ENGINE receives must be the decoded
     # rules verbatim, or the per-gene export below is the artefact of some later rebuild.
@@ -729,6 +776,8 @@ def _run_destination_audit(m, key, expert, screener):
         if complaint is not None:
             complaint = _check_gene(m, key, expert, strat, bases[1], gene, domain, screener)
         if complaint is not None:
+            complaint = _check_gene(m, key, expert, strat, bases[2], gene, domain, screener)
+        if complaint is not None:
             bad[gene] = complaint
 
     assert audited, f"{key}: no gene was audited at all -- the space is empty or all skipped"
@@ -743,9 +792,28 @@ def test_every_toggle_gene_changes_the_emitted_ruleset(key):
     """A ``*:enabled`` gene's value is structural: switching it off must remove something from
     the LIVE EXPORT. A toggle whose export is byte-identical either way is a knob the live
     ruleset cannot express -- the same defect ``enabled: False`` had before 64981161."""
+    _run_toggle_audit(_M, key)
+
+
+@pytest.mark.parametrize("style", STYLE_AUDIT_STYLES)
+def test_every_style_gene_lands_at_its_own_destination(style):
+    """The destination audit for ``O_STYLE``, once per candidate style (FMPRating, no
+    profile). The member-toggle genes (``entry:<rule>:enabled``) are audited by effect below."""
+    m = _M
+    with _style(m, style):
+        _run_destination_audit(m, "O_STYLE", "FMPRating", False)
+
+
+@pytest.mark.parametrize("style", STYLE_AUDIT_STYLES)
+def test_every_style_toggle_gene_changes_the_emitted_ruleset(style):
+    m = _M
+    with _style(m, style):
+        _run_toggle_audit(m, "O_STYLE")
+
+
+def _run_toggle_audit(m, key):
     from app.services.strategy_param_space import decode_params
 
-    m = _M
     expert = "FMPRating"
     strat, space = _space(m, key, expert)
     genome = {g: _non_default(d) for g, d in space.items()}
@@ -805,8 +873,13 @@ def test_the_case_list_is_exactly_what_the_launcher_tables_produce():
     """
     m = _M
     expected_keys = sorted((set(m._STRATEGY_BUILDERS) & set(m._OPTION_STRATEGY_KEYS))
-                           - set(m._PHASE_GATED_OPTION_STRATEGIES))
+                           - set(m._PHASE_GATED_OPTION_STRATEGIES)
+                           - set(m._SPEC_DRIVEN_STRATEGIES))
     assert OPTION_KEYS == expected_keys
+    # O_STYLE (2026-09-26, plan Task 7) is spec-driven: it is audited once per candidate style,
+    # not as a key case, so it does not move the count below.
+    assert m._SPEC_DRIVEN_STRATEGIES == {"O_STYLE"} and "O_STYLE" in m._STRATEGY_BUILDERS
+    assert STYLE_AUDIT_STYLES == ["leaps_convex", "mid", "premium", "short"]
     assert len(OPTION_KEYS) == 29, (
         f"the launchable option-key set moved to {len(OPTION_KEYS)}: {OPTION_KEYS}. If that was "
         f"deliberate, update the arithmetic in this docstring in the same commit.")

@@ -1199,6 +1199,14 @@ def _apply_option_trade_floor(strategy_key: "str | None", backtest_block: dict) 
     """
     if strategy_key in _OPTION_LOW_TRADE_FLOOR_STRATEGIES:
         backtest_block.update(_OPTION_LOW_TRADE_FLOOR)
+    elif strategy_key == _STYLE_KEY and any(
+            k in _OPTION_LOW_TRADE_FLOOR_STRATEGIES for k in _style_member_keys(strategy_key)):
+        # A STYLE with any long-dated member (plan Task 7, the any-member rule): its cadence
+        # includes that member's, and the default floor would disqualify the member for the
+        # holding period it was designed with. NOTE (Q14): option_car_target_soft30 replaces
+        # the annual trade gate with min(structures / 30, 1) and never reads these two keys,
+        # so under soft30 this floor is recorded but inert.
+        backtest_block.update(_OPTION_LOW_TRADE_FLOOR)
 
 
 def _bypass_gene_space(spec: dict) -> dict:
@@ -2764,6 +2772,11 @@ def _lattice_anchor_for(kind: str, override: "str | None") -> str:
     """
     if override is not None:
         return override
+    if kind == _STYLE_KEY:
+        # The any-member rule: a style carrying a grid-2 member carries that member's DTE
+        # genes, which decode under their floors on the zero lattice (Q12).
+        return ("min" if any(k in _GRID2_OPTION_STRATEGIES for k in _style_member_keys(kind))
+                else "zero")
     return "min" if kind in _GRID2_OPTION_STRATEGIES else "zero"
 
 
@@ -3065,7 +3078,14 @@ if _empty_groups:
 #
 # Nothing indexes ``_OPTION_STRATS[kind]`` off this set (checked: the only two readers are the
 # two above), so a member with no row is safe here.
-_PURE_OPTION_STRATEGIES = set(_OPTION_STRATS) | set(_OPTION_GROUPS) | {"O_WHEEL"}
+#
+# ``O_STYLE`` (stage 2, plan 2026-09-25 Task 7) is the SPEC-DRIVEN style key: one expert built from
+# a style spec's members (``_build_strategy_style``). Pure-option for every reader of this set --
+# its book is an option book (option fitness, the holdout rail, market conditions) even when a
+# member enters through a stock buy (O_CC / O_PP, routed per entry since revision E1). It is NOT a
+# ``_OPTION_GROUPS`` key: style groups come from the spec, never from that table.
+_STYLE_KEY = "O_STYLE"
+_PURE_OPTION_STRATEGIES = set(_OPTION_STRATS) | set(_OPTION_GROUPS) | {"O_WHEEL", _STYLE_KEY}
 # All launcher option/equity strategy keys handled by the option builders.
 _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 
@@ -3311,6 +3331,22 @@ def _refuse_convex_fitness_mismatch(command: str, strat_kind: str, fitness: str)
     """
     is_convex_kind = strat_kind in _CONVEX_OPTION_STRATEGIES
     is_convex_fitness = fitness == _CONVEX_FITNESS
+    if strat_kind == _STYLE_KEY and not is_convex_fitness:
+        # A STYLE holding a convex member scores it under the style's (CAR-family) fitness,
+        # the very metric that "teaches the GA to gut the convexity". Open question Q5: refused
+        # until the style records who accepted that (``convex_fitness_waiver``). A style under
+        # option_convex falls through to the O_CONVEX-only refusal below: the metric is tied to
+        # the one structure.
+        style = _style_active(strat_kind)
+        convex = [k for k in _style_member_keys(strat_kind) if k in _CONVEX_OPTION_STRATEGIES]
+        if convex and "convex_fitness_waiver" not in style:
+            sys.exit(
+                f"ba2-test {command}: style {style['name']!r} holds the convex-harvest member(s) "
+                f"{convex}, which would be scored under --fitness {fitness!r} -- the CAR family "
+                f"rewards smooth equity and would teach the GA to gut the convexity. Open "
+                f"question Q5 in {_STYLE_PLAN}: record a convex_fitness_waiver on the style "
+                f"(who accepted it, when), drop {convex} from it (run O_CONVEX as its own "
+                f"--fitness {_CONVEX_FITNESS} job), or define a mixed objective.")
     if is_convex_kind and not is_convex_fitness:
         sys.exit(
             f"ba2-test {command}: --strategy {strat_kind} (the convex-harvest grid) must run "
@@ -3926,6 +3962,8 @@ def _screener_gate_base_for_strategy(kind: str) -> dict:
     """
     if kind == "O_WHEEL":
         return dict(_OPTION_STRATS["O_CSP"].get("screener_gate_base") or {})
+    if kind == _STYLE_KEY:
+        return _style_screener_gate_base(kind)
     if kind in _OPTION_STRATS:
         return dict(_OPTION_STRATS[kind].get("screener_gate_base") or {})
     merged: dict = {}
@@ -3959,6 +3997,29 @@ def _screener_gate_base_for_strategy(kind: str) -> dict:
     return merged
 
 
+def _style_screener_gate_base(kind: str) -> dict:
+    """ONE screener gate for a style job, from its members' own bases (Q3).
+
+    Members that agree give their common base. Otherwise the loader has already refused any
+    difference except ``price_max`` and any style without a ``price_cap_policy``
+    (``_validate_style_price_caps``), so the policy decides the one field left:
+    ``none`` -> no price gate at all (sizing refuses unaffordable entries); ``group_min`` ->
+    every member capped at the lowest member cap. A true per-member cap would need a shared
+    per-entry price leaf (open question Q3)."""
+    style = _style_active(kind)
+    keys = _style_member_keys(kind)
+    bases = [_screener_gate_base_for_strategy(k) for k in keys]
+    if all(b == bases[0] for b in bases):
+        return dict(bases[0])
+    common = {f: v for f, v in bases[0].items() if f != "price_max"}
+    policy = style["price_cap_policy"]          # present: the loader refuses a style without it
+    if policy == "none":
+        return common
+    if policy == "group_min":
+        return {**common, "price_max": min(b["price_max"] for b in bases if "price_max" in b)}
+    raise ValueError(f"style {style['name']!r}: price_cap_policy {policy!r} has no rule here")
+
+
 def _screener_gate_opt_block(args, strategy_key: str) -> "dict | None":
     """The gate-only screener_opt block for --screener-gate-store (None when the flag is unset).
 
@@ -3989,6 +4050,14 @@ def _screener_gate_opt_block(args, strategy_key: str) -> "dict | None":
         with open(args.screener_base_json) as _f:
             base.update(json.load(_f))
     base.update(_screener_gate_base_for_strategy(strategy_key))
+    if (strategy_key == _STYLE_KEY and "price_max" in base
+            and _style_active(strategy_key).get("price_cap_policy") == "none"):
+        # ``none`` promises NO price gate (Q3); the blanket --max-stock-price (or a base json)
+        # would put one back on every member without a word.
+        sys.exit(f"optimize: style {_STYLE_ACTIVE['name']!r} has price_cap_policy 'none' (no "
+                 f"price gate), but the gate would still cap price at {base['price_max']} from "
+                 f"--max-stock-price / --screener-base-json; pass --max-stock-price 0 (and no "
+                 f"price_max in the base json), or set price_cap_policy 'group_min'.")
     return {
         "store": store,
         "base_settings": base,
@@ -4797,9 +4866,53 @@ def _hold_assigned_stock(kind: Optional[str]) -> bool:
     """
     if kind is None:
         return False
+    if kind == _STYLE_KEY:
+        # A STYLE never sets the run-level flag: its hold is member-scoped
+        # (``_hold_assigned_stock_tags``), and a run may not state both (assignment_hold).
+        return False
     if kind in _HOLDS_ASSIGNED_STOCK:
         return True
     return any(m in _HOLDS_ASSIGNED_STOCK for m in _OPTION_GROUPS.get(kind, ()))
+
+
+def _style_active(kind: str) -> dict:
+    """The loaded style for the ``O_STYLE`` key, or a loud exit when none is loaded (a per-run
+    rule decided from the members cannot be decided without them)."""
+    if _STYLE_ACTIVE is None:
+        sys.exit(f"{kind}: no style loaded -- pass --style-config FILE --style NAME")
+    return _STYLE_ACTIVE
+
+
+def _style_member_keys(kind: str) -> list:
+    return [m["key"] for m in _style_active(kind)["members"]]
+
+
+def _hold_assigned_stock_tags(kind: Optional[str]) -> "list | None":
+    """``BacktestAccount.hold_assigned_stock_tags`` for ``kind``'s run config (plan 2026-09-25
+    stage-2 E2 / Task 7), or None to write no such key.
+
+    Only a STYLE has a member-scoped hold: the entry-tag VALUES (``_STYLE_MEMBER_TAGS``, the
+    persisted contract the assigned position's order row carries -- never rule ids) of its
+    members in ``_HOLDS_ASSIGNED_STOCK`` (the wheel). Every other member's assignment is
+    liquidated at the next bar's open, as for its single job. A style with no holding member
+    writes nothing (an empty set is refused by the account: it would still force every
+    assignment to carry a tag, for no member). Every non-style key: None, so every existing run
+    config keeps its shape."""
+    if kind != _STYLE_KEY:
+        return None
+    tags = sorted(_STYLE_MEMBER_TAGS[k] for k in _style_member_keys(kind)
+                  if k in _HOLDS_ASSIGNED_STOCK)
+    return tags or None
+
+
+def _hold_assigned_stock_account_settings(kind: Optional[str]) -> dict:
+    """The run's assigned-stock hold for ``account_settings``: the run-level flag (written on
+    every run, as always) plus, for a style with a holding member, its member tags."""
+    out = {"hold_assigned_stock": _hold_assigned_stock(kind)}
+    tags = _hold_assigned_stock_tags(kind)
+    if tags is not None:
+        out["hold_assigned_stock_tags"] = tags
+    return out
 
 
 # SMOKE MODE (--gates-off): drop every OPTIONAL entry gate so a run exercises the PIPELINE
@@ -5467,7 +5580,7 @@ def _build_strategy_option_group(kind: str):
 # entries, tag-scoped exits, per-member id maps). Every check is a ``ValueError`` naming the
 # style, the member and the reason; the CLI turns it into ``sys.exit`` (Task 7).
 
-_STYLE_KEY = "O_STYLE"
+# ``_STYLE_KEY`` ("O_STYLE") is defined beside ``_PURE_OPTION_STRATEGIES``, which contains it.
 #: Strategy keys whose builder needs a run input (a style spec) -- excluded from every test that
 #: builds "every registered key" with no spec (Task 7 lists them).
 _SPEC_DRIVEN_STRATEGIES = {_STYLE_KEY}
@@ -6659,6 +6772,10 @@ _STRATEGY_BUILDERS = {
     # Grouped option families (one job searches the whole family; see _OPTION_GROUPS):
     "OS1": _build_strategy_option_group, "OS2": _build_strategy_option_group,
     "OS3": _build_strategy_option_group, "OS4": _build_strategy_option_group,
+    # Stage-2 STYLE (plan 2026-09-25 Task 7): ONE expert built from a style spec's members
+    # (``--style-config F --style NAME``, ``optimize`` only). Spec-driven, so every test that
+    # builds "every registered key" with no spec skips ``_SPEC_DRIVEN_STRATEGIES``.
+    _STYLE_KEY: _build_strategy_style,
 }
 
 # Per-strategy GA population multiplier applied on top of --population in optimize-batch. S1 is the
@@ -6790,6 +6907,28 @@ def _apply_neutral_entry_setting(backtest_block, mode):
             expert["settings"]["evaluate_entry_rules_on_hold"] = True
 
 
+def _resolve_style_args(args, spec: dict, command: str) -> "dict | None":
+    """``--style-config FILE --style NAME`` -> the loaded style for ``--strategy O_STYLE``, or
+    None for every other key. Refused by name: either flag without O_STYLE, O_STYLE without
+    both, O_STYLE with a bypass expert (it ignores --strategy), and any spec the loader refuses."""
+    path, name = getattr(args, "style_config", None), getattr(args, "style", None)
+    if args.strategy != _STYLE_KEY:
+        if path is not None or name is not None:
+            sys.exit(f"{command}: --style-config/--style apply only with --strategy "
+                     f"{_STYLE_KEY}, got --strategy {args.strategy}")
+        return None
+    if path is None or name is None:
+        sys.exit(f"{command}: --strategy {_STYLE_KEY} needs both --style-config FILE and "
+                 f"--style NAME (the style spec it builds)")
+    if spec.get("bypass"):
+        sys.exit(f"{command}: expert {args.expert!r} is a bypass expert and ignores --strategy; "
+                 f"a style job needs a ruleset expert")
+    try:
+        return _load_style_spec(path, name)
+    except ValueError as e:
+        sys.exit(f"{command}: {e}")
+
+
 def _cmd_optimize(args) -> int:
     """Create a Strategy + StrategyOptimization and run a joint genetic optimization headless.
 
@@ -6818,6 +6957,9 @@ def _cmd_optimize(args) -> int:
     spec = _EXPERT_OPT.get(expert)
     if spec is None:
         sys.exit(f"ba2-test: optimize not configured for expert {expert!r}; have {sorted(_EXPERT_OPT)}")
+    # BEFORE the fitness checks and the build: both read the style's members.
+    global _STYLE_ACTIVE
+    _STYLE_ACTIVE = _resolve_style_args(args, spec, "optimize")
     _refuse_unbounded_strategy_request("optimize", [args.strategy])
     _refuse_phase_gated_strategy("optimize", [args.strategy])
     # Pure-option kinds AND options experts (spec key `options` — --strategy is ignored)
@@ -6903,8 +7045,14 @@ def _cmd_optimize(args) -> int:
         neutral_mode = getattr(args, "neutral_entry_mode", "legacy")
         if bypass and neutral_mode != "legacy":
             raise ValueError("Neutral option entry experiments require a ruleset expert")
-        strat = _build_strategy_minimal(_sname) if bypass else _build_strategy(
-            args.strategy, _sname, expert, neutral_entry_mode=neutral_mode)
+        try:
+            strat = _build_strategy_minimal(_sname) if bypass else _build_strategy(
+                args.strategy, _sname, expert, neutral_entry_mode=neutral_mode)
+        except ValueError as e:
+            if args.strategy != _STYLE_KEY:
+                raise
+            # The builder names the style and the member in a PEP-678 note; keep it.
+            sys.exit(f"optimize: {e} [{'; '.join(getattr(e, '__notes__', []))}]")
         # Pure-option strategies carry a transient `entry_action` (the option ENTRY action config).
         # Capture it BEFORE commit/refresh so a db.refresh (which reloads only mapped columns) can't
         # affect it, then thread it into the run config below so the handler's _build_experts (and
@@ -6939,8 +7087,10 @@ def _cmd_optimize(args) -> int:
                 "equity_cap": getattr(args, "equity_cap", None),
                 # PER-STRATEGY (see _hold_assigned_stock): True only for kinds whose own
                 # rules manage assigned stock -- the wheel. False everywhere else keeps the
-                # no-orphaned-stock liquidation, so every non-wheel run is unchanged.
-                "hold_assigned_stock": _hold_assigned_stock(None if bypass else args.strategy),
+                # no-orphaned-stock liquidation, so every non-wheel run is unchanged. A STYLE
+                # adds ``hold_assigned_stock_tags`` (its wheel member's tag) instead of the flag
+                # (_hold_assigned_stock_tags); no other run writes that key.
+                **_hold_assigned_stock_account_settings(None if bypass else args.strategy),
             },
             "warmup_days": derive_warmup_days([expert]),
             "seed": int(args.seed),
@@ -6973,6 +7123,13 @@ def _cmd_optimize(args) -> int:
         # GRID 2: the long-dated keys' lower trade-frequency objective (no-op elsewhere).
         _apply_option_trade_floor(None if bypass else args.strategy, backtest_block)
         _apply_neutral_entry_setting(backtest_block, neutral_mode)
+        # STAGE 2: the resolved style (content + sha + the path it came from) on the run config.
+        # Only style jobs write the key, so every other stored config keeps its shape; the
+        # handler carries it into every trial config (_build_daily_trial_config).
+        if args.strategy == _STYLE_KEY:
+            from copy import deepcopy as _deepcopy
+            backtest_block["option_style"] = {**_deepcopy(_STYLE_ACTIVE),
+                                              "spec_path": args.style_config}
 
         # Screener-settings optimization: when --screener, attach a screener_opt block to the
         # backtest config (store + base settings + scan cadence — an OPTIMIZATION config option,
@@ -7236,6 +7393,9 @@ def _cmd_optimize_batch(args) -> int:
             sys.exit(f"optimize-batch: expert {e!r} not configured; have {sorted(_EXPERT_OPT)}")
     _refuse_unbounded_strategy_request("optimize-batch", strategies)
     _refuse_phase_gated_strategy("optimize-batch", strategies)
+    if _STYLE_KEY in strategies:
+        sys.exit(f"optimize-batch: {_STYLE_KEY} is spec-driven (--style-config/--style) and "
+                 f"runs through `optimize`, one style per command; the stage-2 driver loops it")
     # Build the (expert, strategy) job grid. Bypass experts (FactorRanker) have no enter/exit
     # rulesets, so they run ONCE (their factor-model params), not per strategy variant.
     jobs = []  # (expert, strategy_kind)
@@ -8379,6 +8539,12 @@ def main(argv: "list | None" = None) -> int:
                          "O_STK equity). O_SSTG/O_SSTD are UNBOUNDED-risk and refuse "
                          "(operator decision 2026-08-31). Ignored for bypass experts "
                          "(FactorRanker).")
+    op.add_argument("--style-config", default=None, metavar="FILE",
+                    help="Stage-2 style spec (JSON, schema 1; e.g. "
+                         "tools/option_styles.candidates.json). Required with --strategy O_STYLE, "
+                         "refused otherwise.")
+    op.add_argument("--style", default=None, metavar="NAME",
+                    help="The style of --style-config to build (--strategy O_STYLE only).")
     op.add_argument("--universe", required=True, help="Comma-separated symbols.")
     op.add_argument("--start", required=True, help="ISO start date.")
     op.add_argument("--end", required=True, help="ISO end date.")

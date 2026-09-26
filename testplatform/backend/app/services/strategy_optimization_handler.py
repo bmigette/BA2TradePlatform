@@ -2768,6 +2768,14 @@ def _build_daily_trial_config(
         #   Decoded through the ONE reader of both shapes, so a genome persisted before Task 10
         #   (singular ``market_condition_profile``/``_manifest``) re-runs unchanged.
         **_market_condition_trial_pins(backtest_cfg),
+        # STAGE-2 STYLE record (ba2test_launcher, plan 2026-09-25 Task 7): the resolved style
+        # spec (members, overrides, price-cap policy, content sha, source path) a style job was
+        # built from. Same whitelist reason as above: carried so every trial, re-run and top-N
+        # persist of a style job says which style it is. Written ONLY when the run has one, so
+        # every other trial config keeps its exact shape. (Its member-scoped assigned-stock
+        # hold, ``hold_assigned_stock_tags``, rides in ``account_settings``, carried whole.)
+        **({"option_style": backtest_cfg["option_style"]}
+           if "option_style" in backtest_cfg else {}),
         # This config was assembled by the OPTIMIZER (GA trial, re-run, robustness variant or
         # top-N persist), not by the single-backtest path. The market-condition seam reads it to
         # tell "a research run may compute on a miss" from "a search may not".
