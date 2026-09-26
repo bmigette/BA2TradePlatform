@@ -28,14 +28,14 @@ STORAGE_SECRET = 'ba2_trade_platform_default_secret'
 
 STDOUT_LOGGING = True
 FILE_LOGGING = True
-OPENAI_BACKEND_URL="https://api.openai.com/v1"  # Default OpenAI API endpoint
+OPENAI_BACKEND_URL="https://api.openai.com/v1"  # OpenAI API endpoint. A constant, not read from the environment
 
 # Price cache duration in seconds
-PRICE_CACHE_TIME = 60  # Default to 60 seconds
+PRICE_CACHE_TIME = 60  # Seconds. A constant, not read from the environment or .env
 
 # Database performance logging threshold in milliseconds
 # Only log DB operations (queries, lock waits) exceeding this threshold
-# Set DB_PERF_LOG_THRESHOLD_MS in .env to override
+# A constant: change it here (it is not read from the environment or .env)
 DB_PERF_LOG_THRESHOLD_MS = 100
 
 # OpenAI streaming configuration
@@ -43,7 +43,7 @@ DB_PERF_LOG_THRESHOLD_MS = 100
 # When enabled, responses are sent incrementally as they're generated
 # This can reduce perceived latency but may increase API costs slightly
 # This can also reduce likelihood of timeouts for long responses
-# Set OPENAI_ENABLE_STREAMING=false in .env file to disable
+# A constant: set it to False here to disable (it is not read from the environment or .env)
 # See: https://platform.openai.com/docs/guides/streaming-responses
 OPENAI_ENABLE_STREAMING = True  # Default to True for better performance
 

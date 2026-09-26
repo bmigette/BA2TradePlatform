@@ -453,15 +453,9 @@ FROM transaction WHERE symbol = 'AAPL' ORDER BY created_at DESC LIMIT 1;
 
 ---
 
-#### Test 3.1.5: Cache Configuration via Environment
-**Steps**:
-1. Set PRICE_CACHE_TIME=60 in .env file
-2. Restart application
-3. Verify config.PRICE_CACHE_TIME = 60
-
-**Expected Results**:
-- ✅ Cache time configurable
-- ✅ Default 30 seconds used if not set
+#### Test 3.1.5: Cache Configuration
+`PRICE_CACHE_TIME` is a constant in `config.py` (60 seconds). It is not read from the environment or
+`.env`; change it in code. No manual test.
 
 ---
 
@@ -854,7 +848,7 @@ TP: 15.0% | SL: 5.0% | Qty: 100.0% | Type: MARKET
 
 **Expected Results**:
 - ✅ API keys loaded
-- ✅ PRICE_CACHE_TIME configurable
+- ✅ PRICE_CACHE_TIME set in config.py (a constant, not an environment variable)
 - ✅ account_refresh_interval managed through AppSetting in database (not environment variable)
 
 ---
