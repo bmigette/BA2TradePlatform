@@ -24,6 +24,7 @@ at that date and are not kept up to date afterwards: check the code before relyi
 
 ## Runbooks and strategy research
 
+- [REPRODUCE-BACKTESTS.md](REPRODUCE-BACKTESTS.md) — reproduce our equity and option backtest results from scratch: keys, hardware, data preparation, grids, verification, time budget
 - [RUNBOOK-goal2020-grid.md](RUNBOOK-goal2020-grid.md) — start, watch, stop and resume the goal2020 optimization grid
 - [strategy_research/exploration/README.md](strategy_research/exploration/README.md) — the strategy exploration grid (driver `tools/strategy_research/exploration/run_exploration.py`)
   - [market_conditions.md](strategy_research/exploration/market_conditions.md) — market-condition entry gates in that grid
