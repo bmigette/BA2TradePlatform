@@ -34,7 +34,8 @@
 # ThetaData TSLA; the store serialises builders per KEY only, so 24 cold consumers on
 # different keys can OOM the host). From the repo root, same PYTHONPATH/BA2_HOME as below:
 #   /opt/ba2worker/ba2-venvs/test/bin/python tools/build_shared_arrays.py #     --options-store thetadata --universe-file tools/options_universe_top100.txt #     --ohlcv-provider FMPOHLCVProvider --interval 1d --start 2020-01-01 --end 2025-12-31 #     --warmup-days 60 --jobs 4
-# and run it TWICE: the second run must report 0 built / 98 opened before launching.
+# and run it TWICE: the second run must report 0 built / 97 opened before launching (97 since
+# SPCX left the universe on 2026-09-16).
 # BT_MAX_TASKS_PER_CHILD is raised from the handler default of 8: a recycle now costs a
 # re-OPEN of mapped files (ms), not a re-parse, but the projections are still rebuilt.
 set -euo pipefail

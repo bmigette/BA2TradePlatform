@@ -4,7 +4,9 @@ Everything needed to start, watch, stop and resume the grid without help. Run ev
 the repo root (`C:\Users\basti\Documents\dev\BA2TradePlatform`) in **Git Bash**.
 
 Last verified 2026-08-04 against app_version 2026.08.1014. Job counts and the pace figure are
-measured, not estimated (`--dry-run` per band; job 1 of the live run).
+measured, not estimated (`--dry-run` per band; job 1 of the live run). Worker defaults re-checked
+2026-09-26 (§2b, §3). To reproduce results from scratch (keys, hardware, data preparation, option
+grids), start at [REPRODUCE-BACKTESTS.md](REPRODUCE-BACKTESTS.md).
 
 ---
 
@@ -112,7 +114,7 @@ and use `grid_status.sh` rather than waiting on it.
 ## 2. Before you launch — three things that have each cost hours
 
 ### a. Push first. Always.
-`remote150` syncs by `git pull`. If the master's commit is not on `origin/dev`, the worker can
+The remote worker (`remote227` by default) syncs by `git pull`. If the master's commit is not on `origin/dev`, the worker can
 never reach that `app_version` and is retry-excluded **for the whole run**.
 
 ```bash
@@ -121,7 +123,9 @@ git push origin dev
 ```
 
 ### b. Confirm it is actually distributed
-`tools/grid_goal2020.sh` defaults `WORKERS=remote150` and prints its mode on line 1. The old
+`tools/grid_goal2020.sh` defaults `WORKERS=remote227` (changed from `remote150` on 2026-08-31) and
+`PARALLEL=0`, i.e. **remote-only, no local trial slots**; it prints its mode at launch.
+`PARALLEL=4` opts back into local slots, `WORKERS=remote150` selects the other worker. The old
 failure was silent: with no `--workers` the driver simply omits the flag, `worker_ids` stays NULL,
 and the handler keeps the local path **with no warning** — the only tell is the *absence* of a
 `DISTRIBUTED across` line. `grid_status.sh` now calls that out explicitly.
@@ -155,7 +159,8 @@ bash tools/grid_goal2020.sh --dry-run
 
 | var | default | meaning |
 |---|---|---|
-| `WORKERS` | `remote150` | comma-separated remote worker names; empty = local-only |
+| `WORKERS` | `remote227` | comma-separated remote worker names; empty = local-only |
+| `PARALLEL` | `0` | local trial slots passed to the driver as `--parallel`; 0 = remote-only |
 | `SPREAD_BPS_LARGE` | `3` | round-trip spread, large band |
 | `SPREAD_BPS_MID` | `10` | round-trip spread, mid band |
 | `SPREAD_BPS_SMALL` | `40` | round-trip spread, small band |
@@ -173,7 +178,7 @@ want:
 |---|---|---|
 | `--population N` | 40 (+bonus for FMPRating) | wider search; costs time linearly |
 | `--generations N` | 8 | ditto |
-| `--parallel N` | 4 | LOCAL trial slots. **Lower it, never raise it**, on a 64 GB box — ~2.5 GB per slot for light experts, and Senate-class trials are ~11-12 GB. |
+| `--parallel N` | set from `PARALLEL` (0) | LOCAL trial slots — prefer the `PARALLEL` env var, which the script already forwards. On a 64 GB box ~2.5-3.5 GB per slot for light experts on the LARGE band, but ~6.3 GB on mid and 7.4-13 GB (size on the peak) on small (measured 2026-08-20); Senate-class trials are ~11-12 GB. |
 | `--bands a,b` | all three | re-run one band only |
 | `--strategies S1,S3` | S1,S2,S3 | re-run specific strategies |
 
@@ -208,7 +213,7 @@ OPTS    1 row(s), 0 completed   (45 jobs total)
 | line | healthy | wrong |
 |---|---|---|
 | `RUN` | `script alive` | `PARTIAL` = the wrapper died; it will **not** advance to the next band. Stop and relaunch. |
-| `DIST` | `4 local + 6 remote` | `!! LOCAL-ONLY` = the remote worker is not helping |
+| `DIST` | `N local + M remote` (N is `PARALLEL`, 0 by default since 2026-08-31) | `!! LOCAL-ONLY` = the remote worker is not helping |
 | `GEN` | advances every ~20-50 min | frozen for hours = investigate |
 | `OPTS` | grows toward 45 completed | a `failed` row = read the log |
 
@@ -487,8 +492,15 @@ been (pinned by `tests/backtest/test_market_condition_all_off_matches_baseline.p
 
 ### Published snapshots — every universe symbol warmed, not every row usable
 
-Pin these. Window 2020-01-02..2025-12-31 (decision dates; the feature sessions they read run
-2019-12-31..2025-12-30), universe `tools/options_universe_top100.txt`:
+Pin these on the workstation that built them. Window 2020-01-02..2025-12-31 (decision dates; the feature sessions they read run
+2019-12-31..2025-12-30), universe `tools/options_universe_top100.txt`.
+
+> **Superseded for stage 1 (2026-09-26 note).** These digests predate the 2026-09-23 BT/live
+> option parity data repairs (CRWD, META<-FB, HON, NVS, SCCO). The stage-1 grid on remote227 has
+> run on `ohlcv-v1=ca4d65d4…` / `ta-structure-v1=2b6e8ca8…` since that relaunch (digests are per
+> host, see below). To reproduce a job, read the digests from that job's `strategy_optimizations`
+> config, not from this table. The 753-name stage-2 digests are listed in
+> [REPRODUCE-BACKTESTS.md](REPRODUCE-BACKTESTS.md#43-market-condition-manifests).
 
 | profile | digest | symbols the build warmed | symbols with recorded status exceptions |
 |---|---|---|---|
@@ -796,16 +808,15 @@ investigations.
 
 `tools/backup_dbs.py` copies the PROD trade DB, the DEV trade DB and the TEST/GA DB with SQLite's online-backup
 API (safe while the platforms and a GA write), `quick_check`s the copy, deflates it to
-`G:\Mon Driveackup\BA2\<prod|test>_<YYYY-MM-DD>.sqlite.zip`, and keeps the newest 7 per
+`G:\Mon Drive\backup\BA2\<prod|test>_<YYYY-MM-DD>.sqlite.zip`, and keeps the newest 7 per
 database. Windows Task Scheduler task **`BA2 DB Backup`** runs it daily at 00:00 as the
 interactive user (Google Drive's `G:` only exists in the logged-on session), 4 h limit, no
-overlapping instances. Log: `G:\Mon Driveackup\BA2ackup.log`. Measured 2026-09-15: prod
-411 MB -> 93 MB in 12 s. Manual run: `.venv\Scripts\python.exe toolsackup_dbs.py [--dry-run]`.
+overlapping instances. Log: `G:\Mon Drive\backup\BA2\backup.log`. Measured 2026-09-15: prod
+411 MB -> 93 MB in 12 s. Manual run: `.venv\Scripts\python.exe tools\backup_dbs.py [--dry-run]`.
 
 **Weekly remote pull (stage-1 isolated DB).** `tools/backup_remote_db.py` runs the same online
 backup + `quick_check` + zip ON remote227 (python3 over one ssh session, `nice`d so the grid is
-not disturbed), scp's it to `G:\Mon Driveackup\BA2
-emote227-stage1_<YYYY-MM-DD>.sqlite.zip`,
+not disturbed), scp's it to `G:\Mon Drive\backup\BA2\remote227-stage1_<YYYY-MM-DD>.sqlite.zip`,
 deletes the remote copy and keeps the newest 4. Task **`BA2 Remote DB Backup`**, Sunday 01:00,
 interactive user (needs the ssh key + G:). Stage-1 results live ONLY in that isolated DB
 (`/home/debian/ba2-grid/home/test/dl_forecasting.db`); nothing syncs them to the local test DB.
