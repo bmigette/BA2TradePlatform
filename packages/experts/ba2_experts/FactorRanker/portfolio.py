@@ -17,6 +17,9 @@ from ba2_common.core.TransactionHelper import TransactionHelper
 from ba2_common.core.types import (
     OrderDirection, OrderOpenType, OrderStatus, OrderType, TransactionStatus,
 )
+from ba2_common.core.share_grid import (
+    QUANTITY_EPSILON, WHOLE_SHARE, floor_to_unit, fractional_unit, is_whole_grid,
+)
 from ba2_common.logger import logger
 
 # Lightweight per-OPENED-transaction record carried in get_holdings()'s ``by_symbol``: just the
@@ -28,13 +31,24 @@ _OpenedTxn = namedtuple("_OpenedTxn", ["id", "open_price", "open_qty"])
 
 
 def rebalance_deltas(target_weights: Dict[str, float], held_shares: Dict[str, float],
-                     prices: Dict[str, float], equity: float) -> Dict[str, float]:
-    """Signed whole-share deltas to move from current holdings to target weights.
+                     prices: Dict[str, float], equity: float,
+                     quantity_units: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+    """Signed share deltas to move from current holdings to target weights.
 
     target_shares = floor(weight * equity / price); delta = target - held. Names
     held but absent from the target weight 0 (sold down). A held name we must exit
     but cannot price is still fully sold using its held quantity. Zero deltas are
     omitted from the result.
+
+    ``quantity_units`` is ``{symbol: grid step}`` from ``share_grid.fractional_unit``. A
+    symbol absent from it -- and every symbol when it is ``None``, which is every caller
+    before fractional support -- uses the whole-share grid through the SAME
+    ``math.floor`` as before, so an expert that has not opted in computes byte-identical
+    deltas. On a fractional grid the target is floored onto that grid instead, and a BUY
+    delta is floored onto it too (the held quantity can be off-grid -- DRIP pays odd
+    fractions -- and target-minus-held would otherwise carry that residue onto the wire).
+    A SELL is left exact: selling precisely what is held is always acceptable, and
+    rounding it could leave an unsellable crumb behind.
     """
     deltas: Dict[str, float] = {}
     # Iterate in a STABLE (sorted) order. A plain ``set`` union iterates in a
@@ -53,8 +67,21 @@ def rebalance_deltas(target_weights: Dict[str, float], held_shares: Dict[str, fl
             if s in held_shares and target_weights.get(s, 0.0) == 0.0:
                 deltas[s] = -float(held_shares[s])
             continue
-        target_shares = math.floor((target_weights.get(s, 0.0) * equity) / price)
-        delta = target_shares - float(held_shares.get(s, 0.0))
+        unit = (quantity_units or {}).get(s, WHOLE_SHARE)
+        if is_whole_grid(unit):
+            target_shares = math.floor((target_weights.get(s, 0.0) * equity) / price)
+            delta = target_shares - float(held_shares.get(s, 0.0))
+        else:
+            target_shares = floor_to_unit((target_weights.get(s, 0.0) * equity) / price, unit)
+            # Rounded to 10 decimals to strip the subtraction's own float noise, then a
+            # BUY is floored onto the grid; see the docstring for why a SELL is not.
+            delta = round(target_shares - float(held_shares.get(s, 0.0)), 10)
+            if delta > 0:
+                delta = floor_to_unit(delta, unit)
+            # A ledger that accrues fills with += can differ from the target by 1e-11 of a
+            # share. That is not a trade, and submitting it would be a broker rejection.
+            if abs(delta) <= QUANTITY_EPSILON:
+                delta = 0.0
         if delta != 0.0:
             deltas[s] = float(delta)
     return deltas
@@ -244,11 +271,18 @@ class FactorPortfolioManager:
         if equity is None:
             raise ValueError("FactorRanker: virtual balance (equity) not available for rebalance")
 
-        deltas = rebalance_deltas(target_weights, held, prices, equity)
+        quantity_units = self._quantity_units(symbols)
+        deltas = rebalance_deltas(target_weights, held, prices, equity,
+                                  quantity_units=quantity_units)
 
         submitted: List[TradingOrder] = []
         for sym, delta in deltas.items():
-            order = self._submit_delta(sym, int(delta), by_symbol.get(sym, []))
+            # ``int`` on the whole-share grid, exactly as before -- it truncates toward zero,
+            # which a sub-share residue on a whole-grid symbol has always relied on. A
+            # fractional delta is already on its grid and passes through unchanged.
+            unit = quantity_units.get(sym, WHOLE_SHARE)
+            qty = int(delta) if is_whole_grid(unit) else delta
+            order = self._submit_delta(sym, qty, by_symbol.get(sym, []))
             if order is not None:
                 submitted.append(order)
 
@@ -262,6 +296,38 @@ class FactorPortfolioManager:
             f"(equity={equity:.2f}, deltas={deltas})"
         )
         return submitted
+
+    def _quantity_units(self, symbols) -> Dict[str, float]:
+        """``{symbol: grid step}`` for a rebalance; ``{}`` (whole shares) unless opted in.
+
+        Reads the expert's ``allow_fractional_shares`` setting (default off) and, only when
+        it is on, asks the account ONCE for the whole basket -- the account caches the
+        broker's answer for a day, and the backtest account answers from disk. A symbol
+        the broker does not fractionalise, or has not said either way, is simply absent
+        and sizes in whole shares.
+        """
+        try:
+            allowed = bool(self.expert.get_setting_with_interface_default(
+                'allow_fractional_shares', log_warning=False))
+        except Exception:  # noqa: BLE001 -- a settings read must not break a rebalance
+            allowed = False
+        if not allowed or not symbols:
+            return {}
+        getter = getattr(self.account, 'get_fractionable', None)
+        if getter is None:
+            return {}
+        try:
+            flags = getter(list(symbols)) or {}
+        except Exception as e:  # noqa: BLE001 -- degrade to whole shares, never a fraction
+            logger.warning(f"FactorRanker: fractionability lookup failed ({e}); "
+                           f"rebalancing in whole shares")
+            return {}
+        units = {}
+        for symbol, flag in flags.items():
+            unit = fractional_unit(flag, allow_fractional=True)
+            if not is_whole_grid(unit):
+                units[symbol] = unit
+        return units
 
     # ------------------------------------------------------------------
     # Per-name EQUITY-loss stop (reuses risk_per_trade_pct)
@@ -372,14 +438,14 @@ class FactorPortfolioManager:
         stop = avg_cost - (equity * risk_pct / 100.0) / total_qty
         return stop if stop > 0 else None
 
-    def _submit_delta(self, symbol: str, delta: int, transactions: list) -> Optional[TradingOrder]:
+    def _submit_delta(self, symbol: str, delta: float, transactions: list) -> Optional[TradingOrder]:
         if delta > 0:
             return self._submit_buy(symbol, delta, transactions)
         if delta < 0:
             return self._submit_sell(symbol, -delta, transactions)
         return None
 
-    def _submit_buy(self, symbol: str, qty: int, transactions: list) -> Optional[TradingOrder]:
+    def _submit_buy(self, symbol: str, qty: float, transactions: list) -> Optional[TradingOrder]:
         if qty <= 0:
             return None
         entry_price = self.account.get_instrument_current_price(symbol)
@@ -473,7 +539,7 @@ class FactorPortfolioManager:
                     f"{leg.id} for {leg.symbol}: {e}", exc_info=True)
         return released
 
-    def _submit_sell(self, symbol: str, qty: int, transactions: list) -> Optional[TradingOrder]:
+    def _submit_sell(self, symbol: str, qty: float, transactions: list) -> Optional[TradingOrder]:
         if qty <= 0 or not transactions:
             return None
 

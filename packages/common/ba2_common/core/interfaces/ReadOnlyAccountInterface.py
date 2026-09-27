@@ -1,4 +1,5 @@
 import math
+import time
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, NamedTuple, Optional, List, Tuple
@@ -1163,6 +1164,110 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             leverage), which under-deploys rather than over-committing.
         """
         return {}
+
+    #: How long a MEASURED fractionability answer is reused, in seconds. A day, because a
+    #: broker changes a symbol's fractional eligibility rarely and never intraday in
+    #: practice, and the sizers ask on every entry. Matches Alpaca's own asset-cache TTL.
+    _FRACTIONABLE_CACHE_TTL = 24 * 60 * 60
+
+    #: How long an UNKNOWN (``None``) answer is reused. Short, deliberately: an unknown is
+    #: usually a transient lookup failure, and pinning it for a day would size a
+    #: fractionable symbol in whole shares until tomorrow. Short rather than zero so a
+    #: broker that is down is not re-asked on every order of a 50-symbol batch.
+    _FRACTIONABLE_UNKNOWN_TTL = 5 * 60
+
+    def get_fractionable(self, symbols: List[str]) -> Dict[str, Optional[bool]]:
+        """Whether the broker trades each symbol in fractional quantities. TRI-STATE.
+
+        ``True`` / ``False`` are the broker SAYING yes or no; ``None`` means it did not
+        say. Every requested (normalised) symbol is present in the result, and a caller
+        must treat ``None`` exactly as the share grid does -- as whole shares. Never read
+        it with ``bool()``: a fabricated ``False`` under-fills a fractionable symbol, and a
+        fabricated ``True`` sends a fraction the broker refuses.
+
+        CONCRETE and cached here for every broker, so an adapter only has to answer
+        ``get_symbol_margin_info`` -- the one cross-broker channel that already carries
+        ``MarginInfo.fractionable`` -- and gets the 24-hour cache for free. An adapter
+        with a cheaper or more authoritative source overrides ``_fetch_fractionable``
+        (the backtest account does: it reads a file on disk and never touches a network).
+
+        The cache is PER ACCOUNT INSTANCE: fractionability is an answer a specific broker
+        gives a specific account (the same ticker is fractionable at Alpaca and not at
+        IBKR), and account instances are themselves cached, so a live process asks each
+        broker about each symbol at most once a day.
+
+        Args:
+            symbols: symbols to describe; blanks dropped, case and whitespace normalised.
+
+        Returns:
+            Dict[str, Optional[bool]]: keyed by normalised symbol, one entry per symbol.
+        """
+        wanted = []
+        for raw in symbols or []:
+            symbol = (raw or '').strip().upper()
+            if symbol and symbol not in wanted:
+                wanted.append(symbol)
+        if not wanted:
+            return {}
+
+        # Built lazily and per instance, never as a class attribute: a dict declared on
+        # the CLASS would be one shared cache for every account, so Alpaca's answer about
+        # a symbol would be served to TastyTrade.
+        cache = self.__dict__.setdefault('_fractionable_cache', {})
+        now = time.monotonic()
+        out: Dict[str, Optional[bool]] = {}
+        stale: List[str] = []
+        for symbol in wanted:
+            entry = cache.get(symbol)
+            if entry is not None:
+                fetched_at, answer = entry
+                ttl = (self._FRACTIONABLE_CACHE_TTL if answer is not None
+                       else self._FRACTIONABLE_UNKNOWN_TTL)
+                if now - fetched_at < ttl:
+                    out[symbol] = answer
+                    continue
+            stale.append(symbol)
+
+        if stale:
+            try:
+                fetched = self._fetch_fractionable(stale)
+            except Exception as e:  # noqa: BLE001 -- sizing must degrade to whole shares
+                logger.warning(f"Fractionability lookup failed for {len(stale)} symbol(s) "
+                               f"on account {getattr(self, 'id', '?')}: {e}; sizing them in "
+                               f"whole shares")
+                fetched = {}
+            for symbol in stale:
+                answer = fetched.get(symbol)
+                # Only a real bool is an answer. Anything else -- None, a missing key, an
+                # adapter returning a truthy string -- is recorded as UNKNOWN.
+                if answer is not True and answer is not False:
+                    answer = None
+                cache[symbol] = (now, answer)
+                out[symbol] = answer
+        return out
+
+    def is_fractionable(self, symbol: str) -> Optional[bool]:
+        """Whether the broker trades ``symbol`` in fractional quantities. TRI-STATE.
+
+        The single-symbol form of ``get_fractionable``, sharing its 24-hour cache. Prefer
+        the batch form when sizing several symbols: a cold basket is then one broker
+        round-trip instead of one per symbol.
+        """
+        normalised = (symbol or '').strip().upper()
+        if not normalised:
+            return None
+        return self.get_fractionable([normalised]).get(normalised)
+
+    def _fetch_fractionable(self, symbols: List[str]) -> Dict[str, Optional[bool]]:
+        """UNCACHED lookup behind ``get_fractionable``. Override for a better source.
+
+        The default reads ``MarginInfo.fractionable`` off ``get_symbol_margin_info``, which
+        every adapter already implements for the allocator. A symbol the broker could not
+        describe is simply absent, and ``get_fractionable`` records that as unknown.
+        """
+        info = self.get_symbol_margin_info(list(symbols)) or {}
+        return {symbol: getattr(margin, 'fractionable', None)
+                for symbol, margin in info.items()}
 
     #: Upper bound on how stale a cached market-status answer may be, in seconds.
     #: A CLASS attribute so a bare instance built with object.__new__ (the test

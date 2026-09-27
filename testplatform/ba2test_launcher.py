@@ -267,7 +267,8 @@ def _cmd_prewarm(args) -> int:
         frozen_ttl_cache, _fmp_history_cache_dir, persist_empty_sentinel,
     )
     from app.services.prewarm_fetchers import (
-        PrewarmConfigError, PrewarmFetchers, prewarm_fred, resolve_keys, run_prewarm,
+        PrewarmConfigError, PrewarmFetchers, prewarm_fractionable, prewarm_fred, resolve_keys,
+        run_prewarm,
     )
 
     # ONE key resolver, shared with the API handler (env first, then the app-settings DB).
@@ -444,6 +445,15 @@ def _cmd_prewarm(args) -> int:
         fred_summary = prewarm_fred(args.fred_max_age_hours,
                                     log=lambda msg: print(msg, flush=True))
         print(f">> FRED macro series: {fred_summary}", flush=True)
+
+    # Fractional-share eligibility, for experts that opt in to allow_fractional_shares. ONE
+    # bulk broker call for the whole universe, skipped while the file is fresh, and never
+    # fatal: without it every symbol sizes in whole shares, the pre-feature behaviour. Run
+    # for every expert list rather than gated on one, because the classic risk manager
+    # sizes for all of them.
+    fractionable_summary = prewarm_fractionable(args.fractionable_max_age_hours,
+                                                log=lambda msg: print(msg, flush=True))
+    print(f">> fractionable map: {fractionable_summary}", flush=True)
 
     try:
         summary = run_prewarm(fetchers, experts, symbols, args.workers, end=end_date)
@@ -7489,6 +7499,10 @@ def main(argv: "list | None" = None) -> int:
                          "compute trader-skill scores for every trading day in [start, end] instead "
                          "of leaving them to lazy per-trial computation (see _do_senate_scores). "
                          "Ignored by the other experts.")
+    pw.add_argument("--fractionable-max-age-hours", type=float, default=24.0,
+                    help="Refresh the on-disk fractional-share eligibility map (one bulk Alpaca "
+                         "/v2/assets call) only when it is older than this (default 24h, the live "
+                         "account's cache TTL). Read by experts with allow_fractional_shares on.")
     pw.add_argument("--fred-max-age-hours", type=float, default=24.0,
                     help="Refresh a FRED macro series only when its cache file is older than "
                          "this (default 24h, matching the API handler). Only consumed when "

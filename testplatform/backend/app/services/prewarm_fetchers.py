@@ -37,7 +37,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +188,105 @@ def prewarm_fred(max_age_hours: float, *, log: Optional[Callable[[str], None]] =
             errors += 1
             complain(f"!! prewarm FRED {sid} failed: {redact(str(e))}")
     return {"refreshed": refreshed, "fresh": skipped, "errors": errors}
+
+
+#: Alpaca trading-API hosts, tried in order. ``/v2/assets`` returns the same eligibility
+#: data on both, but a key only authenticates against the host it was issued for, and the
+#: configured key may be either -- so a 401/403 from the live host is retried on paper.
+_ALPACA_ASSET_HOSTS = ("https://api.alpaca.markets", "https://paper-api.alpaca.markets")
+
+
+def resolve_alpaca_keys() -> Tuple[Optional[str], Optional[str]]:
+    """``(key, secret)`` for Alpaca: env first, then the app-settings DB.
+
+    The env names are the ones the options cache builder already reads; the settings rows
+    are the ones ``AlpacaOHLCVProvider`` uses. No new configuration is introduced.
+    """
+    def _setting(key: str) -> Optional[str]:
+        try:
+            from ba2_common.config import get_app_setting
+            return get_app_setting(key)
+        except Exception:  # noqa: BLE001 - no DB / no settings row: the env answer stands
+            return None
+
+    key = (os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+           or _setting("alpaca_api_key"))
+    secret = (os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET")
+              or os.getenv("APCA_API_SECRET_KEY") or _setting("alpaca_api_secret"))
+    return key, secret
+
+
+def fetch_alpaca_fractionable(key: str, secret: str, *, timeout: float = 60.0) -> Dict[str, bool]:
+    """``{SYMBOL: fractionable}`` for every active US equity Alpaca lists. ONE request.
+
+    ``/v2/assets`` returns the whole universe (~12k rows) in a single response, so this is
+    a bulk call rather than one per symbol -- cheap enough to run on every prewarm.
+
+    ``fractionable`` is a REQUIRED boolean on Alpaca's Asset, so every row carries a real
+    answer; a row without one (a future API change) is skipped rather than guessed.
+    """
+    import requests
+
+    headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+    params = {"status": "active", "asset_class": "us_equity"}
+    last_error: Optional[str] = None
+    for host in _ALPACA_ASSET_HOSTS:
+        resp = requests.get(f"{host}/v2/assets", headers=headers, params=params,
+                            timeout=timeout)
+        if resp.status_code in (401, 403):
+            last_error = f"{host} refused the key (HTTP {resp.status_code})"
+            continue
+        resp.raise_for_status()
+        out: Dict[str, bool] = {}
+        for row in resp.json() or []:
+            symbol = str(row.get("symbol") or "").strip().upper()
+            flag = row.get("fractionable")
+            if symbol and (flag is True or flag is False):
+                out[symbol] = flag
+        return out
+    raise PrewarmConfigError(f"Alpaca asset list unavailable: {last_error}")
+
+
+def prewarm_fractionable(max_age_hours: float, *, log: Optional[Callable[[str], None]] = None,
+                         warn: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """Refresh the on-disk fractional-share eligibility map backtests read.
+
+    Global, not per-symbol -- the whole US equity universe in one broker call -- so it runs
+    once per prewarm, like the FRED series, rather than entering the per-symbol work list.
+    Skipped when the file is younger than ``max_age_hours`` (24h by default, matching the
+    live account's cache TTL, so a backtest and a live expert see answers of the same age).
+
+    NOT FATAL. Only an expert that opted in to ``allow_fractional_shares`` reads this, and
+    without the file every symbol sizes in whole shares -- exactly the pre-feature
+    behaviour. So a missing key or a failed call is reported through ``warn`` and the rest
+    of the prewarm continues; it must not fail a 500-symbol FMP prewarm.
+
+    The file lands under CACHE_FOLDER, so remote workers receive it with the cache sync.
+    """
+    from ba2_common.core import fractionable_store
+
+    say = log if log is not None else logger.info
+    complain = warn if warn is not None else (log if log is not None else logger.warning)
+
+    age = fractionable_store.store_age_hours()
+    if age is not None and age < max_age_hours:
+        return {"fresh": True, "age_hours": round(age, 2)}
+
+    key, secret = resolve_alpaca_keys()
+    if not key or not secret:
+        msg = ("alpaca_api_key/alpaca_api_secret not configured (AppSetting or ALPACA_API_KEY"
+               "/ALPACA_SECRET_KEY); backtests will size every symbol in whole shares")
+        complain(f"!! prewarm fractionable: {msg}")
+        return {"error": msg}
+    try:
+        flags = fetch_alpaca_fractionable(key, secret)
+        written = fractionable_store.save_fractionable_map(flags, source="alpaca")
+    except Exception as e:  # noqa: BLE001 - never abort the prewarm over an optional input
+        complain(f"!! prewarm fractionable failed: {redact(str(e))}")
+        return {"error": redact(str(e))}
+    fractional = sum(1 for v in flags.values() if v)
+    say(f">> fractionable map: {written} symbols ({fractional} fractionable)")
+    return {"written": written, "fractionable": fractional}
 
 
 class PrewarmFetchers:
