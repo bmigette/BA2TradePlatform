@@ -479,7 +479,8 @@ class TradeRiskManagement:
         return (orders_to_update, orders_to_delete, symbol_prices,
                 total_virtual_balance, max_equity_per_instrument)
 
-    def size_candidate_orders(self, expert_instance_id: int, candidates):
+    def size_candidate_orders(self, expert_instance_id: int, candidates,
+                              option_decisions: Optional[List[Dict[str, Any]]] = None):
         """Size a list of IN-MEMORY candidate (TradingOrder, ExpertRecommendation) pairs and return
         the funded subset — the temp-order-list order flow.
 
@@ -499,14 +500,21 @@ class TradeRiskManagement:
         path — this IS the live enter path, so it is the one that must carry the "why did
         nothing trade today?" record, not just the DB path nothing on dev actually calls (see
         ``_record_candidate_run``).
+
+        ``option_decisions``: rows (``risk_manager_run.option_entry_decision``) for the
+        OPTION entries this pass already executed. They size and submit themselves and never
+        reach this sizing, but they are part of the same pass, so they are appended to its
+        run -- and recorded on their own when the pass had no equity candidate to size.
         """
         from ba2_common.core.instance_resolver import get_instance_resolver
 
         # Monotonic, so the recorded duration cannot jump if the wall clock is adjusted
         # mid-run. Taken before ANY work, matching review_and_prioritize_pending_orders.
         run_started_at = time.monotonic()
+        option_decisions = list(option_decisions or [])
 
         if not candidates:
+            self._record_option_only_run(expert_instance_id, option_decisions, run_started_at)
             return []
 
         expert = get_instance_resolver().get_expert_instance(expert_instance_id)
@@ -542,6 +550,7 @@ class TradeRiskManagement:
         for o in dropped_by_permission:
             self.logger.debug(f"candidate {o.symbol} {o.side} dropped by buy/sell permission filter")
         if not pairs:
+            self._record_option_only_run(expert_instance_id, option_decisions, run_started_at)
             return []
 
         run_record: Dict[str, Any] = {}
@@ -567,8 +576,32 @@ class TradeRiskManagement:
             traces=run_record.get("traces"),
             context=self._run_context_with_permissions(
                 run_record, enable_buy=enable_buy, enable_sell=enable_sell),
+            extra_decisions=option_decisions,
         )
         return funded
+
+    def _record_option_only_run(self, expert_instance_id: int,
+                                option_decisions: List[Dict[str, Any]],
+                                started_at: float) -> None:
+        """A classic run holding only this pass's option entries (no equity was sized).
+
+        Nothing when there are none: a pass with nothing to say writes no row, as before.
+        """
+        if not option_decisions:
+            return
+        try:
+            from ba2_common.core.trade_store import inmem_trades_active
+            if inmem_trades_active():
+                return
+            from ba2_common.core.risk_manager_run import MODE_CLASSIC, record_run
+            expert_instance = get_instance(ExpertInstance, expert_instance_id)
+            record_run(expert_instance_id=expert_instance_id,
+                       account_id=getattr(expert_instance, "account_id", None),
+                       mode=MODE_CLASSIC, decisions=option_decisions,
+                       context={"option_entries_only": True}, started_at=started_at)
+        except Exception as e:  # noqa: BLE001 -- observability must not fail the pass
+            self.logger.warning(f"Failed to record the option entries of expert "
+                                f"{expert_instance_id}'s pass: {e}")
 
     def _get_pending_orders_for_review(self, expert_instance_id: int) -> List[TradingOrder]:
         """Get all pending orders for an expert (RM-2: single JOIN, no N+1)."""
@@ -1059,7 +1092,7 @@ class TradeRiskManagement:
     def _record_candidate_run(self, *, expert_instance_id, account_id, started_at,
                               candidates, dropped_by_permission,
                               orders_to_update, orders_to_delete, symbol_prices,
-                              context, traces=None) -> None:
+                              context, traces=None, extra_decisions=None) -> None:
         """The in-memory-candidate twin of ``_record_classic_run``.
 
         ``size_candidate_orders`` (the LIVE enter path) never persists a qty=0 order — that
@@ -1100,6 +1133,9 @@ class TradeRiskManagement:
                 prices=symbol_prices or {},
                 cap=context.get("max_per_instrument"),
                 traces=traces)
+            # The pass's option entries (sized by their own actions), after the ranked
+            # equity rows: they carry no rank, so the funding order above is untouched.
+            decisions = list(decisions) + list(extra_decisions or [])
 
             record_run(expert_instance_id=expert_instance_id, account_id=account_id,
                        mode=MODE_CLASSIC, decisions=decisions, context=context,

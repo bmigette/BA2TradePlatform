@@ -2423,6 +2423,36 @@ class TradeManager:
             return nullcontext()
         return capture_scope(store, meta)
 
+    def _option_entry_decisions(self, expert, expert_instance_id: int, symbol: str,
+                                results) -> list:
+        """Run-record rows for a classic-mode expert's option ENTRY results.
+
+        ``[]`` for an expert on the option risk manager (``classic_options``): that manager
+        journals the same entries into its own ``options`` run, and recording them here too
+        would show every entry twice. Never raises -- the record is observability, and the
+        entries it describes have already been sent.
+        """
+        try:
+            from ba2_common.core.OptionRiskManagement import option_risk_manager_enabled
+            from ba2_common.core.risk_manager_run import option_entry_decision
+            from .types import get_option_entry_action_values
+
+            if option_risk_manager_enabled(getattr(expert, "settings", None),
+                                           expert_instance_id=expert_instance_id):
+                return []
+            entry_values = set(get_option_entry_action_values())
+            rows = []
+            for result in results or []:
+                action_type = result.get("action_type")
+                value = getattr(action_type, "value", action_type)
+                if value in entry_values:
+                    rows.append(option_entry_decision(symbol, result))
+            return rows
+        except Exception as e:  # noqa: BLE001 -- see the docstring
+            self.logger.warning(f"Could not record the option entries for {symbol} "
+                                f"(expert {expert_instance_id}): {e}")
+            return []
+
     def process_expert_recommendations_after_analysis(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
         """Process enter_market recommendations inside ONE market-condition decision scope.
 
@@ -2485,6 +2515,9 @@ class TradeManager:
         # rec, size them ALL in one in-memory RM pass, then persist + submit ONLY the funded ones.
         # Each entry: (transient_candidate_order, evaluator, recommendation).
         entry_candidates = []
+        # Run-record rows for the OPTION entries this pass executes (they size and submit
+        # themselves); appended to the classic run below. See _option_entry_decisions.
+        option_decisions = []
 
         try:
             self.logger.debug(f"Acquired processing lock for expert {expert_instance_id} (enter_market)")
@@ -2711,13 +2744,16 @@ class TradeManager:
                             # never reach the equity RM below: it re-labels the contracts as
                             # shares and stages a STOCK safeguard stop at the broker (8082,
                             # 2026-09-24: SELL 9 GILD @ 138.56 behind a 2-contract call).
-                            for result in evaluator.execute(submit_to_broker=True):
+                            option_results = evaluator.execute(submit_to_broker=True)
+                            for result in option_results:
                                 if result.get("success"):
                                     oid = (result.get("data") or {}).get("order_id")
                                     if oid:
                                         order = get_instance(TradingOrder, oid)
                                         if order:
                                             created_orders.append(order)
+                            option_decisions.extend(self._option_entry_decisions(
+                                expert, expert_instance_id, recommendation.symbol, option_results))
                             continue
 
                         # TEMP-ORDER-LIST FLOW: do NOT execute (persist) yet. Stage a TRANSIENT
@@ -2740,13 +2776,21 @@ class TradeManager:
                 # delete unfunded). The funded set + quantities are identical to the old DB path
                 # (size_candidate_orders == review_and_prioritize_pending_orders; proven by tests).
                 submitted_count = 0
+                if option_decisions and not entry_candidates:
+                    # Nothing to size, but the option entries still get their run record.
+                    from .TradeRiskManagement import get_risk_management
+                    get_risk_management().size_candidate_orders(
+                        expert_instance_id, [], option_decisions=option_decisions)
                 if entry_candidates and allow_automated_trade_opening:
                     self.logger.info(f"Sizing {len(entry_candidates)} entry candidate(s) for expert {expert_instance_id}")
                     try:
                         from .TradeRiskManagement import get_risk_management
                         risk_management = get_risk_management()
+                        # option_decisions only when there are some: an equity-only pass
+                        # makes exactly the call it always made.
                         funded = risk_management.size_candidate_orders(
-                            expert_instance_id, [(c, rec) for (c, _e, rec) in entry_candidates])
+                            expert_instance_id, [(c, rec) for (c, _e, rec) in entry_candidates],
+                            **({"option_decisions": option_decisions} if option_decisions else {}))
                         funded_by_symbol = {o.symbol: o for o in funded}
                         self.logger.info(f"RM funded {len(funded)} of {len(entry_candidates)} candidate(s)")
 
