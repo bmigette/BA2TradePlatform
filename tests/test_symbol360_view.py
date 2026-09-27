@@ -340,8 +340,8 @@ def test_build_summary_end_to_end():
         "header": {"quote": {"price": 190.0, "changesPercentage": 1.25},
                    "profile": {"companyName": "Apple Inc.", "sector": "Technology"}},
         "weinstein": {"stage": 2},
-        "detscorer": _ds(dist=0.1, mom=0.4, rsi=60, roe=0.3, fscore=8, z=5.0,
-                         ey=0.05, value_norm=-0.3, regime=0.2),
+        "detscorer": {"summary": _ds(dist=0.1, mom=0.4, rsi=60, roe=0.3, fscore=8, z=5.0,
+                                     ey=0.05, value_norm=-0.3, regime=0.2)},
         "analyst": {"fmp": _fmp(analyst_count=20, buy=15, hold=5, target_consensus=215.0)},
         "earnings": _export({"evaluation": {"surprise_pct": 4.0, "days_since_report": 20}}),
         "insider": _export({"cluster": {"is_cluster": False, "buyer_count": 0}}),
@@ -370,7 +370,8 @@ def test_one_card_that_cannot_be_built_costs_that_card_not_the_page(monkeypatch)
     monkeypatch.setattr(v, "build_fundamentals_card", _boom)
 
     _, cards, _, overall = v.build_summary(
-        "AAPL", {"detscorer": _ds(dist=0.1, rsi=50), "weinstein": {"stage": 2}}, TODAY)
+        "AAPL", {"detscorer": {"summary": _ds(dist=0.1, rsi=50)}, "weinstein": {"stage": 2}},
+        TODAY)
 
     by_key = {c.key: c for c in cards}
     assert "AttributeError" in by_key["fundamentals"].unavailable
@@ -450,3 +451,94 @@ def test_an_unmeasured_factor_leg_is_omitted():
 def test_no_factor_data_abstains():
     assert v.build_factors_card(None).verdict is None
     assert v.build_factors_card(_factors()).unavailable
+
+
+# ---------------------------------------------------------------------------
+# A young listing: the scorer's history gate must not blank the DS cards
+# ---------------------------------------------------------------------------
+
+def test_a_skip_says_which_gate_skipped_it():
+    export = _export(skipped=True)
+    export.metrics = [SimpleNamespace(label="Skipped", value="insufficient_history")]
+
+    card = v.build_fundamentals_card(export)
+
+    assert card.unavailable == "Skipped by the expert (insufficient history)"
+
+
+def test_the_relaxed_run_feeds_the_cards_and_the_trend_card_says_so():
+    results = {"detscorer": {"export": _export(skipped=True),
+                             "summary": _ds(dist=0.1, roe=0.3, fscore=8),
+                             "short_history_min": 260}}
+
+    _, cards, _, _ = v.build_summary("NEWCO", results, TODAY)
+
+    by_key = {c.key: c for c in cards}
+    assert by_key["fundamentals"].verdict == v.STRONG_BUY
+    assert "260" in by_key["trend"].note
+    assert by_key["valuation"].note is None
+
+
+def test_a_full_history_run_carries_no_note():
+    _, cards, _, _ = v.build_summary(
+        "AAPL", {"detscorer": {"summary": _ds(dist=0.1), "short_history_min": None}}, TODAY)
+
+    assert cards[0].note is None
+
+
+# ---------------------------------------------------------------------------
+# Earnings from the calendar, not only the PEAD expert's drift window
+# ---------------------------------------------------------------------------
+
+def _q(day, eps, est, surprise, time=None):
+    return {"report_date": day, "reported_eps": eps, "estimated_eps": est,
+            "surprise_percent": surprise, "time": time}
+
+
+def test_an_old_report_still_fills_the_card_outside_the_drift_window():
+    """The PEAD expert knows no earnings outside its window (its live path fetches
+    nothing there). The card reads the calendar instead."""
+    history = {"rows": [_q("2026-11-05", 0, 1.2, None, "amc"),       # scheduled
+                        _q("2026-07-30", 1.10, 1.00, 10.0),
+                        _q("2026-04-30", 1.00, 0.95, 5.3),
+                        _q("2026-01-29", 0.90, 0.92, -2.2),
+                        _q("2025-10-30", 0.95, 0.90, 5.6)]}
+    no_window = _export({"evaluation": {"is_signal": False, "surprise_pct": None}})
+
+    card = v.build_earnings_card(no_window, history, TODAY)
+
+    texts = [ln.text for ln in card.lines]
+    assert texts[0].startswith("Beat estimates by 10.0% last quarter")
+    assert "Beat estimates in 3 of the last 4 quarters" in texts
+    facts = dict(card.facts)
+    assert facts["Next report"].startswith("2026-11-05")
+    assert "after the close" in facts["Next report"]
+    assert card.tables[0].rows[0][0] == "2026-07-30"
+    assert card.verdict == v.STRONG_BUY
+
+
+def test_a_zero_eps_placeholder_is_not_a_reported_quarter():
+    """FMP's EPS fields read 0 when there is no number; only a computable surprise
+    makes a quarter a reported one."""
+    history = {"rows": [_q("2026-08-01", 0, 0, None), _q("2026-05-01", 1.0, 1.1, -9.1)]}
+
+    card = v.build_earnings_card(None, history, TODAY)
+
+    assert card.lines[0].text.startswith("Missed estimates by 9.1%")
+    assert len(card.tables[0].rows) == 1
+
+
+def test_a_miss_heavy_record_is_bad():
+    history = {"rows": [_q(f"202{y}-0{m}-15", 1, 1, s) for (y, m, s) in
+                        [(6, 7, 1.0), (6, 4, -3.0), (6, 1, -4.0), (5, 7, -1.0)]]}
+
+    card = v.build_earnings_card(None, history, TODAY)
+
+    assert "Missed estimates in 3 of the last 4 quarters" in [ln.text for ln in card.lines]
+
+
+def test_no_reports_names_the_next_date():
+    card = v.build_earnings_card(None, {"rows": [_q("2026-10-20", 0, 1, None)]}, TODAY)
+
+    assert card.verdict is None
+    assert card.unavailable.endswith("next report 2026-10-20")

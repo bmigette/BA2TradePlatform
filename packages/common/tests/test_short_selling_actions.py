@@ -783,28 +783,35 @@ class TestPartialCloseRefusals:
         assert _sell(account).execute()["success"] is True
         assert account.closed == [txn_id]
 
-    def test_a_fractional_position_refuses_a_partial_close(self, world):
+    def test_a_fractional_position_partially_closes_the_exact_fraction(self, world):
+        """Refused until 2026-09-27 because the trim re-armed a fractional OCO a broker
+        refuses. Fractional sizing now only applies to experts that arm NO protective
+        orders (share_grid "NO FRACTIONS UNDER PROTECTIVE ORDERS"), so the exact slice
+        is sold -- a whole-share floor would strand a crumb that can never be closed."""
         txn_id, account = self._long(world, 10.5)
         action = _sell(account)
         action.close_percent = 50
         result = action.execute()
-        assert result["success"] is False and "fractional" in result["message"]
-        assert account.closed == [] and account.reduced == []
+        assert result["success"] is True
+        assert account.reduced == [(txn_id, pytest.approx(5.25))]
 
     def test_a_fractional_position_still_closes_in_full(self, world):
         txn_id, account = self._long(world, 10.5)
         assert _sell(account).execute()["success"] is True
         assert account.closed == [txn_id]
 
-    def test_one_fractional_lot_refuses_even_when_the_total_is_whole(self, world):
+    def test_fractional_lots_with_a_whole_total_close_fifo_on_the_whole_share_rule(self, world):
         world.configure(True)
-        _hold(OrderDirection.BUY, 4.5)
-        _hold(OrderDirection.BUY, 5.5)
+        a = _hold(OrderDirection.BUY, 4.5)
+        b = _hold(OrderDirection.BUY, 5.5)
         account = _StubAccount([{"symbol": SYMBOL, "qty": 10.0}])
         action = _sell(account)
         action.close_percent = 50
         result = action.execute()
-        assert result["success"] is False and "fractional" in result["message"]
+        assert result["success"] is True
+        # 50% of the whole 10 held = 5: the oldest 4.5 lot closes, 0.5 comes off the next.
+        assert account.closed == [a]
+        assert account.reduced == [(b, pytest.approx(0.5))]
 
     def test_the_float_floor_edge(self, world):
         """375 x 18.4 / 100 is 68.99999999999999 in binary: 18.4% of 375 must sell 69, not 68."""

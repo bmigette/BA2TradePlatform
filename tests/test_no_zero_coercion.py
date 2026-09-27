@@ -388,7 +388,7 @@ ALLOWLIST: dict = {
     "packages/experts/ba2_experts/settings_io.py:210":
         "settings IMPORT default matching the NOT NULL column default; an export of a 0% sleeve "
         "carries the key explicitly, so this only fires on a pre-field export",
-    "packages/common/ba2_common/core/TradeActions.py:2203":
+    "packages/common/ba2_common/core/TradeActions.py:2206":
         "10.0 is the documented default of the max_virtual_equity_per_instrument_percent "
         "SETTING, a configured cap rather than a measurement of anything "
         "(was :1529 before the ARC gate added lines above it; :1532 before the Phase-2a "
@@ -419,7 +419,8 @@ ALLOWLIST: dict = {
         "direction moved to _position_is_long (+9); :2135 after the close percent + permission "
         "matrix (_close_own_position, buying_enabled) rewrote SellAction/BuyAction above it; :2197 "
         "after the be1a0aab review fixes (partial-close refusals, FIFO plan) grew them; :2203 "
-        "after refusals gained closed_transaction_ids",
+        "after refusals gained closed_transaction_ids; :2206 after fractional partial "
+        "closes replaced the whole-share floor above it (+3)",
     "testplatform/backend/app/services/backtest/parity_harness.py:223":
         "parity HARNESS synthesising a stub bar; 100.0 is an arbitrary fixture price and the "
         "double 'or 100.0' says so",
@@ -450,7 +451,7 @@ BASELINE: dict = {
     # ``_build_structure`` into ba2_common.core.OptionRiskManagement (the shared sleeve
     # reader, listed below at the same count), and the service now delegates.
     "ba2_trade_platform/core/portfolio_allocation_service.py": 3,
-    "ba2_trade_platform/modules/accounts/AlpacaAccount.py": 11,
+    "ba2_trade_platform/modules/accounts/AlpacaAccount.py": 9,
     # IBKRAccount.py LEFT the register 2026-09-08: both of its coercions lived in
     # ``get_cash_balance``/``get_buying_power``, two callerless readers that fabricated
     # 0.0 on error. They were deleted (``get_buying_power`` had also started shadowing
@@ -503,7 +504,7 @@ BASELINE: dict = {
     # 0 entry would be a row claiming "this file is fine", which is the one thing BASELINE
     # must never say. Debt paid off leaves the register entirely.
 }
-BASELINE_TOTAL = 168
+BASELINE_TOTAL = 166
 
 
 # =========================================================================== #

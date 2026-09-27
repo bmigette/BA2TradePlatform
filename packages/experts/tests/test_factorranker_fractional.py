@@ -55,11 +55,12 @@ def test_a_sell_is_left_exact():
     assert out == {"AAA": -3.14159}
 
 
-def _manager(allowed, flags):
+def _manager(allowed, flags, risk_pct=0.0):
     mgr = object.__new__(FactorPortfolioManager)
+    mgr.expert_instance_id = 7
+    settings = {"allow_fractional_shares": allowed, "risk_per_trade_pct": risk_pct}
     mgr.expert = SimpleNamespace(
-        get_setting_with_interface_default=lambda key, log_warning=False:
-            allowed if key == "allow_fractional_shares" else None)
+        get_setting_with_interface_default=lambda key, log_warning=False: settings.get(key))
     calls = []
     mgr.account = SimpleNamespace(
         get_fractionable=lambda symbols: calls.append(list(symbols)) or
@@ -90,3 +91,19 @@ def test_a_lookup_failure_rebalances_in_whole_shares():
     mgr.account.get_fractionable = _boom
 
     assert mgr._quantity_units(["AAA"]) == {}
+
+
+def test_the_resting_stop_wins_over_the_setting():
+    """With risk_per_trade_pct > 0 every held name rests a protective stop, which a
+    broker cannot place on a fraction -- so the rebalance stays in whole shares and
+    never asks the broker."""
+    mgr, calls = _manager(True, {"AAA": True}, risk_pct=1.0)
+
+    assert mgr._quantity_units(["AAA"]) == {}
+    assert calls == []
+
+
+def test_with_the_stop_off_the_setting_applies():
+    mgr, _ = _manager(True, {"AAA": True}, risk_pct=0.0)
+
+    assert mgr._quantity_units(["AAA"]) == {"AAA": 0.0001}

@@ -99,6 +99,8 @@ class SummaryCard:
     votes: bool = True
     #: Why the card has nothing to say -- a missing key, a failed fetch, no coverage.
     unavailable: Optional[str] = None
+    #: A caveat shown under the lines (e.g. "judged on a short price history").
+    note: Optional[str] = None
 
     @property
     def verdict(self) -> Optional[str]:
@@ -226,7 +228,11 @@ def _unavailable(export) -> Optional[str]:
         first = str(error).splitlines()[0]
         return f"Unavailable: {first[:140]}"
     if getattr(export, "skipped", False):
-        return "Skipped by the expert (e.g. not enough history or coverage)"
+        reasons = [str(m.value) for m in (getattr(export, "metrics", None) or [])
+                   if getattr(m, "label", None) == "Skipped" and m.value]
+        if reasons:
+            return f"Skipped by the expert ({reasons[0].replace('_', ' ')})"
+        return "Skipped by the expert"
     return None
 
 
@@ -271,8 +277,17 @@ BREAKOUT_BAND = 0.5
 
 
 def build_trend_card(ds_export, weinstein: Optional[Dict[str, Any]],
-                     quote: Optional[Dict[str, Any]]) -> SummaryCard:
+                     quote: Optional[Dict[str, Any]], *,
+                     short_history_min: Optional[int] = None) -> SummaryCard:
+    """``short_history_min``: set when the scorer skipped this symbol for having fewer
+    than that many daily bars and the page re-ran it with the gate lifted (see the
+    page's ``_fetch_detscorer``). The readings shown are real; the ones that need the
+    longer history are simply absent, and the note says so."""
     card = SummaryCard("trend", "Trend & Momentum")
+    if short_history_min:
+        card.note = (f"Young listing: under {short_history_min} trading days of history, "
+                     f"which the scorer itself would skip. Readings that need a longer "
+                     f"history are left out.")
     tech = (_raw(ds_export).get("technical") or {}) if _unavailable(ds_export) is None else {}
     comps = tech.get("components") or {}
     period = int((getattr(ds_export, "settings_used", None) or {}).get("sma_trend_period", 200))
@@ -560,14 +575,68 @@ def build_analyst_card(analyst: Optional[Dict[str, Any]],
 SURPRISE_BAND_PCT = 2.0
 
 
-def build_earnings_card(earnings_export) -> SummaryCard:
+#: A quarter is a beat/miss record only once this many reported quarters are known.
+BEAT_RECORD_MIN_QUARTERS = 4
+BEAT_SHARE_GOOD = 0.75
+MISS_SHARE_BAD = 0.5
+_SESSION = {"bmo": "before the open", "amc": "after the close"}
+
+
+def _row_date(row: Dict[str, Any]) -> Optional[date]:
+    raw = row.get("report_date") or row.get("fiscal_date_ending")
+    try:
+        return datetime.fromisoformat(str(raw).split("T")[0]).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _split_earnings(rows: Sequence[Dict[str, Any]], today: date
+                    ) -> Tuple[List[Tuple[date, Dict[str, Any]]], Optional[Tuple[date, Dict[str, Any]]]]:
+    """``(reported quarters newest first, next scheduled report)``.
+
+    The provider's EPS fields read 0 when FMP has no number, so a quarter counts as
+    REPORTED only when its surprise was computable (``surprise_percent`` not None) --
+    never from ``reported_eps`` alone. A dated row after ``today`` is a scheduled report.
+    """
+    reported, upcoming = [], []
+    for row in rows or []:
+        d = _row_date(row)
+        if d is None:
+            continue
+        if d > today:
+            upcoming.append((d, row))
+        elif _num(row.get("surprise_percent")) is not None:
+            reported.append((d, row))
+    reported.sort(key=lambda t: t[0], reverse=True)
+    return reported, (min(upcoming, key=lambda t: t[0]) if upcoming else None)
+
+
+def build_earnings_card(earnings_export, history: Optional[Dict[str, Any]] = None,
+                        today: Optional[date] = None) -> SummaryCard:
+    """The last report, the beat record and the next date.
+
+    ``history`` is the page's own read of the quarterly earnings calendar. The PEAD
+    expert's export alone cannot fill this card: its live path deliberately fetches
+    nothing when no report falls inside its drift window, so outside that window it
+    knows no earnings at all. The expert still says whether the drift window is open.
+    """
     card = SummaryCard("earnings", "Earnings")
-    if _unavailable(earnings_export) is not None:
-        card.unavailable = _unavailable(earnings_export)
-        return card
-    ev = _raw(earnings_export).get("evaluation") or {}
-    surprise = _num(ev.get("surprise_pct"))
-    days = ev.get("days_since_report")
+    today = today or date.today()
+    ev = ((_raw(earnings_export).get("evaluation") or {})
+          if _unavailable(earnings_export) is None else {})
+    reported, upcoming = _split_earnings((history or {}).get("rows") or [], today)
+
+    if reported:
+        d, row = reported[0]
+        surprise = _num(row.get("surprise_percent"))
+        latest = {"report_date": d.isoformat(), "days_since_report": (today - d).days,
+                  "surprise_pct": surprise, "reported_eps": row.get("reported_eps"),
+                  "estimated_eps": row.get("estimated_eps")}
+    else:
+        latest = ev
+
+    surprise = _num(latest.get("surprise_pct"))
+    days = latest.get("days_since_report")
     when = f" ({days} days ago)" if isinstance(days, int) else ""
     if surprise is not None:
         if surprise >= SURPRISE_BAND_PCT:
@@ -576,21 +645,49 @@ def build_earnings_card(earnings_export) -> SummaryCard:
             card.lines.append(Line(BAD, f"Missed estimates by {abs(surprise):.1f}% last quarter{when}"))
         else:
             card.lines.append(Line(NEUTRAL, f"Results in line with estimates{when}"))
+
+    record = reported[:8]
+    if len(record) >= BEAT_RECORD_MIN_QUARTERS:
+        beats = sum(1 for _, r in record if _num(r.get("surprise_percent")) > 0)
+        misses = sum(1 for _, r in record if _num(r.get("surprise_percent")) < 0)
+        n = len(record)
+        if beats / n >= BEAT_SHARE_GOOD:
+            card.lines.append(Line(GOOD, f"Beat estimates in {beats} of the last {n} quarters"))
+        elif misses / n >= MISS_SHARE_BAD:
+            card.lines.append(Line(BAD, f"Missed estimates in {misses} of the last {n} quarters"))
+        else:
+            card.lines.append(Line(NEUTRAL, f"Mixed record: {beats} beats, {misses} misses "
+                                            f"in the last {n} quarters"))
+
     if ev.get("is_signal") is True:
         card.lines.append(Line(GOOD, "Still inside the post-earnings drift window"))
 
-    for label, key, fmt in (("Report date", "report_date", str),
+    if upcoming:
+        d, row = upcoming
+        session = _SESSION.get(str(row.get("time") or "").lower())
+        card.facts.append(("Next report", f"{d.isoformat()} (in {(d - today).days} days"
+                                          f"{', ' + session if session else ''})"))
+    for label, key, fmt in (("Last report date", "report_date", str),
                             ("Reported EPS", "reported_eps", lambda v: f"{float(v):.2f}"),
                             ("Estimated EPS", "estimated_eps", lambda v: f"{float(v):.2f}"),
                             ("Surprise", "surprise_pct", lambda v: _pct(float(v)))):
-        v = ev.get(key)
+        v = latest.get(key)
         if v is not None:
             try:
                 card.facts.append((label, fmt(v)))
             except (TypeError, ValueError):
                 pass
+    if record:
+        card.tables.append(DetailTable(
+            "Earnings history", ["Date", "EPS", "Estimate", "Surprise"],
+            [[d.isoformat(), f"{float(r['reported_eps']):.2f}",
+              f"{float(r['estimated_eps']):.2f}", _pct(_num(r.get("surprise_percent")))]
+             for d, r in record]))
+
     if not card.lines:
-        card.unavailable = "No recent earnings report"
+        why = ("No reported earnings on record" if history
+               else _unavailable(earnings_export) or "No reported earnings on record")
+        card.unavailable = why + (f" — next report {upcoming[0].isoformat()}" if upcoming else "")
     return card
 
 
@@ -821,17 +918,21 @@ def build_summary(symbol: str, results: Dict[str, Any], today: date
     header_raw = results.get("header") or {}
     quote = header_raw.get("quote") or (results.get("rvol") or {}).get("quote") or {}
     price = _num(quote.get("price"))
-    ds = results.get("detscorer")
+    ds_result = results.get("detscorer") or {}
+    ds = ds_result.get("summary")
+    short_min = ds_result.get("short_history_min")
 
     cards = [
-        _isolated("trend", "Trend & Momentum", build_trend_card,
+        _isolated("trend", "Trend & Momentum",
+                  lambda *a: build_trend_card(*a, short_history_min=short_min),
                   ds, results.get("weinstein"), quote),
         _isolated("fundamentals", "Fundamentals & Health", build_fundamentals_card, ds),
         _isolated("valuation", "Valuation & Growth", build_valuation_card, ds, quote),
         _isolated("factors", "Momentum, Value & Quality factors", build_factors_card,
                   results.get("factors")),
         _isolated("analysts", "Analysts", build_analyst_card, results.get("analyst"), price),
-        _isolated("earnings", "Earnings", build_earnings_card, results.get("earnings")),
+        _isolated("earnings", "Earnings", build_earnings_card,
+                  results.get("earnings"), results.get("earnings_history"), today),
         _isolated("insiders", "Insiders & Congress", build_insider_card,
                   results.get("insider"), results.get("congress"), today),
     ]

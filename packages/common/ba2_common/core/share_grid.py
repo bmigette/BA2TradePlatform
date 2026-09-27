@@ -28,6 +28,21 @@ With no published ``min_trade_increment``, the fractional step is
 increment a supported broker uses (Alpaca accepts 9 decimals, TastyTrade 5), so a
 quantity on the 4-decimal grid is always also on the broker's own -- which is what lets a
 sizer that has only the fractionable FLAG (not the increment) use it without asking.
+
+NO FRACTIONS UNDER PROTECTIVE ORDERS
+------------------------------------
+A fractional position cannot carry a protective leg of the same size. Alpaca accepts a
+fraction only on a DAY market/limit/stop/stop-limit order and refuses it on every
+complex order (OCO / bracket / OTO), which is how a TP+SL pair is placed. So a
+fractional position's OCO is rejected outright, and a lone fractional stop expires at
+the close. Nothing re-arms an expired leg, so either way the position would be left
+partly or wholly unprotected.
+
+So ``allow_fractional_shares`` only takes effect for an expert that arms NO protective
+orders. An expert that does (the classic risk manager always attaches a stop-loss;
+FactorRanker rests one whenever ``risk_per_trade_pct`` > 0) ignores the setting, logs
+``PROTECTIVE_ORDERS_BLOCK_FRACTIONAL`` and sizes in whole shares -- exactly as it did
+before the setting existed.
 """
 from __future__ import annotations
 
@@ -48,6 +63,13 @@ WHOLE_SHARE = 1.0
 
 #: The fractional grid step when the broker published none.
 DEFAULT_FRACTIONAL_UNIT = 10.0 ** -DEFAULT_FRACTIONAL_DECIMALS
+
+#: Why an expert that arms protective orders ignores ``allow_fractional_shares``
+#: (see "NO FRACTIONS UNDER PROTECTIVE ORDERS" above).
+PROTECTIVE_ORDERS_BLOCK_FRACTIONAL = (
+    "brokers do not accept a fractional quantity on a protective OCO/TP/SL order "
+    "(Alpaca: no fractional OCO/bracket/OTO; a fractional stop is DAY-only and expires), "
+    "so the stop could not match the position")
 
 
 def fractional_unit(fractionable: Optional[bool], *, allow_fractional: bool,

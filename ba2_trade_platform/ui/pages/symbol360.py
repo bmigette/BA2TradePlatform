@@ -195,6 +195,52 @@ def _fetch_factors(symbol: str) -> Optional[Dict[str, Any]]:
     }
 
 
+#: DeterministicScorer's skip reason for a symbol with fewer bars than min_history_days.
+_DS_SHORT_HISTORY = "insufficient_history"
+
+
+def _fetch_detscorer(symbol: str, overrides: Dict[str, Any]) -> Dict[str, Any]:
+    """DeterministicScorer's export, plus what the summary cards should read.
+
+    ``min_history_days`` (260) is a trading gate: the scorer will not score a young
+    listing. It also blanks all three DS cards at once, although fundamentals need no
+    price history and ``technical_score`` already omits each leg it lacks the bars
+    for. So when -- and only when -- that gate is why it skipped, the summary cards
+    get a second run with the gate lifted. The Advanced panel keeps the expert's own
+    verdict (``export``).
+    """
+    export = DeterministicScorer.export_symbol_data(symbol, overrides=overrides)
+    out: Dict[str, Any] = {"export": export, "summary": export, "short_history_min": None}
+    if export.skipped and any(getattr(m, "value", None) == _DS_SHORT_HISTORY
+                              for m in export.metrics or []):
+        relaxed = DeterministicScorer.export_symbol_data(
+            symbol, overrides={**overrides, "min_history_days": 1})
+        if relaxed.error is None and not relaxed.skipped:
+            out["summary"] = relaxed
+            out["short_history_min"] = int(export.settings_used["min_history_days"])
+    return out
+
+
+#: Quarters of earnings history shown, and how far ahead the calendar is read so the
+#: next SCHEDULED report is in it (FMP lists those as dated rows without an EPS).
+_EARNINGS_QUARTERS = 8
+_EARNINGS_LOOKAHEAD_DAYS = 120
+
+
+def _fetch_earnings_history(symbol: str) -> Optional[Dict[str, Any]]:
+    """The quarterly earnings calendar, past and scheduled -- see build_earnings_card
+    for why the PEAD expert's export is not enough on its own."""
+    if not get_app_setting("FMP_API_KEY"):
+        return None
+    provider = get_provider("fundamentals_details", "fmp")
+    data = provider.get_past_earnings(
+        symbol, "quarterly", datetime.now() + timedelta(days=_EARNINGS_LOOKAHEAD_DAYS),
+        lookback_periods=_EARNINGS_QUARTERS + 2, format_type="dict")
+    if not isinstance(data, dict) or data.get("error"):
+        raise RuntimeError(f"earnings history unavailable: {data.get('error') if isinstance(data, dict) else data}")
+    return {"rows": data.get("earnings") or []}
+
+
 def _get_overrides(expert_name: str) -> Dict[str, Any]:
     """Read persisted per-expert settings overrides. UI-thread only (see module docstring
     in ui/account_filter_context.py) — app.storage.user raises RuntimeError outside a UI
@@ -346,7 +392,8 @@ class Symbol360Tab:
              lambda sym: _fetch_analyst(sym, fmp_rating_overrides, finnhub_overrides)),
             ("congress", "Senate/House Activity", _fetch_congress),
             ("detscorer", "DeterministicScorer",
-             lambda sym: DeterministicScorer.export_symbol_data(sym, overrides=detscorer_overrides)),
+             lambda sym: _fetch_detscorer(sym, detscorer_overrides)),
+            ("earnings_history", "Earnings history", _fetch_earnings_history),
             # FactorRanker's inputs, not the expert: see _fetch_factors.
             ("factors", "Momentum / Value / Quality factors", _fetch_factors),
         ]
@@ -363,9 +410,8 @@ class Symbol360Tab:
             self._render_banner(header, overall)
             self._render_chart_card(symbol, results.get("chart"))
             with ui.grid(columns=2).classes("w-full gap-4"):
-                for card in cards:
+                for card in [*cards, backdrop]:
                     self._render_summary_card(card)
-            self._render_summary_card(backdrop)
             self._render_advanced(results)
 
     # ---------------------------------------------------------------- summary view
@@ -415,6 +461,8 @@ class Symbol360Tab:
                     ui.label(line.text).classes("text-sm")
             if card.votes and card.verdict is not None:
                 ui.label(card.tally_text).classes("text-xs mt-1").style("color: #a0aec0;")
+            if card.note:
+                ui.label(card.note).classes("text-xs italic").style("color: #a0aec0;")
             if card.facts or card.tables:
                 with ui.expansion("Show details").classes("w-full text-sm"):
                     if card.facts:
@@ -441,7 +489,7 @@ class Symbol360Tab:
         """
         analyst = results.get("analyst") or {}
         exports = [
-            ("DeterministicScorer", results.get("detscorer")),
+            ("DeterministicScorer", (results.get("detscorer") or {}).get("export")),
             ("Earnings / PEAD", results.get("earnings")),
             ("Insider Activity", results.get("insider")),
             ("FMP Rating", analyst.get("fmp")),

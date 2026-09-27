@@ -18,7 +18,8 @@ from ba2_common.core.types import (
     OrderDirection, OrderOpenType, OrderStatus, OrderType, TransactionStatus,
 )
 from ba2_common.core.share_grid import (
-    QUANTITY_EPSILON, WHOLE_SHARE, floor_to_unit, fractional_unit, is_whole_grid,
+    PROTECTIVE_ORDERS_BLOCK_FRACTIONAL, QUANTITY_EPSILON, WHOLE_SHARE, floor_to_unit,
+    fractional_unit, is_whole_grid,
 )
 from ba2_common.logger import logger
 
@@ -313,6 +314,15 @@ class FactorPortfolioManager:
             allowed = False
         if not allowed or not symbols:
             return {}
+        if self._stop_risk_pct() > 0:
+            # A resting protective stop cannot match a fractional position (share_grid
+            # "NO FRACTIONS UNDER PROTECTIVE ORDERS"), so the setting yields to the stop.
+            logger.warning(
+                f"FactorRanker[{self.expert_instance_id}]: allow_fractional_shares is ignored "
+                f"while its protective stop is on (risk_per_trade_pct > 0): "
+                f"{PROTECTIVE_ORDERS_BLOCK_FRACTIONAL}. Rebalancing in whole shares; set "
+                f"risk_per_trade_pct to 0 to trade fractions without the stop.")
+            return {}
         getter = getattr(self.account, 'get_fractionable', None)
         if getter is None:
             return {}
@@ -349,6 +359,13 @@ class FactorPortfolioManager:
     #
     # stop_loss_sells() is deliberately KEPT: it is pure (no IO, no orders) and is the canonical
     # statement of the rule that protective_stop_price inverts.
+
+    def _stop_risk_pct(self) -> float:
+        """``risk_per_trade_pct``: > 0 means every held name rests a protective stop."""
+        try:
+            return float(self.expert.get_setting_with_interface_default("risk_per_trade_pct") or 0.0)
+        except Exception:  # noqa: BLE001 — a stub expert -> no stop
+            return 0.0
 
     def _resync_protective_stops(self, by_symbol: Dict[str, list], changed: set) -> None:
         """Re-price the resting stop of every still-held name whose position just changed.
@@ -406,10 +423,7 @@ class FactorPortfolioManager:
         is off (no risk_pct), the inputs are unavailable, or the maths yields a non-positive
         price -- a stop must never be invented from missing data.
         """
-        try:
-            risk_pct = float(self.expert.get_setting_with_interface_default("risk_per_trade_pct") or 0.0)
-        except Exception:  # noqa: BLE001 — a stub expert -> no stop
-            return None
+        risk_pct = self._stop_risk_pct()
         if risk_pct <= 0:
             return None
 

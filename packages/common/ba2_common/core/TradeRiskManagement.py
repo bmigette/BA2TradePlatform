@@ -20,7 +20,8 @@ from ba2_common.core.db import get_instance, get_all_instances, update_instance,
 from sqlmodel import select, Session
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.share_grid import (
-    WHOLE_SHARE, floor_to_unit, fractional_unit, is_whole_grid,
+    PROTECTIVE_ORDERS_BLOCK_FRACTIONAL, WHOLE_SHARE, floor_to_unit, fractional_unit,
+    is_whole_grid,
 )
 
 if TYPE_CHECKING:
@@ -1338,12 +1339,20 @@ class TradeRiskManagement:
         symbol_prices = account.get_instrument_current_price(all_symbols)
         self.logger.info(f"Bulk fetched {len(symbol_prices)} prices in single API call")
 
-        # FRACTIONAL SHARES (opt-in, default off). Asked ONCE for the whole batch -- a cold
-        # basket is then one broker round-trip, and the account caches the answers for a day.
-        # Skipped entirely when the setting is off, so an expert that never opted in makes no
-        # new broker call and sizes exactly as before.
-        allow_fractional = bool(expert.get_setting_with_interface_default(
-            'allow_fractional_shares', log_warning=False))
+        # FRACTIONAL SHARES: never here. This risk manager ALWAYS arms a protective stop --
+        # the ruleset's own SL, else the safeguard stop (notional) or the risk stop
+        # (risk_atr) -- and a broker will not carry a fractional protective order (see
+        # share_grid "NO FRACTIONS UNDER PROTECTIVE ORDERS"). An opted-in expert is told so
+        # and sized in whole shares, i.e. exactly as before the setting existed: no broker
+        # lookup, every unit below is the whole share. The grid plumbing stays so a broker
+        # that can protect a fraction only needs this line changed.
+        if expert.get_setting_with_interface_default('allow_fractional_shares', log_warning=False):
+            self.logger.warning(
+                f"allow_fractional_shares is ignored by the classic risk manager: it always "
+                f"attaches a stop-loss, and {PROTECTIVE_ORDERS_BLOCK_FRACTIONAL}. "
+                f"Sizing in whole shares.")
+            context["allow_fractional_shares_ignored"] = True
+        allow_fractional = False
         fractionable_by_symbol = self._fractionable_by_symbol(account, all_symbols,
                                                               allow_fractional)
         context["allow_fractional_shares"] = allow_fractional

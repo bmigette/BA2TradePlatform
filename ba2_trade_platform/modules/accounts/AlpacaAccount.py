@@ -1052,7 +1052,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         return TradingOrder(
             broker_order_id=str(getattr(order, "id", None)) if getattr(order, "id", None) else None,  # Set Alpaca order ID as broker_order_id
             symbol=getattr(order, "symbol", None),
-            quantity=getattr(order, "qty", None),
+            # Alpaca returns qty as a string ("0.4018"); the model field is a float.
+            quantity=self._safe_float(getattr(order, "qty", None)),
             side=side,
             order_type=final_order_type,
             good_for=getattr(order, "time_in_force", None),

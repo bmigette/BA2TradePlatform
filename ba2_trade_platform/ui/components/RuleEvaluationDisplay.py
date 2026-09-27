@@ -219,5 +219,45 @@ def _build_action_params(action_config: Dict[str, Any]) -> List[str]:
         params.append(f"Limit: ${action_config['limit_price']}")
     if 'stop_price' in action_config:
         params.append(f"Stop: ${action_config['stop_price']}")
-    
+
+    params.extend(_option_params_text(action_config.get('option_params') or {}))
     return params
+
+
+#: Option-entry parameters, in reading order: (key, label, formatter).
+_OPTION_PARAM_LABELS = (
+    ('strike_method', 'Strike', str),
+    ('strike_param', 'param', lambda v: f"{float(v):g}"),
+    ('dte_min', 'DTE min', lambda v: f"{int(v)}"),
+    ('dte_max', 'DTE max', lambda v: f"{int(v)}"),
+    ('short_dte_min', 'Short DTE min', lambda v: f"{int(v)}"),
+    ('short_dte_max', 'Short DTE max', lambda v: f"{int(v)}"),
+    ('sizing', 'Sizing', lambda v: f"{float(v):g}%"),
+    ('min_one_contract', 'Min 1 contract', lambda v: 'yes' if v else 'no'),
+    ('min_open_interest', 'Min OI', lambda v: f"{float(v):g}"),
+    ('min_volume', 'Min volume', lambda v: f"{float(v):g}"),
+    ('max_spread_pct', 'Max spread', lambda v: f"{float(v):g}%"),
+    ('wing_width_pct', 'Wing width', lambda v: f"{float(v):g}%"),
+    ('min_arc', 'Min ARC', lambda v: f"{float(v):g}"),
+    ('entry_cross', 'Entry cross', lambda v: f"{float(v):g}"),
+    ('w_premium', 'W premium', lambda v: f"{float(v):g}"),
+    ('w_iv', 'W IV', lambda v: f"{float(v):g}"),
+    ('w_rvol', 'W rel volume', lambda v: f"{float(v):g}"),
+)
+
+
+def _option_params_text(option_params: Dict[str, Any]) -> List[str]:
+    """``["Strike: delta 0.35", "DTE 40-60", ...]`` for an option entry's selection box.
+
+    ``%g`` everywhere: the stored floats carry binary noise (0.35000000000000003) that
+    means nothing to a reader.
+    """
+    out = []
+    for key, label, fmt in _OPTION_PARAM_LABELS:
+        if key not in option_params or option_params[key] is None:
+            continue
+        try:
+            out.append(f"{label}: {fmt(option_params[key])}")
+        except (TypeError, ValueError):
+            out.append(f"{label}: {option_params[key]}")
+    return out
