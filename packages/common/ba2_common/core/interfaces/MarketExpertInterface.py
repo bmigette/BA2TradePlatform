@@ -298,7 +298,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "allow_fractional_shares": {
                     "type": "bool", "required": False, "default": False,
                     "description": "Allow fractional share quantities",
-                    "tooltip": "When on, the classic risk manager and FactorRanker size positions in fractional shares for symbols the BROKER marks fractionable (e.g. 2.3456 shares instead of 2). A symbol the broker does not fractionalise -- or has not said either way -- is still sized in whole shares. Off by default so existing experts keep their current whole-share sizing. Note that brokers typically accept fractions only on plain market DAY orders; a protective stop or take-profit may cover only the whole-share part of a fractional position."
+                    "tooltip": "When on, the classic risk manager and FactorRanker size positions in fractional shares for symbols the BROKER marks fractionable (e.g. 2.3456 shares instead of 2). A symbol the broker does not fractionalise -- or has not said either way -- is still sized in whole shares. Off by default so existing experts keep their current whole-share sizing. The account adapter preserves the transaction quantity for TP/SL and close orders; if a broker rejects a fractional complex order, it records the rejection instead of silently submitting a smaller protective leg."
                 },
                 "diversification_factor": {
                     "type": "float", "required": False, "default": 1.0,

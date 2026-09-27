@@ -1,0 +1,13 @@
+........................................................................ [ 50%]
+........................................................................ [100%]
+============================== warnings summary ===============================
+..\..\..\..\..\ba2-venvs\test\Lib\site-packages\websockets\legacy\__init__.py:6
+  C:\Users\basti\ba2-venvs\test\Lib\site-packages\websockets\legacy\__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+tests/test_backtest_trade_chart.py::test_option_row_resolves_the_whole_transaction_and_reads_cached_bars
+  C:\Users\basti\Documents\dev\BA2TradePlatform\testplatform\backend\app\models\database.py:65: MovedIn20Warning: The ``declarative_base()`` function is now available as sqlalchemy.orm.declarative_base(). (deprecated since: 2.0) (Background on SQLAlchemy 2.0 at: https://sqlalche.me/e/b8d9)
+    Base = declarative_base()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+144 passed, 2 warnings in 112.28s (0:01:52)
