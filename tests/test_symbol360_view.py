@@ -353,8 +353,100 @@ def test_build_summary_end_to_end():
 
     assert header["name"] == "Apple Inc."
     assert header["change"] == "+1.25%"
-    assert [c.key for c in cards] == ["trend", "fundamentals", "valuation", "analysts",
-                                      "earnings", "insiders"]
+    assert [c.key for c in cards] == ["trend", "fundamentals", "valuation", "factors",
+                                      "analysts", "earnings", "insiders"]
     assert overall.answer == "YES"
-    assert overall.abstained == 1          # no insider/congress activity
+    assert overall.abstained == 2          # no factor data; no insider/congress activity
     assert backdrop.votes is False
+
+
+def test_one_card_that_cannot_be_built_costs_that_card_not_the_page(monkeypatch):
+    """A provider payload in an unexpected shape used to raise out of build_summary and
+    blank the whole page (Piotroski components arrived as a list, the builder expected a
+    dict). Now that card abstains and says why; every other card still renders."""
+    def _boom(ds_export):
+        raise AttributeError("'list' object has no attribute 'items'")
+
+    monkeypatch.setattr(v, "build_fundamentals_card", _boom)
+
+    _, cards, _, overall = v.build_summary(
+        "AAPL", {"detscorer": _ds(dist=0.1, rsi=50), "weinstein": {"stage": 2}}, TODAY)
+
+    by_key = {c.key: c for c in cards}
+    assert "AttributeError" in by_key["fundamentals"].unavailable
+    assert by_key["fundamentals"].verdict is None
+    assert by_key["trend"].verdict == v.STRONG_BUY
+    assert overall.abstained >= 1
+
+
+# ---------------------------------------------------------------------------
+# Piotroski components -- the shape DeterministicScorer really emits
+# ---------------------------------------------------------------------------
+
+def test_piotroski_components_are_a_list_of_tests():
+    ds = _ds(fscore=7)
+    ds.raw["fundamental"]["evidence"]["piotroski"] = {
+        "score": 7, "computed": 8,
+        "components": [
+            {"name": "roa_positive", "rule": "ROA > 0", "passed": True,
+             "current": 0.12, "comparator": 0},
+            {"name": "leverage_down", "rule": "LTD/assets fell", "passed": False,
+             "current": 0.3, "comparator": 0.25},
+            {"name": "no_dilution", "rule": "shares <= prior", "passed": None,
+             "current": None, "comparator": None},
+        ],
+    }
+
+    facts = dict(v.build_fundamentals_card(ds).facts)
+
+    assert facts["  roa positive"] == "pass"
+    assert facts["  leverage down"] == "fail"
+    assert facts["  no dilution"] == "n/a"      # not computable is never a fail
+
+
+# ---------------------------------------------------------------------------
+# FactorRanker's factors, judged on absolute bars
+# ---------------------------------------------------------------------------
+
+def _factors(*, mom=None, eps=None, price=None, fcf=None, ev=None, roe=None, gp=None,
+             assets=None, accruals=None):
+    return {
+        "momentum_12_1": mom,
+        "value": {"eps_ttm": eps, "price": price, "fcf_ttm": fcf, "enterprise_value": ev},
+        "quality": {"roe": roe, "gross_profit": gp, "total_assets": assets,
+                    "accruals_ratio": accruals},
+    }
+
+
+def test_a_cheap_profitable_momentum_stock_reads_strong_buy():
+    card = v.build_factors_card(_factors(mom=0.25, eps=10.0, price=100.0, fcf=8e9, ev=1e11,
+                                         roe=0.25, gp=4e10, assets=1e11, accruals=-0.03))
+
+    assert card.verdict == v.STRONG_BUY
+    texts = " | ".join(ln.text for ln in card.lines)
+    assert "+25.0%" in texts and "P/E 10.0" in texts and "8.0%" in texts
+    assert "backed by operating cash flow" in texts
+
+
+def test_losses_cash_burn_and_accruals_are_bad():
+    card = v.build_factors_card(_factors(mom=-0.3, eps=-2.0, price=50.0, fcf=-1e9, ev=2e10,
+                                         roe=-0.1, gp=5e8, assets=2e10, accruals=0.15))
+
+    assert card.verdict == v.STRONG_SELL
+    texts = " | ".join(ln.text for ln in card.lines)
+    assert "loss-making" in texts and "burning cash" in texts
+    assert "ahead of operating cash flow" in texts
+
+
+def test_an_unmeasured_factor_leg_is_omitted():
+    """A non-positive EV or missing FCF is not a 0% yield -- FactorRanker drops that
+    leg, and so does the card."""
+    card = v.build_factors_card(_factors(mom=0.2, fcf=1e9, ev=-5e9))
+
+    assert len(card.lines) == 1
+    assert not any("cash-flow" in ln.text for ln in card.lines)
+
+
+def test_no_factor_data_abstains():
+    assert v.build_factors_card(None).verdict is None
+    assert v.build_factors_card(_factors()).unavailable

@@ -40,6 +40,10 @@ from ..utils.symbol360_view import (
 # DeterministicScorer.data has no in-tree shim (package-only helper, like
 # symbol_snapshot below) -- reached directly, same convention Task 9/10 used.
 from ba2_experts.DeterministicScorer.data import fetch_price_targets
+from ba2_experts.FactorRanker.data import (
+    fetch_close_prices, fetch_quality_inputs, fetch_value_inputs,
+)
+from ba2_experts.FactorRanker.factors import momentum_12_1
 from ba2_common.core.interfaces.ExpertDataExportInterface import (
     DETAIL_TOOLTIP_STYLE, plan_metric_detail,
 )
@@ -172,6 +176,25 @@ def _fetch_congress(symbol: str) -> Optional[Dict[str, Any]]:
     return {"senate": senate, "house": house}
 
 
+def _fetch_factors(symbol: str) -> Optional[Dict[str, Any]]:
+    """FactorRanker's per-symbol factor INPUTS, from FactorRanker's own fetchers.
+
+    Its ranking score is a cross-sectional z-score -- zero against a one-symbol
+    universe -- so the expert itself is not run. What it measures per symbol is real,
+    though: the 12-1 return, the value inputs (EPS, price, FCF, EV) and the quality
+    inputs (ROE, gross profit, assets, accruals). The view judges those on absolute bars.
+    """
+    if not get_app_setting("FMP_API_KEY"):
+        return None
+    closes = fetch_close_prices([symbol])
+    momentum = momentum_12_1(closes).get(symbol) if symbol in closes else None
+    return {
+        "momentum_12_1": momentum,
+        "value": fetch_value_inputs([symbol]).get(symbol),
+        "quality": fetch_quality_inputs([symbol]).get(symbol),
+    }
+
+
 def _get_overrides(expert_name: str) -> Dict[str, Any]:
     """Read persisted per-expert settings overrides. UI-thread only (see module docstring
     in ui/account_filter_context.py) — app.storage.user raises RuntimeError outside a UI
@@ -284,7 +307,14 @@ class Symbol360Tab:
                 logger.error(f"Error in Symbol360 search: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Error in Symbol360 search: {e}", exc_info=True)
-            ui.notify(f"Error searching {symbol}: {str(e)}", type="negative")
+            # After the awaits this task has no slot of its own; notify through a
+            # container, and let a torn-down page swallow the toast rather than raise
+            # a second traceback over the first.
+            try:
+                with self.cards_container:
+                    ui.notify(f"Error searching {symbol}: {str(e)}", type="negative")
+            except RuntimeError as notify_error:
+                logger.debug(f"[Symbol360Tab] Could not show the error toast: {notify_error}")
         finally:
             self._searching = False
             try:
@@ -317,10 +347,8 @@ class Symbol360Tab:
             ("congress", "Senate/House Activity", _fetch_congress),
             ("detscorer", "DeterministicScorer",
              lambda sym: DeterministicScorer.export_symbol_data(sym, overrides=detscorer_overrides)),
-            # FactorRanker is deliberately NOT fetched. Its score is a cross-sectional
-            # z-score, which is identically zero against the one-symbol universe this page
-            # would have to pin it to (its own export says so) -- a verdict chip built on
-            # it would be the same for every symbol ever searched.
+            # FactorRanker's inputs, not the expert: see _fetch_factors.
+            ("factors", "Momentum / Value / Quality factors", _fetch_factors),
         ]
 
     def _render_cards(self, symbol: str, results: Dict[str, Any]) -> None:
@@ -439,9 +467,9 @@ class Symbol360Tab:
 
     def _render_export_card(self, title: str, export: Optional[ExpertDataExport]) -> None:
         """Shared renderer for every ExpertDataExportInterface-backed card
-        (earnings/insider/FMPRating/FinnHubRating/DeterministicScorer/
-        FactorRanker) -- error/skip states, signal badge, metric rows, and
-        the per-card settings expander, written once instead of 6 times."""
+        (earnings/insider/FMPRating/FinnHubRating/DeterministicScorer) --
+        error/skip states, signal badge, metric rows, and the per-card
+        settings expander, written once instead of 5 times."""
         with ui.card().classes("w-full"):
             with ui.row().classes("w-full items-center justify-between"):
                 ui.label(title).classes("text-md font-bold")

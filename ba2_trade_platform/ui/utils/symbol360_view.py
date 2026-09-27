@@ -38,7 +38,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from ...logger import logger
 
 # ---------------------------------------------------------------------------
 # Verdicts
@@ -387,9 +389,14 @@ def build_fundamentals_card(ds_export) -> SummaryCard:
         else:
             card.lines.append(Line(NEUTRAL, f"Piotroski {fscore}/9 — average financials"))
         card.facts.append(("Piotroski F-Score", f"{fscore} / 9"))
-        for name, passed in ((ev.get("piotroski") or {}).get("components") or {}).items():
-            if isinstance(passed, bool):
-                card.facts.append((f"  {name.replace('_', ' ')}", "pass" if passed else "fail"))
+        # components: [{"name", "rule", "passed" (True/False/None), ...}]. None means the
+        # test could not be run (missing prior-year data) -- shown as such, never a fail.
+        for comp in (ev.get("piotroski") or {}).get("components") or []:
+            if not isinstance(comp, dict) or not comp.get("name"):
+                continue
+            passed = comp.get("passed")
+            outcome = "pass" if passed is True else "fail" if passed is False else "n/a"
+            card.facts.append((f"  {str(comp['name']).replace('_', ' ')}", outcome))
 
     z = _num(snap.get("z"))
     if z is not None:
@@ -665,6 +672,117 @@ def build_insider_card(insider_export, congress: Optional[Dict[str, Any]],
 
 
 # ---------------------------------------------------------------------------
+# FactorRanker's factors -- its INPUTS, judged on absolute bars
+# ---------------------------------------------------------------------------
+#
+# FactorRanker ranks a universe by z-scoring these against each other, so its score
+# means nothing for one symbol. Its inputs do: each leg below is the exact quantity
+# FactorRanker measures (same fetchers, same formulas), judged against a fixed bar
+# instead of against the rest of the universe. Its fourth factor, PEAD, is the
+# Earnings card.
+
+MOMENTUM_BAND = 0.10
+#: E/P 5% ~ P/E 20; below 2% ~ P/E above 50, or a loss.
+EARNINGS_YIELD_GOOD = 0.05
+EARNINGS_YIELD_POOR = 0.02
+FCF_YIELD_GOOD = 0.05
+#: Novy-Marx gross profitability; ~0.3 is a typical large-cap.
+GROSS_PROFITABILITY_GOOD = 0.30
+GROSS_PROFITABILITY_POOR = 0.10
+#: Sloan accruals = (net income - operating cash flow) / assets. At or below zero the
+#: earnings are fully backed by cash; well above it they run ahead of the cash.
+ACCRUALS_POOR = 0.10
+
+
+def _ratio(numerator: Any, denominator: Any) -> Optional[float]:
+    """numerator / denominator, or None unless both are measured and the denominator is
+    positive -- FactorRanker's own guard (a 0 or negative EV/price/assets makes the
+    yield uninterpretable, while a numerator of exactly 0 is a real reading)."""
+    n, d = _num(numerator), _num(denominator)
+    if n is None or d is None or d <= 0:
+        return None
+    return n / d
+
+
+def build_factors_card(factors: Optional[Dict[str, Any]]) -> SummaryCard:
+    card = SummaryCard("factors", "Momentum, Value & Quality factors")
+    if not factors:
+        card.unavailable = "Factor data unavailable (FMP key missing or fetch failed)"
+        return card
+
+    mom = _num(factors.get("momentum_12_1"))
+    if mom is not None:
+        text = f"12-month return (excluding the last month) {mom * 100:+.1f}%"
+        if mom >= MOMENTUM_BAND:
+            card.lines.append(Line(GOOD, text + " — strong momentum"))
+        elif mom <= -MOMENTUM_BAND:
+            card.lines.append(Line(BAD, text + " — weak momentum"))
+        else:
+            card.lines.append(Line(NEUTRAL, text + " — flat"))
+        card.facts.append(("Momentum 12-1", _pct(mom * 100)))
+
+    value = factors.get("value") or {}
+    ey = _ratio(value.get("eps_ttm"), value.get("price"))
+    if ey is not None:
+        pe = f" (P/E {1 / ey:.1f})" if ey > 0 else ""
+        if ey >= EARNINGS_YIELD_GOOD:
+            card.lines.append(Line(GOOD, f"Earnings yield {ey * 100:.1f}%{pe} — cheap on earnings"))
+        elif ey < 0:
+            card.lines.append(Line(BAD, f"Earnings yield {ey * 100:.1f}% — loss-making"))
+        elif ey < EARNINGS_YIELD_POOR:
+            card.lines.append(Line(BAD, f"Earnings yield {ey * 100:.1f}%{pe} — expensive on earnings"))
+        else:
+            card.lines.append(Line(NEUTRAL, f"Earnings yield {ey * 100:.1f}%{pe} — fairly priced"))
+        card.facts.append(("Earnings yield (EPS / price)", _pct(ey * 100)))
+        card.facts.append(("EPS (last fiscal year)", _money(_num(value.get("eps_ttm")))))
+    fcfy = _ratio(value.get("fcf_ttm"), value.get("enterprise_value"))
+    if fcfy is not None:
+        if fcfy >= FCF_YIELD_GOOD:
+            card.lines.append(Line(GOOD, f"Free-cash-flow yield {fcfy * 100:.1f}% of enterprise value — strong cash generation"))
+        elif fcfy < 0:
+            card.lines.append(Line(BAD, f"Free-cash-flow yield {fcfy * 100:.1f}% — burning cash"))
+        else:
+            card.lines.append(Line(NEUTRAL, f"Free-cash-flow yield {fcfy * 100:.1f}% of enterprise value"))
+        card.facts.append(("FCF yield (FCF / EV)", _pct(fcfy * 100)))
+        card.facts.append(("Free cash flow (last fiscal year)", _big_money(_num(value.get("fcf_ttm")))))
+        card.facts.append(("Enterprise value", _big_money(_num(value.get("enterprise_value")))))
+
+    quality = factors.get("quality") or {}
+    roe = _num(quality.get("roe"))
+    if roe is not None:
+        if roe >= ROE_GOOD:
+            card.lines.append(Line(GOOD, f"Return on equity {roe * 100:.1f}% — highly profitable"))
+        elif roe < ROE_POOR:
+            card.lines.append(Line(BAD, f"Return on equity {roe * 100:.1f}% — weak profitability"))
+        else:
+            card.lines.append(Line(NEUTRAL, f"Return on equity {roe * 100:.1f}% — moderate"))
+        card.facts.append(("Return on equity", _pct(roe * 100, signed=False)))
+    gpa = _ratio(quality.get("gross_profit"), quality.get("total_assets"))
+    if gpa is not None:
+        if gpa >= GROSS_PROFITABILITY_GOOD:
+            card.lines.append(Line(GOOD, f"Gross profit {gpa * 100:.0f}% of assets — productive asset base"))
+        elif gpa < GROSS_PROFITABILITY_POOR:
+            card.lines.append(Line(BAD, f"Gross profit {gpa * 100:.0f}% of assets — thin"))
+        else:
+            card.lines.append(Line(NEUTRAL, f"Gross profit {gpa * 100:.0f}% of assets"))
+        card.facts.append(("Gross profit / assets", _pct(gpa * 100, signed=False)))
+    accruals = _num(quality.get("accruals_ratio"))
+    if accruals is not None:
+        if accruals <= 0:
+            card.lines.append(Line(GOOD, "Earnings fully backed by operating cash flow"))
+        elif accruals >= ACCRUALS_POOR:
+            card.lines.append(Line(BAD, "Earnings run well ahead of operating cash flow"))
+        else:
+            card.lines.append(Line(NEUTRAL, "Earnings mostly backed by operating cash flow"))
+        card.facts.append(("Accruals ((net income − op. cash flow) / assets)",
+                           _pct(accruals * 100)))
+
+    if not card.lines:
+        card.unavailable = "No price history or financial statements for the factors"
+    return card
+
+
+# ---------------------------------------------------------------------------
 # Market backdrop -- context, never a vote
 # ---------------------------------------------------------------------------
 
@@ -706,12 +824,33 @@ def build_summary(symbol: str, results: Dict[str, Any], today: date
     ds = results.get("detscorer")
 
     cards = [
-        build_trend_card(ds, results.get("weinstein"), quote),
-        build_fundamentals_card(ds),
-        build_valuation_card(ds, quote),
-        build_analyst_card(results.get("analyst"), price),
-        build_earnings_card(results.get("earnings")),
-        build_insider_card(results.get("insider"), results.get("congress"), today),
+        _isolated("trend", "Trend & Momentum", build_trend_card,
+                  ds, results.get("weinstein"), quote),
+        _isolated("fundamentals", "Fundamentals & Health", build_fundamentals_card, ds),
+        _isolated("valuation", "Valuation & Growth", build_valuation_card, ds, quote),
+        _isolated("factors", "Momentum, Value & Quality factors", build_factors_card,
+                  results.get("factors")),
+        _isolated("analysts", "Analysts", build_analyst_card, results.get("analyst"), price),
+        _isolated("earnings", "Earnings", build_earnings_card, results.get("earnings")),
+        _isolated("insiders", "Insiders & Congress", build_insider_card,
+                  results.get("insider"), results.get("congress"), today),
     ]
-    backdrop = build_backdrop_card(ds, results.get("rvol"))
+    backdrop = _isolated("backdrop", "Market Backdrop", build_backdrop_card,
+                         ds, results.get("rvol"), votes=False)
     return build_header(symbol, header_raw), cards, backdrop, overall_from_cards(cards)
+
+
+def _isolated(key: str, title: str, builder: Callable[..., SummaryCard], *args,
+              votes: bool = True) -> SummaryCard:
+    """``builder(*args)``, or an unavailable card if it raises.
+
+    Each card reads a different provider's payload; one payload in a shape the builder
+    did not expect must cost that card, not the whole page. The failure is logged loudly
+    (it is a bug to fix, not a data gap) and the card abstains from the overall tally.
+    """
+    try:
+        return builder(*args)
+    except Exception as e:
+        logger.error(f"Symbol360: could not build the '{key}' card: {e}", exc_info=True)
+        return SummaryCard(key, title, votes=votes,
+                           unavailable=f"Could not be built ({type(e).__name__}: {e})")
