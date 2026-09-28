@@ -1,6 +1,7 @@
 """Capture the live app's expert_batch export (every instance) and the Performance page's
 per-expert and monthly metrics from a COPY of a live trade DB. Run before and after a refactor
-of those code paths, then diff. The tool writes to its copy (WAL); never point it at a real DB.
+of those code paths, then diff. The tool writes to its copy (WAL); never point it at a real DB
+(it refuses <BA2_HOME>/trade/db.sqlite, and ~/Documents/ba2/trade/db.sqlite).
 
 Usage:
     cp /tmp/ba2-backups/dev_2026-09-28.sqlite /tmp/ba2-live-copy.sqlite
@@ -17,9 +18,25 @@ for p in (*(os.path.join(REPO, "packages", n) for n in ("experts", "providers", 
     if p not in sys.path:
         sys.path.insert(0, p)
 
+
+def _refuse_real_db(path: str, rel: str) -> None:
+    """Exit if ``path`` is the REAL default DB ``<root>/<rel>``, for root = ~/Documents/ba2 and,
+    when set, $BA2_HOME. Compared after resolving symlinks (and by inode when both exist)."""
+    roots = [os.path.join(os.path.expanduser("~"), "Documents", "ba2")]
+    if os.environ.get("BA2_HOME"):
+        roots.append(os.environ["BA2_HOME"])
+    target = os.path.realpath(os.path.expanduser(path))
+    for root in roots:
+        real = os.path.realpath(os.path.join(os.path.expanduser(root), rel))
+        if target == real or (os.path.exists(target) and os.path.exists(real)
+                              and os.path.samefile(target, real)):
+            sys.exit(f"Refusing to run against the real DB {real}: point the tool at a COPY")
+
+
 DB = os.environ.get("DB_FILE")
 if not DB:
     sys.exit("Set DB_FILE to a COPY of a live trade DB")
+_refuse_real_db(DB, os.path.join("trade", "db.sqlite"))
 
 from ba2_trade_platform.core.seam_wiring import wire_all_seams  # noqa: E402
 wire_all_seams()
