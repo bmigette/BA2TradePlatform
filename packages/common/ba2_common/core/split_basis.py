@@ -37,6 +37,16 @@ marked file is exactly the defect a marker would otherwise hide for ever. A real
 size that close to a split is rare (APP +46%, ARM +48%, NFLX -35% are all far from any
 split); if one ever is, the symbol is refused loudly, never silently priced.
 
+FURTHER OUT (review r7, APH 2026-09-28): APH's cache had every bar from 2026-07-01 divided by 2
+-- the 2:1 split of 2026-09-03 applied 64 days early, which neither the ratio rule nor the 30-day
+window saw. Beyond ``MIXED_BASIS_WINDOW_DAYS`` and up to ``MIXED_BASIS_FAR_WINDOW_DAYS`` from a
+calendar split, a one-day move whose size MATCHES that split's factor (either direction, within
+``MIXED_BASIS_FAR_MATCH`` in log) is ``mixed_basis`` too. Requiring the match keeps real moves
+out: over the 789 local files of the 753 stage-2 and 97 stage-1 names (2026-09-28) the only
+one-day move of a calendar split's size within 365 days of that split is APH's, and layer 1
+refuses exactly that one file; the other split-sized moves (GME/AMC 2021, MARA 2012/2017,
+biotech gaps) are years from a split of that factor.
+
 ``drift``, ``undetectable`` and ``mixed_basis`` all require a FULL re-fetch. For ``drift`` and
 ``undetectable`` the marker the re-fetch writes turns them into ``refetched``, so that repair
 happens once, never on every refresh. ``mixed_basis`` is NOT cleared by a marker: if the vendor
@@ -70,6 +80,8 @@ __all__ = [
     "VERDICT_MIXED_BASIS",
     "MIXED_BASIS_JUMP",
     "MIXED_BASIS_WINDOW_DAYS",
+    "MIXED_BASIS_FAR_WINDOW_DAYS",
+    "MIXED_BASIS_FAR_MATCH",
     "REFETCH_VERDICTS",
     "check_split_basis",
     "needs_full_refetch",
@@ -96,6 +108,11 @@ REFETCH_VERDICTS = (VERDICT_DRIFT, VERDICT_UNDETECTABLE, VERDICT_MIXED_BASIS)
 MIXED_BASIS_JUMP = 1.4
 #: How far (calendar days, either side of the ex-date) the scan looks.
 MIXED_BASIS_WINDOW_DAYS = 30
+#: Beyond that and up to this far, only a move MATCHING the split's factor counts (docstring).
+MIXED_BASIS_FAR_WINDOW_DAYS = 365
+#: ... within this, in log (|ln|r|| - ln(factor)): the day's own return rides on the step (APH
+#: x0.4884 for a 2:1 = 2.4% off), ~4% of it is allowed.
+MIXED_BASIS_FAR_MATCH = 0.04
 
 #: Below this factor the ratio rule's "ordinary day" and "unadjusted" bands (ln 1.5 wide each,
 #: see ``market_condition_source._MATCH_TOLERANCE``) overlap, so prices cannot decide.
@@ -257,19 +274,34 @@ def _mixed_basis_check(d: np.ndarray, close: np.ndarray, jump_idx: np.ndarray,
     sd = np.datetime64(sp.date, "D")
     ex_i = int(np.searchsorted(d, sd, side="left"))
     win = np.timedelta64(MIXED_BASIS_WINDOW_DAYS, "D")
-    hits = [int(i) for i in jump_idx
-            if i != ex_i and abs(d[i] - sd) <= win]
+    far = np.timedelta64(MIXED_BASIS_FAR_WINDOW_DAYS, "D")
+    log_f = math.log(max(ratio, 1.0 / ratio))
+    near_hits, far_hits = [], []
+    for i in jump_idx:
+        i = int(i)
+        if i == ex_i:
+            continue
+        gap = abs(d[i] - sd)
+        if gap <= win:
+            near_hits.append(i)
+        elif gap <= far and abs(abs(math.log(close[i] / close[i - 1])) - log_f) <= MIXED_BASIS_FAR_MATCH:
+            far_hits.append(i)
+    hits = sorted(near_hits + far_hits)
     if not hits:
         return None
     moves = ", ".join(f"{d[i].astype(object).isoformat()} x{close[i] / close[i - 1]:.4f}"
                       for i in hits)
+    where = (f"within {MIXED_BASIS_WINDOW_DAYS} days" if not far_hits else
+             f"of the split's own size (x{max(ratio, 1.0 / ratio):g}) within "
+             f"{MIXED_BASIS_FAR_WINDOW_DAYS} days" if not near_hits else
+             f"within {MIXED_BASIS_WINDOW_DAYS} days, or of its size within "
+             f"{MIXED_BASIS_FAR_WINDOW_DAYS} days,")
     return SplitBasisCheck(
         sp.date, ratio, VERDICT_MIXED_BASIS, checked_bar=d[hits[0]].astype(object),
         basis="mixed",
-        reason=(f"one-day close move(s) beyond x{MIXED_BASIS_JUMP} within "
-                f"{MIXED_BASIS_WINDOW_DAYS} days of the {sp.date.isoformat()} split but not on "
-                f"its ex-date bar: {moves}. The file is on a mixed basis (adjusted on the wrong "
-                f"day); only a full re-fetch can repair it"))
+        reason=(f"one-day close move(s) beyond x{MIXED_BASIS_JUMP} {where} of the "
+                f"{sp.date.isoformat()} split but not on its ex-date bar: {moves}. The file is on a "
+                f"mixed basis (adjusted on the wrong day); only a full re-fetch can repair it"))
 
 
 def _marker_date(marker: Optional[dict]) -> Optional[date]:
