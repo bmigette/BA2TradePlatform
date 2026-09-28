@@ -127,6 +127,23 @@ class ExpertBalance(NamedTuple):
     available: float    # virtual - used, then clamped to broker BP and account headroom
 
 
+def enabled_instruments_config(settings: Dict[str, Any]) -> Dict[str, Dict]:
+    """Instrument symbol -> config from an expert's decoded settings (``enabled_instruments``
+    holds a dict or its JSON text). Pure; ``_get_enabled_instruments_config`` delegates here."""
+    enabled_instruments_setting = (settings or {}).get('enabled_instruments')
+    if enabled_instruments_setting:
+        if isinstance(enabled_instruments_setting, dict):
+            return enabled_instruments_setting
+        elif isinstance(enabled_instruments_setting, str):
+            try:
+                import json
+                return json.loads(enabled_instruments_setting)
+            except (json.JSONDecodeError, ValueError):
+                logger.warning(f"Failed to parse enabled_instruments setting as JSON: {enabled_instruments_setting}")
+                return {}
+    return {}
+
+
 class MarketExpertInterface(ExtendableSettingsInterface):
     SETTING_MODEL = ExpertSetting
     SETTING_LOOKUP_FIELD = "instance_id"
@@ -1155,24 +1172,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         Returns:
             Dict[str, Dict]: Mapping of instrument symbol to configuration
         """
-        # Get enabled instruments from expert settings
-        enabled_instruments_setting = self.settings.get('enabled_instruments')
-
-        if enabled_instruments_setting:
-            # If it's already a dict, return it directly
-            if isinstance(enabled_instruments_setting, dict):
-                return enabled_instruments_setting
-            # If it's a string, try to parse it as JSON
-            elif isinstance(enabled_instruments_setting, str):
-                try:
-                    import json
-                    return json.loads(enabled_instruments_setting)
-                except (json.JSONDecodeError, ValueError):
-                    logger.warning(f"Failed to parse enabled_instruments setting as JSON: {enabled_instruments_setting}")
-                    return {}
-
-        # Return empty dict if no enabled instruments configured
-        return {}
+        return enabled_instruments_config(self.settings)
 
     def get_virtual_balance(self) -> Optional[float]:
         """
