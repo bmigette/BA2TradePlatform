@@ -163,10 +163,17 @@ def expert_performance(txns: Iterable[Any]) -> Dict[str, Any]:
     for txn in txns:
         pnl = calculate_transaction_pnl(txn)
         if pnl is not None:
+            # Scale by the contract multiplier (100 for options) to match the
+            # multiplier-aware P&L, so the return ratio stays correct.
             position_value = txn.open_price * txn.quantity * (getattr(txn, "multiplier", None) or 1)
             if position_value != 0:
                 returns.append(pnl / position_value)
 
+    # Drawdown walks the cumulative curve, so the order is load-bearing: the same
+    # trades in a different sequence give a different worst fall. `pnls` above is
+    # in whatever order the query returned, so this is sorted explicitly by close
+    # date. A transaction with no close date is still open and has no place on a
+    # REALISED equity curve.
     ordered = sorted((t for t in txns if t.close_date), key=lambda t: t.close_date)
     ordered_pnls = [pnl for pnl in (calculate_transaction_pnl(t) for t in ordered)
                     if pnl is not None]

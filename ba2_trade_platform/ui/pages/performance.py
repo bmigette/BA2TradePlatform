@@ -18,7 +18,6 @@ from ba2_common.analytics.performance import expert_performance, calculate_sharp
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 import pandas as pd
-import numpy as np
 from collections import defaultdict
 from ba2_trade_platform.ui.utils.perf_logger import PerfLogger
 from ba2_trade_platform.ui.account_filter_context import get_expert_ids_for_account

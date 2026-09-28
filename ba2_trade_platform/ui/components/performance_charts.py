@@ -10,7 +10,6 @@ import plotly.graph_objects as go
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Sequence, Tuple
 import pandas as pd
-import numpy as np
 
 
 class MetricCard:
