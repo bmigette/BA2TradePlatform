@@ -473,8 +473,17 @@ def test_the_handler_and_the_exporter_read_THE_SAME_TABLE():
     handler = open(os.path.join(
         _TESTPLATFORM, "backend", "app", "services", "backtest",
         "daily_backtest_handler.py"), encoding="utf-8").read()
-    exporter = open(os.path.join(
+    # The export derivation moved to ba2_common.export.backtest_export (site plan P0a); the
+    # test-app endpoint is a thin wrapper that must keep delegating to it.
+    endpoint = open(os.path.join(
         _TESTPLATFORM, "backend", "app", "api", "backtests.py"), encoding="utf-8").read()
+    assert "from ba2_common.export.backtest_export import" in endpoint, (
+        "the export endpoint no longer delegates to the shared derivation")
+    assert "return derive_export_payload(" in endpoint, (
+        "the export endpoint no longer delegates to the shared derivation")
+    exporter = open(os.path.join(
+        os.path.dirname(_TESTPLATFORM), "packages", "common", "ba2_common", "export",
+        "backtest_export.py"), encoding="utf-8").read()
     for src, who in ((handler, "the handler"), (exporter, "the exporter")):
         assert "forced_expert_settings" in src, (
             f"{who} no longer reads deploy_parity's table")
