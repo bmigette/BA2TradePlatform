@@ -1053,7 +1053,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 **Files:**
 - Create: `packages/common/ba2_common/analytics/__init__.py`, `packages/common/ba2_common/analytics/performance.py`
 - Modify: `ba2_trade_platform/ui/components/performance_charts.py:437-563` (the five functions)
-- Modify: `ba2_trade_platform/ui/pages/performance.py:12-18` (imports), `:122-196` (per-expert loop body), `:198-236` (`_calculate_monthly_metrics`)
+- Modify: `ba2_trade_platform/ui/pages/performance.py:12-18` (imports), `:122-196` (per-expert loop body); `_calculate_monthly_metrics` stays unchanged
 - Test: `tests/test_performance_page_metrics.py` (characterization, written first), `packages/common/tests/test_performance_analytics.py`
 
 **Interfaces:**
@@ -1292,31 +1292,13 @@ from ba2_common.analytics.performance import (  # noqa: E402,F401
 ```
 
 In `performance.py`:
-- Change the `performance_charts` import to keep only the UI classes (`MetricCard, PerformanceBarChart, TimeSeriesChart, PieChartComponent, PerformanceTable, MultiMetricDashboard`), and add `from ba2_common.analytics.performance import expert_performance, monthly_pnl, calculate_sharpe_ratio`. Before deleting any other name, grep the file for remaining uses of `calculate_win_loss_ratio`, `calculate_max_drawdown`, `calculate_profit_factor` and `max_drawdown_from_pnl`; if any remain, import those from `ba2_common.analytics.performance` too.
+- Change the `performance_charts` import to keep only the UI classes (`MetricCard, PerformanceBarChart, TimeSeriesChart, PieChartComponent, PerformanceTable, MultiMetricDashboard`), and add `from ba2_common.analytics.performance import expert_performance, calculate_sharpe_ratio`. Before deleting any other name, grep the file for remaining uses of `calculate_win_loss_ratio`, `calculate_max_drawdown`, `calculate_profit_factor` and `max_drawdown_from_pnl`; if any remain, import those from `ba2_common.analytics.performance` too.
 - In `_calculate_transaction_metrics`, replace everything from `# Calculate transaction duration` through the closing `}` of `expert_metrics[expert_name] = {...}` with:
 
 ```python
             expert_metrics[expert_name] = expert_performance(txns)
 ```
-- Replace the body of `_calculate_monthly_metrics` after the `experts_map` pre-fetch with:
-
-```python
-        by_name = defaultdict(list)
-        for txn in transactions:
-            expert = experts_map.get(txn.expert_id)
-            if expert:
-                expert_name = expert.alias if expert.alias else f"{expert.expert}-{expert.id}"
-            else:
-                expert_name = f"Expert-{txn.expert_id}"
-            by_name[expert_name].append(txn)
-        for expert_name, group in by_name.items():
-            for month_key, bucket in monthly_pnl(group).items():
-                monthly_data[month_key][expert_name]['pnl'] += bucket['pnl']
-                monthly_data[month_key][expert_name]['count'] += bucket['count']
-
-        return monthly_data
-```
-Grouping keeps each expert's transactions in their original relative order, so the float sums come out in the same order and give the same values.
+- Leave `_calculate_monthly_metrics` **unchanged** (controller ruling R9). Regrouping by expert would change the insertion order of the month and expert keys, which the order-sensitive live capture catches. `ba2_common.analytics.performance.monthly_pnl` is used by the public site and pinned by its own tests.
 
 - [ ] **Step 7: Run everything touched**
 
