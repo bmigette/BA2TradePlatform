@@ -1,0 +1,1177 @@
+[
+ {
+  "backtest": {
+   "end_date": "2024-09-30 00:00:00.000000",
+   "engine_type": "daily_expert",
+   "expert_name": "FMPEarningsDrift",
+   "id": 902,
+   "initial_capital": 25000.0,
+   "name": "synthetic-opt-FMPEarningsDrift",
+   "optimization_id": 302,
+   "start_date": "2022-03-01 00:00:00.000000",
+   "strategy_params": {
+    "buyEntryConditions": {
+     "conditions": [
+      {
+       "field": "has_no_position",
+       "id": "c0"
+      },
+      {
+       "field": "rating_upgraded",
+       "id": "c1",
+       "value": 11.0
+      },
+      {
+       "field": "expected_profit_percent",
+       "id": "c2",
+       "op": ">",
+       "optimize": true,
+       "toggle_optimize": true,
+       "value": 3.5,
+       "value_max": 6.0,
+       "value_min": 1.0,
+       "value_step": 0.5
+      }
+     ],
+     "id": "grp-syn-ed",
+     "type": "AND"
+    },
+    "cond:c1:enabled": 1,
+    "cond:c1:value": 11.0,
+    "cond:c2:enabled": 1,
+    "cond:c2:value": 3.5,
+    "exit:syn-x1:enabled": 1,
+    "exitConditions": [
+     {
+      "action_type": "close",
+      "conditions": {
+       "conditions": [
+        {
+         "field": "has_buy_position",
+         "id": "c0"
+        },
+        {
+         "field": "profit_loss_percent",
+         "id": "c1",
+         "op": "<=",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": -7.0,
+         "value_max": -3.0,
+         "value_min": -12.0,
+         "value_step": 1.5
+        }
+       ],
+       "type": "AND"
+      },
+      "id": "syn-x1",
+      "toggle_optimize": true
+     }
+    ],
+    "initialSlPercent": 9.0,
+    "initialTpPercent": 21.0,
+    "model:atr_multiplier": 1.75,
+    "model:max_days_since_report": 12,
+    "model:max_virtual_equity_per_instrument_percent": 15.0,
+    "model:min_stop_loss_pct": 3.0,
+    "model:risk_per_trade_pct": 2.25,
+    "model:surprise_min_pct": 6.5,
+    "sl": 9.0,
+    "tp": 21.0
+   }
+  },
+  "case_id": "opt_FMPEarningsDrift",
+  "opt_backtest_block": {
+   "account_settings": {
+    "commission_per_trade": 0.5,
+    "fill_model": "next_bar_open",
+    "slippage_bps": 2.0,
+    "starting_cash": 25000.0
+   },
+   "backtest_id": 900000102,
+   "enabled_instruments": [
+    "MSFT",
+    "AAPL",
+    "JPM",
+    "KO",
+    "XOM",
+    "PG"
+   ],
+   "end_date": "2024-09-30",
+   "engine": "daily",
+   "execution_interval": "1h",
+   "experts": [
+    {
+     "class": "FMPEarningsDrift",
+     "settings": {}
+    }
+   ],
+   "initial_capital": 25000.0,
+   "name": "synthetic-opt-FMPEarningsDrift-trial",
+   "run_schedule_override": {
+    "days": {
+     "friday": false,
+     "monday": false,
+     "saturday": false,
+     "sunday": false,
+     "thursday": true,
+     "tuesday": true,
+     "wednesday": false
+    },
+    "times": [
+     "10:00"
+    ]
+   },
+   "seed": 1234,
+   "start_date": "2022-03-01",
+   "subtype": "daily_expert",
+   "warmup_days": 30
+  },
+  "strategy_name": "synthetic-strategy-FMPEarningsDrift"
+ },
+ {
+  "backtest": {
+   "end_date": "2024-09-30 00:00:00.000000",
+   "engine_type": "daily_expert",
+   "expert_name": "FMPInsiderClusterBuy",
+   "id": 903,
+   "initial_capital": 25000.0,
+   "name": "synthetic-opt-FMPInsiderClusterBuy",
+   "optimization_id": 303,
+   "start_date": "2022-03-01 00:00:00.000000",
+   "strategy_params": {
+    "buyEntryConditions": {
+     "conditions": [
+      {
+       "field": "has_no_position",
+       "id": "c0"
+      }
+     ],
+     "id": "grp-syn-ic",
+     "type": "AND"
+    },
+    "cond:c1:enabled": 0,
+    "cond:c1:value": 35.0,
+    "cond:c2:enabled": 0,
+    "cond:c2:value": 2.5,
+    "exit:syn-x2:enabled": 1,
+    "exit:syn-x3:enabled": 0,
+    "exitConditions": [
+     {
+      "action_type": "close",
+      "conditions": {
+       "conditions": [
+        {
+         "field": "has_position",
+         "id": "c0"
+        }
+       ],
+       "type": "AND"
+      },
+      "id": "syn-x2",
+      "toggle_optimize": true
+     }
+    ],
+    "initialSlPercent": 11.0,
+    "initialTpPercent": 17.0,
+    "model:atr_multiplier": 3.25,
+    "model:lookback_days": 45,
+    "model:max_virtual_equity_per_instrument_percent": 12.5,
+    "model:min_insiders": 4,
+    "model:min_stop_loss_pct": 5.5,
+    "model:risk_per_trade_pct": 1.25,
+    "sl": 11.0,
+    "tp": 17.0
+   }
+  },
+  "case_id": "opt_FMPInsiderClusterBuy",
+  "opt_backtest_block": {
+   "account_settings": {
+    "commission_per_trade": 0.75,
+    "fill_model": "same_bar_close",
+    "slippage_bps": 3.0,
+    "starting_cash": 25000.0
+   },
+   "backtest_id": 900000103,
+   "enabled_instruments": [
+    "WMT",
+    "HD",
+    "UNH",
+    "V",
+    "MA",
+    "CVX",
+    "PFE"
+   ],
+   "end_date": "2024-09-30",
+   "engine": "daily",
+   "execution_interval": "30min",
+   "experts": [
+    {
+     "class": "FMPInsiderClusterBuy",
+     "settings": {}
+    }
+   ],
+   "initial_capital": 25000.0,
+   "name": "synthetic-opt-FMPInsiderClusterBuy-trial",
+   "run_schedule_override": {
+    "days": {
+     "friday": false,
+     "monday": false,
+     "saturday": false,
+     "sunday": false,
+     "thursday": false,
+     "tuesday": false,
+     "wednesday": true
+    },
+    "times": [
+     "11:30"
+    ]
+   },
+   "seed": 2024,
+   "start_date": "2022-03-01",
+   "subtype": "daily_expert",
+   "warmup_days": 45
+  },
+  "strategy_name": "synthetic-strategy-FMPInsiderClusterBuy"
+ },
+ {
+  "backtest": {
+   "end_date": "2024-09-30 00:00:00.000000",
+   "engine_type": "daily_expert",
+   "expert_name": "FMPRating",
+   "id": 901,
+   "initial_capital": 25000.0,
+   "name": "synthetic-opt-FMPRating",
+   "optimization_id": 301,
+   "start_date": "2022-03-01 00:00:00.000000",
+   "strategy_params": {
+    "buyEntryConditions": {
+     "conditions": [
+      {
+       "conditions": [
+        {
+         "field": "bullish",
+         "id": "c0"
+        },
+        {
+         "field": "confidence",
+         "id": "c1",
+         "op": ">=",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": 62.0,
+         "value_max": 80.0,
+         "value_min": 50.0,
+         "value_step": 5.0
+        },
+        {
+         "field": "has_no_position",
+         "id": "c2"
+        },
+        {
+         "field": "highrisk",
+         "id": "c3",
+         "value": 7.5
+        }
+       ],
+       "id": "grp-syn-fr-a",
+       "type": "AND"
+      },
+      {
+       "conditions": [
+        {
+         "field": "bullish",
+         "id": "c0"
+        },
+        {
+         "field": "percent_to_current_target",
+         "id": "c1",
+         "op": ">",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": 62.0,
+         "value_max": 70.0,
+         "value_min": 55.0,
+         "value_step": 2.5
+        },
+        {
+         "field": "has_no_position",
+         "id": "c2",
+         "value": 3.3000000000000003
+        }
+       ],
+       "id": "grp-syn-fr-b",
+       "type": "AND"
+      },
+      {
+       "conditions": [
+        {
+         "field": "bullish",
+         "id": "c0"
+        },
+        {
+         "field": "expected_profit_target_percent",
+         "id": "c1",
+         "op": ">=",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": 62.0,
+         "value_max": 90.0,
+         "value_min": 40.0,
+         "value_step": 10.0
+        },
+        {
+         "field": "confidence",
+         "id": "c3",
+         "op": "<",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": 7.5,
+         "value_max": 10.0,
+         "value_min": 5.0,
+         "value_step": 0.5
+        }
+       ],
+       "id": "grp-syn-fr-c",
+       "type": "AND"
+      }
+     ],
+     "id": "grp-syn-fr-any",
+     "type": "OR"
+    },
+    "cond:c1:enabled": 1,
+    "cond:c1:value": 62.0,
+    "cond:c2:enabled": 1,
+    "cond:c2:value": 3.3000000000000003,
+    "cond:c3:enabled": 1,
+    "cond:c3:value": 7.5,
+    "cond:c4:enabled": 0,
+    "cond:c4:value": 44.0,
+    "exit:syn-x10:enabled": 1,
+    "exit:syn-x11:enabled": 1,
+    "exit:syn-x12:action_value": -3.5,
+    "exit:syn-x12:enabled": 1,
+    "exit:syn-x13:action_value": 1.5,
+    "exit:syn-x13:enabled": 1,
+    "exit:syn-x14:enabled": 1,
+    "exit:syn-x15:enabled": 1,
+    "exit:syn-x16:action_value": 6.0,
+    "exit:syn-x16:enabled": 0,
+    "exit:syn-x17:enabled": 0,
+    "exitConditions": [
+     {
+      "action_type": "close",
+      "conditions": {
+       "conditions": [
+        {
+         "field": "has_position",
+         "id": "c0"
+        },
+        {
+         "field": "rating_downgraded",
+         "id": "c1",
+         "value": 62.0
+        },
+        {
+         "field": "profit_loss_percent",
+         "id": "c2",
+         "op": ">=",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": 3.3000000000000003,
+         "value_max": 5.0,
+         "value_min": 1.0,
+         "value_step": 0.5
+        }
+       ],
+       "type": "AND"
+      },
+      "id": "syn-x10",
+      "toggle_optimize": true
+     },
+     {
+      "action_type": "close",
+      "conditions": {
+       "conditions": [
+        {
+         "field": "has_position",
+         "id": "c0"
+        },
+        {
+         "field": "profit_loss_percent",
+         "id": "c1",
+         "op": "<=",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": -9.0,
+         "value_max": -5.0,
+         "value_min": -15.0,
+         "value_step": 1.0
+        }
+       ],
+       "type": "AND"
+      },
+      "id": "syn-x11",
+      "toggle_optimize": true
+     },
+     {
+      "action_type": "adjust_take_profit",
+      "action_value": -3.5,
+      "action_value_max": -1.0,
+      "action_value_min": -6.0,
+      "action_value_optimize": true,
+      "action_value_step": 0.5,
+      "conditions": {
+       "conditions": [
+        {
+         "field": "has_position",
+         "id": "c0"
+        },
+        {
+         "field": "days_opened",
+         "id": "c1",
+         "op": ">=",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": 25.0,
+         "value_max": 40.0,
+         "value_min": 10.0,
+         "value_step": 5.0
+        },
+        {
+         "field": "days_opened",
+         "id": "c2",
+         "op": "<",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": 55.0,
+         "value_max": 100.0,
+         "value_min": 40.0,
+         "value_step": 10.0
+        }
+       ],
+       "type": "AND"
+      },
+      "id": "syn-x12",
+      "reference_value": "expert_target_price",
+      "toggle_optimize": true
+     },
+     {
+      "action_type": "adjust_take_profit",
+      "action_value": 1.5,
+      "action_value_max": 4.0,
+      "action_value_min": 0.0,
+      "action_value_optimize": true,
+      "action_value_step": 0.5,
+      "conditions": {
+       "conditions": [
+        {
+         "field": "has_position",
+         "id": "c0"
+        },
+        {
+         "field": "days_opened",
+         "id": "c1",
+         "op": ">=",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": 70.0,
+         "value_max": 110.0,
+         "value_min": 50.0,
+         "value_step": 10.0
+        },
+        {
+         "field": "profit_loss_percent",
+         "id": "c2",
+         "op": "<",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": 2.0,
+         "value_max": 6.0,
+         "value_min": 0.0,
+         "value_step": 1.0
+        }
+       ],
+       "type": "AND"
+      },
+      "id": "syn-x13",
+      "reference_value": "order_open_price",
+      "toggle_optimize": true
+     },
+     {
+      "action_type": "close",
+      "conditions": {
+       "conditions": [
+        {
+         "field": "has_position",
+         "id": "c0"
+        },
+        {
+         "field": "current_rating_neutral",
+         "id": "c1",
+         "value": 62.0
+        },
+        {
+         "field": "profit_loss_percent",
+         "id": "c2",
+         "op": ">=",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": -2.0,
+         "value_max": 0.0,
+         "value_min": -8.0,
+         "value_step": 1.0
+        }
+       ],
+       "type": "AND"
+      },
+      "id": "syn-x14",
+      "toggle_optimize": true
+     },
+     {
+      "action_type": "increase_instrument_share",
+      "conditions": {
+       "conditions": [
+        {
+         "field": "has_position",
+         "id": "c0"
+        },
+        {
+         "field": "new_target_higher",
+         "id": "c1",
+         "value": 62.0
+        },
+        {
+         "field": "profit_loss_percent",
+         "id": "c2",
+         "op": ">=",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": 6.0,
+         "value_max": 9.0,
+         "value_min": 3.0,
+         "value_step": 1.5
+        },
+        {
+         "field": "instrument_account_share",
+         "id": "c3",
+         "op": "<",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": 8.0,
+         "value_max": 16.0,
+         "value_min": 4.0,
+         "value_step": 2.0
+        }
+       ],
+       "type": "AND"
+      },
+      "id": "syn-x15",
+      "toggle_optimize": true
+     }
+    ],
+    "initialSlPercent": 7.5,
+    "initialTpPercent": 12.5,
+    "model:atr_multiplier": 1.5,
+    "model:max_virtual_equity_per_instrument_percent": 18.0,
+    "model:min_analysts": 7,
+    "model:min_stop_loss_pct": 4.5,
+    "model:price_target_window_days": 45,
+    "model:profit_ratio": 0.8,
+    "model:risk_per_trade_pct": 0.75,
+    "model:target_price_type": "high",
+    "sl": 7.5,
+    "tp": 12.5
+   }
+  },
+  "case_id": "opt_FMPRating",
+  "opt_backtest_block": {
+   "account_settings": {
+    "commission_per_trade": 0.25,
+    "fill_model": "next_bar_open",
+    "slippage_bps": 1.5,
+    "starting_cash": 25000.0
+   },
+   "backtest_id": 900000101,
+   "enabled_instruments": [
+    "AAPL",
+    "NVDA",
+    "ORCL",
+    "IBM",
+    "CSCO",
+    "TXN",
+    "QCOM",
+    "ADBE"
+   ],
+   "end_date": "2024-09-30",
+   "engine": "daily",
+   "execution_interval": "15min",
+   "experts": [
+    {
+     "class": "FMPRating",
+     "settings": {}
+    }
+   ],
+   "initial_capital": 25000.0,
+   "name": "synthetic-opt-FMPRating-trial",
+   "run_schedule_override": {
+    "days": {
+     "friday": true,
+     "monday": true,
+     "saturday": false,
+     "sunday": false,
+     "thursday": false,
+     "tuesday": false,
+     "wednesday": false
+    },
+    "times": [
+     "09:45"
+    ]
+   },
+   "seed": 77,
+   "start_date": "2022-03-01",
+   "subtype": "daily_expert",
+   "warmup_days": 40
+  },
+  "strategy_name": "synthetic-strategy-FMPRating"
+ },
+ {
+  "backtest": {
+   "end_date": "2024-09-30 00:00:00.000000",
+   "engine_type": "daily_expert",
+   "expert_name": "FactorRanker",
+   "id": 904,
+   "initial_capital": 25000.0,
+   "name": "synthetic-opt-FactorRanker",
+   "optimization_id": 304,
+   "start_date": "2022-03-01 00:00:00.000000",
+   "strategy_params": {
+    "exitConditions": [],
+    "initialSlPercent": 3.0,
+    "initialTpPercent": 8.0,
+    "model:factor_weight_momentum": 0.75,
+    "model:factor_weight_pead": 0.5,
+    "model:factor_weight_quality": 1.25,
+    "model:factor_weight_value": 0.6,
+    "model:max_weight_per_name": 0.15,
+    "model:top_n": 12
+   }
+  },
+  "case_id": "opt_FactorRanker",
+  "opt_backtest_block": {
+   "account_settings": {
+    "commission_per_trade": 0.5,
+    "fill_model": "next_bar_open",
+    "slippage_bps": 2.5,
+    "starting_cash": 25000.0
+   },
+   "backtest_id": 900000104,
+   "enabled_instruments": [
+    "KO",
+    "PEP",
+    "MCD",
+    "NKE",
+    "DIS",
+    "T",
+    "VZ",
+    "MRK",
+    "ABT"
+   ],
+   "end_date": "2024-09-30",
+   "engine": "daily",
+   "execution_interval": "1d",
+   "experts": [
+    {
+     "class": "FactorRanker",
+     "settings": {
+      "universe_source": "static",
+      "weighting": "rank"
+     }
+    }
+   ],
+   "initial_capital": 25000.0,
+   "name": "synthetic-opt-FactorRanker-trial",
+   "run_schedule_override": {
+    "days": {
+     "friday": false,
+     "monday": false,
+     "saturday": false,
+     "sunday": false,
+     "thursday": true,
+     "tuesday": false,
+     "wednesday": false
+    },
+    "times": [
+     "15:30"
+    ]
+   },
+   "seed": 99,
+   "start_date": "2022-03-01",
+   "subtype": "daily_expert",
+   "warmup_days": 320
+  },
+  "strategy_name": "synthetic-strategy-FactorRanker"
+ },
+ {
+  "backtest": {
+   "end_date": "2024-12-31 00:00:00.000000",
+   "engine_type": "daily_expert",
+   "expert_name": "FMPRating",
+   "id": 905,
+   "initial_capital": 50000.0,
+   "name": "synthetic-opt-screener-FMPRating",
+   "optimization_id": 305,
+   "start_date": "2023-06-01 00:00:00.000000",
+   "strategy_params": {
+    "buyEntryConditions": {
+     "conditions": [
+      {
+       "field": "days_since_last_close",
+       "id": "gate_recent_close",
+       "op": ">",
+       "optimize": true,
+       "toggle_optimize": true,
+       "value": 10.0,
+       "value_max": 20,
+       "value_min": 0,
+       "value_step": 2
+      },
+      {
+       "field": "days_since_last_losing_close",
+       "id": "gate_recent_loss",
+       "op": ">",
+       "optimize": true,
+       "toggle_optimize": true,
+       "value": 6.0,
+       "value_max": 24,
+       "value_min": 0,
+       "value_step": 3
+      }
+     ],
+     "id": "syn-root",
+     "type": "AND"
+    },
+    "cond:gate_confidence_floor:enabled": 0,
+    "cond:gate_confidence_floor:value": 55.0,
+    "cond:gate_profit_floor:enabled": 0,
+    "cond:gate_profit_floor:value": 4.5,
+    "cond:gate_recent_close:enabled": 1,
+    "cond:gate_recent_close:value": 10.0,
+    "cond:gate_recent_loss:enabled": 1,
+    "cond:gate_recent_loss:value": 6.0,
+    "cond:xa:value": 3.0,
+    "cond:xh:value": 35.0,
+    "exit:exit_flip:enabled": 0,
+    "exit:exit_negative:enabled": 1,
+    "exit:exit_stale:enabled": 1,
+    "exit:exit_trail:action_value": 1.5,
+    "exit:exit_trail:enabled": 0,
+    "exitConditions": [
+     {
+      "action_type": "close",
+      "conditions": {
+       "conditions": [
+        {
+         "field": "rating_positive_to_negative",
+         "id": "xn"
+        }
+       ],
+       "type": "AND"
+      },
+      "id": "exit_negative",
+      "toggle_optimize": true
+     },
+     {
+      "action_type": "close",
+      "conditions": {
+       "conditions": [
+        {
+         "field": "days_opened",
+         "id": "xh",
+         "op": ">",
+         "optimize": true,
+         "value": 35.0,
+         "value_max": 105,
+         "value_min": 15,
+         "value_step": 15
+        }
+       ],
+       "type": "AND"
+      },
+      "id": "exit_stale",
+      "toggle_optimize": true
+     }
+    ],
+    "initialSlPercent": 7.0,
+    "initialTpPercent": 13.0,
+    "model:atr_multiplier": 2.75,
+    "model:max_virtual_equity_per_instrument_percent": 20.0,
+    "model:min_analysts": 8,
+    "model:min_stop_loss_pct": 6.0,
+    "model:price_target_window_days": 120,
+    "model:profit_ratio": 1.4,
+    "model:risk_per_trade_pct": 2.0,
+    "model:target_price_type": "low_consensus_avg",
+    "screener:screener_market_cap_min": 2000000000.0,
+    "screener:screener_max_stocks": 25,
+    "screener:screener_price_drop_pct": 6.5,
+    "screener:screener_relative_volume_min": 1.2000000000000002,
+    "screener:screener_weinstein_stage2_only": 1,
+    "sl": 7.0,
+    "tp": 13.0
+   }
+  },
+  "case_id": "opt_screener",
+  "opt_backtest_block": {
+   "account_settings": {
+    "commission_per_trade": 1.25,
+    "fill_model": "same_bar_close",
+    "slippage_bps": 4.0,
+    "starting_cash": 50000.0
+   },
+   "backtest_id": 900000105,
+   "enabled_instruments": [
+    "AMD",
+    "BAC",
+    "CAT",
+    "F",
+    "GE",
+    "INTC",
+    "PYPL",
+    "UBER"
+   ],
+   "end_date": "2024-12-31",
+   "engine": "daily",
+   "execution_interval": "1d",
+   "experts": [
+    {
+     "class": "FMPRating",
+     "settings": {}
+    }
+   ],
+   "initial_capital": 50000.0,
+   "name": "synthetic-opt-screener-FMPRating-trial",
+   "run_schedule_override": {
+    "days": {
+     "friday": false,
+     "monday": false,
+     "saturday": false,
+     "sunday": false,
+     "thursday": false,
+     "tuesday": true,
+     "wednesday": false
+    },
+    "times": [
+     "10:30"
+    ]
+   },
+   "screener_opt": {
+    "apply_to_expert_settings": false,
+    "base_settings": {},
+    "cadence_days": 5,
+    "store": "C:\\ba2-synthetic\\cache\\screener\\metric_store"
+   },
+   "seed": 555,
+   "start_date": "2023-06-01",
+   "subtype": "daily_expert",
+   "warmup_days": 50
+  },
+  "strategy_name": "synthetic-strategy-screener-FMPRating"
+ },
+ {
+  "backtest": {
+   "end_date": "2024-09-30 00:00:00.000000",
+   "engine_type": "daily_expert",
+   "expert_name": "FMPEarningsDrift",
+   "id": 902,
+   "initial_capital": 25000.0,
+   "name": "synthetic-opt-FMPEarningsDrift",
+   "optimization_id": null,
+   "start_date": "2022-03-01 00:00:00.000000",
+   "strategy_params": {
+    "buyEntryConditions": {
+     "conditions": [
+      {
+       "field": "has_no_position",
+       "id": "c0"
+      },
+      {
+       "field": "rating_upgraded",
+       "id": "c1",
+       "value": 11.0
+      },
+      {
+       "field": "expected_profit_percent",
+       "id": "c2",
+       "op": ">",
+       "optimize": true,
+       "toggle_optimize": true,
+       "value": 3.5,
+       "value_max": 6.0,
+       "value_min": 1.0,
+       "value_step": 0.5
+      }
+     ],
+     "id": "grp-syn-ed",
+     "type": "AND"
+    },
+    "commission": 1.0,
+    "cond:c1:enabled": 1,
+    "cond:c1:value": 11.0,
+    "cond:c2:enabled": 1,
+    "cond:c2:value": 3.5,
+    "enableShort": false,
+    "executionInterval": "1d",
+    "exit:syn-x1:enabled": 1,
+    "exitConditions": [
+     {
+      "action_type": "close",
+      "conditions": {
+       "conditions": [
+        {
+         "field": "has_buy_position",
+         "id": "c0"
+        },
+        {
+         "field": "profit_loss_percent",
+         "id": "c1",
+         "op": "<=",
+         "optimize": true,
+         "toggle_optimize": true,
+         "value": -7.0,
+         "value_max": -3.0,
+         "value_min": -12.0,
+         "value_step": 1.5
+        }
+       ],
+       "type": "AND"
+      },
+      "id": "syn-x1",
+      "toggle_optimize": true
+     }
+    ],
+    "fillModel": "next_open",
+    "initialSlPercent": 9.0,
+    "initialTpPercent": 21.0,
+    "model:atr_multiplier": 1.75,
+    "model:max_days_since_report": 12,
+    "model:max_virtual_equity_per_instrument_percent": 15.0,
+    "model:min_stop_loss_pct": 3.0,
+    "model:risk_per_trade_pct": 2.25,
+    "model:surprise_min_pct": 6.5,
+    "seed": 7,
+    "sl": 9.0,
+    "slippage": 5,
+    "tp": 21.0,
+    "universe": {
+     "mode": "static",
+     "symbols": [
+      "AAPL",
+      "MSFT"
+     ]
+    },
+    "warmupDays": 20
+   }
+  },
+  "case_id": "standalone_fallback",
+  "opt_backtest_block": null,
+  "strategy_name": "synthetic-strategy-FMPEarningsDrift"
+ },
+ {
+  "backtest": {
+   "end_date": "2024-09-30 00:00:00.000000",
+   "engine_type": "daily_expert",
+   "expert_name": "FMPEarningsDrift",
+   "id": 902,
+   "initial_capital": 25000.0,
+   "name": "synthetic-opt-FMPEarningsDrift",
+   "optimization_id": 302,
+   "start_date": "2022-03-01 00:00:00.000000",
+   "strategy_params": {
+    "cond:c1:enabled": 1,
+    "cond:c1:value": 11.0,
+    "cond:c2:enabled": 1,
+    "cond:c2:value": 3.5,
+    "entryRules": [
+     {
+      "actions": [
+       {
+        "action": "buy",
+        "action_type": "buy"
+       }
+      ],
+      "conditions": {
+       "conditions": [
+        {
+         "comparison": "is_true",
+         "field": "bullish",
+         "fieldType": "flag",
+         "field_type": "flag",
+         "id": "buy-bullish",
+         "op": "is_true",
+         "optimize": false,
+         "optimizeEnabled": false
+        },
+        {
+         "comparison": "is_true",
+         "field": "has_no_position",
+         "fieldType": "flag",
+         "field_type": "flag",
+         "id": "c0",
+         "op": "is_true",
+         "optimize": false,
+         "optimizeEnabled": false
+        },
+        {
+         "comparison": "is_true",
+         "field": "rating_upgraded",
+         "fieldType": "flag",
+         "field_type": "flag",
+         "id": "c1",
+         "op": "is_true",
+         "optimize": false,
+         "optimizeEnabled": false
+        },
+        {
+         "comparison": ">",
+         "field": "expected_profit_percent",
+         "fieldType": "numeric",
+         "field_type": "numeric",
+         "id": "c2",
+         "op": ">",
+         "optimize": true,
+         "optimizeEnabled": true,
+         "toggleOptimize": true,
+         "toggle_optimize": true,
+         "value": 3.5,
+         "valueMax": 6.0,
+         "valueMin": 1.0,
+         "valueStep": 0.5,
+         "value_max": 6.0,
+         "value_min": 1.0,
+         "value_step": 0.5
+        }
+       ],
+       "id": "grp-syn-ed",
+       "operator": "AND",
+       "type": "AND"
+      },
+      "continueProcessing": false,
+      "continue_processing": false,
+      "id": "buy",
+      "name": "enter-buy"
+     }
+    ],
+    "exit:syn-x1:enabled": 1,
+    "exitRules": [
+     {
+      "actions": [
+       {
+        "action": "close",
+        "action_type": "close"
+       }
+      ],
+      "conditions": {
+       "conditions": [
+        {
+         "comparison": "is_true",
+         "field": "has_buy_position",
+         "fieldType": "flag",
+         "field_type": "flag",
+         "id": "c0",
+         "op": "is_true",
+         "optimize": false,
+         "optimizeEnabled": false
+        },
+        {
+         "comparison": "<=",
+         "field": "profit_loss_percent",
+         "fieldType": "numeric",
+         "field_type": "numeric",
+         "id": "c1",
+         "op": "<=",
+         "optimize": true,
+         "optimizeEnabled": true,
+         "toggleOptimize": true,
+         "toggle_optimize": true,
+         "value": -7.0,
+         "valueMax": -3.0,
+         "valueMin": -12.0,
+         "valueStep": 1.5,
+         "value_max": -3.0,
+         "value_min": -12.0,
+         "value_step": 1.5
+        }
+       ],
+       "operator": "AND",
+       "type": "AND"
+      },
+      "continueProcessing": false,
+      "continue_processing": false,
+      "id": "syn-x1",
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     }
+    ],
+    "initialSlPercent": 9.0,
+    "initialTpPercent": 21.0,
+    "model:atr_multiplier": 1.75,
+    "model:max_days_since_report": 12,
+    "model:max_virtual_equity_per_instrument_percent": 15.0,
+    "model:min_stop_loss_pct": 3.0,
+    "model:risk_per_trade_pct": 2.25,
+    "model:surprise_min_pct": 6.5,
+    "sl": 9.0,
+    "tp": 21.0
+   }
+  },
+  "case_id": "unified_rules",
+  "opt_backtest_block": {
+   "account_settings": {
+    "commission_per_trade": 0.5,
+    "fill_model": "next_bar_open",
+    "slippage_bps": 2.0,
+    "starting_cash": 25000.0
+   },
+   "backtest_id": 900000102,
+   "enabled_instruments": [
+    "MSFT",
+    "AAPL",
+    "JPM",
+    "KO",
+    "XOM",
+    "PG"
+   ],
+   "end_date": "2024-09-30",
+   "engine": "daily",
+   "execution_interval": "1h",
+   "experts": [
+    {
+     "class": "FMPEarningsDrift",
+     "settings": {}
+    }
+   ],
+   "initial_capital": 25000.0,
+   "name": "synthetic-opt-FMPEarningsDrift-trial",
+   "run_schedule_override": {
+    "days": {
+     "friday": false,
+     "monday": false,
+     "saturday": false,
+     "sunday": false,
+     "thursday": true,
+     "tuesday": true,
+     "wednesday": false
+    },
+    "times": [
+     "10:00"
+    ]
+   },
+   "seed": 1234,
+   "start_date": "2022-03-01",
+   "subtype": "daily_expert",
+   "warmup_days": 30
+  },
+  "strategy_name": "synthetic-strategy-FMPEarningsDrift"
+ }
+]

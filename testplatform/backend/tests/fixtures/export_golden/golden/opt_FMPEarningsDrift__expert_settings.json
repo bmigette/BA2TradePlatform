@@ -1,0 +1,63 @@
+{
+ "backtest_id": 902,
+ "backtest_only": {
+  "entry_action": null,
+  "hold_assigned_stock": false
+ },
+ "end_date": "2024-09-30T00:00:00",
+ "engine_type": "daily_expert",
+ "execution": {
+  "commission": 0.5,
+  "enable_short": false,
+  "fill_model": "next_bar_open",
+  "run_schedule_override": {
+   "days": {
+    "friday": false,
+    "monday": false,
+    "saturday": false,
+    "sunday": false,
+    "thursday": true,
+    "tuesday": true,
+    "wednesday": false
+   },
+   "times": [
+    "10:00"
+   ]
+  },
+  "seed": 1234,
+  "slippage": 2.0,
+  "warmup_days": 30
+ },
+ "execution_interval": "1h",
+ "expert": "FMPEarningsDrift",
+ "initial_capital": 25000.0,
+ "name": "synthetic-opt-FMPEarningsDrift",
+ "settings": {
+  "expert_params": {
+   "allow_automated_trade_modification": true,
+   "allow_automated_trade_opening": true,
+   "atr_multiplier": 1.75,
+   "enable_buy": true,
+   "enable_sell": false,
+   "max_days_since_report": 12,
+   "max_virtual_equity_per_instrument_percent": 15.0,
+   "min_stop_loss_pct": 3.0,
+   "regime_overlay_enabled": false,
+   "risk_per_trade_pct": 2.25,
+   "surprise_min_pct": 6.5,
+   "use_atr_stop": false
+  }
+ },
+ "start_date": "2022-03-01T00:00:00",
+ "universe": {
+  "mode": "static",
+  "symbols": [
+   "MSFT",
+   "AAPL",
+   "JPM",
+   "KO",
+   "XOM",
+   "PG"
+  ]
+ }
+}

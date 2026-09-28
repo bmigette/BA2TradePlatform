@@ -1,0 +1,68 @@
+{
+ "backtest_id": 904,
+ "backtest_only": {
+  "entry_action": null,
+  "hold_assigned_stock": false
+ },
+ "end_date": "2024-09-30T00:00:00",
+ "engine_type": "daily_expert",
+ "execution": {
+  "commission": 0.5,
+  "enable_short": false,
+  "fill_model": "next_bar_open",
+  "run_schedule_override": {
+   "days": {
+    "friday": false,
+    "monday": false,
+    "saturday": false,
+    "sunday": false,
+    "thursday": true,
+    "tuesday": false,
+    "wednesday": false
+   },
+   "times": [
+    "15:30"
+   ]
+  },
+  "seed": 99,
+  "slippage": 2.5,
+  "warmup_days": 320
+ },
+ "execution_interval": "1d",
+ "expert": "FactorRanker",
+ "initial_capital": 25000.0,
+ "name": "synthetic-opt-FactorRanker",
+ "settings": {
+  "expert_params": {
+   "allow_automated_trade_modification": true,
+   "allow_automated_trade_opening": true,
+   "enable_buy": true,
+   "enable_sell": false,
+   "factor_weight_momentum": 0.75,
+   "factor_weight_pead": 0.5,
+   "factor_weight_quality": 1.25,
+   "factor_weight_value": 0.6,
+   "max_weight_per_name": 0.15,
+   "regime_overlay_enabled": false,
+   "top_n": 12,
+   "universe_source": "static",
+   "use_atr_stop": false,
+   "weighting": "rank"
+  }
+ },
+ "start_date": "2022-03-01T00:00:00",
+ "universe": {
+  "mode": "static",
+  "symbols": [
+   "KO",
+   "PEP",
+   "MCD",
+   "NKE",
+   "DIS",
+   "T",
+   "VZ",
+   "MRK",
+   "ABT"
+  ]
+ }
+}

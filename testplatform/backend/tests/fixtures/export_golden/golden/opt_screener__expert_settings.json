@@ -1,0 +1,66 @@
+{
+ "backtest_id": 905,
+ "backtest_only": {
+  "entry_action": null,
+  "hold_assigned_stock": false
+ },
+ "end_date": "2024-12-31T00:00:00",
+ "engine_type": "daily_expert",
+ "execution": {
+  "commission": 1.25,
+  "enable_short": false,
+  "fill_model": "same_bar_close",
+  "run_schedule_override": {
+   "days": {
+    "friday": false,
+    "monday": false,
+    "saturday": false,
+    "sunday": false,
+    "thursday": false,
+    "tuesday": true,
+    "wednesday": false
+   },
+   "times": [
+    "10:30"
+   ]
+  },
+  "seed": 555,
+  "slippage": 4.0,
+  "warmup_days": 50
+ },
+ "execution_interval": "1d",
+ "expert": "FMPRating",
+ "initial_capital": 50000.0,
+ "name": "synthetic-opt-screener-FMPRating",
+ "settings": {
+  "expert_params": {
+   "allow_automated_trade_modification": true,
+   "allow_automated_trade_opening": true,
+   "atr_multiplier": 2.75,
+   "enable_buy": true,
+   "enable_sell": false,
+   "max_virtual_equity_per_instrument_percent": 20.0,
+   "min_analysts": 8,
+   "min_stop_loss_pct": 6.0,
+   "price_target_window_days": 120,
+   "profit_ratio": 1.4,
+   "regime_overlay_enabled": false,
+   "risk_per_trade_pct": 2.0,
+   "target_price_type": "low_consensus_avg",
+   "use_atr_stop": false
+  }
+ },
+ "start_date": "2023-06-01T00:00:00",
+ "universe": {
+  "mode": "screener",
+  "screener_cadence_days": 5,
+  "screener_settings": {
+   "screener_market_cap_min": 2000000000.0,
+   "screener_max_stocks": 25,
+   "screener_price_drop_pct": 6.5,
+   "screener_relative_volume_min": 1.2000000000000002,
+   "screener_weinstein_stage2_only": 1
+  },
+  "screener_store": "C:\\ba2-synthetic\\cache\\screener\\metric_store"
+ }
+}
