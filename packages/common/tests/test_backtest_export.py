@@ -47,11 +47,27 @@ def test_bypass_overlay_only_when_bypass_check_true():
     bt = _bt(expert_name="FactorRanker", strategy_params={"screener:min_mcap": 5})
     on = be.derive_export_payload(bt, "expert_settings", opt_backtest_block=block,
                                   bypass_check=lambda name: name == "FactorRanker")
-    off = be.derive_export_payload(bt, "expert_settings", opt_backtest_block=block)
+    off = be.derive_export_payload(bt, "expert_settings", opt_backtest_block=block,
+                                   bypass_check=lambda name: False)
     assert on["settings"]["expert_params"]["universe_source"] == "screener"
     assert on["settings"]["expert_params"]["min_mcap"] == 5
     assert off["settings"]["expert_params"]["universe_source"] == "static"
     assert on["universe"]["mode"] == "screener"
+    # No bypass_check at all: the expert's universe cannot be decided, so the export refuses
+    # rather than silently exporting the non-bypass (static) universe_source.
+    with pytest.raises(be.ExportRefused, match="apply_to_expert_settings needs a bypass_check"):
+        be.derive_export_payload(bt, "expert_settings", opt_backtest_block=block)
+
+
+def test_screener_without_apply_to_expert_settings_needs_no_bypass_check():
+    """bypass_check is only needed on the screener + apply_to_expert_settings branch."""
+    block = {"experts": [{"class": "FactorRanker", "settings": {"universe_source": "static"}}],
+             "account_settings": {}, "screener_opt": {
+                 "store": "sp500", "base_settings": {"min_mcap": 1}, "cadence_days": 7}}
+    bt = _bt(expert_name="FactorRanker", strategy_params={"screener:min_mcap": 5})
+    p = be.derive_export_payload(bt, "expert_settings", opt_backtest_block=block)
+    assert p["settings"]["expert_params"]["universe_source"] == "static"
+    assert p["universe"]["mode"] == "screener"
 
 
 def test_ruleset_unified_rules_pass_through_normalized():
@@ -75,6 +91,19 @@ def test_legacy_reconstruction_callback_used_only_for_gene_only_rows():
     assert be.needs_legacy_reconstruction(with_trees.strategy_params) is False
     empty_exits = _bt(strategy_params={"cond:c1:threshold": 3, "exitConditions": []})
     assert be.needs_legacy_reconstruction(empty_exits.strategy_params) is True
+
+
+def test_gene_only_row_without_reconstructor_is_refused():
+    """A gene-only legacy row's ruleset can only be rebuilt by the test app's decode_params;
+    without a reconstructor the export refuses instead of exporting an empty ruleset."""
+    gene_only = _bt(strategy_params={"cond:c1:threshold": 3})
+    with pytest.raises(be.ExportRefused, match="gene-only legacy row"):
+        be.derive_export_payload(gene_only, "ruleset")
+    # Rows that do not need reconstruction still export without one.
+    unified = _bt(strategy_params={"cond:c1:threshold": 3, "entryRules": []})
+    assert be.needs_legacy_reconstruction(unified.strategy_params) is False
+    assert be.derive_export_payload(unified, "ruleset")["optimized_genes"] == {
+        "cond:c1:threshold": 3}
 
 
 def test_unsupported_kind():

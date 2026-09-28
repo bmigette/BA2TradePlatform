@@ -45,8 +45,8 @@ def needs_legacy_reconstruction(strategy_params: Any) -> bool:
     """True when the ``ruleset`` export of this row can only be rebuilt by decoding its flat
     genes against the optimization's base strategy (the test app's ``decode_params``): no
     unified rule lists, no legacy trees, but rule genes present. Mirrors the condition inside
-    ``derive_export_payload``; callers without a reconstructor must treat such rows as not
-    exportable."""
+    ``derive_export_payload``, which raises ExportRefused for such rows when no reconstructor
+    is given."""
     sp = strategy_params if isinstance(strategy_params, dict) else {}
     for k in ("entryRules", "entry_rules", "exitRules", "exit_rules"):
         if sp.get(k) is not None:
@@ -90,9 +90,16 @@ def derive_export_payload(
     start_date, end_date, initial_capital. ``opt_backtest_block`` is the source optimization's
     ``optimization_config['backtest']`` dict, or None. ``bypass_check(expert_name)`` is only
     consulted on the screener + apply_to_expert_settings branch (lazy, as before).
-    ``reconstruct_legacy_ruleset()`` is only consulted for gene-only legacy rows.
+    ``reconstruct_legacy_ruleset()`` is only consulted for gene-only legacy rows (see
+    ``needs_legacy_reconstruction``).
 
-    Raises ExportRefused (undeployable ruleset) or UnsupportedExportKind.
+    The two callbacks are optional, but a row whose branch needs one that was not given is
+    REFUSED rather than silently derived without it (which would export a different payload
+    than the test app does): a screener + apply_to_expert_settings run with no
+    ``bypass_check``, or a gene-only legacy row with no ``reconstruct_legacy_ruleset``.
+
+    Raises ExportRefused (undeployable ruleset, or a needed callback is missing) or
+    UnsupportedExportKind.
     """
     sp = backtest.strategy_params or {}
 
@@ -156,7 +163,13 @@ def derive_export_payload(
                 # Re-derive the same overlay here so the export/deploy reproduces what the backtest
                 # actually ran with, not the un-overridden template. Explicit model:* overrides
                 # still win last, matching _build_daily_trial_config's merge order.
-                if (screener_opt.get("apply_to_expert_settings") and bypass_check is not None
+                # Without a bypass_check the expert's universe cannot be decided: refuse rather
+                # than silently export the non-bypass (template) universe_source.
+                if screener_opt.get("apply_to_expert_settings") and bypass_check is None:
+                    raise ExportRefused(
+                        "screener run with apply_to_expert_settings needs a bypass_check to "
+                        "decide the expert's universe")
+                if (screener_opt.get("apply_to_expert_settings")
                         and bypass_check(backtest.expert_name)):
                     expert_params = {
                         **persisted_fixed,
@@ -297,9 +310,12 @@ def derive_export_payload(
             # trees from the optimization's base strategy + those genes so Load still
             # restores conditions.
             if buy is None and sell is None and not exits and not entries and cond_genes:
-                r_buy, r_sell, r_exits, r_entries = (
-                    reconstruct_legacy_ruleset() if reconstruct_legacy_ruleset is not None
-                    else (None, None, None, None))
+                # Without a reconstructor this row would silently export an EMPTY ruleset.
+                if reconstruct_legacy_ruleset is None:
+                    raise ExportRefused(
+                        "gene-only legacy row: its ruleset needs the test app's reconstruction "
+                        "(decode_params); no reconstructor was given")
+                r_buy, r_sell, r_exits, r_entries = reconstruct_legacy_ruleset()
                 buy = buy if buy is not None else r_buy
                 sell = sell if sell is not None else r_sell
                 exits = exits if exits else r_exits
