@@ -6,7 +6,6 @@ from copy import deepcopy
 from datetime import date, datetime, timedelta
 import importlib
 import json
-import math
 import os
 from pathlib import Path
 import random
@@ -261,8 +260,14 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
 
 
 def ranked_results(rows, limit):
-    """Deduplicate by parameters, not rounded fitness: tied neighbours remain inspectable."""
-    valid = [r for r in rows if isinstance(r["fitness"], (int, float)) and math.isfinite(r["fitness"])]
+    """Deduplicate by parameters, not rounded fitness: tied neighbours remain inspectable.
+
+    Only MEASURED rows rank (the optimizer's own ``is_measured_result``): a stalled row carries a
+    finite sentinel fitness, and a grid often has fewer combos than ``save_top``, so a finiteness
+    filter alone would re-run a genome that never produced a result as a TOP row.
+    """
+    from app.services.strategy_fitness import is_measured_result
+    valid = [r for r in rows if is_measured_result(r)]
     ranked, seen = [], set()
     for row in sorted(valid, key=lambda r: (-r["fitness"], fingerprint(r["params"]))):
         key = fingerprint(row["params"])

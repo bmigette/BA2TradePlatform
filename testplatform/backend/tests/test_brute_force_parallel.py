@@ -53,6 +53,10 @@ class _Seam:
 
     def __init__(self, delay=True):
         self.delay = delay
+        # When set, the winner (8, -6) blocks until its tied neighbour (8, -5) has FINISHED, so a
+        # batch deterministically sees the winner land after it (a sleep alone raced).
+        self.hold_winner = False
+        self.neighbour_done = threading.Event()
         self.lock = threading.Lock()
         self.started = []
         self.finished = []
@@ -61,11 +65,15 @@ class _Seam:
         tp, sl = _tp_sl(config["entry_rules"])
         with self.lock:
             self.started.append((tp, sl))
-        if self.delay:
+        if self.hold_winner and (tp, sl) == (8.0, -6.0):
+            assert self.neighbour_done.wait(10), "tied neighbour (8, -5) never finished"
+        elif self.delay:
             time.sleep(0.03 if sl == -6.0 else 0.001)
         score = 10.0 - abs(tp - 8.0)
         with self.lock:
             self.finished.append((tp, sl))
+        if (tp, sl) == (8.0, -5.0):
+            self.neighbour_done.set()
         return {"total_trades": 5, "sharpe_ratio": score, "max_drawdown": 5.0,
                 "total_return": score, "profit_factor": 1.5, "win_rate": 55.0}
 
@@ -238,6 +246,8 @@ def test_combos_are_itertools_product_order():
 
 # --------------------------------------------------------------------------- local pool
 def test_parallel_4_local_pool_equals_serial(seam, serial_reference):
+    seam.hold_winner = True
+    seam.neighbour_done.clear()      # the serial reference run already set it
     out, row = _run(parallel=4, task_id="bf-local4")
     assert out["status"] == "completed", out
     assert out["best_params"] == serial_reference["best_params"] == {TP: 8.0, SL: -6.0}
@@ -324,4 +334,86 @@ def test_batch_assembler_dedupes_keys_and_restores_product_order():
     result = H._evaluate_brute_force_batch(combos, key_for, batch_fitness, all_results)
     assert sent == [{"x": 0}, {"x": 2}, {"x": 4}]        # first occurrence of each key only
     assert [r["key"] for r in all_results] == ["earlier", "k0", "k1", "k2"]
-    assert result == {"best_params": {"x": 2}, "best_fitness": 3.0}   # first of the tie wins
+    assert result == {"best_params": {"x": 2}, "best_fitness": 3.0,   # first of the tie wins
+                      "unmeasured": 0, "n_unique": 3}
+
+
+def test_batch_assembler_counts_crashed_and_stalled_combos_as_unmeasured():
+    """A crashed trial writes no row; a stalled one writes a ``status: stalled`` row with a finite
+    sentinel. Neither is a measurement, and the caller fails the grid on either."""
+    from app.services.strategy_fitness import STALLED_SENTINEL, ZERO_TRADE_SENTINEL
+    combos = [{"x": i} for i in range(4)]
+    key_for = lambda flat: f"k{flat['x']}"
+    all_results = []
+
+    def batch_fitness(param_dicts):
+        all_results.append({"params": {"x": 0}, "fitness": 1.0, "key": "k0"})
+        all_results.append({"params": {"x": 2}, "fitness": STALLED_SENTINEL, "key": "k2",
+                            "status": "stalled"})
+        all_results.append({"params": {"x": 3}, "fitness": ZERO_TRADE_SENTINEL, "key": "k3"})
+        # x=1 crashed: no row, sentinel fitness
+        return [1.0, ZERO_TRADE_SENTINEL, STALLED_SENTINEL, ZERO_TRADE_SENTINEL]
+
+    result = H._evaluate_brute_force_batch(combos, key_for, batch_fitness, all_results)
+    # the measured zero-trade row (k3) counts; the crash (k1) and the stall (k2) do not
+    assert (result["unmeasured"], result["n_unique"]) == (2, 4)
+
+
+# --------------------------------------------------------------------------- failures + state
+def test_a_crashed_combo_fails_the_batched_grid(seam, monkeypatch):
+    """The serial loop raises on a failed trial; the batched grid must not report a best over the
+    survivors instead."""
+    seam.delay = False
+    real = seam.__call__
+
+    def crashing(config, progress_cb=None, **kw):
+        if _tp_sl(config["entry_rules"]) == (3.0, -2.0):
+            raise RuntimeError("synthetic trial crash")
+        return real(config, progress_cb, **kw)
+
+    from app.services.backtest import daily_backtest_handler
+    monkeypatch.setattr(daily_backtest_handler, "run_daily_backtest", crashing)
+    out, row = _run(parallel=4, task_id="bf-crash")
+    assert out["status"] == "failed", out
+    assert "brute-force grid incomplete: 1 of 66 combo(s)" in out["error"]
+    assert row["status"] == "failed"
+
+
+def test_a_stalled_combo_fails_the_batched_grid(seam, monkeypatch):
+    seam.delay = False
+    real_trial = H._trial_worker
+
+    def stalling_trial(config, metric, *a, **kw):
+        if _tp_sl(config["entry_rules"]) == (5.0, -4.0):
+            return {"ok": False, "stalled": True, "error": "synthetic stall", "secs": 1.0,
+                    "slot": 0}
+        return real_trial(config, metric, *a, **kw)
+
+    monkeypatch.setattr(H, "_trial_worker", stalling_trial)
+    out, row = _run(parallel=4, task_id="bf-stall")
+    assert out["status"] == "failed", out
+    assert "brute-force grid incomplete: 1 of 66 combo(s)" in out["error"]
+    assert "1 stalled" in out["error"]
+
+
+def test_brute_force_neither_reads_nor_clears_a_checkpoint(seam, serial_reference):
+    """A GA checkpoint under the same task id is foreign to a grid: it is not resumed from and
+    it survives the grid's completion."""
+    ckpt = {"generation": 2, "population": [[1.0]], "fitnesses": [0.5], "all_results": [],
+            "fingerprint": "someone-elses-search"}
+    H._save_checkpoint("bf-ckpt", ckpt)
+    try:
+        out, row = _run(parallel=4, task_id="bf-ckpt")
+        assert out["status"] == "completed", out
+        assert _signature(row) == _signature(serial_reference)
+        assert H._load_checkpoint("bf-ckpt") == ckpt
+    finally:
+        H._clear_checkpoint("bf-ckpt")
+
+
+def test_brute_force_never_requests_full_results(seam):
+    """n_gens is 1 for a grid, so the GA's `is_last_gen` expression would be True and ask every
+    combo for its full-results blob; the brute-force path pins it False."""
+    out, _row = _run(parallel=4, task_id="bf-nofull")
+    assert out["status"] == "completed", out
+    assert out["optimization_id"] not in H._last_gen_full_results_by_opt

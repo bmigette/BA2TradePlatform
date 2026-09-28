@@ -1660,8 +1660,11 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # out as ONE batch through the GA's own evaluator (make_batch_fitness below: local slot
         # pools or DistributedEvaluator), and the result is assembled in product order by
         # _evaluate_brute_force_batch, so it is the serial result regardless of completion order.
+        # Only the daily engine builds batched trial configs; an 'ml' brute-force job stays on
+        # the serial loop whatever its parallel/worker settings say.
         is_brute_force = (opt.optimization_type or "genetic") == "brute_force"
-        if is_brute_force and not _dispatch_engages(parallel, bool(opt.worker_ids)):
+        if is_brute_force and (not _dispatch_engages(parallel, bool(opt.worker_ids))
+                               or backtest_cfg.get("engine", "daily") != "daily"):
             return _run_brute_force(
                 opt, db, task_id, param_space, fitness_function, all_results
             )
@@ -2282,6 +2285,20 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         opt, db, task_id, param_space, fitness_function, all_results)
                 result = _evaluate_brute_force_batch(
                     _brute_force_combos(param_space), _trial_key_for, batch_fitness, all_results)
+                if result["unmeasured"]:
+                    # The serial loop raises on the first failed trial and waits out a slow one,
+                    # so it never reports a best over a grid with holes. Neither does this: a
+                    # grid is small and exhaustive, and a "best" chosen among the combos that
+                    # happened to survive is not the grid's answer.
+                    n_stalled = sum(1 for r in all_results if r.get("status") == "stalled")
+                    return _fail(
+                        opt_id, db,
+                        f"brute-force grid incomplete: {result['unmeasured']} of "
+                        f"{result['n_unique']} combo(s) produced no measurement ({n_stalled} "
+                        f"stalled, the rest crashed -- see the trial warnings above). No best is "
+                        f"reported and no Top-N backtest was exported. If the trials are "
+                        f"genuinely SLOW rather than wedged, raise BT_LOCAL_STALL_TIMEOUT_S "
+                        f"(default 5400s).")
             else:
                 result = optimizer.optimize(
                     fitness_function=fitness_function,
@@ -2297,8 +2314,9 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             # Stops at the CURRENT generation rather than completing the search on data that is
             # known to be incomplete. Whatever was evaluated so far is discarded deliberately:
             # a partial population scored against a crippled universe is not a result.
-            logger.error(f"strategy_optimization {opt_id}: ABORTING at generation "
-                         f"{gen_state['gen'] + 1}/{ga['generations']} — {e}")
+            _where = ("the brute-force grid" if is_brute_force else
+                      f"generation {gen_state['gen'] + 1}/{ga['generations']}")
+            logger.error(f"strategy_optimization {opt_id}: ABORTING {_where} — {e}")
             return _fail(opt_id, db, str(e))
         finally:
             _logging.disable(_prior_disable)
@@ -2953,9 +2971,12 @@ def _evaluate_brute_force_batch(
       earlier combo. The live ``best`` the batch pushes for the UI follows completion order and
       is display-only.
 
-    Failure semantics are the GA's batch semantics, not the serial loop's: a crashed trial scores
-    ZERO_TRADE_SENTINEL, a stalled one STALLED_SENTINEL, a fatal one aborts the job
-    (_FatalTrialError), where the serial loop raised on the first trial error.
+    Failures: inside the batch a crashed trial scores ZERO_TRADE_SENTINEL (and writes no row), a
+    stalled one STALLED_SENTINEL (a ``status: stalled`` row), a fatal one aborts the job
+    (_FatalTrialError). ``unmeasured`` counts the unique combos left without a measured row
+    (:func:`is_measured_result`); the caller fails the job when it is non-zero, as the serial loop
+    fails on the first trial error. Exact because the memo is empty when the grid's single batch
+    starts: every unique key is dispatched, so a missing row means the trial did not measure.
     """
     first_pos: Dict[str, int] = {}
     unique: List[Dict[str, Any]] = []
@@ -2970,12 +2991,16 @@ def _evaluate_brute_force_batch(
     fits = batch_fitness(unique)
     added = all_results[start:]
     all_results[start:] = sorted(added, key=lambda r: first_pos.get(r.get("key"), len(unique)))
+    from app.services.strategy_fitness import is_measured_result
+    measured = {r.get("key") for r in all_results[start:] if is_measured_result(r)}
+    unmeasured = sum(1 for flat in unique if key_for(flat) not in measured)
     best: Dict[str, Any] = {"fitness": None, "params": None}
     for flat, key in zip(combos, keys):
         fit = fits[first_pos[key]]
         if best["fitness"] is None or fit > best["fitness"]:
             best = {"fitness": fit, "params": flat}
-    return {"best_params": best["params"], "best_fitness": best["fitness"]}
+    return {"best_params": best["params"], "best_fitness": best["fitness"],
+            "unmeasured": unmeasured, "n_unique": len(unique)}
 
 
 def _run_brute_force(

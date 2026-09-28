@@ -190,6 +190,17 @@ def test_equal_fitness_neighbours_are_preserved():
         R.ranked_results([{"params": {}, "fitness": float("nan")}], 5)
 
 
+def test_stalled_rows_never_rank():
+    """A stalled row's fitness is a FINITE sentinel; it must not become a TOP row."""
+    from app.services.strategy_fitness import STALLED_SENTINEL
+    good = {"params": {"x": 1}, "fitness": 0.2}
+    stalled = {"params": {"x": 2}, "fitness": STALLED_SENTINEL, "status": "stalled"}
+    old_format = {"params": {"x": 3}, "fitness": STALLED_SENTINEL}   # no status field
+    assert R.ranked_results([stalled, good, old_format], 5) == [good]
+    with pytest.raises(RuntimeError):
+        R.ranked_results([stalled], 5)
+
+
 def test_preflight_reads_actual_screen_and_refuses_missing_files(monkeypatch, tmp_path):
     import pandas as pd
     from ba2_providers.screener import metric_store as ms
