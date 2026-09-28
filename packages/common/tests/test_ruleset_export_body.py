@@ -26,5 +26,6 @@ def test_body_shape_order_and_generated_names():
 
 def test_envelope():
     env = rulesets_export_envelope([{"name": "A"}], exported_at="2026-01-01T00:00:00")
+    assert list(env) == ["export_version", "export_type", "export_timestamp", "rulesets"]
     assert env == {"export_version": "1.0", "export_type": "rulesets",
                    "export_timestamp": "2026-01-01T00:00:00", "rulesets": [{"name": "A"}]}

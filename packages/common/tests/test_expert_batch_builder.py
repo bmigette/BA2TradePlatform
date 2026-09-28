@@ -14,11 +14,14 @@ def test_entry_shape_and_key_order():
                        "symbol_settings"]
     assert e["general"] == {"alias": "", "user_description": "secret note", "enabled": True,
                             "virtual_equity_pct": 10.0, "priority": 1, "account_id": 3}
+    assert list(e["general"]) == ["alias", "user_description", "enabled", "virtual_equity_pct",
+                                  "priority", "account_id"]
     assert e["enter_market_ruleset_name"] == "EM" and e["open_positions_ruleset_name"] is None
 
 
 def test_envelope_and_constants():
     env = build_batch_envelope([{"x": 1}], exported_at="2026-01-01T00:00:00")
+    assert list(env) == ["export_version", "export_type", "export_timestamp", "experts"]
     assert env == {"export_version": EXPORT_VERSION, "export_type": EXPORT_TYPE,
                    "export_timestamp": "2026-01-01T00:00:00", "experts": [{"x": 1}]}
     assert RULESET_SLOTS[0] == ("enter_market_ruleset_id", "enter_market_ruleset_name")
