@@ -1635,10 +1635,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                             f"use_complex_order set for order {trading_order.id} but neither "
                             f"tp_price nor sl_price was provided"
                         )
-                    order_request.order_class = (
-                        OrderClass.BRACKET if len(legs) == 2 else OrderClass.OTO)
+                    # Legs FIRST, class LAST. alpaca-py >= 0.44 validates on every assignment
+                    # and refuses a BRACKET/OCO that has no take_profit/stop_loss yet, so
+                    # setting the class first raised before the legs could be attached.
                     for leg_name, leg in legs.items():
                         setattr(order_request, leg_name, leg)
+                    order_request.order_class = (
+                        OrderClass.BRACKET if len(legs) == 2 else OrderClass.OTO)
                     logger.info(
                         f"Order {trading_order.id} ({trading_order.symbol}) submitted as "
                         f"{order_request.order_class.value.upper()} to bypass the wash-trade block "
