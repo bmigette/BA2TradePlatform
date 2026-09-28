@@ -173,8 +173,9 @@ combinations by every threshold combination; use separate condition-focused GA j
 
 Record the added gene count and the search budget. The driver sizes each genetic job from its
 final gene count (population clamp(4 x genes, 24, 120); 25 generations, or 30 above 20 genes;
-early stop 8) and prints it; each profile adds its genes per opening rule (15 per rule with both),
-and market exits add up to 9. Pass `--population`/`--generations`/`--early-stop` to override;
+early stop after 5 generations without a gain of at least 1%) and prints it; each profile adds its
+genes per opening rule (15 per rule with both), and market exits add up to 9. Pass
+`--population`/`--generations`/`--early-stop`/`--early-stop-min-rel` to override;
 the option defaults do not establish adequate search depth for this campaign. Explicitly evaluate the frozen all-off control;
 random initialization is not a guarantee that the optimizer visits it.
 

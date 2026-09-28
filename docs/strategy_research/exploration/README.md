@@ -179,14 +179,20 @@ large fleet most slots idle during the small jobs. `--parallel 1` without worker
 
 In genetic mode each job's budget scales with the genes its final manifest searches (counted by
 the GA's own collector, after the market entry gates and market exits are attached; one-point
-ranges are not genes): 25 generations, or 30 above 20 genes; early stop after 8 generations
-without improvement; population 4 x genes, within 24..120. The preview and launch lines print
-each job's gene count and budget, and `optimization_config` records `geneCount` and
-`budgetSource`. `--population`, `--generations` and `--early-stop` override the derived values
-for every job; an early stop outside 1..generations is refused. A base family has 1-4 genes (24
+ranges are not genes): 25 generations, or 30 above 20 genes (never more than 30 unless
+`--generations` says so); early stop after 5 generations without a gain of at least 1% over
+the best at the last counted improvement; population 4 x genes, within 24..120. The 1% is the
+GA's `earlyStoppingMinRelativeImprovement` (0.01), the option grid's stricter rule, adopted for
+the equity grids on 2026-09-27/28: a smaller gain still updates the best individual but does not
+reset the patience. The preview and launch lines print each job's gene count and budget
+(`min_gain=0.01`), and `optimization_config` records `geneCount`, `budgetSource` and the 1% key.
+`--population`, `--generations`, `--early-stop` and `--early-stop-min-rel` override the derived
+values for every job; an early stop outside 1..generations and a minimum gain outside [0, 1)
+are refused, and `--early-stop-min-rel 0` restores the legacy rule (any strict gain; the key is
+omitted). A base family has 1-4 genes (24
 population, 25 generations); with both profiles and `--market-exit exit,stop,tp` a job has 22-38
 (88-120 population, 30 generations). Grid mode is unchanged (24 x 4, ignored by the exhaustive
-handler) and rejects `--early-stop`.
+handler) and rejects `--early-stop` and `--early-stop-min-rel`.
 
 Market exits and stop loosening (both opt-in; see [market_conditions.md](market_conditions.md)):
 
