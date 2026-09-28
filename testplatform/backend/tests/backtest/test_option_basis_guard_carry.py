@@ -352,27 +352,88 @@ IONQ = {d: (100.0, [(45, _borrow(45)), (108, _borrow(108))])
 IONQ[date(2022, 3, 25)] = (100.0, [(108, _borrow(108))])
 
 
+#: IONQ with a third monthly (171d) on the borrow curve: 0.6% of the spot off the 45d-108d line.
+IONQ3 = {d: (v[0], v[1] + [(171, _borrow(171))]) if len(v[1]) == 2 else v for d, v in IONQ.items()}
+#: A DIVIDEND PAYER (a row after every expiry: nothing to add back) whose parity sits 5.5% low on
+#: the nearest expiry and 2.5% lower on the next: extrapolated back to 0.9825 of the spot.
+PAYER_WINDOW = {d: (100.0, [(60, 0.945), (100, 0.92)])
+                for d in (date(2022, 3, 21), date(2022, 3, 22), date(2022, 3, 23), date(2022, 3, 24))}
+PAYER_WINDOW[date(2022, 3, 25)] = (100.0, [(100, 0.92)])
+_FAR_ROW = [DividendRow(date(2023, 3, 1), 0.3, date(2022, 1, 5))]
+
+
 def test_a_session_without_its_own_carry_ratio_passes_on_its_window(monkeypatch):
     """The window median decides, as for the uncorrected ratio: >= 3 window sessions with a
-    carry-free ratio, their median within 5%."""
-    g, u, guard = _guard(monkeypatch, IONQ, dividends=lambda s, d: [])
+    carry-free ratio, their median within the band (a payer here: 4 of 5)."""
+    g, u, guard = _guard(monkeypatch, PAYER_WINDOW, dividends=lambda s, d: _FAR_ROW)
     guard.check(u, "X", date(2022, 3, 25))            # first check: window filled backwards
     assert guard.stats()["carry_passed"] == 1
 
 
 def test_the_same_window_with_a_basis_error_is_refused(monkeypatch):
-    g, u, guard = _guard(monkeypatch, IONQ, dividends=lambda s, d: [], scale=1.25)
+    g, u, guard = _guard(monkeypatch, PAYER_WINDOW, dividends=lambda s, d: _FAR_ROW, scale=1.25)
     with pytest.raises(g.OptionSpotBasisMismatch, match="carry-free"):
         guard.check(u, "X", date(2022, 3, 25))
 
 
 def test_fewer_than_three_carry_sessions_in_a_full_window_is_refused(monkeypatch):
-    thin = {d: (v[0], v[1][-1:]) for d, v in IONQ.items()}
-    thin[date(2022, 3, 23)] = IONQ[date(2022, 3, 23)]
-    thin[date(2022, 3, 24)] = IONQ[date(2022, 3, 24)]    # 2 of 5 measurable
-    g, u, guard = _guard(monkeypatch, thin, dividends=lambda s, d: [])
+    thin = {d: (v[0], v[1][-1:]) for d, v in PAYER_WINDOW.items()}
+    thin[date(2022, 3, 23)] = PAYER_WINDOW[date(2022, 3, 23)]
+    thin[date(2022, 3, 24)] = PAYER_WINDOW[date(2022, 3, 24)]    # 2 of 5 measurable
+    g, u, guard = _guard(monkeypatch, thin, dividends=lambda s, d: _FAR_ROW)
     with pytest.raises(g.OptionSpotBasisMismatch, match="2 of 5"):
         guard.check(u, "X", date(2022, 3, 25))
+
+
+# ---- non-payers: a third expiry must confirm the line (review r6, decision D) ------------------
+def test_a_non_payer_with_two_expiries_only_is_refused_and_says_why(monkeypatch):
+    """IONQ's monthlies: two usable expiries per session, no third to confirm the line."""
+    g, u, guard = _guard(monkeypatch, IONQ, dividends=lambda s, d: [])
+    with pytest.raises(g.OptionSpotBasisMismatch, match="measurable on 0 of 5"):
+        guard.check(u, "X", date(2022, 3, 25))
+    from ba2_common.core.option_carry import carry_free_spot
+    d = date(2022, 3, 24)
+    r = carry_free_spot(d, [(d + timedelta(days=t), 100.0 * x) for t, x in IONQ[d][1]], [],
+                        spot=100.0)
+    assert r.linear_confirmed is False and "third usable expiry" in r.reason
+
+
+def test_a_non_payer_whose_third_expiry_confirms_the_borrow_line_passes(monkeypatch):
+    g, u, guard = _guard(monkeypatch, IONQ3, dividends=lambda s, d: [])
+    guard.check(u, "X", date(2022, 3, 25))
+    assert guard.stats()["carry_passed"] == 1
+
+
+def test_two_confirmed_non_payer_sessions_clear_one_does_not(monkeypatch):
+    """A confirmed session is three collinear expiries: MIN_CARRY_FLOOR (2) of them clear a
+    non-payer's window. The real AMC 2023-07-20 window has exactly 2 (06-21 and 06-28) beside
+    three that lack a third expiry or bend the way a fading borrow fee does; requiring 3 made
+    the real AMC abort on 1 of 10 sampled runs."""
+    two = {d: (IONQ3[d] if d in (date(2022, 3, 23), date(2022, 3, 24)) else IONQ[d]) for d in IONQ}
+    g, u, guard = _guard(monkeypatch, two, dividends=lambda s, d: [])
+    guard.check(u, "X", date(2022, 3, 25))
+    assert guard.stats()["carry_passed"] == 1
+    one = {d: (IONQ3[d] if d == date(2022, 3, 24) else IONQ[d]) for d in IONQ}
+    g, u, guard = _guard(monkeypatch, one, dividends=lambda s, d: [])
+    with pytest.raises(g.OptionSpotBasisMismatch, match="1 of 5"):
+        guard.check(u, "X", date(2022, 3, 25))
+
+
+def _missing_with_third(frac, spacing=7, t1=5):
+    """A NON-payer: an uncalendared dividend of ``frac`` between e1 (``t1`` days) and e2, and a
+    third expiry that stays at e2's level (a step, not a slope)."""
+    return {day: (100.0, [(t1, 1.0), (t1 + spacing, 1.0 - frac), (t1 + 2 * spacing, 1.0 - frac)])
+            for day in _monthly(date(2024, 3, 25), n=10)}
+
+
+@pytest.mark.parametrize("frac", [0.03, 0.05, 0.08, 0.10, 0.15])
+@pytest.mark.parametrize("scale", [1.055, 1.06, 1.08, 1.10, 1.12, 1.15, 1.20])
+def test_a_non_payers_uncalendared_dividend_no_longer_hides_an_error(monkeypatch, frac, scale):
+    """The reviewer's adversarial5 composites (no third expiry) and the same with a flat third
+    expiry: every one refused on every start offset. (x1.051 is inside the 5% line itself:
+    0.9515 of the spot passes before any carry question arises.)"""
+    assert _verdicts(monkeypatch, _missing_dividend_table(frac), [], scale, phases=5) == ["REFUSE"] * 5
+    assert _verdicts(monkeypatch, _missing_with_third(frac), [], scale, phases=5) == ["REFUSE"] * 5
 
 
 # ---- the carry band (final review, R1) ---------------------------------------------------------
@@ -464,7 +525,8 @@ def test_amc_still_clears_with_the_veto(monkeypatch):
 
 
 @pytest.mark.parametrize("case", ["special 2.5% + x1.051", "payer, missing 2.5% + x1.055",
-                                  "no dividend in the horizon, missing 8% + x1.08"])
+                                  "non-payer, missing 8% + x1.08",
+                                  "non-payer, a 2.5% step the third cannot see + x1.06"])
 def test_the_residual_after_the_veto(monkeypatch, case):
     """THE RESIDUAL as it stands after the unexplained-drop veto (measured 2026-09-26 over
     missing dividends of 1-20% and errors of x1.051-x1.20, 5 start offsets):
@@ -473,9 +535,12 @@ def test_the_residual_after_the_veto(monkeypatch, case):
         2026-09-26 (coordinator decision, REPAIR_LOG);
       * on a dividend PAYER an uncalendared dividend no longer hides anything past the line:
         x1.055 is refused on every offset for every size;
-      * a symbol whose calendar lists NO dividend in the horizon is read as borrow (AMC must
-        clear): a dividend the chain prices but FMP's calendar lacks ENTIRELY hides an error of
-        about its own size (8% -> x1.08, 10% -> x1.10, 15-20% -> x1.15 pass on 4 of 5 offsets).
+      * a NON-PAYER (no dividend in the horizon) is cleared only on sessions a third expiry
+        confirms (review r6, decision D): a dividend FMP's calendar lacks entirely is a step
+        that pushes the third off the line, so it hides nothing past the line any more
+        (3-15% x x1.055-x1.20 refused on every offset) -- except a step within the linearity
+        tolerance (<= 2.5% of the spot), which at the largest extrapolation leverage allowed
+        (1.43) carries an error to x1.06 (x1.065 refused), like the special.
     Pinned so that any change to it is seen."""
     if case.startswith("special"):
         divs = [DividendRow(date(2022, 10, 28), 27.5 * 0.025 * 1.051, date(2022, 10, 14))]
@@ -483,5 +548,11 @@ def test_the_residual_after_the_veto(monkeypatch, case):
     elif case.startswith("payer"):
         assert _verdicts(monkeypatch, _missing_dividend_table(0.025), PAYER_ROWS, 1.055,
                          phases=5) == ["REFUSE"] * 5
+    elif case.startswith("non-payer, missing 8%"):
+        assert _verdicts(monkeypatch, _missing_dividend_table(0.08), [], 1.08,
+                         phases=5) == ["REFUSE"] * 5
     else:
-        assert _verdicts(monkeypatch, _missing_dividend_table(0.08), [], 1.08, phases=5) ==             ["REFUSE", "PASS", "PASS", "PASS", "PASS"]
+        # the worst leverage the measure allows (10d / 7d = 1.43): a 2.5% step gains 3.6%.
+        assert _verdicts(monkeypatch, _missing_with_third(0.025, t1=10), [], 1.06, phases=5) ==             ["REFUSE", "PASS", "PASS", "PASS", "PASS"]
+        assert _verdicts(monkeypatch, _missing_with_third(0.03, t1=10), [], 1.06, phases=5) ==             ["REFUSE"] * 5
+        assert _verdicts(monkeypatch, _missing_with_third(0.025, t1=10), [], 1.065, phases=5) ==             ["REFUSE"] * 5

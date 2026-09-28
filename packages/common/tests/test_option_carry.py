@@ -207,3 +207,41 @@ def test_no_dividend_in_the_horizon_is_read_as_borrow():
     pts = [(date(2024, 4, 19), 100.0), (date(2024, 5, 17), 92.0)]
     r = carry_free_spot(s, pts, [], spot=100.0)
     assert r.veto is None and r.spot is not None and r.spot > 100.0
+
+
+# ---- non-payers: a third expiry must confirm the line (review r6, decision D) ------------------
+def test_a_non_payer_session_is_confirmed_by_a_third_expiry_on_the_line():
+    s = date(2024, 4, 1)
+    pts = [(date(2024, 4, 5), 99.0), (date(2024, 4, 12), 98.0), (date(2024, 4, 19), 97.1)]
+    r = carry_free_spot(s, pts, [], spot=100.0)
+    assert r.spot is not None and r.linear_confirmed is True and r.expiries_used == 3
+
+
+def test_a_non_payer_without_a_third_expiry_is_not_confirmed():
+    s = date(2024, 4, 1)
+    r = carry_free_spot(s, [(date(2024, 4, 19), 100.0), (date(2024, 5, 17), 92.0)], [], spot=100.0)
+    assert r.linear_confirmed is False and "third" in r.reason
+
+
+def test_a_step_between_the_first_two_expiries_is_not_on_the_line():
+    """An uncalendared dividend between e1 and e2 is a STEP: the third expiry stays at e2's level
+    instead of continuing the slope (a borrow fee keeps accruing)."""
+    s = date(2024, 4, 1)
+    pts = [(date(2024, 4, 5), 100.0), (date(2024, 4, 12), 97.0), (date(2024, 4, 19), 97.0)]
+    r = carry_free_spot(s, pts, [], spot=100.0)
+    assert r.linear_confirmed is False and "line" in r.reason
+
+
+def test_the_third_expiry_must_lie_at_least_as_far_again():
+    """A third expiry 1 day after e2 would hide a step of up to 4x the tolerance: it must lie at
+    least (t2 - t1) beyond e2."""
+    s = date(2024, 4, 1)
+    pts = [(date(2024, 4, 5), 100.0), (date(2024, 5, 3), 92.0), (date(2024, 5, 6), 92.0)]
+    r = carry_free_spot(s, pts, [], spot=100.0)
+    assert r.linear_confirmed is False
+
+
+def test_a_payer_is_not_asked_for_a_third_expiry():
+    s = date(2024, 4, 1)
+    r = carry_free_spot(s, [(date(2024, 4, 19), 100.0), (date(2024, 5, 17), 99.0)], _PAYER, spot=100.0)
+    assert r.linear_confirmed is None and r.spot is not None

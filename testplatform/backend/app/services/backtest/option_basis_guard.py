@@ -53,10 +53,18 @@ the coordinator the same day, REPAIR_LOG):
   of softness as the 5% line itself given its 2.5%-wide quote pairs;
 * on a dividend payer an uncalendared dividend hides nothing past the line (x1.055 refused on
   every offset, dividends of 1-2.5%; larger ones are vetoed);
-* a symbol whose calendar lists NO dividend in the horizon is read as borrow, which AMC needs: a
-  dividend the chain prices but FMP's calendar lacks ENTIRELY hides an error of about its own
-  size (8% -> x1.08, 10% -> x1.10, 15-20% -> x1.15 pass on 4 of 5 offsets). Telling that apart
-  from a borrow fee needs more than the session's own term structure.
+* a NON-PAYER (no dividend in the horizon: read as borrow, which AMC needs) is cleared only on
+  sessions whose third usable expiry -- at least ``t2 - t1`` beyond the second -- lies on the
+  line through the first two within 2.5% of the spot (``option_carry.LINEARITY_TOLERANCE``; review
+  r6, decision D). A dividend FMP's calendar lacks ENTIRELY is a step that pushes the third off
+  the line: 3-15% missing x x1.055-x1.20 are refused on every offset (they hid an error of their
+  own size before). What remains is a step within the tolerance: 2.5% at the largest
+  extrapolation leverage allowed (1.43) carries an error to x1.06 (x1.065 refused). Such a
+  window clears on ``MIN_CARRY_FLOOR`` (2) confirmed sessions -- each is three collinear
+  expiries, a stronger test than the two-point measure -- not ``MIN_CARRY_SESSIONS``: the real
+  AMC 2023-07-20 window has exactly 2 (06-21, 06-28) beside three that lack a third expiry or
+  bend the way a fading borrow fee does, and requiring 3 aborted the real AMC on 1 of 10
+  sampled runs.
 The stricter design (add a dividend back only when an expiry before the ex-date shows the drop)
 is not built.
 
@@ -403,7 +411,18 @@ class BasisGuard:
             return None, f"no as-traded spot on {day.isoformat()}", None
         pts = [(date.fromordinal(e), p) for e, p in expiry_parities(u, session_ord)]
         res = carry_free_spot(day, pts, self._dividends_at(underlying, day), spot=float(spot))
+        if res.linear_confirmed is False:
+            # A non-payer session no third expiry confirms: not measurable (module docstring).
+            return None, res.reason, None
         return (None if res.spot is None else res.spot / float(spot)), res.reason, res.veto
+
+    def _non_payer(self, underlying: str, ratios) -> bool:
+        """True when the calendar lists no dividend in the horizon of any window session."""
+        for d_, _r in ratios:
+            divs = self._dividends_at(underlying, d_)
+            if divs is None or len(divs):
+                return False
+        return True
 
     def _carry_clears(self, u, underlying: str, ratios, med: float):
         """(cleared, text for a refusal). See the module docstring."""
@@ -416,6 +435,10 @@ class BasisGuard:
             return False, f"carry separation refused: {vetoes[0]}"
         avail = [r for r, _w, _v in carry if r is not None]
         need = max(MIN_CARRY_FLOOR, min(MIN_CARRY_SESSIONS, len(carry)))
+        if self._non_payer(underlying, ratios):
+            # Every counted session of a non-payer carries its own third-expiry confirmation,
+            # a stronger test than the two-point measure: MIN_CARRY_FLOOR of them clear.
+            need = MIN_CARRY_FLOOR
         if len(avail) >= need:
             medc = float(np.median(avail))
             if CARRY_BAND_LOW <= medc <= 1.0 + TOLERANCE:

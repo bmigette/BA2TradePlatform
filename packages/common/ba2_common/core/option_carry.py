@@ -45,6 +45,15 @@ WHAT IS NEVER CARRY (a ``veto``: the guard refuses, naming it, rather than clear
   8% -> x1.08 and 10% -> x1.10 passed on 4 of 5 start offsets). A symbol with NO dividend in the
   horizon is read as borrow, the only other carry (AMC July 2023: up to 15% between weeklies).
 
+A NON-PAYER's session (the calendar lists no dividend in the horizon) must be CONFIRMED by a third
+usable expiry (review r6, decision D): the first expiry at least ``t2 - t1`` beyond the second,
+whose parity spot lies on the line through the first two within ``LINEARITY_TOLERANCE`` of the
+spot. A borrow fee's term structure is near-linear; a dividend the calendar lacks ENTIRELY,
+falling between the first two expiries, is a STEP that leaves the third at the second's level
+-- off the line by at least the dividend. ``linear_confirmed`` reports it (None for a payer, whose
+drops the unexplained-drop veto already polices); the guard counts only confirmed non-payer
+sessions.
+
 A dividend DECLARED after the session is not added back (it was not known yet), so the
 correction is causal. The two-point extrapolation is only used when its noise LEVERAGE
 t1 / (t2 - t1) is at most ``MAX_LEVERAGE`` (a further expiry is tried otherwise).
@@ -59,7 +68,7 @@ from datetime import date
 from typing import Optional, Sequence, Tuple
 
 __all__ = ["CarryFreeSpot", "DividendRow", "carry_free_spot", "MAX_ADDBACK_FRACTION",
-           "MAX_LEVERAGE", "SLOPE_SLACK"]
+           "MAX_LEVERAGE", "SLOPE_SLACK", "LINEARITY_TOLERANCE"]
 
 #: The most (of the spot) the carry measure will add back UNVERIFIED: half the guard's 5%.
 MAX_ADDBACK_FRACTION = 0.025
@@ -69,6 +78,10 @@ MAX_LEVERAGE = 1.5
 #: How far the later expiry's (dividend-corrected) parity spot may sit ABOVE the earlier one's
 #: and still be carry (interest: ~0.5% over a few months).
 SLOPE_SLACK = 0.005
+#: How far (of the spot) a non-payer's third expiry may sit off the line through the first two
+#: and still confirm it: the quote uncertainty the guard's pair gate allows
+#: (``option_basis_guard.MAX_QUOTE_UNCERTAINTY``, half its 5% tolerance).
+LINEARITY_TOLERANCE = 0.025
 
 
 @dataclass(frozen=True)
@@ -88,6 +101,8 @@ class CarryFreeSpot:
     expiries_used: int = 0
     #: Set when the session must NOT be cleared as carry (module docstring); names the row.
     veto: Optional[str] = None
+    #: Non-payers only (None for a payer): a third expiry confirms the line (module docstring).
+    linear_confirmed: Optional[bool] = None
 
 
 def _dividends(session: date, until: date, dividends: Sequence[DividendRow], spot: float
@@ -162,5 +177,23 @@ def carry_free_spot(session: date, points: Sequence[Tuple[date, float]],
         return CarryFreeSpot(None, why, veto=why)
     est = s1 - t1 * (s2 - s1) / (t2 - t1)
     note = f"; {pending} dividend(s) not yet declared, not added" if pending else ""
-    return CarryFreeSpot(est, f"extrapolated to T=0 from {t1}d and {t2}d, declared dividends "
-                              f"added back{note}", expiries_used=2)
+    why = f"extrapolated to T=0 from {t1}d and {t2}d, declared dividends added back{note}"
+    if dividends:
+        return CarryFreeSpot(est, why, expiries_used=2)
+    # A NON-PAYER: a third expiry at least as far again must confirm the line.
+    third = next(((e, p) for e, p in pts if (e - session).days - t2 >= t2 - t1), None)
+    if third is None:
+        return CarryFreeSpot(est, f"{why}; non-payer: no third usable expiry >= {2 * t2 - t1}d to "
+                                  f"confirm the line (a step would be an uncalendared dividend)",
+                             expiries_used=2, linear_confirmed=False)
+    e3, p3 = third
+    t3 = (e3 - session).days
+    pred = p1 + (p2 - p1) * (t3 - t1) / (t2 - t1)
+    dev = (p3 - pred) / spot if spot > 0 else float("inf")
+    if not abs(dev) <= LINEARITY_TOLERANCE:
+        return CarryFreeSpot(est, f"{why}; non-payer: the {t3}d expiry is {dev:+.1%} of the spot "
+                                  f"off the line through {t1}d and {t2}d (> "
+                                  f"{LINEARITY_TOLERANCE:.1%}): a step, not a borrow slope",
+                             expiries_used=2, linear_confirmed=False)
+    return CarryFreeSpot(est, f"{why}; non-payer: the {t3}d expiry confirms the line "
+                              f"({dev:+.1%})", expiries_used=3, linear_confirmed=True)
