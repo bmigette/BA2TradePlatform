@@ -24,7 +24,7 @@ from ba2_common.core.types import MarketAnalysisStatus, OrderRecommendation, Rec
 from ba2_common.logger import get_expert_logger
 
 from ba2_experts.FactorRanker import data
-from ba2_experts.FactorRanker.construction import long_only_top_n
+from ba2_experts.FactorRanker.construction import WEIGHTINGS, long_only_top_n
 from ba2_experts.FactorRanker.factors import (
     DEF_MIN_MEASURED_FACTORS, composite_detail, cross_sectional_stats,
     cross_sectional_zscore, describe_composite_availability, earnings_surprise,
@@ -175,10 +175,10 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             },
             "weighting": {
                 "type": "str", "required": False, "default": "equal",
-                "choices": ["equal", "score", "rank"],
+                "choices": list(WEIGHTINGS),
                 # valid_values is what the settings UI renders as a dropdown; choices alone
                 # rendered a free-text box.
-                "valid_values": ["equal", "score", "rank"],
+                "valid_values": list(WEIGHTINGS),
                 "description": "Position weighting: equal (1/N), score-proportional, or by rank.",
                 "tooltip": "equal (default): every held name gets the same weight. score: "
                            "proportional to the composite factor score. rank: linear in rank -- "

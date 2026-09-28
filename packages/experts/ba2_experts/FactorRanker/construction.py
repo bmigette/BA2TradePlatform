@@ -7,6 +7,11 @@ is intentionally left out (YAGNI).
 
 from typing import Dict, List
 
+#: Every weighting ``long_only_top_n`` implements. The setting's declared choices
+#: (FactorRanker.get_settings_definitions()["weighting"]) and the launcher's GA gene are
+#: pinned equal to this by test.
+WEIGHTINGS = ("equal", "score", "rank")
+
 
 def long_only_top_n(ranked: List[str], scores: Dict[str, float], top_n: int,
                     weighting: str = "equal", max_weight_per_name: float = 1.0,
@@ -30,6 +35,13 @@ def long_only_top_n(ranked: List[str], scores: Dict[str, float], top_n: int,
     in cash (total deployed < gross_exposure) — concentration limits win over full
     deployment.
     """
+    if weighting not in WEIGHTINGS:
+        # Before 2026-09-28 any other value fell through to "equal" without a word. The
+        # setting was a free-text box until 7c270156 and is now a GA gene, so a typo or a
+        # stale stored value would have run a different book from the one the operator (or
+        # the genome) asked for. Refuse instead.
+        raise ValueError(f"FactorRanker: unknown weighting {weighting!r}; "
+                         f"expected one of {list(WEIGHTINGS)}")
     picks = ranked[:top_n]
     if not picks:
         return {}

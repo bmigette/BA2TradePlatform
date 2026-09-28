@@ -1446,8 +1446,18 @@ _EXPERT_OPT = {
             "factor_weight_pead": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
             "top_n": {"optimize": True, "min": 10, "max": 40, "step": 5, "type": "int"},
             "max_weight_per_name": {"optimize": True, "min": 0.05, "max": 0.20, "step": 0.05, "type": "float"},
+            # CATEGORICAL (2026-09-28): how the top_n picks share the book. The choices are the
+            # expert's own declared values, in its order (FactorRanker.get_settings_definitions()
+            # ["weighting"]["valid_values"]; a test pins the two lists equal). "rank" is linear in
+            # rank (of N picks the best gets N parts ... the last 1), "score" is proportional to
+            # the composite score, "equal" is 1/N; every mode stays capped by
+            # max_weight_per_name. Lands on the expert setting of the same name (model:weighting
+            # -> expert_overrides -> the trial's expert settings -> the deploy's expert_params),
+            # which is why it is no longer pinned in fixed_settings below: one source.
+            "weighting": {"optimize": True, "type": "choice",
+                          "choices": ["equal", "score", "rank"]},
         },
-        "fixed_settings": {"universe_source": "static", "weighting": "equal"},
+        "fixed_settings": {"universe_source": "static"},
         "bypass": True,
     },
     # PremiumSeller's grid entry was REMOVED 2026-08-31 (operator decision; option-model plan

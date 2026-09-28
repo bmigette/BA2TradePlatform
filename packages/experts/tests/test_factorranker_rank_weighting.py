@@ -51,3 +51,22 @@ def test_the_setting_is_a_dropdown_offering_rank():
     d = FactorRanker.get_settings_definitions()["weighting"]
 
     assert d["valid_values"] == ["equal", "score", "rank"]
+
+
+def test_the_setting_declares_exactly_the_weightings_construction_implements():
+    """One list: the dropdown, the GA gene (ba2test_launcher, pinned in the backend's
+    test_factorranker_weighting_gene.py) and the construction code cannot drift apart."""
+    from ba2_experts.FactorRanker.construction import WEIGHTINGS
+
+    d = FactorRanker.get_settings_definitions()["weighting"]
+    assert d["choices"] == d["valid_values"] == list(WEIGHTINGS)
+    for w in WEIGHTINGS:
+        assert sum(long_only_top_n(RANKED, SCORES, top_n=4, weighting=w).values()) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("bad", ["Rank", "rank ", "", None, "proportional"])
+def test_an_unknown_weighting_is_refused_not_run_as_equal(bad):
+    """It used to fall through to equal without a word -- a typo in the (then free-text)
+    setting, or a stale stored value, ran a different book from the one asked for."""
+    with pytest.raises(ValueError, match="unknown weighting"):
+        long_only_top_n(RANKED, SCORES, top_n=4, weighting=bad)
