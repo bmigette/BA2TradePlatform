@@ -136,7 +136,7 @@ def test_fingerprints_distinguish_cap_costs_dates_and_search():
 
 @pytest.mark.parametrize("kwargs", [dict(equity=-1), dict(equity=float("nan")), dict(equity_cap=-1),
     dict(start="2027-01-01"), dict(end="2021-01-01"), dict(families=[]),
-    dict(families=["mid_ds", "mid_ds"]), dict(parallel=0), dict(workers=["remote227"])])
+    dict(families=["mid_ds", "mid_ds"]), dict(parallel=0)])
 def test_invalid_campaign_fails_before_launch(kwargs):
     with pytest.raises(ValueError):
         P.build_manifest(**kwargs)

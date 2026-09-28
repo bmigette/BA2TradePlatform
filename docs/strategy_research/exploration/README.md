@@ -22,8 +22,9 @@ and [four new ideas](../../../reports/expert_strategy_ideas_2026-09-07.md).
 
 The default campaign contains **ten families, 35 jobs and 193 parameter combinations**.
 It evaluates the complete small grids rather than relying on a genetic search to visit
-their neighbours. An optional genetic mode uses the existing goal2020 optimizer and
-configured remote workers. Jobs run sequentially in separate processes.
+their neighbours. An optional genetic mode uses the existing goal2020 optimizer. Both modes
+can spread a job's trials over parallel local slots and configured remote workers. Jobs run
+sequentially in separate processes.
 
 ### Families
 
@@ -159,8 +160,22 @@ python tools/strategy_research/exploration/run_exploration.py --families mid_ds 
 python tools/strategy_research/exploration/run_exploration.py --families mid_ds --variants control --run
 python tools/strategy_research/exploration/run_exploration.py --families etf_trend --etf-symbols SPY IEF TLT GLD --preflight
 python tools/strategy_research/exploration/run_exploration.py --families pullback_rsi --variants long_sma5 long_choch long_rsi --preflight
+python tools/strategy_research/exploration/run_exploration.py --workers remote227 --parallel 0 --run
 python tools/strategy_research/exploration/run_exploration.py --search genetic --workers remote227 --parallel 0 --run
 ```
+
+`--parallel N` and `--workers a,b` work in both modes and are written into each job's
+`optimization_config` (`parallelIndividuals`) and `worker_names`, so passing them changes the
+job fingerprints and names; without them the manifest is unchanged. In grid mode a job with
+more than one local slot or a named worker sends all its combinations as one batch through the
+GA's evaluator: local slot pools and/or remote workers, with the GA's version check, stall
+guard and failure scoring. The result is identical to the serial loop: `all_results` is
+stored in combination order and a fitness tie keeps the first combination. A crashed trial
+scores the failure sentinel instead of failing the job, as in genetic mode. Parallelism is per
+job, so a job cannot use more slots than it has combinations: 1-6 for most jobs, 36 for each
+`quality_momentum` job, 12-24 for `pullback_rsi`. Jobs still run one after another, so on a
+large fleet most slots idle during the small jobs. `--parallel 1` without workers
+(the default) keeps the original serial in-process loop.
 
 In genetic mode each job's budget scales with the genes its final manifest searches (counted by
 the GA's own collector, after the market entry gates and market exits are attached; one-point
@@ -193,8 +208,9 @@ changes the default manifest.
 Worker names must exist in the test application's worker settings. Remote hosts must have
 this code, including `ETFTrend`, and matching prewarmed data installed before launch. The
 existing optimizer's remote synchronization remains responsible for its worker lifecycle.
-Fixed controls and saved top-result reruns execute locally, including when the GA uses
-`--parallel 0`. Exhaustive grids are local and serial; remote names are rejected in grid mode.
+Saved top-result reruns execute locally and serially in every mode. Fixed controls and grid
+jobs follow the job's `--parallel`/`--workers`: with `--parallel 0 --workers ...` they run on
+the remote workers too.
 
 Each job has a `.log`, `.prepared.json` and, after successful persistence, `.result.json`
 containing database IDs. The configuration, code signature, screened union and cache file
@@ -206,7 +222,8 @@ Completed jobs are reused after comparing their actual stored configuration and 
 Partially saved top results are repaired without duplicating completed rows. A failed child
 stops the campaign with a nonzero exit status. After stopping the previous runner, add
 `--resume` to revisit unfinished jobs. The genetic engine can resume its checkpoint; the
-existing exhaustive-grid engine restarts an interrupted small grid. The optional GA's
+exhaustive-grid engine restarts an interrupted grid job from its first combination (a pause
+stops dispatching; finished jobs are kept). The optional GA's
 history after a checkpoint resume can omit pre-resume neighbours, a limitation of that handler.
 
 ## ETF and signal semantics

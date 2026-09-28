@@ -197,6 +197,38 @@ def test_grid_mode_is_byte_identical():
     assert budget(job) == (30, 6, 6) and "geneCount" not in job["optimization_config"]
 
 
+def test_grid_mode_accepts_parallel_and_workers(tmp_path):
+    """Grid jobs dispatch through the GA's evaluator (local slots / remote workers) when asked.
+    The flags land where genetic mode puts them; without them the manifest is the pinned one."""
+    default = P.build_manifest()
+    assert P.fingerprint(default) == DEFAULT_FINGERPRINT
+    for kwargs in (dict(parallel=4), dict(workers=["remote227"]), dict(parallel=0, workers=["remote227"]),
+                   dict(parallel=4, workers=["remote227", "remote150"])):
+        m = P.build_manifest(**kwargs)
+        assert len(m["jobs"]) == len(default["jobs"])
+        for job, base in zip(m["jobs"], default["jobs"]):
+            oc = job["optimization_config"]
+            assert job["optimization_type"] == "brute_force"
+            assert oc["parallelIndividuals"] == kwargs.get("parallel", 1)
+            assert job["worker_names"] == kwargs.get("workers", [])
+            assert set(oc) == set(base["optimization_config"])   # no other key appears
+            assert budget(job) == (24, 4, 4)
+            D.verify_job(job)
+    # The CLI passes them through in grid mode (it used to refuse --workers there).
+    argv = ["--families", "mid_ds", "--parallel", "4", "--workers", "remote227,remote150",
+            "--dry-run", "--output-dir", str(tmp_path)]
+    assert D.main(argv) == 0
+    written = json.loads((tmp_path / "manifest.json").read_text())
+    assert written == P.build_manifest(families=["mid_ds"], parallel=4, workers=["remote227", "remote150"])
+    assert D.main(["--dry-run", "--output-dir", str(tmp_path / "default")]) == 0
+    assert P.fingerprint(json.loads((tmp_path / "default" / "manifest.json").read_text())) == DEFAULT_FINGERPRINT
+
+
+def test_grid_mode_parallel_0_still_needs_workers():
+    with pytest.raises(ValueError, match="--parallel 0 requires named remote workers"):
+        P.build_manifest(parallel=0)
+
+
 # --------------------------------------------------------------------------- CLI
 def test_cli_flags_default_to_not_passed():
     args = D.parser().parse_args([])

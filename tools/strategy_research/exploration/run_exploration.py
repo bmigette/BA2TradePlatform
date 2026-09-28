@@ -51,8 +51,12 @@ def parser():
                     help="GA generations. Default: genetic 25, or 30 above 20 genes; grid 4.")
     ap.add_argument("--early-stop", type=int, default=None,
                     help="Genetic only: stop after N generations without improvement. Default 8.")
-    ap.add_argument("--parallel", type=int, default=1, help="Local GA individuals; grid and saved reruns are serial.")
-    ap.add_argument("--workers", default="", help="Comma-separated configured worker names (genetic search only).")
+    ap.add_argument("--parallel", type=int, default=1,
+                    help="Local trial slots, in grid and genetic mode (1 = the serial in-process loop "
+                         "when no --workers are named). Saved top-result reruns stay local and serial.")
+    ap.add_argument("--workers", default="",
+                    help="Comma-separated configured worker names, in grid and genetic mode; with "
+                         "--parallel 0 every trial runs remotely.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--save-top", type=int, default=5)
     ap.add_argument("--market-condition-profile", default="none",

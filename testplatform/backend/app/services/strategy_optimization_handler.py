@@ -1648,17 +1648,25 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             _persist_live()  # live top-population refresh after each individual
             return fit
 
-        # --- brute_force option for tiny spaces (optimization_type) ---
-        if (opt.optimization_type or "genetic") == "brute_force":
-            return _run_brute_force(
-                opt, db, task_id, param_space, fitness_function, all_results
-            )
-
         # Parallel trials: ga['parallelIndividuals'] > 1 evaluates the population across a
         # ThreadPoolExecutor. Safe now that each trial isolates its per-run DB on its own
         # thread (ba2_common configure_db_threadlocal) + the OHLCV/FMP caches are lock-guarded.
         parallel = _resolve_parallel_individuals(ga)
-        optimizer = GeneticOptimizer(
+
+        # --- brute_force option for tiny spaces (optimization_type) ---
+        # SERIAL unless the job asks for concurrency. With parallelIndividuals <= 1 and no worker
+        # selected this is the original in-process loop, untouched, so every existing brute-force
+        # caller is byte-identical. With parallelIndividuals > 1 and/or worker_ids the combos go
+        # out as ONE batch through the GA's own evaluator (make_batch_fitness below: local slot
+        # pools or DistributedEvaluator), and the result is assembled in product order by
+        # _evaluate_brute_force_batch, so it is the serial result regardless of completion order.
+        is_brute_force = (opt.optimization_type or "genetic") == "brute_force"
+        if is_brute_force and not _dispatch_engages(parallel, bool(opt.worker_ids)):
+            return _run_brute_force(
+                opt, db, task_id, param_space, fitness_function, all_results
+            )
+
+        optimizer = None if is_brute_force else GeneticOptimizer(
             param_ranges=param_space,
             population_size=int(ga["populationSize"]),
             n_generations=int(ga["generations"]),
@@ -1670,7 +1678,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             lattice_anchor=lattice_anchor,
             early_stopping_min_rel=early_stop_min_rel,
         )
-        if early_stop_min_rel is not None:
+        if early_stop_min_rel is not None and not is_brute_force:
             logger.warning(
                 f"strategy_optimization {opt_id}: early stopping needs a gain of at least "
                 f"{early_stop_min_rel:.2%} over the best at the last counted improvement "
@@ -1818,7 +1826,14 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     _pool.mark_done(fut)
                     yield (i, flat, key, fut.result())
 
-        def make_batch_fitness(execute_jobs):
+        def make_batch_fitness(execute_jobs, brute_force: bool = False):
+            """*brute_force* (the exhaustive grid's single batch, see _evaluate_brute_force_batch)
+            changes three things and nothing else: progress reads as one pass, never the GA's
+            "final generation" (so no trial is asked for its full results blob -- the brute-force
+            completion has no consumer for it), and the task's pause/cancel flag is checked after
+            EVERY landed trial, as the serial loop checks it before every trial, so a cancelled
+            grid stops dispatching instead of draining the whole grid. The GA path passes False
+            and is unchanged."""
             def batch_fitness(param_dicts: list, on_result=None) -> list:
                 """Evaluate one generation's worth of genomes.
 
@@ -1831,8 +1846,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     raise InterruptedError("paused/cancelled")
                 fits: list = [None] * len(param_dicts)
                 jobs = []  # (idx, decoded_flat, key, config)
-                n_gens = int(ga["generations"])
-                is_last_gen = gen_state["gen"] == n_gens - 1
+                n_gens = 1 if brute_force else int(ga["generations"])
+                is_last_gen = False if brute_force else gen_state["gen"] == n_gens - 1
                 for i, flat in enumerate(param_dicts):
                     key = _trial_key_for(flat)
                     cached = memo.get(key)
@@ -1867,7 +1882,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     frac = (done / total_in_batch) if total_in_batch else 1.0
                     pct = ((gen + frac) / n_gens) * 100.0 if n_gens else 0.0
                     bf = best["fitness"]
-                    msg = (f"Gen {gen + 1}/{n_gens} · ind {done}/{total_in_batch}"
+                    msg = ((f"Grid · combo {done}/{total_in_batch}" if brute_force
+                            else f"Gen {gen + 1}/{n_gens} · ind {done}/{total_in_batch}")
                            + (f" best={bf:.4f}" if bf is not None else ""))
                     tq.update_progress(task_id, pct, msg)
 
@@ -2024,6 +2040,14 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         from app.services.distributed_eval import _log_memory_diagnostics
                         _log_memory_diagnostics(
                             logger.warning, f"gen {gen + 1}/{n_gens} ind {done}/{total_in_batch}")
+                    # BRUTE FORCE ONLY: stop dispatching the moment the task is paused/cancelled.
+                    # The raise leaves the result stream; the handler's finally then shuts the
+                    # pool down with cancel_futures (queued trials never start) and stops the
+                    # DistributedEvaluator (its broker is cleared of this optimization's pending
+                    # trials). Trials already running finish and are discarded, as a GA pause
+                    # discards its interrupted generation.
+                    if brute_force and done < total_in_batch and tq.is_task_paused(task_id):
+                        raise InterruptedError("paused/cancelled")
                 # RECYCLE, DISTRIBUTED PATH. With --workers the trials run through
                 # DistributedEvaluator, whose consumer threads submit to the pool continuously --
                 # _local_execute_jobs (and its per-chunk rebuild) is never called, so without this
@@ -2046,7 +2070,9 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             return batch_fitness
 
         start_gen, init_pop, init_fits = 0, None, None
-        ckpt = _load_checkpoint(ckpt_task_id, ckpt_fingerprint)
+        # A brute-force grid has no population to resume or warm-start: never read (or, below,
+        # clear) a GA checkpoint for one.
+        ckpt = None if is_brute_force else _load_checkpoint(ckpt_task_id, ckpt_fingerprint)
         # EXHAUSTED CHECKPOINT: one written at (or past) the final generation leaves nothing to
         # run, and resuming into it produces a 0-trial run that reports "every backtest failed" --
         # a confusing failure for what is really "this search already finished". Only reachable
@@ -2086,7 +2112,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             # Re-seeding from the checkpoint's bounded elite slice fixes that. Cheap, contrary to
             # the note this replaces -- see _elite_slice.
             _seed_all_results_from_checkpoint(ckpt, all_results)
-        else:
+        elif not is_brute_force:
             # Warm-start (NOT resume): seed this job's population from a DIFFERENT, already-run
             # optimization's individuals, but run this job's OWN fresh --generations budget from
             # generation 0 (start_gen stays 0) with its OWN --seed. Distinct from checkpoint-resume
@@ -2239,20 +2265,34 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                                + (" + local" if parallel >= 1 else " (remote-only, 0 local slots)")
                                + (f" (remote slots capped at {_max_remote_slots}/worker)"
                                   if _max_remote_slots else ""))
-                batch_fitness = make_batch_fitness(_evaluator.execute_jobs)
+                batch_fitness = make_batch_fitness(_evaluator.execute_jobs,
+                                                   brute_force=is_brute_force)
             else:
-                batch_fitness = make_batch_fitness(_local_execute_jobs)
+                batch_fitness = make_batch_fitness(_local_execute_jobs,
+                                                   brute_force=is_brute_force)
         try:
-            result = optimizer.optimize(
-                fitness_function=fitness_function,
-                callback=ga_callback,
-                on_generation_start=on_generation_start,
-                checkpoint_callback=checkpoint_cb,
-                start_generation=start_gen,
-                initial_population=init_pop,
-                restored_fitnesses=init_fits,
-                batch_fitness=batch_fitness,
-            )
+            if is_brute_force:
+                if batch_fitness is None:
+                    # worker_ids named, but none resolved to an enabled remote worker and there is
+                    # at most one local slot: nothing to dispatch to, so the serial loop -- the
+                    # same outcome the GA path reaches for this configuration.
+                    logger.warning(f"strategy_optimization {opt_id}: brute force selected "
+                                   f"worker(s) but none is available; evaluating serially")
+                    return _run_brute_force(
+                        opt, db, task_id, param_space, fitness_function, all_results)
+                result = _evaluate_brute_force_batch(
+                    _brute_force_combos(param_space), _trial_key_for, batch_fitness, all_results)
+            else:
+                result = optimizer.optimize(
+                    fitness_function=fitness_function,
+                    callback=ga_callback,
+                    on_generation_start=on_generation_start,
+                    checkpoint_callback=checkpoint_cb,
+                    start_generation=start_gen,
+                    initial_population=init_pop,
+                    restored_fitnesses=init_fits,
+                    batch_fitness=batch_fitness,
+                )
         except _FatalTrialError as e:
             # Stops at the CURRENT generation rather than completing the search on data that is
             # known to be incomplete. Whatever was evaluated so far is discarded deliberately:
@@ -2308,8 +2348,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             )
 
         # The search finished: drop the checkpoint so a later re-run of this name starts a fresh
-        # search instead of resuming from the final generation of a completed one.
-        _clear_checkpoint(ckpt_task_id)
+        # search instead of resuming from the final generation of a completed one. (A brute-force
+        # grid never read or wrote one.)
+        if not is_brute_force:
+            _clear_checkpoint(ckpt_task_id)
 
         opt.status = "completed"
         opt.completed_at = datetime.now()
@@ -2870,24 +2912,10 @@ def _run_ml_trial_backtest(
 # ---------------------------------------------------------------------------
 # brute force + checkpoint persistence
 # ---------------------------------------------------------------------------
-def _run_brute_force(
-    opt: Any,
-    db: Any,
-    task_id: str,
-    param_space: Dict[str, Any],
-    fitness_function,
-    all_results: list,
-) -> Dict[str, Any]:
-    """Exhaustive search over the stepped ranges (itertools.product) for tiny spaces.
-
-    Has its own completion logic entirely separate from the GA path (no per-generation
-    callback either — it's a flat loop, not generational), so the completion push below is
-    this path's ONLY sync point; a brute-force run's failure path is NOT separate from the
-    GA's, though: ``fitness_function`` raising here propagates straight out to
-    ``handle_strategy_optimization``'s own try/except, which already routes any failure
-    through the shared ``_fail()`` helper (itself already wired to push_optimization) — so no
-    separate failure-push is needed here.
-    """
+def _brute_force_combos(param_space: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every combination of the stepped ranges, in ``itertools.product`` order over the space's
+    key order. THE order of a brute-force search: the serial loop walks it, the batched path
+    reports and tie-breaks in it."""
     import itertools
 
     axes: Dict[str, list] = {}
@@ -2898,9 +2926,81 @@ def _run_brute_force(
             v += spec["step"]
         axes[name] = vals
     names = list(axes.keys())
+    return [dict(zip(names, combo)) for combo in itertools.product(*(axes[n] for n in names))]
+
+
+def _evaluate_brute_force_batch(
+    combos: List[Dict[str, Any]],
+    key_for,
+    batch_fitness,
+    all_results: list,
+) -> Dict[str, Any]:
+    """Evaluate a brute-force grid as ONE batch through the GA's *batch_fitness* (local slot
+    pools or DistributedEvaluator) and return ``{"best_params", "best_fitness"}`` exactly as the
+    serial loop in :func:`_run_brute_force` would have found them.
+
+    Why the result is the serial one, whatever order the trials finish in:
+
+    * DEDUPE BY TRIAL KEY FIRST. The serial loop scores a combo whose canonical trial key it has
+      already seen from the memo, without a second run or a second ``all_results`` row. A batch
+      checks the memo only before dispatch, so two such combos would BOTH run. Only the first
+      occurrence of each key is sent; the later ones take its fitness.
+    * ``all_results`` IN PRODUCT ORDER. The batch appends rows as trials complete; the rows this
+      call added are re-sorted into the first-occurrence order of their keys, which is the order
+      the serial loop appends them in. (Rows a batch does not record -- a crashed trial -- are
+      absent in either order.)
+    * BEST BY A PRODUCT-ORDER SCAN with the serial loop's own strict ``>``: a tie keeps the
+      earlier combo. The live ``best`` the batch pushes for the UI follows completion order and
+      is display-only.
+
+    Failure semantics are the GA's batch semantics, not the serial loop's: a crashed trial scores
+    ZERO_TRADE_SENTINEL, a stalled one STALLED_SENTINEL, a fatal one aborts the job
+    (_FatalTrialError), where the serial loop raised on the first trial error.
+    """
+    first_pos: Dict[str, int] = {}
+    unique: List[Dict[str, Any]] = []
+    keys: List[str] = []
+    for flat in combos:
+        key = key_for(flat)
+        keys.append(key)
+        if key not in first_pos:
+            first_pos[key] = len(unique)
+            unique.append(flat)
+    start = len(all_results)
+    fits = batch_fitness(unique)
+    added = all_results[start:]
+    all_results[start:] = sorted(added, key=lambda r: first_pos.get(r.get("key"), len(unique)))
+    best: Dict[str, Any] = {"fitness": None, "params": None}
+    for flat, key in zip(combos, keys):
+        fit = fits[first_pos[key]]
+        if best["fitness"] is None or fit > best["fitness"]:
+            best = {"fitness": fit, "params": flat}
+    return {"best_params": best["params"], "best_fitness": best["fitness"]}
+
+
+def _run_brute_force(
+    opt: Any,
+    db: Any,
+    task_id: str,
+    param_space: Dict[str, Any],
+    fitness_function,
+    all_results: list,
+) -> Dict[str, Any]:
+    """Exhaustive search over the stepped ranges (itertools.product) for tiny spaces, SERIALLY
+    in this process: the path for a job with parallelIndividuals <= 1 and no worker selected.
+    A job that asks for local slots or remote workers is evaluated as one batch instead (see
+    _evaluate_brute_force_batch), with the same result.
+
+    Has its own completion logic entirely separate from the GA path (no per-generation
+    callback either — it's a flat loop, not generational), so the completion push below is
+    this path's ONLY sync point; a brute-force run's failure path is NOT separate from the
+    GA's, though: ``fitness_function`` raising here propagates straight out to
+    ``handle_strategy_optimization``'s own try/except, which already routes any failure
+    through the shared ``_fail()`` helper (itself already wired to push_optimization) — so no
+    separate failure-push is needed here.
+    """
     best = {"fitness": None, "params": None}
-    for combo in itertools.product(*(axes[n] for n in names)):
-        flat = dict(zip(names, combo))
+    for flat in _brute_force_combos(param_space):
         fit = fitness_function(flat)
         if best["fitness"] is None or fit > best["fitness"]:
             best = {"fitness": fit, "params": flat}

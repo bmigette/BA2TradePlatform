@@ -432,8 +432,6 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
             raise ValueError("--early-stop applies to --search genetic only (an exhaustive grid has no generations)")
         if early_stop < 1 or (generations is not None and early_stop > generations):
             raise ValueError(f"Early stop must be between 1 and the generations; got {early_stop}")
-    if search == "grid" and workers:
-        raise ValueError("The existing exhaustive-grid handler is local/serial; use --search genetic for remote workers")
     from tools.strategy_research.exploration.market_conditions import (
         selection, attach, attach_exits, exit_selection, refuse_inert_market_exit)
     profiles, pins = selection(market_condition_profile, market_condition_manifest, market_condition_mode)
