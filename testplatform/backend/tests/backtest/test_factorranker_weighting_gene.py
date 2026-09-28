@@ -106,11 +106,11 @@ RUN_START = datetime(2024, 3, 4)                # a Monday
 RUN_END = datetime(2024, 3, 8)                 # ONE rebalance (see _book)
 
 
-def _bt_block(expert_settings=None) -> Dict[str, Any]:
+def _bt_block(expert_settings=None, end: datetime = RUN_END) -> Dict[str, Any]:
     """The run-level ``optimization_config['backtest']`` block (the launcher's shape)."""
     return {
         "backtest_id": "frweight", "name": "frweight-trial",
-        "start_date": RUN_START.isoformat(), "end_date": RUN_END.isoformat(),
+        "start_date": RUN_START.isoformat(), "end_date": end.isoformat(),
         "enabled_instruments": list(SYMBOLS),
         "experts": [{"class": "FactorRanker", "settings": dict(
             _M._expert_run_settings(_M._EXPERT_OPT["FactorRanker"], SYMBOLS),
@@ -128,13 +128,13 @@ def _bt_block(expert_settings=None) -> Dict[str, Any]:
     }
 
 
-def _trial(decoded_flat, expert_settings=None):
+def _trial(decoded_flat, expert_settings=None, end: datetime = RUN_END):
     from app.services.strategy_optimization_handler import _build_daily_trial_config
     from app.services.strategy_param_space import decode_params
 
     strat, _ = _space()
     decoded = decode_params(strat, decoded_flat)
-    return decoded, _build_daily_trial_config(_bt_block(expert_settings), decoded, None,
+    return decoded, _build_daily_trial_config(_bt_block(expert_settings, end), decoded, None,
                                               option_trade_records=False)
 
 

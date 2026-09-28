@@ -1185,6 +1185,32 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         Returns:
             Optional[float]: The virtual balance amount, None if error occurred
         """
+        return self._virtual_share(lambda account: account.get_tradable_balance(),
+                                   "tradable balance", "balance")
+
+    def get_virtual_equity(self) -> Optional[float]:
+        """This expert's virtual_equity_pct slice of the account's EQUITY (cash plus marked
+        positions, ``get_tradable_equity``), for sizing a TARGET BOOK.
+
+        ``get_virtual_balance`` answers from ``get_balance()``, which is equity live and
+        CASH in a backtest (finding 6, unchanged for the classic RM). A rebalancer that
+        sized on it read its own fully invested book as nearly empty in the backtest only,
+        and sold it. This is the same figure in both runtimes; live it equals
+        ``get_virtual_balance`` exactly.
+
+        Returns:
+            Optional[float]: the virtual equity, None exactly where get_virtual_balance
+            returns None (an unknown/non-finite account figure).
+        """
+        return self._virtual_share(lambda account: account.get_tradable_equity(),
+                                   "tradable equity", "equity")
+
+    def _virtual_share(self, read_account_figure, figure_label: str,
+                       result_label: str) -> Optional[float]:
+        """``read_account_figure(account) x virtual_equity_pct / 100`` for this expert's account.
+
+        The shared body of get_virtual_balance / get_virtual_equity -- they differ ONLY in
+        which account figure they slice."""
         # Named before the try so the except branch can always name the account the
         # failure belongs to. Stays None only while the expert instance itself is
         # still unread -- the one window in which there is no account id to report.
@@ -1213,7 +1239,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # published nothing usable; the except below turns that into None,
             # which every caller already treats as "cannot size". With margin off
             # (every backtest) it is get_balance() unchanged.
-            account_balance = account.get_tradable_balance()
+            account_balance = read_account_figure(account)
 
             # Calculate virtual balance based on virtual_equity_pct.
             #
@@ -1225,8 +1251,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             virtual_equity_pct = expert_instance.virtual_equity_pct
             virtual_balance = account_balance * (virtual_equity_pct / 100.0)
             
-            logger.debug(f"Expert {self.id}: Account tradable balance=${account_balance}, "
-                        f"Virtual equity %={virtual_equity_pct}, Virtual balance=${virtual_balance}")
+            logger.debug(f"Expert {self.id}: Account {figure_label}=${account_balance}, "
+                        f"Virtual equity %={virtual_equity_pct}, "
+                        f"Virtual {result_label}=${virtual_balance}")
             
             return virtual_balance
             
@@ -1240,7 +1267,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # surfacing it.
             absorb_if_benign(e, ValueError)
             logger.error(
-                f"Error calculating virtual balance for expert {self.id} "
+                f"Error calculating virtual {result_label} for expert {self.id} "
                 f"(account {account_id}): {e}", exc_info=True)
             return None
     

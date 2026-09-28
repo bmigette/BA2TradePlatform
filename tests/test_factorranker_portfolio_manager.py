@@ -19,6 +19,13 @@ class _CapturingAccount:
     def get_instrument_current_price(self, symbol):
         return self._prices.get(symbol)
 
+    def adjust_sl(self, transaction, new_sl_price, source=""):
+        """Mirrors AccountInterface.adjust_sl: a rebalance that resizes a held name re-prices
+        its resting stop through here, on the Transaction row (2026-09-28)."""
+        self.adjusted_stops = getattr(self, "adjusted_stops", [])
+        self.adjusted_stops.append((transaction.id, new_sl_price, source))
+        return True
+
     def submit_order(self, order, tp_price=None, sl_price=None, is_closing_order=False):
         """Mirrors AccountInterface.submit_order. tp_price/sl_price are NOT
         optional extras: FactorRanker passes the protective stop through here
@@ -51,7 +58,7 @@ def test_rebalance_buys_new_and_sells_dropped():
 
     account = _CapturingAccount({"A": 10.0, "B": 5.0, "C": 4.0})
     expert_stub = MagicMock()
-    expert_stub.get_virtual_balance.return_value = 1000.0
+    expert_stub.get_virtual_equity.return_value = 1000.0
 
     with patch("ba2_trade_platform.core.utils.get_account_instance_from_id", return_value=account), \
          patch("ba2_trade_platform.core.utils.get_expert_instance_from_id", return_value=expert_stub):
@@ -83,7 +90,7 @@ def test_new_buy_creates_expert_attributed_transaction():
 
     account = _CapturingAccount({"B": 5.0})
     expert_stub = MagicMock()
-    expert_stub.get_virtual_balance.return_value = 1000.0
+    expert_stub.get_virtual_equity.return_value = 1000.0
 
     with patch("ba2_trade_platform.core.utils.get_account_instance_from_id", return_value=account), \
          patch("ba2_trade_platform.core.utils.get_expert_instance_from_id", return_value=expert_stub):

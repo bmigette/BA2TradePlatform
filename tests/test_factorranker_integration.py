@@ -44,6 +44,13 @@ class _PipelineAccount:
     def get_instrument_current_price(self, symbol):
         return self.prices.get(symbol)
 
+    def adjust_sl(self, transaction, new_sl_price, source=""):
+        """Mirrors AccountInterface.adjust_sl: a rebalance that resizes a held name re-prices
+        its resting stop through here, on the Transaction row (2026-09-28)."""
+        self.adjusted_stops = getattr(self, "adjusted_stops", [])
+        self.adjusted_stops.append((transaction.id, new_sl_price, source))
+        return True
+
     def submit_order(self, order, tp_price=None, sl_price=None, is_closing_order=False):
         """Mirrors AccountInterface.submit_order. tp_price/sl_price are NOT
         optional extras: FactorRanker passes the protective stop through here
@@ -97,7 +104,7 @@ def test_two_rebalances_sell_dropped_buy_new():
     # weight produces a zero delta -> no churn order).
     account = _PipelineAccount({s: 10.0 for s in ["A", "B", "C", "D", "E"]})
     expert_stub = MagicMock()
-    expert_stub.get_virtual_balance.return_value = 100_000.0
+    expert_stub.get_virtual_equity.return_value = 100_000.0
 
     # Run 1 momentum: A > B > C > D > E  -> hold {A, B, C}
     run1 = {"A": _ramp(300), "B": _ramp(250), "C": _ramp(200), "D": _ramp(120), "E": _ramp(110)}
@@ -148,6 +155,13 @@ class _LaggingPromotionAccount:
     def get_instrument_current_price(self, symbol):
         return self.prices.get(symbol)
 
+    def adjust_sl(self, transaction, new_sl_price, source=""):
+        """Mirrors AccountInterface.adjust_sl: a rebalance that resizes a held name re-prices
+        its resting stop through here, on the Transaction row (2026-09-28)."""
+        self.adjusted_stops = getattr(self, "adjusted_stops", [])
+        self.adjusted_stops.append((transaction.id, new_sl_price, source))
+        return True
+
     def submit_order(self, order, tp_price=None, sl_price=None, is_closing_order=False):
         """Mirrors AccountInterface.submit_order. tp_price/sl_price are NOT
         optional extras: FactorRanker passes the protective stop through here
@@ -172,7 +186,7 @@ def test_rerun_before_transaction_promoted_does_not_double_buy():
 
     account = _LaggingPromotionAccount({s: 10.0 for s in ["A", "B", "C", "D", "E"]})
     expert_stub = MagicMock()
-    expert_stub.get_virtual_balance.return_value = 100_000.0
+    expert_stub.get_virtual_equity.return_value = 100_000.0
 
     run1 = {"A": _ramp(300), "B": _ramp(250), "C": _ramp(200), "D": _ramp(120), "E": _ramp(110)}
 

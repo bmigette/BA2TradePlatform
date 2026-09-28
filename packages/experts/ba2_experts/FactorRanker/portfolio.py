@@ -31,6 +31,15 @@ from ba2_common.logger import logger
 _OpenedTxn = namedtuple("_OpenedTxn", ["id", "open_price", "open_qty"])
 
 
+class ProtectiveStopResyncError(RuntimeError):
+    """A held name's resting stop could not be re-priced after a rebalance resized it.
+
+    RAISED, never logged-and-continued: the position keeps a stop encoding a rule that no
+    longer holds (wrong quantity, wrong budget), which is an unprotected trade in all but
+    name. The backtest engine lets this through instead of swallowing it as a bad bar.
+    """
+
+
 def rebalance_deltas(target_weights: Dict[str, float], held_shares: Dict[str, float],
                      prices: Dict[str, float], equity: float,
                      quantity_units: Optional[Dict[str, float]] = None) -> Dict[str, float]:
@@ -268,9 +277,12 @@ class FactorPortfolioManager:
             )
 
         if equity is None:
-            equity = self.expert.get_virtual_balance()
+            # EQUITY (cash + this book marked), not get_virtual_balance: that one is cash in
+            # the backtest (finding 6), where a fully invested book then read as nearly empty
+            # and every second rebalance sold it. Same figure live and in the backtest.
+            equity = self.expert.get_virtual_equity()
         if equity is None:
-            raise ValueError("FactorRanker: virtual balance (equity) not available for rebalance")
+            raise ValueError("FactorRanker: virtual equity not available for rebalance")
 
         quantity_units = self._quantity_units(symbols)
         deltas = rebalance_deltas(target_weights, held, prices, equity,
@@ -370,9 +382,17 @@ class FactorPortfolioManager:
     def _resync_protective_stops(self, by_symbol: Dict[str, list], changed: set) -> None:
         """Re-price the resting stop of every still-held name whose position just changed.
 
-        Best-effort and never raises: a stop that could not be amended is worse than one that
-        could, but far better than aborting a rebalance that has already submitted orders.
+        ``by_symbol`` carries ``_OpenedTxn`` records (id, open_price, open_qty) in BOTH
+        runtimes; ``adjust_sl`` reads and writes a real ``Transaction`` (stop_loss,
+        take_profit, its orders), so each row is LOADED BY ID first. Passing the record
+        straight through failed with AttributeError everywhere -- the backtest logged a
+        warning, Alpaca logged an error and returned False -- and no stop was ever re-priced.
+
+        Every symbol is attempted, then any failure RAISES ``ProtectiveStopResyncError``
+        naming them all: the orders already submitted stand, but the run (backtest) or the
+        analysis (live) fails loudly instead of leaving stale stops behind a green log.
         """
+        failures = []
         for symbol in sorted(changed):
             transactions = by_symbol.get(symbol) or []
             if not transactions:
@@ -382,13 +402,21 @@ class FactorPortfolioManager:
                 continue
             for trans in transactions:
                 try:
-                    self.account.adjust_sl(trans, sl, source="factorranker_rebalance")
+                    row = get_instance(Transaction, trans.id)
+                    ok = self.account.adjust_sl(row, sl, source="factorranker_rebalance")
                 except NotImplementedError:
                     return  # broker cannot amend stops — nothing to retry per symbol
-                except Exception as e:  # noqa: BLE001 — one bad amend must not void the rebalance
-                    logger.warning(
-                        f"FactorRanker[{self.expert_instance_id}]: could not re-price the "
-                        f"protective stop for {symbol} to {sl:.4f}: {e}")
+                except Exception as e:  # noqa: BLE001 — collected, then raised below
+                    failures.append(f"{symbol} (transaction {trans.id}): {e}")
+                    continue
+                if not ok:
+                    failures.append(f"{symbol} (transaction {trans.id}): adjust_sl returned "
+                                    f"{ok!r}")
+        if failures:
+            raise ProtectiveStopResyncError(
+                f"FactorRanker[{self.expert_instance_id}]: could not re-price "
+                f"{len(failures)} protective stop(s) after the rebalance: "
+                + "; ".join(failures))
 
     def protective_stop_price(self, symbol: str, transactions: list,
                               extra_qty: float = 0.0, extra_price: Optional[float] = None
@@ -427,9 +455,11 @@ class FactorPortfolioManager:
         if risk_pct <= 0:
             return None
 
-        equity = self.expert.get_virtual_balance()
+        # The budget is a share of what the expert's slice is WORTH -- the same figure the
+        # rebalance sizes on (see rebalance), never the cash left over after buying.
+        equity = self.expert.get_virtual_equity()
         if not equity or equity <= 0:
-            logger.warning(f"FactorRanker[{self.expert_instance_id}]: no virtual balance; "
+            logger.warning(f"FactorRanker[{self.expert_instance_id}]: no virtual equity; "
                            f"cannot price a protective stop for {symbol}")
             return None
 

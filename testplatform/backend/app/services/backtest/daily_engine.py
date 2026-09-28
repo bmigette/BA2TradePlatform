@@ -1527,6 +1527,12 @@ class DailyBacktestEngine:
             # Reuse the run-constant portfolio manager (built once; see _bypass_manager).
             self._bypass_manager(expert_id).rebalance(targets)
         except Exception as e:  # noqa: BLE001 — a rebalance failure must not kill the run
+            from ba2_experts.FactorRanker.portfolio import ProtectiveStopResyncError
+            if isinstance(e, ProtectiveStopResyncError):
+                # Not a bad bar: a held position is left with a stop that no longer encodes
+                # its rule, and every later bar would trade on it. Live fails the analysis
+                # (run_analysis re-raises); the backtest fails the run the same way.
+                raise
             self._log(f"bypass rebalance failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
 
     # -- option expiry / exercise / assignment ------------------------------

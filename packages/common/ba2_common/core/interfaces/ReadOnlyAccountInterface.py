@@ -695,6 +695,38 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             return self._plain_balance()
         return self._stock_capital_from_snapshot().tradable
 
+    def get_tradable_equity(self) -> float:
+        """What this account is WORTH in stock-deployment dollars: equity (cash plus
+        positions marked to market) with margin applied exactly as ``get_tradable_balance``
+        applies it.
+
+        For a sizer of a TARGET BOOK ("this name is w% of what I own"), which is a different
+        question from ``get_tradable_balance``'s "what may I still spend". At every live
+        broker the two are the same number (``get_balance()`` is equity there); on the
+        backtest account ``get_balance()`` is CASH (finding 6, left as is for the classic
+        RM), so a book sized on it reads a fully invested account as nearly empty.
+        ``get_account_snapshot().equity`` means cash + marks in BOTH runtimes -- the backtest
+        publishes its (equity-cap-clamped) ``deployed_equity()`` there -- which is why this
+        reads it.
+
+        RAISES ``ValueError`` when the equity is unpublished or non-finite: unknown is never
+        zero and never the cash figure.
+        """
+        if not self._margin_enabled():
+            return self._finite_equity(self.get_account_snapshot())
+        capital = self._stock_capital_from_snapshot()
+        return self._finite_equity(capital.snapshot) * capital.effective_factor
+
+    def _finite_equity(self, snapshot: AccountSnapshot) -> float:
+        equity = None if snapshot is None else snapshot.equity
+        if equity is None:
+            raise ValueError(f"account {self.id} ({type(self).__name__}) published no equity")
+        value = float(equity)
+        if not math.isfinite(value):
+            raise ValueError(f"account {self.id} ({type(self).__name__}) published a "
+                             f"non-finite equity ({equity!r}); cannot size with it")
+        return value
+
     def _stock_capital_from_snapshot(self) -> StockCapital:
         """Balance, snapshot, effective factor and tradable balance, from ONE snapshot.
 
