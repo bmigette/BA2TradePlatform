@@ -95,7 +95,8 @@ def test_a_new_alias_entry_refetches_every_legacy_partition_in_reach(monkeypatch
     assert r and "OLDCO" in r
 
 
-@pytest.mark.parametrize("first_bar,stale", [(date(2026, 5, 1), True), (date(2026, 5, 26), False),
+@pytest.mark.parametrize("first_bar,stale", [((date(2026, 5, 1), date(2026, 7, 17)), True),
+                                             ((date(2026, 5, 26), date(2026, 7, 17)), False),
                                              (None, False)])
 def test_a_legacy_none_root_partition_is_judged_by_its_bars(first_bar, stale):
     """ECHO: no chain before 2026-05-26. A legacy partition holding an earlier bar holds another
@@ -192,3 +193,47 @@ def test_the_listing_horizon_covers_the_longest_lead_measured_on_the_tree():
     assert T.MEASURED_MAX_LISTING_LEAD_DAYS == 1059
     assert T.LISTING_HORIZON_DAYS >= T.MEASURED_MAX_LISTING_LEAD_DAYS
     assert T.LISTING_HORIZON_DAYS == 1190
+
+
+
+# ------------------------------------------------ review r6 I-A: a MID-history None segment
+@pytest.mark.parametrize("rows,erasable", [
+    ((date(2022, 11, 1), date(2023, 1, 20)), False),     # PARA era (2022-02-17..2025-07-16)
+    ((date(2025, 6, 2), date(2025, 7, 30)), False),      # PARA rows reaching into the stretch
+    ((date(2020, 6, 1), date(2021, 6, 18)), False),      # VIAC era
+    ((date(2025, 7, 18), date(2025, 8, 1)), True),       # all inside the deal stretch
+])
+def test_psky_only_the_deal_stretch_may_be_emptied(rows, erasable):
+    """PSKY's None segment is 2025-07-17..08-06 only: an empty re-fetch may erase rows lying
+    wholly inside it, never the VIAC/PARA history that merely precedes its cutover."""
+    assert T.empty_overwrite_ok("PSKY", *rows) is erasable
+
+
+@pytest.mark.parametrize("rows,erasable", [((date(2020, 3, 2), date(2021, 1, 15)), True),
+                                           ((date(2020, 3, 2), date(2021, 3, 19)), False),
+                                           ((date(2022, 1, 3), date(2022, 6, 17)), False)])
+def test_exe_rows_before_the_new_chesapeake_stay_erasable(rows, erasable):
+    assert T.empty_overwrite_ok("EXE", *rows) is erasable
+
+
+@pytest.mark.parametrize("rows,stale", [((date(2022, 11, 1), date(2023, 1, 20)), False),
+                                        ((date(2025, 6, 2), date(2025, 7, 30)), True),
+                                        ((date(2020, 6, 1), date(2021, 6, 18)), False)])
+def test_psky_legacy_staleness_is_judged_inside_the_none_segment(rows, stale, monkeypatch):
+    """Legacy (unsigned) PSKY partitions: only rows INSIDE 2025-07-17..08-06 make one stale under
+    the None rule (the aliases have their own rule; LEGACY_FETCHED is patched so it cannot fire)."""
+    monkeypatch.setitem(T.ROOT_HISTORY_LEGACY_FETCHED, "PSKY", datetime(2000, 1, 1, tzinfo=UTC))
+    r = T.root_history_refetch_reason("PSKY", date(2030, 1, 18), _m(datetime(2026, 9, 1, tzinfo=UTC)),
+                                      lambda: rows)
+    assert bool(r) is stale
+
+
+def test_the_store_keeps_a_para_era_partition_on_an_empty_refetch(tmp_path):
+    root = str(tmp_path / "theta")
+    legacy = OptionHistoryParquetStore(root=root, clock=lambda: datetime(2026, 9, 1, tzinfo=UTC))
+    exp = date(2023, 1, 20)
+    legacy.write_partition("PSKY", exp, _bars("PSKY", exp, [date(2022, 11, 1), date(2023, 1, 19)]),
+                           date(2020, 1, 1), exp)
+    hooked = OptionHistoryParquetStore(root=root, **T.parquet_store_hooks())
+    got = hooked.write_partition("PSKY", exp, [], date(2020, 1, 1), exp, empty_contracts=["X"])
+    assert got.get("kept_old") and ("PSKY", exp) in hooked.kept_nonempty

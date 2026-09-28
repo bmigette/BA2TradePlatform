@@ -77,7 +77,7 @@ def test_a_kept_partition_is_reported_and_fails_the_run(tmp_path):
     first.write_partition("AAPL", exp, [_bar(occ_symbol("AAPL", exp, "C", 150.0), date(2023, 1, 3))],
                           START, END)
     store = OptionHistoryParquetStore(root=root, stale_reason=lambda u, e, m, fb: "test: stale",
-                                      empty_overwrite_ok=lambda u, last: False)
+                                      empty_overwrite_ok=lambda u, first, last: False)
     provider = FakeProvider()
     provider.contracts["AAPL"] = [_contract("AAPL", exp, 150.0)]
     lines = []

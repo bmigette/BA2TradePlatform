@@ -386,12 +386,25 @@ def _parse_written_at(value: Any) -> Optional[datetime]:
     return t if t.tzinfo is not None else t.replace(tzinfo=timezone.utc)
 
 
+def _none_segments(symbol: str) -> List[Tuple[date, date]]:
+    """``[(from, until), ...]``: the date ranges ROOT_HISTORY gives NO chain for (``from``
+    inclusive, ``until`` exclusive) -- from the previous cutover (or the beginning) to each
+    None-root cutover. PSKY's is 2025-07-17..08-06 only, not its whole VIAC/PARA history."""
+    out, prev = [], date.min
+    for cutover, old_root in sorted(ROOT_HISTORY.get(symbol.upper(), ()), key=lambda h: h[0]):
+        if old_root is None:
+            out.append((prev, cutover))
+        prev = cutover
+    return out
+
+
 def root_history_refetch_reason(symbol: str, expiry: date, manifest: Dict[str, Any],
-                                first_bar) -> Optional[str]:
+                                bar_range) -> Optional[str]:
     """Why a finished partition must be fetched again under today's ROOT_HISTORY, or None.
 
-    ``first_bar()`` returns the partition's earliest bar date (None when empty); it is only
-    called for a legacy partition under a None root. See the section comment above."""
+    ``bar_range()`` returns the partition's (first, last) bar dates (None when empty); it is
+    only called for a legacy partition of a symbol with a None root. See the section comment
+    above."""
     u = symbol.upper()
     hist = ROOT_HISTORY.get(u, ())
     sig = root_history_signature(u)
@@ -409,23 +422,31 @@ def root_history_refetch_reason(symbol: str, expiry: date, manifest: Dict[str, A
         return None
     written = _parse_written_at(manifest.get("written_at"))
     applied = ROOT_HISTORY_LEGACY_FETCHED.get(u)
+    segments = _none_segments(u)
+    if segments:
+        rng = bar_range()
+        if rng is not None:
+            first, last = rng
+            for lo, hi in segments:
+                if first < hi and last >= lo:
+                    return (f"holds bars {first}..{last} inside {lo}..{hi}, where ROOT_HISTORY "
+                            f"has no chain for {u}")
     for cutover, old_root in hist:
         if old_root is None:
-            fb = first_bar()
-            if fb is not None and fb < cutover:
-                return (f"holds bars from {fb}, before {cutover} where ROOT_HISTORY has no chain "
-                        f"for {u} (another company's)")
-        elif expiry <= cutover + horizon and (applied is None or written is None or written < applied):
+            continue
+        if expiry <= cutover + horizon and (applied is None or written is None or written < applied):
             return (f"fetched {manifest.get('written_at')} without ROOT_HISTORY {u} <- {old_root} "
                     f"(cutover {cutover})")
     return None
 
 
-def empty_overwrite_ok(symbol: str, old_last_bar: date) -> bool:
-    """An EMPTY re-fetch may replace a partition holding rows only when every one of those rows
-    precedes a None-root cutover: that chain was another company's (ECHO before its listing).
-    Anything else -- a vendor hiccup, a wrong alias -- keeps the old rows."""
-    return any(root is None and old_last_bar < cut for cut, root in ROOT_HISTORY.get(symbol.upper(), ()))
+def empty_overwrite_ok(symbol: str, old_first_bar: date, old_last_bar: date) -> bool:
+    """An EMPTY re-fetch may replace a partition holding rows only when EVERY one of those rows
+    lies INSIDE a None segment (``_none_segments``: from the previous cutover to the None
+    cutover) -- that chain was not the platform symbol's (ECHO before its listing, PSKY in the
+    Skydance deal stretch). Rows that merely PRECEDE a None cutover (PSKY's VIAC/PARA history)
+    are kept, as is anything else -- a vendor hiccup, a wrong alias."""
+    return any(lo <= old_first_bar and old_last_bar < hi for lo, hi in _none_segments(symbol))
 
 
 def parquet_store_hooks() -> Dict[str, Any]:
