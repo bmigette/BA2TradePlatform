@@ -1,152 +1,152 @@
 {
  "backtest_id": 905,
+ "name": "synthetic-opt-screener-FMPRating",
  "entry_rules": [
   {
+   "continueProcessing": false,
+   "id": "buy",
+   "name": "enter-buy",
+   "conditions": {
+    "id": "syn-root",
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "buy-bullish",
+      "field": "bullish",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "buy-flat",
+      "field": "has_no_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "gate_recent_close",
+      "field": "days_since_last_close",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">",
+      "op": ">",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 10.0,
+      "valueMin": 0.0,
+      "value_min": 0.0,
+      "valueMax": 20.0,
+      "value_max": 20.0,
+      "valueStep": 2.0,
+      "value_step": 2.0,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     },
+     {
+      "id": "gate_recent_loss",
+      "field": "days_since_last_losing_close",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">",
+      "op": ">",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 6.0,
+      "valueMin": 0.0,
+      "value_min": 0.0,
+      "valueMax": 24.0,
+      "value_max": 24.0,
+      "valueStep": 3.0,
+      "value_step": 3.0,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     }
+    ]
+   },
    "actions": [
     {
      "action": "buy",
      "action_type": "buy"
     }
    ],
-   "conditions": {
-    "conditions": [
-     {
-      "comparison": "is_true",
-      "field": "bullish",
-      "fieldType": "flag",
-      "field_type": "flag",
-      "id": "buy-bullish",
-      "op": "is_true",
-      "optimize": false,
-      "optimizeEnabled": false
-     },
-     {
-      "comparison": "is_true",
-      "field": "has_no_position",
-      "fieldType": "flag",
-      "field_type": "flag",
-      "id": "buy-flat",
-      "op": "is_true",
-      "optimize": false,
-      "optimizeEnabled": false
-     },
-     {
-      "comparison": ">",
-      "field": "days_since_last_close",
-      "fieldType": "numeric",
-      "field_type": "numeric",
-      "id": "gate_recent_close",
-      "op": ">",
-      "optimize": true,
-      "optimizeEnabled": true,
-      "toggleOptimize": true,
-      "toggle_optimize": true,
-      "value": 10.0,
-      "valueMax": 20.0,
-      "valueMin": 0.0,
-      "valueStep": 2.0,
-      "value_max": 20.0,
-      "value_min": 0.0,
-      "value_step": 2.0
-     },
-     {
-      "comparison": ">",
-      "field": "days_since_last_losing_close",
-      "fieldType": "numeric",
-      "field_type": "numeric",
-      "id": "gate_recent_loss",
-      "op": ">",
-      "optimize": true,
-      "optimizeEnabled": true,
-      "toggleOptimize": true,
-      "toggle_optimize": true,
-      "value": 6.0,
-      "valueMax": 24.0,
-      "valueMin": 0.0,
-      "valueStep": 3.0,
-      "value_max": 24.0,
-      "value_min": 0.0,
-      "value_step": 3.0
-     }
-    ],
-    "id": "syn-root",
-    "operator": "AND",
-    "type": "AND"
-   },
-   "continueProcessing": false,
-   "continue_processing": false,
-   "id": "buy",
-   "name": "enter-buy"
+   "continue_processing": false
   }
  ],
  "exit_rules": [
   {
-   "actions": [
-    {
-     "action": "close",
-     "action_type": "close"
-    }
-   ],
+   "continueProcessing": false,
+   "toggleOptimize": true,
+   "id": "exit_negative",
    "conditions": {
+    "operator": "AND",
+    "type": "AND",
     "conditions": [
      {
-      "comparison": "is_true",
+      "id": "xn",
       "field": "rating_positive_to_negative",
       "fieldType": "flag",
       "field_type": "flag",
-      "id": "xn",
+      "comparison": "is_true",
       "op": "is_true",
-      "optimize": false,
-      "optimizeEnabled": false
+      "optimizeEnabled": false,
+      "optimize": false
      }
-    ],
-    "operator": "AND",
-    "type": "AND"
+    ]
    },
-   "continueProcessing": false,
-   "continue_processing": false,
-   "id": "exit_negative",
-   "toggleOptimize": true,
-   "toggle_optimize": true
-  },
-  {
    "actions": [
     {
      "action": "close",
      "action_type": "close"
     }
    ],
+   "continue_processing": false,
+   "toggle_optimize": true
+  },
+  {
+   "continueProcessing": false,
+   "toggleOptimize": true,
+   "id": "exit_stale",
    "conditions": {
+    "operator": "AND",
+    "type": "AND",
     "conditions": [
      {
-      "comparison": ">",
+      "id": "xh",
       "field": "days_opened",
       "fieldType": "numeric",
       "field_type": "numeric",
-      "id": "xh",
+      "comparison": ">",
       "op": ">",
-      "optimize": true,
       "optimizeEnabled": true,
+      "optimize": true,
       "value": 35.0,
-      "valueMax": 105.0,
       "valueMin": 15.0,
-      "valueStep": 15.0,
-      "value_max": 105.0,
       "value_min": 15.0,
+      "valueMax": 105.0,
+      "value_max": 105.0,
+      "valueStep": 15.0,
       "value_step": 15.0
      }
-    ],
-    "operator": "AND",
-    "type": "AND"
+    ]
    },
-   "continueProcessing": false,
+   "actions": [
+    {
+     "action": "close",
+     "action_type": "close"
+    }
+   ],
    "continue_processing": false,
-   "id": "exit_stale",
-   "toggleOptimize": true,
    "toggle_optimize": true
   }
  ],
- "name": "synthetic-opt-screener-FMPRating",
  "optimized_genes": {
   "cond:gate_confidence_floor:enabled": 0,
   "cond:gate_confidence_floor:value": 55.0,

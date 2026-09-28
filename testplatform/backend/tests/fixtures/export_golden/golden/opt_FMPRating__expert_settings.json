@@ -1,15 +1,37 @@
 {
  "backtest_id": 901,
- "backtest_only": {
-  "entry_action": null,
-  "hold_assigned_stock": false
- },
- "end_date": "2024-09-30T00:00:00",
+ "name": "synthetic-opt-FMPRating",
+ "expert": "FMPRating",
  "engine_type": "daily_expert",
+ "settings": {
+  "expert_params": {
+   "atr_multiplier": 1.5,
+   "max_virtual_equity_per_instrument_percent": 18.0,
+   "min_analysts": 7,
+   "min_stop_loss_pct": 4.5,
+   "price_target_window_days": 45,
+   "profit_ratio": 0.8,
+   "risk_per_trade_pct": 0.75,
+   "target_price_type": "high",
+   "use_atr_stop": false,
+   "regime_overlay_enabled": false,
+   "allow_automated_trade_opening": true,
+   "enable_buy": true,
+   "allow_automated_trade_modification": true,
+   "enable_sell": false
+  }
+ },
+ "backtest_only": {
+  "hold_assigned_stock": false,
+  "entry_action": null
+ },
  "execution": {
-  "commission": 0.25,
-  "enable_short": false,
+  "seed": 77,
   "fill_model": "next_bar_open",
+  "warmup_days": 40,
+  "commission": 0.25,
+  "slippage": 1.5,
+  "enable_short": false,
   "run_schedule_override": {
    "days": {
     "friday": true,
@@ -23,34 +45,8 @@
    "times": [
     "09:45"
    ]
-  },
-  "seed": 77,
-  "slippage": 1.5,
-  "warmup_days": 40
- },
- "execution_interval": "15min",
- "expert": "FMPRating",
- "initial_capital": 25000.0,
- "name": "synthetic-opt-FMPRating",
- "settings": {
-  "expert_params": {
-   "allow_automated_trade_modification": true,
-   "allow_automated_trade_opening": true,
-   "atr_multiplier": 1.5,
-   "enable_buy": true,
-   "enable_sell": false,
-   "max_virtual_equity_per_instrument_percent": 18.0,
-   "min_analysts": 7,
-   "min_stop_loss_pct": 4.5,
-   "price_target_window_days": 45,
-   "profit_ratio": 0.8,
-   "regime_overlay_enabled": false,
-   "risk_per_trade_pct": 0.75,
-   "target_price_type": "high",
-   "use_atr_stop": false
   }
  },
- "start_date": "2022-03-01T00:00:00",
  "universe": {
   "mode": "static",
   "symbols": [
@@ -63,5 +59,9 @@
    "QCOM",
    "ADBE"
   ]
- }
+ },
+ "execution_interval": "15min",
+ "start_date": "2022-03-01T00:00:00",
+ "end_date": "2024-09-30T00:00:00",
+ "initial_capital": 25000.0
 }

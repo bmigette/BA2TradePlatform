@@ -55,7 +55,7 @@ def main() -> int:
                for month, per in tab._calculate_monthly_metrics(closed).items()}
     with open(sys.argv[1], "w") as f:
         json.dump({"batch": batch, "metrics": metrics, "monthly": monthly}, f, indent=1,
-                  sort_keys=True, default=str)
+                  default=str)
     print(f"captured {len(ids)} experts, {len(closed)} closed transactions -> {sys.argv[1]}")
     return 0
 

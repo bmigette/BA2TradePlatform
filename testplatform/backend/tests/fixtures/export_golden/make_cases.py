@@ -14,9 +14,17 @@ import os
 import sqlite3
 import sys
 
-from ba2_common.core.rule_models import trade_rules_from_legacy
-
 HERE = os.path.dirname(os.path.abspath(__file__))
+# repo root = export_golden -> fixtures -> tests -> backend -> testplatform -> repo
+REPO = HERE
+for _ in range(5):
+    REPO = os.path.dirname(REPO)
+# THIS checkout's packages first: the venv's editable installs may point at another checkout.
+for p in (os.path.join(REPO, "packages", n) for n in ("experts", "providers", "common")):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from ba2_common.core.rule_models import trade_rules_from_legacy  # noqa: E402
 FIELDS = ("id", "name", "expert_name", "engine_type", "strategy_params", "start_date",
           "end_date", "initial_capital", "optimization_id")
 

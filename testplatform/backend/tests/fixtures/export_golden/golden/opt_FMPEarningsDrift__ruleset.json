@@ -1,126 +1,126 @@
 {
  "backtest_id": 902,
+ "name": "synthetic-opt-FMPEarningsDrift",
  "entry_rules": [
   {
+   "continueProcessing": false,
+   "id": "buy",
+   "name": "enter-buy",
+   "conditions": {
+    "id": "grp-syn-ed",
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "buy-bullish",
+      "field": "bullish",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c0",
+      "field": "has_no_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c1",
+      "field": "rating_upgraded",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c2",
+      "field": "expected_profit_percent",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">",
+      "op": ">",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 3.5,
+      "valueMin": 1.0,
+      "value_min": 1.0,
+      "valueMax": 6.0,
+      "value_max": 6.0,
+      "valueStep": 0.5,
+      "value_step": 0.5,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     }
+    ]
+   },
    "actions": [
     {
      "action": "buy",
      "action_type": "buy"
     }
    ],
-   "conditions": {
-    "conditions": [
-     {
-      "comparison": "is_true",
-      "field": "bullish",
-      "fieldType": "flag",
-      "field_type": "flag",
-      "id": "buy-bullish",
-      "op": "is_true",
-      "optimize": false,
-      "optimizeEnabled": false
-     },
-     {
-      "comparison": "is_true",
-      "field": "has_no_position",
-      "fieldType": "flag",
-      "field_type": "flag",
-      "id": "c0",
-      "op": "is_true",
-      "optimize": false,
-      "optimizeEnabled": false
-     },
-     {
-      "comparison": "is_true",
-      "field": "rating_upgraded",
-      "fieldType": "flag",
-      "field_type": "flag",
-      "id": "c1",
-      "op": "is_true",
-      "optimize": false,
-      "optimizeEnabled": false
-     },
-     {
-      "comparison": ">",
-      "field": "expected_profit_percent",
-      "fieldType": "numeric",
-      "field_type": "numeric",
-      "id": "c2",
-      "op": ">",
-      "optimize": true,
-      "optimizeEnabled": true,
-      "toggleOptimize": true,
-      "toggle_optimize": true,
-      "value": 3.5,
-      "valueMax": 6.0,
-      "valueMin": 1.0,
-      "valueStep": 0.5,
-      "value_max": 6.0,
-      "value_min": 1.0,
-      "value_step": 0.5
-     }
-    ],
-    "id": "grp-syn-ed",
-    "operator": "AND",
-    "type": "AND"
-   },
-   "continueProcessing": false,
-   "continue_processing": false,
-   "id": "buy",
-   "name": "enter-buy"
+   "continue_processing": false
   }
  ],
  "exit_rules": [
   {
+   "continueProcessing": false,
+   "toggleOptimize": true,
+   "id": "syn-x1",
+   "conditions": {
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "c0",
+      "field": "has_buy_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c1",
+      "field": "profit_loss_percent",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": "<=",
+      "op": "<=",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": -7.0,
+      "valueMin": -12.0,
+      "value_min": -12.0,
+      "valueMax": -3.0,
+      "value_max": -3.0,
+      "valueStep": 1.5,
+      "value_step": 1.5,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     }
+    ]
+   },
    "actions": [
     {
      "action": "close",
      "action_type": "close"
     }
    ],
-   "conditions": {
-    "conditions": [
-     {
-      "comparison": "is_true",
-      "field": "has_buy_position",
-      "fieldType": "flag",
-      "field_type": "flag",
-      "id": "c0",
-      "op": "is_true",
-      "optimize": false,
-      "optimizeEnabled": false
-     },
-     {
-      "comparison": "<=",
-      "field": "profit_loss_percent",
-      "fieldType": "numeric",
-      "field_type": "numeric",
-      "id": "c1",
-      "op": "<=",
-      "optimize": true,
-      "optimizeEnabled": true,
-      "toggleOptimize": true,
-      "toggle_optimize": true,
-      "value": -7.0,
-      "valueMax": -3.0,
-      "valueMin": -12.0,
-      "valueStep": 1.5,
-      "value_max": -3.0,
-      "value_min": -12.0,
-      "value_step": 1.5
-     }
-    ],
-    "operator": "AND",
-    "type": "AND"
-   },
-   "continueProcessing": false,
    "continue_processing": false,
-   "id": "syn-x1",
-   "toggleOptimize": true,
    "toggle_optimize": true
   }
  ],
- "name": "synthetic-opt-FMPEarningsDrift",
  "optimized_genes": {
   "cond:c1:enabled": 1,
   "cond:c1:value": 11.0,

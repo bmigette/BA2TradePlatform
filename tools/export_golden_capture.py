@@ -51,7 +51,7 @@ def main() -> int:
     finally:
         db.close()
     with open(out_path, "w") as f:
-        json.dump(out, f, indent=1, sort_keys=True, default=str)
+        json.dump(out, f, indent=1, default=str)
     print(f"captured {len(out)} backtests -> {out_path}")
     return 0
 

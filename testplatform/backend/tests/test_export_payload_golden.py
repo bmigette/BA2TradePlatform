@@ -14,7 +14,8 @@ from app.models.strategy import Strategy
 from app.models.strategy_optimization import StrategyOptimization
 
 HERE = os.path.join(os.path.dirname(__file__), "fixtures", "export_golden")
-CASES = json.load(open(os.path.join(HERE, "cases.json")))
+with open(os.path.join(HERE, "cases.json")) as _f:
+    CASES = json.load(_f)
 UPDATE = os.environ.get("BA2_UPDATE_GOLDEN") == "1"
 
 
@@ -34,13 +35,15 @@ def _run(case, kind):
         fields = dict(case["backtest"])
         if case["opt_backtest_block"] is not None:
             strat = Strategy(name=f"golden-{case['case_id']}-{kind}", entry_rules=[], exit_rules=[])
-            db.add(strat); db.commit(); db.refresh(strat)
+            db.add(strat)
+            db.flush()
             opt = StrategyOptimization(
                 strategy_id=strat.id, name=f"golden-{case['case_id']}-{kind}",
                 fitness_metric="sharpe", optimization_type="genetic",
                 optimization_config={"backtest": case["opt_backtest_block"]},
                 all_results=[], best_params={}, best_fitness=0.0, status="completed")
-            db.add(opt); db.commit(); db.refresh(opt)
+            db.add(opt)
+            db.flush()
             fields["optimization_id"] = opt.id
         fields["start_date"] = _dt(fields["start_date"])
         fields["end_date"] = _dt(fields["end_date"])
@@ -51,8 +54,11 @@ def _run(case, kind):
             payload = {"__error__": type(e).__name__, "detail": str(getattr(e, "detail", e))}
         # backtest_id is the ORIGINAL row id carried in the case; optimization ids are
         # host-DB artefacts and are not part of any payload.
-        return json.dumps(payload, indent=1, sort_keys=True, default=str)
+        return json.dumps(payload, indent=1, default=str)
     finally:
+        # Host rows were only flushed (visible to the export's queries on this same session);
+        # roll them back so the test leaves nothing behind.
+        db.rollback()
         db.close()
 
 
@@ -63,5 +69,7 @@ def test_export_payload_matches_golden(case, kind):
     path = os.path.join(HERE, "golden", f"{case['case_id']}__{kind}.json")
     if UPDATE:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        open(path, "w").write(got)
-    assert got == open(path).read()
+        with open(path, "w") as f:
+            f.write(got)
+    with open(path) as f:
+        assert got == f.read()
