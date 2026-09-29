@@ -40,7 +40,7 @@ import sys
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from matrix_flags import cap_passthrough  # noqa: E402
+from matrix_flags import cap_passthrough, job_name_with_digest  # noqa: E402
 
 _UNIVERSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "senate_universe.txt")
 _EXPERT = "FMPSenateTraderWeight"
@@ -48,10 +48,50 @@ _DEFAULT_STRATEGIES = ["S2", "S3", "S5", "S6"]
 _DEFAULT_CAPITAL = 10000.0
 
 
-def _universe() -> str:
-    with open(_UNIVERSE_FILE, encoding="utf-8") as f:
-        syms = [s.strip() for s in f.read().split() if s.strip()]
+def _universe(path: str = _UNIVERSE_FILE) -> str:
+    """Comma-joined symbol list from ``path``. Lines starting with ``#`` are comments (e.g. the
+    provenance header on ``docs/strategy_research/atr_grid/senate_universe_2020_2025.txt``, the
+    goal2027atr Senate-lane universe -- see ``--universe-file``); blank lines are skipped too."""
+    with open(path, encoding="utf-8") as f:
+        syms = [s.strip() for s in f.read().splitlines()
+                if s.strip() and not s.strip().startswith("#")]
     return ",".join(syms)
+
+
+def market_condition_passthrough(args) -> list:
+    """Extra ``optimize`` CLI tokens for the goal2027atr market-condition flags ([] when none of
+    the five is given, so an ordinary invocation of this driver is untouched).
+
+    Byte-for-byte the same five flags/logic as
+    ``tools/run_screener_capband_matrix.py:market_condition_passthrough`` (the equity S1-S7
+    lane) -- Senate needs the identical set (profile, manifest, exit kinds, mode, sl-loosen), so
+    this mirrors that function rather than inventing a Senate-specific shape. Kept as a separate
+    function (not moved into ``matrix_flags.py``) because the sibling drivers' market-condition
+    flag sets already diverge in practice (``run_options_matrix.py``'s is a 2-flag, "none"-aware
+    variant) -- one shared implementation would have to grow driver-specific branches instead of
+    being a plain shared helper.
+    """
+    out: list = []
+    if getattr(args, "market_condition_profile", None):
+        out += ["--market-condition-profile", args.market_condition_profile]
+    if getattr(args, "market_condition_manifest", None):
+        out += ["--market-condition-manifest", args.market_condition_manifest]
+    if getattr(args, "market_exit", None):
+        out += ["--market-exit", args.market_exit]
+    if getattr(args, "market_condition_mode", None) and args.market_condition_mode != "searched":
+        out += ["--market-condition-mode", args.market_condition_mode]
+    if getattr(args, "search_sl_loosen", False):
+        out += ["--search-sl-loosen"]
+    return out
+
+
+def _job_name(name: str, cmd: list) -> str:
+    """``name``, or ``name-d<digest>`` when ``market_condition_passthrough`` added anything.
+
+    Thin wrapper over ``matrix_flags.job_name_with_digest``, exactly mirroring
+    ``tools/run_screener_capband_matrix.py:_job_name`` (same digest math, shared implementation).
+    """
+    return job_name_with_digest(name, cmd)
 
 
 def _db_path() -> str:
@@ -79,10 +119,24 @@ def _jobs(strategies, name_suffix=""):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--strategies", default=",".join(_DEFAULT_STRATEGIES),
-                    help="Comma list of strategy keys (default S2,S3,S5,S6 -- S1/S4/S7 need "
-                         "a real analyst target Senate doesn't have).")
+                    help="Comma list of strategy keys (default S2,S3,S5,S6). S1 was long "
+                         "believed inapplicable (it anchored on expert_target_price, which "
+                         "Senate has none of) -- since S4's target-anchored TP was merged into "
+                         "S1 as a GA-TOGGLEABLE, self-disabling entry_action, S1 runs fine for "
+                         "Senate (goal2020 confirms it: backtests 1438-1440 etc.) and is part "
+                         "of the goal2027atr Senate lane (see tools/grid_atr27.sh PHASE=senate, "
+                         "--strategies S1,S3,S5,S6). S7 stays FMPRating-only (a refinement "
+                         "around ITS archived winner).")
     ap.add_argument("--start", default="2023-01-01")
     ap.add_argument("--end", default="2026-06-30")
+    ap.add_argument("--universe-file", default=_UNIVERSE_FILE,
+                    help="Path to a symbol-per-line universe file (default "
+                         "tools/senate_universe.txt, the static disclosure-derived universe). "
+                         "goal2027atr's PHASE=senate points this at "
+                         "docs/strategy_research/atr_grid/senate_universe_2020_2025.txt, a "
+                         "FRESH derivation for the 2020-2025 window -- see that file's header. "
+                         "'#'-prefixed and blank lines are skipped, so a provenance header is "
+                         "safe to keep in the file.")
     ap.add_argument("--population", type=int, default=60,
                     help="Default 60: the expert has 15 optimizable params (7 legacy + 8 "
                          "skill/scalper) plus strategy/cond genes -- sized like FMPRating's "
@@ -112,29 +166,92 @@ def main() -> int:
                     help="Round-trip bid-ask spread in basis points (see BacktestAccount._slip/"
                          "_limit_trigger_price). Senate's universe spans all cap bands, so this "
                          "is a single blended assumption, not cap-band-specific. Default 0.0.")
+    ap.add_argument("--stress-spread-bps", type=float, default=0.0,
+                    help="Rank every genome on the WORSE of its fitness at --spread-bps and at "
+                         "--spread-bps plus this many bps. Default 0.0 (off). Like --spread-bps, "
+                         "a single blended value -- Senate's universe has no cap-band dimension "
+                         "to key a per-band value on (contrast the equity driver's "
+                         "--stress-spread-bps, which is 'large=..,mid=..,small=..'). Forwarded "
+                         "only when > 0, so an ordinary invocation is unchanged.")
+    ap.add_argument("--early-stop", type=int, default=None,
+                    help="GA early-stop patience passthrough (default: the launcher's own, 4). "
+                         "Forwarded only when given, so existing commands are unchanged.")
+    ap.add_argument("--early-stop-min-rel", type=float, default=None,
+                    help="Minimum RELATIVE gain (a fraction, 0.01 = 1%%) that resets the "
+                         "early-stop patience; passthrough, forwarded only when given.")
+    ap.add_argument("--sizing-mode", choices=("notional", "risk_atr"), default=None,
+                    help="Pin sizing_mode for every job, overriding the expert's default. "
+                         "REQUIRES --name-suffix to contain the mode token ('riskatr'/"
+                         "'notional'), or a same-named prior run of the other mode would be "
+                         "skipped as already-completed -- same guard as the equity driver's "
+                         "--sizing-mode.")
+    ap.add_argument("--robust-fitness", dest="robust_fitness", action="store_true", default=True,
+                    help="Rank on the ROBUSTNESS-ADJUSTED fitness (concentration + monte carlo + "
+                         "spread). ON BY DEFAULT (the launcher's own default since 2026-09-17), "
+                         "so this flag only restates it explicitly; nothing is forwarded.")
+    ap.add_argument("--no-robust-fitness", dest="robust_fitness", action="store_false",
+                    help="Rank on the RAW metric instead (the pre-2026-09-17 default) -- "
+                         "forwarded to every job. Scores are NOT comparable across this "
+                         "setting; use a fresh --name-suffix when flipping it on a re-run.")
+    ap.add_argument("--rm-toggle-policy", default=None, choices=("pinned", "atr-searched"),
+                    help="See `ba2-test optimize --rm-toggle-policy`; passthrough, forwarded "
+                         "only when given, so every existing command is unchanged. "
+                         "'atr-searched' requires --name (or --name-suffix, folded into the "
+                         "built name) to contain '-atr27' -- the launcher refuses per-job "
+                         "otherwise.")
+    # -------------------------------------------------------------------------------------------
+    # goal2027atr market-condition passthrough (Senate lane) -- see market_condition_passthrough's
+    # docstring: each of the five is forwarded ONLY when given, and an invocation that passes
+    # none of them builds a byte-identical job name/argv to before this block existed. When any
+    # IS given, _job_name folds the job's full resolved argv (minus --name/--parallel/--workers)
+    # into a digest suffix, so a flag change gets a new job identity and can never resume an old
+    # (differently-configured) row under the same name.
+    # -------------------------------------------------------------------------------------------
+    ap.add_argument("--market-condition-profile", default=None,
+                    metavar="none|<profile>[,<profile>...]",
+                    help="Forward --market-condition-profile to every job (see `ba2-test "
+                         "optimize --help`). Folds into the job's name digest.")
+    ap.add_argument("--market-condition-manifest", default=None,
+                    metavar="DIGEST[,DIGEST...]|<profile>=DIGEST,...",
+                    help="Forward --market-condition-manifest to every job. Folds into the "
+                         "job's name digest.")
+    ap.add_argument("--market-exit", default=None, metavar="KIND[,KIND...]",
+                    help="Forward --market-exit to every job (S1-S7 only; requires "
+                         "--market-condition-profile). Folds into the job's name digest.")
+    ap.add_argument("--market-condition-mode", default=None, choices=("searched", "all-off"),
+                    help="Forward --market-condition-mode to every job ('searched' is the "
+                         "launcher default and is NOT forwarded -- pass 'all-off' for the "
+                         "matched control arm). Folds into the job's name digest when 'all-off'.")
+    ap.add_argument("--search-sl-loosen", action="store_true", default=False,
+                    help="Forward --search-sl-loosen to every job. Folds into the job's name "
+                         "digest.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
+    # A sizing-mode matrix MUST be name-distinguished from its sibling -- see --sizing-mode help.
+    if args.sizing_mode:
+        token = "riskatr" if args.sizing_mode == "risk_atr" else "notional"
+        if token not in args.name_suffix.replace("_", "").lower():
+            ap.error(
+                f"--sizing-mode {args.sizing_mode} requires --name-suffix to contain "
+                f"'{token}' (got {args.name_suffix!r}). Otherwise a re-run under the other mode "
+                f"is skipped as already-completed. Example: --name-suffix -goal2027atr-{token}")
+
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
-    universe = _universe()
+    universe = _universe(args.universe_file)
     exe = os.path.join(os.path.dirname(sys.executable), "ba2-test.exe")
     if not os.path.exists(exe):
         exe = os.path.join(os.path.dirname(sys.executable), "ba2-test")
 
     jobs = list(_jobs(strategies, args.name_suffix))
     done = _completed_names()
+    mc_tokens_preview = market_condition_passthrough(args)
     print(f"senate matrix: {len(jobs)} jobs (strategies={strategies}, "
           f"universe={len(universe.split(','))} symbols); "
-          f"{sum(1 for j in jobs if j[0] in done)} already completed.")
-    if args.dry_run:
-        for nm, s in jobs:
-            print(f"  {'DONE' if nm in done else 'TODO'}  {nm}  ({_EXPERT} {s})")
-        return 0
+          f"{sum(1 for j in jobs if j[0] in done)} already completed"
+          f"{' (by base name; digest-suffixed names are checked per job)' if mc_tokens_preview else ''}.")
 
     for i, (name, strat) in enumerate(jobs, 1):
-        if name in _completed_names():   # re-read each loop (resumable)
-            print(f"[{i}/{len(jobs)}] SKIP {name} (already completed)", flush=True)
-            continue
         cmd = [exe, "optimize", "--expert", _EXPERT, "--universe", universe,
                "--strategy", strat,
                "--start", args.start, "--end", args.end, "--fitness", args.fitness,
@@ -142,8 +259,16 @@ def main() -> int:
                "--generations", str(args.generations),
                "--initial-capital", str(args.initial_capital),
                "--run-schedule", "weekly", "--name", name, "--parallel", str(args.parallel)]
+        if args.sizing_mode:
+            cmd += ["--sizing-mode", args.sizing_mode]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]
+        if args.early_stop is not None:
+            cmd += ["--early-stop", str(args.early_stop)]
+        if args.early_stop_min_rel is not None:
+            cmd += ["--early-stop-min-rel", str(args.early_stop_min_rel)]
+        if args.rm_toggle_policy:
+            cmd += ["--rm-toggle-policy", args.rm_toggle_policy]
         # "Pass 0 to disable" (see the --profit-cap-pct help): a 0 must be FORWARDED, because
         # omitting the flag lets ba2test_launcher re-apply its own 2000/25 default instead.
         cmd += cap_passthrough(args)
@@ -151,10 +276,32 @@ def main() -> int:
             cmd += ["--workers", args.workers]
         if args.spread_bps and args.spread_bps > 0:
             cmd += ["--spread-bps", str(args.spread_bps)]
+        if args.stress_spread_bps and args.stress_spread_bps > 0:
+            cmd += ["--stress-spread-bps", str(args.stress_spread_bps)]
+        # Default-ON in the launcher: the ON case passes nothing (job names/argv unchanged) and
+        # only the opt-OUT is forwarded.
+        if not args.robust_fitness:
+            cmd += ["--no-robust-fitness"]
         cmd += ["--labels", strat]
-        print(f"[{i}/{len(jobs)}] RUN  {name} ...", flush=True)
+        # goal2027atr market-condition passthrough: [] with none of the five flags given, so an
+        # ordinary invocation's cmd (and therefore its name/digest below) is byte-identical to
+        # before this block existed. Appended LAST so it never displaces an existing token's
+        # position for a job with no new flags.
+        mc_tokens = market_condition_passthrough(args)
+        cmd += mc_tokens
+        job_name = name
+        if mc_tokens:
+            job_name = _job_name(name, cmd)
+            cmd[cmd.index("--name") + 1] = job_name
+        if args.dry_run:
+            print(f"  {'DONE' if job_name in done else 'TODO'}  {job_name}  ({_EXPERT} {strat})")
+            continue
+        if job_name in _completed_names():   # re-read each loop (resumable)
+            print(f"[{i}/{len(jobs)}] SKIP {job_name} (already completed)", flush=True)
+            continue
+        print(f"[{i}/{len(jobs)}] RUN  {job_name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
-        print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)
+        print(f"[{i}/{len(jobs)}] {job_name} exit={rc}", flush=True)
     print("senate matrix driver: done.")
     return 0
 
