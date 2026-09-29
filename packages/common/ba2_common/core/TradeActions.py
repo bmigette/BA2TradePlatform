@@ -339,13 +339,14 @@ class TradeAction(ABC):
         """Close ``self.close_percent`` (1..100, default 100) of this expert's own position.
 
         ``transactions`` are ONE side of this expert's position (all BUY, or all SELL). The
-        quantity is ``floor(filled x percent / 100)`` whole shares of what is FILLED
-        (``_open_filled_quantity``): 100% closes every transaction through ``close_transaction``
-        (a WAITING entry is cancelled), anything less is taken FIFO from the oldest OPENED
-        transactions -- a transaction the slice exhausts is closed, the one it cuts into is
-        reduced through ``account.reduce_transaction``. A percent that rounds to zero shares is
-        refused. The broker must hold at least what is traded, so the order can never pass
-        through zero and flip the position."""
+        ``filled x percent / 100`` of what is FILLED (``_open_filled_quantity``). Fractional
+        positions preserve that fractional quantity; whole-share positions retain the legacy
+        whole-share close rule for backward compatibility. 100% closes every transaction
+        through ``close_transaction`` (a WAITING entry is cancelled), anything less is taken
+        FIFO from the oldest OPENED transactions -- a transaction the slice exhausts is closed,
+        the one it cuts into is reduced through ``account.reduce_transaction``. The broker must
+        hold at least what is traded, so the order can never pass through zero and flip the
+        position."""
         if self.close_percent is None:
             pct = 100.0
         else:
@@ -366,13 +367,24 @@ class TradeAction(ABC):
         held_at_broker = broker_qty if is_long else -broker_qty
         filled = self._open_filled_quantity(transactions)
         full = pct >= 100.0
-        # Rounded before the floor: 375 x 18.4 / 100 is 68.99999999999999 in binary, and flooring
-        # that would sell a share less than the percent asked for.
-        quantity = filled if full else float(math.floor(round(filled * pct / 100.0, 9)))
+        fractional_position = abs(filled - round(filled)) > 1e-9
+        if full:
+            quantity = filled
+        elif fractional_position:
+            # A fractional-enabled account must be able to close the same fractional position
+            # that was opened. The broker adapter owns symbol-specific precision/minimum checks.
+            quantity = float(filled * pct / 100.0)
+        else:
+            # Preserve the pre-fractional behaviour for whole-share positions: percentage
+            # closes are floored to whole shares and a sub-share result is refused.
+            quantity = float(math.floor(round(filled * pct / 100.0, 9)))
         if not full and quantity <= 0:
-            return self._refused(action_type, (
-                f"{what} for {self.instrument_name}: {pct:g}% of the {filled:g} held rounds to 0 "
-                f"whole shares - nothing to close"), percent=pct, held=filled)
+            reason = (f"{what} for {self.instrument_name}: {pct:g}% of the {filled:g} held "
+                      f"rounds to 0 whole shares - nothing to close")
+            if fractional_position:
+                reason = (f"{what} for {self.instrument_name}: {pct:g}% of the {filled:g} "
+                          f"held produces no positive quantity - nothing to close")
+            return self._refused(action_type, reason, percent=pct, held=filled)
         if held_at_broker < quantity:
             return self._refused(action_type, (
                 f"Refusing to close {quantity:g} of {self.instrument_name}: this expert holds "
@@ -382,24 +394,13 @@ class TradeAction(ABC):
         if full:
             return self._close_own_transactions(transactions, action_type, what)
 
-        # PARTIAL close: plan the FIFO legs, and refuse -- before anything is sent -- what the
-        # partial-close facilities cannot do safely.
+        # PARTIAL close: plan the FIFO legs before anything is sent. The close and reduction
+        # facilities preserve the selected quantity, including fractional quantities.
         opened = sorted((t for t in transactions if t.status == TransactionStatus.OPENED),
                         key=lambda t: t.id)
         lots = [(t, abs(float(t.get_current_open_qty()))) for t in opened]
         lots = [(t, net) for t, net in lots if net > 0]
 
-        def _whole(x: float) -> bool:
-            return abs(x - round(x)) < 1e-9
-
-        fractional = [t.id for t, net in lots if not _whole(net)]
-        if fractional or not _whole(filled):
-            # A broker refuses a fractional OCO, which the live trim re-arms for the remainder.
-            return self._refused(action_type, (
-                f"{what} for {self.instrument_name}: a partial close needs a whole-share "
-                f"position, but the {filled:g} held (lots {fractional or [t.id for t, _ in lots]}) "
-                f"is fractional; close it in full instead"),
-                percent=pct, fractional_transaction_ids=fractional)
         partly_filled = [t.id for t, net in lots if abs(net - abs(float(t.quantity))) > 1e-9]
         if partly_filled:
             # The live trim (TransactionHelper.adjust_quantity_with_tpsl) sizes from the ORDERED
@@ -431,7 +432,7 @@ class TradeAction(ABC):
                       "quantity": quantity, "percent": pct, "status": "PENDING"})
         legs = []
         for t, net, take in plan:
-            if take >= net:
+            if take >= net or math.isclose(take, net, rel_tol=0.0, abs_tol=1e-9):
                 logger.info(f"{type(self).__name__}: {what.lower()} - closing transaction {t.id} "
                             f"({net:g} {self.instrument_name}) via close_transaction")
                 result = self.account.close_transaction(t.id)
@@ -712,12 +713,14 @@ class SellAction(TradeAction):
     governs each case (operator decision 2026-09-25):
 
     * this expert LONG  -> CLOSE ``percent`` (1..100, default 100) of the long through
-      ``close_transaction`` / ``reduce_transaction``: whole shares, capped at what is held,
-      never flips, never sized as an entry. Needs ``enable_buy`` (the permission that opened
-      the long), whatever ``enable_sell`` says. A PERCENT RULE RE-TRIMS EVERY TIME IT MATCHES:
+      ``close_transaction`` / ``reduce_transaction``: exact shares, including fractional
+      shares, capped at what is held, never flips, never sized as an entry. Needs ``enable_buy``
+      (the permission that opened the long), whatever ``enable_sell`` says. A PERCENT RULE
+      RE-TRIMS EVERY TIME IT MATCHES:
       50% on 100 shares sells 50, the next matching pass sells 25 of the 50 left, then 12... --
       the rule's own conditions must gate it (e.g. a one-shot profit level), nothing else does.
-      A partial close is refused on a fractional or a partly filled position (close in full);
+      A partial close is refused only when a partly filled lot cannot be safely resized (close
+      that lot in full);
     * this expert SHORT -> refused (a sell would add to the short);
     * long AND short (a legacy hedge) -> refused;
     * this expert flat but the BROKER long (another expert's position) -> refused: the sell

@@ -129,13 +129,16 @@ def classic_run_detail_rows(decisions) -> list:
     for position, d in sorted(enumerate(decisions), key=_order):
         before, after = d.get('balance_before'), d.get('balance_after')
         symbol = d.get('symbol', '')
+        is_option = d.get('asset_class') == 'option'
+        row_symbol = (f"{symbol} · {d['option_strategy']}"
+                      if is_option and d.get('option_strategy') else symbol)
         rows.append({
             # UNIQUE per decision, and not the symbol: two recommendations on one ticker
             # (or two option legs) are two decisions, and on a symbol key Quasar renders
             # them as one row -- silently hiding whichever it saw first.
             'key': f"{position}:{symbol}",
             'rank': _rm_num(d.get('rank'), 'd'),
-            'symbol': symbol,
+            'symbol': row_symbol,
             'outcome': d.get('outcome', ''),
             # WHAT THE RANKING DECIDED ON. The score is the sort key the funding order was
             # built from, so a refused symbol's score IS its explanation: it ranked below the
@@ -144,11 +147,14 @@ def classic_run_detail_rows(decisions) -> list:
             'score': _rm_num(d.get('score'), '.3f'),
             'score_inputs': _rm_score_inputs(d),
             # '-' not 0: a refused symbol has no quantity at all.
-            'quantity': ('-' if d.get('quantity') is None else f"{d['quantity']:g}"),
+            # Contracts for an option entry, shares otherwise.
+            'quantity': ('-' if d.get('quantity') is None
+                         else f"{d['quantity']:g}{' ct' if is_option else ''}"),
             # The ceilings and the risk budget the quantity was solved from. Recorded on
             # every row; shown on hover rather than as four more columns, because they are
-            # what you ask for AFTER the size surprises you.
-            'qty_detail': _rm_qty_detail(d),
+            # what you ask for AFTER the size surprises you. For an option entry: the
+            # contract's quote and liquidity, and the structure's payoff limits.
+            'qty_detail': _rm_option_detail(d) if is_option else _rm_qty_detail(d),
             # THE SIZE IN MONEY, which is what the per-instrument cap in the context above is
             # denominated in -- so a funded row can be checked against the limit it was
             # measured against without doing the multiplication.
@@ -216,6 +222,45 @@ def _rm_qty_detail(d) -> str:
         # min-stop floor without a stop price ever being written to the order.
         parts.append(f"stop {_rm_num(stop_pct, '.1f')}% away")
     return ' · '.join(parts)
+
+
+def _rm_option_detail(d) -> str:
+    """The chosen contract(s)' quote and liquidity, then the payoff limits, or ''.
+
+    Every number through ``_rm_num``: a JSON-column value that is not a number must not
+    raise inside the dialog and take the whole run down with it.
+    """
+    parts = []
+    for leg in d.get('legs') or []:
+        right = {'call': 'C', 'put': 'P'}.get(str(leg.get('right') or '').lower(), '?')
+        head = f"{right} {_rm_num(leg.get('strike'), 'g')} {leg.get('expiry') or ''}".strip()
+        facts = []
+        if leg.get('bid') is not None or leg.get('ask') is not None:
+            facts.append(f"bid {_rm_num(leg.get('bid'), '.2f')} / ask {_rm_num(leg.get('ask'), '.2f')}")
+        if leg.get('iv') is not None:
+            facts.append(f"IV {_rm_num(leg['iv'] * 100 if isinstance(leg['iv'], (int, float)) else leg['iv'], '.0f')}%")
+        if leg.get('open_interest') is not None:
+            facts.append(f"OI {_rm_num(leg['open_interest'], ',.0f')}")
+        if leg.get('volume') is not None:
+            facts.append(f"vol {_rm_num(leg['volume'], ',.0f')}")
+        parts.append(head + (f": {', '.join(facts)}" if facts else ''))
+    if d.get('max_loss_per_contract') is not None:
+        parts.append(f"max loss ${_rm_num(d['max_loss_per_contract'], ',.2f')}/ct")
+    if d.get('max_profit_per_contract') is not None:
+        parts.append(f"max profit ${_rm_num(d['max_profit_per_contract'], ',.2f')}/ct")
+    if d.get('breakevens'):
+        parts.append('breakeven ' + ', '.join(_rm_num(b, ',.2f') for b in d['breakevens']))
+    return ' · '.join(parts)
+
+
+def classic_run_option_legend(decisions) -> str:
+    """One line explaining option rows, or '' when the run has none."""
+    if not any(d.get('asset_class') == 'option' for d in (decisions or [])):
+        return ''
+    return ('Option rows are entries sized by their own action (strike/DTE/sizing box), not '
+            'by this manager\'s ranking: Qty is contracts, Size the premium paid (debit) or '
+            'received (credit), and Reason the contract chosen. Hover Qty for its quote, '
+            'liquidity and payoff limits.')
 
 
 def _rm_binding_detail(d) -> str:
@@ -1267,6 +1312,9 @@ class JobMonitoringTab:
             legend = classic_run_detail_legend(decisions)
             if legend:
                 ui.label(legend).classes('text-xs text-gray-500 mt-1')
+            option_legend = classic_run_option_legend(decisions)
+            if option_legend:
+                ui.label(option_legend).classes('text-xs text-gray-500 mt-1')
 
             if not rows:
                 ui.label('This run received no symbols.').classes('text-sm text-gray-500 mt-2')

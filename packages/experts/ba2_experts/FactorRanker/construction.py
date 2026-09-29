@@ -17,8 +17,10 @@ def long_only_top_n(ranked: List[str], scores: Dict[str, float], top_n: int,
         ranked: symbols best-first (output of ``rank_symbols``).
         scores: composite score per symbol (used by score weighting).
         top_n: number of names to hold.
-        weighting: ``"equal"`` (1/N each) or ``"score"`` (proportional to the
-            non-negative composite score).
+        weighting: ``"equal"`` (1/N each), ``"score"`` (proportional to the
+            non-negative composite score) or ``"rank"`` (linear in rank: of N picks the
+            best gets N parts, the next N-1, ... the last 1 -- so the best name weighs
+            N times the last, whatever the scores' spread).
         max_weight_per_name: per-name weight cap.
         gross_exposure: total weight to deploy across the book.
 
@@ -38,6 +40,10 @@ def long_only_top_n(ranked: List[str], scores: Dict[str, float], top_n: int,
         total_raw = sum(raw.values())
         base = ({s: raw[s] / total_raw for s in picks} if total_raw > 0
                 else {s: 1.0 / len(picks) for s in picks})
+    elif weighting == "rank":
+        n = len(picks)
+        parts = n * (n + 1) / 2.0
+        base = {s: (n - i) / parts for i, s in enumerate(picks)}
     else:  # equal
         base = {s: 1.0 / len(picks) for s in picks}
 

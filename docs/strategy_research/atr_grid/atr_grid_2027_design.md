@@ -144,8 +144,21 @@ From `s1_s7_relevance.md`:
   - DeterministicScorer: large, mid and small.
   - FMPSenateTraderWeight: one universe.
   - That makes 11 expert-bands.
-- **FactorRanker is out.** It bypasses the classic RM, never reads ATR, and its mid/small results were empty.
-- **Job count:** 11 expert-bands × 4 strategies − 2 (ICB S2) = **42 treatment jobs**. See §6 for controls.
+- **FactorRanker is re-run, as its own lane** (operator decision, 2026-09-28; this reverses the draft's exclusion). It is **blocked until the FactorRanker equity-sizing fix merges**; see §4.1.
+- **Job count:** 11 expert-bands × 4 strategies − 2 (ICB S2) = **42 treatment jobs**. See §6 for controls. The FactorRanker jobs (§4.1) are counted and costed separately.
+
+### 4.1 FactorRanker
+
+- **Prerequisite, blocking: FactorRanker cells must not launch until the equity-sizing fix is merged.** Every past FactorRanker backtest is distorted, **including the goal2020 FactorRanker cells**:
+  - in backtests the rebalance sized against CASH only (`BacktestAccount.get_balance`), where live sizes against equity, so every other rebalance sold the whole book and the next one bought it back;
+  - re-pricing the stop after a resize also failed silently.
+  - Past FactorRanker results are therefore unreliable, and nothing in this grid may be compared with them or seeded from them. The fix is in progress on the BT session's branch `feat/factorranker-weighting-gene` (223b5ca9, not merged at the time of writing).
+- **Why it is back:** FactorRanker gains a `weighting` choice that goal2020 never searched. Commit 7c270156 added `"rank"` (weight linear in rank, still capped by `max_weight_per_name`) beside `"equal"` (1/N) and `"score"` (proportional to the composite score); the default stays `"equal"`.
+- **The gene** (same branch): `model:weighting`, a categorical gene index-encoded like FMPRating's `target_price_type`, declared as `_EXPERT_OPT["FactorRanker"]["expert_params"]["weighting"] = {"optimize": True, "type": "choice", "choices": ["equal", "score", "rank"]}`. The GA searches all **three** weightings; `"weighting": "equal"` leaves the launcher's fixed settings.
+- **Job identity:** the gene changes the FactorRanker search space, so an old FactorRanker checkpoint does not match, and the launcher skips completed job NAMES. The new FactorRanker cells need new names (or `--rerun`), and must never pick up an old completed row.
+- **What it does not share with the classic jobs:** it bypasses the classic RM (`bypasses_classic_rm`), so the optimizer drops the rule, TP/SL, condition and exit genes and searches only the expert's own `model:*` genes. ATR, the market entry gates, the market exits and `allow_ruleset_sl_loosen` therefore do not apply, and there is no all-off control arm: the treatment and the control would be the same job.
+- **Budget:** the §7 rule, from its own gene count. That is far below the classic jobs' 60–91 genes, so its population is well under the 120 cap and a job records far fewer trials. It is not in the §7.2 totals.
+- **Before trusting a result:** `top_n` must stay below the screener's `max_stocks`, or the ranking selects the whole universe and the factor weights and `weighting` do nothing (live instances 26/27 collapsed to one portfolio this way). goal2020's mid/small FactorRanker cells came back empty, so check that each band trades before comparing weightings.
 
 ## 5. Market conditions
 
@@ -219,10 +232,10 @@ The operator's 2026-09-15 instruction was: "do not change strategy s1 s7, only o
 ## 7. GA budget: the gene-scaled rule and its cost
 
 **Rule** (A4 revision, operator-approved 2026-09-24, `docs/plans/2026-09-24-pullback-and-market-exits.md` in BA2-pullback):
-- **Generations:** 25, or 30 when a job has more than 20 genes.
-- **Early stop:** 8.
+- **Generations:** 25, or 30 when a job has more than 20 genes; never more than 30 (operator decision, 2026-09-27/28).
+- **Early stop:** 5 generations without a gain of at least **1%** over the best at the last counted improvement (`earlyStoppingMinRelativeImprovement: 0.01`, the launcher's `--early-stop 5 --early-stop-min-rel 0.01`). This is the option grid's stricter rule, adopted for the equity grids on 2026-09-27/28; it replaces the A4 draft's early stop 8. A smaller gain still updates the best individual but does not reset the patience.
 - **Population:** clamp(4 × genes, 24, 120).
-- **Status:** A4 is specified for the exploration driver and not implemented yet. The equity driver needs the same resolution logic, with the gene count recorded in `optimization_config`.
+- **Status:** implemented in the exploration driver (`profiles.ga_budget`, with the 1% key in every genetic job). The equity driver needs the same resolution logic, with the gene count recorded in `optimization_config`.
 
 ### 7.1 Gene counts
 
@@ -249,7 +262,7 @@ Genes per job, market arm / all-off control:
 | DeterministicScorer | 87 / 63 | 72 / 48 | 73 / 49 | 63 / 39 |
 | FMPSenateTraderWeight | 91 / 67 | 76 / 52 | 77 / 53 | 67 / 43 |
 
-- **Every job has more than 30 genes**, so every job gets **population 120, 30 generations, early stop 8**.
+- **Every job has more than 30 genes**, so every job gets **population 120, 30 generations, early stop 5 at a 1% minimum gain**.
 - **The 120 cap binds everywhere.** 4 × genes would be 136–364, so population per gene falls to 1.3–3.5, against the rule's intended 4. The rule was written for exploration families of 1–40 genes. Whether to raise the cap for this grid is decision D11; cost scales linearly with it.
 - With per-tier S1 gates, S1 would carry 112–121 genes.
 
@@ -266,33 +279,36 @@ Reproducible with `cost_model.py`; the output is in `cost_model.out` and `cost_b
 3. **Window factor:** 7/6 for 2020–2026 against 2020–2025; 5/4 for FMPRating.
    - **Overhead** on the market arm: ×1.06. The gates measured +0.4% per trial; +5% is assumed for exit-rule evaluation.
 4. **Trials per job:**
-   - with early stop around generation 20: 0.71 × 120 × 20 = **1,704**;
+   - with early stop around generation 17: 0.71 × 120 × 17 = **1,448**;
    - with no early stop: 0.71 × 120 × 30 = **2,556**.
+   - **Where 17 comes from (an assumption, not a measurement):** the earlier estimate, under early stop 8, put the stop at about generation 20, i.e. the last improvement at about generation 12. Early stop 5 after the same last improvement stops at about generation 17. The 1% rule can only move the last *counted* improvement earlier, because a sub-1% gain no longer resets the clock, so 17 is an upper estimate of the typical stop. Every "early stop" figure below scales linearly with it (×17/20 against the early-stop-8 estimate).
 5. **Fleet:** remote227 at 28 slots (the current option grid runs there at `PARALLEL=28`) plus 4 local.
    - **Large and mid:** 32 slots.
    - **Small band:** 17. The peak child is 7.4–13 GB, so about 15 fit remote plus 2 local.
    - **Senate:** 16, at about 12.3 GB per child, none local.
 6. **Worked examples:**
-   - FMPR large S1 market arm: 1,704 × 3.20 × 1.0 × 1.25 × 1.06 / 32 slots / 60 = **3.7 h**.
-   - Senate S1 market arm: 1,704 × 3.20 × 8.56 × 1.167 × 1.06 / 16 / 60 = **60 h**.
+   - FMPR large S1 market arm: 1,448 × 3.20 × 1.0 × 1.25 × 1.06 / 32 slots / 60 = **3.2 h**.
+   - Senate S1 market arm: 1,448 × 3.20 × 8.56 × 1.167 × 1.06 / 16 / 60 = **51 h**.
 
 Totals, running one job at a time as goal2020 did:
 
 | Scenario | Jobs | Hours | Days |
 |---|---|---|---|
-| Keep list, treatment + all-off control, early stop about gen 20 | 84 | 1,473 | **≈ 61** |
+| Keep list, treatment + all-off control, early stop about gen 17 | 84 | 1,252 | **≈ 52** |
 | Same, all 30 generations | 84 | 2,209 | ≈ 92 |
-| Keep list, control only for S1 and S6 | 64 | 1,124 | ≈ 47 |
-| Keep list, no control | 42 | 758 | ≈ 32 |
-| All six strategies, with control (for comparison) | 128 | 2,228 | ≈ 93 |
+| Keep list, control only for S1 and S6 | 64 | 955 | ≈ 40 |
+| Keep list, no control | 42 | 644 | ≈ 27 |
+| All six strategies, with control (for comparison) | 128 | 1,894 | ≈ 79 |
 
-- **By expert, 20-generation case:**
-  - DeterministicScorer 491 h;
-  - Senate 467 h (8 jobs, **32% of the grid**);
-  - FMPEarningsDrift 288 h;
-  - FMPRating 116 h;
-  - FMPInsiderClusterBuy 111 h.
-- **Cross-check:** goal2020's 135 jobs summed 786 job-hours for 47,081 recorded trials. The new grid has about 3× the trials, a 1.17× window and about 2× the slots: 786 × 3 × 1.17 / 2 ≈ 1,380 h, which is consistent.
+The early-stop rows were 1,473 / 1,124 / 758 / 2,228 h under the draft's early stop 8 (stop about generation 20). The 30-generation row does not depend on the early stop.
+
+- **By expert, 17-generation case:**
+  - DeterministicScorer 417 h;
+  - Senate 397 h (8 jobs, **32% of the grid**);
+  - FMPEarningsDrift 245 h;
+  - FMPRating 99 h;
+  - FMPInsiderClusterBuy 94 h.
+- **Cross-check:** goal2020's 135 jobs summed 786 job-hours for 47,081 recorded trials. The new grid has about 2.6× the trials (84 × 1,448 ≈ 121,600), a 1.17× window and about 2× the slots: 786 × 2.6 × 1.17 / 2 ≈ 1,195 h, which is consistent.
 - **Levers:**
   - run Senate on its own lane in parallel, as goal2020 ran matrix 3 alongside, which roughly halves the wall-clock;
   - controls only for S1/S6;

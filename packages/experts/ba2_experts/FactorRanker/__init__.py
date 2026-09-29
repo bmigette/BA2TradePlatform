@@ -175,8 +175,16 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             },
             "weighting": {
                 "type": "str", "required": False, "default": "equal",
-                "choices": ["equal", "score"],
-                "description": "Position weighting: equal (1/N) or score-proportional.",
+                "choices": ["equal", "score", "rank"],
+                # valid_values is what the settings UI renders as a dropdown; choices alone
+                # rendered a free-text box.
+                "valid_values": ["equal", "score", "rank"],
+                "description": "Position weighting: equal (1/N), score-proportional, or by rank.",
+                "tooltip": "equal (default): every held name gets the same weight. score: "
+                           "proportional to the composite factor score. rank: linear in rank -- "
+                           "of N names the best gets N parts, the next N-1, ... the last 1. In "
+                           "every mode no name exceeds max_weight_per_name; weight a capped name "
+                           "cannot take goes to the others, and to cash once all are capped.",
             },
             "max_weight_per_name": {
                 "type": "float", "required": False, "default": 0.10,

@@ -183,11 +183,44 @@ def test_fred_refreshes_are_counted_in_the_same_ledger(monkeypatch, tmp_path):
     monkeypatch.setattr(fred_series.requests, "get", lambda *a, **k: _Resp())
 
     with fmp_common.fmp_purpose(fmp_common.PURPOSE_WARM):
-        fred_series.refresh_series("VIXCLS", "a-key")
+        fred_series.refresh_series("DGS3MO", "a-key")
 
     stats = fmp_common.get_purpose_stats()["warm"]
     assert stats["endpoints"]["fred-observations"]["requests"] == 1
     assert stats["endpoints"]["fred-observations"]["bytes"] == 512
+
+
+def test_a_first_release_refresh_counts_every_alfred_request(monkeypatch, tmp_path):
+    """A macro signal series is assembled from several ALFRED requests (vintage list, first
+    vintage, initial-release window, current vintage) -- every one is counted."""
+    import ba2_common.core.native_cache  # noqa: F401 - import order parity with the app
+    from ba2_providers.macro import fred_series
+
+    def _get(url, params=None, **kw):
+        class _Resp:
+            content = b"z" * 100
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                if url == fred_series.API_VINTAGEDATES_URL:
+                    return {"count": 1, "vintage_dates": ["2026-09-10"]}
+                return {"observations": [{"date": "2026-09-09", "value": "1.0",
+                                          "realtime_start": "2026-09-10"}]}
+        return _Resp()
+
+    monkeypatch.setattr(fred_series, "CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(fred_series.requests, "get", _get)
+
+    with fmp_common.fmp_purpose(fmp_common.PURPOSE_WARM):
+        fred_series.refresh_series("VIXCLS", "a-key")
+
+    stats = fmp_common.get_purpose_stats()["warm"]
+    assert stats["endpoints"]["fred-observations"]["requests"] == 4
+    assert stats["endpoints"]["fred-observations"]["bytes"] == 400
 
 
 # --------------------------------------------------------------------------- #

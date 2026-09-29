@@ -78,7 +78,7 @@ def test_tastytrade_cannot_be_downgraded_or_cross_a_major():
 
 def test_alpaca_py_cannot_be_downgraded_or_cross_a_breaking_minor():
     # alpaca-py is 0.x, where the MINOR is the breaking number.
-    _assert_bounded("alpaca-py", "0.44.0")
+    _assert_bounded("alpaca-py", "0.45.0")
 
 
 def _requirement_names():

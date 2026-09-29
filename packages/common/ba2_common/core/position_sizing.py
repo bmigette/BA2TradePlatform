@@ -25,6 +25,8 @@ import math
 from datetime import datetime
 from typing import Any, Callable, Optional
 
+from ba2_common.core.share_grid import floor_to_unit, is_whole_grid
+
 from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.replay import replay_now
@@ -59,6 +61,7 @@ def compute_risk_based_quantity(
     available_balance: Optional[float] = None,
     commission_per_trade: float = 0.0,
     lot_size: Optional[int] = None,
+    quantity_unit: float = 1.0,
 ) -> dict:
     """Compute a risk-based share quantity. Pure function (no IO).
 
@@ -83,9 +86,17 @@ def compute_risk_based_quantity(
             by up to one commission at near-full deployment. 0.0 (the default, and what live
             equities cost at Alpaca) is an exact no-op.
         lot_size: round-lot constraint (e.g. 100); quantity is floored to a multiple.
+            A lot constraint FORCES the whole-share grid whatever ``quantity_unit`` says:
+            a round lot exists for an option overlay (one contract per 100 shares), and a
+            fractional share can never be part of one.
+        quantity_unit: the share GRID step (``share_grid.fractional_unit``). ``1.0`` --
+            the default, and every caller before fractional support -- is whole shares
+            and keeps ``quantity`` an ``int`` exactly as before. A smaller step (e.g.
+            0.0001) floors every figure onto that grid instead and returns a ``float``.
 
     Returns:
-        dict with: quantity (int), risk_per_share, risk_dollars, qty_by_risk (the
+        dict with: quantity (int on the whole-share grid, float on a fractional one),
+        risk_per_share, risk_dollars, qty_by_risk (the
         pre-clamp count the risk budget alone bought, absent when sizing refused
         before reaching it), reason (str when quantity is 0 explaining why),
         capped_by (None | 'notional' | 'balance').
@@ -136,13 +147,29 @@ def compute_risk_based_quantity(
             risk_per_share = floor
     out["risk_per_share"] = risk_per_share
 
-    qty = int(risk_dollars // risk_per_share)
+    # THE GRID. A round lot forces whole shares; otherwise the caller's unit decides. Every
+    # floor below goes through ``floor_to_unit`` so the risk count and both clamps land on
+    # the SAME grid -- a whole-share cash clamp applied to a fractional risk count would cut
+    # 2.5 shares to 2 for no reason the budget can explain.
+    unit = 1.0 if (lot_size and lot_size > 1) else float(quantity_unit or 1.0)
+    whole = is_whole_grid(unit)
+
+    def _floor(numerator: float, denominator: float):
+        # WHOLE GRID KEEPS ``//``, deliberately, and not ``floor(a / b)``: the two differ on
+        # float edges (``1.0 // 0.1 == 9.0`` but ``floor(1.0 / 0.1) == 10``). The whole-
+        # share path must stay byte-identical to what every backtest already produced, so
+        # only the NEW fractional path uses the grid's own tolerant floor.
+        if whole:
+            return int(numerator // denominator)
+        return floor_to_unit(numerator / denominator, unit)
+
+    qty = _floor(risk_dollars, risk_per_share)
     # The share count the RISK BUDGET alone buys, before the notional/cash/lot clamps below.
     # Reported, not recomputed by the caller: the run record needs to show whether the budget
     # or a clamp produced the final size, and a caller re-deriving this from risk_dollars and
     # risk_per_share would be a second copy of the formula, free to drift from this one.
     out["qty_by_risk"] = qty
-    if qty < 1:
+    if qty <= 0:
         out["reason"] = (f"risk budget ${risk_dollars:.2f} too small for risk/share "
                          f"${risk_per_share:.2f} (need a wider risk % or tighter stop)")
         return out
@@ -155,7 +182,7 @@ def compute_risk_based_quantity(
     # A negative ceiling floors max_by_notional below 1 and lands on the same refusal, which
     # is the right answer for a nonsensical limit.
     if max_position_value is not None:
-        max_by_notional = int(max_position_value // current_price)
+        max_by_notional = _floor(max_position_value, current_price)
         if qty > max_by_notional:
             qty = max_by_notional
             out["capped_by"] = "notional"
@@ -168,7 +195,7 @@ def compute_risk_based_quantity(
     if available_balance is not None:
         # Reserve the round-trip commission before dividing — a fill costs qty*price + commission,
         # so raw cash / price over-sizes by up to one commission at near-full deployment.
-        max_by_cash = int(max(0.0, available_balance - float(commission_per_trade or 0.0)) // current_price)
+        max_by_cash = _floor(max(0.0, available_balance - float(commission_per_trade or 0.0)), current_price)
         if qty > max_by_cash:
             qty = max_by_cash
             out["capped_by"] = "balance"
@@ -179,7 +206,7 @@ def compute_risk_based_quantity(
         below_one_lot = 1 <= qty < lot_size
         qty = (qty // lot_size) * lot_size
 
-    if qty < 1:
+    if qty <= 0:
         out["reason"] = (
             f"lot sizing refused: the affordable quantity is less than one lot of {lot_size}"
             if below_one_lot else

@@ -1321,6 +1321,15 @@ class TradeActionEvaluator:
                             # Fallback to basic config
                             action_summary["action_config"]["reference_value"] = action_config.get('reference_value')
                             action_summary["action_config"]["percent"] = action_config.get('value')
+                    elif action_type in _OPTION_ENTRY_ACTION_TYPES:
+                        # The EFFECTIVE selection box (strike method/param, DTE window, sizing,
+                        # liquidity gates, policy weights) read off the built action, so a key
+                        # the rule left out shows the default the action actually used.
+                        action_summary["action_config"]["option_params"] = {
+                            key: getattr(trade_action, key)
+                            for key in _OPTION_ENTRY_PARAM_KEYS
+                            if isinstance(getattr(trade_action, key, None), (bool, int, float, str))
+                        }
                     
                     action_summaries.append(action_summary)
                     logger.info(f"Created and stored TradeAction: {action_type.value} for {instrument_name}")

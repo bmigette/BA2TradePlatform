@@ -4256,6 +4256,28 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return snaps
 
     # ======================================================================
+    # Fractional-share eligibility: from DISK, never a broker
+    # ======================================================================
+    def _fetch_fractionable(self, symbols: List[str]) -> Dict[str, Optional[bool]]:
+        """OVERRIDE: answer from the prewarmed file, never a network call.
+
+        The inherited default asks ``get_symbol_margin_info`` -- a broker round-trip a
+        backtest cannot make and must not try to. ``fractionable_store`` holds the broker's
+        answer as ``ba2-test prewarm`` last fetched it; a symbol it does not list comes back
+        absent, which ``get_fractionable`` records as unknown and the share grid sizes in
+        WHOLE shares. So a backtest with no warm file sizes exactly as it did before
+        fractional support -- only an expert that opted in AND a warm file together
+        produce a fractional trade.
+
+        The inherited ``get_fractionable`` still wraps this, so its per-instance cache
+        applies as well; the underlying read is memoised per process on the file's mtime,
+        so thousands of trials parse it once.
+        """
+        from ba2_common.core.fractionable_store import load_fractionable_map
+        stored = load_fractionable_map()
+        return {symbol: stored[symbol] for symbol in symbols if symbol in stored}
+
+    # ======================================================================
     # The critical gotcha: defeat the inherited wall-clock price cache
     # ======================================================================
     def get_instrument_current_price(self, symbol_or_symbols, price_type: str = "bid"):

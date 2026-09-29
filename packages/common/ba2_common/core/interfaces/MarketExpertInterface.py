@@ -295,6 +295,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "description": "Maximum virtual equity allocation per instrument (%)",
                     "tooltip": "Maximum percentage of virtual trading balance that can be allocated to a single instrument. This is a NOTIONAL CEILING (a max, not a target) — the risk manager sizes by conviction up to this cap, never beyond it. Recommended: 5-15%. Lower values (5-10%) provide better diversification, higher values (10-15%) allow larger positions in high-confidence trades."
                 },
+                "allow_fractional_shares": {
+                    "type": "bool", "required": False, "default": False,
+                    "description": "Allow fractional share quantities",
+                    "tooltip": "When on, the classic risk manager and FactorRanker size positions in fractional shares for symbols the BROKER marks fractionable (e.g. 2.3456 shares instead of 2). A symbol the broker does not fractionalise -- or has not said either way -- is still sized in whole shares. Off by default so existing experts keep their current whole-share sizing. IGNORED (with a warning in the log) whenever the expert arms protective orders, because brokers do not accept a fractional OCO/TP/SL order (Alpaca: no fractional OCO/bracket; a fractional stop is DAY-only and expires) -- the stop could never match the position. In practice: the classic risk manager always attaches a stop-loss, so it always sizes whole shares; FactorRanker honours this only when risk_per_trade_pct is 0 (its resting stop off)."
+                },
                 "diversification_factor": {
                     "type": "float", "required": False, "default": 1.0,
                     "description": "Fraction of available equity used per instrument when others still have headroom (0-1)",

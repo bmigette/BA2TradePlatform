@@ -1,0 +1,11 @@
+npm notice run frontend@0.0.0 test
+npm notice run vitest run src/lib/contractDetail.test.ts src/lib/optionTradeChart.test.ts src/lib/optionChartView.test.ts src/lib/optionTrades.test.ts
+
+ RUN  v4.1.9 C:/Users/basti/Documents/dev/BA2TradePlatform/testplatform/frontend
+
+
+ Test Files  4 passed (4)
+      Tests  104 passed (104)
+   Start at  13:58:47
+   Duration  7.66s (transform 543ms, setup 0ms, import 750ms, tests 114ms, environment 1ms)
+

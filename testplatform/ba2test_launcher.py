@@ -267,7 +267,8 @@ def _cmd_prewarm(args) -> int:
         frozen_ttl_cache, _fmp_history_cache_dir, persist_empty_sentinel,
     )
     from app.services.prewarm_fetchers import (
-        PrewarmConfigError, PrewarmFetchers, prewarm_fred, resolve_keys, run_prewarm,
+        PrewarmConfigError, PrewarmFetchers, prewarm_fractionable, prewarm_fred, resolve_keys,
+        run_prewarm,
     )
 
     # ONE key resolver, shared with the API handler (env first, then the app-settings DB).
@@ -444,6 +445,15 @@ def _cmd_prewarm(args) -> int:
         fred_summary = prewarm_fred(args.fred_max_age_hours,
                                     log=lambda msg: print(msg, flush=True))
         print(f">> FRED macro series: {fred_summary}", flush=True)
+
+    # Fractional-share eligibility, for experts that opt in to allow_fractional_shares. ONE
+    # bulk broker call for the whole universe, skipped while the file is fresh, and never
+    # fatal: without it every symbol sizes in whole shares, the pre-feature behaviour. Run
+    # for every expert list rather than gated on one, because the classic risk manager
+    # sizes for all of them.
+    fractionable_summary = prewarm_fractionable(args.fractionable_max_age_hours,
+                                                log=lambda msg: print(msg, flush=True))
+    print(f">> fractionable map: {fractionable_summary}", flush=True)
 
     try:
         summary = run_prewarm(fetchers, experts, symbols, args.workers, end=end_date)
@@ -2773,6 +2783,36 @@ def _apply_lattice_anchor(cfg: dict, kind: str, override: "str | None") -> dict:
     anchor = _lattice_anchor_for(kind, override)
     if anchor != "zero":
         cfg["latticeAnchor"] = anchor
+    return cfg
+
+def _early_stop_min_rel_arg(value: str) -> float:
+    """argparse ``type`` for ``--early-stop-min-rel``: a FRACTION in (0, 1) (0.01 = 1%).
+
+    Refuses 0 (the legacy rule under a new job identity -- omit the flag instead), NaN/inf,
+    negatives and anything >= 1 at parse time -- the backend refuses them too
+    (genetic.validate_early_stop_min_rel), but a job that fails after its row is written wastes a
+    grid slot and leaves a failed row behind."""
+    import math
+    try:
+        v = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
+    if v == 0.0:
+        raise argparse.ArgumentTypeError(
+            "0 is the legacy rule under a new job identity; omit --early-stop-min-rel for the "
+            "legacy rule")
+    if not math.isfinite(v) or v < 0.0 or v >= 1.0:
+        raise argparse.ArgumentTypeError(
+            f"must be finite and in (0, 1) -- a FRACTION, 0.01 means 1% -- got {value!r}")
+    return v
+
+
+def _apply_early_stop_min_rel(cfg: dict, value: "float | None") -> dict:
+    """Write ``earlyStoppingMinRelativeImprovement`` onto a GA config ONLY when given, so every
+    job that does not opt in persists a byte-identical ``optimization_config`` (and keeps its
+    checkpoint fingerprint). Absent = the legacy rule: any strict improvement resets patience."""
+    if value is not None:
+        cfg["earlyStoppingMinRelativeImprovement"] = float(value)
     return cfg
 
 #: O_LEAP's two members (operator decision 2026-09-02, superseding the two separate keys
@@ -6357,6 +6397,7 @@ def _cmd_optimize(args) -> int:
             "backtest": backtest_block,
         }
         _apply_lattice_anchor(cfg, args.strategy, getattr(args, "lattice_anchor", None))
+        _apply_early_stop_min_rel(cfg, getattr(args, "early_stop_min_rel", None))
         if getattr(args, "warm_start_from", None) is not None:
             cfg["warmStartFromOptimizationId"] = int(args.warm_start_from)
         _worker_ids = _worker_ids_from_args(args)
@@ -6602,6 +6643,7 @@ def _cmd_optimize_batch(args) -> int:
                 "backtest": backtest_block,
             }
             _apply_lattice_anchor(cfg, strat_kind, getattr(args, "lattice_anchor", None))
+            _apply_early_stop_min_rel(cfg, getattr(args, "early_stop_min_rel", None))
             opt = StrategyOptimization(
                 strategy_id=strat.id, name=name, fitness_metric=fitness,
                 optimization_type="genetic", optimization_config=cfg,
@@ -7457,6 +7499,10 @@ def main(argv: "list | None" = None) -> int:
                          "compute trader-skill scores for every trading day in [start, end] instead "
                          "of leaving them to lazy per-trial computation (see _do_senate_scores). "
                          "Ignored by the other experts.")
+    pw.add_argument("--fractionable-max-age-hours", type=float, default=24.0,
+                    help="Refresh the on-disk fractional-share eligibility map (one bulk Alpaca "
+                         "/v2/assets call) only when it is older than this (default 24h, the live "
+                         "account's cache TTL). Read by experts with allow_fractional_shares on.")
     pw.add_argument("--fred-max-age-hours", type=float, default=24.0,
                     help="Refresh a FRED macro series only when its cache file is older than "
                          "this (default 24h, matching the API handler). Only consumed when "
@@ -7653,6 +7699,14 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--population", type=int, default=10)
     op.add_argument("--parallel", type=int, default=4, help="Parallel trials (ThreadPoolExecutor).")
     op.add_argument("--early-stop", type=int, default=4)
+    op.add_argument("--early-stop-min-rel", type=_early_stop_min_rel_arg, default=None,
+                    help="Minimum RELATIVE improvement (a fraction: 0.01 = 1%%) a generation's "
+                         "best must make over the best at the last counted improvement to reset "
+                         "the --early-stop patience; a smaller gain still updates the best "
+                         "individual but counts as no improvement. Negative bests use the "
+                         "magnitude (-10 needs -9.9 at 0.01); a zero best needs any strict gain. "
+                         "Omitted: the legacy rule, any strict improvement resets (the stored "
+                         "optimization_config is then unchanged).")
     op.add_argument("--mutation-prob", type=float, default=0.3,
                     help="Per-gene mutation probability (higher = more exploration). Default 0.3.")
     op.add_argument("--elitism-percent", type=float, default=10.0,
@@ -7885,6 +7939,8 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--population", type=int, default=40)
     ob.add_argument("--parallel", type=int, default=6, help="Process-pool workers per job.")
     ob.add_argument("--early-stop", type=int, default=4)
+    ob.add_argument("--early-stop-min-rel", type=_early_stop_min_rel_arg, default=None,
+                    help="See optimize --early-stop-min-rel (omitted: legacy rule).")
     ob.add_argument("--mutation-prob", type=float, default=0.3,
                     help="Per-gene mutation probability (higher = more exploration). Default 0.3.")
     ob.add_argument("--elitism-percent", type=float, default=10.0,

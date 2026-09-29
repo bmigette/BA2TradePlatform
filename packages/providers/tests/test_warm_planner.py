@@ -216,7 +216,8 @@ def test_a_fred_series_file_is_present_until_its_own_max_age(tmp_path):
     d = tmp_path / "fred"
     d.mkdir()
     path = d / "VIXCLS.json"
-    path.write_text('{"observations": []}', encoding="utf-8")
+    path.write_text('{"series_id": "VIXCLS", "format": "first_release_v1", '
+                    '"observations": []}', encoding="utf-8")
     old = (NOW - timedelta(hours=30)).timestamp()
     os.utime(path, (old, old))
 
@@ -227,6 +228,26 @@ def test_a_fred_series_file_is_present_until_its_own_max_age(tmp_path):
 
     assert fresh.entries[0].status == planner.STATUS_PRESENT
     assert stale.entries[0].status == planner.STATUS_STALE
+
+
+def test_a_macro_signal_file_in_the_old_format_needs_a_refresh(tmp_path):
+    """The reader refuses a first-release series cached in the old observation-date format,
+    so the plan must not call it present however young it is. DGS3MO (the option BS rate)
+    keeps its plain format and is present."""
+    d = tmp_path / "fred"
+    d.mkdir()
+    (d / "VIXCLS.json").write_text('{"series_id": "VIXCLS", "vintage": false, '
+                                   '"observations": []}', encoding="utf-8")
+    (d / "DGS3MO.json").write_text('{"series_id": "DGS3MO", "vintage": false, '
+                                   '"observations": []}', encoding="utf-8")
+
+    result = planner.plan([_series_req("VIXCLS"), _series_req("DGS3MO")], [str(tmp_path)],
+                          as_of_now=NOW, fred_max_age_hours=1e9)
+
+    vix, rate = result.entries
+    assert vix.status == planner.STATUS_STALE and vix.action == planner.ACTION_REFRESH
+    assert "old observation-date format" in vix.detail
+    assert rate.status == planner.STATUS_PRESENT
 
 
 def test_a_missing_fred_series_is_missing(tmp_path):

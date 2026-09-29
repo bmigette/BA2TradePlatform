@@ -95,7 +95,13 @@ _BENIGN_DEFAULT: tuple = (OSError,)
 # benign: refusals whose whole meaning is "this run's numbers would be wrong -- stop". Matched
 # by class NAME across the MRO so this module imports neither definer (one lives in
 # ``split_basis``, the other in the backtest engine). BT/live option parity, plan Part E.
-_NEVER_ABSORB_NAMES = frozenset({"SplitBasisRefused", "OptionSpotBasisMismatch"})
+#
+# MacroAvailabilityUnknown (``ba2_providers.macro.fred_series``, 2026-09-26): a macro FRED read
+# whose publication dates cannot be established for the decision (old-format cache, a cache
+# fetched before the decision, a decision before the first vintage). Absorbed, the expert's macro
+# regime would silently fall back to the index trend alone -- in ``observe``/``legacy`` too.
+_NEVER_ABSORB_NAMES = frozenset({"SplitBasisRefused", "OptionSpotBasisMismatch",
+                                 "MacroAvailabilityUnknown"})
 
 
 def is_never_absorbed(exc: BaseException) -> bool:

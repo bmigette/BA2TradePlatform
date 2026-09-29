@@ -240,6 +240,15 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             fred_summary = _prewarm_fred(float(payload.get("fred_max_age_hours", 24.0)))
             logger.info(f"prewarm task {task_id}: FRED {fred_summary}")
 
+        # Fractional-share eligibility: one bulk broker call, freshness-gated, never fatal.
+        # The SAME function the CLI calls -- this handler and `ba2-test prewarm` drifted apart
+        # over the FRED series once already.
+        from app.services.prewarm_fetchers import prewarm_fractionable
+        fractionable_summary = prewarm_fractionable(
+            float(payload.get("fractionable_max_age_hours", 24.0)),
+            log=logger.info, warn=logger.warning)
+        logger.info(f"prewarm task {task_id}: fractionable {fractionable_summary}")
+
         keys = resolve_keys()
         try:
             fetchers = PrewarmFetchers(fmp_key=keys["fmp"], end_date=end_date,

@@ -25,14 +25,21 @@ SCHEDULE_GENES = 5       # weekdays only (decision D8); goal2020 carried 7
 MKT_ENTRY_GENES = 15     # ohlcv-v1 (6) + ta-structure-v1 (9), ONE shared set per strategy (D5)
 MKT_EXIT_GENES = 9       # market exit / stop / TP rules, ~3 genes each (pullback plan B5)
 
-# ---- A4 budget rule (operator-approved 2026-09-24) -------------------------------------------
+# ---- A4 budget rule (operator-approved 2026-09-24; early stop 5 at a 1% minimum gain since
+# 2026-09-27/28, the option grid's rule: earlyStoppingMinRelativeImprovement 0.01) -----------
+EARLY_STOP, EARLY_STOP_MIN_REL = 5, 0.01
+
+
 def budget(genes):
     pop = max(24, min(120, 4 * genes))
     gens = 30 if genes > 20 else 25
-    return pop, gens, 8
+    return pop, gens, EARLY_STOP
 
 NEW_FRACTION = 0.71      # measured: recorded trials / (pop x gens) in goal2020 (memo dedupe)
-GENS_TYPICAL = 20        # assumption: early stop (patience 8) fires around gen 20
+# Assumption: under patience 8 the stop was put at about gen 20 (last improvement ~gen 12);
+# patience 5 after the same improvement stops at ~gen 17, and the 1% rule can only make the
+# last COUNTED improvement earlier, so 17 is an upper estimate.
+GENS_TYPICAL = 17
 GENS_MAX = 30
 
 # ---- per-evaluation cost -----------------------------------------------------------------
@@ -116,11 +123,11 @@ def main(strats=KEEP, gens_run=GENS_TYPICAL, control=True, verbose=True):
 
 if __name__ == "__main__":
     for label, kw in [
-        ("KEEP S1/S2/S5/S6, typical 20 gens, + all-off control", dict()),
+        (f"KEEP S1/S2/S5/S6, typical {GENS_TYPICAL} gens, + all-off control", dict()),
         ("KEEP S1/S2/S5/S6, full 30 gens, + all-off control", dict(gens_run=GENS_MAX)),
-        ("KEEP S1/S2/S5/S6, typical 20 gens, NO control", dict(control=False)),
-        ("ALL six strategies, typical 20 gens, + control", dict(strats={"S1", "S2", "S3", "S5", "S6", "S7"})),
-        ("KEEP S1/S6 only, typical 20 gens, + control", dict(strats={"S1", "S6"})),
+        (f"KEEP S1/S2/S5/S6, typical {GENS_TYPICAL} gens, NO control", dict(control=False)),
+        (f"ALL six strategies, typical {GENS_TYPICAL} gens, + control", dict(strats={"S1", "S2", "S3", "S5", "S6", "S7"})),
+        (f"KEEP S1/S6 only, typical {GENS_TYPICAL} gens, + control", dict(strats={"S1", "S6"})),
     ]:
-        t, n = main(verbose=(label.startswith("KEEP S1/S2/S5/S6, typical 20 gens, + all")), **kw)
+        t, n = main(verbose=(label.startswith(f"KEEP S1/S2/S5/S6, typical {GENS_TYPICAL} gens, + all")), **kw)
         print(f"== {label}: {n} jobs, {t:.0f} h = {t/24:.1f} days sequential")

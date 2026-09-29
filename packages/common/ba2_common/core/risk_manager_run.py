@@ -61,11 +61,17 @@ OUTCOME_UNFUNDED = "REFUSED_UNFUNDED"
 OUTCOME_RAIL = "REFUSED_RAIL"
 #: The manager raised on this symbol. Distinct from a refusal: nothing DECIDED anything.
 OUTCOME_ERROR = "ERROR"
+#: An OPTION entry action of a classic-mode expert placed nothing -- no contract passed its
+#: selection box, its sizing bought zero contracts, a pre-broker check refused it, or the
+#: broker did. Not ``REFUSED_UNFUNDED``: the classic manager never sized it (option entries
+#: size themselves), so "the budget ran out" would name the wrong cause. The action's own
+#: message is the reason.
+OUTCOME_OPTION_NOT_PLACED = "REFUSED_OPTION"
 
 #: Outcomes that mean "this symbol will not trade". Everything except FUNDED, spelled out
 #: rather than derived, so a new outcome has to state which side of the line it is on.
 REFUSED_OUTCOMES = (OUTCOME_PERMISSION, OUTCOME_NO_RECOMMENDATION,
-                    OUTCOME_UNFUNDED, OUTCOME_RAIL, OUTCOME_ERROR)
+                    OUTCOME_UNFUNDED, OUTCOME_RAIL, OUTCOME_ERROR, OUTCOME_OPTION_NOT_PLACED)
 
 
 def decision(symbol: str, outcome: str, reason: str, *,
@@ -91,6 +97,88 @@ def decision(symbol: str, outcome: str, reason: str, *,
         row["quantity"] = float(quantity)
     row.update(extra)
     return row
+
+
+def option_entry_details(data: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """The contract(s) an option entry chose, from its trade record, for a run row.
+
+    Read from ``data["entry_record"]`` (``option_trade_record``), which the entry path
+    builds BEFORE the broker call from the same values it submits -- so the row shows what
+    was sent, never a re-derivation. ``{}`` when the entry carries no record (a GA trial, or
+    a record that failed to build). ``cost`` is the premium paid (debit) or received
+    (credit) for the whole order: |net price| x contracts x multiplier.
+    """
+    record = (data or {}).get("entry_record") or {}
+    structure = record.get("structure") or {}
+    legs = [leg for leg in (record.get("legs") or []) if isinstance(leg, Mapping)]
+    if not structure and not legs:
+        return {}
+    out: Dict[str, Any] = {"asset_class": "option"}
+    for key, field in (("option_strategy", "strategy"), ("contracts", "quantity"),
+                       ("multiplier", "multiplier"), ("net_price", "net_price"),
+                       ("max_loss_per_contract", "max_loss"),
+                       ("max_profit_per_contract", "max_profit"), ("breakevens", "breakevens")):
+        if structure.get(field) is not None:
+            out[key] = structure[field]
+    net, qty, mult = structure.get("net_price"), structure.get("quantity"), structure.get("multiplier")
+    if isinstance(net, (int, float)) and isinstance(qty, (int, float)) and isinstance(mult, (int, float)):
+        out["cost"] = round(abs(net) * qty * mult, 2)
+        out["premium_side"] = "credit" if net < 0 else "debit"
+    out["legs"] = [{k: leg.get(k) for k in (
+        "contract_symbol", "side", "ratio_qty", "right", "strike", "expiry", "dte",
+        "delta", "iv", "mid", "bid", "ask", "open_interest", "volume")} for leg in legs]
+    return out
+
+
+def option_legs_text(details: Mapping[str, Any]) -> str:
+    """``"BUY 1x C 150 2026-11-20 (54 DTE, delta 0.35, mid 3.10)"`` per leg, ``; ``-joined."""
+    parts = []
+    for leg in details.get("legs") or []:
+        right = {"call": "C", "put": "P"}.get(str(leg.get("right") or "").lower(), "?")
+        strike = leg.get("strike")
+        head = (f"{str(leg.get('side') or '').upper()} {leg.get('ratio_qty') or 1}x {right} "
+                f"{strike:g}" if isinstance(strike, (int, float)) else
+                f"{str(leg.get('side') or '').upper()} {leg.get('contract_symbol') or '?'}")
+        if leg.get("expiry"):
+            head += f" {leg['expiry']}"
+        facts = []
+        if leg.get("dte") is not None:
+            facts.append(f"{leg['dte']} DTE")
+        if isinstance(leg.get("delta"), (int, float)):
+            facts.append(f"delta {leg['delta']:.2f}")
+        if isinstance(leg.get("mid"), (int, float)):
+            facts.append(f"mid {leg['mid']:.2f}")
+        parts.append(head + (f" ({', '.join(facts)})" if facts else ""))
+    return "; ".join(parts)
+
+
+def option_entry_decision(symbol: str, result: Mapping[str, Any]) -> Dict[str, Any]:
+    """One classic-mode option ENTRY action's result -> one run row.
+
+    Option entries size and submit themselves (they never reach the classic manager's
+    sizing: it would re-label contracts as shares), so the manager records them as they
+    came back from the action. Placed -> ``FUNDED`` with the contract count as
+    ``quantity`` and the chosen contract(s) beside it; anything else ->
+    ``REFUSED_OPTION`` with the action's own message.
+    """
+    data = result.get("data") or {}
+    details = option_entry_details(data)
+    placed = bool(result.get("success")) and data.get("order_id") is not None
+    message = str(result.get("message") or "")
+    if placed:
+        legs = option_legs_text(details)
+        strategy = details.get("option_strategy") or "option entry"
+        qty = details.get("contracts")
+        reason = f"{strategy}" + (f" x{qty:g}" if isinstance(qty, (int, float)) else "")
+        if legs:
+            reason += f": {legs}"
+        if details.get("cost") is not None:
+            reason += f" -- {details['premium_side']} ${details['cost']:,.2f}"
+        return decision(symbol, OUTCOME_FUNDED, reason,
+                        quantity=qty if isinstance(qty, (int, float)) else None,
+                        order_id=data.get("order_id"), **details)
+    return decision(symbol, OUTCOME_OPTION_NOT_PLACED,
+                    message or "the option entry placed no order", **details)
 
 
 def build_decisions(received: Sequence[str],

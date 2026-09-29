@@ -214,8 +214,11 @@ def _load_launcher():
 
 
 def _prewarm_args(**over):
+    # Mirrors every flag `ba2-test prewarm` declares. `fractionable_max_age_hours` makes the
+    # command refresh the fractional-share map first; under this file's network-refusing
+    # fixture that fetch fails and is reported non-fatally, which is its contract.
     args = {"symbols": "AAA", "experts": "FMPRating", "workers": 1, "end": "2026-09-10",
-            "start": None}
+            "start": None, "fractionable_max_age_hours": 24.0}
     args.update(over)
     return argparse.Namespace(**args)
 

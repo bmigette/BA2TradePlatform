@@ -16,6 +16,8 @@ that no longer existed at the broker.
 """
 
 import threading
+
+import pytest
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
@@ -252,5 +254,86 @@ def test_no_warm_job_is_scheduled_when_the_warm_is_off(monkeypatch):
 
         assert scheduled == []
         assert jm._scheduler.get_job(warm_service.WARM_SETTLEMENT_JOB_ID) is None
+    finally:
+        jm._scheduler.shutdown(wait=False)
+
+
+# ----------------------------------------------------------------------------
+# The FRED pre-open refresh (review 2026-09-26, I3): same remove_all_jobs() path
+# ----------------------------------------------------------------------------
+def test_the_fred_preopen_refresh_is_a_0900_new_york_weekday_cron():
+    """The 09:30 DeterministicScorer analysis must read a file fetched that morning, not depend
+    on ~21 ALFRED requests succeeding at the instant it runs (Monday-only entries: one failed
+    09:30 costs a week)."""
+    from ba2_trade_platform.core.JobManager import FRED_PREOPEN_JOB_ID
+
+    jm = _make_jobmanager()
+    try:
+        jm._schedule_fred_preopen_job()
+        job = jm._scheduler.get_job(FRED_PREOPEN_JOB_ID)
+        assert job is not None
+        fields = {f.name: str(f) for f in job.trigger.fields}
+        assert (fields["hour"], fields["minute"], fields["day_of_week"]) == ("9", "0", "mon-fri")
+        assert str(job.trigger.timezone) == "America/New_York"
+    finally:
+        jm._scheduler.shutdown(wait=False)
+
+
+def test_a_full_schedule_refresh_keeps_the_fred_preopen_job():
+    from ba2_trade_platform.core.JobManager import FRED_PREOPEN_JOB_ID
+
+    jm = _make_jobmanager()
+    _install_account_refresh_stub(jm, [])
+    try:
+        jm._schedule_fred_preopen_job()
+        jm._refresh_expert_schedules_sync(None)
+        assert jm._scheduler.get_job(FRED_PREOPEN_JOB_ID) is not None, (
+            "remove_all_jobs() dropped the FRED pre-open refresh")
+    finally:
+        jm._scheduler.shutdown(wait=False)
+
+
+def test_refresh_scheduled_jobs_keeps_the_fred_preopen_job():
+    from ba2_trade_platform.core.JobManager import FRED_PREOPEN_JOB_ID
+
+    jm = _make_jobmanager()
+    _install_account_refresh_stub(jm, [])
+    jm._remove_scheduled_job = lambda job_id: (
+        jm._scheduler.remove_job(job_id), jm._scheduled_jobs.pop(job_id, None)
+    )
+    try:
+        jm._schedule_fred_preopen_job()
+        jm.refresh_scheduled_jobs()
+        assert jm._scheduler.get_job(FRED_PREOPEN_JOB_ID) is not None
+    finally:
+        jm._scheduler.shutdown(wait=False)
+
+
+def test_the_preopen_job_refreshes_exactly_the_series_the_expert_reads(monkeypatch):
+    from ba2_experts.DeterministicScorer.data import MACRO_SERIES_IDS
+    from ba2_providers.macro import fred_series
+
+    jm = _make_jobmanager()
+    seen = []
+    monkeypatch.setattr(jm, "_any_enabled_expert", lambda name: name == "DeterministicScorer")
+    monkeypatch.setattr(fred_series, "refresh_for_live_decision",
+                        lambda ids: (seen.append(tuple(ids)),
+                                     {"refreshed": list(ids), "current": [], "failed": []})[-1])
+    try:
+        jm._execute_fred_preopen_refresh()
+        assert seen == [tuple(MACRO_SERIES_IDS)]
+    finally:
+        jm._scheduler.shutdown(wait=False)
+
+
+def test_the_preopen_job_does_nothing_without_a_macro_reading_expert(monkeypatch):
+    from ba2_providers.macro import fred_series
+
+    jm = _make_jobmanager()
+    monkeypatch.setattr(jm, "_any_enabled_expert", lambda name: False)
+    monkeypatch.setattr(fred_series, "refresh_for_live_decision",
+                        lambda ids: pytest.fail("fetched FRED for no reader"))
+    try:
+        jm._execute_fred_preopen_refresh()
     finally:
         jm._scheduler.shutdown(wait=False)

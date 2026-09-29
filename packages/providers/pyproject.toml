@@ -18,7 +18,7 @@ dependencies = [
     "fmpsdk>=20230123",
     "yfinance>=0.2.40",
     "stockstats>=0.6.2",
-    "alpaca-py>=0.21.0",
+    "alpaca-py>=0.44.0,<0.45",  # 0.x: the MINOR is the breaking number; matches requirements.txt
     "tenacity>=8.2.0",
     "curl_cffi>=0.7.0",
 ]

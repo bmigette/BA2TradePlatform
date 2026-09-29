@@ -336,6 +336,23 @@ def account_settings_error(dynamic_settings: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _strike_param_text(value: Any) -> str:
+    """The Strike Param box's text: what the save path parses back.
+
+    ``str()`` showed a float's binary noise (0.35000000000000003) and a per-leg dict in
+    Python's single-quoted repr, which the save's ``json.loads`` then refused.
+    """
+    import json as _json
+    if value is None or value == '':
+        return ''
+    if isinstance(value, dict):
+        return _json.dumps({k: (float(f"{v:.10g}") if isinstance(v, float) else v)
+                            for k, v in value.items()})
+    if isinstance(value, float):
+        return f"{value:.10g}"
+    return str(value)
+
+
 def _builtin_default(key: str) -> Any:
     """The DECLARED default of a MarketExpertInterface builtin setting -- the one source.
 
@@ -2208,6 +2225,18 @@ class ExpertSettingsTab:
                                     ).classes('w-20')
                                     ui.label('%').classes('text-sm')
                                 ui.label('Minimum available balance percentage required to enter new market positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management.').classes('text-body2 text-grey-7 ml-2')
+
+                                # Fractional shares (builtin, default off)
+                                self.allow_fractional_shares_checkbox = ui.checkbox(
+                                    'Allow fractional shares',
+                                    value=_builtin_default('allow_fractional_shares')
+                                ).classes('mt-2')
+                                ui.label('Size in fractional shares for symbols the broker marks fractionable. '
+                                         'Ignored (with a log warning) whenever the expert arms protective '
+                                         'orders, because brokers do not accept a fractional OCO/TP/SL: the '
+                                         'classic risk manager always attaches a stop, so it always sizes '
+                                         'whole shares; FactorRanker applies it only when risk per trade is 0 '
+                                         '(its resting stop off).').classes('text-body2 text-grey-7 ml-2')
 
                                 # Risk-based (ATR) sizing builtins - visible/editable for every expert.
                                 # Pull defaults/descriptions/valid_values from the builtin definitions.
@@ -4818,6 +4847,7 @@ class ExpertSettingsTab:
         'enable_sell': 'enable_sell_checkbox',
         'allow_automated_trade_opening': 'allow_automated_trade_opening_checkbox',
         'allow_automated_trade_modification': 'allow_automated_trade_modification_checkbox',
+        'allow_fractional_shares': 'allow_fractional_shares_checkbox',
     }
 
     def _unset_bool_controls(self) -> list:
@@ -5117,6 +5147,8 @@ class ExpertSettingsTab:
         if (hasattr(self, 'enable_buy_checkbox') and hasattr(self, 'enable_sell_checkbox') and 
             hasattr(self, 'allow_automated_trade_opening_checkbox') and hasattr(self, 'allow_automated_trade_modification_checkbox')):
             for key, attr in self._BUILTIN_BOOL_CONTROLS.items():
+                if not hasattr(self, attr):
+                    continue
                 value = getattr(self, attr).value
                 self._save_unless_unedited(expert, key, value, value, "bool")
             logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}, auto_open={self.allow_automated_trade_opening_checkbox.value}, auto_modify={self.allow_automated_trade_modification_checkbox.value}')
@@ -6181,7 +6213,7 @@ class TradeSettingsTab:
                                     ).classes('w-40').props('dense')
                                     strike_param_input = ui.input(
                                         label='Strike Param',
-                                        value=str(action_config.get('strike_param', '')) if action_config else '',
+                                        value=_strike_param_text(action_config.get('strike_param')) if action_config else '',
                                         placeholder='0.30 or {"long":0.45,"short":0.25}'
                                     ).classes('w-44').props('dense')
                                 else:
@@ -6190,7 +6222,7 @@ class TradeSettingsTab:
                                     # exactly how "30-delta" became "0.30 % OTM".
                                     strike_param_input = ui.input(
                                         label='Strike % OTM',
-                                        value=str(action_config.get('strike_param', '')) if action_config else '',
+                                        value=_strike_param_text(action_config.get('strike_param')) if action_config else '',
                                         placeholder='5.0 (this structure selects by % OTM)'
                                     ).classes('w-44').props('dense')
                                 dte_min_input = ui.number(

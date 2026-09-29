@@ -454,15 +454,28 @@ _DS_HISTORY = {
 #: The FRED files DeterministicScorer's macro section reads, seeded into the
 #: module's in-process memo so the REAL (tapped) point-in-time read runs offline.
 _DS_FRED = {
-    "VIXCLS": [{"date": "2026-06-11", "value": "14.5"},
-               {"date": "2026-06-12", "value": "15.5"}],
+    "VIXCLS": [{"date": "2026-06-11", "value": "14.5", "realtime_start": "2026-06-11"},
+               {"date": "2026-06-12", "value": "15.5", "realtime_start": "2026-06-12"}],
     "UNRATE": [{"date": "2026-04-01", "value": "4.1", "realtime_start": "2026-05-02"},
                {"date": "2026-05-01", "value": "4.2", "realtime_start": "2026-06-05"}],
-    "BAA10Y": [{"date": "2026-06-11", "value": "1.8"},
-               {"date": "2026-06-12", "value": "1.9"}],
-    "T10Y3M": [{"date": "2026-06-11", "value": "0.4"},
-               {"date": "2026-06-12", "value": "0.5"}],
+    "BAA10Y": [{"date": "2026-06-11", "value": "1.8", "realtime_start": "2026-06-12"},
+               {"date": "2026-06-12", "value": "1.9", "realtime_start": "2026-06-15"}],
+    "T10Y3M": [{"date": "2026-06-11", "value": "0.4", "realtime_start": "2026-06-11"},
+               {"date": "2026-06-12", "value": "0.5", "realtime_start": "2026-06-12"}],
 }
+
+
+def _ds_fred_meta():
+    """The cache headers the first-release reader requires, fetched NOW (so they cover the
+    live decision these fixtures make)."""
+    from datetime import datetime as _dt, timezone as _tz
+
+    from ba2_providers.macro import fred_series
+
+    return {sid: {"series_id": sid, "format": fred_series.CACHE_FORMAT_FIRST_RELEASE,
+                  "availability": fred_series.AVAIL_FIRST_RELEASE,
+                  "first_vintage": "1960-03-15",
+                  "fetched_at": _dt.now(_tz.utc).isoformat()} for sid in _DS_FRED}
 
 _DS_GRADES = [{"date": "2026-06-01", "analystRatingsStrongBuy": 6,
                "analystRatingsbuy": 4, "analystRatingsHold": 2,
@@ -557,6 +570,7 @@ def _deterministic_scorer_case(bars=400):
         # The FRED memo IS the disk in this fixture: seeded, not cleared.
         fred_series._MEM.update({sid: [dict(r) for r in rows]
                                  for sid, rows in _DS_FRED.items()})
+        fred_series._META.update(_ds_fred_meta())
         for key in counters:
             counters[key] = 0
 
@@ -825,7 +839,7 @@ def _seeded_fred():
 
     with mock.patch.dict(fred_series._MEM,
                          {sid: [dict(row) for row in rows]
-                          for sid, rows in _DS_FRED.items()}, clear=True):
+                          for sid, rows in _DS_FRED.items()}, clear=True),             mock.patch.dict(fred_series._META, _ds_fred_meta(), clear=True):
         yield fred_series
 
 

@@ -43,16 +43,24 @@ def parser():
     ap.add_argument("--end", default="2025-12-31")
     ap.add_argument("--search", choices=("grid", "genetic"), default="grid")
     # None = not passed. Genetic mode then sizes each job from its searched genes (population
-    # clamp(4 x genes, 24, 120); 25 generations, 30 above 20 genes; early stop 8); grid mode
-    # writes 24 x 4 as before.
+    # clamp(4 x genes, 24, 120); 25 generations, 30 above 20 genes; early stop 5 at a 1% minimum
+    # gain); grid mode writes 24 x 4 as before.
     ap.add_argument("--population", type=int, default=None,
                     help="GA population. Default: genetic 4 x the job's genes within 24..120; grid 24.")
     ap.add_argument("--generations", type=int, default=None,
                     help="GA generations. Default: genetic 25, or 30 above 20 genes; grid 4.")
     ap.add_argument("--early-stop", type=int, default=None,
-                    help="Genetic only: stop after N generations without improvement. Default 8.")
-    ap.add_argument("--parallel", type=int, default=1, help="Local GA individuals; grid and saved reruns are serial.")
-    ap.add_argument("--workers", default="", help="Comma-separated configured worker names (genetic search only).")
+                    help="Genetic only: stop after N generations without improvement. Default 5.")
+    ap.add_argument("--early-stop-min-rel", type=float, default=None,
+                    help="Genetic only: the minimum RELATIVE gain (a fraction, 0.01 = 1%%) that counts as an "
+                         "improvement for --early-stop; a smaller gain still updates the best. Default 0.01; "
+                         "0 = any strict gain (the legacy rule, key omitted). Must be in [0, 1).")
+    ap.add_argument("--parallel", type=int, default=1,
+                    help="Local trial slots, in grid and genetic mode (1 = the serial in-process loop "
+                         "when no --workers are named). Saved top-result reruns stay local and serial.")
+    ap.add_argument("--workers", default="",
+                    help="Comma-separated configured worker names, in grid and genetic mode; with "
+                         "--parallel 0 every trial runs remotely.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--save-top", type=int, default=5)
     ap.add_argument("--market-condition-profile", default="none",
@@ -136,7 +144,8 @@ def main(argv=None):
             families=args.families, equity=args.equity,
             equity_cap=None if args.equity_cap == 0 else args.equity_cap,
             start=args.start, end=args.end, search=args.search, population=args.population,
-            generations=args.generations, early_stop=args.early_stop, parallel=args.parallel, seed=args.seed,
+            generations=args.generations, early_stop=args.early_stop,
+            early_stop_min_rel=args.early_stop_min_rel, parallel=args.parallel, seed=args.seed,
             workers=[s.strip() for s in args.workers.split(",") if s.strip()],
             save_top=args.save_top, store=args.store, spread_bps=args.spread_bps, etf_symbols=args.etf_symbols,
             market_condition_profile=args.market_condition_profile,
