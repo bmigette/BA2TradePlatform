@@ -167,6 +167,9 @@ run_senate() {                     # $@ = extra driver args
     echo "FATAL: Senate universe file not found: $SENATE_UNIVERSE_FILE" >&2
     exit 1
   fi
+  # Published 2026-09-29 for the 727-symbol Senate universe (BRK.B / XSP removed, see its header).
+  MC_SEN_OHLCV="${MC_SEN_OHLCV:-8cd4a4bc34f1cf3b072b8de064eb66244dd8a0011d1df21773c3f4ce071c69f1}"
+  MC_SEN_TA="${MC_SEN_TA:-4eb35501180ecc51ff00ce60595caf0cc60247ef2f4fb43294c845aa7aae443d}"
   if [ -z "${MC_SEN_OHLCV:-}" ] || [ -z "${MC_SEN_TA:-}" ]; then
     echo "FATAL: PHASE=senate requires MC_SEN_OHLCV and MC_SEN_TA (the Senate market-condition" >&2
     echo "       snapshot digests). The equity snapshot (MC_OHLCV/MC_TA) does NOT cover the" >&2
@@ -224,6 +227,21 @@ case "$PHASE" in
     # invalidates results already scored under the old name, because a job with the SAME name
     # resumes its GA checkpoint (2026-09-29: -atr27-fr was scored with the ProtectiveStopError
     # trial crash and is restarted as -atr27-fr2 on BT's fix).
+    #
+    # --fr-top-n-below-pool (the "ranking inert" trap: the goal2027atr FactorRanker mid band
+    # converged with top_n >= screener_max_stocks, so the factor weights did nothing) is DEFAULT
+    # ON in the launcher as of 2026-09-29 -- no flag is forwarded here for it, and none is needed:
+    # every job this lane launches gets the repair automatically. Set
+    # FR_SUFFIX=-atr27-fr4 (a NEW suffix) for THIS reason when re-running the lane on the
+    # default-on behaviour, so the repaired results are never confused with (or accidentally
+    # resume the checkpoint of) the un-repaired -atr27-fr/-fr2/-fr3 rows scored before this
+    # default existed. To reproduce the OLD (un-repaired) behaviour instead, pass
+    # --no-fr-top-n-below-pool explicitly (not currently plumbed as an env switch here -- add
+    # one only if a real need for it shows up; see run_screener_capband_matrix.py --help).
+    #
+    # BANDS (default "large mid small", set above): also applies here unchanged -- run_bands
+    # loops `for band in $BANDS`, so e.g. `BANDS=mid PHASE=fr bash tools/grid_atr27.sh` runs
+    # only the mid-band FactorRanker job.
     run_bands "${FR_SUFFIX:--atr27-fr}" \
         --skip-experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,DeterministicScorer,FMPSenateTraderWeight \
         --population 56 --generations 25

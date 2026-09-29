@@ -169,18 +169,41 @@ def exclude_symbols_passthrough(args) -> list:
     return out
 
 
+def fr_top_n_below_pool_passthrough(args) -> list:
+    """Extra `optimize` CLI tokens for --no-fr-top-n-below-pool ([] when not given, so an
+    ordinary invocation of this driver is untouched).
+
+    --fr-top-n-below-pool is DEFAULT ON in the launcher as of 2026-09-29 (operator decision):
+    every NEW bypass-expert (FactorRanker) job this driver launches gets the repair automatically,
+    with NO passthrough needed for the default. Only the OPT-OUT (--no-fr-top-n-below-pool) is
+    ever forwarded, so an ordinary invocation of this driver stays byte-identical (same argv, same
+    job names) -- but note the LAUNCHED FactorRanker job now behaves differently under the same
+    name/row than it did before the launcher's default flipped (the repair itself is new
+    behaviour, not just a new flag). Use a fresh --name-suffix for a grid that must distinguish
+    pre-default from post-default FactorRanker results (goal2027atr's re-run uses -atr27-fr4, a
+    NEW suffix, precisely for this reason).
+
+    Kept separate from ``market_condition_passthrough``/``exclude_symbols_passthrough`` so it
+    also triggers the job-name digest ON ITS OWN (see the call site) -- an opt-out change must
+    get a new job identity even in a run that passes none of the other six sources."""
+    out: list = []
+    if getattr(args, "fr_top_n_below_pool", True) is False:
+        out += ["--no-fr-top-n-below-pool"]
+    return out
+
+
 def _job_name(name: str, cmd: list) -> str:
-    """``name``, or ``name-d<digest>`` when ``market_condition_passthrough`` or
-    ``exclude_symbols_passthrough`` added anything.
+    """``name``, or ``name-d<digest>`` when ``market_condition_passthrough``,
+    ``exclude_symbols_passthrough`` or ``fr_top_n_below_pool_passthrough`` added anything.
 
     Thin wrapper over ``matrix_flags.job_name_with_digest`` (the digest math itself is shared
     with ``tools/run_senate_matrix.py``'s Senate lane -- see that function's docstring). Mirrors
     ``tools/run_options_matrix.py:discovery_name``. Unlike ``discovery_name`` this digest is
-    added ONLY when at least one new market-condition/sl-loosen flag OR ``--exclude-symbols`` was
-    actually forwarded (``market_condition_passthrough`` or ``exclude_symbols_passthrough``
-    returned something): with none of those six sources, every job name -- and therefore the
-    skip-completed-by-name check and the DB row it resumes -- stays byte-identical to before this
-    change existed.
+    added ONLY when at least one new market-condition/sl-loosen flag, ``--exclude-symbols`` or
+    ``--fr-top-n-below-pool`` was actually forwarded (``market_condition_passthrough``,
+    ``exclude_symbols_passthrough`` or ``fr_top_n_below_pool_passthrough`` returned something):
+    with none of those seven sources, every job name -- and therefore the skip-completed-by-name
+    check and the DB row it resumes -- stays byte-identical to before this change existed.
     """
     return job_name_with_digest(name, cmd)
 
@@ -407,6 +430,15 @@ def main() -> int:
                          "Folds into the job's name digest (on its own, not only alongside a "
                          "market-condition flag) so an exclusion change can never reuse an old "
                          "job's completed row under the same name.")
+    ap.add_argument("--no-fr-top-n-below-pool", dest="fr_top_n_below_pool",
+                    action="store_false", default=True,
+                    help="Opt OUT of --fr-top-n-below-pool (see `ba2-test optimize --help`), "
+                         "which is DEFAULT ON in the launcher as of 2026-09-29 for every "
+                         "bypass-expert (FactorRanker) job -- no passthrough is needed for the "
+                         "default, only for this opt-out. Only a FactorRanker job is ever "
+                         "affected, whatever this flag says. Folds into the job's name digest "
+                         "(on its own) so an opted-out run can never resume/be confused with a "
+                         "repaired run's completed row under the same name.")
     ap.add_argument("--interval", default="5min")
     ap.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points, modeled at the fill-engine "
@@ -631,8 +663,13 @@ def main() -> int:
         # the five market-condition flags stays byte-identical.
         excl_tokens = exclude_symbols_passthrough(args)
         cmd += excl_tokens
+        # --no-fr-top-n-below-pool (the opt-out; the default needs no token): appended last (same
+        # "never displaces an existing token's position" reasoning) and, like --exclude-symbols,
+        # triggers the digest on its own.
+        fr_tokens = fr_top_n_below_pool_passthrough(args)
+        cmd += fr_tokens
         job_name = name
-        if mc_tokens or excl_tokens:
+        if mc_tokens or excl_tokens or fr_tokens:
             job_name = _job_name(name, cmd)
             cmd[cmd.index("--name") + 1] = job_name
         if args.dry_run:

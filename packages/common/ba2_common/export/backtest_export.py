@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from ba2_common.core.deploy_parity import (
     BacktestRunFacts, backtest_only_settings, forced_expert_settings,
 )
+from ba2_common.core.factor_ranker_topn import repair_fr_top_n_below_pool
 from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
 from ba2_common.core.market_condition_rules import (
     assert_market_conditions_resolved, assert_market_rule_actions,
@@ -124,6 +125,10 @@ def derive_export_payload(
         # both take precedence, this only fills the gap when they can't.
         persisted_fixed = (sp.get("expertFixedSettings") or {}) if isinstance(sp, dict) else {}
         bt_block = opt_backtest_block if isinstance(opt_backtest_block, dict) else None
+        # RUN-LEVEL OPT-IN (operator decision 2026-09-29) -- see the repair call below. Only an
+        # opt-derived run (bt_block is not None) can ever carry the flag, so a standalone row
+        # (bt_block is None) always exports fr_top_n_repaired=False.
+        fr_top_n_repaired = False
         # FULL expert settings = the optimization's base expert spec settings overlaid with the
         # optimized overrides (faithful reproduction); falls back to a standalone run's stored
         # expertSettings, then to the bare overrides.
@@ -181,6 +186,23 @@ def derive_export_payload(
                     }
             else:
                 universe = {"mode": "static", "symbols": list(bt_block.get("enabled_instruments") or [])}
+            # RUN-LEVEL OPT-IN (operator decision 2026-09-29): a run launched with
+            # --fr-top-n-below-pool persists backtest_cfg['fr_top_n_below_pool'] = True, and
+            # _build_daily_trial_config repairs a FactorRanker screener trial whose decoded
+            # top_n >= screener_max_stocks (the "ranking inert" trap -- see
+            # repair_fr_top_n_below_pool's docstring). Applied here too, on the SAME merged
+            # expert_params dict (persisted_fixed/base_settings/screener overlay/model_overrides,
+            # same precedence _build_daily_trial_config uses), so an export/deploy of a repaired
+            # trial carries the value it actually ran with, not the raw inert gene. Absent/False
+            # (every run before this flag existed) is a no-op -- byte-identical to before.
+            if bt_block.get("fr_top_n_below_pool"):
+                expert_params, fr_top_n_repaired = repair_fr_top_n_below_pool(expert_params)
+                if fr_top_n_repaired:
+                    logger.info(
+                        f"backtest {backtest.id}: fr_top_n_below_pool repaired top_n to "
+                        f"{expert_params['top_n']} (screener_max_stocks="
+                        f"{expert_params.get('screener_max_stocks')}) for the export/deploy "
+                        f"payload")
             execution = {
                 "seed": bt_block.get("seed"),
                 "fill_model": acct.get("fill_model"),
@@ -278,7 +300,7 @@ def derive_export_payload(
             regime_overlay_enabled=_executed_toggle("regime_overlay_enabled"),
         )
         expert_params = {**expert_params, **forced_expert_settings(facts)}
-        return {
+        payload = {
             "backtest_id": backtest.id,
             "name": backtest.name,
             "expert": backtest.expert_name,
@@ -302,6 +324,15 @@ def derive_export_payload(
             "end_date": backtest.end_date.isoformat() if backtest.end_date else None,
             "initial_capital": backtest.initial_capital,
         }
+        # Visible marker (--fr-top-n-below-pool, see the repair call above): added to the
+        # payload ONLY when this run's expert_params["top_n"] was actually REPAIRED away from
+        # the raw optimized gene because it landed >= screener_max_stocks (the ranking-inert
+        # trap). Absent (not merely False) for every run that did not opt in, or that opted in
+        # but never landed in the inert region -- so every payload on record, and every golden
+        # fixture, stays byte-identical.
+        if fr_top_n_repaired:
+            payload["fr_top_n_repaired"] = True
+        return payload
 
     if kind == "ruleset":
         cond_genes = (

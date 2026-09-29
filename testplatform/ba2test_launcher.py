@@ -6730,6 +6730,21 @@ def _cmd_optimize(args) -> int:
         # existed; only written when non-empty.
         if rm_toggles_unpinned:
             backtest_block["rm_toggles_unpinned"] = rm_toggles_unpinned
+        # --fr-top-n-below-pool / --no-fr-top-n-below-pool (operator decision 2026-09-29,
+        # DEFAULT ON as of the same day -- see the flag's own help). ONLY ever written for a
+        # BYPASS expert (FactorRanker) job -- "Non-FactorRanker jobs never get the key" (operator
+        # decision): a classic expert's backtest_block never carries this key, whatever the CLI
+        # flag says, since the repair is meaningless (and a no-op) outside FactorRanker's
+        # top_n/screener_max_stocks settings. Persisted with the run (never an env var) so every
+        # consumer of this stored config -- GA trials via _build_daily_trial_config, top-N
+        # persist, re-runs, robustness variants, the export/deploy payload -- sees the same
+        # repair (or its absence). --no-fr-top-n-below-pool (or a non-bypass expert) leaves the
+        # key ABSENT, not False: _build_daily_trial_config and derive_export_payload both read a
+        # missing key as off, so a re-run of any FactorRanker row from BEFORE this default
+        # existed (goal2020, goal2027atr -atr27-fr/-fr2/-fr3, ...) still decodes byte-identically
+        # -- only a NEW run's config is affected by this default.
+        if bypass and getattr(args, "fr_top_n_below_pool", True):
+            backtest_block["fr_top_n_below_pool"] = True
         # Options experts get the offline options-cache seam (no-op for equity experts).
         _apply_options_seam(spec, backtest_block)
         # WHICH store the run reads, resolved and recorded here rather than left to whatever
@@ -7129,6 +7144,11 @@ def _cmd_optimize_batch(args) -> int:
             # block byte-identical to before the policy existed.
             if rm_toggles_unpinned:
                 backtest_block["rm_toggles_unpinned"] = rm_toggles_unpinned
+            # --fr-top-n-below-pool / --no-fr-top-n-below-pool: see _cmd_optimize. DEFAULT ON,
+            # written ONLY for this job's bypass expert (FactorRanker) -- never for a classic
+            # expert's job in the same batch.
+            if bypass and getattr(args, "fr_top_n_below_pool", True):
+                backtest_block["fr_top_n_below_pool"] = True
             # Options experts get the offline options-cache seam (no-op for equity experts).
             _apply_options_seam(spec, backtest_block)
             # The store decision, resolved once and recorded on the block. THIS driver is the one
@@ -8466,6 +8486,33 @@ def main(argv: "list | None" = None) -> int:
                          "Point-in-time: a name above the cap is only excluded while above it. "
                          "0 disables the price filter. Per-strategy overrides live in "
                          "_OPTION_STRATS[].screener_gate_base.")
+    op.add_argument("--fr-top-n-below-pool", action=argparse.BooleanOptionalAction, default=True,
+                    help="Constraint for a bypass expert's (FactorRanker) genome (operator "
+                         "decision 2026-09-29, DEFAULT ON as of 2026-09-29 -- a later operator "
+                         "decision than the flag's own introduction): when a trial's decoded "
+                         "top_n >= screener_max_stocks, long_only_top_n's ranked[:top_n] slice "
+                         "discards nothing -- every screened name is held and the factor "
+                         "weights (momentum/value/quality/pead) have NO effect on selection "
+                         "(the 'ranking inert' trap; see "
+                         "FactorRanker.validate_deployed_settings). This repairs such a trial's "
+                         "top_n to the next 5-step below the pool (max(5, screener_max_stocks - "
+                         "5)) instead of scoring the inert genome. Applies ONLY to a bypass "
+                         "expert (FactorRanker) job -- never written for any other expert, "
+                         "whatever this flag says. Pass --no-fr-top-n-below-pool to opt OUT and "
+                         "reproduce a FactorRanker run exactly as it behaved before this "
+                         "default flipped (e.g. to re-run/compare against an old goal2027atr "
+                         "-atr27-fr/-fr2/-fr3 row under the OLD, un-repaired behaviour -- though "
+                         "note those rows already predate this flag and decode unchanged "
+                         "regardless, since a STORED config with no fr_top_n_below_pool key is "
+                         "always read as off; --no-fr-top-n-below-pool only affects a NEW run's "
+                         "config). Persisted on the run "
+                         "(optimization_config.backtest.fr_top_n_below_pool), never an env var, "
+                         "so every path that rebuilds a trial from this run's stored config -- "
+                         "GA trials, top-N persist, re-runs, robustness variants, the export/"
+                         "deploy payload -- sees the same repair (or its absence). A run "
+                         "launched before this flag existed, or any run whose stored config "
+                         "carries no fr_top_n_below_pool key, is unaffected: KEY ABSENT ALWAYS "
+                         "MEANS OFF, independent of this CLI default.")
     op.add_argument("--exclude-symbols", default=None, metavar="SYM,SYM,...|@file",
                     help="Remove these symbols from the run's tradable universe -- AFTER "
                          "--screener rewrites it to the band's screened union and BEFORE the "
@@ -8545,6 +8592,11 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--rm-toggle-policy", choices=_RM_TOGGLE_POLICIES, default="pinned",
                     help="See optimize --rm-toggle-policy. Applies to every job in this batch; "
                          "--name-prefix must contain '-atr27' under 'atr-searched'.")
+    ob.add_argument("--fr-top-n-below-pool", action=argparse.BooleanOptionalAction, default=True,
+                    help="See `optimize --fr-top-n-below-pool` -- DEFAULT ON, written only onto a "
+                         "bypass expert's (FactorRanker) job in this batch (never a classic "
+                         "expert's, whatever this flag says). Pass --no-fr-top-n-below-pool to "
+                         "opt out.")
     ob.add_argument("--save-top", type=int, default=5)
     ob.add_argument("--seed", type=int, default=42)
     ob.add_argument("--initial-capital", type=float, default=10000.0)

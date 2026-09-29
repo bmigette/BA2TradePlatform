@@ -2599,6 +2599,7 @@ def _build_daily_trial_config(
     entry TP/SL rides on ``entry_rules`` (Strategy.entry_actions), not a bespoke gene.
     """
     from app.services.strategy_param_space import pinned_rm_toggles
+    from ba2_common.core.factor_ranker_topn import repair_fr_top_n_below_pool
 
     bypass = _is_bypass_expert(backtest_cfg)
     # RUN-LEVEL POLICY (design doc §3.2, atr_grid_2027): a persisted
@@ -2607,6 +2608,12 @@ def _build_daily_trial_config(
     # before this policy existed, and every --rm-toggle-policy pinned run) resolves to
     # INERT_RM_TOGGLES unchanged, so this is byte-identical to before for the default case.
     _pinned_toggles = pinned_rm_toggles(backtest_cfg.get("rm_toggles_unpinned"))
+    # RUN-LEVEL OPT-IN (operator decision 2026-09-29, "ranking inert" trap -- see
+    # repair_fr_top_n_below_pool's docstring): a persisted backtest_cfg['fr_top_n_below_pool']
+    # repairs a FactorRanker screener trial whose decoded top_n >= screener_max_stocks (the
+    # factor weights would otherwise have zero effect on which names are held). Absent/False
+    # (every run before this flag existed) is a no-op -- byte-identical to before.
+    _fr_topn_below_pool = bool(backtest_cfg.get("fr_top_n_below_pool"))
     overrides = dict(decoded.get("expert_overrides") or {})
 
     # OPTIONS seam (parity with the single-run path daily_backtest_handler._build_config):
@@ -2709,11 +2716,15 @@ def _build_daily_trial_config(
             merged_settings.update(bypass_screener_settings)
             merged_settings.update(overrides)
             merged_settings.update(_pinned_toggles)
+            if _fr_topn_below_pool:
+                merged_settings, _ = repair_fr_top_n_below_pool(merged_settings)
             experts_out.append({"class": spec["class"], "settings": merged_settings})
         else:
             merged_settings = dict(bypass_screener_settings)
             merged_settings.update(overrides)
             merged_settings.update(_pinned_toggles)
+            if _fr_topn_below_pool:
+                merged_settings, _ = repair_fr_top_n_below_pool(merged_settings)
             experts_out.append({"class": spec, "settings": merged_settings})
 
     # SCREENER runtime: when the run hoisted a metric store, this individual's EFFECTIVE screener
