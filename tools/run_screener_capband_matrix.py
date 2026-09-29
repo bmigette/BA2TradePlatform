@@ -321,6 +321,11 @@ def main() -> int:
     ap.add_argument("--early-stop-min-rel", type=float, default=None,
                     help="Minimum RELATIVE gain (a fraction, 0.01 = 1%%) that resets the "
                          "early-stop patience; passthrough, forwarded only when given.")
+    ap.add_argument("--rm-toggle-policy", default=None, choices=("pinned", "atr-searched"),
+                    help="See ba2-test optimize --rm-toggle-policy; passthrough, forwarded only "
+                         "when given, so every existing matrix command stays unchanged. "
+                         "'atr-searched' requires every job name this driver builds to contain "
+                         "'-atr27' -- the launcher refuses per-job otherwise.")
     ap.add_argument("--interval", default="5min")
     ap.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points, modeled at the fill-engine "
@@ -504,6 +509,8 @@ def main() -> int:
             cmd += ["--early-stop", str(args.early_stop)]
         if args.early_stop_min_rel is not None:
             cmd += ["--early-stop-min-rel", str(args.early_stop_min_rel)]
+        if getattr(args, "rm_toggle_policy", None):
+            cmd += ["--rm-toggle-policy", args.rm_toggle_policy]
         # "Pass 0 to disable" (see the --profit-cap-pct help): a 0 must be FORWARDED, because
         # omitting the flag lets ba2test_launcher re-apply its own 2000/25 default instead.
         cmd += cap_passthrough(args)

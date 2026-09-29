@@ -1327,9 +1327,24 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
         # and those ran with it off exactly as the constant said. coerce_bool because the gene
         # arrives as an int and a legacy row can hold the JSON string "1" -- which is the very
         # defect these two were pinned for, and which bool() reads backwards.
+        #
+        # EXCEPT on a POLICY row (atr_grid_2027 design §3.2): a run launched under
+        # --rm-toggle-policy atr-searched unpinned use_atr_stop and SEARCHED it, so "absent"
+        # there does not mean "ran off" -- it can also mean the trial that was persisted never
+        # decoded the gene at all (e.g. a hand-edited/older top-N row, or a code path that
+        # dropped it), which is a bug worth surfacing, not a value to guess at. Absent + unpinned
+        # RAISES rather than silently exporting False.
+        _rm_toggles_unpinned = set((bt_block or {}).get("rm_toggles_unpinned") or ())
+
         def _executed_toggle(name: str) -> bool:
             raw = sp.get(f"model:{name}")
             if raw is None:
+                if name in _rm_toggles_unpinned:
+                    raise ValueError(
+                        f"backtest {backtest.id}: this run's policy unpinned {name!r} "
+                        f"(rm_toggles_unpinned={sorted(_rm_toggles_unpinned)}) but its genome "
+                        f"carries no model:{name} gene -- refusing to export/deploy a guessed "
+                        f"value for a policy run")
                 return False
             try:
                 return coerce_bool(raw)

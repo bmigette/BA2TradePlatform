@@ -1049,6 +1049,53 @@ def _daily_manage_schedule() -> dict:
 #: is the control.
 _INERT_RM_TOGGLES = {"use_atr_stop": False, "regime_overlay_enabled": False}
 
+#: Mirrors strategy_param_space.ALLOWED_RM_TOGGLES_UNPINNED. See _pinned_rm_toggles.
+_ALLOWED_RM_TOGGLES_UNPINNED = frozenset({"use_atr_stop"})
+
+#: --rm-toggle-policy values (see _cmd_optimize / _cmd_optimize_batch). "pinned" (default) is
+#: today's behaviour, byte-identical. "atr-searched" is the 2027 ATR grid's run-level policy
+#: (docs/strategy_research/atr_grid/atr_grid_2027_design.md §3.2): it unpins ONLY use_atr_stop,
+#: persisted on the run (backtest_block['rm_toggles_unpinned']) so every path that rebuilds a
+#: trial from the stored config -- GA trials, top-N persist, re-runs, robustness variants,
+#: tools/recover_missing_topn.py, tools/rerun_dev_deployed_on_worker.py -- sees the same policy.
+_RM_TOGGLE_POLICIES = ("pinned", "atr-searched")
+
+
+def _rm_toggles_unpinned_for_policy(policy: str) -> list:
+    """The ``rm_toggles_unpinned`` list a ``--rm-toggle-policy`` value resolves to."""
+    if policy == "pinned":
+        return []
+    if policy == "atr-searched":
+        return ["use_atr_stop"]
+    raise ValueError(f"unknown --rm-toggle-policy {policy!r}; choices are {_RM_TOGGLE_POLICIES}")
+
+
+def _pinned_rm_toggles(rm_toggles_unpinned: "list | None" = None) -> dict:
+    """``_INERT_RM_TOGGLES`` minus the keys a run policy unpinned. Mirrors
+    strategy_param_space.pinned_rm_toggles -- see that function for the full rationale. Refuses
+    (raises) any key outside ``_ALLOWED_RM_TOGGLES_UNPINNED``."""
+    unpinned = list(rm_toggles_unpinned or [])
+    bad = [k for k in unpinned if k not in _ALLOWED_RM_TOGGLES_UNPINNED]
+    if bad:
+        raise ValueError(
+            f"rm_toggles_unpinned may only unpin {sorted(_ALLOWED_RM_TOGGLES_UNPINNED)}; "
+            f"refusing to unpin {bad}")
+    return {k: v for k, v in _INERT_RM_TOGGLES.items() if k not in unpinned}
+
+
+def _refuse_atr_policy_without_job_name(policy: str, name: "str | None") -> None:
+    """An ``atr-searched`` run must be named so it can never be confused with -- or accidentally
+    resume the checkpoint of -- a pinned run of the same expert/strategy. ``pinned`` (the
+    default) is unrestricted."""
+    if policy != "atr-searched":
+        return
+    if not name or "-atr27" not in name:
+        sys.exit(
+            f"ba2-test: --rm-toggle-policy atr-searched requires --name (or --name-prefix) to "
+            f"contain '-atr27' (got {name!r}) -- this policy changes what the run scores, and a "
+            f"job name that could collide with a pinned run's name risks resuming its checkpoint "
+            f"into the wrong search or skipping a policy run as 'already completed'.")
+
 
 def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
     """The spec's ``option_fixed_settings`` when ``strategy_kind`` is an option job, else {}.
@@ -1065,7 +1112,8 @@ def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
 
 
 def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None, *,
-                         strategy_kind: "str | None" = None) -> dict:
+                         strategy_kind: "str | None" = None,
+                         rm_toggles_unpinned: "list | None" = None) -> dict:
     """Expert settings for a run: the spec's fixed_settings, plus the run universe injected into
     the expert's own universe setting when the spec names one (``universe_setting`` — for an
     expert that reads its universe from a setting, not from enabled_instruments; no current
@@ -1091,6 +1139,11 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     same settings dict it always did, byte for byte, so every existing job is unchanged.
     ``test_no_shipped_expert_spec_selects_a_risk_manager_mode`` pins that.
 
+    ``rm_toggles_unpinned`` (the --rm-toggle-policy run policy) relaxes ``_INERT_RM_TOGGLES`` for
+    exactly the keys it names -- see ``_pinned_rm_toggles``. ``None``/``[]`` (every call site
+    before this policy existed, and every ``pinned``-policy run) pins both toggles off exactly as
+    before.
+
     ``option_fixed_settings`` (optional spec key) is layered over ``fixed_settings`` only when
     ``strategy_kind`` is an option strategy (see ``_option_fixed_settings_for``). It lets ONE expert spec
     serve both the equity grids and the option grids with a setting the option grids need
@@ -1099,8 +1152,9 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     """
     settings = dict(spec["fixed_settings"])
     settings.update(_option_fixed_settings_for(spec, strategy_kind))
-    # HISTORICALLY INERT, PINNED SO THEY STAY THAT WAY. See _INERT_RM_TOGGLES.
-    settings.update(_INERT_RM_TOGGLES)
+    # HISTORICALLY INERT, PINNED SO THEY STAY THAT WAY -- unless a run policy unpinned one.
+    # See _INERT_RM_TOGGLES / _pinned_rm_toggles.
+    settings.update(_pinned_rm_toggles(rm_toggles_unpinned))
     if spec.get("universe_setting"):
         settings[spec["universe_setting"]] = ",".join(universe)
     if spec.get("risk_manager_mode"):
@@ -1530,6 +1584,32 @@ _RM_OPT = {
     **_REGIME_OPT,
 }
 
+#: The ATR-searched policy's variant of _RM_OPT (docs/strategy_research/atr_grid/
+#: atr_grid_2027_design.md §3.2/§9, D4). ONLY used when --rm-toggle-policy atr-searched (via
+#: _rm_opt_for's atr_searched=True) -- the pinned policy's _RM_OPT is untouched.
+#:
+#: use_atr_stop: optimize True, searched 0/1 -- it is a real gene here, not dropped, because its
+#: declared default is True (see _INERT_RM_TOGGLES).
+#: atr_multiplier: floor widened 3.0->1.5. The 3.0 floor was raised 2026-07-01 from whipsaw
+#: evidence gathered while use_atr_stop was silently dead (the "1"-string defect, fixed later by
+#: coerce_bool), so it has no basis under a run where the toggle genuinely acts.
+#: The three regime_*_scale genes are DROPPED (D3): the overlay stays pinned off under this
+#: policy too, so they would be pure dead weight -- unlike the pinned policy, which keeps them
+#: in the space to preserve the historical genome shape.
+_RM_OPT_ATR_SEARCHED = {
+    "risk_per_trade_pct": _RM_OPT["risk_per_trade_pct"],
+    "atr_risk_budget_pct": _RM_OPT["atr_risk_budget_pct"],
+    "atr_multiplier": {"optimize": True, "min": 1.5, "max": 6.0, "step": 0.5, "type": "float"},
+    "atr_period": _RM_OPT["atr_period"],
+    "min_stop_loss_pct": _RM_OPT["min_stop_loss_pct"],
+    "use_atr_stop": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
+    "max_virtual_equity_per_instrument_percent":
+        _RM_OPT["max_virtual_equity_per_instrument_percent"],
+    # PINNED OFF, not searched -- D3: the overlay is a separate experiment. Kept as a (non-gene)
+    # entry for documentation; optimize=False means _collect_expert never emits it.
+    "regime_overlay_enabled": _REGIME_OPT["regime_overlay_enabled"],
+}
+
 #: Option jobs need a higher per-instrument ceiling than equity ones, and the setting is shared.
 #:
 #: A cash-secured put at spot $100 reserves strike*100 = $10,000, exactly 50% of the grid's $20k
@@ -1559,8 +1639,12 @@ def _effective_sizing_mode(spec: dict, args) -> "str | None":
     return ((spec or {}).get("fixed_settings") or {}).get("sizing_mode")
 
 
-def _rm_opt_for(kind: str, sizing_mode: "str | None" = None) -> dict:
+def _rm_opt_for(kind: str, sizing_mode: "str | None" = None, *, atr_searched: bool = False) -> dict:
     """The classic-RM gene block for a strategy kind: ``_RM_OPT``, plus the option override.
+
+    ``atr_searched`` (--rm-toggle-policy atr-searched) swaps the base block for
+    ``_RM_OPT_ATR_SEARCHED`` -- use_atr_stop searched, wider atr_multiplier floor, the 3
+    regime_*_scale genes dropped (D3/D4). False (default) is today's ``_RM_OPT``, unchanged.
 
     EVERY option kind gets the 50% ceiling EXCEPT ``O_STK``, and that exclusion is the whole
     point of the function. ``O_STK`` is ``_build_strategy_stock`` -> ``_build_strategy_S2``, i.e.
@@ -1576,8 +1660,9 @@ def _rm_opt_for(kind: str, sizing_mode: "str | None" = None) -> dict:
     Gating on ``_PURE_OPTION_STRATEGIES`` instead would be the natural-looking fix and is wrong
     for that reason.
     """
-    block = ({**_RM_OPT, **_OPTION_RM_OVERRIDE}
-             if kind in _OPTION_STRATEGY_KEYS and kind != "O_STK" else dict(_RM_OPT))
+    base = _RM_OPT_ATR_SEARCHED if atr_searched else _RM_OPT
+    block = ({**base, **_OPTION_RM_OVERRIDE}
+             if kind in _OPTION_STRATEGY_KEYS and kind != "O_STK" else dict(base))
     # atr_risk_budget_pct IS THE SIZING BUDGET, and only ``_risk_atr_quantity`` reads it -- which
     # runs solely under ``sizing_mode == 'risk_atr'``. In a notional run it is therefore a DEAD
     # gene: two genomes differing only in it score identically, so the GA spends population slots,
@@ -1625,6 +1710,16 @@ _BYPASS_RM_OPT = {
 _SCHEDULE_DAY_OPT = {
     day: {"optimize": True}
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+}
+
+#: D8 (atr_grid_2027_design.md §3.2/§9): the ATR-searched policy searches weekday entry-scan
+#: cadence only -- the 2 weekend genes are noise on a daily clock (reference-ga-schedule-genes,
+#: every backtest bar is a weekday). Dropping them from the merged expert_params (not just from
+#: the search) means decode_params never sees a schedule:saturday/schedule:sunday key, so both
+#: default to False via its existing ``schedule_by_day.get(day, False)`` repair -- no change
+#: needed there. The pinned policy keeps _SCHEDULE_DAY_OPT (all 7 days) untouched.
+_WEEKDAY_SCHEDULE_DAY_OPT = {
+    day: spec for day, spec in _SCHEDULE_DAY_OPT.items() if day not in ("saturday", "sunday")
 }
 
 # Screener-settings genes (only added to the search when --screener is passed). The STATIC cap
@@ -6116,6 +6211,13 @@ def _cmd_optimize(args) -> int:
         sys.exit(f"ba2-test: optimize not configured for expert {expert!r}; have {sorted(_EXPERT_OPT)}")
     _refuse_unbounded_strategy_request("optimize", [args.strategy])
     _refuse_phase_gated_strategy("optimize", [args.strategy])
+    # --rm-toggle-policy (design atr_grid_2027 §3.2). "pinned" (default) is byte-identical to
+    # today; "atr-searched" unpins use_atr_stop for this run only, persisted on the run config
+    # so every path that rebuilds a trial from it sees the same policy. Resolved and validated
+    # BEFORE anything is built: a refusal here must cost nothing.
+    rm_toggle_policy = getattr(args, "rm_toggle_policy", "pinned") or "pinned"
+    _refuse_atr_policy_without_job_name(rm_toggle_policy, args.name)
+    rm_toggles_unpinned = _rm_toggles_unpinned_for_policy(rm_toggle_policy)
     # Pure-option kinds AND options experts (spec key `options` — --strategy is ignored)
     # default to the ~30%/yr goal metric; stock kinds keep sharpe_ratio.
     fitness = _resolve_fitness(args.fitness, args.strategy,
@@ -6213,7 +6315,8 @@ def _cmd_optimize(args) -> int:
             "enabled_instruments": universe,
             "experts": [{"class": expert, "settings": _expert_run_settings(
                 spec, universe, _sizing_overrides(args),
-                strategy_kind=None if bypass else args.strategy)}],
+                strategy_kind=None if bypass else args.strategy,
+                rm_toggles_unpinned=rm_toggles_unpinned)}],
             "start_date": args.start, "end_date": args.end,
             "initial_capital": float(args.initial_capital),
             "account_settings": {
@@ -6258,6 +6361,13 @@ def _cmd_optimize(args) -> int:
             "backtest_id": int(_dt.now().timestamp()),
             "name": f"opt-{expert}-trial",
         }
+        # Persisted with the run (never an env var) so every consumer of this stored config --
+        # GA trials via _build_daily_trial_config, top-N persist, re-runs, robustness variants,
+        # tools/recover_missing_topn.py, tools/rerun_dev_deployed_on_worker.py -- sees the same
+        # policy. Absent (pinned policy) keeps this block byte-identical to before the policy
+        # existed; only written when non-empty.
+        if rm_toggles_unpinned:
+            backtest_block["rm_toggles_unpinned"] = rm_toggles_unpinned
         # Options experts get the offline options-cache seam (no-op for equity experts).
         _apply_options_seam(spec, backtest_block)
         # WHICH store the run reads, resolved and recorded here rather than left to whatever
@@ -6402,7 +6512,11 @@ def _cmd_optimize(args) -> int:
         _apply_market_conditions("optimize", backtest_block, strat, args.strategy)
         # Per-weekday entry-scan toggle genes (schedule:<day>) for every non-bypass strategy
         # (S1-S7) — FactorRanker (bypass) has no per-day entry-scan gate, so it never gets these.
-        schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}
+        # D8 under the ATR-searched policy: weekdays only (_WEEKDAY_SCHEDULE_DAY_OPT drops the
+        # 2 weekend genes); the pinned policy keeps all 7.
+        _sched_opt = (_WEEKDAY_SCHEDULE_DAY_OPT if rm_toggle_policy == "atr-searched"
+                     else _SCHEDULE_DAY_OPT)
+        schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _sched_opt.items()}
         cfg = {
             "populationSize": int(args.population),
             "generations": int(args.generations),
@@ -6413,9 +6527,12 @@ def _cmd_optimize(args) -> int:
             # Expert decision params (+ classic-RM sizing for ruleset experts; bypass experts size
             # their own portfolio so they carry only the narrow _BYPASS_RM_OPT block — unless the
             # spec opts out via no_bypass_rm — not the full _RM_OPT). Screener genes (screener:*
-            # namespace) are merged in ONLY when --screener is set.
+            # namespace) are merged in ONLY when --screener is set. _rm_opt_for's atr_searched
+            # swaps in _RM_OPT_ATR_SEARCHED under the ATR-searched policy (no-op otherwise).
             "expert_params": ({**_bypass_gene_space(spec), **screener_genes} if bypass
-                              else {**spec["expert_params"], **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args)),
+                              else {**spec["expert_params"],
+                                    **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args),
+                                                 atr_searched=(rm_toggle_policy == "atr-searched")),
                                     **screener_genes, **schedule_genes}),
             "backtest": backtest_block,
         }
@@ -6533,6 +6650,12 @@ def _cmd_optimize_batch(args) -> int:
             sys.exit(f"optimize-batch: expert {e!r} not configured; have {sorted(_EXPERT_OPT)}")
     _refuse_unbounded_strategy_request("optimize-batch", strategies)
     _refuse_phase_gated_strategy("optimize-batch", strategies)
+    # --rm-toggle-policy (see _cmd_optimize). Resolved ONCE for the whole batch: every job in a
+    # batch run shares one policy, and the name guard checks the prefix every job name is built
+    # from.
+    rm_toggle_policy = getattr(args, "rm_toggle_policy", "pinned") or "pinned"
+    _refuse_atr_policy_without_job_name(rm_toggle_policy, args.name_prefix or "phase1")
+    rm_toggles_unpinned = _rm_toggles_unpinned_for_policy(rm_toggle_policy)
     # Build the (expert, strategy) job grid. Bypass experts (FactorRanker) have no enter/exit
     # rulesets, so they run ONCE (their factor-model params), not per strategy variant.
     jobs = []  # (expert, strategy_kind)
@@ -6586,7 +6709,8 @@ def _cmd_optimize_batch(args) -> int:
                 "enabled_instruments": universe,
                 "experts": [{"class": expert, "settings": _expert_run_settings(
                     spec, universe, _sizing_overrides(args),
-                    strategy_kind=None if bypass else strat_kind)}],
+                    strategy_kind=None if bypass else strat_kind,
+                    rm_toggles_unpinned=rm_toggles_unpinned)}],
                 "start_date": args.start, "end_date": args.end,
                 "initial_capital": float(args.initial_capital),
                 "account_settings": {
@@ -6627,6 +6751,10 @@ def _cmd_optimize_batch(args) -> int:
                 "backtest_id": int(_dt.now().timestamp()),
                 "name": f"{name}-trial",
             }
+            # Persisted with the run (see _cmd_optimize). Absent (pinned policy) keeps this
+            # block byte-identical to before the policy existed.
+            if rm_toggles_unpinned:
+                backtest_block["rm_toggles_unpinned"] = rm_toggles_unpinned
             # Options experts get the offline options-cache seam (no-op for equity experts).
             _apply_options_seam(spec, backtest_block)
             # The store decision, resolved once and recorded on the block. THIS driver is the one
@@ -6661,8 +6789,13 @@ def _cmd_optimize_batch(args) -> int:
                 # leaves the gene dead weight — no current spec); ruleset experts get the full
                 # RM sizing/stop params + per-weekday entry-scan toggle genes.
                 "expert_params": (_bypass_gene_space(spec) if bypass
-                                  else {**spec["expert_params"], **_rm_opt_for(strat_kind, _effective_sizing_mode(spec, args)),
-                                        **{f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}}),
+                                  else {**spec["expert_params"],
+                                        **_rm_opt_for(strat_kind, _effective_sizing_mode(spec, args),
+                                                     atr_searched=(rm_toggle_policy == "atr-searched")),
+                                        **{f"schedule:{k}": v for k, v in
+                                           (_WEEKDAY_SCHEDULE_DAY_OPT
+                                            if rm_toggle_policy == "atr-searched"
+                                            else _SCHEDULE_DAY_OPT).items()}}),
                 "backtest": backtest_block,
             }
             _apply_lattice_anchor(cfg, strat_kind, getattr(args, "lattice_anchor", None))
@@ -7888,6 +8021,17 @@ def main(argv: "list | None" = None) -> int:
                          "TradeRiskManagement entirely, so sizing_mode is never read. ALWAYS "
                          "give the two runs different --name suffixes, or the second is SKIPped "
                          "as an already-completed run.")
+    op.add_argument("--rm-toggle-policy", choices=_RM_TOGGLE_POLICIES, default="pinned",
+                    help="'pinned' (default): use_atr_stop/regime_overlay_enabled are pinned OFF "
+                         "for this run, exactly as every run on record -- byte-identical to "
+                         "before this flag existed. 'atr-searched': unpins ONLY use_atr_stop for "
+                         "this run (D3: regime_overlay_enabled can never be unpinned), searched "
+                         "0/1 with a widened atr_multiplier floor, the 3 regime_*_scale genes "
+                         "dropped, and weekday-only schedule genes (see "
+                         "docs/strategy_research/atr_grid/atr_grid_2027_design.md §3.2). "
+                         "Persisted on the run (optimization_config.backtest.rm_toggles_unpinned), "
+                         "never an env var, so re-runs/top-N/robustness variants of THIS run stay "
+                         "under the same policy. Requires --name to contain '-atr27'.")
     op.add_argument("--screener", action="store_true",
                     help="Optimize a screener-selected dynamic universe (screener:* genes). "
                          "Requires --screener-store; the run universe becomes the store's full "
@@ -7971,6 +8115,9 @@ def main(argv: "list | None" = None) -> int:
                          "(engine default: 10.0). See optimize --elitism-percent.")
     ob.add_argument("--lattice-anchor", choices=["zero", "min"], default=None,
                     help="See optimize --lattice-anchor (per-strategy default).")
+    ob.add_argument("--rm-toggle-policy", choices=_RM_TOGGLE_POLICIES, default="pinned",
+                    help="See optimize --rm-toggle-policy. Applies to every job in this batch; "
+                         "--name-prefix must contain '-atr27' under 'atr-searched'.")
     ob.add_argument("--save-top", type=int, default=5)
     ob.add_argument("--seed", type=int, default=42)
     ob.add_argument("--initial-capital", type=float, default=10000.0)
