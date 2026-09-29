@@ -337,3 +337,131 @@ def test_the_preopen_job_does_nothing_without_a_macro_reading_expert(monkeypatch
         jm._execute_fred_preopen_refresh()
     finally:
         jm._scheduler.shutdown(wait=False)
+
+
+# ----------------------------------------------------------------------------
+# The daily ATM-IV snapshot job (2026-09-29): same remove_all_jobs() trap, a
+# THIRD occupant. Neither the full-refresh branch of _refresh_expert_schedules_sync
+# nor refresh_scheduled_jobs() re-added it, so the first /api/reload or full
+# schedule refresh silently stopped the IV-rank feed for IVRankCondition until the
+# process restarted.
+# ----------------------------------------------------------------------------
+def test_full_schedule_refresh_keeps_the_iv_snapshot_job():
+    from ba2_trade_platform.core.JobManager import IV_SNAPSHOT_JOB_ID
+
+    jm = _make_jobmanager()
+    _install_account_refresh_stub(jm, [])
+    try:
+        jm._schedule_iv_snapshot_job()
+        assert jm._scheduler.get_job(IV_SNAPSHOT_JOB_ID) is not None
+
+        jm._refresh_expert_schedules_sync(None)
+
+        assert jm._scheduler.get_job(IV_SNAPSHOT_JOB_ID) is not None, (
+            "remove_all_jobs() dropped the daily ATM-IV snapshot job -- IVRankCondition "
+            "silently stops updating")
+    finally:
+        jm._scheduler.shutdown(wait=False)
+
+
+def test_refresh_scheduled_jobs_keeps_the_iv_snapshot_job():
+    from ba2_trade_platform.core.JobManager import IV_SNAPSHOT_JOB_ID
+
+    jm = _make_jobmanager()
+    _install_account_refresh_stub(jm, [])
+    jm._remove_scheduled_job = lambda job_id: (
+        jm._scheduler.remove_job(job_id), jm._scheduled_jobs.pop(job_id, None)
+    )
+    try:
+        jm._schedule_iv_snapshot_job()
+
+        jm.refresh_scheduled_jobs()
+
+        assert jm._scheduler.get_job(IV_SNAPSHOT_JOB_ID) is not None, (
+            "refresh_scheduled_jobs() dropped the daily ATM-IV snapshot job"
+        )
+    finally:
+        jm._scheduler.shutdown(wait=False)
+
+
+def test_refresh_scheduled_jobs_keeps_the_warm_jobs(monkeypatch):
+    """refresh_scheduled_jobs() removes only job ids tracked in _scheduled_jobs, and
+    schedule_settlement_job()/_schedule_daily_reresolve() add straight to the
+    APScheduler without registering in that dict -- so this path happens to leave the
+    warm jobs alone today even without calling _schedule_warm_jobs(). Pinned here as a
+    regression guard: if the warm jobs are ever made to register in _scheduled_jobs
+    (matching every other system job), this path removing them without the aggregator
+    re-adding them would silently reintroduce the 2026-07-23-style trap."""
+    warm_service = _warm_jobs_on(monkeypatch)
+    jm = _make_jobmanager()
+    _install_account_refresh_stub(jm, [])
+    jm._remove_scheduled_job = lambda job_id: (
+        jm._scheduler.remove_job(job_id), jm._scheduled_jobs.pop(job_id, None)
+    )
+    try:
+        warm_service.schedule_settlement_job(jm)  # startup state
+        assert jm._scheduler.get_job(warm_service.WARM_SETTLEMENT_JOB_ID) is not None
+
+        jm.refresh_scheduled_jobs()
+
+        assert jm._scheduler.get_job(warm_service.WARM_SETTLEMENT_JOB_ID) is not None, (
+            "refresh_scheduled_jobs() dropped the post-close warm job")
+        assert jm._scheduler.get_job(warm_service.WARM_RERESOLVE_JOB_ID) is not None, (
+            "refresh_scheduled_jobs() dropped the daily close re-resolve job")
+    finally:
+        jm._scheduler.shutdown(wait=False)
+
+
+# ----------------------------------------------------------------------------
+# _schedule_system_jobs(): the single aggregator every removal path now calls.
+# ----------------------------------------------------------------------------
+def test_schedule_system_jobs_reaches_every_known_system_job(monkeypatch):
+    """One call must (re)arm all four system jobs: nothing may need hand-picking
+    again the way the three separate removal-path fixes did historically."""
+    from ba2_trade_platform.core.JobManager import (
+        ACCOUNT_REFRESH_JOB_ID, IV_SNAPSHOT_JOB_ID, FRED_PREOPEN_JOB_ID,
+    )
+    warm_service = _warm_jobs_on(monkeypatch)
+    jm = _make_jobmanager()
+    _install_account_refresh_stub(jm, [])
+    try:
+        jm._schedule_system_jobs()
+
+        assert jm._scheduler.get_job(ACCOUNT_REFRESH_JOB_ID) is not None
+        assert jm._scheduler.get_job(IV_SNAPSHOT_JOB_ID) is not None
+        assert jm._scheduler.get_job(FRED_PREOPEN_JOB_ID) is not None
+        assert jm._scheduler.get_job(warm_service.WARM_SETTLEMENT_JOB_ID) is not None
+        assert jm._scheduler.get_job(warm_service.WARM_RERESOLVE_JOB_ID) is not None
+
+        # And it is safe to call before the warm subsystem exists at all (start()'s
+        # ordering: JobManager.start() runs before initialize_warm_service()).
+        monkeypatch.setattr(warm_service, "get_warm_queue", lambda: None)
+        jm._schedule_system_jobs()  # must not raise
+    finally:
+        jm._scheduler.shutdown(wait=False)
+
+
+def test_a_full_schedule_refresh_now_uses_the_single_system_jobs_aggregator(monkeypatch):
+    """Regression guard for the fix itself: every non-expert job the aggregator knows
+    about survives a full refresh in one assertion, so a future job added to
+    _schedule_system_jobs is automatically covered here too."""
+    from ba2_trade_platform.core.JobManager import (
+        ACCOUNT_REFRESH_JOB_ID, IV_SNAPSHOT_JOB_ID, FRED_PREOPEN_JOB_ID,
+    )
+    warm_service = _warm_jobs_on(monkeypatch)
+    jm = _make_jobmanager()
+    _install_account_refresh_stub(jm, [])
+    try:
+        jm._schedule_system_jobs()
+        system_job_ids = [
+            ACCOUNT_REFRESH_JOB_ID, IV_SNAPSHOT_JOB_ID, FRED_PREOPEN_JOB_ID,
+            warm_service.WARM_SETTLEMENT_JOB_ID, warm_service.WARM_RERESOLVE_JOB_ID,
+        ]
+        assert all(jm._scheduler.get_job(jid) is not None for jid in system_job_ids)
+
+        jm._refresh_expert_schedules_sync(None)
+
+        missing = [jid for jid in system_job_ids if jm._scheduler.get_job(jid) is None]
+        assert not missing, f"full schedule refresh dropped system job(s): {missing}"
+    finally:
+        jm._scheduler.shutdown(wait=False)
