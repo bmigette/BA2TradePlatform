@@ -101,19 +101,24 @@ def test_both_profiles_and_market_exits_count_every_gene_once():
         added = bt["market_condition"]["gene_count"] + bt["market_exit"]["gene_count"]
         # The recorded market genes are among the collector's, so the total adds, never doubles.
         assert set(bt["market_condition"]["genes"]) | set(bt["market_exit"]["genes"]) <= set(collector_genes(job))
-        assert oc["geneCount"] == base + added == len(collector_genes(job)), key
+        # +1: the master gene (atr_grid_2027 market master-gene addendum, ``market:enabled``) is
+        # collected too whenever the strategy carries market genes, but it is not itself a
+        # market_condition/market_exit leaf/rule, so B5/B6's recorded ``gene_count``s do not
+        # include it -- the real collector total is one more than their sum.
+        assert oc["geneCount"] == base + added + 1 == len(collector_genes(job)), key
         assert oc["geneCount"] > 20, key
         assert budget(job) == (min(max(4 * oc["geneCount"], 24), 120), 30, 5), key
         assert oc[MIN_REL] == 0.01, key
-    # Reference counts: +15 per entry rule with both profiles, ~9 (7 with the stop omitted) exits.
+    # Reference counts: +15 per entry rule with both profiles, ~9 (7 with the stop omitted) exits,
+    # +1 for the master gene.
     job = full[("large_ds", "quality_momentum_70_30")]
-    assert job["optimization_config"]["geneCount"] == 25 and budget(job) == (100, 30, 5)
-    assert full[("small_earnings", "control")]["optimization_config"]["geneCount"] == 22
+    assert job["optimization_config"]["geneCount"] == 26 and budget(job) == (104, 30, 5)
+    assert full[("small_earnings", "control")]["optimization_config"]["geneCount"] == 23
 
 
 def test_a_forty_gene_job_is_capped_at_population_120():
     job = by_key(manifest(**FULL))[("mid_insider", "timeout")]
-    assert job["optimization_config"]["geneCount"] == 38
+    assert job["optimization_config"]["geneCount"] == 39
     assert budget(job) == (120, 30, 5)
 
 
@@ -295,7 +300,10 @@ def test_cli_dry_run_prints_every_jobs_budget(tmp_path, capsys):
             "--market-condition-manifest", ",".join(f"{p}={d}" for p, d in PINS.items()),
             "--market-exit", "exit,stop,tp", "--variants", "timeout", "--dry-run", "--output-dir", str(tmp_path)]
     assert D.main(argv) == 0
-    assert ("budget: genes=38 (incl. market entry 30, market exit 7) population=120 generations=30 "
+    # 39, not 30 + 7 + ... : the master gene (``market:enabled``) is one more real gene the
+    # collector counts, but it is not itself a market entry leaf or a market exit rule, so the
+    # "(incl. ...)" breakdown is unchanged.
+    assert ("budget: genes=39 (incl. market entry 30, market exit 7) population=120 generations=30 "
             "early_stop=5 min_gain=0.01" in capsys.readouterr().out)
 
 

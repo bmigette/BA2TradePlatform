@@ -57,6 +57,15 @@ Namespacing:
                                    group jobs so stage-1 winners seed the stage-2 space
   schedule:<day>                   ON/OFF toggle for that weekday's entry scan
   screener:<setting>               screener settings
+  market:enabled                   MASTER GENE (int 0/1; atr_grid_2027 market master-gene
+                                   addendum) -- present ONLY when the strategy template carries
+                                   at least one market-condition gate (a --market-condition-
+                                   profile was applied under --market-condition-mode searched).
+                                   ALWAYS the last key collect_param_space emits, so it never
+                                   shifts any other gene's index. 0 forces every market-condition
+                                   cond:*:mode gene to 'off' and every market exit rule's
+                                   exit:*:enabled gene to 0, overriding whatever those individual
+                                   genes decoded to; 1 (or absent) leaves them as decoded.
 
 The pre-028 namespaces (``exit:<id>:action_value`` with the action fields on
 the rule itself, ``entry:<id>:*`` for the flat entry_actions list) are decoded
@@ -475,6 +484,77 @@ def _collect_conditions(strategy) -> Dict[str, Any]:
     return out
 
 
+def _market_condition_field_names() -> set:
+    """Every registered market-condition FIELD name, across every profile.
+
+    Lazy import: a decode/collect call that touches no market-condition leaf at all (the
+    overwhelming majority — any run without ``--market-condition-profile``) never imports the
+    market-conditions registry.
+    """
+    from ba2_common.core.market_conditions import PROFILES
+
+    return {f.name for prof in PROFILES.values() for f in prof.fields}
+
+
+def _market_condition_members(strategy) -> "tuple[set, set]":
+    """``(leaf_ids, rule_ids)`` of every market-condition gate on this Strategy TEMPLATE.
+
+    The FIELD decides membership, not the id spelling — mirrors the launcher's
+    ``_rename_market_condition_gates`` ("The FIELD decides, not the id spelling"). This is what
+    makes the master gene (``market:enabled``) a decode-time concept with no dependency on the
+    launcher's id conventions (``<prefix>-market-<short>``, ``<prefix>-mkt-exit-*`` etc.):
+
+    * a LEAF is a market-condition leaf when its own ``field`` is one of the registered
+      market-condition fields (``ba2_common.core.market_conditions.PROFILES``), however deep it
+      sits inside a mixed AND tree (the entry gates are appended into the SAME tree as the
+      strategy's ordinary confidence/price gates — design section 5.1);
+    * a RULE (entry or exit) is a market-condition rule when it DECLARES ITS OWN rule-level
+      ``toggle_optimize`` (the ``exit:<rid>:enabled`` gene) AND at least one of its own
+      condition leaves is a market-condition leaf. The ``toggle_optimize`` requirement is not
+      redundant: the equity S1-S7 entry rule (design section 5.1) has NO rule-level toggle of
+      its own — the market leaves are appended INTO its ordinary, always-present tree alongside
+      the strategy's own confidence/price gates — so treating "contains a market leaf" alone as
+      rule membership would make the master gene drop that WHOLE entry rule (every ordinary gate
+      with it) via a rule-level ``enabled`` gene the template never declared, instead of leaving
+      only the individual market leaf off. Every leaf the launcher's ``market_exit_rules``
+      builds IS a market field (``market_condition_templates.py``: structure_state /
+      trend_slope / adx) and every one of those rules DOES declare ``toggle_optimize`` — so this
+      still captures exactly the market-exit rules for every rule the launcher builds.
+
+    Returns ``(set(), set())`` for a strategy with no market-condition profile applied (the
+    ``none``/absent-profile case) and for an ``all-off`` control run (the launcher never
+    appends the leaves/rules there), which is exactly why the master gene is absent in both —
+    see ``collect_param_space``.
+    """
+    fields = _market_condition_field_names()
+    leaf_ids: set = set()
+    rule_ids: set = set()
+
+    def _walk_tree(node) -> bool:
+        """Recurse one condition (sub)tree; True if it or any descendant is a market leaf."""
+        if not isinstance(node, dict):
+            return False
+        found = False
+        for child in (node.get("conditions") or []):
+            if _walk_tree(child):
+                found = True
+        cid = node.get("id")
+        if cid and node.get("field") in fields:
+            leaf_ids.add(cid)
+            found = True
+        return found
+
+    for attr in ("entry_rules", "exit_rules"):
+        for rule in (getattr(strategy, attr, None) or []):
+            if not isinstance(rule, dict):
+                continue
+            has_market_leaf = _walk_tree(rule.get("conditions"))
+            rule_toggleable = bool(rule.get("toggle_optimize") or rule.get("toggleOptimize"))
+            if has_market_leaf and rule_toggleable and rule.get("id"):
+                rule_ids.add(rule["id"])
+    return leaf_ids, rule_ids
+
+
 def collect_param_space(
     strategy,
     expert_cfg: Optional[Dict[str, Any]] = None,
@@ -500,6 +580,16 @@ def collect_param_space(
         space.update(_collect_conditions(strategy))
         space.update(_collect_schedule_days(schedule_cfg))
     space.update(_collect_screener(screener_cfg))
+    # MASTER GENE (``market:enabled``), APPENDED LAST so every other gene's index is unchanged
+    # (atr_grid_2027 design, market master-gene addendum). Added iff this strategy TEMPLATE
+    # actually carries at least one market-condition gate -- i.e. iff a market-condition profile
+    # was applied AND the run's --market-condition-mode was 'searched' (the only combination
+    # under which the launcher appends the leaves/rules at all; 'all-off' and no-profile runs
+    # carry none, so this adds nothing there and the gene list stays byte-identical to today).
+    # bypass experts never collect cond:*/entry:*/exit:* at all (see above), so they get no
+    # master gene either -- there is nothing for it to control.
+    if not bypass and any(_market_condition_members(strategy)):
+        space["market:enabled"] = _range_entry(0, 1, 1, is_int=True)
     if not space:
         raise ValueError(
             "No optimizable parameters found: "
@@ -913,6 +1003,7 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     screener_overrides: Dict[str, Any] = {}
     schedule_by_day: Dict[str, Any] = {}
     optsel_by_half: Dict[str, Dict[str, Any]] = {}
+    market_enabled: Optional[Any] = None
 
     def _rule_gene(store: Dict[str, Dict[str, Any]], rid: str, rest: str, val: Any) -> None:
         genes = store.setdefault(rid, {})
@@ -943,8 +1034,33 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         elif key.startswith("optsel:"):
             _, half, w = key.split(":", 2)
             optsel_by_half.setdefault(half, {})[w] = val
+        elif key.startswith("market:"):
+            field = key[len("market:"):]
+            if field != "enabled":
+                raise ValueError(
+                    f"Unknown market gene field {field!r} (only 'market:enabled' exists)")
+            market_enabled = val
         else:
             raise ValueError(f"Unknown decoded param namespace: {key!r}")
+
+    # MASTER GENE: market:enabled == 0 forces EVERY market-condition entry leaf's mode to 'off'
+    # and EVERY market-condition exit rule's toggle to 0, overriding whatever the individual
+    # genes decoded to -- byte-identical to a genome that carried those raw values (design
+    # requirement: "decode with enabled=0 == decode with every market mode off and every market
+    # exit toggle off"). Resolved HERE, once, in the one decode path every consumer shares (GA
+    # trial, top-N persist, re-run, robustness variant, deploy export, tools) so the exported/
+    # persisted strategy is already the resolved, off-switched shape -- live never needs to know
+    # the master gene exists. enabled=1 (or the gene simply absent, e.g. a genome predating it,
+    # or a strategy with no market genes at all) leaves every individual gene exactly as decoded.
+    if market_enabled is not None and int(market_enabled) == 0:
+        market_leaf_ids, market_rule_ids = _market_condition_members(strategy)
+        for cid in market_leaf_ids:
+            cond_by_id.setdefault(cid, {})["mode"] = MODE_OFF
+        for rid in market_rule_ids:
+            # A market rule lives in exactly one of entry_rules/exit_rules; setting it in both
+            # gene stores is harmless (the OTHER list's _decode_rule_list never sees this rid).
+            entry_genes.setdefault(rid, {})["enabled"] = 0
+            exit_genes.setdefault(rid, {})["enabled"] = 0
 
     # None (no unified-model template on this Strategy -- legacy buy_tree/exit_conditions
     # path) is preserved as None, NOT coerced to []: downstream (daily_backtest_handler's
