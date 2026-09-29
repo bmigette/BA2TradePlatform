@@ -39,6 +39,7 @@ Usage (test venv; FMP_API_KEY/DB_FILE in env):
         [--interval 5min] [--fitness calmar_ratio] [--include-no-data] [--dry-run]
 """
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -138,6 +139,52 @@ _STRATEGY_BUDGET_OVERRIDE = {
     # real neighborhood now (thousands of distinct genomes, not 21) — budget accordingly.
     "S7": {"population": 60, "generations": 8},
 }
+
+
+def market_condition_passthrough(args) -> list:
+    """Extra `optimize` CLI tokens for the goal2027atr market-condition flags ([] when none of
+    the five is given, so an ordinary invocation of this driver is untouched)."""
+    out: list = []
+    if getattr(args, "market_condition_profile", None):
+        out += ["--market-condition-profile", args.market_condition_profile]
+    if getattr(args, "market_condition_manifest", None):
+        out += ["--market-condition-manifest", args.market_condition_manifest]
+    if getattr(args, "market_exit", None):
+        out += ["--market-exit", args.market_exit]
+    if getattr(args, "market_condition_mode", None) and args.market_condition_mode != "searched":
+        out += ["--market-condition-mode", args.market_condition_mode]
+    if getattr(args, "search_sl_loosen", False):
+        out += ["--search-sl-loosen"]
+    return out
+
+
+def _job_name(name: str, cmd: list) -> str:
+    """``name``, or ``name-d<digest>`` when ``market_condition_passthrough`` added anything.
+
+    Mirrors ``tools/run_options_matrix.py:discovery_name``: the digest is a sha256 (first 12 hex
+    chars) of the job's own fully-resolved ``optimize`` argv, EXCLUDING ``--name``/``--parallel``/
+    ``--workers`` (metadata that must not move the job identity -- the same three that function
+    excludes). Unlike ``discovery_name`` this digest is added ONLY when at least one new
+    market-condition/sl-loosen flag was actually forwarded (``market_condition_passthrough``
+    returned something): with none of the five flags, every job name -- and therefore the
+    skip-completed-by-name check and the DB row it resumes -- stays byte-identical to before this
+    change existed.
+    """
+    tokens = [t for t in cmd if t]
+    start = tokens.index("optimize") + 1 if "optimize" in tokens else 0
+    tokens = tokens[start:]
+    kept: list = []
+    skip = False
+    for tok in tokens:
+        if skip:
+            skip = False
+            continue
+        if tok in ("--name", "--parallel", "--workers"):
+            skip = True
+            continue
+        kept.append(tok)
+    digest = hashlib.sha256(json.dumps(kept, sort_keys=False).encode()).hexdigest()[:12]
+    return f"{name}-d{digest}"
 
 
 def _db_path() -> str:
@@ -326,6 +373,33 @@ def main() -> int:
                          "when given, so every existing matrix command stays unchanged. "
                          "'atr-searched' requires every job name this driver builds to contain "
                          "'-atr27' -- the launcher refuses per-job otherwise.")
+    # -------------------------------------------------------------------------------------------
+    # goal2027atr market-condition passthrough (equity S1-S7, deferral lifted 2026-09-29). Each is
+    # forwarded to `ba2-test optimize` ONLY when given -- see _market_condition_passthrough -- so
+    # an invocation that passes none of these five flags builds byte-identical job names/argv to
+    # before this block existed. When any IS given, _job_name below folds the job's full resolved
+    # argv (minus --name/--parallel/--workers) into a digest suffix, so a flag change gets a new
+    # job identity and the skip-completed-by-name check above can never reuse an old row under it.
+    # -------------------------------------------------------------------------------------------
+    ap.add_argument("--market-condition-profile", default=None,
+                    metavar="none|<profile>[,<profile>...]",
+                    help="Forward --market-condition-profile to every job (see `ba2-test "
+                         "optimize --help`). Folds into the job's name digest.")
+    ap.add_argument("--market-condition-manifest", default=None,
+                    metavar="DIGEST[,DIGEST...]|<profile>=DIGEST,...",
+                    help="Forward --market-condition-manifest to every job. Folds into the "
+                         "job's name digest.")
+    ap.add_argument("--market-exit", default=None, metavar="KIND[,KIND...]",
+                    help="Forward --market-exit to every job (equity S1-S7 only; requires "
+                         "--market-condition-profile). Folds into the job's name digest.")
+    ap.add_argument("--market-condition-mode", default=None, choices=("searched", "all-off"),
+                    help="Forward --market-condition-mode to every job ('searched' is the "
+                         "launcher default and is NOT forwarded, so it never folds into the "
+                         "digest on its own -- pass 'all-off' for the matched control arm). "
+                         "Folds into the job's name digest when 'all-off'.")
+    ap.add_argument("--search-sl-loosen", action="store_true", default=False,
+                    help="Forward --search-sl-loosen to every job. Folds into the job's name "
+                         "digest.")
     ap.add_argument("--interval", default="5min")
     ap.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points, modeled at the fill-engine "
@@ -453,16 +527,13 @@ def main() -> int:
     done = _completed_names()
     print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies="
           f"{'per --strategy-plan' if strategy_plan else strategies}); "
-          f"{sum(1 for j in jobs if j[0] in done)} already completed.")
-    if args.dry_run:
-        for nm, exp, s, band in jobs:
-            print(f"  {'DONE' if nm in done else 'TODO'}  {nm}  ({exp} {s or '(bypass)'} / {band})")
-        return 0
-
+          f"{sum(1 for j in jobs if j[0] in done)} already completed"
+          f"{' (by base name; digest-suffixed names are checked per job)' if market_condition_passthrough(args) else ''}.")
+    # --dry-run walks the SAME loop below and stops short of launching: a job's final name can
+    # carry a digest of its resolved argv (market-condition flags), which only exists once the
+    # command is built, so listing the pre-digest names here would show (and check "DONE"
+    # against) names no job will ever have.
     for i, (name, expert, strat, band) in enumerate(jobs, 1):
-        if name in _completed_names():   # re-read each loop (resumable)
-            print(f"[{i}/{len(jobs)}] SKIP {name} (already completed)", flush=True)
-            continue
         # Data-floored start (see _EXPERT_MIN_START). Announced per job so a shorter window is
         # visible in the log instead of being inferred later from a suspiciously late first trade.
         job_start = _start_for(expert, args.start)
@@ -541,9 +612,26 @@ def main() -> int:
             cmd += ["--strategy", strat]
         if args.workers:
             cmd += ["--workers", args.workers]   # distribute trials across remote workers + local
-        print(f"[{i}/{len(jobs)}] RUN  {name} ...", flush=True)
+        # goal2027atr market-condition passthrough: [] with none of the five flags given, so an
+        # ordinary invocation's cmd (and therefore its name/digest below) is byte-identical to
+        # before this block existed. Appended LAST so it never displaces an existing token's
+        # position for a job with no new flags.
+        mc_tokens = market_condition_passthrough(args)
+        cmd += mc_tokens
+        job_name = name
+        if mc_tokens:
+            job_name = _job_name(name, cmd)
+            cmd[cmd.index("--name") + 1] = job_name
+        if args.dry_run:
+            print(f"  {'DONE' if job_name in done else 'TODO'}  {job_name}  "
+                  f"({expert} {strat or '(bypass)'} / {band})")
+            continue
+        if job_name in _completed_names():   # re-read each loop (resumable)
+            print(f"[{i}/{len(jobs)}] SKIP {job_name} (already completed)", flush=True)
+            continue
+        print(f"[{i}/{len(jobs)}] RUN  {job_name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
-        print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)
+        print(f"[{i}/{len(jobs)}] {job_name} exit={rc}", flush=True)
     print("matrix driver: done.")
     return 0
 
