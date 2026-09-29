@@ -13,13 +13,11 @@ from ba2_trade_platform.core.utils import calculate_transaction_pnl
 from ba2_trade_platform.ui.components.performance_charts import (
     MetricCard, PerformanceBarChart, TimeSeriesChart, PieChartComponent,
     PerformanceTable, MultiMetricDashboard,
-    calculate_sharpe_ratio, calculate_win_loss_ratio, calculate_max_drawdown, calculate_profit_factor,
-    max_drawdown_from_pnl
 )
+from ba2_common.analytics.performance import expert_performance, calculate_sharpe_ratio
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 import pandas as pd
-import numpy as np
 from collections import defaultdict
 from ba2_trade_platform.ui.utils.perf_logger import PerfLogger
 from ba2_trade_platform.ui.account_filter_context import get_expert_ids_for_account
@@ -132,66 +130,7 @@ class PerformanceTab:
             else:
                 expert_name = f"Expert-{expert_id}"
             
-            # Calculate transaction duration
-            durations = []
-            for txn in txns:
-                if txn.open_date and txn.close_date:
-                    duration = (txn.close_date - txn.open_date).total_seconds() / 86400  # days
-                    durations.append(duration)
-            
-            # Calculate P&L (handles both long and short positions)
-            pnls = []
-            for txn in txns:
-                pnl = calculate_transaction_pnl(txn)
-                if pnl is not None:
-                    pnls.append(pnl)
-
-            winning_pnls = [p for p in pnls if p > 0]
-            losing_pnls = [p for p in pnls if p < 0]
-
-            # Win/loss ratio
-            win_rate, wins, losses = calculate_win_loss_ratio(
-                [{'pnl': pnl} for pnl in pnls]
-            )
-
-            # Calculate returns for Sharpe ratio
-            returns = []
-            for txn in txns:
-                pnl = calculate_transaction_pnl(txn)
-                if pnl is not None:
-                    # Scale by the contract multiplier (100 for options) to match the
-                    # multiplier-aware P&L, so the return ratio stays correct.
-                    position_value = txn.open_price * txn.quantity * (getattr(txn, "multiplier", None) or 1)
-                    if position_value != 0:
-                        returns.append(pnl / position_value)
-            
-            # Drawdown walks the cumulative curve, so the order is load-bearing: the same
-            # trades in a different sequence give a different worst fall. `pnls` above is
-            # in whatever order the query returned, so this is sorted explicitly by close
-            # date. A transaction with no close date is still open and has no place on a
-            # REALISED equity curve.
-            ordered = sorted((t for t in txns if t.close_date), key=lambda t: t.close_date)
-            ordered_pnls = [pnl for pnl in (calculate_transaction_pnl(t) for t in ordered)
-                            if pnl is not None]
-            max_dd, max_dd_pct = max_drawdown_from_pnl(ordered_pnls)
-
-            expert_metrics[expert_name] = {
-                'total_transactions': len(txns),
-                'max_drawdown': max_dd,
-                'max_drawdown_pct': max_dd_pct,
-                'avg_duration_days': np.mean(durations) if durations else 0,
-                'total_pnl': sum(pnls) if pnls else 0,
-                'avg_pnl': np.mean(pnls) if pnls else 0,
-                'win_rate': win_rate,
-                'wins': wins,
-                'losses': losses,
-                'profit_factor': calculate_profit_factor(winning_pnls, losing_pnls),
-                'largest_win': max(winning_pnls) if winning_pnls else None,
-                'largest_loss': min(losing_pnls) if losing_pnls else None,
-                'sharpe_ratio': calculate_sharpe_ratio(returns) if len(returns) >= 30 else None,
-                'transactions': txns,
-                'returns': returns
-            }
+            expert_metrics[expert_name] = expert_performance(txns)
         
         return expert_metrics
     

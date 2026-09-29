@@ -71,6 +71,68 @@ def trading_permission(expert: Any, setting_key: str) -> bool:
     return coerce_bool(raw)
 
 
+def decode_setting_rows(rows, definitions: Dict[str, Any]) -> Dict[str, Any]:
+    """Typed settings dict from stored setting rows (``key``, ``value_str``, ``value_json``,
+    ``value_float``) and the class's merged settings definitions. Every defined key is present
+    (None when no row); undefined stored keys infer their type from which column holds data.
+    Pure -- the ``settings`` property below and the public site's importer both use it."""
+    # Initialize with definitions (set to None if not found in DB)
+    settings = {k: None for k in definitions.keys()}
+
+    for setting in rows:
+        definition = definitions.get(setting.key, {})
+        value_type = definition.get("type", None)
+        
+        # If no definition exists, determine type from the stored data
+        if value_type is None:
+            if setting.value_json is not None and setting.value_json:  # Non-empty JSON
+                value_type = "json"
+            elif setting.value_float is not None:
+                value_type = "float"
+            else:
+                value_type = "str"
+            #logger.debug(f"Setting '{setting.key}' found in DB but not in definitions, using type: {value_type}")
+        
+        if value_type == "json" or value_type == "list":
+            # JSON and list values are stored as JSON in the database
+            settings[setting.key] = setting.value_json
+        elif value_type == "bool":
+            # Legacy rows written before coerce_bool existed hold '"1"' / '"0"', which
+            # the old `value.lower() == 'true'` test read as False regardless. Reading
+            # through the shared coercion recognises them (see coerce_bool's docstring).
+            try:
+                settings[setting.key] = coerce_bool(setting.value_json)
+            except ValueError as e:
+                # A stored spelling nothing can mean. Still defaults to False so one bad
+                # row cannot take an expert down, but it is now LOUD -- the old handler
+                # swallowed every '"1"' in the database this way, without a word.
+                logger.warning(f"Boolean setting '{setting.key}' holds an unreadable "
+                               f"value ({e}); defaulting to False")
+                settings[setting.key] = False
+        elif value_type == "int":
+            if setting.value_float is not None:
+                settings[setting.key] = int(setting.value_float)
+            elif setting.value_str is not None and setting.value_str != "None":
+                # Legacy rows saved before "int" was stored in value_float
+                try:
+                    settings[setting.key] = int(setting.value_str)
+                except ValueError:
+                    logger.warning(f"Could not parse int setting '{setting.key}' from value_str={setting.value_str!r}")
+                    settings[setting.key] = None
+            else:
+                settings[setting.key] = None
+        elif value_type == "float":
+            settings[setting.key] = setting.value_float
+        else:
+            # Convert string "None" (from str(None) bug) back to Python None
+            value_str = setting.value_str
+            if value_str == "None":
+                settings[setting.key] = None
+            else:
+                settings[setting.key] = value_str
+    return settings
+
+
 class ExtendableSettingsInterface(ABC):
     # Hidden variable for builtin settings that all implementations share
     _builtin_settings: Dict[str, Any] = {}
@@ -459,60 +521,7 @@ class ExtendableSettingsInterface(ABC):
                 results = session.exec(statement)
                 settings_value_from_db = results.all()
             
-            # Initialize with definitions (set to None if not found in DB)
-            settings = {k : None for k in definitions.keys()}
-
-            for setting in settings_value_from_db:
-                definition = definitions.get(setting.key, {})
-                value_type = definition.get("type", None)
-                
-                # If no definition exists, determine type from the stored data
-                if value_type is None:
-                    if setting.value_json is not None and setting.value_json:  # Non-empty JSON
-                        value_type = "json"
-                    elif setting.value_float is not None:
-                        value_type = "float"
-                    else:
-                        value_type = "str"
-                    #logger.debug(f"Setting '{setting.key}' found in DB but not in definitions, using type: {value_type}")
-                
-                if value_type == "json" or value_type == "list":
-                    # JSON and list values are stored as JSON in the database
-                    settings[setting.key] = setting.value_json
-                elif value_type == "bool":
-                    # Legacy rows written before coerce_bool existed hold '"1"' / '"0"', which
-                    # the old `value.lower() == 'true'` test read as False regardless. Reading
-                    # through the shared coercion recognises them (see coerce_bool's docstring).
-                    try:
-                        settings[setting.key] = coerce_bool(setting.value_json)
-                    except ValueError as e:
-                        # A stored spelling nothing can mean. Still defaults to False so one bad
-                        # row cannot take an expert down, but it is now LOUD -- the old handler
-                        # swallowed every '"1"' in the database this way, without a word.
-                        logger.warning(f"Boolean setting '{setting.key}' holds an unreadable "
-                                       f"value ({e}); defaulting to False")
-                        settings[setting.key] = False
-                elif value_type == "int":
-                    if setting.value_float is not None:
-                        settings[setting.key] = int(setting.value_float)
-                    elif setting.value_str is not None and setting.value_str != "None":
-                        # Legacy rows saved before "int" was stored in value_float
-                        try:
-                            settings[setting.key] = int(setting.value_str)
-                        except ValueError:
-                            logger.warning(f"Could not parse int setting '{setting.key}' from value_str={setting.value_str!r}")
-                            settings[setting.key] = None
-                    else:
-                        settings[setting.key] = None
-                elif value_type == "float":
-                    settings[setting.key] = setting.value_float
-                else:
-                    # Convert string "None" (from str(None) bug) back to Python None
-                    value_str = setting.value_str
-                    if value_str == "None":
-                        settings[setting.key] = None
-                    else:
-                        settings[setting.key] = value_str
+            settings = decode_setting_rows(settings_value_from_db, definitions)
                     
             #logger.debug(f"Loaded settings for {lk_field}={self.id}: {settings}")
             

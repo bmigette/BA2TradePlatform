@@ -1,0 +1,7 @@
+{
+ "backtest_id": 904,
+ "name": "synthetic-opt-FactorRanker",
+ "entry_rules": [],
+ "exit_rules": [],
+ "optimized_genes": {}
+}

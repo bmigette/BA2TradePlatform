@@ -6,7 +6,7 @@ and import them back into the system.
 """
 
 import json
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, Iterable, List, Any, Optional, Tuple
 from datetime import datetime
 from sqlmodel import select, Session
 
@@ -169,6 +169,42 @@ def _display_rule_name(rule: "EventAction") -> str:
     return rule.name
 
 
+def ruleset_export_body(ruleset: Any, ordered_rules: Iterable[Tuple[int, Any]]) -> Dict[str, Any]:
+    """The ``ruleset`` object of a ruleset export ({name, description, type, subtype, rules}).
+    Pure: ``ordered_rules`` is ``(order_index, rule)`` pairs already in order. Shared by
+    RulesExporter and the public site's importer."""
+    return {
+        "name": ruleset.name,
+        "description": ruleset.description,
+        "type": ruleset.type.value if ruleset.type else None,
+        "subtype": ruleset.subtype.value if ruleset.subtype else None,
+        "rules": [
+            {
+                "name": _display_rule_name(rule),
+                "type": rule.type.value if rule.type else None,
+                "subtype": rule.subtype.value if rule.subtype else None,
+                "triggers": rule.triggers,
+                "actions": rule.actions,
+                "extra_parameters": rule.extra_parameters,
+                "continue_processing": rule.continue_processing,
+                "order_index": order_index,
+            }
+            for order_index, rule in ordered_rules
+        ],
+    }
+
+
+def rulesets_export_envelope(bodies: List[Dict[str, Any]],
+                             exported_at: Optional[str] = None) -> Dict[str, Any]:
+    """The multi-ruleset export envelope around ``ruleset_export_body`` results."""
+    return {
+        "export_version": "1.0",
+        "export_type": "rulesets",
+        "export_timestamp": exported_at or datetime.now().isoformat(),
+        "rulesets": list(bodies),
+    }
+
+
 class RulesExporter:
     """Handles exporting rules and rulesets to JSON format."""
 
@@ -184,23 +220,9 @@ class RulesExporter:
                 if not ruleset:
                     raise ValueError(f"Ruleset with ID {ruleset_id} not found")
 
-                # Get all event actions for this ruleset with their order
-                ruleset_data = {
-                    "export_version": "1.0",
-                    "export_type": "ruleset",
-                    "export_timestamp": datetime.now().isoformat(),
-                    "ruleset": {
-                        "name": ruleset.name,
-                        "description": ruleset.description,
-                        "type": ruleset.type.value if ruleset.type else None,
-                        "subtype": ruleset.subtype.value if ruleset.subtype else None,
-                        "rules": []
-                    }
-                }
-
                 # Get rules in order by querying the link table
                 from ba2_common.core.models import RulesetEventActionLink, EventAction
-                
+
                 with get_db() as session:
                     # Query link table to get ordered associations
                     statement = (
@@ -209,23 +231,16 @@ class RulesExporter:
                         .where(RulesetEventActionLink.ruleset_id == ruleset_id)
                         .order_by(RulesetEventActionLink.order_index)
                     )
-                    
-                    results = session.exec(statement).all()
-                    
-                    for link, rule in results:
-                        rule_data = {
-                            "name": _display_rule_name(rule),
-                            "type": rule.type.value if rule.type else None,
-                            "subtype": rule.subtype.value if rule.subtype else None,
-                            "triggers": rule.triggers,
-                            "actions": rule.actions,
-                            "extra_parameters": rule.extra_parameters,
-                            "continue_processing": rule.continue_processing,
-                            "order_index": link.order_index
-                        }
-                        ruleset_data["ruleset"]["rules"].append(rule_data)
 
-                return ruleset_data
+                    results = session.exec(statement).all()
+
+                    return {
+                        "export_version": "1.0",
+                        "export_type": "ruleset",
+                        "export_timestamp": datetime.now().isoformat(),
+                        "ruleset": ruleset_export_body(
+                            ruleset, [(link.order_index, rule) for link, rule in results]),
+                    }
 
         except Exception as e:
             logger.error(f"Error exporting ruleset {ruleset_id}: {e}", exc_info=True)
@@ -264,18 +279,8 @@ class RulesExporter:
     def export_multiple_rulesets(ruleset_ids: List[int]) -> Dict[str, Any]:
         """Export multiple rulesets."""
         try:
-            rulesets_data = {
-                "export_version": "1.0",
-                "export_type": "rulesets",
-                "export_timestamp": datetime.now().isoformat(),
-                "rulesets": []
-            }
-
-            for ruleset_id in ruleset_ids:
-                ruleset_data = RulesExporter.export_ruleset(ruleset_id)
-                rulesets_data["rulesets"].append(ruleset_data["ruleset"])
-
-            return rulesets_data
+            bodies = [RulesExporter.export_ruleset(rid)["ruleset"] for rid in ruleset_ids]
+            return rulesets_export_envelope(bodies)
 
         except Exception as e:
             logger.error(f"Error exporting multiple rulesets: {e}", exc_info=True)
