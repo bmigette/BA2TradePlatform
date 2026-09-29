@@ -1,0 +1,18 @@
+# goal2027atr per-run symbol exclusion (ba2-test optimize --exclude-symbols @<this file>).
+#
+# IAC: FMP's split/spin-off adjustment history is broken for this symbol -- Match Group (2020),
+# Vimeo (2021) and Angi (2025) spin-offs each leave a mixed-basis discontinuity in the daily
+# series that fails the split-basis check as drift/undetectable (not a single-day price gap, so
+# acknowledge_jump does not apply -- see reference-fmp-split-spinoff-data-defects). The
+# market-condition snapshot (ohlcv-v1 / ta-structure-v1) therefore cannot cover IAC, and the
+# launcher's coverage guard (check_market_condition_coverage,
+# testplatform/backend/app/services/backtest/seam_wiring.py) refuses any gated job whose universe
+# contains it.
+#
+# Operator decision 2026-09-29: drop IAC from goal2027atr (every -atr27 S1-S7 job, treatment and
+# all-off control alike) rather than fix the underlying FMP data. Narrow, run-scoped exclusion --
+# not a permanent addition to metric_store.EXCLUDED_SYMBOLS.
+#
+# Format: one symbol per line, blank lines and '#' comment lines skipped (see
+# ba2test_launcher._resolve_exclude_symbols_arg).
+IAC

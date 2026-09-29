@@ -158,17 +158,30 @@ def market_condition_passthrough(args) -> list:
     return out
 
 
+def exclude_symbols_passthrough(args) -> list:
+    """Extra `optimize` CLI tokens for --exclude-symbols ([] when not given, so an ordinary
+    invocation of this driver is untouched). Kept separate from
+    ``market_condition_passthrough`` so it also triggers the job-name digest ON ITS OWN (see the
+    call site) -- an exclusion change must get a new job identity even in a run that passes none
+    of the five market-condition flags."""
+    out: list = []
+    if getattr(args, "exclude_symbols", None):
+        out += ["--exclude-symbols", args.exclude_symbols]
+    return out
+
+
 def _job_name(name: str, cmd: list) -> str:
-    """``name``, or ``name-d<digest>`` when ``market_condition_passthrough`` added anything.
+    """``name``, or ``name-d<digest>`` when ``market_condition_passthrough`` or
+    ``exclude_symbols_passthrough`` added anything.
 
     Mirrors ``tools/run_options_matrix.py:discovery_name``: the digest is a sha256 (first 12 hex
     chars) of the job's own fully-resolved ``optimize`` argv, EXCLUDING ``--name``/``--parallel``/
     ``--workers`` (metadata that must not move the job identity -- the same three that function
     excludes). Unlike ``discovery_name`` this digest is added ONLY when at least one new
-    market-condition/sl-loosen flag was actually forwarded (``market_condition_passthrough``
-    returned something): with none of the five flags, every job name -- and therefore the
-    skip-completed-by-name check and the DB row it resumes -- stays byte-identical to before this
-    change existed.
+    market-condition/sl-loosen flag OR ``--exclude-symbols`` was actually forwarded
+    (``market_condition_passthrough`` or ``exclude_symbols_passthrough`` returned something):
+    with none of those six sources, every job name -- and therefore the skip-completed-by-name
+    check and the DB row it resumes -- stays byte-identical to before this change existed.
     """
     tokens = [t for t in cmd if t]
     start = tokens.index("optimize") + 1 if "optimize" in tokens else 0
@@ -400,6 +413,15 @@ def main() -> int:
     ap.add_argument("--search-sl-loosen", action="store_true", default=False,
                     help="Forward --search-sl-loosen to every job. Folds into the job's name "
                          "digest.")
+    ap.add_argument("--exclude-symbols", default=None, metavar="SYM,SYM,...|@file",
+                    help="Forward --exclude-symbols to every job (see `ba2-test optimize "
+                         "--help`), e.g. "
+                         "@docs/strategy_research/atr_grid/excluded_symbols.txt to drop IAC "
+                         "(FMP spin-off split-basis drift; see that file's header) from every "
+                         "-atr27 S1-S7 job, treatment and all-off control alike. "
+                         "Folds into the job's name digest (on its own, not only alongside a "
+                         "market-condition flag) so an exclusion change can never reuse an old "
+                         "job's completed row under the same name.")
     ap.add_argument("--interval", default="5min")
     ap.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points, modeled at the fill-engine "
@@ -528,7 +550,7 @@ def main() -> int:
     print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies="
           f"{'per --strategy-plan' if strategy_plan else strategies}); "
           f"{sum(1 for j in jobs if j[0] in done)} already completed"
-          f"{' (by base name; digest-suffixed names are checked per job)' if market_condition_passthrough(args) else ''}.")
+          f"{' (by base name; digest-suffixed names are checked per job)' if (market_condition_passthrough(args) or exclude_symbols_passthrough(args)) else ''}.")
     # --dry-run walks the SAME loop below and stops short of launching: a job's final name can
     # carry a digest of its resolved argv (market-condition flags), which only exists once the
     # command is built, so listing the pre-digest names here would show (and check "DONE"
@@ -618,8 +640,14 @@ def main() -> int:
         # position for a job with no new flags.
         mc_tokens = market_condition_passthrough(args)
         cmd += mc_tokens
+        # --exclude-symbols: appended after the market-condition tokens (same "never displaces an
+        # existing token's position" reasoning). It ALSO triggers the digest on its own (see
+        # exclude_symbols_passthrough's docstring) -- an ordinary invocation of neither this nor
+        # the five market-condition flags stays byte-identical.
+        excl_tokens = exclude_symbols_passthrough(args)
+        cmd += excl_tokens
         job_name = name
-        if mc_tokens:
+        if mc_tokens or excl_tokens:
             job_name = _job_name(name, cmd)
             cmd[cmd.index("--name") + 1] = job_name
         if args.dry_run:

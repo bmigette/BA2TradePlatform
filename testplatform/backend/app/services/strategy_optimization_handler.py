@@ -2655,6 +2655,16 @@ def _build_daily_trial_config(
     # optimizes its screener thresholds each generation. (The screener_overrides keys are the
     # ``screener_*``-prefixed names FactorRanker._metric_store_settings() translates.) For
     # non-bypass / non-screener runs this dict is empty and nothing changes.
+    # PER-RUN exclusion (launcher ``--exclude-symbols``, persisted as
+    # backtest_cfg['excluded_instruments'] -- see ba2test_launcher._apply_exclude_symbols). The
+    # launcher already removed these from backtest_cfg['enabled_instruments'], which covers the
+    # CLASSIC (non-bypass) entry-gate path (screener_candidate below is intersected with
+    # enabled_instruments). A BYPASS expert's screener-mode universe (FactorRanker
+    # universe_source=screener) does NOT consult enabled_instruments at all -- it resolves
+    # straight off the metric store (see FactorRanker._resolve_universe_source) -- so it needs
+    # the exclusion pushed onto its own settings below.
+    excluded_instruments = list(backtest_cfg.get("excluded_instruments") or [])
+
     bypass_screener_settings: Dict[str, Any] = {}
     if (
         bypass
@@ -2670,6 +2680,8 @@ def _build_daily_trial_config(
             **(hoisted.get("screener_base") or {}),
             **(decoded.get("screener_overrides") or {}),
         }
+        if excluded_instruments:
+            bypass_screener_settings["excluded_symbols"] = excluded_instruments
 
     # Merge the per-trial overrides into each expert spec's settings (do NOT mutate the
     # run-level backtest_cfg — build fresh spec dicts). The bypass screener settings are layered
@@ -2728,6 +2740,11 @@ def _build_daily_trial_config(
             "store": hoisted["screener_store"],
             "settings": eff_norm,
             "cadence_days": hoisted.get("screener_cadence_days", 7),
+            # Defence-in-depth on the classic per-bar gate (daily_engine._screened_symbols_for_bar)
+            # — see excluded_instruments above. Redundant with the enabled_instruments intersection
+            # below for a non-bypass expert, but threaded through so this gate can never be the one
+            # place an excluded symbol slips back in.
+            "excluded_symbols": excluded_instruments,
         }
         # CANDIDATE BOUND (non-bypass): restrict the loaded universe to the symbols THIS trial's
         # screen can EVER select over [start,end] (screened_symbol_union with the trial's own eff
@@ -2741,7 +2758,7 @@ def _build_daily_trial_config(
                 _df = _ms.load_store(hoisted["screener_store"])
                 _sd = str(backtest_cfg["start_date"])[:10]
                 _ed = str(backtest_cfg["end_date"])[:10]
-                _union = set(_ms.screened_symbol_union(_df, _sd, _ed, eff_norm))
+                _union = set(_ms.screened_symbol_union(_df, _sd, _ed, eff_norm, excluded_instruments))
                 screener_candidate = [s for s in backtest_cfg["enabled_instruments"] if s in _union]
             except Exception:  # noqa: BLE001 — never break a trial on the optimization; fall back to full band
                 screener_candidate = None

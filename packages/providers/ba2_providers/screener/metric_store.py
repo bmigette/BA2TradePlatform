@@ -11,7 +11,7 @@ import json
 import os
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1281,12 +1281,18 @@ def normalize_screener_settings(screener_settings: Dict[str, Any]) -> Dict[str, 
 EXCLUDED_SYMBOLS = frozenset({"OP"})
 
 
-def _drop_excluded(d: "pd.DataFrame") -> "pd.DataFrame":
-    """Remove EXCLUDED_SYMBOLS. Applied to every store-driven universe selection so a known-bad
-    symbol cannot enter through any gate combination."""
-    if not EXCLUDED_SYMBOLS or "symbol" not in d.columns:
+def _drop_excluded(d: "pd.DataFrame", excluded_symbols: "Optional[Iterable[str]]" = None) -> "pd.DataFrame":
+    """Remove EXCLUDED_SYMBOLS (the module-level, permanent, evidence-backed list) and, when
+    given, ``excluded_symbols`` (a CALLER-SUPPLIED, per-run exclusion — e.g. a launcher
+    ``--exclude-symbols`` list persisted on ``optimization_config.backtest.excluded_instruments``
+    for one grid, not a global list). Applied to every store-driven universe selection so neither
+    a known-bad symbol NOR a per-run excluded one can enter through any gate combination.
+    ``excluded_symbols`` absent/empty is a no-op — byte-identical to before this parameter existed.
+    """
+    both = set(EXCLUDED_SYMBOLS) | {str(s).upper() for s in (excluded_symbols or ())}
+    if not both or "symbol" not in d.columns:
         return d
-    return d[~d["symbol"].isin(EXCLUDED_SYMBOLS)]
+    return d[~d["symbol"].str.upper().isin(both)]
 
 
 def _latest_scan_date_le(store_df: "pd.DataFrame", day: str) -> Optional[str]:
@@ -1316,16 +1322,19 @@ def _latest_scan_date_le(store_df: "pd.DataFrame", day: str) -> Optional[str]:
 
 
 def screen_universe_for_day(store_df: "pd.DataFrame", day: str,
-                            settings: Dict[str, Any]) -> List[str]:
+                            settings: Dict[str, Any],
+                            excluded_symbols: "Optional[Iterable[str]]" = None) -> List[str]:
     """The dynamic per-day universe for one individual's screener thresholds.
 
     ``day`` is 'YYYY-MM-DD'. ``settings`` keys (all optional; absent => not enforced):
     market_cap_min/max, price_min/max, volume_min/max, relative_volume_min, price_drop_pct
     (min drop to qualify a 'dip'), weinstein_stage2_only (truthy => keep only Weinstein Stage 2
     rows, matching the slow StockScreener Stage-2 filter), max_stocks, sort_metric ('market_cap'|
-    'relative_volume'|'price_drop_pct'). Returns the selected symbols (<= max_stocks), sorted by
-    sort_metric desc. Pure in-memory filter over the precomputed row values — microseconds."""
-    d = _drop_excluded(store_df[store_df["date"] == day])
+    'relative_volume'|'price_drop_pct'). ``excluded_symbols`` (optional) is a PER-RUN exclusion
+    list (see ``_drop_excluded``) applied on top of the module-level ``EXCLUDED_SYMBOLS`` — absent
+    is a no-op. Returns the selected symbols (<= max_stocks), sorted by sort_metric desc. Pure
+    in-memory filter over the precomputed row values — microseconds."""
+    d = _drop_excluded(store_df[store_df["date"] == day], excluded_symbols)
     if d.empty:
         return []
     def _ge(col, key):
@@ -1391,14 +1400,15 @@ def screen_universe_for_day(store_df: "pd.DataFrame", day: str,
 
 
 def screen_universe_as_of(store_df: "pd.DataFrame", as_of_day: str,
-                          settings: Dict[str, Any]) -> List[str]:
+                          settings: Dict[str, Any],
+                          excluded_symbols: "Optional[Iterable[str]]" = None) -> List[str]:
     """Same as ``screen_universe_for_day`` but resolves to the LATEST scan date <= as_of_day,
     so a bar between scan dates gets the held universe (the cadence is weekly by default). Empty
-    if no scan date is on/before as_of_day."""
+    if no scan date is on/before as_of_day. ``excluded_symbols``: see ``screen_universe_for_day``."""
     day = _latest_scan_date_le(store_df, as_of_day)
     if day is None:
         return []
-    return screen_universe_for_day(store_df, day, settings)
+    return screen_universe_for_day(store_df, day, settings, excluded_symbols)
 
 
 def metrics_as_of(store_df: "pd.DataFrame", as_of_day: str,
@@ -1421,7 +1431,8 @@ def metrics_as_of(store_df: "pd.DataFrame", as_of_day: str,
 
 
 def screened_symbol_union(store_df: "pd.DataFrame", start_day: str, end_day: str,
-                          settings: Dict[str, Any]) -> List[str]:
+                          settings: Dict[str, Any],
+                          excluded_symbols: "Optional[Iterable[str]]" = None) -> List[str]:
     """Union of symbols ``settings`` can EVER select over a backtest window — the complete set of
     symbols the per-bar ``screen_universe_as_of`` gate can return for any bar in [start, end].
 
@@ -1441,6 +1452,7 @@ def screened_symbol_union(store_df: "pd.DataFrame", start_day: str, end_day: str
     60s sequential — this workload's Python-loop overhead dominates, so GIL contention from more
     threads only adds cost); this vectorized rewrite instead cuts the per-call cost directly, see
     ``testplatform/backend/tests/backtest`` for the equivalence test against the old logic.
+    ``excluded_symbols``: see ``screen_universe_for_day``.
     Returns sorted symbols (empty if the store has none).
     """
     dates = sorted({str(d) for d in store_df["date"].unique()})
@@ -1455,7 +1467,7 @@ def screened_symbol_union(store_df: "pd.DataFrame", start_day: str, end_day: str
     hi = _latest_scan_date_le(store_df, end_day)
     if hi is None:
         return []
-    d = _drop_excluded(store_df[(store_df["date"] >= lo) & (store_df["date"] <= hi)])
+    d = _drop_excluded(store_df[(store_df["date"] >= lo) & (store_df["date"] <= hi)], excluded_symbols)
     if d.empty:
         return []
 
