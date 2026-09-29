@@ -6,6 +6,11 @@ carries a screener_opt block (if any), plus two synthetic rows derived from the 
 `standalone_fallback` (no optimization link) and `unified_rules` (legacy trees converted to
 entryRules/exitRules). Re-run only when intentionally re-baselining.
 
+WARNING: the committed cases.json and goldens are SYNTHETIC (fake names, values and tickers).
+Run against a real DB copy, this captures real tuned settings, which are the product the site
+sells. Never commit that output. To re-baseline, edit the synthetic cases.json and regenerate
+the goldens with BA2_UPDATE_GOLDEN=1 via test_export_payload_golden.py.
+
 Usage (from testplatform/backend):
     ~/ba2-venvs/test/bin/python tests/fixtures/export_golden/make_cases.py /tmp/ba2-test-copy.db
 """
