@@ -39,6 +39,7 @@ Usage (test venv; FMP_API_KEY/DB_FILE in env):
         [--interval 5min] [--fitness calmar_ratio] [--include-no-data] [--dry-run]
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -154,7 +155,8 @@ def _completed_names() -> set:
         return set()
 
 
-def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suffix=""):
+def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suffix="",
+          strategy_plan=None):
     """Yield (name, expert, strategy_or_None, band) in priority order.
 
     ``skip_experts`` (a set of expert class names) drops those experts entirely — used to defer
@@ -169,6 +171,11 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
     completes before any other expert starts; then the remaining classic experts + FactorRanker run
     band-by-band. (FMPRating is the most general rating expert, so prioritising it surfaces its
     results first.)"""
+    def _strategies_for(expert):
+        # ``strategy_plan`` (expert class -> strategy list, see --strategy-plan) REPLACES the
+        # global list per expert; without a plan every expert runs ``strategies``.
+        return strategies if strategy_plan is None else strategy_plan[expert]
+
     def _eligible(band, expert):
         if expert in skip_experts:
             return False
@@ -181,7 +188,7 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
         for band in bands:
             if not _eligible(band, "FMPRating"):
                 continue
-            for s in strategies:
+            for s in _strategies_for("FMPRating"):
                 # ``_window_tag`` marks a data-floored expert in its own NAME, so a 2022-start
                 # FMPRating row can never be read as, or resumed as, a full-window "goal2020" run.
                 yield (f"scr-{band}-FMPRating-{s}{name_suffix}{_window_tag('FMPRating')}",
@@ -191,7 +198,7 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
         for expert in _CLASSIC:
             if expert == "FMPRating" or not _eligible(band, expert):
                 continue
-            for s in strategies:
+            for s in _strategies_for(expert):
                 if s in _TARGET_PRICE_STRATEGIES and expert not in _TARGET_PRICE_EXPERTS:
                     continue  # S4 needs a real analyst target; these experts have none
                 yield (f"scr-{band}-{expert}-{s}{name_suffix}", expert, s, band)
@@ -249,6 +256,39 @@ def _parse_stress_spread(spec: str) -> dict:
             raise SystemExit(f"--stress-spread-bps: {band}={val!r} is not a number")
     return {b: v for b, v in out.items() if v > 0}
 
+_KNOWN_STRATEGIES = {"S1", "S2", "S3", "S4", "S5", "S6", "S7"}
+
+
+def load_strategy_plan(path, skip_experts=frozenset()) -> dict:
+    """Read a --strategy-plan file: ``{"experts": {expert: [strategy, ...]}}``.
+
+    Refuses, rather than guesses: a classic expert that is not skipped and has no entry (it would
+    otherwise run nothing, or everything), an empty list, an unknown strategy key, a duplicate,
+    and an expert the driver does not know.
+    """
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    plan = doc["experts"]
+    unknown_experts = sorted(set(plan) - set(_CLASSIC) - {"FMPSenateTraderWeight"})
+    if unknown_experts:
+        raise SystemExit(f"--strategy-plan {path}: unknown expert(s) {unknown_experts}")
+    missing = [e for e in _CLASSIC if e not in skip_experts and e not in plan]
+    if missing:
+        raise SystemExit(f"--strategy-plan {path}: no strategy list for {missing}; add them or "
+                         f"--skip-experts them")
+    out = {}
+    for expert, strats in plan.items():
+        if not strats:
+            raise SystemExit(f"--strategy-plan {path}: {expert} has an empty strategy list; "
+                             f"--skip-experts it instead")
+        bad = sorted(set(strats) - _KNOWN_STRATEGIES)
+        if bad or len(set(strats)) != len(strats):
+            raise SystemExit(f"--strategy-plan {path}: {expert} has unknown or repeated "
+                             f"strategies {strats}")
+        out[expert] = list(strats)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bands", default="large,mid,small")
@@ -265,6 +305,16 @@ def main() -> int:
     ap.add_argument("--generations", type=int, default=8)
     ap.add_argument("--mutation-prob", type=float, default=None,
                     help="Per-gene mutation probability passthrough (default: launcher's 0.3).")
+    ap.add_argument("--strategy-plan", default=None,
+                    help="JSON file mapping each classic expert to its strategy list "
+                         "({\"experts\": {\"FMPRating\": [\"S1\", ...], ...}}, as written by "
+                         "tools/strategy_research/atr_grid/select_strategies.py). Replaces "
+                         "--strategies per expert; every classic expert that is not skipped must "
+                         "have an entry. FactorRanker is unaffected.")
+    ap.add_argument("--no-budget-overrides", action="store_true",
+                    help="Use --population/--generations exactly for every job: no FMPRating "
+                         "population bonus and no per-strategy override (S1 140, S7 60x8). For "
+                         "grids whose budget is set by a rule of their own (goal2027atr).")
     ap.add_argument("--early-stop", type=int, default=None,
                     help="GA early-stop patience passthrough (default: the launcher's own, 4). "
                          "Forwarded only when given, so existing grid commands are unchanged.")
@@ -388,9 +438,16 @@ def main() -> int:
         exe = os.path.join(os.path.dirname(sys.executable), "ba2-test")
 
     skip_experts = frozenset(e.strip() for e in args.skip_experts.split(",") if e.strip())
-    jobs = list(_jobs(bands, strategies, args.include_no_data, skip_experts, args.name_suffix))
+    strategy_plan = None
+    if args.strategy_plan:
+        strategy_plan = load_strategy_plan(args.strategy_plan, skip_experts)
+        print(f"strategy plan {args.strategy_plan}: "
+              + "; ".join(f"{e} {','.join(s)}" for e, s in sorted(strategy_plan.items())))
+    jobs = list(_jobs(bands, strategies, args.include_no_data, skip_experts, args.name_suffix,
+                      strategy_plan))
     done = _completed_names()
-    print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies={strategies}); "
+    print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies="
+          f"{'per --strategy-plan' if strategy_plan else strategies}); "
           f"{sum(1 for j in jobs if j[0] in done)} already completed.")
     if args.dry_run:
         for nm, exp, s, band in jobs:
@@ -412,6 +469,8 @@ def main() -> int:
         population = args.population + (args.fmp_population_bonus if expert == "FMPRating" else 0)
         generations = args.generations
         budget = _STRATEGY_BUDGET_OVERRIDE.get(strat)
+        if args.no_budget_overrides:
+            population, budget = args.population, None
         if budget:
             # A refinement strategy (e.g. S7) ignores the FMPRating bonus too -- it's a narrow
             # neighborhood search regardless of expert, not exploring the full space. An override
