@@ -4380,6 +4380,46 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     logger.error(f"No entry order found for transaction {transaction.id}")
                     return False
 
+                # WHICH ORDERS ARE EXIT LEGS -- review finding C1, 2026-09-29. This used to be
+                # "every non-terminal order but the first entry", which swept up whatever ELSE
+                # was working on the transaction: a FactorRanker rebalance's market SELL (trim)
+                # or BUY (add). The filled-entry path then cancelled that order at the broker
+                # (reversing a trim, killing an add), staged the new stop to wait for IT to be
+                # cancelled, and reported success. Only the position's OWN resting protection
+                # (TransactionHelper.is_resting_protection: OCO/OTO, broker legs, TP/SL-marked
+                # rows, never MARKET) is maintained here; every other working order is left
+                # exactly as it is -- it only changes the SIZE the protection must cover.
+                from ba2_common.core.TransactionHelper import TransactionHelper
+                from ba2_common.core.trade_store import orders_where
+                entry_filled = entry_order.status in OrderStatus.get_executed_statuses()
+                # The size the protection must cover once the working orders fill; None while
+                # the entry itself is unfilled (that path sizes on the entry order).
+                post_fill_qty = None
+                if entry_filled:
+                    txn_orders = orders_where(transaction_id=transaction.id)
+                    try:
+                        post_fill_qty = TransactionHelper.post_fill_position_quantity(
+                            transaction_in_session, entry_order.side, txn_orders)
+                    except ValueError as e:
+                        # An executed row with no filled_qty (legacy rows exist). With nothing
+                        # else working, the position is what it has always been sized as here
+                        # -- transaction.quantity -- so keep that, loudly. With an add, trim or
+                        # close in flight there is no way to know what the leg must cover:
+                        # refuse rather than guess.
+                        in_flight = [o for o in txn_orders
+                                     if o.status in (OrderStatus.get_unfilled_statuses()
+                                                     | OrderStatus.get_unsent_statuses())
+                                     and o.id != entry_order.id
+                                     and not TransactionHelper.is_resting_protection(o)]
+                        if in_flight:
+                            logger.error(
+                                f"Refusing TP/SL adjustment for transaction {transaction.id}: {e}, "
+                                f"and order(s) {[o.id for o in in_flight]} are still working")
+                            return False
+                        logger.error(
+                            f"Transaction {transaction.id}: {e}; sizing its exit on "
+                            f"transaction.quantity={transaction_in_session.quantity} as before")
+
                 # 3. Early skip check: if values unchanged and the existing exit orders already
                 # have the right STRUCTURE (OCO vs plain limit vs plain stop) and prices, skip.
                 tp_unchanged = (new_tp_price is None or
@@ -4405,6 +4445,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                             ])
                         )
                     ).all()
+                    valid_tpsl_orders = [o for o in valid_tpsl_orders
+                                         if TransactionHelper.is_resting_protection(o)]
 
                     if target_spec is None:
                         if not valid_tpsl_orders:
@@ -4428,6 +4470,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                                 logger.debug(f"Exit order {order.id} has SL={order.stop_price}, expected ${want_sl:.2f}")
                                 orders_match = False
                                 break
+                            # The right price on the wrong SIZE is not "unchanged": an add or a
+                            # trim moves the position the leg has to cover.
+                            if (post_fill_qty is not None and order.parent_order_id is None
+                                    and (order.quantity is None
+                                         or abs(float(order.quantity) - post_fill_qty) > 1e-9)):
+                                logger.debug(f"Exit order {order.id} covers {order.quantity}, "
+                                             f"position after working orders fill is {post_fill_qty}")
+                                orders_match = False
+                                break
 
                         if orders_match:
                             logger.info(f"Skipping TP/SL adjustment for transaction {transaction.id}: "
@@ -4445,14 +4496,20 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 session.add(transaction_in_session)
                 session.commit()
 
-                # 5. Find existing exit orders (everything non-terminal that isn't the entry)
-                all_orders = session.exec(
-                    select(TradingOrder).where(
-                        TradingOrder.transaction_id == transaction.id,
-                        TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
-                        TradingOrder.id != entry_order.id
-                    )
-                ).all()
+                # 5. Find the existing exit orders: the position's resting PROTECTION that is
+                # still working (see the C1 note above). Executed rows are excluded too -- a
+                # leg that already fired protects nothing and has nothing left to cancel.
+                all_orders = [
+                    o for o in session.exec(
+                        select(TradingOrder).where(
+                            TradingOrder.transaction_id == transaction.id,
+                            TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
+                            TradingOrder.id != entry_order.id
+                        )
+                    ).all()
+                    if o.status not in OrderStatus.get_executed_statuses()
+                    and TransactionHelper.is_resting_protection(o)
+                ]
 
                 # 6. Decide target structure from what's actually set (see _target_exit_spec):
                 # both -> OCO, TP-only -> plain limit, SL-only -> plain stop, neither -> no exit order.
@@ -4475,7 +4532,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 elif entry_order.status in OrderStatus.get_executed_statuses():
                     # Entry filled - work with broker
                     result = self._handle_filled_entry_exit(
-                        session, transaction_in_session, entry_order, spec, all_orders
+                        session, transaction_in_session, entry_order, spec, all_orders,
+                        quantity=post_fill_qty,
                     )
 
                 else:
@@ -5051,7 +5109,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         transaction: Transaction,
         entry_order: TradingOrder,
         spec: tuple | None,
-        all_orders: list
+        all_orders: list,
+        quantity: float | None = None,
     ) -> bool:
         """Handle TP/SL adjustment when entry is filled - maintain the target exit
         structure at the broker (OCO / plain limit / plain stop / none).
@@ -5062,7 +5121,16 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         new order in WAITING_TRIGGER state linked to the cancellation of the
         outgoing order — TradeManager will submit it on the next refresh once
         the parent reaches CANCELED.
+
+        ``all_orders`` holds the position's resting PROTECTION only -- never an add, trim or
+        close working on the same transaction (review finding C1): nothing else is cancelled
+        here and nothing is chained on anything else. ``quantity`` is the position once those
+        working orders fill (``TransactionHelper.post_fill_position_quantity``), which is what
+        the replacement covers; ``transaction.quantity`` (gross entry size) only when a caller
+        gives none. Returns False -- never a hollow True -- when the replacement cannot be
+        staged: nothing left to protect, or a protection cancel the broker did not accept.
         """
+        order_quantity = transaction.quantity if quantity is None else quantity
         spec_desc = f"{spec[0].value} TP={spec[1]} SL={spec[2]}" if spec else "none"
         logger.info(f"[Exit] Adjusting broker exit order for filled entry {entry_order.id} "
                     f"(transaction {transaction.id}): target {spec_desc}")
@@ -5097,14 +5165,25 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         order_type, tp_price, sl_price, label = spec
 
+        if not order_quantity or order_quantity <= 0:
+            # A full exit is working (or done): there is nothing left to protect, and a stop
+            # placed now would reserve the very shares the exit needs.
+            logger.error(
+                f"Not placing a {order_type.value} exit for transaction {transaction.id}: the "
+                f"position is {order_quantity} once its working orders fill -- nothing to protect")
+            return False
+
         # 3. No live broker order — straight path, submit immediately
         if not live_broker_orders:
             if order_type == CoreOrderType.OCO:
-                return self._create_broker_oco_order(session, transaction, entry_order, tp_price, sl_price)
+                return self._create_broker_oco_order(session, transaction, entry_order, tp_price,
+                                                     sl_price, quantity=order_quantity)
             elif tp_price:
-                return self._create_broker_tp_order(session, transaction, entry_order, tp_price)
+                return self._create_broker_tp_order(session, transaction, entry_order, tp_price,
+                                                    quantity=order_quantity)
             else:
-                return self._create_broker_sl_order(session, transaction, entry_order, sl_price)
+                return self._create_broker_sl_order(session, transaction, entry_order, sl_price,
+                                                    quantity=order_quantity)
 
         # 4. Live broker order(s) — chain the new exit order behind the cancellation
         #    of the most recent (highest-id) live order, then cancel all live
@@ -5112,11 +5191,6 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         #    the new order once that parent reaches CANCELED.
         live_broker_orders.sort(key=lambda o: o.id, reverse=True)
         parent_for_trigger = live_broker_orders[0]
-
-        order_quantity = transaction.quantity
-        if not order_quantity or order_quantity <= 0:
-            logger.error(f"Cannot stage replacement exit order for transaction {transaction.id}: invalid quantity {order_quantity}")
-            return False
 
         waiting_exit = self._build_exit_order(
             transaction, entry_order, spec,
@@ -5133,13 +5207,30 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             f"reaches CANCELED at broker"
         )
 
-        # Submit cancel to broker for ALL live orders
+        # Submit cancel to broker for ALL live protection legs. A cancel the broker does not
+        # accept is a FAILURE: the staged replacement waits on it and would never go live.
+        failed = []
         for order in live_broker_orders:
             try:
-                self.cancel_order(order.id)
+                ok = self.cancel_order(order.id)
+            except Exception as e:  # noqa: BLE001 -- reported below
+                ok = False
+                logger.error(f"Failed to cancel broker order {order.id}: {e}", exc_info=True)
+            if ok:
                 logger.info(f"Submitted cancel for broker order {order.id} (broker_id={order.broker_order_id})")
-            except Exception as e:
-                logger.warning(f"Failed to cancel broker order {order.id}: {e}")
+            else:
+                failed.append(order.id)
+        if failed:
+            withdrawn = parent_for_trigger.id in failed
+            if withdrawn:
+                waiting_exit.status = OrderStatus.CANCELED
+                session.add(waiting_exit)
+                session.commit()
+            logger.error(
+                f"Exit replacement for transaction {transaction.id} NOT complete: the broker did "
+                f"not accept the cancel of protective order(s) {failed}"
+                + (f"; staged order {waiting_exit.id} withdrawn" if withdrawn else ""))
+            return False
 
         return True
 
@@ -5165,11 +5256,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return 0.0
         return ((tp_price - entry_order.open_price) / entry_order.open_price) * 100
     
-    def _create_broker_tp_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float) -> bool:
+    def _create_broker_tp_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float,
+                                quantity: float | None = None) -> bool:
         """Create new TP order at broker using OCO (both TP+SL) or simple limit order (TP only)"""
         try:
-            # Use transaction.quantity as source of truth (handles partial closes)
-            order_quantity = transaction.quantity
+            # ``quantity``: the post-fill position from _handle_filled_entry_exit; else the
+            # transaction's quantity (the historical source).
+            order_quantity = transaction.quantity if quantity is None else quantity
             if not order_quantity or order_quantity <= 0:
                 logger.error(f"Cannot create TP order for transaction {transaction.id}: transaction has invalid quantity {order_quantity}")
                 return False
@@ -5482,7 +5575,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             created_at=datetime.now(timezone.utc)
         )
 
-    def _create_broker_oco_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float, sl_price: float) -> bool:
+    def _create_broker_oco_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float, sl_price: float,
+                                 quantity: float | None = None) -> bool:
         """Create new OCO order at broker with both TP and SL."""
         try:
             # Validate TP/SL prices before creating OCO order
@@ -5493,9 +5587,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 logger.error(f"Cannot create broker OCO order for transaction {transaction.id}: invalid stop_loss {sl_price}")
                 return False
             
-            # Use transaction.quantity as source of truth (handles partial closes)
-            # This is the current position size that needs TP/SL protection
-            order_quantity = transaction.quantity
+            # ``quantity``: the post-fill position from _handle_filled_entry_exit; else the
+            # transaction's quantity (the historical source).
+            order_quantity = transaction.quantity if quantity is None else quantity
             if not order_quantity or order_quantity <= 0:
                 logger.error(f"Cannot create OCO order for transaction {transaction.id}: transaction has invalid quantity {order_quantity}")
                 return False
@@ -5548,11 +5642,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             logger.error(f"Error creating broker OCO order: {e}", exc_info=True)
             return False
     
-    def _create_broker_sl_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, sl_price: float) -> bool:
+    def _create_broker_sl_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, sl_price: float,
+                                quantity: float | None = None) -> bool:
         """Create new SL order at broker using OCO (both TP+SL) or simple stop order (SL only)"""
         try:
-            # Use transaction.quantity as source of truth (handles partial closes)
-            order_quantity = transaction.quantity
+            # ``quantity``: the post-fill position from _handle_filled_entry_exit; else the
+            # transaction's quantity (the historical source).
+            order_quantity = transaction.quantity if quantity is None else quantity
             if not order_quantity or order_quantity <= 0:
                 logger.error(f"Cannot create SL order for transaction {transaction.id}: transaction has invalid quantity {order_quantity}")
                 return False

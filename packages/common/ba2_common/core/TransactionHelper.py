@@ -389,6 +389,56 @@ class TransactionHelper:
         return bool(order.comment) and _PROTECTIVE_COMMENT_RE.search(order.comment) is not None
 
     @staticmethod
+    def post_fill_position_quantity(transaction: Transaction, entry_side: OrderDirection,
+                                    orders: List[TradingOrder]) -> float:
+        """The position this transaction will hold once its WORKING non-protection orders fill.
+
+        What a protective exit must cover. ``transaction.quantity`` is not it: that is the sum
+        of the entry-side orders ever sent (``_recalculate_transaction_quantity``), so a trim
+        never lowers it, and an add raises it before the add has filled. This is:
+
+            net filled quantity (every executed order, BUY +, SELL -)
+          + the unfilled remainder of every working order that is NOT resting protection
+            (an add, a trim, a close someone submitted), signed the same way
+
+        expressed in the direction of the position (a long is positive, and so is a short's
+        size). Protection is excluded because it does not move the position until it fires,
+        and a triggered leg is already in the executed sum.
+
+        RAISES ``ValueError`` when an executed order carries no ``filled_qty``: the size is
+        then unmeasurable, and a stop sized on a guess reserves the wrong number of shares.
+
+        ``orders``: the transaction's orders (any status).
+        """
+        executed = OrderStatus.get_executed_statuses()
+        working = (OrderStatus.get_unfilled_statuses() | OrderStatus.get_unsent_statuses()
+                   | {OrderStatus.PARTIALLY_FILLED})
+        net = 0.0
+        for order in orders:
+            sign = 1.0 if order.side == OrderDirection.BUY else -1.0
+            if order.status in executed:
+                if order.filled_qty is None:
+                    raise ValueError(
+                        f"transaction {transaction.id}: order {order.id} is {order.status} with "
+                        f"no filled_qty -- the position size is unmeasurable")
+                net += sign * float(order.filled_qty)
+            if order.status in working and not TransactionHelper.is_resting_protection(order):
+                if order.quantity is None or (order.status == OrderStatus.PARTIALLY_FILLED
+                                              and order.filled_qty is None):
+                    raise ValueError(
+                        f"transaction {transaction.id}: working order {order.id} "
+                        f"({order.status}) has quantity={order.quantity}, "
+                        f"filled_qty={order.filled_qty} -- the position size is unmeasurable")
+                # An order that has not started filling carries no filled_qty: all of it is
+                # still to come.
+                remaining = float(order.quantity)
+                if order.filled_qty is not None:
+                    remaining -= float(order.filled_qty)
+                if remaining > 0:
+                    net += sign * remaining
+        return net if entry_side == OrderDirection.BUY else -net
+
+    @staticmethod
     def tpsl_comment(kind: str, account_id: Optional[int], transaction_id: Optional[int],
                      parent_order_id: Optional[int], note: Optional[str] = None) -> str:
         """The comment every TP/SL writer stamps: ``<ts>-<kind>-[ACC:a/TR:t/PORD:p]``.
