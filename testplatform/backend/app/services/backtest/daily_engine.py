@@ -140,8 +140,16 @@ def _screened_symbols_for_bar(
     for every bar in that period via ``cache`` (the engine passes its per-run dict). Without the
     cache (e.g. unit tests) it still returns the correct set, just recomputed each call.
 
-    ``screener_runtime`` = ``{"store": <metric-store dir>, "settings": {screener thresholds}}``;
-    the store is memoised per worker by ``load_store``.
+    ``screener_runtime`` = ``{"store": <metric-store dir>, "settings": {screener thresholds}
+    [, "excluded_symbols": [...]]}``; the store is memoised per worker by ``load_store``.
+    ``excluded_symbols`` (optional) is the launcher's per-run ``--exclude-symbols`` list
+    (``backtest_cfg['excluded_instruments']``, threaded here by
+    ``strategy_optimization_handler._build_daily_trial_config``) — a defence-in-depth filter on
+    the CLASSIC per-bar gate. The engine's own ``entry_universe`` is already intersected with
+    ``resolve_universe`` (config['enabled_instruments'], which the launcher already excludes
+    from), so for a classic (non-bypass) expert this is redundant with that intersection; it is
+    threaded through anyway so this gate is never the one place an excluded symbol could slip
+    back in if the two paths ever diverge.
     """
     if not screener_runtime:
         return None
@@ -156,7 +164,8 @@ def _screened_symbols_for_bar(
     day = days[i]
     if cache is not None and day in cache:
         return cache[day]
-    syms = ms.screen_universe_for_day(df, day, screener_runtime["settings"])
+    syms = ms.screen_universe_for_day(df, day, screener_runtime["settings"],
+                                      screener_runtime.get("excluded_symbols"))
     if cache is not None:
         cache[day] = syms
     return syms

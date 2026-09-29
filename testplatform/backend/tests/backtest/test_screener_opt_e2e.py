@@ -32,3 +32,26 @@ def test_screened_symbols_for_bar_is_none_without_screener():
     # No screener_runtime -> None (the gate is a no-op; existing runs unchanged).
     assert _screened_symbols_for_bar(None, dt.datetime(2023, 3, 1)) is None
     assert _screened_symbols_for_bar({}, dt.datetime(2023, 3, 1)) is None
+
+
+def test_screened_symbols_for_bar_never_selects_an_excluded_symbol(tmp_path):
+    """goal2027atr split-basis fix: the KEY test. BBB passes every numeric gate (it would be
+    selected on its store values, exactly like a split-basis-defective symbol passes on its
+    corrupted market cap) -- ``excluded_symbols`` on ``screener_runtime`` must still remove it
+    from the day's allowed-to-enter set."""
+    from ba2_providers.screener import metric_store as ms
+    import pandas as pd
+
+    store = str(tmp_path / "s")
+    ms.write_partitions(store, pd.DataFrame({
+        "symbol": ["AAA", "BBB"], "date": ["2023-03-01", "2023-03-01"], "close": [10, 20.0],
+        "market_cap": [5e9, 8e9], "relative_volume": [2.0, 2.0], "price_drop_pct": [20.0, 20.0],
+        "sector": ["T", "T"], "volume": [2e6, 2e6], "price": [10, 20.0]}))
+    rt = {"store": store, "settings": {"market_cap_min": 1e9, "max_stocks": 5},
+         "excluded_symbols": ["BBB"]}
+    got = _screened_symbols_for_bar(rt, dt.datetime(2023, 3, 1))
+    assert got == ["AAA"]               # BBB would otherwise pass (8e9 >= 1e9 cap)
+
+    # Absent/empty -> unchanged (both survive; byte-identical to before this key existed).
+    rt_no_excl = {"store": store, "settings": {"market_cap_min": 1e9, "max_stocks": 5}}
+    assert set(_screened_symbols_for_bar(rt_no_excl, dt.datetime(2023, 3, 1))) == {"AAA", "BBB"}

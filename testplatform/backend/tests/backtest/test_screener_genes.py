@@ -147,3 +147,134 @@ def test_trial_config_gate_only_keeps_static_universe(tmp_path):
     assert hoisted2["screener_gate_only"] is False
     cfg2 = H._build_daily_trial_config(backtest_cfg, decoded, hoisted2, option_trade_records=False)
     assert cfg2["enabled_instruments"] == []
+
+
+def test_excluded_instruments_thread_into_screener_runtime_and_candidate_bound(tmp_path):
+    """goal2027atr split-basis fix: ``backtest_cfg['excluded_instruments']`` (persisted by
+    ba2test_launcher._apply_exclude_symbols from --exclude-symbols) is carried onto every
+    trial's ``screener_runtime['excluded_symbols']`` (the classic per-bar gate) AND applied
+    to the candidate-bound union (defence in depth on top of the enabled_instruments
+    intersection the launcher already performs)."""
+    import pandas as pd
+    from ba2_providers.screener import metric_store as ms
+
+    store = str(tmp_path / "s2")
+    ms.write_partitions(store, pd.DataFrame({
+        "symbol": ["AAA", "BBB"], "date": ["2023-01-31", "2023-01-31"], "close": [10.0, 20.0],
+        "market_cap": [3e9, 4e9], "relative_volume": [1.6, 1.6], "price_drop_pct": [20.0, 20.0],
+        "sector": ["T", "T"], "volume": [2e6, 2e6], "price": [10.0, 20.0]}))
+    ms.clear_store_memo()
+
+    backtest_cfg = {
+        "backtest_id": 100,
+        "start_date": "2023-01-02",
+        "end_date": "2023-02-28",
+        # NOTE: still carries BBB here -- proving the trial-config layer excludes it too, not
+        # only relying on the launcher having already reduced enabled_instruments upstream.
+        "enabled_instruments": ["AAA", "BBB"],
+        "experts": [{"class": "FMPRating", "settings": {}}],
+        "initial_capital": 100000.0,
+        "account_settings": {"starting_cash": 100000.0},
+        "warmup_days": 30,
+        "seed": 7,
+        "screener_opt": {
+            "store": store,
+            "base_settings": {"screener_relative_volume_min": 1.0, "screener_max_stocks": 10},
+            "cadence_days": 7,
+        },
+        "excluded_instruments": ["BBB"],
+    }
+    hoisted = H._build_hoisted_state(backtest_cfg)
+    decoded = {
+        "tp": 5.0, "sl": 5.0, "expert_overrides": {}, "screener_overrides": {},
+        "buy_tree": None, "sell_tree": None, "exit_rules": [],
+    }
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, hoisted, option_trade_records=False)
+
+    assert cfg["screener_runtime"]["excluded_symbols"] == ["BBB"]
+    # BBB is dropped from the candidate-bound loaded universe even though it is still present in
+    # backtest_cfg['enabled_instruments'] and passes every screener threshold.
+    assert cfg["enabled_instruments"] == ["AAA"]
+
+
+def test_excluded_instruments_absent_leaves_screener_runtime_unchanged(tmp_path):
+    import pandas as pd
+    from ba2_providers.screener import metric_store as ms
+
+    store = str(tmp_path / "s3")
+    ms.write_partitions(store, pd.DataFrame({
+        "symbol": ["AAA"], "date": ["2023-01-31"], "close": [10.0],
+        "market_cap": [3e9], "relative_volume": [1.6], "price_drop_pct": [20.0],
+        "sector": ["T"], "volume": [2e6], "price": [10.0]}))
+    ms.clear_store_memo()
+
+    backtest_cfg = {
+        "backtest_id": 101,
+        "start_date": "2023-01-02",
+        "end_date": "2023-02-28",
+        "enabled_instruments": ["AAA"],
+        "experts": [{"class": "FMPRating", "settings": {}}],
+        "initial_capital": 100000.0,
+        "account_settings": {"starting_cash": 100000.0},
+        "warmup_days": 30,
+        "seed": 7,
+        "screener_opt": {"store": store, "base_settings": {}, "cadence_days": 7},
+    }
+    hoisted = H._build_hoisted_state(backtest_cfg)
+    decoded = {
+        "tp": 5.0, "sl": 5.0, "expert_overrides": {}, "screener_overrides": {},
+        "buy_tree": None, "sell_tree": None, "exit_rules": [],
+    }
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, hoisted, option_trade_records=False)
+    assert cfg["screener_runtime"]["excluded_symbols"] == []
+    assert cfg["enabled_instruments"] == ["AAA"]
+
+
+def test_excluded_instruments_pushed_onto_a_bypass_experts_own_settings(tmp_path):
+    """FactorRanker (bypass) resolves its screener-mode universe straight off the metric
+    store -- NOT off enabled_instruments -- so the exclusion must reach its OWN per-trial
+    settings dict (``excluded_symbols``), not just screener_runtime."""
+    import pandas as pd
+    from ba2_providers.screener import metric_store as ms
+
+    store = str(tmp_path / "s4")
+    ms.write_partitions(store, pd.DataFrame({
+        "symbol": ["AAA", "BBB"], "date": ["2023-01-31", "2023-01-31"], "close": [10.0, 20.0],
+        "market_cap": [3e9, 4e9], "relative_volume": [1.6, 1.6], "price_drop_pct": [20.0, 20.0],
+        "sector": ["T", "T"], "volume": [2e6, 2e6], "price": [10.0, 20.0]}))
+    ms.clear_store_memo()
+
+    backtest_cfg = {
+        "backtest_id": 102,
+        "start_date": "2023-01-02",
+        "end_date": "2023-02-28",
+        "enabled_instruments": ["AAA", "BBB"],
+        "experts": [{"class": "FactorRanker", "settings": {}}],
+        "initial_capital": 100000.0,
+        "account_settings": {"starting_cash": 100000.0},
+        "warmup_days": 30,
+        "seed": 7,
+        "screener_opt": {
+            "store": store, "base_settings": {}, "cadence_days": 7,
+            "apply_to_expert_settings": True,
+        },
+        "excluded_instruments": ["BBB"],
+    }
+    hoisted = H._build_hoisted_state(backtest_cfg)
+    assert hoisted["screener_apply_to_expert_settings"] is True
+    decoded = {
+        "tp": 5.0, "sl": 5.0, "expert_overrides": {}, "screener_overrides": {},
+        "buy_tree": None, "sell_tree": None, "exit_rules": [],
+    }
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, hoisted, option_trade_records=False)
+    assert cfg["experts"][0]["settings"]["excluded_symbols"] == ["BBB"]
+    assert cfg["experts"][0]["settings"]["universe_source"] == "screener"
+
+    # Absent excluded_instruments -> the key is not pushed at all (byte-identical settings dict
+    # to before this feature existed).
+    plain_cfg = dict(backtest_cfg)
+    del plain_cfg["excluded_instruments"]
+    plain_hoisted = H._build_hoisted_state(plain_cfg)
+    plain_trial = H._build_daily_trial_config(plain_cfg, decoded, plain_hoisted,
+                                              option_trade_records=False)
+    assert "excluded_symbols" not in plain_trial["experts"][0]["settings"]

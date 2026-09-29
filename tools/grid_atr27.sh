@@ -106,6 +106,11 @@ COMMON=(--start "$START" --end "$END" --fitness "$FITNESS" --store "$STORE" --in
         --early-stop "$EARLY_STOP" --early-stop-min-rel "$EARLY_STOP_MIN_REL"
         --robust-fitness --parallel "$PARALLEL")
 [ -n "$WORKERS" ] && COMMON+=(--workers "$WORKERS")
+# S1-S7 phases ONLY (treatment and all-off control alike): IAC's FMP spin-off split-basis drift
+# fails the market-condition coverage check for every gated job
+# (docs/strategy_research/atr_grid/excluded_symbols.txt). NOT for FactorRanker: it uses no
+# market-condition data and runs on the full universe (operator 2026-09-29).
+S17_EXCLUDE=(--exclude-symbols "@docs/strategy_research/atr_grid/excluded_symbols.txt")
 
 run_bands() {                      # $1=name-suffix  $2...=extra driver args
   local suffix="$1"; shift
