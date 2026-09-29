@@ -4,8 +4,8 @@
 # PHASES (PHASE=...):
 #   fr   FactorRanker, one job per cap band (large, mid, small). FactorRanker bypasses the classic
 #        RM, so ATR, market gates and market exits do not apply to it (design §4.1). Runnable now.
-#   (the S1/S2/S5/S6 ATR + market-condition lanes are added once the ATR policy (§3.2) and the
-#    S1-S7 market-condition wiring (§5) land; the launcher refuses them today.)
+#   atr  The S1-S7 lane (per-expert strategy plan, ATR searched, market conditions togglable via
+#        the market:enabled master gene; 28 equity jobs). Senate is a separate lane.
 #
 # WINDOW: 2020-01-01 -> 2025-12-31, fit on six clean calendar years; 2026-H1 is the out-of-sample
 # holdout (operator decision 2026-09-29, design D1). Same reasoning as grid_goal2020.sh's header.
@@ -135,8 +135,23 @@ case "$PHASE" in
         --skip-experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,DeterministicScorer,FMPSenateTraderWeight \
         --population 56 --generations 25
     ;;
+  atr)
+    # The S1-S7 ATR + market-condition lane: ONE GA per (expert, band, strategy) cell, no all-off
+    # control GA (operator 2026-09-29). Market conditions are togglable by the GA through the
+    # master gene market:enabled, ATR through use_atr_stop; winners are ablated afterwards with
+    # tools/strategy_research/atr_grid/ablate_market.py.
+    #   * strategies per expert: docs/strategy_research/atr_grid/strategy_plan.json (28 equity
+    #     jobs; Senate runs as its own lane -- it needs its own snapshot and driver flags);
+    #   * budget: every job has > 30 genes -> population 120, 30 generations (design §7),
+    #     identical for every job (--no-budget-overrides);
+    #   * sizing risk_atr only (D2); ATR searched (--rm-toggle-policy atr-searched);
+    #   * snapshots pinned below (2,045 of 2,046 symbols; IAC excluded, see S17_EXCLUDE).
+    MC_OHLCV="${MC_OHLCV:-d979c9bc59fcee65230c80f9aa4565c3dbd454db506324c38375c799ae868f5e}"
+    MC_TA="${MC_TA:-97c7bc8c13b2838633769a2723dace9469100d3f16431009f1705f06a0f501e3}"
+    run_bands "${ATR_SUFFIX:--atr27-riskatr}"         --skip-experts FactorRanker         --strategy-plan docs/strategy_research/atr_grid/strategy_plan.json         --no-budget-overrides --population 120 --generations 30         --sizing-mode risk_atr --rm-toggle-policy atr-searched         --market-condition-profile ohlcv-v1,ta-structure-v1         --market-condition-manifest "ohlcv-v1=${MC_OHLCV},ta-structure-v1=${MC_TA}"         --market-exit exit,stop,tp --search-sl-loosen         "${S17_EXCLUDE[@]}"
+    ;;
   *)
-    echo "FATAL: unknown PHASE=$PHASE (known: fr)"; exit 2 ;;
+    echo "FATAL: unknown PHASE=$PHASE (known: fr, atr)"; exit 2 ;;
 esac
 
 echo; echo "=== goal2027atr phase=$PHASE COMPLETE $(date)"
