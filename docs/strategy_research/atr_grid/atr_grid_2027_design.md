@@ -144,17 +144,18 @@ From `s1_s7_relevance.md`:
   - DeterministicScorer: large, mid and small.
   - FMPSenateTraderWeight: one universe.
   - That makes 11 expert-bands.
-- **FactorRanker is re-run, as its own lane** (operator decision, 2026-09-28; this reverses the draft's exclusion). It is **blocked until the FactorRanker equity-sizing fix merges**; see §4.1.
+- **FactorRanker is re-run, as its own lane** (operator decision, 2026-09-28; this reverses the draft's exclusion). Its prerequisite, the FactorRanker equity-sizing fix, merged on 2026-09-29; see §4.1.
 - **Job count:** 11 expert-bands × 4 strategies − 2 (ICB S2) = **42 treatment jobs**. See §6 for controls. The FactorRanker jobs (§4.1) are counted and costed separately.
 
 ### 4.1 FactorRanker
 
-- **Prerequisite, blocking: FactorRanker cells must not launch until the equity-sizing fix is merged.** Every past FactorRanker backtest is distorted, **including the goal2020 FactorRanker cells**:
+- **Prerequisite (met 2026-09-29): the equity-sizing fix, merged to dev at d5a4515e (APP 1210 / TEST 0108).** Every FactorRanker backtest before it is distorted, **including the goal2020 FactorRanker cells**:
   - in backtests the rebalance sized against CASH only (`BacktestAccount.get_balance`), where live sizes against equity, so every other rebalance sold the whole book and the next one bought it back;
   - re-pricing the stop after a resize also failed silently.
-  - Past FactorRanker results are therefore unreliable, and nothing in this grid may be compared with them or seeded from them. The fix is in progress on the BT session's branch `feat/factorranker-weighting-gene` (223b5ca9, not merged at the time of writing).
+  - The fix sizes the rebalance on equity (`get_tradable_equity` / `get_virtual_equity`) and drops the post-rebalance stop re-price. An add prices its stop on the new position, a trim keeps its stop and an exit releases it. An add whose rule stop is at or above market raises `ProtectiveStopError` after the other names are processed.
+  - The distorted backtests are labelled `stale-fr-cash-rebalance`: 1064-1068, 1143-1147, 1265-1269, 1403, 1404. Nothing in this grid may be compared with them or seeded from them. (Backtests 1065 and 1146 re-run to the same numbers on the fixed code.)
 - **Why it is back:** FactorRanker gains a `weighting` choice that goal2020 never searched. Commit 7c270156 added `"rank"` (weight linear in rank, still capped by `max_weight_per_name`) beside `"equal"` (1/N) and `"score"` (proportional to the composite score); the default stays `"equal"`.
-- **The gene** (same branch): `model:weighting`, a categorical gene index-encoded like FMPRating's `target_price_type`, declared as `_EXPERT_OPT["FactorRanker"]["expert_params"]["weighting"] = {"optimize": True, "type": "choice", "choices": ["equal", "score", "rank"]}`. The GA searches all **three** weightings; `"weighting": "equal"` leaves the launcher's fixed settings.
+- **The gene** (merged in the same push, 5cbad64d): `model:weighting`, a categorical gene index-encoded like FMPRating's `target_price_type`, declared as `_EXPERT_OPT["FactorRanker"]["expert_params"]["weighting"] = {"optimize": True, "type": "choice", "choices": ["equal", "score", "rank"]}`. The GA searches all **three** weightings; `"weighting": "equal"` leaves the launcher's fixed settings.
 - **Job identity:** the gene changes the FactorRanker search space, so an old FactorRanker checkpoint does not match, and the launcher skips completed job NAMES. The new FactorRanker cells need new names (or `--rerun`), and must never pick up an old completed row.
 - **What it does not share with the classic jobs:** it bypasses the classic RM (`bypasses_classic_rm`), so the optimizer drops the rule, TP/SL, condition and exit genes and searches only the expert's own `model:*` genes. ATR, the market entry gates, the market exits and `allow_ruleset_sl_loosen` therefore do not apply, and there is no all-off control arm: the treatment and the control would be the same job.
 - **Budget:** the §7 rule, from its own gene count. That is far below the classic jobs' 60–91 genes, so its population is well under the 120 cap and a job records far fewer trials. It is not in the §7.2 totals.
