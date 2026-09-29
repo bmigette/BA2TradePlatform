@@ -711,11 +711,52 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
 
         RAISES ``ValueError`` when the equity is unpublished or non-finite: unknown is never
         zero and never the cash figure.
+
+        RESILIENCE, compared with ``get_balance`` (review 2026-09-29). Alpaca's ``get_balance``
+        retries a failed read once after 10 s and then serves its last cached figure. A failed
+        snapshot read publishes no equity (Alpaca returns an all-None snapshot and does not
+        cache it), so this gives the broker the SAME second chance -- one re-read after
+        ``_EQUITY_RETRY_DELAY_S`` -- but deliberately NOT the stale-cache fallback: this figure
+        sizes a whole target book, and a book sized on a number the broker no longer confirms
+        is the fabricated value the platform refuses ("no fallbacks for balances"). A read that
+        fails twice raises; the rebalance then fails loudly and can be re-run. A NON-FINITE
+        equity is not retried: that is a figure the broker did publish, and it is wrong.
         """
         if not self._margin_enabled():
-            return self._finite_equity(self.get_account_snapshot())
-        capital = self._stock_capital_from_snapshot()
+            snapshot = self.get_account_snapshot()
+            if self._equity_unpublished(snapshot):
+                self._wait_before_equity_retry()
+                snapshot = self.get_account_snapshot()
+            return self._finite_equity(snapshot)
+        # Margin on: a failed read also leaves the multiplier/buying power unpublished, which
+        # the capital reader refuses (ValueError) before the equity is even looked at. Either
+        # way it is the same failed read and gets the same single retry; the retry's own
+        # refusal propagates.
+        try:
+            capital = self._stock_capital_from_snapshot()
+            failed = self._equity_unpublished(capital.snapshot)
+        except ValueError as e:
+            logger.warning(f"account {self.id} ({type(self).__name__}): stock capital "
+                           f"unreadable ({e})")
+            failed = True
+        if failed:
+            self._wait_before_equity_retry()
+            capital = self._stock_capital_from_snapshot()
         return self._finite_equity(capital.snapshot) * capital.effective_factor
+
+    #: Seconds ``get_tradable_equity`` waits before re-reading a snapshot that published no
+    #: equity -- the same pause ``AlpacaAccount.get_balance`` takes before its one retry.
+    _EQUITY_RETRY_DELAY_S = 10.0
+
+    @staticmethod
+    def _equity_unpublished(snapshot: AccountSnapshot) -> bool:
+        return snapshot is None or snapshot.equity is None
+
+    def _wait_before_equity_retry(self) -> None:
+        logger.warning(
+            f"account {self.id} ({type(self).__name__}): the account snapshot published no "
+            f"equity; re-reading once in {self._EQUITY_RETRY_DELAY_S:.0f}s")
+        time.sleep(self._EQUITY_RETRY_DELAY_S)
 
     def _finite_equity(self, snapshot: AccountSnapshot) -> float:
         equity = None if snapshot is None else snapshot.equity

@@ -31,12 +31,16 @@ from ba2_common.logger import logger
 _OpenedTxn = namedtuple("_OpenedTxn", ["id", "open_price", "open_qty"])
 
 
-class ProtectiveStopResyncError(RuntimeError):
-    """A held name's resting stop could not be re-priced after a rebalance resized it.
+class ProtectiveStopError(RuntimeError):
+    """A rebalance could not give a name the protective stop its rule asks for.
 
-    RAISED, never logged-and-continued: the position keeps a stop encoding a rule that no
-    longer holds (wrong quantity, wrong budget), which is an unprotected trade in all but
-    name. The backtest engine lets this through instead of swallowing it as a bad bar.
+    Today: an ADD whose stop -- priced by the rule on the position the add would create --
+    sits at or above the current price. Placing it would put a sell stop above market (it
+    fires at once, or the broker refuses it); buying more of a name already past its loss
+    budget is not what the rule means either. The add is refused and the rebalance finishes
+    the other names, then raises this naming every refused one. RAISED, never logged and
+    continued; the backtest engine lets it through instead of treating it as a bad bar, and
+    the live analysis fails with it (``FactorRanker.run_analysis`` re-raises).
     """
 
 
@@ -288,26 +292,45 @@ class FactorPortfolioManager:
         deltas = rebalance_deltas(target_weights, held, prices, equity,
                                   quantity_units=quantity_units)
 
+        # WHERE THE STOP IS MAINTAINED -- at the order that changes the position, never in a
+        # pass afterwards (review I1, 2026-09-29):
+        #   * ADD / new name: ``_submit_buy`` prices the stop by the rule on the position the
+        #     buy CREATES (held + added, at the blended cost, on this rebalance's equity) and
+        #     attaches it through submit_order(sl_price) -> adjust_sl, which sizes the leg on
+        #     the post-fill position (AlpacaAccount; the backtest keeps it on the transaction);
+        #   * TRIM: ``_reprotect_remainder`` resizes the released leg over what is left and
+        #     KEEPS its price, by design (a reduce must not move a stop the strategy already
+        #     chose -- see its docstring);
+        #   * EXIT: the leg is released and nothing is left to protect.
+        # A post-rebalance re-price pass used to sit here. It ran on the PRE-rebalance
+        # quantities (overwriting the add's correct stop, re-pricing trims against their
+        # documented choice), and on Alpaca its adjust_sl swept up this rebalance's own
+        # SELL/BUY as exit legs (C1). It had also never once succeeded, in either runtime, so
+        # removing it changes no result that was ever produced.
         submitted: List[TradingOrder] = []
+        refused: List[str] = []
         for sym, delta in deltas.items():
             # ``int`` on the whole-share grid, exactly as before -- it truncates toward zero,
             # which a sub-share residue on a whole-grid symbol has always relied on. A
             # fractional delta is already on its grid and passes through unchanged.
             unit = quantity_units.get(sym, WHOLE_SHARE)
             qty = int(delta) if is_whole_grid(unit) else delta
-            order = self._submit_delta(sym, qty, by_symbol.get(sym, []))
+            try:
+                order = self._submit_delta(sym, qty, by_symbol.get(sym, []))
+            except ProtectiveStopError as e:
+                refused.append(str(e))
+                continue
             if order is not None:
                 submitted.append(order)
 
-        # The stop price is a function of avg entry cost, held qty AND equity — a rebalance moves
-        # all three, so a stop priced at the original entry goes stale the moment a name is added
-        # to or trimmed. Re-price the survivors here, the same way every other expert's stop is
-        # maintained (adjust_sl), so the resting order keeps encoding the CURRENT rule.
-        self._resync_protective_stops(by_symbol, changed={s for s, d in deltas.items() if d})
         logger.info(
             f"FactorRanker[{self.expert_instance_id}]: rebalance submitted {len(submitted)} orders "
             f"(equity={equity:.2f}, deltas={deltas})"
         )
+        if refused:
+            raise ProtectiveStopError(
+                f"FactorRanker[{self.expert_instance_id}]: rebalance refused {len(refused)} "
+                f"add(s) (the other {len(submitted)} order(s) stand): " + "; ".join(refused))
         return submitted
 
     def _quantity_units(self, symbols) -> Dict[str, float]:
@@ -378,45 +401,6 @@ class FactorPortfolioManager:
             return float(self.expert.get_setting_with_interface_default("risk_per_trade_pct") or 0.0)
         except Exception:  # noqa: BLE001 — a stub expert -> no stop
             return 0.0
-
-    def _resync_protective_stops(self, by_symbol: Dict[str, list], changed: set) -> None:
-        """Re-price the resting stop of every still-held name whose position just changed.
-
-        ``by_symbol`` carries ``_OpenedTxn`` records (id, open_price, open_qty) in BOTH
-        runtimes; ``adjust_sl`` reads and writes a real ``Transaction`` (stop_loss,
-        take_profit, its orders), so each row is LOADED BY ID first. Passing the record
-        straight through failed with AttributeError everywhere -- the backtest logged a
-        warning, Alpaca logged an error and returned False -- and no stop was ever re-priced.
-
-        Every symbol is attempted, then any failure RAISES ``ProtectiveStopResyncError``
-        naming them all: the orders already submitted stand, but the run (backtest) or the
-        analysis (live) fails loudly instead of leaving stale stops behind a green log.
-        """
-        failures = []
-        for symbol in sorted(changed):
-            transactions = by_symbol.get(symbol) or []
-            if not transactions:
-                continue  # fully exited — its protective leg is closed with the transaction
-            sl = self.protective_stop_price(symbol, transactions)
-            if sl is None:
-                continue
-            for trans in transactions:
-                try:
-                    row = get_instance(Transaction, trans.id)
-                    ok = self.account.adjust_sl(row, sl, source="factorranker_rebalance")
-                except NotImplementedError:
-                    return  # broker cannot amend stops — nothing to retry per symbol
-                except Exception as e:  # noqa: BLE001 — collected, then raised below
-                    failures.append(f"{symbol} (transaction {trans.id}): {e}")
-                    continue
-                if not ok:
-                    failures.append(f"{symbol} (transaction {trans.id}): adjust_sl returned "
-                                    f"{ok!r}")
-        if failures:
-            raise ProtectiveStopResyncError(
-                f"FactorRanker[{self.expert_instance_id}]: could not re-price "
-                f"{len(failures)} protective stop(s) after the rebalance: "
-                + "; ".join(failures))
 
     def protective_stop_price(self, symbol: str, transactions: list,
                               extra_qty: float = 0.0, extra_price: Optional[float] = None
@@ -522,6 +506,15 @@ class FactorPortfolioManager:
         # when the symbol is blocked, instead of locking the entry.
         sl_price = self.protective_stop_price(
             symbol, transactions, extra_qty=qty, extra_price=entry_price)
+        if sl_price is not None and entry_price is not None and sl_price >= entry_price:
+            # Never a sell stop at or above market: it would fire at once (or be refused), and
+            # the rule it encodes says this name is already past its loss budget -- adding to
+            # it is not what the rule means. Refused BEFORE anything is sent for this name.
+            logger.error(
+                f"FactorRanker[{self.expert_instance_id}]: REFUSING add of {qty} {symbol}: its "
+                f"rule stop {sl_price:.4f} is at/above the current price {entry_price:.4f}")
+            raise ProtectiveStopError(
+                f"{symbol} +{qty}: rule stop {sl_price:.4f} >= price {entry_price:.4f}")
         if sl_price is None:
             logger.warning(
                 f"FactorRanker[{self.expert_instance_id}]: no protective stop priced for "

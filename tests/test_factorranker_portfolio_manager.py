@@ -40,9 +40,15 @@ class _CapturingAccount:
         return order
 
 
-def _hold(account_id, expert_id, symbol, shares):
-    """Create an OPENED transaction with a filled BUY so get_current_open_qty == shares."""
-    trans = create_transaction(symbol=symbol, quantity=shares, side=OrderDirection.BUY, expert_id=expert_id)
+def _hold(account_id, expert_id, symbol, shares, cost):
+    """Create an OPENED transaction with a filled BUY so get_current_open_qty == shares.
+
+    ``cost`` is the entry price. It used to be the factory's $150 against a $10 market: an add
+    to that position is 93% under water, its rule stop lands far above market, and since
+    2026-09-29 such an add is refused (ProtectiveStopError) instead of shipping a stop above
+    the price."""
+    trans = create_transaction(symbol=symbol, quantity=shares, side=OrderDirection.BUY,
+                               expert_id=expert_id, open_price=cost)
     create_trading_order(
         account_id=account_id, symbol=symbol, quantity=shares, side=OrderDirection.BUY,
         status=OrderStatus.FILLED, transaction_id=trans.id, filled_qty=shares,
@@ -53,8 +59,8 @@ def _hold(account_id, expert_id, symbol, shares):
 def test_rebalance_buys_new_and_sells_dropped():
     acct = create_account_definition()
     inst = create_expert_instance(account_id=acct.id, expert="FactorRanker")
-    _hold(acct.id, inst.id, "A", 10)   # currently hold A (10 sh) and C (20 sh)
-    _hold(acct.id, inst.id, "C", 20)
+    _hold(acct.id, inst.id, "A", 10, 10.0)   # currently hold A (10 sh) and C (20 sh)
+    _hold(acct.id, inst.id, "C", 20, 4.0)
 
     account = _CapturingAccount({"A": 10.0, "B": 5.0, "C": 4.0})
     expert_stub = MagicMock()

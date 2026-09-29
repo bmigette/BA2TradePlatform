@@ -114,7 +114,43 @@ def test_margin_on_applies_the_same_effective_factor_as_the_tradable_balance():
 def test_an_unpublished_or_non_finite_equity_is_refused(bad):
     """Unknown is not zero and not the cash figure: a guessed book is a guessed trade."""
     acct = _Stub(balance=1_000.0, snapshot=_snap(equity=1_000.0, cash=1_000.0), settings=OFF)
+    acct._EQUITY_RETRY_DELAY_S = 0.0
     acct._snap.equity = bad
 
     with pytest.raises(ValueError, match="equity"):
         acct.get_tradable_equity()
+
+
+class _FlakyStub(_Stub):
+    """A broker whose first snapshot read fails (all-None, as Alpaca returns it)."""
+
+    def __init__(self, *, reads, **kw):
+        super().__init__(**kw)
+        self._reads = list(reads)
+        self.snapshot_reads = 0
+
+    def get_account_snapshot(self):
+        self.snapshot_reads += 1
+        return self._reads.pop(0) if self._reads else self._snap
+
+
+@pytest.mark.parametrize("settings", [OFF, ON], ids=["margin-off", "margin-on"])
+def test_a_failed_snapshot_read_gets_one_retry_like_get_balance(settings):
+    good = _snap(equity=2_000.0, cash=1_000.0, multiplier=2.0, buying_power=2_000.0)
+    acct = _FlakyStub(reads=[AccountSnapshot()], balance=2_000.0, snapshot=good,
+                      settings=settings)
+    acct._EQUITY_RETRY_DELAY_S = 0.0
+
+    expected = 4_000.0 if settings is ON else 2_000.0
+    assert acct.get_tradable_equity() == pytest.approx(expected)
+    assert acct.snapshot_reads == 2
+
+
+def test_two_failed_reads_raise_and_serve_nothing_stale():
+    acct = _FlakyStub(reads=[AccountSnapshot(), AccountSnapshot()], balance=2_000.0,
+                      snapshot=_snap(equity=2_000.0, cash=2_000.0), settings=OFF)
+    acct._EQUITY_RETRY_DELAY_S = 0.0
+
+    with pytest.raises(ValueError, match="published no equity"):
+        acct.get_tradable_equity()
+    assert acct.snapshot_reads == 2

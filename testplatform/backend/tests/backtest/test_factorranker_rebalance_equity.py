@@ -11,14 +11,12 @@ TWO BT/LIVE ASYMMETRIES, found 2026-09-28 while wiring the ``weighting`` gene:
    budgeted on cash. Both now read ``get_virtual_equity()`` -> ``get_tradable_equity()`` ->
    ``get_account_snapshot().equity``, which is cash + marks in both runtimes.
 
-2. THE STOP RE-PRICE NEVER REACHED A TRANSACTION. ``get_holdings`` hands back lightweight
-   ``_OpenedTxn`` (id, open_price, open_qty) records -- in BOTH runtimes -- and
-   ``_resync_protective_stops`` passed them straight to ``account.adjust_sl``, which reads
-   ``stop_loss``/``take_profit`` off a real ``Transaction``. The backtest raised
-   AttributeError, logged a warning and carried on; Alpaca's ``_adjust_tpsl_internal`` hit the
-   same AttributeError on ``transaction.take_profit``, logged an error and returned False. No
-   re-price after a resize ever happened anywhere. The row is now loaded by id, and a failed
-   re-price RAISES (``ProtectiveStopResyncError``), which the engine lets through.
+2. THE POST-REBALANCE STOP RE-PRICE NEVER WORKED, AND WAS WRONG WHEN IT DID. It passed
+   ``_OpenedTxn`` records to ``adjust_sl`` (AttributeError in both runtimes, logged and
+   ignored), priced on PRE-rebalance quantities, and -- once handed a real row -- let Alpaca
+   sweep this rebalance's own SELL/BUY up as exit legs (review C1). It is removed: the stop is
+   maintained at the order that changes the position (``_submit_buy`` prices an add by the rule
+   on the post-add position; ``_reprotect_remainder`` keeps a trim's price by design).
 
 Run from the backend dir:
     python -m pytest tests/backtest/test_factorranker_rebalance_equity.py -v
@@ -54,16 +52,21 @@ def _spy_rebalances(monkeypatch) -> List[Dict[str, Any]]:
     return calls
 
 
-def _spy_adjust_sl(monkeypatch) -> List[Dict[str, Any]]:
+def _spy_adjust_sl(monkeypatch, rebalances) -> List[Dict[str, Any]]:
+    """Every stop the backtest account is asked to set, tagged with the rebalance it came from
+    (``rebalance`` = index into the rebalance log, or -1 outside any rebalance)."""
     from app.services.backtest.backtest_account import BacktestAccount
 
     calls: List[Dict[str, Any]] = []
     real = BacktestAccount.adjust_sl
 
     def spy(self, transaction, new_sl_price, source=""):
+        before = {"symbol": transaction.symbol, "open_price": transaction.open_price,
+                  "rebalance": len(rebalances) - 1}
         ok = real(self, transaction, new_sl_price, source=source)
-        calls.append({"transaction": transaction, "price": new_sl_price, "source": source,
-                      "ok": ok, "stored": getattr(transaction, "stop_loss", None)})
+        calls.append({**before, "transaction": transaction, "price": new_sl_price,
+                      "source": source, "ok": ok,
+                      "stored": getattr(transaction, "stop_loss", None)})
         return ok
 
     monkeypatch.setattr(BacktestAccount, "adjust_sl", spy)
@@ -74,7 +77,7 @@ def _run(monkeypatch, *, weighting="rank", risk_pct=5.0):
     from app.services.backtest.daily_backtest_handler import run_daily_backtest
 
     rebalances = _spy_rebalances(monkeypatch)
-    stops = _spy_adjust_sl(monkeypatch)
+    stops = _spy_adjust_sl(monkeypatch, rebalances)
     _, space = W._space()
     flat = W._genome(space, weighting, **{"model:risk_per_trade_pct": risk_pct})
     _, trial = W._trial(flat, end=MULTI_END)
@@ -120,19 +123,50 @@ def test_every_rebalance_sizes_on_the_whole_book_and_only_resizes_it(monkeypatch
 
 
 # ==================================================================================================
-# 2. the stop re-price after a resize reaches a real Transaction, in the backtest
+# 2. the stop follows the RULE at the order that changes the position -- nothing re-prices after
 # ==================================================================================================
-def test_a_resize_reprices_the_resting_stop_on_the_transaction(monkeypatch):
+RISK_PCT = 5.0
+
+
+def test_an_add_is_protected_at_the_rule_price_and_a_trim_keeps_its_price(monkeypatch):
+    """Review I1: the stop must be priced on the POST-rebalance position.
+
+    * An ADD is priced by ``_submit_buy`` on the position it creates -- held + added, at the
+      blended cost, on this rebalance's equity -- and that is what the account stores. The
+      expected price is recomputed HERE from the rule, not read back from the code.
+    * A TRIM keeps its price (``_reprotect_remainder``'s documented choice): no stop call.
+    * Nothing else sets a stop: the post-rebalance re-price pass is gone.
+    """
     from ba2_common.core.models import Transaction
 
-    _, _, stops = _run(monkeypatch)
+    _, rebalances, stops = _run(monkeypatch, risk_pct=RISK_PCT)
 
-    resyncs = [c for c in stops if c["source"] == "factorranker_rebalance"]
-    assert resyncs, "no protective stop was re-priced after a resize"
-    for c in resyncs:
-        assert isinstance(c["transaction"], Transaction)
-        assert c["ok"] is True
+    assert {c["source"] for c in stops} == {"initial_setup"}
+    adds_checked = 0
+    for c in stops:
+        assert isinstance(c["transaction"], Transaction) and c["ok"] is True
         assert c["stored"] == pytest.approx(c["price"])
+        call = rebalances[c["rebalance"]]
+        sym = c["symbol"]
+        delta = call["deltas"][sym]
+        assert delta > 0, f"a stop was set on {sym} for a non-buy delta {delta}"
+        held = call["held"].get(sym, 0.0)
+        if held == 0:
+            continue            # a new name: its stop is covered by the entry path
+        price = call["prices"][sym]
+        total = held + delta
+        avg_cost = (c["open_price"] * held + price * delta) / total
+        rule = avg_cost - (call["equity"] * RISK_PCT / 100.0) / total
+        assert c["price"] == pytest.approx(rule, rel=1e-12), (
+            f"{sym}: add stop {c['price']} is not the rule on the post-add position ({rule})")
+        adds_checked += 1
+    assert adds_checked > 0, "no add was re-protected -- the test proves nothing"
+
+    trims = [(n, s) for n, call in enumerate(rebalances)
+             for s, d in call["deltas"].items() if d < 0 and call["held"].get(s, 0) + d > 0]
+    assert trims, "no trim happened -- the test proves nothing"
+    for n, sym in trims:
+        assert not [c for c in stops if c["rebalance"] == n and c["symbol"] == sym]
 
 
 # ==================================================================================================

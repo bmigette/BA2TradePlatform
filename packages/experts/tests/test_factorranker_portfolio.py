@@ -182,64 +182,67 @@ def test_stop_below_zero_is_refused():
     assert pm.protective_stop_price("AAA", [_Trans(10, 5.0)]) is None
 
 
-# --- the re-price after a resize reaches the Transaction row, and a failure is LOUD ----------
-# get_holdings hands back _OpenedTxn(id, open_price, open_qty) records in BOTH runtimes, while
-# adjust_sl reads/writes a real Transaction. Passing the record through failed everywhere
-# (AttributeError on stop_loss / take_profit) and was logged and ignored (2026-09-28).
+# --- an add is never protected by a stop at/above market (review 2026-09-29) ------------------
+# The add's stop is priced by the rule on the position the add CREATES. When that lands at or
+# above the current price, placing it would put a sell stop above market; the add is refused
+# before anything is sent for the name, the rest of the rebalance proceeds, and the rebalance
+# then RAISES ProtectiveStopError naming the refused names.
 
-class _StopAccount:
-    def __init__(self, result=True):
-        self.calls, self._result = [], result
+class _BuyAccount:
+    def __init__(self, price):
+        self.price, self.submitted = price, []
 
-    def adjust_sl(self, transaction, price, source=""):
-        self.calls.append((transaction, price, source))
-        if isinstance(self._result, Exception):
-            raise self._result
-        return self._result
+    def get_instrument_current_price(self, symbol):
+        return self.price
 
-
-def _held_txn():
-    from ba2_common.core.db import add_instance
-    from ba2_common.core.models import Transaction
-    from ba2_common.core.types import OrderDirection, TransactionStatus
-    from ba2_experts.FactorRanker.portfolio import _OpenedTxn
-
-    tid = add_instance(Transaction(symbol="AAA", quantity=100, side=OrderDirection.BUY,
-                                   status=TransactionStatus.OPENED, open_price=50.0))
-    return tid, _OpenedTxn(tid, 50.0, 100.0)
+    def submit_order(self, order, sl_price=None, is_closing_order=False, **kw):
+        self.submitted.append((order.symbol, order.quantity, sl_price))
+        return order
 
 
-def test_the_resync_hands_adjust_sl_the_transaction_row():
-    from ba2_common.core.models import Transaction
-
-    tid, rec = _held_txn()
-    pm = _pm(_Expert(risk_pct=1.0))
-    pm.account = _StopAccount()
-
-    pm._resync_protective_stops({"AAA": [rec]}, changed={"AAA"})
-
-    (trans, price, source), = pm.account.calls
-    assert isinstance(trans, Transaction) and trans.id == tid
-    assert price == pytest.approx(pm.protective_stop_price("AAA", [rec]))
-    assert source == "factorranker_rebalance"
+class _HeldTrans(_Trans):
+    def __init__(self, qty, price, id_=1):
+        super().__init__(qty, price)
+        self.id = id_
 
 
-@pytest.mark.parametrize("result", [False, AttributeError("stop_loss")],
-                         ids=["returned-False", "raised"])
-def test_a_failed_reprice_raises_instead_of_being_logged(result):
-    from ba2_experts.FactorRanker.portfolio import ProtectiveStopResyncError
+def test_an_add_whose_rule_stop_is_above_market_is_refused_before_it_is_sent():
+    from ba2_experts.FactorRanker.portfolio import ProtectiveStopError
 
-    _, rec = _held_txn()
-    pm = _pm(_Expert(risk_pct=1.0))
-    pm.account = _StopAccount(result)
+    # 100 held at 100, now 50: adding 10 gives a blended cost of 95.45 and a 1% budget of
+    # $1,000 over 110 shares -> rule stop 86.36, far above the $50 market.
+    pm = _pm(_Expert(risk_pct=1.0, equity=100_000.0))
+    pm.account = _BuyAccount(price=50.0)
 
-    with pytest.raises(ProtectiveStopResyncError, match="AAA"):
-        pm._resync_protective_stops({"AAA": [rec]}, changed={"AAA"})
+    with pytest.raises(ProtectiveStopError, match="AAA"):
+        pm._submit_buy("AAA", 10, [_HeldTrans(100, 100.0)])
+    assert pm.account.submitted == []
 
 
-def test_a_broker_that_cannot_amend_stops_is_not_a_failure():
-    _, rec = _held_txn()
-    pm = _pm(_Expert(risk_pct=1.0))
-    pm.account = _StopAccount(NotImplementedError())
+def test_an_add_whose_rule_stop_is_below_market_is_sent_with_it():
+    pm = _pm(_Expert(risk_pct=1.0, equity=100_000.0))
+    pm.account = _BuyAccount(price=100.0)
 
-    pm._resync_protective_stops({"AAA": [rec]}, changed={"AAA"})   # no raise
+    pm._submit_buy("AAA", 10, [_HeldTrans(100, 100.0)])
+
+    (symbol, qty, sl), = pm.account.submitted
+    # The stop covers the position the add creates: 110 shares at cost 100, $1,000 budget.
+    assert (symbol, qty) == ("AAA", 10)
+    assert sl == pytest.approx(100.0 - 1_000.0 / 110)
+
+
+def test_the_rebalance_finishes_the_other_names_then_raises_for_the_refused_add():
+    from ba2_experts.FactorRanker.portfolio import ProtectiveStopError
+
+    pm = _pm(_Expert(risk_pct=1.0, equity=100_000.0))
+    pm.account = _BuyAccount(price=50.0)
+    held = {"AAA": 100.0}
+    pm.get_holdings = lambda: (held, {"AAA": [_HeldTrans(100, 100.0)]})
+    pm._quantity_units = lambda symbols: {}
+
+    # AAA: 100 held, target $10,000 at $50 -> +100 (refused, rule stop above market);
+    # BBB: new name, $5,000 at $50 -> 100 shares, sent.
+    with pytest.raises(ProtectiveStopError, match="refused 1 add"):
+        pm.rebalance({"AAA": 0.1, "BBB": 0.05})
+
+    assert [(s, q) for s, q, _ in pm.account.submitted] == [("BBB", 100)]
