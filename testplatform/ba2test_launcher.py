@@ -1597,8 +1597,13 @@ def _rm_opt_for(kind: str, sizing_mode: "str | None" = None) -> dict:
 # were quick same-day stop-outs vs 3.1% for large). Exposed as its own (narrower) gene set so the
 # GA can actually tune it, instead of the full _RM_OPT block (whose other keys — ATR/min-stop/
 # max-virtual-equity — have no bypass-path reader).
+# Max 10.0 -> 5.0 (2026-09-29, operator): the stop caps one symbol's loss at risk_per_trade_pct %
+# of the expert's equity. With 10-35 names each position is only ~3-10% of equity, so above ~5%
+# the budget exceeds the position and the stop sits 90%+ below entry or is not placed at all
+# (measured on dev: 38/39 FactorRanker positions). A name whose position cannot lose the budget
+# carrying no stop is accepted by design.
 _BYPASS_RM_OPT = {
-    "risk_per_trade_pct": {"optimize": True, "min": 0.5, "max": 10.0, "step": 0.5, "type": "float"},
+    "risk_per_trade_pct": {"optimize": True, "min": 0.5, "max": 5.0, "step": 0.5, "type": "float"},
 }
 
 # Per-weekday entry-scan ON/OFF toggle genes (schedule:<day>): merged into expert_params
