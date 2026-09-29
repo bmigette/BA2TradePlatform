@@ -39,7 +39,6 @@ Usage (test venv; FMP_API_KEY/DB_FILE in env):
         [--interval 5min] [--fitness calmar_ratio] [--include-no-data] [--dry-run]
 """
 import argparse
-import hashlib
 import json
 import os
 import subprocess
@@ -50,7 +49,7 @@ import sys
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from matrix_flags import cap_passthrough  # noqa: E402
+from matrix_flags import cap_passthrough, job_name_with_digest  # noqa: E402
 
 _STORE = r"C:\Users\basti\Documents\ba2\common\cache\screener\metric_store"
 # A real --universe is required by the CLI but is OVERRIDDEN by the screened union when --screener
@@ -174,30 +173,16 @@ def _job_name(name: str, cmd: list) -> str:
     """``name``, or ``name-d<digest>`` when ``market_condition_passthrough`` or
     ``exclude_symbols_passthrough`` added anything.
 
-    Mirrors ``tools/run_options_matrix.py:discovery_name``: the digest is a sha256 (first 12 hex
-    chars) of the job's own fully-resolved ``optimize`` argv, EXCLUDING ``--name``/``--parallel``/
-    ``--workers`` (metadata that must not move the job identity -- the same three that function
-    excludes). Unlike ``discovery_name`` this digest is added ONLY when at least one new
-    market-condition/sl-loosen flag OR ``--exclude-symbols`` was actually forwarded
-    (``market_condition_passthrough`` or ``exclude_symbols_passthrough`` returned something):
-    with none of those six sources, every job name -- and therefore the skip-completed-by-name
-    check and the DB row it resumes -- stays byte-identical to before this change existed.
+    Thin wrapper over ``matrix_flags.job_name_with_digest`` (the digest math itself is shared
+    with ``tools/run_senate_matrix.py``'s Senate lane -- see that function's docstring). Mirrors
+    ``tools/run_options_matrix.py:discovery_name``. Unlike ``discovery_name`` this digest is
+    added ONLY when at least one new market-condition/sl-loosen flag OR ``--exclude-symbols`` was
+    actually forwarded (``market_condition_passthrough`` or ``exclude_symbols_passthrough``
+    returned something): with none of those six sources, every job name -- and therefore the
+    skip-completed-by-name check and the DB row it resumes -- stays byte-identical to before this
+    change existed.
     """
-    tokens = [t for t in cmd if t]
-    start = tokens.index("optimize") + 1 if "optimize" in tokens else 0
-    tokens = tokens[start:]
-    kept: list = []
-    skip = False
-    for tok in tokens:
-        if skip:
-            skip = False
-            continue
-        if tok in ("--name", "--parallel", "--workers"):
-            skip = True
-            continue
-        kept.append(tok)
-    digest = hashlib.sha256(json.dumps(kept, sort_keys=False).encode()).hexdigest()[:12]
-    return f"{name}-d{digest}"
+    return job_name_with_digest(name, cmd)
 
 
 def _db_path() -> str:

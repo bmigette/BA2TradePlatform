@@ -10,6 +10,8 @@ Imported as a plain sibling module (``import matrix_flags``): every driver is ru
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, List
 
 
@@ -30,3 +32,34 @@ def cap_passthrough(args: Any) -> List[str]:
     if args.profit_share_cap_pct is not None:
         out += ["--profit-share-cap-pct", str(args.profit_share_cap_pct)]
     return out
+
+
+def job_name_with_digest(name: str, cmd: List[str]) -> str:
+    """``name``, or ``name-d<digest>`` when ``cmd`` carries any token beyond the driver's base
+    invocation (i.e. the caller only invokes this once it has decided a digest is warranted —
+    see each driver's own trigger condition, e.g. ``run_screener_capband_matrix.py``'s
+    ``mc_tokens or excl_tokens``).
+
+    The digest is a sha256 (first 12 hex chars) of the job's own fully-resolved ``optimize``
+    argv, EXCLUDING ``--name``/``--parallel``/``--workers`` (metadata that must not move the job
+    identity: a resubmit that only changes concurrency or which workers it runs on must resume
+    the SAME row, not mint a new one). Originally ``run_screener_capband_matrix.py:_job_name``
+    (goal2027atr market-condition passthrough); pulled out here so
+    ``tools/run_senate_matrix.py``'s Senate lane gets byte-identical digest behaviour instead of
+    a second hand-copied implementation that could drift from this one.
+    """
+    tokens = [t for t in cmd if t]
+    start = tokens.index("optimize") + 1 if "optimize" in tokens else 0
+    tokens = tokens[start:]
+    kept: List[str] = []
+    skip = False
+    for tok in tokens:
+        if skip:
+            skip = False
+            continue
+        if tok in ("--name", "--parallel", "--workers"):
+            skip = True
+            continue
+        kept.append(tok)
+    digest = hashlib.sha256(json.dumps(kept, sort_keys=False).encode()).hexdigest()[:12]
+    return f"{name}-d{digest}"
