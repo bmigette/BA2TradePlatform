@@ -5186,11 +5186,38 @@ def _market_condition_manifest_facts(digest: str, profile: str) -> dict:
     return facts
 
 
+#: The classic equity strategy keys (design 2026-09-15 Task 11, lifted 2026-09-29 for the
+#: risk-ATR "goal2027atr" grid ONLY -- an explicit operator call, not an implementation side
+#: effect: "do not change strategy s1 s7" held until this grid). Their builders append the
+#: market-condition ENTRY leaves through ``_append_equity_market_condition_gates`` and (behind
+#: ``--market-exit``) the EXIT/STOP/TP rules through ``_append_equity_market_exit_rules`` -- both
+#: called once, generically, from ``_build_strategy``'s dispatch, unlike the option builders
+#: (which call ``_append_market_condition_gates``/``_option_entry_rule`` themselves).
+_EQUITY_MARKET_CONDITION_STRATEGIES = {"S1", "S2", "S3", "S4", "S5", "S6", "S7"}
+
 #: The strategy keys whose builders actually EMIT market-condition leaves: every pure-option
-#: structure (through ``_option_entry_rule``) plus the two equity-entry option overlays
-#: (through ``_append_market_condition_gates``). Design 2026-09-15 "Deferred": the equity grid
-#: S1-S7 is NOT in this delivery, and O_STK has no entry gate of its own to hang leaves on.
-_MARKET_CONDITION_STRATEGIES = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"}
+#: structure (through ``_option_entry_rule``), the two equity-entry option overlays (through
+#: ``_append_market_condition_gates``), and (since the 2026-09-29 deferral lift) the classic
+#: equity strategies S1-S7. O_STK has no entry gate of its own to hang leaves on, so it stays out.
+_MARKET_CONDITION_STRATEGIES = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"} | _EQUITY_MARKET_CONDITION_STRATEGIES
+
+#: ``--market-condition-mode``: the default arm actually searches the market genes; ``all-off``
+#: is the matched control (design section 6) -- every market gene frozen off, byte-identical to
+#: profile ``none`` for both the entry gates and (see ``--market-exit``) the exit rules.
+_MARKET_CONDITION_MODE_SEARCHED = "searched"
+_MARKET_CONDITION_MODE_ALL_OFF = "all-off"
+_MARKET_CONDITION_MODE: str = _MARKET_CONDITION_MODE_SEARCHED
+
+#: ``--market-exit``: the selected MARKET_EXIT_KINDS (empty = no market exit/stop/tp rules).
+#: Equity-only (S1-S7) in this delivery -- no option kind gets market exits here.
+_MARKET_EXIT_KINDS_SELECTED: "tuple[str, ...]" = ()
+
+#: ``--search-sl-loosen``: searches ``allow_ruleset_sl_loosen`` (MarketExpertInterface, default
+#: False) as ONE model:* gene. NOT a market-condition gene (design D6) -- it must be searched in
+#: BOTH the treatment and the all-off control arm, so it is resolved and merged independently of
+#: ``_MARKET_CONDITION_MODE``.
+_SEARCH_SL_LOOSEN: bool = False
+_SL_LOOSEN_SETTING = "allow_ruleset_sl_loosen"
 
 
 def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: str = "") -> dict:
@@ -5234,12 +5261,18 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
     if _MARKET_CONDITION_PROFILES and kind and kind not in _MARKET_CONDITION_STRATEGIES:
         # A strategy whose builders emit NO market leaves would be labelled gated, would demand
         # snapshot coverage of its own universe, and would search exactly zero market genes --
-        # so `optimize-batch --strategies S1,O_LC --market-condition-profile ...` produced an S1
-        # job that failed coverage against the OPTION universe while claiming to be gated.
-        sys.exit(f"{command}: --market-condition-profile is options-only in this delivery, and "
-                 f"{kind!r} emits no market-condition gates (gated keys: "
-                 f"{sorted(_MARKET_CONDITION_STRATEGIES)}). Drop the flag, or run the option "
-                 f"keys in a job of their own.")
+        # so `optimize-batch --strategies S1,O_STK --market-condition-profile ...` produced an
+        # O_STK job that failed coverage against the gated universe while claiming to be gated.
+        sys.exit(f"{command}: --market-condition-profile: {kind!r} emits no market-condition "
+                 f"gates (gated keys: {sorted(_MARKET_CONDITION_STRATEGIES)}). Drop the flag, or "
+                 f"run the gated keys in a job of their own.")
+    if _MARKET_EXIT_KINDS_SELECTED and kind and kind not in _EQUITY_MARKET_CONDITION_STRATEGIES:
+        # --market-exit is attached ONLY by the equity dispatch in _build_strategy (design section
+        # 5.2 scopes it to S1-S7); an option kind would otherwise silently build WITHOUT the
+        # requested exit rules while the command line claims they are on.
+        sys.exit(f"{command}: --market-exit is equity-only (S1-S7) in this delivery, and "
+                 f"{kind!r} is not one of them ({sorted(_EQUITY_MARKET_CONDITION_STRATEGIES)}). "
+                 f"Drop the flag, or run the equity keys in a job of their own.")
     if not _MARKET_CONDITION_PROFILES:
         if _MARKET_CONDITION_MANIFESTS:
             # Ignoring it would run an UNGATED grid from a command line that says otherwise, and
@@ -5345,6 +5378,231 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
     print(f"{command}: market-condition {shown}; {len(genes)} added genes; population and "
           f"generations are NOT scaled by the profile(s)")
     return recorded
+
+
+def _resolve_market_condition_mode(raw, command: str) -> str:
+    """Parse ``--market-condition-mode``; sets and returns the module global.
+
+    ``searched`` (default) is today's behaviour: the entry gates and (with ``--market-exit``) the
+    exit rules are GA genes. ``all-off`` is the matched control (design section 6): every market
+    gene is frozen off -- ``_append_equity_market_condition_gates``/``_append_equity_market_exit_
+    rules`` skip the strategy entirely, so the built tree is byte-identical to profile ``none``,
+    while ``_apply_market_conditions`` still pins/validates the SAME manifest and writes the SAME
+    ``market_condition_profile`` expert setting, so the control pays the same data-supply cost."""
+    global _MARKET_CONDITION_MODE
+    mode = raw or _MARKET_CONDITION_MODE_SEARCHED
+    if mode not in (_MARKET_CONDITION_MODE_SEARCHED, _MARKET_CONDITION_MODE_ALL_OFF):
+        sys.exit(f"{command}: --market-condition-mode must be "
+                 f"{_MARKET_CONDITION_MODE_SEARCHED!r} or {_MARKET_CONDITION_MODE_ALL_OFF!r}, "
+                 f"got {mode!r}")
+    _MARKET_CONDITION_MODE = mode
+    return _MARKET_CONDITION_MODE
+
+
+def _resolve_market_exit_kinds(raw, command: str) -> tuple:
+    """Parse ``--market-exit``; sets and returns the module global (``()`` = no market exits).
+
+    Mirrors ``tools/strategy_research/exploration/market_conditions.py:exit_selection``: distinct
+    kinds from ``MARKET_EXIT_KINDS``, requires a profile (the rules read market conditions) and
+    requires the ``searched`` arm (the all-off control cannot carry searched exit genes -- design
+    section 6, "identical except every market gene frozen off")."""
+    global _MARKET_EXIT_KINDS_SELECTED
+    from ba2_common.core.market_condition_templates import MARKET_EXIT_KINDS
+
+    tokens = tuple(t.strip() for t in str(raw or "").split(",") if t.strip())
+    if not tokens:
+        _MARKET_EXIT_KINDS_SELECTED = ()
+        return _MARKET_EXIT_KINDS_SELECTED
+    unknown = [t for t in tokens if t not in MARKET_EXIT_KINDS]
+    if unknown or len(set(tokens)) != len(tokens):
+        sys.exit(f"{command}: --market-exit takes distinct kinds from "
+                 f"{','.join(MARKET_EXIT_KINDS)}; got {list(tokens)!r}")
+    if not _MARKET_CONDITION_PROFILES:
+        sys.exit(f"{command}: --market-exit requires --market-condition-profile (the rules read "
+                 f"market conditions)")
+    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+        sys.exit(f"{command}: --market-exit adds searched genes; --market-condition-mode "
+                 f"{_MARKET_CONDITION_MODE!r} is the no-impact control and cannot carry them")
+    _MARKET_EXIT_KINDS_SELECTED = tuple(k for k in MARKET_EXIT_KINDS if k in tokens)
+    return _MARKET_EXIT_KINDS_SELECTED
+
+
+def _resolve_search_sl_loosen(raw, command: str) -> bool:
+    """Parse ``--search-sl-loosen``; sets and returns the module global."""
+    global _SEARCH_SL_LOOSEN
+    _SEARCH_SL_LOOSEN = bool(raw)
+    return _SEARCH_SL_LOOSEN
+
+
+def _sl_loosen_gene_space() -> dict:
+    """The ONE ``model:allow_ruleset_sl_loosen`` gene ``--search-sl-loosen`` adds ({} when off).
+
+    Int 0/1 like every other RM toggle gene (``use_atr_stop``, ``screener_weinstein_stage2_only``)
+    -- ``_build_daily_trial_config`` merges it straight onto the expert's per-trial settings
+    (``overrides``, no whitelist in that path: every ``model:*`` key flows through unconditionally)
+    and ``ruleset_sl_loosen_allowed``/``coerce_bool`` read it back as a real bool regardless of
+    whether it lands as an int or (an older row's) the JSON string ``"1"``. NOT gated by
+    ``_MARKET_CONDITION_MODE`` -- design D6 requires it searched in BOTH arms, or the comparison
+    would measure two things at once."""
+    if not _SEARCH_SL_LOOSEN:
+        return {}
+    return {f"model:{_SL_LOOSEN_SETTING}": {
+        "optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"}}
+
+
+def _refuse_sl_loosen_on_bypass(command: str, kind: str, bypass: bool) -> None:
+    """``allow_ruleset_sl_loosen`` only affects the classic ruleset stop-loss policy
+    (``TradeActions.ruleset_stop_policy``); a bypass expert (FactorRanker) has no ruleset SL to
+    loosen, so the gene would be searched but dead -- refused rather than silently inert."""
+    if _SEARCH_SL_LOOSEN and bypass:
+        sys.exit(f"{command}: --search-sl-loosen: {kind!r} is a bypass expert with no classic "
+                 f"ruleset stop-loss to loosen; the gene would be searched but dead")
+
+
+def _equity_strategy_direction(strategy, kind: str) -> str:
+    """The ONE direction every position this equity strategy's entry rules open.
+
+    Derived from the built Strategy's OWN entry actions (mirrors ``tools/strategy_research/
+    exploration/market_conditions.py:job_direction``) rather than assumed long: S1-S7 are
+    long-only TODAY (every entry action is ``buy`` -- shorts, where enabled at all, are mirrored
+    onto the buy gates by a run-level engine flag, never a strategy-level sell entry), but a
+    strategy that ever grows a sell-side entry must not silently be gated with the wrong-side
+    market exit templates."""
+    opens = {str(a.get("action_type") or a.get("action") or "")
+             for rule in (getattr(strategy, "entry_rules", None) or [])
+             for a in (rule.get("actions") or []) if isinstance(a, dict)} & {"buy", "sell"}
+    if opens == {"buy", "sell"}:
+        raise ValueError(f"{kind}: entry rules both buy and sell; market exits need a single "
+                         f"position direction")
+    if not opens:
+        raise ValueError(f"{kind}: no buy/sell entry action; the position direction is unknown")
+    return "long" if opens == {"buy"} else "short"
+
+
+def _append_equity_market_condition_gates(strategy, kind: str):
+    """Append the market-condition ENTRY leaves to EVERY initial-entry AND tree of an equity
+    strategy (S1-S7), never to an exit/open-position rule (design section 5.1).
+
+    S1 has THREE entry rules, one per conviction tier (``_build_strategy_S1``), and design D5
+    requires them to SHARE one gate set (15 genes total, not 45). Sharing works for free: the SAME
+    leaf ids (``_market_condition_gates`` is deterministic in ``kind``) are appended,
+    independently copied, to every entry rule's tree here -- ``strategy_param_space`` keys
+    condition genes by leaf id ACROSS THE WHOLE STRATEGY (``decode_params``'s ``cond_by_id``) and
+    ``_apply_to_tree`` applies one decoded value/mode to every node carrying that id, exactly the
+    mechanism the option builders already use for ``shared-gate_confidence``/``shared-rel_volume``
+    across members. Every other S1-S7 builder has exactly one entry rule with a condition tree, so
+    this collapses to the ordinary single-tree case there.
+
+    Skipped entirely under the ``all-off`` control mode: the built tree must stay byte-identical
+    to profile ``none`` (design section 6).
+    """
+    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+        return strategy
+    gates = _market_condition_gates(kind.lower())
+    if not gates:
+        return strategy
+    import copy
+
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    rules = list(getattr(strategy, "entry_rules", None) or [])
+    trees = [r for r in rules if isinstance(r, dict) and isinstance(r.get("conditions"), dict)
+             and r["conditions"].get("conditions")]
+    if not trees:
+        raise ValueError(f"{kind}: no entry rule with a condition tree to carry the "
+                         f"market-condition gates")
+    for rule in trees:
+        tree = rule["conditions"]
+        tree["conditions"] = list(tree["conditions"]) + [copy.deepcopy(g) for g in gates]
+    strategy.entry_rules = normalize_trade_rules(rules)
+    return strategy
+
+
+def _equity_market_exit_terminal_catch_all(rule) -> bool:
+    """True for a TERMINAL CATCH-ALL exit rule: it matches every held position and stops
+    processing (ported from ``tools/strategy_research/exploration/market_conditions.py:
+    terminal_catch_all`` -- same algorithm, kept local so the launcher does not import from
+    ``tools/``). S2/S3/S5/S7/S1/S4's always-on floor stop (bare ``has_position``, first-match) is
+    exactly this shape."""
+    if rule.get("continue_processing") or rule.get("continueProcessing"):
+        return False
+
+    def matches_all(node):
+        if not node:
+            return True
+        if "conditions" in node:
+            group = node.get("operator") or node.get("type") or "AND"
+            return group in ("AND", "OR") and all(matches_all(c) for c in node["conditions"])
+        return (node.get("field") == "has_position"
+                and (node.get("op") or node.get("comparison")) == "is_true")
+
+    return matches_all(rule.get("conditions"))
+
+
+def _equity_market_exit_adjusts_stop_loss(rule) -> bool:
+    return any((a.get("action_type") or a.get("action")) == "adjust_stop_loss"
+              for a in (rule.get("actions") or []) if isinstance(a, dict))
+
+
+def _insert_equity_market_exit_rules(exit_rules, new_rules) -> tuple:
+    """Insert ``new_rules`` into an equity strategy's exit list AFTER the existing exits but
+    BEFORE the first TERMINAL CATCH-ALL rule (mirrors ``exploration/market_conditions.py:
+    attach_exits``): a catch-all placed first (S1-S3/S5/S7's floor stop) would otherwise shadow
+    every rule appended strictly at the end, under the engine's first-match semantics. The market
+    rules keep ``continue_processing`` on their adjust actions, so the catch-all still runs right
+    after them -- except the STOP rule is DROPPED when the catch-all itself adjusts the stop-loss
+    (S6 has no catch-all at all, so nothing is omitted there): the engine keeps only the LAST
+    stop-loss action of a pass, and the always-matching catch-all would win that race every time,
+    making a market stop ahead of it a searched-but-dead gene. Returns ``(rules, omitted)``.
+    """
+    rules = list(exit_rules or [])
+    at = next((i for i, r in enumerate(rules) if _equity_market_exit_terminal_catch_all(r)),
+             len(rules))
+    omitted: dict = {}
+    kept = list(new_rules)
+    if at < len(rules) and _equity_market_exit_adjusts_stop_loss(rules[at]):
+        stop_ids = [r["id"] for r in kept if "-mkt-stop" in r["id"]]
+        if stop_ids:
+            omitted["stop"] = (f"catch-all exit rule {rules[at].get('id')!r} adjusts the "
+                               f"stop-loss after it on every bar, and a pass keeps only its "
+                               f"last stop-loss action")
+            kept = [r for r in kept if r["id"] not in stop_ids]
+    if kept:
+        rules[at:at] = kept
+    return rules, omitted
+
+
+def _append_equity_market_exit_rules(strategy, kind: str):
+    """Append the ``--market-exit`` rules (``[]`` when unselected) to an equity strategy's exit
+    list, off by default behind their own rule-level toggle genes (design section 5.2).
+
+    Skipped under the ``all-off`` control mode -- ``_resolve_market_exit_kinds`` already refuses
+    that combination at parse time (``--market-exit`` requires the ``searched`` arm), so
+    ``_MARKET_EXIT_KINDS_SELECTED`` is guaranteed empty whenever the mode is ``all-off``; the
+    guard here is defensive, not load-bearing.
+    """
+    if not _MARKET_EXIT_KINDS_SELECTED:
+        return strategy
+    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+        raise ValueError(f"{kind}: market exit rules requested with a non-searched "
+                         f"market-condition mode {_MARKET_CONDITION_MODE!r}")
+    from ba2_common.core.market_condition_rules import assert_market_rule_actions
+    from ba2_common.core.market_condition_templates import market_exit_rules
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    direction = _equity_strategy_direction(strategy, kind)
+    profiles = _market_condition_setting_profiles()
+    prefix = kind.lower()
+    rules = market_exit_rules(prefix, profiles, direction, _MARKET_EXIT_KINDS_SELECTED)
+    if not rules:
+        raise ValueError(f"{kind}: --market-exit {','.join(_MARKET_EXIT_KINDS_SELECTED)} "
+                         f"produced no rule for the selected profile(s) {','.join(profiles)}")
+    merged, omitted = _insert_equity_market_exit_rules(strategy.exit_rules, rules)
+    strategy.exit_rules = normalize_trade_rules(merged)
+    assert_market_rule_actions(strategy.exit_rules, f"{kind} exit rules")
+    if omitted:
+        print(f"{kind}: market-exit omitted {sorted(omitted)}: {omitted}")
+    return strategy
 
 
 def _option_signal_gate(m: str, member: str) -> dict:
@@ -6026,6 +6284,15 @@ def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="le
         if builder is None:
             sys.exit(f"optimize: unknown strategy {kind!r}; have {sorted(_STRATEGY_BUILDERS)}")
         strat = builder(name)
+    if kind in _EQUITY_MARKET_CONDITION_STRATEGIES:
+        # Equity market-condition gates/exits (design 2026-09-15 Task 11, lifted 2026-09-29):
+        # a no-op with the profile off / no --market-exit, so every existing S1-S7 command stays
+        # byte-identical. The option builders attach their own leaves internally (_option_entry_
+        # rule, _append_market_condition_gates called from the O_CC/O_PP/O_WHEEL builders); S1-S7
+        # attach here, once, generically, since every one of them returns a plain Strategy with no
+        # further per-kind splicing to interact with.
+        strat = _append_equity_market_condition_gates(strat, kind)
+        strat = _append_equity_market_exit_rules(strat, kind)
     if neutral_entry_mode != "legacy":
         _configure_neutral_entry(strat, kind, neutral_entry_mode)
     return _clamp_confidence_genes(strat, expert)
@@ -6101,6 +6368,9 @@ def _cmd_optimize(args) -> int:
     # Read BEFORE _build_strategy too: the market gates are appended by the same builders.
     _resolve_market_condition_profiles(getattr(args, "market_condition_profile", None), "optimize")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None), "optimize")
+    _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize")
+    _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize")
+    _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize")
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -6193,6 +6463,7 @@ def _cmd_optimize(args) -> int:
     db = SessionLocal()
     try:
         bypass = bool(spec.get("bypass"))
+        _refuse_sl_loosen_on_bypass("optimize", args.strategy, bypass)
         _sname = args.name or f"opt-{expert}-{args.strategy}"
         # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
         # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
@@ -6416,7 +6687,7 @@ def _cmd_optimize(args) -> int:
             # namespace) are merged in ONLY when --screener is set.
             "expert_params": ({**_bypass_gene_space(spec), **screener_genes} if bypass
                               else {**spec["expert_params"], **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args)),
-                                    **screener_genes, **schedule_genes}),
+                                    **screener_genes, **schedule_genes, **_sl_loosen_gene_space()}),
             "backtest": backtest_block,
         }
         _apply_lattice_anchor(cfg, args.strategy, getattr(args, "lattice_anchor", None))
@@ -6520,6 +6791,9 @@ def _cmd_optimize_batch(args) -> int:
                                        "optimize-batch")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None),
                                         "optimize-batch")
+    _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize-batch")
+    _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize-batch")
+    _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize-batch")
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     batch_worker_ids = _worker_ids_from_args(args)  # resolved once; applied to every job
@@ -6562,6 +6836,7 @@ def _cmd_optimize_batch(args) -> int:
     for n, (expert, strat_kind) in enumerate(jobs, 1):
         spec = _EXPERT_OPT[expert]
         bypass = bool(spec.get("bypass"))
+        _refuse_sl_loosen_on_bypass("optimize-batch", strat_kind, bypass)
         prefix = args.name_prefix or "phase1"
         # Per-job resolution: pure-option kinds AND options experts (spec key `options` — a
         # bypass one's strat_kind is "FACTOR" and carries no option-kind default) default to
@@ -6662,7 +6937,8 @@ def _cmd_optimize_batch(args) -> int:
                 # RM sizing/stop params + per-weekday entry-scan toggle genes.
                 "expert_params": (_bypass_gene_space(spec) if bypass
                                   else {**spec["expert_params"], **_rm_opt_for(strat_kind, _effective_sizing_mode(spec, args)),
-                                        **{f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}}),
+                                        **{f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()},
+                                        **_sl_loosen_gene_space()}),
                 "backtest": backtest_block,
             }
             _apply_lattice_anchor(cfg, strat_kind, getattr(args, "lattice_anchor", None))
@@ -7456,6 +7732,32 @@ def _add_market_condition_args(p) -> None:
                         "each worker would compute the indicators from whatever cache it "
                         "happened to hold. Refused at launch when it does not cover the run's "
                         "universe.")
+    p.add_argument("--market-exit", default=None, metavar="KIND[,KIND...]",
+                   help="EQUITY (S1-S7) ONLY. Append market-condition EXIT/STOP/TP rules "
+                        "(kinds: exit,stop,tp -- ba2_common.core.market_condition_templates."
+                        "MARKET_EXIT_KINDS) to the strategy's exit list, AFTER its existing "
+                        "exits (but before a terminal catch-all floor stop, which would "
+                        "otherwise shadow them). Each rule is off by default behind its own "
+                        "rule-level toggle gene. Requires --market-condition-profile and "
+                        "--market-condition-mode searched (the default).")
+    p.add_argument("--market-condition-mode", default=_MARKET_CONDITION_MODE_SEARCHED,
+                   choices=(_MARKET_CONDITION_MODE_SEARCHED, _MARKET_CONDITION_MODE_ALL_OFF),
+                   help="'searched' (default): the market entry gates and any --market-exit "
+                        "rules are GA genes. 'all-off': the matched CONTROL arm for a "
+                        "--market-condition-profile run -- every market gene is frozen off (no "
+                        "leaf/rule is appended at all), byte-identical to profile 'none' for "
+                        "both the entry gates and the exits, while the run still pins/validates "
+                        "the same manifest and writes the same market_condition_profile expert "
+                        "setting, so the control pays the same data-supply cost as the "
+                        "treatment. Run the SAME seed/population/generations as the matched "
+                        "'searched' job to isolate what the market conditions add.")
+    p.add_argument("--search-sl-loosen", action="store_true", default=False,
+                   help="Search allow_ruleset_sl_loosen (MarketExpertInterface, default False) "
+                        "as ONE model:* gene (int 0/1, decoded through coerce_bool to a real "
+                        "bool by every reader). NOT a market-condition gene (design D6) -- it is "
+                        "added in BOTH the searched and all-off arms, so the market-condition "
+                        "comparison isolates one variable. Refused on a bypass expert "
+                        "(FactorRanker): it has no classic ruleset stop-loss to loosen.")
 
 
 def main(argv: "list | None" = None) -> int:

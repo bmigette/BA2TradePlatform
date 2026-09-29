@@ -1153,17 +1153,19 @@ def test_the_setting_and_the_run_config_key_agree_by_construction(profile_on, sn
     assert market_condition_pins(block) == (["ohlcv-v1"], {"ohlcv-v1": snapshot})
 
 
-# -------------------------------------------- the flag is OPTIONS-ONLY in this delivery (I5)
+# -------------------------------------------- the flag is refused for a non-gated key (I5)
 def test_the_profile_flag_is_refused_for_a_strategy_that_emits_no_gates(profile_on, snapshot,
                                                                         monkeypatch):
-    """``optimize-batch --strategies S1,O_LC --market-condition-profile ...`` produced an S1 job
-    labelled gated, held to the OPTION snapshot's coverage, and searching exactly zero market
-    genes -- only the option builders emit leaves. Refused by name instead."""
+    """``optimize-batch --strategies O_STK,O_LC --market-condition-profile ...`` produced an
+    O_STK job labelled gated, held to the OPTION snapshot's coverage, and searching exactly zero
+    market genes -- O_STK has no entry gate of its own to hang leaves on. Refused by name
+    instead. (S1-S7 were the historical example here before the 2026-09-29 deferral lift added
+    them to the gated set -- see test_launcher_equity_market_conditions.py.)"""
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
     with pytest.raises(SystemExit) as e:
-        mod._apply_market_conditions("optimize-batch", _gated_block(), _built("O_LC"), "S1")
+        mod._apply_market_conditions("optimize-batch", _gated_block(), _built("O_LC"), "O_STK")
     msg = str(e.value)
-    assert "options-only" in msg and "'S1'" in msg
+    assert "'O_STK'" in msg
     assert "O_LC" in msg                     # the message lists the keys that ARE gated
 
 
@@ -1177,11 +1179,15 @@ def test_every_gate_emitting_key_is_permitted(profile_on, snapshot, monkeypatch,
 
 def test_the_permitted_set_is_exactly_the_keys_whose_builders_emit_leaves():
     """Pinned against the builders rather than restated: the pure-option structures get their
-    leaves from ``_option_entry_rule``, O_CC/O_PP from ``_append_market_condition_gates``, and
-    O_STK has no entry gate of its own to hang them on."""
-    assert mod._MARKET_CONDITION_STRATEGIES == mod._PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"}
+    leaves from ``_option_entry_rule``, O_CC/O_PP from ``_append_market_condition_gates``, the
+    classic equity strategies S1-S7 from ``_append_equity_market_condition_gates`` (design
+    2026-09-15 Task 11, deferral lifted 2026-09-29 -- see
+    test_launcher_equity_market_conditions.py), and O_STK has no entry gate of its own to hang
+    leaves on."""
+    assert mod._MARKET_CONDITION_STRATEGIES == (
+        mod._PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"} | mod._EQUITY_MARKET_CONDITION_STRATEGIES)
     assert "O_STK" not in mod._MARKET_CONDITION_STRATEGIES
-    assert not (mod._MARKET_CONDITION_STRATEGIES & {"S1", "S2", "S5", "S7"})
+    assert mod._MARKET_CONDITION_STRATEGIES & {"S1", "S2", "S5", "S7"} == {"S1", "S2", "S5", "S7"}
 
 
 def test_an_ungated_run_is_not_restricted_by_strategy(monkeypatch):
@@ -1191,7 +1197,7 @@ def test_an_ungated_run_is_not_restricted_by_strategy(monkeypatch):
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {})
     block = _gated_block()
     before = json.loads(json.dumps(block))
-    assert mod._apply_market_conditions("optimize-batch", block, _built("O_LC"), "S1") == {}
+    assert mod._apply_market_conditions("optimize-batch", block, _built("O_LC"), "O_STK") == {}
     assert block == before
 
 
