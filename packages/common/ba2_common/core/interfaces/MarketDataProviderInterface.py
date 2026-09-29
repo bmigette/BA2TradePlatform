@@ -8,6 +8,7 @@ All data providers should extend this class and implement the fetch methods.
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, time, timezone
 from typing import List, Optional, Dict, Any
+import numpy as np
 import pandas as pd
 import os
 import threading
@@ -616,6 +617,17 @@ class MarketDataProviderInterface(DataProviderInterface):
 
         fetch_start = last_bar_naive + interval_td
         fetch_end = now + interval_td
+        if interval not in _INTRADAY_INTERVALS:
+            # DAILY-or-longer: never append blindly across a split (APH 2026-09-28). See
+            # _verified_tail_topup and ba2_common.core.ohlcv_topup_guard.
+            df, action = self._verified_tail_topup(df, symbol, interval, provider_name, fetch_end)
+            if action == "append":
+                from ba2_common.core import native_cache
+                try:
+                    native_cache.write_timeseries(provider_name, symbol, interval, df)
+                except OSError as e:   # the old top-up's policy: the verified frame is still served
+                    logger.warning(f"Failed to refresh parquet cache for {symbol} ({interval}): {e}")
+            return self._report_split_basis_drift(df, symbol, interval, provider_name)
         try:
             new_df = self._get_ohlcv_data_impl(symbol, fetch_start, fetch_end, interval)
             if new_df is not None and not new_df.empty:
@@ -645,6 +657,140 @@ class MarketDataProviderInterface(DataProviderInterface):
             )
         return self._report_split_basis_drift(df, symbol, interval, provider_name)
 
+    # ---- verified daily top-up (APH 2026-09-28) ---------------------------------------------
+    #: ``(provider, SYMBOL, interval) -> (monotonic time, message)`` of a refused top-up. A refusal
+    #: is re-raised from here for ``TOPUP_REFUSAL_MEMO_S`` instead of asking the vendor again on
+    #: every read of the symbol; it is raised (loud) every time either way.
+    _TOPUP_REFUSED: dict = {}
+    TOPUP_REFUSAL_MEMO_S = 600.0
+
+    def _topup_split_calendar(self, symbol: str, interval: str):
+        """``(splits, failed)`` for the top-up guard: the provider's split calendar minus the rows
+        an operator excluded (``split_basis_overrides`` ``exclude_calendar_event``), or ``None``
+        when the provider has none; ``failed`` when it has one that could not be read now."""
+        try:
+            splits = self._split_calendar(symbol, interval)
+        except Exception as e:  # noqa: BLE001 -- reported, and the guard then refuses a split-sized step
+            logger.warning(f"Split calendar unavailable for {symbol} ({interval}); the top-up is "
+                           f"verified on the overlap bars alone: {e}")
+            return None, True
+        if not splits:
+            return splits, False
+        from ba2_common.core import split_basis_overrides as ovr
+        excluded = {e.event_date for e in ovr.overrides_for(symbol)
+                    if e.kind == ovr.KIND_EXCLUDE_CALENDAR_EVENT}
+        return [s for s in splits if s.date not in excluded], False
+
+    def _verified_tail_topup(self, df: pd.DataFrame, symbol: str, interval: str,
+                             provider_name: str, fetch_end: datetime, *,
+                             raise_fetch_errors: bool = False):
+        """Top ``df`` (a cached DAILY history) up to ``fetch_end`` without ever mixing split bases.
+
+        Returns ``(frame, action)``:
+
+        * ``"unchanged"`` -- nothing new (or the vendor could not be reached: logged, cached frame
+          served, exactly the old top-up's failure policy -- unless ``raise_fetch_errors``, for a
+          caller that reports its own failures);
+        * ``"append"``    -- the vendor agrees with the last ``TOPUP_OVERLAP_BARS`` cached bars, so
+          its newer bars are appended (and cached provisional snapshots among the compared bars
+          replaced by the vendor's final bars). NOT written: the caller writes ``frame``;
+        * ``"replaced"``  -- the vendor re-based its history (a split) or the new bars cross a
+          calendar split: :meth:`force_full_refetch` REPLACED the cached history (written, marker
+          included, the refuse-shorter check applied), after checking the replacement reproduces
+          the vendor answer that triggered it. Logged at WARNING.
+
+        Anything else raises ``OHLCVTopUpRefused`` and writes NOTHING: an overlap that disagrees
+        with no split to explain it, a vendor that has not adjusted its pre-split bars yet, a
+        split-sized step while the calendar is unreadable, or a failed replacement. Shared by the
+        live refresh (``_refresh_parquet_if_stale``) and the test platform's ``fetch-cache``
+        (``extend_ohlcv_cache``), the two writers that extend a cached history the backtests read.
+        """
+        import time as _time
+        from ba2_common.core import ohlcv_topup_guard as guard
+
+        key = (provider_name, str(symbol).upper(), interval)
+        memo = type(self)._TOPUP_REFUSED.get(key)
+        if memo is not None:
+            if _time.monotonic() - memo[0] < self.TOPUP_REFUSAL_MEMO_S:
+                raise guard.OHLCVTopUpRefused(
+                    f"{memo[1]} [refused {int(_time.monotonic() - memo[0])}s ago; the vendor is "
+                    f"asked again after {int(self.TOPUP_REFUSAL_MEMO_S)}s]")
+            type(self)._TOPUP_REFUSED.pop(key, None)
+
+        def refuse(msg: str, cause: Optional[BaseException] = None):
+            full = (f"{provider_name} {symbol} ({interval}): top-up REFUSED, cache left untouched "
+                    f"-- {msg}")
+            type(self)._TOPUP_REFUSED[key] = (_time.monotonic(), full)
+            logger.error(full)
+            if cause is not None:
+                raise guard.OHLCVTopUpRefused(full) from cause
+            raise guard.OHLCVTopUpRefused(full)
+
+        df = df.copy()
+        df['Date'] = pd.to_datetime(df['Date'])
+        days = guard.day_index(df['Date'])
+        tail_days = days[-guard.TOPUP_OVERLAP_BARS:]
+        probe_start = tail_days[0].to_pydatetime()
+        try:
+            probe = self._get_ohlcv_data_impl(symbol, probe_start, fetch_end, interval)
+        except Exception as e:  # noqa: BLE001 -- the old top-up's policy: serve the cache, say so
+            if raise_fetch_errors:
+                raise
+            logger.warning(f"Failed to refresh parquet cache for {symbol} ({interval}): {e}")
+            return df, "unchanged"
+        if probe is None or probe.empty:
+            return df, "unchanged"
+        probe = self._clean_dataframe(probe.copy())
+        if probe.empty:
+            return df, "unchanged"
+        probe['Date'] = self._match_tz(pd.to_datetime(probe['Date']), df['Date'])
+        probe_days = guard.day_index(probe['Date'])
+
+        splits, calendar_failed = self._topup_split_calendar(symbol, interval)
+        verdict = guard.verify_topup(df.tail(guard.TOPUP_OVERLAP_BARS), probe, splits,
+                                     calendar_failed=calendar_failed, symbol=symbol)
+
+        if verdict.appendable:
+            last_day = days.max()
+            fresh = probe[np.asarray(probe_days > last_day)].copy()
+            prov = {pd.Timestamp(d) for d in verdict.provisional_days}
+            replace = probe[np.asarray(probe_days.isin(prov))].copy()
+            if fresh.empty and replace.empty:
+                return df, "unchanged"
+            if 'effective_date' not in df.columns:
+                df['effective_date'] = df['Date']
+            if not replace.empty:
+                df = df[~np.asarray(days.isin(prov))]
+                logger.info(f"{provider_name} {symbol} ({interval}): replaced {len(replace)} cached "
+                            f"provisional bar(s) {sorted(d.date().isoformat() for d in prov)} "
+                            f"(snapshots taken before the session closed) with the vendor's final "
+                            f"bars")
+            new_df = pd.concat([replace, fresh], ignore_index=True)
+            new_df['effective_date'] = new_df['Date']
+            df = pd.concat([df, new_df], ignore_index=True)
+            df = (df.drop_duplicates(subset=['Date'])
+                    .sort_values('Date')
+                    .reset_index(drop=True))
+            return df, "append"
+
+        if verdict.needs_full_refetch:
+            logger.warning(
+                f"{provider_name} {symbol} ({interval}): FULL RE-FETCH instead of a top-up -- "
+                f"{verdict.reason}. Replacing the cached history (last cached bar "
+                f"{days.max().date()}).")
+            cached_days = [d.date() for d in tail_days]
+            try:
+                out = self.force_full_refetch(
+                    symbol, interval, provider_name=provider_name,
+                    verify=lambda fresh: guard.verify_replacement(probe, fresh, cached_days,
+                                                                  symbol=symbol))
+            except Exception as e:  # noqa: BLE001 -- ANY failure: the old basis must not be extended
+                refuse(f"{verdict.reason}; the full re-fetch that must replace it failed "
+                       f"({type(e).__name__}: {e})", cause=e)
+            return out, "replaced"
+
+        refuse(verdict.reason)
+
     # ---- split-basis drift (market-condition source contract, plan Task 6) ----------
     #: Providers whose daily history is delivered split-adjusted AS OF THE FETCH set this, so a
     #: cold full fill records a full-fetch marker (``ba2_common.core.split_basis``) and a later
@@ -666,10 +812,12 @@ class MarketDataProviderInterface(DataProviderInterface):
                                   provider_name: str) -> pd.DataFrame:
         """REPORT (never repair) a cached history that is not verifiably on one split basis.
 
-        The top-up above APPENDS bars after the last cached one, so a symbol that split after its
-        file was first fetched holds unadjusted pre-split bars next to adjusted post-split bars --
-        a fake 2x/4x/10x move every reader (the market-condition gates included) would take as
-        real. Daily-or-longer intervals only. A split-calendar failure is logged and the refresh
+        The top-up used to APPEND bars after the last cached one blindly, so a symbol that split
+        after its file was first fetched holds unadjusted pre-split bars next to adjusted
+        post-split bars -- a fake 2x/4x/10x move every reader (the market-condition gates
+        included) would take as real. Since 2026-09-28 (APH) the daily top-up itself refuses to
+        write such a file (:meth:`_verified_tail_topup`); this report covers the files damaged
+        before that, and anything the overlap check cannot see. Daily-or-longer intervals only. A split-calendar failure is logged and the refresh
         result is served unchanged.
 
         IT ONLY REPORTS, deliberately. This runs inside the LIVE analysis pass, on every stale
@@ -720,7 +868,8 @@ class MarketDataProviderInterface(DataProviderInterface):
         return df
 
     def force_full_refetch(self, symbol: str, interval: str = '1d',
-                           provider_name: Optional[str] = None) -> pd.DataFrame:
+                           provider_name: Optional[str] = None, *,
+                           verify=None) -> pd.DataFrame:
         """REPLACE (never merge) the cached daily history of ``symbol`` with a fresh full-history
         fetch -- the same 15-year window as the cold fill -- and record the full-fetch marker.
 
@@ -734,9 +883,14 @@ class MarketDataProviderInterface(DataProviderInterface):
         ``check_split_basis`` return ``refetched`` and skip the check, so the loss would hide
         itself. The marker is therefore written only after a replacement that passed this.
 
+        ``verify`` (optional) is called with the replacement frame after those checks and before
+        anything is written; it raises to refuse the replacement (the verified top-up uses it to
+        demand that the re-fetch reproduces the vendor answer that triggered it).
+
         Raises:
             RuntimeError: the fetch returned nothing, or returned less than the cache already
-                holds (the existing file is left untouched in both cases)."""
+                holds, or ``verify`` refused it (the existing file is left untouched in every
+                case)."""
         from ba2_common.core import native_cache
         from ba2_common.core.split_basis import write_full_fetch_marker
 
@@ -772,6 +926,8 @@ class MarketDataProviderInterface(DataProviderInterface):
         out = out.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
         out['effective_date'] = out['Date']
         self._refuse_shorter_replacement(out, existing_path, symbol, interval, provider_name)
+        if verify is not None:
+            verify(out)
         native_cache.write_timeseries(provider_name, symbol, interval, out)
         path = native_cache.find_timeseries_path(provider_name, symbol, interval)
         write_full_fetch_marker(path, first_bar=pd.Timestamp(out['Date'].iloc[0]).date(),
