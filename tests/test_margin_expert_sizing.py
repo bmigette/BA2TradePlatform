@@ -209,15 +209,31 @@ def test_trade_action_virtual_equity_propagates_a_NON_benign_error(monkeypatch):
 class _ExpertWithMoney:
     """The expert's own available-balance guard is not under test in this section:
     it answers with more money than any order below, so only the per-instrument
-    cap can produce an error."""
+    cap can produce an error.
+
+    ``get_setting_with_interface_default`` delegates to a REAL ``MockExpert`` so the
+    per-instrument cap -- resolved through this same seam since 2026-09-29 -- keeps
+    reading the stored ``ExpertSetting`` row ``_cap_errors`` writes below, exactly as
+    it did when ``_validate_position_size_limits`` read that row directly.
+    """
+
+    def __init__(self, expert_instance_id):
+        from tests.conftest import MockExpert
+        self._real = MockExpert(expert_instance_id)
 
     def get_available_balance(self, exclude_transaction_id=None):
         return 10_000_000.0
 
+    def get_setting_with_interface_default(self, key, log_warning=True):
+        return self._real.get_setting_with_interface_default(key, log_warning=log_warning)
+
 
 class _ExpertOnlyResolver:
+    def __init__(self, expert_instance_id):
+        self._expert_instance_id = expert_instance_id
+
     def get_expert_instance(self, expert_id):
-        return _ExpertWithMoney()
+        return _ExpertWithMoney(self._expert_instance_id)
 
     def get_account_instance(self, account_id):
         raise NotImplementedError
@@ -267,7 +283,7 @@ def _cap_errors(monkeypatch, factor, quantity, *, max_position_pct=10.0,
         expunge_after_flush=True,
     )
     monkeypatch.setattr("ba2_common.core.instance_resolver._resolver",
-                        _ExpertOnlyResolver())
+                        _ExpertOnlyResolver(expert_instance.id))
 
     transaction = create_transaction(
         symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,

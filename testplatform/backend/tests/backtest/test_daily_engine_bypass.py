@@ -128,6 +128,17 @@ def _build_run(account_id=51, expert_id=51):
         enter_market_ruleset_id=ruleset_id,
         instance_id=expert_id,
     )
+    # The account-level per-instrument cap (AccountInterface._validate_position_size_limits)
+    # now resolves to the DECLARED default (10%) when nothing is stored, closing the bug where
+    # a bypass expert with no stored cap silently skipped this check (2026-09-29). This stub
+    # targets a fixed 30% (TARGET_WEIGHT) to exercise realistic rebalance behaviour, not the
+    # cap itself, so it needs a cap wide enough to admit that target.
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import ExpertSetting
+
+    add_instance(ExpertSetting(
+        instance_id=expert_id, key="max_virtual_equity_per_instrument_percent",
+        value_float=50.0))
 
     ps = AsOfPriceSource(ohlcv_provider=None)
     ps.load_bars("AAPL", _bar_rows(BARS))

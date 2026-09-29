@@ -66,6 +66,50 @@ def _accepts_kwarg(fn, name: str) -> bool:
     return False
 
 
+def _refuse_legacy_max_weight_per_name(raw_settings: Dict[str, Any]) -> None:
+    """Raise LOUDLY if the retired ``max_weight_per_name`` setting (fraction 0-1,
+    FactorRanker-only) is present anywhere in ``raw_settings`` -- an old stored DB row, an
+    old GA genome or an old deploy payload. It was unified into the platform-wide
+    ``max_virtual_equity_per_instrument_percent`` (percent, shared with every other
+    expert) on 2026-09-29; silently ignoring a leftover value would run the book at the
+    OTHER setting's cap instead of the one the operator/GA actually chose, with no sign
+    anything changed. Shared by the live settings-resolution path (``self.settings``) and
+    the backtest path (``context.settings``) -- one function, two callers.
+    """
+    legacy = raw_settings.get("max_weight_per_name")
+    if legacy is None:
+        return
+    try:
+        as_percent = f"{float(legacy) * 100.0:g}"
+    except (TypeError, ValueError):
+        as_percent = "<unreadable>"
+    raise ValueError(
+        f"FactorRanker: setting 'max_weight_per_name' ({legacy!r}) is retired -- the "
+        f"per-name cap is now the platform-wide 'max_virtual_equity_per_instrument_percent' "
+        f"(a PERCENT, not a fraction). Set max_virtual_equity_per_instrument_percent="
+        f"{as_percent} instead (the old value x 100) and remove max_weight_per_name."
+    )
+
+
+def _validate_instrument_cap_percent(cap_percent: Any) -> float:
+    """``max_virtual_equity_per_instrument_percent`` (percent) -> validated per-name
+    weight fraction in (0, 1]. Raises ValueError naming the setting for a missing value or
+    anything outside (0, 100] -- no clamping, no fallback (CLAUDE.md: no defaults that hide
+    missing config)."""
+    if cap_percent is None:
+        raise ValueError(
+            "FactorRanker: max_virtual_equity_per_instrument_percent is required "
+            "(no stored value and no interface default resolved)"
+        )
+    value = float(cap_percent)
+    if not (0 < value <= 100):
+        raise ValueError(
+            f"FactorRanker: max_virtual_equity_per_instrument_percent must be in "
+            f"(0, 100], got {cap_percent!r}"
+        )
+    return value / 100.0
+
+
 class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
     """Configurable cross-sectional multi-factor equity ranker."""
 
@@ -96,8 +140,8 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
     # row per factor (momentum/value/quality/pead) -- see
     # _build_export_metrics below. factor_weight_*/winsorize_pct/
     # pead_drift_window_days directly shape those. Excludes: top_n/weighting/
-    # max_weight_per_name/gross_exposure (portfolio CONSTRUCTION across a
-    # book, never reflected in a single-symbol composite/factor display);
+    # max_virtual_equity_per_instrument_percent/gross_exposure (portfolio CONSTRUCTION
+    # across a book, never reflected in a single-symbol composite/factor display);
     # universe_source/min_price/min_dollar_volume/screener_store (universe
     # RESOLUTION, moot here since export_symbol_data pins the universe to
     # exactly the requested symbol regardless of these).
@@ -183,12 +227,10 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
                 "tooltip": "equal (default): every held name gets the same weight. score: "
                            "proportional to the composite factor score. rank: linear in rank -- "
                            "of N names the best gets N parts, the next N-1, ... the last 1. In "
-                           "every mode no name exceeds max_weight_per_name; weight a capped name "
-                           "cannot take goes to the others, and to cash once all are capped.",
-            },
-            "max_weight_per_name": {
-                "type": "float", "required": False, "default": 0.10,
-                "description": "Maximum portfolio weight per holding (0-1).",
+                           "every mode no name exceeds max_virtual_equity_per_instrument_percent "
+                           "(the platform-wide per-instrument cap, shared with every other "
+                           "expert); weight a capped name cannot take goes to the others, and to "
+                           "cash once all are capped.",
             },
             "gross_exposure": {
                 "type": "float", "required": False, "default": 1.0,
@@ -570,14 +612,19 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
     # all four data fetchers; _process is pure (composite_score/rank/construction).
     # ------------------------------------------------------------------
     _FACTOR_SETTING_KEYS = (
-        "winsorize_pct", "top_n", "weighting", "max_weight_per_name",
+        "winsorize_pct", "top_n", "weighting", "max_virtual_equity_per_instrument_percent",
         "gross_exposure", "pead_drift_window_days",
     )
 
     def _resolve_factor_settings(self) -> Dict[str, Any]:
         """Resolve the construction settings _process consumes into a plain dict,
         plus the per-factor weights under ``_factor_weights`` (so _process never
-        reads self for config — matches the optimizer-override flow)."""
+        reads self for config — matches the optimizer-override flow).
+
+        Refuses loudly first if the retired ``max_weight_per_name`` is still stored on
+        this instance (checked against the RAW settings, since it is no longer in
+        ``_FACTOR_SETTING_KEYS`` and would otherwise be silently dropped)."""
+        _refuse_legacy_max_weight_per_name(self.settings)
         settings = self._resolve_settings(self._FACTOR_SETTING_KEYS)
         settings["_factor_weights"] = self._factor_weights()
         return settings
@@ -733,7 +780,8 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             ranked, comp,
             top_n=int(settings["top_n"]),
             weighting=settings["weighting"],
-            max_weight_per_name=float(settings["max_weight_per_name"]),
+            max_weight_per_name=_validate_instrument_cap_percent(
+                settings["max_virtual_equity_per_instrument_percent"]),
             gross_exposure=gross_exposure,
         )
         book = self._build_book(
@@ -757,8 +805,16 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         optimizer's ``model:factor_weight_*`` genes are honoured (the GA overrides arrive via
         ``context.settings``, not on ``self``), falling back to this expert's interface default
         for any weight the engine did not pass. Without this every bar raised
-        ``KeyError('_factor_weights')`` and the bypass expert silently traded nothing."""
+        ``KeyError('_factor_weights')`` and the bypass expert silently traded nothing.
+
+        Refuses loudly first if the retired ``max_weight_per_name`` rides along on
+        ``context.settings`` (an old genome or deploy payload decoded verbatim) — the SAME
+        refusal the live path raises, so a re-run of a pre-2026-09-29 genome fails instead of
+        silently sizing against the wrong cap. ``max_virtual_equity_per_instrument_percent``
+        gets the same live-path fallback as the factor weights: the GA's ``model:*`` gene wins
+        when present, else this expert's declared interface default."""
         settings = dict(context.settings)
+        _refuse_legacy_max_weight_per_name(settings)
         settings.setdefault("_factor_weights", {
             name: float(
                 settings.get(f"factor_weight_{name}",
@@ -766,6 +822,9 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
                 or 0.0)
             for name in _FACTOR_PIPELINE
         })
+        settings.setdefault(
+            "max_virtual_equity_per_instrument_percent",
+            self.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent"))
         self._gather_settings = settings
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, settings, as_of)

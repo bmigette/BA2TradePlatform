@@ -1445,15 +1445,23 @@ _EXPERT_OPT = {
             "factor_weight_quality": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
             "factor_weight_pead": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
             "top_n": {"optimize": True, "min": 10, "max": 40, "step": 5, "type": "int"},
-            "max_weight_per_name": {"optimize": True, "min": 0.05, "max": 0.20, "step": 0.05, "type": "float"},
+            # UNIFIED WITH THE PLATFORM-WIDE PER-INSTRUMENT CAP (2026-09-29): FactorRanker's own
+            # max_weight_per_name (fraction 0-1) is retired in favour of every other expert's
+            # max_virtual_equity_per_instrument_percent (percent), which the account-level
+            # position-size check now also enforces for FactorRanker (previously a no-op for it —
+            # see AccountInterface._validate_position_size_limits). Same range as the old gene
+            # (0.05-0.20), expressed as a percent (5.0-20.0) with the platform's usual 5-point step.
+            "max_virtual_equity_per_instrument_percent": {
+                "optimize": True, "min": 5.0, "max": 20.0, "step": 5.0, "type": "float"},
             # CATEGORICAL (2026-09-28): how the top_n picks share the book. The choices are the
             # expert's own declared values, in its order (FactorRanker.get_settings_definitions()
             # ["weighting"]["valid_values"]; a test pins the two lists equal). "rank" is linear in
             # rank (of N picks the best gets N parts ... the last 1), "score" is proportional to
             # the composite score, "equal" is 1/N; every mode stays capped by
-            # max_weight_per_name. Lands on the expert setting of the same name (model:weighting
-            # -> expert_overrides -> the trial's expert settings -> the deploy's expert_params),
-            # which is why it is no longer pinned in fixed_settings below: one source.
+            # max_virtual_equity_per_instrument_percent. Lands on the expert setting of the same
+            # name (model:weighting -> expert_overrides -> the trial's expert settings -> the
+            # deploy's expert_params), which is why it is no longer pinned in fixed_settings below:
+            # one source.
             "weighting": {"optimize": True, "type": "choice",
                           "choices": ["equal", "score", "rank"]},
         },

@@ -1,7 +1,9 @@
 """FactorRanker ``weighting`` is a GA gene, end to end: gene -> trial -> book -> deploy.
 
 7c270156 gave the expert setting ``weighting`` a third mode, ``rank`` (linear in rank, still
-capped by ``max_weight_per_name``). This file pins that the optimizer can SEARCH it and that the
+capped by ``max_virtual_equity_per_instrument_percent``, the platform-wide per-instrument cap that
+replaced FactorRanker's own ``max_weight_per_name`` on 2026-09-29). This file pins that the
+optimizer can SEARCH it and that the
 searched value is the value that trades, in the backtest and in the deployed instance:
 
   1. GENE SPACE   the launcher's FactorRanker space (``_bypass_gene_space``) run through the
@@ -86,7 +88,7 @@ def _genome(space, weighting: str, **pins) -> Dict[str, Any]:
         "model:factor_weight_quality": 0.0,
         "model:factor_weight_pead": 0.0,
         "model:top_n": 10,
-        "model:max_weight_per_name": 0.2,      # non-binding for top_n=10 under both modes
+        "model:max_virtual_equity_per_instrument_percent": 20.0,  # non-binding for top_n=10
         "model:risk_per_trade_pct": 10.0,
     }
     ga = GeneticOptimizer(param_ranges=space, population_size=2, n_generations=1)
@@ -173,7 +175,7 @@ def test_the_rest_of_the_factorranker_space_is_unchanged():
     assert set(space) == {
         "model:factor_weight_momentum", "model:factor_weight_value",
         "model:factor_weight_quality", "model:factor_weight_pead", "model:top_n",
-        "model:max_weight_per_name", GENE, "model:risk_per_trade_pct",
+        "model:max_virtual_equity_per_instrument_percent", GENE, "model:risk_per_trade_pct",
     }
 
 

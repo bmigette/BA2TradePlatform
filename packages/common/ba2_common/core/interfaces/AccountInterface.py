@@ -1233,48 +1233,6 @@ class AccountInterface(ReadOnlyAccountInterface):
 
         return errors
 
-    def _get_expert_settings_for_validation(self, expert_instance) -> Optional[Dict[str, Any]]:
-        """
-        Load expert settings from database for validation.
-        
-        Args:
-            expert_instance: The ExpertInstance object
-            
-        Returns:
-            Optional[Dict[str, Any]]: Settings dictionary or None if error
-        """
-        try:
-            from ba2_common.core.models import ExpertSetting
-            from sqlmodel import select
-            from ba2_common.core.db import get_db
-
-            # Expert settings are loaded directly from the database below; the
-            # concrete expert class is resolved by the live host (InstanceResolver)
-            # rather than imported here, so ba2_common never depends on the expert
-            # package layout.
-
-            # Manually load expert settings from database
-            with get_db() as session:
-                expert_settings_rows = session.exec(
-                    select(ExpertSetting).where(ExpertSetting.instance_id == expert_instance.id)
-                ).all()
-                
-                # Build settings dict
-                settings = {}
-                for setting_row in expert_settings_rows:
-                    if setting_row.value_float is not None:
-                        settings[setting_row.key] = setting_row.value_float
-                    elif setting_row.value_str is not None:
-                        settings[setting_row.key] = setting_row.value_str
-                    elif setting_row.value_json:
-                        settings[setting_row.key] = setting_row.value_json
-                
-                return settings
-                
-        except (ImportError, AttributeError) as e:
-            logger.warning(f"Could not load expert {expert_instance.expert} for position size validation: {e}")
-            return None
-    
     def _get_transaction_entry_order(self, transaction_id) -> Optional[TradingOrder]:
         """Return the first (entry) order for a transaction, loaded within a session.
 
@@ -1548,13 +1506,42 @@ class AccountInterface(ReadOnlyAccountInterface):
                 logger.warning(f"Expert instance {transaction.expert_id} not found for transaction {transaction.id}")
                 return errors
             
-            # Get expert settings
-            settings = self._get_expert_settings_for_validation(expert_instance)
-            if not settings:
+            # Get the position-size cap the SAME way the classic risk manager does
+            # (TradeRiskManagement.py): resolve the LIVE expert instance through the injected
+            # InstanceResolver (the seam every other cross-package reader of this setting uses —
+            # see _validate_expert_available_balance below), then read the setting through
+            # get_setting_with_interface_default so a stored value wins but an UNSTORED one
+            # falls back to the expert class's DECLARED default instead of skipping the check.
+            #
+            # BUG THIS REPLACES (found 2026-09-29): the old code loaded ONLY the raw DB rows via
+            # ``_get_expert_settings_for_validation`` and did ``settings.get(key)`` with no
+            # fallback, so an expert instance with no stored row for this key skipped this
+            # defense-in-depth gate entirely while the classic RM (which always reads through
+            # get_setting_with_interface_default) applied the declared 10% -- a gate that was a
+            # silent no-op for exactly the experts most likely to rely on it (bypass experts,
+            # e.g. FactorRanker, which have no risk manager of their own).
+            from ba2_common.core.instance_resolver import get_instance_resolver
+
+            expert = get_instance_resolver().get_expert_instance(expert_instance.id)
+            if not expert:
+                # UNRESOLVABLE EXPERT TYPE IS NOT A PASS, same rule as every other "cannot
+                # validate" branch in this method: report it loudly and refuse the order rather
+                # than silently skipping the cap.
+                logger.error(
+                    f"POSITION SIZE VALIDATION CANNOT RUN for {trading_order.symbol}: expert "
+                    f"instance {expert_instance.id} (type {expert_instance.expert!r}) could not "
+                    f"be resolved to a live expert via the InstanceResolver. Rejecting the order "
+                    f"rather than treating an unrun risk check as passed."
+                )
+                errors.append(
+                    f"Cannot validate position size limits: expert type "
+                    f"{expert_instance.expert!r} (instance {expert_instance.id}) could not be "
+                    f"resolved. Refusing the order rather than skipping the check."
+                )
                 return errors
-            
-            # Get position size limit setting
-            max_position_pct = settings.get("max_virtual_equity_per_instrument_percent")
+
+            max_position_pct = expert.get_setting_with_interface_default(
+                "max_virtual_equity_per_instrument_percent", log_warning=False)
             if max_position_pct is None:
                 # Setting not defined - skip validation
                 return errors
@@ -1660,12 +1647,36 @@ class AccountInterface(ReadOnlyAccountInterface):
                 current_price, max_position_pct, virtual_equity
             )
             errors.extend(position_size_errors)
-            
-            # Validate expert available balance (defense-in-depth)
-            balance_errors = self._validate_expert_available_balance(
-                trading_order, transaction, expert_instance, current_price
-            )
-            errors.extend(balance_errors)
+
+            # Validate expert available balance (defense-in-depth) -- but NOT for a
+            # ``bypasses_classic_rm`` expert (e.g. FactorRanker). That guard models the
+            # CLASSIC RM's world: one order at a time, each spending down a REMAINING
+            # cash-like balance (``get_available_balance``, itself CASH-based -- see
+            # get_virtual_balance's "finding 6" docstring). A bypass expert instead submits
+            # a whole basket in one rebalance, every order sized off the SAME equity
+            # snapshot taken up front (get_virtual_equity) -- so the very first buy in that
+            # basket already "spends" the cash-based balance toward zero (or negative) for
+            # every order after it, on a metric the bypass sizer never consulted in the
+            # first place. Discovered 2026-09-29 when fixing the per-instrument cap default
+            # (below) stopped an unset cap from ALSO silently skipping this unrelated guard
+            # for every FactorRanker instance -- exposing that FactorRanker's own rebalance
+            # ADDs were being refused by a check built for a different execution model. The
+            # per-instrument cap above still runs unconditionally: it is a stateless,
+            # single-order check and stays meaningful. This mirrors
+            # ``get_expert_properties()['uses_risk_manager']`` / the daily engine's routing
+            # of bypass experts around TradeRiskManagement and TradeActionEvaluator entirely.
+            if getattr(expert, "bypasses_classic_rm", False):
+                logger.debug(
+                    f"Expert available-balance check skipped for order {trading_order.id} "
+                    f"({trading_order.symbol}): expert {expert_instance.id} "
+                    f"({expert_instance.expert}) bypasses the classic RM and sizes its own "
+                    f"basket off one equity snapshot, not a sequentially-spent balance."
+                )
+            else:
+                balance_errors = self._validate_expert_available_balance(
+                    trading_order, transaction, expert_instance, current_price
+                )
+                errors.extend(balance_errors)
                 
         except Exception as e:
             # A CRASH IN A RISK CONTROL IS NOT A PASS. This used to log a warning and
