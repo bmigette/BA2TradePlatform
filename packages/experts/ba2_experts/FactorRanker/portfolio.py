@@ -32,15 +32,17 @@ _OpenedTxn = namedtuple("_OpenedTxn", ["id", "open_price", "open_qty"])
 
 
 class ProtectiveStopError(RuntimeError):
-    """A rebalance could not give a name the protective stop its rule asks for.
+    """An ADD refused by the per-symbol max-loss rule.
 
-    Today: an ADD whose stop -- priced by the rule on the position the add would create --
-    sits at or above the current price. Placing it would put a sell stop above market (it
-    fires at once, or the broker refuses it); buying more of a name already past its loss
-    budget is not what the rule means either. The add is refused and the rebalance finishes
-    the other names, then raises this naming every refused one. RAISED, never logged and
-    continued; the backtest engine lets it through instead of treating it as a bad bar, and
-    the live analysis fails with it (``FactorRanker.run_analysis`` re-raises).
+    The add's stop -- priced by the rule on the position the add would create -- sits at or
+    above the current price: the combined position would already be past its loss budget, so
+    the rule's answer is "do not add". Raised by ``_submit_buy`` before anything is sent for
+    the name. ``rebalance`` catches it: the refusal is a STRATEGY DECISION, not a failure
+    (2026-09-29). It skips that add, finishes the other names, logs a WARNING naming every
+    refused add and records them on ``last_refused_adds`` -- identically live and in the
+    backtest, which counts them in its results. Until 2026-09-29 the rebalance re-raised it:
+    live failed that day's analysis and carried on the next, while the backtest crashed the
+    whole trial, so one refused add in six years zeroed a GA genome.
     """
 
 
@@ -148,6 +150,8 @@ class FactorPortfolioManager:
         instance = get_instance(ExpertInstance, expert_instance_id)
         self.account_id = instance.account_id
         self.account = resolver.get_account_instance(instance.account_id)
+        # The adds the LAST rebalance refused under the max-loss rule (see ProtectiveStopError).
+        self.last_refused_adds: List[str] = []
 
     # ------------------------------------------------------------------
     # Holdings
@@ -327,10 +331,14 @@ class FactorPortfolioManager:
             f"FactorRanker[{self.expert_instance_id}]: rebalance submitted {len(submitted)} orders "
             f"(equity={equity:.2f}, deltas={deltas})"
         )
+        # A refused add is the max-loss rule deciding "do not add" -- acted on (skipped), stated
+        # loudly, recorded; never a crash (see ProtectiveStopError).
+        self.last_refused_adds = refused
         if refused:
-            raise ProtectiveStopError(
+            logger.warning(
                 f"FactorRanker[{self.expert_instance_id}]: rebalance refused {len(refused)} "
-                f"add(s) (the other {len(submitted)} order(s) stand): " + "; ".join(refused))
+                f"add(s) under the per-symbol max-loss rule (the other {len(submitted)} "
+                f"order(s) stand): " + "; ".join(refused))
         return submitted
 
     def _quantity_units(self, symbols) -> Dict[str, float]:

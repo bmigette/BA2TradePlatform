@@ -241,6 +241,33 @@ def test_bypass_expert_rebalances_and_rm_not_invoked(monkeypatch):
         ctx.__exit__(None, None, None)
 
 
+def test_a_refused_add_does_not_end_the_run_and_is_counted(monkeypatch):
+    """A rebalance that refuses an add under the per-symbol max-loss rule (ProtectiveStopError,
+    caught inside ``rebalance``) is a rule DECISION: the run carries on to the last bar, exactly
+    as live carries on the next day, and the engine counts it. Until 2026-09-29 the engine
+    re-raised it and the whole GA trial crashed (goal2027atr opt 525, JPM +1)."""
+    from ba2_experts.FactorRanker import portfolio as pf_mod
+
+    engine, account, expert, ctx, ps = _build_run()
+    try:
+        orig_rebalance = pf_mod.FactorPortfolioManager.rebalance
+
+        def _refusing_rebalance(self, target_weights, equity=None):
+            orders = orig_rebalance(self, target_weights, equity)
+            self.last_refused_adds = ["JPM +1: rule stop 86.5580 >= price 84.8900"]
+            return orders
+
+        monkeypatch.setattr(pf_mod.FactorPortfolioManager, "rebalance", _refusing_rebalance,
+                            raising=True)
+
+        results = engine.run()
+
+        assert len(account.get_balance_history()) == len(BARS)
+        assert results["refused_adds"] == len(BARS)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 def test_real_factorranker_carries_bypass_marker():
     """Sanity: the real FactorRanker class declares the bypass marker the engine branches on,
     and a non-bypass clean expert does not (so the engine routes them differently)."""

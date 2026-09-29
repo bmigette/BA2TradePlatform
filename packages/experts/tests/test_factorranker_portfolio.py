@@ -185,8 +185,9 @@ def test_stop_below_zero_is_refused():
 # --- an add is never protected by a stop at/above market (review 2026-09-29) ------------------
 # The add's stop is priced by the rule on the position the add CREATES. When that lands at or
 # above the current price, placing it would put a sell stop above market; the add is refused
-# before anything is sent for the name, the rest of the rebalance proceeds, and the rebalance
-# then RAISES ProtectiveStopError naming the refused names.
+# before anything is sent for the name, the rest of the rebalance proceeds, and the refusal is
+# logged and recorded on ``last_refused_adds`` -- a rule decision, never a crash (2026-09-29:
+# re-raising it crashed whole backtest trials while live simply carried on the next day).
 
 class _BuyAccount:
     def __init__(self, price):
@@ -231,10 +232,10 @@ def test_an_add_whose_rule_stop_is_below_market_is_sent_with_it():
     assert sl == pytest.approx(100.0 - 1_000.0 / 110)
 
 
-def test_the_rebalance_finishes_the_other_names_then_raises_for_the_refused_add():
-    from ba2_experts.FactorRanker.portfolio import ProtectiveStopError
-
+def test_the_rebalance_skips_the_refused_add_records_it_and_does_not_raise(monkeypatch):
+    from ba2_experts.FactorRanker import portfolio as pf_mod
     pm = _pm(_Expert(risk_pct=1.0, equity=100_000.0))
+    pm.last_refused_adds = []
     pm.account = _BuyAccount(price=50.0)
     held = {"AAA": 100.0}
     pm.get_holdings = lambda: (held, {"AAA": [_HeldTrans(100, 100.0)]})
@@ -242,7 +243,11 @@ def test_the_rebalance_finishes_the_other_names_then_raises_for_the_refused_add(
 
     # AAA: 100 held, target $10,000 at $50 -> +100 (refused, rule stop above market);
     # BBB: new name, $5,000 at $50 -> 100 shares, sent.
-    with pytest.raises(ProtectiveStopError, match="refused 1 add"):
-        pm.rebalance({"AAA": 0.1, "BBB": 0.05})
+    warnings = []
+    monkeypatch.setattr(pf_mod.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+    orders = pm.rebalance({"AAA": 0.1, "BBB": 0.05})
 
     assert [(s, q) for s, q, _ in pm.account.submitted] == [("BBB", 100)]
+    assert [o.symbol for o in orders] == ["BBB"]
+    assert len(pm.last_refused_adds) == 1 and "AAA" in pm.last_refused_adds[0]
+    assert any("refused 1 add" in w for w in warnings)

@@ -429,6 +429,9 @@ class DailyBacktestEngine:
         # (``_bypass_veq_pct`` lived here too until 2026-08-06; it existed solely to feed the
         # per-bar stop pass its equity, and went with it.)
         self._bypass_pm: Dict[int, Any] = {}
+        # Adds the bypass manager refused under its per-symbol max-loss rule, over the run
+        # (RECORDED, NOT SCORED; see FactorRanker.portfolio.ProtectiveStopError).
+        self._refused_adds = 0
 
         # Entry-option path: when the run's enter_market action IS an option action (pure-option
         # entry, no equity leg), the option action must size + submit itself — so the entry runs
@@ -1525,14 +1528,12 @@ class DailyBacktestEngine:
 
         try:
             # Reuse the run-constant portfolio manager (built once; see _bypass_manager).
-            self._bypass_manager(expert_id).rebalance(targets)
+            pm = self._bypass_manager(expert_id)
+            pm.rebalance(targets)
+            # A refused add is a rule decision the manager already skipped and logged, exactly
+            # as live; the run carries on and counts it.
+            self._refused_adds += len(pm.last_refused_adds)
         except Exception as e:  # noqa: BLE001 — a rebalance failure must not kill the run
-            from ba2_experts.FactorRanker.portfolio import ProtectiveStopError
-            if isinstance(e, ProtectiveStopError):
-                # Not a bad bar: the rebalance refused an add whose rule stop is at/above
-                # market (see ProtectiveStopError). Live fails the analysis (run_analysis
-                # re-raises); the backtest fails the run the same way.
-                raise
             self._log(f"bypass rebalance failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
 
     # -- option expiry / exercise / assignment ------------------------------
@@ -1944,6 +1945,8 @@ class DailyBacktestEngine:
             "initial_capital": float(self.account._cfg["starting_cash"]),
             # RECORDED, NOT SCORED -- see ``_record_uncovered_assigned``.
             "uncovered_assigned_bars": self._uncovered_assigned_metric(),
+            # RECORDED, NOT SCORED: bypass adds refused under the per-symbol max-loss rule.
+            "refused_adds": self._refused_adds,
         }
         # NOTE: the market-condition block is NOT emitted here. ``run_daily_backtest`` discards
         # this payload and builds the persisted one from the account, so a copy here would be a
