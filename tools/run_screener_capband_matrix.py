@@ -265,6 +265,12 @@ def main() -> int:
     ap.add_argument("--generations", type=int, default=8)
     ap.add_argument("--mutation-prob", type=float, default=None,
                     help="Per-gene mutation probability passthrough (default: launcher's 0.3).")
+    ap.add_argument("--early-stop", type=int, default=None,
+                    help="GA early-stop patience passthrough (default: the launcher's own, 4). "
+                         "Forwarded only when given, so existing grid commands are unchanged.")
+    ap.add_argument("--early-stop-min-rel", type=float, default=None,
+                    help="Minimum RELATIVE gain (a fraction, 0.01 = 1%%) that resets the "
+                         "early-stop patience; passthrough, forwarded only when given.")
     ap.add_argument("--interval", default="5min")
     ap.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points, modeled at the fill-engine "
@@ -435,6 +441,10 @@ def main() -> int:
             cmd += ["--sizing-mode", args.sizing_mode]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]
+        if args.early_stop is not None:
+            cmd += ["--early-stop", str(args.early_stop)]
+        if args.early_stop_min_rel is not None:
+            cmd += ["--early-stop-min-rel", str(args.early_stop_min_rel)]
         # "Pass 0 to disable" (see the --profit-cap-pct help): a 0 must be FORWARDED, because
         # omitting the flag lets ba2test_launcher re-apply its own 2000/25 default instead.
         cmd += cap_passthrough(args)
