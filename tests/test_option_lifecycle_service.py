@@ -58,7 +58,12 @@ EXPIRY_NEAR = date(2026, 5, 29)
 
 # ------------------------------------------------------------------------ settings
 #: A complete, ordinary short-premium configuration. Individual tests override one key.
+#: ``risk_manager_mode`` is ``classic_options`` because that is the ONE mode this pass ever
+#: engages for (``option_risk_manager_enabled``, the same predicate the backtest's
+#: ``_option_sleeves`` dispatches on) -- a sleeve tested here IS a classic_options sleeve
+#: unless a test says otherwise.
 BASE_SETTINGS = {
+    "risk_manager_mode": "classic_options",
     "profit_capture_pct": 50.0,
     "strangle_capture_pct": 25.0,
     "tested_delta_enabled": False,
@@ -94,6 +99,12 @@ class FakeExpert:
     A key the expert does not declare raises ``ValueError``, exactly as
     ``get_setting_with_interface_default`` does — that is the shape the service has to
     survive when an expert has no option settings at all.
+
+    ``settings`` mirrors ``ExtendableSettingsInterface.settings`` (a plain dict of every
+    declared value): the ``classic_options`` gate reads ``getattr(expert, "settings",
+    None)``, exactly what ``daily_engine`` reads for the SAME ``option_risk_manager_enabled``
+    dispatch, so the double has to carry the same shape or the gate would engage/decline on
+    a fixture artefact instead of the setting under test.
     """
 
     def __init__(self, settings: Dict, expert_id: int = 1):
@@ -105,6 +116,10 @@ class FakeExpert:
         if key not in self._settings:
             raise ValueError(f"Setting {key!r} not found in FakeExpert interface definitions")
         return self._settings[key]
+
+    @property
+    def settings(self) -> Dict:
+        return dict(self._settings)
 
     def run_analysis(self, *a, **k):          # must NEVER be called by the pass
         self.run_analysis_calls += 1
@@ -1332,6 +1347,108 @@ def test_a_threshold_only_one_rule_needs_is_reported_not_raised(monkeypatch, wir
     assert result.aborted is True
     assert account.submitted == []
     assert any("tested_delta" in m for m in errors), errors
+
+
+# ===========================================================================
+# THE classic_options GATE: this pass runs for exactly the sleeves the backtest's
+# ``_option_sleeves`` does -- ``option_risk_manager_enabled`` over the expert's own
+# ``settings`` mapping, read the SAME way (``getattr(expert, "settings", None)``). The bug
+# this section pins: expert 1 in production was a DeterministicScorer long-call sleeve
+# (``risk_manager_mode`` not ``classic_options``) holding 3 open structures and none of the
+# classic_options-only thresholds -- because it never opted into them, exactly like its
+# backtest never calls ``update_sleeve_breaker`` for it. The live pass ran anyway and
+# aborted loudly every cycle; it must now do nothing at all for that sleeve.
+# ===========================================================================
+def test_a_non_classic_options_expert_is_left_alone(monkeypatch, wired):
+    """No ERROR, no abort, no breaker call, no decision -- for a sleeve outside
+    ``classic_options`` that holds open structures and declares none of this pass's
+    thresholds. This is the exact production shape: a DeterministicScorer sleeve whose
+    exits are its ruleset's ``close_option`` rules.
+
+    FAILS ON THE UNMODIFIED CODE: without the gate, ``_lifecycle_settings`` sees the sleeve
+    holds structures but declares none of ``REQUIRED_SETTINGS`` and aborts with an ERROR
+    naming every missing threshold.
+    """
+    account, expert, expert_row = wired
+    expert._settings = {"risk_manager_mode": "smart"}
+    open_credit_spread(account, expert_row, expiry=EXPIRY_NEAR)
+    quote_spread(account, expiry=EXPIRY_NEAR, **CAPTURED)
+    errors = _capture_errors(monkeypatch)
+    breaker_calls: List = []
+    decide_calls: List = []
+    monkeypatch.setattr(svc, "update_sleeve_breaker",
+                        lambda **kw: breaker_calls.append(kw))
+    monkeypatch.setattr(svc, "decide",
+                        lambda *a, **kw: decide_calls.append((a, kw)) or [])
+
+    result = run(expert_row)
+
+    assert result.aborted is False, result.abort_reason
+    assert result.decisions == []
+    assert account.submitted == []
+    assert errors == []
+    assert breaker_calls == [], "the classic_options-only breaker transition must not run"
+    assert decide_calls == [], "decide() must not run for a non-classic_options sleeve"
+
+
+def test_a_garbage_risk_manager_mode_is_also_left_alone_not_treated_as_engaged(
+        monkeypatch, wired):
+    """``option_risk_manager_enabled`` fails OPEN on an unadmitted mode string (its own
+    WARNING, once). The gate must inherit that, not silently run the pass for garbage."""
+    account, expert, expert_row = wired
+    expert._settings = {"risk_manager_mode": "not-a-real-mode"}
+    open_credit_spread(account, expert_row, expiry=EXPIRY_NEAR)
+    quote_spread(account, expiry=EXPIRY_NEAR, **CAPTURED)
+    errors = _capture_errors(monkeypatch)
+
+    result = run(expert_row)
+
+    assert result.aborted is False
+    assert result.decisions == []
+    assert errors == []
+
+
+def test_a_classic_options_expert_with_missing_thresholds_still_aborts_loudly(
+        monkeypatch, wired):
+    """The classic_options path must be byte-for-byte unchanged: the gate must not swallow
+    the loud abort a classic_options sleeve still earns when it does not declare its rails.
+    """
+    account, expert, expert_row = wired
+    assert expert._settings["risk_manager_mode"] == "classic_options"
+    del expert._settings["profit_capture_pct"]
+    open_credit_spread(account, expert_row, expiry=EXPIRY_NEAR)
+    quote_spread(account, expiry=EXPIRY_NEAR)
+    errors = _capture_errors(monkeypatch)
+
+    result = run(expert_row)
+
+    assert result.aborted is True
+    assert account.submitted == []
+    assert any("profit_capture_pct" in m for m in errors), errors
+
+
+def test_a_classic_options_expert_with_thresholds_still_runs_decide(monkeypatch, wired):
+    """The positive case the gate must not break: a properly configured ``classic_options``
+    sleeve is still managed -- the breaker transitions and ``decide`` is still called."""
+    account, expert, expert_row = wired
+    assert expert._settings["risk_manager_mode"] == "classic_options"
+    open_credit_spread(account, expert_row, expiry=EXPIRY_NEAR)
+    quote_spread(account, expiry=EXPIRY_NEAR, **CAPTURED)
+    decide_calls: List = []
+    real_decide = svc.decide
+
+    def spy(*a, **kw):
+        decide_calls.append((a, kw))
+        return real_decide(*a, **kw)
+
+    monkeypatch.setattr(svc, "decide", spy)
+
+    result = run(expert_row)
+
+    assert result.aborted is False
+    assert len(decide_calls) == 1
+    assert result.decisions != []
+    assert [s.transaction_id for s in result.submitted] != []
 
 
 def test_an_expert_with_no_options_and_no_thresholds_is_silent(monkeypatch, wired):
