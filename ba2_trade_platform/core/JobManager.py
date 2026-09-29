@@ -246,15 +246,11 @@ class JobManager:
         
         # Schedule all expert jobs
         self._schedule_all_expert_jobs()
-        
-        # Schedule account refresh job
-        self._schedule_account_refresh_job()
 
-        # Schedule the daily ATM-IV sampler that feeds IVRankCondition.
-        self._schedule_iv_snapshot_job()
-
-        # Fetch the macro series before the open (DeterministicScorer's regime inputs).
-        self._schedule_fred_preopen_job()
+        # Schedule every non-expert ("system") job -- account refresh, the daily
+        # ATM-IV sampler, the pre-open FRED refresh, and (once the warm queue is up)
+        # the warm settlement jobs. See _schedule_system_jobs for why this is ONE call.
+        self._schedule_system_jobs()
 
         # Watch it for the rest of the process lifetime: losing this job is silent.
         self._start_account_refresh_watchdog()
@@ -367,17 +363,15 @@ class JobManager:
                 self._scheduler.remove_all_jobs()
                 self._scheduled_jobs.clear()
                 self._schedule_all_expert_jobs()
-                # remove_all_jobs() above also deletes the NON-expert jobs, so the
-                # account refresh job must be re-established here. Without this it was
-                # silently dropped on the first "refresh all schedules" and account /
-                # order / transaction reconciliation stopped for 4 days while the
-                # process kept trading (2026-07-23 incident).
-                self._schedule_account_refresh_job()
-                # Same trap, second occupant: the post-close warm and its daily
-                # close re-resolve are non-expert jobs too.
-                self._schedule_warm_jobs()
-                # Third: the pre-open FRED refresh.
-                self._schedule_fred_preopen_job()
+                # remove_all_jobs() above also deletes every NON-expert ("system") job --
+                # account refresh, the ATM-IV sampler, the pre-open FRED refresh, the warm
+                # settlement jobs -- so they must all be re-established here. Without this
+                # the account refresh job was silently dropped on the first "refresh all
+                # schedules" and account/order/transaction reconciliation stopped for 4
+                # days while the process kept trading (2026-07-23 incident); the IV
+                # snapshot job had the identical bug (2026-09-29). See
+                # _schedule_system_jobs for the single list this now reads from.
+                self._schedule_system_jobs()
 
         logger.info("Expert schedules refreshed successfully")
     
@@ -603,12 +597,12 @@ class JobManager:
                 
         # Re-schedule all jobs
         self._schedule_all_expert_jobs()
-        # The removal loop above walks _scheduled_jobs, which also holds the
-        # non-expert "account_refresh_job" -- re-establish it or reconciliation
-        # stops silently (see _refresh_expert_schedules_sync for the same trap).
-        self._schedule_account_refresh_job()
-        # ...and the pre-open FRED refresh, which sits in _scheduled_jobs too.
-        self._schedule_fred_preopen_job()
+        # The removal loop above walks _scheduled_jobs, which also holds every
+        # non-expert ("system") job -- re-establish all of them or reconciliation,
+        # the IV sampler, the FRED refresh and/or the warm jobs stop silently (see
+        # _refresh_expert_schedules_sync for the same trap, and _schedule_system_jobs
+        # for the single list this reads from).
+        self._schedule_system_jobs()
         logger.info("Scheduled jobs refreshed")
         
     def _schedule_all_expert_jobs(self):
@@ -625,6 +619,35 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error scheduling expert jobs: {e}", exc_info=True)
     
+    def _schedule_system_jobs(self):
+        """(Re)establish every non-expert ("system") scheduled job, idempotently.
+
+        THE single list of system jobs, and the single function that restores all of
+        them. Every code path that can wipe scheduled jobs -- ``start()``,
+        ``_refresh_expert_schedules_sync``'s full-refresh branch, and
+        ``refresh_scheduled_jobs`` -- calls this afterward instead of hand-picking
+        which non-expert jobs to bring back, which is exactly how the account refresh
+        job (2026-07-23) and the IV snapshot job (2026-09-29) were each silently
+        dropped by one refresh path that forgot it while another remembered.
+
+        Idempotent and safe to call at any time, including before its subsystem is up:
+        - ``_schedule_account_refresh_job``, ``_schedule_iv_snapshot_job`` and
+          ``_schedule_fred_preopen_job`` each call ``add_job(..., replace_existing=True)``,
+          so calling them again just re-arms the same job id.
+        - ``_schedule_warm_jobs`` is itself guarded on the warm queue being up (it is a
+          no-op before ``initialize_warm_service`` has run, e.g. during ``start()``,
+          where the warm hasn't started yet and re-establishes its own job when it does).
+
+        No silent failure: each ``_schedule_*`` call below wraps its own work in a
+        try/except that logs an ERROR naming the specific job before returning, so one
+        job failing to (re)schedule can never take the others down with it and can
+        never fail invisibly.
+        """
+        self._schedule_account_refresh_job()
+        self._schedule_iv_snapshot_job()
+        self._schedule_fred_preopen_job()
+        self._schedule_warm_jobs()
+
     def _schedule_warm_jobs(self):
         """Re-establish the background warm's scheduled jobs, if the warm is running.
 
