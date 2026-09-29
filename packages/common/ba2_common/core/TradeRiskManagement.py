@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
-from ba2_common.core.interfaces.ExtendableSettingsInterface import trading_permission
+from ba2_common.core.interfaces.ExtendableSettingsInterface import trading_permission, coerce_bool
 from ba2_common.logger import logger
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, ExpertInstance, Transaction
 from ba2_common.core.types import OrderStatus, OrderDirection, TransactionStatus
@@ -75,7 +75,7 @@ DECISION_TRACE_FIELDS = (
     "existing_allocation", "cap_available", "balance_before",
     "max_qty_by_instrument", "max_qty_by_balance", "balance_after", "binding",
     "stop_price", "stop_distance_pct", "risk_budget_pct", "risk_dollars", "qty_by_risk",
-    "refusal_reason",
+    "refusal_reason", "safeguard_candidate",
 )
 
 
@@ -1484,7 +1484,7 @@ class TradeRiskManagement:
                     # unprotected just because it isn't in risk_atr mode -- attach the same
                     # safeguard stop here (quantity-neutral: it only sets order.stop_price so the
                     # existing bracket mechanism creates a protective SL leg).
-                    self._ensure_safeguard_stop(order, symbol, current_price, expert)
+                    self._ensure_safeguard_stop(order, symbol, current_price, expert, trace=trace)
 
                 if not sized_by_risk:
                     # Calculate maximum affordable quantity based on available equity per instrument
@@ -1765,7 +1765,8 @@ class TradeRiskManagement:
         from ba2_common.core.regime_overlay import get_stressed, regime_scale
         return regime_scale(expert, setting_name, get_stressed())
 
-    def _ensure_safeguard_stop(self, order, symbol: str, current_price: float, expert) -> None:
+    def _ensure_safeguard_stop(self, order, symbol: str, current_price: float, expert,
+                               trace: Optional[Dict[str, Any]] = None) -> None:
         """Write a protective stop-loss to ``order.stop_price`` when the strategy's exit
         conditions left none — REGARDLESS of ``sizing_mode``. An entry with no explicit SL must
         never trade fully unprotected just because it happens to be sized in ``notional`` mode
@@ -1775,6 +1776,11 @@ class TradeRiskManagement:
         wins). The caller (live TradeManager / backtest daily_engine, both share this method) must
         pass the result as ``submit_order(..., sl_price=order.stop_price)`` — the EXISTING bracket
         mechanism — for the WAITING_TRIGGER protective SL leg to actually be created.
+
+        ``trace`` (optional, result-neutral): the caller's per-order sizing trace, if it has one.
+        Records ``safeguard_candidate`` (atr_grid_2027 design §3.3) next to the other DECISION_
+        TRACE_FIELDS -- which candidate (ATR / risk% / the min_stop_pct floor) the safeguard stop
+        actually came from, so results can report the ATR-bound share of entries.
         """
         if order.stop_price:
             return
@@ -1798,7 +1804,13 @@ class TradeRiskManagement:
         # use_atr_stop off -> ignore ATR entirely and size purely off risk_per_trade_pct%
         # (still floored at min_stop_loss_pct%). Lets the GA/user drop ATR when its implied
         # stops are too tight and causing frequent whipsaw (see synthesize_safeguard_stop).
-        use_atr_stop = bool(expert.get_setting_with_interface_default('use_atr_stop', log_warning=False))
+        #
+        # coerce_bool, NOT bool(): the setting arrives as a GA int gene (backtest path) or a
+        # stored string (live path), and bool("0") is True -- the exact historical defect that
+        # kept this toggle silently on/off backwards until coerce_bool existed (see
+        # _INERT_RM_TOGGLES / strategy_param_space.INERT_RM_TOGGLES).
+        use_atr_stop = coerce_bool(
+            expert.get_setting_with_interface_default('use_atr_stop', log_warning=False))
 
         # REGIME OVERLAY (stop distance): all three inputs are DISTANCES here -- risk_pct and
         # min_stop_pct as percents of price, atr_mult as a multiple of ATR -- and
@@ -1819,14 +1831,16 @@ class TradeRiskManagement:
         if use_atr_stop:
             sl_atr = get_latest_atr(
                 symbol, self.indicator_provider, period=atr_period, end_date=self.as_of)
+        _synth_trace: Dict[str, Any] = {}
         sl = synthesize_safeguard_stop(
             current_price, order.side == OrderDirection.BUY, risk_pct,
-            atr=sl_atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct)
+            atr=sl_atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct, trace=_synth_trace)
         if sl:
             order.stop_price = sl
             self.logger.info(
                 f"  safeguard SL for {symbol}: ${sl:.2f} "
                 f"(min of ATR×{atr_mult:g} / {risk_pct:g}% risk, floor {min_stop_pct:g}%)")
+        self._trace_note(trace, safeguard_candidate=_synth_trace.get("safeguard_candidate"))
 
     def _risk_atr_quantity(self, order, symbol: str, current_price: float, expert,
                            max_position_value: float, available_balance: float,
@@ -1877,7 +1891,7 @@ class TradeRiskManagement:
         # fallback; safeguard: min-of-two floored) — when they disagreed (e.g. use_atr_stop=0
         # with risk% > min_stop%) the realized loss at the stop exceeded risk_per_trade_pct by up
         # to risk%/min_stop%.
-        self._ensure_safeguard_stop(order, symbol, current_price, expert)
+        self._ensure_safeguard_stop(order, symbol, current_price, expert, trace=trace)
 
         lot = (order.data or {}).get('lot_size') if order.data else None
         # Hoisted to a local ONLY so the run record can report the same figure the cash clamp

@@ -37,6 +37,13 @@ class _Expert:
         self._equity = equity
 
     def get_setting_with_interface_default(self, name, log_warning=True):
+        if name == "use_atr_stop" and name not in self._settings:
+            # See tests/test_classic_rm_run_detail.py's _FakeExpert for why: the real
+            # interface never returns None (it falls back to a declared default, True for
+            # this key), but that would need a real indicator_provider this fixture has
+            # none of, and no test here exercises ATR. False matches every run on record
+            # (INERT_RM_TOGGLES) and what this whole file already implicitly assumed.
+            return False
         return self._settings.get(name)
 
     def _get_enabled_instruments_config(self):

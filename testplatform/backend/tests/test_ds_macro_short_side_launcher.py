@@ -294,12 +294,20 @@ def test_every_option_fixed_setting_is_in_the_checkpoint_identity():
 
 
 def test_the_handler_folds_the_run_settings_into_its_checkpoint_fingerprint():
-    """Read from source: the GA loop needs a full optimization to exercise end to end."""
+    """Read from source: the GA loop needs a full optimization to exercise end to end.
+
+    A third argument, ``backtest_cfg.get("rm_toggles_unpinned")``, joined this call site
+    2026-09-29 (the atr_grid_2027 run policy, docs/strategy_research/atr_grid/
+    atr_grid_2027_design.md §3.2) -- see test_rm_toggle_policy_atr27.py for its own behaviour;
+    this test only pins that the call site still folds BOTH the expert-settings identity AND
+    the policy in, not just one or the other.
+    """
     import inspect
     from app.services import strategy_optimization_handler as H
     src = inspect.getsource(H).replace("\r\n", "\n")
     assert ("checkpoint_fingerprint(\n            param_space, ga, "
-            "checkpoint_expert_settings_identity(backtest_cfg))") in src
+            "checkpoint_expert_settings_identity(backtest_cfg),\n"
+            '            backtest_cfg.get("rm_toggles_unpinned"))') in src
 
 
 # --------------------------------------------------------------------------- #

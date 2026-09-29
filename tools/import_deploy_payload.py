@@ -105,7 +105,7 @@ _PINNED_RM_TOGGLES = {
 }
 
 
-def _apply_rm_toggles(expert_params: dict, enabled: dict) -> None:
+def _apply_rm_toggles(expert_params: dict, enabled: dict, *, label: str) -> None:
     """Set the currently-pinned RM toggles and SAY what was done, either way.
 
     OFF (the default, and what every backtest on record ran): a one-line notice per toggle naming
@@ -115,15 +115,41 @@ def _apply_rm_toggles(expert_params: dict, enabled: dict) -> None:
     deploy did NOT exercise the feature, so live stops matching it the moment the flag is passed.
     That is a legitimate thing to do on purpose (it is how the planned ATR baseline starts) and an
     expensive thing to do by accident.
+
+    ``expert_params`` already carries what the backtest this payload came from ACTUALLY ran with
+    for each toggle (the ONE TABLE in ba2_common.core.deploy_parity -- forced_expert_settings,
+    fed from the row's own model:* gene via app.api.backtests._executed_toggle). That EXERCISED
+    value is read BEFORE this function overwrites the dict with the CLI flag. A row that
+    exercised ``use_atr_stop=True`` (an atr-searched policy run whose winner searched the gene
+    ON) but is deployed without ``--use-atr`` would otherwise silently become
+    ``use_atr_stop=False`` on the live instance -- a DIFFERENT strategy from the one that was
+    scored. Refuse rather than guess (raises ValueError; the caller names the row and exits).
     """
     for setting, flag in _PINNED_RM_TOGGLES.items():
+        exercised = bool(expert_params.get(setting))
         on = bool(enabled.get(setting))
+        if exercised and not on:
+            raise ValueError(
+                f"the backtest this payload came from ran with {setting}=True (its genome "
+                f"exercised the gene) but {flag} was not passed. Deploying now would silently "
+                f"reset it to False on the live instance, which the backtest never scored -- "
+                f"pass {flag} to deploy it as-scored, or investigate why a payload disagrees "
+                f"with the pin.")
         expert_params[setting] = on
         if not on:
             genes = ("atr_multiplier / atr_period" if setting == "use_atr_stop"
                      else "regime_risk_scale / regime_stop_scale / regime_tp_scale")
             print(f"  {setting}=False (pinned; pass {flag} to enable) "
                   f"-- {genes} in this genome are INERT, not tuned values")
+        elif exercised:
+            # POLICY ROW: the backtest genuinely ran with this ON (atr_grid_2027 §3.2) -- the
+            # banner below (for the historical "pinned off in every run on record" case) would
+            # be a lie here, so it is reworded to say what actually happened.
+            print("  " + "!" * 74)
+            print(f"  !! {setting}=True -- ENABLED BY {flag}, and the backtest this payload")
+            print("  !! came from ACTUALLY EXERCISED it (an atr-searched policy run). This")
+            print("  !! deploy reproduces the backtest's stop behaviour as-scored.")
+            print("  " + "!" * 74)
         else:
             print("  " + "!" * 74)
             print(f"  !! {setting}=True -- ENABLED BY {flag}")
@@ -312,7 +338,11 @@ def main() -> int:
         # The pinned RM toggles, applied EXPLICITLY rather than inherited from the payload, so a
         # deploy always states its ATR/regime posture instead of silently carrying whatever the
         # exporting run happened to embed. Off by default = parity with the backtest.
-        _apply_rm_toggles(expert_params, enabled)
+        try:
+            _apply_rm_toggles(expert_params, enabled, label=label)
+        except ValueError as e:
+            print(f"FATAL: {label}: {e}")
+            return 1
         # Settings a payload omits when the backtest ran on the default, written EXPLICITLY:
         # save_settings never deletes, so an omitted key would keep whatever a PRIOR deploy put
         # there (e.g. macro_short_side="mirror" from an option genome under a new equity one).
