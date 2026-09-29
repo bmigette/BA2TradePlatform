@@ -54,7 +54,14 @@ logger = logging.getLogger(__name__)
 # This filter is the ONLY thing standing between a stored genome and decode_params, so a gene
 # namespace added to the search must be added here in the same change. Pinned by
 # testplatform/backend/tests/backtest/test_rerun_carries_schedule_genes.py.
-_GENE_PREFIXES = ("model", "screener", "cond", "exit", "entry", "schedule")
+#
+# "market" (atr_grid_2027 market master-gene addendum): the ONE ``market:enabled`` master gene.
+# Missing here it would be silently stripped before decode_params ever saw it, so a re-run of a
+# market-gated TOP-N row would decode as if the gene were simply absent (every individual
+# cond:*:mode / exit:*:enabled gene honoured unchanged) however the master gene actually
+# resolved when the GA scored it -- exactly the "gene namespace added to the search must be
+# added here" trap this comment already warns about.
+_GENE_PREFIXES = ("model", "screener", "cond", "exit", "entry", "schedule", "market")
 
 # Legacy-row fallbacks: standalone rows created before the run knobs were persisted don't carry a
 # seed / fill model. The re-run uses these so it can still execute (may differ slightly from the

@@ -57,6 +57,15 @@ Namespacing:
                                    group jobs so stage-1 winners seed the stage-2 space
   schedule:<day>                   ON/OFF toggle for that weekday's entry scan
   screener:<setting>               screener settings
+  market:enabled                   MASTER GENE (int 0/1; atr_grid_2027 market master-gene
+                                   addendum) -- present ONLY when the strategy template carries
+                                   at least one market-condition gate (a --market-condition-
+                                   profile was applied under --market-condition-mode searched).
+                                   ALWAYS the last key collect_param_space emits, so it never
+                                   shifts any other gene's index. 0 forces every market-condition
+                                   cond:*:mode gene to 'off' and every market exit rule's
+                                   exit:*:enabled gene to 0, overriding whatever those individual
+                                   genes decoded to; 1 (or absent) leaves them as decoded.
 
 The pre-028 namespaces (``exit:<id>:action_value`` with the action fields on
 the rule itself, ``entry:<id>:*`` for the flat entry_actions list) are decoded
@@ -69,41 +78,14 @@ from typing import Any, Dict, Optional
 
 from ba2_common.core.market_conditions import field_codes, field_spec
 from ba2_common.core.rule_models import MODE_OFF, NUMERIC_MODE_CHOICES, leaf_mode_kind
+from ba2_common.core.schedule_genes import (  # noqa: F401 -- re-bound for existing callers
+    SCHEDULE_DAYS,
+    WEEKDAYS as _WEEKDAYS,
+    repair_no_weekday as _repair_no_weekday,
+    schedule_override_from_genes,
+)
 
 logger = logging.getLogger(__name__)
-
-# Fixed order so the gene list (and therefore reproducibility) is stable across runs.
-SCHEDULE_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-# The days a daily-bar backtest actually has bars for. saturday/sunday stay in SCHEDULE_DAYS
-# (their genes are part of stored genomes and of the export/deploy reconstruction below), but
-# they can never produce a decision point on their own.
-_WEEKDAYS = SCHEDULE_DAYS[:5]
-
-
-def _repair_no_weekday(days: Dict[str, bool], option_run: bool) -> Dict[str, bool]:
-    """Force the first weekday ON when the genome is a dead config; the weekend flags are left
-    as they are. Shared by ``decode_params`` (what a trial runs) and
-    ``schedule_override_from_genes`` (what a re-run/export reconstructs) so the two cannot
-    drift apart.
-
-    OPTION runs (``option_run=True``): repaired when no WEEKDAY is on. A daily clock has no
-    saturday/sunday bars, so a weekend-only genome never scans for entries -- the same dead
-    config as all-OFF, which the fitness cannot tell from "just unlucky" (plan 2026-09-24
-    Task 5). Repair, don't reject.
-
-    EQUITY runs (``option_run=False``): repaired only when ALL seven days are off -- the
-    historical rule, kept unchanged on purpose. Stock backtests and grids must not change
-    behaviour (user rule): an equity weekend-only genome keeps scoring ZERO_TRADE exactly as
-    every stored equity result and every in-flight equity checkpoint was scored.
-
-    MUTATES ``days`` in place (and returns it for convenience); callers pass a dict they built
-    for this call.
-    """
-    dead = ((not any(days.get(day) for day in _WEEKDAYS)) if option_run
-            else (not any(days.values())))
-    if dead:
-        days[SCHEDULE_DAYS[0]] = True
-    return days
 
 
 def _strategy_is_option_run(strategy) -> bool:
@@ -502,6 +484,126 @@ def _collect_conditions(strategy) -> Dict[str, Any]:
     return out
 
 
+def _market_condition_field_names() -> set:
+    """Every registered market-condition FIELD name, across every profile.
+
+    Lazy import: a decode/collect call that touches no market-condition leaf at all (the
+    overwhelming majority — any run without ``--market-condition-profile``) never imports the
+    market-conditions registry.
+    """
+    from ba2_common.core.market_conditions import PROFILES
+
+    return {f.name for prof in PROFILES.values() for f in prof.fields}
+
+
+#: OPT-IN MARKER (atr_grid_2027 market master-gene addendum, review fix): whether a strategy
+#: TEMPLATE collects the ``market:enabled`` master gene at all. Stamped RULE-LEVEL by exactly
+#: two launcher functions -- ``_append_equity_market_condition_gates`` and
+#: ``_append_equity_market_exit_rules`` -- i.e. ONLY on the goal2027atr equity S1-S7 jobs, and
+#: only under ``--market-condition-mode searched``. Every other market-condition consumer
+#: (O_LC/O_CC/O_PP/... option strategies, the ``tools/strategy_research/exploration`` driver)
+#: builds its market leaves through OTHER functions (``_append_market_condition_gates``,
+#: ``_option_entry_rule``, ``market_conditions.py``'s own attach_exits) that never stamp it, so
+#: their gene space and checkpoint fingerprint are byte-identical to before this feature existed
+#: -- deliberately: those jobs pause/resume by gene-space identity, and silently adding a gene
+#: to an in-flight option/exploration job would restart it at generation 0.
+#:
+#: RULE-level, not leaf-level, on purpose: ``ConditionLeaf.to_canonical_dict``
+#: (``ba2_common.core.rule_models``) is a fixed whitelist that does not re-emit an unrecognised
+#: extra key, so a marker stamped on a LEAF is silently dropped by the very
+#: ``normalize_trade_rules`` call the launcher makes right after appending it.
+#: ``TradeRule.to_canonical_dict`` DOES preserve extras (``extra='allow'`` merges
+#: ``__pydantic_extra__`` back into the canonical dict), so the RULE is the only place this
+#: marker survives a normalize pass -- and, by the same JSON-round-trip mechanism, the Strategy
+#: row, a re-run, and an export (stripped from the DECODED artifact by ``_decode_rule_list``,
+#: since a decoded rule is a rule, not a template -- see its docstring).
+_MARKET_MASTER_GENE_MARKER = "market_master_gene"
+
+
+def _strategy_opts_into_market_master_gene(strategy) -> bool:
+    """Whether ANY rule of this strategy TEMPLATE carries :data:`_MARKET_MASTER_GENE_MARKER`.
+
+    This -- not ``_market_condition_members`` -- is what ``collect_param_space`` gates the
+    master gene on: field-membership alone (what ``_market_condition_members`` checks) is
+    family-agnostic and would also match option strategies and exploration jobs, which carry
+    real market-condition leaves of their own but must NOT collect this gene (see the marker's
+    own docstring)."""
+    for attr in ("entry_rules", "exit_rules"):
+        for rule in (getattr(strategy, attr, None) or []):
+            if isinstance(rule, dict) and (rule.get(_MARKET_MASTER_GENE_MARKER)
+                                           or rule.get("marketMasterGene")):
+                return True
+    return False
+
+
+def _market_condition_members(strategy) -> "tuple[set, set]":
+    """``(leaf_ids, rule_ids)`` of every market-condition gate on this Strategy TEMPLATE.
+
+    Used ONLY to RESOLVE ``market:enabled`` at decode time (which leaves/rules to force off) --
+    NOT to decide whether the gene is collected at all; that gating is
+    ``_strategy_opts_into_market_master_gene``, the opt-in marker check. Decode only ever
+    reaches this when ``market:enabled`` is actually present in the genome, which (for a genome
+    a real run produced) only happens for a strategy ``collect_param_space`` added the gene to
+    in the first place -- an equity S1-S7 template, whose market leaves/rules ALL come from the
+    marker-stamping functions. Broad field-based matching is therefore complete for that case
+    without itself needing the marker.
+
+    The FIELD decides membership, not the id spelling — mirrors the launcher's
+    ``_rename_market_condition_gates`` ("The FIELD decides, not the id spelling"). This is what
+    makes the master gene (``market:enabled``) a decode-time concept with no dependency on the
+    launcher's id conventions (``<prefix>-market-<short>``, ``<prefix>-mkt-exit-*`` etc.):
+
+    * a LEAF is a market-condition leaf when its own ``field`` is one of the registered
+      market-condition fields (``ba2_common.core.market_conditions.PROFILES``), however deep it
+      sits inside a mixed AND tree (the entry gates are appended into the SAME tree as the
+      strategy's ordinary confidence/price gates — design section 5.1);
+    * a RULE (entry or exit) is a market-condition rule when it DECLARES ITS OWN rule-level
+      ``toggle_optimize`` (the ``exit:<rid>:enabled`` gene) AND at least one of its own
+      condition leaves is a market-condition leaf. The ``toggle_optimize`` requirement is not
+      redundant: the equity S1-S7 entry rule (design section 5.1) has NO rule-level toggle of
+      its own — the market leaves are appended INTO its ordinary, always-present tree alongside
+      the strategy's own confidence/price gates — so treating "contains a market leaf" alone as
+      rule membership would make the master gene drop that WHOLE entry rule (every ordinary gate
+      with it) via a rule-level ``enabled`` gene the template never declared, instead of leaving
+      only the individual market leaf off. Every leaf the launcher's ``market_exit_rules``
+      builds IS a market field (``market_condition_templates.py``: structure_state /
+      trend_slope / adx) and every one of those rules DOES declare ``toggle_optimize`` — so this
+      still captures exactly the market-exit rules for every rule the launcher builds.
+
+    Returns ``(set(), set())`` for a strategy with no market-condition profile applied (the
+    ``none``/absent-profile case) and for an ``all-off`` control run (the launcher never
+    appends the leaves/rules there), which is exactly why the master gene is absent in both —
+    see ``collect_param_space``.
+    """
+    fields = _market_condition_field_names()
+    leaf_ids: set = set()
+    rule_ids: set = set()
+
+    def _walk_tree(node) -> bool:
+        """Recurse one condition (sub)tree; True if it or any descendant is a market leaf."""
+        if not isinstance(node, dict):
+            return False
+        found = False
+        for child in (node.get("conditions") or []):
+            if _walk_tree(child):
+                found = True
+        cid = node.get("id")
+        if cid and node.get("field") in fields:
+            leaf_ids.add(cid)
+            found = True
+        return found
+
+    for attr in ("entry_rules", "exit_rules"):
+        for rule in (getattr(strategy, attr, None) or []):
+            if not isinstance(rule, dict):
+                continue
+            has_market_leaf = _walk_tree(rule.get("conditions"))
+            rule_toggleable = bool(rule.get("toggle_optimize") or rule.get("toggleOptimize"))
+            if has_market_leaf and rule_toggleable and rule.get("id"):
+                rule_ids.add(rule["id"])
+    return leaf_ids, rule_ids
+
+
 def collect_param_space(
     strategy,
     expert_cfg: Optional[Dict[str, Any]] = None,
@@ -527,6 +629,23 @@ def collect_param_space(
         space.update(_collect_conditions(strategy))
         space.update(_collect_schedule_days(schedule_cfg))
     space.update(_collect_screener(screener_cfg))
+    # MASTER GENE (``market:enabled``), APPENDED LAST so every other gene's index is unchanged
+    # (atr_grid_2027 design, market master-gene addendum). Added iff this strategy TEMPLATE
+    # carries the OPT-IN MARKER (see ``_strategy_opts_into_market_master_gene`` /
+    # ``_MARKET_MASTER_GENE_MARKER``) -- i.e. ONLY the goal2027atr equity S1-S7 jobs
+    # (``ba2test_launcher._append_equity_market_condition_gates`` /
+    # ``_append_equity_market_exit_rules``, only under --market-condition-mode searched).
+    #
+    # Deliberately NOT "does the strategy carry any market-condition gene" (field membership
+    # alone, ``_market_condition_members``): option strategies (O_LC/O_CC/O_PP/...) and the
+    # ``tools/strategy_research/exploration`` driver ALSO gate on real market-condition fields,
+    # through OTHER launcher/driver code paths that never stamp the marker -- their gene space
+    # and checkpoint fingerprint must stay byte-identical to before this feature existed, or a
+    # paused/resumed option or exploration job would silently restart at generation 0 (review
+    # finding, 2026-09-29). bypass experts never collect cond:*/entry:*/exit:* at all (see
+    # above), so they get no master gene either -- there is nothing for it to control.
+    if not bypass and _strategy_opts_into_market_master_gene(strategy):
+        space["market:enabled"] = _range_entry(0, 1, 1, is_int=True)
     if not space:
         raise ValueError(
             "No optimizable parameters found: "
@@ -913,6 +1032,13 @@ def _decode_rule_list(rules, ns: str,
         rule["actions"] = actions
         if rule.get("conditions"):
             rule["conditions"] = _apply_to_tree(rule["conditions"], cond_by_id)
+        # The market-master-gene OPT-IN MARKER (_MARKET_MASTER_GENE_MARKER) is template
+        # provenance -- which launcher function built this rule -- not a rule the live/export
+        # artifact needs to carry, so it is stripped here exactly like a decoded leaf's
+        # mode_optimize/mode_choices (see _apply_mode's docstring: "a decoded leaf is a RULE,
+        # not a template").
+        rule.pop("market_master_gene", None)
+        rule.pop("marketMasterGene", None)
         out.append(rule)
     return out
 
@@ -940,6 +1066,7 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     screener_overrides: Dict[str, Any] = {}
     schedule_by_day: Dict[str, Any] = {}
     optsel_by_half: Dict[str, Dict[str, Any]] = {}
+    market_enabled: Optional[Any] = None
 
     def _rule_gene(store: Dict[str, Dict[str, Any]], rid: str, rest: str, val: Any) -> None:
         genes = store.setdefault(rid, {})
@@ -970,8 +1097,33 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         elif key.startswith("optsel:"):
             _, half, w = key.split(":", 2)
             optsel_by_half.setdefault(half, {})[w] = val
+        elif key.startswith("market:"):
+            field = key[len("market:"):]
+            if field != "enabled":
+                raise ValueError(
+                    f"Unknown market gene field {field!r} (only 'market:enabled' exists)")
+            market_enabled = val
         else:
             raise ValueError(f"Unknown decoded param namespace: {key!r}")
+
+    # MASTER GENE: market:enabled == 0 forces EVERY market-condition entry leaf's mode to 'off'
+    # and EVERY market-condition exit rule's toggle to 0, overriding whatever the individual
+    # genes decoded to -- byte-identical to a genome that carried those raw values (design
+    # requirement: "decode with enabled=0 == decode with every market mode off and every market
+    # exit toggle off"). Resolved HERE, once, in the one decode path every consumer shares (GA
+    # trial, top-N persist, re-run, robustness variant, deploy export, tools) so the exported/
+    # persisted strategy is already the resolved, off-switched shape -- live never needs to know
+    # the master gene exists. enabled=1 (or the gene simply absent, e.g. a genome predating it,
+    # or a strategy with no market genes at all) leaves every individual gene exactly as decoded.
+    if market_enabled is not None and int(market_enabled) == 0:
+        market_leaf_ids, market_rule_ids = _market_condition_members(strategy)
+        for cid in market_leaf_ids:
+            cond_by_id.setdefault(cid, {})["mode"] = MODE_OFF
+        for rid in market_rule_ids:
+            # A market rule lives in exactly one of entry_rules/exit_rules; setting it in both
+            # gene stores is harmless (the OTHER list's _decode_rule_list never sees this rid).
+            entry_genes.setdefault(rid, {})["enabled"] = 0
+            exit_genes.setdefault(rid, {})["enabled"] = 0
 
     # None (no unified-model template on this Strategy -- legacy buy_tree/exit_conditions
     # path) is preserved as None, NOT coerced to []: downstream (daily_backtest_handler's
@@ -1012,59 +1164,6 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         "entry_rules": entry_rules,
         "exit_rules": exit_rules,
     }
-
-
-def schedule_override_from_genes(
-    strategy_params: Optional[Dict[str, Any]],
-    base_override: Optional[Dict[str, Any]] = None,
-    weekdays_only: bool = False,
-    option_run: bool = False,
-) -> Optional[Dict[str, Any]]:
-    """The run_schedule_override a stored genome ACTUALLY ran with, or None if it has no
-    schedule genes.
-
-    ``_build_daily_trial_config`` lets a decoded ``schedule_days`` REPLACE the run-level
-    cadence for that individual, keeping only the run-level ``times``. Anything that
-    reconstructs a genome's config after the fact -- a re-run, an export, a deploy -- has to
-    reproduce that same replacement, or it silently reports/deploys the run-level cadence
-    instead of the days the GA selected. That is exactly how five live instances came to fire
-    on Mondays when their genomes had chosen Thursday, or Tue/Thu/Fri (2026-09-07).
-
-    Mirrors ``decode_params``' repair rule (``_repair_no_weekday``): a dead schedule gets the
-    first weekday forced back ON, because a config that never scans for entries is dead rather
-    than merely unlucky. ``option_run`` selects which rule, exactly as ``decode_params`` derives
-    it from the strategy (``_strategy_is_option_run``): no weekday on (options) vs all seven off
-    (equity, the default). Under ``weekdays_only`` the two rules coincide -- the filter has
-    already cleared the weekend -- which is why the deploy callers need not pass it.
-
-    ``weekdays_only`` translates the genome into the cadence it EFFECTIVELY ran, for callers
-    that drive a real scheduler rather than a bar loop. On a daily clock there are no weekend
-    bars, so a saturday/sunday gene is noise the GA was never able to evaluate -- it stays ON
-    in perfectly good genomes purely because nothing selected against it. A live deploy that
-    copies those bits arms a real Saturday cron and runs an entry pass into a closed market,
-    which is behaviour no backtest ever scored. Deploy paths pass True; anything reproducing a
-    backtest leaves it False so the reconstruction stays bit-for-bit.
-
-    Returns None when the genome predates the schedule genes, so the caller keeps whatever
-    run-level override it already had.
-    """
-    if not isinstance(strategy_params, dict):
-        return None
-    by_day = {
-        k[len("schedule:"):]: bool(v)
-        for k, v in strategy_params.items()
-        if isinstance(k, str) and k.startswith("schedule:")
-    }
-    if not by_day:
-        return None
-    days = {day: by_day.get(day, False) for day in SCHEDULE_DAYS}
-    if weekdays_only:
-        days = {day: (value and day in _WEEKDAYS) for day, value in days.items()}
-    # Same repair as decode_params, so a re-run reconstructs the days the trial actually ran
-    # with. With weekdays_only the filter above has already cleared the weekend, so an
-    # all-weekend genome deploys as Monday rather than as an instance that never scans at all.
-    days = _repair_no_weekday(days, option_run=option_run)
-    return {"days": days, "times": (base_override or {}).get("times") or ["09:30"]}
 
 
 #: Settings that never took effect in any run on record, pinned OFF so they still don't.

@@ -375,12 +375,14 @@ ALLOWLIST: dict = {
         "continuation line 3795, one past the outer .get(...)'s opening line 3794; plan "
         "Task 12's widget + guard then moved the pair to :3850/:3898, then :3889/:3939; the "
         "batch export/import toolbar + handlers moved them 127 lines down, :4016/:4066, then :4056/:4106; the trigger picker moved the pair again, :4215/:4265; the review fixes moved them once more, :4238/:4288; the ruleset rule picker added one import line, :4239/:4289); the UI consistency pass added the shared refresh_button import, :4240/:4290; the pullback/market-exits merge with origin/dev, :4245/:4295; the equity-short netting rule, :4240/:4290; the settings-display fix (declared defaults, no literals; 2026-09-22) and its load-failure guards, :4298/:4348; its review fixes (no-edit no-op, unset method, account save order), :4389/:4439; the declared app settings + dropdown errors, :4352/:4402; the re-review (no rewrite of stored values, forced-method errors), :4374/:4424; the fractional checkbox + _strike_param_text (2026-09-27), :4403/:4453",
-    "ba2_trade_platform/ui/components/performance_charts.py:475":
+    "packages/common/ba2_common/analytics/performance.py:50":
         "a transaction with no P&L counts as neither a win (>0) nor a loss (<0), which is the "
-        "right answer for an unmeasured trade (was :412 before max_drawdown_from_pnl, then :458 before PerformanceTable gained its mobile_hide column tagging)",
-    "ba2_trade_platform/ui/components/performance_charts.py:476":
+        "right answer for an unmeasured trade (was :412 before max_drawdown_from_pnl, then :458 before PerformanceTable gained its mobile_hide column tagging; "
+        "was ba2_trade_platform/ui/components/performance_charts.py:475 before calculate_win_loss_ratio moved verbatim to ba2_common.analytics.performance, site plan P0a)",
+    "packages/common/ba2_common/analytics/performance.py:51":
         "loss half of the same win-rate count; 0 is excluded from both tallies rather than "
-        "scored as either",
+        "scored as either (was ba2_trade_platform/ui/components/performance_charts.py:476 "
+        "before the P0a move)",
     "testplatform/backend/app/services/data_build_handler.py:126":
         "screener CONFIG bound: an absent price_min means 'no minimum', which is what 0.0 "
         "expresses; it is not a quote (was :157 before the prewarm handler moved to "

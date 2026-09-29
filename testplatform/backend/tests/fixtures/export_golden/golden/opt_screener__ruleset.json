@@ -1,0 +1,167 @@
+{
+ "backtest_id": 905,
+ "name": "synthetic-opt-screener-FMPRating",
+ "entry_rules": [
+  {
+   "continueProcessing": false,
+   "id": "buy",
+   "name": "enter-buy",
+   "conditions": {
+    "id": "syn-root",
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "buy-bullish",
+      "field": "bullish",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "buy-flat",
+      "field": "has_no_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "gate_recent_close",
+      "field": "days_since_last_close",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">",
+      "op": ">",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 10.0,
+      "valueMin": 0.0,
+      "value_min": 0.0,
+      "valueMax": 20.0,
+      "value_max": 20.0,
+      "valueStep": 2.0,
+      "value_step": 2.0,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     },
+     {
+      "id": "gate_recent_loss",
+      "field": "days_since_last_losing_close",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">",
+      "op": ">",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 6.0,
+      "valueMin": 0.0,
+      "value_min": 0.0,
+      "valueMax": 24.0,
+      "value_max": 24.0,
+      "valueStep": 3.0,
+      "value_step": 3.0,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "buy",
+     "action_type": "buy"
+    }
+   ],
+   "continue_processing": false
+  }
+ ],
+ "exit_rules": [
+  {
+   "continueProcessing": false,
+   "toggleOptimize": true,
+   "id": "exit_negative",
+   "conditions": {
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "xn",
+      "field": "rating_positive_to_negative",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "close",
+     "action_type": "close"
+    }
+   ],
+   "continue_processing": false,
+   "toggle_optimize": true
+  },
+  {
+   "continueProcessing": false,
+   "toggleOptimize": true,
+   "id": "exit_stale",
+   "conditions": {
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "xh",
+      "field": "days_opened",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">",
+      "op": ">",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 35.0,
+      "valueMin": 15.0,
+      "value_min": 15.0,
+      "valueMax": 105.0,
+      "value_max": 105.0,
+      "valueStep": 15.0,
+      "value_step": 15.0
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "close",
+     "action_type": "close"
+    }
+   ],
+   "continue_processing": false,
+   "toggle_optimize": true
+  }
+ ],
+ "optimized_genes": {
+  "cond:gate_confidence_floor:enabled": 0,
+  "cond:gate_confidence_floor:value": 55.0,
+  "cond:gate_profit_floor:enabled": 0,
+  "cond:gate_profit_floor:value": 4.5,
+  "cond:gate_recent_close:enabled": 1,
+  "cond:gate_recent_close:value": 10.0,
+  "cond:gate_recent_loss:enabled": 1,
+  "cond:gate_recent_loss:value": 6.0,
+  "cond:xa:value": 3.0,
+  "cond:xh:value": 35.0,
+  "exit:exit_flip:enabled": 0,
+  "exit:exit_negative:enabled": 1,
+  "exit:exit_stale:enabled": 1,
+  "exit:exit_trail:action_value": 1.5,
+  "exit:exit_trail:enabled": 0
+ }
+}
