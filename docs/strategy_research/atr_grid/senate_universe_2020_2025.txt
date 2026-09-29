@@ -30,6 +30,12 @@
 # 416 symbols NOT in it (Senate disclosures cover names -- foreign ADRs, bonds/ETPs, non-screened
 # caps -- the cap-band screener never surfaces). IAC is NOT in this universe, so the PHASE=atr
 # S17_EXCLUDE (IAC split-basis drift) does not apply to Senate.
+#
+# 2026-09-29: BRK.B and XSP REMOVED after the Senate market-condition snapshot build could not warm
+# them (BRK.B: no FMP data under that ticker spelling -- fetch_failed; XSP: the Mini-SPX index, not
+# a stock -- no_source_data). Neither can be priced by a Senate backtest either. Snapshots:
+# ohlcv-v1 8cd4a4bc34f1cf3b072b8de064eb66244dd8a0011d1df21773c3f4ce071c69f1,
+# ta-structure-v1 4eb35501180ecc51ff00ce60595caf0cc60247ef2f4fb43294c845aa7aae443d (727 symbols).
 A
 AA
 AAL
@@ -134,7 +140,6 @@ BNTX
 BP
 BR
 BRK-B
-BRK.B
 BRO
 BSX
 BTI
@@ -752,7 +757,6 @@ X
 XEL
 XNGSY
 XOM
-XSP
 XYL
 YUM
 ZBH

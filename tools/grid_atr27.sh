@@ -167,6 +167,9 @@ run_senate() {                     # $@ = extra driver args
     echo "FATAL: Senate universe file not found: $SENATE_UNIVERSE_FILE" >&2
     exit 1
   fi
+  # Published 2026-09-29 for the 727-symbol Senate universe (BRK.B / XSP removed, see its header).
+  MC_SEN_OHLCV="${MC_SEN_OHLCV:-8cd4a4bc34f1cf3b072b8de064eb66244dd8a0011d1df21773c3f4ce071c69f1}"
+  MC_SEN_TA="${MC_SEN_TA:-4eb35501180ecc51ff00ce60595caf0cc60247ef2f4fb43294c845aa7aae443d}"
   if [ -z "${MC_SEN_OHLCV:-}" ] || [ -z "${MC_SEN_TA:-}" ]; then
     echo "FATAL: PHASE=senate requires MC_SEN_OHLCV and MC_SEN_TA (the Senate market-condition" >&2
     echo "       snapshot digests). The equity snapshot (MC_OHLCV/MC_TA) does NOT cover the" >&2
