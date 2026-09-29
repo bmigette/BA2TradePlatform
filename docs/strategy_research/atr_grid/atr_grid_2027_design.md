@@ -144,17 +144,17 @@ From `s1_s7_relevance.md`:
   - DeterministicScorer: large, mid and small.
   - FMPSenateTraderWeight: one universe.
   - That makes 11 expert-bands.
-- **FactorRanker is re-run, as its own lane** (operator decision, 2026-09-28; this reverses the draft's exclusion). The equity-sizing fix and the narrowed `risk_per_trade_pct` range merged on 2026-09-29 (dev 8973675a). **It is ON HOLD** until the per-symbol cap unification merges; see §4.1.
+- **FactorRanker is re-run, as its own lane** (operator decision, 2026-09-28; this reverses the draft's exclusion). Its prerequisites (the equity-sizing fix, the narrowed `risk_per_trade_pct` range and the per-symbol cap unification) all merged on 2026-09-29; FactorRanker cells run on dev 8772a699 or later. See §4.1.
 - **Job count:** 11 expert-bands × 4 strategies − 2 (ICB S2) = **42 treatment jobs**. See §6 for controls. The FactorRanker jobs (§4.1) are counted and costed separately.
 
 ### 4.1 FactorRanker
 
-- **HOLD (2026-09-29): do not launch FactorRanker cells until the per-symbol cap unification merges** (approved by the operator on 2026-09-29; the BT session owns it and will send the merge commit).
-  - FactorRanker's own `max_weight_per_name` (0-1) is REMOVED. FactorRanker reads the platform-wide `max_virtual_equity_per_instrument_percent`, so there is one per-symbol cap.
-  - The GA gene is renamed to `max_virtual_equity_per_instrument_percent`, range 5-20 step 5 (percent; the same range as before).
-  - FactorRanker REFUSES a `max_weight_per_name` value, so a genome, seed or stored setting that still carries the old key fails on purpose. Never seed FactorRanker cells from pre-merge genomes.
-  - **All lanes, watch:** the same change makes the account-level position-size check honour declared defaults, which may move backtests. Re-check the classic lanes' reference numbers (§6 controls) on the merge commit before launch.
-  - Record the merge commit here when it lands.
+- **Per-symbol cap unification (merged 2026-09-29, dev 8772a699 / TEST 0110; feature f590afd2).**
+  - FactorRanker's own `max_weight_per_name` is REMOVED. FactorRanker reads the platform-wide `max_virtual_equity_per_instrument_percent`: one per-symbol cap.
+  - The GA gene is `max_virtual_equity_per_instrument_percent` in FactorRanker's `expert_params`, range 5-20 step 5 (percent).
+  - FactorRanker REFUSES a `max_weight_per_name` value, so never seed FactorRanker cells from a pre-merge genome.
+  - Bypass experts (FactorRanker only) now skip the classic available-balance guard, which was refusing their basket rebalance adds.
+  - **All lanes:** `_validate_position_size_limits` now applies the declared default (10%) when no value is stored; before, it skipped the check. The BT review judged this a no-op for the classic S1-S7 experts (the RM already sizes under the same setting, default and virtual-equity basis), and no golden moved. It is not proven on a binding cap, so still re-check the classic lanes' reference numbers (§6 controls) on 8772a699 before launch.
 - **Stop rule and `risk_per_trade_pct` range (settled 2026-09-29, dev 8973675a, TEST 0109).** A proposed stop cap (`max_stop_loss_pct`) was CANCELLED by the operator. There is no such setting or gene.
   - The rule stays: a single symbol never loses more than `risk_per_trade_pct` % of the expert's equity. A position too small to lose that much carries no stop, by design.
   - The only change: the `_BYPASS_RM_OPT["risk_per_trade_pct"]` gene range narrowed from 0.5-10 to **0.5-5** (step 0.5), so the GA searches only stops that can fire (at 6.5 with `top_n` 15-35, the stop landed 44-97% below entry, or at ≤0). FactorRanker cells must run on 8973675a or later.
@@ -163,7 +163,7 @@ From `s1_s7_relevance.md`:
   - re-pricing the stop after a resize also failed silently.
   - The fix sizes the rebalance on equity (`get_tradable_equity` / `get_virtual_equity`) and drops the post-rebalance stop re-price. An add prices its stop on the new position, a trim keeps its stop and an exit releases it. An add whose rule stop is at or above market raises `ProtectiveStopError` after the other names are processed.
   - The distorted backtests are labelled `stale-fr-cash-rebalance`: 1064-1068, 1143-1147, 1265-1269, 1403, 1404. Nothing in this grid may be compared with them or seeded from them. (Backtests 1065 and 1146 re-run to the same numbers on the fixed code.)
-- **Why it is back:** FactorRanker gains a `weighting` choice that goal2020 never searched. Commit 7c270156 added `"rank"` (weight linear in rank, still capped per name, by `max_virtual_equity_per_instrument_percent` once the hold above lifts) beside `"equal"` (1/N) and `"score"` (proportional to the composite score); the default stays `"equal"`.
+- **Why it is back:** FactorRanker gains a `weighting` choice that goal2020 never searched. Commit 7c270156 added `"rank"` (weight linear in rank, still capped per name, by `max_virtual_equity_per_instrument_percent` since 8772a699) beside `"equal"` (1/N) and `"score"` (proportional to the composite score); the default stays `"equal"`.
 - **The gene** (merged in the same push, 5cbad64d): `model:weighting`, a categorical gene index-encoded like FMPRating's `target_price_type`, declared as `_EXPERT_OPT["FactorRanker"]["expert_params"]["weighting"] = {"optimize": True, "type": "choice", "choices": ["equal", "score", "rank"]}`. The GA searches all **three** weightings; `"weighting": "equal"` leaves the launcher's fixed settings.
 - **Job identity:** the gene changes the FactorRanker search space, so an old FactorRanker checkpoint does not match, and the launcher skips completed job NAMES. The new FactorRanker cells need new names (or `--rerun`), and must never pick up an old completed row.
 - **What it does not share with the classic jobs:** it bypasses the classic RM (`bypasses_classic_rm`), so the optimizer drops the rule, TP/SL, condition and exit genes and searches only the expert's own `model:*` genes. ATR, the market entry gates, the market exits and `allow_ruleset_sl_loosen` therefore do not apply, and there is no all-off control arm: the treatment and the control would be the same job.
