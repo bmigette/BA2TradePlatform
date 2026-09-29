@@ -144,11 +144,16 @@ From `s1_s7_relevance.md`:
   - DeterministicScorer: large, mid and small.
   - FMPSenateTraderWeight: one universe.
   - That makes 11 expert-bands.
-- **FactorRanker is re-run, as its own lane** (operator decision, 2026-09-28; this reverses the draft's exclusion). Its prerequisite, the FactorRanker equity-sizing fix, merged on 2026-09-29; see §4.1.
+- **FactorRanker is re-run, as its own lane** (operator decision, 2026-09-28; this reverses the draft's exclusion). Its first prerequisite, the equity-sizing fix, merged on 2026-09-29. **It is ON HOLD** until the stop-cap change merges; see §4.1.
 - **Job count:** 11 expert-bands × 4 strategies − 2 (ICB S2) = **42 treatment jobs**. See §6 for controls. The FactorRanker jobs (§4.1) are counted and costed separately.
 
 ### 4.1 FactorRanker
 
+- **HOLD (2026-09-29): do not launch FactorRanker cells until the stop-cap change merges** (approved by the operator on 2026-09-29; the BT session owns it).
+  - **Why:** with `risk_per_trade_pct` = 6.5 and `top_n` 15-35, the equity-budget stop lands 44-97% below entry, or at ≤0 (no stop at all). On dev, 18 of 39 FactorRanker positions had no stop.
+  - **Change:** a new expert setting `max_stop_loss_pct` (declared default 25). The stop becomes max(rule stop, cost × (1 − cap)).
+  - **New gene:** `max_stop_loss_pct` in `_BYPASS_RM_OPT`, min 5, max 50, step 5.
+  - FactorRanker backtests change, and the search space gains a gene: a job started before the merge searches the wrong space. Record the merge commit here when it lands.
 - **Prerequisite (met 2026-09-29): the equity-sizing fix, merged to dev at d5a4515e (APP 1210 / TEST 0108).** Every FactorRanker backtest before it is distorted, **including the goal2020 FactorRanker cells**:
   - in backtests the rebalance sized against CASH only (`BacktestAccount.get_balance`), where live sizes against equity, so every other rebalance sold the whole book and the next one bought it back;
   - re-pricing the stop after a resize also failed silently.
