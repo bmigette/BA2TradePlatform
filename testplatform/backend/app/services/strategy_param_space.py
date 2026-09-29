@@ -1085,3 +1085,34 @@ def schedule_override_from_genes(
 #: before any decoding); the two are pinned equal by
 #: testplatform/backend/tests/backtest/test_inert_rm_toggles_stay_off.py.
 INERT_RM_TOGGLES = {"use_atr_stop": False, "regime_overlay_enabled": False}
+
+#: The ONLY key a run-level policy (``--rm-toggle-policy atr-searched``, the 2027 ATR grid --
+#: see docs/strategy_research/atr_grid/atr_grid_2027_design.md §3.2) may ever unpin.
+#: ``regime_overlay_enabled`` stays pinned off forever: the overlay is a separate experiment
+#: (design D3), and this policy exists to unpin ATR, not to become a general escape hatch.
+ALLOWED_RM_TOGGLES_UNPINNED = frozenset({"use_atr_stop"})
+
+
+def pinned_rm_toggles(rm_toggles_unpinned=None) -> Dict[str, bool]:
+    """``INERT_RM_TOGGLES`` minus the keys a persisted run policy unpinned.
+
+    ``rm_toggles_unpinned`` comes straight off the run's own config
+    (``optimization_config['backtest']['rm_toggles_unpinned']``), never an env var, so every path
+    that rebuilds a trial from a persisted config -- GA trials, top-N persist, re-run, robustness
+    variants, the recovery/rerun tools -- sees the SAME policy the run was launched under.
+
+    Refuses (raises) any key outside ``ALLOWED_RM_TOGGLES_UNPINNED`` -- in particular
+    ``regime_overlay_enabled``, which this mechanism must never be able to turn on. The
+    INERT_RM_TOGGLES constant itself never changes; this is the only sanctioned way to relax it.
+
+    ``None``/``[]`` (the default -- every run before this policy existed, and every run launched
+    under ``--rm-toggle-policy pinned``) returns ``INERT_RM_TOGGLES`` unchanged, so the pinned
+    policy stays byte-identical to today.
+    """
+    unpinned = list(rm_toggles_unpinned or [])
+    bad = [k for k in unpinned if k not in ALLOWED_RM_TOGGLES_UNPINNED]
+    if bad:
+        raise ValueError(
+            f"rm_toggles_unpinned may only unpin {sorted(ALLOWED_RM_TOGGLES_UNPINNED)}; "
+            f"refusing to unpin {bad}")
+    return {k: v for k, v in INERT_RM_TOGGLES.items() if k not in unpinned}

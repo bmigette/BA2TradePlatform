@@ -1716,7 +1716,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # interrupted job -- which inserts a NEW StrategyOptimization row -- still finds them.
         ckpt_task_id = checkpoint_task_id(opt.name, opt_id)
         ckpt_fingerprint = checkpoint_fingerprint(
-            param_space, ga, checkpoint_expert_settings_identity(backtest_cfg))
+            param_space, ga, checkpoint_expert_settings_identity(backtest_cfg),
+            backtest_cfg.get("rm_toggles_unpinned"))
         # The OBJECTIVE this run is scored under, as the trials will actually see it (the trial
         # config carries the same key, and strategy_fitness._maybe_robust reads it). Written into
         # every checkpoint and compared on resume -- see _assert_checkpoint_robustness_matches.
@@ -2597,9 +2598,15 @@ def _build_daily_trial_config(
     below gates the screener-settings wiring further down — it has no tp/sl implications since
     entry TP/SL rides on ``entry_rules`` (Strategy.entry_actions), not a bespoke gene.
     """
-    from app.services.strategy_param_space import INERT_RM_TOGGLES
+    from app.services.strategy_param_space import pinned_rm_toggles
 
     bypass = _is_bypass_expert(backtest_cfg)
+    # RUN-LEVEL POLICY (design doc §3.2, atr_grid_2027): a persisted
+    # backtest_cfg['rm_toggles_unpinned'] relaxes INERT_RM_TOGGLES for exactly the keys it names
+    # (only "use_atr_stop" may ever appear -- see pinned_rm_toggles). Absent/empty (every run
+    # before this policy existed, and every --rm-toggle-policy pinned run) resolves to
+    # INERT_RM_TOGGLES unchanged, so this is byte-identical to before for the default case.
+    _pinned_toggles = pinned_rm_toggles(backtest_cfg.get("rm_toggles_unpinned"))
     overrides = dict(decoded.get("expert_overrides") or {})
 
     # OPTIONS seam (parity with the single-run path daily_backtest_handler._build_config):
@@ -2689,12 +2696,12 @@ def _build_daily_trial_config(
             merged_settings = dict(spec.get("settings") or {})
             merged_settings.update(bypass_screener_settings)
             merged_settings.update(overrides)
-            merged_settings.update(INERT_RM_TOGGLES)
+            merged_settings.update(_pinned_toggles)
             experts_out.append({"class": spec["class"], "settings": merged_settings})
         else:
             merged_settings = dict(bypass_screener_settings)
             merged_settings.update(overrides)
-            merged_settings.update(INERT_RM_TOGGLES)
+            merged_settings.update(_pinned_toggles)
             experts_out.append({"class": spec, "settings": merged_settings})
 
     # SCREENER runtime: when the run hoisted a metric store, this individual's EFFECTIVE screener
@@ -3126,7 +3133,8 @@ def checkpoint_expert_settings_identity(backtest_cfg: Dict[str, Any]) -> Dict[st
 
 
 def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
-                           expert_settings: Optional[Dict[str, Any]] = None) -> str:
+                           expert_settings: Optional[Dict[str, Any]] = None,
+                           rm_toggles_unpinned: Optional[List[str]] = None) -> str:
     """Identity of the SEARCH ITSELF -- a checkpoint may only be resumed into a matching one.
 
     A GA checkpoint is a list of chromosomes plus an RNG state; both are meaningless against a
@@ -3153,6 +3161,14 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     fingerprint mismatch -- ``_load_checkpoint`` DISCARDS it (with a warning) and the search
     restarts from generation 0; it is never resumed under the other rule. (The grid driver's
     job-name digest carries the flag too, so in practice the checkpoint KEY already differs.)
+
+    ``rm_toggles_unpinned`` (the ATR-grid run policy, design §3.2) joins it the same way -- ONLY
+    when non-empty -- so a legacy/pinned-policy job's fingerprint is unchanged. In practice the
+    gene space already differs under the policy (use_atr_stop becomes searched, the regime and
+    weekend-schedule genes drop), which alone would move ``genes`` above; this is named
+    explicitly so the identity does not rely on that incidental shape and so a checkpoint written
+    under one policy can never be resumed into the other even if some future gene space happened
+    to coincide.
     """
     import hashlib
     import json
@@ -3165,6 +3181,8 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     }
     if expert_settings:
         payload["expert_settings"] = sorted(expert_settings.items())
+    if rm_toggles_unpinned:
+        payload["rm_toggles_unpinned"] = sorted(rm_toggles_unpinned)
     lattice_anchor = _resolve_lattice_anchor(ga)
     if lattice_anchor != "zero":
         payload["lattice_anchor"] = lattice_anchor

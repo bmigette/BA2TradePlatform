@@ -7,6 +7,10 @@ file: two heavily-tested modules of dead code.
 
 What the pass does, in order, for ONE expert sleeve:
 
+0. engage only for a ``classic_options`` sleeve (``option_risk_manager_enabled`` over
+   ``expert.settings`` -- the SAME predicate, read the SAME way, that gates the backtest's
+   ``_option_sleeves``); any other mode returns at DEBUG, because its exits are owned by its
+   ruleset's ``close_option`` rules, exactly as in its backtest;
 1. refuse to act against a book it cannot see (``get_positions()``);
 2. load the expert's OPENED option transactions and net their legs into
    ``OptionStructure`` values;
@@ -401,6 +405,24 @@ def run_option_lifecycle_pass(expert_instance_id: int,
         # the case that IS a failure — an expert HOLDING options on such an account.
         logger.debug(f"Option lifecycle: account {instance.account_id} does not support "
                      f"options; nothing to manage for expert {expert_instance_id}")
+        return result
+
+    # THE gate this pass shares with the backtest: it exists only for a ``classic_options``
+    # sleeve. ``daily_engine`` builds ``_option_sleeves`` from exactly this predicate,
+    # ``option_risk_manager_enabled``, read over exactly this mapping, ``expert.settings``
+    # (see ``_option_sleeves`` there — ``getattr(expert, "settings", None)``). A sleeve in
+    # ``classic`` or ``smart`` mode owns its option exits through its ruleset's
+    # ``close_option`` rules, exactly as its backtest does; before this gate existed the
+    # live pass ran for it anyway and logged a false "does not declare profit_capture_pct,
+    # ..." ERROR every cycle, because a non-classic_options expert never declares the
+    # classic_options-only thresholds this pass otherwise requires.
+    settings_mapping = getattr(expert, "settings", None)
+    if not _rm.option_risk_manager_enabled(settings_mapping, expert_instance_id=expert_instance_id):
+        raw_mode = settings_mapping.get("risk_manager_mode") if isinstance(settings_mapping, dict) else None
+        logger.debug(f"Option lifecycle: expert {expert_instance_id} is not in "
+                     f"{_rm.RISK_MANAGER_MODE_CLASSIC_OPTIONS!r} mode "
+                     f"(risk_manager_mode={raw_mode!r}) — its option exits are owned by its "
+                     f"ruleset's close_option rules, not this pass; nothing to do")
         return result
 
     # 1. NEVER act against a book we cannot see. `get_positions()` returning None is

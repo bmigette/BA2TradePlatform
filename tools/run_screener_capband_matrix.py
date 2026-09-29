@@ -39,6 +39,8 @@ Usage (test venv; FMP_API_KEY/DB_FILE in env):
         [--interval 5min] [--fitness calmar_ratio] [--include-no-data] [--dry-run]
 """
 import argparse
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -139,6 +141,52 @@ _STRATEGY_BUDGET_OVERRIDE = {
 }
 
 
+def market_condition_passthrough(args) -> list:
+    """Extra `optimize` CLI tokens for the goal2027atr market-condition flags ([] when none of
+    the five is given, so an ordinary invocation of this driver is untouched)."""
+    out: list = []
+    if getattr(args, "market_condition_profile", None):
+        out += ["--market-condition-profile", args.market_condition_profile]
+    if getattr(args, "market_condition_manifest", None):
+        out += ["--market-condition-manifest", args.market_condition_manifest]
+    if getattr(args, "market_exit", None):
+        out += ["--market-exit", args.market_exit]
+    if getattr(args, "market_condition_mode", None) and args.market_condition_mode != "searched":
+        out += ["--market-condition-mode", args.market_condition_mode]
+    if getattr(args, "search_sl_loosen", False):
+        out += ["--search-sl-loosen"]
+    return out
+
+
+def _job_name(name: str, cmd: list) -> str:
+    """``name``, or ``name-d<digest>`` when ``market_condition_passthrough`` added anything.
+
+    Mirrors ``tools/run_options_matrix.py:discovery_name``: the digest is a sha256 (first 12 hex
+    chars) of the job's own fully-resolved ``optimize`` argv, EXCLUDING ``--name``/``--parallel``/
+    ``--workers`` (metadata that must not move the job identity -- the same three that function
+    excludes). Unlike ``discovery_name`` this digest is added ONLY when at least one new
+    market-condition/sl-loosen flag was actually forwarded (``market_condition_passthrough``
+    returned something): with none of the five flags, every job name -- and therefore the
+    skip-completed-by-name check and the DB row it resumes -- stays byte-identical to before this
+    change existed.
+    """
+    tokens = [t for t in cmd if t]
+    start = tokens.index("optimize") + 1 if "optimize" in tokens else 0
+    tokens = tokens[start:]
+    kept: list = []
+    skip = False
+    for tok in tokens:
+        if skip:
+            skip = False
+            continue
+        if tok in ("--name", "--parallel", "--workers"):
+            skip = True
+            continue
+        kept.append(tok)
+    digest = hashlib.sha256(json.dumps(kept, sort_keys=False).encode()).hexdigest()[:12]
+    return f"{name}-d{digest}"
+
+
 def _db_path() -> str:
     return os.getenv("DB_FILE", r"C:\Users\basti\Documents\ba2\test\dl_forecasting.db")
 
@@ -154,7 +202,8 @@ def _completed_names() -> set:
         return set()
 
 
-def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suffix=""):
+def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suffix="",
+          strategy_plan=None):
     """Yield (name, expert, strategy_or_None, band) in priority order.
 
     ``skip_experts`` (a set of expert class names) drops those experts entirely — used to defer
@@ -169,6 +218,11 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
     completes before any other expert starts; then the remaining classic experts + FactorRanker run
     band-by-band. (FMPRating is the most general rating expert, so prioritising it surfaces its
     results first.)"""
+    def _strategies_for(expert):
+        # ``strategy_plan`` (expert class -> strategy list, see --strategy-plan) REPLACES the
+        # global list per expert; without a plan every expert runs ``strategies``.
+        return strategies if strategy_plan is None else strategy_plan[expert]
+
     def _eligible(band, expert):
         if expert in skip_experts:
             return False
@@ -181,7 +235,7 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
         for band in bands:
             if not _eligible(band, "FMPRating"):
                 continue
-            for s in strategies:
+            for s in _strategies_for("FMPRating"):
                 # ``_window_tag`` marks a data-floored expert in its own NAME, so a 2022-start
                 # FMPRating row can never be read as, or resumed as, a full-window "goal2020" run.
                 yield (f"scr-{band}-FMPRating-{s}{name_suffix}{_window_tag('FMPRating')}",
@@ -191,7 +245,7 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
         for expert in _CLASSIC:
             if expert == "FMPRating" or not _eligible(band, expert):
                 continue
-            for s in strategies:
+            for s in _strategies_for(expert):
                 if s in _TARGET_PRICE_STRATEGIES and expert not in _TARGET_PRICE_EXPERTS:
                     continue  # S4 needs a real analyst target; these experts have none
                 yield (f"scr-{band}-{expert}-{s}{name_suffix}", expert, s, band)
@@ -249,6 +303,39 @@ def _parse_stress_spread(spec: str) -> dict:
             raise SystemExit(f"--stress-spread-bps: {band}={val!r} is not a number")
     return {b: v for b, v in out.items() if v > 0}
 
+_KNOWN_STRATEGIES = {"S1", "S2", "S3", "S4", "S5", "S6", "S7"}
+
+
+def load_strategy_plan(path, skip_experts=frozenset()) -> dict:
+    """Read a --strategy-plan file: ``{"experts": {expert: [strategy, ...]}}``.
+
+    Refuses, rather than guesses: a classic expert that is not skipped and has no entry (it would
+    otherwise run nothing, or everything), an empty list, an unknown strategy key, a duplicate,
+    and an expert the driver does not know.
+    """
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    plan = doc["experts"]
+    unknown_experts = sorted(set(plan) - set(_CLASSIC) - {"FMPSenateTraderWeight"})
+    if unknown_experts:
+        raise SystemExit(f"--strategy-plan {path}: unknown expert(s) {unknown_experts}")
+    missing = [e for e in _CLASSIC if e not in skip_experts and e not in plan]
+    if missing:
+        raise SystemExit(f"--strategy-plan {path}: no strategy list for {missing}; add them or "
+                         f"--skip-experts them")
+    out = {}
+    for expert, strats in plan.items():
+        if not strats:
+            raise SystemExit(f"--strategy-plan {path}: {expert} has an empty strategy list; "
+                             f"--skip-experts it instead")
+        bad = sorted(set(strats) - _KNOWN_STRATEGIES)
+        if bad or len(set(strats)) != len(strats):
+            raise SystemExit(f"--strategy-plan {path}: {expert} has unknown or repeated "
+                             f"strategies {strats}")
+        out[expert] = list(strats)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bands", default="large,mid,small")
@@ -265,6 +352,54 @@ def main() -> int:
     ap.add_argument("--generations", type=int, default=8)
     ap.add_argument("--mutation-prob", type=float, default=None,
                     help="Per-gene mutation probability passthrough (default: launcher's 0.3).")
+    ap.add_argument("--strategy-plan", default=None,
+                    help="JSON file mapping each classic expert to its strategy list "
+                         "({\"experts\": {\"FMPRating\": [\"S1\", ...], ...}}, as written by "
+                         "tools/strategy_research/atr_grid/select_strategies.py). Replaces "
+                         "--strategies per expert; every classic expert that is not skipped must "
+                         "have an entry. FactorRanker is unaffected.")
+    ap.add_argument("--no-budget-overrides", action="store_true",
+                    help="Use --population/--generations exactly for every job: no FMPRating "
+                         "population bonus and no per-strategy override (S1 140, S7 60x8). For "
+                         "grids whose budget is set by a rule of their own (goal2027atr).")
+    ap.add_argument("--early-stop", type=int, default=None,
+                    help="GA early-stop patience passthrough (default: the launcher's own, 4). "
+                         "Forwarded only when given, so existing grid commands are unchanged.")
+    ap.add_argument("--early-stop-min-rel", type=float, default=None,
+                    help="Minimum RELATIVE gain (a fraction, 0.01 = 1%%) that resets the "
+                         "early-stop patience; passthrough, forwarded only when given.")
+    ap.add_argument("--rm-toggle-policy", default=None, choices=("pinned", "atr-searched"),
+                    help="See ba2-test optimize --rm-toggle-policy; passthrough, forwarded only "
+                         "when given, so every existing matrix command stays unchanged. "
+                         "'atr-searched' requires every job name this driver builds to contain "
+                         "'-atr27' -- the launcher refuses per-job otherwise.")
+    # -------------------------------------------------------------------------------------------
+    # goal2027atr market-condition passthrough (equity S1-S7, deferral lifted 2026-09-29). Each is
+    # forwarded to `ba2-test optimize` ONLY when given -- see _market_condition_passthrough -- so
+    # an invocation that passes none of these five flags builds byte-identical job names/argv to
+    # before this block existed. When any IS given, _job_name below folds the job's full resolved
+    # argv (minus --name/--parallel/--workers) into a digest suffix, so a flag change gets a new
+    # job identity and the skip-completed-by-name check above can never reuse an old row under it.
+    # -------------------------------------------------------------------------------------------
+    ap.add_argument("--market-condition-profile", default=None,
+                    metavar="none|<profile>[,<profile>...]",
+                    help="Forward --market-condition-profile to every job (see `ba2-test "
+                         "optimize --help`). Folds into the job's name digest.")
+    ap.add_argument("--market-condition-manifest", default=None,
+                    metavar="DIGEST[,DIGEST...]|<profile>=DIGEST,...",
+                    help="Forward --market-condition-manifest to every job. Folds into the "
+                         "job's name digest.")
+    ap.add_argument("--market-exit", default=None, metavar="KIND[,KIND...]",
+                    help="Forward --market-exit to every job (equity S1-S7 only; requires "
+                         "--market-condition-profile). Folds into the job's name digest.")
+    ap.add_argument("--market-condition-mode", default=None, choices=("searched", "all-off"),
+                    help="Forward --market-condition-mode to every job ('searched' is the "
+                         "launcher default and is NOT forwarded, so it never folds into the "
+                         "digest on its own -- pass 'all-off' for the matched control arm). "
+                         "Folds into the job's name digest when 'all-off'.")
+    ap.add_argument("--search-sl-loosen", action="store_true", default=False,
+                    help="Forward --search-sl-loosen to every job. Folds into the job's name "
+                         "digest.")
     ap.add_argument("--interval", default="5min")
     ap.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points, modeled at the fill-engine "
@@ -382,19 +517,23 @@ def main() -> int:
         exe = os.path.join(os.path.dirname(sys.executable), "ba2-test")
 
     skip_experts = frozenset(e.strip() for e in args.skip_experts.split(",") if e.strip())
-    jobs = list(_jobs(bands, strategies, args.include_no_data, skip_experts, args.name_suffix))
+    strategy_plan = None
+    if args.strategy_plan:
+        strategy_plan = load_strategy_plan(args.strategy_plan, skip_experts)
+        print(f"strategy plan {args.strategy_plan}: "
+              + "; ".join(f"{e} {','.join(s)}" for e, s in sorted(strategy_plan.items())))
+    jobs = list(_jobs(bands, strategies, args.include_no_data, skip_experts, args.name_suffix,
+                      strategy_plan))
     done = _completed_names()
-    print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies={strategies}); "
-          f"{sum(1 for j in jobs if j[0] in done)} already completed.")
-    if args.dry_run:
-        for nm, exp, s, band in jobs:
-            print(f"  {'DONE' if nm in done else 'TODO'}  {nm}  ({exp} {s or '(bypass)'} / {band})")
-        return 0
-
+    print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies="
+          f"{'per --strategy-plan' if strategy_plan else strategies}); "
+          f"{sum(1 for j in jobs if j[0] in done)} already completed"
+          f"{' (by base name; digest-suffixed names are checked per job)' if market_condition_passthrough(args) else ''}.")
+    # --dry-run walks the SAME loop below and stops short of launching: a job's final name can
+    # carry a digest of its resolved argv (market-condition flags), which only exists once the
+    # command is built, so listing the pre-digest names here would show (and check "DONE"
+    # against) names no job will ever have.
     for i, (name, expert, strat, band) in enumerate(jobs, 1):
-        if name in _completed_names():   # re-read each loop (resumable)
-            print(f"[{i}/{len(jobs)}] SKIP {name} (already completed)", flush=True)
-            continue
         # Data-floored start (see _EXPERT_MIN_START). Announced per job so a shorter window is
         # visible in the log instead of being inferred later from a suspiciously late first trade.
         job_start = _start_for(expert, args.start)
@@ -406,6 +545,8 @@ def main() -> int:
         population = args.population + (args.fmp_population_bonus if expert == "FMPRating" else 0)
         generations = args.generations
         budget = _STRATEGY_BUDGET_OVERRIDE.get(strat)
+        if args.no_budget_overrides:
+            population, budget = args.population, None
         if budget:
             # A refinement strategy (e.g. S7) ignores the FMPRating bonus too -- it's a narrow
             # neighborhood search regardless of expert, not exploring the full space. An override
@@ -435,6 +576,12 @@ def main() -> int:
             cmd += ["--sizing-mode", args.sizing_mode]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]
+        if args.early_stop is not None:
+            cmd += ["--early-stop", str(args.early_stop)]
+        if args.early_stop_min_rel is not None:
+            cmd += ["--early-stop-min-rel", str(args.early_stop_min_rel)]
+        if getattr(args, "rm_toggle_policy", None):
+            cmd += ["--rm-toggle-policy", args.rm_toggle_policy]
         # "Pass 0 to disable" (see the --profit-cap-pct help): a 0 must be FORWARDED, because
         # omitting the flag lets ba2test_launcher re-apply its own 2000/25 default instead.
         cmd += cap_passthrough(args)
@@ -465,9 +612,26 @@ def main() -> int:
             cmd += ["--strategy", strat]
         if args.workers:
             cmd += ["--workers", args.workers]   # distribute trials across remote workers + local
-        print(f"[{i}/{len(jobs)}] RUN  {name} ...", flush=True)
+        # goal2027atr market-condition passthrough: [] with none of the five flags given, so an
+        # ordinary invocation's cmd (and therefore its name/digest below) is byte-identical to
+        # before this block existed. Appended LAST so it never displaces an existing token's
+        # position for a job with no new flags.
+        mc_tokens = market_condition_passthrough(args)
+        cmd += mc_tokens
+        job_name = name
+        if mc_tokens:
+            job_name = _job_name(name, cmd)
+            cmd[cmd.index("--name") + 1] = job_name
+        if args.dry_run:
+            print(f"  {'DONE' if job_name in done else 'TODO'}  {job_name}  "
+                  f"({expert} {strat or '(bypass)'} / {band})")
+            continue
+        if job_name in _completed_names():   # re-read each loop (resumable)
+            print(f"[{i}/{len(jobs)}] SKIP {job_name} (already completed)", flush=True)
+            continue
+        print(f"[{i}/{len(jobs)}] RUN  {job_name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
-        print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)
+        print(f"[{i}/{len(jobs)}] {job_name} exit={rc}", flush=True)
     print("matrix driver: done.")
     return 0
 

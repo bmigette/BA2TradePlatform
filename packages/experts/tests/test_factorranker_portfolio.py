@@ -120,7 +120,7 @@ class _Expert:
         self._risk, self._equity = risk_pct, equity
     def get_setting_with_interface_default(self, key, **k):
         return self._risk if key == "risk_per_trade_pct" else None
-    def get_virtual_balance(self):
+    def get_virtual_equity(self):
         return self._equity
 
 
@@ -180,3 +180,74 @@ def test_stop_below_zero_is_refused():
     valid order; the caller warns and leaves it unprotected rather than sending nonsense."""
     pm = _pm(_Expert(risk_pct=99.0, equity=1_000_000.0))
     assert pm.protective_stop_price("AAA", [_Trans(10, 5.0)]) is None
+
+
+# --- an add is never protected by a stop at/above market (review 2026-09-29) ------------------
+# The add's stop is priced by the rule on the position the add CREATES. When that lands at or
+# above the current price, placing it would put a sell stop above market; the add is refused
+# before anything is sent for the name, the rest of the rebalance proceeds, and the refusal is
+# logged and recorded on ``last_refused_adds`` -- a rule decision, never a crash (2026-09-29:
+# re-raising it crashed whole backtest trials while live simply carried on the next day).
+
+class _BuyAccount:
+    def __init__(self, price):
+        self.price, self.submitted = price, []
+
+    def get_instrument_current_price(self, symbol):
+        return self.price
+
+    def submit_order(self, order, sl_price=None, is_closing_order=False, **kw):
+        self.submitted.append((order.symbol, order.quantity, sl_price))
+        return order
+
+
+class _HeldTrans(_Trans):
+    def __init__(self, qty, price, id_=1):
+        super().__init__(qty, price)
+        self.id = id_
+
+
+def test_an_add_whose_rule_stop_is_above_market_is_refused_before_it_is_sent():
+    from ba2_experts.FactorRanker.portfolio import ProtectiveStopError
+
+    # 100 held at 100, now 50: adding 10 gives a blended cost of 95.45 and a 1% budget of
+    # $1,000 over 110 shares -> rule stop 86.36, far above the $50 market.
+    pm = _pm(_Expert(risk_pct=1.0, equity=100_000.0))
+    pm.account = _BuyAccount(price=50.0)
+
+    with pytest.raises(ProtectiveStopError, match="AAA"):
+        pm._submit_buy("AAA", 10, [_HeldTrans(100, 100.0)])
+    assert pm.account.submitted == []
+
+
+def test_an_add_whose_rule_stop_is_below_market_is_sent_with_it():
+    pm = _pm(_Expert(risk_pct=1.0, equity=100_000.0))
+    pm.account = _BuyAccount(price=100.0)
+
+    pm._submit_buy("AAA", 10, [_HeldTrans(100, 100.0)])
+
+    (symbol, qty, sl), = pm.account.submitted
+    # The stop covers the position the add creates: 110 shares at cost 100, $1,000 budget.
+    assert (symbol, qty) == ("AAA", 10)
+    assert sl == pytest.approx(100.0 - 1_000.0 / 110)
+
+
+def test_the_rebalance_skips_the_refused_add_records_it_and_does_not_raise(monkeypatch):
+    from ba2_experts.FactorRanker import portfolio as pf_mod
+    pm = _pm(_Expert(risk_pct=1.0, equity=100_000.0))
+    pm.last_refused_adds = []
+    pm.account = _BuyAccount(price=50.0)
+    held = {"AAA": 100.0}
+    pm.get_holdings = lambda: (held, {"AAA": [_HeldTrans(100, 100.0)]})
+    pm._quantity_units = lambda symbols: {}
+
+    # AAA: 100 held, target $10,000 at $50 -> +100 (refused, rule stop above market);
+    # BBB: new name, $5,000 at $50 -> 100 shares, sent.
+    warnings = []
+    monkeypatch.setattr(pf_mod.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+    orders = pm.rebalance({"AAA": 0.1, "BBB": 0.05})
+
+    assert [(s, q) for s, q, _ in pm.account.submitted] == [("BBB", 100)]
+    assert [o.symbol for o in orders] == ["BBB"]
+    assert len(pm.last_refused_adds) == 1 and "AAA" in pm.last_refused_adds[0]
+    assert any("refused 1 add" in w for w in warnings)

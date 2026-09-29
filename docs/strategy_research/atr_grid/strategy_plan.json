@@ -1,0 +1,563 @@
+{
+ "evidence": {
+  "DeterministicScorer": {
+   "dropped": [
+    "S3",
+    "S5",
+    "S7"
+   ],
+   "rows": 179,
+   "strategies_seen": [
+    "S1",
+    "S2",
+    "S3",
+    "S5",
+    "S6",
+    "S7"
+   ],
+   "top5_car": [
+    {
+     "backtest_id": 1109,
+     "band": "large",
+     "car": 31.2,
+     "max_drawdown": -26.67,
+     "mode": "risk_atr",
+     "strategy": "S6"
+    },
+    {
+     "backtest_id": 1107,
+     "band": "large",
+     "car": 24.47,
+     "max_drawdown": -15.59,
+     "mode": "risk_atr",
+     "strategy": "S6"
+    },
+    {
+     "backtest_id": 1001,
+     "band": "small",
+     "car": 22.29,
+     "max_drawdown": -23.28,
+     "mode": "risk_atr",
+     "strategy": "S2"
+    },
+    {
+     "backtest_id": 1016,
+     "band": "large",
+     "car": 22.01,
+     "max_drawdown": -21.08,
+     "mode": "notional",
+     "strategy": "S2"
+    },
+    {
+     "backtest_id": 996,
+     "band": "small",
+     "car": 20.88,
+     "max_drawdown": -13.76,
+     "mode": "risk_atr",
+     "strategy": "S1"
+    }
+   ],
+   "top5_fitness": [
+    {
+     "backtest_id": 1175,
+     "band": "mid",
+     "car": 20.11,
+     "fitness": 8.423,
+     "max_drawdown": -11.75,
+     "mode": "risk_atr",
+     "strategy": "S6"
+    },
+    {
+     "backtest_id": 1176,
+     "band": "mid",
+     "car": 20.11,
+     "fitness": 8.418,
+     "max_drawdown": -11.76,
+     "mode": "risk_atr",
+     "strategy": "S6"
+    },
+    {
+     "backtest_id": 1173,
+     "band": "mid",
+     "car": 20.64,
+     "fitness": 7.961,
+     "max_drawdown": -12.78,
+     "mode": "risk_atr",
+     "strategy": "S6"
+    },
+    {
+     "backtest_id": 1107,
+     "band": "large",
+     "car": 24.47,
+     "fitness": 7.801,
+     "max_drawdown": -15.59,
+     "mode": "risk_atr",
+     "strategy": "S6"
+    },
+    {
+     "backtest_id": 1108,
+     "band": "large",
+     "car": 20.5,
+     "fitness": 7.571,
+     "max_drawdown": -13.9,
+     "mode": "risk_atr",
+     "strategy": "S6"
+    }
+   ]
+  },
+  "FMPEarningsDrift": {
+   "dropped": [
+    "S6",
+    "S7"
+   ],
+   "rows": 116,
+   "strategies_seen": [
+    "S1",
+    "S2",
+    "S3",
+    "S5",
+    "S6",
+    "S7"
+   ],
+   "top5_car": [
+    {
+     "backtest_id": 1088,
+     "band": "mid",
+     "car": 28.35,
+     "max_drawdown": -16.28,
+     "mode": "risk_atr",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1598,
+     "band": "mid",
+     "car": 27.81,
+     "max_drawdown": -25.38,
+     "mode": "notional",
+     "strategy": "S5"
+    },
+    {
+     "backtest_id": 1275,
+     "band": "mid",
+     "car": 24.85,
+     "max_drawdown": -16.39,
+     "mode": "notional",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1367,
+     "band": "small",
+     "car": 22.77,
+     "max_drawdown": -19.15,
+     "mode": "notional",
+     "strategy": "S2"
+    },
+    {
+     "backtest_id": 1103,
+     "band": "mid",
+     "car": 22.58,
+     "max_drawdown": -21.03,
+     "mode": "risk_atr",
+     "strategy": "S3"
+    }
+   ],
+   "top5_fitness": [
+    {
+     "backtest_id": 1088,
+     "band": "mid",
+     "car": 28.35,
+     "fitness": 8.288,
+     "max_drawdown": -16.28,
+     "mode": "risk_atr",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1275,
+     "band": "mid",
+     "car": 24.85,
+     "fitness": 8.004,
+     "max_drawdown": -16.39,
+     "mode": "notional",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1363,
+     "band": "small",
+     "car": 15.35,
+     "fitness": 7.826,
+     "max_drawdown": -10.84,
+     "mode": "notional",
+     "strategy": "S2"
+    },
+    {
+     "backtest_id": 1089,
+     "band": "mid",
+     "car": 18.69,
+     "fitness": 7.794,
+     "max_drawdown": -9.78,
+     "mode": "risk_atr",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1091,
+     "band": "mid",
+     "car": 18.6,
+     "fitness": 7.685,
+     "max_drawdown": -9.22,
+     "mode": "risk_atr",
+     "strategy": "S1"
+    }
+   ]
+  },
+  "FMPInsiderClusterBuy": {
+   "dropped": [
+    "S2",
+    "S3",
+    "S5",
+    "S6",
+    "S7"
+   ],
+   "rows": 114,
+   "strategies_seen": [
+    "S1",
+    "S2",
+    "S3",
+    "S5",
+    "S6",
+    "S7"
+   ],
+   "top5_car": [
+    {
+     "backtest_id": 1243,
+     "band": "small",
+     "car": 27.38,
+     "max_drawdown": -12.51,
+     "mode": "risk_atr",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1386,
+     "band": "small",
+     "car": 27.38,
+     "max_drawdown": -12.51,
+     "mode": "notional",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1245,
+     "band": "small",
+     "car": 23.75,
+     "max_drawdown": -9.74,
+     "mode": "risk_atr",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1389,
+     "band": "small",
+     "car": 23.75,
+     "max_drawdown": -9.74,
+     "mode": "notional",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1244,
+     "band": "small",
+     "car": 23.42,
+     "max_drawdown": -5.69,
+     "mode": "risk_atr",
+     "strategy": "S1"
+    }
+   ],
+   "top5_fitness": [
+    {
+     "backtest_id": 1245,
+     "band": "small",
+     "car": 23.75,
+     "fitness": 13.164,
+     "max_drawdown": -9.74,
+     "mode": "risk_atr",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1389,
+     "band": "small",
+     "car": 23.75,
+     "fitness": 13.164,
+     "max_drawdown": -9.74,
+     "mode": "notional",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1243,
+     "band": "small",
+     "car": 27.38,
+     "fitness": 8.673,
+     "max_drawdown": -12.51,
+     "mode": "risk_atr",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1386,
+     "band": "small",
+     "car": 27.38,
+     "fitness": 8.673,
+     "max_drawdown": -12.51,
+     "mode": "notional",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1298,
+     "band": "mid",
+     "car": 15.78,
+     "fitness": 7.476,
+     "max_drawdown": -9.38,
+     "mode": "notional",
+     "strategy": "S1"
+    }
+   ]
+  },
+  "FMPRating": {
+   "dropped": [
+    "S3",
+    "S5",
+    "S7"
+   ],
+   "rows": 170,
+   "strategies_seen": [
+    "S1",
+    "S2",
+    "S3",
+    "S5",
+    "S6",
+    "S7"
+   ],
+   "top5_car": [
+    {
+     "backtest_id": 1331,
+     "band": "small",
+     "car": 36.91,
+     "max_drawdown": -23.33,
+     "mode": "notional",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1332,
+     "band": "small",
+     "car": 35.4,
+     "max_drawdown": -19.78,
+     "mode": "notional",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1330,
+     "band": "small",
+     "car": 28.66,
+     "max_drawdown": -13.53,
+     "mode": "notional",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1155,
+     "band": "small",
+     "car": 23.9,
+     "max_drawdown": -21.77,
+     "mode": "risk_atr",
+     "strategy": "S2"
+    },
+    {
+     "backtest_id": 1329,
+     "band": "small",
+     "car": 23.53,
+     "max_drawdown": -14.47,
+     "mode": "notional",
+     "strategy": "S1"
+    }
+   ],
+   "top5_fitness": [
+    {
+     "backtest_id": 1641,
+     "band": "small",
+     "car": 17.64,
+     "fitness": 13.3,
+     "max_drawdown": -12.1,
+     "mode": "notional",
+     "strategy": "S6"
+    },
+    {
+     "backtest_id": 1640,
+     "band": "small",
+     "car": 17.31,
+     "fitness": 11.812,
+     "max_drawdown": -12.11,
+     "mode": "notional",
+     "strategy": "S6"
+    },
+    {
+     "backtest_id": 1572,
+     "band": "large",
+     "car": 20.59,
+     "fitness": 8.527,
+     "max_drawdown": -12.19,
+     "mode": "notional",
+     "strategy": "S6"
+    },
+    {
+     "backtest_id": 1637,
+     "band": "small",
+     "car": 16.12,
+     "fitness": 8.261,
+     "max_drawdown": -12.43,
+     "mode": "notional",
+     "strategy": "S6"
+    },
+    {
+     "backtest_id": 1178,
+     "band": "large",
+     "car": 15.96,
+     "fitness": 7.995,
+     "max_drawdown": -9.03,
+     "mode": "notional",
+     "strategy": "S1"
+    }
+   ]
+  },
+  "FMPSenateTraderWeight": {
+   "dropped": [
+    "S2",
+    "S7"
+   ],
+   "rows": 53,
+   "strategies_seen": [
+    "S1",
+    "S2",
+    "S3",
+    "S5",
+    "S6",
+    "S7"
+   ],
+   "top5_car": [
+    {
+     "backtest_id": 1438,
+     "band": "all",
+     "car": 14.99,
+     "max_drawdown": -12.77,
+     "mode": "risk_atr",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1649,
+     "band": "all",
+     "car": 14.4,
+     "max_drawdown": -9.41,
+     "mode": "notional",
+     "strategy": "S6"
+    },
+    {
+     "backtest_id": 1646,
+     "band": "all",
+     "car": 14.39,
+     "max_drawdown": -9.41,
+     "mode": "notional",
+     "strategy": "S6"
+    },
+    {
+     "backtest_id": 1440,
+     "band": "all",
+     "car": 14.37,
+     "max_drawdown": -13.01,
+     "mode": "risk_atr",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1645,
+     "band": "all",
+     "car": 14.34,
+     "max_drawdown": -9.65,
+     "mode": "notional",
+     "strategy": "S6"
+    }
+   ],
+   "top5_fitness": [
+    {
+     "backtest_id": 1439,
+     "band": "all",
+     "car": 14.01,
+     "fitness": 6.169,
+     "max_drawdown": -11.25,
+     "mode": "risk_atr",
+     "strategy": "S1"
+    },
+    {
+     "backtest_id": 1634,
+     "band": "all",
+     "car": 11.75,
+     "fitness": 5.833,
+     "max_drawdown": -10.08,
+     "mode": "notional",
+     "strategy": "S5"
+    },
+    {
+     "backtest_id": 1629,
+     "band": "all",
+     "car": 12.2,
+     "fitness": 5.749,
+     "max_drawdown": -10.62,
+     "mode": "notional",
+     "strategy": "S5"
+    },
+    {
+     "backtest_id": 1645,
+     "band": "all",
+     "car": 14.34,
+     "fitness": 5.462,
+     "max_drawdown": -9.65,
+     "mode": "notional",
+     "strategy": "S6"
+    },
+    {
+     "backtest_id": 1494,
+     "band": "all",
+     "car": 10.87,
+     "fitness": 5.44,
+     "max_drawdown": -9.38,
+     "mode": "risk_atr",
+     "strategy": "S3"
+    }
+   ]
+  }
+ },
+ "experts": {
+  "DeterministicScorer": [
+   "S1",
+   "S2",
+   "S6"
+  ],
+  "FMPEarningsDrift": [
+   "S1",
+   "S2",
+   "S3",
+   "S5"
+  ],
+  "FMPInsiderClusterBuy": [
+   "S1"
+  ],
+  "FMPRating": [
+   "S1",
+   "S2",
+   "S6"
+  ],
+  "FMPSenateTraderWeight": [
+   "S1",
+   "S3",
+   "S5",
+   "S6"
+  ]
+ },
+ "rule": "keep a strategy for an expert when one of its goal2020 TOP-N backtests is in that expert's pooled top 5 (all bands, both sizing modes) by any of: fitness, car",
+ "source": {
+  "db": "C:\\Users\\basti\\Documents\\ba2\\test\\dl_forecasting.db",
+  "generated_at": "2026-09-29T10:20:10",
+  "like": "%goal2020%",
+  "rows": 632
+ }
+}

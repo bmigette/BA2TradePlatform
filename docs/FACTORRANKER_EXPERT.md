@@ -29,7 +29,7 @@ One rebalance = one batch run of `run_analysis("EXPERT", market_analysis)`:
    - **quality** — ROE + gross profitability (gross profit / total assets) − Sloan accruals ratio.
    - **pead** — *Post-Earnings-Announcement Drift*: standardized unexpected earnings (SUE = `(actual EPS − estimated EPS) / estimate dispersion`), counted only while the stock is still within the post-earnings drift window (`pead_drift_window_days`); 0 otherwise.
 4. **Combine** — winsorize each factor (`winsorize_pct`), cross-sectional z-score, multiply by its weight, and sum into a composite score; rank descending.
-5. **Construct** — long-only target weights for the top `top_n` names: `equal` (1/N) or `score`-proportional `weighting`, with a per-name cap (`max_weight_per_name`, enforced by water-filling) scaled to `gross_exposure`.
+5. **Construct** — long-only target weights for the top `top_n` names: `equal` (1/N) or `score`-proportional `weighting`, with a per-name cap (`max_virtual_equity_per_instrument_percent`, the platform-wide per-instrument cap, enforced by water-filling) scaled to `gross_exposure`.
 6. **Rebalance** — `FactorPortfolioManager` reads current holdings (this expert's `OPENED` transactions), prices them, computes whole-share deltas vs the targets, and submits market orders (buys for new/added names, sells for dropped/reduced names). New positions pre-create a `Transaction` stamped with `expert_id` so the holding is attributed to this expert on the next rebalance.
 7. **Audit** — the ranked book (per-symbol factor z-scores, composite, rank, target weight, action) is written to `MarketAnalysis.state` and an `AnalysisOutput`, and rendered in the analysis detail UI.
 
@@ -58,7 +58,7 @@ Symbols whose data can't be gathered (FMP error / missing fundamentals) are **dr
 | `factor_weight_pead` | float | `0.0` | Post-earnings-drift factor weight (0 disables it). |
 | `top_n` | int | `20` | Number of top-ranked names to hold. |
 | `weighting` | str | `equal` | Position weighting: `equal` (1/N) or `score`-proportional. |
-| `max_weight_per_name` | float | `0.10` | Maximum portfolio weight per holding (0–1). |
+| `max_virtual_equity_per_instrument_percent` | float | `10.0` | Maximum virtual equity allocation per instrument (%). Platform-wide setting (declared on `MarketExpertInterface`, shared with every other expert); FactorRanker's own `max_weight_per_name` (fraction 0-1) was retired into it 2026-09-29 — a stored `max_weight_per_name` now raises loudly naming the replacement. |
 | `gross_exposure` | float | `1.0` | Total gross exposure to deploy (1.0 = fully invested). |
 | `winsorize_pct` | float | `0.02` | Winsorize each factor's tails at this fraction before z-scoring. |
 | `pead_drift_window_days` | int | `60` | Post-earnings drift window (days) for the PEAD factor. |

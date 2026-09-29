@@ -1049,6 +1049,53 @@ def _daily_manage_schedule() -> dict:
 #: is the control.
 _INERT_RM_TOGGLES = {"use_atr_stop": False, "regime_overlay_enabled": False}
 
+#: Mirrors strategy_param_space.ALLOWED_RM_TOGGLES_UNPINNED. See _pinned_rm_toggles.
+_ALLOWED_RM_TOGGLES_UNPINNED = frozenset({"use_atr_stop"})
+
+#: --rm-toggle-policy values (see _cmd_optimize / _cmd_optimize_batch). "pinned" (default) is
+#: today's behaviour, byte-identical. "atr-searched" is the 2027 ATR grid's run-level policy
+#: (docs/strategy_research/atr_grid/atr_grid_2027_design.md §3.2): it unpins ONLY use_atr_stop,
+#: persisted on the run (backtest_block['rm_toggles_unpinned']) so every path that rebuilds a
+#: trial from the stored config -- GA trials, top-N persist, re-runs, robustness variants,
+#: tools/recover_missing_topn.py, tools/rerun_dev_deployed_on_worker.py -- sees the same policy.
+_RM_TOGGLE_POLICIES = ("pinned", "atr-searched")
+
+
+def _rm_toggles_unpinned_for_policy(policy: str) -> list:
+    """The ``rm_toggles_unpinned`` list a ``--rm-toggle-policy`` value resolves to."""
+    if policy == "pinned":
+        return []
+    if policy == "atr-searched":
+        return ["use_atr_stop"]
+    raise ValueError(f"unknown --rm-toggle-policy {policy!r}; choices are {_RM_TOGGLE_POLICIES}")
+
+
+def _pinned_rm_toggles(rm_toggles_unpinned: "list | None" = None) -> dict:
+    """``_INERT_RM_TOGGLES`` minus the keys a run policy unpinned. Mirrors
+    strategy_param_space.pinned_rm_toggles -- see that function for the full rationale. Refuses
+    (raises) any key outside ``_ALLOWED_RM_TOGGLES_UNPINNED``."""
+    unpinned = list(rm_toggles_unpinned or [])
+    bad = [k for k in unpinned if k not in _ALLOWED_RM_TOGGLES_UNPINNED]
+    if bad:
+        raise ValueError(
+            f"rm_toggles_unpinned may only unpin {sorted(_ALLOWED_RM_TOGGLES_UNPINNED)}; "
+            f"refusing to unpin {bad}")
+    return {k: v for k, v in _INERT_RM_TOGGLES.items() if k not in unpinned}
+
+
+def _refuse_atr_policy_without_job_name(policy: str, name: "str | None") -> None:
+    """An ``atr-searched`` run must be named so it can never be confused with -- or accidentally
+    resume the checkpoint of -- a pinned run of the same expert/strategy. ``pinned`` (the
+    default) is unrestricted."""
+    if policy != "atr-searched":
+        return
+    if not name or "-atr27" not in name:
+        sys.exit(
+            f"ba2-test: --rm-toggle-policy atr-searched requires --name (or --name-prefix) to "
+            f"contain '-atr27' (got {name!r}) -- this policy changes what the run scores, and a "
+            f"job name that could collide with a pinned run's name risks resuming its checkpoint "
+            f"into the wrong search or skipping a policy run as 'already completed'.")
+
 
 def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
     """The spec's ``option_fixed_settings`` when ``strategy_kind`` is an option job, else {}.
@@ -1065,7 +1112,8 @@ def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
 
 
 def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None, *,
-                         strategy_kind: "str | None" = None) -> dict:
+                         strategy_kind: "str | None" = None,
+                         rm_toggles_unpinned: "list | None" = None) -> dict:
     """Expert settings for a run: the spec's fixed_settings, plus the run universe injected into
     the expert's own universe setting when the spec names one (``universe_setting`` — for an
     expert that reads its universe from a setting, not from enabled_instruments; no current
@@ -1091,6 +1139,11 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     same settings dict it always did, byte for byte, so every existing job is unchanged.
     ``test_no_shipped_expert_spec_selects_a_risk_manager_mode`` pins that.
 
+    ``rm_toggles_unpinned`` (the --rm-toggle-policy run policy) relaxes ``_INERT_RM_TOGGLES`` for
+    exactly the keys it names -- see ``_pinned_rm_toggles``. ``None``/``[]`` (every call site
+    before this policy existed, and every ``pinned``-policy run) pins both toggles off exactly as
+    before.
+
     ``option_fixed_settings`` (optional spec key) is layered over ``fixed_settings`` only when
     ``strategy_kind`` is an option strategy (see ``_option_fixed_settings_for``). It lets ONE expert spec
     serve both the equity grids and the option grids with a setting the option grids need
@@ -1099,8 +1152,9 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     """
     settings = dict(spec["fixed_settings"])
     settings.update(_option_fixed_settings_for(spec, strategy_kind))
-    # HISTORICALLY INERT, PINNED SO THEY STAY THAT WAY. See _INERT_RM_TOGGLES.
-    settings.update(_INERT_RM_TOGGLES)
+    # HISTORICALLY INERT, PINNED SO THEY STAY THAT WAY -- unless a run policy unpinned one.
+    # See _INERT_RM_TOGGLES / _pinned_rm_toggles.
+    settings.update(_pinned_rm_toggles(rm_toggles_unpinned))
     if spec.get("universe_setting"):
         settings[spec["universe_setting"]] = ",".join(universe)
     if spec.get("risk_manager_mode"):
@@ -1445,9 +1499,27 @@ _EXPERT_OPT = {
             "factor_weight_quality": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
             "factor_weight_pead": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
             "top_n": {"optimize": True, "min": 10, "max": 40, "step": 5, "type": "int"},
-            "max_weight_per_name": {"optimize": True, "min": 0.05, "max": 0.20, "step": 0.05, "type": "float"},
+            # UNIFIED WITH THE PLATFORM-WIDE PER-INSTRUMENT CAP (2026-09-29): FactorRanker's own
+            # max_weight_per_name (fraction 0-1) is retired in favour of every other expert's
+            # max_virtual_equity_per_instrument_percent (percent), which the account-level
+            # position-size check now also enforces for FactorRanker (previously a no-op for it —
+            # see AccountInterface._validate_position_size_limits). Same range as the old gene
+            # (0.05-0.20), expressed as a percent (5.0-20.0) with the platform's usual 5-point step.
+            "max_virtual_equity_per_instrument_percent": {
+                "optimize": True, "min": 5.0, "max": 20.0, "step": 5.0, "type": "float"},
+            # CATEGORICAL (2026-09-28): how the top_n picks share the book. The choices are the
+            # expert's own declared values, in its order (FactorRanker.get_settings_definitions()
+            # ["weighting"]["valid_values"]; a test pins the two lists equal). "rank" is linear in
+            # rank (of N picks the best gets N parts ... the last 1), "score" is proportional to
+            # the composite score, "equal" is 1/N; every mode stays capped by
+            # max_virtual_equity_per_instrument_percent. Lands on the expert setting of the same
+            # name (model:weighting -> expert_overrides -> the trial's expert settings -> the
+            # deploy's expert_params), which is why it is no longer pinned in fixed_settings below:
+            # one source.
+            "weighting": {"optimize": True, "type": "choice",
+                          "choices": ["equal", "score", "rank"]},
         },
-        "fixed_settings": {"universe_source": "static", "weighting": "equal"},
+        "fixed_settings": {"universe_source": "static"},
         "bypass": True,
     },
     # PremiumSeller's grid entry was REMOVED 2026-08-31 (operator decision; option-model plan
@@ -1512,6 +1584,32 @@ _RM_OPT = {
     **_REGIME_OPT,
 }
 
+#: The ATR-searched policy's variant of _RM_OPT (docs/strategy_research/atr_grid/
+#: atr_grid_2027_design.md §3.2/§9, D4). ONLY used when --rm-toggle-policy atr-searched (via
+#: _rm_opt_for's atr_searched=True) -- the pinned policy's _RM_OPT is untouched.
+#:
+#: use_atr_stop: optimize True, searched 0/1 -- it is a real gene here, not dropped, because its
+#: declared default is True (see _INERT_RM_TOGGLES).
+#: atr_multiplier: floor widened 3.0->1.5. The 3.0 floor was raised 2026-07-01 from whipsaw
+#: evidence gathered while use_atr_stop was silently dead (the "1"-string defect, fixed later by
+#: coerce_bool), so it has no basis under a run where the toggle genuinely acts.
+#: The three regime_*_scale genes are DROPPED (D3): the overlay stays pinned off under this
+#: policy too, so they would be pure dead weight -- unlike the pinned policy, which keeps them
+#: in the space to preserve the historical genome shape.
+_RM_OPT_ATR_SEARCHED = {
+    "risk_per_trade_pct": _RM_OPT["risk_per_trade_pct"],
+    "atr_risk_budget_pct": _RM_OPT["atr_risk_budget_pct"],
+    "atr_multiplier": {"optimize": True, "min": 1.5, "max": 6.0, "step": 0.5, "type": "float"},
+    "atr_period": _RM_OPT["atr_period"],
+    "min_stop_loss_pct": _RM_OPT["min_stop_loss_pct"],
+    "use_atr_stop": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
+    "max_virtual_equity_per_instrument_percent":
+        _RM_OPT["max_virtual_equity_per_instrument_percent"],
+    # PINNED OFF, not searched -- D3: the overlay is a separate experiment. Kept as a (non-gene)
+    # entry for documentation; optimize=False means _collect_expert never emits it.
+    "regime_overlay_enabled": _REGIME_OPT["regime_overlay_enabled"],
+}
+
 #: Option jobs need a higher per-instrument ceiling than equity ones, and the setting is shared.
 #:
 #: A cash-secured put at spot $100 reserves strike*100 = $10,000, exactly 50% of the grid's $20k
@@ -1541,8 +1639,12 @@ def _effective_sizing_mode(spec: dict, args) -> "str | None":
     return ((spec or {}).get("fixed_settings") or {}).get("sizing_mode")
 
 
-def _rm_opt_for(kind: str, sizing_mode: "str | None" = None) -> dict:
+def _rm_opt_for(kind: str, sizing_mode: "str | None" = None, *, atr_searched: bool = False) -> dict:
     """The classic-RM gene block for a strategy kind: ``_RM_OPT``, plus the option override.
+
+    ``atr_searched`` (--rm-toggle-policy atr-searched) swaps the base block for
+    ``_RM_OPT_ATR_SEARCHED`` -- use_atr_stop searched, wider atr_multiplier floor, the 3
+    regime_*_scale genes dropped (D3/D4). False (default) is today's ``_RM_OPT``, unchanged.
 
     EVERY option kind gets the 50% ceiling EXCEPT ``O_STK``, and that exclusion is the whole
     point of the function. ``O_STK`` is ``_build_strategy_stock`` -> ``_build_strategy_S2``, i.e.
@@ -1558,8 +1660,9 @@ def _rm_opt_for(kind: str, sizing_mode: "str | None" = None) -> dict:
     Gating on ``_PURE_OPTION_STRATEGIES`` instead would be the natural-looking fix and is wrong
     for that reason.
     """
-    block = ({**_RM_OPT, **_OPTION_RM_OVERRIDE}
-             if kind in _OPTION_STRATEGY_KEYS and kind != "O_STK" else dict(_RM_OPT))
+    base = _RM_OPT_ATR_SEARCHED if atr_searched else _RM_OPT
+    block = ({**base, **_OPTION_RM_OVERRIDE}
+             if kind in _OPTION_STRATEGY_KEYS and kind != "O_STK" else dict(base))
     # atr_risk_budget_pct IS THE SIZING BUDGET, and only ``_risk_atr_quantity`` reads it -- which
     # runs solely under ``sizing_mode == 'risk_atr'``. In a notional run it is therefore a DEAD
     # gene: two genomes differing only in it score identically, so the GA spends population slots,
@@ -1587,8 +1690,13 @@ def _rm_opt_for(kind: str, sizing_mode: "str | None" = None) -> dict:
 # were quick same-day stop-outs vs 3.1% for large). Exposed as its own (narrower) gene set so the
 # GA can actually tune it, instead of the full _RM_OPT block (whose other keys — ATR/min-stop/
 # max-virtual-equity — have no bypass-path reader).
+# Max 10.0 -> 5.0 (2026-09-29, operator): the stop caps one symbol's loss at risk_per_trade_pct %
+# of the expert's equity. With 10-35 names each position is only ~3-10% of equity, so above ~5%
+# the budget exceeds the position and the stop sits 90%+ below entry or is not placed at all
+# (measured on dev: 38/39 FactorRanker positions). A name whose position cannot lose the budget
+# carrying no stop is accepted by design.
 _BYPASS_RM_OPT = {
-    "risk_per_trade_pct": {"optimize": True, "min": 0.5, "max": 10.0, "step": 0.5, "type": "float"},
+    "risk_per_trade_pct": {"optimize": True, "min": 0.5, "max": 5.0, "step": 0.5, "type": "float"},
 }
 
 # Per-weekday entry-scan ON/OFF toggle genes (schedule:<day>): merged into expert_params
@@ -1602,6 +1710,16 @@ _BYPASS_RM_OPT = {
 _SCHEDULE_DAY_OPT = {
     day: {"optimize": True}
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+}
+
+#: D8 (atr_grid_2027_design.md §3.2/§9): the ATR-searched policy searches weekday entry-scan
+#: cadence only -- the 2 weekend genes are noise on a daily clock (reference-ga-schedule-genes,
+#: every backtest bar is a weekday). Dropping them from the merged expert_params (not just from
+#: the search) means decode_params never sees a schedule:saturday/schedule:sunday key, so both
+#: default to False via its existing ``schedule_by_day.get(day, False)`` repair -- no change
+#: needed there. The pinned policy keeps _SCHEDULE_DAY_OPT (all 7 days) untouched.
+_WEEKDAY_SCHEDULE_DAY_OPT = {
+    day: spec for day, spec in _SCHEDULE_DAY_OPT.items() if day not in ("saturday", "sunday")
 }
 
 # Screener-settings genes (only added to the search when --screener is passed). The STATIC cap
@@ -5163,11 +5281,38 @@ def _market_condition_manifest_facts(digest: str, profile: str) -> dict:
     return facts
 
 
+#: The classic equity strategy keys (design 2026-09-15 Task 11, lifted 2026-09-29 for the
+#: risk-ATR "goal2027atr" grid ONLY -- an explicit operator call, not an implementation side
+#: effect: "do not change strategy s1 s7" held until this grid). Their builders append the
+#: market-condition ENTRY leaves through ``_append_equity_market_condition_gates`` and (behind
+#: ``--market-exit``) the EXIT/STOP/TP rules through ``_append_equity_market_exit_rules`` -- both
+#: called once, generically, from ``_build_strategy``'s dispatch, unlike the option builders
+#: (which call ``_append_market_condition_gates``/``_option_entry_rule`` themselves).
+_EQUITY_MARKET_CONDITION_STRATEGIES = {"S1", "S2", "S3", "S4", "S5", "S6", "S7"}
+
 #: The strategy keys whose builders actually EMIT market-condition leaves: every pure-option
-#: structure (through ``_option_entry_rule``) plus the two equity-entry option overlays
-#: (through ``_append_market_condition_gates``). Design 2026-09-15 "Deferred": the equity grid
-#: S1-S7 is NOT in this delivery, and O_STK has no entry gate of its own to hang leaves on.
-_MARKET_CONDITION_STRATEGIES = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"}
+#: structure (through ``_option_entry_rule``), the two equity-entry option overlays (through
+#: ``_append_market_condition_gates``), and (since the 2026-09-29 deferral lift) the classic
+#: equity strategies S1-S7. O_STK has no entry gate of its own to hang leaves on, so it stays out.
+_MARKET_CONDITION_STRATEGIES = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"} | _EQUITY_MARKET_CONDITION_STRATEGIES
+
+#: ``--market-condition-mode``: the default arm actually searches the market genes; ``all-off``
+#: is the matched control (design section 6) -- every market gene frozen off, byte-identical to
+#: profile ``none`` for both the entry gates and (see ``--market-exit``) the exit rules.
+_MARKET_CONDITION_MODE_SEARCHED = "searched"
+_MARKET_CONDITION_MODE_ALL_OFF = "all-off"
+_MARKET_CONDITION_MODE: str = _MARKET_CONDITION_MODE_SEARCHED
+
+#: ``--market-exit``: the selected MARKET_EXIT_KINDS (empty = no market exit/stop/tp rules).
+#: Equity-only (S1-S7) in this delivery -- no option kind gets market exits here.
+_MARKET_EXIT_KINDS_SELECTED: "tuple[str, ...]" = ()
+
+#: ``--search-sl-loosen``: searches ``allow_ruleset_sl_loosen`` (MarketExpertInterface, default
+#: False) as ONE model:* gene. NOT a market-condition gene (design D6) -- it must be searched in
+#: BOTH the treatment and the all-off control arm, so it is resolved and merged independently of
+#: ``_MARKET_CONDITION_MODE``.
+_SEARCH_SL_LOOSEN: bool = False
+_SL_LOOSEN_SETTING = "allow_ruleset_sl_loosen"
 
 
 def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: str = "") -> dict:
@@ -5211,12 +5356,18 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
     if _MARKET_CONDITION_PROFILES and kind and kind not in _MARKET_CONDITION_STRATEGIES:
         # A strategy whose builders emit NO market leaves would be labelled gated, would demand
         # snapshot coverage of its own universe, and would search exactly zero market genes --
-        # so `optimize-batch --strategies S1,O_LC --market-condition-profile ...` produced an S1
-        # job that failed coverage against the OPTION universe while claiming to be gated.
-        sys.exit(f"{command}: --market-condition-profile is options-only in this delivery, and "
-                 f"{kind!r} emits no market-condition gates (gated keys: "
-                 f"{sorted(_MARKET_CONDITION_STRATEGIES)}). Drop the flag, or run the option "
-                 f"keys in a job of their own.")
+        # so `optimize-batch --strategies S1,O_STK --market-condition-profile ...` produced an
+        # O_STK job that failed coverage against the gated universe while claiming to be gated.
+        sys.exit(f"{command}: --market-condition-profile: {kind!r} emits no market-condition "
+                 f"gates (gated keys: {sorted(_MARKET_CONDITION_STRATEGIES)}). Drop the flag, or "
+                 f"run the gated keys in a job of their own.")
+    if _MARKET_EXIT_KINDS_SELECTED and kind and kind not in _EQUITY_MARKET_CONDITION_STRATEGIES:
+        # --market-exit is attached ONLY by the equity dispatch in _build_strategy (design section
+        # 5.2 scopes it to S1-S7); an option kind would otherwise silently build WITHOUT the
+        # requested exit rules while the command line claims they are on.
+        sys.exit(f"{command}: --market-exit is equity-only (S1-S7) in this delivery, and "
+                 f"{kind!r} is not one of them ({sorted(_EQUITY_MARKET_CONDITION_STRATEGIES)}). "
+                 f"Drop the flag, or run the equity keys in a job of their own.")
     if not _MARKET_CONDITION_PROFILES:
         if _MARKET_CONDITION_MANIFESTS:
             # Ignoring it would run an UNGATED grid from a command line that says otherwise, and
@@ -5322,6 +5473,231 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
     print(f"{command}: market-condition {shown}; {len(genes)} added genes; population and "
           f"generations are NOT scaled by the profile(s)")
     return recorded
+
+
+def _resolve_market_condition_mode(raw, command: str) -> str:
+    """Parse ``--market-condition-mode``; sets and returns the module global.
+
+    ``searched`` (default) is today's behaviour: the entry gates and (with ``--market-exit``) the
+    exit rules are GA genes. ``all-off`` is the matched control (design section 6): every market
+    gene is frozen off -- ``_append_equity_market_condition_gates``/``_append_equity_market_exit_
+    rules`` skip the strategy entirely, so the built tree is byte-identical to profile ``none``,
+    while ``_apply_market_conditions`` still pins/validates the SAME manifest and writes the SAME
+    ``market_condition_profile`` expert setting, so the control pays the same data-supply cost."""
+    global _MARKET_CONDITION_MODE
+    mode = raw or _MARKET_CONDITION_MODE_SEARCHED
+    if mode not in (_MARKET_CONDITION_MODE_SEARCHED, _MARKET_CONDITION_MODE_ALL_OFF):
+        sys.exit(f"{command}: --market-condition-mode must be "
+                 f"{_MARKET_CONDITION_MODE_SEARCHED!r} or {_MARKET_CONDITION_MODE_ALL_OFF!r}, "
+                 f"got {mode!r}")
+    _MARKET_CONDITION_MODE = mode
+    return _MARKET_CONDITION_MODE
+
+
+def _resolve_market_exit_kinds(raw, command: str) -> tuple:
+    """Parse ``--market-exit``; sets and returns the module global (``()`` = no market exits).
+
+    Mirrors ``tools/strategy_research/exploration/market_conditions.py:exit_selection``: distinct
+    kinds from ``MARKET_EXIT_KINDS``, requires a profile (the rules read market conditions) and
+    requires the ``searched`` arm (the all-off control cannot carry searched exit genes -- design
+    section 6, "identical except every market gene frozen off")."""
+    global _MARKET_EXIT_KINDS_SELECTED
+    from ba2_common.core.market_condition_templates import MARKET_EXIT_KINDS
+
+    tokens = tuple(t.strip() for t in str(raw or "").split(",") if t.strip())
+    if not tokens:
+        _MARKET_EXIT_KINDS_SELECTED = ()
+        return _MARKET_EXIT_KINDS_SELECTED
+    unknown = [t for t in tokens if t not in MARKET_EXIT_KINDS]
+    if unknown or len(set(tokens)) != len(tokens):
+        sys.exit(f"{command}: --market-exit takes distinct kinds from "
+                 f"{','.join(MARKET_EXIT_KINDS)}; got {list(tokens)!r}")
+    if not _MARKET_CONDITION_PROFILES:
+        sys.exit(f"{command}: --market-exit requires --market-condition-profile (the rules read "
+                 f"market conditions)")
+    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+        sys.exit(f"{command}: --market-exit adds searched genes; --market-condition-mode "
+                 f"{_MARKET_CONDITION_MODE!r} is the no-impact control and cannot carry them")
+    _MARKET_EXIT_KINDS_SELECTED = tuple(k for k in MARKET_EXIT_KINDS if k in tokens)
+    return _MARKET_EXIT_KINDS_SELECTED
+
+
+def _resolve_search_sl_loosen(raw, command: str) -> bool:
+    """Parse ``--search-sl-loosen``; sets and returns the module global."""
+    global _SEARCH_SL_LOOSEN
+    _SEARCH_SL_LOOSEN = bool(raw)
+    return _SEARCH_SL_LOOSEN
+
+
+def _sl_loosen_gene_space() -> dict:
+    """The ONE ``model:allow_ruleset_sl_loosen`` gene ``--search-sl-loosen`` adds ({} when off).
+
+    Int 0/1 like every other RM toggle gene (``use_atr_stop``, ``screener_weinstein_stage2_only``)
+    -- ``_build_daily_trial_config`` merges it straight onto the expert's per-trial settings
+    (``overrides``, no whitelist in that path: every ``model:*`` key flows through unconditionally)
+    and ``ruleset_sl_loosen_allowed``/``coerce_bool`` read it back as a real bool regardless of
+    whether it lands as an int or (an older row's) the JSON string ``"1"``. NOT gated by
+    ``_MARKET_CONDITION_MODE`` -- design D6 requires it searched in BOTH arms, or the comparison
+    would measure two things at once."""
+    if not _SEARCH_SL_LOOSEN:
+        return {}
+    return {f"model:{_SL_LOOSEN_SETTING}": {
+        "optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"}}
+
+
+def _refuse_sl_loosen_on_bypass(command: str, kind: str, bypass: bool) -> None:
+    """``allow_ruleset_sl_loosen`` only affects the classic ruleset stop-loss policy
+    (``TradeActions.ruleset_stop_policy``); a bypass expert (FactorRanker) has no ruleset SL to
+    loosen, so the gene would be searched but dead -- refused rather than silently inert."""
+    if _SEARCH_SL_LOOSEN and bypass:
+        sys.exit(f"{command}: --search-sl-loosen: {kind!r} is a bypass expert with no classic "
+                 f"ruleset stop-loss to loosen; the gene would be searched but dead")
+
+
+def _equity_strategy_direction(strategy, kind: str) -> str:
+    """The ONE direction every position this equity strategy's entry rules open.
+
+    Derived from the built Strategy's OWN entry actions (mirrors ``tools/strategy_research/
+    exploration/market_conditions.py:job_direction``) rather than assumed long: S1-S7 are
+    long-only TODAY (every entry action is ``buy`` -- shorts, where enabled at all, are mirrored
+    onto the buy gates by a run-level engine flag, never a strategy-level sell entry), but a
+    strategy that ever grows a sell-side entry must not silently be gated with the wrong-side
+    market exit templates."""
+    opens = {str(a.get("action_type") or a.get("action") or "")
+             for rule in (getattr(strategy, "entry_rules", None) or [])
+             for a in (rule.get("actions") or []) if isinstance(a, dict)} & {"buy", "sell"}
+    if opens == {"buy", "sell"}:
+        raise ValueError(f"{kind}: entry rules both buy and sell; market exits need a single "
+                         f"position direction")
+    if not opens:
+        raise ValueError(f"{kind}: no buy/sell entry action; the position direction is unknown")
+    return "long" if opens == {"buy"} else "short"
+
+
+def _append_equity_market_condition_gates(strategy, kind: str):
+    """Append the market-condition ENTRY leaves to EVERY initial-entry AND tree of an equity
+    strategy (S1-S7), never to an exit/open-position rule (design section 5.1).
+
+    S1 has THREE entry rules, one per conviction tier (``_build_strategy_S1``), and design D5
+    requires them to SHARE one gate set (15 genes total, not 45). Sharing works for free: the SAME
+    leaf ids (``_market_condition_gates`` is deterministic in ``kind``) are appended,
+    independently copied, to every entry rule's tree here -- ``strategy_param_space`` keys
+    condition genes by leaf id ACROSS THE WHOLE STRATEGY (``decode_params``'s ``cond_by_id``) and
+    ``_apply_to_tree`` applies one decoded value/mode to every node carrying that id, exactly the
+    mechanism the option builders already use for ``shared-gate_confidence``/``shared-rel_volume``
+    across members. Every other S1-S7 builder has exactly one entry rule with a condition tree, so
+    this collapses to the ordinary single-tree case there.
+
+    Skipped entirely under the ``all-off`` control mode: the built tree must stay byte-identical
+    to profile ``none`` (design section 6).
+    """
+    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+        return strategy
+    gates = _market_condition_gates(kind.lower())
+    if not gates:
+        return strategy
+    import copy
+
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    rules = list(getattr(strategy, "entry_rules", None) or [])
+    trees = [r for r in rules if isinstance(r, dict) and isinstance(r.get("conditions"), dict)
+             and r["conditions"].get("conditions")]
+    if not trees:
+        raise ValueError(f"{kind}: no entry rule with a condition tree to carry the "
+                         f"market-condition gates")
+    for rule in trees:
+        tree = rule["conditions"]
+        tree["conditions"] = list(tree["conditions"]) + [copy.deepcopy(g) for g in gates]
+    strategy.entry_rules = normalize_trade_rules(rules)
+    return strategy
+
+
+def _equity_market_exit_terminal_catch_all(rule) -> bool:
+    """True for a TERMINAL CATCH-ALL exit rule: it matches every held position and stops
+    processing (ported from ``tools/strategy_research/exploration/market_conditions.py:
+    terminal_catch_all`` -- same algorithm, kept local so the launcher does not import from
+    ``tools/``). S2/S3/S5/S7/S1/S4's always-on floor stop (bare ``has_position``, first-match) is
+    exactly this shape."""
+    if rule.get("continue_processing") or rule.get("continueProcessing"):
+        return False
+
+    def matches_all(node):
+        if not node:
+            return True
+        if "conditions" in node:
+            group = node.get("operator") or node.get("type") or "AND"
+            return group in ("AND", "OR") and all(matches_all(c) for c in node["conditions"])
+        return (node.get("field") == "has_position"
+                and (node.get("op") or node.get("comparison")) == "is_true")
+
+    return matches_all(rule.get("conditions"))
+
+
+def _equity_market_exit_adjusts_stop_loss(rule) -> bool:
+    return any((a.get("action_type") or a.get("action")) == "adjust_stop_loss"
+              for a in (rule.get("actions") or []) if isinstance(a, dict))
+
+
+def _insert_equity_market_exit_rules(exit_rules, new_rules) -> tuple:
+    """Insert ``new_rules`` into an equity strategy's exit list AFTER the existing exits but
+    BEFORE the first TERMINAL CATCH-ALL rule (mirrors ``exploration/market_conditions.py:
+    attach_exits``): a catch-all placed first (S1-S3/S5/S7's floor stop) would otherwise shadow
+    every rule appended strictly at the end, under the engine's first-match semantics. The market
+    rules keep ``continue_processing`` on their adjust actions, so the catch-all still runs right
+    after them -- except the STOP rule is DROPPED when the catch-all itself adjusts the stop-loss
+    (S6 has no catch-all at all, so nothing is omitted there): the engine keeps only the LAST
+    stop-loss action of a pass, and the always-matching catch-all would win that race every time,
+    making a market stop ahead of it a searched-but-dead gene. Returns ``(rules, omitted)``.
+    """
+    rules = list(exit_rules or [])
+    at = next((i for i, r in enumerate(rules) if _equity_market_exit_terminal_catch_all(r)),
+             len(rules))
+    omitted: dict = {}
+    kept = list(new_rules)
+    if at < len(rules) and _equity_market_exit_adjusts_stop_loss(rules[at]):
+        stop_ids = [r["id"] for r in kept if "-mkt-stop" in r["id"]]
+        if stop_ids:
+            omitted["stop"] = (f"catch-all exit rule {rules[at].get('id')!r} adjusts the "
+                               f"stop-loss after it on every bar, and a pass keeps only its "
+                               f"last stop-loss action")
+            kept = [r for r in kept if r["id"] not in stop_ids]
+    if kept:
+        rules[at:at] = kept
+    return rules, omitted
+
+
+def _append_equity_market_exit_rules(strategy, kind: str):
+    """Append the ``--market-exit`` rules (``[]`` when unselected) to an equity strategy's exit
+    list, off by default behind their own rule-level toggle genes (design section 5.2).
+
+    Skipped under the ``all-off`` control mode -- ``_resolve_market_exit_kinds`` already refuses
+    that combination at parse time (``--market-exit`` requires the ``searched`` arm), so
+    ``_MARKET_EXIT_KINDS_SELECTED`` is guaranteed empty whenever the mode is ``all-off``; the
+    guard here is defensive, not load-bearing.
+    """
+    if not _MARKET_EXIT_KINDS_SELECTED:
+        return strategy
+    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+        raise ValueError(f"{kind}: market exit rules requested with a non-searched "
+                         f"market-condition mode {_MARKET_CONDITION_MODE!r}")
+    from ba2_common.core.market_condition_rules import assert_market_rule_actions
+    from ba2_common.core.market_condition_templates import market_exit_rules
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    direction = _equity_strategy_direction(strategy, kind)
+    profiles = _market_condition_setting_profiles()
+    prefix = kind.lower()
+    rules = market_exit_rules(prefix, profiles, direction, _MARKET_EXIT_KINDS_SELECTED)
+    if not rules:
+        raise ValueError(f"{kind}: --market-exit {','.join(_MARKET_EXIT_KINDS_SELECTED)} "
+                         f"produced no rule for the selected profile(s) {','.join(profiles)}")
+    merged, omitted = _insert_equity_market_exit_rules(strategy.exit_rules, rules)
+    strategy.exit_rules = normalize_trade_rules(merged)
+    assert_market_rule_actions(strategy.exit_rules, f"{kind} exit rules")
+    if omitted:
+        print(f"{kind}: market-exit omitted {sorted(omitted)}: {omitted}")
+    return strategy
 
 
 def _option_signal_gate(m: str, member: str) -> dict:
@@ -6003,6 +6379,15 @@ def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="le
         if builder is None:
             sys.exit(f"optimize: unknown strategy {kind!r}; have {sorted(_STRATEGY_BUILDERS)}")
         strat = builder(name)
+    if kind in _EQUITY_MARKET_CONDITION_STRATEGIES:
+        # Equity market-condition gates/exits (design 2026-09-15 Task 11, lifted 2026-09-29):
+        # a no-op with the profile off / no --market-exit, so every existing S1-S7 command stays
+        # byte-identical. The option builders attach their own leaves internally (_option_entry_
+        # rule, _append_market_condition_gates called from the O_CC/O_PP/O_WHEEL builders); S1-S7
+        # attach here, once, generically, since every one of them returns a plain Strategy with no
+        # further per-kind splicing to interact with.
+        strat = _append_equity_market_condition_gates(strat, kind)
+        strat = _append_equity_market_exit_rules(strat, kind)
     if neutral_entry_mode != "legacy":
         _configure_neutral_entry(strat, kind, neutral_entry_mode)
     return _clamp_confidence_genes(strat, expert)
@@ -6078,6 +6463,9 @@ def _cmd_optimize(args) -> int:
     # Read BEFORE _build_strategy too: the market gates are appended by the same builders.
     _resolve_market_condition_profiles(getattr(args, "market_condition_profile", None), "optimize")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None), "optimize")
+    _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize")
+    _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize")
+    _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize")
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -6093,6 +6481,13 @@ def _cmd_optimize(args) -> int:
         sys.exit(f"ba2-test: optimize not configured for expert {expert!r}; have {sorted(_EXPERT_OPT)}")
     _refuse_unbounded_strategy_request("optimize", [args.strategy])
     _refuse_phase_gated_strategy("optimize", [args.strategy])
+    # --rm-toggle-policy (design atr_grid_2027 §3.2). "pinned" (default) is byte-identical to
+    # today; "atr-searched" unpins use_atr_stop for this run only, persisted on the run config
+    # so every path that rebuilds a trial from it sees the same policy. Resolved and validated
+    # BEFORE anything is built: a refusal here must cost nothing.
+    rm_toggle_policy = getattr(args, "rm_toggle_policy", "pinned") or "pinned"
+    _refuse_atr_policy_without_job_name(rm_toggle_policy, args.name)
+    rm_toggles_unpinned = _rm_toggles_unpinned_for_policy(rm_toggle_policy)
     # Pure-option kinds AND options experts (spec key `options` — --strategy is ignored)
     # default to the ~30%/yr goal metric; stock kinds keep sharpe_ratio.
     fitness = _resolve_fitness(args.fitness, args.strategy,
@@ -6170,6 +6565,7 @@ def _cmd_optimize(args) -> int:
     db = SessionLocal()
     try:
         bypass = bool(spec.get("bypass"))
+        _refuse_sl_loosen_on_bypass("optimize", args.strategy, bypass)
         _sname = args.name or f"opt-{expert}-{args.strategy}"
         # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
         # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
@@ -6190,7 +6586,8 @@ def _cmd_optimize(args) -> int:
             "enabled_instruments": universe,
             "experts": [{"class": expert, "settings": _expert_run_settings(
                 spec, universe, _sizing_overrides(args),
-                strategy_kind=None if bypass else args.strategy)}],
+                strategy_kind=None if bypass else args.strategy,
+                rm_toggles_unpinned=rm_toggles_unpinned)}],
             "start_date": args.start, "end_date": args.end,
             "initial_capital": float(args.initial_capital),
             "account_settings": {
@@ -6235,6 +6632,13 @@ def _cmd_optimize(args) -> int:
             "backtest_id": int(_dt.now().timestamp()),
             "name": f"opt-{expert}-trial",
         }
+        # Persisted with the run (never an env var) so every consumer of this stored config --
+        # GA trials via _build_daily_trial_config, top-N persist, re-runs, robustness variants,
+        # tools/recover_missing_topn.py, tools/rerun_dev_deployed_on_worker.py -- sees the same
+        # policy. Absent (pinned policy) keeps this block byte-identical to before the policy
+        # existed; only written when non-empty.
+        if rm_toggles_unpinned:
+            backtest_block["rm_toggles_unpinned"] = rm_toggles_unpinned
         # Options experts get the offline options-cache seam (no-op for equity experts).
         _apply_options_seam(spec, backtest_block)
         # WHICH store the run reads, resolved and recorded here rather than left to whatever
@@ -6379,7 +6783,11 @@ def _cmd_optimize(args) -> int:
         _apply_market_conditions("optimize", backtest_block, strat, args.strategy)
         # Per-weekday entry-scan toggle genes (schedule:<day>) for every non-bypass strategy
         # (S1-S7) — FactorRanker (bypass) has no per-day entry-scan gate, so it never gets these.
-        schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}
+        # D8 under the ATR-searched policy: weekdays only (_WEEKDAY_SCHEDULE_DAY_OPT drops the
+        # 2 weekend genes); the pinned policy keeps all 7.
+        _sched_opt = (_WEEKDAY_SCHEDULE_DAY_OPT if rm_toggle_policy == "atr-searched"
+                     else _SCHEDULE_DAY_OPT)
+        schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _sched_opt.items()}
         cfg = {
             "populationSize": int(args.population),
             "generations": int(args.generations),
@@ -6390,10 +6798,13 @@ def _cmd_optimize(args) -> int:
             # Expert decision params (+ classic-RM sizing for ruleset experts; bypass experts size
             # their own portfolio so they carry only the narrow _BYPASS_RM_OPT block — unless the
             # spec opts out via no_bypass_rm — not the full _RM_OPT). Screener genes (screener:*
-            # namespace) are merged in ONLY when --screener is set.
+            # namespace) are merged in ONLY when --screener is set. _rm_opt_for's atr_searched
+            # swaps in _RM_OPT_ATR_SEARCHED under the ATR-searched policy (no-op otherwise).
             "expert_params": ({**_bypass_gene_space(spec), **screener_genes} if bypass
-                              else {**spec["expert_params"], **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args)),
-                                    **screener_genes, **schedule_genes}),
+                              else {**spec["expert_params"],
+                                    **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args),
+                                                 atr_searched=(rm_toggle_policy == "atr-searched")),
+                                    **screener_genes, **schedule_genes, **_sl_loosen_gene_space()}),
             "backtest": backtest_block,
         }
         _apply_lattice_anchor(cfg, args.strategy, getattr(args, "lattice_anchor", None))
@@ -6497,6 +6908,9 @@ def _cmd_optimize_batch(args) -> int:
                                        "optimize-batch")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None),
                                         "optimize-batch")
+    _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize-batch")
+    _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize-batch")
+    _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize-batch")
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     batch_worker_ids = _worker_ids_from_args(args)  # resolved once; applied to every job
@@ -6510,6 +6924,12 @@ def _cmd_optimize_batch(args) -> int:
             sys.exit(f"optimize-batch: expert {e!r} not configured; have {sorted(_EXPERT_OPT)}")
     _refuse_unbounded_strategy_request("optimize-batch", strategies)
     _refuse_phase_gated_strategy("optimize-batch", strategies)
+    # --rm-toggle-policy (see _cmd_optimize). Resolved ONCE for the whole batch: every job in a
+    # batch run shares one policy, and the name guard checks the prefix every job name is built
+    # from.
+    rm_toggle_policy = getattr(args, "rm_toggle_policy", "pinned") or "pinned"
+    _refuse_atr_policy_without_job_name(rm_toggle_policy, args.name_prefix or "phase1")
+    rm_toggles_unpinned = _rm_toggles_unpinned_for_policy(rm_toggle_policy)
     # Build the (expert, strategy) job grid. Bypass experts (FactorRanker) have no enter/exit
     # rulesets, so they run ONCE (their factor-model params), not per strategy variant.
     jobs = []  # (expert, strategy_kind)
@@ -6539,6 +6959,7 @@ def _cmd_optimize_batch(args) -> int:
     for n, (expert, strat_kind) in enumerate(jobs, 1):
         spec = _EXPERT_OPT[expert]
         bypass = bool(spec.get("bypass"))
+        _refuse_sl_loosen_on_bypass("optimize-batch", strat_kind, bypass)
         prefix = args.name_prefix or "phase1"
         # Per-job resolution: pure-option kinds AND options experts (spec key `options` — a
         # bypass one's strat_kind is "FACTOR" and carries no option-kind default) default to
@@ -6563,7 +6984,8 @@ def _cmd_optimize_batch(args) -> int:
                 "enabled_instruments": universe,
                 "experts": [{"class": expert, "settings": _expert_run_settings(
                     spec, universe, _sizing_overrides(args),
-                    strategy_kind=None if bypass else strat_kind)}],
+                    strategy_kind=None if bypass else strat_kind,
+                    rm_toggles_unpinned=rm_toggles_unpinned)}],
                 "start_date": args.start, "end_date": args.end,
                 "initial_capital": float(args.initial_capital),
                 "account_settings": {
@@ -6604,6 +7026,10 @@ def _cmd_optimize_batch(args) -> int:
                 "backtest_id": int(_dt.now().timestamp()),
                 "name": f"{name}-trial",
             }
+            # Persisted with the run (see _cmd_optimize). Absent (pinned policy) keeps this
+            # block byte-identical to before the policy existed.
+            if rm_toggles_unpinned:
+                backtest_block["rm_toggles_unpinned"] = rm_toggles_unpinned
             # Options experts get the offline options-cache seam (no-op for equity experts).
             _apply_options_seam(spec, backtest_block)
             # The store decision, resolved once and recorded on the block. THIS driver is the one
@@ -6638,8 +7064,13 @@ def _cmd_optimize_batch(args) -> int:
                 # leaves the gene dead weight — no current spec); ruleset experts get the full
                 # RM sizing/stop params + per-weekday entry-scan toggle genes.
                 "expert_params": (_bypass_gene_space(spec) if bypass
-                                  else {**spec["expert_params"], **_rm_opt_for(strat_kind, _effective_sizing_mode(spec, args)),
-                                        **{f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}}),
+                                  else {**spec["expert_params"],
+                                        **_rm_opt_for(strat_kind, _effective_sizing_mode(spec, args),
+                                                     atr_searched=(rm_toggle_policy == "atr-searched")),
+                                        **{f"schedule:{k}": v for k, v in
+                                           (_WEEKDAY_SCHEDULE_DAY_OPT
+                                            if rm_toggle_policy == "atr-searched"
+                                            else _SCHEDULE_DAY_OPT).items()}, **_sl_loosen_gene_space()}),
                 "backtest": backtest_block,
             }
             _apply_lattice_anchor(cfg, strat_kind, getattr(args, "lattice_anchor", None))
@@ -7433,6 +7864,32 @@ def _add_market_condition_args(p) -> None:
                         "each worker would compute the indicators from whatever cache it "
                         "happened to hold. Refused at launch when it does not cover the run's "
                         "universe.")
+    p.add_argument("--market-exit", default=None, metavar="KIND[,KIND...]",
+                   help="EQUITY (S1-S7) ONLY. Append market-condition EXIT/STOP/TP rules "
+                        "(kinds: exit,stop,tp -- ba2_common.core.market_condition_templates."
+                        "MARKET_EXIT_KINDS) to the strategy's exit list, AFTER its existing "
+                        "exits (but before a terminal catch-all floor stop, which would "
+                        "otherwise shadow them). Each rule is off by default behind its own "
+                        "rule-level toggle gene. Requires --market-condition-profile and "
+                        "--market-condition-mode searched (the default).")
+    p.add_argument("--market-condition-mode", default=_MARKET_CONDITION_MODE_SEARCHED,
+                   choices=(_MARKET_CONDITION_MODE_SEARCHED, _MARKET_CONDITION_MODE_ALL_OFF),
+                   help="'searched' (default): the market entry gates and any --market-exit "
+                        "rules are GA genes. 'all-off': the matched CONTROL arm for a "
+                        "--market-condition-profile run -- every market gene is frozen off (no "
+                        "leaf/rule is appended at all), byte-identical to profile 'none' for "
+                        "both the entry gates and the exits, while the run still pins/validates "
+                        "the same manifest and writes the same market_condition_profile expert "
+                        "setting, so the control pays the same data-supply cost as the "
+                        "treatment. Run the SAME seed/population/generations as the matched "
+                        "'searched' job to isolate what the market conditions add.")
+    p.add_argument("--search-sl-loosen", action="store_true", default=False,
+                   help="Search allow_ruleset_sl_loosen (MarketExpertInterface, default False) "
+                        "as ONE model:* gene (int 0/1, decoded through coerce_bool to a real "
+                        "bool by every reader). NOT a market-condition gene (design D6) -- it is "
+                        "added in BOTH the searched and all-off arms, so the market-condition "
+                        "comparison isolates one variable. Refused on a bypass expert "
+                        "(FactorRanker): it has no classic ruleset stop-loss to loosen.")
 
 
 def main(argv: "list | None" = None) -> int:
@@ -7865,6 +8322,17 @@ def main(argv: "list | None" = None) -> int:
                          "TradeRiskManagement entirely, so sizing_mode is never read. ALWAYS "
                          "give the two runs different --name suffixes, or the second is SKIPped "
                          "as an already-completed run.")
+    op.add_argument("--rm-toggle-policy", choices=_RM_TOGGLE_POLICIES, default="pinned",
+                    help="'pinned' (default): use_atr_stop/regime_overlay_enabled are pinned OFF "
+                         "for this run, exactly as every run on record -- byte-identical to "
+                         "before this flag existed. 'atr-searched': unpins ONLY use_atr_stop for "
+                         "this run (D3: regime_overlay_enabled can never be unpinned), searched "
+                         "0/1 with a widened atr_multiplier floor, the 3 regime_*_scale genes "
+                         "dropped, and weekday-only schedule genes (see "
+                         "docs/strategy_research/atr_grid/atr_grid_2027_design.md §3.2). "
+                         "Persisted on the run (optimization_config.backtest.rm_toggles_unpinned), "
+                         "never an env var, so re-runs/top-N/robustness variants of THIS run stay "
+                         "under the same policy. Requires --name to contain '-atr27'.")
     op.add_argument("--screener", action="store_true",
                     help="Optimize a screener-selected dynamic universe (screener:* genes). "
                          "Requires --screener-store; the run universe becomes the store's full "
@@ -7948,6 +8416,9 @@ def main(argv: "list | None" = None) -> int:
                          "(engine default: 10.0). See optimize --elitism-percent.")
     ob.add_argument("--lattice-anchor", choices=["zero", "min"], default=None,
                     help="See optimize --lattice-anchor (per-strategy default).")
+    ob.add_argument("--rm-toggle-policy", choices=_RM_TOGGLE_POLICIES, default="pinned",
+                    help="See optimize --rm-toggle-policy. Applies to every job in this batch; "
+                         "--name-prefix must contain '-atr27' under 'atr-searched'.")
     ob.add_argument("--save-top", type=int, default=5)
     ob.add_argument("--seed", type=int, default=42)
     ob.add_argument("--initial-capital", type=float, default=10000.0)

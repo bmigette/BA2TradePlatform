@@ -128,6 +128,17 @@ def _build_run(account_id=51, expert_id=51):
         enter_market_ruleset_id=ruleset_id,
         instance_id=expert_id,
     )
+    # The account-level per-instrument cap (AccountInterface._validate_position_size_limits)
+    # now resolves to the DECLARED default (10%) when nothing is stored, closing the bug where
+    # a bypass expert with no stored cap silently skipped this check (2026-09-29). This stub
+    # targets a fixed 30% (TARGET_WEIGHT) to exercise realistic rebalance behaviour, not the
+    # cap itself, so it needs a cap wide enough to admit that target.
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import ExpertSetting
+
+    add_instance(ExpertSetting(
+        instance_id=expert_id, key="max_virtual_equity_per_instrument_percent",
+        value_float=50.0))
 
     ps = AsOfPriceSource(ohlcv_provider=None)
     ps.load_bars("AAPL", _bar_rows(BARS))
@@ -226,6 +237,33 @@ def test_bypass_expert_rebalances_and_rm_not_invoked(monkeypatch):
 
         # One equity snapshot per simulated bar.
         assert len(account.get_balance_history()) == len(BARS)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_a_refused_add_does_not_end_the_run_and_is_counted(monkeypatch):
+    """A rebalance that refuses an add under the per-symbol max-loss rule (ProtectiveStopError,
+    caught inside ``rebalance``) is a rule DECISION: the run carries on to the last bar, exactly
+    as live carries on the next day, and the engine counts it. Until 2026-09-29 the engine
+    re-raised it and the whole GA trial crashed (goal2027atr opt 525, JPM +1)."""
+    from ba2_experts.FactorRanker import portfolio as pf_mod
+
+    engine, account, expert, ctx, ps = _build_run()
+    try:
+        orig_rebalance = pf_mod.FactorPortfolioManager.rebalance
+
+        def _refusing_rebalance(self, target_weights, equity=None):
+            orders = orig_rebalance(self, target_weights, equity)
+            self.last_refused_adds = ["JPM +1: rule stop 86.5580 >= price 84.8900"]
+            return orders
+
+        monkeypatch.setattr(pf_mod.FactorPortfolioManager, "rebalance", _refusing_rebalance,
+                            raising=True)
+
+        results = engine.run()
+
+        assert len(account.get_balance_history()) == len(BARS)
+        assert results["refused_adds"] == len(BARS)
     finally:
         ctx.__exit__(None, None, None)
 

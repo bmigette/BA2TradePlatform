@@ -100,8 +100,12 @@ _BENIGN_DEFAULT: tuple = (OSError,)
 # whose publication dates cannot be established for the decision (old-format cache, a cache
 # fetched before the decision, a decision before the first vintage). Absorbed, the expert's macro
 # regime would silently fall back to the index trend alone -- in ``observe``/``legacy`` too.
+#
+# OHLCVTopUpRefused (``ba2_common.core.ohlcv_topup_guard``, 2026-09-28): a daily OHLCV top-up that
+# could not be appended without mixing split bases (APH). The cache is on the OLD basis and the
+# market is on the new one, so absorbing it would price the symbol on the stale history.
 _NEVER_ABSORB_NAMES = frozenset({"SplitBasisRefused", "OptionSpotBasisMismatch",
-                                 "MacroAvailabilityUnknown"})
+                                 "MacroAvailabilityUnknown", "OHLCVTopUpRefused"})
 
 
 def is_never_absorbed(exc: BaseException) -> bool:

@@ -31,6 +31,21 @@ from ba2_common.logger import logger
 _OpenedTxn = namedtuple("_OpenedTxn", ["id", "open_price", "open_qty"])
 
 
+class ProtectiveStopError(RuntimeError):
+    """An ADD refused by the per-symbol max-loss rule.
+
+    The add's stop -- priced by the rule on the position the add would create -- sits at or
+    above the current price: the combined position would already be past its loss budget, so
+    the rule's answer is "do not add". Raised by ``_submit_buy`` before anything is sent for
+    the name. ``rebalance`` catches it: the refusal is a STRATEGY DECISION, not a failure
+    (2026-09-29). It skips that add, finishes the other names, logs a WARNING naming every
+    refused add and records them on ``last_refused_adds`` -- identically live and in the
+    backtest, which counts them in its results. Until 2026-09-29 the rebalance re-raised it:
+    live failed that day's analysis and carried on the next, while the backtest crashed the
+    whole trial, so one refused add in six years zeroed a GA genome.
+    """
+
+
 def rebalance_deltas(target_weights: Dict[str, float], held_shares: Dict[str, float],
                      prices: Dict[str, float], equity: float,
                      quantity_units: Optional[Dict[str, float]] = None) -> Dict[str, float]:
@@ -135,6 +150,8 @@ class FactorPortfolioManager:
         instance = get_instance(ExpertInstance, expert_instance_id)
         self.account_id = instance.account_id
         self.account = resolver.get_account_instance(instance.account_id)
+        # The adds the LAST rebalance refused under the max-loss rule (see ProtectiveStopError).
+        self.last_refused_adds: List[str] = []
 
     # ------------------------------------------------------------------
     # Holdings
@@ -268,34 +285,60 @@ class FactorPortfolioManager:
             )
 
         if equity is None:
-            equity = self.expert.get_virtual_balance()
+            # EQUITY (cash + this book marked), not get_virtual_balance: that one is cash in
+            # the backtest (finding 6), where a fully invested book then read as nearly empty
+            # and every second rebalance sold it. Same figure live and in the backtest.
+            equity = self.expert.get_virtual_equity()
         if equity is None:
-            raise ValueError("FactorRanker: virtual balance (equity) not available for rebalance")
+            raise ValueError("FactorRanker: virtual equity not available for rebalance")
 
         quantity_units = self._quantity_units(symbols)
         deltas = rebalance_deltas(target_weights, held, prices, equity,
                                   quantity_units=quantity_units)
 
+        # WHERE THE STOP IS MAINTAINED -- at the order that changes the position, never in a
+        # pass afterwards (review I1, 2026-09-29):
+        #   * ADD / new name: ``_submit_buy`` prices the stop by the rule on the position the
+        #     buy CREATES (held + added, at the blended cost, on this rebalance's equity) and
+        #     attaches it through submit_order(sl_price) -> adjust_sl, which sizes the leg on
+        #     the post-fill position (AlpacaAccount; the backtest keeps it on the transaction);
+        #   * TRIM: ``_reprotect_remainder`` resizes the released leg over what is left and
+        #     KEEPS its price, by design (a reduce must not move a stop the strategy already
+        #     chose -- see its docstring);
+        #   * EXIT: the leg is released and nothing is left to protect.
+        # A post-rebalance re-price pass used to sit here. It ran on the PRE-rebalance
+        # quantities (overwriting the add's correct stop, re-pricing trims against their
+        # documented choice), and on Alpaca its adjust_sl swept up this rebalance's own
+        # SELL/BUY as exit legs (C1). It had also never once succeeded, in either runtime, so
+        # removing it changes no result that was ever produced.
         submitted: List[TradingOrder] = []
+        refused: List[str] = []
         for sym, delta in deltas.items():
             # ``int`` on the whole-share grid, exactly as before -- it truncates toward zero,
             # which a sub-share residue on a whole-grid symbol has always relied on. A
             # fractional delta is already on its grid and passes through unchanged.
             unit = quantity_units.get(sym, WHOLE_SHARE)
             qty = int(delta) if is_whole_grid(unit) else delta
-            order = self._submit_delta(sym, qty, by_symbol.get(sym, []))
+            try:
+                order = self._submit_delta(sym, qty, by_symbol.get(sym, []))
+            except ProtectiveStopError as e:
+                refused.append(str(e))
+                continue
             if order is not None:
                 submitted.append(order)
 
-        # The stop price is a function of avg entry cost, held qty AND equity — a rebalance moves
-        # all three, so a stop priced at the original entry goes stale the moment a name is added
-        # to or trimmed. Re-price the survivors here, the same way every other expert's stop is
-        # maintained (adjust_sl), so the resting order keeps encoding the CURRENT rule.
-        self._resync_protective_stops(by_symbol, changed={s for s, d in deltas.items() if d})
         logger.info(
             f"FactorRanker[{self.expert_instance_id}]: rebalance submitted {len(submitted)} orders "
             f"(equity={equity:.2f}, deltas={deltas})"
         )
+        # A refused add is the max-loss rule deciding "do not add" -- acted on (skipped), stated
+        # loudly, recorded; never a crash (see ProtectiveStopError).
+        self.last_refused_adds = refused
+        if refused:
+            logger.warning(
+                f"FactorRanker[{self.expert_instance_id}]: rebalance refused {len(refused)} "
+                f"add(s) under the per-symbol max-loss rule (the other {len(submitted)} "
+                f"order(s) stand): " + "; ".join(refused))
         return submitted
 
     def _quantity_units(self, symbols) -> Dict[str, float]:
@@ -367,29 +410,6 @@ class FactorPortfolioManager:
         except Exception:  # noqa: BLE001 — a stub expert -> no stop
             return 0.0
 
-    def _resync_protective_stops(self, by_symbol: Dict[str, list], changed: set) -> None:
-        """Re-price the resting stop of every still-held name whose position just changed.
-
-        Best-effort and never raises: a stop that could not be amended is worse than one that
-        could, but far better than aborting a rebalance that has already submitted orders.
-        """
-        for symbol in sorted(changed):
-            transactions = by_symbol.get(symbol) or []
-            if not transactions:
-                continue  # fully exited — its protective leg is closed with the transaction
-            sl = self.protective_stop_price(symbol, transactions)
-            if sl is None:
-                continue
-            for trans in transactions:
-                try:
-                    self.account.adjust_sl(trans, sl, source="factorranker_rebalance")
-                except NotImplementedError:
-                    return  # broker cannot amend stops — nothing to retry per symbol
-                except Exception as e:  # noqa: BLE001 — one bad amend must not void the rebalance
-                    logger.warning(
-                        f"FactorRanker[{self.expert_instance_id}]: could not re-price the "
-                        f"protective stop for {symbol} to {sl:.4f}: {e}")
-
     def protective_stop_price(self, symbol: str, transactions: list,
                               extra_qty: float = 0.0, extra_price: Optional[float] = None
                               ) -> Optional[float]:
@@ -427,9 +447,11 @@ class FactorPortfolioManager:
         if risk_pct <= 0:
             return None
 
-        equity = self.expert.get_virtual_balance()
+        # The budget is a share of what the expert's slice is WORTH -- the same figure the
+        # rebalance sizes on (see rebalance), never the cash left over after buying.
+        equity = self.expert.get_virtual_equity()
         if not equity or equity <= 0:
-            logger.warning(f"FactorRanker[{self.expert_instance_id}]: no virtual balance; "
+            logger.warning(f"FactorRanker[{self.expert_instance_id}]: no virtual equity; "
                            f"cannot price a protective stop for {symbol}")
             return None
 
@@ -492,6 +514,15 @@ class FactorPortfolioManager:
         # when the symbol is blocked, instead of locking the entry.
         sl_price = self.protective_stop_price(
             symbol, transactions, extra_qty=qty, extra_price=entry_price)
+        if sl_price is not None and entry_price is not None and sl_price >= entry_price:
+            # Never a sell stop at or above market: it would fire at once (or be refused), and
+            # the rule it encodes says this name is already past its loss budget -- adding to
+            # it is not what the rule means. Refused BEFORE anything is sent for this name.
+            logger.error(
+                f"FactorRanker[{self.expert_instance_id}]: REFUSING add of {qty} {symbol}: its "
+                f"rule stop {sl_price:.4f} is at/above the current price {entry_price:.4f}")
+            raise ProtectiveStopError(
+                f"{symbol} +{qty}: rule stop {sl_price:.4f} >= price {entry_price:.4f}")
         if sl_price is None:
             logger.warning(
                 f"FactorRanker[{self.expert_instance_id}]: no protective stop priced for "

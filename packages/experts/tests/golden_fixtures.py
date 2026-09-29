@@ -305,7 +305,7 @@ _FR_VALUE_INPUTS = {
 }
 _FR_SETTINGS = {
     "winsorize_pct": 0.0, "top_n": 2, "weighting": "equal",
-    "max_weight_per_name": 1.0, "gross_exposure": 1.0, "pead_drift_window_days": 60,
+    "max_virtual_equity_per_instrument_percent": 100.0, "gross_exposure": 1.0, "pead_drift_window_days": 60,
     "_factor_weights": {"momentum": 0.0, "value": 1.0, "quality": 0.0, "pead": 0.0},
 }
 

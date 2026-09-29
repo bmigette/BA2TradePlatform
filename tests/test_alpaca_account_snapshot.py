@@ -356,10 +356,22 @@ def test_a_burst_of_position_size_validations_makes_one_round_trip(monkeypatch):
 
     class _Resolver:
         def get_expert_instance(self, expert_id):
+            from tests.conftest import MockExpert
+
             class _E:
+                # get_setting_with_interface_default delegates to a REAL MockExpert so
+                # the per-instrument cap (resolved through this same seam since
+                # 2026-09-29) keeps reading the stored ExpertSetting row above.
+                def __init__(self, real):
+                    self._real = real
+
                 def get_available_balance(self, exclude_transaction_id=None):
                     return 1_000_000.0
-            return _E()
+
+                def get_setting_with_interface_default(self, key, log_warning=True):
+                    return self._real.get_setting_with_interface_default(
+                        key, log_warning=log_warning)
+            return _E(MockExpert(expert_id))
 
         def get_account_instance(self, account_id):
             raise NotImplementedError

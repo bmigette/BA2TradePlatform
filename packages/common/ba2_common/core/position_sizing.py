@@ -286,6 +286,17 @@ def derive_stop_for_quantity(
     return out
 
 
+#: ``trace["safeguard_candidate"]`` values written by ``synthesize_safeguard_stop`` -- WHICH
+#: candidate the synthesised stop distance actually came from (atr_grid_2027 design §3.3, "the
+#: ATR-bound share of entries"). "risk_pct" and "atr" are the two competing DISTANCE candidates
+#: (the tighter wins); "min_stop_floor" means the min_stop_pct floor widened past whichever of
+#: those won. A winner recorded "atr" or (rarer) "min_stop_floor" with atr>0 means ATR bound;
+#: "risk_pct" with use_atr_stop on means the risk-budget distance was tighter than ATR that day.
+SAFEGUARD_CANDIDATE_ATR = "atr"
+SAFEGUARD_CANDIDATE_RISK_PCT = "risk_pct"
+SAFEGUARD_CANDIDATE_MIN_STOP_FLOOR = "min_stop_floor"
+
+
 def synthesize_safeguard_stop(
     current_price: float,
     is_long: bool,
@@ -294,6 +305,7 @@ def synthesize_safeguard_stop(
     atr: Optional[float] = None,
     atr_multiplier: float = 2.0,
     min_stop_pct: float = 7.0,
+    trace: Optional[dict] = None,
 ) -> Optional[float]:
     """Safeguard stop-loss PRICE to place when an order has NO explicit SL from its conditions.
 
@@ -307,22 +319,35 @@ def synthesize_safeguard_stop(
 
     Mirrors the SmartRiskManager's auto-SL so the classic RM — and the backtest, which shares the
     same sizing path — never leaves a position without a hard stop when the strategy's exit
-    conditions set none (e.g. trailing rules that only fire once in profit)."""
+    conditions set none (e.g. trailing rules that only fire once in profit).
+
+    ``trace`` (optional, result-neutral): when given a dict, this writes
+    ``trace["safeguard_candidate"]`` -- one of the ``SAFEGUARD_CANDIDATE_*`` constants, or is left
+    untouched when no stop could be synthesised -- naming which candidate the stop distance
+    actually came from (atr_grid_2027 design §3.3). Callers that pass nothing get exactly
+    today's return value and no other side effect."""
     if not current_price or current_price <= 0:
         return None
     if not risk_per_trade_pct or risk_per_trade_pct <= 0:
         return None
     risk_dist = current_price * (risk_per_trade_pct / 100.0)
-    candidates = [risk_dist]
+    candidates = [(SAFEGUARD_CANDIDATE_RISK_PCT, risk_dist)]
     if atr and atr > 0 and atr_multiplier and atr_multiplier > 0:
-        candidates.append(atr_multiplier * atr)
-    stop_dist = min(candidates)                                    # the tighter stop
+        candidates.append((SAFEGUARD_CANDIDATE_ATR, atr_multiplier * atr))
+    winner, stop_dist = min(candidates, key=lambda c: c[1])         # the tighter stop
     if min_stop_pct and min_stop_pct > 0:
-        stop_dist = max(stop_dist, current_price * (min_stop_pct / 100.0))   # floor
+        floor_dist = current_price * (min_stop_pct / 100.0)
+        if floor_dist > stop_dist:
+            stop_dist = floor_dist
+            winner = SAFEGUARD_CANDIDATE_MIN_STOP_FLOOR
     if stop_dist <= 0:
         return None
     sl = current_price - stop_dist if is_long else current_price + stop_dist
-    return round(sl, 2) if sl > 0 else None
+    if not (sl > 0):
+        return None
+    if trace is not None:
+        trace["safeguard_candidate"] = winner
+    return round(sl, 2)
 
 
 def reconcile_protective_stop(ruleset_sl: Optional[float], safeguard_sl: Optional[float],
