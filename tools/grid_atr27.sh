@@ -122,7 +122,11 @@ run_bands() {                      # $1=name-suffix  $2...=extra driver args
 case "$PHASE" in
   fr)
     # 14 genes -> population 56, 25 generations (design §7 rule).
-    run_bands -atr27-fr \
+    # FR_SUFFIX: a NEW suffix restarts the lane from scratch. Needed whenever a code change
+    # invalidates results already scored under the old name, because a job with the SAME name
+    # resumes its GA checkpoint (2026-09-29: -atr27-fr was scored with the ProtectiveStopError
+    # trial crash and is restarted as -atr27-fr2 on BT's fix).
+    run_bands "${FR_SUFFIX:--atr27-fr}" \
         --skip-experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,DeterministicScorer,FMPSenateTraderWeight \
         --population 56 --generations 25
     ;;
