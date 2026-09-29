@@ -85,18 +85,13 @@ def test_mode_optimize_emits_a_choice_gene_next_to_the_value_gene():
 def test_three_numeric_leaves_produce_six_genes():
     leaves = [_numeric_leaf(id=f"o_ic-market-{s}") for s in ("slope", "adx", "rv")]
     space = collect_param_space(_strategy(*leaves))
-    # +1: the master gene (atr_grid_2027 addendum, ``market:enabled``) -- these leaves use a
-    # REAL market-condition field (``underlying_adx_14``), so the strategy genuinely carries
-    # market genes and the master gene is collected too, appended last.
-    assert sorted(g for g in space if g != "market:enabled") == sorted(
-        f"cond:o_ic-market-{s}:{g}" for s in ("slope", "adx", "rv") for g in ("value", "mode"))
-    assert list(space)[-1] == "market:enabled"
+    assert sorted(space) == sorted(f"cond:o_ic-market-{s}:{g}"
+                                   for s in ("slope", "adx", "rv") for g in ("value", "mode"))
 
 
 def test_categorical_leaf_emits_only_a_mode_gene_with_off_then_codes_in_code_order(state_field):
     space = collect_param_space(_strategy(_cat_leaf()))
-    # +1: the master gene, appended last -- see test_three_numeric_leaves_produce_six_genes.
-    assert list(space) == ["cond:o_ic-market-state:mode", "market:enabled"]
+    assert list(space) == ["cond:o_ic-market-state:mode"]
     assert space["cond:o_ic-market-state:mode"] == {
         "type": "choice", "choices": ["off", "bull", "bear", "chop"], "min": 0, "max": 3,
         "step": 1}
@@ -312,10 +307,7 @@ def test_encode_decode_roundtrip_keeps_mode_index_and_value(state_field):
     space = collect_param_space(s)
     opt = GeneticOptimizer(param_ranges=space, population_size=4, n_generations=1)
     flat_in = {"cond:o_ic-market-adx:value": 30.0, "cond:o_ic-market-adx:mode": "above",
-               "cond:o_ic-market-state:mode": "bear",
-               # The master gene (atr_grid_2027 addendum): 1 keeps it a no-op, so the mode genes
-               # this test exercises are not overridden off.
-               "market:enabled": 1}
+               "cond:o_ic-market-state:mode": "bear"}
     ind = opt.encode_params(flat_in)
     names = list(space)
     assert ind[names.index("cond:o_ic-market-adx:mode")] == 2
@@ -353,8 +345,7 @@ _REAL_LEAF = {"id": "o_lc-market-structure", "field": "structure_state", "op": "
 
 def test_the_real_structure_state_emits_one_mode_gene_over_off_bull_bear():
     space = collect_param_space(_strategy(dict(_REAL_LEAF)))
-    # +1: the master gene, appended last -- see test_three_numeric_leaves_produce_six_genes.
-    assert list(space) == ["cond:o_lc-market-structure:mode", "market:enabled"]
+    assert list(space) == ["cond:o_lc-market-structure:mode"]
     assert space["cond:o_lc-market-structure:mode"] == {
         "type": "choice", "choices": ["off", "bull", "bear"], "min": 0, "max": 2, "step": 1}
     assert "cond:o_lc-market-structure:value" not in space

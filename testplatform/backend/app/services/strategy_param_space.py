@@ -496,8 +496,57 @@ def _market_condition_field_names() -> set:
     return {f.name for prof in PROFILES.values() for f in prof.fields}
 
 
+#: OPT-IN MARKER (atr_grid_2027 market master-gene addendum, review fix): whether a strategy
+#: TEMPLATE collects the ``market:enabled`` master gene at all. Stamped RULE-LEVEL by exactly
+#: two launcher functions -- ``_append_equity_market_condition_gates`` and
+#: ``_append_equity_market_exit_rules`` -- i.e. ONLY on the goal2027atr equity S1-S7 jobs, and
+#: only under ``--market-condition-mode searched``. Every other market-condition consumer
+#: (O_LC/O_CC/O_PP/... option strategies, the ``tools/strategy_research/exploration`` driver)
+#: builds its market leaves through OTHER functions (``_append_market_condition_gates``,
+#: ``_option_entry_rule``, ``market_conditions.py``'s own attach_exits) that never stamp it, so
+#: their gene space and checkpoint fingerprint are byte-identical to before this feature existed
+#: -- deliberately: those jobs pause/resume by gene-space identity, and silently adding a gene
+#: to an in-flight option/exploration job would restart it at generation 0.
+#:
+#: RULE-level, not leaf-level, on purpose: ``ConditionLeaf.to_canonical_dict``
+#: (``ba2_common.core.rule_models``) is a fixed whitelist that does not re-emit an unrecognised
+#: extra key, so a marker stamped on a LEAF is silently dropped by the very
+#: ``normalize_trade_rules`` call the launcher makes right after appending it.
+#: ``TradeRule.to_canonical_dict`` DOES preserve extras (``extra='allow'`` merges
+#: ``__pydantic_extra__`` back into the canonical dict), so the RULE is the only place this
+#: marker survives a normalize pass -- and, by the same JSON-round-trip mechanism, the Strategy
+#: row, a re-run, and an export (stripped from the DECODED artifact by ``_decode_rule_list``,
+#: since a decoded rule is a rule, not a template -- see its docstring).
+_MARKET_MASTER_GENE_MARKER = "market_master_gene"
+
+
+def _strategy_opts_into_market_master_gene(strategy) -> bool:
+    """Whether ANY rule of this strategy TEMPLATE carries :data:`_MARKET_MASTER_GENE_MARKER`.
+
+    This -- not ``_market_condition_members`` -- is what ``collect_param_space`` gates the
+    master gene on: field-membership alone (what ``_market_condition_members`` checks) is
+    family-agnostic and would also match option strategies and exploration jobs, which carry
+    real market-condition leaves of their own but must NOT collect this gene (see the marker's
+    own docstring)."""
+    for attr in ("entry_rules", "exit_rules"):
+        for rule in (getattr(strategy, attr, None) or []):
+            if isinstance(rule, dict) and (rule.get(_MARKET_MASTER_GENE_MARKER)
+                                           or rule.get("marketMasterGene")):
+                return True
+    return False
+
+
 def _market_condition_members(strategy) -> "tuple[set, set]":
     """``(leaf_ids, rule_ids)`` of every market-condition gate on this Strategy TEMPLATE.
+
+    Used ONLY to RESOLVE ``market:enabled`` at decode time (which leaves/rules to force off) --
+    NOT to decide whether the gene is collected at all; that gating is
+    ``_strategy_opts_into_market_master_gene``, the opt-in marker check. Decode only ever
+    reaches this when ``market:enabled`` is actually present in the genome, which (for a genome
+    a real run produced) only happens for a strategy ``collect_param_space`` added the gene to
+    in the first place -- an equity S1-S7 template, whose market leaves/rules ALL come from the
+    marker-stamping functions. Broad field-based matching is therefore complete for that case
+    without itself needing the marker.
 
     The FIELD decides membership, not the id spelling — mirrors the launcher's
     ``_rename_market_condition_gates`` ("The FIELD decides, not the id spelling"). This is what
@@ -582,13 +631,20 @@ def collect_param_space(
     space.update(_collect_screener(screener_cfg))
     # MASTER GENE (``market:enabled``), APPENDED LAST so every other gene's index is unchanged
     # (atr_grid_2027 design, market master-gene addendum). Added iff this strategy TEMPLATE
-    # actually carries at least one market-condition gate -- i.e. iff a market-condition profile
-    # was applied AND the run's --market-condition-mode was 'searched' (the only combination
-    # under which the launcher appends the leaves/rules at all; 'all-off' and no-profile runs
-    # carry none, so this adds nothing there and the gene list stays byte-identical to today).
-    # bypass experts never collect cond:*/entry:*/exit:* at all (see above), so they get no
-    # master gene either -- there is nothing for it to control.
-    if not bypass and any(_market_condition_members(strategy)):
+    # carries the OPT-IN MARKER (see ``_strategy_opts_into_market_master_gene`` /
+    # ``_MARKET_MASTER_GENE_MARKER``) -- i.e. ONLY the goal2027atr equity S1-S7 jobs
+    # (``ba2test_launcher._append_equity_market_condition_gates`` /
+    # ``_append_equity_market_exit_rules``, only under --market-condition-mode searched).
+    #
+    # Deliberately NOT "does the strategy carry any market-condition gene" (field membership
+    # alone, ``_market_condition_members``): option strategies (O_LC/O_CC/O_PP/...) and the
+    # ``tools/strategy_research/exploration`` driver ALSO gate on real market-condition fields,
+    # through OTHER launcher/driver code paths that never stamp the marker -- their gene space
+    # and checkpoint fingerprint must stay byte-identical to before this feature existed, or a
+    # paused/resumed option or exploration job would silently restart at generation 0 (review
+    # finding, 2026-09-29). bypass experts never collect cond:*/entry:*/exit:* at all (see
+    # above), so they get no master gene either -- there is nothing for it to control.
+    if not bypass and _strategy_opts_into_market_master_gene(strategy):
         space["market:enabled"] = _range_entry(0, 1, 1, is_int=True)
     if not space:
         raise ValueError(
@@ -976,6 +1032,13 @@ def _decode_rule_list(rules, ns: str,
         rule["actions"] = actions
         if rule.get("conditions"):
             rule["conditions"] = _apply_to_tree(rule["conditions"], cond_by_id)
+        # The market-master-gene OPT-IN MARKER (_MARKET_MASTER_GENE_MARKER) is template
+        # provenance -- which launcher function built this rule -- not a rule the live/export
+        # artifact needs to carry, so it is stripped here exactly like a decoded leaf's
+        # mode_optimize/mode_choices (see _apply_mode's docstring: "a decoded leaf is a RULE,
+        # not a template").
+        rule.pop("market_master_gene", None)
+        rule.pop("marketMasterGene", None)
         out.append(rule)
     return out
 

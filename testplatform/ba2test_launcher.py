@@ -5682,6 +5682,19 @@ def _append_equity_market_condition_gates(strategy, kind: str):
     for rule in trees:
         tree = rule["conditions"]
         tree["conditions"] = list(tree["conditions"]) + [copy.deepcopy(g) for g in gates]
+        # OPT-IN MARKER for the master gene (``market:enabled``, atr_grid_2027 addendum) --
+        # RULE-level, not leaf-level: ``ConditionLeaf.to_canonical_dict`` is a fixed whitelist
+        # and does not re-emit unrecognised extras, so a marker stamped on a LEAF is silently
+        # dropped by the very ``normalize_trade_rules`` call below. ``TradeRule.to_canonical_
+        # dict`` DOES preserve unrecognised extras (``extra='allow'`` + ``__pydantic_extra__``
+        # merged back in), so the rule itself is the only place this survives a normalize pass
+        # -- and, by the same mechanism, every later JSON round trip (the Strategy row, a
+        # re-run, an export). This is what scopes ``market:enabled`` to exactly the equity
+        # S1-S7 goal2027atr jobs this function builds for: option strategies get their market
+        # leaves from ``_market_condition_gates``/``_append_market_condition_gates`` too, but
+        # never through THIS function, so they never carry the marker and never collect the
+        # master gene (``strategy_param_space._strategy_opts_into_market_master_gene``).
+        rule["market_master_gene"] = True
     strategy.entry_rules = normalize_trade_rules(rules)
     return strategy
 
@@ -5765,6 +5778,11 @@ def _append_equity_market_exit_rules(strategy, kind: str):
     if not rules:
         raise ValueError(f"{kind}: --market-exit {','.join(_MARKET_EXIT_KINDS_SELECTED)} "
                          f"produced no rule for the selected profile(s) {','.join(profiles)}")
+    # OPT-IN MARKER for the master gene -- see the matching comment in
+    # _append_equity_market_condition_gates. Rule-level (these rules have no mode-gened leaves
+    # to stamp anyway -- market_exit_rules' leaves are fixed/resolved, design section 5.2).
+    for rule in rules:
+        rule["market_master_gene"] = True
     merged, omitted = _insert_equity_market_exit_rules(strategy.exit_rules, rules)
     strategy.exit_rules = normalize_trade_rules(merged)
     assert_market_rule_actions(strategy.exit_rules, f"{kind} exit rules")

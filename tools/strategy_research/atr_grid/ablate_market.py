@@ -6,11 +6,21 @@ ONE GA per cell where market conditions (and ATR) are togglable by the GA, plus 
 of the winners after the fact. This tool is that ablation: for every completed optimization whose
 name matches ``--pattern`` (default ``%atr27%``) and whose config carries a market-condition
 profile, it takes each persisted TOP-N backtest (``TOP<k>-<opt name>``, linked by
-``optimization_id``) whose genome carries the master gene, re-runs the SAME configuration with
-``market:enabled`` forced to 0 -- everything else identical: seed, window, costs, stress,
-fitness, robust setting, ATR policy, all read verbatim off the optimization's own
-``optimization_config`` -- and persists the result as a new ``Backtest`` row
-``ABL-MKTOFF-TOP<k>-<opt name>``.
+``optimization_id``) whose genome carries the master gene, and re-runs the SAME configuration
+TWICE -- ``market:enabled`` as STORED, and forced to 0 -- everything else identical: seed,
+window, costs, stress, fitness, robust setting, ATR policy, all read verbatim off the
+optimization's own ``optimization_config``.
+
+COMPARABILITY (review fix, 2026-09-29): the report compares two FRESH re-runs of the same
+in-process path against each other, not a fresh re-run against the GA's own stored
+``ga_fitness`` -- code/data can drift between when the GA scored a genome and when this tool
+ablates it, and diffing a fresh number against a stale one would misattribute that drift to the
+market gate. The stored ``ga_fitness`` is still reported, as a deviation check on the FRESH
+ORIGINAL re-run: if it moves by more than 1%, the pair is flagged rather than silently trusted.
+
+Persists BOTH re-runs as new ``Backtest`` rows -- ``ABL-ORIG-TOP<k>-<opt name>`` (label
+``ablation-original``) and ``ABL-MKTOFF-TOP<k>-<opt name>`` (label ``ablation-market-off``) --
+so the pair is queryable together later.
 
 Reuses the platform's existing re-run path -- the same reconstruction
 ``app.services.backtest.rerun_handler._build_optimization_rerun_config`` uses for an
@@ -52,9 +62,16 @@ logger = logging.getLogger(__name__)
 #: Default optimization-name filter (SQL LIKE): the goal2027atr grid's job names.
 DEFAULT_PATTERN = "%atr27%"
 
-#: The label every ablation Backtest row carries, so it is queryable later
+#: Labels the two persisted rows of a pair carry, so they are queryable later
 #: (``labels`` is a JSON list, filtered via SQLite json_each -- see app/models/backtest.py).
 ABLATION_LABEL = "ablation-market-off"
+ORIGINAL_LABEL = "ablation-original"
+
+#: Above this absolute percent, a FRESH re-run of the stored (unmodified) genome disagreeing
+#: with the GA's own recorded ``ga_fitness`` is flagged rather than silently trusted -- the same
+#: fidelity-gate idea ``ba2test_launcher._persist_top_backtests``/``rerun_fitness_divergence``
+#: already applies to an ordinary top-N re-run, reused here at a fixed, reportable threshold.
+DEVIATION_THRESHOLD_PCT = 1.0
 
 _TOPN_RE = re.compile(r"^TOP(\d+)-")
 
@@ -94,8 +111,14 @@ def topn_rank(name: str) -> Optional[int]:
 
 
 def ablation_name(topn_name: str) -> str:
-    """``TOP3-sen-S1-atr27`` -> ``ABL-MKTOFF-TOP3-sen-S1-atr27``."""
+    """``TOP3-sen-S1-atr27`` -> ``ABL-MKTOFF-TOP3-sen-S1-atr27`` (the market-off re-run)."""
     return f"ABL-MKTOFF-{topn_name}"
+
+
+def original_name(topn_name: str) -> str:
+    """``TOP3-sen-S1-atr27`` -> ``ABL-ORIG-TOP3-sen-S1-atr27`` (the FRESH stored-genome re-run,
+    the comparability baseline for the market-off row of the same pair)."""
+    return f"ABL-ORIG-{topn_name}"
 
 
 def force_market_off(genome: Dict[str, Any]) -> Dict[str, Any]:
@@ -104,9 +127,9 @@ def force_market_off(genome: Dict[str, Any]) -> Dict[str, Any]:
     Refuses (raises) a genome that does not carry the master gene at all: an optimization can be
     market-condition-gated (pass ``require_market_profile``) yet have run before the master gene
     existed, or under ``--market-condition-mode all-off`` (which never adds it -- see
-    ``strategy_param_space._market_condition_members``); either way there is nothing to force
-    off, and silently no-op-ing would report a market-off row that is byte-identical to the
-    original as though the ablation had run.
+    ``strategy_param_space._strategy_opts_into_market_master_gene``); either way there is
+    nothing to force off, and silently no-op-ing would report a market-off row that is
+    byte-identical to the original as though the ablation had run.
     """
     if "market:enabled" not in genome:
         raise ValueError(
@@ -129,10 +152,26 @@ def row_metrics(bt: Any) -> Dict[str, Optional[float]]:
     }
 
 
-def delta_row(source_name: str, rank: Optional[int], original: Dict[str, Optional[float]],
-              ablated: Dict[str, Optional[float]]) -> Dict[str, Any]:
-    """One report row: original vs market-off vs delta, for the 5 tracked metrics."""
-    out: Dict[str, Any] = {"source": source_name, "rank": rank}
+def fitness_deviation_pct(stored: Optional[float], fresh: Optional[float]) -> Optional[float]:
+    """``(fresh - stored) / |stored| * 100``, or None when either side is missing/zero (a zero
+    stored fitness has no meaningful percent base -- reported as an unmeasurable deviation, not
+    a divide-by-zero)."""
+    if not isinstance(stored, (int, float)) or not isinstance(fresh, (int, float)):
+        return None
+    if stored == 0:
+        return None
+    return (float(fresh) - float(stored)) / abs(float(stored)) * 100.0
+
+
+def pair_row(source_name: str, rank: Optional[int], stored_fitness: Optional[float],
+            original: Dict[str, Optional[float]], ablated: Dict[str, Optional[float]]) -> Dict[str, Any]:
+    """One report row: the FRESH original vs the FRESH market-off re-run (and their delta) for
+    the 5 tracked metrics, plus the stored GA fitness and how far the fresh original strayed
+    from it."""
+    out: Dict[str, Any] = {"source": source_name, "rank": rank, "stored_fitness": stored_fitness}
+    dev = fitness_deviation_pct(stored_fitness, original.get("fitness"))
+    out["fitness_stored_deviation_pct"] = dev
+    out["fitness_stored_deviation_flag"] = (dev is not None and abs(dev) > DEVIATION_THRESHOLD_PCT)
     for key in ("fitness", "car", "max_drawdown", "total_return", "trades"):
         o, a = original.get(key), ablated.get(key)
         out[key] = o
@@ -141,7 +180,9 @@ def delta_row(source_name: str, rank: Optional[int], original: Dict[str, Optiona
     return out
 
 
-REPORT_COLUMNS = ["source", "rank", "fitness", "fitness_off", "fitness_delta",
+REPORT_COLUMNS = ["source", "rank", "stored_fitness", "fitness_stored_deviation_pct",
+                  "fitness_stored_deviation_flag",
+                  "fitness", "fitness_off", "fitness_delta",
                   "car", "car_off", "car_delta", "max_drawdown", "max_drawdown_off",
                   "max_drawdown_delta", "total_return", "total_return_off", "total_return_delta",
                   "trades", "trades_off", "trades_delta"]
@@ -150,6 +191,8 @@ REPORT_COLUMNS = ["source", "rank", "fitness", "fitness_off", "fitness_delta",
 def _fmt(v: Any) -> str:
     if v is None:
         return ""
+    if isinstance(v, bool):
+        return "YES" if v else ""
     if isinstance(v, float):
         return f"{v:.4f}"
     return str(v)
@@ -226,24 +269,25 @@ def find_topn_rows(db: Any, optimization_id: int) -> List[Any]:
     return [r for _k, r in ranked]
 
 
-def find_existing_ablation(db: Any, name: str) -> Optional[Any]:
-    """The already-persisted ablation row of this name, or None -- resume support."""
+def find_existing_row(db: Any, name: str) -> Optional[Any]:
+    """The already-persisted row of this name, or None -- resume support (either half of a pair)."""
     from app.models.backtest import Backtest
 
     return db.query(Backtest).filter(Backtest.name == name).first()
 
 
-def build_ablation_trial_config(db: Any, opt: Any, source_bt: Any) -> Dict[str, Any]:
-    """The ``run_daily_backtest`` config for ``source_bt``'s market-off ablation.
+def build_trial_config(db: Any, opt: Any, source_bt: Any, genome: Dict[str, Any],
+                       name: str) -> Dict[str, Any]:
+    """The ``run_daily_backtest`` config for ``genome`` under ``opt``'s stored run config.
 
     Mirrors ``rerun_handler._build_optimization_rerun_config`` (the SAME reconstruction an
-    optimization-derived row's ordinary re-run uses) with exactly one change: the genome fed to
-    ``decode_params`` has ``market:enabled`` forced to 0 via :func:`force_market_off`. Everything
-    else -- window, costs, stress, fitness metric, robust setting, ATR/rm-toggle policy -- comes
-    from ``opt.optimization_config['backtest']`` verbatim, unchanged.
+    optimization-derived row's ordinary re-run uses): window, costs, stress, fitness metric,
+    robust setting, ATR/rm-toggle policy all come from ``opt.optimization_config['backtest']``
+    verbatim, unchanged. The caller supplies the (already gene-filtered) genome, so this one
+    function serves both halves of a pair -- the stored genome unchanged, or with
+    :func:`force_market_off` applied.
     """
     from app.models.strategy import Strategy
-    from app.services.backtest.rerun_handler import _gene_params
     from app.services.strategy_optimization_handler import _build_daily_trial_config, _build_hoisted_state
     from app.services.strategy_param_space import decode_params
 
@@ -255,30 +299,34 @@ def build_ablation_trial_config(db: Any, opt: Any, source_bt: Any) -> Dict[str, 
     if strat is None:
         raise ValueError(f"optimization {opt.id}: strategy {opt.strategy_id} not found")
 
-    genome = force_market_off(_gene_params(source_bt.strategy_params))
     decoded = decode_params(strat, genome)
     hoisted = _build_hoisted_state(bt_block) if bt_block.get("screener_opt") else None
     trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted,
                                           option_trade_records=True)  # a persisted row
-    trial_cfg["name"] = ablation_name(source_bt.name)
+    trial_cfg["name"] = name
     trial_cfg["persist_trading_db"] = True
     return trial_cfg
 
 
-def _new_ablation_row(db: Any, opt: Any, source_bt: Any, name: str) -> Any:
+def _new_row(db: Any, opt: Any, source_bt: Any, *, name: str, label: str,
+            market_enabled_override: Optional[int]) -> Any:
     """A placeholder ``running`` Backtest row (mirrors ``ba2test_launcher._persist_one``): created
     BEFORE the (slow) backtest runs, so it has a real id to hand the trial config as
-    ``backtest_id`` and progress is visible even if the process dies mid-run."""
+    ``backtest_id`` and progress is visible even if the process dies mid-run.
+
+    ``market_enabled_override`` is written onto the persisted ``strategy_params['market:enabled']``
+    when given (0 for the market-off half); the ORIGINAL half passes None so the stored value --
+    whatever the genome actually carried -- rides through unchanged.
+    """
     from app.models.backtest import Backtest
 
     labels = list(source_bt.labels or [])
-    if ABLATION_LABEL not in labels:
-        labels.append(ABLATION_LABEL)
-    source_label = f"ablation-source:{source_bt.id}"
-    if source_label not in labels:
-        labels.append(source_label)
+    for extra in (label, f"ablation-source:{source_bt.id}"):
+        if extra not in labels:
+            labels.append(extra)
     strategy_params = dict(source_bt.strategy_params or {})
-    strategy_params["market:enabled"] = 0
+    if market_enabled_override is not None:
+        strategy_params["market:enabled"] = market_enabled_override
     strategy_params["ablation_source_backtest_id"] = source_bt.id
     strategy_params["ablation_source_backtest_name"] = source_bt.name
     bt = Backtest(
@@ -295,33 +343,20 @@ def _new_ablation_row(db: Any, opt: Any, source_bt: Any, name: str) -> Any:
     return bt
 
 
-def run_one_ablation(db: Any, opt: Any, source_bt: Any, *,
-                     runner: Callable[[Dict[str, Any]], Dict[str, Any]],
-                     dry_run: bool = False) -> Optional[Dict[str, Any]]:
-    """Ablate ONE TOP-N row. Returns the report row, or None when skipped (dry-run or resumed).
-
-    ``runner`` defaults to ``run_daily_backtest`` in :func:`main`; tests pass a stub so no real
-    backtest executes.
-    """
-    name = ablation_name(source_bt.name)
-    existing = find_existing_ablation(db, name)
-    if existing is not None:
-        print(f"  skip {name} (already ablated, backtest #{existing.id})")
-        return delta_row(source_bt.name, topn_rank(source_bt.name), row_metrics(source_bt),
-                         row_metrics(existing))
-    if dry_run:
-        print(f"  would ablate {source_bt.name!r} (#{source_bt.id}) -> {name!r}")
-        return None
-
-    trial_cfg = build_ablation_trial_config(db, opt, source_bt)
-    bt = _new_ablation_row(db, opt, source_bt, name)
-    trial_cfg["backtest_id"] = bt.id
-    print(f"  running {name} (backtest #{bt.id})...", flush=True)
-    out = runner(trial_cfg)
-
+def _run_and_persist(db: Any, opt: Any, source_bt: Any, *, name: str, label: str,
+                     genome: Dict[str, Any], market_enabled_override: Optional[int],
+                     runner: Callable[[Dict[str, Any]], Dict[str, Any]]) -> Any:
+    """Build, run and persist ONE half of a pair (either the original or the market-off
+    re-run); returns the completed, persisted ``Backtest`` row."""
     from app.services.backtest.daily_backtest_handler import _persist_results
     from app.services.strategy_fitness import compute_fitness
 
+    trial_cfg = build_trial_config(db, opt, source_bt, genome, name)
+    bt = _new_row(db, opt, source_bt, name=name, label=label,
+                 market_enabled_override=market_enabled_override)
+    trial_cfg["backtest_id"] = bt.id
+    print(f"  running {name} (backtest #{bt.id})...", flush=True)
+    out = runner(trial_cfg)
     _persist_results(db, bt, out)
     try:
         bt.ga_fitness = float(compute_fitness(opt.fitness_metric, out))
@@ -331,13 +366,57 @@ def run_one_ablation(db: Any, opt: Any, source_bt: Any, *,
     bt.completed_at = datetime.now()
     bt.is_saved = True
     db.commit()
-    return delta_row(source_bt.name, topn_rank(source_bt.name), row_metrics(source_bt), row_metrics(bt))
+    return bt
+
+
+def run_pair(db: Any, opt: Any, source_bt: Any, *,
+            runner: Callable[[Dict[str, Any]], Dict[str, Any]],
+            dry_run: bool = False) -> Optional[Dict[str, Any]]:
+    """Ablate ONE TOP-N row: a FRESH re-run of the stored genome AND a FRESH market-off re-run,
+    each independently resumable. Returns the report row, or None when skipped (dry-run, or
+    everything already persisted with nothing new to report from this call -- resume still
+    returns the row so a partial re-invocation's output stays complete).
+
+    ``runner`` defaults to ``run_daily_backtest`` in :func:`main`; tests pass a stub so no real
+    backtest executes.
+    """
+    from app.services.backtest.rerun_handler import _gene_params
+
+    orig_name, off_name = original_name(source_bt.name), ablation_name(source_bt.name)
+    orig_bt = find_existing_row(db, orig_name)
+    off_bt = find_existing_row(db, off_name)
+
+    if dry_run:
+        for name, existing in ((orig_name, orig_bt), (off_name, off_bt)):
+            if existing is not None:
+                print(f"  skip {name} (already persisted, backtest #{existing.id})")
+            else:
+                print(f"  would run {source_bt.name!r} (#{source_bt.id}) -> {name!r}")
+        return None
+
+    base_genome = _gene_params(source_bt.strategy_params)
+    if orig_bt is None:
+        orig_bt = _run_and_persist(db, opt, source_bt, name=orig_name, label=ORIGINAL_LABEL,
+                                   genome=base_genome, market_enabled_override=None, runner=runner)
+    else:
+        print(f"  skip {orig_name} (already persisted, backtest #{orig_bt.id})")
+    if off_bt is None:
+        off_genome = force_market_off(base_genome)
+        off_bt = _run_and_persist(db, opt, source_bt, name=off_name, label=ABLATION_LABEL,
+                                  genome=off_genome, market_enabled_override=0, runner=runner)
+    else:
+        print(f"  skip {off_name} (already persisted, backtest #{off_bt.id})")
+
+    return pair_row(source_bt.name, topn_rank(source_bt.name), source_bt.ga_fitness,
+                    row_metrics(orig_bt), row_metrics(off_bt))
 
 
 def ablate_optimization(db: Any, opt: Any, *,
                         runner: Callable[[Dict[str, Any]], Dict[str, Any]],
                         dry_run: bool = False) -> List[Dict[str, Any]]:
     """Ablate every TOP-N row of ONE optimization. Refuses (raises) if it is not gated."""
+    from app.services.backtest.rerun_handler import _gene_params
+
     require_market_profile(opt.name or f"#{opt.id}", opt.optimization_config)
     rows = find_topn_rows(db, opt.id)
     if not rows:
@@ -345,15 +424,12 @@ def ablate_optimization(db: Any, opt: Any, *,
         return []
     out: List[Dict[str, Any]] = []
     for source_bt in rows:
-        genome = None
         try:
-            from app.services.backtest.rerun_handler import _gene_params
-            genome = _gene_params(source_bt.strategy_params)
-            force_market_off(genome)  # validate-only here; raises loudly if absent
+            force_market_off(_gene_params(source_bt.strategy_params))  # validate-only; raises if absent
         except ValueError as e:
             print(f"  refusing {source_bt.name!r}: {e}")
             continue
-        result = run_one_ablation(db, opt, source_bt, runner=runner, dry_run=dry_run)
+        result = run_pair(db, opt, source_bt, runner=runner, dry_run=dry_run)
         if result is not None:
             out.append(result)
     return out
@@ -408,6 +484,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.dry_run:
             return 0
         print_table(rows)
+        flagged = [r for r in rows if r.get("fitness_stored_deviation_flag")]
+        if flagged:
+            print(f"WARNING: {len(flagged)} row(s) had a fresh-original fitness more than "
+                  f"{DEVIATION_THRESHOLD_PCT:.0f}% off the stored ga_fitness: "
+                  f"{[r['source'] for r in flagged]}")
         if args.out:
             write_report(rows, args.out)
             print(f"wrote {args.out}")

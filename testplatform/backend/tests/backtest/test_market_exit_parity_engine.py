@@ -138,17 +138,7 @@ def decode(exit_rules, on=()):
         return decode_params(strategy, {})["exit_rules"]    # no gene at all (nothing searched)
     genome = {}
     for gene in collect_param_space(strategy, {}):
-        if gene == "market:enabled":
-            # The master gene (atr_grid_2027 market master-gene addendum): this suite drives the
-            # PER-RULE toggles directly via ``on``, so it must stay a no-op (1) here -- forcing it
-            # to the generic ":enabled" branch below would read "enabled" (its own field name,
-            # not a rule id) against ``on`` and always resolve to 0, overriding every selective
-            # per-rule toggle this file exists to test.
-            genome[gene] = 1
-        elif gene.endswith(":enabled"):
-            genome[gene] = int(gene.split(":")[1] in on)
-        else:
-            genome[gene] = authored[gene]
+        genome[gene] = int(gene.split(":")[1] in on) if gene.endswith(":enabled") else authored[gene]
     return decode_params(strategy, genome)["exit_rules"]
 
 
@@ -417,12 +407,7 @@ def test_research_driver_market_exits_all_off_parity_and_structure_close(tmp_pat
             assert any(g.endswith(":enabled") for g in genes)
         params = {g: "off" for g in genes if g.endswith(":mode")}
         params.update({g: int(arm == "exit-on" and "-mkt-exit-structure:" in g)
-                       for g in genes if g.endswith(":enabled") and g != "market:enabled"})
-        # The master gene (atr_grid_2027 addendum) stays a NO-OP (1) here: this arm drives which
-        # individual rule is on directly (only "-mkt-exit-structure" above), and 0 would force
-        # every market rule/leaf off regardless of that per-rule selection.
-        if "market:enabled" in genes:
-            params["market:enabled"] = 1
+                       for g in genes if g.endswith(":enabled")})
         params.update({g: 0.0 for g in genes if g.startswith("cond:") and g.endswith(":value")})
         params.update({g: 20.0 if "-mkt-tp:" in g else 0.0
                        for g in genes if g.endswith(":action_value")})
