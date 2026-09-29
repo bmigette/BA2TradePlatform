@@ -5315,6 +5315,79 @@ _SEARCH_SL_LOOSEN: bool = False
 _SL_LOOSEN_SETTING = "allow_ruleset_sl_loosen"
 
 
+def _resolve_exclude_symbols_arg(spec) -> list:
+    """Parse ``--exclude-symbols``: a comma list, or ``@path`` to a file.
+
+    The file form is ONE SYMBOL PER LINE (not comma-separated): blank lines and lines starting
+    with ``#`` (comments) are skipped -- matches
+    ``docs/strategy_research/atr_grid/excluded_symbols.txt``. Returns the symbols
+    UPPERCASED, first-occurrence order, de-duplicated. ``None``/empty -> ``[]`` (no-op).
+    """
+    if not spec:
+        return []
+    spec = spec.strip()
+    if spec.startswith("@"):
+        path = spec[1:]
+        with open(path, encoding="utf-8") as f:
+            raw = [line.strip() for line in f]
+        raw = [line for line in raw if line and not line.startswith("#")]
+    else:
+        raw = [s.strip() for s in spec.split(",") if s.strip()]
+    seen: set = set()
+    out: list = []
+    for s in raw:
+        su = s.upper()
+        if su not in seen:
+            seen.add(su)
+            out.append(su)
+    return out
+
+
+def _apply_exclude_symbols(command: str, backtest_block: dict, exclude_symbols: list) -> None:
+    """Remove ``exclude_symbols`` from ``backtest_block['enabled_instruments']`` and persist the
+    FULL requested list on ``backtest_block['excluded_instruments']``.
+
+    Called AFTER every block that can rewrite ``enabled_instruments`` (--screener,
+    --screener-gate-store) and BEFORE ``_apply_market_conditions`` (whose coverage check reads
+    ``enabled_instruments`` and must see the REDUCED universe, or it would validate coverage for
+    symbols this run can never trade).
+
+    Persisting the full requested list (not just the subset that was present) is what lets a
+    re-run reproduce the exclusion even if the resolved universe differs slightly next time
+    (a different screener band snapshot, a cache refresh, ...). ``_build_daily_trial_config``
+    reads ``excluded_instruments`` back off the run config and carries it into
+    ``screener_runtime['excluded_symbols']`` (the classic per-bar screener gate,
+    ``daily_engine._screened_symbols_for_bar``) AND into a bypass expert's OWN per-trial settings
+    (FactorRanker's ``_screen_universe`` resolves its screener-mode universe straight from the
+    metric store, NOT from ``enabled_instruments`` -- see FactorRanker._resolve_universe_source's
+    docstring -- so removing symbols from ``enabled_instruments`` alone does not reach it).
+
+    No-op (byte-identical) when ``exclude_symbols`` is empty. Refuses an empty resulting universe
+    loudly: a run with nothing left to trade is a launch-time configuration error (CLAUDE.md "no
+    silent failure"), not a 0-trade result to discover after hours of compute.
+    """
+    if not exclude_symbols:
+        return
+    universe = list(backtest_block.get("enabled_instruments") or [])
+    # Uppercased defensively (not just relying on the caller having already normalized it via
+    # _resolve_exclude_symbols_arg): both the membership test AND the reported names are on the
+    # canonical uppercase form, so a mixed-case universe entry (e.g. a screener union that has
+    # not itself been normalized) is matched, and the report always names the symbol the same
+    # way regardless of how it happened to be cased in this run's universe.
+    excluded_set = {str(s).upper() for s in exclude_symbols}
+    removed = sorted({s.upper() for s in universe if s.upper() in excluded_set})
+    kept = [s for s in universe if s.upper() not in excluded_set]
+    if not kept:
+        sys.exit(f"{command}: --exclude-symbols removed the ENTIRE universe "
+                 f"({len(universe)} symbols: {sorted(universe)}) -- refusing an empty universe.")
+    backtest_block["enabled_instruments"] = kept
+    # Persisted verbatim (not just `removed`) — see docstring.
+    backtest_block["excluded_instruments"] = list(exclude_symbols)
+    print(f"{command}: excluded {len(removed)} of {len(exclude_symbols)} symbols "
+          f"({len(kept)} in this universe): "
+          f"{', '.join(removed) if removed else '(none of the given symbols were in this universe)'}")
+
+
 def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: str = "") -> dict:
     """Record the market-condition decisions on a run's backtest block, or do nothing.
 
@@ -6771,6 +6844,14 @@ def _cmd_optimize(args) -> int:
         # enter ruleset with the option action (no equity leg). Equity strategies leave it unset.
         if strat_entry_action:
             backtest_block["entry_action"] = strat_entry_action
+        # --exclude-symbols: AFTER the screener/gate-only blocks (which can still rewrite
+        # enabled_instruments) and BEFORE _apply_market_conditions (whose coverage check reads
+        # enabled_instruments and must be checked against the REDUCED universe, same ordering
+        # reason as that check documents below).
+        _exclude_symbols = _resolve_exclude_symbols_arg(getattr(args, "exclude_symbols", None))
+        _apply_exclude_symbols("optimize", backtest_block, _exclude_symbols)
+        if _exclude_symbols:
+            universe = list(backtest_block["enabled_instruments"])
         # Market-condition gates: record the profile + the pinned manifest on the run config
         # (persisted, so every _build_daily_trial_config consumer of this run -- trials, re-runs,
         # robustness variants, top-N persist, tools/backtest_parity.py -- carries the digest), and
@@ -7046,6 +7127,12 @@ def _cmd_optimize_batch(args) -> int:
             # seeds the enter ruleset with the option action (forwarded by _build_daily_trial_config).
             if strat_entry_action:
                 backtest_block["entry_action"] = strat_entry_action
+            # --exclude-symbols (see _cmd_optimize for the full rationale/ordering note). The
+            # outer `universe` var is SHARED across every job of this batch loop, so it is left
+            # untouched here -- only this job's own backtest_block is reduced.
+            _apply_exclude_symbols(
+                "optimize-batch", backtest_block,
+                _resolve_exclude_symbols_arg(getattr(args, "exclude_symbols", None)))
             # Market-condition gates (no-op with the profile off) — see _cmd_optimize for why this
             # sits after every block that can still rewrite enabled_instruments.
             _apply_market_conditions("optimize-batch", backtest_block, strat, strat_kind)
@@ -8361,6 +8448,21 @@ def main(argv: "list | None" = None) -> int:
                          "Point-in-time: a name above the cap is only excluded while above it. "
                          "0 disables the price filter. Per-strategy overrides live in "
                          "_OPTION_STRATS[].screener_gate_base.")
+    op.add_argument("--exclude-symbols", default=None, metavar="SYM,SYM,...|@file",
+                    help="Remove these symbols from the run's tradable universe -- AFTER "
+                         "--screener rewrites it to the band's screened union and BEFORE the "
+                         "market-condition coverage check, so a symbol with defective source "
+                         "data (e.g. FMP mixed-basis split history) can never enter this run, "
+                         "however it is screened. A comma list, or '@path' to a file (one "
+                         "symbol per line, blank lines and '#' comments skipped -- see "
+                         "docs/strategy_research/atr_grid/excluded_symbols.txt). "
+                         "Persisted on the run (optimization_config.backtest.excluded_instruments) "
+                         "so re-runs/top-N/robustness variants apply the same exclusion, "
+                         "including a screener-driven bypass expert's OWN per-day screen (which "
+                         "does not otherwise consult enabled_instruments). An excluded symbol "
+                         "absent from this run's universe is fine; an exclusion that empties the "
+                         "universe is refused. Absent -> byte-identical to before this flag "
+                         "existed.")
     op.add_argument("--submit", action="store_true",
                     help="Enqueue on the running serve queue (live in the UI Running-jobs strip) "
                          "instead of running in-process. Submit jobs one at a time to avoid "
@@ -8382,6 +8484,12 @@ def main(argv: "list | None" = None) -> int:
                          "UNBOUNDED-risk and refuse, operator decision 2026-08-31). Each is "
                          "dispatched through _build_strategy. Bypass experts (FactorRanker) ignore this.")
     ob.add_argument("--universe", required=True, help="Comma-separated symbols (shared by all jobs).")
+    ob.add_argument("--exclude-symbols", default=None, metavar="SYM,SYM,...|@file",
+                    help="Remove these symbols from --universe for every job (see `ba2-test "
+                         "optimize --help` for the exact semantics/format; same flag, same "
+                         "_apply_exclude_symbols behaviour). Persisted per-job on "
+                         "optimization_config.backtest.excluded_instruments. Absent -> "
+                         "byte-identical to before this flag existed.")
     ob.add_argument("--start", required=True, help="ISO start date.")
     ob.add_argument("--end", required=True, help="ISO end date.")
     ob.add_argument("--gates-off", action="store_true",

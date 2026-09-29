@@ -461,7 +461,22 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
                 from ba2_providers.screener import metric_store as ms  # local import (opt-in)
                 df = ms.load_store(store)
                 day = (as_of or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
-                syms = ms.screen_universe_as_of(df, day, self._metric_store_settings())
+                # PER-RUN exclusion (not a persisted expert setting -- pushed onto this trial's
+                # settings dict by strategy_optimization_handler._build_daily_trial_config from
+                # the launcher's --exclude-symbols / optimization_config.backtest.
+                # excluded_instruments). This expert's screener-mode universe resolves straight
+                # off the metric store, never off enabled_instruments, so the launcher-level
+                # exclusion cannot reach it any other way. Absent/empty -> no-op (unchanged).
+                # NOTE on CLAUDE.md's "no .get() defaults" rule: that rule targets REQUIRED
+                # config, where a silent default would mask a missing value that should have
+                # been supplied. "excluded_symbols" is optional BY DESIGN -- it is never a
+                # declared setting (see get_settings_definitions), it does not exist for a live
+                # ExpertInstance at all, and its absence is the correct, intended state for every
+                # run except a backtest launched with --exclude-symbols. `.get()` here reads "not
+                # applicable to this run", not "value forgotten".
+                excluded_symbols = self.settings.get("excluded_symbols")
+                syms = ms.screen_universe_as_of(df, day, self._metric_store_settings(),
+                                                excluded_symbols)
                 syms = [s.upper() for s in syms]
                 self.logger.info(
                     f"FactorRanker: metric_store returned {len(syms)} candidates "

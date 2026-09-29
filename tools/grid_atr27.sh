@@ -104,7 +104,12 @@ fi
 
 COMMON=(--start "$START" --end "$END" --fitness "$FITNESS" --store "$STORE" --interval "$INTERVAL"
         --early-stop "$EARLY_STOP" --early-stop-min-rel "$EARLY_STOP_MIN_REL"
-        --robust-fitness --parallel "$PARALLEL")
+        --robust-fitness --parallel "$PARALLEL"
+        # IAC: FMP spin-off split-basis drift fails the coverage check for every gated job
+        # (docs/strategy_research/atr_grid/excluded_symbols.txt has the full reasoning). Applied
+        # to EVERY job this script launches -- treatment and the all-off control alike -- so no
+        # -atr27 lane can silently trade a symbol the market-condition snapshot cannot cover.
+        --exclude-symbols "@docs/strategy_research/atr_grid/excluded_symbols.txt")
 [ -n "$WORKERS" ] && COMMON+=(--workers "$WORKERS")
 
 run_bands() {                      # $1=name-suffix  $2...=extra driver args
