@@ -433,6 +433,56 @@ def test_the_query_window_start_is_never_narrowed_only_the_end():
     assert calls_seen[0] == date(2010, 1, 1), "the run's start date must survive untouched"
 
 
+def test_the_narrow_shape_also_clamps_a_future_expiry_to_yesterday(monkeypatch):
+    """FIX (2026-09-30 LEAPS backfill pilot): the per-expiry path used to clamp the window's
+    end only to ``min(end, expiry)``, never to today, so an expiry AFTER today (e.g. a LEAPS
+    run whose ``--end`` runs months past the vendor's "today") sent a window whose END was in
+    the future. ThetaData refuses that PERMANENTLY -- "INVALID_ARGUMENT: Date range contains
+    future date; end must be before or equal to today" -- on every attempt, so every such
+    expiry was unfetchable. This reuses the exact same exchange-today clamp as the wide shape
+    (see test_the_wide_shape_never_requests_the_current_day) so the two paths cannot
+    disagree about what "today" means."""
+    import ba2_providers.options.thetadata as mod
+    monkeypatch.setattr(mod, "_exchange_today", lambda: date(2024, 6, 1))
+
+    calls_seen = []
+
+    class _TrackingClient(_FakeClient):
+        def option_history_greeks_eod(self, **kw):
+            calls_seen.append((kw["start_date"], kw["end_date"]))
+            return _greeks_df([])
+
+    client = _TrackingClient()
+    p = _wired(client)
+    # _EXPIRY is 2025-01-17 -- AFTER the faked "today" of 2024-06-01 -- and the run's own
+    # `end` (2030-01-01) is further out still: exactly the shape a LEAPS run's expiry window
+    # produces without --bars-end.
+    list(p.fetch_eod_bars(_CONTRACTS, start=date(2024, 1, 1), end=date(2030, 1, 1)))
+
+    assert calls_seen, "the fetch must still happen for the days before today"
+    yesterday = date(2024, 5, 31)
+    for _, c_end in calls_seen:
+        assert c_end <= yesterday, (
+            f"queried past yesterday ({yesterday}) for an expiry after today: "
+            f"end_date={c_end}")
+
+
+def test_the_narrow_shape_yields_nothing_when_the_expiry_is_entirely_in_the_future(monkeypatch):
+    """Clamping to yesterday can empty the window entirely (an expiry far in the future, a
+    run start also after the clamp); that must be a quiet no-op -- no vendor call at all --
+    not a request the server will refuse."""
+    import ba2_providers.options.thetadata as mod
+    monkeypatch.setattr(mod, "_exchange_today", lambda: date(2024, 1, 1))
+
+    client = _FakeClient()
+    p = _wired(client)
+    # start (2024-01-01) is after the clamped "yesterday" (2023-12-31), so nothing at all
+    # can be fetched for this expiry.
+    bars = list(p.fetch_eod_bars(_CONTRACTS, start=date(2024, 1, 1), end=date(2030, 1, 1)))
+    assert bars == []
+    assert client.calls == []
+
+
 def test_an_expiry_entirely_before_the_window_is_skipped_without_a_call():
     client = _FakeClient()
     p = _wired(client)

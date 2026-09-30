@@ -29,6 +29,13 @@ EMPTY.
     venv/bin/python tools/warm_options_history.py \
         --symbols-file tools/options_universe_top100.txt
 
+    # A LEAPS-only backfill: expiries 2026-09-12..2027-06-30, but only the bars a LEAPS
+    # entry 270-550 days out actually needs (2025-06-01..2025-12-31), and only standard
+    # monthly expiries (weeklies that far out carry none of those bars anyway).
+    venv/bin/python tools/warm_options_history.py --provider thetadata --monthly-only \
+        --start 2026-09-12 --end 2027-06-30 --bars-start 2025-06-01 --bars-end 2025-12-31 \
+        --symbols-file tools/options_universe_top100.txt
+
 CREDENTIALS are read from the environment (TT_CLIENT_SECRET / TT_REFRESH_TOKEN, optionally
 TT_SANDBOX=1) or, failing that, READ-ONLY from a platform sqlite DB via ``--db``. Nothing is
 ever written to any database and no token is ever printed.
@@ -187,6 +194,28 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "e.g. tools/options_universe_top100.txt.")
     p.add_argument("--start", default=DEFAULT_START, help=f"Window start (default {DEFAULT_START}).")
     p.add_argument("--end", help="Window end (default: today).")
+    p.add_argument("--bars-start",
+                   help="Cap the BAR date range's START independently of --start (default: "
+                        "--start). WHY: --start/--end otherwise do DOUBLE DUTY -- they pick "
+                        "which EXPIRIES are in scope (via discovery) AND the days to fetch "
+                        "bars for -- so e.g. a LEAPS run whose expiry window is "
+                        "2026-09..2027-06 would also fetch 9 months of bars nobody asked "
+                        "for. A partition fetched with a capped bars window is recorded "
+                        "with THAT window in its manifest (see OptionHistoryParquetStore."
+                        "write_partition), so a later run with a wider --bars-end sees it as "
+                        "STALE and refetches it rather than skipping it as already done.")
+    p.add_argument("--bars-end",
+                   help="Cap the BAR date range's END independently of --end (default: "
+                        "--end, today if --end is omitted too). See --bars-start.")
+    p.add_argument("--monthly-only", action="store_true",
+                   help="Only enumerate STANDARD MONTHLY expiries (the 3rd Friday of the "
+                        "month, or the Thursday before when that Friday is an NYSE holiday "
+                        "-- e.g. 2026-06-18 for Juneteenth). LEAPS only ever list on "
+                        "standard monthlies; weeklies dated a year-plus out are listed only "
+                        "weeks before they expire and carry none of the earlier bars a "
+                        "LEAPS backfill needs, so this is what keeps such a run from paying "
+                        "for expiries it can never use. Applies after discovery, so it works "
+                        "under both --discovery synthetic and --discovery rest.")
     p.add_argument("--out", help="Store root (default: CACHE_FOLDER/TastyTradeOptionsProvider "
                                  "or CACHE_FOLDER/ThetaDataOptionsProvider, matching --provider "
                                  "-- always a SEPARATE tree per provider unless overridden).")
@@ -548,14 +577,24 @@ def _price_range(underlying: str, start: date, end: date):
 def build_plan(provider, store: OptionHistoryParquetStore, symbols: Sequence[str],
                start: date, end: date, ns: argparse.Namespace, *, persist: bool,
                log: Optional[Callable[[str], None]] = None,
-               budget: Optional[int] = None) -> Plan:
+               budget: Optional[int] = None,
+               bars_start: Optional[date] = None,
+               bars_end: Optional[date] = None) -> Plan:
     """The pending work for ``symbols``, capped at ``budget`` units.
 
     ``budget`` defaults to ``--limit`` (unchanged behaviour for a caller that plans the whole
     symbol list in one go). ``main`` plans in chunks and passes the REMAINING global budget,
     so ``--limit`` stays a budget for the run rather than becoming one per chunk.
+
+    ``start``/``end`` select which EXPIRIES are discovered (``discover``'s window).
+    ``bars_start``/``bars_end`` (default: ``start``/``end``, unchanged behaviour) are the
+    window a partition's RESUME STATE is checked against -- see ``--bars-start``. The two
+    windows are independent: a LEAPS run's expiry window commonly runs long after its bars
+    window ends.
     """
     log = log or print
+    bars_start = start if bars_start is None else bars_start
+    bars_end = end if bars_end is None else bars_end
     plan = Plan()
     if budget is None:
         budget = ns.limit if ns.limit and ns.limit > 0 else None
@@ -571,13 +610,19 @@ def build_plan(provider, store: OptionHistoryParquetStore, symbols: Sequence[str
             plan.discovery_failed[symbol] = str(e)
             log(f"  [{symbol}] discovery failed, skipping this symbol: {e}")
             continue
+        if ns.monthly_only:
+            # Applied AFTER discovery so it works under both --discovery modes without
+            # touching either one: the synthetic Friday grid and the real vendor listing
+            # both just lose their non-monthly expiries here.
+            from ba2_providers.options.tastytrade import is_monthly_expiry
+            contracts = [c for c in contracts if is_monthly_expiry(c.expiry)]
         by_expiry: Dict[date, List[OptionContractMeta]] = {}
         for c in contracts:
             by_expiry.setdefault(c.expiry, []).append(c)
 
         done = empty = pending = 0
         for expiry in sorted(by_expiry):
-            state = store.partition_state(symbol, expiry, start, end)
+            state = store.partition_state(symbol, expiry, bars_start, bars_end)
             if state is PartitionState.COMPLETE:
                 done += 1
                 continue
@@ -1310,12 +1355,17 @@ def _progress_line(stats: RunStats, plan: Plan, ns: argparse.Namespace,
 
 def print_plan(plan: Plan, store: OptionHistoryParquetStore, symbols: Sequence[str],
                start: date, end: date, ns: argparse.Namespace,
-               log: Callable[[str], None]) -> None:
+               log: Callable[[str], None], *,
+               bars_start: Optional[date] = None, bars_end: Optional[date] = None) -> None:
     log("=" * 78)
     log("DRY RUN — no bars downloaded, no file written (discovery is read-only)")
     log("=" * 78)
     log(f"store root : {store.root}")
     log(f"window     : {start.isoformat()} .. {end.isoformat()}")
+    if bars_start is not None and bars_end is not None and (
+            bars_start != start or bars_end != end):
+        log(f"bars window: {bars_start.isoformat()} .. {bars_end.isoformat()} "
+            f"(capped independently of the expiry window above)")
     log(f"symbols    : {len(symbols)}  ({', '.join(symbols[:12])}"
         f"{' ...' if len(symbols) > 12 else ''})")
     log(f"discovery  : {ns.discovery}")
@@ -1384,6 +1434,14 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
     if end < start:
         raise SystemExit(f"--end {end} is before --start {start}.")
 
+    # bars_start/bars_end (see --bars-start) are the BAR-fetch window, independent of the
+    # EXPIRY window above -- they default to it unchanged, so a caller that never passes
+    # them sees exactly today's behaviour.
+    bars_start = date.fromisoformat(ns.bars_start) if ns.bars_start else start
+    bars_end = date.fromisoformat(ns.bars_end) if ns.bars_end else end
+    if bars_end < bars_start:
+        raise SystemExit(f"--bars-end {bars_end} is before --bars-start {bars_start}.")
+
     if store is None:
         # Each provider writes to its OWN tree by default -- "ThetaDataOptionsProvider" is a
         # SEPARATE folder from "TastyTradeOptionsProvider", never the same one, so running
@@ -1399,16 +1457,20 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
         provider = build_provider(ns)  # pragma: no cover - network
 
     floor = provider.history_floor()
-    if start < floor:
+    earliest_asked = min(start, bars_start)
+    if earliest_asked < floor:
         raise SystemExit(
-            f"--start {start} is before this vendor's history floor {floor}. Implied "
-            f"volatility — the whole point of this cache — is not available earlier, and "
-            f"accepting the window would build a cache with silently unusable leading "
-            f"months. Use --start {floor} or later.")
+            f"--start {start} or --bars-start {bars_start} is before this vendor's history "
+            f"floor {floor}. Implied volatility — the whole point of this cache — is not "
+            f"available earlier, and accepting the window would build a cache with "
+            f"silently unusable leading months. Use {floor} or later for both.")
 
     if not ns.dry_run:
         log(f"store root : {store.root}")
         log(f"window     : {start.isoformat()} .. {end.isoformat()}")
+        if bars_start != start or bars_end != end:
+            log(f"bars window: {bars_start.isoformat()} .. {bars_end.isoformat()} "
+                f"(capped independently of the expiry window above)")
 
     # PLAN AND FETCH IN CHUNKS. Building the whole universe's plan first held one WorkUnit per
     # pending (underlying, expiry) -- each with its complete contract list -- for all 857
@@ -1433,7 +1495,8 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
         if remaining is not None and remaining <= 0:
             break
         chunk_plan = build_plan(provider, store, chunk, start, end, ns,
-                               persist=not ns.dry_run, log=log, budget=remaining)
+                               persist=not ns.dry_run, log=log, budget=remaining,
+                               bars_start=bars_start, bars_end=bars_end)
         aggregate.absorb(chunk_plan)
         if ns.dry_run:
             # Keep exactly ONE unit -- the very first one planned -- so print_plan can still
@@ -1451,18 +1514,19 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
                 f"{len(symbol_units)} wide symbol(s), {tail_plan.units_pending} tail "
                 f"partition(s), {chunk_plan.units_pending} partitions pending")
             if symbol_units:
-                stats.merge(run_symbol_units_concurrent(symbol_units, provider, store, start,
-                                                        end, ns, clock=clock, sleep=sleep,
-                                                        log=log, concurrency=ns.concurrency))
+                stats.merge(run_symbol_units_concurrent(symbol_units, provider, store,
+                                                        bars_start, bars_end, ns, clock=clock,
+                                                        sleep=sleep, log=log,
+                                                        concurrency=ns.concurrency))
             if tail_plan.units:
-                stats.merge(run_units_concurrent(tail_plan, provider, store, start, end, ns,
-                                                 clock=clock, sleep=sleep, log=log,
-                                                 concurrency=ns.concurrency))
+                stats.merge(run_units_concurrent(tail_plan, provider, store, bars_start,
+                                                 bars_end, ns, clock=clock, sleep=sleep,
+                                                 log=log, concurrency=ns.concurrency))
         else:
             log(f"plan chunk {k}/{len(chunks)}: {chunk[0]}..{chunk[-1]} — "
                 f"{chunk_plan.units_pending} units pending")
-            stats.merge(run_units_concurrent(chunk_plan, provider, store, start, end, ns,
-                                            clock=clock, sleep=sleep, log=log,
+            stats.merge(run_units_concurrent(chunk_plan, provider, store, bars_start, bars_end,
+                                            ns, clock=clock, sleep=sleep, log=log,
                                             concurrency=ns.concurrency))
         log(f"cumulative: {_progress_line(stats, aggregate, ns, t0, clock)}")
 
@@ -1472,7 +1536,8 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
             f"skipped: {', '.join(sorted(aggregate.discovery_failed))}")
 
     if ns.dry_run:
-        print_plan(aggregate, store, symbols, start, end, ns, log)
+        print_plan(aggregate, store, symbols, start, end, ns, log,
+                  bars_start=bars_start, bars_end=bars_end)
         return 0
 
     log(f"done: {stats.units_written} partitions written, {stats.units_empty} empty, "

@@ -555,7 +555,16 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
             # date, so narrowing that side risks losing real data) fixes that for every
             # expiry earlier than the run's end, which in a multi-year backfill is most of
             # them.
-            group_end = min(end, expiry)
+            # ALSO clamped to yesterday-at-the-exchange, same as fetch_underlying_eod_bars
+            # (see its docstring's NO CURRENT-DAY DATA note): an expiry AFTER today (e.g. a
+            # LEAPS backfill whose window commonly runs months past `end`) used to leave
+            # `group_end` a future date, and the server refuses that PERMANENTLY --
+            # "INVALID_ARGUMENT: Date range contains future date; end must be before or
+            # equal to today" -- on every attempt, so every such expiry was unfetchable.
+            # Measured live 2026-09-30 (narrow-mode LEAPS pilot). Both paths must agree on
+            # what "today" means, so this reuses the exact same helper rather than a second
+            # date.today() that could drift from it.
+            group_end = min(end, expiry, _exchange_today() - timedelta(days=1))
             if group_end < start:
                 continue  # this expiry is entirely before the window -- nothing to fetch
             # A contract does not exist before it is LISTED, and the run's start date says

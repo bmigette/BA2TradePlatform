@@ -47,6 +47,9 @@ class FakeProvider:
     contracts: Dict[str, List[OptionContractMeta]] = field(default_factory=dict)
     batches: Dict[date, CandleBatch] = field(default_factory=dict)
     fetched: List[date] = field(default_factory=list)
+    #: (start, end) of every fetch_bars_detailed call, in order -- lets a test assert what
+    #: BAR window was actually asked for (see --bars-start/--bars-end).
+    fetched_windows: List[tuple] = field(default_factory=list)
     discovered: List[str] = field(default_factory=list)
     raise_on: Set[date] = field(default_factory=set)
     #: expiry -> the exact exception to raise, for testing transient-vs-permanent handling.
@@ -67,6 +70,7 @@ class FakeProvider:
         contracts = list(contracts)
         exp = contracts[0].expiry
         self.fetched.append(exp)
+        self.fetched_windows.append((start, end))
         if exp in self.raise_exc:
             raise self.raise_exc[exp]
         if exp in self.raise_on:
@@ -278,6 +282,102 @@ def test_widening_the_window_refetches_rather_than_serving_the_narrower_cache(pr
               sleep=lambda s: clock.advance(s), log=lambda _l: None)
     assert sorted(provider.fetched) == EXPIRIES, \
         "a wider window must not be served from a narrower fetch"
+
+
+# --------------------------------------------------------------------------- #
+# --bars-start/--bars-end -- the BAR window, independent of the EXPIRY window
+# --------------------------------------------------------------------------- #
+def test_bars_start_and_bars_end_cap_the_vendor_call_independently_of_the_expiry_window(
+        provider, store):
+    """--start/--end otherwise do double duty: they pick which expiries are discovered AND
+    the days bars are fetched for. --bars-start/--bars-end must reach the vendor call
+    UNCHANGED from --start/--end (2023-01-01..2026-03-01, see START/END)."""
+    rc, _ = _run(provider, store, ["--bars-start", "2023-01-10", "--bars-end", "2023-01-15"])
+    assert rc == 0
+    assert provider.fetched_windows, "bars must still be fetched"
+    for w_start, w_end in provider.fetched_windows:
+        assert (w_start, w_end) == (date(2023, 1, 10), date(2023, 1, 15)), (
+            f"vendor call must use the capped bars window, got {w_start}..{w_end}, not "
+            f"the expiry window {START}..{END}")
+
+
+def test_bars_start_and_bars_end_default_to_start_and_end_unchanged(provider, store):
+    """No --bars-start/--bars-end at all must be byte-identical to today's behaviour."""
+    _run(provider, store)
+    assert provider.fetched_windows == [(START, END)] * len(EXPIRIES)
+
+
+def test_a_bars_end_cap_is_recorded_in_the_manifest_not_the_discovery_window(provider, store):
+    """The manifest's start/end must reflect what was actually FETCHED (the capped bars
+    window), not --start/--end -- that is what lets a later, wider run detect staleness
+    (see the next test) instead of wrongly treating a capped partition as fully done."""
+    _run(provider, store, ["--bars-start", "2023-01-05", "--bars-end", "2023-01-10"])
+    for e in EXPIRIES:
+        m = store.read_manifest("AAPL", e)
+        assert (m["start"], m["end"]) == ("2023-01-05", "2023-01-10"), (
+            f"manifest for {e} must record the CAPPED bars window it actually fetched, "
+            f"got {m['start']}..{m['end']}")
+
+
+def test_a_capped_bars_window_is_refetched_by_a_later_wider_run(provider, store):
+    """A partition written under a capped --bars-end must not look COMPLETE to a later run
+    that asks for a wider bars window -- it must be STALE and refetched, exactly like
+    widening --end already does for the expiry window
+    (test_widening_the_window_refetches_rather_than_serving_the_narrower_cache)."""
+    _run(provider, store, ["--bars-end", "2023-01-10"])
+    for e in EXPIRIES:
+        assert store.partition_state("AAPL", e, date(2023, 1, 10), END) is \
+            PartitionState.STALE, f"{e} must be stale once a wider bars window is asked for"
+
+    provider.fetched.clear()
+    _run(provider, store)  # no cap this run -- the default (full) bars window
+    assert sorted(provider.fetched) == EXPIRIES, \
+        "a wider bars window must not be served from the capped partitions"
+
+
+def test_a_bars_end_before_the_start_is_refused(provider, store):
+    with pytest.raises(SystemExit):
+        warm.main(["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
+                  "--bars-start", "2023-06-01", "--bars-end", "2023-01-01"],
+                  provider=provider, store=store, clock=FakeClock(),
+                  sleep=lambda s: None, log=lambda _l: None)
+
+
+def test_a_bars_start_before_the_providers_history_floor_is_refused(provider, store):
+    """The floor guard must also cover --bars-start: a LEAPS run's bars window commonly
+    starts EARLIER than its expiry window (bars from mid-2025, expiries into 2027), and a
+    floor violation hiding in the bars window must not be silently accepted just because
+    --start alone passes."""
+    with pytest.raises(SystemExit):
+        warm.main(["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
+                  "--bars-start", "2019-01-01", "--bars-end", END.isoformat()],
+                  provider=provider, store=store, clock=FakeClock(),
+                  sleep=lambda s: None, log=lambda _l: None)
+
+
+# --------------------------------------------------------------------------- #
+# --monthly-only -- LEAPS only ever list on standard monthly expiries
+# --------------------------------------------------------------------------- #
+def test_monthly_only_keeps_just_the_standard_monthly_expiry(provider, store):
+    """EXPIRIES = [2023-01-20, 2023-01-27, 2023-02-03]. 2023-01-20 is January 2023's 3rd
+    Friday (a standard monthly); the other two are weeklies and must be dropped."""
+    _run(provider, store, ["--monthly-only", "--dry-run"])
+    plan = warm.last_plan()
+    assert plan.per_symbol["AAPL"]["expiries"] == 1
+    assert plan.per_symbol["AAPL"]["pending"] == 1
+    assert plan.units[0].expiry == date(2023, 1, 20)
+
+
+def test_monthly_only_off_by_default_keeps_every_expiry(provider, store):
+    _run(provider, store, ["--dry-run"])
+    plan = warm.last_plan()
+    assert plan.per_symbol["AAPL"]["expiries"] == len(EXPIRIES)
+
+
+def test_monthly_only_fetches_only_the_monthly_expiry(provider, store):
+    rc, _ = _run(provider, store, ["--monthly-only"])
+    assert rc == 0
+    assert provider.fetched == [date(2023, 1, 20)]
 
 
 # --------------------------------------------------------------------------- #
