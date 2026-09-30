@@ -5,8 +5,12 @@ day of 2020-01-02..2025-12-31 whether an O_LEAP entry is possible -- a CALL with
 at a DTE inside the band -- plus quote / iv coverage and per-strike bar density inside the band.
 
 Usage:
-    LEAPS_BAND=365,550 python tools/probe_leaps_depth.py <symbols.txt> <out.json>
+    LEAPS_BAND=270,550 python tools/probe_leaps_depth.py <symbols.txt> <out.json>
     python tools/probe_leaps_depth.py --report <out.json>
+
+Default band is 270,550 (the entry floor lowered from 365, operator decision 2026-09-30 --
+design §1b's own measurement of the 270-550 band). Pass LEAPS_BAND=365,550 to reproduce the
+pre-2026-09-30 band's numbers.
 
 Results are recorded in docs/superpowers/specs/2026-08-31-leaps-grid-design.md §1b.
 """
@@ -24,7 +28,7 @@ import pyarrow.parquet as pq
 ROOT = os.path.join(os.path.expanduser("~"), "Documents", "ba2", "common", "cache",
                     "ThetaDataOptionsProvider")
 W0, W1 = pd.Timestamp("2020-01-02"), pd.Timestamp("2025-12-31")
-BAND = tuple(int(x) for x in os.environ.get("LEAPS_BAND", "365,550").split(","))
+BAND = tuple(int(x) for x in os.environ.get("LEAPS_BAND", "270,550").split(","))
 COLS = ["option_type", "strike", "expiry", "bar_date", "volume", "bid", "ask", "iv"]
 
 

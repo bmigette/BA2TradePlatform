@@ -83,6 +83,12 @@ On the stage-2 union the 365–550 medians are lower (35% in 2020, about 52% in
 - **Option to consider.** Lowering the entry floor to about 270 DTE
   (§1 originally said "270–540") roughly doubles availability. Whether a
   270-DTE entry is still a "LEAPS" is a design call; it is not changed here.
+  **ADOPTED (operator decision 2026-09-30).** `O_LEAPC`/`O_LEAPP`/`O_PMCC`'s
+  entry DTE floor is lowered from 365 to 270: authored half-width stays 45,
+  step stays 15, and the searched centres move from 410–500 to 315–495 (13
+  levels instead of 7), decoding to windows [270,360]..[450,540] (was
+  [365,455]..[455,545]). See §2's own LANDED AS note and §5's updated
+  preflight threshold.
 
 **BLOCKER for a 2020–2025 window: the cache stops at 2026-09 expiries.**
 - The latest cached expiry is 2026-09-xx for all 796 names. `warm_options_history.py` only
@@ -117,13 +123,28 @@ method, §6.1). Genes: target delta 0.70–0.90 step 0.05; entry DTE 365–550;
 roll/exit DTE floor 90–240 (exit before the decay/gamma zone); `opt_sl_ml`;
 sizing.
 
+> **LANDED AS / changed 2026-09-30 (operator decision, §1b): entry DTE floor
+> lowered 365 → 270.** Searched centres move 410–500 → 315–495 (step 15
+> unchanged, half-width 45 unchanged), decoding to windows [270,360]..
+> [450,540] (was [365,455]..[455,545]). The roll/exit DTE floor (90–240,
+> unchanged) still clears every decoded entry window with margin: the
+> thinnest case is a 270-DTE entry against a 240-DTE exit floor, a 30-day
+> gap (was 125 days pre-change) — checked exhaustively by
+> `_assert_entry_dte_clears_exit_floor` at launcher import, so a future
+> change to either band that closes the gap fails loudly rather than
+> producing a same-day exit.
+
 **`O_LEAPP` — bearish arm.** Same builder, `buy_put`, same genes. The grid's
-only bearish long-dated arm.
+only bearish long-dated arm. Same 2026-09-30 floor change as O_LEAPC.
 
 **`O_PMCC` — poor man's covered call** (diagonal, wheel-pattern lifecycle, §3–4).
 LEAPS leg delta 0.75–0.85, DTE ≥365; short-call overlay delta 0.15–0.30, DTE
 30–45, rolled at expiry or buyback trigger (% of credit decayed — searched);
 shares the LEAPS roll-floor gene.
+
+> **LANDED AS / changed 2026-09-30: same floor change as O_LEAPC** — the
+> LEAPS long leg's entry DTE floor is 270, not 365 (the 30–45-DTE overlay is
+> unaffected).
 
 > **LANDED AS (2026-09-02, plan Task 6): a launchable phase-1 key.** The two-expiry
 > lifecycle is a RULESET, not an engine hook — `open_pmcc` opens both legs as one
@@ -219,10 +240,11 @@ Applies to `O_PMCC` and `O_CAL`:
 
 **Listed-depth ∩ stage-1 universe, measured at preflight** with a
 per-strategy DTE threshold: LEAPS/PMCC keys need January-cycle bars at
-DTE ≥365; O_CBS/O_PBS/O_CAL need DTE ≥180; O_ERN needs only earnings dates +
-DTE ≥7 chains (nearly the whole stage-1 universe). One probe tool, threshold
-parameterised; preflight prints kept/dropped per strategy — no silent
-no-contract trials.
+DTE ≥270 (lowered from ≥365, operator decision 2026-09-30, matching the
+entry-gene floor change above); O_CBS/O_PBS/O_CAL need DTE ≥180; O_ERN needs
+only earnings dates + DTE ≥7 chains (nearly the whole stage-1 universe). One
+probe tool, threshold parameterised; preflight prints kept/dropped per
+strategy — no silent no-contract trials.
 
 ## 6. Build items (dependency order)
 

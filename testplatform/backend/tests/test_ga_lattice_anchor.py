@@ -3,8 +3,11 @@
 ``GeneticOptimizer.decode_individual`` snapped a numeric gene with ``round(v / step) * step`` --
 a lattice counted from ZERO, not from the gene's ``min``. For a gene whose ``min`` is not a
 multiple of its ``step`` that decodes BELOW ``min`` (and above ``max``) and off the intended
-levels: the LEAPS entry-DTE gene (410..500 step 15) decodes 410 to 405, i.e. a window starting at
-360 under a design floor of 365; O_ERN's (14..23 step 3) decodes 23 to 24, i.e. dte_max 31.
+levels: the LEAPS entry-DTE gene's ORIGINAL 410..500 step 15 decoded 410 to 405, i.e. a window
+starting at 360 under the original design floor of 365 (the floor was lowered to 270 on
+2026-09-30, and the new bound, 315..495, happens to land exactly on the zero lattice -- see
+``ba2test_launcher._lattice_anchor_for``); O_ERN's (14..23 step 3) decodes 23 to 24, i.e.
+dte_max 31.
 
 The fix is OPT-IN (``lattice_anchor="min"``; optimization_config ``latticeAnchor``) because the
 measurement for this change found genes that decode differently in the running stage-1 option

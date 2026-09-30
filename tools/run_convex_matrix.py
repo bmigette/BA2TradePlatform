@@ -30,10 +30,11 @@ just discouraged here.
 
 PREFLIGHT IS THE POINT OF THIS DRIVER (design Section 4/5), same discipline as grid 2's:
 `tools/probe_option_chain_depth.py` measures whether each universe symbol's parquet tree
-carries an expiry with bars at DTE >= 270 over the run window -- broader than grid 2's LEAPS
-threshold (365) because O_CONVEX's entry band is 180-540 DTE, not January-cycle-only. A
-threshold that keeps NOTHING fails the whole run rather than launching a job with an empty
-universe.
+carries an expiry with bars at DTE >= 270 over the run window -- the SAME number grid 2's own
+LEAPS/PMCC threshold now uses (both lowered/aligned to 270; grid 2's floor was 365 until
+2026-09-30), reached for a different reason: O_CONVEX's entry band is 180-540 DTE, not
+January-cycle-only, so regular monthlies at DTE >= 270 already qualify it. A threshold that
+keeps NOTHING fails the whole run rather than launching a job with an empty universe.
 
 Jobs are named `convex-<expert>-O_CONVEX[suffix]` and are IDEMPOTENT/RESUMABLE: a job whose
 StrategyOptimization row is already `completed` is skipped, so the driver can be killed and
@@ -76,8 +77,10 @@ _DEFAULT_STRATEGIES = ["O_CONVEX"]
 
 # The CHAIN-DEPTH O_CONVEX needs, in DTE (design Section 4: "keep a stage-1-universe symbol
 # iff the cache carries expiries with bars at DTE >= 270 in-window -- regular monthlies
-# qualify; January-only names too"). Broader than grid 2's LEAPS threshold (365) because
-# O_CONVEX's entry band starts at 180 DTE, not a January-cycle-only 365+. Keyed by strategy,
+# qualify; January-only names too"). Same number as grid 2's LEAPS/PMCC threshold as of
+# 2026-09-30 (grid 2's floor was 365 before that), for a different reason: O_CONVEX's entry
+# band starts at 180 DTE, not a January-cycle-only 365+, so monthlies at 270 already qualify
+# it. Keyed by strategy,
 # mirroring run_options2_matrix.py's ``_MIN_DTE``, so a second convex-grid key added later
 # cannot run unfiltered by omission.
 _MIN_DTE = {

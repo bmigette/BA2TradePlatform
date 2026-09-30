@@ -1206,15 +1206,21 @@ def _apply_options_store(args, backtest_block: dict) -> None:
 # ``option_consistent_annual_return`` disqualifies a config below a hard trades/year floor
 # (``strategy_fitness._CAR_HARD_MIN_TRADES_PER_YEAR`` = 12) and ramps credit up to
 # ``_CAR_MIN_TRADES_PER_YEAR`` = 30. Those two numbers are a SCREENER expert's cadence. A
-# structure that is OPENED at 365-550 DTE and exited at a 90-240 DTE floor lives 125-460
-# CALENDAR DAYS by construction (365-240 at the fastest, 550-90 at the slowest), so over the
-# grid's 1,095-day window ONE underlying supports between 1,095/460 = 2.4 and 1,095/125 = 8.8
-# sequential structures -- 0.8 to 2.9 per underlying per YEAR. Clearing a 12/yr floor
-# therefore needs between 4 and 15 underlyings occupied CONTINUOUSLY, and design §1 measured
-# that only 8 of 14 sampled January expiries carry any 1-year+ bars at all: the eligible slice
-# of the universe is a fraction of it. On the default floor the metric would disqualify the
-# long-dated arms for having the holding period the design chose for them, and the grid would
-# report that as "LEAPS do not work".
+# structure that is OPENED at 270-540 DTE (floor lowered from 365, operator decision
+# 2026-09-30 -- design §1b) and exited at a 90-240 DTE floor lives 30-450 CALENDAR DAYS by
+# construction (270-240 at the fastest, 540-90 at the slowest), so over the grid's 1,095-day
+# window ONE underlying supports between 1,095/450 = 2.4 and 1,095/30 = 36.5 sequential
+# structures -- 0.8 to 12.2 per underlying per YEAR. Clearing a 12/yr floor therefore needs
+# between (rounding up) 1 and 15 underlyings occupied CONTINUOUSLY, and design §1b measured
+# that lowering the floor to 270 roughly doubles day-level availability versus the pre-2026-
+# 09-30 365 floor -- the eligible slice of the universe is still a fraction of it at the SLOW
+# end of this range, which is what the floor below still exists to cover. (The FAST end can
+# now clear the platform default alone; the exemption is unconditional per strategy KEY, not
+# per decoded window, so it still applies to every O_LEAP/O_PMCC genome, slow or fast --
+# a floor of 3/8 stays comfortably below both ends of the new range, so it is still correct,
+# just less tightly binding at the fast end than it was pre-2026-09-30.) On the default floor
+# the metric would disqualify the long-dated arms for having the holding period the design
+# chose for them, and the grid would report that as "LEAPS do not work".
 #
 # THESE TWO NUMBERS ARE AUTHORED FROM THAT ARITHMETIC, NOT MEASURED -- there is no grid-2 run
 # to measure against yet, the same footing as the ARC bands above. 3/yr hard keeps a genuinely
@@ -2668,15 +2674,22 @@ _OPTION_STRATS = {
         "option_strike_param": 0.80, "option_strike_delta": 0.80,
         "option_strike_delta_optimize": True, "option_strike_delta_min": 0.70,
         "option_strike_delta_max": 0.90, "option_strike_delta_step": 0.05,
-        # ENTRY DTE 365-550 (design §2). ``_apply_option_dte`` decodes the gene as the window
-        # CENTRE and keeps a half-width taken from the AUTHORED window, so the authored
-        # 380..470 fixes hw = (470-380)//2 = 45 and the searched centres 410..500 step 15
-        # (7 levels) decode to [365,455] .. [455,545] -- every window inside the design band,
-        # and 90 days wide so a January-cycle LEAPS expiry can actually fall in it (§1: LEAPS
-        # live on the January cycles, so a narrow window is usually empty).
+        # ENTRY DTE 270-540 (design §2/§1b; floor LOWERED from 365 to 270, operator decision
+        # 2026-09-30 -- §1b measured that a 365-550 floor holds an entry-able January-cycle
+        # LEAPS contract only ~half of each year, and a single genome's 90-day window only
+        # 25-50% of days; a 270 floor roughly doubles availability).
+        # ``_apply_option_dte`` decodes the gene as the window CENTRE and keeps a half-width
+        # taken from the AUTHORED window, so the authored 380..470 fixes hw = (470-380)//2 = 45
+        # (unchanged, and still inside the new band) and the searched centres 315..495 step 15
+        # (13 levels) decode to [270,360] .. [450,540] -- every window inside the new design
+        # band, and 90 days wide so a January-cycle LEAPS expiry can actually fall in it (§1:
+        # LEAPS live on the January cycles, so a narrow window is usually empty). 315/495 are
+        # both on the 15-day lattice from 0 (315 = 21*15, 495 = 33*15), so the ``"min"`` lattice
+        # anchor grid 2 already runs under (``_lattice_anchor_for``) decodes them EXACTLY, with
+        # no rounding slack at either end.
         "option_dte_min": 380, "option_dte_max": 470,
-        "option_dte_optimize": True, "option_dte_min_range": 410,
-        "option_dte_max_range": 500, "option_dte_step": 15,
+        "option_dte_optimize": True, "option_dte_min_range": 315,
+        "option_dte_max_range": 495, "option_dte_step": 15,
         "option_sizing": 5.0},
     "O_LEAPP": {  # LEAPS long PUT arm of O_LEAP -- the bearish twin; same genes, kind=put.
         # Enters on the BEARISH signal (see _OPTION_ENTRY_GATE), like O_LP. The delta band is
@@ -2685,9 +2698,11 @@ _OPTION_STRATS = {
         "option_strike_param": 0.80, "option_strike_delta": 0.80,
         "option_strike_delta_optimize": True, "option_strike_delta_min": 0.70,
         "option_strike_delta_max": 0.90, "option_strike_delta_step": 0.05,
+        # Same 270-540 entry band as O_LEAPC (see its comment) -- floor lowered from 365,
+        # operator decision 2026-09-30.
         "option_dte_min": 380, "option_dte_max": 470,
-        "option_dte_optimize": True, "option_dte_min_range": 410,
-        "option_dte_max_range": 500, "option_dte_step": 15,
+        "option_dte_optimize": True, "option_dte_min_range": 315,
+        "option_dte_max_range": 495, "option_dte_step": 15,
         "option_sizing": 5.0},
     "O_PMCC": {  # poor man's covered call -- LEAPS + a rolling short-call overlay (debit)
         # TWO LEGS ON TWO EXPIRIES, and the ONLY key in any grid that is. The LEAPS is the
@@ -2707,13 +2722,14 @@ _OPTION_STRATS = {
         "option_strike_delta_long": 0.80,
         "option_strike_delta_long_optimize": True, "option_strike_delta_long_min": 0.75,
         "option_strike_delta_long_max": 0.85, "option_strike_delta_long_step": 0.05,
-        # LEAPS ENTRY DTE >= 365, decoded exactly as O_LEAPC's: authored 380..470 fixes the
-        # half-width at 45, and centres 410..500 step 15 (7 levels) decode to [365,455] ..
-        # [455,545]. 90 days wide because §1 measured LEAPS living on the JANUARY cycles --
-        # a narrow window is usually empty.
+        # LEAPS ENTRY DTE >= 270 (floor lowered from 365, operator decision 2026-09-30 -- see
+        # O_LEAPC's comment for the §1b measurement), decoded exactly as O_LEAPC's: authored
+        # 380..470 fixes the half-width at 45, and centres 315..495 step 15 (13 levels) decode
+        # to [270,360] .. [450,540]. 90 days wide because §1 measured LEAPS living on the
+        # JANUARY cycles -- a narrow window is usually empty.
         "option_dte_min": 380, "option_dte_max": 470,
-        "option_dte_optimize": True, "option_dte_min_range": 410,
-        "option_dte_max_range": 500, "option_dte_step": 15,
+        "option_dte_optimize": True, "option_dte_min_range": 315,
+        "option_dte_max_range": 495, "option_dte_step": 15,
         # THE OVERLAY'S OWN WINDOW: design §2's "DTE 30-45", FIXED and deliberately not a
         # gene. The design states it as one narrow band rather than a range, and at pop 40 /
         # gen 6 the gene budget belongs to the two deltas and the roll trigger. It is still a
@@ -2801,7 +2817,9 @@ _OPTION_STRATS = {
     # CONVEX-HARVEST GRID (design 2026-08-31, docs/superpowers/specs/
     # 2026-08-31-convex-harvest-grid-design.md §2) -- plan Task 13. A SEPARATE grid from GRID 2
     # above: its own fitness (``option_convex``, ``_CONVEX_FITNESS`` below), its own universe
-    # threshold (DTE >= 270 vs 365/180/7), its own matrix script
+    # threshold (DTE >= 270 vs 270/180/7 -- grid 2's LEAPS/PMCC floor was ALSO lowered to 270
+    # on 2026-09-30, so the two grids now share this number by coincidence, not construction),
+    # its own matrix script
     # (``tools/run_convex_matrix.py``). Sharing this table with grid 2 is fine -- the ROW is
     # just a gene table -- but every DERIVED set below is checked member-by-member so O_CONVEX
     # never inherits a grid-2-only behaviour (the trade floor) or drifts into grid 2's fitness
@@ -2877,9 +2895,13 @@ def _lattice_anchor_for(kind: str, override: "str | None") -> str:
     other key is ``"zero"``, the legacy lattice (``genetic.LATTICE_ANCHORS``):
 
     * GRID 2 NEEDS it. Its DTE genes are the ones whose ``min`` is not a multiple of the step:
-      O_LEAPC/O_LEAPP/O_PMCC 410..500 step 15 decoded 410 to 405 on the zero lattice -- an entry
-      window starting at 360, under design §2's 365 floor -- and O_ERN 14..23 step 3 decoded 23 to
-      24, a dte_max of 31 against the designed 7-30 band. On the min lattice they decode to the
+      O_LEAPC/O_LEAPP/O_PMCC's ORIGINAL 410..500 step 15 decoded 410 to 405 on the zero lattice --
+      an entry window starting at 360, under design §2's original 365 floor -- and O_ERN 14..23
+      step 3 decoded 23 to 24, a dte_max of 31 against the designed 7-30 band. The LEAPS floor
+      was lowered to 270 on 2026-09-30 and the new bound, 315..495 step 15, happens to land
+      exactly on the zero lattice (315 = 21*15, 495 = 33*15) -- so "min" now decodes it
+      bit-identically to "zero" -- but the key still needs "min" for O_ERN's still-misaligned
+      band, so the policy stays per-KIND, not per-gene. On the min lattice they decode to the
       levels their row comments state.
     * EVERYTHING ELSE KEEPS zero, because it was measured to matter (2026-09-25): the stage-1
       discovery grid (``cond:xlk:value`` 3..20 step 2) and the equity S1-S7 grids carry genes that
@@ -4227,6 +4249,52 @@ _OPTION_DTE_EXIT_BANDS = {
     # entry (pinned by test_the_dte_exit_ceiling_never_reaches_the_entry_floor).
     "O_CONVEX": (60, 30, 120, 15),   # 7
 }
+
+
+def _assert_entry_dte_clears_exit_floor(kind: str, member_keys) -> None:
+    """The roll/exit DTE floor (``_OPTION_DTE_EXIT_BANDS``) must never be reachable AT ENTRY.
+
+    Both genes are searched INDEPENDENTLY -- the entry window centre and the exit floor
+    threshold share no code path -- so nothing stops the GA from pairing the LOWEST entry
+    window a genome can decode with the HIGHEST exit-floor threshold. If that pairing ever let
+    ``entry_dte <= exit_floor``, the position would roll/exit the same day (or before) it
+    opened: a silent no-op trade that still consumes a fitness evaluation and looks like a
+    structure that "trades but never holds".
+
+    Checked the same way ``_assert_option_expiry_clears_event_window`` checks O_ERN's
+    event/expiry ordering: derive the WORST CASE from the tables rather than restate a number
+    that could drift from them. The lowest DTE any genome can decode to at entry is
+    ``option_dte_min_range - hw`` (``_apply_option_dte``'s own arithmetic, hw fixed by the
+    authored window); that must exceed the exit floor's own ceiling (the gene's ``max``, the
+    largest threshold the GA can pick), for every member the group key builds an exit ruleset
+    for (O_LEAP has two: O_LEAPC and O_LEAPP, sharing one exit ruleset -- see
+    ``_OPTION_GROUPS_ALL``).
+
+    2026-09-30: the entry floor was lowered 365 -> 270 (operator decision). At the extremes
+    this leaves a 30-day margin (270 entry floor vs 240 exit-floor ceiling) -- positive, so
+    still structurally impossible, but far thinner than the previous 125-day margin (365 vs
+    240). Pinned here so a FUTURE change to either band cannot silently close that margin.
+    """
+    dte_hi = _OPTION_DTE_EXIT_BANDS[kind][2]
+    for member in member_keys:
+        cfg = _OPTION_STRATS[member]
+        base_min, base_max = int(cfg["option_dte_min"]), int(cfg["option_dte_max"])
+        hw = max(int((base_max - base_min) // 2) if base_max > base_min else 0, 7)
+        lowest_entry_dte = max(0, int(cfg["option_dte_min_range"]) - hw)
+        if lowest_entry_dte <= dte_hi:
+            raise RuntimeError(
+                f"{kind}/{member}: the entry option_dte gene can decode to dte_min="
+                f"{lowest_entry_dte} (option_dte_min_range={cfg['option_dte_min_range']} minus "
+                f"the half-width {hw}), which is NOT strictly greater than the exit/roll DTE "
+                f"floor's own ceiling {dte_hi} (_OPTION_DTE_EXIT_BANDS[{kind!r}][2]). Such a "
+                f"genome would exit the same day (or before) it entered -- a silent no-op "
+                f"trade. Raise option_dte_min_range, widen the authored window, or lower the "
+                f"exit floor's ceiling.")
+
+
+_assert_entry_dte_clears_exit_floor("O_LEAP", _LEAP_MEMBER_KEYS)
+_assert_entry_dte_clears_exit_floor("O_PMCC", ["O_PMCC"])
+
 
 # TAKE PROFIT AS A MULTIPLE OF THE PREMIUM PAID (``profit_multiple_of_premium``, plan Task 4).
 # Design §2 gives the backspreads "take-profit multiple 2x-6x | to expiry" -- the "| to
