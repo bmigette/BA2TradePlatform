@@ -538,14 +538,27 @@ def _synthetic_contracts(underlying: str, start: date, end: date,
 
     Needs no listing endpoint. Strikes that never existed simply come back as empty
     snapshots and are recorded as empty — a wasted request, never fabricated data.
+
+    The expiry set is ``expiry_calendar`` (every Friday) UNIONED with
+    ``monthly_expiry_calendar`` (one expiry per month, holiday-shifted to Thursday when the
+    3rd Friday itself is an NYSE holiday, e.g. 2026-06-18 for Juneteenth). ``expiry_calendar``
+    alone never proposes a Thursday, so without the union a holiday-shifted monthly expiry
+    would never even be a discovery CANDIDATE -- ``--monthly-only``'s post-discovery filter
+    (see ``build_plan``) would then have nothing to keep for that month, silently dropping a
+    real, listed monthly expiry. The union costs nothing for an ordinary month (its date is
+    already the 3rd Friday, already in the grid) and this is independent of
+    ``ns.monthly_only`` on purpose: the discovery CACHE (``store.read/write_contracts``) is
+    keyed only on (underlying, start, end), not on the flag, so its content must not depend
+    on it -- narrowing to monthlies-only stays build_plan's job, applied after discovery.
     """
     from ba2_providers.options.tastytrade import (
-        expiry_calendar, occ_symbol, parse_occ, strike_ladder,
+        expiry_calendar, monthly_expiry_calendar, occ_symbol, parse_occ, strike_ladder,
     )
     low, high = _price_range(underlying, start, end)
     strikes = strike_ladder(low, high, band_pct=ns.strike_band_pct)
+    expiries = sorted(set(expiry_calendar(start, end)) | set(monthly_expiry_calendar(start, end)))
     out: List[OptionContractMeta] = []
-    for expiry in expiry_calendar(start, end):
+    for expiry in expiries:
         for strike in strikes:
             for right in ("C", "P"):
                 out.append(parse_occ(occ_symbol(underlying, expiry, right, strike)))

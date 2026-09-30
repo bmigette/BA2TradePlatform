@@ -380,6 +380,44 @@ def test_monthly_only_fetches_only_the_monthly_expiry(provider, store):
     assert provider.fetched == [date(2023, 1, 20)]
 
 
+def test_synthetic_discovery_includes_a_holiday_shifted_monthly_thursday(monkeypatch):
+    """FIX: expiry_calendar alone (every FRIDAY) never proposes 2026-06-18 -- the Thursday
+    Juneteenth 2026 (a Friday) shifts June's monthly expiry to -- so without unioning in
+    monthly_expiry_calendar, --monthly-only's post-discovery filter would have nothing to
+    keep for that month and silently drop a real, listed monthly expiry. Caught by the
+    live LEAPS pilot (2026-09-30): a 2026-09..2027-06 window came back 9 monthly expiries
+    per symbol instead of 10, missing 2027-06-17 (2027's Juneteenth-adjacent shift)."""
+    monkeypatch.setattr(warm, "_price_range", lambda *a, **k: (100.0, 110.0))
+    ns = warm.parse_args(["--symbols", "AAPL", "--start", "2026-06-01", "--end", "2026-06-30"])
+    contracts = warm._synthetic_contracts("AAPL", date(2026, 6, 1), date(2026, 6, 30), ns)
+    # _synthetic_contracts only PROPOSES candidates -- 2026-06-19 (an ordinary Friday, just
+    # one that happens to be a holiday) stays a harmless candidate here exactly like any
+    # other weekly, the same way a strike that never existed does; is_monthly_expiry (see
+    # its own unit tests) is what excludes it once --monthly-only actually filters.
+    assert any(c.expiry == date(2026, 6, 18) for c in contracts), \
+        "the holiday-shifted monthly Thursday must be a discovery candidate too"
+
+
+def test_monthly_only_end_to_end_keeps_the_holiday_shifted_thursday_under_synthetic_discovery(
+        provider, store, monkeypatch):
+    """The full pipeline (synthetic discovery, the shipped default, + --monthly-only's
+    post-discovery filter) must land on 2026-06-18 alone for June 2026, not 2026-06-19 and
+    not both."""
+    monkeypatch.setattr(warm, "_price_range", lambda *a, **k: (100.0, 110.0))
+    clock = FakeClock()
+    lines: List[str] = []
+    warm.main(["--symbols", "AAPL", "--start", "2026-06-01", "--end", "2026-06-30",
+              "--monthly-only", "--dry-run", "--rate-limit", "0"],
+              provider=provider, store=store, clock=clock,
+              sleep=lambda s: clock.advance(s), log=lines.append)
+    plan = warm.last_plan()
+    # per_symbol["expiries"] is the TRUE post-filter count (dry-run truncates `plan.units`
+    # itself to one, so asserting on that alone could not tell "filtered correctly to one"
+    # apart from "filtered to two but truncated for display").
+    assert plan.per_symbol["AAPL"]["expiries"] == 1
+    assert [u.expiry for u in plan.units] == [date(2026, 6, 18)]
+
+
 # --------------------------------------------------------------------------- #
 # dropped socket mid-symbol
 # --------------------------------------------------------------------------- #
