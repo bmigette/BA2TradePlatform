@@ -102,6 +102,14 @@ On the stage-2 union the 365–550 medians are lower (35% in 2020, about 52% in
   keys' entry window at 2025-06-30.
 - Either choice must be recorded with the results.
 
+> **RESOLVED for the stage-1 universe (2026-09-30):** backfill run (`warm_options_history.py
+> --provider thetadata --discovery rest --monthly-only --start 2026-09-12 --end 2027-06-30
+> --bars-start 2025-06-01 --bars-end 2025-12-31`, 95 LEAPS-listing stage-1 names, 13h10m,
+> 332 partitions / 4.07M rows written, 405 empty, 0 failed). Probe on the 97 at 270–550:
+> 2025 median coverage 47% → **100%**, latest possible entry median 2025-06-23 → **2025-12-31**.
+> The other ~558 stage-2 LEAPS names are NOT backfilled yet (projected 80–145 h); do that
+> before any stage-2 LEAPS/convex run on the 753-name universe.
+
 ## 2. Strategy keys and genes (each its own searched space)
 
 ### Long-dated family
