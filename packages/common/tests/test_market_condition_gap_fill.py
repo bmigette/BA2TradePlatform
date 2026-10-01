@@ -200,3 +200,17 @@ def test_assemble_window_filled_rejects_unknown_policy():
     d, o, h, l, c, v = _series(_sessions())
     with pytest.raises(ValueError, match="unknown gap_fill policy"):
         assemble_window_filled(d, o, h, l, c, v, SESSION, gap_fill="next")
+
+
+def test_absent_session_after_an_invalid_first_bar_is_emitted_as_an_invalid_row_not_a_crash():
+    sessions = regular_sessions_ending_at(date(2025, 7, 15), 6)
+    keep = [sessions[0]] + sessions[2:]                # session 2 absent
+    d, o, h, l, c, v = _series(keep)
+    h = h.copy()
+    h[0] = l[0] - 1.0                                  # first bar present but invalid
+    res = fill_gaps_previous(d, o, h, l, c, v)
+    assert len(res.dates) == len(sessions)
+    assert res.unfilled_hole_at_start == sessions[0]
+    assert np.isnan(res.c[1]) and np.isnan(res.v[1])   # the absent session: explicitly invalid
+    assert res.filled_sessions == ()                   # nothing was carried
+    assert not np.isnan(res.c[2])                      # later valid bars are untouched

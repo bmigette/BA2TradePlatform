@@ -106,15 +106,6 @@ def test_an_unknown_gap_fill_policy_is_refused_at_construction(tmp_path):
         FMPCacheMarketConditionReader("ohlcv-v1", str(tmp_path), gap_fill="next")
 
 
-def test_a_pinned_manifest_reader_never_consults_its_own_gap_fill(tmp_path):
-    """The dominant/production path: a pinned manifest's rows are served verbatim regardless of
-    whatever ``gap_fill`` this reader was constructed with -- the manifest's OWN build-time
-    policy is the only one that can ever matter, which is what makes BT/live parity exact here
-    without any live-side rule to keep in sync."""
-    from ba2_common.core.market_condition_reader import MappedMarketConditionReader
-    from ba2_common.core.market_condition_store import MarketConditionStore
-
-    # A reader with no manifest to map still constructs fine with a gap_fill set, and observing
-    # against a MISSING file (no cache at all) must not crash on the fill path either.
+def test_a_reader_without_a_manifest_tolerates_a_missing_cache_file(tmp_path):
     reader = FMPCacheMarketConditionReader("ohlcv-v1", str(tmp_path), gap_fill="previous")
     assert reader.observe("NOPE", SESSION) is None

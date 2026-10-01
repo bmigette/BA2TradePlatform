@@ -439,3 +439,42 @@ def test_a_legacy_calc_version_manifest_still_reads_and_wraps_in_a_window_reader
     wrapped = WindowMarketConditionReader("ohlcv-v1", mapped=mapped)
     assert wrapped.calc_version == "ohlcv-v1/calc-1"
     assert wrapped.observe("AAA", VALID_SESSION) is not None
+
+
+def test_a_pinned_reader_refuses_a_conflicting_explicit_gap_fill(tmp_path):
+    """A pinned manifest serves the rows it was built with; an explicit gap_fill that differs from
+    its gap_fill_policy (absent == no fill) must raise, not be silently ignored."""
+    from ba2_common.core.market_condition_readers import FMPCacheMarketConditionReader
+
+    store, digest, _w = _fabricate(tmp_path / "cache")
+    root = str(store.cache_root)
+    with pytest.raises(ValueError, match="conflicts with the pinned manifest"):
+        FMPCacheMarketConditionReader("ohlcv-v1", root, manifest_digest=digest, gap_fill="previous")
+    FMPCacheMarketConditionReader("ohlcv-v1", root, manifest_digest=digest)          # fine
+    FMPCacheMarketConditionReader("ohlcv-v1", root, manifest_digest=digest, gap_fill=None)
+
+
+def test_replay_serves_a_legacy_calc_1_capture_as_recorded():
+    from ba2_common.core.market_condition_readers import ReplayMarketConditionReader
+
+    spec = PROFILES["ohlcv-v1"]
+    names = [f.name for f in spec.fields]
+    payload = {"schema": "market_condition_window/v1", "symbol": "AAA", "session": "2025-06-30",
+               "profile": "ohlcv-v1", "source_profile": "fmp-daily-split-adjusted-v1",
+               "timing_policy": "prior_session_v1", "calc_version": "ohlcv-v1/calc-1",
+               "row_present": True, "window_digest": None, "window_first_session": None,
+               "window_shape": None, "window_f8_b64": None,
+               "values": {n: None for n in names}, "statuses": {n: "invalid_prices" for n in names},
+               "reasons": {n: "atr<=0 at index 127" for n in names}}
+    reader = ReplayMarketConditionReader.from_payloads(
+        [payload], profile="ohlcv-v1", source_profile="fmp-daily-split-adjusted-v1",
+        timing_policy="prior_session_v1")
+    row = reader.observe("AAA", date(2025, 6, 30))
+    assert {o.status for o in row.by_field().values()} == {"invalid_prices"}   # served as recorded
+    assert set(row.calc_versions.values()) == {"ohlcv-v1/calc-1"}
+    bad = dict(payload, calc_version="ohlcv-v1/calc-0", session="2025-06-27")
+    reader2 = ReplayMarketConditionReader.from_payloads(
+        [bad], profile="ohlcv-v1", source_profile="fmp-daily-split-adjusted-v1",
+        timing_policy="prior_session_v1")
+    with pytest.raises(MarketConditionVersionMismatch):
+        reader2.observe("AAA", date(2025, 6, 27))

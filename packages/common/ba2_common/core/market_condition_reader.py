@@ -109,6 +109,7 @@ from ba2_common.core.market_condition_store import (
 from ba2_common.core.market_conditions import (
     PROFILES,
     STATUS_INSUFFICIENT_HISTORY,
+    STATUS_MISSING_SESSION,
     STATUS_VALID,
     STATUSES,
     WINDOW,
@@ -1170,7 +1171,12 @@ def _status_problems(symbol: str, record: Mapping[str, Any],
         # record's own ``last_session``, which the record carries regardless of this one field's
         # status). A run that stops SHORT of ``cov_last`` has valid data resuming after it within
         # this very snapshot, so it is an interior hole and is never exempted here, however long.
-        trailing = not leading and contiguous and cov_last is not None and exc_last == cov_last
+        # ONLY ``missing_session``: a trailing run of ``invalid_prices`` (or any other status) is a
+        # corrupt-data problem on a symbol that still trades, never a delisting. The run starts
+        # inside the window (``exc_first <= want_last``), so the symbol's last valid bar precedes
+        # the window end.
+        trailing = (status == STATUS_MISSING_SESSION and not leading and contiguous
+                    and cov_last is not None and exc_last == cov_last and exc_first <= want_last)
         if trailing:
             continue                     # the delisting date explains it: legitimate post-delisting
         whole = leading and contiguous

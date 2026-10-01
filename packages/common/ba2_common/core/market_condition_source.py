@@ -293,7 +293,16 @@ class GapFillResult:
     whose raw bar failed :func:`ba2_common.core.market_conditions._invalid_bar_checks`. Their
     union is ``filled_sessions``. A hole at the very start of the series (the first regular
     session itself is absent or invalid) has no earlier valid bar to carry and is NEVER filled --
-    it is left exactly as the input carried it (absent, or present-but-invalid)."""
+    it is left as the input carried it: a present-but-invalid bar verbatim, an absent session as
+    an explicitly invalid (NaN) row so the output stays one bar per session.
+
+    CAVEATS (documented, accepted): a filled bar repeats the previous bar's open/high/low/close
+    with volume 0, so true range around a fill is slightly understated and ATR/ADX are biased a
+    little toward "quiet" there. A long fill produces flat bars; under calc-2 those are defined
+    neutral values (ADX 0, slope 0), never invalid. Likewise calc-2's realized-vol ratio is 1.0
+    whenever the last 20 closes are flat (a halted stock), and ``ta-structure-v1`` channel
+    width/position are 0.0/0.5 when the channel's residual sigma is 0 -- values that used to be
+    ``invalid_prices`` before calc-2."""
 
     dates: np.ndarray                  # datetime64[D], one per regular session, ascending
     o: np.ndarray
@@ -394,9 +403,13 @@ def fill_gaps_previous(dates: Any, o: Any, h: Any, l: Any, c: Any, v: Any) -> Ga
                 out_o.append(float(cols[0][i])); out_h.append(float(cols[1][i]))
                 out_l.append(float(cols[2][i])); out_c.append(float(cols[3][i])); out_v.append(float(cols[4][i]))
                 continue
-            raise ValueError(
-                f"the first regular session {sd} of {first_day}..{last_day} has no bar and no "
-                f"earlier valid bar to carry forward (a hole at series start is never filled)")
+            # An ABSENT session while no valid bar exists yet (the series starts on a present-but-
+            # invalid bar and the next session is missing): keep the series dense but emit the
+            # session as an explicitly INVALID row (NaN OHLCV), never a fabricated price. The
+            # calculators then report invalid_prices for any window containing it.
+            nan = float("nan")
+            out_o.append(nan); out_h.append(nan); out_l.append(nan); out_c.append(nan); out_v.append(nan)
+            continue
         o_, h_, l_, c_ = prev_ohlc
         out_o.append(o_); out_h.append(h_); out_l.append(l_); out_c.append(c_); out_v.append(0.0)
         if i is None:

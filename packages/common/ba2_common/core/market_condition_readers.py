@@ -158,6 +158,11 @@ class WindowMarketConditionReader:
         #: When set, ``_bars``/the calculator are never reached -- see the module docstring.
         if mapped is not None and mapped.profile != profile:
             raise ValueError(f"mapped reader serves profile {mapped.profile!r}, this reader wants {profile!r}")
+        if mapped is not None and gap_fill is not None                 and gap_fill != mapped.manifest.get("gap_fill_policy"):
+            raise ValueError(
+                f"gap_fill={gap_fill!r} conflicts with the pinned manifest {mapped.manifest_digest} "
+                f"(gap_fill_policy={mapped.manifest.get('gap_fill_policy')!r}): a pinned snapshot "
+                f"serves the rows it was built with, so a different explicit policy is refused")
         self._mapped = mapped
         #: rows served from a pinned manifest (mirror of ``computed`` for the mapped path).
         self.mapped_rows = 0
@@ -323,10 +328,10 @@ class FMPCacheMarketConditionReader(WindowMarketConditionReader):
         nothing is calculated; without it the reader computes on a miss and says so once.
 
         ``gap_fill`` only affects the UNPINNED (research-mode) path: a pinned manifest already
-        carries whatever gap-fill policy built it, so this reader's own ``gap_fill`` is simply
-        never consulted when ``manifest_digest`` is set -- the standard production/BT path is
-        therefore exact by construction (same manifest, same rows), never a separate live rule
-        that could drift from the build."""
+        carries whatever gap-fill policy built it. An explicit ``gap_fill`` that DIFFERS from the
+        pinned manifest's ``gap_fill_policy`` is refused (ValueError) rather than silently
+        ignored -- the standard production/BT path is exact by construction (same manifest, same
+        rows), never a separate live rule that could drift from the build."""
         mapped = None
         if manifest_digest:
             from ba2_common.core.market_condition_reader import MappedMarketConditionReader
@@ -554,19 +559,22 @@ class ReplayMarketConditionReader:
     def _build(self, symbol: str, session: date) -> Optional[FeatureRow]:
         from ba2_common.core.replay.context import ReplayMiss
 
+        payload = self._recorded.get((self.profile, symbol, session))
+        # A capture recorded under a LEGACY calculator version (still accepted) is served as
+        # recorded: replay reproduces what the live run saw, not what today's calculator would say.
+        recorded_cv = payload["calc_version"] if payload is not None else self.calc_version
         identity = capture_identity(symbol, session, profile=self.profile,
                                     source_profile=self._source_profile,
-                                    timing_policy=self._timing_policy, calc_version=self.calc_version)
-        payload = self._recorded.get((self.profile, symbol, session))
+                                    timing_policy=self._timing_policy, calc_version=recorded_cv)
         if payload is None:
             raise ReplayMiss("market_condition_window", request_identity=identity,
                              detail="no recorded market-condition window for this profile/symbol/session")
-        for name in ("source_profile", "timing_policy", "calc_version"):
+        if not calc_version_accepted(self.profile, recorded_cv):
+            raise MarketConditionVersionMismatch(
+                f"recorded calc version {recorded_cv!r} is neither profile {self.profile!r}'s "
+                f"registered calc version {self.calc_version!r} nor an accepted legacy one")
+        for name in ("source_profile", "timing_policy"):
             if payload[name] != identity[name]:
-                if name == "calc_version":
-                    raise MarketConditionVersionMismatch(
-                        f"recorded calc version {payload[name]!r} != profile {self.profile!r} "
-                        f"calc version {self.calc_version!r}")
                 raise ReplayMiss("market_condition_window", request_identity=identity,
                                  detail=f"recorded {name} {payload[name]!r} differs")
         if not payload["row_present"]:
@@ -580,8 +588,8 @@ class ReplayMarketConditionReader:
         values = {f: Observation(payload["values"][f] if payload["statuses"][f] == STATUS_VALID else None,
                                  payload["statuses"][f], payload["reasons"][f])
                   for f in payload["statuses"]}
-        row = FeatureRow(values=values, calc_versions={f: payload["calc_version"] for f in values})
-        _check_row(self.profile, self.calc_version, row)
+        row = FeatureRow(values=values, calc_versions={f: recorded_cv for f in values})
+        _check_row(self.profile, recorded_cv, row)
         return row
 
     def recorded_window(self, symbol: str, session: date) -> Optional[Tuple[np.ndarray, ...]]:

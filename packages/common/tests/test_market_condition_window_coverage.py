@@ -372,3 +372,13 @@ def test_a_reader_that_cannot_report_its_manifest_is_refused_not_assumed_good(tm
 
     problems = window_coverage_problems(_NoManifest(), ["AAA"], SNAP_FIRST, SNAP_LAST)
     assert len(problems) == 1 and "cannot report the sessions it covers" in problems[0]
+
+
+def test_a_trailing_invalid_prices_run_stays_a_problem(tmp_path):
+    """A live symbol with corrupt bars shortly before the window end is NOT a delisting: only
+    missing_session may be exempted as trailing."""
+    sessions = _warm_rows(SNAP_FIRST, SNAP_LAST)
+    statuses = {"BBB": {s: "invalid_prices" for s in sessions[-5:]}}
+    store, digest = _publish(tmp_path / "cache", statuses=statuses)
+    problems = window_coverage_problems(_reader(store, digest), ["BBB"], SNAP_FIRST, SNAP_LAST)
+    assert len(problems) == 1 and "invalid_prices" in problems[0]
