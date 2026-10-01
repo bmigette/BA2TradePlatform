@@ -322,7 +322,7 @@ def test_the_mapping_key_and_meta_carry_the_portable_identity(tmp_path):
     assert sorted(meta["symbols"]) == ["AAA", "BBB", "CCC"]
     assert set(arrays) == {"session", "values", "status", "reason_codes", "meta_json"}
     assert arrays["session"].dtype == np.int32 and arrays["status"].dtype == np.int8
-    assert arrays["reason_codes"].dtype == np.int16 and arrays["values"].dtype == np.float64
+    assert arrays["reason_codes"].dtype == np.int32 and arrays["values"].dtype == np.float64
 
 
 # --------------------------------------------------------------------- readiness markers
@@ -478,3 +478,13 @@ def test_replay_serves_a_legacy_calc_1_capture_as_recorded():
         timing_policy="prior_session_v1")
     with pytest.raises(MarketConditionVersionMismatch):
         reader2.observe("AAA", date(2025, 6, 27))
+
+
+def test_reason_codes_are_int32_so_a_wide_union_with_date_bearing_reasons_maps():
+    """2026-10-01: a 2,040-symbol snapshot carries >32,768 distinct reason strings (each embeds a date);
+    int16 codes refused it at the master before the first trial."""
+    assert np.iinfo(np.int32).max > 32767
+    import inspect
+    from ba2_common.core import market_condition_reader as mcr
+    src = inspect.getsource(mcr.MappedMarketConditionReader)
+    assert "dtype=np.int32" in src and "dtype=np.int16" not in src

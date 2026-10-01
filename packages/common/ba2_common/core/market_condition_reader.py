@@ -34,7 +34,10 @@ whatever the symbol count -- the symbol slices live INSIDE them:
   * ``values``       float64(n, F)  the profile's fields in registry order (a categorical field
                                     holds its integer code; NaN where the field is not valid)
   * ``status``       int8   (n, F)  index into ``market_conditions.STATUSES``
-  * ``reason_codes`` int16  (n, F)  index into the manifest's small reason table
+  * ``reason_codes`` int32  (n, F)  index into the manifest's reason table (int16 until 2026-10-01;
+    a 2,040-symbol snapshot carries >32,768 distinct date-bearing reason strings, so the codes are
+    int32 now. The layout key is unchanged: older int16 derived arrays are still read correctly,
+    the code is only ever an index)
   * ``meta_json``    uint8  (m,)    UTF-8 JSON: layout/manifest/profile/calc version, the field
                                     list, the per-symbol ``[lo, hi)`` slice table and the reason
                                     table.
@@ -327,8 +330,10 @@ class MappedMarketConditionReader:
         values = np.empty((total, n_f), dtype=np.float64)
         status = np.empty((total, n_f), dtype=np.int8)
         # zeros, not empty: a symbol with no rows leaves its slice untouched, and uninitialised
-        # int16 would index the reason table out of range if anything ever read it.
-        reason_codes = np.zeros((total, n_f), dtype=np.int16)
+        # int32: reasons carry dates ("... sessions ending 2020-01-03", "series starts ..."), so a
+        # wide union has tens of thousands of distinct strings. Zeros, not empty: a symbol with no
+        # rows leaves its slice untouched, and uninitialised codes would index the table out of range.
+        reason_codes = np.zeros((total, n_f), dtype=np.int32)
         reason_table: Dict[str, int] = {}
         slices: Dict[str, List[int]] = {}
         pos = 0
@@ -349,10 +354,10 @@ class MappedMarketConditionReader:
                     code = reason_table.get(reason)
                     if code is None:
                         code = reason_table[reason] = len(reason_table)
-                        if code > 32767:
+                        if code > np.iinfo(np.int32).max:
                             raise ManifestError(
-                                f"manifest {self.manifest_digest} carries more than 32768 distinct "
-                                f"reason strings; the packed reason code is int16")
+                                f"manifest {self.manifest_digest} carries more distinct reason "
+                                f"strings than the packed reason code (int32) can index")
                     reason_codes[pos + i, j] = code
             pos += n
         meta = {
