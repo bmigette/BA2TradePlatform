@@ -38,6 +38,7 @@ import numpy as np
 
 from ba2_common.core.market_calendar import (
     register_calendar_cache_clear_hook,
+    regular_session_dates,
     regular_sessions_ending_at_tuple,
 )
 from ba2_common.core.market_conditions import (
@@ -45,6 +46,7 @@ from ba2_common.core.market_conditions import (
     STATUS_MISSING_SESSION,
     STATUS_VALID,
     WINDOW,
+    _invalid_bar_checks,
 )
 
 __all__ = [
@@ -69,6 +71,12 @@ __all__ = [
     "BASIS_UNADJUSTED",
     "BASIS_MIXED",
     "BASIS_UNAVAILABLE",
+    "GAP_FILL_PREVIOUS",
+    "GAP_FILL_POLICIES",
+    "GapFillResult",
+    "validate_gap_fill",
+    "fill_gaps_previous",
+    "assemble_window_filled",
 ]
 
 #: The v1 source profile: FMP ``historical-price-full`` daily bars as cached by
@@ -257,6 +265,168 @@ def window_from_bytes(data: bytes) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
 def _sha256(data: bytes) -> str:
     import hashlib
     return hashlib.sha256(data).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Gap fill (operator decision 2026-09-30: REPAIR by re-fetch where possible, else carry the
+# PREVIOUS valid bar forward -- never the next bar, which would be look-ahead).
+# ---------------------------------------------------------------------------
+#: The only gap-fill policy today. A manifest/reader that never set ``gap_fill`` behaves exactly
+#: as before this feature existed (default = no fill); this is the one non-default value.
+GAP_FILL_PREVIOUS = "previous"
+GAP_FILL_POLICIES: Tuple[str, ...] = (GAP_FILL_PREVIOUS,)
+
+
+def validate_gap_fill(policy: Optional[str]) -> None:
+    """Raise on an unknown policy. ``None`` (no fill) always passes."""
+    if policy is not None and policy not in GAP_FILL_POLICIES:
+        raise ValueError(f"unknown gap_fill policy {policy!r}; known: {GAP_FILL_POLICIES!r}")
+
+
+@dataclass(frozen=True)
+class GapFillResult:
+    """A symbol's raw series, densified to one bar per regular session over
+    ``[dates[0], dates[-1]]`` of the ORIGINAL input (never extended: a listing/delisting boundary
+    is not a hole). ``o``/``h``/``l``/``c``/``v`` are float64 arrays parallel to ``dates``.
+
+    ``missing_filled``/``invalid_filled`` are disjoint: a session with no raw bar at all vs. one
+    whose raw bar failed :func:`ba2_common.core.market_conditions._invalid_bar_checks`. Their
+    union is ``filled_sessions``. A hole at the very start of the series (the first regular
+    session itself is absent or invalid) has no earlier valid bar to carry and is NEVER filled --
+    it is left exactly as the input carried it (absent, or present-but-invalid)."""
+
+    dates: np.ndarray                  # datetime64[D], one per regular session, ascending
+    o: np.ndarray
+    h: np.ndarray
+    l: np.ndarray
+    c: np.ndarray
+    v: np.ndarray
+    filled_sessions: Tuple[date, ...]
+    missing_filled: Tuple[date, ...]
+    invalid_filled: Tuple[date, ...]
+    unfilled_hole_at_start: Optional[date]
+
+    @property
+    def fill_count(self) -> int:
+        return len(self.filled_sessions)
+
+
+def fill_gaps_previous(dates: Any, o: Any, h: Any, l: Any, c: Any, v: Any) -> GapFillResult:
+    """Densify one symbol's raw bar series to one bar per regular NYSE session over
+    ``[first raw bar, last raw bar]``, carrying the previous VALID bar's OHLC forward into every
+    session in that span that is either missing a bar or whose bar fails the calculators'
+    ``_invalid_bar_checks`` (the one definition of a bad bar; see ``market_conditions.py``).
+
+    Volume of a filled bar is always ``0.0`` (never carried): a filled bar represents no observed
+    trading, and only the session that actually traded owns its volume. No registered profile
+    divides by volume, and 0.0 passes every volume check in ``_invalid_bar_checks`` (finite,
+    non-negative), so a filled bar can never itself register as a NEW ``invalid_prices`` row
+    through its volume.
+
+    Never fabricates a bar before ``dates[0]`` or after ``dates[-1]`` (those are a listing /
+    delisting boundary, not a hole): the output's calendar span is exactly the input's own first
+    and last bar dates. A bar dated off the regular-session calendar is refused (``ValueError``),
+    matching ``assemble_window``'s treatment of a stray date as a hard problem rather than a
+    silently dropped row. Conflicting duplicate bars on one date (different values) are also
+    refused; identical duplicates collapse, as in ``assemble_window``.
+    """
+    d = _to_day64(dates)
+    cols = [np.asarray(x, dtype=np.float64) for x in (o, h, l, c, v)]
+    if any(len(col) != len(d) for col in cols):
+        raise ValueError(f"dates and OHLCV must have equal lengths, got {[len(d)] + [len(x) for x in cols]}")
+    if not len(d):
+        raise ValueError("fill_gaps_previous needs at least one bar")
+
+    order = np.argsort(d, kind="stable")
+    d = d[order]
+    cols = [col[order] for col in cols]
+
+    uniq, first_idx, counts = np.unique(d, return_index=True, return_counts=True)
+    if (counts > 1).any():
+        for day64 in uniq[counts > 1]:
+            rows = np.stack([col[d == day64] for col in cols], axis=1)
+            if not all(np.array_equal(rows[0], r, equal_nan=True) for r in rows[1:]):
+                raise ValueError(f"conflicting duplicate bars on {_day(day64)}")
+        cols = [col[first_idx] for col in cols]
+        d = uniq
+
+    first_day, last_day = _day(d[0]), _day(d[-1])
+    sessions = regular_session_dates(first_day, last_day)
+    sess_arr = np.array(sessions, dtype=_DAY)
+    extra = np.setdiff1d(d, sess_arr, assume_unique=True)
+    if len(extra):
+        raise ValueError(f"bar dated {_day(extra[0])} is not a regular session")
+
+    checks = _invalid_bar_checks(*cols)
+    any_bad = np.zeros(len(d), dtype=bool)
+    for _label, mask in checks:
+        any_bad |= mask
+    idx_of_date = {dd: i for i, dd in enumerate(d.tolist())}
+
+    out_o: List[float] = []
+    out_h: List[float] = []
+    out_l: List[float] = []
+    out_c: List[float] = []
+    out_v: List[float] = []
+    missing_filled: List[date] = []
+    invalid_filled: List[date] = []
+    unfilled_hole_at_start: Optional[date] = None
+    prev_ohlc: Optional[Tuple[float, float, float, float]] = None
+
+    for sd64 in sess_arr:
+        sd = _day(sd64)
+        i = idx_of_date.get(sd)
+        present_and_valid = i is not None and not bool(any_bad[i])
+        if present_and_valid:
+            row = (float(cols[0][i]), float(cols[1][i]), float(cols[2][i]), float(cols[3][i]))
+            out_o.append(row[0]); out_h.append(row[1]); out_l.append(row[2]); out_c.append(row[3])
+            out_v.append(float(cols[4][i]))
+            prev_ohlc = row
+            continue
+        if prev_ohlc is None:
+            # No earlier valid bar within this symbol's own history: cannot carry anything
+            # forward. Keep the bar exactly as given (absent sessions stay absent -- they never
+            # entered ``d``/``idx_of_date`` in the first place, so there is nothing to append for
+            # them; a present-but-invalid first bar is kept verbatim).
+            if unfilled_hole_at_start is None:
+                unfilled_hole_at_start = sd
+            if i is not None:
+                out_o.append(float(cols[0][i])); out_h.append(float(cols[1][i]))
+                out_l.append(float(cols[2][i])); out_c.append(float(cols[3][i])); out_v.append(float(cols[4][i]))
+                continue
+            raise ValueError(
+                f"the first regular session {sd} of {first_day}..{last_day} has no bar and no "
+                f"earlier valid bar to carry forward (a hole at series start is never filled)")
+        o_, h_, l_, c_ = prev_ohlc
+        out_o.append(o_); out_h.append(h_); out_l.append(l_); out_c.append(c_); out_v.append(0.0)
+        if i is None:
+            missing_filled.append(sd)
+        else:
+            invalid_filled.append(sd)
+
+    filled_sessions = tuple(sorted(missing_filled + invalid_filled))
+    return GapFillResult(
+        dates=sess_arr, o=np.array(out_o, dtype=np.float64), h=np.array(out_h, dtype=np.float64),
+        l=np.array(out_l, dtype=np.float64), c=np.array(out_c, dtype=np.float64),
+        v=np.array(out_v, dtype=np.float64), filled_sessions=filled_sessions,
+        missing_filled=tuple(missing_filled), invalid_filled=tuple(invalid_filled),
+        unfilled_hole_at_start=unfilled_hole_at_start)
+
+
+def assemble_window_filled(dates: Any, o: Any, h: Any, l: Any, c: Any, v: Any, session: date,
+                           n: int = WINDOW, *, gap_fill: Optional[str] = None) -> WindowResult:
+    """``assemble_window``, optionally over a ``gap_fill``-densified series (see
+    :func:`fill_gaps_previous`). The SAME function backs both the build (warmup) and the live/
+    research-mode compute path, so a pinned policy produces byte-identical windows either way.
+
+    Filling the whole raw series is O(its length); a caller that assembles many sessions over one
+    symbol should call :func:`fill_gaps_previous` ONCE and feed the result to ``assemble_window``
+    directly rather than calling this per session (``warmup.py`` does exactly that)."""
+    validate_gap_fill(gap_fill)
+    if gap_fill == GAP_FILL_PREVIOUS:
+        filled = fill_gaps_previous(dates, o, h, l, c, v)
+        dates, o, h, l, c, v = filled.dates, filled.o, filled.h, filled.l, filled.c, filled.v
+    return assemble_window(dates, o, h, l, c, v, session, n)
 
 
 # ---------------------------------------------------------------------------

@@ -87,7 +87,7 @@ def cmd_plan(args) -> int:
     universe = _universe(args.universe_file)
     try:
         plan = W.plan(args.profile, universe, args.start, args.end, args.source_profile, root,
-                      source=make_source(root), log=_logger(args))
+                      source=make_source(root), log=_logger(args), gap_fill=args.gap_fill)
     except W.WarmupConfigError as e:  # includes a source whose provider writes elsewhere
         print(f"configuration error: {e}", file=sys.stderr)
         return EXIT_CONFIG
@@ -111,6 +111,11 @@ def cmd_build(args) -> int:
         plan = W.MarketConditionWarmPlan.load(args.plan)
     except (ValueError, KeyError, TypeError) as e:
         print(f"configuration error: {args.plan} is not a usable plan: {e}", file=sys.stderr)
+        return EXIT_CONFIG
+    if args.gap_fill is not None and args.gap_fill != plan.gap_fill:
+        print(f"configuration error: --gap-fill {args.gap_fill!r} does not match the plan's own "
+              f"gap_fill {plan.gap_fill!r} (set at `plan` time; re-run `plan` with the wanted "
+              f"--gap-fill instead of overriding it at `build` time)", file=sys.stderr)
         return EXIT_CONFIG
     source = None
     if args.fetch_missing:
@@ -189,6 +194,8 @@ def _logger(args):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from ba2_common.core.market_condition_source import GAP_FILL_POLICIES
+
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--quiet", action="store_true", help="no progress lines on stderr")
     ap = argparse.ArgumentParser(description=__doc__, parents=[common],
@@ -206,6 +213,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--source-profile", default=None)
     p.add_argument("--cache-root", default=None)
     p.add_argument("--out", default=None, help="where to write the plan JSON")
+    p.add_argument("--gap-fill", default=None, choices=list(GAP_FILL_POLICIES),
+                   help="densify each symbol's raw series, carrying the PREVIOUS valid bar "
+                        "forward into a missing/invalid session inside its own listed range "
+                        "(never before its first bar or after its last). Default: no fill, "
+                        "byte-identical to every plan/manifest built before this flag existed.")
     p.set_defaults(func=cmd_plan)
 
     b = sub.add_parser("build", parents=[common], help="build and publish the manifest for a plan")
@@ -214,6 +226,9 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--cache-only", action="store_true", help="never fetch; stop with the inventory")
     mode.add_argument("--fetch-missing", action="store_true", help="fetch the missing coverage first")
     b.add_argument("--concurrency", type=int, default=4)
+    b.add_argument("--gap-fill", default=None, choices=list(GAP_FILL_POLICIES),
+                   help="must match the plan's own --gap-fill (set at `plan` time); passing it "
+                        "here is an explicit consistency check, not a way to change it post hoc.")
     b.add_argument("--allow-exclusions", action="store_true",
                    help="publish even though some symbols cannot be warmed (an unreadable split "
                         "calendar, an unverifiable basis, no source data); each is recorded in the "

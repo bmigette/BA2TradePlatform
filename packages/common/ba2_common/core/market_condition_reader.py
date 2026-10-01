@@ -935,10 +935,18 @@ def coverage_detail(mapped: Any, missing: Any) -> str:
 #     the window (APP, ARM, GEV, PLTR, SNDK in the published snapshots). LEGITIMATE for the same
 #     reason: there is no price history to have computed anything from, and the strategy could
 #     not have traded the symbol then either.
-#   * The same status ELSEWHERE -- an interior gap, a trailing run (a delisting, or a source that
-#     stops before the window does), or an entire window with no usable row at all (SPCX, whose
-#     daily cache starts in 2026). None of those is explained by the symbol's listing date, and
-#     each one silently removes real decision dates from the search. A JOB CONFIGURATION ERROR.
+#   * A ROW that says ``missing_session`` (or any other non-``valid`` status) as a TRAILING run
+#     that reaches the LAST session this snapshot has anything recorded for at all (``coverage``'s
+#     own ``last_session``) -- the symmetric case: the company was acquired/delisted (ATVI, DFS,
+#     ANSS, CDAY, FI, ...) or its source simply stops before the window does. LEGITIMATE for the
+#     same reason as a leading run: the symbol never trades again after its last bar (the engine
+#     treats "no more bars" as "no more fills," never an error), so there is nothing a re-fetch or
+#     a fill could supply and no strategy could have traded it either.
+#   * The same status ELSEWHERE -- an interior gap, or an entire window with no usable row at all
+#     (SPCX, whose daily cache starts in 2026). Neither is explained by a listing or delisting
+#     date (an interior gap has valid rows resuming AFTER it, inside this very snapshot, which
+#     proves the source did not simply stop), and each one silently removes real decision dates
+#     from the search. A JOB CONFIGURATION ERROR.
 #
 # The per-symbol ``coverage`` record is what makes the distinction cheap: its ``exceptions``
 # carry ``{kind, field, status, rows, first_session, last_session}`` per (field, status), so a
@@ -1116,11 +1124,17 @@ def _status_problems(symbol: str, record: Mapping[str, Any],
                      want_first: date, want_last: date) -> List[str]:
     """The symbol's recorded status exceptions that this window cannot explain.
 
-    A run of unusable rows is EXPLAINED when it is the symbol's leading prefix and contiguous:
-    the symbol had not listed yet (or its source history starts later), which no re-download
-    repairs and no strategy could have traded through. Anything else -- an interior gap, a
-    trailing run, a whole window with no usable row -- removes real decision dates from the
-    search for a reason the snapshot does not record.
+    A run of unusable rows is EXPLAINED when EITHER:
+    * it is the symbol's leading prefix and contiguous -- the symbol had not listed yet (or its
+      source history starts later), which no re-download repairs and no strategy could have
+      traded through; or
+    * it is a trailing run, contiguous, and reaches the snapshot's own last recorded session
+      (``coverage``'s ``last_session``) -- the symmetric case: the company was delisted/acquired,
+      or the source simply stops there. Nothing valid follows it in THIS snapshot, which is what
+      tells a genuine delisting apart from an interior gap (where valid rows resume afterward).
+
+    Anything else -- an interior gap, or a whole window with no usable row -- removes real
+    decision dates from the search for a reason the snapshot does not record.
 
     The exceptions are recorded PER FIELD, and a symbol with no source data has the identical
     run on all twelve of them, so identical runs are reported ONCE naming their fields: twelve
@@ -1128,6 +1142,7 @@ def _status_problems(symbol: str, record: Mapping[str, Any],
     """
     from ba2_common.core.market_calendar import regular_session_dates
 
+    cov_last = _opt_date(record.get("last_session"))
     grouped: "OrderedDict[Tuple[Any, ...], List[str]]" = OrderedDict()
     for exc in record.get("exceptions") or ():
         if not isinstance(exc, Mapping) or str(exc.get("kind")) != "status":
@@ -1146,6 +1161,17 @@ def _status_problems(symbol: str, record: Mapping[str, Any],
         leading = exc_first <= want_first
         if leading and contiguous and exc_last < want_last:
             continue                     # the listing date explains it: legitimate pre-listing
+        # The SYMMETRIC rule: a TRAILING run is a delisting (the company stopped trading, or the
+        # source stops before this window does), not a hole, when it is contiguous, does not
+        # also touch the window's start (a leading run is handled above; the "whole" branch below
+        # catches a run that is BOTH), and -- the safety property -- reaches all the way to the
+        # LAST session this snapshot has anything recorded for (``cov_last``, the coverage
+        # record's own ``last_session``, which the record carries regardless of this one field's
+        # status). A run that stops SHORT of ``cov_last`` has valid data resuming after it within
+        # this very snapshot, so it is an interior hole and is never exempted here, however long.
+        trailing = not leading and contiguous and cov_last is not None and exc_last == cov_last
+        if trailing:
+            continue                     # the delisting date explains it: legitimate post-delisting
         whole = leading and contiguous
         grouped.setdefault((whole, status, exc_first, exc_last, rows), []).append(
             str(exc.get("field") or "?"))

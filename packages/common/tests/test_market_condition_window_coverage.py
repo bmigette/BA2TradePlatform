@@ -253,11 +253,27 @@ def test_a_symbol_with_no_usable_row_anywhere_in_the_window_is_refused(tmp_path)
         assert field in problems[0]
 
 
-def test_a_trailing_run_of_missing_sessions_is_refused(tmp_path):
-    """A delisting, or a source cache that stops before the window does. The last decision dates
-    would read missing_session, and nothing about the symbol's listing explains it."""
+def test_a_trailing_run_of_missing_sessions_that_reaches_the_end_is_accepted(tmp_path):
+    """The SYMMETRIC rule to the leading-listing case: a delisting, or a source cache that stops
+    before the window does. The company stopped trading (ATVI 2023-10-13, DFS 2025-05-18, ANSS
+    2025-07-17, CDAY 2024-02, FI 2025-12 in the Senate universe) -- nothing a re-fetch or a fill
+    could supply, and no strategy could have traded it either, exactly like a listing date.
+    Accepted ONLY because the run reaches the snapshot's own last recorded session with NOTHING
+    valid after it (see the interior-run test right below for the case this must NOT cover)."""
     sessions = _warm_rows(SNAP_FIRST, SNAP_LAST)
     statuses = {"BBB": {s: STATUS_MISSING_SESSION for s in sessions[-5:]}}
+    store, digest = _publish(tmp_path / "cache", statuses=statuses)
+    problems = window_coverage_problems(_reader(store, digest), ["BBB"], SNAP_FIRST, SNAP_LAST)
+    assert problems == []
+
+
+def test_a_near_trailing_run_that_stops_short_of_the_end_is_still_refused(tmp_path):
+    """The safety property the symmetric rule must keep: a run that does NOT reach the
+    snapshot's own last recorded session has valid data resuming after it -- proof the source
+    did not simply stop -- so it is an interior hole, however close to the end, never a
+    delisting."""
+    sessions = _warm_rows(SNAP_FIRST, SNAP_LAST)
+    statuses = {"BBB": {s: STATUS_MISSING_SESSION for s in sessions[-5:-1]}}  # last session excluded
     store, digest = _publish(tmp_path / "cache", statuses=statuses)
     problems = window_coverage_problems(_reader(store, digest), ["BBB"], SNAP_FIRST, SNAP_LAST)
     assert len(problems) == 1 and "unexplained hole" in problems[0]

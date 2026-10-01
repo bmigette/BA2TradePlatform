@@ -201,13 +201,17 @@ def _reader_profiles(reader: Any) -> Tuple[str, ...]:
 
 
 def _fmp_cache_reader(profile: str, cache_root: Optional[str] = None, *,
-                      manifest_digest: Optional[str] = None) -> Any:
-    """One profile's live reader. Indirection so a test can build resolvers without a cache."""
+                      manifest_digest: Optional[str] = None, gap_fill: Optional[str] = None) -> Any:
+    """One profile's live reader. Indirection so a test can build resolvers without a cache.
+
+    ``gap_fill`` only matters when ``manifest_digest`` is None (research mode): a pinned
+    manifest already carries whatever policy built it, so the standard production path never
+    consults this reader's own ``gap_fill`` at all -- see ``FMPCacheMarketConditionReader``."""
     from ba2_common.core.market_condition_readers import FMPCacheMarketConditionReader
 
     if cache_root is None:
-        return FMPCacheMarketConditionReader(profile, manifest_digest=manifest_digest)
-    return FMPCacheMarketConditionReader(profile, cache_root, manifest_digest=manifest_digest)
+        return FMPCacheMarketConditionReader(profile, manifest_digest=manifest_digest, gap_fill=gap_fill)
+    return FMPCacheMarketConditionReader(profile, cache_root, manifest_digest=manifest_digest, gap_fill=gap_fill)
 
 
 def assert_profile_env_retired(environ: Optional[Any] = None) -> None:
@@ -1015,7 +1019,8 @@ def clear_certification_cache() -> None:
 def resolver_for_profiles(profiles: Sequence[str], *,
                           source_profile: str = SOURCE_PROFILE_FMP_DAILY,
                           manifest_digests: Optional[Mapping[str, str]] = None,
-                          cache_root: Optional[str] = None) -> "LiveMarketConditionResolver":
+                          cache_root: Optional[str] = None,
+                          gap_fill: Optional[str] = None) -> "LiveMarketConditionResolver":
     """A live resolver serving ``profiles``: ONE reader per profile, joined by
     ``market_condition_reader_for`` (the reader itself for a single profile, a
     ``CompositeMarketConditionReader`` for several -- the same join the backtest seam makes, so
@@ -1043,7 +1048,13 @@ def resolver_for_profiles(profiles: Sequence[str], *,
     if extra:
         raise ValueError(f"manifest digest(s) pinned for profile(s) {extra!r} this resolver does "
                          f"not serve (profiles: {list(names)!r}): nothing would read them.")
-    readers = [_fmp_cache_reader(name, cache_root, manifest_digest=digests.get(name))
+    reader_kwargs: Dict[str, Any] = {}
+    if gap_fill is not None:
+        # Passed only when actually set: existing callers of `_fmp_cache_reader` (a seam several
+        # tests monkeypatch with a simpler stand-in) never had to know about this parameter, and
+        # the default (None) must not force them to.
+        reader_kwargs["gap_fill"] = gap_fill
+    readers = [_fmp_cache_reader(name, cache_root, manifest_digest=digests.get(name), **reader_kwargs)
                for name in names]
     return LiveMarketConditionResolver(
         names, reader=market_condition_reader_for(readers), source_profile=source_profile,
