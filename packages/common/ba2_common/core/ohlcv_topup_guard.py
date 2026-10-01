@@ -28,8 +28,9 @@ compares them (:func:`verify_topup`):
 PROVISIONAL BARS. A daily refresh during the session caches today's bar as it stood then (the dev
 app refreshes near 09:30 New York). That bar is never revisited by an append-only top-up, so the
 cache holds such snapshots, e.g. AAOI 2026-09-21 O=H=L=C=108.01 on 360,654 shares. A cached bar
-whose open equals the vendor's and whose high/low/close/volume lie INSIDE the vendor's final bar is
-such a snapshot: it is not a disagreement, and the ``agree`` top-up replaces it with the vendor's
+whose open equals the vendor's (within ``PROVISIONAL_OPEN_TOL`` and inside the vendor's day range:
+a snapshot's open is the first price seen, not the official open) and whose high/low/close/volume lie
+INSIDE the vendor's final bar is such a snapshot: it is not a disagreement, and the ``agree`` top-up replaces it with the vendor's
 bar (``TopUpVerdict.provisional_days``).
 
 Pure (pandas/numpy only). The provider side lives in ``MarketDataProviderInterface``.
@@ -72,6 +73,12 @@ TOPUP_OVERLAP_BARS = 5
 PRICE_REL_TOL = 0.005
 #: ... or within this absolute amount (cent rounding of a low-priced stock).
 PRICE_ABS_TOL = 0.0101
+#: A cached PROVISIONAL snapshot's open is the first price seen when it was captured, not the
+#: vendor's official open, so it may differ from the vendor's by more than ``PRICE_REL_TOL``
+#: (2026-10-01: MXL 0.6%, VSXY 0.6%, GKOS 0.7%, SIMO 1.0%, every one refused). Such an open must
+#: still lie inside the vendor's day range. A split moves a whole bar by at least ~10% (the
+#: smallest ratio ``SPLIT_RATIO_TOL`` recognises), far above this, so it cannot hide one.
+PROVISIONAL_OPEN_TOL = 0.03
 #: A rescale factor matches a (cumulative) calendar split within this, in log.
 CALENDAR_MATCH_TOL = 0.02
 #: With no calendar event to match, a rescale factor is split-like when it lies within this (log)
@@ -155,7 +162,10 @@ def _classify(c, v, k: float) -> str:
         return _EQUAL
     tol_hi = lambda x: x + max(PRICE_REL_TOL * abs(x), PRICE_ABS_TOL)   # noqa: E731
     tol_lo = lambda x: x - max(PRICE_REL_TOL * abs(x), PRICE_ABS_TOL)   # noqa: E731
-    inside = (_same(co, v.Open) and ch <= tol_hi(v.High) and cl >= tol_lo(v.Low)
+    open_ok = (_same(co, v.Open)
+               or (abs(co - v.Open) <= PROVISIONAL_OPEN_TOL * abs(v.Open)
+                   and tol_lo(v.Low) <= co <= tol_hi(v.High)))
+    inside = (open_ok and ch <= tol_hi(v.High) and cl >= tol_lo(v.Low)
               and tol_lo(v.Low) <= cc <= tol_hi(v.High))
     if inside:
         cv, vv = getattr(c, "Volume", float("nan")), getattr(v, "Volume", float("nan"))
