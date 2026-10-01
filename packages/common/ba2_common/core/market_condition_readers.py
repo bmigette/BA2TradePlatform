@@ -56,6 +56,7 @@ from ba2_common.core.market_conditions import (
     WINDOW,
     FeatureRow,
     Observation,
+    calc_version_accepted,
 )
 
 __all__ = [
@@ -128,7 +129,7 @@ class ObservedWindow:
 
 def _check_row(profile: str, calc_version: str, row: Optional[FeatureRow]) -> None:
     spec = PROFILES[profile]
-    if spec.calc_version != calc_version:
+    if not calc_version_accepted(profile, calc_version):
         raise MarketConditionVersionMismatch(
             f"profile {profile!r} is registered at calc version {spec.calc_version!r}, "
             f"but this reader serves {calc_version!r}")
@@ -161,7 +162,9 @@ class WindowMarketConditionReader:
         #: rows served from a pinned manifest (mirror of ``computed`` for the mapped path).
         self.mapped_rows = 0
         self.profile = profile
-        self.calc_version = PROFILES[profile].calc_version
+        #: A pinned manifest serves the rows ITS calculator produced (possibly a legacy version
+        #: still accepted by ``calc_version_accepted``); a computing reader uses the registered one.
+        self.calc_version = mapped.calc_version if mapped is not None else PROFILES[profile].calc_version
         self._memo_size = int(memo_size)
         #: Keep each memoised row's window arrays + digest (needed only for capture). A backtest
         #: reader turns it off: 2000 retained windows would be ~10 MB per run for nothing.
@@ -241,7 +244,7 @@ class WindowMarketConditionReader:
         if hit is not _ABSENT:
             # The registry could have changed under a long-lived reader: one dict lookup and one
             # string compare per read (the full row check ran when the row was computed).
-            if PROFILES[self.profile].calc_version != self.calc_version:
+            if not calc_version_accepted(self.profile, self.calc_version):
                 _check_row(self.profile, self.calc_version, hit.row if hit is not None else None)
             return hit
         entry = self._compute(symbol, session)

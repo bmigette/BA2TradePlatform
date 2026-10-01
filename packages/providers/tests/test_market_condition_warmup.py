@@ -658,11 +658,11 @@ def test_a_calc_version_bump_recomputes_every_row(root, monkeypatch):
     total = p1.row_sessions * len(UNIVERSE)
     assert r1.counters["rows_computed"] == total
 
-    bumped = dc_replace(MC.PROFILES[PROFILE], calc_version="ohlcv-v1/calc-2")
+    bumped = dc_replace(MC.PROFILES[PROFILE], calc_version="ohlcv-v1/calc-3")
     monkeypatch.setitem(MC.PROFILES, PROFILE, bumped)
 
     p2, r2 = _warm(root, src)
-    assert p2.calc_version == "ohlcv-v1/calc-2"
+    assert p2.calc_version == "ohlcv-v1/calc-3"
     assert r2.counters["rows_computed"] == total and r2.counters["rows_reused"] == 0
     assert r2.manifest_digest != r1.manifest_digest
     # Objects are addressed by CONTENT, so this fixture's unchanged calculator re-derives the same
@@ -670,10 +670,10 @@ def test_a_calc_version_bump_recomputes_every_row(root, monkeypatch):
     # WITHOUT being recomputed, which the counters above pin.
     assert r2.counters["objects_written"] == 0 and r2.counters["objects_reused"] == 36
     store = MarketConditionStore(root)
-    assert store.read_manifest(r2.manifest_digest)["calc_version"] == "ohlcv-v1/calc-2"
+    assert store.read_manifest(r2.manifest_digest)["calc_version"] == "ohlcv-v1/calc-3"
     # The old manifest is untouched and still readable at its own version.
     old = store.read_manifest(r1.manifest_digest)
-    assert old["calc_version"] == "ohlcv-v1/calc-1" and store.verify(old, r1.manifest_digest).ok
+    assert old["calc_version"] == "ohlcv-v1/calc-2" and store.verify(old, r1.manifest_digest).ok
     assert len(list(store.iter_rows(old, "AAA"))) == p1.row_sessions
 
     # Back at the original version (the bump undone), the original rows are reused again and the

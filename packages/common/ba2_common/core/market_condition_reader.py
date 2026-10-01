@@ -114,6 +114,7 @@ from ba2_common.core.market_conditions import (
     WINDOW,
     FeatureRow,
     Observation,
+    calc_version_accepted,
 )
 from ba2_common.core.shared_arrays import (
     DONE_MARKER,
@@ -250,7 +251,7 @@ class MappedMarketConditionReader:
         if self.manifest["profile"] != self.profile:
             raise ManifestError(f"manifest {self.manifest_digest} carries profile "
                                 f"{self.manifest['profile']!r}, not {self.profile!r}")
-        if spec.calc_version != self.calc_version:
+        if not calc_version_accepted(self.profile, self.calc_version):
             raise MarketConditionVersionMismatch(
                 f"manifest {self.manifest_digest} was built at calc version {self.calc_version!r}; "
                 f"profile {self.profile!r} is registered at {spec.calc_version!r}")
@@ -480,7 +481,7 @@ class MappedMarketConditionReader:
         would serve a memoised row computed under the old calculator without a word -- the exact
         silent-corruption case this reader raises for.
         """
-        if PROFILES[self.profile].calc_version != self.calc_version:
+        if not calc_version_accepted(self.profile, self.calc_version):
             self._check_registry()
 
     # -- retained evidence (capture) ---------------------------------------------------------

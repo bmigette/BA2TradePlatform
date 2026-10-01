@@ -15,6 +15,7 @@ import dataclasses
 import json
 import os
 import shutil
+import sys
 from datetime import date
 
 import numpy as np
@@ -153,7 +154,7 @@ def test_an_absent_symbol_or_session_is_none_never_a_default(fab):
 
 def test_a_moved_calculator_version_raises_instead_of_serving(fab, monkeypatch):
     store, digest, _w = fab
-    moved = dataclasses.replace(PROFILES["ohlcv-v1"], calc_version="ohlcv-v1/calc-2")
+    moved = dataclasses.replace(PROFILES["ohlcv-v1"], calc_version="ohlcv-v1/calc-9")
     monkeypatch.setitem(PROFILES, "ohlcv-v1", moved)
     with pytest.raises(MarketConditionVersionMismatch):
         _reader(store, digest)
@@ -414,7 +415,27 @@ def test_a_calc_version_that_moves_under_a_memoised_row_still_raises(tmp_path, m
     reader = _reader(store, digest)
     assert reader.observe("AAA", VALID_SESSION) is not None      # now memoised
 
-    moved = dataclasses.replace(PROFILES["ohlcv-v1"], calc_version="ohlcv-v1/calc-2")
+    moved = dataclasses.replace(PROFILES["ohlcv-v1"], calc_version="ohlcv-v1/calc-9")
     monkeypatch.setitem(PROFILES, "ohlcv-v1", moved)
     with pytest.raises(MarketConditionVersionMismatch):
         reader.observe("AAA", VALID_SESSION)
+
+
+def test_a_legacy_calc_version_manifest_still_reads_and_wraps_in_a_window_reader(tmp_path, monkeypatch):
+    """calc-2 (flat windows are defined, not invalid) must not orphan published calc-1 manifests:
+    a pinned manifest serves the rows ITS calculator produced, through the mapped reader and
+    through the window reader that wraps it (the live/BT path)."""
+    from ba2_common.core.market_condition_readers import WindowMarketConditionReader
+
+    legacy = dataclasses.replace(PROFILES["ohlcv-v1"], calc_version="ohlcv-v1/calc-1")
+    with monkeypatch.context() as m:
+        m.setitem(PROFILES, "ohlcv-v1", legacy)
+        m.setattr(sys.modules[__name__], "PROFILE", legacy)
+        store, digest, _w = _fabricate(tmp_path / "cache")
+    assert PROFILES["ohlcv-v1"].calc_version == "ohlcv-v1/calc-2"
+    mapped = _reader(store, digest)
+    assert mapped.calc_version == "ohlcv-v1/calc-1"
+    assert mapped.observe("AAA", VALID_SESSION) is not None
+    wrapped = WindowMarketConditionReader("ohlcv-v1", mapped=mapped)
+    assert wrapped.calc_version == "ohlcv-v1/calc-1"
+    assert wrapped.observe("AAA", VALID_SESSION) is not None
