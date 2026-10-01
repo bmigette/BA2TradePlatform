@@ -16,3 +16,15 @@
 # Format: one symbol per line, blank lines and '#' comment lines skipped (see
 # ba2test_launcher._resolve_exclude_symbols_arg).
 IAC
+
+# 2026-10-01 additions (market-condition snapshot, calc-2 + previous-bar fill build):
+#   IVT, GDEV, SSII, BWLP: flat bars (O=H=L=C, thin trading) make up more than 10% of the 2020-2025
+#     window (37%, 33%, 18%, 13%). Isolated flat stretches (< 10%) are accepted instead: ADX 0 and
+#     neutral volatility values (operator 2026-10-01).
+#   BEP: the FMP daily file has a bar dated on a Saturday (2025-11-08), which the fill refuses, so
+#     the symbol is not in the snapshot.
+IVT
+GDEV
+SSII
+BWLP
+BEP
