@@ -25,6 +25,10 @@
 # Resumable: the driver skips any job whose StrategyOptimization row is `completed`.
 set -u
 cd "$(dirname "$0")/.."
+# ABSOLUTE repo path (Windows form under Git Bash): the launcher resolves @file arguments against
+# ITS OWN working directory, which is not this one -- a relative @docs/... path failed every
+# atr job with FileNotFoundError on the first launch (2026-10-01).
+REPO_ROOT="$(pwd -W 2>/dev/null || pwd)"
 
 GRID_LOG="${GRID_LOG:-grid_atr27.log}"
 export PYTHONUNBUFFERED=1
@@ -122,7 +126,7 @@ COMMON=(--start "$START" --end "$END" --fitness "$FITNESS" --store "$STORE" --in
 # fails the market-condition coverage check for every gated job
 # (docs/strategy_research/atr_grid/excluded_symbols.txt). NOT for FactorRanker: it uses no
 # market-condition data and runs on the full universe (operator 2026-09-29).
-S17_EXCLUDE=(--exclude-symbols "@docs/strategy_research/atr_grid/excluded_symbols.txt")
+S17_EXCLUDE=(--exclude-symbols "@${REPO_ROOT}/docs/strategy_research/atr_grid/excluded_symbols.txt")
 
 run_bands() {                      # $1=name-suffix  $2...=extra driver args
   local suffix="$1"; shift
@@ -142,7 +146,7 @@ SENATE_DRIVER=tools/run_senate_matrix.py
 # grid's 2020-2025 window (729 symbols; see that file's header for how it was built and its
 # overlap with the equity S1-S7 snapshot union). NOT tools/senate_universe.txt, which was built
 # for a different window. Senate's own preflight below refuses to start if it is missing.
-SENATE_UNIVERSE_FILE="${SENATE_UNIVERSE_FILE:-docs/strategy_research/atr_grid/senate_universe_2020_2025.txt}"
+SENATE_UNIVERSE_FILE="${SENATE_UNIVERSE_FILE:-${REPO_ROOT}/docs/strategy_research/atr_grid/senate_universe_2020_2025.txt}"
 # goal2020 matrix3's measured Senate settings (tools/grid_goal2020_matrix3.sh): 5min execution
 # clock (TP/SL exits are NOT low-frequency even though disclosure ENTRIES are -- see that
 # script's header), $10k initial capital, spread 9 bps (measured mid-band median -- Senate's
