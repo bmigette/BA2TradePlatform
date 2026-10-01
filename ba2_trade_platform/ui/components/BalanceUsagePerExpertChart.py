@@ -79,6 +79,7 @@ class BalanceUsagePerExpertChart:
             # over-allocated). Fetch each account's balance once instead of calling the
             # per-expert get_virtual_balance (which re-fetches balance every time).
             balance_by_account: Dict[int, Optional[float]] = {}
+            bp_by_account: Dict[int, Optional[float]] = {}
             for expert in experts:
                 acc_id = expert.account_id
                 if acc_id not in balance_by_account:
@@ -93,6 +94,15 @@ class BalanceUsagePerExpertChart:
                 account_balance = balance_by_account[acc_id]
                 if account_balance is None:
                     continue
+                if acc_id not in bp_by_account:
+                    # The broker's REMAINING buying power: the real ceiling on what can still
+                    # be deployed. None when unpublished -- shown as unknown, never guessed.
+                    acct = _get_account(acc_id)
+                    try:
+                        bp_by_account[acc_id] = acct.get_buying_power() if acct else None
+                    except Exception as e:
+                        logger.error(f"Broker buying power unavailable for account {acc_id}: {e}", exc_info=True)
+                        bp_by_account[acc_id] = None
                 # NO ``or 100.0``: virtual_equity_pct is NOT NULL with a 100.0 default,
                 # so that only ever fired on a real 0% allocation and drew the sleeve as
                 # owning the whole account. Same coercion as
@@ -113,6 +123,7 @@ class BalanceUsagePerExpertChart:
                     # times -- see summarize_capital.
                     'account_id': acc_id,
                     'account_total': account_balance,
+                    'broker_bp': bp_by_account[acc_id],
                 }
 
             # Now calculate used balance from transactions
@@ -242,12 +253,23 @@ class BalanceUsagePerExpertChart:
         allocated = sum(d['total'] for d in balance_data.values())
         capital = sum({d['account_id']: d['account_total']
                        for d in balance_data.values()}.values())
+        # Broker remaining buying power, once per account. ``available`` is capped at it:
+        # tradable capital minus positions is a margin-factor figure, while the broker only
+        # lends what its own multiplier and current positions allow (2026-10-01: the widget
+        # showed $2,789 available against ~$500 of real buying power). Unknown when any
+        # account did not publish one -- then the uncapped figure stands and says so.
+        bp_per_account = {d['account_id']: d.get('broker_bp') for d in balance_data.values()}
+        broker_bp = (None if any(v is None for v in bp_per_account.values())
+                     else sum(bp_per_account.values()))
+        available = max(0.0, capital - filled - pending)
         return {
             'filled': filled,
             'pending': pending,
             'allocated': allocated,
             'capital': capital,
-            'available': max(0.0, capital - filled - pending),
+            'available': available if broker_bp is None else min(available, max(0.0, broker_bp)),
+            'available_uncapped': available,
+            'broker_bp': broker_bp,
             'allocated_pct': (allocated / capital * 100.0) if capital else None,
         }
 
@@ -397,7 +419,12 @@ class BalanceUsagePerExpertChart:
                 ui.label(f'Total Experts: {len(balance_data)}').classes('text-gray-600')
                 ui.label(f"Filled: ${summary['filled']:,.2f}").classes('text-green-600 font-bold')
                 ui.label(f"Pending: ${summary['pending']:,.2f}").classes('text-orange-600 font-bold')
-                ui.label(f"Available: ${summary['available']:,.2f}").classes('text-gray-500')
+                available_text = f"Available: ${summary['available']:,.2f}"
+                if summary['broker_bp'] is None:
+                    available_text += " (broker buying power unknown)"
+                elif summary['available'] < summary['available_uncapped']:
+                    available_text += f" (capped at broker buying power; ${summary['available_uncapped']:,.2f} before the cap)"
+                ui.label(available_text).classes('text-gray-500')
                 ui.label(allocated_text).classes(allocated_classes)
 
     def refresh(self):
