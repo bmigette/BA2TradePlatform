@@ -170,3 +170,46 @@ def test_split_like_ratio():
     assert g._split_like_ratio(1.5, g.SPLIT_RATIO_TOL) == "2:3"
     assert g._split_like_ratio(10.0, g.SPLIT_RATIO_TOL) == "1:10"
     assert g._split_like_ratio(1.07, g.SPLIT_RATIO_TOL) is None
+
+
+def _snapshot_with_open_off(rel: float):
+    """The last cached bar: a flat partial-day snapshot whose open is ``rel`` away from the vendor's."""
+    cached = TRUTH.iloc[:LAST].copy()
+    last = cached.index[-1]
+    vendor_open = TRUTH.loc[last, "Open"]
+    o = vendor_open * (1 + rel)
+    lo, hi = TRUTH.loc[last, "Low"], TRUTH.loc[last, "High"]
+    assert lo <= o <= hi, "fixture: the snapshot open must sit inside the vendor's range"
+    cached.loc[last, ["Open", "High", "Low", "Close"]] = [o, o, o, o]
+    cached.loc[last, "Volume"] = cached.loc[last, "Volume"] * 0.05
+    return cached
+
+
+@pytest.mark.parametrize("rel", [0.006, 0.007, 0.0097, -0.006, -0.0097])
+def test_a_provisional_snapshot_whose_open_is_a_first_print_is_replaced_not_refused(rel):
+    """MXL/VSXY/GKOS/SIMO 2026-10-01: the snapshot's open was 0.6-1.0% off the vendor's official open."""
+    cached = _snapshot_with_open_off(rel)
+    v = g.verify_topup(cached, _vendor(TRUTH.iloc[:LAST + 5]), [])
+    assert v.verdict == g.VERDICT_AGREE
+    assert v.provisional_days == (TRUTH["Date"].iloc[LAST - 1].date(),)
+
+
+def test_an_open_beyond_the_provisional_tolerance_is_still_refused():
+    last = TRUTH.iloc[LAST - 1]
+    rel = 0.05
+    cached = TRUTH.iloc[:LAST].copy()
+    i = cached.index[-1]
+    o = float(last.Open) * (1 + rel)
+    cached.loc[i, ["Open", "High", "Low", "Close"]] = [o, o, o, o]
+    vendor = TRUTH.iloc[:LAST + 5].copy()
+    # widen the vendor's day range so the open is inside it: only the 5% open gap can refuse it
+    vendor.loc[vendor.index[LAST - 1], "High"] = o * 1.02
+    v = g.verify_topup(cached, _vendor(vendor), [])
+    assert v.verdict == g.VERDICT_UNEXPLAINED
+
+
+def test_a_relaxed_open_never_hides_a_split():
+    """A 2:1 rebase of the last bars is still a basis change, not a provisional snapshot."""
+    cached = TRUTH.iloc[:LAST].copy()
+    v = g.verify_topup(cached, _vendor(_scaled(TRUTH.iloc[:LAST + 5], 0.5, before=SPLIT)), CAL)
+    assert v.verdict != g.VERDICT_AGREE
