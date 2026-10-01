@@ -20,7 +20,8 @@ PHASE-1 strategy keys -- one job per (strategy x expert), so every result is att
 ONE structure (design Section 7):
 
     O_LEAP    LEAPS long -- ONE signal-driven key: a bullish buy_call arm (O_LEAPC) and a
-              bearish buy_put arm (O_LEAPP), delta 0.70-0.90, entry DTE 365-550, sharing one
+              bearish buy_put arm (O_LEAPP), delta 0.70-0.90, entry DTE 270-540 (floor
+              lowered from 365, operator decision 2026-09-30 -- design §1b), sharing one
               exit ruleset. Operator decision 2026-09-02, superseding the two separate keys:
               the two arms are the same structure pointed either way, and the group shape gives
               the GA a per-arm on/off gene so it can drop a direction in a one-sided regime.
@@ -48,8 +49,9 @@ tree actually reaches it over the run window. Without it a LEAPS job over the fu
 universe spends most of its compute on names that never listed a 1-year expiry, and reports
 the resulting nothing as a result. Per-strategy thresholds:
 
-    O_LEAP  / O_PMCC    DTE >= 365     (January-cycle LEAPS: both O_LEAP arms, and the
-                                       PMCC's long leg)
+    O_LEAP  / O_PMCC    DTE >= 270     (January-cycle LEAPS: both O_LEAP arms, and the
+                                       PMCC's long leg; lowered from 365, operator decision
+                                       2026-09-30 -- design §1b)
     O_CBS   / O_PBS     DTE >= 180
     O_ERN               DTE >= 7       (nearly the whole universe)
 
@@ -100,11 +102,14 @@ _DEFAULT_STRATEGIES = ["O_LEAP", "O_PMCC", "O_ERN", "O_CBS", "O_PBS"]
 _MIN_DTE = {
     # Keyed by the LAUNCHABLE key: O_LEAPC/O_LEAPP are the two arms of O_LEAP and are not
     # launchable on their own, so a threshold for them would never be read.
-    "O_LEAP": 365,
+    # Lowered from 365, operator decision 2026-09-30 (design §1b): the entry gene's floor
+    # dropped to 270, so a universe filter still keyed at 365 would drop names the strategy
+    # can now actually trade.
+    "O_LEAP": 270,
     # The PMCC's LONG leg is a LEAPS, so it needs the same January-cycle depth O_LEAP
     # does; its 30-45-DTE overlay is listed on every name and is never the binding
     # constraint.
-    "O_PMCC": 365,
+    "O_PMCC": 270,
     "O_ERN": 7,
     "O_CBS": 180,
     "O_PBS": 180,

@@ -86,7 +86,34 @@ from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Mapping, Opti
 import numpy as np
 
 WINDOW = 128
-CALC_VERSION = "ohlcv-v1/calc-1"
+
+#: profile -> calculator versions OLDER than the registered one whose published manifests remain
+#: readable. A pinned manifest serves the rows it was built with (its own ``calc_version``);
+#: only a freshly COMPUTED row uses the registered version.
+LEGACY_CALC_VERSIONS = {
+    "ohlcv-v1": ("ohlcv-v1/calc-1",),
+    "ta-structure-v1": ("ta-structure-v1/calc-1",),
+}
+
+
+def calc_version_accepted(profile: str, calc_version: str) -> bool:
+    """Whether ``calc_version`` is the registered version of ``profile`` or a legacy one."""
+    spec = PROFILES[profile]
+    return calc_version == spec.calc_version or calc_version in LEGACY_CALC_VERSIONS.get(profile, ())
+CALC_VERSION = "ohlcv-v1/calc-2"
+#: calc-2 (operator decision 2026-10-01): a FLAT stretch (O=H=L=C for 14+ bars, thin trading) is
+#: a real market state, not a data defect. The Wilder ATR seed may then be exactly 0; instead of
+#: ``invalid_prices`` the observations take DEFINED neutral values:
+#:
+#: * ``DX`` at an index where ATR == 0 is 0.0 (no directional movement), so ADX is computed on
+#:   the normal recurrence and an all-flat window reads ADX == 0.0;
+#: * ``underlying_trend_slope_50_atr14`` with ATR[127] == 0 is 0.0 (a flat window has no slope);
+#: * ``underlying_realized_vol_ratio_5_20`` with a zero 20-session denominator is 1.0 (neutral:
+#:   short-term volatility is neither expanding nor contracting).
+#:
+#: Truly bad bars (non-finite / non-positive prices, high < low, a close outside the range,
+#: bad volume) are unchanged and still ``invalid_prices``. calc-1 manifests stay valid and
+#: readable (see ``LEGACY_CALC_VERSIONS``); they simply carry the old semantics.
 
 FIELD_TREND_SLOPE = "underlying_trend_slope_50_atr14"
 FIELD_ADX = "underlying_adx_14"
@@ -312,7 +339,12 @@ def adx14_wilder(h: np.ndarray, l: np.ndarray, c: np.ndarray, atr: Optional[np.n
     dx = [_NAN] * n
     for j in range(_ATR_PERIOD, n):
         a = atr_l[j]
-        if not a > 0:  # ATR <= 0 (or NaN) -> unknown, never zero
+        if a == 0.0:   # flat stretch (calc-2): no directional movement, DX is defined as 0
+            pdi[j] = 0.0
+            mdi[j] = 0.0
+            dx[j] = 0.0
+            continue
+        if not a > 0:  # NaN -> unknown, never zero
             continue
         p = 100.0 * s_pdm[j] / a
         m = 100.0 * s_mdm[j] / a
@@ -352,7 +384,8 @@ def realized_vol_ratio(c: np.ndarray) -> Observation:
     std_long = _fsum_sample_std(r[-_RV_LONG:])
     std_short = _fsum_sample_std(r[-_RV_SHORT:])
     if not std_long > 0:
-        return Observation(None, STATUS_INVALID_PRICES, "zero 20-session volatility")
+        # calc-2: a flat stretch has no volatility to be expanding or contracting -> neutral 1.0.
+        return Observation(1.0, STATUS_VALID)
     value = std_short / std_long
     if not math.isfinite(value):
         # Defensive: unreachable for finite positive closes (finite std / positive std).
@@ -427,12 +460,13 @@ def compute_market_conditions(o, h, l, c, v) -> MarketConditionValues:
     atr = atr14_wilder(h, l, c)
     atr_last = float(atr[last])
     rv = realized_vol_ratio(c)
-    if not atr_last > 0:
-        bad = Observation(None, STATUS_INVALID_PRICES, f"atr<=0 at index {last}")
+    if not atr_last >= 0:
+        bad = Observation(None, STATUS_INVALID_PRICES, f"atr<0 or non-finite at index {last}")
         return MarketConditionValues(trend_slope=bad, adx=bad, rv_ratio=rv)
 
     ema = ema_sma_seeded(c, _EMA_PERIOD)
-    slope = (float(ema[last]) - float(ema[last - _SLOPE_LAG])) / (_SLOPE_LAG * atr_last)
+    # calc-2: ATR[127] == 0 means every TR of the window is 0 (all bars flat): slope 0.0.
+    slope = 0.0 if atr_last == 0.0 else         (float(ema[last]) - float(ema[last - _SLOPE_LAG])) / (_SLOPE_LAG * atr_last)
     if math.isfinite(slope):
         trend = Observation(slope, STATUS_VALID)
     else:
@@ -741,7 +775,13 @@ COMPUTE_BY_PROFILE: Dict[str, Callable[..., FeatureRow]] = {OHLCV_V1.name: _comp
 #  * ``structure_state == none`` makes BOTH ``bars_since`` fields unknown: section 3.3 item 4
 #    walks "while structure is bull" (or bear), so with no direction there is no break to find.
 
-STRUCTURE_CALC_VERSION = "ta-structure-v1/calc-1"
+STRUCTURE_CALC_VERSION = "ta-structure-v1/calc-2"
+# calc-2 (operator decision 2026-10-01, see ``CALC_VERSION``): flat stretches are defined, not
+# invalid. A window with ATR[127] == 0 is all-flat and reads: channel slope 0.0, channel width
+# 0.0, channel position 0.5 (the middle), close vs prior 20-session high/low 0.0, structure state
+# ``none`` (0.0); there is no confirmed pivot, so levels/touches/bars-since stay
+# ``insufficient_history`` exactly as for any pivot-less window. A 20-close channel with zero
+# residual dispersion (ATR > 0) likewise gets width 0.0 and position 0.5 instead of invalid.
 STRUCTURE_PROFILE = "ta-structure-v1"
 
 PIVOT_K = 3
@@ -1008,9 +1048,7 @@ def _channel_fields(closes: Sequence[float], atr_last: float
     a, b, sigma = fit_channel(tail)
     slope = Observation(b / atr_last, STATUS_VALID)
     if not sigma > 0:
-        degenerate = Observation(None, STATUS_INVALID_PRICES,
-                                 f"zero residual dispersion over the {CHANNEL_LOOKBACK}-session channel")
-        return slope, degenerate, degenerate
+        return slope, Observation(0.0, STATUS_VALID), Observation(0.5, STATUS_VALID)
     width = Observation(4.0 * sigma / atr_last, STATUS_VALID)
     lower = a + (CHANNEL_LOOKBACK - 1) * b - 2.0 * sigma
     pos = Observation((tail[-1] - lower) / (4.0 * sigma), STATUS_VALID)  # deliberately UNCLAMPED
@@ -1116,6 +1154,21 @@ def _chart_structure_core(h: List[float], l: List[float], c: List[float],
         bars_since_bos=bos, bars_since_choch=choch)
 
 
+def flat_chart_structure() -> ChartStructureValues:
+    """The ``ta-structure-v1`` row of an all-flat window (ATR[127] == 0), calc-2: see
+    ``STRUCTURE_CALC_VERSION``. Shared by the per-window reference and the batch form."""
+    valid = lambda x: Observation(x, STATUS_VALID)  # noqa: E731
+    no_pivot = Observation(None, STATUS_INSUFFICIENT_HISTORY, "flat window: no confirmed pivot")
+    no_structure = Observation(None, STATUS_INSUFFICIENT_HISTORY,
+                               "no swing structure: neither a break nor a change of character is defined")
+    return ChartStructureValues(
+        dist_support=no_pivot, dist_resistance=no_pivot, support_touches=no_pivot,
+        resistance_touches=no_pivot, channel_slope=valid(0.0), channel_width=valid(0.0),
+        channel_pos=valid(0.5), close_vs_prior_high=valid(0.0), close_vs_prior_low=valid(0.0),
+        structure_state=valid(STRUCTURE_STATE_NONE_CODE), bars_since_bos=no_structure,
+        bars_since_choch=no_structure)
+
+
 def compute_chart_structure(o, h, l, c, v, atr: Optional[np.ndarray] = None) -> ChartStructureValues:
     """Compute the twelve ``ta-structure-v1`` observations from exactly ``WINDOW`` bars.
 
@@ -1142,8 +1195,10 @@ def compute_chart_structure(o, h, l, c, v, atr: Optional[np.ndarray] = None) -> 
     if len(atr_arr) != n:
         raise ValueError(f"atr length {len(atr_arr)} != bars {n}")
     atr_last = float(atr_arr[last])
-    if not atr_last > 0:
-        return _all_structure(STATUS_INVALID_PRICES, f"atr<=0 at index {last}")
+    if not atr_last >= 0:
+        return _all_structure(STATUS_INVALID_PRICES, f"atr<0 or non-finite at index {last}")
+    if atr_last == 0.0:
+        return flat_chart_structure()
 
     hl, ll, cl = h.tolist(), l.tolist(), c.tolist()
     return _chart_structure_core(hl, ll, cl, find_pivots(hl, ll), atr_last)

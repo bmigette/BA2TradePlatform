@@ -74,10 +74,13 @@ from ba2_common.core.market_calendar import NY_TZ, nyse_regular_sessions, prior_
 from ba2_common.core.market_condition_context import TIMING_POLICY_PRIOR_SESSION_V1
 from ba2_common.core.market_condition_source import (
     SOURCE_PROFILE_FMP_DAILY,
+    GapFillResult,
     assemble_window,
     certify_source_columns,
+    fill_gaps_previous,
     fmp_daily_cache_path,
     read_fmp_daily_cache,
+    validate_gap_fill,
     window_digest,
 )
 from ba2_common.core.market_condition_store import (
@@ -197,6 +200,20 @@ class SymbolInventory:
     rows_required: int = 0
     rows_reusable: int = 0
     rows_missing: int = 0
+    #: Gap-fill visibility (operator decision 2026-09-30): sessions inside ``[cache_first,
+    #: cache_last]`` that were missing a bar / had an invalid bar and were carried forward from
+    #: the previous valid bar when the plan's ``gap_fill`` policy is set. Always 0 when it is not
+    #: (an unfilled plan never touches these fields, so an old saved plan's defaults are correct).
+    gap_fill_missing_sessions: int = 0
+    gap_fill_invalid_sessions: int = 0
+    #: The first regular session that could not be filled for lack of an earlier valid bar
+    #: (never filled -- see ``fill_gaps_previous``), or None.
+    gap_fill_hole_at_start: Optional[str] = None
+    #: ``fill_gaps_previous`` itself refused this symbol's raw series (e.g. a bar dated off the
+    #: regular-session calendar -- a genuine upstream data defect, distinct from a hole): the
+    #: WHOLE plan/build must not crash for it, so it is isolated here and waived the same way an
+    #: unreadable split calendar is.
+    gap_fill_error: Optional[str] = None
 
     @property
     def fetch_needed(self) -> bool:
@@ -208,6 +225,16 @@ class SymbolInventory:
             return None
         return (f"{self.symbol}: split calendar unavailable ({self.split_calendar_error}); the cached "
                 "history cannot be proven to be on one split basis")
+
+    def gap_fill_preflight_message(self) -> Optional[str]:
+        """The preflight error text for a raw series ``fill_gaps_previous`` refused outright (a
+        bar dated off the regular-session calendar, or conflicting duplicate bars) -- a genuine
+        upstream data defect distinct from an ordinary hole, which IS filled. None when the fill
+        succeeded (or was never requested: ``gap_fill`` is None)."""
+        if not self.gap_fill_error:
+            return None
+        return (f"{self.symbol}: the gap-fill policy refused this symbol's raw series "
+                f"({self.gap_fill_error}); its cache needs repair before it can be filled")
 
     def blocking_items(self) -> List[Dict[str, Any]]:
         items = []
@@ -253,6 +280,13 @@ class MarketConditionWarmPlan:
     provider_calls: int = 0
     provider_bytes: int = 0
     plan_version: int = MC_PLAN_VERSION
+    #: None (default, unchanged from before this feature existed) or one of ``GAP_FILL_POLICIES``
+    #: ("previous"). Carried into the published manifest's optional ``gap_fill_policy`` key (see
+    #: ``market_condition_store.OPTIONAL_MANIFEST_KEYS``) so a filled snapshot's identity differs
+    #: from an unfilled one over the same universe/window. An old saved plan JSON has no
+    #: ``gap_fill`` key at all; ``MarketConditionWarmPlan(**d)`` then uses this default (None),
+    #: so loading it is unaffected by this field's existence.
+    gap_fill: Optional[str] = None
 
     # -- views
     def symbol(self, sym: str) -> SymbolInventory:
@@ -266,8 +300,10 @@ class MarketConditionWarmPlan:
 
     def waivable_preflight_errors(self) -> List[str]:
         """Preflight errors an operator may waive with ``allow_exclusions`` (the symbol is then
-        excluded from the manifest and recorded): an unreadable split calendar."""
-        return [m for m in (s.split_calendar_preflight_message() for s in self.symbols) if m]
+        excluded from the manifest and recorded): an unreadable split calendar, or a raw series
+        ``fill_gaps_previous`` refused outright."""
+        return ([m for m in (s.split_calendar_preflight_message() for s in self.symbols) if m]
+                + [m for m in (s.gap_fill_preflight_message() for s in self.symbols) if m])
 
     def fatal_preflight_errors(self) -> List[str]:
         """Preflight errors nothing can waive: the source certification itself failed."""
@@ -289,6 +325,11 @@ class MarketConditionWarmPlan:
             "split_calendar_errors": [s.symbol for s in self.symbols if s.split_calendar_error],
             "provider_calls": self.provider_calls, "provider_bytes": self.provider_bytes,
             "elapsed_s": self.elapsed_s,
+            "gap_fill": self.gap_fill,
+            "gap_fill_missing_sessions": sum(s.gap_fill_missing_sessions for s in self.symbols),
+            "gap_fill_invalid_sessions": sum(s.gap_fill_invalid_sessions for s in self.symbols),
+            "gap_fill_holes_at_start": {s.symbol: s.gap_fill_hole_at_start for s in self.symbols
+                                       if s.gap_fill_hole_at_start},
         }
 
     # -- serialisation
@@ -360,6 +401,26 @@ def _normalize_bars(dates: np.ndarray, cols: Sequence[np.ndarray]) -> Tuple[np.n
                 conflicts.append(uniq[k].astype(object))
         d, mat = uniq[keep], mat[first_idx[keep]]
     return d, mat, conflicts
+
+
+def _gap_filled_snapshot(snap: _Snapshot, policy: str) -> Tuple[_Snapshot, GapFillResult]:
+    """``snap`` densified by ``policy`` (see ``market_condition_source.fill_gaps_previous``): a
+    new ``_Snapshot`` over the SAME path/signature/conflicts, with ``days``/``bars`` replaced by
+    the filled series, plus the fill's own stats. The raw cache file on disk is never touched --
+    this is a market-condition feature-input view of it, not the shared FMP OHLCV price cache
+    backtests trade on."""
+    b = snap.bars
+    filled = fill_gaps_previous(snap.days, b[:, 0], b[:, 1], b[:, 2], b[:, 3], b[:, 4])
+    bars = np.stack([filled.o, filled.h, filled.l, filled.c, filled.v], axis=1)
+    return _Snapshot(path=snap.path, signature=snap.signature, days=filled.dates, bars=bars,
+                     conflicts=snap.conflicts), filled
+
+
+def _apply_gap_fill_to_inventory(inv: SymbolInventory, fstats: GapFillResult) -> None:
+    inv.gap_fill_missing_sessions = len(fstats.missing_filled)
+    inv.gap_fill_invalid_sessions = len(fstats.invalid_filled)
+    inv.gap_fill_hole_at_start = (str(fstats.unfilled_hole_at_start)
+                                  if fstats.unfilled_hole_at_start is not None else None)
 
 
 def _read_snapshot(cache_root: str, symbol: str) -> Tuple[Optional[_Snapshot], int]:
@@ -578,7 +639,12 @@ def _split_checks_for(snap: Optional[_Snapshot], events: Sequence[CalendarSplit]
 
 
 def _inventory_symbol(inv: SymbolInventory, snap: Optional[_Snapshot], cal: np.ndarray, n_rows: int,
-                      candidates: List[_Candidate]) -> List[_RowWindow]:
+                      candidates: List[_Candidate], *, fill_snap: Optional[_Snapshot] = None
+                      ) -> List[_RowWindow]:
+    """``fill_snap`` (when given) is the gap-filled view of ``snap`` used ONLY for the window
+    pass: every raw-cache diagnostic below (``holes``, ``young_listing``, ``cache_first/last``,
+    ...) stays computed from the UNFILLED ``snap``, so an operator can always see what the raw
+    cache actually looked like, whether or not a fill then covered it."""
     earliest, last_row = cal[0], cal[-1]
     inv.rows_required = n_rows
     inv.source_conflicts = _as_iso(snap.conflicts) if snap else []
@@ -606,7 +672,7 @@ def _inventory_symbol(inv: SymbolInventory, snap: Optional[_Snapshot], cal: np.n
         inv.raw_state = RAW_PRESENT
         inv.missing_from = inv.missing_to = None
         inv.missing_sessions = 0
-    windows = _row_windows(snap, cal, n_rows)
+    windows = _row_windows(fill_snap if fill_snap is not None else snap, cal, n_rows)
     known = {(s, dg) for cand in candidates for s, dg in zip(cand.sessions, cand.digests)}
     inv.rows_reusable = sum(1 for w in windows if (w.session, w.digest) in known)
     inv.rows_missing = n_rows - inv.rows_reusable
@@ -615,11 +681,18 @@ def _inventory_symbol(inv: SymbolInventory, snap: Optional[_Snapshot], cal: np.n
 
 def plan(profile: str, universe: Sequence[str], start: date, end: date,
          source_profile: str = SOURCE_PROFILE_FMP_DAILY, cache_root: Optional[os.PathLike] = None, *,
-         source: Optional[WarmupSource] = None, log: Callable[[str], None] = _log_noop) -> MarketConditionWarmPlan:
+         source: Optional[WarmupSource] = None, log: Callable[[str], None] = _log_noop,
+         gap_fill: Optional[str] = None) -> MarketConditionWarmPlan:
     """Inventory + preflight for warming ``profile`` over ``universe`` and decisions in ``[start, end]``.
 
-    ``source`` supplies the split calendar (default: the FMP source for ``cache_root``)."""
+    ``source`` supplies the split calendar (default: the FMP source for ``cache_root``).
+
+    ``gap_fill`` (default None = no fill, byte-identical to every plan built before this
+    parameter existed): one of ``market_condition_source.GAP_FILL_POLICIES`` ("previous"). Saved
+    on the plan and read back by :func:`build`, which bakes it into the published manifest's
+    optional ``gap_fill_policy`` key."""
     t0 = time.monotonic()
+    validate_gap_fill(gap_fill)
     if profile not in PROFILES or profile not in COMPUTE_BY_PROFILE:
         raise WarmupConfigError(f"unknown market-condition profile {profile!r}; registered: {sorted(PROFILES)}")
     if source_profile != SOURCE_PROFILE_FMP_DAILY:
@@ -672,8 +745,16 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     for sym in symbols:
         inv = SymbolInventory(symbol=sym)
         snap, _retries = _read_snapshot(cache_root, sym)
+        fill_snap = None
+        if gap_fill is not None and snap is not None and len(snap.days):
+            try:
+                fill_snap, fstats = _gap_filled_snapshot(snap, gap_fill)
+                _apply_gap_fill_to_inventory(inv, fstats)
+            except ValueError as e:  # noqa: BLE001 -- a preflight error for this symbol, isolated
+                inv.gap_fill_error = str(e)
+                preflight.append(inv.gap_fill_preflight_message())
         cands = _load_candidates(store, index, cache_root, profile, sym, verify_hashes=False, fields=fields)
-        _inventory_symbol(inv, snap, cal, n_rows, cands)
+        _inventory_symbol(inv, snap, cal, n_rows, cands, fill_snap=fill_snap)
         try:
             events = list(source.split_calendar(sym))
             inv.split_events = [[e.date.isoformat(), float(e.ratio)] for e in events]
@@ -686,7 +767,8 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
         inventories.append(inv)
         log(f"plan {sym}: raw={inv.raw_state} rows={inv.rows_required} reusable={inv.rows_reusable} "
             f"refetch_required={inv.refetch_required}"
-            + (f" split_calendar_error={inv.split_calendar_error}" if inv.split_calendar_error else ""))
+            + (f" split_calendar_error={inv.split_calendar_error}" if inv.split_calendar_error else "")
+            + (f" gap_fill_error={inv.gap_fill_error}" if inv.gap_fill_error else ""))
     return MarketConditionWarmPlan(
         profile=profile, calc_version=PROFILES[profile].calc_version, source_profile=source_profile,
         timing_policy=TIMING_POLICY_PRIOR_SESSION_V1, cache_root=cache_root, universe=symbols,
@@ -696,7 +778,7 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
         earliest_raw_bar=str(cal[0]), certification=cert_dict, preflight_errors=preflight,
         symbols=inventories, created_at=datetime.now(timezone.utc).isoformat(),
         elapsed_s=round(time.monotonic() - t0, 4), provider_calls=int(source.calls - calls0),
-        provider_bytes=int(source.bytes - bytes0))
+        provider_bytes=int(source.bytes - bytes0), gap_fill=gap_fill)
 
 
 # ---------------------------------------------------------------------------
@@ -849,7 +931,8 @@ class BuildReport:
 
 _COUNTER_KEYS = ("provider_calls", "provider_bytes", "rows_total", "rows_computed", "rows_reused",
                  "objects_written", "objects_reused", "raw_objects_written", "raw_objects_reused",
-                 "symbols_built", "symbols_excluded", "snapshot_retries", "full_refetches", "range_fetches")
+                 "symbols_built", "symbols_excluded", "snapshot_retries", "full_refetches", "range_fetches",
+                 "gap_fill_missing_sessions", "gap_fill_invalid_sessions")
 
 
 class _Counters:
@@ -1044,8 +1127,22 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
         extra.append({"kind": "raw_unavailable", "first_session": str(tail[0]), "last_session": str(tail[-1]),
                       "sessions": int(len(tail))})
 
-    shards, raw_by_sha = _raw_shards(store, snap, cal, counters)
-    windows = _row_windows(snap, cal, n_rows)
+    build_snap = snap
+    if plan_.gap_fill:
+        build_snap, fstats = _gap_filled_snapshot(snap, plan_.gap_fill)
+        if fstats.missing_filled or fstats.invalid_filled:
+            extra.append({
+                "kind": "gap_filled", "policy": plan_.gap_fill,
+                "missing_sessions": len(fstats.missing_filled), "invalid_sessions": len(fstats.invalid_filled),
+                "first_session": str(min(fstats.filled_sessions)), "last_session": str(max(fstats.filled_sessions)),
+            })
+            counters.add("gap_fill_missing_sessions", len(fstats.missing_filled))
+            counters.add("gap_fill_invalid_sessions", len(fstats.invalid_filled))
+        if fstats.unfilled_hole_at_start is not None:
+            extra.append({"kind": "gap_fill_hole_at_start", "session": str(fstats.unfilled_hole_at_start)})
+
+    shards, raw_by_sha = _raw_shards(store, build_snap, cal, counters)
+    windows = _row_windows(build_snap, cal, n_rows)
     candidates = _load_candidates(store, index, plan_.cache_root, profile.name, sym, verify_hashes=True,
                                   fields=fields)
     reusable: Dict[date, Tuple[_Candidate, int]] = {}
@@ -1099,7 +1196,7 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
             continue
         records = []
         batch_rows = _batch_rows(
-            batch, snap, [w for w in remaining if w.ok and w.session not in reusable])
+            batch, build_snap, [w for w in remaining if w.ok and w.session not in reusable])
         for w in remaining:
             ref = _raw_ref(shards, w.lo, w.hi)
             hit = reusable.get(w.session)
@@ -1110,7 +1207,7 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
                 if w.ok and w.session in batch_rows:
                     row = batch_rows[w.session]
                 elif w.ok:
-                    b = snap.bars[w.lo:w.hi]
+                    b = build_snap.bars[w.lo:w.hi]
                     row = compute(b[:, 0], b[:, 1], b[:, 2], b[:, 3], b[:, 4])
                 else:
                     row = FeatureRow.uniform(profile, w.status, w.reason)
@@ -1152,6 +1249,7 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
 
     Exit codes in the report: 0 published; 1 actionable inventory / preflight / build failure."""
     t_total = time.monotonic()
+    validate_gap_fill(plan_.gap_fill)
     counters = _Counters()
     report = BuildReport(ok=False, exit_code=1, profile=plan_.profile)
     if plan_.profile not in PROFILES or PROFILES[plan_.profile].calc_version != plan_.calc_version:
@@ -1207,6 +1305,8 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
     for inv in plan_.symbols:
         if inv.split_calendar_error:
             excluded[inv.symbol] = [{"kind": "split_calendar_unavailable", "error": inv.split_calendar_error}]
+        elif inv.gap_fill_error:
+            excluded[inv.symbol] = [{"kind": "gap_fill_refused", "error": inv.gap_fill_error}]
     fetch_elapsed = time.monotonic() - t_fetch
 
     # -- build
@@ -1299,7 +1399,8 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
         PROFILES[plan_.profile], source_profile=plan_.source_profile, timing_policy=plan_.timing_policy,
         objects=objects, raw_objects=raw.values(), coverage={s: r.coverage for s, r in results.items()},
         universe=plan_.universe, sessions=[c.astype(object) for c in cal[WINDOW - 1:]],
-        window_start=date.fromisoformat(plan_.start), window_end=date.fromisoformat(plan_.end))
+        window_start=date.fromisoformat(plan_.start), window_end=date.fromisoformat(plan_.end),
+        gap_fill_policy=plan_.gap_fill)
     digest = store.write_manifest(manifest)
     for r in results.values():
         d = _progress_dir(plan_.cache_root, plan_.profile, r.symbol)

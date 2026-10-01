@@ -124,3 +124,39 @@ class TestDegenerateInputs:
         assert s['capital'] == 0.0
         assert s['allocated'] == 0.0
         assert s['allocated_pct'] is None
+
+
+class TestAvailableIsCappedAtBrokerBuyingPower:
+    """2026-10-01: the footer showed $2,789 available against ~$500 of real buying power,
+    because tradable capital (equity x margin factor) minus positions ignores what the
+    broker will actually lend."""
+
+    @staticmethod
+    def _rows(bp):
+        rows = {f"e{i}": _row(1, 6291.54, 35.0) for i in range(7)}
+        rows["e0"]['filled'] = 3502.76
+        for r in rows.values():
+            r['broker_bp'] = bp
+        return rows
+
+    def test_available_is_capped_at_the_broker_figure(self):
+        s = _summarize(self._rows(500.0))
+        assert s['available_uncapped'] == pytest.approx(6291.54 - 3502.76)
+        assert s['available'] == pytest.approx(500.0)
+        assert s['broker_bp'] == pytest.approx(500.0)
+
+    def test_a_larger_broker_figure_does_not_raise_available(self):
+        s = _summarize(self._rows(9000.0))
+        assert s['available'] == pytest.approx(6291.54 - 3502.76)
+
+    def test_unknown_buying_power_leaves_the_uncapped_figure_and_says_so(self):
+        s = _summarize(self._rows(None))
+        assert s['broker_bp'] is None
+        assert s['available'] == pytest.approx(s['available_uncapped'])
+
+    def test_buying_power_is_counted_once_per_account_not_once_per_sleeve(self):
+        s = _summarize(self._rows(500.0))
+        assert s['broker_bp'] == pytest.approx(500.0)
+
+    def test_negative_buying_power_floors_at_zero(self):
+        assert _summarize(self._rows(-40.0))['available'] == 0.0

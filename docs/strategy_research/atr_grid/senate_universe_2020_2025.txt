@@ -36,6 +36,10 @@
 # a stock -- no_source_data). Neither can be priced by a Senate backtest either. Snapshots:
 # ohlcv-v1 8cd4a4bc34f1cf3b072b8de064eb66244dd8a0011d1df21773c3f4ce071c69f1,
 # ta-structure-v1 4eb35501180ecc51ff00ce60595caf0cc60247ef2f4fb43294c845aa7aae443d (727 symbols).
+#
+# 2026-10-01: removed ARNA, MSDA, RADI, SKX -- not in the calc-2 market-condition snapshot
+# (ARNA, SKX: split-basis exclusions that survive a re-fetch; MSDA, RADI: late listing plus delisting
+# inside the window; the rest: flat bars > 10% of the window or an off-calendar bar).
 A
 AA
 AAL
@@ -94,7 +98,6 @@ ARE
 ARES
 ARLP
 ARMK
-ARNA
 ARW
 ASC
 ASML
@@ -486,7 +489,6 @@ MRO
 MRVL
 MS
 MSCI
-MSDA
 MSFT
 MSI
 MTB
@@ -577,7 +579,6 @@ PYPL
 QCOM
 QQQ
 QSR
-RADI
 RBLX
 RCL
 REGN
@@ -621,7 +622,6 @@ SHW
 SHY
 SIEGY
 SIRI
-SKX
 SLB
 SLG
 SMCI

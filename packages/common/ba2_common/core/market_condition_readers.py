@@ -39,9 +39,11 @@ import numpy as np
 from ba2_common.core.market_condition_source import (
     WindowResult,
     assemble_window,
+    fill_gaps_previous,
     fmp_daily_cache_path,
     normalized_window_bytes,
     read_fmp_daily_cache,
+    validate_gap_fill,
     window_digest,
     window_digest_of_bytes,
     window_from_bytes,
@@ -54,6 +56,7 @@ from ba2_common.core.market_conditions import (
     WINDOW,
     FeatureRow,
     Observation,
+    calc_version_accepted,
 )
 
 __all__ = [
@@ -126,7 +129,7 @@ class ObservedWindow:
 
 def _check_row(profile: str, calc_version: str, row: Optional[FeatureRow]) -> None:
     spec = PROFILES[profile]
-    if spec.calc_version != calc_version:
+    if not calc_version_accepted(profile, calc_version):
         raise MarketConditionVersionMismatch(
             f"profile {profile!r} is registered at calc version {spec.calc_version!r}, "
             f"but this reader serves {calc_version!r}")
@@ -146,7 +149,7 @@ class WindowMarketConditionReader:
     """Base reader: bars -> window -> ``FeatureRow``, memoised. Thread-safe."""
 
     def __init__(self, profile: str, *, memo_size: int = MEMO_SIZE, retain_windows: bool = True,
-                 mapped: Optional[Any] = None):
+                 mapped: Optional[Any] = None, gap_fill: Optional[str] = None):
         if profile not in PROFILES:
             raise KeyError(f"unknown market-condition profile {profile!r}; registered: {sorted(PROFILES)!r}")
         if profile not in COMPUTE_BY_PROFILE:
@@ -155,11 +158,18 @@ class WindowMarketConditionReader:
         #: When set, ``_bars``/the calculator are never reached -- see the module docstring.
         if mapped is not None and mapped.profile != profile:
             raise ValueError(f"mapped reader serves profile {mapped.profile!r}, this reader wants {profile!r}")
+        if mapped is not None and gap_fill is not None                 and gap_fill != mapped.manifest.get("gap_fill_policy"):
+            raise ValueError(
+                f"gap_fill={gap_fill!r} conflicts with the pinned manifest {mapped.manifest_digest} "
+                f"(gap_fill_policy={mapped.manifest.get('gap_fill_policy')!r}): a pinned snapshot "
+                f"serves the rows it was built with, so a different explicit policy is refused")
         self._mapped = mapped
         #: rows served from a pinned manifest (mirror of ``computed`` for the mapped path).
         self.mapped_rows = 0
         self.profile = profile
-        self.calc_version = PROFILES[profile].calc_version
+        #: A pinned manifest serves the rows ITS calculator produced (possibly a legacy version
+        #: still accepted by ``calc_version_accepted``); a computing reader uses the registered one.
+        self.calc_version = mapped.calc_version if mapped is not None else PROFILES[profile].calc_version
         self._memo_size = int(memo_size)
         #: Keep each memoised row's window arrays + digest (needed only for capture). A backtest
         #: reader turns it off: 2000 retained windows would be ~10 MB per run for nothing.
@@ -168,6 +178,17 @@ class WindowMarketConditionReader:
         self._lock = threading.Lock()
         #: rows actually computed (memo misses that produced a row) -- test/benchmark visibility.
         self.computed = 0
+        #: Research-mode (no ``mapped``) gap-fill policy: when a snapshot IS pinned (the standard
+        #: production path), the pinned manifest already carries whatever policy built it and this
+        #: value is never consulted -- see the module docstring and
+        #: ``market_condition_source.GAP_FILL_POLICIES``. Default None (no fill) is unchanged
+        #: behaviour.
+        validate_gap_fill(gap_fill)
+        self.gap_fill = gap_fill
+        #: One entry per distinct symbol file-state this reader has filled (NOT per session): the
+        #: fill itself is O(the symbol's whole history), so it is done once per symbol and reused
+        #: across every session of a backtest/research pass over that symbol.
+        self._fill_cache: Dict[Hashable, Any] = {}
 
     @property
     def mapped_reader(self) -> Optional[Any]:
@@ -187,6 +208,33 @@ class WindowMarketConditionReader:
     def _memo_key(self, symbol: str, session: date) -> Hashable:
         return (symbol, session)
 
+    def _bars_cache_key(self, symbol: str) -> Hashable:
+        """Identity of the SOURCE a gap-fill was computed from, for ``_filled_bars``'s cache.
+        Overridden by a subclass whose source can change under a long-lived reader (the FMP file
+        reader keys on path/mtime/size, mirroring ``_memo_key``); the base default is the symbol
+        alone, correct for a source that cannot change within one reader's lifetime."""
+        return symbol
+
+    def _filled_bars(self, symbol: str, session: date) -> Optional[Tuple[Any, Any, Any, Any, Any, Any]]:
+        """``self._bars(symbol, session)``, gap-filled once per distinct source state and cached
+        (filling is O(the symbol's whole history); a session-by-session caller must not pay that
+        on every call). Returns the bars unchanged when ``gap_fill`` is None."""
+        bars = self._bars(symbol, session)
+        if bars is None or self.gap_fill is None:
+            return bars
+        key = self._bars_cache_key(symbol)
+        with self._lock:
+            hit = self._fill_cache.get(key, _ABSENT)
+        if hit is not _ABSENT:
+            return hit
+        filled = fill_gaps_previous(*bars)
+        result = (filled.dates, filled.o, filled.h, filled.l, filled.c, filled.v)
+        with self._lock:
+            self._fill_cache[key] = result
+            while len(self._fill_cache) > max(1, self._memo_size // 10):
+                self._fill_cache.pop(next(iter(self._fill_cache)))
+        return result
+
     # -- reading
     def observe(self, symbol: str, session: date) -> Optional[FeatureRow]:
         entry = self.observe_window(symbol, session)
@@ -201,7 +249,7 @@ class WindowMarketConditionReader:
         if hit is not _ABSENT:
             # The registry could have changed under a long-lived reader: one dict lookup and one
             # string compare per read (the full row check ran when the row was computed).
-            if PROFILES[self.profile].calc_version != self.calc_version:
+            if not calc_version_accepted(self.profile, self.calc_version):
                 _check_row(self.profile, self.calc_version, hit.row if hit is not None else None)
             return hit
         entry = self._compute(symbol, session)
@@ -215,7 +263,7 @@ class WindowMarketConditionReader:
     def _compute(self, symbol: str, session: date) -> Optional[ObservedWindow]:
         if self._mapped is not None:
             return self._mapped_entry(symbol, session)
-        bars = self._bars(symbol, session)
+        bars = self._filled_bars(symbol, session)
         if bars is None:
             return None
         window = assemble_window(*bars, session)
@@ -274,10 +322,16 @@ class FMPCacheMarketConditionReader(WindowMarketConditionReader):
     """
 
     def __init__(self, profile: str, cache_root: Optional[str] = None, *, memo_size: int = MEMO_SIZE,
-                 manifest_digest: Optional[str] = None):
+                 manifest_digest: Optional[str] = None, gap_fill: Optional[str] = None):
         """``manifest_digest`` pins the published snapshot this reader serves (design section 4.5:
         a scheduled analysis consumes a pinned manifest). With it the FMP cache is never read and
-        nothing is calculated; without it the reader computes on a miss and says so once."""
+        nothing is calculated; without it the reader computes on a miss and says so once.
+
+        ``gap_fill`` only affects the UNPINNED (research-mode) path: a pinned manifest already
+        carries whatever gap-fill policy built it. An explicit ``gap_fill`` that DIFFERS from the
+        pinned manifest's ``gap_fill_policy`` is refused (ValueError) rather than silently
+        ignored -- the standard production/BT path is exact by construction (same manifest, same
+        rows), never a separate live rule that could drift from the build."""
         mapped = None
         if manifest_digest:
             from ba2_common.core.market_condition_reader import MappedMarketConditionReader
@@ -291,7 +345,7 @@ class FMPCacheMarketConditionReader(WindowMarketConditionReader):
             mapped = MappedMarketConditionReader(root, manifest_digest, profile, memo_size=0)
         else:
             warn_research_mode(profile, "live FMP cache reader")
-        super().__init__(profile, memo_size=memo_size, mapped=mapped)
+        super().__init__(profile, memo_size=memo_size, mapped=mapped, gap_fill=gap_fill)
         self.manifest_digest = manifest_digest
         self._cache_root = cache_root
 
@@ -304,14 +358,17 @@ class FMPCacheMarketConditionReader(WindowMarketConditionReader):
             # A pinned manifest is immutable, so the file-freshness part of the key (a stat per
             # observe) would only be dead weight -- and the file it stats need not even exist.
             return (symbol, session)
+        return (symbol, session) + self._bars_cache_key(symbol)[1:]
+
+    def _bars_cache_key(self, symbol: str) -> Hashable:
         path = self._path(symbol)
         if path is None:
-            return (symbol, session, None)
+            return (symbol, None)
         try:
             st = os.stat(path)
         except FileNotFoundError:
-            return (symbol, session, None)
-        return (symbol, session, path, st.st_mtime_ns, st.st_size)
+            return (symbol, None)
+        return (symbol, path, st.st_mtime_ns, st.st_size)
 
     def _bars(self, symbol: str, session: date):
         path = self._path(symbol)
@@ -502,19 +559,22 @@ class ReplayMarketConditionReader:
     def _build(self, symbol: str, session: date) -> Optional[FeatureRow]:
         from ba2_common.core.replay.context import ReplayMiss
 
+        payload = self._recorded.get((self.profile, symbol, session))
+        # A capture recorded under a LEGACY calculator version (still accepted) is served as
+        # recorded: replay reproduces what the live run saw, not what today's calculator would say.
+        recorded_cv = payload["calc_version"] if payload is not None else self.calc_version
         identity = capture_identity(symbol, session, profile=self.profile,
                                     source_profile=self._source_profile,
-                                    timing_policy=self._timing_policy, calc_version=self.calc_version)
-        payload = self._recorded.get((self.profile, symbol, session))
+                                    timing_policy=self._timing_policy, calc_version=recorded_cv)
         if payload is None:
             raise ReplayMiss("market_condition_window", request_identity=identity,
                              detail="no recorded market-condition window for this profile/symbol/session")
-        for name in ("source_profile", "timing_policy", "calc_version"):
+        if not calc_version_accepted(self.profile, recorded_cv):
+            raise MarketConditionVersionMismatch(
+                f"recorded calc version {recorded_cv!r} is neither profile {self.profile!r}'s "
+                f"registered calc version {self.calc_version!r} nor an accepted legacy one")
+        for name in ("source_profile", "timing_policy"):
             if payload[name] != identity[name]:
-                if name == "calc_version":
-                    raise MarketConditionVersionMismatch(
-                        f"recorded calc version {payload[name]!r} != profile {self.profile!r} "
-                        f"calc version {self.calc_version!r}")
                 raise ReplayMiss("market_condition_window", request_identity=identity,
                                  detail=f"recorded {name} {payload[name]!r} differs")
         if not payload["row_present"]:
@@ -528,8 +588,8 @@ class ReplayMarketConditionReader:
         values = {f: Observation(payload["values"][f] if payload["statuses"][f] == STATUS_VALID else None,
                                  payload["statuses"][f], payload["reasons"][f])
                   for f in payload["statuses"]}
-        row = FeatureRow(values=values, calc_versions={f: payload["calc_version"] for f in values})
-        _check_row(self.profile, self.calc_version, row)
+        row = FeatureRow(values=values, calc_versions={f: recorded_cv for f in values})
+        _check_row(self.profile, recorded_cv, row)
         return row
 
     def recorded_window(self, symbol: str, session: date) -> Optional[Tuple[np.ndarray, ...]]:

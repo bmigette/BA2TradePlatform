@@ -90,14 +90,15 @@ def test_every_offered_strategy_states_its_chain_depth():
 
 
 def test_the_chain_depth_thresholds_are_the_designs():
-    """Design section 5: LEAPS keys need DTE >= 365, the backspreads >= 180, O_ERN >= 7.
+    """Design section 5: LEAPS keys need DTE >= 270 (lowered from 365, operator decision
+    2026-09-30 -- design §1b), the backspreads >= 180, O_ERN >= 7.
 
-    O_PMCC joins the 365 group at ``718f7cf4`` (Task 6 un-gated the key): its LONG leg IS a
+    O_PMCC joins the 270 group at ``718f7cf4`` (Task 6 un-gated the key): its LONG leg IS a
     LEAPS, so it needs the same January-cycle chain depth O_LEAP does -- the 30-45-DTE
     overlay is listed on every name and is never the binding constraint.
     """
     d = _driver()
-    assert d._MIN_DTE == {"O_LEAP": 365, "O_PMCC": 365, "O_ERN": 7,
+    assert d._MIN_DTE == {"O_LEAP": 270, "O_PMCC": 270, "O_ERN": 7,
                           "O_CBS": 180, "O_PBS": 180}
 
 
@@ -110,12 +111,12 @@ def test_an_unknown_strategy_fails_LOUDLY_rather_than_running_unfiltered():
 def test_the_preflight_runs_once_per_DISTINCT_threshold():
     """Three probes for FIVE keys: the probe walks the whole parquet tree, so running it per
     STRATEGY would pay for the same scan twice. Still three DISTINCT thresholds after
-    ``718f7cf4`` added O_PMCC -- it shares O_LEAP's 365, which is exactly the saving this
-    test exists to state."""
+    ``718f7cf4`` added O_PMCC -- it shares O_LEAP's threshold (270 as of 2026-09-30, was 365),
+    which is exactly the saving this test exists to state."""
     d = _driver()
     groups = d._thresholds(d._DEFAULT_STRATEGIES)
-    assert set(groups) == {365, 180, 7}
-    assert sorted(groups[365]) == ["O_LEAP", "O_PMCC"]
+    assert set(groups) == {270, 180, 7}
+    assert sorted(groups[270]) == ["O_LEAP", "O_PMCC"]
     assert sorted(groups[180]) == ["O_CBS", "O_PBS"]
     assert groups[7] == ["O_ERN"]
 

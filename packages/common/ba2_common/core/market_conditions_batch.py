@@ -77,6 +77,7 @@ from ba2_common.core.market_conditions import (
     _invalid_bar_label,
     atr14_wilder,
     find_pivots,
+    flat_chart_structure,
     levels_from_sorted,
 )
 
@@ -162,8 +163,11 @@ def chart_structure_rows(o, h, l, c, v) -> List[Optional[ChartStructureValues]]:
             out[e] = _all_structure(STATUS_INVALID_PRICES, _invalid_bar_label(checks, g, g - s))
             continue
         atr_last = float(atr14_wilder(h[s:e + 1], l[s:e + 1], c[s:e + 1])[last_local])
-        if not atr_last > 0:
-            out[e] = _all_structure(STATUS_INVALID_PRICES, f"atr<=0 at index {last_local}")
+        if not atr_last >= 0:
+            out[e] = _all_structure(STATUS_INVALID_PRICES, f"atr<0 or non-finite at index {last_local}")
+            continue
+        if atr_last == 0.0:
+            out[e] = flat_chart_structure()
             continue
         local = [Pivot(p.index - s, p.kind, p.price) for p in pivots[dropped:added]]
         out[e] = _chart_structure_core(

@@ -151,7 +151,7 @@ def test_registry_version_change_under_a_live_reader_raises(ps, monkeypatch):
     reader = _reader(ps)
     reader.observe("AAA", SESSION)
     monkeypatch.setitem(mc.PROFILES, "ohlcv-v1",
-                        ProfileSpec(name="ohlcv-v1", calc_version="ohlcv-v1/calc-2", fields=OHLCV_V1.fields))
+                        ProfileSpec(name="ohlcv-v1", calc_version="ohlcv-v1/calc-9", fields=OHLCV_V1.fields))
     with pytest.raises(MarketConditionVersionMismatch):
         reader.observe("AAA", SESSION)
 

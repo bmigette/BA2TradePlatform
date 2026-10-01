@@ -13,8 +13,9 @@ silent no-contract trial for every name that cannot reach the strategy's DTE dep
 same "nothing failed, the universe was quietly wrong" shape that tools/check_window_coverage.py
 exists to catch on the OHLCV side (see that file's docstring). This is that check for the
 options tree, parameterised on DTE depth instead of calendar coverage, because the per-strategy
-requirement is a DEPTH one: LEAPS/PMCC keys need bars at DTE >= 365, O_CBS/O_PBS/O_CAL need
-DTE >= 180, O_ERN only needs DTE >= 7 (design Section 5 / Section 2 gene tables).
+requirement is a DEPTH one: LEAPS/PMCC keys need bars at DTE >= 270 (lowered from 365, operator
+decision 2026-09-30 -- design §1b), O_CBS/O_PBS/O_CAL need DTE >= 180, O_ERN only needs
+DTE >= 7 (design Section 5 / Section 2 gene tables).
 
 WHAT IT CHECKS
 --------------
@@ -50,7 +51,7 @@ rather than paying for a full-row pandas parquet load.
 
 Usage (test venv):
     ba2-venvs/test/Scripts/python.exe tools/probe_option_chain_depth.py \\
-        --symbols @tools/options_universe_top100.txt --min-dte 365 \\
+        --symbols @tools/options_universe_top100.txt --min-dte 270 \\
         --start 2023-01-01 --end 2025-12-31 --out /tmp/leaps_universe.txt
 
     # quick sanity pass over a random subset instead of the full list (printed, reproducible):
