@@ -171,9 +171,9 @@ run_senate() {                     # $@ = extra driver args
     echo "FATAL: Senate universe file not found: $SENATE_UNIVERSE_FILE" >&2
     exit 1
   fi
-  # Published 2026-09-29 for the 727-symbol Senate universe (BRK.B / XSP removed, see its header).
-  MC_SEN_OHLCV="${MC_SEN_OHLCV:-8cd4a4bc34f1cf3b072b8de064eb66244dd8a0011d1df21773c3f4ce071c69f1}"
-  MC_SEN_TA="${MC_SEN_TA:-4eb35501180ecc51ff00ce60595caf0cc60247ef2f4fb43294c845aa7aae443d}"
+  # Rebuilt 2026-10-01 (calc-2 + previous-bar fill) for the 723-symbol Senate universe (see its header).
+  MC_SEN_OHLCV="${MC_SEN_OHLCV:-537c755d566c1c494612fb471dd4bb0708034a8de5bf686b094a8e4666eb3e52}"
+  MC_SEN_TA="${MC_SEN_TA:-7f611a09b5dbbe1c20ed90e3cf2203716f466bb4ecaa2445d8d716bf4381d0f5}"
   if [ -z "${MC_SEN_OHLCV:-}" ] || [ -z "${MC_SEN_TA:-}" ]; then
     echo "FATAL: PHASE=senate requires MC_SEN_OHLCV and MC_SEN_TA (the Senate market-condition" >&2
     echo "       snapshot digests). The equity snapshot (MC_OHLCV/MC_TA) does NOT cover the" >&2
@@ -260,9 +260,9 @@ case "$PHASE" in
     #   * budget: every job has > 30 genes -> population 120, 30 generations (design §7),
     #     identical for every job (--no-budget-overrides);
     #   * sizing risk_atr only (D2); ATR searched (--rm-toggle-policy atr-searched);
-    #   * snapshots pinned below (2,045 of 2,046 symbols; IAC excluded, see S17_EXCLUDE).
-    MC_OHLCV="${MC_OHLCV:-d979c9bc59fcee65230c80f9aa4565c3dbd454db506324c38375c799ae868f5e}"
-    MC_TA="${MC_TA:-97c7bc8c13b2838633769a2723dace9469100d3f16431009f1705f06a0f501e3}"
+    #   * snapshots pinned below (calc-2 + previous-bar fill, 2,040 symbols; see excluded_symbols.txt).
+    MC_OHLCV="${MC_OHLCV:-fe448b776872798d4e507a86131d533f8490f3b79badef0222a0d7b0e91ed9c3}"
+    MC_TA="${MC_TA:-b6fa3ae3309d25c56d9522401b610d6353c91adf48a4a94eadb440344c489aa1}"
     run_bands "${ATR_SUFFIX:--atr27-riskatr}"         --skip-experts FactorRanker         --strategy-plan docs/strategy_research/atr_grid/strategy_plan.json         --no-budget-overrides --population 120 --generations 30         --sizing-mode risk_atr --rm-toggle-policy atr-searched         --market-condition-profile ohlcv-v1,ta-structure-v1         --market-condition-manifest "ohlcv-v1=${MC_OHLCV},ta-structure-v1=${MC_TA}"         --market-exit exit,stop,tp --search-sl-loosen         "${S17_EXCLUDE[@]}"
     ;;
   senate)
