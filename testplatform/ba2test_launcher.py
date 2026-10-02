@@ -5671,7 +5671,7 @@ def _resolve_search_sl_loosen(raw, command: str) -> bool:
 
 
 def _sl_loosen_gene_space() -> dict:
-    """The ONE ``model:allow_ruleset_sl_loosen`` gene ``--search-sl-loosen`` adds ({} when off).
+    """The ONE ``allow_ruleset_sl_loosen`` expert gene (``model:`` once collected) ``--search-sl-loosen`` adds ({} when off).
 
     Int 0/1 like every other RM toggle gene (``use_atr_stop``, ``screener_weinstein_stage2_only``)
     -- ``_build_daily_trial_config`` merges it straight onto the expert's per-trial settings
@@ -5682,7 +5682,12 @@ def _sl_loosen_gene_space() -> dict:
     would measure two things at once."""
     if not _SEARCH_SL_LOOSEN:
         return {}
-    return {f"model:{_SL_LOOSEN_SETTING}": {
+    # Keyed by the PLAIN setting name, like every other expert gene (``risk_per_trade_pct``,
+    # ``use_atr_stop``): ``collect_param_space`` adds the ``model:`` namespace itself, and
+    # ``decode_params`` strips exactly one. Keying it ``model:allow_ruleset_sl_loosen`` here made
+    # the gene ``model:model:...`` and the trial setting ``model:allow_ruleset_sl_loosen`` -- a name
+    # nothing reads -- so the gene was INERT in every goal2027atr job before 2026-10-02.
+    return {_SL_LOOSEN_SETTING: {
         "optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"}}
 
 
