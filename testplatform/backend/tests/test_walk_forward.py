@@ -44,6 +44,7 @@ def _launcher_mod():
 
 D = date.fromisoformat
 TH = WF.Thresholds(min_oos_return=0.0, max_dd_mult=1.5, min_folds=2)
+SEL = {"min_trade_rows": 30, "min_return_rel_pct": 5.0, "min_dd_pts": 2.0, "min_trades_rel_pct": 5.0}
 
 
 # ------------------------------------------------------------------ fold construction
@@ -198,7 +199,7 @@ def _oos(ret, dd, trades=10):
 
 def _plan(folds=None, **kw):
     folds = folds or WF.build_year_folds(D("2020-01-01"), [2024, 2025, 2026], D("2026-06-30"))
-    args = dict(test_parallel=1, skip_train=False, only_fold=None, embargo_days=0)
+    args = dict(test_parallel=1, skip_train=False, only_fold=None, embargo_days=0, selection=SEL)
     args.update(kw)
     return WF.make_plan("wfp", folds, ["--expert", "FMPRating", "--strategy", "S2"],
                         "ba2-test", 2, TH, **args)
@@ -284,7 +285,7 @@ def test_compounding_worst_dd_trades_and_efficiency_hand_computed():
     assert s.total_return == pytest.approx(8.9)
     assert s.years == pytest.approx(y1 + y2)
     assert s.oos_car == pytest.approx(((1 + total / 100) ** (1 / (y1 + y2)) - 1) * 100)
-    assert s.worst_dd == -12.0                           # deepest |dd| across folds
+    assert s.worst_fold_dd == -12.0                           # deepest |dd| across folds
     assert s.trades == 12
     assert s.is_car_mean == pytest.approx(25.0)
     assert s.efficiency == pytest.approx(s.oos_car / 25.0)

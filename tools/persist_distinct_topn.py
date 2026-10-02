@@ -180,19 +180,27 @@ def _expert_of(bt_block: Dict[str, Any]) -> str:
     raise Refused("optimization_config.backtest names no expert")
 
 
-def _existing_rows(db, opt_id: int) -> List[Tuple[int, str, str, Optional[tuple]]]:
-    """(id, name, params_key, fingerprint) of every completed Backtest of this optimization.
+def _existing_rows(db, opt_id: int, opt_window: Tuple[str, str]
+                   ) -> List[Tuple[int, str, str, Optional[tuple]]]:
+    """(id, name, params_key, fingerprint) of every completed IN-SAMPLE Backtest of this
+    optimization: rows run on the optimization's own window (``opt_window`` = its start/end) and
+    not walk-forward out-of-sample rows (same optimization_id and genes, other window; matching
+    one would make ``--skip-already-persisted`` skip the real in-sample row).
     Never the curve/trade blobs (see the backtests blob-layout note). ``fingerprint`` is None
     for a row flagged ``ga_fitness_divergence``: its metrics come from a re-run that did NOT
     reproduce the GA's score, so they must not stand in for a GA record's behaviour."""
     from app.models.backtest import Backtest
-    from app.services.distinct_topn import behaviour_fingerprint, params_key
+    from app.services.distinct_topn import (behaviour_fingerprint, is_oos_row, params_key,
+                                            row_in_window)
     rows = (db.query(Backtest.id, Backtest.name, Backtest.strategy_params, Backtest.total_trades,
-                     Backtest.total_return, Backtest.max_drawdown, Backtest.results)
+                     Backtest.total_return, Backtest.max_drawdown, Backtest.results,
+                     Backtest.labels, Backtest.start_date, Backtest.end_date)
               .filter(Backtest.optimization_id == opt_id, Backtest.status == "completed")
               .order_by(Backtest.id).all())
     out = []
-    for bid, name, sp, trades, ret, dd, res in rows:
+    for bid, name, sp, trades, ret, dd, res, labels, bstart, bend in rows:
+        if is_oos_row(name, labels) or not row_in_window(bstart, bend, *opt_window):
+            continue
         diverged = isinstance(res, dict) and res.get("ga_fitness_divergence") is not None
         fp = (behaviour_fingerprint(trades, ret, dd)
               if None not in (trades, ret, dd) and not diverged else None)
@@ -339,7 +347,7 @@ def _main(args) -> int:
                           f"job) to proceed anyway.")
         bt_block, expert, years, picks, stats = select_picks(
             opt, args.n, args.min_trade_rows, tol)
-        existing = _existing_rows(db, opt.id)
+        existing = _existing_rows(db, opt.id, (bt_block["start_date"], bt_block["end_date"]))
         existing_by_rank = {p.rank: m for p in picks
                             if (m := _match_existing(p, existing)) is not None}
         opt_id, opt_name, opt_status = opt.id, opt.name, opt.status

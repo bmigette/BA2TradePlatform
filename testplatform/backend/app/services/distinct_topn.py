@@ -48,6 +48,7 @@ passes this floor with 8 bets.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -70,6 +71,37 @@ _SENTINELS = frozenset({ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTI
 PERSIST_ADDED_PARAM_KEYS = ("expertFixedSettings", "entryRules", "exitRules")
 
 DEFAULT_MIN_TRADES = 30   # round-trip ROWS (one per leg on options), not structures
+
+# Walk-forward out-of-sample re-runs (tools/run_walk_forward.py) are persisted with the TRAIN
+# optimization's id, status ``completed`` and the same genes, so a consumer that wants an
+# optimization's own (in-sample) rows must tell them apart. Both markers are checked: the label
+# (``OOS``) and the name shape ``WF<k>-OOS-R<rank>-<job>``; consumers that know the
+# optimization's window also compare it (``row_in_window``).
+OOS_LABEL = "OOS"
+_OOS_NAME_RE = re.compile(r"^WF\d+-OOS-R\d+-")
+
+
+def _labels_list(labels) -> List[str]:
+    import json
+    if labels is None:
+        return []
+    if isinstance(labels, str):
+        try:
+            labels = json.loads(labels)
+        except ValueError:
+            return [labels]
+    return [str(x) for x in labels] if isinstance(labels, (list, tuple)) else []
+
+
+def is_oos_row(name: Optional[str], labels) -> bool:
+    """True for a walk-forward out-of-sample Backtest (label ``OOS`` or ``WF<k>-OOS-R<n>-`` name)."""
+    return OOS_LABEL in _labels_list(labels) or bool(_OOS_NAME_RE.match(name or ""))
+
+
+def row_in_window(row_start, row_end, opt_start, opt_end) -> bool:
+    """True when a Backtest's own start/end dates equal the optimization's run window (compared
+    as ISO dates, so datetime vs ``YYYY-MM-DD`` strings both work)."""
+    return (str(row_start)[:10], str(row_end)[:10]) == (str(opt_start)[:10], str(opt_end)[:10])
 
 
 @dataclass(frozen=True)

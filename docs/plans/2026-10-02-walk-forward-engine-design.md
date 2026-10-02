@@ -38,7 +38,7 @@ empty windows, test not after train end, folds out of order, overlapping test wi
 ## Report (`reports/walk_forward/<prefix>/report.{json,md}`)
 Per-fold IS/OOS table; per-rank stitched OOS (fold returns compounded, CAR over the summed test
 years, deepest fold DD, total trades, IS CAR = mean of the folds' IS CARs); the rank-1-per-fold
-stitch (what deploying each fold's winner would have returned); efficiency = OOS CAR / IS CAR per
+stitch (what deploying each fold's winner would have returned). The stitched "worst DD" is the worst SINGLE-FOLD drawdown, not a chained one (fold equity curves are not read). `--pass-min-oos-return` is a per-fold TOTAL return, not annualised; fold lengths are printed next to it. The selection knobs used are written to the report; efficiency = OOS CAR / IS CAR per
 genome and for stitches (n/a when IS CAR <= 0); the thresholds used.
 
 ## Verdict
@@ -47,6 +47,30 @@ A genome passes a fold iff OOS trades > 0, OOS return >= `--pass-min-oos-return`
 pass. All three flags are required, no defaults. Zero OOS trades always fails. A missing metric
 raises. `--only-fold` gives no overall verdict (reported as INCOMPLETE). Exit codes: 0
 pass/partial/dry-run, 1 run failure, 2 refusal, 3 FAIL.
+
+## Why not run_genome_once
+`tools/run_genome_once.py` also supports a window override, but it passes only
+`{"backtest_cfg": ...}` as hoisted state, so it runs the STATIC universe with no screener state and
+does NOT reproduce the GA. Measured 2026-10-02: opt 375 rank 1 on H1 2026 gave 157 trades / -0.33% /
+DD -5.1% there, against 61 trades / -0.27% / DD -2.5% through `_persist_top_backtests`, which is what
+the GA does. The engine therefore re-runs through `_persist_top_backtests(window=...)`;
+`run_genome_once` now prints a warning and says so in its docstring (behaviour unchanged).
+
+## Out-of-sample rows are not in-sample rows
+OOS Backtests carry the train optimization's id, status `completed` and the same genes. Consumers of
+"an optimization's backtests" therefore exclude them: `persist_distinct_topn._existing_rows`
+(window equal to the optimization's AND not an OOS row, so `--skip-already-persisted` cannot treat an
+OOS row as the in-sample one), `robustness_label_topn`, `report_market_conditions.persisted_runs`,
+`report_grid_results` (name pattern). The UI re-run (`rerun_handler._build_optimization_rerun_config`)
+honours the row's own start/end, so re-running a `WF<k>-OOS-...` row re-runs its test window.
+Helpers: `distinct_topn.is_oos_row`, `row_in_window`.
+
+## Look-ahead and duplicate-name doors
+The optimize args may not carry `--start/--end/--name`, `--warm-start-from` (imports another job's
+population, which may have seen the test window), `--rerun` (a second optimization under the same
+name) or `--submit` (returns before the job completes). A name shared by two optimizations, a
+non-completed optimization or a non-completed OOS row of the expected name are refused up front with
+the ids and what to do.
 
 ## Option holdout rail
 `_assert_option_window_excludes_holdout` guards only the optimize CLI handlers (`cmd_optimize`,

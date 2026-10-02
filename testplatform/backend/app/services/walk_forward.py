@@ -30,7 +30,19 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tupl
 from app.services.distinct_topn import annualise
 
 OOS_LABELS = ("WalkForward", "OOS")     # + ``wf-fold-<k>`` per fold
-FORBIDDEN_OPTIMIZE_FLAGS = ("--start", "--end", "--name")
+# The window and name are owned by the engine. The others import state from ANOTHER job (a
+# look-ahead door: that job may have seen the fold's test window) or break the one-name-one-row
+# resume rule; seeding comes only through ``initial_population_for_fold``.
+FORBIDDEN_OPTIMIZE_FLAGS = {
+    "--start": "the engine sets the fold's train window",
+    "--end": "the engine sets the fold's train window",
+    "--name": "the engine names each fold's job",
+    "--warm-start-from": "it imports another job's population, which may have seen the test "
+                         "window (look-ahead); seeding goes through initial_population_for_fold",
+    "--rerun": "it creates a second optimization under the same name and breaks resume",
+    "--submit": "it queues the job and returns before it is completed, so the fold cannot "
+                "continue",
+}
 
 
 class WalkForwardError(Exception):
@@ -145,13 +157,13 @@ def validate_folds(folds: Sequence[Fold], embargo_days: int = 0) -> None:
 
 
 def check_user_optimize_args(args: Sequence[str]) -> None:
-    """The wrapped optimize args must not carry the window or the job name: the engine owns them."""
+    """The wrapped optimize args must not carry the window, the job name, or a flag that imports
+    state from another job / queues the job: see ``FORBIDDEN_OPTIMIZE_FLAGS``."""
     for a in args:
-        for flag in FORBIDDEN_OPTIMIZE_FLAGS:
+        for flag, why in FORBIDDEN_OPTIMIZE_FLAGS.items():
             if a == flag or a.startswith(flag + "="):
                 raise WalkForwardError(
-                    f"optimize args must not contain {flag} (the walk-forward engine sets "
-                    f"--start/--end/--name per fold); got {a!r}")
+                    f"optimize args must not contain {flag} ({why}); got {a!r}")
 
 
 def optimize_arg_value(args: Sequence[str], flag: str) -> Optional[str]:
@@ -325,7 +337,8 @@ class Stitch:
     folds: List[int]
     total_return: float
     oos_car: float
-    worst_dd: float                 # the deepest fold drawdown (largest |dd|), signed as recorded
+    worst_fold_dd: float            # WORST SINGLE-FOLD drawdown (largest |dd|), NOT chained across
+                                    # folds: fold equity curves are not read (summary columns only)
     trades: int
     is_car_mean: float              # arithmetic mean of the folds' IS CARs
     efficiency: Optional[float]     # oos_car / is_car_mean; None when is_car_mean <= 0
@@ -343,7 +356,7 @@ def stitch(items: Sequence[Tuple[Fold, GenomeFold]]) -> Stitch:
         raise MissingMetric("missing metric: stitched CAR")
     is_mean = sum(g.is_car for _, g in items) / len(items)
     return Stitch(folds=[f.index for f, _ in items], total_return=total, oos_car=car,
-                  worst_dd=max((g.oos_max_dd for _, g in items), key=abs),
+                  worst_fold_dd=max((g.oos_max_dd for _, g in items), key=abs),
                   trades=sum(g.oos_trades for _, g in items), is_car_mean=is_mean,
                   efficiency=efficiency(car, is_mean), years=years)
 
@@ -359,6 +372,7 @@ class WalkForwardResult:
     rank_stitches: Dict[int, Stitch]
     winner_stitch: Optional[Stitch]
     winners_passed: int
+    selection: Dict[str, Any]               # the selection knobs USED (persist_distinct_topn's)
     complete: bool                          # every planned fold was run
     overall_passed: Optional[bool]          # None = incomplete (--only-fold)
     notes: List[str]
@@ -368,7 +382,8 @@ class WalkForwardResult:
 
 
 def aggregate(prefix: str, folds: Sequence[Fold], planned_folds: int, top_n: int,
-              genomes: Sequence[GenomeFold], th: Thresholds) -> WalkForwardResult:
+              genomes: Sequence[GenomeFold], th: Thresholds,
+              selection: Optional[Dict[str, Any]] = None) -> WalkForwardResult:
     by_fold = {f.index: f for f in folds}
     notes: List[str] = []
     ranks = sorted({g.rank for g in genomes})
@@ -390,7 +405,7 @@ def aggregate(prefix: str, folds: Sequence[Fold], planned_folds: int, top_n: int
     return WalkForwardResult(
         prefix=prefix, thresholds=th, top_n=top_n, folds=list(folds), planned_folds=planned_folds,
         genomes=list(genomes), rank_stitches=rank_stitches, winner_stitch=winner_stitch,
-        winners_passed=passed, complete=complete,
+        winners_passed=passed, selection=dict(selection or {}), complete=complete,
         overall_passed=(passed >= th.min_folds) if complete else None, notes=notes)
 
 
@@ -419,6 +434,7 @@ class Plan:
     skip_train: bool = False
     only_fold: Optional[int] = None
     embargo_days: int = 0
+    selection: Dict[str, Any] = field(default_factory=dict)   # the selection knobs USED
 
     def selected_folds(self) -> List[Fold]:
         if self.only_fold is None:
@@ -432,7 +448,7 @@ class Plan:
 
 def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], launcher: Any,
               top_n: int, thresholds: Thresholds, *, test_parallel: int, skip_train: bool,
-              only_fold: Optional[int], embargo_days: int) -> Plan:
+              only_fold: Optional[int], embargo_days: int, selection: Dict[str, Any]) -> Plan:
     """Validate everything BEFORE any run: a refusal here costs nothing."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix or ""):
         raise WalkForwardError(f"--prefix {prefix!r}: use letters, digits, '_', '.', '-'")
@@ -444,7 +460,7 @@ def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], 
     validate_folds(folds, embargo_days)
     thresholds.validate(len(folds))
     plan = Plan(prefix, list(folds), list(optimize_args), launcher, top_n, thresholds,
-                test_parallel, skip_train, only_fold, embargo_days)
+                test_parallel, skip_train, only_fold, embargo_days, dict(selection))
     plan.selected_folds()          # refuses an unknown --only-fold
     return plan
 
@@ -467,7 +483,7 @@ def render_dry_run(plan: Plan) -> str:
             lines.append("  train cmd: " + " ".join(train_command(plan.launcher, plan.optimize_args,
                                                                   plan.prefix, f)))
         lines.append(f"  select: top {plan.top_n} behaviour-distinct genomes "
-                     f"(tools/persist_distinct_topn.py selection)")
+                     f"(tools/persist_distinct_topn.py selection; {plan.selection})")
         lines.append(f"  test: re-run each once on {f.test_start}..{f.test_end} as "
                      f"{oos_name_prefix(f.index)}<rank>-{name}  labels={oos_labels(f.index)}")
     lines.append("\n--dry-run: nothing was run.")
@@ -506,7 +522,8 @@ def run_walk_forward(plan: Plan, runner: Runner, log: Callable[[str], None] = pr
                 raise WalkForwardError(
                     f"fold {f.index} rank {p.rank}: no out-of-sample result was produced")
             genomes.append(evaluate_genome(f, p, oos[p.rank], plan.thresholds))
-    return aggregate(plan.prefix, folds, len(plan.folds), plan.top_n, genomes, plan.thresholds)
+    return aggregate(plan.prefix, folds, len(plan.folds), plan.top_n, genomes, plan.thresholds,
+                     plan.selection)
 
 
 # --------------------------------------------------------------------------------- report
@@ -525,6 +542,7 @@ def result_to_json(res: WalkForwardResult) -> Dict[str, Any]:
         "prefix": res.prefix,
         "thresholds": asdict(res.thresholds),
         "top_n": res.top_n,
+        "selection": res.selection,
         "complete": res.complete,
         "overall_passed": res.overall_passed,
         "winners_passed": res.winners_passed,
@@ -546,10 +564,13 @@ def render_markdown(res: WalkForwardResult) -> str:
            f"**Overall verdict: {verdict}** -- {res.winners_passed} of {len(res.folds)} fold "
            f"winner(s) passed (need {th.min_folds}).", "",
            "## Thresholds used", "",
-           f"- `--pass-min-oos-return` {th.min_oos_return:g}% (OOS total return, per fold)",
+           f"- `--pass-min-oos-return` {th.min_oos_return:g}% (per-fold TOTAL OOS return over that "
+           f"fold's test window, NOT annualised; window lengths are in each fold heading)",
            f"- `--pass-max-dd-mult` {th.max_dd_mult:g} (OOS |max DD| <= mult x IS |max DD|)",
            f"- `--pass-min-folds` {th.min_folds} (fold winners that must pass)",
-           "- a genome with zero OOS trades FAILS", ""]
+           "- a genome with zero OOS trades FAILS",
+           f"- top-n {res.top_n}; selection knobs used: "
+           + (", ".join(f"{k}={v}" for k, v in res.selection.items()) or "n/a"), ""]
     for n in res.notes:
         out.append(f"> {n}")
     if res.notes:
@@ -557,8 +578,8 @@ def render_markdown(res: WalkForwardResult) -> str:
     out += ["Returns and drawdowns in percent. CAR = annualised total return over the window. "
             "Efficiency = OOS CAR / IS CAR (n/a when IS CAR <= 0).", ""]
     for f in res.folds:
-        out += [f"## Fold {f.index}: train {f.train_start}..{f.train_end}, test "
-                f"{f.test_start}..{f.test_end}", "",
+        out += [f"## Fold {f.index}: train {f.train_start}..{f.train_end} ({f.train_years:.2f}y), "
+                f"test {f.test_start}..{f.test_end} ({f.test_years:.2f}y)", "",
                 "| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | "
                 "OOS CAR | OOS maxDD | OOS trades | eff | verdict |",
                 "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
@@ -575,16 +596,17 @@ def render_markdown(res: WalkForwardResult) -> str:
         out += ["## Stitched out-of-sample per rank (rank r of every fold)", "",
                 _stitch_table({f"rank {r}": st for r, st in sorted(res.rank_stitches.items())}), ""]
     out.append("Stitch: fold OOS returns compounded; CAR over the summed test years; worst DD = "
-               "deepest fold drawdown; IS CAR = mean of the folds' IS CARs.")
+               "worst single-fold drawdown (NOT a chained drawdown: fold equity curves are not "
+               "read); IS CAR = mean of the folds' IS CARs.")
     return "\n".join(out) + "\n"
 
 
 def _stitch_table(rows: Dict[str, Stitch]) -> str:
-    lines = ["| genome | folds | OOS return | OOS CAR | worst DD | trades | IS CAR (mean) | eff |",
+    lines = ["| genome | folds | OOS return | OOS CAR | worst single-fold DD | trades | IS CAR (mean) | eff |",
              "|---|---|---:|---:|---:|---:|---:|---:|"]
     for name, s in rows.items():
         lines.append(f"| {name} | {','.join(map(str, s.folds))} | {_f(s.total_return)} | "
-                     f"{_f(s.oos_car)} | {_f(s.worst_dd)} | {s.trades} | {_f(s.is_car_mean)} | "
+                     f"{_f(s.oos_car)} | {_f(s.worst_fold_dd)} | {s.trades} | {_f(s.is_car_mean)} | "
                      f"{_eff(s.efficiency)} |")
     return "\n".join(lines)
 

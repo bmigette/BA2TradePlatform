@@ -37,7 +37,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import sqlite3
 import subprocess
 import sys
 from datetime import date
@@ -52,9 +51,13 @@ for _p in (_BACKEND, os.path.join(_REPO, "tools")):
 from app.services import walk_forward as WF  # noqa: E402
 
 
-def _db_path() -> str:
-    # Same location rule as the grid drivers (tools/run_options2_matrix.py:_db_path).
-    return os.getenv("DB_FILE", r"C:\Users\basti\Documents\ba2\test\dl_forecasting.db")
+def selection_defaults() -> Dict[str, object]:
+    """The selection knobs' DECLARED defaults, read from persist_distinct_topn's own parser so the
+    two tools can never drift apart."""
+    import persist_distinct_topn as P
+    ns = P._parse(["--opt-id", "0"])
+    return {"min_trade_rows": ns.min_trade_rows, "min_return_rel_pct": ns.min_return_rel_pct,
+            "min_dd_pts": ns.min_dd_pts, "min_trades_rel_pct": ns.min_trades_rel_pct}
 
 
 class RealRunner:
@@ -80,16 +83,39 @@ class RealRunner:
         self._tool()
         return self._launcher
 
-    def train_completed(self, name: str) -> bool:
-        con = sqlite3.connect(_db_path())
+    def _opts_named(self, name: str):
+        """(id, status) of every optimization of this name (name/status columns only)."""
+        self._tool()
+        from app.models.database import SessionLocal
+        from app.models.strategy_optimization import StrategyOptimization as SO
+        db = SessionLocal()
         try:
-            row = con.execute("SELECT 1 FROM strategy_optimizations WHERE name=? AND "
-                              "status='completed' LIMIT 1", (name,)).fetchone()
+            return [(i, st) for i, st in db.query(SO.id, SO.status).filter(SO.name == name)
+                    .order_by(SO.id).all()]
         finally:
-            con.close()
-        return row is not None
+            db.close()
+
+    def train_completed(self, name: str) -> bool:
+        """True when the job exists and is completed (the rule of the grid drivers). More than
+        one optimization of the name is REFUSED up front: ``persist_distinct_topn._load_opt`` would
+        refuse it later, after the expensive part."""
+        rows = self._opts_named(name)
+        if len(rows) > 1:
+            raise WF.WalkForwardError(
+                f"{len(rows)} optimizations are named {name!r} "
+                f"({', '.join(f'id={i} {st}' for i, st in rows)}). A failed train plus a re-run "
+                f"under the same name does this. Delete the unwanted row(s) from the test DB "
+                f"(or use a new --prefix) so exactly one remains.")
+        return bool(rows) and rows[0][1] == "completed"
 
     def run_train(self, cmd: List[str], name: str) -> None:
+        stale = self._opts_named(name)
+        if stale:
+            raise WF.WalkForwardError(
+                f"optimization {name!r} already exists and is not completed "
+                f"({', '.join(f'id={i} {st}' for i, st in stale)}): re-running would create a "
+                f"duplicate name. Delete that row (or let a running job finish), or use a new "
+                f"--prefix.")
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         if rc != 0:
             raise WF.WalkForwardError(f"training job {name!r} exited with code {rc}")
@@ -98,7 +124,7 @@ class RealRunner:
         P = self._tool()
         from app.models.database import SessionLocal
         from app.services.distinct_topn import Tolerances
-        a = self.args
+        a = self.args           # selection knobs already resolved by main()
         tol = Tolerances(return_rel_pct=a.min_return_rel_pct, dd_pts=a.min_dd_pts,
                          trades_rel_pct=a.min_trades_rel_pct)
         db = SessionLocal()
@@ -126,14 +152,17 @@ class RealRunner:
         return out
 
     def _summaries(self, db, opt_id: int, names: Sequence[str]) -> Dict[str, tuple]:
-        """Summary columns only -- never the curve/trade blobs (backtests blob-layout note)."""
+        """Summary columns only -- never the curve/trade blobs (backtests blob-layout note). Every
+        column read here is part of the covering index ``ix_backtests_summary``, so the planner
+        answers from the index. ALL statuses are returned: the caller refuses a non-completed
+        row (a crash can leave a ``running`` one) instead of creating a duplicate."""
         from app.models.backtest import Backtest
         rows = (db.query(Backtest.id, Backtest.name, Backtest.status, Backtest.start_date,
                          Backtest.end_date, Backtest.ga_fitness, Backtest.total_return,
                          Backtest.max_drawdown, Backtest.total_trades)
                   .filter(Backtest.optimization_id == opt_id, Backtest.name.in_(list(names)))
                   .order_by(Backtest.id).all())
-        return {r[1]: r for r in rows if r[2] == "completed"}
+        return {r[1]: r for r in rows}
 
     @staticmethod
     def _metrics(row, reused: bool) -> WF.OosMetrics:
@@ -141,14 +170,21 @@ class RealRunner:
                              trades=row[8], reused=reused)
 
     def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel):
+        # Standalone re-runs bypass the GA's logging suppression (10x+ slower), as in
+        # tools/run_genome_once.py. The caller's level is restored afterwards.
+        prior = logging.root.manager.disable
+        logging.disable(logging.WARNING)
+        try:
+            return self._run_oos(train_name, fold, picks, name_prefix, labels, parallel)
+        finally:
+            logging.disable(prior)
+
+    def _run_oos(self, train_name, fold, picks, name_prefix, labels, parallel):
         P = self._tool()
         L = self._launcher
         from app.models.database import SessionLocal
         opt_id, expert = self._opt[train_name]
         window = (fold.test_start.isoformat(), fold.test_end.isoformat())
-        # Standalone re-runs bypass the GA's logging suppression (10x+ slower), as in
-        # tools/run_genome_once.py.
-        logging.disable(logging.WARNING)
         names = {p.rank: WF.oos_backtest_name(fold.index, p.rank, train_name) for p in picks}
         db = SessionLocal()
         try:
@@ -162,6 +198,11 @@ class RealRunner:
             if row is None:
                 todo.append(p)
                 continue
+            if row[2] != "completed":
+                raise WF.WalkForwardError(
+                    f"Backtest {names[p.rank]!r} (id {row[0]}) exists with status {row[2]!r} (a "
+                    f"crashed or running earlier attempt). Delete it before resuming; re-running "
+                    f"would create a duplicate.")
             same_window = (row[3].date().isoformat(), row[4].date().isoformat()) == window
             if not same_window or row[5] is None or abs(row[5] - p.fitness) > 1e-9:
                 raise WF.WalkForwardError(
@@ -171,7 +212,17 @@ class RealRunner:
             print(f"  reusing {names[p.rank]} (backtest {row[0]})")
             out[p.rank] = self._metrics(row, True)
         if todo:
-            P._check_memory(self.args)
+            try:
+                P._check_memory(self.args)
+            except P.Refused as e:
+                raise WF.WalkForwardError(str(e)) from e
+        self._rerun_chunks(todo, parallel, L, opt_id, expert, name_prefix, labels, window,
+                           names, train_name, out)
+        return out
+
+    def _rerun_chunks(self, todo, parallel, L, opt_id, expert, name_prefix, labels, window,
+                      names, train_name, out):
+        from app.models.database import SessionLocal
         for i in range(0, len(todo), parallel):
             chunk = todo[i:i + parallel]
             ids: List[tuple] = []
@@ -196,7 +247,6 @@ class RealRunner:
                     out[p.rank] = self._metrics(row, False)
             finally:
                 db.close()
-        return out
 
 
 def _positive_int(v: str) -> int:
@@ -221,7 +271,9 @@ def _parse(argv: Sequence[str]):
     ap.add_argument("--fold", action="append", default=[])
     ap.add_argument("--embargo-days", type=int, default=0)
     ap.add_argument("--top-n", type=_positive_int, required=True)
-    ap.add_argument("--pass-min-oos-return", type=float, required=True)
+    ap.add_argument("--pass-min-oos-return", type=float, required=True,
+                    help="percent: the fold's TOTAL out-of-sample return over its test window "
+                         "(NOT annualised; mind the window length)")
     ap.add_argument("--pass-max-dd-mult", type=float, required=True)
     ap.add_argument("--pass-min-folds", type=int, required=True)
     ap.add_argument("--test-parallel", type=_positive_int, default=1)
@@ -230,10 +282,12 @@ def _parse(argv: Sequence[str]):
     ap.add_argument("--skip-train", action="store_true")
     ap.add_argument("--launcher")
     ap.add_argument("--out-dir")
-    ap.add_argument("--min-trade-rows", type=int, default=30)
-    ap.add_argument("--min-return-rel-pct", type=float, default=5.0)
-    ap.add_argument("--min-dd-pts", type=float, default=2.0)
-    ap.add_argument("--min-trades-rel-pct", type=float, default=5.0)
+    # Selection knobs: default None = persist_distinct_topn's own declared default (resolved in
+    # main via selection_defaults()); recorded in the report either way.
+    ap.add_argument("--min-trade-rows", type=int, default=None)
+    ap.add_argument("--min-return-rel-pct", type=float, default=None)
+    ap.add_argument("--min-dd-pts", type=float, default=None)
+    ap.add_argument("--min-trades-rel-pct", type=float, default=None)
     ap.add_argument("--min-free-gb", type=float, default=20.0)
     ap.add_argument("--force-memory", action="store_true")
     return ap.parse_args(argv), opt_args
@@ -266,12 +320,17 @@ def _launcher_path(a):
 
 def main(argv=None, runner: Optional[WF.Runner] = None) -> int:
     a, opt_args = _parse(sys.argv[1:] if argv is None else argv)
+    defaults = selection_defaults()
+    for k, v in defaults.items():
+        if getattr(a, k) is None:
+            setattr(a, k, v)
+    selection = {k: getattr(a, k) for k in defaults}
     try:
         plan = WF.make_plan(
             a.prefix, _folds_from_args(a), opt_args, _launcher_path(a), a.top_n,
             WF.Thresholds(a.pass_min_oos_return, a.pass_max_dd_mult, a.pass_min_folds),
             test_parallel=a.test_parallel, skip_train=a.skip_train, only_fold=a.only_fold,
-            embargo_days=a.embargo_days)
+            embargo_days=a.embargo_days, selection=selection)
         runner = runner or RealRunner(a)
         # Option-holdout rail, REUSED unchanged: refuse a fold whose TRAIN window reaches 2026
         # for a pure-option strategy BEFORE any run (the launcher would refuse it mid-run).

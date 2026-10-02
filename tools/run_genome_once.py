@@ -1,5 +1,15 @@
 """Re-run ONE optimization's TOP-N genome as a single backtest and print its metrics.
 
+!! WARNING -- DOES NOT REPRODUCE THE GA for screener optimizations. This script passes only
+!! ``{"backtest_cfg": ...}`` as the hoisted state to ``_build_daily_trial_config``, so it runs
+!! the STATIC universe with NO screener state, whereas the GA (and
+!! ``ba2test_launcher._persist_top_backtests``) apply the per-individual screener genes through
+!! ``_build_hoisted_state``. Measured 2026-10-02, opt 375 rank 1 on H1 2026: 157 trades / -0.33% /
+!! DD -5.1% here, against 61 trades / -0.27% / DD -2.5% through ``_persist_top_backtests``.
+!! Do NOT use it to judge a deployed genome or to validate out of sample; use
+!! tools/run_walk_forward.py (``_persist_top_backtests(window=...)``) instead. Its behaviour is
+!! unchanged; it prints a WARNING at start.
+
 Rebuilds the trial exactly as the GA did -- same fitness-dedup ranking, same
 ``decode_params`` + ``_build_daily_trial_config`` -- so the result is directly comparable with
 what the optimization recorded. Two uses so far:
@@ -53,6 +63,9 @@ DB = os.path.expanduser(r"~\Documents\ba2\test\dl_forecasting.db")
 
 
 def main() -> int:
+    print("WARNING: run_genome_once does NOT apply screener hoisted state (static universe), so "
+          "it does not reproduce the GA's run for screener optimizations and must not be used to "
+          "judge a deployed genome. See this file's docstring.", flush=True)
     opt_id, rank, label = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
     con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
     cfg_json, all_results, strategy_id = con.execute(
