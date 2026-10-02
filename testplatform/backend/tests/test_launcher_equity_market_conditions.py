@@ -299,8 +299,8 @@ def test_search_sl_loosen_adds_exactly_one_gene():
     assert mod._sl_loosen_gene_space() == {}
     mod._resolve_search_sl_loosen(True, "optimize")
     space = mod._sl_loosen_gene_space()
-    assert list(space) == ["model:allow_ruleset_sl_loosen"]
-    assert space["model:allow_ruleset_sl_loosen"] == {
+    assert list(space) == ["allow_ruleset_sl_loosen"]
+    assert space["allow_ruleset_sl_loosen"] == {
         "optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"}
 
 
@@ -340,7 +340,7 @@ def test_search_sl_loosen_is_searched_in_both_arms_design_d6():
     mod._resolve_search_sl_loosen(True, "optimize")
     for target_mode in (mod._MARKET_CONDITION_MODE_SEARCHED, mod._MARKET_CONDITION_MODE_ALL_OFF):
         mod._MARKET_CONDITION_MODE = target_mode
-        assert list(mod._sl_loosen_gene_space()) == ["model:allow_ruleset_sl_loosen"]
+        assert list(mod._sl_loosen_gene_space()) == ["allow_ruleset_sl_loosen"]
     mod._MARKET_CONDITION_MODE = mod._MARKET_CONDITION_MODE_SEARCHED
 
 
@@ -483,3 +483,29 @@ def test_driver_dry_run_is_unaffected_with_no_new_flags():
     assert not re.search(r"-d[0-9a-f]{12}\b", result.stdout)  # no digest token anywhere
     assert "scr-large-FMPRating-S1-from2022" in result.stdout
     assert "scr-large-FMPRating-S6-from2022" in result.stdout
+
+
+
+def test_search_sl_loosen_gene_reaches_the_trial_setting_end_to_end():
+    """The gene name must survive collect_param_space -> decode_params as the REAL setting name.
+
+    2026-10-02: the gene was keyed ``model:allow_ruleset_sl_loosen`` and collected as
+    ``model:model:...``, so decode produced an override nothing reads and the gene was inert in
+    every goal2027atr job. The test above fed ``decode`` the right key by hand, which hid it."""
+    from app.services.strategy_param_space import collect_param_space, decode_params
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+
+    mod._resolve_search_sl_loosen(True, "optimize")
+    strategy = mod._build_strategy("S6", "sl-e2e", "FMPRating")
+    space = collect_param_space(strategy, expert_cfg=mod._sl_loosen_gene_space())
+    assert "model:allow_ruleset_sl_loosen" in space and "model:model:allow_ruleset_sl_loosen" not in space
+    backtest_cfg = {
+        "backtest_id": "sl", "start_date": "2024-01-01", "end_date": "2024-02-01",
+        "enabled_instruments": ["AAA"], "experts": [{"class": "FMPRating", "settings": {}}],
+        "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
+    }
+    for raw, expected in ((1, True), (0, False)):
+        decoded = decode_params(strategy, {"model:allow_ruleset_sl_loosen": raw})
+        assert decoded["expert_overrides"]["allow_ruleset_sl_loosen"] == raw
+        trial = _build_daily_trial_config(backtest_cfg, decoded, None, option_trade_records=False)
+        assert coerce_bool(trial["experts"][0]["settings"]["allow_ruleset_sl_loosen"]) is expected
