@@ -1253,7 +1253,10 @@ def test_time_in_force_survives_a_broker_round_trip(tif):
     mapped = acct.tastytrade_order_to_tradingorder(_placed_order(time_in_force=tif))
     assert mapped.good_for == tif.value
 
-    account_def, order = _tt_trading_order(good_for=mapped.good_for)
+    # A LIMIT order: a market order accepts DAY/IOC only (see the market tests below).
+    from ba2_trade_platform.core.types import OrderType
+    account_def, order = _tt_trading_order(good_for=mapped.good_for,
+                                           order_type=OrderType.BUY_LIMIT, limit_price=34.0)
     acct.id = account_def.id
     with patch("tastytrade.instruments.Equity.get",
                new=AsyncMock(return_value=_FakeEquity("AAPL"))):
@@ -1265,9 +1268,33 @@ def test_time_in_force_survives_a_broker_round_trip(tif):
 @pytest.mark.parametrize("good_for", [None, "", "  ", "banana"])
 def test_an_unknown_time_in_force_falls_back_to_gtc(good_for):
     """N19. The documented default, matching AlpacaAccount's tif_map default."""
-    new_order = _built_order(good_for=good_for)
+    from ba2_trade_platform.core.types import OrderType
+    new_order = _built_order(good_for=good_for, order_type=OrderType.BUY_LIMIT,
+                             limit_price=34.0)
 
     assert new_order.time_in_force == OrderTimeInForce.GTC
+
+
+@pytest.mark.parametrize("good_for", [None, "", "gtc", "GTC Ext", "gtd", "banana"])
+def test_a_market_order_is_never_sent_with_a_resting_time_in_force(good_for):
+    """Live 2026-10-02: TastyTrade answers a GTC market order with HTTP 422
+    `tif_market_orders_not_supported`. The add-to-position and close writers leave
+    `good_for` unset, which resolved to the GTC default -- 42 orders of one allocation
+    run were rejected. A market order goes out as DAY."""
+    from ba2_trade_platform.core.types import OrderType
+    new_order = _built_order(good_for=good_for, order_type=OrderType.MARKET)
+
+    assert new_order.order_type == TTOrderType.MARKET
+    assert new_order.time_in_force == OrderTimeInForce.DAY
+
+
+@pytest.mark.parametrize("good_for,expected", [("day", OrderTimeInForce.DAY),
+                                               ("ioc", OrderTimeInForce.IOC)])
+def test_a_market_order_keeps_a_time_in_force_the_broker_accepts(good_for, expected):
+    from ba2_trade_platform.core.types import OrderType
+    new_order = _built_order(good_for=good_for, order_type=OrderType.MARKET)
+
+    assert new_order.time_in_force == expected
 
 
 def test_an_unrecognised_time_in_force_is_logged_rather_than_silently_downgraded(monkeypatch):
