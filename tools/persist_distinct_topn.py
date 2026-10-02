@@ -214,6 +214,22 @@ def _match_existing(pick, existing) -> Optional[Tuple[int, str, str]]:
     return None
 
 
+def select_picks(opt, n: int, min_trade_rows: int, tol):
+    """The behaviour-distinct selection of ONE optimization row: ``(bt_block, expert, years,
+    picks, stats)``. Shared with tools/run_walk_forward.py so both pick the same genomes.
+    Refuses (``Refused``) a row without an ``optimization_config.backtest`` block."""
+    from app.services.distinct_topn import select_behaviour_distinct
+    if not isinstance((opt.optimization_config or {}).get("backtest"), dict):
+        raise Refused(f"optimization {opt.id} has no optimization_config.backtest block")
+    bt_block = dict(opt.optimization_config["backtest"])
+    expert = _expert_of(bt_block)
+    years = _window_years(bt_block)
+    stats: Dict[str, int] = {}
+    picks = select_behaviour_distinct(opt.all_results, n, min_trades=min_trade_rows,
+                                      tolerances=tol, years=years, stats=stats)
+    return bt_block, expert, years, picks, stats
+
+
 def _fmt(v, spec=".1f", suffix="%"):
     return "n/a" if v is None else f"{format(v, spec)}{suffix}"
 
@@ -310,7 +326,7 @@ def main(argv=None) -> int:
 def _main(args) -> int:
     L = _bootstrap()
     from app.models.database import SessionLocal
-    from app.services.distinct_topn import Tolerances, select_behaviour_distinct
+    from app.services.distinct_topn import Tolerances
 
     tol = Tolerances(return_rel_pct=args.min_return_rel_pct, dd_pts=args.min_dd_pts,
                      trades_rel_pct=args.min_trades_rel_pct)
@@ -321,15 +337,8 @@ def _main(args) -> int:
             raise Refused(f"optimization {opt.id} ({opt.name}) is {opt.status!r}, not "
                           f"'completed'. Pass --allow-running (meant for --dry-run on a live "
                           f"job) to proceed anyway.")
-        if not isinstance((opt.optimization_config or {}).get("backtest"), dict):
-            raise Refused(f"optimization {opt.id} has no optimization_config.backtest block")
-        bt_block = dict(opt.optimization_config["backtest"])
-        expert = _expert_of(bt_block)
-        years = _window_years(bt_block)
-        stats: Dict[str, int] = {}
-        picks = select_behaviour_distinct(opt.all_results, args.n,
-                                          min_trades=args.min_trade_rows,
-                                          tolerances=tol, years=years, stats=stats)
+        bt_block, expert, years, picks, stats = select_picks(
+            opt, args.n, args.min_trade_rows, tol)
         existing = _existing_rows(db, opt.id)
         existing_by_rank = {p.rank: m for p in picks
                             if (m := _match_existing(p, existing)) is not None}
