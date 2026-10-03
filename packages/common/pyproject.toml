@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ba2trade-common"
-version = "2026.10.00001"
+version = "2026.10.00002"
 description = "BA2 Trade — shared interfaces, types, models, ruleset engine, classic risk/sizing"
 requires-python = ">=3.11"
 dependencies = [
