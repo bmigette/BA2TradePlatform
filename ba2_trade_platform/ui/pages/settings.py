@@ -47,6 +47,22 @@ from ba2_common.core.trigger_catalog import (
 )
 from functools import partial
 from ..components.refresh_button import refresh_button
+from ..utils import phone_sections as _phone_sections
+from ..utils.phone_sections import (expert_card_template,
+                                    check_card_covers_table, phone_css, DIALOG_CLASS, TABS_CLASS,
+                                    FOOT_CLASS, LIST_CLASS, LIST_TOP_CLASS)
+from ..utils.responsive import PhoneTableRegistry, install_phone_listener, phone_grid_prop
+
+
+def phone_section(title, **kwargs):
+    """A section that folds on a phone (see utils/phone_sections.py), built with THIS module's
+    ``ui`` -- looked up at call time, so a test that swaps ``ui`` swaps it for the sections too."""
+    return _phone_sections.phone_section(title, ui=ui, **kwargs)
+
+
+def dialog_tab(name, icon):
+    return _phone_sections.dialog_tab(name, icon, ui=ui)
+
 
 
 class TriggerTypePicker:
@@ -1587,8 +1603,9 @@ class ExpertSettingsTab:
     with appropriate setting_type parameters to ensure proper data type handling.
     """
     
-    def __init__(self):
+    def __init__(self, phone_tables=None):
         logger.debug('Initializing ExpertSettingsTab')
+        self._phone_tables = phone_tables
         self.dialog = ui.dialog()
         # Disallow closing dialog by clicking outside - user must explicitly click Cancel or Save
         self.dialog.props('no-backdrop-dismiss')
@@ -1619,11 +1636,20 @@ class ExpertSettingsTab:
                 rows=self._get_all_expert_instances(),
                 row_key='id',
                 selection='multiple'
-            ).classes('w-full')
+            ).classes('w-full ' + LIST_CLASS)
             self.experts_table.selected = []
+            # PHONE: one card per expert (q-table grid mode, same rows, same selection and the
+            # same edit/duplicate/del events as the desktop cells). The registry re-pins it when
+            # the viewport crosses the breakpoint.
+            check_card_covers_table([c['name'] for c in self.experts_table.columns])
+            self.experts_table.props(phone_grid_prop())
+            self.experts_table.add_slot('item', expert_card_template())
+            phone_tables = getattr(self, '_phone_tables', None)
+            if phone_tables is not None:
+                phone_tables.register(self.experts_table)
 
             with self.experts_table.add_slot('top-left'):
-                with ui.row().classes('items-center gap-4'):
+                with ui.row().classes('items-center gap-4 ' + LIST_TOP_CLASS):
                     ui.button('Export Selected', icon='download',
                               on_click=self._export_selected_experts) \
                         .props('flat') \
@@ -1997,7 +2023,7 @@ class ExpertSettingsTab:
         with self.dialog:
             self.dialog.clear()
             
-            with ui.card().classes('w-full').style('width: 90vw; max-width: 1400px; height: 95vh; margin: auto; display: flex; flex-direction: column'):
+            with ui.card().classes('w-full ' + DIALOG_CLASS).style('width: 90vw; max-width: 1400px; height: 95vh; margin: auto; display: flex; flex-direction: column'):
                 ui.label('Add Expert' if not is_edit else 'Edit Expert').classes('text-h6')
                 
                 # Tabs for different settings sections
@@ -2011,20 +2037,20 @@ class ExpertSettingsTab:
                     except Exception:
                         pass
 
-                with ui.tabs() as settings_tabs:
-                    ui.tab('General Settings', icon='schedule')
-                    ui.tab('Instruments', icon='trending_up')
-                    ui.tab('Expert Settings', icon='settings')
-                    ui.tab('Import/Export', icon='download')
+                with ui.tabs().classes(TABS_CLASS) as settings_tabs:
+                    dialog_tab('General Settings', 'schedule')
+                    dialog_tab('Instruments', 'trending_up')
+                    dialog_tab('Expert Settings', 'settings')
+                    dialog_tab('Import/Export', 'download')
                     if expert_actions:
-                        ui.tab('Actions', icon='play_circle')
+                        dialog_tab('Actions', 'play_circle')
                 
                 with ui.tab_panels(settings_tabs, value='General Settings').classes('w-full').style('flex: 1; overflow-y: auto'):
                     # General Settings tab
                     with ui.tab_panel('General Settings'):
                         # Basic expert information
                         with ui.column().classes('w-full gap-2'):
-                            with ui.row().classes('w-full gap-4'):
+                            with ui.row().classes('w-full gap-4 bm-stack'):
                                 expert_types = self._get_available_expert_types()
                                 initial_expert = expert_instance.expert if is_edit else (expert_types[0] if expert_types else None)
                                 self.expert_select = ui.select(
@@ -2058,7 +2084,7 @@ class ExpertSettingsTab:
                                     value='100.0'
                                 ).props('dense').classes('w-32')
 
-                            with ui.row().classes('w-full gap-4'):
+                            with ui.row().classes('w-full gap-4 bm-stack'):
                                 accounts = self._get_available_accounts()
                                 initial_account = None
                                 if is_edit:
@@ -2073,380 +2099,387 @@ class ExpertSettingsTab:
                                     value=initial_account
                                 ).classes('flex-1').props('dense')
 
-                        ui.separator().classes('my-2')
-                        ui.label('General Expert Configuration:').classes('text-subtitle1 mb-4')
+                        ui.separator().classes('my-2 bm-sec-sep')
+                        ui.label('General Expert Configuration:').classes('text-subtitle1 mb-4 bm-sec-title')
                         
                         # Schedule settings - hidden for live experts
                         with ui.column().classes('w-full') as self.execution_schedule_section:
-                            ui.label('Execution Schedules:').classes('text-subtitle2 mb-2')
-                            ui.label('Configure when the expert should run for different analysis types:').classes('text-body2 mb-2')
+                            with phone_section('Execution Schedules', open_=True):
+                                ui.label('Execution Schedules:').classes('text-subtitle2 mb-2 bm-sec-title')
+                                ui.label('Configure when the expert should run for different analysis types:').classes('text-body2 mb-2 bm-sec-intro')
 
-                            # Enter Market Analysis Schedule
-                            with ui.expansion('📈 Enter Market Analysis Schedule', value=True).classes('w-full mb-4'):
-                                with ui.card().classes('w-full'):
-                                    ui.label('Schedule for analyzing new market entry opportunities:').classes('text-body2 mb-2')
+                                # Enter Market Analysis Schedule
+                                with ui.expansion('📈 Enter Market Analysis Schedule', value=True).classes('w-full mb-4'):
+                                    with ui.card().classes('w-full bm-flat'):
+                                        ui.label('Schedule for analyzing new market entry opportunities:').classes('text-body2 mb-2')
 
-                                    self._build_schedule_frequency_controls('enter_market')
+                                        self._build_schedule_frequency_controls('enter_market')
 
-                                    with ui.row().classes('w-full items-center gap-4 mb-2'):
-                                        ui.label('Time basis:').classes('text-body2')
-                                        self.enter_market_time_basis = ui.toggle(
-                                            ['Local time', 'Market time (NYSE)'], value='Local time',
-                                            on_change=lambda e: self._refresh_time_basis_hint('enter_market'),
-                                        ).props('no-caps dense')
-                                    self.enter_market_local_hint = ui.label('').classes('text-caption text-grey-7 mb-1')
+                                        with ui.row().classes('w-full items-center gap-4 mb-2'):
+                                            ui.label('Time basis:').classes('text-body2')
+                                            self.enter_market_time_basis = ui.toggle(
+                                                ['Local time', 'Market time (NYSE)'], value='Local time',
+                                                on_change=lambda e: self._refresh_time_basis_hint('enter_market'),
+                                            ).props('no-caps dense')
+                                        self.enter_market_local_hint = ui.label('').classes('text-caption text-grey-7 mb-1')
 
-                                    ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
-                                    try:
-                                        self.enter_market_times_container = ui.column().classes('w-full mb-4')
+                                        ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
+                                        try:
+                                            self.enter_market_times_container = ui.column().classes('w-full mb-4')
+                                            if self.enter_market_times_container is None:
+                                                logger.error("ui.column() returned None for enter_market_times_container")
+                                                self.enter_market_times_container = ui.column()  # Try again without classes
+                                        except Exception as e:
+                                            logger.error(f"Error creating enter_market_times_container: {e}", exc_info=True)
+                                            self.enter_market_times_container = None
+
+                                        self.enter_market_execution_times = []
+
+                                        # Verify container was created successfully
                                         if self.enter_market_times_container is None:
-                                            logger.error("ui.column() returned None for enter_market_times_container")
-                                            self.enter_market_times_container = ui.column()  # Try again without classes
-                                    except Exception as e:
-                                        logger.error(f"Error creating enter_market_times_container: {e}", exc_info=True)
-                                        self.enter_market_times_container = None
+                                            logger.error("Failed to create enter_market_times_container, skipping time input setup")
+                                        else:
+                                            # Add initial time input
+                                            self._add_time_input_enter_market('09:30')
 
-                                    self.enter_market_execution_times = []
+                                        # Only create the add time button if we have a valid container
+                                        if self.enter_market_times_container is not None:
+                                            with ui.row().classes('w-full gap-2 mb-4'):
+                                                ui.button('Add Time', on_click=self._add_time_input_enter_market, icon='add_alarm').props('flat')
 
-                                    # Verify container was created successfully
-                                    if self.enter_market_times_container is None:
-                                        logger.error("Failed to create enter_market_times_container, skipping time input setup")
-                                    else:
-                                        # Add initial time input
-                                        self._add_time_input_enter_market('09:30')
+                                # Open Positions Analysis Schedule
+                                # Captured so it can be hidden for experts that rebalance in one batch
+                                # run (schedules_open_positions=False), via _update_open_positions_schedule_visibility.
+                                with ui.expansion('💼 Open Positions Analysis Schedule', value=False).classes('w-full mb-4') as self.open_positions_schedule_expansion:
+                                    with ui.card().classes('w-full bm-flat'):
+                                        ui.label('Schedule for analyzing existing open positions:').classes('text-body2 mb-2')
 
-                                    # Only create the add time button if we have a valid container
-                                    if self.enter_market_times_container is not None:
-                                        with ui.row().classes('w-full gap-2 mb-4'):
-                                            ui.button('Add Time', on_click=self._add_time_input_enter_market, icon='add_alarm').props('flat')
+                                        self._build_schedule_frequency_controls('open_positions')
 
-                            # Open Positions Analysis Schedule
-                            # Captured so it can be hidden for experts that rebalance in one batch
-                            # run (schedules_open_positions=False), via _update_open_positions_schedule_visibility.
-                            with ui.expansion('💼 Open Positions Analysis Schedule', value=False).classes('w-full mb-4') as self.open_positions_schedule_expansion:
-                                with ui.card().classes('w-full'):
-                                    ui.label('Schedule for analyzing existing open positions:').classes('text-body2 mb-2')
+                                        with ui.row().classes('w-full items-center gap-4 mb-2'):
+                                            ui.label('Time basis:').classes('text-body2')
+                                            self.open_positions_time_basis = ui.toggle(
+                                                ['Local time', 'Market time (NYSE)'], value='Local time',
+                                                on_change=lambda e: self._refresh_time_basis_hint('open_positions'),
+                                            ).props('no-caps dense')
+                                        self.open_positions_local_hint = ui.label('').classes('text-caption text-grey-7 mb-1')
 
-                                    self._build_schedule_frequency_controls('open_positions')
+                                        ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
+                                        try:
+                                            self.open_positions_times_container = ui.column().classes('w-full mb-4')
+                                            if self.open_positions_times_container is None:
+                                                logger.error("ui.column() returned None for open_positions_times_container")
+                                                self.open_positions_times_container = ui.column()  # Try again without classes
+                                        except Exception as e:
+                                            logger.error(f"Error creating open_positions_times_container: {e}", exc_info=True)
+                                            self.open_positions_times_container = None
 
-                                    with ui.row().classes('w-full items-center gap-4 mb-2'):
-                                        ui.label('Time basis:').classes('text-body2')
-                                        self.open_positions_time_basis = ui.toggle(
-                                            ['Local time', 'Market time (NYSE)'], value='Local time',
-                                            on_change=lambda e: self._refresh_time_basis_hint('open_positions'),
-                                        ).props('no-caps dense')
-                                    self.open_positions_local_hint = ui.label('').classes('text-caption text-grey-7 mb-1')
+                                        self.open_positions_execution_times = []
 
-                                    ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
-                                    try:
-                                        self.open_positions_times_container = ui.column().classes('w-full mb-4')
+                                        # Verify container was created successfully
                                         if self.open_positions_times_container is None:
-                                            logger.error("ui.column() returned None for open_positions_times_container")
-                                            self.open_positions_times_container = ui.column()  # Try again without classes
-                                    except Exception as e:
-                                        logger.error(f"Error creating open_positions_times_container: {e}", exc_info=True)
-                                        self.open_positions_times_container = None
+                                            logger.error("Failed to create open_positions_times_container, skipping time input setup")
+                                        else:
+                                            # Add initial time inputs (more frequent for position monitoring)
+                                            for time in ['09:30', '10:30', '11:30', '12:30', '13:30', '14:30', '15:30']:
+                                                self._add_time_input_open_positions(time)
 
-                                    self.open_positions_execution_times = []
-
-                                    # Verify container was created successfully
-                                    if self.open_positions_times_container is None:
-                                        logger.error("Failed to create open_positions_times_container, skipping time input setup")
-                                    else:
-                                        # Add initial time inputs (more frequent for position monitoring)
-                                        for time in ['09:30', '10:30', '11:30', '12:30', '13:30', '14:30', '15:30']:
-                                            self._add_time_input_open_positions(time)
-
-                                    # Only create the add time button if we have a valid container
-                                    if self.open_positions_times_container is not None:
-                                        with ui.row().classes('w-full gap-2 mb-4'):
-                                            ui.button('Add Time', on_click=self._add_time_input_open_positions, icon='add_alarm').props('flat')
+                                        # Only create the add time button if we have a valid container
+                                        if self.open_positions_times_container is not None:
+                                            with ui.row().classes('w-full gap-2 mb-4'):
+                                                ui.button('Add Time', on_click=self._add_time_input_open_positions, icon='add_alarm').props('flat')
                         
-                        ui.separator().classes('my-4')
+                        ui.separator().classes('my-4 bm-sec-sep')
                         
                         # Trading direction settings
-                        ui.label('Trading Permissions:').classes('text-subtitle2 mb-2')
-                        ui.label('Select which trading actions this expert can perform:').classes('text-body2 mb-2')
+                        with phone_section('Trading Permissions'):
+                            ui.label('Trading Permissions:').classes('text-subtitle2 mb-2 bm-sec-title')
+                            ui.label('Select which trading actions this expert can perform:').classes('text-body2 mb-2 bm-sec-intro')
                         
-                        with ui.row().classes('w-full gap-4'):
-                            # Initial values are the DECLARED defaults (a new expert shows and
-                            # saves exactly those); editing overwrites them in _load_general_settings.
-                            self.enable_buy_checkbox = ui.checkbox('Enable BUY orders', value=_builtin_default('enable_buy'))
-                            self.enable_sell_checkbox = ui.checkbox('Enable SELL orders', value=_builtin_default('enable_sell'))
-                        ui.label('BUY opens longs; SELL opens shorts (a sell from flat). Closing a '
-                                 'position needs the permission that opened it: a sell closing a long '
-                                 'needs BUY, a buy covering a short needs SELL.').classes('text-body2 text-grey-7 ml-6')
-                        ui.label('An order opposite to an open position only reduces or closes it; '
-                                 'a new position in the other direction opens only from flat').classes('text-body2 text-grey-7 ml-6')
+                            with ui.row().classes('w-full gap-4'):
+                                # Initial values are the DECLARED defaults (a new expert shows and
+                                # saves exactly those); editing overwrites them in _load_general_settings.
+                                self.enable_buy_checkbox = ui.checkbox('Enable BUY orders', value=_builtin_default('enable_buy'))
+                                self.enable_sell_checkbox = ui.checkbox('Enable SELL orders', value=_builtin_default('enable_sell'))
+                            ui.label('BUY opens longs; SELL opens shorts (a sell from flat). Closing a '
+                                     'position needs the permission that opened it: a sell closing a long '
+                                     'needs BUY, a buy covering a short needs SELL.').classes('text-body2 text-grey-7 ml-6')
+                            ui.label('An order opposite to an open position only reduces or closes it; '
+                                     'a new position in the other direction opens only from flat').classes('text-body2 text-grey-7 ml-6')
                         
-                        ui.separator().classes('my-4')
+                        ui.separator().classes('my-4 bm-sec-sep')
                         
                         # Automatic trading settings
-                        ui.label('Automatic Trading:').classes('text-subtitle2 mb-2')
-                        ui.label('Configure automatic trading permissions for this expert:').classes('text-body2 mb-2')
+                        with phone_section('Automatic Trading'):
+                            ui.label('Automatic Trading:').classes('text-subtitle2 mb-2 bm-sec-title')
+                            ui.label('Configure automatic trading permissions for this expert:').classes('text-body2 mb-2 bm-sec-intro')
                         
-                        with ui.column().classes('w-full gap-2'):
-                            self.allow_automated_trade_opening_checkbox = ui.checkbox(
-                                'Allow automated trade opening', 
-                                value=_builtin_default('allow_automated_trade_opening')
-                            )
-                            ui.label('Allows the expert to automatically open new trading positions').classes('text-body2 text-grey-7 ml-6')
+                            with ui.column().classes('w-full gap-2'):
+                                self.allow_automated_trade_opening_checkbox = ui.checkbox(
+                                    'Allow automated trade opening', 
+                                    value=_builtin_default('allow_automated_trade_opening')
+                                )
+                                ui.label('Allows the expert to automatically open new trading positions').classes('text-body2 text-grey-7 ml-6')
                             
-                            self.allow_automated_trade_modification_checkbox = ui.checkbox(
-                                'Allow automated trade modification/closing', 
-                                value=_builtin_default('allow_automated_trade_modification')
-                            )
-                            ui.label('Allows the expert to automatically modify or close existing positions').classes('text-body2 text-grey-7 ml-6')
+                                self.allow_automated_trade_modification_checkbox = ui.checkbox(
+                                    'Allow automated trade modification/closing', 
+                                    value=_builtin_default('allow_automated_trade_modification')
+                                )
+                                ui.label('Allows the expert to automatically modify or close existing positions').classes('text-body2 text-grey-7 ml-6')
                         
                         # Position sizing section - always visible for all experts
                         with ui.column().classes('w-full'):
-                            ui.separator().classes('my-4')
+                            ui.separator().classes('my-4 bm-sec-sep')
 
-                            ui.label('Position Sizing:').classes('text-subtitle2 mb-2')
-                            ui.label('Configure position sizing parameters for this expert:').classes('text-body2 mb-2')
+                            with phone_section('Position Sizing'):
+                                ui.label('Position Sizing:').classes('text-subtitle2 mb-2 bm-sec-title')
+                                ui.label('Configure position sizing parameters for this expert:').classes('text-body2 mb-2 bm-sec-intro')
 
-                            with ui.column().classes('w-full gap-2'):
-                                # Max Virtual Equity Per Instrument
-                                with ui.row().classes('items-center gap-2'):
-                                    ui.label('Max equity per instrument (%):').classes('text-sm font-medium')
-                                    self.max_virtual_equity_per_instrument_input = ui.input(
-                                        value=str(_builtin_default('max_virtual_equity_per_instrument_percent')),
-                                        placeholder=str(_builtin_default('max_virtual_equity_per_instrument_percent'))
-                                    ).classes('w-20')
-                                    ui.label('%').classes('text-sm')
-                                ui.label('Maximum percentage of virtual trading balance that can be allocated to a single instrument. Recommended: 5-15%.').classes('text-body2 text-grey-7 ml-2')
-
-                                # Min Available Balance Percentage
-                                with ui.row().classes('items-center gap-2 mt-2'):
-                                    ui.label('Min balance for new positions (%):').classes('text-sm font-medium')
-                                    self.min_available_balance_pct_input = ui.input(
-                                        value=str(_builtin_default('min_available_balance_pct')),
-                                        placeholder=str(_builtin_default('min_available_balance_pct'))
-                                    ).classes('w-20')
-                                    ui.label('%').classes('text-sm')
-                                ui.label('Minimum available balance percentage required to enter new market positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management.').classes('text-body2 text-grey-7 ml-2')
-
-                                # Fractional shares (builtin, default off)
-                                self.allow_fractional_shares_checkbox = ui.checkbox(
-                                    'Allow fractional shares',
-                                    value=_builtin_default('allow_fractional_shares')
-                                ).classes('mt-2')
-                                ui.label('Size in fractional shares for symbols the broker marks fractionable. '
-                                         'Ignored (with a log warning) whenever the expert arms protective '
-                                         'orders, because brokers do not accept a fractional OCO/TP/SL: the '
-                                         'classic risk manager always attaches a stop, so it always sizes '
-                                         'whole shares; FactorRanker applies it only when risk per trade is 0 '
-                                         '(its resting stop off).').classes('text-body2 text-grey-7 ml-2')
-
-                                # Risk-based (ATR) sizing builtins - visible/editable for every expert.
-                                # Pull defaults/descriptions/valid_values from the builtin definitions.
-                                from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
-                                MarketExpertInterface._ensure_builtin_settings()
-
-                                sizing_mode_def = MarketExpertInterface._builtin_settings.get('sizing_mode', {})
-                                sizing_mode_default = _builtin_default('sizing_mode')
-                                sizing_mode_values = sizing_mode_def.get('valid_values', ['notional', 'risk_atr'])
-
-                                risk_per_trade_pct_default = _builtin_default('risk_per_trade_pct')
-
-                                atr_multiplier_default = _builtin_default('atr_multiplier')
-
-                                atr_period_default = _builtin_default('atr_period')
-
-                                min_stop_loss_pct_default = _builtin_default('min_stop_loss_pct')
-
-                                # Sizing mode select - always shown
-                                with ui.row().classes('items-center gap-2 mt-2'):
-                                    ui.label('Sizing mode:').classes('text-sm font-medium')
-                                    self.sizing_mode_select = ui.select(
-                                        options={v: v for v in sizing_mode_values},
-                                        value=sizing_mode_default,
-                                        on_change=lambda e: self.risk_atr_settings_container.set_visibility(e.value == 'risk_atr')
-                                    ).classes('w-40')
-                                ui.label(sizing_mode_def.get('description', 'How position size is computed')).classes('text-body2 text-grey-7 ml-2')
-
-                                # risk_atr knobs - only visible when sizing_mode == risk_atr
-                                with ui.column().classes('w-full gap-2') as self.risk_atr_settings_container:
-                                    with ui.row().classes('items-center gap-2 mt-2'):
-                                        ui.label('Risk per trade (%):').classes('text-sm font-medium')
-                                        self.risk_per_trade_pct_input = ui.input(
-                                            value=str(risk_per_trade_pct_default),
-                                            placeholder=str(risk_per_trade_pct_default)
+                                with ui.column().classes('w-full gap-2'):
+                                    # Max Virtual Equity Per Instrument
+                                    with ui.row().classes('items-center gap-2'):
+                                        ui.label('Max equity per instrument (%):').classes('text-sm font-medium')
+                                        self.max_virtual_equity_per_instrument_input = ui.input(
+                                            value=str(_builtin_default('max_virtual_equity_per_instrument_percent')),
+                                            placeholder=str(_builtin_default('max_virtual_equity_per_instrument_percent'))
                                         ).classes('w-20')
                                         ui.label('%').classes('text-sm')
+                                    ui.label('Maximum percentage of virtual trading balance that can be allocated to a single instrument. Recommended: 5-15%.').classes('text-body2 text-grey-7 ml-2')
 
+                                    # Min Available Balance Percentage
                                     with ui.row().classes('items-center gap-2 mt-2'):
-                                        ui.label('ATR multiplier:').classes('text-sm font-medium')
-                                        self.atr_multiplier_input = ui.input(
-                                            value=str(atr_multiplier_default),
-                                            placeholder=str(atr_multiplier_default)
-                                        ).classes('w-20')
-
-                                    with ui.row().classes('items-center gap-2 mt-2'):
-                                        ui.label('ATR period (bars):').classes('text-sm font-medium')
-                                        self.atr_period_input = ui.input(
-                                            value=str(atr_period_default),
-                                            placeholder=str(atr_period_default)
-                                        ).classes('w-20')
-
-                                    with ui.row().classes('items-center gap-2 mt-2'):
-                                        ui.label('Min stop loss (%):').classes('text-sm font-medium')
-                                        self.min_stop_loss_pct_input = ui.input(
-                                            value=str(min_stop_loss_pct_default),
-                                            placeholder=str(min_stop_loss_pct_default)
+                                        ui.label('Min balance for new positions (%):').classes('text-sm font-medium')
+                                        self.min_available_balance_pct_input = ui.input(
+                                            value=str(_builtin_default('min_available_balance_pct')),
+                                            placeholder=str(_builtin_default('min_available_balance_pct'))
                                         ).classes('w-20')
                                         ui.label('%').classes('text-sm')
+                                    ui.label('Minimum available balance percentage required to enter new market positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management.').classes('text-body2 text-grey-7 ml-2')
 
-                                    ui.label('Risk-based sizing: quantity = (equity × risk_per_trade_pct%) ÷ stop-distance-per-share. risk_per_trade_pct is the $ budget (max % of EQUITY to lose per trade). The stop distance is |entry − stop| when an SL is known, else atr_multiplier × ATR. min_stop_loss_pct floors the stop distance (as % of price) so a tiny ATR can\'t oversize the lot. Only used when sizing_mode = risk_atr.').classes('text-body2 text-grey-7 ml-2')
+                                    # Fractional shares (builtin, default off)
+                                    self.allow_fractional_shares_checkbox = ui.checkbox(
+                                        'Allow fractional shares',
+                                        value=_builtin_default('allow_fractional_shares')
+                                    ).classes('mt-2')
+                                    ui.label('Size in fractional shares for symbols the broker marks fractionable. '
+                                             'Ignored (with a log warning) whenever the expert arms protective '
+                                             'orders, because brokers do not accept a fractional OCO/TP/SL: the '
+                                             'classic risk manager always attaches a stop, so it always sizes '
+                                             'whole shares; FactorRanker applies it only when risk per trade is 0 '
+                                             '(its resting stop off).').classes('text-body2 text-grey-7 ml-2')
 
-                                # Set initial visibility based on the default; load handler updates it when editing.
-                                self.risk_atr_settings_container.set_visibility(sizing_mode_default == 'risk_atr')
+                                    # Risk-based (ATR) sizing builtins - visible/editable for every expert.
+                                    # Pull defaults/descriptions/valid_values from the builtin definitions.
+                                    from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+                                    MarketExpertInterface._ensure_builtin_settings()
+
+                                    sizing_mode_def = MarketExpertInterface._builtin_settings.get('sizing_mode', {})
+                                    sizing_mode_default = _builtin_default('sizing_mode')
+                                    sizing_mode_values = sizing_mode_def.get('valid_values', ['notional', 'risk_atr'])
+
+                                    risk_per_trade_pct_default = _builtin_default('risk_per_trade_pct')
+
+                                    atr_multiplier_default = _builtin_default('atr_multiplier')
+
+                                    atr_period_default = _builtin_default('atr_period')
+
+                                    min_stop_loss_pct_default = _builtin_default('min_stop_loss_pct')
+
+                                    # Sizing mode select - always shown
+                                    with ui.row().classes('items-center gap-2 mt-2'):
+                                        ui.label('Sizing mode:').classes('text-sm font-medium')
+                                        self.sizing_mode_select = ui.select(
+                                            options={v: v for v in sizing_mode_values},
+                                            value=sizing_mode_default,
+                                            on_change=lambda e: self.risk_atr_settings_container.set_visibility(e.value == 'risk_atr')
+                                        ).classes('w-40')
+                                    ui.label(sizing_mode_def.get('description', 'How position size is computed')).classes('text-body2 text-grey-7 ml-2')
+
+                                    # risk_atr knobs - only visible when sizing_mode == risk_atr
+                                    with ui.column().classes('w-full gap-2') as self.risk_atr_settings_container:
+                                        with ui.row().classes('items-center gap-2 mt-2'):
+                                            ui.label('Risk per trade (%):').classes('text-sm font-medium')
+                                            self.risk_per_trade_pct_input = ui.input(
+                                                value=str(risk_per_trade_pct_default),
+                                                placeholder=str(risk_per_trade_pct_default)
+                                            ).classes('w-20')
+                                            ui.label('%').classes('text-sm')
+
+                                        with ui.row().classes('items-center gap-2 mt-2'):
+                                            ui.label('ATR multiplier:').classes('text-sm font-medium')
+                                            self.atr_multiplier_input = ui.input(
+                                                value=str(atr_multiplier_default),
+                                                placeholder=str(atr_multiplier_default)
+                                            ).classes('w-20')
+
+                                        with ui.row().classes('items-center gap-2 mt-2'):
+                                            ui.label('ATR period (bars):').classes('text-sm font-medium')
+                                            self.atr_period_input = ui.input(
+                                                value=str(atr_period_default),
+                                                placeholder=str(atr_period_default)
+                                            ).classes('w-20')
+
+                                        with ui.row().classes('items-center gap-2 mt-2'):
+                                            ui.label('Min stop loss (%):').classes('text-sm font-medium')
+                                            self.min_stop_loss_pct_input = ui.input(
+                                                value=str(min_stop_loss_pct_default),
+                                                placeholder=str(min_stop_loss_pct_default)
+                                            ).classes('w-20')
+                                            ui.label('%').classes('text-sm')
+
+                                        ui.label('Risk-based sizing: quantity = (equity × risk_per_trade_pct%) ÷ stop-distance-per-share. risk_per_trade_pct is the $ budget (max % of EQUITY to lose per trade). The stop distance is |entry − stop| when an SL is known, else atr_multiplier × ATR. min_stop_loss_pct floors the stop distance (as % of price) so a tiny ATR can\'t oversize the lot. Only used when sizing_mode = risk_atr.').classes('text-body2 text-grey-7 ml-2')
+
+                                    # Set initial visibility based on the default; load handler updates it when editing.
+                                    self.risk_atr_settings_container.set_visibility(sizing_mode_default == 'risk_atr')
 
                         # Risk manager section - hidden for experts that manage their own risk
                         with ui.column().classes('w-full') as self.risk_manager_section:
-                            ui.separator().classes('my-4')
+                            ui.separator().classes('my-4 bm-sec-sep')
 
                             # AI Model Settings
-                            ui.label('AI Model Settings:').classes('text-subtitle2 mb-2')
-                            ui.label('Configure AI models used by this expert for various tasks:').classes('text-body2 mb-2')
+                            with phone_section('AI Model Settings'):
+                                ui.label('AI Model Settings:').classes('text-subtitle2 mb-2 bm-sec-title')
+                                ui.label('Configure AI models used by this expert for various tasks:').classes('text-body2 mb-2 bm-sec-intro')
 
-                            # Get model options from builtin settings definitions for defaults/descriptions
-                            from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
-                            MarketExpertInterface._ensure_builtin_settings()
+                                # Get model options from builtin settings definitions for defaults/descriptions
+                                from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+                                MarketExpertInterface._ensure_builtin_settings()
 
-                            risk_manager_model_def = MarketExpertInterface._builtin_settings.get('risk_manager_model', {})
-                            risk_manager_model_default = _builtin_default('risk_manager_model')
-                            risk_manager_model_help = risk_manager_model_def.get('description', 'AI model used for risk management analysis and decision-making')
+                                risk_manager_model_def = MarketExpertInterface._builtin_settings.get('risk_manager_model', {})
+                                risk_manager_model_default = _builtin_default('risk_manager_model')
+                                risk_manager_model_help = risk_manager_model_def.get('description', 'AI model used for risk management analysis and decision-making')
 
-                            dynamic_model_def = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {})
-                            dynamic_model_default = _builtin_default('dynamic_instrument_selection_model')
-                            dynamic_model_help = dynamic_model_def.get('description', 'AI model used for dynamically selecting trading instruments based on market conditions')
+                                dynamic_model_def = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {})
+                                dynamic_model_default = _builtin_default('dynamic_instrument_selection_model')
+                                dynamic_model_help = dynamic_model_def.get('description', 'AI model used for dynamically selecting trading instruments based on market conditions')
 
-                            # Import the ModelSelectorInput component and labels
-                            from ..components.ModelSelector import ModelSelectorInput
-                            from ...core.models_registry import LABEL_WEBSEARCH
+                                # Import the ModelSelectorInput component and labels
+                                from ..components.ModelSelector import ModelSelectorInput
+                                from ...core.models_registry import LABEL_WEBSEARCH
 
-                            with ui.column().classes('w-full gap-2'):
-                                # Risk Manager Model - using ModelSelectorInput
-                                self.risk_manager_model_input = ModelSelectorInput(
-                                    label='Risk Manager Model',
-                                    value=risk_manager_model_default,
-                                    default_provider='nagaai',
-                                    help_text=risk_manager_model_help
-                                )
-                                self.risk_manager_model_input.render()
+                                with ui.column().classes('w-full gap-2'):
+                                    # Risk Manager Model - using ModelSelectorInput
+                                    self.risk_manager_model_input = ModelSelectorInput(
+                                        label='Risk Manager Model',
+                                        value=risk_manager_model_default,
+                                        default_provider='nagaai',
+                                        help_text=risk_manager_model_help
+                                    )
+                                    self.risk_manager_model_input.render()
 
-                                # Dynamic Instrument Selection Model - REQUIRES web search capability
-                                self.dynamic_instrument_selection_model_input = ModelSelectorInput(
-                                    label='Dynamic Instrument Selection Model',
-                                    value=dynamic_model_default,
-                                    default_provider='nagaai',
-                                    help_text=dynamic_model_help + ' (Only models with web search capability are shown)',
-                                    required_labels=[LABEL_WEBSEARCH]  # Only show models with websearch label
-                                )
-                                self.dynamic_instrument_selection_model_input.render()
+                                    # Dynamic Instrument Selection Model - REQUIRES web search capability
+                                    self.dynamic_instrument_selection_model_input = ModelSelectorInput(
+                                        label='Dynamic Instrument Selection Model',
+                                        value=dynamic_model_default,
+                                        default_provider='nagaai',
+                                        help_text=dynamic_model_help + ' (Only models with web search capability are shown)',
+                                        required_labels=[LABEL_WEBSEARCH]  # Only show models with websearch label
+                                    )
+                                    self.dynamic_instrument_selection_model_input.render()
 
-                            ui.separator().classes('my-4')
+                            ui.separator().classes('my-4 bm-sec-sep')
 
                             # Risk Manager Mode
-                            ui.label('Risk Manager Mode:').classes('text-subtitle2 mb-2')
-                            ui.label('Select how risk management decisions are made:').classes('text-body2 mb-2')
+                            with phone_section('Risk Manager Mode'):
+                                ui.label('Risk Manager Mode:').classes('text-subtitle2 mb-2 bm-sec-title')
+                                ui.label('Select how risk management decisions are made:').classes('text-body2 mb-2 bm-sec-intro')
 
-                            with ui.column().classes('w-full gap-2'):
-                                # Options = the DECLARED modes (a hand list lacked classic_options,
-                                # which then showed blank and silent).
-                                _rm_labels = {'classic': 'Classic (Rules)', 'smart': 'Smart (Agentic)'}
-                                self.risk_manager_mode_select = ui.select(
-                                    options={mode: _rm_labels.get(mode, mode.replace('_', ' ').title())
-                                             for mode in MarketExpertInterface._builtin_settings[
-                                                 'risk_manager_mode']['valid_values']},
-                                    label='Risk Management Mode',
-                                    value=_builtin_default('risk_manager_mode')
-                                ).classes('w-full')
-                                ui.label('Classic: Rule-based risk management using automation rulesets. Smart: AI-powered agentic risk management.').classes('text-body2 text-grey-7 ml-2')
+                                with ui.column().classes('w-full gap-2'):
+                                    # Options = the DECLARED modes (a hand list lacked classic_options,
+                                    # which then showed blank and silent).
+                                    _rm_labels = {'classic': 'Classic (Rules)', 'smart': 'Smart (Agentic)'}
+                                    self.risk_manager_mode_select = ui.select(
+                                        options={mode: _rm_labels.get(mode, mode.replace('_', ' ').title())
+                                                 for mode in MarketExpertInterface._builtin_settings[
+                                                     'risk_manager_mode']['valid_values']},
+                                        label='Risk Management Mode',
+                                        value=_builtin_default('risk_manager_mode')
+                                    ).classes('w-full')
+                                    ui.label('Classic: Rule-based risk management using automation rulesets. Smart: AI-powered agentic risk management.').classes('text-body2 text-grey-7 ml-2')
 
-                                # Smart Risk Manager User Instructions
-                                ui.label('Smart Risk Manager User Instructions:').classes('text-sm font-medium mt-2')
-                                self.smart_risk_manager_user_instructions_input = ui.textarea(
-                                    label='Instructions for Smart Risk Manager',
-                                    value=_builtin_default('smart_risk_manager_user_instructions'),
-                                    placeholder='Enter your risk management strategy instructions...'
-                                ).props('stack-label rows=3').classes('w-full')
-                                ui.label('Provide high-level instructions to guide the smart risk manager when in Smart mode (e.g., focus areas, risk tolerance, time horizon)').classes('text-body2 text-grey-7 ml-2')
+                                    # Smart Risk Manager User Instructions
+                                    ui.label('Smart Risk Manager User Instructions:').classes('text-sm font-medium mt-2')
+                                    self.smart_risk_manager_user_instructions_input = ui.textarea(
+                                        label='Instructions for Smart Risk Manager',
+                                        value=_builtin_default('smart_risk_manager_user_instructions'),
+                                        placeholder='Enter your risk management strategy instructions...'
+                                    ).props('stack-label rows=3').classes('w-full')
+                                    ui.label('Provide high-level instructions to guide the smart risk manager when in Smart mode (e.g., focus areas, risk tolerance, time horizon)').classes('text-body2 text-grey-7 ml-2')
 
-                                # Smart Risk Manager Max Iterations
-                                ui.label('Smart Risk Manager Max Iterations:').classes('text-sm font-medium mt-2')
-                                self.smart_risk_manager_max_iterations_input = ui.number(
-                                    label='Maximum Iterations',
-                                    value=_builtin_default('smart_risk_manager_max_iterations'),
-                                    min=1,
-                                    max=50,
-                                    step=1
-                                ).classes('w-full')
-                                ui.label('Maximum number of analysis cycles the smart risk manager can perform. Higher values allow more thorough analysis but take longer. Recommended: 5-15.').classes('text-body2 text-grey-7 ml-2')
+                                    # Smart Risk Manager Max Iterations
+                                    ui.label('Smart Risk Manager Max Iterations:').classes('text-sm font-medium mt-2')
+                                    self.smart_risk_manager_max_iterations_input = ui.number(
+                                        label='Maximum Iterations',
+                                        value=_builtin_default('smart_risk_manager_max_iterations'),
+                                        min=1,
+                                        max=50,
+                                        step=1
+                                    ).classes('w-full')
+                                    ui.label('Maximum number of analysis cycles the smart risk manager can perform. Higher values allow more thorough analysis but take longer. Recommended: 5-15.').classes('text-body2 text-grey-7 ml-2')
 
-                                # Smart Risk Manager Analysis Window (hours)
-                                ui.label('Analysis Window (hours):').classes('text-sm font-medium mt-2')
-                                self.smart_risk_manager_analysis_window_hours_input = ui.number(
-                                    label='Analysis Discovery Window (hours)',
-                                    value=_builtin_default('smart_risk_manager_analysis_window_hours'),
-                                    min=1,
-                                    max=168,
-                                    step=1
-                                ).classes('w-full')
-                                ui.label('How far back the risk manager looks for analyses when deciding which symbols are tradable to OPEN. Lower it for a more frequent/intraday trader. The agent can still pull older analyses for context. (Screener experts keep a 24h execution floor.)').classes('text-body2 text-grey-7 ml-2')
+                                    # Smart Risk Manager Analysis Window (hours)
+                                    ui.label('Analysis Window (hours):').classes('text-sm font-medium mt-2')
+                                    self.smart_risk_manager_analysis_window_hours_input = ui.number(
+                                        label='Analysis Discovery Window (hours)',
+                                        value=_builtin_default('smart_risk_manager_analysis_window_hours'),
+                                        min=1,
+                                        max=168,
+                                        step=1
+                                    ).classes('w-full')
+                                    ui.label('How far back the risk manager looks for analyses when deciding which symbols are tradable to OPEN. Lower it for a more frequent/intraday trader. The agent can still pull older analyses for context. (Screener experts keep a 24h execution floor.)').classes('text-body2 text-grey-7 ml-2')
 
-                            ui.separator().classes('my-4')
+                            ui.separator().classes('my-4 bm-sec-sep')
                         
                         # Ruleset assignment settings
-                        ui.label('Automation Rulesets:').classes('text-subtitle2 mb-2')
-                        ui.label('Assign rulesets to control automated trading behavior:').classes('text-body2 mb-2')
+                        with phone_section('Automation Rulesets'):
+                            ui.label('Automation Rulesets:').classes('text-subtitle2 mb-2 bm-sec-title')
+                            ui.label('Assign rulesets to control automated trading behavior:').classes('text-body2 mb-2 bm-sec-intro')
                         
-                        with ui.column().classes('w-full gap-2'):
-                            # Enter Market Ruleset
-                            enter_market_rulesets_list, self.enter_market_ruleset_map = self._get_rulesets_list_by_use_case('enter_market')
-                            self.enter_market_ruleset_select = ui.select(
-                                options=enter_market_rulesets_list,
-                                label='Enter Market Ruleset',
-                                with_input=True,
-                                clearable=True
-                            ).classes('w-full')
-                            ui.label('Ruleset to evaluate when creating new positions from expert recommendations').classes('text-body2 text-grey-7 ml-2')
+                            with ui.column().classes('w-full gap-2'):
+                                # Enter Market Ruleset
+                                enter_market_rulesets_list, self.enter_market_ruleset_map = self._get_rulesets_list_by_use_case('enter_market')
+                                self.enter_market_ruleset_select = ui.select(
+                                    options=enter_market_rulesets_list,
+                                    label='Enter Market Ruleset',
+                                    with_input=True,
+                                    clearable=True
+                                ).classes('w-full')
+                                ui.label('Ruleset to evaluate when creating new positions from expert recommendations').classes('text-body2 text-grey-7 ml-2')
                             
-                            # Open Positions Ruleset
-                            open_positions_rulesets_list, self.open_positions_ruleset_map = self._get_rulesets_list_by_use_case('open_positions')
-                            self.open_positions_ruleset_select = ui.select(
-                                options=open_positions_rulesets_list,
-                                label='Open Positions Ruleset',
-                                with_input=True,
-                                clearable=True
-                            ).classes('w-full')
-                            ui.label('Ruleset to evaluate when managing existing open positions').classes('text-body2 text-grey-7 ml-2')
+                                # Open Positions Ruleset
+                                open_positions_rulesets_list, self.open_positions_ruleset_map = self._get_rulesets_list_by_use_case('open_positions')
+                                self.open_positions_ruleset_select = ui.select(
+                                    options=open_positions_rulesets_list,
+                                    label='Open Positions Ruleset',
+                                    with_input=True,
+                                    clearable=True
+                                ).classes('w-full')
+                                ui.label('Ruleset to evaluate when managing existing open positions').classes('text-body2 text-grey-7 ml-2')
 
-                            # MARKET-CONDITION PROFILE. Rendered HERE, with the rulesets, because
-                            # it is the data supply for the enter-market ruleset's market gates --
-                            # the two are one strategy and saving them apart is what
-                            # _refuse_unserved_market_gates below refuses. It is a BUILTIN setting
-                            # (MarketExpertInterface), and this dialog's Expert Settings tab
-                            # renders only expert-SPECIFIC definitions, so it needs its own widget.
-                            # MULTI-select: the setting is a comma list and a strategy may gate on
-                            # fields from several profiles at once (e.g. ohlcv-v1 + ta-structure-v1).
-                            # Nothing selected = MARKET_CONDITION_PROFILE_OFF (no data served).
-                            self.market_condition_profile_select = ui.select(
-                                options=self._market_condition_profile_options(),
-                                label='Market-Condition Profile(s)',
-                                value=[],
-                                multiple=True,
-                                clearable=True,
-                            ).classes('w-full').props('use-chips')
-                            # A NEW instance has no stored value to read, so the widget IS the
-                            # operator's input and is saveable from the start. The edit branch
-                            # below clears this if it cannot read what is stored.
-                            self._market_condition_profile_loaded = True
-                            ui.label('Market-condition profile(s) the enter-market ruleset may gate on. '
-                                     'Empty serves no market-condition data: a ruleset with a market '
-                                     'gate then cannot enter, and saving that combination is refused.'
-                                     ).classes('text-body2 text-grey-7 ml-2')
+                                # MARKET-CONDITION PROFILE. Rendered HERE, with the rulesets, because
+                                # it is the data supply for the enter-market ruleset's market gates --
+                                # the two are one strategy and saving them apart is what
+                                # _refuse_unserved_market_gates below refuses. It is a BUILTIN setting
+                                # (MarketExpertInterface), and this dialog's Expert Settings tab
+                                # renders only expert-SPECIFIC definitions, so it needs its own widget.
+                                # MULTI-select: the setting is a comma list and a strategy may gate on
+                                # fields from several profiles at once (e.g. ohlcv-v1 + ta-structure-v1).
+                                # Nothing selected = MARKET_CONDITION_PROFILE_OFF (no data served).
+                                self.market_condition_profile_select = ui.select(
+                                    options=self._market_condition_profile_options(),
+                                    label='Market-Condition Profile(s)',
+                                    value=[],
+                                    multiple=True,
+                                    clearable=True,
+                                ).classes('w-full').props('use-chips')
+                                # A NEW instance has no stored value to read, so the widget IS the
+                                # operator's input and is saveable from the start. The edit branch
+                                # below clears this if it cannot read what is stored.
+                                self._market_condition_profile_loaded = True
+                                ui.label('Market-condition profile(s) the enter-market ruleset may gate on. '
+                                         'Empty serves no market-condition data: a ruleset with a market '
+                                         'gate then cannot enter, and saving that combination is refused.'
+                                         ).classes('text-body2 text-grey-7 ml-2')
 
                     # Instruments tab
                     with ui.tab_panel('Instruments').style('display: flex; flex-direction: column; flex: 1; overflow: hidden'):
@@ -2542,7 +2575,7 @@ class ExpertSettingsTab:
                     self._load_general_settings(expert_instance)
 
                 # Save button
-                with ui.row().classes('w-full justify-end mt-4'):
+                with ui.row().classes('w-full justify-end mt-4 ' + FOOT_CLASS):
                     ui.button('Cancel', on_click=self.dialog.close).props('flat')
                     self._save_button = ui.button('Save', on_click=lambda: self._save_expert(expert_instance))
                     self._refresh_save_button()
@@ -3646,7 +3679,7 @@ class ExpertSettingsTab:
                     tooltip_text = meta.get("tooltip")
 
                     # 3-column grid: label / input / reset-default button
-                    setting_container = ui.element('div').classes('w-full mb-2').style(
+                    setting_container = ui.element('div').classes('w-full mb-2 bm-setgrid').style(
                         'display: grid; grid-template-columns: 55% 38% 7%; align-items: center; gap: 8px'
                     )
                     with setting_container:
@@ -3970,7 +4003,7 @@ class ExpertSettingsTab:
                     ui_editor_type = meta.get("ui_editor_type")  # Custom UI editor type
                     
                     # 3-column grid: 55% label / 38% input / 7% reset-default button
-                    setting_container = ui.element('div').classes('w-full mb-2').style(
+                    setting_container = ui.element('div').classes('w-full mb-2 bm-setgrid').style(
                         'display: grid; grid-template-columns: 55% 38% 7%; align-items: center; gap: 8px'
                     )
                     with setting_container:
@@ -8532,6 +8565,14 @@ def content() -> None:
     render_timer = PerfLogger.start(PerfLogger.PAGE, PerfLogger.RENDER, "Settings")
     logger.debug('Initializing settings page')
 
+    # PHONE LAYER, installed FIRST: NiceGUI drops ui.add_css / ui.add_head_html made after a
+    # page's first await (this function has none; tests/test_settings_phone_css_before_await.py
+    # pins it). The registry flips the expert list between table and cards on a breakpoint
+    # crossing.
+    ui.add_css(phone_css())
+    phone_tables = PhoneTableRegistry()
+    install_phone_listener(phone_tables, ui.add_head_html, ui.on)
+
     # Tab configuration: (tab_name, tab_label)
     tab_config = [
         ('global', 'Global Settings'),
@@ -8555,7 +8596,7 @@ def content() -> None:
         with ui.tab_panel(tab_objects['account']):
             AccountDefinitionsTab()
         with ui.tab_panel(tab_objects['expert']):
-            ExpertSettingsTab()
+            ExpertSettingsTab(phone_tables)
         with ui.tab_panel(tab_objects['trade']):
             TradeSettingsTab()
         with ui.tab_panel(tab_objects['instruments']):
