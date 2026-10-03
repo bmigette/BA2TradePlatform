@@ -1099,6 +1099,13 @@ div[class*="disconnect"] * {
         min-height: 260px !important;
     }
 
+    /* The Overview charts (legend at the bottom, rotated date labels) need more than the
+     * generic 260px to leave a readable plot. */
+    .nicegui-echart.ba2-tall-chart {
+        height: 360px !important;
+        min-height: 360px !important;
+    }
+
     /* The header bar wraps rather than pushing the account balance and the account
      * selector off the right edge. */
     .q-header .q-toolbar,

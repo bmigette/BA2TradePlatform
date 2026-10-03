@@ -157,6 +157,46 @@ def label_series_colors(labels: Sequence[str], palette: Sequence[str],
     return out
 
 
+#: Container width (px) at and below which a chart is laid out for a phone.
+NARROW_CHART_WIDTH = 520
+
+
+def responsive_chart_options(options: dict) -> dict:
+    """``options`` plus an ECharts ``media`` rule for a narrow chart (a phone).
+
+    Decided by the CHART'S OWN WIDTH, client-side, so it also holds in the fullscreen
+    dialog and on rotation, and needs no server-side screen detection. On a narrow chart
+    the legend becomes a one-row scroll legend UNDER the plot (it otherwise wraps over
+    the plot and the y-axis labels) and the grid reserves room for it. Charts without a
+    legend, or already a plain dict from a caller that wants none, pass through.
+    """
+    if not options or 'baseOption' in options:
+        return options
+    narrow = {'grid': {'top': 24, 'bottom': 52, 'containLabel': True}}
+    if options.get('legend'):
+        narrow['legend'] = {'type': 'scroll', 'top': 'bottom', 'left': 'center',
+                            'orient': 'horizontal', 'width': '88%',
+                            'pageTextStyle': {'color': '#a0aec0'},
+                            'pageIconColor': '#a0aec0',
+                            'pageIconInactiveColor': '#4a5568'}
+    else:
+        narrow['grid']['bottom'] = 24
+    return {'baseOption': options,
+            'media': [{'query': {'maxWidth': NARROW_CHART_WIDTH}, 'option': narrow}]}
+
+
+def responsive_echart(options: dict, *, tall: bool = True) -> "ui.echart":
+    """``ui.echart`` with :func:`responsive_chart_options` applied.
+
+    ``tall`` tags the chart ``ba2-tall-chart``: on a phone styles.css gives it a taller
+    minimum than the generic 260px panel height, because a bottom legend plus rotated
+    date labels leave a 260px chart almost no plot. The fullscreen copy opts out."""
+    chart = ui.echart(responsive_chart_options(options))
+    if tall:
+        chart.classes('ba2-tall-chart')
+    return chart
+
+
 def mode_toggle() -> "ui.toggle":
     """The $ / % switch, in the shape the monthly charts already use."""
     return ui.toggle(['$', '%'], value='$').props('dense')
@@ -191,7 +231,7 @@ def fullscreen_button(build_options: Callable[[], dict], *, title: str) -> "ui.b
             # The chart is built INSIDE the open dialog so ECharts initialises into the
             # box it will live in, rather than into a small one it then has to grow out
             # of -- the same reason SymbolInfoPanel builds its chart at render time.
-            ui.echart(options).classes('w-full grow').style('min-height: 0')
+            responsive_echart(options, tall=False).classes('w-full grow').style('min-height: 0')
         dialog.open()
 
     return ui.button(icon='fullscreen', on_click=_open).props('flat round dense') \

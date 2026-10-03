@@ -14,17 +14,23 @@ from ...core.ModelBillingUsage import ModelBillingUsage
 from ...modules.accounts import providers
 from ...logger import logger
 from types import SimpleNamespace
+from datetime import date
 
 from ..utils.chart_helpers import (
     axis_format, fullscreen_button, fullscreen_content_button, grid_options,
     growth_pct_of_invested, label_series_colors, legend_options, mode_toggle,
-    pct_of_invested,
+    pct_of_invested, responsive_echart,
 )
 from ..utils.perf_logger import PerfLogger
 from ..utils.protective_stop import resolve_protective_legs
 from ..utils.growth_label_storage import (
     GROWTH_LABELS_STORAGE_KEY, MONTHLY_PROFIT_LABELS_STORAGE_KEY,
     resolve_growth_labels,
+)
+from ..utils.dividend_forecast import forecast_dividends
+from ..utils.overview_range import (
+    RANGE_OPTIONS, date_in_range, filter_dates, filter_months, read_range,
+    resolve_range_start, write_range, yf_period_for,
 )
 from ..utils.overview_label_scope import (
     CHART_GROWTH, CHART_MONTHLY, CHART_POSITION_LABEL, CHART_POSITION_SYMBOL,
@@ -5195,6 +5201,12 @@ def _build_qty_timeline(current_qty, filled_trades, all_dates, dividends=None):
 
 
 
+def _rgba(hex_color: str, alpha: float) -> str:
+    """``#RRGGBB`` -> ``rgba(r, g, b, alpha)`` (forecast bars: the series colour, see-through)."""
+    h = hex_color.lstrip('#')
+    return f'rgba({int(h[0:2], 16)}, {int(h[2:4], 16)}, {int(h[4:6], 16)}, {alpha})'
+
+
 def _stored_label_colors() -> dict:
     """``{label: stored colour}`` for the selected account, or ``{}``.
 
@@ -5229,6 +5241,12 @@ class AccountGrowthTab:
         self._scope = None
         self._account_ids = []
         self._single_account = None
+        # Page-level time range (DB-persisted, one value for the whole page) and the next
+        # 2 months' dividend forecast (see ui/utils/dividend_forecast.py).
+        self._range = read_range()
+        self._range_start = resolve_range_start(self._range, date.today())
+        self._forecast = {}
+        self._gen = 0
         self.render()
 
     # ------------------------------------------------------------------
@@ -5273,11 +5291,68 @@ class AccountGrowthTab:
         with ui.row().classes('items-center gap-1 mb-2'):
             select = ui.select(options=list(options), value=list(value), label=label,
                                multiple=True).classes(width)
+
+            def _summary(_=None):
+                # A phone shows ~25 characters: a comma list of 18 labels is cut mid-word.
+                # The count says what the list cannot. Quasar's display-value replaces the text.
+                select.props(f'display-value="{len(select.value or [])} of {len(options)} labels"')
+            _summary()
+            select.on_value_change(_summary)
             ui.button('All', on_click=lambda: setattr(select, 'value', select_all(options))
                       ).props('flat dense size=sm').tooltip('Select all')
             ui.button('None', on_click=lambda: setattr(select, 'value', select_none())
                       ).props('flat dense size=sm').tooltip('Select none')
         return select
+
+    def _compute_dividend_forecast(self, all_dividends, all_filled_trades, qty_by_account_symbol):
+        """``{month: {'total': x, 'labels': {label: x}}}`` for the next 2 months.
+
+        Reuses the page's own dividend rows (``get_dividends``) -- no second source.
+        Those rows are TOTALS, so the per-share amount is the row's net amount over the
+        shares held on the payment date (``_build_qty_timeline`` from the account's
+        current quantity and trades, minus the DRIP shares the payment itself bought).
+        Per symbol the accounts' per-share figures are averaged by date; the forecast
+        quantity is the symbol's CURRENT quantity across the accounts in view. A
+        symbol's forecast goes to its labels exactly like its actual dividends.
+        """
+        from collections import defaultdict
+        today = date.today()
+        held = defaultdict(float)                      # symbol -> qty across accounts
+        for (_aid, sym), q in qty_by_account_symbol.items():
+            held[sym] += q
+        rows = defaultdict(list)                       # (account, symbol) -> dividend rows
+        for d in all_dividends or []:
+            sym = d.get('symbol')
+            if sym and held.get(sym, 0) > 0 and d.get('date'):
+                rows[(d.get('account_id'), sym)].append(d)
+        per_share = defaultdict(lambda: defaultdict(list))   # symbol -> date -> [per-share by account]
+        for (aid, sym), divs in rows.items():
+            dates = sorted({(r['date'].strftime('%Y-%m-%d') if hasattr(r['date'], 'strftime')
+                             else str(r['date'])[:10]) for r in divs})
+            trades = [t for t in (all_filled_trades or [])
+                      if t.get('symbol') == sym and t.get('account_id') == aid]
+            qty_by_date, _ = _build_qty_timeline(
+                qty_by_account_symbol.get((aid, sym), 0.0), trades, dates, dividends=divs)
+            per_acct_date = defaultdict(float)
+            for r in divs:
+                ds = (r['date'].strftime('%Y-%m-%d') if hasattr(r['date'], 'strftime')
+                      else str(r['date'])[:10])
+                q = qty_by_date.get(ds, 0) - float(r.get('drip_quantity') or 0)
+                if q > 0:
+                    per_acct_date[ds] += float(r.get('amount') or 0) / q
+            for ds, v in per_acct_date.items():
+                per_share[sym][ds].append(v)
+        labels_by_symbol = get_labels_by_symbol(sorted(per_share)) if per_share else {}
+        out = {}
+        for sym, by_date in per_share.items():
+            history = [(date.fromisoformat(ds), sum(v) / len(v)) for ds, v in by_date.items()]
+            for ev in forecast_dividends(history, held[sym], today, months=2):
+                month = ev['date'].strftime('%Y-%m')
+                slot = out.setdefault(month, {'total': 0.0, 'labels': {}})
+                slot['total'] += ev['amount']
+                for lb in (labels_by_symbol.get(normalize_symbol(sym)) or ['Unlabeled']):
+                    slot['labels'][lb] = slot['labels'].get(lb, 0.0) + ev['amount']
+        return out
 
     def _compute_scope_inputs(self, target_accounts, filled_trades, dividends, positions_by_account):
         """Per account: traded labels (reusing get_labels_by_symbol, the derivation the label
@@ -5341,9 +5416,16 @@ class AccountGrowthTab:
                     ui.label(', '.join(self._scope or []) or '(none)').classes('text-sm')
                     return
                 st = state[single]
-                with ui.row().classes('items-center gap-2'):
-                    select = ui.select(options=options, value=list(self._scope or []),
-                                       label='Labels in scope', multiple=True).classes('w-96')
+                # A column that wraps: on a phone a 24rem select plus a switch in one row
+                # overflowed the card and scrolled sideways.
+                select = ui.select(options=options, value=list(self._scope or []),
+                                   label='Labels in scope', multiple=True).classes('w-full sm:w-96')
+
+                def _summary(_=None):
+                    select.props(f'display-value="{len(select.value or [])} of {len(options)} labels"')
+                _summary()
+                select.on_value_change(_summary)
+                with ui.row().classes('w-full items-center gap-2 flex-wrap'):
                     all_btn = ui.button('All', on_click=lambda: setattr(select, 'value', select_all(options))
                                         ).props('flat dense size=sm')
                     none_btn = ui.button('None', on_click=lambda: setattr(select, 'value', select_none())
@@ -5403,14 +5485,37 @@ class AccountGrowthTab:
             ui.label('Account Growth').classes('text-lg font-bold mb-2')
             ui.label('Track portfolio value, dividend income, and per-position growth over time. Price data from Yahoo Finance.').classes('text-sm text-gray-500 mb-4')
 
+            # ONE time range for every chart on the page (persisted in the DB).
+            with ui.row().classes('w-full items-center gap-2 mb-2'):
+                ui.label('Time range').classes('text-sm text-gray-500')
+                range_toggle = ui.toggle(RANGE_OPTIONS, value=self._range).props('dense no-caps')
+                range_toggle.tooltip(
+                    'Applies to every chart on this page. Cumulative lines (dividends, '
+                    'invested, P&L %) are rebased to start at the range start; the monthly '
+                    'bars show the months in range plus the next 2 months of dividend forecast.')
+
             # Loading state
             loading_label = ui.label('Loading account growth data...').classes('text-sm text-gray-500')
             charts_container = ui.column().classes('w-full')
 
+            def on_range_change(e):
+                if e.value not in RANGE_OPTIONS or e.value == self._range:
+                    return
+                write_range(e.value)
+                self._range = e.value
+                self._range_start = resolve_range_start(e.value, date.today())
+                charts_container.clear()
+                with charts_container:
+                    reloading = ui.label('Reloading for the new range...').classes('text-sm text-gray-500')
+                asyncio.create_task(self._load_growth_data(reloading, charts_container, selected_account_id))
+
+            range_toggle.on_value_change(on_range_change)
             asyncio.create_task(self._load_growth_data(loading_label, charts_container, selected_account_id))
 
     async def _load_growth_data(self, loading_label, charts_container, selected_account_id):
         """Load all growth data asynchronously."""
+        self._gen += 1
+        gen = self._gen
         try:
             accounts = get_all_instances(AccountDefinition)
             if not accounts:
@@ -5477,11 +5582,14 @@ class AccountGrowthTab:
             all_positions = []
             account_map = {}  # symbol -> account instance
             positions_by_account = {}  # account id -> symbols held (label-scope default)
+            qty_by_account_symbol = {}  # (account id, symbol) -> qty (dividend forecast)
             for acc_def, account_instance in target_accounts:
                 try:
                     positions = await asyncio.to_thread(account_instance.get_positions)
                     for pos in positions:
                         positions_by_account.setdefault(acc_def.id, set()).add(pos.symbol)
+                        qk = (acc_def.id, pos.symbol)
+                        qty_by_account_symbol[qk] = qty_by_account_symbol.get(qk, 0.0) + float(pos.qty)
                         all_positions.append(pos)
                         account_map[pos.symbol] = account_instance
                 except Exception as e:
@@ -5494,7 +5602,7 @@ class AccountGrowthTab:
                 try:
                     import yfinance as yf
                     hist_data = await asyncio.to_thread(
-                        lambda: yf.download(position_symbols, period='6mo', progress=False, auto_adjust=False)
+                        lambda: yf.download(position_symbols, period=yf_period_for(self._range), progress=False, auto_adjust=False)
                     )
                     for sym in position_symbols:
                         prices = _extract_yf_close_prices(hist_data, sym)
@@ -5527,16 +5635,31 @@ class AccountGrowthTab:
             self._scope = self._effective_scope(scope_state) if scope_state else None
 
             try:
+                self._forecast = await asyncio.to_thread(
+                    self._compute_dividend_forecast, all_dividends, all_filled_trades,
+                    qty_by_account_symbol)
+            except Exception as e:
+                logger.warning(f"Could not compute the dividend forecast: {e}")
+                self._forecast = {}
+
+            if gen != self._gen:
+                return  # a newer load (range changed meanwhile) owns the container
+
+            try:
                 with charts_container:
                     scope_holder = ui.column().classes('w-full')
                     chart_holder = ui.column().classes('w-full')
 
                 def draw_charts():
                     chart_holder.clear()
+                    # The ONE place the range reaches the monthly bars: months before the
+                    # range start drop out (the FIFO/dividend compute above stays on the
+                    # full history so realized P&L is unchanged).
+                    shown_months = filter_months(months, self._range_start)
                     with chart_holder:
                         # New monthly histograms at the top
-                        self._render_monthly_realized_income_chart(months, monthly_income, monthly_global)
-                        self._render_monthly_profit_by_label_chart(months, monthly_by_label, income_labels, monthly_label)
+                        self._render_monthly_realized_income_chart(shown_months, monthly_income, monthly_global)
+                        self._render_monthly_profit_by_label_chart(shown_months, monthly_by_label, income_labels, monthly_label)
                         self._render_total_growth_chart(all_balance_history, all_dividends, all_filled_trades)
                         self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
                         self._render_growth_by_position_in_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
@@ -5741,6 +5864,9 @@ class AccountGrowthTab:
                     mode = ui.toggle(['$', '%'], value='$').props('dense')
                     fullscreen_button(lambda: build(),
                                       title='Monthly Realized Income')
+            forecast = self._forecast or {}
+            fc_months = sorted(forecast)
+            months = sorted(set(months) | set(fc_months))
             if not months:
                 ui.label('No closed trades or dividend income yet.').classes('text-sm text-gray-500')
                 return
@@ -5755,21 +5881,32 @@ class AccountGrowthTab:
 
             def build():
                 pct = mode.value == '%'
-                pnl = [conv(m, monthly_income[m]['pnl'], pct) for m in months]
-                div = [conv(m, monthly_income[m]['div'], pct) for m in months]
-                total = [conv(m, round(monthly_income[m]['pnl'] + monthly_income[m]['div'], 2), pct) for m in months]
+                inc = {m: monthly_income.get(m) for m in months}
+                pnl = [conv(m, inc[m]['pnl'], pct) if inc[m] else None for m in months]
+                div = [conv(m, inc[m]['div'], pct) if inc[m] else None for m in months]
+                total = [conv(m, round(inc[m]['pnl'] + inc[m]['div'], 2), pct) if inc[m] else None
+                         for m in months]
+                # Forecast is $ only (no honest % denominator for a future month) and is
+                # its OWN series: never part of Closed P&L, Dividends or Total.
+                fc = [None if pct or m not in forecast else round(forecast[m]['total'], 2)
+                      for m in months]
                 fmt = '{value}%' if pct else '${value}'
                 return {
                     'backgroundColor': 'transparent',
                     'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
-                    'legend': {'data': ['Closed P&L', 'Dividends', 'Total'], 'textStyle': {'color': '#a0aec0'}, 'top': 5},
+                    'legend': {'data': ['Closed P&L', 'Dividends', 'Dividends (forecast, estimated)', 'Total'],
+                               'textStyle': {'color': '#a0aec0'}, 'top': 5},
                     'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
                     'xAxis': {'type': 'category', 'data': months, 'axisLabel': {'color': '#a0aec0'}},
                     'yAxis': {'type': 'value', 'axisLabel': {'color': '#a0aec0', 'formatter': fmt},
                               'splitLine': {'lineStyle': {'color': 'rgba(255,255,255,0.05)'}}},
                     'series': [
                         {'name': 'Closed P&L', 'type': 'bar', 'data': pnl, 'itemStyle': {'color': '#3b82f6'}},
-                        {'name': 'Dividends', 'type': 'bar', 'data': div, 'itemStyle': {'color': '#22c55e'}},
+                        {'name': 'Dividends', 'type': 'bar', 'data': div, 'stack': 'div',
+                         'itemStyle': {'color': '#22c55e'}},
+                        {'name': 'Dividends (forecast, estimated)', 'type': 'bar', 'data': fc, 'stack': 'div',
+                         'itemStyle': {'color': _rgba('#22c55e', 0.35), 'borderColor': '#22c55e',
+                                       'borderType': 'dashed', 'borderWidth': 1}},
                         {'name': 'Total', 'type': 'bar', 'data': total, 'itemStyle': {'color': '#f59e0b'}},
                     ],
                 }
@@ -5777,10 +5914,10 @@ class AccountGrowthTab:
             def rebuild():
                 chart_container.clear()
                 with chart_container:
-                    ui.echart(build()).classes('w-full').style('height: 320px')
+                    responsive_echart(build()).classes('w-full').style('height: 320px')
 
             with chart_container:
-                ui.echart(build()).classes('w-full').style('height: 320px')
+                responsive_echart(build()).classes('w-full').style('height: 320px')
             mode.on_value_change(lambda e: rebuild())
 
     def _render_monthly_profit_by_label_chart(self, months, monthly_by_label, labels, monthly_label=None):
@@ -5797,6 +5934,8 @@ class AccountGrowthTab:
                     fullscreen_button(lambda: build(),
                                       title='Monthly Closed Profit + Dividends by Label')
             labels = apply_scope(labels, self._scope)
+            forecast = self._forecast or {}
+            months = sorted(set(months) | set(forecast))
             if not months or not labels:
                 ui.label('No closed trades yet.' if not months
                          else 'No labels in scope (see the label scope setting above).'
@@ -5821,16 +5960,34 @@ class AccountGrowthTab:
                     if lb not in visible:
                         continue
                     series.append({
-                        'name': lb, 'type': 'bar',
-                        'data': [cell(m, lb, pct) for m in months],
+                        'name': lb, 'type': 'bar', 'stack': lb,
+                        'data': [cell(m, lb, pct) if m in monthly_by_label else None for m in months],
                         'itemStyle': {'color': label_color[lb]},
                     })
+                legend_names = [s['name'] for s in series]
+                if not pct:
+                    # Forecast: the label's colour, see-through with a dashed border, stacked
+                    # on the label's own bar. Never merged into the actual series.
+                    for lb in labels:
+                        if lb not in visible:
+                            continue
+                        data = [round(forecast[m]['labels'][lb], 2)
+                                if m in forecast and lb in forecast[m]['labels'] else None
+                                for m in months]
+                        if any(v is not None for v in data):
+                            series.append({
+                                'name': f'{lb} (forecast, estimated)', 'type': 'bar', 'stack': lb,
+                                'data': data,
+                                'itemStyle': {'color': _rgba(label_color[lb], 0.35),
+                                              'borderColor': label_color[lb],
+                                              'borderType': 'dashed', 'borderWidth': 1},
+                            })
                 fmt = '{value}%' if pct else '${value}'
                 return {
                     'backgroundColor': 'transparent',
                     'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
-                    'legend': {'data': [s['name'] for s in series], 'textStyle': {'color': '#a0aec0'}, 'top': 5},
-                    'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+                    'legend': legend_options(legend_names),
+                    'grid': grid_options(legend_names),
                     'xAxis': {'type': 'category', 'data': months, 'axisLabel': {'color': '#a0aec0'}},
                     'yAxis': {'type': 'value', 'axisLabel': {'color': '#a0aec0', 'formatter': fmt},
                               'splitLine': {'lineStyle': {'color': 'rgba(255,255,255,0.05)'}}},
@@ -5851,10 +6008,10 @@ class AccountGrowthTab:
                 self._persist_selection(CHART_MONTHLY, visible)
                 chart_container.clear()
                 with chart_container:
-                    ui.echart(build_options(visible, mode.value == '%')).classes('w-full').style('height: 320px')
+                    responsive_echart(build_options(visible, mode.value == '%')).classes('w-full').style('height: 320px')
 
             with chart_container:
-                ui.echart(build_options(default_labels, False)).classes('w-full').style('height: 320px')
+                responsive_echart(build_options(default_labels, False)).classes('w-full').style('height: 320px')
             label_select.on_value_change(lambda e: rebuild())
             mode.on_value_change(lambda e: rebuild())
 
@@ -5867,8 +6024,15 @@ class AccountGrowthTab:
             # until then.
             header_row = ui.row().classes('w-full items-center justify-between')
             with header_row:
-                ui.label('Total Account Growth').classes('text-md font-bold mb-2')
+                ui.label(f'Total Account Growth ({self._range}, rebased to range start)').classes('text-md font-bold mb-2')
 
+            # TIME RANGE: the inputs are cut at the range start, so everything cumulative
+            # restarts there -- Cumulative Dividends from 0, Invested Capital and P&L %
+            # from the first in-range balance (they initialise on the first entry).
+            balance_history = [e for e in (balance_history or [])
+                               if date_in_range(e.get('date'), self._range_start)]
+            dividends = [d for d in (dividends or [])
+                         if date_in_range(d.get('date'), self._range_start)]
             if not balance_history and not dividends:
                 ui.label('No balance history or dividend data available.').classes('text-sm text-gray-500')
                 return
@@ -6156,7 +6320,7 @@ class AccountGrowthTab:
                 'series': series,
             }
 
-            ui.echart(chart_options).classes('w-full h-96')
+            responsive_echart(chart_options).classes('w-full h-96')
             # Static options -- this panel has no toggles -- so the closure cannot go
             # stale and a plain capture is honest here.
             with header_row:
@@ -6203,12 +6367,12 @@ class AccountGrowthTab:
         all_dates_set = set()
         for sym_prices in historical_prices.values():
             all_dates_set.update(sym_prices.keys())
-        all_dates = sorted(all_dates_set)
+        all_dates = filter_dates(sorted(all_dates_set), self._range_start)
 
         if not all_dates:
             # Fallback: no historical data, show a simple current-value bar chart
             with ui.card().classes('w-full mb-4 p-4'):
-                ui.label('Growth by Label').classes('text-md font-bold mb-2')
+                ui.label(f'Growth by Label ({self._range}, rebased to range start)').classes('text-md font-bold mb-2')
                 ui.label('No historical price data available for line chart.').classes('text-sm text-gray-400')
             return
 
@@ -6368,7 +6532,7 @@ class AccountGrowthTab:
 
         with ui.card().classes('w-full mb-4 p-4'):
             with ui.row().classes('w-full items-center justify-between'):
-                ui.label('Growth by Label').classes('text-md font-bold mb-2')
+                ui.label(f'Growth by Label ({self._range}, rebased to range start)').classes('text-md font-bold mb-2')
                 with ui.row().classes('items-center gap-1'):
                     mode = mode_toggle()
                     fullscreen_button(lambda: build_chart_options(
@@ -6514,12 +6678,12 @@ class AccountGrowthTab:
                 self._persist_selection(CHART_GROWTH, visible)
                 chart_container.clear()
                 with chart_container:
-                    ui.echart(build_chart_options(
+                    responsive_echart(build_chart_options(
                         visible, show_total_cb.value, show_div_cb.value, show_inv_cb.value
                     )).classes('w-full h-80')
 
             with chart_container:
-                ui.echart(build_chart_options(default_labels)).classes('w-full h-80')
+                responsive_echart(build_chart_options(default_labels)).classes('w-full h-80')
 
             label_select.on_value_change(lambda e: rebuild_label_chart())
             show_total_cb.on_value_change(lambda e: rebuild_label_chart())
@@ -6556,7 +6720,7 @@ class AccountGrowthTab:
         all_dates_set = set()
         for sym_prices in historical_prices.values():
             all_dates_set.update(sym_prices.keys())
-        all_dates = sorted(all_dates_set)
+        all_dates = filter_dates(sorted(all_dates_set), self._range_start)
 
         if not all_dates:
             return
@@ -6846,7 +7010,7 @@ class AccountGrowthTab:
 
             position_chart_container = ui.column().classes('w-full')
             with position_chart_container:
-                ui.echart(build_position_chart_options(default_label)).classes('w-full h-80')
+                responsive_echart(build_position_chart_options(default_label)).classes('w-full h-80')
 
             def on_position_label_change(e):
                 if not e.value:
@@ -6854,7 +7018,7 @@ class AccountGrowthTab:
                 self._persist_single(CHART_POSITION_LABEL, e.value)
                 position_chart_container.clear()
                 with position_chart_container:
-                    ui.echart(build_position_chart_options(e.value)).classes('w-full h-80')
+                    responsive_echart(build_position_chart_options(e.value)).classes('w-full h-80')
 
             label_select.on_value_change(on_position_label_change)
             # The toggle redraws the CURRENT label, so it reuses the same handler with
@@ -6863,14 +7027,15 @@ class AccountGrowthTab:
                 lambda e: on_position_label_change(SimpleNamespace(value=label_select.value)))
 
     def _render_dividend_history_table(self, dividends):
-        """Render a paginated table of dividend history for the last 6 months."""
+        """Render a paginated table of dividend history within the page time range."""
         from datetime import datetime, timedelta
 
         if not dividends:
             return
 
-        # Filter to last 6 months
-        cutoff = datetime.now() - timedelta(days=183)
+        # Filter to the page's time range (Max = everything)
+        cutoff = (datetime.combine(self._range_start, datetime.min.time())
+                  if self._range_start else datetime.min)
         filtered = []
         for div in dividends:
             date_val = div.get('date')
@@ -7040,7 +7205,7 @@ class AccountGrowthTab:
                     # Fetch historical prices from Yahoo Finance
                     import yfinance as yf
                     hist_data = await asyncio.to_thread(
-                        lambda: yf.download(symbol, period='6mo', progress=False, auto_adjust=False)
+                        lambda: yf.download(symbol, period=yf_period_for(self._range), progress=False, auto_adjust=False)
                     )
                     hist_prices = _extract_yf_close_prices(hist_data, symbol)
                 except Exception as e:
@@ -7097,7 +7262,11 @@ class AccountGrowthTab:
         line rises only on dates a reinvestment actually posted, so enabling/disabling
         DRIP at the broker is reflected automatically without any account setting.
         """
-        hist_prices = hist_prices or {}
+        # TIME RANGE: prices and dividends from the range start only, so the cumulative
+        # dividend / DRIP lines restart there like every other chart on the page.
+        start = self._range_start
+        hist_prices = {d: p for d, p in (hist_prices or {}).items() if date_in_range(d, start)}
+        dividends = [dv for dv in (dividends or []) if date_in_range(dv.get('date'), start)]
         has_dividends = bool(dividends)
         has_prices = bool(hist_prices)
 
@@ -7402,7 +7571,7 @@ class AccountGrowthTab:
             'series': series,
         }
 
-        ui.echart(chart_options).classes('w-full h-80')
+        responsive_echart(chart_options).classes('w-full h-80')
         # Handed back so the PANEL (which owns the fullscreen button and is built
         # long before this async load finishes) can reopen exactly what is on
         # screen, for whichever symbol is currently selected.
