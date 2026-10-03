@@ -259,6 +259,12 @@ def _base_layout(height: int, layout: ChartLayout) -> Dict[str, Any]:
     )
 
 
+def plot_config(layout: ChartLayout) -> Dict[str, Any]:
+    """Plotly ``config``: the mode bar is hidden on a phone, where it floats over the bars
+    (and its buttons are useless on touch). ``responsive`` stays on."""
+    return {'responsive': True, 'displayModeBar': not layout.phone}
+
+
 def hbar_figure(names: Sequence[str], values: Sequence[float], colors: Dict[str, str],
                 layout: ChartLayout, kind: str) -> go.Figure:
     """One horizontal bar per expert, in the order given (first on top), coloured by
@@ -269,9 +275,9 @@ def hbar_figure(names: Sequence[str], values: Sequence[float], colors: Dict[str,
     fig = go.Figure(go.Bar(
         x=list(values), y=list(names), orientation='h',
         marker=dict(color=[colors[n] for n in names], line=dict(width=0)),
-        text=text, textposition='outside', cliponaxis=False,
+        text=text, textposition='outside', cliponaxis=False, customdata=list(names),
         textfont=dict(color=_TEXT, size=layout.tick_font),
-        hovertemplate='<b>%{y}</b><br>%{text}<extra></extra>',
+        hovertemplate='<b>%{customdata}</b><br>%{text}<extra></extra>',
     ))
     fig.update_layout(
         **_base_layout(height, layout), showlegend=False, bargap=0.25,
@@ -299,11 +305,11 @@ def win_loss_figure(names: Sequence[str], wins: Sequence[int], losses: Sequence[
     fig = go.Figure()
     for label, series, color in (('Wins', wins, WIN_COLOR), ('Losses', losses, LOSS_COLOR)):
         fig.add_trace(go.Bar(
-            x=list(series), y=list(names), orientation='h', name=label,
+            x=list(series), y=list(names), orientation='h', name=label, customdata=list(names),
             marker=dict(color=color, line=dict(width=0)),
             text=[str(v) if v else '' for v in series], textposition='inside',
             insidetextanchor='middle', textfont=dict(color='#10141f', size=layout.tick_font),
-            hovertemplate=f'<b>%{{y}}</b><br>{label}: %{{x}}<extra></extra>',
+            hovertemplate=f'<b>%{{customdata}}</b><br>{label}: %{{x}}<extra></extra>',
         ))
     fig.update_layout(
         **_base_layout(height, layout), barmode='stack', bargap=0.25,
@@ -343,8 +349,8 @@ def monthly_line_figure(series: Dict[str, List[Tuple[datetime, Optional[float]]]
         fig.add_trace(go.Scatter(
             x=[p[0] for p in pts], y=[p[1] for p in pts], mode='lines+markers', name=name,
             line=dict(color=color, width=2), marker=dict(size=6, color=color),
-            connectgaps=False,
-            hovertemplate=f'<b>{name}</b><br>%{{x|%b %Y}}: {hover_val}<extra></extra>'))
+            connectgaps=False, customdata=[name] * len(pts),
+            hovertemplate=f'<b>%{{customdata}}</b><br>%{{x|%b %Y}}: {hover_val}<extra></extra>'))
     rows = legend_rows(names, layout.legend_width_px) if show_legend else 0
     legend_px = rows * 18
     margin_t, margin_b = 10, 40 + legend_px
