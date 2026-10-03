@@ -424,6 +424,7 @@ class IBKROptionsMixin:
                 spec["order_ref"] = M.make_order_ref(self.id, trading_order.id, nonce=nonce)
         try:
             if placed is None:
+                self._stamp_placed(trading_order)
                 placed = self._call(lambda ib: self._place_option(ib, spec),
                                     op=f"place option order {trading_order.id}",
                                     timeout=self._submit_budget(1, reads=len(legs) + 1))

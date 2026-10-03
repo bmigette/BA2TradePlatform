@@ -13,7 +13,11 @@ IB applied it); a non-warning error on a live trade turns its status into ``Canc
 with the error in the log; a WARNING (105 110 165 321 329 399 404 434 492 and every 21xx) turns it into
 ``ValidationError`` while the order stays live; ``openOrders`` / ``completedOrders`` / ``positions`` have ONE
 pending future each, so a second concurrent identical request steals the first one's answer; after a
-reconnect order ids restart (reused ids); the order values ib_async shows are overwritten by what IB echoes.
+reconnect order ids restart (reused ids); the order values ib_async shows are overwritten by what IB echoes;
+a COMPLETED order comes back as a NEW Trade with an EMPTY status record (filled 0, avgFillPrice 0, orderId 0)
+and the real figure on ``order.filledQuantity``; every open order is answered with ``openOrder`` +
+``orderStatus``, so a re-read right after a modification logs 'Modified' whatever IB applied; a refused
+modification leaves the (still live) trade ``Cancelled`` LOCALLY until IB's next echo restores it.
 
 Everything that mutates state runs ON THE ADAPTER'S LOOP THREAD (the adapter calls the fake from
 coroutines there); the ``simulate_*`` helpers are for the TEST thread and hop onto that loop.
@@ -119,6 +123,8 @@ class FakeIB:
         self.request_delay = 0.01
         self._futures: Dict[str, asyncio.Future] = {}
         self.request_log: List[str] = []
+        #: seconds ib_async's startup sync keeps connectAsync running AFTER the socket is already connected
+        self.connect_sync_delay = 0.0
         self.market_data_type: Optional[int] = None
         # account data
         self.account_rows: List[AccountValue] = default_account_rows(account)
@@ -206,6 +212,9 @@ class FakeIB:
             raise ConnectionRefusedError("client id in use")
         self._connected = True
         self.client_id = clientId
+        if self.connect_sync_delay:
+            # the socket is up (isConnected() is True) while ib_async's startup sync is still running
+            await asyncio.sleep(self.connect_sync_delay)
 
     def disconnect(self) -> None:
         was = self._connected
@@ -462,7 +471,8 @@ class FakeIB:
 
         def produce() -> List[Trade]:
             live = [t for t in self._trades + self.prior_trades
-                    if t.orderStatus.status not in FINAL and not getattr(t, "_lost", False)]
+                    if (t.orderStatus.status not in FINAL or getattr(t, "_restore_status", None))
+                    and not getattr(t, "_lost", False)]
             for trade in live:
                 self._echo_open_order(trade)
             return live
@@ -471,8 +481,19 @@ class FakeIB:
     async def reqCompletedOrdersAsync(self, apiOnly: bool) -> List[Trade]:
         await self._maybe_fail("reqCompletedOrdersAsync")
         return await self._keyed("completedOrders", lambda: [
-            t for t in self.prior_trades + self._trades
+            self._completed_shape(t) for t in self.prior_trades + self._trades
             if t.orderStatus.status in FINAL and not getattr(t, "_lost", False)])
+
+    @staticmethod
+    def _completed_shape(trade: Trade) -> Trade:
+        """What ib_async ``wrapper.completedOrder`` builds: a NEW Trade whose status record is EMPTY
+        (filled 0, remaining 0, avgFillPrice 0) and whose order carries the traded quantity in
+        ``filledQuantity`` (orderId 0, no log)."""
+        order = copy.copy(trade.order)
+        order.filledQuantity = trade.orderStatus.filled if trade.orderStatus.filled else 1.7976931348623157e308
+        order.orderId = 0
+        status = IBOrderStatus(orderId=0, status=trade.orderStatus.status)
+        return Trade(trade.contract, order, status, [], [])
 
     @staticmethod
     def _ib_values(order: Order) -> Dict[str, Any]:
@@ -485,10 +506,19 @@ class FakeIB:
         ib = getattr(trade, "_ib", None)
         if ib is None:
             return
+        restore = getattr(trade, "_restore_status", None)
+        if restore is not None:                      # IB's answer restores what ib_async changed locally
+            trade.orderStatus.status = restore
+            trade._restore_status = None  # type: ignore[attr-defined]
         trade.order.lmtPrice, trade.order.auxPrice = ib["lmt"], ib["aux"]
         trade.order.totalQuantity, trade.order.orderType = ib["qty"], ib["type"]
         trade.order.orderRef = ib["ref"]
         trade.orderStatus.remaining = max(0.0, ib["qty"] - trade.orderStatus.filled)
+        # ...and the orderStatus that follows each openOrder (ib_async: unchanged status 'Submitted' with
+        # 'Modify' as the last log entry is logged as 'Modified', whatever IB did with the prices)
+        if (trade.orderStatus.status == "Submitted" and trade.log
+                and trade.log[-1].message == "Modify"):
+            self._log(trade, "Submitted", "Modified")
 
     async def reqExecutionsAsync(self, execFilter=None) -> List[Fill]:
         await self._maybe_fail("reqExecutionsAsync")
@@ -560,7 +590,10 @@ class FakeIB:
         if mb == "silent":
             return                                    # IB ignored it: no echo of any kind
         if isinstance(mb, tuple) and mb[0] == "reject":
+            trade._restore_status = trade.orderStatus.status  # type: ignore[attr-defined]
             self.wrapper_error(trade, trade.order.orderId, mb[1], mb[2], trade.contract)
+            if trade.orderStatus.status not in ("Cancelled",):
+                trade._restore_status = None  # type: ignore[attr-defined]   # a warning: nothing to restore
             return
         if mb in ("confirm", "applied_no_echo"):
             trade._ib.update(sent)  # type: ignore[attr-defined]   # IB APPLIED the change

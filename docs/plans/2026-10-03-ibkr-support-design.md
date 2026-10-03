@@ -692,3 +692,32 @@ does not); how long a cancel takes to confirm outside the session (`_CANCEL_ACK_
 `AvailableFunds` / `SMA` / `ExcessLiquidity` are published for cash, Reg-T margin and portfolio-margin accounts;
 how long startup requests take (the connect no longer raises); completed-order / execution survival across the
 Gateway's nightly restart; combo fill shape and negative-limit acceptance; partial OCA fill reduction.
+
+## 15. Review round 3 (re-review of 476c8e43)
+
+Pinned against the REAL ib_async this time (`tests/ibkr_tws_sim.py` feeds the real `Wrapper` the callbacks TWS
+sends; `tests/test_ibkr_review_fixes3.py`). The fake was corrected too: completed orders come back as new Trades
+with an EMPTY status record, every open order is answered with `openOrder` + `orderStatus`, and a refused
+modification leaves the live trade `Cancelled` locally until IB's next echo.
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | a COMPLETED order has `orderStatus.filled = 0`; the traded size is `order.filledQuantity`: after a restart refresh set `filled_qty` 10 -> 0.0 and a partly filled then cancelled order read as dead (a retry re-bought) | `BrokerOrderView.from_trade` reads `order.filledQuantity` when the status record is empty; a view NEVER lowers `filled_qty` or zeroes `open_price`; a completed order's average price comes from the executions (by ref, else permId) |
+| 2 | our own re-read of the open orders makes TWS send an unchanged `orderStatus` that ib_async logs as `Modified` even when IB kept the OLD prices | `Modified` counts only while the order object still carries the SENT lmt/aux/qty |
+| 3 | a modify refused with 201 marks the live trade `Cancelled` locally; the cancel paths trusted it and sent nothing | a refused modification re-reads IB's open orders (restoring the status); `_cancel_trades` / `_cancel_trade_confirmed` never trust a local final status without asking IB (`_listed_by_ib`), and after sending the cancel wait for IB to stop listing the order or move its status |
+| 4 | the never-reached grace aged from `created_at` (dependent exits, staged replacements, stop->MARKET retries are created hours before placement) | `data["ibkr_placed_at"]` is stamped at placement (also on the caller's object); the grace ages from it |
+| 5 | the shared expert clamp caught the IBKR error and fell back to net liquidation (100000 vs `AvailableFunds` 80000) | `AccountInterface.buying_power_is_mandatory` (default False; True on `IBKRAccount`): for such a broker `MarketExpertInterface._get_actual_available_balance` raises on a missing / non-finite buying power and the caller's own handler turns it into the loud "cannot size" refusal. Alpaca/TastyTrade take the unchanged chain (pinned by a test per broker) |
+| 6 | a retired nonce warned on every refresh | `ibkr_prior_nonces` is consulted; a retired nonce is silent (an unknown foreign nonce still warns) |
+| 7 | a refused re-submission (row ERROR, 'differs') is re-bound to the live order on the next refresh | KEPT and documented in code: the live order is tracked, never orphaned; the row shows what IB really has and keeps the explanation in its comment |
+| 8 | a non-read-only 321 / 434 on a new order leaves a `ValidationError` limbo; the settle rule only looked at `PendingSubmit` | a session-only `ValidationError` trade IB does not list is unacknowledged too |
+| 9 | during connect other coroutines could use the session before the managed-account / paper checks finished | `IBKRRuntime._ready` is False from the start of a connect until the checks pass; every caller waits on the connect lock |
+
+Residuals: a completed order's average price exists only if an execution is still available (the API gives none
+otherwise); the Gateway restart can drop it, in which case `open_price` stays unset (never zero).
+
+New `[CHECK]` lines in `tools/ibkr_paper_smoke.py` (the script now connects exactly as the adapter does:
+`fetchFields=ACCOUNT_UPDATES`, `raiseSyncErrors=False`): `orderStatus` delivered per order on `reqAllOpenOrders`;
+modify + immediate re-read logging `Modified` with the OLD price; the local status after a refused modify and
+after a re-read; a completed order's `orderStatus.filled` vs `order.filledQuantity` and its status strings; the
+exact 321 text on a Read-Only-API Gateway; executions carrying an `orderRef`; whether TWS lists a
+not-yet-acknowledged order.

@@ -103,14 +103,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 # ----------------------------------------------------------------------------- sections
+def adapter_connect_kwargs(args: argparse.Namespace, *, readonly: bool, account: str) -> dict:
+    """The arguments the ADAPTER connects with (``ibkr_runtime.IBKRRuntime._connect``): only the
+    account-updates feed is fetched at startup and a slow optional sync does not fail the connect. The
+    smoke test must connect the same way, or it measures a different session."""
+    from ib_async import StartupFetch
+    return dict(clientId=args.client_id, timeout=args.timeout, readonly=readonly, account=account,
+                raiseSyncErrors=False, fetchFields=StartupFetch.ACCOUNT_UPDATES)
+
+
 async def connect(ib: Any, args: argparse.Namespace, rep: Report) -> str:
     """Connect READ-ONLY first, always. Only after the account is confirmed to be a paper account is a
     writable session opened (and only for ``--place-test-order``), so a live account never sees one."""
     rep.section("Connection")
     kind = M.IB_PORTS.get(args.port, "unknown port")
     await asyncio.wait_for(
-        ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=args.timeout,
-                        readonly=True, account=args.account or ""),
+        ib.connectAsync(args.host, args.port,
+                        **adapter_connect_kwargs(args, readonly=True, account=args.account or "")),
         args.timeout + 5)
     accounts = list(ib.managedAccounts())
     rep.ok(f"connected to {args.host}:{args.port} ({kind}), clientId={args.client_id}, readonly=True")
@@ -131,8 +140,8 @@ async def connect(ib: Any, args: argparse.Namespace, rep: Report) -> str:
                           f"(paper ids start with {M.PAPER_ACCOUNT_PREFIX!r}); nothing was placed")
         ib.disconnect()
         await asyncio.wait_for(
-            ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=args.timeout,
-                            readonly=False, account=account),
+            ib.connectAsync(args.host, args.port,
+                            **adapter_connect_kwargs(args, readonly=False, account=account)),
             args.timeout + 5)
         rep.ok("reconnected WRITABLE (paper account confirmed) for the test order")
     ib.reqMarketDataType(2)
@@ -200,7 +209,20 @@ async def book_section(ib: Any, account: str, rep: Report) -> None:
     times = [t.log[0].time for t in completed if t.log]
     rep.check("how long completed orders survive (run again AFTER the Gateway's nightly restart and compare)",
               f"{len(completed)} completed orders; oldest log time {min(times) if times else None}")
+    rep.check("a COMPLETED order's orderStatus.filled vs order.filledQuantity, and the status strings "
+              "(ib_async leaves the status record empty; the adapter reads order.filledQuantity and takes the "
+              "price from the executions)",
+              [f"{t.orderStatus.status}: status.filled={t.orderStatus.filled} "
+               f"avgFillPrice={t.orderStatus.avgFillPrice} order.filledQuantity={t.order.filledQuantity} "
+               f"totalQuantity={t.order.totalQuantity}" for t in completed[:6]] or "no completed orders")
     trades = await ib.reqAllOpenOrdersAsync()
+    rep.check("an orderStatus is delivered PER ORDER on reqAllOpenOrders (non-empty status and permId on "
+              "every open order)",
+              [f"id={t.order.orderId} perm={t.orderStatus.permId} status={t.orderStatus.status!r}"
+               for t in trades[:6]] or "no open orders")
+    fills = await ib.reqExecutionsAsync()
+    rep.check("executions carry the orderRef (the adapter settles a row from an execution under its ref)",
+              f"{sum(1 for f in fills if f.execution.orderRef)} of {len(fills)} executions have an orderRef")
     rep.info(f"{len(trades)} open orders (all clients)")
     for t in trades[:10]:
         rep.line(f"    id={t.order.orderId} perm={t.orderStatus.permId} ref={t.order.orderRef!r} "
@@ -215,12 +237,13 @@ async def reconnect_positions_check(ib: Any, args: argparse.Namespace, account: 
     rep.section("Positions right after a reconnect")
     ib.disconnect()
     await asyncio.wait_for(
-        ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=args.timeout,
-                        readonly=not args.place_test_order, account=account, raiseSyncErrors=True),
+        ib.connectAsync(args.host, args.port,
+                        **adapter_connect_kwargs(args, readonly=not args.place_test_order, account=account)),
         args.timeout + 5)
     immediately = len(ib.positions(account))
     confirmed = len(await asyncio.wait_for(ib.reqPositionsAsync(), args.timeout))
-    rep.check("positions cache immediately after connectAsync(raiseSyncErrors=True) vs after reqPositions",
+    rep.check("positions cache immediately after the adapter-style connect (raiseSyncErrors=False, "
+              "account updates only) vs after reqPositions",
               f"{immediately} vs {confirmed} (they must agree; the adapter always awaits reqPositions)")
     ib.reqMarketDataType(2)
 
@@ -443,10 +466,24 @@ async def modify_check(ib: Any, contract: Any, account: str, last: float, args: 
     order = Order(action="BUY", totalQuantity=1, orderType="LMT", lmtPrice=far, tif="DAY",
                   orderRef=TEST_ORDER_REF + "-mod", account=account, transmit=True)
     trade = ib.placeOrder(contract, order)
+    immediately = await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), args.timeout)
+    rep.check("does TWS list a NOT-YET-ACKNOWLEDGED order? (the 'never reached IBKR' rule assumes an order IB "
+              "has not acknowledged is on none of its lists)",
+              f"local status at the re-read={trade.orderStatus.status!r}; listed by IB: "
+              f"{any(t.order.orderId == trade.order.orderId for t in immediately)}")
     await _wait_status(trade, ("Submitted", "PreSubmitted"), args.timeout)
     log_len = len(trade.log)
     trade.order.lmtPrice = round(far + 0.05, 2)
     ib.placeOrder(contract, trade.order)
+    # an IMMEDIATE re-read (what the adapter does after ~1 s): does ib_async log 'Modified' although the
+    # order still carries the OLD price? (an unchanged orderStatus is what 'Modified' is keyed on)
+    reread = await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), args.timeout)
+    mine = [t for t in reread if t.order.orderId == trade.order.orderId]
+    rep.check("modify + IMMEDIATE re-read: is 'Modified' logged while the open order still shows the OLD "
+              "price? (the adapter accepts 'Modified' only when the order object carries the NEW price)",
+              f"'Modified' logged={any(e.message == 'Modified' for e in trade.log[log_len:])}; open-order "
+              f"lmtPrice after the re-read={mine[0].order.lmtPrice if mine else 'not listed'} "
+              f"(sent {round(far + 0.05, 2)}, was {far})")
     await asyncio.sleep(min(args.timeout, 4.0))
     entries = [(e.status, e.message, e.errorCode) for e in trade.log[log_len:]]
     rep.check("a modification is acknowledged by a 'Modified' log entry while status stays the same",
@@ -455,8 +492,14 @@ async def modify_check(ib: Any, contract: Any, account: str, last: float, args: 
     trade.order.lmtPrice = 0.0
     ib.placeOrder(contract, trade.order)
     await asyncio.sleep(min(args.timeout, 4.0))
-    rep.check("a REFUSED modification (limit 0.0) arrives as an error/warning, not as 'Modified'",
-              f"status={trade.orderStatus.status} new log entries="
+    status_after_refusal = trade.orderStatus.status
+    still_listed = await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), args.timeout)
+    rep.check("a REFUSED modification (limit 0.0) arrives as an error/warning, not as 'Modified'; and the "
+              "LOCAL status after it (ib_async marks the trade Cancelled on a non-warning error although IB "
+              "may still work the order) vs after a re-read of the open orders",
+              f"status right after={status_after_refusal!r}; listed by IB after the re-read="
+              f"{any(t.order.orderId == trade.order.orderId for t in still_listed)}; status after the "
+              f"re-read={trade.orderStatus.status!r}; new log entries="
               f"{[(e.status, e.message, e.errorCode) for e in trade.log[refused_at:]]}")
     trade.order.lmtPrice = round(far + 0.05, 2)
     ib.cancelOrder(trade.order)
@@ -550,6 +593,10 @@ async def run(args: argparse.Namespace, ib_factory: Callable[[], Any], rep: Repo
         rep.section("Non-info errors/warnings IB sent during this run")
         for e in errors or ["none"]:
             rep.line(f"    {e}")
+        rep.check("EXACT 321 text on a Gateway with 'Read-Only API' ON: run once with the Gateway's Read-Only "
+                  "API checked and --place-test-order; the adapter refuses a new order on a 321 warning "
+                  "containing 'read-only' (it never went live) -- compare the wording printed above",
+                  [e for e in errors if e.startswith("321")] or "no 321 seen this run")
         seen = sorted({int(e.split(" ")[0]) for e in errors if e.split(" ")[0].isdigit()
                        and M.error_severity(int(e.split(" ")[0])) == "order_warning"})
         rep.check("order WARNING codes seen (399 held until the open, 404 shares being located, 10349 TIF "

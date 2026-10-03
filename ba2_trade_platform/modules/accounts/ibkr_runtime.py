@@ -116,6 +116,10 @@ class IBKRRuntime:
         self._ib: Any = None
         self._events_wired = False
         self._degraded = False
+        #: False from the moment a connect starts until its managed-account / paper-live checks have
+        #: PASSED: ``isConnected()`` turns True as soon as the socket is up, long before ib_async's startup
+        #: sync finishes, and nothing may use the session (let alone place an order) before then.
+        self._ready = False
         self._last_failure_at: Optional[float] = None
         self._last_failure: Optional[str] = None
         self._connect_lock: Optional[asyncio.Lock] = None
@@ -146,7 +150,7 @@ class IBKRRuntime:
 
     def is_connected(self) -> bool:
         ib = self._ib
-        return bool(ib is not None and ib.isConnected() and not self._degraded)
+        return bool(ib is not None and ib.isConnected() and self._ready and not self._degraded)
 
     # ------------------------------------------------------------------ facade
     def call(self, fn: Callable[[Any], Any], *, timeout: float, op: str) -> Any:
@@ -219,7 +223,7 @@ class IBKRRuntime:
 
     # ------------------------------------------------------------------ connection
     async def _ensure_connected(self) -> Any:
-        if self._ib is not None and self._ib.isConnected():
+        if self._ib is not None and self._ib.isConnected() and self._ready:
             if not self._degraded:
                 return self._ib
             await self._probe_degraded()
@@ -227,7 +231,9 @@ class IBKRRuntime:
         if self._connect_lock is None:
             self._connect_lock = asyncio.Lock()
         async with self._connect_lock:
-            if self._ib is not None and self._ib.isConnected() and not self._degraded:
+            # A caller arriving while another coroutine is still connecting waits HERE (the lock is held
+            # for the whole connect + checks) and only proceeds once the session is READY.
+            if self._ib is not None and self._ib.isConnected() and self._ready and not self._degraded:
                 return self._ib
             now = time.monotonic()
             if self._last_failure_at is not None and now - self._last_failure_at < self.cooldown:
@@ -268,6 +274,7 @@ class IBKRRuntime:
             ib.errorEvent += self._on_error
             ib.disconnectedEvent += self._on_disconnected
             self._events_wired = True
+        self._ready = False
         self.recent_global_errors.clear()
         self._errors.clear()                  # ids repeat across sessions: nothing from before counts
         logger.info(f"[{self.label}] connecting to IBKR {self.host}:{self.port} "
@@ -301,6 +308,7 @@ class IBKRRuntime:
         # (3/4) is never requested, and a delayed tick is refused by the price readers.
         ib.reqMarketDataType(2)
         self._degraded = False
+        self._ready = True
         logger.info(f"[{self.label}] IBKR connected; account {self.account_id} "
                     f"({'paper' if self.paper else 'LIVE'})")
 
@@ -332,6 +340,7 @@ class IBKRRuntime:
         self._errors.append((self._err_seq, reqId, errorCode, errorString))
 
     def _on_disconnected(self) -> None:
+        self._ready = False
         logger.warning(f"[{self.label}] IBKR disconnected")
 
     def mark(self) -> int:

@@ -53,7 +53,11 @@ class TestReadOnlyByDefault:
         assert "whatIfOrder" in out and "initMarginChange=5000.0" in out
         assert "Summary: facts to confirm" in out and "(nothing was placed)" in out
         assert "Reg-T room: AvailableFunds x 2 vs SMA x 2" in out
-        assert "positions cache immediately after connectAsync" in out
+        assert "a COMPLETED order's orderStatus.filled vs order.filledQuantity" in out
+        assert "an orderStatus is delivered PER ORDER" in out
+        assert "executions carry the orderRef" in out
+        assert a_adapter_style_connect(fake)
+        assert "positions cache immediately after the adapter-style connect" in out
         assert "how long completed orders survive" in out
         assert "request/order ids after (re)connect" in out
         assert "order WARNING codes seen" in out
@@ -125,6 +129,14 @@ class TestRefusals:
         assert code == 1 and "FAILED: ConnectionRefusedError" in out
 
 
+def a_adapter_style_connect(fake):
+    """Every connect the script makes uses the adapter's startup arguments (not defaults, and not
+    raiseSyncErrors=True)."""
+    from ib_async import StartupFetch
+    return (fake.connect_kwargs["raiseSyncErrors"] is False
+            and fake.connect_kwargs["fetchFields"] == StartupFetch.ACCOUNT_UPDATES)
+
+
 class TestTestOrder:
     def test_places_far_orders_only_cancels_everything_and_checks_modify_and_oca(self):
         fake, _ = make_fake()
@@ -147,6 +159,11 @@ class TestTestOrder:
         assert "a modification is acknowledged by a 'Modified' log entry" in out
         assert "a REFUSED modification" in out
         assert "cancelling ONE OCA leg leaves the other working" in out
+        assert "does TWS list a NOT-YET-ACKNOWLEDGED order" in out
+        assert "modify + IMMEDIATE re-read" in out
+        assert "LOCAL status after it" in out
+        assert "EXACT 321 text" in out
+        assert a_adapter_style_connect(fake)
         assert "a RESTING STOP's modification" in out
         assert "resting status=PreSubmitted" in out and "'Modified' logged=False" in out
         assert "shows the new stop=True" in out

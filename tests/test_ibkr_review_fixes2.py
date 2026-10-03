@@ -56,8 +56,11 @@ def activity(monkeypatch):
 
 
 def age(row_id, minutes=60):
+    """Age a row the way real time would: from the moment it was PLACED (round 3: the grace no longer
+    ages from created_at)."""
     r = get_instance(TradingOrder, row_id)
-    r.created_at = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    r.data = {**(r.data or {}), "ibkr_placed_at":
+              (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()}
     update_instance(r)
 
 
@@ -502,8 +505,8 @@ class TestBuyingPowerEdges:
         account, fake, _ = world
         from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
         self._set(fake, ExcessLiquidity=None)
-        got = MarketExpertInterface._get_actual_available_balance(account)
-        assert got != 50000.0, "TotalCashValue must never stand in for an unknown buying power"
+        with pytest.raises(ValueError, match="mandatory"):       # round 3: refused, not a fallback figure
+            MarketExpertInterface._get_actual_available_balance(account)
 
 
 # ======================================================================= 8  connect

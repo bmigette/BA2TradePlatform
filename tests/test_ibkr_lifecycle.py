@@ -164,9 +164,12 @@ class TestRefresh:
                         qty=5.0)
         order = Order(action="BUY", totalQuantity=5, orderType="MKT", account=ACCOUNT_ID)
         fake.add_prior_trade(aapl, order, "Filled", filled=5, avg=99.0, perm=777777777)
+        # a COMPLETED order has no average price of its own (ib_async leaves the status record empty):
+        # the price comes from the executions, the size from order.filledQuantity
+        fake.make_fill_record(aapl, "BOT", 5, 99.0, perm=777777777)
         account.refresh_orders()
         f = fresh(row)
-        assert f.status == OrderStatus.FILLED and f.open_price == 99.0
+        assert f.status == OrderStatus.FILLED and f.open_price == 99.0 and f.filled_qty == 5.0
 
     def test_other_accounts_orders_are_ignored(self, world):
         account, fake, aapl = world
