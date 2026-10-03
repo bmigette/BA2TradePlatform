@@ -218,8 +218,17 @@ async def book_section(ib: Any, account: str, rep: Report) -> None:
     trades = await ib.reqAllOpenOrdersAsync()
     rep.check("an orderStatus is delivered PER ORDER on reqAllOpenOrders (non-empty status and permId on "
               "every open order)",
-              [f"id={t.order.orderId} perm={t.orderStatus.permId} status={t.orderStatus.status!r}"
-               for t in trades[:6]] or "no open orders")
+              f"{sum(1 for t in trades if not t.orderStatus.status)} of {len(trades)} open orders have an EMPTY "
+              f"status; " + "; ".join(f"id={t.order.orderId} perm={t.orderStatus.permId} "
+                                      f"status={t.orderStatus.status!r}" for t in trades[:6]))
+    mine_ids = {t.order.orderId for t in trades if int(t.orderStatus.clientId or 0) == args.client_id}
+    foreign = [(t.order.orderId, int(t.orderStatus.clientId or 0)) for t in trades
+               if int(t.orderStatus.clientId or 0) not in (0, args.client_id)]
+    rep.check("OTHER API clients' orders: their orderIds are only unique PER client; the adapter matches an "
+              "order by permId, else (clientId, orderId). Does any foreign order carry the same orderId as one "
+              "of ours?",
+              f"foreign (orderId, clientId)={foreign[:8]}; same orderId as one of ours="
+              f"{sorted({oid for oid, _ in foreign} & mine_ids)}")
     fills = await ib.reqExecutionsAsync()
     rep.check("executions carry the orderRef (the adapter settles a row from an execution under its ref)",
               f"{sum(1 for f in fills if f.execution.orderRef)} of {len(fills)} executions have an orderRef")
@@ -389,6 +398,16 @@ async def executions_section(ib: Any, account: str, rep: Report) -> None:
         rep.line(f"    {ex.time} acct={ex.acctNumber} {c.secType} {c.localSymbol or c.symbol} "
                  f"{ex.side} {ex.shares}@{ex.price} orderId={ex.orderId} permId={ex.permId} "
                  f"exchange={ex.exchange!r} liquidation={ex.liquidation} ref={ex.orderRef!r}{flag}")
+    by_perm = {}
+    for f in fills:
+        by_perm.setdefault(f.execution.permId, []).append(f)
+    combos = {perm: fs for perm, fs in by_perm.items() if perm and len({x.contract.conId for x in fs}) > 1}
+    rep.check("COMBO executions: do the legs' executions carry the combo's orderRef, and is there any "
+              "combo-level (BAG) execution? The adapter prices a combo from its LEG fills "
+              "(side x leg average x ratio) found by (permId, conId) or (orderRef, conId)",
+              [f"permId={perm}: legs={[(x.contract.secType, x.contract.conId, x.execution.side, x.execution.shares, x.execution.price, x.execution.orderRef) for x in fs]}"
+               for perm, fs in list(combos.items())[:4]] or "no multi-leg execution in the window "
+              f"(BAG-level executions seen: {sum(1 for f in fills if f.contract.secType == 'BAG')})")
     rep.check("executions older than ~7 days are not returned", f"oldest seen: "
               f"{min((f.execution.time for f in fills), default=None)}")
 
@@ -479,6 +498,10 @@ async def modify_check(ib: Any, contract: Any, account: str, last: float, args: 
     # order still carries the OLD price? (an unchanged orderStatus is what 'Modified' is keyed on)
     reread = await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), args.timeout)
     mine = [t for t in reread if t.order.orderId == trade.order.orderId]
+    rep.check("auxPrice as echoed for a LIMIT order (0.0 or unset?): the adapter compares only the prices it "
+              "SENT, so an echoed aux of either kind must not veto a confirmation",
+              f"auxPrice after the re-read={mine[0].order.auxPrice if mine else 'not listed'} "
+              f"(UNSET marker is {1.7976931348623157e308})")
     rep.check("modify + IMMEDIATE re-read: is 'Modified' logged while the open order still shows the OLD "
               "price? (the adapter accepts 'Modified' only when the order object carries the NEW price)",
               f"'Modified' logged={any(e.message == 'Modified' for e in trade.log[log_len:])}; open-order "
@@ -504,6 +527,19 @@ async def modify_check(ib: Any, contract: Any, account: str, last: float, args: 
     trade.order.lmtPrice = round(far + 0.05, 2)
     ib.cancelOrder(trade.order)
     await _wait_status(trade, ("Cancelled", "ApiCancelled", "Inactive"), args.timeout)
+    # cancelling an ALREADY-CANCELLED order: which error does IB answer with (the adapter treats 103/104/135/
+    # 136/161/10147/10148 as "the cancel was refused")?
+    seen = []
+
+    def on_error(req_id, code, msg, contract=None):
+        if req_id == trade.order.orderId:
+            seen.append((code, msg))
+    ib.errorEvent += on_error
+    ib.cancelOrder(trade.order)
+    await asyncio.sleep(min(args.timeout, 3.0))
+    ib.errorEvent -= on_error
+    rep.check("error codes when CANCELLING AN ALREADY-CANCELLED order (adapter refusal set: "
+              f"{sorted(M.ORDER_STATE_CODES)})", seen or "no error answered")
 
 
 async def stop_modify_check(ib: Any, contract: Any, account: str, last: float, args: argparse.Namespace,
@@ -593,6 +629,13 @@ async def run(args: argparse.Namespace, ib_factory: Callable[[], Any], rep: Repo
         rep.section("Non-info errors/warnings IB sent during this run")
         for e in errors or ["none"]:
             rep.line(f"    {e}")
+        held = [t for t in ib.trades() if t.orderStatus.status == "ValidationError"]
+        listed = await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), args.timeout) if held else []
+        rep.check("are HELD orders (399 held until the open / 404 shares being located) LISTED by "
+                  "reqAllOpenOrders? (only answerable if one arose this run: place a market order pre-open)",
+                  [f"id={t.order.orderId}: listed by IB="
+                   f"{any(x.order.orderId == t.order.orderId for x in listed)}" for t in held]
+                  or "no held order arose this run")
         rep.check("EXACT 321 text on a Gateway with 'Read-Only API' ON: run once with the Gateway's Read-Only "
                   "API checked and --place-test-order; the adapter refuses a new order on a 321 warning "
                   "containing 'read-only' (it never went live) -- compare the wording printed above",

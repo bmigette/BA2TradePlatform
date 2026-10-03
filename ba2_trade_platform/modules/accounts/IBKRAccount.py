@@ -95,6 +95,8 @@ class BrokerOrderView:
     created_at: Optional[datetime]
     last_message: str = ""
     client_id: int = 0
+    #: a BAG combo's legs as ``(conId, ratio, action)`` (empty for anything else)
+    combo_legs: Tuple = ()
 
     @property
     def key(self) -> Tuple:
@@ -147,6 +149,8 @@ class BrokerOrderView:
             created_at=created,
             last_message=message,
             client_id=int(getattr(status, "clientId", 0) or getattr(order, "clientId", 0) or 0),
+            combo_legs=tuple((int(leg.conId), int(leg.ratio), str(leg.action))
+                             for leg in (getattr(contract, "comboLegs", None) or [])),
         )
 
 
@@ -169,6 +173,11 @@ class OrderBook:
     #: option-leg executions of a combo, keyed by (permId, OCC symbol)
     executions_by_perm_occ: Dict[Tuple[int, str], Dict[str, Any]] = field(default_factory=dict)
     executions_ok: bool = True
+    #: per-LEG buckets (a combo's legs are separate executions sharing the combo's permId / orderRef):
+    #: ``(permId, conId)``, ``(orderRef, conId)`` and ``(orderRef, OCC)``; each carries ``side``
+    executions_by_perm_con: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict)
+    executions_by_ref_con: Dict[Tuple[str, int], Dict[str, Any]] = field(default_factory=dict)
+    executions_by_ref_occ: Dict[Tuple[str, str], Dict[str, Any]] = field(default_factory=dict)
     #: view keys IB ITSELF listed (open / completed orders): a session-only trade is a LOCAL object
     open_keys: set = field(default_factory=set)
     completed_keys: set = field(default_factory=set)
@@ -866,23 +875,75 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
                 continue
             buckets = [(book.executions_by_ref, str(ex.orderRef or "")),
                        (book.executions_by_perm, int(ex.permId or 0))]
+            if ex.permId and fill.contract.conId:
+                buckets.append((book.executions_by_perm_con, (int(ex.permId), int(fill.contract.conId))))
+            if ex.orderRef and fill.contract.conId:
+                buckets.append((book.executions_by_ref_con, (str(ex.orderRef), int(fill.contract.conId))))
             if fill.contract.secType == "OPT" and ex.permId:
                 try:
-                    buckets.append((book.executions_by_perm_occ,
-                                    (int(ex.permId), cls._occ_of(fill.contract))))
+                    occ = cls._occ_of(fill.contract)
+                    buckets.append((book.executions_by_perm_occ, (int(ex.permId), occ)))
+                    if ex.orderRef:
+                        buckets.append((book.executions_by_ref_occ, (str(ex.orderRef), occ)))
                 except ValueError:
                     logger.warning(f"execution {ex.execId}: cannot derive an OCC symbol from "
                                    f"{fill.contract.localSymbol!r}; leg price not attributed")
             for bucket, key in buckets:
                 if not key:
                     continue
-                agg = bucket.setdefault(key, {"shares": 0.0, "notional": 0.0, "when": None})
+                agg = bucket.setdefault(key, {"shares": 0.0, "notional": 0.0, "when": None,
+                                              "side": str(ex.side)})
                 agg["shares"] += shares
                 agg["notional"] += shares * price
                 agg["when"] = ex.time
-        for bucket in (book.executions_by_ref, book.executions_by_perm, book.executions_by_perm_occ):
+        for bucket in (book.executions_by_ref, book.executions_by_perm, book.executions_by_perm_occ,
+                       book.executions_by_perm_con, book.executions_by_ref_con, book.executions_by_ref_occ):
             for agg in bucket.values():
                 agg["price"] = agg["notional"] / agg["shares"] if agg["shares"] else None
+
+    @staticmethod
+    def _combo_net_price(legs, book: OrderBook) -> Optional[float]:
+        """The net price PER COMBO UNIT of a filled combo, from its legs' own executions: the sum over legs
+        of ``side x leg average price x ratio`` (bought +, sold -; a debit is positive, a credit negative,
+        the platform's convention). ``legs`` = ``[(agg, ratio), ...]``. NEVER an average of the legs: a debit
+        spread bought at 5.00 and sold at 2.00 cost 3.00, not 3.50. ``None`` when any leg has no price."""
+        total = 0.0
+        for agg, ratio in legs:
+            if not agg or not agg.get("price"):
+                return None
+            total += (1.0 if str(agg.get("side")) == "BOT" else -1.0) * float(agg["price"]) * ratio
+        return total
+
+    @classmethod
+    def _combo_from_view(cls, view: BrokerOrderView, book: OrderBook) -> Optional[float]:
+        if not view.combo_legs:
+            return None
+        legs = []
+        for con_id, ratio, _action in view.combo_legs:
+            agg = ((book.executions_by_perm_con.get((view.perm_id, con_id)) if view.perm_id else None)
+                   or book.executions_by_ref_con.get((view.order_ref, con_id)))
+            legs.append((agg, ratio))
+        return cls._combo_net_price(legs, book)
+
+    def _combo_from_children(self, row: TradingOrder, children: List[TradingOrder], ref: str, perm: int,
+                             book: OrderBook) -> Optional[Tuple[float, Optional[float]]]:
+        """``(filled combo units, net price per unit)`` of a combo PARENT row from its leg children's
+        executions, or ``None`` when any leg has none (a half-executed combo is not settled from here).
+        Units are the SMALLEST leg fill divided by that leg's ratio, never the sum of the legs' shares."""
+        units, legs = None, []
+        for child in children:
+            if not child.contract_symbol or not row.quantity:
+                return None
+            agg = ((book.executions_by_perm_occ.get((perm, child.contract_symbol)) if perm else None)
+                   or book.executions_by_ref_occ.get((ref, child.contract_symbol)))
+            if not agg:
+                return None
+            ratio = float(child.quantity) / float(row.quantity)
+            leg_units = agg["shares"] / ratio
+            units = leg_units if units is None else min(units, leg_units)
+            agg = dict(agg, side=("BOT" if child.side == OrderDirection.BUY else "SLD"))
+            legs.append((agg, ratio))
+        return (units, self._combo_net_price(legs, book)) if units is not None else None
 
     @staticmethod
     def _status_wanted(status: Any) -> Optional[set]:
@@ -1175,7 +1236,22 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         changed LOCALLY.)"""
         listed = await self._open_orders(ib)
         oid = int(trade.order.orderId or 0)
-        return any(t is trade or (oid and int(t.order.orderId or 0) == oid) for t in listed)
+        perm = int(trade.orderStatus.permId or trade.order.permId or 0)
+        own_client = self._runtime().client_id
+        for t in listed:
+            if t is trade:
+                return True
+            t_perm = int(t.orderStatus.permId or t.order.permId or 0)
+            if perm and t_perm:
+                if t_perm == perm:               # permId is global: the same order, whoever placed it
+                    return True
+                continue
+            # no permId on one side: an orderId is only unique PER CLIENT (another API client on the same
+            # Gateway can hold the same number), so it counts only together with our own clientId
+            t_client = int(getattr(t.orderStatus, "clientId", 0) or getattr(t.order, "clientId", 0) or 0)
+            if oid and int(t.order.orderId or 0) == oid and t_client == own_client:
+                return True
+        return False
 
     async def _cancel_trade_confirmed(self, ib: Any, trade: Any) -> str:
         """Cancel one order and WAIT for IB to say so: ``"cancelled"``, ``"filled"`` (it traded first) or
@@ -1196,10 +1272,14 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
                 distrust = False
         if status == "Filled":
             return "filled"
+        seq = self._runtime().mark()
         ib.cancelOrder(trade.order)
         deadline = time.monotonic() + self._CANCEL_ACK_TIMEOUT
         while time.monotonic() < deadline:
             status = str(trade.orderStatus.status or "")
+            if any(c in M.ORDER_STATE_CODES for c, _ in self._runtime().order_errors(
+                    int(trade.order.orderId), seq, kinds=("order", "cancelled"))):
+                return "unconfirmed"             # IB REFUSED the cancel (e.g. 10148): it may still work
             if distrust:
                 if status in M.IB_REJECTION_STATUSES:
                     if not await self._listed_by_ib(ib, trade):
@@ -1752,6 +1832,12 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
             deadline = time.monotonic() + self._CANCEL_ACK_TIMEOUT
             refused = None
             while time.monotonic() < deadline:
+                errors = [(c, m) for c, m in self._runtime().order_errors(order_id, seq,
+                                                                           kinds=("order", "cancelled"))
+                          if c in M.ORDER_STATE_CODES]
+                if errors:                       # read BEFORE any status shortcut, in every branch
+                    refused = errors[-1]
+                    break
                 if distrust and str(trade.orderStatus.status) in M.IB_REJECTION_STATUSES:
                     # still the stale local status: wait for IB's own word (it stops listing the order,
                     # or its status moves to PendingCancel)
@@ -1761,12 +1847,6 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
                     continue
                 distrust = False
                 if str(trade.orderStatus.status) in ("PendingCancel", "Cancelled", "ApiCancelled"):
-                    break
-                errors = [(c, m) for c, m in self._runtime().order_errors(order_id, seq,
-                                                                           kinds=("order", "cancelled"))
-                          if c in M.ORDER_STATE_CODES]
-                if errors:
-                    refused = errors[-1]
                     break
                 await asyncio.sleep(0.02)
             if refused:
@@ -1822,8 +1902,13 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
 
     @classmethod
     def _order_carries(cls, order: Any, sent: Dict[str, Any]) -> bool:
-        return (cls._same_number(order.lmtPrice, sent["lmt"]) and cls._same_number(order.auxPrice, sent["aux"])
-                and cls._same_number(order.totalQuantity, sent["qty"]))
+        """Does the order object carry what was SENT? Only the prices that were actually sent count: a
+        LIMIT order sends no ``auxPrice`` (UNSET) and IB may echo it as 0.0 (or leave it unset), a STOP
+        sends no ``lmtPrice``; comparing those would never confirm a modification."""
+        for key, value in (("lmt", order.lmtPrice), ("aux", order.auxPrice)):
+            if M.ib_number(sent[key]) is not None and not cls._same_number(value, sent[key]):
+                return False
+        return cls._same_number(order.totalQuantity, sent["qty"])
 
     async def _modification_echoed(self, ib: Any, trade: Any, sent: Dict[str, Any]) -> bool:
         """Re-read the open orders and compare THIS order's values with what was sent. ib_async copies
@@ -2114,10 +2199,17 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         elif not row.open_price and view.filled > 0 and book is not None:
             # A completed order carries no average price (its status record is empty): take it from the
             # executions under the row's own ref / the order's permId, never zero or invent one.
-            ex = (book.executions_by_ref.get(view.order_ref)
-                  or (book.executions_by_perm.get(view.perm_id) if view.perm_id else None))
-            if ex and ex.get("price"):
-                row.open_price, changed = ex["price"], True
+            if view.sec_type == "BAG":
+                # a combo's executions are its LEGS': the price is the NET per combo unit, never the
+                # average of the leg prices
+                net = self._combo_from_view(view, book)
+                if net is not None:
+                    row.open_price, changed = net, True
+            else:
+                ex = (book.executions_by_ref.get(view.order_ref)
+                      or (book.executions_by_perm.get(view.perm_id) if view.perm_id else None))
+                if ex and ex.get("price"):
+                    row.open_price, changed = ex["price"], True
         working = view.status not in ("Filled", "Cancelled", "ApiCancelled", "Inactive")
         if working:
             # What is WORKING at IB is the truth: an OCO leg's size shrinks when the other leg part-fills
@@ -2209,12 +2301,24 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
             if age is not None and age < timedelta(minutes=grace):
                 continue
             perm = int(row.broker_order_id) if str(row.broker_order_id or "").isdigit() else 0
-            ex = book.executions_by_ref.get(self._order_ref_for_row(row, self.id)) \
-                or (book.executions_by_perm.get(perm) if perm else None)
+            ref = self._order_ref_for_row(row, self.id)
+            children = []
+            if row.asset_class == CoreAssetClass.OPTION and not row.contract_symbol:
+                with get_db() as session:
+                    children = list(session.exec(select(TradingOrder).where(
+                        TradingOrder.parent_order_id == row.id, TradingOrder.account_id == self.id)).all())
+            if children:
+                # a combo: its executions are LEG fills. Units = smallest leg fill / ratio, price = the net.
+                combo = self._combo_from_children(row, children, ref, perm, book)
+                ex = None if combo is None else {"shares": combo[0], "price": combo[1]}
+            else:
+                ex = book.executions_by_ref.get(ref) or (book.executions_by_perm.get(perm) if perm else None)
             if ex:
                 row.status = (OrderStatus.FILLED if ex["shares"] + 1e-9 >= float(row.quantity)
                               else OrderStatus.PARTIALLY_FILLED)
-                row.filled_qty, row.open_price = ex["shares"], ex["price"]
+                row.filled_qty = ex["shares"]
+                if ex["price"] is not None:
+                    row.open_price = ex["price"]
                 update_instance(row)
                 settled += 1
                 continue

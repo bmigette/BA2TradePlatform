@@ -24,15 +24,60 @@ class TwsSim:
         self.truth = {}
         self.sent = []
         c.placeOrder = lambda oid, contract, order: self.sent.append(("place", oid, order.lmtPrice, order.auxPrice))
-        c.cancelOrder = lambda *a, **k: self.sent.append(("cancel",) + a)
+        #: how TWS answers a cancel: 'ok' (PendingCancel then Cancelled + error 202), 'refuse' (error 10148),
+        #: 'lost' (nothing at all)
+        self.cancel_mode = "lost"
+        #: does TWS send an orderStatus after each openOrder on reqAllOpenOrders? (it is believed to)
+        self.status_on_open = True
+        #: other API clients' working orders: {orderId: {"client": n, "perm": n, ...}}
+        self.foreign = {}
+        c.cancelOrder = self._on_cancel
         c.reqAllOpenOrders = self._req_all_open
         c.reqOpenOrders = self._req_all_open
 
     def _req_all_open(self):
         asyncio.get_event_loop().call_later(0.05, self.deliver_open)
 
+    def _on_cancel(self, *a, **k):
+        self.sent.append(("cancel",) + a)
+        oid = a[0]
+        loop = asyncio.get_event_loop()
+        w = self.ib.wrapper
+        t = next((x for x in w.trades.values() if x.order.orderId == oid), None)
+        if t is None or self.cancel_mode == "lost":
+            return
+        if self.cancel_mode == "refuse":
+            loop.call_later(0.05, lambda: w.error(
+                oid, 10148, f"OrderId {oid} that needs to be cancelled cannot be cancelled, state: PendingCancel.", ""))
+            return
+
+        def pending():
+            self.truth[oid]["status"] = "PendingCancel"
+            self.status(t, "PendingCancel")
+        def done():
+            self.truth[oid]["status"] = "Cancelled"
+            self.status(t, "Cancelled")
+            w.error(oid, 202, "Order Canceled - reason:", "")
+        loop.call_later(0.03, pending)
+        loop.call_later(0.08, done)
+
+    def fill(self, order_id, qty, price):
+        """IB fills ``qty`` of the order (a partial fill leaves it Submitted)."""
+        t = next(x for x in self.ib.wrapper.trades.values() if x.order.orderId == order_id)
+        tr = self.truth[order_id]
+        done = tr.get("filled", 0.0) + qty
+        tr["filled"] = done
+        tr["status"] = "Filled" if done >= tr["qty"] - 1e-9 else "Submitted"
+        self.ib.wrapper.orderStatus(order_id, tr["status"], done, tr["qty"] - done, price, t.order.permId,
+                                    0, price, 7, "", 0.0)
+
     def deliver_open(self):
         w = self.ib.wrapper
+        for oid, f in self.foreign.items():
+            fo = Order(orderId=oid, clientId=f["client"], permId=f["perm"], action="BUY", totalQuantity=5,
+                       orderType="LMT", lmtPrice=10.0, orderRef="other-app", account=ACCOUNT)
+            w.openOrder(oid, AAPL, fo, OrderState(status="Submitted"))
+            w.orderStatus(oid, "Submitted", 0.0, 5.0, 0.0, f["perm"], 0, 0.0, f["client"], "", 0.0)
         for t in list(w.trades.values()):
             tr = self.truth.get(t.order.orderId)
             if tr is None or tr["status"] in ("Filled", "Cancelled"):
@@ -41,13 +86,15 @@ class TwsSim:
                       totalQuantity=tr["qty"], orderType=t.order.orderType, lmtPrice=tr["lmt"],
                       auxPrice=tr["aux"], orderRef=t.order.orderRef, account=ACCOUNT)
             w.openOrder(o.orderId, t.contract, o, OrderState(status=tr["status"]))
-            self.status(t, tr["status"])
+            if self.status_on_open:
+                self.status(t, tr["status"])
         w.openOrderEnd()
 
     def status(self, t, st):
         o = t.order
         tr = self.truth[o.orderId]
-        self.ib.wrapper.orderStatus(o.orderId, st, 0.0, tr["qty"], 0.0, o.permId, 0, 0.0, 7, "", 0.0)
+        done = tr.get("filled", 0.0)
+        self.ib.wrapper.orderStatus(o.orderId, st, done, tr["qty"] - done, 0.0, o.permId, 0, 0.0, 7, "", 0.0)
 
 
 AAPL = Stock("AAPL", "SMART", "USD")

@@ -721,3 +721,22 @@ modify + immediate re-read logging `Modified` with the OLD price; the local stat
 after a re-read; a completed order's `orderStatus.filled` vs `order.filledQuantity` and its status strings; the
 exact 321 text on a Read-Only-API Gateway; executions carrying an `orderRef`; whether TWS lists a
 not-yet-acknowledged order.
+
+## 16. Review round 4 (verification of 51a347a0)
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | a combo's executions are LEG fills: the price fallback averaged them (bought 5.00 / sold 2.00 stored 3.50, true net debit 3.00) and the settle path summed the legs' shares into `filled_qty` | the price is the NET per combo unit, `sum(side x leg average x ratio)` over the legs found by `(permId, conId)` / `(orderRef, conId)` (`BrokerOrderView.combo_legs` carries the ratios); the settle path takes units = smallest leg fill / ratio and the same net; a combo with any leg unexecuted is not settled from the others (UNRESOLVED); the sign follows the platform's +debit / -credit |
+| 2 | the cancel paths' distrust loops never read order errors: IB refused the cancel (10148) yet `_cancel_trades` returned True | errors are read before any status shortcut in every branch; `_cancel_trade_confirmed` returns `unconfirmed` on a refusal |
+| 3 | `_listed_by_ib` matched on orderId alone: another API client's order with the same orderId blocked re-placement | match on identity, else permId when both are known, else `(clientId, orderId)` with OUR client id |
+| J | a LIMIT order's `auxPrice` (unset, or echoed as 0.0) vetoed every modification confirmation | `_order_carries` compares only the prices that were actually SENT |
+
+`tests/ibkr_tws_sim.py` now also simulates a fill, `PendingCancel` / `Cancelled` + error 202, a refused cancel
+(10148), a lost cancel, an open-orders answer without `orderStatus`, and another client's colliding orderId;
+`TestRefusedModifyThenCancelOutcomes` distinguishes a CONFIRMED cancel (fast, IB-side truth `Cancelled`) from a
+timed-out one. `TestSizingRefusesWithoutBuyingPower` proves end to end that `get_available_balance()` is `None`
+for an IBKR account without buying power.
+
+New smoke `[CHECK]`s: orders with an empty status on `reqAllOpenOrders`; foreign clients' orderIds colliding with
+ours; the echoed `auxPrice` of a LIMIT order; error codes for cancelling an already-cancelled order; whether held
+(399/404) orders are listed; combo executions (leg fills carrying the combo's orderRef, any BAG-level fill).

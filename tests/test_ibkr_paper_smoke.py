@@ -89,6 +89,7 @@ class TestReadOnlyByDefault:
         assert code == 0
         assert out.count("candidate assignment/exercise") == 1
         assert "BOT 10.0@150.0 orderId=5" in out
+        assert "COMBO executions" in out
 
     def test_flex(self):
         fake, _ = make_fake()
@@ -164,6 +165,10 @@ class TestTestOrder:
         assert "LOCAL status after it" in out
         assert "EXACT 321 text" in out
         assert a_adapter_style_connect(fake)
+        assert "auxPrice as echoed for a LIMIT order" in out
+        assert "error codes when CANCELLING AN ALREADY-CANCELLED order" in out
+        assert "are HELD orders" in out
+        assert "OTHER API clients' orders" in out
         assert "a RESTING STOP's modification" in out
         assert "resting status=PreSubmitted" in out and "'Modified' logged=False" in out
         assert "shows the new stop=True" in out
