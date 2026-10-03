@@ -4158,6 +4158,69 @@ async def _open_invest_flow(account_id: int, valuation_mode: str, amount: float,
                                 invest_amount=amount)
 
 
+def _install_page_styles() -> None:
+    """Every stylesheet this page needs, installed BEFORE ``content()``'s first await.
+
+    NiceGUI sends the page HTML once the page builder yields; until the websocket
+    connects, ``ui.add_css`` / ``ui.add_head_html`` only append to the client's head
+    buffer, which has already been rendered -- so anything added in that window is
+    silently dropped (the phone cards and this toolbar rendered unstyled on prod,
+    2026-10-03). Called first thing in ``content()``, before ``_load_gate``'s await,
+    these land in the initial HTML.
+    """
+    # ONE HEIGHT FOR EVERY CONTROL, set in CSS because no combination of props gets
+    # there. A Quasar field and a Quasar button are different components with
+    # different internal padding: `dense` and `hide-bottom-space` narrow the gap and
+    # leave the select a few pixels taller than the buttons, which is exactly the
+    # misalignment that keeps being reported. `items-center` then centres two boxes
+    # of different heights -- correctly, and still looking wrong.
+    #
+    # Scoped to this toolbar (`pf-toolbar`) rather than global: the same fields
+    # elsewhere on the page sit in forms where their natural height is right.
+    # `!important` throughout, and that is not laziness. Quasar sets these heights
+    # from `.q-field--outlined .q-field__control`, which has the SAME specificity as
+    # anything scoped to this toolbar by one class -- so the winner is decided by
+    # stylesheet ORDER, and Quasar's loads after NiceGUI's add_css. The first
+    # attempt at this had no effect whatsoever for that reason.
+    #
+    # The field's own top padding is what makes the box taller than a button even
+    # once the control is pinned, so it is zeroed here too.
+    ui.add_css(f'''
+        .{TOOLBAR_CLASS} .q-field__control {{
+            min-height: {TOOLBAR_CONTROL_PX}px !important;
+            height: {TOOLBAR_CONTROL_PX}px !important; }}
+        .{TOOLBAR_CLASS} .q-field__marginal {{
+            height: {TOOLBAR_CONTROL_PX}px !important; }}
+        .{TOOLBAR_CLASS} .q-field--outlined .q-field__control {{
+            padding-top: 0 !important; padding-bottom: 0 !important; }}
+        .{TOOLBAR_CLASS} .q-field__native, .{TOOLBAR_CLASS} .q-field__input {{
+            padding-top: 0 !important; padding-bottom: 0 !important; }}
+        .{TOOLBAR_CLASS} .q-btn {{
+            min-height: {TOOLBAR_CONTROL_PX}px !important;
+            height: {TOOLBAR_CONTROL_PX}px !important; }}
+
+        /* The Review button's own bar: WHITE on the button's green.
+           Not `color=white track-color=green-8`, which is what it was: Quasar's
+           palette props resolve to its theme colours and land a dark green track
+           under a white sweep on a mid-green button -- three greens, and the bar
+           reads as a shadow. The moving part and the track are addressed directly
+           so the contrast is a decision rather than whatever the palette gives.
+           `__model` covers BOTH renderings: determinate uses one, indeterminate
+           two, and both carry that class. */
+        .{TOOLBAR_CLASS} .q-linear-progress__model {{
+            background: #ffffff !important; opacity: 1 !important; }}
+        .{TOOLBAR_CLASS} .q-linear-progress__track {{
+            background: rgba(255, 255, 255, 0.35) !important; opacity: 1 !important; }}
+    ''')
+    # THE PHONE LAYER for this page's own widgets (label headers, symbol cards, the
+    # dry-run dialog's card rows, dialogs) -- see ``page_phone_css``. Then the
+    # breakpoint listener: it re-pins every symbol table's card mode when the
+    # viewport crosses 639px, because the ``:grid`` expression is read once.
+    ui.add_head_html(page_css_link_html())
+    ui.add_css(page_phone_css())
+    install_phone_listener(_phone_tables(), ui.add_head_html, ui.on)
+
+
 async def content() -> None:
     """Entry point for the /portfolioallocation route."""
     account_id = get_selected_account_id()
@@ -4167,6 +4230,9 @@ async def content() -> None:
         with ui.row().classes('w-full items-center justify-between'):
             ui.label('📊 Portfolio Allocation').classes('text-h6')
             ui.label('Manually traded accounts only').classes('text-xs text-secondary-custom')
+
+        # Styles FIRST: anything added to the head after the await below is dropped.
+        _install_page_styles()
 
         # Both loaders touch the DB. Unguarded, a DB error here escapes the route
         # handler and NiceGUI answers 500 with nothing on the page to explain it.
@@ -4182,57 +4248,6 @@ async def content() -> None:
             _render_gate_blocked(gate)
             return
 
-        # ONE HEIGHT FOR EVERY CONTROL, set in CSS because no combination of props gets
-        # there. A Quasar field and a Quasar button are different components with
-        # different internal padding: `dense` and `hide-bottom-space` narrow the gap and
-        # leave the select a few pixels taller than the buttons, which is exactly the
-        # misalignment that keeps being reported. `items-center` then centres two boxes
-        # of different heights -- correctly, and still looking wrong.
-        #
-        # Scoped to this toolbar (`pf-toolbar`) rather than global: the same fields
-        # elsewhere on the page sit in forms where their natural height is right.
-        # `!important` throughout, and that is not laziness. Quasar sets these heights
-        # from `.q-field--outlined .q-field__control`, which has the SAME specificity as
-        # anything scoped to this toolbar by one class -- so the winner is decided by
-        # stylesheet ORDER, and Quasar's loads after NiceGUI's add_css. The first
-        # attempt at this had no effect whatsoever for that reason.
-        #
-        # The field's own top padding is what makes the box taller than a button even
-        # once the control is pinned, so it is zeroed here too.
-        ui.add_css(f'''
-            .{TOOLBAR_CLASS} .q-field__control {{
-                min-height: {TOOLBAR_CONTROL_PX}px !important;
-                height: {TOOLBAR_CONTROL_PX}px !important; }}
-            .{TOOLBAR_CLASS} .q-field__marginal {{
-                height: {TOOLBAR_CONTROL_PX}px !important; }}
-            .{TOOLBAR_CLASS} .q-field--outlined .q-field__control {{
-                padding-top: 0 !important; padding-bottom: 0 !important; }}
-            .{TOOLBAR_CLASS} .q-field__native, .{TOOLBAR_CLASS} .q-field__input {{
-                padding-top: 0 !important; padding-bottom: 0 !important; }}
-            .{TOOLBAR_CLASS} .q-btn {{
-                min-height: {TOOLBAR_CONTROL_PX}px !important;
-                height: {TOOLBAR_CONTROL_PX}px !important; }}
-
-            /* The Review button's own bar: WHITE on the button's green.
-               Not `color=white track-color=green-8`, which is what it was: Quasar's
-               palette props resolve to its theme colours and land a dark green track
-               under a white sweep on a mid-green button -- three greens, and the bar
-               reads as a shadow. The moving part and the track are addressed directly
-               so the contrast is a decision rather than whatever the palette gives.
-               `__model` covers BOTH renderings: determinate uses one, indeterminate
-               two, and both carry that class. */
-            .{TOOLBAR_CLASS} .q-linear-progress__model {{
-                background: #ffffff !important; opacity: 1 !important; }}
-            .{TOOLBAR_CLASS} .q-linear-progress__track {{
-                background: rgba(255, 255, 255, 0.35) !important; opacity: 1 !important; }}
-        ''')
-        # THE PHONE LAYER for this page's own widgets (label headers, symbol cards, the
-        # dry-run dialog's card rows, dialogs) -- see ``page_phone_css``. Then the
-        # breakpoint listener: it re-pins every symbol table's card mode when the
-        # viewport crosses 639px, because the ``:grid`` expression is read once.
-        ui.add_head_html(page_css_link_html())
-        ui.add_css(page_phone_css())
-        install_phone_listener(_phone_tables(), ui.add_head_html, ui.on)
         toolbar = ui.row().classes(f'w-full items-center gap-2 {TOOLBAR_CLASS} {ACTIONS_CLASS}')
         body = ui.column().classes('w-full gap-3')
         # THE INCOME PANEL'S OWN HOME, cleared and refilled by ``_refresh``. It used to
