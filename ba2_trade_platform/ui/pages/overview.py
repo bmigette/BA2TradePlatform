@@ -20,7 +20,11 @@ from datetime import date
 from ..utils.chart_helpers import (
     axis_format, fullscreen_button, fullscreen_content_button, grid_options,
     growth_pct_of_invested, label_series_colors, legend_options, mode_toggle,
-    pct_of_invested, responsive_echart,
+    pct_of_invested, responsive_echart, legend_below, grid_below,
+)
+from ..utils.chart_axes import (
+    MAX_DETAIL_LABELS, clip_forecast, date_axis, detail_labels, first_holding_index,
+    month_axis, null_before_start, stacked_month_series, stacked_tooltip_js,
 )
 from ..utils.perf_logger import PerfLogger
 from ..utils.protective_stop import resolve_protective_legs
@@ -5417,6 +5421,22 @@ class AccountGrowthTab:
         else:
             self._sess()[chart] = list(visible)
 
+    def _flag(self, name, default):
+        """A persisted on/off choice of the Growth by Label chart. Per account in the DB; with
+        several accounts in view it is whatever the session set, else any account's saved ON."""
+        key = ('flag', name)
+        if key in self._sess():
+            return self._sess()[key]
+        saved = [read_overview_setting(single_key('growth_' + name, aid)) for aid in self._account_ids]
+        saved = [v for v in saved if isinstance(v, bool)]
+        return any(saved) if saved else default
+
+    def _set_flag(self, name, value):
+        if self._single_account is not None:
+            _save_setting(single_key('growth_' + name, self._single_account), bool(value))
+        else:
+            self._sess()[('flag', name)] = bool(value)
+
     def _persist_single(self, chart, value):
         if self._single_account is not None:
             _save_setting(single_key(chart, self._single_account), value)
@@ -5453,9 +5473,9 @@ class AccountGrowthTab:
             _summary()
             select.on_value_change(_summary)
             ui.button('All', on_click=lambda: setattr(select, 'value', select_all(options))
-                      ).props('flat dense size=sm').tooltip('Select all')
+                      ).props('outline dense no-caps').classes('ba2-ctl ba2-ctl-btn').tooltip('Select all')
             ui.button('None', on_click=lambda: setattr(select, 'value', select_none())
-                      ).props('flat dense size=sm').tooltip('Select none')
+                      ).props('outline dense no-caps').classes('ba2-ctl ba2-ctl-btn').tooltip('Select none')
         return select
 
     def _compute_dividend_forecast(self, all_dividends, all_filled_trades, qty_by_account_symbol):
@@ -5598,9 +5618,9 @@ class AccountGrowthTab:
                 select.on_value_change(_summary)
                 with ui.row().classes('w-full items-center gap-2 flex-wrap'):
                     all_btn = ui.button('All', on_click=lambda: setattr(select, 'value', select_all(options))
-                                        ).props('flat dense size=sm')
+                                        ).props('outline dense no-caps').classes('ba2-ctl ba2-ctl-btn')
                     none_btn = ui.button('None', on_click=lambda: setattr(select, 'value', select_none())
-                                         ).props('flat dense size=sm')
+                                         ).props('outline dense no-caps').classes('ba2-ctl ba2-ctl-btn')
                     follow = ui.switch('Follow portfolio manager labels', value=st['follow']).tooltip(
                         'On: the scope is the account managed labels from the portfolio manager '
                         'and follows them as they change (re-read on every page load). Turning it on '
@@ -5659,18 +5679,18 @@ class AccountGrowthTab:
             # ONE time range for every chart on the page (persisted in the DB).
             with ui.row().classes('w-full items-center gap-2 mb-2'):
                 ui.label('Time range').classes('text-sm text-gray-500')
-                range_toggle = ui.toggle(RANGE_OPTIONS, value=self._range).props('dense no-caps')
+                range_toggle = ui.toggle(RANGE_OPTIONS, value=self._range).props('dense no-caps').classes('ba2-ctl')
                 range_toggle.tooltip(
                     'Applies to every chart on this page. Cumulative lines (dividends, '
                     'invested, P&L %) are rebased to start at the range start; the monthly '
                     'bars show the months in range plus the next 2 months of dividend forecast.')
-                refresh_btn = ui.button(icon='refresh').props('flat round dense').tooltip(
+                refresh_btn = ui.button(icon='refresh').props('flat round dense').classes('ba2-ctl').tooltip(
                     'Reload broker data (trades, dividends, balances, prices) now. Data is reused '
                     f'for {BROKER_DATA_TTL_SECONDS}s; a click after that redraws from what the '
                     'page has and refreshes in the background (a chip appears if rows changed).')
                 self._updated_label = ui.label('Updated --:--:--').classes('text-xs text-gray-500')
                 new_data_btn = ui.button('New data - tap to refresh', icon='sync').props(
-                    'dense no-caps color=primary')
+                    'dense no-caps color=primary').classes('ba2-ctl')
                 new_data_btn.set_visibility(False)
                 self._new_data_btn = new_data_btn
 
@@ -5884,6 +5904,8 @@ class AccountGrowthTab:
                     # range start drop out (the FIFO/dividend compute above stays on the
                     # full history so realized P&L is unchanged).
                     shown_months = filter_months(months, self._range_start)
+                    shown_months = month_axis(shown_months, list((self._forecast or {}).keys()),
+                                              self._range_start, date.today())
                     with chart_holder:
                         # New monthly histograms at the top
                         self._render_monthly_realized_income_chart(shown_months, monthly_income, monthly_global)
@@ -6360,13 +6382,12 @@ class AccountGrowthTab:
             with ui.row().classes('w-full items-center justify-between'):
                 ui.label('Monthly Realized Income').classes('text-md font-bold mb-2')
                 with ui.row().classes('items-center gap-1'):
-                    mode = ui.toggle(['$', '%'], value='$').props('dense')
+                    mode = mode_toggle()
                     fullscreen_button(lambda: build(),
                                       title='Monthly Realized Income')
-            forecast = self._forecast or {}
-            fc_months = sorted(forecast)
-            months = sorted(set(months) | set(fc_months))
-            if not months:
+            # ``months`` is the shared axis (month_axis): range start .. current month + 1.
+            forecast = clip_forecast(self._forecast, months)
+            if not any(m in monthly_income for m in months) and not forecast:
                 ui.label('No closed trades or dividend income yet.').classes('text-sm text-gray-500')
                 return
             monthly_global = monthly_global or {}
@@ -6429,16 +6450,16 @@ class AccountGrowthTab:
             with ui.row().classes('w-full items-center justify-between'):
                 ui.label('Monthly Closed Profit + Dividends by Label').classes('text-md font-bold mb-2')
                 with ui.row().classes('items-center gap-1'):
-                    mode = ui.toggle(['$', '%'], value='$').props('dense')
+                    mode = mode_toggle()
                     fullscreen_button(lambda: build(),
                                       title='Monthly Closed Profit + Dividends by Label')
             all_label_count = len(set(labels))
             labels = apply_scope(labels, self._scope)
             hidden_by_scope = all_label_count - len(set(labels))
-            forecast = self._forecast or {}
-            months = sorted(set(months) | set(forecast))
-            if not months or not labels:
-                ui.label('No closed trades yet.' if not months
+            forecast = clip_forecast(self._forecast, months)
+            has_data = any(m in monthly_by_label for m in months) or bool(forecast)
+            if not has_data or not labels:
+                ui.label('No closed trades yet.' if not has_data
                          else 'No labels in scope (see the label scope setting above).'
                          ).classes('text-sm text-gray-500')
                 return
@@ -6456,39 +6477,33 @@ class AccountGrowthTab:
                 return round(v / denom * 100, 2) if denom else None
 
             def build_options(visible, pct):
-                series = []
-                for lb in labels:
-                    if lb not in visible:
-                        continue
-                    series.append({
-                        'name': lb, 'type': 'bar', 'stack': lb,
-                        'data': [cell(m, lb, pct) if m in monthly_by_label else None for m in months],
-                        'itemStyle': {'color': label_color[lb]},
-                    })
-                legend_names = [s['name'] for s in series]
-                if not pct:
-                    # Forecast: the label's colour, see-through with a dashed border, stacked
-                    # on the label's own bar. Never merged into the actual series.
-                    for lb in labels:
-                        if lb not in visible:
-                            continue
-                        data = [round(forecast[m]['labels'][lb], 2)
-                                if m in forecast and lb in forecast[m]['labels'] else None
-                                for m in months]
-                        if any(v is not None for v in data):
-                            series.append({
-                                'name': f'{lb} (forecast, estimated)', 'type': 'bar', 'stack': lb,
-                                'data': data,
-                                'itemStyle': {'color': _rgba(label_color[lb], 0.35),
-                                              'borderColor': label_color[lb],
-                                              'borderType': 'dashed', 'borderWidth': 1},
-                            })
+                shown = [lb for lb in labels if lb in visible]
+                if pct:
+                    # % of each label's OWN market value: stacking percentages of different
+                    # bases is meaningless, so % keeps side-by-side bars (no forecast, no total).
+                    series = [{'name': lb, 'type': 'bar',
+                               'data': [cell(m, lb, True) if m in monthly_by_label else None for m in months],
+                               'itemStyle': {'color': label_color[lb]}} for lb in shown]
+                    legend_names = list(shown)
+                else:
+                    # $: STACKED per month -- positives up, negatives down -- so 19 labels are
+                    # readable bars instead of hair-thin side-by-side slivers. Same numbers.
+                    series = stacked_month_series(
+                        months, shown,
+                        lambda m, lb: cell(m, lb, False) if m in monthly_by_label else None,
+                        lambda m, lb: (round(forecast[m]['labels'][lb], 2)
+                                       if m in forecast and lb in forecast[m]['labels'] else None),
+                        lambda lb: label_color[lb], lambda lb: _rgba(label_color[lb], 0.35))
+                    legend_names = list(shown) + ['Total']
                 fmt = '{value}%' if pct else '${value}'
+                tooltip = {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}}
+                if not pct:
+                    tooltip[':formatter'] = stacked_tooltip_js(False)
                 return {
                     'backgroundColor': 'transparent',
-                    'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
-                    'legend': legend_options(legend_names),
-                    'grid': grid_options(legend_names),
+                    'tooltip': tooltip,
+                    'legend': legend_below(legend_names),
+                    'grid': grid_below(legend_names),
                     'xAxis': {'type': 'category', 'data': months, 'axisLabel': {'color': '#a0aec0'}},
                     'yAxis': {'type': 'value', 'axisLabel': {'color': '#a0aec0', 'formatter': fmt},
                               'splitLine': {'lineStyle': {'color': 'rgba(255,255,255,0.05)'}}},
@@ -6512,10 +6527,10 @@ class AccountGrowthTab:
                 self._kick_refresh()
                 chart_container.clear()
                 with chart_container:
-                    responsive_echart(build_options(visible, mode.value == '%')).classes('w-full').style('height: 320px')
+                    responsive_echart(build_options(visible, mode.value == '%')).classes('w-full').style('height: 360px')
 
             with chart_container:
-                responsive_echart(build_options(default_labels, False)).classes('w-full').style('height: 320px')
+                responsive_echart(build_options(default_labels, False)).classes('w-full').style('height: 360px')
             label_select.on_value_change(lambda e: rebuild())
             mode.on_value_change(lambda e: rebuild())
 
@@ -6818,12 +6833,7 @@ class AccountGrowthTab:
                     'top': 5,
                 },
                 'grid': {'left': '3%', 'right': right_margin, 'bottom': '3%', 'containLabel': True},
-                'xAxis': {
-                    'type': 'category',
-                    'data': all_dates,
-                    'axisLabel': {'color': '#a0aec0', 'rotate': 45, 'fontSize': 10},
-                    'axisLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.1)'}},
-                },
+                'xAxis': date_axis(all_dates),
                 'yAxis': y_axes,
                 'series': series,
             }
@@ -7058,6 +7068,7 @@ class AccountGrowthTab:
                 # is the reference the other two are read against.
                 pct = mode.value == '%'
 
+                detail_set = set(detail_labels(visible_labels)[0])
                 for i, label in enumerate(visible_labels):
                     color = color_by_label.get(label, palette[i % len(palette)])
                     # Total value = holdings value only. Dividends are NOT added: reinvested
@@ -7069,6 +7080,7 @@ class AccountGrowthTab:
                     div_data = list(label_cum_divs[label])
                     has_div = has_any_dividends and label_cum_divs[label][-1] > 0
                     has_inv = has_any_invested and label_cum_invested[label][-1] > 0
+                    start_idx = first_holding_index(total_data)     # nothing is held before this
                     if pct:
                         # Converted BEFORE the band is computed, so "above/below the
                         # invested line" keeps meaning the same thing in both modes.
@@ -7083,6 +7095,10 @@ class AccountGrowthTab:
                         total_data = growth_pct_of_invested(total_data, denom)
                         div_data = pct_of_invested(div_data, denom)
                         inv_data = growth_pct_of_invested(denom, denom)
+                    # No line before the label held anything (None, not a flat 0 that jumps).
+                    total_data = null_before_start(total_data, start_idx)
+                    inv_data = null_before_start(inv_data, start_idx)
+                    div_data = null_before_start(div_data, start_idx)
 
                     # Gain/loss band between Total and Invested (single label only).
                     # Two stacked bands: green where Total >= Invested, red where Invested > Total.
@@ -7115,7 +7131,7 @@ class AccountGrowthTab:
 
                     # Cumulative dividends (dashed) — full amount (cash + reinvested) for
                     # visibility; informational only, not added to the Total line.
-                    if show_dividends and has_div:
+                    if show_dividends and has_div and label in detail_set:
                         div_name = f'{label} (Dividends)'
                         series.append({
                             'name': div_name, 'type': 'line', 'data': div_data, 'smooth': True,
@@ -7125,7 +7141,7 @@ class AccountGrowthTab:
                         legend_data.append(div_name)
 
                     # Invested capital (DOTTED)
-                    if show_invested and has_inv:
+                    if show_invested and has_inv and label in detail_set:
                         inv_name = f'{label} (Invested)'
                         series.append({
                             'name': inv_name, 'type': 'line', 'data': inv_data, 'smooth': False,
@@ -7150,14 +7166,9 @@ class AccountGrowthTab:
                     # handful of entries the legend paginates instead of wrapping, and
                     # the plot starts below whichever shape it took. Unpaginated, thirty
                     # series names wrapped onto four rows and covered the top gridline.
-                    'legend': legend_options(legend_data),
-                    'grid': grid_options(legend_data),
-                    'xAxis': {
-                        'type': 'category',
-                        'data': all_dates,
-                        'axisLabel': {'color': '#a0aec0', 'rotate': 45, 'fontSize': 10},
-                        'axisLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.1)'}},
-                    },
+                    'legend': legend_below(legend_data),
+                    'grid': grid_below(legend_data),
+                    'xAxis': date_axis(all_dates),
                     'yAxis': {
                         'type': 'value',
                         'axisLabel': {'color': '#a0aec0', 'formatter': axis_format(pct)},
@@ -7175,9 +7186,21 @@ class AccountGrowthTab:
             with ui.row().classes('w-full gap-4 items-center mb-2'):
                 label_select = self._multi_select_with_all_none(
                     all_labels, default_labels, 'Visible Labels', 'w-64')
-                show_total_cb = ui.checkbox('Total', value=True)
-                show_div_cb = ui.checkbox('Dividends', value=True)
-                show_inv_cb = ui.checkbox('Invested', value=True)
+                # Total only by default: 19 labels x 3 series is 57 lines. Dividends / Invested
+                # are opt-in and the choice is remembered (per account, like the label picks).
+                show_total_cb = ui.checkbox('Total', value=self._flag('show_total', True))
+                show_div_cb = ui.checkbox('Dividends', value=self._flag('show_dividends', False))
+                show_inv_cb = ui.checkbox('Invested', value=self._flag('show_invested', False))
+            detail_note = ui.label('').classes('text-xs text-gray-500')
+
+            def update_detail_note(visible):
+                _, left_out = detail_labels(visible)
+                on = show_div_cb.value or show_inv_cb.value
+                detail_note.set_text(
+                    f'Dividends / Invested are drawn for the first {MAX_DETAIL_LABELS} selected labels '
+                    f'only ({left_out} left out); select fewer labels to see them all.'
+                    if on and left_out else '')
+            update_detail_note(default_labels)
 
             if self._hidden_labels > 0:
                 ui.label(f'{self._hidden_labels} labels hidden by the label scope').classes('text-xs text-gray-500')
@@ -7186,15 +7209,21 @@ class AccountGrowthTab:
             def rebuild_label_chart():
                 visible = sorted(list(label_select.value)) if label_select.value else []
                 self._persist_selection(CHART_GROWTH, visible)
+                self._set_flag('show_total', bool(show_total_cb.value))
+                self._set_flag('show_dividends', bool(show_div_cb.value))
+                self._set_flag('show_invested', bool(show_inv_cb.value))
                 self._kick_refresh()
+                update_detail_note(visible)
                 chart_container.clear()
                 with chart_container:
                     responsive_echart(build_chart_options(
                         visible, show_total_cb.value, show_div_cb.value, show_inv_cb.value
-                    )).classes('w-full h-80')
+                    )).classes('w-full').style('height: 380px')
 
             with chart_container:
-                responsive_echart(build_chart_options(default_labels)).classes('w-full h-80')
+                responsive_echart(build_chart_options(
+                    default_labels, show_total_cb.value, show_div_cb.value, show_inv_cb.value
+                )).classes('w-full').style('height: 380px')
 
             label_select.on_value_change(lambda e: rebuild_label_chart())
             show_total_cb.on_value_change(lambda e: rebuild_label_chart())
@@ -7415,71 +7444,37 @@ class AccountGrowthTab:
                         return [round(v, 2) for v in values]
                     return pct_of_invested(values, sym_cum_invested.get(sym) or [])
 
+                # ONE colour per symbol; the line style says what the line is: solid = value,
+                # dashed = cumulative dividends, dotted = invested capital. The legend lists the
+                # symbols only (it used to carry 'IBB (Total)' = the value line again, 'IBB
+                # (Invested)', ... and was read as five different things).
                 for i, sym in enumerate(symbols):
                     if sym not in sym_daily_values:
                         continue
                     color = colors[i % len(colors)]
+                    # No line before the position existed (None, not a flat 0 that jumps).
+                    start_idx = first_holding_index(sym_daily_values[sym])
                     series.append({
-                        'name': sym,
-                        'type': 'line',
-                        'data': _conv(sym_daily_values[sym], sym),
-                        'smooth': True,
-                        'lineStyle': {'width': 2, 'color': color},
-                        'itemStyle': {'color': color},
-                        'showSymbol': False,
+                        'name': sym, 'type': 'line',
+                        'data': null_before_start(_conv(sym_daily_values[sym], sym), start_idx),
+                        'smooth': True, 'lineStyle': {'width': 2, 'color': color, 'type': 'solid'},
+                        'itemStyle': {'color': color}, 'showSymbol': False,
                     })
                     legend_data.append(sym)
-
-                if has_divs:
-                    for i, sym in enumerate(symbols):
-                        if sym not in sym_cum_divs:
-                            continue
-                        color = colors[i % len(colors)]
-                        if sym_cum_divs[sym][-1] > 0:
-                            div_name = f'{sym} (Dividends)'
-                            series.append({
-                                'name': div_name,
-                                'type': 'line',
-                                'data': _conv_yield(sym_cum_divs[sym], sym),
-                                'smooth': True,
-                                'lineStyle': {'width': 1.5, 'color': color, 'type': 'dashed'},
-                                'itemStyle': {'color': color},
-                                'showSymbol': False,
-                            })
-                            legend_data.append(div_name)
-
-                            # Total = holdings value only. Dividends are shown separately and
-                            # not added (reinvested dividends are already in value + invested).
-                            total_name = f'{sym} (Total)'
-                            total_data = _conv(sym_daily_values[sym], sym)
-                            series.append({
-                                'name': total_name,
-                                'type': 'line',
-                                'data': total_data,
-                                'smooth': True,
-                                'lineStyle': {'width': 1.5, 'color': color, 'type': 'dotted'},
-                                'itemStyle': {'color': color},
-                                'showSymbol': False,
-                            })
-                            legend_data.append(total_name)
-
-                if has_invested:
-                    for i, sym in enumerate(symbols):
-                        if sym not in sym_cum_invested:
-                            continue
-                        color = colors[i % len(colors)]
-                        if sym_cum_invested[sym][-1] > 0:
-                            inv_name = f'{sym} (Invested)'
-                            series.append({
-                                'name': inv_name,
-                                'type': 'line',
-                                'data': _conv(sym_cum_invested[sym], sym),
-                                'smooth': False,
-                                'lineStyle': {'width': 1.5, 'color': color, 'type': 'dotdash'},
-                                'itemStyle': {'color': color},
-                                'showSymbol': False,
-                            })
-                            legend_data.append(inv_name)
+                    if has_divs and sym in sym_cum_divs and sym_cum_divs[sym][-1] > 0:
+                        series.append({
+                            'name': f'{sym} - dividends', 'type': 'line',
+                            'data': null_before_start(_conv_yield(sym_cum_divs[sym], sym), start_idx),
+                            'smooth': True, 'lineStyle': {'width': 1.5, 'color': color, 'type': 'dashed'},
+                            'itemStyle': {'color': color}, 'showSymbol': False,
+                        })
+                    if has_invested and sym in sym_cum_invested and sym_cum_invested[sym][-1] > 0:
+                        series.append({
+                            'name': f'{sym} - invested', 'type': 'line',
+                            'data': null_before_start(_conv(sym_cum_invested[sym], sym), start_idx),
+                            'smooth': False, 'lineStyle': {'width': 1.5, 'color': color, 'type': 'dotted'},
+                            'itemStyle': {'color': color}, 'showSymbol': False,
+                        })
 
                 return {
                     'backgroundColor': 'transparent',
@@ -7493,14 +7488,9 @@ class AccountGrowthTab:
                         'borderColor': 'rgba(255, 255, 255, 0.1)',
                         'textStyle': {'color': '#ffffff'},
                     },
-                    'legend': legend_options(legend_data),
-                    'grid': grid_options(legend_data),
-                    'xAxis': {
-                        'type': 'category',
-                        'data': all_dates,
-                        'axisLabel': {'color': '#a0aec0', 'rotate': 45, 'fontSize': 10},
-                        'axisLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.1)'}},
-                    },
+                    'legend': legend_below(legend_data),
+                    'grid': grid_below(legend_data),
+                    'xAxis': date_axis(all_dates),
                     'yAxis': {
                         'type': 'value',
                         'axisLabel': {'color': '#a0aec0', 'formatter': axis_format(pct)},
@@ -7519,9 +7509,12 @@ class AccountGrowthTab:
                 label='Select Label',
             ).classes('w-64 mb-2')
 
+            ui.label('One colour per symbol. Solid = value, dashed = cumulative dividends, '
+                     'dotted = invested capital. No line before the position existed.'
+                     ).classes('text-xs text-gray-500 mb-1')
             position_chart_container = ui.column().classes('w-full')
             with position_chart_container:
-                responsive_echart(build_position_chart_options(default_label)).classes('w-full h-80')
+                responsive_echart(build_position_chart_options(default_label)).classes('w-full').style('height: 380px')
 
             def on_position_label_change(e):
                 if not e.value:
@@ -7530,7 +7523,7 @@ class AccountGrowthTab:
                 self._kick_refresh()
                 position_chart_container.clear()
                 with position_chart_container:
-                    responsive_echart(build_position_chart_options(e.value)).classes('w-full h-80')
+                    responsive_echart(build_position_chart_options(e.value)).classes('w-full').style('height: 380px')
 
             label_select.on_value_change(on_position_label_change)
             # The toggle redraws the CURRENT label, so it reuses the same handler with
@@ -8089,11 +8082,7 @@ class AccountGrowthTab:
                 'top': 30,
             },
             'grid': {'left': '3%', 'right': right_margin, 'bottom': '3%', 'containLabel': True},
-            'xAxis': {
-                'type': 'category',
-                'data': all_dates,
-                'axisLabel': {'color': '#a0aec0', 'rotate': 45, 'fontSize': 10},
-            },
+            'xAxis': date_axis(all_dates),
             'yAxis': y_axes,
             'series': series,
         }
