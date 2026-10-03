@@ -141,3 +141,22 @@ def test_monthly_series_drawdown_walks_the_cumulative_curve():
     assert [v for _d, v in dd['n']] == [5.0, 5.0]       # peak starts at 0, as the $ metric
     assert [v for _d, v in count['a']] == [1, 2]
     assert [v for _d, v in profit['n']] == [-5.0, 0]
+
+
+def test_every_hover_shows_the_full_name_not_the_shortened_tick():
+    names = ['goal2020-sen_S6_notional_top1', 'goal2020-small_ED_S2top1']
+    colors = pv.assign_colors(names)
+    hb = pv.hbar_figure(names, [20.94, -3.0], colors, pv.PHONE_LAYOUT, 'money').data[0]
+    wl = pv.win_loss_figure(names, [3, 1], [1, 2], pv.PHONE_LAYOUT)
+    series = {n: [(datetime(2026, 2, 1), 1.0)] for n in names}
+    ml = pv.monthly_line_figure(series, names, colors, pv.PHONE_LAYOUT, 'money')
+    for trace in [hb, *wl.data, *ml.data]:
+        assert '%{customdata}' in trace.hovertemplate and '%{y}<' not in trace.hovertemplate
+    assert list(hb.customdata) == names and list(wl.data[0].customdata) == names
+    assert [t.customdata[0] for t in ml.data] == names
+
+
+def test_modebar_hidden_on_phone_only():
+    assert pv.plot_config(pv.PHONE_LAYOUT)['displayModeBar'] is False
+    assert pv.plot_config(pv.DESKTOP_LAYOUT)['displayModeBar'] is True
+    assert pv.plot_config(pv.PHONE_LAYOUT)['responsive'] is True
