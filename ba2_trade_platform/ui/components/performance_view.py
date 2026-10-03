@@ -128,11 +128,32 @@ def assign_colors(order: Sequence[str]) -> Dict[str, str]:
 
 
 def shorten_label(name: str, max_chars: Optional[int]) -> str:
-    """Tick label: the name, or its first ``max_chars - 1`` characters and an ellipsis.
-    The full name stays in the hover."""
+    """Tick label: the name, or its head and its TAIL joined by an ellipsis (the suffix
+    is what tells ``goal2020-small_ED_S1top1`` from ``goal2020-small_ED_S2top1``), at most
+    ``max_chars`` long. The full name stays in the hover."""
     if max_chars is None or len(name) <= max_chars:
         return name
-    return name[:max_chars - 1] + '…'
+    keep = max_chars - 1
+    tail = (keep * 9 + 10) // 20       # ~45% tail
+    head = keep - tail
+    return name[:head] + '…' + name[len(name) - tail:]
+
+
+def shorten_labels(names: Sequence[str], max_chars: Optional[int]) -> List[str]:
+    """Shorten every name to ``max_chars``, then widen the limit until distinct full names
+    stay distinct (falls back to the full names). Pure."""
+    names = list(names)
+    if max_chars is None:
+        return names
+    distinct = len(set(names))
+    limit = max_chars
+    longest = max((len(n) for n in names), default=0)
+    while limit < longest:
+        out = [shorten_label(n, limit) for n in names]
+        if len(set(out)) == distinct:
+            return out
+        limit += 1
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +283,7 @@ def hbar_figure(names: Sequence[str], values: Sequence[float], colors: Dict[str,
                    ticksuffix=' d' if kind == 'days' else ''),
         yaxis=dict(autorange='reversed', automargin=True, fixedrange=True,
                    tickmode='array', tickvals=list(names),
-                   ticktext=[shorten_label(n, layout.label_max_chars) for n in names],
+                   ticktext=shorten_labels(names, layout.label_max_chars),
                    tickfont=dict(size=layout.tick_font, color=_TEXT)),
     )
     return fig
@@ -292,7 +313,7 @@ def win_loss_figure(names: Sequence[str], wins: Sequence[int], losses: Sequence[
                    tickfont=dict(size=layout.tick_font - 1)),
         yaxis=dict(autorange='reversed', automargin=True, fixedrange=True,
                    tickmode='array', tickvals=list(names),
-                   ticktext=[shorten_label(n, layout.label_max_chars) for n in names],
+                   ticktext=shorten_labels(names, layout.label_max_chars),
                    tickfont=dict(size=layout.tick_font, color=_TEXT)),
         legend=dict(orientation='h', x=0, xanchor='left', yanchor='top',
                     y=-(34 / max(1, height - 8 - 62)),
@@ -308,7 +329,7 @@ def win_loss_figure(names: Sequence[str], wins: Sequence[int], losses: Sequence[
 def monthly_line_figure(series: Dict[str, List[Tuple[datetime, Optional[float]]]],
                         order: Sequence[str], colors: Dict[str, str], layout: ChartLayout,
                         value_kind: str, show_legend: bool = True,
-                        reverse_y: bool = False) -> go.Figure:
+                        reverse_y: bool = False, y_title: str = '') -> go.Figure:
     """One line per expert over the months. The legend sits BELOW the plot, in as many
     rows as the names need; the figure's bottom margin is sized to that, so nothing
     overlaps the plot or the title (which is HTML, outside the figure).
@@ -334,6 +355,9 @@ def monthly_line_figure(series: Dict[str, List[Tuple[datetime, Optional[float]]]
                  ticksuffix='%' if value_kind == 'pct' else '')
     if value_kind == 'count':
         yaxis['rangemode'] = 'tozero'
+    if y_title:
+        yaxis['title'] = dict(text=y_title, font=dict(size=layout.tick_font - 1, color=_MUTED),
+                              standoff=6)
     if reverse_y:
         yaxis['autorange'] = 'reversed'
         yaxis['rangemode'] = 'tozero'
@@ -361,9 +385,10 @@ def monthly_series(monthly_data: Dict[str, Dict[str, Dict[str, float]]]):
 
     Drawdown is a property of the CUMULATIVE curve, so it is walked month by month rather
     than derived from each month's P&L in isolation: a month that made money can still leave
-    the expert further below its peak. With no positive peak yet there is nothing to be down
-    FROM, so the value is ``None`` (a gap), not 0% -- 0% would read as "never lost". An expert
-    that was never in drawdown has no drawdown series at all.
+    the expert further below its peak. The value is in DOLLARS below the running peak of
+    cumulative P&L (peak starts at 0, as in ``max_drawdown_from_pnl``): a percentage of that
+    peak explodes when the peak is tiny, so none is computed. An expert that was never in
+    drawdown has no drawdown series at all.
     """
     months = sorted(monthly_data)
     names = set()
@@ -382,7 +407,7 @@ def monthly_series(monthly_data: Dict[str, Dict[str, Dict[str, float]]]):
             c_pts.append((month_date, cell['count']))
             cumulative += cell['pnl']
             peak = max(peak, cumulative)
-            d_pts.append((month_date, round((peak - cumulative) / peak * 100.0, 2) if peak > 0 else None))
+            d_pts.append((month_date, round(peak - cumulative, 2)))
         profit[name], count[name] = p_pts, c_pts
         if any(v for _d, v in d_pts):
             drawdown[name] = d_pts

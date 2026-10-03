@@ -33,14 +33,14 @@ DETAIL_TABLE_CLASS = 'perf-detail-table'
 DETAIL_TAG_PREFIX = 'perf-c-'
 #: (column key, label, minimum px on a phone). The first column is pinned.
 DETAIL_COLUMNS = [
-    ('expert', 'Expert Instance', 150), ('transactions', 'Transactions', 110),
+    ("expert", "Expert Instance", 170), ('transactions', 'Transactions', 110),
     ('avg_duration', 'Avg Duration (days)', 150), ('total_pnl', 'Total P&L', 100),
     ('avg_pnl', 'Avg P&L', 90), ('win_rate', 'Win Rate', 90),
     ('profit_factor', 'Profit Factor', 110), ('largest_win', 'Largest Win', 110),
     ('largest_loss', 'Largest Loss', 110), ('max_dd', 'Max DD', 140),
     ('sharpe', 'Sharpe Ratio', 110),
 ]
-DETAIL_PINNED = (PinnedColumn('expert', 0, 150),)
+DETAIL_PINNED = (PinnedColumn("expert", 0, 170),)
 
 # One cell template for every column: the raw number is the sortable ``field`` (a formatted
 # "$-1.98" string sorts wrongly), the text shown is ``<key>_txt``, the optional tooltip
@@ -99,7 +99,7 @@ def performance_page_css() -> str:
     # The pinned name cell is cut with an ellipsis (full name in its tooltip) instead of
     # growing past its pin width; scroll_table_phone_css sets max-width: none on it.
     table_extra = phone_media(f'''
-    .{DETAIL_TABLE_CLASS} td.{DETAIL_TAG_PREFIX}expert {{ max-width: 150px !important;
+    .{DETAIL_TABLE_CLASS} td.{DETAIL_TAG_PREFIX}expert {{ max-width: 170px !important;
         overflow: hidden; text-overflow: ellipsis; }}
     ''')
     return desktop + phone + table + table_extra
@@ -370,31 +370,34 @@ class PerformanceTab:
                 # Same colours as above, so no legend of its own (hover names the expert).
                 with self._chart_card(
                         'Drawdown from Peak',
-                        'How far each expert\'s cumulative P&L sits below its running peak, '
-                        'month by month (deeper = lower). Experts never above zero have no '
-                        'percentage and are left out.', span_all=True):
-                    self._plot(pv.monthly_line_figure(drawdown_series, order, colors, layout,
-                                                      'pct', show_legend=False, reverse_y=True))
+                        "Dollars each expert's cumulative P&L sits below its running peak, "
+                        'month by month (deeper = further below). In dollars because a '
+                        'percentage of a small peak is meaningless.', span_all=True):
+                    self._plot(pv.monthly_line_figure(
+                        drawdown_series, order, colors, layout, 'money', show_legend=False,
+                        reverse_y=True, y_title='Drawdown ($ below peak cumulative P&L)'))
 
     def _detail_rows(self, expert_metrics: Dict[str, Any], order: List[str]) -> List[Dict[str, Any]]:
         rows = []
+        shown = [n for n in order if n in expert_metrics]
+        short = dict(zip(shown, pv.shorten_labels(
+            shown, None if self._layout.label_max_chars is None else self._layout.label_max_chars + 2)))
         for name in order:
             if name not in expert_metrics:
                 continue
             m = expert_metrics[name]
             pf_txt, pf_tip = pv.format_profit_factor(m['profit_factor'])
             sh_txt, sh_tip = pv.format_sharpe(m['sharpe_ratio'], len(m['returns']))
-            dd_txt = pv.format_money(m['max_drawdown']) + (
-                f" ({m['max_drawdown_pct']:.1f}%)" if m['max_drawdown_pct'] is not None else "")
-            dd_tip = ('Worst fall of cumulative P&L from its peak, in dollars'
-                      + (' and as a percentage of that peak.' if m['max_drawdown_pct'] is not None
-                         else '; no percentage because cumulative P&L never rose above zero.'))
+            dd_txt = pv.format_money(m['max_drawdown'])
+            dd_tip = ('Worst fall of cumulative P&L from its peak, in dollars. No percentage is '
+                      'shown: it would be relative to the peak cumulative P&L, which is often '
+                      'tiny, so it would not mean anything.')
 
             def sign_cls(v):
                 return '' if v is None or v == 0 else ('perf-pos' if v > 0 else 'perf-neg')
 
             rows.append({
-                'expert': name,
+                'expert': name, 'expert_txt': short[name],
                 'transactions': m['total_transactions'],
                 'avg_duration': round(float(m['avg_duration_days']), 4),
                 'avg_duration_txt': pv.format_days(m['avg_duration_days']),

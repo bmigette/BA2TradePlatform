@@ -72,7 +72,20 @@ def test_padded_range_leaves_room_for_labels_on_both_sides():
 
 def test_shorten_label():
     assert pv.shorten_label('abcdef', None) == 'abcdef'
-    assert pv.shorten_label('abcdefghij', 5) == 'abcd…'
+    short = pv.shorten_label('goal2020-small_ED_S2top1', 20)
+    assert len(short) == 20 and short.endswith('S2top1') and short.startswith('goal')
+
+
+def test_shorten_labels_keeps_distinct_names_distinct():
+    names = [f'goal2020-small_ED_S{i}top1' for i in range(1, 6)] + ['goal2020-small_ED_S1top2']
+    out = pv.shorten_labels(names, 14)
+    assert len(set(out)) == len(set(names))
+    assert pv.shorten_labels(names, None) == names
+    # two names whose head and tail are identical force a longer limit, never a clash
+    tricky = ['aaaaaaaaaa-X-bbbbbbbbbb', 'aaaaaaaaaa-Y-bbbbbbbbbb']
+    out = pv.shorten_labels(tricky, 10)
+    assert len(set(out)) == 2 and all(len(o) <= len(t) for o, t in zip(out, tricky))
+    assert pv.shorten_labels([], 10) == []
 
 
 def test_legend_rows_grow_with_names():
@@ -96,7 +109,7 @@ def test_hbar_figure_has_headroom_full_names_and_unclipped_labels():
     bar = fig.data[0]
     assert bar.orientation == 'h' and bar.cliponaxis is False
     assert list(bar.y) == names                        # full name stays the hover value
-    assert fig.layout.yaxis.ticktext[0].endswith('…')  # phone tick shortened
+    assert '…' in fig.layout.yaxis.ticktext[0] and fig.layout.yaxis.ticktext[0].endswith('S1top1')
     lo, hi = fig.layout.xaxis.range
     assert lo < -120 and hi > 60
     assert fig.layout.yaxis.autorange == 'reversed'
@@ -124,7 +137,7 @@ def test_monthly_series_drawdown_walks_the_cumulative_curve():
     data = {'2026-01': {'a': {'pnl': 10.0, 'count': 1}, 'n': {'pnl': -5.0, 'count': 1}},
             '2026-02': {'a': {'pnl': -5.0, 'count': 2}}}
     profit, count, dd = pv.monthly_series(data)
-    assert [v for _d, v in dd['a']] == [0.0, 50.0]
-    assert 'n' not in dd                   # never above zero -> no percentage series
+    assert [v for _d, v in dd['a']] == [0.0, 5.0]       # dollars below the running peak
+    assert [v for _d, v in dd['n']] == [5.0, 5.0]       # peak starts at 0, as the $ metric
     assert [v for _d, v in count['a']] == [1, 2]
     assert [v for _d, v in profit['n']] == [-5.0, 0]
