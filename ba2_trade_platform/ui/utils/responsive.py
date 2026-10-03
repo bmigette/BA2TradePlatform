@@ -74,6 +74,13 @@ def phone_media(css: str) -> str:
     return f'@media (max-width: {PHONE_MAX_WIDTH_PX}px) {{\n{css}\n}}'
 
 
+def is_phone_width(width_px: float) -> bool:
+    """Whether a viewport ``width_px`` wide is a phone. The Python twin of the
+    ``Quasar.Screen.width <= 639`` the first render evaluates in the browser, and the
+    function the breakpoint-crossing handler decides with. Pure."""
+    return float(width_px) <= PHONE_MAX_WIDTH_PX
+
+
 def phone_grid_expression() -> str:
     """The JS expression a ``:grid`` prop evaluates on first render.
 
@@ -302,7 +309,7 @@ PHONE_LISTENER_HEAD_HTML = (
     '<script>(function(){var m=window.matchMedia("(max-width: '
     f'{PHONE_MAX_WIDTH_PX}px)");'
     'var f=function(e){if(window.emitEvent){window.emitEvent("'
-    f'{PHONE_EVENT}",{{phone:e.matches}});}}}};'
+    f'{PHONE_EVENT}",{{phone:e.matches,width:window.innerWidth}});}}}};'
     'if(m.addEventListener){m.addEventListener("change",f);}else{m.addListener(f);}'
     '})();</script>'
 )
@@ -318,13 +325,33 @@ class PhoneTableRegistry:
 
     def __init__(self) -> None:
         self._tables: 'weakref.WeakSet' = weakref.WeakSet()
+        #: The layout the tables were last PINNED to; ``None`` until the first event.
+        self._phone: Optional[bool] = None
 
     def register(self, table) -> None:
         self._tables.add(table)
+        if self._phone is not None:
+            table.props(phone_grid_prop(self._phone))
 
     def set_phone(self, phone: bool) -> None:
         for table in list(self._tables):
             table.props(phone_grid_prop(phone))
+
+    def on_width(self, width_px: float) -> bool:
+        """The viewport is now ``width_px`` wide. Re-pin the tables when that is a
+        different layout from the one they are in; return whether anything changed.
+
+        A phone rotated to landscape (390 -> 844) goes back to the table; rotated
+        again (844 -> 390) it goes to cards; a resize within the same side of the
+        line does nothing. Tables registered AFTER an event are pinned too (a refresh
+        rebuilds them), which is why the last state is remembered.
+        """
+        phone = is_phone_width(width_px)
+        if phone == self._phone:
+            return False
+        self._phone = phone
+        self.set_phone(phone)
+        return True
 
     def __len__(self) -> int:
         return len(self._tables)
@@ -340,6 +367,6 @@ def install_phone_listener(registry: PhoneTableRegistry, add_head_html: Callable
     add_head_html(PHONE_LISTENER_HEAD_HTML)
 
     def _changed(event) -> None:
-        registry.set_phone(bool(event.args['phone']))
+        registry.on_width(float(event.args['width']))
 
     on_event(PHONE_EVENT, _changed)

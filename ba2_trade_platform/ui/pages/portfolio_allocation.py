@@ -2868,6 +2868,12 @@ def page_phone_css() -> str:
 _PHONE_REGISTRIES: Dict[Any, PhoneTableRegistry] = {}
 
 
+def _forget_phone_registry(client) -> None:
+    """``client.on_delete`` handler. NiceGUI hands it the CLIENT, so a ``cid=`` default
+    argument would be silently overwritten with it and the pop would never match."""
+    _PHONE_REGISTRIES.pop(client.id, None)
+
+
 def _phone_tables() -> PhoneTableRegistry:
     """This client's registry of card-mode tables. One per browser tab: the breakpoint
     event is scoped to the client that emitted it, and a table must be re-pinned by
@@ -2877,7 +2883,7 @@ def _phone_tables() -> PhoneTableRegistry:
     registry = _PHONE_REGISTRIES.get(client.id)
     if registry is None:
         registry = _PHONE_REGISTRIES[client.id] = PhoneTableRegistry()
-        client.on_delete(lambda cid=client.id: _PHONE_REGISTRIES.pop(cid, None))
+        client.on_delete(_forget_phone_registry)
     return registry
 
 
@@ -3957,7 +3963,7 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
             logger.error(f"Allocation submission failed: {e}", exc_info=True)
             ui.notify(f'Submission failed: {e}', type='negative')
             if wizard is not None:
-                wizard.finish_submit(SUBMIT_FAILED_FMT.format(error=e))
+                wizard.finish_submit(SUBMIT_FAILED_FMT.format(error=e), interrupted=True)
             return
         finally:
             # One last pass BEFORE the timer stops, or the rows that landed in the
@@ -4111,6 +4117,23 @@ async def content() -> None:
         install_phone_listener(_phone_tables(), ui.add_head_html, ui.on)
         toolbar = ui.row().classes(f'w-full items-center gap-2 {TOOLBAR_CLASS} {ACTIONS_CLASS}')
         body = ui.column().classes('w-full gap-3')
+        # THE INCOME PANEL'S OWN HOME, cleared and refilled by ``_refresh``. It used to
+        # be drawn into whatever slot happened to be running ``_refresh``: the Refresh
+        # button's row, a timer's parent, and -- after a Submit, whose ``_do_submit``
+        # runs in the Submit button's slot -- the dry-run DIALOG's footer. Every refresh
+        # also appended another copy, because nothing ever cleared the old one.
+        income_host = ui.column().classes('w-full gap-3')
+        # THE HOME OF EVERY TIMER-CREATED DIALOG. A NiceGUI element is a child of the
+        # slot that is current when it is built, and a timer built inside the income
+        # panel's Invest button would put the whole invest-scope dialog -- and the dry run
+        # opened from it -- INSIDE the income panel, which ``_refresh`` clears. The
+        # refresh that ends every Submit would then delete the dry-run table the user is
+        # reading its results in. Nothing in this container is ever cleared.
+        dialog_host = ui.element('div')
+
+        def _defer(callback) -> None:
+            with dialog_host:
+                ui.timer(0.1, callback, once=True)
         try:
             mode_state = {'value': await asyncio.to_thread(_load_valuation_mode, account_id)}
             # SESSION-ONLY, deliberately not persisted: a what-if that survived a
@@ -4126,6 +4149,7 @@ async def content() -> None:
 
         async def _refresh() -> None:
             body.clear()
+            income_host.clear()
             with body:
                 ui.spinner(size='lg').classes('self-center')
             try:
@@ -4165,16 +4189,15 @@ async def content() -> None:
                 except Exception as e:
                     logger.error(f"Income panel failed to load: {e}", exc_info=True)
                     events, open_total, working_note = [], 0.0, None
-                    ui.label(f'Income could not be loaded: {e}') \
-                        .classes('text-xs text-orange-400') \
-                        .style(class_color_style('text-orange-400'))
-                render_income_panel(
-                    events, open_total, working_note=working_note,
-                    on_sync=lambda: ui.timer(0.1, _refresh, once=True),
-                    on_invest=lambda amount: ui.timer(
-                        0.1, lambda: _open_invest_flow(
-                            account_id, mode_state['value'], amount, _refresh),
-                        once=True))
+                    with income_host:
+                        ui.label(f'Income could not be loaded: {e}')                             .classes('text-xs text-orange-400')                             .style(class_color_style('text-orange-400'))
+                with income_host:
+                    render_income_panel(
+                        events, open_total, working_note=working_note,
+                        on_sync=lambda: _defer(_refresh),
+                        on_invest=lambda amount: _defer(
+                            lambda: _open_invest_flow(
+                                account_id, mode_state['value'], amount, _refresh)))
 
         async def _set_mode(event) -> None:
             """Persist the mode EAGERLY and RE-COMPUTE -- never reinterpret silently."""

@@ -8781,3 +8781,137 @@ def test_an_invest_run_stamps_the_weights_but_leaves_the_labels_last_alone(accou
 
     assert get_symbol_rows(account_id, 'ARK26')['AAPL'].previous_weight_pct == 70.0
     assert get_managed_labels(account_id)[0].previous_target_pct is None
+
+
+# ---------------------------------------------------------------------------
+# WHERE THE DIALOGS LIVE, and what ``refresh()`` may clear
+#
+# A NiceGUI element is a child of the slot that is current when it is built, and a
+# click handler / timer callback runs in the slot of the element that fired it. Two
+# consequences were live on this page: the income panel was drawn into whatever slot
+# ran ``_refresh`` (after a Submit: the dry-run dialog's own footer, whose
+# ``_do_submit`` runs in the Submit button's slot), and the Invest button's timer put
+# the invest-scope dialog -- and the dry run opened from it -- inside the income
+# panel, which a refresh clears.
+# ---------------------------------------------------------------------------
+
+def _income_labels(root):
+    return [e for e in root.descendants()
+            if isinstance(e, _ui().label) and e._text == 'Income (last 30 days)']
+
+
+def _flow_to_a_submitted_dry_run(monkeypatch, nicegui_client, account_id):
+    """Review -> Submit through the page's REAL closures, each step run in the slot
+    NiceGUI would run it in (the clicked element's parent)."""
+    # The page starts a background thread per refresh to top up the ⓘ stats; on the
+    # in-memory test DB that thread is the SQLite native-crash flake, and nothing here
+    # is about it.
+    monkeypatch.setattr(page.svc, 'refresh_symbol_stats', lambda *a, **k: None)
+    root = _drawn_page(monkeypatch, nicegui_client, account_id)
+    ui = _ui()
+    timers = []
+
+    class _Timer:
+        def deactivate(self):
+            pass
+
+    def _fake_timer(_delay, callback, once=False):
+        from nicegui import context
+        timers.append((callback, context.slot.parent))
+        return _Timer()
+
+    monkeypatch.setattr(page.ui, 'timer', _fake_timer)
+
+    captured = {}
+    real_flow = page._open_allocation_flow
+
+    async def _spy(*args, **kwargs):
+        captured['refresh'] = args[2]
+
+    monkeypatch.setattr(page, '_open_allocation_flow', _spy)
+    review = _review_button(root)
+    _press(review)
+    monkeypatch.setattr(page, '_open_allocation_flow', real_flow)
+
+    async def _open():
+        with review.parent_slot:
+            await real_flow(account_id, VALUATION_MODE_COST, captured['refresh'])
+
+    asyncio.run(_open())
+    def _submit_button(d):
+        return next((e for e in d.descendants()
+                     if isinstance(e, ui.button) and e._props.get('label') == 'Submit'),
+                    None)
+
+    dialog = next(d for d in root.descendants()
+                  if isinstance(d, ui.dialog) and _submit_button(d) is not None)
+    submit = _submit_button(dialog)
+    handler = next(l.handler for l in submit._event_listeners.values()
+                   if l.type.split('.')[0] == 'click')
+    with submit.parent_slot:
+        handler(None)
+    callback, _parent = timers.pop()          # the Submit timer (the painter comes later)
+
+    async def _submit():
+        with submit.parent_slot:
+            result = callback()
+            if asyncio.iscoroutine(result):
+                await result
+
+    asyncio.run(_submit())
+    return root, dialog, timers
+
+
+def test_the_refresh_that_ends_a_submit_does_not_delete_the_dry_run_dialog(
+        monkeypatch, nicegui_client, account_id):
+    root, dialog, _timers = _flow_to_a_submitted_dry_run(monkeypatch, nicegui_client,
+                                                         account_id)
+    assert dialog.is_deleted is False
+    assert any('pf-dry-row' in getattr(e, '_classes', []) for e in dialog.descendants())
+
+
+def test_the_income_panel_is_not_drawn_into_the_dry_run_dialog(
+        monkeypatch, nicegui_client, account_id):
+    """``_do_submit`` runs in the Submit button's slot and ends with ``refresh()``; the
+    income panel used to be drawn wherever that slot was -- inside the dialog."""
+    root, dialog, _timers = _flow_to_a_submitted_dry_run(monkeypatch, nicegui_client,
+                                                         account_id)
+    assert _income_labels(dialog) == []
+
+
+def test_refreshing_replaces_the_income_panel_instead_of_stacking_another(
+        monkeypatch, nicegui_client, account_id):
+    root, _dialog, _timers = _flow_to_a_submitted_dry_run(monkeypatch, nicegui_client,
+                                                          account_id)
+    assert len(_income_labels(root)) == 1
+
+
+def test_a_dialog_opened_from_the_income_panel_is_built_outside_what_refresh_clears(
+        monkeypatch, nicegui_client, account_id):
+    """The Invest button's timer must be parented to the page's dialog host, not to the
+    income panel: invest-scope and the dry run opened from it hang off that parent."""
+    ui = _ui()
+    monkeypatch.setattr(page.svc, 'refresh_symbol_stats', lambda *a, **k: None)
+    root = _drawn_page(monkeypatch, nicegui_client, account_id)
+    parents = []
+
+    class _Timer:
+        def deactivate(self):
+            pass
+
+    def _fake_timer(_delay, callback, once=False):
+        from nicegui import context
+        parents.append(context.slot.parent)
+        return _Timer()
+
+    monkeypatch.setattr(page.ui, 'timer', _fake_timer)
+    invest = next(e for e in root.descendants()
+                  if isinstance(e, ui.button) and e._props.get('label') == 'Invest')
+    income_card = next(e for e in invest.ancestors()
+                       if any(isinstance(c, ui.label) and c._text == 'Income (last 30 days)'
+                              for c in e.descendants()))
+    _press(invest)
+    assert parents, 'the Invest click scheduled nothing'
+    host = parents[-1]
+    assert host is not income_card and income_card not in list(host.ancestors())
+    assert host not in list(income_card.descendants())

@@ -201,7 +201,7 @@ def test_the_breakpoint_event_reaches_the_registry():
     heads, handlers = [], {}
 
     class _E:
-        args = {'phone': True}
+        args = {'phone': True, 'width': 390}
 
     seen = []
     registry.set_phone = lambda phone: seen.append(phone)
@@ -210,6 +210,57 @@ def test_the_breakpoint_event_reaches_the_registry():
     assert rsp.PHONE_EVENT in heads[0]
     handlers[rsp.PHONE_EVENT](_E())
     assert seen == [True]
+
+
+def test_the_listener_script_is_well_formed_and_sends_the_width():
+    script = rsp.PHONE_LISTENER_HEAD_HTML
+    assert script.count('{') == script.count('}')
+    assert script.count('(') == script.count(')')
+    assert 'width:window.innerWidth' in script and 'phone:e.matches' in script
+    assert f'max-width: {rsp.PHONE_MAX_WIDTH_PX}px' in script
+
+
+@pytest.mark.parametrize('width,phone', [(320, True), (390, True), (639, True),
+                                         (640, False), (844, False), (1280, False)])
+def test_which_widths_are_phones(width, phone):
+    assert rsp.is_phone_width(width) is phone
+
+
+def test_rotating_a_phone_crosses_the_breakpoint_both_ways(nicegui_client):
+    """Portrait 390 -> landscape 844 -> portrait 390: cards, table, cards. A resize on
+    the same side of the line changes nothing."""
+    table = _table(nicegui_client)
+    registry = rsp.PhoneTableRegistry()
+    registry.register(table)
+
+    assert registry.on_width(390) is True and table._props[':grid'] == 'true'
+    assert registry.on_width(400) is False and table._props[':grid'] == 'true'
+    assert registry.on_width(844) is True and table._props[':grid'] == 'false'
+    assert registry.on_width(900) is False and table._props[':grid'] == 'false'
+    assert registry.on_width(390) is True and table._props[':grid'] == 'true'
+
+
+def test_a_table_built_after_the_crossing_starts_in_the_current_layout(nicegui_client):
+    """A refresh rebuilds every table; the new ones must not come up in the layout the
+    browser has left."""
+    registry = rsp.PhoneTableRegistry()
+    registry.on_width(844)
+    table = _table(nicegui_client)
+    registry.register(table)
+    assert table._props[':grid'] == 'false'
+
+
+def test_the_phone_registry_entry_is_dropped_when_the_client_is_deleted(
+        nicegui_client):
+    """``client.on_delete`` hands the handler the CLIENT. The first version was
+    ``lambda cid=client.id: pop(cid)``, so ``cid`` became the Client and nothing was
+    ever removed: one leaked registry per page load."""
+    with nicegui_client:
+        registry = page._phone_tables()
+    assert page._PHONE_REGISTRIES[nicegui_client.id] is registry
+    for handler in nicegui_client.delete_handlers:
+        nicegui_client.safe_invoke(handler)
+    assert nicegui_client.id not in page._PHONE_REGISTRIES
 
 
 # -- the dry run: same elements, tagged ---------------------------------------
