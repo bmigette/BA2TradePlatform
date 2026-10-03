@@ -64,6 +64,16 @@ class AccountInterface(ReadOnlyAccountInterface):
     #: so the only safe place to fail is BEFORE the broker call.
     supports_protective_legs = True
 
+    #: True on a broker whose spendable-room figure (``get_account_snapshot().buying_power``) MUST exist
+    #: for an expert to size an order. The shared expert clamp
+    #: (``MarketExpertInterface._get_actual_available_balance``) normally falls back, when that figure is
+    #: missing, to the account's ``cash`` and then to ``get_balance()`` (net liquidation): fine where those
+    #: are the same order of magnitude as the buying power, an over-sizing on a margin account whose
+    #: ``AvailableFunds`` is far below net liquidation. When this is True a missing / non-finite
+    #: buying power REFUSES sizing loudly instead. Default False: Alpaca, TastyTrade and every fake keep
+    #: the existing fallback chain byte for byte.
+    buying_power_is_mandatory = False
+
     #: One RLock per ACCOUNT ID, serialising ``submit_order`` from validation through the
     #: broker call. The account-wide exposure ceiling is a read-decide-act sequence against
     #: shared broker state: two threads that read the same pre-trade snapshot both see the

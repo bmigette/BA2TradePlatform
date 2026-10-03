@@ -93,6 +93,17 @@ def reset_account_filter_state():
     yield
 
 
+@pytest.fixture(autouse=True)
+def close_ibkr_runtimes():
+    """IBKRAccount keeps one connection runtime (a daemon loop thread) per account id in a
+    process-wide registry; account ids restart at 1 in every test. Close whatever a test left."""
+    yield
+    import sys
+    runtime = sys.modules.get("ba2_trade_platform.modules.accounts.ibkr_runtime")
+    if runtime is not None:
+        runtime.shutdown_all_runtimes()
+
+
 # ---------------------------------------------------------------------------
 # Phase 6 seam wiring (done at conftest import time, BEFORE any test module is
 # collected). The shimmed in-tree experts/interfaces now execute the *package*

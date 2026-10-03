@@ -1536,6 +1536,22 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         # .buying_power -- the "effective" figure, larger than the Reg-T power the account
         # can actually hold overnight -- so this clamp and the BP the UI shows disagreed.
         # The raw probe below stays as the fallback for adapters/fakes without a snapshot.
+        if getattr(account, "buying_power_is_mandatory", False) is True:
+            # An adapter that DECLARES its buying power mandatory (IBKR): no cash / net-liquidation
+            # fallback. A missing figure raises, and the caller's own handler turns that into the loud
+            # "cannot size" refusal (``None``) -- never a quietly larger number.
+            snap_bp = getattr(account.get_account_snapshot(), "buying_power", None)
+            try:
+                mandatory = float(snap_bp) if snap_bp is not None else None
+            except (TypeError, ValueError):
+                mandatory = None
+            if mandatory is None or not math.isfinite(mandatory):
+                raise ValueError(
+                    f"Account {getattr(account, 'id', '?')} publishes no usable buying power "
+                    f"({snap_bp!r}) and declares it mandatory (buying_power_is_mandatory): refusing to size "
+                    f"from cash or net liquidation instead")
+            return mandatory
+
         snap_fn = getattr(account, "get_account_snapshot", None)
         if callable(snap_fn):
             try:

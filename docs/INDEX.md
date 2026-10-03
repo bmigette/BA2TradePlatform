@@ -20,6 +20,7 @@ at that date and are not kept up to date afterwards: check the code before relyi
 
 - [FACTORRANKER_EXPERT.md](FACTORRANKER_EXPERT.md) — the FactorRanker expert: factors, universe, self-executing rebalance
 - [WASHTRADE-LOCK.md](WASHTRADE-LOCK.md) — wash-trade locking decision record; read before changing the wash-trade path
+- [IBKR-SETUP.md](IBKR-SETUP.md) — Interactive Brokers: IB Gateway paper setup, account settings, what works and what the IBKR API cannot do; design and every unverified assumption in [plans/2026-10-03-ibkr-support-design.md](plans/2026-10-03-ibkr-support-design.md)
 - [features/expert_priority.md](features/expert_priority.md) — scheduled expert priority (ordering of experts that fire at the same instant)
 - [FMP_BACKTEST_FEASIBILITY.md](FMP_BACKTEST_FEASIBILITY.md) — which experts can be backtested from FMP history (2026-06 survey)
 - [screener_price_drop_fix.md](screener_price_drop_fix.md) — the screener metric store's `price_drop_pct` fix and why the store had to be rebuilt

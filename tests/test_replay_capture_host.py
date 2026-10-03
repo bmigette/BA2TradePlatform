@@ -174,8 +174,10 @@ def test_every_account_classes_quote_read_is_tapped(account_class):
         f"override must carry @observe_provider, or it must not override at all")
 
 
-def test_the_ibkr_override_records_the_quote_it_returned(tmp_path):
-    """The override's own tap: identity, provenance, and the value untouched."""
+def test_ibkr_quote_read_is_the_base_tap_and_records_the_quote_it_returned(monkeypatch):
+    """IBKRAccount no longer OVERRIDES get_instrument_current_price (the old override bypassed the
+    shared price cache and its tap): it implements ``_get_instrument_current_price_impl`` and
+    inherits the tapped base method, so every quote it serves reaches the record."""
     from ba2_common.core.replay import (
         CaptureContext,
         CaptureHealth,
@@ -183,43 +185,16 @@ def test_the_ibkr_override_records_the_quote_it_returned(tmp_path):
         use_capture_context,
     )
     from ba2_trade_platform.modules.accounts.IBKRAccount import IBKRAccount
+    from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
+    from tests.ibkr_helpers import make_account
 
-    # IBKRAccount is itself abstract (it leaves several AccountInterface methods
-    # unimplemented), so drive its override through a minimal concrete subclass --
-    # which is also what the live registry would have to provide.
-    class _ConcreteIBKR(IBKRAccount):
-        def _get_instrument_current_price_impl(self, *a, **k):
-            raise AssertionError("the override must not fall through to the base impl")
+    assert "get_instrument_current_price" not in vars(IBKRAccount), (
+        "an override would have to carry its own tap; IBKR relies on the base method's")
+    assert IBKRAccount.get_instrument_current_price is ReadOnlyAccountInterface.get_instrument_current_price
 
-        def _submit_order_impl(self, *a, **k): ...
-        def adjust_sl(self, *a, **k): ...
-        def adjust_tp(self, *a, **k): ...
-        def adjust_tp_sl(self, *a, **k): ...
-        def get_balance(self, *a, **k): ...
-        def get_order(self, *a, **k): ...
-        def get_orders(self, *a, **k): ...
-        def refresh_positions(self, *a, **k): ...
-        def symbols_exist(self, *a, **k): ...
-
-    account = _ConcreteIBKR.__new__(_ConcreteIBKR)
-    account.id = 77
-    account._connected = False          # IBKRAccount.__del__ reads it
-    account._ensure_connected = lambda: None
-    account._create_contract = lambda symbol: object()
-
-    class _Ticker:
-        last = 123.5
-        close = 120.0
-
-    class _IB:
-        def reqMktData(self, contract):
-            return _Ticker()
-
-        def sleep(self, seconds):
-            pass
-
-    account.ib = _IB()
-
+    account, fake = make_account(monkeypatch)
+    aapl = fake.add_stock("AAPL", 265598)
+    fake.set_quote(aapl, bid=123.5, ask=123.7, last=123.6)
     context = CaptureContext(
         analysis_meta={
             "analysis_id": "A1", "attempt_id": "T1", "session_id": "S1",
@@ -229,8 +204,11 @@ def test_the_ibkr_override_records_the_quote_it_returned(tmp_path):
         },
         health=CaptureHealth(),
     )
-    with use_capture_context(context):
-        price = account.get_instrument_current_price("AAPL")
+    try:
+        with use_capture_context(context):
+            price = account.get_instrument_current_price("AAPL")
+    finally:
+        account.close()
 
     assert price == 123.5
     observed = [pending.observation for pending in context.observations]
@@ -238,13 +216,8 @@ def test_the_ibkr_override_records_the_quote_it_returned(tmp_path):
     assert (observed[0].provider, observed[0].method) == (
         "broker", "get_instrument_current_price")
     assert observed[0].request_identity["symbols"] == ["AAPL"]
-    assert observed[0].request_identity["account_class"] == "_ConcreteIBKR"
-    assert IBKRAccount.get_instrument_current_price.__wrapped__ is not None, (
-        "the method under test is IBKR's own tapped override, not the base method")
-    assert "price_type" not in observed[0].request_identity, (
-        "this override takes no price_type; the record must not invent one")
-    assert observed[0].provenance == ReplayStatus.PROVENANCE_NETWORK, (
-        "the override keeps no memo -- every call is a broker read")
+    assert observed[0].request_identity["account_class"] == "IBKRAccount"
+    assert observed[0].provenance == ReplayStatus.PROVENANCE_NETWORK
     assert context.observations[0].payload == 123.5
 
 
