@@ -30,7 +30,7 @@ def test_variable_payers_use_the_median_not_the_mean():
     var = [(date(2026, 7, 15), 0.10), (date(2026, 8, 15), 0.30), (date(2026, 9, 15), 0.20)]
     out = forecast_dividends(var, 10, TODAY)
     assert out[0]['per_share'] == pytest.approx(0.20)               # median, not 0.2 mean-equal case
-    skew = [(date(2026, 7, 15), 0.10), (date(2026, 8, 15), 0.11), (date(2026, 9, 15), 0.30)]
+    skew = [(date(2026, 7, 15), 0.11), (date(2026, 8, 15), 0.30), (date(2026, 9, 15), 0.10)]
     assert forecast_dividends(skew, 10, TODAY)[0]['per_share'] == pytest.approx(0.11)   # mean would be 0.17
 
 

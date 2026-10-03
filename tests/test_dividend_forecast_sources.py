@@ -34,7 +34,7 @@ def test_provider_monthly_weekly_and_quarterly_beyond_the_horizon():
 
 def test_a_special_payment_is_excluded_from_amount_and_cadence():
     hist = monthly(amt=0.20)
-    hist.append((date(2026, 9, 25), 0.90))               # special, 4.5x the regular
+    hist.append((date(2026, 8, 25), 0.90))               # special, 4.5x the regular, regular ones after it
     hist.sort()
     ev, info = forecast_dividends_ex(hist, 10, TODAY, specials=True)
     assert info['per_share'] == pytest.approx(0.20) and ev[0]['per_share'] == pytest.approx(0.20)

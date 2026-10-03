@@ -137,16 +137,24 @@ def detect_cadence(dates: List[date]) -> Optional[Tuple[str, int]]:
 
 
 def drop_specials(by_date: Dict[date, float]) -> Dict[date, float]:
-    """Payments that are not a special: a value more than ``SPECIAL_RATIO`` x the median of the
-    (up to six) payments before it is dropped. The first two payments cannot be judged."""
+    """Drop SPECIAL payments: one that is a spike against the payments before it AND against the
+    payments after it (each judged against the median of up to six neighbours, ratio
+    ``SPECIAL_RATIO``). A fund that RAISES its payout is not a special -- the later payments
+    are the new normal -- and the latest payments (nothing after them) are never dropped, so a
+    filter mistake cannot make an active payer look stale. MAIN's quarterly supplements sit
+    between regular monthly payments and are dropped; CAS 0.10 -> 0.50 -> 1.00 is kept."""
+    ds = sorted(by_date)
+    vals = [by_date[d] for d in ds]
     out: Dict[date, float] = {}
-    prior: List[float] = []
-    for d in sorted(by_date):
-        v = by_date[d]
-        if len(prior) >= 2 and v > SPECIAL_RATIO * median(prior[-6:]):
-            continue                                  # special: not part of the regular series
+    for i, d in enumerate(ds):
+        v = vals[i]
+        before = vals[max(0, i - 6):i]
+        after = vals[i + 1:i + 7]
+        spike_before = len(before) >= 2 and v > SPECIAL_RATIO * median(before)
+        spike_after = len(after) >= 1 and v > SPECIAL_RATIO * median(after)
+        if spike_before and spike_after:
+            continue
         out[d] = v
-        prior.append(v)
     return out
 
 
@@ -164,7 +172,8 @@ def _normalise(history: Iterable[Tuple[Any, float]]) -> Dict[date, float]:
 
 
 def _project(anchor: date, step: Tuple[str, int], per_share: float, held_qty: float,
-             today: date, months: int, first_is_anchor: bool = False) -> List[Dict[str, Any]]:
+             today: date, months: int, first_is_anchor: bool = False,
+             after: Optional[date] = None) -> List[Dict[str, Any]]:
     """Events in ``[today, today + months]`` on the schedule ``anchor + k * step`` (k >= 1, or
     k >= 0 when ``first_is_anchor``). A date before today (one period overdue at most -- the
     callers guard staleness) is taken as paid late and placed ON today; later ones keep the
@@ -177,6 +186,8 @@ def _project(anchor: date, step: Tuple[str, int], per_share: float, held_qty: fl
         if due > end:
             break
         k += 1
+        if after is not None and due <= after:
+            continue                  # a REAL payment on or after this date already happened
         if due < today:
             due = today if not out else due
             if due < today:
@@ -197,6 +208,9 @@ def forecast_dividends_ex(history: Iterable[Tuple[Any, float]], held_qty: float,
         info['status'] = 'no_qty'
         return [], info
     by_date = _normalise(history)
+    if not by_date:
+        return [], info
+    raw_last = max(by_date)                    # staleness is judged on the UNFILTERED last payment
     if specials:
         by_date = drop_specials(by_date)
     dates = sorted(by_date)
@@ -210,21 +224,29 @@ def forecast_dividends_ex(history: Iterable[Tuple[Any, float]], held_qty: float,
 
     last_date = dates[-1]                      # the schedule runs from the last REAL payment date
     recent = dates[-OUTLIER_WINDOW:]
-    clean = [d for d in dates if not (d in recent and is_outlier(
+    # The 5x outlier guard is for amounts DERIVED from a share count (account rows: a payout divided
+    # by a liquidation-shrunk quantity explodes). Declared per-share amounts (specials=True) are
+    # exact, and a genuine raise (CAS 0.10 -> 1.00) must not be filtered as an outlier.
+    clean = dates if specials else [d for d in dates if not (d in recent and is_outlier(
         by_date[d], [by_date[o] for o in recent if o != d]))]
     if not clean:
         return [], info
     last3 = [by_date[d] for d in clean[-3:]]
     mean3 = sum(last3) / len(last3)
     variable = len(last3) > 1 and mean3 > 0 and (max(last3) - min(last3)) / mean3 > VARIABLE_TOLERANCE
-    per_share = median(last3) if variable else by_date[clean[-1]]
+    latest = by_date[clean[-1]]
+    last_two_agree = len(last3) >= 2 and latest > 0 and abs(latest - last3[-2]) / latest <= VARIABLE_TOLERANCE
+    stepping_up = len(last3) == 3 and last3[0] <= last3[1] <= last3[2] and last3[2] > last3[0]
+    # a payer that has just stepped its payout up (CAS 0.5, 0.5, 1.0) pays the LATEST amount; the
+    # median of the last three is for payers that jump around
+    per_share = median(last3) if (variable and not last_two_agree and not stepping_up) else latest
     info['per_share'] = per_share
 
-    if (today - last_date).days >= 2 * _step_days(step):      # silent for over a full extra period
+    if (today - raw_last).days >= 2 * _step_days(step):       # silent for over a full extra period
         info['status'] = 'stale'
         return [], info
     info['status'] = 'ok'
-    events = _project(last_date, step, per_share, held_qty, today, months)
+    events = _project(last_date, step, per_share, held_qty, today, months, after=raw_last)
     if include_declared:
         # Payments the provider already DECLARED (dated after today) are certain amounts: they come
         # first, with their own per-share value; the projection continues after the last of them.
