@@ -31,6 +31,49 @@ from dataclasses import dataclass, field
 from .LazyTable import LazyTable, ColumnDef, LazyTableConfig, DataLoaderCallback
 from ...logger import logger
 from ..utils.perf_logger import PerfLogger
+from ..utils.responsive import (
+    PinnedColumn, PIN_TAG_PREFIX, phone_media, scroll_table_phone_css, tag_quasar_columns,
+)
+
+#: PHONE LAYOUT of the transactions tables (equity and options share this component).
+#: Every column stays; the table scrolls sideways inside its own box with the checkbox
+#: and the symbol pinned on the left. See ``ui/utils/responsive.py`` (scroll_table_phone_css).
+LIVE_TRADES_ROOT_CLASS = 'live-trades-table'
+#: Pinned left, in order. ``left`` is the sum of the widths before it; the expand button
+#: sits between the two and scrolls away under the pinned symbol.
+LIVE_TRADES_PINNED = (
+    PinnedColumn('select', 0, 60),
+    PinnedColumn('symbol', 60, 84),
+)
+#: Minimum width of each column on a phone, sized to the widest thing it holds
+#: ("$-0.13 (-2.55%)", "$27.55 / $27.55", "$9.01 ($-35.10)", a 4-button action cell at
+#: 40px a tap target) so a value is scrolled to, not clipped.
+LIVE_TRADES_MIN_WIDTHS = {
+    'expand': 44, 'id': 56, 'account': 120, 'direction': 84, 'expert': 150,
+    'quantity': 76, 'open_price': 96, 'current_price': 96, 'value': 160,
+    'close_price': 104, 'stop_loss': 140, 'take_profit': 140, 'pnl': 170,
+    'status': 104, 'order_count': 76, 'created_at': 150, 'closed_at': 150,
+    'actions': 176, 'strategy': 140, 'expiry': 130, 'legs': 64,
+}
+
+
+def live_trades_phone_css() -> str:
+    """All the phone CSS of the transactions table. Pure."""
+    r = f'.{LIVE_TRADES_ROOT_CLASS}'
+    extra = phone_media(f'''
+    {r} td .q-btn {{ min-width: 40px !important; min-height: 40px !important; }}
+    {r} td .q-checkbox__inner {{ min-width: 40px !important; min-height: 40px !important; }}
+    {r} td.lt-c-actions {{ white-space: nowrap; }}
+    /* The expanded "Related Orders" row is a colspan cell as wide as the whole table:
+       keep its content one screen wide and pinned left so it does not scroll away. */
+    {r} td.lt-expand-td {{ white-space: normal; padding: 0 !important; }}
+    {r} .lt-expand-inner {{ position: sticky; left: 0; width: calc(100vw - 2rem);
+        max-width: 100%; padding: 4px; box-sizing: border-box; }}
+    {r} .lt-expand-inner .q-table__middle {{ max-height: none; overflow-x: auto !important; }}
+''')
+    return scroll_table_phone_css(
+        LIVE_TRADES_ROOT_CLASS, PIN_TAG_PREFIX, LIVE_TRADES_PINNED, LIVE_TRADES_MIN_WIDTHS,
+    ) + '\n' + extra
 
 
 def bracket_level_cell(level: Any, open_price: Any, quantity: Any, side: Any,
@@ -332,8 +375,8 @@ class LiveTradesTable(LazyTable):
             </q-td>
         </q-tr>
         <q-tr v-show="props.expand" :props="props" class="bg-white/5">
-            <q-td colspan="100%">
-                <div class="q-pa-xs">
+            <q-td colspan="100%" class="lt-expand-td">
+                <div class="q-pa-xs lt-expand-inner">
                     <div class="text-subtitle2 q-mb-sm text-accent">📋 Related Orders ({{ props.row.order_count }})</div>
                     <q-markup-table flat bordered dense v-if="props.row.orders && props.row.orders.length > 0" class="bg-transparent">
                         <thead>
@@ -587,7 +630,9 @@ class LiveTradesTable(LazyTable):
                 self._loading_spinner = ui.spinner('dots').set_visibility(False)
             
             # Quasar columns
-            quasar_columns = [col.to_quasar_column() for col in self.columns]
+            # Each column wears a tag so the phone CSS can pin / size it by name.
+            quasar_columns = tag_quasar_columns(
+                [col.to_quasar_column() for col in self.columns], PIN_TAG_PREFIX)
             
             # Build table props from config
             table_props = 'flat bordered hide-pagination'
@@ -620,6 +665,8 @@ class LiveTradesTable(LazyTable):
                     }
                 ''')
             
+            ui.add_css(live_trades_phone_css())
+
             # Add the body template for expansion and custom cells
             self._table.add_slot('body', self.BODY_TEMPLATE)
             
