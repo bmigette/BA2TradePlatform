@@ -327,7 +327,8 @@ IBKR account-summary tags used (all USD; a non-USD base currency raises `IBKRUns
 
 **Which feeds `get_account_info` / `get_account_snapshot`:**
 
-* `buying_power` = `AvailableFunds x margin_multiplier`, where `margin_multiplier` = **2.0 when
+* `buying_power` = `min(AvailableFunds x m, SMA x m [only when published and > 0], ExcessLiquidity x m)` (section
+  12/13; `None` when it cannot be derived, and `get_account_info` then raises). `m` = `margin_multiplier`, where `margin_multiplier` = **2.0 when
   `BuyingPower / AvailableFunds >= 1.9`** (a Reg-T margin account: IB's `BuyingPower` is 4x
   `AvailableFunds` intraday, which is the day-trading figure we deliberately do not trade on) and
   **1.0 otherwise**. This is the Reg-T *overnight* leverage, the number the platform already uses for
@@ -647,3 +648,47 @@ modification confirmation and refusal; completed-orders/executions survival acro
 positions right after a reconnect (cache vs `reqPositions`); request ids vs `nextValidId`; Reg-T SMA vs
 `AvailableFunds x 2`; negative BAG limit acceptance (what-if) and the per-leg combo fill shape. Partial/full
 OCA fill reduction needs a real fill and is NOT exercised by the script.
+
+## 13. Review round 2 (re-review of 4cb38821)
+
+The first round's fixes were built on a fake that hid four real ib_async behaviours. `tests/ibkr_fakes.py`
+now reproduces them (and `tests/test_ibkr_review_fixes2.py::TestRealIbAsync` pins them against the REAL
+library with the socket stubbed): a `Modified` log entry only for an echoed status of exactly `Submitted`;
+a rejected order turns `Cancelled` (not `Inactive`) with the error in its log; EVERY warning (105 110 165 321
+329 399 404 434 492 and all 21xx) is `ValidationError` while the order lives; `openOrders` /
+`completedOrders` / `positions` have ONE pending future each (a concurrent identical request steals the
+answer); ids restart after a reconnect; resting stops are `PreSubmitted` outside the regular session.
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | adoption picked up DEAD orders: the stop-through-market MARKET retry and the UI Retry never placed anything | adopt only an order that is working or has a fill AND matches side/type/quantity; a live order that differs is refused (no duplicate); an order that merely died has a spent ref, so the row gets a NEW nonce and is placed again; the lookup runs only for a row that already had a nonce (first attempts do none) |
+| 2 | `Modified` is not logged for PreSubmitted stops, so every stop adjustment was reported failed and degraded to cancel+replace | confirm on `Modified` OR on a re-read of the open orders showing the SENT prices (after a short window); refuse on an error, a final state, or a warning plus a non-matching re-read; roll back only then |
+| 3 | 21xx / 105 / 110 / 165 / 321 / 329 / 434 / 492 warnings were rejections | rejection is decided from the STATUS (Cancelled/ApiCancelled/Inactive), as ib_async decides it; a trade that already traded is a fact, not an error; one explicit exception, a 321 'read-only' warning on a new order (never placed) |
+| 4 | concurrent requests stole each other's answer | one asyncio lock per request type on the runtime (openOrders, completedOrders, positions, executions, accountSummary) serialises every caller |
+| 5 | orphan stop after a rejected OCO take-profit (cancel was fire-and-forget) | the stop's cancel is awaited until IB confirms; if it cannot be confirmed (or the stop filled) the live stop is recorded as a plain stop exit of the transaction and the failure is raised loudly (`ORPHAN STOP`) |
+| 6 | an order that never reached IB stayed PENDING_NEW forever | a row IB never acknowledged, on none of IB's lists (a session-only `PendingSubmit` trade is local), with no execution under its ref, older than `_UNACKNOWLEDGED_GRACE_MINUTES` and inside the execution window, with a COMPLETE book, becomes ERROR 'never reached IBKR' + an Activity Log entry; an order IB DID acknowledge that vanishes stays UNRESOLVED (warning once + Activity Log entry), never CANCELED or ERROR |
+| 7 | SMA <= 0 blocked trading; an unknown buying power fell back to cash in the shared clamp | SMA is a bound only when published and > 0; the binding component is logged when it changes; `get_account_info` RAISES when no buying power can be derived (the shared clamp then reaches `get_balance()`, a real net-liquidation figure, never `cash`) |
+| 8 | `raiseSyncErrors=True` failed the connect on any slow startup request | startup fetches only the account-updates feed (`fetchFields=ACCOUNT_UPDATES`), `raiseSyncErrors=False`; every positions read still awaits `reqPositions` |
+
+Follow-ups: an OCO with only the stop placed gives the PARENT no broker id and the stop its own child row (a
+refresh never copies the stop's limit over the parent's take-profit); `_submit_budget(acks, reads, cancel_waits)`
+is explicit and the lookup has its own `_lookup_budget`; a timeout names the read that expired (`inner wait` vs
+`total budget`); a partial fill followed by Cancelled inside the acknowledgement window is recorded as the fill
+(CANCELED + `filled_qty`, folded back like a refresh), never ERROR; `_runtime()` called inside a coroutine
+never rebuilds (it would close the loop thread it runs on); the caller's order object carries the nonce in the
+equity path too; changing the client id while orders are live logs an ERROR naming the orders the new session
+cannot touch.
+
+Known residuals: (a) the shared expert clamp falls through to `get_balance()` (net liquidation) when
+`get_account_info` raises; it cannot be changed from the IBKR side. (b) A live order whose ref carries a spent
+nonce after a refused retry is tracked only by its broker id. (c) After an unconfirmed stop cancel the plain stop
+row protects the transaction, but nothing re-tries the cancel.
+
+What only a paper session can answer (each is a `[CHECK]` line in `tools/ibkr_paper_smoke.py`): the status a
+resting stop shows (Submitted vs PreSubmitted), whether a re-read after a modification shows the new price and
+how fast; whether a 105/321/329 warning accompanies a refused modification; the 321 'read-only' text on a new
+order; whether `reqAllOpenOrders` ever lists an order IB has not acknowledged (the never-reached rule assumes it
+does not); how long a cancel takes to confirm outside the session (`_CANCEL_ACK_TIMEOUT` is 3 s); which of
+`AvailableFunds` / `SMA` / `ExcessLiquidity` are published for cash, Reg-T margin and portfolio-margin accounts;
+how long startup requests take (the connect no longer raises); completed-order / execution survival across the
+Gateway's nightly restart; combo fill shape and negative-limit acceptance; partial OCA fill reduction.

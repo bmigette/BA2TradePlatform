@@ -76,7 +76,8 @@ class IBKROptionsMixin:
                        lastTradeDateOrContractMonth=M.ib_expiry_string(expiry), strike=strike,
                        right=M.ib_right(right), exchange="SMART", currency="USD",
                        multiplier=str(M.STANDARD_OPTION_MULTIPLIER), tradingClass=root)
-        details = await asyncio.wait_for(ib.reqContractDetailsAsync(probe), self._READ_TIMEOUT)
+        details = await self._bounded(ib.reqContractDetailsAsync(probe),
+                                      "option contract details (reqContractDetails)")
         options = [d for d in (details or []) if d.contract.secType == "OPT"]
         if len(options) != 1:
             raise IBKRContractError(
@@ -164,9 +165,9 @@ class IBKROptionsMixin:
                                     expiry_max: date, option_type: Optional[OptionRight],
                                     strike_min: Optional[float], strike_max: Optional[float]):
         stock = await self._resolve_stock(ib, underlying)
-        params = await asyncio.wait_for(
+        params = await self._bounded(
             ib.reqSecDefOptParamsAsync(stock.contract.symbol, "", "STK", stock.contract.conId),
-            self._READ_TIMEOUT)
+            "option chain parameters (reqSecDefOptParams)")
         chain = self._pick_chain(params, underlying)
         expiries = []
         for text in chain.expirations or []:
@@ -184,7 +185,8 @@ class IBKROptionsMixin:
                            exchange="SMART", currency="USD",
                            multiplier=str(M.STANDARD_OPTION_MULTIPLIER),
                            tradingClass=chain.tradingClass)
-            details = await asyncio.wait_for(ib.reqContractDetailsAsync(probe), self._READ_TIMEOUT)
+            details = await self._bounded(ib.reqContractDetailsAsync(probe),
+                                          "option chain contract details (reqContractDetails)")
             for d in details or []:
                 c = d.contract
                 if c.secType != "OPT" or str(c.multiplier) != str(M.STANDARD_OPTION_MULTIPLIER):
@@ -336,9 +338,6 @@ class IBKROptionsMixin:
         return -magnitude if price < 0 else magnitude
 
     async def _place_option(self, ib: Any, spec: Dict[str, Any]) -> Dict[str, Any]:
-        adopted = await self._existing_order(ib, spec["order_ref"])
-        if adopted is not None:
-            return {"view": adopted, "limit": adopted.limit_price, "adopted": True}
         legs = spec["legs"]
         resolved = [await self._resolve_option(ib, leg["occ"], leg["underlying"]) for leg in legs]
         if len(legs) == 1:
@@ -392,10 +391,9 @@ class IBKROptionsMixin:
         if len(legs) == 1 and not is_market and float(trading_order.limit_price) <= 0:
             raise ValueError(f"a single-leg option limit must be a positive premium, got "
                              f"{trading_order.limit_price!r}")
+        had_nonce = bool(self._row_nonce(trading_order.id))
         nonce = self._ensure_nonce(trading_order.id)
-        # the caller's object is stale (it predates the nonce); later update_instance calls on it
-        # must not wipe the nonce out of the row
-        trading_order.data = {**(trading_order.data or {}), "ibkr_nonce": nonce}
+        self._carry_nonce(trading_order, nonce)
         spec = {
             "legs": [{"occ": leg.contract_symbol,
                       "underlying": leg.underlying,
@@ -407,10 +405,28 @@ class IBKROptionsMixin:
             "order_ref": M.make_order_ref(self.id, trading_order.id, nonce=nonce),
             "progress": {"order_ids": []},
         }
+        placed = None
+        if had_nonce:
+            # a re-submission: look first (same rules as equities; see _submit_order_impl)
+            combo_action = legs[0].side == OrderDirection.BUY
+            kind, prior = self._resolve_prior(
+                [{"name": "main", "ref": spec["order_ref"],
+                  "action": ("BUY" if combo_action else "SELL") if len(legs) == 1 else "BUY",
+                  "ib_type": spec["ib_type"] if spec["ib_type"] == "MKT" else "LMT",
+                  "qty": float(spec["quantity"])}], f"option order {trading_order.id}")["main"]
+            if kind == "adopt":
+                logger.warning(f"[Account {self.id}] option order {trading_order.id}: IB already has "
+                               f"this order ({prior.broker_order_id}, {prior.status}); adopting it")
+                placed = {"view": prior, "limit": prior.limit_price, "adopted": True}
+            elif kind == "dead":
+                nonce = self._rotate_nonce(trading_order.id)
+                self._carry_nonce(trading_order, nonce)
+                spec["order_ref"] = M.make_order_ref(self.id, trading_order.id, nonce=nonce)
         try:
-            placed = self._call(lambda ib: self._place_option(ib, spec),
-                                op=f"place option order {trading_order.id}",
-                                timeout=self._submit_budget(1) + self._READ_TIMEOUT * len(legs))
+            if placed is None:
+                placed = self._call(lambda ib: self._place_option(ib, spec),
+                                    op=f"place option order {trading_order.id}",
+                                    timeout=self._submit_budget(1, reads=len(legs) + 1))
         except (TimeoutError, IBKRConnectionError) as e:
             if spec["progress"]["order_ids"]:
                 # placed, but unconfirmed: the order may be live. Record the id and RETURN (never

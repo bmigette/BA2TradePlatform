@@ -147,6 +147,9 @@ class TestTestOrder:
         assert "a modification is acknowledged by a 'Modified' log entry" in out
         assert "a REFUSED modification" in out
         assert "cancelling ONE OCA leg leaves the other working" in out
+        assert "a RESTING STOP's modification" in out
+        assert "resting status=PreSubmitted" in out and "'Modified' logged=False" in out
+        assert "shows the new stop=True" in out
 
     def test_no_price_means_no_order(self):
         fake, aapl = make_fake()

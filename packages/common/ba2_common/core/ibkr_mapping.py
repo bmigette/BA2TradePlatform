@@ -158,9 +158,17 @@ def map_ib_status(status: Optional[str], filled: Optional[float] = None,
 #: Codes that are connection-farm chatter / warnings attached to an order. Never an order failure.
 INFO_CODES = frozenset(set(range(2100, 2111)) | {2119, 2137, 2150, 2157, 2158})
 
-#: Warnings attached to an ORDER that stays live (held until the open, shares being located, TIF
-#: adjusted by preset). They are logged and never fail the order.
-ORDER_WARNING_CODES = frozenset({399, 404, 10349})
+#: Codes ib_async (wrapper.py ``warningCodes``) treats as WARNINGS: the order stays LIVE and its status
+#: becomes ``ValidationError``. Plus EVERY 2100-2199 code (those are warnings too), plus 10349
+#: (TIF adjusted by the order preset), which ib_async treats as an error although IB keeps the order.
+#: A warning is logged and NEVER fails an order; whether an order failed is decided from its STATUS
+#: (see ``IB_REJECTION_STATUSES``), exactly as ib_async decides it.
+ORDER_WARNING_CODES = frozenset({105, 110, 165, 321, 329, 399, 404, 434, 492, 10349})
+IB_ASYNC_WARNING_RANGE = range(2100, 2200)
+
+#: The statuses that mean an order is dead without having traded (ib_async sets ``Cancelled`` when a
+#: non-warning error arrives for a live trade; TWS itself sends ``Inactive`` / ``ApiCancelled``).
+IB_REJECTION_STATUSES = frozenset({"Cancelled", "ApiCancelled", "Inactive"})
 
 #: Connectivity state changes.
 CONNECTION_LOST_CODES = frozenset({1100, 504, 502, 1300})
@@ -187,7 +195,7 @@ def error_severity(code: int) -> str:
     """
     if code in INFO_CODES:
         return "info"
-    if code in ORDER_WARNING_CODES:
+    if code in ORDER_WARNING_CODES or code in IB_ASYNC_WARNING_RANGE:
         return "order_warning"
     if code in CONNECTION_LOST_CODES:
         return "connection_lost"
@@ -505,11 +513,22 @@ def buying_power_components(numbers: Dict[str, float], multiplier: float) -> Dic
     parts: Dict[str, float] = {}
     if numbers.get("AvailableFunds") is not None:
         parts["available_funds_x_mult"] = numbers["AvailableFunds"] * multiplier
-    if numbers.get("SMA") is not None:
+    # SMA is a bound only when published AND positive: a cash account publishes 0 (and a margin one can
+    # briefly publish a negative figure after a withdrawal), which would read as "no buying power" and
+    # silently block all trading; AvailableFunds and ExcessLiquidity already carry the real limit.
+    if numbers.get("SMA") is not None and numbers["SMA"] > 0:
         parts["sma_x_mult"] = numbers["SMA"] * multiplier
     if numbers.get("ExcessLiquidity") is not None:
         parts["excess_liquidity_x_mult"] = numbers["ExcessLiquidity"] * multiplier
     return parts
+
+
+def buying_power_binding(numbers: Dict[str, float], multiplier: float) -> Optional[str]:
+    """Which component of ``conservative_buying_power`` is the smallest (the one that binds)."""
+    parts = buying_power_components(numbers, multiplier)
+    if not parts:
+        return None
+    return min(parts, key=lambda k: parts[k])
 
 
 def conservative_buying_power(numbers: Dict[str, float], multiplier: float) -> Optional[float]:
@@ -558,6 +577,7 @@ def snapshot_from_account_values(numbers: Dict[str, float], texts: Dict[str, str
              "available_funds": funds,
              "sma": numbers.get("SMA"),
              "bp_components": buying_power_components(numbers, multiplier),
+             "bp_binding": buying_power_binding(numbers, multiplier),
              "excess_liquidity": numbers.get("ExcessLiquidity"),
              "init_margin_req": numbers.get("InitMarginReq"),
              "maint_margin_req": numbers.get("MaintMarginReq"),

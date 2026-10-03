@@ -67,7 +67,17 @@ class TestErrors:
         assert M.error_severity(1102) == "connection_restored"
         assert M.error_severity(354) == "market_data" and M.error_severity(10089) == "market_data"
         assert M.error_severity(202) == "cancelled"
-        assert M.error_severity(201) == "order" and M.error_severity(110) == "order"
+        assert M.error_severity(201) == "order" and M.error_severity(103) == "order"
+
+    @pytest.mark.parametrize("code", [105, 110, 165, 321, 329, 399, 404, 434, 492, 10349, 2100, 2119, 2148,
+                                      2161, 2199])
+    def test_every_ib_async_warning_is_a_warning(self, code):
+        """ib_async (wrapper.py warningCodes + 2100-2199): the order stays live. Never a rejection."""
+        assert M.error_severity(code) in ("order_warning", "info")
+
+    def test_rejection_is_decided_from_the_status(self):
+        assert M.IB_REJECTION_STATUSES == {"Cancelled", "ApiCancelled", "Inactive"}
+        assert "ValidationError" not in M.IB_REJECTION_STATUSES
 
     def test_201_is_classified_by_its_text(self):
         c = M.classify_ib_error
@@ -239,6 +249,19 @@ class TestSnapshot:
         assert M.margin_multiplier_from({**self.BASE, "BuyingPower": 100000.0}) == 1.0
         assert M.margin_multiplier_from({**self.BASE, "AvailableFunds": 0.0}) == 1.0
         assert M.margin_multiplier_from({"NetLiquidation": 1.0}) == 1.0
+
+    @pytest.mark.parametrize("sma", [0.0, -2000.0])
+    def test_a_zero_or_negative_sma_is_not_a_bound(self, sma):
+        nums = {"AvailableFunds": 80000.0, "BuyingPower": 320000.0, "ExcessLiquidity": 90000.0,
+                "NetLiquidation": 100000.0, "SMA": sma}
+        snap = M.snapshot_from_account_values(nums, {}, None, None)
+        assert snap.buying_power == 160000.0 and snap.raw["bp_binding"] == "available_funds_x_mult"
+
+    def test_a_positive_sma_binds_when_smallest_and_the_binder_is_named(self):
+        nums = {"AvailableFunds": 80000.0, "BuyingPower": 320000.0, "ExcessLiquidity": 90000.0,
+                "NetLiquidation": 100000.0, "SMA": 30000.0}
+        snap = M.snapshot_from_account_values(nums, {}, None, None)
+        assert snap.buying_power == 60000.0 and snap.raw["bp_binding"] == "sma_x_mult"
 
     def test_buying_power_is_available_funds_times_regt_never_ibs_own(self):
         snap = M.snapshot_from_account_values(dict(self.BASE), {}, 1000.0, -200.0)

@@ -33,6 +33,8 @@ from ba2_common.core.ibkr_mapping import (
     CLIENT_ID_IN_USE_CODE, CONNECTION_RESTORED_CODES, IB_PORTS,
     PAPER_ACCOUNT_PREFIX, error_severity)
 
+from ib_async import StartupFetch
+
 from ...logger import logger
 
 
@@ -54,6 +56,17 @@ class IBKROrderRejected(IBKRError):
     def __init__(self, message: str, code: Optional[int] = None):
         super().__init__(message)
         self.code = code
+
+
+class IBKROrphanStop(IBKROrderRejected):
+    """An OCO's take-profit failed and the stop leg already placed could not be CONFIRMED cancelled
+    (or it filled meanwhile): a live/filled order exists that the caller must record, never lose."""
+
+    def __init__(self, message: str, code: Optional[int] = None, *, view: Any = None,
+                 sl_stop: Optional[float] = None, sl_limit: Optional[float] = None,
+                 outcome: str = "unconfirmed"):
+        super().__init__(message, code)
+        self.view, self.sl_stop, self.sl_limit, self.outcome = view, sl_stop, sl_limit, outcome
 
 
 class IBKRContractError(IBKRError):
@@ -80,6 +93,10 @@ class RuntimeState:
         #: Created lazily ON the loop thread.
         self.data_lock: Optional[asyncio.Lock] = None
         self.flex: Any = None
+        #: One asyncio lock per ib_async request TYPE (see ``IBKRRuntime.request_lock``).
+        self.request_locks: Dict[str, asyncio.Lock] = {}
+        #: the buying-power component that last bound (logged when it changes)
+        self.bp_binding: Optional[str] = None
 
 
 class IBKRRuntime:
@@ -154,9 +171,17 @@ class IBKRRuntime:
         self._pending.add(future)
         try:
             return future.result(timeout=budget)
-        except FutureTimeoutError:
+        except FutureTimeoutError as e:
+            if future.done() and not future.cancelled():
+                # concurrent.futures.TimeoutError IS the builtin TimeoutError (3.11): an inner
+                # ``asyncio.wait_for`` that expired inside the coroutine surfaces here too. Say which
+                # one fired, so a read that timed out is never reported as the whole call's budget.
+                raise TimeoutError(f"[{self.label}] IBKR call '{op}': an inner wait timed out "
+                                   f"({e or 'no detail'}); the call's own budget of {budget:.0f}s "
+                                   f"had not run out") from e
             future.cancel()
-            raise TimeoutError(f"[{self.label}] IBKR call '{op}' timed out after {budget:.0f}s") from None
+            raise TimeoutError(f"[{self.label}] IBKR call '{op}' exceeded its total budget of "
+                               f"{budget:.0f}s (the call's own deadline, not an inner read)") from None
         except CancelledError:
             raise IBKRConnectionError(
                 f"[{self.label}] IBKR call '{op}' was cancelled: the runtime was closed (settings "
@@ -174,6 +199,16 @@ class IBKRRuntime:
             f"[{self.label}] IBKR call '{op}' is blocking a thread that is running an asyncio loop "
             f"(the NiceGUI UI thread?). It is bounded by its timeout, but move it to "
             f"run.io_bound. Call site:\n{site}")
+
+    def request_lock(self, name: str) -> asyncio.Lock:
+        """The lock serialising every caller of one ib_async request TYPE. ib_async keeps ONE pending
+        future per type (``openOrders``, ``completedOrders``, ``positions``, ...): a second concurrent
+        request overwrites the first's future, so the first caller never gets its answer and times
+        out. Every such request is therefore made under this lock. Loop thread only."""
+        lock = self.state.request_locks.get(name)
+        if lock is None:
+            lock = self.state.request_locks[name] = asyncio.Lock()
+        return lock
 
     async def _run(self, fn: Callable[[Any], Any], op: str) -> Any:
         ib = await self._ensure_connected()
@@ -237,10 +272,17 @@ class IBKRRuntime:
         self._errors.clear()                  # ids repeat across sessions: nothing from before counts
         logger.info(f"[{self.label}] connecting to IBKR {self.host}:{self.port} "
                     f"clientId={self.client_id} readonly={self.read_only}")
+        # Startup is trimmed to what the adapter streams: the account-updates feed (values + portfolio).
+        # Completed orders, open orders and executions are NOT preloaded (the order book is read
+        # explicitly, under a request lock, when needed) and a slow optional sync must not fail the
+        # connect: ``raiseSyncErrors`` stays False. Positions are always requested by ib_async at
+        # connect, and the adapter re-confirms them with ``reqPositions`` on EVERY positions read, so an
+        # unsynced cache can never be mistaken for a flat book.
         await asyncio.wait_for(
             ib.connectAsync(self.host, self.port, clientId=self.client_id,
                             timeout=self.connect_timeout, readonly=self.read_only,
-                            account=self.account_id, raiseSyncErrors=True),
+                            account=self.account_id, raiseSyncErrors=False,
+                            fetchFields=StartupFetch.ACCOUNT_UPDATES),
             self.connect_timeout + 5.0)
         managed = list(ib.managedAccounts())
         if self.account_id not in managed:
@@ -297,11 +339,13 @@ class IBKRRuntime:
         return self._err_seq
 
     def order_errors(self, order_id: int, after_seq: int = 0,
-                     kinds: Tuple[str, ...] = ("order", "cancelled")) -> List[Tuple[int, str]]:
-        """Errors for ``order_id`` that arrived AFTER ``after_seq`` and fail an order (info,
-        warnings, connection and market-data chatter excluded)."""
+                     kinds: Optional[Tuple[str, ...]] = ("order", "cancelled")) -> List[Tuple[int, str]]:
+        """Messages for ``order_id`` that arrived AFTER ``after_seq``. By default only the kinds that can
+        fail an order (warnings, info, connection and market-data chatter excluded); ``kinds=None``
+        returns every message, used to EXPLAIN a rejection that ib_async already decided."""
         return [(c, m) for seq, rid, c, m in self._errors
-                if rid == order_id and seq > after_seq and error_severity(c) in kinds]
+                if rid == order_id and seq > after_seq
+                and (kinds is None or error_severity(c) in kinds)]
 
     def order_warnings(self, order_id: int, after_seq: int = 0) -> List[Tuple[int, str]]:
         return self.order_errors(order_id, after_seq, kinds=("order_warning",))
@@ -309,6 +353,7 @@ class IBKRRuntime:
     # ------------------------------------------------------------------ shutdown
     def close(self) -> None:
         self.closed = True
+        on_own_thread = threading.current_thread() is self._thread
         for future in list(self._pending):          # waiting callers fail NOW, not after their timeout
             future.cancel()
         loop = self._loop
@@ -325,7 +370,8 @@ class IBKRRuntime:
 
         try:
             loop.call_soon_threadsafe(_stop)
-            self._thread.join(timeout=5.0)
+            if not on_own_thread:                 # a thread cannot join itself
+                self._thread.join(timeout=5.0)
         except Exception as e:  # noqa: BLE001 -- shutdown must never raise
             logger.error(f"[{self.label}] error closing IBKR runtime: {e}")
 
@@ -358,6 +404,13 @@ def get_runtime(account_definition_id: int, signature: Tuple,
         runtime = factory()
         _REGISTRY[account_definition_id] = (signature, runtime)
         return runtime
+
+
+def registry_signature(account_definition_id: int) -> Optional[Tuple]:
+    """The signature the current runtime for this account definition was built with, if any."""
+    with _REGISTRY_LOCK:
+        entry = _REGISTRY.get(account_definition_id)
+        return entry[0] if entry is not None and not entry[1].closed else None
 
 
 def shutdown_runtime(account_definition_id: int) -> None:

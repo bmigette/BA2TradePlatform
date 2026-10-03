@@ -127,9 +127,10 @@ class TestNoDuplicateAfterPlacement:
         assert f.status != OrderStatus.ERROR
         assert len(fake.placed) <= 1
 
-    def test_retrying_a_row_adopts_the_live_order_instead_of_sending_again(self, world):
+    def test_retrying_a_row_adopts_the_live_order_instead_of_sending_again(self, world, monkeypatch):
         """Probe D."""
         account, fake, _ = world
+        monkeypatch.setattr(IBKRAccount, "_ORDER_ACK_TIMEOUT", 0.3)
         fake.behaviors.append("silent")
         row = new_order(account)
         first = submit(account, row)
@@ -173,10 +174,15 @@ class TestNoDuplicateAfterPlacement:
 
 # ---------------------------------------------------------------- 4: positions are never 'flat' unconfirmed
 class TestPositionsSync:
-    def test_connect_asks_ib_async_to_raise_sync_errors(self, world):
+    def test_connect_is_trimmed_and_every_positions_read_is_confirmed(self, world):
+        """(Superseded by round 2, item 8: raiseSyncErrors=True failed the connect on any slow startup
+        request. Startup is now trimmed and each positions read awaits reqPositions itself.)"""
         account, fake, _ = world
         account.get_positions()
-        assert fake.connect_kwargs.get("raiseSyncErrors") is True
+        assert fake.connect_kwargs.get("raiseSyncErrors") is False
+        fake.request_log.clear()
+        account.get_positions()
+        assert "positions" in fake.request_log
 
     def test_a_failed_startup_sync_is_none_not_flat(self, world):
         account, fake, aapl = world
@@ -428,7 +434,7 @@ class TestFollowUps:
                                            transaction_id=txn.id))
         fake.simulate_fill(ref_of(account, parent), qty=4, price=120.0)
         sl = fake.trade_by_ref(ref_of(account, parent) + ":SL")
-        sl.order.totalQuantity = 6.0                                # ocaType 2 reduced the other leg
+        fake.simulate_ib_quantity(sl.order.orderRef, 6.0)           # ocaType 2 reduced the other leg
         account.refresh_orders()
         kid = rows(account, parent_order_id=parent.id)[0]
         assert kid.quantity == 6.0

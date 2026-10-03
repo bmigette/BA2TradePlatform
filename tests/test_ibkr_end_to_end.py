@@ -73,7 +73,7 @@ def test_the_whole_life_of_a_protected_position(world, monkeypatch):
     new_oco = live[0]
     fake.simulate_fill(ref(account, new_oco), qty=4, price=130.0)
     stop_leg = fake.trade_by_ref(ref(account, new_oco) + ":SL")
-    stop_leg.order.totalQuantity = new_oco.quantity - 4          # ocaType 2: reduced, not cancelled
+    fake.simulate_ib_quantity(stop_leg.order.orderRef, new_oco.quantity - 4)   # ocaType 2: reduced
     account.refresh_orders()
     assert fresh(new_oco).status == OrderStatus.PARTIALLY_FILLED
     assert rows(account, parent_order_id=new_oco.id)[0].quantity == new_oco.quantity - 4

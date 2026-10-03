@@ -423,6 +423,7 @@ async def place_test_order(ib: Any, account: str, symbol: str, details: Any, rep
     if trade.orderStatus.status == "Filled":
         rep.warn("the far-from-market order FILLED (price moved?); check and close the 1-share position")
     await modify_check(ib, contract, account, last, args, rep)
+    await stop_modify_check(ib, contract, account, last, args, rep)
     await oca_check(ib, contract, account, last, args, rep)
 
 
@@ -458,6 +459,38 @@ async def modify_check(ib: Any, contract: Any, account: str, last: float, args: 
               f"status={trade.orderStatus.status} new log entries="
               f"{[(e.status, e.message, e.errorCode) for e in trade.log[refused_at:]]}")
     trade.order.lmtPrice = round(far + 0.05, 2)
+    ib.cancelOrder(trade.order)
+    await _wait_status(trade, ("Cancelled", "ApiCancelled", "Inactive"), args.timeout)
+
+
+async def stop_modify_check(ib: Any, contract: Any, account: str, last: float, args: argparse.Namespace,
+                            rep: Report) -> None:
+    """A RESTING STOP leg is what the adapter modifies most. ib_async logs ``Modified`` only when the echoed
+    status is exactly ``Submitted``; a stop that rests as ``PreSubmitted`` (typical outside the regular
+    session, and for stops IB simulates) gets no log entry although IB applies the change. The adapter
+    therefore also re-reads the open order and compares prices. This records which status the stop rests
+    in, whether the 'Modified' entry appears, and whether the re-read shows the new price."""
+    from ib_async import Order
+    stop = round(last * 1.5, 2)
+    order = Order(action="BUY", totalQuantity=1, orderType="STP LMT", auxPrice=stop,
+                  lmtPrice=round(stop * 1.005, 2), tif="GTC", orderRef=TEST_ORDER_REF + "-stpmod",
+                  account=account, transmit=True)
+    trade = ib.placeOrder(contract, order)
+    resting = await _wait_status(trade, ("Submitted", "PreSubmitted", "Cancelled", "Inactive"), args.timeout)
+    log_len = len(trade.log)
+    new_stop = round(stop + 0.05, 2)
+    trade.order.auxPrice, trade.order.lmtPrice = new_stop, round(new_stop * 1.005, 2)
+    ib.placeOrder(contract, trade.order)
+    await asyncio.sleep(min(args.timeout, 4.0))
+    modified_logged = any(e.message == "Modified" for e in trade.log[log_len:])
+    listed = await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), args.timeout)
+    mine = [t for t in listed if t.order.orderId == trade.order.orderId]
+    echoed = bool(mine) and abs(mine[0].order.auxPrice - new_stop) < 1e-6
+    rep.check("a RESTING STOP's modification: resting status, 'Modified' log entry, and whether a re-read of "
+              "the open orders shows the new stop (the adapter confirms on EITHER; PreSubmitted should give "
+              "no log entry but a matching re-read)",
+              f"resting status={resting}; 'Modified' logged={modified_logged}; open-order re-read shows the "
+              f"new stop={echoed}; status now={trade.orderStatus.status}")
     ib.cancelOrder(trade.order)
     await _wait_status(trade, ("Cancelled", "ApiCancelled", "Inactive"), args.timeout)
 
@@ -518,7 +551,7 @@ async def run(args: argparse.Namespace, ib_factory: Callable[[], Any], rep: Repo
         for e in errors or ["none"]:
             rep.line(f"    {e}")
         seen = sorted({int(e.split(" ")[0]) for e in errors if e.split(" ")[0].isdigit()
-                       and int(e.split(" ")[0]) in M.ORDER_WARNING_CODES})
+                       and M.error_severity(int(e.split(" ")[0])) == "order_warning"})
         rep.check("order WARNING codes seen (399 held until the open, 404 shares being located, 10349 TIF "
                   "preset): ib_async sets status 'ValidationError' for them while the order stays LIVE. "
                   "Pre-market, place a 1-share MARKET order from TWS and note whether these arrive; also "

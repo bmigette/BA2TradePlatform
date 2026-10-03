@@ -6,6 +6,15 @@ the adapter fails here exactly as it would against a Gateway. What it fakes is I
 acknowledgement, rejection, partial fills, cancel handshakes, OCA groups, untransmitted orders,
 disconnects, client-id collisions, error callbacks.
 
+IB/ib_async SEMANTICS it reproduces (verified against ib_async 2.1.0 wrapper.py, see
+``tests/test_ibkr_review_fixes2.py``): a modification is acknowledged with a ``Modified`` log entry ONLY when
+the echoed status is exactly ``Submitted`` (a resting ``PreSubmitted`` stop gets no log entry at all, though
+IB applied it); a non-warning error on a live trade turns its status into ``Cancelled`` (not ``Inactive``)
+with the error in the log; a WARNING (105 110 165 321 329 399 404 434 492 and every 21xx) turns it into
+``ValidationError`` while the order stays live; ``openOrders`` / ``completedOrders`` / ``positions`` have ONE
+pending future each, so a second concurrent identical request steals the first one's answer; after a
+reconnect order ids restart (reused ids); the order values ib_async shows are overwritten by what IB echoes.
+
 Everything that mutates state runs ON THE ADAPTER'S LOOP THREAD (the adapter calls the fake from
 coroutines there); the ``simulate_*`` helpers are for the TEST thread and hop onto that loop.
 
@@ -28,6 +37,12 @@ from ib_async.objects import CommissionReport, OptionComputation
 
 NAN = float("nan")
 FINAL = ("Filled", "Cancelled", "ApiCancelled", "Inactive")
+#: ib_async wrapper.error(): these codes are WARNINGS (order stays live, status ValidationError)
+WARNING_CODES = frozenset({105, 110, 165, 321, 329, 399, 404, 434, 492, 10167})
+
+
+def is_warning_code(code: int) -> bool:
+    return code in WARNING_CODES or 2100 <= code < 2200
 
 
 class FakeEvent:
@@ -95,6 +110,15 @@ class FakeIB:
         self.positions_sync_ok_on_request = False
         #: how a modification is answered: 'confirm' (log 'Modified'), 'silent', or ('reject', code, text)
         self.modify_behavior: Any = 'confirm'
+        #: resting stops are ``Submitted`` inside the regular session and ``PreSubmitted`` outside it
+        #: (and for simulated stops); the default is the awkward, common one
+        self.regular_session = False
+        #: cancel requests that never reach IB (socket dropped right after sending)
+        self.lose_cancels = False
+        #: seconds TWS takes to answer a keyed request (openOrders/completedOrders/positions)
+        self.request_delay = 0.01
+        self._futures: Dict[str, asyncio.Future] = {}
+        self.request_log: List[str] = []
         self.market_data_type: Optional[int] = None
         # account data
         self.account_rows: List[AccountValue] = default_account_rows(account)
@@ -172,6 +196,10 @@ class FakeIB:
             raise ConnectionError(["positions request timed out"])
         if self.reset_ids_on_connect is not None and self.connect_calls[1:]:
             self._next_order_id = self.reset_ids_on_connect
+            # the previous session's trades are not this session's: they are only visible through the
+            # open / completed order requests now (their ids are about to be reused)
+            self.prior_trades.extend(self._trades)
+            self._trades = []
         if self.client_id_in_use:
             self.errorEvent.emit(-1, 326, "Unable to connect as the client id is already in use. "
                                           "Retry with a unique client id.", None)
@@ -190,7 +218,8 @@ class FakeIB:
 
     def simulate_error(self, req_id: int, code: int, text: str) -> None:
         asyncio.run_coroutine_threadsafe(
-            self._async(lambda: self.errorEvent.emit(req_id, code, text, None)), self.loop).result(5)
+            self._async(lambda: self.wrapper_error(self._find(req_id), req_id, code, text, None)),
+            self.loop).result(5)
 
     @staticmethod
     async def _async(fn: Callable[[], Any]) -> Any:
@@ -241,12 +270,35 @@ class FakeIB:
             return []                       # the dangerous shape: nothing synced, looks flat
         return [p for p in self._positions if not account or p.account == account]
 
+    async def _keyed(self, key: str, produce: Callable[[], Any]) -> Any:
+        """ib_async ``startReq(key)``: ONE pending future per key. A second request made before TWS
+        answered the first REPLACES it: the first future never completes (its caller times out) and the
+        single answer completes the second."""
+        loop = asyncio.get_running_loop()
+        self.request_log.append(key)
+        fut = loop.create_future()
+        self._futures[key] = fut
+        loop.call_later(self.request_delay, self._end_req, key, produce)
+        return await fut
+
+    def _end_req(self, key: str, produce: Callable[[], Any]) -> None:
+        fut = self._futures.pop(key, None)
+        if fut is None or fut.done():
+            return
+        try:
+            fut.set_result(produce())
+        except BaseException as e:  # noqa: BLE001 -- delivered to the waiting caller
+            fut.set_exception(e)
+
     async def reqPositionsAsync(self) -> List[Position]:
         await self._maybe_fail("reqPositionsAsync")
-        if self.positions_sync_fails and not self.positions_sync_ok_on_request:
-            raise TimeoutError("positions request timed out")
-        self.positions_confirmed = True
-        return list(self._positions)
+
+        def produce() -> List[Position]:
+            if self.positions_sync_fails and not self.positions_sync_ok_on_request:
+                raise TimeoutError("positions request timed out")
+            self.positions_confirmed = True
+            return list(self._positions)
+        return await self._keyed("positions", produce)
 
     def portfolio(self, account: str = "") -> List[PortfolioItem]:
         self._note("portfolio")
@@ -407,11 +459,36 @@ class FakeIB:
 
     async def reqAllOpenOrdersAsync(self) -> List[Trade]:
         await self._maybe_fail("reqAllOpenOrdersAsync")
-        return self.openTrades()
+
+        def produce() -> List[Trade]:
+            live = [t for t in self._trades + self.prior_trades
+                    if t.orderStatus.status not in FINAL and not getattr(t, "_lost", False)]
+            for trade in live:
+                self._echo_open_order(trade)
+            return live
+        return await self._keyed("openOrders", produce)
 
     async def reqCompletedOrdersAsync(self, apiOnly: bool) -> List[Trade]:
         await self._maybe_fail("reqCompletedOrdersAsync")
-        return list(self.prior_trades) + [t for t in self._trades if t.orderStatus.status in FINAL]
+        return await self._keyed("completedOrders", lambda: [
+            t for t in self.prior_trades + self._trades
+            if t.orderStatus.status in FINAL and not getattr(t, "_lost", False)])
+
+    @staticmethod
+    def _ib_values(order: Order) -> Dict[str, Any]:
+        return {"lmt": order.lmtPrice, "aux": order.auxPrice, "qty": order.totalQuantity,
+                "type": order.orderType, "ref": order.orderRef, "tif": order.tif}
+
+    def _echo_open_order(self, trade: Trade) -> None:
+        """ib_async ``wrapper.openOrder`` for a KNOWN trade: the order object takes IB's values (so a
+        local edit IB never applied is reverted by the next open-orders read)."""
+        ib = getattr(trade, "_ib", None)
+        if ib is None:
+            return
+        trade.order.lmtPrice, trade.order.auxPrice = ib["lmt"], ib["aux"]
+        trade.order.totalQuantity, trade.order.orderType = ib["qty"], ib["type"]
+        trade.order.orderRef = ib["ref"]
+        trade.orderStatus.remaining = max(0.0, ib["qty"] - trade.orderStatus.filled)
 
     async def reqExecutionsAsync(self, execFilter=None) -> List[Fill]:
         await self._maybe_fail("reqExecutionsAsync")
@@ -430,24 +507,34 @@ class FakeIB:
                 return trade
         return None
 
+    def wrapper_error(self, trade: Optional[Trade], req_id: int, code: int, text: str,
+                      contract: Any = None) -> None:
+        """ib_async ``wrapper.error`` for an order id: a WARNING marks the trade ``ValidationError`` and
+        leaves it live; any other error turns a not-yet-done trade into ``Cancelled`` (the log carries the
+        error code). The error event itself is emitted last, as ib_async does."""
+        if trade is not None:
+            warning = is_warning_code(code)
+            if code == 110 and trade.orderStatus.status == "PendingSubmit":
+                warning = False          # wrapper.py: an invalid price for a NEW order must cancel it
+            if warning:
+                trade.orderStatus.status = "ValidationError"
+                self._log(trade, "ValidationError", f"Warning {code}, reqId {req_id}: {text}", code)
+            elif trade.orderStatus.status not in FINAL:
+                trade.orderStatus.status = "Cancelled"
+                self._log(trade, "Cancelled", f"Error {code}, reqId {req_id}: {text}", code)
+        self.errorEvent.emit(req_id, code, text, contract)
+
     def placeOrder(self, contract: Contract, order: Order) -> Trade:
         self._note("placeOrder")
-        if self._find(order.orderId) is not None and order.orderId:
-            trade = self._find(order.orderId)
-            self.placed.append(self._snapshot(contract, order, modification=True))
-            mb = self.modify_behavior
-            self._log(trade, trade.orderStatus.status, "Modify")    # ib_async logs this itself
-            if mb == "confirm":
-                # ib_async appends 'Modified' when IB echoes the changed order; it does NOT change status
-                self._log(trade, trade.orderStatus.status, "Modified")
-            elif isinstance(mb, tuple) and mb[0] == "reject":
-                self.errorEvent.emit(order.orderId, mb[1], mb[2], contract)
-            return trade
+        existing = self._find(order.orderId) if order.orderId else None
+        if existing is not None:
+            return self._modify(existing, contract, order)
         order.orderId = self._next_order_id
         self._next_order_id += 1
         status = IBOrderStatus(orderId=order.orderId, status="PendingSubmit",
                                remaining=order.totalQuantity, clientId=self.client_id or 0)
         trade = Trade(contract, order, status, [], [])
+        trade._ib = self._ib_values(order)  # type: ignore[attr-defined]
         self._log(trade, "PendingSubmit")
         self._trades.append(trade)
         self.placed.append(self._snapshot(contract, order, modification=False))
@@ -458,6 +545,32 @@ class FakeIB:
         # OCA order is NOT held back (design review 2026-10-03, item 5).
         self._release(trade)
         return trade
+
+    def _modify(self, trade: Trade, contract: Contract, order: Order) -> Trade:
+        """ib_async ``placeOrder`` with a known orderId: logs ``Modify`` at once; what comes back from IB
+        depends on ``modify_behavior``."""
+        self.placed.append(self._snapshot(contract, order, modification=True))
+        self._log(trade, trade.orderStatus.status, "Modify")
+        sent = self._ib_values(order)
+        (self.loop or asyncio.get_event_loop()).call_later(0.005, self._answer_modify, trade, sent)
+        return trade
+
+    def _answer_modify(self, trade: Trade, sent: Dict[str, Any]) -> None:
+        mb = self.modify_behavior
+        if mb == "silent":
+            return                                    # IB ignored it: no echo of any kind
+        if isinstance(mb, tuple) and mb[0] == "reject":
+            self.wrapper_error(trade, trade.order.orderId, mb[1], mb[2], trade.contract)
+            return
+        if mb in ("confirm", "applied_no_echo"):
+            trade._ib.update(sent)  # type: ignore[attr-defined]   # IB APPLIED the change
+        if mb == "confirm":
+            self._echo_open_order(trade)
+            status = trade.orderStatus
+            # wrapper.orderStatus: nothing changed in the status record + status 'Submitted' + the last
+            # log entry is 'Modify'  ->  'Modified'. A PreSubmitted stop is acknowledged by NO log entry.
+            if status.status == "Submitted" and trade.log and trade.log[-1].message == "Modify":
+                self._log(trade, "Submitted", "Modified")
 
     @staticmethod
     def _snapshot(contract: Contract, order: Order, modification: bool) -> Dict[str, Any]:
@@ -480,11 +593,19 @@ class FakeIB:
         order, status = trade.order, trade.orderStatus
         if behavior == "silent":
             return
+        if behavior == "lost":
+            trade._lost = True  # type: ignore[attr-defined]   # the order never reached IB at all
+            return
+        if isinstance(behavior, tuple) and behavior[0] == "lost_with_warning":
+            trade._lost = True  # type: ignore[attr-defined]
+            self.wrapper_error(trade, order.orderId, behavior[1], behavior[2], trade.contract)
+            return
         if behavior == "warn399":
-            # ib_async's wrapper sets status 'ValidationError' on a WARNING code while the order lives on
-            self.errorEvent.emit(order.orderId, 399, "Order Message: Warning: your order will not be "
-                                 "placed at the exchange until the next session open", trade.contract)
-            status.status = "ValidationError"
+            behavior = ("warn", 399, "Order Message: Warning: your order will not be placed at the "
+                                     "exchange until the next session open")
+        if isinstance(behavior, tuple) and behavior[0] == "warn":
+            # a warning arrives first; the order is acknowledged a moment later
+            self.wrapper_error(trade, order.orderId, behavior[1], behavior[2], trade.contract)
             (self.loop or asyncio.get_event_loop()).call_later(0.25, self._accept_late, trade)
             return
         if behavior == "slow":
@@ -492,14 +613,28 @@ class FakeIB:
             return
         if isinstance(behavior, tuple) and behavior[0] == "reject":
             _, code, text = behavior
-            self.errorEvent.emit(order.orderId, code, text, trade.contract)
+            self.wrapper_error(trade, order.orderId, code, text, trade.contract)
+            return
+        if isinstance(behavior, tuple) and behavior[0] == "reject_inactive":
+            _, code, text = behavior                  # TWS-side asynchronous rejection
             status.status = "Inactive"
             self._log(trade, "Inactive", text, code)
+            self.errorEvent.emit(order.orderId, code, text, trade.contract)
+            return
+        if isinstance(behavior, tuple) and behavior[0] == "partial_then_cancel":
+            qty = behavior[1]
+            trade._behavior = "accept"  # type: ignore[attr-defined]
+            self._resolve(trade)
+            self._fill(trade, qty, 100.0)
+            status.status = "Cancelled"
+            self._log(trade, "Cancelled", "Order Canceled - reason: price protection", 202)
+            self.errorEvent.emit(order.orderId, 202, "Order Canceled - reason:", None)
             return
         status.permId = self._next_perm
         self._next_perm += 1
         order.permId = status.permId
-        status.status = "PreSubmitted" if order.orderType in ("STP", "STP LMT") else "Submitted"
+        is_stop = order.orderType in ("STP", "STP LMT")
+        status.status = "PreSubmitted" if (is_stop and not self.regular_session) else "Submitted"
         self._log(trade, status.status)
         if behavior == "fill" or (isinstance(behavior, tuple) and behavior[0] == "fill"):
             price = behavior[1] if isinstance(behavior, tuple) else (order.lmtPrice if order.lmtPrice
@@ -538,6 +673,8 @@ class FakeIB:
     def cancelOrder(self, order: Order, manualCancelOrderTime: str = "") -> Optional[Trade]:
         self._note("cancelOrder")
         self.cancel_requests.append(order.orderId)
+        if self.lose_cancels:
+            return self._find(order.orderId)          # the request never reached IB
         trade = self._find(order.orderId)
         if trade is None:
             self.errorEvent.emit(order.orderId, 10147,
@@ -577,6 +714,14 @@ class FakeIB:
         def run() -> None:
             trade = self.trade_by_ref(ref)
             self._fill(trade, qty if qty is not None else trade.orderStatus.remaining, price)
+        self._on_loop(run)
+
+    def simulate_ib_quantity(self, ref: str, qty: float) -> None:
+        """IB reduced a working order's size (an OCA leg after the other leg part-filled)."""
+        def run() -> None:
+            trade = self.trade_by_ref(ref)
+            trade._ib["qty"] = qty
+            self._echo_open_order(trade)
         self._on_loop(run)
 
     def simulate_status(self, ref: str, status: str) -> None:
