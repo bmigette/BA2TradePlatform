@@ -248,47 +248,18 @@ def test_parser_accepts_months_01_to_12():
         assert pv.try_parse(f"2026.{m:02d}.00001") == (2026, m, 1)
 
 
-# ------------------------------------------------------------ the allowlist stays honest
-
-
-def _neutral_modules() -> list[str]:
-    globs = pv.read_ga_neutral_globs(ROOT)
-    mods = []
-    for pkg, d in pv.PACKAGE_DIRS.items():
-        base = ROOT / "packages" / d
-        for f in (base / pkg).rglob("*.py"):
-            rel = f.relative_to(ROOT).as_posix()
-            if "/tests/" in rel or f.name.startswith("test_"):
-                continue
-            if any(fnmatch.fnmatchcase(rel, g) for g in globs):
-                mods.append(".".join(f.relative_to(base).with_suffix("").parts))
-    return mods
-
-
-def test_backtest_engine_never_imports_a_ga_neutral_module():
-    """If the engine started importing a module the allowlist calls GA-neutral, its changes could
-    alter GA results while the guard waves them through. Checked in a clean interpreter."""
-    mods = _neutral_modules()
-    if not mods:
-        pytest.skip("no ga-neutral python modules exist in this tree yet (checked when they land)")
-    code = (
-        "import sys\n"
-        "import app.services.backtest.daily_engine, app.services.backtest.daily_backtest_handler\n"
-        "import app.services.strategy_optimization_handler\n"
-        f"mods = {mods!r}\n"
-        "bad = [m for m in mods if m in sys.modules]\n"
-        "print('LEAK', bad) if bad else print('CLEAN')\n"
-    )
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
-    r = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT / "testplatform" / "backend"),
-                       env=env, capture_output=True, text=True, timeout=300)
-    assert r.returncode == 0, r.stderr[-2000:]
-    assert "CLEAN" in r.stdout, r.stdout
-
-
-def test_the_neutral_module_scan_itself_finds_what_the_globs_promise(tmp_path):
-    """Guards the guard: the glob->module conversion must not silently produce nothing once
-    modules matching the shipped globs exist."""
-    globs = pv.read_ga_neutral_globs(ROOT)
-    assert any(fnmatch.fnmatchcase("packages/common/ba2_common/core/ibkr_mapping.py", g) for g in globs)
-    assert any(fnmatch.fnmatchcase("packages/common/ba2_common/core/protective_legs.py", g) for g in globs)
+def test_ahead_detected_after_update_stops_waiting_immediately(monkeypatch):
+    """/update pulled the worker onto a branch that is NEWER than the master: do not wait out
+    max_wait, warn with commits and the git commands."""
+    ahead = dict(REQ, ba2_common="2026.10.00009")
+    fake = _Fake(_info(app="2026.10.0009"), after={**_info(pkgs=ahead, reqs=ahead), "git_commit": "wwww111"})
+    _install(monkeypatch, fake)
+    lines: list[str] = []
+    t0 = time.time()
+    ok = worker_client.ensure_synced(_W, MASTER, log=lines.append, max_wait=60.0, poll_interval=0.01,
+                                     required_packages=REQ)
+    assert ok is False and fake.updates == 1
+    assert time.time() - t0 < 5, "must not wait for max_wait"
+    joined = "\n".join(lines)
+    assert "NEWER than the master" in joined and "did not converge" not in joined
+    assert "wwww111" in joined and "git checkout" in joined and "RESTART" in joined

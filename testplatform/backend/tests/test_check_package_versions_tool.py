@@ -321,3 +321,60 @@ def test_include_worktree_sees_uncommitted_changes(repo):
 def test_the_real_repository_tree_is_consistent():
     """Rule 0 on this very checkout (no git history needed)."""
     assert tool.check_consistency(REPO) == []
+
+
+def test_multi_commit_range_minimum_equals_the_version_at_the_last_ga_relevant_commit(repo):
+    # commit 1: GA-relevant change at V2 with the minimum raised to V2
+    _w(repo, "packages/common/ba2_common/core/engine.py", "x = 2\n")
+    _set_version(repo, "ba2_common", V2)
+    _set_required(repo, ba2_common=V2)
+    _commit(repo)
+    # commit 2: neutral change (allowlisted file) bumped again to V3, minimum untouched
+    _w(repo, "packages/common/ba2_common/core/ibkr_mapping.py", "y = 2\n")
+    _set_version(repo, "ba2_common", "2026.10.00003")
+    _commit(repo)
+    rc, out = _run(repo)
+    assert rc == 0, out
+
+
+def test_multi_commit_docstring_edit_of_the_same_file_does_not_move_the_target(repo):
+    _w(repo, "packages/common/ba2_common/core/engine.py", "x = 2\n")
+    _set_version(repo, "ba2_common", V2)
+    _set_required(repo, ba2_common=V2)
+    _commit(repo)
+    _w(repo, "packages/common/ba2_common/core/engine.py", '"""now documented."""\nx = 2  # c\n')
+    _set_version(repo, "ba2_common", "2026.10.00003")
+    _commit(repo)
+    rc, out = _run(repo)
+    assert rc == 0, out
+
+
+def test_multi_commit_a_later_ga_change_without_a_new_minimum_fails(repo):
+    _w(repo, "packages/common/ba2_common/core/engine.py", "x = 2\n")
+    _set_version(repo, "ba2_common", V2)
+    _set_required(repo, ba2_common=V2)
+    _commit(repo)
+    _w(repo, "packages/common/ba2_common/core/engine.py", "x = 3\n")
+    _set_version(repo, "ba2_common", "2026.10.00003")
+    _commit(repo)
+    rc, out = _run(repo)
+    assert rc == 1 and "[rule 2]" in out and "2026.10.00003" in out
+
+
+def test_equality_is_required_even_when_test_app_version_is_also_bumped(repo):
+    _w(repo, "packages/common/ba2_common/core/engine.py", "x = 2\n")
+    _set_version(repo, "ba2_common", "2026.10.00005")
+    _set_required(repo, ba2_common=V2)
+    _w(repo, "testplatform/version.py", 'TEST_APP_VERSION = "2026.10.0011"\n')
+    _commit(repo)
+    rc, out = _run(repo)
+    assert rc == 1 and "must EQUAL" in out
+
+
+def test_non_cp1252_file_content_does_not_crash_git_decoding(repo):
+    raw = bytes([0x78, 0x20, 0x3d, 0x20, 0x22, 0x81, 0x8d, 0x8f, 0x22, 0x0a])  # bytes undefined in cp1252
+    (repo / "packages/common/ba2_common/core/blob.py").write_bytes(raw)
+    _set_version(repo, "ba2_common", V2)
+    _commit(repo)
+    rc, out = _run(repo)          # must complete (verdict irrelevant), not raise UnicodeDecodeError
+    assert rc in (0, 1)

@@ -100,7 +100,9 @@ Failure messages name the rule, the offending files and the exact fix (which fil
 glob list to extend).
 
 **How to declare a path GA-neutral:** append a narrow `fnmatch` glob (`*` crosses `/`) to
-`GA_NEUTRAL_GLOBS` in the same commit and justify it in the commit message (the code must be
+`GA_NEUTRAL_GLOBS` in a REVIEWED change (rule 3: `--allow-neutral-change`; in CI the
+`ga-neutral-reviewed` PR label or a `GA-Neutral-Reviewed: <reason>` commit trailer in a pushed commit;
+the base's list judges the same diff) and justify it in the commit message (the code must be
 unreachable from the GA/backtest path). Never list a module the backtest engine imports.
 
 ### What to bump when
@@ -108,10 +110,10 @@ unreachable from the GA/backtest path). Never list a module the backtest engine 
 | Change | Bump |
 |---|---|
 | `ba2_trade_platform/` only | `APP_VERSION` |
-| `testplatform/` | `TEST_APP_VERSION` |
+| `testplatform/` | `TEST_APP_VERSION`. EXEMPT: edits to `required_package_versions.py` / `ga_neutral_package_paths.py` alone |
 | shipped `packages/<dir>/<pkg>/` code | that package's `PACKAGE_VERSION` (+ pyproject), always |
-| ... that can affect GA results | also raise its entry in `required_package_versions.py` |
-| ... that cannot | add the path to `ga_neutral_package_paths.py` |
+| ... that can affect GA results | also set its entry in `required_package_versions.py` EQUAL to the package version at the LAST GA-relevant change in the range; no TEST bump needed |
+| ... that cannot | add the path to `ga_neutral_package_paths.py` in a reviewed change (see rule 3) |
 
 ## Limits and open points
 
@@ -148,7 +150,7 @@ Final rule, as documented in CLAUDE.md "Versioning":
 4. Guard rule 2: a raised minimum must EQUAL the new `PACKAGE_VERSION`.
 5. An explicitly named base (`--base`, `$BA2_VERSION_CHECK_BASE`) that does not resolve exits 1; only
    automatic candidates are skipped softly.
-6. CI: job `package-version-guard` (fetch-depth 0, base = `origin/<PR base>` or the push's `before`
+6. CI: job `package-version-guard` (PRs: opened/synchronize/reopened/labeled/unlabeled; a force-pushed `before` that cannot be fetched falls back to `origin/<ref>`, then the automatic candidates) (fetch-depth 0, base = `origin/<PR base>` or the push's `before`
    sha) runs the guard; the two new test files also run in the `parity` job. Local `pytest` runs them too.
 7. Neutrality is judged with the BASE's allowlist. Editing `ga_neutral_package_paths.py` is rule 3 and
    needs `--allow-neutral-change` (CI: PR label `ga-neutral-reviewed`). If the base has no allowlist yet
@@ -170,3 +172,18 @@ Final rule, as documented in CLAUDE.md "Versioning":
 4. After workers report, check `GET /version` on one worker shows `package_versions` equal to the master's.
 5. From then on: package change -> bump that `PACKAGE_VERSION`; GA-relevant -> minimum EQUAL to it;
    neutral -> allowlist (reviewed). Never touch `TEST_APP_VERSION` for a package change mid-run.
+
+Additions (second review):
+
+6. Every master that shares the workers moves to the new commit together, between jobs: the main
+   clone, the remote150 isolated-worktree lanes, remote227 if shared. Pull and RESTART long-lived
+   `ba2-test serve` masters.
+7. Push before the next job and confirm `unsyncable_reason` is silent.
+8. Check EVERY worker's `GET /version`, including `required_package_versions`.
+9. Roll back by reverting FORWARD with a higher `TEST_APP_VERSION`, never `git reset`: a worker newer
+   than the master is excluded, not downgraded (the WARN names both commits and the git commands).
+10. Never push a minimum raise to dev while any master is mid-job.
+
+Guard note: the minimum must equal the package version at the LAST GA-relevant commit of the range
+(evaluated per commit; a later neutral/docstring bump does not invalidate it), and this equality is
+required even when `TEST_APP_VERSION` is also bumped.

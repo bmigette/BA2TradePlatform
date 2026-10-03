@@ -14,6 +14,8 @@ on:
     branches: [dev, main]
   pull_request:
     branches: [dev, main]
+    # labeled/unlabeled: the package-version-guard honours the `ga-neutral-reviewed` label.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 jobs:
   parity:
@@ -89,7 +91,7 @@ jobs:
       - name: Package-version policy tests (blocking)
         working-directory: testplatform/backend
         # Needs a git-capable checkout only for tmp repos it creates itself, not for history.
-        run: python -m pytest tests/test_package_versions.py tests/test_check_package_versions_tool.py -q -p no:cacheprovider
+        run: python -m pytest tests/test_package_versions.py tests/test_package_versions_review_fixes.py tests/test_check_package_versions_tool.py -q -p no:cacheprovider
 
       - name: Surface the failure tracebacks as annotations
         # Runs ONLY on failure. See .github/scripts/annotate_junit_failures.py for why this is
@@ -146,15 +148,34 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
           BEFORE_SHA: ${{ github.event.before }}
-          NEUTRAL_REVIEWED: ${{ contains(github.event.pull_request.labels.*.name, 'ga-neutral-reviewed') }}
+          REF_NAME: ${{ github.ref_name }}
+          NEUTRAL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ga-neutral-reviewed') }}
         run: |
           args=""
+          range=""
           if [ -n "$BASE_REF" ]; then
             args="--base origin/$BASE_REF"
+            range="origin/$BASE_REF..HEAD"
           elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
-            args="--base $BEFORE_SHA"
+            # A force-push can leave `before` unreachable: try to fetch it, else fall back to the
+            # remote branch / the tool's automatic candidates instead of failing on history.
+            if git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null || git fetch --quiet origin "$BEFORE_SHA" 2>/dev/null; then
+              args="--base $BEFORE_SHA"
+              range="$BEFORE_SHA..HEAD"
+            elif git rev-parse --verify --quiet "origin/$REF_NAME^{commit}" >/dev/null; then
+              echo "::warning::before sha $BEFORE_SHA unavailable (force-push?); using origin/$REF_NAME"
+              args="--base origin/$REF_NAME"
+              range="origin/$REF_NAME..HEAD"
+            else
+              echo "::warning::before sha $BEFORE_SHA unavailable (force-push?); using automatic base candidates"
+            fi
           fi
-          if [ "$NEUTRAL_REVIEWED" = "true" ]; then
+          # Reviewed GA-neutral allowlist edits: the PR label, or (pushes) a commit-message trailer
+          # `GA-Neutral-Reviewed: <reason>` in the pushed range.
+          if [ "$NEUTRAL_LABEL" = "true" ]; then
+            args="$args --allow-neutral-change"
+          elif [ -n "$range" ] && git log --format=%B "$range" 2>/dev/null | grep -qiE '^GA-Neutral-Reviewed: +[^ ]'; then
+            echo "GA-Neutral-Reviewed trailer found in $range"
             args="$args --allow-neutral-change"
           fi
           python tools/check_package_versions.py $args

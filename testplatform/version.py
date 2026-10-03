@@ -8,7 +8,9 @@
 # `testplatform/required_package_versions.py`. Changes under `packages/` therefore no longer bump
 # this file by default: they bump the package's own `PACKAGE_VERSION`, and raise the required
 # minimum (workers then re-sync) only if the change can affect GA results; otherwise the path goes
-# in `testplatform/ga_neutral_package_paths.py`. See CLAUDE.md "Versioning" and
+# in `testplatform/ga_neutral_package_paths.py`. Edits to `required_package_versions.py` and
+# `ga_neutral_package_paths.py` ALONE are exempt from this bump (a raised minimum itself syncs older
+# workers). See CLAUDE.md "Versioning" and
 # docs/plans/2026-10-03-package-versioning-design.md.
 #
 # Changes confined to `ba2_trade_platform/` bump `ba2_trade_platform/version.py` instead. The two

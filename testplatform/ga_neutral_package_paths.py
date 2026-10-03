@@ -5,8 +5,10 @@
 # the package (or bumps TEST_APP_VERSION) OR touches only paths matched here. Listing a path is
 # therefore the reviewed, in-diff statement "workers need not take this change".
 #
-# HOW TO ADD: append a glob (fnmatch syntax, `/` separators, `*` also crosses `/`) in the SAME
-# commit as the change, and say in the commit message why the code is unreachable from the GA /
+# HOW TO ADD: append a glob (fnmatch syntax, `/` separators, `*` also crosses `/`) in a REVIEWED
+# change. The guard judges the same diff with the BASE's list, so the edit itself needs
+# `--allow-neutral-change` by hand; in CI the `ga-neutral-reviewed` PR label, or a
+# `GA-Neutral-Reviewed: <reason>` trailer in a pushed commit message. In the commit message say in the commit message why the code is unreachable from the GA /
 # backtest path (e.g. broker-only module never imported by the backtest engine). Prefer a narrow
 # glob for one module over a wide one; never list a module the backtest engine imports.
 #

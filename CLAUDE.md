@@ -294,3 +294,17 @@ Run it before pushing: `python tools/check_package_versions.py [--base origin/de
 Full rationale: `docs/plans/2026-10-03-package-versioning-design.md`. Commit AND push the bumps --
 `unsyncable_reason` WARNS (it does not block the run) when a version file is uncommitted or the
 branch is unpushed; a worker's `git pull` could not reach it.
+
+Boundary checklist (shipping a package-versioning or minimum-raising change):
+
+1. Every master that shares the workers moves to the new commit TOGETHER, between jobs: the main
+   clone, the remote150 isolated-worktree lanes, remote227 if shared. Pull and RESTART long-lived
+   `ba2-test serve` masters (a pulled but un-restarted master still advertises the old payload).
+2. Push before the next job and confirm `unsyncable_reason` is silent (it warns on uncommitted
+   version files or an unpushed branch).
+3. Check EVERY worker's `GET /version`: `package_versions` and `required_package_versions` present
+   and what you expect (an old worker without them is synced once, loudly).
+4. Roll back by reverting FORWARD (a revert commit with a higher TEST_APP_VERSION), never by
+   `git reset`: a worker newer than the master is EXCLUDED, not downgraded.
+5. Never push a minimum raise to dev while any master is mid-job: workers below it re-sync.
+

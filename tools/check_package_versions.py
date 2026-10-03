@@ -58,7 +58,8 @@ TEST_VERSION_FILE = "testplatform/version.py"
 def _git(root: Path, *args: str) -> Optional[str]:
     try:
         r = subprocess.run(["git", "-c", "core.quotepath=off", *args], cwd=str(root),
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout if r.returncode == 0 else None
@@ -148,6 +149,40 @@ def semantically_same(base_text: Optional[str], head_text: Optional[str]) -> boo
     except (SyntaxError, ValueError):
         return False
     return a == b
+
+
+def _target_version(root: Path, base_sha: str, include_worktree: bool, candidates: List[str],
+                    vfile: str) -> Optional[str]:
+    """PACKAGE_VERSION as of the LAST GA-relevant change to *candidates* in base..HEAD(+worktree).
+
+    A multi-commit range may raise the minimum for an early GA change and then bump the package
+    again for a later neutral/docstring change; the minimum must equal the version that SHIPPED the last semantically
+    real change to these files (the bump may be in a later commit), not the range's final version.
+    """
+    if include_worktree:
+        for rel in candidates:
+            head = _read(root, None, rel)
+            if not (rel.endswith(".py") and semantically_same(_read(root, "HEAD", rel), head)):
+                if head != _read(root, "HEAD", rel):
+                    return _lit(root, None, vfile, "PACKAGE_VERSION")
+    log = _git(root, "log", "--format=%H", "--no-renames", f"{base_sha}..HEAD", "--", *candidates)
+    for commit in (log or "").split():
+        names = _git(root, "diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames",
+                     "-z", "--root", commit) or ""
+        touched = [n for n in names.split("\0") if n in candidates]
+        for rel in touched:
+            parent_text = _read(root, f"{commit}~1", rel)
+            if not (rel.endswith(".py") and semantically_same(parent_text, _read(root, commit, rel))):
+                # The bump that SHIPS this change may land in this commit or a later one: take
+                # the first version at/after it that differs from the pre-change version.
+                before = _lit(root, f"{commit}~1", vfile, "PACKAGE_VERSION")
+                later = _git(root, "rev-list", "--reverse", "--ancestry-path", f"{commit}..HEAD") or ""
+                for c in [commit, *later.split()]:
+                    v = _lit(root, c, vfile, "PACKAGE_VERSION")
+                    if v != before:
+                        return v
+                break
+    return _lit(root, None if include_worktree else "HEAD", vfile, "PACKAGE_VERSION")
 
 
 def check_consistency(root: Path) -> List[str]:
@@ -253,10 +288,12 @@ def check_diff(root: Path, base_sha: str, include_worktree: bool,
             b = pv.try_parse(base_req.get(pkg))
             h = pv.try_parse(head_req.get(pkg))
             raised = h is not None and (b is None or h > b)
-            if raised and not test_bumped and hv is not None and h != hv:
+            target = _target_version(root, base_sha, include_worktree, non_neutral, vfile)
+            tv = pv.try_parse(target)
+            if raised and tv is not None and h != tv:
                 problems.append(
-                    f"[rule 2] {pkg}: the minimum was raised to {head_req.get(pkg)} but the package is "
-                    f"now at {_lit(root, head_ref, vfile, 'PACKAGE_VERSION')}.\n"
+                    f"[rule 2] {pkg}: the minimum was raised to {head_req.get(pkg)} but the last "
+                    f"GA-relevant change to this package shipped at {target}.\n"
                     f"    FIX: the new minimum must EQUAL the new PACKAGE_VERSION (a lower one leaves "
                     f"this change optional for workers).")
             if not (raised or test_bumped):
@@ -269,7 +306,9 @@ def check_diff(root: Path, base_sha: str, include_worktree: bool,
                     f"{REQUIRED_FILE} to the new PACKAGE_VERSION (workers will then re-sync);\n"
                     f"    (b) it CANNOT (e.g. broker-only code the backtest engine never imports): "
                     f"add a narrow glob for these paths to GA_NEUTRAL_GLOBS in {NEUTRAL_FILE} and "
-                    f"say why in the commit message.")
+                    f"say why in the commit message. That edit is itself reviewed (rule 3): "
+                    f"--allow-neutral-change by hand; in CI the `ga-neutral-reviewed` PR label, or "
+                    f"a `GA-Neutral-Reviewed: <reason>` trailer in a pushed commit message.")
     return problems
 
 

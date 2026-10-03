@@ -577,6 +577,29 @@ def package_drift(worker: dict, info: dict, master_packages: Optional[Mapping[st
                f"(running different package code than the master by design): {detail}")
 
 
+def _warn_ahead(worker: dict, info: dict, reason: str, required_packages: Mapping[str, str],
+                log: Callable[[str], None], drift_seen: Optional[set]) -> None:
+    """Loud, actionable WARN for a worker NEWER than the master (once per job via *drift_seen*)."""
+    pk = reason.split(":", 1)[1]
+    key = ("ahead", worker["name"], pk, repr(info.get("required_package_versions")))
+    if drift_seen is not None:
+        if key in drift_seen:
+            return
+        drift_seen.add(key)
+    try:
+        master_commit = self_update._git_commit(self_update.resolve_repo_root()) or "unknown"
+    except Exception:  # noqa: BLE001 -- diagnostics only
+        master_commit = "unknown"
+    worker_commit = info.get("git_commit") or "unknown"
+    _warn(log, f"worker {worker['name']} is NEWER than the master for package(s) {pk} (its declared "
+               f"minimum {info.get('required_package_versions')} is above the master's "
+               f"{dict(required_packages)}); excluding it WITHOUT /update -- an update cannot "
+               f"downgrade. master commit {master_commit}, worker commit {worker_commit}. FIX, one of: "
+               f"(a) move the master forward: `git pull` (or `git checkout {worker_commit}`) in the "
+               f"master's checkout and RESTART it; (b) move the worker back: on the worker run "
+               f"`git fetch && git checkout {master_commit}` then restart `ba2-test worker`.")
+
+
 def ensure_synced(worker: dict, master_version: Optional[str],
                   log: Callable[[str], None] = logger.info, max_wait: float = 300.0,
                   poll_interval: float = 3.0,
@@ -625,15 +648,7 @@ def ensure_synced(worker: dict, master_version: Optional[str],
     reasons = sync_reasons(info, master_version, required_packages)
     ahead = [r for r in reasons if r.startswith("worker-ahead:")]
     if ahead:
-        pk = ahead[0].split(":", 1)[1]
-        key = ("ahead", worker["name"], pk, repr(info.get("required_package_versions")))
-        if drift_seen is None or key not in drift_seen:
-            if drift_seen is not None:
-                drift_seen.add(key)
-            _warn(log, f"worker {worker['name']} is NEWER than the master for package(s) {pk} "
-                       f"(its declared minimum {info.get('required_package_versions')} is above the "
-                       f"master's {dict(required_packages)}); excluding it WITHOUT /update -- an "
-                       f"update cannot downgrade. Move the master forward (or the worker back) first")
+        _warn_ahead(worker, info, ahead[0], required_packages, log, drift_seen)
         return False
     if not reasons:
         package_drift(worker, info, master_packages, log, drift_seen)
@@ -663,7 +678,12 @@ def ensure_synced(worker: dict, master_version: Optional[str],
         except Exception:  # noqa: BLE001 — still restarting
             continue
         pre_split = _is_pre_split(info)
-        if not sync_reasons(info, master_version, required_packages):
+        post = sync_reasons(info, master_version, required_packages)
+        ahead_post = [r for r in post if r.startswith("worker-ahead:")]
+        if ahead_post:  # an update cannot fix this: stop waiting now instead of after max_wait
+            _warn_ahead(worker, info, ahead_post[0], required_packages, log, drift_seen)
+            return False
+        if not post:
             log(f"worker {worker['name']} updated to {master_version}")
             package_drift(worker, info, master_packages, log, drift_seen)
             return True
