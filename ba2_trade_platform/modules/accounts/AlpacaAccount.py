@@ -1099,7 +1099,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         )
         
     @alpaca_api_retry
-    def _fetch_raw_alpaca_orders(self, status: Optional[OrderStatus] = OrderStatus.ALL, fetch_all: bool = False) -> list:
+    def _fetch_raw_alpaca_orders(self, status: Optional[OrderStatus] = OrderStatus.ALL, fetch_all: bool = False,
+                                 full_history: bool = False) -> list:
         """
         Fetch raw Alpaca order objects from the API.
 
@@ -1110,14 +1111,22 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             status: Filter by order status. Defaults to ALL.
             fetch_all: If True, fetches ALL orders using date-based pagination.
                        If False, returns first 500 orders.
+            full_history: Opt-in (only with fetch_all) for callers that need the COMPLETE history
+                       (``get_filled_trades``). Alpaca's ``limit`` counts nested legs, so the
+                       legacy stop check ends paging early and the history is truncated; this
+                       mode counts legs, overlaps pages by 1s, keeps the copy of an order with
+                       the most legs, and RAISES on a failed page instead of returning [].
+                       Default False keeps the legacy (cheap, bounded) behaviour used by the
+                       refresh/TP-SL flows.
 
         Returns:
-            list: Raw Alpaca order objects. Empty list if authentication fails or error occurs.
+            list: Raw Alpaca order objects. Empty list if authentication fails or (legacy mode) error occurs.
         """
         if not self._check_authentication():
             return []
 
         try:
+            page = 0
             limit = 500  # Always use 500 as limit per Alpaca's maximum
             all_orders_dict = {}  # Use dict to deduplicate by broker_order_id
 
@@ -1153,6 +1162,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                             if order.id not in all_orders_dict:
                                 all_orders_dict[order.id] = order
                                 new_order_count += 1
+                            elif full_history and len(getattr(order, 'legs', None) or []) > len(
+                                    getattr(all_orders_dict[order.id], 'legs', None) or []):
+                                # Overlapping pages: keep the copy that carries more legs.
+                                all_orders_dict[order.id] = order
 
                             # Track the oldest order date in this batch
                             if order.created_at:
@@ -1164,8 +1177,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         f"{new_order_count} new unique orders (total unique: {len(all_orders_dict)})"
                     )
 
+                    if full_history:
+                        # Alpaca's ``limit`` counts nested legs too, so compare the TOTAL
+                        # (orders + legs) against the limit.
+                        def _row_count(orders):
+                            return sum(1 + _row_count(getattr(o, 'legs', None) or []) for o in orders)
+                        page_is_last = _row_count(alpaca_orders) < limit
+                    else:
+                        page_is_last = len(alpaca_orders) < limit
+
                     # If we got fewer than limit, we've reached the end
-                    if len(alpaca_orders) < limit:
+                    if page_is_last:
                         logger.debug(f"Received fewer than {limit} orders, pagination complete")
                         break
 
@@ -1174,13 +1196,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         logger.debug(f"No new unique orders in this batch, pagination complete")
                         break
 
-                    # Set until_date to oldest order's date - 1 day for next iteration
-                    # The 'until' parameter means "fetch orders created BEFORE this date"
-                    # So we go backwards in time to get older orders
+                    # Set until_date for the next iteration ('until' = created BEFORE this
+                    # date, so we walk backwards in time).
                     if oldest_order_date:
-                        # Subtract 1 day to fetch older orders in next iteration
-                        until_date = oldest_order_date - timedelta(days=1)
-                        logger.debug(f"Next pagination until date (going backwards): {until_date}")
+                        if full_history:
+                            # +1s overlap (deduped by id) so a parent/leg pair split at a page
+                            # boundary survives even if Alpaca's 'until' is exclusive.
+                            until_date = oldest_order_date + timedelta(seconds=1)
+                        else:
+                            until_date = oldest_order_date - timedelta(days=1)
                     else:
                         # No date found, can't continue pagination
                         logger.warning("No created_at date found in orders, stopping pagination")
@@ -1210,7 +1234,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return alpaca_orders
 
         except Exception as e:
-            logger.error(f"Error fetching Alpaca orders: {e}", exc_info=True)
+            logger.error(
+                f"Error fetching Alpaca orders (page {page + 1 if fetch_all else 1}, "
+                f"full_history={full_history}): {e}", exc_info=True)
+            if full_history:
+                # Never hand back a silently truncated history; let the retry decorator /
+                # caller see the failure.
+                raise
             return []
 
     def get_orders(self, status: Optional[OrderStatus] = OrderStatus.ALL, fetch_all: bool = False):
@@ -6109,9 +6139,27 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return []
 
         try:
-            raw_orders = self._fetch_raw_alpaca_orders(status=OrderStatus.CLOSED, fetch_all=True)
+            raw_orders = self._fetch_raw_alpaca_orders(
+                status=OrderStatus.CLOSED, fetch_all=True, full_history=True)
             trades = []
-            for order in raw_orders:
+            seen_ids = set()
+
+            def _walk(orders):
+                # Orders are fetched with nested=True, so a bracket/OCO exit leg
+                # (stop-loss / take-profit) is returned only inside its parent's
+                # ``legs``. Walk them recursively so filled legs are not lost.
+                for o in orders or []:
+                    yield o
+                    yield from _walk(getattr(o, 'legs', None))
+
+            for order in _walk(raw_orders):
+                order_id = getattr(order, 'id', None)
+                if order_id is not None:
+                    key = str(order_id)
+                    if key in seen_ids:
+                        continue
+                    seen_ids.add(key)
+
                 filled_qty = float(getattr(order, 'filled_qty', 0) or 0)
                 if filled_qty <= 0:
                     continue
@@ -6149,8 +6197,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return trades
 
         except Exception as e:
+            # Raise (not []) so the caller can tell a failed fetch from "no trades"
+            # (the Overview keeps its old rows on a failed fetch).
             logger.error(f"[Account {self.id}] Error fetching filled trades: {e}", exc_info=True)
-            return []
+            raise
 
     # ======================================================================
     # OptionsAccountInterface — market data (chain / quote / ATM-IV)

@@ -271,7 +271,7 @@ class PerformanceTab:
         return card
 
     def _plot(self, fig):
-        ui.plotly(fig).classes('w-full')
+        ui.plotly({**fig.to_plotly_json(), 'config': pv.plot_config(self._layout)}).classes('w-full')
 
     def _render_summary_metrics(self, expert_metrics: Dict[str, Any]):
         """Render top-level summary metric cards."""
