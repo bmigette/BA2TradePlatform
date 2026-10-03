@@ -5573,12 +5573,17 @@ class AccountGrowthTab:
                 p_events, p_info = forecast_dividends_ex(p_hist, qty, today, months=2, specials=True,
                                                          include_declared=True)
 
-            ratio = ratio_by_aid.get(aid)
-            # hints for the broker cross-check: the symbol's GROSS per-payment payout and cadence
-            step_hint = p_info['cadence'] or a_info['cadence']
-            if p_info['per_share']:
+            # Tax: this SYMBOL's own observed net/gross where its rows carry both (an ETN pays with
+            # no withholding), else the account's ratio.
+            ratio = net_ratio(rows) or ratio_by_aid.get(aid)
+            # hints for the broker cross-check: the symbol's GROSS per-payment payout and cadence,
+            # ONLY from a history whose status is 'ok' (a stale 0.10 hint would make the broker's
+            # 1.00 read as an annual rate)
+            p_ok, a_ok = p_info['status'] == 'ok', a_info['status'] == 'ok'
+            step_hint = (p_info['cadence'] if p_ok else None) or (a_info['cadence'] if a_ok else None)
+            if p_ok and p_info['per_share']:
                 ps_hint = p_info['per_share']
-            elif a_info['per_share']:
+            elif a_ok and a_info['per_share']:
                 ps_hint = a_info['per_share'] / ratio if ratio else a_info['per_share']
             else:
                 ps_hint = None
@@ -5596,26 +5601,66 @@ class AccountGrowthTab:
                 continue
             factor = (ratio or 1.0) if scale else 1.0
             basis = 'net' if (not scale or ratio) else 'gross'
+            # gross = what the payer declares; net = after the observed withholding. Account-history
+            # amounts are already net (gross is net / ratio where known).
             out_events = [dict(ev, per_share=round(ev['per_share'] * factor, 6),
-                               amount=round(ev['amount'] * factor, 2)) for ev in evs]
+                               amount=round(ev['amount'] * factor, 2),
+                               gross_amount=round(ev['amount'] if scale else
+                                                  (ev['amount'] / ratio if ratio else ev['amount']), 2))
+                          for ev in evs]
             for ev in out_events:
                 events.append((sym, source, ev))
             detail.append({'symbol': sym, 'account': aid, 'qty': qty, 'source': source,
                            'cadence': info['cadence'], 'per_share': (info['per_share'] or 0) * factor,
                            'basis': basis, 'date_kind': date_kind if source == 'history' else None,
-                           'events': [(e['date'].isoformat(), e['amount']) for e in out_events]})
+                           'events': [(e['date'].isoformat(), e['amount']) for e in out_events],
+                           'gross_events': [(e['date'].isoformat(), e['gross_amount']) for e in out_events]})
         self._forecast_detail = detail
 
         labels_by_symbol = get_labels_by_symbol(sorted({sym for sym, _s, _e in events})) if events else {}
         out = {}
+        per_label = {}                     # label -> {month: [gross, net]}
         for sym, source, ev in events:
             month = ev['date'].strftime('%Y-%m')
-            slot = out.setdefault(month, {'total': 0.0, 'labels': {}, 'sources': {}})
+            slot = out.setdefault(month, {'total': 0.0, 'gross_total': 0.0, 'labels': {}, 'sources': {}})
             slot['total'] += ev['amount']
+            slot['gross_total'] += ev['gross_amount']
             slot['sources'][source] = slot['sources'].get(source, 0.0) + ev['amount']
             for lb in (labels_by_symbol.get(normalize_symbol(sym)) or ['Unlabeled']):
                 slot['labels'][lb] = slot['labels'].get(lb, 0.0) + ev['amount']
+                gm = per_label.setdefault(lb, {}).setdefault(month, [0.0, 0.0])
+                gm[0] += ev['gross_amount']
+                gm[1] += ev['amount']
+        self._set_forecast_summaries(out, per_label, labels_by_symbol, held)
         return out
+
+    def _set_forecast_summaries(self, out, per_label, labels_by_symbol, held):
+        """Monthly net / gross totals and, per label, gross / net per month and the gross yield
+        on the label's market value. "Per month" = the mean of the first two forecast months (the
+        third is a few days only). Values come from the page's positions (market value, else
+        qty x price)."""
+        months = sorted(out)[:2]
+        n = max(1, len(months))
+        self._forecast_totals = {'net': sum(out[m]['total'] for m in months) / n,
+                                 'gross': sum(out[m]['gross_total'] for m in months) / n} if months else None
+        value_by_symbol = {}
+        for p_ in ((getattr(self, '_broker_cache', None) or {}).get('positions') or []):
+            v = getattr(p_, 'market_value', None)
+            if v is None:
+                v = float(getattr(p_, 'qty', 0) or 0) * float(getattr(p_, 'current_price', 0) or 0)
+            value_by_symbol[p_.symbol] = value_by_symbol.get(p_.symbol, 0.0) + float(v)
+        label_value = {}
+        for (aid, sym) in held:
+            for lb in (labels_by_symbol.get(normalize_symbol(sym)) or ['Unlabeled']):
+                label_value.setdefault(lb, {})[sym] = value_by_symbol.get(sym, 0.0)
+        detail = {}
+        for lb, by_month in per_label.items():
+            gross = sum(by_month.get(m, [0.0, 0.0])[0] for m in months) / n
+            net = sum(by_month.get(m, [0.0, 0.0])[1] for m in months) / n
+            value = sum(label_value.get(lb, {}).values())
+            detail[lb] = {'gross': gross, 'net': net, 'value': value,
+                          'yield_pct': (100.0 * gross / value) if value > 0 else None}
+        self._forecast_label_detail = detail
 
     def _provider_dividend_histories(self, symbols):
         """``{symbol: (history, date_kind)}`` from the FMP provider, for symbols that have one.
@@ -5691,9 +5736,13 @@ class AccountGrowthTab:
         for d in used:
             counts[d['source']] = counts.get(d['source'], 0) + 1
         gross = sum(1 for d in used if d.get('basis') == 'gross')
+        totals = getattr(self, '_forecast_totals', None)
+        per_month = (f" - per month ~${totals['net']:,.2f} net / ${totals['gross']:,.2f} gross"
+                     if totals else '')
         text = ('Forecast (estimated) - sources: '
                 + ', '.join(f'{k} {v}' for k, v in sorted(counts.items()))
-                + (f' - {gross} symbols shown GROSS (no observed tax ratio)' if gross else ' - net of tax'))
+                + per_month
+                + (f' - {gross} symbols shown GROSS (no observed tax ratio)' if gross else ''))
         lines = []
         for d in sorted(used, key=lambda x: x['symbol']):
             cad = d.get('cadence')
@@ -5704,6 +5753,13 @@ class AccountGrowthTab:
         skipped = [d for d in detail if not d.get('source')]
         if skipped:
             lines.append('no forecast: ' + ', '.join(sorted({d['symbol'] for d in skipped})))
+        label_lines = []
+        for lb, d in sorted((getattr(self, '_forecast_label_detail', None) or {}).items(),
+                            key=lambda kv: -kv[1]['gross']):
+            yld = f", {d['yield_pct']:.1f}% of value" if d.get('yield_pct') is not None else ''
+            label_lines.append(f"{lb}: {d['gross']:.1f} gross / {d['net']:.1f} net per month{yld}")
+        if label_lines:
+            lines = ['Per label (mean of the next 2 months):'] + label_lines + [''] + lines
         return text, '\n'.join(lines)
 
     def _compute_scope_inputs(self, target_accounts, filled_trades, dividends, positions_by_account):

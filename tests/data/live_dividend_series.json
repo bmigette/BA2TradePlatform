@@ -1,0 +1,2514 @@
+{
+"CAS": [
+{
+"date": "2026-09-25",
+"dividend": 1,
+"paymentDate": "2026-09-30"
+},
+{
+"date": "2026-08-26",
+"dividend": 0.5,
+"paymentDate": "2026-08-31"
+},
+{
+"date": "2026-07-28",
+"dividend": 0.5,
+"paymentDate": "2026-07-31"
+},
+{
+"date": "2026-06-25",
+"dividend": 0.1,
+"paymentDate": "2026-06-30"
+},
+{
+"date": "2026-05-26",
+"dividend": 0.1,
+"paymentDate": "2026-05-29"
+},
+{
+"date": "2026-04-27",
+"dividend": 0.1,
+"paymentDate": "2026-04-30"
+},
+{
+"date": "2026-03-26",
+"dividend": 0.1,
+"paymentDate": "2026-03-31"
+},
+{
+"date": "2026-02-24",
+"dividend": 0.15,
+"paymentDate": "2026-02-27"
+},
+{
+"date": "2026-01-27",
+"dividend": 0.2,
+"paymentDate": "2026-01-30"
+},
+{
+"date": "2025-12-23",
+"dividend": 10.49881,
+"paymentDate": "2025-12-31"
+},
+{
+"date": "2025-11-21",
+"dividend": 1,
+"paymentDate": "2025-11-28"
+},
+{
+"date": "2025-09-25",
+"dividend": 0.5,
+"paymentDate": "2025-09-30"
+},
+{
+"date": "2025-06-25",
+"dividend": 0.24,
+"paymentDate": "2025-06-30"
+}
+],
+"SLVO": [
+{
+"date": "2026-09-22",
+"dividend": 1.899,
+"paymentDate": "2026-09-25"
+},
+{
+"date": "2026-08-20",
+"dividend": 1.3177,
+"paymentDate": "2026-08-25"
+},
+{
+"date": "2026-07-22",
+"dividend": 2.004,
+"paymentDate": "2026-07-27"
+},
+{
+"date": "2026-06-22",
+"dividend": 7.0402,
+"paymentDate": "2026-06-25"
+},
+{
+"date": "2026-05-20",
+"dividend": 4.7253,
+"paymentDate": "2026-05-26"
+},
+{
+"date": "2026-04-22",
+"dividend": 4.8518,
+"paymentDate": "2026-04-27"
+},
+{
+"date": "2026-03-20",
+"dividend": 3.9736,
+"paymentDate": "2026-03-25"
+},
+{
+"date": "2026-02-20",
+"dividend": 7.9098,
+"paymentDate": "2026-02-25"
+},
+{
+"date": "2026-01-21",
+"dividend": 5.7888,
+"paymentDate": "2026-01-26"
+},
+{
+"date": "2025-12-22",
+"dividend": 2.6874,
+"paymentDate": "2025-12-29"
+},
+{
+"date": "2025-11-20",
+"dividend": 2.9152,
+"paymentDate": "2025-11-25"
+},
+{
+"date": "2025-10-22",
+"dividend": 1.175,
+"paymentDate": "2025-10-27"
+},
+{
+"date": "2025-09-22",
+"dividend": 1.2519,
+"paymentDate": "2025-09-25"
+},
+{
+"date": "2025-08-20",
+"dividend": 1.5757,
+"paymentDate": "2025-08-26"
+},
+{
+"date": "2025-07-22",
+"dividend": 1.0595,
+"paymentDate": "2025-07-25"
+},
+{
+"date": "2025-06-20",
+"dividend": 1.3311,
+"paymentDate": "2025-06-25"
+},
+{
+"date": "2025-05-21",
+"dividend": 2.1553,
+"paymentDate": "2025-05-27"
+},
+{
+"date": "2025-04-22",
+"dividend": 2.0836,
+"paymentDate": "2025-04-25"
+},
+{
+"date": "2025-03-20",
+"dividend": 1.2939,
+"paymentDate": "2025-03-25"
+},
+{
+"date": "2025-02-21",
+"dividend": 1.0603,
+"paymentDate": "2025-02-26"
+},
+{
+"date": "2025-01-22",
+"dividend": 0.7359,
+"paymentDate": "2025-01-27"
+},
+{
+"date": "2024-12-20",
+"dividend": 0.939,
+"paymentDate": "2024-12-27"
+},
+{
+"date": "2024-11-20",
+"dividend": 1.2434,
+"paymentDate": "2024-11-25"
+},
+{
+"date": "2024-10-22",
+"dividend": 2.1477,
+"paymentDate": "2024-10-25"
+},
+{
+"date": "2024-09-20",
+"dividend": 1.7448,
+"paymentDate": "2024-09-25"
+},
+{
+"date": "2024-08-21",
+"dividend": 1.5541,
+"paymentDate": "2024-08-27"
+},
+{
+"date": "2024-07-22",
+"dividend": 1.3612,
+"paymentDate": "2024-07-25"
+},
+{
+"date": "2024-06-21",
+"dividend": 1.5706,
+"paymentDate": "2024-06-26"
+},
+{
+"date": "2024-05-21",
+"dividend": 2.1246,
+"paymentDate": "2024-05-28"
+},
+{
+"date": "2024-04-19",
+"dividend": 0.7516,
+"paymentDate": "2024-04-25"
+},
+{
+"date": "2024-03-19",
+"dividend": 0.4791,
+"paymentDate": "2024-03-25"
+},
+{
+"date": "2024-02-20",
+"dividend": 0.4387,
+"paymentDate": "2024-02-26"
+},
+{
+"date": "2024-01-19",
+"dividend": 0.5195,
+"paymentDate": "2024-01-25"
+},
+{
+"date": "2023-12-19",
+"dividend": 0.3258,
+"paymentDate": "2023-12-27"
+},
+{
+"date": "2023-11-20",
+"dividend": 0.6813,
+"paymentDate": "2023-11-27"
+},
+{
+"date": "2023-10-19",
+"dividend": 0.2991,
+"paymentDate": "2023-10-25"
+},
+{
+"date": "2023-09-19",
+"dividend": 0.3001,
+"paymentDate": "2023-09-25"
+},
+{
+"date": "2023-08-21",
+"dividend": 1.6329,
+"paymentDate": "2023-08-25"
+},
+{
+"date": "2023-07-19",
+"dividend": 1.3573,
+"paymentDate": "2023-07-25"
+},
+{
+"date": "2023-06-20",
+"dividend": 0.7843,
+"paymentDate": "2023-06-26"
+},
+{
+"date": "2023-05-19",
+"dividend": 1.6155,
+"paymentDate": "2023-05-25"
+},
+{
+"date": "2023-04-19",
+"dividend": 0.9424,
+"paymentDate": "2023-04-25"
+},
+{
+"date": "2023-03-21",
+"dividend": 0.792,
+"paymentDate": "2023-03-27"
+},
+{
+"date": "2023-02-21",
+"dividend": 1.2187,
+"paymentDate": "2023-02-27"
+},
+{
+"date": "2023-01-19",
+"dividend": 2.244,
+"paymentDate": "2023-01-25"
+},
+{
+"date": "2022-12-20",
+"dividend": 2.33,
+"paymentDate": "2022-12-28"
+},
+{
+"date": "2022-11-18",
+"dividend": 0.794,
+"paymentDate": "2022-11-25"
+},
+{
+"date": "2022-10-19",
+"dividend": 1.736,
+"paymentDate": "2022-10-25"
+},
+{
+"date": "2022-09-20",
+"dividend": 0.0344,
+"paymentDate": "2022-09-26"
+},
+{
+"date": "2022-08-19",
+"dividend": 0.028,
+"paymentDate": "2022-08-25"
+},
+{
+"date": "2022-07-19",
+"dividend": 0.033,
+"paymentDate": "2022-07-25"
+},
+{
+"date": "2022-06-21",
+"dividend": 0.047,
+"paymentDate": "2022-06-27"
+},
+{
+"date": "2022-05-19",
+"dividend": 0.063,
+"paymentDate": "2022-05-25"
+},
+{
+"date": "2022-04-19",
+"dividend": 0.135,
+"paymentDate": "2022-04-25"
+},
+{
+"date": "2022-03-21",
+"dividend": 0.062,
+"paymentDate": "2022-03-25"
+},
+{
+"date": "2022-02-18",
+"dividend": 0.057,
+"paymentDate": "2022-02-25"
+},
+{
+"date": "2022-01-20",
+"dividend": 0.064,
+"paymentDate": "2022-01-26"
+},
+{
+"date": "2021-12-21",
+"dividend": 0.082,
+"paymentDate": "2021-12-29"
+},
+{
+"date": "2021-11-19",
+"dividend": 0.052,
+"paymentDate": "2021-11-26"
+},
+{
+"date": "2021-10-19",
+"dividend": 0.024,
+"paymentDate": "2021-10-25"
+},
+{
+"date": "2021-09-21",
+"dividend": 0.031,
+"paymentDate": "2021-09-27"
+},
+{
+"date": "2021-08-19",
+"dividend": 0.05,
+"paymentDate": "2021-08-25"
+},
+{
+"date": "2021-07-20",
+"dividend": 0.106,
+"paymentDate": "2021-07-26"
+},
+{
+"date": "2021-06-21",
+"dividend": 0.125,
+"paymentDate": "2021-06-25"
+},
+{
+"date": "2021-05-19",
+"dividend": 0.116,
+"paymentDate": "2021-05-25"
+},
+{
+"date": "2021-04-20",
+"dividend": 0.188,
+"paymentDate": "2021-04-26"
+},
+{
+"date": "2021-03-19",
+"dividend": 0.191,
+"paymentDate": "2021-03-25"
+},
+{
+"date": "2021-02-19",
+"dividend": 0.21,
+"paymentDate": "2021-02-25"
+},
+{
+"date": "2021-01-19",
+"dividend": 0.116,
+"paymentDate": "2021-01-25"
+},
+{
+"date": "2020-12-21",
+"dividend": 0.181,
+"paymentDate": "2020-12-29"
+},
+{
+"date": "2020-11-19",
+"dividend": 0.247,
+"paymentDate": "2020-11-25"
+},
+{
+"date": "2020-10-20",
+"dividend": 0.206,
+"paymentDate": "2020-10-26"
+},
+{
+"date": "2020-09-21",
+"dividend": 0.223,
+"paymentDate": "2020-09-25"
+},
+{
+"date": "2020-08-19",
+"dividend": 0.141,
+"paymentDate": "2020-08-25"
+},
+{
+"date": "2020-07-21",
+"dividend": 0.094,
+"paymentDate": "2020-07-27"
+},
+{
+"date": "2020-06-19",
+"dividend": 0.176,
+"paymentDate": "2020-06-25"
+},
+{
+"date": "2020-05-19",
+"dividend": 0.222,
+"paymentDate": "2020-05-26"
+},
+{
+"date": "2020-04-21",
+"dividend": 0.041,
+"paymentDate": "2020-04-27"
+},
+{
+"date": "2020-03-19",
+"dividend": 0.026,
+"paymentDate": "2020-03-25"
+},
+{
+"date": "2020-02-20",
+"dividend": 0.062,
+"paymentDate": "2020-02-26"
+},
+{
+"date": "2020-01-21",
+"dividend": 0.046,
+"paymentDate": "2020-01-27"
+},
+{
+"date": "2019-12-19",
+"dividend": 0.029,
+"paymentDate": "2019-12-27"
+},
+{
+"date": "2019-11-19",
+"dividend": 0.057,
+"paymentDate": "2019-11-25"
+},
+{
+"date": "2019-10-21",
+"dividend": 0.098,
+"paymentDate": "2019-10-25"
+},
+{
+"date": "2019-09-19",
+"dividend": 0.136,
+"paymentDate": "2019-09-25"
+},
+{
+"date": "2019-08-20",
+"dividend": 0.051,
+"paymentDate": "2019-08-27"
+},
+{
+"date": "2019-07-19",
+"dividend": 0.022,
+"paymentDate": "2019-07-25"
+},
+{
+"date": "2019-06-19",
+"dividend": 0.015,
+"paymentDate": "2019-06-25"
+},
+{
+"date": "2019-05-21",
+"dividend": 0.003,
+"paymentDate": "2019-05-28"
+},
+{
+"date": "2019-04-17",
+"dividend": 0.031,
+"paymentDate": "2019-04-25"
+},
+{
+"date": "2019-03-19",
+"dividend": 0.013,
+"paymentDate": "2019-03-25"
+},
+{
+"date": "2019-02-19",
+"dividend": 0.017,
+"paymentDate": "2019-02-25"
+},
+{
+"date": "2019-01-18",
+"dividend": 0.041,
+"paymentDate": "2019-01-25"
+},
+{
+"date": "2018-12-19",
+"dividend": 0.017,
+"paymentDate": "2018-12-26"
+},
+{
+"date": "2018-11-19",
+"dividend": 0.041,
+"paymentDate": "2018-11-26"
+},
+{
+"date": "2018-10-19",
+"dividend": 0.015,
+"paymentDate": "2018-10-25"
+},
+{
+"date": "2018-09-19",
+"dividend": 0.028,
+"paymentDate": "2018-09-25"
+},
+{
+"date": "2018-08-21",
+"dividend": 0.012,
+"paymentDate": "2018-08-27"
+},
+{
+"date": "2018-07-19",
+"dividend": 0.063,
+"paymentDate": "2018-07-25"
+},
+{
+"date": "2018-06-19",
+"dividend": 0.051,
+"paymentDate": "2018-06-25"
+},
+{
+"date": "2018-05-21",
+"dividend": 0.057,
+"paymentDate": "2018-05-25"
+},
+{
+"date": "2018-04-19",
+"dividend": 0.066,
+"paymentDate": "2018-04-25"
+},
+{
+"date": "2018-03-20",
+"dividend": 0.026,
+"paymentDate": "2018-03-26"
+},
+{
+"date": "2018-02-20",
+"dividend": 0.023,
+"paymentDate": "2018-02-26"
+},
+{
+"date": "2018-01-19",
+"dividend": 0.023,
+"paymentDate": "2018-01-25"
+},
+{
+"date": "2017-12-19",
+"dividend": 0.024,
+"paymentDate": "2017-12-26"
+},
+{
+"date": "2017-11-20",
+"dividend": 0.066,
+"paymentDate": "2017-11-27"
+},
+{
+"date": "2017-10-19",
+"dividend": 0.074,
+"paymentDate": "2017-10-25"
+},
+{
+"date": "2017-09-19",
+"dividend": 0.097,
+"paymentDate": "2017-09-25"
+},
+{
+"date": "2017-08-18",
+"dividend": 0.049,
+"paymentDate": "2017-08-25"
+},
+{
+"date": "2017-07-18",
+"dividend": 0.031,
+"paymentDate": "2017-07-25"
+},
+{
+"date": "2017-06-19",
+"dividend": 0.039,
+"paymentDate": "2017-06-26"
+},
+{
+"date": "2017-05-18",
+"dividend": 0.063,
+"paymentDate": "2017-05-25"
+},
+{
+"date": "2017-04-19",
+"dividend": 0.023,
+"paymentDate": "2017-04-26"
+},
+{
+"date": "2017-03-20",
+"dividend": 0.072,
+"paymentDate": "2017-03-27"
+},
+{
+"date": "2017-02-17",
+"dividend": 0.068,
+"paymentDate": "2017-02-27"
+},
+{
+"date": "2017-01-18",
+"dividend": 0.11,
+"paymentDate": "2017-01-25"
+},
+{
+"date": "2016-12-19",
+"dividend": 0.091,
+"paymentDate": "2016-12-27"
+},
+{
+"date": "2016-11-17",
+"dividend": 0.061,
+"paymentDate": "2016-11-25"
+},
+{
+"date": "2016-10-18",
+"dividend": 0.112,
+"paymentDate": "2016-10-25"
+},
+{
+"date": "2016-09-19",
+"dividend": 0.118,
+"paymentDate": "2016-09-26"
+},
+{
+"date": "2016-08-18",
+"dividend": 0.267,
+"paymentDate": "2016-08-25"
+},
+{
+"date": "2016-07-18",
+"dividend": 0.186,
+"paymentDate": "2016-07-25"
+},
+{
+"date": "2016-06-20",
+"dividend": 0.122,
+"paymentDate": "2016-06-27"
+},
+{
+"date": "2016-05-18",
+"dividend": 0.132,
+"paymentDate": "2016-05-25"
+},
+{
+"date": "2016-04-18",
+"dividend": 0.081,
+"paymentDate": "2016-04-25"
+},
+{
+"date": "2016-03-18",
+"dividend": 0.157,
+"paymentDate": "2016-03-25"
+},
+{
+"date": "2016-02-18",
+"dividend": 0.129,
+"paymentDate": "2016-02-25"
+},
+{
+"date": "2016-01-15",
+"dividend": 0.031,
+"paymentDate": "2016-01-25"
+},
+{
+"date": "2015-12-18",
+"dividend": 0.052,
+"paymentDate": "2015-12-28"
+},
+{
+"date": "2015-11-18",
+"dividend": 0.171,
+"paymentDate": "2015-11-25"
+},
+{
+"date": "2015-10-19",
+"dividend": 0.123,
+"paymentDate": "2015-10-26"
+},
+{
+"date": "2015-09-18",
+"dividend": 0.118,
+"paymentDate": "2015-09-25"
+},
+{
+"date": "2015-08-18",
+"dividend": 0.086,
+"paymentDate": "2015-08-25"
+},
+{
+"date": "2015-07-20",
+"dividend": 0.071,
+"paymentDate": "2015-07-27"
+},
+{
+"date": "2015-06-18",
+"dividend": 0.097,
+"paymentDate": "2015-06-25"
+},
+{
+"date": "2015-05-18",
+"dividend": 0.047,
+"paymentDate": "2015-05-26"
+},
+{
+"date": "2015-04-20",
+"dividend": 0.066,
+"paymentDate": "2015-04-27"
+},
+{
+"date": "2015-03-18",
+"dividend": 0.143,
+"paymentDate": "2015-03-25"
+},
+{
+"date": "2015-02-18",
+"dividend": 0.2412,
+"paymentDate": "2015-02-25"
+},
+{
+"date": "2015-01-16",
+"dividend": 0.21,
+"paymentDate": "2015-01-26"
+},
+{
+"date": "2014-12-18",
+"dividend": 0.205,
+"paymentDate": "2014-12-29"
+},
+{
+"date": "2014-11-19",
+"dividend": 0.1114,
+"paymentDate": "2014-11-25"
+},
+{
+"date": "2014-10-20",
+"dividend": 0.051,
+"paymentDate": "2014-10-27"
+},
+{
+"date": "2014-09-18",
+"dividend": 0.056,
+"paymentDate": "2014-09-25"
+},
+{
+"date": "2014-08-18",
+"dividend": 0.117,
+"paymentDate": "2014-08-26"
+},
+{
+"date": "2014-07-18",
+"dividend": 0.105,
+"paymentDate": "2014-07-25"
+},
+{
+"date": "2014-06-18",
+"dividend": 0.133,
+"paymentDate": "2014-06-25"
+},
+{
+"date": "2014-05-19",
+"dividend": 0.133,
+"paymentDate": "2014-05-27"
+},
+{
+"date": "2014-04-17",
+"dividend": 0.23,
+"paymentDate": "2014-04-25"
+},
+{
+"date": "2014-03-18",
+"dividend": 0.438,
+"paymentDate": "2014-03-25"
+},
+{
+"date": "2014-02-19",
+"dividend": 0.131,
+"paymentDate": "2014-02-26"
+},
+{
+"date": "2014-01-17",
+"dividend": 0.14,
+"paymentDate": "2014-01-27"
+},
+{
+"date": "2013-12-18",
+"dividend": 0.202,
+"paymentDate": "2013-12-27"
+},
+{
+"date": "2013-11-18",
+"dividend": 0.219,
+"paymentDate": "2013-11-25"
+},
+{
+"date": "2013-10-18",
+"dividend": 0.155,
+"paymentDate": "2013-10-25"
+},
+{
+"date": "2013-09-18",
+"dividend": 0.246,
+"paymentDate": "2013-09-25"
+},
+{
+"date": "2013-08-19",
+"dividend": 0.332,
+"paymentDate": "2013-08-27"
+},
+{
+"date": "2013-07-18",
+"dividend": 0.25,
+"paymentDate": "2013-07-25"
+},
+{
+"date": "2013-06-18",
+"dividend": 0.183,
+"paymentDate": "2013-06-25"
+},
+{
+"date": "2013-05-20",
+"dividend": 0.172,
+"paymentDate": "2013-05-28"
+}
+],
+"OVL": [
+{
+"date": "2026-09-29",
+"dividend": 0.49348,
+"paymentDate": "2026-09-30"
+},
+{
+"date": "2026-08-27",
+"dividend": 0.49436,
+"paymentDate": "2026-08-28"
+},
+{
+"date": "2026-07-29",
+"dividend": 0.4875,
+"paymentDate": "2026-07-30"
+},
+{
+"date": "2026-06-26",
+"dividend": 0.48509,
+"paymentDate": "2026-06-29"
+},
+{
+"date": "2026-05-27",
+"dividend": 0.4976,
+"paymentDate": "2026-05-28"
+},
+{
+"date": "2026-04-28",
+"dividend": 0.46902,
+"paymentDate": "2026-04-29"
+},
+{
+"date": "2026-03-27",
+"dividend": 0.4411,
+"paymentDate": "2026-03-30"
+},
+{
+"date": "2026-02-25",
+"dividend": 0.4655,
+"paymentDate": "2026-02-26"
+},
+{
+"date": "2026-01-28",
+"dividend": 0.47062,
+"paymentDate": "2026-01-29"
+},
+{
+"date": "2025-12-23",
+"dividend": 0.41987,
+"paymentDate": "2025-12-24"
+},
+{
+"date": "2025-10-03",
+"dividend": 0.40987,
+"paymentDate": "2025-10-06"
+},
+{
+"date": "2025-07-03",
+"dividend": 0.38961,
+"paymentDate": "2025-07-07"
+},
+{
+"date": "2025-04-03",
+"dividend": 0.37355,
+"paymentDate": "2025-04-04"
+},
+{
+"date": "2024-12-24",
+"dividend": 0.38926,
+"paymentDate": "2024-12-26"
+},
+{
+"date": "2024-10-03",
+"dividend": 0.3758,
+"paymentDate": "2024-10-04"
+},
+{
+"date": "2024-07-03",
+"dividend": 0.37676,
+"paymentDate": "2024-07-05"
+},
+{
+"date": "2024-04-03",
+"dividend": 0.30295,
+"paymentDate": "2024-04-05"
+},
+{
+"date": "2023-12-27",
+"dividend": 0.34355,
+"paymentDate": "2023-12-29"
+},
+{
+"date": "2023-10-03",
+"dividend": 0.29873,
+"paymentDate": "2023-10-05"
+},
+{
+"date": "2023-07-05",
+"dividend": 0.31839,
+"paymentDate": "2023-07-07"
+},
+{
+"date": "2023-04-04",
+"dividend": 0.29453,
+"paymentDate": "2023-04-06"
+},
+{
+"date": "2022-12-28",
+"dividend": 0.3007,
+"paymentDate": "2022-12-30"
+},
+{
+"date": "2022-10-04",
+"dividend": 0.2722,
+"paymentDate": "2022-10-06"
+},
+{
+"date": "2022-07-05",
+"dividend": 0.285,
+"paymentDate": "2022-07-07"
+},
+{
+"date": "2022-04-04",
+"dividend": 0.317,
+"paymentDate": "2022-04-06"
+},
+{
+"date": "2021-12-29",
+"dividend": 0.565,
+"paymentDate": "2021-12-31"
+},
+{
+"date": "2021-10-04",
+"dividend": 0.308,
+"paymentDate": "2021-10-06"
+},
+{
+"date": "2021-07-02",
+"dividend": 0.312,
+"paymentDate": "2021-07-07"
+},
+{
+"date": "2021-04-05",
+"dividend": 0.29,
+"paymentDate": "2021-04-07"
+},
+{
+"date": "2020-12-28",
+"dividend": 0.379,
+"paymentDate": "2020-12-30"
+},
+{
+"date": "2020-10-02",
+"dividend": 0.266,
+"paymentDate": "2020-10-06"
+},
+{
+"date": "2020-06-26",
+"dividend": 0.067,
+"paymentDate": "2020-06-30"
+},
+{
+"date": "2020-03-27",
+"dividend": 0.065,
+"paymentDate": "2020-03-31"
+},
+{
+"date": "2019-12-27",
+"dividend": 0.137,
+"paymentDate": "2019-12-31"
+}
+],
+"HSHP": [
+{
+"date": "2026-09-17",
+"dividend": 0.25,
+"paymentDate": "2026-09-25"
+},
+{
+"date": "2026-08-20",
+"dividend": 0.22,
+"paymentDate": "2026-08-27"
+},
+{
+"date": "2026-07-17",
+"dividend": 0.22,
+"paymentDate": "2026-07-28"
+},
+{
+"date": "2026-06-19",
+"dividend": 0.22,
+"paymentDate": "2026-06-26"
+},
+{
+"date": "2026-05-18",
+"dividend": 0.15,
+"paymentDate": "2026-05-26"
+},
+{
+"date": "2026-04-17",
+"dividend": 0.06,
+"paymentDate": "2026-04-27"
+},
+{
+"date": "2026-03-16",
+"dividend": 0.06,
+"paymentDate": "2026-03-25"
+},
+{
+"date": "2026-02-19",
+"dividend": 0.06,
+"paymentDate": "2026-02-27"
+},
+{
+"date": "2026-01-19",
+"dividend": 0.13,
+"paymentDate": "2026-01-27"
+},
+{
+"date": "2025-12-12",
+"dividend": 0.1,
+"paymentDate": "2025-12-23"
+},
+{
+"date": "2025-11-14",
+"dividend": 0.07,
+"paymentDate": "2025-11-24"
+},
+{
+"date": "2025-10-17",
+"dividend": 0.1,
+"paymentDate": "2025-10-28"
+},
+{
+"date": "2025-09-15",
+"dividend": 0.1,
+"paymentDate": "2025-09-25"
+},
+{
+"date": "2025-08-18",
+"dividend": 0.04,
+"paymentDate": "2025-08-29"
+},
+{
+"date": "2025-07-18",
+"dividend": 0.05,
+"paymentDate": "2025-08-05"
+},
+{
+"date": "2025-06-17",
+"dividend": 0.03,
+"paymentDate": "2025-07-03"
+},
+{
+"date": "2025-05-19",
+"dividend": 0.025,
+"paymentDate": "2025-06-03"
+},
+{
+"date": "2025-04-14",
+"dividend": 0.04,
+"paymentDate": "2025-05-02"
+},
+{
+"date": "2025-03-18",
+"dividend": 0.005,
+"paymentDate": "2025-04-22"
+},
+{
+"date": "2025-02-20",
+"dividend": 0.00500957,
+"paymentDate": "2025-03-05"
+},
+{
+"date": "2025-01-21",
+"dividend": 0.005,
+"paymentDate": "2025-02-05"
+},
+{
+"date": "2024-12-16",
+"dividend": 0.01,
+"paymentDate": "2025-01-03"
+},
+{
+"date": "2024-11-18",
+"dividend": 0.04,
+"paymentDate": "2024-11-29"
+},
+{
+"date": "2024-10-18",
+"dividend": 0.1,
+"paymentDate": "2024-10-31"
+},
+{
+"date": "2024-09-17",
+"dividend": 0.07,
+"paymentDate": "2024-09-30"
+},
+{
+"date": "2024-08-16",
+"dividend": 0.06033071,
+"paymentDate": "2024-09-04"
+},
+{
+"date": "2024-07-18",
+"dividend": 0.0497273,
+"paymentDate": "2024-08-05"
+},
+{
+"date": "2024-06-14",
+"dividend": 0.04007827,
+"paymentDate": "2024-07-05"
+},
+{
+"date": "2024-05-22",
+"dividend": 0.03987836,
+"paymentDate": "2024-06-06"
+},
+{
+"date": "2024-04-18",
+"dividend": 0.02987273,
+"paymentDate": "2024-05-08"
+},
+{
+"date": "2024-03-18",
+"dividend": 0.02996236,
+"paymentDate": "2024-04-05"
+},
+{
+"date": "2024-02-21",
+"dividend": 0.00999362,
+"paymentDate": "2024-03-08"
+}
+],
+"MAGS": [
+{
+"date": "2025-12-30",
+"dividend": 0.97618,
+"paymentDate": "2025-12-31"
+},
+{
+"date": "2024-12-30",
+"dividend": 0.44,
+"paymentDate": "2024-12-31"
+},
+{
+"date": "2023-12-27",
+"dividend": 0.14593,
+"paymentDate": "2023-12-29"
+}
+],
+"MAIN": [
+{
+"date": "2026-12-08",
+"dividend": 0.265,
+"paymentDate": "2026-12-15"
+},
+{
+"date": "2026-11-06",
+"dividend": 0.265,
+"paymentDate": "2026-11-13"
+},
+{
+"date": "2026-10-08",
+"dividend": 0.265,
+"paymentDate": "2026-10-15"
+},
+{
+"date": "2026-09-21",
+"dividend": 0.3,
+"paymentDate": "2026-09-28"
+},
+{
+"date": "2026-09-08",
+"dividend": 0.265,
+"paymentDate": "2026-09-15"
+},
+{
+"date": "2026-08-07",
+"dividend": 0.265,
+"paymentDate": "2026-08-14"
+},
+{
+"date": "2026-07-08",
+"dividend": 0.265,
+"paymentDate": "2026-07-15"
+},
+{
+"date": "2026-06-22",
+"dividend": 0.3,
+"paymentDate": "2026-06-29"
+},
+{
+"date": "2026-06-08",
+"dividend": 0.26,
+"paymentDate": "2026-06-15"
+},
+{
+"date": "2026-05-08",
+"dividend": 0.26,
+"paymentDate": "2026-05-15"
+},
+{
+"date": "2026-04-08",
+"dividend": 0.26,
+"paymentDate": "2026-04-15"
+},
+{
+"date": "2026-03-20",
+"dividend": 0.3,
+"paymentDate": "2026-03-27"
+},
+{
+"date": "2026-03-06",
+"dividend": 0.26,
+"paymentDate": "2026-03-13"
+},
+{
+"date": "2026-02-06",
+"dividend": 0.26,
+"paymentDate": "2026-02-13"
+},
+{
+"date": "2026-01-08",
+"dividend": 0.26,
+"paymentDate": "2026-01-15"
+},
+{
+"date": "2025-12-22",
+"dividend": 0.3,
+"paymentDate": "2025-12-29"
+},
+{
+"date": "2025-12-08",
+"dividend": 0.255,
+"paymentDate": "2025-12-15"
+},
+{
+"date": "2025-11-07",
+"dividend": 0.255,
+"paymentDate": "2025-11-14"
+},
+{
+"date": "2025-10-08",
+"dividend": 0.255,
+"paymentDate": "2025-10-15"
+},
+{
+"date": "2025-09-19",
+"dividend": 0.3,
+"paymentDate": "2025-09-26"
+},
+{
+"date": "2025-09-08",
+"dividend": 0.255,
+"paymentDate": "2025-09-15"
+},
+{
+"date": "2025-08-08",
+"dividend": 0.255,
+"paymentDate": "2025-08-15"
+},
+{
+"date": "2025-07-08",
+"dividend": 0.255,
+"paymentDate": "2025-07-15"
+},
+{
+"date": "2025-06-20",
+"dividend": 0.3,
+"paymentDate": "2025-06-27"
+},
+{
+"date": "2025-06-06",
+"dividend": 0.25,
+"paymentDate": "2025-06-13"
+},
+{
+"date": "2025-05-08",
+"dividend": 0.25,
+"paymentDate": "2025-05-15"
+},
+{
+"date": "2025-04-08",
+"dividend": 0.25,
+"paymentDate": "2025-04-15"
+},
+{
+"date": "2025-03-20",
+"dividend": 0.3,
+"paymentDate": "2025-03-27"
+},
+{
+"date": "2025-03-07",
+"dividend": 0.25,
+"paymentDate": "2025-03-14"
+},
+{
+"date": "2025-02-07",
+"dividend": 0.25,
+"paymentDate": "2025-02-14"
+},
+{
+"date": "2025-01-08",
+"dividend": 0.25,
+"paymentDate": "2025-01-15"
+},
+{
+"date": "2024-12-20",
+"dividend": 0.3,
+"paymentDate": "2024-12-27"
+},
+{
+"date": "2024-12-06",
+"dividend": 0.245,
+"paymentDate": "2024-12-13"
+},
+{
+"date": "2024-11-08",
+"dividend": 0.245,
+"paymentDate": "2024-11-15"
+},
+{
+"date": "2024-10-08",
+"dividend": 0.245,
+"paymentDate": "2024-10-15"
+},
+{
+"date": "2024-09-20",
+"dividend": 0.3,
+"paymentDate": "2024-09-27"
+},
+{
+"date": "2024-09-06",
+"dividend": 0.245,
+"paymentDate": "2024-09-13"
+},
+{
+"date": "2024-08-08",
+"dividend": 0.245,
+"paymentDate": "2024-08-15"
+},
+{
+"date": "2024-07-08",
+"dividend": 0.245,
+"paymentDate": "2024-07-15"
+},
+{
+"date": "2024-06-21",
+"dividend": 0.3,
+"paymentDate": "2024-06-27"
+},
+{
+"date": "2024-06-07",
+"dividend": 0.24,
+"paymentDate": "2024-06-14"
+},
+{
+"date": "2024-05-07",
+"dividend": 0.24,
+"paymentDate": "2024-05-15"
+},
+{
+"date": "2024-04-05",
+"dividend": 0.24,
+"paymentDate": "2024-04-15"
+},
+{
+"date": "2024-03-19",
+"dividend": 0.3,
+"paymentDate": "2024-03-27"
+},
+{
+"date": "2024-03-07",
+"dividend": 0.24,
+"paymentDate": "2024-03-15"
+},
+{
+"date": "2024-02-07",
+"dividend": 0.24,
+"paymentDate": "2024-02-15"
+},
+{
+"date": "2024-01-04",
+"dividend": 0.24,
+"paymentDate": "2024-01-12"
+},
+{
+"date": "2023-12-19",
+"dividend": 0.275,
+"paymentDate": "2023-12-27"
+},
+{
+"date": "2023-12-07",
+"dividend": 0.235,
+"paymentDate": "2023-12-15"
+},
+{
+"date": "2023-11-07",
+"dividend": 0.235,
+"paymentDate": "2023-11-15"
+},
+{
+"date": "2023-10-05",
+"dividend": 0.235,
+"paymentDate": "2023-10-13"
+},
+{
+"date": "2023-09-19",
+"dividend": 0.275,
+"paymentDate": "2023-09-27"
+},
+{
+"date": "2023-09-07",
+"dividend": 0.23,
+"paymentDate": "2023-09-15"
+},
+{
+"date": "2023-08-07",
+"dividend": 0.23,
+"paymentDate": "2023-08-15"
+},
+{
+"date": "2023-07-06",
+"dividend": 0.23,
+"paymentDate": "2023-07-14"
+},
+{
+"date": "2023-06-20",
+"dividend": 0.225,
+"paymentDate": "2023-06-28"
+},
+{
+"date": "2023-06-07",
+"dividend": 0.225,
+"paymentDate": "2023-06-15"
+},
+{
+"date": "2023-05-05",
+"dividend": 0.225,
+"paymentDate": "2023-05-15"
+},
+{
+"date": "2023-04-05",
+"dividend": 0.225,
+"paymentDate": "2023-04-14"
+},
+{
+"date": "2023-03-20",
+"dividend": 0.175,
+"paymentDate": "2023-03-28"
+},
+{
+"date": "2023-03-07",
+"dividend": 0.225,
+"paymentDate": "2023-03-15"
+},
+{
+"date": "2023-02-07",
+"dividend": 0.225,
+"paymentDate": "2023-02-15"
+},
+{
+"date": "2023-01-05",
+"dividend": 0.225,
+"paymentDate": "2023-01-13"
+},
+{
+"date": "2022-12-19",
+"dividend": 0.1,
+"paymentDate": "2022-12-28"
+},
+{
+"date": "2022-12-07",
+"dividend": 0.22,
+"paymentDate": "2022-12-15"
+},
+{
+"date": "2022-11-07",
+"dividend": 0.22,
+"paymentDate": "2022-11-15"
+},
+{
+"date": "2022-10-06",
+"dividend": 0.22,
+"paymentDate": "2022-10-14"
+},
+{
+"date": "2022-09-19",
+"dividend": 0.1,
+"paymentDate": "2022-09-27"
+},
+{
+"date": "2022-09-01",
+"dividend": 0.215,
+"paymentDate": "2022-09-15"
+},
+{
+"date": "2022-08-01",
+"dividend": 0.215,
+"paymentDate": "2022-08-15"
+},
+{
+"date": "2022-07-01",
+"dividend": 0.215,
+"paymentDate": "2022-07-15"
+},
+{
+"date": "2022-06-21",
+"dividend": 0.075,
+"paymentDate": "2022-06-30"
+},
+{
+"date": "2022-06-01",
+"dividend": 0.215,
+"paymentDate": "2022-06-15"
+},
+{
+"date": "2022-05-02",
+"dividend": 0.215,
+"paymentDate": "2022-05-13"
+},
+{
+"date": "2022-04-01",
+"dividend": 0.215,
+"paymentDate": "2022-04-14"
+},
+{
+"date": "2022-03-21",
+"dividend": 0.075,
+"paymentDate": "2022-03-30"
+},
+{
+"date": "2022-03-01",
+"dividend": 0.215,
+"paymentDate": "2022-03-15"
+},
+{
+"date": "2022-02-01",
+"dividend": 0.215,
+"paymentDate": "2022-02-15"
+},
+{
+"date": "2022-01-03",
+"dividend": 0.215,
+"paymentDate": "2022-01-14"
+},
+{
+"date": "2021-12-21",
+"dividend": 0.1,
+"paymentDate": "2021-12-30"
+},
+{
+"date": "2021-11-23",
+"dividend": 0.21,
+"paymentDate": "2021-12-15"
+},
+{
+"date": "2021-10-28",
+"dividend": 0.21,
+"paymentDate": "2021-11-15"
+},
+{
+"date": "2021-09-28",
+"dividend": 0.21,
+"paymentDate": "2021-10-15"
+},
+{
+"date": "2021-08-26",
+"dividend": 0.205,
+"paymentDate": "2021-09-15"
+},
+{
+"date": "2021-07-28",
+"dividend": 0.205,
+"paymentDate": "2021-08-13"
+},
+{
+"date": "2021-06-28",
+"dividend": 0.205,
+"paymentDate": "2021-07-15"
+},
+{
+"date": "2021-05-27",
+"dividend": 0.205,
+"paymentDate": "2021-06-15"
+},
+{
+"date": "2021-04-28",
+"dividend": 0.205,
+"paymentDate": "2021-05-14"
+},
+{
+"date": "2021-03-26",
+"dividend": 0.205,
+"paymentDate": "2021-04-15"
+},
+{
+"date": "2021-02-25",
+"dividend": 0.205,
+"paymentDate": "2021-03-15"
+},
+{
+"date": "2021-01-28",
+"dividend": 0.205,
+"paymentDate": "2021-02-12"
+},
+{
+"date": "2021-01-04",
+"dividend": 0.205,
+"paymentDate": "2021-01-15"
+},
+{
+"date": "2020-11-24",
+"dividend": 0.205,
+"paymentDate": "2020-12-15"
+},
+{
+"date": "2020-10-28",
+"dividend": 0.205,
+"paymentDate": "2020-11-13"
+},
+{
+"date": "2020-09-28",
+"dividend": 0.205,
+"paymentDate": "2020-10-15"
+},
+{
+"date": "2020-08-18",
+"dividend": 0.205,
+"paymentDate": "2020-09-15"
+},
+{
+"date": "2020-07-17",
+"dividend": 0.205,
+"paymentDate": "2020-08-14"
+},
+{
+"date": "2020-06-17",
+"dividend": 0.205,
+"paymentDate": "2020-07-15"
+},
+{
+"date": "2020-05-19",
+"dividend": 0.205,
+"paymentDate": "2020-06-15"
+},
+{
+"date": "2020-04-17",
+"dividend": 0.205,
+"paymentDate": "2020-05-15"
+},
+{
+"date": "2020-03-17",
+"dividend": 0.205,
+"paymentDate": "2020-04-15"
+},
+{
+"date": "2020-02-19",
+"dividend": 0.205,
+"paymentDate": "2020-03-13"
+},
+{
+"date": "2020-01-21",
+"dividend": 0.205,
+"paymentDate": "2020-02-14"
+},
+{
+"date": "2019-12-27",
+"dividend": 0.205,
+"paymentDate": "2020-01-15"
+},
+{
+"date": "2019-12-12",
+"dividend": 0.24,
+"paymentDate": "2019-12-26"
+},
+{
+"date": "2019-11-19",
+"dividend": 0.205,
+"paymentDate": "2019-12-11"
+},
+{
+"date": "2019-10-17",
+"dividend": 0.205,
+"paymentDate": "2019-11-15"
+},
+{
+"date": "2019-09-18",
+"dividend": 0.205,
+"paymentDate": "2019-10-15"
+},
+{
+"date": "2019-08-19",
+"dividend": 0.205,
+"paymentDate": "2019-09-16"
+},
+{
+"date": "2019-07-17",
+"dividend": 0.205,
+"paymentDate": "2019-08-15"
+},
+{
+"date": "2019-06-27",
+"dividend": 0.205,
+"paymentDate": "2019-07-15"
+},
+{
+"date": "2019-06-17",
+"dividend": 0.25,
+"paymentDate": "2019-06-25"
+},
+{
+"date": "2019-05-17",
+"dividend": 0.2,
+"paymentDate": "2019-06-14"
+},
+{
+"date": "2019-04-17",
+"dividend": 0.2,
+"paymentDate": "2019-05-15"
+},
+{
+"date": "2019-03-19",
+"dividend": 0.2,
+"paymentDate": "2019-04-15"
+},
+{
+"date": "2019-02-20",
+"dividend": 0.195,
+"paymentDate": "2019-03-15"
+},
+{
+"date": "2019-01-17",
+"dividend": 0.195,
+"paymentDate": "2019-02-15"
+},
+{
+"date": "2018-12-28",
+"dividend": 0.195,
+"paymentDate": "2019-01-15"
+},
+{
+"date": "2018-12-17",
+"dividend": 0.275,
+"paymentDate": "2018-12-27"
+},
+{
+"date": "2018-11-19",
+"dividend": 0.195,
+"paymentDate": "2018-12-14"
+},
+{
+"date": "2018-10-18",
+"dividend": 0.195,
+"paymentDate": "2018-11-15"
+},
+{
+"date": "2018-09-19",
+"dividend": 0.195,
+"paymentDate": "2018-10-15"
+},
+{
+"date": "2018-08-20",
+"dividend": 0.19,
+"paymentDate": "2018-09-14"
+},
+{
+"date": "2018-07-19",
+"dividend": 0.19,
+"paymentDate": "2018-08-15"
+},
+{
+"date": "2018-06-28",
+"dividend": 0.19,
+"paymentDate": "2018-07-16"
+},
+{
+"date": "2018-06-18",
+"dividend": 0.275,
+"paymentDate": "2018-06-26"
+},
+{
+"date": "2018-05-18",
+"dividend": 0.19,
+"paymentDate": "2018-06-15"
+},
+{
+"date": "2018-04-19",
+"dividend": 0.19,
+"paymentDate": "2018-05-15"
+},
+{
+"date": "2018-03-20",
+"dividend": 0.19,
+"paymentDate": "2018-04-16"
+},
+{
+"date": "2018-02-21",
+"dividend": 0.19,
+"paymentDate": "2018-03-15"
+},
+{
+"date": "2018-01-18",
+"dividend": 0.19,
+"paymentDate": "2018-02-15"
+},
+{
+"date": "2017-12-28",
+"dividend": 0.19,
+"paymentDate": "2018-01-12"
+},
+{
+"date": "2017-12-18",
+"dividend": 0.275,
+"paymentDate": "2017-12-27"
+},
+{
+"date": "2017-11-20",
+"dividend": 0.19,
+"paymentDate": "2017-12-15"
+},
+{
+"date": "2017-10-19",
+"dividend": 0.19,
+"paymentDate": "2017-11-15"
+},
+{
+"date": "2017-09-20",
+"dividend": 0.19,
+"paymentDate": "2017-10-16"
+},
+{
+"date": "2017-08-17",
+"dividend": 0.185,
+"paymentDate": "2017-09-15"
+},
+{
+"date": "2017-07-18",
+"dividend": 0.185,
+"paymentDate": "2017-08-15"
+},
+{
+"date": "2017-06-28",
+"dividend": 0.185,
+"paymentDate": "2017-07-14"
+},
+{
+"date": "2017-06-15",
+"dividend": 0.275,
+"paymentDate": "2017-06-26"
+},
+{
+"date": "2017-05-17",
+"dividend": 0.185,
+"paymentDate": "2017-06-14"
+},
+{
+"date": "2017-04-18",
+"dividend": 0.185,
+"paymentDate": "2017-05-15"
+},
+{
+"date": "2017-03-17",
+"dividend": 0.185,
+"paymentDate": "2017-04-13"
+},
+{
+"date": "2017-02-17",
+"dividend": 0.185,
+"paymentDate": "2017-03-15"
+},
+{
+"date": "2017-01-18",
+"dividend": 0.185,
+"paymentDate": "2017-02-15"
+},
+{
+"date": "2016-12-28",
+"dividend": 0.185,
+"paymentDate": "2017-01-13"
+},
+{
+"date": "2016-12-14",
+"dividend": 0.275,
+"paymentDate": "2016-12-23"
+},
+{
+"date": "2016-11-17",
+"dividend": 0.185,
+"paymentDate": "2016-12-13"
+},
+{
+"date": "2016-10-18",
+"dividend": 0.185,
+"paymentDate": "2016-11-15"
+},
+{
+"date": "2016-09-19",
+"dividend": 0.185,
+"paymentDate": "2016-10-14"
+},
+{
+"date": "2016-08-17",
+"dividend": 0.18,
+"paymentDate": "2016-09-15"
+},
+{
+"date": "2016-07-19",
+"dividend": 0.18,
+"paymentDate": "2016-08-15"
+},
+{
+"date": "2016-06-29",
+"dividend": 0.18,
+"paymentDate": "2016-07-15"
+},
+{
+"date": "2016-06-16",
+"dividend": 0.275,
+"paymentDate": "2016-06-27"
+},
+{
+"date": "2016-05-18",
+"dividend": 0.18,
+"paymentDate": "2016-06-15"
+},
+{
+"date": "2016-04-19",
+"dividend": 0.18,
+"paymentDate": "2016-05-16"
+},
+{
+"date": "2016-03-17",
+"dividend": 0.18,
+"paymentDate": "2016-04-15"
+},
+{
+"date": "2016-02-18",
+"dividend": 0.18,
+"paymentDate": "2016-03-15"
+},
+{
+"date": "2016-01-20",
+"dividend": 0.18,
+"paymentDate": "2016-02-17"
+},
+{
+"date": "2015-12-28",
+"dividend": 0.18,
+"paymentDate": "2016-01-15"
+},
+{
+"date": "2015-12-15",
+"dividend": 0.275,
+"paymentDate": "2015-12-24"
+},
+{
+"date": "2015-11-18",
+"dividend": 0.18,
+"paymentDate": "2015-12-14"
+},
+{
+"date": "2015-10-19",
+"dividend": 0.18,
+"paymentDate": "2015-11-16"
+},
+{
+"date": "2015-09-17",
+"dividend": 0.18,
+"paymentDate": "2015-10-15"
+},
+{
+"date": "2015-08-18",
+"dividend": 0.175,
+"paymentDate": "2015-09-15"
+},
+{
+"date": "2015-07-17",
+"dividend": 0.175,
+"paymentDate": "2015-08-14"
+},
+{
+"date": "2015-06-29",
+"dividend": 0.175,
+"paymentDate": "2015-07-15"
+},
+{
+"date": "2015-06-16",
+"dividend": 0.275,
+"paymentDate": "2015-06-25"
+},
+{
+"date": "2015-05-18",
+"dividend": 0.175,
+"paymentDate": "2015-06-15"
+},
+{
+"date": "2015-04-17",
+"dividend": 0.175,
+"paymentDate": "2015-05-15"
+},
+{
+"date": "2015-03-27",
+"dividend": 0.175,
+"paymentDate": "2015-04-15"
+},
+{
+"date": "2015-02-18",
+"dividend": 0.17,
+"paymentDate": "2015-03-16"
+},
+{
+"date": "2015-01-16",
+"dividend": 0.17,
+"paymentDate": "2015-02-13"
+},
+{
+"date": "2014-12-29",
+"dividend": 0.17,
+"paymentDate": "2015-01-15"
+},
+{
+"date": "2014-12-16",
+"dividend": 0.275,
+"paymentDate": "2014-12-24"
+},
+{
+"date": "2014-11-18",
+"dividend": 0.17,
+"paymentDate": "2014-12-15"
+},
+{
+"date": "2014-10-16",
+"dividend": 0.17,
+"paymentDate": "2014-11-14"
+},
+{
+"date": "2014-09-17",
+"dividend": 0.17,
+"paymentDate": "2014-10-15"
+},
+{
+"date": "2014-08-18",
+"dividend": 0.165,
+"paymentDate": "2014-09-15"
+},
+{
+"date": "2014-07-17",
+"dividend": 0.165,
+"paymentDate": "2014-08-15"
+},
+{
+"date": "2014-06-26",
+"dividend": 0.165,
+"paymentDate": "2014-07-15"
+},
+{
+"date": "2014-06-18",
+"dividend": 0.275,
+"paymentDate": "2014-06-25"
+},
+{
+"date": "2014-05-16",
+"dividend": 0.165,
+"paymentDate": "2014-06-16"
+},
+{
+"date": "2014-04-16",
+"dividend": 0.165,
+"paymentDate": "2014-05-15"
+},
+{
+"date": "2014-03-18",
+"dividend": 0.165,
+"paymentDate": "2014-04-15"
+},
+{
+"date": "2014-02-18",
+"dividend": 0.165,
+"paymentDate": "2014-03-14"
+},
+{
+"date": "2014-01-16",
+"dividend": 0.165,
+"paymentDate": "2014-02-14"
+},
+{
+"date": "2013-12-26",
+"dividend": 0.165,
+"paymentDate": "2014-01-15"
+},
+{
+"date": "2013-12-17",
+"dividend": 0.25,
+"paymentDate": "2013-12-24"
+},
+{
+"date": "2013-11-19",
+"dividend": 0.16,
+"paymentDate": "2013-12-16"
+},
+{
+"date": "2013-10-17",
+"dividend": 0.16,
+"paymentDate": "2013-11-15"
+},
+{
+"date": "2013-09-18",
+"dividend": 0.16,
+"paymentDate": "2013-10-15"
+},
+{
+"date": "2013-08-19",
+"dividend": 0.155,
+"paymentDate": "2013-09-16"
+},
+{
+"date": "2013-07-31",
+"dividend": 0.155,
+"paymentDate": "2013-08-15"
+},
+{
+"date": "2013-07-18",
+"dividend": 0.2,
+"paymentDate": "2013-07-26"
+},
+{
+"date": "2013-06-18",
+"dividend": 0.155,
+"paymentDate": "2013-07-15"
+},
+{
+"date": "2013-05-17",
+"dividend": 0.155,
+"paymentDate": "2013-06-14"
+},
+{
+"date": "2013-04-17",
+"dividend": 0.155,
+"paymentDate": "2013-05-15"
+},
+{
+"date": "2013-03-19",
+"dividend": 0.155,
+"paymentDate": "2013-04-15"
+},
+{
+"date": "2013-02-19",
+"dividend": 0.15,
+"paymentDate": "2013-03-15"
+},
+{
+"date": "2013-01-16",
+"dividend": 0.15,
+"paymentDate": "2013-02-15"
+},
+{
+"date": "2013-01-02",
+"dividend": 0.35,
+"paymentDate": "2013-01-23"
+},
+{
+"date": "2012-12-18",
+"dividend": 0.15,
+"paymentDate": "2013-01-15"
+},
+{
+"date": "2012-11-19",
+"dividend": 0.15,
+"paymentDate": "2012-12-14"
+},
+{
+"date": "2012-10-17",
+"dividend": 0.15,
+"paymentDate": "2012-11-15"
+},
+{
+"date": "2012-09-18",
+"dividend": 0.15,
+"paymentDate": "2012-10-15"
+},
+{
+"date": "2012-08-17",
+"dividend": 0.145,
+"paymentDate": "2012-09-14"
+},
+{
+"date": "2012-07-18",
+"dividend": 0.145,
+"paymentDate": "2012-08-15"
+},
+{
+"date": "2012-06-19",
+"dividend": 0.145,
+"paymentDate": "2012-07-16"
+},
+{
+"date": "2012-05-17",
+"dividend": 0.14,
+"paymentDate": "2012-06-15"
+},
+{
+"date": "2012-04-18",
+"dividend": 0.14,
+"paymentDate": "2012-05-15"
+},
+{
+"date": "2012-03-19",
+"dividend": 0.14,
+"paymentDate": "2012-04-16"
+},
+{
+"date": "2012-02-22",
+"dividend": 0.135,
+"paymentDate": "2012-03-15"
+},
+{
+"date": "2012-01-18",
+"dividend": 0.135,
+"paymentDate": "2012-02-15"
+},
+{
+"date": "2011-12-21",
+"dividend": 0.135,
+"paymentDate": "2012-01-16"
+},
+{
+"date": "2011-11-17",
+"dividend": 0.135,
+"paymentDate": "2011-12-15"
+},
+{
+"date": "2011-10-18",
+"dividend": 0.135,
+"paymentDate": "2011-11-15"
+},
+{
+"date": "2011-09-19",
+"dividend": 0.135,
+"paymentDate": "2011-10-14"
+},
+{
+"date": "2011-08-17",
+"dividend": 0.13,
+"paymentDate": "2011-09-15"
+},
+{
+"date": "2011-07-19",
+"dividend": 0.13,
+"paymentDate": "2011-08-15"
+},
+{
+"date": "2011-06-20",
+"dividend": 0.13,
+"paymentDate": "2011-07-15"
+},
+{
+"date": "2011-05-18",
+"dividend": 0.13,
+"paymentDate": "2011-06-15"
+},
+{
+"date": "2011-04-19",
+"dividend": 0.13,
+"paymentDate": "2011-05-16"
+},
+{
+"date": "2011-03-22",
+"dividend": 0.13,
+"paymentDate": "2011-04-15"
+},
+{
+"date": "2011-02-17",
+"dividend": 0.125,
+"paymentDate": "2011-03-15"
+},
+{
+"date": "2011-01-18",
+"dividend": 0.125,
+"paymentDate": "2011-02-15"
+},
+{
+"date": "2011-01-04",
+"dividend": 0.125,
+"paymentDate": "2011-01-14"
+},
+{
+"date": "2010-11-17",
+"dividend": 0.125,
+"paymentDate": "2010-12-15"
+},
+{
+"date": "2010-10-19",
+"dividend": 0.125,
+"paymentDate": "2010-11-15"
+},
+{
+"date": "2010-09-21",
+"dividend": 0.125,
+"paymentDate": "2010-10-15"
+},
+{
+"date": "2010-08-18",
+"dividend": 0.125,
+"paymentDate": "2010-09-15"
+},
+{
+"date": "2010-07-19",
+"dividend": 0.125,
+"paymentDate": "2010-08-16"
+},
+{
+"date": "2010-06-17",
+"dividend": 0.125,
+"paymentDate": "2010-07-15"
+},
+{
+"date": "2010-05-18",
+"dividend": 0.125,
+"paymentDate": "2010-06-15"
+},
+{
+"date": "2010-04-19",
+"dividend": 0.125,
+"paymentDate": "2010-05-14"
+},
+{
+"date": "2010-03-23",
+"dividend": 0.125,
+"paymentDate": "2010-04-15"
+},
+{
+"date": "2010-02-18",
+"dividend": 0.125,
+"paymentDate": "2010-03-15"
+},
+{
+"date": "2010-01-19",
+"dividend": 0.125,
+"paymentDate": "2010-02-16"
+},
+{
+"date": "2010-01-04",
+"dividend": 0.125,
+"paymentDate": "2010-01-15"
+},
+{
+"date": "2009-11-18",
+"dividend": 0.125,
+"paymentDate": "2009-12-15"
+},
+{
+"date": "2009-10-19",
+"dividend": 0.125,
+"paymentDate": "2009-11-16"
+},
+{
+"date": "2009-09-17",
+"dividend": 0.125,
+"paymentDate": "2009-10-15"
+},
+{
+"date": "2009-08-18",
+"dividend": 0.125,
+"paymentDate": "2009-09-15"
+},
+{
+"date": "2009-07-17",
+"dividend": 0.125,
+"paymentDate": "2009-08-14"
+},
+{
+"date": "2009-06-17",
+"dividend": 0.125,
+"paymentDate": "2009-07-15"
+},
+{
+"date": "2009-05-19",
+"dividend": 0.125,
+"paymentDate": "2009-06-15"
+},
+{
+"date": "2009-04-17",
+"dividend": 0.125,
+"paymentDate": "2009-05-15"
+},
+{
+"date": "2009-03-18",
+"dividend": 0.125,
+"paymentDate": "2009-04-15"
+},
+{
+"date": "2009-02-18",
+"dividend": 0.125,
+"paymentDate": "2009-03-16"
+},
+{
+"date": "2009-01-20",
+"dividend": 0.125,
+"paymentDate": "2009-02-16"
+},
+{
+"date": "2008-12-17",
+"dividend": 0.125,
+"paymentDate": "2009-01-15"
+},
+{
+"date": "2008-11-17",
+"dividend": 0.125,
+"paymentDate": "2008-12-15"
+},
+{
+"date": "2008-10-15",
+"dividend": 0.125,
+"paymentDate": "2008-11-14"
+},
+{
+"date": "2008-09-16",
+"dividend": 0.125,
+"paymentDate": "2008-10-15"
+},
+{
+"date": "2008-08-12",
+"dividend": 0.36,
+"paymentDate": "2008-09-12"
+},
+{
+"date": "2008-05-08",
+"dividend": 0.35,
+"paymentDate": "2008-06-12"
+},
+{
+"date": "2008-02-13",
+"dividend": 0.34,
+"paymentDate": "2008-03-21"
+}
+]
+}
