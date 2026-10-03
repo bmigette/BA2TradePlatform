@@ -80,7 +80,7 @@ def _gene_params(strategy_params: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _build_optimization_rerun_config(db: Any, bt: Backtest) -> Dict[str, Any]:
+def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None) -> Dict[str, Any]:
     """Rebuild an opt-derived row's run config.
 
     Builds the SAME config the GA SCORED the individual with: ``_build_daily_trial_config`` fed the
@@ -122,6 +122,11 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest) -> Dict[str, Any]:
         _rs, _re = bt.start_date.date().isoformat(), bt.end_date.date().isoformat()
         if (str(bt_block["start_date"])[:10], str(bt_block["end_date"])[:10]) != (_rs, _re):
             bt_block["start_date"], bt_block["end_date"] = _rs, _re
+    # An explicit ``window`` (start, end ISO dates) REPLACES both: re-measure THIS stored row's own
+    # genome (pins included) on another period. The screener hoisted state below is derived from
+    # bt_block, so it follows the overridden window.
+    if window is not None:
+        bt_block["start_date"], bt_block["end_date"] = str(window[0]), str(window[1])
 
     # The optimization may have run on another machine (e.g. a Windows store path) or the store may
     # have moved — remap a missing screener store to this machine's local SCREENER_STORE_DIR so the
@@ -194,7 +199,7 @@ def _build_standalone_rerun_config(bt: Backtest) -> Dict[str, Any]:
     return _build_config(payload)
 
 
-def rebuild_config_for_backtest(bt: Backtest, db: Any = None) -> Dict[str, Any]:
+def rebuild_config_for_backtest(bt: Backtest, db: Any = None, window: Any = None) -> Dict[str, Any]:
     """Reconstruct the ``run_daily_backtest`` config that reproduces ``bt``'s ORIGINAL run.
 
     This is the SINGLE reconstruction path shared by BOTH the ``/rerun`` handler (which
@@ -212,12 +217,14 @@ def rebuild_config_for_backtest(bt: Backtest, db: Any = None) -> Dict[str, Any]:
             f"re-run is only supported for daily_expert backtests (backtest {bt.id} is "
             f"'{bt.engine_type}')"
         )
+    if window is not None and not bt.optimization_id:
+        raise ValueError("window override is only supported for optimization-derived rows")
     if bt.optimization_id:
         if db is not None:
-            return _build_optimization_rerun_config(db, bt)
+            return _build_optimization_rerun_config(db, bt, window)
         session = SessionLocal()
         try:
-            return _build_optimization_rerun_config(session, bt)
+            return _build_optimization_rerun_config(session, bt, window)
         finally:
             session.close()
     return _build_standalone_rerun_config(bt)
