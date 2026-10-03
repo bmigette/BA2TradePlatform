@@ -139,10 +139,18 @@ tightens it.
   it; every wait has a timeout, after which the pending future is cancelled and a `TimeoutError`
   naming the account and operation is raised. Tests pin all four properties against a fake that
   blocks on purpose.
-* `__init__` validates settings and starts the loop thread but does **not** connect (the account
-  object is cached for the life of the process and must survive a Gateway that is down at startup).
-  The first call connects; a failed connect raises `IBKRConnectionError` and arms a 15 s
-  cooldown so a Gateway outage does not turn every price lookup into a connect storm.
+* `__init__` validates settings and attaches to the account's runtime but does **not** connect (a
+  Gateway that is down at startup must not make the account unusable). The first call connects; a
+  failed connect raises `IBKRConnectionError` and arms a 15 s cooldown so a Gateway outage does not
+  turn every price lookup into a connect storm.
+* **One runtime (thread + loop + TWS session) per account DEFINITION, shared by every
+  `IBKRAccount` object** (`ibkr_runtime.get_runtime`). This is not an optimisation: `TradeManager`
+  builds a fresh `account_class(id)` per call, and the instance cache is dropped by `/api/reload`; a
+  connection per object would put several sessions on one `clientId`, which TWS refuses (error 326) or
+  resolves by dropping the older one. Caches (contract details, market rules, previous closes) live on
+  the shared runtime for the same reason. Dropping an object never disconnects; `close()` (app
+  shutdown, tests) does. A changed host/port/client id/account/flags replaces the runtime and closes
+  the old session, so a settings edit needs no restart.
 
 ### 3.3 Reconnects, Gateway/TWS restarts, client ids
 
@@ -166,7 +174,8 @@ tightens it.
   stays 1. Two accounts on one Gateway need two different ids.
 * **Ports:** TWS live 7496, TWS paper 7497, Gateway live 4001, Gateway paper 4002. Default 4002
   with `paper_account=True`.
-* **Paper/live guard:** after connecting, the account id must exist in `managedAccounts()`, and
+* **Paper/live guard (`paper_account` defaults to checked, matching the 4002 default port and the
+  already-merged settings-dialog default):** after connecting, the account id must exist in `managedAccounts()`, and
   `paper_account=True` requires an id starting `DU` while `paper_account=False` requires one that
   does not (paper accounts are `DU...`). A mismatch refuses to trade (`IBKRConnectionError`), so a
   paper-configured row can never address a live account through a wrongly forwarded port, and the
@@ -464,6 +473,47 @@ Each has a conservative default already implemented; answering changes the defau
 11. **Read-only mode** is honoured by refusing writes before they are sent; do you also want the
     Gateway itself set read-only for the first runs? (Recommended.)
 
-## 11. Assumptions recorded while implementing (appended per stage)
+## 11. Implementation record and assumptions (appended per stage)
 
-Stage 2/3/4 assumptions are appended below as they are taken.
+### Stage 2 (equity), as built
+
+Files: `modules/accounts/IBKRAccount.py` (adapter), `modules/accounts/ibkr_runtime.py` (loop thread,
+connection policy, shared runtime), `ba2_common/core/ibkr_mapping.py` (pure rules),
+`ba2_common/core/protective_legs.py` (shared exit-order mixin), `ba2_common/core/ibkr_flex.py` (Flex
+parsing). Tests: `tests/ibkr_fakes.py` (behavioural fake of `ib_async.IB` over the real ib_async value
+types), `tests/test_ibkr_*.py`, `packages/common/tests/test_ibkr_{mapping,flex}.py`.
+
+Deviations from the sections above, and why:
+
+* `paper_account` has a declared default (True). An existing test pins the dialog behaviour "a new
+  IBKR account shows paper checked", and the connect-time paper/live guard makes the default fail-safe.
+* **Flex is implemented**, not just designed (7.1): `flex_token` / `flex_query_id` enable
+  `get_dividends`, `get_cash_transfers` and `get_balance_history`, cached 10 minutes; unset they return
+  `[]` with one WARNING per process. Schema names are UNVERIFIED.
+* The in-place exit modification stores the **tick-rounded** price IB was sent, not the requested one.
+* A `cancel_order` on an order IB already reports Cancelled returns True (goal met, the refresh
+  records the final status); on a Filled one it returns False and says so.
+* `get_positions` marks come from IB's own portfolio (`marketPrice`, `unrealizedPNL`); a missing mark
+  is fetched as a snapshot and, if that is empty too, the whole fetch is reported as FAILED (`None`)
+  rather than fabricating a price. `lastday_price`/intraday fields (display only) use the snapshot
+  close and fall back to the mark (zero intraday change) when no close is available.
+* `refresh_orders` never cancels a row on absence alone: the open and completed lists AND the execution
+  list must all have been read, the row must be older than 5 minutes, and an execution by `orderRef` /
+  `permId` settles it as FILLED instead. Older than 7 days with no evidence: left alone, loudly.
+
+Assumptions taken (all conservative; each is the documented default, not a hidden one):
+
+1. `Inactive` is a rejection (REJECTED). TWS also uses it for a user-deactivated order; a refresh that
+   later sees the order working revives the row.
+2. `PreSubmitted` = accepted/resting (ACCEPTED), never `WAITING_TRIGGER` (reserved for DB-only rows).
+3. Market orders are DAY; resting orders with no `good_for` are GTC (Alpaca's default; a protective
+   stop must survive the close). An unrecognised `good_for` is an error.
+4. The OCO stop leg is a stop-limit with `OCO_STOP_LIMIT_CUSHION` (imported from `AlpacaAccount`, the
+   single constant `TradeManager._force_close_breached_stops` also reads). Q1 asks whether to change it.
+5. Margin: `margin_multiplier` 2.0 only when `BuyingPower / AvailableFunds >= 1.9`, else 1.0.
+6. `ocaType=2` (reduce with block) for the OCO pair.
+7. No wash-trade lock (`_is_washtrade_lock_candidate` is False).
+8. Shortable means `shortableShares > 2.5`; unknown means refuse.
+9. Fractional only when `ContractDetails.minSize`/`sizeIncrement` publish a sub-share step; otherwise
+   whole shares, floored (never rounded up); a floor to zero is a CANCELED skip, not an ERROR.
+10. Delayed market data is never a price (`marketDataType` 3/4), and `reqMarketDataType(2)` is requested.

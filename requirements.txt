@@ -11,7 +11,7 @@ alembic
 reportlab<5  # pin: reportlab 5.0 untested on live trade app (PDF export) — keep on 4.x
 plotly
 fmpsdk
-ib_async
+ib_async>=2.1.0,<3  # floor: never DOWNGRADE the SDK IBKRAccount is written against (2.1.0 installed). Ceiling: ib_async's Order/Trade/Ticker field shapes and its Ticker.__post_init__ NaN-reset are what the adapter and tests/ibkr_fakes.py encode; a 3.x may move them.
 
 # TradingAgents Tools
 typing-extensions
