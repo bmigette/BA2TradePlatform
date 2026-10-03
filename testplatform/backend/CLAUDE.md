@@ -34,18 +34,25 @@ ba2-test serve --mode back --reload
 ~/ba2-venvs/test/bin/python -m uvicorn app.main:app --reload
 ```
 
-## Versioning — bump `testplatform/version.py`, NOT the trade app's
+## Versioning -- `testplatform/version.py` for the test platform, per-package versions for `packages/`
 
-Any change under `testplatform/` **or `packages/`** must increment `TEST_APP_VERSION` (NNNNN + 1)
-in `testplatform/version.py` before the push. Only changes confined to `ba2_trade_platform/` bump
-`ba2_trade_platform/version.py`.
+Changes under `testplatform/` increment `TEST_APP_VERSION` (NNNNN + 1) in `testplatform/version.py`
+before the push. Changes under `packages/` increment that package's `PACKAGE_VERSION`; they raise
+`testplatform/required_package_versions.py` ONLY when the change can affect GA results (otherwise the
+path goes in `testplatform/ga_neutral_package_paths.py`). Changes confined to `ba2_trade_platform/`
+bump `ba2_trade_platform/version.py`.
 
-This is not cosmetic: `worker_client.ensure_synced` decides whether a distributed GA worker
-self-updates by comparing `TEST_APP_VERSION` alone (deliberately not the git commit, so ordinary
-pushes don't churn every worker mid-run). Ship a `packages/` fix without bumping it and the
-workers keep running the old code while reporting "synced". Commit **and push** the bump —
-`unsyncable_reason` refuses the run otherwise, because a worker's `git pull` could never
-converge on an uncommitted or unpushed version.
+This is not cosmetic: `worker_client.ensure_synced` re-syncs a distributed GA worker when its
+`TEST_APP_VERSION` differs from the master's OR a package it reports is below the declared minimum
+(deliberately not the git commit, so ordinary pushes don't churn every worker mid-run). A worker
+at/above the minimums may run older package code than the master by design; the master WARNs
+(`DRIFT`) once per job. Ship a GA-relevant `packages/` fix without raising the minimum and workers
+keep running the old code while reporting "synced" -- `tools/check_package_versions.py` fails that.
+Commit **and push** the bumps -- `unsyncable_reason` logs a WARNING otherwise (it does not block).
+A raised minimum needs no `TEST_APP_VERSION` bump (the minimum itself syncs older workers);
+edits to `required_package_versions.py` / `ga_neutral_package_paths.py` alone are exempt from the
+`testplatform/` bump rule. A worker NEWER than the master (declares a higher minimum) is excluded,
+not updated. The master refuses distributed mode if its own minimums are unreadable.
 
 ## Key Directories
 

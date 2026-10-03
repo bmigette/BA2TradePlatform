@@ -15,8 +15,11 @@ The most important rules:
 3. **No fallbacks for live data.** Never substitute a default for a price, balance or quantity
    (`price or 1.0`). Raise an error when the value is missing.
 4. **Bump the version before every push.** Changes under `ba2_trade_platform/` bump `APP_VERSION`
-   in `ba2_trade_platform/version.py`; changes under `testplatform/` or `packages/` bump
-   `TEST_APP_VERSION` in `testplatform/version.py`.
+   in `ba2_trade_platform/version.py`; changes under `testplatform/` bump `TEST_APP_VERSION` in
+   `testplatform/version.py`; every change under `packages/` bumps that package's `PACKAGE_VERSION`
+   (`packages/<dir>/<pkg>/version.py`), and raises `testplatform/required_package_versions.py`
+   only if it can affect GA results (else list the path in `ga_neutral_package_paths.py`).
+   `python tools/check_package_versions.py` checks it.
 5. **Reuse before writing.** Check `core/utils.py` (shared helpers in `ba2_common.core.utils`) for
    an existing helper first. Log through `ba2_trade_platform.logger`, with `exc_info=True` only
    inside `except` blocks.

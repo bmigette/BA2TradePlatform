@@ -350,9 +350,13 @@ def main() -> int:
     worker = get_worker(args.worker)
     if not args.skip_sync:
         from testplatform.version import TEST_APP_VERSION
-        from app.services import worker_client
+        from app.services import worker_client, self_update
         print(f"syncing {worker['name']} to TEST_APP_VERSION {TEST_APP_VERSION} ...", flush=True)
-        if not worker_client.ensure_synced(worker, TEST_APP_VERSION, log=lambda m: print("   ", m)):
+        _policy = self_update.master_sync_policy()  # refuses loudly if minimums are unreadable
+        if not worker_client.ensure_synced(
+                worker, TEST_APP_VERSION, log=lambda m: print("   ", m),
+                required_packages=_policy["required_package_versions"],
+                master_packages=_policy["package_versions"], drift_seen=set()):
             raise SystemExit(f"worker {worker['name']} could not be synced; refusing to run "
                              f"(its results would come from the OLD ceiling)")
         print("   worker is on the master's version", flush=True)

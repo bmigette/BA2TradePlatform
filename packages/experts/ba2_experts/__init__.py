@@ -4,7 +4,7 @@ TradingAgents/TradingAgentsUI (the multi-agent LLM framework) stay in the live
 BA2TradePlatform and are intentionally NOT part of this package, so importing
 ba2_experts never pulls langchain.
 """
-__version__ = "0.1.0"
+from .version import PACKAGE_VERSION as __version__  # noqa: F401  (single source: version.py)
 
 from .FinnHubRating import FinnHubRating
 from .FMPRating import FMPRating

@@ -166,7 +166,8 @@ By using this software, you acknowledge that you understand and accept these ris
   cash-secured put, long and short straddle / strangle, iron condor, jade lizard, call butterfly, put
   ratio spread, call / put backspread, poor man's covered call (open and roll), close option
 - **Entry-option path**: a ruleset can open an option structure with no equity leg
-- **Broker**: Alpaca implements `OptionsAccountInterface`; the Live Trades page has an **Options** tab
+- **Broker**: Alpaca and Interactive Brokers implement `OptionsAccountInterface` (IBKR: no assignment feed, see
+  [docs/IBKR-SETUP.md](docs/IBKR-SETUP.md)); the Live Trades page has an **Options** tab
   with structure detail and a payoff chart
 - **Option risk rails**: `risk_manager_mode: classic_options` gates every option entry with sleeve
   rails (max deployment, notional leverage, undefined-risk cap, max concurrent structures,
@@ -261,7 +262,7 @@ The LLM-backed news, company-overview and social-sentiment providers (`AINewsPro
 |--------|--------|
 | **Alpaca** | Paper and live; equities and options; TP/SL as limit, stop or OCO exit orders. The primary, most exercised broker |
 | **TastyTrade** | Equities: market / limit / stop / stop-limit orders, cancellation, order and position refresh, account snapshot. No TP/SL legs, order modification or options trading |
-| **Interactive Brokers (IBKR)** | Present, but trading is disabled (`submit_order` raises `NotImplementedError` pending a rework) |
+| **Interactive Brokers (IBKR)** | Equities (market / limit / stop / stop-limit, OCO TP/SL exits with in-place price moves, fractional shares, shorts) and options (chains, single-leg and multi-leg combos, positions) through IB Gateway / TWS via `ib_async`. **Built without access to a live IBKR account**: tested only against a behavioural fake, so run [`tools/ibkr_paper_smoke.py`](docs/IBKR-SETUP.md) on a paper account before trusting it. Dividend / cash / NAV history needs an IBKR Flex query; there is no option assignment feed. Setup and limits: [docs/IBKR-SETUP.md](docs/IBKR-SETUP.md) |
 
 New brokers are added by implementing `AccountInterface` and registering the class in
 `ba2_trade_platform/modules/accounts/__init__.py`.
@@ -331,8 +332,9 @@ OpenRouter and NagaAI**, plus AWS credentials and region for **Amazon Bedrock**.
 
 ### Broker keys
 
-Broker credentials are configured **per account** (Settings → Account Settings → add an Alpaca or
-TastyTrade account). The application-level **Alpaca API key** (Global Settings) is used for market
+Broker credentials are configured **per account** (Settings → Account Settings → add an Alpaca,
+TastyTrade or Interactive Brokers account; IBKR needs no key, only a running IB Gateway/TWS: see
+[docs/IBKR-SETUP.md](docs/IBKR-SETUP.md)). The application-level **Alpaca API key** (Global Settings) is used for market
 data and news.
 
 ### Data keys
@@ -525,7 +527,7 @@ BA2TradePlatform/
 │   │   ├── replay_capture.py, seam_wiring.py, utils.py
 │   │   └── rules_export_import.py, MarketAnalysisPDFExport.py
 │   ├── modules/
-│   │   ├── accounts/           # AlpacaAccount, TastyTradeAccount, IBKRAccount + registry
+│   │   ├── accounts/           # AlpacaAccount, TastyTradeAccount, IBKRAccount (+ ibkr_runtime, ibkr_options) + registry
 │   │   ├── experts/            # TradingAgents (live) + shims/registry for ba2_experts
 │   │   └── dataproviders/      # AI providers (live) + shims for ba2_providers
 │   ├── thirdparties/TradingAgents/  # Multi-agent LLM framework
@@ -681,13 +683,16 @@ Add it to the `experts` list in `packages/experts/ba2_experts/__init__.py` (back
 
 ## 🔢 Versioning
 
-Two independent build versions, both `YYYY.MM.NNNNN`:
+Build versions, all `YYYY.MM.NNNNN`:
 
 - `ba2_trade_platform/version.py` → `APP_VERSION` (trade app; shown in the UI sidebar and logged at startup)
 - `testplatform/version.py` → `TEST_APP_VERSION` (test platform; remote GA workers self-update by comparing it)
+- `packages/<dir>/<pkg>/version.py` → `PACKAGE_VERSION` (one per shared package) and
+  `testplatform/required_package_versions.py` → the minimum a worker must run
 
-Bump `APP_VERSION` for changes under `ba2_trade_platform/`, and `TEST_APP_VERSION` for changes under
-`testplatform/` **or `packages/`**, before pushing.
+Bump `APP_VERSION` for changes under `ba2_trade_platform/`, `TEST_APP_VERSION` for changes under
+`testplatform/`, and the package's `PACKAGE_VERSION` for every change under `packages/`; raise the
+required minimum only when the package change can affect GA results (see CLAUDE.md "Versioning").
 
 ## 📝 Logging
 
@@ -755,6 +760,7 @@ Bump `APP_VERSION` for changes under `ba2_trade_platform/`, and `TEST_APP_VERSIO
 
 - [EXPERTS.md](EXPERTS.md) — every expert, its settings and scheduling
 - [docs/](docs/) — design docs, plans (`docs/plans/`, `docs/superpowers/`) and runbooks
+- [docs/IBKR-SETUP.md](docs/IBKR-SETUP.md) — Interactive Brokers setup (IB Gateway paper trading) and the design in [docs/plans/2026-10-03-ibkr-support-design.md](docs/plans/2026-10-03-ibkr-support-design.md)
 - [MIGRATIONS.md](MIGRATIONS.md) — database migrations; [MIGRATION.md](MIGRATION.md) — the move to a monorepo
 - [testplatform/README.md](testplatform/README.md) — the backtest & ML platform
 - [CLAUDE.md](CLAUDE.md) — development conventions (package vs in-tree code, config access, logging, versioning)

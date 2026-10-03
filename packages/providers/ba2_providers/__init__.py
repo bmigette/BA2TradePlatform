@@ -263,3 +263,5 @@ __all__ = [
     # Helper functions
     "get_provider",
 ]
+
+from .version import PACKAGE_VERSION as __version__  # noqa: F401  (single source: version.py)
