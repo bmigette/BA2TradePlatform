@@ -14,16 +14,24 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # ---- month axis (item 1) -----------------------------------------------------------------------
 
-def test_ytd_axis_ends_at_the_next_month_never_an_empty_december():
+def test_axis_includes_a_forecast_payment_in_the_third_calendar_month():
     actual = [f'2026-{m:02d}' for m in range(1, 11)]
     axis = month_axis(actual, ['2026-10', '2026-11', '2026-12'], date(2026, 1, 1), date(2026, 10, 3))
-    assert axis[0] == '2026-01' and axis[-1] == '2026-11' and '2026-12' not in axis
-    assert clip_forecast({'2026-10': 1, '2026-11': 2, '2026-12': 3}, axis) == {'2026-10': 1, '2026-11': 2}
+    assert axis[0] == '2026-01' and axis[-1] == '2026-12'          # payment on 2 Dec: forecast-only column
+    assert clip_forecast({'2026-10': 1, '2026-11': 2, '2026-12': 3}, axis) == {
+        '2026-10': 1, '2026-11': 2, '2026-12': 3}
+
+
+def test_axis_without_a_december_payment_ends_at_november_or_october():
+    actual = [f'2026-{m:02d}' for m in range(1, 11)]
+    assert month_axis(actual, ['2026-10', '2026-11'], date(2026, 1, 1), date(2026, 10, 3))[-1] == '2026-11'
+    assert month_axis(actual, ['2026-10'], date(2026, 1, 1), date(2026, 10, 3))[-1] == '2026-10'
+    assert month_axis(actual, [], date(2026, 1, 1), date(2026, 10, 3))[-1] == '2026-10'
 
 
 def test_3m_axis_starts_at_the_range_month_and_is_contiguous():
     axis = month_axis(['2026-08'], [], date(2026, 7, 3), date(2026, 10, 3))
-    assert axis == ['2026-07', '2026-08', '2026-09', '2026-10', '2026-11']
+    assert axis == ['2026-07', '2026-08', '2026-09', '2026-10']
 
 
 def test_max_axis_starts_at_the_first_month_with_data():
@@ -32,13 +40,14 @@ def test_max_axis_starts_at_the_first_month_with_data():
 
 
 def test_month_boundaries_and_year_rollover():
-    assert month_axis([], [], date(2026, 11, 20), date(2026, 12, 31))[-1] == '2027-01'
-    assert month_axis([], [], date(2026, 1, 1), date(2026, 1, 31)) == ['2026-01', '2026-02']
+    assert month_axis([], [], date(2026, 11, 20), date(2026, 12, 31))[-1] == '2026-12'
+    assert month_axis([], ['2027-01'], date(2026, 11, 20), date(2026, 12, 31))[-1] == '2027-01'
+    assert month_axis([], [], date(2026, 1, 1), date(2026, 1, 31)) == ['2026-01']
     assert shift_month('2026-12', 1) == '2027-01' and shift_month('2026-01', -1) == '2025-12'
 
 
 def test_axis_with_no_data_and_a_late_actual_month():
-    assert month_axis([], [], None, date(2026, 10, 3)) == ['2026-10', '2026-11']
+    assert month_axis([], [], None, date(2026, 10, 3)) == ['2026-10']
     assert month_axis(['2026-12'], [], date(2026, 11, 1), date(2026, 10, 3))[-1] == '2026-12'
 
 
@@ -177,7 +186,7 @@ def test_label_chart_is_stacked_with_the_same_money_and_a_total(nicegui_client, 
     total = next(s for s in opts['series'] if s['name'] == 'Total')
     assert total['data'][:2] == [pytest.approx(sum(by_label['2026-08'].values())),
                                  pytest.approx(sum(by_label['2026-09'].values()))]
-    assert opts['xAxis']['data'] == months and months[-1] == '2026-11'
+    assert opts['xAxis']['data'] == months and months[-1] == '2026-10'
     assert ':formatter' in opts['tooltip']
     assert opts['legend']['bottom'] == 0 and opts['legend']['type'] == 'scroll'
 

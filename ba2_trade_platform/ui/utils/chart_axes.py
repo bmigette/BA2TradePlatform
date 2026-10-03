@@ -1,7 +1,7 @@
 """Pure axis / series decisions for the Account Growth charts (no NiceGUI, no DB).
 
 * ``month_axis``: ONE helper for the monthly bar charts' x axis -- contiguous months from the
-  range start to the current month plus the next one (never an empty December).
+  range start to the last month with an actual or forecast value (never an empty trailing month).
 * ``tick_plan`` / ``date_axis``: readable date axes for the daily line charts -- week ticks
   for a short span, month ticks for a year, quarter / year ticks beyond -- horizontal labels,
   tooltips stay daily.
@@ -12,9 +12,6 @@
 import json
 from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
-
-#: Month-chart forecast horizon shown: the current month and the next one.
-FORECAST_MONTHS_AHEAD = 1
 
 #: Dividends / Invested lines are drawn for at most this many selected labels (readability).
 MAX_DETAIL_LABELS = 6
@@ -42,17 +39,16 @@ def month_axis(actual_months: Iterable[str], forecast_months: Iterable[str],
     """Contiguous ``YYYY-MM`` keys for the monthly bar charts.
 
     Start: the range start's month, or (no range start = Max) the first month with data.
-    End: the current month plus ``FORECAST_MONTHS_AHEAD`` -- today's Oct + Nov, never an empty
-    Dec -- or the last actual month if that is later. Months in between with no data stay on
-    the axis (a gap is information).
+    End: the LATEST of the current month, the last month holding a forecast payment (the
+    forecast already covers only today .. today + 2 months, so a payment on 2 Dec shows a
+    forecast-only December column) and the last actual month. Never a trailing month with
+    nothing in it; months in between with no data stay on the axis (a gap is information).
     """
     actual = sorted({m for m in actual_months})
     fc = sorted({m for m in forecast_months})
     if isinstance(today, datetime):
         today = today.date()
-    end = shift_month(month_key(today), FORECAST_MONTHS_AHEAD)
-    if actual:
-        end = max(end, actual[-1])
+    end = max([month_key(today)] + fc + actual)
     if range_start is not None:
         start = month_key(range_start)
     else:
