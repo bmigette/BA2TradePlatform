@@ -1164,8 +1164,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         f"{new_order_count} new unique orders (total unique: {len(all_orders_dict)})"
                     )
 
-                    # If we got fewer than limit, we've reached the end
-                    if len(alpaca_orders) < limit:
+                    # Alpaca's ``limit`` counts nested legs too (nested=True), so a full page
+                    # of 500 rows can arrive as <500 top-level orders. Compare the TOTAL
+                    # (orders + legs) against the limit, otherwise pagination stops early and
+                    # silently drops all older history.
+                    def _row_count(orders):
+                        return sum(1 + _row_count(getattr(o, 'legs', None) or []) for o in orders)
+
+                    if _row_count(alpaca_orders) < limit:
                         logger.debug(f"Received fewer than {limit} orders, pagination complete")
                         break
 
@@ -1174,12 +1180,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         logger.debug(f"No new unique orders in this batch, pagination complete")
                         break
 
-                    # Set until_date to oldest order's date - 1 day for next iteration
+                    # Set until_date to the oldest order's timestamp for the next iteration.
                     # The 'until' parameter means "fetch orders created BEFORE this date"
-                    # So we go backwards in time to get older orders
+                    # So we go backwards in time to get older orders. Orders are deduplicated
+                    # by id, so no day margin is needed (a -1 day margin skipped every order
+                    # created in the day before the page boundary).
                     if oldest_order_date:
-                        # Subtract 1 day to fetch older orders in next iteration
-                        until_date = oldest_order_date - timedelta(days=1)
+                        until_date = oldest_order_date
                         logger.debug(f"Next pagination until date (going backwards): {until_date}")
                     else:
                         # No date found, can't continue pagination
@@ -6111,7 +6118,24 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         try:
             raw_orders = self._fetch_raw_alpaca_orders(status=OrderStatus.CLOSED, fetch_all=True)
             trades = []
-            for order in raw_orders:
+            seen_ids = set()
+
+            def _walk(orders):
+                # Orders are fetched with nested=True, so a bracket/OCO exit leg
+                # (stop-loss / take-profit) is returned only inside its parent's
+                # ``legs``. Walk them recursively so filled legs are not lost.
+                for o in orders or []:
+                    yield o
+                    yield from _walk(getattr(o, 'legs', None))
+
+            for order in _walk(raw_orders):
+                order_id = getattr(order, 'id', None)
+                if order_id is not None:
+                    key = str(order_id)
+                    if key in seen_ids:
+                        continue
+                    seen_ids.add(key)
+
                 filled_qty = float(getattr(order, 'filled_qty', 0) or 0)
                 if filled_qty <= 0:
                     continue
