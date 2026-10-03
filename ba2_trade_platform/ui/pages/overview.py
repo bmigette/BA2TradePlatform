@@ -24,7 +24,14 @@ from ..utils.perf_logger import PerfLogger
 from ..utils.protective_stop import resolve_protective_legs
 from ..utils.growth_label_storage import (
     GROWTH_LABELS_STORAGE_KEY, MONTHLY_PROFIT_LABELS_STORAGE_KEY,
-    read_growth_labels, resolve_growth_labels, write_growth_labels,
+    resolve_growth_labels,
+)
+from ..utils.overview_label_scope import (
+    CHART_GROWTH, CHART_MONTHLY, CHART_POSITION_LABEL, CHART_POSITION_SYMBOL,
+    apply_scope, chart_key, follow_pf_key, pick_single,
+    read_overview_setting, read_stored_list, resolve_chart_selection, resolve_scope,
+    scope_key, select_all, select_none, single_key, union_scopes,
+    write_overview_setting,
 )
 from ..components import ProfitPerExpertChart, InstrumentDistributionChart, BalanceUsagePerExpertChart
 from ..components.FloatingPLPerExpertWidget import FloatingPLPerExpertWidget
@@ -5217,7 +5224,176 @@ class AccountGrowthTab:
     """Account Growth tab showing balance history and dividend income charts."""
 
     def __init__(self):
+        # Page-level label scope (None = unrestricted) and the accounts in view; set by
+        # _load_growth_data before any chart renders. See ui/utils/overview_label_scope.py.
+        self._scope = None
+        self._account_ids = []
+        self._single_account = None
         self.render()
+
+    # ------------------------------------------------------------------
+    # label scope + persisted chart selections (DB, per account)
+    # ------------------------------------------------------------------
+
+    def _stored_selection(self, chart, legacy_key, options):
+        """A multi-select chart's initial value: each account in view's saved choice,
+        resolved against ``options`` and unioned (All accounts). With one account, a
+        missing DB value falls back ONCE to the legacy per-browser value."""
+        legacy = legacy_key if self._single_account is not None else None
+        stored = [read_stored_list(chart_key(chart, aid), legacy) for aid in self._account_ids]
+        return resolve_chart_selection(stored, options)
+
+    def _stored_singles(self, chart):
+        return [read_overview_setting(single_key(chart, aid)) for aid in self._account_ids]
+
+    def _persist_selection(self, chart, visible):
+        # Only with ONE account selected: with "All accounts" a change has no single
+        # owner, so it stays session-only (the union is what is shown on reload).
+        if self._single_account is not None:
+            write_overview_setting(chart_key(chart, self._single_account), list(visible))
+
+    def _persist_single(self, chart, value):
+        if self._single_account is not None:
+            write_overview_setting(single_key(chart, self._single_account), value)
+
+    def _scope_symbol_info(self, symbol_info):
+        """Drop out-of-scope labels from each symbol (and symbols left with none)."""
+        if self._scope is None:
+            return symbol_info
+        out = {}
+        for sym, info in symbol_info.items():
+            kept = apply_scope(info['labels'], self._scope)
+            if kept:
+                out[sym] = dict(info, labels=kept)
+        return out
+
+    @staticmethod
+    def _multi_select_with_all_none(options, value, label, width):
+        """A multi-select with Select all / Select none buttons beside it."""
+        with ui.row().classes('items-center gap-1 mb-2'):
+            select = ui.select(options=list(options), value=list(value), label=label,
+                               multiple=True).classes(width)
+            ui.button('All', on_click=lambda: setattr(select, 'value', select_all(options))
+                      ).props('flat dense size=sm').tooltip('Select all')
+            ui.button('None', on_click=lambda: setattr(select, 'value', select_none())
+                      ).props('flat dense size=sm').tooltip('Select none')
+        return select
+
+    def _compute_scope_inputs(self, target_accounts, filled_trades, dividends, positions_by_account):
+        """Per account: traded labels (reusing get_labels_by_symbol, the derivation the label
+        charts use; an unlabeled symbol counts as 'Unlabeled' like the charts), managed
+        labels, stored scope, follow flag. DB only -- safe in a worker thread."""
+        from ...core.portfolio_allocation_store import get_managed_labels
+        state = {}
+        for acc_def, _inst in target_accounts:
+            aid = acc_def.id
+            symbols = set(positions_by_account.get(aid, ()))
+            symbols.update(t.get('symbol') for t in filled_trades if t.get('account_id') == aid)
+            symbols.update(d.get('symbol') for d in dividends if d.get('account_id') == aid)
+            symbols = sorted(s for s in symbols if s)
+            by_sym = get_labels_by_symbol(symbols) if symbols else {}
+            traded = set()
+            for sym in symbols:
+                traded.update(by_sym.get(normalize_symbol(sym)) or ['Unlabeled'])
+            try:
+                managed = [r.label for r in get_managed_labels(aid)]
+            except Exception as e:  # noqa: BLE001 -- an account without a pf manager
+                logger.warning(f"Overview scope: managed labels unavailable for {aid}: {e}")
+                managed = []
+            stored = read_overview_setting(scope_key(aid))
+            state[aid] = {
+                'name': acc_def.name,
+                'traded': sorted(traded),
+                'managed': managed,
+                'stored': [str(x) for x in stored] if isinstance(stored, list) else None,
+                'follow': read_overview_setting(follow_pf_key(aid)) is True,
+            }
+        return state
+
+    @staticmethod
+    def _effective_scope(state):
+        return union_scopes(
+            resolve_scope(st['stored'], st['traded'], st['follow'], st['managed'])
+            for st in state.values())
+
+    def _render_scope_controls(self, holder, state, on_change):
+        """The page-level "labels in scope" setting (expandable row above the charts)."""
+        from ...core.utils import get_all_instrument_labels
+        try:
+            every = list(get_all_instrument_labels())
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Overview scope: could not list instrument labels: {e}")
+            every = []
+        options = sorted(set(every) | {'Unlabeled'}
+                         | {l for st in state.values() for l in st['traded'] + st['managed']}
+                         | set(self._scope or []))
+        single = self._single_account
+        with holder:
+            with ui.expansion('Label scope', icon='filter_alt').classes('w-full mb-2').props('dense') as exp:
+                pass
+            with exp:
+                ui.label('Labels the whole page considers. Every label chart (and its dropdown) '
+                         'is limited to these. Default: the labels of every symbol this account '
+                         'has traded.').classes('text-xs text-gray-500')
+                if single is None:
+                    ui.label('All accounts: showing the union of every account scope. '
+                             'Select a single account to edit it.').classes('text-xs text-gray-500')
+                    ui.label(', '.join(self._scope or []) or '(none)').classes('text-sm')
+                    return
+                st = state[single]
+                with ui.row().classes('items-center gap-2'):
+                    select = ui.select(options=options, value=list(self._scope or []),
+                                       label='Labels in scope', multiple=True).classes('w-96')
+                    all_btn = ui.button('All', on_click=lambda: setattr(select, 'value', select_all(options))
+                                        ).props('flat dense size=sm')
+                    none_btn = ui.button('None', on_click=lambda: setattr(select, 'value', select_none())
+                                         ).props('flat dense size=sm')
+                    follow = ui.switch('Follow portfolio manager labels', value=st['follow']).tooltip(
+                        'On: the scope is the account managed labels from the portfolio manager '
+                        'and follows them as they change (re-read on every page load). Turning it on '
+                        'also copies them into the selection once, so turning it off keeps them. '
+                        'Off: the selection stays as you leave it.')
+
+                def lock(on):
+                    for w in (select, all_btn, none_btn):
+                        w.set_enabled(not on)
+                lock(st['follow'])
+                guard = {'busy': False}
+
+                def on_select(e):
+                    if guard['busy'] or st['follow']:
+                        return
+                    st['stored'] = sorted(select_all(e.value or []))
+                    write_overview_setting(scope_key(single), st['stored'])
+                    on_change()
+
+                def on_follow(e):
+                    if guard['busy']:
+                        return
+                    if e.value:
+                        if not st['managed']:
+                            ui.notify('This account has no managed labels in the portfolio manager; '
+                                      'the label scope is unchanged.', type='warning')
+                            guard['busy'] = True
+                            follow.value = False
+                            guard['busy'] = False
+                            return
+                        st['follow'] = True
+                        st['stored'] = sorted(select_all(st['managed']))
+                        write_overview_setting(scope_key(single), st['stored'])
+                        write_overview_setting(follow_pf_key(single), True)
+                        guard['busy'] = True
+                        select.value = list(st['stored'])
+                        guard['busy'] = False
+                        lock(True)
+                    else:
+                        st['follow'] = False
+                        write_overview_setting(follow_pf_key(single), False)
+                        lock(False)
+                    on_change()
+
+                select.on_value_change(on_select)
+                follow.on_value_change(on_follow)
 
     def render(self):
         logger.debug("[RENDER] AccountGrowthTab.render() - START")
@@ -5256,6 +5432,9 @@ class AccountGrowthTab:
             if not target_accounts:
                 loading_label.set_text('No accounts available for growth data.')
                 return
+
+            self._account_ids = [a.id for a, _ in target_accounts]
+            self._single_account = selected_account_id if selected_account_id is not None else None
 
             # Collect balance history, dividend data, and filled trades from all target accounts
             all_balance_history = []
@@ -5297,10 +5476,12 @@ class AccountGrowthTab:
             # Pre-fetch positions from all accounts in thread pool
             all_positions = []
             account_map = {}  # symbol -> account instance
+            positions_by_account = {}  # account id -> symbols held (label-scope default)
             for acc_def, account_instance in target_accounts:
                 try:
                     positions = await asyncio.to_thread(account_instance.get_positions)
                     for pos in positions:
+                        positions_by_account.setdefault(acc_def.id, set()).add(pos.symbol)
                         all_positions.append(pos)
                         account_map[pos.symbol] = account_instance
                 except Exception as e:
@@ -5337,15 +5518,38 @@ class AccountGrowthTab:
                 monthly_global, monthly_label = {}, {}
 
             try:
+                scope_state = await asyncio.to_thread(
+                    self._compute_scope_inputs, target_accounts, all_filled_trades,
+                    all_dividends, positions_by_account)
+            except Exception as e:
+                logger.warning(f"Could not compute the label scope inputs: {e}")
+                scope_state = {}
+            self._scope = self._effective_scope(scope_state) if scope_state else None
+
+            try:
                 with charts_container:
-                    # New monthly histograms at the top
-                    self._render_monthly_realized_income_chart(months, monthly_income, monthly_global)
-                    self._render_monthly_profit_by_label_chart(months, monthly_by_label, income_labels, monthly_label)
-                    self._render_total_growth_chart(all_balance_history, all_dividends, all_filled_trades)
-                    self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
-                    self._render_growth_by_position_in_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
-                    self._render_per_position_section(all_positions, account_map, all_filled_trades, all_dividends)
-                    self._render_dividend_history_table(all_dividends)
+                    scope_holder = ui.column().classes('w-full')
+                    chart_holder = ui.column().classes('w-full')
+
+                def draw_charts():
+                    chart_holder.clear()
+                    with chart_holder:
+                        # New monthly histograms at the top
+                        self._render_monthly_realized_income_chart(months, monthly_income, monthly_global)
+                        self._render_monthly_profit_by_label_chart(months, monthly_by_label, income_labels, monthly_label)
+                        self._render_total_growth_chart(all_balance_history, all_dividends, all_filled_trades)
+                        self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
+                        self._render_growth_by_position_in_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
+                        self._render_per_position_section(all_positions, account_map, all_filled_trades, all_dividends)
+                        self._render_dividend_history_table(all_dividends)
+
+                def on_scope_change():
+                    self._scope = self._effective_scope(scope_state)
+                    draw_charts()
+
+                if scope_state:
+                    self._render_scope_controls(scope_holder, scope_state, on_scope_change)
+                draw_charts()
             except RuntimeError:
                 return
 
@@ -5592,8 +5796,11 @@ class AccountGrowthTab:
                     mode = ui.toggle(['$', '%'], value='$').props('dense')
                     fullscreen_button(lambda: build(),
                                       title='Monthly Closed Profit + Dividends by Label')
+            labels = apply_scope(labels, self._scope)
             if not months or not labels:
-                ui.label('No closed trades yet.').classes('text-sm text-gray-500')
+                ui.label('No closed trades yet.' if not months
+                         else 'No labels in scope (see the label scope setting above).'
+                         ).classes('text-sm text-gray-500')
                 return
 
             monthly_label = monthly_label or {}
@@ -5630,18 +5837,18 @@ class AccountGrowthTab:
                     'series': series,
                 }
 
-            # The selection persists in app.storage.user (session, not the DB) and is
-            # intersected with the labels that still exist, so a deleted label cannot
-            # break the chart. See ui/utils/growth_label_storage.py.
-            default_labels = resolve_growth_labels(
-                read_growth_labels(MONTHLY_PROFIT_LABELS_STORAGE_KEY), list(labels))
-            label_select = ui.select(options=list(labels), value=default_labels, multiple=True,
-                                     label='Labels shown').classes('w-72 mb-2')
+            # The selection persists in the DB per account (ui/utils/overview_label_scope.py)
+            # and is intersected with the labels in scope that still exist, so a deleted
+            # label cannot break the chart.
+            default_labels = self._stored_selection(
+                CHART_MONTHLY, MONTHLY_PROFIT_LABELS_STORAGE_KEY, list(labels))
+            label_select = self._multi_select_with_all_none(
+                list(labels), default_labels, 'Labels shown', 'w-72')
             chart_container = ui.column().classes('w-full')
 
             def rebuild():
                 visible = list(label_select.value) if label_select.value else []
-                write_growth_labels(visible, MONTHLY_PROFIT_LABELS_STORAGE_KEY)
+                self._persist_selection(CHART_MONTHLY, visible)
                 chart_container.clear()
                 with chart_container:
                     ui.echart(build_options(visible, mode.value == '%')).classes('w-full').style('height: 320px')
@@ -5988,6 +6195,7 @@ class AccountGrowthTab:
             symbol_info[pos.symbol]['qty'] += pos.qty
             symbol_info[pos.symbol]['cost_basis'] += pos.cost_basis
 
+        symbol_info = self._scope_symbol_info(symbol_info)
         if not symbol_info:
             return
 
@@ -6286,17 +6494,15 @@ class AccountGrowthTab:
                     'series': series,
                 }
 
-            # The selection persists in app.storage.user (session, not the DB) and is
-            # intersected with the labels that still exist, so a deleted label cannot
-            # break the chart. See ui/utils/growth_label_storage.py.
-            default_labels = resolve_growth_labels(
-                read_growth_labels(GROWTH_LABELS_STORAGE_KEY), list(all_labels))
+            # The selection persists in the DB per account (ui/utils/overview_label_scope.py)
+            # and is intersected with the labels in scope that still exist.
+            default_labels = self._stored_selection(
+                CHART_GROWTH, GROWTH_LABELS_STORAGE_KEY, list(all_labels))
 
             # Controls: visible labels + per-category show/hide toggles
             with ui.row().classes('w-full gap-4 items-center mb-2'):
-                label_select = ui.select(
-                    options=all_labels, value=default_labels, label='Visible Labels', multiple=True,
-                ).classes('w-64')
+                label_select = self._multi_select_with_all_none(
+                    all_labels, default_labels, 'Visible Labels', 'w-64')
                 show_total_cb = ui.checkbox('Total', value=True)
                 show_div_cb = ui.checkbox('Dividends', value=True)
                 show_inv_cb = ui.checkbox('Invested', value=True)
@@ -6305,7 +6511,7 @@ class AccountGrowthTab:
 
             def rebuild_label_chart():
                 visible = sorted(list(label_select.value)) if label_select.value else []
-                write_growth_labels(visible, GROWTH_LABELS_STORAGE_KEY)
+                self._persist_selection(CHART_GROWTH, visible)
                 chart_container.clear()
                 with chart_container:
                     ui.echart(build_chart_options(
@@ -6342,6 +6548,7 @@ class AccountGrowthTab:
             symbol_info[pos.symbol]['qty'] += pos.qty
             symbol_info[pos.symbol]['cost_basis'] += pos.cost_basis
 
+        symbol_info = self._scope_symbol_info(symbol_info)
         if not symbol_info:
             return
 
@@ -6628,6 +6835,8 @@ class AccountGrowthTab:
                 }
 
             default_label = next((l for l in all_labels if l != 'auto_added'), all_labels[0])
+            default_label = pick_single(
+                self._stored_singles(CHART_POSITION_LABEL), all_labels, default_label)
 
             label_select = ui.select(
                 options=all_labels,
@@ -6642,6 +6851,7 @@ class AccountGrowthTab:
             def on_position_label_change(e):
                 if not e.value:
                     return
+                self._persist_single(CHART_POSITION_LABEL, e.value)
                 position_chart_container.clear()
                 with position_chart_container:
                     ui.echart(build_position_chart_options(e.value)).classes('w-full h-80')
@@ -6808,7 +7018,8 @@ class AccountGrowthTab:
                                   title='Per-Position Growth')
             symbol_select = ui.select(
                 options=symbol_options,
-                value=symbol_options[0] if symbol_options else None,
+                value=pick_single(self._stored_singles(CHART_POSITION_SYMBOL), symbol_options,
+                                  symbol_options[0] if symbol_options else None),
                 label='Select Symbol'
             ).classes('w-64 mb-2')
             chart_container = ui.column().classes('w-full')
@@ -6860,6 +7071,7 @@ class AccountGrowthTab:
                 latest_options['value'] = None
                 if not e.value:
                     return
+                self._persist_single(CHART_POSITION_SYMBOL, e.value)
                 selected_symbol = e.value
                 account_inst = account_map.get(selected_symbol)
                 if not account_inst:
@@ -6871,7 +7083,7 @@ class AccountGrowthTab:
             symbol_select.on_value_change(on_symbol_change)
 
             if symbol_options:
-                initial_symbol = symbol_options[0]
+                initial_symbol = symbol_select.value or symbol_options[0]
                 account_inst = account_map.get(initial_symbol)
                 if account_inst:
                     asyncio.create_task(_load_position_chart(chart_container, account_inst, initial_symbol))
