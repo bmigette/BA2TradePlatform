@@ -5201,6 +5201,10 @@ def _build_qty_timeline(current_qty, filled_trades, all_dates, dividends=None):
 
 
 
+#: balance_floor before anything has been requested (None means the default window).
+_UNFETCHED = object()
+
+
 def _save_setting(key, value) -> bool:
     """``write_overview_setting`` that SAYS so when it fails: a view preference that does not
     persist must not look like one that does."""
@@ -5283,6 +5287,7 @@ class AccountGrowthTab:
         re-filters and redraws. A new page load (or a different account selection)
         builds a fresh tab / key, which is the only invalidation there is."""
         self._broker_cache = {}
+        self._load_lock = asyncio.Lock()    # one load at a time: no overlapping fetches
         self._earliest = None            # first balance / trade / dividend date
         self._raw_range_start = None
         self._balance_first = None
@@ -5391,12 +5396,22 @@ class AccountGrowthTab:
             trades = trades_by.get((aid, sym), [])
             dates = sorted({_ds(r['date']) for r in rows} | {_ds(t['date']) for t in trades})
             qty_by_date, _ = _build_qty_timeline(qty, trades, dates, dividends=rows)
-            per_date = defaultdict(float)
+            # The timeline is END of day; the payment is made on the shares held BEFORE that
+            # day's own trades and DRIP, so those are taken back out (a sale of 90 on the
+            # payment date still earned the dividend on the 90).
+            day_trades = defaultdict(float)
+            for t in trades:
+                delta = float(t.get('qty') or 0)
+                day_trades[_ds(t['date'])] += delta if t.get('side') == 'BUY' else -delta
+            amount_on, drip_on = defaultdict(float), defaultdict(float)
             for r in rows:
-                ds = _ds(r['date'])
-                q = qty_by_date.get(ds, 0) - float(r.get('drip_quantity') or 0)
+                amount_on[_ds(r['date'])] += float(r.get('amount') or 0)
+                drip_on[_ds(r['date'])] += float(r.get('drip_quantity') or 0)
+            per_date = {}
+            for ds, amount in amount_on.items():
+                q = qty_by_date.get(ds, 0) - day_trades.get(ds, 0.0) - drip_on[ds]
                 if q > 0:
-                    per_date[ds] += float(r.get('amount') or 0) / q
+                    per_date[ds] = amount / q
             history = [(date.fromisoformat(ds), v) for ds, v in per_date.items()]
             for ev in forecast_dividends(history, qty, today, months=2):
                 events.append((sym, ev))
@@ -5550,6 +5565,9 @@ class AccountGrowthTab:
                     'Applies to every chart on this page. Cumulative lines (dividends, '
                     'invested, P&L %) are rebased to start at the range start; the monthly '
                     'bars show the months in range plus the next 2 months of dividend forecast.')
+                refresh_btn = ui.button(icon='refresh').props('flat round dense').tooltip(
+                    'Reload broker data (trades, dividends, balances, prices). Charts otherwise '
+                    'reuse what was fetched when this page opened.')
 
             # Loading state
             loading_label = ui.label('Loading account growth data...').classes('text-sm text-gray-500')
@@ -5567,13 +5585,36 @@ class AccountGrowthTab:
                     reloading = ui.label('Reloading for the new range...').classes('text-sm text-gray-500')
                 asyncio.create_task(self._load_growth_data(reloading, charts_container, selected_account_id))
 
+            def on_refresh():
+                self._init_data_cache()
+                self._set_range(self._range)
+                charts_container.clear()
+                with charts_container:
+                    reloading = ui.label('Reloading broker data...').classes('text-sm text-gray-500')
+                asyncio.create_task(self._load_growth_data(reloading, charts_container, selected_account_id))
+
+            refresh_btn.on_click(on_refresh)
             range_toggle.on_value_change(on_range_change)
             asyncio.create_task(self._load_growth_data(loading_label, charts_container, selected_account_id))
 
     async def _load_growth_data(self, loading_label, charts_container, selected_account_id):
-        """Load all growth data asynchronously."""
+        """Load all growth data asynchronously.
+
+        Loads are SERIALISED (``_load_lock``) and numbered (``_gen``): a load that a newer
+        click has overtaken returns before fetching anything it has not already started,
+        and a stale load never writes range-dependent state (the effective start, scope,
+        forecast, the first-balance date) or draws. It may still store the broker data it
+        fetched -- that is range-independent and saves the next load a second request.
+        """
         self._gen += 1
         gen = self._gen
+        async with self._load_lock:
+            if gen != self._gen:
+                return      # overtaken while waiting for the lock; the newer click owns the page
+            await self._load_growth_data_locked(loading_label, charts_container,
+                                                selected_account_id, gen)
+
+    async def _load_growth_data_locked(self, loading_label, charts_container, selected_account_id, gen):
         try:
             accounts = get_all_instances(AccountDefinition)
             if not accounts:
@@ -5640,24 +5681,33 @@ class AccountGrowthTab:
                         logger.warning(f"Could not load positions for {acc_def.name}: {e}")
                 cache.update(dividends=dividends_all, trades=trades_all, positions=positions_all,
                              account_map=account_map_c, positions_by_account=positions_by_acc,
-                             qty_by_account_symbol=qty_by_acc, balance=[], balance_floor='default')
+                             qty_by_account_symbol=qty_by_acc, balance=[], balance_floor=_UNFETCHED)
                 dates = [_to_date(x.get('date')) for x in dividends_all + trades_all]
                 dates = [d for d in dates if d]
-                self._activity_first = min(dates) if dates else None
+                cache['activity_first'] = min(dates) if dates else None
+            if gen != self._gen:
+                return      # stale: the raw data is cached above, nothing range-dependent is touched
+            self._activity_first = cache['activity_first']
 
             # Balance history: the default window (Alpaca 1A, TastyTrade 365 days) unless the
             # range needs more; then ask for it ONCE, from the range start (3y) or the first
             # trade / dividend (Max). Both brokers accept start_date.
             req = self._balance_request_start()
             floor = cache['balance_floor']
-            if floor == 'default' or (req is not None and floor is not None and req < floor):
+            # floor: _UNFETCHED (nothing yet) | None (the broker's default ~1y window) | a date
+            # (explicitly requested from there). Refetch when nothing was fetched, or when the
+            # range needs an earlier start than what was requested -- including from the
+            # default window. A broker that returns less than asked is NOT asked again: the
+            # floor records what was REQUESTED.
+            if floor is _UNFETCHED or (req is not None and (floor is None or req < floor)):
                 balance = []
                 for acc_def, account_instance in target_accounts:
                     try:
                         if req is not None:
                             bh = await asyncio.to_thread(
                                 account_instance.get_balance_history,
-                                start_date=datetime.combine(req, datetime.min.time()))
+                                start_date=datetime.combine(req, datetime.min.time()),
+                                end_date=datetime.now())
                         else:
                             bh = await asyncio.to_thread(account_instance.get_balance_history)
                         for entry in bh:
@@ -5670,7 +5720,10 @@ class AccountGrowthTab:
                 cache['balance_floor'] = req
                 bdates = [_to_date(x.get('date')) for x in balance]
                 bdates = [d for d in bdates if d]
-                self._balance_first = min(bdates) if bdates else None
+                cache['balance_first'] = min(bdates) if bdates else None
+            if gen != self._gen:
+                return
+            self._balance_first = cache['balance_first']
             all_balance_history = cache['balance']
             all_dividends = cache['dividends']
             all_filled_trades = cache['trades']
@@ -5694,6 +5747,8 @@ class AccountGrowthTab:
             # needed (or new symbols appeared); a shorter range is just filtered.
             position_symbols = sorted(set(pos.symbol for pos in all_positions))
             historical_prices = await self._ensure_prices(position_symbols)
+            if gen != self._gen:
+                return
 
             # Monthly realized income (closed-trade P&L + cash dividends), incl. per-label
             try:
@@ -5716,18 +5771,18 @@ class AccountGrowthTab:
             except Exception as e:
                 logger.warning(f"Could not compute the label scope inputs: {e}")
                 scope_state = {}
-            self._scope = self._effective_scope(scope_state) if scope_state else None
-
             try:
-                self._forecast = await asyncio.to_thread(
+                forecast = await asyncio.to_thread(
                     self._compute_dividend_forecast, all_dividends, all_filled_trades,
                     qty_by_account_symbol)
             except Exception as e:
                 logger.warning(f"Could not compute the dividend forecast: {e}")
-                self._forecast = {}
+                forecast = {}
 
             if gen != self._gen:
                 return  # a newer load (range changed meanwhile) owns the container
+            self._scope = self._effective_scope(scope_state) if scope_state else None
+            self._forecast = forecast
 
             try:
                 with charts_container:
@@ -5792,6 +5847,7 @@ class AccountGrowthTab:
                 and self._PRICE_RANKS.index(held['period']) >= self._PRICE_RANKS.index(need)):
             return held['data']
         data = {}
+        ok = True
         if symbols:
             try:
                 import yfinance as yf
@@ -5801,9 +5857,14 @@ class AccountGrowthTab:
                     prices = _extract_yf_close_prices(hist, sym)
                     if prices:
                         data[sym] = prices
+                ok = bool(data)
             except Exception as e:
                 logger.warning(f"Could not fetch historical prices: {e}")
-        cache['prices'] = {'period': need, 'symbols': set(symbols), 'data': data}
+                ok = False
+        if ok:
+            # Only a download that returned something is remembered: a failed one is retried
+            # on the next load instead of freezing empty charts until the page is reopened.
+            cache['prices'] = {'period': need, 'symbols': set(symbols), 'data': data}
         return data
 
     def _cached_symbol_prices(self, symbol):

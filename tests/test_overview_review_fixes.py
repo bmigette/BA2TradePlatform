@@ -123,8 +123,8 @@ def test_pick_single_ignores_unhashable_and_non_string_stored_values():
 
 def test_ytd_is_never_blank_on_the_first_days_of_january():
     assert resolve_range_start('YTD', date(2026, 1, 1)) < date(2026, 1, 1)
-    assert resolve_range_start('YTD', date(2026, 1, 3)) < date(2026, 1, 1)
-    assert resolve_range_start('YTD', date(2026, 1, 4)) == date(2026, 1, 1)
+    assert resolve_range_start('YTD', date(2026, 1, 7)) < date(2026, 1, 1)
+    assert resolve_range_start('YTD', date(2026, 1, 8)) == date(2026, 1, 1)
     assert resolve_range_start('YTD', date(2026, 6, 1)) == date(2026, 1, 1)
 
 

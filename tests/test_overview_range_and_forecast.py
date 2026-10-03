@@ -19,7 +19,7 @@ def test_options_and_default():
 
 
 def test_ytd_boundary_is_jan_first():
-    assert resolve_range_start('YTD', date(2026, 1, 4)) == date(2026, 1, 1)
+    assert resolve_range_start('YTD', date(2026, 1, 8)) == date(2026, 1, 1)
     assert resolve_range_start('YTD', date(2026, 12, 31)) == date(2026, 1, 1)
 
 

@@ -33,7 +33,7 @@ def resolve_range_start(range_key: str, today: date) -> Optional[date]:
 
     ``3m``/``6m``/``1y``/``3y`` are calendar offsets back from ``today`` (month-end
     clamped); ``YTD`` is 1 January of today's year (1 December of the previous year on
-    1-3 January, when the year has fewer than two data points). An unknown key raises -- a typo
+    1-7 January, when the year has fewer than two completed trading days). An unknown key raises -- a typo
     must not silently become "everything".
     """
     if isinstance(today, datetime):
@@ -41,10 +41,12 @@ def resolve_range_start(range_key: str, today: date) -> Optional[date]:
     if range_key == 'Max':
         return None
     if range_key == 'YTD':
-        # On 1-3 January the year has at most one trading day, so a Jan-1 start would
-        # leave every chart blank or a single point. The start then reaches back to
-        # 1 December of the previous year; from 4 January on it is plain 1 January.
-        if today.month == 1 and today.day <= 3:
+        # In the first week of January the year has fewer than two COMPLETED trading days
+        # (1 Jan is a holiday; 2026-01-04/05 have one, 2027-01-04 none), so a Jan-1 start
+        # would leave every chart blank or a single point. Through 7 January the start
+        # therefore reaches back to 1 December of the previous year; from 8 January on it
+        # is plain 1 January.
+        if today.month == 1 and today.day <= 7:
             return date(today.year - 1, 12, 1)
         return date(today.year, 1, 1)
     offsets = {'3m': 3, '6m': 6, '1y': 12, '3y': 36}
