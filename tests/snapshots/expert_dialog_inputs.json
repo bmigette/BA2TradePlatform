@@ -1,0 +1,1810 @@
+{
+ "add": {
+  "bound_widget_attributes": [
+   "_save_button",
+   "account_select",
+   "alias_input",
+   "allow_automated_trade_modification_checkbox",
+   "allow_automated_trade_opening_checkbox",
+   "allow_fractional_shares_checkbox",
+   "atr_multiplier_input",
+   "atr_period_input",
+   "description_label",
+   "dialog",
+   "enable_buy_checkbox",
+   "enable_sell_checkbox",
+   "enabled_checkbox",
+   "enter_market_frequency",
+   "enter_market_local_hint",
+   "enter_market_monthly_container",
+   "enter_market_ordinal_select",
+   "enter_market_ruleset_select",
+   "enter_market_time_basis",
+   "enter_market_times_container",
+   "enter_market_weekday_select",
+   "enter_market_weekly_container",
+   "execution_schedule_section",
+   "expert_select",
+   "expert_settings_container",
+   "instrument_selection_method_select",
+   "instruments_content_container",
+   "market_condition_profile_select",
+   "max_virtual_equity_per_instrument_input",
+   "min_available_balance_pct_input",
+   "min_stop_loss_pct_input",
+   "open_positions_frequency",
+   "open_positions_local_hint",
+   "open_positions_monthly_container",
+   "open_positions_ordinal_select",
+   "open_positions_ruleset_select",
+   "open_positions_schedule_expansion",
+   "open_positions_time_basis",
+   "open_positions_times_container",
+   "open_positions_weekday_select",
+   "open_positions_weekly_container",
+   "priority_input",
+   "risk_atr_settings_container",
+   "risk_manager_mode_select",
+   "risk_manager_section",
+   "risk_per_trade_pct_input",
+   "sizing_mode_select",
+   "smart_risk_manager_analysis_window_hours_input",
+   "smart_risk_manager_max_iterations_input",
+   "smart_risk_manager_user_instructions_input",
+   "user_description_textarea",
+   "virtual_equity_input"
+  ],
+  "constructed": [
+   [
+    "tab",
+    [
+     "General Settings"
+    ],
+    {
+     "icon": "schedule"
+    }
+   ],
+   [
+    "tab",
+    [
+     "Instruments"
+    ],
+    {
+     "icon": "trending_up"
+    }
+   ],
+   [
+    "tab",
+    [
+     "Expert Settings"
+    ],
+    {
+     "icon": "settings"
+    }
+   ],
+   [
+    "tab",
+    [
+     "Import/Export"
+    ],
+    {
+     "icon": "download"
+    }
+   ],
+   [
+    "tab_panel",
+    [
+     "General Settings"
+    ],
+    {}
+   ],
+   [
+    "select",
+    [
+     [
+      "TradingAgents",
+      "FinnHubRating",
+      "FMPRating",
+      "FMPSenateTraderWeight",
+      "FMPSenateTraderCopy",
+      "FMPInsiderClusterBuy",
+      "FMPEarningsDrift",
+      "FMPEarningsEvent",
+      "PennyMomentumTrader",
+      "FactorRanker",
+      "DeterministicScorer"
+     ]
+    ],
+    {
+     "label": "Expert Type",
+     "value": "TradingAgents"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Alias (max 100 chars)",
+     "placeholder": "Short display name..."
+    }
+   ],
+   [
+    "textarea",
+    [],
+    {
+     "label": "User Notes",
+     "placeholder": "Add your own notes..."
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Enabled"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "number",
+    [
+     "Priority"
+    ],
+    {
+     "min": 1,
+     "precision": 0,
+     "step": 1,
+     "value": 1
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Virtual Equity",
+     "value": "100.0"
+    }
+   ],
+   [
+    "select",
+    [
+     []
+    ],
+    {
+     "label": "Trading Account",
+     "value": null
+    }
+   ],
+   [
+    "toggle",
+    [
+     [
+      "Weekly",
+      "Monthly"
+     ]
+    ],
+    {
+     "on_change": "<callable>",
+     "value": "Weekly"
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Monday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Tuesday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Wednesday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Thursday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Friday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Saturday"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Sunday"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "select",
+    [
+     {
+      "1": "1st",
+      "2": "2nd",
+      "3": "3rd"
+     }
+    ],
+    {
+     "label": "Which",
+     "value": 1
+    }
+   ],
+   [
+    "select",
+    [
+     {
+      "friday": "Friday",
+      "monday": "Monday",
+      "saturday": "Saturday",
+      "sunday": "Sunday",
+      "thursday": "Thursday",
+      "tuesday": "Tuesday",
+      "wednesday": "Wednesday"
+     }
+    ],
+    {
+     "label": "Weekday",
+     "value": "monday"
+    }
+   ],
+   [
+    "toggle",
+    [
+     [
+      "Local time",
+      "Market time (NYSE)"
+     ]
+    ],
+    {
+     "on_change": "<callable>",
+     "value": "Local time"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "09:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "button",
+    [
+     "Add Time"
+    ],
+    {
+     "icon": "add_alarm",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "toggle",
+    [
+     [
+      "Weekly",
+      "Monthly"
+     ]
+    ],
+    {
+     "on_change": "<callable>",
+     "value": "Weekly"
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Monday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Tuesday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Wednesday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Thursday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Friday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Saturday"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Sunday"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "select",
+    [
+     {
+      "1": "1st",
+      "2": "2nd",
+      "3": "3rd"
+     }
+    ],
+    {
+     "label": "Which",
+     "value": 1
+    }
+   ],
+   [
+    "select",
+    [
+     {
+      "friday": "Friday",
+      "monday": "Monday",
+      "saturday": "Saturday",
+      "sunday": "Sunday",
+      "thursday": "Thursday",
+      "tuesday": "Tuesday",
+      "wednesday": "Wednesday"
+     }
+    ],
+    {
+     "label": "Weekday",
+     "value": "monday"
+    }
+   ],
+   [
+    "toggle",
+    [
+     [
+      "Local time",
+      "Market time (NYSE)"
+     ]
+    ],
+    {
+     "on_change": "<callable>",
+     "value": "Local time"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "09:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "10:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "11:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "12:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "13:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "14:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "15:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "button",
+    [
+     "Add Time"
+    ],
+    {
+     "icon": "add_alarm",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Enable BUY orders"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Enable SELL orders"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Allow automated trade opening"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Allow automated trade modification/closing"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "placeholder": "10.0",
+     "value": "10.0"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "placeholder": "10.0",
+     "value": "10.0"
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Allow fractional shares"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "select",
+    [],
+    {
+     "on_change": "<callable>",
+     "options": {
+      "notional": "notional",
+      "risk_atr": "risk_atr"
+     },
+     "value": "notional"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "placeholder": "1.0",
+     "value": "1.0"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "placeholder": "2.0",
+     "value": "2.0"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "placeholder": "14",
+     "value": "14"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "placeholder": "7.0",
+     "value": "7.0"
+    }
+   ],
+   [
+    "select",
+    [],
+    {
+     "label": "Risk Management Mode",
+     "options": {
+      "classic": "Classic (Rules)",
+      "classic_options": "Classic Options",
+      "smart": "Smart (Agentic)"
+     },
+     "value": "classic"
+    }
+   ],
+   [
+    "textarea",
+    [],
+    {
+     "label": "Instructions for Smart Risk Manager",
+     "placeholder": "Enter your risk management strategy instructions...",
+     "value": "Maximize short term profit with medium risk taking.\n\nRisk sizing guidance (advisory \u2014 use judgement, not strict enforcement):\n- A 'Technical Levels per Symbol' table is pre-loaded in your scratchpad with ATR / ATR%, Bollinger bands (BB_Lower / BB_Upper as dynamic S/R), VWMA, 10-EMA, 50-SMA, 200-SMA, RSI, MACD, a Trend flag, and a suggested SL_Floor%. Use these as guidance when choosing SL/TP \u2014 they are inputs to your decision, not hard limits.\n- Recommended anchors: for BUY, place SL near BB_Lower / nearest swing low and TP near BB_Upper / next resistance. Mirror for SELL.\n- SL_Floor% is a suggested minimum SL distance based on volatility. Try to honor it as a default, but you may deviate if the analysis context (e.g. clearly defined nearby support) justifies a different level \u2014 just be explicit about why.\n- For counter-trend / mean-reversion entries (Trend shows '<10EMA <50SMA' or analysis flags 'chart damaged / in repair phase'), prefer widening SL to ~8% and/or halving position size \u2014 or skip the trade if R:R doesn't justify it.\n- Aim for R:R \u2248 2 or better. If you can't reach that with sensible levels, prefer skipping or reducing size rather than tightening SL into intraday noise.\n- Prefer controlling risk via position size (fractional shares OK) rather than by shrinking the SL distance.\n- In the recommendation `reason` field, briefly cite the levels you used (e.g. SL=$X near BB_Lower, TP=$W at BB_Upper, R:R\u2248R) so the choice can be reviewed."
+    }
+   ],
+   [
+    "number",
+    [],
+    {
+     "label": "Maximum Iterations",
+     "max": 50,
+     "min": 1,
+     "step": 1,
+     "value": 20
+    }
+   ],
+   [
+    "number",
+    [],
+    {
+     "label": "Analysis Discovery Window (hours)",
+     "max": 168,
+     "min": 1,
+     "step": 1,
+     "value": 24
+    }
+   ],
+   [
+    "select",
+    [],
+    {
+     "clearable": true,
+     "label": "Enter Market Ruleset",
+     "options": [
+      "(None)"
+     ],
+     "with_input": true
+    }
+   ],
+   [
+    "select",
+    [],
+    {
+     "clearable": true,
+     "label": "Open Positions Ruleset",
+     "options": [
+      "(None)"
+     ],
+     "with_input": true
+    }
+   ],
+   [
+    "select",
+    [],
+    {
+     "clearable": true,
+     "label": "Market-Condition Profile(s)",
+     "multiple": true,
+     "options": [
+      "ohlcv-v1",
+      "ta-structure-v1"
+     ],
+     "value": []
+    }
+   ],
+   [
+    "tab_panel",
+    [
+     "Instruments"
+    ],
+    {}
+   ],
+   [
+    "select",
+    [],
+    {
+     "label": "Instrument Selection Method",
+     "on_change": "<callable>",
+     "options": [
+      "static",
+      "dynamic",
+      "screener"
+     ],
+     "value": "static"
+    }
+   ],
+   [
+    "tab_panel",
+    [
+     "Expert Settings"
+    ],
+    {}
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "",
+     "value": "test_value"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "restart_alt",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "",
+     "value": "24"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "restart_alt",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "tab_panel",
+    [
+     "Import/Export"
+    ],
+    {}
+   ],
+   [
+    "checkbox",
+    [
+     "General Settings"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Expert Settings"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Symbol Settings"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Instruments"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "button",
+    [
+     "Export Settings"
+    ],
+    {
+     "icon": "download",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "upload",
+    [],
+    {
+     "auto_upload": true,
+     "label": "Upload Settings (.json)",
+     "max_files": 1,
+     "on_upload": "<callable>"
+    }
+   ],
+   [
+    "button",
+    [
+     "Cancel"
+    ],
+    {
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "button",
+    [
+     "Save"
+    ],
+    {
+     "on_click": "<callable>"
+    }
+   ]
+  ]
+ },
+ "edit": {
+  "bound_widget_attributes": [
+   "_save_button",
+   "account_select",
+   "alias_input",
+   "allow_automated_trade_modification_checkbox",
+   "allow_automated_trade_opening_checkbox",
+   "allow_fractional_shares_checkbox",
+   "atr_multiplier_input",
+   "atr_period_input",
+   "description_label",
+   "dialog",
+   "enable_buy_checkbox",
+   "enable_sell_checkbox",
+   "enabled_checkbox",
+   "enter_market_frequency",
+   "enter_market_local_hint",
+   "enter_market_monthly_container",
+   "enter_market_ordinal_select",
+   "enter_market_ruleset_select",
+   "enter_market_time_basis",
+   "enter_market_times_container",
+   "enter_market_weekday_select",
+   "enter_market_weekly_container",
+   "execution_schedule_section",
+   "expert_select",
+   "expert_settings_container",
+   "instrument_selection_method_select",
+   "instruments_content_container",
+   "market_condition_profile_select",
+   "max_virtual_equity_per_instrument_input",
+   "min_available_balance_pct_input",
+   "min_stop_loss_pct_input",
+   "open_positions_frequency",
+   "open_positions_local_hint",
+   "open_positions_monthly_container",
+   "open_positions_ordinal_select",
+   "open_positions_ruleset_select",
+   "open_positions_schedule_expansion",
+   "open_positions_time_basis",
+   "open_positions_times_container",
+   "open_positions_weekday_select",
+   "open_positions_weekly_container",
+   "priority_input",
+   "risk_atr_settings_container",
+   "risk_manager_mode_select",
+   "risk_manager_section",
+   "risk_per_trade_pct_input",
+   "sizing_mode_select",
+   "smart_risk_manager_analysis_window_hours_input",
+   "smart_risk_manager_max_iterations_input",
+   "smart_risk_manager_user_instructions_input",
+   "user_description_textarea",
+   "virtual_equity_input"
+  ],
+  "constructed": [
+   [
+    "tab",
+    [
+     "General Settings"
+    ],
+    {
+     "icon": "schedule"
+    }
+   ],
+   [
+    "tab",
+    [
+     "Instruments"
+    ],
+    {
+     "icon": "trending_up"
+    }
+   ],
+   [
+    "tab",
+    [
+     "Expert Settings"
+    ],
+    {
+     "icon": "settings"
+    }
+   ],
+   [
+    "tab",
+    [
+     "Import/Export"
+    ],
+    {
+     "icon": "download"
+    }
+   ],
+   [
+    "tab_panel",
+    [
+     "General Settings"
+    ],
+    {}
+   ],
+   [
+    "select",
+    [
+     [
+      "TradingAgents",
+      "FinnHubRating",
+      "FMPRating",
+      "FMPSenateTraderWeight",
+      "FMPSenateTraderCopy",
+      "FMPInsiderClusterBuy",
+      "FMPEarningsDrift",
+      "FMPEarningsEvent",
+      "PennyMomentumTrader",
+      "FactorRanker",
+      "DeterministicScorer"
+     ]
+    ],
+    {
+     "label": "Expert Type",
+     "value": "MockExpert"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Alias (max 100 chars)",
+     "placeholder": "Short display name..."
+    }
+   ],
+   [
+    "textarea",
+    [],
+    {
+     "label": "User Notes",
+     "placeholder": "Add your own notes..."
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Enabled"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "number",
+    [
+     "Priority"
+    ],
+    {
+     "min": 1,
+     "precision": 0,
+     "step": 1,
+     "value": 1
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Virtual Equity",
+     "value": "100.0"
+    }
+   ],
+   [
+    "select",
+    [
+     []
+    ],
+    {
+     "label": "Trading Account",
+     "value": "Test Account (MockAccount)"
+    }
+   ],
+   [
+    "toggle",
+    [
+     [
+      "Weekly",
+      "Monthly"
+     ]
+    ],
+    {
+     "on_change": "<callable>",
+     "value": "Weekly"
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Monday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Tuesday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Wednesday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Thursday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Friday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Saturday"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Sunday"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "select",
+    [
+     {
+      "1": "1st",
+      "2": "2nd",
+      "3": "3rd"
+     }
+    ],
+    {
+     "label": "Which",
+     "value": 1
+    }
+   ],
+   [
+    "select",
+    [
+     {
+      "friday": "Friday",
+      "monday": "Monday",
+      "saturday": "Saturday",
+      "sunday": "Sunday",
+      "thursday": "Thursday",
+      "tuesday": "Tuesday",
+      "wednesday": "Wednesday"
+     }
+    ],
+    {
+     "label": "Weekday",
+     "value": "monday"
+    }
+   ],
+   [
+    "toggle",
+    [
+     [
+      "Local time",
+      "Market time (NYSE)"
+     ]
+    ],
+    {
+     "on_change": "<callable>",
+     "value": "Local time"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "09:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "button",
+    [
+     "Add Time"
+    ],
+    {
+     "icon": "add_alarm",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "toggle",
+    [
+     [
+      "Weekly",
+      "Monthly"
+     ]
+    ],
+    {
+     "on_change": "<callable>",
+     "value": "Weekly"
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Monday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Tuesday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Wednesday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Thursday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Friday"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Saturday"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Sunday"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "select",
+    [
+     {
+      "1": "1st",
+      "2": "2nd",
+      "3": "3rd"
+     }
+    ],
+    {
+     "label": "Which",
+     "value": 1
+    }
+   ],
+   [
+    "select",
+    [
+     {
+      "friday": "Friday",
+      "monday": "Monday",
+      "saturday": "Saturday",
+      "sunday": "Sunday",
+      "thursday": "Thursday",
+      "tuesday": "Tuesday",
+      "wednesday": "Wednesday"
+     }
+    ],
+    {
+     "label": "Weekday",
+     "value": "monday"
+    }
+   ],
+   [
+    "toggle",
+    [
+     [
+      "Local time",
+      "Market time (NYSE)"
+     ]
+    ],
+    {
+     "on_change": "<callable>",
+     "value": "Local time"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "09:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "10:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "11:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "12:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "13:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "14:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "Time (HH:MM)",
+     "placeholder": "09:30",
+     "value": "15:30"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "remove",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "button",
+    [
+     "Add Time"
+    ],
+    {
+     "icon": "add_alarm",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Enable BUY orders"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Enable SELL orders"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Allow automated trade opening"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Allow automated trade modification/closing"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "placeholder": "10.0",
+     "value": "10.0"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "placeholder": "10.0",
+     "value": "10.0"
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Allow fractional shares"
+    ],
+    {
+     "value": false
+    }
+   ],
+   [
+    "select",
+    [],
+    {
+     "on_change": "<callable>",
+     "options": {
+      "notional": "notional",
+      "risk_atr": "risk_atr"
+     },
+     "value": "notional"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "placeholder": "1.0",
+     "value": "1.0"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "placeholder": "2.0",
+     "value": "2.0"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "placeholder": "14",
+     "value": "14"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "placeholder": "7.0",
+     "value": "7.0"
+    }
+   ],
+   [
+    "select",
+    [],
+    {
+     "label": "Risk Management Mode",
+     "options": {
+      "classic": "Classic (Rules)",
+      "classic_options": "Classic Options",
+      "smart": "Smart (Agentic)"
+     },
+     "value": "classic"
+    }
+   ],
+   [
+    "textarea",
+    [],
+    {
+     "label": "Instructions for Smart Risk Manager",
+     "placeholder": "Enter your risk management strategy instructions...",
+     "value": "Maximize short term profit with medium risk taking.\n\nRisk sizing guidance (advisory \u2014 use judgement, not strict enforcement):\n- A 'Technical Levels per Symbol' table is pre-loaded in your scratchpad with ATR / ATR%, Bollinger bands (BB_Lower / BB_Upper as dynamic S/R), VWMA, 10-EMA, 50-SMA, 200-SMA, RSI, MACD, a Trend flag, and a suggested SL_Floor%. Use these as guidance when choosing SL/TP \u2014 they are inputs to your decision, not hard limits.\n- Recommended anchors: for BUY, place SL near BB_Lower / nearest swing low and TP near BB_Upper / next resistance. Mirror for SELL.\n- SL_Floor% is a suggested minimum SL distance based on volatility. Try to honor it as a default, but you may deviate if the analysis context (e.g. clearly defined nearby support) justifies a different level \u2014 just be explicit about why.\n- For counter-trend / mean-reversion entries (Trend shows '<10EMA <50SMA' or analysis flags 'chart damaged / in repair phase'), prefer widening SL to ~8% and/or halving position size \u2014 or skip the trade if R:R doesn't justify it.\n- Aim for R:R \u2248 2 or better. If you can't reach that with sensible levels, prefer skipping or reducing size rather than tightening SL into intraday noise.\n- Prefer controlling risk via position size (fractional shares OK) rather than by shrinking the SL distance.\n- In the recommendation `reason` field, briefly cite the levels you used (e.g. SL=$X near BB_Lower, TP=$W at BB_Upper, R:R\u2248R) so the choice can be reviewed."
+    }
+   ],
+   [
+    "number",
+    [],
+    {
+     "label": "Maximum Iterations",
+     "max": 50,
+     "min": 1,
+     "step": 1,
+     "value": 20
+    }
+   ],
+   [
+    "number",
+    [],
+    {
+     "label": "Analysis Discovery Window (hours)",
+     "max": 168,
+     "min": 1,
+     "step": 1,
+     "value": 24
+    }
+   ],
+   [
+    "select",
+    [],
+    {
+     "clearable": true,
+     "label": "Enter Market Ruleset",
+     "options": [
+      "(None)"
+     ],
+     "with_input": true
+    }
+   ],
+   [
+    "select",
+    [],
+    {
+     "clearable": true,
+     "label": "Open Positions Ruleset",
+     "options": [
+      "(None)"
+     ],
+     "with_input": true
+    }
+   ],
+   [
+    "select",
+    [],
+    {
+     "clearable": true,
+     "label": "Market-Condition Profile(s)",
+     "multiple": true,
+     "options": [
+      "ohlcv-v1",
+      "ta-structure-v1"
+     ],
+     "value": []
+    }
+   ],
+   [
+    "tab_panel",
+    [
+     "Instruments"
+    ],
+    {}
+   ],
+   [
+    "select",
+    [],
+    {
+     "label": "Instrument Selection Method",
+     "on_change": "<callable>",
+     "options": [
+      "static",
+      "dynamic",
+      "screener"
+     ],
+     "value": "static"
+    }
+   ],
+   [
+    "tab_panel",
+    [
+     "Expert Settings"
+    ],
+    {}
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "",
+     "value": "test_value"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "restart_alt",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "input",
+    [],
+    {
+     "label": "",
+     "value": "24"
+    }
+   ],
+   [
+    "button",
+    [],
+    {
+     "icon": "restart_alt",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "tab_panel",
+    [
+     "Import/Export"
+    ],
+    {}
+   ],
+   [
+    "checkbox",
+    [
+     "General Settings"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Expert Settings"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Symbol Settings"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "checkbox",
+    [
+     "Instruments"
+    ],
+    {
+     "value": true
+    }
+   ],
+   [
+    "button",
+    [
+     "Export Settings"
+    ],
+    {
+     "icon": "download",
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "upload",
+    [],
+    {
+     "auto_upload": true,
+     "label": "Upload Settings (.json)",
+     "max_files": 1,
+     "on_upload": "<callable>"
+    }
+   ],
+   [
+    "button",
+    [
+     "Cancel"
+    ],
+    {
+     "on_click": "<callable>"
+    }
+   ],
+   [
+    "button",
+    [
+     "Save"
+    ],
+    {
+     "on_click": "<callable>"
+    }
+   ]
+  ]
+ }
+}

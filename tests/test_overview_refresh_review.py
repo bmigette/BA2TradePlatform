@@ -294,7 +294,7 @@ def test_failed_broker_fetch_keeps_the_good_rows_and_warns_once(env):
     assert good and env.last('monthly')['income'] == good
     assert 'refresh failed' in page.tab._updated_label.text
     assert env.last('total')['n_trades'] == 1 and env.last('total')['n_div'] == 3
-    assert len([n for n in env.notes if n.get('type') == 'warning']) >= 1
+    assert len([n for n in env.notes if n.get('type') == 'warning' and n['ctx_ok']]) == 1
     assert page.tab._broker_cache['positions']
 
 
@@ -451,7 +451,7 @@ def test_partial_price_download_is_not_asked_again_within_a_broker_ttl(env, monk
 
 # ---- F3a replacement: the refresh button, behaviourally ---------------------------------------------------
 
-def test_refresh_button_clears_the_cache_and_refetches_everything(env):
+def test_refresh_button_refetches_every_dataset_once(env):
     async def go():
         page = env.build()
         await env.settle()
@@ -624,3 +624,70 @@ def test_a_checkbox_click_after_the_ttl_keeps_the_choice_and_does_not_reload(env
         return boxes[-1].value, len([d for d in env.drawn if d['kind'] == 'total']) - n_total
     value, redraws = asyncio.run(go())
     assert value is False and redraws == 0
+
+
+# ===================================================================== final follow-ups
+def test_a_failed_longer_balance_request_shows_the_marker_and_is_not_repeated_per_click(env):
+    class LongFails(Broker):
+        def get_balance_history(self, start_date=None, end_date=None):
+            self._enter('balance')
+            if start_date is not None:
+                return []                      # the 3y / Max request fails (error-shaped)
+            return super().get_balance_history(start_date, end_date)
+    env.state.brokers = [LongFails()]
+
+    async def go():
+        page = env.build()
+        await env.settle()
+        broker = env.state.brokers[0]
+        broker.calls.clear()
+        from nicegui import ui
+        with page.client.content:
+            for rk in ('3y', '6m', '3y', '3y'):
+                page.tab._set_range(rk)
+                await page.tab._load_growth_data(ui.label('x'), ui.column(), 1)
+        return page, broker
+    page, broker = asyncio.run(go())
+    assert 'refresh failed' in page.tab._updated_label.text
+    assert broker.n('balance') == 1 and env.notes            # asked once, announced
+
+
+def test_chip_follows_what_is_drawn_and_the_stamp_does_not_run_ahead(env):
+    async def go():
+        page = env.build()
+        await env.settle()
+        broker = env.state.brokers[0]
+        stamp0 = page.tab._updated_label.text
+        extra = {'symbol': 'AAA', 'amount': 7.0, 'date': _dt(TODAY - timedelta(days=2)),
+                 'drip_quantity': None}
+        broker.divs.append(extra)
+        env.clock.t += 300
+        await page.timer.callback()
+        shown = page.chip.visible
+        stamp_after_bg = page.tab._updated_label.text
+        broker.divs.remove(extra)                 # the late row disappears again
+        env.clock.t += 300
+        await page.timer.callback()
+        return shown, page.chip.visible, stamp0, stamp_after_bg
+    shown, shown_after, stamp0, stamp_after_bg = asyncio.run(go())
+    assert shown is True and shown_after is False
+    assert stamp_after_bg == stamp0
+
+
+def test_manual_refresh_accepts_data_that_truly_became_empty(env):
+    async def go():
+        page = env.build()
+        await env.settle()
+        broker = env.state.brokers[0]
+        broker.divs, broker.trades = [], []
+        env.clock.t += 300
+        await page.timer.callback()                       # background: pinned as a failure
+        pinned = 'refresh failed' in page.tab._updated_label.text
+        with page.client.content:
+            page.refresh(None)                            # manual: takes the empty result
+        await env.settle()
+        return page, pinned
+    page, pinned = asyncio.run(go())
+    assert pinned
+    assert env.last('total')['n_div'] == 0 and env.last('total')['n_trades'] == 0
+    assert 'refresh failed' not in page.tab._updated_label.text

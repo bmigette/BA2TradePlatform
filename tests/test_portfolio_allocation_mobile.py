@@ -491,3 +491,34 @@ def test_hand_rolled_cards_get_the_same_structure_from_the_generator():
 def test_the_label_header_is_a_card_too():
     assert '.q-expansion-item:has(.pf-bar-row)' in page.LABEL_BAR_PHONE_CSS
     assert 'border-radius: 12px' in page.LABEL_BAR_PHONE_CSS
+
+
+# -- label header: name on its own line, one card (operator, 2026-10-03) -----------
+
+def _bar_rule(selector_fragment):
+    css = page.LABEL_BAR_PHONE_CSS
+    return next(m.group(0) for m in re.finditer(r'[^{}]*\{[^}]*\}', css)
+                if selector_fragment in m.group(0))
+
+
+def test_the_label_name_has_its_own_full_width_wrapping_line():
+    rule = _bar_rule('> .pf-b-name {')
+    assert 'order: 1' in rule and 'flex: 1 1 100%' in rule
+    assert 'white-space: normal' in rule and 'text-overflow: clip' in rule
+    assert 'font-weight: 700' in rule
+
+
+def test_the_identity_controls_sit_on_the_second_line_after_the_name():
+    css = page.LABEL_BAR_PHONE_CSS
+    orders = {cls: int(re.search(rf'\.pf-bar-row > \.pf-b-{cls} \{{[^}}]*order: (\d+)', css).group(1))
+              for cls in ('icon', 'count', 'edit', 'info')}
+    assert 1 < orders['icon'] <= orders['count'] < orders['edit'] < orders['info'] < 9
+    # 40px tap targets: 24px glyph + 8px padding each side
+    assert 'padding: 8px; box-sizing: content-box; font-size: 24px' in css
+
+
+def test_the_label_is_one_card_not_a_box_in_a_box():
+    css = page.LABEL_BAR_PHONE_CSS
+    assert '.q-expansion-item:has(.pf-bar-row) > .q-expansion-item__container' in css
+    assert '.q-expansion-item:has(.pf-bar-row) .q-item { background: transparent' in css
+    assert 'background: #232a3d !important' in css      # the ONE card's own fill
