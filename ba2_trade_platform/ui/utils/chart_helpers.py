@@ -198,8 +198,24 @@ def responsive_echart(options: dict, *, tall: bool = True) -> "ui.echart":
 
 
 def mode_toggle() -> "ui.toggle":
-    """The $ / % switch, in the shape the monthly charts already use."""
-    return ui.toggle(['$', '%'], value='$').props('dense')
+    """The $ / % switch, in the shape the monthly charts already use. ``ba2-ctl``: a real
+    tap target (styles.css: 32px desktop, 40px phone)."""
+    return ui.toggle(['$', '%'], value='$').props('dense no-caps').classes('ba2-ctl')
+
+
+def legend_below(legend_data: Sequence[str]) -> dict:
+    """A one-row scroll legend UNDER the plot, whatever the entry count."""
+    opts = legend_options(legend_data)
+    opts.pop('top', None)
+    opts.update({'type': 'scroll', 'bottom': 0, 'left': 'center', 'width': '90%',
+                 'pageTextStyle': {'color': '#a0aec0'}, 'pageIconColor': '#a0aec0',
+                 'pageIconInactiveColor': '#4a5568'})
+    return opts
+
+
+def grid_below(legend_data: Sequence[str]) -> dict:
+    """The plot area for :func:`legend_below`: room at the bottom, none reserved on top."""
+    return {'left': '3%', 'right': '3%', 'top': 16, 'bottom': 48, 'containLabel': True}
 
 
 def fullscreen_button(build_options: Callable[[], dict], *, title: str) -> "ui.button":

@@ -1205,3 +1205,30 @@ div[class*="disconnect"] * {
         overflow-wrap: anywhere;
     }
 }
+
+
+/* ==========================================================================
+ * Account Growth controls: real tap targets (32px desktop, 40px phone).
+ * `ba2-ctl` is set on the range / $-% toggles, the refresh + chip buttons and the
+ * All / None buttons next to the label selectors (ui/utils/chart_helpers.py,
+ * ui/pages/overview.py). Lives in the GLOBAL stylesheet on purpose: a per-page add_css
+ * after an await is dropped by NiceGUI.
+ * ========================================================================== */
+.ba2-ctl.q-btn,
+.ba2-ctl .q-btn {
+    min-height: 32px;
+    min-width: 32px;
+    font-size: 0.85rem;
+}
+.ba2-ctl-btn.q-btn {
+    padding: 0 12px;
+    min-width: 48px;
+}
+@media (max-width: 639px) {
+    .ba2-ctl.q-btn,
+    .ba2-ctl .q-btn {
+        min-height: 40px;
+        min-width: 40px;
+        font-size: 0.95rem;
+    }
+}
