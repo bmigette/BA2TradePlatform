@@ -34,7 +34,7 @@ from ..utils.growth_label_storage import (
     GROWTH_LABELS_STORAGE_KEY, MONTHLY_PROFIT_LABELS_STORAGE_KEY,
     resolve_growth_labels,
 )
-from ..utils.dividend_forecast import forecast_dividends
+from ..utils.dividend_forecast import drop_tiny_quantity_outliers, forecast_dividends
 from ..utils.overview_range import (
     RANGE_OPTIONS, date_in_range, effective_range_start, filter_dates, filter_months,
     history_capped, read_range, resolve_range_start, write_range, yf_period_for,
@@ -5531,11 +5531,15 @@ class AccountGrowthTab:
             for r in rows:
                 amount_on[_ds(r['date'])] += float(r.get('amount') or 0)
                 drip_on[_ds(r['date'])] += float(r.get('drip_quantity') or 0)
-            per_date = {}
+            per_date, qty_on = {}, {}
             for ds, amount in amount_on.items():
                 q = qty_by_date.get(ds, 0) - day_trades.get(ds, 0.0) - drip_on[ds]
                 if q > 0:
                     per_date[ds] = amount / q
+                    qty_on[ds] = q
+            # A payment made on a tiny share count (right after a forced liquidation) is not a
+            # trustworthy per-share figure: dropped when it is also an outlier.
+            per_date = drop_tiny_quantity_outliers(per_date, qty_on, qty)
             history = [(date.fromisoformat(ds), v) for ds, v in per_date.items()]
             for ev in forecast_dividends(history, qty, today, months=2):
                 events.append((sym, ev))

@@ -11,8 +11,12 @@ The rule
   weekly (<=10d), monthly (25-35), quarterly (80-100), semi-annual (170-195) or
   annual (350-380). Anything else is irregular -> no forecast. At least two
   payments are needed to see a cadence.
-* Amount per share: the last payment; if the last three differ by more than 10%
-  of their mean (a variable payer) the mean of the last three.
+* Outliers: a per-share value more than ``OUTLIER_RATIO`` (5x) above, or below 1/5 of, the
+  MEDIAN of the symbol's other recent values (last ``OUTLIER_WINDOW``) is excluded from the
+  AMOUNT (not from the cadence: it is still a real payment date). A payment right after a
+  forced liquidation divides a normal payout by a tiny share count and explodes.
+* Amount per share: the last non-outlier payment; if the last three non-outlier values differ
+  by more than 10% of their mean (a variable payer) the MEDIAN of those three.
 * Dates: last payment + one period, repeated (7 days for weekly, whole calendar
   months otherwise, day clamped to the month's end). Every date inside
   ``[today, today + months]`` is a forecast payment: a weekly payer yields several.
@@ -25,7 +29,7 @@ The rule
 import calendar
 from datetime import date, datetime, timedelta
 from statistics import median
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 #: (min_gap_days, max_gap_days, step) -- step is ('days', n) or ('months', n).
 _CADENCES = (
@@ -36,6 +40,35 @@ _CADENCES = (
     (350, 380, ('months', 12)),
 )
 VARIABLE_TOLERANCE = 0.10
+OUTLIER_RATIO = 5.0
+OUTLIER_WINDOW = 8
+#: A per-date quantity below this share of the CURRENT holding is not a trustworthy divisor.
+TINY_QTY_FRACTION = 0.10
+
+
+def is_outlier(value: float, others: Sequence[float]) -> bool:
+    """More than ``OUTLIER_RATIO`` x above, or below 1/``OUTLIER_RATIO`` of, the median of
+    ``others`` (needs at least two others to have an opinion). Pure."""
+    vals = [v for v in others if v is not None and v > 0]
+    if len(vals) < 2:
+        return False
+    med = median(vals)
+    return value > OUTLIER_RATIO * med or value < med / OUTLIER_RATIO
+
+
+def drop_tiny_quantity_outliers(per_date: Dict[Any, float], qty_on_date: Dict[Any, float],
+                                current_qty: float) -> Dict[Any, float]:
+    """Per-share values to trust: a date is dropped when the shares held on it were below
+    ``TINY_QTY_FRACTION`` of today's quantity AND its per-share value is an outlier against
+    the symbol's other values. Pure."""
+    out = {}
+    for d, v in per_date.items():
+        others = [x for k, x in per_date.items() if k != d]
+        tiny = current_qty > 0 and qty_on_date.get(d, 0) < TINY_QTY_FRACTION * current_qty
+        if tiny and is_outlier(v, others):
+            continue
+        out[d] = v
+    return out
 
 
 def _to_date(value: Any) -> date:
@@ -103,11 +136,16 @@ def forecast_dividends(history: Iterable[Tuple[Any, float]], held_qty: float,
     if step is None:
         return []
 
-    last_date = dates[-1]
-    last3 = [by_date[d] for d in dates[-3:]]
+    last_date = dates[-1]                      # the schedule runs from the last REAL payment date
+    recent = dates[-OUTLIER_WINDOW:]
+    clean = [d for d in dates if not (d in recent and is_outlier(
+        by_date[d], [by_date[o] for o in recent if o != d]))]
+    if not clean:
+        return []
+    last3 = [by_date[d] for d in clean[-3:]]
     mean3 = sum(last3) / len(last3)
     variable = len(last3) > 1 and mean3 > 0 and (max(last3) - min(last3)) / mean3 > VARIABLE_TOLERANCE
-    per_share = mean3 if variable else by_date[last_date]
+    per_share = median(last3) if variable else by_date[clean[-1]]
 
     period = _step_days(step)
     if (today - last_date).days >= 2 * period:      # silent for over a full extra period
