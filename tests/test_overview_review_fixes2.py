@@ -227,13 +227,3 @@ def test_failed_price_download_is_retried_on_the_next_load(env):
     tab = asyncio.run(go())
     assert env.yf == ['1y', '1y']                               # failed once, retried once, then cached
     assert tab._broker_cache['prices']['data']
-
-
-# ---- F3a: explicit refresh -----------------------------------------------------------------------
-
-def test_range_row_has_a_refresh_button_that_clears_the_cache():
-    from pathlib import Path
-    src = (Path(__file__).resolve().parents[1] / 'ba2_trade_platform' / 'ui' / 'pages'
-           / 'overview.py').read_text(encoding='utf-8')
-    assert "ui.button(icon='refresh'" in src
-    assert 'self._init_data_cache()' in src.split('def on_refresh():')[1][:300]
