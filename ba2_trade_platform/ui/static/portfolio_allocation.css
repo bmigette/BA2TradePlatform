@@ -28,7 +28,7 @@
         align-items: center; }
     /* THE LABEL IS A CARD TOO: its own background, a 1px line, a 12px gap to the next. */
     .q-expansion-item:has(.pf-bar-row) { border: 1px solid rgba(255,255,255,0.16);
-        border-radius: 12px; background: #232a3d; margin-bottom: 12px;
+        border-radius: 12px; background: #232a3d !important; margin-bottom: 12px;
         box-shadow: 0 1px 3px rgba(0,0,0,0.35); }
     /* a divider between the identity line and the figures under it */
     .pf-bar-row.pf-bar-row::before { content: ""; order: 9; flex: 0 0 100%;
@@ -37,13 +37,23 @@
         max-width: 100% !important; }
     .pf-bar-row > .pf-b-icon, .pf-bar-row > .pf-b-edit, .pf-bar-row > .pf-b-info {
         padding: 8px; box-sizing: content-box; font-size: 24px; }
-    .pf-bar-row > .pf-b-icon { order: 1; }
-    .pf-bar-row > .pf-b-zero { order: 1; }
-    .pf-bar-row > .pf-b-warn { order: 1; }
-    .pf-bar-row.pf-bar-row > .pf-b-name { order: 2; flex: 1 1 0 !important;
-        font-size: 1rem; }
+    /* ONE CARD, not a box in a box: the expansion's header row and its container each
+       painted their own translucent panel and padding inside the card above. */
+    .q-expansion-item:has(.pf-bar-row) > .q-expansion-item__container {
+        background: transparent !important; }
+    .q-expansion-item:has(.pf-bar-row) .q-item { background: transparent !important;
+        padding: 8px 6px 8px 10px !important; }
+    /* LINE 1: the FULL label name, bold, wrapping allowed (never an ellipsis).
+       LINE 2: colour tag, badges, symbol count, edit, info -- 40px tap targets. */
+    .pf-bar-row.pf-bar-row > .pf-b-name { order: 1; flex: 1 1 100% !important;
+        font-size: 1.1rem; font-weight: 700 !important; line-height: 1.25;
+        white-space: normal !important; overflow: visible !important;
+        text-overflow: clip !important; overflow-wrap: anywhere; }
+    .pf-bar-row > .pf-b-icon { order: 2; }
+    .pf-bar-row > .pf-b-zero { order: 2; }
+    .pf-bar-row > .pf-b-warn { order: 2; }
     .pf-bar-row > .pf-b-count { order: 3; }
-    .pf-bar-row > .pf-b-edit { order: 4; }
+    .pf-bar-row > .pf-b-edit { order: 4; margin-left: auto; }
     .pf-bar-row > .pf-b-info { order: 5; }
     .pf-bar-row.pf-bar-row > .pf-b-value { order: 10; flex: 1 1 auto !important;
         text-align: left; font-size: 1rem; font-weight: 600; }
