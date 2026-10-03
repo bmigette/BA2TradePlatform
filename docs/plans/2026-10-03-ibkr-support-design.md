@@ -517,3 +517,47 @@ Assumptions taken (all conservative; each is the documented default, not a hidde
 9. Fractional only when `ContractDetails.minSize`/`sizeIncrement` publish a sub-share step; otherwise
    whole shares, floored (never rounded up); a floor to zero is a CANCELED skip, not an ERROR.
 10. Delayed market data is never a price (`marketDataType` 3/4), and `reqMarketDataType(2)` is requested.
+
+### Stage 3 (options), as built
+
+File: `modules/accounts/ibkr_options.py` (`IBKROptionsMixin`, mixed into `IBKRAccount`, which now also
+inherits `OptionsAccountInterface`). Tests: `tests/test_ibkr_options.py` (46), fake extensions in
+`tests/ibkr_fakes.py` (`add_option`, `add_option_chain`, `add_leg_fills`, line accounting).
+
+* **Chain:** `reqSecDefOptParams` picks the standard class (100-share, trading class = the underlying's
+  own root, SMART first) and supplies the expirations; **one `reqContractDetails` call per expiry with a
+  wildcard strike/right** returns the ladder with conIds (not one call per strike); quotes stream in
+  batches of 90 market-data lines (`_QUOTE_BATCH`), 3 s wait per batch, every line is cancelled in a
+  `finally`. Rows: bid/ask/last (IB's negative "no quote" becomes `None`, a real zero bid is kept), model
+  greeks, open interest from `callOpenInterest`/`putOpenInterest` by right, `volume=None`, `rho=None`,
+  `greeks_source="broker"`. Delayed rows are excluded with an ERROR. A request spanning more than 1500
+  contracts raises instead of truncating.
+* **Contracts:** an OCC symbol resolves to exactly one `Option` (root as trading class, multiplier 100);
+  a non-standard root or non-100 multiplier is refused (OPT-L7, as Alpaca). `localSymbol` with the spaces
+  removed IS our OCC symbol.
+* **Orders:** single leg = one `Option` order; 2-4 legs = one `BAG` order (`action=BUY`, legs carry their
+  own sides, **signed limit: negative = credit**, ticked to 0.01), TIF DAY, `orderRef` = our parent id.
+  The broker id is persisted before anything else can raise; a rejection raises, and
+  `OptionsAccountInterface._unwind_failed_option_submission` terminalises the parent and its children
+  (ERROR only when nothing reached IBKR); a missing acknowledgement leaves the rows open (`PENDING_NEW`)
+  for the refresh to adopt, never resent.
+* **Refresh:** the BAG is ONE IB order, so its children follow the parent's status; each leg's filled
+  quantity is the parent's fill x the leg's ratio; a leg's price is set only when an execution for that
+  contract was reported (matched by `(permId, OCC)`; shape UNVERIFIED), otherwise it stays NULL.
+* **Positions:** `OPT` portfolio rows, `avgCost / multiplier` is the per-share premium, signed qty ->
+  side, tri-state, malformed rows skipped. `get_positions` no longer includes options.
+* **ATM IV:** the Alpaca rule (nearest strike, 20-45 DTE) on a +/-10 % strike band to keep the pull small.
+* **Shared gates verified on this adapter:** assignment capacity (measured on `TotalCashValue`, not
+  equity), short-put delivery exposure, cover guard, close-rides-the-transaction.
+
+What is **missing**, exactly (nothing is faked):
+
+1. `get_option_activities` / `reconcile_option_assignments`: not defined, so `TradeManager`'s option
+   reconciliation hook is a no-op for IBKR. Assignment/exercise/expiry are seen only as a vanished option
+   position (`reconcile_externally_closed_option_transactions`) plus the assigned shares arriving through
+   `get_positions()`. The Alpaca-style settlement bookkeeping (synthetic settlement orders, called-away
+   accounting, `OptionActivity` audit rows) needs the real execution shape of an assignment; run
+   `tools/ibkr_paper_smoke.py --dump-executions` after a paper assignment to capture it.
+2. `OptionContract.volume` (Q4). 3. `rho`. 4. No IBKR historical-option ingest provider
+   (`OptionsDataProviderInterface`): that interface feeds the backtest cache and IBKR offers no bulk
+   historical chain.

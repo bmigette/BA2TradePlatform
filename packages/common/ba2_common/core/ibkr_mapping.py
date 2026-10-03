@@ -265,6 +265,24 @@ def is_standard_occ_root(root: str, underlying: Optional[str] = None) -> bool:
     return underlying is None or root.upper() == underlying.strip().upper().replace(" ", "")
 
 
+def occ_from_contract_fields(local_symbol: str, trading_class: str, symbol: str,
+                             last_trade: str, right: str, strike: float) -> str:
+    """The OCC symbol (unpadded root) of an IB option contract.
+
+    IB's ``localSymbol`` for an option IS the OCC symbol with the root space-padded to six
+    characters (``"AAPL  260116C00150000"``), so removing the spaces yields ours. When it is absent
+    the fields are used, with ``tradingClass`` as the root (the OCC root, which differs from the
+    underlying for e.g. BRK B -> BRKB). Raises ValueError when neither can produce one.
+    """
+    compact = (local_symbol or "").replace(" ", "").upper()
+    if _OCC_RE.match(compact):
+        return compact
+    root = (trading_class or symbol or "").replace(" ", "").upper()
+    expiry = date(int(last_trade[0:4]), int(last_trade[4:6]), int(last_trade[6:8]))
+    return build_occ(root, expiry, OptionRight.CALL if right.upper().startswith("C")
+                     else OptionRight.PUT, strike)
+
+
 def ib_expiry_string(expiry: date) -> str:
     """``lastTradeDateOrContractMonth`` for an option: ``YYYYMMDD``."""
     return f"{expiry:%Y%m%d}"

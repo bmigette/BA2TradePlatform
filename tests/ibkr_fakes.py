@@ -87,6 +87,9 @@ class FakeIB:
         self.quotes: Dict[int, Ticker] = {}
         self.shortable_shares: Dict[int, float] = {}
         self.detail_calls = 0
+        self.active_lines = 0
+        self.max_active_lines = 0
+        self.cancelled_lines = 0
         # orders
         self._trades: List[Trade] = []
         self.prior_trades: List[Trade] = []
@@ -223,6 +226,52 @@ class FakeIB:
         self.details.setdefault(symbol, []).append(details)
         return contract
 
+    def add_option(self, underlying: str, expiry: str, strike: float, right: str,
+                   con_id: Optional[int] = None, bid=NAN, ask=NAN, last=NAN, iv: Optional[float] = None,
+                   delta: Optional[float] = None, gamma: Optional[float] = None,
+                   theta: Optional[float] = None, vega: Optional[float] = None,
+                   oi: Optional[float] = None, trading_class: Optional[str] = None,
+                   multiplier: str = "100", rule: str = "26", market_data_type: int = 1) -> Contract:
+        """Register an option contract (+ its streaming quote) the way IB would describe it."""
+        root = trading_class or underlying.replace(" ", "")
+        con_id = con_id or self._con_id_for(f"{underlying}{expiry}{strike}{right}")
+        local = f"{root:<6}{expiry[2:]}{right}{int(round(strike * 1000)):08d}"
+        contract = Option(symbol=underlying, lastTradeDateOrContractMonth=expiry, strike=strike,
+                          right=right, exchange="SMART", currency="USD", multiplier=multiplier,
+                          tradingClass=root, conId=con_id, localSymbol=local)
+        self.details.setdefault(underlying, []).append(
+            ContractDetails(contract=contract, marketRuleIds=f"{rule},{rule}", minSize=1.0,
+                            sizeIncrement=1.0))
+        quote: Dict[str, Any] = {"bid": bid, "ask": ask, "last": last, "marketDataType": market_data_type}
+        if any(v is not None for v in (iv, delta, gamma, theta, vega)):
+            quote["modelGreeks"] = OptionComputation(
+                0, iv if iv is not None else NAN, delta if delta is not None else NAN, NAN, NAN,
+                gamma if gamma is not None else NAN, vega if vega is not None else NAN,
+                theta if theta is not None else NAN, NAN)
+        if oi is not None:
+            quote["callOpenInterest" if right == "C" else "putOpenInterest"] = oi
+        self.option_quotes[con_id] = quote
+        return contract
+
+    def add_option_chain(self, underlying: str, expirations: List[str], strikes: List[float],
+                         trading_class: Optional[str] = None, multiplier: str = "100",
+                         exchange: str = "SMART", under_con_id: int = 1) -> None:
+        self.option_chains.setdefault(underlying, []).append(OptionChain(
+            exchange, under_con_id, trading_class or underlying.replace(" ", ""), multiplier,
+            expirations, strikes))
+
+    def add_leg_fills(self, ref: str, legs: List[Any]) -> None:
+        """Per-leg executions of a combo: ``legs`` = [(leg_contract, side 'BOT'/'SLD', shares, price)]."""
+        trade = self.trade_by_ref(ref)
+        for contract, side, shares, price in legs:
+            execution = Execution(execId=f"L{len(self.fills_list) + 1}", time=self.now(),
+                                  acctNumber=self.account, side=side, shares=shares, price=price,
+                                  permId=trade.orderStatus.permId, orderId=trade.order.orderId,
+                                  orderRef=trade.order.orderRef)
+            self.fills_list.append(Fill(contract, execution,
+                                        CommissionReport(execution.execId, 0.5, "USD", 0.0, 0.0, 0),
+                                        self.now()))
+
     def set_quote(self, contract: Contract, bid=NAN, ask=NAN, last=NAN, close=NAN,
                   market_data_type: int = 1) -> None:
         # Ticker.__post_init__ resets every price field to NaN, so constructor kwargs are lost:
@@ -237,10 +286,12 @@ class FakeIB:
         self.detail_calls += 1
         found = list(self.details.get(contract.symbol, []))
         if contract.secType == "OPT":
+            # a blank right / zero strike is a WILDCARD, as at IBKR (one call returns the ladder)
             found = [d for d in found if d.contract.secType == "OPT"
                      and d.contract.lastTradeDateOrContractMonth == contract.lastTradeDateOrContractMonth
-                     and abs(d.contract.strike - contract.strike) < 1e-9
-                     and d.contract.right == contract.right]
+                     and (not contract.strike or abs(d.contract.strike - contract.strike) < 1e-9)
+                     and (not contract.right or d.contract.right == contract.right)
+                     and (not contract.tradingClass or d.contract.tradingClass == contract.tradingClass)]
         else:
             found = [d for d in found if d.contract.secType == contract.secType]
         if not found:
@@ -270,6 +321,8 @@ class FakeIB:
     def reqMktData(self, contract, genericTickList="", snapshot=False, regulatorySnapshot=False,
                    mktDataOptions=None) -> Ticker:
         self._note("reqMktData")
+        self.active_lines += 1
+        self.max_active_lines = max(self.max_active_lines, self.active_lines)
         base = self.quotes.get(contract.conId)
         ticker = copy.copy(base) if base is not None else Ticker(contract=contract)
         if contract.conId in self.shortable_shares:
@@ -281,6 +334,8 @@ class FakeIB:
         return ticker
 
     def cancelMktData(self, contract) -> bool:
+        self.active_lines -= 1
+        self.cancelled_lines += 1
         return True
 
     async def reqSecDefOptParamsAsync(self, underlyingSymbol, futFopExchange, underlyingSecType,

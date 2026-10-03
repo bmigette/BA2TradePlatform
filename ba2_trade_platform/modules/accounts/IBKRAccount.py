@@ -35,6 +35,7 @@ from ...core.account_types import (
     AccountSnapshot, MarginInfo, OrderImpact, MARGIN_SOURCE_DEFAULT)
 from ...core.db import InstanceNotFound, add_instance, get_db, get_instance, update_instance
 from ...core.interfaces import AccountInterface
+from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ...core.models import Position, TradingOrder, Transaction
 from ...core.types import (
     AssetClass as CoreAssetClass, BrokerOrderErrorReason, OrderDirection, OrderOpenType,
@@ -42,6 +43,7 @@ from ...core.types import (
 from ...core.types import OrderType as CoreOrderType
 from ...logger import logger
 from .AlpacaAccount import OCO_STOP_LIMIT_CUSHION
+from .ibkr_options import IBKROptionsMixin
 from .ibkr_runtime import (
     IBKRConnectionError, IBKRContractError, IBKRError, IBKROrderRejected, IBKRReadOnlyError,
     IBKRRuntime, get_runtime, shutdown_runtime)
@@ -151,6 +153,8 @@ class OrderBook:
     #: execution aggregates keyed by orderRef and by permId: {"shares", "price", "when"}
     executions_by_ref: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     executions_by_perm: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    #: option-leg executions of a combo, keyed by (permId, OCC symbol)
+    executions_by_perm_occ: Dict[Tuple[int, str], Dict[str, Any]] = field(default_factory=dict)
     executions_ok: bool = True
 
     @property
@@ -158,7 +162,7 @@ class OrderBook:
         return self.open_ok and self.completed_ok and self.executions_ok
 
 
-class IBKRAccount(ProtectiveLegsMixin, AccountInterface):
+class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, OptionsAccountInterface):
     """Interactive Brokers via TWS / IB Gateway (see the module docstring)."""
 
     #: Overridable in tests with a fake; the runtime builds the IB object ON its loop thread.
@@ -628,14 +632,17 @@ class IBKRAccount(ProtectiveLegsMixin, AccountInterface):
     def _view_to_tradingorder(self, view: BrokerOrderView) -> TradingOrder:
         """An UNSAVED TradingOrder describing an IB order (the read-side listing shape)."""
         side = OrderDirection.BUY if view.action == "BUY" else OrderDirection.SELL
-        order_type = self._map_order_type(view.order_type, view.action)
+        if view.sec_type == "BAG" and view.limit_price is not None and view.limit_price < 0:
+            side = OrderDirection.SELL          # a credit combo: the platform's parent side is the net side
+        order_type = self._map_order_type(view.order_type,
+                                          "BUY" if side == OrderDirection.BUY else "SELL")
         limit, stop = view.limit_price, None
         if view.order_type == "STP":
             stop, limit = view.aux_price, None
         elif view.order_type == "STP LMT":
             stop = view.aux_price
         symbol = M.from_ib_symbol(view.symbol)
-        asset = CoreAssetClass.OPTION if view.sec_type == "OPT" else CoreAssetClass.EQUITY
+        asset = CoreAssetClass.OPTION if view.sec_type in ("OPT", "BAG") else CoreAssetClass.EQUITY
         return TradingOrder(
             account_id=self.id, broker_order_id=view.broker_order_id,
             symbol=symbol, quantity=view.total_quantity, side=side, order_type=order_type,
@@ -643,8 +650,9 @@ class IBKRAccount(ProtectiveLegsMixin, AccountInterface):
             status=M.map_ib_status(view.status, view.filled, view.remaining),
             filled_qty=view.filled,
             open_price=view.avg_fill_price if view.avg_fill_price and view.avg_fill_price > 0 else None,
-            asset_class=asset, contract_symbol=(view.local_symbol.replace(" ", "")
-                                                if asset == CoreAssetClass.OPTION else None),
+            asset_class=asset,
+            contract_symbol=((view.local_symbol.replace(" ", "") or None)
+                             if view.sec_type == "OPT" else None),
             comment=None, created_at=view.created_at)
 
     async def _read_order_book(self, ib: Any) -> OrderBook:
@@ -674,22 +682,30 @@ class IBKRAccount(ProtectiveLegsMixin, AccountInterface):
             logger.error(f"[Account {self.id}] could not read IBKR executions: {e}", exc_info=True)
         return book
 
-    @staticmethod
-    def _aggregate_executions(book: OrderBook, fills: List[Any]) -> None:
+    @classmethod
+    def _aggregate_executions(cls, book: OrderBook, fills: List[Any]) -> None:
         for fill in fills or []:
             ex = fill.execution
             shares, price = float(ex.shares), float(ex.price)
             if shares <= 0:
                 continue
-            for bucket, key in ((book.executions_by_ref, str(ex.orderRef or "")),
-                                (book.executions_by_perm, int(ex.permId or 0))):
+            buckets = [(book.executions_by_ref, str(ex.orderRef or "")),
+                       (book.executions_by_perm, int(ex.permId or 0))]
+            if fill.contract.secType == "OPT" and ex.permId:
+                try:
+                    buckets.append((book.executions_by_perm_occ,
+                                    (int(ex.permId), cls._occ_of(fill.contract))))
+                except ValueError:
+                    logger.warning(f"execution {ex.execId}: cannot derive an OCC symbol from "
+                                   f"{fill.contract.localSymbol!r}; leg price not attributed")
+            for bucket, key in buckets:
                 if not key:
                     continue
                 agg = bucket.setdefault(key, {"shares": 0.0, "notional": 0.0, "when": None})
                 agg["shares"] += shares
                 agg["notional"] += shares * price
                 agg["when"] = ex.time
-        for bucket in (book.executions_by_ref, book.executions_by_perm):
+        for bucket in (book.executions_by_ref, book.executions_by_perm, book.executions_by_perm_occ):
             for agg in bucket.values():
                 agg["price"] = agg["notional"] / agg["shares"] if agg["shares"] else None
 
@@ -1453,6 +1469,8 @@ class IBKRAccount(ProtectiveLegsMixin, AccountInterface):
                 matched.add(row.id)
                 if self._apply_view(row, view):
                     updated += 1
+                if row.asset_class == CoreAssetClass.OPTION and not row.contract_symbol:
+                    self._reconcile_option_children(row, view, book)
             except M.UnknownIBOrderStatus as e:
                 logger.error(f"[Account {self.id}] {e}")
         absent = self._settle_absent_rows(book, matched) if book.complete else 0
