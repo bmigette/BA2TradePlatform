@@ -34,7 +34,10 @@ from ..utils.growth_label_storage import (
     GROWTH_LABELS_STORAGE_KEY, MONTHLY_PROFIT_LABELS_STORAGE_KEY,
     resolve_growth_labels,
 )
-from ..utils.dividend_forecast import drop_tiny_quantity_outliers, forecast_dividends
+from ..utils.dividend_forecast import (
+    broker_forecast, drop_tiny_quantity_outliers, forecast_dividends, forecast_dividends_ex, net_ratio,
+    parse_provider_history,
+)
 from ..utils.overview_range import (
     RANGE_OPTIONS, date_in_range, effective_range_start, filter_dates, filter_months,
     history_capped, read_range, resolve_range_start, write_range, yf_period_for,
@@ -5484,19 +5487,27 @@ class AccountGrowthTab:
         return select
 
     def _compute_dividend_forecast(self, all_dividends, all_filled_trades, qty_by_account_symbol):
-        """``{month: {'total': x, 'labels': {label: x}}}`` for the next 2 months.
+        """``{month: {'total': x, 'labels': {label: x}, 'sources': {source: x}}}`` for the next 2
+        months; the per-symbol detail lands in ``self._forecast_detail``.
 
-        Reuses the page's own dividend rows (``get_dividends``) -- no second source.
-        Those rows are TOTALS, so the per-share amount is the row's net amount over the
-        shares held on the payment date: ``_build_qty_timeline`` walks back from the
-        account's CURRENT quantity over the union of its dividend dates AND its trade
-        dates for the symbol (a trade is only undone if its date is in the list), minus
-        the DRIP shares the payment itself bought.
+        PER ACCOUNT AND SYMBOL (a holding is that account's quantity), then summed. For each
+        held symbol the first source that can speak wins:
 
-        PER ACCOUNT AND SYMBOL, then summed: two brokers booking the same payment a day
-        apart would otherwise interleave into gaps of 1 / 89 days and kill the cadence.
-        Each account's forecast uses that account's own quantity. A symbol's forecast
-        goes to its labels exactly like its actual dividends.
+        1. ``broker``  -- the account's own dividend metadata (TastyTrade market metrics:
+           next pay date + rate), cross-checked against the symbol's payout from another
+           source before it is believed (see ``broker_forecast``);
+        2. ``history`` -- the symbol's DECLARED per-share dividends from the platform's FMP
+           provider (``ba2_providers.symbol_info.fetch_dividends``: its 24 h cache + rate-limit
+           gate), payment dates (ex-dates when absent), specials excluded;
+        3. ``account`` -- the page's own broker dividend rows (``get_dividends``): totals, so
+           the per-share amount is net amount / shares held on the payment date
+           (``_build_qty_timeline`` over dividend + trade dates, minus the day's own trades and
+           DRIP), with the outlier guards for a liquidation-shrunk share count.
+
+        Declared / broker amounts are GROSS: they are scaled to net by the account's observed
+        net/gross ratio (its own rows); with no such ratio they stay gross (flagged). Runs in a
+        worker thread (provider and broker calls block); everything it fetches is cached
+        (provider: per symbol for the session, broker: the broker-data TTL).
         """
         from collections import defaultdict
 
@@ -5508,51 +5519,191 @@ class AccountGrowthTab:
         for d in all_dividends or []:
             if d.get('symbol') and d.get('date'):
                 divs_by[(d.get('account_id'), d['symbol'])].append(d)
+        divs_by_acc = defaultdict(list)
+        for d in all_dividends or []:
+            divs_by_acc[d.get('account_id')].append(d)
         trades_by = defaultdict(list)
         for t in all_filled_trades or []:
             if t.get('symbol') and t.get('date'):
                 trades_by[(t.get('account_id'), t['symbol'])].append(t)
 
-        events = []                                    # (symbol, forecast event)
-        for (aid, sym), qty in qty_by_account_symbol.items():
-            if qty <= 0 or (aid, sym) not in divs_by:
-                continue
-            rows = divs_by[(aid, sym)]
-            trades = trades_by.get((aid, sym), [])
-            dates = sorted({_ds(r['date']) for r in rows} | {_ds(t['date']) for t in trades})
-            qty_by_date, _ = _build_qty_timeline(qty, trades, dates, dividends=rows)
-            # The timeline is END of day; the payment is made on the shares held BEFORE that
-            # day's own trades and DRIP, so those are taken back out (a sale of 90 on the
-            # payment date still earned the dividend on the 90).
-            day_trades = defaultdict(float)
-            for t in trades:
-                day_trades[_ds(t['date'])] += signed_trade_qty(t.get('side'), t.get('qty') or 0)
-            amount_on, drip_on = defaultdict(float), defaultdict(float)
-            for r in rows:
-                amount_on[_ds(r['date'])] += float(r.get('amount') or 0)
-                drip_on[_ds(r['date'])] += float(r.get('drip_quantity') or 0)
-            per_date, qty_on = {}, {}
-            for ds, amount in amount_on.items():
-                q = qty_by_date.get(ds, 0) - day_trades.get(ds, 0.0) - drip_on[ds]
-                if q > 0:
-                    per_date[ds] = amount / q
-                    qty_on[ds] = q
-            # A payment made on a tiny share count (right after a forced liquidation) is not a
-            # trustworthy per-share figure: dropped when it is also an outlier.
-            per_date = drop_tiny_quantity_outliers(per_date, qty_on, qty)
-            history = [(date.fromisoformat(ds), v) for ds, v in per_date.items()]
-            for ev in forecast_dividends(history, qty, today, months=2):
-                events.append((sym, ev))
+        held = {k: q for k, q in qty_by_account_symbol.items() if q > 0}
+        symbols = sorted({sym for _aid, sym in held})
+        provider = self._provider_dividend_histories(symbols)
+        meta_by_aid = self._dividend_metadata(sorted({aid for aid, _ in held}), held)
+        ratio_by_aid = {aid: net_ratio(rows) for aid, rows in divs_by_acc.items()}
 
-        labels_by_symbol = get_labels_by_symbol(sorted({sym for sym, _ in events})) if events else {}
+        detail, events = [], []                        # events: (symbol, source, event)
+        for (aid, sym), qty in held.items():
+            # ---- account history (net per share per payment date)
+            a_events, a_info = [], {'status': 'no_history', 'cadence': None, 'per_share': None}
+            rows = divs_by.get((aid, sym), [])
+            if rows:
+                trades = trades_by.get((aid, sym), [])
+                dates = sorted({_ds(r['date']) for r in rows} | {_ds(t['date']) for t in trades})
+                qty_by_date, _ = _build_qty_timeline(qty, trades, dates, dividends=rows)
+                # The timeline is END of day; the payment is made on the shares held BEFORE that
+                # day's own trades and DRIP, so those are taken back out (a sale of 90 on the
+                # payment date still earned the dividend on the 90).
+                day_trades = defaultdict(float)
+                for t in trades:
+                    day_trades[_ds(t['date'])] += signed_trade_qty(t.get('side'), t.get('qty') or 0)
+                amount_on, drip_on = defaultdict(float), defaultdict(float)
+                for r in rows:
+                    amount_on[_ds(r['date'])] += float(r.get('amount') or 0)
+                    drip_on[_ds(r['date'])] += float(r.get('drip_quantity') or 0)
+                per_date, qty_on = {}, {}
+                for ds, amount in amount_on.items():
+                    q = qty_by_date.get(ds, 0) - day_trades.get(ds, 0.0) - drip_on[ds]
+                    if q > 0:
+                        per_date[ds] = amount / q
+                        qty_on[ds] = q
+                # A payment made on a tiny share count (right after a forced liquidation) is not
+                # a trustworthy per-share figure: dropped when it is also an outlier.
+                per_date = drop_tiny_quantity_outliers(per_date, qty_on, qty)
+                history = [(date.fromisoformat(ds), v) for ds, v in per_date.items()]
+                a_events, a_info = forecast_dividends_ex(history, qty, today, months=2)
+
+            # ---- declared (provider) history
+            p_events, p_info, date_kind = [], {'status': 'no_history', 'cadence': None,
+                                               'per_share': None}, None
+            if provider.get(sym):
+                p_hist, date_kind = provider[sym]
+                p_events, p_info = forecast_dividends_ex(p_hist, qty, today, months=2, specials=True,
+                                                         include_declared=True)
+
+            ratio = ratio_by_aid.get(aid)
+            # hints for the broker cross-check: the symbol's GROSS per-payment payout and cadence
+            step_hint = p_info['cadence'] or a_info['cadence']
+            if p_info['per_share']:
+                ps_hint = p_info['per_share']
+            elif a_info['per_share']:
+                ps_hint = a_info['per_share'] / ratio if ratio else a_info['per_share']
+            else:
+                ps_hint = None
+            b_events, b_info = broker_forecast(meta_by_aid.get((aid, sym)), qty, today, 2,
+                                               step_hint, ps_hint)
+            if b_info:
+                source, evs, info, scale = 'broker', b_events, b_info, True
+            elif p_info['status'] == 'ok':
+                source, evs, info, scale = 'history', p_events, p_info, True
+            elif a_info['status'] == 'ok':
+                source, evs, info, scale = 'account', a_events, a_info, False
+            else:
+                detail.append({'symbol': sym, 'account': aid, 'qty': qty, 'source': None,
+                               'status': (p_info['status'] if provider.get(sym) else a_info['status'])})
+                continue
+            factor = (ratio or 1.0) if scale else 1.0
+            basis = 'net' if (not scale or ratio) else 'gross'
+            out_events = [dict(ev, per_share=round(ev['per_share'] * factor, 6),
+                               amount=round(ev['amount'] * factor, 2)) for ev in evs]
+            for ev in out_events:
+                events.append((sym, source, ev))
+            detail.append({'symbol': sym, 'account': aid, 'qty': qty, 'source': source,
+                           'cadence': info['cadence'], 'per_share': (info['per_share'] or 0) * factor,
+                           'basis': basis, 'date_kind': date_kind if source == 'history' else None,
+                           'events': [(e['date'].isoformat(), e['amount']) for e in out_events]})
+        self._forecast_detail = detail
+
+        labels_by_symbol = get_labels_by_symbol(sorted({sym for sym, _s, _e in events})) if events else {}
         out = {}
-        for sym, ev in events:
+        for sym, source, ev in events:
             month = ev['date'].strftime('%Y-%m')
-            slot = out.setdefault(month, {'total': 0.0, 'labels': {}})
+            slot = out.setdefault(month, {'total': 0.0, 'labels': {}, 'sources': {}})
             slot['total'] += ev['amount']
+            slot['sources'][source] = slot['sources'].get(source, 0.0) + ev['amount']
             for lb in (labels_by_symbol.get(normalize_symbol(sym)) or ['Unlabeled']):
                 slot['labels'][lb] = slot['labels'].get(lb, 0.0) + ev['amount']
         return out
+
+    def _provider_dividend_histories(self, symbols):
+        """``{symbol: (history, date_kind)}`` from the FMP provider, for symbols that have one.
+        Per-symbol session cache (a failure is retried after ``PRICE_TTL_SECONDS``); the provider
+        has its own 24 h cache + global rate-limit gate; uncached symbols are fetched in a small
+        thread pool. No FMP key / any failure -> the symbol is simply absent (one warning)."""
+        cache = self.__dict__.setdefault('_provider_div_cache', {})
+        now = _clock()
+        todo = [s for s in symbols if s not in cache or (cache[s][0] is None
+                                                         and now - cache[s][1] > PRICE_TTL_SECONDS)]
+        if todo:
+            try:
+                from ...config import get_app_setting
+                api_key = get_app_setting('FMP_API_KEY')
+            except Exception:
+                api_key = None
+            if not api_key:
+                for s in todo:
+                    cache[s] = (None, now)
+            else:
+                def one(sym):
+                    try:
+                        from ba2_providers.symbol_info import fetch_dividends
+                        hist, kind = parse_provider_history(fetch_dividends(api_key, sym))
+                        return sym, ((hist, kind) if hist else ()), None
+                    except Exception as e:  # noqa: BLE001 -- a data source must not break the page
+                        return sym, None, e
+                from concurrent.futures import ThreadPoolExecutor
+                warned = False
+                with ThreadPoolExecutor(max_workers=6) as pool:
+                    for sym, res, err in pool.map(one, todo):
+                        if err is not None and not warned:
+                            warned = True
+                            logger.warning(f"Dividend forecast: provider history unavailable ({err}); "
+                                           f"falling back to the account's own history")
+                        cache[sym] = ((res if res else None), now)
+        return {s: cache[s][0] for s in symbols if s in cache and cache[s][0]}
+
+    def _dividend_metadata(self, account_ids, held):
+        """``{(account_id, symbol): meta}`` from each account's ``get_dividend_metadata`` (one
+        batched, read-only request per account; accounts without the method -- Alpaca -- give
+        nothing). Cached on the page for the broker-data TTL; a failure -> nothing (logged by the
+        account) and the next source takes over."""
+        cache = self._broker_cache.setdefault('dividend_meta', {}) if hasattr(self, '_broker_cache') else {}
+        instances = (self._broker_cache.get('instances') or {}) if hasattr(self, '_broker_cache') else {}
+        out = {}
+        for aid in account_ids:
+            inst = instances.get(aid)
+            fn = getattr(inst, 'get_dividend_metadata', None)
+            if not callable(fn):
+                continue
+            syms = sorted({s for (a, s) in held if a == aid})
+            slot = cache.get(aid)
+            if not slot or _clock() - slot['at'] > BROKER_DATA_TTL_SECONDS or not set(syms) <= slot['symbols']:
+                try:
+                    data = fn(syms) or {}
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"Dividend metadata failed for account {aid}: {e}")
+                    data = {}
+                slot = cache[aid] = {'at': _clock(), 'symbols': set(syms), 'data': data}
+            for sym in syms:
+                if slot['data'].get(sym.upper()):
+                    out[(aid, sym)] = slot['data'][sym.upper()]
+        return out
+
+    def _forecast_caption(self):
+        """``(text, tooltip)`` describing where the forecast numbers come from."""
+        detail = getattr(self, '_forecast_detail', None) or []
+        used = [d for d in detail if d.get('source')]
+        if not used:
+            return '', ''
+        counts = {}
+        for d in used:
+            counts[d['source']] = counts.get(d['source'], 0) + 1
+        gross = sum(1 for d in used if d.get('basis') == 'gross')
+        text = ('Forecast (estimated) - sources: '
+                + ', '.join(f'{k} {v}' for k, v in sorted(counts.items()))
+                + (f' - {gross} symbols shown GROSS (no observed tax ratio)' if gross else ' - net of tax'))
+        lines = []
+        for d in sorted(used, key=lambda x: x['symbol']):
+            cad = d.get('cadence')
+            lines.append(f"{d['symbol']}: source {d['source']}, "
+                         f"{('every ' + str(cad[1]) + ' ' + cad[0]) if cad else 'single payment'}, "
+                         f"{d['per_share']:.4f}/sh x {d['qty']:g} ({d['basis']})"
+                         + (f", {d['date_kind']}-dates" if d.get('date_kind') == 'ex' else ''))
+        skipped = [d for d in detail if not d.get('source')]
+        if skipped:
+            lines.append('no forecast: ' + ', '.join(sorted({d['symbol'] for d in skipped})))
+        return text, '\n'.join(lines)
 
     def _compute_scope_inputs(self, target_accounts, filled_trades, dividends, positions_by_account):
         """Per account: traded labels (reusing get_labels_by_symbol, the derivation the label
@@ -6452,6 +6603,10 @@ class AccountGrowthTab:
 
             with chart_container:
                 responsive_echart(build()).classes('w-full').style('height: 320px')
+            caption, tip = self._forecast_caption()
+            if caption and forecast:
+                ui.label(caption).classes('text-xs text-gray-500').tooltip(tip).style(
+                    'white-space: pre-line')
             mode.on_value_change(lambda e: rebuild())
 
     def _render_monthly_profit_by_label_chart(self, months, monthly_by_label, labels, monthly_label=None):

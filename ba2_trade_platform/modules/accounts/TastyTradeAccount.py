@@ -1702,6 +1702,43 @@ class TastyTradeAccount(AccountInterface):
             nets[biggest] = round(nets[biggest] + residual, 2)
         return [n if n > 0 else 0.0 for n in nets]
 
+    def get_dividend_metadata(self, symbols) -> Dict[str, Dict]:
+        """The broker's own dividend metadata for ``symbols`` (read-only, ONE market-metrics
+        request for the whole list), as plain dicts keyed by UPPERCASE symbol::
+
+            {'rate': float|None, 'ex_date': date|None, 'next_date': date|None,
+             'pay_date': date|None, 'yield': float|None}
+
+        Fields relied on (``tastytrade.metrics.MarketMetricInfo``): ``dividend_rate_per_share``,
+        ``dividend_ex_date``, ``dividend_next_date``, ``dividend_pay_date``, ``dividend_yield``.
+        Any failure -> ``{}`` (logged once) so the caller falls back to its next source. Never
+        call this from the UI loop: it blocks on the broker (use a worker thread).
+        """
+        syms = sorted({str(s).strip().upper() for s in (symbols or []) if s})
+        if not syms or not self._check_authentication():
+            return {}
+        try:
+            from tastytrade.metrics import get_market_metrics
+            items = self._run_async(get_market_metrics(self._session, syms))
+        except Exception as e:
+            logger.warning(f"[Account {self.id}] dividend metadata unavailable: "
+                           f"{self._describe_broker_error(e, 'the market-metrics request')}")
+            return {}
+
+        def num(v):
+            return float(v) if v is not None else None
+        out: Dict[str, Dict] = {}
+        for m in items or []:
+            sym = str(getattr(m, 'symbol', '') or '').upper()
+            if not sym:
+                continue
+            out[sym] = {'rate': num(getattr(m, 'dividend_rate_per_share', None)),
+                        'ex_date': getattr(m, 'dividend_ex_date', None),
+                        'next_date': getattr(m, 'dividend_next_date', None),
+                        'pay_date': getattr(m, 'dividend_pay_date', None),
+                        'yield': num(getattr(m, 'dividend_yield', None))}
+        return out
+
     def get_dividends(self, symbol=None, start_date=None, end_date=None) -> List[Dict]:
         """Return one record per dividend the account received.
 
