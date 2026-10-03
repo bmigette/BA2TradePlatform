@@ -95,7 +95,7 @@ def db(tmp_path):
                 "initial_capital REAL, final_equity REAL, total_return REAL, "
                 "annualized_return REAL, max_drawdown REAL, calmar_ratio REAL, "
                 "total_trades INT, win_rate REAL, ga_fitness REAL, results TEXT, trades TEXT, "
-                "equity_curve TEXT, drawdown_curve TEXT, start_date TEXT, end_date TEXT)")
+                "equity_curve TEXT, drawdown_curve TEXT, start_date TEXT, end_date TEXT, labels TEXT)")
     trades = [
         # One two-leg structure: ONE unit, net +300, in the ADX [15, 25) bin.
         _leg("AAA", "2022-03-01", 500.0, txn=11, contract="AAA220401C00100000", adx=20.0),
@@ -139,11 +139,11 @@ def db(tmp_path):
          ]),
          json.dumps({}), 1.5))
     con.execute(
-        "INSERT INTO backtests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO backtests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (900, "BEST-opt-ohlcv-O_LC", 7, 100000.0, 95000.0, -5.0, -2.5, 12.0, 0.4,
          len(trades), 50.0, 1.5, json.dumps(results), json.dumps(trades),
          json.dumps(equity), json.dumps([{"date": e["date"], "drawdown": -1.0} for e in equity]),
-         "2022-01-01", "2023-12-29"))
+         "2022-01-01", "2023-12-29", None))
     con.commit()
     con.close()
     return str(path)

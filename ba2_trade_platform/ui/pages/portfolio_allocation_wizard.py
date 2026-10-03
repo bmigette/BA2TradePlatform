@@ -1072,6 +1072,8 @@ class AllocationWizard:
                               (getattr(self, '_fractional_switch', None), False)):
             if element is not None:
                 element.set_enabled(flag)
+        for box in getattr(self, '_tick_boxes', {}).values():
+            box.set_enabled(False)
         self._pending = (set(self._result_cells) if symbols is None else set(symbols))
         self._unresolved = {}
         getattr(self, '_outcomes', {}).clear()
@@ -1129,6 +1131,10 @@ class AllocationWizard:
         if chosen is outcome:
             self._outcome_times[symbol] = when or datetime.now()
         getattr(self, '_pending', set()).discard(symbol)
+        # A real outcome supersedes any "not sent" / "check broker" the run's end put on
+        # this row; left in place, a later repaint would paint the unresolved mark over
+        # it while the details view still said what the outcome was.
+        getattr(self, '_unresolved', {}).pop(symbol, None)
         self._apply_outcome(chosen)
 
     def _apply_outcome(self, outcome) -> None:
@@ -1173,7 +1179,8 @@ class AllocationWizard:
         for outcome in self._outcomes.values():
             self._apply_outcome(outcome)
         for symbol, status in self._unresolved.items():
-            self._apply_unresolved(symbol, status)
+            if symbol not in self._outcomes:
+                self._apply_unresolved(symbol, status)
 
     def _open_outcome_details(self, symbol: str) -> None:
         """The details view behind a row's icon: ONE dialog per wizard, refilled each
@@ -1230,14 +1237,24 @@ class AllocationWizard:
         if not retryable or on_retry is None:
             return
         with container:
+            fired = []
+            holder = []
+
             def _retry(symbols=list(retryable)):
+                # ONCE: a double tap would open two live dry runs, each with its own
+                # Submit, over positions the first one is about to change.
+                if fired:
+                    return
+                fired.append(True)
+                holder[0].set_enabled(False)
                 # Closed FIRST: the retry re-solves and opens a fresh dry run, and
                 # two stacked dialogs describing two different plans is exactly the
                 # confusion this feature exists to remove.
                 self.dialog.close()
                 on_retry(symbols)
-            ui.button(RETRY_FAILED_FMT.format(count=len(retryable)), on_click=_retry) \
-                .props('outline').mark(MARKER_OUTCOME_RETRY).tooltip(RETRY_TOOLTIP)
+            holder.append(
+                ui.button(RETRY_FAILED_FMT.format(count=len(retryable)), on_click=_retry)
+                .props('outline').mark(MARKER_OUTCOME_RETRY).tooltip(RETRY_TOOLTIP))
 
     def finish_submit(self, summary: str, *, run_id: Optional[int] = None,
                       outcomes=None, on_retry=None, interrupted: bool = False) -> None:
@@ -1767,6 +1784,8 @@ class AllocationWizard:
         if self._selection_container is None:
             return
         self._selection_container.clear()
+        if getattr(self, '_submitted', False):
+            return          # nothing left to tick: this plan has been sent
         if not self._sendable_rows():
             return
         labels = self._labels_in_table()
@@ -1876,6 +1895,7 @@ class AllocationWizard:
         """
         self._rows_container.clear()
         self._footer_container = None
+        self._tick_boxes = {}
         self._result_cells = {}
         self._result_icons = {}
         self._row_elements = {}
@@ -1934,7 +1954,8 @@ class AllocationWizard:
             ).classes(_col('tick')).mark(MARKER_ROW_TICK)
             # A suppressed row has no order to submit, so it must not be tickable
             # -- greying it is not enough, the box would still be clickable.
-            checkbox.set_enabled(not blocked)
+            checkbox.set_enabled(not blocked and not getattr(self, '_submitted', False))
+            self._tick_boxes[row['symbol']] = checkbox
             ui.label(row['symbol']).classes(_col('symbol', 'font-medium'))
             # THE BASIS THIS ROW IS TRADING AGAINST.
             # "held -> projected", and ONLY when they differ: a row that trades
@@ -2343,7 +2364,10 @@ class AllocationWizard:
             logger.error(f"Allocation dry-run refresh failed: {e}", exc_info=True)
             ui.notify(f'Refresh failed: {e}', type='negative')
             return
-        self.selected = self._default_selection(self.plan)
+        # After a Submit the selection is what was SENT: re-ticking the re-solved plan
+        # would make the footer count orders nobody placed.
+        if not getattr(self, '_submitted', False):
+            self.selected = self._default_selection(self.plan)
         # A verdict describes ONE exact set of orders. This is a different plan.
         if self._validation_container is not None:
             self._validation_container.clear()

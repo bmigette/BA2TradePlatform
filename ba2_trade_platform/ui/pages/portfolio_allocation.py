@@ -2679,10 +2679,10 @@ SYMBOL_CARD = (
     CardColumn('target_value', 'Target value', TIER_PRIMARY),
     CardColumn('target_quantity', 'Target qty', TIER_PRIMARY),
     CardColumn('previous_weight_pct', 'Last %', TIER_PRIMARY),
+    CardColumn('pct_of_total', '% of total', TIER_PRIMARY),
     CardColumn('pnl', 'P&L', TIER_WIDE),
     CardColumn('comment', 'Comment', TIER_WIDE),
     CardColumn('pct_of_label_target', '% of label tgt', TIER_DETAIL),
-    CardColumn('pct_of_total', '% of total', TIER_DETAIL),
     CardColumn('cost_basis', 'Cost basis', TIER_DETAIL),
     CardColumn('price', 'Price', TIER_DETAIL),
     CardColumn('market_value', 'Market value', TIER_DETAIL),
@@ -2711,27 +2711,76 @@ CARD_COMMENT_INPUT_TEMPLATE = r"""
              @update:model-value="(val) => $parent.$emit('commentChange', props.row.symbol, val)" />
 """
 
-CARD_PNL_TEMPLATE = r"""
-    <span :class="'text-' + props.row.pnl_color">{{ props.row.pnl_head }}</span
-    ><span v-if="props.row.pnl_div" :class="'text-' + props.row.pnl_div_color"
-      >{{ props.row.pnl_div }}</span
-    ><span :class="'text-' + props.row.pnl_color">{{ props.row.pnl_tail }}</span>
-"""
+#: A change's colour as an INLINE style (a Vue expression over a Quasar colour name).
+#: Not ``text-negative``: Quasar's class is a dark red (#C10015) that is close to
+#: unreadable on this dark card, and the stylesheet's own ``span {{ color: white }}`` beats
+#: an inherited class colour on any inner element -- an inline style needs neither fight.
+_TONE = ("{{ color: ({{ positive: '#4ade80', negative: '#f87171' }})[{v}] || '#94a3b8' }}")
 
-#: Values that are more than ``props.row[name]``: the target money and the target
-#: shares carry their live change underneath, exactly as the desktop cells do.
-CARD_VALUE_TEMPLATES = {
-    'target_value': r"""{{ props.row.target_value }}<div v-if="props.row.value_delta"
-        class="text-caption" :class="'text-' + props.row.value_delta_color">{{ props.row.value_delta }}</div>""",
-    'target_quantity': r"""{{ props.row.target_quantity }}<div v-if="props.row.qty_delta"
-        class="text-caption" :class="'text-' + props.row.qty_delta_color">{{ props.row.qty_delta }}</div>""",
+
+def card_tone_style(color_field: str) -> str:
+    """The ``:style`` expression for a field coloured by a Quasar colour name. Pure."""
+    return _TONE.format(v=f'props.row.{color_field}')
+
+
+#: P&L as its own tile. The money figure is the value (16px, coloured); the rest of the
+#: sentence -- "(+1.68%, w/ div: +12.05%)" -- is a second, smaller line, so it can never
+#: wrap in the middle of a token and run into the figure. ``pnl_head`` carries
+#: "<money> (<pct>, w/ div: " and ``pnl_div`` / ``pnl_tail`` the rest (see the row
+#: builder); the split here is on the first " (" and touches no data.
+CARD_PNL_TEMPLATE = (
+    r"""
+    <div class="pf-tile-v" :style="__PNL__">{{
+        ((h) => { const i = h.indexOf(' ('); return i < 0 ? h : h.slice(0, i); })(props.row.pnl_head || '')
+    }}</div>
+    <div class="pf-tile-sub pf-pnl-rest"><span :style="__PNL__">{{
+        ((h) => { const i = h.indexOf(' ('); return i < 0 ? '' : h.slice(i + 1); })(props.row.pnl_head || '')
+    }}</span><span v-if="props.row.pnl_div" :style="__DIV__">{{
+        props.row.pnl_div }}</span><span :style="__PNL__">{{
+        props.row.pnl_tail }}</span></div>
+"""
+    .replace('__PNL__', card_tone_style('pnl_color'))
+    .replace('__DIV__', card_tone_style('pnl_div_color')))
+
+#: A coloured arrow for a change: down for a negative one. The sign stays in the text.
+_ARROW = "String({v}).charAt(0) === '-' ? '\u25BC' : '\u25B2'"
+
+
+def _sub_template(delta_field: str, color_field: str) -> str:
+    return (
+        '<div v-if="props.row.' + delta_field + '" class="pf-tile-sub">'
+        '<span :style="' + card_tone_style(color_field) + '">{{ '
+        + _ARROW.format(v='props.row.' + delta_field) + ' }} {{ props.row.'
+        + delta_field + ' }}</span> <span class="pf-sub-k">to target</span></div>')
+
+
+#: A tile's SUB-LINE for the two figures that carry a live change: the change sits INSIDE
+#: its tile, with an arrow and the words "to target", and says which figure it belongs to
+#: by being under it -- never a lone red number between two rows.
+CARD_SUB_TEMPLATES = {
+    'target_value': _sub_template('value_delta', 'value_delta_color'),
+    'target_quantity': _sub_template('qty_delta', 'qty_delta_color'),
 }
 
 
-def _card_kv(column: CardColumn) -> str:
-    value = CARD_VALUE_TEMPLATES.get(column.name, '{{ props.row.' + column.name + ' }}')
-    return (f'<div class="pf-kv"><span class="pf-k">{column.caption}</span>'
-            f'<span class="pf-v">{value}</span></div>')
+def card_tile_html(caption: str, value_html: str, *, sub_html: str = '',
+                   wide: bool = False, field: str = '') -> str:
+    """One TILE of the symbol card: a small muted caption on top, the value below, and
+    an optional sub-line (a change, a second sentence). Pure.
+
+    Every read-only figure on the card is one of these, so the grid is regular by
+    construction: same caption size, same value size, same padding, equal heights.
+    """
+    extra = ' pf-tile--wide' if wide else ''
+    data = f' data-field="{field}"' if field else ''
+    return (f'<div class="pf-tile{extra}"{data}><div class="pf-tile-k">{caption}</div>'
+            f'<div class="pf-tile-v">{value_html}</div>{sub_html}</div>')
+
+
+def _card_tile(column: CardColumn) -> str:
+    return card_tile_html(column.caption, '{{ props.row.' + column.name + ' }}',
+                          sub_html=CARD_SUB_TEMPLATES.get(column.name, ''),
+                          field=column.name)
 
 
 def symbol_card_template(card_columns=SYMBOL_CARD) -> str:
@@ -2744,10 +2793,16 @@ def symbol_card_template(card_columns=SYMBOL_CARD) -> str:
     Quasar expansion item.
     """
     wide = {
-        'weight_pct': CARD_WEIGHT_INPUT_TEMPLATE.replace('__DEBOUNCE__', str(TARGET_DEBOUNCE_MS)),
-        'comment': CARD_COMMENT_INPUT_TEMPLATE.replace('__DEBOUNCE__', str(COMMENT_DEBOUNCE_MS)),
-        'pnl': ('<div class="pf-kv pf-kv--wide"><span class="pf-k">P&amp;L</span>'
-                '<span class="pf-v">' + CARD_PNL_TEMPLATE + '</span></div>'),
+        'weight_pct': ('<div class="pf-field">'
+                       + CARD_WEIGHT_INPUT_TEMPLATE.replace('__DEBOUNCE__',
+                                                            str(TARGET_DEBOUNCE_MS))
+                       + '</div>'),
+        'comment': ('<div class="pf-field">'
+                    + CARD_COMMENT_INPUT_TEMPLATE.replace('__DEBOUNCE__',
+                                                          str(COMMENT_DEBOUNCE_MS))
+                    + '</div>'),
+        'pnl': ('<div class="pf-tiles"><div class="pf-tile pf-tile--wide" data-field="pnl">'
+                '<div class="pf-tile-k">P&amp;L</div>' + CARD_PNL_TEMPLATE + '</div></div>'),
     }
     parts: List[str] = []
     grid: List[str] = []
@@ -2755,23 +2810,23 @@ def symbol_card_template(card_columns=SYMBOL_CARD) -> str:
 
     def flush() -> None:
         if grid:
-            parts.append('<div class="pf-sym-grid">' + ''.join(grid) + '</div>')
+            parts.append('<div class="pf-tiles">' + ''.join(grid) + '</div>')
             grid.clear()
 
     for column in card_columns:
         if column.tier == TIER_HEAD:
             continue
         if column.tier == TIER_PRIMARY:
-            grid.append(_card_kv(column))
+            grid.append(_card_tile(column))
         elif column.tier == TIER_DETAIL:
-            details.append(_card_kv(column))
+            details.append(_card_tile(column))
         else:
             flush()
             parts.append(wide[column.name])
     flush()
     if details:
         parts.append('<q-expansion-item dense dense-toggle label="Details" '
-                     'header-class="pf-sym-more"><div class="pf-sym-grid">'
+                     'class="pf-fold" header-class="pf-sym-more"><div class="pf-tiles">'
                      + ''.join(details) + '</div></q-expansion-item>')
     return (
         '<div class="col-12" style="width:100%">'
@@ -2796,8 +2851,15 @@ LABEL_BAR_PHONE_CSS = phone_media(r"""
        identity (tag, badges, name, count, edit, info), the money and the bar, then
        the sentences that explain them. Widths the desktop pins per cell would each
        be a whole line here, so they go. */
-    .pf-bar-row.pf-bar-row { flex-wrap: wrap !important; row-gap: 2px;
+    .pf-bar-row.pf-bar-row { flex-wrap: wrap !important; row-gap: 4px;
         align-items: center; }
+    /* THE LABEL IS A CARD TOO: its own background, a 1px line, a 12px gap to the next. */
+    .q-expansion-item:has(.pf-bar-row) { border: 1px solid rgba(255,255,255,0.16);
+        border-radius: 12px; background: #232a3d; margin-bottom: 12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.35); }
+    /* a divider between the identity line and the figures under it */
+    .pf-bar-row.pf-bar-row::before { content: ""; order: 9; flex: 0 0 100%;
+        height: 1px; background: rgba(255,255,255,0.22); margin: 2px 0 4px; }
     .pf-bar-row.pf-bar-row > * { width: auto !important; min-width: 0 !important;
         max-width: 100% !important; }
     .pf-bar-row > .pf-b-icon, .pf-bar-row > .pf-b-edit, .pf-bar-row > .pf-b-info {
@@ -2830,29 +2892,79 @@ LABEL_BAR_PHONE_CSS = phone_media(r"""
 #: The symbol card's own look (card mode is only ever on at phone width, so this is
 #: not media-gated -- a desktop never renders these classes).
 SYMBOL_CARD_CSS = r"""
-    .pf-sym-card { border: 1px solid rgba(255,255,255,0.10); border-radius: 8px;
-        padding: 6px 10px 8px; margin-bottom: 8px; width: 100%;
-        background: rgba(37,43,59,0.5); }
+    /* THE SYMBOL CARD: a distinct card (its own background, a 1px line, a 12px gap to the
+       next one), a header row, a strict two-column grid of equal TILES, two outlined
+       inputs of one height, and a full-width Details fold. One value size (16px) and one
+       caption size (11px) throughout. */
+    .pf-sym-card { border: 1px solid rgba(255,255,255,0.16); border-radius: 12px;
+        padding: 10px 12px 12px; margin: 0 0 12px; width: 100%;
+        background: #232a3d; box-shadow: 0 1px 3px rgba(0,0,0,0.35); }
     .pf-sym-card--sel { border-color: #00d4aa; }
-    .pf-sym-head { display: flex; align-items: center; gap: 6px; }
-    .pf-sym-name { font-size: 1.1rem; font-weight: 600; margin-right: auto; }
-    .pf-sym-grid { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr);
-        gap: 4px 14px; margin: 6px 0; }
-    .pf-kv { display: flex; justify-content: space-between; align-items: baseline;
-        gap: 6px; font-size: 0.9rem; min-width: 0; }
-    .pf-kv--wide { grid-column: 1 / -1; margin: 4px 0; }
-    .pf-k { color: #94a3b8; font-size: 0.78rem; white-space: nowrap; }
-    .pf-v { text-align: right; overflow-wrap: anywhere; }
-    .pf-sym-card .q-field { margin: 4px 0; }
-    .pf-sym-card .q-field__native, .pf-sym-card .q-field__control { min-height: 40px; }
-    .pf-sym-more { min-height: 40px; color: #94a3b8; }
+    .pf-sym-head { display: flex; align-items: center; gap: 8px; padding-bottom: 8px;
+        margin-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.10); }
+    .pf-sym-name { font-size: 1.2rem; font-weight: 700; line-height: 1.1; }
+    .pf-sym-head > .row { margin-left: auto; flex-wrap: wrap !important;
+        justify-content: flex-end !important; gap: 6px !important; }
     .pf-sym-head .q-btn { min-width: 40px; min-height: 40px; }
+    .pf-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px; margin: 10px 0; }
+    .pf-tile { display: flex; flex-direction: column; min-width: 0; min-height: 4rem;
+        padding: 8px 10px; border-radius: 8px; background: rgba(255,255,255,0.04); }
+    .pf-tile--wide { grid-column: 1 / -1; min-height: 0; }
+    .pf-tile-k { font-size: 11px; line-height: 1.2; letter-spacing: 0.05em;
+        text-transform: uppercase; color: #94a3b8; }
+    .pf-tile-v { font-size: 16px; line-height: 1.3; margin-top: 3px; font-weight: 600;
+        font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    .pf-tile-sub { font-size: 12px; line-height: 1.3; margin-top: 2px;
+        font-variant-numeric: tabular-nums; }
+    .pf-sub-k { color: #94a3b8; }
+    .pf-pnl-rest { word-break: keep-all; }
+    .pf-sym-card .text-negative { color: #f87171 !important; }
+    .pf-sym-card .text-positive { color: #4ade80 !important; }
+    .pf-field { margin: 10px 0; }
+    .pf-sym-card .q-field__control { min-height: 44px; height: 44px; }
+    .pf-sym-card .q-field--outlined .q-field__control:before { border-color: rgba(255,255,255,0.35); }
+    .pf-sym-card .q-field__native, .pf-sym-card .q-field__input { min-height: 44px; font-size: 16px; }
+    .pf-fold { margin-top: 10px; border: 1px solid rgba(255,255,255,0.14);
+        border-radius: 8px; background: rgba(255,255,255,0.03); }
+    .pf-sym-more { min-height: 44px; color: #cbd5e1; font-size: 0.95rem; }
+    .pf-fold .pf-tiles { margin: 0; padding: 0 8px 10px; }
     .q-table__grid-content { padding: 0 !important; }
 """
 
 PHONE_SWATCH_CSS = phone_media("""
     .pf-swatch { width: 36px !important; height: 36px !important; }
 """)
+
+
+#: THE PAGE'S STYLESHEET IS SERVED AS A FILE, not only injected with ``ui.add_css``.
+#: On the operator's iPhone the symbol cards arrived with NONE of their rules (no
+#: border, no grid, caption and value run together: "Current value390.94") while the
+#: global ``styles.css`` -- linked from the head -- applied. ``ui.add_css`` is JavaScript
+#: (``addStyle(...)``) run in the page; a plain ``<link>`` is the mechanism that has
+#: demonstrably worked on that phone, and it is cacheable. The file is generated from
+#: ``page_phone_css()`` (a test pins the two equal) and the URL carries a content hash
+#: so a changed sheet is never served stale.
+PAGE_CSS_FILENAME = 'portfolio_allocation.css'
+
+
+def page_css_path():
+    from pathlib import Path
+    return Path(__file__).resolve().parents[1] / 'static' / PAGE_CSS_FILENAME
+
+
+def page_css_link_html() -> str:
+    """The ``<link>`` that loads the page stylesheet, versioned by content. Pure."""
+    import hashlib
+    digest = hashlib.md5(page_phone_css().encode('utf-8')).hexdigest()[:10]
+    return f'<link rel="stylesheet" href="/static/{PAGE_CSS_FILENAME}?v={digest}">'
+
+
+def write_page_css() -> None:
+    """Regenerate ``static/portfolio_allocation.css`` from ``page_phone_css()``.
+    Run ``python -c "from ba2_trade_platform.ui.pages.portfolio_allocation import
+    write_page_css; write_page_css()"`` after changing any phone CSS."""
+    page_css_path().write_text(page_phone_css(), encoding='utf-8', newline='\n')
 
 
 def page_phone_css() -> str:
@@ -3963,6 +4075,11 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
             logger.error(f"Allocation submission failed: {e}", exc_info=True)
             ui.notify(f'Submission failed: {e}', type='negative')
             if wizard is not None:
+                # Paint what the worker had already recorded FIRST: a row that landed in
+                # the last 200 ms before the exception has a real outcome, and marking
+                # it "unknown - check the broker" before painting it would leave the
+                # amber mark winning over a FAILED the details view then contradicts.
+                _paint()
                 wizard.finish_submit(SUBMIT_FAILED_FMT.format(error=e), interrupted=True)
             return
         finally:
@@ -4041,6 +4158,69 @@ async def _open_invest_flow(account_id: int, valuation_mode: str, amount: float,
                                 invest_amount=amount)
 
 
+def _install_page_styles() -> None:
+    """Every stylesheet this page needs, installed BEFORE ``content()``'s first await.
+
+    NiceGUI sends the page HTML once the page builder yields; until the websocket
+    connects, ``ui.add_css`` / ``ui.add_head_html`` only append to the client's head
+    buffer, which has already been rendered -- so anything added in that window is
+    silently dropped (the phone cards and this toolbar rendered unstyled on prod,
+    2026-10-03). Called first thing in ``content()``, before ``_load_gate``'s await,
+    these land in the initial HTML.
+    """
+    # ONE HEIGHT FOR EVERY CONTROL, set in CSS because no combination of props gets
+    # there. A Quasar field and a Quasar button are different components with
+    # different internal padding: `dense` and `hide-bottom-space` narrow the gap and
+    # leave the select a few pixels taller than the buttons, which is exactly the
+    # misalignment that keeps being reported. `items-center` then centres two boxes
+    # of different heights -- correctly, and still looking wrong.
+    #
+    # Scoped to this toolbar (`pf-toolbar`) rather than global: the same fields
+    # elsewhere on the page sit in forms where their natural height is right.
+    # `!important` throughout, and that is not laziness. Quasar sets these heights
+    # from `.q-field--outlined .q-field__control`, which has the SAME specificity as
+    # anything scoped to this toolbar by one class -- so the winner is decided by
+    # stylesheet ORDER, and Quasar's loads after NiceGUI's add_css. The first
+    # attempt at this had no effect whatsoever for that reason.
+    #
+    # The field's own top padding is what makes the box taller than a button even
+    # once the control is pinned, so it is zeroed here too.
+    ui.add_css(f'''
+        .{TOOLBAR_CLASS} .q-field__control {{
+            min-height: {TOOLBAR_CONTROL_PX}px !important;
+            height: {TOOLBAR_CONTROL_PX}px !important; }}
+        .{TOOLBAR_CLASS} .q-field__marginal {{
+            height: {TOOLBAR_CONTROL_PX}px !important; }}
+        .{TOOLBAR_CLASS} .q-field--outlined .q-field__control {{
+            padding-top: 0 !important; padding-bottom: 0 !important; }}
+        .{TOOLBAR_CLASS} .q-field__native, .{TOOLBAR_CLASS} .q-field__input {{
+            padding-top: 0 !important; padding-bottom: 0 !important; }}
+        .{TOOLBAR_CLASS} .q-btn {{
+            min-height: {TOOLBAR_CONTROL_PX}px !important;
+            height: {TOOLBAR_CONTROL_PX}px !important; }}
+
+        /* The Review button's own bar: WHITE on the button's green.
+           Not `color=white track-color=green-8`, which is what it was: Quasar's
+           palette props resolve to its theme colours and land a dark green track
+           under a white sweep on a mid-green button -- three greens, and the bar
+           reads as a shadow. The moving part and the track are addressed directly
+           so the contrast is a decision rather than whatever the palette gives.
+           `__model` covers BOTH renderings: determinate uses one, indeterminate
+           two, and both carry that class. */
+        .{TOOLBAR_CLASS} .q-linear-progress__model {{
+            background: #ffffff !important; opacity: 1 !important; }}
+        .{TOOLBAR_CLASS} .q-linear-progress__track {{
+            background: rgba(255, 255, 255, 0.35) !important; opacity: 1 !important; }}
+    ''')
+    # THE PHONE LAYER for this page's own widgets (label headers, symbol cards, the
+    # dry-run dialog's card rows, dialogs) -- see ``page_phone_css``. Then the
+    # breakpoint listener: it re-pins every symbol table's card mode when the
+    # viewport crosses 639px, because the ``:grid`` expression is read once.
+    ui.add_head_html(page_css_link_html())
+    ui.add_css(page_phone_css())
+    install_phone_listener(_phone_tables(), ui.add_head_html, ui.on)
+
+
 async def content() -> None:
     """Entry point for the /portfolioallocation route."""
     account_id = get_selected_account_id()
@@ -4050,6 +4230,9 @@ async def content() -> None:
         with ui.row().classes('w-full items-center justify-between'):
             ui.label('📊 Portfolio Allocation').classes('text-h6')
             ui.label('Manually traded accounts only').classes('text-xs text-secondary-custom')
+
+        # Styles FIRST: anything added to the head after the await below is dropped.
+        _install_page_styles()
 
         # Both loaders touch the DB. Unguarded, a DB error here escapes the route
         # handler and NiceGUI answers 500 with nothing on the page to explain it.
@@ -4065,56 +4248,6 @@ async def content() -> None:
             _render_gate_blocked(gate)
             return
 
-        # ONE HEIGHT FOR EVERY CONTROL, set in CSS because no combination of props gets
-        # there. A Quasar field and a Quasar button are different components with
-        # different internal padding: `dense` and `hide-bottom-space` narrow the gap and
-        # leave the select a few pixels taller than the buttons, which is exactly the
-        # misalignment that keeps being reported. `items-center` then centres two boxes
-        # of different heights -- correctly, and still looking wrong.
-        #
-        # Scoped to this toolbar (`pf-toolbar`) rather than global: the same fields
-        # elsewhere on the page sit in forms where their natural height is right.
-        # `!important` throughout, and that is not laziness. Quasar sets these heights
-        # from `.q-field--outlined .q-field__control`, which has the SAME specificity as
-        # anything scoped to this toolbar by one class -- so the winner is decided by
-        # stylesheet ORDER, and Quasar's loads after NiceGUI's add_css. The first
-        # attempt at this had no effect whatsoever for that reason.
-        #
-        # The field's own top padding is what makes the box taller than a button even
-        # once the control is pinned, so it is zeroed here too.
-        ui.add_css(f'''
-            .{TOOLBAR_CLASS} .q-field__control {{
-                min-height: {TOOLBAR_CONTROL_PX}px !important;
-                height: {TOOLBAR_CONTROL_PX}px !important; }}
-            .{TOOLBAR_CLASS} .q-field__marginal {{
-                height: {TOOLBAR_CONTROL_PX}px !important; }}
-            .{TOOLBAR_CLASS} .q-field--outlined .q-field__control {{
-                padding-top: 0 !important; padding-bottom: 0 !important; }}
-            .{TOOLBAR_CLASS} .q-field__native, .{TOOLBAR_CLASS} .q-field__input {{
-                padding-top: 0 !important; padding-bottom: 0 !important; }}
-            .{TOOLBAR_CLASS} .q-btn {{
-                min-height: {TOOLBAR_CONTROL_PX}px !important;
-                height: {TOOLBAR_CONTROL_PX}px !important; }}
-
-            /* The Review button's own bar: WHITE on the button's green.
-               Not `color=white track-color=green-8`, which is what it was: Quasar's
-               palette props resolve to its theme colours and land a dark green track
-               under a white sweep on a mid-green button -- three greens, and the bar
-               reads as a shadow. The moving part and the track are addressed directly
-               so the contrast is a decision rather than whatever the palette gives.
-               `__model` covers BOTH renderings: determinate uses one, indeterminate
-               two, and both carry that class. */
-            .{TOOLBAR_CLASS} .q-linear-progress__model {{
-                background: #ffffff !important; opacity: 1 !important; }}
-            .{TOOLBAR_CLASS} .q-linear-progress__track {{
-                background: rgba(255, 255, 255, 0.35) !important; opacity: 1 !important; }}
-        ''')
-        # THE PHONE LAYER for this page's own widgets (label headers, symbol cards, the
-        # dry-run dialog's card rows, dialogs) -- see ``page_phone_css``. Then the
-        # breakpoint listener: it re-pins every symbol table's card mode when the
-        # viewport crosses 639px, because the ``:grid`` expression is read once.
-        ui.add_css(page_phone_css())
-        install_phone_listener(_phone_tables(), ui.add_head_html, ui.on)
         toolbar = ui.row().classes(f'w-full items-center gap-2 {TOOLBAR_CLASS} {ACTIONS_CLASS}')
         body = ui.column().classes('w-full gap-3')
         # THE INCOME PANEL'S OWN HOME, cleared and refilled by ``_refresh``. It used to
@@ -4186,11 +4319,22 @@ async def content() -> None:
                 try:
                     events, open_total, working_note = await asyncio.to_thread(
                         _load_income_panel, account_id)
+                    load_error = None
                 except Exception as e:
                     logger.error(f"Income panel failed to load: {e}", exc_info=True)
                     events, open_total, working_note = [], 0.0, None
+                    load_error = e
+                # CLEARED HERE, right before drawing, and not only at the top of the
+                # refresh: two refreshes can overlap (a double tap on Sync, the
+                # toolbar Refresh during the one that ends a Submit), each reaches this
+                # point after its own awaits, and each used to append its own copy.
+                # Nothing below awaits, so clear-and-draw is atomic.
+                income_host.clear()
+                if load_error is not None:
                     with income_host:
-                        ui.label(f'Income could not be loaded: {e}')                             .classes('text-xs text-orange-400')                             .style(class_color_style('text-orange-400'))
+                        ui.label(f'Income could not be loaded: {load_error}') \
+                            .classes('text-xs text-orange-400') \
+                            .style(class_color_style('text-orange-400'))
                 with income_host:
                     render_income_panel(
                         events, open_total, working_note=working_note,
@@ -4324,7 +4468,8 @@ async def content() -> None:
             refresh_button(_refresh)
             # The what-if control sits in the TOOLBAR, beside Valuation: both change
             # how every number below is computed, and neither is a number itself.
-            ui.switch(SIM_TOGGLE_LABEL, on_change=_toggle_simulation)                 .props('dense').tooltip(SIM_TOGGLE_TOOLTIP).mark(MARKER_SIM_TOGGLE)
+            ui.switch(SIM_TOGGLE_LABEL, on_change=_toggle_simulation) \
+                .props('dense').tooltip(SIM_TOGGLE_TOOLTIP).mark(MARKER_SIM_TOGGLE)
             ui.number(label='Simulated base', format='%.2f', min=0,
                       on_change=_set_simulated_base) \
                 .props('dense outlined hide-bottom-space prefix=$') \

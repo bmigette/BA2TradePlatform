@@ -29,6 +29,7 @@ def _rows(like: str, top: int):
                start_date, end_date
         from backtests
         where status = 'completed' and name like ? and ga_fitness is not null
+          and name not like 'WF%-OOS-R%'   -- walk-forward out-of-sample rows
         order by name
         """,
         (like,),

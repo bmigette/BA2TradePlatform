@@ -212,11 +212,11 @@ def test_the_breakpoint_event_reaches_the_registry():
     assert seen == [True]
 
 
-def test_the_listener_script_is_well_formed_and_sends_the_width():
+def test_the_listener_script_is_well_formed_and_sends_the_phone_flag():
     script = rsp.PHONE_LISTENER_HEAD_HTML
     assert script.count('{') == script.count('}')
     assert script.count('(') == script.count(')')
-    assert 'width:window.innerWidth' in script and 'phone:e.matches' in script
+    assert 'phone:e.matches' in script
     assert f'max-width: {rsp.PHONE_MAX_WIDTH_PX}px' in script
 
 
@@ -303,3 +303,191 @@ def test_dry_run_rows_are_cards_with_addressable_cells_and_a_hidden_header(
     # the dialog's primary action is first on a phone
     submit = next(e for e in elements if getattr(e, '_props', {}).get('label') == 'Submit')
     assert rsp.PRIMARY_ACTION_CLASS in classes(submit)
+
+
+def test_the_rotation_listener_dedupes_on_the_media_query_not_the_width():
+    """A pinch-zoomed iOS page reports the ZOOMED innerWidth; the media query is the
+    layout's own verdict."""
+    script = rsp.PHONE_LISTENER_HEAD_HTML
+    assert 'e.matches===last' in script
+    assert 'innerWidth' not in script and ',width' not in script
+
+
+def test_the_breakpoint_handler_follows_the_phone_flag(nicegui_client):
+    table = _table(nicegui_client)
+    registry = rsp.PhoneTableRegistry()
+    registry.register(table)
+    heads, handlers = [], {}
+    rsp.install_phone_listener(registry, heads.append,
+                               lambda name, fn: handlers.__setitem__(name, fn))
+
+    class _E:
+        def __init__(self, phone):
+            self.args = {'phone': phone}
+
+    handlers[rsp.PHONE_EVENT](_E(True))
+    assert table._props[':grid'] == 'true'
+    handlers[rsp.PHONE_EVENT](_E(False))
+    assert table._props[':grid'] == 'false'
+    assert registry.on_phone(False) is False          # no change, nothing re-pinned
+
+
+# ---------------------------------------------------------------------------
+# The redesigned phone cards: tiles, boundaries, one value size, delta INSIDE its tile
+# (operator's iPhone screenshot, 2026-10-03: no boundary between cards, caption run into
+# its value, deltas floating alone, ragged column)
+# ---------------------------------------------------------------------------
+
+def test_the_page_stylesheet_is_a_served_file_equal_to_the_generated_css():
+    """On the operator's phone the page's rules did not arrive through ``ui.add_css``
+    (every ``pf-*`` rule was missing) while the linked ``styles.css`` did. The sheet is
+    now ALSO a file linked from the head; this pins the file to the generator and the
+    link to the file's content."""
+    css_file = page.page_css_path()
+    assert css_file.read_text(encoding='utf-8') == page.page_phone_css(), (
+        'static/portfolio_allocation.css is stale: run '
+        'write_page_css() from ui/pages/portfolio_allocation.py')
+    link = page.page_css_link_html()
+    assert link.startswith('<link rel="stylesheet" href="/static/portfolio_allocation.css?v=')
+    assert page.page_css_link_html() == link          # stable for unchanged content
+
+
+def test_a_tile_is_a_caption_line_above_a_value_line():
+    html = page.card_tile_html('Current value', '{{ props.row.current_value }}',
+                               field='current_value')
+    assert html.index('class="pf-tile-k"') < html.index('class="pf-tile-v"')
+    assert 'Current value</div>' in html and 'data-field="current_value"' in html
+    assert 'pf-tile--wide' not in html
+    assert 'pf-tile--wide' in page.card_tile_html('P&L', 'x', wide=True)
+
+
+def _tiles(template):
+    import re
+    return re.findall(r'<div class="pf-tile[^"]*" data-field="(\w+)">', template)
+
+
+def test_every_figure_is_a_tile_in_a_regular_grid():
+    template = page.symbol_card_template()
+    tiles = _tiles(template)
+    by_tier = rsp.columns_by_tier(page.SYMBOL_CARD)
+    # every primary and detail column is exactly one tile, plus the wide P&L tile
+    assert sorted(tiles) == sorted(by_tier[rsp.TIER_PRIMARY] + by_tier[rsp.TIER_DETAIL]
+                                   + ['pnl'])
+    # an even number of half-width tiles in the grid and in the fold: no ragged last row
+    assert len(by_tier[rsp.TIER_PRIMARY]) % 2 == 0
+    assert len(by_tier[rsp.TIER_DETAIL]) % 2 == 0
+    # no caption-beside-value rows left over from the first design
+    assert 'pf-kv' not in template and 'pf-k"' not in template
+
+
+def test_a_change_sits_inside_the_tile_it_belongs_to():
+    template = page.symbol_card_template()
+    import re
+    for field, delta in (('target_value', 'value_delta'), ('target_quantity', 'qty_delta')):
+        tile = re.search(r'<div class="pf-tile" data-field="%s">.*?(?=<div class="pf-tile"'
+                         r'|</div></div><div class="pf-tile|</div><div class="pf-field|$)'
+                         % field, template, re.S).group(0)
+        assert f'props.row.{delta}' in tile, field
+        assert 'to target' in tile and '▼' in tile and '▲' in tile
+    # and nowhere else: the delta appears only within those two tiles
+    assert template.count('props.row.value_delta') == template.split(
+        'data-field="target_quantity"')[0].count('props.row.value_delta')
+
+
+def test_the_pnl_tile_is_full_width_with_the_sentence_on_a_second_line():
+    template = page.symbol_card_template()
+    tile = template[template.index('data-field="pnl"'):]
+    assert 'pf-tile--wide' in template[template.index('data-field="pnl"') - 60:
+                                       template.index('data-field="pnl"')]
+    assert tile.index('pf-tile-v') < tile.index('pf-tile-sub pf-pnl-rest')
+    assert "indexOf(' (')" in tile                       # split on the first " ("
+    assert 'props.row.pnl_div' in tile and 'props.row.pnl_tail' in tile
+
+
+def test_colours_are_inline_tones_not_the_dark_quasar_classes():
+    """Quasar's text-negative is #C10015 -- close to unreadable on the dark card -- and
+    the global ``span {color:#fff}`` beats an inherited class colour."""
+    template = page.symbol_card_template()
+    assert 'text-negative' not in template and 'text-positive' not in template
+    assert "#f87171" in template and "#4ade80" in template
+    assert page.card_tone_style('value_delta_color').startswith('{ color: ({ positive')
+
+
+def test_the_two_inputs_are_outlined_fields_in_their_own_blocks_and_keep_their_wiring():
+    template = page.symbol_card_template()
+    assert template.count('class="pf-field"') == 2
+    assert 'dense outlined' in template
+    assert 'inputmode="decimal"' in template and 'label="Share of label %"' in template
+    assert 'label="Comment"' in template
+
+
+def test_the_header_row_holds_the_checkbox_the_symbol_and_the_chips():
+    template = page.symbol_card_template()
+    head = template[template.index('class="pf-sym-head"'):template.index('class="pf-field"')]
+    assert head.index('q-checkbox') < head.index('pf-sym-name') < head.index('symbolInfo')
+    assert 'lev_badge' in head and 'frac_badge' in head
+
+
+def test_the_card_markup_is_balanced_so_the_vue_compile_cannot_blow_up():
+    """A malformed slot template blanks the whole page (it did once, with a doubled
+    quote); the tag structure is checked here, the expressions in the browser."""
+    from html.parser import HTMLParser
+
+    class _Counter(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.depth = {}
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ('div', 'span', 'q-expansion-item', 'q-input'):
+                self.depth[tag] = self.depth.get(tag, 0) + 1
+            for _name, value in attrs:
+                assert value is None or '"' not in value, (tag, value)
+
+        def handle_startendtag(self, tag, attrs):
+            self.handle_starttag(tag, attrs)
+            if tag in self.depth:
+                self.depth[tag] -= 1
+
+        def handle_endtag(self, tag):
+            if tag in self.depth:
+                self.depth[tag] -= 1
+
+    counter = _Counter()
+    counter.feed(page.symbol_card_template())
+    assert all(v == 0 for v in counter.depth.values()), counter.depth
+
+
+def test_the_card_css_gives_each_card_a_boundary_and_one_size_per_role():
+    css = page.SYMBOL_CARD_CSS
+    card = css[css.index('.pf-sym-card {'):css.index('}', css.index('.pf-sym-card {'))]
+    assert 'border: 1px solid' in card and 'border-radius: 12px' in card
+    assert 'margin: 0 0 12px' in card and 'background:' in card
+    value = css[css.index('.pf-tile-v {'):css.index('}', css.index('.pf-tile-v {'))]
+    assert 'font-size: 16px' in value and 'tabular-nums' in value
+    caption = css[css.index('.pf-tile-k {'):css.index('}', css.index('.pf-tile-k {'))]
+    assert 'font-size: 11px' in caption and 'uppercase' in caption
+    assert 'repeat(2, minmax(0, 1fr))' in css          # a strict two-column grid
+
+
+def test_hand_rolled_cards_get_the_same_structure_from_the_generator():
+    css = rsp.card_rows_css(wiz.DRY_RUN_ROW_KEY, wiz.DRY_RUN_CELL_PREFIX, wiz.DRY_RUN_CARD)
+    card = css[css.index('.pf-card-row.pf-dry-row {'):]
+    card = card[:card.index('}')]
+    assert 'border: 1px solid' in card and 'border-radius: 12px' in card
+    assert 'margin: 0 0 12px' in card and 'box-sizing: border-box' in card
+    # a tile: caption above (own grid line), padded, equal minimum height
+    assert 'min-height: 4rem' in css and 'grid-column: 1 / -1; color: #94a3b8' in css
+    assert 'font-size: 11px' in css and 'text-transform: uppercase' in css
+    # the head line has a divider; Details is a full-width 44px button row
+    assert 'border-bottom: 1px solid' in css
+    assert 'line-height: 44px' in css and 'content: "Details' in css
+    # one value size
+    assert 'font-size: 16px !important' in rsp.card_rows_common_css()
+    # no left indent for the tick: tiles use the card's full width
+    assert 'padding: 10px 8px 10px 8px' in card
+
+
+def test_the_label_header_is_a_card_too():
+    assert '.q-expansion-item:has(.pf-bar-row)' in page.LABEL_BAR_PHONE_CSS
+    assert 'border-radius: 12px' in page.LABEL_BAR_PHONE_CSS
