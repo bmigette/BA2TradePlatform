@@ -206,8 +206,9 @@ is hermetic and seeded, so its fitness does not depend on which host ran it.
   `--worker NAME` (repeatable) or `--workers A,B` to `ba2-test optimize` or `optimize-batch`.
 - **Pre-flight** (`services/distributed_eval.py`): for each selected worker, the master calls
   `ensure_synced` (`services/worker_client.py`). This compares the worker's `TEST_APP_VERSION`
-  with the master's and triggers `/update` (git pull, package reinstall, restart) on a
-  mismatch. The master then pushes missing cache files as a tar stream, and prepares the
+  with the master's, and the worker's reported package versions with the master's
+  `REQUIRED_PACKAGE_VERSIONS`, and triggers `/update` (git pull, package reinstall, restart) on a
+  mismatch or a package below its minimum. The master then pushes missing cache files as a tar stream, and prepares the
   market-condition snapshot if the run pins one. A worker that fails pre-flight is dropped.
   The master re-checks dropped workers during the run and re-admits any that recover.
 - **During a run**: the master's local consumer threads and the remote dispatcher threads all
@@ -333,11 +334,13 @@ pass `--apply` to move files, and restart running instances afterwards.
 ## Versioning
 
 `version.py` holds `TEST_APP_VERSION` (`YYYY.MM.NNNNN`). Increment the build number before
-every push that touches `testplatform/` **or `packages/`**. Changes confined to
-`ba2_trade_platform/` bump `ba2_trade_platform/version.py` instead. Workers compare
-`TEST_APP_VERSION` only, not the git commit. An unbumped shared-package change would leave
-workers running different code while they report themselves as synced. Commit and push the
-bump: the master refuses to sync workers to a version that a `git pull` cannot reach
+every push that touches `testplatform/`. Each shared package has its own `PACKAGE_VERSION`
+(`packages/<dir>/<pkg>/version.py`), bumped on every change to that package; the test platform
+requires workers to run at least `REQUIRED_PACKAGE_VERSIONS` (`required_package_versions.py`), and
+that minimum is raised only when a package change can affect GA results (GA-neutral paths are
+listed in `ga_neutral_package_paths.py`). Workers compare `TEST_APP_VERSION` and those minimums, not
+the git commit. `python tools/check_package_versions.py` enforces the bump rules. Commit and push
+the bump: the master refuses to sync workers to a version that a `git pull` cannot reach
 (`self_update.unsyncable_reason`).
 
 ## Testing
