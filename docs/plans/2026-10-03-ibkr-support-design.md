@@ -592,3 +592,19 @@ What is **missing**, exactly (nothing is faked):
 * **Restarts:** the platform loads the new account class only on restart of the instance that uses it; no
   existing account (there is no IBKR account in any live DB) is affected. `ib_async` is already installed in
   the venv (2.1.0); `requirements.txt` only gained bounds.
+
+### Known limitations of this implementation (none are hidden by a fallback)
+
+* **Share-class option underlyings** (BRK.B, BF.B): `get_option_quote(occ)` is given only the OCC symbol,
+  whose root (`BRKB`) is not IB's underlying symbol (`BRK B`), so the contract lookup fails (loudly) unless
+  the leg also carries its `underlying`, which the order paths do. Chains and orders are unaffected.
+* **Orders placed by another client id** (typed in TWS, or a second API session) are listed and refreshed
+  but cannot be cancelled or modified by this client (IBKR allows that only for the same client id, or the
+  master client 0); the adapter says so instead of pretending. Run the platform as client 0 only if you
+  want it to manage manual TWS orders.
+* **A BAG combo's per-leg price** exists only if IBKR reports per-leg executions (UNVERIFIED); otherwise the
+  leg rows keep a NULL price and the structure's net price is on the parent.
+* **Reconnect while orders are resting** is covered by refreshing from IBKR's open/completed lists by
+  `orderRef`; there is no replay of events missed while disconnected.
+* **TWS Read-Only API + `readonly=True` connect:** ib_async skips its startup open-order fetch in read-only
+  mode; the adapter never depends on it (every order read is an explicit `reqAllOpenOrders`).
