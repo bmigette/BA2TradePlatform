@@ -22,6 +22,8 @@ from ..utils.chart_helpers import (
     growth_pct_of_invested, label_series_colors, legend_options, mode_toggle,
     pct_of_invested, responsive_echart, legend_below, grid_below,
 )
+from ..utils.dividend_table import DIVIDEND_ROOT_CLASS, dividend_columns, dividend_phone_css
+from ..utils.responsive import CssOnce
 from ..utils.chart_axes import (
     MAX_DETAIL_LABELS, clip_forecast, date_axis, detail_labels, first_holding_index,
     month_axis, null_before_start, stacked_month_series, stacked_tooltip_js,
@@ -5289,6 +5291,9 @@ def merge_refresh(prev, new, failed, accept_empty=frozenset()):
 _UNFETCHED = object()
 
 
+_GROWTH_CSS_ONCE = CssOnce()
+
+
 def _save_setting(key, value) -> bool:
     """``write_overview_setting`` that SAYS so when it fails: a view preference that does not
     persist must not look like one that does."""
@@ -5671,6 +5676,11 @@ class AccountGrowthTab:
     def render(self):
         logger.debug("[RENDER] AccountGrowthTab.render() - START")
         selected_account_id = get_selected_account_id()
+
+        # The dividend table's phone CSS is installed HERE, synchronously, before the first
+        # await: the table itself is drawn after the data loads, and NiceGUI drops an
+        # add_css that arrives after an await (see portfolio_allocation._install_page_styles).
+        _GROWTH_CSS_ONCE.add(ui.context.client, 'dividend-history', dividend_phone_css(), ui.add_css)
 
         with ui.card().classes('w-full mb-4 p-4'):
             ui.label('Account Growth').classes('text-lg font-bold mb-2')
@@ -7593,16 +7603,7 @@ class AccountGrowthTab:
                 row['drip_price'] = ''
             rows.append(row)
 
-        columns = [
-            {'name': 'date', 'label': 'Date', 'field': 'date', 'sortable': True, 'align': 'left'},
-            {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
-            {'name': 'amount', 'label': 'Gross ($)', 'field': 'amount', 'sortable': True, 'align': 'right'},
-            {'name': 'tax', 'label': 'Tax ($)', 'field': 'tax', 'sortable': True, 'align': 'right'},
-            {'name': 'net', 'label': 'Net ($)', 'field': 'net', 'sortable': True, 'align': 'right'},
-            {'name': 'drip_shares', 'label': 'DRIP Shares', 'field': 'drip_shares', 'sortable': False, 'align': 'right'},
-            {'name': 'drip_price', 'label': 'DRIP Price', 'field': 'drip_price', 'sortable': False, 'align': 'right'},
-            {'name': 'account', 'label': 'Account', 'field': 'account', 'sortable': True, 'align': 'left', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
-        ]
+        columns = dividend_columns(rows)       # short labels; DRIP columns only with DRIP data
 
         total_gross = sum(r['amount'] for r in rows)
         total_tax = sum(r['tax'] for r in rows)
@@ -7629,7 +7630,7 @@ class AccountGrowthTab:
                 row_key='id',
                 pagination={'rowsPerPage': rows_per_page, 'sortBy': 'date',
                             'descending': True},
-            ).classes('w-full').props('dense')
+            ).classes(f'w-full {DIVIDEND_ROOT_CLASS}').props('dense')
 
         with ui.card().classes('w-full mb-4 p-4'):
             with ui.row().classes('w-full items-center justify-between'):
