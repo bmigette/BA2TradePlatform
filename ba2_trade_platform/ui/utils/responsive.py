@@ -308,8 +308,12 @@ PHONE_EVENT = 'pf_phone_change'
 PHONE_LISTENER_HEAD_HTML = (
     '<script>(function(){var m=window.matchMedia("(max-width: '
     f'{PHONE_MAX_WIDTH_PX}px)");'
-    'var f=function(e){if(window.emitEvent){window.emitEvent("'
-    f'{PHONE_EVENT}",{{phone:e.matches,width:window.innerWidth}});}}}};'
+    # Deduplicated on ``e.matches`` -- the media query's own verdict -- and NOT on
+    # ``window.innerWidth``: a pinch-zoomed iOS page reports the ZOOMED width.
+    'var last=m.matches;'
+    'var f=function(e){if(e.matches===last){return;}last=e.matches;'
+    'if(window.emitEvent){window.emitEvent("'
+    f'{PHONE_EVENT}",{{phone:e.matches}});}}}};'
     'if(m.addEventListener){m.addEventListener("change",f);}else{m.addListener(f);}'
     '})();</script>'
 )
@@ -337,6 +341,16 @@ class PhoneTableRegistry:
         for table in list(self._tables):
             table.props(phone_grid_prop(phone))
 
+    def on_phone(self, phone: bool) -> bool:
+        """The media query now says ``phone``. Re-pin the tables when that is a different
+        layout from the one they are in; return whether anything changed."""
+        phone = bool(phone)
+        if phone == self._phone:
+            return False
+        self._phone = phone
+        self.set_phone(phone)
+        return True
+
     def on_width(self, width_px: float) -> bool:
         """The viewport is now ``width_px`` wide. Re-pin the tables when that is a
         different layout from the one they are in; return whether anything changed.
@@ -346,12 +360,7 @@ class PhoneTableRegistry:
         line does nothing. Tables registered AFTER an event are pinned too (a refresh
         rebuilds them), which is why the last state is remembered.
         """
-        phone = is_phone_width(width_px)
-        if phone == self._phone:
-            return False
-        self._phone = phone
-        self.set_phone(phone)
-        return True
+        return self.on_phone(is_phone_width(width_px))
 
     def __len__(self) -> int:
         return len(self._tables)
@@ -367,6 +376,6 @@ def install_phone_listener(registry: PhoneTableRegistry, add_head_html: Callable
     add_head_html(PHONE_LISTENER_HEAD_HTML)
 
     def _changed(event) -> None:
-        registry.on_width(float(event.args['width']))
+        registry.on_phone(bool(event.args['phone']))
 
     on_event(PHONE_EVENT, _changed)

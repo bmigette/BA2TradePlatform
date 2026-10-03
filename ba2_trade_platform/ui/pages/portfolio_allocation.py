@@ -3963,6 +3963,11 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
             logger.error(f"Allocation submission failed: {e}", exc_info=True)
             ui.notify(f'Submission failed: {e}', type='negative')
             if wizard is not None:
+                # Paint what the worker had already recorded FIRST: a row that landed in
+                # the last 200 ms before the exception has a real outcome, and marking
+                # it "unknown - check the broker" before painting it would leave the
+                # amber mark winning over a FAILED the details view then contradicts.
+                _paint()
                 wizard.finish_submit(SUBMIT_FAILED_FMT.format(error=e), interrupted=True)
             return
         finally:
@@ -4186,11 +4191,22 @@ async def content() -> None:
                 try:
                     events, open_total, working_note = await asyncio.to_thread(
                         _load_income_panel, account_id)
+                    load_error = None
                 except Exception as e:
                     logger.error(f"Income panel failed to load: {e}", exc_info=True)
                     events, open_total, working_note = [], 0.0, None
+                    load_error = e
+                # CLEARED HERE, right before drawing, and not only at the top of the
+                # refresh: two refreshes can overlap (a double tap on Sync, the
+                # toolbar Refresh during the one that ends a Submit), each reaches this
+                # point after its own awaits, and each used to append its own copy.
+                # Nothing below awaits, so clear-and-draw is atomic.
+                income_host.clear()
+                if load_error is not None:
                     with income_host:
-                        ui.label(f'Income could not be loaded: {e}')                             .classes('text-xs text-orange-400')                             .style(class_color_style('text-orange-400'))
+                        ui.label(f'Income could not be loaded: {load_error}') \
+                            .classes('text-xs text-orange-400') \
+                            .style(class_color_style('text-orange-400'))
                 with income_host:
                     render_income_panel(
                         events, open_total, working_note=working_note,
@@ -4324,7 +4340,8 @@ async def content() -> None:
             refresh_button(_refresh)
             # The what-if control sits in the TOOLBAR, beside Valuation: both change
             # how every number below is computed, and neither is a number itself.
-            ui.switch(SIM_TOGGLE_LABEL, on_change=_toggle_simulation)                 .props('dense').tooltip(SIM_TOGGLE_TOOLTIP).mark(MARKER_SIM_TOGGLE)
+            ui.switch(SIM_TOGGLE_LABEL, on_change=_toggle_simulation) \
+                .props('dense').tooltip(SIM_TOGGLE_TOOLTIP).mark(MARKER_SIM_TOGGLE)
             ui.number(label='Simulated base', format='%.2f', min=0,
                       on_change=_set_simulated_base) \
                 .props('dense outlined hide-bottom-space prefix=$') \

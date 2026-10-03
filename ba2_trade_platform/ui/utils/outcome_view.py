@@ -139,7 +139,8 @@ def worst_outcome(existing: Any, new: Any) -> Any:
         return new
     if new is None:
         return existing
-    if status_severity(getattr(existing, 'status', None)) >             status_severity(getattr(new, 'status', None)):
+    if status_severity(getattr(existing, 'status', None)) > \
+            status_severity(getattr(new, 'status', None)):
         return existing
     return new
 
@@ -218,12 +219,20 @@ def copy_click_js(text: str) -> str:
     literal = json.dumps(text)
     return (
         '(e) => { const t = ' + literal + '; '
+        # The textarea goes INSIDE the dialog card: Quasar's dialog pulls focus back to
+        # itself, so a textarea appended to <body> never keeps focus or a selection --
+        # and execCommand("copy") then still returns true having copied nothing.
+        'const host = (e && e.target && e.target.closest && e.target.closest(".q-card")) '
+        '|| document.body; '
         'const a = document.createElement("textarea"); a.value = t; '
         'a.setAttribute("readonly", ""); a.style.position = "fixed"; '
-        'a.style.opacity = "0"; document.body.appendChild(a); a.focus(); a.select(); '
-        'a.setSelectionRange(0, t.length); '
-        'let ok = false; try { ok = document.execCommand("copy"); } catch (x) {} '
-        'document.body.removeChild(a); '
+        'a.style.opacity = "0"; a.style.left = "0"; a.style.top = "0"; '
+        'host.appendChild(a); a.focus(); a.select(); a.setSelectionRange(0, t.length); '
+        # Only trust execCommand when the textarea really holds focus and a selection.
+        'let ok = false; '
+        'if (document.activeElement === a && a.selectionEnd - a.selectionStart === t.length) '
+        '{ try { ok = document.execCommand("copy"); } catch (x) {} } '
+        'host.removeChild(a); '
         'if (!ok && navigator.clipboard && window.isSecureContext) { '
         'navigator.clipboard.writeText(t).then(() => emit({ok: true}), '
         '() => emit({ok: false})); } else { emit({ok: ok}); } }'

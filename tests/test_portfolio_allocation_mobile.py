@@ -212,11 +212,11 @@ def test_the_breakpoint_event_reaches_the_registry():
     assert seen == [True]
 
 
-def test_the_listener_script_is_well_formed_and_sends_the_width():
+def test_the_listener_script_is_well_formed_and_sends_the_phone_flag():
     script = rsp.PHONE_LISTENER_HEAD_HTML
     assert script.count('{') == script.count('}')
     assert script.count('(') == script.count(')')
-    assert 'width:window.innerWidth' in script and 'phone:e.matches' in script
+    assert 'phone:e.matches' in script
     assert f'max-width: {rsp.PHONE_MAX_WIDTH_PX}px' in script
 
 
@@ -303,3 +303,30 @@ def test_dry_run_rows_are_cards_with_addressable_cells_and_a_hidden_header(
     # the dialog's primary action is first on a phone
     submit = next(e for e in elements if getattr(e, '_props', {}).get('label') == 'Submit')
     assert rsp.PRIMARY_ACTION_CLASS in classes(submit)
+
+
+def test_the_rotation_listener_dedupes_on_the_media_query_not_the_width():
+    """A pinch-zoomed iOS page reports the ZOOMED innerWidth; the media query is the
+    layout's own verdict."""
+    script = rsp.PHONE_LISTENER_HEAD_HTML
+    assert 'e.matches===last' in script
+    assert 'innerWidth' not in script and ',width' not in script
+
+
+def test_the_breakpoint_handler_follows_the_phone_flag(nicegui_client):
+    table = _table(nicegui_client)
+    registry = rsp.PhoneTableRegistry()
+    registry.register(table)
+    heads, handlers = [], {}
+    rsp.install_phone_listener(registry, heads.append,
+                               lambda name, fn: handlers.__setitem__(name, fn))
+
+    class _E:
+        def __init__(self, phone):
+            self.args = {'phone': phone}
+
+    handlers[rsp.PHONE_EVENT](_E(True))
+    assert table._props[':grid'] == 'true'
+    handlers[rsp.PHONE_EVENT](_E(False))
+    assert table._props[':grid'] == 'false'
+    assert registry.on_phone(False) is False          # no change, nothing re-pinned
