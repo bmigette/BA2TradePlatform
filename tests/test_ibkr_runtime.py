@@ -33,8 +33,8 @@ class TestThreading:
         account, fake = world
         account.get_account_snapshot()
         rt = account._runtime()
-        assert fake.call_threads["accountSummaryAsync"] == rt.loop_thread.ident
-        assert fake.call_threads["accountSummaryAsync"] != threading.get_ident()
+        assert fake.call_threads["accountValues"] == rt.loop_thread.ident
+        assert fake.call_threads["accountValues"] != threading.get_ident()
         assert fake.call_threads["connectAsync"] == rt.loop_thread.ident
         assert rt.loop_thread.daemon is True
 
@@ -53,6 +53,7 @@ class TestThreading:
 
     def test_a_slow_ibkr_call_times_out_boundedly_and_the_loop_survives(self, world, monkeypatch):
         account, fake = world
+        fake.updates_available = False                      # force the awaited summary path
         monkeypatch.setattr(IBKRAccount, "_READ_TIMEOUT", 0.3)
         fake.block_calls["accountSummaryAsync"] = 5.0
         started = time.monotonic()
@@ -64,6 +65,7 @@ class TestThreading:
     def test_timeout_names_the_account_and_the_operation(self, world, monkeypatch):
         account, fake = world
         account.get_positions()                                      # connected: no connect budget
+        fake.updates_available = False
         fake.block_calls["accountSummaryAsync"] = 5.0
         with pytest.raises(TimeoutError, match=r"IBKR account \d+.*account info"):
             account._runtime().call(lambda ib: account._account_numbers(ib), timeout=0.2,
@@ -72,6 +74,7 @@ class TestThreading:
     def test_a_slow_call_does_not_block_another_threads_call(self, world, monkeypatch):
         account, fake = world
         account.get_positions()                                      # connect first
+        fake.updates_available = False
         fake.block_calls["accountSummaryAsync"] = 0.6
         done = {}
 
@@ -93,6 +96,7 @@ class TestThreading:
         thread, so the UI loop is never the one waiting."""
         account, fake = world
         account.get_positions()
+        fake.updates_available = False
         fake.block_calls["accountSummaryAsync"] = 0.5
         ticks = []
 

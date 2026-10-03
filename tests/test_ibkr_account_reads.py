@@ -67,11 +67,29 @@ class TestAccountState:
 
     def test_failed_fetch_is_an_all_none_snapshot_never_zeros(self, world):
         account, fake, *_ = world
-        fake.fail_calls["accountSummaryAsync"] = ConnectionError("socket closed")
+        fake.fail_account_reads(ConnectionError("socket closed"))
         snap = account.get_account_snapshot()
         assert snap == AccountSnapshot()
         assert account.get_balance() is None
         assert account.get_account_info() == {}
+
+    def test_the_live_account_stream_beats_the_three_minute_summary(self, world):
+        """AvailableFunds moves at once on a fill in the account-updates stream; reqAccountSummary
+        refreshes only every ~3 minutes, so a stale summary must never win."""
+        from ib_async import AccountValue
+        account, fake, *_ = world
+        fake.summary_rows = [AccountValue(ACCOUNT_ID, "NetLiquidation", "1", "USD", ""),
+                             AccountValue(ACCOUNT_ID, "AvailableFunds", "999999", "USD", ""),
+                             AccountValue(ACCOUNT_ID, "BuyingPower", "999999", "USD", "")]
+        fake.set_account_value("AvailableFunds", "10000")
+        fake.set_account_value("BuyingPower", "40000")
+        snap = account.get_account_snapshot()
+        assert snap.buying_power == pytest.approx(20000.0) and snap.equity == 100000.0
+
+    def test_the_summary_is_only_the_fallback_before_the_stream_has_delivered(self, world):
+        account, fake, *_ = world
+        fake.updates_available = False
+        assert account.get_account_snapshot().buying_power == pytest.approx(160000.0)
 
     def test_balance_is_net_liquidation(self, world):
         account, *_ = world

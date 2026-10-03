@@ -145,14 +145,16 @@ class IBKROptionsMixin:
         out: Dict[int, Dict[str, Any]] = {}
         for start in range(0, len(contracts), self._QUOTE_BATCH):
             batch = contracts[start:start + self._QUOTE_BATCH]
-            tickers = [(c, ib.reqMktData(c, "101", False, False)) for c in batch]
-            try:
-                deadline = time.monotonic() + self._QUOTE_WAIT
-                while time.monotonic() < deadline and not all(self._has_data(t) for _, t in tickers):
-                    await asyncio.sleep(0.05)
-            finally:
-                for contract, _ in tickers:
-                    ib.cancelMktData(contract)
+            async with self._market_data_lock():
+                tickers = [(c, ib.reqMktData(c, "101", False, False)) for c in batch]
+                try:
+                    deadline = time.monotonic() + self._QUOTE_WAIT
+                    while time.monotonic() < deadline and not all(
+                            self._has_data(t) for _, t in tickers):
+                        await asyncio.sleep(0.05)
+                finally:
+                    for contract, _ in tickers:
+                        ib.cancelMktData(contract)
             for contract, ticker in tickers:
                 out[int(contract.conId)] = self._quote_values(contract, ticker)
         return out

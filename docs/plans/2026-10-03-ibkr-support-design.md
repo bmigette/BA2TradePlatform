@@ -490,6 +490,13 @@ Deviations from the sections above, and why:
 * **Flex is implemented**, not just designed (7.1): `flex_token` / `flex_query_id` enable
   `get_dividends`, `get_cash_transfers` and `get_balance_history`, cached 10 minutes; unset they return
   `[]` with one WARNING per process. Schema names are UNVERIFIED.
+* **Account values come from the account-updates stream** (`ib.accountValues`, which ib_async subscribes at
+  connect and IBKR pushes on every change), with `reqAccountSummary` only as the fallback for the first
+  reads: the summary subscription refreshes about every three minutes, long enough to over-state buying
+  power after a fill (UNVERIFIED cadence; the smoke script prints both sources side by side).
+* **Market-data requests share one lock per connection** (price snapshots, option streaming batches, the
+  shortable tick), so their lines can never add up past IBKR's ~100-line budget when a chain pull and a
+  price lookup overlap.
 * The in-place exit modification stores the **tick-rounded** price IB was sent, not the requested one.
 * A `cancel_order` on an order IB already reports Cancelled returns True (goal met, the refresh
   records the final status); on a Filled one it returns False and says so.
@@ -561,3 +568,27 @@ What is **missing**, exactly (nothing is faked):
 2. `OptionContract.volume` (Q4). 3. `rho`. 4. No IBKR historical-option ingest provider
    (`OptionsDataProviderInterface`): that interface feeds the backtest cache and IBKR offers no bulk
    historical chain.
+
+### Stage 4 (wiring, UI, docs), as built
+
+* **Registry / settings UI:** `providers["IBKR"]` and the `InteractiveBrokers` alias already existed. The
+  settings dialog hides an *abstract* provider (`selectable_account_providers`), so IBKR became selectable
+  simply by becoming concrete; `tests/test_ibkr_conformance.py` pins that. The settings it declares
+  (host, port, client_id, account_id, paper_account, read_only, optional flex_token / flex_query_id) render
+  through the generic dialog (str/int/bool), which already refuses an unset required value by name.
+* **Docs:** `docs/IBKR-SETUP.md` (IB Gateway paper setup: enabling the API, ports, trusted IPs, read-only API,
+  client ids, restart behaviour, Flex), README broker table + links, CLAUDE.md note (rules specific to the
+  adapter), `docs/INDEX.md`.
+* **Smoke script:** `tools/ibkr_paper_smoke.py` (tested against the fake in `tests/test_ibkr_paper_smoke.py`):
+  read-only session first, always; `--place-test-order` reconnects writable only after the account id is
+  confirmed to start with `DU`, places one 1-share limit at half the last price, then cancels it. Prints each
+  UNVERIFIED fact as a `[CHECK]` line and a summary block to send back.
+* **Pins:** `ib_async>=2.1.0,<3` in `requirements.txt` with a floor/ceiling test in
+  `tests/test_broker_sdk_pins.py` (the same pattern as tastytrade/alpaca-py).
+* **Versions:** none bumped (instruction). The change touches `packages/` and `ba2_trade_platform/`, so before
+  the branch is pushed **both** `testplatform/version.py` (packages/ change: distributed GA workers compare
+  `TEST_APP_VERSION`) **and** `ba2_trade_platform/version.py` need their build number incremented (CLAUDE.md,
+  "Versioning").
+* **Restarts:** the platform loads the new account class only on restart of the instance that uses it; no
+  existing account (there is no IBKR account in any live DB) is affected. `ib_async` is already installed in
+  the venv (2.1.0); `requirements.txt` only gained bounds.

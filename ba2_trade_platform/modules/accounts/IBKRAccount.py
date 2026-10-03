@@ -294,6 +294,13 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
     def _utcnow() -> datetime:
         return datetime.now(timezone.utc)
 
+    def _market_data_lock(self) -> asyncio.Lock:
+        """The runtime-wide lock around any group of market-data requests (loop thread only)."""
+        state = self._runtime().state
+        if state.data_lock is None:
+            state.data_lock = asyncio.Lock()
+        return state.data_lock
+
     # ------------------------------------------------------------------ contracts (loop thread)
     async def _resolve_stock(self, ib: Any, symbol: str) -> _Resolved:
         key = (symbol or "").strip().upper()
@@ -384,8 +391,9 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         for start in range(0, len(live), self._PRICE_CHUNK):
             chunk = live[start:start + self._PRICE_CHUNK]
             try:
-                tickers = await asyncio.wait_for(
-                    ib.reqTickersAsync(*[r.contract for _, r in chunk]), self._READ_TIMEOUT)
+                async with self._market_data_lock():
+                    tickers = await asyncio.wait_for(
+                        ib.reqTickersAsync(*[r.contract for _, r in chunk]), self._READ_TIMEOUT)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[Account {self.id}] price snapshot for {len(chunk)} symbols "
                                f"starting at {chunk[0][0]} failed: {type(e).__name__}: {e}")
@@ -436,8 +444,15 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
 
     # ------------------------------------------------------------------ account state
     async def _account_numbers(self, ib: Any):
-        rows = await asyncio.wait_for(ib.accountSummaryAsync(self._account_id), self._READ_TIMEOUT)
-        return M.select_account_values(rows, self._account_id)
+        """Account tags by name. PRIMARY source: the account-updates stream ib_async subscribes to at
+        connect (``ib.accountValues``), which IBKR pushes on every change (fills move AvailableFunds at
+        once). ``reqAccountSummary`` is only the FALLBACK (first reads before the stream has delivered):
+        its subscription refreshes every ~3 minutes, long enough to over-state buying power after a fill."""
+        account = self._account_id
+        rows = ib.accountValues(account)
+        if not any(r.tag == "NetLiquidation" for r in rows):
+            rows = await asyncio.wait_for(ib.accountSummaryAsync(account), self._READ_TIMEOUT)
+        return M.select_account_values(rows, account)
 
     async def _snapshot_inputs(self, ib: Any):
         numbers, texts = await self._account_numbers(ib)
@@ -513,7 +528,10 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         tickers: Dict[int, Any] = {}
         if need_snapshot:
             try:
-                for t in await asyncio.wait_for(ib.reqTickersAsync(*need_snapshot), self._READ_TIMEOUT):
+                async with self._market_data_lock():
+                    snapshot = await asyncio.wait_for(ib.reqTickersAsync(*need_snapshot),
+                                                      self._READ_TIMEOUT)
+                for t in snapshot:
                     tickers[int(t.contract.conId)] = t
             except Exception as e:  # noqa: BLE001 -- only matters if a mark is then missing
                 logger.warning(f"[Account {self.id}] position price snapshot failed: {e}")
@@ -856,15 +874,16 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
 
     async def _short_check(self, ib: Any, contract: Any, symbol: str) -> None:
         """Refuse to open a short unless IB reports the stock shortable AND easy to borrow."""
-        ticker = ib.reqMktData(contract, "236", False, False)
-        try:
-            deadline = time.monotonic() + 3.0
-            while M.ib_number(getattr(ticker, "shortableShares", None)) is None \
-                    and time.monotonic() < deadline:
-                await asyncio.sleep(0.05)
-            shares = getattr(ticker, "shortableShares", None)
-        finally:
-            ib.cancelMktData(contract)
+        async with self._market_data_lock():
+            ticker = ib.reqMktData(contract, "236", False, False)
+            try:
+                deadline = time.monotonic() + 3.0
+                while (M.ib_number(getattr(ticker, "shortableShares", None)) is None
+                       and time.monotonic() < deadline):
+                    await asyncio.sleep(0.05)
+                shares = getattr(ticker, "shortableShares", None)
+            finally:
+                ib.cancelMktData(contract)
         if M.ib_number(shares) is None:
             raise ValueError(
                 f"Cannot open SHORT position for {symbol}: IBKR published no shortable-shares "
@@ -1633,7 +1652,7 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
                 f"returning []."))
             return None
         state = self._runtime().state
-        cached = getattr(state, "flex", None)
+        cached = state.flex
         if cached is not None and time.monotonic() - cached[0] < self._FLEX_CACHE_SECONDS:
             return cached[1]
         try:

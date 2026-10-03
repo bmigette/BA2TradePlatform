@@ -79,6 +79,9 @@ class FakeIB:
         self.market_data_type: Optional[int] = None
         # account data
         self.account_rows: List[AccountValue] = default_account_rows(account)
+        #: when set, accountSummaryAsync serves THESE rows instead of ``account_rows`` (to test staleness)
+        self.summary_rows: Optional[List[AccountValue]] = None
+        self.updates_available = True
         self._positions: List[Position] = []
         self._portfolio: List[PortfolioItem] = []
         # contracts
@@ -181,7 +184,25 @@ class FakeIB:
     # ------------------------------------------------------------------ account
     async def accountSummaryAsync(self, account: str = "") -> List[AccountValue]:
         await self._maybe_fail("accountSummaryAsync")
+        return [r for r in self.account_summary_rows() if not account or r.account == account]
+
+    def accountValues(self, account: str = "") -> List[AccountValue]:
+        """The account-updates stream (what ib_async keeps live after connect). Empty when
+        ``updates_available`` is False, which forces the adapter onto the summary fallback."""
+        self._note("accountValues")
+        if "accountValues" in self.fail_calls:
+            raise self.fail_calls["accountValues"]
+        if not self.updates_available:
+            return []
         return [r for r in self.account_rows if not account or r.account == account]
+
+    def account_summary_rows(self) -> List[AccountValue]:
+        return self.summary_rows if self.summary_rows is not None else self.account_rows
+
+    def fail_account_reads(self, exc: BaseException) -> None:
+        """Make BOTH account-value sources fail (the stream raises, the summary raises)."""
+        self.fail_calls["accountValues"] = exc
+        self.fail_calls["accountSummaryAsync"] = exc
 
     def set_account_value(self, tag: str, value: str, currency: str = "USD") -> None:
         self.account_rows = [r for r in self.account_rows if r.tag != tag]
@@ -537,7 +558,7 @@ class FakeIB:
                          when: Optional[datetime] = None, order_ref: str = "", perm: int = 0,
                          order_id: int = 0) -> Fill:
         execution = Execution(execId=f"X{len(self.fills_list) + 1}", time=when or self.now(),
-                              acctNumber=self.account, side=side, shares=shares, price=price,
+                              acctNumber=self.account, side=side, shares=float(shares), price=float(price),
                               permId=perm, orderId=order_id, orderRef=order_ref)
         fill = Fill(contract, execution, CommissionReport(execution.execId, 1.0, "USD", 0.0, 0.0, 0),
                     execution.time)

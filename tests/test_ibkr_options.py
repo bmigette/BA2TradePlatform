@@ -484,7 +484,7 @@ class TestSharedOptionGatesOnIBKR:
 
     def test_unreadable_cash_is_unmeasurable_never_refused_on_equity(self, world):
         account, fake, _ = world
-        fake.fail_calls["accountSummaryAsync"] = ConnectionError("x")
+        fake.fail_account_reads(ConnectionError("x"))
         assert account.cash_available_for_delivery() is None
         assert account.assignment_capacity(1.0).ok is False
 
@@ -502,3 +502,34 @@ class TestSharedOptionGatesOnIBKR:
     def test_option_buying_power_comes_from_available_funds(self, world):
         account, *_ = world
         assert account.get_option_buying_power() == 80000.0
+
+
+class TestMarketDataLineBudget:
+    def test_concurrent_market_data_groups_never_overlap(self, world, monkeypatch):
+        """A chain pull and shortable-tick lookups from other threads share ONE line budget."""
+        import threading
+        from ba2_trade_platform.modules.accounts.IBKRAccount import IBKRAccount
+        account, fake, aapl = world
+        monkeypatch.setattr(IBKRAccount, "_QUOTE_BATCH", 4)
+        monkeypatch.setattr(IBKRAccount, "_QUOTE_WAIT", 0.15)
+        seed_chain(fake)
+        fake.shortable_shares[aapl.conId] = 5.0
+        account.get_positions()                                   # connect first
+        stock = account._runtime().state.contracts.get("AAPL")
+        errors = []
+
+        def shorts():
+            try:
+                for _ in range(4):
+                    account._call(lambda ib: account._short_check(ib, aapl, "AAPL"), op="short")
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=shorts) for _ in range(3)]
+        for t in threads:
+            t.start()
+        rows_ = account.get_option_chain("AAPL", EXP_NEAR, EXP_FAR)
+        for t in threads:
+            t.join()
+        assert not errors and len(rows_) == 12
+        assert fake.max_active_lines <= 4 and fake.active_lines == 0

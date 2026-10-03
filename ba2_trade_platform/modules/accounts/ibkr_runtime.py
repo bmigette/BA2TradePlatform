@@ -75,6 +75,11 @@ class RuntimeState:
         self.rules: Dict[str, Any] = {}
         self.prev_close: Dict[str, Tuple[str, float]] = {}
         self.warned: set = set()
+        #: Serialises every market-data request group (price snapshots, option streaming batches,
+        #: the shortable tick) so their lines can never add up past IBKR's ~100-line budget.
+        #: Created lazily ON the loop thread.
+        self.data_lock: Optional[asyncio.Lock] = None
+        self.flex: Any = None
 
 
 class IBKRRuntime:

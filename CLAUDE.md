@@ -64,9 +64,23 @@ Do NOT upgrade torch to the latest (e.g. 2.10+) blindly - it causes `OSError: [W
 ## Architecture
 
 ### Plugin System
-- **AccountInterface**: Base class for broker integrations (e.g., `AlpacaAccount`, `IBKRAccount`)
+- **AccountInterface**: Base class for broker integrations (e.g., `AlpacaAccount`, `TastyTradeAccount`, `IBKRAccount`)
 - **MarketExpertInterface**: Base class for AI trading experts (e.g., `TradingAgents`, `FMPRating`)
 - **ExtendableSettingsInterface**: Shared settings management via database key-value storage
+
+### Interactive Brokers (IBKR) account
+`IBKRAccount` (`modules/accounts/IBKRAccount.py`, + `ibkr_runtime.py`, `ibkr_options.py`) was written **with no live
+IBKR account to test against**: everything is exercised against `tests/ibkr_fakes.py`, a behavioural fake of
+`ib_async.IB`. Read `docs/plans/2026-10-03-ibkr-support-design.md` before changing it: it lists every UNVERIFIED IBKR
+fact and the conservative choice taken for each. Rules specific to this adapter:
+- **Never call `ib_async` from a platform thread.** Each account definition has ONE runtime (private asyncio loop
+  thread + one TWS session, `ibkr_runtime.get_runtime`) shared by every `IBKRAccount` object; use `self._call(...)`.
+  `TradeManager` builds a fresh account object per call, so a connection per object would collide on the client id.
+- Pure mapping rules (status table, error codes, OCC symbols, ticks, snapshot maths) live in
+  `ba2_common/core/ibkr_mapping.py`; the shared TP/SL exit-order maintenance in `ba2_common/core/protective_legs.py`
+  (not yet adopted by Alpaca). `ib_async` is imported only in `modules/accounts/` (CI installs `packages/*` only).
+- Operator smoke test against a PAPER Gateway: `tools/ibkr_paper_smoke.py` (read-only by default). Setup:
+  `docs/IBKR-SETUP.md`.
 
 ### Core Directory Structure
 ```
@@ -81,7 +95,7 @@ ba2_trade_platform/
 │   ├── JobManager.py        # Background job scheduling
 │   └── WorkerQueue.py       # Task queue for parallel processing
 ├── modules/
-│   ├── accounts/            # Broker implementations (AlpacaAccount, IBKRAccount)
+│   ├── accounts/            # Broker implementations (AlpacaAccount, IBKRAccount, TastyTradeAccount)
 │   ├── experts/             # Expert implementations (TradingAgents, FMPRating, etc.)
 │   └── dataproviders/       # Market data providers (news, indicators, OHLCV, etc.)
 ├── ui/                      # NiceGUI web interface
