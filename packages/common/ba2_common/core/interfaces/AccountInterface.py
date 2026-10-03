@@ -1865,8 +1865,9 @@ class AccountInterface(ReadOnlyAccountInterface):
         Close a transaction asynchronously by:
         1. For unfilled orders: Cancel them at broker and delete WAITING_TRIGGER orders from DB
         2. For filled positions: Check if there's already a pending close order
-           - If close order exists and is in ERROR state: Retry submitting it
-           - If close order exists and is not in ERROR: Do nothing (log it)
+           - If the close order is dead (terminal and never filled: ERROR, REJECTED,
+             CANCELED, EXPIRED, ...): Retry submitting a fresh one
+           - If the close order is live or filled: Do nothing (log it)
            - If no close order exists: Create and submit a new closing order
         3. Refresh orders from broker
         4. Refresh transactions to update status
@@ -2325,13 +2326,47 @@ class AccountInterface(ReadOnlyAccountInterface):
                     f"be sized safely - close it in full")
         return None
 
+    @staticmethod
+    def _is_dead_close_order(order) -> bool:
+        """A close order that ended WITHOUT executing: terminal and not filled.
+
+        Derived from the OrderStatus enum (not a hand list) so the rule follows it. A
+        REJECTED/CANCELED/EXPIRED close order leaves the position open, so it must be
+        re-submitted, never reported as "already exists".
+        """
+        return (order.status in OrderStatus.get_terminal_statuses()
+                and order.status not in OrderStatus.get_executed_statuses())
+
+    @classmethod
+    def _pick_governing_close_order(cls, closing_orders):
+        """The closing order that decides what close_transaction does.
+
+        ``closing_orders`` is oldest-first. A live or filled closing order always governs
+        (newest such), so an older dead one can never trigger a duplicate close while a
+        newer live one works, and a dead newer one never hides a live older one. With
+        none live, the newest dead one governs (and is retried).
+        """
+        if not closing_orders:
+            return None
+        non_dead = [o for o in closing_orders if not cls._is_dead_close_order(o)]
+        return non_dead[-1] if non_dead else closing_orders[-1]
+
+    @staticmethod
+    def _retire_dead_close_order(order) -> None:
+        """Mark a dead close order as superseded. ERROR is not a broker status, so it
+        becomes CANCELED as before; REJECTED/EXPIRED/CANCELED keep the broker's status so
+        the audit trail stays true. The fresh order, being newer, governs the next scan."""
+        if order.status == OrderStatus.ERROR:
+            order.status = OrderStatus.CANCELED
+
     def close_transaction(self, transaction_id: int) -> dict:
         """
         Close a transaction by:
         1. For unfilled orders: Cancel them at broker and delete WAITING_TRIGGER orders from DB
         2. For filled positions: Check if there's already a pending close order
-           - If close order exists and is in ERROR state: Retry submitting it
-           - If close order exists and is not in ERROR: Do nothing (log it)
+           - If the close order is dead (terminal and never filled: ERROR, REJECTED,
+             CANCELED, EXPIRED, ...): Retry submitting a fresh one
+           - If the close order is live or filled: Do nothing (log it)
            - If no close order exists: Create and submit a new closing order
         
         This method handles both initial close and retry close operations.
@@ -2486,7 +2521,8 @@ class AccountInterface(ReadOnlyAccountInterface):
                     account_id=self.id, transaction_id=transaction_id, session=session)
                 all_orders = sorted(
                     all_orders,
-                    key=lambda o: o.created_at or datetime.min.replace(tzinfo=timezone.utc))
+                    key=lambda o: (o.created_at or datetime.min.replace(tzinfo=timezone.utc),
+                                   o.id or 0))
 
                 if not all_orders:
                     result['message'] = 'No orders found for this transaction'
@@ -2497,7 +2533,7 @@ class AccountInterface(ReadOnlyAccountInterface):
                 executed_statuses = OrderStatus.get_executed_statuses()
                 unsent_statuses = OrderStatus.get_unsent_statuses()
                 has_filled = False
-                existing_close_order = None
+                closing_orders = []
                 last_broker_canceled_order_id = None  # Track for deferred close trigger
 
                 for order in all_orders:
@@ -2515,7 +2551,7 @@ class AccountInterface(ReadOnlyAccountInterface):
                     )
 
                     if is_closing_order:
-                        existing_close_order = order
+                        closing_orders.append(order)
                         logger.info(f"Found existing closing order {order.id} with status {order.status}")
                         continue
 
@@ -2544,14 +2580,18 @@ class AccountInterface(ReadOnlyAccountInterface):
                         except Exception as e:
                             logger.error(f"Error canceling order {order.id}: {e}")
                 
+                existing_close_order = self._pick_governing_close_order(closing_orders)
+
                 # Handle filled positions
                 if has_filled:
                     # Check if there's an existing close order
                     if existing_close_order:
-                        if existing_close_order.status == OrderStatus.ERROR:
+                        if self._is_dead_close_order(existing_close_order):
                             # Before retrying, check if position still exists at broker
                             # If position is gone, just mark transaction as CLOSED (it was already closed externally)
-                            logger.info(f"Retrying close order {existing_close_order.id} which is in ERROR state")
+                            logger.info(
+                                f"Retrying close order {existing_close_order.id}: it is dead "
+                                f"(status {existing_close_order.status.value}) and never filled")
                             try:
                                 # Check if position still exists at broker
                                 broker_positions = None
@@ -2589,8 +2629,7 @@ class AccountInterface(ReadOnlyAccountInterface):
                                                 f"Position {transaction.symbol} no longer exists at broker - "
                                                 f"marking transaction {transaction_id} as CLOSED without retry"
                                             )
-                                            # Mark the ERROR order as CANCELED (not needed anymore)
-                                            existing_close_order.status = OrderStatus.CANCELED
+                                            self._retire_dead_close_order(existing_close_order)
                                             # Mark transaction as CLOSED with logging
                                             from ba2_common.core.utils import close_transaction_with_logging
                                             close_transaction_with_logging(
@@ -2625,9 +2664,9 @@ class AccountInterface(ReadOnlyAccountInterface):
                                     )
                                     # If we can't check, proceed with retry (safer than assuming position is gone)
                                 
-                                # Mark the errored order as CANCELED and create a fresh one
-                                # via the helper (which handles TP/SL deferred submission)
-                                existing_close_order.status = OrderStatus.CANCELED
+                                # Retire the dead order and create a fresh one via the
+                                # helper (which handles TP/SL deferred submission)
+                                self._retire_dead_close_order(existing_close_order)
                                 if inmem:
                                     update_instance(existing_close_order)
                                 else:
