@@ -163,55 +163,112 @@ def detail_labels(visible: Sequence[str], cap: int = MAX_DETAIL_LABELS) -> Tuple
     return vis[:cap], max(0, len(vis) - cap)
 
 
+TOTAL_NAME = 'Total (shown labels, each symbol once)'
+
+
+def shown_label_totals(months: Sequence[str], shown: Iterable[str],
+                       by_symbol: Dict[str, Dict[str, float]],
+                       labels_of: Dict[str, Sequence[str]]) -> Dict[str, Any]:
+    """Per month: ``totals`` = realized P&L + dividends of the DISTINCT symbols that carry at
+    least one shown label (each symbol counted ONCE however many shown labels it has),
+    ``not_shown`` = what the other symbols made, and ``overlap`` = does any symbol with a value
+    carry two or more shown labels (then a per-label stack cannot add up). Pure.
+
+    ``by_symbol``: ``{month: {symbol: value}}``; ``labels_of``: ``{symbol: [labels]}`` (a symbol
+    without labels is 'Unlabeled'). Months with no row give ``None``.
+    """
+    shown_set = set(shown)
+    totals: List[Optional[float]] = []
+    not_shown: List[Optional[float]] = []
+    overlap = False
+    for m in months:
+        row = by_symbol.get(m)
+        if not row:
+            totals.append(None)
+            not_shown.append(None)
+            continue
+        t = n = 0.0
+        for sym, v in row.items():
+            labs = labels_of.get(sym) or ['Unlabeled']
+            k = sum(1 for lb in labs if lb in shown_set)
+            if k >= 2 and v:
+                overlap = True
+            if k >= 1:
+                t += v
+            else:
+                n += v
+        totals.append(round(t, 2))
+        not_shown.append(round(n, 2))
+    return {'totals': totals, 'not_shown': not_shown, 'overlap': overlap}
+
+
 def stacked_month_series(months: Sequence[str], labels: Sequence[str],
                          cell: Callable[[str, str], Optional[float]],
                          forecast_cell: Callable[[str, str], Optional[float]],
                          color_of: Callable[[str], str],
                          faded_of: Callable[[str], str],
-                         include_forecast: bool = True) -> List[dict]:
-    """Bars stacked per month: positive values up, negative down (``samesign`` stacking), one
-    series per label, a transparent dashed forecast segment per label on top of its actual,
-    and a ``Total`` marker per month = the sum of the ACTUAL values only (forecast is never
-    mixed into it)."""
+                         include_forecast: bool = True,
+                         stacked: bool = True,
+                         totals: Optional[Sequence[Optional[float]]] = None) -> List[dict]:
+    """One bar series per label (+ a transparent dashed forecast segment per label) and a
+    Total marker per month.
+
+    ``stacked=True``: all labels share one ``samesign`` stack (positives up, negatives down) --
+    only honest when the shown labels are DISJOINT. ``stacked=False``: labels sit side by side,
+    each label's forecast stacked on its own bar. ``totals`` is the Total marker (see
+    :func:`shown_label_totals`: distinct symbols); without it the marker is the sum of the
+    ACTUAL segments. The forecast is never part of the Total."""
     series: List[dict] = []
-    totals = [0.0 for _ in months]
-    any_total = [False for _ in months]
+    sums = [0.0 for _ in months]
+    any_sum = [False for _ in months]
     for lb in labels:
         data = [cell(m, lb) for m in months]
         for i, v in enumerate(data):
             if v is not None:
-                totals[i] += v
-                any_total[i] = True
-        series.append({'name': lb, 'type': 'bar', 'stack': 'labels', 'stackStrategy': 'samesign',
-                       'data': data, 'itemStyle': {'color': color_of(lb)}, 'barMaxWidth': 46})
+                sums[i] += v
+                any_sum[i] = True
+        s = {'name': lb, 'type': 'bar', 'stack': 'labels' if stacked else lb, 'data': data,
+             'itemStyle': {'color': color_of(lb)}, 'barMaxWidth': 46}
+        if stacked:
+            s['stackStrategy'] = 'samesign'
+        series.append(s)
     if include_forecast:
         for lb in labels:
             data = [forecast_cell(m, lb) for m in months]
             if any(v is not None for v in data):
-                series.append({'name': f'{lb} (forecast, estimated)', 'type': 'bar', 'stack': 'labels',
-                               'stackStrategy': 'samesign', 'data': data, 'barMaxWidth': 46,
-                               'itemStyle': {'color': faded_of(lb), 'borderColor': color_of(lb),
-                                             'borderType': 'dashed', 'borderWidth': 1}})
-    series.append({'name': 'Total', 'type': 'line', 'symbol': 'diamond', 'symbolSize': 9,
+                s = {'name': f'{lb} (forecast, estimated)', 'type': 'bar',
+                     'stack': 'labels' if stacked else lb, 'data': data, 'barMaxWidth': 46,
+                     'itemStyle': {'color': faded_of(lb), 'borderColor': color_of(lb),
+                                   'borderType': 'dashed', 'borderWidth': 1}}
+                if stacked:
+                    s['stackStrategy'] = 'samesign'
+                series.append(s)
+    marker = (list(totals) if totals is not None
+              else [round(t, 2) if any_sum[i] else None for i, t in enumerate(sums)])
+    series.append({'name': TOTAL_NAME, 'type': 'line', 'symbol': 'diamond', 'symbolSize': 9,
                    'lineStyle': {'width': 0}, 'itemStyle': {'color': '#f59e0b', 'borderColor': '#fff',
                                                              'borderWidth': 1},
-                   'z': 10,
-                   'data': [round(t, 2) if any_total[i] else None for i, t in enumerate(totals)]})
+                   'z': 10, 'data': marker})
     return series
 
 
-def stacked_tooltip_js(pct: bool = False) -> str:
-    """Tooltip for the stacked chart: every non-zero entry sorted by magnitude, ``Total`` last."""
+def stacked_tooltip_js(pct: bool = False, not_shown: Optional[Sequence[Optional[float]]] = None) -> str:
+    """Tooltip: every non-zero label entry sorted by magnitude, then the distinct-symbol Total and,
+    when the shown labels do not cover everything the account made that month, a
+    'Not shown (other labels)' line."""
     fmt = ("v => Number(v).toFixed(2) + '%'" if pct
            else "v => (v < 0 ? '-$' : '$') + Math.abs(v).toFixed(2)")
+    ns = json.dumps(list(not_shown) if not_shown else [])
     return (
         "(params) => { const rows = params.filter(p => p.value !== null && p.value !== undefined"
-        " && p.seriesName !== 'Total' && Number(p.value) !== 0)"
+        " && p.seriesName !== " + json.dumps(TOTAL_NAME) + " && Number(p.value) !== 0)"
         ".sort((a, b) => Math.abs(b.value) - Math.abs(a.value));"
         f" const fmt = {fmt};"
         " let out = '<b>' + params[0].axisValueLabel + '</b>';"
         " rows.forEach(p => { out += '<br/>' + p.marker + p.seriesName + ': ' + fmt(Number(p.value)); });"
-        " const t = params.find(p => p.seriesName === 'Total');"
-        " if (t && t.value !== null && t.value !== undefined) out += '<br/><b>Total: ' + fmt(Number(t.value)) + '</b>';"
+        " const t = params.find(p => p.seriesName === " + json.dumps(TOTAL_NAME) + ");"
+        " if (t && t.value !== null && t.value !== undefined) out += '<br/><b>' + t.seriesName + ': ' + fmt(Number(t.value)) + '</b>';"
+        f" const ns = {ns}[params[0].dataIndex];"
+        " if (ns !== null && ns !== undefined && Math.abs(ns) >= 0.005) out += '<br/>Not shown (other labels): ' + fmt(Number(ns));"
         " return out; }"
     )
