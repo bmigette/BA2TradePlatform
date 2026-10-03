@@ -173,7 +173,7 @@ from ..utils.portfolio_allocation_view import (
     important_color_style,
     SUBMIT_FAILED_FMT, format_pnl_caption_parts, missing_quote_symbols,
     picker_options, pnl_classes,
-    pnl_color, pnl_div_classes, pnl_div_color, pnl_div_delta_color, submit_result_cell,
+    pnl_color, pnl_div_classes, pnl_div_color, pnl_div_delta_color,
     submit_summary_line,
     positions_by_symbol,
     resolve_label_icon_color, resolve_symbol_weights,
@@ -185,7 +185,7 @@ from ..utils.portfolio_allocation_view import (
     wipe_symbol_shares, working_orders_notice,
 )
 from .portfolio_allocation_wizard import (
-    open_allocation_wizard, open_invest_scope, render_income_panel, render_outcomes,
+    notify_outcomes, open_allocation_wizard, open_invest_scope, render_income_panel,
     phone_card_css as wizard_phone_card_css,
 )
 
@@ -3941,8 +3941,8 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
             while painted < len(landed):
                 outcome = landed[painted]
                 painted += 1
-                text, classes = submit_result_cell(outcome)
-                wizard.set_row_result(outcome.symbol, text, classes)
+                # Text, icon and (for a failure) the marking of the whole row.
+                wizard.set_row_outcome(outcome)
 
         # Only when there is somewhere to paint. A caller without a wizard -- the
         # invest-scope path, and every test that drives _do_submit directly -- has no
@@ -3986,11 +3986,14 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
                         f"row(s) on account {account_id}: {', '.join(symbols)}")
             ui.timer(0.1, _run_dry_run, once=True)
 
+        # NO second dialog: the dry-run table is the result. The summary line, the
+        # Retry button (only when something failed) and the per-row icons are all in it.
         if wizard is not None:
             wizard.finish_submit(submit_summary_line(result['outcomes'],
-                                                     run_id=result['run_id']))
-        render_outcomes(result['outcomes'], run_id=result['run_id'],
-                        on_retry=_on_retry)
+                                                     run_id=result['run_id']),
+                                 run_id=result['run_id'], outcomes=result['outcomes'],
+                                 on_retry=_on_retry)
+        notify_outcomes(result['outcomes'])
         note = working_orders_notice(settled=result['settled'],
                                      working_order_ids=result['working_order_ids'],
                                      refresh_failed=result['refresh_failed'])

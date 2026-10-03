@@ -1441,6 +1441,54 @@ def test_the_allocate_flow_opens_the_wizard_and_submits_through_the_service(
     assert len(runs) == 1 and runs[0].order_ids
 
 
+def test_submit_opens_NO_results_dialog_and_reports_into_the_dry_run_table(
+        monkeypatch, nicegui_client, account_id):
+    """The dry-run table IS the result: each row gets its outcome (icon, marking,
+    details) through ``set_row_outcome``, the summary and the Retry hook go through
+    ``finish_submit``, and no second dialog is drawn on top."""
+    from nicegui import ui
+
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+
+    class _Wizard:
+        def __init__(self):
+            self.outcomes, self.finished = [], None
+
+        def set_row_outcome(self, outcome):
+            self.outcomes.append(outcome)
+
+        def finish_submit(self, summary, **kwargs):
+            self.finished = (summary, kwargs)
+
+    wizard, opened, pending = _Wizard(), {}, []
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: (opened.update(kw, base=a[0], plan=a[1]),
+                                          wizard)[1])
+    monkeypatch.setattr(page.ui, 'timer',
+                        lambda _delay, callback, once=False: pending.append(callback)
+                        or type('T', (), {'deactivate': lambda self: None})())
+
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+    opened['on_submit'](opened['plan'])
+    _run_in_client(nicegui_client, pending.pop(0))
+
+    assert [o.symbol for o in wizard.outcomes] == ['AAPL']
+    summary, kwargs = wizard.finished
+    assert summary.startswith('Run ')
+    assert [o.symbol for o in kwargs['outcomes']] == ['AAPL']
+    assert callable(kwargs['on_retry']) and kwargs['run_id']
+    assert [el for el in nicegui_client.layout.descendants()
+            if isinstance(el, ui.dialog)] == []
+    assert not hasattr(page, 'render_outcomes')
+
+
 def test_pressing_allocate_opens_NO_dialog_before_the_dry_run(monkeypatch,
                                                               nicegui_client,
                                                               account_id):
