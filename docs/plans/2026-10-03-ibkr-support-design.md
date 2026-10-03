@@ -193,7 +193,7 @@ tightens it.
 
 * Equity: `Stock(symbol, "SMART", "USD")`, qualified once through `qualifyContractsAsync` and cached
   per symbol (`conId`, 24 h). Share classes: `BRK.B` -> IB symbol `BRK B` and back
-  (`modules/accounts/ibkr_mapping.to_ib_symbol/from_ib_symbol`). An ambiguous or unknown symbol
+  (`ba2_common.core.ibkr_mapping.to_ib_symbol/from_ib_symbol`). An ambiguous or unknown symbol
   raises (`error 200`/ambiguity), never guessing a listing: the candidate list is filtered to
   secType STK, currency USD, a US primary exchange; more than one survivor is an error naming them.
 * Options: OCC symbol <-> (`root`, expiry, right, strike) in the pure mapping module; the
@@ -256,7 +256,7 @@ IBKR therefore follows the same contract:
 
 * `adjust_tp/sl/tp_sl` run the **same** exit-order maintenance code as Alpaca. It is broker-neutral
   (it only creates `TradingOrder` rows and calls `self.cancel_order` / `self.submit_order`), so it
-  is lifted into `modules/accounts/ibkr_protective_legs.ProtectiveLegsMixin` for IBKR. AlpacaAccount is
+  is lifted into `ba2_common.core.protective_legs.ProtectiveLegsMixin` for IBKR. AlpacaAccount is
   deliberately **not** migrated onto it in this change (live prod code, no way to regression-test
   against Alpaca's API here); migrating it is a follow-up, listed in section 9.
 * An `OCO` row submits as **two IB orders in one OCA group**: the TP leg (`LMT`) and the SL leg
@@ -375,7 +375,7 @@ becomes a warning; a rejected what-if is `accepted=False`. **UNVERIFIED** sign/s
 
 1. **Dividends, deposits/withdrawals, NAV history.** The TWS API has no cash-transaction history.
    The only IBKR source is the Flex Web Service (an HTTPS report: token + query id). Optional settings
-   `flex_token` and `flex_query_id` enable it (`modules/accounts/ibkr_flex`: pure XML parsing +
+   `flex_token` and `flex_query_id` enable it (`ba2_common.core.ibkr_flex`: pure XML parsing +
    an injectable fetcher; `CashTransaction` rows -> dividends/cash transfers net of withholding,
    `EquitySummaryByReportDateInBase` -> balance history). Unset: `get_dividends`,
    `get_cash_transfers`, `get_balance_history` return `[]` and log **one** WARNING per process that
@@ -423,7 +423,7 @@ becomes a warning; a rejected what-if is `accepted=False`. **UNVERIFIED** sign/s
 | 162 | historical pacing | logged, request fails |
 | 434 | order size invalid | `UNKNOWN`, verbatim |
 
-The mapping is a pure function in `modules/accounts/ibkr_mapping` and is table-tested; an
+The mapping is a pure function in `ba2_common.core.ibkr_mapping` and is table-tested; an
 unrecognised **order status string** raises (`UnknownIBOrderStatus`), an unrecognised **error code**
 is `UNKNOWN` with the broker text kept (the comment is what the Pending Orders UI shows, same as
 the TastyTrade empty-error lesson).
@@ -482,8 +482,8 @@ Each has a conservative default already implemented; answering changes the defau
 ### Stage 2 (equity), as built
 
 Files: `modules/accounts/IBKRAccount.py` (adapter), `modules/accounts/ibkr_runtime.py` (loop thread,
-connection policy, shared runtime), `modules/accounts/ibkr_mapping.py` (pure rules),
-`modules/accounts/ibkr_protective_legs.py` (shared exit-order mixin), `modules/accounts/ibkr_flex.py` (Flex
+connection policy, shared runtime), `ba2_common/core/ibkr_mapping.py` (pure rules),
+`ba2_common/core/protective_legs.py` (shared exit-order mixin), `ba2_common/core/ibkr_flex.py` (Flex
 parsing). Tests: `tests/ibkr_fakes.py` (behavioural fake of `ib_async.IB` over the real ib_async value
 types), `tests/test_ibkr_*.py`, `packages/common/tests/test_ibkr_{mapping,flex}.py`.
 
@@ -637,7 +637,7 @@ when asked by name); a settings edit drops the object's runtime handle and the s
 (`IBKRRuntime.close` fails waiting callers at once instead of after their timeout); an OCO leg's quantity and
 every working order's prices follow IB's live order in `refresh_orders`; no assumed option multiplier
 (an option position without one fails the fetch) and no assumed USD (a contract must say USD; Flex rows
-without a currency are skipped); `OCO_STOP_LIMIT_CUSHION` is duplicated in `ibkr_protective_legs.py` (pinned equal
+without a currency are skipped); `OCO_STOP_LIMIT_CUSHION` is duplicated in `protective_legs.py` (pinned equal
 to Alpaca's by a test) instead of imported from the Alpaca adapter; `supports_trading` is `True` on the class
 and `not read_only` on an instance, and a read-only account raises `IBKRReadOnlyError` BEFORE any row is
 written.
@@ -692,14 +692,3 @@ does not); how long a cancel takes to confirm outside the session (`_CANCEL_ACK_
 `AvailableFunds` / `SMA` / `ExcessLiquidity` are published for cash, Reg-T margin and portfolio-margin accounts;
 how long startup requests take (the connect no longer raises); completed-order / execution survival across the
 Gateway's nightly restart; combo fill shape and negative-limit acceptance; partial OCA fill reduction.
-
-## 14. Module placement (2026-10-03)
-
-`ibkr_mapping.py`, `ibkr_flex.py` and `ibkr_protective_legs.py` (formerly `ba2_common/core/protective_legs.py`)
-were first written under `packages/common`. They are imported ONLY by the IBKR files, and any change under
-`packages/` forces a `TEST_APP_VERSION` bump that makes every distributed GA worker re-sync for nothing. Per
-CLAUDE.md (broker-specific / live-only code is in-tree) they now live in `ba2_trade_platform/modules/accounts/`,
-their tests in `tests/`, and `git diff 47f67180..HEAD -- packages testplatform` is empty (the docstring-only edit
-to `OptionsAccountInterface.py` was reverted). Nothing under `packages/` imports them (checked by grep), so the CI
-job that installs only `packages/*` never needs them. `tools/ibkr_paper_smoke.py` loads the two pure modules by
-file path so the operator tool still imports no `ba2_trade_platform` code.

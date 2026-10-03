@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ib_async import ComboLeg, Contract, Option, Order
 
-from . import ibkr_mapping as M
+from ba2_common.core import ibkr_mapping as M
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition, OptionQuote
 
 from ...core.db import get_instance, update_instance
