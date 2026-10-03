@@ -26,7 +26,7 @@ from ..utils.perf_logger import PerfLogger
 from ..utils.margin_view import capital_requirement, factors_by_account, value_capreq_text
 from ..components.refresh_button import refresh_button
 from ..utils.responsive import (
-    GENERIC_PHONE_CSS, GRID_PHONE_CSS, PIN_TAG_PREFIX, PRIMARY_ACTION_CLASS,
+    CssOnce, GENERIC_PHONE_CSS, GRID_PHONE_CSS, PIN_TAG_PREFIX, PRIMARY_ACTION_CLASS,
     PinnedColumn, grid_phone_class, phone_media, scroll_table_phone_css, tag_quasar_columns,
 )
 
@@ -45,6 +45,9 @@ OPTION_LEGS_MIN_WIDTHS = {'Contract': 170, 'Strike': 84, 'Expiry': 104, 'Qty × 
 OPTION_CHAIN_MIN_WIDTHS = {'Bid': 64, 'Ask': 64, 'Mid': 64, 'Last': 64, 'IV': 64,
                            'Delta': 72, 'Gamma': 72, 'Theta': 72, 'Vega': 72, 'Note': 120}
 
+#: The page's phone sheet is added once per page load.
+CSS_ONCE = CssOnce()
+
 #: Class on the dialogs' action row: sticky at the bottom of the (scrolling) card on a phone.
 DIALOG_ACTIONS_CLASS = 'lt-dialog-actions'
 
@@ -57,6 +60,8 @@ def live_trades_page_phone_css() -> str:
     .lt-page-card.lt-page-card {{ padding: 0.25rem !important; }}
     .lt-page-card .q-tab-panel {{ padding: 0 !important; }}
     .lt-page-card .live-trades-table {{ max-width: 100%; }}
+    /* a focused input scrolls clear of the sticky action row (iOS keyboard) */
+    .q-dialog .q-card, .q-dialog__inner--minimized > div {{ scroll-padding-bottom: 4rem; }}
     .{DIALOG_ACTIONS_CLASS} {{ position: sticky; bottom: 0; z-index: 5;
         background: #252b3b; padding-top: 0.5rem; margin-top: 0.5rem;
         box-shadow: 0 -6px 8px -6px rgba(0,0,0,0.6); }}
@@ -166,7 +171,7 @@ class LiveTradesTab:
         expert_options, expert_map = self._get_expert_options()
         self.expert_id_map = expert_map
 
-        ui.add_css(live_trades_page_phone_css())
+        CSS_ONCE.add(ui.context.client, 'live-trades-page', live_trades_page_phone_css(), ui.add_css)
         with ui.card().classes('w-full lt-page-card'):
             with ui.row().classes('w-full items-center justify-between mb-4'):
                 ui.label('💼 Live Trades').classes('text-h6')
@@ -1511,7 +1516,7 @@ class LiveTradesTab:
 
             with ui.row().classes(f'w-full justify-end gap-2 {DIALOG_ACTIONS_CLASS}'):
                 ui.button('Cancel', on_click=dialog.close).props('flat')
-                ui.button('Reset & Retry', on_click=lambda: self._retry_close_position(transaction_id, dialog)).props('color=warning').classes(PRIMARY_ACTION_CLASS)
+                ui.button('Reset & Retry', on_click=lambda: self._retry_close_position(transaction_id, dialog)).props('color=warning')
 
         dialog.open()
 
@@ -1618,7 +1623,7 @@ class LiveTradesTab:
 
             with ui.row().classes(f'w-full justify-end gap-2 {DIALOG_ACTIONS_CLASS}'):
                 ui.button('Cancel', on_click=dialog.close).props('flat')
-                ui.button('Close Position', on_click=lambda: self._close_position(transaction_id, dialog)).props('color=negative').classes(PRIMARY_ACTION_CLASS)
+                ui.button('Close Position', on_click=lambda: self._close_position(transaction_id, dialog)).props('color=negative')
 
         dialog.open()
 
@@ -2279,7 +2284,7 @@ class LiveTradesTab:
             ).classes('text-xs text-secondary-custom mt-2')
 
             if option_orders:
-                columns = ['Leg', 'Contract', 'Strike', 'Expiry', 'Qty × mult', 'Intent', 'Status', 'Fill prem.']
+                columns = OPTION_LEGS_COLUMNS
                 rows = []
                 for order in option_orders:
                     rows.append({
@@ -2520,7 +2525,7 @@ class LiveTradesTab:
                     'Note': '',
                 })
 
-            columns = ['Contract', 'Bid', 'Ask', 'Mid', 'Last', 'IV', 'Delta', 'Gamma', 'Theta', 'Vega', 'Note']
+            columns = OPTION_CHAIN_COLUMNS
             ui.table(columns=_plain_table_columns(columns),
                      rows=table_rows, row_key='Contract').classes(
                 f'w-full {OPTION_CHAIN_TABLE_CLASS}').props('dense flat')
@@ -2576,7 +2581,7 @@ class LiveTradesTab:
 
             with ui.row().classes(f'w-full justify-end gap-2 {DIALOG_ACTIONS_CLASS}'):
                 ui.button('Cancel', on_click=dialog.close).props('flat')
-                ui.button('Confirm Close', on_click=lambda: self._execute_batch_close(dialog)).props('color=negative').classes(PRIMARY_ACTION_CLASS)
+                ui.button('Confirm Close', on_click=lambda: self._execute_batch_close(dialog)).props('color=negative')
 
         dialog.open()
 

@@ -70,12 +70,30 @@ def test_columns_carry_the_tag_and_keep_existing_classes():
     assert 'classes' not in quasar[1]                  # input untouched
 
 
-def test_phone_css_is_phone_only_and_balanced():
-    css = ltt.live_trades_phone_css()
-    assert css.count('{') == css.count('}')
-    # every top-level block is inside the phone query
-    assert css.count('@media (max-width: 639px)') == css.count('\n}\n') + 1 or True
-    assert not re.match(r'\s*\.live-trades-table', css)
+def _top_level_preludes(css):
+    """The text before every top-level ``{`` of a stylesheet (depth-0 blocks)."""
+    depth, buf, out = 0, '', []
+    for ch in css:
+        if depth == 0 and ch == '{':
+            out.append(buf.strip())
+            buf = ''
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+        elif depth == 0:
+            buf += ch
+    assert depth == 0, 'unbalanced braces'
+    return out
+
+
+def test_every_generated_sheet_is_phone_only():
+    sheets = [ltt.live_trades_phone_css(), page.live_trades_page_phone_css(),
+              rsp.GRID_PHONE_CSS]
+    for css in sheets:
+        preludes = _top_level_preludes(css)
+        assert preludes, 'empty sheet'
+        assert set(preludes) == {'@media (max-width: 639px)'}, set(preludes)
 
 
 def test_pinned_cells_are_opaque_sticky_and_take_the_hover_tint():
@@ -105,12 +123,12 @@ def test_every_desktop_handler_survives_in_the_template():
 @pytest.mark.parametrize('desktop,phone', [(4, 2), (3, 2), (2, 1), (1, 1)])
 def test_grid_columns_on_a_phone(desktop, phone):
     assert rsp.phone_grid_columns(desktop) == phone
-    assert rsp.grid_phone_class(desktop) == f'pf-grid-{phone}'
+    assert rsp.grid_phone_class(desktop) == f'lt-grid-{phone}'
 
 
 def test_page_css_covers_grids_dialogs_and_plain_tables():
     css = page.live_trades_page_phone_css()
-    for needle in ('.lt-page-card', '.lt-dialog-actions', '.pf-grid-2', '.lt-legs-table',
+    for needle in ('.lt-page-card', '.lt-dialog-actions', '.lt-grid-2', '.lt-legs-table',
                    '.lt-chain-table', '.pf-primary-action'):
         assert needle in css, needle
     assert css.count('{') == css.count('}')
@@ -127,3 +145,89 @@ def test_the_page_uses_the_phone_grid_helper_for_every_grid():
     src = open(page.__file__, encoding='utf-8').read()
     assert len(re.findall(r'ui\.grid\(columns=\d\)', src)) == \
         len(re.findall(r'ui\.grid\(columns=(\d)\)\.classes\(grid_phone_class\(\1\)', src))
+
+
+# -- the template is the base's, plus two layout classes ---------------------
+
+#: Captured from the allocator-branch base (1a3ca317): every event the table emits, with
+#: the argument it passes, the conditions that show each control, and the handlers.
+BASE_EMITS = [
+    "'toggle_selection', props.row.id", "'view_transaction_details', props.row.id",
+    "'recreate_tpsl', props.row.id", "'edit_transaction', props.row.id",
+    "'close_transaction', props.row.id", "'retry_close', props.row.id",
+    "'view_recommendation', order.expert_recommendation_id",
+]
+BASE_CONDITIONS = [
+    "col.name === 'select'", "col.name === 'expand'", "col.name === 'direction'",
+    "col.name === 'status'", "col.name === 'current_price'", "col.name === 'current_pnl'",
+    'props.row.pnl_reason', "col.name === 'pnl'", 'props.row.pnl_reason',
+    "col.name === 'closed_pnl'", "col.name === 'actions'",
+    'props.row.has_missing_tpsl_orders', 'props.row.is_open || props.row.is_waiting',
+    '(props.row.is_open || props.row.is_waiting) && !props.row.is_closing',
+    'props.row.is_closing',
+    '!props.row.is_open && !props.row.is_waiting && !props.row.is_closing && '
+    '!props.row.has_missing_tpsl_orders',
+    'props.row.orders && props.row.orders.length > 0', 'order.has_recommendation',
+]
+BASE_CLICKS = [
+    'props.expand = !props.expand',
+    "$parent.$emit('view_transaction_details', props.row.id)",
+    "$parent.$emit('recreate_tpsl', props.row.id)",
+    "$parent.$emit('edit_transaction', props.row.id)",
+    "$parent.$emit('close_transaction', props.row.id)",
+    "$parent.$emit('retry_close', props.row.id)",
+    "$parent.$emit('view_recommendation', order.expert_recommendation_id)",
+]
+
+
+def test_the_template_handlers_arguments_and_conditions_are_the_bases():
+    tpl = LiveTradesTable.BODY_TEMPLATE
+    assert re.findall(r'\$emit\(([^)]*)\)', tpl) == BASE_EMITS
+    assert re.findall(r'(?:v-if|v-else-if)="([^"]*)"', tpl) == BASE_CONDITIONS
+    assert re.findall(r'@click="([^"]*)"', tpl) == BASE_CLICKS
+    assert re.findall(r'@update:model-value="([^"]*)"', tpl) ==         ["(val) => $parent.$emit('toggle_selection', props.row.id)"]
+
+
+def test_destructive_dialog_buttons_do_not_take_the_primary_class():
+    """The primary-action class moves a button first and full width on a phone: right
+    for Update/Apply, wrong for a red button that closes positions, which must never be
+    the biggest or first target, 8px from Cancel."""
+    src = open(page.__file__, encoding='utf-8').read()
+    for label in ('Reset & Retry', 'Close Position', 'Confirm Close'):
+        line = next(l for l in src.splitlines() if f"ui.button('{label}'" in l)
+        assert 'PRIMARY_ACTION_CLASS' not in line, label
+    for label in ('Update', 'Apply'):
+        assert 'PRIMARY_ACTION_CLASS' in src[src.index(f"ui.button('{label}'"):][:400]
+
+
+def test_the_option_dialogs_build_their_columns_from_the_pinned_constants():
+    src = open(page.__file__, encoding='utf-8').read()
+    assert 'columns = OPTION_LEGS_COLUMNS' in src
+    assert 'columns = OPTION_CHAIN_COLUMNS' in src
+    assert src.count('_plain_table_columns(columns)') == 2
+    # no second, inline copy of either list that a rename could drift from
+
+
+def test_nested_tables_are_not_reached_by_the_table_rules():
+    css = ltt.live_trades_phone_css()
+    assert '.live-trades-table > .q-table__middle > table > thead > tr > th' in css
+    assert '.live-trades-table table {' not in css
+    assert 'dvh' in css and css.index('100vh') < css.index('100dvh')
+    assert '100cqw' in css and 'container-type: inline-size' in css
+
+
+def test_the_stylesheet_is_added_once_per_client():
+    once = rsp.CssOnce()
+    added = []
+    class _C: pass
+    a, b = _C(), _C()
+    assert once.add(a, 'k', 'css', added.append) is True
+    assert once.add(a, 'k', 'css', added.append) is False
+    assert once.add(b, 'k', 'css', added.append) is True       # a new page load
+    assert once.add(a, 'other', 'css2', added.append) is True
+    assert added == ['css', 'css', 'css2']
+
+
+def test_live_trades_grids_do_not_use_the_allocators_prefix():
+    assert rsp.grid_phone_class(4) == 'lt-grid-2'
+    assert 'pf-grid' not in rsp.GRID_PHONE_CSS

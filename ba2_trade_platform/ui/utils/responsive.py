@@ -462,7 +462,7 @@ def pinned_offsets(pinned: Sequence[PinnedColumn]) -> Dict[str, int]:
 
 
 def scroll_table_phone_css(root_class: str, prefix: str, pinned: Sequence[PinnedColumn],
-                           min_widths: Dict[str, int], max_height: str = 'calc(100vh - 8rem)',
+                           min_widths: Dict[str, int], max_height: str = '100vh - 8rem',
                            ) -> str:
     """The phone CSS of one wide q-table (``root_class`` is on the table root).
 
@@ -475,14 +475,29 @@ def scroll_table_phone_css(root_class: str, prefix: str, pinned: Sequence[Pinned
     Pure.
     """
     r = f'.{root_class}'
+    # Direct-child chain, NOT descendants: a row-expansion can hold a nested q-markup-table
+    # (the orders list) that must keep its own layout.
+    mid = f'{r} > .q-table__middle'
+    tbl = f'{mid} > table'
+    # ``max_height`` is an expression ("100vh - 8rem"), emitted twice: ``dvh`` (the visible
+    # viewport as the iOS toolbar comes and goes) after a ``vh`` fallback for browsers that
+    # do not know it. ``none`` is passed through. ``container-type`` makes the scroll
+    # box a size container, so a descendant can be as wide as its VISIBLE width (``cqw``).
+    if max_height == 'none':
+        height_rules = 'max-height: none; '
+    else:
+        height_rules = (f'max-height: calc({max_height}); '
+                        f'max-height: calc({max_height.replace("vh", "dvh")}); ')
     rules: List[str] = [
-        f'{r} .q-table__middle {{ max-height: {max_height}; overflow: auto !important; '
-        f'-webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; }}',
-        f'{r} table {{ width: max-content; min-width: 100%; }}',
-        f'{r} thead th {{ white-space: nowrap !important; word-break: normal !important; '
-        f'overflow-wrap: normal !important; position: sticky; top: 0; z-index: 3; '
-        f'background: {PINNED_HEAD_BG} !important; }}',
-        f'{r} tbody td {{ white-space: nowrap; font-variant-numeric: tabular-nums; }}',
+        f'{mid} {{ {height_rules}overflow: auto !important; '
+        f'-webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; '
+        f'container-type: inline-size; }}',
+        f'{tbl} {{ width: max-content; min-width: 100%; }}',
+        f'{tbl} > thead > tr > th {{ white-space: nowrap !important; '
+        f'word-break: normal !important; overflow-wrap: normal !important; '
+        f'position: sticky; top: 0; z-index: 3; background: {PINNED_HEAD_BG} !important; }}',
+        f'{tbl} > tbody > tr > td {{ white-space: nowrap; '
+        f'font-variant-numeric: tabular-nums; }}',
     ]
     for name, width in min_widths.items():
         tag = f'.{column_tag(prefix, name)}'
@@ -520,12 +535,35 @@ def phone_grid_columns(desktop_columns: int) -> int:
 
 def grid_phone_class(desktop_columns: int) -> str:
     """The class that gives a ``ui.grid`` its phone column count. Pure."""
-    return f'pf-grid-{phone_grid_columns(desktop_columns)}'
+    return f'lt-grid-{phone_grid_columns(desktop_columns)}'
 
 
 GRID_PHONE_CSS = phone_media('''
-    .nicegui-grid.pf-grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    .nicegui-grid.lt-grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
         gap: 0.5rem !important; }
-    .nicegui-grid.pf-grid-1 { grid-template-columns: minmax(0, 1fr) !important; }
-    .nicegui-grid.pf-grid-2 > *, .nicegui-grid.pf-grid-1 > * { min-width: 0; }
+    .nicegui-grid.lt-grid-1 { grid-template-columns: minmax(0, 1fr) !important; }
+    .nicegui-grid.lt-grid-2 > *, .nicegui-grid.lt-grid-1 > * { min-width: 0; }
 ''')
+
+
+class CssOnce:
+    """Add a stylesheet once per browser client (page load), however many widgets ask.
+
+    The Stocks and Options tables each call for the same sheet when they render, and a
+    refresh re-renders them; without this every call appended another copy to the page.
+    Keyed on the client object (weakly), so a new page load gets its own.
+    """
+
+    def __init__(self) -> None:
+        self._seen: 'weakref.WeakKeyDictionary' = weakref.WeakKeyDictionary()
+
+    def add(self, client, key: str, css: str, add_css: Callable[[str], None]) -> bool:
+        """Call ``add_css(css)`` unless ``key`` was already added for ``client``.
+        Returns whether it was added. ``add_css`` is ``ui.add_css`` (injected so the
+        module stays free of NiceGUI)."""
+        keys = self._seen.setdefault(client, set())
+        if key in keys:
+            return False
+        keys.add(key)
+        add_css(css)
+        return True

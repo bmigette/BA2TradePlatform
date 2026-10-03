@@ -32,13 +32,15 @@ from .LazyTable import LazyTable, ColumnDef, LazyTableConfig, DataLoaderCallback
 from ...logger import logger
 from ..utils.perf_logger import PerfLogger
 from ..utils.responsive import (
-    PinnedColumn, PIN_TAG_PREFIX, phone_media, scroll_table_phone_css, tag_quasar_columns,
+    CssOnce, PinnedColumn, PIN_TAG_PREFIX, phone_media, scroll_table_phone_css, tag_quasar_columns,
 )
 
 #: PHONE LAYOUT of the transactions tables (equity and options share this component).
 #: Every column stays; the table scrolls sideways inside its own box with the checkbox
 #: and the symbol pinned on the left. See ``ui/utils/responsive.py`` (scroll_table_phone_css).
 LIVE_TRADES_ROOT_CLASS = 'live-trades-table'
+#: The Stocks and Options tables share one stylesheet: added once per page load.
+CSS_ONCE = CssOnce()
 #: Pinned left, in order. ``left`` is the sum of the widths before it; the expand button
 #: sits between the two and scrolls away under the pinned symbol.
 LIVE_TRADES_PINNED = (
@@ -67,9 +69,10 @@ def live_trades_phone_css() -> str:
     /* The expanded "Related Orders" row is a colspan cell as wide as the whole table:
        keep its content one screen wide and pinned left so it does not scroll away. */
     {r} td.lt-expand-td {{ white-space: normal; padding: 0 !important; }}
+    /* Width = the scroll box's VISIBLE width (``cqw``, less 12px for a scrollbar that
+       is drawn inside it: scroll_table_phone_css makes the box a size container); the vw line is the fallback for a browser without it. */
     {r} .lt-expand-inner {{ position: sticky; left: 0; width: calc(100vw - 2rem);
-        max-width: 100%; padding: 4px; box-sizing: border-box; }}
-    {r} .lt-expand-inner .q-table__middle {{ max-height: none; overflow-x: auto !important; }}
+        width: calc(100cqw - 12px); max-width: calc(100cqw - 12px); padding: 4px; box-sizing: border-box; }}
 ''')
     return scroll_table_phone_css(
         LIVE_TRADES_ROOT_CLASS, PIN_TAG_PREFIX, LIVE_TRADES_PINNED, LIVE_TRADES_MIN_WIDTHS,
@@ -665,7 +668,7 @@ class LiveTradesTable(LazyTable):
                     }
                 ''')
             
-            ui.add_css(live_trades_phone_css())
+            CSS_ONCE.add(ui.context.client, 'live-trades-table', live_trades_phone_css(), ui.add_css)
 
             # Add the body template for expansion and custom cells
             self._table.add_slot('body', self.BODY_TEMPLATE)
