@@ -8915,3 +8915,84 @@ def test_a_dialog_opened_from_the_income_panel_is_built_outside_what_refresh_cle
     host = parents[-1]
     assert host is not income_card and income_card not in list(host.ancestors())
     assert host not in list(income_card.descendants())
+
+
+# ---------------------------------------------------------------------------
+# Review round 2: ordering on the exception path, overlapping refreshes
+# ---------------------------------------------------------------------------
+
+def test_a_submit_that_dies_paints_what_landed_before_it_marks_the_rest_unknown(
+        monkeypatch, nicegui_client, account_id):
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+
+    calls = []
+
+    class _Wizard:
+        def set_row_outcome(self, outcome):
+            calls.append(('outcome', outcome.symbol))
+
+        def finish_submit(self, summary, **kwargs):
+            calls.append(('finish', kwargs.get('interrupted', False)))
+
+    wizard, opened, pending = _Wizard(), {}, []
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: (opened.update(kw, base=a[0], plan=a[1]),
+                                          wizard)[1])
+    monkeypatch.setattr(page.ui, 'timer',
+                        lambda _d, cb, once=False: pending.append(cb)
+                        or type('T', (), {'deactivate': lambda self: None})())
+
+    def _dies_after_one_order(*args, on_outcome=None, **kwargs):
+        # recorded by the worker in the last moments before it blew up -- and the
+        # 200 ms painter timer never ran (it is a queued fake here)
+        on_outcome(svc.RowOutcome(symbol='AAPL', action='new',
+                                  status=svc.OUTCOME_FAILED, quantity=1.0))
+        raise RuntimeError('broker connection reset')
+
+    monkeypatch.setattr(page, '_submit_plan', _dies_after_one_order)
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+    opened['on_submit'](opened['plan'])
+    _run_in_client(nicegui_client, pending.pop(0))
+
+    assert calls == [('outcome', 'AAPL'), ('finish', True)]
+
+
+def test_two_overlapping_refreshes_draw_one_income_panel(monkeypatch, nicegui_client,
+                                                         account_id):
+    monkeypatch.setattr(page.svc, 'refresh_symbol_stats', lambda *a, **k: None)
+    root = _drawn_page(monkeypatch, nicegui_client, account_id)
+    captured = {}
+    real_flow = page._open_allocation_flow
+
+    async def _spy(*args, **kwargs):
+        captured['refresh'] = args[2]
+
+    monkeypatch.setattr(page, '_open_allocation_flow', _spy)
+    _press(_review_button(root))
+    monkeypatch.setattr(page, '_open_allocation_flow', real_flow)
+    refresh = captured['refresh']
+
+    # A to_thread that really YIELDS, so the two refreshes interleave at every await the
+    # way two browser taps do (the autouse fixture runs thread bodies inline and never
+    # suspends, which hides the overlap).
+    async def _yielding(func, /, *args, **kwargs):
+        await asyncio.sleep(0)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(page.asyncio, 'to_thread', _yielding)
+
+    async def _both():
+        with nicegui_client:
+            await asyncio.gather(refresh(), refresh())
+
+    asyncio.run(_both())
+    assert len(_income_labels(root)) == 1

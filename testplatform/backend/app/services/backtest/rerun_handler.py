@@ -114,6 +114,14 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest) -> Dict[str, Any]:
         )
     strat = db.query(Strategy).filter(Strategy.id == opt.strategy_id).first()
     bt_block = dict(cfg["backtest"])
+    # The row's OWN window wins over the optimization's: a walk-forward out-of-sample row
+    # (``WF<k>-OOS-R<n>-...``, tools/run_walk_forward.py) shares the optimization_id and genes but
+    # ran on the test window, and re-running it on the train window would overwrite it with
+    # in-sample numbers. For an ordinary TOP-N row the two windows are equal, so nothing changes.
+    if bt.start_date is not None and bt.end_date is not None:
+        _rs, _re = bt.start_date.date().isoformat(), bt.end_date.date().isoformat()
+        if (str(bt_block["start_date"])[:10], str(bt_block["end_date"])[:10]) != (_rs, _re):
+            bt_block["start_date"], bt_block["end_date"] = _rs, _re
 
     # The optimization may have run on another machine (e.g. a Windows store path) or the store may
     # have moved — remap a missing screener store to this machine's local SCREENER_STORE_DIR so the

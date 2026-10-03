@@ -7546,7 +7546,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                             name_prefix: str = "TOP",
                             extra_labels: Optional[List[str]] = None,
                             use_remote_workers: bool = True,
-                            persisted_ids: Optional[List[tuple]] = None) -> int:
+                            persisted_ids: Optional[List[tuple]] = None,
+                            window: Optional[tuple] = None) -> int:
     """Re-run the optimization's TOP-N distinct param sets and persist each as a tagged,
     saved Backtest (best params + their metrics) so the top performers are kept for
     comparison and to warm-start future optimizations. Returns how many were persisted.
@@ -7561,7 +7562,15 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
       * ``extra_labels`` -- appended to the optimization's own labels on every persisted row;
       * ``use_remote_workers=False`` -- re-run on the local pool only, even when the
         optimization used remote workers;
-      * ``persisted_ids`` -- a list this appends ``(rank, backtest_id)`` to per persisted row.
+      * ``persisted_ids`` -- a list this appends ``(rank, backtest_id)`` to per persisted row;
+      * ``window`` -- ``(start, end)`` ISO dates that REPLACE the optimization's own run window
+        for every re-run (walk-forward out-of-sample tests, tools/run_walk_forward.py). Nothing
+        else about the trial changes (same ``decode_params`` + ``_build_daily_trial_config``,
+        the screener hoisted state is derived from the overridden window). The GA-fitness
+        fidelity gate is skipped: it compares against a score earned on a DIFFERENT window.
+        NOT an optimize path -- ``_assert_option_window_excludes_holdout`` guards only the
+        optimize CLI handlers and is deliberately not consulted here (a re-run is a single
+        measurement, not a search).
 
     The re-runs are the slow post-GA phase (~minutes each at 5min/multi-year). They are
     INDEPENDENT, so with ``parallel`` > 1 they fan out across a bounded local process pool
@@ -7593,6 +7602,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         strat = db.query(Strategy).filter_by(id=opt.strategy_id).first()
         cfg = opt.optimization_config or {}
         bt_block = dict(cfg["backtest"])
+        if window is not None:
+            bt_block["start_date"], bt_block["end_date"] = str(window[0]), str(window[1])
         # Apply the SAME screener hoisted state the GA scored each individual with, so the persisted
         # top-N are the actual optimized SCREENER runs (universe_source=screener + the per-individual
         # screener genes) — not static-universe runs. Without this the persisted top-N silently
@@ -7721,7 +7732,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 # scores disagree, the row is not the strategy that earned its rank -- and a row
                 # that reads as finished, with plausible numbers, is exactly what somebody
                 # deploys. Say so on the row and in the log rather than persisting it silently.
-                _div = rerun_fitness_divergence(trial_cfg.get("ga_fitness"), _rerun_fit)
+                _div = (None if window is not None
+                        else rerun_fitness_divergence(trial_cfg.get("ga_fitness"), _rerun_fit))
                 if _div is not None:
                     _pct = "n/a" if _div["pct"] is None else f"{_div['pct']:+.1f}%"
                     print(f"    !! {name_prefix}{rank} RE-RUN DIVERGED from its GA score: "

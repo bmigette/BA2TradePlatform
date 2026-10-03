@@ -573,3 +573,104 @@ def test_the_copy_button_copies_in_the_browser_and_reports_back(nicegui_client,
     listener.handler(GenericEventArguments(sender=copy, client=None, args=[{'ok': False}]))
     assert toasts == [('Details copied', 'positive'),
                       ('Could not copy - select the text', 'warning')]
+
+
+# -- second review round ------------------------------------------------------------
+
+def test_a_late_outcome_supersedes_the_unknown_mark_of_a_finished_run(
+        nicegui_client, monkeypatch):
+    """The exception path used to call ``finish_submit(interrupted=True)`` and only THEN
+    paint the outcomes that had landed in the last 200 ms. The row went amber
+    "check broker", the FAILED painted over it -- and a Refresh repainted the stale
+    amber last, while the details said FAILED."""
+    wizard, _sent = _submit_with(nicegui_client)
+    with nicegui_client:
+        wizard.finish_submit('Submission failed: boom', interrupted=True)   # old order
+        wizard.set_row_outcome(_outcome('MSFT', svc.OUTCOME_FAILED, message='refused'))
+    assert 'MSFT' not in wizard._unresolved
+    _run_refresh(nicegui_client, wizard, monkeypatch)
+    assert 'pf-row-failed' in _classes(wizard._row_elements['MSFT'])
+    assert 'pf-row-alert' not in _classes(wizard._row_elements['MSFT'])
+    assert wizard._result_cells['MSFT'].text == 'FAILED'
+    assert wizard._result_icons['MSFT'][0]._props['icon'] == \
+        ov.outcome_icon(svc.OUTCOME_FAILED).icon
+    # the rows that never reported are still "check broker"
+    assert wizard._result_cells['KO'].text == wiz.SUBMIT_UNKNOWN_TEXT
+
+
+def test_the_real_order_paints_first_then_marks_the_rest_unknown(nicegui_client,
+                                                                 monkeypatch):
+    """The page's order since the fix: ``_paint()`` (outcomes recorded so far) and THEN
+    ``finish_submit(interrupted=True)``."""
+    wizard, _sent = _submit_with(nicegui_client)
+    with nicegui_client:
+        wizard.set_row_outcome(_outcome('AAPL', svc.OUTCOME_SUBMITTED))
+        wizard.set_row_outcome(_outcome('MSFT', svc.OUTCOME_FAILED))   # the last 200 ms
+        wizard.finish_submit('Submission failed: boom', interrupted=True)
+    _run_refresh(nicegui_client, wizard, monkeypatch)
+    assert wizard._result_cells['MSFT'].text == 'FAILED'
+    assert 'pf-row-failed' in _classes(wizard._row_elements['MSFT'])
+    assert wizard._result_cells['KO'].text == wiz.SUBMIT_UNKNOWN_TEXT
+    assert 'pf-row-alert' in _classes(wizard._row_elements['KO'])
+    assert wizard._result_cells['AAPL'].text == 'sent'
+
+
+def test_retry_fires_once_however_often_it_is_tapped(nicegui_client):
+    wizard = _open(nicegui_client)
+    calls = []
+    wizard.dialog.close = lambda: calls.append('closed')
+    with nicegui_client:
+        wizard.finish_submit('Run 1', run_id=1, on_retry=lambda s: calls.append(list(s)),
+                             outcomes=[_outcome('A', svc.OUTCOME_FAILED)])
+    button = _retry_buttons(nicegui_client)[0]
+    handler = next(l.handler for l in button._event_listeners.values()
+                   if l.type.split('.')[0] == 'click')
+    handler(None)
+    handler(None)
+    assert calls == ['closed', ['A']]
+    assert button.enabled is False
+
+
+def test_tick_boxes_and_the_selection_toolbar_are_locked_once_a_run_starts(
+        nicegui_client, monkeypatch):
+    wizard, _sent = _submit_with(nicegui_client, untick=('KO',))
+    assert wizard._tick_boxes and all(not b.enabled for b in wizard._tick_boxes.values())
+    with nicegui_client:
+        wizard.finish_submit('Run 1', run_id=1)
+    _run_refresh(nicegui_client, wizard, monkeypatch)
+    # a redraw after the run keeps them locked and offers no Select all
+    assert all(not b.enabled for b in wizard._tick_boxes.values())
+    assert not any(wiz.MARKER_SELECT_ALL in getattr(e, '_markers', [])
+                   for e in nicegui_client.layout.descendants())
+
+
+def test_the_footer_counts_what_was_sent_after_a_refresh(nicegui_client, monkeypatch):
+    """KO was un-ticked; a refresh of the re-solved plan must not re-tick it and make
+    the footer count an order nobody placed."""
+    wizard, _sent = _submit_with(nicegui_client, untick=('KO',))
+    with nicegui_client:
+        wizard.finish_submit('Run 1', run_id=1)
+    _run_refresh(nicegui_client, wizard, monkeypatch)
+    assert wizard.selected == {'AAPL', 'MSFT'}
+    foot = next(e for e in nicegui_client.layout.descendants()
+                if wiz.MARKER_TABLE_FOOT in getattr(e, '_markers', []))
+    texts = [e._text for e in foot.descendants() if getattr(e, '_text', None)]
+    assert any('2' in t and '3' in t for t in texts), texts
+
+
+def test_the_copy_handler_only_trusts_a_copy_that_really_had_focus_and_selection():
+    js = ov.copy_click_js('x')
+    # the textarea is hosted INSIDE the dialog card (Quasar steals focus back otherwise)
+    assert 'closest(".q-card")' in js and 'host.appendChild(a)' in js
+    assert js.index('closest(".q-card")') < js.index('execCommand')
+    # execCommand is only believed when the textarea holds focus and the whole selection
+    assert 'document.activeElement === a' in js
+    assert 'a.selectionEnd - a.selectionStart === t.length' in js
+    assert js.index('document.activeElement === a') < js.index('execCommand')
+    # when it was not trusted the async clipboard API is tried, else the toast says no
+    assert js.index('execCommand') < js.index('navigator.clipboard')
+    assert 'emit({ok: ok})' in js
+    # hostile text cannot break out of the string literal
+    hostile = ov.copy_click_js('"); alert(1); (" </script>')
+    assert hostile.count('const t = "') == 1
+    assert '\\"); alert(1); (\\"' in hostile
