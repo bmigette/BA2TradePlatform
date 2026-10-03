@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from ba2_common.core import ibkr_mapping as M
+from ba2_trade_platform.modules.accounts import ibkr_mapping as M
 from ba2_common.core.interfaces.OptionsAccountInterface import COVER_REFUSAL, OptionsAccountInterface
 from ba2_common.core.option_types import OptionLeg, OptionPosition
 from ba2_trade_platform.core.db import get_instance

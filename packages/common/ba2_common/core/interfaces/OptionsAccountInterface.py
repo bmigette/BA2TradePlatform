@@ -2301,10 +2301,12 @@ class OptionsAccountInterface(ABC):
         The symbol filter alone would not catch it either, because IBKR builds its
         ``Position`` from ``ib_pos.contract.symbol`` — the UNDERLYING for an option.
 
-        (RESOLVED 2026-10-03: ``IBKRAccount.get_positions`` now returns EQUITY rows only,
-        stamped ``asset_class="Equity"``, and publishes option positions through
-        ``get_option_positions``, so the IBKR case no longer needs this guard -- it stays for
-        Alpaca, whose ``get_positions`` maps every row.)
+        KNOWN GAP, recorded rather than papered over: that same ``IBKRAccount.get_positions``
+        constructs ``Position`` without ``asset_class`` at all (it is ``None`` — SQLModel
+        ``table=True`` skips validation), so an IBKR-held option WOULD be counted here as
+        equity cover under its underlying's ticker. Nothing in a ``Position`` distinguishes
+        it, so the fix belongs in that adapter — it should filter options the way
+        ``TastyTradeAccount.get_positions`` does — and not in a guess here.
 
         A SHORT equity position is NEGATIVE cover, and the sign is taken from ``side`` as
         well as from ``qty`` because the adapters disagree: Alpaca reports a short as a
@@ -2437,8 +2439,8 @@ class OptionsAccountInterface(ABC):
 
         ``qty_available`` IS THE FIELD THAT WOULD ANSWER BOTH — "total shares minus open
         orders", the number Alpaca actually enforces (``models.Position.qty_available``;
-        ``AlpacaAccount.get_positions`` populates it, ``TastyTradeAccount`` and
-        ``IBKRAccount`` mirror ``qty`` into it). Reading it instead of ``qty`` would
+        ``AlpacaAccount.get_positions`` populates it, ``TastyTradeAccount`` mirrors ``qty``
+        into it, ``IBKRAccount`` leaves it unset). Reading it instead of ``qty`` would
         subtract a resting leg at the source, on live broker state rather than on DB rows
         the platform is known to leave stale — which is what made counting the legs
         unworkable at the exit face. It is not done here because a tri-state accessor

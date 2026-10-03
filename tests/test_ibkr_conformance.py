@@ -6,7 +6,7 @@ import inspect
 import pytest
 from ib_async import OrderStatus as IBOrderStatus
 
-from ba2_common.core import ibkr_mapping as M
+from ba2_trade_platform.modules.accounts import ibkr_mapping as M
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
 from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
 from ba2_trade_platform.core.types import OrderDirection, OrderType

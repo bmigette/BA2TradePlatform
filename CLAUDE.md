@@ -77,8 +77,10 @@ fact and the conservative choice taken for each. Rules specific to this adapter:
   thread + one TWS session, `ibkr_runtime.get_runtime`) shared by every `IBKRAccount` object; use `self._call(...)`.
   `TradeManager` builds a fresh account object per call, so a connection per object would collide on the client id.
 - Pure mapping rules (status table, error codes, OCC symbols, ticks, snapshot maths) live in
-  `ba2_common/core/ibkr_mapping.py`; the shared TP/SL exit-order maintenance in `ba2_common/core/protective_legs.py`
-  (not yet adopted by Alpaca). `ib_async` is imported only in `modules/accounts/` (CI installs `packages/*` only).
+  `modules/accounts/ibkr_mapping.py`, the Flex Web Service client in `ibkr_flex.py`, and the TP/SL exit-order
+  maintenance in `ibkr_protective_legs.py` (not yet adopted by Alpaca). All of it is IBKR-only and therefore IN-TREE:
+  nothing under `packages/` imports it, so an IBKR change never forces a `TEST_APP_VERSION` bump. `ib_async` is
+  imported only in `modules/accounts/` (CI installs `packages/*` only); their tests live in `tests/`.
 - Operator smoke test against a PAPER Gateway: `tools/ibkr_paper_smoke.py` (read-only by default). Setup:
   `docs/IBKR-SETUP.md`.
 

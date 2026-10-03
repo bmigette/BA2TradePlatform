@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from ib_async import IB, Order, OrderState, Stock
 
-from ba2_common.core import ibkr_mapping as M
+from ba2_trade_platform.modules.accounts import ibkr_mapping as M
 from ba2_trade_platform.core.db import add_instance, get_instance, update_instance
 from ba2_trade_platform.core.models import TradingOrder
 from ba2_trade_platform.core.types import OrderDirection, OrderStatus, OrderType, TransactionStatus

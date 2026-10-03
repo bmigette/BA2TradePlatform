@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from ba2_common.core import ibkr_mapping as M
+from ba2_trade_platform.modules.accounts import ibkr_mapping as M
 from ba2_common.core.types import BrokerOrderErrorReason as R
 from ba2_common.core.types import OptionRight, OrderStatus
 

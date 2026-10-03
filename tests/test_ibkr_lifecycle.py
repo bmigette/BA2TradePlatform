@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from ib_async import Order
 
-from ba2_common.core.ibkr_mapping import make_order_ref
+from ba2_trade_platform.modules.accounts.ibkr_mapping import make_order_ref
 from ba2_trade_platform.core.db import add_instance, get_db, get_instance, update_instance
 from ba2_trade_platform.core.models import TradingOrder, Transaction
 from ba2_trade_platform.core.types import (

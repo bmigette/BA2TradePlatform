@@ -29,7 +29,7 @@ from collections import deque
 from concurrent.futures import CancelledError, TimeoutError as FutureTimeoutError
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
-from ba2_common.core.ibkr_mapping import (
+from .ibkr_mapping import (
     CLIENT_ID_IN_USE_CODE, CONNECTION_RESTORED_CODES, IB_PORTS,
     PAPER_ACCOUNT_PREFIX, error_severity)
 

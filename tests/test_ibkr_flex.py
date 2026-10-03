@@ -4,7 +4,7 @@ from datetime import date, datetime
 
 import pytest
 
-from ba2_common.core import ibkr_flex as F
+from ba2_trade_platform.modules.accounts import ibkr_flex as F
 from ba2_common.core.account_types import CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_DIVIDEND, CASH_TRANSFER_WITHDRAWAL
 
 SEND_OK = """<FlexStatementResponse timestamp="03 October, 2026 10:00 AM EDT">

@@ -6,10 +6,10 @@ the conservative readings and the UNVERIFIED items live there). Highlights:
 * Connection/threading is ``ibkr_runtime.IBKRRuntime``: a private asyncio loop thread per account,
   every ib_async call is a coroutine on it, the public methods here are the bounded sync facade.
 * Pure mapping rules (status table, error codes, OCC symbols, price ticks, snapshot maths) live in
-  ``ba2_common.core.ibkr_mapping``; this module only talks to IB.
+  ``ibkr_mapping`` (this package); this module only talks to IB.
 * ``submit_order`` is NEVER overridden (that was audit finding A1): ``_submit_order_impl`` sends ONE
   order, the template owns validation, transactions and the protective legs, which come from
-  ``ba2_common.core.protective_legs.ProtectiveLegsMixin`` (an OCO row is two IB orders in one OCA group).
+  ``ibkr_protective_legs.ProtectiveLegsMixin`` (an OCO row is two IB orders in one OCA group).
 * TIF: market orders DAY, never GTC; resting orders default GTC (protective stops must survive the close).
 * Nothing live is ever defaulted: a missing price/balance is ``None`` or a raise, a failed fetch is
   ``None``/``[]`` plus an ERROR log per the interface's tri-state contract.
@@ -28,10 +28,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from ib_async import IB, Order, Stock
 from sqlmodel import or_, select
 
-from ba2_common.core import ibkr_flex as flex
-from ba2_common.core import ibkr_mapping as M
-from ba2_common.core.ibkr_flex import FlexClient, FlexStatement, default_http_get
-from ba2_common.core.protective_legs import OCO_STOP_LIMIT_CUSHION, ProtectiveLegsMixin
 
 from ...core.account_types import (
     AccountSnapshot, MarginInfo, OrderImpact, MARGIN_SOURCE_DEFAULT)
@@ -44,7 +40,11 @@ from ...core.types import (
     OrderStatus)
 from ...core.types import OrderType as CoreOrderType
 from ...logger import logger
+from . import ibkr_flex as flex
+from . import ibkr_mapping as M
+from .ibkr_flex import FlexClient, FlexStatement, default_http_get
 from .ibkr_options import IBKROptionsMixin
+from .ibkr_protective_legs import OCO_STOP_LIMIT_CUSHION, ProtectiveLegsMixin
 from .ibkr_runtime import (
     IBKRConnectionError, IBKRContractError, IBKRError, IBKROrderRejected, IBKROrphanStop,
     IBKRReadOnlyError, IBKRRuntime, get_runtime, registry_signature, shutdown_runtime)

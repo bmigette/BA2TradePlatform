@@ -41,7 +41,22 @@ for _p in (_ROOT, _ROOT / "packages" / "common"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from ba2_common.core import ibkr_mapping as M  # noqa: E402
+import importlib.util  # noqa: E402
+
+
+def _load_standalone(name: str, filename: str):
+    """Load an IBKR helper module BY PATH. They are pure (they import only ``ba2_common``), and loading
+    them this way keeps this tool from importing ``ba2_trade_platform`` (and with it the app's DB
+    configuration and every broker SDK) just to read a mapping table."""
+    path = _ROOT / "ba2_trade_platform" / "modules" / "accounts" / filename
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+M = _load_standalone("ibkr_mapping_standalone", "ibkr_mapping.py")
 
 DEFAULT_CLIENT_ID = 98
 TEST_ORDER_REF = "ba2-smoke-test"
@@ -372,7 +387,7 @@ async def executions_section(ib: Any, account: str, rep: Report) -> None:
 
 def flex_section(args: argparse.Namespace, account: str, rep: Report,
                  http_get: Optional[Callable[[str], str]] = None) -> None:
-    from ba2_common.core import ibkr_flex as F
+    F = _load_standalone("ibkr_flex_standalone", "ibkr_flex.py")
     rep.section("Flex Web Service")
     kwargs = {"http_get": http_get} if http_get else {}
     client = F.FlexClient(args.flex_token, args.flex_query, **kwargs)

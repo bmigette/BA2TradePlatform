@@ -12,7 +12,7 @@ import time
 import pytest
 from ib_async import Order
 
-from ba2_common.core import ibkr_mapping as M
+from ba2_trade_platform.modules.accounts import ibkr_mapping as M
 from ba2_trade_platform.core.db import add_instance, get_instance, update_instance
 from ba2_trade_platform.core.models import TradingOrder
 from ba2_trade_platform.core.types import OrderDirection, OrderStatus, OrderType, TransactionStatus
@@ -453,7 +453,7 @@ class TestFollowUps:
         assert account.symbols_exist(["AAPL"]) == {"AAPL": False}
 
     def test_cushion_constant_is_not_imported_from_alpaca(self):
-        import ba2_common.core.protective_legs as pl
+        import ba2_trade_platform.modules.accounts.ibkr_protective_legs as pl
         src = open(IBKRAccount.__module__.replace(".", "/") + ".py", encoding="utf-8").read() \
             if False else None
         from ba2_trade_platform.modules.accounts.AlpacaAccount import OCO_STOP_LIMIT_CUSHION
