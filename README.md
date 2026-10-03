@@ -681,13 +681,16 @@ Add it to the `experts` list in `packages/experts/ba2_experts/__init__.py` (back
 
 ## 🔢 Versioning
 
-Two independent build versions, both `YYYY.MM.NNNNN`:
+Build versions, all `YYYY.MM.NNNNN`:
 
 - `ba2_trade_platform/version.py` → `APP_VERSION` (trade app; shown in the UI sidebar and logged at startup)
 - `testplatform/version.py` → `TEST_APP_VERSION` (test platform; remote GA workers self-update by comparing it)
+- `packages/<dir>/<pkg>/version.py` → `PACKAGE_VERSION` (one per shared package) and
+  `testplatform/required_package_versions.py` → the minimum a worker must run
 
-Bump `APP_VERSION` for changes under `ba2_trade_platform/`, and `TEST_APP_VERSION` for changes under
-`testplatform/` **or `packages/`**, before pushing.
+Bump `APP_VERSION` for changes under `ba2_trade_platform/`, `TEST_APP_VERSION` for changes under
+`testplatform/`, and the package's `PACKAGE_VERSION` for every change under `packages/`; raise the
+required minimum only when the package change can affect GA results (see CLAUDE.md "Versioning").
 
 ## 📝 Logging
 

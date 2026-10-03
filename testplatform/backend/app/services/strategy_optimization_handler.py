@@ -2242,8 +2242,9 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 f"{_MAX_TASKS_PER_CHILD} individual(s); pool: {_pool_kind}")
             if _workers:
                 from app.services.distributed_eval import DistributedEvaluator
-                from app.services.self_update import get_version_info, unsyncable_reason
-                _master_version = get_version_info().get("app_version")
+                from app.services.self_update import master_sync_policy, unsyncable_reason
+                _master_info = master_sync_policy()  # raises PackageGatingError: refuse, never gate silently off
+                _master_version = _master_info.get("app_version")
                 _unsyncable = unsyncable_reason()
                 if _unsyncable:
                     logger.warning(
@@ -2255,6 +2256,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 _evaluator = DistributedEvaluator(
                     _pool, opt.fitness_metric, parallel, opt_id,
                     workers=_workers, master_version=_master_version,
+                    required_packages=_master_info.get("required_package_versions"),
+                    master_packages=_master_info.get("package_versions"),
                     pool_factory=_make_pool if parallel >= 1 else None,
                     max_remote_slots_per_worker=_max_remote_slots,
                     governor=_governor,

@@ -36,6 +36,8 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from . import package_versions
+
 logger = logging.getLogger(__name__)
 
 # The three shared packages, installed in dependency order (common <- providers <- experts).
@@ -112,7 +114,8 @@ def get_version_info(root: Optional[Path] = None) -> dict:
 
     ``app_version`` is the TEST platform's ``TEST_APP_VERSION`` — the string workers sync on.
     ``trade_app_version`` is the trade app's, carried purely so a human reading ``/version`` can
-    see both. ``version_scheme`` says where ``app_version`` came from; a pre-split build omits it
+    see both. ``package_versions`` / ``required_package_versions`` carry the per-package
+    versions (see ``package_versions``). ``version_scheme`` says where ``app_version`` came from; a pre-split build omits it
     entirely, which is how a master recognises a worker that has not pulled yet.
 
     The git commit is the authoritative equality check for "is this the same code?" — a worker
@@ -123,10 +126,40 @@ def get_version_info(root: Optional[Path] = None) -> dict:
         "app_version": _app_version(root),
         "trade_app_version": _trade_app_version(root),
         "version_scheme": VERSION_SCHEME,
+        # Additive (2026-10-03): each shared package's own PACKAGE_VERSION, read from the
+        # checkout by TEXT, plus the minimums this build declares. A worker built before this
+        # field existed omits both keys; `worker_client.ensure_synced` treats that as "unknown".
+        "package_versions": package_versions.read_package_versions(root),
+        "required_package_versions": package_versions.read_required_package_versions(root),
         "git_commit": _git_commit(root),
         "editable": is_editable_install(root),
         "root": str(root),
     }
+
+
+class PackageGatingError(RuntimeError):
+    """The master cannot enforce package minimums (file missing/garbled/inconsistent)."""
+
+
+def master_sync_policy(root: Optional[Path] = None) -> dict:
+    """``get_version_info`` for a master about to dispatch to remote workers, validated.
+
+    Raises ``PackageGatingError`` (loudly) unless the master's own version, every package version
+    and every declared minimum parse. Every entry point that syncs workers calls this instead of
+    ``get_version_info``: an unreadable ``required_package_versions.py`` reads as ``{}`` and would
+    otherwise silently switch package gating OFF.
+    """
+    info = get_version_info(root)
+    problems = package_versions.master_problems(info["package_versions"],
+                                                info["required_package_versions"])
+    if package_versions.try_parse(info.get("app_version")) is None:
+        problems.append(f"app_version {info.get('app_version')!r} is unreadable "
+                        f"(testplatform/version.py)")
+    if problems:
+        raise PackageGatingError(
+            "refusing distributed mode: the master cannot enforce package minimums -- "
+            + "; ".join(problems))
+    return info
 
 
 def unsyncable_reason(root: Optional[Path] = None) -> Optional[str]:
@@ -151,11 +184,13 @@ def unsyncable_reason(root: Optional[Path] = None) -> Optional[str]:
     root = root or resolve_repo_root()
     try:
         r = subprocess.run(
-            ["git", "status", "--porcelain", "--", "testplatform/version.py"],
+            ["git", "status", "--porcelain", "--", "testplatform/version.py",
+             "testplatform/required_package_versions.py", "packages/*/*/version.py"],
             cwd=str(root), capture_output=True, text=True, timeout=10,
         )
         if r.returncode == 0 and r.stdout.strip():
-            return ("testplatform/version.py has UNCOMMITTED changes — a remote worker's "
+            return ("testplatform/version.py / required_package_versions.py / a package version.py has "
+                    "UNCOMMITTED changes — a remote worker's "
                     "`git pull` can never reach this app_version. Commit and push before running "
                     "a distributed job, or workers will retry-and-exclude for the whole run.")
     except (OSError, subprocess.SubprocessError):

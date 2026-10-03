@@ -172,7 +172,9 @@ class DistributedEvaluator:
                  pool_factory: Optional[Callable[[], Any]] = None,
                  max_remote_slots_per_worker: Optional[int] = None,
                  governor: Optional[Any] = None,
-                 market_condition_manifests: Optional[Dict[str, str]] = None):
+                 market_condition_manifests: Optional[Dict[str, str]] = None,
+                 required_packages: Optional[Dict[str, str]] = None,
+                 master_packages: Optional[Dict[str, str]] = None):
         self.pool = submit_pool
         self._pool_factory = pool_factory
         # Dynamic worker allocation. When set, consumers above governor.current PARK
@@ -190,6 +192,12 @@ class DistributedEvaluator:
         self.optimization_id = optimization_id
         self.workers = workers or []
         self.master_version = master_version
+        # Per-package minimums (REQUIRED_PACKAGE_VERSIONS) and the master's own package versions;
+        # see worker_client.ensure_synced. `_drift_seen` makes each distinct drift WARN once per
+        # job (this evaluator is one job).
+        self.required_packages = required_packages
+        self.master_packages = master_packages
+        self._drift_seen: set = set()
         self.log = log
         # Per-run ceiling on concurrent remote slots PER WORKER, regardless of the worker's
         # reported /health capacity -- so a worker that advertises 8 slots doesn't run 8
@@ -354,7 +362,10 @@ class DistributedEvaluator:
     def _preflight_worker(self, w: dict, secrets: dict) -> bool:
         """Version-match + cache/secrets-push one worker. Returns True if it's usable now."""
         try:
-            if not worker_client.ensure_synced(w, self.master_version, log=self.log):
+            if not worker_client.ensure_synced(
+                    w, self.master_version, log=self.log,
+                    required_packages=self.required_packages,
+                    master_packages=self.master_packages, drift_seen=self._drift_seen):
                 return False
             worker_client.push_cache(w, log=self.log)
             worker_client.push_secrets(w, secrets, log=self.log)

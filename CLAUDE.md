@@ -254,29 +254,57 @@ The test platform is different: `ba2-test` loads `testplatform/backend/.env` and
 
 ## Versioning
 
-There are **TWO** independent version files, both static strings of the form `YYYY.MM.NNNNN`:
+There are **FOUR** kinds of static version string, all of the form `YYYY.MM.NNNNN`:
 
 - `ba2_trade_platform/version.py` -> `APP_VERSION` (the trade app; shown in the UI sidebar,
   bottom-left)
 - `testplatform/version.py` -> `TEST_APP_VERSION` (the test platform, zero-padded so the two
   sequences can never produce the same string)
+- `packages/<dir>/<pkg>/version.py` -> `PACKAGE_VERSION`, one per shared package (`ba2_common`,
+  `ba2_providers`, `ba2_experts`); `__version__` and the pyproject `version` are the same string
+- `testplatform/required_package_versions.py` -> `REQUIRED_PACKAGE_VERSIONS`, the minimum
+  package versions the test platform requires of its workers
 
-**Before every `git push`, increment the build number (NNNNN) by 1** in the file that matches
-what you changed:
+**Before every `git push`, increment the build number (NNNNN) by 1** in each file that matches what
+you changed:
 
 | What you changed | Bump |
 |---|---|
 | `ba2_trade_platform/` only | `ba2_trade_platform/version.py` (`APP_VERSION`) |
-| `testplatform/` **or `packages/`** | `testplatform/version.py` (`TEST_APP_VERSION`) |
-| both | both files |
+| `testplatform/` | `testplatform/version.py` (`TEST_APP_VERSION`). EXEMPT: edits to `required_package_versions.py` and `ga_neutral_package_paths.py` alone need no TEST bump |
+| anything shipped under `packages/<dir>/<pkg>/` | that package's `PACKAGE_VERSION` (`packages/<dir>/<pkg>/version.py`, plus the same string as `version` in `packages/<dir>/pyproject.toml`) -- ALWAYS |
+| ... and the change CAN affect GA / backtest results | also set that package's entry in `testplatform/required_package_versions.py` EQUAL to the new `PACKAGE_VERSION`. No `TEST_APP_VERSION` bump is needed: the raised minimum itself makes older workers sync |
+| ... and the change CANNOT (broker-only code, etc.) | leave the minimum alone; add a narrow glob for the path to `testplatform/ga_neutral_package_paths.py` in a reviewed change (CI: the `ga-neutral-reviewed` PR label, or `--allow-neutral-change` by hand); the allowlist is judged from the BASE, so a path added in the same diff does not exempt itself |
+| more than one of the above | each matching file |
 
-`packages/` counts as a test-platform change because the distributed GA workers decide whether to
-self-update by comparing `TEST_APP_VERSION` alone
-(`testplatform/backend/app/services/worker_client.py:ensure_synced`, which deliberately does not
-key on the git commit so that ordinary pushes don't churn every worker mid-run). A shared-package
-change that does not bump it leaves workers running different `ba2_common` code from the master,
-which silently breaks trial reproducibility.
+Why workers compare versions: distributed GA trials must run the IDENTICAL code as the master or a
+trial's fitness depends on where it ran. A worker re-syncs (`git pull`, reinstall, restart) when
+(a) its `TEST_APP_VERSION` differs from the master's, or (b) a package version it reports is BELOW
+the master's `REQUIRED_PACKAGE_VERSIONS` entry (a worker that reports none is "unknown": synced once,
+logged loudly). A package version that merely differs from the master's while the worker is at/above
+the minimum does NOT force a re-sync -- that is the point of the scheme, and it means such a worker
+may run OLDER package code than the master by design. The master logs a `WARNING ... DRIFT` line
+(once per job, per worker) listing every package that differs, so drift is observable, never silent.
+Raising a minimum is therefore the explicit act "this change can affect GA results".
 
-Keeping the two files separate is what stops a test-platform-only change from needing a cosmetic
-trade bump to reach the workers (and stops a trade-only bump from making every worker re-sync for
-nothing). Update the year/month when they change.
+`tools/check_package_versions.py` (a unit test, and the `package-version-guard` CI job) enforces the bump rules against
+`git diff <base>...HEAD`: a shipped `packages/` change without a `PACKAGE_VERSION` bump fails; one that
+is not matched by `GA_NEUTRAL_GLOBS` and does not raise the minimum (or bump `TEST_APP_VERSION`) fails.
+Run it before pushing: `python tools/check_package_versions.py [--base origin/dev] [--include-worktree]`.
+Full rationale: `docs/plans/2026-10-03-package-versioning-design.md`. Commit AND push the bumps --
+`unsyncable_reason` WARNS (it does not block the run) when a version file is uncommitted or the
+branch is unpushed; a worker's `git pull` could not reach it.
+
+Boundary checklist (shipping a package-versioning or minimum-raising change):
+
+1. Every master that shares the workers moves to the new commit TOGETHER, between jobs: the main
+   clone, the remote150 isolated-worktree lanes, remote227 if shared. Pull and RESTART long-lived
+   `ba2-test serve` masters (a pulled but un-restarted master still advertises the old payload).
+2. Push before the next job and confirm `unsyncable_reason` is silent (it warns on uncommitted
+   version files or an unpushed branch).
+3. Check EVERY worker's `GET /version`: `package_versions` and `required_package_versions` present
+   and what you expect (an old worker without them is synced once, loudly).
+4. Roll back by reverting FORWARD (a revert commit with a higher TEST_APP_VERSION), never by
+   `git reset`: a worker newer than the master is EXCLUDED, not downgraded.
+5. Never push a minimum raise to dev while any master is mid-job: workers below it re-sync.
+
