@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from sqlmodel import select, func
 from typing import Dict, Any, Optional, List
 import asyncio
+import time as _time
 
 from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
@@ -14,17 +15,30 @@ from ...core.ModelBillingUsage import ModelBillingUsage
 from ...modules.accounts import providers
 from ...logger import logger
 from types import SimpleNamespace
+from datetime import date
 
 from ..utils.chart_helpers import (
     axis_format, fullscreen_button, fullscreen_content_button, grid_options,
     growth_pct_of_invested, label_series_colors, legend_options, mode_toggle,
-    pct_of_invested,
+    pct_of_invested, responsive_echart,
 )
 from ..utils.perf_logger import PerfLogger
 from ..utils.protective_stop import resolve_protective_legs
 from ..utils.growth_label_storage import (
     GROWTH_LABELS_STORAGE_KEY, MONTHLY_PROFIT_LABELS_STORAGE_KEY,
-    read_growth_labels, resolve_growth_labels, write_growth_labels,
+    resolve_growth_labels,
+)
+from ..utils.dividend_forecast import forecast_dividends
+from ..utils.overview_range import (
+    RANGE_OPTIONS, date_in_range, effective_range_start, filter_dates, filter_months,
+    history_capped, read_range, resolve_range_start, write_range, yf_period_for,
+)
+from ..utils.overview_label_scope import (
+    CHART_GROWTH, CHART_MONTHLY, CHART_POSITION_LABEL, CHART_POSITION_SYMBOL,
+    apply_scope, chart_key, follow_pf_key, pick_single,
+    read_overview_setting, read_stored_list, resolve_chart_selection, resolve_scope,
+    scope_key, select_all, select_none, single_key, union_scopes,
+    write_overview_setting,
 )
 from ..components import ProfitPerExpertChart, InstrumentDistributionChart, BalanceUsagePerExpertChart
 from ..components.FloatingPLPerExpertWidget import FloatingPLPerExpertWidget
@@ -5097,6 +5111,16 @@ def _pnl_color_gradient(pnl_data, positive_color, negative_color):
     }
 
 
+def signed_trade_qty(side, qty) -> float:
+    """+qty for a BUY, -qty for a SELL, 0 for anything else. ONE predicate shared by the
+    quantity timeline and the dividend forecast, so an unknown side is ignored by both."""
+    if side == 'BUY':
+        return float(qty)
+    if side == 'SELL':
+        return -float(qty)
+    return 0.0
+
+
 def _build_qty_timeline(current_qty, filled_trades, all_dates, dividends=None):
     """
     Build a mapping of date -> qty by walking backwards from current_qty through filled trades
@@ -5143,10 +5167,7 @@ def _build_qty_timeline(current_qty, filled_trades, all_dates, dividends=None):
         d = te['date']
         if d not in daily_change:
             daily_change[d] = 0.0
-        if te['side'] == 'BUY':
-            daily_change[d] += te['qty']
-        elif te['side'] == 'SELL':
-            daily_change[d] -= te['qty']
+        daily_change[d] += signed_trade_qty(te['side'], te['qty'])
 
     # Add DRIP qty changes (DRIP adds shares, so it's like a BUY in the forward direction)
     if dividends:
@@ -5188,6 +5209,106 @@ def _build_qty_timeline(current_qty, filled_trades, all_dates, dividends=None):
 
 
 
+#: How long fetched broker data (dividends, trades, positions, balance history) may be reused.
+#: Within it a range / scope / dropdown click costs no broker call (rapid toggling stays free);
+#: past it ANY redraw refetches the FULL lists -- never "since the last fetch", because a
+#: payment can be booked a day or three BACK-DATED and an incremental fetch would miss it.
+BROKER_DATA_TTL_SECONDS = 60
+#: yfinance prices have their own, longer, TTL (today's bar can be at most this old).
+PRICE_TTL_SECONDS = 15 * 60
+#: Gentle auto-refresh of a long-open, VISIBLE tab: refetch, redraw only if the data changed.
+AUTO_REFRESH_SECONDS = 5 * 60
+
+
+def _clock() -> float:
+    """Monotonic seconds. A module-level function so tests can drive the TTLs."""
+    return _time.monotonic()
+
+
+def rows_fingerprint(dividends, trades, positions) -> tuple:
+    '''One digest per dataset over the SORTED full rows, so it changes when any row is added,
+    back-dated, re-symboled, re-sided, re-amounted or gains a DRIP quantity. The balance is
+    deliberately NOT part of it: equity moves every few minutes in market hours, and the
+    "new data" chip is for changed ROWS. A balance-only change updates the cache silently
+    and the next draw uses it.'''
+    import hashlib
+
+    def digest(rows):
+        return hashlib.md5(repr(sorted(rows)).encode('utf-8')).hexdigest()
+
+    def f(v):
+        return '' if v is None else str(v)
+    div = [(f(r.get('date')), f(r.get('symbol')), f(r.get('amount')), f(r.get('drip_quantity')),
+            f(r.get('account_id'))) for r in dividends]
+    trd = [(f(r.get('date')), f(r.get('symbol')), f(r.get('side')), f(r.get('qty')), f(r.get('price')),
+            f(r.get('account_id'))) for r in trades]
+    pos = [(f(getattr(p, 'symbol', None)), f(getattr(p, 'qty', None))) for p in positions]
+    return (digest(div), digest(trd), digest(pos))
+
+
+#: Datasets where "had rows, now has none" is read as a failed fetch (the brokers return []
+#: on any error). Positions are judged by their explicit failure only: a flat account is real.
+NONEMPTY_RULE = ('dividends', 'trades', 'balance')
+
+
+def merge_refresh(prev, new, failed):
+    '''``(merged, bad)``: never replace good data with an error-shaped result, PER ACCOUNT.
+
+    ``prev`` / ``new``: ``{account_id: {dataset: rows}}``; ``failed``: ``{(account_id,
+    dataset)}`` for fetches that raised (or, for positions, returned None). A dataset is BAD
+    when its fetch failed or it went from non-empty to empty (``NONEMPTY_RULE``) -- judged
+    on that account's own rows, so one account's transient ``[]`` is not hidden by the
+    other account's rows keeping the combined total non-empty. A bad dataset keeps its
+    previous value; with no previous value it is reported and used as it is.'''
+    merged, bad = {}, set()
+    for aid, data in new.items():
+        old = (prev or {}).get(aid)
+        row = dict(data)
+        for name in data:
+            err = (aid, name) in failed or (
+                name in NONEMPTY_RULE and old is not None and old.get(name) and not data.get(name))
+            if err:
+                bad.add((aid, name))
+                if old is not None and name in old:
+                    row[name] = old[name]
+        merged[aid] = row
+    return merged, bad
+
+
+#: balance_floor before anything has been requested (None means the default window).
+_UNFETCHED = object()
+
+
+def _save_setting(key, value) -> bool:
+    """``write_overview_setting`` that SAYS so when it fails: a view preference that does not
+    persist must not look like one that does."""
+    ok = write_overview_setting(key, value)
+    if not ok:
+        try:
+            ui.notify('Could not save this setting; it will not survive a reload.', type='warning')
+        except RuntimeError:
+            pass
+    return ok
+
+
+def _to_date(value):
+    """date | datetime | ISO string -> date, or None."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _rgba(hex_color: str, alpha: float) -> str:
+    """``#RRGGBB`` -> ``rgba(r, g, b, alpha)`` (forecast bars: the series colour, see-through)."""
+    h = hex_color.lstrip('#')
+    return f'rgba({int(h[0:2], 16)}, {int(h[2:4], 16)}, {int(h[4:6], 16)}, {alpha})'
+
+
 def _stored_label_colors() -> dict:
     """``{label: stored colour}`` for the selected account, or ``{}``.
 
@@ -5217,7 +5338,311 @@ class AccountGrowthTab:
     """Account Growth tab showing balance history and dividend income charts."""
 
     def __init__(self):
+        # Page-level label scope (None = unrestricted) and the accounts in view; set by
+        # _load_growth_data before any chart renders. See ui/utils/overview_label_scope.py.
+        self._scope = None
+        self._account_ids = []
+        self._single_account = None
+        # Page-level time range (DB-persisted, one value for the whole page) and the next
+        # 2 months' dividend forecast (see ui/utils/dividend_forecast.py).
+        self._forecast = {}
+        self._gen = 0
+        self._hidden_labels = 0
+        self._init_data_cache()
+        self._set_range(read_range())
         self.render()
+
+    # ------------------------------------------------------------------
+    # time range + the per-page broker-data cache
+    # ------------------------------------------------------------------
+
+    def _init_data_cache(self):
+        """Broker data lives on the tab for the life of the page: a range click only
+        re-filters and redraws. A new page load (or a different account selection)
+        builds a fresh tab / key, which is the only invalidation there is."""
+        if not hasattr(self, '_load_lock'):
+            # Created ONCE: a new lock per refresh click would give every click its own
+            # unlocked lock (concurrent full fetches) and blind ``locked()`` checks.
+            self._load_lock = asyncio.Lock()
+        if hasattr(self, '_broker_cache'):
+            self._broker_cache.clear()
+        else:
+            self._broker_cache = {}
+        self._refresh_warned = False
+        self._bg_running = False
+        self._earliest = None            # first balance / trade / dividend date
+        self._raw_range_start = None
+        self._balance_first = None
+        self._activity_first = None
+
+    def _set_range(self, range_key):
+        self._range = range_key
+        self._raw_range_start = resolve_range_start(range_key, date.today())
+        self._range_start = effective_range_start(self._raw_range_start, self._earliest)
+
+    # ------------------------------------------------------------------
+    # label scope + persisted chart selections (DB, per account)
+    # ------------------------------------------------------------------
+
+    def _sess(self):
+        """Session-only chart selections (All-accounts mode has no owner to persist to)."""
+        return self.__dict__.setdefault('_session_sel', {})
+
+    def _stored_selection(self, chart, legacy_key, options):
+        """A multi-select chart's initial value: each account in view's saved choice,
+        resolved against ``options`` and unioned (All accounts). With one account, a
+        missing DB value falls back ONCE to the legacy per-browser value."""
+        legacy = legacy_key if self._single_account is not None else None
+        if self._single_account is None and chart in self._sess():
+            # "All accounts": a dropdown change has no owner to persist to, but it must
+            # survive the reload a stale-TTL click triggers.
+            return resolve_chart_selection([self._sess()[chart]], options)
+        stored = [read_stored_list(chart_key(chart, aid), legacy) for aid in self._account_ids]
+        return resolve_chart_selection(stored, options)
+
+    def _stored_singles(self, chart):
+        if self._single_account is None and ('single', chart) in self._sess():
+            return [self._sess()[('single', chart)]]
+        return [read_overview_setting(single_key(chart, aid)) for aid in self._account_ids]
+
+    def _persist_selection(self, chart, visible):
+        # Only with ONE account selected: with "All accounts" a change has no single
+        # owner, so it stays session-only (the union is what is shown on reload).
+        if self._single_account is not None:
+            _save_setting(chart_key(chart, self._single_account), list(visible))
+        else:
+            self._sess()[chart] = list(visible)
+
+    def _persist_single(self, chart, value):
+        if self._single_account is not None:
+            _save_setting(single_key(chart, self._single_account), value)
+        else:
+            self._sess()[('single', chart)] = value
+
+    def _scope_symbol_info(self, symbol_info):
+        """Drop out-of-scope labels from each symbol (and symbols left with none)."""
+        if self._scope is None:
+            self._hidden_labels = 0
+            return symbol_info
+        out = {}
+        before, after = set(), set()
+        for sym, info in symbol_info.items():
+            kept = apply_scope(info['labels'], self._scope)
+            before.update(info['labels'])
+            after.update(kept)
+            if kept:
+                out[sym] = dict(info, labels=kept)
+        self._hidden_labels = len(before - after)
+        return out
+
+    @staticmethod
+    def _multi_select_with_all_none(options, value, label, width):
+        """A multi-select with Select all / Select none buttons beside it."""
+        with ui.row().classes('items-center gap-1 mb-2'):
+            select = ui.select(options=list(options), value=list(value), label=label,
+                               multiple=True).classes(width)
+
+            def _summary(_=None):
+                # A phone shows ~25 characters: a comma list of 18 labels is cut mid-word.
+                # The count says what the list cannot. Quasar's display-value replaces the text.
+                select.props(f'display-value="{len(select.value or [])} of {len(options)} labels"')
+            _summary()
+            select.on_value_change(_summary)
+            ui.button('All', on_click=lambda: setattr(select, 'value', select_all(options))
+                      ).props('flat dense size=sm').tooltip('Select all')
+            ui.button('None', on_click=lambda: setattr(select, 'value', select_none())
+                      ).props('flat dense size=sm').tooltip('Select none')
+        return select
+
+    def _compute_dividend_forecast(self, all_dividends, all_filled_trades, qty_by_account_symbol):
+        """``{month: {'total': x, 'labels': {label: x}}}`` for the next 2 months.
+
+        Reuses the page's own dividend rows (``get_dividends``) -- no second source.
+        Those rows are TOTALS, so the per-share amount is the row's net amount over the
+        shares held on the payment date: ``_build_qty_timeline`` walks back from the
+        account's CURRENT quantity over the union of its dividend dates AND its trade
+        dates for the symbol (a trade is only undone if its date is in the list), minus
+        the DRIP shares the payment itself bought.
+
+        PER ACCOUNT AND SYMBOL, then summed: two brokers booking the same payment a day
+        apart would otherwise interleave into gaps of 1 / 89 days and kill the cadence.
+        Each account's forecast uses that account's own quantity. A symbol's forecast
+        goes to its labels exactly like its actual dividends.
+        """
+        from collections import defaultdict
+
+        def _ds(v):
+            return v.strftime('%Y-%m-%d') if hasattr(v, 'strftime') else str(v)[:10]
+
+        today = date.today()
+        divs_by = defaultdict(list)
+        for d in all_dividends or []:
+            if d.get('symbol') and d.get('date'):
+                divs_by[(d.get('account_id'), d['symbol'])].append(d)
+        trades_by = defaultdict(list)
+        for t in all_filled_trades or []:
+            if t.get('symbol') and t.get('date'):
+                trades_by[(t.get('account_id'), t['symbol'])].append(t)
+
+        events = []                                    # (symbol, forecast event)
+        for (aid, sym), qty in qty_by_account_symbol.items():
+            if qty <= 0 or (aid, sym) not in divs_by:
+                continue
+            rows = divs_by[(aid, sym)]
+            trades = trades_by.get((aid, sym), [])
+            dates = sorted({_ds(r['date']) for r in rows} | {_ds(t['date']) for t in trades})
+            qty_by_date, _ = _build_qty_timeline(qty, trades, dates, dividends=rows)
+            # The timeline is END of day; the payment is made on the shares held BEFORE that
+            # day's own trades and DRIP, so those are taken back out (a sale of 90 on the
+            # payment date still earned the dividend on the 90).
+            day_trades = defaultdict(float)
+            for t in trades:
+                day_trades[_ds(t['date'])] += signed_trade_qty(t.get('side'), t.get('qty') or 0)
+            amount_on, drip_on = defaultdict(float), defaultdict(float)
+            for r in rows:
+                amount_on[_ds(r['date'])] += float(r.get('amount') or 0)
+                drip_on[_ds(r['date'])] += float(r.get('drip_quantity') or 0)
+            per_date = {}
+            for ds, amount in amount_on.items():
+                q = qty_by_date.get(ds, 0) - day_trades.get(ds, 0.0) - drip_on[ds]
+                if q > 0:
+                    per_date[ds] = amount / q
+            history = [(date.fromisoformat(ds), v) for ds, v in per_date.items()]
+            for ev in forecast_dividends(history, qty, today, months=2):
+                events.append((sym, ev))
+
+        labels_by_symbol = get_labels_by_symbol(sorted({sym for sym, _ in events})) if events else {}
+        out = {}
+        for sym, ev in events:
+            month = ev['date'].strftime('%Y-%m')
+            slot = out.setdefault(month, {'total': 0.0, 'labels': {}})
+            slot['total'] += ev['amount']
+            for lb in (labels_by_symbol.get(normalize_symbol(sym)) or ['Unlabeled']):
+                slot['labels'][lb] = slot['labels'].get(lb, 0.0) + ev['amount']
+        return out
+
+    def _compute_scope_inputs(self, target_accounts, filled_trades, dividends, positions_by_account):
+        """Per account: traded labels (reusing get_labels_by_symbol, the derivation the label
+        charts use; an unlabeled symbol counts as 'Unlabeled' like the charts), managed
+        labels, stored scope, follow flag. DB only -- safe in a worker thread."""
+        from ...core.portfolio_allocation_store import get_managed_labels
+        state = {}
+        for acc_def, _inst in target_accounts:
+            aid = acc_def.id
+            symbols = set(positions_by_account.get(aid, ()))
+            symbols.update(t.get('symbol') for t in filled_trades if t.get('account_id') == aid)
+            symbols.update(d.get('symbol') for d in dividends if d.get('account_id') == aid)
+            symbols = sorted(s for s in symbols if s)
+            by_sym = get_labels_by_symbol(symbols) if symbols else {}
+            traded = set()
+            for sym in symbols:
+                traded.update(by_sym.get(normalize_symbol(sym)) or ['Unlabeled'])
+            try:
+                managed = [r.label for r in get_managed_labels(aid)]
+            except Exception as e:  # noqa: BLE001 -- an account without a pf manager
+                logger.warning(f"Overview scope: managed labels unavailable for {aid}: {e}")
+                managed = []
+            stored = read_overview_setting(scope_key(aid))
+            state[aid] = {
+                'name': acc_def.name,
+                'traded': sorted(traded),
+                'managed': managed,
+                'stored': [str(x) for x in stored] if isinstance(stored, list) else None,
+                'follow': read_overview_setting(follow_pf_key(aid)) is True,
+            }
+        return state
+
+    @staticmethod
+    def _effective_scope(state):
+        return union_scopes(
+            resolve_scope(st['stored'], st['traded'], st['follow'], st['managed'])
+            for st in state.values())
+
+    def _render_scope_controls(self, holder, state, on_change):
+        """The page-level "labels in scope" setting (expandable row above the charts)."""
+        from ...core.utils import get_all_instrument_labels
+        try:
+            every = list(get_all_instrument_labels())
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Overview scope: could not list instrument labels: {e}")
+            every = []
+        options = sorted(set(every) | {'Unlabeled'}
+                         | {l for st in state.values() for l in st['traded'] + st['managed']}
+                         | set(self._scope or []))
+        single = self._single_account
+        with holder:
+            with ui.expansion('Label scope', icon='filter_alt').classes('w-full mb-2').props('dense') as exp:
+                pass
+            with exp:
+                ui.label('Labels the whole page considers. Every label chart (and its dropdown) '
+                         'is limited to these. Default: the labels of every symbol this account '
+                         'has traded.').classes('text-xs text-gray-500')
+                if single is None:
+                    ui.label('All accounts: showing the union of every account scope. '
+                             'Select a single account to edit it.').classes('text-xs text-gray-500')
+                    ui.label(', '.join(self._scope or []) or '(none)').classes('text-sm')
+                    return
+                st = state[single]
+                # A column that wraps: on a phone a 24rem select plus a switch in one row
+                # overflowed the card and scrolled sideways.
+                select = ui.select(options=options, value=list(self._scope or []),
+                                   label='Labels in scope', multiple=True).classes('w-full sm:w-96')
+
+                def _summary(_=None):
+                    select.props(f'display-value="{len(select.value or [])} of {len(options)} labels"')
+                _summary()
+                select.on_value_change(_summary)
+                with ui.row().classes('w-full items-center gap-2 flex-wrap'):
+                    all_btn = ui.button('All', on_click=lambda: setattr(select, 'value', select_all(options))
+                                        ).props('flat dense size=sm')
+                    none_btn = ui.button('None', on_click=lambda: setattr(select, 'value', select_none())
+                                         ).props('flat dense size=sm')
+                    follow = ui.switch('Follow portfolio manager labels', value=st['follow']).tooltip(
+                        'On: the scope is the account managed labels from the portfolio manager '
+                        'and follows them as they change (re-read on every page load). Turning it on '
+                        'also copies them into the selection once, so turning it off keeps them. '
+                        'Off: the selection stays as you leave it.')
+
+                def lock(on):
+                    for w in (select, all_btn, none_btn):
+                        w.set_enabled(not on)
+                lock(st['follow'])
+                guard = {'busy': False}
+
+                def on_select(e):
+                    if guard['busy'] or st['follow']:
+                        return
+                    st['stored'] = sorted(select_all(e.value or []))
+                    _save_setting(scope_key(single), st['stored'])
+                    on_change()
+
+                def on_follow(e):
+                    if guard['busy']:
+                        return
+                    if e.value:
+                        if not st['managed']:
+                            ui.notify('This account has no managed labels in the portfolio manager; '
+                                      'the label scope is unchanged.', type='warning')
+                            guard['busy'] = True
+                            follow.value = False
+                            guard['busy'] = False
+                            return
+                        st['follow'] = True
+                        st['stored'] = sorted(select_all(st['managed']))
+                        _save_setting(scope_key(single), st['stored'])
+                        _save_setting(follow_pf_key(single), True)
+                        guard['busy'] = True
+                        select.value = list(st['stored'])
+                        guard['busy'] = False
+                        lock(True)
+                    else:
+                        st['follow'] = False
+                        _save_setting(follow_pf_key(single), False)
+                        lock(False)
+                    on_change()
+
+                select.on_value_change(on_select)
+                follow.on_value_change(on_follow)
 
     def render(self):
         logger.debug("[RENDER] AccountGrowthTab.render() - START")
@@ -5227,100 +5652,178 @@ class AccountGrowthTab:
             ui.label('Account Growth').classes('text-lg font-bold mb-2')
             ui.label('Track portfolio value, dividend income, and per-position growth over time. Price data from Yahoo Finance.').classes('text-sm text-gray-500 mb-4')
 
+            # ONE time range for every chart on the page (persisted in the DB).
+            with ui.row().classes('w-full items-center gap-2 mb-2'):
+                ui.label('Time range').classes('text-sm text-gray-500')
+                range_toggle = ui.toggle(RANGE_OPTIONS, value=self._range).props('dense no-caps')
+                range_toggle.tooltip(
+                    'Applies to every chart on this page. Cumulative lines (dividends, '
+                    'invested, P&L %) are rebased to start at the range start; the monthly '
+                    'bars show the months in range plus the next 2 months of dividend forecast.')
+                refresh_btn = ui.button(icon='refresh').props('flat round dense').tooltip(
+                    'Reload broker data (trades, dividends, balances, prices) now. Data is reused '
+                    f'for {BROKER_DATA_TTL_SECONDS}s; any redraw after that refetches it.')
+                self._updated_label = ui.label('Updated --:--:--').classes('text-xs text-gray-500')
+                new_data_btn = ui.button('New data - tap to refresh', icon='sync').props(
+                    'dense no-caps color=primary')
+                new_data_btn.set_visibility(False)
+                self._new_data_btn = new_data_btn
+
             # Loading state
             loading_label = ui.label('Loading account growth data...').classes('text-sm text-gray-500')
             charts_container = ui.column().classes('w-full')
 
+            def reload_page(message):
+                charts_container.clear()
+                with charts_container:
+                    reloading = ui.label(message).classes('text-sm text-gray-500')
+                asyncio.create_task(self._load_growth_data(reloading, charts_container, selected_account_id))
+
+
+            def on_range_change(e):
+                if e.value not in RANGE_OPTIONS or e.value == self._range:
+                    return
+                if not write_range(e.value):
+                    ui.notify('Could not save the time range; it will not survive a reload.',
+                              type='warning')
+                self._set_range(e.value)
+                reload_page('Reloading for the new range...')
+
+            def on_refresh(*_):
+                self._expire_cache()          # keep the old rows until the new fetch succeeds
+                self._set_range(self._range)
+                new_data_btn.set_visibility(False)
+                reload_page('Reloading broker data...')
+
+            def on_new_data(*_):
+                new_data_btn.set_visibility(False)
+                reload_page('Updating...')     # the cache already holds the new rows: no fetch
+
+            async def background_refresh():
+                # Under the load lock, so it never overlaps a load. Refetches IN FULL and
+                # stores the result; never redraws on its own (that would jump the scroll
+                # position and reset session-only selections) -- when ROWS changed it shows
+                # the "New data - tap to refresh" chip instead.
+                changed = False
+                try:
+                    async with self._load_lock:
+                        target, problem = self._resolve_target_accounts(selected_account_id)
+                        if problem or 'dividends' not in self._broker_cache:
+                            return
+                        if not self._cache_expired():
+                            return                 # another load refreshed it meanwhile
+                        changed = await self._refresh_cache(target)
+                except RuntimeError:
+                    return
+                except Exception as e:
+                    logger.warning(f"Background refresh failed: {e}")
+                    return
+                finally:
+                    self._bg_running = False
+                if changed:
+                    new_data_btn.set_visibility(True)
+
+            self._background_refresh = background_refresh
+
+            async def auto_refresh():
+                # Skipped while a load runs or the browser tab is hidden (document.hidden is
+                # true for a background TAB; it cannot see a panel that is merely scrolled
+                # away or covered).
+                if self._load_lock.locked() or not self._account_ids or self._bg_running:
+                    return
+                try:
+                    if await ui.run_javascript('document.hidden'):
+                        return
+                except Exception:
+                    return
+                self._bg_running = True
+                await background_refresh()
+
+            refresh_btn.on_click(on_refresh)
+            new_data_btn.on_click(on_new_data)
+            ui.timer(AUTO_REFRESH_SECONDS, auto_refresh, immediate=False)
+            range_toggle.on_value_change(on_range_change)
             asyncio.create_task(self._load_growth_data(loading_label, charts_container, selected_account_id))
 
     async def _load_growth_data(self, loading_label, charts_container, selected_account_id):
-        """Load all growth data asynchronously."""
+        """Load all growth data asynchronously.
+
+        Loads are SERIALISED (``_load_lock``) and numbered (``_gen``): a load that a newer
+        click has overtaken returns before fetching anything it has not already started,
+        and a stale load never writes range-dependent state (the effective start, scope,
+        forecast, the first-balance date) or draws. It may still store the broker data it
+        fetched -- that is range-independent and saves the next load a second request.
+        """
+        self._gen += 1
+        gen = self._gen
+        async with self._load_lock:
+            if gen != self._gen:
+                return      # overtaken while waiting for the lock; the newer click owns the page
+            await self._load_growth_data_locked(loading_label, charts_container,
+                                                selected_account_id, gen)
+
+    async def _load_growth_data_locked(self, loading_label, charts_container, selected_account_id, gen):
         try:
-            accounts = get_all_instances(AccountDefinition)
-            if not accounts:
-                loading_label.set_text('No accounts configured.')
+            target_accounts, problem = self._resolve_target_accounts(selected_account_id)
+            if problem:
+                loading_label.set_text(problem)
                 return
 
-            # Determine which accounts to load
-            target_accounts = []
-            for acc_def in accounts:
-                if selected_account_id is not None and acc_def.id != selected_account_id:
-                    continue
-                try:
-                    account_instance = get_account_instance_from_id(acc_def.id)
-                    if account_instance:
-                        target_accounts.append((acc_def, account_instance))
-                except Exception as e:
-                    logger.warning(f"Could not load account {acc_def.id}: {e}")
+            self._account_ids = [a.id for a, _ in target_accounts]
+            self._single_account = selected_account_id if selected_account_id is not None else None
 
-            if not target_accounts:
-                loading_label.set_text('No accounts available for growth data.')
+            # BROKER DATA IS FETCHED ONCE PER PAGE (per account selection). None of it depends
+            # on the time range, and it shares the live accounts' rate limit, so a range click
+            # must not re-ask for it. Only a LONGER balance history (3y / Max) or a longer
+            # price period than already held triggers one more request.
+            cache = self._broker_cache
+            key = tuple(self._account_ids)
+            if cache.get('key') != key:
+                cache.clear()
+                cache['key'] = key
+            # TTL: past it everything is fetched again IN FULL (BROKER_DATA_TTL_SECONDS); within
+            # it nothing is asked of the broker. A failed refresh keeps the old rows.
+            if 'dividends' not in cache or self._cache_expired():
+                await self._refresh_cache(target_accounts)
+            if gen != self._gen:
+                return      # stale: the raw data is cached above, nothing range-dependent is touched
+            self._activity_first = cache['activity_first']
+
+            # Longer balance history only when the range needs an earlier start than what was
+            # REQUESTED (floor: None = the broker's default ~1y | a date). A broker that
+            # returns less than asked is not asked again.
+            req = self._balance_request_start()
+            floor = cache.get('balance_floor', _UNFETCHED)
+            if floor is _UNFETCHED or (req is not None and (floor is None or req < floor)):
+                await self._refresh_balance(target_accounts, req)
+            if gen != self._gen:
                 return
+            self._balance_first = cache['balance_first']
+            all_balance_history = cache['balance']
+            all_dividends = cache['dividends']
+            all_filled_trades = cache['trades']
+            all_positions = cache['positions']
+            account_map = cache['account_map']
+            positions_by_account = cache['positions_by_account']
+            qty_by_account_symbol = cache['qty_by_account_symbol']
 
-            # Collect balance history, dividend data, and filled trades from all target accounts
-            all_balance_history = []
-            all_dividends = []
-            all_filled_trades = []
-
-            for acc_def, account_instance in target_accounts:
-                try:
-                    balance_hist = await asyncio.to_thread(account_instance.get_balance_history)
-                    for entry in balance_hist:
-                        entry['account_name'] = acc_def.name
-                        entry['account_id'] = acc_def.id
-                    all_balance_history.extend(balance_hist)
-                except Exception as e:
-                    logger.warning(f"Could not load balance history for {acc_def.name}: {e}")
-
-                try:
-                    dividends = await asyncio.to_thread(account_instance.get_dividends)
-                    for entry in dividends:
-                        entry['account_name'] = acc_def.name
-                        entry['account_id'] = acc_def.id
-                    all_dividends.extend(dividends)
-                except Exception as e:
-                    logger.warning(f"Could not load dividends for {acc_def.name}: {e}")
-
-                try:
-                    trades = await asyncio.to_thread(account_instance.get_filled_trades)
-                    for t in trades:
-                        t['account_id'] = acc_def.id
-                    all_filled_trades.extend(trades)
-                except Exception as e:
-                    logger.warning(f"Could not load filled trades for {acc_def.name}: {e}")
+            # Never earlier than the account's first activity (Max = from there, not from a
+            # symbol's 1962 listing date).
+            firsts = [d for d in (self._balance_first, self._activity_first) if d]
+            self._earliest = min(firsts) if firsts else None
+            self._set_range(self._range)
 
             try:
                 loading_label.delete()
             except RuntimeError:
                 return
 
-            # Pre-fetch positions from all accounts in thread pool
-            all_positions = []
-            account_map = {}  # symbol -> account instance
-            for acc_def, account_instance in target_accounts:
-                try:
-                    positions = await asyncio.to_thread(account_instance.get_positions)
-                    for pos in positions:
-                        all_positions.append(pos)
-                        account_map[pos.symbol] = account_instance
-                except Exception as e:
-                    logger.warning(f"Could not load positions for {acc_def.name}: {e}")
-
-            # Fetch historical prices from Yahoo Finance
-            historical_prices = {}
-            position_symbols = list(set(pos.symbol for pos in all_positions))
-            if position_symbols:
-                try:
-                    import yfinance as yf
-                    hist_data = await asyncio.to_thread(
-                        lambda: yf.download(position_symbols, period='6mo', progress=False, auto_adjust=False)
-                    )
-                    for sym in position_symbols:
-                        prices = _extract_yf_close_prices(hist_data, sym)
-                        if prices:
-                            historical_prices[sym] = prices
-                except Exception as e:
-                    logger.warning(f"Could not fetch historical prices: {e}")
+            # Historical prices: re-download only when a LONGER period than already held is
+            # needed (or new symbols appeared); a shorter range is just filtered.
+            position_symbols = sorted(set(pos.symbol for pos in all_positions))
+            historical_prices = await self._ensure_prices(position_symbols)
+            if gen != self._gen:
+                return
 
             # Monthly realized income (closed-trade P&L + cash dividends), incl. per-label
             try:
@@ -5337,15 +5840,56 @@ class AccountGrowthTab:
                 monthly_global, monthly_label = {}, {}
 
             try:
+                scope_state = await asyncio.to_thread(
+                    self._compute_scope_inputs, target_accounts, all_filled_trades,
+                    all_dividends, positions_by_account)
+            except Exception as e:
+                logger.warning(f"Could not compute the label scope inputs: {e}")
+                scope_state = {}
+            try:
+                forecast = await asyncio.to_thread(
+                    self._compute_dividend_forecast, all_dividends, all_filled_trades,
+                    qty_by_account_symbol)
+            except Exception as e:
+                logger.warning(f"Could not compute the dividend forecast: {e}")
+                forecast = {}
+
+            if gen != self._gen:
+                return  # a newer load (range changed meanwhile) owns the container
+            self._scope = self._effective_scope(scope_state) if scope_state else None
+            self._forecast = forecast
+
+            try:
                 with charts_container:
-                    # New monthly histograms at the top
-                    self._render_monthly_realized_income_chart(months, monthly_income, monthly_global)
-                    self._render_monthly_profit_by_label_chart(months, monthly_by_label, income_labels, monthly_label)
-                    self._render_total_growth_chart(all_balance_history, all_dividends, all_filled_trades)
-                    self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
-                    self._render_growth_by_position_in_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
-                    self._render_per_position_section(all_positions, account_map, all_filled_trades, all_dividends)
-                    self._render_dividend_history_table(all_dividends)
+                    scope_holder = ui.column().classes('w-full')
+                    chart_holder = ui.column().classes('w-full')
+
+                def draw_charts():
+                    chart_holder.clear()
+                    # The ONE place the range reaches the monthly bars: months before the
+                    # range start drop out (the FIFO/dividend compute above stays on the
+                    # full history so realized P&L is unchanged).
+                    shown_months = filter_months(months, self._range_start)
+                    with chart_holder:
+                        # New monthly histograms at the top
+                        self._render_monthly_realized_income_chart(shown_months, monthly_income, monthly_global)
+                        self._render_monthly_profit_by_label_chart(shown_months, monthly_by_label, income_labels, monthly_label)
+                        self._render_total_growth_chart(all_balance_history, all_dividends, all_filled_trades)
+                        self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
+                        self._render_growth_by_position_in_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
+                        self._render_per_position_section(all_positions, account_map, all_filled_trades, all_dividends)
+                        self._render_dividend_history_table(all_dividends)
+
+                def on_scope_change():
+                    self._kick_refresh()
+                    self._scope = self._effective_scope(scope_state)
+                    draw_charts()
+
+                if scope_state:
+                    self._render_scope_controls(scope_holder, scope_state, on_scope_change)
+                draw_charts()
+                self._hide_chip()
+                self._update_age_label()
             except RuntimeError:
                 return
 
@@ -5355,6 +5899,264 @@ class AccountGrowthTab:
                 loading_label.set_text(f'Error loading growth data: {str(e)}')
             except RuntimeError:
                 pass
+
+    def _resolve_target_accounts(self, selected_account_id):
+        """``([(AccountDefinition, instance)], problem_message_or_None)``."""
+        accounts = get_all_instances(AccountDefinition)
+        if not accounts:
+            return [], 'No accounts configured.'
+        target = []
+        for acc_def in accounts:
+            if selected_account_id is not None and acc_def.id != selected_account_id:
+                continue
+            try:
+                account_instance = get_account_instance_from_id(acc_def.id)
+                if account_instance:
+                    target.append((acc_def, account_instance))
+            except Exception as e:
+                logger.warning(f"Could not load account {acc_def.id}: {e}")
+        if not target:
+            return [], 'No accounts available for growth data.'
+        return target, None
+
+    async def _fetch_accounts(self, target_accounts, req=None, only=('dividends', 'trades', 'positions', 'balance')):
+        '''``({account_id: {dataset: rows}}, failed)`` -- fetched IN FULL, never incrementally.
+        ``failed`` holds ``(account_id, dataset)`` for fetches that raised (``get_positions``
+        returning None counts: that is the brokers' "fetch failed").'''
+        new, failed = {}, set()
+        for acc_def, inst in target_accounts:
+            aid, row = acc_def.id, {}
+            for name in only:
+                try:
+                    if name == 'dividends':
+                        rows = await asyncio.to_thread(inst.get_dividends)
+                        for entry in rows:
+                            entry['account_name'] = acc_def.name
+                            entry['account_id'] = aid
+                    elif name == 'trades':
+                        rows = await asyncio.to_thread(inst.get_filled_trades)
+                        for t in rows:
+                            t['account_id'] = aid
+                    elif name == 'positions':
+                        rows = await asyncio.to_thread(inst.get_positions)
+                        if rows is None:
+                            raise RuntimeError('get_positions returned None')
+                    else:
+                        if req is not None:
+                            rows = await asyncio.to_thread(
+                                inst.get_balance_history,
+                                start_date=datetime.combine(req, datetime.min.time()),
+                                end_date=datetime.now())
+                        else:
+                            rows = await asyncio.to_thread(inst.get_balance_history)
+                        for entry in rows:
+                            entry['account_name'] = acc_def.name
+                            entry['account_id'] = aid
+                    row[name] = list(rows)
+                except Exception as e:
+                    failed.add((aid, name))
+                    row[name] = []
+                    logger.warning(f"Could not load {name} for {acc_def.name}: {e}")
+            new[aid] = row
+        return new, failed
+
+    def _store_accounts(self, accounts, instances):
+        '''Keep the per-account rows and the combined views the charts read.'''
+        cache = self._broker_cache
+        cache['accounts'], cache['instances'] = accounts, instances
+        div, trd, pos, bal = [], [], [], []
+        account_map, pos_by_acc, qty_by_acc = {}, {}, {}
+        for aid, data in accounts.items():
+            div.extend(data.get('dividends', []))
+            trd.extend(data.get('trades', []))
+            bal.extend(data.get('balance', []))
+            for p_ in data.get('positions', []):
+                pos.append(p_)
+                pos_by_acc.setdefault(aid, set()).add(p_.symbol)
+                qty_by_acc[(aid, p_.symbol)] = qty_by_acc.get((aid, p_.symbol), 0.0) + float(p_.qty)
+                account_map[p_.symbol] = instances[aid]
+        dates = [_to_date(x.get('date')) for x in div + trd]
+        dates = [d for d in dates if d]
+        bdates = [_to_date(x.get('date')) for x in bal]
+        bdates = [d for d in bdates if d]
+        cache.update(dividends=div, trades=trd, positions=pos, balance=bal, account_map=account_map,
+                     positions_by_account=pos_by_acc, qty_by_account_symbol=qty_by_acc,
+                     activity_first=min(dates) if dates else None,
+                     balance_first=min(bdates) if bdates else None)
+
+    def _cache_expired(self):
+        cache = self._broker_cache
+        return 'dividends' in cache and _clock() - cache['fetched_at'] > BROKER_DATA_TTL_SECONDS
+
+    def _expire_cache(self):
+        '''Mark everything stale WITHOUT dropping it: the refresh button keeps the old rows on
+        screen and in the cache until the new fetch succeeds.'''
+        cache = self._broker_cache
+        if 'fetched_at' in cache:
+            cache['fetched_at'] = float('-inf')
+        if cache.get('prices'):
+            cache['prices']['fetched_at'] = float('-inf')
+        self._refresh_warned = False
+
+    async def _refresh_cache(self, target_accounts):
+        '''Fetch EVERYTHING again, in full (never "since the last fetch": a payment can be
+        booked back-dated) and merge it per account (``merge_refresh``): a failed or
+        error-shaped dataset keeps its previous rows. ``fetched_at`` is the time of this
+        ATTEMPT, success or not, so a failing broker is asked once per TTL, not on every
+        click; ``updated_wall`` (the "Updated" stamp) moves only on a fully good fetch.
+        Returns ``changed`` -- whether the ROWS (not the balance) differ from before.'''
+        cache = self._broker_cache
+        prev = cache.get('accounts')
+        prev_fp = (rows_fingerprint(cache['dividends'], cache['trades'], cache['positions'])
+                   if prev else None)
+        instances = {a.id: inst for a, inst in target_accounts}
+        new, failed = await self._fetch_accounts(
+            target_accounts, only=('dividends', 'trades', 'positions'))
+        merged, bad = merge_refresh(prev, new, failed)
+        for aid, row in merged.items():                     # carry the balance until refetched
+            row['balance'] = list(((prev or {}).get(aid) or {}).get('balance', []))
+        self._store_accounts(merged, instances)
+        bad |= await self._refresh_balance(target_accounts)
+        changed = (prev_fp is not None and prev_fp != rows_fingerprint(
+            cache['dividends'], cache['trades'], cache['positions']))
+        cache['fetched_at'] = _clock()
+        cache['failed'] = bad
+        if not bad or prev is None:
+            cache['updated_wall'] = datetime.now()
+        self._announce_refresh(bad, prev is not None)
+        return changed
+
+    async def _refresh_balance(self, target_accounts, req=None):
+        '''Fetch the balance history (from ``req``, default: this range's need), merge it per
+        account into the cache and record what was REQUESTED as the floor -- even when the
+        broker returned nothing (an IBKR-only selection is not asked twice per load).'''
+        cache = self._broker_cache
+        if req is None:
+            req = self._balance_request_start(cache.get('activity_first'))
+        new, failed = await self._fetch_accounts(target_accounts, req, only=('balance',))
+        merged, bad = merge_refresh(cache.get('accounts'), new, failed)
+        accounts = {aid: dict(cache['accounts'].get(aid, {}), balance=row['balance'])
+                    for aid, row in merged.items()}
+        self._store_accounts(accounts, cache['instances'])
+        if not bad:
+            cache['balance_floor'] = req
+        else:
+            cache.setdefault('balance_floor', req)
+        return bad
+
+    def _announce_refresh(self, bad, had_previous):
+        '''The refresh result, where the user can see it. The inline marker (set by
+        ``_update_age_label``) stays until a fetch succeeds; the toast is a bonus -- page
+        loads run as bare asyncio tasks with no UI slot, so it is raised from INSIDE the
+        stamp label's own slot, and the "already warned" flag is set only once it worked.'''
+        self._update_age_label()
+        if bad and had_previous:
+            logger.warning(f"Broker refresh incomplete {sorted(bad)}; kept the previous rows")
+            if not self._refresh_warned:
+                label = getattr(self, '_updated_label', None)
+                try:
+                    with label:
+                        ui.notify('Could not refresh some broker data; showing the previous '
+                                  'data.', type='warning')
+                    self._refresh_warned = True
+                except (RuntimeError, AttributeError, TypeError):
+                    pass
+        elif not bad:
+            self._refresh_warned = False
+
+    def _kick_refresh(self):
+        '''A click that redraws from the data already on the page also starts a BACKGROUND
+        refresh when the cache is past its TTL. Never a reload: that would lose the click
+        and jump the scroll. When the refresh finds changed rows the chip appears.'''
+        bg = getattr(self, '_background_refresh', None)
+        if (bg is not None and not self._bg_running and not self._load_lock.locked()
+                and self._cache_expired()):
+            self._bg_running = True
+            asyncio.create_task(bg())
+
+    def _hide_chip(self):
+        chip = getattr(self, '_new_data_btn', None)
+        if chip is not None:
+            try:
+                chip.set_visibility(False)       # what it offered is on screen now
+            except RuntimeError:
+                pass
+
+    def _update_age_label(self):
+        label = getattr(self, '_updated_label', None)
+        when = self._broker_cache.get('updated_wall')
+        if label is None or when is None:
+            return
+        failed = bool(self._broker_cache.get('failed'))
+        try:
+            label.set_text(f"Updated {when.strftime('%H:%M:%S')}"
+                           + (' - refresh failed' if failed else ''))
+            label.classes(replace='text-xs ' + ('text-orange-500' if failed else 'text-gray-500'))
+        except RuntimeError:
+            pass
+
+    _PRICE_RANKS = ['6mo', '1y', '3y', 'max']
+
+    def _balance_request_start(self, activity_first=None):
+        """``start_date`` to ask the broker's balance history for, or None for its default
+        window (about one year). Only 3y / Max reach further back."""
+        if self._range not in ('3y', 'Max'):
+            return None
+        act = activity_first if activity_first is not None else self._activity_first
+        req = self._raw_range_start if self._raw_range_start else act
+        if req is not None and act is not None:
+            req = max(req, act)
+        if req is None or req >= date.today() - timedelta(days=365):
+            return None
+        return req
+
+    async def _ensure_prices(self, symbols):
+        """``{symbol: {date: close}}`` from the page cache; downloads only when the cached
+        period is shorter than this range needs, or a symbol is missing."""
+        cache = self._broker_cache
+        need = yf_period_for(self._range)
+        held = cache.get('prices')
+        covered = False
+        if held:
+            missing = set(symbols) - held['symbols']
+            # A symbol Yahoo returned nothing for is not hammered on every click: it is
+            # tolerated for one broker TTL, then asked for again.
+            covered = not missing or (missing <= held['missing']
+                                      and _clock() - held['fetched_at'] <= BROKER_DATA_TTL_SECONDS)
+        if (held and covered
+                and _clock() - held['fetched_at'] <= PRICE_TTL_SECONDS
+                and self._PRICE_RANKS.index(held['period']) >= self._PRICE_RANKS.index(need)):
+            return held['data']
+        data = {}
+        ok = True
+        if symbols:
+            try:
+                import yfinance as yf
+                hist = await asyncio.to_thread(
+                    lambda: yf.download(symbols, period=need, progress=False, auto_adjust=False))
+                for sym in symbols:
+                    prices = _extract_yf_close_prices(hist, sym)
+                    if prices:
+                        data[sym] = prices
+                ok = bool(data)
+            except Exception as e:
+                logger.warning(f"Could not fetch historical prices: {e}")
+                ok = False
+        if ok:
+            # Only a download that returned something is remembered: a failed one is retried
+            # on the next load instead of freezing empty charts until the page is reopened.
+            cache['prices'] = {'period': need, 'symbols': set(data), 'data': data,
+                               'missing': set(symbols) - set(data), 'fetched_at': _clock()}
+        return data
+
+    def _cached_symbol_prices(self, symbol):
+        held = self._broker_cache.get('prices')
+        if (held and symbol in held['data']
+                and _clock() - held['fetched_at'] <= PRICE_TTL_SECONDS
+                and self._PRICE_RANKS.index(held['period'])
+                >= self._PRICE_RANKS.index(yf_period_for(self._range))):
+            return held['data'][symbol]
+        return None
 
     def _compute_monthly_realized(self, all_filled_trades, all_dividends):
         """Aggregate realized closed-trade P&L and dividend income by month (and by label).
@@ -5537,6 +6339,9 @@ class AccountGrowthTab:
                     mode = ui.toggle(['$', '%'], value='$').props('dense')
                     fullscreen_button(lambda: build(),
                                       title='Monthly Realized Income')
+            forecast = self._forecast or {}
+            fc_months = sorted(forecast)
+            months = sorted(set(months) | set(fc_months))
             if not months:
                 ui.label('No closed trades or dividend income yet.').classes('text-sm text-gray-500')
                 return
@@ -5551,21 +6356,32 @@ class AccountGrowthTab:
 
             def build():
                 pct = mode.value == '%'
-                pnl = [conv(m, monthly_income[m]['pnl'], pct) for m in months]
-                div = [conv(m, monthly_income[m]['div'], pct) for m in months]
-                total = [conv(m, round(monthly_income[m]['pnl'] + monthly_income[m]['div'], 2), pct) for m in months]
+                inc = {m: monthly_income.get(m) for m in months}
+                pnl = [conv(m, inc[m]['pnl'], pct) if inc[m] else None for m in months]
+                div = [conv(m, inc[m]['div'], pct) if inc[m] else None for m in months]
+                total = [conv(m, round(inc[m]['pnl'] + inc[m]['div'], 2), pct) if inc[m] else None
+                         for m in months]
+                # Forecast is $ only (no honest % denominator for a future month) and is
+                # its OWN series: never part of Closed P&L, Dividends or Total.
+                fc = [None if pct or m not in forecast else round(forecast[m]['total'], 2)
+                      for m in months]
                 fmt = '{value}%' if pct else '${value}'
                 return {
                     'backgroundColor': 'transparent',
                     'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
-                    'legend': {'data': ['Closed P&L', 'Dividends', 'Total'], 'textStyle': {'color': '#a0aec0'}, 'top': 5},
+                    'legend': {'data': ['Closed P&L', 'Dividends', 'Dividends (forecast, estimated)', 'Total'],
+                               'textStyle': {'color': '#a0aec0'}, 'top': 5},
                     'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
                     'xAxis': {'type': 'category', 'data': months, 'axisLabel': {'color': '#a0aec0'}},
                     'yAxis': {'type': 'value', 'axisLabel': {'color': '#a0aec0', 'formatter': fmt},
                               'splitLine': {'lineStyle': {'color': 'rgba(255,255,255,0.05)'}}},
                     'series': [
                         {'name': 'Closed P&L', 'type': 'bar', 'data': pnl, 'itemStyle': {'color': '#3b82f6'}},
-                        {'name': 'Dividends', 'type': 'bar', 'data': div, 'itemStyle': {'color': '#22c55e'}},
+                        {'name': 'Dividends', 'type': 'bar', 'data': div, 'stack': 'div',
+                         'itemStyle': {'color': '#22c55e'}},
+                        {'name': 'Dividends (forecast, estimated)', 'type': 'bar', 'data': fc, 'stack': 'div',
+                         'itemStyle': {'color': _rgba('#22c55e', 0.35), 'borderColor': '#22c55e',
+                                       'borderType': 'dashed', 'borderWidth': 1}},
                         {'name': 'Total', 'type': 'bar', 'data': total, 'itemStyle': {'color': '#f59e0b'}},
                     ],
                 }
@@ -5573,10 +6389,10 @@ class AccountGrowthTab:
             def rebuild():
                 chart_container.clear()
                 with chart_container:
-                    ui.echart(build()).classes('w-full').style('height: 320px')
+                    responsive_echart(build()).classes('w-full').style('height: 320px')
 
             with chart_container:
-                ui.echart(build()).classes('w-full').style('height: 320px')
+                responsive_echart(build()).classes('w-full').style('height: 320px')
             mode.on_value_change(lambda e: rebuild())
 
     def _render_monthly_profit_by_label_chart(self, months, monthly_by_label, labels, monthly_label=None):
@@ -5592,8 +6408,15 @@ class AccountGrowthTab:
                     mode = ui.toggle(['$', '%'], value='$').props('dense')
                     fullscreen_button(lambda: build(),
                                       title='Monthly Closed Profit + Dividends by Label')
+            all_label_count = len(set(labels))
+            labels = apply_scope(labels, self._scope)
+            hidden_by_scope = all_label_count - len(set(labels))
+            forecast = self._forecast or {}
+            months = sorted(set(months) | set(forecast))
             if not months or not labels:
-                ui.label('No closed trades yet.').classes('text-sm text-gray-500')
+                ui.label('No closed trades yet.' if not months
+                         else 'No labels in scope (see the label scope setting above).'
+                         ).classes('text-sm text-gray-500')
                 return
 
             monthly_label = monthly_label or {}
@@ -5614,40 +6437,61 @@ class AccountGrowthTab:
                     if lb not in visible:
                         continue
                     series.append({
-                        'name': lb, 'type': 'bar',
-                        'data': [cell(m, lb, pct) for m in months],
+                        'name': lb, 'type': 'bar', 'stack': lb,
+                        'data': [cell(m, lb, pct) if m in monthly_by_label else None for m in months],
                         'itemStyle': {'color': label_color[lb]},
                     })
+                legend_names = [s['name'] for s in series]
+                if not pct:
+                    # Forecast: the label's colour, see-through with a dashed border, stacked
+                    # on the label's own bar. Never merged into the actual series.
+                    for lb in labels:
+                        if lb not in visible:
+                            continue
+                        data = [round(forecast[m]['labels'][lb], 2)
+                                if m in forecast and lb in forecast[m]['labels'] else None
+                                for m in months]
+                        if any(v is not None for v in data):
+                            series.append({
+                                'name': f'{lb} (forecast, estimated)', 'type': 'bar', 'stack': lb,
+                                'data': data,
+                                'itemStyle': {'color': _rgba(label_color[lb], 0.35),
+                                              'borderColor': label_color[lb],
+                                              'borderType': 'dashed', 'borderWidth': 1},
+                            })
                 fmt = '{value}%' if pct else '${value}'
                 return {
                     'backgroundColor': 'transparent',
                     'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
-                    'legend': {'data': [s['name'] for s in series], 'textStyle': {'color': '#a0aec0'}, 'top': 5},
-                    'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+                    'legend': legend_options(legend_names),
+                    'grid': grid_options(legend_names),
                     'xAxis': {'type': 'category', 'data': months, 'axisLabel': {'color': '#a0aec0'}},
                     'yAxis': {'type': 'value', 'axisLabel': {'color': '#a0aec0', 'formatter': fmt},
                               'splitLine': {'lineStyle': {'color': 'rgba(255,255,255,0.05)'}}},
                     'series': series,
                 }
 
-            # The selection persists in app.storage.user (session, not the DB) and is
-            # intersected with the labels that still exist, so a deleted label cannot
-            # break the chart. See ui/utils/growth_label_storage.py.
-            default_labels = resolve_growth_labels(
-                read_growth_labels(MONTHLY_PROFIT_LABELS_STORAGE_KEY), list(labels))
-            label_select = ui.select(options=list(labels), value=default_labels, multiple=True,
-                                     label='Labels shown').classes('w-72 mb-2')
+            # The selection persists in the DB per account (ui/utils/overview_label_scope.py)
+            # and is intersected with the labels in scope that still exist, so a deleted
+            # label cannot break the chart.
+            default_labels = self._stored_selection(
+                CHART_MONTHLY, MONTHLY_PROFIT_LABELS_STORAGE_KEY, list(labels))
+            label_select = self._multi_select_with_all_none(
+                list(labels), default_labels, 'Labels shown', 'w-72')
+            if hidden_by_scope > 0:
+                ui.label(f'{hidden_by_scope} labels hidden by the label scope').classes('text-xs text-gray-500')
             chart_container = ui.column().classes('w-full')
 
             def rebuild():
                 visible = list(label_select.value) if label_select.value else []
-                write_growth_labels(visible, MONTHLY_PROFIT_LABELS_STORAGE_KEY)
+                self._persist_selection(CHART_MONTHLY, visible)
+                self._kick_refresh()
                 chart_container.clear()
                 with chart_container:
-                    ui.echart(build_options(visible, mode.value == '%')).classes('w-full').style('height: 320px')
+                    responsive_echart(build_options(visible, mode.value == '%')).classes('w-full').style('height: 320px')
 
             with chart_container:
-                ui.echart(build_options(default_labels, False)).classes('w-full').style('height: 320px')
+                responsive_echart(build_options(default_labels, False)).classes('w-full').style('height: 320px')
             label_select.on_value_change(lambda e: rebuild())
             mode.on_value_change(lambda e: rebuild())
 
@@ -5660,8 +6504,19 @@ class AccountGrowthTab:
             # until then.
             header_row = ui.row().classes('w-full items-center justify-between')
             with header_row:
-                ui.label('Total Account Growth').classes('text-md font-bold mb-2')
+                ui.label(f'Total Account Growth ({self._range}, rebased to range start)'
+                         + (f' - broker history starts {self._balance_first}'
+                            if history_capped(self._raw_range_start, self._balance_first,
+                                              self._activity_first) else '')
+                         ).classes('text-md font-bold mb-2')
 
+            # TIME RANGE: the inputs are cut at the range start, so everything cumulative
+            # restarts there -- Cumulative Dividends from 0, Invested Capital and P&L %
+            # from the first in-range balance (they initialise on the first entry).
+            balance_history = [e for e in (balance_history or [])
+                               if date_in_range(e.get('date'), self._range_start)]
+            dividends = [d for d in (dividends or [])
+                         if date_in_range(d.get('date'), self._range_start)]
             if not balance_history and not dividends:
                 ui.label('No balance history or dividend data available.').classes('text-sm text-gray-500')
                 return
@@ -5949,7 +6804,7 @@ class AccountGrowthTab:
                 'series': series,
             }
 
-            ui.echart(chart_options).classes('w-full h-96')
+            responsive_echart(chart_options).classes('w-full h-96')
             # Static options -- this panel has no toggles -- so the closure cannot go
             # stale and a plain capture is honest here.
             with header_row:
@@ -5988,6 +6843,7 @@ class AccountGrowthTab:
             symbol_info[pos.symbol]['qty'] += pos.qty
             symbol_info[pos.symbol]['cost_basis'] += pos.cost_basis
 
+        symbol_info = self._scope_symbol_info(symbol_info)
         if not symbol_info:
             return
 
@@ -5995,12 +6851,12 @@ class AccountGrowthTab:
         all_dates_set = set()
         for sym_prices in historical_prices.values():
             all_dates_set.update(sym_prices.keys())
-        all_dates = sorted(all_dates_set)
+        all_dates = filter_dates(sorted(all_dates_set), self._range_start)
 
         if not all_dates:
             # Fallback: no historical data, show a simple current-value bar chart
             with ui.card().classes('w-full mb-4 p-4'):
-                ui.label('Growth by Label').classes('text-md font-bold mb-2')
+                ui.label(f'Growth by Label ({self._range}, rebased to range start)').classes('text-md font-bold mb-2')
                 ui.label('No historical price data available for line chart.').classes('text-sm text-gray-400')
             return
 
@@ -6160,7 +7016,7 @@ class AccountGrowthTab:
 
         with ui.card().classes('w-full mb-4 p-4'):
             with ui.row().classes('w-full items-center justify-between'):
-                ui.label('Growth by Label').classes('text-md font-bold mb-2')
+                ui.label(f'Growth by Label ({self._range}, rebased to range start)').classes('text-md font-bold mb-2')
                 with ui.row().classes('items-center gap-1'):
                     mode = mode_toggle()
                     fullscreen_button(lambda: build_chart_options(
@@ -6286,34 +7142,35 @@ class AccountGrowthTab:
                     'series': series,
                 }
 
-            # The selection persists in app.storage.user (session, not the DB) and is
-            # intersected with the labels that still exist, so a deleted label cannot
-            # break the chart. See ui/utils/growth_label_storage.py.
-            default_labels = resolve_growth_labels(
-                read_growth_labels(GROWTH_LABELS_STORAGE_KEY), list(all_labels))
+            # The selection persists in the DB per account (ui/utils/overview_label_scope.py)
+            # and is intersected with the labels in scope that still exist.
+            default_labels = self._stored_selection(
+                CHART_GROWTH, GROWTH_LABELS_STORAGE_KEY, list(all_labels))
 
             # Controls: visible labels + per-category show/hide toggles
             with ui.row().classes('w-full gap-4 items-center mb-2'):
-                label_select = ui.select(
-                    options=all_labels, value=default_labels, label='Visible Labels', multiple=True,
-                ).classes('w-64')
+                label_select = self._multi_select_with_all_none(
+                    all_labels, default_labels, 'Visible Labels', 'w-64')
                 show_total_cb = ui.checkbox('Total', value=True)
                 show_div_cb = ui.checkbox('Dividends', value=True)
                 show_inv_cb = ui.checkbox('Invested', value=True)
 
+            if self._hidden_labels > 0:
+                ui.label(f'{self._hidden_labels} labels hidden by the label scope').classes('text-xs text-gray-500')
             chart_container = ui.column().classes('w-full')
 
             def rebuild_label_chart():
                 visible = sorted(list(label_select.value)) if label_select.value else []
-                write_growth_labels(visible, GROWTH_LABELS_STORAGE_KEY)
+                self._persist_selection(CHART_GROWTH, visible)
+                self._kick_refresh()
                 chart_container.clear()
                 with chart_container:
-                    ui.echart(build_chart_options(
+                    responsive_echart(build_chart_options(
                         visible, show_total_cb.value, show_div_cb.value, show_inv_cb.value
                     )).classes('w-full h-80')
 
             with chart_container:
-                ui.echart(build_chart_options(default_labels)).classes('w-full h-80')
+                responsive_echart(build_chart_options(default_labels)).classes('w-full h-80')
 
             label_select.on_value_change(lambda e: rebuild_label_chart())
             show_total_cb.on_value_change(lambda e: rebuild_label_chart())
@@ -6342,6 +7199,7 @@ class AccountGrowthTab:
             symbol_info[pos.symbol]['qty'] += pos.qty
             symbol_info[pos.symbol]['cost_basis'] += pos.cost_basis
 
+        symbol_info = self._scope_symbol_info(symbol_info)
         if not symbol_info:
             return
 
@@ -6349,7 +7207,7 @@ class AccountGrowthTab:
         all_dates_set = set()
         for sym_prices in historical_prices.values():
             all_dates_set.update(sym_prices.keys())
-        all_dates = sorted(all_dates_set)
+        all_dates = filter_dates(sorted(all_dates_set), self._range_start)
 
         if not all_dates:
             return
@@ -6628,6 +7486,8 @@ class AccountGrowthTab:
                 }
 
             default_label = next((l for l in all_labels if l != 'auto_added'), all_labels[0])
+            default_label = pick_single(
+                self._stored_singles(CHART_POSITION_LABEL), all_labels, default_label)
 
             label_select = ui.select(
                 options=all_labels,
@@ -6637,14 +7497,16 @@ class AccountGrowthTab:
 
             position_chart_container = ui.column().classes('w-full')
             with position_chart_container:
-                ui.echart(build_position_chart_options(default_label)).classes('w-full h-80')
+                responsive_echart(build_position_chart_options(default_label)).classes('w-full h-80')
 
             def on_position_label_change(e):
                 if not e.value:
                     return
+                self._persist_single(CHART_POSITION_LABEL, e.value)
+                self._kick_refresh()
                 position_chart_container.clear()
                 with position_chart_container:
-                    ui.echart(build_position_chart_options(e.value)).classes('w-full h-80')
+                    responsive_echart(build_position_chart_options(e.value)).classes('w-full h-80')
 
             label_select.on_value_change(on_position_label_change)
             # The toggle redraws the CURRENT label, so it reuses the same handler with
@@ -6653,14 +7515,15 @@ class AccountGrowthTab:
                 lambda e: on_position_label_change(SimpleNamespace(value=label_select.value)))
 
     def _render_dividend_history_table(self, dividends):
-        """Render a paginated table of dividend history for the last 6 months."""
+        """Render a paginated table of dividend history within the page time range."""
         from datetime import datetime, timedelta
 
         if not dividends:
             return
 
-        # Filter to last 6 months
-        cutoff = datetime.now() - timedelta(days=183)
+        # Filter to the page's time range (Max = everything)
+        cutoff = (datetime.combine(self._range_start, datetime.min.time())
+                  if self._range_start else datetime.min)
         filtered = []
         for div in dividends:
             date_val = div.get('date')
@@ -6753,9 +7616,9 @@ class AccountGrowthTab:
 
         with ui.card().classes('w-full mb-4 p-4'):
             with ui.row().classes('w-full items-center justify-between'):
-                ui.label('Dividend History (Last 6 Months)').classes('text-md font-bold mb-2')
+                ui.label(f'Dividend History ({self._range})').classes('text-md font-bold mb-2')
                 fullscreen_content_button(lambda: _body(50),
-                                          title='Dividend History (Last 6 Months)')
+                                          title=f'Dividend History ({self._range})')
             _body(10)
 
     def _render_per_position_section(self, all_positions, account_map, all_filled_trades=None,
@@ -6808,7 +7671,8 @@ class AccountGrowthTab:
                                   title='Per-Position Growth')
             symbol_select = ui.select(
                 options=symbol_options,
-                value=symbol_options[0] if symbol_options else None,
+                value=pick_single(self._stored_singles(CHART_POSITION_SYMBOL), symbol_options,
+                                  symbol_options[0] if symbol_options else None),
                 label='Select Symbol'
             ).classes('w-64 mb-2')
             chart_container = ui.column().classes('w-full')
@@ -6827,11 +7691,13 @@ class AccountGrowthTab:
                     filled_trades = trades_by_symbol.get(symbol, [])
 
                     # Fetch historical prices from Yahoo Finance
-                    import yfinance as yf
-                    hist_data = await asyncio.to_thread(
-                        lambda: yf.download(symbol, period='6mo', progress=False, auto_adjust=False)
-                    )
-                    hist_prices = _extract_yf_close_prices(hist_data, symbol)
+                    hist_prices = self._cached_symbol_prices(symbol)
+                    if hist_prices is None:
+                        import yfinance as yf
+                        hist_data = await asyncio.to_thread(
+                            lambda: yf.download(symbol, period=yf_period_for(self._range), progress=False, auto_adjust=False)
+                        )
+                        hist_prices = _extract_yf_close_prices(hist_data, symbol)
                 except Exception as e:
                     try:
                         if loading:
@@ -6860,6 +7726,8 @@ class AccountGrowthTab:
                 latest_options['value'] = None
                 if not e.value:
                     return
+                self._persist_single(CHART_POSITION_SYMBOL, e.value)
+                self._kick_refresh()
                 selected_symbol = e.value
                 account_inst = account_map.get(selected_symbol)
                 if not account_inst:
@@ -6871,7 +7739,7 @@ class AccountGrowthTab:
             symbol_select.on_value_change(on_symbol_change)
 
             if symbol_options:
-                initial_symbol = symbol_options[0]
+                initial_symbol = symbol_select.value or symbol_options[0]
                 account_inst = account_map.get(initial_symbol)
                 if account_inst:
                     asyncio.create_task(_load_position_chart(chart_container, account_inst, initial_symbol))
@@ -6885,7 +7753,14 @@ class AccountGrowthTab:
         line rises only on dates a reinvestment actually posted, so enabling/disabling
         DRIP at the broker is reflected automatically without any account setting.
         """
-        hist_prices = hist_prices or {}
+        # TIME RANGE: prices and dividends from the range start only, so the cumulative
+        # dividend / DRIP lines restart there like every other chart on the page.
+        start = self._range_start
+        hist_prices = {d: p for d, p in (hist_prices or {}).items() if date_in_range(d, start)}
+        # The FULL list still feeds the cost basis below: a DRIP share bought before the
+        # range start is part of what the position cost, whatever window is drawn.
+        dividends_all = list(dividends or [])
+        dividends = [dv for dv in dividends_all if date_in_range(dv.get('date'), start)]
         has_dividends = bool(dividends)
         has_prices = bool(hist_prices)
 
@@ -6947,8 +7822,8 @@ class AccountGrowthTab:
                 # On sell, reduce cost proportionally (at current avg)
                 cost_events[d]['cost_delta'] -= tqty * tprice
 
-        if dividends:
-            for div in dividends:
+        if dividends_all:
+            for div in dividends_all:
                 drip_qty = div.get('drip_quantity')
                 drip_price = div.get('drip_price')
                 if not drip_qty or not drip_price:
@@ -6985,6 +7860,23 @@ class AccountGrowthTab:
         running_cost = 0.0
         running_shares = 0.0
 
+        def apply_cost_event(evt):
+            nonlocal running_cost, running_shares
+            if evt['qty_delta'] < 0 and running_shares > 0:
+                # For sells, reduce cost at current running avg (not sale price)
+                running_avg = running_cost / running_shares
+                running_cost += evt['qty_delta'] * running_avg
+                running_shares += evt['qty_delta']
+            else:
+                running_cost += evt['cost_delta']
+                running_shares += evt['qty_delta']
+
+        # Everything bought or sold BEFORE the first drawn date is already in the running
+        # cost basis when the window opens: without this, a position bought before the
+        # range start showed P&L 0% and an Invested line of just the in-window DRIP cost.
+        for d0 in sorted(k for k in cost_events if k < all_dates[0]):
+            apply_cost_event(cost_events[d0])
+
         for d in all_dates:
             if d in hist_prices:
                 last_price = hist_prices[d]
@@ -6999,15 +7891,7 @@ class AccountGrowthTab:
 
             # Update running cost basis
             if d in cost_events:
-                evt = cost_events[d]
-                if evt['qty_delta'] < 0 and running_shares > 0:
-                    # For sells, reduce cost at current running avg (not sale price)
-                    running_avg = running_cost / running_shares
-                    running_cost += evt['qty_delta'] * running_avg
-                    running_shares += evt['qty_delta']
-                else:
-                    running_cost += evt['cost_delta']
-                    running_shares += evt['qty_delta']
+                apply_cost_event(cost_events[d])
 
             qty_at_date = qty_by_date.get(d, 0)
             # ``None`` before the first purchase, so the line STARTS at the first buy
@@ -7190,7 +8074,7 @@ class AccountGrowthTab:
             'series': series,
         }
 
-        ui.echart(chart_options).classes('w-full h-80')
+        responsive_echart(chart_options).classes('w-full h-80')
         # Handed back so the PANEL (which owns the fullscreen button and is built
         # long before this async load finishes) can reopen exactly what is on
         # screen, for whichever symbol is currently selected.
