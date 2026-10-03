@@ -3399,7 +3399,10 @@ def test_the_target_column_is_renamed_so_it_cannot_be_read_as_the_label_target()
     Neither was: one is a share of the label, the other of the portfolio."""
     from ba2_trade_platform.ui.pages import portfolio_allocation as module
     import inspect
-    source = inspect.getsource(module._render_label_body)
+    # The column list moved out of ``_render_label_body`` into ``symbol_table_columns``
+    # (one list read by the table and by the phone card spec); the pin follows it.
+    source = (inspect.getsource(module._render_label_body)
+              + inspect.getsource(module.symbol_table_columns))
     assert "'label': 'Share of label %'" in source
     assert "'label': 'Target %'" not in source
 

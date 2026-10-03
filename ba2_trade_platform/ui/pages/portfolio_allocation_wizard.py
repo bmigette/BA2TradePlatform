@@ -116,6 +116,12 @@ from ...core.portfolio_allocation_service import (
 )
 from ...logger import logger
 from ..components.refresh_button import refresh_button
+from ..utils.responsive import (
+    ACTIONS_CLASS, CARD_HEAD_CLASS, CARD_ROW_CLASS, PRIMARY_ACTION_CLASS,
+    TIER_DETAIL, TIER_HEAD, TIER_PRIMARY, TIER_TICK, TIER_WIDE, CardColumn,
+    attach_card_toggle, card_cell_class, card_rows_common_css, card_rows_css,
+    check_card_columns,
+)
 
 #: Shown above the dry-run table whenever any row will be sent as a FRACTIONAL
 #: order. Both brokers refuse a fractional equity LIMIT order (TastyTrade
@@ -580,10 +586,79 @@ DRY_RUN_COLUMNS = (
     ('reasons', 'Reasons', 'flex-1 min-w-64', False),
 )
 
+#: Every cell also wears ``pf-c-<name>``: the hook the PHONE layout addresses it by
+#: (see ``DRY_RUN_CARD`` below). It changes nothing above the breakpoint.
+DRY_RUN_CELL_PREFIX = 'pf-c-'
+DRY_RUN_ROW_KEY = 'pf-dry-row'
+
 _COLUMN_CLASSES = {
-    name: width + (' text-right' if numeric else '')
+    name: (width + (' text-right' if numeric else '')
+           + ' ' + card_cell_class(DRY_RUN_CELL_PREFIX, name))
     for name, _header, width, numeric in DRY_RUN_COLUMNS
 }
+
+#: WHAT EACH COLUMN BECOMES ON A PHONE, decided once, in reading order.
+#:
+#: The 18-column table cannot be shown at 390px, and scrolling it sideways hides the
+#: Side of an order from its Symbol. On a phone every row is a CARD (the same
+#: elements, re-laid-out by CSS -- see ``ui/utils/responsive.py``):
+#:   * line 1: the tick box, the SYMBOL and the SIDE (BUY / SELL);
+#:   * always visible, captioned, two to a line: what is held and where the order
+#:     takes it, the quantity, the order's value and kind, the weight, and the
+#:     buying-power effect -- the fields a person reads before pressing Submit;
+#:   * folded behind a tap on the card ("Details"): the analytical columns (cost,
+#:     value, target, projected, capital required, BP multiple, BP %);
+#:   * full width underneath: the submit Result and the Reasons, which are prose.
+#: ``check_card_columns`` pins that this covers exactly ``DRY_RUN_COLUMNS``.
+DRY_RUN_CARD = (
+    CardColumn('tick', '', TIER_TICK),
+    CardColumn('symbol', 'Symbol', TIER_HEAD),
+    CardColumn('side', 'Side', TIER_HEAD),
+    CardColumn('held', 'Held', TIER_PRIMARY),
+    CardColumn('qty', 'Qty', TIER_PRIMARY),
+    CardColumn('estimated_value', 'Order value', TIER_PRIMARY),
+    CardColumn('order', 'Order', TIER_PRIMARY),
+    CardColumn('weight', 'Weight', TIER_PRIMARY),
+    CardColumn('bp_effect', 'BP effect', TIER_PRIMARY),
+    CardColumn('cost', 'Cost', TIER_DETAIL),
+    CardColumn('value', 'Value', TIER_DETAIL),
+    CardColumn('target', 'Target value', TIER_DETAIL),
+    CardColumn('projected', 'Projected', TIER_DETAIL),
+    CardColumn('capital_required', 'Cap req', TIER_DETAIL),
+    CardColumn('bp_ratio', 'BP ×', TIER_DETAIL),
+    CardColumn('bp_pct', 'BP %', TIER_DETAIL),
+    CardColumn('result', 'Result', TIER_WIDE),
+    CardColumn('reasons', 'Reasons', TIER_WIDE),
+)
+check_card_columns(DRY_RUN_CARD, [c[0] for c in DRY_RUN_COLUMNS])
+
+#: The "Not traded" table: smaller, hand-rolled the same way, and laid out as cards by
+#: the same CSS generator. Its cells wear these prefixes.
+NOT_TRADED_CELL_PREFIX = 'pf-n-'
+NOT_TRADED_ROW_KEY = 'pf-nt-row'
+NOT_TRADED_CARD = (
+    CardColumn('symbol', 'Symbol', TIER_HEAD),
+    CardColumn('outcome', 'Outcome', TIER_HEAD),
+    CardColumn('price', 'Price', TIER_PRIMARY),
+    CardColumn('target', 'Target', TIER_PRIMARY),
+    CardColumn('projected', 'Projected', TIER_PRIMARY),
+    CardColumn('unmet', 'Unallocated', TIER_PRIMARY),
+    CardColumn('why', 'Why', TIER_WIDE),
+)
+
+
+def phone_card_css() -> str:
+    """All the phone CSS the wizard's tables need. Pure.
+
+    Injected by the PAGE (``ui.add_css`` in ``portfolio_allocation.content``): a
+    dialog is built after the page, and styles added to a page that is already on
+    screen are not guaranteed to land.
+    """
+    return '\n'.join((
+        card_rows_common_css(),
+        card_rows_css(DRY_RUN_ROW_KEY, DRY_RUN_CELL_PREFIX, DRY_RUN_CARD),
+        card_rows_css(NOT_TRADED_ROW_KEY, NOT_TRADED_CELL_PREFIX, NOT_TRADED_CARD),
+    ))
 
 #: THE REASONS CELL, in inline CSS rather than Tailwind classes.
 #:
@@ -1029,7 +1104,7 @@ class AllocationWizard:
             self._submit_summary = ui.label('') \
                 .classes('w-full text-sm shrink-0').mark(MARKER_SUBMIT_SUMMARY)
             self._submit_summary.set_visibility(False)
-            with ui.row().classes('w-full justify-end gap-2 shrink-0'):
+            with ui.row().classes(f'w-full justify-end gap-2 shrink-0 {ACTIONS_CLASS}'):
                 # Held, because a submit in flight must be able to disable it: a
                 # refresh re-renders every row and would throw away the Result cells
                 # the run is writing into.
@@ -1045,7 +1120,7 @@ class AllocationWizard:
                     self._validate_button.tooltip(VALIDATE_TOOLTIP)
                 ui.button('Cancel', on_click=dialog.close).props('flat')
                 self._submit_button = ui.button('Submit', on_click=self._submit) \
-                    .props('color=primary')
+                    .props('color=primary').classes(PRIMARY_ACTION_CLASS)
                 # Built ONCE and re-texted on refresh. ``Element.tooltip()`` creates
                 # a fresh q-tooltip on every call (nicegui/element.py), so calling
                 # it again from _refresh would stack one per refresh.
@@ -1278,7 +1353,10 @@ class AllocationWizard:
                 # THE SAME grid treatment as the order table two inches above --
                 # header bar, separators, right-aligned money. Two tables in one
                 # dialog drawn two ways is a second look to learn for no reason.
-                with ui.row().classes(GRID_HEAD_CLASSES):
+                def _nt(name: str) -> str:
+                    return card_cell_class(NOT_TRADED_CELL_PREFIX, name)
+
+                with ui.row().classes(GRID_HEAD_CLASSES + ' ' + CARD_HEAD_CLASS):
                     for header, width in (('Symbol', 'w-24'),
                                           ('Price', 'w-28 text-right'),
                                           ('Outcome', 'w-32'),
@@ -1288,22 +1366,27 @@ class AllocationWizard:
                                           ('Why', 'flex-1')):
                         ui.label(header).classes(width)
                 for row in dropped:
-                    with ui.row().classes(GRID_ROW_CLASSES):
-                        ui.label(row['symbol']).classes('w-24 font-medium')
+                    with ui.row().classes(
+                            f'{GRID_ROW_CLASSES} {CARD_ROW_CLASS} {NOT_TRADED_ROW_KEY}'):
+                        ui.label(row['symbol']).classes(f"w-24 font-medium {_nt('symbol')}")
                         ui.label('-' if row['price'] is None
-                                 else f"{row['price']:,.2f}").classes('w-28 text-right')
-                        _label(row['outcome'], 'w-32 text-xs text-orange-400')
+                                 else f"{row['price']:,.2f}") \
+                            .classes(f"w-28 text-right {_nt('price')}")
+                        _label(row['outcome'],
+                               f"w-32 text-xs text-orange-400 {_nt('outcome')}")
                         ui.label(f"{row['target_notional']:,.2f}") \
-                            .classes('w-28 text-right')
+                            .classes(f"w-28 text-right {_nt('target')}")
                         projected = row['projected_notional']
                         ui.label('-' if projected is None
-                                 else f"{projected:,.2f}").classes('w-28 text-right')
+                                 else f"{projected:,.2f}") \
+                            .classes(f"w-28 text-right {_nt('projected')}")
                         _label(f"{row['unmet_notional']:,.2f}",
-                               'w-28 text-right text-orange-400')
+                               f"w-28 text-right text-orange-400 {_nt('unmet')}")
                         # The SAME treatment as the column two inches above: these
                         # are the longest strings in the dialog and used to run
                         # straight off the right-hand edge.
-                        _reasons_cell(row['reasons'], 'flex-1 text-xs text-gray-400')
+                        _reasons_cell(row['reasons'],
+                                      f"flex-1 text-xs text-gray-400 {_nt('why')}")
 
     @staticmethod
     def _default_selection(plan: AllocationPlan) -> set:
@@ -1478,21 +1561,23 @@ class AllocationWizard:
         bp_effect = sum(r['bp_effect'] for r in rows)
         bp_pct = sum(r['bp_usage_pct'] for r in rows)
         with self._footer_container:
-            with ui.row().classes(GRID_FOOT_CLASSES).style(GRID_FOOT_STYLE) \
-                    .mark(MARKER_TABLE_FOOT):
-                ui.label('').classes(_col('tick'))
+            with ui.row().classes(
+                    f'{GRID_FOOT_CLASSES} {CARD_ROW_CLASS} {DRY_RUN_ROW_KEY}') \
+                    .style(GRID_FOOT_STYLE).mark(MARKER_TABLE_FOOT) as foot:
+                attach_card_toggle(foot)
+                ui.label('').classes(_col('tick', 'pf-empty'))
                 with ui.label(FOOTER_CAPTION_FMT.format(ticked=len(rows),
                                                         sendable=sendable)) \
                         .classes(_col('symbol', 'font-medium')):
                     ui.tooltip(FOOTER_TOOLTIP)
-                ui.label('').classes(_col('held'))
+                ui.label('').classes(_col('held', 'pf-empty'))
                 ui.label(f"{cost:,.2f}").classes(_col('cost'))
                 ui.label(f"{sum(values):,.2f}"
                          + ('' if len(values) == len(rows) else ' *')) \
                     .classes(_col('value'))
-                ui.label('').classes(_col('side'))
-                ui.label('').classes(_col('qty'))
-                ui.label('').classes(_col('order'))
+                ui.label('').classes(_col('side', 'pf-empty'))
+                ui.label('').classes(_col('qty', 'pf-empty'))
+                ui.label('').classes(_col('order', 'pf-empty'))
                 with ui.column().classes(_col('estimated_value', 'gap-0 leading-tight')):
                     _label(f"B {buys:,.2f}", 'text-green-500 text-xs')
                     _label(f"S {sells:,.2f}", 'text-red-500 text-xs')
@@ -1505,7 +1590,7 @@ class AllocationWizard:
                 _label(f"{bp_effect:+,.2f}" if abs(bp_effect) >= 0.005 else '0.00',
                        _col('bp_effect', 'text-green-500 font-medium'
                             if bp_effect > 0 else ''))
-                ui.label('').classes(_col('bp_ratio'))
+                ui.label('').classes(_col('bp_ratio', 'pf-empty'))
                 ui.label(f"{bp_pct:.1f}%").classes(_col('bp_pct'))
                 _label('* an unpriced row is left out of this total'
                        if len(values) != len(rows) or len(projected) != len(rows)
@@ -1549,7 +1634,8 @@ class AllocationWizard:
             if any(r['fractional'] and not r['suppressed'] for r in rows):
                 _label(FRACTIONAL_IS_MARKET_ONLY_NOTE,
                        'text-xs text-orange-400 shrink-0')
-            with ui.row().classes(GRID_HEAD_CLASSES).mark(MARKER_TABLE_HEAD):
+            with ui.row().classes(GRID_HEAD_CLASSES + ' ' + CARD_HEAD_CLASS) \
+                    .mark(MARKER_TABLE_HEAD):
                 for name, header, _width, _numeric in DRY_RUN_COLUMNS:
                     ui.label(header.format(mode=self.plan.valuation_mode)) \
                         .classes(_col(name))
@@ -1557,7 +1643,8 @@ class AllocationWizard:
                 self._render_row(row)
             # The footer lives INSIDE the viewport so it can stick to its bottom
             # edge; its own container so a tick redraws the totals and nothing else.
-            self._footer_container = ui.column().classes('w-full min-w-max gap-0')
+            self._footer_container = ui.column().classes(
+                'w-full min-w-max gap-0 pf-card-wrap')
         self._render_table_footer()
 
     def _render_row(self, row: Dict):
@@ -1578,7 +1665,11 @@ class AllocationWizard:
         """
         blocked = row['suppressed'] or row['skipped']
         with ui.row().classes(GRID_ROW_CLASSES
-                              + (' opacity-60' if blocked else '')):
+                              + f' {CARD_ROW_CLASS} {DRY_RUN_ROW_KEY}'
+                              + (' opacity-60' if blocked else '')) as card:
+            # A tap on the row (not on its tick box) folds the card's details open
+            # on a phone; a no-op above the breakpoint. Browser-side only.
+            attach_card_toggle(card)
             checkbox = ui.checkbox(
                 value=row['symbol'] in self.selected,
                 on_change=lambda e, s=row['symbol']: self._toggle(s, bool(e.value)),

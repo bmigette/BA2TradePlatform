@@ -96,6 +96,11 @@ keeps the registries out of THIS module's own graph, so the deferral survives if
 the package ``__init__`` is ever trimmed.
 """
 from ..components.refresh_button import refresh_button
+from ..utils.responsive import (
+    ACTIONS_CLASS, BAR_TRACK_CLASS, GENERIC_PHONE_CSS, TIER_DETAIL, TIER_HEAD,
+    TIER_PRIMARY, TIER_WIDE, WRAP_ROW_CLASS, CardColumn, PhoneTableRegistry,
+    check_card_columns, install_phone_listener, phone_grid_prop, phone_media,
+)
 import asyncio
 import threading
 from datetime import date, datetime, timezone
@@ -181,6 +186,7 @@ from ..utils.portfolio_allocation_view import (
 )
 from .portfolio_allocation_wizard import (
     open_allocation_wizard, open_invest_scope, render_income_panel, render_outcomes,
+    phone_card_css as wizard_phone_card_css,
 )
 
 #: The toolbar's main button. It was called ``Allocate``, and that name outlived
@@ -992,7 +998,7 @@ COLOR_DEBOUNCE_MS = 400
 #: ``truncate`` is not decoration: a flex item's default ``min-width:auto`` lets it
 #: grow past its own ``w-*`` to fit its content, and only a non-visible overflow
 #: pins it. Without it the width class is advisory.
-DELTA_CELL_CLASSES = 'w-56 shrink-0 truncate '
+DELTA_CELL_CLASSES = 'w-56 shrink-0 truncate pf-b-delta '
 #: Wide enough for the dividend clause: "P&L -50.20 (-4.27%, w/ div: +1.20%)"
 #: is ~35 characters, and a truncated P&L would hide the half of the sentence
 #: that was added because the other half misreads a distribution-paying holding.
@@ -1001,7 +1007,7 @@ SYMBOL_DELTA_CELL_CLASSES = 'w-44 shrink-0 truncate '
 RESERVE_DELTA_CELL_CLASSES = 'w-52 shrink-0 truncate '
 #: The label header's bar. It GROWS -- the tracks stay equal because everything to
 #: their right is pinned above, not because the bar itself is nailed down.
-LABEL_BAR_CLASSES = 'flex-1 min-w-[120px]'
+LABEL_BAR_CLASSES = 'flex-1 min-w-[120px] pf-b-bar'
 
 
 def _render_mini_bar(*, fill_marker: str, notch_marker: str,
@@ -1014,7 +1020,7 @@ def _render_mini_bar(*, fill_marker: str, notch_marker: str,
     divs carry no content at all: the geometry IS the information, which is why
     they are marked rather than found by text.
     """
-    with ui.element('div').classes(classes).style(BAR_TRACK_STYLE):
+    with ui.element('div').classes(f'{classes} {BAR_TRACK_CLASS}').style(BAR_TRACK_STYLE):
         fill = ui.element('div').mark(fill_marker)
         notch = ui.element('div').mark(notch_marker)
     return {'fill': fill, 'notch': notch}
@@ -2286,16 +2292,16 @@ def _render_color_choices(account_id: int, label: str, current, on_saved, *,
     keeps the stacked form, where it hangs under an icon and has no siblings to
     line up with.
     """
-    container = (ui.row().classes('items-center gap-3 no-wrap') if inline
+    container = (ui.row().classes(f'items-center gap-3 no-wrap {WRAP_ROW_CLASS}') if inline
                  else ui.column().classes('gap-2 p-2'))
     with container:
         if not inline:
             ui.label('Label colour').classes('text-xs text-secondary-custom')
-        with ui.row().classes('items-center gap-2 no-wrap'):
+        with ui.row().classes(f'items-center gap-2 no-wrap {WRAP_ROW_CLASS}'):
             for name, hex_value in LABEL_COLOR_PALETTE:
                 # ``hx=hex_value`` on the handler: without the default-argument
                 # capture every chip would save the last colour in the tuple.
-                ui.element('div').mark(MARKER_COLOR_SWATCH).style(
+                ui.element('div').classes('pf-swatch').mark(MARKER_COLOR_SWATCH).style(
                     COLOR_SWATCH_STYLE + f'background:{resolve_label_icon_color(hex_value)};'
                 ).tooltip(name).on(
                     'click.stop',
@@ -2405,7 +2411,7 @@ def _open_label_picker(account_id: int, refresh) -> None:
                      'it no longer has to be found in here.'
                      ).classes('text-xs text-secondary-custom')
         for label in current:
-            with ui.row().classes('w-full items-center gap-3 no-wrap'):
+            with ui.row().classes(f'w-full items-center gap-3 no-wrap {WRAP_ROW_CLASS}'):
                 # ``lbl=label`` on BOTH the swatch and the handler: without the
                 # default-argument capture every row would recolour the last label.
                 #
@@ -2599,6 +2605,350 @@ def _symbol_fact_fields(facts) -> Dict[str, Any]:
     }
 
 
+#: The ⓘ button and the two broker-fact chips of a symbol row, as one Vue fragment.
+#: Shared by the desktop table's ``info`` cell and the phone card's header, so a
+#: change to the chips reaches both. Reads ``props.row`` only.
+SYMBOL_CHIPS_TEMPLATE = r'''
+            <div class="row items-center no-wrap justify-center" style="gap:6px">
+                <q-btn dense flat round size="sm" icon="info" color="grey-5"
+                       @click="() => $parent.$emit('symbolInfo', props.row.symbol)">
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                        <div class="text-weight-bold">{{ props.row.symbol }}</div>
+                        <div v-if="props.row.company_name">{{ props.row.company_name }}</div>
+                        <!-- Income and total return, from the cached provider stats.
+                             Exactly one of these three lines is ever non-empty: the
+                             figures, "not fetched yet", or the fetch error. -->
+                        <div v-if="props.row.stat_line" class="text-weight-medium"
+                             style="margin-top:4px">{{ props.row.stat_line }}</div>
+                        <div v-if="props.row.stat_pending" style="opacity:0.7">
+                            {{ props.row.stat_pending }}</div>
+                        <div v-if="props.row.stat_error" style="opacity:0.7">
+                            {{ props.row.stat_error }}</div>
+                        <div style="margin-top:4px">Click for holdings, dividends and total return</div>
+                    </q-tooltip>
+                </q-btn>
+                <span v-if="props.row.frac_badge"
+                      class="text-caption text-weight-bold"
+                      style="width:0.9rem;text-align:center"
+                      :style="props.row.frac_strike
+                              ? 'color:#94a3b8;text-decoration:line-through'
+                              : 'color:#4ade80'">
+                    {{ props.row.frac_badge }}
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                        {{ props.row.frac_tip }}
+                    </q-tooltip>
+                </span>
+                <span v-if="props.row.lev_badge"
+                      class="text-caption"
+                      style="color:#cbd5e1;background:rgba(148,163,184,0.18);
+                             border-radius:4px;padding:0 4px;line-height:1.25;
+                             font-variant-numeric:tabular-nums;white-space:nowrap">
+                    {{ props.row.lev_badge }}
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                        {{ props.row.lev_tip }}
+                    </q-tooltip>
+                </span>
+            </div>
+'''
+
+
+#: WHAT EACH SYMBOL-TABLE COLUMN BECOMES ON A PHONE (``<= 639px``), in reading order.
+#:
+#: Sixteen columns cannot share 390px, and scrolling them sideways leaves the symbol
+#: and the money it is held at in different screens. On a phone the SAME ``ui.table``
+#: switches to Quasar's card mode (``grid``): one card per row, drawn from the SAME
+#: row dicts the table is -- so every figure, every inline write path
+#: (``weightChange``, ``commentChange``, ``symbolInfo``) and the selection that
+#: Compare / Remove read are shared, not re-implemented.
+#:   * header: the multi-label flag, the SYMBOL, the ⓘ and the broker chips;
+#:   * the Share-of-label % box first (it is the thing this page exists to edit), on
+#:     its own full-width line with a numeric keyboard;
+#:   * always visible, captioned, two to a line: current value, qty, target value,
+#:     target qty, Last %;
+#:   * P&L and the comment on their own lines;
+#:   * folded behind "Details": the two percentages-of-label/total, cost basis, price
+#:     and market value.
+#: ``check_card_columns`` pins that this accounts for exactly the table's columns.
+SYMBOL_CARD = (
+    CardColumn('flag', '', TIER_HEAD),
+    CardColumn('symbol', 'Symbol', TIER_HEAD),
+    CardColumn('info', '', TIER_HEAD),
+    CardColumn('weight_pct', 'Share of label %', TIER_WIDE),
+    CardColumn('current_value', 'Current value', TIER_PRIMARY),
+    CardColumn('quantity', 'Qty', TIER_PRIMARY),
+    CardColumn('target_value', 'Target value', TIER_PRIMARY),
+    CardColumn('target_quantity', 'Target qty', TIER_PRIMARY),
+    CardColumn('previous_weight_pct', 'Last %', TIER_PRIMARY),
+    CardColumn('pnl', 'P&L', TIER_WIDE),
+    CardColumn('comment', 'Comment', TIER_WIDE),
+    CardColumn('pct_of_label_target', '% of label tgt', TIER_DETAIL),
+    CardColumn('pct_of_total', '% of total', TIER_DETAIL),
+    CardColumn('cost_basis', 'Cost basis', TIER_DETAIL),
+    CardColumn('price', 'Price', TIER_DETAIL),
+    CardColumn('market_value', 'Market value', TIER_DETAIL),
+)
+
+#: The weight box, as a Vue fragment, for the card. Same ``:key`` (a refused edit puts
+#: the typed text back), same debounce, same emit as the desktop cell. ``inputmode``
+#: asks a phone for the DECIMAL keypad: ``type="number"`` alone gives iOS a keypad
+#: with no decimal point on some versions.
+CARD_WEIGHT_INPUT_TEMPLATE = r"""
+    <q-input :key="props.row.weight_key" :model-value="props.row.weight_pct"
+             type="number" inputmode="decimal" dense outlined
+             label="Share of label %" input-class="text-right" class="full-width"
+             debounce="__DEBOUNCE__"
+             @update:model-value="(val) => $parent.$emit('weightChange', props.row.symbol, val)">
+        <template v-slot:hint>
+            <div class="text-right"
+                 :class="'text-' + props.row.share_delta_color">{{ props.row.share_delta }}</div>
+        </template>
+    </q-input>
+"""
+
+CARD_COMMENT_INPUT_TEMPLATE = r"""
+    <q-input :model-value="props.row.comment" dense outlined label="Comment"
+             class="full-width" debounce="__DEBOUNCE__"
+             @update:model-value="(val) => $parent.$emit('commentChange', props.row.symbol, val)" />
+"""
+
+CARD_PNL_TEMPLATE = r"""
+    <span :class="'text-' + props.row.pnl_color">{{ props.row.pnl_head }}</span
+    ><span v-if="props.row.pnl_div" :class="'text-' + props.row.pnl_div_color"
+      >{{ props.row.pnl_div }}</span
+    ><span :class="'text-' + props.row.pnl_color">{{ props.row.pnl_tail }}</span>
+"""
+
+#: Values that are more than ``props.row[name]``: the target money and the target
+#: shares carry their live change underneath, exactly as the desktop cells do.
+CARD_VALUE_TEMPLATES = {
+    'target_value': r"""{{ props.row.target_value }}<div v-if="props.row.value_delta"
+        class="text-caption" :class="'text-' + props.row.value_delta_color">{{ props.row.value_delta }}</div>""",
+    'target_quantity': r"""{{ props.row.target_quantity }}<div v-if="props.row.qty_delta"
+        class="text-caption" :class="'text-' + props.row.qty_delta_color">{{ props.row.qty_delta }}</div>""",
+}
+
+
+def _card_kv(column: CardColumn) -> str:
+    value = CARD_VALUE_TEMPLATES.get(column.name, '{{ props.row.' + column.name + ' }}')
+    return (f'<div class="pf-kv"><span class="pf-k">{column.caption}</span>'
+            f'<span class="pf-v">{value}</span></div>')
+
+
+def symbol_card_template(card_columns=SYMBOL_CARD) -> str:
+    """The Vue ``item`` slot of the symbol table's card mode. Pure.
+
+    Built FROM the spec: head columns into the header, ``wide`` columns one per line
+    in spec order, ``primary`` runs into captioned two-column grids, ``detail`` into
+    one fold at the end. ``props.selected`` is the row's tick box (Compare / Remove
+    read the table's selection), and a card tap is not needed -- the fold is a
+    Quasar expansion item.
+    """
+    wide = {
+        'weight_pct': CARD_WEIGHT_INPUT_TEMPLATE.replace('__DEBOUNCE__', str(TARGET_DEBOUNCE_MS)),
+        'comment': CARD_COMMENT_INPUT_TEMPLATE.replace('__DEBOUNCE__', str(COMMENT_DEBOUNCE_MS)),
+        'pnl': ('<div class="pf-kv pf-kv--wide"><span class="pf-k">P&amp;L</span>'
+                '<span class="pf-v">' + CARD_PNL_TEMPLATE + '</span></div>'),
+    }
+    parts: List[str] = []
+    grid: List[str] = []
+    details: List[str] = []
+
+    def flush() -> None:
+        if grid:
+            parts.append('<div class="pf-sym-grid">' + ''.join(grid) + '</div>')
+            grid.clear()
+
+    for column in card_columns:
+        if column.tier == TIER_HEAD:
+            continue
+        if column.tier == TIER_PRIMARY:
+            grid.append(_card_kv(column))
+        elif column.tier == TIER_DETAIL:
+            details.append(_card_kv(column))
+        else:
+            flush()
+            parts.append(wide[column.name])
+    flush()
+    if details:
+        parts.append('<q-expansion-item dense dense-toggle label="Details" '
+                     'header-class="pf-sym-more"><div class="pf-sym-grid">'
+                     + ''.join(details) + '</div></q-expansion-item>')
+    return (
+        '<div class="col-12" style="width:100%">'
+        '<div class="pf-sym-card" :class="{\'pf-sym-card--sel\': props.selected}">'
+        '<div class="pf-sym-head">'
+        '<q-checkbox v-model="props.selected" />'
+        '<span v-if="props.row.flag" :title="\'Also in: \' + props.row.labels" '
+        'style="color:#f6ad55;font-weight:600">{{ props.row.flag }}</span>'
+        '<span class="pf-sym-name">{{ props.row.symbol }}</span>'
+        + SYMBOL_CHIPS_TEMPLATE +
+        '</div>' + ''.join(parts) + '</div></div>')
+
+
+#: The label header's cells, tagged so the phone layout can address them. The tag
+#: is on the ELEMENT; the repaints that ``classes(replace=...)`` keep it by
+#: prefixing it (see ``DELTA_CELL_CLASSES``).
+BAR_CELL_PREFIX = 'pf-b-'
+BAR_ROW_CLASS = 'pf-bar-row'
+
+LABEL_BAR_PHONE_CSS = phone_media(r"""
+    /* THE LABEL HEADER, on a phone. Eleven cells on one no-wrap line become three:
+       identity (tag, badges, name, count, edit, info), the money and the bar, then
+       the sentences that explain them. Widths the desktop pins per cell would each
+       be a whole line here, so they go. */
+    .pf-bar-row.pf-bar-row { flex-wrap: wrap !important; row-gap: 2px;
+        align-items: center; }
+    .pf-bar-row.pf-bar-row > * { width: auto !important; min-width: 0 !important;
+        max-width: 100% !important; }
+    .pf-bar-row > .pf-b-icon, .pf-bar-row > .pf-b-edit, .pf-bar-row > .pf-b-info {
+        padding: 8px; box-sizing: content-box; font-size: 24px; }
+    .pf-bar-row > .pf-b-icon { order: 1; }
+    .pf-bar-row > .pf-b-zero { order: 1; }
+    .pf-bar-row > .pf-b-warn { order: 1; }
+    .pf-bar-row.pf-bar-row > .pf-b-name { order: 2; flex: 1 1 0 !important;
+        font-size: 1rem; }
+    .pf-bar-row > .pf-b-count { order: 3; }
+    .pf-bar-row > .pf-b-edit { order: 4; }
+    .pf-bar-row > .pf-b-info { order: 5; }
+    .pf-bar-row.pf-bar-row > .pf-b-value { order: 10; flex: 1 1 auto !important;
+        text-align: left; font-size: 1rem; font-weight: 600; }
+    .pf-bar-row > .pf-b-pct { order: 11; font-size: 0.95rem; }
+    .pf-bar-row.pf-bar-row > .pf-b-bar { order: 12; flex: 1 1 100% !important; }
+    .pf-bar-row.pf-bar-row > .pf-b-target, .pf-bar-row.pf-bar-row > .pf-b-delta,
+    .pf-bar-row.pf-bar-row > .pf-b-last, .pf-bar-row.pf-bar-row > .pf-b-pnl,
+    .pf-bar-row.pf-bar-row > .pf-b-pnl > * {
+        white-space: normal !important; overflow: visible !important;
+        text-overflow: clip !important; font-size: 0.875rem !important;
+        text-align: left; }
+    .pf-bar-row.pf-bar-row > .pf-b-target { order: 13; flex: 1 1 100% !important; }
+    .pf-bar-row.pf-bar-row > .pf-b-delta { order: 14; flex: 1 1 auto !important; }
+    .pf-bar-row.pf-bar-row > .pf-b-last { order: 15; }
+    .pf-bar-row.pf-bar-row > .pf-b-pnl { order: 16; flex: 1 1 100% !important;
+        flex-wrap: wrap !important; }
+""")
+
+#: The symbol card's own look (card mode is only ever on at phone width, so this is
+#: not media-gated -- a desktop never renders these classes).
+SYMBOL_CARD_CSS = r"""
+    .pf-sym-card { border: 1px solid rgba(255,255,255,0.10); border-radius: 8px;
+        padding: 6px 10px 8px; margin-bottom: 8px; width: 100%;
+        background: rgba(37,43,59,0.5); }
+    .pf-sym-card--sel { border-color: #00d4aa; }
+    .pf-sym-head { display: flex; align-items: center; gap: 6px; }
+    .pf-sym-name { font-size: 1.1rem; font-weight: 600; margin-right: auto; }
+    .pf-sym-grid { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr);
+        gap: 4px 14px; margin: 6px 0; }
+    .pf-kv { display: flex; justify-content: space-between; align-items: baseline;
+        gap: 6px; font-size: 0.9rem; min-width: 0; }
+    .pf-kv--wide { grid-column: 1 / -1; margin: 4px 0; }
+    .pf-k { color: #94a3b8; font-size: 0.78rem; white-space: nowrap; }
+    .pf-v { text-align: right; overflow-wrap: anywhere; }
+    .pf-sym-card .q-field { margin: 4px 0; }
+    .pf-sym-card .q-field__native, .pf-sym-card .q-field__control { min-height: 40px; }
+    .pf-sym-more { min-height: 40px; color: #94a3b8; }
+    .pf-sym-head .q-btn { min-width: 40px; min-height: 40px; }
+    .q-table__grid-content { padding: 0 !important; }
+"""
+
+PHONE_SWATCH_CSS = phone_media("""
+    .pf-swatch { width: 36px !important; height: 36px !important; }
+""")
+
+
+def page_phone_css() -> str:
+    """Every stylesheet rule this page's phone layout needs, in one string. Pure.
+
+    Added by ``content()`` with the page's other ``ui.add_css``; the wizard's dialog
+    is built later and relies on it being there already.
+    """
+    return '\n'.join((GENERIC_PHONE_CSS, LABEL_BAR_PHONE_CSS, SYMBOL_CARD_CSS,
+                      PHONE_SWATCH_CSS, wizard_phone_card_css()))
+
+
+_PHONE_REGISTRIES: Dict[Any, PhoneTableRegistry] = {}
+
+
+def _phone_tables() -> PhoneTableRegistry:
+    """This client's registry of card-mode tables. One per browser tab: the breakpoint
+    event is scoped to the client that emitted it, and a table must be re-pinned by
+    ITS OWN tab's viewport. Weakly-held tables, so a refresh frees the old ones;
+    the registries themselves are dropped with the client."""
+    client = ui.context.client
+    registry = _PHONE_REGISTRIES.get(client.id)
+    if registry is None:
+        registry = _PHONE_REGISTRIES[client.id] = PhoneTableRegistry()
+        client.on_delete(lambda cid=client.id: _PHONE_REGISTRIES.pop(cid, None))
+    return registry
+
+
+def symbol_table_columns() -> List[Dict[str, Any]]:
+    """The symbol table's column definitions. ONE list, read by the table and by
+    the phone card spec check (``SYMBOL_CARD``)."""
+    # The LABELS column is gone. Every row inside a label's own section repeated the
+    # same value, and the section header already says which label this is; the one
+    # case where the value differs -- a symbol carrying two managed labels -- is
+    # named by the ⚠ cell's tooltip, which is why ``labels`` stays in the row DATA.
+    # The table is built here and nowhere else (no cross-label or "all symbols" view
+    # reuses it), so there is nothing to make the column conditional for.
+    columns = [
+        {'name': 'flag', 'label': '', 'field': 'flag', 'align': 'center'},
+        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
+        # The ⓘ, beside the symbol it describes rather than at the far end of
+        # eleven columns. ``field`` is required by Quasar and is never printed --
+        # the slot below draws a button over it.
+        {'name': 'info', 'label': '', 'field': 'symbol', 'align': 'center'},
+        {'name': 'current_value', 'label': 'Current value', 'field': 'current_value', 'sortable': True, 'align': 'right'},
+        # THE HELD SHARES, beside the held money they are the other half of. This
+        # column already existed, out past ``Target value`` and wearing the buy/sell
+        # change as its caption -- which reads as a target column, and had the
+        # operator asking for the current quantity to be "added". It was never
+        # added: it moved, and the change moved with the TARGET quantity below,
+        # which is the figure it is a change to.
+        {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'sortable': True, 'align': 'right'},
+        # AGAINST THE LABEL'S TARGET MONEY, not against what the label happens to
+        # hold (2026-09-05). The old denominator was the label's own held total, so
+        # the column summed to exactly 100% on every label whatever its funding --
+        # a label holding twice its target read as perfectly balanced. Over 100%
+        # here now means over-subscribed and under means under-invested, which is
+        # what the reader is looking for. The header names the denominator: an
+        # unqualified "% of label" is what made the old figure misread.
+        {'name': 'pct_of_label_target', 'label': '% of label tgt',
+         'field': 'pct_of_label_target', 'sortable': True, 'align': 'right'},
+        {'name': 'pct_of_total', 'label': '% of total', 'field': 'pct_of_total', 'sortable': True, 'align': 'right'},
+        # "Share of label %", not "Target %": the label header above prints a target
+        # too, and that one is a share of the PORTFOLIO. Two different quantities
+        # under one word is what made "target 0.0%" over a column of 20s look wrong.
+        # NARROWED. The cell holds a number box, not prose, and at its natural width the
+        # header text was setting the column -- pushing the money columns, which the eye
+        # actually compares down the page, off to the right.
+        {'name': 'weight_pct', 'label': 'Share of label %', 'field': 'weight_pct',
+         'sortable': True, 'align': 'right', 'style': 'width: 108px',
+         'headerStyle': 'width: 108px; white-space: normal'},
+        # "Last %", immediately after the box it is the history OF. Its denominator
+        # is the same one -- a share of THIS label -- so it needs no clause of its
+        # own; a blank cell means the symbol has never been allocated.
+        {'name': 'previous_weight_pct', 'label': 'Last %', 'field': 'previous_weight_pct', 'sortable': True, 'align': 'right'},
+        {'name': 'target_value', 'label': 'Target value', 'field': 'target_value', 'sortable': True, 'align': 'right'},
+        # The shares that money buys, and under it the change from what is held --
+        # the pair the order is actually placed from. Both are written by
+        # ``_write_row_deltas``, so a share edit moves the two together or neither.
+        {'name': 'target_quantity', 'label': 'Target qty', 'field': 'target_quantity', 'sortable': True, 'align': 'right'},
+        {'name': 'cost_basis', 'label': 'Cost basis', 'field': 'cost_basis', 'sortable': True, 'align': 'right'},
+        {'name': 'price', 'label': 'Price', 'field': 'price', 'sortable': True, 'align': 'right'},
+        {'name': 'market_value', 'label': 'Market value', 'field': 'market_value', 'sortable': True, 'align': 'right'},
+        # Unrealised P&L, money and percent in one pre-formatted string. It is a
+        # STRING and not two numeric columns because half its values are not
+        # numbers at all -- "-", "- (no price)", "no cost basis" -- and rendering
+        # those as 0.00 is the failure mode this platform has actually paid for.
+        {'name': 'pnl', 'label': 'P&L', 'field': 'pnl', 'align': 'right'},
+        {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left'},
+    ]
+    return columns
+
+
+check_card_columns(SYMBOL_CARD, [c['name'] for c in symbol_table_columns()])
+
+
 def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     """One managed label's target box, comment box, symbol table and controls.
 
@@ -2614,7 +2964,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     live['weights'][view.label] = {r.symbol: float(r.weight_pct)
                                    for r in view.rows if r.weight_pct is not None}
 
-    with ui.row().classes('w-full items-center gap-2'):
+    with ui.row().classes(f'w-full items-center gap-2 {ACTIONS_CLASS}'):
         # THE label target, on the page at last. It used to be reachable only from
         # inside the Allocate wizard, which is why every label on an untouched
         # account sat at 0 while the table below printed a share of nothing.
@@ -2715,68 +3065,17 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     for row in rows:
         _write_row_deltas(row)
 
-    # The LABELS column is gone. Every row inside a label's own section repeated the
-    # same value, and the section header already says which label this is; the one
-    # case where the value differs -- a symbol carrying two managed labels -- is
-    # named by the ⚠ cell's tooltip, which is why ``labels`` stays in the row DATA.
-    # The table is built here and nowhere else (no cross-label or "all symbols" view
-    # reuses it), so there is nothing to make the column conditional for.
-    columns = [
-        {'name': 'flag', 'label': '', 'field': 'flag', 'align': 'center'},
-        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
-        # The ⓘ, beside the symbol it describes rather than at the far end of
-        # eleven columns. ``field`` is required by Quasar and is never printed --
-        # the slot below draws a button over it.
-        {'name': 'info', 'label': '', 'field': 'symbol', 'align': 'center'},
-        {'name': 'current_value', 'label': 'Current value', 'field': 'current_value', 'sortable': True, 'align': 'right'},
-        # THE HELD SHARES, beside the held money they are the other half of. This
-        # column already existed, out past ``Target value`` and wearing the buy/sell
-        # change as its caption -- which reads as a target column, and had the
-        # operator asking for the current quantity to be "added". It was never
-        # added: it moved, and the change moved with the TARGET quantity below,
-        # which is the figure it is a change to.
-        {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'sortable': True, 'align': 'right'},
-        # AGAINST THE LABEL'S TARGET MONEY, not against what the label happens to
-        # hold (2026-09-05). The old denominator was the label's own held total, so
-        # the column summed to exactly 100% on every label whatever its funding --
-        # a label holding twice its target read as perfectly balanced. Over 100%
-        # here now means over-subscribed and under means under-invested, which is
-        # what the reader is looking for. The header names the denominator: an
-        # unqualified "% of label" is what made the old figure misread.
-        {'name': 'pct_of_label_target', 'label': '% of label tgt',
-         'field': 'pct_of_label_target', 'sortable': True, 'align': 'right'},
-        {'name': 'pct_of_total', 'label': '% of total', 'field': 'pct_of_total', 'sortable': True, 'align': 'right'},
-        # "Share of label %", not "Target %": the label header above prints a target
-        # too, and that one is a share of the PORTFOLIO. Two different quantities
-        # under one word is what made "target 0.0%" over a column of 20s look wrong.
-        # NARROWED. The cell holds a number box, not prose, and at its natural width the
-        # header text was setting the column -- pushing the money columns, which the eye
-        # actually compares down the page, off to the right.
-        {'name': 'weight_pct', 'label': 'Share of label %', 'field': 'weight_pct',
-         'sortable': True, 'align': 'right', 'style': 'width: 108px',
-         'headerStyle': 'width: 108px; white-space: normal'},
-        # "Last %", immediately after the box it is the history OF. Its denominator
-        # is the same one -- a share of THIS label -- so it needs no clause of its
-        # own; a blank cell means the symbol has never been allocated.
-        {'name': 'previous_weight_pct', 'label': 'Last %', 'field': 'previous_weight_pct', 'sortable': True, 'align': 'right'},
-        {'name': 'target_value', 'label': 'Target value', 'field': 'target_value', 'sortable': True, 'align': 'right'},
-        # The shares that money buys, and under it the change from what is held --
-        # the pair the order is actually placed from. Both are written by
-        # ``_write_row_deltas``, so a share edit moves the two together or neither.
-        {'name': 'target_quantity', 'label': 'Target qty', 'field': 'target_quantity', 'sortable': True, 'align': 'right'},
-        {'name': 'cost_basis', 'label': 'Cost basis', 'field': 'cost_basis', 'sortable': True, 'align': 'right'},
-        {'name': 'price', 'label': 'Price', 'field': 'price', 'sortable': True, 'align': 'right'},
-        {'name': 'market_value', 'label': 'Market value', 'field': 'market_value', 'sortable': True, 'align': 'right'},
-        # Unrealised P&L, money and percent in one pre-formatted string. It is a
-        # STRING and not two numeric columns because half its values are not
-        # numbers at all -- "-", "- (no price)", "no cost basis" -- and rendering
-        # those as 0.00 is the failure mode this platform has actually paid for.
-        {'name': 'pnl', 'label': 'P&L', 'field': 'pnl', 'align': 'right'},
-        {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left'},
-    ]
+    columns = symbol_table_columns()
 
     table = ui.table(columns=columns, rows=rows, row_key='symbol',
                      selection='multiple').classes('w-full dark-pagination')
+    # PHONE: the same table in Quasar's card mode (``grid``), one card per row. The
+    # ``:grid`` expression reads the viewport once on render; the registry re-pins it
+    # when the viewport crosses the breakpoint (a rotated phone). See
+    # ``ui/utils/responsive.py`` and ``SYMBOL_CARD``.
+    table.props(phone_grid_prop())
+    table.add_slot('item', symbol_card_template())
+    _phone_tables().register(table)
     live['tables'][view.label] = table
     # WHAT AN UNSET SHARE IS SHOWING. The default used to be the fair share, which
     # would have BOUGHT a newly added symbol; it is the symbol's actual share now,
@@ -2788,8 +3087,8 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     # pool, this one is its symbols' shares of the label. The caption on each says
     # which, because two bars two inches apart on two denominators is exactly the
     # collision this page has been unpicking.
-    with ui.row().classes('w-full items-center gap-3 no-wrap').style(TABULAR_NUMS) \
-            .mark(MARKER_SYMBOL_BAR_ROW):
+    with ui.row().classes(f'w-full items-center gap-3 no-wrap {WRAP_ROW_CLASS}') \
+            .style(TABULAR_NUMS).mark(MARKER_SYMBOL_BAR_ROW):
         ui.label(SYMBOL_TOTAL_BAR_CAPTION).classes('w-40 text-xs text-secondary-custom')
         symbol_bar_widgets = _render_mini_bar(
             fill_marker=MARKER_SYMBOL_BAR_FILL, notch_marker=MARKER_SYMBOL_BAR_NOTCH)
@@ -2819,46 +3118,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     # non-empty (see ``_symbol_fact_fields``): an absent broker answer draws nothing.
     table.add_slot('body-cell-info', r'''
         <q-td :props="props">
-            <div class="row items-center no-wrap justify-center" style="gap:6px">
-                <q-btn dense flat round size="sm" icon="info" color="grey-5"
-                       @click="() => $parent.$emit('symbolInfo', props.row.symbol)">
-                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
-                        <div class="text-weight-bold">{{ props.row.symbol }}</div>
-                        <div v-if="props.row.company_name">{{ props.row.company_name }}</div>
-                        <!-- Income and total return, from the cached provider stats.
-                             Exactly one of these three lines is ever non-empty: the
-                             figures, "not fetched yet", or the fetch error. -->
-                        <div v-if="props.row.stat_line" class="text-weight-medium"
-                             style="margin-top:4px">{{ props.row.stat_line }}</div>
-                        <div v-if="props.row.stat_pending" style="opacity:0.7">
-                            {{ props.row.stat_pending }}</div>
-                        <div v-if="props.row.stat_error" style="opacity:0.7">
-                            {{ props.row.stat_error }}</div>
-                        <div style="margin-top:4px">Click for holdings, dividends and total return</div>
-                    </q-tooltip>
-                </q-btn>
-                <span v-if="props.row.frac_badge"
-                      class="text-caption text-weight-bold"
-                      style="width:0.9rem;text-align:center"
-                      :style="props.row.frac_strike
-                              ? 'color:#94a3b8;text-decoration:line-through'
-                              : 'color:#4ade80'">
-                    {{ props.row.frac_badge }}
-                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
-                        {{ props.row.frac_tip }}
-                    </q-tooltip>
-                </span>
-                <span v-if="props.row.lev_badge"
-                      class="text-caption"
-                      style="color:#cbd5e1;background:rgba(148,163,184,0.18);
-                             border-radius:4px;padding:0 4px;line-height:1.25;
-                             font-variant-numeric:tabular-nums;white-space:nowrap">
-                    {{ props.row.lev_badge }}
-                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
-                        {{ props.row.lev_tip }}
-                    </q-tooltip>
-                </span>
-            </div>
+            ''' + SYMBOL_CHIPS_TEMPLATE + r'''
         </q-td>
     ''')
     table.on('symbolInfo', lambda e: _open_symbol_info([emitted_value(e)]))
@@ -2878,7 +3138,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     table.add_slot('body-cell-weight_pct', r'''
         <q-td :props="props">
             <q-input :key="props.row.weight_key" :model-value="props.value"
-                     type="number" dense borderless input-class="text-right"
+                     type="number" inputmode="decimal" dense borderless input-class="text-right"
                      class="full-width"
                      debounce="''' + str(TARGET_DEBOUNCE_MS) + r'''"
                      @update:model-value="(val) => $parent.$emit('weightChange', props.row.symbol, val)">
@@ -2974,7 +3234,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     # None of them is DISABLED when it has nothing to do. The wizard greyed them
     # out; this page reports the no-op in words instead, which is the convention
     # Fill 100% set and which costs no per-keystroke sweep over every row.
-    with ui.row().classes('w-full items-center gap-2 mt-2'):
+    with ui.row().classes(f'w-full items-center gap-2 mt-2 {ACTIONS_CLASS}'):
         ui.button('Fill 100%', icon='functions',
                   on_click=lambda lbl=view.label: _fill_label_to_100(
                       account_id, live, lbl)
@@ -3053,7 +3313,7 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
     """
     with ui.column().classes('stat-card p-3 w-full').mark(MARKER_RESERVE_CARD):
         ui.label('Unallocated reserve').classes('text-xs text-secondary-custom')
-        with ui.row().classes('items-center gap-3 no-wrap'):
+        with ui.row().classes(f'items-center gap-3 no-wrap {WRAP_ROW_CLASS}'):
             slider = ui.slider(min=0, max=100, step=1,
                                value=live['unallocated_pct']).classes('w-40')
             number = ui.number(value=live['unallocated_pct'], min=0, max=100, step=0.01,
@@ -3096,7 +3356,7 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
         # which -- so it does.
         live['reserve_row'] = ui.label('').style(TABULAR_NUMS)
         ui.label(ALLOCATION_BAR_LEGEND).classes('text-xs text-secondary-custom')
-        with ui.row().classes('w-full items-center gap-3 no-wrap') \
+        with ui.row().classes(f'w-full items-center gap-3 no-wrap {WRAP_ROW_CLASS}') \
                 .style(TABULAR_NUMS).mark(MARKER_RESERVE_BAR_ROW):
             reserve_bar_widgets = _render_mini_bar(
                 fill_marker=MARKER_RESERVE_BAR_FILL,
@@ -3148,7 +3408,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
     live['bars'][view.label] = widgets
 
     with expansion.add_slot('header'):
-        with ui.row().classes('w-full items-center gap-3 no-wrap') \
+        with ui.row().classes(f'w-full items-center gap-3 no-wrap {BAR_ROW_CLASS}') \
                 .style(TABULAR_NUMS).mark(MARKER_BAR_ROW):
             # THE tag icon, drawn UNCOLOURED. ``_apply_bars`` paints it from
             # ``bar.color``, in the same loop and from the same value as the fill
@@ -3169,7 +3429,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # both resolve to the same neutral grey and only the second is
             # something the user can put right.
             with ui.icon('label').mark(MARKER_LABEL_ICON) \
-                    .classes('cursor-pointer') as icon:
+                    .classes('cursor-pointer pf-b-icon') as icon:
                 ui.tooltip(describe_label_color(view.color))
                 with ui.menu().props('auto-close'):
                     _render_color_choices(
@@ -3185,7 +3445,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # the page as it loaded; ``_apply_bars`` also hides it when every
             # symbol has a share, because a badge reading 0 is noise.
             zero_badge = ui.badge('').props('color=orange') \
-                .classes('shrink-0').mark(MARKER_LABEL_ZERO_BADGE)
+                .classes('shrink-0 pf-b-zero').mark(MARKER_LABEL_ZERO_BADGE)
             with zero_badge:
                 widgets['zero_tooltip'] = ui.tooltip('')
             widgets['zero_badge'] = zero_badge
@@ -3197,11 +3457,11 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # (WARNING_SYMBOL_UNDER_FMT) -- the tooltip says which, using the
             # engine's own wording so the two can never disagree.
             weight_warning = ui.icon('warning').props('color=orange size=xs') \
-                .classes('shrink-0 cursor-help').mark(MARKER_LABEL_WEIGHT_WARNING)
+                .classes('shrink-0 cursor-help pf-b-warn').mark(MARKER_LABEL_WEIGHT_WARNING)
             with weight_warning:
                 widgets['weight_warning_tooltip'] = ui.tooltip('')
             widgets['weight_warning'] = weight_warning
-            ui.label(view.label).classes('w-48 truncate font-medium')
+            ui.label(view.label).classes('w-48 truncate font-medium pf-b-name')
             # HOW MANY SYMBOLS THE LABEL HOLDS, beside the name it is a size of.
             # Static: membership is changed by adding or removing symbols, and both
             # paths reload the page -- unlike the orange badge above, which counts
@@ -3212,12 +3472,12 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # warning, and "this label has nothing in it" is the single state of the
             # count most worth seeing without opening the fold.
             count_badge = ui.badge(str(len(view.rows))).props('color=grey-7') \
-                .classes('shrink-0').mark(MARKER_LABEL_COUNT_BADGE)
+                .classes('shrink-0 pf-b-count').mark(MARKER_LABEL_COUNT_BADGE)
             with count_badge:
                 ui.tooltip(SYMBOL_COUNT_BADGE_TOOLTIP_FMT.format(
                     count=len(view.rows), label=view.label))
             widgets['count_badge'] = count_badge
-            widgets['value'] = ui.label('').classes('w-28 text-right')
+            widgets['value'] = ui.label('').classes('w-28 text-right pf-b-value')
             # THE bar component, shared with the per-label symbol-share total and
             # the unallocated row so the three read as one visual language.
             # IT GROWS, and every track still comes out the same length, because
@@ -3231,7 +3491,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             widgets.update(_render_mini_bar(
                 fill_marker=MARKER_BAR_FILL, notch_marker=MARKER_BAR_NOTCH,
                 classes=LABEL_BAR_CLASSES))
-            widgets['pct'] = ui.label('').classes('w-16 shrink-0 text-right')
+            widgets['pct'] = ui.label('').classes('w-16 shrink-0 text-right pf-b-pct')
             # WIDE ENOUGH FOR THE MONEY, NOWRAP, and LEFT-aligned. The cell carries
             # "tgt 18.0% (real 16.2% — $1,357.00)" since the money was added
             # (2026-09-05) -- ~33 characters, which wrapped at the old w-36 and made
@@ -3240,7 +3500,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # between the bar and its own label. The bar absorbs whatever is left,
             # which is what keeps a wide screen from opening a hole in the row.
             widgets['target'] = ui.label('').classes(
-                'w-72 shrink-0 truncate text-left')
+                'w-72 shrink-0 truncate text-left pf-b-target')
             # THE number that says what to do. It replaced the bare status word --
             # "over" beside a bar already sitting past its notch said nothing the
             # geometry had not -- and it keeps that word's COLOUR, so the row still
@@ -3251,12 +3511,12 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # basis (it is a stored target), so unlike the wizard's "% of base"
             # wording it needs no restating -- see ``LAST_TARGET_FMT``.
             widgets['last'] = ui.label('') \
-                .classes('w-28 shrink-0 truncate text-xs text-secondary-custom') \
+                .classes('w-28 shrink-0 truncate text-xs text-secondary-custom pf-b-last') \
                 .mark(MARKER_LABEL_LAST)
             # TWO spans in ONE fixed-width cell. ``gap-0`` because the split is
             # invisible: the halves must read as the one sentence they were before,
             # and the engine guarantees head + dividend + tail is that sentence.
-            with ui.row().classes(PNL_CELL_CLASSES + 'gap-0 flex-nowrap items-baseline') \
+            with ui.row().classes(PNL_CELL_CLASSES + 'gap-0 flex-nowrap items-baseline pf-b-pnl') \
                     .mark(MARKER_LABEL_PNL_CELL):
                 widgets['pnl'] = ui.label('').classes('truncate') \
                     .mark(MARKER_LABEL_PNL)
@@ -3264,7 +3524,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
                     .mark(MARKER_LABEL_PNL_DIV)
             # The pencil. It OPENS the label and focuses its target box; it never
             # closes one, because "edit this" is not a toggle.
-            ui.icon('edit').classes('cursor-pointer text-secondary-custom') \
+            ui.icon('edit').classes('cursor-pointer text-secondary-custom pf-b-edit') \
                 .on('click.stop',
                     lambda _e=None, lbl=view.label: _focus_label_target(live, lbl)) \
                 .tooltip('Edit this label’s portfolio target')
@@ -3272,7 +3532,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # created ONCE and re-texted on every redraw: calling ``.tooltip()``
             # again would add a second tooltip element, and by the tenth keystroke
             # there would be ten of them stacked on one icon.
-            with ui.icon('info_outline').classes('text-secondary-custom') as info:
+            with ui.icon('info_outline').classes('text-secondary-custom pf-b-info') as info:
                 # ``LABEL_TOOLTIP_STYLE`` is the expert cards' own
                 # ``DETAIL_TOOLTIP_STYLE`` plus a legible size: "The info text is too
                 # small", and a tooltip is HTML, so without the max-width the
@@ -3840,7 +4100,13 @@ async def content() -> None:
             .{TOOLBAR_CLASS} .q-linear-progress__track {{
                 background: rgba(255, 255, 255, 0.35) !important; opacity: 1 !important; }}
         ''')
-        toolbar = ui.row().classes(f'w-full items-center gap-2 {TOOLBAR_CLASS}')
+        # THE PHONE LAYER for this page's own widgets (label headers, symbol cards, the
+        # dry-run dialog's card rows, dialogs) -- see ``page_phone_css``. Then the
+        # breakpoint listener: it re-pins every symbol table's card mode when the
+        # viewport crosses 639px, because the ``:grid`` expression is read once.
+        ui.add_css(page_phone_css())
+        install_phone_listener(_phone_tables(), ui.add_head_html, ui.on)
+        toolbar = ui.row().classes(f'w-full items-center gap-2 {TOOLBAR_CLASS} {ACTIONS_CLASS}')
         body = ui.column().classes('w-full gap-3')
         try:
             mode_state = {'value': await asyncio.to_thread(_load_valuation_mode, account_id)}
