@@ -137,6 +137,31 @@ def get_version_info(root: Optional[Path] = None) -> dict:
     }
 
 
+class PackageGatingError(RuntimeError):
+    """The master cannot enforce package minimums (file missing/garbled/inconsistent)."""
+
+
+def master_sync_policy(root: Optional[Path] = None) -> dict:
+    """``get_version_info`` for a master about to dispatch to remote workers, validated.
+
+    Raises ``PackageGatingError`` (loudly) unless the master's own version, every package version
+    and every declared minimum parse. Every entry point that syncs workers calls this instead of
+    ``get_version_info``: an unreadable ``required_package_versions.py`` reads as ``{}`` and would
+    otherwise silently switch package gating OFF.
+    """
+    info = get_version_info(root)
+    problems = package_versions.master_problems(info["package_versions"],
+                                                info["required_package_versions"])
+    if package_versions.try_parse(info.get("app_version")) is None:
+        problems.append(f"app_version {info.get('app_version')!r} is unreadable "
+                        f"(testplatform/version.py)")
+    if problems:
+        raise PackageGatingError(
+            "refusing distributed mode: the master cannot enforce package minimums -- "
+            + "; ".join(problems))
+    return info
+
+
 def unsyncable_reason(root: Optional[Path] = None) -> Optional[str]:
     """None if a remote worker can actually converge to this master's reported ``app_version``
     via ``git pull``; otherwise a human-readable reason it can't.

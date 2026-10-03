@@ -2242,8 +2242,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 f"{_MAX_TASKS_PER_CHILD} individual(s); pool: {_pool_kind}")
             if _workers:
                 from app.services.distributed_eval import DistributedEvaluator
-                from app.services.self_update import get_version_info, unsyncable_reason
-                _master_info = get_version_info()
+                from app.services.self_update import master_sync_policy, unsyncable_reason
+                _master_info = master_sync_policy()  # raises PackageGatingError: refuse, never gate silently off
                 _master_version = _master_info.get("app_version")
                 _unsyncable = unsyncable_reason()
                 if _unsyncable:

@@ -48,7 +48,11 @@ This is not cosmetic: `worker_client.ensure_synced` re-syncs a distributed GA wo
 at/above the minimums may run older package code than the master by design; the master WARNs
 (`DRIFT`) once per job. Ship a GA-relevant `packages/` fix without raising the minimum and workers
 keep running the old code while reporting "synced" -- `tools/check_package_versions.py` fails that.
-Commit **and push** the bumps -- `unsyncable_reason` refuses the run otherwise.
+Commit **and push** the bumps -- `unsyncable_reason` logs a WARNING otherwise (it does not block).
+A raised minimum needs no `TEST_APP_VERSION` bump (the minimum itself syncs older workers);
+edits to `required_package_versions.py` / `ga_neutral_package_paths.py` alone are exempt from the
+`testplatform/` bump rule. A worker NEWER than the master (declares a higher minimum) is excluded,
+not updated. The master refuses distributed mode if its own minimums are unreadable.
 
 ## Key Directories
 

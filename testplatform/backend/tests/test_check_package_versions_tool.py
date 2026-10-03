@@ -195,23 +195,120 @@ def test_malformed_package_version_fails_consistency(repo):
     assert rc == 1 and "YYYY.MM.NNNNN" in out
 
 
-def test_missing_base_ref_degrades_to_a_consistency_check_and_says_so(repo):
+def test_explicit_base_that_does_not_resolve_is_an_error(repo):
+    lines: list[str] = []
+    rc = tool.run_check(repo, base="no-such-ref", out=lines.append)
+    out = "\n".join(lines)
+    assert rc == 1 and "does not resolve" in out and "fetch-depth: 0" in out
+
+
+def test_explicit_base_from_the_environment_is_also_an_error(repo, monkeypatch):
+    monkeypatch.setenv("BA2_VERSION_CHECK_BASE", "no-such-ref")
+    lines: list[str] = []
+    assert tool.run_check(repo, out=lines.append) == 1
+
+
+def test_automatic_base_missing_degrades_to_a_consistency_check_and_says_so(repo, monkeypatch):
+    monkeypatch.delenv("BA2_VERSION_CHECK_BASE", raising=False)
+    _git(repo, "branch", "-m", "main", "trunk")          # no origin/dev, origin/main, dev, main
     _w(repo, "packages/common/ba2_common/core/engine.py", "x = 2\n")  # would fail rule 1 with a base
     _commit(repo)
     lines: list[str] = []
-    rc = tool.run_check(repo, base="no-such-ref", out=lines.append)
+    rc = tool.run_check(repo, out=lines.append)
     out = "\n".join(lines)
     assert rc == 0, out
     assert "base ref unavailable" in out and "SKIPPED" in out
 
 
-def test_not_a_git_repo_degrades_the_same_way(tmp_path):
+def test_not_a_git_repo_degrades_the_same_way_with_automatic_base(tmp_path, monkeypatch):
+    monkeypatch.delenv("BA2_VERSION_CHECK_BASE", raising=False)
     for pkg in PKGS:
         _set_version(tmp_path, pkg, V1)
     _set_required(tmp_path)
     lines: list[str] = []
-    assert tool.run_check(tmp_path, base="main", out=lines.append) == 0
+    assert tool.run_check(tmp_path, out=lines.append) == 0
     assert any("SKIPPED" in ln for ln in lines)
+
+
+def test_minimum_raised_to_something_other_than_the_new_version_fails(repo):
+    _w(repo, "packages/common/ba2_common/core/engine.py", "x = 2\n")
+    _set_version(repo, "ba2_common", "2026.10.00005")
+    _set_required(repo, ba2_common=V2)                  # raised, but not to 00005
+    _commit(repo)
+    rc, out = _run(repo)
+    assert rc == 1 and "must EQUAL the new PACKAGE_VERSION" in out
+
+
+def test_widening_the_allowlist_in_the_same_diff_does_not_exempt_the_change(repo):
+    _w(repo, "packages/common/ba2_common/core/engine.py", "x = 2\n")
+    _set_version(repo, "ba2_common", V2)
+    n = repo / "testplatform/ga_neutral_package_paths.py"
+    n.write_text(n.read_text(encoding="utf-8").replace(
+        "GA_NEUTRAL_GLOBS = [", 'GA_NEUTRAL_GLOBS = [\n    "packages/common/ba2_common/core/engine.py",'), encoding="utf-8")
+    _commit(repo)
+    rc, out = _run(repo)
+    assert rc == 1
+    assert "[rule 3]" in out and "--allow-neutral-change" in out
+    assert "[rule 2]" in out, "the base's allowlist must still judge engine.py as GA-relevant"
+
+
+def test_allow_neutral_change_flag_accepts_a_reviewed_allowlist_edit(repo):
+    _w(repo, "packages/common/ba2_common/core/engine.py", "x = 2\n")
+    _set_version(repo, "ba2_common", V2)
+    n = repo / "testplatform/ga_neutral_package_paths.py"
+    n.write_text(n.read_text(encoding="utf-8").replace(
+        "GA_NEUTRAL_GLOBS = [", 'GA_NEUTRAL_GLOBS = [\n    "packages/common/ba2_common/core/engine.py",'), encoding="utf-8")
+    _commit(repo)
+    rc, out = _run(repo, allow_neutral_change=True)
+    assert rc == 0, out
+
+
+def test_docstring_and_comment_only_change_is_neutral_but_still_needs_a_bump(repo):
+    _w(repo, "packages/common/ba2_common/core/engine.py", '"""doc."""\nx = 1  # comment\n')
+    _commit(repo)
+    rc, out = _run(repo)
+    assert rc == 1 and "[rule 1]" in out and "[rule 2]" not in out
+    _set_version(repo, "ba2_common", V2)
+    _commit(repo)
+    rc, out = _run(repo)
+    assert rc == 0, out
+
+
+def test_a_code_change_next_to_a_docstring_is_still_ga_relevant(repo):
+    _w(repo, "packages/common/ba2_common/core/engine.py", '"""doc."""\nx = 2\n')
+    _set_version(repo, "ba2_common", V2)
+    _commit(repo)
+    rc, out = _run(repo)
+    assert rc == 1 and "[rule 2]" in out
+
+
+def test_deleting_a_shipped_file_needs_bump_and_minimum(repo):
+    (repo / "packages/common/ba2_common/core/engine.py").unlink()
+    _commit(repo)
+    rc, out = _run(repo)
+    assert rc == 1 and "[rule 1]" in out
+    _set_version(repo, "ba2_common", V2)
+    _commit(repo)
+    rc, out = _run(repo)
+    assert rc == 1 and "[rule 2]" in out
+
+
+def test_renaming_a_shipped_file_is_a_delete_plus_an_add(repo):
+    _git(repo, "mv", "packages/common/ba2_common/core/engine.py", "packages/common/ba2_common/core/engine2.py")
+    _commit(repo)
+    rc, out = _run(repo)
+    assert rc == 1 and "[rule 1]" in out
+    _set_version(repo, "ba2_common", V2)
+    _set_required(repo, ba2_common=V2)
+    _commit(repo)
+    rc, out = _run(repo)
+    assert rc == 0, out
+
+
+def test_month_13_package_version_fails_consistency(repo):
+    _set_version(repo, "ba2_common", "2026.13.00001")
+    rc, out = _run(repo)
+    assert rc == 1 and "YYYY.MM.NNNNN" in out
 
 
 def test_include_worktree_sees_uncommitted_changes(repo):

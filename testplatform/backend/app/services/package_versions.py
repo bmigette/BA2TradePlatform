@@ -27,8 +27,8 @@ PACKAGES: Tuple[str, ...] = tuple(PACKAGE_DIRS)
 
 # Package versions are exactly YYYY.MM.NNNNN (5-digit build). The comparison parser is more
 # lenient (TEST_APP_VERSION / APP_VERSION are zero-padded to 4 digits) but ALWAYS numeric.
-PACKAGE_VERSION_RE = re.compile(r"^\d{4}\.\d{2}\.\d{5}$")
-_ANY_VERSION_RE = re.compile(r"^(\d{4})\.(\d{2})\.(\d+)$")
+PACKAGE_VERSION_RE = re.compile(r"\d{4}\.(0[1-9]|1[0-2])\.\d{5}\Z")
+_ANY_VERSION_RE = re.compile(r"(\d{4})\.(0[1-9]|1[0-2])\.(\d+)\Z")
 
 #: What a worker that cannot (or does not) report a package is recorded as.
 UNKNOWN = "unknown"
@@ -43,9 +43,9 @@ def parse_version(value) -> Tuple[int, int, int]:
     """
     if not isinstance(value, str):
         raise ValueError(f"version must be a string, got {type(value).__name__}")
-    m = _ANY_VERSION_RE.match(value.strip())
+    m = _ANY_VERSION_RE.match(value)
     if not m:
-        raise ValueError(f"not a YYYY.MM.NNNNN version: {value!r}")
+        raise ValueError(f"not a YYYY.MM.NNNNN version (month 01-12): {value!r}")
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
 
@@ -150,3 +150,42 @@ def drift(worker_packages, master_packages: Mapping[str, str]) -> Dict[str, Tupl
         if wv != mv:
             out[pkg] = (mv, wv)
     return out
+
+
+def worker_ahead(worker_required, master_required: Mapping[str, str]) -> List[str]:
+    """Packages for which the WORKER declares a higher minimum than the master does.
+
+    A worker's reported ``required_package_versions`` is the set of GA-relevant package changes it
+    carries; a higher entry than the master's means the worker has GA-relevant code the master
+    lacks (master rolled back, or the worker pulled a newer branch). It cannot be downgraded by
+    ``/update`` (that only pulls), so the caller must EXCLUDE it. Unreported/unparseable entries
+    are ignored (an older worker reports none; that is handled as "unknown", not "ahead").
+    """
+    reported = worker_required if isinstance(worker_required, Mapping) else {}
+    out: List[str] = []
+    for pkg, mine in master_required.items():
+        theirs = try_parse(reported.get(pkg))
+        want = try_parse(mine)
+        if theirs is not None and want is not None and theirs > want:
+            out.append(pkg)
+    return out
+
+
+def master_problems(packages: Mapping[str, str], required: Mapping[str, str]) -> List[str]:
+    """Why the MASTER cannot enforce package minimums (empty list = it can).
+
+    A missing, garbled or conflict-marked ``required_package_versions.py`` reads as ``{}``; that
+    must refuse distributed mode loudly rather than silently switch gating off.
+    """
+    problems: List[str] = []
+    for pkg in PACKAGES:
+        own = packages.get(pkg) if isinstance(packages, Mapping) else None
+        if not isinstance(own, str) or not PACKAGE_VERSION_RE.match(own):
+            problems.append(f"{pkg}: own PACKAGE_VERSION {own!r} is missing or not YYYY.MM.NNNNN")
+        minimum = required.get(pkg) if isinstance(required, Mapping) else None
+        if not isinstance(minimum, str) or not PACKAGE_VERSION_RE.match(minimum):
+            problems.append(f"{pkg}: required minimum {minimum!r} is missing or not YYYY.MM.NNNNN "
+                            f"(testplatform/required_package_versions.py unreadable or incomplete?)")
+        elif isinstance(own, str) and PACKAGE_VERSION_RE.match(own) and parse_version(minimum) > parse_version(own):
+            problems.append(f"{pkg}: required minimum {minimum} is above the package's own version {own}")
+    return problems

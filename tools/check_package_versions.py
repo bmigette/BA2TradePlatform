@@ -22,12 +22,17 @@ Rules (docs/plans/2026-10-03-package-versioning-design.md):
      ``REQUIRED_PACKAGE_VERSIONS`` must ALSO be raised in the same diff (or ``TEST_APP_VERSION``
      bumped): the change can affect GA results, so every worker must take it.
 
-If the base ref is not available (a shallow CI checkout, no git) only rule 0 runs and the tool
-says so; it never fails CI for lack of history. Exit status: 0 ok, 1 violations.
+  3. Neutrality is judged with the BASE's allowlist; editing ``ga_neutral_package_paths.py`` in the
+     diff needs ``--allow-neutral-change`` (a reviewed decision).
+
+If an AUTOMATIC base (origin/dev, origin/main, dev, main) is unavailable only rule 0 runs and the
+tool says so. A base you NAME (``--base`` / ``$BA2_VERSION_CHECK_BASE``) that does not resolve is an
+error: CI names its base and checks out full history. Exit status: 0 ok, 1 violations.
 """
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
 import importlib.util
 import os
@@ -59,18 +64,25 @@ def _git(root: Path, *args: str) -> Optional[str]:
     return r.stdout if r.returncode == 0 else None
 
 
-def _resolve_base(root: Path, base: Optional[str]) -> Tuple[Optional[str], str]:
-    """(merge-base sha, human label) or (None, reason it is unavailable)."""
-    candidates = [base] if base else [os.environ.get("BA2_VERSION_CHECK_BASE"), *BASE_CANDIDATES]
+def _resolve_base(root: Path, base: Optional[str]) -> Tuple[Optional[str], str, bool]:
+    """(merge-base sha, label, explicit). sha is None when unavailable (label = reason).
+
+    *explicit* is True when the caller NAMED the base (``--base`` or ``$BA2_VERSION_CHECK_BASE``):
+    an explicit base that does not resolve is an error, only the automatic candidates may be
+    skipped softly.
+    """
+    named = base or os.environ.get("BA2_VERSION_CHECK_BASE")
+    explicit = bool(named)
+    candidates = [named] if explicit else list(BASE_CANDIDATES)
     tried = []
-    for c in filter(None, candidates):
+    for c in candidates:
         tried.append(c)
         if _git(root, "rev-parse", "--verify", "--quiet", f"{c}^{{commit}}") is None:
             continue
         mb = _git(root, "merge-base", c, "HEAD")
         if mb and mb.strip():
-            return mb.strip(), c
-    return None, f"none of {tried} resolves to a commit sharing history with HEAD"
+            return mb.strip(), c, explicit
+    return None, f"none of {tried} resolves to a commit sharing history with HEAD", explicit
 
 
 def _read(root: Path, ref: Optional[str], rel: str) -> Optional[str]:
@@ -116,6 +128,28 @@ def _is_neutral(rel: str, globs: List[str]) -> bool:
     return any(fnmatch.fnmatchcase(rel, g) for g in globs)
 
 
+def _strip_docstrings(tree: ast.AST) -> ast.AST:
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                node.body = body[1:] or [ast.Pass()]
+    return tree
+
+
+def semantically_same(base_text: Optional[str], head_text: Optional[str]) -> bool:
+    """True if two versions of a .py file differ only in comments/docstrings/formatting."""
+    if base_text is None or head_text is None:
+        return False
+    try:
+        a = ast.dump(_strip_docstrings(ast.parse(base_text)))
+        b = ast.dump(_strip_docstrings(ast.parse(head_text)))
+    except (SyntaxError, ValueError):
+        return False
+    return a == b
+
+
 def check_consistency(root: Path) -> List[str]:
     """Rule 0: internal consistency of the tree at *root*."""
     problems: List[str] = []
@@ -147,7 +181,8 @@ def check_consistency(root: Path) -> List[str]:
     return problems
 
 
-def check_diff(root: Path, base_sha: str, include_worktree: bool) -> List[str]:
+def check_diff(root: Path, base_sha: str, include_worktree: bool,
+               allow_neutral_change: bool = False) -> List[str]:
     """Rules 1 and 2 for the diff base_sha..HEAD (or ..worktree)."""
     head_ref: Optional[str] = None if include_worktree else "HEAD"
     spec = [base_sha] if include_worktree else [f"{base_sha}...HEAD"]
@@ -155,8 +190,27 @@ def check_diff(root: Path, base_sha: str, include_worktree: bool) -> List[str]:
     if out is None:
         return [f"git diff against {base_sha} failed; cannot evaluate rules 1 and 2."]
     changed = [p for p in out.split("\0") if p]
-    globs = pv.read_ga_neutral_globs(root)
     problems: List[str] = []
+    # Neutrality is judged with the BASE's allowlist: widening it in the same diff must not
+    # exempt the very change that needs it. The allowlist's own edit needs an explicit flag
+    # (CI passes it only for PRs carrying the `ga-neutral-reviewed` label). A base that has no
+    # allowlist yet is the initial introduction: the head's list is used.
+    base_neutral_text = _read(root, base_sha, NEUTRAL_FILE)
+    head_neutral_text = _read(root, head_ref, NEUTRAL_FILE)
+    if base_neutral_text is None:
+        globs = pv.read_ga_neutral_globs(root)
+    else:
+        v = pv.literal_from_text(base_neutral_text, "GA_NEUTRAL_GLOBS")
+        globs = [str(x) for x in v] if isinstance(v, list) else []
+    if base_neutral_text is not None and head_neutral_text != base_neutral_text:
+        if allow_neutral_change:
+            globs = pv.read_ga_neutral_globs(root)
+        else:
+            problems.append(
+                f"[rule 3] {NEUTRAL_FILE} changed in this diff. Neutrality of the other changes is "
+                f"judged with the BASE's list, so widening it cannot exempt itself.\n"
+                f"    FIX: have the allowlist change reviewed, then re-run with --allow-neutral-change "
+                f"(CI: add the `ga-neutral-reviewed` label to the PR).")
 
     base_test = _lit(root, base_sha, TEST_VERSION_FILE, "TEST_APP_VERSION")
     head_test = _lit(root, head_ref, TEST_VERSION_FILE, "TEST_APP_VERSION")
@@ -191,11 +245,20 @@ def check_diff(root: Path, base_sha: str, include_worktree: bool) -> List[str]:
                 f"[rule 1] {pkg}: shipped code changed ({sample}) but PACKAGE_VERSION was not bumped.\n"
                 f"    FIX: increase PACKAGE_VERSION in {vfile} (and the same string as `version` in "
                 f"packages/{d}/pyproject.toml). Every package change bumps its own version.")
-        non_neutral = [r for r in shipped if not _is_neutral(r, globs)]
+        def _doc_only(rel: str) -> bool:
+            return rel.endswith(".py") and semantically_same(_read(root, base_sha, rel),
+                                                             _read(root, head_ref, rel))
+        non_neutral = [r for r in shipped if not _is_neutral(r, globs) and not _doc_only(r)]
         if non_neutral:
             b = pv.try_parse(base_req.get(pkg))
             h = pv.try_parse(head_req.get(pkg))
             raised = h is not None and (b is None or h > b)
+            if raised and not test_bumped and hv is not None and h != hv:
+                problems.append(
+                    f"[rule 2] {pkg}: the minimum was raised to {head_req.get(pkg)} but the package is "
+                    f"now at {_lit(root, head_ref, vfile, 'PACKAGE_VERSION')}.\n"
+                    f"    FIX: the new minimum must EQUAL the new PACKAGE_VERSION (a lower one leaves "
+                    f"this change optional for workers).")
             if not (raised or test_bumped):
                 nsample = ", ".join(non_neutral[:4]) + (
                     f" (+{len(non_neutral) - 4} more)" if len(non_neutral) > 4 else "")
@@ -211,17 +274,20 @@ def check_diff(root: Path, base_sha: str, include_worktree: bool) -> List[str]:
 
 
 def run_check(root: Path, base: Optional[str] = None, include_worktree: bool = False,
-              out=print) -> int:
+              out=print, allow_neutral_change: bool = False) -> int:
     root = Path(root).resolve()
     problems = check_consistency(root)
-    base_sha, label = _resolve_base(root, base)
-    if base_sha is None:
+    base_sha, label, explicit = _resolve_base(root, base)
+    if base_sha is None and explicit:
+        problems.append(f"the base you named does not resolve ({label}); rules 1-2 cannot run. "
+                        f"In CI fetch full history (actions/checkout fetch-depth: 0).")
+    elif base_sha is None:
         out(f"NOTE: base ref unavailable ({label}); checked this tree's internal consistency only. "
             f"Rules 1-2 (diff vs base) were SKIPPED.")
     else:
         out(f"Checking packages/ changes in {base_sha[:10]} ({label}) ... "
             f"{'worktree' if include_worktree else 'HEAD'}")
-        problems += check_diff(root, base_sha, include_worktree)
+        problems += check_diff(root, base_sha, include_worktree, allow_neutral_change)
     if problems:
         out("FAIL: package version policy violated:")
         for p in problems:
@@ -238,8 +304,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--root", default=str(_HERE.parent), help="repository root (default: this repo)")
     ap.add_argument("--include-worktree", action="store_true",
                     help="compare the working tree (uncommitted + staged changes) instead of HEAD")
+    ap.add_argument("--allow-neutral-change", action="store_true",
+                    help="accept an edit to ga_neutral_package_paths.py in this diff (reviewed)")
     a = ap.parse_args(argv)
-    return run_check(Path(a.root), a.base, a.include_worktree)
+    return run_check(Path(a.root), a.base, a.include_worktree,
+                     allow_neutral_change=a.allow_neutral_change)
 
 
 if __name__ == "__main__":

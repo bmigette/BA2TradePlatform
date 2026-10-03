@@ -340,8 +340,8 @@ requires workers to run at least `REQUIRED_PACKAGE_VERSIONS` (`required_package_
 that minimum is raised only when a package change can affect GA results (GA-neutral paths are
 listed in `ga_neutral_package_paths.py`). Workers compare `TEST_APP_VERSION` and those minimums, not
 the git commit. `python tools/check_package_versions.py` enforces the bump rules. Commit and push
-the bump: the master refuses to sync workers to a version that a `git pull` cannot reach
-(`self_update.unsyncable_reason`).
+the bump: the master WARNS (`self_update.unsyncable_reason`) when a version that a `git pull` cannot reach
+is about to be synced.
 
 ## Testing
 

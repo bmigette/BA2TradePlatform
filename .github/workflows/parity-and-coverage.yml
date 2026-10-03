@@ -86,6 +86,11 @@ jobs:
         # failure is diagnosable from the artifact alone when the log is not readable.
         run: python -m pytest tests/backtest -q -rA --junitxml=junit-backtest.xml
 
+      - name: Package-version policy tests (blocking)
+        working-directory: testplatform/backend
+        # Needs a git-capable checkout only for tmp repos it creates itself, not for history.
+        run: python -m pytest tests/test_package_versions.py tests/test_check_package_versions_tool.py -q -p no:cacheprovider
+
       - name: Surface the failure tracebacks as annotations
         # Runs ONLY on failure. See .github/scripts/annotate_junit_failures.py for why this is
         # the only channel a non-admin can read.
@@ -122,3 +127,34 @@ jobs:
             testplatform/backend/junit-backtest.xml
             pip-freeze.txt
           if-no-files-found: ignore
+
+  package-version-guard:
+    # Fails a PR/push that changes shipped packages/ code without bumping PACKAGE_VERSION, or
+    # that is not declared GA-neutral without raising the required minimum. Stdlib only; needs
+    # FULL history so the base can be diffed (a named base that does not resolve is an error).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Package version policy (tools/check_package_versions.py)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          NEUTRAL_REVIEWED: ${{ contains(github.event.pull_request.labels.*.name, 'ga-neutral-reviewed') }}
+        run: |
+          args=""
+          if [ -n "$BASE_REF" ]; then
+            args="--base origin/$BASE_REF"
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            args="--base $BEFORE_SHA"
+          fi
+          if [ "$NEUTRAL_REVIEWED" = "true" ]; then
+            args="$args --allow-neutral-change"
+          fi
+          python tools/check_package_versions.py $args

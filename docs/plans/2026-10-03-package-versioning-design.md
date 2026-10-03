@@ -74,7 +74,7 @@ package(s) ...`, triggers `/update` once, and converges when the pulled worker r
 never does, it is excluded with `still failing package minimums`, never a crash. An OLD master with a
 NEW worker simply ignores the extra keys (and never passes minimums).
 
-`unsyncable_reason` now also refuses a distributed run if `required_package_versions.py` or a package
+`unsyncable_reason` now also WARNS (it never blocks a run) if `required_package_versions.py` or a package
 `version.py` is uncommitted (a worker's `git pull` could never reach it).
 
 ### Guard (the risk this scheme creates)
@@ -125,3 +125,48 @@ unreachable from the GA/backtest path). Never list a module the backtest engine 
   `/update` -> `/version` loop is covered only through fakes.
 * A bump to `TEST_APP_VERSION`, the first set of values, and the first real minimum raise are left
   to the controller at a grid job boundary.
+
+## Review amendments (Opus review of e3876bde)
+
+Final rule, as documented in CLAUDE.md "Versioning":
+
+1. **Worker AHEAD of the master is excluded, not tolerated.** A worker whose reported
+   `required_package_versions[pkg]` is above the master's declares GA-relevant code the master lacks;
+   `/update` cannot downgrade it, so `ensure_synced` returns False WITHOUT calling `/update`, with a
+   `WARNING ... NEWER than the master ...` (once per job via `drift_seen`). The re-admission recheck
+   re-evaluates it each cycle, so it returns as soon as the master catches up. A worker that only has
+   a higher package VERSION with an equal minimum is allowed drift (neutral changes), as before.
+2. **The master refuses distributed mode when it cannot enforce minimums.** Every entry
+   (`strategy_optimization_handler`, `ba2test_launcher`, `api/workers.py`, `tools/rerun_dev_deployed_on_worker.py`)
+   calls `self_update.master_sync_policy()`, which raises `PackageGatingError` unless every package has
+   a parseable own version and minimum (missing, empty, conflict-marked or inconsistent files all fail).
+   `ensure_synced` itself raises on an empty minimum mapping instead of treating it as "gating off".
+3. **No TEST bump for a minimum raise.** The raised minimum itself makes older workers sync.
+   `required_package_versions.py` and `ga_neutral_package_paths.py` edits are exempt from the
+   `testplatform/` -> bump-TEST rule. A `TEST_APP_VERSION` bump still satisfies guard rule 2 (it
+   re-syncs every worker anyway).
+4. Guard rule 2: a raised minimum must EQUAL the new `PACKAGE_VERSION`.
+5. An explicitly named base (`--base`, `$BA2_VERSION_CHECK_BASE`) that does not resolve exits 1; only
+   automatic candidates are skipped softly.
+6. CI: job `package-version-guard` (fetch-depth 0, base = `origin/<PR base>` or the push's `before`
+   sha) runs the guard; the two new test files also run in the `parity` job. Local `pytest` runs them too.
+7. Neutrality is judged with the BASE's allowlist. Editing `ga_neutral_package_paths.py` is rule 3 and
+   needs `--allow-neutral-change` (CI: PR label `ga-neutral-reviewed`). If the base has no allowlist yet
+   (first introduction) the head's list is used.
+8. `unsyncable_reason` WARNS; docs say so.
+9. Docstring/comment-only edits to a `.py` file (ast equal after stripping docstrings) are neutral for
+   rule 2 but still need the package bump (rule 1). Deleted/renamed files are changed files.
+10. Version parsing is strict: month 01-12, no surrounding whitespace/newline. Unhashable package
+    values from a worker never raise. A worker with no `app_version` is still accepted (pre-existing)
+    but now with a WARNING. A test imports the backtest engine in a clean interpreter and asserts no
+    GA-neutral module is loaded, keeping the allowlist honest.
+
+### Boundary checklist (when shipping at a grid job boundary)
+
+1. Merge `feat/package-versions` into dev; run `python tools/check_package_versions.py --base origin/dev`.
+2. Bump `TEST_APP_VERSION` once (this change touches `testplatform/`): every worker re-syncs once, and
+   old workers (no `package_versions`) are synced loudly one time. Do it only between jobs.
+3. Push; confirm the `package-version-guard` and `parity` CI jobs are green.
+4. After workers report, check `GET /version` on one worker shows `package_versions` equal to the master's.
+5. From then on: package change -> bump that `PACKAGE_VERSION`; GA-relevant -> minimum EQUAL to it;
+   neutral -> allowlist (reviewed). Never touch `TEST_APP_VERSION` for a package change mid-run.

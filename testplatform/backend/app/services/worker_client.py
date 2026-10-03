@@ -527,8 +527,20 @@ def sync_reasons(info: dict, master_version: str,
     and a package the worker reports is BELOW its declared minimum, or the worker reports no
     version for it ("unknown" -- every pre-2026-10-03 worker). Package versions merely DIFFERING
     from the master's while at/above the minimum are not a reason (see ``package_drift``).
+
+    A ``"worker-ahead:<pkgs>"`` reason is different in kind: the worker declares a HIGHER minimum
+    than the master for those packages, i.e. it carries GA-relevant code the master lacks. ``/update``
+    only pulls, so it cannot fix that; ``ensure_synced`` EXCLUDES such a worker (the old
+    ``TEST_APP_VERSION`` equality rule excluded a worker ahead of the master too).
     """
     reasons: list[str] = []
+    if required_packages is not None and not required_packages:
+        raise ValueError("required_packages is empty: the master's minimums are unreadable "
+                         "(use master_sync_policy at the entry point)")
+    if required_packages:
+        ahead = package_versions.worker_ahead(info.get("required_package_versions"), required_packages)
+        if ahead:
+            reasons.append("worker-ahead:" + ",".join(ahead))
     if _is_pre_split(info):
         reasons.append("pre-split")
     elif info.get("app_version") != master_version:
@@ -555,7 +567,7 @@ def package_drift(worker: dict, info: dict, master_packages: Optional[Mapping[st
     d = package_versions.drift(info.get("package_versions"), master_packages)
     if not d:
         return
-    key = (worker["name"], tuple(sorted(d.items())))
+    key = (worker["name"], repr(sorted(d.items(), key=lambda kv: kv[0])))
     if drift_seen is not None:
         if key in drift_seen:
             return
@@ -602,9 +614,27 @@ def ensure_synced(worker: dict, master_version: Optional[str],
         return False
     wv = info.get("app_version")
     pre_split = _is_pre_split(info)
-    if not master_version or not wv:
-        return True  # caller isn't version-gating (or the worker reports no version at all)
+    if not master_version:
+        return True  # caller isn't version-gating
+    if not wv:
+        # Pre-existing leniency kept, but never silent: nothing (not even the package minimums)
+        # can be checked for a worker that reports no app_version.
+        _warn(log, f"worker {worker['name']} reports NO app_version; accepting it UNCHECKED "
+                   f"(no version or package-minimum gating applied)")
+        return True
     reasons = sync_reasons(info, master_version, required_packages)
+    ahead = [r for r in reasons if r.startswith("worker-ahead:")]
+    if ahead:
+        pk = ahead[0].split(":", 1)[1]
+        key = ("ahead", worker["name"], pk, repr(info.get("required_package_versions")))
+        if drift_seen is None or key not in drift_seen:
+            if drift_seen is not None:
+                drift_seen.add(key)
+            _warn(log, f"worker {worker['name']} is NEWER than the master for package(s) {pk} "
+                       f"(its declared minimum {info.get('required_package_versions')} is above the "
+                       f"master's {dict(required_packages)}); excluding it WITHOUT /update -- an "
+                       f"update cannot downgrade. Move the master forward (or the worker back) first")
+        return False
     if not reasons:
         package_drift(worker, info, master_packages, log, drift_seen)
         return True

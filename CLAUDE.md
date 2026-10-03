@@ -271,10 +271,10 @@ you changed:
 | What you changed | Bump |
 |---|---|
 | `ba2_trade_platform/` only | `ba2_trade_platform/version.py` (`APP_VERSION`) |
-| `testplatform/` | `testplatform/version.py` (`TEST_APP_VERSION`) |
+| `testplatform/` | `testplatform/version.py` (`TEST_APP_VERSION`). EXEMPT: edits to `required_package_versions.py` and `ga_neutral_package_paths.py` alone need no TEST bump |
 | anything shipped under `packages/<dir>/<pkg>/` | that package's `PACKAGE_VERSION` (`packages/<dir>/<pkg>/version.py`, plus the same string as `version` in `packages/<dir>/pyproject.toml`) -- ALWAYS |
-| ... and the change CAN affect GA / backtest results | also raise that package's entry in `testplatform/required_package_versions.py` to the new `PACKAGE_VERSION` (workers below it re-sync) |
-| ... and the change CANNOT (broker-only code, etc.) | leave the minimum alone; add a narrow glob for the path to `testplatform/ga_neutral_package_paths.py` in the same commit |
+| ... and the change CAN affect GA / backtest results | also set that package's entry in `testplatform/required_package_versions.py` EQUAL to the new `PACKAGE_VERSION`. No `TEST_APP_VERSION` bump is needed: the raised minimum itself makes older workers sync |
+| ... and the change CANNOT (broker-only code, etc.) | leave the minimum alone; add a narrow glob for the path to `testplatform/ga_neutral_package_paths.py` in a reviewed change (CI: the `ga-neutral-reviewed` PR label, or `--allow-neutral-change` by hand); the allowlist is judged from the BASE, so a path added in the same diff does not exempt itself |
 | more than one of the above | each matching file |
 
 Why workers compare versions: distributed GA trials must run the IDENTICAL code as the master or a
@@ -287,10 +287,10 @@ may run OLDER package code than the master by design. The master logs a `WARNING
 (once per job, per worker) listing every package that differs, so drift is observable, never silent.
 Raising a minimum is therefore the explicit act "this change can affect GA results".
 
-`tools/check_package_versions.py` (also a unit test) enforces the bump rules against
+`tools/check_package_versions.py` (a unit test, and the `package-version-guard` CI job) enforces the bump rules against
 `git diff <base>...HEAD`: a shipped `packages/` change without a `PACKAGE_VERSION` bump fails; one that
 is not matched by `GA_NEUTRAL_GLOBS` and does not raise the minimum (or bump `TEST_APP_VERSION`) fails.
 Run it before pushing: `python tools/check_package_versions.py [--base origin/dev] [--include-worktree]`.
 Full rationale: `docs/plans/2026-10-03-package-versioning-design.md`. Commit AND push the bumps --
-`unsyncable_reason` refuses a distributed run when a version file is uncommitted or the branch is
-unpushed.
+`unsyncable_reason` WARNS (it does not block the run) when a version file is uncommitted or the
+branch is unpushed; a worker's `git pull` could not reach it.

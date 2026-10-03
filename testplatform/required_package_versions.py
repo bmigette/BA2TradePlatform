@@ -9,10 +9,11 @@
 # still at/above the minimum, does NOT force a re-sync (the master logs it as drift instead).
 #
 # RAISING an entry is the explicit act meaning "this package change can affect GA results; make
-# every worker take it". Set it to the package's new PACKAGE_VERSION in the same commit (and bump
-# TEST_APP_VERSION at the job boundary as before). A change that cannot affect GA results (a
+# every worker take it". Set it EQUAL to the package's new PACKAGE_VERSION in the same commit. No
+# TEST_APP_VERSION bump is needed: the raised minimum itself makes older workers sync, and an edit to
+# this file alone is exempt from the `testplatform/` -> bump-TEST rule. A change that cannot affect GA results (a
 # broker-only module, tests, docs) leaves this file alone and instead adds its path to
-# `ga_neutral_package_paths.py`. `tools/check_package_versions.py` enforces the choice in CI.
+# `ga_neutral_package_paths.py`. `tools/check_package_versions.py` enforces the choice (the `package-version-guard` CI job).
 #
 # This file is read by TEXT (ast.literal_eval of the assignment), never imported: keep the value
 # a plain dict literal of str -> str.

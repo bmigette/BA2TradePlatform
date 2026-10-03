@@ -7770,9 +7770,9 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         remote_workers = (_resolve_workers(db, getattr(opt, "worker_ids", None))
                           if use_remote_workers else [])
         if remote_workers:
-            from app.services.self_update import get_version_info
+            from app.services.self_update import master_sync_policy
             from app.services.worker_client import ensure_synced
-            _master_info = get_version_info()
+            _master_info = master_sync_policy()  # raises PackageGatingError: refuse, never gate silently off
             master_version = _master_info.get("app_version")
             _drift_seen: set = set()
             remote_workers = [w for w in remote_workers if ensure_synced(

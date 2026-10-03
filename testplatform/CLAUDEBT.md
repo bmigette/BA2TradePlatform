@@ -16,10 +16,10 @@ by 1** in each file that matches what you changed:
 | What you changed | Bump |
 |---|---|
 | `ba2_trade_platform/` only | `ba2_trade_platform/version.py` (`APP_VERSION`) |
-| `testplatform/` | `testplatform/version.py` (`TEST_APP_VERSION`) |
+| `testplatform/` | `testplatform/version.py` (`TEST_APP_VERSION`). EXEMPT: edits to `required_package_versions.py` and `ga_neutral_package_paths.py` alone need no TEST bump |
 | anything shipped under `packages/<dir>/<pkg>/` | that package's `PACKAGE_VERSION` (`packages/<dir>/<pkg>/version.py`, plus the same string as `version` in `packages/<dir>/pyproject.toml`) -- ALWAYS |
-| ... and the change CAN affect GA / backtest results | also raise that package's entry in `testplatform/required_package_versions.py` to the new `PACKAGE_VERSION` (workers below it re-sync) |
-| ... and the change CANNOT (broker-only code, etc.) | leave the minimum alone; add a narrow glob for the path to `testplatform/ga_neutral_package_paths.py` in the same commit |
+| ... and the change CAN affect GA / backtest results | also set that package's entry in `testplatform/required_package_versions.py` EQUAL to the new `PACKAGE_VERSION`. No `TEST_APP_VERSION` bump is needed: the raised minimum itself makes older workers sync |
+| ... and the change CANNOT (broker-only code, etc.) | leave the minimum alone; add a narrow glob for the path to `testplatform/ga_neutral_package_paths.py` in a reviewed change (CI: the `ga-neutral-reviewed` PR label, or `--allow-neutral-change` by hand); the allowlist is judged from the BASE, so a path added in the same diff does not exempt itself |
 | more than one of the above | each matching file |
 
 Workers sync on `TEST_APP_VERSION` (`backend/app/services/worker_client.py:ensure_synced`, which
@@ -29,7 +29,7 @@ differs while within the minimum is allowed and logged as `DRIFT`. Run
 `python tools/check_package_versions.py` before pushing (rationale:
 `docs/plans/2026-10-03-package-versioning-design.md`).
 
-Also: `unsyncable_reason` refuses a distributed run when a version file (`testplatform/version.py`, `required_package_versions.py`, a package `version.py`) is uncommitted
+Also: `unsyncable_reason` WARNS about a distributed run when a version file (`testplatform/version.py`, `required_package_versions.py`, a package `version.py`) is uncommitted
 or the branch is unpushed — a worker's `git pull` could never converge on it. Commit AND push the
 bump before dispatching.
 
