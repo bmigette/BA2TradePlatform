@@ -156,7 +156,7 @@ _CARD_COMMON_CSS = f'''
     .{CARD_ROW_CLASS}.{CARD_ROW_CLASS} > :empty {{ display: none !important; }}
     .{CARD_ROW_CLASS}.{CARD_ROW_CLASS} > .pf-empty {{ display: none !important; }}
     .{CARD_ROW_CLASS}.{CARD_ROW_CLASS} > * {{
-        font-size: 0.9rem !important; text-transform: none !important;
+        font-size: 16px !important; text-transform: none !important;
         letter-spacing: 0 !important; min-width: 0 !important;
         overflow-wrap: anywhere; }}
     .pf-card-wrap.pf-card-wrap {{ min-width: 0 !important; max-width: 100% !important; }}
@@ -169,9 +169,12 @@ def card_cell_class(prefix: str, name: str) -> str:
 
 
 def _caption_rule(selector: str, caption: str) -> str:
-    return (f'{selector}::before {{ content: "{caption}"; margin-right: auto; '
-            f'color: #94a3b8; font-size: 0.78rem; font-weight: 400; '
-            f'white-space: nowrap; }}')
+    """The caption of a tile: its own small muted uppercase LINE above the value (a grid
+    item spanning the cell's width), never run into the value on the same line."""
+    return (f'{selector}::before {{ content: "{caption}"; grid-column: 1 / -1; '
+            f'color: #94a3b8; font-size: 11px; line-height: 1.2; font-weight: 400; '
+            f'letter-spacing: 0.05em; text-transform: uppercase; white-space: nowrap; '
+            f'margin-bottom: 3px; }}')
 
 
 def card_rows_css(row_key: str, prefix: str, card_columns: Sequence[CardColumn],
@@ -188,14 +191,26 @@ def card_rows_css(row_key: str, prefix: str, card_columns: Sequence[CardColumn],
     base = f'.{CARD_ROW_CLASS}.{row_key}'
     has_tick = any(c.tier == TIER_TICK for c in card_columns)
     has_detail = any(c.tier == TIER_DETAIL for c in card_columns)
-    left = '3rem' if has_tick else '0.5rem'
+    left = '8px'
+    # THE CARD: its own background, a 1px line, rounded, a 12px gap to the next one.
+    # The grid has NO column gap -- the tiles carry their own 4px margin -- so the divider
+    # under the head line runs unbroken from edge to edge.
     rules: List[str] = [
         f'{base} {{ display: grid !important; '
         f'grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); '
-        f'column-gap: 0.75rem; row-gap: 0.125rem; align-items: baseline; '
-        f'position: relative; width: 100% !important; min-width: 0 !important; '
-        f'padding: 0.5rem 0.5rem 0.25rem {left} !important; }}',
+        f'column-gap: 0; row-gap: 0; align-items: start; position: relative; '
+        f'width: 100% !important; min-width: 0 !important; '
+        f'padding: 10px 8px 10px {left} !important; margin: 0 0 12px !important; '
+        f'box-sizing: border-box; '
+        f'border: 1px solid rgba(255,255,255,0.16); border-radius: 12px; '
+        f'background: #232a3d !important; box-shadow: 0 1px 3px rgba(0,0,0,0.35); }}',
     ]
+    tile = ('display: grid; grid-template-columns: max-content max-content; '
+            'justify-content: start; align-content: start; column-gap: 4px; '
+            'margin: 4px; padding: 8px 10px; min-height: 4rem; border-radius: 8px; '
+            'background: rgba(255,255,255,0.04); text-align: left !important; '
+            'font-variant-numeric: tabular-nums; width: auto !important; '
+            'max-width: none !important; ')
     order = 0
     head_seen = 0
     for column in card_columns:
@@ -203,36 +218,41 @@ def card_rows_css(row_key: str, prefix: str, card_columns: Sequence[CardColumn],
         order += 1
         common = 'width: auto !important; max-width: none !important; '
         if column.tier == TIER_TICK:
-            rules.append(f'{cell} {{ position: absolute; left: 0.25rem; top: 0.1rem; '
+            rules.append(f'{cell} {{ position: absolute; left: 12px; top: 8px; '
                          f'{common}}}')
         elif column.tier == TIER_HEAD:
             head_seen += 1
+            pad = ('0 0 8px 2.6rem' if has_tick else '0 0 8px 4px') if head_seen == 1                 else '0 4px 8px 0'
+            line = (f'padding: {pad}; display: flex; align-items: center; '
+                    f'min-height: 2.4rem; box-sizing: border-box; '
+                    'margin: 0 0 6px 0; '
+                    'border-bottom: 1px solid rgba(255,255,255,0.10); ')
             if head_seen == 1:
-                rules.append(f'{cell} {{ order: {order}; grid-column: 1; {common}'
-                             f'font-size: 1.05rem !important; font-weight: 600; '
+                rules.append(f'{cell} {{ order: {order}; grid-column: 1; {common}{line}'
+                             f'font-size: 1.2rem !important; font-weight: 700; '
                              f'text-align: left; }}')
             else:
-                rules.append(f'{cell} {{ order: {order}; grid-column: 2; {common}'
-                             f'text-align: right; justify-self: end; }}')
+                rules.append(f'{cell} {{ order: {order}; grid-column: 2; {common}{line}'
+                             f'text-align: right; justify-content: flex-end; justify-self: stretch; }}')
         elif column.tier in (TIER_PRIMARY, TIER_DETAIL):
-            display = 'flex' if column.tier == TIER_PRIMARY else 'none'
-            rules.append(
-                f'{cell} {{ order: {order}; display: {display} !important; '
-                f'justify-content: flex-end; align-items: baseline; gap: 0.25rem; '
-                f'text-align: right; {common}}}')
+            display = 'grid' if column.tier == TIER_PRIMARY else 'none'
+            rules.append(f'{cell} {{ order: {order}; {tile}display: {display} !important; }}')
             rules.append(_caption_rule(cell, column.caption))
             if column.tier == TIER_DETAIL:
                 rules.append(f'{base}.{CARD_OPEN_CLASS} > '
                              f'.{card_cell_class(prefix, column.name)} '
-                             f'{{ display: flex !important; }}')
+                             f'{{ display: grid !important; }}')
         else:  # wide
-            rules.append(f'{cell} {{ order: {order + 100}; grid-column: 1 / -1; '
-                         f'{common}text-align: left; }}')
+            rules.append(f'{cell} {{ order: {order + 100}; grid-column: 1 / -1; {common}'
+                         f'margin: 4px; padding: 0 2px; text-align: left; }}')
     if has_detail:
+        # "Details" is a full-width subtle button row, closed by default.
         rules.append(
             f'{base}::after {{ content: "Details \\25BE"; order: 99; '
-            f'grid-column: 1 / -1; text-align: center; color: #94a3b8; '
-            f'font-size: 0.85rem; line-height: 2.5rem; min-height: 2.5rem; }}')
+            f'grid-column: 1 / -1; margin: 6px 4px 0; text-align: center; color: #cbd5e1; '
+            f'font-size: 0.95rem; line-height: 44px; min-height: 44px; '
+            f'border: 1px solid rgba(255,255,255,0.14); border-radius: 8px; '
+            f'background: rgba(255,255,255,0.03); }}')
         rules.append(f'{base}.{CARD_OPEN_CLASS}::after '
                      f'{{ content: "Hide details \\25B4"; }}')
     return phone_media('\n'.join('    ' + r for r in rules))
