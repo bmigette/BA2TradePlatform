@@ -128,10 +128,14 @@ def resolve_chart_selection(stored_by_account: Sequence[Optional[Sequence[str]]]
 
 def pick_single(stored_values: Sequence[Optional[str]], options: Sequence[str],
                 default: Optional[str]) -> Optional[str]:
-    """A single-select's value: the first stored value (account order) still an option, else ``default``."""
+    """A single-select's value: the first stored value (account order) still an option, else ``default``.
+
+    Only strings count: a stored list/dict/number (hand-edited or corrupt) is treated as
+    absent -- it must neither raise (unhashable) nor match by accident.
+    """
     opts = set(options or [])
     for v in stored_values or []:
-        if v is not None and v in opts:
+        if isinstance(v, str) and v in opts:
             return v
     return default
 

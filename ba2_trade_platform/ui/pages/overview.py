@@ -29,8 +29,8 @@ from ..utils.growth_label_storage import (
 )
 from ..utils.dividend_forecast import forecast_dividends
 from ..utils.overview_range import (
-    RANGE_OPTIONS, date_in_range, filter_dates, filter_months, read_range,
-    resolve_range_start, write_range, yf_period_for,
+    RANGE_OPTIONS, date_in_range, effective_range_start, filter_dates, filter_months,
+    history_capped, read_range, resolve_range_start, write_range, yf_period_for,
 )
 from ..utils.overview_label_scope import (
     CHART_GROWTH, CHART_MONTHLY, CHART_POSITION_LABEL, CHART_POSITION_SYMBOL,
@@ -5201,6 +5201,30 @@ def _build_qty_timeline(current_qty, filled_trades, all_dates, dividends=None):
 
 
 
+def _save_setting(key, value) -> bool:
+    """``write_overview_setting`` that SAYS so when it fails: a view preference that does not
+    persist must not look like one that does."""
+    ok = write_overview_setting(key, value)
+    if not ok:
+        try:
+            ui.notify('Could not save this setting; it will not survive a reload.', type='warning')
+        except RuntimeError:
+            pass
+    return ok
+
+
+def _to_date(value):
+    """date | datetime | ISO string -> date, or None."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
 def _rgba(hex_color: str, alpha: float) -> str:
     """``#RRGGBB`` -> ``rgba(r, g, b, alpha)`` (forecast bars: the series colour, see-through)."""
     h = hex_color.lstrip('#')
@@ -5243,11 +5267,31 @@ class AccountGrowthTab:
         self._single_account = None
         # Page-level time range (DB-persisted, one value for the whole page) and the next
         # 2 months' dividend forecast (see ui/utils/dividend_forecast.py).
-        self._range = read_range()
-        self._range_start = resolve_range_start(self._range, date.today())
         self._forecast = {}
         self._gen = 0
+        self._hidden_labels = 0
+        self._init_data_cache()
+        self._set_range(read_range())
         self.render()
+
+    # ------------------------------------------------------------------
+    # time range + the per-page broker-data cache
+    # ------------------------------------------------------------------
+
+    def _init_data_cache(self):
+        """Broker data lives on the tab for the life of the page: a range click only
+        re-filters and redraws. A new page load (or a different account selection)
+        builds a fresh tab / key, which is the only invalidation there is."""
+        self._broker_cache = {}
+        self._earliest = None            # first balance / trade / dividend date
+        self._raw_range_start = None
+        self._balance_first = None
+        self._activity_first = None
+
+    def _set_range(self, range_key):
+        self._range = range_key
+        self._raw_range_start = resolve_range_start(range_key, date.today())
+        self._range_start = effective_range_start(self._raw_range_start, self._earliest)
 
     # ------------------------------------------------------------------
     # label scope + persisted chart selections (DB, per account)
@@ -5268,21 +5312,26 @@ class AccountGrowthTab:
         # Only with ONE account selected: with "All accounts" a change has no single
         # owner, so it stays session-only (the union is what is shown on reload).
         if self._single_account is not None:
-            write_overview_setting(chart_key(chart, self._single_account), list(visible))
+            _save_setting(chart_key(chart, self._single_account), list(visible))
 
     def _persist_single(self, chart, value):
         if self._single_account is not None:
-            write_overview_setting(single_key(chart, self._single_account), value)
+            _save_setting(single_key(chart, self._single_account), value)
 
     def _scope_symbol_info(self, symbol_info):
         """Drop out-of-scope labels from each symbol (and symbols left with none)."""
         if self._scope is None:
+            self._hidden_labels = 0
             return symbol_info
         out = {}
+        before, after = set(), set()
         for sym, info in symbol_info.items():
             kept = apply_scope(info['labels'], self._scope)
+            before.update(info['labels'])
+            after.update(kept)
             if kept:
                 out[sym] = dict(info, labels=kept)
+        self._hidden_labels = len(before - after)
         return out
 
     @staticmethod
@@ -5309,49 +5358,57 @@ class AccountGrowthTab:
 
         Reuses the page's own dividend rows (``get_dividends``) -- no second source.
         Those rows are TOTALS, so the per-share amount is the row's net amount over the
-        shares held on the payment date (``_build_qty_timeline`` from the account's
-        current quantity and trades, minus the DRIP shares the payment itself bought).
-        Per symbol the accounts' per-share figures are averaged by date; the forecast
-        quantity is the symbol's CURRENT quantity across the accounts in view. A
-        symbol's forecast goes to its labels exactly like its actual dividends.
+        shares held on the payment date: ``_build_qty_timeline`` walks back from the
+        account's CURRENT quantity over the union of its dividend dates AND its trade
+        dates for the symbol (a trade is only undone if its date is in the list), minus
+        the DRIP shares the payment itself bought.
+
+        PER ACCOUNT AND SYMBOL, then summed: two brokers booking the same payment a day
+        apart would otherwise interleave into gaps of 1 / 89 days and kill the cadence.
+        Each account's forecast uses that account's own quantity. A symbol's forecast
+        goes to its labels exactly like its actual dividends.
         """
         from collections import defaultdict
+
+        def _ds(v):
+            return v.strftime('%Y-%m-%d') if hasattr(v, 'strftime') else str(v)[:10]
+
         today = date.today()
-        held = defaultdict(float)                      # symbol -> qty across accounts
-        for (_aid, sym), q in qty_by_account_symbol.items():
-            held[sym] += q
-        rows = defaultdict(list)                       # (account, symbol) -> dividend rows
+        divs_by = defaultdict(list)
         for d in all_dividends or []:
-            sym = d.get('symbol')
-            if sym and held.get(sym, 0) > 0 and d.get('date'):
-                rows[(d.get('account_id'), sym)].append(d)
-        per_share = defaultdict(lambda: defaultdict(list))   # symbol -> date -> [per-share by account]
-        for (aid, sym), divs in rows.items():
-            dates = sorted({(r['date'].strftime('%Y-%m-%d') if hasattr(r['date'], 'strftime')
-                             else str(r['date'])[:10]) for r in divs})
-            trades = [t for t in (all_filled_trades or [])
-                      if t.get('symbol') == sym and t.get('account_id') == aid]
-            qty_by_date, _ = _build_qty_timeline(
-                qty_by_account_symbol.get((aid, sym), 0.0), trades, dates, dividends=divs)
-            per_acct_date = defaultdict(float)
-            for r in divs:
-                ds = (r['date'].strftime('%Y-%m-%d') if hasattr(r['date'], 'strftime')
-                      else str(r['date'])[:10])
+            if d.get('symbol') and d.get('date'):
+                divs_by[(d.get('account_id'), d['symbol'])].append(d)
+        trades_by = defaultdict(list)
+        for t in all_filled_trades or []:
+            if t.get('symbol') and t.get('date'):
+                trades_by[(t.get('account_id'), t['symbol'])].append(t)
+
+        events = []                                    # (symbol, forecast event)
+        for (aid, sym), qty in qty_by_account_symbol.items():
+            if qty <= 0 or (aid, sym) not in divs_by:
+                continue
+            rows = divs_by[(aid, sym)]
+            trades = trades_by.get((aid, sym), [])
+            dates = sorted({_ds(r['date']) for r in rows} | {_ds(t['date']) for t in trades})
+            qty_by_date, _ = _build_qty_timeline(qty, trades, dates, dividends=rows)
+            per_date = defaultdict(float)
+            for r in rows:
+                ds = _ds(r['date'])
                 q = qty_by_date.get(ds, 0) - float(r.get('drip_quantity') or 0)
                 if q > 0:
-                    per_acct_date[ds] += float(r.get('amount') or 0) / q
-            for ds, v in per_acct_date.items():
-                per_share[sym][ds].append(v)
-        labels_by_symbol = get_labels_by_symbol(sorted(per_share)) if per_share else {}
+                    per_date[ds] += float(r.get('amount') or 0) / q
+            history = [(date.fromisoformat(ds), v) for ds, v in per_date.items()]
+            for ev in forecast_dividends(history, qty, today, months=2):
+                events.append((sym, ev))
+
+        labels_by_symbol = get_labels_by_symbol(sorted({sym for sym, _ in events})) if events else {}
         out = {}
-        for sym, by_date in per_share.items():
-            history = [(date.fromisoformat(ds), sum(v) / len(v)) for ds, v in by_date.items()]
-            for ev in forecast_dividends(history, held[sym], today, months=2):
-                month = ev['date'].strftime('%Y-%m')
-                slot = out.setdefault(month, {'total': 0.0, 'labels': {}})
-                slot['total'] += ev['amount']
-                for lb in (labels_by_symbol.get(normalize_symbol(sym)) or ['Unlabeled']):
-                    slot['labels'][lb] = slot['labels'].get(lb, 0.0) + ev['amount']
+        for sym, ev in events:
+            month = ev['date'].strftime('%Y-%m')
+            slot = out.setdefault(month, {'total': 0.0, 'labels': {}})
+            slot['total'] += ev['amount']
+            for lb in (labels_by_symbol.get(normalize_symbol(sym)) or ['Unlabeled']):
+                slot['labels'][lb] = slot['labels'].get(lb, 0.0) + ev['amount']
         return out
 
     def _compute_scope_inputs(self, target_accounts, filled_trades, dividends, positions_by_account):
@@ -5446,7 +5503,7 @@ class AccountGrowthTab:
                     if guard['busy'] or st['follow']:
                         return
                     st['stored'] = sorted(select_all(e.value or []))
-                    write_overview_setting(scope_key(single), st['stored'])
+                    _save_setting(scope_key(single), st['stored'])
                     on_change()
 
                 def on_follow(e):
@@ -5462,15 +5519,15 @@ class AccountGrowthTab:
                             return
                         st['follow'] = True
                         st['stored'] = sorted(select_all(st['managed']))
-                        write_overview_setting(scope_key(single), st['stored'])
-                        write_overview_setting(follow_pf_key(single), True)
+                        _save_setting(scope_key(single), st['stored'])
+                        _save_setting(follow_pf_key(single), True)
                         guard['busy'] = True
                         select.value = list(st['stored'])
                         guard['busy'] = False
                         lock(True)
                     else:
                         st['follow'] = False
-                        write_overview_setting(follow_pf_key(single), False)
+                        _save_setting(follow_pf_key(single), False)
                         lock(False)
                     on_change()
 
@@ -5501,9 +5558,10 @@ class AccountGrowthTab:
             def on_range_change(e):
                 if e.value not in RANGE_OPTIONS or e.value == self._range:
                     return
-                write_range(e.value)
-                self._range = e.value
-                self._range_start = resolve_range_start(e.value, date.today())
+                if not write_range(e.value):
+                    ui.notify('Could not save the time range; it will not survive a reload.',
+                              type='warning')
+                self._set_range(e.value)
                 charts_container.clear()
                 with charts_container:
                     reloading = ui.label('Reloading for the new range...').classes('text-sm text-gray-500')
@@ -5541,75 +5599,101 @@ class AccountGrowthTab:
             self._account_ids = [a.id for a, _ in target_accounts]
             self._single_account = selected_account_id if selected_account_id is not None else None
 
-            # Collect balance history, dividend data, and filled trades from all target accounts
-            all_balance_history = []
-            all_dividends = []
-            all_filled_trades = []
+            # BROKER DATA IS FETCHED ONCE PER PAGE (per account selection). None of it depends
+            # on the time range, and it shares the live accounts' rate limit, so a range click
+            # must not re-ask for it. Only a LONGER balance history (3y / Max) or a longer
+            # price period than already held triggers one more request.
+            cache = self._broker_cache
+            key = tuple(self._account_ids)
+            if cache.get('key') != key:
+                cache.clear()
+                cache['key'] = key
+            if 'dividends' not in cache:
+                dividends_all, trades_all = [], []
+                positions_all, account_map_c = [], {}
+                positions_by_acc, qty_by_acc = {}, {}
+                for acc_def, account_instance in target_accounts:
+                    try:
+                        divs = await asyncio.to_thread(account_instance.get_dividends)
+                        for entry in divs:
+                            entry['account_name'] = acc_def.name
+                            entry['account_id'] = acc_def.id
+                        dividends_all.extend(divs)
+                    except Exception as e:
+                        logger.warning(f"Could not load dividends for {acc_def.name}: {e}")
+                    try:
+                        trades = await asyncio.to_thread(account_instance.get_filled_trades)
+                        for t in trades:
+                            t['account_id'] = acc_def.id
+                        trades_all.extend(trades)
+                    except Exception as e:
+                        logger.warning(f"Could not load filled trades for {acc_def.name}: {e}")
+                    try:
+                        positions = await asyncio.to_thread(account_instance.get_positions)
+                        for pos in positions:
+                            positions_by_acc.setdefault(acc_def.id, set()).add(pos.symbol)
+                            qk = (acc_def.id, pos.symbol)
+                            qty_by_acc[qk] = qty_by_acc.get(qk, 0.0) + float(pos.qty)
+                            positions_all.append(pos)
+                            account_map_c[pos.symbol] = account_instance
+                    except Exception as e:
+                        logger.warning(f"Could not load positions for {acc_def.name}: {e}")
+                cache.update(dividends=dividends_all, trades=trades_all, positions=positions_all,
+                             account_map=account_map_c, positions_by_account=positions_by_acc,
+                             qty_by_account_symbol=qty_by_acc, balance=[], balance_floor='default')
+                dates = [_to_date(x.get('date')) for x in dividends_all + trades_all]
+                dates = [d for d in dates if d]
+                self._activity_first = min(dates) if dates else None
 
-            for acc_def, account_instance in target_accounts:
-                try:
-                    balance_hist = await asyncio.to_thread(account_instance.get_balance_history)
-                    for entry in balance_hist:
-                        entry['account_name'] = acc_def.name
-                        entry['account_id'] = acc_def.id
-                    all_balance_history.extend(balance_hist)
-                except Exception as e:
-                    logger.warning(f"Could not load balance history for {acc_def.name}: {e}")
+            # Balance history: the default window (Alpaca 1A, TastyTrade 365 days) unless the
+            # range needs more; then ask for it ONCE, from the range start (3y) or the first
+            # trade / dividend (Max). Both brokers accept start_date.
+            req = self._balance_request_start()
+            floor = cache['balance_floor']
+            if floor == 'default' or (req is not None and floor is not None and req < floor):
+                balance = []
+                for acc_def, account_instance in target_accounts:
+                    try:
+                        if req is not None:
+                            bh = await asyncio.to_thread(
+                                account_instance.get_balance_history,
+                                start_date=datetime.combine(req, datetime.min.time()))
+                        else:
+                            bh = await asyncio.to_thread(account_instance.get_balance_history)
+                        for entry in bh:
+                            entry['account_name'] = acc_def.name
+                            entry['account_id'] = acc_def.id
+                        balance.extend(bh)
+                    except Exception as e:
+                        logger.warning(f"Could not load balance history for {acc_def.name}: {e}")
+                cache['balance'] = balance
+                cache['balance_floor'] = req
+                bdates = [_to_date(x.get('date')) for x in balance]
+                bdates = [d for d in bdates if d]
+                self._balance_first = min(bdates) if bdates else None
+            all_balance_history = cache['balance']
+            all_dividends = cache['dividends']
+            all_filled_trades = cache['trades']
+            all_positions = cache['positions']
+            account_map = cache['account_map']
+            positions_by_account = cache['positions_by_account']
+            qty_by_account_symbol = cache['qty_by_account_symbol']
 
-                try:
-                    dividends = await asyncio.to_thread(account_instance.get_dividends)
-                    for entry in dividends:
-                        entry['account_name'] = acc_def.name
-                        entry['account_id'] = acc_def.id
-                    all_dividends.extend(dividends)
-                except Exception as e:
-                    logger.warning(f"Could not load dividends for {acc_def.name}: {e}")
-
-                try:
-                    trades = await asyncio.to_thread(account_instance.get_filled_trades)
-                    for t in trades:
-                        t['account_id'] = acc_def.id
-                    all_filled_trades.extend(trades)
-                except Exception as e:
-                    logger.warning(f"Could not load filled trades for {acc_def.name}: {e}")
+            # Never earlier than the account's first activity (Max = from there, not from a
+            # symbol's 1962 listing date).
+            firsts = [d for d in (self._balance_first, self._activity_first) if d]
+            self._earliest = min(firsts) if firsts else None
+            self._set_range(self._range)
 
             try:
                 loading_label.delete()
             except RuntimeError:
                 return
 
-            # Pre-fetch positions from all accounts in thread pool
-            all_positions = []
-            account_map = {}  # symbol -> account instance
-            positions_by_account = {}  # account id -> symbols held (label-scope default)
-            qty_by_account_symbol = {}  # (account id, symbol) -> qty (dividend forecast)
-            for acc_def, account_instance in target_accounts:
-                try:
-                    positions = await asyncio.to_thread(account_instance.get_positions)
-                    for pos in positions:
-                        positions_by_account.setdefault(acc_def.id, set()).add(pos.symbol)
-                        qk = (acc_def.id, pos.symbol)
-                        qty_by_account_symbol[qk] = qty_by_account_symbol.get(qk, 0.0) + float(pos.qty)
-                        all_positions.append(pos)
-                        account_map[pos.symbol] = account_instance
-                except Exception as e:
-                    logger.warning(f"Could not load positions for {acc_def.name}: {e}")
-
-            # Fetch historical prices from Yahoo Finance
-            historical_prices = {}
-            position_symbols = list(set(pos.symbol for pos in all_positions))
-            if position_symbols:
-                try:
-                    import yfinance as yf
-                    hist_data = await asyncio.to_thread(
-                        lambda: yf.download(position_symbols, period=yf_period_for(self._range), progress=False, auto_adjust=False)
-                    )
-                    for sym in position_symbols:
-                        prices = _extract_yf_close_prices(hist_data, sym)
-                        if prices:
-                            historical_prices[sym] = prices
-                except Exception as e:
-                    logger.warning(f"Could not fetch historical prices: {e}")
+            # Historical prices: re-download only when a LONGER period than already held is
+            # needed (or new symbols appeared); a shorter range is just filtered.
+            position_symbols = sorted(set(pos.symbol for pos in all_positions))
+            historical_prices = await self._ensure_prices(position_symbols)
 
             # Monthly realized income (closed-trade P&L + cash dividends), incl. per-label
             try:
@@ -5682,6 +5766,53 @@ class AccountGrowthTab:
                 loading_label.set_text(f'Error loading growth data: {str(e)}')
             except RuntimeError:
                 pass
+
+    _PRICE_RANKS = ['6mo', '1y', '3y', 'max']
+
+    def _balance_request_start(self):
+        """``start_date`` to ask the broker's balance history for, or None for its default
+        window (about one year). Only 3y / Max reach further back."""
+        if self._range not in ('3y', 'Max'):
+            return None
+        act = self._activity_first
+        req = self._raw_range_start if self._raw_range_start else act
+        if req is not None and act is not None:
+            req = max(req, act)
+        if req is None or req >= date.today() - timedelta(days=365):
+            return None
+        return req
+
+    async def _ensure_prices(self, symbols):
+        """``{symbol: {date: close}}`` from the page cache; downloads only when the cached
+        period is shorter than this range needs, or a symbol is missing."""
+        cache = self._broker_cache
+        need = yf_period_for(self._range)
+        held = cache.get('prices')
+        if (held and set(symbols) <= held['symbols']
+                and self._PRICE_RANKS.index(held['period']) >= self._PRICE_RANKS.index(need)):
+            return held['data']
+        data = {}
+        if symbols:
+            try:
+                import yfinance as yf
+                hist = await asyncio.to_thread(
+                    lambda: yf.download(symbols, period=need, progress=False, auto_adjust=False))
+                for sym in symbols:
+                    prices = _extract_yf_close_prices(hist, sym)
+                    if prices:
+                        data[sym] = prices
+            except Exception as e:
+                logger.warning(f"Could not fetch historical prices: {e}")
+        cache['prices'] = {'period': need, 'symbols': set(symbols), 'data': data}
+        return data
+
+    def _cached_symbol_prices(self, symbol):
+        held = self._broker_cache.get('prices')
+        if (held and symbol in held['data']
+                and self._PRICE_RANKS.index(held['period'])
+                >= self._PRICE_RANKS.index(yf_period_for(self._range))):
+            return held['data'][symbol]
+        return None
 
     def _compute_monthly_realized(self, all_filled_trades, all_dividends):
         """Aggregate realized closed-trade P&L and dividend income by month (and by label).
@@ -5933,7 +6064,9 @@ class AccountGrowthTab:
                     mode = ui.toggle(['$', '%'], value='$').props('dense')
                     fullscreen_button(lambda: build(),
                                       title='Monthly Closed Profit + Dividends by Label')
+            all_label_count = len(set(labels))
             labels = apply_scope(labels, self._scope)
+            hidden_by_scope = all_label_count - len(set(labels))
             forecast = self._forecast or {}
             months = sorted(set(months) | set(forecast))
             if not months or not labels:
@@ -6001,6 +6134,8 @@ class AccountGrowthTab:
                 CHART_MONTHLY, MONTHLY_PROFIT_LABELS_STORAGE_KEY, list(labels))
             label_select = self._multi_select_with_all_none(
                 list(labels), default_labels, 'Labels shown', 'w-72')
+            if hidden_by_scope > 0:
+                ui.label(f'{hidden_by_scope} labels hidden by the label scope').classes('text-xs text-gray-500')
             chart_container = ui.column().classes('w-full')
 
             def rebuild():
@@ -6024,7 +6159,11 @@ class AccountGrowthTab:
             # until then.
             header_row = ui.row().classes('w-full items-center justify-between')
             with header_row:
-                ui.label(f'Total Account Growth ({self._range}, rebased to range start)').classes('text-md font-bold mb-2')
+                ui.label(f'Total Account Growth ({self._range}, rebased to range start)'
+                         + (f' - broker history starts {self._balance_first}'
+                            if history_capped(self._raw_range_start, self._balance_first,
+                                              self._activity_first) else '')
+                         ).classes('text-md font-bold mb-2')
 
             # TIME RANGE: the inputs are cut at the range start, so everything cumulative
             # restarts there -- Cumulative Dividends from 0, Invested Capital and P&L %
@@ -6671,6 +6810,8 @@ class AccountGrowthTab:
                 show_div_cb = ui.checkbox('Dividends', value=True)
                 show_inv_cb = ui.checkbox('Invested', value=True)
 
+            if self._hidden_labels > 0:
+                ui.label(f'{self._hidden_labels} labels hidden by the label scope').classes('text-xs text-gray-500')
             chart_container = ui.column().classes('w-full')
 
             def rebuild_label_chart():
@@ -7128,9 +7269,9 @@ class AccountGrowthTab:
 
         with ui.card().classes('w-full mb-4 p-4'):
             with ui.row().classes('w-full items-center justify-between'):
-                ui.label('Dividend History (Last 6 Months)').classes('text-md font-bold mb-2')
+                ui.label(f'Dividend History ({self._range})').classes('text-md font-bold mb-2')
                 fullscreen_content_button(lambda: _body(50),
-                                          title='Dividend History (Last 6 Months)')
+                                          title=f'Dividend History ({self._range})')
             _body(10)
 
     def _render_per_position_section(self, all_positions, account_map, all_filled_trades=None,
@@ -7203,11 +7344,13 @@ class AccountGrowthTab:
                     filled_trades = trades_by_symbol.get(symbol, [])
 
                     # Fetch historical prices from Yahoo Finance
-                    import yfinance as yf
-                    hist_data = await asyncio.to_thread(
-                        lambda: yf.download(symbol, period=yf_period_for(self._range), progress=False, auto_adjust=False)
-                    )
-                    hist_prices = _extract_yf_close_prices(hist_data, symbol)
+                    hist_prices = self._cached_symbol_prices(symbol)
+                    if hist_prices is None:
+                        import yfinance as yf
+                        hist_data = await asyncio.to_thread(
+                            lambda: yf.download(symbol, period=yf_period_for(self._range), progress=False, auto_adjust=False)
+                        )
+                        hist_prices = _extract_yf_close_prices(hist_data, symbol)
                 except Exception as e:
                     try:
                         if loading:
@@ -7266,7 +7409,10 @@ class AccountGrowthTab:
         # dividend / DRIP lines restart there like every other chart on the page.
         start = self._range_start
         hist_prices = {d: p for d, p in (hist_prices or {}).items() if date_in_range(d, start)}
-        dividends = [dv for dv in (dividends or []) if date_in_range(dv.get('date'), start)]
+        # The FULL list still feeds the cost basis below: a DRIP share bought before the
+        # range start is part of what the position cost, whatever window is drawn.
+        dividends_all = list(dividends or [])
+        dividends = [dv for dv in dividends_all if date_in_range(dv.get('date'), start)]
         has_dividends = bool(dividends)
         has_prices = bool(hist_prices)
 
@@ -7328,8 +7474,8 @@ class AccountGrowthTab:
                 # On sell, reduce cost proportionally (at current avg)
                 cost_events[d]['cost_delta'] -= tqty * tprice
 
-        if dividends:
-            for div in dividends:
+        if dividends_all:
+            for div in dividends_all:
                 drip_qty = div.get('drip_quantity')
                 drip_price = div.get('drip_price')
                 if not drip_qty or not drip_price:
@@ -7366,6 +7512,23 @@ class AccountGrowthTab:
         running_cost = 0.0
         running_shares = 0.0
 
+        def apply_cost_event(evt):
+            nonlocal running_cost, running_shares
+            if evt['qty_delta'] < 0 and running_shares > 0:
+                # For sells, reduce cost at current running avg (not sale price)
+                running_avg = running_cost / running_shares
+                running_cost += evt['qty_delta'] * running_avg
+                running_shares += evt['qty_delta']
+            else:
+                running_cost += evt['cost_delta']
+                running_shares += evt['qty_delta']
+
+        # Everything bought or sold BEFORE the first drawn date is already in the running
+        # cost basis when the window opens: without this, a position bought before the
+        # range start showed P&L 0% and an Invested line of just the in-window DRIP cost.
+        for d0 in sorted(k for k in cost_events if k < all_dates[0]):
+            apply_cost_event(cost_events[d0])
+
         for d in all_dates:
             if d in hist_prices:
                 last_price = hist_prices[d]
@@ -7380,15 +7543,7 @@ class AccountGrowthTab:
 
             # Update running cost basis
             if d in cost_events:
-                evt = cost_events[d]
-                if evt['qty_delta'] < 0 and running_shares > 0:
-                    # For sells, reduce cost at current running avg (not sale price)
-                    running_avg = running_cost / running_shares
-                    running_cost += evt['qty_delta'] * running_avg
-                    running_shares += evt['qty_delta']
-                else:
-                    running_cost += evt['cost_delta']
-                    running_shares += evt['qty_delta']
+                apply_cost_event(cost_events[d])
 
             qty_at_date = qty_by_date.get(d, 0)
             # ``None`` before the first purchase, so the line STARTS at the first buy

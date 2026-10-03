@@ -32,7 +32,8 @@ def resolve_range_start(range_key: str, today: date) -> Optional[date]:
     """First day included by ``range_key``; ``None`` for ``'Max'`` (no lower bound).
 
     ``3m``/``6m``/``1y``/``3y`` are calendar offsets back from ``today`` (month-end
-    clamped); ``YTD`` is 1 January of today's year. An unknown key raises -- a typo
+    clamped); ``YTD`` is 1 January of today's year (1 December of the previous year on
+    1-3 January, when the year has fewer than two data points). An unknown key raises -- a typo
     must not silently become "everything".
     """
     if isinstance(today, datetime):
@@ -40,11 +41,27 @@ def resolve_range_start(range_key: str, today: date) -> Optional[date]:
     if range_key == 'Max':
         return None
     if range_key == 'YTD':
+        # On 1-3 January the year has at most one trading day, so a Jan-1 start would
+        # leave every chart blank or a single point. The start then reaches back to
+        # 1 December of the previous year; from 4 January on it is plain 1 January.
+        if today.month == 1 and today.day <= 3:
+            return date(today.year - 1, 12, 1)
         return date(today.year, 1, 1)
     offsets = {'3m': 3, '6m': 6, '1y': 12, '3y': 36}
     if range_key not in offsets:
         raise ValueError(f"Unknown time range {range_key!r}; expected one of {RANGE_OPTIONS}")
     return _minus_months(today, offsets[range_key])
+
+
+def effective_range_start(range_start: Optional[date], earliest: Optional[date]) -> Optional[date]:
+    """The start charts actually use: the range start, but NEVER earlier than the account's
+    first balance / trade / dividend date (``Max`` -- ``range_start is None`` -- starts there
+    instead of at the oldest listing date of a symbol, decades of zeros)."""
+    if range_start is None:
+        return earliest
+    if earliest is None:
+        return range_start
+    return max(range_start, earliest)
 
 
 def normalize_range(value: Any) -> str:
@@ -95,3 +112,18 @@ def read_range() -> str:
 
 def write_range(range_key: str) -> bool:
     return write_overview_setting(RANGE_SETTING_KEY, normalize_range(range_key))
+
+
+def history_capped(range_start: Optional[date], balance_first: Optional[date],
+                   activity_first: Optional[date], slack_days: int = 30) -> bool:
+    """Did the broker return LESS balance history than the range asks for?
+
+    True when the first balance snapshot is more than ``slack_days`` later than the point the
+    range wants (the range start, but never before the account's first trade / dividend --
+    an account younger than the range is not "capped"). Alpaca returns 1A and TastyTrade 365
+    days by default, so 3y / Max can otherwise look like they cover more than they do.
+    """
+    if balance_first is None or activity_first is None:
+        return False
+    wanted = max(range_start, activity_first) if range_start else activity_first
+    return (balance_first - wanted).days > slack_days
