@@ -35,6 +35,7 @@ and pinned by a test against ``styles.css``.
 """
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+import re
 import weakref
 
 #: The app's phone breakpoint, in CSS px. ``styles.css`` uses the same value in its
@@ -379,3 +380,199 @@ def install_phone_listener(registry: PhoneTableRegistry, add_head_html: Callable
         registry.on_phone(bool(event.args['phone']))
 
     on_event(PHONE_EVENT, _changed)
+
+
+# ---------------------------------------------------------------------------
+# Wide q-table kept as a TABLE: scroll sideways, pin the identifying column(s)
+# ---------------------------------------------------------------------------
+# (Added for the Live Trades page. Purely additive: nothing above changed.)
+#
+# The other mechanism in this module (``phone_grid_prop``) turns a table into cards.
+# That is wrong for a table whose point is comparing a column down its rows, and the
+# operator asked for the opposite on Live Trades: every column kept, scrolling inside
+# the table's own box, the Symbol pinned on the left. Quasar adds no per-column class
+# of its own, so the columns are tagged through their ``classes``/``headerClasses``
+# (``column_tag``) and the CSS below addresses the tag, never a position.
+
+#: Theme colours the pinned cells must be painted with. OPAQUE: a translucent sticky
+#: cell lets the scrolling columns show through it. These are the solid equivalents
+#: of the table theme's translucent row (``rgba(37, 43, 59, .5)``) and header
+#: (``rgba(26, 31, 46, .9)``) colours in ``styles.css``.
+PINNED_BODY_BG = '#252b3b'
+PINNED_HEAD_BG = '#1a1f2e'
+#: The row-hover tint of ``styles.css`` (``tbody tr:hover``), laid OVER the opaque
+#: pinned background so a hovered / tapped row is highlighted across its pinned cells
+#: too, instead of from the second column on.
+PINNED_HOVER_TINT = 'rgba(0, 212, 170, 0.1)'
+
+PIN_TAG_PREFIX = 'lt-c-'
+
+
+def column_tag(prefix: str, name: str) -> str:
+    """The class a column wears (cell and header) so CSS can address it. Anything that
+    is not a letter, digit or underscore becomes ``-`` (a column named ``Fill prem.``
+    must still give a valid class). Pure."""
+    return f'{prefix}' + re.sub(r'[^A-Za-z0-9_]+', '-', str(name)).strip('-')
+
+
+def tag_quasar_columns(quasar_columns: Sequence[dict], prefix: str) -> List[dict]:
+    """Add the column tag to each Quasar column dict's ``classes`` and
+    ``headerClasses`` (keeping any class already there, e.g. ``mobile-hide``).
+    Returns new dicts; the input is not modified. Pure."""
+    out: List[dict] = []
+    for col in quasar_columns:
+        tag = column_tag(prefix, col['name'])
+        new = dict(col)
+        for key in ('classes', 'headerClasses'):
+            existing = str(new[key]) if key in new and new[key] else ''
+            new[key] = f'{existing} {tag}'.strip()
+        out.append(new)
+    return out
+
+
+@dataclass(frozen=True)
+class PinnedColumn:
+    """A column that stays at ``left_px`` while the rest scrolls, ``width_px`` wide."""
+    name: str
+    left_px: int
+    width_px: int
+
+
+def check_pinned_columns(pinned: Sequence[PinnedColumn], table_columns: Iterable[str],
+                         min_widths: Dict[str, int]) -> None:
+    """Refuse a pin / min-width spec that names a column the table does not have, or
+    a pinned column whose offset is not the sum of the pinned widths before it (which
+    would make two pinned cells overlap, or leave a gap the scroll shows through).
+    Pure. Raises ``ValueError`` naming every problem."""
+    names = list(table_columns)
+    problems: List[str] = []
+    unknown = [p.name for p in pinned if p.name not in names]
+    unknown += [n for n in min_widths if n not in names]
+    if unknown:
+        problems.append(f'columns the table does not have: {sorted(set(unknown))}')
+    expected = 0
+    for p in pinned:
+        if p.left_px != expected:
+            problems.append(f'{p.name}: left {p.left_px}px, expected {expected}px '
+                            f'(the widths pinned before it)')
+        expected += p.width_px
+    if problems:
+        raise ValueError('; '.join(problems))
+
+
+def pinned_offsets(pinned: Sequence[PinnedColumn]) -> Dict[str, int]:
+    """``{column: left offset}`` from the widths, i.e. what ``left_px`` must be. Pure."""
+    out: Dict[str, int] = {}
+    left = 0
+    for p in pinned:
+        out[p.name] = left
+        left += p.width_px
+    return out
+
+
+def scroll_table_phone_css(root_class: str, prefix: str, pinned: Sequence[PinnedColumn],
+                           min_widths: Dict[str, int], max_height: str = '100vh - 8rem',
+                           ) -> str:
+    """The phone CSS of one wide q-table (``root_class`` is on the table root).
+
+    * the table scrolls INSIDE ``.q-table__middle`` (momentum scrolling, no page-level
+      horizontal scroll) and is height-capped so its header can stay sticky on top;
+    * header labels and cells never wrap; each tagged column has a min-width that fits
+      its content, so the reader scrolls instead of reading clipped text;
+    * the pinned columns are sticky at their offsets, opaque, painted with the row's
+      hover tint, and the last one carries a shadow so it reads as pinned.
+    Pure.
+    """
+    r = f'.{root_class}'
+    # Direct-child chain, NOT descendants: a row-expansion can hold a nested q-markup-table
+    # (the orders list) that must keep its own layout.
+    mid = f'{r} > .q-table__middle'
+    tbl = f'{mid} > table'
+    # ``max_height`` is an expression ("100vh - 8rem"), emitted twice: ``dvh`` (the visible
+    # viewport as the iOS toolbar comes and goes) after a ``vh`` fallback for browsers that
+    # do not know it. ``none`` is passed through. ``container-type`` makes the scroll
+    # box a size container, so a descendant can be as wide as its VISIBLE width (``cqw``).
+    if max_height == 'none':
+        height_rules = 'max-height: none; '
+    else:
+        height_rules = (f'max-height: calc({max_height}); '
+                        f'max-height: calc({max_height.replace("vh", "dvh")}); ')
+    rules: List[str] = [
+        f'{mid} {{ {height_rules}overflow: auto !important; '
+        f'-webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; '
+        f'container-type: inline-size; }}',
+        f'{tbl} {{ width: max-content; min-width: 100%; }}',
+        f'{tbl} > thead > tr > th {{ white-space: nowrap !important; '
+        f'word-break: normal !important; overflow-wrap: normal !important; '
+        f'position: sticky; top: 0; z-index: 3; background: {PINNED_HEAD_BG} !important; }}',
+        f'{tbl} > tbody > tr > td {{ white-space: nowrap; '
+        f'font-variant-numeric: tabular-nums; }}',
+    ]
+    for name, width in min_widths.items():
+        tag = f'.{column_tag(prefix, name)}'
+        rules.append(f'{r} th{tag}, {r} td{tag} {{ min-width: {width}px; }}')
+    if pinned:
+        last = pinned[-1].name
+        for p in pinned:
+            tag = f'.{column_tag(prefix, p.name)}'
+            shadow = ('box-shadow: 1px 0 0 rgba(255,255,255,0.14), '
+                      '5px 0 6px -3px rgba(0,0,0,0.55); ' if p.name == last else '')
+            rules.append(
+                f'{r} th{tag}, {r} td{tag} {{ position: sticky !important; '
+                f'left: {p.left_px}px; width: {p.width_px}px; min-width: {p.width_px}px; '
+                f'max-width: none; {shadow}}}')
+            rules.append(f'{r} td{tag} {{ z-index: 2 !important; background-color: {PINNED_BODY_BG} '
+                         f'!important; }}')
+            rules.append(f'{r} th{tag} {{ z-index: 4 !important; background: {PINNED_HEAD_BG} '
+                         f'!important; }}')
+            rules.append(f'{r} tbody tr:hover td{tag} {{ background-image: '
+                         f'linear-gradient({PINNED_HOVER_TINT}, {PINNED_HOVER_TINT}); }}')
+    return phone_media('\n'.join('    ' + x for x in rules))
+
+
+def phone_grid_columns(desktop_columns: int) -> int:
+    """How many columns a ``ui.grid(columns=N)`` of metric tiles has on a phone.
+
+    Four and three tile grids go two-up (four tiles one per row is four screens to
+    read four numbers); a two-column grid is label/value text blocks and goes to one.
+    Pure.
+    """
+    if desktop_columns >= 3:
+        return 2
+    return 1
+
+
+def grid_phone_class(desktop_columns: int) -> str:
+    """The class that gives a ``ui.grid`` its phone column count. Pure."""
+    return f'lt-grid-{phone_grid_columns(desktop_columns)}'
+
+
+GRID_PHONE_CSS = phone_media('''
+    .nicegui-grid.lt-grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+        gap: 0.5rem !important; }
+    .nicegui-grid.lt-grid-1 { grid-template-columns: minmax(0, 1fr) !important; }
+    .nicegui-grid.lt-grid-2 > *, .nicegui-grid.lt-grid-1 > * { min-width: 0; }
+''')
+
+
+class CssOnce:
+    """Add a stylesheet once per browser client (page load), however many widgets ask.
+
+    The Stocks and Options tables each call for the same sheet when they render, and a
+    refresh re-renders them; without this every call appended another copy to the page.
+    Keyed on the client object (weakly), so a new page load gets its own.
+    """
+
+    def __init__(self) -> None:
+        self._seen: 'weakref.WeakKeyDictionary' = weakref.WeakKeyDictionary()
+
+    def add(self, client, key: str, css: str, add_css: Callable[[str], None]) -> bool:
+        """Call ``add_css(css)`` unless ``key`` was already added for ``client``.
+        Returns whether it was added. ``add_css`` is ``ui.add_css`` (injected so the
+        module stays free of NiceGUI)."""
+        keys = self._seen.setdefault(client, set())
+        if key in keys:
+            return False
+        keys.add(key)
+        add_css(css)
+        return True

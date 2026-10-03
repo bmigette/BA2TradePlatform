@@ -25,6 +25,59 @@ from ..components.account_scope import scope_transactions_to_account
 from ..utils.perf_logger import PerfLogger
 from ..utils.margin_view import capital_requirement, factors_by_account, value_capreq_text
 from ..components.refresh_button import refresh_button
+from ..utils.responsive import (
+    CssOnce, GENERIC_PHONE_CSS, GRID_PHONE_CSS, PIN_TAG_PREFIX, PRIMARY_ACTION_CLASS,
+    PinnedColumn, grid_phone_class, phone_media, scroll_table_phone_css, tag_quasar_columns,
+)
+
+#: The two plain ``ui.table``s of the option detail dialog scroll sideways on a phone with
+#: their first column (the leg / the contract) pinned, like the transactions table.
+OPTION_LEGS_TABLE_CLASS = 'lt-legs-table'
+OPTION_CHAIN_TABLE_CLASS = 'lt-chain-table'
+OPTION_LEGS_COLUMNS = ['Leg', 'Contract', 'Strike', 'Expiry', 'Qty × mult', 'Intent',
+                       'Status', 'Fill prem.']
+OPTION_CHAIN_COLUMNS = ['Contract', 'Bid', 'Ask', 'Mid', 'Last', 'IV', 'Delta', 'Gamma',
+                        'Theta', 'Vega', 'Note']
+OPTION_LEGS_PINNED = (PinnedColumn('Leg', 0, 96),)
+OPTION_CHAIN_PINNED = (PinnedColumn('Contract', 0, 150),)
+OPTION_LEGS_MIN_WIDTHS = {'Contract': 170, 'Strike': 84, 'Expiry': 104, 'Qty × mult': 96,
+                          'Intent': 130, 'Status': 90, 'Fill prem.': 120}
+OPTION_CHAIN_MIN_WIDTHS = {'Bid': 64, 'Ask': 64, 'Mid': 64, 'Last': 64, 'IV': 64,
+                           'Delta': 72, 'Gamma': 72, 'Theta': 72, 'Vega': 72, 'Note': 120}
+
+#: The page's phone sheet is added once per page load.
+CSS_ONCE = CssOnce()
+
+#: Class on the dialogs' action row: sticky at the bottom of the (scrolling) card on a phone.
+DIALOG_ACTIONS_CLASS = 'lt-dialog-actions'
+
+
+def live_trades_page_phone_css() -> str:
+    """Page-level phone CSS for Live Trades: reclaim the card padding the table needs,
+    grids, dialogs (full width, primary action first and sticky), the two plain tables.
+    Pure; desktop is untouched (everything is inside the phone media query)."""
+    chrome = phone_media(f'''
+    .lt-page-card.lt-page-card {{ padding: 0.25rem !important; }}
+    .lt-page-card .q-tab-panel {{ padding: 0 !important; }}
+    .lt-page-card .live-trades-table {{ max-width: 100%; }}
+    /* a focused input scrolls clear of the sticky action row (iOS keyboard) */
+    .q-dialog .q-card, .q-dialog__inner--minimized > div {{ scroll-padding-bottom: 4rem; }}
+    .{DIALOG_ACTIONS_CLASS} {{ position: sticky; bottom: 0; z-index: 5;
+        background: #252b3b; padding-top: 0.5rem; margin-top: 0.5rem;
+        box-shadow: 0 -6px 8px -6px rgba(0,0,0,0.6); }}
+''')
+    return '\n'.join((
+        GENERIC_PHONE_CSS, GRID_PHONE_CSS, chrome,
+        scroll_table_phone_css(OPTION_LEGS_TABLE_CLASS, PIN_TAG_PREFIX, OPTION_LEGS_PINNED,
+                               OPTION_LEGS_MIN_WIDTHS, max_height='none'),
+        scroll_table_phone_css(OPTION_CHAIN_TABLE_CLASS, PIN_TAG_PREFIX, OPTION_CHAIN_PINNED,
+                               OPTION_CHAIN_MIN_WIDTHS, max_height='none'),
+    ))
+
+
+def _plain_table_columns(names):
+    return tag_quasar_columns(
+        [{'name': c, 'label': c, 'field': c, 'align': 'left'} for c in names], PIN_TAG_PREFIX)
 
 #: The Live Trades tabs, IN ORDER. Stocks first and DEFAULT, so the page's existing view is
 #: what you get before touching anything.
@@ -118,7 +171,8 @@ class LiveTradesTab:
         expert_options, expert_map = self._get_expert_options()
         self.expert_id_map = expert_map
 
-        with ui.card().classes('w-full'):
+        CSS_ONCE.add(ui.context.client, 'live-trades-page', live_trades_page_phone_css(), ui.add_css)
+        with ui.card().classes('w-full lt-page-card'):
             with ui.row().classes('w-full items-center justify-between mb-4'):
                 ui.label('💼 Live Trades').classes('text-h6')
 
@@ -1109,17 +1163,17 @@ class LiveTradesTab:
                         f'⚠️ {" and ".join(locked)} locked — automation will not modify until reverted.'
                     ).classes('text-xs text-orange-600')
 
-                with ui.row().classes('w-full justify-between items-center gap-2'):
+                with ui.row().classes(f'w-full justify-between items-center gap-2 {DIALOG_ACTIONS_CLASS}'):
                     ui.button(
                         'Revert (re-enable automation)',
                         icon='restore',
                         on_click=lambda: self._revert_tpsl_manual_override(transaction_id, dialog),
                     ).props('flat color=warning')
-                    with ui.row().classes('gap-2'):
+                    with ui.row().classes('gap-2 w-full sm:w-auto'):
                         ui.button('Cancel', on_click=dialog.close).props('flat')
                         ui.button('Update', on_click=lambda: self._update_position(
                             transaction_id, qty_input.value, tp_input.value, sl_input.value, dialog
-                        )).props('color=primary')
+                        )).props('color=primary').classes(PRIMARY_ACTION_CLASS)
 
         dialog.open()
 
@@ -1460,7 +1514,7 @@ class LiveTradesTab:
 
             ui.label('⚠️ Use this if the close operation failed or got stuck.').classes('text-sm text-orange mb-4')
 
-            with ui.row().classes('w-full justify-end gap-2'):
+            with ui.row().classes(f'w-full justify-end gap-2 {DIALOG_ACTIONS_CLASS}'):
                 ui.button('Cancel', on_click=dialog.close).props('flat')
                 ui.button('Reset & Retry', on_click=lambda: self._retry_close_position(transaction_id, dialog)).props('color=warning')
 
@@ -1567,7 +1621,7 @@ class LiveTradesTab:
             ui.label(f'Are you sure you want to close this position?').classes('mb-2')
             ui.label(f'{txn.symbol}: {txn.quantity:+.2f} @ ${txn.open_price:.2f}').classes('text-sm font-bold mb-4')
 
-            with ui.row().classes('w-full justify-end gap-2'):
+            with ui.row().classes(f'w-full justify-end gap-2 {DIALOG_ACTIONS_CLASS}'):
                 ui.button('Cancel', on_click=dialog.close).props('flat')
                 ui.button('Close Position', on_click=lambda: self._close_position(transaction_id, dialog)).props('color=negative')
 
@@ -1697,7 +1751,7 @@ class LiveTradesTab:
                     ui.label(rec.symbol).classes('text-body1 font-bold')
 
             # Recommendation details
-            with ui.grid(columns=2).classes('w-full gap-4 mb-4'):
+            with ui.grid(columns=2).classes(grid_phone_class(2) + ' w-full gap-4 mb-4'):
                 # Trade recommendation
                 with ui.card():
                     ui.label('Recommendation').classes('text-caption text-grey-7')
@@ -1743,7 +1797,7 @@ class LiveTradesTab:
 
             # Metadata
             with ui.expansion('Metadata', icon='info').classes('w-full'):
-                with ui.grid(columns=2).classes('gap-2'):
+                with ui.grid(columns=2).classes(grid_phone_class(2) + ' gap-2'):
                     ui.label('Recommendation ID:').classes('text-caption font-bold')
                     ui.label(str(rec.id)).classes('text-caption')
 
@@ -1816,7 +1870,7 @@ class LiveTradesTab:
                 with ui.card().classes('w-full mb-4'):
                     ui.label('📊 Transaction Overview').classes('text-h6 mb-3')
                     
-                    with ui.grid(columns=4).classes('w-full gap-4 metric-grid'):
+                    with ui.grid(columns=4).classes(grid_phone_class(4) + ' w-full gap-4 metric-grid'):
                         # Symbol
                         with ui.card().classes('bg-primary/5'):
                             ui.label('Symbol').classes('text-caption text-grey-7')
@@ -1842,7 +1896,7 @@ class LiveTradesTab:
                             ui.badge(txn.status.value, color=status_color).classes('text-body1')
 
                     # Prices and P/L
-                    with ui.grid(columns=4).classes('w-full gap-4 mt-4'):
+                    with ui.grid(columns=4).classes(grid_phone_class(4) + ' w-full gap-4 mt-4'):
                         # Open Price
                         with ui.card().classes('bg-primary/5'):
                             ui.label('Open Price').classes('text-caption text-grey-7')
@@ -1868,7 +1922,7 @@ class LiveTradesTab:
                             ui.label(close_price_str).classes('text-body1')
 
                     # Dates
-                    with ui.grid(columns=3).classes('w-full gap-4 mt-4'):
+                    with ui.grid(columns=3).classes(grid_phone_class(3) + ' w-full gap-4 mt-4'):
                         # Created
                         with ui.card().classes('bg-primary/5'):
                             ui.label('Created').classes('text-caption text-grey-7')
@@ -1927,7 +1981,7 @@ class LiveTradesTab:
                             with ui.expansion(f'Order #{order.id} - {order.order_type.value if order.order_type else "N/A"} {order.side.value if order.side else "N/A"}', 
                                             icon='receipt').classes('w-full').props('dense'):
                                 
-                                with ui.grid(columns=3).classes('w-full gap-4 mt-2'):
+                                with ui.grid(columns=3).classes(grid_phone_class(3) + ' w-full gap-4 mt-2'):
                                     # Basic Info
                                     with ui.card():
                                         ui.label('Order ID').classes('text-caption text-grey-7')
@@ -2138,7 +2192,7 @@ class LiveTradesTab:
             ui.label(f'Screener ({len(criteria)})').classes('text-subtitle2 text-teal')
             ui.label('— the universe this expert selects from') \
                 .classes('text-caption text-grey-7')
-        with ui.grid(columns=2).classes('w-full gap-x-6 gap-y-1'):
+        with ui.grid(columns=2).classes(grid_phone_class(2) + ' w-full gap-x-6 gap-y-1'):
             for criterion in criteria:
                 with ui.row().classes('w-full items-baseline justify-between no-wrap gap-2'):
                     with ui.column().classes('gap-0 min-w-0'):
@@ -2195,7 +2249,7 @@ class LiveTradesTab:
                 if getattr(txn, 'option_strategy', None):
                     ui.badge(str(txn.option_strategy), color='indigo')
 
-            with ui.grid(columns=4).classes('w-full gap-4'):
+            with ui.grid(columns=4).classes(grid_phone_class(4) + ' w-full gap-4'):
                 with ui.card().classes('bg-primary/5'):
                     ui.label('Strategy').classes('text-caption text-grey-7')
                     ui.label(str(getattr(txn, 'option_strategy', None) or '—')).classes('text-body1 font-bold')
@@ -2230,7 +2284,7 @@ class LiveTradesTab:
             ).classes('text-xs text-secondary-custom mt-2')
 
             if option_orders:
-                columns = ['Leg', 'Contract', 'Strike', 'Expiry', 'Qty × mult', 'Intent', 'Status', 'Fill prem.']
+                columns = OPTION_LEGS_COLUMNS
                 rows = []
                 for order in option_orders:
                     rows.append({
@@ -2243,8 +2297,9 @@ class LiveTradesTab:
                         'Status': getattr(order.status, 'value', '') or '—',
                         'Fill prem.': '—' if order.open_price is None else f'${float(order.open_price):.2f}/share',
                     })
-                ui.table(columns=[{'name': c, 'label': c, 'field': c, 'align': 'left'} for c in columns],
-                         rows=rows, row_key='Contract').classes('w-full mt-3').props('dense flat')
+                ui.table(columns=_plain_table_columns(columns),
+                         rows=rows, row_key='Contract').classes(
+                    f'w-full mt-3 {OPTION_LEGS_TABLE_CLASS}').props('dense flat')
 
             # THE CHART (spec steps 9-10): cached-style daily candles for the underlying,
             # one dashed line per strike, both marker sets, and the expiration payoff drawn
@@ -2470,9 +2525,10 @@ class LiveTradesTab:
                     'Note': '',
                 })
 
-            columns = ['Contract', 'Bid', 'Ask', 'Mid', 'Last', 'IV', 'Delta', 'Gamma', 'Theta', 'Vega', 'Note']
-            ui.table(columns=[{'name': c, 'label': c, 'field': c, 'align': 'left'} for c in columns],
-                     rows=table_rows, row_key='Contract').classes('w-full').props('dense flat')
+            columns = OPTION_CHAIN_COLUMNS
+            ui.table(columns=_plain_table_columns(columns),
+                     rows=table_rows, row_key='Contract').classes(
+                f'w-full {OPTION_CHAIN_TABLE_CLASS}').props('dense flat')
             ui.label(
                 'Broker-sourced and current: greeks and IV describe the contract RIGHT NOW, '
                 'and are not part of any expiration payoff.'
@@ -2523,7 +2579,7 @@ class LiveTradesTab:
             ui.label(f'Are you sure you want to close {count} transaction{"s" if count != 1 else ""}?').classes('text-body1 mb-4')
             ui.label('This action cannot be undone.').classes('text-caption text-red-700 mb-4')
 
-            with ui.row().classes('w-full justify-end gap-2'):
+            with ui.row().classes(f'w-full justify-end gap-2 {DIALOG_ACTIONS_CLASS}'):
                 ui.button('Cancel', on_click=dialog.close).props('flat')
                 ui.button('Confirm Close', on_click=lambda: self._execute_batch_close(dialog)).props('color=negative')
 
@@ -2640,9 +2696,9 @@ class LiveTradesTab:
 
             ui.label('Example: 5.0% means TP = Open Price × 1.05').classes('text-caption text-grey-7')
 
-            with ui.row().classes('w-full justify-end gap-2 mt-4'):
+            with ui.row().classes(f'w-full justify-end gap-2 {DIALOG_ACTIONS_CLASS} mt-4'):
                 ui.button('Cancel', on_click=dialog.close).props('flat')
-                ui.button('Apply', on_click=lambda: self._execute_batch_adjust_tp(tp_percent_input.value, dialog)).props('color=info')
+                ui.button('Apply', on_click=lambda: self._execute_batch_adjust_tp(tp_percent_input.value, dialog)).props('color=info').classes(PRIMARY_ACTION_CLASS)
 
         dialog.open()
 
