@@ -192,13 +192,14 @@ class TestRefresh:
         fake.connect_failure = ConnectionRefusedError("x")
         assert account.refresh_orders() is False
 
-    def test_absent_old_row_with_complete_lists_and_no_execution_is_cancelled(self, world):
+    def test_absent_old_row_is_never_cancelled_on_absence_alone(self, world, ibkr_logs):
         account, fake, _ = world
         old = datetime.now(timezone.utc) - timedelta(hours=1)
         row = new_order(account, broker_order_id="999999991", status=OrderStatus.ACCEPTED,
                         created_at=old)
         account.refresh_orders()
-        assert fresh(row).status == OrderStatus.CANCELED
+        assert fresh(row).status == OrderStatus.ACCEPTED
+        assert "UNRESOLVED" in ibkr_logs.text()
 
     def test_absent_row_with_an_execution_is_filled_not_cancelled(self, world):
         account, fake, aapl = world
@@ -225,14 +226,14 @@ class TestRefresh:
         assert account.refresh_orders() is True
         assert fresh(row).status == OrderStatus.ACCEPTED
 
-    def test_a_row_older_than_the_execution_window_is_not_guessed_at(self, world, ibkr_logs):
+    def test_a_very_old_unlisted_row_is_not_guessed_at_either(self, world, ibkr_logs):
         account, fake, _ = world
         old = datetime.now(timezone.utc) - timedelta(days=30)
         row = new_order(account, broker_order_id="999999995", status=OrderStatus.ACCEPTED,
                         created_at=old)
         account.refresh_orders()
         assert fresh(row).status == OrderStatus.ACCEPTED
-        assert "cannot verify whether it filled" in ibkr_logs.text()
+        assert "UNRESOLVED" in ibkr_logs.text() and "Flex" in ibkr_logs.text()
 
     def test_get_orders_and_get_order(self, world):
         account, fake, _ = world
@@ -260,16 +261,16 @@ def oco_row(account, txn, qty=10.0, tp=120.0, sl=90.0, side=OrderDirection.SELL)
 
 
 class TestOCO:
-    def test_one_oca_group_two_orders_atomic_transmit(self, world):
+    def test_one_oca_group_two_orders_stop_first_both_transmitted(self, world):
         account, fake, _ = world
         txn = create_transaction(symbol="AAPL", status=TransactionStatus.OPENED)
         parent = oco_row(account, txn)
         out = submit(account, parent)
-        tp, sl = fake.placed[-2], fake.placed[-1]
-        assert (tp["orderType"], tp["lmt"], tp["transmit"]) == ("LMT", 120.0, False)
+        sl, tp = fake.placed[-2], fake.placed[-1]       # the protective stop exists BEFORE the take-profit
+        assert (tp["orderType"], tp["lmt"], tp["transmit"]) == ("LMT", 120.0, True)
         assert (sl["orderType"], sl["aux"], sl["transmit"]) == ("STP LMT", 90.0, True)
         assert sl["lmt"] == pytest.approx(89.55)             # 0.5 % through the stop (the shared cushion)
-        assert tp["oca"] == sl["oca"] == f"ba2-oca-{account.id}-{parent.id}"
+        assert tp["oca"] == sl["oca"] and tp["oca"].startswith(f"ba2-oca-{account.id}-{parent.id}-")
         assert tp["oca_type"] == sl["oca_type"] == 2
         assert tp["tif"] == sl["tif"] == "GTC" and tp["action"] == sl["action"] == "SELL"
         assert tp["ref"] == ref(account, parent) and sl["ref"] == ref(account, parent) + ":SL"
@@ -285,7 +286,7 @@ class TestOCO:
         account, fake, _ = world
         txn = create_transaction(symbol="AAPL", side=OrderDirection.SELL, status=TransactionStatus.OPENED)
         submit(account, oco_row(account, txn, tp=80.0, sl=110.0, side=OrderDirection.BUY))
-        assert fake.placed[-1]["lmt"] == pytest.approx(110.55)
+        assert fake.placed[-2]["lmt"] == pytest.approx(110.55)       # the stop leg is placed first
 
     def test_stop_leg_firing_cancels_the_take_profit_and_rows_follow(self, world):
         account, fake, _ = world

@@ -126,7 +126,9 @@ def _amount(row: Dict[str, str]) -> Optional[float]:
         amount = float(row.get("amount", ""))
     except ValueError:
         return None
-    currency = (row.get("currency") or "USD").upper()
+    currency = (row.get("currency") or "").upper()
+    if not currency:
+        return None          # no currency stated: the amount cannot be interpreted, never assumed USD
     if currency != "USD":
         try:
             amount *= float(row["fxRateToBase"])

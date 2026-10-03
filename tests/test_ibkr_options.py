@@ -16,6 +16,10 @@ from tests.ibkr_fakes import NAN
 from tests.ibkr_helpers import ibkr_logs, make_account  # noqa: F401
 from tests.test_ibkr_lifecycle import fresh, rows
 
+def ref_of(account, row):
+    return account._order_ref_for_row(get_instance(TradingOrder, row.id), account.id)
+
+
 TODAY = datetime.now(timezone.utc).date()
 
 
@@ -280,7 +284,7 @@ class TestOptionOrders:
         assert (p["sec_type"], p["orderType"], p["action"], p["qty"], p["tif"]) == (
             "OPT", "LMT", "BUY", 2.0, "DAY")
         assert p["lmt"] == pytest.approx(3.45)                        # 0.05 tick above $3
-        assert p["ref"] == f"ba2:{account.id}:{parent.id}" and p["account"] == "DU1234567"
+        assert p["ref"] == ref_of(account, parent) and p["account"] == "DU1234567"
         assert p["outsideRth"] is False
         f = fresh(parent)
         assert f.status == OrderStatus.ACCEPTED and f.broker_order_id.isdigit()
@@ -408,7 +412,7 @@ class TestOptionRefresh:
         seed_chain(fake)
         legs = [leg(OrderDirection.SELL, 150.0, "P"), leg(OrderDirection.BUY, 140.0, "P")]
         parent = account.submit_option_order(legs, 4, "limit", -1.2, option_strategy="bull_put_spread")
-        ref = f"ba2:{account.id}:{parent.id}"
+        ref = ref_of(account, parent)
         contracts = {c.contract.strike: c.contract for c in fake.details["AAPL"]
                      if c.contract.secType == "OPT" and c.contract.right == "P"
                      and c.contract.lastTradeDateOrContractMonth == ymd(EXP_NEAR)}
@@ -461,7 +465,7 @@ class TestOptionRefresh:
         seed_chain(fake)
         parent = account.submit_option_order([leg(OrderDirection.BUY, 150.0)], 2, "limit", 3.0,
                                              option_strategy="long_call")
-        fake.simulate_fill(f"ba2:{account.id}:{parent.id}", price=3.0)
+        fake.simulate_fill(ref_of(account, parent), price=3.0)
         account.refresh_orders()
         f = fresh(parent)
         assert f.status == OrderStatus.FILLED and f.filled_qty == 2 and f.open_price == 3.0
@@ -493,7 +497,7 @@ class TestSharedOptionGatesOnIBKR:
         seed_chain(fake)
         parent = account.submit_option_order([leg(OrderDirection.SELL, 150.0, "P")], 2, "limit", 2.0,
                                              option_strategy="short_put")
-        fake.simulate_fill(f"ba2:{account.id}:{parent.id}", price=2.0)
+        fake.simulate_fill(ref_of(account, parent), price=2.0)
         account.refresh_orders()
         exposure = account.short_put_assignment_exposure()
         assert exposure.is_measurable and exposure.cost == 150.0 * 100 * 2

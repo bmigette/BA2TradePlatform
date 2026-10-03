@@ -136,6 +136,15 @@ async def connect(ib: Any, args: argparse.Namespace, rep: Report) -> str:
             args.timeout + 5)
         rep.ok("reconnected WRITABLE (paper account confirmed) for the test order")
     ib.reqMarketDataType(2)
+    try:
+        first_id = ib.client.getReqId()
+        second_id = ib.client.getReqId()
+        rep_check_ids = f"two consecutive getReqId() calls: {first_id}, {second_id}"
+    except Exception as e:  # noqa: BLE001 -- informational
+        rep_check_ids = f"not readable ({type(e).__name__}: {e})"
+    rep.check("request/order ids after (re)connect: ib_async's counter vs TWS nextValidId (the adapter "
+              "clears its error history on every connect because ids can repeat across sessions)",
+              rep_check_ids)
     return account
 
 
@@ -164,6 +173,11 @@ async def account_section(ib: Any, account: str, rep: Report) -> None:
     snap = M.snapshot_from_account_values(primary, texts, None, None)
     rep.info(f"adapter would publish: buying_power={snap.buying_power}, equity={snap.equity}, "
              f"cash={snap.cash}, option_buying_power={snap.option_buying_power}")
+    comps = M.buying_power_components(primary, multiplier)
+    rep.check("Reg-T room: AvailableFunds x 2 vs SMA x 2 vs ExcessLiquidity x 2 (the adapter publishes the "
+              "MINIMUM; if SMA x 2 is the smaller one, AvailableFunds x 2 would have overstated the "
+              "overnight room)",
+              f"{comps} -> published {snap.buying_power}; SMA tag present={'SMA' in primary}")
 
 
 async def book_section(ib: Any, account: str, rep: Report) -> None:
@@ -182,12 +196,33 @@ async def book_section(ib: Any, account: str, rep: Report) -> None:
     for p in opt[:3]:
         rep.check("option avgCost is per CONTRACT (premium x multiplier); adapter divides by multiplier",
                   f"{p.contract.localSymbol}: avgCost={p.avgCost}, multiplier={p.contract.multiplier}")
+    completed = await ib.reqCompletedOrdersAsync(False)
+    times = [t.log[0].time for t in completed if t.log]
+    rep.check("how long completed orders survive (run again AFTER the Gateway's nightly restart and compare)",
+              f"{len(completed)} completed orders; oldest log time {min(times) if times else None}")
     trades = await ib.reqAllOpenOrdersAsync()
     rep.info(f"{len(trades)} open orders (all clients)")
     for t in trades[:10]:
         rep.line(f"    id={t.order.orderId} perm={t.orderStatus.permId} ref={t.order.orderRef!r} "
                  f"{t.order.action} {t.order.totalQuantity} {t.contract.symbol} "
                  f"{t.order.orderType} {t.orderStatus.status}")
+
+
+async def reconnect_positions_check(ib: Any, args: argparse.Namespace, account: str,
+                                    rep: Report) -> None:
+    """Positions right after a reconnect: the cache read straight away vs after an explicit request.
+    The adapter never trusts the cache alone (an empty cache after a timed-out sync reads as flat)."""
+    rep.section("Positions right after a reconnect")
+    ib.disconnect()
+    await asyncio.wait_for(
+        ib.connectAsync(args.host, args.port, clientId=args.client_id, timeout=args.timeout,
+                        readonly=not args.place_test_order, account=account, raiseSyncErrors=True),
+        args.timeout + 5)
+    immediately = len(ib.positions(account))
+    confirmed = len(await asyncio.wait_for(ib.reqPositionsAsync(), args.timeout))
+    rep.check("positions cache immediately after connectAsync(raiseSyncErrors=True) vs after reqPositions",
+              f"{immediately} vs {confirmed} (they must agree; the adapter always awaits reqPositions)")
+    ib.reqMarketDataType(2)
 
 
 async def equity_section(ib: Any, symbol: str, rep: Report, args: argparse.Namespace,
@@ -294,6 +329,31 @@ async def option_section(ib: Any, symbol: str, stock: Any, rep: Report) -> None:
               f"theta={_num(getattr(g, 'theta', None))} callOI={_num(stream.callOpenInterest)} "
               f"volume={_num(stream.volume)} marketDataType={stream.marketDataType}")
     ib.cancelMktData(pick)
+    await combo_whatif(ib, calls, spot, rep)
+
+
+async def combo_whatif(ib: Any, calls: List[Any], spot: float, rep: Report) -> None:
+    """A 2-leg combo what-if with a NEGATIVE limit (credit) and the per-leg structure it implies.
+    what-if is read-only: nothing is placed."""
+    from ib_async import ComboLeg, Contract, Order
+    if len(calls) < 2:
+        return
+    ordered = sorted(calls, key=lambda k: abs(k.strike - spot))
+    short_leg, long_leg = ordered[0], ordered[1]
+    bag = Contract(secType="BAG", symbol=short_leg.symbol, exchange="SMART", currency="USD",
+                   comboLegs=[ComboLeg(conId=short_leg.conId, ratio=1, action="SELL", exchange="SMART"),
+                              ComboLeg(conId=long_leg.conId, ratio=1, action="BUY", exchange="SMART")])
+    order = Order(action="BUY", totalQuantity=1, orderType="LMT", lmtPrice=-0.05, tif="DAY")
+    try:
+        state = await asyncio.wait_for(ib.whatIfOrderAsync(bag, order), 20)
+        rep.check("BAG order with a NEGATIVE limit (credit) is accepted (adapter: action BUY + signed price)",
+                  f"what-if ok: initMarginChange={_num(state.initMarginChange)} "
+                  f"warning={state.warningText!r}")
+    except Exception as e:  # noqa: BLE001 -- the answer is the point
+        rep.check("BAG order with a NEGATIVE limit (credit) is accepted", f"REFUSED: {type(e).__name__}: {e}")
+    rep.info("per-leg combo fill shape needs a real fill: after a paper fill of a combo run "
+             "--dump-executions and look for one execution per leg (secType OPT) with the combo's permId "
+             "(the adapter attributes leg prices by (permId, OCC))")
 
 
 async def executions_section(ib: Any, account: str, rep: Report) -> None:
@@ -362,6 +422,75 @@ async def place_test_order(ib: Any, account: str, symbol: str, details: Any, rep
     rep.check("cancel handshake PendingCancel -> Cancelled", f"final status={trade.orderStatus.status}")
     if trade.orderStatus.status == "Filled":
         rep.warn("the far-from-market order FILLED (price moved?); check and close the 1-share position")
+    await modify_check(ib, contract, account, last, args, rep)
+    await oca_check(ib, contract, account, last, args, rep)
+
+
+async def _wait_status(trade: Any, wanted: tuple, timeout: float) -> str:
+    deadline = time.monotonic() + timeout
+    while trade.orderStatus.status not in wanted and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    return str(trade.orderStatus.status)
+
+
+async def modify_check(ib: Any, contract: Any, account: str, last: float, args: argparse.Namespace,
+                       rep: Report) -> None:
+    """How IB confirms (and refuses) a modification. ib_async keeps the status unchanged, so the adapter
+    waits for a 'Modified' log entry; a refusal must arrive as an error."""
+    from ib_async import Order
+    far = max(round(last * 0.5, 2), 0.02)
+    order = Order(action="BUY", totalQuantity=1, orderType="LMT", lmtPrice=far, tif="DAY",
+                  orderRef=TEST_ORDER_REF + "-mod", account=account, transmit=True)
+    trade = ib.placeOrder(contract, order)
+    await _wait_status(trade, ("Submitted", "PreSubmitted"), args.timeout)
+    log_len = len(trade.log)
+    trade.order.lmtPrice = round(far + 0.05, 2)
+    ib.placeOrder(contract, trade.order)
+    await asyncio.sleep(min(args.timeout, 4.0))
+    entries = [(e.status, e.message, e.errorCode) for e in trade.log[log_len:]]
+    rep.check("a modification is acknowledged by a 'Modified' log entry while status stays the same",
+              f"status={trade.orderStatus.status} new log entries={entries}")
+    refused_at = len(trade.log)
+    trade.order.lmtPrice = 0.0
+    ib.placeOrder(contract, trade.order)
+    await asyncio.sleep(min(args.timeout, 4.0))
+    rep.check("a REFUSED modification (limit 0.0) arrives as an error/warning, not as 'Modified'",
+              f"status={trade.orderStatus.status} new log entries="
+              f"{[(e.status, e.message, e.errorCode) for e in trade.log[refused_at:]]}")
+    trade.order.lmtPrice = round(far + 0.05, 2)
+    ib.cancelOrder(trade.order)
+    await _wait_status(trade, ("Cancelled", "ApiCancelled", "Inactive"), args.timeout)
+
+
+async def oca_check(ib: Any, contract: Any, account: str, last: float, args: argparse.Namespace,
+                    rep: Report) -> None:
+    """Two BUY orders in one OCA group (ocaType 2), both transmit=True, stop first: statuses, and what
+    cancelling ONE leg does to the other. (Partial/full-fill reduction needs a real fill: not tested.)"""
+    from ib_async import Order
+    stop = round(last * 1.5, 2)
+    stop_lmt = round(stop * 1.005, 2)
+    tp = max(round(last * 0.5, 2), 0.02)
+    group = f"ba2-smoke-oca-{int(time.time())}"
+    sl_order = Order(action="BUY", totalQuantity=1, orderType="STP LMT", auxPrice=stop, lmtPrice=stop_lmt,
+                     tif="GTC", ocaGroup=group, ocaType=2, orderRef=TEST_ORDER_REF + "-sl",
+                     account=account, transmit=True)
+    tp_order = Order(action="BUY", totalQuantity=1, orderType="LMT", lmtPrice=tp, tif="GTC",
+                     ocaGroup=group, ocaType=2, orderRef=TEST_ORDER_REF + "-tp", account=account,
+                     transmit=True)
+    sl_trade = ib.placeOrder(contract, sl_order)
+    sl_status = await _wait_status(sl_trade, ("Submitted", "PreSubmitted", "Cancelled", "Inactive"), args.timeout)
+    tp_trade = ib.placeOrder(contract, tp_order)
+    tp_status = await _wait_status(tp_trade, ("Submitted", "PreSubmitted", "Cancelled", "Inactive"), args.timeout)
+    rep.check("OCA pair with BOTH legs transmit=True, stop first (transmit=False is only a parent/child "
+              "device): each leg goes live on its own",
+              f"stop status={sl_status}, take-profit status={tp_status}, ocaType=2")
+    ib.cancelOrder(tp_trade.order)
+    await _wait_status(tp_trade, ("Cancelled", "ApiCancelled"), args.timeout)
+    await asyncio.sleep(1.0)
+    rep.check("cancelling ONE OCA leg leaves the other working (the adapter cancels both explicitly)",
+              f"cancelled take-profit -> stop status={sl_trade.orderStatus.status}")
+    ib.cancelOrder(sl_trade.order)
+    await _wait_status(sl_trade, ("Cancelled", "ApiCancelled"), args.timeout)
 
 
 # ----------------------------------------------------------------------------- driver
@@ -378,6 +507,7 @@ async def run(args: argparse.Namespace, ib_factory: Callable[[], Any], rep: Repo
         stock = await equity_section(ib, args.symbol, rep, args, account)
         if args.option and stock is not None:
             await option_section(ib, args.symbol, stock, rep)
+        await reconnect_positions_check(ib, args, account, rep)
         if args.dump_executions:
             await executions_section(ib, account, rep)
         if args.flex_token and args.flex_query:
@@ -387,6 +517,13 @@ async def run(args: argparse.Namespace, ib_factory: Callable[[], Any], rep: Repo
         rep.section("Non-info errors/warnings IB sent during this run")
         for e in errors or ["none"]:
             rep.line(f"    {e}")
+        seen = sorted({int(e.split(" ")[0]) for e in errors if e.split(" ")[0].isdigit()
+                       and int(e.split(" ")[0]) in M.ORDER_WARNING_CODES})
+        rep.check("order WARNING codes seen (399 held until the open, 404 shares being located, 10349 TIF "
+                  "preset): ib_async sets status 'ValidationError' for them while the order stays LIVE. "
+                  "Pre-market, place a 1-share MARKET order from TWS and note whether these arrive; also "
+                  "note the Gateway's Configure > API > Precautions (order precautions) settings",
+                  seen or "none this run")
         rep.section("Summary: facts to confirm (copy this block back)")
         for fact in rep.facts:
             rep.line(f"  - {fact}")

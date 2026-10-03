@@ -37,6 +37,14 @@ from ba2_common.core.types import OrderType as CoreOrderType
 from ba2_common.logger import logger
 
 
+#: How far THROUGH its stop price an OCO stop leg's limit is placed (0.5 %). A DUPLICATE, on purpose,
+#: of ``AlpacaAccount.OCO_STOP_LIMIT_CUSHION`` (the constant ``TradeManager._force_close_breached_stops``
+#: reads): importing it from the Alpaca adapter would make the IBKR adapter depend on that SDK module,
+#: and editing AlpacaAccount is out of scope here. ``tests/test_ibkr_review_fixes.py`` pins the two
+#: values equal, so they cannot drift apart unnoticed.
+OCO_STOP_LIMIT_CUSHION = 0.005
+
+
 class ProtectiveLegsMixin:
     """``adjust_tp`` / ``adjust_sl`` / ``adjust_tp_sl`` and the exit-order rows behind them."""
 

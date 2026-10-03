@@ -203,7 +203,8 @@ class TestPrices:
         fake.set_quote(aapl, last=101.0, close=99.0)
         assert account._get_instrument_current_price_impl("AAPL", "bid") == 101.0
         fake.set_quote(aapl, close=99.0)
-        assert account._get_instrument_current_price_impl("AAPL", "bid") == 99.0
+        # yesterday's close is NOT a quote: nothing live means no price (review follow-up)
+        assert account._get_instrument_current_price_impl("AAPL", "bid") is None
 
     def test_nothing_published_is_none_never_a_default(self, world):
         account, fake, aapl, _ = world

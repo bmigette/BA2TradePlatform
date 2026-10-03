@@ -116,13 +116,20 @@ class TestSymbols:
 
 
 class TestOrderIds:
-    def test_order_ref_round_trip(self):
+    def test_order_ref_round_trip_with_nonce_and_suffix(self):
         assert M.make_order_ref(3, 41) == "ba2:3:41"
-        assert M.make_order_ref(3, 41, "SL") == "ba2:3:41:SL"
-        assert M.parse_order_ref("ba2:3:41") == (3, 41, None)
-        assert M.parse_order_ref("ba2:3:41:SL") == (3, 41, "SL")
+        assert M.make_order_ref(3, 41, nonce="0a1b2c3d") == "ba2:3:41:0a1b2c3d"
+        assert M.make_order_ref(3, 41, "SL", nonce="0a1b2c3d") == "ba2:3:41:0a1b2c3d:SL"
+        assert M.parse_order_ref("ba2:3:41:0a1b2c3d") == (3, 41, "0a1b2c3d", None)
+        assert M.parse_order_ref("ba2:3:41:0a1b2c3d:SL") == (3, 41, "0a1b2c3d", "SL")
+        assert M.parse_order_ref("ba2:3:41").nonce is None       # legacy: parsed, but never trusted
 
-    @pytest.mark.parametrize("junk", [None, "", "manual", "ba2:x:1", "ba2:1", "ba2:1:2:sl"])
+    def test_nonces_are_random_eight_hex_digits(self):
+        a, b = M.new_nonce(), M.new_nonce()
+        assert a != b and len(a) == 8 and int(a, 16) >= 0
+
+    @pytest.mark.parametrize("junk", [None, "", "manual", "ba2:x:1", "ba2:1", "ba2:1:2:sl",
+                                      "ba2:1:2:XYZ12345", "ba2:1:2:0a1b2c3d:sl"])
     def test_foreign_refs_are_not_ours(self, junk):
         assert M.parse_order_ref(junk) is None
 

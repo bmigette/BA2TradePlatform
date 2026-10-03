@@ -40,7 +40,7 @@ from ...core.db import get_instance, update_instance
 from ...core.models import TradingOrder
 from ...core.types import OptionRight, OrderDirection, OrderStatus
 from ...logger import logger
-from .ibkr_runtime import IBKRContractError, IBKROrderRejected, IBKRReadOnlyError
+from .ibkr_runtime import IBKRConnectionError, IBKRContractError, IBKROrderRejected, IBKRReadOnlyError
 
 
 class IBKROptionsMixin:
@@ -275,13 +275,20 @@ class IBKROptionsMixin:
     # ------------------------------------------------------------------ positions
     async def _option_positions_payload(self, ib: Any) -> List[Dict[str, Any]]:
         account = self._account_id
+        await self._confirm_positions(ib)
         held = [p for p in ib.positions(account)
                 if p.account == account and p.contract.secType == "OPT" and p.position]
         portfolio = {int(i.contract.conId): i for i in ib.portfolio(account)}
         out = []
         for pos in held:
             item = portfolio.get(int(pos.contract.conId))
-            multiplier = M.ib_number(pos.contract.multiplier) or float(M.STANDARD_OPTION_MULTIPLIER)
+            multiplier = M.ib_number(pos.contract.multiplier)
+            if multiplier is None or multiplier <= 0:
+                # no assumed 100: an option position whose deliverable IB did not state cannot be valued,
+                # and a book with an unvalued row is not a reliable book -> the whole fetch fails (None)
+                raise IBKRContractError(
+                    f"option position {pos.contract.localSymbol!r} has no usable multiplier "
+                    f"({pos.contract.multiplier!r}); refusing to assume one")
             out.append({
                 "occ": self._occ_of(pos.contract), "underlying": M.from_ib_symbol(pos.contract.symbol),
                 "right": str(pos.contract.right), "strike": float(pos.contract.strike),
@@ -329,6 +336,9 @@ class IBKROptionsMixin:
         return -magnitude if price < 0 else magnitude
 
     async def _place_option(self, ib: Any, spec: Dict[str, Any]) -> Dict[str, Any]:
+        adopted = await self._existing_order(ib, spec["order_ref"])
+        if adopted is not None:
+            return {"view": adopted, "limit": adopted.limit_price, "adopted": True}
         legs = spec["legs"]
         resolved = [await self._resolve_option(ib, leg["occ"], leg["underlying"]) for leg in legs]
         if len(legs) == 1:
@@ -353,8 +363,10 @@ class IBKROptionsMixin:
         else:
             order.orderType = "LMT"
             order.lmtPrice = self._signed_round(spec["limit"], rules)
+        seq = self._runtime().mark()
         trade = ib.placeOrder(contract, order)
-        view = await self._wait_ack(ib, trade, self._ORDER_ACK_TIMEOUT)
+        spec["progress"]["order_ids"].append(int(trade.order.orderId))
+        view = await self._wait_ack(ib, trade, self._ORDER_ACK_TIMEOUT, seq)
         return {"view": view, "limit": order.lmtPrice if spec["ib_type"] == "LMT" else None}
 
     def _submit_option_order_impl(self, trading_order: TradingOrder, legs: List[OptionLeg],
@@ -380,6 +392,10 @@ class IBKROptionsMixin:
         if len(legs) == 1 and not is_market and float(trading_order.limit_price) <= 0:
             raise ValueError(f"a single-leg option limit must be a positive premium, got "
                              f"{trading_order.limit_price!r}")
+        nonce = self._ensure_nonce(trading_order.id)
+        # the caller's object is stale (it predates the nonce); later update_instance calls on it
+        # must not wipe the nonce out of the row
+        trading_order.data = {**(trading_order.data or {}), "ibkr_nonce": nonce}
         spec = {
             "legs": [{"occ": leg.contract_symbol,
                       "underlying": leg.underlying,
@@ -388,11 +404,24 @@ class IBKROptionsMixin:
             "underlying": legs[0].underlying or trading_order.underlying_symbol or trading_order.symbol,
             "quantity": int(quantity), "ib_type": "MKT" if is_market else "LMT",
             "limit": None if is_market else float(trading_order.limit_price),
-            "order_ref": M.make_order_ref(self.id, trading_order.id),
+            "order_ref": M.make_order_ref(self.id, trading_order.id, nonce=nonce),
+            "progress": {"order_ids": []},
         }
-        placed = self._call(lambda ib: self._place_option(ib, spec),
-                            op=f"place option order {trading_order.id}",
-                            timeout=self._ORDER_ACK_TIMEOUT + self._READ_TIMEOUT * (1 + len(legs)))
+        try:
+            placed = self._call(lambda ib: self._place_option(ib, spec),
+                                op=f"place option order {trading_order.id}",
+                                timeout=self._submit_budget(1) + self._READ_TIMEOUT * len(legs))
+        except (TimeoutError, IBKRConnectionError) as e:
+            if spec["progress"]["order_ids"]:
+                # placed, but unconfirmed: the order may be live. Record the id and RETURN (never
+                # raise): submit_option_order would otherwise unwind it to ERROR.
+                trading_order = self._record_unconfirmed_placement(
+                    trading_order.id, spec["progress"], "day", None, e)
+                for child in (leg_orders or []):
+                    child.status = OrderStatus.PENDING_NEW
+                    update_instance(child)
+                return trading_order
+            raise
         view = placed["view"]
         # The broker id FIRST: from here on the contracts may exist at IBKR whatever else fails.
         trading_order.broker_order_id = view.broker_order_id

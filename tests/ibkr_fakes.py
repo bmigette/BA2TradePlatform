@@ -61,11 +61,21 @@ def default_account_rows(account: str) -> List[AccountValue]:
             for tag, value in values.items()]
 
 
+class _FakeClient:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def getReqId(self) -> int:
+        self.owner._next_req = getattr(self.owner, '_next_req', 1) + 1
+        return self.owner._next_req
+
+
 class FakeIB:
     """See the module docstring."""
 
     def __init__(self, account: str = "DU1234567", managed: Optional[List[str]] = None) -> None:
         self.errorEvent = FakeEvent()
+        self.client = _FakeClient(self)
         self.disconnectedEvent = FakeEvent()
         self.account = account
         self.managed = managed if managed is not None else [account]
@@ -76,6 +86,15 @@ class FakeIB:
         self.connect_calls: List[Dict[str, Any]] = []
         self.connect_failure: Optional[BaseException] = None
         self.client_id_in_use = False
+        self.connect_kwargs: Dict[str, Any] = {}
+        #: a startup positions sync that times out: without raiseSyncErrors ib_async connects with NO positions
+        self.positions_sync_fails = False
+        #: after a RECONNECT the order-id counter restarts here (real TWS/ib_async reuse low ids)
+        self.reset_ids_on_connect: Optional[int] = None
+        self.positions_confirmed = False
+        self.positions_sync_ok_on_request = False
+        #: how a modification is answered: 'confirm' (log 'Modified'), 'silent', or ('reject', code, text)
+        self.modify_behavior: Any = 'confirm'
         self.market_data_type: Optional[int] = None
         # account data
         self.account_rows: List[AccountValue] = default_account_rows(account)
@@ -145,8 +164,14 @@ class FakeIB:
         self.connect_calls.append({"host": host, "port": port, "clientId": clientId,
                                    "readonly": readonly, "account": account})
         self._note("connectAsync")
+        self.connect_kwargs = dict(kwargs)
         if self.connect_failure is not None:
             raise self.connect_failure
+        if self.positions_sync_fails and kwargs.get("raiseSyncErrors"):
+            # what ib_async does when a startup request times out and raiseSyncErrors is set
+            raise ConnectionError(["positions request timed out"])
+        if self.reset_ids_on_connect is not None and self.connect_calls[1:]:
+            self._next_order_id = self.reset_ids_on_connect
         if self.client_id_in_use:
             self.errorEvent.emit(-1, 326, "Unable to connect as the client id is already in use. "
                                           "Retry with a unique client id.", None)
@@ -212,7 +237,16 @@ class FakeIB:
         self._note("positions")
         if "positions" in self.fail_calls:
             raise self.fail_calls["positions"]
+        if self.positions_sync_fails and not self.positions_confirmed:
+            return []                       # the dangerous shape: nothing synced, looks flat
         return [p for p in self._positions if not account or p.account == account]
+
+    async def reqPositionsAsync(self) -> List[Position]:
+        await self._maybe_fail("reqPositionsAsync")
+        if self.positions_sync_fails and not self.positions_sync_ok_on_request:
+            raise TimeoutError("positions request timed out")
+        self.positions_confirmed = True
+        return list(self._positions)
 
     def portfolio(self, account: str = "") -> List[PortfolioItem]:
         self._note("portfolio")
@@ -401,7 +435,13 @@ class FakeIB:
         if self._find(order.orderId) is not None and order.orderId:
             trade = self._find(order.orderId)
             self.placed.append(self._snapshot(contract, order, modification=True))
-            self._log(trade, trade.orderStatus.status, "modified")
+            mb = self.modify_behavior
+            self._log(trade, trade.orderStatus.status, "Modify")    # ib_async logs this itself
+            if mb == "confirm":
+                # ib_async appends 'Modified' when IB echoes the changed order; it does NOT change status
+                self._log(trade, trade.orderStatus.status, "Modified")
+            elif isinstance(mb, tuple) and mb[0] == "reject":
+                self.errorEvent.emit(order.orderId, mb[1], mb[2], contract)
             return trade
         order.orderId = self._next_order_id
         self._next_order_id += 1
@@ -413,16 +453,10 @@ class FakeIB:
         self.placed.append(self._snapshot(contract, order, modification=False))
         behavior = self.behaviors.pop(0) if self.behaviors else self.default_behavior
         trade._behavior = behavior  # type: ignore[attr-defined]
-        if order.transmit:
-            self._release(trade)
-            for other in self._trades:
-                if (other is not trade and other.orderStatus.status == "PendingSubmit"
-                        and getattr(other, "_untransmitted", False)
-                        and other.order.ocaGroup == order.ocaGroup and order.ocaGroup):
-                    other._untransmitted = False  # type: ignore[attr-defined]
-                    self._release(other)
-        else:
-            trade._untransmitted = True  # type: ignore[attr-defined]
+        # NOTE: ``transmit`` is NOT modelled. TWS's transmit=False holds an order only for the
+        # parent/child (bracket) relation; an OCA group has no such semantics, so an untransmitted
+        # OCA order is NOT held back (design review 2026-10-03, item 5).
+        self._release(trade)
         return trade
 
     @staticmethod
@@ -446,6 +480,16 @@ class FakeIB:
         order, status = trade.order, trade.orderStatus
         if behavior == "silent":
             return
+        if behavior == "warn399":
+            # ib_async's wrapper sets status 'ValidationError' on a WARNING code while the order lives on
+            self.errorEvent.emit(order.orderId, 399, "Order Message: Warning: your order will not be "
+                                 "placed at the exchange until the next session open", trade.contract)
+            status.status = "ValidationError"
+            (self.loop or asyncio.get_event_loop()).call_later(0.25, self._accept_late, trade)
+            return
+        if behavior == "slow":
+            (self.loop or asyncio.get_event_loop()).call_later(0.5, self._accept_late, trade)
+            return
         if isinstance(behavior, tuple) and behavior[0] == "reject":
             _, code, text = behavior
             self.errorEvent.emit(order.orderId, code, text, trade.contract)
@@ -461,6 +505,10 @@ class FakeIB:
             price = behavior[1] if isinstance(behavior, tuple) else (order.lmtPrice if order.lmtPrice
                                                                      < 1e300 else 100.0)
             self._fill(trade, order.totalQuantity, price)
+
+    def _accept_late(self, trade: Trade) -> None:
+        trade._behavior = "accept"  # type: ignore[attr-defined]
+        self._resolve(trade)
 
     def _fill(self, trade: Trade, qty: float, price: float) -> None:
         status, order = trade.orderStatus, trade.order
@@ -500,10 +548,6 @@ class FakeIB:
             self.errorEvent.emit(order.orderId, 10148,
                                  f"OrderId {order.orderId} that needs to be cancelled cannot be "
                                  f"cancelled, state: {trade.orderStatus.status}.", None)
-            return trade
-        if getattr(trade, "_untransmitted", False):
-            trade.orderStatus.status = "Cancelled"
-            self._log(trade, "Cancelled", "never transmitted")
             return trade
         trade.orderStatus.status = "PendingCancel"
         self._log(trade, "PendingCancel")

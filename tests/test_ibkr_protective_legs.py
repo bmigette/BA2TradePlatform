@@ -76,7 +76,7 @@ class TestTemplateFlow:
         assert entry.status == OrderStatus.FILLED
         trigger_exit(account, fake)
         placed = fake.placed[-2:]
-        assert [p["orderType"] for p in placed] == ["LMT", "STP LMT"]
+        assert [p["orderType"] for p in placed] == ["STP LMT", "LMT"]      # stop first
         assert placed[0]["qty"] == 10.0 and placed[0]["action"] == "SELL"
         live = [e for e in exits(account, entry) if e.status != OrderStatus.CANCELED]
         assert [(e.order_type, e.status) for e in live] == [(OrderType.OCO, OrderStatus.ACCEPTED)]

@@ -24,9 +24,10 @@ from __future__ import annotations
 
 import math
 import re
+import secrets
 from datetime import date
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 from ba2_common.core.account_types import AccountSnapshot
 from ba2_common.core.types import BrokerOrderErrorReason, OptionRight, OrderStatus
@@ -107,7 +108,10 @@ _STATUS_TABLE: Dict[str, OrderStatus] = {
     # user deactivated). Terminal for our purposes; refresh_orders can still revive the row if
     # IB later reports it working, because a refresh applies whatever IB currently says.
     "Inactive": OrderStatus.REJECTED,
-    "ValidationError": OrderStatus.REJECTED,
+    # ValidationError: ib_async sets it when IB sends a WARNING (399 "held until the open", 404 "held
+    # while shares are located", 10349, 2100-2199...) while the order stays LIVE and goes on to
+    # PreSubmitted/Submitted. It is "working with a warning", never a rejection (review item 1).
+    "ValidationError": OrderStatus.PENDING_NEW,
 }
 
 IB_STATUS_STRINGS = frozenset(_STATUS_TABLE)
@@ -117,7 +121,7 @@ IB_FINAL_STATUSES = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"
 
 #: IB statuses that count as the broker having ACKNOWLEDGED a submission (accepted or done).
 IB_ACK_STATUSES = frozenset({"PreSubmitted", "Submitted", "Filled", "Cancelled", "ApiCancelled",
-                             "Inactive", "ValidationError", "ApiUpdate"})
+                             "Inactive", "ApiUpdate"})
 
 
 def map_ib_status(status: Optional[str], filled: Optional[float] = None,
@@ -152,7 +156,11 @@ def map_ib_status(status: Optional[str], filled: Optional[float] = None,
 # ---------------------------------------------------------------------------
 
 #: Codes that are connection-farm chatter / warnings attached to an order. Never an order failure.
-INFO_CODES = frozenset(set(range(2100, 2111)) | {2119, 2137, 2150, 2157, 2158, 399})
+INFO_CODES = frozenset(set(range(2100, 2111)) | {2119, 2137, 2150, 2157, 2158})
+
+#: Warnings attached to an ORDER that stays live (held until the open, shares being located, TIF
+#: adjusted by preset). They are logged and never fail the order.
+ORDER_WARNING_CODES = frozenset({399, 404, 10349})
 
 #: Connectivity state changes.
 CONNECTION_LOST_CODES = frozenset({1100, 504, 502, 1300})
@@ -172,13 +180,15 @@ ORDER_STATE_CODES = frozenset({103, 104, 105, 135, 136, 161, 10147, 10148})
 
 
 def error_severity(code: int) -> str:
-    """``"info" | "connection_lost" | "connection_restored" | "market_data" | "cancelled" | "order"``.
+    """``"info" | "order_warning" | "connection_lost" | "connection_restored" | "market_data" | "cancelled" | "order"``.
 
     ``"order"`` is the bucket that fails an order when its ``reqId`` is an order id; everything
     else is handled by the connection or data paths.
     """
     if code in INFO_CODES:
         return "info"
+    if code in ORDER_WARNING_CODES:
+        return "order_warning"
     if code in CONNECTION_LOST_CODES:
         return "connection_lost"
     if code in CONNECTION_RESTORED_CODES:
@@ -296,21 +306,38 @@ def ib_right(right: OptionRight) -> str:
 # Order ids
 # ---------------------------------------------------------------------------
 
-_ORDER_REF_RE = re.compile(r"^ba2:(?P<account>\d+):(?P<order>\d+)(?::(?P<suffix>[A-Z]+))?$")
+class OrderRef(NamedTuple):
+    account: int
+    order: int
+    nonce: Optional[str]
+    suffix: Optional[str]
 
 
-def make_order_ref(account_id: int, order_id: int, suffix: Optional[str] = None) -> str:
-    """Our correlation key on every IB order (the ``client_order_id`` analogue)."""
+_ORDER_REF_RE = re.compile(r"^ba2:(?P<account>\d+):(?P<order>\d+)(?::(?P<nonce>[0-9a-f]{8}))?"
+                           r"(?::(?P<suffix>[A-Z]+))?$")
+
+
+def new_nonce() -> str:
+    """A per-row random token. ``tradingorder`` ids are recycled by SQLite and repeat across
+    instances, so the id alone must never identify an IB order or execution (review item 7)."""
+    return secrets.token_hex(4)
+
+
+def make_order_ref(account_id: int, order_id: int, suffix: Optional[str] = None,
+                   nonce: Optional[str] = None) -> str:
+    """Our correlation key on every IB order: ``ba2:<account def>:<order id>:<nonce>[:SL]``."""
     ref = f"ba2:{int(account_id)}:{int(order_id)}"
+    if nonce:
+        ref += f":{nonce}"
     return f"{ref}:{suffix}" if suffix else ref
 
 
-def parse_order_ref(ref: Optional[str]) -> Optional[Tuple[int, int, Optional[str]]]:
-    """``(account_id, trading_order_id, suffix)`` or ``None`` for a ref that is not ours."""
+def parse_order_ref(ref: Optional[str]) -> Optional[OrderRef]:
+    """``OrderRef(account, order, nonce, suffix)`` or ``None`` for a ref that is not ours."""
     match = _ORDER_REF_RE.match(ref or "")
     if not match:
         return None
-    return int(match["account"]), int(match["order"]), match["suffix"]
+    return OrderRef(int(match["account"]), int(match["order"]), match["nonce"], match["suffix"])
 
 
 def format_broker_order_id(perm_id: Optional[int], order_id: Optional[int]) -> str:
@@ -467,14 +494,46 @@ def margin_multiplier_from(numbers: Dict[str, float]) -> float:
     return REGT_MARGIN_MULTIPLIER if power / funds >= MARGIN_DETECTION_RATIO else 1.0
 
 
+def buying_power_components(numbers: Dict[str, float], multiplier: float) -> Dict[str, float]:
+    """The candidate Reg-T room figures, each in buying-power dollars (``x multiplier``).
+
+    ``AvailableFunds x m`` can exceed the true overnight Reg-T room, so it is never used alone:
+    ``SMA x m`` (the Reg-T special memorandum account, present on margin accounts) and
+    ``ExcessLiquidity x m`` (the liquidation cushion) bound it from below. Only tags IBKR published
+    appear in the result.
+    """
+    parts: Dict[str, float] = {}
+    if numbers.get("AvailableFunds") is not None:
+        parts["available_funds_x_mult"] = numbers["AvailableFunds"] * multiplier
+    if numbers.get("SMA") is not None:
+        parts["sma_x_mult"] = numbers["SMA"] * multiplier
+    if numbers.get("ExcessLiquidity") is not None:
+        parts["excess_liquidity_x_mult"] = numbers["ExcessLiquidity"] * multiplier
+    return parts
+
+
+def conservative_buying_power(numbers: Dict[str, float], multiplier: float) -> Optional[float]:
+    """``min(AvailableFunds x m, SMA x m [if published], ExcessLiquidity x m)``.
+
+    ``None`` (never a default) when ``AvailableFunds`` is missing, or when leverage is applied
+    (m > 1) and ``ExcessLiquidity`` is missing: the bound cannot be checked, so no figure is given.
+    """
+    parts = buying_power_components(numbers, multiplier)
+    if "available_funds_x_mult" not in parts:
+        return None
+    if multiplier > 1.0 and "excess_liquidity_x_mult" not in parts:
+        return None
+    return min(parts.values())
+
+
 def snapshot_from_account_values(numbers: Dict[str, float], texts: Dict[str, str],
                                  long_market_value: Optional[float],
                                  short_market_value: Optional[float]) -> AccountSnapshot:
     """The platform's broker-agnostic snapshot from IBKR tags. See design doc section 5.
 
-    Nothing is defaulted: a missing tag is ``None``. ``buying_power`` is ``AvailableFunds`` times
-    the Reg-T multiplier (never IB's own 4x ``BuyingPower``, kept in ``raw``). Short market value is
-    forced negative (the AccountSnapshot convention).
+    Nothing is defaulted: a missing tag is ``None``. ``buying_power`` is the conservative minimum of
+    ``AvailableFunds``, ``SMA`` and ``ExcessLiquidity``, each times the Reg-T multiplier (never IB's
+    own 4x ``BuyingPower``, kept in ``raw``). Short market value is forced negative.
     """
     multiplier = margin_multiplier_from(numbers)
     funds = numbers.get("AvailableFunds")
@@ -486,7 +545,7 @@ def snapshot_from_account_values(numbers: Dict[str, float], texts: Dict[str, str
         cash=numbers.get("TotalCashValue"),
         equity=net_liq,
         net_liquidation=net_liq,
-        buying_power=(funds * multiplier) if funds is not None else None,
+        buying_power=conservative_buying_power(numbers, multiplier),
         non_marginable_buying_power=numbers.get("SettledCash"),
         option_buying_power=funds,
         margin_multiplier=multiplier if funds is not None else None,
@@ -497,6 +556,8 @@ def snapshot_from_account_values(numbers: Dict[str, float], texts: Dict[str, str
         supports_fractional=False,
         raw={"ib_buying_power": numbers.get("BuyingPower"),
              "available_funds": funds,
+             "sma": numbers.get("SMA"),
+             "bp_components": buying_power_components(numbers, multiplier),
              "excess_liquidity": numbers.get("ExcessLiquidity"),
              "init_margin_req": numbers.get("InitMarginReq"),
              "maint_margin_req": numbers.get("MaintMarginReq"),

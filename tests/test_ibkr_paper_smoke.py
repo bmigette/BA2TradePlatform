@@ -43,7 +43,7 @@ class TestReadOnlyByDefault:
         code, out = run(["--timeout", "2"], fake)
         assert code == 0, out
         assert fake.placed == [] and fake.cancel_requests == []
-        assert [c["readonly"] for c in fake.connect_calls] == [True]
+        assert [c["readonly"] for c in fake.connect_calls] == [True, True]   # + the reconnect check, still read-only
         assert "connected to 127.0.0.1:4002 (IB Gateway paper)" in out
         assert "[CHECK] paper accounts start with 'DU': DU1234567 -> paper" in out
         assert "BuyingPower / AvailableFunds" in out and "4.00" in out
@@ -52,6 +52,11 @@ class TestReadOnlyByDefault:
         assert "shortableShares" in out and "easy_to_borrow=True" in out
         assert "whatIfOrder" in out and "initMarginChange=5000.0" in out
         assert "Summary: facts to confirm" in out and "(nothing was placed)" in out
+        assert "Reg-T room: AvailableFunds x 2 vs SMA x 2" in out
+        assert "positions cache immediately after connectAsync" in out
+        assert "how long completed orders survive" in out
+        assert "request/order ids after (re)connect" in out
+        assert "order WARNING codes seen" in out
 
     def test_delayed_data_is_flagged(self):
         fake, aapl = make_fake()
@@ -69,6 +74,7 @@ class TestReadOnlyByDefault:
         assert code == 0, out
         assert "localSymbol with spaces removed IS the OCC symbol" in out and "equal=True" in out
         assert "3 contracts for expiry" in out and "callOI=900.0" in out
+        assert "BAG order with a NEGATIVE limit" in out and "per-leg combo fill shape" in out
         assert fake.placed == []
 
     def test_dump_executions_flags_orders_without_an_order_id(self):
@@ -120,20 +126,27 @@ class TestRefusals:
 
 
 class TestTestOrder:
-    def test_places_exactly_one_far_limit_then_cancels_it(self):
+    def test_places_far_orders_only_cancels_everything_and_checks_modify_and_oca(self):
         fake, _ = make_fake()
         code, out = run(["--place-test-order", "--timeout", "3"], fake)
         assert code == 0, out
-        assert [c["readonly"] for c in fake.connect_calls] == [True, False]   # writable only after DU confirmed
+        assert [c["readonly"] for c in fake.connect_calls][:2] == [True, False]   # writable only after DU confirmed
         placed = [p for p in fake.placed if not p["modification"]]
-        assert len(placed) == 1
-        p = placed[0]
-        assert (p["orderType"], p["action"], p["qty"], p["tif"]) == ("LMT", "BUY", 1.0, "DAY")
-        assert p["lmt"] == pytest.approx(100.0)                   # half of the 200 last: cannot fill
-        assert p["ref"] == "ba2-smoke-test" and p["account"] == "DU1234567"
-        assert fake.cancel_requests == [p["orderId"]]
+        first = placed[0]
+        assert (first["orderType"], first["action"], first["qty"], first["tif"]) == ("LMT", "BUY", 1.0, "DAY")
+        assert first["lmt"] == pytest.approx(100.0)               # half of the 200 last: cannot fill
+        assert first["ref"] == "ba2-smoke-test" and first["account"] == "DU1234567"
+        assert all(p["qty"] == 1.0 for p in placed)
+        # the OCA pair: stop first, both transmitted, ocaType 2
+        oca = [p for p in placed if p["oca"]]
+        assert [p["orderType"] for p in oca] == ["STP LMT", "LMT"]
+        assert all(p["transmit"] is True and p["oca_type"] == 2 for p in oca)
+        # every order the script placed ended Cancelled
+        assert {t.orderStatus.status for t in fake.trades()} == {"Cancelled"}
         assert "final status=Cancelled" in out
-        assert fake.trades()[0].orderStatus.status == "Cancelled"
+        assert "a modification is acknowledged by a 'Modified' log entry" in out
+        assert "a REFUSED modification" in out
+        assert "cancelling ONE OCA leg leaves the other working" in out
 
     def test_no_price_means_no_order(self):
         fake, aapl = make_fake()

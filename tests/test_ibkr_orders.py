@@ -39,7 +39,8 @@ def submit(account, row, **kw):
 
 
 def ref(account, row):
-    return make_order_ref(account.id, row.id)
+    """The orderRef the adapter put on this row's IB order (it carries the row's nonce)."""
+    return account._order_ref_for_row(get_instance(TradingOrder, row.id), account.id)
 
 
 def last_placed(fake):
@@ -54,7 +55,8 @@ class TestPlacement:
         out = submit(account, row)
         p = last_placed(fake)
         assert (p["orderType"], p["action"], p["qty"], p["tif"]) == ("MKT", "BUY", 10.0, "DAY")
-        assert p["ref"] == f"ba2:{account.id}:{row.id}" and p["account"] == ACCOUNT_ID
+        assert p["ref"] == ref(account, row) and p["account"] == ACCOUNT_ID
+        assert p["ref"].startswith(f"ba2:{account.id}:{row.id}:")
         assert p["outsideRth"] is False and p["transmit"] is True
         assert out.status == OrderStatus.ACCEPTED
         assert out.broker_order_id.isdigit() and int(out.broker_order_id) >= 1_000_000_000
@@ -188,16 +190,17 @@ class TestRejectsAndAcks:
         assert fresh.broker_order_id == "1234567890" and fresh.status == OrderStatus.ACCEPTED
         assert len(fake.placed) == 1
 
-    def test_read_only_account_refuses_and_says_unauthorized(self, monkeypatch):
+    def test_read_only_account_refuses_loudly_before_anything_is_written(self, monkeypatch):
+        from ba2_trade_platform.modules.accounts.ibkr_runtime import IBKRReadOnlyError
         account, fake = make_account(monkeypatch, read_only=True)
         fake.add_stock("AAPL", 1)
         try:
             row = new_order(account)
-            assert submit(account, row) is None
-            fresh = get_instance(TradingOrder, row.id)
-            assert fresh.status == OrderStatus.ERROR and "[unauthorized]" in fresh.comment
-            assert "read-only" in fresh.comment and fake.placed == []
-            assert fake.connect_calls[-1]["readonly"] is True if fake.connect_calls else True
+            with pytest.raises(IBKRReadOnlyError, match="read-only"):
+                submit(account, row)
+            assert get_instance(TradingOrder, row.id).status == OrderStatus.PENDING
+            assert fake.placed == []
+            assert account.supports_trading is False      # TradeManager refuses to route to it
         finally:
             account.close()
 

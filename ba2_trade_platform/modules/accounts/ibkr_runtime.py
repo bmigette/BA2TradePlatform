@@ -26,7 +26,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from concurrent.futures import TimeoutError as FutureTimeoutError
+from concurrent.futures import CancelledError, TimeoutError as FutureTimeoutError
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from ba2_common.core.ibkr_mapping import (
@@ -102,8 +102,15 @@ class IBKRRuntime:
         self._last_failure_at: Optional[float] = None
         self._last_failure: Optional[str] = None
         self._connect_lock: Optional[asyncio.Lock] = None
-        #: reqId -> [(code, message)] for errors with a request id (orders use their orderId).
-        self.errors_by_req: Dict[int, List[Tuple[int, str]]] = {}
+        #: Errors with a request id (orders use their orderId), in ARRIVAL order with a monotonic
+        #: sequence number: [(seq, reqId, code, message)]. ib_async reuses request/order ids after a
+        #: reconnect, so an error is only ever read together with the sequence mark taken just before
+        #: the request it belongs to (``mark()`` / ``order_errors(..., after_seq=)``), and the list is
+        #: cleared on every (re)connect.
+        self._errors: Deque[Tuple[int, int, int, str]] = deque(maxlen=5000)
+        self._err_seq = 0
+        self.closed = False
+        self._pending: set = set()
         #: Connection-level errors (reqId -1) seen recently; read to explain a failed connect.
         self.recent_global_errors: Deque[Tuple[int, str]] = deque(maxlen=50)
 
@@ -139,13 +146,23 @@ class IBKRRuntime:
                 f"[{self.label}] IBKR facade call '{op}' made from the IB loop thread; it would "
                 f"wait on the loop it runs on and deadlock")
         self._warn_if_on_a_running_loop(op)
+        if self.closed:
+            raise IBKRConnectionError(f"[{self.label}] the IBKR runtime was closed (settings changed or "
+                                      f"shutdown); retry on the current one")
         budget = float(timeout) + (0.0 if self.is_connected() else self.connect_timeout + 5.0)
         future = asyncio.run_coroutine_threadsafe(self._run(fn, op), self._loop)
+        self._pending.add(future)
         try:
             return future.result(timeout=budget)
         except FutureTimeoutError:
             future.cancel()
             raise TimeoutError(f"[{self.label}] IBKR call '{op}' timed out after {budget:.0f}s") from None
+        except CancelledError:
+            raise IBKRConnectionError(
+                f"[{self.label}] IBKR call '{op}' was cancelled: the runtime was closed (settings "
+                f"changed or shutdown)") from None
+        finally:
+            self._pending.discard(future)
 
     def _warn_if_on_a_running_loop(self, op: str) -> None:
         try:
@@ -217,12 +234,13 @@ class IBKRRuntime:
             ib.disconnectedEvent += self._on_disconnected
             self._events_wired = True
         self.recent_global_errors.clear()
+        self._errors.clear()                  # ids repeat across sessions: nothing from before counts
         logger.info(f"[{self.label}] connecting to IBKR {self.host}:{self.port} "
                     f"clientId={self.client_id} readonly={self.read_only}")
         await asyncio.wait_for(
             ib.connectAsync(self.host, self.port, clientId=self.client_id,
                             timeout=self.connect_timeout, readonly=self.read_only,
-                            account=self.account_id),
+                            account=self.account_id, raiseSyncErrors=True),
             self.connect_timeout + 5.0)
         managed = list(ib.managedAccounts())
         if self.account_id not in managed:
@@ -268,22 +286,31 @@ class IBKRRuntime:
         if reqId is None or reqId < 0:
             self.recent_global_errors.append((errorCode, errorString))
             return
-        bucket = self.errors_by_req.setdefault(reqId, [])
-        bucket.append((errorCode, errorString))
-        if len(self.errors_by_req) > _MAX_TRACKED_REQ_IDS:
-            oldest = next(iter(self.errors_by_req))
-            self.errors_by_req.pop(oldest, None)
+        self._err_seq += 1
+        self._errors.append((self._err_seq, reqId, errorCode, errorString))
 
     def _on_disconnected(self) -> None:
         logger.warning(f"[{self.label}] IBKR disconnected")
 
-    def order_errors(self, order_id: int) -> List[Tuple[int, str]]:
-        """Errors that fail an order (info/connection/market-data chatter excluded)."""
-        return [(c, m) for c, m in self.errors_by_req.get(order_id, [])
-                if error_severity(c) in ("order", "cancelled")]
+    def mark(self) -> int:
+        """The current error sequence number: take it immediately BEFORE sending a request."""
+        return self._err_seq
+
+    def order_errors(self, order_id: int, after_seq: int = 0,
+                     kinds: Tuple[str, ...] = ("order", "cancelled")) -> List[Tuple[int, str]]:
+        """Errors for ``order_id`` that arrived AFTER ``after_seq`` and fail an order (info,
+        warnings, connection and market-data chatter excluded)."""
+        return [(c, m) for seq, rid, c, m in self._errors
+                if rid == order_id and seq > after_seq and error_severity(c) in kinds]
+
+    def order_warnings(self, order_id: int, after_seq: int = 0) -> List[Tuple[int, str]]:
+        return self.order_errors(order_id, after_seq, kinds=("order_warning",))
 
     # ------------------------------------------------------------------ shutdown
     def close(self) -> None:
+        self.closed = True
+        for future in list(self._pending):          # waiting callers fail NOW, not after their timeout
+            future.cancel()
         loop = self._loop
         if loop.is_closed():
             return
@@ -301,7 +328,6 @@ class IBKRRuntime:
             self._thread.join(timeout=5.0)
         except Exception as e:  # noqa: BLE001 -- shutdown must never raise
             logger.error(f"[{self.label}] error closing IBKR runtime: {e}")
-
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +349,7 @@ def get_runtime(account_definition_id: int, signature: Tuple,
     """
     with _REGISTRY_LOCK:
         entry = _REGISTRY.get(account_definition_id)
-        if entry is not None and entry[0] == signature:
+        if entry is not None and entry[0] == signature and not entry[1].closed:
             return entry[1]
         if entry is not None:
             logger.info(f"IBKR account {account_definition_id}: settings changed, replacing its "

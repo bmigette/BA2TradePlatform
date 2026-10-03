@@ -210,8 +210,10 @@ Three ids exist at IBKR: `orderId` (an int, per `clientId`, unique only for orde
 placed), `permId` (global, permanent, but assigned only after TWS acknowledges, so it can be 0 for
 a moment) and `orderRef` (free text, echoed back on every status/exec, up to 128 chars).
 
-* **Correlation key = `orderRef`** (the analogue of Alpaca's `client_order_id = str(TradingOrder.id)`):
-  `ba2:<account_id>:<trading_order_id>`; an OCO stop leg is `ba2:<account_id>:<parent_id>:SL`.
+* **Correlation key = `orderRef`** (the analogue of Alpaca's `client_order_id`):
+  `ba2:<account_def_id>:<trading_order_id>:<nonce>`, an OCO stop leg `...:<nonce>:SL`. The nonce is an
+  8-hex random token stored in the row's `data["ibkr_nonce"]`: SQLite recycles `tradingorder` ids and
+  instances share ids, so an id alone must never identify an IB order or execution.
   `refresh_orders` matches on it first and then falls back to `broker_order_id`.
 * **`broker_order_id` = `str(permId)`** once known (stable across reconnects and daily restarts,
   and what TWS shows). If TWS has not yet assigned a `permId` when the submit ack arrives,
@@ -261,9 +263,10 @@ IBKR therefore follows the same contract:
   (`STP LMT`, limit = stop x (1 -/+ `OCO_STOP_LIMIT_CUSHION`), the platform's standing decision for
   Alpaca). `ocaType=2` (remaining orders proportionately reduced *with block*): a partial fill of
   one leg shrinks the other instead of cancelling it, so a part-filled take-profit never leaves the
-  rest of the position stop-less. The TP leg goes with `transmit=False` and the SL leg with
-  `transmit=True`, so TWS transmits both or neither; if the second placement fails the first is
-  cancelled before it was ever live.
+  rest of the position stop-less. **Both legs are transmitted, the stop FIRST** (`transmit=False` is a parent/child bracket device and
+  holds nothing back in an OCA group, so the pair is not atomic at the broker); if the take-profit
+  fails the stop is cancelled and the failure raised. A leg already carrying its orderRef (a retry) is
+  adopted, not re-placed. (Superseded: see "Review round" below.)
 * DB shape mirrors Alpaca: the OCO **parent** row is the TP leg (`broker_order_id` = its id); the SL
   leg is a child row (`parent_order_id` = parent, comment `<ts>-OCO-SL-[PARENT:..]`). The parent's
   status follows the TP leg, the child's the SL leg, so "stop fired" is a FILLED child + CANCELED
@@ -608,3 +611,39 @@ What is **missing**, exactly (nothing is faked):
   `orderRef`; there is no replay of events missed while disconnected.
 * **TWS Read-Only API + `readonly=True` connect:** ib_async skips its startup open-order fetch in read-only
   mode; the adapter never depends on it (every order read is an explicit `reqAllOpenOrders`).
+
+## 12. Review round (2026-10-03, items 1-9 and follow-ups)
+
+An independent review found the adapter safe to merge disabled but unsafe to enable. Each finding was
+reproduced first (probes A-D, `tests/test_ibkr_review_fixes.py`), then fixed. Where the fix rests on real-IB
+behaviour that cannot be verified here, the most conservative variant was implemented and the fact was added
+to `tools/ibkr_paper_smoke.py`'s `[CHECK]` list.
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | `ValidationError` (set by ib_async on a WARNING 399/404/10349 while the order stays live) was a rejection | maps to `PENDING_NEW`; warning codes are their own severity (`order_warning`), logged, never fail the order; `_wait_ack` keeps waiting |
+| 2 | stale errors survived reconnects; ids are reused | errors carry a sequence number, are cleared on connect, and `_wait_ack` reads only errors that arrived after the mark taken just before `placeOrder` |
+| 3 | a timeout after `placeOrder` marked the row ERROR and a retry duplicated the order | before EVERY placement (equity, OCO legs, options) the orderRef is looked up in session trades, open orders and completed orders and a match is ADOPTED; after `placeOrder` has run nothing marks the row ERROR (it stays `PENDING_NEW` with `o<orderId>` for the refresh); the submit budget is split explicitly (`_submit_budget`) |
+| 4 | an unsynced positions cache read as `[]` ("flat") | `connectAsync(raiseSyncErrors=True)`, and every positions read awaits an explicit `reqPositions`; failure -> `None` |
+| 5 | OCO `transmit=False` TP relied on bracket semantics | both legs transmitted, STOP FIRST then take-profit; TP failure cancels the stop and raises; the fake no longer models transmit for OCA |
+| 6 | a modify was never confirmed (ib_async keeps the status) | confirmed only by ib_async's `Modified` log entry; refusal = order error or final state; unconfirmed/refused rolls the shared Order object back, stores nothing, and `_modify_exit_in_place` rolls back its first leg |
+| 7 | orderRef collided across recycled ids/instances | per-row nonce in the ref and on the row; refresh matches by ref only when account, id AND nonce match and the order is this client's; executions are matched by the nonce-bearing ref or permId |
+| 8 | absent orders were marked CANCELED assuming 7 days of executions | never: an unlisted order with no execution is left unchanged with an `UNRESOLVED` warning (once per row) |
+| 9 | `AvailableFunds x 2` can exceed the true Reg-T room | `buying_power = min(AvailableFunds x m, SMA x m [if published], ExcessLiquidity x m)`; a margin account without `ExcessLiquidity` publishes `None`; components are in `raw["bp_components"]` |
+
+Follow-ups: `_pick_price` no longer falls back to yesterday's close (nothing live means no price; `close` only
+when asked by name); a settings edit drops the object's runtime handle and the shared session is replaced
+(`IBKRRuntime.close` fails waiting callers at once instead of after their timeout); an OCO leg's quantity and
+every working order's prices follow IB's live order in `refresh_orders`; no assumed option multiplier
+(an option position without one fails the fetch) and no assumed USD (a contract must say USD; Flex rows
+without a currency are skipped); `OCO_STOP_LIMIT_CUSHION` is duplicated in `protective_legs.py` (pinned equal
+to Alpaca's by a test) instead of imported from the Alpaca adapter; `supports_trading` is `True` on the class
+and `not read_only` on an instance, and a read-only account raises `IBKRReadOnlyError` BEFORE any row is
+written.
+
+Smoke-script additions (all under `[CHECK]`): OCA pair with both legs transmitted + ocaType 2 and what
+cancelling one leg does to the other; order-warning codes seen and the Gateway's order precautions;
+modification confirmation and refusal; completed-orders/executions survival across the nightly restart;
+positions right after a reconnect (cache vs `reqPositions`); request ids vs `nextValidId`; Reg-T SMA vs
+`AvailableFunds x 2`; negative BAG limit acceptance (what-if) and the per-leg combo fill shape. Partial/full
+OCA fill reduction needs a real fill and is NOT exercised by the script.

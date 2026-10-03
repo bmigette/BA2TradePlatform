@@ -29,7 +29,7 @@ from sqlmodel import select
 from ba2_common.core import ibkr_flex as flex
 from ba2_common.core import ibkr_mapping as M
 from ba2_common.core.ibkr_flex import FlexClient, FlexStatement, default_http_get
-from ba2_common.core.protective_legs import ProtectiveLegsMixin
+from ba2_common.core.protective_legs import OCO_STOP_LIMIT_CUSHION, ProtectiveLegsMixin
 
 from ...core.account_types import (
     AccountSnapshot, MarginInfo, OrderImpact, MARGIN_SOURCE_DEFAULT)
@@ -42,7 +42,6 @@ from ...core.types import (
     OrderStatus)
 from ...core.types import OrderType as CoreOrderType
 from ...logger import logger
-from .AlpacaAccount import OCO_STOP_LIMIT_CUSHION
 from .ibkr_options import IBKROptionsMixin
 from .ibkr_runtime import (
     IBKRConnectionError, IBKRContractError, IBKRError, IBKROrderRejected, IBKRReadOnlyError,
@@ -93,6 +92,7 @@ class BrokerOrderView:
     local_symbol: str
     created_at: Optional[datetime]
     last_message: str = ""
+    client_id: int = 0
 
     @property
     def key(self) -> Tuple:
@@ -134,6 +134,7 @@ class BrokerOrderView:
             local_symbol=str(contract.localSymbol or ""),
             created_at=created,
             last_message=message,
+            client_id=int(getattr(status, "clientId", 0) or getattr(order, "clientId", 0) or 0),
         )
 
 
@@ -162,8 +163,24 @@ class OrderBook:
         return self.open_ok and self.completed_ok and self.executions_ok
 
 
+class _SupportsTrading:
+    """``True`` when read from the CLASS (the settings UI and registry read it there), but on an
+    INSTANCE it is ``not read_only``: a read-only account must tell ``TradeManager`` it cannot trade,
+    so orders are refused loudly BEFORE routing instead of ending as ERROR rows."""
+
+    def __get__(self, obj, owner=None):
+        if obj is None:
+            return True
+        try:
+            return not obj._runtime().read_only
+        except Exception:  # noqa: BLE001 -- unreadable settings: refuse, never assume writable
+            return False
+
+
 class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, OptionsAccountInterface):
     """Interactive Brokers via TWS / IB Gateway (see the module docstring)."""
+
+    supports_trading = _SupportsTrading()
 
     #: Overridable in tests with a fake; the runtime builds the IB object ON its loop thread.
     _ib_factory = staticmethod(IB)
@@ -211,12 +228,24 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         if missing:
             raise ValueError(f"Missing required settings: {', '.join(missing)}")
 
+    def _invalidate_settings_cache(self) -> None:
+        """A settings edit: drop the cached settings AND this object's runtime handle, so the next
+        call rebuilds the signature from the new settings and ``get_runtime`` replaces (and closes)
+        the old session. Calls still waiting on the old one fail at once (see ``IBKRRuntime.close``)."""
+        super()._invalidate_settings_cache()
+        self._rt = None
+
     def _runtime(self) -> IBKRRuntime:
         """This account's shared runtime (one TWS session per account definition, however many
         ``IBKRAccount`` objects exist for it)."""
         rt = getattr(self, "_rt", None)
-        if rt is not None:
+        if rt is not None and not rt.closed:
             return rt
+        if rt is not None:
+            # replaced elsewhere (settings edit / shutdown): this object's cached settings may be
+            # stale, so re-read them before rebuilding rather than resurrecting the old session
+            self._settings_cache = None
+            self._rt = None
         from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
         get = lambda k: self.get_setting_with_interface_default(k, log_warning=False)  # noqa: E731
         host, port, client_id = str(get("host")), int(get("port")), int(get("client_id"))
@@ -312,7 +341,7 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         details = await asyncio.wait_for(ib.reqContractDetailsAsync(probe), self._READ_TIMEOUT)
         stocks = [d for d in (details or [])
                   if getattr(d.contract, "secType", "") == "STK"
-                  and getattr(d.contract, "currency", "USD") == "USD"]
+                  and d.contract.currency == "USD"]
         if not stocks:
             raise IBKRContractError(f"IBKR knows no US stock {symbol!r} (no security definition)")
         if len(stocks) > 1:
@@ -377,7 +406,9 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         values = {"bid": bid, "ask": ask,
                   "mid": ((bid + ask) / 2.0) if bid and ask else None,
                   "last": M.ib_number(ticker.last), "close": M.ib_number(ticker.close)}
-        ladder = [price_type] + [n for n in ("mid", "last", "close") if n != price_type]
+        # NEVER fall back to a previous close: it is yesterday's price, not a quote. 'close' is
+        # returned only when it is asked for by name.
+        ladder = [price_type] + [n for n in ("mid", "last") if n != price_type]
         for name in ladder:
             value = values.get(name)
             if value is not None and value > 0:
@@ -512,8 +543,17 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         return info
 
     # ------------------------------------------------------------------ positions
+    async def _confirm_positions(self, ib: Any) -> None:
+        """An unconfirmed position snapshot is NOT an empty book. ib_async reads ``positions()`` from
+        a cache a startup sync fills; if that sync timed out the cache is empty and reads as "flat",
+        which is what makes reconcilers close transactions and cancel protective orders. So every
+        positions read first awaits an explicit ``reqPositions`` round trip; any failure raises and
+        the caller reports the fetch as FAILED (``None``)."""
+        await asyncio.wait_for(ib.reqPositionsAsync(), self._READ_TIMEOUT)
+
     async def _equity_positions_payload(self, ib: Any) -> List[Dict[str, Any]]:
         account = self._account_id
+        await self._confirm_positions(ib)
         held = [p for p in ib.positions(account)
                 if p.account == account and p.contract.secType == "STK" and p.position]
         portfolio = {int(i.contract.conId): i for i in ib.portfolio(account)}
@@ -845,29 +885,43 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         return order
 
     # ------------------------------------------------------------------ placement (loop thread)
-    async def _wait_ack(self, ib: Any, trade: Any, timeout: float) -> BrokerOrderView:
+    async def _wait_ack(self, ib: Any, trade: Any, timeout: float, seq: int) -> BrokerOrderView:
         """Wait for IB to acknowledge or reject a placed order (bounded; never resends).
 
-        Raises ``IBKROrderRejected`` on a rejection. Returns the view as it stands at the deadline
-        otherwise (``PendingSubmit`` means "no answer yet", which the caller records and
-        ``refresh_orders`` resolves).
+        ``seq`` is the runtime's error sequence mark taken just BEFORE the ``placeOrder`` call: only
+        errors that arrived after it, for this order's id, count (ids are reused after a reconnect).
+
+        * rejected = status Cancelled/Inactive/ApiCancelled, or an error of the ORDER kind for this id
+          -> ``IBKROrderRejected``;
+        * ``ValidationError`` is NOT a rejection: ib_async sets it when IB sends a WARNING (399 held
+          until the open, 404 shares being located, 10349 ...) and the order stays live. The warning is
+          logged and the wait continues;
+        * otherwise returns the view at the deadline (``PendingSubmit``/``ValidationError`` mean "no
+          answer yet": the caller records them PENDING and ``refresh_orders`` resolves them).
         """
         order_id = int(trade.order.orderId)
-        deadline = time.monotonic() + timeout
+        start = time.monotonic()
+        deadline = start + timeout
         rt = self._runtime()
+        warned = False
         while True:
             status = str(trade.orderStatus.status or "")
-            errors = rt.order_errors(order_id)
-            if status in ("Cancelled", "Inactive", "ApiCancelled", "ValidationError"):
+            errors = rt.order_errors(order_id, seq)
+            if status in ("Cancelled", "Inactive", "ApiCancelled"):
                 code, text = (errors[-1] if errors else (None, trade.log[-1].message if trade.log
                                                          else status))
                 raise IBKROrderRejected(f"IB error {code}: {text}" if code else
                                         f"IBKR {status}: {text}", code)
             if status in ("Submitted", "PreSubmitted", "Filled", "ApiUpdate"):
                 return BrokerOrderView.from_trade(trade)
-            if errors and time.monotonic() > deadline - timeout + 0.2:
+            if errors and time.monotonic() > start + 0.2:
                 code, text = errors[-1]
                 raise IBKROrderRejected(f"IB error {code}: {text}", code)
+            if not warned:
+                for code, text in rt.order_warnings(order_id, seq):
+                    warned = True
+                    logger.warning(f"[Account {self.id}] IB warning {code} on order {order_id} "
+                                   f"(the order stays LIVE): {text}")
             if time.monotonic() >= deadline:
                 return BrokerOrderView.from_trade(trade)
             await asyncio.sleep(0.02)
@@ -893,7 +947,44 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
                 f"Cannot open SHORT position for {symbol}: IBKR reports shortable shares "
                 f"{shares} (needs > {M.EASY_TO_BORROW_THRESHOLD}, i.e. shortable and easy to borrow).")
 
+    def _submit_budget(self, acks: int) -> float:
+        """The caller's total wait for one submission, split EXPLICITLY: two list reads for the
+        adopt-before-place lookup, contract details + market rule (each bounded by ``_READ_TIMEOUT``),
+        the short check (3 s), then ``acks`` acknowledgement waits."""
+        return 4 * self._READ_TIMEOUT + 3.0 + acks * self._ORDER_ACK_TIMEOUT
+
+    async def _existing_order(self, ib: Any, ref: str) -> Optional[BrokerOrderView]:
+        """The IB order already carrying this ``orderRef`` (session trades, open orders, completed
+        orders), or ``None``. IB does NOT reject a reused orderRef, so a retry would silently create a
+        second live order: every placement looks first and ADOPTS a match (review item 3). A list that
+        cannot be read raises: an unverifiable book is not an empty one."""
+        account = self._account_id
+
+        def search(trades) -> Optional[BrokerOrderView]:
+            for trade in trades:
+                if trade.order.orderRef == ref:
+                    view = BrokerOrderView.from_trade(trade)
+                    if not view.account or view.account == account:
+                        return view
+            return None
+
+        found = search(ib.trades())
+        if found is None:
+            found = search(await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), self._READ_TIMEOUT))
+        if found is None:
+            found = search(await asyncio.wait_for(ib.reqCompletedOrdersAsync(False), self._READ_TIMEOUT))
+        if found is not None:
+            logger.warning(f"[Account {self.id}] an IB order with orderRef {ref} already exists "
+                           f"(permId {found.perm_id}, status {found.status}); adopting it instead of "
+                           f"placing a duplicate")
+        return found
+
     async def _place_single(self, ib: Any, spec: Dict[str, Any]) -> Dict[str, Any]:
+        progress = spec["progress"]
+        adopted = await self._existing_order(ib, spec["order_ref"])
+        if adopted is not None:
+            return {"view": adopted, "quantity": adopted.total_quantity,
+                    "tif": adopted.tif or spec["tif"], "adopted": True}
         resolved = await self._resolve_stock(ib, spec["symbol"])
         details, contract = resolved.details, resolved.contract
         rules = await self._market_rules(ib, details)
@@ -908,11 +999,23 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         order = self._new_ib_order(
             action=spec["action"], order_type=spec["ib_type"], qty=qty, tif=spec["tif"],
             ref=spec["order_ref"], limit=spec["limit"], stop=spec["stop"], rules=rules)
+        seq = self._runtime().mark()
         trade = ib.placeOrder(contract, order)
-        view = await self._wait_ack(ib, trade, self._ORDER_ACK_TIMEOUT)
+        progress["order_ids"].append(int(trade.order.orderId))     # from here the order may exist at IB
+        view = await self._wait_ack(ib, trade, self._ORDER_ACK_TIMEOUT, seq)
         return {"view": view, "quantity": qty, "tif": spec["tif"]}
 
     async def _place_oco(self, ib: Any, spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Two orders in one OCA group, STOP FIRST then take-profit, both transmitted.
+
+        ``transmit=False`` is a parent/child (bracket) device; it holds nothing back in an OCA group,
+        so the pair is NOT atomic at the broker and the order matters: the protective stop must exist
+        before the take-profit does. If the take-profit fails the stop is cancelled and the failure
+        raised. Either leg already carrying its orderRef (a retry) is adopted, not re-placed.
+        """
+        progress = spec["progress"]
+        sl_view = await self._existing_order(ib, spec["sl_ref"])
+        tp_view = await self._existing_order(ib, spec["tp_ref"])
         resolved = await self._resolve_stock(ib, spec["symbol"])
         rules = await self._market_rules(ib, resolved.details)
         qty = float(spec["quantity"])
@@ -922,30 +1025,33 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         cushion = (1.0 - OCO_STOP_LIMIT_CUSHION) if spec["action"] == "SELL" else (1.0 + OCO_STOP_LIMIT_CUSHION)
         sl_limit = M.round_to_increment(sl_stop * cushion, rules)
         group = spec["oca_group"]
-        tp_order = self._new_ib_order(action=spec["action"], order_type="LMT", qty=qty,
-                                      tif=spec["tif"], ref=spec["tp_ref"], limit=tp, rules=rules)
-        sl_order = self._new_ib_order(action=spec["action"], order_type="STP LMT", qty=qty,
-                                      tif=spec["tif"], ref=spec["sl_ref"], limit=sl_limit,
-                                      stop=sl_stop, rules=rules)
-        for leg in (tp_order, sl_order):
-            leg.ocaGroup, leg.ocaType = group, 2   # 2 = reduce remaining proportionally, with block
-        # TP goes untransmitted, SL transmits both: TWS releases the pair or neither.
-        tp_order.transmit, sl_order.transmit = False, True
-        tp_trade = ib.placeOrder(resolved.contract, tp_order)
-        try:
+        rt = self._runtime()
+        sl_trade = None
+        if sl_view is None:
+            sl_order = self._new_ib_order(action=spec["action"], order_type="STP LMT", qty=qty,
+                                          tif=spec["tif"], ref=spec["sl_ref"], limit=sl_limit,
+                                          stop=sl_stop, rules=rules)
+            sl_order.ocaGroup, sl_order.ocaType = group, 2     # 2 = reduce remaining, with block
+            seq = rt.mark()
             sl_trade = ib.placeOrder(resolved.contract, sl_order)
-        except Exception:
-            ib.cancelOrder(tp_trade.order)
-            raise
-        try:
-            tp_view = await self._wait_ack(ib, tp_trade, self._ORDER_ACK_TIMEOUT)
-            sl_view = await self._wait_ack(ib, sl_trade, self._ORDER_ACK_TIMEOUT)
-        except IBKROrderRejected:
-            # One leg refused: never leave the other working alone.
-            for trade in (tp_trade, sl_trade):
-                if str(trade.orderStatus.status) not in ("Cancelled", "ApiCancelled", "Inactive"):
-                    ib.cancelOrder(trade.order)
-            raise
+            progress["order_ids"].append(int(sl_trade.order.orderId))
+            progress["sl_id"] = int(sl_trade.order.orderId)
+            sl_view = await self._wait_ack(ib, sl_trade, self._ORDER_ACK_TIMEOUT, seq)
+        if tp_view is None:
+            tp_order = self._new_ib_order(action=spec["action"], order_type="LMT", qty=qty,
+                                          tif=spec["tif"], ref=spec["tp_ref"], limit=tp, rules=rules)
+            tp_order.ocaGroup, tp_order.ocaType = group, 2
+            seq = rt.mark()
+            try:
+                tp_trade = ib.placeOrder(resolved.contract, tp_order)
+                progress["order_ids"].append(int(tp_trade.order.orderId))
+                progress["tp_id"] = int(tp_trade.order.orderId)
+                tp_view = await self._wait_ack(ib, tp_trade, self._ORDER_ACK_TIMEOUT, seq)
+            except IBKROrderRejected:
+                # the take-profit failed: never leave the stop working alone behind a failed submit
+                if sl_trade is not None:
+                    ib.cancelOrder(sl_trade.order)
+                raise
         return {"tp": tp_view, "sl": sl_view, "tp_price": tp, "sl_stop": sl_stop, "sl_limit": sl_limit}
 
     # ------------------------------------------------------------------ submission
@@ -993,6 +1099,42 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         update_instance(fresh)
         return fresh
 
+    def _ensure_nonce(self, row_id: int) -> str:
+        """The row's per-row random token (persisted in ``data["ibkr_nonce"]``), created once.
+        It is part of every orderRef: ``tradingorder`` ids are recycled by SQLite and repeat across
+        instances, so an id alone must never identify an IB order or execution (review item 7)."""
+        row = get_instance(TradingOrder, row_id)
+        data = dict(row.data or {})
+        nonce = data.get("ibkr_nonce")
+        if not nonce:
+            nonce = M.new_nonce()
+            data["ibkr_nonce"] = nonce
+            row.data = data
+            update_instance(row)
+        return nonce
+
+    def _record_unconfirmed_placement(self, row_id: int, progress: Dict[str, Any], tif: str,
+                                      quantity: Optional[float], error: Exception) -> TradingOrder:
+        """The call timed out (or the connection dropped) AFTER ``placeOrder`` ran: the order may be
+        live at IB. NEVER mark the row ERROR (a retry would then create a duplicate): record it
+        PENDING_NEW with the client-scoped id and let ``refresh_orders`` resolve it by orderRef."""
+        ids = progress["order_ids"]
+        main_id = progress.get("tp_id") or progress.get("sl_id") or ids[0]
+        fresh = get_instance(TradingOrder, row_id)
+        if not fresh.broker_order_id:
+            fresh.broker_order_id = M.format_broker_order_id(0, main_id)
+        fresh.status = OrderStatus.PENDING_NEW
+        fresh.good_for = tif.lower()
+        if quantity is not None:
+            fresh.quantity = quantity
+        fresh.comment = (f"{fresh.comment} | " if fresh.comment else "") + (
+            f"placement unconfirmed ({type(error).__name__}: {error}); left PENDING for refresh")[:300]
+        update_instance(fresh)
+        logger.error(f"[Account {self.id}] order {row_id}: {type(error).__name__} AFTER placeOrder "
+                     f"(IB order ids {ids}); the order may be live. Left PENDING_NEW, not ERROR; "
+                     f"refresh_orders resolves it by orderRef")
+        return fresh
+
     def _submit_order_impl(self, trading_order: TradingOrder, tp_price: Optional[float] = None,
                            sl_price: Optional[float] = None, is_closing_order: bool = False,
                            use_complex_order: bool = False) -> Optional[TradingOrder]:
@@ -1001,7 +1143,7 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         ``tp_price``/``sl_price`` are accepted for the interface and deliberately not acted on
         here: ``AccountInterface.submit_order`` calls ``adjust_tp_sl`` after this returns, which
         builds the protective exit. ``use_complex_order`` cannot occur (no wash-trade lock) and
-        raises rather than being ignored.
+        raises rather than being ignored. A read-only account raises BEFORE anything is written.
         """
         if use_complex_order:
             raise NotImplementedError(
@@ -1011,18 +1153,21 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
             logger.warning(f"Order {trading_order.id} already has broker_order_id "
                            f"{trading_order.broker_order_id} -- skipping re-submission")
             return trading_order
+        self._refuse_if_read_only("submit orders")
+        progress: Dict[str, Any] = {"order_ids": []}
+        tif_used = "day"
         try:
             if trading_order.id is None:
                 trading_order.status = OrderStatus.PENDING
                 trading_order.id = add_instance(trading_order, expunge_after_flush=True)
-            self._refuse_if_read_only("submit orders")
             if trading_order.asset_class == CoreAssetClass.OPTION:
                 raise ValueError("option orders go through submit_option_order, not submit_order")
             order_type = trading_order.order_type
             action = "BUY" if trading_order.side == OrderDirection.BUY else "SELL"
-            ref = M.make_order_ref(self.id, trading_order.id)
+            nonce = self._ensure_nonce(trading_order.id)
+            ref = M.make_order_ref(self.id, trading_order.id, nonce=nonce)
             if order_type == CoreOrderType.OCO:
-                return self._submit_oco(trading_order, action)
+                return self._submit_oco(trading_order, action, nonce, progress)
             if order_type in (CoreOrderType.TRAILING_STOP, CoreOrderType.OTO):
                 raise ValueError(f"IBKR submission does not support order type {order_type.value}")
             ib_type = {CoreOrderType.MARKET: "MKT", CoreOrderType.BUY_LIMIT: "LMT",
@@ -1037,23 +1182,29 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
                 raise ValueError(f"Stop price is required for {order_type.value} orders")
             tif, warning = M.ib_time_in_force(trading_order.good_for,
                                               is_market=self._is_market(order_type))
+            tif_used = tif
             if warning:
                 logger.warning(f"Order {trading_order.id}: {warning}")
             spec = {
                 "symbol": trading_order.symbol, "quantity": float(trading_order.quantity),
                 "order_type": order_type, "ib_type": ib_type, "action": action, "tif": tif,
                 "limit": trading_order.limit_price, "stop": trading_order.stop_price,
-                "order_ref": ref,
+                "order_ref": ref, "progress": progress,
                 "opens_short": self._order_opens_short(trading_order, is_closing_order),
             }
             try:
                 placed = self._call(lambda ib: self._place_single(ib, spec),
                                     op=f"place order {trading_order.id}",
-                                    timeout=self._ORDER_ACK_TIMEOUT + self._READ_TIMEOUT)
+                                    timeout=self._submit_budget(1))
             except _ZeroQuantityAfterRounding as e:
                 logger.warning(f"Order {trading_order.id} ({trading_order.symbol}) skipped: {e}")
                 self._record_skip(trading_order, f"skipped: {e}")
                 return None
+            except (TimeoutError, IBKRConnectionError) as e:
+                if progress["order_ids"]:
+                    return self._record_unconfirmed_placement(
+                        trading_order.id, progress, tif_used, None, e)
+                raise
             fresh = self._persist_submission(trading_order.id, placed["view"], placed["tif"],
                                              quantity=placed["quantity"])
             logger.info(f"Submitted IBKR order {fresh.id}: broker_order_id={fresh.broker_order_id}, "
@@ -1061,12 +1212,17 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
             return fresh
         except Exception as e:  # noqa: BLE001 -- recorded on the row, never swallowed
             logger.error(f"Error submitting order {trading_order.id} to IBKR: {e}", exc_info=True)
+            if progress["order_ids"] and not isinstance(e, IBKROrderRejected):
+                # something went wrong AFTER IB had the order (e.g. writing the answer back):
+                # never mark it ERROR, the order may be live
+                return self._record_unconfirmed_placement(trading_order.id, progress, tif_used, None, e)
             if trading_order.id:
                 return self._handle_order_submit_error(trading_order, e)
             logger.warning("Cannot mark order as ERROR - order has no ID")
             return None
 
-    def _submit_oco(self, parent: TradingOrder, action: str) -> TradingOrder:
+    def _submit_oco(self, parent: TradingOrder, action: str, nonce: str,
+                    progress: Dict[str, Any]) -> TradingOrder:
         if not parent.limit_price or parent.limit_price <= 0:
             raise ValueError("Limit price (take profit) is required for OCO orders")
         if not parent.stop_price or parent.stop_price <= 0:
@@ -1075,12 +1231,21 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         spec = {
             "symbol": parent.symbol, "quantity": float(parent.quantity), "action": action,
             "tp": float(parent.limit_price), "sl": float(parent.stop_price), "tif": tif,
-            "oca_group": f"ba2-oca-{self.id}-{parent.id}",
-            "tp_ref": M.make_order_ref(self.id, parent.id),
-            "sl_ref": M.make_order_ref(self.id, parent.id, "SL"),
+            "oca_group": f"ba2-oca-{self.id}-{parent.id}-{nonce}", "progress": progress,
+            "tp_ref": M.make_order_ref(self.id, parent.id, nonce=nonce),
+            "sl_ref": M.make_order_ref(self.id, parent.id, "SL", nonce=nonce),
         }
-        placed = self._call(lambda ib: self._place_oco(ib, spec), op=f"place OCO {parent.id}",
-                            timeout=2 * self._ORDER_ACK_TIMEOUT + self._READ_TIMEOUT)
+        try:
+            placed = self._call(lambda ib: self._place_oco(ib, spec), op=f"place OCO {parent.id}",
+                                timeout=self._submit_budget(2))
+        except (TimeoutError, IBKRConnectionError) as e:
+            if progress["order_ids"]:
+                fresh = self._record_unconfirmed_placement(parent.id, progress, tif, None, e)
+                if progress.get("sl_id") and progress.get("tp_id"):
+                    self._create_oco_child(parent, action, tif, None, None, None, M.format_broker_order_id(
+                        0, progress["sl_id"]), OrderStatus.PENDING_NEW, "")
+                return fresh
+            raise
         tp_view, sl_view = placed["tp"], placed["sl"]
         fresh = self._persist_submission(parent.id, tp_view, tif)
         fresh.legs_broker_ids = [tp_view.broker_order_id, sl_view.broker_order_id]
@@ -1088,31 +1253,46 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
             "oca_group": spec["oca_group"], "tp_order_id": tp_view.order_id,
             "sl_order_id": sl_view.order_id, "sl_limit": placed["sl_limit"]}}
         update_instance(fresh)
-        child = TradingOrder(
-            account_id=self.id, symbol=parent.symbol, quantity=parent.quantity, side=parent.side,
-            order_type=(CoreOrderType.SELL_STOP_LIMIT if action == "SELL"
-                        else CoreOrderType.BUY_STOP_LIMIT),
-            broker_order_id=sl_view.broker_order_id, limit_price=placed["sl_limit"],
-            stop_price=placed["sl_stop"], good_for=tif.lower(),
-            status=M.map_ib_status(sl_view.status, sl_view.filled, sl_view.remaining),
-            filled_qty=sl_view.filled or None,
-            comment=f"{int(self._utcnow().timestamp())}-OCO-SL-[PARENT:{parent.id}/BROKER:"
-                    f"{tp_view.broker_order_id}]",
-            transaction_id=parent.transaction_id, parent_order_id=parent.id,
-            created_at=self._utcnow())
-        add_instance(child)
+        self._create_oco_child(parent, action, tif, placed["sl_limit"], placed["sl_stop"],
+                               sl_view.filled or None, sl_view.broker_order_id,
+                               M.map_ib_status(sl_view.status, sl_view.filled, sl_view.remaining),
+                               tp_view.broker_order_id)
         logger.info(f"Submitted IBKR OCO {parent.id}: TP leg {tp_view.broker_order_id}, "
                     f"SL leg {sl_view.broker_order_id}")
         return fresh
 
+    def _create_oco_child(self, parent: TradingOrder, action: str, tif: str,
+                          sl_limit: Optional[float], sl_stop: Optional[float],
+                          filled: Optional[float], broker_id: str, status: OrderStatus,
+                          tp_broker_id: str = "") -> None:
+        """The stop-leg child row of an OCO parent (skipped when one already exists: a retry)."""
+        with get_db() as session:
+            existing = session.exec(select(TradingOrder).where(
+                TradingOrder.parent_order_id == parent.id,
+                TradingOrder.account_id == self.id)).first()
+        if existing is not None:
+            return
+        add_instance(TradingOrder(
+            account_id=self.id, symbol=parent.symbol, quantity=parent.quantity, side=parent.side,
+            order_type=(CoreOrderType.SELL_STOP_LIMIT if action == "SELL"
+                        else CoreOrderType.BUY_STOP_LIMIT),
+            broker_order_id=broker_id, limit_price=sl_limit, stop_price=sl_stop,
+            good_for=tif.lower(), status=status, filled_qty=filled,
+            comment=f"{int(self._utcnow().timestamp())}-OCO-SL-[PARENT:{parent.id}/BROKER:"
+                    f"{tp_broker_id}]",
+            transaction_id=parent.transaction_id, parent_order_id=parent.id,
+            created_at=self._utcnow()))
+
     # ------------------------------------------------------------------ cancel / modify
-    @staticmethod
-    def _order_ref_for_row(row: TradingOrder, account_id: int) -> str:
-        """The ``orderRef`` this row's IB order carries (an OCO stop leg is ``<parent>:SL``)."""
+    def _order_ref_for_row(self, row: TradingOrder, account_id: int) -> str:
+        """The ``orderRef`` this row's IB order carries (an OCO stop leg is ``<parent>:SL`` and uses
+        the PARENT's nonce)."""
         if row.parent_order_id and row.order_type in (CoreOrderType.SELL_STOP_LIMIT,
                                                       CoreOrderType.BUY_STOP_LIMIT):
-            return M.make_order_ref(account_id, row.parent_order_id, "SL")
-        return M.make_order_ref(account_id, row.id)
+            parent = get_instance(TradingOrder, row.parent_order_id)
+            return M.make_order_ref(account_id, row.parent_order_id, "SL",
+                                    nonce=(parent.data or {}).get("ibkr_nonce"))
+        return M.make_order_ref(account_id, row.id, nonce=(row.data or {}).get("ibkr_nonce"))
 
     def _row_for_order_id(self, order_id: Any) -> Optional[TradingOrder]:
         """Our row for a DB id OR a broker id (scoped to this account), else ``None``.
@@ -1174,13 +1354,15 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
                 # Already not working: the goal is met; refresh_orders records the final status.
                 results[row["broker_order_id"]] = True
                 continue
+            seq = self._runtime().mark()
             ib.cancelOrder(trade.order)
             deadline = time.monotonic() + self._CANCEL_ACK_TIMEOUT
             refused = None
             while time.monotonic() < deadline:
                 if str(trade.orderStatus.status) in ("PendingCancel", "Cancelled", "ApiCancelled"):
                     break
-                errors = [(c, m) for c, m in self._runtime().errors_by_req.get(order_id, [])
+                errors = [(c, m) for c, m in self._runtime().order_errors(order_id, seq,
+                                                                           kinds=("order", "cancelled"))
                           if c in M.ORDER_STATE_CODES]
                 if errors:
                     refused = errors[-1]
@@ -1236,6 +1418,15 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
     async def _modify_order_object(self, ib: Any, row: Dict[str, Any], *, qty: Optional[float],
                                    limit: Optional[float], stop: Optional[float],
                                    tif: Optional[str], symbol: str) -> Dict[str, Any]:
+        """Re-send an order with the same ``orderId`` and WAIT FOR IB TO CONFIRM it.
+
+        ib_async keeps the order's status unchanged on a modification, so "no error" is not
+        confirmation. Confirmed = ib_async logs ``Modified`` after its own ``Modify`` entry (IB echoed
+        the change). Refused = an order-kind error for this id, or the order reaching a final state.
+        Anything else at the deadline is UNCONFIRMED. In every non-confirmed case the in-memory Order
+        object is rolled back to its old values (it is shared with ib_async's state) and an exception
+        is raised: the caller must not store the new prices as truth.
+        """
         trade = await self._find_trade(ib, row)
         if trade is None:
             raise IBKRContractError(
@@ -1244,6 +1435,7 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         resolved = await self._resolve_stock(ib, symbol)
         rules = await self._market_rules(ib, resolved.details)
         order = trade.order
+        old = (order.lmtPrice, order.auxPrice, order.totalQuantity, order.tif, order.transmit)
         applied: Dict[str, Optional[float]] = {"limit": None, "stop": None}
         if limit is not None:
             order.lmtPrice = applied["limit"] = M.round_to_increment(limit, rules)
@@ -1254,9 +1446,35 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         if tif:
             order.tif = tif
         order.transmit = True
-        new_trade = ib.placeOrder(resolved.contract, order)   # same orderId => in-place modify
-        view = await self._wait_ack(ib, new_trade, self._ORDER_ACK_TIMEOUT)
-        return {"view": view, **applied}
+        rt = self._runtime()
+        seq, log_len = rt.mark(), len(trade.log)
+        order_id = int(order.orderId)
+
+        def rollback() -> None:
+            order.lmtPrice, order.auxPrice, order.totalQuantity, order.tif, order.transmit = old
+
+        try:
+            new_trade = ib.placeOrder(resolved.contract, order)   # same orderId => in-place modify
+            deadline = time.monotonic() + self._ORDER_ACK_TIMEOUT
+            while True:
+                if any(e.message == "Modified" for e in list(new_trade.log)[log_len:]):
+                    break
+                errors = rt.order_errors(order_id, seq)
+                if errors:
+                    raise IBKROrderRejected(f"IB error {errors[-1][0]}: {errors[-1][1]}", errors[-1][0])
+                if str(new_trade.orderStatus.status) in ("Filled", "Cancelled", "ApiCancelled",
+                                                          "Inactive"):
+                    raise IBKROrderRejected(
+                        f"order {order_id} reached {new_trade.orderStatus.status} while being modified")
+                if time.monotonic() >= deadline:
+                    raise IBKROrderRejected(
+                        f"IB did not confirm the modification of order {order_id} within "
+                        f"{self._ORDER_ACK_TIMEOUT:.0f}s (no 'Modified' acknowledgement)")
+                await asyncio.sleep(0.02)
+        except BaseException:
+            rollback()
+            raise
+        return {"view": BrokerOrderView.from_trade(new_trade), **applied}
 
     def modify_order(self, order_id: str, trading_order: Optional[TradingOrder] = None):
         """TRUE in-place modification (same IB ``orderId``): prices, TIF, and whole-share size.
@@ -1283,7 +1501,7 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
                 lambda ib: self._modify_order_object(
                     ib, payload, qty=qty, limit=src.limit_price, stop=src.stop_price, tif=tif,
                     symbol=db_order.symbol),
-                op=f"modify {db_order.id}", timeout=self._READ_TIMEOUT + self._ORDER_ACK_TIMEOUT)
+                op=f"modify {db_order.id}", timeout=2 * self._READ_TIMEOUT + self._ORDER_ACK_TIMEOUT)
             view = result["view"]
             fresh = get_instance(TradingOrder, db_order.id)
             # Persist what IB was actually sent (rounded to its tick), not what was asked for.
@@ -1367,24 +1585,34 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
 
     # ------------------------------------------------------------------ refresh
     def _row_for_view(self, view: BrokerOrderView) -> Optional[TradingOrder]:
+        """Our row for an IB order. By ``orderRef`` ONLY when its account, row id AND per-row nonce
+        all match and the order is this client's: a recycled ``tradingorder`` id (SQLite reuses them,
+        and instances share ids) must never claim someone else's order. Otherwise by the broker id."""
         ref = M.parse_order_ref(view.order_ref)
-        if ref is not None and ref[0] == self.id:
-            _, order_id, suffix = ref
-            if suffix is None:
-                try:
-                    row = get_instance(TradingOrder, order_id)
-                except InstanceNotFound:
-                    row = None
-                if row is not None and row.account_id == self.id:
+        own_client = self._runtime().client_id
+        if view.client_id and view.client_id != own_client:
+            return None                      # another API client's order: never ours
+        if ref is not None and ref.account == self.id and ref.nonce:
+            try:
+                row = get_instance(TradingOrder, ref.order)
+            except InstanceNotFound:
+                row = None
+            if row is not None and row.account_id == self.id \
+                    and (row.data or {}).get("ibkr_nonce") == ref.nonce:
+                if ref.suffix is None:
                     return row
-            elif suffix == "SL":
-                with get_db() as session:
-                    child = session.exec(select(TradingOrder).where(
-                        TradingOrder.parent_order_id == order_id,
-                        TradingOrder.account_id == self.id)).first()
-                    child_id = child.id if child else None
-                if child_id:
-                    return get_instance(TradingOrder, child_id)
+                if ref.suffix == "SL":
+                    with get_db() as session:
+                        child = session.exec(select(TradingOrder).where(
+                            TradingOrder.parent_order_id == ref.order,
+                            TradingOrder.account_id == self.id)).first()
+                        child_id = child.id if child else None
+                    if child_id:
+                        return get_instance(TradingOrder, child_id)
+            elif row is not None:
+                logger.warning(f"[Account {self.id}] IB order {view.broker_order_id} carries orderRef "
+                               f"{view.order_ref} but row {ref.order}'s nonce does not match "
+                               f"(a recycled id?); not matched by reference")
         wanted = [f"o{view.order_id}"] if view.order_id else []
         if view.perm_id:
             wanted.append(str(view.perm_id))
@@ -1414,6 +1642,27 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
             row.filled_qty, changed = view.filled, True
         if view.avg_fill_price and view.avg_fill_price > 0 and row.open_price != view.avg_fill_price:
             row.open_price, changed = view.avg_fill_price, True
+        working = view.status not in ("Filled", "Cancelled", "ApiCancelled", "Inactive")
+        if working:
+            # What is WORKING at IB is the truth: an OCO leg's size shrinks when the other leg part-fills
+            # (ocaType 2), and a price moved in TWS (or a modify IB applied late) must reach the row.
+            if view.total_quantity > 0 and (row.quantity is None
+                                            or abs(float(row.quantity) - view.total_quantity) > 1e-9):
+                row.quantity, changed = view.total_quantity, True
+            prices = {"limit_price": None, "stop_price": None}
+            if view.order_type == "LMT":
+                prices["limit_price"] = view.limit_price
+            elif view.order_type == "STP":
+                prices["stop_price"] = view.aux_price
+            elif view.order_type == "STP LMT":
+                prices["limit_price"], prices["stop_price"] = view.limit_price, view.aux_price
+            if row.order_type == CoreOrderType.OCO:
+                prices["stop_price"] = None           # the parent's stop is its child's: leave it
+            for field_name, value in prices.items():
+                current = getattr(row, field_name)
+                if value is not None and (current is None or abs(float(current) - value) > 1e-6):
+                    setattr(row, field_name, value)
+                    changed = True
         wanted_id = view.broker_order_id
         if row.broker_order_id != wanted_id and (
                 not row.broker_order_id or (view.perm_id and row.broker_order_id.startswith("o"))):
@@ -1427,8 +1676,12 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         return changed
 
     def _settle_absent_rows(self, book: OrderBook, matched_ids: set) -> int:
-        """Rows with a broker id that IB lists nowhere. Absence from the open list is authoritative
-        for "not working", but FILLED is only knowable from fills (kept for ~7 days)."""
+        """Rows with a broker id that IB lists nowhere (open, completed, session). They are NEVER
+        marked CANCELED on that evidence (the Gateway's daily restart can drop completed orders and
+        executions, and an order that filled while we were down must not be recorded as cancelled).
+        An execution found by the row's own orderRef (with its nonce) or by permId settles it as
+        FILLED/PARTIAL; otherwise it stays as it is with a loud, once-per-row warning that it needs an
+        operator or a Flex reconciliation."""
         settled = 0
         terminal = OrderStatus.get_terminal_statuses() | {OrderStatus.FILLED}
         with get_db() as session:
@@ -1442,11 +1695,10 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
             created = row.created_at
             if created is not None and created.tzinfo is None:
                 created = created.replace(tzinfo=timezone.utc)
-            age = (now - created) if created else None
-            if age is not None and age < timedelta(minutes=self._ABSENT_GRACE_MINUTES):
+            if created is not None and now - created < timedelta(minutes=self._ABSENT_GRACE_MINUTES):
                 continue
             perm = int(row.broker_order_id) if str(row.broker_order_id).isdigit() else 0
-            ex = book.executions_by_ref.get(M.make_order_ref(self.id, row.id)) \
+            ex = book.executions_by_ref.get(self._order_ref_for_row(row, self.id)) \
                 or (book.executions_by_perm.get(perm) if perm else None)
             if ex:
                 row.status = (OrderStatus.FILLED if ex["shares"] + 1e-9 >= float(row.quantity)
@@ -1455,16 +1707,12 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
                 update_instance(row)
                 settled += 1
                 continue
-            if age is not None and age > timedelta(days=self._EXECUTION_WINDOW_DAYS):
-                logger.warning(f"Order {row.id} (broker_order_id={row.broker_order_id}) is on no "
-                               f"IBKR list and is older than the {self._EXECUTION_WINDOW_DAYS}-day "
-                               f"execution window: cannot verify whether it filled; left unchanged")
-                continue
-            logger.warning(f"Order {row.id} (broker_order_id={row.broker_order_id}) is not working "
-                           f"at IBKR and has no execution: marking CANCELED")
-            row.status = OrderStatus.CANCELED
-            update_instance(row)
-            settled += 1
+            self._warn_once(f"absent-{row.id}", (
+                f"UNRESOLVED: order {row.id} (broker_order_id={row.broker_order_id}, status "
+                f"{row.status.value}) is on none of IBKR's lists (open, completed, session) and has no "
+                f"execution. It is left UNCHANGED, not cancelled: whether it filled, was cancelled or "
+                f"never existed cannot be told from the API (the Gateway restart drops completed "
+                f"orders and executions). Reconcile it by hand or from a Flex statement."))
         return settled
 
     def refresh_orders(self, **kwargs) -> bool:
