@@ -26,7 +26,8 @@ from ..utils.dividend_table import DIVIDEND_ROOT_CLASS, dividend_columns, divide
 from ..utils.responsive import CssOnce
 from ..utils.chart_axes import (
     MAX_DETAIL_LABELS, clip_forecast, date_axis, detail_labels, first_holding_index,
-    month_axis, null_before_start, stacked_month_series, stacked_tooltip_js,
+    TOTAL_NAME, month_axis, null_before_start, shown_label_totals, stacked_month_series,
+    stacked_tooltip_js,
 )
 from ..utils.perf_logger import PerfLogger
 from ..utils.protective_stop import resolve_protective_legs
@@ -6387,6 +6388,8 @@ class AccountGrowthTab:
 
         monthly_income = {}
         monthly_by_label = {}
+        by_symbol = {}          # month -> {symbol: realized + dividends}
+        labels_of = {}          # symbol -> its labels
         labels_set = set()
 
         # Group fills by symbol
@@ -6429,6 +6432,9 @@ class AccountGrowthTab:
                     month = dt.strftime('%Y-%m') if hasattr(dt, 'strftime') else str(dt)[:7]
                     monthly_income.setdefault(month, {'pnl': 0.0, 'div': 0.0})['pnl'] += realized
                     mlbl = monthly_by_label.setdefault(month, {})
+                    by_symbol_m = by_symbol.setdefault(month, {})
+                    by_symbol_m[sym] = by_symbol_m.get(sym, 0.0) + realized
+                    labels_of[sym] = labels_by_symbol.get(normalize_symbol(sym)) or ['Unlabeled']
                     for lb in (labels_by_symbol.get(normalize_symbol(sym)) or ['Unlabeled']):
                         mlbl[lb] = mlbl.get(lb, 0.0) + realized
                         labels_set.add(lb)
@@ -6443,6 +6449,10 @@ class AccountGrowthTab:
             amount = float(div.get('amount', 0))
             monthly_income.setdefault(month, {'pnl': 0.0, 'div': 0.0})['div'] += amount
             mlbl = monthly_by_label.setdefault(month, {})
+            dsym = div.get('symbol') or '?'
+            by_symbol_m = by_symbol.setdefault(month, {})
+            by_symbol_m[dsym] = by_symbol_m.get(dsym, 0.0) + amount
+            labels_of[dsym] = labels_by_symbol.get(normalize_symbol(div.get('symbol'))) or ['Unlabeled']
             for lb in (labels_by_symbol.get(normalize_symbol(div.get('symbol'))) or ['Unlabeled']):
                 mlbl[lb] = mlbl.get(lb, 0.0) + amount
                 labels_set.add(lb)
@@ -6454,6 +6464,11 @@ class AccountGrowthTab:
         for m in monthly_by_label:
             for lb in monthly_by_label[m]:
                 monthly_by_label[m][lb] = round(monthly_by_label[m][lb], 2)
+        for m in by_symbol:
+            by_symbol[m] = {k: round(v, 2) for k, v in by_symbol[m].items()}
+        # Kept for the label chart: a symbol with several labels is in several segments, so the
+        # chart's Total must count DISTINCT symbols (see chart_axes.shown_label_totals).
+        self._monthly_symbol_detail = {'by_symbol': by_symbol, 'labels_of': labels_of}
         return months, monthly_income, monthly_by_label, sorted(labels_set)
 
     def _compute_value_denominators(self, all_balance_history, all_positions,
@@ -6645,8 +6660,27 @@ class AccountGrowthTab:
                 denom = monthly_label.get(m, {}).get(lb)
                 return round(v / denom * 100, 2) if denom else None
 
+            detail = getattr(self, '_monthly_symbol_detail', None)
+
+            def layout_for(shown):
+                """Distinct-symbol totals, the 'not shown' remainder and whether the shown labels
+                overlap. Without per-symbol detail nothing can be said: disjoint is assumed (the
+                segment sum), as before."""
+                if not detail:
+                    return {'totals': None, 'not_shown': None, 'overlap': False}
+                return shown_label_totals(months, shown, detail['by_symbol'], detail['labels_of'])
+
+            def subtitle_for(shown, overlap, pct):
+                if pct:
+                    return 'Side by side: each bar is a % of that label\'s own market value.'
+                if overlap:
+                    return ('Labels overlap: a symbol with several labels appears in each, so bars '
+                            'do not add up. The marker counts each symbol once.')
+                return 'Labels are disjoint: segments stack to the marker (each symbol once).'
+
             def build_options(visible, pct):
                 shown = [lb for lb in labels if lb in visible]
+                lay = layout_for(shown)
                 if pct:
                     # % of each label's OWN market value: stacking percentages of different
                     # bases is meaningless, so % keeps side-by-side bars (no forecast, no total).
@@ -6655,19 +6689,22 @@ class AccountGrowthTab:
                                'itemStyle': {'color': label_color[lb]}} for lb in shown]
                     legend_names = list(shown)
                 else:
-                    # $: STACKED per month -- positives up, negatives down -- so 19 labels are
-                    # readable bars instead of hair-thin side-by-side slivers. Same numbers.
+                    # $: STACKED per month (positives up, negatives down) when the shown labels
+                    # are disjoint; SIDE BY SIDE when any symbol carries two or more of them (a
+                    # stack would count it twice and look like it adds up). The marker is the
+                    # realized + dividends of the DISTINCT symbols in the shown labels.
                     series = stacked_month_series(
                         months, shown,
                         lambda m, lb: cell(m, lb, False) if m in monthly_by_label else None,
                         lambda m, lb: (round(forecast[m]['labels'][lb], 2)
                                        if m in forecast and lb in forecast[m]['labels'] else None),
-                        lambda lb: label_color[lb], lambda lb: _rgba(label_color[lb], 0.35))
-                    legend_names = list(shown) + ['Total']
+                        lambda lb: label_color[lb], lambda lb: _rgba(label_color[lb], 0.35),
+                        stacked=not lay['overlap'], totals=lay['totals'])
+                    legend_names = list(shown) + [TOTAL_NAME]
                 fmt = '{value}%' if pct else '${value}'
                 tooltip = {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}}
                 if not pct:
-                    tooltip[':formatter'] = stacked_tooltip_js(False)
+                    tooltip[':formatter'] = stacked_tooltip_js(False, lay['not_shown'])
                 return {
                     'backgroundColor': 'transparent',
                     'tooltip': tooltip,
@@ -6688,12 +6725,19 @@ class AccountGrowthTab:
                 list(labels), default_labels, 'Labels shown', 'w-72')
             if hidden_by_scope > 0:
                 ui.label(f'{hidden_by_scope} labels hidden by the label scope').classes('text-xs text-gray-500')
+            subtitle = ui.label('').classes('text-xs text-gray-500')
+
+            def update_subtitle(visible, pct):
+                shown = [lb for lb in labels if lb in visible]
+                subtitle.set_text(subtitle_for(shown, layout_for(shown)['overlap'], pct))
+            update_subtitle(default_labels, False)
             chart_container = ui.column().classes('w-full')
 
             def rebuild():
                 visible = list(label_select.value) if label_select.value else []
                 self._persist_selection(CHART_MONTHLY, visible)
                 self._kick_refresh()
+                update_subtitle(visible, mode.value == '%')
                 chart_container.clear()
                 with chart_container:
                     responsive_echart(build_options(visible, mode.value == '%')).classes('w-full').style('height: 360px')
