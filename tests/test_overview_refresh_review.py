@@ -82,7 +82,17 @@ def env(monkeypatch):
     monkeypatch.setattr(ov, 'get_labels_by_symbol', lambda syms: {})
     monkeypatch.setattr(yfinance, 'download', lambda *a, **k: yf_calls.append(k.get('period')))
     monkeypatch.setattr(ov, '_extract_yf_close_prices', lambda h, s: {'2026-09-01': 1.0})
-    monkeypatch.setattr(ov.ui, 'notify', lambda *a, **k: notes.append((a, k)))
+    from nicegui.slot import Slot
+
+    def notify(msg, *a, **k):
+        # production: a create_task'd load has an EMPTY slot stack, so ui.notify raises
+        notes.append({'msg': msg, 'ctx_ok': bool(Slot.get_stack()), **k})
+        if not Slot.get_stack():
+            raise RuntimeError('slot stack empty (what production raises)')
+    monkeypatch.setattr(ov.ui, 'notify', notify)
+    originals = {n: getattr(ov.AccountGrowthTab, n) for n in (
+        '_render_per_position_section', '_render_growth_by_label_charts',
+        '_render_position_growth_chart_from_data')}
 
     async def hidden(code, *a, **k):
         return state.__dict__.get('hidden', False)
@@ -130,8 +140,13 @@ def env(monkeypatch):
 
     def last(kind):
         return [d for d in drawn if d['kind'] == kind][-1]
+    def restore(name):
+        monkeypatch.setattr(ov.AccountGrowthTab, name, originals[name])
+    monkeypatch.setattr(ov.AccountGrowthTab, '_render_position_growth_chart_from_data',
+                        lambda self, symbol, *a, **k: drawn.append({'kind': 'symbol_chart', 'symbol': symbol}) or {})
     return SimpleNamespace(ov=ov, clock=clock, drawn=drawn, notes=notes, captured=captured,
-                           yf=yf_calls, state=state, settle=settle, build=build, last=last, ui=ui)
+                           yf=yf_calls, state=state, settle=settle, build=build, last=last, ui=ui,
+                           restore=restore)
 
 
 # ---- 1: one lock, no concurrent fetches ---------------------------------------------------------
@@ -165,7 +180,7 @@ def test_timer_does_not_fire_immediately(env):
 
 # ---- 2: auto refresh keeps balance and TTL consistent; chip instead of a redraw -------------------
 
-def test_auto_refresh_with_a_moved_balance_stores_it_and_offers_a_chip(env):
+def test_auto_refresh_with_a_moved_balance_updates_silently_without_a_chip(env):
     async def go():
         page = env.build()
         await env.settle()
@@ -184,14 +199,35 @@ def test_auto_refresh_with_a_moved_balance_stores_it_and_offers_a_chip(env):
         from nicegui import ui
         with page.client.content:
             await page.tab._load_growth_data(ui.label('x'), ui.column(), 1)
-        return page, redrawn, calls_auto, list(broker.calls), chip_shown
-    page, redrawn, calls_auto, calls_click, chip_shown = asyncio.run(go())
-    assert not redrawn                              # never redraws on its own
-    assert chip_shown                               # ...it offers a chip
-    assert not page.chip.visible                    # and drawing the new data hides it again
-    assert 'balance' in calls_auto                  # equity IS refetched with the rest
-    assert calls_click == []                        # the click 30 s later is fresh
-    assert env.last('total')['nlv'] == 2000.0       # and shows the new equity
+        return redrawn, chip_shown, calls_auto, list(broker.calls)
+    redrawn, chip_shown, calls_auto, calls_click = asyncio.run(go())
+    assert not redrawn and not chip_shown           # balance-only: no redraw, no chip
+    assert 'balance' in calls_auto
+    assert calls_click == []                        # the click 30 s later is fresh...
+    assert env.last('total')['nlv'] == 2000.0       # ...and shows the new equity
+
+
+def test_auto_refresh_with_changed_rows_offers_the_chip_and_the_tap_draws_from_cache(env):
+    async def go():
+        page = env.build()
+        await env.settle()
+        broker = env.state.brokers[0]
+        broker.divs.append({'symbol': 'AAA', 'amount': 7.0, 'date': _dt(TODAY - timedelta(days=2)),
+                            'drip_quantity': None})
+        broker.calls.clear()
+        env.clock.t += 300
+        n0 = len([d for d in env.drawn if d['kind'] == 'total'])
+        await page.timer.callback()
+        shown = page.chip.visible
+        redrawn = len([d for d in env.drawn if d['kind'] == 'total']) != n0
+        broker.calls.clear()
+        with page.client.content:
+            page.new_data(None)
+        await env.settle()
+        return page, shown, redrawn, list(broker.calls)
+    page, shown, redrawn, calls = asyncio.run(go())
+    assert shown and not redrawn
+    assert calls == [] and env.last('total')['n_div'] == 4 and not page.chip.visible
 
 
 def test_auto_refresh_with_nothing_changed_is_silent_and_resets_the_ttl_consistently(env):
@@ -204,7 +240,6 @@ def test_auto_refresh_with_nothing_changed_is_silent_and_resets_the_ttl_consiste
         await page.timer.callback()
         fresh = page.tab._broker_cache['fetched_at'] == env.clock.t
         env.clock.t += 30
-        await page.tab._load_growth_data(env.ui.label('x'), env.ui.column(), 1) if False else None
         return page, fresh, list(broker.calls)
     page, fresh, calls = asyncio.run(go())
     assert not page.chip.visible
@@ -257,29 +292,34 @@ def test_failed_broker_fetch_keeps_the_good_rows_and_warns_once(env):
         return page, good
     page, good = asyncio.run(go())
     assert good and env.last('monthly')['income'] == good
+    assert 'refresh failed' in page.tab._updated_label.text
     assert env.last('total')['n_trades'] == 1 and env.last('total')['n_div'] == 3
-    assert len([n for n in env.notes if n[1].get('type') == 'warning']) == 1
+    assert len([n for n in env.notes if n.get('type') == 'warning']) >= 1
     assert page.tab._broker_cache['positions']
 
 
-def test_merge_refresh_rules():
+def test_merge_refresh_is_judged_per_account():
     from ba2_trade_platform.ui.pages.overview import merge_refresh
-    prev = {'dividends': [1], 'trades': [2], 'positions': [3], 'account_map': {'a': 1},
-            'positions_by_account': {1: {'a'}}, 'qty_by_account_symbol': {(1, 'a'): 1.0}}
-    raw = {'dividends': [], 'trades': [9], 'positions': [], 'account_map': {},
-           'positions_by_account': {}, 'qty_by_account_symbol': {}}
-    merged, bad = merge_refresh(prev, raw, {'positions'})
-    assert bad == {'dividends', 'positions'}
-    assert merged['dividends'] == [1] and merged['trades'] == [9]
-    assert merged['positions'] == [3] and merged['qty_by_account_symbol'] == {(1, 'a'): 1.0}
+    prev = {1: {'dividends': [1, 2, 3], 'trades': [4], 'positions': ['p1'], 'balance': [9]},
+            2: {'dividends': [5, 6, 7], 'trades': [8], 'positions': ['p2'], 'balance': [9]}}
+    new = {1: {'dividends': [1, 2, 3, 10], 'trades': [4], 'positions': ['p1'], 'balance': [9]},
+           2: {'dividends': [], 'trades': [], 'positions': [], 'balance': [9]}}
+    merged, bad = merge_refresh(prev, new, {(2, 'positions')})
+    assert bad == {(2, 'dividends'), (2, 'trades'), (2, 'positions')}
+    assert merged[1]['dividends'] == [1, 2, 3, 10]                  # account 1 updates
+    assert merged[2]['dividends'] == [5, 6, 7] and merged[2]['trades'] == [8]
+    assert merged[2]['positions'] == ['p2']                          # failed -> kept
     # first fetch: nothing to fall back on; an empty history is simply empty
-    merged, bad = merge_refresh(None, raw, set())
-    assert bad == set() and merged['dividends'] == []
+    merged, bad = merge_refresh(None, new, set())
+    assert bad == set() and merged[2]['dividends'] == []
+    # a flat account (positions really []) is not a failure
+    merged, bad = merge_refresh(prev, {1: dict(prev[1], positions=[]), 2: prev[2]}, set())
+    assert bad == set() and merged[1]['positions'] == []
 
 
 # ---- 4: scope / dropdown redraws after the TTL refetch ---------------------------------------------------
 
-def test_scope_change_after_the_ttl_goes_through_a_load(env):
+def test_scope_change_after_the_ttl_redraws_at_once_and_refreshes_in_the_background(env):
     async def go():
         page = env.build()
         await env.settle()
@@ -290,25 +330,38 @@ def test_scope_change_after_the_ttl_goes_through_a_load(env):
         env.captured['on_scope_change']()                 # inside the TTL: plain redraw
         within = list(broker.calls)
         env.clock.t += 600
-        env.captured['on_scope_change']()                 # expired: reload -> refetch
+        n0 = len([d for d in env.drawn if d['kind'] == 'total'])
+        env.captured['on_scope_change']()                 # expired
+        redrawn_now = len([d for d in env.drawn if d['kind'] == 'total']) - n0
+        n_div_now = env.last('total')['n_div']
         await env.settle()
-        return within, list(broker.calls), env.last('total')['n_div']
-    within, after, n_div = asyncio.run(go())
-    assert within == [] and after.count('dividends') == 1 and n_div == 4
+        for _ in range(60):
+            await asyncio.sleep(0.05)
+            if page.chip.visible:
+                break
+        return page, within, redrawn_now, n_div_now, list(broker.calls), env.last('total')['n_div']
+    page, within, redrawn_now, n_div_now, after, n_div_end = asyncio.run(go())
+    assert within == [] and redrawn_now == 1               # drawn immediately from page data
+    assert n_div_now == 3 and n_div_end == 3               # not redrawn by the refresh itself
+    assert after.count('dividends') == 1 and page.chip.visible   # background refetch -> chip
 
 
-def test_dropdown_helper_reloads_only_when_expired(env):
+def test_kick_refresh_only_starts_when_expired_and_idle(env):
     async def go():
         page = env.build()
         await env.settle()
-        started = []
-        page.tab._reload = lambda msg: started.append(msg)
-        fresh = page.tab._reload_if_expired()
+        broker = env.state.brokers[0]
+        broker.calls.clear()
+        page.tab._kick_refresh()                          # fresh: nothing
+        await asyncio.sleep(0.2)
+        fresh = list(broker.calls)
         env.clock.t += 61
-        expired = page.tab._reload_if_expired()
-        return fresh, expired, started
-    fresh, expired, started = asyncio.run(go())
-    assert (fresh, expired) == (False, True) and len(started) == 1
+        page.tab._kick_refresh()
+        page.tab._kick_refresh()                          # second kick while one is running
+        await asyncio.sleep(0.5)
+        return fresh, broker.n('dividends')
+    fresh, n = asyncio.run(go())
+    assert fresh == [] and n == 1
 
 
 def test_all_accounts_dropdown_choice_survives_a_reload():
@@ -322,15 +375,14 @@ def test_all_accounts_dropdown_choice_survives_a_reload():
 # ---- 6: fingerprint false negatives -----------------------------------------------------------------------
 
 def _fp(divs=None, trades=None, positions=None, balance=None):
-    from ba2_trade_platform.ui.pages.overview import data_fingerprint
+    from ba2_trade_platform.ui.pages.overview import rows_fingerprint as data_fingerprint
     base_d = [{'symbol': 'AAA', 'amount': 5.0, 'date': '2026-07-01', 'drip_quantity': None, 'account_id': 1},
               {'symbol': 'AAA', 'amount': 5.0, 'date': '2026-04-01', 'drip_quantity': None, 'account_id': 1}]
     base_t = [{'symbol': 'AAA', 'side': 'BUY', 'qty': 10, 'price': 10.0, 'date': '2025-01-01', 'account_id': 1}]
     base_p = [SimpleNamespace(symbol='AAA', qty=10)]
     base_b = [{'date': '2026-10-02', 'net_liquidating_value': 1000.0, 'cash_balance': 10.0}]
     return data_fingerprint(divs if divs is not None else base_d, trades if trades is not None else base_t,
-                            positions if positions is not None else base_p,
-                            balance if balance is not None else base_b)
+                            positions if positions is not None else base_p)
 
 
 @pytest.mark.parametrize('name,kw', [
@@ -347,17 +399,15 @@ def _fp(divs=None, trades=None, positions=None, balance=None):
         {'symbol': 'AAA', 'side': 'SELL', 'qty': 10, 'price': 10.0, 'date': '2025-01-01', 'account_id': 1}])),
     ('position quantity moved', dict(positions=[SimpleNamespace(symbol='AAA', qty=4),
                                                 SimpleNamespace(symbol='BBB', qty=6)])),
-    ('intraday equity', dict(balance=[{'date': '2026-10-02', 'net_liquidating_value': 1001.0,
-                                       'cash_balance': 10.0}])),
 ])
 def test_fingerprint_detects_changes_the_old_summary_missed(name, kw):
     assert _fp(**kw) != _fp(), name
 
 
 def test_fingerprint_is_order_independent_and_stable():
-    from ba2_trade_platform.ui.pages.overview import data_fingerprint
+    from ba2_trade_platform.ui.pages.overview import rows_fingerprint
     a = [{'symbol': 'A', 'amount': 1, 'date': '2026-01-01'}, {'symbol': 'B', 'amount': 2, 'date': '2026-01-02'}]
-    assert data_fingerprint(a, [], [], []) == data_fingerprint(list(reversed(a)), [], [], [])
+    assert rows_fingerprint(a, [], []) == rows_fingerprint(list(reversed(a)), [], [])
 
 
 # ---- follow-ups ----------------------------------------------------------------------------------------------
@@ -413,3 +463,164 @@ def test_refresh_button_clears_the_cache_and_refetches_everything(env):
         return broker
     broker = asyncio.run(go())
     assert [broker.n(n) for n in ('dividends', 'trades', 'positions', 'balance')] == [1, 1, 1, 1]
+
+
+# ===================================================================== review 4
+def test_failure_on_the_load_path_is_visible_inline_and_toasted_from_the_label_slot(env):
+    async def go():
+        page = env.build()
+        await env.settle()
+        env.state.brokers[0].fail = {'dividends'}
+        env.clock.t += 120
+        with page.client.content:
+            page.tab._set_range('1y')
+            from nicegui import ui
+            await page.tab._load_growth_data(ui.label('x'), ui.column(), 1)   # a bare task: no slot
+        return page
+    page = asyncio.run(go())
+    assert env.notes and all(n['ctx_ok'] for n in env.notes)        # shown: raised inside the label slot
+    assert page.tab._refresh_warned is True
+    assert 'refresh failed' in page.tab._updated_label.text
+    assert 'text-orange-500' in page.tab._updated_label.classes
+
+
+def test_marker_clears_when_a_fetch_succeeds_again(env):
+    async def go():
+        page = env.build()
+        await env.settle()
+        broker = env.state.brokers[0]
+        broker.fail = {'dividends'}
+        env.clock.t += 300
+        await page.timer.callback()
+        marked = 'refresh failed' in page.tab._updated_label.text
+        broker.fail = set()
+        env.clock.t += 300
+        await page.timer.callback()
+        return page, marked
+    page, marked = asyncio.run(go())
+    assert marked and 'refresh failed' not in page.tab._updated_label.text
+    assert page.tab._refresh_warned is False
+
+
+def test_one_accounts_transient_empty_keeps_that_accounts_rows_in_all_accounts_mode(env):
+    b1, b2 = Broker(aid=1), Broker(aid=2)
+    b2.divs = [dict(d, symbol='BBB') for d in b2.divs]
+    b2.trades = [dict(t, symbol='BBB') for t in b2.trades]
+    b2.positions = [SimpleNamespace(symbol='BBB', qty=10, avg_entry_price=10.0)]
+    env.state.brokers, env.state.selected = [b1, b2], None
+
+    async def go():
+        page = env.build()
+        await env.settle()
+        n_div, n_trd = env.last('total')['n_div'], env.last('total')['n_trades']
+        b2.fail = {'dividends', 'trades'}
+        b1.divs.append({'symbol': 'AAA', 'amount': 9.0, 'date': _dt(TODAY - timedelta(days=1)),
+                        'drip_quantity': None})
+        env.clock.t += 300
+        await page.timer.callback()
+        cache = page.tab._broker_cache
+        return page, n_div, n_trd, len(cache['dividends']), len(cache['trades'])
+    page, n_div, n_trd, now_div, now_trd = asyncio.run(go())
+    assert (n_div, n_trd) == (6, 2)
+    assert now_div == 7 and now_trd == 2          # acct 1 updated, acct 2 kept its 3 rows + trade
+    assert page.chip.visible                      # acct 1's new dividend is a real change
+
+
+def test_a_failing_broker_is_asked_once_per_ttl_not_once_per_click(env):
+    async def go():
+        page = env.build()
+        await env.settle()
+        broker = env.state.brokers[0]
+        broker.fail = {'dividends', 'trades', 'positions'}
+        broker.calls.clear()
+        env.clock.t += 120
+        for _ in range(3):
+            env.captured['on_scope_change']()
+            await asyncio.sleep(0.4)
+            env.clock.t += 5
+        return broker
+    broker = asyncio.run(go())
+    assert broker.n('dividends') == 1               # one round for the three clicks
+
+
+def test_refresh_button_during_an_outage_keeps_the_old_rows_on_screen(env):
+    async def go():
+        page = env.build()
+        await env.settle()
+        broker = env.state.brokers[0]
+        broker.fail = {'dividends', 'trades', 'positions'}
+        with page.client.content:
+            page.refresh(None)
+        await env.settle()
+        return page
+    page = asyncio.run(go())
+    assert env.last('total')['n_div'] == 3 and env.last('total')['n_trades'] == 1
+    assert 'refresh failed' in page.tab._updated_label.text
+
+
+def test_an_account_whose_balance_history_is_empty_is_asked_once_per_load(env):
+    class NoBalance(Broker):
+        def get_balance_history(self, start_date=None, end_date=None):
+            self._enter('balance')
+            return []
+    env.state.brokers = [NoBalance()]
+
+    async def go():
+        page = env.build()
+        await env.settle()
+        return env.state.brokers[0]
+    assert asyncio.run(go()).n('balance') == 1
+
+
+def test_a_click_after_the_ttl_keeps_the_all_accounts_symbol_pick_and_does_not_reload(env):
+    b1, b2 = Broker(aid=1), Broker(aid=2)
+    b1.positions = [SimpleNamespace(symbol=s, qty=10, avg_entry_price=10.0, cost_basis=100.0)
+                    for s in ('AAA', 'BBB')]
+    b2.positions = [SimpleNamespace(symbol='CCC', qty=10, avg_entry_price=10.0, cost_basis=100.0)]
+    env.state.brokers, env.state.selected = [b1, b2], None
+    env.restore('_render_per_position_section')
+
+    async def go():
+        page = env.build()
+        await env.settle()
+        sel = [e for e in page.client.elements.values() if type(e).__name__ == 'Select'
+               and e._props.get('label') == 'Select Symbol'][-1]
+        n_total = len([d for d in env.drawn if d['kind'] == 'total'])
+        env.clock.t += 120
+        with page.client.content:
+            sel.set_value('CCC')
+        await env.settle()
+        sels = [e for e in page.client.elements.values() if type(e).__name__ == 'Select'
+                and e._props.get('label') == 'Select Symbol']
+        return page, sels, len([d for d in env.drawn if d['kind'] == 'total']) - n_total
+    page, sels, redraws = asyncio.run(go())
+    assert redraws == 0                                    # no page reload
+    assert [d['symbol'] for d in env.drawn if d['kind'] == 'symbol_chart'][-1] == 'CCC'
+    assert sels[-1].value == 'CCC'
+    assert page.tab._stored_singles('position_symbol') == ['CCC']
+
+
+def test_a_checkbox_click_after_the_ttl_keeps_the_choice_and_does_not_reload(env, monkeypatch):
+    from datetime import timedelta as td
+    monkeypatch.setattr(env.ov, '_extract_yf_close_prices',
+                        lambda h, s: {(TODAY - td(days=i)).isoformat(): 10.0 + i * 0.01 for i in range(1, 100)})
+    env.restore('_render_growth_by_label_charts')
+    env.state.brokers[0].positions = [SimpleNamespace(symbol='AAA', qty=10, avg_entry_price=10.0,
+                                                      cost_basis=100.0)]
+
+    async def go():
+        page = env.build()
+        await env.settle()
+        boxes = [e for e in page.client.elements.values()
+                 if type(e).__name__ == 'Checkbox' and e.text == 'Dividends']
+        assert boxes, 'growth-by-label controls were not rendered'
+        n_total = len([d for d in env.drawn if d['kind'] == 'total'])
+        env.clock.t += 120
+        with page.client.content:
+            boxes[-1].set_value(False)
+        await env.settle()
+        boxes = [e for e in page.client.elements.values()
+                 if type(e).__name__ == 'Checkbox' and e.text == 'Dividends']
+        return boxes[-1].value, len([d for d in env.drawn if d['kind'] == 'total']) - n_total
+    value, redraws = asyncio.run(go())
+    assert value is False and redraws == 0

@@ -178,9 +178,9 @@ def test_fresh_page_and_account_change_start_with_an_empty_cache(env):
 
 def test_updated_label_text_and_fingerprint():
     import ba2_trade_platform.ui.pages.overview as ov
-    a = ov.data_fingerprint([{'amount': 1, 'date': '2026-10-01'}], [], [], [])
-    b = ov.data_fingerprint([{'amount': 1, 'date': '2026-10-01'}, {'amount': 2, 'date': '2026-10-01'}], [], [], [])
-    c = ov.data_fingerprint([{'amount': 1, 'date': '2026-10-01'}], [], [], [])
+    a = ov.rows_fingerprint([{'amount': 1, 'date': '2026-10-01'}], [], [])
+    b = ov.rows_fingerprint([{'amount': 1, 'date': '2026-10-01'}, {'amount': 2, 'date': '2026-10-01'}], [], [])
+    c = ov.rows_fingerprint([{'amount': 1, 'date': '2026-10-01'}], [], [])
     assert a == c and a != b
 
 

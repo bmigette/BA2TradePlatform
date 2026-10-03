@@ -5225,11 +5225,12 @@ def _clock() -> float:
     return _time.monotonic()
 
 
-def data_fingerprint(dividends, trades, positions, balance) -> tuple:
-    """One digest per dataset over the SORTED full rows, so it changes when any row is
-    added, back-dated, re-symboled, re-sided, re-amounted or gains a DRIP quantity -- not
-    just when a count / sum / newest-date moves. The balance contributes its tail (count,
-    last date, last equity and cash): intraday equity changes count as changes."""
+def rows_fingerprint(dividends, trades, positions) -> tuple:
+    '''One digest per dataset over the SORTED full rows, so it changes when any row is added,
+    back-dated, re-symboled, re-sided, re-amounted or gains a DRIP quantity. The balance is
+    deliberately NOT part of it: equity moves every few minutes in market hours, and the
+    "new data" chip is for changed ROWS. A balance-only change updates the cache silently
+    and the next draw uses it.'''
     import hashlib
 
     def digest(rows):
@@ -5242,42 +5243,35 @@ def data_fingerprint(dividends, trades, positions, balance) -> tuple:
     trd = [(f(r.get('date')), f(r.get('symbol')), f(r.get('side')), f(r.get('qty')), f(r.get('price')),
             f(r.get('account_id'))) for r in trades]
     pos = [(f(getattr(p, 'symbol', None)), f(getattr(p, 'qty', None))) for p in positions]
-    bal_sorted = sorted(balance, key=lambda r: f(r.get('date')))
-    tail = bal_sorted[-1] if bal_sorted else {}
-    bal = (len(balance), f(tail.get('date')), f(tail.get('net_liquidating_value')),
-           f(tail.get('cash_balance')))
-    return (digest(div), digest(trd), digest(pos), bal)
+    return (digest(div), digest(trd), digest(pos))
 
 
-#: dataset -> the cache keys that travel together
-RAW_GROUPS = {
-    'dividends': ('dividends',),
-    'trades': ('trades',),
-    'positions': ('positions', 'account_map', 'positions_by_account', 'qty_by_account_symbol'),
-}
+#: Datasets where "had rows, now has none" is read as a failed fetch (the brokers return []
+#: on any error). Positions are judged by their explicit failure only: a flat account is real.
+NONEMPTY_RULE = ('dividends', 'trades', 'balance')
 
 
-def merge_refresh(prev, raw, failed):
-    """``(merged, bad)``: never replace good data with an error-shaped result.
+def merge_refresh(prev, new, failed):
+    '''``(merged, bad)``: never replace good data with an error-shaped result, PER ACCOUNT.
 
-    The brokers return ``[]`` on ANY error from ``get_dividends`` / ``get_filled_trades`` and
-    ``None`` from ``get_positions`` -- indistinguishable from "nothing there" except by
-    history. A dataset is BAD when its fetch raised / reported failure, or it went from
-    non-empty to empty (dividends and trades never legitimately shrink to nothing). A bad
-    dataset keeps its previous value; with no previous value it is reported but used as is.
-    """
-    merged = dict(raw)
-    bad = set()
-    for name, keys in RAW_GROUPS.items():
-        err = name in failed
-        if (not err and name in ('dividends', 'trades') and prev
-                and prev.get(keys[0]) and not raw.get(keys[0])):
-            err = True
-        if err:
-            bad.add(name)
-            if prev and keys[0] in prev:
-                for k in keys:
-                    merged[k] = prev[k]
+    ``prev`` / ``new``: ``{account_id: {dataset: rows}}``; ``failed``: ``{(account_id,
+    dataset)}`` for fetches that raised (or, for positions, returned None). A dataset is BAD
+    when its fetch failed or it went from non-empty to empty (``NONEMPTY_RULE``) -- judged
+    on that account's own rows, so one account's transient ``[]`` is not hidden by the
+    other account's rows keeping the combined total non-empty. A bad dataset keeps its
+    previous value; with no previous value it is reported and used as it is.'''
+    merged, bad = {}, set()
+    for aid, data in new.items():
+        old = (prev or {}).get(aid)
+        row = dict(data)
+        for name in data:
+            err = (aid, name) in failed or (
+                name in NONEMPTY_RULE and old is not None and old.get(name) and not data.get(name))
+            if err:
+                bad.add((aid, name))
+                if old is not None and name in old:
+                    row[name] = old[name]
+        merged[aid] = row
     return merged, bad
 
 
@@ -5375,6 +5369,7 @@ class AccountGrowthTab:
         else:
             self._broker_cache = {}
         self._refresh_warned = False
+        self._bg_running = False
         self._earliest = None            # first balance / trade / dividend date
         self._raw_range_start = None
         self._balance_first = None
@@ -5406,6 +5401,8 @@ class AccountGrowthTab:
         return resolve_chart_selection(stored, options)
 
     def _stored_singles(self, chart):
+        if self._single_account is None and ('single', chart) in self._sess():
+            return [self._sess()[('single', chart)]]
         return [read_overview_setting(single_key(chart, aid)) for aid in self._account_ids]
 
     def _persist_selection(self, chart, visible):
@@ -5419,6 +5416,8 @@ class AccountGrowthTab:
     def _persist_single(self, chart, value):
         if self._single_account is not None:
             _save_setting(single_key(chart, self._single_account), value)
+        else:
+            self._sess()[('single', chart)] = value
 
     def _scope_symbol_info(self, symbol_info):
         """Drop out-of-scope labels from each symbol (and symbols left with none)."""
@@ -5680,9 +5679,6 @@ class AccountGrowthTab:
                     reloading = ui.label(message).classes('text-sm text-gray-500')
                 asyncio.create_task(self._load_growth_data(reloading, charts_container, selected_account_id))
 
-            # Charts and dropdowns call this once the TTL has expired, so a long-open page
-            # refetches on the next click instead of redrawing from old data.
-            self._reload = reload_page
 
             def on_range_change(e):
                 if e.value not in RANGE_OPTIONS or e.value == self._range:
@@ -5694,7 +5690,7 @@ class AccountGrowthTab:
                 reload_page('Reloading for the new range...')
 
             def on_refresh(*_):
-                self._init_data_cache()       # clears the cache dict; the lock is kept
+                self._expire_cache()          # keep the old rows until the new fetch succeeds
                 self._set_range(self._range)
                 new_data_btn.set_visibility(False)
                 reload_page('Reloading broker data...')
@@ -5703,34 +5699,45 @@ class AccountGrowthTab:
                 new_data_btn.set_visibility(False)
                 reload_page('Updating...')     # the cache already holds the new rows: no fetch
 
-            async def auto_refresh():
-                # Cheap and polite. Skipped while a load runs or the browser tab is hidden
-                # (document.hidden is true for a background TAB; it cannot see a panel that
-                # is merely scrolled away or covered). It refetches IN FULL under the load
-                # lock and stores the result, but never redraws on its own -- that would jump
-                # the scroll position and reset session-only selections; it shows a
-                # "New data - tap to refresh" chip instead.
-                if self._load_lock.locked() or not self._account_ids:
-                    return
-                try:
-                    if await ui.run_javascript('document.hidden'):
-                        return
-                except Exception:
-                    return
+            async def background_refresh():
+                # Under the load lock, so it never overlaps a load. Refetches IN FULL and
+                # stores the result; never redraws on its own (that would jump the scroll
+                # position and reset session-only selections) -- when ROWS changed it shows
+                # the "New data - tap to refresh" chip instead.
                 changed = False
                 try:
                     async with self._load_lock:
                         target, problem = self._resolve_target_accounts(selected_account_id)
                         if problem or 'dividends' not in self._broker_cache:
                             return
-                        changed, _bad = await self._refresh_cache(target)
+                        if not self._cache_expired():
+                            return                 # another load refreshed it meanwhile
+                        changed = await self._refresh_cache(target)
                 except RuntimeError:
                     return
                 except Exception as e:
-                    logger.warning(f"Auto refresh failed: {e}")
+                    logger.warning(f"Background refresh failed: {e}")
                     return
+                finally:
+                    self._bg_running = False
                 if changed:
                     new_data_btn.set_visibility(True)
+
+            self._background_refresh = background_refresh
+
+            async def auto_refresh():
+                # Skipped while a load runs or the browser tab is hidden (document.hidden is
+                # true for a background TAB; it cannot see a panel that is merely scrolled
+                # away or covered).
+                if self._load_lock.locked() or not self._account_ids or self._bg_running:
+                    return
+                try:
+                    if await ui.run_javascript('document.hidden'):
+                        return
+                except Exception:
+                    return
+                self._bg_running = True
+                await background_refresh()
 
             refresh_btn.on_click(on_refresh)
             new_data_btn.on_click(on_new_data)
@@ -5783,18 +5790,12 @@ class AccountGrowthTab:
             self._activity_first = cache['activity_first']
 
             # Longer balance history only when the range needs an earlier start than what was
-            # REQUESTED (floor: _UNFETCHED | None = the broker's default ~1y | a date). A
-            # broker that returns less than asked is not asked again.
+            # REQUESTED (floor: None = the broker's default ~1y | a date). A broker that
+            # returns less than asked is not asked again.
             req = self._balance_request_start()
-            floor = cache['balance_floor']
+            floor = cache.get('balance_floor', _UNFETCHED)
             if floor is _UNFETCHED or (req is not None and (floor is None or req < floor)):
-                balance, bfailed = await self._fetch_balance(target_accounts, req)
-                if balance or not cache['balance']:
-                    cache['balance'] = balance
-                    cache['balance_floor'] = req if balance else _UNFETCHED
-                    bdates = [_to_date(x.get('date')) for x in balance]
-                    bdates = [d for d in bdates if d]
-                    cache['balance_first'] = min(bdates) if bdates else None
+                await self._refresh_balance(target_accounts, req)
             if gen != self._gen:
                 return
             self._balance_first = cache['balance_first']
@@ -5880,14 +5881,14 @@ class AccountGrowthTab:
                         self._render_dividend_history_table(all_dividends)
 
                 def on_scope_change():
-                    if self._reload_if_expired():
-                        return      # the reload recomputes the scope from the saved choice
+                    self._kick_refresh()
                     self._scope = self._effective_scope(scope_state)
                     draw_charts()
 
                 if scope_state:
                     self._render_scope_controls(scope_holder, scope_state, on_scope_change)
                 draw_charts()
+                self._hide_chip()
                 self._update_age_label()
             except RuntimeError:
                 return
@@ -5918,142 +5919,181 @@ class AccountGrowthTab:
             return [], 'No accounts available for growth data.'
         return target, None
 
-    async def _fetch_raw_data(self, target_accounts):
-        """The range-independent broker lists, fetched IN FULL (never incrementally)."""
-        dividends_all, trades_all = [], []
-        positions_all, account_map_c = [], {}
-        positions_by_acc, qty_by_acc = {}, {}
-        failed = set()
-        for acc_def, account_instance in target_accounts:
-            try:
-                divs = await asyncio.to_thread(account_instance.get_dividends)
-                for entry in divs:
-                    entry['account_name'] = acc_def.name
-                    entry['account_id'] = acc_def.id
-                dividends_all.extend(divs)
-            except Exception as e:
-                failed.add('dividends')
-                logger.warning(f"Could not load dividends for {acc_def.name}: {e}")
-            try:
-                trades = await asyncio.to_thread(account_instance.get_filled_trades)
-                for t in trades:
-                    t['account_id'] = acc_def.id
-                trades_all.extend(trades)
-            except Exception as e:
-                failed.add('trades')
-                logger.warning(f"Could not load filled trades for {acc_def.name}: {e}")
-            try:
-                positions = await asyncio.to_thread(account_instance.get_positions)
-                if positions is None:       # the brokers' "fetch failed" (not "no positions")
-                    raise RuntimeError('get_positions returned None')
-                for pos in positions:
-                    positions_by_acc.setdefault(acc_def.id, set()).add(pos.symbol)
-                    qk = (acc_def.id, pos.symbol)
-                    qty_by_acc[qk] = qty_by_acc.get(qk, 0.0) + float(pos.qty)
-                    positions_all.append(pos)
-                    account_map_c[pos.symbol] = account_instance
-            except Exception as e:
-                failed.add('positions')
-                logger.warning(f"Could not load positions for {acc_def.name}: {e}")
-        return (dict(dividends=dividends_all, trades=trades_all, positions=positions_all,
-                     account_map=account_map_c, positions_by_account=positions_by_acc,
-                     qty_by_account_symbol=qty_by_acc), failed)
+    async def _fetch_accounts(self, target_accounts, req=None, only=('dividends', 'trades', 'positions', 'balance')):
+        '''``({account_id: {dataset: rows}}, failed)`` -- fetched IN FULL, never incrementally.
+        ``failed`` holds ``(account_id, dataset)`` for fetches that raised (``get_positions``
+        returning None counts: that is the brokers' "fetch failed").'''
+        new, failed = {}, set()
+        for acc_def, inst in target_accounts:
+            aid, row = acc_def.id, {}
+            for name in only:
+                try:
+                    if name == 'dividends':
+                        rows = await asyncio.to_thread(inst.get_dividends)
+                        for entry in rows:
+                            entry['account_name'] = acc_def.name
+                            entry['account_id'] = aid
+                    elif name == 'trades':
+                        rows = await asyncio.to_thread(inst.get_filled_trades)
+                        for t in rows:
+                            t['account_id'] = aid
+                    elif name == 'positions':
+                        rows = await asyncio.to_thread(inst.get_positions)
+                        if rows is None:
+                            raise RuntimeError('get_positions returned None')
+                    else:
+                        if req is not None:
+                            rows = await asyncio.to_thread(
+                                inst.get_balance_history,
+                                start_date=datetime.combine(req, datetime.min.time()),
+                                end_date=datetime.now())
+                        else:
+                            rows = await asyncio.to_thread(inst.get_balance_history)
+                        for entry in rows:
+                            entry['account_name'] = acc_def.name
+                            entry['account_id'] = aid
+                    row[name] = list(rows)
+                except Exception as e:
+                    failed.add((aid, name))
+                    row[name] = []
+                    logger.warning(f"Could not load {name} for {acc_def.name}: {e}")
+            new[aid] = row
+        return new, failed
 
-    async def _fetch_balance(self, target_accounts, req):
-        """``(balance rows, failed)``; ``req`` None = the broker's default window."""
-        balance, failed = [], False
-        for acc_def, account_instance in target_accounts:
-            try:
-                if req is not None:
-                    bh = await asyncio.to_thread(
-                        account_instance.get_balance_history,
-                        start_date=datetime.combine(req, datetime.min.time()),
-                        end_date=datetime.now())
-                else:
-                    bh = await asyncio.to_thread(account_instance.get_balance_history)
-                for entry in bh:
-                    entry['account_name'] = acc_def.name
-                    entry['account_id'] = acc_def.id
-                balance.extend(bh)
-            except Exception as e:
-                failed = True
-                logger.warning(f"Could not load balance history for {acc_def.name}: {e}")
-        return balance, failed
+    def _store_accounts(self, accounts, instances):
+        '''Keep the per-account rows and the combined views the charts read.'''
+        cache = self._broker_cache
+        cache['accounts'], cache['instances'] = accounts, instances
+        div, trd, pos, bal = [], [], [], []
+        account_map, pos_by_acc, qty_by_acc = {}, {}, {}
+        for aid, data in accounts.items():
+            div.extend(data.get('dividends', []))
+            trd.extend(data.get('trades', []))
+            bal.extend(data.get('balance', []))
+            for p_ in data.get('positions', []):
+                pos.append(p_)
+                pos_by_acc.setdefault(aid, set()).add(p_.symbol)
+                qty_by_acc[(aid, p_.symbol)] = qty_by_acc.get((aid, p_.symbol), 0.0) + float(p_.qty)
+                account_map[p_.symbol] = instances[aid]
+        dates = [_to_date(x.get('date')) for x in div + trd]
+        dates = [d for d in dates if d]
+        bdates = [_to_date(x.get('date')) for x in bal]
+        bdates = [d for d in bdates if d]
+        cache.update(dividends=div, trades=trd, positions=pos, balance=bal, account_map=account_map,
+                     positions_by_account=pos_by_acc, qty_by_account_symbol=qty_by_acc,
+                     activity_first=min(dates) if dates else None,
+                     balance_first=min(bdates) if bdates else None)
 
     def _cache_expired(self):
         cache = self._broker_cache
         return 'dividends' in cache and _clock() - cache['fetched_at'] > BROKER_DATA_TTL_SECONDS
 
-    async def _refresh_cache(self, target_accounts):
-        """Fetch EVERYTHING again, in full (never "since the last fetch": a payment can be
-        booked back-dated), and store it -- raw lists and balance together, so the cache is
-        consistent and the TTL applies to all of it. A dataset that failed or came back
-        error-shaped keeps its previous rows (``merge_refresh``) and the TTL is NOT reset,
-        so the next click or tick retries. Returns ``(changed, bad)``."""
+    def _expire_cache(self):
+        '''Mark everything stale WITHOUT dropping it: the refresh button keeps the old rows on
+        screen and in the cache until the new fetch succeeds.'''
         cache = self._broker_cache
-        prev = {k: cache[k] for keys in RAW_GROUPS.values() for k in keys} if 'dividends' in cache else None
-        prev_balance = cache.get('balance') or []
-        prev_fp = (data_fingerprint(prev['dividends'], prev['trades'], prev['positions'], prev_balance)
+        if 'fetched_at' in cache:
+            cache['fetched_at'] = float('-inf')
+        if cache.get('prices'):
+            cache['prices']['fetched_at'] = float('-inf')
+        self._refresh_warned = False
+
+    async def _refresh_cache(self, target_accounts):
+        '''Fetch EVERYTHING again, in full (never "since the last fetch": a payment can be
+        booked back-dated) and merge it per account (``merge_refresh``): a failed or
+        error-shaped dataset keeps its previous rows. ``fetched_at`` is the time of this
+        ATTEMPT, success or not, so a failing broker is asked once per TTL, not on every
+        click; ``updated_wall`` (the "Updated" stamp) moves only on a fully good fetch.
+        Returns ``changed`` -- whether the ROWS (not the balance) differ from before.'''
+        cache = self._broker_cache
+        prev = cache.get('accounts')
+        prev_fp = (rows_fingerprint(cache['dividends'], cache['trades'], cache['positions'])
                    if prev else None)
-        raw, failed = await self._fetch_raw_data(target_accounts)
-        merged, bad = merge_refresh(prev, raw, failed)
-        dates = [_to_date(x.get('date')) for x in merged['dividends'] + merged['trades']]
-        dates = [d for d in dates if d]
-        activity_first = min(dates) if dates else None
-        req = self._balance_request_start(activity_first)
-        balance, bfailed = await self._fetch_balance(target_accounts, req)
-        floor = req
-        if (bfailed or not balance) and prev_balance:
-            balance, floor = prev_balance, cache.get('balance_floor', _UNFETCHED)
-            bad.add('balance')
-        elif bfailed or not balance:
-            floor = _UNFETCHED            # nothing to fall back on: ask again on the next load
-        bdates = [_to_date(x.get('date')) for x in balance]
-        bdates = [d for d in bdates if d]
-        cache.update(merged)
-        cache.update(balance=balance, balance_floor=floor,
-                     balance_first=min(bdates) if bdates else None, activity_first=activity_first)
+        instances = {a.id: inst for a, inst in target_accounts}
+        new, failed = await self._fetch_accounts(
+            target_accounts, only=('dividends', 'trades', 'positions'))
+        merged, bad = merge_refresh(prev, new, failed)
+        for aid, row in merged.items():                     # carry the balance until refetched
+            row['balance'] = list(((prev or {}).get(aid) or {}).get('balance', []))
+        self._store_accounts(merged, instances)
+        bad |= await self._refresh_balance(target_accounts)
+        changed = (prev_fp is not None and prev_fp != rows_fingerprint(
+            cache['dividends'], cache['trades'], cache['positions']))
+        cache['fetched_at'] = _clock()
+        cache['failed'] = bad
         if not bad or prev is None:
-            cache['fetched_at'] = _clock()
             cache['updated_wall'] = datetime.now()
-        changed = (prev_fp is not None and prev_fp != data_fingerprint(
-            merged['dividends'], merged['trades'], merged['positions'], balance))
-        if bad and prev is not None:
-            logger.warning(f"Broker refresh incomplete ({', '.join(sorted(bad))}); kept the previous data")
+        self._announce_refresh(bad, prev is not None)
+        return changed
+
+    async def _refresh_balance(self, target_accounts, req=None):
+        '''Fetch the balance history (from ``req``, default: this range's need), merge it per
+        account into the cache and record what was REQUESTED as the floor -- even when the
+        broker returned nothing (an IBKR-only selection is not asked twice per load).'''
+        cache = self._broker_cache
+        if req is None:
+            req = self._balance_request_start(cache.get('activity_first'))
+        new, failed = await self._fetch_accounts(target_accounts, req, only=('balance',))
+        merged, bad = merge_refresh(cache.get('accounts'), new, failed)
+        accounts = {aid: dict(cache['accounts'].get(aid, {}), balance=row['balance'])
+                    for aid, row in merged.items()}
+        self._store_accounts(accounts, cache['instances'])
+        if not bad:
+            cache['balance_floor'] = req
+        else:
+            cache.setdefault('balance_floor', req)
+        return bad
+
+    def _announce_refresh(self, bad, had_previous):
+        '''The refresh result, where the user can see it. The inline marker (set by
+        ``_update_age_label``) stays until a fetch succeeds; the toast is a bonus -- page
+        loads run as bare asyncio tasks with no UI slot, so it is raised from INSIDE the
+        stamp label's own slot, and the "already warned" flag is set only once it worked.'''
+        self._update_age_label()
+        if bad and had_previous:
+            logger.warning(f"Broker refresh incomplete {sorted(bad)}; kept the previous rows")
             if not self._refresh_warned:
-                self._refresh_warned = True
+                label = getattr(self, '_updated_label', None)
                 try:
-                    ui.notify('Could not refresh ' + ', '.join(sorted(bad)) +
-                              ' from the broker; showing the previous data.', type='warning')
-                except RuntimeError:
+                    with label:
+                        ui.notify('Could not refresh some broker data; showing the previous '
+                                  'data.', type='warning')
+                    self._refresh_warned = True
+                except (RuntimeError, AttributeError, TypeError):
                     pass
         elif not bad:
             self._refresh_warned = False
-        return changed, bad
 
-    def _reload_if_expired(self):
-        """True (and a reload started) when the cache is past its TTL: a click that would
-        redraw from captured data must instead go through ``_load_growth_data``."""
-        reload = getattr(self, '_reload', None)
-        if reload is not None and self._cache_expired():
-            reload('Refreshing broker data...')
-            return True
-        return False
+    def _kick_refresh(self):
+        '''A click that redraws from the data already on the page also starts a BACKGROUND
+        refresh when the cache is past its TTL. Never a reload: that would lose the click
+        and jump the scroll. When the refresh finds changed rows the chip appears.'''
+        bg = getattr(self, '_background_refresh', None)
+        if (bg is not None and not self._bg_running and not self._load_lock.locked()
+                and self._cache_expired()):
+            self._bg_running = True
+            asyncio.create_task(bg())
 
-    def _update_age_label(self):
+    def _hide_chip(self):
         chip = getattr(self, '_new_data_btn', None)
         if chip is not None:
             try:
                 chip.set_visibility(False)       # what it offered is on screen now
             except RuntimeError:
                 pass
+
+    def _update_age_label(self):
         label = getattr(self, '_updated_label', None)
         when = self._broker_cache.get('updated_wall')
-        if label is not None and when is not None:
-            try:
-                label.set_text(f"Updated {when.strftime('%H:%M:%S')}")
-            except RuntimeError:
-                pass
+        if label is None or when is None:
+            return
+        failed = bool(self._broker_cache.get('failed'))
+        try:
+            label.set_text(f"Updated {when.strftime('%H:%M:%S')}"
+                           + (' - refresh failed' if failed else ''))
+            label.classes(replace='text-xs ' + ('text-orange-500' if failed else 'text-gray-500'))
+        except RuntimeError:
+            pass
 
     _PRICE_RANKS = ['6mo', '1y', '3y', 'max']
 
@@ -6445,8 +6485,7 @@ class AccountGrowthTab:
             def rebuild():
                 visible = list(label_select.value) if label_select.value else []
                 self._persist_selection(CHART_MONTHLY, visible)
-                if self._reload_if_expired():
-                    return
+                self._kick_refresh()
                 chart_container.clear()
                 with chart_container:
                     responsive_echart(build_options(visible, mode.value == '%')).classes('w-full').style('height: 320px')
@@ -7123,8 +7162,7 @@ class AccountGrowthTab:
             def rebuild_label_chart():
                 visible = sorted(list(label_select.value)) if label_select.value else []
                 self._persist_selection(CHART_GROWTH, visible)
-                if self._reload_if_expired():
-                    return
+                self._kick_refresh()
                 chart_container.clear()
                 with chart_container:
                     responsive_echart(build_chart_options(
@@ -7465,8 +7503,7 @@ class AccountGrowthTab:
                 if not e.value:
                     return
                 self._persist_single(CHART_POSITION_LABEL, e.value)
-                if self._reload_if_expired():
-                    return
+                self._kick_refresh()
                 position_chart_container.clear()
                 with position_chart_container:
                     responsive_echart(build_position_chart_options(e.value)).classes('w-full h-80')
@@ -7690,8 +7727,7 @@ class AccountGrowthTab:
                 if not e.value:
                     return
                 self._persist_single(CHART_POSITION_SYMBOL, e.value)
-                if self._reload_if_expired():
-                    return
+                self._kick_refresh()
                 selected_symbol = e.value
                 account_inst = account_map.get(selected_symbol)
                 if not account_inst:
