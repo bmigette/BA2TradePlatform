@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from ba2_trade_platform.ui.utils.chart_axes import (
-    MAX_DETAIL_LABELS, clip_forecast, date_axis, detail_labels, first_holding_index, month_axis,
+    MAX_DETAIL_LABELS, TOTAL_NAME, clip_forecast, date_axis, detail_labels, first_holding_index, month_axis,
     null_before_start, shift_month, stacked_month_series, stacked_tooltip_js, tick_plan,
 )
 
@@ -126,7 +126,7 @@ def test_stacked_series_keep_every_value_and_stack_by_sign():
 
 def test_total_marker_is_the_actual_sum_and_never_includes_the_forecast():
     s = _series()
-    total = next(x for x in s if x['name'] == 'Total')
+    total = next(x for x in s if x['name'] == TOTAL_NAME)
     assert total['data'] == [6.0, 3.75, None]                    # Oct has only a forecast
     fc = next(x for x in s if x['name'] == 'A (forecast, estimated)')
     assert fc['data'] == [None, None, 3.0] and 'borderType' in fc['itemStyle']
@@ -183,7 +183,7 @@ def test_label_chart_is_stacked_with_the_same_money_and_a_total(nicegui_client, 
         want = sum(by_label.get(m, {}).values())
         got = sum(s['data'][m_i] or 0 for s in bars)
         assert got == pytest.approx(want)
-    total = next(s for s in opts['series'] if s['name'] == 'Total')
+    total = next(s for s in opts['series'] if s['name'] == TOTAL_NAME)
     assert total['data'][:2] == [pytest.approx(sum(by_label['2026-08'].values())),
                                  pytest.approx(sum(by_label['2026-09'].values()))]
     assert opts['xAxis']['data'] == months and months[-1] == '2026-10'
