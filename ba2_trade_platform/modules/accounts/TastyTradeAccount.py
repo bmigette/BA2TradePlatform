@@ -1061,6 +1061,33 @@ class TastyTradeAccount(AccountInterface):
             return cls._TT_DEFAULT_TIF
         return tif
 
+    #: The only times in force TastyTrade accepts on a MARKET order. Anything that rests
+    #: past the session is refused with HTTP 422 ``tif_market_orders_not_supported: GTC
+    #: Market orders are not supported`` -- live 2026-10-02, when 42 add-to-position and
+    #: close orders of one allocation run were all rejected. Those two writers
+    #: (``TransactionHelper`` add/partial-close, ``submit_close_order_for_transaction``)
+    #: leave ``good_for`` unset, which resolved to the GTC default above.
+    _TT_MARKET_TIFS = frozenset({OrderTimeInForce.DAY, OrderTimeInForce.IOC})
+
+    @classmethod
+    def _tt_market_time_in_force(cls, good_for: Optional[str]) -> OrderTimeInForce:
+        """The time in force for a MARKET order: DAY unless ``good_for`` names one the
+        broker accepts on a market order.
+
+        A market order fills at once or not at all, so a resting TIF carries no meaning
+        on it and DAY is the same order. An EXPLICIT resting TIF is still logged when it
+        is replaced -- the order row said one thing and the broker is sent another.
+        """
+        tif = cls._tt_time_in_force(good_for)
+        if tif in cls._TT_MARKET_TIFS:
+            return tif
+        if str(good_for or "").strip():
+            logger.warning(
+                f"TastyTrade does not accept {tif.value} on a market order "
+                f"(tif_market_orders_not_supported); sending {OrderTimeInForce.DAY.value} "
+                f"instead of good_for={good_for!r}")
+        return OrderTimeInForce.DAY
+
     @staticmethod
     def _tt_action(side: OrderDirection, is_closing_order: bool) -> OrderAction:
         """The equity ``OrderAction`` for a side plus an open/close intent."""
@@ -1157,6 +1184,7 @@ class TastyTradeAccount(AccountInterface):
         core_type = trading_order.order_type
         if core_type == CoreOrderType.MARKET:
             kwargs["order_type"] = TTOrderType.MARKET
+            kwargs["time_in_force"] = self._tt_market_time_in_force(trading_order.good_for)
         elif core_type in (CoreOrderType.BUY_LIMIT, CoreOrderType.SELL_LIMIT):
             if trading_order.limit_price is None:
                 raise ValueError(f"Limit price is required for {core_type.value} orders")

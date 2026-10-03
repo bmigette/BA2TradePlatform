@@ -59,6 +59,7 @@ It stays MODAL. A commit gate for real orders should be a deliberate stop, not
 something reachable by scrolling.
 """
 import asyncio
+from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from nicegui import ui
@@ -116,6 +117,17 @@ from ...core.portfolio_allocation_service import (
 )
 from ...logger import logger
 from ..components.refresh_button import refresh_button
+from ..utils.outcome_view import (
+    MARK_CLASSES, STATUS_NOT_SENT, STATUS_PENDING, STATUS_UNKNOWN_CHECK_BROKER,
+    copy_click_js, copy_succeeded, outcome_details, outcome_details_text, outcome_icon,
+    row_mark_class, worst_outcome,
+)
+from ..utils.responsive import (
+    ACTIONS_CLASS, CARD_HEAD_CLASS, CARD_ROW_CLASS, PRIMARY_ACTION_CLASS,
+    TIER_DETAIL, TIER_HEAD, TIER_PRIMARY, TIER_TICK, TIER_WIDE, CardColumn,
+    attach_card_toggle, card_cell_class, card_rows_common_css, card_rows_css,
+    check_card_columns, phone_media,
+)
 
 #: Shown above the dry-run table whenever any row will be sent as a FRACTIONAL
 #: order. Both brokers refuse a fractional equity LIMIT order (TastyTrade
@@ -307,6 +319,10 @@ FOOTER_TOOLTIP = ('Column totals over the TICKED rows only - exactly what Submit
 #: By marker: every word in it also appears in a notice above, so a text search
 #: cannot tell which of the two drew it.
 MARKER_ROW_RESULT = 'dry-run-row-result'
+#: The status ICON beside a row's Result text, and the details dialog behind it.
+MARKER_ROW_RESULT_ICON = 'dry-run-row-result-icon'
+MARKER_OUTCOME_DETAILS = 'outcome-details'
+MARKER_OUTCOME_COPY = 'outcome-copy'
 MARKER_SUBMIT_SUMMARY = 'dry-run-submit-summary'
 
 #: What a Result cell says between "Submit pressed" and "this row's order came back".
@@ -314,6 +330,13 @@ MARKER_SUBMIT_SUMMARY = 'dry-run-submit-summary'
 #: appearing to do nothing until the first order lands.
 SUBMIT_PENDING_TEXT = 'sending...'
 SUBMIT_PENDING_CLASSES = 'text-gray-400'
+#: What a row says when the run ended without an order for it (not ticked, or the run was
+#: refused by the gate re-check), and when the run DIED before reporting on it -- in
+#: which case an order may have gone out, so it says so.
+SUBMIT_NOT_SENT_TEXT = 'not sent'
+SUBMIT_NOT_SENT_CLASSES = 'text-gray-500'
+SUBMIT_UNKNOWN_TEXT = 'check broker'
+SUBMIT_UNKNOWN_CLASSES = 'text-orange-400 font-medium'
 MARKER_ROW_REASONS = 'dry-run-row-reasons'
 
 #: Marker on the income panel's working-orders line, for the same reason.
@@ -580,10 +603,106 @@ DRY_RUN_COLUMNS = (
     ('reasons', 'Reasons', 'flex-1 min-w-64', False),
 )
 
+#: Every cell also wears ``pf-c-<name>``: the hook the PHONE layout addresses it by
+#: (see ``DRY_RUN_CARD`` below). It changes nothing above the breakpoint.
+DRY_RUN_CELL_PREFIX = 'pf-c-'
+DRY_RUN_ROW_KEY = 'pf-dry-row'
+
 _COLUMN_CLASSES = {
-    name: width + (' text-right' if numeric else '')
+    name: (width + (' text-right' if numeric else '')
+           + ' ' + card_cell_class(DRY_RUN_CELL_PREFIX, name))
     for name, _header, width, numeric in DRY_RUN_COLUMNS
 }
+
+#: WHAT EACH COLUMN BECOMES ON A PHONE, decided once, in reading order.
+#:
+#: The 18-column table cannot be shown at 390px, and scrolling it sideways hides the
+#: Side of an order from its Symbol. On a phone every row is a CARD (the same
+#: elements, re-laid-out by CSS -- see ``ui/utils/responsive.py``):
+#:   * line 1: the tick box, the SYMBOL and the SIDE (BUY / SELL);
+#:   * always visible, captioned, two to a line: what is held and where the order
+#:     takes it, the quantity, the order's value and kind, the weight, and the
+#:     buying-power effect -- the fields a person reads before pressing Submit;
+#:   * folded behind a tap on the card ("Details"): the analytical columns (cost,
+#:     value, target, projected, capital required, BP multiple, BP %);
+#:   * full width underneath: the submit Result and the Reasons, which are prose.
+#: ``check_card_columns`` pins that this covers exactly ``DRY_RUN_COLUMNS``.
+DRY_RUN_CARD = (
+    CardColumn('tick', '', TIER_TICK),
+    CardColumn('symbol', 'Symbol', TIER_HEAD),
+    CardColumn('side', 'Side', TIER_HEAD),
+    CardColumn('held', 'Held', TIER_PRIMARY),
+    CardColumn('qty', 'Qty', TIER_PRIMARY),
+    CardColumn('estimated_value', 'Order value', TIER_PRIMARY),
+    CardColumn('order', 'Order', TIER_PRIMARY),
+    CardColumn('weight', 'Weight', TIER_PRIMARY),
+    CardColumn('bp_effect', 'BP effect', TIER_PRIMARY),
+    CardColumn('cost', 'Cost', TIER_DETAIL),
+    CardColumn('value', 'Value', TIER_DETAIL),
+    CardColumn('target', 'Target value', TIER_DETAIL),
+    CardColumn('projected', 'Projected', TIER_DETAIL),
+    CardColumn('capital_required', 'Cap req', TIER_DETAIL),
+    CardColumn('bp_ratio', 'BP ×', TIER_DETAIL),
+    CardColumn('bp_pct', 'BP %', TIER_DETAIL),
+    CardColumn('result', 'Result', TIER_WIDE),
+    CardColumn('reasons', 'Reasons', TIER_WIDE),
+)
+check_card_columns(DRY_RUN_CARD, [c[0] for c in DRY_RUN_COLUMNS])
+
+#: The "Not traded" table: smaller, hand-rolled the same way, and laid out as cards by
+#: the same CSS generator. Its cells wear these prefixes.
+NOT_TRADED_CELL_PREFIX = 'pf-n-'
+NOT_TRADED_ROW_KEY = 'pf-nt-row'
+NOT_TRADED_CARD = (
+    CardColumn('symbol', 'Symbol', TIER_HEAD),
+    CardColumn('outcome', 'Outcome', TIER_HEAD),
+    CardColumn('price', 'Price', TIER_PRIMARY),
+    CardColumn('target', 'Target', TIER_PRIMARY),
+    CardColumn('projected', 'Projected', TIER_PRIMARY),
+    CardColumn('unmet', 'Unallocated', TIER_PRIMARY),
+    CardColumn('why', 'Why', TIER_WIDE),
+)
+
+
+#: A submitted row's marking. FAILED is red (background tint, a left border and the
+#: symbol in red) and unactionable / wash-trade-locked rows are amber, so a failure is
+#: never confused with "not sent". Translucent tints, not solid fills: legible on the
+#: dark theme and on a light one. ``!important`` because ``styles.css`` gives every
+#: ``.pf-grid-row`` its background with one. Not phone-only.
+ROW_STATE_CSS = """
+    .pf-grid-row.pf-row-failed { background: rgba(239,68,68,0.20) !important;
+        box-shadow: inset 4px 0 0 #ef4444; }
+    .pf-grid-row.pf-row-failed .pf-c-symbol { color: #ef4444 !important; }
+    .pf-grid-row.pf-row-alert { background: rgba(245,158,11,0.14) !important;
+        box-shadow: inset 4px 0 0 #f59e0b; }
+    .pf-detail-grid { display: grid; grid-template-columns: auto minmax(0, 1fr);
+        gap: 4px 12px; align-items: baseline; }
+"""
+
+#: The outcome-details dialog is a bottom sheet on a phone: full width, anchored to
+#: the bottom edge, where a thumb reaches it.
+DETAIL_SHEET_CSS = phone_media("""
+    .pf-detail-dialog .q-dialog__inner--minimized { align-items: flex-end !important;
+        padding: 0 !important; }
+    .pf-detail-dialog .q-dialog__inner--minimized > div {
+        border-radius: 12px 12px 0 0 !important; max-width: 100% !important; }
+""")
+
+
+def phone_card_css() -> str:
+    """All the phone CSS the wizard's tables need. Pure.
+
+    Injected by the PAGE (``ui.add_css`` in ``portfolio_allocation.content``): a
+    dialog is built after the page, and styles added to a page that is already on
+    screen are not guaranteed to land.
+    """
+    return '\n'.join((
+        card_rows_common_css(),
+        card_rows_css(DRY_RUN_ROW_KEY, DRY_RUN_CELL_PREFIX, DRY_RUN_CARD),
+        card_rows_css(NOT_TRADED_ROW_KEY, NOT_TRADED_CELL_PREFIX, NOT_TRADED_CARD),
+        ROW_STATE_CSS,
+        DETAIL_SHEET_CSS,
+    ))
 
 #: THE REASONS CELL, in inline CSS rather than Tailwind classes.
 #:
@@ -909,25 +1028,64 @@ class AllocationWizard:
         #: submit and its results would drop them -- which is why Refresh is disabled
         #: for the duration (see ``begin_submit``).
         self._result_cells: Dict[str, Any] = {}
+        #: symbol -> (icon button, its tooltip) in the same Result cell, the row
+        #: element (so a failure can mark the WHOLE row), the engine's outcome and
+        #: the moment it landed. Rebuilt with the rows; the details dialog reads them.
+        self._result_icons: Dict[str, Any] = {}
+        self._row_elements: Dict[str, Any] = {}
+        self._outcomes: Dict[str, Any] = {}
+        self._outcome_times: Dict[str, datetime] = {}
+        self._run_id: Optional[int] = None
+        #: The container the "Retry the N that failed" button is drawn into, beside
+        #: the summary line.
+        self._retry_container = None
+        #: Rows that were IN the submit and have not reported yet (spinner), and rows
+        #: the run ended without reporting on (symbol -> STATUS_NOT_SENT /
+        #: STATUS_UNKNOWN_CHECK_BROKER). Both survive a re-render of the rows.
+        self._pending: set = set()
+        self._unresolved: Dict[str, str] = {}
+        #: ONE details dialog for the wizard's life (built in ``open``), refilled per
+        #: tap. Building a fresh ``ui.dialog`` inside the tapped cell leaked one per tap
+        #: and tied its life to a row that a refresh deletes.
+        self._details_dialog = None
+        self._details_card = None
+        self._fractional_switch = None
 
     # -- public -----------------------------------------------------------
-    def begin_submit(self) -> None:
+    def begin_submit(self, symbols=None) -> None:
         """Lock the dialog down for the duration of a submit and clear the results.
 
+        ``symbols`` is what is actually being SENT (the ticked rows). ONLY those get the
+        "sending" spinner: an un-ticked row is not in flight, and the table is now the
+        only per-row view of the run, so a spinner on a row that will never be sent would
+        read as an order still working. ``None`` means every drawn row.
+
         Everything that could change the plan under a run in flight is disabled, not
-        merely ignored: Submit (one-shot anyway), Refresh (it re-renders the rows and
-        would throw away the result cells the run is writing into) and the tick boxes
-        (un-ticking a row whose order has already gone would be a lie about what was
-        sent). Cancel stays live -- closing the window does not recall an order, and
-        a user who wants the dialog gone is entitled to it.
+        merely ignored: Submit (one-shot anyway), Refresh (it re-renders the rows), the
+        fractional switch (it re-solves and re-renders) and the tick boxes (un-ticking a
+        row whose order has already gone would be a lie about what was sent). Cancel
+        stays live -- closing the window does not recall an order, and a user who wants
+        the dialog gone is entitled to it.
         """
         for element, flag in ((self._submit_button, False),
-                              (self._refresh_button, False)):
+                              (self._refresh_button, False),
+                              (getattr(self, '_fractional_switch', None), False)):
             if element is not None:
                 element.set_enabled(flag)
-        for cell in self._result_cells.values():
+        self._pending = (set(self._result_cells) if symbols is None else set(symbols))
+        self._unresolved = {}
+        getattr(self, '_outcomes', {}).clear()
+        for symbol in self._pending:
+            self._show_pending(symbol)
+
+    def _show_pending(self, symbol: str) -> None:
+        cell = self._result_cells.get(symbol)
+        if cell is not None:
             cell.set_text(SUBMIT_PENDING_TEXT)
             cell.classes(replace='text-xs ' + SUBMIT_PENDING_CLASSES)
+        icon = getattr(self, '_result_icons', {}).get(symbol)
+        if icon is not None:
+            self._paint_icon(icon[0], icon[1], outcome_icon(STATUS_PENDING), loading=True)
 
     def set_row_result(self, symbol: str, text: str, classes: str) -> None:
         """Report ONE row's outcome on its own line. Safe for an unknown symbol.
@@ -943,8 +1101,153 @@ class AllocationWizard:
         cell.set_text(text)
         cell.classes(replace='text-xs ' + classes)
 
-    def finish_submit(self, summary: str) -> None:
+    @staticmethod
+    def _paint_icon(button, tip, icon, *, loading: bool = False) -> None:
+        """Put ``icon`` (an ``OutcomeIcon``) on one row's status button. Pending is
+        Quasar's own ``loading`` spinner, so the same button is spinner, then verdict."""
+        button.set_visibility(True)
+        button.props(f'icon={icon.icon}')
+        if loading:
+            button.props('loading')
+        else:
+            button.props(remove='loading')
+        button.props(f'color={icon.quasar_color}')
+        tip.set_text(icon.label)
+
+    def set_row_outcome(self, outcome, *, when: Optional[datetime] = None) -> None:
+        """Report ONE row's outcome: its text, its icon, and -- for a failure -- the
+        marking of the whole row. Safe for an unknown symbol, like ``set_row_result``.
+
+        The outcome is KEPT (the icon opens a details view built from it, and a
+        re-render of the rows repaints it). A symbol reported twice shows its WORST
+        outcome, not its last: a failed close followed by a sent order stays red.
+        """
+        symbol = getattr(outcome, 'symbol', None)
+        previous = self._outcomes.get(symbol)
+        chosen = worst_outcome(previous, outcome)
+        self._outcomes[symbol] = chosen
+        if chosen is outcome:
+            self._outcome_times[symbol] = when or datetime.now()
+        getattr(self, '_pending', set()).discard(symbol)
+        self._apply_outcome(chosen)
+
+    def _apply_outcome(self, outcome) -> None:
+        """Paint one stored outcome onto its row (text, icon, marking). No storing."""
+        from ..utils.portfolio_allocation_view import submit_result_cell
+        symbol = getattr(outcome, 'symbol', None)
+        text, classes = submit_result_cell(outcome)
+        self.set_row_result(symbol, text, classes)
+        self._paint_row(symbol, getattr(outcome, 'status', None))
+
+    def _paint_row(self, symbol, status) -> None:
+        """The icon and the row marking for ``status``."""
+        icon = self._result_icons.get(symbol)
+        if icon is not None:
+            self._paint_icon(icon[0], icon[1], outcome_icon(status))
+        row = self._row_elements.get(symbol)
+        if row is not None:
+            row.classes(remove=' '.join(MARK_CLASSES.values()))
+            mark = row_mark_class(status)
+            if mark:
+                row.classes(mark)
+
+    def _apply_unresolved(self, symbol: str, status: str) -> None:
+        if status == STATUS_UNKNOWN_CHECK_BROKER:
+            self.set_row_result(symbol, SUBMIT_UNKNOWN_TEXT, SUBMIT_UNKNOWN_CLASSES)
+        else:
+            self.set_row_result(symbol, SUBMIT_NOT_SENT_TEXT, SUBMIT_NOT_SENT_CLASSES)
+        self._paint_row(symbol, status)
+
+    def _repaint_results(self) -> None:
+        """Put what a run has reported back on freshly drawn rows.
+
+        ``_render_rows`` rebuilds every row, and with them every icon and marking; a
+        Refresh (or a Select-all) after -- or during -- a submit would otherwise wipe the
+        only per-row record of what was sent while ``_outcomes`` sat unreachable.
+        """
+        if not (self._pending or self._outcomes or self._unresolved):
+            return
+        for symbol in self._pending:
+            if symbol not in self._outcomes:
+                self._show_pending(symbol)
+        for outcome in self._outcomes.values():
+            self._apply_outcome(outcome)
+        for symbol, status in self._unresolved.items():
+            self._apply_unresolved(symbol, status)
+
+    def _open_outcome_details(self, symbol: str) -> None:
+        """The details view behind a row's icon: ONE dialog per wizard, refilled each
+        tap (a bottom sheet on a phone, see ``pf-detail-dialog``). Never raises for a
+        row with no outcome yet."""
+        outcome = self._outcomes.get(symbol)
+        details = outcome_details(outcome, symbol=symbol, run_id=self._run_id,
+                                  when=self._outcome_times.get(symbol),
+                                  status=self._unresolved.get(symbol))
+        text = outcome_details_text(details)
+        shown = (getattr(outcome, 'status', None) if outcome is not None
+                 else self._unresolved.get(symbol, STATUS_PENDING))
+        icon = outcome_icon(shown)
+
+        def _copied(event) -> None:
+            ok = copy_succeeded(getattr(event, 'args', None))
+            ui.notify('Details copied' if ok else 'Could not copy - select the text',
+                      type='positive' if ok else 'warning')
+
+        card = self._details_card
+        card.clear()
+        with card:
+            with ui.row().classes('items-center gap-2 no-wrap'):
+                _paint(ui.icon(icon.icon), 'text-2xl', color=icon.colour)
+                _label(f'{symbol} - {icon.label}', 'text-lg font-bold')
+            with ui.element('div').classes('pf-detail-grid w-full'):
+                for label, value in details:
+                    ui.label(label).classes('text-xs text-gray-400')
+                    cell = ui.label(value).classes('text-sm whitespace-pre-wrap break-words')
+                    if label == 'Filled qty':
+                        cell.mark(MARKER_OUTCOME_FILLED)
+            with ui.row().classes('w-full justify-end gap-2'):
+                # The copy runs IN THE BROWSER, inside the tap (see ``copy_click_js``).
+                ui.button('Copy details', icon='content_copy') \
+                    .on('click', _copied, js_handler=copy_click_js(text)) \
+                    .props('outline').mark(MARKER_OUTCOME_COPY)
+                ui.button('Close', on_click=self._details_dialog.close).props('flat')
+        self._details_dialog.open()
+
+    def _render_retry(self, outcomes, on_retry) -> None:
+        """The "Retry the N that failed" button, in the dialog footer beside the
+        summary line -- ONLY when something failed (``retryable_outcomes``).
+
+        Re-solves and opens a fresh dry run, exactly as it did from the old results
+        popup: the positions have moved -- what filled is now held, so the new plan
+        does not ask for it again, while what failed is still off target and comes
+        back in. Nothing is re-sent without another Submit.
+        """
+        container = getattr(self, '_retry_container', None)
+        if container is None:
+            return
+        container.clear()
+        retryable = retryable_outcomes(outcomes)
+        if not retryable or on_retry is None:
+            return
+        with container:
+            def _retry(symbols=list(retryable)):
+                # Closed FIRST: the retry re-solves and opens a fresh dry run, and
+                # two stacked dialogs describing two different plans is exactly the
+                # confusion this feature exists to remove.
+                self.dialog.close()
+                on_retry(symbols)
+            ui.button(RETRY_FAILED_FMT.format(count=len(retryable)), on_click=_retry) \
+                .props('outline').mark(MARKER_OUTCOME_RETRY).tooltip(RETRY_TOOLTIP)
+
+    def finish_submit(self, summary: str, *, run_id: Optional[int] = None,
+                      outcomes=None, on_retry=None, interrupted: bool = False) -> None:
         """The run is over: say so, and let the user out.
+
+        Any row that was in the submit and never reported is RESOLVED here, never left
+        spinning: "not sent" when the run ended normally or was refused by the gate
+        re-check, and -- ``interrupted=True``, the exception path -- "unknown - check the
+        broker" in amber, because a run that died part-way may have left an order at the
+        broker for a row it never reported.
 
         Submit stays disabled -- this plan has been sent and there is nothing left to
         send -- while Refresh comes back, because re-solving is exactly what a user
@@ -955,6 +1258,17 @@ class AllocationWizard:
         if self._submit_summary is not None:
             self._submit_summary.set_text(summary)
             self._submit_summary.set_visibility(True)
+        self._run_id = run_id
+        pending = getattr(self, '_pending', set())
+        status = STATUS_UNKNOWN_CHECK_BROKER if interrupted else STATUS_NOT_SENT
+        for symbol in sorted(pending - set(getattr(self, '_outcomes', {}))):
+            self._unresolved[symbol] = status
+            self._apply_unresolved(symbol, status)
+        self._pending = set()
+        switch = getattr(self, '_fractional_switch', None)
+        if switch is not None:
+            switch.set_enabled(bool(self.base.supports_fractional))
+        self._render_retry(outcomes, on_retry)
 
     def open(self):
         with ui.dialog().props('maximized') as dialog, \
@@ -999,6 +1313,7 @@ class AllocationWizard:
                         # the user would see quantities they never asked for.
                         # DISABLED, not hidden, and the reason said out loud.
                         fractional.set_enabled(bool(self.base.supports_fractional))
+                        self._fractional_switch = fractional
                         if not self.base.supports_fractional:
                             _label(NO_FRACTIONAL_SUPPORT_NOTE,
                                    'text-xs text-gray-400')
@@ -1026,10 +1341,15 @@ class AllocationWizard:
             # The submit verdict sits ABOVE the buttons and left of nothing: it is the
             # answer to the button the user just pressed, and it must not be looked
             # for elsewhere on a maximised dialog.
-            self._submit_summary = ui.label('') \
-                .classes('w-full text-sm shrink-0').mark(MARKER_SUBMIT_SUMMARY)
-            self._submit_summary.set_visibility(False)
-            with ui.row().classes('w-full justify-end gap-2 shrink-0'):
+            # The summary line and, beside it, the Retry button (drawn only when a row
+            # failed): the run's verdict and the one thing to do about it, together.
+            with ui.row().classes('w-full items-center gap-2 shrink-0 no-wrap '
+                                  + ACTIONS_CLASS):
+                self._submit_summary = ui.label('') \
+                    .classes('flex-grow text-sm').mark(MARKER_SUBMIT_SUMMARY)
+                self._submit_summary.set_visibility(False)
+                self._retry_container = ui.row().classes('items-center shrink-0')
+            with ui.row().classes(f'w-full justify-end gap-2 shrink-0 {ACTIONS_CLASS}'):
                 # Held, because a submit in flight must be able to disable it: a
                 # refresh re-renders every row and would throw away the Result cells
                 # the run is writing into.
@@ -1045,13 +1365,20 @@ class AllocationWizard:
                     self._validate_button.tooltip(VALIDATE_TOOLTIP)
                 ui.button('Cancel', on_click=dialog.close).props('flat')
                 self._submit_button = ui.button('Submit', on_click=self._submit) \
-                    .props('color=primary')
+                    .props('color=primary').classes(PRIMARY_ACTION_CLASS)
                 # Built ONCE and re-texted on refresh. ``Element.tooltip()`` creates
                 # a fresh q-tooltip on every call (nicegui/element.py), so calling
                 # it again from _refresh would stack one per refresh.
                 with self._submit_button:
                     self._submit_tooltip = ui.tooltip('')
                 self._sync_submit_button()
+            # THE ONE DETAILS DIALOG (see ``_open_outcome_details``), built here so that it
+            # lives as long as the wizard and not as long as a row.
+            with ui.dialog().classes('pf-detail-dialog') as details_dialog, \
+                    ui.card().classes('w-full max-w-md gap-2') \
+                    .mark(MARKER_OUTCOME_DETAILS) as details_card:
+                pass
+            self._details_dialog, self._details_card = details_dialog, details_card
         dialog.open()
         return dialog
 
@@ -1278,7 +1605,10 @@ class AllocationWizard:
                 # THE SAME grid treatment as the order table two inches above --
                 # header bar, separators, right-aligned money. Two tables in one
                 # dialog drawn two ways is a second look to learn for no reason.
-                with ui.row().classes(GRID_HEAD_CLASSES):
+                def _nt(name: str) -> str:
+                    return card_cell_class(NOT_TRADED_CELL_PREFIX, name)
+
+                with ui.row().classes(GRID_HEAD_CLASSES + ' ' + CARD_HEAD_CLASS):
                     for header, width in (('Symbol', 'w-24'),
                                           ('Price', 'w-28 text-right'),
                                           ('Outcome', 'w-32'),
@@ -1288,22 +1618,27 @@ class AllocationWizard:
                                           ('Why', 'flex-1')):
                         ui.label(header).classes(width)
                 for row in dropped:
-                    with ui.row().classes(GRID_ROW_CLASSES):
-                        ui.label(row['symbol']).classes('w-24 font-medium')
+                    with ui.row().classes(
+                            f'{GRID_ROW_CLASSES} {CARD_ROW_CLASS} {NOT_TRADED_ROW_KEY}'):
+                        ui.label(row['symbol']).classes(f"w-24 font-medium {_nt('symbol')}")
                         ui.label('-' if row['price'] is None
-                                 else f"{row['price']:,.2f}").classes('w-28 text-right')
-                        _label(row['outcome'], 'w-32 text-xs text-orange-400')
+                                 else f"{row['price']:,.2f}") \
+                            .classes(f"w-28 text-right {_nt('price')}")
+                        _label(row['outcome'],
+                               f"w-32 text-xs text-orange-400 {_nt('outcome')}")
                         ui.label(f"{row['target_notional']:,.2f}") \
-                            .classes('w-28 text-right')
+                            .classes(f"w-28 text-right {_nt('target')}")
                         projected = row['projected_notional']
                         ui.label('-' if projected is None
-                                 else f"{projected:,.2f}").classes('w-28 text-right')
+                                 else f"{projected:,.2f}") \
+                            .classes(f"w-28 text-right {_nt('projected')}")
                         _label(f"{row['unmet_notional']:,.2f}",
-                               'w-28 text-right text-orange-400')
+                               f"w-28 text-right text-orange-400 {_nt('unmet')}")
                         # The SAME treatment as the column two inches above: these
                         # are the longest strings in the dialog and used to run
                         # straight off the right-hand edge.
-                        _reasons_cell(row['reasons'], 'flex-1 text-xs text-gray-400')
+                        _reasons_cell(row['reasons'],
+                                      f"flex-1 text-xs text-gray-400 {_nt('why')}")
 
     @staticmethod
     def _default_selection(plan: AllocationPlan) -> set:
@@ -1478,21 +1813,23 @@ class AllocationWizard:
         bp_effect = sum(r['bp_effect'] for r in rows)
         bp_pct = sum(r['bp_usage_pct'] for r in rows)
         with self._footer_container:
-            with ui.row().classes(GRID_FOOT_CLASSES).style(GRID_FOOT_STYLE) \
-                    .mark(MARKER_TABLE_FOOT):
-                ui.label('').classes(_col('tick'))
+            with ui.row().classes(
+                    f'{GRID_FOOT_CLASSES} {CARD_ROW_CLASS} {DRY_RUN_ROW_KEY}') \
+                    .style(GRID_FOOT_STYLE).mark(MARKER_TABLE_FOOT) as foot:
+                attach_card_toggle(foot)
+                ui.label('').classes(_col('tick', 'pf-empty'))
                 with ui.label(FOOTER_CAPTION_FMT.format(ticked=len(rows),
                                                         sendable=sendable)) \
                         .classes(_col('symbol', 'font-medium')):
                     ui.tooltip(FOOTER_TOOLTIP)
-                ui.label('').classes(_col('held'))
+                ui.label('').classes(_col('held', 'pf-empty'))
                 ui.label(f"{cost:,.2f}").classes(_col('cost'))
                 ui.label(f"{sum(values):,.2f}"
                          + ('' if len(values) == len(rows) else ' *')) \
                     .classes(_col('value'))
-                ui.label('').classes(_col('side'))
-                ui.label('').classes(_col('qty'))
-                ui.label('').classes(_col('order'))
+                ui.label('').classes(_col('side', 'pf-empty'))
+                ui.label('').classes(_col('qty', 'pf-empty'))
+                ui.label('').classes(_col('order', 'pf-empty'))
                 with ui.column().classes(_col('estimated_value', 'gap-0 leading-tight')):
                     _label(f"B {buys:,.2f}", 'text-green-500 text-xs')
                     _label(f"S {sells:,.2f}", 'text-red-500 text-xs')
@@ -1505,7 +1842,7 @@ class AllocationWizard:
                 _label(f"{bp_effect:+,.2f}" if abs(bp_effect) >= 0.005 else '0.00',
                        _col('bp_effect', 'text-green-500 font-medium'
                             if bp_effect > 0 else ''))
-                ui.label('').classes(_col('bp_ratio'))
+                ui.label('').classes(_col('bp_ratio', 'pf-empty'))
                 ui.label(f"{bp_pct:.1f}%").classes(_col('bp_pct'))
                 _label('* an unpriced row is left out of this total'
                        if len(values) != len(rows) or len(projected) != len(rows)
@@ -1539,6 +1876,9 @@ class AllocationWizard:
         """
         self._rows_container.clear()
         self._footer_container = None
+        self._result_cells = {}
+        self._result_icons = {}
+        self._row_elements = {}
         self._render_selection_toolbar()
         rows = dry_run_rows(self.plan)
         with self._rows_container:
@@ -1549,7 +1889,8 @@ class AllocationWizard:
             if any(r['fractional'] and not r['suppressed'] for r in rows):
                 _label(FRACTIONAL_IS_MARKET_ONLY_NOTE,
                        'text-xs text-orange-400 shrink-0')
-            with ui.row().classes(GRID_HEAD_CLASSES).mark(MARKER_TABLE_HEAD):
+            with ui.row().classes(GRID_HEAD_CLASSES + ' ' + CARD_HEAD_CLASS) \
+                    .mark(MARKER_TABLE_HEAD):
                 for name, header, _width, _numeric in DRY_RUN_COLUMNS:
                     ui.label(header.format(mode=self.plan.valuation_mode)) \
                         .classes(_col(name))
@@ -1557,7 +1898,10 @@ class AllocationWizard:
                 self._render_row(row)
             # The footer lives INSIDE the viewport so it can stick to its bottom
             # edge; its own container so a tick redraws the totals and nothing else.
-            self._footer_container = ui.column().classes('w-full min-w-max gap-0')
+            self._footer_container = ui.column().classes(
+                'w-full min-w-max gap-0 pf-card-wrap')
+        # A re-render must not erase what a run has reported (or is still reporting).
+        self._repaint_results()
         self._render_table_footer()
 
     def _render_row(self, row: Dict):
@@ -1578,7 +1922,12 @@ class AllocationWizard:
         """
         blocked = row['suppressed'] or row['skipped']
         with ui.row().classes(GRID_ROW_CLASSES
-                              + (' opacity-60' if blocked else '')):
+                              + f' {CARD_ROW_CLASS} {DRY_RUN_ROW_KEY}'
+                              + (' opacity-60' if blocked else '')) as card:
+            # A tap on the row (not on its tick box) folds the card's details open
+            # on a phone; a no-op above the breakpoint. Browser-side only.
+            attach_card_toggle(card)
+            self._row_elements[row['symbol']] = card
             checkbox = ui.checkbox(
                 value=row['symbol'] in self.selected,
                 on_change=lambda e, s=row['symbol']: self._toggle(s, bool(e.value)),
@@ -1682,9 +2031,21 @@ class AllocationWizard:
             ui.label(f"{row['bp_usage_pct']:.1f}%").classes(_col('bp_pct'))
             # Filled in by ``set_row_result`` as each order comes back, so the row
             # the user is looking at is the row that reports.
-            self._result_cells[row['symbol']] = ui.label('') \
-                .classes(_col('result', 'text-xs')) \
-                .mark(MARKER_ROW_RESULT)
+            # An icon (spinner, then the verdict) and the text. The icon opens the
+            # row's details; it is drawn only once a submit has started.
+            with ui.row().classes(_col('result', 'text-xs items-center no-wrap gap-1')):
+                symbol = row['symbol']
+                icon_button = ui.button(
+                    icon='hourglass_empty',
+                    on_click=lambda _e=None, s=symbol: self._open_outcome_details(s)) \
+                    .props('flat dense round size=sm').mark(MARKER_ROW_RESULT_ICON)
+                icon_button.set_visibility(False)
+                with icon_button:
+                    icon_tip = ui.tooltip('')
+                self._result_icons[symbol] = (icon_button, icon_tip)
+                self._result_cells[symbol] = ui.label('') \
+                    .classes('text-xs') \
+                    .mark(MARKER_ROW_RESULT)
             # An abnormal sizing outcome is a REASON and is drawn RED at the front
             # of that column; the rest of the reasons keep their own colour.
             _reasons_cell(row['reasons'], _col(
@@ -2057,7 +2418,7 @@ class AllocationWizard:
             ui.notify('Nothing selected to submit', type='warning')
             return
         self._submitted = True
-        self.begin_submit()
+        self.begin_submit([r.symbol for r in selected_plan.rows])
         self.on_submit(selected_plan)
 
 
@@ -2349,22 +2710,8 @@ def render_income_panel(events: List[Dict], open_total: float,
             .classes('w-full dark-pagination')
 
 
-#: Status -> colour class. Keyed on the SERVICE's own constants, never on
-#: literals: a renamed constant would silently stop matching, and the failure
-#: count below would then read 0 for a run in which everything failed.
-OUTCOME_COLOURS = {
-    OUTCOME_SUBMITTED: 'text-green-500',
-    OUTCOME_PARTIAL: 'text-yellow-500',
-    OUTCOME_SKIPPED: 'text-gray-400',
-    OUTCOME_WASHTRADE_LOCKED: 'text-orange-400',
-    # NOT the grey of SKIPPED, which is the whole reason this status exists: the
-    # position is held, the user asked to exit it and the run had no route to it.
-    OUTCOME_UNACTIONABLE: 'text-red-400',
-    OUTCOME_FAILED: 'text-red-500',
-}
-
-#: NiceGUI marker on the outcome table's "Filled" cell, so a test can read the
-#: column without matching on a quantity string that also appears in "Qty".
+#: Marker on the details view's "Filled qty" value, so a test can read it without
+#: matching on a quantity string that also appears in "Planned qty".
 MARKER_OUTCOME_FILLED = 'outcome-filled'
 
 
@@ -2387,60 +2734,14 @@ def retryable_outcomes(outcomes: List) -> List[str]:
     return out
 
 
-def render_outcomes(outcomes: List, *, run_id: Optional[int] = None,
-                    on_retry: Optional[Callable[[List[str]], None]] = None) -> None:
-    """Per-row outcome table shown after Submit.
+def notify_outcomes(outcomes: List) -> None:
+    """The toast for a finished run: failed / unactionable / locked / all sent.
 
-    Partial failure is normal: a failed row sits next to a filled one and nothing
-    is rolled back, so every row is listed with its own status and message.
-
-    ``Filled`` is shown next to ``Qty`` because they differ in the cases that
-    matter: a partially filled order, and a fractional order that fell back to
-    whole shares. ``filled_quantity is None`` means the broker reported no fill
-    at all -- an accepted market order before the open looks exactly like that --
-    and is drawn as "-", never as 0, which would read as "nothing filled".
-
-    ``on_retry`` is offered ONLY when something actually failed
-    (``retryable_outcomes``). Re-running the flow re-solves against the positions
-    as they are NOW, so the rows that filled are already gone from the new plan
-    and the ones that failed are still in it -- the retry is a re-solve, never a
-    replay of the orders that were just sent.
+    The per-row results are in the dry-run table itself -- an icon per row, a red or
+    amber row, a details view behind the icon -- and there is no second dialog. What
+    remains of the old results popup is this sentence: a failure must still announce
+    itself to a user who is looking at another part of the dialog.
     """
-    with ui.dialog() as dialog, ui.card().classes('w-full max-w-3xl'):
-        title = f'Allocation run {run_id} - results' if run_id else 'Allocation run - results'
-        ui.label(title).classes('text-lg font-bold')
-        with ui.row().classes('w-full text-xs font-bold border-b py-1'):
-            for header, width in (('Symbol', 'w-24'), ('Action', 'w-24'), ('Status', 'w-36'),
-                                  ('Qty', 'w-24'), ('Filled', 'w-24'), ('Path', 'w-24'),
-                                  ('Detail', 'flex-1')):
-                ui.label(header).classes(width)
-        for outcome in outcomes:
-            with ui.row().classes('w-full text-sm border-b py-1'):
-                ui.label(outcome.symbol).classes('w-24 font-medium')
-                ui.label(outcome.action).classes('w-24')
-                ui.label(outcome.status).classes(
-                    'w-36 ' + OUTCOME_COLOURS.get(outcome.status, ''))
-                ui.label(f'{outcome.quantity:,.4f}').classes('w-24')
-                ui.label('-' if outcome.filled_quantity is None
-                         else f'{outcome.filled_quantity:,.4f}') \
-                    .classes('w-24').mark(MARKER_OUTCOME_FILLED)
-                ui.label(outcome.path or '-').classes('w-24')
-                ui.label(outcome.message or '').classes('flex-1 text-xs text-gray-400')
-        retryable = retryable_outcomes(outcomes)
-        with ui.row().classes('w-full justify-end mt-2 gap-2'):
-            if retryable and on_retry is not None:
-                def _retry(symbols=list(retryable)):
-                    # Closed FIRST: the retry re-solves and opens a fresh dry run,
-                    # and two stacked dialogs describing two different plans is
-                    # exactly the confusion this feature exists to remove.
-                    dialog.close()
-                    on_retry(symbols)
-                ui.button(RETRY_FAILED_FMT.format(count=len(retryable)),
-                          on_click=_retry).props('outline') \
-                    .mark(MARKER_OUTCOME_RETRY).tooltip(RETRY_TOOLTIP)
-            ui.button('Close', on_click=dialog.close).props('flat')
-    dialog.open()
-
     failed = sum(1 for o in outcomes if o.status == OUTCOME_FAILED)
     unactionable = sum(1 for o in outcomes if o.status == OUTCOME_UNACTIONABLE)
     locked = sum(1 for o in outcomes if o.status == OUTCOME_WASHTRADE_LOCKED)
