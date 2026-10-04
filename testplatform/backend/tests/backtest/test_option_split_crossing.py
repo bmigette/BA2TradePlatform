@@ -637,4 +637,5 @@ def test_the_round_trip_row_carries_the_entry_basis_and_the_refinement_uses_it(m
              "entry_time": "2020-08-31T00:00:00", "exit_time": "2020-09-02T00:00:00",
              "option_basis_factor": 4.0}], 0.1)
         assert seen["entry"] == pytest.approx(110.0 * 4)
-        assert seen["bars"] == [{"Low": pytest.approx(420.0), "High": pytest.approx(444.0)}]
+        assert [{"Low": b["Low"], "High": b["High"]} for b in seen["bars"]] == [
+            {"Low": pytest.approx(420.0), "High": pytest.approx(444.0)}]
