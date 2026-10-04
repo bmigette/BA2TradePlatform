@@ -4137,7 +4137,7 @@ class _OptionEntryAction(TradeAction):
         """
         cost = resolved.cost_per_contract
         extra_per_contract = 0.0
-        if resolved.sizing_basis == "premium":
+        if getattr(resolved, "sizing_basis", None) == "premium":
             # A DEBIT structure is sized by what it can LOSE, which is its debit only when the
             # debit is the worst case (``option_payoff.sizing_risk``, the one definition live
             # and backtest share). A call butterfly with a wider upper wing can lose more; a

@@ -542,8 +542,11 @@ def test_every_builder_offered_the_floor_really_sizes_by_cost():
         return "".join(inspect.getsource(k) for k in cls.__mro__
                        if issubclass(k, TA._OptionEntryAction) and k is not TA._OptionEntryAction)
 
-    assert "self._size_by_cost(resolved.cost_per_contract" in inspect.getsource(
-        TA._OptionEntryAction._size_and_submit)
+    # ``cost`` starts as ``resolved.cost_per_contract`` and is only RAISED to the structure's
+    # true max loss (``option_payoff.sizing_risk``) -- still the one cost sizer.
+    src_sas = inspect.getsource(TA._OptionEntryAction._size_and_submit)
+    assert "cost = resolved.cost_per_contract" in src_sas
+    assert "self._size_by_cost(cost, self.sizing)" in src_sas
     for value in get_min_one_contract_action_values():
         cls = type(create_action(ExpertActionType(value), "AAPL", SimpleNamespace(),
                                  SimpleNamespace(), None, None))

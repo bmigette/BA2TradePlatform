@@ -155,11 +155,14 @@ def acct_asym_iron_condor(tmp_path):
         _bar(_IC_SP, "2024-03-06", 1.5, "put", 95.0),
         _bar(_IC_SC, "2024-03-06", 1.5, "call", 105.0),
         _bar(_IC_LC, "2024-03-06", 0.5, "call", 110.0),
-        # mid-life outlier on the short call: group net = (0.2-0.5-8.0+0.3)*100 = -800
+        # mid-life move on the short call: group net = (0.2-0.5-8.0+3.1)*100 = -520, beyond
+        # the -500 wing. The call prints are CONSISTENT with each other (8.0 - 3.1 <= the 5
+        # gap), so this exercises the group CLAMP; an inconsistent outlier (110c at 0.3) is
+        # replaced by the cross-leg print check first -- see the sibling test below.
         _bar(_IC_LP, "2024-03-08", 0.2, "put", 90.0),
         _bar(_IC_SP, "2024-03-08", 0.5, "put", 95.0),
         _bar(_IC_SC, "2024-03-08", 8.0, "call", 105.0),
-        _bar(_IC_LC, "2024-03-08", 0.3, "call", 110.0),
+        _bar(_IC_LC, "2024-03-08", 3.1, "call", 110.0),
     ]
     ps = _make_ps("AAPL", bars, datetime(2024, 3, 5))
     acct, ctx = _account(tmp_path, "f1ic", ps, "AAPL", chain, bar_rows)
@@ -188,7 +191,7 @@ def test_iron_condor_mtm_clamps_to_wing_not_body(acct_asym_iron_condor):
 
     ps.set_clock(datetime(2024, 3, 8))
     mtm = acct._option_positions_mtm()
-    assert mtm == pytest.approx(-500.0, abs=1e-6)  # wing bound; the old body bound left -800
+    assert mtm == pytest.approx(-500.0, abs=1e-6)  # wing bound; the old body bound left -520
 
 
 def test_iron_condor_expiry_max_loss_not_over_clamped(acct_asym_iron_condor):
