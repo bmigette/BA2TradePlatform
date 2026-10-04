@@ -13,7 +13,8 @@ from ba2_trade_platform.core import allocator_protection_models  # noqa: F401 --
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 REVISION_FILE = ROOT / "alembic/versions/a7c3e91d5b24_add_allocator_protection_tables.py"
-TABLES = ["allocator_protection", "allocator_protection_order"]
+TABLES = ["allocator_protection", "allocator_protection_order", "allocator_exclusion",
+          "allocator_weight_change"]
 
 
 def _load():
@@ -37,7 +38,7 @@ def migrated(tmp_path):
     return engine
 
 
-def test_creates_both_tables(migrated):
+def test_creates_every_table(migrated):
     assert sorted(t for t in inspect(migrated).get_table_names() if t.startswith("allocator_")) == sorted(TABLES)
 
 
@@ -62,6 +63,11 @@ def test_the_migrated_schema_is_what_create_all_would_build(migrated):
         assert compare_metadata(context, SQLModel.metadata) == []
 
 
+def test_one_exclusion_per_account_and_symbol(migrated):
+    unique = {tuple(u["column_names"]) for u in inspect(migrated).get_unique_constraints("allocator_exclusion")}
+    assert ("account_id", "symbol") in unique
+
+
 def test_one_protection_per_account_and_symbol(migrated):
     unique = {tuple(u["column_names"]) for u in inspect(migrated).get_unique_constraints("allocator_protection")}
     assert ("account_id", "symbol") in unique
@@ -80,7 +86,7 @@ def test_upgrade_twice_is_harmless(migrated):
     assert {t: sorted(i["name"] for i in inspect(migrated).get_indexes(t)) for t in TABLES} == before
 
 
-def test_downgrade_drops_both_and_tolerates_a_gap(migrated):
+def test_downgrade_drops_every_table_and_tolerates_a_gap(migrated):
     _run(migrated, "downgrade")
     assert [t for t in inspect(migrated).get_table_names() if t.startswith("allocator_")] == []
     _run(migrated, "downgrade")        # nothing left: still fine

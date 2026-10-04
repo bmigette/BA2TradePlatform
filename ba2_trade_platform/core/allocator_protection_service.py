@@ -5,7 +5,7 @@ in ``allocator_protection``; the broker calls are ``TastyTradeAccount`` methods
 (``place_protective_oco`` / ``cancel_complex_order`` / ``get_complex_order_state``); this module
 is the DB bookkeeping and the lifecycle that ties them together:
 
-    save / disable / delete / re-enable / replace      (operator actions from the page)
+    save / disable / delete / replace (resize)          (operator actions from the page)
     reconcile_account                                  (account refresh job + page Refresh)
     prepare_for_trade / resume_protection              (the allocator run boundary)
 
@@ -23,22 +23,25 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from sqlmodel import select
 
 from ..logger import logger
+from .allocator_exclusion import reduce_symbol_weights
 from .allocator_protection import (
-    ASSUMED_GTC_LIFETIME_DAYS, CODE_CANCEL_UNCONFIRMED, CODE_GTC_EXPIRING, CODE_HELD_FILL,
+    ASSUMED_GTC_LIFETIME_DAYS, CODE_CANCEL_UNCONFIRMED, CODE_FILL, CODE_GTC_EXPIRING,
     CODE_LOST_CANCELLED, CODE_LOST_EXPIRED, CODE_LOST_REJECTED, CODE_PLACEMENT_REFUSED,
     CODE_QUANTITY_MISMATCH, CODE_RECONCILE_FETCH_FAILED, CODE_REPLACE_FAILED,
     CODE_UNKNOWN_STATE, KIND_SL, KIND_TP, PLACING_STALE_SECONDS, ProtectionRefused,
     ProtectionStatus, SliceObservation, TpTarget, classify_complex_order, gtc_expiry_due,
-    protection_status, remaining_targets, targets_from_dicts, validate_protection, whole_shares,
+    protection_status, targets_from_dicts, validate_protection, whole_shares,
     plan_slices, fractional_remainder,
 )
 from .allocator_protection_models import (
-    AllocatorProtection, AllocatorProtectionOrder, SLICE_ALARM_STATES, SLICE_CANCELLED_BY_US,
-    SLICE_CANCELLING, SLICE_FILLED_SL, SLICE_FILLED_TP, SLICE_LIVE, SLICE_LOST_CANCELLED,
-    SLICE_LOST_EXPIRED, SLICE_LOST_REJECTED, SLICE_PLACING, SLICE_RESTING_STATES, SLICE_UNKNOWN,
+    AllocatorProtection, AllocatorProtectionOrder, ORDER_KIND_OCO, ORDER_KIND_STOP,
+    SLICE_ALARM_STATES, SLICE_CANCELLED_BY_US, SLICE_CANCELLING, SLICE_FILLED_SL,
+    SLICE_FILLED_TP, SLICE_LIVE, SLICE_LOST_CANCELLED, SLICE_LOST_EXPIRED, SLICE_LOST_REJECTED,
+    SLICE_PLACING, SLICE_RESTING_STATES, SLICE_UNKNOWN, WEIGHT_REASON_SL_FILL,
+    WEIGHT_REASON_TP_FILL,
 )
 from .db import add_instance, get_db, get_instance, log_activity, update_instance
-from .models import TradingOrder
+from .models import TradingOrder, Transaction
 from .types import ActivityLogSeverity, ActivityLogType, OrderDirection, OrderStatus
 
 #: Slices still worth asking the broker about: resting ones, a partially filled one whose
@@ -97,11 +100,6 @@ def get_slices(protection_id: int) -> List[AllocatorProtectionOrder]:
             .order_by(AllocatorProtectionOrder.id)).all())
 
 
-def held_protections(account_id: int) -> Dict[str, AllocatorProtection]:
-    """``{symbol: protection}`` for every symbol the allocator must NOT trade. DB only."""
-    return {p.symbol: p for p in list_protections(account_id) if p.held_at is not None}
-
-
 def _save(obj):
     """Insert or update, refreshing ``updated_at`` on a protection. Returns the object."""
     if isinstance(obj, AllocatorProtection):
@@ -130,6 +128,32 @@ def _remaining_qty(slice_: AllocatorProtectionOrder) -> float:
 
 def covered_quantity(slices: Iterable[AllocatorProtectionOrder]) -> float:
     return sum(_remaining_qty(s) for s in slices if _is_resting(s))
+
+
+def _broker_id(s: AllocatorProtectionOrder) -> Optional[int]:
+    """The id the broker knows this slice by: the complex-order id of an OCO, the plain order
+    id of a stop-only slice. None while the placement has not reported back."""
+    return s.sl_order_id if s.kind == ORDER_KIND_STOP else s.complex_order_id
+
+
+def _describe(s: AllocatorProtectionOrder) -> str:
+    if s.kind == ORDER_KIND_STOP:
+        return f"stop-only order {s.sl_order_id}"
+    return f"complex order {s.complex_order_id}"
+
+
+def _read_slice(account, s: AllocatorProtectionOrder):
+    """The broker's current state of one slice (a complex order, or a one-member wrapper for a
+    stop-only order: both classify the same way). Raises on a failed read."""
+    if s.kind == ORDER_KIND_STOP:
+        return account.get_protective_order_state(s.sl_order_id)
+    return account.get_complex_order_state(s.complex_order_id)
+
+
+def _cancel_slice(account, s: AllocatorProtectionOrder):
+    if s.kind == ORDER_KIND_STOP:
+        return account.cancel_protective_stop(s.sl_order_id)
+    return account.cancel_complex_order(s.complex_order_id)
 
 
 # =========================================================================================
@@ -195,6 +219,20 @@ def _read_position(account, symbol: str) -> Tuple[float, bool]:
     return 0.0, True
 
 
+def _read_average_cost(account, symbol: str) -> Optional[float]:
+    """The broker's AVERAGE COST per share of ``symbol`` (what the presets are computed from),
+    or None when the broker did not state one. Raises ``BrokerReadError`` when the position read
+    failed. Never a fabricated number."""
+    positions = account.get_positions()
+    if positions is None:
+        raise BrokerReadError(f"the position fetch for account {account.id} failed")
+    for pos in positions:
+        if _norm(pos.symbol) == symbol:
+            avg = getattr(pos, "avg_entry_price", None)
+            return float(avg) if avg is not None and float(avg) > 0 else None
+    return None
+
+
 def _read_price(account, symbol: str) -> float:
     fetched = account.get_instrument_current_price([symbol], price_type="mark")
     price = fetched.get(symbol) if isinstance(fetched, dict) else fetched
@@ -218,11 +256,14 @@ def _tick_sizes(account, symbol: str):
 
 def _apply_observation(account, p: AllocatorProtection, s: AllocatorProtectionOrder,
                        obs: SliceObservation) -> AllocatorProtection:
-    """Write what the broker said onto the slice row and act on it (hold / alarm).
+    """Write what the broker said onto the slice row and act on it (fill / alarm).
 
-    Returns the (possibly updated) protection. The ONE place a fill becomes a HOLD and a
-    lost order becomes an alert, so the reconcile and the cancel path cannot disagree.
+    Returns the (possibly updated) protection. The ONE place a fill becomes a weight reduction
+    and a note and a lost order becomes an alert, so the reconcile and the cancel path cannot
+    disagree. A fill does NOT exclude the symbol: the remaining orders keep protecting the rest
+    and the next rebalance treats the symbol normally.
     """
+    covered_before = covered_quantity(get_slices(p.id))
     s.tp_order_id = obs.tp_order_id or s.tp_order_id
     s.sl_order_id = obs.sl_order_id or s.sl_order_id
     if obs.gtc_date is not None:
@@ -241,29 +282,115 @@ def _apply_observation(account, p: AllocatorProtection, s: AllocatorProtectionOr
         s.closed_at = s.closed_at or _now()
     _save(s)
 
-    if obs.state in _FILLED_STATES and p.held_at is None:
-        kind = "take-profit" if obs.kind == KIND_TP else "stop-loss"
-        p.held_at = _now()
-        p.held_reason = (f"{kind} filled (slice {s.slice_index + 1}, "
-                         f"{obs.filled_qty:g} of {s.quantity} sh"
-                         f"{'' if obs.fill_price is None else f' @ {obs.fill_price:g}'}); "
-                         f"the symbol is excluded from rebalancing until you re-enable it")
-        p.pending_replace = False
-        p.pending_replace_since = None
-        _save(p)
-        _log(p.account_id, ActivityLogSeverity.WARNING,
-             f"{p.symbol}: {p.held_reason}", code=CODE_HELD_FILL, symbol=p.symbol,
-             kind=obs.kind, slice=s.slice_index, filled_qty=obs.filled_qty,
-             fill_price=obs.fill_price)
-        logger.warning(f"allocator TP/SL: {p.symbol} HELD: {p.held_reason}")
+    if obs.state in _FILLED_STATES:
+        newly = max(0.0, float(obs.filled_qty) - float(s.weight_applied_qty or 0.0))
+        if newly > 1e-9:
+            p = _on_protective_fill(account, p, s, obs, newly, covered_before)
     elif obs.state in SLICE_ALARM_STATES:
         code = {SLICE_LOST_EXPIRED: CODE_LOST_EXPIRED, SLICE_LOST_CANCELLED: CODE_LOST_CANCELLED,
                 SLICE_LOST_REJECTED: CODE_LOST_REJECTED}.get(obs.state, CODE_UNKNOWN_STATE)
-        p = _alert(p, code, f"slice {s.slice_index + 1} ({s.quantity} sh, complex order "
-                            f"{s.complex_order_id}): {obs.detail}. The position is "
+        p = _alert(p, code, f"slice {s.slice_index + 1} ({s.quantity} sh, {_describe(s)}): "
+                            f"{obs.detail}. The position is "
                             f"{'partly ' if covered_quantity(get_slices(p.id)) > 0 else ''}"
                             f"UNPROTECTED -- re-place protection or close the position.")
     return _reload(p.id)
+
+
+def _fill_name(s: AllocatorProtectionOrder, obs: SliceObservation) -> Tuple[str, str]:
+    """``(what, weight_reason)`` for a fill: ``("TP1 filled", tp_fill)`` or ``("SL hit", sl_fill)``."""
+    if obs.kind == KIND_TP and s.kind == ORDER_KIND_OCO:
+        label = f"TP{s.target_index + 1} filled" if s.target_index >= 0 else "TP filled"
+        return label, WEIGHT_REASON_TP_FILL
+    return "SL hit", WEIGHT_REASON_SL_FILL
+
+
+def _on_protective_fill(account, p: AllocatorProtection, s: AllocatorProtectionOrder,
+                        obs: SliceObservation, newly: float,
+                        covered_before: float) -> AllocatorProtection:
+    """A protective order sold ``newly`` shares: reduce the symbol's allocator weight in
+    proportion (``new = old x remaining protected qty / protected qty before``; 0 when the
+    protection exited the position), keep the platform's own records in step, write the note.
+
+    The freed share is NOT given to the label's other symbols: it stays unallocated until the
+    operator reassigns it. Every automatic change is written to ``allocator_weight_change``.
+    """
+    what, reason = _fill_name(s, obs)
+    remaining = max(0.0, covered_before - newly)
+    factor = min(1.0, max(0.0, remaining / covered_before)) if covered_before > 1e-9 else 1.0
+    detail = (f"{what}: {newly:g} of {covered_before:g} protected sh sold"
+              + (f" @ {obs.fill_price:g}" if obs.fill_price is not None else ""))
+    try:
+        changes = reduce_symbol_weights(p.account_id, p.symbol, factor, reason=reason, detail=detail)
+    except Exception as e:  # noqa: BLE001 -- the fill is real whatever the weight write does
+        logger.error(f"allocator TP/SL: weight reduction for {p.symbol} failed: {e}", exc_info=True)
+        _log(p.account_id, ActivityLogSeverity.FAILURE,
+             f"{p.symbol}: {what}, but its allocator weight could not be reduced ({e}); "
+             f"lower it by hand or the next rebalance may buy it back", code="WEIGHT_FAILED",
+             symbol=p.symbol)
+        changes = []
+    note = f"{what} {_now():%Y-%m-%d}"
+    if changes:
+        if len({c.label for c in changes}) == 1:
+            note += f": share {changes[0].before_pct:g}% -> {changes[0].after_pct:g}%"
+        else:
+            note += ": " + "; ".join(f"{c.label} share {c.before_pct:g}% -> {c.after_pct:g}%"
+                                     for c in changes)
+    s.weight_applied_qty = float(s.weight_applied_qty or 0.0) + newly
+    _save(s)
+    _shrink_transactions(p.account_id, p.symbol, newly, obs.fill_price)
+    p.last_fill_at = _now()
+    p.last_fill_note = note
+    _save(p)
+    _log(p.account_id, ActivityLogSeverity.WARNING,
+         f"{p.symbol}: {note}. The remaining protective orders keep protecting the rest; the "
+         f"freed share stays unallocated and the next rebalance treats the symbol normally.",
+         code=CODE_FILL, symbol=p.symbol, kind=obs.kind, slice=s.slice_index,
+         filled_qty=newly, fill_price=obs.fill_price, weight_factor=factor)
+    logger.warning(f"allocator TP/SL: {p.symbol} {note}")
+    return _reload(p.id)
+
+
+def _shrink_transactions(account_id: int, symbol: str, quantity: float,
+                         price: Optional[float]) -> None:
+    """Keep the platform's open Transactions in step with a protective sale, FIFO.
+
+    A protective fill sells shares the platform never ordered, so without this the open
+    Transaction rows still carry the pre-fill quantity and the NEXT rebalance (which splits its
+    delta across them) would size against shares that are gone. A transaction sold in full is
+    closed at the fill price; a partly sold one is reduced. Never raises (the fill is real
+    whatever the bookkeeping does); a failure is logged loudly.
+    """
+    try:
+        from .portfolio_allocation_service import _open_transaction_ids
+        from .utils import close_transaction_with_logging
+        ids = _open_transaction_ids(account_id, [symbol]).get(symbol, [])
+        remaining = float(quantity)
+        for txn_id in ids:
+            if remaining <= 1e-9:
+                break
+            txn = get_instance(Transaction, txn_id)
+            have = float(txn.quantity or 0.0)
+            if have <= 1e-9:
+                continue
+            if remaining + 1e-9 >= have:
+                remaining -= have
+                if price is not None:
+                    txn.close_price = float(price)
+                close_transaction_with_logging(txn, account_id, "tp_sl_filled")
+            else:
+                txn.quantity = have - remaining
+                remaining = 0.0
+            update_instance(txn)
+        if remaining > 1e-6:
+            logger.warning(f"allocator TP/SL: {symbol}: {remaining:g} sh of a protective fill had no "
+                           f"open transaction to take it from")
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"allocator TP/SL: could not update the transactions of {symbol} after a "
+                     f"protective fill: {e}", exc_info=True)
+        _log(account_id, ActivityLogSeverity.FAILURE,
+             f"{symbol}: a protective order sold {quantity:g} sh but the open transactions could "
+             f"not be reduced ({e}); reconcile them before rebalancing", code="TXN_FAILED",
+             symbol=symbol)
 
 
 def _ack_alarm_slices(p: AllocatorProtection) -> None:
@@ -289,7 +416,7 @@ class CancelResult:
 def _cancel_live_slices(account, p: AllocatorProtection) -> Tuple[AllocatorProtection, CancelResult]:
     """Cancel every resting slice of ``p`` and require the broker to CONFIRM each.
 
-    A fill that lands before the cancel does is applied as a fill (-> HELD). An unconfirmed
+    A fill that lands before the cancel does is applied as a fill (weight reduced). An unconfirmed
     cancel leaves the slice CANCELLING, raises CANCEL_UNCONFIRMED and returns
     ``all_confirmed=False``: the shares may still be reserved, so the caller must not trade.
     """
@@ -297,7 +424,7 @@ def _cancel_live_slices(account, p: AllocatorProtection) -> Tuple[AllocatorProte
     for s in get_slices(p.id):
         if not _is_resting(s):
             continue
-        if s.complex_order_id is None:
+        if _broker_id(s) is None:
             # PLACING with no broker id: an order may exist that we cannot name.
             s.state = SLICE_UNKNOWN
             s.detail = "a placement never reported back; an order may exist at the broker"
@@ -306,17 +433,17 @@ def _cancel_live_slices(account, p: AllocatorProtection) -> Tuple[AllocatorProte
             result.detail.append(f"slice {s.slice_index + 1} has no broker id")
             p = _alert(p, CODE_UNKNOWN_STATE,
                        f"slice {s.slice_index + 1} was being placed and never reported back; "
-                       f"check the TastyTrade site for a GTC OCO on {p.symbol}")
+                       f"check the TastyTrade site for a GTC order on {p.symbol}")
             continue
         s.cancel_requested = True
         s.state = SLICE_CANCELLING
         _save(s)
-        outcome = account.cancel_complex_order(s.complex_order_id)
+        outcome = _cancel_slice(account, s)
         if not outcome.confirmed:
             result.all_confirmed = False
             result.detail.append(f"slice {s.slice_index + 1}: {outcome.detail}")
             p = _alert(p, CODE_CANCEL_UNCONFIRMED,
-                       f"could not confirm the cancel of complex order {s.complex_order_id} "
+                       f"could not confirm the cancel of {_describe(s)} "
                        f"({s.quantity} sh): {outcome.detail}. The orders may still be live; "
                        f"check the TastyTrade site.")
             continue
@@ -391,12 +518,16 @@ def _place_slices(account, p: AllocatorProtection) -> Tuple[AllocatorProtection,
         tag = f"ba2prot:{p.id}:{index}"
         row = _save(AllocatorProtectionOrder(
             protection_id=p.id, slice_index=index, target_index=plan.target_index,
-            quantity=plan.quantity, tp_price=plan.tp_price, sl_price=plan.sl_price,
-            external_tag=tag, state=SLICE_PLACING, placed_at=_now()))
+            kind=plan.kind, quantity=plan.quantity, tp_price=plan.tp_price,
+            sl_price=plan.sl_price, external_tag=tag, state=SLICE_PLACING, placed_at=_now()))
         try:
-            placed = account.place_protective_oco(
-                symbol=p.symbol, quantity=plan.quantity, tp_price=plan.tp_price,
-                sl_price=plan.sl_price, tag=tag)
+            if plan.kind == ORDER_KIND_STOP:
+                placed = account.place_protective_stop(
+                    symbol=p.symbol, quantity=plan.quantity, sl_price=plan.sl_price, tag=tag)
+            else:
+                placed = account.place_protective_oco(
+                    symbol=p.symbol, quantity=plan.quantity, tp_price=plan.tp_price,
+                    sl_price=plan.sl_price, tag=tag)
         except ProtectionRefused as e:
             row.state = SLICE_LOST_REJECTED
             row.detail = str(e)[:500]
@@ -411,10 +542,14 @@ def _place_slices(account, p: AllocatorProtection) -> Tuple[AllocatorProtection,
                                  f"an order may exist at the broker")
             logger.error(f"allocator TP/SL: placement raised for {p.symbol}: {e}", exc_info=True)
             continue
-        row.complex_order_id = placed.complex_order_id
-        row.tp_order_id = placed.tp_order_id
-        row.sl_order_id = placed.sl_order_id
-        row.tp_price, row.sl_price = placed.tp_price, placed.sl_price
+        if plan.kind == ORDER_KIND_STOP:
+            row.sl_order_id = placed.order_id
+            row.sl_price = placed.sl_price
+        else:
+            row.complex_order_id = placed.complex_order_id
+            row.tp_order_id = placed.tp_order_id
+            row.sl_order_id = placed.sl_order_id
+            row.tp_price, row.sl_price = placed.tp_price, placed.sl_price
         row.state = SLICE_LIVE
         if placed.gtc_date is not None:
             row.gtc_date = DateTime(placed.gtc_date.year, placed.gtc_date.month,
@@ -427,11 +562,18 @@ def _place_slices(account, p: AllocatorProtection) -> Tuple[AllocatorProtection,
         _save(row)
         result.placed += 1
         result.shares_covered += plan.quantity
-        _log(p.account_id, ActivityLogSeverity.SUCCESS,
-             f"{p.symbol}: placed protective OCO {placed.complex_order_id}: sell "
-             f"{plan.quantity} sh @ {plan.tp_price:g} or stop {plan.sl_price:g} (GTC)",
-             code="PLACED", symbol=p.symbol, complex_order_id=placed.complex_order_id,
-             quantity=plan.quantity, tp=plan.tp_price, sl=plan.sl_price)
+        if plan.kind == ORDER_KIND_STOP:
+            _log(p.account_id, ActivityLogSeverity.SUCCESS,
+                 f"{p.symbol}: placed protective stop {placed.order_id}: sell {plan.quantity} sh "
+                 f"on a stop at {plan.sl_price:g} (GTC, no take-profit)",
+                 code="PLACED", symbol=p.symbol, order_id=placed.order_id,
+                 quantity=plan.quantity, sl=plan.sl_price)
+        else:
+            _log(p.account_id, ActivityLogSeverity.SUCCESS,
+                 f"{p.symbol}: placed protective OCO {placed.complex_order_id}: sell "
+                 f"{plan.quantity} sh @ {plan.tp_price:g} or stop {plan.sl_price:g} (GTC)",
+                 code="PLACED", symbol=p.symbol, complex_order_id=placed.complex_order_id,
+                 quantity=plan.quantity, tp=plan.tp_price, sl=plan.sl_price)
 
     p = _reload(p.id)
     if result.errors:
@@ -463,15 +605,13 @@ def save_protection(account, symbol: str, sl_price: float,
                     targets: List[TpTarget]) -> ActionResult:
     """Validate, store and PLACE a protection (the dialog's Save). Real orders on success.
 
-    Refused (nothing written, nothing sent) on any validation error, on a held symbol (re-enable
-    first) and while a rebalance re-placement is pending. If orders already exist they are
+    Refused (nothing written, nothing sent) on any validation error and while a rebalance
+    re-placement is pending. If orders already exist they are
     cancelled with confirmation first; an unconfirmed cancel aborts before anything new is sent.
     """
     symbol = _norm(symbol)
     with protection_lock(account.id):
         p = get_protection(account.id, symbol)
-        if p is not None and p.held_at is not None:
-            return ActionResult(False, f"{symbol} is held after a TP/SL fill: re-enable it first.")
         if p is not None and p.pending_replace:
             return ActionResult(False, f"{symbol}: protective orders are being re-placed after a "
                                        f"rebalance; wait for that to finish.")
@@ -498,9 +638,6 @@ def save_protection(account, symbol: str, sl_price: float,
         _save(p)
 
         p, cancelled = _cancel_live_slices(account, p)
-        if cancelled.filled:
-            return ActionResult(False, f"{symbol}: a protective order filled while replacing it; "
-                                       f"the symbol is now held.")
         if not cancelled.all_confirmed:
             return ActionResult(False, f"{symbol}: the existing protective orders could not be "
                                        f"confirmed cancelled, so nothing new was placed.",
@@ -563,97 +700,16 @@ def delete_protection(account, symbol: str) -> ActionResult:
         return ActionResult(True, f"{symbol}: protection removed.")
 
 
-def reenable_symbol(account, symbol: str) -> ActionResult:
-    """Lift the HOLD so the allocator may trade the symbol again.
-
-    After a STOP fill the configuration is switched OFF (the stop already fired; arming a stop on
-    whatever is bought next at stale prices unasked would be wrong). After a TAKE-PROFIT fill the
-    consumed targets are dropped, the rest renormalised, and the slices still resting are kept
-    (they already match the reduced position; the next reconcile verifies it).
-    """
-    symbol = _norm(symbol)
-    with protection_lock(account.id):
-        p = get_protection(account.id, symbol)
-        if p is None or p.held_at is None:
-            return ActionResult(False, f"{symbol} is not held.")
-        slices = get_slices(p.id)
-        filled_sl = [s for s in slices if s.state == SLICE_FILLED_SL and s.target_index >= 0]
-        filled_tp = [s for s in slices if s.state == SLICE_FILLED_TP and s.target_index >= 0]
-        consumed = sorted({s.target_index for s in filled_tp})
-        targets = targets_from_dicts(p.tp_targets)
-        message = f"{symbol}: re-enabled for allocation."
-        left: List[TpTarget] = []
-        if not filled_sl:
-            try:
-                left = remaining_targets(targets, consumed)
-            except ValueError:
-                left = []
-        if filled_sl:
-            p.enabled = False
-            message += (" The stop had fired, so TP/SL protection was switched off; set it "
-                        "again if you re-buy.")
-        elif not left:
-            p.enabled = False
-            message += " Every take-profit target was hit, so TP/SL protection was switched off."
-        else:
-            shift = {old: old - sum(1 for c in consumed if c < old)
-                     for old in range(len(targets)) if old not in consumed}
-            p.tp_targets = [t.to_dict() for t in left]
-            for s in slices:
-                if s.state not in _FILLED_STATES and s.target_index in shift:
-                    s.target_index = shift[s.target_index]
-                    _save(s)
-        for s in filled_tp + filled_sl:
-            s.target_index = -1
-            _save(s)
-        p.held_at = None
-        p.held_reason = None
-        _save(p)
-        if not p.enabled:
-            # Switching protection off with orders still resting would leave them unmanaged.
-            p, cancelled = _cancel_live_slices(account, p)
-            if not cancelled.all_confirmed:
-                message += (" WARNING: remaining protective orders could not be confirmed "
-                            "cancelled; check the TastyTrade site.")
-        _log(account.id, ActivityLogSeverity.INFO, message, code="REENABLED", symbol=symbol)
-        warn = _tracked_quantity_warning(account, symbol)
-        if warn:
-            _log(account.id, ActivityLogSeverity.WARNING, warn, code="TRACKED_QTY_MISMATCH",
-                 symbol=symbol)
-            message += " " + warn
-        return ActionResult(True, message)
-
-
-def _tracked_quantity_warning(account, symbol: str) -> Optional[str]:
-    """After a TP fill the Transaction row still carries the pre-fill quantity; say so."""
-    try:
-        from .portfolio_allocation_service import _open_transaction_ids, _transaction_quantity
-        ids = _open_transaction_ids(account.id, [symbol]).get(symbol, [])
-        tracked = sum(_transaction_quantity(i) for i in ids)
-        held, _ = _read_position(account, symbol)
-    except Exception as e:  # noqa: BLE001 -- advisory only
-        logger.debug(f"allocator TP/SL: tracked-quantity check skipped for {symbol}: {e}")
-        return None
-    if ids and abs(tracked - held) > 1e-6:
-        return (f"{symbol}: the broker holds {held:g} sh but the tracked transaction(s) say "
-                f"{tracked:g}; reconcile before rebalancing it.")
-    return None
-
-
 def replace_protection(account, symbol: str) -> ActionResult:
-    """Cancel what is live (confirmed) and place a fresh set from the stored numbers.
-    Renews the GTC lifetime and repairs a lost or partial protection."""
+    """Resize / re-place: cancel what is live (confirmed) and place a fresh set from the stored
+    numbers at the CURRENT held quantity. Renews the GTC lifetime and repairs a lost, partial or
+    size-mismatched protection."""
     symbol = _norm(symbol)
     with protection_lock(account.id):
         p = get_protection(account.id, symbol)
         if p is None or not p.enabled:
             return ActionResult(False, f"{symbol}: protection is not enabled.")
-        if p.held_at is not None:
-            return ActionResult(False, f"{symbol} is held: re-enable it first.")
         p, cancelled = _cancel_live_slices(account, p)
-        if cancelled.filled:
-            return ActionResult(False, f"{symbol}: a protective order filled during the cancel; "
-                                       f"the symbol is now held.")
         if not cancelled.all_confirmed:
             return ActionResult(False, f"{symbol}: the cancel was not confirmed; nothing re-placed.",
                                 errors=cancelled.detail)
@@ -674,10 +730,11 @@ def replace_protection(account, symbol: str) -> ActionResult:
 @dataclass
 class ReconcileReport:
     checked: int = 0
-    new_holds: List[str] = field(default_factory=list)
+    new_fills: List[str] = field(default_factory=list)
     alarms: List[str] = field(default_factory=list)
     failed_symbols: List[str] = field(default_factory=list)
     resumed: List[str] = field(default_factory=list)
+    extended: List[str] = field(default_factory=list)
 
 
 def _working_order_symbols(account_id: int, symbols: Iterable[str]) -> Set[str]:
@@ -693,14 +750,31 @@ def _working_order_symbols(account_id: int, symbols: Iterable[str]) -> Set[str]:
     return {_norm(o.symbol) for o in rows if o.status not in terminal}
 
 
+def _run_in_flight(account) -> bool:
+    """True when an allocator run holds this account's submission lock right now (best effort:
+    the answer can change a microsecond later, which is why every placement path is also safe
+    against a run starting after it -- the run's prepare cancels whatever is live)."""
+    from .portfolio_allocation_service import _submission_lock
+    lock = _submission_lock(account.id)
+    if lock.acquire(blocking=False):
+        lock.release()
+        return False
+    return True
+
+
 def _reconcile_one(account, p: AllocatorProtection, report: ReconcileReport,
-                   position: Optional[Tuple[float, bool]]) -> None:
-    held_before = p.held_at is not None
+                   position: Optional[Tuple[float, bool]], may_place: bool = False) -> None:
+    """Reconcile one protection with the broker.
+
+    ``may_place`` True lets it ADD protection for shares nobody covers (see the growth rule
+    below); ``prepare_for_trade`` calls it False because it is about to cancel everything anyway.
+    """
+    fills_before = p.last_fill_at
     slices = get_slices(p.id)
     for s in slices:
         if s.state not in _RECONCILABLE_STATES or (s.closed_at is not None and s.state != SLICE_UNKNOWN):
             continue
-        if s.complex_order_id is None:
+        if _broker_id(s) is None:
             age = (_now() - s.placed_at).total_seconds() if s.placed_at else 0
             if s.state == SLICE_PLACING and age > PLACING_STALE_SECONDS:
                 obs = SliceObservation(
@@ -711,23 +785,23 @@ def _reconcile_one(account, p: AllocatorProtection, report: ReconcileReport,
                 report.alarms.append(p.symbol)
             continue
         try:
-            placed = account.get_complex_order_state(s.complex_order_id)
+            placed = _read_slice(account, s)
         except Exception as e:  # noqa: BLE001 -- a failed READ never flips a state
             report.failed_symbols.append(p.symbol)
             p = _alert(p, CODE_RECONCILE_FETCH_FAILED,
-                       f"could not read complex order {s.complex_order_id}: {e}; its state is "
+                       f"could not read {_describe(s)}: {e}; its state is "
                        f"UNCHANGED and unverified",
                        severity=ActivityLogSeverity.WARNING)
             break    # the broker is unreachable: one report per symbol, not one per slice
         report.checked += 1
         obs = classify_complex_order(placed, slice_quantity=s.quantity,
                                      we_requested_cancel=bool(s.cancel_requested))
-        before = (s.state, round(s.filled_qty or 0.0, 6))
+        before = s.state
         p = _apply_observation(account, p, s, obs)
-        if obs.state in SLICE_ALARM_STATES and before[0] != obs.state:
+        if obs.state in SLICE_ALARM_STATES and before != obs.state:
             report.alarms.append(p.symbol)
-    if not held_before and p.held_at is not None:
-        report.new_holds.append(p.symbol)
+    if p.last_fill_at != fills_before:
+        report.new_fills.append(p.symbol)
 
     p = _reload(p.id)
     slices = get_slices(p.id)
@@ -749,23 +823,22 @@ def _reconcile_one(account, p: AllocatorProtection, report: ReconcileReport,
             s.gtc_warned = True
             _save(s)
             p = _alert(p, CODE_GTC_EXPIRING,
-                       f"slice {s.slice_index + 1} (complex order {s.complex_order_id}) is "
+                       f"slice {s.slice_index + 1} ({_describe(s)}) is "
                        f"GTC until {s.gtc_date:%Y-%m-%d}"
                        f"{' (assumed, the broker gave no date)' if s.gtc_date_assumed else ''}; "
                        f"re-place protection to renew it",
                        severity=ActivityLogSeverity.WARNING)
 
-    if (not p.enabled and p.held_at is None and p.alert_code
-            and not any(_is_resting(x) for x in slices)
-            and not any(x.state in SLICE_ALARM_STATES and x.closed_at is None for x in slices)):
+    has_alarm = any(x.state in SLICE_ALARM_STATES and x.closed_at is None for x in slices)
+    if (not p.enabled and p.alert_code and not any(_is_resting(x) for x in slices)
+            and not has_alarm):
         # Switched off and every order is gone: an alert about orders that no longer exist
         # (an unconfirmed cancel that has since landed) is stale.
         p = _clear_alert(p)
-    if not p.enabled or p.held_at is not None or position is None:
+    if not p.enabled or position is None:
         return
     qty, is_long = position
     n_whole = whole_shares(qty) if is_long else 0
-    has_alarm = any(s.state in SLICE_ALARM_STATES and s.closed_at is None for s in slices)
     if p.pending_replace:
         if n_whole > 0 and abs(live - n_whole) < 1e-9:
             p.pending_replace = False
@@ -775,42 +848,61 @@ def _reconcile_one(account, p: AllocatorProtection, report: ReconcileReport,
         return
     if has_alarm:
         return
-    if n_whole > 0 and abs(live - n_whole) > 1e-9:
+
+    # GROWTH: whole shares nobody covers (a manual buy, a dividend reinvestment, shares bought back
+    # after the stop fired). Protection is ADDED for exactly those shares -- no cancel, so there
+    # is NO gap in which the existing shares are unprotected. Not while an allocator run is in
+    # flight or an order on the symbol is still working (the position is not final then).
+    if n_whole > live + 1e-9:
+        if not may_place or _working_order_symbols(account.id, [p.symbol]):
+            return
+        p, placed = _place_slices(account, p)
+        if placed.placed:
+            report.extended.append(p.symbol)
+            _log(account.id, ActivityLogSeverity.INFO,
+                 f"{p.symbol}: the position grew outside the allocator; added protection for "
+                 f"{placed.shares_covered} sh (the existing orders were not touched)",
+                 code="EXTENDED", symbol=p.symbol, added=placed.shares_covered)
+        if not placed.ok:
+            report.alarms.append(p.symbol)
+        elif p.alert_code and p.alert_code != CODE_GTC_EXPIRING:
+            _clear_alert(p)
+        return
+    if abs(live - n_whole) > 1e-9:
+        # SHRINK or a mismatch the platform will not auto-fix: the orders cover MORE shares than
+        # are held. Resizing means cancelling live orders (a gap), so it is the operator's
+        # one-click Resize protection, not something a background job does.
         _alert(p, CODE_QUANTITY_MISMATCH,
-               f"{live:g} of {n_whole} whole share(s) are covered by live protective orders"
-               + (" (none)" if live <= 0 else "") + "; re-place protection to resize it",
+               f"live protective orders cover {live:g} sh but {n_whole} whole share(s) are held; "
+               f"use Resize protection to re-place them at the held quantity",
                severity=ActivityLogSeverity.FAILURE)
         report.alarms.append(p.symbol)
-    elif abs(live - n_whole) < 1e-9:
+    elif p.alert_code and p.alert_code != CODE_GTC_EXPIRING:
         # Matched (or nothing to protect) and no alarm slice: every open alert but the GTC
         # expiry warning (which only a renewal resolves) is stale.
-        if p.alert_code and p.alert_code != CODE_GTC_EXPIRING:
-            _clear_alert(p)
+        _clear_alert(p)
 
 
 def _resume_unless_run_in_progress(account, symbols: List[str]) -> List[str]:
     """The background reconcile may complete a ``pending_replace`` only when NO allocator run is
     in flight: between a run's cancel and its first order a re-placement would reserve the very
     shares the run is about to sell. The run's own ``resume_protection`` is the normal path."""
-    from .portfolio_allocation_service import _submission_lock
-    lock = _submission_lock(account.id)
-    if not lock.acquire(blocking=False):
+    if _run_in_flight(account):
         logger.info(f"allocator TP/SL: account {account.id} has an allocator run in flight; "
                     f"re-placement left to the run")
         return []
-    try:
-        return resume_protection(account, symbols)
-    finally:
-        lock.release()
+    return resume_protection(account, symbols)
 
 
 def reconcile_account(account) -> ReconcileReport:
     """Reconcile every protection of ``account`` with the broker. Never raises.
 
-    Detects fills (-> HELD), lost/expired/cancelled orders (-> alarm), size mismatches, GTC
-    expiry; completes a ``pending_replace`` that WE started once the symbol has no working
-    platform order. Does NOT re-place a lost order (the operator may have cancelled it on the
-    broker's site on purpose): it alerts, and the page offers Re-place protection.
+    Detects fills (note + weight reduction), lost/expired/cancelled orders (-> alarm), size
+    mismatches, GTC expiry; completes a ``pending_replace`` that WE started once the symbol has no
+    working platform order; ADDS protection for shares that appeared outside the allocator
+    (growth, no cancel). Does NOT re-place a lost order (the operator may have cancelled it on the
+    broker's site on purpose) and does NOT resize a shrink: it alerts, and the page offers
+    Resize protection.
     """
     report = ReconcileReport()
     if getattr(account, "supports_allocator_protection", False) is not True:
@@ -829,10 +921,11 @@ def reconcile_account(account) -> ReconcileReport:
             if positions is not None:
                 for pos in positions:
                     by_symbol[_norm(pos.symbol)] = (float(pos.qty), pos.side == OrderDirection.BUY)
+            may_place = not _run_in_flight(account)
             for p in protections:
                 try:
                     position = None if positions is None else by_symbol.get(p.symbol, (0.0, True))
-                    _reconcile_one(account, _reload(p.id), report, position)
+                    _reconcile_one(account, _reload(p.id), report, position, may_place)
                 except Exception as e:  # noqa: BLE001 -- one symbol must not cost the others
                     report.failed_symbols.append(p.symbol)
                     logger.error(f"allocator TP/SL: reconcile of {p.symbol} failed: {e}",
@@ -855,12 +948,10 @@ def reconcile_account(account) -> ReconcileReport:
 class PrepareResult:
     """What ``prepare_for_trade`` tells the run.
 
-    ``held`` -- symbols the run must DROP (held after a fill, including one detected here).
     ``blocked`` -- ``{symbol: reason}`` the run must DROP and report FAILED (protective orders
     could not be cancelled, so shares are still reserved).
     ``pending`` -- symbols whose protection was cancelled/armed and needs ``resume_protection``.
     """
-    held: Dict[str, AllocatorProtection] = field(default_factory=dict)
     blocked: Dict[str, str] = field(default_factory=dict)
     pending: List[str] = field(default_factory=list)
 
@@ -873,9 +964,11 @@ def prepare_for_trade(account, symbols: Iterable[str]) -> PrepareResult:
     """Before the allocator trades ``symbols``: reconcile, cancel (confirmed), mark pending.
 
     Called under the allocator's submission lock, after the run's gates passed and before the
-    plan is recorded. A held symbol -- including one whose fill is only discovered here -- is
-    returned in ``held`` and must not be traded. ``pending_replace`` is written BEFORE the
-    first cancel, so a crash between cancel and re-placement leaves a durable marker.
+    plan is recorded. Every protected (enabled) symbol the plan touches has ALL its protective
+    orders (OCOs and stop-only) cancelled and the cancel CONFIRMED by the broker; a symbol whose
+    cancel cannot be confirmed is ``blocked`` (its shares may still be reserved, so the run must
+    not trade it). ``pending_replace`` is written BEFORE the first cancel, so a crash between
+    cancel and re-placement leaves a durable marker. A protection never excludes the symbol.
     """
     result = PrepareResult()
     if not has_protection(account):
@@ -885,21 +978,15 @@ def prepare_for_trade(account, symbols: Iterable[str]) -> PrepareResult:
             p = get_protection(account.id, symbol)
             if p is None:
                 continue
-            if p.held_at is None and any(_is_resting(s) for s in get_slices(p.id)):
-                _reconcile_one(account, p, ReconcileReport(), None)
+            if any(_is_resting(x) for x in get_slices(p.id)):
+                _reconcile_one(account, p, ReconcileReport(), None, may_place=False)
                 p = _reload(p.id)
-            if p.held_at is not None:
-                result.held[symbol] = p
-                continue
             if not p.enabled:
                 continue
             p.pending_replace = True
             p.pending_replace_since = _now()
             _save(p)
             p, cancelled = _cancel_live_slices(account, p)
-            if p.held_at is not None:
-                result.held[symbol] = p
-                continue
             if not cancelled.all_confirmed:
                 result.blocked[symbol] = (
                     "its protective TP/SL orders could not be confirmed cancelled, so the shares "
@@ -928,7 +1015,7 @@ def resume_protection(account, symbols: Iterable[str], *,
                 _working_order_symbols(account.id, wanted)
             for symbol in wanted:
                 p = get_protection(account.id, symbol)
-                if p is None or not p.pending_replace or p.held_at is not None or not p.enabled:
+                if p is None or not p.pending_replace or not p.enabled:
                     continue
                 if symbol in busy:
                     continue
@@ -938,8 +1025,9 @@ def resume_protection(account, symbols: Iterable[str], *,
                     _alert(p, CODE_REPLACE_FAILED, f"re-placement postponed: {e}")
                     continue
                 if whole_shares(qty) < 1:
-                    # Nothing to protect (sold out, or only a fractional remainder). Armed and
-                    # waiting, not an alarm; pending_replace is done.
+                    # The rebalance sold the whole position (or left only a fractional remainder):
+                    # protection is inactive (status 'no position', config kept) and is placed
+                    # again when the symbol is bought. Not an alarm; pending_replace is done.
                     p.pending_replace = False
                     p.pending_replace_since = None
                     _save(p)
@@ -969,16 +1057,17 @@ def status_for(p: Optional[AllocatorProtection], position_quantity: Optional[flo
                slices: Optional[List[AllocatorProtectionOrder]] = None) -> ProtectionStatus:
     """The page status of one symbol. ``p`` None -> OFF. Pure over its arguments."""
     if p is None:
-        return protection_status(enabled=False, held_at=None, held_reason=None,
-                                 pending_replace=False, pending_replace_since=None,
+        return protection_status(enabled=False, pending_replace=False, pending_replace_since=None,
                                  slice_states=[], position_quantity=position_quantity)
     rows = slices if slices is not None else get_slices(p.id)
-    states = [(s.state, _remaining_qty(s)) for s in rows
+    # A slice that part-filled and still rests counts as LIVE for the shares it still reserves.
+    states = [(SLICE_LIVE if s.state in _FILLED_STATES else s.state, _remaining_qty(s)) for s in rows
               if _is_resting(s) or (s.state in SLICE_ALARM_STATES and s.closed_at is None)]
     return protection_status(
-        enabled=p.enabled, held_at=p.held_at, held_reason=p.held_reason,
-        pending_replace=p.pending_replace, pending_replace_since=p.pending_replace_since,
-        slice_states=states, position_quantity=position_quantity, alert_message=p.alert_message)
+        enabled=p.enabled, pending_replace=p.pending_replace,
+        pending_replace_since=p.pending_replace_since, slice_states=states,
+        position_quantity=position_quantity, alert_message=p.alert_message,
+        last_fill_note=p.last_fill_note)
 
 
 def statuses_for_account(account_id: int, quantities: Dict[str, float]
@@ -994,3 +1083,10 @@ def open_alerts(account_id: int) -> List[AllocatorProtection]:
     """Protections with an open (non-GTC-warning) alert, for the page banner."""
     return [p for p in list_protections(account_id)
             if p.alert_code and p.alert_code != CODE_GTC_EXPIRING]
+
+
+# Public names for the UI (the underscored ones stay the implementation).
+read_position = _read_position
+read_price = _read_price
+read_average_cost = _read_average_cost
+read_tick_sizes = _tick_sizes

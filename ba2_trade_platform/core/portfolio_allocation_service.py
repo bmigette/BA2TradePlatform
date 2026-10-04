@@ -2113,11 +2113,17 @@ def _budget_block(account, plan: AllocationPlan) -> Optional[str]:
     return None
 
 
-HELD_BY_PROTECTION_FMT = (
-    "{symbol} is held after a TP/SL fill ({reason}); it is excluded from rebalancing "
-    "(no buys, no sells) until it is re-enabled on the allocation page.")
+EXCLUDED_BY_OPERATOR_FMT = (
+    "{symbol} is excluded from allocation (disabled by you{since}{note}): no buys, no sells, "
+    "and its value is outside the label maths. Include it again on the allocation page.")
 PROTECTION_CANCEL_BLOCK_FMT = (
     "{symbol}: not traded -- {why}.")
+
+
+def _excluded_message(symbol: str, exclusion) -> str:
+    since = f" on {exclusion.since:%Y-%m-%d}" if getattr(exclusion, "since", None) else ""
+    note = f", note: {exclusion.note}" if getattr(exclusion, "note", None) else ""
+    return EXCLUDED_BY_OPERATOR_FMT.format(symbol=symbol, since=since, note=note)
 
 
 def _drop_symbols(plan: AllocationPlan, symbols) -> AllocationPlan:
@@ -2127,38 +2133,60 @@ def _drop_symbols(plan: AllocationPlan, symbols) -> AllocationPlan:
     return filter_plan_rows(plan, keep)
 
 
-def _strip_held_symbols(account, plan: AllocationPlan) -> Tuple[AllocationPlan, List[RowOutcome]]:
-    """Remove every row of a symbol HELD after a TP/SL fill. DB only; a no-op off TastyTrade.
+def _strip_excluded_symbols(account, plan: AllocationPlan) -> Tuple[AllocationPlan, List[RowOutcome]]:
+    """Remove every row of a symbol the operator EXCLUDED from allocation. DB only; every broker.
 
-    Done FIRST, before any gate, so the gates (budget, stale-plan) judge the plan that will
-    really be sent, and enforced HERE -- the boundary that writes -- so a stale dialog opened
-    before the fill cannot trade a held symbol. The rows come back as SKIPPED outcomes so the
-    run's table still says why nothing happened.
+    The plan is built without excluded symbols (they are outside the managed money), so this is
+    the boundary guarantee: a dialog that was opened before the symbol was disabled, a wizard
+    re-solve over cached labels, or any retry path still cannot emit an order for it. Done
+    FIRST, before any gate, so the gates judge the plan that will really be sent. The rows come
+    back as SKIPPED outcomes so the run's table still says why nothing happened.
     """
-    from .allocator_protection_service import has_protection, held_protections
-    if not has_protection(account):
-        return plan, []
-    held = held_protections(account.id)
-    in_plan = [r.symbol for r in plan.rows if r.symbol.strip().upper() in held]
+    from .allocator_exclusion import get_exclusions
+    excluded = get_exclusions(account.id)
+    in_plan = [r.symbol for r in plan.rows if r.symbol.strip().upper() in excluded]
     if not in_plan:
         return plan, []
-    outcomes = [RowOutcome(
-        symbol=sym, action=ACTION_SKIP, status=OUTCOME_SKIPPED,
-        message=HELD_BY_PROTECTION_FMT.format(
-            symbol=sym, reason=held[sym.strip().upper()].held_reason or "TP/SL fill"))
-        for sym in in_plan]
-    logger.warning(f"Allocation for account {account.id}: held after TP/SL fill, excluded: "
+    outcomes = [RowOutcome(symbol=sym, action=ACTION_SKIP, status=OUTCOME_SKIPPED,
+                           message=_excluded_message(sym, excluded[sym.strip().upper()]))
+                for sym in in_plan]
+    logger.warning(f"Allocation for account {account.id}: excluded by the operator, not traded: "
                    f"{', '.join(in_plan)}")
     return _drop_symbols(plan, in_plan), outcomes
 
 
+def mark_excluded_rows_skipped(account, plan: AllocationPlan) -> AllocationPlan:
+    """The DRY RUN's view of an excluded symbol that is still in the plan (a re-solve over cached
+    labels): its row is SKIPPED with the reason, order fields zeroed.
+
+    ``run_allocation`` enforces the exclusion again by dropping the row at the boundary that
+    writes; this is only what the operator sees while reviewing. Totals are recomputed
+    (``filter_plan_rows`` over every row), so the budget footer is the exclusion-free one.
+    """
+    from .allocator_exclusion import get_exclusions
+    excluded = get_exclusions(account.id)
+    hits = [r for r in plan.rows if r.symbol.strip().upper() in excluded]
+    if not hits:
+        return plan
+    for row in hits:
+        row.reasons.append(_excluded_message(row.symbol, excluded[row.symbol.strip().upper()]))
+        row.skipped = True
+        row.delta_quantity = 0.0
+        row.side = None
+        row.estimated_value = 0.0
+        row.bp_cost = 0.0
+        row.bp_released = 0.0
+        row.target_quantity = row.current_quantity
+    return filter_plan_rows(plan, [r.symbol for r in plan.rows])
+
+
 def _prepare_protected_rows(account, plan: AllocationPlan):
-    """Cancel (confirmed) the protective orders of every symbol this plan will TRADE.
+    """Cancel (confirmed) ALL protective orders of every protected symbol this plan will TRADE.
 
     Called under the submission lock AFTER the gates passed, so a blocked attempt changed
-    nothing. Returns ``(plan, outcomes, prepare_result)``: a symbol that turned out to be held
-    (a fill discovered right now) or whose cancel could not be confirmed (its shares may still
-    be reserved at the broker) has its row dropped from the plan and reported.
+    nothing. Returns ``(plan, outcomes, prepare_result)``: a symbol whose cancel could not be
+    confirmed (its shares may still be reserved at the broker) has its row dropped from the plan
+    and reported FAILED. A protection never excludes the symbol: everything else trades.
     """
     from .allocator_protection_service import PrepareResult, has_protection, prepare_for_trade
     if not has_protection(account):
@@ -2166,17 +2194,12 @@ def _prepare_protected_rows(account, plan: AllocationPlan):
     trading = [r.symbol for r in plan.rows if r.side is not None and r.delta_quantity]
     prep = prepare_for_trade(account, trading)
     outcomes: List[RowOutcome] = []
-    for sym, p in prep.held.items():
-        outcomes.append(RowOutcome(
-            symbol=sym, action=ACTION_SKIP, status=OUTCOME_SKIPPED,
-            message=HELD_BY_PROTECTION_FMT.format(symbol=sym, reason=p.held_reason or "TP/SL fill")))
     for sym, why in prep.blocked.items():
         outcomes.append(RowOutcome(
             symbol=sym, action=ACTION_SKIP, status=OUTCOME_FAILED,
             message=PROTECTION_CANCEL_BLOCK_FMT.format(symbol=sym, why=why)))
-    dropped = list(prep.held) + list(prep.blocked)
-    if dropped:
-        plan = _drop_symbols(plan, dropped)
+    if prep.blocked:
+        plan = _drop_symbols(plan, list(prep.blocked))
     return plan, outcomes, prep
 
 
@@ -2281,9 +2304,9 @@ def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, Pos
         reading only those two tells the user "0 order(s) still working" -- which
         reads as "nothing outstanding" for a run nobody has been able to price.
     """
-    # ALLOCATOR TP/SL: a symbol held after a protective fill is not traded. Stripped FIRST
-    # so every gate below judges the plan that will really be sent.
-    plan, held_outcomes = _strip_held_symbols(account, plan)
+    # An EXCLUDED symbol (the operator's manual disable) is never traded. Stripped FIRST so every
+    # gate below judges the plan that will really be sent.
+    plan, excluded_outcomes = _strip_excluded_symbols(account, plan)
 
     # Market-hours gate, FIRST, before anything is written. Disabling the Submit
     # button is a courtesy; this is the enforcement -- the wizard can sit open across
@@ -2433,7 +2456,7 @@ def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, Pos
         raise
 
     # The rows the TP/SL boundary took out of the plan are still part of what the run reports.
-    for extra in held_outcomes + protection_outcomes:
+    for extra in excluded_outcomes + protection_outcomes:
         outcomes.append(extra)
         if on_outcome is not None:
             try:
@@ -2499,10 +2522,9 @@ def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, Pos
         unactionable=counts[OUTCOME_UNACTIONABLE],
         skipped=counts[OUTCOME_SKIPPED])
     description += RUN_FILLED_FMT.format(buys=totals.buy_value, sells=totals.sell_value)
-    if protection_prep.pending or protection_prep.held or protection_prep.blocked:
+    if protection_prep.pending or protection_prep.blocked:
         description += (f"; TP/SL: re-placed {len(replaced_protection)} of "
-                        f"{len(protection_prep.pending)}, held {len(protection_prep.held)}, "
-                        f"blocked {len(protection_prep.blocked)}")
+                        f"{len(protection_prep.pending)}, blocked {len(protection_prep.blocked)}")
     if not refreshed:
         description += RUN_REFRESH_FAILED_FMT
     elif not totals.settled:

@@ -15,7 +15,7 @@ from math import floor
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .allocator_protection_models import (
-    SLICE_ALARM_STATES, SLICE_CANCELLED_BY_US, SLICE_CANCELLING, SLICE_FILLED_SL,
+    ORDER_KIND_OCO, ORDER_KIND_STOP, SLICE_ALARM_STATES, SLICE_CANCELLED_BY_US, SLICE_CANCELLING, SLICE_FILLED_SL,
     SLICE_FILLED_TP, SLICE_LIVE, SLICE_LOST_CANCELLED, SLICE_LOST_EXPIRED,
     SLICE_LOST_REJECTED, SLICE_PLACING, SLICE_RESTING_STATES, SLICE_UNKNOWN,
 )
@@ -39,7 +39,6 @@ STATUS_PROTECTED = "PROTECTED"
 STATUS_PARTIAL = "PARTIAL"
 STATUS_UNPROTECTED = "UNPROTECTED"
 STATUS_REPLACING = "REPLACING"
-STATUS_HELD = "HELD"
 
 #: Alarm / alert codes (persisted on the protection row and written to the activity log).
 CODE_PLACEMENT_REFUSED = "PLACEMENT_REFUSED"
@@ -52,7 +51,7 @@ CODE_REPLACE_FAILED = "REPLACE_FAILED"
 CODE_QUANTITY_MISMATCH = "QUANTITY_MISMATCH"
 CODE_RECONCILE_FETCH_FAILED = "RECONCILE_FETCH_FAILED"
 CODE_GTC_EXPIRING = "GTC_EXPIRING"
-CODE_HELD_FILL = "HELD_FILL"
+CODE_FILL = "FILL"
 
 
 # =========================================================================================
@@ -71,12 +70,19 @@ class TpTarget:
 
 @dataclass(frozen=True)
 class SlicePlan:
-    """One OCO to place: ``quantity`` whole shares, take-profit at ``tp_price``, stop at ``sl_price``."""
+    """One order to place: ``quantity`` whole shares.
+
+    ``kind`` OCO: take-profit limit at ``tp_price`` OR stop at ``sl_price`` (``target_index`` is
+    the take-profit target it serves). ``kind`` STOP: a plain GTC stop-only sell at ``sl_price``
+    for the part of the position no take-profit covers (the "runner"); ``tp_price`` is None and
+    ``target_index`` is -1.
+    """
     slice_index: int
     target_index: int
     quantity: int
-    tp_price: float
+    tp_price: Optional[float]
     sl_price: float
+    kind: str = ORDER_KIND_OCO
 
 
 def targets_from_dicts(raw: Optional[Iterable[Dict[str, Any]]]) -> List[TpTarget]:
@@ -150,10 +156,10 @@ def validate_protection(*, sl_price: Optional[float], targets: Sequence[TpTarget
     """Blocking validation messages for a protection request; an empty list means valid. Pure.
 
     No defaults for live data: an unknown price or position is itself an error, never "assume
-    OK". Rules: SL > 0 and strictly BELOW the current price; every TP strictly ABOVE it; at
-    least one target; TP prices distinct AFTER tick rounding; each fraction in (0, 1]; fractions
-    sum to 1; the whole-share quantity must be at least the number of targets that can be
-    placed (at least one share).
+    OK". Rules: SL > 0 and strictly BELOW the current price; every TP strictly ABOVE it; TP
+    prices distinct AFTER tick rounding; each fraction in (0, 1] and the fractions sum to AT MOST
+    1 (the part no target covers is a stop-only runner, so ZERO targets is valid: a stop for the
+    whole position); at least one whole share.
     """
     errors: List[str] = []
     if last_price is None or last_price <= 0:
@@ -164,8 +170,6 @@ def validate_protection(*, sl_price: Optional[float], targets: Sequence[TpTarget
                       "Refresh and try again.")
     if sl_price is None or sl_price <= 0:
         errors.append("The stop-loss price must be greater than 0.")
-    if not targets:
-        errors.append("Add at least one take-profit target.")
 
     if last_price is not None and last_price > 0:
         if sl_price is not None and sl_price > 0 and sl_price >= last_price:
@@ -186,8 +190,8 @@ def validate_protection(*, sl_price: Optional[float], targets: Sequence[TpTarget
                           f"and at most 100%.")
     if targets:
         total = sum(t.fraction for t in targets)
-        if abs(total - 1.0) > _FRACTION_TOLERANCE:
-            errors.append(f"The take-profit shares must total 100% (they total "
+        if total > 1.0 + _FRACTION_TOLERANCE:
+            errors.append(f"The take-profit shares must not exceed 100% (they total "
                           f"{total * 100:.2f}%).")
 
     if last_price is not None and last_price > 0 and targets:
@@ -207,6 +211,11 @@ def validate_protection(*, sl_price: Optional[float], targets: Sequence[TpTarget
                           f"protect: TastyTrade does not accept fractional quantities on limit "
                           f"or stop orders.")
     return errors
+
+
+def runner_fraction(targets: Sequence[TpTarget]) -> float:
+    """The share of the position no take-profit covers (the stop-only runner), 0..1."""
+    return max(0.0, 1.0 - sum(t.fraction for t in targets))
 
 
 def split_quantity(shares: int, fractions: Sequence[float]) -> List[int]:
@@ -235,62 +244,138 @@ def split_quantity(shares: int, fractions: Sequence[float]) -> List[int]:
 def plan_slices(*, shares: int, targets: Sequence[TpTarget], sl_price: float,
                 last_price: float, tick_sizes: Optional[Sequence[Any]] = None
                 ) -> Tuple[List[SlicePlan], List[str]]:
-    """The OCOs to place for ``shares`` whole shares, plus notes about what could not be placed.
+    """The orders to place for ``shares`` whole shares, plus notes about what could not be placed.
 
-    Targets that receive 0 shares (fewer shares than targets) are DROPPED and their share is
-    folded into the nearest placeable target by re-splitting over the survivors, so the slices
-    always sum to ``shares``. Each dropped target is named in the notes (the dialog shows
-    them). Prices are snapped to the tick grid: TP to nearest, SL down.
+    The position is split by largest remainder over the targets (cheapest price first) and the
+    RUNNER (``1 - sum(fractions)``, last): every take-profit target becomes an OCO and the runner
+    becomes ONE plain stop-only order, so the quantities always sum to ``shares`` and the whole
+    position is always covered by a stop. A target that receives 0 shares is dropped (named in
+    the notes) -- its share is simply not carved out of the runner or the others. Prices are
+    snapped to the tick grid: TP to nearest, SL down. With no targets the plan is a single stop
+    for everything.
     """
     if shares < 1:
         return [], ["no whole share to protect"]
     notes: List[str] = []
     ordered = sorted(enumerate(targets), key=lambda it: it[1].price)
-    fractions = [t.fraction for _, t in ordered]
+    runner = runner_fraction(targets)
+    fractions = [t.fraction for _, t in ordered] + [runner if runner > _FRACTION_TOLERANCE else 0.0]
     quantities = split_quantity(shares, fractions)
-    kept = [(idx, t) for (idx, t), q in zip(ordered, quantities) if q > 0]
-    dropped = [(idx, t) for (idx, t), q in zip(ordered, quantities) if q == 0]
-    if dropped:
-        for idx, t in dropped:
-            notes.append(f"Take-profit target {idx + 1} ({t.price:g}) gets 0 shares of {shares} "
-                         f"and is not placed; its share goes to the other targets.")
-        quantities = split_quantity(shares, [t.fraction for _, t in kept])
-    else:
-        quantities = [q for q in quantities if q > 0]
+    runner_qty = quantities[-1]
+    tp_quantities = quantities[:-1]
     tick = tick_for_price(last_price, tick_sizes)
     sl = round_price_to_tick(sl_price, tick, "down")
-    plans = [SlicePlan(slice_index=n, target_index=idx, quantity=q,
-                       tp_price=round_price_to_tick(t.price, tick, "nearest"), sl_price=sl)
-             for n, ((idx, t), q) in enumerate(zip(kept, quantities))]
+    plans: List[SlicePlan] = []
+    for (idx, t), q in zip(ordered, tp_quantities):
+        if q == 0:
+            notes.append(f"Take-profit target {idx + 1} ({t.price:g}) gets 0 shares of {shares} "
+                         f"and is not placed.")
+            continue
+        plans.append(SlicePlan(slice_index=len(plans), target_index=idx, quantity=q,
+                               tp_price=round_price_to_tick(t.price, tick, "nearest"), sl_price=sl,
+                               kind=ORDER_KIND_OCO))
+    if runner_qty > 0:
+        plans.append(SlicePlan(slice_index=len(plans), target_index=-1, quantity=runner_qty,
+                               tp_price=None, sl_price=sl, kind=ORDER_KIND_STOP))
     return plans, notes
 
 
-def remaining_targets(targets: Sequence[TpTarget],
-                      consumed_indexes: Iterable[int]) -> List[TpTarget]:
-    """The targets still to be served after some were consumed by a fill, fractions
-    renormalised to sum 1. Raises ``ValueError`` when none are left."""
-    gone = set(consumed_indexes)
-    left = [t for i, t in enumerate(targets) if i not in gone]
-    if not left:
-        raise ValueError("every take-profit target has been consumed")
-    total = sum(t.fraction for t in left)
-    return [TpTarget(price=t.price, fraction=t.fraction / total) for t in left]
+def _plan_line(p: SlicePlan) -> str:
+    if p.kind == ORDER_KIND_STOP:
+        return f"STOP {p.quantity} sh @ {p.sl_price:g} (GTC, runner: no take-profit)"
+    return (f"OCO {p.slice_index + 1}: sell {p.quantity} sh -- limit {p.tp_price:g} "
+            f"OR stop {p.sl_price:g} (GTC)")
+
+
+def preview_summary(plans: Sequence[SlicePlan]) -> str:
+    """One line for the dialog: ``3 orders: OCO 5 sh TP 12.5 / SL 8, OCO 5 sh TP 15 / SL 8,
+    STOP 6 sh @ 8``. Pure."""
+    parts = [(f"STOP {p.quantity} sh @ {p.sl_price:g}" if p.kind == ORDER_KIND_STOP else
+              f"OCO {p.quantity} sh TP {p.tp_price:g} / SL {p.sl_price:g}") for p in plans]
+    noun = "order" if len(parts) == 1 else "orders"
+    return f"{len(parts)} {noun}: " + ", ".join(parts) if parts else "no orders"
 
 
 def preview_orders(*, shares: int, position_quantity: float, targets: Sequence[TpTarget],
                    sl_price: float, last_price: float,
                    tick_sizes: Optional[Sequence[Any]] = None) -> List[str]:
-    """Human sentences for the dialog's preview, one per order plus notes. Pure."""
+    """Human sentences for the dialog's preview: the one-line summary, one line per order, the
+    notes, and the fractional-remainder warning. Pure."""
     plans, notes = plan_slices(shares=shares, targets=targets, sl_price=sl_price,
                                last_price=last_price, tick_sizes=tick_sizes)
-    lines = [f"OCO {p.slice_index + 1}: sell {p.quantity} sh -- limit {p.tp_price:g} "
-             f"OR stop {p.sl_price:g} (GTC)" for p in plans]
+    lines = [preview_summary(plans)] if plans else []
+    lines.extend(_plan_line(p) for p in plans)
     lines.extend(notes)
     rest = fractional_remainder(position_quantity)
     if rest > 1e-9:
         lines.append(f"{rest:g} fractional share(s) cannot carry a limit or stop on "
                      f"TastyTrade and stay UNPROTECTED.")
     return lines
+
+
+# =========================================================================================
+# presets: fill the dialog from the position's AVERAGE COST (pure; the form stays editable)
+# =========================================================================================
+
+@dataclass(frozen=True)
+class PresetSpec:
+    """A named recipe: stop at ``sl_pct`` from average cost (negative) and take-profits at
+    ``(multiple_of_average_cost, share_of_position)``. The part no take-profit covers is the
+    stop-only runner."""
+    key: str
+    label: str
+    description: str
+    sl_pct: float
+    take_profits: Tuple[Tuple[float, float], ...]
+
+
+PRESETS: Tuple[PresetSpec, ...] = (
+    PresetSpec("double_up", "Double-up: take half at 2x",
+               "Sell 50% at 2.0x average cost; the other 50% has no take-profit (a runner) and "
+               "is protected by the stop. Stop -25% from average cost.", -25.0, ((2.0, 0.5),)),
+    PresetSpec("ladder", "Ladder +25/+50/+100%",
+               "Three take-profits of one third each at +25%, +50% and +100% over average cost. "
+               "Stop -15%.", -15.0, ((1.25, 1 / 3), (1.5, 1 / 3), (2.0, 1 / 3))),
+    PresetSpec("two_r", "2R scale-out",
+               "Stop -10% (the risk R); sell 50% at +20% (2R); the other 50% is a stop-only "
+               "runner.", -10.0, ((1.2, 0.5),)),
+    PresetSpec("income_stop", "Income: stop only",
+               "No take-profit; stop -20% from average cost. For income / wheel ETFs: keep "
+               "collecting the yield, cut a collapse.", -20.0, ()),
+)
+
+
+def preset_by_key(key: str) -> PresetSpec:
+    for spec in PRESETS:
+        if spec.key == key:
+            return spec
+    raise KeyError(f"unknown protection preset {key!r}")
+
+
+@dataclass
+class PresetResult:
+    sl_price: float
+    targets: List[TpTarget]
+
+
+def apply_preset(key: str, average_cost: Optional[float],
+                 tick_sizes: Optional[Sequence[Any]] = None) -> PresetResult:
+    """The stop and the take-profit targets a preset gives for ``average_cost``, on the tick grid
+    (TP to nearest, SL down). Pure. An unknown or non-positive average cost RAISES: a preset
+    computed from a guessed cost would be a fabricated price.
+
+    The result may fail validation against the CURRENT price (a position far under water has its
+    -25% stop above the market; one far in profit has a +25% target below it): the dialog
+    shows that as the usual validation message and leaves every number editable.
+    """
+    if average_cost is None or average_cost <= 0:
+        raise ValueError("the position's average cost is unknown, so a preset cannot be computed")
+    spec = preset_by_key(key)
+    tick = tick_for_price(average_cost, tick_sizes)
+    sl = round_price_to_tick(average_cost * (1.0 + spec.sl_pct / 100.0), tick, "down")
+    targets = [TpTarget(price=round_price_to_tick(average_cost * multiple, tick, "nearest"),
+                        fraction=fraction) for multiple, fraction in spec.take_profits]
+    return PresetResult(sl_price=sl, targets=targets)
 
 
 # =========================================================================================
@@ -451,7 +536,7 @@ class ProtectionStatus:
 
 _COLORS = {STATUS_OFF: "grey", STATUS_NO_POSITION: "grey", STATUS_PROTECTED: "positive",
            STATUS_PARTIAL: "warning", STATUS_REPLACING: "warning",
-           STATUS_UNPROTECTED: "negative", STATUS_HELD: "info"}
+           STATUS_UNPROTECTED: "negative"}
 
 
 def _as_utc_naive(value: Optional[DateTime]) -> Optional[DateTime]:
@@ -460,44 +545,34 @@ def _as_utc_naive(value: Optional[DateTime]) -> Optional[DateTime]:
     return value.replace(tzinfo=None) if value.tzinfo is not None else value
 
 
-def protection_status(*, enabled: bool, held_at: Optional[DateTime], held_reason: Optional[str],
-                      pending_replace: bool, pending_replace_since: Optional[DateTime],
+def protection_status(*, enabled: bool, pending_replace: bool,
+                      pending_replace_since: Optional[DateTime],
                       slice_states: Sequence[Tuple[str, float]], position_quantity: Optional[float],
-                      alert_message: Optional[str] = None,
+                      alert_message: Optional[str] = None, last_fill_note: Optional[str] = None,
                       now: Optional[DateTime] = None) -> ProtectionStatus:
     """The page status of one symbol. Pure; see section 3 of the design.
 
     ``slice_states`` is ``[(state, remaining_live_qty)]`` over this protection's slices (ALL of
     them: history rows are ignored here, alarm rows are what make it UNPROTECTED).
     ``position_quantity`` ``None`` (position unreadable) yields UNPROTECTED with that reason on
-    an enabled protection: unknown is never "fine".
+    an enabled protection: unknown is never "fine". A protection NEVER excludes the symbol from
+    allocation, so there is no "held" status; ``last_fill_note`` ("TP1 filled 2026-10-03: share
+    6% -> 3%") is appended to the tooltip of whatever the status is.
     """
     now = _as_utc_naive(now) or DateTime.utcnow()
     live_qty = sum(q for state, q in slice_states if state in SLICE_RESTING_STATES)
     alarms = [state for state, _ in slice_states if state in SLICE_ALARM_STATES]
-    held = held_at is not None
+    tail = f" Last fill: {last_fill_note}." if last_fill_note else ""
 
-    if not enabled and not held:
+    if not enabled:
         return ProtectionStatus(STATUS_OFF, "Set TP/SL", _COLORS[STATUS_OFF],
-                                "TP/SL protection is off for this symbol.")
+                                "TP/SL protection is off for this symbol." + tail)
 
     n_whole = None if position_quantity is None else whole_shares(position_quantity)
-    if held:
-        when = held_at.strftime("%Y-%m-%d")
-        tip = (f"Held after TP/SL fill on {when}: excluded from allocator rebalancing "
-               f"(no buys, no sells) until you re-enable it. {held_reason or ''}").strip()
-        if live_qty > 0:
-            tip += f" {live_qty:g} share(s) are still covered by resting orders."
-        if alarms:
-            tip += f" ALERT: {len(alarms)} protective order(s) were lost ({', '.join(sorted(set(alarms)))})."
-        return ProtectionStatus(STATUS_HELD, f"Held after TP/SL fill on {when}",
-                                _COLORS[STATUS_HELD], tip, alarm=bool(alarms),
-                                covered_quantity=live_qty, whole_shares=n_whole or 0)
-
     if position_quantity is None:
         return ProtectionStatus(STATUS_UNPROTECTED, "Unprotected", _COLORS[STATUS_UNPROTECTED],
                                 "The position could not be read, so protection cannot be "
-                                "confirmed.", alarm=True)
+                                "confirmed." + tail, alarm=True)
     if pending_replace:
         since = _as_utc_naive(pending_replace_since)
         stale = since is not None and (now - since).total_seconds() > PENDING_REPLACE_STALE_SECONDS
@@ -505,38 +580,41 @@ def protection_status(*, enabled: bool, held_at: Optional[DateTime], held_reason
             return ProtectionStatus(
                 STATUS_UNPROTECTED, "Unprotected", _COLORS[STATUS_UNPROTECTED],
                 "The protective orders were cancelled for a rebalance and the replacement "
-                "has not been placed. " + (alert_message or ""), alarm=True,
+                "has not been placed. " + (alert_message or "") + tail, alarm=True,
                 whole_shares=n_whole)
         return ProtectionStatus(STATUS_REPLACING, "Re-placing", _COLORS[STATUS_REPLACING],
-                                "Protective orders are being re-placed after a trade.",
+                                "Protective orders are being re-placed after a trade." + tail,
                                 covered_quantity=live_qty, whole_shares=n_whole)
     if n_whole == 0 and not alarms:
         return ProtectionStatus(STATUS_NO_POSITION, "Armed, no position", _COLORS[STATUS_NO_POSITION],
-                                "Enabled, but there is no whole share to protect yet.",
+                                "Enabled, but there is no whole share to protect yet; it is "
+                                "placed again as soon as the position is bought." + tail,
                                 whole_shares=0)
     if alarms:
         return ProtectionStatus(
             STATUS_UNPROTECTED, "Unprotected", _COLORS[STATUS_UNPROTECTED],
-            f"A protective order was lost ({', '.join(sorted(set(alarms)))}). "
-            f"{alert_message or ''}".strip(), alarm=True, covered_quantity=live_qty,
+            (f"A protective order was lost ({', '.join(sorted(set(alarms)))}). "
+             f"{alert_message or ''}").strip() + tail, alarm=True, covered_quantity=live_qty,
             whole_shares=n_whole)
     if live_qty <= 0:
         return ProtectionStatus(STATUS_UNPROTECTED, "Unprotected", _COLORS[STATUS_UNPROTECTED],
                                 "Enabled, but no protective order is live. "
-                                + (alert_message or ""), alarm=True, whole_shares=n_whole)
+                                + (alert_message or "") + tail, alarm=True, whole_shares=n_whole)
     if abs(live_qty - n_whole) < 1e-9:
         rest = fractional_remainder(position_quantity)
         note = (f" {rest:g} fractional share(s) cannot carry a stop on TastyTrade and are "
                 f"unprotected." if rest > 1e-9 else "")
         return ProtectionStatus(STATUS_PROTECTED, "Protected", _COLORS[STATUS_PROTECTED],
                                 f"{live_qty:g} of {position_quantity:g} shares are covered by "
-                                f"resting TP/SL orders.{note}", covered_quantity=live_qty,
+                                f"resting TP/SL orders.{note}{tail}", covered_quantity=live_qty,
                                 whole_shares=n_whole)
+    direction = ("The orders cover MORE shares than are held" if live_qty > n_whole
+                 else "Only part of the position is covered")
     return ProtectionStatus(
-        STATUS_PARTIAL, "Partly protected", _COLORS[STATUS_PARTIAL],
-        f"Only {live_qty:g} of {n_whole} whole shares are covered. "
-        f"{alert_message or 'Re-place protection to resize it.'}", alarm=True,
-        covered_quantity=live_qty, whole_shares=n_whole)
+        STATUS_PARTIAL, "Size mismatch", _COLORS[STATUS_PARTIAL],
+        f"{direction}: {live_qty:g} covered, {n_whole} whole shares held. "
+        f"{alert_message or 'Use Resize protection to re-place it at the held quantity.'}{tail}",
+        alarm=True, covered_quantity=live_qty, whole_shares=n_whole)
 
 
 def gtc_expiry_due(gtc_date: Optional[DateTime], *, today: Optional[Date] = None) -> bool:
@@ -566,6 +644,16 @@ class ProtectiveOcoResult:
     status: str
     gtc_date: Optional[Date]
     tp_price: float
+    sl_price: float
+    quantity: int
+
+
+@dataclass
+class ProtectiveStopResult:
+    """What ``place_protective_stop`` hands back after the broker accepted the stop-only order."""
+    order_id: int
+    status: str
+    gtc_date: Optional[Date]
     sl_price: float
     quantity: int
 

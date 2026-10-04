@@ -15,11 +15,12 @@ from ba2_trade_platform.core import allocator_protection_service as aps
 from ba2_trade_platform.core import portfolio_allocation_service as svc
 from ba2_trade_platform.core.allocator_protection_models import SLICE_LIVE
 from ba2_trade_platform.core.db import add_instance, get_db, get_instance, update_instance
-from ba2_trade_platform.core.models import PortfolioAllocationRun, TradingOrder
+from ba2_trade_platform.core.models import PortfolioAllocationRun, TradingOrder, Transaction
 from ba2_trade_platform.core.portfolio_allocation import (
     ALLOCATION_MODE_REBALANCE, AllocationPlan, PositionState,
 )
-from ba2_trade_platform.core.types import OrderDirection, OrderStatus
+from ba2_trade_platform.core.types import ActivityLogSeverity, OrderDirection, OrderStatus
+from tastytrade.utils import TastytradeError
 from tests.allocator_protection_fakes import FakeTastyBroker, make_account, patch_equity
 from tests.test_portfolio_allocation_submit import (
     FakeAccount, make_base, make_open_transaction, make_row,
@@ -59,13 +60,38 @@ class ProtectedFakeAccount(FakeAccount):
     def equity_tick_sizes(self, symbol):
         return self.tt.equity_tick_sizes(symbol)
 
+    def place_protective_stop(self, **kw):
+        return self.tt.place_protective_stop(**kw)
+
+    def cancel_protective_stop(self, oid):
+        return self.tt.cancel_protective_stop(oid)
+
+    def get_protective_order_state(self, oid):
+        return self.tt.get_protective_order_state(oid)
+
     def reserved(self, symbol) -> int:
         total = 0
         for record in self.broker.complex.values():
             for m in record["members"][:1]:                       # an OCO reserves its size ONCE
                 if m.underlying_symbol == symbol and str(m.status.value) in ("Live", "Received", "Cancel Requested"):
                     total += int(m.size)
+        for record in self.broker.singles.values():                      # a stop-only order reserves too
+            m = record["member"]
+            if m.underlying_symbol == symbol and str(m.status.value) in ("Live", "Received", "Cancel Requested"):
+                total += int(m.size)
         return total
+
+    def close_transaction(self, transaction_id):
+        """A full close: refused like the broker would if OCOs still reserve the shares."""
+        txn = get_instance(Transaction, transaction_id)
+        free = int(self.broker.positions.get(txn.symbol, 0)) - self.reserved(txn.symbol)
+        if txn.quantity > free:
+            return {'success': False, 'message': 'insufficient_qty: shares are reserved by resting orders'}
+        out = super().close_transaction(transaction_id)
+        if out.get('success'):
+            self.broker.positions[txn.symbol] = (self.broker.positions.get(txn.symbol, Decimal(0))
+                                                 - Decimal(str(txn.quantity)))
+        return out
 
     def submit_order(self, trading_order, tp_price=None, sl_price=None, is_closing_order="<not passed>"):
         if trading_order.side == OrderDirection.SELL:
@@ -192,36 +218,80 @@ def test_a_buy_resizes_the_protection_upward(world):
     assert sum(s.quantity for s in _live()) == 40
 
 
-def test_a_held_symbol_is_skipped_entirely_and_the_rest_still_trades(world):
+def test_a_fill_then_a_rebalance_buys_back_and_re_protects_the_whole_template(world):
+    """After a TP fill the symbol is NOT excluded: the next rebalance may buy it back to target and
+    then protection is re-placed on the new quantity -- every target again, same prices."""
     broker, account = world
-    txn_a = make_open_transaction(1, "ABC", 30.0)
-    txn_x = make_open_transaction(1, "XYZ", 20.0)
+    txn = make_open_transaction(1, "ABC", 30.0)
+    _protect(account)                                                  # 10 + 10 + 10
+    broker.fill(_live()[0].complex_order_id, "TP")                     # 10 sold by protection
+    aps.reconcile_account(account.tt)
+    assert broker.positions["ABC"] == Decimal(20)
+    account.fills = {"ABC": (OrderStatus.FILLED, None, 50.0)}
+    result = _run(account, [_trim("ABC", 10.0, 30.0, 50.0)], {"ABC": _state(account, "ABC", 20.0, txn)})
+    assert result["outcomes"][0].status == svc.OUTCOME_SUBMITTED
+    assert broker.positions["ABC"] == Decimal(30)
+    live = _live()
+    assert sum(s.quantity for s in live) == 30
+    assert sorted(s.tp_price for s in live) == [60.0, 65.0, 70.0]      # TP1 is back: the template is whole
+    assert {s.sl_price for s in live} == {45.0}
+
+
+def test_a_rebalance_resizes_oco_and_stop_only_slices_with_the_same_proportions(world):
+    broker, account = world
+    txn = make_open_transaction(1, "ABC", 30.0)
+    _protect(account, targets=[T(60, 0.5)])                            # OCO 15 + stop-only 15
+    assert sorted((s.kind, s.quantity) for s in _live()) == [("OCO", 15), ("STOP", 15)]
+    account.fills = {"ABC": (OrderStatus.FILLED, None, 50.0)}
+    result = _run(account, [_trim("ABC", -24.0, 6.0, 50.0)], {"ABC": _state(account, "ABC", 30.0, txn)})
+    assert result["outcomes"][0].status == svc.OUTCOME_SUBMITTED       # not refused for reserved shares
+    assert len(broker.delete_calls) == 1 and len(broker.single_delete_calls) == 1   # BOTH kinds cancelled
+    assert broker.positions["ABC"] == Decimal(6)
+    assert sorted((s.kind, s.quantity) for s in _live()) == [("OCO", 3), ("STOP", 3)]
+    assert {s.sl_price for s in _live()} == {45.0}
+    assert aps.status_for(aps.get_protection(1, "ABC"), 6.0).code == ap.STATUS_PROTECTED
+
+
+def test_selling_the_whole_position_clears_protection_it_stays_configured_and_inactive(world):
+    broker, account = world
+    txn = make_open_transaction(1, "ABC", 30.0)
     _protect(account)
-    broker.fill(_live()[0].complex_order_id, "TP")
-    aps.reconcile_account(account.tt)                                # the fill is known: HELD
-    assert "ABC" in aps.held_protections(1)
-    deletes = len(broker.delete_calls)
-
-    result = _run(account, [_trim("ABC", -10.0, 10.0, 50.0), _trim("XYZ", -5.0, 15.0, 20.0)],
-                  {"ABC": _state(account, "ABC", 20.0, txn_a), "XYZ": _state(account, "XYZ", 20.0, txn_x)})
-
-    assert [(s[0], s[2]) for s in account.submitted] == [("XYZ", 5.0)]     # ABC: no buy, no sell
-    by_symbol = {o.symbol: o for o in result["outcomes"]}
-    assert by_symbol["ABC"].status == svc.OUTCOME_SKIPPED
-    assert "held after a TP/SL fill" in by_symbol["ABC"].message
-    assert by_symbol["XYZ"].status == svc.OUTCOME_SUBMITTED
-    assert len(broker.delete_calls) == deletes                        # its remaining OCOs untouched
-    run = get_run()
-    assert [r["symbol"] for r in run.plan_json["rows"]] == ["XYZ"]   # the RECORDED plan excludes it
+    account.fills = {"ABC": (OrderStatus.FILLED, None, 50.0)}
+    result = _run(account, [_trim("ABC", -30.0, 0.0, 50.0)], {"ABC": _state(account, "ABC", 30.0, txn)})
+    assert result["outcomes"][0].status == svc.OUTCOME_SUBMITTED
+    assert broker.positions["ABC"] == Decimal(0)
+    assert _live() == []
+    p = aps.get_protection(1, "ABC")
+    assert p.enabled and not p.pending_replace and p.alert_code is None      # config kept, nothing owed
+    status = aps.status_for(p, 0.0)
+    assert status.code == ap.STATUS_NO_POSITION and not status.alarm
+    # bought again later (outside the allocator): protection comes back from the same template
+    broker.positions["ABC"] = Decimal(9)
+    assert aps.reconcile_account(account).extended == ["ABC"]
+    assert sum(s.quantity for s in _live()) == 9
 
 
-def get_run():
-    with get_db() as session:
-        return session.exec(select(PortfolioAllocationRun)).one()
+def test_a_failed_re_placement_after_the_rebalance_flags_the_symbol_unprotected_loudly(world):
+    broker, account = world
+    txn = make_open_transaction(1, "ABC", 30.0)
+    _protect(account)
+    account.fills = {"ABC": (OrderStatus.FILLED, None, 50.0)}
+    broker.raise_on_place = TastytradeError("tif_invalid: rejected")      # the re-placement is refused
+    result = _run(account, [_trim("ABC", -25.0, 5.0, 50.0)], {"ABC": _state(account, "ABC", 30.0, txn)})
+    assert result["outcomes"][0].status == svc.OUTCOME_SUBMITTED         # the trade itself went through
+    assert broker.positions["ABC"] == Decimal(5)
+    p = aps.get_protection(1, "ABC")
+    assert p.alert_code == ap.CODE_REPLACE_FAILED and "tif_invalid" in p.alert_message
+    assert not p.pending_replace
+    assert aps.status_for(p, 5.0).code == ap.STATUS_UNPROTECTED
+    failures = [c for c in account.log if c["severity"] == ActivityLogSeverity.FAILURE]
+    assert failures and any(ap.CODE_REPLACE_FAILED == c["data"].get("code") for c in failures)
+    assert [a.symbol for a in aps.open_alerts(1)] == ["ABC"]              # the page banner lists it
 
 
-def test_a_fill_discovered_at_run_time_holds_the_symbol_and_drops_its_row(world, monkeypatch):
-    """The fill lands AFTER the stale-plan gate and before the cancel (the race window)."""
+def test_the_fills_of_a_stop_out_during_the_run_window_are_seen_before_the_cancel(world, monkeypatch):
+    """A fill that lands after the stale-plan gate and before the cancel is applied first (weight
+    reduced, note written); the symbol is still traded normally, never skipped."""
     broker, account = world
     txn = make_open_transaction(1, "ABC", 30.0)
     _protect(account)
@@ -229,14 +299,14 @@ def test_a_fill_discovered_at_run_time_holds_the_symbol_and_drops_its_row(world,
     original = aps.prepare_for_trade
 
     def fill_then_prepare(acct, symbols):
-        broker.fill(target, "SL")                                    # nobody has reconciled yet
+        broker.fill(target, "SL")
         return original(acct, symbols)
     monkeypatch.setattr(aps, "prepare_for_trade", fill_then_prepare)
+    account.fills = {"ABC": (OrderStatus.FILLED, None, 50.0)}
     result = _run(account, [_trim("ABC", -10.0, 20.0, 50.0)], {"ABC": _state(account, "ABC", 30.0, txn)})
-    assert account.submitted == []
-    assert result["outcomes"][0].status == svc.OUTCOME_SKIPPED
-    assert "held after a TP/SL fill" in result["outcomes"][0].message
-    assert aps.get_protection(1, "ABC").held_at is not None
+    assert aps.get_protection(1, "ABC").last_fill_note.startswith("SL hit")
+    assert result["outcomes"][0].status in (svc.OUTCOME_SUBMITTED, svc.OUTCOME_FAILED)   # traded, not skipped
+    assert result["outcomes"][0].status != svc.OUTCOME_SKIPPED
 
 
 def test_a_stale_dialog_after_a_fill_is_refused_by_the_existing_position_gate(world):

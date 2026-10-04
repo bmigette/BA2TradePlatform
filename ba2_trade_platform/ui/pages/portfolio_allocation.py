@@ -110,6 +110,8 @@ from nicegui import ui
 from sqlmodel import select
 
 from ...config import get_app_setting
+from ...core import allocator_exclusion as exclusion_store
+from ...core import allocator_protection_service as protect_svc
 from ...core import portfolio_allocation_service as svc
 from ...core.db import get_db
 from ...core.instrument_enrichment import enrich_instruments
@@ -184,6 +186,10 @@ from ..utils.portfolio_allocation_view import (
     validate_label_target_edit, validate_reserve_edit, validate_symbol_weight_edit,
     wipe_symbol_shares, working_orders_notice,
 )
+from ..utils import allocator_protection_view as protect_view
+from ..utils.allocator_protection_view import label_extras_text
+from ..utils.portfolio_allocation_view import effective_symbol_weights
+from .allocator_protection_dialog import open_protection_dialog
 from .portfolio_allocation_wizard import (
     notify_outcomes, open_allocation_wizard, open_invest_scope, render_income_panel,
     phone_card_css as wizard_phone_card_css,
@@ -281,12 +287,19 @@ def _load_view_payload(account_id: int, valuation_mode: str,
                for row in get_managed_labels(account_id)]
     symbols_by_label = get_symbols_by_label([m.label for m in managed])
     symbols = collect_managed_symbols(symbols_by_label)
+    # THE OPERATOR'S EXCLUSIONS (manual disable). An excluded symbol is still priced and drawn
+    # (quantity, value and P&L are information) but it is OUTSIDE the managed money: its value is
+    # not in any label, nor in the investable base below.
+    exclusions = exclusion_store.get_exclusions(account_id)
+    enabled_symbols = exclusion_store.split_included(symbols, exclusions)
 
     account = get_account_instance_from_id(account_id)
     if account is None:
         raise RuntimeError(f"Account {account_id} could not be instantiated")
 
     positions = positions_by_symbol(account.get_positions())
+
+    protection = _load_protection_payload(account, account_id, positions)
 
     prices: Dict[str, Optional[float]] = {}
     if symbols:
@@ -365,7 +378,7 @@ def _load_view_payload(account_id: int, valuation_mode: str,
             # ``build_base_snapshot`` uses: buying power plus the DISTINCT managed
             # value under the active mode. Anything else and the page's percentages
             # would divide by a different base from the plan's.
-            base_notional = compute_base_notional(buying_power, positions, symbols,
+            base_notional = compute_base_notional(buying_power, positions, enabled_symbols,
                                                   valuation_mode=valuation_mode)
     except Exception as e:
         # The label table is this page's job; buying power is a bonus on top of it.
@@ -449,7 +462,9 @@ def _load_view_payload(account_id: int, valuation_mode: str,
                                    # dividend-adjusted number.
                                    dividends_by_symbol=cash_dividends_by_symbol(
                                        account.get_dividends()),
-                                   unallocated_pct=unallocated_pct),
+                                   unallocated_pct=unallocated_pct,
+                                   excluded=exclusions,
+                                   freed_labels=exclusion_store.labels_with_weight_changes(account_id)),
         'symbols_by_label': symbols_by_label,
         'valuation_mode': valuation_mode,
         'base_notional': base_notional,
@@ -470,7 +485,36 @@ def _load_view_payload(account_id: int, valuation_mode: str,
         #: ``{symbol: SymbolMarketStats}`` for the ⓘ tooltip. Absent until the
         #: background refresh has reached that symbol.
         'symbol_stats': stats,
+        #: The allocator TP/SL layer: ``{'supported': bool, 'items': {symbol: (protection,
+        #: slices)}}``. ``supported`` False on every broker that cannot do it, and then the
+        #: page draws nothing of it.
+        'protection': protection,
+        #: ``{SYMBOL: AllocatorExclusion}`` -- the symbols the operator switched off.
+        'exclusions': exclusions,
     }
+
+
+def _load_protection_payload(account, account_id: int, positions) -> Dict[str, Any]:
+    """The TP/SL layer's share of one render. Blocking (a broker read on a supporting account).
+
+    ``supported`` is tested with ``is True``: a MagicMock account is truthy on any attribute.
+    The reconcile is the Refresh button's job here -- it detects fills (HELD), lost or expired
+    orders and size mismatches, and never raises. A reconcile failure is logged and the page
+    still draws what is stored: the alert banner then shows the last known state, not nothing.
+    """
+    if getattr(account, 'supports_allocator_protection', False) is not True:
+        return {'supported': False, 'items': {}, 'quantities': {}}
+    try:
+        protect_svc.reconcile_account(account)
+    except Exception as e:  # noqa: BLE001 -- the stored state is still worth drawing
+        logger.error(f"TP/SL reconcile on page load failed for account {account_id}: {e}",
+                     exc_info=True)
+    items = {p.symbol: (p, protect_svc.get_slices(p.id))
+             for p in protect_svc.list_protections(account_id)}
+    # The broker's held quantity per symbol (read ONCE for the page), so a protection on a
+    # symbol that is in no managed label is still judged against its real position.
+    quantities = {sym: float(state.quantity or 0.0) for sym, state in positions.items()}
+    return {'supported': True, 'items': items, 'quantities': quantities}
 
 
 def refresh_symbol_facts(account, account_id: int, symbols):
@@ -557,46 +601,58 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
         raise RuntimeError(f"Account {account_id} could not be instantiated")
     managed = get_managed_labels(account_id)
     symbols_by_label = get_symbols_by_label([row.label for row in managed])
-    symbols = collect_managed_symbols(symbols_by_label)
+    all_symbols = collect_managed_symbols(symbols_by_label)
+    # THE OPERATOR'S EXCLUSIONS. An excluded symbol never reaches the engine: it is not in a
+    # label's symbols, not in ``current`` and not in the base -- it is an unmanaged holding as far
+    # as the plan is concerned (and ``run_allocation`` strips it again at the boundary that writes).
+    excluded = exclusion_store.excluded_symbols(account_id)
+    symbols = exclusion_store.split_included(all_symbols, excluded)
 
     # THE BOOK FIRST: the solve path resolves an unsaved share the same way the
     # page displays it -- saved wins, else the symbol's ACTUAL share of its label
     # -- and that needs the positions and their prices, so they are read before
-    # the labels rather than after.
-    current = svc.build_position_states(account, symbols)
+    # the labels rather than after. Read for EVERY managed symbol (the default share of an
+    # excluded one is part of the label's stored total) and then narrowed to the enabled ones.
+    current_all = svc.build_position_states(account, all_symbols)
+    current = {sym: state for sym, state in current_all.items() if sym not in excluded}
 
     labels = []
     for row in managed:
-        members = symbols_by_label.get(row.label, [])
+        members_all = symbols_by_label.get(row.label, [])
+        members = exclusion_store.split_included(members_all, excluded)
         saved = {symbol: float(stored.weight_pct)
                  for symbol, stored in get_symbol_rows(account_id, row.label).items()
-                 if symbol in members}
+                 if symbol in members_all}
         # THE SAME resolver the page's table is built from, so the number on
         # screen and the number the plan solves against cannot be two different
         # defaults. ``fair_share`` is the last resort and only reachable for an
         # UNMEASURABLE symbol -- see below.
         resolved = resolve_symbol_weights(
-            members, saved=saved,
-            values={s: current_value(current.get(s), valuation_mode) for s in members},
-            unmeasurable=[s for s in members
-                          if _is_unmeasurable_holding(current.get(s), valuation_mode)])
+            members_all, saved=saved,
+            values={s: current_value(current_all.get(s), valuation_mode) for s in members_all},
+            unmeasurable=[s for s in members_all
+                          if _is_unmeasurable_holding(current_all.get(s), valuation_mode)])
         # ``SymbolTarget.weight_pct`` is a float and the engine reads 0 as "hold
         # none of this", so an UNKNOWN share may not travel as 0 -- that would sell
         # the position out. It falls back to the historical fair share instead,
         # which is what this path did for every unsaved symbol until now; and the
         # only way to reach it is a held symbol with no price, which
         # ``held_no_price_block`` already refuses to SUBMIT against.
-        fair_share = get_symbol_weights(account_id, row.label, members)
+        fair_share = get_symbol_weights(account_id, row.label, members_all)
         # NULL stays None all the way to the dialog: "there is no last" is what
         # disables the Load-last button, and it is a different fact from 0.0.
         previous_weights = get_previous_symbol_weights(account_id, row.label, members)
+        # The STORED share of every symbol (excluded ones included); the enabled ones are then
+        # SCALED over the excluded ones' (``effective_symbol_weights``), so the label's target
+        # money applies to the enabled symbols only -- and a share a TP/SL fill freed stays freed.
+        stored_shares = {s: (float(fair_share.get(s, 0.0)) if resolved[s].weight_pct is None
+                             else float(resolved[s].weight_pct)) for s in members_all}
+        solved_shares = effective_symbol_weights(stored_shares, excluded)
         labels.append(LabelTarget(
             label=row.label, target_pct=float(row.target_pct or 0.0),
             symbols=[SymbolTarget(
                 symbol=s,
-                weight_pct=(float(fair_share.get(s, 0.0))
-                            if resolved[s].weight_pct is None
-                            else float(resolved[s].weight_pct)),
+                weight_pct=solved_shares[s],
                 previous_weight_pct=previous_weights.get(s)) for s in members],
             comment=row.comment,
             previous_target_pct=row.previous_target_pct))
@@ -606,6 +662,33 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
     config = get_allocation_config(account_id)
     return (base, labels, bool(config.allow_fractional),
             float(config.unallocated_pct or 0.0))
+
+
+def labels_for_persist(account_id: int, labels):
+    """The labels to hand ``save_allocation_targets``: for a label that holds an EXCLUDED symbol the
+    solved shares are SCALED (the excluded share spread over the rest) and persisting those would
+    rewrite the stored shares -- re-including the symbol would then total over 100%. So such a
+    label is written with its STORED shares only (read back from the DB); a symbol with no stored
+    row is left unstored rather than persisted at a scaled number. Other labels pass through.
+    Pure over the store reads; one call per run.
+    """
+    from dataclasses import replace
+    excluded = exclusion_store.excluded_symbols(account_id)
+    if not excluded or not labels:
+        return labels
+    from ...core.utils import get_symbols_by_label
+    members_all = get_symbols_by_label([lt.label for lt in labels])
+    out = []
+    for lt in labels:
+        if not any(sym in excluded for sym in members_all.get(lt.label, [])):
+            out.append(lt)
+            continue
+        stored = get_symbol_rows(account_id, lt.label)
+        out.append(replace(lt, symbols=[
+            SymbolTarget(symbol=st.symbol, weight_pct=float(stored[st.symbol].weight_pct),
+                         previous_weight_pct=st.previous_weight_pct)
+            for st in lt.symbols if st.symbol in stored]))
+    return out
 
 
 def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: float,
@@ -673,6 +756,9 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
     plan = svc.precheck_plan(account, plan,
                              available_buying_power=base.available_buying_power,
                              margin=margin, on_progress=on_progress)
+    # ALLOCATOR TP/SL: a symbol held after a protective fill is shown SKIPPED (the run itself
+    # enforces it again at the boundary that writes).
+    plan = svc.mark_excluded_rows_skipped(account, plan)
     return base, plan, current, svc.fetch_market_hours(account)
 
 
@@ -1049,7 +1135,9 @@ def _new_live_state(*, base_notional: Optional[float] = None,
                     available_buying_power: Optional[float] = None,
                     unallocated_pct: float = 0.0,
                     symbol_facts: Optional[Dict[str, Any]] = None,
-                    symbol_stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                    symbol_stats: Optional[Dict[str, Any]] = None,
+                    protection: Optional[Dict[str, Any]] = None,
+                    exclusions: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One render's mutable view of what is on screen. Not persisted anywhere.
 
     ``views`` is the ORDERED ``LabelView`` list and is the single source for every
@@ -1068,6 +1156,10 @@ def _new_live_state(*, base_notional: Optional[float] = None,
         # {symbol: SymbolMarketStats} for the ⓘ tooltip; absent until the
         # background refresh has reached that symbol.
         'symbol_stats': symbol_stats or {},
+        # The allocator TP/SL layer (see ``_load_protection_payload``).
+        'protection': protection or {'supported': False, 'items': {}, 'quantities': {}},
+        # {SYMBOL: AllocatorExclusion}: the operator's manual disables.
+        'exclusions': {(k or '').strip().upper(): v for k, v in (exclusions or {}).items()},
         'views': [],            # ordered LabelView list, MUTATED on an accepted edit
         'view_by_label': {},
         'weights': {},          # label -> {symbol: effective weight %}
@@ -1113,7 +1205,16 @@ def _write_row_deltas(row: Dict[str, Any]) -> None:
     that same figure minus the held shares. Computing it anywhere else would be a
     second writer for a number this one already has to derive.
     """
-    delta = symbol_delta(weight_pct=row.get('weight_pct'),
+    if row.get('excluded'):
+        # OUTSIDE the managed money: nothing to move, so no change to print.
+        for key in ('share_delta', 'value_delta', 'qty_delta'):
+            row[key] = ''
+        for key in ('share_delta_color', 'value_delta_color', 'qty_delta_color'):
+            row[key] = delta_color(None)
+        row['target_quantity'] = None
+        return
+    effective = row.get('eff_weight_pct')
+    delta = symbol_delta(weight_pct=(row.get('weight_pct') if effective is None else effective),
                          pct_of_label=row.get('pct_of_label'),
                          target_value=row.get('target_value'),
                          current_value=row.get('current_value'),
@@ -1150,14 +1251,21 @@ def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
         return
     view = live['view_by_label'].get(label)
     weights = live['weights'].get(label) or {}
+    # The stored shares are what the boxes hold; the SOLVED shares are the enabled symbols' ones
+    # scaled over the excluded symbols' (see ``effective_symbol_weights``).
+    effective = effective_symbol_weights(weights, live['exclusions'])
     values = symbol_target_values(
-        weights, label_target_pct=(float(view.target_pct or 0.0) if view else 0.0),
+        effective, label_target_pct=(float(view.target_pct or 0.0) if view else 0.0),
         base_notional=live['base_notional'], unallocated_pct=live['unallocated_pct'])
     for row in table.rows:
         symbol = row['symbol']
         if symbol not in weights:
             continue
         row['weight_pct'] = round(float(weights[symbol]), 2)
+        scaled = effective.get(symbol)
+        row['eff_weight_pct'] = (None if (scaled is None or abs(scaled - weights[symbol]) < 0.005)
+                                 else scaled)
+        row['eff_weight'] = protect_view.effective_weight_text(weights[symbol], row['eff_weight_pct'])
         value = values.get(symbol)
         row['target_value'] = None if value is None else round(value, 2)
         # The live deltas, recomputed from the SAME two numbers the cells above were
@@ -2652,6 +2760,52 @@ SYMBOL_CHIPS_TEMPLATE = r'''
 '''
 
 
+PROTECT_COLUMN = 'protect'
+MARKER_PROTECT_ALERT = 'pf-protect-alert'
+EXCLUDE_COLUMN = 'exclude'
+MARKER_EXCLUDE_TOGGLE = 'pf-exclude-toggle'
+MARKER_LABEL_EXTRAS = 'pf-label-extras'
+
+#: The Set TP/SL control of a symbol row, as one Vue fragment shared by the desktop cell and the
+#: phone card's header (the same trick as ``SYMBOL_CHIPS_TEMPLATE``). Reads ``props.row`` only and
+#: draws NOTHING when ``prot_on`` is false (a broker that cannot do it). A plain ``div`` and not a
+#: ``.row``: the card header's ``> .row`` rule right-aligns the broker chips and would drag this
+#: with it. The colour is inline hex (``prot_hex``), decided in Python.
+PROTECT_TEMPLATE = r'''
+            <div v-if="props.row.prot_on" class="pf-prot" style="display:flex;align-items:center;gap:4px;justify-content:center">
+                <q-btn dense flat round size="sm" icon="shield"
+                       :style="{ color: props.row.prot_hex }"
+                       @click="() => $parent.$emit('protectClick', props.row.symbol)">
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                        <div class="text-weight-bold">{{ props.row.symbol }}: TP/SL</div>
+                        <div>{{ props.row.prot_tip }}</div>
+                        <div style="margin-top:4px">Click to set, change or switch off</div>
+                    </q-tooltip>
+                </q-btn>
+                <span v-if="props.row.prot_label" class="text-caption text-weight-bold pf-prot-chip"
+                      :style="{ color: props.row.prot_hex }">{{ props.row.prot_label }}</span>
+                <span v-if="props.row.prot_note" class="text-caption pf-prot-note"
+                      style="color:#94a3b8">{{ props.row.prot_note }}</span>
+            </div>
+'''
+
+
+#: The exclude toggle of a symbol row (an eye) and its 'Excluded: manual' badge, as one Vue fragment
+#: shared by the desktop cell and the phone card's header. Always drawn (every broker). The toggle
+#: emits ``excludeToggle`` with the row's own symbol.
+EXCLUDE_TEMPLATE = r'''
+            <div class="pf-excl" style="display:flex;align-items:center;gap:4px;justify-content:center">
+                <q-btn dense flat round size="sm" :icon="props.row.excl_icon"
+                       :style="{ color: props.row.excluded ? '#fbbf24' : '#94a3b8' }"
+                       @click="() => $parent.$emit('excludeToggle', props.row.symbol)">
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">{{ props.row.excl_tip }}</q-tooltip>
+                </q-btn>
+                <span v-if="props.row.excl_badge" class="text-caption text-weight-bold pf-excl-chip"
+                      style="color:#fbbf24">{{ props.row.excl_badge }}</span>
+            </div>
+'''
+
+
 #: WHAT EACH SYMBOL-TABLE COLUMN BECOMES ON A PHONE (``<= 639px``), in reading order.
 #:
 #: Sixteen columns cannot share 390px, and scrolling them sideways leaves the symbol
@@ -2673,6 +2827,8 @@ SYMBOL_CARD = (
     CardColumn('flag', '', TIER_HEAD),
     CardColumn('symbol', 'Symbol', TIER_HEAD),
     CardColumn('info', '', TIER_HEAD),
+    CardColumn(PROTECT_COLUMN, 'TP/SL', TIER_HEAD),
+    CardColumn(EXCLUDE_COLUMN, '', TIER_HEAD),
     CardColumn('weight_pct', 'Share of label %', TIER_WIDE),
     CardColumn('current_value', 'Current value', TIER_PRIMARY),
     CardColumn('quantity', 'Qty', TIER_PRIMARY),
@@ -2701,6 +2857,8 @@ CARD_WEIGHT_INPUT_TEMPLATE = r"""
         <template v-slot:hint>
             <div class="text-right"
                  :class="'text-' + props.row.share_delta_color">{{ props.row.share_delta }}</div>
+            <div v-if="props.row.eff_weight" class="text-right text-caption"
+                 style="color:#94a3b8">{{ props.row.eff_weight }}</div>
         </template>
     </q-input>
 """
@@ -2830,13 +2988,14 @@ def symbol_card_template(card_columns=SYMBOL_CARD) -> str:
                      + ''.join(details) + '</div></q-expansion-item>')
     return (
         '<div class="col-12" style="width:100%">'
-        '<div class="pf-sym-card" :class="{\'pf-sym-card--sel\': props.selected}">'
+        '<div class="pf-sym-card" :class="{\'pf-sym-card--sel\': props.selected, '
+        '\'pf-sym-card--excl\': props.row.excluded}">'
         '<div class="pf-sym-head">'
         '<q-checkbox v-model="props.selected" />'
         '<span v-if="props.row.flag" :title="\'Also in: \' + props.row.labels" '
         'style="color:#f6ad55;font-weight:600">{{ props.row.flag }}</span>'
         '<span class="pf-sym-name">{{ props.row.symbol }}</span>'
-        + SYMBOL_CHIPS_TEMPLATE +
+        + SYMBOL_CHIPS_TEMPLATE + PROTECT_TEMPLATE + EXCLUDE_TEMPLATE +
         '</div>' + ''.join(parts) + '</div></div>')
 
 
@@ -2942,6 +3101,32 @@ SYMBOL_CARD_CSS = r"""
     .q-table__grid-content { padding: 0 !important; }
 """
 
+PROTECT_CSS = r"""
+    /* THE SET TP/SL CONTROL: a shield button and a status chip. The chip never wraps. */
+    .pf-prot-chip { white-space: nowrap; line-height: 1.2; }
+    .pf-sym-head > .pf-prot { margin-left: 6px; }
+    .pf-sym-head > .pf-excl { margin-left: 6px; }
+    .pf-prot-note { white-space: nowrap; font-size: 0.7rem; }
+    .pf-excl-chip { white-space: nowrap; }
+    /* AN EXCLUDED ROW is greyed (it is outside the managed money); its toggle stays readable. */
+    .pf-row-excluded td { opacity: 0.55; }
+    .pf-row-excluded td:has(.pf-excl) { opacity: 1; }
+    .pf-sym-card--excl .pf-tiles, .pf-sym-card--excl .pf-field { opacity: 0.55; }
+    /* the dialog's take-profit rows: price + share + delete stay on one line on a desktop */
+    .pf-tp-row .q-field { min-width: 0; }
+"""
+
+PROTECT_PHONE_CSS = phone_media("""
+    /* THE TP/SL DIALOG on a phone: each take-profit row is a full-width price over a share box
+       and the delete button, never three fields squeezed into 340px. */
+    .pf-tp-row.pf-tp-row { flex-wrap: wrap !important; row-gap: 4px; }
+    .pf-tp-row.pf-tp-row > .flex-grow { flex: 1 1 100% !important; }
+    .pf-tp-row.pf-tp-row > .w-32 { flex: 1 1 auto !important; width: auto !important; }
+    .pf-prot-dialog .q-field__control { min-height: 44px; }
+    .pf-sym-head > .pf-prot { margin-left: auto; }
+    .pf-bar-row > .pf-b-excl { order: 3; }
+""")
+
 PHONE_SWATCH_CSS = phone_media("""
     .pf-swatch { width: 36px !important; height: 36px !important; }
 """)
@@ -2984,6 +3169,7 @@ def page_phone_css() -> str:
     is built later and relies on it being there already.
     """
     return '\n'.join((GENERIC_PHONE_CSS, LABEL_BAR_PHONE_CSS, SYMBOL_CARD_CSS,
+                      PROTECT_CSS, PROTECT_PHONE_CSS,
                       PHONE_SWATCH_CSS, wizard_phone_card_css()))
 
 
@@ -3009,7 +3195,7 @@ def _phone_tables() -> PhoneTableRegistry:
     return registry
 
 
-def symbol_table_columns() -> List[Dict[str, Any]]:
+def symbol_table_columns(include_protect: bool = True) -> List[Dict[str, Any]]:
     """The symbol table's column definitions. ONE list, read by the table and by
     the phone card spec check (``SYMBOL_CARD``)."""
     # The LABELS column is gone. Every row inside a label's own section repeated the
@@ -3025,6 +3211,11 @@ def symbol_table_columns() -> List[Dict[str, Any]]:
         # eleven columns. ``field`` is required by Quasar and is never printed --
         # the slot below draws a button over it.
         {'name': 'info', 'label': '', 'field': 'symbol', 'align': 'center'},
+        # The allocator's TP/SL control: a shield button + the protection status chip. Dropped
+        # at render time (``include_protect``) on a broker that cannot do it.
+        {'name': PROTECT_COLUMN, 'label': 'TP/SL', 'field': 'prot_label', 'align': 'center'},
+        # The operator's manual disable: an eye toggle + the 'Excluded: manual' badge.
+        {'name': EXCLUDE_COLUMN, 'label': '', 'field': 'excl_badge', 'align': 'center'},
         {'name': 'current_value', 'label': 'Current value', 'field': 'current_value', 'sortable': True, 'align': 'right'},
         # THE HELD SHARES, beside the held money they are the other half of. This
         # column already existed, out past ``Target value`` and wearing the buy/sell
@@ -3071,10 +3262,82 @@ def symbol_table_columns() -> List[Dict[str, Any]]:
         {'name': 'pnl', 'label': 'P&L', 'field': 'pnl', 'align': 'right'},
         {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left'},
     ]
+    if not include_protect:
+        columns = [c for c in columns if c['name'] != PROTECT_COLUMN]
     return columns
 
 
 check_card_columns(SYMBOL_CARD, [c['name'] for c in symbol_table_columns()])
+
+
+async def apply_exclusion_change(account_id: int, symbol: str, currently_excluded: bool,
+                                 note: Optional[str], refresh) -> bool:
+    """Write the exclude / include decision, tell the operator, redraw. Returns whether it was
+    written (a failure is shown and logged, never swallowed)."""
+    symbol = symbol.strip().upper()
+    try:
+        if currently_excluded:
+            await asyncio.to_thread(exclusion_store.include_symbol, account_id, symbol)
+        else:
+            await asyncio.to_thread(exclusion_store.exclude_symbol, account_id, symbol, note=note)
+    except Exception as e:  # noqa: BLE001 -- shown, not swallowed
+        logger.error(f'Toggling exclusion of {symbol} failed: {e}', exc_info=True)
+        ui.notify(f'Could not change {symbol}: {e}', type='negative')
+        return False
+    ui.notify(f"{symbol} {'included in' if currently_excluded else 'excluded from'} allocation",
+              type='positive')
+    await refresh()
+    return True
+
+
+def _open_exclusion_dialog(account_id: int, symbol: str, exclusions: Dict[str, Any], refresh) -> None:
+    """Exclude / include ONE symbol for allocation. Always confirmed: it changes what the next run trades.
+
+    Excluding does not touch protective TP/SL orders (they stay exactly as they are); including is
+    explicit."""
+    symbol = symbol.strip().upper()
+    currently = symbol in exclusions
+    with ui.dialog() as dialog, ui.card().classes('w-full max-w-[520px]'):
+        if currently:
+            ui.label(f'Include {symbol} in allocation again?').classes('text-h6')
+            ui.label('It counts in its labels again: rebalancing may buy or sell it and its share '
+                     'is part of the label maths.').classes('text-xs text-secondary-custom')
+            note = None
+        else:
+            ui.label(f'Exclude {symbol} from allocation?').classes('text-h6')
+            ui.label('The allocator will not buy or sell it, its value is outside the label and the '
+                     'investable base, and its share is ignored (the other symbols are scaled over '
+                     'the enabled ones). It stays visible in its label. Protective TP/SL orders stay '
+                     'exactly as they are.').classes('text-xs text-secondary-custom')
+            note = ui.input('Note (optional)', placeholder='e.g. bought manually').props('dense outlined') \
+                .classes('w-full')
+
+        async def _go() -> None:
+            done = await apply_exclusion_change(
+                account_id, symbol, currently,
+                (note.value or None) if note is not None else None, refresh)
+            if done:
+                dialog.close()
+
+        with ui.row().classes('w-full justify-end gap-2 mt-2 pf-actions'):
+            ui.button('Cancel', on_click=dialog.close).props('flat')
+            ui.button('Include again' if currently else 'Exclude', on_click=_go) \
+                .props('color=primary').mark(MARKER_EXCLUDE_TOGGLE)
+    dialog.open()
+
+
+def _protection_fields(protection: Dict[str, Any], symbol: str, quantity: float) -> Dict[str, Any]:
+    """The row fields of the Set TP/SL control for one symbol. Pure over its arguments."""
+    if not protection['supported']:
+        return protect_view.row_fields(False, None)
+    entry = protection['items'].get(symbol)
+    if entry is None:
+        status = protect_svc.status_for(None, quantity)
+        note = None
+    else:
+        status = protect_svc.status_for(entry[0], quantity, entry[1])
+        note = entry[0].last_fill_note
+    return protect_view.row_fields(True, status, note)
 
 
 def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
@@ -3133,6 +3396,12 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # is never mistaken for "fractionable" at a glance.
         **_symbol_fact_fields(live['symbol_facts'].get(r.symbol)),
         **_symbol_stat_fields(live['symbol_stats'].get(r.symbol)),
+        **_protection_fields(live['protection'], r.symbol, r.quantity),
+        # The operator's manual disable: badge, toggle, tooltip. An excluded row is greyed.
+        **protect_view.exclusion_fields(live['exclusions'].get(r.symbol)),
+        # The share an ENABLED row is really solved with when its label has an excluded symbol.
+        'eff_weight_pct': r.effective_weight_pct,
+        'eff_weight': protect_view.effective_weight_text(r.weight_pct, r.effective_weight_pct),
         'current_value': round(r.current_value, 2),
         # BOTH label denominators travel to the browser. ``pct_of_label_target`` is
         # what the "% of label tgt" COLUMN prints -- the label's target money, so an
@@ -3193,7 +3462,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     for row in rows:
         _write_row_deltas(row)
 
-    columns = symbol_table_columns()
+    columns = symbol_table_columns(include_protect=live['protection']['supported'])
 
     table = ui.table(columns=columns, rows=rows, row_key='symbol',
                      selection='multiple').classes('w-full dark-pagination')
@@ -3250,6 +3519,27 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         </q-td>
     ''')
     table.on('symbolInfo', lambda e: _open_symbol_info([emitted_value(e)]))
+    # THE TP/SL CONTROL. Like ``symbolInfo`` the row's own symbol travels with the click. A
+    # broker that cannot do it has no column (``include_protect``), so the cell and the handler
+    # are only attached when it is there.
+    table.add_slot('body-cell-exclude', r'''
+        <q-td :props="props">
+            ''' + EXCLUDE_TEMPLATE + r'''
+        </q-td>
+    ''')
+    table.on('excludeToggle',
+             lambda e: _open_exclusion_dialog(account_id, str(emitted_value(e)),
+                                              live['exclusions'], refresh))
+    # An excluded row is greyed (Quasar's ``table-row-class-fn``); its toggle stays readable.
+    table.props(':table-row-class-fn="(row) => row.excluded ? \'pf-row-excluded\' : \'\'"')
+    if live['protection']['supported']:
+        table.add_slot('body-cell-protect', r'''
+            <q-td :props="props">
+                ''' + PROTECT_TEMPLATE + r'''
+            </q-td>
+        ''')
+        table.on('protectClick',
+                 lambda e: open_protection_dialog(account_id, str(emitted_value(e)), refresh))
     # THE DELTA IS THE INPUT'S ``hint``, not a sibling div. A sibling right-aligns to
     # the CELL's edge while the input's number right-aligns to the INPUT's content box,
     # and the two are not the same edge -- the delta hung a dozen pixels past the box it
@@ -3273,6 +3563,8 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
                 <template v-slot:hint>
                     <div class="text-right"
                          :class="'text-' + props.row.share_delta_color">{{ props.row.share_delta }}</div>
+                    <div v-if="props.row.eff_weight" class="text-right text-caption"
+                         style="color:#94a3b8">{{ props.row.eff_weight }}</div>
                 </template>
             </q-input>
         </q-td>
@@ -3605,6 +3897,16 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
                 ui.tooltip(SYMBOL_COUNT_BADGE_TOOLTIP_FMT.format(
                     count=len(view.rows), label=view.label))
             widgets['count_badge'] = count_badge
+            # '+$X excluded' (the operator's manual disables are OUTSIDE this label's value) and
+            # 'freed Y% from TP/SL fills' (a share a protective fill released and left unallocated).
+            extras = label_extras_text(view.excluded_value, view.excluded_count, view.freed_pct)
+            if extras:
+                excl_label = ui.label(extras).classes('text-xs shrink-0 pf-b-excl').style('color:#fbbf24') \
+                    .mark(MARKER_LABEL_EXTRAS)
+                with excl_label:
+                    ui.tooltip('Excluded symbols are outside this label: not traded, not in its value, '
+                               'their share ignored. A freed share (TP/SL fills) stays unallocated until '
+                               'you reassign it.')
             widgets['value'] = ui.label('').classes('w-28 text-right pf-b-value')
             # THE bar component, shared with the per-label symbol-share total and
             # the unallocated row so the three read as one visual language.
@@ -3694,12 +3996,35 @@ def _render_sim_banner(payload: Dict[str, Any]) -> None:
             real=f"${float(real):,.2f}" if real is not None else SIM_BANNER_NO_REAL))
 
 
+def _render_protection_banner(payload: Dict[str, Any]) -> None:
+    """The red TP/SL ALERT banner above the label list.
+
+    An unprotected, partly protected or unverifiable position must be impossible to miss, and
+    it must not depend on which label the symbol sits in or whether that label is expanded.
+    Drawn from the SAME statuses the rows use. Nothing is drawn on a broker without the
+    feature, or when there is nothing to say.
+    """
+    protection = payload.get('protection') or {}
+    if not protection.get('supported'):
+        return
+    quantities = protection.get('quantities') or {}
+    entries = [(p, protect_svc.status_for(p, quantities.get(p.symbol, 0.0), slices))
+               for p, slices in protection['items'].values()]
+    alerts = protect_view.banner_lines(entries)
+    if alerts:
+        with ui.element('div').classes('alert-banner danger w-full p-3').mark(MARKER_PROTECT_ALERT):
+            ui.label(f'TP/SL ALERT: {len(alerts)} position(s) are not fully protected').classes('text-weight-bold')
+            for line in alerts:
+                ui.label(line).classes('text-sm')
+
+
 def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     # Biggest holding first. The 39.5% row used to sit between two 1-5% rows,
     # because the order was whatever ``sort_order`` happened to be.
     # BEFORE the empty-label early return: an account with no labels can still be
     # simulating, and the warning must not depend on there being a table under it.
     _render_sim_banner(payload)
+    _render_protection_banner(payload)
 
     views = sort_label_views(payload['views'])
     if not views:
@@ -3714,7 +4039,9 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
                            available_buying_power=buying_power,
                            unallocated_pct=payload['unallocated_pct'],
                            symbol_facts=payload.get('symbol_facts') or {},
-                           symbol_stats=payload.get('symbol_stats') or {})
+                           symbol_stats=payload.get('symbol_stats') or {},
+                           protection=payload.get('protection'),
+                           exclusions=payload.get('exclusions'))
     # NOT sum(v.current_value ...): that counts a symbol once per managed label,
     # while every pct_of_total below was divided by the DISTINCT total.
     total = managed_total_value(views)
@@ -3955,7 +4282,7 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
         if mode != ALLOCATION_MODE_INVEST_LABEL:
             set_allocation_config(account_id, unallocated_pct=float(unallocated_pct))
         return save_allocation_targets(
-            account_id, labels,
+            account_id, labels_for_persist(account_id, labels),
             save_label_targets=(mode != ALLOCATION_MODE_INVEST_LABEL))
 
     async def _save_choices(mode: str, labels, allow_fractional: bool,

@@ -70,6 +70,9 @@ class FakeTastyBroker:
         self.tick_sizes = [TickSize(value=Decimal("0.0001"), threshold=Decimal("1")),
                            TickSize(value=Decimal("0.01"))]
         self.complex: Dict[int, dict] = {}
+        self.singles: Dict[int, dict] = {}        # plain (stop-only) orders by id
+        self.single_place_calls: List[tuple] = []   # (dry_run, NewOrder)
+        self.single_delete_calls: List[int] = []
         self._next_complex = 9000
         self._next_order = 70000
         self.place_calls: List[tuple] = []     # (dry_run, NewComplexOrder)
@@ -84,6 +87,11 @@ class FakeTastyBroker:
         self.cancel_polls = 1                   # reads that still say 'Cancel Requested'
         self.never_confirm_cancel = False
         self.fill_on_delete: Optional[str] = None   # "TP" or "SL": the order fills instead of cancelling
+        self.single_raise_on_place: Optional[Exception] = None
+        self.single_dry_run_errors: List[str] = []
+        self.single_reject_after_accept = False
+        self.single_raise_on_read: Optional[Exception] = None
+        self.single_fill_on_delete = False
         self.positions_fail = False
 
     # ------------------------------------------------------------- SDK surface
@@ -145,6 +153,55 @@ class FakeTastyBroker:
             m.status = TTOrderStatus.CANCEL_REQUESTED
         record["cancel_left"] = self.cancel_polls
 
+    # ---- plain orders (the stop-only runner) ---------------------------------
+    async def place_order(self, session, order, dry_run: bool = True):
+        self.single_place_calls.append((dry_run, order))
+        if dry_run:
+            errors = [SimpleNamespace(code="x", message=m) for m in self.single_dry_run_errors]
+            return SimpleNamespace(order=SimpleNamespace(id=-1), errors=errors or None, warnings=None)
+        if self.single_raise_on_place is not None:
+            raise self.single_raise_on_place
+        member = self._placed_from_new(order)
+        oid = int(member.id)
+        self.singles[oid] = {"member": member, "cancel_left": None}
+        if self.single_reject_after_accept:
+            member.status = TTOrderStatus.REJECTED
+        return SimpleNamespace(order=member, errors=None, warnings=None)
+
+    async def get_order(self, session, order_id: int):
+        if self.single_raise_on_read is not None:
+            raise self.single_raise_on_read
+        record = self.singles.get(int(order_id))
+        if record is None:
+            raise TastytradeError(f"order {order_id} not found")
+        if record["cancel_left"] is not None:
+            if self.never_confirm_cancel:
+                pass
+            elif record["cancel_left"] <= 0:
+                if record["member"].status == TTOrderStatus.CANCEL_REQUESTED:
+                    record["member"].status = TTOrderStatus.CANCELLED
+                record["cancel_left"] = None
+            else:
+                record["cancel_left"] -= 1
+        return record["member"]
+
+    async def delete_order(self, session, order_id: int):
+        self.single_delete_calls.append(int(order_id))
+        if self.raise_on_delete is not None:
+            raise self.raise_on_delete
+        record = self.singles.get(int(order_id))
+        if record is None:
+            raise TastytradeError(f"order {order_id} not found")
+        member = record["member"]
+        if member.status in (TTOrderStatus.FILLED, TTOrderStatus.CANCELLED,
+                             TTOrderStatus.EXPIRED, TTOrderStatus.REJECTED):
+            raise TastytradeError("order is not cancellable")
+        if self.single_fill_on_delete:
+            self.fill_single(int(order_id))
+            return
+        member.status = TTOrderStatus.CANCEL_REQUESTED
+        record["cancel_left"] = self.cancel_polls
+
     async def get_live_complex_orders(self, session):
         return [self._placed_complex(cid) for cid, r in self.complex.items()
                 if any(m.status in (TTOrderStatus.LIVE, TTOrderStatus.RECEIVED)
@@ -186,6 +243,27 @@ class FakeTastyBroker:
             for other in record["members"]:
                 if other is not member and other.status in (TTOrderStatus.LIVE, TTOrderStatus.RECEIVED):
                     other.status = TTOrderStatus.CANCELLED
+
+    def fill_single(self, order_id: int, qty: Optional[int] = None, price: Optional[float] = None):
+        """A stop-only order fills (fully, or ``qty`` shares). The position shrinks."""
+        member = self.singles[order_id]["member"]
+        size = int(member.size)
+        done = size if qty is None else int(qty)
+        px = price if price is not None else float(member.stop_trigger)
+        leg = member.legs[0]
+        leg.fills = (leg.fills or []) + [FillInfo(
+            fill_id=f"s{order_id}", quantity=Decimal(done), fill_price=Decimal(str(px)),
+            filled_at=datetime(2026, 10, 5, 15, 0, tzinfo=timezone.utc))]
+        self.positions[member.underlying_symbol] = (
+            self.positions.get(member.underlying_symbol, Decimal(0)) - Decimal(done))
+        if done >= size:
+            member.status = TTOrderStatus.FILLED
+
+    def expire_single(self, order_id: int):
+        self.singles[order_id]["member"].status = TTOrderStatus.EXPIRED
+
+    def external_cancel_single(self, order_id: int):
+        self.singles[order_id]["member"].status = TTOrderStatus.CANCELLED
 
     def expire(self, complex_id: int):
         for m in self.complex[complex_id]["members"]:

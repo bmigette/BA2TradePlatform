@@ -222,3 +222,103 @@ def test_cancel_when_delete_raises_and_the_order_is_still_live_is_unconfirmed(ac
 def test_cancel_unauthenticated_is_unconfirmed(acct, broker):
     acct._session = None
     assert not acct.cancel_complex_order(1).confirmed
+
+
+# ----------------------------------------------------------------- stop-only (the runner)
+
+def _stop(acct, **over):
+    kw = dict(symbol="ABC", quantity=6, sl_price=45.0, tag="ba2prot:1:2")
+    kw.update(over)
+    return acct.place_protective_stop(**kw)
+
+
+def test_stop_only_sends_a_dry_run_then_a_live_plain_gtc_stop_sell_to_close(acct, broker):
+    result = _stop(acct)
+    assert [dry for dry, _ in broker.single_place_calls] == [True, False]
+    order = broker.single_place_calls[1][1]
+    assert order.order_type == TTOrderType.STOP and order.stop_trigger == Decimal("45.0")
+    assert order.time_in_force == OrderTimeInForce.GTC and order.price is None
+    assert [l.action for l in order.legs] == [OrderAction.SELL_TO_CLOSE]
+    assert order.legs[0].quantity == Decimal(6) and order.external_identifier == "ba2prot:1:2"
+    assert broker.complex == {}                                       # NOT a complex order
+    assert result.order_id == 70000 and result.quantity == 6 and result.status == "LIVE"
+    assert result.gtc_date is not None
+
+
+def test_stop_only_dry_run_error_refuses_and_never_goes_live(acct, broker):
+    broker.single_dry_run_errors = ["stop_invalid: nope"]
+    with pytest.raises(ProtectionRefused, match="stop_invalid"):
+        _stop(acct)
+    assert [dry for dry, _ in broker.single_place_calls] == [True] and broker.singles == {}
+
+
+def test_stop_only_placement_exception_refuses(acct, broker):
+    broker.single_raise_on_place = TastytradeError("insufficient_quantity")
+    with pytest.raises(ProtectionRefused, match="insufficient_quantity"):
+        _stop(acct)
+
+
+def test_stop_only_accepted_but_rejected_is_refused(acct, broker):
+    broker.single_reject_after_accept = True
+    with pytest.raises(ProtectionRefused, match="not live"):
+        _stop(acct)
+
+
+def test_stop_only_unreadable_readback_cancels_and_refuses(acct, broker):
+    original = broker.get_order
+    state = {"n": 0}
+
+    async def flaky(session, order_id):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise TastytradeError("read failed")
+        return await original(session, order_id)
+    broker.get_order = flaky
+    with pytest.raises(ProtectionRefused, match="could not read it back"):
+        _stop(acct)
+    assert broker.single_delete_calls == [70000]
+
+
+@pytest.mark.parametrize("qty", [0, -1, 2.5])
+def test_stop_only_bad_quantity_is_refused_before_any_call(acct, broker, qty):
+    with pytest.raises(ProtectionRefused, match="WHOLE number"):
+        _stop(acct, quantity=qty)
+    assert broker.single_place_calls == []
+
+
+def test_stop_only_zero_stop_is_refused(acct, broker):
+    with pytest.raises(ProtectionRefused, match="must be > 0"):
+        _stop(acct, sl_price=0)
+
+
+def test_stop_only_state_reads_like_a_one_member_complex_order(acct, broker):
+    result = _stop(acct)
+    state = acct.get_protective_order_state(result.order_id)
+    assert state.id == result.order_id and len(state.orders) == 1
+
+
+def test_stop_only_cancel_waits_for_the_broker(acct, broker):
+    oid = _stop(acct).order_id
+    broker.cancel_polls = 3
+    outcome = acct.cancel_protective_stop(oid)
+    assert outcome.confirmed and not outcome.filled and broker.single_delete_calls == [oid]
+
+
+def test_stop_only_cancel_that_never_confirms_is_unconfirmed(acct, broker):
+    oid = _stop(acct).order_id
+    broker.never_confirm_cancel = True
+    acct._PROTECTION_CANCEL_TIMEOUT_SECONDS = 0.0
+    assert not acct.cancel_protective_stop(oid).confirmed
+
+
+def test_stop_only_cancel_when_it_fills_first_reports_the_fill(acct, broker):
+    oid = _stop(acct).order_id
+    broker.single_fill_on_delete = True
+    outcome = acct.cancel_protective_stop(oid)
+    assert outcome.confirmed and outcome.filled
+
+
+def test_stop_only_cancel_of_a_finished_order_is_confirmed_by_the_state_read(acct, broker):
+    oid = _stop(acct).order_id
+    broker.expire_single(oid)
+    assert acct.cancel_protective_stop(oid).confirmed

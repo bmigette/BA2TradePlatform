@@ -7,7 +7,7 @@ import pytest
 
 from ba2_trade_platform.core import allocator_protection as ap
 from ba2_trade_platform.core.allocator_protection_models import (
-    SLICE_CANCELLED_BY_US, SLICE_CANCELLING, SLICE_FILLED_SL, SLICE_FILLED_TP, SLICE_LIVE,
+    ORDER_KIND_OCO, ORDER_KIND_STOP, SLICE_CANCELLED_BY_US, SLICE_CANCELLING, SLICE_FILLED_SL, SLICE_FILLED_TP, SLICE_LIVE,
     SLICE_LOST_CANCELLED, SLICE_LOST_EXPIRED, SLICE_LOST_REJECTED, SLICE_UNKNOWN,
 )
 
@@ -103,18 +103,49 @@ def test_plan_slices_three_targets_ten_shares():
                                   sl_price=45.004, last_price=50.0)
     assert sum(p.quantity for p in plans) == 10
     assert [p.tp_price for p in plans] == [60.0, 65.0, 70.0]
+    assert {p.kind for p in plans} == {ORDER_KIND_OCO}                 # fractions sum to 1: no runner
     assert {p.sl_price for p in plans} == {45.0}          # rounded DOWN, same stop on every OCO
     assert notes == []
 
 
-def test_plan_slices_drops_targets_without_a_share_and_resplits():
+def test_plan_slices_a_partial_tp_leaves_a_stop_only_runner():
+    plans, notes = ap.plan_slices(shares=10, targets=_targets((100, 0.5)), sl_price=75, last_price=90)
+    assert [(p.kind, p.quantity, p.tp_price, p.sl_price) for p in plans] == [
+        (ORDER_KIND_OCO, 5, 100.0, 75.0), (ORDER_KIND_STOP, 5, None, 75.0)]
+    assert plans[1].target_index == -1 and notes == []
+
+
+def test_plan_slices_no_targets_is_one_stop_for_everything():
+    plans, _ = ap.plan_slices(shares=7, targets=[], sl_price=40, last_price=50)
+    assert [(p.kind, p.quantity) for p in plans] == [(ORDER_KIND_STOP, 7)]
+
+
+def test_plan_slices_always_covers_every_share_with_a_stop():
+    for shares in range(1, 40):
+        for fractions in ([], [0.5], [0.3, 0.3], [1 / 3] * 3, [0.25, 0.25, 0.25], [1.0]):
+            targets = [T(60 + i, f) for i, f in enumerate(fractions)]
+            plans, _ = ap.plan_slices(shares=shares, targets=targets, sl_price=45, last_price=50)
+            assert sum(p.quantity for p in plans) == shares, (shares, fractions)
+            assert all(p.sl_price == 45.0 for p in plans)
+
+
+def test_plan_slices_the_operators_example_preview():
+    """16 shares, two 5-share OCOs and a 6-share runner: the shape in the request."""
+    targets = _targets((12.5, 5 / 16), (15.0, 5 / 16))
+    plans, _ = ap.plan_slices(shares=16, targets=targets, sl_price=8.0, last_price=10.0)
+    assert [(p.kind, p.quantity) for p in plans] == [(ORDER_KIND_OCO, 5), (ORDER_KIND_OCO, 5), (ORDER_KIND_STOP, 6)]
+    assert ap.preview_summary(plans) == ("3 orders: OCO 5 sh TP 12.5 / SL 8, OCO 5 sh TP 15 / SL 8, "
+                                         "STOP 6 sh @ 8")
+
+
+def test_plan_slices_drops_targets_without_a_share_and_says_so():
     plans, notes = ap.plan_slices(shares=2, targets=_targets((60, 0.5), (65, 0.25), (70, 0.25)),
                                   sl_price=45, last_price=50)
     assert sum(p.quantity for p in plans) == 2
     assert len(plans) == 2 and len(notes) == 1 and "gets 0 shares" in notes[0]
 
 
-def test_plan_slices_one_share_one_oco():
+def test_plan_slices_one_share_one_order():
     plans, notes = ap.plan_slices(shares=1, targets=_targets((60, 0.5), (65, 0.5)),
                                   sl_price=45, last_price=50)
     assert [p.quantity for p in plans] == [1] and len(notes) == 1
@@ -131,16 +162,22 @@ def test_plan_slices_orders_by_price_and_keeps_the_target_index():
     assert [(p.target_index, p.tp_price) for p in plans] == [(1, 60.0), (0, 70.0)]
 
 
-def test_remaining_targets_renormalises():
-    left = ap.remaining_targets(_targets((60, 0.25), (65, 0.25), (70, 0.5)), [0])
-    assert [t.price for t in left] == [65, 70]
-    assert sum(t.fraction for t in left) == pytest.approx(1.0)
-    assert left[0].fraction == pytest.approx(1 / 3)
+def test_a_fill_consumes_nothing_the_template_is_replaced_whole():
+    """Protection is a TEMPLATE: after a fill the same targets/fractions are re-placed on the new
+    quantity, so there is no 'remaining targets' bookkeeping any more."""
+    assert not hasattr(ap, "remaining_targets")
+    plans, _ = ap.plan_slices(shares=6, targets=_targets((60, 0.5), (65, 0.5)), sl_price=45, last_price=50)
+    assert [(p.target_index, p.quantity) for p in plans] == [(0, 3), (1, 3)]
 
 
-def test_remaining_targets_all_consumed_raises():
-    with pytest.raises(ValueError):
-        ap.remaining_targets(_targets((60, 1.0)), [0])
+def test_the_same_template_keeps_its_proportions_on_a_smaller_position():
+    """Rebalance resize: 50% TP + 50% runner on 20 shares, then on 6."""
+    targets = _targets((100, 0.5))
+    for shares, expect in ((20, [(ORDER_KIND_OCO, 10), (ORDER_KIND_STOP, 10)]),
+                           (6, [(ORDER_KIND_OCO, 3), (ORDER_KIND_STOP, 3)]),
+                           (3, [(ORDER_KIND_OCO, 2), (ORDER_KIND_STOP, 1)])):
+        plans, _ = ap.plan_slices(shares=shares, targets=targets, sl_price=75, last_price=90)
+        assert [(p.kind, p.quantity) for p in plans] == expect, shares
 
 
 # --------------------------------------------------------------------- validation
@@ -171,9 +208,17 @@ def test_tp_must_be_above_the_price():
     assert any("ABOVE the current price" in e for e in errors)
 
 
-def test_fractions_must_total_one():
-    assert any("must total 100%" in e for e in _valid(targets=_targets((60, 0.5), (65, 0.4))))
-    assert any("must total 100%" in e for e in _valid(targets=_targets((60, 0.6), (65, 0.6))))
+def test_fractions_may_total_less_than_one_the_rest_is_a_runner():
+    assert _valid(targets=_targets((60, 0.5))) == []
+    assert _valid(targets=_targets((60, 0.5), (65, 0.4))) == []
+
+
+def test_fractions_must_not_exceed_one():
+    assert any("must not exceed 100%" in e for e in _valid(targets=_targets((60, 0.6), (65, 0.6))))
+
+
+def test_no_targets_is_valid_a_stop_for_everything():
+    assert _valid(targets=[]) == []
 
 
 def test_a_fraction_must_be_positive():
@@ -183,10 +228,6 @@ def test_a_fraction_must_be_positive():
 def test_distinct_tp_prices_after_tick_rounding():
     errors = _valid(targets=_targets((60.001, 0.5), (60.004, 0.5)))
     assert any("same price once rounded" in e for e in errors)
-
-
-def test_at_least_one_target():
-    assert any("at least one take-profit" in e for e in _valid(targets=[]))
 
 
 def test_unknown_price_or_position_is_an_error_not_a_default():
@@ -208,8 +249,100 @@ def test_a_fractional_position_is_valid_for_its_whole_part():
 def test_preview_lists_orders_and_notes_the_fractional_remainder():
     lines = ap.preview_orders(shares=10, position_quantity=10.4,
                               targets=_targets((60, 0.5), (65, 0.5)), sl_price=45, last_price=50)
-    assert lines[0].startswith("OCO 1: sell 5 sh") and "limit 60" in lines[0] and "stop 45" in lines[0]
+    assert lines[0].startswith("2 orders: OCO 5 sh TP 60 / SL 45")
+    assert lines[1].startswith("OCO 1: sell 5 sh") and "limit 60" in lines[1] and "stop 45" in lines[1]
     assert any("fractional" in l and "UNPROTECTED" in l for l in lines)
+
+
+def test_preview_shows_the_runner_as_a_stop_only_order():
+    lines = ap.preview_orders(shares=10, position_quantity=10.0, targets=_targets((60, 0.5)),
+                              sl_price=45, last_price=50)
+    assert lines[0] == "2 orders: OCO 5 sh TP 60 / SL 45, STOP 5 sh @ 45"
+    assert any(l.startswith("STOP 5 sh @ 45") and "runner" in l for l in lines)
+
+
+def test_preview_of_a_stop_only_protection():
+    lines = ap.preview_orders(shares=7, position_quantity=7.0, targets=[], sl_price=40, last_price=50)
+    assert lines[0] == "1 order: STOP 7 sh @ 40"
+
+
+# --------------------------------------------------------------------- presets
+
+COST = 100.0
+
+
+def _preset(key, cost=COST):
+    r = ap.apply_preset(key, cost)
+    return r.sl_price, [(t.price, t.fraction) for t in r.targets]
+
+
+def test_preset_double_up_takes_half_at_2x_with_a_25pct_stop():
+    sl, tps = _preset("double_up")
+    assert sl == 75.0 and tps == [(200.0, 0.5)]
+
+
+def test_preset_ladder_is_three_thirds_at_25_50_100_with_a_15pct_stop():
+    sl, tps = _preset("ladder")
+    assert sl == 85.0
+    assert [p for p, _ in tps] == [125.0, 150.0, 200.0]
+    assert [f for _, f in tps] == pytest.approx([1 / 3] * 3)
+
+
+def test_preset_two_r_stops_10pct_and_takes_half_at_plus_20pct():
+    sl, tps = _preset("two_r")
+    assert sl == 90.0 and tps == [(120.0, 0.5)]
+
+
+def test_preset_income_stop_only_has_no_take_profit_and_a_20pct_stop():
+    sl, tps = _preset("income_stop")
+    assert sl == 80.0 and tps == []
+
+
+def test_presets_are_computed_from_the_average_cost_not_the_price():
+    sl, tps = _preset("double_up", cost=12.34)
+    assert sl == 9.25 and tps == [(24.68, 0.5)]
+
+
+def test_presets_round_to_the_tick_grid_tp_nearest_and_sl_down():
+    r = ap.apply_preset("ladder", 10.17)           # 10.17 * 1.25 = 12.7125 ; * 0.85 = 8.6445
+    assert [t.price for t in r.targets][0] == 12.71 and r.sl_price == 8.64
+
+
+def test_presets_use_the_brokers_tick_table():
+    sizes = [SimpleNamespace(value=Decimal("0.05"), threshold=None)]
+    r = ap.apply_preset("double_up", 10.17, sizes)
+    assert r.targets[0].price == 20.35 and r.sl_price == 7.60
+
+
+def test_preset_with_an_unknown_cost_raises_rather_than_guessing():
+    for bad in (None, 0, -5):
+        with pytest.raises(ValueError, match="average cost is unknown"):
+            ap.apply_preset("ladder", bad)
+
+
+def test_unknown_preset_key_raises():
+    with pytest.raises(KeyError):
+        ap.apply_preset("nope", 10)
+
+
+def test_every_preset_validates_against_a_price_near_the_cost():
+    for spec in ap.PRESETS:
+        r = ap.apply_preset(spec.key, 100.0)
+        assert ap.validate_protection(sl_price=r.sl_price, targets=r.targets, last_price=100.0,
+                                      position_quantity=30) == [], spec.key
+
+
+def test_a_preset_far_from_the_price_fails_validation_visibly_but_stays_editable():
+    r = ap.apply_preset("double_up", 100.0)       # stop 75
+    errors = ap.validate_protection(sl_price=r.sl_price, targets=r.targets, last_price=70.0,
+                                    position_quantity=30)
+    assert any("BELOW the current price" in e for e in errors)
+
+
+def test_there_are_exactly_the_four_requested_presets():
+    assert [p.key for p in ap.PRESETS] == ["double_up", "ladder", "two_r", "income_stop"]
+    assert [p.label for p in ap.PRESETS] == ["Double-up: take half at 2x", "Ladder +25/+50/+100%",
+                                             "2R scale-out", "Income: stop only"]
 
 
 # --------------------------------------------------------------------- classification
@@ -312,7 +445,7 @@ NOW = datetime(2026, 10, 5, 12, 0)
 
 
 def _status(**over):
-    kw = dict(enabled=True, held_at=None, held_reason=None, pending_replace=False,
+    kw = dict(enabled=True, pending_replace=False,
               pending_replace_since=None, slice_states=[(SLICE_LIVE, 10.0)],
               position_quantity=10.0, alert_message=None, now=NOW)
     kw.update(over)
@@ -360,16 +493,22 @@ def test_status_a_fractional_only_position_is_not_an_alarm():
     assert s.code == ap.STATUS_NO_POSITION
 
 
-def test_status_held_badge_names_the_date():
-    s = _status(held_at=datetime(2026, 10, 3, 9, 30), held_reason="take-profit filled",
-                slice_states=[(SLICE_LIVE, 4.0)])
-    assert s.code == ap.STATUS_HELD
-    assert s.label == "Held after TP/SL fill on 2026-10-03" and "4 share(s) are still covered" in s.tooltip
+def test_there_is_no_held_status_a_protection_never_excludes_a_symbol():
+    assert not hasattr(ap, "STATUS_HELD") and not hasattr(ap, "CODE_HELD_FILL")
 
 
-def test_status_held_with_a_lost_remaining_slice_is_flagged():
-    s = _status(held_at=NOW, slice_states=[(SLICE_LOST_CANCELLED, 0.0)])
-    assert s.code == ap.STATUS_HELD and s.alarm
+def test_the_last_fill_note_rides_on_the_tooltip_of_any_status():
+    s = _status(last_fill_note="TP1 filled 2026-10-03: share 6% -> 3%")
+    assert s.code == ap.STATUS_PROTECTED and "TP1 filled 2026-10-03: share 6% -> 3%" in s.tooltip
+    off = _status(enabled=False, slice_states=[], last_fill_note="SL hit 2026-10-03: share 5% -> 0%")
+    assert "SL hit 2026-10-03" in off.tooltip
+
+
+def test_a_size_mismatch_says_which_way():
+    more = _status(slice_states=[(SLICE_LIVE, 10.0)], position_quantity=6.0)
+    assert more.code == ap.STATUS_PARTIAL and more.label == "Size mismatch" and "MORE shares" in more.tooltip
+    less = _status(slice_states=[(SLICE_LIVE, 4.0)], position_quantity=10.0)
+    assert less.label == "Size mismatch" and "Only part" in less.tooltip and "Resize protection" in less.tooltip
 
 
 def test_status_replacing_then_stale():

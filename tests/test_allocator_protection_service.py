@@ -2,8 +2,8 @@
 
 Real ``TastyTradeAccount`` methods, real DB (conftest's in-memory SQLite), a fake broker. The
 scenarios the operator cares about: place, partial TP fill -> hold, SL fill -> hold, expiry or a
-cancel on the broker's site -> loud UNPROTECTED alert, rebalance cancel/re-place, held symbols
-skipped, an unconfirmed cancel blocking a trade. Nothing contacts a broker.
+cancel on the broker's site -> loud UNPROTECTED alert, rebalance cancel/re-place, an unconfirmed
+cancel blocking a trade, the weight reduction a fill makes (the freed share stays unallocated). Nothing contacts a broker.
 """
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -14,16 +14,18 @@ from tastytrade.order import OrderStatus as TTOrderStatus
 from tastytrade.utils import TastytradeError
 
 from ba2_trade_platform.core import allocator_protection as ap
+from ba2_trade_platform.core import allocator_exclusion as aex
 from ba2_trade_platform.core import allocator_protection_service as aps
 from ba2_trade_platform.core.allocator_protection_models import (
     AllocatorProtection, AllocatorProtectionOrder, SLICE_CANCELLED_BY_US, SLICE_CANCELLING,
     SLICE_FILLED_SL, SLICE_FILLED_TP, SLICE_LIVE, SLICE_LOST_CANCELLED, SLICE_LOST_EXPIRED,
+    SLICE_LOST_REJECTED,
     SLICE_UNKNOWN,
 )
 from ba2_trade_platform.core.db import add_instance, get_db, get_instance, update_instance
-from ba2_trade_platform.core.models import TradingOrder
+from ba2_trade_platform.core.models import PortfolioAllocationSymbol, TradingOrder, Transaction
 from ba2_trade_platform.core.types import (
-    ActivityLogSeverity, OrderDirection, OrderOpenType, OrderStatus, OrderType,
+    ActivityLogSeverity, OrderDirection, OrderOpenType, OrderStatus, OrderType, TransactionStatus,
 )
 from tests.allocator_protection_fakes import FakeTastyBroker, make_account, patch_equity
 
@@ -61,7 +63,7 @@ def _codes(activity):
 
 
 def _save(acct, targets=None, sl=45.0, symbol="ABC"):
-    return aps.save_protection(acct, symbol, sl, targets or THIRDS)
+    return aps.save_protection(acct, symbol, sl, THIRDS if targets is None else targets)
 
 
 def _slices(symbol="ABC", account_id=1):
@@ -90,7 +92,7 @@ def test_save_places_three_ocos_covering_the_whole_position(acct, broker, activi
     assert len(live_calls) == 3
     assert [dry for dry, _ in broker.place_calls] == [True, False] * 3   # dry run before each
     p = aps.get_protection(1, "ABC")
-    assert p.enabled and p.protected_quantity == 10 and p.held_at is None and p.alert_code is None
+    assert p.enabled and p.protected_quantity == 10 and p.alert_code is None
     assert _status(acct, broker).code == ap.STATUS_PROTECTED
     assert "PLACED" in _codes(activity)
 
@@ -201,72 +203,221 @@ def test_saving_is_refused_while_a_rebalance_replacement_is_pending(acct, broker
     assert not result.ok and "being re-placed" in result.message
 
 
-# ============================================================================ reconcile: fills -> hold
+# ============================================================================ reconcile: fills
 
-def test_a_full_tp_fill_holds_the_symbol_and_the_other_slices_keep_resting(acct, broker, activity):
+def _weight(label="L", symbol="ABC"):
+    with get_db() as session:
+        rows = session.exec(select(PortfolioAllocationSymbol).where(
+            PortfolioAllocationSymbol.account_id == 1, PortfolioAllocationSymbol.label == label,
+            PortfolioAllocationSymbol.symbol == symbol)).all()
+    return rows[0].weight_pct if rows else None
+
+
+def _store_weight(pct, label="L", symbol="ABC", previous=None):
+    add_instance(PortfolioAllocationSymbol(account_id=1, label=label, symbol=symbol,
+                                           weight_pct=pct, previous_weight_pct=previous))
+
+
+def test_a_tp_fill_keeps_the_symbol_in_the_allocation_and_the_rest_protected(acct, broker, activity):
     _save(acct)
     first = _slices()[0]
     broker.fill(first.complex_order_id, "TP")
     report = aps.reconcile_account(acct)
-    assert report.new_holds == ["ABC"]
+    assert report.new_fills == ["ABC"]
     p = aps.get_protection(1, "ABC")
-    assert p.held_at is not None and "take-profit filled" in p.held_reason
+    assert p.enabled and p.last_fill_at is not None and p.last_fill_note.startswith("TP1 filled ")
     states = {s.slice_index: s.state for s in _slices()}
     assert states[0] == SLICE_FILLED_TP and states[1] == states[2] == SLICE_LIVE
     status = _status(acct, broker)
-    assert status.code == ap.STATUS_HELD and "Held after TP/SL fill on" in status.label
-    assert "still covered" in status.tooltip
-    assert ap.CODE_HELD_FILL in _codes(activity)
-    assert "ABC" in aps.held_protections(1)
+    assert status.code == ap.STATUS_PROTECTED and "TP1 filled" in status.tooltip   # 6 shares held, 6 covered
+    assert ap.CODE_FILL in _codes(activity)
+    assert aex.get_exclusions(1) == {}                                   # a protection never excludes
 
 
-def test_a_partial_tp_fill_holds_and_keeps_the_remainder_reserved(acct, broker):
-    _save(acct)
-    s0 = _slices()[0]
-    broker.fill(s0.complex_order_id, "TP", qty=1)
+def test_a_tp_fill_reduces_the_stored_weight_in_proportion_and_audits_it(acct, broker):
+    _save(acct)                                           # 3 OCOs of 4 + 3 + 3 = 10 protected
+    _store_weight(6.0, previous=6.0)
+    broker.fill(_slices()[0].complex_order_id, "TP")       # 4 of 10 protected shares sold
     aps.reconcile_account(acct)
-    p = aps.get_protection(1, "ABC")
-    assert p.held_at is not None
-    s0 = _slices()[0]
-    assert s0.state == SLICE_FILLED_TP and s0.filled_qty == 1 and s0.closed_at is None
-    assert aps.covered_quantity(_slices()) == (s0.quantity - 1) + sum(
-        s.quantity for s in _slices()[1:])
+    assert _weight() == pytest.approx(3.6)                 # 6 x 6/10
+    (change,) = aex.get_weight_changes(1)
+    assert (change.label, change.symbol, change.reason) == ("L", "ABC", "tp_fill")
+    assert (change.before_pct, change.after_pct) == (6.0, pytest.approx(3.6))
+    assert "TP1 filled: 4 of 10 protected sh sold @ 60" in change.detail
+    assert aps.get_protection(1, "ABC").last_fill_note.endswith("share 6% -> 3.6%")
 
 
-def test_an_sl_fill_holds_the_symbol(acct, broker):
+def test_the_freed_share_is_not_given_to_any_other_symbol(acct, broker):
     _save(acct)
+    _store_weight(6.0)
+    _store_weight(94.0, symbol="OTHER")
+    broker.fill(_slices()[0].complex_order_id, "TP")
+    aps.reconcile_account(acct)
+    assert _weight(symbol="OTHER") == 94.0                 # untouched: the label now sums below 100
+    assert _weight() + _weight(symbol="OTHER") < 100.0
+
+
+def test_a_partial_tp_fill_halves_the_weight(acct, broker):
+    _save(acct, [T(60, 1.0)])                              # one OCO of 10
+    _store_weight(8.0)
+    broker.fill(_slices()[0].complex_order_id, "TP", qty=5)
+    aps.reconcile_account(acct)
+    assert _weight() == pytest.approx(4.0)
+    s0 = _slices()[0]
+    assert s0.state == SLICE_FILLED_TP and s0.filled_qty == 5 and s0.closed_at is None   # remainder rests
+    assert _status(acct, broker).code == ap.STATUS_PROTECTED                              # 5 held, 5 covered
+
+
+def test_partial_fills_accumulate_without_double_counting(acct, broker):
+    _save(acct, [T(60, 1.0)])
+    _store_weight(10.0)
+    broker.fill(_slices()[0].complex_order_id, "TP", qty=2)
+    aps.reconcile_account(acct)
+    aps.reconcile_account(acct)                            # nothing new: no second reduction
+    assert _weight() == pytest.approx(8.0)
+    broker.fill(_slices()[0].complex_order_id, "TP", qty=2)   # 4 filled in total
+    aps.reconcile_account(acct)
+    assert _weight() == pytest.approx(6.0)                 # 10 x 6/10, once per share sold
+    assert len(aex.get_weight_changes(1)) == 2
+
+
+def test_every_target_filled_takes_the_weight_to_zero(acct, broker):
+    _save(acct)
+    _store_weight(6.0)
+    for s in _slices():
+        broker.fill(s.complex_order_id, "TP")
+    aps.reconcile_account(acct)
+    assert _weight() == 0.0
+    changes = aex.get_weight_changes(1)
+    assert [c.after_pct for c in reversed(changes)] == [pytest.approx(3.6), pytest.approx(1.8), 0.0]
+    assert _status(acct, broker).code == ap.STATUS_NO_POSITION               # exited: armed, waiting
+
+
+def test_an_sl_fill_takes_the_weight_to_zero_so_the_next_rebalance_does_not_buy_it_back(acct, broker):
+    _save(acct)
+    _store_weight(5.0)
+    for s in _slices():                                    # the same stop on every OCO
+        broker.fill(s.complex_order_id, "SL")
+    aps.reconcile_account(acct)
+    assert _weight() == 0.0
+    assert all(c.reason == "sl_fill" for c in aex.get_weight_changes(1))
+    assert aps.get_protection(1, "ABC").last_fill_note.startswith("SL hit ")
+    assert aps.get_protection(1, "ABC").last_fill_note.endswith("share 1.5% -> 0%")
+
+
+def test_an_sl_fill_of_one_slice_reduces_only_its_part_until_the_others_fill(acct, broker):
+    _save(acct)
+    _store_weight(10.0)
     broker.fill(_slices()[0].complex_order_id, "SL")
     aps.reconcile_account(acct)
-    p = aps.get_protection(1, "ABC")
-    assert p.held_at is not None and "stop-loss filled" in p.held_reason
-    assert _slices()[0].state == SLICE_FILLED_SL and _slices()[0].fill_price == 45.0
+    assert _weight() == pytest.approx(6.0)                 # 4 of 10 sold
+    assert "SL hit" in aps.get_protection(1, "ABC").last_fill_note
 
 
-def test_the_hold_is_set_once_and_the_first_reason_is_kept(acct, broker):
+def test_a_fill_without_a_stored_weight_changes_nothing_and_says_so_plainly(acct, broker):
     _save(acct)
     broker.fill(_slices()[0].complex_order_id, "TP")
     aps.reconcile_account(acct)
-    reason = aps.get_protection(1, "ABC").held_reason
-    broker.fill(_slices()[1].complex_order_id, "TP")
+    assert aex.get_weight_changes(1) == []
+    note = aps.get_protection(1, "ABC").last_fill_note
+    assert note.startswith("TP1 filled ") and "share" not in note
+
+
+def test_the_weight_is_reduced_in_every_label_that_stores_one(acct, broker):
+    _save(acct, [T(60, 1.0)])
+    _store_weight(10.0, label="A")
+    _store_weight(20.0, label="B")
+    broker.fill(_slices()[0].complex_order_id, "TP", qty=5)
     aps.reconcile_account(acct)
-    assert aps.get_protection(1, "ABC").held_reason == reason
+    assert (_weight("A"), _weight("B")) == (pytest.approx(5.0), pytest.approx(10.0))
+    note = aps.get_protection(1, "ABC").last_fill_note
+    assert "A share 10% -> 5%" in note and "B share 20% -> 10%" in note
 
 
-def test_a_held_symbol_is_still_reconciled_and_a_lost_remaining_slice_alarms(acct, broker):
+def test_previous_weight_is_untouched_it_belongs_to_the_last_run(acct, broker):
     _save(acct)
+    _store_weight(6.0, previous=6.0)
     broker.fill(_slices()[0].complex_order_id, "TP")
     aps.reconcile_account(acct)
-    broker.expire(_slices()[1].complex_order_id)
+    with get_db() as session:
+        row = session.exec(select(PortfolioAllocationSymbol)).first()
+    assert row.weight_pct == pytest.approx(3.6) and row.previous_weight_pct == 6.0
+
+
+def test_the_latest_change_per_symbol_is_what_the_row_shows(acct, broker):
+    _save(acct, [T(60, 1.0)])
+    _store_weight(10.0)
+    broker.fill(_slices()[0].complex_order_id, "TP", qty=2)
     aps.reconcile_account(acct)
-    status = _status(acct, broker)
-    assert status.code == ap.STATUS_HELD and status.alarm
+    broker.fill(_slices()[0].complex_order_id, "TP", qty=3)
+    aps.reconcile_account(acct)
+    latest = aex.latest_weight_change_by_symbol(1)["ABC"]
+    assert latest.before_pct == pytest.approx(8.0) and latest.after_pct == pytest.approx(5.0)
+    assert aex.labels_with_weight_changes(1) == {"L"}
+
+
+def test_a_failing_weight_write_is_loud_but_the_fill_is_still_recorded(acct, broker, activity, monkeypatch):
+    _save(acct)
+    _store_weight(6.0)
+
+    def boom(*a, **k):
+        raise RuntimeError("db locked")
+    monkeypatch.setattr(aps, "reduce_symbol_weights", boom)
+    broker.fill(_slices()[0].complex_order_id, "TP")
+    aps.reconcile_account(acct)
+    assert "WEIGHT_FAILED" in _codes(activity)
+    assert aps.get_protection(1, "ABC").last_fill_note.startswith("TP1 filled")
+
+
+def _txn(quantity, symbol="ABC", price=48.0):
+    tid = add_instance(Transaction(symbol=symbol, quantity=quantity, side=OrderDirection.BUY,
+                                   open_price=price, status=TransactionStatus.OPENED))
+    add_instance(TradingOrder(account_id=1, symbol=symbol, quantity=quantity, side=OrderDirection.BUY,
+                              order_type=OrderType.MARKET, good_for="day", status=OrderStatus.FILLED,
+                              open_type=OrderOpenType.MANUAL, transaction_id=tid))
+    return tid
+
+
+def test_a_protective_sale_shrinks_the_open_transactions_so_the_next_rebalance_sizes_correctly(acct, broker):
+    t1, t2 = _txn(6), _txn(4)
+    _save(acct)
+    broker.fill(_slices()[0].complex_order_id, "TP")         # 4 sold
+    aps.reconcile_account(acct)
+    assert get_instance(Transaction, t1).quantity == 2           # FIFO: the oldest takes it first
+    assert get_instance(Transaction, t2).quantity == 4
+    assert get_instance(Transaction, t1).status == TransactionStatus.OPENED
+
+
+def test_a_transaction_sold_in_full_is_closed_at_the_fill_price(acct, broker):
+    t1, t2 = _txn(4), _txn(6)
+    _save(acct)
+    broker.fill(_slices()[0].complex_order_id, "TP")         # exactly the first transaction's 4
+    aps.reconcile_account(acct)
+    closed = get_instance(Transaction, t1)
+    assert closed.status == TransactionStatus.CLOSED and closed.close_price == 60.0
+    assert closed.quantity == 4 and get_instance(Transaction, t2).quantity == 6
+
+
+def test_a_failing_transaction_update_is_loud_not_silent(acct, broker, activity, monkeypatch):
+    _txn(10)
+    _save(acct)
+
+    def boom(*a, **k):
+        raise RuntimeError("txn db down")
+    monkeypatch.setattr(aps, "close_transaction_with_logging", boom, raising=False)
+    import ba2_trade_platform.core.utils as core_utils
+    monkeypatch.setattr(core_utils, "close_transaction_with_logging", boom)
+    for s in _slices():
+        broker.fill(s.complex_order_id, "SL")
+    aps.reconcile_account(acct)
+    assert "TXN_FAILED" in _codes(activity)
 
 
 def test_reconcile_with_nothing_changed_is_a_no_op(acct, broker, activity):
     _save(acct)
     before = len(activity)
     report = aps.reconcile_account(acct)
-    assert report.new_holds == [] and report.alarms == [] and report.failed_symbols == []
+    assert report.new_fills == [] and report.alarms == [] and report.failed_symbols == []
     assert len(activity) == before
     assert _status(acct, broker).code == ap.STATUS_PROTECTED
 
@@ -332,16 +483,112 @@ def test_a_mixed_unreadable_member_state_is_an_alarm_not_live(acct, broker):
     assert _status(acct, broker).code == ap.STATUS_UNPROTECTED
 
 
-def test_a_growing_position_is_flagged_partial_not_ignored(acct, broker):
+def test_a_growing_position_gets_added_protection_without_touching_the_existing_orders(acct, broker, activity):
+    """Growth (a manual buy, a DRIP): protection is ADDED for exactly the new shares -- no cancel,
+    so the existing shares are never unprotected."""
+    _save(acct)
+    old_ids = {s.complex_order_id for s in _slices()}
+    broker.positions["ABC"] = Decimal(14)
+    report = aps.reconcile_account(acct)
+    assert report.extended == ["ABC"]
+    assert broker.delete_calls == []                                  # nothing was cancelled
+    assert {s.complex_order_id for s in _slices()} >= old_ids and len(_slices()) > 3
+    assert aps.covered_quantity(_slices()) == 14
+    assert aps.get_protection(1, "ABC").alert_code is None
+    assert _status(acct, broker).code == ap.STATUS_PROTECTED
+    assert "EXTENDED" in _codes(activity)
+
+
+def test_the_added_protection_uses_the_same_stop_targets_and_fractions(acct, broker):
+    _save(acct, [T(60, 0.5)])                                          # OCO 5 + stop-only 5
+    broker.positions["ABC"] = Decimal(16)
+    aps.reconcile_account(acct)
+    new = _slices()[2:]
+    assert [(s.kind, s.quantity) for s in new] == [("OCO", 3), ("STOP", 3)] or \
+        sorted((s.kind, s.quantity) for s in new) == [("OCO", 3), ("STOP", 3)]
+    assert {s.sl_price for s in new} == {45.0} and [s.tp_price for s in new if s.kind == "OCO"] == [60.0]
+
+
+def test_growth_is_left_alone_while_an_allocator_run_is_in_flight(acct, broker):
+    from ba2_trade_platform.core.portfolio_allocation_service import _submission_lock
+    import threading
     _save(acct)
     broker.positions["ABC"] = Decimal(14)
+    held, release = threading.Event(), threading.Event()
+
+    def hold_the_run_lock():
+        with _submission_lock(acct.id):
+            held.set()
+            release.wait(5)
+    t = threading.Thread(target=hold_the_run_lock)
+    t.start()
+    held.wait(5)
+    try:
+        report = aps.reconcile_account(acct)
+    finally:
+        release.set()
+        t.join()
+    assert report.extended == [] and len(_slices()) == 3
+    assert aps.get_protection(1, "ABC").alert_code is None            # transient, not an alarm
+
+
+def test_growth_is_left_alone_while_an_order_on_the_symbol_is_still_working(acct, broker):
+    _save(acct)
+    add_instance(TradingOrder(account_id=1, symbol="ABC", quantity=4, side=OrderDirection.BUY,
+                              order_type=OrderType.MARKET, good_for="day", status=OrderStatus.ACCEPTED,
+                              open_type=OrderOpenType.MANUAL))
+    broker.positions["ABC"] = Decimal(14)
+    assert aps.reconcile_account(acct).extended == []
+
+
+def test_growth_after_the_position_was_exited_re_protects_with_the_same_template(acct, broker):
+    _save(acct)
+    for s in _slices():
+        broker.fill(s.complex_order_id, "SL")
     aps.reconcile_account(acct)
+    assert _status(acct, broker).code == ap.STATUS_NO_POSITION
+    broker.positions["ABC"] = Decimal(8)                               # bought again (outside the allocator)
+    report = aps.reconcile_account(acct)
+    assert report.extended == ["ABC"]
+    live = [s for s in _slices() if s.state == SLICE_LIVE]
+    assert sum(s.quantity for s in live) == 8 and {s.sl_price for s in live} == {45.0}
+
+
+def test_a_lost_slice_blocks_the_auto_extension_the_operator_decides(acct, broker):
+    _save(acct)
+    broker.external_cancel(_slices()[0].complex_order_id)
+    broker.positions["ABC"] = Decimal(14)
+    report = aps.reconcile_account(acct)
+    assert report.extended == [] and aps.get_protection(1, "ABC").alert_code == ap.CODE_LOST_CANCELLED
+
+
+def test_a_failed_extension_is_loud(acct, broker, activity):
+    _save(acct)
+    broker.positions["ABC"] = Decimal(14)
+    broker.raise_on_place = TastytradeError("rejected: no")
+    report = aps.reconcile_account(acct)
+    assert "ABC" in report.alarms
+    assert aps.get_protection(1, "ABC").alert_code == ap.CODE_PLACEMENT_REFUSED
+    assert _status(acct, broker).code in (ap.STATUS_UNPROTECTED, ap.STATUS_PARTIAL)
+
+
+def test_a_shrinking_position_is_flagged_for_a_one_click_resize_not_auto_fixed(acct, broker):
+    """The orders cover MORE than is held: fixing it means cancelling live orders (a gap), so it is
+    the operator's Resize protection, not a background job."""
+    _save(acct)
+    broker.positions["ABC"] = Decimal(6)
+    deletes = len(broker.delete_calls)
+    report = aps.reconcile_account(acct)
     p = aps.get_protection(1, "ABC")
-    assert p.alert_code == ap.CODE_QUANTITY_MISMATCH
-    assert _status(acct, broker).code == ap.STATUS_PARTIAL
-    broker.positions["ABC"] = Decimal(10)
+    assert p.alert_code == ap.CODE_QUANTITY_MISMATCH and "Resize protection" in p.alert_message
+    assert len(broker.delete_calls) == deletes and report.extended == []
+    status = _status(acct, broker)
+    assert status.code == ap.STATUS_PARTIAL and status.label == "Size mismatch" and status.alarm
+    result = aps.replace_protection(acct, "ABC")                        # the one click
+    assert result.ok and aps.covered_quantity(_slices()) == 6
     aps.reconcile_account(acct)
     assert aps.get_protection(1, "ABC").alert_code is None
+    assert _status(acct, broker).code == ap.STATUS_PROTECTED
 
 
 def test_a_position_sold_elsewhere_while_protected_is_flagged(acct, broker):
@@ -448,60 +695,6 @@ def test_delete_with_an_unconfirmed_cancel_keeps_the_rows(acct, broker):
     assert aps.get_protection(1, "ABC") is not None
 
 
-# ============================================================================ re-enable
-
-def test_reenable_after_a_tp_fill_drops_the_consumed_target_and_keeps_the_rest(acct, broker):
-    _save(acct)
-    broker.fill(_slices()[0].complex_order_id, "TP")
-    aps.reconcile_account(acct)
-    result = aps.reenable_symbol(acct, "ABC")
-    assert result.ok
-    p = aps.get_protection(1, "ABC")
-    assert p.held_at is None and p.enabled
-    assert [t["price"] for t in p.tp_targets] == [65, 70]
-    assert sum(t["fraction"] for t in p.tp_targets) == pytest.approx(1.0)
-    live = [s for s in _slices() if s.state == SLICE_LIVE]
-    assert sorted(s.target_index for s in live) == [0, 1]           # remapped onto the shortened list
-    aps.reconcile_account(acct)                                     # the reduced position still matches
-    assert aps.get_protection(1, "ABC").alert_code is None
-    assert _status(acct, broker).code == ap.STATUS_PROTECTED
-
-
-def test_reenable_after_an_sl_fill_switches_protection_off_and_cancels_leftovers(acct, broker):
-    _save(acct)
-    broker.fill(_slices()[0].complex_order_id, "SL")
-    aps.reconcile_account(acct)
-    result = aps.reenable_symbol(acct, "ABC")
-    assert result.ok and "stop had fired" in result.message
-    p = aps.get_protection(1, "ABC")
-    assert p.held_at is None and not p.enabled
-    assert all(s.state != SLICE_LIVE for s in _slices())            # leftovers cancelled
-    assert _status(acct, broker).code == ap.STATUS_OFF
-
-
-def test_reenable_when_every_target_was_hit_switches_off(acct, broker):
-    _save(acct, [T(60, 1.0)])
-    broker.fill(_slices()[0].complex_order_id, "TP")
-    aps.reconcile_account(acct)
-    result = aps.reenable_symbol(acct, "ABC")
-    assert result.ok and "Every take-profit target was hit" in result.message
-    assert not aps.get_protection(1, "ABC").enabled
-
-
-def test_reenable_of_a_symbol_that_is_not_held_is_refused(acct, broker):
-    _save(acct)
-    assert not aps.reenable_symbol(acct, "ABC").ok
-    assert not aps.reenable_symbol(acct, "NOPE").ok
-
-
-def test_saving_is_refused_while_held(acct, broker):
-    _save(acct)
-    broker.fill(_slices()[0].complex_order_id, "TP")
-    aps.reconcile_account(acct)
-    result = _save(acct)
-    assert not result.ok and "held" in result.message
-
-
 # ============================================================================ replace
 
 def test_replace_cancels_and_places_fresh_orders(acct, broker):
@@ -539,7 +732,7 @@ def test_replace_refuses_a_price_that_moved_through_the_stop(acct, broker):
 def test_prepare_cancels_confirmed_and_marks_the_replacement_pending(acct, broker):
     _save(acct)
     prep = aps.prepare_for_trade(acct, ["ABC", "OTHER"])
-    assert prep.pending == ["ABC"] and not prep.held and not prep.blocked
+    assert prep.pending == ["ABC"] and not prep.blocked
     assert len(broker.delete_calls) == 3
     p = aps.get_protection(1, "ABC")
     assert p.pending_replace and p.pending_replace_since is not None
@@ -561,21 +754,16 @@ def test_prepare_sets_pending_before_the_first_cancel(acct, broker):
     assert seen["pending"] is True
 
 
-def test_prepare_discovers_a_fill_and_reports_the_symbol_held(acct, broker):
+def test_prepare_after_a_fill_still_trades_the_symbol_normally(acct, broker):
+    """A fill does not exclude the symbol: prepare notes the fill, then cancels what is left."""
     _save(acct)
+    _store_weight(6.0)
     broker.fill(_slices()[0].complex_order_id, "SL")                 # not reconciled yet
     prep = aps.prepare_for_trade(acct, ["ABC"])
-    assert "ABC" in prep.held and prep.pending == []
-    assert aps.get_protection(1, "ABC").held_at is not None
-
-
-def test_prepare_reports_a_held_symbol_without_touching_its_orders(acct, broker):
-    _save(acct)
-    broker.fill(_slices()[0].complex_order_id, "TP")
-    aps.reconcile_account(acct)
-    deletes = len(broker.delete_calls)
-    prep = aps.prepare_for_trade(acct, ["ABC"])
-    assert "ABC" in prep.held and len(broker.delete_calls) == deletes
+    assert prep.pending == ["ABC"] and not prep.blocked
+    assert aps.get_protection(1, "ABC").last_fill_note.startswith("SL hit")
+    assert _weight() == pytest.approx(3.6)
+    assert aps.covered_quantity(_slices()) == 0                      # the rest was cancelled for the trade
 
 
 def test_prepare_blocks_the_row_when_a_cancel_cannot_be_confirmed(acct, broker):
@@ -724,6 +912,10 @@ def test_an_account_without_the_capability_is_never_touched():
     assert aps.has_protection(Other()) is False
 
 
+def test_held_protections_are_gone_the_only_exclusion_is_manual():
+    assert not hasattr(aps, "held_protections") and not hasattr(aps, "reenable_symbol")
+
+
 def test_a_mock_account_does_not_pass_the_capability_check():
     from unittest.mock import MagicMock
     assert aps.has_protection(MagicMock()) is False
@@ -733,7 +925,6 @@ def test_protections_are_scoped_per_account(acct, broker):
     _save(acct)
     assert aps.get_protection(2, "ABC") is None
     assert aps.list_protections(2) == []
-    assert aps.held_protections(2) == {}
 
 
 def test_status_for_a_symbol_without_a_row_is_off():
@@ -748,10 +939,10 @@ def test_one_symbols_reconcile_failure_does_not_cost_the_others(acct, broker, mo
     aps.save_protection(acct, "XYZ", 15.0, [T(30, 1.0)])
     real = aps._reconcile_one
 
-    def flaky(account, p, report, position):
+    def flaky(account, p, report, position, may_place=False):
         if p.symbol == "ABC":
             raise RuntimeError("boom")
-        return real(account, p, report, position)
+        return real(account, p, report, position, may_place)
     monkeypatch.setattr(aps, "_reconcile_one", flaky)
     broker.expire(_slices("XYZ")[0].complex_order_id)
     report = aps.reconcile_account(acct)
@@ -766,3 +957,96 @@ def test_reconcile_never_raises_when_the_position_read_fails(acct, broker):
         raise RuntimeError("down")
     acct.get_positions = boom
     assert aps.reconcile_account(acct).checked == 3        # slices are still read; no raise
+
+
+# ============================================================================ stop-only runner slices
+
+def test_a_partial_tp_places_an_oco_and_a_stop_only_order_covering_the_whole_position(acct, broker):
+    result = _save(acct, [T(60, 0.5)])
+    assert result.ok, result
+    kinds = [(s.kind, s.quantity, s.tp_price) for s in _slices()]
+    assert kinds == [("OCO", 5, 60.0), ("STOP", 5, None)]
+    assert len(broker.complex) == 1 and len(broker.singles) == 1
+    assert [dry for dry, _ in broker.single_place_calls] == [True, False]          # dry run, then live
+    stop = _slices()[1]
+    assert stop.complex_order_id is None and stop.sl_order_id and stop.sl_price == 45.0
+    assert aps.covered_quantity(_slices()) == 10
+    assert _status(acct, broker).code == ap.STATUS_PROTECTED
+
+
+def test_no_take_profit_at_all_is_one_stop_for_the_whole_position(acct, broker):
+    assert _save(acct, []).ok
+    assert [(s.kind, s.quantity) for s in _slices()] == [("STOP", 10)]
+    assert broker.complex == {} and len(broker.singles) == 1
+
+
+def test_a_stop_only_fill_is_an_sl_hit_and_reduces_the_weight(acct, broker):
+    _save(acct, [T(60, 0.5)])
+    _store_weight(8.0)
+    broker.fill_single(_slices()[1].sl_order_id)                       # the 5-share runner stops out
+    aps.reconcile_account(acct)
+    assert _slices()[1].state == SLICE_FILLED_SL and _slices()[1].fill_price == 45.0
+    assert _weight() == pytest.approx(4.0)                             # 5 of 10 sold
+    assert aps.get_protection(1, "ABC").last_fill_note.startswith("SL hit ")
+    assert _status(acct, broker).code == ap.STATUS_PROTECTED           # the OCO still covers the other 5
+
+
+def test_a_stop_only_order_that_expires_or_is_cancelled_outside_alarms(acct, broker):
+    _save(acct, [T(60, 0.5)])
+    broker.expire_single(_slices()[1].sl_order_id)
+    aps.reconcile_account(acct)
+    assert _slices()[1].state == SLICE_LOST_EXPIRED
+    assert aps.get_protection(1, "ABC").alert_code == ap.CODE_LOST_EXPIRED
+    assert _status(acct, broker).code == ap.STATUS_UNPROTECTED
+
+
+def test_a_stop_only_order_cancelled_on_the_brokers_site_is_not_ours(acct, broker):
+    _save(acct, [])
+    broker.external_cancel_single(_slices()[0].sl_order_id)
+    aps.reconcile_account(acct)
+    assert _slices()[0].state == SLICE_LOST_CANCELLED
+
+
+def test_prepare_cancels_both_the_oco_and_the_stop_only_order_confirmed(acct, broker):
+    _save(acct, [T(60, 0.5)])
+    broker.cancel_polls = 2
+    prep = aps.prepare_for_trade(acct, ["ABC"])
+    assert prep.pending == ["ABC"] and not prep.blocked
+    assert len(broker.delete_calls) == 1 and len(broker.single_delete_calls) == 1
+    assert aps.covered_quantity(_slices()) == 0
+
+
+def test_an_unconfirmed_stop_only_cancel_blocks_the_trade(acct, broker):
+    _save(acct, [])
+    broker.never_confirm_cancel = True
+    acct._PROTECTION_CANCEL_TIMEOUT_SECONDS = 0.0
+    prep = aps.prepare_for_trade(acct, ["ABC"])
+    assert "ABC" in prep.blocked and aps.get_protection(1, "ABC").alert_code == ap.CODE_CANCEL_UNCONFIRMED
+    assert _slices()[0].state == SLICE_CANCELLING
+
+
+def test_a_refused_stop_only_order_keeps_the_oco_and_alerts(acct, broker):
+    broker.single_raise_on_place = TastytradeError("stop rejected")
+    result = _save(acct, [T(60, 0.5)])
+    assert not result.ok and any("stop rejected" in e for e in result.errors)
+    assert [s.state for s in _slices()] == [SLICE_LIVE, SLICE_LOST_REJECTED]
+    assert aps.get_protection(1, "ABC").alert_code == ap.CODE_PLACEMENT_REFUSED
+    assert _status(acct, broker).code in (ap.STATUS_UNPROTECTED, ap.STATUS_PARTIAL)
+
+
+def test_resume_replaces_both_kinds_at_the_new_size_with_the_same_proportions(acct, broker):
+    _save(acct, [T(60, 0.5)])
+    aps.prepare_for_trade(acct, ["ABC"])
+    broker.positions["ABC"] = Decimal(6)
+    assert aps.resume_protection(acct, ["ABC"], working_symbols=set()) == ["ABC"]
+    live = [s for s in _slices() if s.state == SLICE_LIVE]
+    assert sorted((s.kind, s.quantity) for s in live) == [("OCO", 3), ("STOP", 3)]
+    assert {s.sl_price for s in live} == {45.0} and [s.tp_price for s in live if s.kind == "OCO"] == [60.0]
+    assert _status(acct, broker).code == ap.STATUS_PROTECTED
+
+
+def test_a_failed_read_of_a_stop_only_order_changes_nothing(acct, broker):
+    _save(acct, [])
+    broker.single_raise_on_read = TastytradeError("api down")
+    report = aps.reconcile_account(acct)
+    assert report.failed_symbols == ["ABC"] and _slices()[0].state == SLICE_LIVE
