@@ -27,6 +27,8 @@ from ba2_common.core.option_entry_quote import (
 )
 from ba2_common.core.option_payoff import (
     MEASURED as _PAYOFF_MEASURED,
+    UNBOUNDED as _PAYOFF_UNBOUNDED,
+    sizing_risk as _sizing_risk,
     PayoffLeg,
     max_loss as _payoff_max_loss,
     _numeric as _payoff_numeric,
@@ -4133,7 +4135,33 @@ class _OptionEntryAction(TradeAction):
         ``floor(budget / reserve)``. Both are ``floor(budget / cost_per_contract)``, which is
         why ``ResolvedStructure`` carries that single number instead of the two inputs.
         """
-        quantity = self._size_by_cost(resolved.cost_per_contract, self.sizing)
+        cost = resolved.cost_per_contract
+        extra_per_contract = 0.0
+        if resolved.sizing_basis == "premium":
+            # A DEBIT structure is sized by what it can LOSE, which is its debit only when the
+            # debit is the worst case (``option_payoff.sizing_risk``, the one definition live
+            # and backtest share). A call butterfly with a wider upper wing can lose more; a
+            # balanced one sizes exactly as before.
+            risk = _sizing_risk(resolved.payoff_legs, cost)
+            if risk.state == _PAYOFF_UNBOUNDED:
+                return self._result(
+                    False, f"{resolved.option_strategy} on {self.instrument_name} has unbounded "
+                           f"loss: refused (a premium-sized entry is sized by its max loss)")
+            cost = risk.risk_per_contract
+            extra_per_contract = risk.extra_beyond_outlay
+        quantity = self._size_by_cost(cost, self.sizing)
+        if quantity >= 1 and extra_per_contract > 0.0:
+            # The loss beyond the debit is NOT paid at the fill, so it is reserved (the debit is
+            # already out of the account). Honoured by ``reserved_option_buying_power_detail``
+            # for any strategy that records a positive ``option_reserve``.
+            reserve = extra_per_contract * quantity
+            if not self.account.check_option_buying_power(reserve):
+                return self._result(
+                    False, f"Insufficient BP for {resolved.option_strategy} on "
+                           f"{self.instrument_name} (loss beyond its debit: reserve {reserve})")
+            return self._submit_option_order(
+                resolved.legs, quantity, resolved.limit_price, resolved.option_strategy,
+                option_reserve=reserve)
         if quantity < 1:
             # The structure's OWN historical wording, not a uniform one. These strings are
             # persisted to TradeActionResult.message and rendered in the UI as the reason an

@@ -358,6 +358,8 @@ def _new_integrity_counters() -> Dict[str, Any]:
     return {"option_ledger_mismatches": {"count": 0, "examples": []},
             "option_clamp_fallbacks": 0,
             "option_clamp_fallback_examples": [],
+            "option_mark_prints_corrected": 0,
+            "option_mark_print_examples": [],
             "option_orders_volume_sized": 0,
             "option_orders_volume_refused": 0,
             "option_split_rekeys": 0,
@@ -1072,6 +1074,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # equity dipped negative for one bar).
         group_has_short: Dict[Any, bool] = {}
         group_lots: Dict[Any, List[Any]] = {}
+        group_prints: Dict[Any, List[Any]] = {}
         for lot in self._option_positions.values():
             if lot.qty == 0:
                 continue
@@ -1100,7 +1103,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 # estimate must never be allowed to feed a later BS estimate. Zero extra
                 # BS work happens here (this IS the happy path; see the perf pin in
                 # test_bs_mark_fallback.py).
-                self._update_lot_last_iv(lot, bar)
+                if is_defined_risk:
+                    # A leg of a multi-leg group is cross-checked against its siblings below
+                    # BEFORE its iv may feed a later BS fallback: an inconsistent print's iv
+                    # must not become the iv the corrected mark is priced with.
+                    group_prints.setdefault(gkey, []).append((lot, px, bar))
+                else:
+                    self._update_lot_last_iv(lot, bar)
             elif is_defined_risk:
                 # (2a) NO premium bar for a defined-risk leg on this bar. Task 3 inserts a
                 # BS(last-known-iv) stage AHEAD of the intrinsic floor: mark at INTRINSIC (not
@@ -1144,6 +1153,28 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     group_has_short[gkey] = True
             else:
                 total += contribution
+
+        # THE LEGS OF ONE GROUP MUST AGREE WITH EACH OTHER (item 8). The sparse cache can print a
+        # leg stale or off-market while its siblings print normally; one such leg swings a
+        # multi-leg book by thousands for a day and reverses the next (genome A, 2022-11-11: a
+        # 70C close of 12.89 against 65C 17.00 / 72.5C 9.32 -- above the convexity bound -- cut
+        # a butterfly's mark from 3,668 to 756 and back to 2,702 on the 14th). A print that
+        # breaks the no-arbitrage relations between same-expiry, same-type strikes is replaced
+        # through the SAME fallback chain a missing bar already uses (BS on the lot's prior
+        # iv, then intrinsic, then entry), never a new default; counted and recorded.
+        for gkey, entries in group_prints.items():
+            bad = self._inconsistent_prints(entries)
+            for lot, px, bar in entries:
+                if lot.contract_symbol not in bad:
+                    self._update_lot_last_iv(lot, bar)
+                    continue
+                new_px = self._bs_fallback_premium(lot)
+                if new_px is None:
+                    new_px = self._leg_intrinsic(lot.contract_symbol, group_bounds[gkey])
+                if new_px is None:
+                    new_px = lot.avg_price
+                self._count_print_correction(gkey, lot.contract_symbol, px, new_px, bad[lot.contract_symbol])
+                group_mtm[gkey] += lot.qty * (new_px - px) * lot.multiplier
 
         # Clamp each defined-risk group's net contribution to its no-arb range. (2b) The bound is
         # composition-aware: while a SHORT leg is held the combo carries credit downside so it is
@@ -1193,6 +1224,68 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             seen.add((kind, detail))
             logger.warning("[backtest] option clamp FELL BACK to the strategy-width bound "
                            "(%s): %s", kind, detail)
+
+    #: Dollars per share a print may sit outside a no-arbitrage relation before it counts as
+    #: inconsistent: the sparse cache rounds to a cent and American exercise can sit a hair
+    #: off the European relations, and neither is a stale print.
+    _PRINT_CONSISTENCY_TOL = 0.02
+
+    def _inconsistent_prints(self, entries: List[Any]) -> Dict[str, str]:
+        """Contracts of ONE group whose print breaks the no-arbitrage relations against their
+        same-expiry, same-type siblings, as ``{contract_symbol: reason}``.
+
+        For strikes ``K1 < K2 < K3`` of one expiry and type, calls ``C`` (puts ``P`` mirror
+        the first two with the direction flipped):
+          * monotone: ``C(K1) >= C(K2)`` (puts: ``P(K1) <= P(K2)``);
+          * width: ``|price(K1) - price(K2)| <= K2 - K1``;
+          * convexity: ``price(K2) <= w*price(K1) + (1-w)*price(K3)``, ``w = (K3-K2)/(K3-K1)``.
+        A violated convexity blames the MIDDLE strike (the point the chord bounds); a violated
+        monotone/width pair blames the leg with the LOWER bar volume (the less reliable print;
+        the lower strike on a tie). ``entries`` is ``(lot, px, bar)``. Single-leg groups and
+        groups with no two same-expiry, same-type legs return {} untouched.
+        """
+        by_series: Dict[Any, List[Any]] = {}
+        for lot, px, bar in entries:
+            o = self._lot_order(lot.contract_symbol)
+            if o is None or o.strike is None or o.expiry is None or o.option_type is None:
+                continue
+            by_series.setdefault((o.expiry, o.option_type), []).append(
+                (float(o.strike), float(px), float(bar.get("volume") or 0.0), lot.contract_symbol))
+        tol = self._PRINT_CONSISTENCY_TOL
+        bad: Dict[str, str] = {}
+        for (_expiry, right), legs in by_series.items():
+            if len(legs) < 2:
+                continue
+            legs.sort()
+            is_call = right == OptionRight.CALL
+            for (k1, p1, v1, c1), (k2, p2, v2, c2) in zip(legs, legs[1:]):
+                diff = (p1 - p2) if is_call else (p2 - p1)        # must lie in [0, k2 - k1]
+                if diff < -tol or diff > (k2 - k1) + tol:
+                    culprit = c1 if v1 < v2 or (v1 == v2) else c2
+                    bad.setdefault(culprit, f"strike pair {k1:g}/{k2:g} breaks monotone/width "
+                                            f"({p1:.2f} vs {p2:.2f})")
+            for (k1, p1, _v1, _c1), (k2, p2, _v2, c2), (k3, p3, _v3, _c3) in zip(
+                    legs, legs[1:], legs[2:]):
+                w = (k3 - k2) / (k3 - k1)
+                if p2 > w * p1 + (1.0 - w) * p3 + tol:
+                    bad.setdefault(c2, f"strikes {k1:g}/{k2:g}/{k3:g} break convexity "
+                                       f"({p1:.2f}/{p2:.2f}/{p3:.2f})")
+        return bad
+
+    def _count_print_correction(self, gkey: Any, contract: str, old_px: float, new_px: float,
+                                reason: str) -> None:
+        """One leg-day whose inconsistent print was replaced (counted once per contract per
+        engine date: the mark is read several times a bar)."""
+        day = self._as_of_date()
+        seen = self.__dict__.setdefault("_print_correction_seen", set())
+        if (day, contract) in seen:
+            return
+        seen.add((day, contract))
+        c = self._integrity()
+        c["option_mark_prints_corrected"] += 1
+        if len(c["option_mark_print_examples"]) < 3:
+            c["option_mark_print_examples"].append(
+                f"{day} {contract}: {old_px:.2f} -> {new_px:.2f} ({reason})")
 
     def _held_value_bounds(self, gkey: Any, lots: List[Any]):
         """``(lo, hi)`` dollars the legs of one defined-risk group that are STILL HELD can be
@@ -5125,6 +5218,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         c = self._integrity()
         return {**c,
                 "option_clamp_fallback_examples": list(c["option_clamp_fallback_examples"]),
+                "option_mark_print_examples": list(c["option_mark_print_examples"]),
                 "option_ledger_mismatches": {
             "count": c["option_ledger_mismatches"]["count"],
             "examples": [dict(e) for e in c["option_ledger_mismatches"]["examples"]]}}

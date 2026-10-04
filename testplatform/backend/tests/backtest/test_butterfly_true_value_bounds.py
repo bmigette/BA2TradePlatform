@@ -29,7 +29,8 @@ def _occ(k):
     return f"AAPL240315C{int(k * 1000):08d}"
 
 
-def _build(tmp_path, strikes, spot_late):
+def _build(tmp_path, strikes, spot_late, late_closes=None):
+    """``late_closes``: (close_k1, close_k2, close_k3, volumes) premium prints on ``_LATER_BAR``."""
     from app.services.backtest.backtest_db import backtest_trading_db, seed_account_definition
     from app.services.backtest.seam_wiring import wire_backtest_seams
     from app.services.backtest.backtest_account import BacktestAccount
@@ -49,7 +50,12 @@ def _build(tmp_path, strikes, spot_late):
         {"occ_symbol": occ, "date": "2024-03-06", "open": px, "high": px, "low": px, "close": px,
          "volume": 500, "underlying": "AAPL", "option_type": "call", "strike": terms[occ],
          "expiry": "2024-03-15"}
-        for occ, px in ((_occ(k1), 11.0), (_occ(k2), 2.0), (_occ(k3), 0.5))])
+        for occ, px in ((_occ(k1), 11.0), (_occ(k2), 2.0), (_occ(k3), 0.5))]
+        + ([{"occ_symbol": _occ(k), "date": "2024-03-08", "open": px, "high": px, "low": px,
+             "close": px, "volume": vol, "underlying": "AAPL", "option_type": "call",
+             "strike": float(k), "expiry": "2024-03-15"}
+            for k, px, vol in zip((k1, k2, k3), late_closes[:3], late_closes[3])]
+           if late_closes else []))
     bars = [{"Date": d, "Open": 100, "High": 101, "Low": 99, "Close": c, "Volume": 1000}
             for d, c in ((_ENTRY_BAR, 100), (_FILL_BAR, 100), (_LATER_BAR, spot_late),
                          (_EXPIRY_BAR, spot_late))]
@@ -182,6 +188,52 @@ def test_underivable_bounds_fall_back_loudly_and_are_recorded(unbalanced_fly, mo
     stats = acct.option_integrity_stats()
     assert stats["option_clamp_fallbacks"] >= 2
     assert any("one bad leg" in e for e in stats["option_clamp_fallback_examples"])
+
+
+def _fly_with_late_prints(tmp_path, closes, vols=(100, 100, 100)):
+    return _build(tmp_path, (100, 110, 120), spot_late=110, late_closes=(*closes, vols))
+
+
+def test_a_consistent_set_of_prints_is_marked_as_printed(tmp_path):
+    """11 / 4 / 0.5 satisfies monotone, width and convexity (4 <= 0.5*11 + 0.5*0.5): untouched."""
+    ctx, acct, ps = _fly_with_late_prints(tmp_path, (11.0, 4.0, 0.5))
+    try:
+        ps.set_clock(_LATER_BAR)
+        assert acct._option_positions_mtm() == pytest.approx((11.0 - 8.0 + 0.5) * 100.0)
+        assert acct.option_integrity_stats()["option_mark_prints_corrected"] == 0
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_a_print_above_the_convexity_bound_is_replaced_through_the_fallback_chain(tmp_path):
+    """The 110 call prints 7.0 against 11.0 / 0.5 neighbours: above the 5.75 chord. The middle
+    strike is marked through the existing fallback (intrinsic here: 0.0 at spot 110), not the
+    junk print, and the leg-day is counted and recorded."""
+    ctx, acct, ps = _fly_with_late_prints(tmp_path, (11.0, 7.0, 0.5))
+    try:
+        ps.set_clock(_LATER_BAR)
+        # corrected: 11.0 - 2*0.0 + 0.5 = 11.5 -> 1150, clamped to the fly's 1000 maximum
+        assert acct._option_positions_mtm() == pytest.approx(1_000.0)
+        stats = acct.option_integrity_stats()
+        assert stats["option_mark_prints_corrected"] == 1
+        assert any("break convexity" in e for e in stats["option_mark_print_examples"])
+        acct._option_positions_mtm()                      # re-reading the mark does not recount
+        assert acct.option_integrity_stats()["option_mark_prints_corrected"] == 1
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_a_width_violation_blames_the_lower_volume_leg(tmp_path):
+    """110 prints 13.0 against 100 at 11.0: a 110 call cannot be worth more than the 100 call.
+    The 110 call has the lower bar volume, so IT is replaced, not the 100 call."""
+    ctx, acct, ps = _fly_with_late_prints(tmp_path, (11.0, 13.0, 0.5), vols=(500, 5, 500))
+    try:
+        ps.set_clock(_LATER_BAR)
+        acct._option_positions_mtm()
+        ex = acct.option_integrity_stats()["option_mark_print_examples"]
+        assert len(ex) >= 1 and all(_occ(110) in e for e in ex)
+    finally:
+        ctx.__exit__(None, None, None)
 
 
 def test_a_cancelled_child_leg_does_not_push_a_group_into_the_fallback(unbalanced_fly):
