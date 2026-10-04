@@ -36,7 +36,7 @@ from .portfolio_allocation import (
     apply_order_impacts, blocking_messages, decide_symbol_action,
     held_no_price_block,
     measure_filled_values, plan_quantity_attempts, signed_position_values,
-    split_delta_fifo, validate_label_targets, validate_plan_budget,
+    filter_plan_rows, split_delta_fifo, validate_label_targets, validate_plan_budget,
     validate_plan_rows,
 )
 from .TransactionHelper import TransactionHelper
@@ -2113,6 +2113,91 @@ def _budget_block(account, plan: AllocationPlan) -> Optional[str]:
     return None
 
 
+HELD_BY_PROTECTION_FMT = (
+    "{symbol} is held after a TP/SL fill ({reason}); it is excluded from rebalancing "
+    "(no buys, no sells) until it is re-enabled on the allocation page.")
+PROTECTION_CANCEL_BLOCK_FMT = (
+    "{symbol}: not traded -- {why}.")
+
+
+def _drop_symbols(plan: AllocationPlan, symbols) -> AllocationPlan:
+    """The plan without the rows of ``symbols``, totals recomputed (``filter_plan_rows``)."""
+    drop = {s.strip().upper() for s in symbols}
+    keep = [r.symbol for r in plan.rows if r.symbol.strip().upper() not in drop]
+    return filter_plan_rows(plan, keep)
+
+
+def _strip_held_symbols(account, plan: AllocationPlan) -> Tuple[AllocationPlan, List[RowOutcome]]:
+    """Remove every row of a symbol HELD after a TP/SL fill. DB only; a no-op off TastyTrade.
+
+    Done FIRST, before any gate, so the gates (budget, stale-plan) judge the plan that will
+    really be sent, and enforced HERE -- the boundary that writes -- so a stale dialog opened
+    before the fill cannot trade a held symbol. The rows come back as SKIPPED outcomes so the
+    run's table still says why nothing happened.
+    """
+    from .allocator_protection_service import has_protection, held_protections
+    if not has_protection(account):
+        return plan, []
+    held = held_protections(account.id)
+    in_plan = [r.symbol for r in plan.rows if r.symbol.strip().upper() in held]
+    if not in_plan:
+        return plan, []
+    outcomes = [RowOutcome(
+        symbol=sym, action=ACTION_SKIP, status=OUTCOME_SKIPPED,
+        message=HELD_BY_PROTECTION_FMT.format(
+            symbol=sym, reason=held[sym.strip().upper()].held_reason or "TP/SL fill"))
+        for sym in in_plan]
+    logger.warning(f"Allocation for account {account.id}: held after TP/SL fill, excluded: "
+                   f"{', '.join(in_plan)}")
+    return _drop_symbols(plan, in_plan), outcomes
+
+
+def _prepare_protected_rows(account, plan: AllocationPlan):
+    """Cancel (confirmed) the protective orders of every symbol this plan will TRADE.
+
+    Called under the submission lock AFTER the gates passed, so a blocked attempt changed
+    nothing. Returns ``(plan, outcomes, prepare_result)``: a symbol that turned out to be held
+    (a fill discovered right now) or whose cancel could not be confirmed (its shares may still
+    be reserved at the broker) has its row dropped from the plan and reported.
+    """
+    from .allocator_protection_service import PrepareResult, has_protection, prepare_for_trade
+    if not has_protection(account):
+        return plan, [], PrepareResult()
+    trading = [r.symbol for r in plan.rows if r.side is not None and r.delta_quantity]
+    prep = prepare_for_trade(account, trading)
+    outcomes: List[RowOutcome] = []
+    for sym, p in prep.held.items():
+        outcomes.append(RowOutcome(
+            symbol=sym, action=ACTION_SKIP, status=OUTCOME_SKIPPED,
+            message=HELD_BY_PROTECTION_FMT.format(symbol=sym, reason=p.held_reason or "TP/SL fill")))
+    for sym, why in prep.blocked.items():
+        outcomes.append(RowOutcome(
+            symbol=sym, action=ACTION_SKIP, status=OUTCOME_FAILED,
+            message=PROTECTION_CANCEL_BLOCK_FMT.format(symbol=sym, why=why)))
+    dropped = list(prep.held) + list(prep.blocked)
+    if dropped:
+        plan = _drop_symbols(plan, dropped)
+    return plan, outcomes, prep
+
+
+def _resume_protections_after_run(account, prep) -> List[str]:
+    """Re-place protection on the symbols the run cancelled it for. NEVER raises.
+
+    A symbol with an order still working keeps its ``pending_replace`` marker (status
+    REPLACING); the account refresh completes it once the order settles. Run in the failure
+    path too: a raise mid-submission must not leave a position naked.
+    """
+    if not prep.pending:
+        return []
+    try:
+        from .allocator_protection_service import _working_order_symbols, resume_protection
+        busy = _working_order_symbols(account.id, prep.pending)
+        return resume_protection(account, prep.pending, working_symbols=busy)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Allocation run: re-placing TP/SL after the trade failed: {e}", exc_info=True)
+        return []
+
+
 def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionState],
                    base: BaseSnapshot, *, mode: str,
                    scope_label: Optional[str] = None,
@@ -2196,6 +2281,10 @@ def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, Pos
         reading only those two tells the user "0 order(s) still working" -- which
         reads as "nothing outstanding" for a run nobody has been able to price.
     """
+    # ALLOCATOR TP/SL: a symbol held after a protective fill is not traded. Stripped FIRST
+    # so every gate below judges the plan that will really be sent.
+    plan, held_outcomes = _strip_held_symbols(account, plan)
+
     # Market-hours gate, FIRST, before anything is written. Disabling the Submit
     # button is a courtesy; this is the enforcement -- the wizard can sit open across
     # 16:00. Blocking here means no run row, no stamped order comments and, above
@@ -2284,6 +2373,11 @@ def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, Pos
     # run would spend it a second time.
     reconcile_unconsumed_runs(account)
 
+    # ALLOCATOR TP/SL: cancel (confirmed) the protective OCOs of every symbol this plan
+    # trades, so the allocator never sells shares an OCO still reserves. Before the run row
+    # is recorded, so the recorded plan is the one actually submitted.
+    plan, protection_outcomes, protection_prep = _prepare_protected_rows(account, plan)
+
     from .portfolio_allocation_store import append_run_order_ids, record_allocation_run
 
     run = record_allocation_run(
@@ -2328,7 +2422,8 @@ def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, Pos
                          f"already created; leaving it UNCONSUMED for the reconcile "
                          f"drain rather than stamping it as having taken nothing",
                          exc_info=True)
-        else:
+        _resume_protections_after_run(account, protection_prep)
+        if not recorded_ids:
             # submit_plan validates BEFORE its first order and catches per row, so a
             # raise with nothing recorded really does mean nothing went out. Stamp
             # the run rather than leaving a phantom in the recovery queue forever.
@@ -2336,6 +2431,15 @@ def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, Pos
                          exc_info=True)
             _finalise_run(run_id, FilledTotals(), [])
         raise
+
+    # The rows the TP/SL boundary took out of the plan are still part of what the run reports.
+    for extra in held_outcomes + protection_outcomes:
+        outcomes.append(extra)
+        if on_outcome is not None:
+            try:
+                on_outcome(extra)
+            except Exception as e:  # noqa: BLE001 -- a status cell may not stop a run
+                logger.debug(f"Allocation outcome callback failed for {extra.symbol}: {e}")
 
     # EVERY outcome's ids, not just the submitted ones. A hard submit failure leaves
     # the row at OrderStatus.ERROR (AccountInterface.py:148) -- terminal, worth 0,
@@ -2361,6 +2465,10 @@ def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, Pos
                      f"price or side; their value is NOT being guessed at, so this "
                      f"run's income stays unconsumed until they can be read")
     income_consumed = _finalise_run(run_id, totals, order_ids)
+
+    # ALLOCATOR TP/SL: re-place the protection this run cancelled, now that the fills are known.
+    # A symbol whose order is still working stays REPLACING; the account refresh finishes it.
+    replaced_protection = _resume_protections_after_run(account, protection_prep)
 
     counts = {status: sum(1 for o in outcomes if o.status == status)
               for status in (OUTCOME_SUBMITTED, OUTCOME_PARTIAL, OUTCOME_WASHTRADE_LOCKED,
@@ -2391,6 +2499,10 @@ def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, Pos
         unactionable=counts[OUTCOME_UNACTIONABLE],
         skipped=counts[OUTCOME_SKIPPED])
     description += RUN_FILLED_FMT.format(buys=totals.buy_value, sells=totals.sell_value)
+    if protection_prep.pending or protection_prep.held or protection_prep.blocked:
+        description += (f"; TP/SL: re-placed {len(replaced_protection)} of "
+                        f"{len(protection_prep.pending)}, held {len(protection_prep.held)}, "
+                        f"blocked {len(protection_prep.blocked)}")
     if not refreshed:
         description += RUN_REFRESH_FAILED_FMT
     elif not totals.settled:

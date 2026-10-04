@@ -132,7 +132,10 @@ def initialize_system():
     logger.info(f"Using log folder: {config.LOG_FOLDER}")
     logger.info(f"Web interface will start on port: {config.HTTP_PORT}")
     
-    # Initialize database
+    # Initialize database. The allocator TP/SL tables are declared IN-TREE (ba2_common's
+    # init_db cannot import them), so register them with the shared metadata first: create_all
+    # then builds them on any database. See core/allocator_protection_models.py.
+    import ba2_trade_platform.core.allocator_protection_models  # noqa: F401
     init_db()
 
     # Housekeeping, FIRST and alone. The activity-log purge is cheap; the conditional
