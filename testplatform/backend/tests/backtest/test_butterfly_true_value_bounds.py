@@ -137,3 +137,67 @@ def test_the_expiry_settlement_books_the_real_liability(unbalanced_fly):
     engine._apply_option_expiry(_EXPIRY_BAR)
     assert acct.get_option_positions() == []
     assert acct._cash - cash_before == pytest.approx(-2_000.0)
+
+
+# --------------------------------------------------------------------------- held legs / loud fallbacks
+def test_the_mark_clamp_uses_the_legs_still_held(unbalanced_fly):
+    """One leg left from the fly (a long 100 call) is worth [0, +inf), not the whole structure's
+    [-2000, 1000]; the whole structure is unchanged."""
+    import math
+    acct, _ = unbalanced_fly
+    lots = [l for l in acct._option_positions.values() if l.qty != 0]
+    (gkey,) = set(acct._option_group_bounds()[0].values())
+    assert acct._held_value_bounds(gkey, lots) == (-2000.0, 1000.0)
+    one = [l for l in lots if l.contract_symbol == _occ(100)]
+    assert acct._held_value_bounds(gkey, one) == (0.0, math.inf)
+
+
+def test_settling_a_vertical_remainder_is_not_capped_at_the_old_width(unbalanced_fly):
+    """With the short body closed early, the legs left (long 100 and long 140 calls) pay
+    50 + 10 = $60 a share at spot 150 = $6,000. The old ``+-width`` expiry clamp bound that at
+    the 100/140 gap ($4,000); a long call is not capped by a strike gap, so the real payoff
+    now stands."""
+    acct, ps = unbalanced_fly
+    held = [p for p in acct.get_option_positions() if p.contract_symbol != _occ(110)]
+    assert len(held) == 2
+    ps.set_clock(_EXPIRY_BAR)
+    cash_before = acct._cash
+    assert acct.settle_defined_risk_combo_expiry(held, 150.0) is True
+    assert acct._cash - cash_before == pytest.approx(6_000.0)
+
+
+def test_underivable_bounds_fall_back_loudly_and_are_recorded(unbalanced_fly, monkeypatch):
+    import app.services.backtest.backtest_account as bt
+
+    acct, _ = unbalanced_fly
+
+    def boom(legs):
+        raise ValueError("one bad leg")
+
+    monkeypatch.setattr(bt, "position_value_bounds", boom)
+    acct._group_bounds_memo = None
+    acct._held_bounds_memo = {}
+    acct._option_group_bounds()                  # does not raise: one bad leg cannot abort the mark
+    assert acct._option_positions_mtm() is not None
+    stats = acct.option_integrity_stats()
+    assert stats["option_clamp_fallbacks"] >= 2
+    assert any("one bad leg" in e for e in stats["option_clamp_fallback_examples"])
+
+
+def test_a_cancelled_child_leg_does_not_push_a_group_into_the_fallback(unbalanced_fly):
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import TradingOrder
+    from ba2_common.core.types import OrderStatus
+    acct, _ = unbalanced_fly
+    leg = next(o for o in acct.get_orders() if o.parent_order_id and o.contract_symbol == _occ(110))
+    clone = TradingOrder(**{k: getattr(leg, k) for k in (
+        "account_id", "symbol", "underlying_symbol", "quantity", "side", "order_type",
+        "asset_class", "multiplier", "contract_symbol", "option_type", "strike", "expiry",
+        "parent_order_id")}, status=OrderStatus.CANCELED)
+    add_instance(clone)
+    acct.invalidate_order_cache()
+    acct._group_bounds_memo = None
+    _, gb = acct._option_group_bounds()
+    (bounds,) = gb.values()
+    assert (bounds["lo"], bounds["hi"]) == (-2000.0, 1000.0)
+    assert acct.option_integrity_stats()["option_clamp_fallbacks"] == 0
