@@ -123,7 +123,7 @@ def _is_resting(slice_: AllocatorProtectionOrder) -> bool:
 
 
 def _remaining_qty(slice_: AllocatorProtectionOrder) -> float:
-    return max(0.0, float(slice_.quantity) - float(slice_.filled_qty or 0.0))
+    return max(0.0, float(slice_.quantity) - float(slice_.filled_qty))   # both NOT NULL
 
 
 def covered_quantity(slices: Iterable[AllocatorProtectionOrder]) -> float:
@@ -283,7 +283,7 @@ def _apply_observation(account, p: AllocatorProtection, s: AllocatorProtectionOr
     _save(s)
 
     if obs.state in _FILLED_STATES:
-        newly = max(0.0, float(obs.filled_qty) - float(s.weight_applied_qty or 0.0))
+        newly = max(0.0, float(obs.filled_qty) - float(s.weight_applied_qty))   # NOT NULL, default 0.0
         if newly > 1e-9:
             p = _on_protective_fill(account, p, s, obs, newly, covered_before)
     elif obs.state in SLICE_ALARM_STATES:
@@ -335,7 +335,7 @@ def _on_protective_fill(account, p: AllocatorProtection, s: AllocatorProtectionO
         else:
             note += ": " + "; ".join(f"{c.label} share {c.before_pct:g}% -> {c.after_pct:g}%"
                                      for c in changes)
-    s.weight_applied_qty = float(s.weight_applied_qty or 0.0) + newly
+    s.weight_applied_qty = float(s.weight_applied_qty) + newly
     _save(s)
     _shrink_transactions(p.account_id, p.symbol, newly, obs.fill_price)
     p.last_fill_at = _now()
@@ -369,7 +369,7 @@ def _shrink_transactions(account_id: int, symbol: str, quantity: float,
             if remaining <= 1e-9:
                 break
             txn = get_instance(Transaction, txn_id)
-            have = float(txn.quantity or 0.0)
+            have = float(txn.quantity)          # Transaction.quantity is a required float
             if have <= 1e-9:
                 continue
             if remaining + 1e-9 >= have:

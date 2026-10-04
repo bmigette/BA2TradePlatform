@@ -1,335 +1,346 @@
-# Allocator per-symbol TP/SL protection (TastyTrade) -- design (2026-10-04)
+# Allocator per-symbol TP/SL protection and manual exclusion (TastyTrade) -- design (2026-10-04)
 
-Status: design, branch `feat/alloc-tp-sl` (from origin/dev f6466171). LIVE real-money order
-placement: nothing here has ever been run against TastyTrade. Everything is built and tested
-against a fake of the SDK complex-order API; the first real use is a supervised test (checklist
-in the final report).
+Status: built on branch `feat/alloc-tp-sl` (from origin/dev f6466171), tested ONLY against a fake
+of the SDK's complex-order API. LIVE real-money order placement: nothing here has ever been run
+against TastyTrade. The first real use is a supervised test (checklist in the final report). This
+document supersedes the first draft (commit 1a9256e9): the operator changed the model three times
+on 2026-10-04 (section 0).
 
-## 0. Operator decisions (2026-10-04, fixed input)
+## 0. Operator decisions (2026-10-04, in the order they arrived; the LAST word wins)
 
-* OFF by default. Set PER SYMBOL from an icon ("Set TP/SL") on the allocator symbol row
-  (desktop table) and the phone card. No label or account defaults.
-* ONE stop-loss PRICE and one or MORE take-profit targets (price + share of the position per
-  target, e.g. 3 targets x 1/3). Implementation: one TastyTrade OCO complex order per TP
-  target, each covering its slice of shares: `[TP limit sell slice_i @ tp_i] OCO [stop sell
-  slice_i @ SL]`. Slices sum to the protected quantity; the stop is split across the OCOs at the
-  same SL price. Plain price stop, no dividend adjustment, same for income ETFs.
-* After ANY TP or SL fill the symbol is HELD: excluded from allocator rebalancing (no buys, no
-  sells) until the operator re-enables it. Visible badge "Held after TP/SL fill on <date>" and
-  a re-enable action.
-* Order lifetime GTC.
-
-Decision taken here on the one ambiguity: a TP-slice fill ALSO holds the symbol ("any
-protective fill holds"). The remaining OCO slices stay live and keep being reconciled.
+1. OFF by default; set PER SYMBOL from a shield icon ("Set TP/SL") on the allocator symbol row
+   (desktop table) and the phone card. No label or account defaults.
+2. ONE stop-loss PRICE and one or MORE take-profit targets (price + share of the position).
+   Several OCO complex orders, one per target, each `[TP limit sell slice_i @ tp_i] OCO [stop sell
+   slice_i @ SL]`; plain price stop, same for income ETFs; GTC.
+3. TP fractions may sum to LESS than 100%: the uncovered remainder (the "runner") gets a plain GTC
+   STOP-only sell at the same SL, so the whole position is always covered by a stop. Zero targets =
+   one stop for everything. Four presets (section 5.6) fill the form from the average cost.
+4. **A protection NEVER excludes a symbol from rebalancing** (supersedes "hold after a TP/SL
+   fill"): not while active, not after a fill. Every protected symbol a plan touches has ALL its
+   protective orders cancelled (broker-confirmed), is traded, and gets its protection re-placed at
+   the NEW quantity with the SAME stop and the SAME target prices and fractions.
+5. After a TP or SL fill the remaining protection stays; the filled slice is gone; a small note
+   ("TP1 filled <date>: share 6% -> 3%") sits on the row; the next rebalance treats the symbol
+   normally.
+6. **A fill reduces the symbol's stored share of its label** in proportion to the protected
+   quantity that left; all exited -> 0 (so the next rebalance does not buy it back). The freed share
+   is NOT spread to the other symbols: it stays unallocated (cash) until the operator reassigns it.
+   Audited.
+7. **ONE exclusion mechanism**, reason = manual "disabled" only (the VST case): no buys, no sells,
+   outside the label maths, weights normalised over the enabled symbols, toggle on row and card,
+   '+$X excluded' on the label header. Protective orders of an excluded symbol stay as they are.
 
 ## 1. Facts established from the code and SDK (tastytrade 12.4.1, read locally)
 
 | Fact | Source | Consequence |
 |---|---|---|
-| `Account.place_complex_order(session, NewComplexOrder, dry_run=True)`; `dry_run` DEFAULTS TO TRUE | `account.py:917` | always pass `dry_run=False` explicitly; use `dry_run=True` once first as a validation pass |
+| `Account.place_complex_order(session, NewComplexOrder, dry_run=True)` and `place_order(..., dry_run=True)`: `dry_run` DEFAULTS TO TRUE | `account.py:917`, `:877` | every call passes `dry_run` explicitly; a dry run goes first; `test_every_place_order_call_site_passes_dry_run_explicitly` now pins all four call sites |
 | `NewComplexOrder(orders=[NewOrder, NewOrder], type=OCO)`; `type` defaults to OCO | `order.py:316` | no trigger order; two plain `NewOrder`s |
-| `PlacedComplexOrder` has NO top-level status: `orders: list[PlacedOrder]`, `terminal_at`, `id` | `order.py:395` | complex-order state is DERIVED from the member orders' statuses and fills |
-| `OrderStatus` includes `EXPIRED`, `CANCELLED`, `REMOVED`, `PARTIALLY_REMOVED`, `CONTINGENT`, `CANCEL_REQUESTED`, `REJECTED` | `order.py:58` | a lost protection is observable as EXPIRED/CANCELLED members |
+| `PlacedComplexOrder` has NO top-level status: `orders: list[PlacedOrder]`, `terminal_at`, `id` | `order.py:395` | complex-order state is DERIVED from the member orders' statuses and fills; a stop-only order is classified as a one-member complex order |
+| `OrderStatus` includes `EXPIRED`, `CANCELLED`, `REMOVED`, `PARTIALLY_REMOVED`, `CONTINGENT`, `CANCEL_REQUESTED`, `REJECTED` | `order.py:58` | a lost protection is observable |
 | `NewOrder.gtc_date`, `PlacedOrder.gtc_date` exist | `order.py:281,354` | the broker states a GTC end date; recorded on every slice |
-| `get_live_complex_orders` returns "complex orders placed TODAY" | `account.py:755` | NOT usable to find a GTC order placed last week. Reconcile reads each placed id with `get_complex_order(id)` |
-| `delete_complex_order(id)` returns None; nothing says the cancel completed | `account.py:792` | cancel is a REQUEST: poll `get_complex_order` until every member is terminal before treating the shares as released |
-| Fractional quantity is refused on EVERY priced order type (`fractional_market_orders_only`, 2026-08-21 dry-run) | `TastyTradeAccount._refuse_fractional_priced_order` | protect only `floor(position)` whole shares; the fractional remainder is unprotected and the UI says so |
-| TIF on a MARKET order must be DAY/IOC (`tif_market_orders_not_supported`, 2026-10-02, 47f67180) | `_tt_market_time_in_force` | does not apply to the limit/stop legs (GTC is fine for priced orders); the allocator's own market sells keep using DAY |
-| TastyTrade does not give a resting-order reservation on the position read | `get_positions` sets `qty_available = qty` | the platform itself must never sell shares an OCO reserves: cancel-before-trade |
-| `refresh_orders` walks `get_order_history`, which also lists OCO member orders; members carry no platform `external_identifier` row | `TastyTradeAccount.refresh_orders` | they match no `TradingOrder` and are skipped (`continue`): protection orders never pollute the order table. Members are tagged `external_identifier="ba2prot:<protection_id>:<slice>"` (non-numeric, so the integer lookup raises ValueError and is already tolerated) for human traceability on the TT site |
+| `get_live_complex_orders` returns "complex orders placed TODAY" | `account.py:755` | not usable for last week's GTC order; reconcile reads each placed id (`get_complex_order` / `get_order`) |
+| `delete_complex_order` / `delete_order` return None; nothing says the cancel completed | `account.py:792` | cancel is a REQUEST: poll the state until every member is terminal before treating shares as released |
+| Fractional quantity is refused on EVERY priced order type | `TastyTradeAccount._refuse_fractional_priced_order` | protect only `floor(position)`; the fractional remainder is unprotected and the UI says so |
+| TIF on a MARKET order must be DAY/IOC (47f67180) | `_tt_market_time_in_force` | does not apply to the limit/stop legs (GTC); the allocator's own market sells keep DAY |
+| The position read has no resting-order reservation (`qty_available = qty`) | `get_positions` | the platform itself must never sell shares an OCO reserves: cancel-before-trade |
+| `refresh_orders` walks `get_order_history`, which also lists the members; they match no `TradingOrder` row | `refresh_orders` | skipped (`continue`): protection orders never pollute the order table. Members are tagged `external_identifier="ba2prot:<protection_id>:<slice>"` |
+| `portfolio_allocation_symbol` weights below 100 are ADVISORY, not blocking (`WARNING_SYMBOL_UNDER_FMT`, 2026-09-05) | `ba2_common.core.portfolio_allocation.validate_symbol_weights` | a label summing under 100% already plans correctly and leaves the freed share as cash: no engine change was needed |
+| `compute_allocation` multiplies the weights straight through | engine | the freed share is simply undeployed money |
 
 ### GTC lifetime (could not be verified locally)
 
-Nothing in the SDK, the repo docs or `docs/` states how long a TastyTrade GTC order lives. The
-SDK only proves orders CAN end as `EXPIRED` and that a `gtc_date` exists. My recollection is that
-TastyTrade GTC orders end after about 90 days and are also cancelled on some corporate actions
-(splits, symbol changes); that is NOT verified. Therefore the design never relies on a number:
-
-1. Every placement stores the broker-reported `gtc_date` per slice (from the placed order). If
-   the broker returns none, an ASSUMED expiry `placed_at + ASSUMED_GTC_LIFETIME_DAYS (90)` is
-   stored and flagged `gtc_date_assumed`.
-2. The reconcile classifies an EXPIRED/CANCELLED/REJECTED member as a LOST protection and alerts
-   loudly (section 6). It does not matter why it ended.
-3. A WARNING alert fires `GTC_EXPIRY_WARN_DAYS (7)` days before the stored date, once per slice.
-4. A "Re-place protection" action (cancel remaining + place fresh) renews. NOT automatic (see
-   open question 3).
-
-Supervised-test item: read `gtc_date` on the placed order on tastytrade.com and compare to the
-stored one.
+Nothing in the SDK, the repo docs or `docs/` states how long a TastyTrade GTC order lives. The SDK
+only proves orders CAN end as `EXPIRED` and that a `gtc_date` exists. My recollection is ~90 days
+plus cancellation on some corporate actions: NOT verified. The design never relies on a number:
+every placement stores the broker-reported `gtc_date` per slice (else an ASSUMED `placed_at + 90d`,
+flagged); an EXPIRED/CANCELLED/REJECTED member is a LOST protection and alerts loudly regardless of
+why; a WARNING fires 7 days before the stored date; "Resize protection" renews. Supervised-test
+item: compare the stored `gtc_date` with the one on tastytrade.com.
 
 ## 2. Scope boundaries
 
 * Allocator-owned protection layer. `TastyTradeAccount.adjust_tp/adjust_sl/adjust_tp_sl/
-  modify_order` KEEP raising NotImplementedError / refusing: the expert paths must still be
-  refused (`supports_protective_legs` stays False). The new methods have different, explicit
-  names.
-* Long equity positions only. A short position, an option, or a symbol with no position is
-  refused with a reason.
-* Nothing under `packages/`. The model, store, service, pure helpers and UI live in-tree
-  (`ba2_trade_platform/core/allocator_protection*.py`) because they touch a broker and the
-  live DB: "live-only code belongs in-tree". Consequence: NO `PACKAGE_VERSION` bump and NO
-  `ga_neutral_package_paths` change are needed, and the backtest/GA path cannot import any of
-  it. (APP_VERSION is bumped by the operator at ship time; this branch bumps nothing.)
-* The table model is declared in-tree. `init_db()` lives in `ba2_common` and cannot import it,
-  so `main.initialize_system()` imports the module BEFORE `init_db()` (create_all then builds
-  the table on any DB), `alembic/env.py` imports it so autogenerate sees it, and an Alembic
-  revision (idempotent: `has_table` guards, same pattern as `f1c8a24b7e05`) exists for
-  databases managed by `migrate.py upgrade`.
+  modify_order` KEEP refusing (`supports_protective_legs` stays False); the new methods have
+  different, explicit names: `place_protective_oco`, `place_protective_stop`,
+  `cancel_complex_order`, `cancel_protective_stop`, `get_complex_order_state`,
+  `get_protective_order_state`, `list_live_complex_orders`, `equity_tick_sizes`.
+* Long equity positions only. Short, option or no-position symbols are refused with a reason.
+* **Nothing under `packages/`** (verified by `tools/check_package_versions.py` and by a test that
+  greps `packages/` for the module names). Live-only code belongs in-tree, so there is NO
+  `PACKAGE_VERSION` bump and NO `ga_neutral_package_paths` entry; the backtest/GA path cannot
+  import any of it. (APP_VERSION is the operator's bump at ship time; this branch bumps nothing.)
+  Everything the engine needed was achievable in-tree: exclusions are applied where the allocator's
+  INPUTS are built (page payload, dry-run inputs) and at the submission boundary, never inside the
+  pure engine.
+* `init_db()` lives in `ba2_common` and cannot import an in-tree model, so
+  `main.initialize_system()` imports `core/allocator_protection_models` BEFORE `init_db()`
+  (create_all then builds the tables on any DB), `alembic/env.py` imports it for autogenerate, and an
+  idempotent hand-written Alembic revision `a7c3e91d5b24` (chained on head `d9e3b72a10fc`; same
+  `has_table` guards as `f1c8a24b7e05`) serves databases managed by `migrate.py upgrade`. A test
+  runs alembic's own comparator: zero differences vs the models.
 
-## 3. Data model
+## 3. Data model (four tables, in-tree)
 
-Two tables (Alembic revision, never raw SQL).
+`allocator_protection` -- one row per (account_id, symbol), unique: `enabled`, `sl_price`,
+`tp_targets` JSON `[{"price","fraction"}]` (fractions sum to AT MOST 1; `[]` = stop only),
+`pending_replace(+since)` (we cancelled and still owe the re-placement; written BEFORE the first
+cancel), `last_fill_at/last_fill_note`, `alert_code/alert_message/alerted_at`, `last_error`,
+`protected_quantity` (display cache).
 
-`allocator_protection` -- one row per (account_id, symbol), unique:
+`allocator_protection_order` -- one row per broker order: `kind` OCO|STOP, `slice_index`,
+`target_index` (-1 for STOP), `quantity` (whole shares), `tp_price` (None for STOP), `sl_price`,
+`complex_order_id` (OCO) / `sl_order_id` (STOP's own id), `state` (PLACING / LIVE / CANCELLING /
+CANCELLED_BY_US / FILLED_TP / FILLED_SL / LOST_EXPIRED / LOST_CANCELLED / LOST_REJECTED / UNKNOWN),
+`filled_qty`, `weight_applied_qty` (filled shares the weight was already reduced for), `fill_price`,
+`gtc_date(+assumed, warned)`, `cancel_requested`, `closed_at`. LOST_*/UNKNOWN are the alarms.
 
-| column | meaning |
-|---|---|
-| id, account_id (FK accountdefinition, CASCADE, indexed), symbol (upper) | identity |
-| enabled | operator intent. False = switched off (numbers kept, no orders live) |
-| sl_price | the one stop price (> 0) |
-| tp_targets_json | `[{"price": float, "fraction": float}]`, fractions sum to 1, prices distinct and ascending |
-| held_at, held_reason | set by a fill; NULL = not held. `held_reason` e.g. "TP target 2 filled (slice 2: 4 sh @ 61.50)" |
-| pending_replace | True while WE cancelled the orders (rebalance/resize) and still owe the re-placement |
-| alert_code, alert_message, alerted_at | last loud alert (dedupe: same code is not re-logged every refresh) |
-| last_error | last refusal text from the broker/validation, shown in the UI |
-| protected_quantity | whole shares covered by LIVE slices at last reconcile (display cache) |
-| created_at, updated_at | |
+`allocator_exclusion` -- one row per (account_id, symbol): `excluded_reason` (plain str; only
+`'disabled'`), `since`, `note`.
 
-`allocator_protection_order` -- one row per OCO slice:
-
-| column | meaning |
-|---|---|
-| id, protection_id (FK, CASCADE) | |
-| slice_index, target_index | slice number; which TP target it serves |
-| quantity (int whole shares), tp_price, sl_price | what was sent |
-| complex_order_id (int, nullable until the broker answers), tp_order_id, sl_order_id | broker ids |
-| state | `LIVE` / `CANCELLING` / `CANCELLED_BY_US` / `FILLED_TP` / `FILLED_SL` / `LOST_EXPIRED` / `LOST_CANCELLED` / `LOST_REJECTED` / `UNKNOWN` |
-| filled_qty, fill_price | from the member fills |
-| gtc_date, gtc_date_assumed | see 1 |
-| placed_at, closed_at | |
-
-Terminal states other than LIVE/CANCELLING are history; `LOST_*` and `UNKNOWN` are the alarms.
+`allocator_weight_change` -- audit: `label, symbol, reason (tp_fill|sl_fill), before_pct,
+after_pct, detail, created_at`.
 
 ### Status shown on the page (derived, never stored)
 
-`protection_status(config, slices, position_qty)` -> one of:
+OFF / NO_POSITION ("Armed, no position", not an alarm) / PROTECTED (live slice quantity ==
+floor(position)) / PARTIAL ("Size mismatch": covered != held, either way) / UNPROTECTED (nothing
+live, or a LOST/UNKNOWN slice, or a stale `pending_replace`) / REPLACING (we are mid-rebalance).
+There is no HELD status. A part-filled slice that still rests counts as LIVE for what it reserves.
 
-* `OFF` -- no row, or `enabled` False. (Icon outline.)
-* `HELD` -- `held_at` set. Badge "Held after TP/SL fill on <date>"; if slices are still live the
-  tooltip lists them. Takes precedence over everything except it still shows an alert marker if
-  a remaining slice was lost.
-* `NO_POSITION` -- enabled, whole-share position 0 (nothing to protect yet; not an alarm).
-* `PROTECTED` -- live slice quantity == floor(position). Tooltip notes any fractional remainder
-  ("protecting 10 of 10.4 shares: fractional part cannot carry a stop on TastyTrade").
-* `PARTIAL` -- 0 < live slice quantity < floor(position) (position grew, or a slice was lost).
-* `UNPROTECTED` -- enabled, floor(position) > 0, live slice quantity 0, or `pending_replace`
-  stuck, or any LOST_/UNKNOWN slice. Red, with the reason.
-* `REPLACING` -- `pending_replace` and not yet stale (we are mid-rebalance; amber).
+## 4. Order shapes
 
-## 4. Pure helpers (`allocator_protection.py`, no IO, fully unit-tested)
-
-* `validate_protection(sl, tps, last_price, position_qty, tick)` -> errors list: SL > 0 and
-  strictly below the current price; every TP strictly above the current price; TP prices distinct
-  (after tick rounding); at least one TP; fractions each in (0,1] and sum to 1.0 within 1e-6;
-  at least `n_targets` whole shares or the target count is reported as unplaceable.
-* `round_price_to_tick(price, tick, mode)`: a TP limit sell rounds to the NEAREST tick; an SL
-  stop trigger rounds DOWN (never closer to the market than asked). Tick from `Equity.tick_sizes` when present (threshold-aware),
-  else $0.01 (>= $1) / $0.0001 (< $1).
-* `split_quantity(whole_shares, fractions)` -> `[int]`, largest-remainder, sum == whole_shares,
-  zero-share slices dropped (their fraction folds into the next slice up) and reported.
-* `plan_slices(whole_shares, targets, sl)` -> `[SlicePlan(index, target_index, qty, tp, sl)]`.
-* `remaining_targets(targets, consumed_target_indexes)` -> targets renormalised to sum 1, for
-  re-placement after a TP slice filled.
-* `classify_complex_order(placed, tp_price, sl_price)` -> `SliceObservation(state, filled_qty,
-  fill_price, kind)`; the rules are in section 5.3.
-* `protection_status(...)` as above; `preview_orders(...)` for the dialog.
+* One OCO per take-profit target: SELL_TO_CLOSE limit at the target + SELL_TO_CLOSE plain STOP at
+  the stop, TIF GTC, same whole quantity, `NewComplexOrder(type=OCO)`.
+* ONE plain STOP-only SELL_TO_CLOSE (GTC) for the runner (`1 - sum(fractions)`), or for the whole
+  position when there are no targets. A plain stop (market once triggered), not a stop-limit: a
+  stop-limit can be jumped by a gap and never fill (the repo's `_force_close_breached_stops` exists
+  to patch exactly that).
+* Slicing = largest remainder over `[targets (cheapest first)..., runner]`, summing to the whole
+  shares exactly; a target that gets 0 shares is dropped and named in the notes. Prices snap to the
+  broker's tick table (TP nearest, SL down; fallback $0.01 / $0.0001, the dry run still rejects an
+  off-tick price). Preview example (16 shares): `3 orders: OCO 5 sh TP 12.5 / SL 8, OCO 5 sh TP 15 /
+  SL 8, STOP 6 sh @ 8`.
+* Placement = refuse bad input -> DRY RUN (any `errors` refuse) -> live `dry_run=False` -> read the
+  order back and require it live; an accepted order that cannot be shown live is cancelled before
+  the raise. A slice row is written PLACING before its broker call. If a later slice is refused,
+  the placed ones are KEPT (partial protection beats none) and the symbol is flagged.
 
 ## 5. Lifecycle
 
-All broker IO is in `TastyTradeAccount` (explicit names, below); orchestration and DB are in
-`allocator_protection_service.py`. One per-account RLock (`_submission_lock` is reused: the
-allocator run already holds it, and the service RLock is re-entrant) serialises every
-mutation.
+All broker IO is in `TastyTradeAccount`; orchestration and DB in
+`core/allocator_protection_service.py`, serialised by a per-account RLock (the allocator run takes
+its submission lock first, this lock inside it).
 
-### 5.1 TastyTradeAccount surface
+### 5.1 Operator actions
 
-`supports_allocator_protection = True` (class attr; False on every other account).
+`save_protection` (validate against a FRESH price and position, cancel what is live with
+confirmation, place), `disable_protection` (cancel confirmed, keep the numbers), `delete_protection`,
+`replace_protection` ("Resize protection": cancel confirmed + place at the CURRENT quantity; renews
+GTC; the one-click fix for any mismatch). Validation: SL > 0 and strictly below the price; each TP
+strictly above it; TP prices distinct after rounding; each fraction in (0,1] and the sum <= 1;
+at least one whole share; unknown price/position is an ERROR, never a default.
 
-* `place_protective_oco(symbol, quantity, tp_price, sl_price, tag)` -> `ProtectiveOcoResult`.
-  Refuses: not authenticated, fractional/zero/negative quantity, tp <= sl, equity not found.
-  Builds `NewOrder(LIMIT, GTC, price=+tp, SELL_TO_CLOSE)` and `NewOrder(STOP, GTC,
-  stop_trigger=sl, SELL_TO_CLOSE)` (plain STOP = market stop; decision: a stop-limit can be
-  jumped by a gap and never fill, which the repo's own `_force_close_breached_stops` exists to
-  patch; a market stop trades through the gap. Open question 5), wraps them in
-  `NewComplexOrder(orders=[tp, sl], type=OCO)`, runs `place_complex_order(dry_run=True)` first
-  and refuses on any `errors`, then `dry_run=False`. Reads the placed complex order back with
-  `get_complex_order` and raises `ProtectionRefused` unless every member is live-ish. Returns
-  the ids, statuses and `gtc_date`.
-* `get_complex_order_state(complex_order_id)` -> the `PlacedComplexOrder` (or raises).
-* `cancel_complex_order(complex_order_id)` -> `delete_complex_order`, then polls
-  `get_complex_order` (2s steps, 30s cap) until every member is terminal. Returns
-  `CancelOutcome(confirmed: bool, final: PlacedComplexOrder)`. `confirmed=False` is a LOUD
-  failure, never "assume cancelled".
-* `list_live_complex_orders()` -> `get_live_complex_orders` (today's only: used as a
-  cross-check/diagnostic, not as the source of truth).
+### 5.2 Reconcile (`reconcile_account`, also run by `TradeManager`'s account refresh and by the
+page's Refresh)
 
-### 5.2 Operations (service)
+Per live slice one broker read (`get_complex_order` / `get_order`), classified by pure rules: any
+fill -> FILLED_TP/FILLED_SL (partial counts); Cancel Requested -> CANCELLING; all live -> LIVE;
+Expired / Rejected / cancelled-by-someone-else -> LOST_* alarm; anything else (mixed, unmapped) ->
+UNKNOWN alarm, never read as live. A failed READ changes nothing and is reported (WARNING alert).
 
-* `save_protection(account, symbol, sl, tps)` (UI Save): validate against a FRESH price and
-  position; write the config row (`enabled=True`, `held_at=NULL` is NOT cleared here -- a held
-  symbol must be re-enabled explicitly); if no live slices exist and the symbol is not held,
-  place them (`place_slices`). On a broker refusal: nothing is left half-placed (any slice
-  placed earlier in the same call is cancelled; if THAT cancel is unconfirmed the state is
-  UNPROTECTED+alert and the unconfirmed ids are recorded), `last_error` is set, activity-log
-  FAILURE, and the status shows UNPROTECTED with the reason.
-* `place_slices(account, protection)`: quantity = floor(broker position) (fresh), minus the
-  quantity already covered by LIVE slices (normally 0); `plan_slices`; place sequentially,
-  recording each slice row BEFORE the network call as `state=PLACING`... (see 5.5) and
-  updating it after.
-* `disable_protection(account, symbol)`: cancel every live slice with confirmation; `enabled=
-  False`; numbers kept. If any cancel is unconfirmed the slice stays CANCELLING and an alert is
-  raised (the orders may still be live at the broker).
-* `delete_protection`: disable then delete the config rows (history in the activity log).
-* `reenable_symbol(account, symbol)`: clears `held_at/held_reason` only. If the hold came from
-  an SL fill the config is switched `enabled=False` (the stop already fired; protecting a
-  re-bought position at stale prices unasked would be wrong), if from a TP fill the consumed
-  targets are removed and the rest renormalised; live slices stay (they already match the
-  reduced position) and the next reconcile verifies that.
-* `replace_protection(account, symbol)` (UI "Re-place protection", also the rebalance
-  re-placement): cancel live slices with confirmation, then `place_slices` with the
-  remaining targets. Renews GTC.
+**On a protective fill** (`_on_protective_fill`, the one place): (a) the symbol's stored weight in
+every label that stores one is multiplied by `remaining protected qty / protected qty before the
+fill` (0 when protection exited the position) and one `allocator_weight_change` row per label is
+written; (b) the platform's open `Transaction`s of the symbol are shrunk FIFO by the shares sold (a
+transaction sold in full is closed at the fill price) so the next rebalance does not size against
+shares that are gone; (c) a note is stored on the protection ("TP1 filled 2026-10-03: share 6% ->
+3%" / "SL hit ..."); (d) an activity-log WARNING. NOTHING excludes the symbol. A fill that lands in
+several reconciles reduces the weight once per share (`weight_applied_qty`). Each step's failure is
+loud (`WEIGHT_FAILED`, `TXN_FAILED` activity-log FAILURE) and never masks the fill. A symbol
+with no STORED weight row (it runs on the derived default, its actual share) has nothing to reduce:
+its target follows its holdings by itself.
 
-### 5.3 Reconcile (`reconcile_account(account, repair=False)`)
+**Quantity changes outside the allocator** (decided: split by direction, justification below):
+* GROWTH (whole shares nobody covers: a manual buy, a DRIP, shares bought back after the stop
+  fired): the reconcile ADDS protection for exactly the uncovered shares from the same template. No
+  cancel, so there is NO gap in which existing shares are unprotected. Not while an allocator run is
+  in flight (the submission lock is held) or while an order on the symbol is still working (the
+  position is not final), and never when an alarm slice exists (the operator may have cancelled on
+  purpose: it alerts instead).
+* SHRINK / any other mismatch (live orders cover MORE than is held): flagged `QUANTITY_MISMATCH`,
+  status "Size mismatch", loud, with the one-click **Resize protection**. Resizing means cancelling
+  live orders, i.e. a window in which the whole position is unprotected; a background job should
+  not open that window by itself, and the operator may be mid-manual-trade on the TT site.
+Justification: auto-adding is strictly additive and protective; auto-resizing is destructive
+before it is protective. The asymmetry is the whole decision; section 12 asks the operator to
+confirm it.
 
-Called (a) from `TradeManager`'s account refresh loop after the order refresh, (b) from the
-page's Refresh, (c) by the allocator service before a run. For every enabled-or-held protection
-with non-terminal slices:
+### 5.3 The allocator run (`run_allocation`) -- cancel, confirm, trade, re-place
 
-1. One broker read per live slice: `get_complex_order(id)` (cheap; `get_live_complex_orders`
-   only lists today's).
-2. `classify_complex_order`:
-   * any member with fills > 0 or status FILLED -> `FILLED_TP` (limit member) or `FILLED_SL`
-     (stop member), `filled_qty`, `fill_price` from the fills. A partially filled live member
-     counts as a fill (any protective fill holds).
-   * all members LIVE/RECEIVED/CONTINGENT/ROUTED/IN_FLIGHT -> `LIVE`.
-   * CANCEL_REQUESTED anywhere -> `CANCELLING`.
-   * any EXPIRED -> `LOST_EXPIRED`; any REJECTED -> `LOST_REJECTED`; all CANCELLED/REMOVED/
-     PARTIALLY_REMOVED -> `CANCELLED_BY_US` if we had asked, else `LOST_CANCELLED` (somebody
-     cancelled it on the TT site or TT cancelled it).
-   * anything else (mixed, unmapped) -> `UNKNOWN` = alarm, never treated as live.
-3. A fill: set `held_at=now`, `held_reason`, ActivityLog (SUCCESS, "TP/SL filled") and an
-   ALERT-level log so the operator sees the position changed under them. Remaining live slices
-   keep resting and are still reconciled.
-4. A LOST/UNKNOWN slice: alert (6). The slice is NOT silently re-placed in the background:
-   the operator may have cancelled it deliberately on the TT site. The UI shows UNPROTECTED and
-   offers "Re-place protection". (Exception: `pending_replace`, which is our own unfinished
-   operation -- reconcile completes it when no working allocator order remains on the symbol.)
-5. Fetch failure is reported (`reconcile` returns `ReconcileReport.failed_symbols`) and logged
-   at ERROR; it never flips a state to LIVE or to LOST on a failed read.
-6. GTC expiry warning at `gtc_date - 7d`, once per slice.
+Inside `_run_allocation_locked`:
+1. FIRST, before any gate: rows of EXCLUDED symbols are stripped (section 6) and re-emitted as
+   SKIPPED outcomes.
+2. After the gates pass and before the run row is recorded (a blocked attempt changes nothing):
+   `prepare_for_trade` for every symbol the plan will TRADE (side and delta): reconcile first (a fill
+   discovered now is applied: weight reduced, transactions shrunk), set `pending_replace` BEFORE the
+   first cancel, then cancel ALL its protective orders (OCOs and stop-only) and require the broker to
+   CONFIRM each. A symbol whose cancel cannot be confirmed is DROPPED from the plan and reported FAILED
+   ("the shares may still be reserved"); the allocator never sells shares an OCO still reserves.
+3. The remaining plan is recorded and submitted as today (sells first).
+4. After `measure_run_fills`, `resume_protection`: for each pending symbol, if one of its orders is
+   still working it stays REPLACING; otherwise read the fresh position and place protection at the
+   NEW quantity from the stored template (same SL, same target prices and fractions; slices and the
+   stop-only remainder recomputed). Whole position sold -> nothing to place, protection is inactive
+   ("Armed, no position", config kept, not an alarm) and comes back automatically when the symbol is
+   bought again (next run, or the growth rule). A re-placement the broker or validation refuses
+   (including a price that moved through the stop while the orders were off: refused, never traded
+   through) sets `REPLACE_FAILED`, clears `pending_replace` (no endless retry) and leaves the symbol
+   UNPROTECTED for the operator: red status, red page banner, activity-log FAILURE.
+5. The same re-placement runs in the failure path (a raise mid-submission), and never raises
+   itself. The background reconcile completes a `pending_replace` only when NO run is in flight.
+6. The run's activity-log description reports `TP/SL: re-placed X of Y, blocked Z`.
 
-### 5.4 Interplay with the allocator rebalance (`run_allocation`)
+### 5.4 Crash safety
 
-Inside `_run_allocation_locked`, after the existing block gates pass (so a blocked attempt
-changes nothing) and before `record_allocation_run`:
+Each slice row is inserted PLACING before the broker call; a PLACING row older than 60s is an UNKNOWN
+alarm (an order may exist: the `external_identifier` tag lets the operator find it). `pending_replace`
+older than 15 minutes shows UNPROTECTED.
 
-1. HELD symbols are removed from the plan (`filter_plan_rows` over the rest) and re-emitted as
-   SKIPPED outcomes "Held after TP/SL fill on <date>: excluded from rebalancing". The dry run
-   dialog shows the same rows as skipped (page loader passes the held set), but the enforcement
-   is here, at the boundary that writes -- a stale dialog cannot trade a held symbol.
-2. For every remaining row that WILL trade (`side` and `delta_quantity`) on a symbol with LIVE
-   slices: reconcile it first (a fill since the last look makes it HELD -> step 1 applies, row
-   dropped), then `cancel_complex_order` each slice and require `confirmed`. A symbol whose
-   cancel is unconfirmed has its row DROPPED from the plan and reported FAILED
-   ("protective orders could not be cancelled: not traded"), and stays alerted -- the allocator
-   never sells shares an OCO still reserves. Protection flagged `pending_replace=True` BEFORE the
-   first cancel (so a crash mid-way leaves a durable "we owe a re-placement" marker, which the
-   next reconcile completes).
-3. The remaining plan is recorded and submitted as today.
-4. After `measure_run_fills`, `resume_protection(account, symbols)`: for each symbol with
-   `pending_replace`: if any of the run's orders on it is still working, leave it
-   `pending_replace` (REPLACING); otherwise read the fresh position and `place_slices` with the
-   remaining targets. A failure leaves UNPROTECTED + alert. This also runs in a `finally`, so a
-   raise mid-submission still attempts to re-protect, and never itself raises.
-5. The re-placement is reported in the run's activity-log description.
+### 5.5 Failure policy (never silent)
 
-Sells vs reserved shares, belt and braces: `_stale_plan_block` already re-reads positions; a
-SELL row additionally asserts `sum(live slice qty on symbol) == 0` at submit time (after step
-2) and fails the row loudly otherwise.
+Every failure path does all three: `logger.error`, an `ActivityLog` entry (`TP_SL_ADJUSTED`,
+`data.kind="allocator_protection"`, `data.code`), and a persisted `alert_code/alert_message` rendered
+as a red page banner and a red chip on the row. The same code is not re-logged on every refresh. No
+notification channel exists in the platform (no email/telegram): banner + activity log. Codes:
+PLACEMENT_REFUSED, CANCEL_UNCONFIRMED, LOST_EXPIRED, LOST_CANCELLED, LOST_REJECTED, UNKNOWN_STATE,
+REPLACE_FAILED, QUANTITY_MISMATCH, RECONCILE_FETCH_FAILED, GTC_EXPIRING; events: FILL, PLACED,
+EXTENDED, WEIGHT_FAILED, TXN_FAILED.
 
-### 5.5 Crash safety / idempotence
+### 5.6 Presets (pure, `apply_preset`; unit-tested; every number stays editable)
 
-Each slice row is inserted `state=PLACING` BEFORE the broker call (carrying the
-`external_identifier` tag) and updated with the ids after. A crash in between leaves a PLACING
-row; reconcile treats a PLACING row older than 60s as UNKNOWN (alarm) and, because the order
-may exist at the broker, the supervised checklist says to look at the TT site. (The tag lets the
-operator find it; automatic adoption by tag is future work.)
+Computed from the position's AVERAGE COST, snapped to the tick grid (TP nearest, SL down); an unknown
+average cost RAISES (a preset from a guessed cost would be a fabricated price) and the buttons are
+disabled.
 
-## 6. Failure policy (never silent)
+| Preset | Stop | Take-profit |
+|---|---|---|
+| Double-up: take half at 2x | -25% | 50% at 2.0x; the other 50% a stop-only runner |
+| Ladder +25/+50/+100% | -15% | thirds at +25%, +50%, +100% (boxes read 33.33/33.33/33.34) |
+| 2R scale-out | -10% | 50% at +20%; 50% stop-only runner |
+| Income: stop only | -20% | none |
 
-Every failure path does all three: `logger.error`, an `ActivityLog` entry (severity FAILURE,
-type `TP_SL_ADJUSTED`, `data.kind="allocator_protection"`, `data.code`), and a persisted
-`alert_code/alert_message` on the protection row that the page renders as a red banner above the
-label list ("N position(s) UNPROTECTED: AAPL (stop order expired) ...") and as a red badge on
-the symbol. The same code is not re-logged on every 5-minute refresh (`alerted_at` + code
-dedupe; it re-fires if the code changes). There is no notification channel in the platform
-(no email/telegram); the UI banner and the activity log are the channels.
+A preset can fail validation against the CURRENT price (a deeply under-water position has its -25%
+stop above the market): that appears as the usual validation message and nothing is saved.
 
-Codes: `PLACEMENT_REFUSED`, `CANCEL_UNCONFIRMED`, `LOST_EXPIRED`, `LOST_CANCELLED`,
-`LOST_REJECTED`, `UNKNOWN_STATE`, `REPLACE_FAILED`, `QUANTITY_MISMATCH` (PARTIAL),
-`RECONCILE_FETCH_FAILED` (warning), `GTC_EXPIRING` (warning), `HELD_FILL` (info/success).
+## 6. The ONE exclusion mechanism
 
-## 7. UI
+**Storage decision.** A new in-tree table `allocator_exclusion`, NOT a column on
+`portfolio_allocation_symbol`. That row is per LABEL, created lazily and deleted with the membership,
+while "I do not want the allocator touching VST" is a standing decision about a HOLDING for the
+account (a symbol in two labels is excluded from both). Also, `ba2_common.core.models` is imported by
+the backtest engine: a column there is GA-relevant (package bump + raised minimum); an in-tree table
+is GA-neutral. `excluded_reason` is a plain str with the single value `disabled` (manual); a TP/SL
+fill no longer needs a second reason (section 0.4).
 
-* Desktop: a `protect` column (TIER_HEAD on phone) with a shield icon button + a status chip,
-  one Vue fragment (`PROTECT_TEMPLATE`) shared by the table cell and the card header, like
-  `SYMBOL_CHIPS_TEMPLATE`. Emits `protectClick(symbol)`. Shown only when the account class
-  declares `supports_allocator_protection`; other brokers never see the column.
-* Dialog (`allocator_protection_dialog.py`): current price and held quantity (whole shares +
-  fractional note); SL price; a list of TP targets (price, % of position), add/remove; live
-  validation messages; PREVIEW table "Order 1: sell 4 sh, limit 61.50 OCO stop 55.00 ..." with
-  the whole-share note; Save / Switch off / Re-place protection / Re-enable after hold. Phone:
-  the dialog uses the page's responsive classes (`ui/utils/responsive.py`).
-* Styles are installed in `_install_page_styles` (before the first await); the new CSS rides
-  `page_phone_css()` and the generated static file.
-* Held rows in the dry-run/wizard show as skipped with the badge text.
+**Semantics of an excluded symbol** (the symbol is simply outside the managed money, like an
+unmanaged holding):
+1. The plan never emits an order for it. The inputs are built without it (page payload and
+   `_load_flow_inputs`), and `run_allocation` strips its rows FIRST as the boundary guarantee (stale
+   dialog, wizard re-solve over cached labels, retries); the dry run shows any such row SKIPPED
+   ("excluded from allocation (disabled by you on ..., note): no buys, no sells ...").
+2. The label maths ignore it. Its value is not in the label's value, the distinct managed total, the
+   label P&L or its cost basis, and not in the investable base (`compute_base_notional` is called
+   over the enabled symbols). Its share is ignored: the enabled symbols' shares are scaled by
+   `T / N` (T = the label's total of ALL stored shares, N = the enabled ones') so the excluded
+   share is spread over the rest. The scale target is the stored total T, NOT 100, so a shortfall that
+   is not an excluded share (a share freed by a fill) stays unallocated: stored 40/40/VST 10 (T=90)
+   solves 45/45, not 50/50. The label's target $ applies to the enabled symbols only. The table shows
+   the stored share in the box and "eff. 50.00%" under it.
+3. Interaction with the rest of the allocator: **label target %** -- unchanged: it is a share of the
+   investable pool, which is now `(buying power + enabled managed value) x (1 - reserve)`; the label
+   targets stay relative weights totalling 100. **Unallocated reserve** -- applies to the base
+   WITHOUT the excluded value (an excluded holding does not shrink or grow the cash reserve).
+   **Simulate base** -- replaces the measured base as before; the free-buying-power term absorbs the
+   change using the enabled-only managed value, so the identity `base = managed + buying power` still
+   holds on the page. An excluded position is not part of any of these numbers.
+4. UI: an eye toggle on the row (desktop cell + phone card header; every broker); excluded rows grey
+   with a badge "Excluded: manual" and still show quantity, value and P&L; the label header shows
+   "+$X excluded". Including again is explicit (a confirm dialog). The dialog states that protective
+   orders stay as they are.
+5. Inline-edit helpers (Fill 100%, Even split, Wipe, Load last) keep operating on the STORED shares
+   of every label symbol, excluded ones included: the stored set is the operator's own numbers and
+   re-including must restore them. `labels_for_persist` stops the dry run's "Continue" (which stamps
+   `previous_weight_pct`) from writing the SCALED shares back: for a label with an excluded symbol it
+   writes the stored shares only.
 
-## 8. Tests (fake SDK, no network)
+## 7. Weight reduction on fills (rule 0.6)
 
-`tests/test_allocator_protection_*.py`: pure helpers (tick rounding, slicing, fractions,
-validation); a `FakeTastyBroker` (place complex order incl. dry-run, errors/rejection, statuses,
-partial fills, cancel with a delay and a cancel/fill race, expiry, position changes) exercised
-through the REAL `TastyTradeAccount` methods; service lifecycle (place, partial TP fill -> hold,
-SL fill -> hold, expiry -> unprotected alert, cancel detected, rebalance cancel/replace, held
-skip, unconfirmed cancel drops the row); UI construction tests (dialog builds, card template has
-the protect cell, `check_card_columns`).
+`new = old x remaining protected qty / protected qty before the fill`; all exited -> 0. Applied to
+every label that stores a weight for the symbol; the freed share is not given to anyone. Because
+under-100 symbol weights are already advisory in the engine (`WARNING_SYMBOL_UNDER_FMT`), a label
+summing below 100% plans correctly (the freed money stays cash) and blocks nothing; the label header
+shows "freed X% from TP/SL fills" -- only for a label that has an audit record, so a hand-typed 60 is
+not reported as freed. The row note carries "share 6% -> 3%". Interaction with the previous-weight
+mechanism: `previous_weight_pct` is "what the last RUN went out with" and only
+`save_allocation_targets` writes it; the automatic change never touches it, so "Last %" keeps
+showing the weight of the last run next to the reduced current one, and "Load last" restores the
+pre-fill share only on an explicit operator action. The audit trail is `allocator_weight_change`.
 
-## 9. What is NOT verified without a broker
+## 8. UI
 
-Real TT behaviour of: OCO acceptance for sell-to-close equity with a GTC plain stop; whether
-`get_complex_order` shows member statuses as I model them (esp. which status the surviving OCO
-leg takes when its partner fills, and what a TT-side expiry looks like); `gtc_date` population;
-cancel latency; whether two live OCOs on one position with summed quantity == position are
-accepted (should be); behaviour around corporate actions. The fake encodes my best reading of
-the SDK; the supervised test exists to correct it.
+Desktop: two columns (`protect`, `exclude`); phone: both in the card header (TIER_HEAD). The dialog:
+presets row, SL box, TP rows (price, % of position; delete; add -- adding after a deliberate runner
+gives the new row the remaining share, otherwise an even split), validation messages, the order
+preview, the orders at the broker with state and GTC date, the fill note, the alert, and the
+sentences "the allocator rebalances a protected symbol normally ... excluding does not cancel them".
+Save / Resize protection / Switch off. Styles ride `page_phone_css()` and the generated static file
+(installed before the page's first await; the dialog and the helper modules add no CSS).
 
-## 10. Open questions for the operator
+## 9. Tests (fake SDK, no network)
 
-1. SL fill then re-enable: I switch protection OFF (numbers kept) rather than re-arming a stop on
-   whatever is bought next. OK, or should re-enable keep it armed?
-2. After a TP slice fills the Transaction row for the symbol is stale (broker holds less than
-   the transaction says). Do you want the reconcile to shrink the transaction quantity on a TP
-   fill, or is the hold + manual re-enable enough? (Out of scope as built; a re-enable
-   writes a warning to the activity log when broker qty != tracked qty.)
-3. GTC expiry: alert only (built), or auto-renew (cancel + re-place ~7 days before the date)?
-   Auto-renew leaves a short unprotected gap and fights a deliberate manual cancel.
-4. Background reconcile never re-places a lost slice (could be a deliberate manual cancel on
-   the TT site). Confirm, or allow auto-repair for a lost STOP only.
-5. Plain market STOP (built) vs stop-LIMIT. Plain stop is a market order once triggered: it
-   fills through a gap, at a worse price. Stop-limit can be jumped and not fill. Preference?
-6. Extended-hours: GTC (not "GTC Ext"): protection triggers in the regular session only.
-   Is that acceptable?
-7. Does the 5-minute-ish account refresh interval give fast enough fill detection for the
-   hold? A rebalance fired between a fill and the next reconcile is covered by the per-run
-   reconcile in 5.4 step 2 (only for symbols the run trades). The wizard's dry run for OTHER
-   symbols is unaffected.
+`tests/allocator_protection_fakes.py` implements `place_complex_order`, `get_complex_order`,
+`delete_complex_order`, `get_live_complex_orders`, `place_order`, `get_order`, `delete_order`,
+`get_positions` with REAL SDK models, a cancel that takes N reads, a cancel that never confirms, a
+fill-instead-of-cancel race, expiry, an outside cancel, a read failure. Suites: pure helpers (122),
+TastyTradeAccount methods (42), service lifecycle (87), run boundary (15), exclusion (49), UI (64),
+migration (15). Also fixed: `tests/conftest.py` now forgets `nicegui.Client`s a test built (a
+pre-existing order-dependent failure of `test_batch_import_upload`/`test_settings_dialog_*`, exposed
+the moment a client-building test file sorted before them).
+
+## 10. What is NOT verified without a broker
+
+Real TT behaviour of: OCO acceptance for sell-to-close equity with a GTC plain stop; the statuses of
+the surviving OCO leg when its partner fills and what a TT-side expiry looks like; `gtc_date`
+population; cancel latency; whether `get_order` works for a GTC order from another day;
+`external_identifier` format acceptance; two or more OCOs plus a stop-only order on one position
+whose quantities sum to the position (should be accepted); corporate actions; behaviour of a plain
+stop in the pre-market. The fake encodes my best reading of the SDK (`BROKER_ASSUMPTIONS` in the
+fakes module); the supervised test exists to correct it.
+
+## 11. Known limitation
+
+A `Transaction` shrunk after a partial protective sale loses the realised P&L of the sold part from
+its own row (the same simplification `adjust_quantity_with_tpsl` makes for a partial close); a
+transaction sold in full is closed at the fill price with its real P&L.
+
+## 12. Open questions for the operator
+
+1. Growth is protected automatically (add-only, no cancel); a shrink is flagged for a one-click
+   Resize. Confirm the asymmetry (5.2), or want auto-resize as well?
+2. GTC expiry: alert only (built) or auto-renew ~7 days before the date? Auto-renew leaves a short
+   gap and fights a deliberate manual cancel.
+3. The background reconcile never re-places a LOST slice (could be a deliberate cancel on the TT
+   site). OK, or auto-repair a lost STOP only?
+4. Plain market STOP (built) vs stop-limit.
+5. Regular session only (GTC, not "GTC Ext"). Acceptable?
+6. After the stop fired and the position is gone, the protection stays armed and re-places itself
+   the next time the symbol is bought (by the allocator or by hand). Intended?
+7. A symbol with NO stored weight row has no weight to reduce on a fill (its derived target follows
+   holdings). Intended, or should a fill write an explicit reduced row?
+8. Excluding a symbol keeps its stored share; re-including restores it. If you re-include after
+   fills reduced other symbols, the label may sum to more than 100%: it then blocks (engine rule).
+   Want the page to warn when re-including would do that?
+9. The row shows only the LATEST fill note; the full history is `allocator_weight_change` plus the
+   activity log. Enough?

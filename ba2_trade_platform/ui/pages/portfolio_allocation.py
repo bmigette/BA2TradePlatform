@@ -513,7 +513,7 @@ def _load_protection_payload(account, account_id: int, positions) -> Dict[str, A
              for p in protect_svc.list_protections(account_id)}
     # The broker's held quantity per symbol (read ONCE for the page), so a protection on a
     # symbol that is in no managed label is still judged against its real position.
-    quantities = {sym: float(state.quantity or 0.0) for sym, state in positions.items()}
+    quantities = {sym: float(state.quantity) for sym, state in positions.items()}
     return {'supported': True, 'items': items, 'quantities': quantities}
 
 
