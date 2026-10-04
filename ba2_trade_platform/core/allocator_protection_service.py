@@ -718,7 +718,7 @@ def _reconcile_one(account, p: AllocatorProtection, report: ReconcileReport,
                        f"could not read complex order {s.complex_order_id}: {e}; its state is "
                        f"UNCHANGED and unverified",
                        severity=ActivityLogSeverity.WARNING)
-            continue
+            break    # the broker is unreachable: one report per symbol, not one per slice
         report.checked += 1
         obs = classify_complex_order(placed, slice_quantity=s.quantity,
                                      we_requested_cancel=bool(s.cancel_requested))
@@ -731,7 +731,11 @@ def _reconcile_one(account, p: AllocatorProtection, report: ReconcileReport,
 
     p = _reload(p.id)
     slices = get_slices(p.id)
-    if p.alert_code == CODE_RECONCILE_FETCH_FAILED and p.symbol not in report.failed_symbols:
+    if p.symbol in report.failed_symbols:
+        # The broker could not be read: nothing below (the quantity check, clearing alerts) may
+        # draw a conclusion from state we could not verify.
+        return
+    if p.alert_code == CODE_RECONCILE_FETCH_FAILED:
         p = _clear_alert(p, [CODE_RECONCILE_FETCH_FAILED])
 
     live = covered_quantity(slices)
@@ -751,6 +755,12 @@ def _reconcile_one(account, p: AllocatorProtection, report: ReconcileReport,
                        f"re-place protection to renew it",
                        severity=ActivityLogSeverity.WARNING)
 
+    if (not p.enabled and p.held_at is None and p.alert_code
+            and not any(_is_resting(x) for x in slices)
+            and not any(x.state in SLICE_ALARM_STATES and x.closed_at is None for x in slices)):
+        # Switched off and every order is gone: an alert about orders that no longer exist
+        # (an unconfirmed cancel that has since landed) is stale.
+        p = _clear_alert(p)
     if not p.enabled or p.held_at is not None or position is None:
         return
     qty, is_long = position

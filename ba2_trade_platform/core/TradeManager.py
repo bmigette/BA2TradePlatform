@@ -410,6 +410,21 @@ class TradeManager:
                             exc_info=True,
                         )
 
+                    # ALLOCATOR TP/SL (TastyTrade): detect protective fills (-> the symbol is
+                    # HELD), lost/expired/cancelled OCOs (-> loud alert) and size mismatches,
+                    # and finish a re-placement a rebalance started. A no-op for every account
+                    # that does not declare ``supports_allocator_protection``; reconcile never
+                    # raises, and the try below keeps even a bug in it from costing the rest of
+                    # the refresh.
+                    try:
+                        from .allocator_protection_service import reconcile_account
+                        reconcile_account(account)
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error reconciling allocator TP/SL protection for {account_def.name}: {e}",
+                            exc_info=True,
+                        )
+
                 except Exception as e:
                     self.logger.error(f"Error refreshing account {account_def.name} (ID: {account_def.id}): {e}", exc_info=True)
                     continue
