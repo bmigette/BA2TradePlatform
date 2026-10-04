@@ -80,6 +80,7 @@ from ba2_common.core.market_calendar import backtest_decision_label, decision_da
 from ba2_common.core.utils import as_utc_key
 from ba2_common.core.failure_modes import must_measure
 from ba2_common.core.option_bs import bs_price
+from ba2_common.core.option_payoff import PayoffLeg, position_value_bounds
 from ba2_common.core import option_spread_model as _osm
 from ba2_common.core.db import get_db, get_instance, add_instance, update_instance
 from ba2_common.core.trade_store import orders_where, transactions_where
@@ -1148,7 +1149,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 # are still held; once the shorts are closed/settled the surviving LONG legs are a
                 # net-long asset worth [0, width] — so their positive residual is preserved, not
                 # erased (the O_IC id=449 1-bar transient).
-                if is_credit and group_has_short.get(gkey, False):
+                #
+                # THE BOUNDS ARE THE STRUCTURE'S TRUE VALUE RANGE where it is derivable
+                # (``gb["lo"]/["hi"]``, from ``option_payoff.position_value_bounds`` -- the same
+                # payoff the entry ``max_loss`` stamp is measured from), not ``[0, width]``. For
+                # every shape that already obeyed that rule the two are the same number; they
+                # differ for a call butterfly whose UPPER wing is wider than its lower one, which
+                # is worth a NEGATIVE amount above its top strike. ``[0, width]`` floored that
+                # liability at zero and hid the loss until expiry. An infinite side means
+                # unbounded on that side: no clamp there.
+                lo, hi = gb.get("lo"), gb.get("hi")
+                if lo is not None and hi is not None and not (
+                        is_credit and not group_has_short.get(gkey, False)):
+                    mtm = min(max(mtm, lo), hi)
+                elif is_credit and group_has_short.get(gkey, False):
                     mtm = max(min(mtm, 0.0), -width)          # credit exposure live: [-width, 0]
                 else:
                     mtm = min(max(mtm, 0.0), width)           # long / long-only remainder: [0, width]
@@ -1269,7 +1283,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                             o.id,
                             {"strategy": o.option_strategy,
                              "qty": abs(float(o.quantity or 0.0)) or 1.0,
-                             "strikes": [], "multiplier": float(o.multiplier or 100)},
+                             "strikes": [], "multiplier": float(o.multiplier or 100),
+                             "legs": [], "leg_orders": 0},
                         )
                     else:  # single-leg option (its own group)
                         single_info[cs] = {
@@ -1282,8 +1297,22 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 children.append(o)
         # opening child legs contribute their strikes to the parent group
         for o in children:
-            if o.parent_order_id in parent_info and o.strike is not None:
-                parent_info[o.parent_order_id]["strikes"].append(float(o.strike))
+            if o.parent_order_id in parent_info:
+                info = parent_info[o.parent_order_id]
+                info["leg_orders"] += 1
+                if o.strike is not None:
+                    info["strikes"].append(float(o.strike))
+                # The leg as the shared payoff evaluator sees it (value bounds below). A leg
+                # that cannot be expressed (no strike / right / side / size) leaves the
+                # structure's bounds UNDERIVABLE rather than computed from a partial leg set.
+                if (o.strike is not None and o.option_type in (OptionRight.CALL, OptionRight.PUT)
+                        and o.side in (OrderDirection.BUY, OrderDirection.SELL)
+                        and o.quantity):
+                    info["legs"].append(PayoffLeg(
+                        kind=("call" if o.option_type == OptionRight.CALL else "put"),
+                        side=o.side, premium=0.0, strike=float(o.strike),
+                        ratio=abs(float(o.quantity)),
+                        multiplier=float(o.multiplier or 100)))
 
         def _width(info):
             if info["qty"] <= 0:
@@ -1292,6 +1321,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if per is None:
                 return None
             return per * info["multiplier"] * info["qty"]
+
+        def _value_bounds(info):
+            """``(lo, hi)`` dollars the WHOLE structure can be worth (see
+            ``option_payoff.position_value_bounds``), or None when any opening leg could not
+            be expressed. Leg ratios are the legs' own contract counts, so the result is
+            already scaled by the structure quantity."""
+            if "legs" not in info or not info["legs"] or len(info["legs"]) != info["leg_orders"]:
+                return None
+            return position_value_bounds(info["legs"])
 
         contract_group: Dict[str, Any] = {}
         group_bounds: Dict[Any, Dict[str, Any]] = {}
@@ -1310,7 +1348,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 continue
             contract_group[cs] = gkey
             if gkey not in group_bounds:
-                group_bounds[gkey] = {"strategy": info["strategy"], "width": _width(info)}
+                vb = _value_bounds(info)
+                group_bounds[gkey] = {
+                    "strategy": info["strategy"], "width": _width(info),
+                    "lo": None if vb is None else vb[0],
+                    "hi": None if vb is None else vb[1],
+                }
         self._group_bounds_memo = (self._option_memo_gen, contract_group, group_bounds)
         return contract_group, group_bounds
 
@@ -6033,9 +6076,25 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Safety clamp: a defined-risk combo's expiry payoff magnitude can never exceed the
         # structure's defined risk. Bound both directions so rounding / bad cache data cannot
         # leak past it.
-        bound = self._combo_expiry_bound(txn, positions, strikes)
-        if bound is not None:
-            net_payoff = max(-bound, min(net_payoff, bound))
+        # The bounds are the held legs' TRUE value range (``position_value_bounds``), so the
+        # clamp cannot clip a real liability: the symmetric ``+-width`` below cuts a call
+        # butterfly whose upper wing is more than twice its lower, whose expiry payoff
+        # exceeds the lower gap in magnitude. Falls back to the symmetric bound only when the
+        # legs cannot be expressed.
+        try:
+            lo, hi = position_value_bounds([
+                PayoffLeg(kind=("call" if p.option_type == OptionRight.CALL else "put"),
+                          side=p.side, premium=0.0, strike=float(p.strike),
+                          ratio=abs(float(p.quantity)), multiplier=float(p.multiplier or 100))
+                for p in positions])
+        except (ValueError, TypeError):
+            lo = hi = None
+        if lo is not None:
+            net_payoff = max(lo, min(net_payoff, hi))
+        else:
+            bound = self._combo_expiry_bound(txn, positions, strikes)
+            if bound is not None:
+                net_payoff = max(-bound, min(net_payoff, bound))
 
         # Apply the net payoff to cash and book each leg's synthetic close (moves no extra cash).
         self._cash += net_payoff
