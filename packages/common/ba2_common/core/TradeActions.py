@@ -3229,7 +3229,9 @@ class _OptionEntryAction(TradeAction):
         * OPTION rows, on the SAME basis the sizer measured their ticket (the dollars one
           contract took from the budget, times the contracts):
             - a structure whose orders carry ``data['option_reserve']`` (every reserving
-              builder stamps the TOTAL collateral at submit) counts that reserve;
+              builder stamps the TOTAL collateral at submit) counts that reserve -- and, for
+              a NON-reserving debit structure that stamped one anyway (a call butterfly whose
+              worst loss exceeds its debit: the stamp is only the EXCESS), the debit too;
             - a RESERVING strategy WITHOUT one is unmeasurable (the reserve pool's rule:
               unknown must never read as the zero that frees room);
             - anything else counts ``|net premium per share| x multiplier x contracts`` --
@@ -3264,8 +3266,14 @@ class _OptionEntryAction(TradeAction):
                         and float(o.data["option_reserve"]) > 0]
             if reserves:
                 total += sum(reserves)
-                continue
-            if txn.option_strategy in OptionsAccountInterface.RESERVING_STRATEGIES:
+                if txn.option_strategy in OptionsAccountInterface.RESERVING_STRATEGIES:
+                    continue
+                # A NON-reserving strategy that recorded a reserve is a DEBIT structure whose
+                # worst loss exceeds its debit (a call butterfly with a wider upper wing): the
+                # recorded reserve is only the EXCESS over the debit (see ``_size_and_submit``;
+                # the reserve pool counts it the same way), so the debit still counts below.
+                # Counting the excess alone would under-state the commitment by the whole debit.
+            elif txn.option_strategy in OptionsAccountInterface.RESERVING_STRATEGIES:
                 return None, (f"transaction {txn.id} ({txn.option_strategy}) must reserve "
                               f"capital but no order carries a readable option_reserve")
             price = txn.open_price if txn.open_price is not None else fallback
@@ -4137,13 +4145,16 @@ class _OptionEntryAction(TradeAction):
         """
         cost = resolved.cost_per_contract
         extra_per_contract = 0.0
-        if getattr(resolved, "sizing_basis", None) == "premium":
+        if resolved.sizing_basis == "premium":
             # A DEBIT structure is sized by what it can LOSE, which is its debit only when the
             # debit is the worst case (``option_payoff.sizing_risk``, the one definition live
             # and backtest share). A call butterfly with a wider upper wing can lose more; a
             # balanced one sizes exactly as before.
             risk = _sizing_risk(resolved.payoff_legs, cost)
             if risk.state == _PAYOFF_UNBOUNDED:
+                logger.warning(
+                    f"{resolved.option_strategy} on {self.instrument_name} REFUSED: unbounded "
+                    f"loss, so there is no max loss to size a premium-sized entry by")
                 return self._result(
                     False, f"{resolved.option_strategy} on {self.instrument_name} has unbounded "
                            f"loss: refused (a premium-sized entry is sized by its max loss)")

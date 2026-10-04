@@ -57,7 +57,7 @@ import math
 import os
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
@@ -91,6 +91,12 @@ from .options_provider import HistoricalOptionsProvider
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class ComboSettlementRefused(RuntimeError):
+    """A defined-risk combo cannot be settled at expiry (its held legs have no payoff bounds).
+    The engine's per-expiry handler re-raises it (``_reraise_option_basis_refusal``): left to
+    that handler's log line the legs would be marked forever and the settle retried daily."""
 
 
 #: Child-leg statuses that mean the leg never became (or is no longer pending to become) part of
@@ -1163,17 +1169,34 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # through the SAME fallback chain a missing bar already uses (BS on the lot's prior
         # iv, then intrinsic, then entry), never a new default; counted and recorded.
         for gkey, entries in group_prints.items():
-            bad = self._inconsistent_prints(entries)
+            def _fallback(lot, _gb=group_bounds[gkey]):
+                p = self._bs_fallback_premium(lot)
+                if p is None:
+                    p = self._leg_intrinsic(lot.contract_symbol, _gb)
+                return lot.avg_price if p is None else p
+
+            # TWO PASSES. A convexity break blames the MIDDLE print; the monotone/width breaks
+            # that same print causes against its neighbours must not blame the neighbours too.
+            # So the middles are corrected first and the pair relations are re-validated on the
+            # corrected set; only breaks that REMAIN are then attributed (lower volume).
+            reasons = self._inconsistent_prints(entries, ("convexity",))
+            fixed = {lot.contract_symbol: _fallback(lot) for lot, _px, _bar in entries
+                     if lot.contract_symbol in reasons}
+            # The corrected legs are model values now, not market prints: they take no part in
+            # the re-validation (an intrinsic stand-in would itself "break" the width relation).
+            second = self._inconsistent_prints(
+                [e for e in entries if e[0].contract_symbol not in reasons], ("pair",))
+            for lot, _px, _bar in entries:
+                if lot.contract_symbol in second:
+                    reasons[lot.contract_symbol] = second[lot.contract_symbol]
+                    fixed[lot.contract_symbol] = _fallback(lot)
             for lot, px, bar in entries:
-                if lot.contract_symbol not in bad:
+                if lot.contract_symbol not in reasons:
                     self._update_lot_last_iv(lot, bar)
                     continue
-                new_px = self._bs_fallback_premium(lot)
-                if new_px is None:
-                    new_px = self._leg_intrinsic(lot.contract_symbol, group_bounds[gkey])
-                if new_px is None:
-                    new_px = lot.avg_price
-                self._count_print_correction(gkey, lot.contract_symbol, px, new_px, bad[lot.contract_symbol])
+                new_px = fixed[lot.contract_symbol]
+                self._count_print_correction(gkey, lot.contract_symbol, px, new_px,
+                                             reasons[lot.contract_symbol])
                 group_mtm[gkey] += lot.qty * (new_px - px) * lot.multiplier
 
         # Clamp each defined-risk group's net contribution to its no-arb range. (2b) The bound is
@@ -1230,7 +1253,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     #: off the European relations, and neither is a stale print.
     _PRINT_CONSISTENCY_TOL = 0.02
 
-    def _inconsistent_prints(self, entries: List[Any]) -> Dict[str, str]:
+    def _inconsistent_prints(self, entries: List[Any],
+                             kinds: Tuple[str, ...] = ("convexity", "pair")) -> Dict[str, str]:
         """Contracts of ONE group whose print breaks the no-arbitrage relations against their
         same-expiry, same-type siblings, as ``{contract_symbol: reason}``.
 
@@ -1258,14 +1282,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 continue
             legs.sort()
             is_call = right == OptionRight.CALL
-            for (k1, p1, v1, c1), (k2, p2, v2, c2) in zip(legs, legs[1:]):
+            for (k1, p1, v1, c1), (k2, p2, v2, c2) in (
+                    zip(legs, legs[1:]) if "pair" in kinds else ()):
                 diff = (p1 - p2) if is_call else (p2 - p1)        # must lie in [0, k2 - k1]
                 if diff < -tol or diff > (k2 - k1) + tol:
                     culprit = c1 if v1 < v2 or (v1 == v2) else c2
                     bad.setdefault(culprit, f"strike pair {k1:g}/{k2:g} breaks monotone/width "
                                             f"({p1:.2f} vs {p2:.2f})")
-            for (k1, p1, _v1, _c1), (k2, p2, _v2, c2), (k3, p3, _v3, _c3) in zip(
-                    legs, legs[1:], legs[2:]):
+            for (k1, p1, _v1, _c1), (k2, p2, _v2, c2), (k3, p3, _v3, _c3) in (
+                    zip(legs, legs[1:], legs[2:]) if "convexity" in kinds else ()):
                 w = (k3 - k2) / (k3 - k1)
                 if p2 > w * p1 + (1.0 - w) * p3 + tol:
                     bad.setdefault(c2, f"strikes {k1:g}/{k2:g}/{k3:g} break convexity "
@@ -6261,7 +6286,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # A defined-risk combo whose held legs cannot be expressed is REFUSED, not clamped
             # by a cruder rule: this clamp moves cash, and a wrong bound destroys it. (The mark
             # clamp falls back loudly instead, because a refusal there would abort every bar.)
-            raise RuntimeError(
+            raise ComboSettlementRefused(
                 f"cannot settle a defined-risk combo at expiry: its held legs have no payoff "
                 f"bounds ({type(e).__name__}: {e})") from e
         net_payoff = max(lo, min(net_payoff, hi))

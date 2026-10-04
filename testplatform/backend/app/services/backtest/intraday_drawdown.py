@@ -126,15 +126,23 @@ def estimate_worst_structure_pnl(
 ) -> Optional[float]:
     """Worst-case P&L (dollars, commission-inclusive) of a MULTI-LEG structure over ``bars_5m``.
 
-    Every leg is re-priced on the SAME underlying print -- each bar's Low and High -- with
-    Black-Scholes (the engine's pricer, the leg's entry iv, its remaining whole days at that
-    print, the run's risk-free rate), so GAMMA is in the estimate: a linear-delta sum reads a
+    Every leg is re-priced on the SAME underlying price -- over each session's [low, high]
+    range, on a grid of it -- with Black-Scholes (the engine's pricer, the leg's entry iv, its
+    remaining whole days AT ENTRY, the run's risk-free rate), so GAMMA is in the estimate: a linear-delta sum reads a
     near-delta-neutral short-premium structure (iron condor, strangle) as almost flat when a
     move to its short strike really costs hundreds of dollars. A leg's premium at a print is
     ``entry_premium + (model(print) - model(entry))`` floored at zero: anchoring on the entry
     fill cancels the model's bias, like the linear estimate's ``entry_premium + delta * dS``.
     Legs are SUMMED per print and the minimum over prints taken. Commission is charged once per
     leg. A bar may carry ``Date`` (its session); without one the entry date is used.
+
+    TIME IS FROZEN AT ENTRY (no theta). The question this layer answers is what an adverse
+    UNDERLYING move costs beyond the daily curve; the daily curve is built from the real
+    marks, which already carry the decay. Letting remaining days shrink along the window
+    charged a long structure's whole decay as an extra "dip" (genome B: -15.35% refined
+    against -13.85% daily, and -13.85% again with time frozen), and it is the same basis the
+    single-leg estimate has always used (delta x spot move, no theta). It errs against short
+    premium (which would gain decay), never in its favour.
 
     ``legs`` carry ``entry_premium``, ``iv``, ``size``, ``multiplier``, ``direction_sign``,
     ``strike``, ``right`` (``OptionRight``), ``expiry`` (``date``). Raises
@@ -144,22 +152,45 @@ def estimate_worst_structure_pnl(
     if not bars_5m:
         return None
     anchors = [_leg_value(leg, entry_underlying_price, entry_time, rate) for leg in legs]
-    worst: Optional[float] = None
+    # ONE SESSION AT A TIME. With time frozen at entry the structure's value is a function of
+    # the underlying price alone, and the underlying's path is continuous: over a session it passes through EVERY price in [low, high], not only
+    # the 5-minute prints. The worst point of that function over the session range is what is
+    # wanted, and it is found on a coarse grid of the range -- its two ends, ``_GRID_INTERIOR``
+    # equispaced interior points and every leg strike inside it (an interior extremum of a
+    # strike-kinked payoff sits near a strike) -- instead of pricing every print of every
+    # bar (~150 per session). Measured: the per-print form cost ~470 Black-Scholes calls per
+    # structure-day.
+    sessions: Dict[Any, List[float]] = {}
     for bar in bars_5m:
         when = bar.get("Date") or entry_time
+        day = when.date() if hasattr(when, "date") else when
         for px in (bar.get("Low"), bar.get("High")):
-            if px is None:
-                continue
+            if px is not None:
+                r = sessions.setdefault(day, [float(px), float(px), when])
+                r[0] = min(r[0], float(px))
+                r[1] = max(r[1], float(px))
+    worst: Optional[float] = None
+    for lo, hi, when in sessions.values():
+        prices = {lo, hi}
+        if hi > lo:
+            step = (hi - lo) / (_GRID_INTERIOR + 1)
+            prices.update(lo + step * i for i in range(1, _GRID_INTERIOR + 1))
+            prices.update(float(leg["strike"]) for leg in legs if lo < float(leg["strike"]) < hi)
+        for px in prices:
             total = 0.0
             for leg, anchor in zip(legs, anchors):
                 implied = max(leg["entry_premium"]
-                              + (_leg_value(leg, float(px), when, rate) - anchor), 0.0)
+                              + (_leg_value(leg, px, entry_time, rate) - anchor), 0.0)
                 total += ((implied - leg["entry_premium"]) * leg["size"] * leg["multiplier"]
                           * leg["direction_sign"])
             total -= commission_per_leg * len(legs)
             if worst is None or total < worst:
                 worst = total
     return worst
+
+
+#: Interior grid points per session range (see ``estimate_worst_structure_pnl``).
+_GRID_INTERIOR = 4
 
 
 def structure_max_loss(rows: List[Dict[str, Any]]):
@@ -292,6 +323,7 @@ def refine_max_drawdown(
     no_base = 0        # dips dropped because their denominator (the peak) was not positive
     structures = 0     # flagged MULTI-LEG structures (a subset of ``flagged``)
     no_iv = 0          # of the uncovered structures, those that lacked an iv / rate / price
+    no_exit = 0        # structures uncovered because a leg had no exit time
     staggered = 0      # structures priced over the all-legs-held window (legs exit apart)
     capped = 0         # structures whose estimate was bounded by their true max loss
     unbounded = 0      # structures with unbounded loss: no cap, summed-legs estimate only
@@ -365,7 +397,7 @@ def refine_max_drawdown(
         re-priced with Black-Scholes, summed per print, capped at the structure's true maximum
         loss. Never priced from a partial leg set: any leg without an iv, or a run with no iv /
         rate seam, leaves the WHOLE structure uncovered (counted)."""
-        nonlocal flagged, uncovered, structures, staggered, capped, no_iv
+        nonlocal flagged, uncovered, structures, staggered, capped, no_iv, no_exit
         nonlocal unbounded, unmeasurable
         # Flagged if ANY leg's exit flags it: the legs of one package normally exit together,
         # so they agree; "any" cannot hide a dip one of them shows.
@@ -384,6 +416,12 @@ def refine_max_drawdown(
         # The window in which ALL legs are held: entry until the FIRST leg exit. Legs that
         # exit apart are no longer the same structure afterwards.
         exits = [t.get("exit_time") for t in rows]
+        if any(x is None for x in exits):
+            # A leg with no exit time has no window to price: uncovered, with its own counter
+            # (``min`` over a None would raise and be filed under the generic ``errored``).
+            uncovered += 1
+            no_exit += 1
+            return
         exit_time = min(exits)
         if len(set(exits)) > 1:
             staggered += 1
@@ -476,7 +514,7 @@ def refine_max_drawdown(
             "flagged": flagged, "uncovered": uncovered, "errored": errored, "no_base": no_base,
             "structures": structures, "capped": capped, "unbounded": unbounded,
             "unmeasurable": unmeasurable, "staggered": staggered, "rolled": rolled,
-            "no_iv": no_iv})
+            "no_iv": no_iv, "no_exit": no_exit})
     if flagged or errored:
         pct = uncovered / flagged * 100.0 if flagged else 0.0
         # WARNING, not debug, past a third: the refinement moved from the entry day's own

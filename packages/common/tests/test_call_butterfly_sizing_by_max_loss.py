@@ -87,6 +87,22 @@ def test_the_loss_beyond_the_debit_is_refused_when_buying_power_cannot_cover_it(
     assert acct.submitted == []
 
 
+def test_an_unbounded_premium_sized_entry_is_refused_and_logged(monkeypatch):
+    import ba2_common.core.TradeActions as TA
+    a = TA.BuyCallAction.__new__(TA.BuyCallAction)
+    a.instrument_name = "AAPL"
+    a._result = lambda ok, msg, data=None: {"success": ok, "message": msg}
+    warned = []
+    monkeypatch.setattr(TA.logger, "warning", lambda m, *x, **k: warned.append(m))
+    resolved = SimpleNamespace(
+        cost_per_contract=100.0, sizing_basis="premium", option_strategy="ratio_x", legs=[],
+        limit_price=1.0, budget_refusal_message=None,
+        payoff_legs=[PayoffLeg("call", BUY, 10.0, 100.0, 1), PayoffLeg("call", SELL, 5.0, 110.0, 2)])
+    res = a._size_and_submit(resolved)
+    assert res["success"] is False and "unbounded" in res["message"]
+    assert warned and "unbounded" in warned[0]
+
+
 # --------------------------------------------------------------------------- the shared function
 def _c(k, side, prem, ratio=1):
     return PayoffLeg("call", side, prem, k, ratio)

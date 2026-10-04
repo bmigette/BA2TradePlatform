@@ -172,6 +172,26 @@ def test_settling_a_vertical_remainder_is_not_capped_at_the_old_width(unbalanced
     assert acct._cash - cash_before == pytest.approx(6_000.0)
 
 
+def test_a_refused_combo_settlement_ends_the_run_instead_of_being_logged(unbalanced_fly,
+                                                                         monkeypatch):
+    """The engine's per-expiry handler turns an exception into a log line. A refused settlement
+    left to it would mark the legs forever and retry daily, so it is re-raised."""
+    import app.services.backtest.backtest_account as bt
+    from app.services.backtest.daily_engine import DailyBacktestEngine
+
+    acct, ps = unbalanced_fly
+
+    def boom(legs):
+        raise ValueError("no payoff bounds")
+
+    monkeypatch.setattr(bt, "position_value_bounds", boom)
+    engine = DailyBacktestEngine.__new__(DailyBacktestEngine)
+    engine.account, engine.price, engine.config = acct, ps, CFG
+    ps.set_clock(_EXPIRY_BAR)
+    with pytest.raises(bt.ComboSettlementRefused):
+        engine._apply_option_expiry(_EXPIRY_BAR)
+
+
 def test_underivable_bounds_fall_back_loudly_and_are_recorded(unbalanced_fly, monkeypatch):
     import app.services.backtest.backtest_account as bt
 
@@ -232,6 +252,22 @@ def test_a_width_violation_blames_the_lower_volume_leg(tmp_path):
         acct._option_positions_mtm()
         ex = acct.option_integrity_stats()["option_mark_print_examples"]
         assert len(ex) >= 1 and all(_occ(110) in e for e in ex)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_a_bad_middle_print_does_not_also_blame_its_lower_volume_neighbour(tmp_path):
+    """110c prints 13.0 (high volume) against 100c 10.0 (LOW volume) and 120c 0.5. The 110 print
+    breaks convexity and, against the 100 call, the monotone relation too. Blaming by volume
+    for the pair would wrongly replace the clean 100 call as well; the middle is corrected
+    first and the pair is re-validated, so exactly ONE leg is corrected."""
+    ctx, acct, ps = _fly_with_late_prints(tmp_path, (10.0, 13.0, 0.5), vols=(5, 500, 500))
+    try:
+        ps.set_clock(_LATER_BAR)
+        acct._option_positions_mtm()
+        stats = acct.option_integrity_stats()
+        assert stats["option_mark_prints_corrected"] == 1
+        assert all(_occ(110) in e for e in stats["option_mark_print_examples"])
     finally:
         ctx.__exit__(None, None, None)
 

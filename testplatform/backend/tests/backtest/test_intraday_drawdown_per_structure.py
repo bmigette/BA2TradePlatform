@@ -257,6 +257,48 @@ def test_legs_that_exit_apart_are_priced_over_the_all_legs_held_window():
     assert refined < -0.5                                       # priced, not dropped
 
 
+def test_a_leg_without_an_exit_time_is_uncovered_with_its_own_counter():
+    fly = _fly()
+    fly[1]["exit_time"] = None
+    stats = {}
+    refined = _refine(fly, [{"Low": 95.0, "High": 140.0}], stats=stats)
+    assert refined == -0.5
+    assert stats["no_exit"] == 1 and stats["uncovered"] == 1 and stats["errored"] == 0
+
+
+def test_time_decay_is_not_charged_as_a_dip():
+    """A long straddle whose underlying sits exactly where it entered, ten days later, has
+    lost time value in a model that lets time run -- but that decay is already in the daily
+    marks the refinement sits on. Time is frozen at entry, so no extra dip appears."""
+    rows = [_row(100, "buy", 1, 4.0), _row(100, "buy", 1, 4.0, option_type="put")]
+    bars = [{"Date": datetime(2024, 4, 13), "Low": 100.0, "High": 100.0}]
+    refined = _refine(rows, bars, spot=100.0)
+    assert refined == -0.5
+
+
+def test_the_estimate_prices_a_session_range_not_every_print(monkeypatch):
+    """78 five-minute bars in one session cost a handful of Black-Scholes evaluations per leg
+    (ends + interior grid + strikes inside), not 156 per leg -- and the session's worst point
+    over the range is found: here an interior strike where a short-gamma structure is worst."""
+    import app.services.backtest.intraday_drawdown as mod
+    calls = []
+    real = mod._leg_value
+
+    def counting(leg, spot, when, rate):
+        calls.append(spot)
+        return real(leg, spot, when, rate)
+
+    monkeypatch.setattr(mod, "_leg_value", counting)
+    legs = _legs_of([_row(110, "sell", 1, 1.5), _row(90, "sell", 1, 1.5, option_type="put")],
+                    iv=0.25)
+    day = datetime(2024, 4, 3)
+    bars = [{"Date": day, "Low": 100.0 - 0.1 * (i % 10), "High": 100.0 + 0.1 * (i % 10) + (12 if i == 5 else 0)}
+            for i in range(78)]
+    worst = mod.estimate_worst_structure_pnl(legs, 100.0, day, bars, 0.0, RATE)
+    assert worst is not None and worst < 0
+    assert len(calls) <= 2 * (1 + 2 + 4 + 2)          # anchors + ends + interior + strikes, per leg
+
+
 def test_two_structures_are_independent_candidates():
     a, b = _fly(txn=1), _fly(txn=2)
     for r in b:

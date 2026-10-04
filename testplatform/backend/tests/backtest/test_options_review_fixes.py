@@ -158,7 +158,8 @@ def acct_asym_iron_condor(tmp_path):
         # mid-life move on the short call: group net = (0.2-0.5-8.0+3.1)*100 = -520, beyond
         # the -500 wing. The call prints are CONSISTENT with each other (8.0 - 3.1 <= the 5
         # gap), so this exercises the group CLAMP; an inconsistent outlier (110c at 0.3) is
-        # replaced by the cross-leg print check first -- see the sibling test below.
+        # replaced by the cross-leg print check first -- see
+        # ``test_butterfly_true_value_bounds.py::test_a_print_above_the_convexity_bound_is_replaced_through_the_fallback_chain``.
         _bar(_IC_LP, "2024-03-08", 0.2, "put", 90.0),
         _bar(_IC_SP, "2024-03-08", 0.5, "put", 95.0),
         _bar(_IC_SC, "2024-03-08", 8.0, "call", 105.0),

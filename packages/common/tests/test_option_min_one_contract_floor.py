@@ -23,7 +23,8 @@ from types import SimpleNamespace
 import pytest
 
 from ba2_common.core.TradeActions import BuyCallAction, create_action
-from ba2_common.core.types import ExpertActionType
+from ba2_common.core.option_payoff import PayoffLeg
+from ba2_common.core.types import ExpertActionType, OrderDirection
 
 from tests.test_option_assignment_capacity_wiring import (  # noqa: F401
     FakeAccount, _own_db, act, held_short_put,
@@ -67,6 +68,8 @@ def _sizer(*, balance=20_000.0, cap_pct=10.0, floor=None, sizing=5.0, committed=
 
 _TSM = SimpleNamespace(
     cost_per_contract=11.32 * 100.0, option_strategy="long_call", legs=[], limit_price=11.32,
+    sizing_basis="premium",
+    payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY, premium=11.32, strike=400.0)],
     budget_refusal_message="Insufficient budget to size long_call for TSM (premium=11.32)")
 
 
@@ -397,6 +400,25 @@ def test_a_waiting_debit_without_a_fill_is_measured_off_its_order_price():
     _order(txn, limit_price=3.0, status=OrderStatus_PENDING())
     committed, why = _measuring()._committed_to_underlying()
     assert why is None and committed == pytest.approx(300.0)
+
+
+def test_an_unbalanced_fly_counts_its_debit_plus_the_recorded_excess():
+    """A call fly whose worst loss exceeds its debit records only the EXCESS as its
+    ``option_reserve`` (the debit is already spent). The per-instrument commitment must count
+    debit + excess: 3 contracts, $2.00 debit, $5.00/share excess -> 600 + 1,500 = 2,100, not
+    the 1,500 the reserve alone gives. A balanced fly (no reserve) is still just its debit."""
+    from ba2_common.core.types import AssetClass
+
+    fly = _txn(quantity=3, open_price=2.0, asset_class=AssetClass.OPTION,
+               option_strategy="call_butterfly", multiplier=100)
+    _order(fly, data={"option_reserve": 5.0 * 100.0 * 3})
+    committed, why = _measuring()._committed_to_underlying()
+    assert why is None and committed == pytest.approx(2_100.0)
+
+    _txn(quantity=1, open_price=2.0, asset_class=AssetClass.OPTION,
+         option_strategy="call_butterfly", multiplier=100)          # balanced: no reserve
+    committed, _ = _measuring()._committed_to_underlying()
+    assert committed == pytest.approx(2_100.0 + 200.0)
 
 
 def test_the_room_check_refuses_a_second_floored_ticket_on_the_same_name():
