@@ -112,6 +112,7 @@ class FakeTastyBroker:
         self.single_fill_on_delete = False
         self.positions_fail = False
         self.history_fails = False
+        self.history_ignores_sort = False   # a server that ignores sort='Desc' (lists oldest first)
         self.history_ascending = False   # history lists oldest first unless sort='Desc' is passed (plain orders)
 
     # ------------------------------------------------------------- SDK surface
@@ -128,6 +129,7 @@ class FakeTastyBroker:
         members = []
         for new in order.orders:
             members.append(self._placed_from_new(new))
+            members[-1].complex_order_id = cid      # the legs show their complex order in the PLAIN history
         self.complex[cid] = {"id": cid, "members": members, "cancel_left": None,
                              "type": str(order.type.value)}
         errors = [SimpleNamespace(code="x", message=m) for m in self.place_errors]
@@ -250,8 +252,11 @@ class FakeTastyBroker:
     async def get_order_history(self, session, per_page=50, page_offset=0, **kw):
         if self.history_fails:
             raise TastytradeError("order history unavailable")
-        rows = [r["member"] for r in self.singles.values()]
-        if not (self.history_ascending and kw.get("sort") != "Desc"):
+        rows = [r["member"] for r in self.singles.values()] + \
+            [m for r in self.complex.values() for m in r["members"]]
+        rows.sort(key=lambda m: int(m.id))
+        ascending = self.history_ignores_sort or (self.history_ascending and kw.get("sort") != "Desc")
+        if not ascending:
             rows = rows[::-1]
         return rows[page_offset * per_page:(page_offset + 1) * per_page]
 

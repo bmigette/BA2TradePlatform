@@ -278,14 +278,7 @@ def effective_targets(raw: Optional[Iterable[Dict[str, Any]]], last_price: float
     """
     items = list(raw or [])
 
-    def taken_ratio(item: Dict[str, Any]) -> float:
-        """How much of the target is already TAKEN: 1 when marked filled, else the stored partial ratio."""
-        if item.get("filled"):
-            return 1.0
-        stored = item.get("taken")
-        return 0.0 if stored is None else min(1.0, max(0.0, float(stored)))
-
-    ratios = [taken_ratio(it) for it in items]
+    ratios = [target_taken(it) for it in items]
     filled = [i for i, r in enumerate(ratios) if r >= 1.0 - 1e-9]
     taken = sum(float(it["fraction"]) * r for it, r in zip(items, ratios))
     left = [i for i in range(len(items)) if i not in filled]
@@ -299,6 +292,14 @@ def effective_targets(raw: Optional[Iterable[Dict[str, Any]]], last_price: float
     usable_index = [i for i, t in zip(left, scaled) if (t.price, t.fraction) not in reached_keys]
     reached_index = [i for i, t in zip(left, scaled) if (t.price, t.fraction) in reached_keys]
     return EffectiveTargets(usable, usable_index, filled, reached_index)
+
+
+def target_taken(item: Dict[str, Any]) -> float:
+    """How much of a stored target is already TAKEN (0..1): 1 when marked filled, else its ``taken``."""
+    if item.get("filled"):
+        return 1.0
+    stored = item.get("taken")
+    return 0.0 if stored is None else min(1.0, max(0.0, float(stored)))
 
 
 def split_quantity(shares: int, fractions: Sequence[float]) -> List[int]:
@@ -361,6 +362,54 @@ def plan_slices(*, shares: int, targets: Sequence[TpTarget], sl_price: float,
         plans.append(SlicePlan(slice_index=len(plans), target_index=-1, quantity=runner_qty,
                                tp_price=None, sl_price=sl, kind=ORDER_KIND_STOP))
     return plans, notes
+
+
+def plan_add_only(*, total_shares: int, to_cover: int, targets: Sequence[TpTarget],
+                  target_ids: Sequence[int], existing_by_target: Dict[int, int], existing_runner: int,
+                  sl_price: float, last_price: float, tick_sizes: Optional[Sequence[Any]] = None
+                  ) -> List[SlicePlan]:
+    """Orders for ``to_cover`` shares that join a protection whose older orders still rest (growth, repair).
+
+    The plan is made for the WHOLE position (``total_shares``) and each order only fills the DEFICIT of its
+    target against what already rests there (``existing_by_target`` by original target id, and the stop-only
+    runner), so the per-target totals stay as close to the template as the shares allow instead of every
+    added share being split by the template again (which would pile extra take-profit shares on whatever
+    target is left). A deficit total above ``to_cover`` is scaled down by largest remainder; shares beyond
+    the deficits go to the stop-only runner, so the stop always covers everything. ``target_ids`` map the
+    positions in ``targets`` to the ids the slices carry (original target indices). Pure.
+    """
+    if to_cover < 1 or total_shares < 1:
+        return []
+    total_plan, _ = plan_slices(shares=total_shares, targets=targets, sl_price=sl_price,
+                                last_price=last_price, tick_sizes=tick_sizes)
+    if not total_plan:
+        return []
+    keyed = []
+    for plan in total_plan:
+        key = -1 if plan.kind == ORDER_KIND_STOP else int(target_ids[plan.target_index])
+        have = int(existing_runner) if key == -1 else int(existing_by_target.get(key, 0))
+        keyed.append((key, plan, max(0, plan.quantity - have)))
+    deficit_sum = sum(d for _, _, d in keyed)
+    sl = total_plan[0].sl_price
+    if deficit_sum > to_cover:
+        amounts = split_quantity(to_cover, [float(d) for _, _, d in keyed])
+    else:
+        amounts = [d for _, _, d in keyed]
+        extra = to_cover - deficit_sum
+        if extra:
+            runner_at = next((i for i, (k, _, _) in enumerate(keyed) if k == -1), None)
+            if runner_at is None:
+                keyed.append((-1, SlicePlan(slice_index=0, target_index=-1, quantity=0, tp_price=None,
+                                            sl_price=sl, kind=ORDER_KIND_STOP), 0))
+                amounts.append(extra)
+            else:
+                amounts[runner_at] += extra
+    out: List[SlicePlan] = []
+    for (key, plan, _), amount in zip(keyed, amounts):
+        if amount > 0:
+            out.append(SlicePlan(slice_index=len(out), target_index=key, quantity=int(amount),
+                                 tp_price=plan.tp_price, sl_price=plan.sl_price, kind=plan.kind))
+    return out
 
 
 def _plan_line(p: SlicePlan) -> str:

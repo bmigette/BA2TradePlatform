@@ -27,7 +27,7 @@ from ..logger import logger
 from .allocator_exclusion import reduce_symbol_weights
 from .allocator_protection import (
     AUTO_ACTION_MIN_INTERVAL_SECONDS, AUTO_FAILURE_LIMIT, UNKNOWN_MIN_AGE_SECONDS, CODE_SALE_SETTLING,
-    effective_targets, CODE_AUTO_STOPPED,
+    effective_targets, plan_add_only, target_taken, CODE_AUTO_STOPPED,
     CODE_CANCEL_UNCONFIRMED, CODE_FILL, CODE_LOST_CANCELLED, CODE_LOST_EXPIRED, CODE_LOST_REJECTED,
     CODE_PLACEMENT_REFUSED, CODE_QUANTITY_MISMATCH, CODE_RECONCILE_FETCH_FAILED, CODE_REPLACE_FAILED,
     CODE_REPLACE_STALE, CODE_UNKNOWN_STATE, FILL_SETTLE_SECONDS, GTC_RENEW_DAYS, KIND_SL, KIND_TP,
@@ -528,14 +528,23 @@ def _mark_target_filled(p: AllocatorProtection, s: AllocatorProtectionOrder,
         logger.warning(f"allocator TP/SL: {p.symbol}: the filled slice {s.slice_index + 1} matches no stored "
                        f"target (index {i}, tp {s.tp_price}); no target marked")
         return p
-    full = float(obs.filled_qty) >= float(s.quantity) - 1e-9
-    ratio = 1.0 if full else min(1.0, float(obs.filled_qty) / float(s.quantity))
-    previous = 0.0 if raw[i].get("taken") is None else float(raw[i]["taken"])
-    if raw[i].get("filled") or ratio <= previous + 1e-12:
+    if any(x.id != s.id and x.kind == ORDER_KIND_OCO and x.target_index == i and _is_resting(x)
+           for x in get_slices(p.id)):
+        # Another slice of this target still rests (a growth lot, or the older part): this fill is a LOT's,
+        # not the target's. Nothing is marked; the slice that still rests is planned again as it is.
         return p
-    raw[i]["taken"] = ratio
+    bases = raw[i].get("bases") or {}
+    base = float(bases[s.external_tag]) if s.external_tag in bases else 0.0
+    done = min(1.0, float(obs.filled_qty) / float(s.quantity))
+    taken = min(1.0, base + (1.0 - base) * done)           # of the target, however many placements it took
+    full = done >= 1.0 - 1e-9
+    previous = target_taken(raw[i])
+    if raw[i].get("filled") or taken <= previous + 1e-12:
+        return p
+    raw[i]["taken"] = taken
     if full:
         raw[i]["filled"] = True
+        raw[i]["taken"] = 1.0
     p.tp_targets = raw
     return _save(p)
 
@@ -616,7 +625,8 @@ def _resolve_unknown_slice(account, p: AllocatorProtection, s: AllocatorProtecti
         return True
     since = (_naive(s.placed_at) or _now()) - timedelta_seconds(600)
     try:
-        found = account.find_protective_orders_by_tag(s.external_tag, since=since.replace(tzinfo=timezone.utc))
+        found = account.find_protective_orders_by_tag(
+            s.external_tag, since=since.replace(tzinfo=timezone.utc), kind=s.kind)
     except Exception as e:  # noqa: BLE001
         logger.error(f"allocator TP/SL: could not search for tag {s.external_tag}: {e}", exc_info=True)
         return False
@@ -889,16 +899,33 @@ def _place_slices(account, p: AllocatorProtection) -> Tuple[AllocatorProtection,
         return _alert(p, CODE_PLACEMENT_REFUSED,
                       "protection not placed: " + " ".join(errors)), result
 
-    plans, notes = plan_slices(shares=to_cover, targets=targets, sl_price=p.sl_price,
-                               last_price=last, tick_sizes=ticks)
-    result.notes.extend(notes)
+    if covered > 0:
+        # Orders still rest for older shares (growth, repair): each new order fills its target's DEFICIT
+        # against the plan for the whole position (S1), so per-target totals stay near the template.
+        resting = [x for x in get_slices(p.id) if _is_resting(x)]
+        by_target: Dict[int, int] = {}
+        for x in resting:
+            if x.kind == ORDER_KIND_OCO and x.target_index >= 0:
+                by_target[x.target_index] = by_target.get(x.target_index, 0) + int(round(_remaining_qty(x)))
+        runner_have = sum(int(round(_remaining_qty(x))) for x in resting if x.kind == ORDER_KIND_STOP)
+        plans = plan_add_only(total_shares=whole_shares(qty), to_cover=to_cover, targets=targets,
+                              target_ids=eff.usable_index, existing_by_target=by_target,
+                              existing_runner=runner_have, sl_price=p.sl_price, last_price=last,
+                              tick_sizes=ticks)
+        origin = [plan.target_index for plan in plans]
+    else:
+        plans, notes = plan_slices(shares=to_cover, targets=targets, sl_price=p.sl_price,
+                                   last_price=last, tick_sizes=ticks)
+        result.notes.extend(notes)
+        origin = [(eff.usable_index[plan.target_index] if plan.target_index >= 0 else -1) for plan in plans]
+    placed_oco: List[Tuple[AllocatorProtectionOrder, int]] = []
     existing = len(get_slices(p.id))
-    for plan in plans:
+    for plan, target_id in zip(plans, origin):
         index = existing + plan.slice_index
         tag = f"ba2prot:{p.id}:{index}:{uuid.uuid4().hex[:8]}"   # unique: SQLite reuses deleted ids (N1)
         row = _save(AllocatorProtectionOrder(
             protection_id=p.id, slice_index=index,
-            target_index=(eff.usable_index[plan.target_index] if plan.target_index >= 0 else plan.target_index),
+            target_index=target_id,
             kind=plan.kind, quantity=plan.quantity, tp_price=plan.tp_price,
             sl_price=plan.sl_price, external_tag=tag, state=SLICE_PLACING, placed_at=_now()))
         try:
@@ -953,6 +980,8 @@ def _place_slices(account, p: AllocatorProtection) -> Tuple[AllocatorProtection,
         row.gtc_date_assumed = False
         row.placed_at = _now()
         _save(row)
+        if plan.kind != ORDER_KIND_STOP:
+            placed_oco.append((row, target_id))
         result.placed += 1
         result.shares_covered += plan.quantity
         if plan.kind == ORDER_KIND_STOP:
@@ -969,6 +998,16 @@ def _place_slices(account, p: AllocatorProtection) -> Tuple[AllocatorProtection,
                  quantity=plan.quantity, tp=plan.tp_price, sl=plan.sl_price)
 
     p = _reload(p.id)
+    if placed_oco:
+        # What the target had ALREADY given up when each slice was placed: the base its later fills add to.
+        raw = [dict(t) for t in (p.tp_targets or [])]
+        for row, idx in placed_oco:
+            if 0 <= idx < len(raw):
+                bases = dict(raw[idx].get("bases") or {})
+                bases[row.external_tag] = target_taken(raw[idx])
+                raw[idx]["bases"] = bases
+        p.tp_targets = raw
+        p = _save(p)
     if result.errors:
         p.last_error = " | ".join(result.errors)[:1000]
         p = _alert(p, CODE_PLACEMENT_REFUSED,
@@ -995,7 +1034,8 @@ class ActionResult:
 
 
 def save_protection(account, symbol: str, sl_price: float,
-                    targets: List[TpTarget]) -> ActionResult:
+                    targets: List[TpTarget], kept_filled: Optional[List[TpTarget]] = None,
+                    taken: Optional[List[Optional[float]]] = None) -> ActionResult:
     """Validate, store and PLACE a protection (the dialog's Save). Real orders on success.
 
     Refused (nothing written, nothing sent) on any validation error and while a rebalance
@@ -1022,6 +1062,9 @@ def save_protection(account, symbol: str, sl_price: float,
         ticks = _tick_sizes(account, symbol)
         errors = validate_protection(sl_price=sl_price, targets=targets, last_price=last,
                                      position_quantity=qty, tick_sizes=ticks)
+        kept = list(kept_filled or [])
+        if sum(t.fraction for t in targets) + sum(t.fraction for t in kept) > 1.0 + 1e-9:
+            errors.append("The take-profit shares, together with the targets already taken, exceed 100%.")
         if errors:
             return ActionResult(False, "The TP/SL is not valid.", errors=errors)
 
@@ -1029,7 +1072,13 @@ def save_protection(account, symbol: str, sl_price: float,
             p = _save(AllocatorProtection(account_id=account.id, symbol=symbol))
         p.enabled = True
         p.sl_price = float(sl_price)
-        p.tp_targets = [t.to_dict() for t in targets]
+        stored = [t.to_dict() for t in targets]
+        for entry, mark in zip(stored, list(taken or [])):
+            if mark is not None and mark > 0:
+                entry["taken"] = float(mark)             # a partly taken target stays partly taken
+        # Targets the operator left as TAKEN stay marked; leaving them out of ``kept_filled`` re-arms them.
+        stored += [dict(t.to_dict(), filled=True, taken=1.0) for t in kept]
+        p.tp_targets = stored
         p.last_error = None
         p.auto_failures = 0                  # an operator action re-arms the automatic paths
         p.expected_qty = None
@@ -1127,7 +1176,7 @@ def forget_unknown_slices(account, symbol: str) -> ActionResult:
             since = (_naive(s.placed_at) or _now()) - timedelta_seconds(600)
             try:
                 found = account.find_protective_orders_by_tag(
-                    s.external_tag, since=since.replace(tzinfo=timezone.utc))
+                    s.external_tag, since=since.replace(tzinfo=timezone.utc), kind=s.kind)
             except Exception as e:  # noqa: BLE001 -- the ONE case in which forgetting is allowed
                 logger.warning(f"allocator TP/SL: tag search for {s.external_tag} failed ({e}); forgetting allowed")
                 continue
@@ -1900,6 +1949,8 @@ def extend_after_buys(account, symbols: Iterable[str]) -> List[str]:
                 p = get_protection(account.id, symbol)
                 if p is None or not p.enabled or p.pending_replace or not _auto_allowed(p):
                     continue
+                if any(x.state in SLICE_ALARM_STATES and x.closed_at is None for x in get_slices(p.id)):
+                    continue          # an alarm keeps the protection suspended until Resize (as in the refresh)
                 if _working_order_symbols(account.id, [symbol]):
                     continue
                 try:
