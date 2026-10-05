@@ -14,6 +14,7 @@ from ...core.TransactionHelper import TransactionHelper
 from ...modules.accounts import providers
 from ...logger import logger
 from ..components import LiveTradesTable, LiveTradesTableConfig
+from ..components.secret_display import masked_json_view
 from ..components.LiveTradesTable import bracket_level_cell, related_order_rows, transaction_status_color
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.option_structure_chart import (
@@ -1970,7 +1971,7 @@ class LiveTradesTab:
                         
                         # Show all meta_data in JSON format
                         with ui.expansion('Raw Meta Data (JSON)', icon='code').classes('w-full mt-2'):
-                            ui.json_editor({'content': {'json': txn.meta_data}}).classes('w-full').props('read-only')
+                            masked_json_view(txn.meta_data)
 
                 # Related Orders
                 with ui.card().classes('w-full mb-4'):

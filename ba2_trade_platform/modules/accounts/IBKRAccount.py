@@ -376,7 +376,7 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
                           "description": "Read-only (refuse every order)",
                           "tooltip": "Recommended for the first runs. Also set Read-Only API in "
                                      "the Gateway/TWS API settings."},
-            "flex_token": {"type": "str", "required": False,
+            "flex_token": {"type": "str", "required": False, "secret": True,
                            "description": "Flex Web Service token (optional)",
                            "tooltip": "Only needed for dividend, cash-transfer and balance "
                                       "history, which the IBKR API does not provide."},

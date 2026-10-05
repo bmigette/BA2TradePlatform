@@ -445,8 +445,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             dict: Dictionary with setting names and their types.
         """
         return {
-            "api_key": {"type": 'str', "required": True, "description": "Alpaca API Key ID"},
-            "api_secret": {"type": 'str', "required": True, "description": "Alpaca API Secret Key"},
+            "api_key": {"type": 'str', "required": True, "secret": True, "description": "Alpaca API Key ID"},
+            "api_secret": {"type": 'str', "required": True, "secret": True, "description": "Alpaca API Secret Key"},
             "paper_account": {"type": 'bool', "required": True, "description": "Is this a paper trading account?"},
             "data_feed": {
                 "type": "str",

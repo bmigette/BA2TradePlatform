@@ -362,11 +362,13 @@ class TastyTradeAccount(AccountInterface):
             "client_secret": {
                 "type": "str",
                 "required": True,
+                "secret": True,
                 "description": "OAuth provider secret (mapped to provider_secret in SDK)"
             },
             "refresh_token": {
                 "type": "str",
                 "required": True,
+                "secret": True,
                 "description": "OAuth refresh token"
             },
             "account_id": {
