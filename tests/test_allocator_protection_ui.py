@@ -38,31 +38,58 @@ def _status(**over):
 
 def test_unsupported_broker_draws_nothing():
     f = view.row_fields(False, None)
-    assert f["prot_on"] is False and f["prot_label"] == "" and f["prot_tip"] == ""
+    assert f["prot_on"] is False and f["prot_tip"] == "" and "prot_label" not in f and "prot_note" not in f
 
 
-def test_off_symbol_shows_the_icon_with_no_chip_and_an_invitation():
+def test_off_symbol_shows_a_grey_shield_with_an_invitation_and_no_text():
     f = view.row_fields(True, _status(enabled=False, slice_states=[]))
-    assert f["prot_on"] and f["prot_label"] == "" and "Set TP/SL" in f["prot_tip"]
-    assert f["prot_code"] == ap.STATUS_OFF
+    assert f["prot_on"] and "Set TP/SL" in f["prot_tip"] and f["prot_color"] == "grey"
+    assert f["prot_code"] == ap.STATUS_OFF and "prot_label" not in f
 
 
-@pytest.mark.parametrize("status,label,hex_", [
-    (_status(), "TP/SL", view.STATUS_HEX["positive"]),
-    (_status(position_quantity=14.0), "TP/SL size mismatch", view.STATUS_HEX["warning"]),
-    (_status(slice_states=[]), "UNPROTECTED", view.STATUS_HEX["negative"]),
+@pytest.mark.parametrize("status,color", [
+    (_status(), "green"),
+    (_status(position_quantity=14.0), "amber"),
+    (_status(slice_states=[]), "red"),
+    (_status(pending_replace=True, slice_states=[]), "amber"),
+    (_status(enabled=False, slice_states=[]), "grey"),
+    (_status(position_quantity=0.0, slice_states=[]), "grey"),
 ])
-def test_status_chips(status, label, hex_):
+def test_the_shield_colour_per_status(status, color):
     f = view.row_fields(True, status)
-    assert f["prot_label"] == label and f["prot_hex"] == hex_
+    assert f["prot_color"] == color and f["prot_hex"] == view.ICON_COLORS[color]
 
 
-def test_the_fill_note_rides_on_the_row_and_in_the_tooltip():
+def test_every_status_code_has_a_shield_colour_and_a_tooltip():
+    codes = [ap.STATUS_OFF, ap.STATUS_NO_POSITION, ap.STATUS_PROTECTED, ap.STATUS_PARTIAL,
+             ap.STATUS_REPLACING, ap.STATUS_UNPROTECTED]
+    for code in codes:
+        assert view.protection_icon_color(code) in view.ICON_COLORS
+        assert view.protection_icon_color(code, failure_alert=True) == "red"
+    assert view.protection_icon_color("SOMETHING_NEW") == "grey"                    # total
+    assert set(view._STATUS_ICON) == set(codes)
+
+
+def test_a_failure_alert_turns_any_shield_red_but_a_warning_does_not():
+    ok = _status()
+    assert view.row_fields(True, ok, None, "PLACEMENT_REFUSED", "refused")["prot_color"] == "red"
+    assert view.row_fields(True, ok, None, ap.CODE_GTC_EXPIRING, "expires soon")["prot_color"] == "green"
+    assert view.row_fields(True, ok, None, None, None)["prot_color"] == "green"
+
+
+def test_the_tooltip_carries_counts_the_fill_note_and_the_alert():
+    status = _status(position_quantity=2.0, slice_states=[("LIVE", 1.0)])
+    f = view.row_fields(True, status, "TP1 filled 2026-10-03: share 6% -> 3%", "PLACEMENT_REFUSED",
+                        "1 share has no stop")
+    tip = f["prot_tip"]
+    assert "1 of 2 shares protected" in tip and "TP1 filled 2026-10-03: share 6% -> 3%" in tip
+    assert "1 share has no stop" in tip and tip.rstrip().endswith("Click to set, change or switch off")
+
+
+def test_the_fill_note_is_in_the_tooltip_not_beside_the_icon():
     s = _status(last_fill_note="TP1 filled 2026-10-03: share 6% -> 3%")
     f = view.row_fields(True, s, "TP1 filled 2026-10-03: share 6% -> 3%")
-    assert f["prot_note"] == "TP1 filled 2026-10-03: share 6% -> 3%"
-    assert "TP1 filled 2026-10-03: share 6% -> 3%" in f["prot_tip"]
-    assert view.row_fields(True, _status())["prot_note"] == ""
+    assert "TP1 filled 2026-10-03: share 6% -> 3%" in f["prot_tip"] and "prot_note" not in f
 
 
 def _p(symbol, **kw):
@@ -158,48 +185,48 @@ def _marked(client, marker):
     return [el for el in client.layout.descendants() if marker in getattr(el, '_markers', [])]
 
 
-def test_the_card_spec_and_the_table_agree_with_the_protect_column():
+def test_the_card_spec_and_the_table_agree_and_have_no_protect_or_exclude_column():
     names = [c['name'] for c in page.symbol_table_columns()]
-    assert page.PROTECT_COLUMN in names
+    assert 'protect' not in names and 'exclude' not in names
     rsp.check_card_columns(page.SYMBOL_CARD, names)
-    assert page.PROTECT_COLUMN not in [c['name'] for c in page.symbol_table_columns(include_protect=False)]
+    assert not hasattr(page, 'PROTECT_COLUMN') and not hasattr(page, 'EXCLUDE_COLUMN')
 
 
-def test_a_supporting_account_gets_the_column_the_slot_and_the_click_handler(nicegui_client):
+def test_a_supporting_account_gets_the_click_handler_and_the_icon_fields_but_no_cell(nicegui_client):
     table = _render(nicegui_client, _protection_payload())
-    assert 'body-cell-protect' in table.slots
-    assert page.PROTECT_COLUMN in [c['name'] for c in table.columns]
-    assert 'protectClick' in {k.split('.')[0] for k in (getattr(table, '_event_listeners', {}) and
-                                                          [l.type for l in table._event_listeners.values()])} \
-        or any(l.type == 'protectClick' for l in table._event_listeners.values())
+    assert 'body-cell-protect' not in table.slots and 'body-cell-exclude' not in table.slots
+    assert 'protect' not in [c['name'] for c in table.columns]
+    assert any(l.type == 'protectClick' for l in table._event_listeners.values())
     row = next(r for r in table.rows if r['symbol'] == 'ABC')
-    assert row['prot_on'] is True and 'prot_label' in row and 'prot_hex' in row and 'prot_tip' in row
+    assert row['prot_on'] is True and 'prot_hex' in row and 'prot_tip' in row and 'prot_label' not in row
 
 
-def test_a_broker_without_the_feature_gets_none_of_it(nicegui_client):
+def test_a_broker_without_the_feature_gets_no_shield(nicegui_client):
     for payload in (None, _protection_payload(supported=False)):
         table = _render(nicegui_client, payload)
-        assert 'body-cell-protect' not in table.slots
-        assert page.PROTECT_COLUMN not in [c['name'] for c in table.columns]
         assert all(r['prot_on'] is False for r in table.rows)
         assert not any(l.type == 'protectClick' for l in table._event_listeners.values())
 
 
-def test_the_phone_card_carries_the_control_in_its_header():
+def test_the_icons_live_in_the_symbol_cell_group_with_the_info_icon():
+    chips = page.SYMBOL_CHIPS_TEMPLATE
+    assert "$emit('protectClick', props.row.symbol)" in chips and "$emit('excludeToggle', props.row.symbol)" in chips
+    assert chips.index('icon="info"') < chips.index('icon="shield"') < chips.index('icon="visibility"')
+    assert chips.count('size="sm"') == 3 and 'pf-icons' in chips                       # all three the same size
     template = page.symbol_card_template()
-    assert "$emit('protectClick', props.row.symbol)" in template
-    head = template[:template.index('pf-sym-head')] + template[template.index('pf-sym-head'):template.index('</div>', template.index('pf-sym-head') + 600)]
-    assert 'props.row.prot_on' in template and 'props.row.prot_hex' in template
-    assert template.index('props.row.prot_on') < template.index('class="pf-tiles"')   # in the header, above the tiles
+    assert 'props.row.prot_on' in template and template.index('props.row.prot_on') < template.index('class="pf-tiles"')
 
 
-def test_the_control_is_a_plain_div_so_the_card_header_rule_does_not_drag_it():
-    assert 'class="row' not in page.PROTECT_TEMPLATE and 'class="pf-prot"' in page.PROTECT_TEMPLATE
+def test_there_is_no_text_beside_the_icons():
+    chips = page.SYMBOL_CHIPS_TEMPLATE
+    for field in ('prot_label', 'prot_note', 'excl_badge'):
+        assert field not in chips and field not in page.symbol_card_template()
 
 
-def test_the_row_colour_is_inline_hex_not_a_quasar_class():
-    assert ":style=\"{ color: props.row.prot_hex }\"" in page.PROTECT_TEMPLATE
-    assert 'text-negative' not in page.PROTECT_TEMPLATE
+def test_the_icon_colour_is_inline_hex_not_a_quasar_class():
+    assert ":style=\"{ color: props.row.prot_hex }\"" in page.SYMBOL_CHIPS_TEMPLATE
+    assert ":style=\"{ color: props.row.excl_hex }\"" in page.SYMBOL_CHIPS_TEMPLATE
+    assert 'text-negative' not in page.SYMBOL_CHIPS_TEMPLATE
 
 
 def test_protection_status_reaches_the_rows(nicegui_client):
@@ -208,8 +235,8 @@ def test_protection_status_reaches_the_rows(nicegui_client):
     live_slice = SimpleNamespace(state='LIVE', quantity=10, filled_qty=0.0, closed_at=None)
     table = _render(nicegui_client, _protection_payload({'ABC': (p, [live_slice])}))
     by = {r['symbol']: r for r in table.rows}
-    assert by['ABC']['prot_code'] == ap.STATUS_PROTECTED and by['ABC']['prot_label'] == 'TP/SL'
-    assert by['XYZ']['prot_code'] == ap.STATUS_OFF and by['XYZ']['prot_label'] == ''
+    assert by['ABC']['prot_code'] == ap.STATUS_PROTECTED and by['ABC']['prot_color'] == 'green'
+    assert by['XYZ']['prot_code'] == ap.STATUS_OFF and by['XYZ']['prot_color'] == 'grey'
 
 
 def test_an_unprotected_symbol_raises_the_red_banner(nicegui_client):
@@ -231,7 +258,7 @@ def test_a_filled_symbol_is_not_held_and_shows_its_note_on_the_row(nicegui_clien
     live_slice = SimpleNamespace(state='LIVE', quantity=10, filled_qty=0.0, closed_at=None)
     table = _render(nicegui_client, _protection_payload({'ABC': (p, [live_slice])}))
     row = next(r for r in table.rows if r['symbol'] == 'ABC')
-    assert row['prot_note'] == 'TP1 filled 2026-10-03: share 6% -> 3%' and row['prot_code'] == ap.STATUS_PROTECTED
+    assert 'TP1 filled 2026-10-03: share 6% -> 3%' in row['prot_tip'] and row['prot_code'] == ap.STATUS_PROTECTED
     assert _marked(nicegui_client, page.MARKER_PROTECT_ALERT) == []
     assert not hasattr(page, 'MARKER_PROTECT_HELD')
 
@@ -245,7 +272,7 @@ def test_no_banner_when_all_is_well(nicegui_client):
 
 def test_the_stylesheet_carries_the_protect_rules_and_the_static_file_is_current():
     css = page.page_phone_css()
-    assert '.pf-prot-chip' in css and '.pf-tp-row' in css and '.pf-prot-dialog' in css
+    assert '.pf-seg' in css and '.pf-tp-row' in css and '.pf-prot-dialog' in css and '.pf-icons' in css
     assert page.page_css_path().read_text(encoding='utf-8') == css
 
 

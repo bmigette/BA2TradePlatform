@@ -392,22 +392,24 @@ def test_labels_without_an_excluded_symbol_pass_through_untouched(monkeypatch, a
 
 def test_exclusion_fields_for_an_included_symbol():
     f = view.exclusion_fields(None)
-    assert f["excluded"] is False and f["excl_badge"] == "" and "Exclude from allocation" in f["excl_tip"]
+    assert f["excluded"] is False and "excl_badge" not in f
+    assert f["excl_tip"] == "Click to exclude from allocation" and f["excl_hex"] == view.INCLUDED_HEX
+    assert f["excl_icon"] == "visibility"
 
 
 def test_exclusion_fields_for_an_excluded_symbol_name_the_reason_and_the_way_back():
     from datetime import datetime
     f = view.exclusion_fields(SimpleNamespace(since=datetime(2026, 10, 3), note="bought manually"))
-    assert f["excluded"] and f["excl_badge"] == "Excluded: manual"
-    assert "since 2026-10-03" in f["excl_tip"] and "bought manually" in f["excl_tip"]
-    assert "Click to include it again" in f["excl_tip"]
+    assert f["excluded"] and "excl_badge" not in f and f["excl_hex"] == view.EXCLUDED_HEX      # orange eye, no text
+    assert f["excl_tip"].startswith("Excluded from allocation (manual) since 2026-10-03")
+    assert "bought manually" in f["excl_tip"] and f["excl_tip"].endswith("Click to include again.")
 
 
 def test_the_label_header_extras():
     assert view.label_extras_text(0.0, 0, 0.0) == ""
-    assert view.label_extras_text(1234.4, 1, 0.0) == "+$1,234 excluded"
+    assert view.label_extras_text(1234.4, 1, 0.0) == ""                      # excluded is the orange segment now
     assert view.label_extras_text(0.0, 0, 6.0) == "freed 6.00% from TP/SL fills"
-    assert view.label_extras_text(500.0, 2, 3.5) == "+$500 excluded | freed 3.50% from TP/SL fills"
+    assert view.label_extras_text(500.0, 2, 3.5) == "freed 3.50% from TP/SL fills"
 
 
 def test_the_effective_weight_note():
@@ -440,10 +442,10 @@ def _render(client, exclusions, freed=None, weights=None):
     return next(el for el in client.layout.descendants() if isinstance(el, ui.table))
 
 
-def test_every_broker_gets_the_exclude_column_the_slot_the_handler_and_the_grey_row_class(nicegui_client):
+def test_every_broker_gets_the_exclude_handler_and_the_grey_row_class_but_no_column(nicegui_client):
     table = _render(nicegui_client, {})
-    assert page.EXCLUDE_COLUMN in [c["name"] for c in table.columns]
-    assert "body-cell-exclude" in table.slots
+    assert "exclude" not in [c["name"] for c in table.columns]
+    assert "body-cell-exclude" not in table.slots
     assert any(l.type == "excludeToggle" for l in table._event_listeners.values())
     assert "table-row-class-fn" in " ".join(table._props)
     rsp = __import__("ba2_trade_platform.ui.utils.responsive", fromlist=["x"])
@@ -456,18 +458,24 @@ def test_an_excluded_row_carries_the_badge_the_flag_and_no_deltas(nicegui_client
                                                             since=datetime(2026, 10, 3), note=None)})
     rows = {r["symbol"]: r for r in table.rows}
     vst, abc = rows["VST"], rows["ABC"]
-    assert vst["excluded"] is True and vst["excl_badge"] == "Excluded: manual"
+    assert vst["excluded"] is True and "excl_badge" not in vst and vst["excl_hex"] == view.EXCLUDED_HEX
     assert vst["value_delta"] == "" and vst["qty_delta"] == "" and vst["share_delta"] == ""
     assert vst["quantity"] == 20.0 and vst["current_value"] == 2000.0          # information still shown
     assert abc["excluded"] is False and abc["eff_weight"] == "eff. 50.00%"
 
 
-def test_the_label_header_shows_the_excluded_value(nicegui_client):
+def test_the_label_header_has_no_excluded_text_but_an_orange_segment_with_the_value(nicegui_client):
     from datetime import datetime
+    from nicegui import ui
     _render(nicegui_client, {"VST": SimpleNamespace(excluded_reason="disabled",
                                                     since=datetime(2026, 10, 3), note=None)})
     texts = [getattr(el, "text", "") for el in nicegui_client.layout.descendants()]
-    assert "+$2,000 excluded" in texts
+    assert not any("excluded" in t and t.startswith("+$") for t in texts)
+    seg = [el for el in nicegui_client.layout.descendants()
+           if page.MARKER_SEGMENT_PREFIX + "excluded" in getattr(el, "_markers", [])]
+    assert len(seg) == 1 and seg[0].text == "1" and seg[0]._props.get("color") == "orange-8"
+    tips = [el._text for el in seg[0].descendants() if isinstance(el, ui.tooltip)]
+    assert tips == ["1 excluded: $2,000"]
 
 
 def test_the_label_header_shows_freed_share(nicegui_client):
@@ -479,7 +487,7 @@ def test_the_label_header_shows_freed_share(nicegui_client):
 def test_the_card_template_carries_the_toggle_the_badge_and_the_grey_class():
     template = page.symbol_card_template()
     assert "$emit('excludeToggle', props.row.symbol)" in template
-    assert "props.row.excl_badge" in template and "pf-sym-card--excl" in template
+    assert "props.row.excl_hex" in template and "excl_badge" not in template and "pf-sym-card--excl" in template
     assert "props.row.eff_weight" in template                       # the effective share under the box
 
 

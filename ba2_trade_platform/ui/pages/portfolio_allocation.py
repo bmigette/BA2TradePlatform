@@ -187,7 +187,7 @@ from ..utils.portfolio_allocation_view import (
     wipe_symbol_shares, working_orders_notice,
 )
 from ..utils import allocator_protection_view as protect_view
-from ..utils.allocator_protection_view import label_extras_text
+from ..utils.allocator_protection_view import label_badge_segments, label_extras_text
 from ..utils.portfolio_allocation_view import effective_symbol_weights
 from .allocator_protection_dialog import open_protection_dialog
 from .portfolio_allocation_wizard import (
@@ -2714,7 +2714,7 @@ def _symbol_fact_fields(facts) -> Dict[str, Any]:
 #: Shared by the desktop table's ``info`` cell and the phone card's header, so a
 #: change to the chips reaches both. Reads ``props.row`` only.
 SYMBOL_CHIPS_TEMPLATE = r'''
-            <div class="row items-center no-wrap justify-center" style="gap:6px">
+            <div class="row items-center no-wrap justify-center pf-icons" style="gap:4px">
                 <q-btn dense flat round size="sm" icon="info" color="grey-5"
                        @click="() => $parent.$emit('symbolInfo', props.row.symbol)">
                     <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
@@ -2753,56 +2753,28 @@ SYMBOL_CHIPS_TEMPLATE = r'''
                         {{ props.row.lev_tip }}
                     </q-tooltip>
                 </span>
-            </div>
-'''
-
-
-PROTECT_COLUMN = 'protect'
-MARKER_PROTECT_ALERT = 'pf-protect-alert'
-MARKER_PROTECT_CHECK = 'pf-protect-check'
-EXCLUDE_COLUMN = 'exclude'
-MARKER_EXCLUDE_TOGGLE = 'pf-exclude-toggle'
-MARKER_LABEL_EXTRAS = 'pf-label-extras'
-
-#: The Set TP/SL control of a symbol row, as one Vue fragment shared by the desktop cell and the
-#: phone card's header (the same trick as ``SYMBOL_CHIPS_TEMPLATE``). Reads ``props.row`` only and
-#: draws NOTHING when ``prot_on`` is false (a broker that cannot do it). A plain ``div`` and not a
-#: ``.row``: the card header's ``> .row`` rule right-aligns the broker chips and would drag this
-#: with it. The colour is inline hex (``prot_hex``), decided in Python.
-PROTECT_TEMPLATE = r'''
-            <div v-if="props.row.prot_on" class="pf-prot" style="display:flex;align-items:center;gap:4px;justify-content:center">
-                <q-btn dense flat round size="sm" icon="shield"
-                       :style="{ color: props.row.prot_hex }"
+                <!-- THE TP/SL SHIELD and the EXCLUDE EYE: icons only, the same size as the (i). The colour
+                     and the tooltip carry the whole status; there is no text and no column of their own. -->
+                <q-btn v-if="props.row.prot_on" dense flat round size="sm" icon="shield"
+                       class="pf-prot-icon" :style="{ color: props.row.prot_hex }"
                        @click="() => $parent.$emit('protectClick', props.row.symbol)">
-                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
-                        <div class="text-weight-bold">{{ props.row.symbol }}: TP/SL</div>
-                        <div>{{ props.row.prot_tip }}</div>
-                        <div style="margin-top:4px">Click to set, change or switch off</div>
-                    </q-tooltip>
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem;white-space:pre-line">{{ props.row.prot_tip }}</q-tooltip>
                 </q-btn>
-                <span v-if="props.row.prot_label" class="text-caption text-weight-bold pf-prot-chip"
-                      :style="{ color: props.row.prot_hex }">{{ props.row.prot_label }}</span>
-                <span v-if="props.row.prot_note" class="text-caption pf-prot-note"
-                      style="color:#94a3b8">{{ props.row.prot_note }}</span>
-            </div>
-'''
-
-
-#: The exclude toggle of a symbol row (an eye) and its 'Excluded: manual' badge, as one Vue fragment
-#: shared by the desktop cell and the phone card's header. Always drawn (every broker). The toggle
-#: emits ``excludeToggle`` with the row's own symbol.
-EXCLUDE_TEMPLATE = r'''
-            <div class="pf-excl" style="display:flex;align-items:center;gap:4px;justify-content:center">
-                <q-btn dense flat round size="sm" :icon="props.row.excl_icon"
-                       :style="{ color: props.row.excluded ? '#fbbf24' : '#94a3b8' }"
+                <q-btn dense flat round size="sm" icon="visibility" class="pf-excl-icon"
+                       :style="{ color: props.row.excl_hex }"
                        @click="() => $parent.$emit('excludeToggle', props.row.symbol)">
                     <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">{{ props.row.excl_tip }}</q-tooltip>
                 </q-btn>
-                <span v-if="props.row.excl_badge" class="text-caption text-weight-bold pf-excl-chip"
-                      style="color:#fbbf24">{{ props.row.excl_badge }}</span>
             </div>
 '''
 
+
+MARKER_PROTECT_ALERT = 'pf-protect-alert'
+MARKER_PROTECT_CHECK = 'pf-protect-check'
+MARKER_EXCLUDE_TOGGLE = 'pf-exclude-toggle'
+MARKER_LABEL_EXTRAS = 'pf-label-extras'
+MARKER_LABEL_SEGMENTS = 'pf-label-segments'
+MARKER_SEGMENT_PREFIX = 'pf-label-seg-'
 
 #: WHAT EACH SYMBOL-TABLE COLUMN BECOMES ON A PHONE (``<= 639px``), in reading order.
 #:
@@ -2825,8 +2797,6 @@ SYMBOL_CARD = (
     CardColumn('flag', '', TIER_HEAD),
     CardColumn('symbol', 'Symbol', TIER_HEAD),
     CardColumn('info', '', TIER_HEAD),
-    CardColumn(PROTECT_COLUMN, 'TP/SL', TIER_HEAD),
-    CardColumn(EXCLUDE_COLUMN, '', TIER_HEAD),
     CardColumn('weight_pct', 'Share of label %', TIER_WIDE),
     CardColumn('current_value', 'Current value', TIER_PRIMARY),
     CardColumn('quantity', 'Qty', TIER_PRIMARY),
@@ -2993,7 +2963,7 @@ def symbol_card_template(card_columns=SYMBOL_CARD) -> str:
         '<span v-if="props.row.flag" :title="\'Also in: \' + props.row.labels" '
         'style="color:#f6ad55;font-weight:600">{{ props.row.flag }}</span>'
         '<span class="pf-sym-name">{{ props.row.symbol }}</span>'
-        + SYMBOL_CHIPS_TEMPLATE + PROTECT_TEMPLATE + EXCLUDE_TEMPLATE +
+        + SYMBOL_CHIPS_TEMPLATE +
         '</div>' + ''.join(parts) + '</div></div>')
 
 
@@ -3070,9 +3040,9 @@ SYMBOL_CARD_CSS = r"""
     .pf-sym-head { display: flex; align-items: center; gap: 8px; padding-bottom: 8px;
         margin-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.10); }
     .pf-sym-name { font-size: 1.2rem; font-weight: 700; line-height: 1.1; }
-    .pf-sym-head > .row { margin-left: auto; flex-wrap: wrap !important;
-        justify-content: flex-end !important; gap: 6px !important; }
-    .pf-sym-head .q-btn { min-width: 40px; min-height: 40px; }
+    .pf-sym-head > .row { margin-left: auto; flex-wrap: nowrap !important;
+        justify-content: flex-end !important; gap: 2px !important; }
+    .pf-sym-head .q-btn { min-width: 32px; min-height: 32px; }
     .pf-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 8px; margin: 10px 0; }
     .pf-tile { display: flex; flex-direction: column; min-width: 0; min-height: 4rem;
@@ -3100,18 +3070,15 @@ SYMBOL_CARD_CSS = r"""
 """
 
 PROTECT_CSS = r"""
-    /* THE SET TP/SL CONTROL: a shield button and a status chip. The chip never wraps. */
-    .pf-prot-chip { white-space: nowrap; line-height: 1.2; }
-    .pf-sym-head > .pf-prot { margin-left: 6px; }
-    .pf-sym-head > .pf-excl { margin-left: 6px; }
-    .pf-prot-note { white-space: nowrap; font-size: 0.7rem; }
-    .pf-excl-chip { white-space: nowrap; }
-    /* AN EXCLUDED ROW is greyed (it is outside the managed money); its toggle stays readable. */
+    /* THE TP/SL SHIELD AND THE EXCLUDE EYE sit in the symbol cell's icon group, the size of the (i). */
+    .pf-icons .q-btn { min-width: 0; }
+    /* THE LABEL HEADER'S COUNT PILL: total | profitable | losing | excluded, touching segments. */
+    .pf-seg { border-radius: 10px; overflow: hidden; gap: 1px !important; }
+    .pf-seg .pf-seg-part { border-radius: 0; padding: 2px 7px; font-weight: 700; }
+    /* AN EXCLUDED ROW is greyed (it is outside the managed money); its icon group stays readable. */
     .pf-row-excluded td { opacity: 0.55; }
-    .pf-row-excluded td:has(.pf-excl) { opacity: 1; }
+    .pf-row-excluded td:has(.pf-icons) { opacity: 1; }
     .pf-sym-card--excl .pf-tiles, .pf-sym-card--excl .pf-field { opacity: 0.55; }
-    /* the dialog's take-profit rows: price + share + delete stay on one line on a desktop */
-    .pf-tp-row .q-field { min-width: 0; }
 """
 
 PROTECT_PHONE_CSS = phone_media("""
@@ -3121,7 +3088,6 @@ PROTECT_PHONE_CSS = phone_media("""
     .pf-tp-row.pf-tp-row > .flex-grow { flex: 1 1 100% !important; }
     .pf-tp-row.pf-tp-row > .w-32 { flex: 1 1 auto !important; width: auto !important; }
     .pf-prot-dialog .q-field__control { min-height: 44px; }
-    .pf-sym-head > .pf-prot { margin-left: auto; }
     .pf-bar-row > .pf-b-excl { order: 3; }
 """)
 
@@ -3193,7 +3159,7 @@ def _phone_tables() -> PhoneTableRegistry:
     return registry
 
 
-def symbol_table_columns(include_protect: bool = True) -> List[Dict[str, Any]]:
+def symbol_table_columns() -> List[Dict[str, Any]]:
     """The symbol table's column definitions. ONE list, read by the table and by
     the phone card spec check (``SYMBOL_CARD``)."""
     # The LABELS column is gone. Every row inside a label's own section repeated the
@@ -3209,11 +3175,6 @@ def symbol_table_columns(include_protect: bool = True) -> List[Dict[str, Any]]:
         # eleven columns. ``field`` is required by Quasar and is never printed --
         # the slot below draws a button over it.
         {'name': 'info', 'label': '', 'field': 'symbol', 'align': 'center'},
-        # The allocator's TP/SL control: a shield button + the protection status chip. Dropped
-        # at render time (``include_protect``) on a broker that cannot do it.
-        {'name': PROTECT_COLUMN, 'label': 'TP/SL', 'field': 'prot_label', 'align': 'center'},
-        # The operator's manual disable: an eye toggle + the 'Excluded: manual' badge.
-        {'name': EXCLUDE_COLUMN, 'label': '', 'field': 'excl_badge', 'align': 'center'},
         {'name': 'current_value', 'label': 'Current value', 'field': 'current_value', 'sortable': True, 'align': 'right'},
         # THE HELD SHARES, beside the held money they are the other half of. This
         # column already existed, out past ``Target value`` and wearing the buy/sell
@@ -3260,8 +3221,6 @@ def symbol_table_columns(include_protect: bool = True) -> List[Dict[str, Any]]:
         {'name': 'pnl', 'label': 'P&L', 'field': 'pnl', 'align': 'right'},
         {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left'},
     ]
-    if not include_protect:
-        columns = [c for c in columns if c['name'] != PROTECT_COLUMN]
     return columns
 
 
@@ -3412,10 +3371,12 @@ def _protection_fields(protection: Dict[str, Any], symbol: str, quantity: float)
     if entry is None:
         status = protect_svc.status_for(None, quantity)
         note = None
+        alert = (None, None)
     else:
         status = protect_svc.status_for(entry[0], quantity, entry[1])
         note = entry[0].last_fill_note
-    return protect_view.row_fields(True, status, note)
+        alert = (entry[0].alert_code, entry[0].alert_message)
+    return protect_view.row_fields(True, status, note, alert[0], alert[1])
 
 
 def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
@@ -3540,7 +3501,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     for row in rows:
         _write_row_deltas(row)
 
-    columns = symbol_table_columns(include_protect=live['protection']['supported'])
+    columns = symbol_table_columns()
 
     table = ui.table(columns=columns, rows=rows, row_key='symbol',
                      selection='multiple').classes('w-full dark-pagination')
@@ -3597,25 +3558,14 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         </q-td>
     ''')
     table.on('symbolInfo', lambda e: _open_symbol_info([emitted_value(e)]))
-    # THE TP/SL CONTROL. Like ``symbolInfo`` the row's own symbol travels with the click. A
-    # broker that cannot do it has no column (``include_protect``), so the cell and the handler
-    # are only attached when it is there.
-    table.add_slot('body-cell-exclude', r'''
-        <q-td :props="props">
-            ''' + EXCLUDE_TEMPLATE + r'''
-        </q-td>
-    ''')
+    # THE TP/SL SHIELD AND THE EXCLUDE EYE live in the ``info`` cell beside the (i) (``SYMBOL_CHIPS_TEMPLATE``):
+    # icons only, so they cost no column. Like ``symbolInfo`` the row's own symbol travels with the click.
     table.on('excludeToggle',
              lambda e: _open_exclusion_dialog(account_id, str(emitted_value(e)),
                                               live['exclusions'], refresh))
     # An excluded row is greyed (Quasar's ``table-row-class-fn``); its toggle stays readable.
     table.props(':table-row-class-fn="(row) => row.excluded ? \'pf-row-excluded\' : \'\'"')
     if live['protection']['supported']:
-        table.add_slot('body-cell-protect', r'''
-            <q-td :props="props">
-                ''' + PROTECT_TEMPLATE + r'''
-            </q-td>
-        ''')
         table.on('protectClick',
                  lambda e: open_protection_dialog(account_id, str(emitted_value(e)), refresh))
     # THE DELTA IS THE INPUT'S ``hint``, not a sibling div. A sibling right-aligns to
@@ -3969,22 +3919,32 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # because an orange 0 beside a healthy label is noise; this one is not a
             # warning, and "this label has nothing in it" is the single state of the
             # count most worth seeing without opening the fold.
-            count_badge = ui.badge(str(len(view.rows))).props('color=grey-7') \
-                .classes('shrink-0 pf-b-count').mark(MARKER_LABEL_COUNT_BADGE)
-            with count_badge:
-                ui.tooltip(SYMBOL_COUNT_BADGE_TOOLTIP_FMT.format(
-                    count=len(view.rows), label=view.label))
+            # ONE segmented pill of symbol counts: grey = total, green = profitable, red = losing, orange =
+            # excluded (zero segments are omitted except the total). Replaces the grey count badge and the
+            # '+$X excluded' text. Static, like the count it replaces: membership changes reload the page.
+            segments = label_badge_segments(view.rows, view.excluded_value)
+            legend = '\n'.join(seg['tooltip'] for seg in segments[1:])
+            with ui.row().classes('items-center no-wrap gap-0 shrink-0 pf-b-count pf-seg') \
+                    .mark(MARKER_LABEL_SEGMENTS):
+                count_badge = ui.badge(str(len(view.rows))).props('color=grey-7') \
+                    .classes('pf-seg-part').mark(MARKER_LABEL_COUNT_BADGE)
+                with count_badge:
+                    ui.tooltip(SYMBOL_COUNT_BADGE_TOOLTIP_FMT.format(
+                        count=len(view.rows), label=view.label)
+                        + ('\n' + legend if legend else '')).style('white-space:pre-line')
+                for seg in segments[1:]:
+                    part = ui.badge(str(seg['count'])).props(f"color={seg['color']}") \
+                        .classes('pf-seg-part').mark(MARKER_SEGMENT_PREFIX + seg['key'])
+                    with part:
+                        ui.tooltip(seg['tooltip'])
             widgets['count_badge'] = count_badge
-            # '+$X excluded' (the operator's manual disables are OUTSIDE this label's value) and
             # 'freed Y% from TP/SL fills' (a share a protective fill released and left unallocated).
             extras = label_extras_text(view.excluded_value, view.excluded_count, view.freed_pct)
             if extras:
                 excl_label = ui.label(extras).classes('text-xs shrink-0 pf-b-excl').style('color:#fbbf24') \
                     .mark(MARKER_LABEL_EXTRAS)
                 with excl_label:
-                    ui.tooltip('Excluded symbols are outside this label: not traded, not in its value, '
-                               'their share ignored. A freed share (TP/SL fills) stays unallocated until '
-                               'you reassign it.')
+                    ui.tooltip('A share a TP/SL fill released stays unallocated until you reassign it.')
             widgets['value'] = ui.label('').classes('w-28 text-right pf-b-value')
             # THE bar component, shared with the per-label symbol-share total and
             # the unallocated row so the three read as one visual language.
