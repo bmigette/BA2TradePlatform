@@ -12,7 +12,7 @@ operator's manual 'disable' of a symbol for allocation) and ``allocator_weight_c
 audit trail of the automatic weight reductions a protective fill makes).
 
 IDEMPOTENT ON PURPOSE, the same pattern as f1c8a24b7e05: ``main.initialize_system`` imports the
-in-tree models BEFORE ``init_db()``, so ``create_all`` materialises both tables on any database
+in-tree models BEFORE ``init_db()``, so ``create_all`` materialises all four tables on any database
 the first time the app starts on this branch -- outside alembic. An unguarded ``create_table``
 would then die with "table already exists" and the revision could never be applied. Every create
 is therefore guarded by ``has_table`` / ``has_index``; if create_all already built them,
@@ -22,7 +22,7 @@ Index names are the ones SQLAlchemy itself emits for these models (``ix_<table>_
 create_all and this revision agree. Foreign keys are declarative (the live DB runs with
 PRAGMA foreign_keys = 0).
 
-Nothing here touches an existing row. Downgrade drops the two tables (and with them every
+Nothing here touches an existing row. Downgrade drops the four tables (and with them every
 protection configuration -- they are NOT recoverable; orders already placed at the broker are
 not cancelled by a downgrade, so cancel them on the broker first).
 """
@@ -66,6 +66,10 @@ def upgrade() -> None:
             sa.Column('pending_replace', sa.Boolean(), nullable=False),
             sa.Column('pending_replace_since', sa.DateTime(), nullable=True),
             sa.Column('last_fill_at', sa.DateTime(), nullable=True),
+            sa.Column('auto_failures', sa.Integer(), nullable=False),
+            sa.Column('last_auto_action_at', sa.DateTime(), nullable=True),
+            sa.Column('disarmed_at', sa.DateTime(), nullable=True),
+            sa.Column('disarmed_note', sa.String(), nullable=True),
             sa.Column('last_fill_note', sa.String(), nullable=True),
             sa.Column('alert_code', sa.String(), nullable=True),
             sa.Column('alert_message', sa.String(), nullable=True),

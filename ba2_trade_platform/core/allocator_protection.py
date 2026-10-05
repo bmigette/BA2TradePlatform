@@ -20,11 +20,19 @@ from .allocator_protection_models import (
     SLICE_LOST_REJECTED, SLICE_PLACING, SLICE_RESTING_STATES, SLICE_UNKNOWN,
 )
 
-#: The GTC lifetime ASSUMED when the broker returns no ``gtc_date``. NOT verified against
-#: TastyTrade documentation (nothing local states it); it only ever produces an early WARNING.
-ASSUMED_GTC_LIFETIME_DAYS = 90
+#: A broker that returns NO ``gtc_date`` is never renewed and never warned about (operator, 2026-10-05):
+#: the date is stored as NULL, not guessed.
 #: Days before the stored GTC end date at which the expiry warning fires.
 GTC_EXPIRY_WARN_DAYS = 7
+#: A slice whose BROKER-REPORTED gtc_date is this close is cancelled (confirmed) and re-placed with the
+#: same prices by the account refresh; one symbol per refresh cycle.
+GTC_RENEW_DAYS = 7
+#: After a protective fill the broker's position read may lag; automatic growth/resize/disarm wait this long.
+FILL_SETTLE_SECONDS = 300
+#: Consecutive failed AUTOMATIC placements after which the background paths stop retrying (loud alert).
+AUTO_FAILURE_LIMIT = 3
+#: Minimum gap between two automatic cancel/re-place actions on one symbol.
+AUTO_ACTION_MIN_INTERVAL_SECONDS = 600
 #: A PLACING row older than this is an alarm: the broker call never reported back.
 PLACING_STALE_SECONDS = 60
 #: A ``pending_replace`` older than this is an alarm: the re-placement is stuck.
@@ -52,6 +60,10 @@ CODE_QUANTITY_MISMATCH = "QUANTITY_MISMATCH"
 CODE_RECONCILE_FETCH_FAILED = "RECONCILE_FETCH_FAILED"
 CODE_GTC_EXPIRING = "GTC_EXPIRING"
 CODE_FILL = "FILL"
+CODE_REPLACE_STALE = "REPLACE_STALE"
+CODE_AUTO_STOPPED = "AUTO_STOPPED"
+#: Alert codes that are WARNINGS: a failure-class alert is never overwritten by one of these.
+WARNING_CODES = frozenset({CODE_GTC_EXPIRING, CODE_RECONCILE_FETCH_FAILED})
 
 
 # =========================================================================================
@@ -545,7 +557,7 @@ def _as_utc_naive(value: Optional[DateTime]) -> Optional[DateTime]:
     return value.replace(tzinfo=None) if value.tzinfo is not None else value
 
 
-def protection_status(*, enabled: bool, pending_replace: bool,
+def protection_status(*, enabled: bool, pending_replace: bool, disarmed_note: Optional[str] = None,
                       pending_replace_since: Optional[DateTime],
                       slice_states: Sequence[Tuple[str, float]], position_quantity: Optional[float],
                       alert_message: Optional[str] = None, last_fill_note: Optional[str] = None,
@@ -565,8 +577,9 @@ def protection_status(*, enabled: bool, pending_replace: bool,
     tail = f" Last fill: {last_fill_note}." if last_fill_note else ""
 
     if not enabled:
+        gone = f" Disarmed after the position was exited (was: {disarmed_note}); set TP/SL again on re-entry." if disarmed_note else ""
         return ProtectionStatus(STATUS_OFF, "Set TP/SL", _COLORS[STATUS_OFF],
-                                "TP/SL protection is off for this symbol." + tail)
+                                "TP/SL protection is off for this symbol." + gone + tail)
 
     n_whole = None if position_quantity is None else whole_shares(position_quantity)
     if position_quantity is None:
@@ -629,6 +642,20 @@ def gtc_expiry_due(gtc_date: Optional[DateTime], *, today: Optional[Date] = None
 # =========================================================================================
 # broker-call result types (shared by the account adapter and the service)
 # =========================================================================================
+
+class PlacementOutcomeUnknown(Exception):
+    """The LIVE placement call raised AFTER it may have reached the broker (a timeout, a dropped
+    connection) or the order was accepted but could not be read back. The order MAY be resting.
+    Never a refusal: the service records the slice UNKNOWN with every id it knows and the tag, and
+    resolves it by finding the tag at the broker (adopt or cancel). ``broker_id`` is the complex-order
+    id (OCO) or the order id (stop-only) when the broker had already named one."""
+
+    def __init__(self, message: str, *, tag: str, kind: str, broker_id: Optional[int] = None):
+        super().__init__(message)
+        self.tag = tag
+        self.kind = kind
+        self.broker_id = broker_id
+
 
 class ProtectionRefused(Exception):
     """The broker (or a pre-check) refused to place a protective order. Never swallowed: the

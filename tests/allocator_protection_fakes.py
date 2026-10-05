@@ -33,6 +33,21 @@ from ba2_trade_platform.core.types import OrderDirection
 from ba2_trade_platform.modules.accounts.TastyTradeAccount import TastyTradeAccount
 
 BROKER_ASSUMPTIONS = (
+    "A1: TastyTrade refuses a SELL_TO_CLOSE larger than the shares held, including when a resting "
+    "stop triggers on a position that has since become smaller.",
+    "A2: resting closing orders RESERVE shares: a new closing order for shares an older one reserves "
+    "is refused (or, if accepted, over-reserves).",
+    "A3: an OCO counts its quantity ONCE (q, not 2q) against the held shares; otherwise an OCO above "
+    "half the position fails its dry run.",
+    "A4: after a PARTIAL fill of one OCO leg the partner leg stays live for the remainder (it is not "
+    "cancelled and not reduced).",
+    "A5: a timeout/connection error AFTER the broker accepted a placement leaves the order resting "
+    "(the call raised, the order exists) -- resolved by finding the tag.",
+    "A6: get_order / get_complex_order work for a GTC order placed on an EARLIER day.",
+    "A7: the position read can LAG a fill by seconds to minutes.",
+    "A8: external_identifier accepts the 'ba2prot:<id>:<n>' format and length.",
+    "A9: GTC stops outside regular hours report one of Received / Live / Contingent / Routed (the "
+    "classifier treats all of them as resting).",
     "When one OCO member fills, the partner is reported 'Cancelled' (the classifier does not "
     "depend on it: any fill wins).",
     "An expired GTC order is reported with status 'Expired' on its members.",
@@ -93,6 +108,7 @@ class FakeTastyBroker:
         self.single_raise_on_read: Optional[Exception] = None
         self.single_fill_on_delete = False
         self.positions_fail = False
+        self.history_fails = False
 
     # ------------------------------------------------------------- SDK surface
     async def place_complex_order(self, session, order: NewComplexOrder, dry_run: bool = True):
@@ -201,6 +217,22 @@ class FakeTastyBroker:
             return
         member.status = TTOrderStatus.CANCEL_REQUESTED
         record["cancel_left"] = self.cancel_polls
+
+    async def get_live_orders(self, session):
+        if self.history_fails:
+            raise TastytradeError("order list unavailable")
+        return [r["member"] for r in self.singles.values()
+                if r["member"].status in (TTOrderStatus.LIVE, TTOrderStatus.RECEIVED)]
+
+    async def get_order_history(self, session, per_page=50, page_offset=0, **kw):
+        if self.history_fails:
+            raise TastytradeError("order history unavailable")
+        return [r["member"] for r in self.singles.values()]
+
+    async def get_complex_order_history(self, session, per_page=50, page_offset=0):
+        if self.history_fails:
+            raise TastytradeError("complex order history unavailable")
+        return [self._placed_complex(cid) for cid in self.complex]
 
     async def get_live_complex_orders(self, session):
         return [self._placed_complex(cid) for cid, r in self.complex.items()

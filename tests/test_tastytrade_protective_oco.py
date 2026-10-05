@@ -7,7 +7,7 @@ import pytest
 from tastytrade.order import ComplexOrderType, OrderAction, OrderTimeInForce, OrderType as TTOrderType
 from tastytrade.utils import TastytradeError
 
-from ba2_trade_platform.core.allocator_protection import ProtectionRefused
+from ba2_trade_platform.core.allocator_protection import PlacementOutcomeUnknown, ProtectionRefused
 from ba2_trade_platform.modules.accounts.TastyTradeAccount import TastyTradeAccount
 from tests.allocator_protection_fakes import FakeTastyBroker, make_account, patch_equity
 
@@ -105,7 +105,7 @@ def test_a_response_with_errors_cancels_what_was_placed(acct, broker):
     assert broker.delete_calls == [9000]     # the order existed and was cleaned up
 
 
-def test_an_unreadable_readback_cancels_and_refuses(acct, broker):
+def test_an_unreadable_readback_is_UNKNOWN_and_keeps_the_complex_id(acct, broker):
     original = broker.get_complex_order
     state = {"n": 0}
 
@@ -115,9 +115,10 @@ def test_an_unreadable_readback_cancels_and_refuses(acct, broker):
             raise TastytradeError("read failed")
         return await original(session, order_id)
     broker.get_complex_order = flaky
-    with pytest.raises(ProtectionRefused, match="could not read it back"):
+    with pytest.raises(PlacementOutcomeUnknown, match="could not read it back") as info:
         _place(acct)
-    assert broker.delete_calls == [9000]
+    assert info.value.broker_id == 9000 and info.value.tag == "ba2prot:1:0"    # the known id is never dropped
+    assert broker.delete_calls == []                                           # no blind cleanup
 
 
 @pytest.mark.parametrize("qty", [0, -3, 2.5, "1.5"])
@@ -264,7 +265,7 @@ def test_stop_only_accepted_but_rejected_is_refused(acct, broker):
         _stop(acct)
 
 
-def test_stop_only_unreadable_readback_cancels_and_refuses(acct, broker):
+def test_stop_only_unreadable_readback_is_UNKNOWN_and_keeps_the_order_id(acct, broker):
     original = broker.get_order
     state = {"n": 0}
 
@@ -274,9 +275,10 @@ def test_stop_only_unreadable_readback_cancels_and_refuses(acct, broker):
             raise TastytradeError("read failed")
         return await original(session, order_id)
     broker.get_order = flaky
-    with pytest.raises(ProtectionRefused, match="could not read it back"):
+    with pytest.raises(PlacementOutcomeUnknown, match="could not read it back") as info:
         _stop(acct)
-    assert broker.single_delete_calls == [70000]
+    assert info.value.broker_id == 70000 and info.value.kind == "STOP"
+    assert broker.single_delete_calls == []
 
 
 @pytest.mark.parametrize("qty", [0, -1, 2.5])
@@ -322,3 +324,95 @@ def test_stop_only_cancel_of_a_finished_order_is_confirmed_by_the_state_read(acc
     oid = _stop(acct).order_id
     broker.expire_single(oid)
     assert acct.cancel_protective_stop(oid).confirmed
+
+
+# ----------------------------------------------------------------- F1: the live call raising after sending
+
+def test_a_timeout_on_the_live_oco_call_is_unknown_not_refused(acct, broker):
+    original = broker.place_complex_order
+
+    async def timeout_after(session, order, dry_run=True):
+        r = await original(session, order, dry_run=dry_run)
+        if not dry_run:
+            raise TimeoutError("read timed out")
+        return r
+    broker.place_complex_order = timeout_after
+    with pytest.raises(PlacementOutcomeUnknown, match="MAY be resting") as info:
+        _place(acct)
+    assert info.value.kind == "OCO" and info.value.tag == "ba2prot:1:0" and info.value.broker_id is None
+    assert len(broker.complex) == 1                                           # the order IS at the broker
+
+
+def test_a_timeout_on_the_live_stop_call_is_unknown_not_refused(acct, broker):
+    original = broker.place_order
+
+    async def timeout_after(session, order, dry_run=True):
+        r = await original(session, order, dry_run=dry_run)
+        if not dry_run:
+            raise ConnectionError("connection reset")
+        return r
+    broker.place_order = timeout_after
+    with pytest.raises(PlacementOutcomeUnknown) as info:
+        _stop(acct)
+    assert info.value.kind == "STOP" and len(broker.singles) == 1
+
+
+def test_a_dry_run_exception_is_a_plain_refusal(acct, broker):
+    async def boom(session, order, dry_run=True):
+        raise TimeoutError("dry run timed out")
+    broker.place_complex_order = boom
+    with pytest.raises(ProtectionRefused):
+        _place(acct)
+    assert broker.complex == {}
+
+
+# ----------------------------------------------------------------- finding an order by its tag
+
+def test_find_by_tag_locates_an_oco_and_a_stop(acct, broker):
+    _place(acct, tag="ba2prot:1:0")
+    _stop(acct, tag="ba2prot:1:1")
+    kinds = {t: acct.find_protective_orders_by_tag(t) for t in ("ba2prot:1:0", "ba2prot:1:1", "ba2prot:9:9")}
+    assert [(k, i) for k, i, _ in kinds["ba2prot:1:0"]] == [("OCO", 9000)]
+    assert [(k, i) for k, i, _ in kinds["ba2prot:1:1"]] == [("STOP", 70002)] or kinds["ba2prot:1:1"][0][0] == "STOP"
+    assert kinds["ba2prot:9:9"] == []
+
+
+def test_find_by_tag_raises_when_the_search_cannot_be_completed(acct, broker):
+    broker.history_fails = True
+    with pytest.raises(TastytradeError):
+        acct.find_protective_orders_by_tag("ba2prot:1:0")
+
+
+def test_find_by_tag_sees_a_finished_order_in_history(acct, broker):
+    result = _stop(acct, tag="ba2prot:1:3")
+    broker.fill_single(result.order_id)
+    (found,) = acct.find_protective_orders_by_tag("ba2prot:1:3")
+    assert found[0] == "STOP" and found[1] == result.order_id
+
+
+# ----------------------------------------------------------------- the batch cancel
+
+def test_the_batch_cancels_mixed_kinds_with_one_confirmation_poll(acct, broker):
+    oco = _place(acct, tag="ba2prot:1:0").complex_order_id
+    stop = _stop(acct, tag="ba2prot:1:1").order_id
+    broker.cancel_polls = 2
+    out = acct.cancel_protective_batch([("OCO", oco), ("STOP", stop)])
+    assert all(o.confirmed for o in out.values()) and set(out) == {("OCO", oco), ("STOP", stop)}
+    assert broker.delete_calls == [oco] and broker.single_delete_calls == [stop]
+
+
+def test_the_batch_reports_a_fill_that_beat_the_cancel(acct, broker):
+    oco = _place(acct).complex_order_id
+    broker.fill_on_delete = "SL"
+    out = acct.cancel_protective_batch([("OCO", oco)])
+    assert out[("OCO", oco)].confirmed and out[("OCO", oco)].filled
+
+
+def test_the_batch_marks_only_the_unconfirmed_ones(acct, broker):
+    oco = _place(acct, tag="ba2prot:1:0").complex_order_id
+    stop = _stop(acct, tag="ba2prot:1:1").order_id
+    broker.never_confirm_cancel = True
+    acct._PROTECTION_CANCEL_TIMEOUT_SECONDS = 0.0
+    broker.expire_single(stop)                                              # this one is already final
+    out = acct.cancel_protective_batch([("OCO", oco), ("STOP", stop)])
+    assert not out[("OCO", oco)].confirmed and out[("STOP", stop)].confirmed

@@ -66,7 +66,7 @@ def load_dialog_data(account_id: int, symbol: str) -> Dict[str, Any]:
 def initial_rows(protection: Optional[AllocatorProtection]) -> List[Dict[str, Any]]:
     """The TP rows the dialog opens with: the stored ones (possibly none: a stop-only
     protection), else one blank row at 100%."""
-    if protection is not None:
+    if protection is not None and (protection.enabled or protection.tp_targets):
         targets = list(protection.tp_targets or [])
         pcts = fractions_to_percentages([float(t['fraction']) for t in targets])
         return [{'price': t['price'], 'pct': pct} for t, pct in zip(targets, pcts)]
@@ -81,7 +81,8 @@ def slice_rows(slices: List[AllocatorProtectionOrder]) -> List[Dict[str, Any]]:
             continue
         rows.append({'n': s.slice_index + 1, 'qty': s.quantity,
                      'tp': s.tp_price if s.tp_price is not None else '(stop only)', 'sl': s.sl_price,
-                     'state': s.state, 'order': s.complex_order_id or '',
+                     'state': s.state, 'order': s.complex_order_id or '', 'stop': s.sl_order_id or '',
+                     'tag': s.external_tag or '',
                      'gtc': (f"{s.gtc_date:%Y-%m-%d}" + ('*' if s.gtc_date_assumed else ''))
                      if s.gtc_date else ''})
     return rows
@@ -153,7 +154,9 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
                 {'name': 'tp', 'label': 'Take-profit', 'field': 'tp', 'align': 'right'},
                 {'name': 'sl', 'label': 'Stop', 'field': 'sl', 'align': 'right'},
                 {'name': 'state', 'label': 'State', 'field': 'state', 'align': 'left'},
-                {'name': 'order', 'label': 'Order', 'field': 'order', 'align': 'right'},
+                {'name': 'order', 'label': 'OCO order', 'field': 'order', 'align': 'right'},
+                {'name': 'stop', 'label': 'Stop order', 'field': 'stop', 'align': 'right'},
+                {'name': 'tag', 'label': 'Tag (find it on the TT site)', 'field': 'tag', 'align': 'left'},
                 {'name': 'gtc', 'label': 'GTC until', 'field': 'gtc', 'align': 'right'},
             ], rows=slice_rows(data['slices']), row_key='n').props('dense flat').classes('w-full')
 

@@ -258,13 +258,13 @@ def test_payload_of_a_mock_account_is_unsupported():
     assert out == {'supported': False, 'items': {}, 'quantities': {}}
 
 
-def test_payload_of_a_supporting_account_reconciles_and_reads_quantities(monkeypatch):
+def test_payload_of_a_supporting_account_is_display_only_and_reads_quantities(monkeypatch):
     calls = []
     monkeypatch.setattr(aps, 'reconcile_account', lambda account: calls.append(account))
     account = SimpleNamespace(id=1, supports_allocator_protection=True)
     positions = {'ABC': SimpleNamespace(quantity=10.0), 'XYZ': SimpleNamespace(quantity=5.0)}
     out = page._load_protection_payload(account, 1, positions)
-    assert calls == [account] and out['supported'] is True
+    assert calls == [] and out['supported'] is True                  # NO reconcile on page load
     assert out['quantities'] == {'ABC': 10.0, 'XYZ': 5.0} and out['items'] == {}
 
 
@@ -397,7 +397,7 @@ def test_an_enabled_protection_offers_replace_and_switch_off(nicegui_client):
     p = AllocatorProtection(id=1, account_id=1, symbol='ABC', enabled=True, sl_price=45.0,
                             tp_targets=[T(60, 0.5).to_dict(), T(65, 0.5).to_dict()])
     s = SimpleNamespace(slice_index=0, quantity=10, tp_price=60.0, sl_price=45.0, state='LIVE',
-                        complex_order_id=9000, gtc_date=None, gtc_date_assumed=False, closed_at=None,
+                        complex_order_id=9000, sl_order_id=None, external_tag='ba2prot:1:0', gtc_date=None, gtc_date_assumed=False, closed_at=None,
                         filled_qty=0.0)
     with nicegui_client:
         dlg._build_dialog(1, _data(protection=p, quantity=10.0, slices=[s]), _noop)
@@ -434,10 +434,10 @@ def test_initial_rows_default_to_one_blank_target_at_100_percent():
 def test_slice_rows_hide_cancelled_history():
     from datetime import datetime
     gone = SimpleNamespace(slice_index=0, quantity=3, tp_price=60, sl_price=45, state='CANCELLED_BY_US',
-                           complex_order_id=1, gtc_date=None, gtc_date_assumed=False,
+                           complex_order_id=1, sl_order_id=None, external_tag='t', gtc_date=None, gtc_date_assumed=False,
                            closed_at=datetime(2026, 10, 4))
     live = SimpleNamespace(slice_index=1, quantity=7, tp_price=61, sl_price=45, state='LIVE',
-                           complex_order_id=2, gtc_date=datetime(2027, 1, 3), gtc_date_assumed=True,
+                           complex_order_id=2, sl_order_id=None, external_tag='t2', gtc_date=datetime(2027, 1, 3), gtc_date_assumed=True,
                            closed_at=None)
     rows = dlg.slice_rows([gone, live])
     assert [r['n'] for r in rows] == [2] and rows[0]['gtc'] == '2027-01-03*'

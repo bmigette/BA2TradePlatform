@@ -491,6 +491,7 @@ def _load_view_payload(account_id: int, valuation_mode: str,
         'protection': protection,
         #: ``{SYMBOL: AllocatorExclusion}`` -- the symbols the operator switched off.
         'exclusions': exclusions,
+        'account_id': account_id,
     }
 
 
@@ -498,17 +499,13 @@ def _load_protection_payload(account, account_id: int, positions) -> Dict[str, A
     """The TP/SL layer's share of one render. Blocking (a broker read on a supporting account).
 
     ``supported`` is tested with ``is True``: a MagicMock account is truthy on any attribute.
-    The reconcile is the Refresh button's job here -- it detects fills (HELD), lost or expired
-    orders and size mismatches, and never raises. A reconcile failure is logged and the page
-    still draws what is stored: the alert banner then shows the last known state, not nothing.
+    DISPLAY ONLY (review F8): no reconcile and no order is placed or cancelled on page load -- that
+    work scales with the number of protected symbols and must not run on every render. The
+    reconcile runs in the TradeManager account refresh and in the explicit 'Check TP/SL orders now'
+    action; the page draws what those last stored.
     """
     if getattr(account, 'supports_allocator_protection', False) is not True:
         return {'supported': False, 'items': {}, 'quantities': {}}
-    try:
-        protect_svc.reconcile_account(account)
-    except Exception as e:  # noqa: BLE001 -- the stored state is still worth drawing
-        logger.error(f"TP/SL reconcile on page load failed for account {account_id}: {e}",
-                     exc_info=True)
     items = {p.symbol: (p, protect_svc.get_slices(p.id))
              for p in protect_svc.list_protections(account_id)}
     # The broker's held quantity per symbol (read ONCE for the page), so a protection on a
@@ -2762,6 +2759,7 @@ SYMBOL_CHIPS_TEMPLATE = r'''
 
 PROTECT_COLUMN = 'protect'
 MARKER_PROTECT_ALERT = 'pf-protect-alert'
+MARKER_PROTECT_CHECK = 'pf-protect-check'
 EXCLUDE_COLUMN = 'exclude'
 MARKER_EXCLUDE_TOGGLE = 'pf-exclude-toggle'
 MARKER_LABEL_EXTRAS = 'pf-label-extras'
@@ -3311,6 +3309,12 @@ def _open_exclusion_dialog(account_id: int, symbol: str, exclusions: Dict[str, A
                      'exactly as they are.').classes('text-xs text-secondary-custom')
             note = ui.input('Note (optional)', placeholder='e.g. bought manually').props('dense outlined') \
                 .classes('w-full')
+            emptied = labels_left_without_symbols(account_id, symbol)
+            if emptied:
+                ui.label(f"WARNING: {', '.join(emptied)} would have no enabled symbol left while it has a "
+                         f"non-zero target. The allocator refuses such a label and that blocks the WHOLE "
+                         f"rebalance until you set its target to 0 or include a symbol."
+                         ).classes('text-sm').style('color:#f87171')
 
         async def _go() -> None:
             done = await apply_exclusion_change(
@@ -3324,6 +3328,53 @@ def _open_exclusion_dialog(account_id: int, symbol: str, exclusions: Dict[str, A
             ui.button('Include again' if currently else 'Exclude', on_click=_go) \
                 .props('color=primary').mark(MARKER_EXCLUDE_TOGGLE)
     dialog.open()
+
+
+def check_protection_now(account_id: int):
+    """The explicit 'Check TP/SL orders now' action. Blocking (broker reads).
+
+    Runs the same reconcile the account refresh runs (fills, lost orders, resizes) and the GTC
+    renewal; the page never does this on load. Returns the ``ReconcileReport``.
+    """
+    from ...core.utils import get_account_instance_from_id
+    account = get_account_instance_from_id(account_id)
+    if account is None:
+        raise RuntimeError(f"Account {account_id} could not be instantiated")
+    report = protect_svc.reconcile_account(account)
+    protect_svc.renew_expiring(account)
+    return report
+
+
+async def _check_protection_clicked(account_id) -> None:
+    if account_id is None:
+        ui.notify('No account selected', type='warning')
+        return
+    try:
+        report = await asyncio.to_thread(check_protection_now, int(account_id))
+    except Exception as e:  # noqa: BLE001 -- shown, not swallowed
+        logger.error(f'TP/SL check failed for account {account_id}: {e}', exc_info=True)
+        ui.notify(f'TP/SL check failed: {e}', type='negative')
+        return
+    ui.notify(f'TP/SL checked: {report.checked} order(s) read, {len(report.new_fills)} fill(s), '
+              f'{len(report.alarms)} alarm(s). Press Refresh to redraw.', type='info')
+
+
+def labels_left_without_symbols(account_id: int, symbol: str) -> List[str]:
+    """Managed labels with a NON-ZERO target that would have NO enabled symbol left if ``symbol``
+    were excluded. The engine refuses a funded label with no symbols (ERROR_LABEL_NO_SYMBOLS) and
+    that blocks the WHOLE rebalance, so the exclude dialog warns first.
+    """
+    from ...core.utils import get_symbols_by_label
+    symbol = symbol.strip().upper()
+    managed = [m for m in get_managed_labels(account_id) if float(m.target_pct or 0.0) > 0.0]
+    members = get_symbols_by_label([m.label for m in managed])
+    excluded = exclusion_store.excluded_symbols(account_id)
+    out = []
+    for m in managed:
+        syms = [x.strip().upper() for x in members.get(m.label, [])]
+        if symbol in syms and not [x for x in syms if x != symbol and x not in excluded]:
+            out.append(m.label)
+    return out
 
 
 def _protection_fields(protection: Dict[str, Any], symbol: str, quantity: float) -> Dict[str, Any]:
@@ -4011,6 +4062,9 @@ def _render_protection_banner(payload: Dict[str, Any]) -> None:
     entries = [(p, protect_svc.status_for(p, quantities.get(p.symbol, 0.0), slices))
                for p, slices in protection['items'].values()]
     alerts = protect_view.banner_lines(entries)
+    ui.button('Check TP/SL orders now', icon='fact_check',
+              on_click=lambda: _check_protection_clicked(payload.get('account_id'))
+              ).props('outline dense').classes('self-start').mark(MARKER_PROTECT_CHECK)
     if alerts:
         with ui.element('div').classes('alert-banner danger w-full p-3').mark(MARKER_PROTECT_ALERT):
             ui.label(f'TP/SL ALERT: {len(alerts)} position(s) are not fully protected').classes('text-weight-bold')

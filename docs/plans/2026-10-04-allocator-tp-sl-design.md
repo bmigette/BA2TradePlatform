@@ -325,22 +325,84 @@ A `Transaction` shrunk after a partial protective sale loses the realised P&L of
 its own row (the same simplification `adjust_quantity_with_tpsl` makes for a partial close); a
 transaction sold in full is closed at the fill price with its real P&L.
 
-## 12. Open questions for the operator
+## 12. Revision 2026-10-05 (Opus review of b8005547 + the operator's answers)
 
-1. Growth is protected automatically (add-only, no cancel); a shrink is flagged for a one-click
-   Resize. Confirm the asymmetry (5.2), or want auto-resize as well?
-2. GTC expiry: alert only (built) or auto-renew ~7 days before the date? Auto-renew leaves a short
-   gap and fights a deliberate manual cancel.
-3. The background reconcile never re-places a LOST slice (could be a deliberate cancel on the TT
-   site). OK, or auto-repair a lost STOP only?
-4. Plain market STOP (built) vs stop-limit.
-5. Regular session only (GTC, not "GTC Ext"). Acceptable?
-6. After the stop fired and the position is gone, the protection stays armed and re-places itself
-   the next time the symbol is bought (by the allocator or by hand). Intended?
-7. A symbol with NO stored weight row has no weight to reduce on a fill (its derived target follows
-   holdings). Intended, or should a fill write an explicit reduced row?
-8. Excluding a symbol keeps its stored share; re-including restores it. If you re-include after
-   fills reduced other symbols, the label may sum to more than 100%: it then blocks (engine rule).
-   Want the page to warn when re-including would do that?
-9. The row shows only the LATEST fill note; the full history is `allocator_weight_change` plus the
-   activity log. Enough?
+This section SUPERSEDES anything above that contradicts it (sections 5.2, 5.3, 5.5, the GTC paragraph
+of section 1, the status table of section 3 and the "armed, no position" wording).
+
+### 12.1 Operator answers
+* **Quantity changes outside the allocator: BOTH directions are automatic.** Growth adds orders
+  (add-only, no cancel). A shrink cancels (broker-confirmed) and re-places at the held quantity in the
+  background, rate-limited (one automatic cancel/re-place per symbol per 10 minutes), one
+  activity-log entry each time, never during an allocator run, never with a trade in flight, never
+  with an UNKNOWN slice or a LOST alarm, and never within 5 minutes of a protective fill (the broker's
+  position read may lag it, A7). After 3 consecutive FAILED automatic attempts the automatic paths
+  stop for that symbol and say so (`AUTO_STOPPED`); an operator Save / Resize re-arms them. A failed
+  resize leaves LOST slices, which already block further automatic action: no endless retry.
+* **Stop type: stop-MARKET** (as built).
+* **GTC expiry: auto-renew.** A resting slice whose BROKER-REPORTED `gtc_date` is within 7 days is
+  renewed (confirmed cancel + re-place with the same prices) by `renew_expiring`, called from the
+  account refresh in `TradeManager` right after the reconcile (never on page load). One symbol per
+  refresh cycle, the soonest-expiring first, so many orders sharing a date spread over cycles and each
+  still renews before its date (a date already past renews first). Same safety: never during a run,
+  never with `pending_replace`, an UNKNOWN slice or a LOST alarm, never with a trade in flight,
+  per-symbol rate limit, one activity-log entry per renewal, a loud alert and the failure counter on
+  failure. **A slice with no `gtc_date` is never renewed** (stored as NULL; the old "assumed 90 days"
+  and the expiry warning are gone). The supervised test reports what TT returns for `gtc_date`.
+* **After an exit the protection is DISARMED.** When the whole-share position is gone (sold by a
+  rebalance, or exited by protection fills and then confirmed flat after the 5-minute settle window)
+  the settings are CLEARED (`sl_price` 0, no targets, `enabled` False) and a history record is kept
+  (`disarmed_at`, `disarmed_note` = "SL 45, TP 60@33%..."; also in the activity log). A later buy is
+  NOT auto-protected; the operator sets TP/SL again on re-entry. A flat read while orders still rest
+  is flagged as a mismatch instead (a wrong position read must not disarm a live protection).
+
+### 12.2 Review findings and the fixes (tests in `tests/test_allocator_protection_review.py`)
+* **F1 (UNKNOWN placements).** Only a broker ANSWER (a `TastytradeError`) is a refusal. Any other
+  exception from the LIVE call, or an accepted order that cannot be read back, raises
+  `PlacementOutcomeUnknown` (tag, kind, and the broker id when one was named). The slice becomes
+  UNKNOWN with the tag and every known id and placement STOPS. UNKNOWN BLOCKS (`_blocks`): prepare,
+  new placements, resize and renewal refuse while one is unresolved; it is never superseded. It is
+  resolved by `find_protective_orders_by_tag` (today's live orders and complex orders plus the newest
+  history pages): found -> the id is adopted and the order handled like any other (cancelled with the
+  rest on a resize); not found with a successful search -> "never reached the broker", closed; a
+  search that fails resolves nothing.
+* **F2.** `prepare_for_trade` reports any fill it observes (its own reconcile, or one that lands
+  during the cancel) in `PrepareResult.filled`; the run drops that row (SKIPPED: "re-run the dry
+  run"), applies the fill and re-places protection on what is left.
+* **F3.** Prepare blocks whenever ANY slice is resting/UNKNOWN, enabled or not.
+* **F4.** `replace_protection` and Save refuse while `pending_replace` or a run is in flight.
+* **F5.** The weight factor is `(held - sold) / held` from the broker position (`held = position now +
+  sold`; fallback to covered when the read fails), computed once per reconcile in slice order.
+* **F6.** A protective fill is recorded as a synthetic FILLED SELL `TradingOrder` linked to the
+  transaction (FIFO; `data.source = "allocator_protection"`; comment without the word "closing"), so
+  `refresh_transactions` derives the same quantity; a full exit closes through
+  `close_transaction_with_logging`. A test runs the real refresh twice.
+* **F7.** The single choke point is `TastyTradeAccount._submit_order_impl`: before any SELL it calls
+  `before_sale` (cancel protection, confirmed; `pending_replace` owed; refuse the sale if the cancel
+  cannot be confirmed). Expert exits, Live Trades manual close, Smart RM and the breached-stop force
+  close all reach it through `submit_order`; the allocator's own sells find nothing resting and pass.
+* **F8.** Prepare cancels only for symbols the plan SELLS; bought symbols get add-only protection
+  after the run (`extend_after_buys`); cancels share ONE confirmation poll (`cancel_protective_batch`);
+  the page payload is DISPLAY ONLY, with an explicit "Check TP/SL orders now" action.
+* **F9.** `_working_order_symbols` counts only non-terminal orders created after the protection was
+  cancelled (5 minutes of slack for the triggering sale) or, with nothing pending, within 2 hours; a
+  `pending_replace` older than 15 minutes writes `REPLACE_STALE` (alert + activity-log FAILURE).
+* **F10.** A warning (`GTC_EXPIRING`, `RECONCILE_FETCH_FAILED`) never overwrites a failure alert; the
+  automatic paths stop after 3 failures (above).
+* **F11.** The dialog's order table shows the OCO id, the stop-order id and the tag.
+* Also: the migration docstring says four tables; the exclude dialog warns when excluding the symbol
+  would leave a funded label with no enabled symbol (which blocks the whole rebalance).
+
+### 12.3 Added to the assumptions list (`BROKER_ASSUMPTIONS`) and the supervised checklist
+A1 TT refuses a SELL_TO_CLOSE larger than the shares held, including when a resting stop triggers on a
+position that has since become smaller. A2 resting closing orders reserve shares. A3 an OCO counts its
+quantity once (q, not 2q); otherwise an OCO above half the position fails its dry run. A4 the partner
+leg after a partial fill stays live for the remainder. A5 a timeout after an accepted placement leaves
+the order resting. A6 `get_order` works for a GTC order from an earlier day. A7 the position read can
+lag a fill. A8 `external_identifier` accepts `ba2prot:<id>:<n>`. A9 status names of GTC stops outside
+regular hours.
+
+### 12.4 Open questions (remaining)
+1. Weight of a symbol with no STORED weight row is never reduced by a fill (it follows holdings).
+2. Re-including an excluded symbol after fills reduced others can push a label over 100%: warn?
+3. The row shows only the latest fill note; the history is the audit table and the activity log.

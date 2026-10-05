@@ -417,8 +417,12 @@ class TradeManager:
                     # raises, and the try below keeps even a bug in it from costing the rest of
                     # the refresh.
                     try:
-                        from .allocator_protection_service import reconcile_account
+                        from .allocator_protection_service import reconcile_account, renew_expiring
                         reconcile_account(account)
+                        # GTC renewal lives HERE (the account refresh), never on page load: orders
+                        # with a broker-reported gtc_date within 7 days are cancelled (confirmed)
+                        # and re-placed with the same prices, one symbol per cycle.
+                        renew_expiring(account)
                     except Exception as e:
                         self.logger.error(
                             f"Error reconciling allocator TP/SL protection for {account_def.name}: {e}",

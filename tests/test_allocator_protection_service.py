@@ -243,7 +243,7 @@ def test_a_tp_fill_reduces_the_stored_weight_in_proportion_and_audits_it(acct, b
     (change,) = aex.get_weight_changes(1)
     assert (change.label, change.symbol, change.reason) == ("L", "ABC", "tp_fill")
     assert (change.before_pct, change.after_pct) == (6.0, pytest.approx(3.6))
-    assert "TP1 filled: 4 of 10 protected sh sold @ 60" in change.detail
+    assert "TP1 filled: 4 of 10 held sh sold @ 60" in change.detail
     assert aps.get_protection(1, "ABC").last_fill_note.endswith("share 6% -> 3.6%")
 
 
@@ -541,17 +541,38 @@ def test_growth_is_left_alone_while_an_order_on_the_symbol_is_still_working(acct
     assert aps.reconcile_account(acct).extended == []
 
 
-def test_growth_after_the_position_was_exited_re_protects_with_the_same_template(acct, broker):
+def _age_fill(minutes=10):
+    p = aps.get_protection(1, "ABC")
+    p.last_fill_at = datetime.utcnow() - timedelta(minutes=minutes)
+    update_instance(p)
+
+
+def test_an_exited_position_disarms_the_protection_and_a_later_buy_is_not_auto_protected(acct, broker, activity):
+    """Operator 2026-10-05: after an exit the settings are CLEARED (history kept); re-entry is not
+    auto-protected."""
     _save(acct)
     for s in _slices():
         broker.fill(s.complex_order_id, "SL")
-    aps.reconcile_account(acct)
-    assert _status(acct, broker).code == ap.STATUS_NO_POSITION
-    broker.positions["ABC"] = Decimal(8)                               # bought again (outside the allocator)
+    aps.reconcile_account(acct)                                       # fills noted; position settling
+    assert aps.get_protection(1, "ABC").enabled                       # not yet: the broker read may lag
+    _age_fill()
     report = aps.reconcile_account(acct)
-    assert report.extended == ["ABC"]
-    live = [s for s in _slices() if s.state == SLICE_LIVE]
-    assert sum(s.quantity for s in live) == 8 and {s.sl_price for s in live} == {45.0}
+    assert report.disarmed == ["ABC"]
+    p = aps.get_protection(1, "ABC")
+    assert not p.enabled and p.tp_targets == [] and p.sl_price == 0.0 and p.disarmed_at is not None
+    assert p.disarmed_note.startswith("SL 45, TP 60@33%")
+    assert "DISARMED" in _codes(activity)
+    assert "Disarmed after the position was exited" in _status(acct, broker).tooltip
+    broker.positions["ABC"] = Decimal(8)                               # bought again
+    assert aps.reconcile_account(acct).extended == [] and not [s for s in _slices() if s.state == SLICE_LIVE]
+
+
+def test_resting_orders_on_a_position_read_as_flat_are_flagged_not_disarmed(acct, broker):
+    _save(acct)
+    broker.positions["ABC"] = Decimal(0)                               # a wrong/lagging read must not disarm
+    report = aps.reconcile_account(acct)
+    assert report.disarmed == [] and aps.get_protection(1, "ABC").enabled
+    assert aps.get_protection(1, "ABC").alert_code == ap.CODE_QUANTITY_MISMATCH
 
 
 def test_a_lost_slice_blocks_the_auto_extension_the_operator_decides(acct, broker):
@@ -572,65 +593,247 @@ def test_a_failed_extension_is_loud(acct, broker, activity):
     assert _status(acct, broker).code in (ap.STATUS_UNPROTECTED, ap.STATUS_PARTIAL)
 
 
-def test_a_shrinking_position_is_flagged_for_a_one_click_resize_not_auto_fixed(acct, broker):
-    """The orders cover MORE than is held: fixing it means cancelling live orders (a gap), so it is
-    the operator's Resize protection, not a background job."""
+def test_a_shrinking_position_is_resized_automatically_with_a_log_entry(acct, broker, activity):
+    """Operator 2026-10-05: BOTH directions are automatic. A shrink cancels (confirmed) and re-places
+    at the held quantity, rate-limited, one activity-log entry per resize."""
     _save(acct)
+    old = {s.complex_order_id for s in _slices()}
     broker.positions["ABC"] = Decimal(6)
-    deletes = len(broker.delete_calls)
     report = aps.reconcile_account(acct)
-    p = aps.get_protection(1, "ABC")
-    assert p.alert_code == ap.CODE_QUANTITY_MISMATCH and "Resize protection" in p.alert_message
-    assert len(broker.delete_calls) == deletes and report.extended == []
-    status = _status(acct, broker)
-    assert status.code == ap.STATUS_PARTIAL and status.label == "Size mismatch" and status.alarm
-    result = aps.replace_protection(acct, "ABC")                        # the one click
-    assert result.ok and aps.covered_quantity(_slices()) == 6
-    aps.reconcile_account(acct)
+    assert report.resized == ["ABC"] and set(broker.delete_calls) == old
+    assert aps.covered_quantity(_slices()) == 6
     assert aps.get_protection(1, "ABC").alert_code is None
     assert _status(acct, broker).code == ap.STATUS_PROTECTED
+    assert "AUTO_RESIZE" in _codes(activity)
 
 
-def test_a_position_sold_elsewhere_while_protected_is_flagged(acct, broker):
+def test_the_automatic_resize_is_rate_limited(acct, broker):
+    _save(acct)
+    broker.positions["ABC"] = Decimal(6)
+    aps.reconcile_account(acct)
+    deletes = len(broker.delete_calls)
+    broker.positions["ABC"] = Decimal(3)                               # shrinks again within the interval
+    assert aps.reconcile_account(acct).resized == []
+    assert len(broker.delete_calls) == deletes
+    p = aps.get_protection(1, "ABC")
+    p.last_auto_action_at = datetime.utcnow() - timedelta(hours=1)
+    update_instance(p)
+    assert aps.reconcile_account(acct).resized == ["ABC"] and aps.covered_quantity(_slices()) == 3
+
+
+def test_the_automatic_resize_never_runs_during_a_run_or_with_a_trade_in_flight(acct, broker):
+    from ba2_trade_platform.core.portfolio_allocation_service import _submission_lock
+    import threading
+    _save(acct)
+    broker.positions["ABC"] = Decimal(6)
+    held, release = threading.Event(), threading.Event()
+
+    def hold_the_run_lock():
+        with _submission_lock(acct.id):
+            held.set()
+            release.wait(5)
+    t = threading.Thread(target=hold_the_run_lock)
+    t.start()
+    held.wait(5)
+    try:
+        assert aps.reconcile_account(acct).resized == []
+    finally:
+        release.set()
+        t.join()
+    add_instance(TradingOrder(account_id=1, symbol="ABC", quantity=4, side=OrderDirection.SELL,
+                              order_type=OrderType.MARKET, good_for="day", status=OrderStatus.ACCEPTED,
+                              open_type=OrderOpenType.MANUAL))
+    assert aps.reconcile_account(acct).resized == [] and broker.delete_calls == []
+
+
+def test_a_failed_automatic_resize_is_loud_and_not_retried(acct, broker, activity):
+    _save(acct)
+    broker.positions["ABC"] = Decimal(6)
+    broker.raise_on_place = TastytradeError("rejected: no")
+    p = aps.get_protection(1, "ABC")
+    assert aps.reconcile_account(acct).alarms == ["ABC"]
+    p = aps.get_protection(1, "ABC")
+    assert p.auto_failures == 1 and p.alert_code is not None
+    attempts = len([c for c in broker.place_calls if not c[0]])
+    p.last_auto_action_at = datetime.utcnow() - timedelta(hours=1)
+    update_instance(p)
+    aps.reconcile_account(acct)
+    assert len([c for c in broker.place_calls if not c[0]]) == attempts      # the alarm slice blocks a retry
+    assert any(c["severity"] == ActivityLogSeverity.FAILURE for c in activity)
+
+
+def test_the_growth_path_stops_retrying_after_three_failures_and_alerts(acct, broker, activity):
+    """F10: a validation refusal leaves no alarm slice, so the growth rule would retry every refresh
+    for ever. It stops after AUTO_FAILURE_LIMIT and says so; an operator action re-arms it."""
+    _save(acct)
+    broker.positions["ABC"] = Decimal(14)
+    broker.prices["ABC"] = 40.0                                          # below the 45 stop: refused
+    for _ in range(ap.AUTO_FAILURE_LIMIT + 2):
+        aps.reconcile_account(acct)
+    p = aps.get_protection(1, "ABC")
+    assert p.auto_failures == ap.AUTO_FAILURE_LIMIT and p.alert_code == ap.CODE_AUTO_STOPPED
+    reads = len(broker.place_calls)
+    aps.reconcile_account(acct)
+    assert len(broker.place_calls) == reads                              # no more attempts
+    broker.prices["ABC"] = 50.0
+    assert aps.replace_protection(acct, "ABC").ok                         # the operator re-arms it
+    assert aps.get_protection(1, "ABC").auto_failures == 0
+
+
+def test_a_position_sold_elsewhere_while_protected_is_resized(acct, broker):
     _save(acct)
     broker.positions["ABC"] = Decimal(4)
+    assert aps.reconcile_account(acct).resized == ["ABC"] and aps.covered_quantity(_slices()) == 4
+
+
+broker_ref = {}
+
+
+def _set_gtc(days):
+    soon = (datetime.utcnow() + timedelta(days=days)).date()
+    for rec in broker_ref["b"].complex.values():
+        for m in rec["members"]:
+            m.gtc_date = soon
+    for rec in broker_ref["b"].singles.values():
+        rec["member"].gtc_date = soon
+
+
+def _refresh_slices_gtc(acct, broker, days):
+    """Make the broker report ``days`` to expiry, and let a reconcile record it on the slices."""
+    broker_ref["b"] = broker
+    _set_gtc(days)
     aps.reconcile_account(acct)
-    assert aps.get_protection(1, "ABC").alert_code == ap.CODE_QUANTITY_MISMATCH
 
 
-def test_gtc_expiry_is_warned_once(acct, broker, activity):
+def test_an_order_six_days_from_expiry_is_renewed_in_the_refresh(acct, broker, activity):
     _save(acct)
-    soon = (datetime.utcnow() + timedelta(days=3)).date()
-    for m in broker.complex[_slices()[0].complex_order_id]["members"]:
-        m.gtc_date = soon                                             # the broker says: ends in 3 days
-    aps.reconcile_account(acct)
-    aps.reconcile_account(acct)
-    assert _codes(activity).count(ap.CODE_GTC_EXPIRING) == 1
-    assert aps.get_protection(1, "ABC").alert_code == ap.CODE_GTC_EXPIRING
-    assert aps.open_alerts(1) == []                                 # a warning, not the red banner
+    old = {s.complex_order_id for s in _slices()}
+    _refresh_slices_gtc(acct, broker, 6)
+    renewed = aps.renew_expiring(acct)
+    assert renewed == ["ABC"] and set(broker.delete_calls) == old                # cancel, confirmed
+    live = [s for s in _slices() if s.state == SLICE_LIVE]
+    assert sum(s.quantity for s in live) == 10 and [s.tp_price for s in live] == [60.0, 65.0, 70.0]
+    assert {s.sl_price for s in live} == {45.0}                                   # same prices
+    assert "AUTO_RESIZE" in _codes(activity)
 
 
-def test_a_missing_broker_gtc_date_is_assumed_and_flagged(acct, broker, monkeypatch):
-    real = acct.place_protective_oco
-
-    def no_gtc(**kw):
-        r = real(**kw)
-        r.gtc_date = None
-        return r
-    acct.place_protective_oco = no_gtc
+def test_an_order_eight_days_from_expiry_is_not_renewed(acct, broker):
     _save(acct)
-    s = _slices()[0]
-    assert s.gtc_date_assumed is True
-    assert (s.gtc_date - datetime.utcnow()).days in (ap.ASSUMED_GTC_LIFETIME_DAYS - 1,
-                                                     ap.ASSUMED_GTC_LIFETIME_DAYS)
+    _refresh_slices_gtc(acct, broker, 8)
+    assert aps.renew_expiring(acct) == [] and broker.delete_calls == []
 
 
-def test_a_stale_placing_row_is_an_alarm(acct, broker):
+def test_a_null_gtc_date_is_never_renewed(acct, broker):
+    _save(acct)
+    for rec in broker.complex.values():
+        for m in rec["members"]:
+            m.gtc_date = None
+    aps.reconcile_account(acct)
+    for s in _slices():
+        row = get_instance(AllocatorProtectionOrder, s.id)
+        row.gtc_date = None
+        update_instance(row)
+    assert aps.renew_expiring(acct) == [] and broker.delete_calls == []
+
+
+def test_renewal_never_happens_while_a_run_is_in_flight(acct, broker):
+    from ba2_trade_platform.core.portfolio_allocation_service import _submission_lock
+    import threading
+    _save(acct)
+    _refresh_slices_gtc(acct, broker, 2)
+    held, release = threading.Event(), threading.Event()
+
+    def hold_the_run_lock():
+        with _submission_lock(acct.id):
+            held.set()
+            release.wait(5)
+    t = threading.Thread(target=hold_the_run_lock)
+    t.start()
+    held.wait(5)
+    try:
+        assert aps.renew_expiring(acct) == []
+    finally:
+        release.set()
+        t.join()
+    assert broker.delete_calls == []
+
+
+def test_renewal_is_blocked_by_a_pending_replacement_or_an_unknown_slice(acct, broker):
+    _save(acct)
+    _refresh_slices_gtc(acct, broker, 2)
+    p = aps.get_protection(1, "ABC")
+    p.pending_replace = True
+    update_instance(p)
+    assert aps.renew_expiring(acct) == []
+    p.pending_replace = False
+    update_instance(p)
+    row = get_instance(AllocatorProtectionOrder, _slices()[0].id)
+    row.state = SLICE_UNKNOWN
+    update_instance(row)
+    assert aps.renew_expiring(acct) == [] and broker.delete_calls == []
+
+
+def test_renewals_are_spread_one_symbol_per_cycle_the_soonest_first(acct, broker):
+    broker.positions["XYZ"] = Decimal(10)
+    broker.prices["XYZ"] = 20.0
+    _save(acct)
+    aps.save_protection(acct, "XYZ", 15.0, [T(30, 1.0)])
+    abc = {s.complex_order_id for s in _slices("ABC")}
+    for cid in abc:
+        for m in broker.complex[cid]["members"]:
+            m.gtc_date = (datetime.utcnow() + timedelta(days=5)).date()
+    for s in _slices("XYZ"):
+        for m in broker.complex[s.complex_order_id]["members"]:
+            m.gtc_date = (datetime.utcnow() + timedelta(days=2)).date()
+    aps.reconcile_account(acct)
+    assert aps.renew_expiring(acct) == ["XYZ"]                               # the soonest first, only one
+    assert not abc & set(broker.delete_calls)
+    p = aps.get_protection(1, "XYZ")
+    p.last_auto_action_at = datetime.utcnow() - timedelta(hours=1)
+    update_instance(p)
+    for s in _slices("XYZ"):
+        if s.state == SLICE_LIVE:
+            for m in broker.complex[s.complex_order_id]["members"]:
+                m.gtc_date = (datetime.utcnow() + timedelta(days=60)).date()
+    aps.reconcile_account(acct)
+    assert aps.renew_expiring(acct) == ["ABC"]                                # next cycle
+
+
+def test_a_failed_renewal_is_loud(acct, broker, activity):
+    _save(acct)
+    _refresh_slices_gtc(acct, broker, 3)
+    broker.raise_on_place = TastytradeError("rejected: no")
+    assert aps.renew_expiring(acct) == []
+    p = aps.get_protection(1, "ABC")
+    assert p.auto_failures == 1 and p.alert_code is not None
+    assert any(c["severity"] == ActivityLogSeverity.FAILURE for c in activity)
+
+
+def test_the_account_refresh_runs_the_renewal():
+    import inspect
+    from ba2_trade_platform.core import TradeManager
+    source = inspect.getsource(TradeManager)
+    assert "renew_expiring(account)" in source and "reconcile_account(account)" in source
+
+
+def test_a_stale_placing_row_with_no_order_at_the_broker_is_resolved_as_never_placed(acct, broker):
     p = aps._save(AllocatorProtection(account_id=1, symbol="ABC", enabled=True, sl_price=45.0,
                                       tp_targets=[T(60, 1.0).to_dict()]))
     aps._save(AllocatorProtectionOrder(protection_id=p.id, quantity=10, tp_price=60, sl_price=45,
-                                       state="PLACING",
+                                       external_tag="ba2prot:1:0", state="PLACING",
                                        placed_at=datetime.utcnow() - timedelta(minutes=5)))
+    aps.reconcile_account(acct)
+    s = aps.get_slices(p.id)[0]
+    assert s.state == SLICE_LOST_REJECTED and s.closed_at is not None and "never reached" in s.detail
+
+
+def test_a_stale_placing_row_whose_search_fails_stays_unknown_and_alarms(acct, broker):
+    p = aps._save(AllocatorProtection(account_id=1, symbol="ABC", enabled=True, sl_price=45.0,
+                                      tp_targets=[T(60, 1.0).to_dict()]))
+    aps._save(AllocatorProtectionOrder(protection_id=p.id, quantity=10, tp_price=60, sl_price=45,
+                                       external_tag="ba2prot:1:0", state="PLACING",
+                                       placed_at=datetime.utcnow() - timedelta(minutes=5)))
+    broker.history_fails = True
     aps.reconcile_account(acct)
     assert aps.get_slices(p.id)[0].state == SLICE_UNKNOWN
     assert aps.get_protection(1, "ABC").alert_code == ap.CODE_UNKNOWN_STATE
@@ -744,12 +947,12 @@ def test_prepare_sets_pending_before_the_first_cancel(acct, broker):
     """A crash between the cancel and the re-placement must leave a durable marker."""
     _save(acct)
     seen = {}
-    original = acct.cancel_complex_order
+    original = acct.cancel_protective_batch
 
-    def spy(cid):
+    def spy(items):
         seen.setdefault("pending", aps.get_protection(1, "ABC").pending_replace)
-        return original(cid)
-    acct.cancel_complex_order = spy
+        return original(items)
+    acct.cancel_protective_batch = spy
     aps.prepare_for_trade(acct, ["ABC"])
     assert seen["pending"] is True
 
@@ -815,14 +1018,15 @@ def test_resume_waits_while_an_order_is_still_working(acct, broker):
     assert _status(acct, broker).code == ap.STATUS_REPLACING
 
 
-def test_resume_after_selling_everything_just_waits_for_the_next_buy(acct, broker):
+def test_resume_after_selling_everything_disarms_and_keeps_the_history(acct, broker):
     _save(acct)
     aps.prepare_for_trade(acct, ["ABC"])
     broker.positions["ABC"] = Decimal(0)
     assert aps.resume_protection(acct, ["ABC"], working_symbols=set()) == []
     p = aps.get_protection(1, "ABC")
-    assert not p.pending_replace and p.alert_code is None and p.enabled
-    assert _status(acct, broker).code == ap.STATUS_NO_POSITION
+    assert not p.pending_replace and p.alert_code is None and not p.enabled
+    assert p.disarmed_at is not None and p.disarmed_note.startswith("SL 45")
+    assert _status(acct, broker).code == ap.STATUS_OFF
 
 
 def test_a_failed_replacement_alerts_and_stops_retrying(acct, broker, activity):
