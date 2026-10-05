@@ -32,6 +32,7 @@ DIALOG_CLASS = 'pf-prot-dialog'
 TP_ROW_CLASS = 'pf-tp-row'
 MARKER_SAVE = 'pf-prot-save'
 MARKER_SWITCH_OFF = 'pf-prot-off'
+MARKER_DELETE = 'pf-prot-delete'
 MARKER_FORGET = 'pf-prot-forget'
 MARKER_REARM = 'pf-prot-rearm'
 MARKER_CHECK = 'pf-prot-check'
@@ -436,6 +437,14 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
             sure.open()
 
         with ui.row().classes('w-full justify-end gap-2 mt-2 pf-actions'):
+            if protection is not None:
+                # Far from Save (left edge). Shown whenever a configuration exists, enabled or switched off.
+                ui.button('Delete TP/SL', icon='delete',
+                          on_click=lambda: _confirm(
+                              f'Cancel all protective orders for {symbol} and forget its TP/SL settings? '
+                              f'The position itself is not touched.', 'Delete',
+                              lambda: aps.delete_protection(account, symbol))
+                          ).props('outline color=negative').classes('mr-auto').mark(MARKER_DELETE)
             ui.button('Close', on_click=dialog.close).props('flat')
             if protection is not None and protection.enabled:
                 ui.button('Resize protection', icon='autorenew',
