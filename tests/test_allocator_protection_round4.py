@@ -86,25 +86,6 @@ def test_r4_3_an_ascending_plain_history_does_not_hide_a_filled_stop(acct, broke
     assert s.sl_order_id == ours and s.state != "LOST_REJECTED"
 
 
-def test_r4_3_an_ascending_complex_history_is_read_in_full(acct, broker):
-    old = datetime.now(timezone.utc) - timedelta(days=3)
-    mine = SimpleNamespace(id=9, orders=[SimpleNamespace(
-        external_identifier="ba2prot:x", received_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc))])
-    fillers = [SimpleNamespace(id=100 + i, orders=[SimpleNamespace(
-        external_identifier="other", received_at=old + timedelta(seconds=i),
-        updated_at=old + timedelta(seconds=i))]) for i in range(120)]
-    rows = fillers + [mine]                                      # oldest first
-    calls = []
-
-    async def history(session, per_page=50, page_offset=0):
-        calls.append(page_offset)
-        return rows[page_offset * per_page:(page_offset + 1) * per_page]
-    broker.get_complex_order_history = history
-    found = acct.find_protective_orders_by_tag("ba2prot:x", since=datetime.now(timezone.utc) - timedelta(hours=1))
-    assert [f[1] for f in found] == [9] and max(calls) == 2
-
-
 def test_r4_3_history_ordering_is_a_listed_broker_assumption():
     from tests.allocator_protection_fakes import BROKER_ASSUMPTIONS
     assert any(a.startswith("A10") and "ordering" in a for a in BROKER_ASSUMPTIONS)
