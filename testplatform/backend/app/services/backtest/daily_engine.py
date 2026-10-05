@@ -88,7 +88,8 @@ def _reraise_option_basis_refusal(e: BaseException) -> None:
     these, so an equity run never reaches this."""
     from ba2_common.core.split_basis import SplitBasisRefused
     from app.services.backtest.option_basis_guard import OptionSpotBasisMismatch
-    if isinstance(e, (SplitBasisRefused, OptionSpotBasisMismatch)):
+    from app.services.backtest.backtest_account import ComboSettlementRefused
+    if isinstance(e, (SplitBasisRefused, OptionSpotBasisMismatch, ComboSettlementRefused)):
         raise e
 
 

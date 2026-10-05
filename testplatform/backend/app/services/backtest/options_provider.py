@@ -397,6 +397,17 @@ class HistoricalOptionsProvider:
         # the two stores disagree about the same trade's entry delta. A snapshot is dated at
         # the CLOSE, so the entry day's own snapshot has already absorbed the session,
         # including the move that flagged this trade for refinement in the first place.
+        row = self._entry_chain_row(underlying, occ_symbol, when)
+        return None if row is None else row.get("delta")
+
+    def iv_at_entry(self, underlying: str, occ_symbol: str, when: Any) -> Optional[float]:
+        """The contract's implied vol AS OF ``when`` (same strictly-prior snapshot as
+        ``delta_at_entry``): the input the multi-leg intraday refinement re-prices with
+        Black-Scholes. None when there is no prior snapshot or no usable iv -- never 0.0."""
+        row = self._entry_chain_row(underlying, occ_symbol, when)
+        return None if row is None else row.get("iv")
+
+    def _entry_chain_row(self, underlying: str, occ_symbol: str, when: Any):
         d = when.date() if hasattr(when, "date") and not isinstance(when, date) else when
         if not isinstance(d, date):
             try:
@@ -412,7 +423,7 @@ class HistoricalOptionsProvider:
             return None
         for row in hist.by_asof.get(snapshot, []):
             if row.get("occ_symbol") == occ_symbol:
-                return row.get("delta")
+                return row
         return None
 
     def get_atm_iv(self, underlying: str, as_of: date) -> Optional[float]:

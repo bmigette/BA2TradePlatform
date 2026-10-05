@@ -1399,7 +1399,11 @@ class OptionsAccountInterface(ABC):
     #: ``call_butterfly`` belongs HERE, not in ``RESERVING_STRATEGIES``. A 1-2-1 fly is
     #: bought for a net DEBIT and its maximum loss is that debit, already paid at entry —
     #: the design spec classes it as a debit structure and every other debit structure is
-    #: on this list. It was mis-listed as reserving while ``OpenCallButterflyAction``,
+    #: on this list. (A fly whose UPPER wing is wider than its lower can lose MORE than its
+    #: debit; that excess is not a strategy-level reserve but a per-order one:
+    #: ``TradeActions._size_and_submit`` sizes by ``option_payoff.sizing_risk`` and records
+    #: the excess as ``data["option_reserve"]``, which the reserve pool honours for any
+    #: strategy. A balanced fly records none, so it still reserves nothing.) It was mis-listed as reserving while ``OpenCallButterflyAction``,
     #: alone among the 19 entry builders, submitted it with no ``option_reserve=``. One
     #: open fly therefore made ``reserved_option_buying_power_detail`` UNMEASURABLE, so
     #: ``available_option_buying_power()`` returned ``None`` and

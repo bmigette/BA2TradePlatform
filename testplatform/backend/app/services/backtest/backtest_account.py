@@ -57,7 +57,7 @@ import math
 import os
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
@@ -80,6 +80,7 @@ from ba2_common.core.market_calendar import backtest_decision_label, decision_da
 from ba2_common.core.utils import as_utc_key
 from ba2_common.core.failure_modes import must_measure
 from ba2_common.core.option_bs import bs_price
+from ba2_common.core.option_payoff import PayoffLeg, position_value_bounds
 from ba2_common.core import option_spread_model as _osm
 from ba2_common.core.db import get_db, get_instance, add_instance, update_instance
 from ba2_common.core.trade_store import orders_where, transactions_where
@@ -90,6 +91,19 @@ from .options_provider import HistoricalOptionsProvider
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class ComboSettlementRefused(RuntimeError):
+    """A defined-risk combo cannot be settled at expiry (its held legs have no payoff bounds).
+    The engine's per-expiry handler re-raises it (``_reraise_option_basis_refusal``): left to
+    that handler's log line the legs would be marked forever and the settle retried daily."""
+
+
+#: Child-leg statuses that mean the leg never became (or is no longer pending to become) part of
+#: a held structure; ``_option_group_bounds`` leaves them out of the structure's legs.
+_NEVER_HELD_LEG_STATUSES = frozenset({
+    OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED, OrderStatus.REPLACED,
+})
 
 
 def _expiry_trigger(side: OrderDirection, itm: bool) -> OptionCloseReason:
@@ -348,6 +362,10 @@ def _option_fill_capacity(volume) -> float:
 
 def _new_integrity_counters() -> Dict[str, Any]:
     return {"option_ledger_mismatches": {"count": 0, "examples": []},
+            "option_clamp_fallbacks": 0,
+            "option_clamp_fallback_examples": [],
+            "option_mark_prints_corrected": 0,
+            "option_mark_print_examples": [],
             "option_orders_volume_sized": 0,
             "option_orders_volume_refused": 0,
             "option_split_rekeys": 0,
@@ -1061,6 +1079,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # must NOT be clamped to 0 (the O_IC id=449 1-bar transient: leftover long value erased ->
         # equity dipped negative for one bar).
         group_has_short: Dict[Any, bool] = {}
+        group_lots: Dict[Any, List[Any]] = {}
+        group_prints: Dict[Any, List[Any]] = {}
         for lot in self._option_positions.values():
             if lot.qty == 0:
                 continue
@@ -1089,7 +1109,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 # estimate must never be allowed to feed a later BS estimate. Zero extra
                 # BS work happens here (this IS the happy path; see the perf pin in
                 # test_bs_mark_fallback.py).
-                self._update_lot_last_iv(lot, bar)
+                if is_defined_risk:
+                    # A leg of a multi-leg group is cross-checked against its siblings below
+                    # BEFORE its iv may feed a later BS fallback: an inconsistent print's iv
+                    # must not become the iv the corrected mark is priced with.
+                    group_prints.setdefault(gkey, []).append((lot, px, bar))
+                else:
+                    self._update_lot_last_iv(lot, bar)
             elif is_defined_risk:
                 # (2a) NO premium bar for a defined-risk leg on this bar. Task 3 inserts a
                 # BS(last-known-iv) stage AHEAD of the intrinsic floor: mark at INTRINSIC (not
@@ -1128,10 +1154,50 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
             if is_defined_risk:
                 group_mtm[gkey] = group_mtm.get(gkey, 0.0) + contribution
+                group_lots.setdefault(gkey, []).append(lot)
                 if lot.qty < 0:
                     group_has_short[gkey] = True
             else:
                 total += contribution
+
+        # THE LEGS OF ONE GROUP MUST AGREE WITH EACH OTHER (item 8). The sparse cache can print a
+        # leg stale or off-market while its siblings print normally; one such leg swings a
+        # multi-leg book by thousands for a day and reverses the next (genome A, 2022-11-11: a
+        # 70C close of 12.89 against 65C 17.00 / 72.5C 9.32 -- above the convexity bound -- cut
+        # a butterfly's mark from 3,668 to 756 and back to 2,702 on the 14th). A print that
+        # breaks the no-arbitrage relations between same-expiry, same-type strikes is replaced
+        # through the SAME fallback chain a missing bar already uses (BS on the lot's prior
+        # iv, then intrinsic, then entry), never a new default; counted and recorded.
+        for gkey, entries in group_prints.items():
+            def _fallback(lot, _gb=group_bounds[gkey]):
+                p = self._bs_fallback_premium(lot)
+                if p is None:
+                    p = self._leg_intrinsic(lot.contract_symbol, _gb)
+                return lot.avg_price if p is None else p
+
+            # TWO PASSES. A convexity break blames the MIDDLE print; the monotone/width breaks
+            # that same print causes against its neighbours must not blame the neighbours too.
+            # So the middles are corrected first and the pair relations are re-validated on the
+            # corrected set; only breaks that REMAIN are then attributed (lower volume).
+            reasons = self._inconsistent_prints(entries, ("convexity",))
+            fixed = {lot.contract_symbol: _fallback(lot) for lot, _px, _bar in entries
+                     if lot.contract_symbol in reasons}
+            # The corrected legs are model values now, not market prints: they take no part in
+            # the re-validation (an intrinsic stand-in would itself "break" the width relation).
+            second = self._inconsistent_prints(
+                [e for e in entries if e[0].contract_symbol not in reasons], ("pair",))
+            for lot, _px, _bar in entries:
+                if lot.contract_symbol in second:
+                    reasons[lot.contract_symbol] = second[lot.contract_symbol]
+                    fixed[lot.contract_symbol] = _fallback(lot)
+            for lot, px, bar in entries:
+                if lot.contract_symbol not in reasons:
+                    self._update_lot_last_iv(lot, bar)
+                    continue
+                new_px = fixed[lot.contract_symbol]
+                self._count_print_correction(gkey, lot.contract_symbol, px, new_px,
+                                             reasons[lot.contract_symbol])
+                group_mtm[gkey] += lot.qty * (new_px - px) * lot.multiplier
 
         # Clamp each defined-risk group's net contribution to its no-arb range. (2b) The bound is
         # composition-aware: while a SHORT leg is held the combo carries credit downside so it is
@@ -1148,12 +1214,136 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 # are still held; once the shorts are closed/settled the surviving LONG legs are a
                 # net-long asset worth [0, width] — so their positive residual is preserved, not
                 # erased (the O_IC id=449 1-bar transient).
-                if is_credit and group_has_short.get(gkey, False):
+                #
+                # THE BOUNDS ARE THE VALUE RANGE OF THE LEGS STILL HELD (``position_value_bounds``,
+                # the same payoff the entry ``max_loss`` stamp is measured from, and the same
+                # legs the expiry settlement clamps), not ``[0, width]``. While the whole
+                # structure is held that is its true range: the same number as the width rule
+                # for every shape that obeyed it, but NEGATIVE below zero for a call butterfly
+                # whose UPPER wing is wider than its lower one, which ``[0, width]`` floored at
+                # zero and so hid until expiry. Once a leg has closed, the remainder's own range
+                # applies (a long call left from a vertical is worth more than the width).
+                # An infinite side means unbounded on that side: no clamp there.
+                held = self._held_value_bounds(gkey, group_lots[gkey])
+                if held is not None:
+                    mtm = min(max(mtm, held[0]), held[1])
+                elif is_credit and group_has_short.get(gkey, False):
                     mtm = max(min(mtm, 0.0), -width)          # credit exposure live: [-width, 0]
                 else:
                     mtm = min(max(mtm, 0.0), width)           # long / long-only remainder: [0, width]
             total += mtm
         return total
+
+    def _count_clamp_fallback(self, kind: str, detail: str) -> None:
+        """A defined-risk clamp that could not use the payoff-derived bounds and fell back to
+        the strategy-width rule. NEVER SILENT: counted (``option_clamp_fallbacks`` in the
+        results) and warned once per distinct cause."""
+        c = self._integrity()
+        c["option_clamp_fallbacks"] += 1
+        if len(c["option_clamp_fallback_examples"]) < 3:
+            c["option_clamp_fallback_examples"].append(f"{kind}: {detail}")
+        seen = self.__dict__.setdefault("_clamp_fallback_seen", set())
+        if (kind, detail) not in seen:
+            seen.add((kind, detail))
+            logger.warning("[backtest] option clamp FELL BACK to the strategy-width bound "
+                           "(%s): %s", kind, detail)
+
+    #: Dollars per share a print may sit outside a no-arbitrage relation before it counts as
+    #: inconsistent: the sparse cache rounds to a cent and American exercise can sit a hair
+    #: off the European relations, and neither is a stale print.
+    _PRINT_CONSISTENCY_TOL = 0.02
+
+    def _inconsistent_prints(self, entries: List[Any],
+                             kinds: Tuple[str, ...] = ("convexity", "pair")) -> Dict[str, str]:
+        """Contracts of ONE group whose print breaks the no-arbitrage relations against their
+        same-expiry, same-type siblings, as ``{contract_symbol: reason}``.
+
+        For strikes ``K1 < K2 < K3`` of one expiry and type, calls ``C`` (puts ``P`` mirror
+        the first two with the direction flipped):
+          * monotone: ``C(K1) >= C(K2)`` (puts: ``P(K1) <= P(K2)``);
+          * width: ``|price(K1) - price(K2)| <= K2 - K1``;
+          * convexity: ``price(K2) <= w*price(K1) + (1-w)*price(K3)``, ``w = (K3-K2)/(K3-K1)``.
+        A violated convexity blames the MIDDLE strike (the point the chord bounds); a violated
+        monotone/width pair blames the leg with the LOWER bar volume (the less reliable print;
+        the lower strike on a tie). ``entries`` is ``(lot, px, bar)``. Single-leg groups and
+        groups with no two same-expiry, same-type legs return {} untouched.
+        """
+        by_series: Dict[Any, List[Any]] = {}
+        for lot, px, bar in entries:
+            o = self._lot_order(lot.contract_symbol)
+            if o is None or o.strike is None or o.expiry is None or o.option_type is None:
+                continue
+            by_series.setdefault((o.expiry, o.option_type), []).append(
+                (float(o.strike), float(px), float(bar.get("volume") or 0.0), lot.contract_symbol))
+        tol = self._PRINT_CONSISTENCY_TOL
+        bad: Dict[str, str] = {}
+        for (_expiry, right), legs in by_series.items():
+            if len(legs) < 2:
+                continue
+            legs.sort()
+            is_call = right == OptionRight.CALL
+            for (k1, p1, v1, c1), (k2, p2, v2, c2) in (
+                    zip(legs, legs[1:]) if "pair" in kinds else ()):
+                diff = (p1 - p2) if is_call else (p2 - p1)        # must lie in [0, k2 - k1]
+                if diff < -tol or diff > (k2 - k1) + tol:
+                    culprit = c1 if v1 < v2 or (v1 == v2) else c2
+                    bad.setdefault(culprit, f"strike pair {k1:g}/{k2:g} breaks monotone/width "
+                                            f"({p1:.2f} vs {p2:.2f})")
+            for (k1, p1, _v1, _c1), (k2, p2, _v2, c2), (k3, p3, _v3, _c3) in (
+                    zip(legs, legs[1:], legs[2:]) if "convexity" in kinds else ()):
+                w = (k3 - k2) / (k3 - k1)
+                if p2 > w * p1 + (1.0 - w) * p3 + tol:
+                    bad.setdefault(c2, f"strikes {k1:g}/{k2:g}/{k3:g} break convexity "
+                                       f"({p1:.2f}/{p2:.2f}/{p3:.2f})")
+        return bad
+
+    def _count_print_correction(self, gkey: Any, contract: str, old_px: float, new_px: float,
+                                reason: str) -> None:
+        """One leg-day whose inconsistent print was replaced (counted once per contract per
+        engine date: the mark is read several times a bar)."""
+        day = self._as_of_date()
+        seen = self.__dict__.setdefault("_print_correction_seen", set())
+        if (day, contract) in seen:
+            return
+        seen.add((day, contract))
+        c = self._integrity()
+        c["option_mark_prints_corrected"] += 1
+        if len(c["option_mark_print_examples"]) < 3:
+            c["option_mark_print_examples"].append(
+                f"{day} {contract}: {old_px:.2f} -> {new_px:.2f} ({reason})")
+
+    def _held_value_bounds(self, gkey: Any, lots: List[Any]):
+        """``(lo, hi)`` dollars the legs of one defined-risk group that are STILL HELD can be
+        worth at expiry (``option_payoff.position_value_bounds``), or None -- counted and
+        warned via ``_count_clamp_fallback`` -- when a held leg cannot be expressed.
+        Memoized on the held (contract, signed qty) set: it only changes when a leg closes."""
+        memo = self.__dict__.setdefault("_held_bounds_memo", {})
+        key = (gkey, tuple(sorted((l.contract_symbol, l.qty) for l in lots)))
+        if key in memo:
+            return memo[key]
+        legs = []
+        result = None
+        for lot in lots:
+            o = self._lot_order(lot.contract_symbol)
+            if o is None or o.strike is None or o.option_type not in (OptionRight.CALL,
+                                                                      OptionRight.PUT):
+                legs = None
+                break
+            legs.append(PayoffLeg(
+                kind=("call" if o.option_type == OptionRight.CALL else "put"),
+                side=OrderDirection.BUY if lot.qty > 0 else OrderDirection.SELL,
+                premium=0.0, strike=float(o.strike), ratio=abs(float(lot.qty)),
+                multiplier=float(lot.multiplier)))
+        if legs is None:
+            self._count_clamp_fallback("held_legs_unresolvable",
+                                       f"group {gkey}: a held lot has no resolvable order")
+        else:
+            try:
+                result = position_value_bounds(legs)
+            except ValueError as e:
+                self._count_clamp_fallback("held_legs_invalid", f"group {gkey}: {e}")
+        memo[key] = result
+        return result
 
     def _leg_intrinsic(self, contract_symbol: str, group_bound: Dict[str, Any]) -> Optional[float]:
         """Per-share INTRINSIC value of an option leg at the current underlying close.
@@ -1269,7 +1459,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                             o.id,
                             {"strategy": o.option_strategy,
                              "qty": abs(float(o.quantity or 0.0)) or 1.0,
-                             "strikes": [], "multiplier": float(o.multiplier or 100)},
+                             "strikes": [], "multiplier": float(o.multiplier or 100),
+                             "legs": [], "leg_orders": 0},
                         )
                     else:  # single-leg option (its own group)
                         single_info[cs] = {
@@ -1278,12 +1469,29 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                             "strikes": [float(o.strike)] if o.strike is not None else [],
                             "multiplier": float(o.multiplier or 100),
                         }
-            else:
+            elif getattr(o, "status", None) not in _NEVER_HELD_LEG_STATUSES:
+                # A cancelled / rejected / expired / still-unfilled child leg is not part of
+                # the structure: counting it would make ``leg_orders`` disagree with the legs
+                # that exist and push a healthy group into the width fallback.
                 children.append(o)
         # opening child legs contribute their strikes to the parent group
         for o in children:
-            if o.parent_order_id in parent_info and o.strike is not None:
-                parent_info[o.parent_order_id]["strikes"].append(float(o.strike))
+            if o.parent_order_id in parent_info:
+                info = parent_info[o.parent_order_id]
+                info["leg_orders"] += 1
+                if o.strike is not None:
+                    info["strikes"].append(float(o.strike))
+                # The leg as the shared payoff evaluator sees it (value bounds below). A leg
+                # that cannot be expressed (no strike / right / side / size) leaves the
+                # structure's bounds UNDERIVABLE rather than computed from a partial leg set.
+                if (o.strike is not None and o.option_type in (OptionRight.CALL, OptionRight.PUT)
+                        and o.side in (OrderDirection.BUY, OrderDirection.SELL)
+                        and o.quantity):
+                    info["legs"].append(PayoffLeg(
+                        kind=("call" if o.option_type == OptionRight.CALL else "put"),
+                        side=o.side, premium=0.0, strike=float(o.strike),
+                        ratio=abs(float(o.quantity)),
+                        multiplier=float(o.multiplier or 100)))
 
         def _width(info):
             if info["qty"] <= 0:
@@ -1292,6 +1500,28 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if per is None:
                 return None
             return per * info["multiplier"] * info["qty"]
+
+        def _value_bounds(info):
+            """``(lo, hi)`` dollars the WHOLE structure can be worth (see
+            ``option_payoff.position_value_bounds``), or None when any opening leg could not
+            be expressed. Leg ratios are the legs' own contract counts, so the result is
+            already scaled by the structure quantity."""
+            if "legs" not in info:
+                return None                      # a single-leg option: not a defined-risk group
+            if not info["legs"] or len(info["legs"]) != info["leg_orders"]:
+                self._count_clamp_fallback(
+                    "group_bounds_underivable",
+                    f"{info['strategy']}: {len(info['legs'])} of {info['leg_orders']} opening "
+                    f"leg order(s) could be expressed as payoff legs")
+                return None
+            try:
+                return position_value_bounds(info["legs"])
+            except ValueError as e:
+                # One bad leg must not abort every bar's mark: counted, warned and the
+                # group falls back to the strategy-width rule. LOUD, never silent.
+                self._count_clamp_fallback("group_bounds_invalid",
+                                           f"{info['strategy']}: {e}")
+                return None
 
         contract_group: Dict[str, Any] = {}
         group_bounds: Dict[Any, Dict[str, Any]] = {}
@@ -1310,7 +1540,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 continue
             contract_group[cs] = gkey
             if gkey not in group_bounds:
-                group_bounds[gkey] = {"strategy": info["strategy"], "width": _width(info)}
+                vb = _value_bounds(info)
+                group_bounds[gkey] = {
+                    "strategy": info["strategy"], "width": _width(info),
+                    "lo": None if vb is None else vb[0],
+                    "hi": None if vb is None else vb[1],
+                }
         self._group_bounds_memo = (self._option_memo_gen, contract_group, group_bounds)
         return contract_group, group_bounds
 
@@ -5006,7 +5241,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         Recorded, not scored."""
         c = self._integrity()
-        return {**c, "option_ledger_mismatches": {
+        return {**c,
+                "option_clamp_fallback_examples": list(c["option_clamp_fallback_examples"]),
+                "option_mark_print_examples": list(c["option_mark_print_examples"]),
+                "option_ledger_mismatches": {
             "count": c["option_ledger_mismatches"]["count"],
             "examples": [dict(e) for e in c["option_ledger_mismatches"]["examples"]]}}
 
@@ -6033,9 +6271,25 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Safety clamp: a defined-risk combo's expiry payoff magnitude can never exceed the
         # structure's defined risk. Bound both directions so rounding / bad cache data cannot
         # leak past it.
-        bound = self._combo_expiry_bound(txn, positions, strikes)
-        if bound is not None:
-            net_payoff = max(-bound, min(net_payoff, bound))
+        # The bounds are the held legs' TRUE value range (``position_value_bounds``), so the
+        # clamp cannot clip a real liability: the symmetric ``+-width`` below cuts a call
+        # butterfly whose upper wing is more than twice its lower, whose expiry payoff
+        # exceeds the lower gap in magnitude. Falls back to the symmetric bound only when the
+        # legs cannot be expressed.
+        try:
+            lo, hi = position_value_bounds([
+                PayoffLeg(kind=("call" if p.option_type == OptionRight.CALL else "put"),
+                          side=p.side, premium=0.0, strike=float(p.strike),
+                          ratio=abs(float(p.quantity)), multiplier=float(p.multiplier or 100))
+                for p in positions])
+        except (ValueError, TypeError) as e:
+            # A defined-risk combo whose held legs cannot be expressed is REFUSED, not clamped
+            # by a cruder rule: this clamp moves cash, and a wrong bound destroys it. (The mark
+            # clamp falls back loudly instead, because a refusal there would abort every bar.)
+            raise ComboSettlementRefused(
+                f"cannot settle a defined-risk combo at expiry: its held legs have no payoff "
+                f"bounds ({type(e).__name__}: {e})") from e
+        net_payoff = max(lo, min(net_payoff, hi))
 
         # Apply the net payoff to cash and book each leg's synthetic close (moves no extra cash).
         self._cash += net_payoff
