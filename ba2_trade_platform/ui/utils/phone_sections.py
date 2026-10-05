@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from typing import List, Sequence, Tuple
 
 from .responsive import PHONE_MAX_WIDTH_PX, phone_media
+from .secret_mask import secret_input_css
 
 #: Classes (the CSS addresses these, never a position).
 SECTION_CLASS = 'bm-sec'
@@ -219,7 +220,9 @@ def _phone_list_css() -> str:
 
 def phone_css() -> str:
     """Everything the Settings page's expert list and dialog need, in one string. Pure."""
-    return '\n'.join((DESKTOP_CSS, phone_media(_phone_dialog_css()), phone_media(_phone_list_css())))
+    # secret_input_css: the eye toggle of a credential input is a >= 40 px tap target.
+    return '\n'.join((DESKTOP_CSS, secret_input_css(), phone_media(_phone_dialog_css()),
+                      phone_media(_phone_list_css())))
 
 
 # ---------------------------------------------------------------------------

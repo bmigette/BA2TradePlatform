@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from ...core.db import get_instance
 from ...core.models import SmartRiskManagerJob, ExpertInstance, AccountDefinition, Transaction
 from ...logger import logger
+from .secret_display import masked_json_view
 
 
 def format_duration(seconds: Optional[int]) -> str:
@@ -559,7 +560,7 @@ class SmartRiskManagerContentRenderer:
             try:
                 # Try to parse as JSON
                 state = json.loads(job.graph_state) if isinstance(job.graph_state, str) else job.graph_state
-                ui.json_editor({'content': {'json': state}}).classes('w-full')
+                masked_json_view(state, read_only=False)
             except (json.JSONDecodeError, TypeError):
                 # Display as plain text if not valid JSON
                 ui.label(str(job.graph_state)).classes(f'text-sm whitespace-pre-wrap {self._text_class("primary")}').style(self._text_style("primary"))

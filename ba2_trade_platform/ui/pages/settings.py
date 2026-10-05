@@ -48,10 +48,21 @@ from ba2_common.core.trigger_catalog import (
 from functools import partial
 from ..components.refresh_button import refresh_button
 from ..utils import phone_sections as _phone_sections
+from ..utils.secret_mask import SECRET_INPUT_CLASS, is_secret_setting
 from ..utils.phone_sections import (expert_card_template,
                                     check_card_covers_table, phone_css, DIALOG_CLASS, TABS_CLASS,
                                     FOOT_CLASS, LIST_CLASS, LIST_TOP_CLASS)
 from ..utils.responsive import PhoneTableRegistry, install_phone_listener, phone_grid_prop
+
+
+def _secret_input(label, value=''):
+    """A credential input: hidden by default, eye icon to reveal (never pre-revealed).
+
+    ``password=True`` only changes how the browser DRAWS the field; ``.value`` is the real
+    text, so what the form records and what Save compares/writes is unchanged.
+    """
+    return ui.input(label=label, value=value, password=True,
+                    password_toggle_button=True).classes(SECRET_INPUT_CLASS)
 
 
 def phone_section(title, **kwargs):
@@ -886,44 +897,44 @@ class AppSettingsTab:
             
             with ui.expansion('OpenAI', icon='smart_toy').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
-                    self.openai_input = ui.input(label='OpenAI API Key', value=self._shown_value('openai_api_key'), password=True, password_toggle_button=True).classes('w-full')
+                    self.openai_input = _secret_input(label='OpenAI API Key', value=self._shown_value('openai_api_key')).classes('w-full')
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.openai_admin_input = ui.input(label='OpenAI Admin API Key (for usage data)', value=self._shown_value('openai_admin_api_key'), password=True, password_toggle_button=True).classes('flex-1')
+                        self.openai_admin_input = _secret_input(label='OpenAI Admin API Key (for usage data)', value=self._shown_value('openai_admin_api_key')).classes('flex-1')
                         ui.link('Get Admin Key', 'https://platform.openai.com/settings/organization/admin-keys', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('NagaAI', icon='waves').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.naga_ai_input = ui.input(label='NagaAI API Key', value=self._shown_value('naga_ai_api_key'), password=True, password_toggle_button=True).classes('flex-1')
+                        self.naga_ai_input = _secret_input(label='NagaAI API Key', value=self._shown_value('naga_ai_api_key')).classes('flex-1')
                         ui.link('Get NagaAI Key', 'https://naga.ac/', new_tab=True).classes('text-sm text-blue-600 underline')
-                    self.naga_ai_admin_input = ui.input(label='NagaAI Admin API Key (for usage data)', value=self._shown_value('naga_ai_admin_api_key'), password=True, password_toggle_button=True).classes('w-full')
+                    self.naga_ai_admin_input = _secret_input(label='NagaAI Admin API Key (for usage data)', value=self._shown_value('naga_ai_admin_api_key')).classes('w-full')
             
             with ui.expansion('Anthropic (Claude)', icon='psychology').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.anthropic_input = ui.input(label='Anthropic API Key', value=self._shown_value('anthropic_api_key'), password=True, password_toggle_button=True).classes('flex-1')
+                        self.anthropic_input = _secret_input(label='Anthropic API Key', value=self._shown_value('anthropic_api_key')).classes('flex-1')
                         ui.link('Get Anthropic Key', 'https://console.anthropic.com/settings/keys', new_tab=True).classes('text-sm text-blue-600 underline')
-                    self.anthropic_admin_input = ui.input(label='Anthropic Admin API Key (sk-ant-admin..., for spend/usage data)', value=self._shown_value('anthropic_admin_api_key'), password=True, password_toggle_button=True).classes('w-full')
+                    self.anthropic_admin_input = _secret_input(label='Anthropic Admin API Key (sk-ant-admin..., for spend/usage data)', value=self._shown_value('anthropic_admin_api_key')).classes('w-full')
             
             with ui.expansion('Google (Gemini)', icon='auto_awesome').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.google_input = ui.input(label='Google API Key', value=self._shown_value('google_api_key'), password=True, password_toggle_button=True).classes('flex-1')
+                        self.google_input = _secret_input(label='Google API Key', value=self._shown_value('google_api_key')).classes('flex-1')
                         ui.link('Get Google Key', 'https://aistudio.google.com/app/apikey', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('OpenRouter', icon='route').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.openrouter_input = ui.input(label='OpenRouter API Key', value=self._shown_value('openrouter_api_key'), password=True, password_toggle_button=True).classes('flex-1')
+                        self.openrouter_input = _secret_input(label='OpenRouter API Key', value=self._shown_value('openrouter_api_key')).classes('flex-1')
                         ui.link('Get OpenRouter Key', 'https://openrouter.ai/keys', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('xAI (Grok)', icon='bolt').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.xai_input = ui.input(label='xAI API Key', value=self._shown_value('xai_api_key'), password=True, password_toggle_button=True).classes('flex-1')
+                        self.xai_input = _secret_input(label='xAI API Key', value=self._shown_value('xai_api_key')).classes('flex-1')
                         ui.link('Get xAI Key', 'https://console.x.ai/', new_tab=True).classes('text-sm text-blue-600 underline')
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.xai_admin_input = ui.input(label='xAI Admin API Key (for billing/usage data)', value=self._shown_value('xai_admin_api_key'), password=True, password_toggle_button=True).classes('flex-1')
+                        self.xai_admin_input = _secret_input(label='xAI Admin API Key (for billing/usage data)', value=self._shown_value('xai_admin_api_key')).classes('flex-1')
                         ui.link('Management API Docs', 'https://docs.x.ai/docs/key-information/using-management-api', new_tab=True).classes('text-sm text-blue-600 underline')
                     self.xai_team_id_input = ui.input(label='xAI Team ID (e.g., team-xxxxx)', value=self._shown_value('xai_team_id')).classes('w-full')
                     ui.label('Find your Team ID in the xAI console URL or account settings').classes('text-xs text-gray-500')
@@ -931,22 +942,22 @@ class AppSettingsTab:
             with ui.expansion('Moonshot (Kimi)', icon='nightlight').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.moonshot_input = ui.input(label='Moonshot API Key', value=self._shown_value('moonshot_api_key'), password=True, password_toggle_button=True).classes('flex-1')
+                        self.moonshot_input = _secret_input(label='Moonshot API Key', value=self._shown_value('moonshot_api_key')).classes('flex-1')
                         ui.link('Get Moonshot Key', 'https://platform.moonshot.ai/console/api-keys', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('DeepSeek', icon='explore').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.deepseek_input = ui.input(label='DeepSeek API Key', value=self._shown_value('deepseek_api_key'), password=True, password_toggle_button=True).classes('flex-1')
+                        self.deepseek_input = _secret_input(label='DeepSeek API Key', value=self._shown_value('deepseek_api_key')).classes('flex-1')
                         ui.link('Get DeepSeek Key', 'https://platform.deepseek.com/api_keys', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('AWS Bedrock', icon='cloud').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     ui.label('AWS credentials for Amazon Bedrock models (Claude, etc.)').classes('text-sm text-gray-500')
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.aws_access_key_input = ui.input(label='AWS Access Key ID', value=self._shown_value('aws_access_key_id'), password=True, password_toggle_button=True).classes('flex-1')
+                        self.aws_access_key_input = _secret_input(label='AWS Access Key ID', value=self._shown_value('aws_access_key_id')).classes('flex-1')
                         ui.link('Get AWS Keys', 'https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html', new_tab=True).classes('text-sm text-blue-600 underline')
-                    self.aws_secret_key_input = ui.input(label='AWS Secret Access Key', value=self._shown_value('aws_secret_access_key'), password=True, password_toggle_button=True).classes('w-full')
+                    self.aws_secret_key_input = _secret_input(label='AWS Secret Access Key', value=self._shown_value('aws_secret_access_key')).classes('w-full')
                     self.aws_region_input = ui.input(label='AWS Region (e.g., us-east-1)', value=self._shown_value('aws_bedrock_region')).classes('w-full')
         
         # =================================================================
@@ -956,11 +967,11 @@ class AppSettingsTab:
             ui.label('📊 Data Provider API Keys').classes('text-xl font-bold mb-2')
             ui.label('Configure API keys for market data providers').classes('text-sm text-gray-500 mb-4')
             
-            self.finnhub_input = ui.input(label='Finnhub API Key', value=self._shown_value('finnhub_api_key'), password=True, password_toggle_button=True).classes('w-full')
-            self.fred_input = ui.input(label='FRED API Key', value=self._shown_value('fred_api_key'), password=True, password_toggle_button=True).classes('w-full')
-            self.alpha_vantage_input = ui.input(label='Alpha Vantage API Key', value=self._shown_value('alpha_vantage_api_key'), password=True, password_toggle_button=True).classes('w-full')
+            self.finnhub_input = _secret_input(label='Finnhub API Key', value=self._shown_value('finnhub_api_key')).classes('w-full')
+            self.fred_input = _secret_input(label='FRED API Key', value=self._shown_value('fred_api_key')).classes('w-full')
+            self.alpha_vantage_input = _secret_input(label='Alpha Vantage API Key', value=self._shown_value('alpha_vantage_api_key')).classes('w-full')
             with ui.row().classes('w-full items-center gap-2 mt-2'):
-                self.fmp_input = ui.input(label='Financial Modeling Prep (FMP) API Key', value=self._shown_value('FMP_API_KEY'), password=True, password_toggle_button=True).classes('flex-1')
+                self.fmp_input = _secret_input(label='Financial Modeling Prep (FMP) API Key', value=self._shown_value('FMP_API_KEY')).classes('flex-1')
                 ui.link('Get FMP Key', 'https://site.financialmodelingprep.com/developer/docs', new_tab=True).classes('text-sm text-blue-600 underline')
         
         # =================================================================
@@ -971,9 +982,9 @@ class AppSettingsTab:
             ui.label('Configure API keys for trading brokers').classes('text-sm text-gray-500 mb-4')
             
             with ui.row().classes('w-full items-center gap-2'):
-                self.alpaca_key_input = ui.input(label='Alpaca API Key', value=self._shown_value('alpaca_api_key'), password=True, password_toggle_button=True).classes('flex-1')
+                self.alpaca_key_input = _secret_input(label='Alpaca API Key', value=self._shown_value('alpaca_api_key')).classes('flex-1')
                 ui.link('Get Alpaca Keys', 'https://alpaca.markets/docs/trading/getting-started/', new_tab=True).classes('text-sm text-blue-600 underline')
-            self.alpaca_secret_input = ui.input(label='Alpaca API Secret', value=self._shown_value('alpaca_api_secret'), password=True, password_toggle_button=True).classes('w-full')
+            self.alpaca_secret_input = _secret_input(label='Alpaca API Secret', value=self._shown_value('alpaca_api_secret')).classes('w-full')
         
         # =================================================================
         # System Settings Section
@@ -1432,7 +1443,10 @@ class AccountDefinitionsTab:
                             _show_select_error(key, inp, select_error)
                             self._select_checks[key] = (inp, list(valid_values))
                         elif meta["type"] == "str":
-                            inp = ui.input(label=label, value=value or "").props('dense outlined').classes('flex-grow')
+                            if is_secret_setting(key, meta):
+                                inp = _secret_input(label, value or "").props('dense outlined').classes('flex-grow')
+                            else:
+                                inp = ui.input(label=label, value=value or "").props('dense outlined').classes('flex-grow')
                         elif meta["type"] == "bool":
                             # Stored value (through coerce_bool), else the DECLARED default --
                             # an unset bool used to show False whatever the definition said.
@@ -1469,6 +1483,8 @@ class AccountDefinitionsTab:
                             inp = ui.input(label=label, value="" if value is None
                                            else display_text(settings_def, key, value)
                                            ).props('dense outlined').classes('flex-grow')
+                        elif is_secret_setting(key, meta):
+                            inp = _secret_input(label, value or "").props('dense outlined').classes('flex-grow')
                         else:
                             inp = ui.input(label=label, value=value or "").props('dense outlined').classes('flex-grow')
                         _help(tooltip_text)
@@ -3712,7 +3728,10 @@ class ExpertSettingsTab:
                                            else display_text(builtin, key, value)).classes('w-full').props('dense')
                         else:
                             value = current_value if current_value is not None else default_value or ""
-                            inp = ui.input(label='', value=str(value)).classes('w-full').props('dense')
+                            if is_secret_setting(key, meta):
+                                inp = _secret_input('', str(value)).classes('w-full').props('dense')
+                            else:
+                                inp = ui.input(label='', value=str(value)).classes('w-full').props('dense')
 
                         _render_reset_default_button(inp, default_value, meta)
 
@@ -4066,6 +4085,8 @@ class ExpertSettingsTab:
                                         inp.props('use-input')  # Enable search for long lists
                                     _show_select_error(key, inp, select_error)
                                     self._select_checks_expert[key] = (inp, list(valid_values))
+                            elif is_secret_setting(key, meta):
+                                inp = _secret_input(display_label, value)
                             else:
                                 inp = ui.input(label=display_label, value=value).classes('w-full')
                         elif meta["type"] == "list":
