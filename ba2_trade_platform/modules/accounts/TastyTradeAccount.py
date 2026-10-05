@@ -1283,7 +1283,7 @@ class TastyTradeAccount(AccountInterface):
             # find nothing resting (its prepare step already cancelled) and pass untouched.
             if trading_order.side == OrderDirection.SELL:
                 from ...core import allocator_protection_service as _protect
-                blocked = _protect.before_sale(self, trading_order.symbol)
+                blocked = _protect.before_sale(self, trading_order.symbol, trading_order.quantity)
                 if blocked is not None:
                     raise RuntimeError(f"sale of {trading_order.symbol} refused: {blocked}")
 

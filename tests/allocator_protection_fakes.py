@@ -170,6 +170,22 @@ class FakeTastyBroker:
         record["cancel_left"] = self.cancel_polls
 
     # ---- plain orders (the stop-only runner) ---------------------------------
+    def single_place_count(self) -> int:
+        """LIVE (non dry-run) plain-order placements so far."""
+        return sum(1 for dry, _ in self.single_place_calls if not dry)
+
+    def place_foreign_stop(self, symbol: str, qty: int, stop: float, tag: str) -> int:
+        """A resting STOP order for ANOTHER symbol that carries ``tag`` (a reused-id collision)."""
+        from tastytrade.order import Leg, NewOrder, OrderAction, OrderTimeInForce
+        from tastytrade.order import OrderType as TTOT
+        leg = Leg(instrument_type=TTInstrumentType.EQUITY, symbol=symbol, action=OrderAction.SELL_TO_CLOSE,
+                  quantity=Decimal(qty))
+        new = NewOrder(time_in_force=OrderTimeInForce.GTC, order_type=TTOT.STOP, legs=[leg],
+                       stop_trigger=Decimal(str(stop)), external_identifier=tag)
+        member = self._placed_from_new(new)
+        self.singles[int(member.id)] = {"member": member, "cancel_left": None}
+        return int(member.id)
+
     async def place_order(self, session, order, dry_run: bool = True):
         self.single_place_calls.append((dry_run, order))
         if dry_run:
@@ -321,8 +337,8 @@ class FakeTastyBroker:
             account_number="5WX00000", time_in_force=new.time_in_force, order_type=new.order_type,
             underlying_symbol=new.legs[0].symbol, underlying_instrument_type=TTInstrumentType.EQUITY,
             status=TTOrderStatus.LIVE, cancellable=True, editable=True, edited=False,
-            updated_at=datetime(2026, 10, 5, 14, 0, tzinfo=timezone.utc),
-            received_at=datetime(2026, 10, 5, 14, 0, tzinfo=timezone.utc), legs=legs, id=oid,
+            updated_at=datetime.now(timezone.utc),
+            received_at=datetime.now(timezone.utc), legs=legs, id=oid,
             size=size, price=new.price, stop_trigger=new.stop_trigger,
             gtc_date=date(2027, 1, 3), external_identifier=new.external_identifier)
 

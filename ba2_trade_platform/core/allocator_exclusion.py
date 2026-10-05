@@ -102,7 +102,8 @@ def split_included(symbols: Iterable[str], excluded: Iterable[str]) -> List[str]
 # =========================================================================================
 
 def reduce_symbol_weights(account_id: int, symbol: str, factor: float, *, reason: str,
-                          detail: str) -> List[AllocatorWeightChange]:
+                          detail: str, implicit: Optional[Dict[str, float]] = None
+                          ) -> List[AllocatorWeightChange]:
     """Multiply the STORED weight of ``symbol`` by ``factor`` in every label that has one, and
     write one audit row per change. Returns the audit rows (``[]`` when no label stores a weight
     for it: a symbol on the derived default -- its actual share -- follows its holdings by itself).
@@ -119,6 +120,16 @@ def reduce_symbol_weights(account_id: int, symbol: str, factor: float, *, reason
         rows = list(session.exec(select(PortfolioAllocationSymbol).where(
             PortfolioAllocationSymbol.account_id == int(account_id),
             PortfolioAllocationSymbol.symbol == symbol)).all())
+        # A label with NO stored row for the symbol runs on the derived default (its actual share).
+        # ``implicit`` carries that share per label: an EXPLICIT row is written with share x factor, so
+        # the reduction applies and a stopped-out symbol is not bought back (operator, 2026-10-05).
+        stored_labels = {r.label for r in rows}
+        for label, share in (implicit or {}).items():
+            if label not in stored_labels and factor < 1.0:
+                row = PortfolioAllocationSymbol(account_id=int(account_id), label=label,
+                                                symbol=symbol, weight_pct=float(share))
+                session.add(row)
+                rows.append(row)
         for row in rows:
             before = float(row.weight_pct or 0.0)
             after = round(before * factor, 6)

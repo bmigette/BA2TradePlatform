@@ -406,3 +406,19 @@ regular hours.
 1. Weight of a symbol with no STORED weight row is never reduced by a fill (it follows holdings).
 2. Re-including an excluded symbol after fills reduced others can push a label over 100%: warn?
 3. The row shows only the latest fill note; the history is the audit table and the activity log.
+
+## 13. Round 2 fixes (2026-10-05, branch fix/alloc-tp-sl-round2)
+
+- N8: every automatic re-placement plans and validates BEFORE it cancels (`_preflight_errors`); a refused plan
+  keeps the existing orders and alerts. Targets at or below the price (the one that just filled) are dropped
+  (`drop_reached_targets`) and their fraction folds into the stop-only runner, so the stop always remains.
+- N1: tags are `ba2prot:{id}:{index}:{nonce}`; an order found by tag is adopted only when symbol, quantity and
+  received time (>= placed_at) match, otherwise UNKNOWN_STATE alert and no adoption.
+- N2: UNKNOWN stays blocking until `UNKNOWN_MIN_AGE_SECONDS` (300) old, then history is searched again.
+- N5: `_disarm` refuses (QUANTITY_MISMATCH, alert kept) while any slice rests.
+- N6: `before_sale` looks the row up before taking the account lock.
+- N7: `before_sale` stores `expected_qty` (new column, Alembic b8d1f4a29c63); `resume_protection` waits for the
+  broker read to agree, up to FILL_SETTLE_SECONDS.
+- Q1: a protective fill on a symbol with no stored weight row writes an explicit row (measured share x factor).
+- Q2: the include dialog warns (never blocks) when a label's stored shares would exceed 100%.
+- Q3: the latest fill note is enough (no change).

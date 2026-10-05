@@ -102,6 +102,7 @@ class AllocatorProtection(SQLModel, table=True):
     pending_replace: bool = Field(default=False, description="We cancelled the orders and owe the re-placement")
     pending_replace_since: DateTime | None = Field(default=None)
     last_fill_at: DateTime | None = Field(default=None, description="When a protective order last filled")
+    expected_qty: float | None = Field(default=None, description="Position expected after a platform sale that triggered the cancel; the re-placement waits until the broker read agrees (or the settle window passes)")
     auto_failures: int = Field(default=0, description="Consecutive failed AUTOMATIC placements (growth / resize / renewal); the automatic paths stop at AUTO_FAILURE_LIMIT")
     last_auto_action_at: DateTime | None = Field(default=None, description="When the background reconcile last cancelled/re-placed on its own (rate limit)")
     disarmed_at: DateTime | None = Field(default=None, description="The position was exited: the settings were cleared (history below)")

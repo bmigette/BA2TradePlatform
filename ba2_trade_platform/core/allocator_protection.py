@@ -31,6 +31,9 @@ GTC_RENEW_DAYS = 7
 FILL_SETTLE_SECONDS = 300
 #: Consecutive failed AUTOMATIC placements after which the background paths stop retrying (loud alert).
 AUTO_FAILURE_LIMIT = 3
+#: An UNKNOWN slice (a placement whose outcome we do not know) is never concluded 'never placed'
+#: before it is this old: the broker may simply not have listed it yet (round-2 review N2).
+UNKNOWN_MIN_AGE_SECONDS = 300
 #: Minimum gap between two automatic cancel/re-place actions on one symbol.
 AUTO_ACTION_MIN_INTERVAL_SECONDS = 600
 #: A PLACING row older than this is an alarm: the broker call never reported back.
@@ -228,6 +231,22 @@ def validate_protection(*, sl_price: Optional[float], targets: Sequence[TpTarget
 def runner_fraction(targets: Sequence[TpTarget]) -> float:
     """The share of the position no take-profit covers (the stop-only runner), 0..1."""
     return max(0.0, 1.0 - sum(t.fraction for t in targets))
+
+
+def drop_reached_targets(targets: Sequence[TpTarget], last_price: float,
+                         tick_sizes: Optional[Sequence[Any]] = None
+                         ) -> Tuple[List[TpTarget], List[TpTarget]]:
+    """Split ``targets`` into ``(usable, reached)``: a target AT or BELOW the current price (after tick
+    rounding) is already reached -- typically the one that just filled -- and a limit sell there would
+    fill at once or be refused. Pure. The fraction of a dropped target is not carved out of anything:
+    ``plan_slices`` sizes the stop-only remainder as ``1 - sum(usable fractions)``, so it folds into
+    the stop-only order and the stop ALWAYS covers the whole position.
+    """
+    tick = tick_for_price(last_price, tick_sizes)
+    usable, reached = [], []
+    for t in targets:
+        (reached if round_price_to_tick(t.price, tick, "nearest") <= last_price else usable).append(t)
+    return usable, reached
 
 
 def split_quantity(shares: int, fractions: Sequence[float]) -> List[int]:
