@@ -409,6 +409,28 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any], *,
                            exc_info=True)
             return None
 
+    iv_reader = getattr(options, "iv_at_entry", None)
+    rate_source_fn = getattr(account, "options_risk_free_rate_source", None)
+    rate_source = rate_source_fn() if callable(rate_source_fn) else None
+
+    def _iv_at_entry(underlying: str, contract: str, dt: Any) -> Optional[float]:
+        # The multi-leg refinement's second option seam (Black-Scholes needs the leg's iv).
+        # Same discipline as ``_delta_at_entry``: never fatal, never 0.0.
+        try:
+            return iv_reader(underlying, contract, dt)
+        except Exception:  # noqa: BLE001
+            logger.warning("[backtest] iv_at_entry(%s, %s, %s) failed; the multi-leg structure "
+                           "is left out of the intraday refinement.", underlying, contract, dt,
+                           exc_info=True)
+            return None
+
+    def _risk_free_rate(dt: Any) -> float:
+        # THE RUN'S OWN rate (``options_risk_free_rate_source``, FRED as-of), the one the
+        # engine's Black-Scholes mark uses -- never a flat default. A FRED series that does
+        # not cover the date raises, which counts the structure as errored (loud).
+        day = dt.date() if hasattr(dt, "date") else dt
+        return float(rate_source.rate_on(day))
+
     def _bars_5m_between(symbol: str, entry: Any, exit_: Any) -> List[Dict[str, Optional[float]]]:
         df = _bars_5m_for_symbol(symbol)
         if df is None or df.empty or entry is None or exit_ is None:
@@ -421,7 +443,8 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any], *,
         # the post-split bars would otherwise read as a fake k-fold move. Without a split
         # inside the trade the two factors are the same number.
         k = _entry_factor(symbol, entry)
-        return [{"Low": _in_basis(row["Low"], k), "High": _in_basis(row["High"], k)}
+        return [{"Date": row["Date"], "Low": _in_basis(row["Low"], k),
+                 "High": _in_basis(row["High"], k)}
                 for _, row in window.iterrows()]
 
     def _refine(trades: List[Dict[str, Any]], max_drawdown: float) -> float:
@@ -458,9 +481,14 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any], *,
                 return running_peaks[0]
             return running_peaks[max(bisect_right(snap_dates, dt) - 1, 0)]
 
+        stats: Dict[str, int] = {}
+        _refine.last_stats = stats
         return refine_max_drawdown(
             parsed_trades,
             max_drawdown,
+            iv_at_entry=_iv_at_entry if callable(iv_reader) and rate_source is not None else None,
+            risk_free_rate=_risk_free_rate if rate_source is not None else None,
+            stats=stats,
             equity_at=lambda dt: getattr(account, "_equity_at", lambda _dt: None)(dt),
             peak_at=_peak_at,
             drawdown_base=equity_cap,
@@ -472,6 +500,7 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any], *,
             commission_per_trade=commission,
         )
 
+    _refine.last_stats = {}
     return _refine
 
 
@@ -582,7 +611,10 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
         # no-op for equities, per-FILL fallback rows and blobs persisted before the round-trip
         # recorder published the column.
         "transaction_id": trade.get("transaction_id"),
-        "multiplier": _finite(trade.get("multiplier"), "trade.multiplier", default=1.0),
+        # An OPTION leg has no safe default: 1.0 would read a 100x contract as one share and
+        # cap a structure's max loss 100x too small. Equity / per-FILL rows keep the 1.0 no-op.
+        "multiplier": _finite(trade.get("multiplier"), "trade.multiplier",
+                              default=None if _is_option_leg(trade) else 1.0),
     }
     # THE OPTION TRADE RECORD (BT/live option parity, plan Part C4), OPTION ROWS ONLY and only
     # when the recorder attached it: every equity row -- and every per-FILL fallback row --
@@ -737,6 +769,10 @@ def _compute_metrics(
     #: the curve was empty), "applied" (it ran; the figure may or may not have moved) or
     #: "failed:<ExcType>" (it raised; the daily figure stands). Recorded next to the figure.
     refinement_status = "none"
+    #: The refinement's coverage counters (structures priced, capped, unbounded, uncovered,
+    #: staggered, rolled ...), recorded next to the figure: a GA trial child runs with logging
+    #: disabled, so the log line is not where a reader will find them.
+    refinement_stats: Dict[str, int] = {}
     if refine_drawdown_fn is not None and dd_values:
         # Best-effort: a daily-bar equity curve can hide a real intraday dip for a
         # single-bar-held option trade, or one whose exit day made a new low vs. the day
@@ -747,6 +783,7 @@ def _compute_metrics(
         try:
             max_drawdown = refine_drawdown_fn(trades, max_drawdown)
             refinement_status = "applied"
+            refinement_stats = dict(getattr(refine_drawdown_fn, "last_stats", None) or {})
         except Exception as e:  # noqa: BLE001 -- refinement must never fail the backtest
             # Kept running on the daily figure, but LOUDLY and on the record: a refinement that
             # failed reports a max_drawdown that is a different quantity from one that ran, and
@@ -995,7 +1032,8 @@ def _compute_metrics(
         # Only where a refinement exists (option runs): an equity result must keep exactly its
         # old key set, so a stored stock backtest re-runs byte-identical (user acceptance gate,
         # 2026-09-25 -- the key used to be written as "none" on every equity run).
-        **({"max_drawdown_refinement": refinement_status}
+        **({"max_drawdown_refinement": refinement_status,
+            "max_drawdown_refinement_stats": refinement_stats}
            if refine_drawdown_fn is not None else {}),
         "avg_drawdown": round(_finite(avg_drawdown, "avg_drawdown"), 2),
         "max_drawdown_duration": round(_finite(max_dd_duration, "max_drawdown_duration"), 1),

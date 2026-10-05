@@ -1443,6 +1443,27 @@ class ParquetOptionsProvider:
         contract, and building a whole chain (and every greek in it) to read one delta is what
         makes a refinement expensive enough to be worth switching off.
         """
+        hit = self._entry_row(underlying, occ_symbol, when)
+        if hit is None:
+            return None
+        u, i, ci = hit
+        return u.greeks_tuple(i, ci, self.spot_source)[1]
+
+    def iv_at_entry(self, underlying: str, occ_symbol: str, when: Any) -> Optional[float]:
+        """The contract's implied vol AS OF ``when`` (same strictly-prior snapshot as
+        ``delta_at_entry``): the input the multi-leg intraday refinement re-prices with
+        Black-Scholes. None when there is no prior snapshot or no usable iv -- never 0.0."""
+        hit = self._entry_row(underlying, occ_symbol, when)
+        if hit is None:
+            return None
+        u, i, ci = hit
+        return u.delta_iv_of_row(i, ci, self.spot_source)[1]
+
+    def _entry_row(self, underlying: str, occ_symbol: str, when: Any):
+        """``(underlying_store, row, contract_index)`` of the contract's LATEST row strictly
+        before ``when``'s date, or None -- the shared as-of discipline of the two entry seams
+        (see ``delta_at_entry``: a daily row is dated at the CLOSE, so the entry day's own row
+        has already absorbed the session)."""
         d = _as_date(when)
         if d is None:
             return None
@@ -1468,7 +1489,7 @@ class ParquetOptionsProvider:
             # move with the underlying, which would silently report a refined drawdown of
             # exactly the daily one. The caller counts this as uncovered.
             return None
-        return u.greeks_tuple(i, ci, self.spot_source)[1]
+        return u, i, ci
 
     # -- internals ------------------------------------------------------
     def _u(self, underlying: str) -> _Underlying:

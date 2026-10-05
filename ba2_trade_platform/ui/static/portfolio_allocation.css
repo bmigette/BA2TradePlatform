@@ -112,6 +112,32 @@
     .pf-fold .pf-tiles { margin: 0; padding: 0 8px 10px; }
     .q-table__grid-content { padding: 0 !important; }
 
+
+    /* THE SET TP/SL CONTROL: a shield button and a status chip. The chip never wraps. */
+    .pf-prot-chip { white-space: nowrap; line-height: 1.2; }
+    .pf-sym-head > .pf-prot { margin-left: 6px; }
+    .pf-sym-head > .pf-excl { margin-left: 6px; }
+    .pf-prot-note { white-space: nowrap; font-size: 0.7rem; }
+    .pf-excl-chip { white-space: nowrap; }
+    /* AN EXCLUDED ROW is greyed (it is outside the managed money); its toggle stays readable. */
+    .pf-row-excluded td { opacity: 0.55; }
+    .pf-row-excluded td:has(.pf-excl) { opacity: 1; }
+    .pf-sym-card--excl .pf-tiles, .pf-sym-card--excl .pf-field { opacity: 0.55; }
+    /* the dialog's take-profit rows: price + share + delete stay on one line on a desktop */
+    .pf-tp-row .q-field { min-width: 0; }
+
+@media (max-width: 639px) {
+
+    /* THE TP/SL DIALOG on a phone: each take-profit row is a full-width price over a share box
+       and the delete button, never three fields squeezed into 340px. */
+    .pf-tp-row.pf-tp-row { flex-wrap: wrap !important; row-gap: 4px; }
+    .pf-tp-row.pf-tp-row > .flex-grow { flex: 1 1 100% !important; }
+    .pf-tp-row.pf-tp-row > .w-32 { flex: 1 1 auto !important; width: auto !important; }
+    .pf-prot-dialog .q-field__control { min-height: 44px; }
+    .pf-sym-head > .pf-prot { margin-left: auto; }
+    .pf-bar-row > .pf-b-excl { order: 3; }
+
+}
 @media (max-width: 639px) {
 
     .pf-swatch { width: 36px !important; height: 36px !important; }

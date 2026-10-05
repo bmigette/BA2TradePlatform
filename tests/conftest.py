@@ -94,6 +94,33 @@ def reset_account_filter_state():
 
 
 @pytest.fixture(autouse=True)
+def forget_nicegui_test_clients():
+    """Drop the ``nicegui.Client`` objects a test constructed, so they cannot starve other tests.
+
+    NiceGUI answers ``ui.context.client`` outside any ``with`` block by lazily creating a pseudo
+    "script" client -- but ONLY while ``Client.instances`` is empty. A test that builds its own
+    ``Client(page(...), request=None)`` registers it there and (its fixture removes the elements,
+    not the registry entry) leaves it behind, after which every later test that touches
+    ``ui.context.client`` bare -- ``tests/test_batch_import_upload.py`` is one -- dies with "The
+    current slot cannot be determined because the slot stack for this task is empty". It only
+    showed once a client-building test file sorted BEFORE that one in pytest's alphabetical order.
+    The script client NiceGUI itself created is never touched.
+    """
+    import sys
+    client_module = sys.modules.get('nicegui.client')
+    before = set(client_module.Client.instances) if client_module is not None else set()
+    yield
+    client_module = sys.modules.get('nicegui.client')
+    if client_module is None:
+        return
+    core_module = sys.modules.get('nicegui.core')
+    script_client = getattr(core_module, 'script_client', None)
+    for client_id in set(client_module.Client.instances) - before:
+        if client_module.Client.instances[client_id] is not script_client:
+            client_module.Client.instances.pop(client_id, None)
+
+
+@pytest.fixture(autouse=True)
 def close_ibkr_runtimes():
     """IBKRAccount keeps one connection runtime (a daemon loop thread) per account id in a
     process-wide registry; account ids restart at 1 in every test. Close whatever a test left."""

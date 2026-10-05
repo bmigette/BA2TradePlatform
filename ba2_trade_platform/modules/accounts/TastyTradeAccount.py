@@ -1274,6 +1274,19 @@ class TastyTradeAccount(AccountInterface):
                 logger.info(
                     f"Created new order {trading_order.id} in database with status PENDING")
 
+            # F7: resting PROTECTIVE orders (the allocator's TP/SL layer) reserve the shares a sale
+            # needs, and every platform sale on this account (expert exits, Live Trades manual
+            # close, Smart Risk Manager, the breached-stop force close, the allocator's own sells)
+            # passes THIS method. Cancel them first, broker-confirmed; if that cannot be confirmed the
+            # sale is REFUSED here (never sent blind). Re-placement is owed (pending_replace) and
+            # completed by the account refresh once no order is in flight. The allocator's own sells
+            # find nothing resting (its prepare step already cancelled) and pass untouched.
+            if trading_order.side == OrderDirection.SELL:
+                from ...core import allocator_protection_service as _protect
+                blocked = _protect.before_sale(self, trading_order.symbol)
+                if blocked is not None:
+                    raise RuntimeError(f"sale of {trading_order.symbol} refused: {blocked}")
+
             try:
                 new_order = self._build_new_order(
                     trading_order, is_closing_order=is_closing_order)
@@ -1515,6 +1528,530 @@ class TastyTradeAccount(AccountInterface):
             f"[Account {self.id}] adjust_tp_sl is not supported for TastyTrade "
             f"(transaction {transaction.id}, tp={new_tp_price}, sl={new_sl_price}): this "
             f"broker cannot place protective legs.")
+
+    # ------------------------------------------------------------------
+    # ALLOCATOR PROTECTION LAYER (per-symbol TP/SL as OCO complex orders)
+    #
+    # A SEPARATE, allocator-owned layer. The EXPERT paths above (adjust_tp / adjust_sl /
+    # adjust_tp_sl / modify_order, ``supports_protective_legs = False``) stay refused on
+    # purpose: those would have to keep a Transaction's protective legs in step, which this
+    # adapter does not do. The methods below place, read and cancel plain OCO complex orders
+    # for the allocator's own bookkeeping (``core/allocator_protection_service.py``) and have
+    # explicit names so nothing can mistake them for the refused ones.
+    #
+    # Design and the list of what is NOT verified without a broker:
+    # docs/plans/2026-10-04-allocator-tp-sl-design.md
+    # ------------------------------------------------------------------
+
+    #: Read by the allocator page / service: only an account that sets this True is offered
+    #: the Set TP/SL control. Compared with ``is True`` by callers (a MagicMock is truthy).
+    supports_allocator_protection = True
+
+    #: Cancel confirmation polling: ask again every 2s for up to 30s.
+    _PROTECTION_CANCEL_POLL_SECONDS = 2.0
+    _PROTECTION_CANCEL_TIMEOUT_SECONDS = 30.0
+
+    def _sleep(self, seconds: float) -> None:
+        """Seam for tests: the cancel-confirmation poll waits through this."""
+        import time
+        time.sleep(seconds)
+
+    def equity_tick_sizes(self, symbol: str):
+        """The broker's tick table for ``symbol`` (``Equity.tick_sizes``), ``None`` if absent.
+
+        Used only to snap protective prices onto the grid; a missing table falls back to the
+        documented US-equity rule in ``allocator_protection.default_tick``, and the dry run
+        rejects an off-tick price loudly either way.
+        """
+        from tastytrade.instruments import Equity
+        if not self._check_authentication():
+            return None
+        equity = self._run_async(Equity.get(self._session, symbol))
+        return getattr(equity, "tick_sizes", None)
+
+    def place_protective_oco(self, symbol: str, quantity: int, tp_price: float,
+                             sl_price: float, tag: str) -> "ProtectiveOcoResult":
+        """Place ONE GTC OCO: sell ``quantity`` whole shares at a limit ``tp_price`` OR as a
+        plain stop at ``sl_price``, whichever comes first.
+
+        Real money. The sequence is: refuse bad input -> dry run (any ``errors`` refuse) ->
+        place with ``dry_run=False`` (explicit: the SDK default is True) -> read the placed
+        order back and require it to be live. Anything else raises ``ProtectionRefused``; a
+        refusal is never swallowed and never leaves a half-placed order behind (an order that
+        exists but cannot be shown live is cancelled before the raise).
+
+        Both legs are SELL_TO_CLOSE of the same whole quantity, TIF GTC (a GTC is valid on
+        priced orders; the DAY-for-MARKET rule in ``_tt_market_time_in_force`` does not apply),
+        tagged with ``external_identifier=tag`` (non-numeric, so ``refresh_orders`` ignores the
+        members: they match no TradingOrder row).
+
+        The STOP is a plain stop (market once triggered), not a stop-limit: a stop-limit can be
+        jumped by a gap and never fill.
+
+        Raises:
+            ProtectionRefused: for every refusal, with the broker's own words when it gave any.
+        """
+        from tastytrade.instruments import Equity
+        from tastytrade.order import ComplexOrderType, NewComplexOrder
+
+        from ...core.allocator_protection import (
+            PlacementOutcomeUnknown, ProtectionRefused, ProtectiveOcoResult, classify_complex_order)
+        from ...core.allocator_protection_models import SLICE_LIVE
+
+        if not self._check_authentication():
+            raise ProtectionRefused(
+                f"[Account {self.id}] not authenticated with TastyTrade: {self._authentication_error}")
+        qty = Decimal(str(quantity))
+        if qty <= 0 or qty % 1 != 0:
+            raise ProtectionRefused(
+                f"[Account {self.id}] {symbol}: protective quantity {quantity} must be a positive "
+                f"WHOLE number of shares (fractional quantities are refused on priced orders)")
+        if not (sl_price > 0 and tp_price > sl_price):
+            raise ProtectionRefused(
+                f"[Account {self.id}] {symbol}: need 0 < stop ({sl_price}) < take-profit ({tp_price})")
+        qty = qty.quantize(Decimal(1))
+
+        try:
+            equity = self._run_async(Equity.get(self._session, symbol))
+            tp_order = NewOrder(
+                time_in_force=OrderTimeInForce.GTC, order_type=TTOrderType.LIMIT,
+                legs=[equity.build_leg(qty, OrderAction.SELL_TO_CLOSE)],
+                price=self._signed_price(tp_price, OrderDirection.SELL),
+                external_identifier=tag)
+            sl_order = NewOrder(
+                time_in_force=OrderTimeInForce.GTC, order_type=TTOrderType.STOP,
+                legs=[equity.build_leg(qty, OrderAction.SELL_TO_CLOSE)],
+                stop_trigger=Decimal(str(sl_price)), external_identifier=tag)
+            complex_order = NewComplexOrder(orders=[tp_order, sl_order], type=ComplexOrderType.OCO)
+
+            # DRY RUN FIRST (dry_run=True is the SDK default, written out on both calls).
+            dry = self._run_async(
+                self._account.place_complex_order(self._session, complex_order, dry_run=True))
+            dry_errors = [getattr(e, "message", str(e)) for e in (getattr(dry, "errors", None) or [])]
+            if dry_errors:
+                raise ProtectionRefused(
+                    f"[Account {self.id}] TastyTrade rejected the protective OCO for {symbol} in "
+                    f"the dry run: {'; '.join(dry_errors)}")
+
+        except ProtectionRefused:
+            raise
+        except Exception as e:
+            raise ProtectionRefused(
+                f"[Account {self.id}] preparing the protective OCO for {symbol} failed: "
+                f"{self._describe_broker_error(e, 'protective OCO preparation')}") from e
+
+        # THE LIVE CALL. Only a broker ANSWER (a TastytradeError: the SDK parsed a rejection) is a
+        # refusal. Anything else -- a timeout, a dropped connection -- may have happened AFTER the
+        # order reached the broker, so the outcome is UNKNOWN, never "refused": the service records
+        # the tag and resolves it by finding the order at the broker.
+        try:
+            response = self._run_async(
+                self._account.place_complex_order(self._session, complex_order, dry_run=False))
+        except TastytradeError as e:
+            raise ProtectionRefused(
+                f"[Account {self.id}] placing the protective OCO for {symbol} failed: "
+                f"{self._describe_broker_error(e, 'protective OCO placement')}") from e
+        except Exception as e:
+            raise PlacementOutcomeUnknown(
+                f"[Account {self.id}] the protective OCO for {symbol} (tag {tag}) was sent but the call "
+                f"raised {type(e).__name__}: {e}. It MAY be resting at the broker.",
+                tag=tag, kind="OCO") from e
+
+        placed = response.complex_order
+        complex_id = getattr(placed, "id", None)
+        errors = [getattr(e, "message", str(e)) for e in (getattr(response, "errors", None) or [])]
+        if complex_id in (None, -1):
+            raise ProtectionRefused(
+                f"[Account {self.id}] TastyTrade returned no complex-order id for the protective "
+                f"OCO on {symbol}" + (f": {'; '.join(errors)}" if errors else ""))
+
+        # Read it back: the placement response is not evidence that it is RESTING.
+        try:
+            placed = self._run_async(self._account.get_complex_order(self._session, complex_id))
+        except Exception as e:
+            # The id is KNOWN and the order exists: never drop it. The service stores it on an
+            # UNKNOWN slice and resolves (adopts or cancels) it; a cancel here would be unconfirmed.
+            raise PlacementOutcomeUnknown(
+                f"[Account {self.id}] placed protective OCO {complex_id} for {symbol} but could "
+                f"not read it back ({self._describe_broker_error(e, 'the read-back')})",
+                tag=tag, kind="OCO", broker_id=int(complex_id)) from e
+        observation = classify_complex_order(placed, slice_quantity=float(qty),
+                                             we_requested_cancel=False)
+        if errors or observation.state != SLICE_LIVE:
+            if observation.state not in ("LOST_REJECTED", "LOST_EXPIRED", "LOST_CANCELLED",
+                                         "CANCELLED_BY_US"):
+                if not self._cancel_after_failed_placement(symbol, complex_id):
+                    raise PlacementOutcomeUnknown(
+                        f"[Account {self.id}] the protective OCO {complex_id} for {symbol} is not live "
+                        f"({observation.state}) and its cleanup cancel was not confirmed",
+                        tag=tag, kind="OCO", broker_id=int(complex_id))
+            raise ProtectionRefused(
+                f"[Account {self.id}] the protective OCO {complex_id} for {symbol} is not live "
+                f"({observation.state}: {observation.detail})"
+                + (f"; broker said: {'; '.join(errors)}" if errors else ""))
+
+        logger.info(
+            f"[Account {self.id}] placed protective OCO {complex_id} for {symbol}: sell {qty} "
+            f"@ {tp_price} limit OR stop {sl_price} (GTC, gtc_date={observation.gtc_date})")
+        return ProtectiveOcoResult(
+            complex_order_id=int(complex_id), tp_order_id=observation.tp_order_id,
+            sl_order_id=observation.sl_order_id, status=observation.state,
+            gtc_date=observation.gtc_date, tp_price=float(tp_price), sl_price=float(sl_price),
+            quantity=int(qty))
+
+    def _cancel_after_failed_placement(self, symbol: str, complex_id: int) -> bool:
+        """Cancel of an OCO that was accepted but cannot be shown live. Returns whether the cancel was
+        CONFIRMED (False: an order may still rest, and the caller must record it, never drop it)."""
+        try:
+            outcome = self.cancel_complex_order(complex_id)
+            if not outcome.confirmed:
+                logger.error(
+                    f"[Account {self.id}] UNCONFIRMED protective OCO {complex_id} for {symbol}: the "
+                    f"cleanup cancel was not confirmed. Check it on the TastyTrade site.")
+            return bool(outcome.confirmed)
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                f"[Account {self.id}] UNTRACKED protective OCO {complex_id} for {symbol}: cleanup "
+                f"cancel failed: {self._describe_broker_error(e, 'the cleanup cancel')}. "
+                f"Check it on the TastyTrade site.", exc_info=True)
+            return False
+
+    def get_complex_order_state(self, complex_order_id: int):
+        """The broker's ``PlacedComplexOrder`` for one id (reads work for any past day).
+
+        Raises whatever the SDK raises: the caller owns the decision that a failed read is a
+        FAILED READ (reported), never "the order is gone".
+        """
+        if not self._check_authentication():
+            raise RuntimeError(f"[Account {self.id}] not authenticated with TastyTrade")
+        return self._run_async(
+            self._account.get_complex_order(self._session, int(complex_order_id)))
+
+    def list_live_complex_orders(self):
+        """Complex orders the broker lists as live TODAY.
+
+        Diagnostic only: ``get_live_complex_orders`` is documented as "placed today" in the SDK,
+        so a GTC order placed last week may not appear. The protection reconcile therefore reads
+        each placed id with ``get_complex_order_state`` instead.
+        """
+        if not self._check_authentication():
+            raise RuntimeError(f"[Account {self.id}] not authenticated with TastyTrade")
+        return self._run_async(self._account.get_live_complex_orders(self._session))
+
+    def cancel_complex_order(self, complex_order_id: int) -> "CancelOutcome":
+        """Cancel one complex order and CONFIRM it: the delete is only a request.
+
+        ``delete_complex_order`` returns nothing and the orders may sit in Cancel Requested for
+        a while (or fill in the meantime), so this polls ``get_complex_order`` every
+        ``_PROTECTION_CANCEL_POLL_SECONDS`` up to ``_PROTECTION_CANCEL_TIMEOUT_SECONDS`` until
+        every member is terminal. A delete that errors because the order is already finished is
+        not a failure by itself -- the state read decides.
+
+        Returns:
+            CancelOutcome: ``confirmed`` True only when every member is final. ``filled`` True
+            when a member filled (before or during the cancel).
+        """
+        import time
+        from ...core.allocator_protection import (
+            CancelOutcome, _member_fills, is_complex_order_terminal)
+
+        if not self._check_authentication():
+            return CancelOutcome(confirmed=False, filled=False,
+                                 detail="not authenticated with TastyTrade")
+        delete_error = None
+        try:
+            self._run_async(self._account.delete_complex_order(self._session, int(complex_order_id)))
+        except Exception as e:  # noqa: BLE001 -- decided by the state read below
+            delete_error = self._describe_broker_error(e, "complex-order cancellation")
+            logger.warning(
+                f"[Account {self.id}] delete of complex order {complex_order_id} raised: "
+                f"{delete_error}; reading its state to decide")
+
+        deadline = time.monotonic() + self._PROTECTION_CANCEL_TIMEOUT_SECONDS
+        final = None
+        while True:
+            try:
+                final = self._run_async(
+                    self._account.get_complex_order(self._session, int(complex_order_id)))
+            except Exception as e:  # noqa: BLE001
+                detail = (f"could not read complex order {complex_order_id} after the cancel: "
+                          f"{self._describe_broker_error(e, 'the cancel confirmation read')}")
+                logger.error(f"[Account {self.id}] {detail}")
+                return CancelOutcome(confirmed=False, filled=False, detail=detail)
+            if is_complex_order_terminal(final):
+                break
+            if time.monotonic() >= deadline:
+                detail = (f"complex order {complex_order_id} was not confirmed cancelled within "
+                          f"{self._PROTECTION_CANCEL_TIMEOUT_SECONDS:g}s"
+                          + (f" (delete said: {delete_error})" if delete_error else ""))
+                logger.error(f"[Account {self.id}] {detail}")
+                return CancelOutcome(confirmed=False, filled=False, final=final, detail=detail)
+            self._sleep(self._PROTECTION_CANCEL_POLL_SECONDS)
+        filled = any(_member_fills(o)[0] > 0 for o in (getattr(final, "orders", None) or []))
+        return CancelOutcome(confirmed=True, filled=filled, final=final,
+                             detail=delete_error or "")
+
+    def place_protective_stop(self, symbol: str, quantity: int, sl_price: float,
+                              tag: str) -> "ProtectiveStopResult":
+        """Place ONE plain GTC stop-only SELL (not a complex order): the stop for the part of a
+        position no take-profit covers (the "runner").
+
+        Same discipline as ``place_protective_oco``: refuse bad input, DRY RUN first (any
+        ``errors`` refuse), then ``dry_run=False`` (explicit: the SDK default is True), then read
+        the order back and require it to be live; an accepted order that cannot be shown live is
+        cancelled before the raise. A plain STOP (market once triggered), SELL_TO_CLOSE, TIF GTC,
+        tagged with ``external_identifier=tag`` so ``refresh_orders`` ignores it.
+
+        Raises:
+            ProtectionRefused: for every refusal, with the broker's own words when it gave any.
+        """
+        from tastytrade.instruments import Equity
+
+        from ...core.allocator_protection import (
+            PlacementOutcomeUnknown, ProtectionRefused, ProtectiveStopResult, classify_complex_order)
+        from ...core.allocator_protection_models import SLICE_LIVE
+
+        if not self._check_authentication():
+            raise ProtectionRefused(
+                f"[Account {self.id}] not authenticated with TastyTrade: {self._authentication_error}")
+        qty = Decimal(str(quantity))
+        if qty <= 0 or qty % 1 != 0:
+            raise ProtectionRefused(
+                f"[Account {self.id}] {symbol}: protective quantity {quantity} must be a positive "
+                f"WHOLE number of shares (fractional quantities are refused on priced orders)")
+        if not sl_price > 0:
+            raise ProtectionRefused(f"[Account {self.id}] {symbol}: the stop ({sl_price}) must be > 0")
+        qty = qty.quantize(Decimal(1))
+
+        try:
+            equity = self._run_async(Equity.get(self._session, symbol))
+            order = NewOrder(
+                time_in_force=OrderTimeInForce.GTC, order_type=TTOrderType.STOP,
+                legs=[equity.build_leg(qty, OrderAction.SELL_TO_CLOSE)],
+                stop_trigger=Decimal(str(sl_price)), external_identifier=tag)
+            dry = self._run_async(self._account.place_order(self._session, order, dry_run=True))
+            dry_errors = [getattr(e, "message", str(e)) for e in (getattr(dry, "errors", None) or [])]
+            if dry_errors:
+                raise ProtectionRefused(
+                    f"[Account {self.id}] TastyTrade rejected the protective stop for {symbol} in "
+                    f"the dry run: {'; '.join(dry_errors)}")
+        except ProtectionRefused:
+            raise
+        except Exception as e:
+            raise ProtectionRefused(
+                f"[Account {self.id}] preparing the protective stop for {symbol} failed: "
+                f"{self._describe_broker_error(e, 'protective stop preparation')}") from e
+        # THE LIVE CALL: only a broker ANSWER is a refusal; a timeout may follow acceptance (UNKNOWN).
+        try:
+            response = self._run_async(self._account.place_order(self._session, order, dry_run=False))
+        except TastytradeError as e:
+            raise ProtectionRefused(
+                f"[Account {self.id}] placing the protective stop for {symbol} failed: "
+                f"{self._describe_broker_error(e, 'protective stop placement')}") from e
+        except Exception as e:
+            raise PlacementOutcomeUnknown(
+                f"[Account {self.id}] the protective stop for {symbol} (tag {tag}) was sent but the call "
+                f"raised {type(e).__name__}: {e}. It MAY be resting at the broker.",
+                tag=tag, kind="STOP") from e
+
+        order_id = getattr(response.order, "id", None)
+        errors = [getattr(e, "message", str(e)) for e in (getattr(response, "errors", None) or [])]
+        if order_id in (None, -1):
+            raise ProtectionRefused(
+                f"[Account {self.id}] TastyTrade returned no order id for the protective stop on "
+                f"{symbol}" + (f": {'; '.join(errors)}" if errors else ""))
+        try:
+            state = self.get_protective_order_state(order_id)
+        except Exception as e:
+            raise PlacementOutcomeUnknown(
+                f"[Account {self.id}] placed protective stop {order_id} for {symbol} but could not "
+                f"read it back ({self._describe_broker_error(e, 'the read-back')})",
+                tag=tag, kind="STOP", broker_id=int(order_id)) from e
+        observation = classify_complex_order(state, slice_quantity=float(qty),
+                                             we_requested_cancel=False)
+        if errors or observation.state != SLICE_LIVE:
+            if observation.state not in ("LOST_REJECTED", "LOST_EXPIRED", "LOST_CANCELLED",
+                                         "CANCELLED_BY_US"):
+                if not self._cancel_stop_after_failed_placement(symbol, order_id):
+                    raise PlacementOutcomeUnknown(
+                        f"[Account {self.id}] the protective stop {order_id} for {symbol} is not live "
+                        f"({observation.state}) and its cleanup cancel was not confirmed",
+                        tag=tag, kind="STOP", broker_id=int(order_id))
+            raise ProtectionRefused(
+                f"[Account {self.id}] the protective stop {order_id} for {symbol} is not live "
+                f"({observation.state}: {observation.detail})"
+                + (f"; broker said: {'; '.join(errors)}" if errors else ""))
+        logger.info(f"[Account {self.id}] placed protective stop {order_id} for {symbol}: sell "
+                    f"{qty} on a stop at {sl_price} (GTC, gtc_date={observation.gtc_date})")
+        return ProtectiveStopResult(order_id=int(order_id), status=observation.state,
+                                    gtc_date=observation.gtc_date, sl_price=float(sl_price),
+                                    quantity=int(qty))
+
+    def _cancel_stop_after_failed_placement(self, symbol: str, order_id: int) -> bool:
+        try:
+            outcome = self.cancel_protective_stop(order_id)
+            if not outcome.confirmed:
+                logger.error(
+                    f"[Account {self.id}] UNCONFIRMED protective stop {order_id} for {symbol}: the "
+                    f"cleanup cancel was not confirmed. Check it on the TastyTrade site.")
+            return bool(outcome.confirmed)
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                f"[Account {self.id}] UNTRACKED protective stop {order_id} for {symbol}: cleanup "
+                f"cancel failed: {self._describe_broker_error(e, 'the cleanup cancel')}. "
+                f"Check it on the TastyTrade site.", exc_info=True)
+            return False
+
+    def find_protective_orders_by_tag(self, tag: str):
+        """Find resting/recent protective orders carrying ``external_identifier == tag``.
+
+        The resolver of an UNKNOWN placement (the live call raised and we do not know whether the
+        order reached the broker). Looks at TODAY's live orders, today's live complex orders and the
+        newest page of complex-order and order history, so an order accepted a moment ago is found
+        whichever of them lists it. Returns ``[(kind, broker_id, wrapper)]`` where ``kind`` is
+        ``"OCO"`` or ``"STOP"`` and ``wrapper`` reads like a complex order (``.orders``). Raises on
+        a failed read: "nothing found" must mean nothing was there, never that we could not look.
+        """
+        from types import SimpleNamespace
+        if not self._check_authentication():
+            raise RuntimeError(f"[Account {self.id}] not authenticated with TastyTrade")
+        found, seen = [], set()
+
+        def tagged(order):
+            return getattr(order, "external_identifier", None) == tag
+
+        for complex_order in (list(self._run_async(self._account.get_live_complex_orders(self._session)))
+                              + list(self._run_async(self._account.get_complex_order_history(
+                                  self._session, per_page=50, page_offset=0)))):
+            if any(tagged(m) for m in (getattr(complex_order, "orders", None) or [])) \
+                    and ("OCO", complex_order.id) not in seen:
+                seen.add(("OCO", complex_order.id))
+                found.append(("OCO", int(complex_order.id), complex_order))
+        for order in (list(self._run_async(self._account.get_live_orders(self._session)))
+                      + list(self._run_async(self._account.get_order_history(
+                          self._session, per_page=50, page_offset=0)))):
+            if tagged(order) and getattr(order, "complex_order_id", None) in (None, 0) \
+                    and ("STOP", order.id) not in seen:
+                seen.add(("STOP", order.id))
+                found.append(("STOP", int(order.id), SimpleNamespace(id=int(order.id), orders=[order])))
+        return found
+
+    def cancel_protective_batch(self, items):
+        """Cancel several protective orders with ONE shared confirmation poll.
+
+        ``items`` is ``[("OCO", complex_id) | ("STOP", order_id)]``. Every delete is sent first, then
+        all states are polled together every ``_PROTECTION_CANCEL_POLL_SECONDS`` up to
+        ``_PROTECTION_CANCEL_TIMEOUT_SECONDS`` in TOTAL, so cancelling many orders does not take
+        ``n x 30s`` (the window in which the position is unprotected). Returns
+        ``{(kind, id): CancelOutcome}``; ``confirmed`` only when every member is final.
+        """
+        import time
+        from ...core.allocator_protection import (
+            CancelOutcome, _member_fills, is_complex_order_terminal)
+
+        outcomes = {}
+        if not self._check_authentication():
+            return {item: CancelOutcome(confirmed=False, filled=False,
+                                        detail="not authenticated with TastyTrade") for item in items}
+        delete_errors = {}
+        for kind, oid in items:
+            try:
+                if kind == "STOP":
+                    self._run_async(self._account.delete_order(self._session, int(oid)))
+                else:
+                    self._run_async(self._account.delete_complex_order(self._session, int(oid)))
+            except Exception as e:  # noqa: BLE001 -- decided by the state read below
+                delete_errors[(kind, oid)] = self._describe_broker_error(e, "protective-order cancellation")
+        pending = list(items)
+        deadline = time.monotonic() + self._PROTECTION_CANCEL_TIMEOUT_SECONDS
+        last = {}
+        while pending:
+            still = []
+            for item in pending:
+                kind, oid = item
+                try:
+                    final = (self.get_protective_order_state(oid) if kind == "STOP"
+                             else self._run_async(self._account.get_complex_order(self._session, int(oid))))
+                except Exception as e:  # noqa: BLE001
+                    outcomes[item] = CancelOutcome(
+                        confirmed=False, filled=False,
+                        detail=f"could not read {kind} {oid} after the cancel: "
+                               f"{self._describe_broker_error(e, 'the cancel confirmation read')}")
+                    continue
+                last[item] = final
+                if is_complex_order_terminal(final):
+                    filled = any(_member_fills(o)[0] > 0 for o in (getattr(final, "orders", None) or []))
+                    outcomes[item] = CancelOutcome(confirmed=True, filled=filled, final=final,
+                                                   detail=delete_errors.get(item, ""))
+                else:
+                    still.append(item)
+            pending = still
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                for item in pending:
+                    outcomes[item] = CancelOutcome(
+                        confirmed=False, filled=False, final=last.get(item),
+                        detail=f"{item[0]} {item[1]} was not confirmed cancelled within "
+                               f"{self._PROTECTION_CANCEL_TIMEOUT_SECONDS:g}s"
+                               + (f" (delete said: {delete_errors[item]})" if item in delete_errors else ""))
+                break
+            self._sleep(self._PROTECTION_CANCEL_POLL_SECONDS)
+        for item, outcome in outcomes.items():
+            if not outcome.confirmed:
+                logger.error(f"[Account {self.id}] {outcome.detail}")
+        return outcomes
+
+    def get_protective_order_state(self, order_id: int):
+        """The broker's state of ONE plain order, wrapped as ``SimpleNamespace(id, orders=[order])``
+        so it reads exactly like a complex order to ``classify_complex_order`` (a stop-only
+        slice is classified by the same rules as an OCO with a single member).
+
+        Raises whatever the SDK raises: a failed read is a FAILED READ, never "the order is gone".
+        """
+        from types import SimpleNamespace
+        if not self._check_authentication():
+            raise RuntimeError(f"[Account {self.id}] not authenticated with TastyTrade")
+        placed = self._run_async(self._account.get_order(self._session, int(order_id)))
+        return SimpleNamespace(id=int(order_id), orders=[placed])
+
+    def cancel_protective_stop(self, order_id: int) -> "CancelOutcome":
+        """Cancel one stop-only order and CONFIRM it (``delete_order`` is only a request; polls
+        ``get_order`` like ``cancel_complex_order``). ``confirmed`` True only when final."""
+        import time
+        from ...core.allocator_protection import (
+            CancelOutcome, _member_fills, is_complex_order_terminal)
+
+        if not self._check_authentication():
+            return CancelOutcome(confirmed=False, filled=False,
+                                 detail="not authenticated with TastyTrade")
+        delete_error = None
+        try:
+            self._run_async(self._account.delete_order(self._session, int(order_id)))
+        except Exception as e:  # noqa: BLE001 -- decided by the state read below
+            delete_error = self._describe_broker_error(e, "order cancellation")
+            logger.warning(f"[Account {self.id}] delete of order {order_id} raised: "
+                           f"{delete_error}; reading its state to decide")
+        deadline = time.monotonic() + self._PROTECTION_CANCEL_TIMEOUT_SECONDS
+        while True:
+            try:
+                final = self.get_protective_order_state(order_id)
+            except Exception as e:  # noqa: BLE001
+                detail = (f"could not read order {order_id} after the cancel: "
+                          f"{self._describe_broker_error(e, 'the cancel confirmation read')}")
+                logger.error(f"[Account {self.id}] {detail}")
+                return CancelOutcome(confirmed=False, filled=False, detail=detail)
+            if is_complex_order_terminal(final):
+                break
+            if time.monotonic() >= deadline:
+                detail = (f"order {order_id} was not confirmed cancelled within "
+                          f"{self._PROTECTION_CANCEL_TIMEOUT_SECONDS:g}s"
+                          + (f" (delete said: {delete_error})" if delete_error else ""))
+                logger.error(f"[Account {self.id}] {detail}")
+                return CancelOutcome(confirmed=False, filled=False, final=final, detail=detail)
+            self._sleep(self._PROTECTION_CANCEL_POLL_SECONDS)
+        filled = any(_member_fills(o)[0] > 0 for o in final.orders)
+        return CancelOutcome(confirmed=True, filled=filled, final=final, detail=delete_error or "")
 
     def refresh_positions(self) -> bool:
         """Confirm the broker's equity book is readable.

@@ -790,6 +790,18 @@ class SymbolRow:
     target_value: Optional[float] = None
     previous_weight_pct: Optional[float] = None
     pnl: UnrealisedPnL = field(default_factory=UnrealisedPnL)
+    #: The operator switched this symbol OFF for allocation (``allocator_exclusion``). The row is
+    #: still drawn -- quantity, value and P&L are information -- but it is OUTSIDE the managed
+    #: money: no order, its value is not in the label's value or the base, and its share is
+    #: ignored (the other symbols' shares are normalised over the enabled ones).
+    excluded: bool = False
+    excluded_reason: Optional[str] = None
+    excluded_since: Any = None
+    excluded_note: Optional[str] = None
+    #: The share this ENABLED row is really solved with when its label has an excluded symbol:
+    #: ``weight_pct x T / N`` (T = the label's stored total, N = the enabled symbols' total).
+    #: ``None`` when nothing is excluded in the label -- then ``weight_pct`` IS the share.
+    effective_weight_pct: Optional[float] = None
 
     @property
     def multi_label(self) -> bool:
@@ -841,6 +853,13 @@ class LabelView:
     #: UNRESOLVED so the absence stays readable; the render turns it into something
     #: drawable with ``resolve_label_icon_color``.
     color: Optional[str] = None
+    #: Value of the label's EXCLUDED symbols (shown as '+$X excluded', never part of
+    #: ``current_value``) and how many there are.
+    excluded_value: float = 0.0
+    excluded_count: int = 0
+    #: Share of the label freed by automatic TP/SL weight reductions and left UNALLOCATED:
+    #: ``100 - total of the stored shares``, reported only for a label that has such a record.
+    freed_pct: float = 0.0
 
 
 def build_label_views(managed,
@@ -855,7 +874,9 @@ def build_label_views(managed,
                       symbol_previous_weights=None,
                       company_names=None,
                       dividends_by_symbol=None,
-                      unallocated_pct: float = 0.0) -> List[LabelView]:
+                      unallocated_pct: float = 0.0,
+                      excluded=None,
+                      freed_labels=None) -> List[LabelView]:
     """Build the default view: one LabelView per managed label. Pure.
 
     ``valuation_mode`` (decision 5a) selects what "current value" means: ``cost``
@@ -901,6 +922,16 @@ def build_label_views(managed,
             "this instrument has no stored name" and "it is named after its ticker" are
             different facts, and only the first is true of the ~two thirds of rows the
             DB-only creation helpers insert without one.
+        excluded: ``{SYMBOL: exclusion}`` of the symbols the operator switched off
+            (``allocator_exclusion.get_exclusions``); optional. An excluded symbol keeps a row
+            (information only) but contributes NOTHING to the label's value, the distinct
+            managed total, the label's P&L or its targets, and is not a recipient of
+            ``target_value``. The label's enabled symbols' shares are normalised so that
+            they total what the label's STORED shares total (``weight x T / N``): the
+            excluded share is redistributed over the enabled symbols, but a shortfall that
+            is NOT an excluded share (a freed TP/SL share) stays unallocated.
+        freed_labels: labels that have an automatic TP/SL weight-change record; only for those
+            is a stored total below 100 reported as ``freed_pct``.
         unallocated_pct: the account's stored cash reserve, 0-100. It scales the
             TARGET money only -- ``target_value`` on the label and on every symbol
             row -- because the label percentages divide what the reserve LEFT.
@@ -930,6 +961,8 @@ def build_label_views(managed,
     previous_by_label = symbol_previous_weights or {}
 
     dividends = dividends_by_symbol or {}
+    excl = {(k or '').strip().upper(): v for k, v in (excluded or {}).items()}
+    freed_set = set(freed_labels or [])
 
     def _pnl_of(sym: str) -> UnrealisedPnL:
         """One symbol's unrealised P&L, on the LIVE quote in either mode.
@@ -995,12 +1028,14 @@ def build_label_views(managed,
             return False
         return (prices or {}).get(sym) is None
 
-    total_value = sum(_value_of(sym) for sym in membership)
+    total_value = sum(_value_of(sym) for sym in membership if sym not in excl)
 
     views: List[LabelView] = []
     for entry in managed:
         symbols = _clean(entry.label)
-        label_value = sum(_value_of(s) for s in symbols)
+        enabled = [s for s in symbols if s not in excl]
+        excluded_here = [s for s in symbols if s in excl]
+        label_value = sum(_value_of(s) for s in enabled)
         label_target_value = (None if investable is None
                               else investable * float(entry.target_pct or 0.0) / 100.0)
         label_previous = previous_by_label.get(entry.label) or {}
@@ -1013,9 +1048,23 @@ def build_label_views(managed,
             saved=weights_by_label.get(entry.label) or {},
             values={s: _value_of(s) for s in symbols},
             unmeasurable=[s for s in symbols if _is_unmeasurable(s)])
+        # THE EFFECTIVE SHARES. Only when this label has an excluded symbol: the enabled symbols'
+        # shares are scaled by T / N (T = every stored share of the label, N = the enabled
+        # ones'), so the excluded share is spread over the rest while a shortfall that is not an
+        # excluded share (a freed TP/SL share) is NOT. Nothing is scaled when nothing is excluded.
+        effective: Dict[str, Optional[float]] = {}
+        stored_total = sum(float(resolved[s].weight_pct) for s in symbols
+                           if resolved[s].weight_pct is not None)
+        enabled_total = sum(float(resolved[s].weight_pct) for s in enabled
+                            if resolved[s].weight_pct is not None)
+        scale = (stored_total / enabled_total) if (excluded_here and enabled_total > 0) else None
+        for s in enabled:
+            w = resolved[s].weight_pct
+            effective[s] = None if (scale is None or w is None) else float(w) * scale
         rows: List[SymbolRow] = []
 
         for sym in symbols:
+            is_excluded = sym in excl
             state = positions.get(sym)
             quantity = state.quantity if state is not None else 0.0
             cost_basis = state.cost_basis if state is not None else 0.0
@@ -1040,24 +1089,32 @@ def build_label_views(managed,
                 current_value=row_value,
                 price=price,
                 market_value=market_value,
-                pct_of_label=(row_value / label_value * 100.0) if label_value else 0.0,
+                pct_of_label=((row_value / label_value * 100.0)
+                              if (label_value and not is_excluded) else 0.0),
                 # Against the label's TARGET money, so the column can say "this
                 # label is over-subscribed" -- see the field's own docstring for
                 # why both denominators are kept rather than one replacing the
                 # other.
                 pct_of_label_target=((row_value / label_target_value * 100.0)
-                                     if label_target_value else 0.0),
-                pct_of_total=(row_value / total_value * 100.0) if total_value else 0.0,
+                                     if (label_target_value and not is_excluded) else 0.0),
+                pct_of_total=((row_value / total_value * 100.0)
+                              if (total_value and not is_excluded) else 0.0),
                 comment=comments.get((entry.label, sym)),
                 weight_pct=resolved[sym].weight_pct,
                 weight_source=resolved[sym].source,
                 measurable=not _is_unmeasurable(sym),
-                target_value=(None if (label_target_value is None
+                target_value=(None if (is_excluded or label_target_value is None
                                        or resolved[sym].weight_pct is None)
                               else label_target_value
-                              * float(resolved[sym].weight_pct) / 100.0),
+                              * float(effective[sym] if effective.get(sym) is not None
+                                      else resolved[sym].weight_pct) / 100.0),
                 previous_weight_pct=label_previous.get(sym),
                 pnl=_pnl_of(sym),
+                excluded=is_excluded,
+                excluded_reason=(getattr(excl[sym], 'excluded_reason', None) if is_excluded else None),
+                excluded_since=(getattr(excl[sym], 'since', None) if is_excluded else None),
+                excluded_note=(getattr(excl[sym], 'note', None) if is_excluded else None),
+                effective_weight_pct=effective.get(sym),
             ))
 
         rows.sort(key=lambda r: (-r.current_value, r.symbol))
@@ -1066,7 +1123,7 @@ def build_label_views(managed,
             target_pct=entry.target_pct,
             comment=entry.comment,
             current_value=label_value,
-            cost_basis=sum(positions[s].cost_basis for s in symbols if s in positions),
+            cost_basis=sum(positions[s].cost_basis for s in enabled if s in positions),
             pct_of_total=(label_value / total_value * 100.0) if total_value else 0.0,
             rows=rows,
             pct_of_base=(label_value / base * 100.0) if base else None,
@@ -1081,12 +1138,17 @@ def build_label_views(managed,
                 [PositionState(symbol=s, quantity=positions[s].quantity,
                                cost_basis=positions[s].cost_basis,
                                price=(prices or {}).get(s))
-                 for s in symbols if s in positions],
+                 for s in enabled if s in positions],
                 # The label's dividends are its MEMBERS' dividends -- summed over the
                 # same membership the states came from, so a symbol whose position is
                 # gone contributes neither a state nor its old payouts.
                 dividends=sum(dividends.get(s, 0.0)
-                              for s in symbols if s in positions)),
+                              for s in enabled if s in positions)),
+            excluded_value=sum(_value_of(s) for s in excluded_here),
+            excluded_count=len(excluded_here),
+            freed_pct=(max(0.0, 100.0 - stored_total)
+                       if (entry.label in freed_set and symbols
+                           and all(resolved[s].weight_pct is not None for s in symbols)) else 0.0),
         ))
 
     return views
@@ -4561,3 +4623,27 @@ def submit_summary_line(outcomes, *, run_id) -> str:
     if not parts:
         return SUBMIT_SUMMARY_NOTHING.format(run_id=run_id)
     return SUBMIT_SUMMARY_FMT.format(run_id=run_id, parts=', '.join(parts))
+
+
+def effective_symbol_weights(weights, excluded) -> Dict[str, float]:
+    """The shares a label's symbols are SOLVED with, given which of them are excluded. Pure.
+
+    ``weights`` is ``{SYMBOL: stored share}``. Excluded symbols are dropped; the ENABLED symbols
+    are scaled by ``T / N`` (T = the total of every stored share, N = the enabled symbols'
+    total), so the excluded share is spread over the rest while a shortfall that is NOT an
+    excluded share -- a share freed by a TP/SL fill, left unallocated on purpose -- stays a
+    shortfall. With nothing excluded in the label the weights come back unchanged; with every
+    symbol excluded (or the enabled ones all at 0) nothing is left to scale and the enabled
+    weights are returned as they are.
+    """
+    gone = {(s or "").strip().upper() for s in (excluded or [])}
+    mine = {(k or "").strip().upper(): float(v) for k, v in (weights or {}).items()}
+    if not any(k in gone for k in mine):
+        return dict(mine)
+    total = sum(mine.values())
+    enabled = {k: v for k, v in mine.items() if k not in gone}
+    enabled_total = sum(enabled.values())
+    if enabled_total <= 0:
+        return enabled
+    scale = total / enabled_total
+    return {k: v * scale for k, v in enabled.items()}

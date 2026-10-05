@@ -168,6 +168,9 @@ def _refine_trade():
         "pnl_pct": 0.5,
         "bars_held": 1,
         "exit_reason": "exit",
+        # Every real option round-trip row carries its contract size; results._trade_row now
+        # refuses an option row without one.
+        "multiplier": 100.0,
     }
 
 
