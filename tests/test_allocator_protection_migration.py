@@ -13,19 +13,20 @@ from ba2_trade_platform.core import allocator_protection_models  # noqa: F401 --
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 REVISION_FILE = ROOT / "alembic/versions/a7c3e91d5b24_add_allocator_protection_tables.py"
+EXPECTED_QTY_FILE = ROOT / "alembic/versions/b8d1f4a29c63_allocator_protection_expected_qty.py"
 TABLES = ["allocator_protection", "allocator_protection_order", "allocator_exclusion",
           "allocator_weight_change"]
 
 
-def _load():
-    spec = importlib.util.spec_from_file_location("alloc_protection_revision", REVISION_FILE)
+def _load(path=None):
+    spec = importlib.util.spec_from_file_location("alloc_protection_revision", path or REVISION_FILE)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def _run(engine, fn_name):
-    module = _load()
+def _run(engine, fn_name, path=None):
+    module = _load(path)
     with engine.begin() as connection:
         with Operations.context(MigrationContext.configure(connection)):
             getattr(module, fn_name)()
@@ -35,6 +36,7 @@ def _run(engine, fn_name):
 def migrated(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'm.sqlite'}")
     _run(engine, "upgrade")
+    _run(engine, "upgrade", EXPECTED_QTY_FILE)
     return engine
 
 
@@ -96,8 +98,24 @@ def test_the_revision_chains_onto_the_previous_head_and_keeps_a_single_head():
     from alembic.config import Config
     from alembic.script import ScriptDirectory
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
-    assert script.get_heads() == ["a7c3e91d5b24"]
+    assert script.get_heads() == ["b8d1f4a29c63"]
+    assert script.get_revision("b8d1f4a29c63").down_revision == "a7c3e91d5b24"
     assert script.get_revision("a7c3e91d5b24").down_revision == "d9e3b72a10fc"
+
+
+def test_expected_qty_revision_adds_the_column_to_a_first_revision_database(tmp_path):
+    """The shape prod/dev/8082 are in: a7c3e91d5b24 applied, no expected_qty column."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'p.sqlite'}")
+    _run(engine, "upgrade")
+    with engine.begin() as c:
+        c.exec_driver_sql("ALTER TABLE allocator_protection DROP COLUMN expected_qty") \
+            if "expected_qty" in {x["name"] for x in inspect(engine).get_columns("allocator_protection")} else None
+    assert "expected_qty" not in {c["name"] for c in inspect(engine).get_columns("allocator_protection")}
+    _run(engine, "upgrade", EXPECTED_QTY_FILE)
+    assert "expected_qty" in {c["name"] for c in inspect(engine).get_columns("allocator_protection")}
+    _run(engine, "upgrade", EXPECTED_QTY_FILE)          # twice is harmless
+    _run(engine, "downgrade", EXPECTED_QTY_FILE)
+    assert "expected_qty" not in {c["name"] for c in inspect(engine).get_columns("allocator_protection")}
 
 
 def test_main_registers_the_models_before_init_db():

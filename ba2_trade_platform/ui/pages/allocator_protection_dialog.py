@@ -19,7 +19,7 @@ from nicegui import ui
 
 from ...core import allocator_protection_service as aps
 from ...core.allocator_protection import (
-    PRESETS, STATUS_OFF, ProtectionStatus, TpTarget, apply_preset, preview_orders,
+    PRESETS, STATUS_OFF, ProtectionStatus, TpTarget, apply_preset, effective_targets, preview_orders,
     runner_fraction, validate_protection, whole_shares, fractional_remainder,
 )
 from ...core.allocator_protection_models import AllocatorProtection, AllocatorProtectionOrder
@@ -32,6 +32,7 @@ DIALOG_CLASS = 'pf-prot-dialog'
 TP_ROW_CLASS = 'pf-tp-row'
 MARKER_SAVE = 'pf-prot-save'
 MARKER_SWITCH_OFF = 'pf-prot-off'
+MARKER_FORGET = 'pf-prot-forget'
 MARKER_REPLACE = 'pf-prot-replace'
 MARKER_ADD_TARGET = 'pf-prot-add'
 MARKER_PRESET_PREFIX = 'pf-prot-preset-'
@@ -67,9 +68,11 @@ def initial_rows(protection: Optional[AllocatorProtection]) -> List[Dict[str, An
     """The TP rows the dialog opens with: the stored ones (possibly none: a stop-only
     protection), else one blank row at 100%."""
     if protection is not None and (protection.enabled or protection.tp_targets):
-        targets = list(protection.tp_targets or [])
-        pcts = fractions_to_percentages([float(t['fraction']) for t in targets])
-        return [{'price': t['price'], 'pct': pct} for t, pct in zip(targets, pcts)]
+        # A target that already FILLED is shown no more, and the others are spread over the shares that
+        # are left (what is actually placed). Saving this therefore does not take the filled target again.
+        eff = effective_targets(protection.tp_targets, 0.01)
+        pcts = fractions_to_percentages([t.fraction for t in eff.usable])
+        return [{'price': t.price, 'pct': pct} for t, pct in zip(eff.usable, pcts)]
     return [{'price': None, 'pct': 100.0}]
 
 
@@ -346,6 +349,19 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
                               f'The position will have NO protective orders.', 'Switch off',
                               lambda: aps.disable_protection(account, symbol))
                           ).props('outline color=negative').mark(MARKER_SWITCH_OFF)
+            if any(s.state == 'UNKNOWN' and s.closed_at is None and not (s.complex_order_id or s.sl_order_id)
+                   for s in data['slices']):
+                ui.button('Forget unresolved order', icon='help_center',
+                          on_click=lambda: _confirm(
+                              f'Only possible when the tag search itself cannot be completed AND the slice is '
+                              f'at least {aps.UNKNOWN_MIN_AGE_SECONDS // 60} minutes old; otherwise the refresh '
+                              f'resolves it by itself. Do it only after you LOOKED at the TastyTrade site and '
+                              f'found no resting order for {symbol} that this platform placed (or cancelled '
+                              f'it yourself): the slice is closed and no longer tracked, and an order that does '
+                              f'exist would keep reserving shares untracked. Forget it?',
+                              'Forget', lambda: aps.forget_unknown_slices(account, symbol),
+                              close_on_ok=False)
+                          ).props('outline color=negative').mark(MARKER_FORGET)
             save_button = ui.button('Save and place orders', icon='shield',
                                     on_click=lambda: _run('Save', _save_work)
                                     ).props('color=primary').classes('pf-primary-action').mark(MARKER_SAVE)

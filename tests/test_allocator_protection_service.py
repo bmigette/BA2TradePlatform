@@ -101,7 +101,8 @@ def test_orders_are_tagged_for_traceability(acct, broker):
     _save(acct)
     p = aps.get_protection(1, "ABC")
     tags = [s.external_tag for s in _slices()]
-    assert tags == [f"ba2prot:{p.id}:{i}" for i in range(3)]
+    assert all(t.startswith(f"ba2prot:{p.id}:{i}:") and len(t.split(":")) == 4 for i, t in enumerate(tags))
+    assert len(set(tags)) == 3                                      # N1: a unique nonce per slice
 
 
 def test_save_validation_failure_writes_nothing_and_sends_nothing(acct, broker):
@@ -927,7 +928,8 @@ def test_replace_refuses_a_price_that_moved_through_the_stop(acct, broker):
     assert not result.ok and any("BELOW the current price" in e for e in result.errors)
     p = aps.get_protection(1, "ABC")
     assert p.alert_code == ap.CODE_PLACEMENT_REFUSED
-    assert _status(acct, broker).code == ap.STATUS_UNPROTECTED
+    assert broker.delete_calls == []                  # N8: refused BEFORE cancelling: the old orders stand
+    assert _status(acct, broker).code == ap.STATUS_PROTECTED
 
 
 # ============================================================================ the allocator boundary
