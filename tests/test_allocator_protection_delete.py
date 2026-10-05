@@ -67,10 +67,13 @@ def test_delete_is_refused_while_a_run_is_in_flight(acct, broker):
     held, release = threading.Event(), threading.Event()
 
     def hold():                       # a run in ANOTHER thread holds the submission lock
-        with lock:
-            held.set()
-            release.wait(10)
-    t = threading.Thread(target=hold)
+        if lock.acquire(timeout=5):
+            try:
+                held.set()
+                release.wait(10)
+            finally:
+                lock.release()
+    t = threading.Thread(target=hold, daemon=True)
     t.start()
     assert held.wait(5)
     cancels = len(broker.delete_calls)
