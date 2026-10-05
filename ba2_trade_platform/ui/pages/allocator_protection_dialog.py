@@ -34,6 +34,9 @@ MARKER_SAVE = 'pf-prot-save'
 MARKER_SWITCH_OFF = 'pf-prot-off'
 MARKER_FORGET = 'pf-prot-forget'
 MARKER_REARM = 'pf-prot-rearm'
+MARKER_CHECK = 'pf-prot-check'
+MARKER_USE_ACCEPTED = 'pf-prot-accepted'
+MARKER_USE_SUGGESTED = 'pf-prot-suggested'
 MARKER_REPLACE = 'pf-prot-replace'
 MARKER_ADD_TARGET = 'pf-prot-add'
 MARKER_PRESET_PREFIX = 'pf-prot-preset-'
@@ -195,6 +198,7 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
         kept_box = ui.column().classes('w-full gap-1')
         problems_box = ui.column().classes('w-full gap-0')
         preview_box = ui.column().classes('w-full gap-0')
+        check_box = ui.column().classes('w-full gap-0')
         result_box = ui.column().classes('w-full gap-0')
 
         def _collect() -> Dict[str, Any]:
@@ -219,8 +223,53 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
             return {'targets': targets, 'kept': kept, 'marks': marks, 'errors': unique,
                     'sl': None if sl_raw in (None, '') else float(sl_raw)}
 
+        async def _check() -> None:
+            """'Check with broker': DRY RUNS only (nothing is placed), on the operator's click, never on load."""
+            info = _collect()
+            if info['errors']:
+                return
+            check_box.clear()
+            with check_box:
+                ui.spinner(size='sm')
+            try:
+                report = await asyncio.to_thread(aps.check_with_broker, account, symbol, info['sl'],
+                                                 info['targets'], info['kept'], info['marks'])
+            except Exception as e:  # noqa: BLE001 -- shown, not swallowed
+                logger.error(f'TP/SL check for {symbol} failed: {e}', exc_info=True)
+                check_box.clear()
+                with check_box:
+                    ui.label(f'The broker check failed: {e}').classes('text-xs').style(
+                        f'color:{STATUS_HEX["negative"]}')
+                return
+            check_box.clear()
+            with check_box:
+                ui.label('Broker check (dry run, nothing placed):').classes('text-caption text-secondary-custom')
+                for item in report.slices:
+                    what = (f'STOP {item.quantity} sh @ {item.sl_price:g}' if item.tp_price is None else
+                            f'OCO {item.quantity} sh TP {item.tp_price:g} / SL {item.sl_price:g}')
+                    if item.ok:
+                        change = ('' if item.bp_change is None else f', buying power {item.bp_change:+,.2f}')
+                        ui.label(f'{what}: accepted{change}').classes('text-xs').style(
+                            f'color:{STATUS_HEX["positive"]}')
+                    else:
+                        ui.label(f'{what}: REFUSED. {item.message}').classes('text-xs').style(
+                            f'color:{STATUS_HEX["negative"]}')
+                if report.available is not None:
+                    ui.label(f'Available buying power: ${report.available:,.2f}').classes('text-xs')
+                if report.warning:
+                    ui.label(report.warning).classes('text-body2 text-weight-bold').style(
+                        f'color:{STATUS_HEX["warning"]};white-space:normal')
+                    if report.suggested_stop is not None:
+                        ui.button(f'Use ~${report.suggested_stop:,.2f}', icon='tune',
+                                  on_click=lambda: sl_input.set_value(report.suggested_stop)
+                                  ).props('outline dense').mark(MARKER_USE_SUGGESTED)
+                elif report.all_ok:
+                    ui.label('The broker accepts this plan.').classes('text-xs').style(
+                        f'color:{STATUS_HEX["positive"]}')
+
         def _recompute() -> None:
             info = _collect()
+            check_box.clear()                                    # a stale verdict must not outlive an edit
             problems_box.clear()
             preview_box.clear()
             with problems_box:
@@ -397,6 +446,32 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
                               f'the GTC lifetime.',
                               'Resize', lambda: aps.replace_protection(account, symbol))
                           ).props('outline').mark(MARKER_REPLACE)
+            if protection is not None and protection.enabled and protection.alert_message \
+                    and 'far below the market' in protection.alert_message:
+                async def _use_accepted() -> None:
+                    """Re-plan with a stop the broker accepts: an explicit action, never silent."""
+                    stored = list(protection.tp_targets or [])
+                    active = [TpTarget(price=float(t['price']), fraction=float(t['fraction']))
+                              for t in stored if not t.get('filled')]
+                    kept = [TpTarget(price=float(t['price']), fraction=float(t['fraction']))
+                            for t in stored if t.get('filled')]
+                    marks = [t.get('taken') for t in stored if not t.get('filled')]
+                    try:
+                        report = await asyncio.to_thread(aps.check_with_broker, account, symbol,
+                                                         protection.sl_price, active, kept, marks)
+                    except Exception as e:  # noqa: BLE001 -- shown, not swallowed
+                        ui.notify(f'The broker check failed: {e}', type='negative')
+                        return
+                    if report.suggested_stop is None:
+                        ui.notify('No stop the broker accepts could be found: free buying power instead.',
+                                  type='warning')
+                        return
+                    _confirm(f'Change the stop of {symbol} from {protection.sl_price:g} to about '
+                             f'{report.suggested_stop:,.2f} (approx.) and re-place the protective orders? '
+                             f'The take-profit targets stay as they are.', 'Change stop',
+                             lambda: aps.change_stop_and_replace(account, symbol, report.suggested_stop))
+                ui.button('Use a stop the broker accepts', icon='tune', on_click=_use_accepted
+                          ).props('outline').mark(MARKER_USE_ACCEPTED)
             if protection is not None and (protection.enabled or data['slices']):
                 ui.button('Switch off', icon='shield_moon',
                           on_click=lambda: _confirm(
@@ -417,6 +492,8 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
                               'Forget', lambda: aps.forget_unknown_slices(account, symbol),
                               close_on_ok=False)
                           ).props('outline color=negative').mark(MARKER_FORGET)
+            check_button = ui.button('Check with broker', icon='fact_check', on_click=_check
+                                     ).props('outline').mark(MARKER_CHECK)
             save_button = ui.button('Save and place orders', icon='shield',
                                     on_click=lambda: _run('Save', _save_work)
                                     ).props('color=primary').classes('pf-primary-action').mark(MARKER_SAVE)

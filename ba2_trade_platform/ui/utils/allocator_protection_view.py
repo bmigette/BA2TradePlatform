@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ...core.allocator_protection import (
     STATUS_NO_POSITION, STATUS_OFF, STATUS_PARTIAL, STATUS_PROTECTED, STATUS_REPLACING,
-    STATUS_UNPROTECTED, ProtectionStatus, TpTarget,
+    STATUS_UNPROTECTED, WARNING_CODES, ProtectionStatus, TpTarget,
 )
 
 #: Quasar colour name -> the hex the row paints with. Inline colours, not ``text-negative``:
@@ -17,28 +17,60 @@ from ...core.allocator_protection import (
 STATUS_HEX = {"grey": "#94a3b8", "positive": "#4ade80", "warning": "#fbbf24",
               "negative": "#f87171", "info": "#60a5fa"}
 
-#: The short chip text beside the shield icon. OFF has no chip: the icon alone is the control.
-_SHORT_LABELS = {STATUS_PROTECTED: "TP/SL", STATUS_PARTIAL: "TP/SL size mismatch",
-                 STATUS_UNPROTECTED: "UNPROTECTED", STATUS_REPLACING: "Re-placing",
-                 STATUS_NO_POSITION: "TP/SL armed", STATUS_OFF: ""}
+#: The shield's colour NAME per status (icon only; the text lives in the tooltip). grey = no TP/SL set,
+#: green = every whole share covered, amber = partly covered / size mismatch / re-placing, red = unprotected.
+ICON_COLORS = {"grey": "#94a3b8", "green": "#4ade80", "amber": "#fbbf24", "red": "#f87171"}
+_STATUS_ICON = {STATUS_OFF: "grey", STATUS_NO_POSITION: "grey", STATUS_PROTECTED: "green",
+                STATUS_PARTIAL: "amber", STATUS_REPLACING: "amber", STATUS_UNPROTECTED: "red"}
+#: The exclusion eye: orange when excluded, muted grey when included.
+EXCLUDED_HEX = "#fb923c"
+INCLUDED_HEX = "#94a3b8"
 
 
-def row_fields(supported: bool, status: Optional[ProtectionStatus],
-               note: Optional[str] = None) -> Dict[str, Any]:
-    """The flat row fields the symbol table / card template reads for the TP/SL control. Pure.
+def protection_icon_color(code: str, failure_alert: bool = False) -> str:
+    """The shield's colour name for a status code; a FAILURE alert makes any status red. Total: an unknown
+    code is grey-with-a-tooltip rather than a crash. Pure."""
+    if failure_alert:
+        return "red"
+    return _STATUS_ICON.get(code, "grey")
 
-    ``prot_on`` False (a broker that cannot do it) draws nothing at all; the strings are ``''``
-    rather than ``None`` because Quasar prints a bare ``null`` for a missing one. ``note`` is the
-    small line under the chip ("TP1 filled 2026-10-03: share 6% -> 3%").
+
+def protection_tooltip(status: ProtectionStatus, note: Optional[str] = None,
+                       alert_message: Optional[str] = None) -> str:
+    """The shield's whole tooltip: status, the shares-protected count, the status text, the latest fill
+    note and the alert message (each once), then the click hint. Newline-separated. Pure."""
+    if status.code == STATUS_OFF:
+        lines = ["TP/SL: off", "Set TP/SL: place a take-profit and stop-loss for this position."]
+        if status.tooltip and status.tooltip not in lines[1]:
+            lines.append(status.tooltip)
+    else:
+        lines = [f"TP/SL: {status.label}"]
+        if status.whole_shares and status.whole_shares > 0:
+            lines.append(f"{status.covered_quantity:g} of {status.whole_shares} shares protected")
+        lines.append(status.tooltip)
+    for extra in (note, alert_message):
+        if extra and extra not in " ".join(lines):
+            lines.append(extra)
+    lines.append("Click to set, change or switch off")
+    return "\n".join(line for line in lines if line)
+
+
+def row_fields(supported: bool, status: Optional[ProtectionStatus], note: Optional[str] = None,
+               alert_code: Optional[str] = None, alert_message: Optional[str] = None) -> Dict[str, Any]:
+    """The flat row fields the symbol table / card template reads for the TP/SL shield. Pure.
+
+    ``prot_on`` False (a broker that cannot do it) draws nothing at all. There is NO text beside the icon:
+    the colour (``prot_hex``) and the tooltip (``prot_tip``) carry everything. The strings are ``''``
+    rather than ``None`` because Quasar prints a bare ``null`` for a missing one.
     """
     if not supported or status is None:
-        return {"prot_on": False, "prot_code": "", "prot_label": "", "prot_hex": STATUS_HEX["grey"],
-                "prot_tip": "", "prot_alarm": False, "prot_note": ""}
-    tip = (status.tooltip if status.code != STATUS_OFF
-           else "Set TP/SL: place a take-profit and stop-loss for this position.")
-    return {"prot_on": True, "prot_code": status.code, "prot_label": _SHORT_LABELS.get(status.code, ""),
-            "prot_hex": STATUS_HEX.get(status.color, STATUS_HEX["grey"]), "prot_tip": tip,
-            "prot_alarm": bool(status.alarm), "prot_note": note or ""}
+        return {"prot_on": False, "prot_code": "", "prot_color": "grey", "prot_hex": ICON_COLORS["grey"],
+                "prot_tip": "", "prot_alarm": False}
+    failure = bool(alert_code) and alert_code not in WARNING_CODES
+    color = protection_icon_color(status.code, failure)
+    return {"prot_on": True, "prot_code": status.code, "prot_color": color,
+            "prot_hex": ICON_COLORS[color], "prot_tip": protection_tooltip(status, note, alert_message),
+            "prot_alarm": bool(status.alarm) or failure}
 
 
 def banner_lines(entries: Iterable[Tuple[Any, ProtectionStatus]]) -> List[str]:
@@ -55,27 +87,25 @@ def banner_lines(entries: Iterable[Tuple[Any, ProtectionStatus]]) -> List[str]:
 
 # --------------------------------------------------------------------- exclusion
 
-EXCLUDED_BADGE = "Excluded: manual"
-
-
 def exclusion_fields(exclusion: Any) -> Dict[str, Any]:
-    """The flat row fields of the exclude toggle and its badge. Pure.
+    """The flat row fields of the exclude eye. Pure.
 
-    ``exclusion`` is an ``AllocatorExclusion`` (or anything with ``since`` / ``note``) or None.
-    An excluded row is greyed and says why; the toggle's tooltip is the action it performs.
+    ``exclusion`` is an ``AllocatorExclusion`` (or anything with ``since`` / ``note``) or None. NO text
+    beside the icon: the eye is orange when excluded and muted grey when included, the tooltip says what
+    clicking does, and the row itself is greyed by the table.
     """
     if exclusion is None:
-        return {"excluded": False, "excl_badge": "", "excl_tip": "Exclude from allocation",
-                "excl_icon": "visibility_off"}
+        return {"excluded": False, "excl_tip": "Click to exclude from allocation",
+                "excl_icon": "visibility", "excl_hex": INCLUDED_HEX}
     since = getattr(exclusion, "since", None)
     note = getattr(exclusion, "note", None)
-    tip = "Excluded from allocation"
+    tip = "Excluded from allocation (manual)"
     if since:
         tip += f" since {since:%Y-%m-%d}"
     if note:
         tip += f" ({note})"
-    tip += ": no buys, no sells, outside the label maths. Click to include it again."
-    return {"excluded": True, "excl_badge": EXCLUDED_BADGE, "excl_tip": tip, "excl_icon": "visibility"}
+    tip += ". Click to include again."
+    return {"excluded": True, "excl_tip": tip, "excl_icon": "visibility", "excl_hex": EXCLUDED_HEX}
 
 
 def effective_weight_text(weight_pct: Optional[float], effective_pct: Optional[float]) -> str:
@@ -88,13 +118,51 @@ def effective_weight_text(weight_pct: Optional[float], effective_pct: Optional[f
 
 
 def label_extras_text(excluded_value: float, excluded_count: int, freed_pct: float) -> str:
-    """The label header's small extra line: '+$X excluded' and 'freed Y% from TP/SL fills'. Pure."""
-    parts: List[str] = []
-    if excluded_count > 0:
-        parts.append(f"+${excluded_value:,.0f} excluded")
+    """The label header's small extra line: 'freed Y% from TP/SL fills' only. The excluded symbols are the
+    orange segment of the count badge now (``label_badge_segments``). Pure."""
     if freed_pct > 0.005:
-        parts.append(f"freed {freed_pct:.2f}% from TP/SL fills")
-    return " | ".join(parts)
+        return f"freed {freed_pct:.2f}% from TP/SL fills"
+    return ""
+
+
+#: The segment colours of the label header's count badge (Quasar colour names).
+SEGMENT_COLORS = {"total": "grey-7", "profit": "green-8", "loss": "red-8", "excluded": "orange-8"}
+
+
+def label_badge_segments(rows: Iterable[Any], excluded_value: float = 0.0) -> List[Dict[str, Any]]:
+    """The segments of the label header's count badge, in order: total (grey, always), profitable (green),
+    losing (red), excluded (orange). Segments with a zero count are omitted except the total. Pure.
+
+    Every symbol of the label is in the total. An EXCLUDED symbol counts only in the orange segment; the
+    others are profitable when their floating P&L plus dividends is above zero and losing when it is below
+    (a flat, unpriced or unmeasurable P&L is in neither, never guessed). ``rows`` need ``excluded`` and
+    ``pnl`` (``total_amount`` when there is dividend cash, else ``amount``).
+    """
+    total = profit = loss = excluded = 0
+    for row in rows:
+        total += 1
+        if getattr(row, "excluded", False):
+            excluded += 1
+            continue
+        pnl = getattr(row, "pnl", None)
+        value = None
+        if pnl is not None:
+            value = pnl.total_amount if getattr(pnl, "total_amount", None) is not None else pnl.amount
+        if value is None:
+            continue
+        if value > 0:
+            profit += 1
+        elif value < 0:
+            loss += 1
+    meaning = {"total": "symbols in this label", "profit": "profitable (floating P&L + dividends above 0)",
+               "loss": "losing (floating P&L + dividends below 0)",
+               "excluded": "excluded" + (f": ${excluded_value:,.0f}" if excluded_value else " from allocation")}
+    out = []
+    for key, count in (("total", total), ("profit", profit), ("loss", loss), ("excluded", excluded)):
+        if count > 0 or key == "total":
+            out.append({"key": key, "count": count, "color": SEGMENT_COLORS[key],
+                        "tooltip": f"{count} {meaning[key]}"})
+    return out
 
 
 def weight_note(change: Any) -> str:

@@ -467,3 +467,27 @@ regular hours.
   partly taken target stays partly taken while its price and share are unchanged (S3).
 - Operator-facing supervised checklist: `2026-10-04-allocator-tp-sl-supervised-test.md`; read-only probe:
   `tools/tt_protection_probe.py`.
+
+### 13.3 UI polish and the stop's buying-power effect (live findings, 2026-10-05)
+
+Verified on prod by dry runs: TastyTrade margin-checks a STOP as if it filled AT ITS TRIGGER. The buying-power change
+is about `q x (stop - p0)` (p0 = price minus the margin released; ~$215 for a $287 stock), so stops within ~25% of the
+price cost nothing, deeper stops RESERVE buying power, resting stops keep it reserved, and when it is not available the
+order is refused with `margin_check_failed`. `BROKER_ASSUMPTIONS`: A3 CONFIRMED (an OCO counts its quantity once),
+new A11 (stop buying-power effect at the trigger price), and `gtc_date` is NULL on live GTC orders (no expiry, so no
+renewal).
+
+- Dialog: a **Check with broker** button (dry runs only, on click, never on load) lists per order the broker's verdict
+  and buying-power change, the account's available buying power, and, when the stops do not fit, the sentence
+  "This stop is far below the market: ... (needs ~$X, available $Y). Raise the stop to ~$Z (approx.) or free buying
+  power." Z is bisected on dry runs (at most 7 rounds). **Use ~$Z** only fills the stop box; nothing is saved.
+- A refused placement says the same sentence in the alert (the broker's raw text stays in the details) and, when only
+  some orders were placed, "N of M protective order(s) placed; K share(s) have no stop". The placed ones are kept.
+  **Use a stop the broker accepts** (explicit, confirmed) re-plans with the suggested stop
+  (`change_stop_and_replace`); the operator's stop is never changed silently.
+- Symbol rows: the TP/SL and exclusion controls are two icons (shield, eye) in the Symbol cell's icon group beside the
+  (i), no column and no text. Shield: grey no TP/SL, green protected, amber partly protected / size mismatch /
+  re-placing, red unprotected or a failure alert; the tooltip carries the status, "N of M shares protected", the last
+  fill note and the alert. Eye: orange when excluded, grey when included; the row stays greyed.
+- Label header: one segmented badge, total (grey) | profitable (green) | losing (red) | excluded (orange); zero
+  segments are omitted except the total; the tooltip lists each meaning and the excluded value.
