@@ -406,3 +406,47 @@ regular hours.
 1. Weight of a symbol with no STORED weight row is never reduced by a fill (it follows holdings).
 2. Re-including an excluded symbol after fills reduced others can push a label over 100%: warn?
 3. The row shows only the latest fill note; the history is the audit table and the activity log.
+
+## 13. Round 2 fixes (2026-10-05, branch fix/alloc-tp-sl-round2)
+
+- N8: every automatic re-placement plans and validates BEFORE it cancels (`_preflight_errors`); a refused plan
+  keeps the existing orders and alerts. Targets at or below the price (the one that just filled) are dropped
+  (`drop_reached_targets`) and their fraction folds into the stop-only runner, so the stop always remains.
+- N1: tags are `ba2prot:{id}:{index}:{nonce}`; an order found by tag is adopted only when symbol, quantity and
+  received time (>= placed_at) match, otherwise UNKNOWN_STATE alert and no adoption.
+- N2: UNKNOWN stays blocking until `UNKNOWN_MIN_AGE_SECONDS` (300) old, then history is searched again.
+- N5: `_disarm` refuses (QUANTITY_MISMATCH, alert kept) while any slice rests.
+- N6: `before_sale` looks the row up before taking the account lock.
+- N7: `before_sale` stores `expected_qty` (new column, Alembic b8d1f4a29c63); `resume_protection` waits for the
+  broker read to agree, up to FILL_SETTLE_SECONDS.
+- Q1: a protective fill on a symbol with no stored weight row writes an explicit row (measured share x factor).
+- Q2: the include dialog warns (never blocks) when a label's stored shares would exceed 100%.
+- Q3: the latest fill note is enough (no change).
+
+### 13.1 Round 3 (verification of 06530d43)
+
+- Adoption by tag (item 2): the tag carries a nonce, so a found order is adopted on tag + symbol. A size or
+  received-time disagreement only logs a WARNING (broker clock skew must never freeze a symbol). A tagged order
+  that is terminal with no fill closes the slice. Broker times are converted to UTC (`_naive`). The history is
+  searched newest-first page by page back to the slice's placement time (an incomplete search raises). New
+  operator action "Forget unresolved order" (`forget_unknown_slices`, confirmation + activity log).
+- `before_sale` (item 3) skips the account lock only for no row, or a protection that is off with nothing resting.
+- Weights (item 4): the shares of unstored label members are measured BEFORE the fill (cost valuation rescales the
+  already reduced basis), written as explicit rows on the first fill, and every other unstored member is PINNED at
+  its pre-fill share (audit reason `pinned`), so the label total drops by exactly the freed share. A share that
+  cannot be measured raises WEIGHT_FAILED (naming label and unpriced symbols) and the fill log no longer claims
+  the share stays unallocated.
+- Filled targets (item 5, round 4): the stored target gets `"filled": true` when its slice filled in full, or
+  `"taken": ratio` after a PARTIAL fill (the rest of the target keeps its price). The marks are honoured
+  EVERYWHERE (re-placement, growth, repair): re-placement drops filled targets, spreads the others over the
+  remaining shares (`f * (1 - taken) / (1 - sum(f * taken))`), then folds only reached-but-unfilled targets into the
+  stop. New shares added later get what is left of the plan; the operator re-saves the protection to re-arm a
+  filled target. Slices keep the ORIGINAL target index. The dialog hides filled targets.
+- Round 4: a site-cancelled UNKNOWN order is a LOST_CANCELLED alarm (never re-placed); an adopted order of a
+  different size resizes the slice and raises QUANTITY_MISMATCH; the forget action needs age >= 300 s and a tag
+  search that itself FAILS (inside the lock); plain history is read with `sort='Desc', start_at=since`, the
+  complex-order history ordering is detected (ascending or indeterminate: read on to the 6-page cap, then raise);
+  pinned members are listed in the fill note and log. Supervised checklist addition: history ordering (A10).
+- N7 (item 6): `expected_qty` is cleared wherever `pending_replace` is set or cleared; the wait only applies when
+  a platform SELL of the symbol is FILLED in the DB; it logs SALE_SETTLING once and SALE_UNSETTLED if it ends
+  still mismatched.

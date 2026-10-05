@@ -54,6 +54,14 @@ def activity(monkeypatch):
     return calls
 
 
+def _age_unknown_slices(minutes):
+    with get_db() as session:
+        for s in session.query(AllocatorProtectionOrder).all():
+            s.placed_at = s.placed_at - timedelta(minutes=minutes)
+            session.add(s)
+        session.commit()
+
+
 def _slices(symbol="ABC"):
     return aps.get_slices(aps.get_protection(1, symbol).id)
 
@@ -134,6 +142,7 @@ def test_f1_an_unknown_that_is_not_at_the_broker_is_closed_as_never_placed(acct,
     aps.save_protection(acct, "ABC", 45.0, [])
     assert [s.state for s in _slices()] == [SLICE_UNKNOWN]
     broker.single_raise_on_place = None
+    _age_unknown_slices(minutes=10)                                      # N2: only an OLD UNKNOWN is concluded
     aps.reconcile_account(acct)
     s = _slices()[0]                                                     # (the growth rule may then place a new one)
     assert s.state == SLICE_LOST_REJECTED and "never reached" in s.detail and s.closed_at is not None

@@ -31,6 +31,9 @@ GTC_RENEW_DAYS = 7
 FILL_SETTLE_SECONDS = 300
 #: Consecutive failed AUTOMATIC placements after which the background paths stop retrying (loud alert).
 AUTO_FAILURE_LIMIT = 3
+#: An UNKNOWN slice (a placement whose outcome we do not know) is never concluded 'never placed'
+#: before it is this old: the broker may simply not have listed it yet (round-2 review N2).
+UNKNOWN_MIN_AGE_SECONDS = 300
 #: Minimum gap between two automatic cancel/re-place actions on one symbol.
 AUTO_ACTION_MIN_INTERVAL_SECONDS = 600
 #: A PLACING row older than this is an alarm: the broker call never reported back.
@@ -62,8 +65,10 @@ CODE_GTC_EXPIRING = "GTC_EXPIRING"
 CODE_FILL = "FILL"
 CODE_REPLACE_STALE = "REPLACE_STALE"
 CODE_AUTO_STOPPED = "AUTO_STOPPED"
+#: A platform sale is filled but the broker position read has not caught up yet: the re-placement waits.
+CODE_SALE_SETTLING = "SALE_SETTLING"
 #: Alert codes that are WARNINGS: a failure-class alert is never overwritten by one of these.
-WARNING_CODES = frozenset({CODE_GTC_EXPIRING, CODE_RECONCILE_FETCH_FAILED})
+WARNING_CODES = frozenset({CODE_GTC_EXPIRING, CODE_RECONCILE_FETCH_FAILED, CODE_SALE_SETTLING})
 
 
 # =========================================================================================
@@ -228,6 +233,72 @@ def validate_protection(*, sl_price: Optional[float], targets: Sequence[TpTarget
 def runner_fraction(targets: Sequence[TpTarget]) -> float:
     """The share of the position no take-profit covers (the stop-only runner), 0..1."""
     return max(0.0, 1.0 - sum(t.fraction for t in targets))
+
+
+def drop_reached_targets(targets: Sequence[TpTarget], last_price: float,
+                         tick_sizes: Optional[Sequence[Any]] = None
+                         ) -> Tuple[List[TpTarget], List[TpTarget]]:
+    """Split ``targets`` into ``(usable, reached)``: a target AT or BELOW the current price (after tick
+    rounding) is already reached -- typically the one that just filled -- and a limit sell there would
+    fill at once or be refused. Pure. The fraction of a dropped target is not carved out of anything:
+    ``plan_slices`` sizes the stop-only remainder as ``1 - sum(usable fractions)``, so it folds into
+    the stop-only order and the stop ALWAYS covers the whole position.
+    """
+    tick = tick_for_price(last_price, tick_sizes)
+    usable, reached = [], []
+    for t in targets:
+        (reached if round_price_to_tick(t.price, tick, "nearest") <= last_price else usable).append(t)
+    return usable, reached
+
+
+@dataclass(frozen=True)
+class EffectiveTargets:
+    """The targets a re-placement should actually place (see ``effective_targets``).
+
+    ``usable`` are scaled to the shares that are LEFT; ``usable_index`` are their positions in the
+    ORIGINAL list; ``filled`` and ``reached`` are original positions too.
+    """
+    usable: List[TpTarget]
+    usable_index: List[int]
+    filled: List[int]
+    reached: List[int]
+
+
+def effective_targets(raw: Optional[Iterable[Dict[str, Any]]], last_price: float,
+                      tick_sizes: Optional[Sequence[Any]] = None) -> EffectiveTargets:
+    """What to place now from the stored targets (each ``{price, fraction[, filled]}``). Pure.
+
+    1. A target recorded as FILLED is never placed again (it was already taken); one PARTLY taken
+       (``"taken"``: the filled share of its slice) keeps the part that is left.
+    2. The rest are spread over the shares that are left: ``f / (1 - sum(filled f))``, so TP2 of
+       50% after TP1's 50% fill covers ALL the remaining shares, not half of them.
+    3. Only then are targets at or below the price dropped (reached but not filled). Their share is
+       NOT redistributed: ``plan_slices`` sizes the stop-only remainder as ``1 - sum(usable)``, so it
+       folds into the stop and the stop always covers the whole position.
+    """
+    items = list(raw or [])
+
+    def taken_ratio(item: Dict[str, Any]) -> float:
+        """How much of the target is already TAKEN: 1 when marked filled, else the stored partial ratio."""
+        if item.get("filled"):
+            return 1.0
+        stored = item.get("taken")
+        return 0.0 if stored is None else min(1.0, max(0.0, float(stored)))
+
+    ratios = [taken_ratio(it) for it in items]
+    filled = [i for i, r in enumerate(ratios) if r >= 1.0 - 1e-9]
+    taken = sum(float(it["fraction"]) * r for it, r in zip(items, ratios))
+    left = [i for i in range(len(items)) if i not in filled]
+    if not left or taken >= 1.0 - 1e-9:
+        return EffectiveTargets([], [], filled, [])
+    scale = 1.0 / (1.0 - taken)
+    scaled = [TpTarget(price=float(items[i]["price"]),
+                       fraction=float(items[i]["fraction"]) * (1.0 - ratios[i]) * scale) for i in left]
+    usable, reached = drop_reached_targets(scaled, last_price, tick_sizes)
+    reached_keys = {(t.price, t.fraction) for t in reached}
+    usable_index = [i for i, t in zip(left, scaled) if (t.price, t.fraction) not in reached_keys]
+    reached_index = [i for i, t in zip(left, scaled) if (t.price, t.fraction) in reached_keys]
+    return EffectiveTargets(usable, usable_index, filled, reached_index)
 
 
 def split_quantity(shares: int, fractions: Sequence[float]) -> List[int]:

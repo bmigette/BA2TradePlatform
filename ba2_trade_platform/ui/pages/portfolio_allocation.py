@@ -104,7 +104,7 @@ from ..utils.responsive import (
 import asyncio
 import threading
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from nicegui import ui
 from sqlmodel import select
@@ -3301,6 +3301,13 @@ def _open_exclusion_dialog(account_id: int, symbol: str, exclusions: Dict[str, A
             ui.label('It counts in its labels again: rebalancing may buy or sell it and its share '
                      'is part of the label maths.').classes('text-xs text-secondary-custom')
             note = None
+            over = labels_over_allocated_by_include(account_id, symbol)
+            if over:
+                ui.label("WARNING: including it again puts "
+                         + "; ".join(f"{lb} at {total:g}%" for lb, total in over)
+                         + " of its stored shares, over 100%. Nothing is blocked: the engine scales the "
+                           "shares down, but check the label's shares.").classes('text-sm') \
+                    .style('color:#f87171')
         else:
             ui.label(f'Exclude {symbol} from allocation?').classes('text-h6')
             ui.label('The allocator will not buy or sell it, its value is outside the label and the '
@@ -3374,6 +3381,26 @@ def labels_left_without_symbols(account_id: int, symbol: str) -> List[str]:
         syms = [x.strip().upper() for x in members.get(m.label, [])]
         if symbol in syms and not [x for x in syms if x != symbol and x not in excluded]:
             out.append(m.label)
+    return out
+
+
+def labels_over_allocated_by_include(account_id: int, symbol: str) -> List[Tuple[str, float]]:
+    """``[(label, stored total %)]`` for the managed labels holding ``symbol`` whose STORED shares, with
+    this symbol's included, sum to more than 100%. A warning only (the operator's call, 2026-10-05):
+    re-including is never blocked. Pure over the store reads."""
+    from ...core.utils import get_symbols_by_label
+    symbol = symbol.strip().upper()
+    managed = get_managed_labels(account_id)
+    members = get_symbols_by_label([m.label for m in managed])
+    out = []
+    for m in managed:
+        syms = [x.strip().upper() for x in members.get(m.label, [])]
+        if symbol not in syms:
+            continue
+        rows = get_symbol_rows(account_id, m.label)
+        total = sum(float(rows[s].weight_pct) for s in syms if s in rows)
+        if total > 100.0 + 0.005:
+            out.append((m.label, round(total, 2)))
     return out
 
 
