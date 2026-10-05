@@ -1902,7 +1902,11 @@ class TastyTradeAccount(AccountInterface):
                 f"Check it on the TastyTrade site.", exc_info=True)
             return False
 
-    def find_protective_orders_by_tag(self, tag: str):
+    #: History is read newest-first, ``_TAG_SEARCH_PAGE`` orders per page, at most this many pages.
+    _TAG_SEARCH_PAGE = 50
+    _TAG_SEARCH_MAX_PAGES = 20
+
+    def find_protective_orders_by_tag(self, tag: str, since=None):
         """Find resting/recent protective orders carrying ``external_identifier == tag``.
 
         The resolver of an UNKNOWN placement (the live call raised and we do not know whether the
@@ -1911,25 +1915,50 @@ class TastyTradeAccount(AccountInterface):
         whichever of them lists it. Returns ``[(kind, broker_id, wrapper)]`` where ``kind`` is
         ``"OCO"`` or ``"STOP"`` and ``wrapper`` reads like a complex order (``.orders``). Raises on
         a failed read: "nothing found" must mean nothing was there, never that we could not look.
+
+        ``since`` (an aware datetime) bounds how far back the history is read: pages are fetched
+        newest-first until one is short or its oldest order is older than ``since``. Without it only the
+        newest page is read. When ``_TAG_SEARCH_MAX_PAGES`` pages were read and ``since`` was still not
+        reached the search RAISES: it could not look far enough, which is not 'nothing there'.
         """
+        from datetime import timezone
         from types import SimpleNamespace
         if not self._check_authentication():
             raise RuntimeError(f"[Account {self.id}] not authenticated with TastyTrade")
         found, seen = [], set()
 
+        def order_time(item):
+            members = getattr(item, "orders", None) or [item]
+            times = [getattr(m, "received_at", None) or getattr(m, "updated_at", None) for m in members]
+            times = [t if t.tzinfo is not None else t.replace(tzinfo=timezone.utc) for t in times if t is not None]
+            return min(times) if times else None
+
+        def history(fetch):
+            out = []
+            for page in range(self._TAG_SEARCH_MAX_PAGES):
+                rows = list(self._run_async(fetch(page)))
+                out.extend(rows)
+                if since is None or len(rows) < self._TAG_SEARCH_PAGE:
+                    return out
+                stamps = [t for t in (order_time(r) for r in rows) if t is not None]
+                if stamps and min(stamps) < since:
+                    return out
+            raise RuntimeError(f"the order history was read {self._TAG_SEARCH_MAX_PAGES} pages deep and "
+                               f"still reaches no further back than {since}; the search is incomplete")
+
         def tagged(order):
             return getattr(order, "external_identifier", None) == tag
 
         for complex_order in (list(self._run_async(self._account.get_live_complex_orders(self._session)))
-                              + list(self._run_async(self._account.get_complex_order_history(
-                                  self._session, per_page=50, page_offset=0)))):
+                              + history(lambda page: self._account.get_complex_order_history(
+                                  self._session, per_page=self._TAG_SEARCH_PAGE, page_offset=page))):
             if any(tagged(m) for m in (getattr(complex_order, "orders", None) or [])) \
                     and ("OCO", complex_order.id) not in seen:
                 seen.add(("OCO", complex_order.id))
                 found.append(("OCO", int(complex_order.id), complex_order))
         for order in (list(self._run_async(self._account.get_live_orders(self._session)))
-                      + list(self._run_async(self._account.get_order_history(
-                          self._session, per_page=50, page_offset=0)))):
+                      + history(lambda page: self._account.get_order_history(
+                          self._session, per_page=self._TAG_SEARCH_PAGE, page_offset=page))):
             if tagged(order) and getattr(order, "complex_order_id", None) in (None, 0) \
                     and ("STOP", order.id) not in seen:
                 seen.add(("STOP", order.id))

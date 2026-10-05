@@ -422,3 +422,25 @@ regular hours.
 - Q1: a protective fill on a symbol with no stored weight row writes an explicit row (measured share x factor).
 - Q2: the include dialog warns (never blocks) when a label's stored shares would exceed 100%.
 - Q3: the latest fill note is enough (no change).
+
+### 13.1 Round 3 (verification of 06530d43)
+
+- Adoption by tag (item 2): the tag carries a nonce, so a found order is adopted on tag + symbol. A size or
+  received-time disagreement only logs a WARNING (broker clock skew must never freeze a symbol). A tagged order
+  that is terminal with no fill closes the slice. Broker times are converted to UTC (`_naive`). The history is
+  searched newest-first page by page back to the slice's placement time (an incomplete search raises). New
+  operator action "Forget unresolved order" (`forget_unknown_slices`, confirmation + activity log).
+- `before_sale` (item 3) skips the account lock only for no row, or a protection that is off with nothing resting.
+- Weights (item 4): the shares of unstored label members are measured BEFORE the fill (cost valuation rescales the
+  already reduced basis), written as explicit rows on the first fill, and every other unstored member is PINNED at
+  its pre-fill share (audit reason `pinned`), so the label total drops by exactly the freed share. A share that
+  cannot be measured raises WEIGHT_FAILED (naming label and unpriced symbols) and the fill log no longer claims
+  the share stays unallocated.
+- Filled targets (item 5): the stored target gets `"filled": true` (no schema change); re-placement drops filled
+  targets, spreads the others over the remaining shares (`f / (1 - sum filled f)`), then folds only
+  reached-but-unfilled targets into the stop. Slices keep the ORIGINAL target index. Add-only growth is a fresh
+  lot and ignores the marks (a later full re-placement honours them, so a fresh lot's TP for a filled target is
+  folded into the stop: the safe direction). The dialog hides filled targets.
+- N7 (item 6): `expected_qty` is cleared wherever `pending_replace` is set or cleared; the wait only applies when
+  a platform SELL of the symbol is FILLED in the DB; it logs SALE_SETTLING once and SALE_UNSETTLED if it ends
+  still mismatched.

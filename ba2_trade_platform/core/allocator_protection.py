@@ -65,8 +65,10 @@ CODE_GTC_EXPIRING = "GTC_EXPIRING"
 CODE_FILL = "FILL"
 CODE_REPLACE_STALE = "REPLACE_STALE"
 CODE_AUTO_STOPPED = "AUTO_STOPPED"
+#: A platform sale is filled but the broker position read has not caught up yet: the re-placement waits.
+CODE_SALE_SETTLING = "SALE_SETTLING"
 #: Alert codes that are WARNINGS: a failure-class alert is never overwritten by one of these.
-WARNING_CODES = frozenset({CODE_GTC_EXPIRING, CODE_RECONCILE_FETCH_FAILED})
+WARNING_CODES = frozenset({CODE_GTC_EXPIRING, CODE_RECONCILE_FETCH_FAILED, CODE_SALE_SETTLING})
 
 
 # =========================================================================================
@@ -247,6 +249,45 @@ def drop_reached_targets(targets: Sequence[TpTarget], last_price: float,
     for t in targets:
         (reached if round_price_to_tick(t.price, tick, "nearest") <= last_price else usable).append(t)
     return usable, reached
+
+
+@dataclass(frozen=True)
+class EffectiveTargets:
+    """The targets a re-placement should actually place (see ``effective_targets``).
+
+    ``usable`` are scaled to the shares that are LEFT; ``usable_index`` are their positions in the
+    ORIGINAL list; ``filled`` and ``reached`` are original positions too.
+    """
+    usable: List[TpTarget]
+    usable_index: List[int]
+    filled: List[int]
+    reached: List[int]
+
+
+def effective_targets(raw: Optional[Iterable[Dict[str, Any]]], last_price: float,
+                      tick_sizes: Optional[Sequence[Any]] = None) -> EffectiveTargets:
+    """What to place now from the stored targets (each ``{price, fraction[, filled]}``). Pure.
+
+    1. A target recorded as FILLED is never placed again (it was already taken).
+    2. The rest are spread over the shares that are left: ``f / (1 - sum(filled f))``, so TP2 of
+       50% after TP1's 50% fill covers ALL the remaining shares, not half of them.
+    3. Only then are targets at or below the price dropped (reached but not filled). Their share is
+       NOT redistributed: ``plan_slices`` sizes the stop-only remainder as ``1 - sum(usable)``, so it
+       folds into the stop and the stop always covers the whole position.
+    """
+    items = list(raw or [])
+    filled = [i for i, it in enumerate(items) if it.get("filled")]
+    taken = sum(float(items[i]["fraction"]) for i in filled)
+    left = [(i, items[i]) for i in range(len(items)) if i not in filled]
+    if not left or taken >= 1.0 - 1e-9:
+        return EffectiveTargets([], [], filled, [])
+    scale = 1.0 / (1.0 - taken)
+    scaled = [TpTarget(price=float(it["price"]), fraction=float(it["fraction"]) * scale) for _, it in left]
+    usable, reached = drop_reached_targets(scaled, last_price, tick_sizes)
+    reached_keys = {(t.price, t.fraction) for t in reached}
+    usable_index = [i for (i, _), t in zip(left, scaled) if (t.price, t.fraction) not in reached_keys]
+    reached_index = [i for (i, _), t in zip(left, scaled) if (t.price, t.fraction) in reached_keys]
+    return EffectiveTargets(usable, usable_index, filled, reached_index)
 
 
 def split_quantity(shares: int, fractions: Sequence[float]) -> List[int]:

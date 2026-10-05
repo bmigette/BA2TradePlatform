@@ -81,7 +81,7 @@ def _tp1_filled_price_62(acct, broker):
     """Probe: TP1 60@50%, TP2 70@50%, SL 45; TP1 fills; the price is 62 now."""
     assert aps.save_protection(acct, "ABC", 45.0, TARGETS).ok
     first = [s for s in _slices() if s.kind == "OCO" and s.target_index == 0][0]
-    broker.fill(first.complex_order_id, "tp")
+    broker.fill(first.complex_order_id, "TP")
     aps.reconcile_account(acct)
     broker.prices["ABC"] = 62.0
 
@@ -154,8 +154,8 @@ def test_n1_a_same_tag_order_for_another_symbol_is_never_adopted(acct, broker):
     _age(10)
     aps.reconcile_account(acct)
     (s,) = [x for x in _slices() if x.id == s.id]
-    assert s.state == SLICE_UNKNOWN and s.sl_order_id is None        # NOT adopted
-    assert aps.get_protection(1, "ABC").alert_code == ap.CODE_UNKNOWN_STATE
+    assert s.sl_order_id is None                                     # NOT adopted: another symbol's order
+    assert s.state == SLICE_LOST_REJECTED and s.closed_at is not None  # ours never reached the broker
 
 
 def test_n1_a_matching_order_is_still_adopted(acct, broker):
@@ -231,11 +231,19 @@ def test_n6_before_sale_without_a_row_never_takes_the_lock(acct, broker, monkeyp
 
 
 # ======================================================================== N7
+def _filled_sale():
+    from ba2_trade_platform.core.types import OrderOpenType
+    add_instance(TradingOrder(account_id=1, symbol="ABC", quantity=100.0, filled_qty=100.0,
+                              side=OrderDirection.SELL, order_type=OrderType.MARKET,
+                              status=OrderStatus.FILLED, open_type=OrderOpenType.MANUAL, broker_order_id="55"))
+
+
 def test_n7_a_lagging_position_read_after_a_full_sale_does_not_replace(acct, broker):
     assert aps.save_protection(acct, "ABC", 45.0, [T(60.0, 1.0)]).ok
     assert aps.before_sale(acct, "ABC", 100) is None     # cancels, marks pending, records the expectation
     p = aps.get_protection(1, "ABC")
     assert p.expected_qty == 0
+    _filled_sale()
     # The platform sale filled in the DB, but the broker still reads the OLD position.
     placed = len(broker.place_calls)
     aps.resume_protection(acct, ["ABC"])
@@ -254,6 +262,7 @@ def test_n7_once_the_read_agrees_the_symbol_is_disarmed(acct, broker):
 def test_n7_after_the_settle_window_a_stale_read_is_trusted_no_longer_waited_on(acct, broker):
     assert aps.save_protection(acct, "ABC", 45.0, [T(60.0, 1.0)]).ok
     aps.before_sale(acct, "ABC", 100)
+    _filled_sale()
     from ba2_trade_platform.core.db import update_instance
     p = aps.get_protection(1, "ABC")
     p.pending_replace_since = datetime.utcnow() - timedelta(seconds=aps.FILL_SETTLE_SECONDS + 60)
@@ -280,19 +289,19 @@ def _weights(symbol):
 
 
 def test_q1_implicit_weight_is_written_explicit_and_reduced(monkeypatch):
-    changes = aex.reduce_symbol_weights(1, "ABC", 0.5, reason="tp_fill", detail="TP1", implicit={"L": 20.0})
+    changes = aex.reduce_symbol_weights(1, "ABC", 0.5, reason="tp_fill", detail="TP1", implicit={"L": {"ABC": 20.0}})
     assert _weights("ABC") == {"L": 10.0}
     assert [(c.before_pct, c.after_pct) for c in changes] == [(20.0, 10.0)]
 
 
 def test_q1_a_stored_row_wins_over_the_implicit_share():
     add_instance(PortfolioAllocationSymbol(account_id=1, label="L", symbol="ABC", weight_pct=8.0))
-    aex.reduce_symbol_weights(1, "ABC", 0.5, reason="tp", detail="TP1", implicit={"L": 20.0})
+    aex.reduce_symbol_weights(1, "ABC", 0.5, reason="tp", detail="TP1", implicit={"L": {"ABC": 20.0}})
     assert _weights("ABC") == {"L": 4.0}
 
 
 def test_q1_a_full_exit_writes_an_explicit_zero():
-    aex.reduce_symbol_weights(1, "ABC", 0.0, reason="tp", detail="exit", implicit={"L": 20.0})
+    aex.reduce_symbol_weights(1, "ABC", 0.0, reason="tp", detail="exit", implicit={"L": {"ABC": 20.0}})
     assert _weights("ABC") == {"L": 0.0}
 
 
@@ -307,9 +316,9 @@ def test_q1_the_fill_path_writes_the_measured_share_for_an_unstored_symbol(acct,
     monkeypatch.setattr(core_utils, "get_symbols_by_label", lambda labels: {"L": ["ABC", "OTHER"]})
     p = aps.get_protection(1, "ABC") or SimpleNamespace(account_id=1, symbol="ABC")
     out = aps._implicit_weights(acct, p, 100.0)
-    assert out == {"L": 50.0}
+    assert out == {"L": {"ABC": 50.0, "OTHER": 50.0}}
     add_instance(PortfolioAllocationSymbol(account_id=1, label="L", symbol="ABC", weight_pct=30.0))
-    assert aps._implicit_weights(acct, p, 100.0) == {}    # a stored row: nothing implicit
+    assert aps._implicit_weights(acct, p, 100.0) == {"L": {"OTHER": 50.0}}   # ABC stored: only OTHER still unstored
 
 
 # ======================================================================== Q2

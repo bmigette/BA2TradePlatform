@@ -61,6 +61,9 @@ EXCLUDED_DISABLED = "disabled"
 # --- automatic weight changes ------------------------------------------------------------
 WEIGHT_REASON_TP_FILL = "tp_fill"
 WEIGHT_REASON_SL_FILL = "sl_fill"
+#: An unstored member of a label whose sibling just had a fill: its measured share is written down so
+#: the freed share is not spread over it (before == after: it only records what it was pinned at).
+WEIGHT_REASON_PINNED = "pinned"
 
 
 class AllocatorProtection(SQLModel, table=True):

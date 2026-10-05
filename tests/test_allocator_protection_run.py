@@ -63,8 +63,8 @@ class ProtectedFakeAccount(FakeAccount):
     def cancel_protective_batch(self, items):
         return self.tt.cancel_protective_batch(items)
 
-    def find_protective_orders_by_tag(self, tag):
-        return self.tt.find_protective_orders_by_tag(tag)
+    def find_protective_orders_by_tag(self, tag, since=None):
+        return self.tt.find_protective_orders_by_tag(tag, since=since)
 
     def place_protective_stop(self, **kw):
         return self.tt.place_protective_stop(**kw)

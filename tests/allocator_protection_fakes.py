@@ -243,12 +243,14 @@ class FakeTastyBroker:
     async def get_order_history(self, session, per_page=50, page_offset=0, **kw):
         if self.history_fails:
             raise TastytradeError("order history unavailable")
-        return [r["member"] for r in self.singles.values()]
+        newest_first = [r["member"] for r in self.singles.values()][::-1]
+        return newest_first[page_offset * per_page:(page_offset + 1) * per_page]
 
     async def get_complex_order_history(self, session, per_page=50, page_offset=0):
         if self.history_fails:
             raise TastytradeError("complex order history unavailable")
-        return [self._placed_complex(cid) for cid in self.complex]
+        newest_first = [self._placed_complex(cid) for cid in self.complex][::-1]
+        return newest_first[page_offset * per_page:(page_offset + 1) * per_page]
 
     async def get_live_complex_orders(self, session):
         return [self._placed_complex(cid) for cid, r in self.complex.items()
