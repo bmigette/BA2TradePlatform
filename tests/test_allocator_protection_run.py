@@ -242,7 +242,7 @@ def test_a_fill_then_a_rebalance_buys_back_and_the_new_shares_get_the_same_templ
     assert len(broker.delete_calls) == deletes                          # a buy cancels NOTHING
     live = _live()
     assert sum(s.quantity for s in live) == 30                          # 20 old + 10 added
-    assert {s.sl_price for s in live} == {45.0} and set(s.tp_price for s in live) == {60.0, 65.0, 70.0}
+    assert {s.sl_price for s in live} == {45.0} and set(s.tp_price for s in live) == {65.0, 70.0}   # TP1 was taken
 
 
 def test_a_rebalance_resizes_oco_and_stop_only_slices_with_the_same_proportions(world):

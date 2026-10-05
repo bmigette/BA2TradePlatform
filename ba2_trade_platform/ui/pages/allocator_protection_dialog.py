@@ -353,10 +353,12 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
                    for s in data['slices']):
                 ui.button('Forget unresolved order', icon='help_center',
                           on_click=lambda: _confirm(
-                              f'Only do this after you LOOKED at the TastyTrade site and found no resting '
-                              f'order for {symbol} that this platform placed (or cancelled it yourself). '
-                              f'The unresolved slice is closed and no longer tracked; if an order does '
-                              f'exist it will keep reserving shares untracked. Forget it?',
+                              f'Only possible when the tag search itself cannot be completed AND the slice is '
+                              f'at least {aps.UNKNOWN_MIN_AGE_SECONDS // 60} minutes old; otherwise the refresh '
+                              f'resolves it by itself. Do it only after you LOOKED at the TastyTrade site and '
+                              f'found no resting order for {symbol} that this platform placed (or cancelled '
+                              f'it yourself): the slice is closed and no longer tracked, and an order that does '
+                              f'exist would keep reserving shares untracked. Forget it?',
                               'Forget', lambda: aps.forget_unknown_slices(account, symbol),
                               close_on_ok=False)
                           ).props('outline color=negative').mark(MARKER_FORGET)

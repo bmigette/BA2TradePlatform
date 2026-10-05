@@ -436,11 +436,17 @@ regular hours.
   its pre-fill share (audit reason `pinned`), so the label total drops by exactly the freed share. A share that
   cannot be measured raises WEIGHT_FAILED (naming label and unpriced symbols) and the fill log no longer claims
   the share stays unallocated.
-- Filled targets (item 5): the stored target gets `"filled": true` (no schema change); re-placement drops filled
-  targets, spreads the others over the remaining shares (`f / (1 - sum filled f)`), then folds only
-  reached-but-unfilled targets into the stop. Slices keep the ORIGINAL target index. Add-only growth is a fresh
-  lot and ignores the marks (a later full re-placement honours them, so a fresh lot's TP for a filled target is
-  folded into the stop: the safe direction). The dialog hides filled targets.
+- Filled targets (item 5, round 4): the stored target gets `"filled": true` when its slice filled in full, or
+  `"taken": ratio` after a PARTIAL fill (the rest of the target keeps its price). The marks are honoured
+  EVERYWHERE (re-placement, growth, repair): re-placement drops filled targets, spreads the others over the
+  remaining shares (`f * (1 - taken) / (1 - sum(f * taken))`), then folds only reached-but-unfilled targets into the
+  stop. New shares added later get what is left of the plan; the operator re-saves the protection to re-arm a
+  filled target. Slices keep the ORIGINAL target index. The dialog hides filled targets.
+- Round 4: a site-cancelled UNKNOWN order is a LOST_CANCELLED alarm (never re-placed); an adopted order of a
+  different size resizes the slice and raises QUANTITY_MISMATCH; the forget action needs age >= 300 s and a tag
+  search that itself FAILS (inside the lock); plain history is read with `sort='Desc', start_at=since`, the
+  complex-order history ordering is detected (ascending or indeterminate: read on to the 6-page cap, then raise);
+  pinned members are listed in the fill note and log. Supervised checklist addition: history ordering (A10).
 - N7 (item 6): `expected_qty` is cleared wherever `pending_replace` is set or cleared; the wait only applies when
   a platform SELL of the symbol is FILLED in the DB; it logs SALE_SETTLING once and SALE_UNSETTLED if it ends
   still mismatched.

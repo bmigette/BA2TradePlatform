@@ -479,6 +479,7 @@ def _on_protective_fill(account, p: AllocatorProtection, s: AllocatorProtectionO
              f"lower it by hand or the next rebalance may buy it back", code="WEIGHT_FAILED",
              symbol=p.symbol)
         changes = []
+    pins = [c for c in changes if c.reason == WEIGHT_REASON_PINNED]
     changes = [c for c in changes if c.reason != WEIGHT_REASON_PINNED]
     note = f"{what} {_now():%Y-%m-%d}"
     if changes:
@@ -487,10 +488,14 @@ def _on_protective_fill(account, p: AllocatorProtection, s: AllocatorProtectionO
         else:
             note += ": " + "; ".join(f"{c.label} share {c.before_pct:g}% -> {c.after_pct:g}%"
                                      for c in changes)
+    if pins:
+        many = len({c.label for c in pins}) > 1
+        note += "; pinned " + ", ".join(f"{c.symbol} {c.after_pct:g}%" + (f" ({c.label})" if many else "")
+                                        for c in pins)
     s.weight_applied_qty = float(s.weight_applied_qty) + newly
     _save(s)
     if obs.kind == KIND_TP and s.kind == ORDER_KIND_OCO:
-        p = _mark_target_filled(p, s)
+        p = _mark_target_filled(p, s, obs)
     _record_protective_sale(p.account_id, p.symbol, newly, obs.fill_price,
                             s.external_tag or f"ba2prot:{p.id}:{s.slice_index}")
     p.last_fill_at = _now()
@@ -507,21 +512,30 @@ def _on_protective_fill(account, p: AllocatorProtection, s: AllocatorProtectionO
     return _reload(p.id)
 
 
-def _mark_target_filled(p: AllocatorProtection, s: AllocatorProtectionOrder) -> AllocatorProtection:
-    """Record on the stored target that it was TAKEN (a fill, even a partial one), so no later
-    re-placement plans it again (review round 3 item 5). The slice's ``target_index`` is the target's
-    position in the stored list; its price must still agree with the stored target (a slice left over
-    from an earlier configuration is never marked against the new one)."""
+def _mark_target_filled(p: AllocatorProtection, s: AllocatorProtectionOrder,
+                        obs: SliceObservation) -> AllocatorProtection:
+    """Record on the stored target how much of it was TAKEN, so no later placement plans it again.
+
+    A slice that filled in full marks the target ``filled``; a PARTIAL fill stores the filled share of the
+    slice as ``taken`` and the rest of the target keeps its price (it is re-placed for the shares still
+    held). The slice's ``target_index`` is the target's position in the stored list; its price must still
+    agree with the stored target (a slice left over from an earlier configuration is never marked against
+    the new one)."""
     raw = [dict(t) for t in (p.tp_targets or [])]
     i = s.target_index
     if not (0 <= i < len(raw)) or s.tp_price is None \
             or abs(float(raw[i]["price"]) - float(s.tp_price)) > 0.0101:
         logger.warning(f"allocator TP/SL: {p.symbol}: the filled slice {s.slice_index + 1} matches no stored "
-                       f"target (index {i}, tp {s.tp_price}); no target marked as filled")
+                       f"target (index {i}, tp {s.tp_price}); no target marked")
         return p
-    if raw[i].get("filled"):
+    full = float(obs.filled_qty) >= float(s.quantity) - 1e-9
+    ratio = 1.0 if full else min(1.0, float(obs.filled_qty) / float(s.quantity))
+    previous = 0.0 if raw[i].get("taken") is None else float(raw[i]["taken"])
+    if raw[i].get("filled") or ratio <= previous + 1e-12:
         return p
-    raw[i]["filled"] = True
+    raw[i]["taken"] = ratio
+    if full:
+        raw[i]["filled"] = True
     p.tp_targets = raw
     return _save(p)
 
@@ -634,24 +648,24 @@ def _resolve_unknown_slice(account, p: AllocatorProtection, s: AllocatorProtecti
                 for f in ours]
     live = [(f, o) for f, o in observed if not (o.state in _ENDED_STATES and o.filled_qty <= 0)]
     if not live:
-        # Every tagged order is terminal and none filled (cancelled on the site, expired, rejected): the
-        # slice covers nothing and never will. Close it so it stops freezing the symbol.
-        (kind, broker_id, _), obs = observed[0]
+        # Every tagged order is terminal and none filled: cancelled on the site, expired, rejected. That is
+        # the operator's (or the broker's) decision: adopt the id and raise the usual LOST_* alarm. It is
+        # NEVER re-placed automatically (``has_alarm`` stops the growth rule); the operator re-places.
+        (kind, broker_id, wrapper), obs = observed[0]
         if kind == ORDER_KIND_STOP:
             s.sl_order_id = broker_id
         else:
             s.complex_order_id = broker_id
-        s.state = obs.state
-        s.detail = (f"found at the broker as {obs.state} with no fill ({obs.detail}); closed")
-        s.closed_at = _now()
         _save(s)
-        _log(p.account_id, ActivityLogSeverity.INFO,
-             f"{p.symbol}: the order {broker_id} (tag {s.external_tag}) ended at the broker without a "
-             f"fill; the slice was closed", code="UNKNOWN_RESOLVED", symbol=p.symbol, broker_id=broker_id)
+        _apply_observation(account, p, s, obs)
+        _log(p.account_id, ActivityLogSeverity.WARNING,
+             f"{p.symbol}: the order {broker_id} (tag {s.external_tag}) was found ended at the broker "
+             f"without a fill ({obs.state}); NOT re-placed", code="UNKNOWN_RESOLVED", symbol=p.symbol,
+             broker_id=broker_id)
         return True
     matches = [f for f, _ in live]
     kind, broker_id, wrapper = matches[0]
-    _warn_if_mismatch(p, s, wrapper, broker_id)
+    broker_size = _warn_if_mismatch(p, s, wrapper, broker_id)
     if len(matches) > 1:
         logger.error(f"allocator TP/SL: {len(matches)} orders carry tag {s.external_tag}: adopting "
                      f"{broker_id}; check the TastyTrade site for duplicates")
@@ -662,12 +676,20 @@ def _resolve_unknown_slice(account, p: AllocatorProtection, s: AllocatorProtecti
         s.sl_order_id = broker_id
     else:
         s.complex_order_id = broker_id
+    slice_said = s.quantity
+    if broker_size is not None:
+        s.quantity = int(round(broker_size))          # the broker's size is what is really reserved
     _save(s)
     obs = classify_complex_order(wrapper, slice_quantity=s.quantity, we_requested_cancel=False)
-    _apply_observation(account, p, s, obs)
+    p = _apply_observation(account, p, s, obs)
     _log(p.account_id, ActivityLogSeverity.INFO,
          f"{p.symbol}: adopted the order {broker_id} found by tag {s.external_tag} ({obs.state})",
          code="UNKNOWN_RESOLVED", symbol=p.symbol, broker_id=broker_id)
+    if broker_size is not None:
+        _alert(p, CODE_QUANTITY_MISMATCH,
+               f"the adopted order {broker_id} reserves {s.quantity} sh at the broker, not the {slice_said} "
+               f"the slice said; the slice was resized to the broker's figure. Check the position on the "
+               f"TastyTrade site.")
     return True
 
 
@@ -689,13 +711,16 @@ def _order_symbols(wrapper) -> Set[str]:
     return {_norm(getattr(m, "underlying_symbol", "") or "") for m in (getattr(wrapper, "orders", None) or [])} - {""}
 
 
-def _warn_if_mismatch(p: AllocatorProtection, s: AllocatorProtectionOrder, wrapper, broker_id) -> None:
-    """The adopted order's size or received time disagrees with the slice: adopted all the same (the tag
-    and symbol identify it; refusing would freeze the symbol), but the operator is told."""
+def _warn_if_mismatch(p: AllocatorProtection, s: AllocatorProtectionOrder, wrapper, broker_id) -> Optional[float]:
+    """The adopted order's received time or size disagrees with the slice: adopted all the same (the tag
+    and symbol identify it; refusing would freeze the symbol), but the operator is told. Returns the
+    broker's size when it differs from the slice's (the caller resizes the slice), else None."""
     placed = _naive(s.placed_at)
+    differing: Optional[float] = None
     for m in (getattr(wrapper, "orders", None) or []):
         size = getattr(m, "size", None)
         if size is not None and abs(float(size) - float(s.quantity)) > 1e-9:
+            differing = float(size)
             _log(p.account_id, ActivityLogSeverity.WARNING,
                  f"{p.symbol}: the adopted order {broker_id} has quantity {float(size):g} at the broker but "
                  f"the slice says {s.quantity}; adopted by tag, check the TastyTrade site",
@@ -706,6 +731,7 @@ def _warn_if_mismatch(p: AllocatorProtection, s: AllocatorProtectionOrder, wrapp
                  f"{p.symbol}: the adopted order {broker_id} was received {when:%Y-%m-%d %H:%M:%S} UTC but the "
                  f"slice was placed {placed:%Y-%m-%d %H:%M:%S} UTC (clock skew? check the broker time); "
                  f"adopted by tag", code="ADOPTED_MISMATCH", symbol=p.symbol, broker_id=broker_id)
+    return differing
 
 
 def _unresolved_unknowns(account, p: AllocatorProtection) -> List[AllocatorProtectionOrder]:
@@ -844,10 +870,9 @@ def _place_slices(account, p: AllocatorProtection) -> Tuple[AllocatorProtection,
     ticks = _tick_sizes(account, p.symbol)
     # N8: a target at/below the price now (the one that just filled) cannot be placed; its fraction folds
     # into the stop-only remainder, so the stop ALWAYS remains and the placement is not refused for it.
-    # Add-only growth (orders already rest for the older shares): the NEW shares are a fresh lot that has
-    # taken no target, so the 'filled' marks do not apply to them. A re-placement of everything (nothing
-    # rests) honours the marks.
-    stored = list(p.tp_targets or []) if covered <= 0 else         [{k: v for k, v in t.items() if k != "filled"} for t in (p.tp_targets or [])]
+    # The filled marks are honoured EVERYWHERE (re-placement, growth, repair): a target that was taken is
+    # never placed again; new shares get what is left of the plan. Saving the protection again re-arms it.
+    stored = list(p.tp_targets or [])
     eff = effective_targets(stored, last, ticks)
     targets = eff.usable
     for i in eff.filled:
@@ -1079,36 +1104,54 @@ def delete_protection(account, symbol: str) -> ActionResult:
 def forget_unknown_slices(account, symbol: str) -> ActionResult:
     """The operator checked the TastyTrade site: forget every UNKNOWN slice that has no broker id.
 
-    An UNKNOWN placement blocks the symbol (every sale, Disable, Delete) because an order may rest at
-    the broker. The automatic resolution only concludes 'never placed' on evidence; when the operator has
-    LOOKED (nothing there, or it was cancelled by hand) this closes the slice. Confirmed in the UI; an
-    activity-log entry per slice. A slice that has a broker id is not touched (it is read, not guessed).
+    Allowed ONLY when the automatic resolution is impossible: the slice is at least
+    ``UNKNOWN_MIN_AGE_SECONDS`` old AND the tag search itself FAILS right now. A search that works either
+    finds the order (it is adopted by the refresh) or finds nothing (the refresh closes the slice), so
+    forgetting by hand could only create a double protection; it is refused with that explanation. The
+    search runs inside the lock. An activity-log entry per forgotten slice.
     """
     symbol = _norm(symbol)
     with protection_lock(account.id):
         p = get_protection(account.id, symbol)
         if p is None:
             return ActionResult(False, f"{symbol}: there is no protection.")
-        forgotten = []
-        for s in get_slices(p.id):
-            if s.state == SLICE_UNKNOWN and s.closed_at is None and _broker_id(s) is None:
-                s.state = SLICE_LOST_REJECTED
-                s.detail = (f"forgotten by the operator after checking the TastyTrade site (tag "
-                            f"{s.external_tag}); whatever was there is no longer tracked")
-                s.closed_at = _now()
-                _save(s)
-                forgotten.append(s)
-                _log(account.id, ActivityLogSeverity.WARNING,
-                     f"{symbol}: the operator forgot the unresolved slice {s.slice_index + 1} "
-                     f"({s.quantity} sh, tag {s.external_tag}) after checking the TastyTrade site",
-                     code="UNKNOWN_FORGOTTEN", symbol=symbol, tag=s.external_tag)
-        if not forgotten:
+        candidates = [s for s in get_slices(p.id)
+                      if s.state == SLICE_UNKNOWN and s.closed_at is None and _broker_id(s) is None]
+        if not candidates:
             return ActionResult(False, f"{symbol}: no unresolved slice without a broker id to forget.")
+        young = [s for s in candidates if _unknown_wait_left(s) > 0]
+        if young:
+            return ActionResult(False, f"{symbol}: the unresolved slice is only {_unknown_age_seconds(young[0]):.0f} s "
+                                       f"old; the broker may not list it yet. Wait {_unknown_wait_left(young[0]):.0f} s.")
+        for s in candidates:
+            since = (_naive(s.placed_at) or _now()) - timedelta_seconds(600)
+            try:
+                found = account.find_protective_orders_by_tag(
+                    s.external_tag, since=since.replace(tzinfo=timezone.utc))
+            except Exception as e:  # noqa: BLE001 -- the ONE case in which forgetting is allowed
+                logger.warning(f"allocator TP/SL: tag search for {s.external_tag} failed ({e}); forgetting allowed")
+                continue
+            return ActionResult(
+                False, f"{symbol}: the tag search works (it found "
+                       f"{'an order' if found else 'nothing'}), so the refresh will "
+                       f"{'adopt it' if found else 'close the slice as never placed'} by itself; forgetting "
+                       f"it by hand could create a double protection. Refresh the page.")
+        for s in candidates:
+            s.state = SLICE_LOST_REJECTED
+            s.detail = (f"forgotten by the operator after checking the TastyTrade site (tag "
+                        f"{s.external_tag}); the tag search could not be completed; whatever was there is "
+                        f"no longer tracked")
+            s.closed_at = _now()
+            _save(s)
+            _log(account.id, ActivityLogSeverity.WARNING,
+                 f"{symbol}: the operator forgot the unresolved slice {s.slice_index + 1} "
+                 f"({s.quantity} sh, tag {s.external_tag}) after checking the TastyTrade site",
+                 code="UNKNOWN_FORGOTTEN", symbol=symbol, tag=s.external_tag)
         p = _reload(p.id)
         if p.alert_code == CODE_UNKNOWN_STATE and not any(
                 x.state in SLICE_ALARM_STATES and x.closed_at is None for x in get_slices(p.id)):
             _clear_alert(p, [CODE_UNKNOWN_STATE])
-        return ActionResult(True, f"{symbol}: {len(forgotten)} unresolved slice(s) forgotten.")
+        return ActionResult(True, f"{symbol}: {len(candidates)} unresolved slice(s) forgotten.")
 
 
 def replace_protection(account, symbol: str) -> ActionResult:

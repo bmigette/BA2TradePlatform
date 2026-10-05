@@ -55,6 +55,9 @@ BROKER_ASSUMPTIONS = (
     "A placement response carries the new complex order with members 'Live'; its read-back via "
     "get_complex_order shows the same.",
     "gtc_date is populated on the placed members.",
+    "A10: order HISTORY ordering. get_order_history(sort='Desc', start_at=...) lists newest first and filters "
+    "server side; get_complex_order_history has no sort option, so its ordering is DETECTED (a page whose first "
+    "entry is older than its last is ascending: every page is read). Verify page 0 of both on the real broker.",
 )
 
 
@@ -109,6 +112,7 @@ class FakeTastyBroker:
         self.single_fill_on_delete = False
         self.positions_fail = False
         self.history_fails = False
+        self.history_ascending = False   # history lists oldest first unless sort='Desc' is passed (plain orders)
 
     # ------------------------------------------------------------- SDK surface
     async def place_complex_order(self, session, order: NewComplexOrder, dry_run: bool = True):
@@ -174,7 +178,7 @@ class FakeTastyBroker:
         """LIVE (non dry-run) plain-order placements so far."""
         return sum(1 for dry, _ in self.single_place_calls if not dry)
 
-    def place_foreign_stop(self, symbol: str, qty: int, stop: float, tag: str) -> int:
+    def place_foreign_stop(self, symbol: str, qty: int, stop: float, tag: str, received_at=None) -> int:
         """A resting STOP order for ANOTHER symbol that carries ``tag`` (a reused-id collision)."""
         from tastytrade.order import Leg, NewOrder, OrderAction, OrderTimeInForce
         from tastytrade.order import OrderType as TTOT
@@ -183,6 +187,9 @@ class FakeTastyBroker:
         new = NewOrder(time_in_force=OrderTimeInForce.GTC, order_type=TTOT.STOP, legs=[leg],
                        stop_trigger=Decimal(str(stop)), external_identifier=tag)
         member = self._placed_from_new(new)
+        if received_at is not None:
+            member.received_at = received_at
+            member.updated_at = received_at
         self.singles[int(member.id)] = {"member": member, "cancel_left": None}
         return int(member.id)
 
@@ -243,14 +250,18 @@ class FakeTastyBroker:
     async def get_order_history(self, session, per_page=50, page_offset=0, **kw):
         if self.history_fails:
             raise TastytradeError("order history unavailable")
-        newest_first = [r["member"] for r in self.singles.values()][::-1]
-        return newest_first[page_offset * per_page:(page_offset + 1) * per_page]
+        rows = [r["member"] for r in self.singles.values()]
+        if not (self.history_ascending and kw.get("sort") != "Desc"):
+            rows = rows[::-1]
+        return rows[page_offset * per_page:(page_offset + 1) * per_page]
 
     async def get_complex_order_history(self, session, per_page=50, page_offset=0):
         if self.history_fails:
             raise TastytradeError("complex order history unavailable")
-        newest_first = [self._placed_complex(cid) for cid in self.complex][::-1]
-        return newest_first[page_offset * per_page:(page_offset + 1) * per_page]
+        rows = [self._placed_complex(cid) for cid in self.complex]
+        if not self.history_ascending:
+            rows = rows[::-1]
+        return rows[page_offset * per_page:(page_offset + 1) * per_page]
 
     async def get_live_complex_orders(self, session):
         return [self._placed_complex(cid) for cid, r in self.complex.items()

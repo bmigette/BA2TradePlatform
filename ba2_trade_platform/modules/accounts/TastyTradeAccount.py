@@ -1904,7 +1904,7 @@ class TastyTradeAccount(AccountInterface):
 
     #: History is read newest-first, ``_TAG_SEARCH_PAGE`` orders per page, at most this many pages.
     _TAG_SEARCH_PAGE = 50
-    _TAG_SEARCH_MAX_PAGES = 20
+    _TAG_SEARCH_MAX_PAGES = 6      # bounded: the search runs inside the account's protection lock
 
     def find_protective_orders_by_tag(self, tag: str, since=None):
         """Find resting/recent protective orders carrying ``external_identifier == tag``.
@@ -1933,18 +1933,25 @@ class TastyTradeAccount(AccountInterface):
             times = [t if t.tzinfo is not None else t.replace(tzinfo=timezone.utc) for t in times if t is not None]
             return min(times) if times else None
 
-        def history(fetch):
-            out = []
+        def history(fetch, ordered_desc_by_server=False):
+            """All pages that can hold orders newer than ``since``. A plain-order fetch is asked for
+            ``sort='Desc'``; a complex-order fetch has no sort option, so its ordering is DETECTED from page
+            0 (first entry older than the last = ascending: every page is read, up to the cap)."""
+            out, newest_first = [], ordered_desc_by_server
             for page in range(self._TAG_SEARCH_MAX_PAGES):
                 rows = list(self._run_async(fetch(page)))
                 out.extend(rows)
                 if since is None or len(rows) < self._TAG_SEARCH_PAGE:
                     return out
                 stamps = [t for t in (order_time(r) for r in rows) if t is not None]
-                if stamps and min(stamps) < since:
+                if page == 0 and not ordered_desc_by_server:
+                    # Newest-first is ONLY concluded from evidence; ascending or indeterminate ordering
+                    # reads on until a short page (or the cap).
+                    newest_first = len(stamps) > 1 and stamps[0] > stamps[-1]
+                if newest_first and stamps and min(stamps) < since:
                     return out
             raise RuntimeError(f"the order history was read {self._TAG_SEARCH_MAX_PAGES} pages deep and "
-                               f"still reaches no further back than {since}; the search is incomplete")
+                               f"still is not complete back to {since}; the search is incomplete")
 
         def tagged(order):
             return getattr(order, "external_identifier", None) == tag
@@ -1958,7 +1965,8 @@ class TastyTradeAccount(AccountInterface):
                 found.append(("OCO", int(complex_order.id), complex_order))
         for order in (list(self._run_async(self._account.get_live_orders(self._session)))
                       + history(lambda page: self._account.get_order_history(
-                          self._session, per_page=self._TAG_SEARCH_PAGE, page_offset=page))):
+                          self._session, per_page=self._TAG_SEARCH_PAGE, page_offset=page,
+                          sort="Desc", start_at=since), ordered_desc_by_server=True)):
             if tagged(order) and getattr(order, "complex_order_id", None) in (None, 0) \
                     and ("STOP", order.id) not in seen:
                 seen.add(("STOP", order.id))

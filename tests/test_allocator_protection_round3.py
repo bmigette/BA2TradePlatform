@@ -134,14 +134,17 @@ def test_i2_a_size_mismatch_warns_and_still_adopts(acct, broker, activity):
     assert any(c["severity"] == ActivityLogSeverity.WARNING and "quantity" in c["description"] for c in activity)
 
 
-def test_i2_an_order_cancelled_on_the_site_closes_the_slice_instead_of_freezing_it(acct, broker):
+def test_i2_an_order_cancelled_on_the_site_is_an_alarm_not_a_freeze_and_not_re_placed(acct, broker):
     _timeout_after_acceptance(broker)
     aps.save_protection(acct, "ABC", 45.0, [])
     broker.external_cancel_single(next(iter(broker.singles)))       # the operator cancelled it on TastyTrade
+    placed = broker.single_place_count()
     aps.reconcile_account(acct)
-    (s,) = [x for x in _slices() if x.id == _slices()[0].id]
-    assert s.state != SLICE_UNKNOWN and s.closed_at is not None
-    assert aps.disable_protection(acct, "ABC").ok                    # not frozen
+    (s,) = _slices()
+    assert s.state == "LOST_CANCELLED" and s.closed_at is None       # item 6: respected, never auto re-placed
+    assert aps.get_protection(1, "ABC").alert_code == ap.CODE_LOST_CANCELLED
+    assert broker.single_place_count() == placed
+    assert aps.disable_protection(acct, "ABC").ok                    # and not frozen
 
 
 def test_i2_forget_closes_an_unknown_slice_with_a_log_entry(acct, broker, activity):
@@ -149,7 +152,8 @@ def test_i2_forget_closes_an_unknown_slice_with_a_log_entry(acct, broker, activi
     aps.save_protection(acct, "ABC", 45.0, [])
     broker.single_raise_on_place = None
     assert [s.state for s in _slices()] == [SLICE_UNKNOWN]
-    assert not aps.disable_protection(acct, "ABC").ok or True
+    _age(aps.UNKNOWN_MIN_AGE_SECONDS // 60 + 1)
+    broker.history_fails = True                                      # the search itself cannot be completed
     result = aps.forget_unknown_slices(acct, "ABC")
     assert result.ok
     assert all(s.closed_at is not None and s.state != SLICE_UNKNOWN for s in _slices())
@@ -452,10 +456,10 @@ def test_i5_the_dialog_does_not_offer_a_filled_target_again():
     assert initial_rows(p) == [{"price": 70.0, "pct": 100.0}]
 
 
-def test_i5_new_shares_added_to_a_resting_protection_get_the_full_template(acct, broker, monkeypatch):
-    """Add-only growth is a fresh lot: the filled mark applies to a re-placement of EVERYTHING only."""
+def test_i5_new_shares_added_to_a_resting_protection_get_the_remaining_plan(acct, broker, monkeypatch):
+    """Round 4 item 1: the filled mark is honoured EVERYWHERE; new shares get what is left of the plan."""
     monkeypatch.setattr(aps, "FILL_SETTLE_SECONDS", 0)
     _tp1_filled(acct, broker, 50.0)
     broker.positions["ABC"] = broker.positions["ABC"] + Decimal(10)
     aps.reconcile_account(acct)
-    assert sorted(_live_oco(broker)) == [(5, 60.0), (5, 70.0), (50, 70.0)]
+    assert sorted(_live_oco(broker)) == [(10, 70.0), (50, 70.0)]

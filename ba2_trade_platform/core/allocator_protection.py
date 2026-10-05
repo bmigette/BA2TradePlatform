@@ -268,7 +268,8 @@ def effective_targets(raw: Optional[Iterable[Dict[str, Any]]], last_price: float
                       tick_sizes: Optional[Sequence[Any]] = None) -> EffectiveTargets:
     """What to place now from the stored targets (each ``{price, fraction[, filled]}``). Pure.
 
-    1. A target recorded as FILLED is never placed again (it was already taken).
+    1. A target recorded as FILLED is never placed again (it was already taken); one PARTLY taken
+       (``"taken"``: the filled share of its slice) keeps the part that is left.
     2. The rest are spread over the shares that are left: ``f / (1 - sum(filled f))``, so TP2 of
        50% after TP1's 50% fill covers ALL the remaining shares, not half of them.
     3. Only then are targets at or below the price dropped (reached but not filled). Their share is
@@ -276,17 +277,27 @@ def effective_targets(raw: Optional[Iterable[Dict[str, Any]]], last_price: float
        folds into the stop and the stop always covers the whole position.
     """
     items = list(raw or [])
-    filled = [i for i, it in enumerate(items) if it.get("filled")]
-    taken = sum(float(items[i]["fraction"]) for i in filled)
-    left = [(i, items[i]) for i in range(len(items)) if i not in filled]
+
+    def taken_ratio(item: Dict[str, Any]) -> float:
+        """How much of the target is already TAKEN: 1 when marked filled, else the stored partial ratio."""
+        if item.get("filled"):
+            return 1.0
+        stored = item.get("taken")
+        return 0.0 if stored is None else min(1.0, max(0.0, float(stored)))
+
+    ratios = [taken_ratio(it) for it in items]
+    filled = [i for i, r in enumerate(ratios) if r >= 1.0 - 1e-9]
+    taken = sum(float(it["fraction"]) * r for it, r in zip(items, ratios))
+    left = [i for i in range(len(items)) if i not in filled]
     if not left or taken >= 1.0 - 1e-9:
         return EffectiveTargets([], [], filled, [])
     scale = 1.0 / (1.0 - taken)
-    scaled = [TpTarget(price=float(it["price"]), fraction=float(it["fraction"]) * scale) for _, it in left]
+    scaled = [TpTarget(price=float(items[i]["price"]),
+                       fraction=float(items[i]["fraction"]) * (1.0 - ratios[i]) * scale) for i in left]
     usable, reached = drop_reached_targets(scaled, last_price, tick_sizes)
     reached_keys = {(t.price, t.fraction) for t in reached}
-    usable_index = [i for (i, _), t in zip(left, scaled) if (t.price, t.fraction) not in reached_keys]
-    reached_index = [i for (i, _), t in zip(left, scaled) if (t.price, t.fraction) in reached_keys]
+    usable_index = [i for i, t in zip(left, scaled) if (t.price, t.fraction) not in reached_keys]
+    reached_index = [i for i, t in zip(left, scaled) if (t.price, t.fraction) in reached_keys]
     return EffectiveTargets(usable, usable_index, filled, reached_index)
 
 
