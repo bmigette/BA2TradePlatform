@@ -1569,6 +1569,52 @@ class TastyTradeAccount(AccountInterface):
         equity = self._run_async(Equity.get(self._session, symbol))
         return getattr(equity, "tick_sizes", None)
 
+    def dry_run_protective(self, symbol: str, quantity: int, sl_price: float,
+                           tp_price: Optional[float] = None) -> "ProtectiveDryRun":
+        """The broker's verdict on ONE protective order, by DRY RUN only: nothing is placed.
+
+        ``tp_price`` None checks a plain stop; a price checks an OCO (limit OR stop). The verdict carries the
+        signed buying-power change and, when the broker refuses, its own words (``margin_check_failed`` marks
+        the reservation of a stop far below the market, A11). A refusal raised by the SDK and one returned in
+        ``errors`` are both a ``not ok`` verdict, never an exception.
+        """
+        from tastytrade.instruments import Equity
+        from tastytrade.order import ComplexOrderType, NewComplexOrder
+
+        from ...core.allocator_protection import ProtectiveDryRun, is_margin_refusal
+
+        if not self._check_authentication():
+            return ProtectiveDryRun(False, None, f"not authenticated with TastyTrade: {self._authentication_error}")
+        qty = Decimal(str(quantity)).quantize(Decimal(1))
+        if qty <= 0 or not sl_price > 0:
+            return ProtectiveDryRun(False, None, f"quantity {quantity} and stop {sl_price} must be positive")
+        try:
+            equity = self._run_async(Equity.get(self._session, symbol))
+            tag = "ba2prot:dryrun"
+            stop_order = NewOrder(
+                time_in_force=OrderTimeInForce.GTC, order_type=TTOrderType.STOP,
+                legs=[equity.build_leg(qty, OrderAction.SELL_TO_CLOSE)],
+                stop_trigger=Decimal(str(sl_price)), external_identifier=tag)
+            if tp_price is None:
+                response = self._run_async(self._account.place_order(self._session, stop_order, dry_run=True))
+            else:
+                tp_order = NewOrder(
+                    time_in_force=OrderTimeInForce.GTC, order_type=TTOrderType.LIMIT,
+                    legs=[equity.build_leg(qty, OrderAction.SELL_TO_CLOSE)],
+                    price=self._signed_price(tp_price, OrderDirection.SELL), external_identifier=tag)
+                check_oco = NewComplexOrder(orders=[tp_order, stop_order], type=ComplexOrderType.OCO)
+                response = self._run_async(self._account.place_complex_order(self._session, check_oco, dry_run=True))
+        except Exception as e:  # noqa: BLE001 -- a refusal is a verdict, whatever raised it
+            text = self._describe_broker_error(e, "the protective dry run")
+            return ProtectiveDryRun(False, None, text, is_margin_refusal(text))
+        errors = [getattr(e, "message", str(e)) for e in (getattr(response, "errors", None) or [])]
+        effect = getattr(response, "buying_power_effect", None)
+        change = None if effect is None else float(effect.change_in_buying_power)
+        if errors:
+            text = "; ".join(errors)
+            return ProtectiveDryRun(False, change, text, is_margin_refusal(text))
+        return ProtectiveDryRun(True, change, "")
+
     def place_protective_oco(self, symbol: str, quantity: int, tp_price: float,
                              sl_price: float, tag: str) -> "ProtectiveOcoResult":
         """Place ONE GTC OCO: sell ``quantity`` whole shares at a limit ``tp_price`` OR as a

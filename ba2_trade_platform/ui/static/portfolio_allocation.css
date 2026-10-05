@@ -84,9 +84,9 @@
     .pf-sym-head { display: flex; align-items: center; gap: 8px; padding-bottom: 8px;
         margin-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.10); }
     .pf-sym-name { font-size: 1.2rem; font-weight: 700; line-height: 1.1; }
-    .pf-sym-head > .row { margin-left: auto; flex-wrap: wrap !important;
-        justify-content: flex-end !important; gap: 6px !important; }
-    .pf-sym-head .q-btn { min-width: 40px; min-height: 40px; }
+    .pf-sym-head > .row { margin-left: auto; flex-wrap: nowrap !important;
+        justify-content: flex-end !important; gap: 2px !important; }
+    .pf-sym-head .q-btn { min-width: 32px; min-height: 32px; }
     .pf-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 8px; margin: 10px 0; }
     .pf-tile { display: flex; flex-direction: column; min-width: 0; min-height: 4rem;
@@ -113,18 +113,15 @@
     .q-table__grid-content { padding: 0 !important; }
 
 
-    /* THE SET TP/SL CONTROL: a shield button and a status chip. The chip never wraps. */
-    .pf-prot-chip { white-space: nowrap; line-height: 1.2; }
-    .pf-sym-head > .pf-prot { margin-left: 6px; }
-    .pf-sym-head > .pf-excl { margin-left: 6px; }
-    .pf-prot-note { white-space: nowrap; font-size: 0.7rem; }
-    .pf-excl-chip { white-space: nowrap; }
-    /* AN EXCLUDED ROW is greyed (it is outside the managed money); its toggle stays readable. */
+    /* THE TP/SL SHIELD AND THE EXCLUDE EYE sit in the symbol cell's icon group, the size of the (i). */
+    .pf-icons .q-btn { min-width: 0; }
+    /* THE LABEL HEADER'S COUNT PILL: total | profitable | losing | excluded, touching segments. */
+    .pf-seg { border-radius: 10px; overflow: hidden; gap: 1px !important; }
+    .pf-seg .pf-seg-part { border-radius: 0; padding: 2px 7px; font-weight: 700; }
+    /* AN EXCLUDED ROW is greyed (it is outside the managed money); its icon group stays readable. */
     .pf-row-excluded td { opacity: 0.55; }
-    .pf-row-excluded td:has(.pf-excl) { opacity: 1; }
+    .pf-row-excluded td:has(.pf-icons) { opacity: 1; }
     .pf-sym-card--excl .pf-tiles, .pf-sym-card--excl .pf-field { opacity: 0.55; }
-    /* the dialog's take-profit rows: price + share + delete stay on one line on a desktop */
-    .pf-tp-row .q-field { min-width: 0; }
 
 @media (max-width: 639px) {
 
@@ -134,7 +131,6 @@
     .pf-tp-row.pf-tp-row > .flex-grow { flex: 1 1 100% !important; }
     .pf-tp-row.pf-tp-row > .w-32 { flex: 1 1 auto !important; width: auto !important; }
     .pf-prot-dialog .q-field__control { min-height: 44px; }
-    .pf-sym-head > .pf-prot { margin-left: auto; }
     .pf-bar-row > .pf-b-excl { order: 3; }
 
 }

@@ -55,6 +55,12 @@ BROKER_ASSUMPTIONS = (
     "A placement response carries the new complex order with members 'Live'; its read-back via "
     "get_complex_order shows the same.",
     "gtc_date is populated on the placed members.",
+    "A3 is CONFIRMED on the live broker (a second OCO on the second share dry-runs fine: an OCO counts its "
+    "quantity once). A11: TastyTrade margin-checks a STOP as if it filled AT ITS TRIGGER: the buying-power "
+    "change is about q x (stop - p0) (p0 = price minus the margin released, ~$215 for a $287 stock). Stops "
+    "within ~25% of the price cost nothing; deeper ones RESERVE buying power and resting stops keep it "
+    "reserved; when it is not available the order is refused with 'margin_check_failed'. gtc_date is NULL on "
+    "live GTC orders (no expiry, so no renewal).",
     "A10: order HISTORY ordering. get_order_history(sort='Desc', start_at=...) lists newest first and filters "
     "server side; get_complex_order_history has no sort option, so its ordering is DETECTED (a page whose first "
     "entry is older than its last is ascending: every page is read). Verify page 0 of both on the real broker.",
@@ -112,16 +118,49 @@ class FakeTastyBroker:
         self.single_fill_on_delete = False
         self.positions_fail = False
         self.history_fails = False
+        self.bp_p0 = None          # when set, a stop's BP effect is q x (stop - p0)
+        self.available_bp = 0.0    # the account's buying power for that model
         self.history_ignores_sort = False   # a server that ignores sort='Desc' (lists oldest first)
         self.history_ascending = False   # history lists oldest first unless sort='Desc' is passed (plain orders)
 
     # ------------------------------------------------------------- SDK surface
+    def _stop_bp_change(self, orders) -> Decimal:
+        """BP change of the STOP legs among ``orders`` under the live-broker model (A11)."""
+        if self.bp_p0 is None:
+            return Decimal(0)
+        total = Decimal(0)
+        for o in orders:
+            if getattr(o, "stop_trigger", None) is not None:
+                total += Decimal(str(o.legs[0].quantity)) * (Decimal(str(o.stop_trigger)) - Decimal(str(self.bp_p0)))
+        return total
+
+    def _reserved_bp(self) -> Decimal:
+        """Buying power the RESTING stops already reserve (only their negative effects)."""
+        total = Decimal(0)
+        live = (TTOrderStatus.LIVE, TTOrderStatus.RECEIVED)
+        members = [r["member"] for r in self.singles.values()] + \
+            [m for r in self.complex.values() for m in r["members"]]
+        for m in members:
+            if m.status in live and getattr(m, "stop_trigger", None) is not None and self.bp_p0 is not None:
+                change = Decimal(str(m.size)) * (Decimal(str(m.stop_trigger)) - Decimal(str(self.bp_p0)))
+                if change < 0:
+                    total += -change
+        return total
+
+    def _bp_check(self, orders):
+        """The margin check: refuse (raise) when the stops' reservation is not affordable; else the effect."""
+        change = self._stop_bp_change(orders)
+        if change < 0 and -change + self._reserved_bp() > Decimal(str(self.available_bp)):
+            raise TastytradeError("margin_check_failed: Your account does not have sufficient buying power")
+        return SimpleNamespace(change_in_buying_power=change)
+
     async def place_complex_order(self, session, order: NewComplexOrder, dry_run: bool = True):
         self.place_calls.append((dry_run, order))
+        effect = self._bp_check(order.orders)
         if dry_run:
             errors = [SimpleNamespace(code="x", message=m) for m in self.dry_run_errors]
             return SimpleNamespace(complex_order=SimpleNamespace(id=-1, orders=[]),
-                                   errors=errors or None, warnings=None)
+                                   errors=errors or None, warnings=None, buying_power_effect=effect)
         if self.raise_on_place is not None:
             raise self.raise_on_place
         cid = self._next_complex
@@ -197,9 +236,11 @@ class FakeTastyBroker:
 
     async def place_order(self, session, order, dry_run: bool = True):
         self.single_place_calls.append((dry_run, order))
+        effect = self._bp_check([order])
         if dry_run:
             errors = [SimpleNamespace(code="x", message=m) for m in self.single_dry_run_errors]
-            return SimpleNamespace(order=SimpleNamespace(id=-1), errors=errors or None, warnings=None)
+            return SimpleNamespace(order=SimpleNamespace(id=-1), errors=errors or None, warnings=None,
+                                   buying_power_effect=effect)
         if self.single_raise_on_place is not None:
             raise self.single_raise_on_place
         member = self._placed_from_new(order)

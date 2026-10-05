@@ -27,7 +27,8 @@ from ..logger import logger
 from .allocator_exclusion import reduce_symbol_weights
 from .allocator_protection import (
     AUTO_ACTION_MIN_INTERVAL_SECONDS, AUTO_FAILURE_LIMIT, UNKNOWN_MIN_AGE_SECONDS, CODE_SALE_SETTLING,
-    effective_targets, plan_add_only, target_taken, CODE_AUTO_STOPPED,
+    effective_targets, plan_add_only, target_taken, is_margin_refusal, margin_sentence, round_price_to_tick,
+    tick_for_price, CODE_AUTO_STOPPED,
     CODE_CANCEL_UNCONFIRMED, CODE_FILL, CODE_LOST_CANCELLED, CODE_LOST_EXPIRED, CODE_LOST_REJECTED,
     CODE_PLACEMENT_REFUSED, CODE_QUANTITY_MISMATCH, CODE_RECONCILE_FETCH_FAILED, CODE_REPLACE_FAILED,
     CODE_REPLACE_STALE, CODE_UNKNOWN_STATE, FILL_SETTLE_SECONDS, GTC_RENEW_DAYS, KIND_SL, KIND_TP,
@@ -1010,9 +1011,20 @@ def _place_slices(account, p: AllocatorProtection) -> Tuple[AllocatorProtection,
         p = _save(p)
     if result.errors:
         p.last_error = " | ".join(result.errors)[:1000]
-        p = _alert(p, CODE_PLACEMENT_REFUSED,
-                   f"{result.placed} of {len(plans)} protective order(s) placed; refused: "
-                   f"{' | '.join(result.errors)}")
+        raw = " | ".join(result.errors)
+        if any(is_margin_refusal(e) for e in result.errors):
+            # A11: the broker reserves buying power for the loss at a stop's trigger price.
+            bare = int(to_cover) - int(result.shares_covered)
+            try:
+                available = account.get_account_snapshot().buying_power
+            except Exception:  # noqa: BLE001 -- only context for the sentence
+                available = None
+            message = (margin_sentence(available=available)
+                       + f" {result.placed} of {len(plans)} protective order(s) placed; {bare} "
+                       + ("share has" if bare == 1 else "shares have") + f" no stop. Details: {raw}")
+        else:
+            message = f"{result.placed} of {len(plans)} protective order(s) placed; refused: {raw}"
+        p = _alert(p, CODE_PLACEMENT_REFUSED, message)
     else:
         p.last_error = None
         p.protected_quantity = covered_quantity(get_slices(p.id))
@@ -1201,6 +1213,155 @@ def forget_unknown_slices(account, symbol: str) -> ActionResult:
                 x.state in SLICE_ALARM_STATES and x.closed_at is None for x in get_slices(p.id)):
             _clear_alert(p, [CODE_UNKNOWN_STATE])
         return ActionResult(True, f"{symbol}: {len(candidates)} unresolved slice(s) forgotten.")
+
+
+@dataclass
+class SliceCheck:
+    """The broker's dry-run verdict on one order of the plan."""
+    kind: str
+    quantity: int
+    tp_price: Optional[float]
+    sl_price: float
+    ok: bool
+    bp_change: Optional[float] = None
+    message: str = ""
+    margin_failed: bool = False
+
+
+@dataclass
+class CheckReport:
+    """What 'Check with broker' shows: per-order verdicts, the buying power, and a warning when the
+    stops' reservation is not affordable (with an approximate stop the broker would accept)."""
+    slices: List[SliceCheck] = field(default_factory=list)
+    available: Optional[float] = None
+    needed: Optional[float] = None
+    suggested_stop: Optional[float] = None
+    warning: str = ""
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def all_ok(self) -> bool:
+        return all(x.ok for x in self.slices) and not self.warning
+
+
+#: How many dry-run rounds the stop suggestion may spend (each round is one call per order of the plan).
+SUGGEST_STOP_ROUNDS = 7
+
+
+def _dry_run_plan(account, symbol: str, plans, sl_price: float) -> List[SliceCheck]:
+    out = []
+    for plan in plans:
+        verdict = account.dry_run_protective(symbol, plan.quantity, sl_price=sl_price, tp_price=plan.tp_price)
+        out.append(SliceCheck(kind=plan.kind, quantity=plan.quantity, tp_price=plan.tp_price, sl_price=sl_price,
+                              ok=verdict.ok, bp_change=verdict.bp_change, message=verdict.message,
+                              margin_failed=verdict.margin_failed))
+    return out
+
+
+def _reserved(checks: List[SliceCheck]) -> float:
+    return sum(-c.bp_change for c in checks if c.ok and c.bp_change is not None and c.bp_change < 0)
+
+
+def check_with_broker(account, symbol: str, sl_price: float, targets: List[TpTarget],
+                      kept_filled: Optional[List[TpTarget]] = None,
+                      taken: Optional[List[Optional[float]]] = None) -> CheckReport:
+    """Ask the broker (DRY RUNS only, nothing is placed) whether the plan would be accepted and what it
+    does to buying power. Read-only; never on page load (the dialog's explicit 'Check with broker').
+
+    TastyTrade margin-checks a stop as if it filled at its trigger (A11): the check sums the reservation
+    of the plan's stops against the account's buying power and, when it does not fit, bisects a stop the
+    broker accepts (a few extra dry-run rounds, labelled approximate).
+    """
+    symbol = _norm(symbol)
+    qty, is_long = _read_position(account, symbol)
+    last = _read_price(account, symbol)
+    ticks = _tick_sizes(account, symbol)
+    report = CheckReport()
+    shares = whole_shares(qty)
+    if not is_long and qty > 0 or shares < 1:
+        report.notes.append("no whole share to protect" if shares < 1 else "short position")
+        return report
+    raw = [dict(t.to_dict(), taken=m) if m else t.to_dict()
+           for t, m in zip(targets, list(taken or []) + [None] * len(targets))]
+    raw += [dict(t.to_dict(), filled=True, taken=1.0) for t in (kept_filled or [])]
+    eff = effective_targets(raw, last, ticks)
+    plans, notes = plan_slices(shares=shares, targets=eff.usable, sl_price=sl_price, last_price=last,
+                               tick_sizes=ticks)
+    report.notes.extend(notes)
+    report.slices = _dry_run_plan(account, symbol, plans, plans[0].sl_price if plans else sl_price)
+    try:
+        report.available = account.get_account_snapshot().buying_power
+    except Exception as e:  # noqa: BLE001 -- the verdicts stand without it
+        logger.warning(f"allocator TP/SL: buying power unreadable for the check: {e}")
+    refused = any(not c.ok and c.margin_failed for c in report.slices)
+    reserved = _reserved(report.slices)
+    too_much = report.available is not None and reserved > report.available + 1e-9
+    if not (refused or too_much):
+        report.needed = reserved if report.available is not None else None
+        return report
+
+    # Bisect the lowest stop the broker accepts, between the operator's stop and just under the market.
+    tick = tick_for_price(last, ticks)
+    top = round_price_to_tick(last - float(tick), tick, "down")
+
+    def accepted(stop: float):
+        checks = _dry_run_plan(account, symbol, plans, stop)
+        ok = all(c.ok for c in checks) and (report.available is None or _reserved(checks) <= report.available + 1e-9)
+        return ok, checks
+    lo, hi = float(plans[0].sl_price), top
+    suggested, at_hi = None, None
+    if hi > lo:
+        good, checks = accepted(hi)
+        if good:
+            suggested, at_hi = hi, checks
+            for _ in range(SUGGEST_STOP_ROUNDS):
+                mid = round_price_to_tick((lo + hi) / 2.0, tick, "down")
+                if mid <= lo or mid >= hi:
+                    break
+                good, checks = accepted(mid)
+                if good:
+                    hi, suggested, at_hi = mid, mid, checks
+                else:
+                    lo = mid
+    needed = None
+    if at_hi is not None and all(c.bp_change is not None for c in at_hi):
+        total_q = sum(c.quantity for c in at_hi if c.kind == ORDER_KIND_STOP or c.tp_price is not None)
+        change_at_hi = sum(c.bp_change for c in at_hi)
+        needed = max(0.0, -(change_at_hi + total_q * (float(plans[0].sl_price) - float(suggested))))
+    report.needed = needed
+    report.suggested_stop = suggested
+    report.warning = margin_sentence(needed=needed, available=report.available, suggested=suggested)
+    return report
+
+
+def change_stop_and_replace(account, symbol: str, new_sl: float) -> ActionResult:
+    """The operator's explicit 'Use a stop the broker accepts': set the stop and re-place the protection.
+
+    The stop is never changed silently: this is the action behind a button. A stop that is not below the
+    market is refused; if the re-placement places nothing with the new stop the old stop is put back.
+    """
+    symbol = _norm(symbol)
+    with protection_lock(account.id):
+        p = get_protection(account.id, symbol)
+        if p is None or not p.enabled:
+            return ActionResult(False, f"{symbol}: protection is not enabled.")
+        try:
+            last = _read_price(account, symbol)
+        except BrokerReadError as e:
+            return ActionResult(False, f"Cannot change the stop: {e}")
+        if not (0 < float(new_sl) < last):
+            return ActionResult(False, f"{symbol}: the stop {new_sl:g} must be above 0 and BELOW the current "
+                                       f"price {last:g}.")
+        old = p.sl_price
+        p.sl_price = float(new_sl)
+        _save(p)
+        result = replace_protection(account, symbol)
+        if not result.ok:
+            fresh = _reload(p.id)
+            if not any(_is_resting(x) and abs(float(x.sl_price) - float(new_sl)) < 0.0101 for x in get_slices(p.id)):
+                fresh.sl_price = old
+                _save(fresh)
+        return result
 
 
 def replace_protection(account, symbol: str) -> ActionResult:

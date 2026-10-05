@@ -294,6 +294,46 @@ def effective_targets(raw: Optional[Iterable[Dict[str, Any]]], last_price: float
     return EffectiveTargets(usable, usable_index, filled, reached_index)
 
 
+#: What the broker's refusal says when the stop's buying-power reservation is not affordable.
+MARGIN_FAILED_MARK = "margin_check_failed"
+
+
+def is_margin_refusal(text: Optional[str]) -> bool:
+    """True when a broker message is the buying-power refusal of a stop (A11)."""
+    return MARGIN_FAILED_MARK in (text or "")
+
+
+@dataclass(frozen=True)
+class ProtectiveDryRun:
+    """The broker's verdict on ONE protective order, from a dry run (nothing is placed).
+
+    ``bp_change`` is the SIGNED buying-power change (negative = reserves buying power), ``None`` when the
+    broker refused before computing one. ``message`` is the broker's own words (kept verbatim).
+    """
+    ok: bool
+    bp_change: Optional[float] = None
+    message: str = ""
+    margin_failed: bool = False
+
+
+def margin_sentence(*, needed: Optional[float] = None, available: Optional[float] = None,
+                    suggested: Optional[float] = None) -> str:
+    """The one sentence the dialog, the alert and the tooltip use for a stop the broker cannot afford.
+
+    TastyTrade margin-checks a STOP as if it filled AT ITS TRIGGER (A11), so a stop far below the market
+    RESERVES buying power for the loss at that price. Pure; the numbers are optional (never invented).
+    """
+    detail = ""
+    if needed is not None and available is not None:
+        detail = f" (needs ~${needed:,.2f}, available ${available:,.2f})"
+    elif available is not None:
+        detail = f" (available ${available:,.2f})"
+    advice = (f" Raise the stop to ~${suggested:,.2f} (approx.) or free buying power."
+              if suggested is not None else " Raise the stop or free buying power.")
+    return ("This stop is far below the market: TastyTrade reserves buying power for the loss at the stop "
+            "price" + detail + "." + advice)
+
+
 def target_taken(item: Dict[str, Any]) -> float:
     """How much of a stored target is already TAKEN (0..1): 1 when marked filled, else its ``taken``."""
     if item.get("filled"):
