@@ -33,6 +33,7 @@ TP_ROW_CLASS = 'pf-tp-row'
 MARKER_SAVE = 'pf-prot-save'
 MARKER_SWITCH_OFF = 'pf-prot-off'
 MARKER_FORGET = 'pf-prot-forget'
+MARKER_REARM = 'pf-prot-rearm'
 MARKER_REPLACE = 'pf-prot-replace'
 MARKER_ADD_TARGET = 'pf-prot-add'
 MARKER_PRESET_PREFIX = 'pf-prot-preset-'
@@ -68,12 +69,27 @@ def initial_rows(protection: Optional[AllocatorProtection]) -> List[Dict[str, An
     """The TP rows the dialog opens with: the stored ones (possibly none: a stop-only
     protection), else one blank row at 100%."""
     if protection is not None and (protection.enabled or protection.tp_targets):
-        # A target that already FILLED is shown no more, and the others are spread over the shares that
-        # are left (what is actually placed). Saving this therefore does not take the filled target again.
-        eff = effective_targets(protection.tp_targets, 0.01)
-        pcts = fractions_to_percentages([t.fraction for t in eff.usable])
-        return [{'price': t.price, 'pct': pct} for t, pct in zip(eff.usable, pcts)]
+        # The targets still to be taken, at their ORIGINAL shares; the ones already taken are listed apart
+        # (``initial_kept``) with a Re-arm control.
+        items = [t for t in (protection.tp_targets or []) if not t.get('filled')]
+        pcts = fractions_to_percentages([float(t['fraction']) for t in items])
+        rows = []
+        for t, pct in zip(items, pcts):
+            row = {'price': t['price'], 'pct': pct}
+            if t.get('taken'):
+                row['taken'] = float(t['taken'])                # a partly taken target stays partly taken
+                row['orig'] = (t['price'], pct)
+            rows.append(row)
+        return rows
     return [{'price': None, 'pct': 100.0}]
+
+
+def initial_kept(protection: Optional[AllocatorProtection]) -> List[Dict[str, Any]]:
+    """The targets that already FILLED (shown greyed, each with a Re-arm checkbox)."""
+    if protection is None:
+        return []
+    items = [t for t in (protection.tp_targets or []) if t.get('filled')]
+    return [{'price': t['price'], 'pct': round(float(t['fraction']) * 100.0, 4)} for t in items]
 
 
 def slice_rows(slices: List[AllocatorProtectionOrder]) -> List[Dict[str, Any]]:
@@ -113,6 +129,7 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
     status: ProtectionStatus = data['status']
     shares = whole_shares(quantity)
     rows_state: List[Dict[str, Any]] = initial_rows(protection)
+    kept_state: List[Dict[str, Any]] = initial_kept(protection)
     changed = {'v': False}
     busy = {'v': False}
 
@@ -175,23 +192,31 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
         preset_row = ui.row().classes('w-full gap-2 pf-wrap-row pf-actions')
         ui.label('Take-profit targets').classes('text-caption text-secondary-custom')
         targets_box = ui.column().classes('w-full gap-1')
+        kept_box = ui.column().classes('w-full gap-1')
         problems_box = ui.column().classes('w-full gap-0')
         preview_box = ui.column().classes('w-full gap-0')
         result_box = ui.column().classes('w-full gap-0')
 
         def _collect() -> Dict[str, Any]:
             targets, parse_errors = parse_target_rows(rows_state)
+            kept = [TpTarget(price=float(k['price']), fraction=float(k['pct']) / 100.0) for k in kept_state]
             sl_raw = sl_input.value
             errors = list(parse_errors)
             errors.extend(validate_protection(
                 sl_price=None if sl_raw in (None, '') else float(sl_raw), targets=targets,
                 last_price=price, position_quantity=quantity, tick_sizes=ticks))
+            if sum(t.fraction for t in targets) + sum(t.fraction for t in kept) > 1.0 + 1e-9:
+                errors.append('The take-profit shares, together with the targets already taken, exceed 100%.')
+            marks = None
+            if not parse_errors:
+                marks = [row.get('taken') if row.get('taken') and (row['price'], row['pct']) == row.get('orig')
+                         else None for row in rows_state]
             seen, unique = set(), []
             for e in errors:                                    # parse + validate can repeat
                 if e not in seen:
                     seen.add(e)
                     unique.append(e)
-            return {'targets': targets, 'errors': unique,
+            return {'targets': targets, 'kept': kept, 'marks': marks, 'errors': unique,
                     'sl': None if sl_raw in (None, '') else float(sl_raw)}
 
         def _recompute() -> None:
@@ -204,8 +229,13 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
             if not info['errors']:
                 with preview_box:
                     ui.label('Orders that will be placed (GTC):').classes('text-caption text-secondary-custom')
+                    raw = [dict(t.to_dict(), taken=m) if m else t.to_dict()
+                           for t, m in zip(info['targets'], info['marks'] or [None] * len(info['targets']))]
+                    raw += [dict(t.to_dict(), filled=True) for t in info['kept']]
+                    # What is PLACED: the targets already taken are left out and the rest spread over what is left.
                     for line in preview_orders(shares=shares, position_quantity=quantity,
-                                               targets=info['targets'], sl_price=info['sl'],
+                                               targets=effective_targets(raw, price, ticks).usable,
+                                               sl_price=info['sl'],
                                                last_price=price, tick_sizes=ticks):
                         ui.label(line).classes('text-xs')
             save_button.set_enabled(not info['errors'] and not busy['v'] and data['is_long'])
@@ -229,6 +259,29 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
                         ui.button(icon='delete', on_click=lambda r=row: _remove_row(r)
                                   ).props('flat dense round').tooltip('Remove this target'
                                   ).set_enabled(True)
+
+        def _draw_kept() -> None:
+            kept_box.clear()
+            with kept_box:
+                if kept_state:
+                    ui.label('Targets already taken (not placed again unless re-armed)'
+                             ).classes('text-caption text-secondary-custom')
+                for entry in list(kept_state):
+                    with ui.row().classes('w-full items-center gap-2 no-wrap'):
+                        ui.label(f"TP {float(entry['price']):g}  {float(entry['pct']):g}%  taken"
+                                 ).classes('text-body2 flex-grow').style('opacity:0.55')
+                        ui.checkbox('Re-arm', value=False,
+                                    on_change=lambda e, en=entry: _rearm(en) if e.value else None
+                                    ).props('dense').mark(MARKER_REARM)
+
+        def _rearm(entry: Dict[str, Any]) -> None:
+            """The operator wants this target taken again: it becomes an ordinary editable row."""
+            if entry in kept_state:
+                kept_state.remove(entry)
+                rows_state.append({'price': entry['price'], 'pct': entry['pct']})
+            _draw_kept()
+            _draw_rows()
+            _recompute()
 
         def _remove_row(row: Dict[str, Any]) -> None:
             if row in rows_state:
@@ -276,6 +329,7 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
                 button.tooltip(spec.description)
                 button.set_enabled(bool(average_cost) and data['is_long'])
         _draw_rows()
+        _draw_kept()
         add_button = ui.button('Add take-profit target', icon='add', on_click=_add_row
                                ).props('outline dense').mark(MARKER_ADD_TARGET)
         sl_input.on_value_change(lambda e: _recompute())
@@ -317,7 +371,8 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
             info = _collect()
             if info['errors']:
                 return aps.ActionResult(False, 'The TP/SL is not valid.', errors=info['errors'])
-            return aps.save_protection(account, symbol, info['sl'], info['targets'])
+            return aps.save_protection(account, symbol, info['sl'], info['targets'],
+                                       kept_filled=info['kept'], taken=info['marks'])
 
         def _confirm(text: str, label: str, work, *, close_on_ok: bool = True) -> None:
             with ui.dialog() as sure, ui.card():

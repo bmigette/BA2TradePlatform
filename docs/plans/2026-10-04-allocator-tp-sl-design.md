@@ -450,3 +450,20 @@ regular hours.
 - N7 (item 6): `expected_qty` is cleared wherever `pending_replace` is set or cleared; the wait only applies when
   a platform SELL of the symbol is FILLED in the DB; it logs SALE_SETTLING once and SALE_UNSETTLED if it ends
   still mismatched.
+
+### 13.2 Round 5
+
+- Per-slice `taken` (M1): each slice stores, keyed by its tag inside the target's JSON (`bases`), what the target had
+  already given up when it was placed; a fill updates `taken = base + (1 - base) * filled/qty`. A target is marked
+  `filled` only when its slice fills in full AND no other slice of the same target still rests (a growth lot's fill is
+  the lot's, not the target's).
+- Tag search (M2): only the plain order endpoints are read (`sort='Desc'`, `start-at` as ISO 8601). OCO legs are found
+  there by their `complex_order_id` and the complex order is read by id; the complex history is never read. An
+  ascending page raises, so the caller concludes nothing.
+- Add-only placement (S1): growth and repair shares fill each target's DEFICIT against the plan for the whole
+  position (`plan_add_only`), so per-target totals stay near the template; surplus shares go to the stop-only runner.
+- `extend_after_buys` respects an open alarm like the refresh does (S2).
+- The dialog lists taken targets greyed with a Re-arm checkbox; saving keeps them marked unless re-armed, and a
+  partly taken target stays partly taken while its price and share are unchanged (S3).
+- Operator-facing supervised checklist: `2026-10-04-allocator-tp-sl-supervised-test.md`; read-only probe:
+  `tools/tt_protection_probe.py`.

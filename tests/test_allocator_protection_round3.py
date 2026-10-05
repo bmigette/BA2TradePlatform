@@ -453,7 +453,7 @@ def test_i5_the_dialog_does_not_offer_a_filled_target_again():
     from ba2_trade_platform.ui.pages.allocator_protection_dialog import initial_rows
     p = SimpleNamespace(enabled=True, tp_targets=[{"price": 60.0, "fraction": 0.5, "filled": True},
                                                   {"price": 70.0, "fraction": 0.5}])
-    assert initial_rows(p) == [{"price": 70.0, "pct": 100.0}]
+    assert [r["price"] for r in initial_rows(p)] == [70.0]          # the taken one is in the re-arm list
 
 
 def test_i5_new_shares_added_to_a_resting_protection_get_the_remaining_plan(acct, broker, monkeypatch):

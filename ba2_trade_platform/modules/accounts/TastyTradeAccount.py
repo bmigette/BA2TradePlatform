@@ -1906,49 +1906,49 @@ class TastyTradeAccount(AccountInterface):
     _TAG_SEARCH_PAGE = 50
     _TAG_SEARCH_MAX_PAGES = 6      # bounded: the search runs inside the account's protection lock
 
-    def find_protective_orders_by_tag(self, tag: str, since=None):
+    def find_protective_orders_by_tag(self, tag: str, since=None, kind=None):
         """Find resting/recent protective orders carrying ``external_identifier == tag``.
 
         The resolver of an UNKNOWN placement (the live call raised and we do not know whether the
-        order reached the broker). Looks at TODAY's live orders, today's live complex orders and the
-        newest page of complex-order and order history, so an order accepted a moment ago is found
-        whichever of them lists it. Returns ``[(kind, broker_id, wrapper)]`` where ``kind`` is
-        ``"OCO"`` or ``"STOP"`` and ``wrapper`` reads like a complex order (``.orders``). Raises on
-        a failed read: "nothing found" must mean nothing was there, never that we could not look.
+        order reached the broker). Returns ``[(kind, broker_id, wrapper)]`` where ``kind`` is ``"OCO"`` or
+        ``"STOP"`` and ``wrapper`` reads like a complex order (``.orders``). Raises on a failed read OR an
+        unverifiable history: "nothing found" must mean nothing was there, never that we could not look.
 
-        ``since`` (an aware datetime) bounds how far back the history is read: pages are fetched
-        newest-first until one is short or its oldest order is older than ``since``. Without it only the
-        newest page is read. When ``_TAG_SEARCH_MAX_PAGES`` pages were read and ``since`` was still not
-        reached the search RAISES: it could not look far enough, which is not 'nothing there'.
+        Only the PLAIN order endpoints are searched (today's live orders and the plain history asked ``sort='Desc', start_at=since``): an OCO's legs appear there
+        with their ``complex_order_id`` and the complex order is then read by id. The complex-order
+        history is never read (it has no filter or sort and covers the account's whole life). ``kind``
+        ``"STOP"`` skips every complex endpoint. The server's ordering is not trusted: an ascending page
+        raises (and so does a full page that never reaches ``since`` within the page cap); the caller
+        then concludes nothing.
         """
         from datetime import timezone
         from types import SimpleNamespace
         if not self._check_authentication():
             raise RuntimeError(f"[Account {self.id}] not authenticated with TastyTrade")
+        want_oco = kind in (None, "OCO")
+        want_stop = kind in (None, "STOP")
         found, seen = [], set()
 
         def order_time(item):
-            members = getattr(item, "orders", None) or [item]
-            times = [getattr(m, "received_at", None) or getattr(m, "updated_at", None) for m in members]
-            times = [t if t.tzinfo is not None else t.replace(tzinfo=timezone.utc) for t in times if t is not None]
-            return min(times) if times else None
+            stamp = getattr(item, "received_at", None) or getattr(item, "updated_at", None)
+            if stamp is None:
+                return None
+            return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
 
-        def history(fetch, ordered_desc_by_server=False):
-            """All pages that can hold orders newer than ``since``. A plain-order fetch is asked for
-            ``sort='Desc'``; a complex-order fetch has no sort option, so its ordering is DETECTED from page
-            0 (first entry older than the last = ascending: every page is read, up to the cap)."""
-            out, newest_first = [], ordered_desc_by_server
+        def history():
+            out = []
             for page in range(self._TAG_SEARCH_MAX_PAGES):
-                rows = list(self._run_async(fetch(page)))
+                rows = list(self._run_async(self._account.get_order_history(
+                    self._session, per_page=self._TAG_SEARCH_PAGE, page_offset=page, sort="Desc",
+                    start_at=since.isoformat() if since is not None else None)))
                 out.extend(rows)
                 if since is None or len(rows) < self._TAG_SEARCH_PAGE:
                     return out
                 stamps = [t for t in (order_time(r) for r in rows) if t is not None]
-                if page == 0 and not ordered_desc_by_server:
-                    # Newest-first is ONLY concluded from evidence; ascending or indeterminate ordering
-                    # reads on until a short page (or the cap).
-                    newest_first = len(stamps) > 1 and stamps[0] > stamps[-1]
-                if newest_first and stamps and min(stamps) < since:
+                if len(stamps) > 1 and stamps[0] < stamps[-1]:
+                    raise RuntimeError("the order history came back oldest-first although it was asked "
+                                       "newest-first; the search cannot be trusted")
+                if len(stamps) > 1 and stamps[0] > stamps[-1] and min(stamps) < since:
                     return out
             raise RuntimeError(f"the order history was read {self._TAG_SEARCH_MAX_PAGES} pages deep and "
                                f"still is not complete back to {since}; the search is incomplete")
@@ -1956,19 +1956,15 @@ class TastyTradeAccount(AccountInterface):
         def tagged(order):
             return getattr(order, "external_identifier", None) == tag
 
-        for complex_order in (list(self._run_async(self._account.get_live_complex_orders(self._session)))
-                              + history(lambda page: self._account.get_complex_order_history(
-                                  self._session, per_page=self._TAG_SEARCH_PAGE, page_offset=page))):
-            if any(tagged(m) for m in (getattr(complex_order, "orders", None) or [])) \
-                    and ("OCO", complex_order.id) not in seen:
-                seen.add(("OCO", complex_order.id))
-                found.append(("OCO", int(complex_order.id), complex_order))
-        for order in (list(self._run_async(self._account.get_live_orders(self._session)))
-                      + history(lambda page: self._account.get_order_history(
-                          self._session, per_page=self._TAG_SEARCH_PAGE, page_offset=page,
-                          sort="Desc", start_at=since), ordered_desc_by_server=True)):
-            if tagged(order) and getattr(order, "complex_order_id", None) in (None, 0) \
-                    and ("STOP", order.id) not in seen:
+        for order in list(self._run_async(self._account.get_live_orders(self._session))) + history():
+            if not tagged(order):
+                continue
+            complex_id = getattr(order, "complex_order_id", None)
+            if complex_id not in (None, 0):
+                if want_oco and ("OCO", complex_id) not in seen:
+                    seen.add(("OCO", complex_id))
+                    found.append(("OCO", int(complex_id), self.get_complex_order_state(int(complex_id))))
+            elif want_stop and ("STOP", order.id) not in seen:
                 seen.add(("STOP", order.id))
                 found.append(("STOP", int(order.id), SimpleNamespace(id=int(order.id), orders=[order])))
         return found
