@@ -1145,9 +1145,19 @@ def disable_protection(account, symbol: str) -> ActionResult:
 
 
 def delete_protection(account, symbol: str) -> ActionResult:
-    """Switch off and forget the configuration (only once every cancel is confirmed)."""
+    """Switch off and forget the configuration (only once every cancel is confirmed).
+
+    CANCEL-ONLY: it reaches the broker only through the confirmed cancel of the protective orders, never a
+    place call, so it can never sell. The protection row and its slice rows are DELETED; the audit trail
+    (``allocator_weight_change``, the activity log) and the operator's exclusions are kept. Refused, with
+    the config kept, while an allocator run is in flight, when a cancel cannot be confirmed, or while an
+    UNKNOWN slice may still rest at the broker.
+    """
     symbol = _norm(symbol)
     with protection_lock(account.id):
+        if _run_in_flight(account):
+            return ActionResult(False, f"{symbol}: an allocator run is in flight; it cancels and re-places "
+                                       f"protective orders itself. Try again when it has finished.")
         result = disable_protection(account, symbol)
         if not result.ok:
             return result
@@ -1159,6 +1169,8 @@ def delete_protection(account, symbol: str) -> ActionResult:
                     session.delete(s)
                 session.delete(session.get(AllocatorProtection, p.id))
                 session.commit()
+        _log(account.id, ActivityLogSeverity.INFO, f"{symbol}: TP/SL configuration deleted by the operator",
+             code="DELETED", symbol=symbol)
         return ActionResult(True, f"{symbol}: protection removed.")
 
 
