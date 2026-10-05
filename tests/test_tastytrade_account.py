@@ -4363,10 +4363,19 @@ def test_every_place_order_call_site_passes_dry_run_explicitly():
     source = inspect.getsource(sys.modules[TastyTradeAccount.__module__])
     call_sites = [line.strip() for line in source.splitlines() if ".place_order(" in line]
 
-    assert len(call_sites) == 2, call_sites
+    # Four: the order submit/preview pair, plus the allocator's stop-only protective order pair.
+    assert len(call_sites) == 4, call_sites
     assert all("dry_run=" in line for line in call_sites), call_sites
-    assert sum("dry_run=False" in line for line in call_sites) == 1, call_sites
-    assert sum("dry_run=True" in line for line in call_sites) == 1, call_sites
+    assert sum("dry_run=False" in line for line in call_sites) == 2, call_sites
+    assert sum("dry_run=True" in line for line in call_sites) == 2, call_sites
+
+    # ...and the same discipline for the complex-order endpoint the protective OCOs use: its
+    # SDK default is ALSO dry_run=True.
+    complex_sites = [line.strip() for line in source.splitlines() if ".place_complex_order(" in line]
+    assert len(complex_sites) == 2, complex_sites
+    assert all("dry_run=" in line for line in complex_sites), complex_sites
+    assert sum("dry_run=False" in line for line in complex_sites) == 1, complex_sites
+    assert sum("dry_run=True" in line for line in complex_sites) == 1, complex_sites
 
 
 def test_no_tastytrade_order_is_ever_priced_by_dollar_value():
