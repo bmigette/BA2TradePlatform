@@ -30,7 +30,13 @@ _REFRESH_LOCK = threading.Lock()
 # TradeManager._publish_market_regime). SPY: the classifier in ba2_common.core.market_regime was
 # measured on it, and the backtest uses the same symbol so live and simulated agree.
 _REGIME_BENCHMARK = "SPY"
-_LIVE_REGIME_CACHE = {"day": None, "stressed": None}
+_LIVE_REGIME_CACHE = {"day": None, "stressed": None, "retry_after": None, "failures": 0}
+
+# How long a FAILED classification waits before the next attempt. A failure is never cached for
+# the day: until 2026-10-07 one failed SPY fetch (a single WARNING) left every overlay-enabled
+# expert trading at neutral scales until the next calendar day. The data provider already retries
+# the HTTP call itself; this spaces the attempts of a refresh loop that runs many times a day.
+_REGIME_RETRY_SECONDS = 300
 
 # Wash-trade lock lifetime. A lock is a WAIT, and a wait that outlives its signal is a
 # deadlock: an entry blocked by a protective stop on an open position can never clear on
@@ -254,41 +260,64 @@ class TradeManager:
         overlay-enabled genome behaves identically in a backtest and in production — the whole
         point of keeping the classifier in ``ba2_common``.
 
-        Cached per day because the classifier's inputs are DAILY closes: re-fetching 3 years of
-        SPY on every refresh (which runs many times a day) would buy nothing.
+        A SUCCESSFUL classification is cached for the day, because its inputs are DAILY closes:
+        re-fetching 3 years of SPY on every refresh (which runs many times a day) buys nothing.
 
-        A failure publishes ``None`` = "unclassified" = neutral scales, i.e. exactly today's
-        behaviour. That is safe in LIVE (never trade off a guessed regime); the loud-failure
-        stance belongs in the backtest, where a silently-neutral overlay would waste a grid.
+        A FAILED one is NOT cached. It publishes ``None`` = "unclassified" = neutral scales (never
+        trade off a guessed regime), logs an ERROR -- an overlay-enabled expert is then sizing
+        without its regime scale, which is not the strategy that was backtested -- and is retried
+        on the next refresh once ``_REGIME_RETRY_SECONDS`` have passed, until it succeeds.
+        "Failed" covers an exception, no bars, and a classifier that could not answer (too few
+        closes): the last used to read as "not stressed" with no trace at all.
         """
         from datetime import datetime, timedelta, timezone
 
-        from ba2_common.core.market_regime import is_stressed
+        from ba2_common.core.market_regime import STRESSED, classify_volatility_regime
         from ba2_common.core.regime_overlay import set_stressed
 
-        today = datetime.now(timezone.utc).date()
-        if _LIVE_REGIME_CACHE["day"] != today:
+        now = datetime.now(timezone.utc)
+        today = now.date()
+        retry_after = _LIVE_REGIME_CACHE["retry_after"]
+        if _LIVE_REGIME_CACHE["day"] != today and (retry_after is None or now >= retry_after):
             stressed = None
+            failure = None
             try:
                 from ba2_providers import get_provider
                 # 1200 calendar days ~= 825 sessions, comfortably above the 524 daily closes
                 # (20 vol window + 504 rank lookback) the classifier needs before it will answer.
                 df = get_provider("ohlcv", "fmp").get_ohlcv_data(
                     _REGIME_BENCHMARK,
-                    start_date=datetime.now(timezone.utc) - timedelta(days=1200),
-                    end_date=datetime.now(timezone.utc),
+                    start_date=now - timedelta(days=1200),
+                    end_date=now,
                     interval="1d",
                 )
-                if df is not None and len(df):
-                    stressed = is_stressed([c for c in df["Close"].tolist() if c is not None])
+                if df is None or not len(df):
+                    failure = f"no {_REGIME_BENCHMARK} daily bars returned"
                 else:
-                    self.logger.warning(
-                        f"Market regime: no {_REGIME_BENCHMARK} daily bars returned")
-            except Exception as e:  # noqa: BLE001 -- regime is advisory; never block a refresh
-                self.logger.warning(f"Market regime unavailable ({type(e).__name__}: {e})")
-            _LIVE_REGIME_CACHE["day"] = today
-            _LIVE_REGIME_CACHE["stressed"] = stressed
-            self.logger.info(f"Market regime for {today}: stressed={stressed}")
+                    closes = [c for c in df["Close"].tolist() if c is not None]
+                    verdict = classify_volatility_regime(closes)
+                    if verdict["regime"] is None:
+                        failure = (f"classifier could not answer on {len(closes)} "
+                                   f"{_REGIME_BENCHMARK} closes ({verdict['reason']})")
+                    else:
+                        stressed = verdict["regime"] == STRESSED
+            except Exception as e:  # noqa: BLE001 -- the regime must never block a refresh
+                failure = f"{type(e).__name__}: {e}"
+                self.logger.error(f"Market regime fetch failed: {failure}", exc_info=True)
+
+            if failure is None:
+                _LIVE_REGIME_CACHE.update(
+                    {"day": today, "stressed": stressed, "retry_after": None, "failures": 0})
+                self.logger.info(f"Market regime for {today}: stressed={stressed}")
+            else:
+                _LIVE_REGIME_CACHE["failures"] += 1
+                _LIVE_REGIME_CACHE["stressed"] = None
+                _LIVE_REGIME_CACHE["retry_after"] = now + timedelta(seconds=_REGIME_RETRY_SECONDS)
+                self.logger.error(
+                    f"Market regime for {today} is UNCLASSIFIED (attempt "
+                    f"{_LIVE_REGIME_CACHE['failures']}: {failure}). Experts with the regime "
+                    f"overlay enabled trade at NEUTRAL scales until it is classified; retrying "
+                    f"in {_REGIME_RETRY_SECONDS}s.")
 
         set_stressed(_LIVE_REGIME_CACHE["stressed"])
 
