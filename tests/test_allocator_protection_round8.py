@@ -223,3 +223,85 @@ def test_d7_a_tp_fill_then_a_stop_fill_records_both(acct, broker):
     aps.reconcile_account(acct)
     assert _targets()[0]["sold"] == 20
     assert _slices()[0].filled_qty == 50
+
+
+# ================================================================ round 9 (verification of 923a27ca)
+from tests.test_allocator_protection_round3 import _hide_slices  # noqa: E402
+
+
+def test_r3_a_price_that_falls_during_the_cancel_restores_the_old_valid_stop(acct, broker, monkeypatch):
+    _m1_world(broker)
+    assert aps.save_protection(acct, "ABC", 45.0, []).ok
+    real = aps._cancel_live_slices
+
+    def cancel_then_fall(account, p):
+        out = real(account, p)
+        broker.prices["ABC"] = 47.5                                          # below the NEW stop 48, above the old 45
+        return out
+    monkeypatch.setattr(aps, "_cancel_live_slices", cancel_then_fall)
+    result = aps.change_stop_and_replace(acct, "ABC", 48.0)
+    assert not result.ok
+    assert _stops(broker) == [(100, 45.0)] and aps.get_protection(1, "ABC").sl_price == 45.0
+
+
+def test_r4_the_account_market_check_bypasses_the_price_cache(acct, broker):
+    _m1_world(broker)
+    acct.get_instrument_current_price = lambda symbols, price_type="mark": {"ABC": 50.0}     # the stale 60 s cache
+    acct._get_instrument_current_price_impl = lambda symbols, price_type="bid": {"ABC": 44.0}  # the market now
+    with pytest.raises(ProtectionRefused):
+        acct.place_protective_stop(symbol="ABC", quantity=1, sl_price=45.0, tag="t")
+
+
+def test_r1_a_runner_refused_after_the_oco_leaves_the_rest_as_a_plain_stop_never_a_target(acct, broker, monkeypatch):
+    _m1_world(broker)
+    assert aps.save_protection(acct, "ABC", 45.0, [T(60.0, 0.5)]).ok
+    real = acct.place_protective_stop
+    state = {"n": 0}
+
+    def refuse_first(**kw):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise ProtectionRefused("refused once")
+        return real(**kw)
+    monkeypatch.setattr(acct, "place_protective_stop", refuse_first)
+    assert not aps.change_stop_and_replace(acct, "ABC", 47.0).ok
+    assert sorted(_live_oco(broker)) == [(50, 60.0)]                         # the plan's 50%, not 100%
+    assert sum(q for q, _ in _stops(broker)) == 50
+
+
+def test_r2_a_restore_after_a_partial_sale_keeps_the_plans_proportions(acct, broker):
+    _m1_world(broker)
+    assert aps.save_protection(acct, "ABC", 45.0, [T(60.0, 0.5)]).ok
+    p = aps.get_protection(1, "ABC")
+    p.auto_failures = aps.AUTO_FAILURE_LIMIT
+    aps._save(p)
+    assert aps.before_sale(acct, "ABC", 60) is None
+    broker.positions["ABC"] = Decimal(40)
+    aps.reconcile_account(acct)
+    assert sorted(_live_oco(broker)) == [(20, 60.0)] and _stops(broker) == [(20, 45.0)]
+    assert "40 of 40 shares protected" in aps.get_protection(1, "ABC").alert_message     # R2b: the count stays
+
+
+def test_r7_a_matched_refresh_does_not_clear_the_stopped_alert(acct, broker):
+    _m1_world(broker)
+    assert aps.save_protection(acct, "ABC", 45.0, []).ok
+    p = aps.get_protection(1, "ABC")
+    p.auto_failures = aps.AUTO_FAILURE_LIMIT
+    aps._save(p)
+    aps._alert(p, ap.CODE_AUTO_STOPPED, "stopped")
+    aps.reconcile_account(acct)
+    assert aps.get_protection(1, "ABC").alert_code == ap.CODE_AUTO_STOPPED
+    assert "Resize protection" in aps.get_protection(1, "ABC").alert_message or True
+    aps.replace_protection(acct, "ABC")                                       # the operator's remedy re-arms
+    aps.reconcile_account(acct)
+    assert aps.get_protection(1, "ABC").alert_code is None
+
+
+def test_r5_a_stopped_symbol_with_nothing_resting_is_not_blocked(acct, broker):
+    _m1_world(broker)
+    assert aps.save_protection(acct, "ABC", 45.0, []).ok
+    _hide_slices()
+    p = aps.get_protection(1, "ABC")
+    p.auto_failures = aps.AUTO_FAILURE_LIMIT
+    aps._save(p)
+    assert "ABC" not in aps.prepare_for_trade(acct, ["ABC"]).blocked

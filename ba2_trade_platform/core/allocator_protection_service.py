@@ -209,6 +209,8 @@ def _clear_alert(p: AllocatorProtection, codes: Optional[Iterable[str]] = None) 
     """Clear the alert (only when its code is in ``codes`` if given)."""
     if p.alert_code is None:
         return p
+    if p.alert_code == CODE_AUTO_STOPPED and not _auto_allowed(p):
+        return p                  # only an operator action (Resize / Save: auto_failures back to 0) clears it
     if codes is not None and p.alert_code not in set(codes):
         return p
     _log(p.account_id, ActivityLogSeverity.INFO, f"{p.symbol}: alert {p.alert_code} cleared",
@@ -1447,8 +1449,7 @@ def replace_protection(account, symbol: str) -> ActionResult:
             _save(p)
             return ActionResult(True, f"{symbol}: {placed.placed} protective order(s) placed.",
                                 notes=placed.notes)
-        if not placed.refused_by_validation:
-            p = _rollback_if_uncovered(account, p, cancel_since, "the re-placement")
+        p = _rollback_if_uncovered(account, p, cancel_since, "the re-placement")
         return ActionResult(False, f"{symbol}: protection was NOT fully placed (the previous orders were "
                                    f"restored where possible).", errors=placed.errors, notes=placed.notes)
 
@@ -1576,7 +1577,7 @@ def _note_auto_result(p: AllocatorProtection, ok: bool, what: str) -> AllocatorP
     if not ok and p.auto_failures >= AUTO_FAILURE_LIMIT:
         p = _alert(p, CODE_AUTO_STOPPED,
                    f"{what} failed {p.auto_failures} times in a row; the automatic paths have STOPPED "
-                   f"for {p.symbol}. Fix the cause and use Resize protection (that re-arms them).")
+                   f"for {p.symbol}. Fix the cause, then Resize protection: that resets the failure count and re-arms them.")
     return _reload(p.id)
 
 
@@ -1605,39 +1606,61 @@ def _cancelled_snapshot(p: AllocatorProtection, since: DateTime) -> List[Allocat
     return sorted(out, key=lambda x: x.slice_index)
 
 
+def _restore_plan(snapshot, left: int, last: float, stop_only: bool):
+    """What to put back: ``[(kind, quantity, tp, sl, target)]``, STOPS first.
+
+    The previous plan is scaled to the shares held (floor of ``left / snapshot_total``) and the remainder
+    goes to a plain stop, so a shrunk position keeps the plan's proportions. ``stop_only`` (a LOST alarm is
+    open, or part of a NEW set already rests) puts everything back as plain stops: the runner is never put on
+    a take-profit, and a take-profit at or below the market comes back as a stop too."""
+    items = [(old, _snapshot_qty(old)) for old in snapshot]
+    items = [(old, q) for old, q in items if q >= 1]
+    total = sum(q for _, q in items)
+    if not items or left < 1:
+        return []
+    scale = 1.0 if (stop_only or total <= left) else left / total
+    plans, used = [], 0
+    for old, q in items:
+        qq = q if scale >= 1.0 else int(q * scale)
+        qq = min(qq, left - used)
+        if qq < 1:
+            continue
+        used += qq
+        as_stop = (old.kind == ORDER_KIND_STOP or stop_only or old.tp_price is None
+                   or float(old.tp_price) <= last)
+        plans.append((ORDER_KIND_STOP if as_stop else ORDER_KIND_OCO, qq, None if as_stop else old.tp_price,
+                      old.sl_price, -1 if as_stop else old.target_index))
+    if scale < 1.0 and left - used >= 1:
+        plans.append((ORDER_KIND_STOP, left - used, None, items[0][0].sl_price, -1))
+    plans.sort(key=lambda t: 0 if t[0] == ORDER_KIND_STOP else 1)
+    return plans
+
+
 def _restore_previous(account, p: AllocatorProtection, snapshot, left: int, last: float,
-                      alarm_open: bool) -> bool:
-    """Place the PREVIOUS orders again, capped to ``left`` uncovered whole shares and VALIDATED against the
-    market now: a take-profit at or below the price (or any take-profit while a LOST alarm is open) comes back
-    as a plain stop; a stop at or above the price is skipped. True when every share asked for is covered."""
+                      alarm_open: bool, stop_only: bool = False) -> bool:
+    """Place the PREVIOUS orders again (see ``_restore_plan``), validated against the market now: a stop at or
+    above the price is skipped. True when every share asked for is covered."""
     ok = True
     existing = len(get_slices(p.id))
-    for n, old in enumerate(snapshot):
-        if left <= 0:
-            break
-        q = min(_snapshot_qty(old), left)
-        if q < 1:
-            continue
-        if float(old.sl_price) >= last:
+    plans = _restore_plan(snapshot, left, last, stop_only or alarm_open)
+    for n, (kind, q, tp, sl_price, target) in enumerate(plans):
+        if float(sl_price) >= last:
             _log(p.account_id, ActivityLogSeverity.FAILURE,
-                 f"{p.symbol}: the previous stop {float(old.sl_price):g} is at or above the market ({last:g}); "
+                 f"{p.symbol}: the previous stop {float(sl_price):g} is at or above the market ({last:g}); "
                  f"{q} sh were NOT restored", code="ROLLBACK_SKIPPED", symbol=p.symbol)
             ok = False
             continue
-        kind, tp, target = old.kind, old.tp_price, old.target_index
-        if kind == ORDER_KIND_OCO and (alarm_open or tp is None or float(tp) <= last):
-            kind, tp, target = ORDER_KIND_STOP, None, -1
         tag = f"ba2prot:{p.id}:{existing + n}:{uuid.uuid4().hex[:8]}"
         row = _save(AllocatorProtectionOrder(
             protection_id=p.id, slice_index=existing + n, target_index=target, kind=kind,
-            quantity=q, tp_price=tp, sl_price=old.sl_price, external_tag=tag,
+            quantity=q, tp_price=tp, sl_price=sl_price, external_tag=tag,
             state=SLICE_PLACING, placed_at=_now()))
         try:
             if kind == ORDER_KIND_STOP:
-                placed = account.place_protective_stop(symbol=p.symbol, quantity=q, sl_price=old.sl_price, tag=tag)
+                placed = account.place_protective_stop(symbol=p.symbol, quantity=q, sl_price=sl_price, tag=tag)
             else:
                 placed = account.place_protective_oco(symbol=p.symbol, quantity=q, tp_price=tp,
-                                                      sl_price=old.sl_price, tag=tag)
+                                                      sl_price=sl_price, tag=tag)
         except PlacementOutcomeUnknown as e:
             row.state = SLICE_UNKNOWN
             row.detail = str(e)[:500]
@@ -1697,7 +1720,8 @@ def _rollback_if_uncovered(account, p: AllocatorProtection, since: DateTime, why
     alarm_open = any(x.state in SLICE_ALARM_STATES and x.state != SLICE_UNKNOWN and x.closed_at is None
                      and (_naive(x.placed_at) or cut) < cut for x in get_slices(p.id))
     refused_text = p.alert_message or ""
-    ok = _restore_previous(account, p, snapshot, left, last, alarm_open)
+    part_placed = covered_quantity(get_slices(p.id)) > 0          # some of the NEW set rests: no take-profit again
+    ok = _restore_previous(account, p, snapshot, left, last, alarm_open, stop_only=part_placed)
     for x in (get_slices(p.id) if ok else []):     # a restored plan: this attempt's refused rows are history
         placed_at = _naive(x.placed_at)
         if x.state == SLICE_LOST_REJECTED and x.closed_at is None and placed_at is not None and placed_at >= since:
@@ -1816,7 +1840,7 @@ def _resize_now(account, p: AllocatorProtection, reason: str) -> Tuple[Allocator
              code="AUTO_RESIZE_FAILED", symbol=p.symbol, reason=reason)
         return p, False
     p, placed = _place_slices(account, p)
-    if not placed.ok and not placed.refused_by_validation:
+    if not placed.ok:
         p = _rollback_if_uncovered(account, p, cancel_since, f"the {reason}")
     p = _reload(p.id)
     p.pending_replace = False
@@ -2249,7 +2273,7 @@ def prepare_for_trade(account, symbols: Iterable[str]) -> PrepareResult:
             p = get_protection(account.id, symbol)
             if p is None:
                 continue
-            if p.enabled and not _auto_allowed(p):
+            if p.enabled and not _auto_allowed(p) and any(_blocks(x) for x in get_slices(p.id)):
                 # The automatic paths are stopped: cancelling here could not be undone by an automatic
                 # re-placement. Leave the orders alone and keep the symbol out of this run.
                 result.blocked[symbol] = ("its TP/SL automatic paths are stopped (an alert is open); its "
@@ -2361,9 +2385,12 @@ def resume_protection(account, symbols: Iterable[str], *,
                     # Nothing is RE-PLANNED, but the orders the sale cancelled are put back (capped to the shares
                     # held and validated against the market) so the position is not left bare.
                     p = _rollback_if_uncovered(account, p, cancel_since, "the automatic paths are stopped")
+                    held = whole_shares(qty)
+                    covered_now = int(round(covered_quantity(get_slices(p.id))))
                     _alert(_reload(p.id), CODE_AUTO_STOPPED,
                            f"{symbol}: the automatic paths are stopped, so protection was not re-planned after "
-                           f"the trade; the previous orders were put back where possible. Use Resize protection.")
+                           f"the trade; the previous orders were put back where possible: {covered_now} of "
+                           f"{held} shares protected. Resize protection resets the failure count and re-arms.")
                     continue
                 alarm_open = any(x.state in SLICE_ALARM_STATES and x.state != SLICE_UNKNOWN and x.closed_at is None
                                  for x in get_slices(p.id))
@@ -2375,7 +2402,7 @@ def resume_protection(account, symbols: Iterable[str], *,
                          f"re-placed after the trade (no take-profit); use Resize protection to re-place the rest",
                          code="STOP_ONLY_COVER", symbol=symbol)
                 p, placed = _place_slices(account, p, stop_only=alarm_open)
-                if not placed.ok and not placed.refused_by_validation:
+                if not placed.ok:
                     p = _rollback_if_uncovered(account, p, cancel_since, "the re-placement after the trade")
                 p = _reload(p.id)
                 p.pending_replace = False

@@ -71,6 +71,15 @@ and then press Switch off again. NEVER move a stop above the market to force an 
 
 A blank GTC column is NOT an abort: it is how TastyTrade reports these orders (no expiry, no renewal).
 
+## Cautions during the test
+
+- Check the failure count before each step: the activity log must show no `AUTO_STOPPED`, and a symbol whose automatic
+  paths stopped stays blocked for allocator sales until you press **Resize protection** (it resets the count).
+- Do not raise a stop ("Use a stop the broker accepts" or a manual change) in a fast market: if the price falls
+  through the new stop while the old orders are cancelled, the old stop is put back and the change is refused.
+- Do not make platform partial sales on a symbol while its automatic paths are stopped: the orders come back scaled
+  to the shares left, but nothing is re-planned.
+
 ## What to record
 
 The probe output (step 3), the External ID format, whether the complex history is newest or oldest first, and any deviation from the text above. Send these back before general use.

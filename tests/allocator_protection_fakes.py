@@ -430,6 +430,8 @@ def make_account(broker: FakeTastyBroker, *, account_id: int = 1) -> TastyTradeA
     acct._PROTECTION_CANCEL_TIMEOUT_SECONDS = 2.0
     acct.get_instrument_current_price = lambda symbols, price_type="mark": {
         s: broker.prices.get(s) for s in (symbols if isinstance(symbols, list) else [symbols])}
+    acct._get_instrument_current_price_impl = lambda symbols, price_type="bid": {
+        s: broker.prices.get(s) for s in (symbols if isinstance(symbols, list) else [symbols])}
     original_snapshot = acct.get_account_snapshot
 
     def snapshot():

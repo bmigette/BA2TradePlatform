@@ -1619,10 +1619,14 @@ class TastyTradeAccount(AccountInterface):
 
     def _check_protective_vs_market(self, symbol: str, sl_price: float, tp_price=None) -> None:
         """Last line of defence: a stop at or above the market SELLS at once, a target at or below it fills at
-        once. Reads a FRESH price; an unreadable price refuses (never assumed)."""
+        once. Reads the price straight from the broker through ``_get_instrument_current_price_impl``: the
+        public ``get_instrument_current_price`` sits behind a 60 s cache that validation already used, so it
+        could not catch a move since. 'mark' is the broker's consolidated live price (the one net liquidation
+        is struck at); outside regular hours it is the broker's last mark and may lag the true quote, which
+        cannot be verified offline. An unreadable price refuses (never assumed)."""
         from ...core.allocator_protection import ProtectionRefused
         try:
-            fetched = self.get_instrument_current_price([symbol], price_type="mark")
+            fetched = self._get_instrument_current_price_impl([symbol], "mark")
             last = fetched.get(symbol) if isinstance(fetched, dict) else fetched
         except Exception as e:  # noqa: BLE001 -- refused, with the reason
             raise ProtectionRefused(f"[Account {self.id}] {symbol}: the current price could not be read ({e}); "
