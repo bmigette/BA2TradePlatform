@@ -4135,7 +4135,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 priced = self._reprice_closing_legs(parent, priced, structures, as_of, bound_reason)
                 net_per_share = 0.0
                 for leg, px in priced:
-                    ratio = abs(float(leg.quantity or 0.0)) / structures
+                    ratio = abs(float(leg.quantity)) / structures
                     net_per_share += (px if leg.side == OrderDirection.BUY else -px) * ratio
             else:
                 self._count_structure_refusal(parent, as_of, bound_reason)
@@ -4247,7 +4247,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             chosen = attempt
             net = 0.0
             for leg, px in attempt:
-                ratio = abs(float(leg.quantity or 0.0)) / structures
+                ratio = abs(float(leg.quantity)) / structures
                 net += (px if leg.side == OrderDirection.BUY else -px) * ratio
             if self._structure_net_bound_reason(parent, attempt, structures, net) is None:
                 break

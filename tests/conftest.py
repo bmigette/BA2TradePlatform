@@ -508,3 +508,17 @@ def _test_fakes_declare_a_greeks_source(monkeypatch):
     from ba2_common.core.interfaces.OptionsAccountInterface import (
         OptionsAccountInterface as _OAI)
     monkeypatch.setattr(_OAI, "OPTION_GREEKS_SOURCE", "test_fake")
+
+
+@pytest.fixture(autouse=True)
+def _mock_expert_is_resolvable(monkeypatch):
+    """An option entry now reads its expert's capital (``get_available_equity_balance_detail``)
+    through the instance resolver, so an ``ExpertInstance`` row named ``MockExpert`` must resolve to
+    the ``MockExpert`` double here (the production registry knows only real expert classes)."""
+    import ba2_trade_platform.core.utils as _utils
+    real = _utils.get_expert_class
+    monkeypatch.setattr(_utils, "get_expert_class",
+                        lambda name: MockExpert if name == "MockExpert" else real(name))
+    real_account = _utils.get_account_class
+    monkeypatch.setattr(_utils, "get_account_class",
+                        lambda name: MockAccount if name == "MockAccount" else real_account(name))
