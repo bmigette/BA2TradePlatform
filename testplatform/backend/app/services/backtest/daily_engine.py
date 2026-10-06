@@ -1103,9 +1103,10 @@ class DailyBacktestEngine:
             # sufficient available equity (available_balance >= minimum_equity_threshold_percent
             # of virtual balance, default 5%). Calls the SAME shared
             # MarketExpertInterface.has_sufficient_equity_for_trading the live path uses — no
-            # re-implementation. Note: BacktestAccount.get_balance() is cash (not NLV), which is
-            # the same balance BT sizing already uses (TradeRiskManagement), so the gate stays
-            # consistent with BT sizing. Stub experts without the method are treated as allowed.
+            # re-implementation. The virtual balance it reads is the expert's share of the account's
+            # EQUITY in both runtimes (BacktestAccount._plain_balance), the same base BT sizing
+            # uses, so the gate stays consistent with sizing. Stub experts without the method are
+            # treated as allowed.
             equity_check = getattr(expert, "has_sufficient_equity_for_trading", None)
             if callable(equity_check):
                 try:

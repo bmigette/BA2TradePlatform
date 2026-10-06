@@ -2754,6 +2754,31 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return self._cash
         return min(self._cash, self.deployed_equity())
 
+    def _plain_balance(self) -> float:
+        """The balance every SIZING / THRESHOLD / CEILING reader starts from: the deployed EQUITY.
+
+        ``ReadOnlyAccountInterface._plain_balance`` answers ``get_balance()``, which is EQUITY at
+        every live broker (a filled purchase leaves it unchanged) but CASH here (``get_balance``
+        above, which stays cash: the fill engine, the buying-power clamp and the cash ledger need
+        it). The expert math then subtracts the open positions again as ``used``
+        (``available = virtual - used``), so the backtest charged an open position TWICE where live
+        charges it once ("finding 6", fixed 2026-10-07: it moved every classic stock backtest).
+
+        This is the ONE seam: ``get_tradable_balance`` (the classic RM, the per-instrument cap, the
+        min-balance thresholds, risk_atr), ``get_option_tradable_balance`` (the option buying-power
+        gate), the margin ceiling and the capital mapping all start here, so the base is the same
+        quantity in both runtimes -- the account's equity (cash + marks), clamped by the equity cap
+        exactly as the snapshot's ``equity`` is. NOT ``true_equity()``: the cap is what may be spent.
+
+        Cash can still never go negative: the expert's actual-available clamp reads the snapshot's
+        ``buying_power`` (= cash, floored at 0), not this figure.
+        """
+        value = float(self.deployed_equity())
+        if not math.isfinite(value):
+            raise ValueError(f"account {self.id} ({type(self).__name__}) computed a non-finite "
+                             f"equity ({value!r}); cannot size with it")
+        return value
+
     def true_equity(self) -> Optional[float]:
         """The UNCAPPED equity: ``equity()`` = cash + mark-to-market. Overrides the interface.
 

@@ -1493,6 +1493,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
 
         For example, if the account's tradable balance is $10,000 and virtual_equity_pct
         is 10, the virtual balance would be $1,000 (10% of the tradable balance).
+
+        The base is the account's EQUITY in both runtimes (live ``get_balance()`` is equity; the
+        backtest account publishes its deployed equity as its sizing balance), so
+        ``available = virtual - used`` charges an open position once everywhere.
         
         Returns:
             Optional[float]: The virtual balance amount, None if error occurred
@@ -1504,11 +1508,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         """This expert's virtual_equity_pct slice of the account's EQUITY (cash plus marked
         positions, ``get_tradable_equity``), for sizing a TARGET BOOK.
 
-        ``get_virtual_balance`` answers from ``get_balance()``, which is equity live and
-        CASH in a backtest (finding 6, unchanged for the classic RM). A rebalancer that
-        sized on it read its own fully invested book as nearly empty in the backtest only,
-        and sold it. This is the same figure in both runtimes; live it equals
-        ``get_virtual_balance`` exactly.
+        ``get_virtual_balance`` is the same figure: both runtimes start from the account's EQUITY
+        (live ``get_balance()`` is equity; the backtest account's sizing balance,
+        ``BacktestAccount._plain_balance``, is its deployed equity -- finding 6, fixed 2026-10-07,
+        when it was CASH there and the classic RM charged open positions twice). This one reads the
+        snapshot's equity directly, so it also stays right for an account whose ``get_balance`` is not
+        equity; live it equals ``get_virtual_balance`` exactly.
 
         Returns:
             Optional[float]: the virtual equity, None exactly where get_virtual_balance
@@ -1594,8 +1599,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         too), with two differences that make it the same in a backtest and live:
 
           * ``virtual`` is this expert's ``virtual_equity_pct`` slice of the account's EQUITY
-            (``option_capital_equity``, no margin factor), not of ``get_balance()``, which is cash in
-            a backtest and equity live; so the option book is bounded by 100 % of the expert's
+            (``option_capital_equity``, no margin factor); the classic stock path now starts from the
+            same equity base in both runtimes (finding 6); so the option book is bounded by 100 % of the expert's
             equity share whatever a stock margin multiplier or the broker's buying power says. The
             option SIZING budget (``TradeActions._virtual_equity``) is the same slice;
           * ``used`` (``used_balance_for_transactions``, loss adjustment off because the base already
