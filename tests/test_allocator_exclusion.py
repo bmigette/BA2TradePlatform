@@ -553,3 +553,26 @@ def test_a_failed_write_is_reported_not_swallowed_and_does_not_refresh(account_i
     assert asyncio.run(page.apply_exclusion_change(account_id, "VST", False, None, refresh)) is False
     assert refreshed == [] and any("Toggling exclusion of VST failed" in e for e in errors)
     assert sent and sent[0][1] == 'negative' and 'db locked' in sent[0][0]
+
+
+def test_excluded_eye_uses_the_crossed_icon_and_buttons_carry_aria_labels():
+    from ba2_trade_platform.ui.pages import portfolio_allocation as pa
+    assert view.exclusion_fields(object())["excl_icon"] == "visibility_off"
+    chips = pa.SYMBOL_CHIPS_TEMPLATE
+    assert ':icon="props.row.excl_icon"' in chips and 'aria-label="TP/SL protection"' in chips
+    assert ":aria-label=\"props.row.excluded" in chips
+
+
+def test_badge_total_names_symbols_without_measurable_pnl():
+    from types import SimpleNamespace as NS
+    rows = [NS(excluded=False, pnl=NS(amount=5.0, total_amount=None)),
+            NS(excluded=False, pnl=None), NS(excluded=True, pnl=None)]
+    segs = view.label_badge_segments(rows)
+    assert segs[0]["count"] == 3 and segs[0]["unmeasured"] == 1
+
+
+def test_phone_head_icons_keep_40px_and_tp_rows_keep_min_width_zero():
+    from ba2_trade_platform.ui.pages import portfolio_allocation as pa
+    css = pa.page_phone_css()
+    assert '.pf-sym-head .pf-icons .q-btn { min-width: 40px; min-height: 40px; }' in css
+    assert '.pf-tp-row .q-field { min-width: 0; }' in css

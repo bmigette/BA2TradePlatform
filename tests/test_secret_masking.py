@@ -205,3 +205,11 @@ def test_global_settings_credentials_all_use_the_secret_input():
     src = pathlib.Path(settings_page.__file__).read_text(encoding="utf-8")
     assert src.count("password_toggle_button=True") == 1   # defined once, in _secret_input
     assert src.count("_secret_input(") >= 20
+
+
+def test_secret_inputs_carry_autofill_guards():
+    import inspect
+    from ba2_trade_platform.ui.pages import settings
+    for token in ("autocomplete=new-password", "data-1p-ignore", "data-lpignore=true", "data-bwignore"):
+        assert token in settings.SECRET_INPUT_PROPS
+    assert "SECRET_INPUT_PROPS" in inspect.getsource(settings._secret_input)

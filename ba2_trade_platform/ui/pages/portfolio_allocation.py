@@ -2755,12 +2755,13 @@ SYMBOL_CHIPS_TEMPLATE = r'''
                 </span>
                 <!-- THE TP/SL SHIELD and the EXCLUDE EYE: icons only, the same size as the (i). The colour
                      and the tooltip carry the whole status; there is no text and no column of their own. -->
-                <q-btn v-if="props.row.prot_on" dense flat round size="sm" icon="shield"
+                <q-btn v-if="props.row.prot_on" dense flat round size="sm" icon="shield" aria-label="TP/SL protection"
                        class="pf-prot-icon" :style="{ color: props.row.prot_hex }"
                        @click="() => $parent.$emit('protectClick', props.row.symbol)">
                     <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem;white-space:pre-line">{{ props.row.prot_tip }}</q-tooltip>
                 </q-btn>
-                <q-btn dense flat round size="sm" icon="visibility" class="pf-excl-icon"
+                <q-btn dense flat round size="sm" :icon="props.row.excl_icon" class="pf-excl-icon"
+                       :aria-label="props.row.excluded ? 'Include in allocation' : 'Exclude from allocation'"
                        :style="{ color: props.row.excl_hex }"
                        @click="() => $parent.$emit('excludeToggle', props.row.symbol)">
                     <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">{{ props.row.excl_tip }}</q-tooltip>
@@ -3072,6 +3073,8 @@ SYMBOL_CARD_CSS = r"""
 PROTECT_CSS = r"""
     /* THE TP/SL SHIELD AND THE EXCLUDE EYE sit in the symbol cell's icon group, the size of the (i). */
     .pf-icons .q-btn { min-width: 0; }
+    /* the take-profit rows' fields may shrink so price + share + delete stay on one desktop line */
+    .pf-tp-row .q-field { min-width: 0; }
     /* THE LABEL HEADER'S COUNT PILL: total | profitable | losing | excluded, touching segments. */
     .pf-seg { border-radius: 10px; overflow: hidden; gap: 1px !important; }
     .pf-seg .pf-seg-part { border-radius: 0; padding: 2px 7px; font-weight: 700; }
@@ -3088,6 +3091,8 @@ PROTECT_PHONE_CSS = phone_media("""
     .pf-tp-row.pf-tp-row > .flex-grow { flex: 1 1 100% !important; }
     .pf-tp-row.pf-tp-row > .w-32 { flex: 1 1 auto !important; width: auto !important; }
     .pf-prot-dialog .q-field__control { min-height: 44px; }
+    /* the symbol head's icon buttons keep a thumb-sized target (beats .pf-icons .q-btn {min-width:0}) */
+    .pf-sym-head .pf-icons .q-btn { min-width: 40px; min-height: 40px; }
     .pf-bar-row > .pf-b-excl { order: 3; }
 """)
 
@@ -3931,7 +3936,9 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
                 with count_badge:
                     ui.tooltip(SYMBOL_COUNT_BADGE_TOOLTIP_FMT.format(
                         count=len(view.rows), label=view.label)
-                        + ('\n' + legend if legend else '')).style('white-space:pre-line')
+                        + ('\n' + legend if legend else '')
+                        + (f"\n{segments[0]['unmeasured']} with no measurable P&L"
+                           if segments[0].get('unmeasured') else '')).style('white-space:pre-line')
                 for seg in segments[1:]:
                     part = ui.badge(str(seg['count'])).props(f"color={seg['color']}") \
                         .classes('pf-seg-part').mark(MARKER_SEGMENT_PREFIX + seg['key'])
