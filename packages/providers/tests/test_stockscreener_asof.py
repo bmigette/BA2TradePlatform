@@ -119,7 +119,7 @@ def test_fetch_history_bulk_live_window_is_today(monkeypatch):
     sc = S.StockScreener({})  # no as_of -> live
     captured = {}
 
-    def fake_http(url, params=None, endpoint=None, timeout=None):
+    def fake_http(url, params=None, endpoint=None, timeout=None, **kw):
         captured["to"] = params.get("to")
 
         class R:
