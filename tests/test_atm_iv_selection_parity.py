@@ -153,3 +153,18 @@ def test_no_testplatform_or_package_file_imports_the_live_module():
                         if pat.search(fh.read()):
                             offenders.append(os.path.relpath(path, REPO))
     assert offenders == [], offenders
+
+
+def test_low_volume_picks_are_not_filtered_and_still_match_the_backtest(study):
+    """F3 pin: the study picks (== the backtest's picks) include contracts with volume < 5; the
+    provider keeps them (no volume floor exists in the backtest)."""
+    pts, bars, _ = study
+    g = {k: v for k, v in bars.groupby(["symbol", "date"])}
+    low = 0
+    for p in pts.itertuples():
+        day = g[(p.symbol, p.date)]
+        sel = H.select_atm(p.date.date(), p.spot, p.rate, _cands(day))
+        if sel.candidate.volume < 5:
+            low += 1
+            assert sel.candidate.occ == p.study_occ and abs(sel.iv - p.study_iv) <= 1e-12
+    assert low >= 3

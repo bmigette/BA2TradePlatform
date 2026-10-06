@@ -10,7 +10,7 @@ flag agreement 99.4%. This module is that derivation, as a lazily-filled disk ca
 
 THE STATISTIC ("rule C", must stay in lockstep with ``ParquetOptionsProvider._compute_atm_iv``)
   * calls only, 20..45 calendar days to expiry (``DTE_MIN``/``DTE_MAX``);
-  * candidates per session = the ``N_STRIKES`` (24; see its comment) listed strikes nearest spot,
+  * candidates per session = the ``N_STRIKES`` (40; see its comment) listed strikes nearest spot,
     per expiry;
   * price = the session's own daily bar CLOSE (no carry-forward: a contract with no bar that
     session is not a candidate);
@@ -21,14 +21,29 @@ THE STATISTIC ("rule C", must stay in lockstep with ``ParquetOptionsProvider._co
 
 NEVER FABRICATED. A session with no usable bar is a TOMBSTONE row (iv = NaN, with a reason), not
 a carried-forward value. A missing FRED cache or missing spot makes the series ``unavailable``;
-there is no default rate or price. A bar volume below ``MIN_BAR_VOLUME`` is a ``low_volume``
-tombstone (a one-lot close is not a price).
+there is no default rate or price. There is no volume floor (the backtest has none); the bar
+volume is stored for diagnostics only.
 
-LAZY FILL (the cache fills itself; nothing depends on a tool). A request computes the sessions
-missing up to the LAST COMPLETED session (never today's incomplete bar). The caller's thread is
-capped (``max_api_calls``/``max_seconds``: enough for a warm cache's one new day); a cold
-backfill is handed to ONE daemon worker thread behind a shared token bucket and the caller gets
-the partial series with status ``filling``. One fill per (cache, symbol) at a time.
+WHERE THE CACHE IS UPDATED (operator design, 2026-10-06): INSIDE THE PER-SYMBOL ANALYSIS TASK.
+``WorkerQueue._execute_task`` calls ``atm_iv_task_hook.ensure_for_analysis_task`` just before
+``expert.run_analysis`` for an expert whose ruleset for that use case carries an iv_rank condition.
+That hook calls ``AtmIvHistoryProvider.ensure_filled``: BLOCKING, incremental (only the sessions
+missing up to the LAST COMPLETED session, never today's incomplete bar -- about 5 on a normal
+Monday), on that task's own worker thread, one task per symbol, so the series is fresh BEFORE the
+rule is evaluated. No background thread, no warm job, no foreground call budget.
+  * one fill per (cache, symbol): a second caller of the same symbol WAITS for the lock and then
+    finds the series complete (zero calls), or times out and reads the partial store;
+  * every API call draws a token from ONE process-wide bucket (~100/min, shared by all worker
+    threads) and is retried with exponential backoff + jitter on 429 / 5xx / timeouts, honouring
+    Retry-After; every call has a hard timeout (alpaca-py has none) so a hung socket cannot pin the
+    analysis thread;
+  * an overall per-symbol deadline (default 15 min) returns status ``filling`` with what exists
+    and one warning; progress is persisted chunk by chunk (atomic), so the NEXT pass resumes;
+  * ``get_iv_rank`` NEVER calls the API: it reads the store only (``peek``), so rule evaluation
+    stays cheap and deterministic. A cold symbol is None until its first fill completes.
+Expected cold fill: ~20 calls per symbol (2 listings + ~15-20 bar batches for a year), 97 symbols
+~ 2,000 calls = ~20 minutes at 100/min no matter how many worker threads share the bucket
+(threads only hide latency; the bucket is the limit). Later passes: ~2-4 calls per symbol.
 
 STORE: ``<CACHE_FOLDER>/AtmIvHistory/<SYMBOL>.parquet`` (one row per session, atomic replace under
 a per-file lock) + ``_contracts/<SYMBOL>.{parquet,json}`` (contract listings: the inactive set is
@@ -41,7 +56,7 @@ from __future__ import annotations
 import json
 import math
 import os
-import queue
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -59,7 +74,7 @@ from .bs_inversion import iv_and_delta
 # Method definition. Changing ANY of these changes the statistic: bump METHOD_VERSION so stored
 # rows are recomputed.
 # ---------------------------------------------------------------------------------------------
-METHOD_VERSION = "ruleC-barclose-v1"
+METHOD_VERSION = "ruleC-barclose-v2"   # v2: no volume tombstone (backtest has none); 40 strikes
 PROVENANCE_DERIVED = "derived_alpaca_bars"
 PROVENANCE_SNAPSHOT = "snapshot"
 DTE_MIN = 20
@@ -69,17 +84,26 @@ DTE_MAX = 45
 #: the 6 nearest on ANY session of a batch, i.e. an effective set of ~20+ strikes. Measured on
 #: the study's replay fixture, a literal 6 loses accuracy against the backtest (p95 |diff| 5.4 vp
 #: vs 1.8 vp; contract agreement 82.6% vs 86.6%) because the |delta|-0.5 strike of a high-vol
-#: name sits several strikes above spot. 24 reproduces the study's effective set on the fixture
-#: and costs ~1 extra bar call per symbol-year (bars are range-fetched per contract).
-N_STRIKES = 24
-MIN_BAR_VOLUME = 5
+#: name sits several strikes above spot. 24 reproduced the study's effective set on the fixture;
+#: the review measured the backtest's picks at nearness rank p99 17 / max 38 (0.37% outside the 24
+#: nearest, all MU), so 40 covers every observed pick. Costs a few extra bar calls per symbol-year
+#: (bars are range-fetched per contract).
+N_STRIKES = 40
 CHUNK_SESSIONS = 60
 BARS_BATCH = 200                      # symbols per option-bars call (AlpacaOptionsProvider's)
 HISTORY_FLOOR = date(2024, 1, 18)     # Alpaca option history floor (AlpacaOptionsProvider)
-CALLS_PER_MINUTE = 150
+CALLS_PER_MINUTE = 100
 INACTIVE_TAIL_REFRESH_DAYS = 7
-FAIL_COOLDOWN_SECONDS = 1800
-MAX_CONSECUTIVE_FAILURES = 3
+DEFAULT_DEADLINE_SECONDS = 900.0      # per symbol per ensure_filled
+MAX_RETRIES = 6                       # per API call (429 / 5xx / timeout), exponential backoff
+BACKOFF_BASE_SECONDS = 2.0
+BACKOFF_CAP_SECONDS = 120.0
+MAX_SUSPECT_RERUNS = 2
+LOCK_WAIT_SECONDS = 900.0
+REQUEST_TIMEOUT_SECONDS = 60.0        # background calls; alpaca-py sets no timeout of its own
+TOMBSTONE_RETRY_SESSIONS = 3          # a 'no_bar' tombstone younger than this is retried daily
+PRECEDING_SESSIONS_TRADED = 10        # "normally trades" = had a value in this many prior sessions
+STALE_TMP_SECONDS = 3600
 
 STATUS_COMPLETE = "complete"
 STATUS_FILLING = "filling"
@@ -106,7 +130,23 @@ class BudgetExhausted(RuntimeError):
 
 
 class RateLimited(RuntimeError):
-    """The data API answered 429."""
+    """The data API answered 429 (``retry_after`` seconds when it said so)."""
+
+    def __init__(self, msg: str = "", retry_after: Optional[float] = None):
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+
+class TransientApiError(RuntimeError):
+    """5xx or a timeout: retried with backoff like a 429."""
+
+    def __init__(self, msg: str = "", retry_after: Optional[float] = None):
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+
+class SuspectEmpty(RuntimeError):
+    """An all-empty answer for a name that traded in each of the preceding sessions."""
 
 
 class ApiFailure(RuntimeError):
@@ -136,6 +176,8 @@ class AtmIvSeries:
     window_start: Optional[date] = None
     #: sessions neither valued nor tombstoned (still to fill, or no spot to compute them)
     unresolved: int = 0
+    #: sessions with a tombstone row (no value), for resolved-coverage maths
+    tombstone_days: List[date] = field(default_factory=list)
 
     @property
     def coverage(self) -> str:
@@ -227,9 +269,9 @@ def window_sessions(end_session: date, lookback_days: int) -> List[date]:
 # Token bucket + budget
 # ---------------------------------------------------------------------------------------------
 class TokenBucket:
-    """Shared API rate limiter (default ~150 calls/minute, small burst)."""
+    """Shared API rate limiter (default ~100 calls/minute, small burst)."""
 
-    def __init__(self, per_minute: float = CALLS_PER_MINUTE, burst: float = 20.0,
+    def __init__(self, per_minute: float = CALLS_PER_MINUTE, burst: float = 10.0,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep):
         self.rate = per_minute / 60.0
@@ -245,50 +287,59 @@ class TokenBucket:
         self._tokens = min(self.capacity, self._tokens + (now - self._last) * self.rate)
         self._last = now
 
+    def try_acquire(self) -> float:
+        """Take a token and return 0.0, or return the seconds until one is available."""
+        with self._lock:
+            self._refill()
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return 0.0
+            return (1.0 - self._tokens) / self.rate
+
     def acquire(self, blocking: bool = True) -> bool:
         while True:
-            with self._lock:
-                self._refill()
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    return True
-                wait = (1.0 - self._tokens) / self.rate
+            wait = self.try_acquire()
+            if wait == 0.0:
+                return True
             if not blocking:
                 return False
             self._sleep(min(max(wait, 0.001), 5.0))
 
 
-#: ONE bucket for the whole process: the data API limit is per key, not per provider object.
+#: ONE bucket for the whole process: the data API limit is per key, not per worker thread.
 _SHARED_BUCKET = TokenBucket()
 
 
 class _Budget:
-    """Caps a unit of work: API calls, wall time, and the shared token bucket."""
+    """The deadline of one ``ensure_filled`` plus the shared bucket. ``spend`` BLOCKS for a token
+    (it never gives up early) but raises ``BudgetExhausted`` once the deadline is reached or the
+    wait for a token would cross it."""
 
-    def __init__(self, max_calls: Optional[int], max_seconds: Optional[float],
-                 bucket: TokenBucket, blocking: bool):
-        self.max_calls = max_calls
+    def __init__(self, max_seconds: Optional[float], bucket: TokenBucket,
+                 sleep: Callable[[float], None] = time.sleep):
         self.deadline = None if max_seconds is None else time.monotonic() + max_seconds
         self.bucket = bucket
-        self.blocking = blocking
+        self._sleep = sleep
         self.used = 0
 
-    def can_afford(self, n: int) -> bool:
-        return self.max_calls is None or self.used + n <= self.max_calls
+    def remaining_seconds(self, default: float) -> float:
+        if self.deadline is None:
+            return default
+        return max(self.deadline - time.monotonic(), 0.05)
 
-    def require(self, n: int) -> None:
-        if not self.can_afford(n):
-            raise BudgetExhausted(f"needs {n} API call(s), {self.max_calls - self.used} left")
+    def check_deadline(self, extra: float = 0.0) -> None:
+        if self.deadline is not None and time.monotonic() + extra > self.deadline:
+            raise BudgetExhausted("per-symbol deadline reached")
 
-    def spend(self, n: int = 1) -> None:
-        for _ in range(n):
-            if not self.can_afford(1):
-                raise BudgetExhausted("API call budget exhausted")
-            if self.deadline is not None and time.monotonic() > self.deadline:
-                raise BudgetExhausted("time budget exhausted")
-            if not self.bucket.acquire(blocking=self.blocking):
-                raise BudgetExhausted("shared rate bucket empty")
-            self.used += 1
+    def spend(self) -> None:
+        while True:
+            self.check_deadline()
+            wait = self.bucket.try_acquire()
+            if wait == 0.0:
+                self.used += 1
+                return
+            self.check_deadline(extra=wait)
+            self._sleep(min(wait, 1.0))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -475,43 +526,21 @@ def _default_rate_source(start: date, end: date):
 # ---------------------------------------------------------------------------------------------
 # Background worker (one daemon thread, shared by every provider object)
 # ---------------------------------------------------------------------------------------------
-class _BackgroundWorker:
-    def __init__(self):
-        self._q: "queue.Queue[Callable[[], None]]" = queue.Queue()
-        self._thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
-
-    def submit(self, job: Callable[[], None]) -> None:
-        with self._lock:
-            if self._thread is None or not self._thread.is_alive():
-                self._thread = threading.Thread(target=self._run, name="atm-iv-history-fill",
-                                                daemon=True)
-                self._thread.start()
-        self._q.put(job)
-
-    def _run(self):
-        while True:
-            try:
-                job = self._q.get(timeout=60)
-            except queue.Empty:
-                with self._lock:
-                    if self._q.empty():
-                        self._thread = None
-                        return
-                continue
-            try:
-                job()
-            except BaseException as e:  # noqa: BLE001 - a fill must never kill the worker
-                logger.error(f"ATM-IV history background job crashed: {e}", exc_info=True)
-
-
-_BG = _BackgroundWorker()
-
-# (cache_dir, symbol) -> True while a fill owns the symbol; shared across provider objects.
+# One lock per (cache, symbol): the per-symbol "one fill at a time" and the wait-then-read rule.
 _FILL_LOCK = threading.Lock()
-_FILLING: Dict[Tuple[str, str], bool] = {}
-_FAIL_UNTIL: Dict[Tuple[str, str], float] = {}
+_SYMBOL_LOCKS: Dict[Tuple[str, str], threading.Lock] = {}
+
+
+def _symbol_lock(key: Tuple[str, str]) -> threading.Lock:
+    with _FILL_LOCK:
+        lk = _SYMBOL_LOCKS.get(key)
+        if lk is None:
+            lk = _SYMBOL_LOCKS[key] = threading.Lock()
+        return lk
+
+
 _WARNED: Dict[str, date] = {}
+_SUSPECT_SEEN: set = set()
 
 
 def _warn_once_per_day(key: str, message: str, today: date) -> None:
@@ -534,7 +563,7 @@ class AtmIvHistoryProvider:
                  now: Optional[Callable[[], datetime]] = None,
                  sleep: Callable[[float], None] = time.sleep,
                  bucket: Optional[TokenBucket] = None,
-                 background_runner: Optional[Callable[[Callable[[], None]], None]] = None):
+                 jitter: Callable[[], float] = random.random):
         if cache_dir is None:
             from ba2_trade_platform import config
             cache_dir = os.path.join(config.CACHE_FOLDER, "AtmIvHistory")
@@ -547,9 +576,48 @@ class AtmIvHistoryProvider:
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep
         self.bucket = bucket or _SHARED_BUCKET
-        self._runner = background_runner or _BG.submit
+        self._jitter = jitter
         #: every API call this provider made (listing pages + bar batches); for tests/diagnostics
         self.api_calls = 0
+        self._clean_orphan_tmp()
+
+    def _clean_orphan_tmp(self) -> None:
+        """A crash between ``to_parquet`` and ``os.replace`` leaves a ``.tmp``: sweep old ones."""
+        cutoff = time.time() - STALE_TMP_SECONDS
+        for folder in (self.cache_dir, os.path.join(self.cache_dir, "_contracts")):
+            try:
+                names = os.listdir(folder)
+            except OSError:
+                continue
+            for n in names:
+                if n.endswith(".tmp"):
+                    fp = os.path.join(folder, n)
+                    try:
+                        if os.path.getmtime(fp) < cutoff:
+                            os.remove(fp)
+                    except OSError:
+                        pass
+
+    # -- request timeouts ------------------------------------------------------------------
+    def _timed(self, budget: "_Budget", fn: Callable[[], Any]):
+        """Run an API call with a hard time limit (alpaca-py has none): the call runs in a daemon
+        thread and an overrun raises ApiFailure, so ``max_seconds`` is honoured on the caller."""
+        limit = min(budget.remaining_seconds(REQUEST_TIMEOUT_SECONDS), REQUEST_TIMEOUT_SECONDS)
+        box: Dict[str, Any] = {}
+
+        def run():
+            try:
+                box["v"] = fn()
+            except BaseException as e:  # noqa: BLE001
+                box["e"] = e
+        t = threading.Thread(target=run, name="atm-iv-api-call", daemon=True)
+        t.start()
+        t.join(limit)
+        if t.is_alive():
+            raise TransientApiError(f"API call exceeded {limit:.1f}s")
+        if "e" in box:
+            raise box["e"]
+        return box["v"]
 
     # -- clients --------------------------------------------------------------------------
     def _bars(self):
@@ -640,24 +708,42 @@ class AtmIvHistoryProvider:
 
     # -- window / missing -----------------------------------------------------------------
     def _fresh_sessions(self, df: pd.DataFrame) -> set:
+        """Sessions with a current-version row, EXCEPT a young ``no_bar`` tombstone: a thin day
+        or a transient empty response looks the same on the day, so for the first
+        ``TOMBSTONE_RETRY_SESSIONS`` sessions it is retried once per calendar day."""
         if df.empty:
             return set()
         cur = df[df["method_version"] == METHOD_VERSION]
-        return {ts.date() for ts in cur["session_date"]}
+        today = self._now().astimezone(_ny_tz()).date()
+        young_cut = pd.Timestamp(today - timedelta(days=10))
+        out = set()
+        for ts, reason, comp in zip(cur["session_date"], cur["reason"], cur["computed_at"]):
+            d = ts.date()
+            if reason in ("no_bar", "no_spot") and ts >= young_cut and pd.notna(comp) and comp.date() < today:
+                from ba2_common.core import market_calendar
+                gap = len(market_calendar.regular_session_dates(d + timedelta(days=1), comp.date()))
+                if gap < TOMBSTONE_RETRY_SESSIONS:
+                    continue
+            out.add(d)
+        return out
 
     def _assemble(self, symbol: str, df: pd.DataFrame, window: List[date], end_session: date,
                   status: str, reason: Optional[str] = None) -> AtmIvSeries:
         wset = set(window)
         values: Dict[date, float] = {}
         tomb = 0
+        tomb_days: List[date] = []
         if not df.empty:
             cur = df[df["method_version"] == METHOD_VERSION]
-            for ts, iv in zip(cur["session_date"], cur["iv"]):
+            for ts, iv, why in zip(cur["session_date"], cur["iv"], cur["reason"]):
                 d = ts.date()
                 if d not in wset:
                     continue
+                if why == "no_spot":
+                    continue          # recorded so the session is not 'missing', but UNRESOLVED
                 if iv is None or (isinstance(iv, float) and math.isnan(iv)):
                     tomb += 1
+                    tomb_days.append(d)
                 else:
                     values[d] = float(iv)
         resolved = len(values) + tomb
@@ -666,7 +752,7 @@ class AtmIvHistoryProvider:
             covered=len(values), expected=len(window), tombstones=tomb,
             provenance={PROVENANCE_DERIVED: len(values)} if values else {},
             reason=reason, window_start=window[0] if window else None,
-            unresolved=max(len(window) - resolved, 0))
+            unresolved=max(len(window) - resolved, 0), tombstone_days=tomb_days)
 
     def peek(self, symbol: str, end_session: date, lookback_days: int = 365) -> AtmIvSeries:
         """The stored series only: ZERO API calls, no fill, no prerequisites."""
@@ -680,102 +766,78 @@ class AtmIvHistoryProvider:
     def last_completed_session(self) -> date:
         return last_completed_session(self._now())
 
-    def get_atm_iv_series(self, symbol: str, end_session: date, lookback_days: int = 365,
-                          max_api_calls: int = 2, max_seconds: float = 3.0) -> AtmIvSeries:
+    def ensure_filled(self, symbol: str, end_session: Optional[date] = None, lookback_days: int = 365,
+                      deadline_seconds: float = DEFAULT_DEADLINE_SECONDS) -> AtmIvSeries:
+        """Bring ``symbol``'s series up to the last completed session, BLOCKING (analysis thread).
+
+        Incremental: only missing sessions are computed. Returns ``complete`` (also when the only
+        gaps are sessions without a spot), ``filling`` (deadline / persistent API failure; progress
+        so far is kept and the next call resumes) or ``unavailable`` (FRED rate or spot cannot be
+        stated; nothing defaulted). ``deadline_seconds`` bounds the WHOLE call, lock wait included.
+        """
         sym = symbol.upper()
-        end_session = min(end_session, self.last_completed_session())
+        last = self.last_completed_session()
+        end_session = last if end_session is None else min(end_session, last)
         window = window_sessions(end_session, lookback_days)
         df = self.read_store(sym)
-        fresh = self._fresh_sessions(df)
-        missing = [d for d in window if d not in fresh]
-        if not missing:
+        if not [d for d in window if d not in self._fresh_sessions(df)]:
             return self._assemble(sym, df, window, end_session, STATUS_COMPLETE)
 
+        t0 = time.monotonic()
         key = (self.cache_dir, sym)
         today = self._now().astimezone(_ny_tz()).date()
-        with _FILL_LOCK:
-            cooling = _FAIL_UNTIL.get(key, 0.0) > time.monotonic()
-            busy = _FILLING.get(key, False)
-            if not cooling and not busy:
-                _FILLING[key] = True
-        if cooling:
-            return self._assemble(sym, df, window, end_session, STATUS_UNAVAILABLE,
-                                  "background fill failed recently; retrying later")
-        if busy:
-            return self._assemble(sym, df, window, end_session, STATUS_FILLING,
-                                  "another caller is filling this symbol")
-
-        handed_off = False
+        lock = _symbol_lock(key)
+        if not lock.acquire(timeout=min(deadline_seconds, LOCK_WAIT_SECONDS)):
+            return self._assemble(sym, self.read_store(sym), window, end_session, STATUS_FILLING,
+                                  "another fill of this symbol is still running")
         status, reason = STATUS_COMPLETE, None
         try:
-            budget = _Budget(max_api_calls, max_seconds, self.bucket, blocking=False)
-            try:
-                self._run_fill(sym, window, budget, background=False)
-            except AtmIvUnavailable as e:
-                status, reason = STATUS_UNAVAILABLE, str(e)
-                _warn_once_per_day(f"unavail:{key}", f"ATM-IV history unavailable for {sym}: {e}", today)
-            except (BudgetExhausted, RateLimited, ApiFailure) as e:
-                self._runner(lambda: self._background_job(key, sym, end_session, lookback_days))
-                handed_off = True
-                status, reason = STATUS_FILLING, f"continuing in background ({type(e).__name__})"
-            if status == STATUS_COMPLETE:
+            df = self.read_store(sym)             # the holder we waited for may have finished it
+            missing = [d for d in window if d not in self._fresh_sessions(df)]
+            if missing:
+                if len(missing) > 5:
+                    logger.info(f"ATM-IV history fill started for {sym}: {len(missing)} of "
+                                f"{len(window)} session(s) to derive")
+                budget = _Budget(max(deadline_seconds - (time.monotonic() - t0), 1.0), self.bucket, self._sleep)
+                reruns = 0
+                while True:
+                    before = len(self._fresh_sessions(self.read_store(sym)))
+                    try:
+                        self._run_fill(sym, window, budget)
+                        break
+                    except AtmIvUnavailable as e:
+                        status, reason = STATUS_UNAVAILABLE, str(e)
+                        _warn_once_per_day(f"unavail:{key}", f"ATM-IV history unavailable for {sym}: {e}", today)
+                        break
+                    except SuspectEmpty as e:
+                        # reruns count only attempts that persisted nothing new (each chunk may
+                        # legitimately ask to look again once)
+                        progressed = len(self._fresh_sessions(self.read_store(sym))) > before
+                        reruns = 0 if progressed else reruns + 1
+                        if reruns > MAX_SUSPECT_RERUNS:
+                            status, reason = STATUS_FILLING, str(e)
+                            break
+                    except (BudgetExhausted, RateLimited, TransientApiError, ApiFailure) as e:
+                        status, reason = STATUS_FILLING, f"{type(e).__name__}: {e}"
+                        _warn_once_per_day(
+                            f"fillstop:{key}", f"ATM-IV history fill for {sym} stopped after "
+                            f"{time.monotonic() - t0:.0f}s ({reason}); progress is kept and the next "
+                            f"analysis pass resumes. IV rank stays unavailable until it completes.", today)
+                        break
                 df = self.read_store(sym)
                 still = [d for d in window if d not in self._fresh_sessions(df)]
-                # sessions with no spot cannot be filled; they stay unresolved (not "filling")
-                if still:
-                    reason = f"{len(still)} session(s) not computable (no spot)"
+                if status == STATUS_COMPLETE:
+                    if still:
+                        reason = f"{len(still)} session(s) not computable (no spot)"
+                    elif len(missing) > 5:
+                        logger.info(f"ATM-IV history fill completed for {sym}: {budget.used} API "
+                                    f"call(s), {time.monotonic() - t0:.0f}s")
         finally:
-            if not handed_off:
-                with _FILL_LOCK:
-                    _FILLING.pop(key, None)
-        df = self.read_store(sym)
-        return self._assemble(sym, df, window, end_session, status, reason)
-
-    # -- background -----------------------------------------------------------------------
-    def _background_job(self, key, sym: str, end_session: date, lookback_days: int) -> None:
-        today = self._now().astimezone(_ny_tz()).date()
-        failures = 0
-        t0 = time.monotonic()
-        try:
-            window = window_sessions(end_session, lookback_days)
-            n_missing = len([d for d in window if d not in self._fresh_sessions(self.read_store(sym))])
-            logger.info(f"ATM-IV history fill started for {sym}: {n_missing} of {len(window)} "
-                        f"session(s) to derive")
-            while True:
-                budget = _Budget(None, None, self.bucket, blocking=True)
-                try:
-                    self._run_fill(sym, window, budget, background=True)
-                    break
-                except AtmIvUnavailable as e:
-                    _warn_once_per_day(f"unavail:{key}", f"ATM-IV history fill for {sym} cannot "
-                                       f"proceed: {e}", today)
-                    with _FILL_LOCK:
-                        _FAIL_UNTIL[key] = time.monotonic() + FAIL_COOLDOWN_SECONDS
-                    return
-                except (RateLimited, ApiFailure, BudgetExhausted) as e:
-                    failures += 1
-                    if failures >= MAX_CONSECUTIVE_FAILURES:
-                        logger.warning(f"ATM-IV history fill for {sym} giving up after {failures} "
-                                       f"consecutive failures ({type(e).__name__}: {e}); will retry "
-                                       f"in {FAIL_COOLDOWN_SECONDS // 60} min")
-                        with _FILL_LOCK:
-                            _FAIL_UNTIL[key] = time.monotonic() + FAIL_COOLDOWN_SECONDS
-                        return
-                    self._sleep(min(30.0 * failures, 120.0))
-            df = self.read_store(sym)
-            vals = self._assemble(sym, df, window, end_session, STATUS_COMPLETE)
-            logger.info(f"ATM-IV history fill completed for {sym}: coverage {vals.coverage}, "
-                        f"{vals.tombstones} tombstone(s), {time.monotonic() - t0:.0f}s")
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"ATM-IV history fill for {sym} failed unexpectedly: {e}", exc_info=True)
-            with _FILL_LOCK:
-                _FAIL_UNTIL[key] = time.monotonic() + FAIL_COOLDOWN_SECONDS
-        finally:
-            with _FILL_LOCK:
-                _FILLING.pop(key, None)
+            lock.release()
+        return self._assemble(sym, self.read_store(sym), window, end_session, status, reason)
 
     # -- the fill -------------------------------------------------------------------------
-    def _run_fill(self, sym: str, window: List[date], budget: _Budget, *, background: bool) -> None:
+    def _run_fill(self, sym: str, window: List[date], budget: _Budget) -> None:
         df = self.read_store(sym)
         fresh = self._fresh_sessions(df)
         missing = [d for d in window if d not in fresh]
@@ -785,6 +847,12 @@ class AtmIvHistoryProvider:
         rate = self._rate_source(lo, hi)           # AtmIvUnavailable -> series unavailable
         spots = self.spot_source.spots(sym, lo, hi)  # SpotUnavailable -> series unavailable
         fillable = sorted((d for d in missing if d in spots), reverse=True)   # newest first
+        nospot = [d for d in missing if d not in spots]
+        if nospot:
+            now_ts = pd.Timestamp(self._now().astimezone(timezone.utc).replace(tzinfo=None))
+            self._merge_rows(sym, [self._tomb(dict(session_date=d, provenance=PROVENANCE_DERIVED,
+                                                   method_version=METHOD_VERSION, computed_at=now_ts), "no_spot")
+                                   for d in nospot])
         if not fillable:
             return
         listing = self._ensure_listing(sym, budget)
@@ -822,11 +890,8 @@ class AtmIvHistoryProvider:
         rows: List[dict] = []
         token = None
         while True:
-            self._spend(budget)
-            try:
-                page, token = self._listing_client().list_page(sym, status, gte, lte, token)
-            except Exception as e:  # noqa: BLE001
-                raise self._classify(e) from e
+            page, token = self._call_api(budget, lambda t=token: self._listing_client().list_page(
+                sym, status, gte, lte, t))
             rows.extend(r for r in page if r.get("size", 100) == 100 and r.get("root", sym) in ("", sym))
             if not token:
                 break
@@ -862,31 +927,51 @@ class AtmIvHistoryProvider:
         return df
 
     # -- API plumbing ---------------------------------------------------------------------
-    def _spend(self, budget: _Budget) -> None:
-        budget.spend(1)
-        self.api_calls += 1
-
     @staticmethod
     def _classify(e: BaseException) -> Exception:
-        if isinstance(e, (BudgetExhausted, RateLimited, ApiFailure, AtmIvUnavailable)):
+        if isinstance(e, (BudgetExhausted, RateLimited, TransientApiError, ApiFailure,
+                          AtmIvUnavailable, SuspectEmpty)):
             return e
+        resp = getattr(e, "response", None)
+        code = getattr(e, "status_code", None) or getattr(resp, "status_code", None)
+        retry_after = None
+        try:
+            ra = (getattr(resp, "headers", None) or {}).get("Retry-After")
+            retry_after = float(ra) if ra is not None else None
+        except (TypeError, ValueError):
+            retry_after = None
         if _is_rate_limited(e):
-            return RateLimited(str(e))
+            return RateLimited(str(e), retry_after)
+        if isinstance(code, int) and code >= 500:
+            return TransientApiError(f"HTTP {code}: {e}", retry_after)
         return ApiFailure(f"{type(e).__name__}: {e}")
 
-    def _fetch_batch(self, batch: Sequence[str], start: date, end: date, budget: _Budget):
+    def _call_api(self, budget: _Budget, fn: Callable[[], Any]):
+        """One API call: bucket token, hard timeout, exponential backoff + jitter on 429 / 5xx /
+        timeout (Retry-After wins when given). Raises once ``MAX_RETRIES`` or the deadline."""
         attempt = 0
         while True:
-            self._spend(budget)
+            budget.spend()
+            self.api_calls += 1
             try:
-                return self._bars().fetch(batch, start, end)
+                return self._timed(budget, fn)
             except Exception as e:  # noqa: BLE001
                 err = self._classify(e)
-                if isinstance(err, RateLimited) and budget.blocking and attempt < 4:
+                if isinstance(err, (RateLimited, TransientApiError)) and attempt < MAX_RETRIES:
+                    wait = getattr(err, "retry_after", None)
+                    if wait is None:
+                        wait = min(BACKOFF_BASE_SECONDS * 2 ** attempt, BACKOFF_CAP_SECONDS)
+                    wait *= 1.0 + 0.25 * self._jitter()
+                    budget.check_deadline(extra=wait)
+                    self._sleep(wait)
                     attempt += 1
-                    self._sleep(min(5.0 * 2 ** attempt, 60.0))
                     continue
+                if err is e:
+                    raise
                 raise err from e
+
+    def _fetch_batch(self, batch: Sequence[str], start: date, end: date, budget: _Budget):
+        return self._call_api(budget, lambda: self._bars().fetch(batch, start, end))
 
     # -- one chunk of sessions ------------------------------------------------------------
     def _compute_chunk(self, sym: str, sessions: List[date], listing: pd.DataFrame,
@@ -910,17 +995,32 @@ class AtmIvHistoryProvider:
             member[d] = m
         occ_list = sorted(need, key=lambda o: (min(need[o]), o))
         batches = [occ_list[i:i + BARS_BATCH] for i in range(0, len(occ_list), BARS_BATCH)]
-        budget.require(len(batches))        # a chunk is atomic: never spend calls we cannot finish
         bars: Dict[str, Dict[date, BarRec]] = {}
         for batch in batches:
             start = min(min(need[o]) for o in batch)
             end = max(max(need[o]) for o in batch)
-            for occ, recs in self._fetch_batch(batch, start, end, budget).items():
+            got = self._fetch_batch(batch, start, end, budget)
+            if not got:
+                # a whole batch of listed contracts with not one bar is far more likely an empty
+                # response than 200 contracts that never traded: look again once, then accept
+                bkey = (self.cache_dir, sym, "batch", batch[0], len(batch), start, end)
+                with _FILL_LOCK:
+                    first_time = bkey not in _SUSPECT_SEEN
+                    _SUSPECT_SEEN.add(bkey)
+                if first_time:
+                    raise SuspectEmpty(f"{sym}: an entire batch of {len(batch)} contract(s) "
+                                       f"returned no bars ({start}..{end})")
+            for occ, recs in got.items():
                 bars[occ] = {r.day: r for r in recs}
 
+        from ba2_common.core import market_calendar
         now_ts = pd.Timestamp(self._now().astimezone(timezone.utc).replace(tzinfo=None))
+        stored = self.read_store(sym)
+        valued = ({ts.date() for ts, iv, mv in zip(stored["session_date"], stored["iv"], stored["method_version"])
+                   if mv == METHOD_VERSION and pd.notna(iv)} if len(stored) else set())
         rows: List[dict] = []
-        for d in sessions:
+        suspects: List[date] = []
+        for d in sorted(sessions):           # ascending, so a chunk sees its own earlier values
             S = float(spots[d])
             r = float(rate_obj.rate_on(d))
             cands = []
@@ -931,6 +1031,8 @@ class AtmIvHistoryProvider:
             base = dict(session_date=d, spot=S, rate=r, provenance=PROVENANCE_DERIVED,
                         method_version=METHOD_VERSION, computed_at=now_ts)
             if not cands:
+                if member[d] and self._normally_trades(d, valued):
+                    suspects.append(d)
                 rows.append(self._tomb(base, "no_bar"))
                 continue
             sel = select_atm(d, S, r, cands)
@@ -941,11 +1043,33 @@ class AtmIvHistoryProvider:
             detail = dict(occ=c.occ, strike=c.strike, expiry=pd.Timestamp(c.expiry), dte=sel.dte,
                           delta=sel.delta, bar_close=c.close,
                           bar_volume=np.nan if c.volume is None else float(c.volume))
-            if c.volume is None or c.volume < MIN_BAR_VOLUME:
-                rows.append(self._tomb({**base, **detail}, "low_volume"))
-                continue
+            # bar_volume is recorded for diagnostics ONLY: the backtest applies no volume floor
+            # (its bars carry volume and nothing reads it here), so neither does the live series.
             rows.append({**base, **detail, "iv": sel.iv, "reason": "ok"})
+            valued.add(d)
+        if not valued.intersection(sessions) and any(member[d] for d in sessions):
+            # not one session of the chunk produced a value although contracts were listed for it:
+            # the SAME suspicion as below (an empty response), whether or not it traded before
+            suspects = [d for d in sorted(sessions) if member[d]]
+        if suspects:
+            # A name that traded in each of the last sessions returning NO bar for any of its
+            # candidates is far more likely an empty/partial response than a dead chain. Fail the
+            # chunk ONCE (nothing written; one failure however many sessions are suspect) and look
+            # again; a second identical answer is accepted as real thin days.
+            with _FILL_LOCK:
+                fresh = [d for d in suspects if (self.cache_dir, sym, d) not in _SUSPECT_SEEN]
+                _SUSPECT_SEEN.update((self.cache_dir, sym, d) for d in suspects)
+            if fresh:
+                raise SuspectEmpty(f"{sym}: no option bars at all for {len(suspects)} session(s) "
+                                 f"(first {suspects[0]}) although it traded in the preceding "
+                                 f"{PRECEDING_SESSIONS_TRADED} sessions")
         return rows
+
+    @staticmethod
+    def _normally_trades(d: date, valued: set) -> bool:
+        from ba2_common.core import market_calendar
+        prior = market_calendar.regular_session_dates(d - timedelta(days=21), d - timedelta(days=1))
+        return any(x in valued for x in prior[-PRECEDING_SESSIONS_TRADED:])
 
     @staticmethod
     def _tomb(base: dict, reason: str) -> dict:

@@ -256,6 +256,8 @@ class JobManager:
         self._start_account_refresh_watchdog()
 
         # Announce which iv_rank-gated rules are still inert and which are armed.
+        import threading as _th
+        _th.Thread(target=self._ensure_dgs3mo, args=(True,), name="dgs3mo-startup", daemon=True).start()
         self._report_iv_rank_readiness()
 
         logger.info("JobManager started successfully")
@@ -774,6 +776,15 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error scheduling the pre-open FRED refresh job: {e}", exc_info=True)
 
+    def _ensure_dgs3mo(self, only_if_stale: bool):
+        """Keep the option risk-free rate (FRED DGS3MO) cached whenever an iv_rank gate exists."""
+        try:
+            from ..modules.dataproviders.options import atm_iv_task_hook as atm_iv_warm
+            if atm_iv_warm.has_iv_rank_gates():
+                atm_iv_warm.ensure_dgs3mo(only_if_stale=only_if_stale)
+        except Exception as e:
+            logger.error(f"Error refreshing FRED DGS3MO: {e}", exc_info=True)
+
     def _any_enabled_expert(self, expert_class_name: str) -> bool:
         """True when an enabled ExpertInstance of *expert_class_name* exists."""
         return any(inst.enabled and inst.expert == expert_class_name
@@ -786,6 +797,9 @@ class JobManager:
         cannot drift from what the analyses read. A failure is logged at ERROR by
         ``refresh_for_live_decision``; the 09:30 reads then retry once (guarded) and refuse.
         """
+        # DGS3MO is the derived-ATM-IV risk-free rate, refreshed independently of any expert
+        # (refresh_for_live_decision refuses it by design).
+        self._ensure_dgs3mo(only_if_stale=False)
         try:
             if not self._any_enabled_expert("DeterministicScorer"):
                 logger.debug("Pre-open FRED refresh: no enabled DeterministicScorer; skipped")
