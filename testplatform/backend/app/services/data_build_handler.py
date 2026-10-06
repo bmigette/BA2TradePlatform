@@ -129,6 +129,7 @@ def handle_build_screener_metrics(task_id: str, payload: Dict[str, Any]) -> Dict
             shares_get=_shares,
             cadence_days=int(payload.get("cadence_days", 7)),
             drop_days=int(payload.get("drop_days", 1)),
+            allow_stale_symbols=payload.get("allow_stale_symbols") or None,
         )
         logger.info(f"build-screener-metrics task {task_id}: {summary}")
         return {"status": "completed", "summary": summary}

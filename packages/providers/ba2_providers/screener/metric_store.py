@@ -34,6 +34,32 @@ _HIST_FLOAT_URL = "https://financialmodelingprep.com/api/v4/historical/shares_fl
 # confirmed-safe point while keeping the per-symbol call count low.
 _MCAP_CHUNK_DAYS = 1000
 
+# STALENESS RULES (added 2026-10-06 after the frozen-row incident: ~46% of the 2026 rows of the
+# store were a symbol's LAST known bar forward-filled with no age limit, because the OHLCV cache
+# the builder read had ended on 2025-12-31 for ~2,000 symbols). Every as-of (ffill) read now
+# carries an explicit maximum age; older than that is NOT carried forward.
+#   OHLCV  : a scan row is built only if the symbol's latest bar is <= 7 calendar days old. The
+#            longest legitimate gap between two bars is a long weekend / holiday (<= 4 days;
+#            Good Friday + weekend, 9/11-style closures aside), so 7 never trims a live symbol.
+#   market cap : a TRADING-DAY series (measured on the live cache 2026-10-06: median gap 1 day,
+#            99% of symbols never exceed a 5-day gap since 2025-06, none exceeds 100). Older than
+#            MCAP_MAX_AGE_DAYS (14: covers 99.6% of symbols' worst gap, i.e. any holiday/FMP skipped
+#            days) before a bar, the value is NaN -- a screen drops a NaN cap, and the
+#            ``market_cap`` quality gate (20% NaN) turns a stale cache into a loud build failure.
+#   float  : also dense in the cache (the effective-dated series has a row for ~every calendar
+#            day; 99% max gap 4 days, 6 of 4,687 symbols have a gap >100 days). A float changes
+#            only with filings (~quarterly), so it is held up to FLOAT_MAX_AGE_DAYS = 120 (one
+#            quarter + filing slack); older -> NaN, which the (NaN-tolerant) float gate passes.
+STALENESS_MAX_DAYS = 7
+MCAP_MAX_AGE_DAYS = 14
+FLOAT_MAX_AGE_DAYS = 120
+#: Pre-build check: a symbol whose cached last bar is more than this many days before the build
+#: --end is stale input and fails the build unless explicitly allowed (see build_store).
+PREBUILD_MAX_STALE_DAYS = 10
+#: >= this many consecutive scans with identical close+volume+relative_volume (volume > 0) is
+#: a frozen forward-fill, never a market.
+FROZEN_RUN_MIN = 3
+
 
 def _date_chunks(start: str, end: str, chunk_days: int) -> List[Tuple[str, str]]:
     """Split [start, end] (``YYYY-MM-DD``) into consecutive <=``chunk_days`` windows."""
@@ -76,12 +102,46 @@ def _read_fetched_from(meta_path: str) -> Optional[str]:
         return None
 
 
-def _write_fetched_from(meta_path: str, start: str) -> None:
+def _read_meta(meta_path: str) -> Dict[str, Any]:
     try:
+        with open(meta_path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001 - missing/corrupt meta -> unknown
+        return {}
+
+
+def _write_fetched_from(meta_path: str, start: str, fetched_to: Optional[str] = None) -> None:
+    """Record the window a cache was fetched for: ``fetched_from`` (earliest start requested) and
+    ``fetched_to`` (latest end requested; absent in caches written before this tracking existed,
+    which is why the END coverage check also looks at the newest cached row)."""
+    try:
+        prior = _read_meta(meta_path)
+        rec = {"fetched_from": start}
+        to = max([x for x in (fetched_to, prior.get("fetched_to")) if x], default=None)
+        if to:
+            rec["fetched_to"] = to
         with open(meta_path, "w") as f:
-            json.dump({"fetched_from": start}, f)
+            json.dump(rec, f)
     except Exception:  # noqa: BLE001 — best-effort, same as the parquet cache write
         pass
+
+
+def _cache_covers_end(meta: Dict[str, Any], cached_df: "Optional[pd.DataFrame]", end: str,
+                      slack_days: int) -> bool:
+    """True when a fundamentals cache already reaches ``end``: it was fetched for an end >= ``end``
+    (``fetched_to``), or its newest row is within ``slack_days`` of ``end``. The START was always
+    checked; the END never was, so a cache fetched through 2026-06-30 was served as-is to a build
+    ending 2026-09-26 and every later as-of read forward-filled stale values (2026-10-06 audit)."""
+    to = meta.get("fetched_to")
+    if to and to >= end:
+        return True
+    if cached_df is None or cached_df.empty or "date" not in cached_df.columns:
+        return False
+    newest = pd.to_datetime(cached_df["date"], errors="coerce").max()
+    if pd.isna(newest):
+        return False
+    return newest >= pd.Timestamp(end) - pd.Timedelta(days=int(slack_days))
 
 
 def _write_parquet_atomic(df: "pd.DataFrame", path: str) -> None:
@@ -131,19 +191,27 @@ def fetch_historical_market_cap(symbol: str, api_key: str, start: str, end: str)
     FMP per-request caps (intraday OHLCV's 8-day chunking, the insider provider's pagination)."""
     path = _fund_cache_path("market_cap", symbol)
     meta_path = _fund_meta_path(path)
-    prior_start = _read_fetched_from(meta_path)
+    meta = _read_meta(meta_path)
+    prior_start = meta.get("fetched_from")
     covers_start = prior_start is not None and prior_start <= start
     cached_df: "Optional[pd.DataFrame]" = None
+    fetch_start = start
     if os.path.exists(path):
         try:
             cached_df = pd.read_parquet(path)
             if covers_start:
-                return _series_from_cache_df(cached_df, "market_cap")
+                if _cache_covers_end(meta, cached_df, end, slack_days=7):
+                    return _series_from_cache_df(cached_df, "market_cap")
+                # START covered, END not: top up ONLY the tail after the newest cached row.
+                newest = pd.to_datetime(cached_df["date"], errors="coerce").max()
+                if cached_df is not None and not pd.isna(newest):
+                    fetch_start = (newest + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
         except Exception:  # noqa: BLE001 — corrupt cache -> re-fetch
             cached_df = None
+            fetch_start = start
     rows: list = []
     fetch_ok = True
-    for chunk_start, chunk_end in _date_chunks(start, end, _MCAP_CHUNK_DAYS):
+    for chunk_start, chunk_end in _date_chunks(fetch_start, end, _MCAP_CHUNK_DAYS):
         try:
             r = fmp_http_get(f"{_HIST_MCAP_URL}/{symbol}",
                              params={"apikey": api_key, "from": chunk_start, "to": chunk_end,
@@ -170,7 +238,7 @@ def fetch_historical_market_cap(symbol: str, api_key: str, start: str, end: str)
     # that produced the 2020-2021 nulls even after the range-check fix above).
     if fetch_ok:
         try:
-            _write_fetched_from(meta_path, start)
+            _write_fetched_from(meta_path, start if fetch_start == start else prior_start, end)
         except Exception:  # noqa: BLE001
             pass
     return _series_from_cache_df(df, "market_cap")
@@ -205,17 +273,22 @@ def fetch_historical_float(symbol: str, api_key: str, start: str, end: str) -> "
     than silently breaking a screen."""
     path = _fund_cache_path("float", symbol)
     meta_path = _fund_meta_path(path)
-    prior_start = _read_fetched_from(meta_path)
+    meta = _read_meta(meta_path)
+    prior_start = meta.get("fetched_from")
     covers_start = prior_start is not None and prior_start <= start
     cached_df: "Optional[pd.DataFrame]" = None
     if os.path.exists(path):
         try:
             cached_df = pd.read_parquet(path)
-            if covers_start:
+            # The cache's rows are EFFECTIVE-dated (filing date / date + ~75d lag), so a cache
+            # fetched recently already reaches ~2.5 months past its fetch day; END coverage uses
+            # the same newest-row/fetched_to rule as market cap (slack 0: no trading-day lag).
+            if covers_start and _cache_covers_end(meta, cached_df, end, slack_days=0):
                 return _series_from_cache_df(cached_df, "float_shares")
         except Exception:  # noqa: BLE001
             cached_df = None
     rows: list = []
+    fetch_ok = True
     try:
         r = fmp_http_get(_HIST_FLOAT_URL, params={"symbol": symbol, "apikey": api_key},
                          endpoint="historical-shares-float", timeout=30)
@@ -223,6 +296,7 @@ def fetch_historical_float(symbol: str, api_key: str, start: str, end: str) -> "
         rows = j if isinstance(j, list) else []
     except Exception:  # noqa: BLE001
         rows = []
+        fetch_ok = False
     from ba2_common.core.provider_utils import statement_effective_date
     recs = []
     for x in rows:
@@ -241,7 +315,8 @@ def fetch_historical_float(symbol: str, api_key: str, start: str, end: str) -> "
     if not df.empty:
         try:
             _write_parquet_atomic(df, path)
-            _write_fetched_from(meta_path, start)
+            if fetch_ok:
+                _write_fetched_from(meta_path, min(x for x in (start, prior_start) if x), end)
         except Exception:  # noqa: BLE001
             pass
     return _series_from_cache_df(df, "float_shares")
@@ -439,7 +514,9 @@ def compute_daily_metrics(ohlcv: "pd.DataFrame",
                           float_series: Optional["pd.Series"] = None,
                           shares: Optional[float] = None,
                           rvol_window: int = 20, drop_days: int = 5,
-                          vol_window: int = 20, max_lookback: int = 30) -> "pd.DataFrame":
+                          vol_window: int = 20, max_lookback: int = 30,
+                          mcap_max_age_days: Optional[int] = None,
+                          float_max_age_days: Optional[int] = None) -> "pd.DataFrame":
     """Per-day screen metrics for ONE symbol, vectorised over its full history.
 
     ``ohlcv`` is indexed by date with columns Open/High/Low/Close/Volume (the shape the as-of
@@ -455,7 +532,13 @@ def compute_daily_metrics(ohlcv: "pd.DataFrame",
                         series) — NOT close x CURRENT shares. Falls back to close x ``shares``
                         only if no series is supplied (legacy).
       * float_shares  = ``float_series`` as-of D (ffill from the FMP historical free-float series).
+
+    STALENESS: the market-cap / float ffills are bounded (``mcap_max_age_days`` /
+    ``float_max_age_days``, default ``MCAP_MAX_AGE_DAYS`` / ``FLOAT_MAX_AGE_DAYS``): a value whose
+    source row is older than the limit at bar D is NaN, never carried forward indefinitely.
     """
+    mcap_age = MCAP_MAX_AGE_DAYS if mcap_max_age_days is None else int(mcap_max_age_days)
+    float_age = FLOAT_MAX_AGE_DAYS if float_max_age_days is None else int(float_max_age_days)
     close = ohlcv["Close"].astype(float)
     vol = ohlcv["Volume"].astype(float)
     # RVOL: today's volume / trailing average of the PRIOR rvol_window days (EXCLUDES today via
@@ -476,14 +559,16 @@ def compute_daily_metrics(ohlcv: "pd.DataFrame",
     # Market cap: point-in-time from the historical series (as-of each bar via ffill). Falls back
     # to close x static shares only when no series is available.
     if market_cap_series is not None and len(market_cap_series):
-        mcap = market_cap_series.reindex(close.index, method="ffill")
+        mcap = market_cap_series.reindex(close.index, method="ffill",
+                                         tolerance=pd.Timedelta(days=mcap_age))
     elif shares:
         mcap = close * shares
     else:
         mcap = pd.Series(float("nan"), index=close.index)
     # Free float: point-in-time from the historical series (held as-of via ffill); NaN otherwise.
     if float_series is not None and len(float_series):
-        flt = float_series.reindex(close.index, method="ffill")
+        flt = float_series.reindex(close.index, method="ffill",
+                                   tolerance=pd.Timedelta(days=float_age))
     else:
         flt = pd.Series(float("nan"), index=close.index)
     # Weinstein stage (price vs RISING 150-session/30-week SMA) — vectorised 1:1 with
@@ -551,12 +636,124 @@ def scan_date_grid(start: str, end: str, cadence_days: int) -> "pd.DatetimeIndex
     return pd.date_range(start=start, end=end, freq=f"{int(cadence_days)}D")
 
 
+class MetricStoreStaleInputError(RuntimeError):
+    """The OHLCV cache the build would read is stale for some symbols (pre-build check)."""
+
+
+def ohlcv_last_bars(symbols: "Iterable[str]", ohlcv_get, end: str, max_workers: int = 4
+                    ) -> "Tuple[Dict[str, pd.Timestamp], Dict[str, str]]":
+    """Last cached bar per symbol, exactly as the build will read it (``ohlcv_get(sym, end)``).
+
+    Returns ``(last_bar_by_symbol, unreadable_by_symbol)``: a symbol whose getter returns nothing
+    (or raises) is reported in ``unreadable`` (reason string), never silently skipped."""
+    from concurrent.futures import ThreadPoolExecutor
+    last: Dict[str, "pd.Timestamp"] = {}
+    bad: Dict[str, str] = {}
+
+    def _one(sym: str):
+        try:
+            df = ohlcv_get(sym, end)
+        except Exception as e:  # noqa: BLE001 - recorded, not hidden
+            return sym, None, f"{type(e).__name__}: {e}"
+        if df is None or len(df) == 0:
+            return sym, None, "no OHLCV"
+        return sym, pd.Timestamp(df.index.max()), None
+
+    with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
+        for sym, lb, err in ex.map(_one, list(symbols)):
+            if err is not None:
+                bad[sym] = err
+            else:
+                last[sym] = lb.tz_localize(None) if lb.tzinfo is not None else lb
+    return last, bad
+
+
+def last_bar_distribution(last: "Dict[str, pd.Timestamp]", end: str) -> Dict[str, Any]:
+    """Histogram of how many calendar days before ``end`` each symbol's last cached bar is."""
+    e = pd.Timestamp(end)
+    ages = pd.Series({k: (e - v).days for k, v in last.items()}, dtype="float64")
+    edges = [(-10_000, 3, "<=3d"), (3, 10, "4-10d"), (10, 30, "11-30d"),
+             (30, 90, "31-90d"), (90, 365, "91-365d"), (365, 10 ** 6, ">365d")]
+    out: Dict[str, Any] = {
+        "n_symbols": int(len(ages)),
+        "days_before_end_buckets": {name: int(((ages > lo) & (ages <= hi)).sum())
+                                    for lo, hi, name in edges}}
+    if len(last):
+        ordered = sorted(last.values())
+        out["min_last_bar"] = str(ordered[0].date())
+        out["median_last_bar"] = str(ordered[len(ordered) // 2].date())
+        out["max_last_bar"] = str(ordered[-1].date())
+    return out
+
+
+def find_frozen_runs(df: "pd.DataFrame", min_run: int = FROZEN_RUN_MIN) -> "pd.DataFrame":
+    """Frozen forward-fill detector: per symbol, a row (ordered by date) whose close, volume and
+    relative_volume are ALL identical to the previous scan's, with volume > 0, continues a run; a
+    run of ``min_run`` or more consecutive identical scans is a stale carry-forward, never a market
+    (a 20-day average volume and an RVOL repeating to 4 decimals while the close does not move,
+    three scans running, is impossible for a symbol that trades).
+
+    EXEMPT: rows with ``volume == 0`` or ``relative_volume == 0``. ``relative_volume`` is
+    today's volume over its prior average, so exactly 0 means the bar itself had ZERO volume: a
+    dormant SPAC/unit/warrant legitimately repeats its close and its (sparse-trade) 20-day average
+    for weeks (measured on the 2026-H1 scratch build: BEBE, LPAAU). Such rows are real bars; the
+    7-day row limit and the pre-build last-bar check are what guard them against staleness.
+
+    Returns one row per offending run: symbol, first_date, last_date, n_scans."""
+    cols = ["symbol", "first_date", "last_date", "n_scans"]
+    need = {"symbol", "date", "close", "volume", "relative_volume"}
+    if df is None or df.empty or not need.issubset(df.columns):
+        return pd.DataFrame(columns=cols)
+    d = df[["symbol", "date", "close", "volume", "relative_volume"]].copy()
+    d["symbol"] = d["symbol"].astype(str)
+    d["date"] = d["date"].astype(str)
+    d = d.sort_values(["symbol", "date"], kind="mergesort").reset_index(drop=True)
+    same = ((d["symbol"] == d["symbol"].shift()) & (d["close"] == d["close"].shift())
+            & (d["volume"] == d["volume"].shift())
+            & (d["relative_volume"] == d["relative_volume"].shift())
+            & (d["volume"] > 0) & (d["relative_volume"] > 0))
+    # a row is in a run if it repeats its predecessor OR its successor repeats it; the run id
+    # increments at every row that does not repeat its predecessor.
+    in_run = same | same.shift(-1, fill_value=False)
+    run_id = (~same).cumsum()
+    runs = []
+    for _rid, g in d[in_run].groupby(run_id[in_run]):
+        if len(g) >= int(min_run):
+            runs.append({"symbol": g["symbol"].iloc[0], "first_date": g["date"].iloc[0],
+                         "last_date": g["date"].iloc[-1], "n_scans": int(len(g))})
+    return pd.DataFrame(runs, columns=cols)
+
+
+def _append_build_manifest(store_dir: str, entry: Dict[str, Any]) -> str:
+    """Append one build record to ``<store>/build_manifest.json`` (atomic)."""
+    path = os.path.join(store_dir, "build_manifest.json")
+    doc: Dict[str, Any] = {"builds": []}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+            if not isinstance(doc.get("builds"), list):
+                doc = {"builds": []}
+        except Exception:  # noqa: BLE001 - a corrupt manifest must not block the build
+            doc = {"builds": []}
+    doc["builds"].append(entry)
+    os.makedirs(store_dir, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=1, default=str)
+    os.replace(tmp, path)
+    return path
+
+
 def build_store(store_dir: str, api_key: str, start: str, end: str, *,
                 market_cap_min: float, price_min: float, volume_min: float,
                 ohlcv_get, mcap_get=None, float_get=None, shares_get=None,
                 cadence_days: int = 7, rvol_window: int = 20, drop_days: int = 5,
                 max_lookback: int = 30, max_workers: int = 8, symbol_retries: int = 2,
-                flush_every: int = 250, fail_on_quality: bool = True) -> Dict[str, Any]:
+                flush_every: int = 250, fail_on_quality: bool = True,
+                allow_stale_symbols: "Optional[Iterable[str]]" = None,
+                staleness_max_days: int = STALENESS_MAX_DAYS,
+                prebuild_max_stale_days: int = PREBUILD_MAX_STALE_DAYS) -> Dict[str, Any]:
     """Build/extend the metric store for [start,end] at ``cadence_days`` (default 7 = weekly).
     SKIPS months already present (incremental).
 
@@ -579,6 +776,18 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
     ``fail_on_quality`` (default True): raise ``MetricStoreQualityError`` if any written month has
     a column exceeding its ``_BUILD_MAX_NAN`` tolerance. Written partitions are kept either way --
     the raise reports that they are not TRUSTWORTHY, it does not discard the work.
+
+    STALENESS (never silent):
+      * a scan row is built only if the symbol's latest bar is within ``staleness_max_days``
+        calendar days of the scan date; an older bar is DROPPED, not forward-filled;
+      * PRE-BUILD check: any symbol whose cached last bar is more than ``prebuild_max_stale_days``
+        before ``end`` raises ``MetricStoreStaleInputError`` (nothing is written) listing the
+        symbols, unless named in ``allow_stale_symbols`` (genuinely delisted names only - the
+        opt-in is explicit and the names are recorded in the manifest);
+      * ``fail_on_quality`` also fails on frozen runs (>= ``FROZEN_RUN_MIN`` consecutive scans
+        with identical close+volume+relative_volume, volume > 0);
+      * ``<store>/build_manifest.json`` records the rule, the OHLCV last-bar distribution and the
+        dropped-row counts of every build.
     """
     grid = scan_date_grid(start, end, cadence_days)
     want_months = sorted({d.strftime("%Y-%m") for d in grid})
@@ -590,6 +799,35 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
     universe = enumerate_universe(api_key, market_cap_min, price_min, volume_min)
     static_by_sym = {r["symbol"]: r for r in universe}
 
+    # ---- PRE-BUILD freshness check (before any write) -------------------------------------
+    last_bars, unreadable = ohlcv_last_bars(static_by_sym, ohlcv_get, end,
+                                            max_workers=max(1, int(max_workers)))
+    cutoff = pd.Timestamp(end) - pd.Timedelta(days=int(prebuild_max_stale_days))
+    stale_all = {sym: lb for sym, lb in last_bars.items() if lb < cutoff}
+    allowed = {str(x).strip().upper() for x in (allow_stale_symbols or []) if str(x).strip()}
+    stale_blocking = {k: v for k, v in stale_all.items() if k.upper() not in allowed}
+    stale_allowed = {k: v for k, v in stale_all.items() if k.upper() in allowed}
+    if stale_blocking:
+        worst = sorted(stale_blocking.items(), key=lambda kv: kv[1])
+        raise MetricStoreStaleInputError(
+            f"metric-store build REFUSED: {len(stale_blocking)} symbol(s) have a cached last OHLCV "
+            f"bar more than {int(prebuild_max_stale_days)} days before --end {end} (the cache the "
+            f"build would read is stale; rows would be frozen/forward-filled). Refresh the OHLCV "
+            f"cache for them (fetch-cache --timeframes 1d --end {end}), or, ONLY for genuinely "
+            f"delisted names, opt in explicitly with --allow-stale-symbols. "
+            f"Oldest first (symbol: last bar): "
+            f"{', '.join(f'{k}: {v.date()}' for k, v in worst[:40])}"
+            f"{' ...' if len(worst) > 40 else ''}. Full list: {sorted(stale_blocking)}")
+    if unreadable:
+        logger.warning(f"metric-store: {len(unreadable)} universe symbol(s) have no readable OHLCV "
+                       f"(no rows will be built for them): {sorted(unreadable)[:30]}")
+    import threading as _threading
+    _drop_lock = _threading.Lock()
+    drop_stats: Dict[str, Any] = {"rows_candidate": 0, "rows_kept": 0, "rows_dropped_stale": 0,
+                                  "symbols_with_drops": 0, "dropped_by_month": {}}
+    stale_tol = pd.Timedelta(days=int(staleness_max_days))
+    frozen_found: List["pd.DataFrame"] = []
+
     def _build_one_once(sym: str, srow: Dict[str, Any]):
         df = ohlcv_get(sym, end)
         if df is None or df.empty:
@@ -600,7 +838,25 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
         m = compute_daily_metrics(df, market_cap_series=mcap_s, float_series=flt_s,
                                   shares=shares, rvol_window=rvol_window, drop_days=drop_days,
                                   max_lookback=max_lookback)
-        m = m.reindex(grid_todo, method="ffill")             # value AS-OF each scan date
+        # value AS-OF each scan date, but NEVER carried more than ``staleness_max_days`` past the
+        # symbol's last bar (a stale cache / delisted ticker must not be forward-filled).
+        eligible = grid_todo[grid_todo >= m.index.min()]      # scan dates with any history at all
+        m = m.reindex(grid_todo, method="ffill", tolerance=stale_tol)
+        kept_dates = set(grid_todo[m["close"].notna().to_numpy()])
+        n_drop_by_month: Dict[str, int] = {}
+        for d in eligible:
+            if d not in kept_dates:
+                k = d.strftime("%Y-%m")
+                n_drop_by_month[k] = n_drop_by_month.get(k, 0) + 1
+        n_drop = sum(n_drop_by_month.values())
+        with _drop_lock:
+            drop_stats["rows_candidate"] += int(len(eligible))
+            drop_stats["rows_kept"] += int(len(eligible) - n_drop)
+            drop_stats["rows_dropped_stale"] += int(n_drop)
+            if n_drop:
+                drop_stats["symbols_with_drops"] += 1
+            for k, v in n_drop_by_month.items():
+                drop_stats["dropped_by_month"][k] = drop_stats["dropped_by_month"].get(k, 0) + v
         m = m.dropna(subset=["close"]).reset_index().rename(columns={"index": "date"})
         m["date"] = m["date"].astype(str).str.slice(0, 10)
         if m.empty:
@@ -666,6 +922,9 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
     with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
         for res in ex.map(lambda kv: _build_one(kv[0], kv[1]), items):
             if res is not None and not res.empty:
+                _fr = find_frozen_runs(res)
+                if not _fr.empty:
+                    frozen_found.append(_fr)
                 frames.append(res)
                 if fe > 0 and len(frames) >= fe:
                     _record_quality(pd.concat(frames, ignore_index=True))
@@ -674,9 +933,44 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
         _record_quality(pd.concat(frames, ignore_index=True))
     _flush()  # final remainder
 
+    frozen_runs = (pd.concat(frozen_found, ignore_index=True) if frozen_found
+                   else pd.DataFrame(columns=["symbol", "first_date", "last_date", "n_scans"]))
+    if not frozen_runs.empty:
+        quality["__frozen_runs__"] = {
+            "n_runs": int(len(frozen_runs)), "n_symbols": int(frozen_runs["symbol"].nunique()),
+            "examples": frozen_runs.head(10).to_dict("records")}
     summary = {"symbols": len(static_by_sym), "months_written": len(todo_months),
                "months_skipped": len(set(have) & set(want_months)),
-               "cadence_days": cadence_days, "quality_failures": quality}
+               "cadence_days": cadence_days, "quality_failures": quality,
+               "rows_dropped_stale": drop_stats["rows_dropped_stale"],
+               "stale_symbols_allowed": sorted(stale_allowed),
+               "symbols_without_ohlcv": len(unreadable)}
+    try:
+        manifest_path = _append_build_manifest(store_dir, {
+            "built_at": datetime.now().isoformat(timespec="seconds"),
+            "start": start, "end": end, "cadence_days": cadence_days,
+            "months_written": todo_months,
+            "staleness_rule": {
+                "ohlcv_row_max_age_days": int(staleness_max_days),
+                "market_cap_max_age_days": MCAP_MAX_AGE_DAYS,
+                "float_max_age_days": FLOAT_MAX_AGE_DAYS,
+                "prebuild_max_stale_days": int(prebuild_max_stale_days),
+                "frozen_run_min_scans": FROZEN_RUN_MIN,
+                "semantics": "scan row dropped when the symbol's latest bar is older than "
+                             "ohlcv_row_max_age_days; market_cap/float NaN when older than their "
+                             "max age at the bar"},
+            "ohlcv_last_bar_distribution": last_bar_distribution(last_bars, end),
+            "symbols_with_cached_ohlcv": len(last_bars),
+            "symbols_without_ohlcv": {k: v for k, v in sorted(unreadable.items())},
+            "stale_symbols_allowed": {k: str(v.date()) for k, v in sorted(stale_allowed.items())},
+            "dropped_rows": drop_stats,
+            "frozen_runs": int(len(frozen_runs)),
+            "quality_failures": quality,
+        })
+        summary["manifest"] = manifest_path
+    except Exception as e:  # noqa: BLE001 - a manifest write failure must be visible, not fatal
+        logger.error(f"metric-store: could not write build manifest: {e}", exc_info=True)
+        summary["manifest_error"] = str(e)
     if quality and fail_on_quality:
         # FAIL LOUD. A partition that exists but whose columns are mostly NaN is worse than a
         # missing one: every downstream check ("month coverage continuous", "all partitions
@@ -690,6 +984,8 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
             f"metric-store build wrote {len(quality)} month(s) failing column-quality thresholds "
             f"{_BUILD_MAX_NAN} -- partitions are on disk but NOT trustworthy. "
             f"First failures: {worst}. "
+            f"A '__frozen_runs__' / 'frozen_runs' entry means rows were forward-filled from a "
+            f"stale last bar (>= {FROZEN_RUN_MIN} identical consecutive scans). "
             f"A high NaN rate on warmup-dependent columns (weinstein_stage/atr_14/momentum_12_1) "
             f"usually means the underlying OHLCV cache lacks history BEFORE the build's start "
             f"date -- re-fetch 1d bars with an earlier --start, then rebuild. "
@@ -762,6 +1058,11 @@ def check_frame_quality(df: "pd.DataFrame", thresholds: Optional[Dict[str, float
         rate = float(df[col].isna().mean())
         if rate > limit:
             bad[col] = round(rate, 4)
+    # Frozen forward-fill: ZERO tolerance for runs of >= FROZEN_RUN_MIN consecutive scans of one
+    # symbol with identical close+volume+relative_volume (volume > 0). Value = rows in such runs.
+    runs = find_frozen_runs(df)
+    if not runs.empty:
+        bad["frozen_runs"] = float(runs["n_scans"].sum())
     return bad
 
 

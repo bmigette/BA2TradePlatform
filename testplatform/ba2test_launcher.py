@@ -583,7 +583,8 @@ def _cmd_build_screener_metrics(args) -> int:
         ohlcv_get=_ohlcv, mcap_get=_mcap, float_get=_float, shares_get=_shares,
         cadence_days=args.cadence_days, drop_days=args.drop_days,
         max_lookback=getattr(args, "max_lookback", 30) or 30,
-        max_workers=getattr(args, "workers", 8) or 8)
+        max_workers=getattr(args, "workers", 8) or 8,
+        allow_stale_symbols=_parse_symbols_arg(getattr(args, "allow_stale_symbols", None) or ""))
     print(f"build-screener-metrics: {summary}")
     return 0
 
@@ -8306,6 +8307,11 @@ def main(argv: "list | None" = None) -> int:
     bm.add_argument("--workers", type=int, default=8,
                     help="Parallel per-symbol fetch threads (default 8). Historical market-cap + "
                          "float fetches are disk-cached, so re-builds are fast regardless.")
+    bm.add_argument("--allow-stale-symbols", default=None, metavar="SYM[,SYM...]|@FILE",
+                    help="EXPLICIT opt-in for symbols whose cached last OHLCV bar is >10 days before "
+                         "--end (the build otherwise REFUSES, listing them). Only for genuinely "
+                         "delisted names; they are recorded in <store>/build_manifest.json and "
+                         "their rows still stop 7 days after the last bar.")
 
     rs = sub.add_parser("recompute-screener-drops",
                         help="CACHE-ONLY rebuild of an existing store's price-drop columns (no FMP).")
