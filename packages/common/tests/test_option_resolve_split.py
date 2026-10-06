@@ -36,6 +36,7 @@ class _Acct:
     """Minimal options account double: serves a chain, a price, a balance, records submits."""
 
     def __init__(self, chain):
+        self.id = 1     # a debit entry now reads the account's open book (its capital headroom)
         self._chain = chain
         self.submitted = []
 
