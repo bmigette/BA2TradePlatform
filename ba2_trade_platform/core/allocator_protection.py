@@ -587,6 +587,8 @@ class SliceObservation:
     fill_price: Optional[float] = None
     remaining_live_qty: float = 0.0
     detail: str = ""
+    #: Shares sold by the take-profit member alone (``filled_qty`` is the SUM over both members).
+    tp_filled_qty: float = 0.0
     tp_order_id: Optional[int] = None
     sl_order_id: Optional[int] = None
     gtc_date: Optional[Date] = None
@@ -649,23 +651,30 @@ def classify_complex_order(placed: Any, *, slice_quantity: float,
                                 **base)
 
     statuses = [_status_text(o) for o in members]
-    best = None
+    best, total, tp_total = None, 0.0, 0.0
     for order in members:
         qty, price = _member_fills(order)
-        if (qty > 0 or _status_text(order) == "Filled") and (best is None or qty > best[1]):
-            best = (order, qty, price)
+        if qty > 0 or _status_text(order) == "Filled":
+            total += qty
+            if _member_kind(order) == KIND_TP:
+                tp_total += qty
+            if best is None or qty > best[1]:
+                best = (order, qty, price)
     if best is not None:
-        order, qty, price = best
+        # BOTH members can fill (a take-profit part-fills, then the stop sells the rest): the slice records
+        # their SUM; the largest member names the fill and prices it.
+        order, _, price = best
+        qty = total
         kind = _member_kind(order)
         if kind is None:
             return SliceObservation(state=SLICE_UNKNOWN, filled_qty=qty, fill_price=price,
                                     detail=f"a member filled but its type {_type_text(order)!r} "
                                            f"is neither a limit nor a stop", **base)
-        member_live = _status_text(order) in _LIVE_STATUSES or _status_text(order) == _CANCEL_REQUESTED
-        remaining = max(0.0, float(slice_quantity) - qty) if member_live else 0.0
+        any_live = any(_status_text(o) in _LIVE_STATUSES or _status_text(o) == _CANCEL_REQUESTED for o in members)
+        remaining = max(0.0, float(slice_quantity) - qty) if any_live else 0.0
         return SliceObservation(
             state=SLICE_FILLED_TP if kind == KIND_TP else SLICE_FILLED_SL, kind=kind,
-            filled_qty=qty, fill_price=price, remaining_live_qty=remaining,
+            filled_qty=qty, fill_price=price, remaining_live_qty=remaining, tp_filled_qty=tp_total,
             detail=("partially filled, remainder still resting" if remaining > 0
                     else "filled"), **base)
 

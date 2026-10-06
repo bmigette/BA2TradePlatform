@@ -42,7 +42,8 @@ def broker():
 
 
 @pytest.fixture
-def acct(broker):
+def acct(broker, monkeypatch):
+    monkeypatch.setattr(aps, "SHRINK_CONFIRM_SECONDS", 0)
     with patch_equity(broker):
         yield make_account(broker)
 

@@ -492,10 +492,14 @@ def _on_protective_fill(account, p: AllocatorProtection, s: AllocatorProtectionO
         many = len({c.label for c in pins}) > 1
         note += "; pinned " + ", ".join(f"{c.symbol} {c.after_pct:g}%" + (f" ({c.label})" if many else "")
                                         for c in pins)
-    s.weight_applied_qty = float(s.weight_applied_qty) + newly
+    # Shares the TAKE-PROFIT member newly sold (a stop fill after a take-profit part-fill is not credited to
+    # the target): the slice's earlier applied quantity is taken to be the take-profit's own.
+    applied_before = float(s.weight_applied_qty)
+    tp_new = max(0.0, float(obs.tp_filled_qty) - min(applied_before, float(obs.tp_filled_qty)))
+    s.weight_applied_qty = applied_before + newly
     _save(s)
-    if obs.kind == KIND_TP and s.kind == ORDER_KIND_OCO:
-        p = _mark_target_filled(p, s, obs, newly)
+    if tp_new > 0 and s.kind == ORDER_KIND_OCO:
+        p = _mark_target_filled(p, s, obs, tp_new)
     _record_protective_sale(p.account_id, p.symbol, newly, obs.fill_price,
                             s.external_tag or f"ba2prot:{p.id}:{s.slice_index}")
     p.last_fill_at = _now()
@@ -834,6 +838,9 @@ class PlaceResult:
     shares_covered: int = 0
     errors: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    #: Refused by the pre-placement validation (the PRICE moved through the stop or a target, or the position
+    #: is not protectable): nothing was sent, and restoring the old prices would be wrong.
+    refused_by_validation: bool = False
 
     @property
     def ok(self) -> bool:
@@ -892,6 +899,7 @@ def _place_slices(account, p: AllocatorProtection, stop_only: bool = False) -> T
                                  position_quantity=float(to_cover), tick_sizes=ticks)
     if errors:
         result.errors.extend(errors)
+        result.refused_by_validation = True
         p.last_error = " ".join(errors)
         _save(p)
         return _alert(p, CODE_PLACEMENT_REFUSED,
@@ -1006,13 +1014,21 @@ def _place_slices(account, p: AllocatorProtection, stop_only: bool = False) -> T
             if not 0 <= idx < len(raw):
                 continue
             t = raw[idx]
-            taken_before = target_taken(t)
-            if t.get("planned") is None:
-                t["planned"] = q / (1.0 - taken_before) if taken_before < 1.0 - 1e-9 else float(q)
-                if taken_before > 0:
-                    t["sold"] = taken_before * t["planned"]
-            elif covered > 0:
-                t["planned"] = float(t["planned"]) + q
+            if covered > 0 and t.get("planned") is not None:
+                t["planned"] = float(t["planned"]) + q              # a growth lot adds to what was planned
+            else:
+                # A FULL (re-)placement: what is planned now is what has been sold plus what is placed.
+                sold = t.get("sold")
+                if sold is None:
+                    before = target_taken(t)
+                    if 0 < before < 1.0 - 1e-9:                     # a row stored before share counting
+                        t["planned"] = q / (1.0 - before)
+                        t["sold"] = before * t["planned"]
+                    else:
+                        t["planned"] = float(q)
+                else:
+                    t["planned"] = float(sold) + q
+                    t["taken"] = min(1.0, float(sold) / t["planned"])
         p.tp_targets = raw
         p = _save(p)
     if result.errors:
@@ -1431,7 +1447,8 @@ def replace_protection(account, symbol: str) -> ActionResult:
             _save(p)
             return ActionResult(True, f"{symbol}: {placed.placed} protective order(s) placed.",
                                 notes=placed.notes)
-        p = _rollback_if_uncovered(account, p, cancel_since, "the re-placement")
+        if not placed.refused_by_validation:
+            p = _rollback_if_uncovered(account, p, cancel_since, "the re-placement")
         return ActionResult(False, f"{symbol}: protection was NOT fully placed (the previous orders were "
                                    f"restored where possible).", errors=placed.errors, notes=placed.notes)
 
@@ -1566,36 +1583,60 @@ def _note_auto_result(p: AllocatorProtection, ok: bool, what: str) -> AllocatorP
 RESTORED_MARK = "(restored)"
 
 
+def _snapshot_qty(x: AllocatorProtectionOrder) -> int:
+    """Shares a cancelled slice still had to sell: all of it, or what a part-filled one had left."""
+    if x.state in _FILLED_STATES:
+        return max(0, int(round(float(x.quantity) - float(x.filled_qty))))
+    return int(x.quantity)
+
+
 def _cancelled_snapshot(p: AllocatorProtection, since: DateTime) -> List[AllocatorProtectionOrder]:
-    """The slices WE cancelled at or after ``since`` and have not restored: the previous plan."""
+    """The slices WE cancelled at or after ``since`` and have not restored: the previous plan. A part-filled
+    slice whose remainder we cancelled counts with its unfilled rest."""
     out = []
     for x in get_slices(p.id):
         closed = _naive(x.closed_at)
-        if x.state == SLICE_CANCELLED_BY_US and closed is not None and closed >= since \
-                and RESTORED_MARK not in (x.detail or ""):
+        if closed is None or closed < since or RESTORED_MARK in (x.detail or ""):
+            continue
+        cancelled = x.state == SLICE_CANCELLED_BY_US or (
+            x.state in _FILLED_STATES and x.cancel_requested and _snapshot_qty(x) > 0)
+        if cancelled:
             out.append(x)
     return sorted(out, key=lambda x: x.slice_index)
 
 
-def _restore_previous(account, p: AllocatorProtection, snapshot, left: int) -> bool:
-    """Place the PREVIOUS orders again (same prices), capped to ``left`` uncovered whole shares. True when
-    every share asked for is covered again. Rows are written like any placement; a failure is recorded."""
+def _restore_previous(account, p: AllocatorProtection, snapshot, left: int, last: float,
+                      alarm_open: bool) -> bool:
+    """Place the PREVIOUS orders again, capped to ``left`` uncovered whole shares and VALIDATED against the
+    market now: a take-profit at or below the price (or any take-profit while a LOST alarm is open) comes back
+    as a plain stop; a stop at or above the price is skipped. True when every share asked for is covered."""
     ok = True
     existing = len(get_slices(p.id))
     for n, old in enumerate(snapshot):
         if left <= 0:
             break
-        q = min(int(old.quantity), left)
+        q = min(_snapshot_qty(old), left)
+        if q < 1:
+            continue
+        if float(old.sl_price) >= last:
+            _log(p.account_id, ActivityLogSeverity.FAILURE,
+                 f"{p.symbol}: the previous stop {float(old.sl_price):g} is at or above the market ({last:g}); "
+                 f"{q} sh were NOT restored", code="ROLLBACK_SKIPPED", symbol=p.symbol)
+            ok = False
+            continue
+        kind, tp, target = old.kind, old.tp_price, old.target_index
+        if kind == ORDER_KIND_OCO and (alarm_open or tp is None or float(tp) <= last):
+            kind, tp, target = ORDER_KIND_STOP, None, -1
         tag = f"ba2prot:{p.id}:{existing + n}:{uuid.uuid4().hex[:8]}"
         row = _save(AllocatorProtectionOrder(
-            protection_id=p.id, slice_index=existing + n, target_index=old.target_index, kind=old.kind,
-            quantity=q, tp_price=old.tp_price, sl_price=old.sl_price, external_tag=tag,
+            protection_id=p.id, slice_index=existing + n, target_index=target, kind=kind,
+            quantity=q, tp_price=tp, sl_price=old.sl_price, external_tag=tag,
             state=SLICE_PLACING, placed_at=_now()))
         try:
-            if old.kind == ORDER_KIND_STOP:
+            if kind == ORDER_KIND_STOP:
                 placed = account.place_protective_stop(symbol=p.symbol, quantity=q, sl_price=old.sl_price, tag=tag)
             else:
-                placed = account.place_protective_oco(symbol=p.symbol, quantity=q, tp_price=old.tp_price,
+                placed = account.place_protective_oco(symbol=p.symbol, quantity=q, tp_price=tp,
                                                       sl_price=old.sl_price, tag=tag)
         except PlacementOutcomeUnknown as e:
             row.state = SLICE_UNKNOWN
@@ -1609,7 +1650,7 @@ def _restore_previous(account, p: AllocatorProtection, snapshot, left: int) -> b
             logger.error(f"allocator TP/SL: rollback placement for {p.symbol} failed: {e}")
             ok = False
             continue
-        if old.kind == ORDER_KIND_STOP:
+        if kind == ORDER_KIND_STOP:
             row.sl_order_id = placed.order_id
             row.sl_price = placed.sl_price
         else:
@@ -1631,7 +1672,8 @@ def _restore_previous(account, p: AllocatorProtection, snapshot, left: int) -> b
 
 def _rollback_if_uncovered(account, p: AllocatorProtection, since: DateTime, why: str) -> AllocatorProtection:
     """A re-placement failed AFTER the confirmed cancel: put the PREVIOUS orders back (capped to the shares
-    held), loudly. If even that fails the position is UNPROTECTED: an activity-log FAILURE and an alert."""
+    held, validated against the market now), loudly, and say how many shares are protected. If nothing could
+    be restored the position is UNPROTECTED: an activity-log FAILURE and an alert."""
     p = _reload(p.id)
     if any(x.state == SLICE_UNKNOWN and x.closed_at is None for x in get_slices(p.id)):
         return p                                   # an order may exist: never place a second one on a guess
@@ -1640,14 +1682,22 @@ def _rollback_if_uncovered(account, p: AllocatorProtection, since: DateTime, why
         return p
     try:
         qty, is_long = _read_position(account, p.symbol)
+        last = _read_price(account, p.symbol)
     except BrokerReadError as e:
-        _log(p.account_id, ActivityLogSeverity.FAILURE, f"{p.symbol}: {why}; the position could not be read for "
-             f"the rollback ({e}): UNPROTECTED", code="ROLLBACK_FAILED", symbol=p.symbol)
+        _log(p.account_id, ActivityLogSeverity.FAILURE, f"{p.symbol}: {why}; the position or price could not be "
+             f"read for the rollback ({e}): NOT restored", code="ROLLBACK_FAILED", symbol=p.symbol)
         return p
-    left = whole_shares(qty) - int(round(covered_quantity(get_slices(p.id))))
+    whole = whole_shares(qty)
+    left = whole - int(round(covered_quantity(get_slices(p.id))))
     if not is_long or left < 1:
         return p
-    ok = _restore_previous(account, p, snapshot, left)
+    # A LOST order from BEFORE this attempt (the operator cancelled it): never brought back as a take-profit.
+    # This attempt's own refused rows are not that.
+    cut = min((_naive(x.closed_at) for x in snapshot), default=since)     # the moment WE cancelled
+    alarm_open = any(x.state in SLICE_ALARM_STATES and x.state != SLICE_UNKNOWN and x.closed_at is None
+                     and (_naive(x.placed_at) or cut) < cut for x in get_slices(p.id))
+    refused_text = p.alert_message or ""
+    ok = _restore_previous(account, p, snapshot, left, last, alarm_open)
     for x in (get_slices(p.id) if ok else []):     # a restored plan: this attempt's refused rows are history
         placed_at = _naive(x.placed_at)
         if x.state == SLICE_LOST_REJECTED and x.closed_at is None and placed_at is not None and placed_at >= since:
@@ -1655,39 +1705,53 @@ def _rollback_if_uncovered(account, p: AllocatorProtection, since: DateTime, why
             x.detail = f"{x.detail or ''} (refused; rolled back)".strip()
             _save(x)
     p = _reload(p.id)
+    refused_text = refused_text or (p.last_error or "")
+    covered = int(round(covered_quantity(get_slices(p.id))))
+    counts = f"{covered} of {whole} shares protected" + (f", {whole - covered} UNPROTECTED" if covered < whole else "")
     if ok:
         _log(p.account_id, ActivityLogSeverity.WARNING,
-             f"{p.symbol}: {why}: the new orders were refused, so the PREVIOUS protective orders were restored",
-             code="ROLLBACK", symbol=p.symbol)
+             f"{p.symbol}: {why}: the new orders were refused, so the PREVIOUS protective orders were restored "
+             f"({counts})", code="ROLLBACK", symbol=p.symbol)
         return _alert(p, CODE_REPLACE_FAILED, f"{why}: the new orders were refused (see the log); the previous "
-                      f"protective orders were restored. Nothing changed at the broker.")
+                      f"protective orders were restored: {counts}. Refused: {refused_text}")
     _log(p.account_id, ActivityLogSeverity.FAILURE,
-         f"{p.symbol}: {why}: the new orders were refused AND the previous orders could not be restored: the "
-         f"position is UNPROTECTED", code="ROLLBACK_FAILED", symbol=p.symbol)
+         f"{p.symbol}: {why}: the new orders were refused and the previous orders could not be fully restored "
+         f"({counts})", code="ROLLBACK_FAILED", symbol=p.symbol)
     return _alert(p, CODE_REPLACE_FAILED, f"{why}: the new orders were refused and the previous orders could not "
-                  f"be restored: the position is UNPROTECTED. Set TP/SL again or free buying power.")
+                  f"be fully restored: {counts}. Set TP/SL again or free buying power. Refused: {refused_text}")
 
 
 def _preflight_bp(account, p: AllocatorProtection, shares: int, last: float, ticks) -> List[str]:
-    """Would the broker afford the new stop AFTER the old orders are cancelled? (A11) Estimated from ONE dry
-    run of a shallow stop (it yields the broker's own reference price p0): need = shares x (p0 - stop) against
-    the buying power available now PLUS what the orders about to be cancelled reserve. Empty when it fits or
-    when nothing can be estimated (the rollback then covers a refusal)."""
+    """Would the broker afford the new stop AFTER the old orders are cancelled? (A11)
+
+    1. Dry-run the REAL stop at the real quantity. Accepted (even with the old orders still reserving buying
+       power) means it fits for certain: no error. A non-margin refusal is not a buying-power question.
+    2. Refused for margin: estimate with a shallow reference stop (it yields the broker's own p0):
+       need = shares x (p0 - stop) against the buying power available now PLUS what the orders about to be
+       cancelled reserve. A reference change of 0 or None is not an estimate; a need of 0 or less never blocks.
+    Empty when it fits or nothing can be estimated (the rollback then covers a refusal)."""
     dry = getattr(account, "dry_run_protective", None)
     if dry is None:
         return []
     try:
         available = account.get_account_snapshot().buying_power
+        if available is None:
+            return []
+        real = dry(p.symbol, shares, sl_price=float(p.sl_price))
+        if real.ok or not real.margin_failed:
+            return []
         tick = tick_for_price(last, ticks)
         ref = round_price_to_tick(last * 0.9, tick, "down")
         verdict = dry(p.symbol, 1, sl_price=ref)
     except Exception as e:  # noqa: BLE001 -- an estimate that cannot be made blocks nothing
         logger.warning(f"allocator TP/SL: buying-power pre-check for {p.symbol} unavailable: {e}", exc_info=True)
         return []
-    if available is None or not verdict.ok or verdict.bp_change is None:
+    if not verdict.ok or not verdict.bp_change:
         return []
     p0 = ref - float(verdict.bp_change)
-    need = max(0.0, shares * (p0 - float(p.sl_price)))
+    need = shares * (p0 - float(p.sl_price))
+    if need <= 0:
+        return []
     reserved = sum(max(0.0, _remaining_qty(x) * (p0 - float(x.sl_price)))
                    for x in get_slices(p.id) if _is_resting(x))
     if need <= float(available) + reserved + 1e-9:
@@ -1752,7 +1816,7 @@ def _resize_now(account, p: AllocatorProtection, reason: str) -> Tuple[Allocator
              code="AUTO_RESIZE_FAILED", symbol=p.symbol, reason=reason)
         return p, False
     p, placed = _place_slices(account, p)
-    if not placed.ok:
+    if not placed.ok and not placed.refused_by_validation:
         p = _rollback_if_uncovered(account, p, cancel_since, f"the {reason}")
     p = _reload(p.id)
     p.pending_replace = False
@@ -1781,11 +1845,28 @@ class ReconcileReport:
 
 #: ``(account id, symbol) -> whole shares`` seen the LAST refresh while the orders covered more than was held.
 #: A shrink is acted on only when the SAME smaller position shows on two consecutive refreshes.
-_SHRINK_SEEN: Dict[Tuple[int, str], int] = {}
+_SHRINK_SEEN: Dict[Tuple[int, str], Tuple[int, DateTime]] = {}
+#: Keys the CURRENT reconcile call reached the shrink rule for; a call that returned earlier (pending, an alarm,
+#: a fill settling, no whole share) clears its key, so the two sightings are strictly consecutive.
+_SHRINK_TOUCHED: Set[Tuple[int, str]] = set()
+#: The second sighting must be at least this long after the first (about one refresh interval): a refresh and
+#: 'Check and repair' landing seconds apart are one observation, not two.
+SHRINK_CONFIRM_SECONDS = 60
 
 
 def _reconcile_one(account, p: AllocatorProtection, report: ReconcileReport,
                    position: Optional[Tuple[float, bool]], may_place: bool = False) -> None:
+    key = (account.id, p.symbol)
+    _SHRINK_TOUCHED.discard(key)
+    try:
+        _reconcile_one_inner(account, p, report, position, may_place)
+    finally:
+        if key not in _SHRINK_TOUCHED:
+            _SHRINK_SEEN.pop(key, None)
+
+
+def _reconcile_one_inner(account, p: AllocatorProtection, report: ReconcileReport,
+                         position: Optional[Tuple[float, bool]], may_place: bool = False) -> None:
     """Reconcile one protection with the broker.
 
     ``may_place`` True lets it act on its own (growth, shrink resize, disarm); ``prepare_for_trade``
@@ -1925,8 +2006,12 @@ def _reconcile_one(account, p: AllocatorProtection, report: ReconcileReport,
         if not may_place or working:
             return
         key = (account.id, p.symbol)
-        if _SHRINK_SEEN.get(key) != n_whole:
-            _SHRINK_SEEN[key] = n_whole        # first sighting (could be one stale read): wait for a second
+        _SHRINK_TOUCHED.add(key)
+        seen = _SHRINK_SEEN.get(key)
+        if seen is None or seen[0] != n_whole:
+            _SHRINK_SEEN[key] = (n_whole, _now())   # first sighting (could be one stale read): wait for a second
+            return
+        if (_now() - seen[1]).total_seconds() < SHRINK_CONFIRM_SECONDS:
             return
         if not _auto_allowed(p) or not _interval_ok(p):
             if not _auto_allowed(p):
@@ -2164,6 +2249,12 @@ def prepare_for_trade(account, symbols: Iterable[str]) -> PrepareResult:
             p = get_protection(account.id, symbol)
             if p is None:
                 continue
+            if p.enabled and not _auto_allowed(p):
+                # The automatic paths are stopped: cancelling here could not be undone by an automatic
+                # re-placement. Leave the orders alone and keep the symbol out of this run.
+                result.blocked[symbol] = ("its TP/SL automatic paths are stopped (an alert is open); its "
+                                          "protective orders were left untouched. Re-run after fixing the alert")
+                continue
             fills_before = p.last_fill_at
             if any(_blocks(x) for x in get_slices(p.id)):
                 _reconcile_one(account, p, ReconcileReport(), None, may_place=False)
@@ -2267,9 +2358,12 @@ def resume_protection(account, symbols: Iterable[str], *,
                     p.pending_replace_since = None
                     p.expected_qty = None
                     _save(p)
-                    _alert(p, CODE_AUTO_STOPPED, f"{symbol}: the automatic paths are stopped, so protection was "
-                           f"NOT re-placed after the trade; the position has no protective orders. Use Resize "
-                           f"protection.")
+                    # Nothing is RE-PLANNED, but the orders the sale cancelled are put back (capped to the shares
+                    # held and validated against the market) so the position is not left bare.
+                    p = _rollback_if_uncovered(account, p, cancel_since, "the automatic paths are stopped")
+                    _alert(_reload(p.id), CODE_AUTO_STOPPED,
+                           f"{symbol}: the automatic paths are stopped, so protection was not re-planned after "
+                           f"the trade; the previous orders were put back where possible. Use Resize protection.")
                     continue
                 alarm_open = any(x.state in SLICE_ALARM_STATES and x.state != SLICE_UNKNOWN and x.closed_at is None
                                  for x in get_slices(p.id))
@@ -2281,7 +2375,7 @@ def resume_protection(account, symbols: Iterable[str], *,
                          f"re-placed after the trade (no take-profit); use Resize protection to re-place the rest",
                          code="STOP_ONLY_COVER", symbol=symbol)
                 p, placed = _place_slices(account, p, stop_only=alarm_open)
-                if not placed.ok:
+                if not placed.ok and not placed.refused_by_validation:
                     p = _rollback_if_uncovered(account, p, cancel_since, "the re-placement after the trade")
                 p = _reload(p.id)
                 p.pending_replace = False
@@ -2293,9 +2387,15 @@ def resume_protection(account, symbols: Iterable[str], *,
                 if placed.ok:
                     resumed.append(symbol)
                 else:
-                    _alert(p, CODE_REPLACE_FAILED,
-                           "protection was NOT re-placed after the trade: "
-                           + " | ".join(placed.errors))
+                    now_p = _reload(p.id)
+                    if now_p.alert_code == CODE_REPLACE_FAILED and "restored" in (now_p.alert_message or ""):
+                        pass                       # the rollback already said, truthfully, what is protected
+                    else:
+                        whole = whole_shares(qty)
+                        covered = int(round(covered_quantity(get_slices(p.id))))
+                        _alert(p, CODE_REPLACE_FAILED,
+                               f"protection was NOT fully re-placed after the trade ({covered} of {whole} "
+                               f"shares protected): " + " | ".join(placed.errors))
     except Exception as e:  # noqa: BLE001 -- never raises into the allocator run
         logger.error(f"allocator TP/SL: resume failed: {e}", exc_info=True)
         _log(account.id, ActivityLogSeverity.FAILURE,

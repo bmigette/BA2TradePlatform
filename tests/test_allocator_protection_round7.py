@@ -26,10 +26,9 @@ def broker():
 @pytest.fixture
 def acct(broker, monkeypatch):
     monkeypatch.setattr(aps, "FILL_SETTLE_SECONDS", 0)
+    monkeypatch.setattr(aps, "SHRINK_CONFIRM_SECONDS", 0)
     with patch_equity(broker):
         a = make_account(broker)
-        a.get_account_snapshot = lambda: SimpleNamespace(
-            buying_power=float(broker.available_bp) - float(broker._reserved_bp()))
         yield a
 
 
@@ -131,18 +130,18 @@ def test_f2_a_platform_sale_does_not_bring_back_a_site_cancelled_order(acct, bro
     assert _live_oco(broker) == [] and _stops(broker) == [(90, 45.0)]
 
 
-def test_f2_when_the_automatic_paths_are_stopped_resume_places_nothing(acct, broker):
+def test_f2_when_the_automatic_paths_are_stopped_resume_only_restores_never_replans(acct, broker):
     broker.positions["ABC"] = Decimal(100)
     broker.prices["ABC"] = 50.0
     broker.bp_p0 = None
-    assert aps.save_protection(acct, "ABC", 45.0, []).ok
+    assert aps.save_protection(acct, "ABC", 45.0, [T(60.0, 0.5)]).ok
     aps.prepare_for_trade(acct, ["ABC"])
     p = aps.get_protection(1, "ABC")
     p.auto_failures = aps.AUTO_FAILURE_LIMIT
+    p.sl_price = 40.0                                                         # a changed template is NOT applied
     aps._save(p)
-    placed = broker.single_place_count()
     aps.resume_protection(acct, ["ABC"], working_symbols=set())
-    assert broker.single_place_count() == placed
+    assert _stops(broker) and all(sl == 45.0 for _, sl in _stops(broker))      # the previous orders came back
     assert aps.get_protection(1, "ABC").alert_code == ap.CODE_AUTO_STOPPED
 
 

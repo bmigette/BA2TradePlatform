@@ -1617,6 +1617,26 @@ class TastyTradeAccount(AccountInterface):
             return ProtectiveDryRun(False, change, text, is_margin_refusal(text))
         return ProtectiveDryRun(True, change, "")
 
+    def _check_protective_vs_market(self, symbol: str, sl_price: float, tp_price=None) -> None:
+        """Last line of defence: a stop at or above the market SELLS at once, a target at or below it fills at
+        once. Reads a FRESH price; an unreadable price refuses (never assumed)."""
+        from ...core.allocator_protection import ProtectionRefused
+        try:
+            fetched = self.get_instrument_current_price([symbol], price_type="mark")
+            last = fetched.get(symbol) if isinstance(fetched, dict) else fetched
+        except Exception as e:  # noqa: BLE001 -- refused, with the reason
+            raise ProtectionRefused(f"[Account {self.id}] {symbol}: the current price could not be read ({e}); "
+                                    f"protective orders are not placed blind") from e
+        if last is None or float(last) <= 0:
+            raise ProtectionRefused(f"[Account {self.id}] {symbol}: no current price; protective orders are "
+                                    f"not placed blind")
+        if float(sl_price) >= float(last):
+            raise ProtectionRefused(f"[Account {self.id}] {symbol}: the stop {sl_price:g} is at or above the "
+                                    f"market ({float(last):g}) and would sell at once")
+        if tp_price is not None and float(tp_price) <= float(last):
+            raise ProtectionRefused(f"[Account {self.id}] {symbol}: the take-profit {tp_price:g} is at or below "
+                                    f"the market ({float(last):g}) and would fill at once")
+
     def place_protective_oco(self, symbol: str, quantity: int, tp_price: float,
                              sl_price: float, tag: str) -> "ProtectiveOcoResult":
         """Place ONE GTC OCO: sell ``quantity`` whole shares at a limit ``tp_price`` OR as a
@@ -1658,6 +1678,7 @@ class TastyTradeAccount(AccountInterface):
             raise ProtectionRefused(
                 f"[Account {self.id}] {symbol}: need 0 < stop ({sl_price}) < take-profit ({tp_price})")
         qty = qty.quantize(Decimal(1))
+        self._check_protective_vs_market(symbol, sl_price, tp_price)
 
         try:
             equity = self._run_async(Equity.get(self._session, symbol))
@@ -1870,6 +1891,7 @@ class TastyTradeAccount(AccountInterface):
         if not sl_price > 0:
             raise ProtectionRefused(f"[Account {self.id}] {symbol}: the stop ({sl_price}) must be > 0")
         qty = qty.quantize(Decimal(1))
+        self._check_protective_vs_market(symbol, sl_price)
 
         try:
             equity = self._run_async(Equity.get(self._session, symbol))

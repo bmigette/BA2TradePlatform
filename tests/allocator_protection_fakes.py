@@ -118,6 +118,7 @@ class FakeTastyBroker:
         self.single_fill_on_delete = False
         self.positions_fail = False
         self.history_fails = False
+        self.bp_report_zero = False   # the dry run reports a buying-power change of 0
         self.bp_p0 = None          # when set, a stop's BP effect is q x (stop - p0)
         self.available_bp = 0.0    # the account's buying power for that model
         self.history_ignores_sort = False   # a server that ignores sort='Desc' (lists oldest first)
@@ -147,12 +148,16 @@ class FakeTastyBroker:
                     total += -change
         return total
 
+    def net_bp(self) -> float:
+        """Buying power REMAINING: the total less what the resting stops reserve (what the real snapshot reports)."""
+        return float(self.available_bp) - float(self._reserved_bp())
+
     def _bp_check(self, orders):
         """The margin check: refuse (raise) when the stops' reservation is not affordable; else the effect."""
         change = self._stop_bp_change(orders)
         if change < 0 and -change + self._reserved_bp() > Decimal(str(self.available_bp)):
             raise TastytradeError("margin_check_failed: Your account does not have sufficient buying power")
-        return SimpleNamespace(change_in_buying_power=change)
+        return SimpleNamespace(change_in_buying_power=Decimal(0) if self.bp_report_zero else change)
 
     async def place_complex_order(self, session, order: NewComplexOrder, dry_run: bool = True):
         self.place_calls.append((dry_run, order))
@@ -419,10 +424,19 @@ def make_account(broker: FakeTastyBroker, *, account_id: int = 1) -> TastyTradeA
     acct._loop_thread = None
     acct._settings_cache = {}
     acct._run_async = sync_run
-    acct._sleep = lambda seconds: None
-    acct._PROTECTION_CANCEL_TIMEOUT_SECONDS = 5.0
+    # A tiny REAL sleep: with a no-op the unconfirmed-cancel poll spun for the whole timeout, opening thousands
+    # of asyncio loops (a socketpair each) and exhausting Windows' loopback ports (the suite then hung).
+    acct._sleep = lambda seconds: __import__("time").sleep(0.02)
+    acct._PROTECTION_CANCEL_TIMEOUT_SECONDS = 2.0
     acct.get_instrument_current_price = lambda symbols, price_type="mark": {
         s: broker.prices.get(s) for s in (symbols if isinstance(symbols, list) else [symbols])}
+    original_snapshot = acct.get_account_snapshot
+
+    def snapshot():
+        if broker.bp_p0 is None:
+            return original_snapshot()
+        return SimpleNamespace(buying_power=broker.net_bp())      # net of what resting stops reserve
+    acct.get_account_snapshot = snapshot
     return acct
 
 
