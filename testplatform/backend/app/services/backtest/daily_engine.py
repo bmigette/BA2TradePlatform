@@ -45,7 +45,8 @@ from __future__ import annotations
 
 import bisect
 import random
-from datetime import date, datetime, time as dtime, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
+from app.services.backtest.price_source import exp_prior_day_str  # EXPERIMENT
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
@@ -159,7 +160,8 @@ def _screened_symbols_for_bar(
     store = screener_runtime["store"]
     df = ms.load_store(store)
     days = ms.scan_dates(df, store_key=store)
-    i = bisect.bisect_right(days, as_of_dt.strftime("%Y-%m-%d")) - 1
+    from app.services.backtest.price_source import exp_prior_day_str  # EXPERIMENT
+    i = bisect.bisect_right(days, exp_prior_day_str(as_of_dt) or as_of_dt.strftime("%Y-%m-%d")) - 1
     if i < 0:
         return []
     day = days[i]
@@ -644,7 +646,9 @@ class DailyBacktestEngine:
             #     regime_overlay seam instead of classifying per symbol. Cheap: a bisect into the
             #     precomputed calendar. None (no calendar) publishes None = neutral, which
             #     _check_regime_calendar has already proven no expert depends on.
-            set_stressed(self._regime_calendar.at(as_of_dt) if self._regime_calendar else None)
+            set_stressed(self._regime_calendar.at(
+                (as_of_dt - timedelta(days=1)) if exp_prior_day_str(as_of_dt) else as_of_dt)
+                if self._regime_calendar else None)  # EXPERIMENT prior-close
 
             # 2. universe for the bar.
             universe = resolve_universe(as_of_dt, self.config, self.price)

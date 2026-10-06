@@ -763,6 +763,10 @@ class MetricStoreATRProvider:
         try:
             df = ms.load_store(self._store_dir)
             day = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)[:10]
+            from app.services.backtest.price_source import exp_prior_day_str  # EXPERIMENT
+            _prior = exp_prior_day_str(end_date)
+            if _prior is not None:
+                day = _prior
             rows = ms.metrics_as_of(df, day, [col])
         except Exception:  # noqa: BLE001 — any store issue -> safe empty (caller's no-ATR fallback)
             return empty

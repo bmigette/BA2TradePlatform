@@ -647,6 +647,8 @@ class AsOfPriceSource:
     # ---- virtual clock -----------------------------------------------------
     def set_clock(self, as_of: datetime) -> None:
         """Advance the virtual clock to ``as_of`` (engine calls this once per bar)."""
+        global _EXP_CLOCK
+        _EXP_CLOCK = as_of if self._intraday else None   # EXPERIMENT (BA2_EXP_PRIOR_CLOSE)
         self._clock = as_of
         # Precompute the current bar's normalised key ONCE per bar. bar_at/close_at are called
         # millions of times per backtest, almost always for the current clock — caching the key
@@ -1225,6 +1227,27 @@ def _df_to_rows(df: Any) -> List[Dict[str, Any]]:
 # (the pool workers stay alive across trials), not once per call.
 _FULL_SERIES_MEMO: Dict[tuple, Any] = {}
 
+# EXPERIMENT (exp/verify-lookahead-and-entry-bar) -- TEMPORARY, never merge. The ONE place the
+# BA2_EXP_PRIOR_CLOSE env var is read. When "1" AND the run is on an intraday clock, every daily
+# read (OHLCV 1d bars, metric-store ATR / screener scan day, regime calendar) is clamped to data
+# strictly BEFORE the decision session (what live can know at 09:30). Returns the current
+# intraday decision clock, or None (switch off / daily clock) meaning "do not clamp".
+_EXP_CLOCK: Optional[datetime] = None
+
+
+def exp_prior_close_clock() -> Optional[datetime]:
+    if os.environ.get("BA2_EXP_PRIOR_CLOSE") != "1":
+        return None
+    return _EXP_CLOCK
+
+
+def exp_prior_day_str(as_of: Any) -> Optional[str]:
+    """YYYY-MM-DD of the calendar day before ``as_of``'s session when the switch is on, else None."""
+    clk = exp_prior_close_clock()
+    if clk is None:
+        return None
+    return (_to_utc(as_of).date() - timedelta(days=1)).isoformat()
+
 # Exception TYPE names already reported by MemoizedOHLCVProvider.cached_path in this process. The
 # lookup runs once per symbol per individual (thousands of times a job), so a degraded cache would
 # otherwise print the same line thousands of times; it still must print ONCE, because "sharing is
@@ -1436,6 +1459,15 @@ class MemoizedOHLCVProvider:
         return df.iloc[lo:hi].reset_index(drop=True)
 
     def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval="1d", **kwargs):
+        _clk = exp_prior_close_clock()
+        if (_clk is not None and interval == "1d" and end_date is not None
+                and _to_utc(end_date) <= _to_utc(_clk)):
+            # EXPERIMENT: prior-close clamp. Only an EXPLICIT as_of end (<= the clock) is cut to the
+            # day before the decision session; a wall-clock/None end is a "whole series, I slice it
+            # myself" request (DeterministicScorer) and is clamped by the driver wrapper instead,
+            # because it memoises that first fetch for the whole run.
+            _c = _to_utc(end_date)
+            end_date = datetime(_c.year, _c.month, _c.day, tzinfo=timezone.utc) - timedelta(microseconds=1)
         df, dates = self._full(symbol, interval)
         return self._slice(df, dates, start_date, end_date)
 
