@@ -144,6 +144,88 @@ def enabled_instruments_config(settings: Dict[str, Any]) -> Dict[str, Dict]:
     return {}
 
 
+def used_balance_for_transactions(account: Any, transactions: List[Any], *,
+                                  loss_adjusted: bool = True) -> float:
+    """The capital ``transactions`` have committed, priced the way the stock path prices it.
+
+    THE ONE used-balance function: ``MarketExpertInterface._calculate_used_balance`` (one
+    expert's open transactions, the classic RM's ``available = virtual - used``) and the
+    option capital headroom (``OptionsAccountInterface.option_capital_headroom``, every open
+    transaction of an account) both call it, so what an open position "uses" is defined once.
+
+    Per transaction: cost = ``open_price x quantity x multiplier``. ``loss_adjusted`` (the
+    stock path's convention, the default) charges a LOSING transaction its cost PLUS the loss
+    -- the maximum potential loss, for a virtual-equity bookkeeping whose base does not move
+    with marks. A caller whose base IS equity (marks included) passes ``False``: the loss is
+    already out of the base, and charging it again would count it twice.
+
+    Bulk price fetch for the stock rows; option rows are marked off their own quote
+    (``_used_balance_option_price``). Raises on any failure (callers decide the refusal).
+    """
+    used_balance = 0.0
+    if not transactions:
+        return used_balance
+    # Fetch all prices at once (bulk fetching)
+    all_symbols = list(set(t.symbol for t in transactions))
+    logger.debug(f"Fetching prices for {len(all_symbols)} symbols in bulk for used balance calculation")
+    symbol_prices = account.get_instrument_current_price(all_symbols) if loss_adjusted else None
+
+    for transaction in transactions:
+        if transaction.open_price is None or transaction.quantity is None:
+            logger.warning(f"Transaction {transaction.id} missing open_price or quantity, skipping")
+            continue
+
+        is_option = bool(transaction.multiplier and transaction.multiplier != 1)
+        multiplier = float(transaction.multiplier) if is_option else 1.0
+
+        if not loss_adjusted:
+            used_balance += transaction.open_price * transaction.quantity * multiplier
+            continue
+
+        if is_option:
+            # transaction.symbol is the UNDERLYING ticker for options (see
+            # OptionsAccountInterface.submit_option_order) -- the bulk-fetched
+            # symbol_prices above are the underlying's STOCK price, off by roughly the
+            # option's leverage ratio. Price the option off its OWN quote instead (long
+            # marks at bid, short at ask, last as fallback -- same convention as
+            # TradeConditions._get_option_pnl_via_transaction).
+            current_price = MarketExpertInterface._used_balance_option_price(account, transaction)
+            if current_price is None:
+                logger.warning(f"No option quote for transaction {transaction.id} "
+                               f"({transaction.symbol}) — using open_price")
+                current_price = transaction.open_price
+        else:
+            # Get current price from bulk-fetched prices
+            current_price = symbol_prices.get(transaction.symbol) if symbol_prices else None
+            if current_price is None:
+                logger.warning(f"Could not get current price for {transaction.symbol}, using open_price")
+                current_price = transaction.open_price
+
+        # Calculate profit/loss based on side field
+        # BUY = LONG, SELL = SHORT
+        if transaction.side == OrderDirection.BUY:  # Long position
+            profit_loss = (current_price - transaction.open_price) * transaction.quantity * multiplier
+        else:  # Short position
+            profit_loss = (transaction.open_price - current_price) * transaction.quantity * multiplier
+
+        # Calculate used balance for this transaction
+        if profit_loss >= 0:
+            # Transaction is profitable, use open_price
+            transaction_used = transaction.open_price * transaction.quantity * multiplier
+        else:
+            # Transaction is losing money, use open_price + loss
+            loss_amount = abs(profit_loss)
+            transaction_used = (transaction.open_price * transaction.quantity * multiplier) + loss_amount
+
+        used_balance += transaction_used
+
+        logger.debug(f"Transaction {transaction.id} ({transaction.symbol}): "
+                     f"Open=${transaction.open_price}, Current=${current_price}, "
+                     f"P/L=${profit_loss:.2f}, Used=${transaction_used:.2f}")
+
+    return used_balance
+
+
 class MarketExpertInterface(ExtendableSettingsInterface):
     SETTING_MODEL = ExpertSetting
     SETTING_LOOKUP_FIELD = "instance_id"
@@ -1675,8 +1757,6 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             Optional[float]: The total used balance, None if error occurred
         """
         try:
-            used_balance = 0.0
-
             # Get all open transactions for this expert (dual-path: the in-memory store in a
             # backtest, SQLite in live — same rows either way).
             from ba2_common.core.trade_store import transactions_where
@@ -1685,66 +1765,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED])
             if exclude_transaction_id is not None:
                 transactions = [t for t in transactions if t.id != exclude_transaction_id]
-
-            if not transactions:
-                return used_balance
-            
-            # Fetch all prices at once (bulk fetching)
-            all_symbols = list(set(t.symbol for t in transactions))
-            logger.debug(f"Fetching prices for {len(all_symbols)} symbols in bulk for used balance calculation")
-            symbol_prices = account.get_instrument_current_price(all_symbols)
-            
-            for transaction in transactions:
-                if transaction.open_price is None or transaction.quantity is None:
-                    logger.warning(f"Transaction {transaction.id} missing open_price or quantity, skipping")
-                    continue
-
-                is_option = bool(transaction.multiplier and transaction.multiplier != 1)
-                multiplier = float(transaction.multiplier) if is_option else 1.0
-
-                if is_option:
-                    # transaction.symbol is the UNDERLYING ticker for options (see
-                    # OptionsAccountInterface.submit_option_order) -- the bulk-fetched
-                    # symbol_prices above are the underlying's STOCK price, off by roughly the
-                    # option's leverage ratio. Price the option off its OWN quote instead (long
-                    # marks at bid, short at ask, last as fallback -- same convention as
-                    # TradeConditions._get_option_pnl_via_transaction).
-                    current_price = self._used_balance_option_price(account, transaction)
-                    if current_price is None:
-                        logger.warning(f"No option quote for transaction {transaction.id} "
-                                       f"({transaction.symbol}) — using open_price")
-                        current_price = transaction.open_price
-                else:
-                    # Get current price from bulk-fetched prices
-                    current_price = symbol_prices.get(transaction.symbol) if symbol_prices else None
-                    if current_price is None:
-                        logger.warning(f"Could not get current price for {transaction.symbol}, using open_price")
-                        current_price = transaction.open_price
-
-                # Calculate profit/loss based on side field
-                # BUY = LONG, SELL = SHORT
-                if transaction.side == OrderDirection.BUY:  # Long position
-                    profit_loss = (current_price - transaction.open_price) * transaction.quantity * multiplier
-                else:  # Short position
-                    profit_loss = (transaction.open_price - current_price) * transaction.quantity * multiplier
-
-                # Calculate used balance for this transaction
-                if profit_loss >= 0:
-                    # Transaction is profitable, use open_price
-                    transaction_used = transaction.open_price * transaction.quantity * multiplier
-                else:
-                    # Transaction is losing money, use open_price + loss
-                    loss_amount = abs(profit_loss)
-                    transaction_used = (transaction.open_price * transaction.quantity * multiplier) + loss_amount
-
-                used_balance += transaction_used
-
-                logger.debug(f"Transaction {transaction.id} ({transaction.symbol}): "
-                           f"Open=${transaction.open_price}, Current=${current_price}, "
-                           f"P/L=${profit_loss:.2f}, Used=${transaction_used:.2f}")
-            
-            return used_balance
-
+            return used_balance_for_transactions(account, transactions)
         except Exception as e:
             logger.error(f"Error calculating used balance for expert {self.id}: {e}", exc_info=True)
             return None

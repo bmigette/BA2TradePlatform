@@ -12,6 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._capital_double import EquityFromBalance
+
 from ba2_common.core import TradeActions
 from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract
@@ -98,7 +100,7 @@ def _recommendation():
 def _action(cls, **kw):
     from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
     acct = _Acct(CHAIN)
-    acct.__class__ = type("_A", (_Acct, OptionsAccountInterface), {})
+    acct.__class__ = type("_A", (EquityFromBalance, _Acct, OptionsAccountInterface), {})
     params = dict(strike_method="delta", strike_param=0.30, dte_min=1, dte_max=60,
                   sizing=10.0)
     params.update(kw)

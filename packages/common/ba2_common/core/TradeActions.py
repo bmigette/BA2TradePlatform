@@ -3704,7 +3704,8 @@ class _OptionEntryAction(TradeAction):
                              limit_price: float, option_strategy: str,
                              option_reserve: Optional[float] = None,
                              stock_cover_price: Optional[float] = None,
-                             extra_entry_facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                             extra_entry_facts: Optional[Dict[str, Any]] = None,
+                             sizing_note: Optional[str] = None) -> Dict[str, Any]:
         """Submit (or defer) the assembled option order, honoring submit_to_broker.
 
         ``extra_entry_facts`` is a builder-specific fact set that must ride the ORDER ROW,
@@ -3794,6 +3795,10 @@ class _OptionEntryAction(TradeAction):
             data["min_one_contract_floor"] = True
         if extra_entry_facts:
             data.update(extra_entry_facts)
+        # WHY THE SIZE IS WHAT IT IS, when the capital headroom cut it: on the result message,
+        # the result data and (below) the order comment, like every other sizing reason.
+        if sizing_note:
+            data["capital_headroom_cut"] = sizing_note
         # Design 2026-08-29 S8.2: persist the structure's measured max loss beside
         # option_reserve so the loss_pct_of_max_loss exit can read it BACK -- no leg
         # reconstruction, no OCC parsing at evaluation time. Stamped ONLY when MEASURED
@@ -3962,17 +3967,23 @@ class _OptionEntryAction(TradeAction):
             entry_facts["entry_record"] = data["entry_record"]
         if self.entry_cross is not None and float(self.entry_cross) != ENTRY_CROSS_NEUTRAL:
             entry_facts["entry_cross"] = float(self.entry_cross)
-        if entry_facts and order_id is not None:
+        if (entry_facts or sizing_note) and order_id is not None:
             try:
                 stored = get_instance(TradingOrder, order_id)
                 if stored is not None:
                     stored.data = {**(stored.data or {}), **entry_facts}
+                    if sizing_note:
+                        stored.comment = (f"{stored.comment}; {sizing_note}" if stored.comment
+                                          else sizing_note)
                     update_instance(stored)
             except Exception as e:
                 absorb_if_benign(e, InstanceNotFound)
                 logger.error(f"Failed to persist entry facts {sorted(entry_facts)} on "
                              f"order {order_id}: {e}", exc_info=True)
-        return self._result(True, f"Submitted {option_strategy} for {self.instrument_name}", data)
+        message = f"Submitted {option_strategy} for {self.instrument_name}"
+        if sizing_note:
+            message += f"; {sizing_note}"
+        return self._result(True, message, data)
 
     def _entry_record_or_refusal(self, legs: List[OptionLeg], *, quantity: int,
                                  limit_price: float, option_strategy: str,
@@ -4136,42 +4147,44 @@ class _OptionEntryAction(TradeAction):
         return (expiry - self._today()).days
 
     def _fit_debit_to_capital(self, quantity: int, commit_per_contract: float,
-                              option_strategy: str) -> "Tuple[int, Optional[Dict[str, Any]]]":
-        """``(quantity that fits, None)`` or ``(quantity, refusal)`` for a premium-sized entry.
+                              option_strategy: str
+                              ) -> "Tuple[int, Optional[Dict[str, Any]], Optional[str]]":
+        """``(quantity that fits, None, note)`` or ``(quantity, refusal, None)`` for a
+        premium-sized entry. ``note`` is non-None exactly when the size was CUT, and says why
+        ("sized 12 -> 7 contracts: option capital headroom $X ..."); ``_size_and_submit``
+        carries it into the result message and the order comment.
 
-        THE CAPITAL LIMIT OF THE OPTION BOOK (owner rule, 2026-10-06): no portfolio cap, but the
-        debits paid plus the collateral reserved by every open option structure can never exceed
-        what the account has -- "like with stocks", where the entry is clamped to buying power.
-        Credit structures already refuse when their reserve does not fit
-        (``check_option_buying_power``); a debit entry sized as a percentage of the account
-        never asked, so it could spend cash a credit structure had reserved, or cash a debit
-        entry decided in the same session was about to pay.
+        THE CAPITAL LIMIT OF THE OPTION BOOK (owner rule, 2026-10-06): no portfolio cap, but
+        the debits paid plus the collateral reserved by every open option structure -- and the
+        stock the account holds -- can never exceed the account's EQUITY, "like with stocks".
+        ``account.option_capital_headroom_detail()`` is the one answer, defined identically in
+        backtest and live (equity - cost of open positions - reserves - pending debit entries;
+        see ``OptionsAccountInterface.option_capital_headroom_detail``). The size is CUT to
+        what fits; REFUSED when not even one contract fits, or when the headroom cannot be
+        measured -- and then the refusal NAMES every order that could not be read, so it can be
+        repaired. Unknown never reads as room.
 
-        ``account.option_capital_headroom()`` is the one answer. The size is CUT to what fits
-        (and said so in the log); REFUSED when not even one contract fits, or when the
-        headroom cannot be measured (an unreadable reserve is UNKNOWN, and unknown never reads
-        as room). Live and backtest run this same function.
+        NO FAIL-OPEN: an account with no capital model, or a non-numeric headroom, is a defect
+        and raises (``AttributeError`` / ``TypeError``). Test doubles carry the model.
         """
-        headroom_fn = getattr(self.account, "option_capital_headroom", None)
-        if not callable(headroom_fn):
-            return quantity, None      # an account double with no reserve model
-        headroom = headroom_fn()
-        if headroom is not None and (isinstance(headroom, bool)
-                                     or not isinstance(headroom, (int, float))):
-            return quantity, None      # only a NUMBER (or None = unknown) is an answer
+        detail = self.account.option_capital_headroom_detail()
+        headroom = detail.value
         if headroom is None:
+            culprits = "; ".join(detail.unmeasurable)
             logger.warning(f"{option_strategy} on {self.instrument_name} REFUSED: the option "
-                           f"capital headroom is unmeasurable (an open order's reserve is "
-                           f"unreadable), so no debit can be shown to fit")
+                           f"capital headroom is unmeasurable: {culprits}")
             return quantity, self._result(
                 False, f"{option_strategy} on {self.instrument_name} refused: the account's "
-                       f"option capital headroom cannot be measured")
+                       f"option capital headroom cannot be measured: {culprits}"), None
+        if isinstance(headroom, bool) or not isinstance(headroom, (int, float)):
+            raise TypeError(f"option_capital_headroom_detail().value must be a number or None, "
+                            f"got {headroom!r}")
         fits = int(math.floor(headroom / commit_per_contract)) if headroom > 0 else 0
         # The same float comparison the fill makes: never one contract past the room.
         while fits > 0 and fits * commit_per_contract > headroom:
             fits -= 1
         if fits >= quantity:
-            return quantity, None
+            return quantity, None, None
         if fits < 1:
             logger.warning(f"{option_strategy} on {self.instrument_name} REFUSED: one contract "
                            f"commits {commit_per_contract:.2f} but only {headroom:.2f} of option "
@@ -4179,11 +4192,11 @@ class _OptionEntryAction(TradeAction):
             return quantity, self._result(
                 False, f"Insufficient option capital for {option_strategy} on "
                        f"{self.instrument_name}: one contract commits {commit_per_contract:.2f}, "
-                       f"{headroom:.2f} is uncommitted")
-        logger.warning(f"{option_strategy} on {self.instrument_name} DOWNSIZED {quantity} -> "
-                       f"{fits} contract(s) to fit the uncommitted option capital "
-                       f"{headroom:.2f} ({commit_per_contract:.2f} per contract)")
-        return fits, None
+                       f"{headroom:.2f} is uncommitted"), None
+        note = (f"sized {quantity} -> {fits} contract(s): option capital headroom "
+                f"${headroom:,.2f} ({commit_per_contract:,.2f} per contract)")
+        logger.warning(f"{option_strategy} on {self.instrument_name} DOWNSIZED: {note}")
+        return fits, None, note
 
     def _size_and_submit(self, resolved) -> Dict[str, Any]:
         """Size ``resolved`` and submit it. The former tail of every ``_build_and_submit``.
@@ -4211,15 +4224,20 @@ class _OptionEntryAction(TradeAction):
             cost = risk.risk_per_contract
             extra_per_contract = risk.extra_beyond_outlay
         quantity = self._size_by_cost(cost, self.sizing)
+        sizing_note = None
         if quantity >= 1 and resolved.sizing_basis == "premium":
             # A DEBIT entry spends cash the account must still hold: what it pays (and, for a
             # structure that can lose more than its debit, the excess it reserves -- ``cost``
             # is that whole commitment per contract) cannot exceed the headroom left after the
             # collateral reserved by credit structures and the debit entries still in flight.
-            quantity, refusal = self._fit_debit_to_capital(
+            quantity, refusal, sizing_note = self._fit_debit_to_capital(
                 quantity, cost, resolved.option_strategy)
             if refusal is not None:
                 return refusal
+        # What ONE contract of this entry pays (the debit), recorded on the order so a working
+        # entry with no limit price can still be valued by the capital headroom.
+        entry_facts = ({OptionsAccountInterface.ENTRY_DEBIT_PER_CONTRACT_KEY: resolved.cost_per_contract}
+                       if resolved.sizing_basis == "premium" else None)
         if quantity >= 1 and extra_per_contract > 0.0:
             # The loss beyond the debit is NOT paid at the fill, so it is reserved (the debit is
             # already out of the account). Honoured by ``reserved_option_buying_power_detail``
@@ -4231,7 +4249,7 @@ class _OptionEntryAction(TradeAction):
                            f"{self.instrument_name} (loss beyond its debit: reserve {reserve})")
             return self._submit_option_order(
                 resolved.legs, quantity, resolved.limit_price, resolved.option_strategy,
-                option_reserve=reserve)
+                option_reserve=reserve, extra_entry_facts=entry_facts, sizing_note=sizing_note)
         if quantity < 1:
             # The structure's OWN historical wording, not a uniform one. These strings are
             # persisted to TradeActionResult.message and rendered in the UI as the reason an
@@ -4242,7 +4260,8 @@ class _OptionEntryAction(TradeAction):
                 or (f"Insufficient budget to size {resolved.option_strategy} for "
                     f"{self.instrument_name}"))
         return self._submit_option_order(
-            resolved.legs, quantity, resolved.limit_price, resolved.option_strategy)
+            resolved.legs, quantity, resolved.limit_price, resolved.option_strategy,
+            extra_entry_facts=entry_facts, sizing_note=sizing_note)
 
     def execute(self) -> "TradeActionResult":
         # One execute, one decision: the spot the record reuses is THIS run's, never a

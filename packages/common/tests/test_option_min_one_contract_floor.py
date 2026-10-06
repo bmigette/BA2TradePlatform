@@ -41,6 +41,11 @@ class _Acct:
     def get_option_tradable_balance(self):
         return self._balance
 
+    def option_capital_headroom_detail(self):
+        # The sizing tail's capital gate: this double holds nothing but its balance.
+        from ba2_common.core.interfaces.OptionsAccountInterface import CapitalHeadroom
+        return CapitalHeadroom(value=self._balance)
+
 
 def _sizer(*, balance=20_000.0, cap_pct=10.0, floor=None, sizing=5.0, committed=0.0):
     """A BuyCallAction with only what the sizing tail reads. ``cap_pct=None`` means no
@@ -61,7 +66,7 @@ def _sizer(*, balance=20_000.0, cap_pct=10.0, floor=None, sizing=5.0, committed=
     results, submitted = [], []
     a._result = lambda success, message, data=None: (
         results.append((success, message)) or {"success": success, "message": message})
-    a._submit_option_order = lambda legs, quantity, limit, strategy: (
+    a._submit_option_order = lambda legs, quantity, limit, strategy, **kw: (
         submitted.append(quantity) or {"success": True, "quantity": quantity})
     return a, submitted
 

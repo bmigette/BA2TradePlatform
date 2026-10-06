@@ -107,3 +107,33 @@ def test_same_session_debit_entries_never_commit_more_than_the_account_holds(cap
             "the fill-time cash cap had to cut an order the sizing seam should have fitted"
     finally:
         ctx.__exit__(None, None, None)
+
+
+def test_the_backtests_headroom_is_equity_less_the_cost_of_what_it_holds():
+    """The backtest publishes its equity in the snapshot, and its open option transaction carries
+    its cost: headroom = equity - cost. With marks at cost that is the cash left -- the figure a
+    live account (balance = equity) reaches by the SAME subtraction."""
+    call = occ("C", 180.0)
+    acct, ps, ctx, _ = build_account()
+    try:
+        acct.submit_option_order(
+            legs=[_leg(call, 180.0, OrderDirection.BUY, "buy_to_open")], quantity=10,
+            order_type="market", option_strategy="long_call")
+        acct.refresh_orders()
+        acct.refresh_transactions()
+        # the headroom reads what the account's EXPERTS hold (the stock path's own scope): the
+        # engine always has one; this direct submission has none, so attach it to one.
+        from ba2_common.core.db import add_instance
+        from ba2_common.core.models import ExpertInstance
+        from ba2_common.core.trade_store import transactions_where
+        expert_id = add_instance(ExpertInstance(account_id=acct.id, expert="Stub"))
+        for txn in transactions_where():
+            txn.expert_id = expert_id
+            update_instance(txn)
+        cost = 10 * model_price("C", 180.0, date(2024, 2, 2)) * 100.0
+        assert acct.get_balance() == pytest.approx(START_CASH - cost)         # CASH fell
+        assert acct.option_capital_equity() == pytest.approx(START_CASH, abs=200.0)   # equity did not (marks drift a few dollars)
+        assert acct.open_position_cost_basis().total == pytest.approx(cost)
+        assert acct.option_capital_headroom() == pytest.approx(START_CASH - cost, abs=200.0)
+    finally:
+        ctx.__exit__(None, None, None)

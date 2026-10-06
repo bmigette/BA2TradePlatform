@@ -111,12 +111,25 @@ _OWNER_DEAD, _OWNER_CLOSING, _OWNER_PENDING_OPEN, _OWNER_FILLED_OPEN = 0, 1, 2, 
 
 
 def _owner_rank(order) -> int:
-    """How good a claim ``order`` has to be the order that OPENED a held contract's lot."""
+    """How good a claim ``order`` has to be the order that OPENED a held contract's lot.
+
+    DECIDED BY WHAT WAS FILLED, not by the status the row ended in: an opening order that
+    filled some contracts and was CANCELED afterwards still holds them (a cancel does not
+    un-trade a print), so it outranks every order that filled nothing. Status only orders the
+    rest: dead (never held), closing, still-pending opening."""
+    intent = (getattr(order, "position_intent", None) or "").lower()
+    opening = not intent or "open" in intent
+    raw = getattr(order, "filled_qty", None)
+    try:
+        filled = float(raw) if raw is not None else 0.0
+    except (TypeError, ValueError):
+        filled = 0.0
+    if opening and filled > 0:
+        return _OWNER_FILLED_OPEN
     status = getattr(order, "status", None)
     if status in _NEVER_HELD_LEG_STATUSES:
         return _OWNER_DEAD
-    intent = (getattr(order, "position_intent", None) or "").lower()
-    if intent and "open" not in intent:
+    if not opening:
         return _OWNER_CLOSING
     if status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
         return _OWNER_FILLED_OPEN
@@ -398,6 +411,12 @@ def _new_integrity_counters() -> Dict[str, Any]:
             # Orders that actually FILLED at a replaced print (a replaced print may still
             # fail the limit / liquidity tests and never fill).
             "option_fills_at_replaced_print": 0,
+            # CLOSING orders repriced from INTRINSIC (no trusted decision-bar iv); closing
+            # STRUCTURES whose net broke the bounds and were repriced instead of refused;
+            # market-type OPENING entries expired after a refused fill.
+            "option_close_prints_fallback": 0,
+            "option_close_structure_fallbacks": 0,
+            "option_market_entries_expired": 0,
             "option_fill_print_examples": [],
             "option_structure_fills_refused": 0,
             "option_structure_fill_examples": []}
@@ -1491,7 +1510,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # per-lot rescan below used to re-derive for EVERY held lot: that was O(held x orders)
         # on top of the two passes, and the dominant own-time in the options profile).
         owner_of: Dict[str, Any] = {}
-        owner_rank: Dict[str, int] = {}
+        owner_key: Dict[str, Tuple[int, float, int]] = {}
         # ONE pass: parent/single strategy+qty, the child legs (their strikes need the completed
         # parent set), and each held contract's owning order.
         for o in orders:
@@ -1508,11 +1527,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 # stage-1 O_BULLCS winner (bt 79). The owner is the order that OPENED the lot:
                 # the latest FILLED opening order, else a still-pending opening order (the
                 # instant inside a fill), else any live order, else the first.
+                # "Latest" is EXPLICIT, never the order ``get_orders()`` happens to return:
+                # among filled opening orders the one filled last (fill time, then id); among
+                # the rest the lowest id (the earliest claim, as before).
                 rank = _owner_rank(o)
-                best = owner_rank.get(cs)
-                if best is None or rank > best or (rank == best == _OWNER_FILLED_OPEN):
+                stamp = self._fill_stamp(o)
+                oid = o.id if o.id is not None else 0
+                key = (rank, stamp, oid) if rank == _OWNER_FILLED_OPEN else (rank, 0.0, -oid)
+                if cs not in owner_key or key > owner_key[cs]:
                     owner_of[cs] = o
-                    owner_rank[cs] = rank
+                    owner_key[cs] = key
             if o.parent_order_id is None:
                 # multi-leg PARENT (no contract) or a single-leg option order.
                 if o.id is not None and getattr(o, "option_strategy", None):
@@ -1531,7 +1555,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                             "strikes": [float(o.strike)] if o.strike is not None else [],
                             "multiplier": float(o.multiplier or 100),
                         }
-            elif getattr(o, "status", None) not in _NEVER_HELD_LEG_STATUSES:
+            elif (getattr(o, "status", None) not in _NEVER_HELD_LEG_STATUSES
+                  or _owner_rank(o) == _OWNER_FILLED_OPEN):
                 # A cancelled / rejected / expired / still-unfilled child leg is not part of
                 # the structure: counting it would make ``leg_orders`` disagree with the legs
                 # that exist and push a healthy group into the width fallback.
@@ -1822,6 +1847,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             ):
                 out.add(cs)
         return out
+
+    def _fill_stamp(self, order) -> float:
+        """When ``order`` filled, as a sortable number (-inf when no fill time is recorded)."""
+        when = self._fill_dates.get(order.id) if order.id is not None else None
+        if when is None:
+            return float("-inf")
+        try:
+            return float(when.timestamp())
+        except (AttributeError, OverflowError, OSError, ValueError):
+            return float("-inf")
 
     def _lot_order(self, contract_symbol: str) -> Optional[TradingOrder]:
         """The option ``TradingOrder`` carrying a held lot's contract terms.
@@ -3090,7 +3125,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             filled = True
         # An option DAY-order expiry changed the book WITHOUT a fill — the engine must still roll
         # transactions (see the Step 0 note above), so report it as a book change too.
-        return filled or book_changed
+        # A market-type entry the fill screen refused is terminalised inside the loop above.
+        return filled or book_changed or self.__dict__.pop("_fill_book_changed", False)
 
     def _expire_stale_option_limits(self, as_of) -> bool:
         """TIME-IN-FORCE DAY for option LIMIT orders (OPT-B4).
@@ -3262,7 +3298,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 fill_day, k_fill, underlying, k_decided / k_fill)
         return True
 
-    def _option_fill_price(self, order, as_of) -> Optional[float]:
+    def _option_fill_price(self, order, as_of, _force_fallback: Optional[str] = None) -> Optional[float]:
         """Premium per share for an option order on its fill bar, per ``fill_model``.
 
         The fill BAR is chosen exactly like the equity branch (``_bar_for_fill``): the
@@ -3332,8 +3368,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # own session evidence; a rejected print is repriced through the mark chain's BS stage
         # or the order is refused -- never filled at it (``_screen_open_print``).
         if not same_bar:
-            screened = self._screen_open_print(order, px, fill_day, bar, as_of_bar, as_of)
+            screened = self._screen_open_print(order, px, fill_day, bar, as_of_bar, as_of,
+                                               force_fallback=_force_fallback)
             if screened is None:
+                self._expire_refused_market_entry(order)
                 return None
             px = screened
         limit = getattr(order, "limit_price", None)
@@ -3627,12 +3665,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return True
 
     def _screen_open_print(self, order, px: float, fill_day, bar: dict, as_of_bar,
-                           as_of) -> Optional[float]:
+                           as_of, force_fallback: Optional[str] = None) -> Optional[float]:
         """The premium an option fill may be priced from, given its OPEN print ``px``.
 
-        ``px`` when it is consistent with the contract's own session evidence; the Black-Scholes
-        premium of the DECISION bar's iv at the fill day's open when it is not; None -- REFUSE,
-        the order stays pending like any no-fill -- when no such premium exists.
+        ``px`` when it is consistent with the contract's own session evidence; a replacement
+        when it is not; None -- REFUSE, the order does not fill -- when an OPENING order has no
+        defensible replacement. A CLOSING order is never refused here (see below).
 
         WHY. A daily bar has no timestamp on its open, and a thin contract's open is routinely
         an isolated trade far from where the contract then traded (LRCX 2022-10-12: the 370 call
@@ -3645,16 +3683,24 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         contract repriced with Black-Scholes at the UNDERLYING'S OPEN on the fill day: one at the
         iv the fill day's own CLOSE implies (``bar['iv']``), one at the DECISION bar's iv
         (``as_of_bar['iv']``). A real open sits between them or near them -- the iv drifted across
-        the session -- while an isolated print sits outside both. Gamma and big underlying moves
-        are inside the references (they are priced at the open's spot), which is why this is not
-        a delta-linear adjustment of the close. The print is rejected when it lies further than
-        ``max(REL x reference, ABS)`` outside their interval.
+        the session -- while an isolated print sits outside both. The print is rejected when it
+        lies further than ``max(REL x reference, ABS)`` outside their interval.
 
-        THE REPLACEMENT is the decision-bar-iv reference: ``_bs_premium_clamped``, the same BS
-        stage the mark chain uses for a held lot with no bar. Nothing else is invented: no
-        decision-bar close carried over, no intrinsic stand-in (an OTM leg's intrinsic is 0, and
-        a fill at 0 is the bug). Without a decision-bar iv, a risk-free rate or an underlying
-        open there is no defensible price and the order is refused.
+        THE CLOSE-IMPLIED IV IS EVIDENCE FOR THAT DECISION ONLY. It never feeds a price: the
+        replacement below is built from the DECISION bar's iv alone, which is known before the
+        session opens (a fill priced from the session's own close would be look-ahead).
+
+        THE REPLACEMENT is the decision-bar-iv reference (``_bs_premium_clamped``, the mark
+        chain's BS stage), made CONSERVATIVE against the contract's own session range: a BUY
+        never fills below the session's low, a SELL never above its high (``_adverse_clamp``). An
+        OPENING order whose session has no usable [low, high], or that has no trusted decision-bar
+        iv, is refused (a market-type one is expired like a DAY order, once).
+
+        A CLOSING ORDER IS NEVER STUCK. With no trusted decision-bar iv it falls back through the
+        mark chain's next stage, INTRINSIC at the underlying's open (and takes the BS price
+        unclamped when the session range is unusable); counted ``option_close_prints_fallback``.
+        ``force_fallback`` ('bs' | 'intrinsic') is the closing-STRUCTURE path
+        (``_reprice_closing_legs``): the print is not judged, the leg is priced from that stage.
 
         NOT JUDGED (counted ``unverified``, print accepted): no reference could be built at all.
         Not applied under ``same_bar_close`` (the caller): the print IS the session's close.
@@ -3671,6 +3717,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if expiry is None and bar.get("expiry"):
             expiry = date.fromisoformat(str(bar["expiry"])[:10])
         contract = getattr(order, "contract_symbol", None)
+        closing = "close" in str(getattr(order, "position_intent", None) or "").lower()
+        is_buy = getattr(order, "side", None) == OrderDirection.BUY
         label = (f"{fill_day} {getattr(order, 'side', None)} {contract}: open {px:.2f}")
         underlying = getattr(order, "underlying_symbol", None) or order.symbol
         spot_bar = self._price.bar_at(underlying, fill_day)
@@ -3705,7 +3753,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 return None
             return float(day_bar["iv"])
 
+        # EVIDENCE ONLY (accept / reject): the fill day's close-implied iv. NEVER a price.
         close_iv = _trusted_iv(bar, fill_day, rate)
+        # THE PRICE SOURCE: the decision bar's iv, known before the session opens.
         prior_iv = _trusted_iv(as_of_bar, as_of_day, rate_source.rate_on(as_of_day))
         close_ref = prior_ref = None
         if close_iv is not None:
@@ -3714,6 +3764,33 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if prior_iv is not None:
             prior_ref = self._bs_premium_clamped(strike, spot, right, expiry, prior_iv,
                                                  fill_day, rate)
+        intrinsic = self._no_arb_premium_bounds(strike, right == OptionRight.CALL, spot)[0]
+
+        def _fallback(reason: str) -> Optional[float]:
+            """The replacement price per the chain above, or None (refuse an open)."""
+            if force_fallback == "intrinsic" or (prior_ref is None and closing):
+                base, source = intrinsic, "intrinsic at the underlying's open"
+            elif prior_ref is not None:
+                base, source = prior_ref, "BS at the decision-bar iv, the underlying's open"
+            else:
+                return None
+            clamped = self._adverse_clamp(base, is_buy, bar)
+            if clamped is None:
+                if not closing:
+                    return None
+                clamped = base            # a close never needs the range to be priced
+            first = self._count_fill_print(
+                "replaced", order, fill_day,
+                f"{reason} -> repriced to {clamped:.2f} ({source}"
+                + ("" if clamped == base else f", clamped into the session range from {base:.2f}")
+                + ")")
+            if closing and first and base == intrinsic:
+                self._integrity()["option_close_prints_fallback"] += 1
+            return clamped
+
+        if force_fallback is not None:
+            return _fallback(f"{label} (closing structure repriced from the {force_fallback} stage)")
+
         refs = [r for r in (close_ref, prior_ref) if r is not None]
         if not refs:
             self._count_fill_print("unverified", order, fill_day,
@@ -3729,15 +3806,68 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         evidence = (f"{label} vs session-consistent range [{lo_ref:.2f}, {hi_ref:.2f}] "
                     f"(tolerance {tol:.2f}; session low/high {bar.get('low')}/{bar.get('high')}, "
                     f"close {close})")
-        if prior_ref is None:
-            self._count_fill_print("refused", order, fill_day,
-                                   f"{evidence} -> no trusted decision-bar iv to reprice from; order "
-                                   f"refused")
+        replacement = _fallback(evidence)
+        if replacement is None:
+            why = ("no trusted decision-bar iv to reprice from" if prior_ref is None
+                   else "no usable session [low, high] to bound the replacement")
+            self._count_fill_print("refused", order, fill_day, f"{evidence} -> {why}; order refused")
             return None
-        self._count_fill_print("replaced", order, fill_day,
-                               f"{evidence} -> repriced to {prior_ref:.2f} "
-                               f"(BS at the decision-bar iv, the underlying's open)")
-        return prior_ref
+        return replacement
+
+    @staticmethod
+    def _adverse_clamp(price: float, is_buy: bool, bar: dict) -> Optional[float]:
+        """``price`` made conservative against the contract's own session: a BUY never fills
+        below the session's low, a SELL never above its high (so a model price outside the range
+        takes the adverse end, and one inside it is untouched). None when the bar carries no
+        usable ``[low, high]`` (missing, non-finite, or low > high)."""
+        low, high = bar.get("low"), bar.get("high")
+        try:
+            low, high = float(low), float(high)
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(low) and math.isfinite(high)) or low > high:
+            return None
+        return max(price, low) if is_buy else min(price, high)
+
+    def _expire_refused_market_entry(self, order) -> bool:
+        """A MARKET-type OPENING entry whose fill was refused expires like a DAY order, once.
+
+        The DAY sweep (``_expire_stale_option_limits``) ages limit orders only and a market
+        order is never aged: left alone, a refused one would retry every bar on a decision made
+        sessions ago. The broker would have filled it or rejected it that day; so this
+        terminalises it (and, for a multi-leg parent, its legs), counted
+        ``option_market_entries_expired``. Limit orders are untouched (the sweep owns them);
+        so are closing orders. Returns True when something was expired."""
+        entry = order
+        if getattr(order, "parent_order_id", None) is not None:
+            entry = self.get_order(order.parent_order_id) or order
+        if entry.order_type != OrderType.MARKET:
+            return False
+        if entry.contract_symbol is not None:
+            if "close" in str(getattr(entry, "position_intent", None) or "").lower():
+                return False
+            members = [entry]
+        else:
+            members = [entry] + [o for o in self.get_orders() if o.parent_order_id == entry.id
+                                 and o.status not in OrderStatus.get_terminal_statuses()
+                                 and o.status != OrderStatus.FILLED]
+            if self._multi_leg_is_closing(entry, members[1:]):
+                return False
+        for o in members:
+            if o.status in OrderStatus.get_terminal_statuses() or o.status == OrderStatus.FILLED:
+                continue
+            o.status = OrderStatus.EXPIRED
+            o.comment = f"{(o.comment or '')} | market entry refused by the fill screen".strip(" |")
+            update_instance(o)
+            self._option_order_day.pop(o.id, None)
+        self._integrity()["option_market_entries_expired"] += 1
+        self._fill_book_changed = True
+        self.invalidate_order_cache()
+        self._bump_option_memo()
+        logger.warning("[backtest] market-type option entry EXPIRED after a refused fill: %s %s",
+                       getattr(entry, "option_strategy", None),
+                       getattr(entry, "contract_symbol", None))
+        return True
 
     def _arb_fill_reject_reason(
         self, order, fill_px: float, fill_day, same_bar: bool, bar: dict
@@ -3998,8 +4128,19 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # open) is two inconsistent prints, never a market, and is not filled.
         bound_reason = self._structure_net_bound_reason(parent, priced, structures, net_per_share)
         if bound_reason is not None:
-            self._count_structure_refusal(parent, as_of, bound_reason)
-            return
+            if self._multi_leg_is_closing(parent, [leg for leg, _ in priced]):
+                # A CLOSE IS NEVER BLOCKED by the bound check: its legs are repriced through
+                # the mark chain (BS at the decision-bar iv, then intrinsic), counted, and the
+                # structure closes at the first stage whose net is inside the bounds.
+                priced = self._reprice_closing_legs(parent, priced, structures, as_of, bound_reason)
+                net_per_share = 0.0
+                for leg, px in priced:
+                    ratio = abs(float(leg.quantity or 0.0)) / structures
+                    net_per_share += (px if leg.side == OrderDirection.BUY else -px) * ratio
+            else:
+                self._count_structure_refusal(parent, as_of, bound_reason)
+                self._expire_refused_market_entry(parent)
+                return
         limit = getattr(parent, "limit_price", None)
         if limit is not None and net_per_share > float(limit) + _NET_LIMIT_TOLERANCE:
             logger.warning(
@@ -4082,6 +4223,42 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             self._sync_transaction_quantity(parent.transaction_id, float(capped))
 
         self._apply_multi_leg_fill(parent, priced, as_of)
+
+    def _reprice_closing_legs(self, parent, priced, structures: float, as_of, reason: str):
+        """The closing structure's legs repriced because its print net broke the bounds.
+
+        Stage 1: every leg from BS at the decision-bar iv (clamped adverse to its session);
+        stage 2: every leg from INTRINSIC at the underlying's open (whose net is the payoff at
+        the spot, inside the bounds by construction). The first stage whose net is inside the
+        bounds wins; failing both, the last stage still closes (a close is never stuck).
+        Counted once per parent per day in ``option_close_structure_fallbacks``."""
+        legs = [leg for leg, _ in priced]
+        chosen = priced
+        for mode in ("bs", "intrinsic"):
+            attempt = []
+            for leg in legs:
+                px = self._option_fill_price(leg, as_of, _force_fallback=mode)
+                if px is None:
+                    attempt = None
+                    break
+                attempt.append((leg, px))
+            if attempt is None:
+                continue
+            chosen = attempt
+            net = 0.0
+            for leg, px in attempt:
+                ratio = abs(float(leg.quantity or 0.0)) / structures
+                net += (px if leg.side == OrderDirection.BUY else -px) * ratio
+            if self._structure_net_bound_reason(parent, attempt, structures, net) is None:
+                break
+        day = as_of.date() if hasattr(as_of, "date") else as_of
+        seen = self.__dict__.setdefault("_close_structure_fallback_seen", set())
+        if (getattr(parent, "id", None), day) not in seen:
+            seen.add((getattr(parent, "id", None), day))
+            self._integrity()["option_close_structure_fallbacks"] += 1
+            logger.warning("[backtest] closing %s repriced through the mark chain instead of "
+                           "refused: %s", getattr(parent, "option_strategy", None), reason)
+        return chosen
 
     #: Dollars of slack when testing a structure's net against its value bounds. An OPENING
     #: net must lie STRICTLY inside them; a net within this of an edge is on it.

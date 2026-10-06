@@ -17,6 +17,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._capital_double import EquityFromBalance
+
 from ba2_common.core import option_selector
 from ba2_common.core.option_selector import (
     OptionLiquidityDataMissingToday,
@@ -230,7 +232,7 @@ def _own_db(tmp_path):
     yield
 
 
-class _Acct(OptionsAccountInterface):
+class _Acct(EquityFromBalance, OptionsAccountInterface):
     """Chain shaped like the real historical cache: quotes present, OI and volume NULL."""
 
     def __init__(self, *, oi=None, volume=None):
