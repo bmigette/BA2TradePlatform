@@ -109,31 +109,24 @@ def test_same_session_debit_entries_never_commit_more_than_the_account_holds(cap
         ctx.__exit__(None, None, None)
 
 
-def test_the_backtests_headroom_is_equity_less_the_cost_of_what_it_holds():
-    """The backtest publishes its equity in the snapshot, and its open option transaction carries
-    its cost: headroom = equity - cost. With marks at cost that is the cash left -- the figure a
-    live account (balance = equity) reaches by the SAME subtraction."""
-    call = occ("C", 180.0)
-    acct, ps, ctx, _ = build_account()
+def test_the_backtests_headroom_is_the_stock_paths_remaining_balance_on_equity():
+    """The engine's expert reads the SAME calculation a live expert does: its slice of the published
+    equity less what it holds (the held call's premium, from its open transaction). With marks near
+    cost that is the cash left -- the figure a live account (balance = equity) reaches by the same
+    subtraction."""
+    from ba2_common.core.instance_resolver import get_instance_resolver
+    _, acct, ctx, _res = run_structure("buy_call", sizing=40.0,
+                                       strike_method="percent_otm", strike_param=0.0)
     try:
-        acct.submit_option_order(
-            legs=[_leg(call, 180.0, OrderDirection.BUY, "buy_to_open")], quantity=10,
-            order_type="market", option_strategy="long_call")
-        acct.refresh_orders()
-        acct.refresh_transactions()
-        # the headroom reads what the account's EXPERTS hold (the stock path's own scope): the
-        # engine always has one; this direct submission has none, so attach it to one.
-        from ba2_common.core.db import add_instance
-        from ba2_common.core.models import ExpertInstance
-        from ba2_common.core.trade_store import transactions_where
-        expert_id = add_instance(ExpertInstance(account_id=acct.id, expert="Stub"))
-        for txn in transactions_where():
-            txn.expert_id = expert_id
-            update_instance(txn)
-        cost = 10 * model_price("C", 180.0, date(2024, 2, 2)) * 100.0
-        assert acct.get_balance() == pytest.approx(START_CASH - cost)         # CASH fell
-        assert acct.option_capital_equity() == pytest.approx(START_CASH, abs=200.0)   # equity did not (marks drift a few dollars)
-        assert acct.open_position_cost_basis().total == pytest.approx(cost)
-        assert acct.option_capital_headroom() == pytest.approx(START_CASH - cost, abs=200.0)
+        held = [p for p in acct._option_positions.values() if p.qty]
+        assert held
+        cost = sum(p.qty * p.avg_price * p.multiplier for p in held)
+        expert = get_instance_resolver().get_expert_instance(90)
+        available, names = expert.get_available_equity_balance_detail()
+        assert names == ()
+        assert acct.get_balance() == pytest.approx(START_CASH - cost)            # CASH fell
+        # equity (cash + marks) and the cost of what is held: the whole definition, to the cent
+        assert available == pytest.approx(acct.option_capital_equity() - cost, abs=0.01)
+        assert acct.option_capital_equity() > acct.get_balance()               # marks are in it
     finally:
         ctx.__exit__(None, None, None)

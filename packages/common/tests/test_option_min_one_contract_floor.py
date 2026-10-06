@@ -41,11 +41,6 @@ class _Acct:
     def get_option_tradable_balance(self):
         return self._balance
 
-    def option_capital_headroom_detail(self):
-        # The sizing tail's capital gate: this double holds nothing but its balance.
-        from ba2_common.core.interfaces.OptionsAccountInterface import CapitalHeadroom
-        return CapitalHeadroom(value=self._balance)
-
 
 def _sizer(*, balance=20_000.0, cap_pct=10.0, floor=None, sizing=5.0, committed=0.0):
     """A BuyCallAction with only what the sizing tail reads. ``cap_pct=None`` means no
@@ -55,6 +50,7 @@ def _sizer(*, balance=20_000.0, cap_pct=10.0, floor=None, sizing=5.0, committed=
     a.instrument_name = "TSM"
     a.account = _Acct(balance)
     a.expert_recommendation = None          # _virtual_equity: no instance -> 100%
+    a._capital_headroom = lambda: (balance, ())   # this double holds nothing but its balance
     a.existing_order = None
     a.sizing = sizing
     if floor is not None:
@@ -451,6 +447,9 @@ class _RMExpert:
         self.settings = {"risk_manager_mode": "classic_options",
                          "max_virtual_equity_per_instrument_percent": 10.0}
         self._rails = rails
+
+    def get_available_equity_balance_detail(self):
+        return 1e12, ()                     # the capital model is not what these tests exercise
 
     def get_setting_with_interface_default(self, key, log_warning=True):
         if key not in self._rails:

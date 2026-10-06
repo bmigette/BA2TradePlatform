@@ -287,7 +287,8 @@ def test_the_per_instrument_cap_still_clamps_the_shared_tails_budget(monkeypatch
 
     inst_id = add_instance(ExpertInstance(account_id=1, expert="MockExpert",
                                           virtual_equity_pct=100.0))
-    capped = SimpleNamespace(settings={"max_virtual_equity_per_instrument_percent": 1.0})
+    capped = SimpleNamespace(settings={"max_virtual_equity_per_instrument_percent": 1.0},
+                             get_available_equity_balance_detail=lambda: (1e12, ()))
     monkeypatch.setattr(
         ir_mod, "get_instance_resolver",
         lambda: SimpleNamespace(get_expert_instance=lambda _id: capped))

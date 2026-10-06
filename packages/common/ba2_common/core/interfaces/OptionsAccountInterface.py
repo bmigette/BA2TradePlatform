@@ -106,30 +106,6 @@ class ReservePool:
 
 
 @dataclass(frozen=True)
-class PendingOutlay:
-    """Cash the in-flight debit entries still have to pay, WITH the entries that could not be
-    valued (``unmeasurable``: order id, symbol, why). ``total`` is a lower bound whenever
-    ``unmeasurable`` is non-empty."""
-    total: float
-    unmeasurable: Tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class PositionCost:
-    """Cost of the open positions of an account's experts, or why it could not be read."""
-    total: float
-    unmeasurable: Tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class CapitalHeadroom:
-    """What the option book may still commit. ``value`` is None when ``unmeasurable`` names
-    anything that could not be read -- every gate refuses on it and names the culprits."""
-    value: Optional[float]
-    unmeasurable: Tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
 class AssignmentExposure:
     """Cash owed if every open SHORT PUT were assigned at once — the second view.
 
@@ -1435,6 +1411,30 @@ class OptionsAccountInterface(ABC):
     #: account-wide across every expert, until the order was closed by hand. It failed
     #: CLOSED — no capital was at risk — and it told the operator to repair a reserve that
     #: should never have existed.
+    #: ``order.data`` key a debit entry's builder stamps with the cash ONE contract of it
+    #: commits (``ResolvedStructure.cost_per_contract``), so a working entry that carries no
+    #: limit price (a market-type order) can still be valued by the expert capital calculation
+    #: (``MarketExpertInterface.used_balance_for_transactions``).
+    ENTRY_DEBIT_PER_CONTRACT_KEY = "entry_debit_per_contract"
+
+    def option_capital_equity(self) -> float:
+        """The equity the option book is bounded by: the account's EQUITY (cash plus marked
+        positions) from ``get_account_snapshot().equity`` -- the figure that is the same in a
+        backtest (its deployed equity) and at every live broker, which ``get_balance()`` is not
+        (CASH in a backtest, equity live). NO margin factor: options are cash-settled and the
+        option leverage is 1.0 at every supported broker, so a stock margin multiplier can never
+        let the option book use more than 100 % of equity. Raises ``ValueError`` when unpublished
+        or non-finite (unknown is never the cash figure)."""
+        snapshot = self.get_account_snapshot()
+        raw = None if snapshot is None else getattr(snapshot, "equity", None)
+        if raw is None:
+            raise ValueError(f"account {self.id} ({type(self).__name__}) published no equity")
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError(f"account {self.id} ({type(self).__name__}) published a "
+                             f"non-finite equity ({raw!r}); cannot bound the option book by it")
+        return value
+
     ZERO_RESERVE_STRATEGIES = frozenset({
         "long_call", "long_put", "bull_call_spread", "bear_put_spread",
         "straddle", "strangle", "covered_call", "protective_put",
@@ -2578,7 +2578,7 @@ class OptionsAccountInterface(ABC):
         # already on its way out is the direction that uncovers a call.
         return int(math.ceil(round(total, 6)))
 
-    def reserved_option_buying_power_detail(self, book: Optional[List[Any]] = None) -> "ReservePool":
+    def reserved_option_buying_power_detail(self) -> "ReservePool":
         """The reserve pool WITH its unknowns named — the honest form of the answer.
 
         A reserve belongs to the POSITION, not to the order row that created it: the broker
@@ -2637,7 +2637,7 @@ class OptionsAccountInterface(ABC):
         terminal = OrderStatus.get_terminal_statuses()
         total = 0.0
         blind: List[str] = []
-        for o in (self.open_option_orders_book_wide() if book is None else book):
+        for o in self.open_option_orders_book_wide():
             strategy = getattr(o, "option_strategy", None)
             raw = (o.data or {}).get("option_reserve") if isinstance(o.data, dict) else None
             reserve = None
@@ -2694,13 +2694,6 @@ class OptionsAccountInterface(ABC):
         balance x the option leverage, which is 1.0 at every supported broker today, so
         with margin off or on this equals the plain balance until an adapter reports real
         option leverage.
-
-        NOT THE GATE ANY MORE. ``get_balance()`` is CASH in a backtest and EQUITY at every
-        live broker, so this figure tightens after a filled debit in the backtest and never
-        live. The gates (``check_option_buying_power``, the debit entries in
-        ``TradeActions._size_and_submit``) read ``option_capital_headroom`` -- equity, cost of
-        open positions, reserves and pending debit entries, the same in both runtimes. This
-        stays for reporting.
         """
         from ba2_common.core.failure_modes import absorb_if_benign
         from ba2_common.logger import logger
@@ -2724,214 +2717,18 @@ class OptionsAccountInterface(ABC):
             return None
         return bal - pool.total
 
-    #: ``order.data`` key a debit entry's builder stamps with the cash ONE contract of it
-    #: commits (``ResolvedStructure.cost_per_contract``), so a working entry that carries no
-    #: limit price (a market-type order) can still be valued. Read by
-    #: :meth:`pending_option_debit_outlay_detail`.
-    ENTRY_DEBIT_PER_CONTRACT_KEY = "entry_debit_per_contract"
-
-    def pending_option_debit_outlay_detail(self, book: Optional[List[Any]] = None) -> "PendingOutlay":
-        """Cash this account's own in-flight option ENTRIES have yet to pay, WITH the orders
-        that could not be valued named.
-
-        A DEBIT entry (a bought single leg, a net-debit structure) is not a reserve: its cost
-        leaves the account when it FILLS, and until then nothing in the reserve pool knows
-        about it. Several entries decided in the same session therefore each sized
-        themselves against the SAME capital, and the sum of what they would pay could exceed
-        what the account holds (a 60 % sizing on five names is 300 %).
-
-        Counted: working (not yet filled) option orders that OPEN a debit position -- a
-        single-leg BUY, or a multi-leg PARENT that is not a reserving (credit) structure and
-        whose side is BUY -- for the unfilled remainder. Leg CHILDREN (no price of their own),
-        closing orders and credit structures contribute nothing, by name, not by guess.
-
-        VALUE of one working entry, in order: its ``limit_price`` x ``multiplier`` x unfilled
-        contracts; failing a readable limit (a market-type order), the per-contract debit its
-        builder stamped on the row (``ENTRY_DEBIT_PER_CONTRACT_KEY``) x unfilled contracts.
-        NOTHING is defaulted: a missing / non-numeric / non-positive limit with no stamped
-        debit, an unreadable quantity or multiplier, makes the entry UNMEASURABLE and it is
-        NAMED in ``unmeasurable`` (order id, symbol, why). Unknown is never zero.
-        """
-        from ba2_common.core.types import OrderDirection, OrderStatus
-
-        working = OrderStatus.get_active_statuses()
-        total = 0.0
-        blind: List[str] = []
-        for o in (self.open_option_orders_book_wide() if book is None else book):
-            if getattr(o, "status", None) not in working or getattr(o, "parent_order_id", None):
-                continue
-            strategy = getattr(o, "option_strategy", None)
-            intent = (getattr(o, "position_intent", None) or "").lower()
-            if "close" in intent or str(strategy or "") == "close":
-                continue
-            is_single_leg = getattr(o, "contract_symbol", None) is not None
-            if getattr(o, "side", None) != OrderDirection.BUY:
-                continue
-            if not is_single_leg and strategy in self.RESERVING_STRATEGIES:
-                continue                       # a credit structure: its reserve is the pool's
-            label = (f"order {getattr(o, 'id', '?')} ({strategy or 'single leg'} on "
-                     f"{getattr(o, 'symbol', '?')})")
-            quantity = self._readable_positive_number(getattr(o, "quantity", None))
-            if quantity is None:
-                blind.append(f"{label} is a working debit entry with an unreadable quantity "
-                             f"({getattr(o, 'quantity', None)!r})")
-                continue
-            filled = self._readable_number(getattr(o, "filled_qty", None)) or 0.0
-            remaining = max(quantity - filled, 0.0)
-            limit = self._readable_positive_number(getattr(o, "limit_price", None))
-            if limit is not None:
-                multiplier = self._readable_positive_number(getattr(o, "multiplier", None))
-                if multiplier is None:
-                    blind.append(f"{label} is a working debit entry with an unreadable "
-                                 f"multiplier ({getattr(o, 'multiplier', None)!r})")
-                    continue
-                total += limit * multiplier * remaining
-                continue
-            stamped = None
-            if isinstance(getattr(o, "data", None), dict):
-                stamped = self._readable_positive_number(
-                    o.data.get(self.ENTRY_DEBIT_PER_CONTRACT_KEY))
-            if stamped is None:
-                blind.append(f"{label} is a working debit entry with no readable limit price "
-                             f"({getattr(o, 'limit_price', None)!r}) and no recorded "
-                             f"{self.ENTRY_DEBIT_PER_CONTRACT_KEY}, so its cost is UNKNOWN")
-                continue
-            total += stamped * remaining
-        if blind:
-            from ba2_common.logger import logger
-            logger.error(f"Account {self.id}: {len(blind)} working option entr(ies) cannot be "
-                         f"valued, so the option capital headroom is UNKNOWN until repaired: "
-                         + "; ".join(blind))
-        return PendingOutlay(total=total, unmeasurable=tuple(blind))
-
-    def pending_option_debit_outlay(self, book: Optional[List[Any]] = None) -> float:
-        """The readable part of :meth:`pending_option_debit_outlay_detail` (a LOWER BOUND when
-        any entry is unmeasurable); gates must read the detail."""
-        return self.pending_option_debit_outlay_detail(book).total
-
-    def open_position_cost_basis(self) -> "PositionCost":
-        """Cost of what this account's experts hold, priced by the STOCK path's own function.
-
-        Every OPENED transaction of every expert on this account (the classic RM's
-        ``available = virtual - used`` reads one expert's; the account bound reads all of
-        them) through ``MarketExpertInterface.used_balance_for_transactions``, with the loss
-        adjustment OFF: the equity this is subtracted from already carries the marks.
-        Stock rows are their cost; an option row counts only when it is a DEBIT (side BUY, a
-        positive price) -- a credit structure commits its RESERVE (the pool) and its premium
-        is not capital spent.
-
-        ``unmeasurable`` names a failure to read (never a silent zero): the headroom is then
-        unknown. Manual positions no expert tracks are not attributable and are not here.
-        """
-        from ba2_common.core.db import get_all_instances
-        from ba2_common.core.interfaces.MarketExpertInterface import used_balance_for_transactions
-        from ba2_common.core.models import ExpertInstance
-        from ba2_common.core.trade_store import transactions_where
-        from ba2_common.core.types import AssetClass, OrderDirection, TransactionStatus
-
-        try:
-            rows = []
-            for expert in get_all_instances(ExpertInstance):
-                if getattr(expert, "account_id", None) != self.id:
-                    continue
-                for t in transactions_where(expert_id=expert.id,
-                                            statuses=[TransactionStatus.OPENED]):
-                    if t.asset_class == AssetClass.OPTION:
-                        if (t.side != OrderDirection.BUY or t.open_price is None
-                                or t.open_price <= 0
-                                or t.option_strategy in self.RESERVING_STRATEGIES):
-                            continue
-                    rows.append(t)
-            return PositionCost(
-                total=float(used_balance_for_transactions(self, rows, loss_adjusted=False)))
-        except Exception as e:  # noqa: BLE001 -- named below, never absorbed into a number
-            from ba2_common.logger import logger
-            logger.error(f"Account {self.id}: open position cost unreadable: {e}", exc_info=True)
-            return PositionCost(total=0.0, unmeasurable=(f"open position cost unreadable "
-                                                         f"({type(e).__name__}: {e})",))
-
-    def option_capital_equity(self) -> float:
-        """The equity the option book is bounded by: the account's EQUITY (cash plus marked
-        positions), read from ``get_account_snapshot().equity``.
-
-        THE SAME QUANTITY IN BOTH RUNTIMES, which ``get_balance()`` is not (cash in a
-        backtest, equity at every live broker -- finding 6). The snapshot publishes equity in
-        both: the backtest its deployed equity, a broker its account equity. Options are
-        cash-settled and the option leverage is 1.0 at every supported broker
-        (``get_option_tradable_balance``), so no factor is applied; a broker that reports a real
-        option multiplier must override this. Raises ``ValueError`` when the equity is
-        unpublished or non-finite: unknown is never the cash figure.
-        """
-        snapshot = self.get_account_snapshot()
-        raw = None if snapshot is None else getattr(snapshot, "equity", None)
-        if raw is None:
-            raise ValueError(f"account {self.id} ({type(self).__name__}) published no equity")
-        value = float(raw)
-        if not math.isfinite(value):
-            raise ValueError(f"account {self.id} ({type(self).__name__}) published a "
-                             f"non-finite equity ({raw!r}); cannot bound the option book by it")
-        return value
-
-    def option_capital_headroom_detail(self) -> "CapitalHeadroom":
-        """What the option book may still COMMIT, with every unreadable input named.
-
-        ``equity - cost of open positions - option reserves - pending debit entries``:
-        owner rule, "options must not use more than 100 % of the equity, like with stocks".
-
-        THE BOUND IS PER ACCOUNT. The stock path bounds each EXPERT at
-        ``virtual - used`` (its ``virtual_equity_pct`` slice less its own open cost) and
-        clamps that to what the ACCOUNT can still spend; the option reserve pool, the pending
-        entries and this headroom are all account-wide books, and the owner's rule is about
-        the account. An option expert's own slice keeps governing each entry's size
-        (``option_sizing`` x virtual equity, the per-instrument cap) exactly as before.
-
-        A negative value means over-committed. ``value`` is None -- unknown -- when the equity,
-        the reserve pool, the pending entries or the position cost cannot be read, and then
-        ``unmeasurable`` names each (order id / symbol / why).
-        """
-        from ba2_common.core.failure_modes import absorb_if_benign
-        from ba2_common.logger import logger
-
-        book = self.open_option_orders_book_wide()          # ONE read for pool and pending
-        pool = self.reserved_option_buying_power_detail(book)
-        pending = self.pending_option_debit_outlay_detail(book)
-        cost = self.open_position_cost_basis()
-        blind = pool.unmeasurable + pending.unmeasurable + cost.unmeasurable
-        try:
-            equity = self.option_capital_equity()
-        except Exception as e:  # noqa: BLE001 -- narrowed by absorb_if_benign
-            absorb_if_benign(e, ValueError, *self._cover_benign_errors())
-            logger.error(f"Account {self.id}: option capital equity unavailable: {e}",
-                         exc_info=True)
-            blind = blind + (f"account equity unavailable ({e})",)
-            equity = None
-        if blind:
-            return CapitalHeadroom(value=None, unmeasurable=tuple(blind))
-        return CapitalHeadroom(
-            value=equity - cost.total - pool.total - pending.total, unmeasurable=())
-
-    def option_capital_headroom(self) -> Optional[float]:
-        """:meth:`option_capital_headroom_detail`'s value; ``None`` when unknown."""
-        return self.option_capital_headroom_detail().value
-
     def check_option_buying_power(self, required: float) -> bool:
-        """True if `required` reserve fits in the option capital headroom.
+        """True if `required` reserve fits in available buying power.
 
         A required reserve of zero always passes: reserving nothing needs no capacity,
         and refusing it would break the entire long/debit arm the moment one unrelated
-        row lost its reserve. Anything above zero measured against an UNKNOWN headroom
+        row lost its reserve. Anything above zero measured against an UNKNOWN pool
         refuses — "we cannot measure this" and "this is fine" must never be the same
         answer.
-
-        THE HEADROOM IS THE ACCOUNT'S (``option_capital_headroom``): equity less the cost of
-        open positions, less every reserve, less the debit entries still in flight. A credit
-        structure's reserve (and a butterfly's excess) is therefore also refused when pending
-        DEBIT entries or open stock positions have already spoken for the capital -- wider
-        than the debit arm it was introduced for, and the same in backtest and live.
         """
         if required <= 0:
             return True
-        available = self.option_capital_headroom()
+        available = self.available_option_buying_power()
         if available is None:
             return False
         return required <= available
