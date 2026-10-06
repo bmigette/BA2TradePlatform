@@ -6580,6 +6580,128 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         return nearest.implied_volatility
 
     # ======================================================================
+    # IV rank from DERIVED ATM-IV history (BT/live statistic parity)
+    #
+    # ``OptionsAccountInterface._iv_series`` / ``get_iv_rank`` read the ~daily 16:30
+    # ``option_iv_snapshot`` rows (Alpaca snapshot IV, calls+puts nearest strike), a different
+    # statistic from the backtest's and with only days of history. Here the series comes from
+    # ``AtmIvHistoryProvider`` (Alpaca daily option bars inverted with the backtest's own
+    # Black-Scholes and ATM selection). Overridden HERE, not in the shared interface, so no
+    # package changes; see ``modules/dataproviders/options/atm_iv_history.py``.
+    # ======================================================================
+    #: minimum share of the window's sessions that must carry a value before a rank is served
+    IV_RANK_MIN_COVERAGE = 0.80
+
+    def _atm_iv_history(self):
+        p = getattr(self, "_atm_iv_history_provider", None)
+        if p is None:
+            from ..dataproviders.options.atm_iv_history import get_provider_for_credentials
+            p = get_provider_for_credentials(self.settings["api_key"], self.settings["api_secret"],
+                                             bool(self.settings["paper_account"]))
+            self._atm_iv_history_provider = p
+        return p
+
+    def _snapshot_iv_by_session(self, underlying: str, start, end) -> Dict[Any, float]:
+        """The 16:30 snapshot rows as {New York session date: atm_iv} (latest row of a day)."""
+        from ba2_common.core.models import OptionIVSnapshot
+        from zoneinfo import ZoneInfo
+        ny = ZoneInfo("America/New_York")
+        lo = datetime(start.year, start.month, start.day, tzinfo=timezone.utc) - timedelta(days=1)
+        with get_db() as session:
+            rows = session.exec(
+                select(OptionIVSnapshot).where(
+                    OptionIVSnapshot.account_id == self.id,
+                    OptionIVSnapshot.underlying == underlying,
+                    OptionIVSnapshot.recorded_at >= lo)
+                .order_by(OptionIVSnapshot.recorded_at)).all()
+            pairs = [(r.recorded_at, r.atm_iv) for r in rows]
+        out: Dict[Any, float] = {}
+        for ts, iv in pairs:
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            d = ts.astimezone(ny).date()
+            if start <= d <= end:
+                out[d] = iv
+        return out
+
+    def _iv_rank_state(self, underlying: str, lookback_days: Optional[int], *,
+                       fill: bool = True) -> Dict[str, Any]:
+        """Series + current for the rank. ``fill=False`` reads the store only (zero API calls).
+
+        Keys: ok (series complete), series (values strictly before the last completed session
+        L), current (derived IV of L), n/m (coverage of the series), status, provenance, reason."""
+        from ..dataproviders.options.atm_iv_history import STATUS_COMPLETE, merge_snapshots
+        if lookback_days is None:
+            lookback_days = self.IV_RANK_LOOKBACK_DAYS
+        state: Dict[str, Any] = {"ok": False, "series": [], "current": None, "n": 0, "m": 0,
+                                 "status": "unavailable", "provenance": {}, "reason": None,
+                                 "L": None}
+        try:
+            prov = self._atm_iv_history()
+            L = prov.last_completed_session()
+            res = (prov.get_atm_iv_series(underlying, L, lookback_days) if fill
+                   else prov.peek(underlying, L, lookback_days))
+            df = prov.read_store(underlying)
+            stored = {ts.date() for ts in df["session_date"]} if len(df) else set()
+            snaps = (self._snapshot_iv_by_session(underlying, res.window_start, L)
+                     if res.window_start is not None else {})
+            merged, provenance = merge_snapshots(res, snaps, stored)
+            series = {d: v for d, v in merged.items() if d < L}
+            state.update(status=res.status, reason=res.reason, series=list(series.values()),
+                         current=res.values.get(L), n=len(series), m=max(res.expected - 1, 0),
+                         provenance=provenance, L=L, ok=res.status == STATUS_COMPLETE)
+        except Exception as e:  # noqa: BLE001 -- fail closed, loudly (a gate reading None stays shut)
+            state["reason"] = f"{type(e).__name__}: {e}"
+            logger.warning(f"ATM-IV history unavailable for {underlying}: {state['reason']}")
+        return state
+
+    def _iv_series(self, underlying: str, lookback_days: Optional[int] = None):
+        """Trailing ATM-IV samples strictly before the last completed session: derived rows
+        first, 16:30 snapshots only for dates with no derived row. Empty unless the derived
+        series is complete (a filling series must not look like a short real one)."""
+        st = self._iv_rank_state(underlying, lookback_days)
+        return list(st["series"]) if st["ok"] else []
+
+    def iv_sample_count(self, underlying: str, lookback_days: Optional[int] = None) -> int:
+        """Readiness count from the STORE ONLY (the startup report must not start fills or
+        spend API calls)."""
+        return int(self._iv_rank_state(underlying, lookback_days, fill=False)["n"])
+
+    def get_iv_rank(self, underlying: str, lookback_days: Optional[int] = None,
+                    min_samples: int = 20, current: Optional[float] = None) -> Optional[float]:
+        """IV percentile of the LAST COMPLETED SESSION's derived ATM IV against the trailing
+        derived series (backtest parity: the BT ranks the as-of bar's IV against the sessions
+        before it). ``current`` may be supplied by a caller that holds one; it is NOT fetched
+        from the live snapshot any more.
+
+        None (gate false, exactly as 'IV rank unavailable') while the series is filling or
+        unavailable, when coverage is below max(min_samples, 80% of the window's sessions), or
+        when the last session has no derived value. Never a partial number. One warning per
+        symbol per day."""
+        import math as _m
+        from datetime import date as _date
+        from ..dataproviders.options.atm_iv_history import _warn_once_per_day
+        st = self._iv_rank_state(underlying, lookback_days)
+        today = _date.today()
+
+        def _none(why: str):
+            _warn_once_per_day(f"ivrank:{self.id}:{underlying}",
+                               f"IV rank for {underlying} unavailable: {why}", today)
+            return None
+
+        if not st["ok"]:
+            if st["status"] == "filling":
+                return _none(f"ATM-IV history filling {st['n']}/{st['m']}")
+            return _none(f"ATM-IV history {st['status']} ({st['reason']})")
+        need = max(int(min_samples), _m.ceil(self.IV_RANK_MIN_COVERAGE * st["m"]))
+        if st["n"] < need:
+            return _none(f"coverage {st['n']}/{st['m']} below the required {need}")
+        cur = current if current is not None else st["current"]
+        if cur is None:
+            return _none(f"no derived ATM IV for the last completed session {st['L']}")
+        return self._iv_rank_from_series(st["series"], cur, min_samples)
+
+    # ======================================================================
     # OptionsAccountInterface — TEMPORARY stubs (replaced in later tasks)
     # ======================================================================
     @staticmethod
