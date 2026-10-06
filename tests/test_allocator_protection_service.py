@@ -600,6 +600,7 @@ def test_a_shrinking_position_is_resized_automatically_with_a_log_entry(acct, br
     _save(acct)
     old = {s.complex_order_id for s in _slices()}
     broker.positions["ABC"] = Decimal(6)
+    assert aps.reconcile_account(acct).resized == [] and broker.delete_calls == []     # first sighting: wait
     report = aps.reconcile_account(acct)
     assert report.resized == ["ABC"] and set(broker.delete_calls) == old
     assert aps.covered_quantity(_slices()) == 6
@@ -652,6 +653,7 @@ def test_a_failed_automatic_resize_is_loud_and_not_retried(acct, broker, activit
     broker.positions["ABC"] = Decimal(6)
     broker.raise_on_place = TastytradeError("rejected: no")
     p = aps.get_protection(1, "ABC")
+    aps.reconcile_account(acct)                                                  # first sighting of the shrink
     assert aps.reconcile_account(acct).alarms == ["ABC"]
     p = aps.get_protection(1, "ABC")
     assert p.auto_failures == 1 and p.alert_code is not None
@@ -684,6 +686,7 @@ def test_the_growth_path_stops_retrying_after_three_failures_and_alerts(acct, br
 def test_a_position_sold_elsewhere_while_protected_is_resized(acct, broker):
     _save(acct)
     broker.positions["ABC"] = Decimal(4)
+    aps.reconcile_account(acct)                                                  # first sighting
     assert aps.reconcile_account(acct).resized == ["ABC"] and aps.covered_quantity(_slices()) == 4
 
 

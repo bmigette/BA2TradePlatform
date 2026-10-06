@@ -50,6 +50,8 @@ STATUS_PROTECTED = "PROTECTED"
 STATUS_PARTIAL = "PARTIAL"
 STATUS_UNPROTECTED = "UNPROTECTED"
 STATUS_REPLACING = "REPLACING"
+#: Switched off / deleted, but a cancel was never confirmed: orders may still rest at the broker.
+STATUS_CANCEL_UNCONFIRMED = "CANCEL_UNCONFIRMED"
 
 #: Alarm / alert codes (persisted on the protection row and written to the activity log).
 CODE_PLACEMENT_REFUSED = "PLACEMENT_REFUSED"
@@ -314,6 +316,13 @@ class ProtectiveDryRun:
     bp_change: Optional[float] = None
     message: str = ""
     margin_failed: bool = False
+
+
+def no_acceptable_stop_sentence(available: Optional[float] = None, distance_pct: float = 3.0) -> str:
+    """What the dialog says when no stop at or below the suggestion cap is accepted. Never a near-market stop."""
+    detail = f" (available ${available:,.2f})" if available is not None else ""
+    return (f"No acceptable stop for this symbol/account: TastyTrade refuses even a stop {distance_pct:g}% below "
+            f"the market{detail}. Free buying power or reduce the position.")
 
 
 def margin_sentence(*, needed: Optional[float] = None, available: Optional[float] = None,
@@ -708,7 +717,7 @@ class ProtectionStatus:
 
 _COLORS = {STATUS_OFF: "grey", STATUS_NO_POSITION: "grey", STATUS_PROTECTED: "positive",
            STATUS_PARTIAL: "warning", STATUS_REPLACING: "warning",
-           STATUS_UNPROTECTED: "negative"}
+           STATUS_UNPROTECTED: "negative", STATUS_CANCEL_UNCONFIRMED: "warning"}
 
 
 def _as_utc_naive(value: Optional[DateTime]) -> Optional[DateTime]:
@@ -736,6 +745,12 @@ def protection_status(*, enabled: bool, pending_replace: bool, disarmed_note: Op
     alarms = [state for state, _ in slice_states if state in SLICE_ALARM_STATES]
     tail = f" Last fill: {last_fill_note}." if last_fill_note else ""
 
+    if not enabled and any(state == SLICE_CANCELLING for state, _ in slice_states):
+        return ProtectionStatus(
+            STATUS_CANCEL_UNCONFIRMED, "Cancel unconfirmed", _COLORS[STATUS_CANCEL_UNCONFIRMED],
+            "TP/SL was switched off but the broker has not confirmed the cancel of every protective order: "
+            "they may still rest at the broker. The next refresh closes this once they are gone; otherwise "
+            "check the TastyTrade site." + tail, alarm=True)
     if not enabled:
         gone = f" Disarmed after the position was exited (was: {disarmed_note}); set TP/SL again on re-entry." if disarmed_note else ""
         return ProtectionStatus(STATUS_OFF, "Set TP/SL", _COLORS[STATUS_OFF],
