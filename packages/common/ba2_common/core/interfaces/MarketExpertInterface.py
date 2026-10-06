@@ -1,4 +1,5 @@
 import math
+import time
 from abc import abstractmethod
 from contextlib import contextmanager
 from datetime import datetime
@@ -1896,9 +1897,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         true "can I actually place this order" figure); different account implementations name it
         differently (Alpaca/backtest: ``buying_power``; IBKR: ``buying_power``; TastyTrade:
         ``equity_buying_power`` or ``cash_balance``), so several known names are tried in order.
-        Falls back to ``get_balance()`` (equity) if none are present — a real, if less precise,
-        cap; still catches an account whose overall value has genuinely dropped. None (never a
-        fabricated number) if nothing is available."""
+        The read is retried (``_ACTUAL_BP_ATTEMPTS`` tries, ``_ACTUAL_BP_BACKOFF_S`` apart). When it
+        still fails, or the account publishes no figure, an ERROR is logged and None ("no clamp")
+        is returned: the broker's own order check is then the remaining guard. There is NO equity
+        (``get_balance()``) substitute -- equity is not buying power. A backtest account's read
+        cannot fail, so it never sleeps there."""
         # The broker-agnostic snapshot FIRST: ``AccountSnapshot.buying_power`` is each
         # adapter's REMAINING stock buying power (Alpaca: regt_buying_power; TastyTrade:
         # equity_buying_power; backtest/IBKR: the same figure get_account_info() carries).
@@ -1922,12 +1925,49 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     f"from cash or net liquidation instead")
             return mandatory
 
+        # Everything below is a READ of a broker figure that can fail transiently: retry it a
+        # small bounded number of times (the sizing path is waiting, so keep it short), and if it
+        # still fails say so LOUDLY and size without the clamp -- the broker's own order check is
+        # then the remaining guard. No substitute figure: equity is NOT buying power.
+        attempts = MarketExpertInterface._ACTUAL_BP_ATTEMPTS
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return MarketExpertInterface._read_actual_buying_power(account)
+            except Exception as e:  # noqa: BLE001 -- a broker hiccup: retried, then reported at ERROR below
+                last_error = e
+                if attempt < attempts:
+                    logger.warning(
+                        f"Account {getattr(account, 'id', '?')}: buying power read failed "
+                        f"(attempt {attempt}/{attempts}): {type(e).__name__}: {e}; retrying in "
+                        f"{MarketExpertInterface._ACTUAL_BP_BACKOFF_S:.1f}s")
+                    MarketExpertInterface._ACTUAL_BP_SLEEP(MarketExpertInterface._ACTUAL_BP_BACKOFF_S)
+        logger.error(
+            f"Account {getattr(account, 'id', '?')}: buying power could not be read after "
+            f"{attempts} attempts ({type(last_error).__name__}: {last_error}). The available-balance "
+            f"clamp is SKIPPED for this sizing call; the broker's own order check is the remaining guard.")
+        return None
+
+    #: Total tries (first read included) and the pause between them for the buying-power read.
+    _ACTUAL_BP_ATTEMPTS = 3
+    _ACTUAL_BP_BACKOFF_S = 1.0
+    _ACTUAL_BP_SLEEP = staticmethod(time.sleep)
+
+    @staticmethod
+    def _read_actual_buying_power(account: AccountInterface) -> Optional[float]:
+        """One attempt at the buying-power figure. Raises when the broker read itself fails (the
+        caller retries); returns None when the account answered but publishes no usable figure."""
         snap_fn = getattr(account, "get_account_snapshot", None)
+        snap_error: Optional[BaseException] = None
         if callable(snap_fn):
+            snap_bp = None
             try:
                 snap_bp = getattr(snap_fn(), "buying_power", None)
-            except Exception:  # noqa: BLE001 — same contract as the info probe: never block sizing
-                snap_bp = None
+            except Exception as e:  # noqa: BLE001 -- the raw info probe below is the same read's second source
+                snap_error = e
+                logger.warning(
+                    f"Account {getattr(account, 'id', '?')}: snapshot read failed "
+                    f"({type(e).__name__}: {e}); trying get_account_info() for the clamp")
             if snap_bp is not None:
                 try:
                     snap_num = float(snap_bp)
@@ -1939,10 +1979,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     f"Account {getattr(account, 'id', '?')}: unusable snapshot buying_power "
                     f"({snap_bp!r}); falling back to get_account_info() for the clamp")
 
-        try:
-            info = account.get_account_info()
-        except Exception:  # noqa: BLE001 — a broker hiccup here must not block the virtual figure
-            info = None
+        info = account.get_account_info()   # a raise here fails this attempt (the caller retries)
 
         def _field(obj: Any, name: str) -> Optional[float]:
             val = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
@@ -1969,11 +2006,16 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 if val is not None:
                     return val
 
-        try:
-            return account.get_balance()
-        except Exception:  # noqa: BLE001 — best-effort; None means "couldn't determine, don't clamp"
-            return None
-    
+        if snap_error is not None:
+            raise snap_error    # the snapshot failed and the probe had no figure either: a failed read
+        # The account answered but carries no buying-power figure. NOT get_balance(): equity is not
+        # spendable power and substituting it hid a missing figure behind a plausible number.
+        logger.error(
+            f"Account {getattr(account, 'id', '?')}: neither the snapshot nor get_account_info() "
+            f"carries a usable buying power; the available-balance clamp is SKIPPED for this sizing "
+            f"call (the broker's own order check is the remaining guard)")
+        return None
+
     def has_sufficient_equity_for_trading(self) -> tuple[bool, str]:
         """
         Check if expert has sufficient available equity to create new positions.

@@ -7,6 +7,9 @@ allowed to sum past 100% across an account's experts), or (b) a manual trade pla
 expert's tracking -- both silently consume REAL account cash the expert's own math never learns
 about, letting it believe it can afford more than the account actually has.
 """
+import contextlib
+import logging
+
 import pytest
 from types import SimpleNamespace
 
@@ -109,6 +112,44 @@ def test_available_balance_untouched_when_actual_is_higher():
 # ---------------------------------------------------------------------------
 # _get_actual_available_balance: field-name fallback order, in isolation
 # ---------------------------------------------------------------------------
+class _LogCapture:
+    def __init__(self):
+        self.errors, self.warnings = [], []
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self, cap):
+        super().__init__(level=logging.DEBUG)
+        self.cap = cap
+
+    def emit(self, record):
+        if record.levelno >= logging.ERROR:
+            self.cap.errors.append(record.getMessage())
+        elif record.levelno == logging.WARNING:
+            self.cap.warnings.append(record.getMessage())
+
+
+@contextlib.contextmanager
+def _ba2_logs():
+    """``ba2_common.logger`` has propagate=False, so caplog sees nothing: attach a handler."""
+    from ba2_common.logger import logger as ba2_logger
+    cap = _LogCapture()
+    handler = _ListHandler(cap)
+    ba2_logger.addHandler(handler)
+    try:
+        yield cap
+    finally:
+        ba2_logger.removeHandler(handler)
+
+
+@pytest.fixture
+def no_bp_sleep(monkeypatch):
+    """Record the backoff instead of sleeping."""
+    slept = []
+    monkeypatch.setattr(MarketExpertInterface, "_ACTUAL_BP_SLEEP", staticmethod(slept.append))
+    return slept
+
+
 class _InfoObj:
     """Attribute-style account info (mirrors the raw Alpaca SDK object)."""
     def __init__(self, **kw):
@@ -130,18 +171,30 @@ def test_actual_balance_falls_back_through_known_field_names():
     assert MarketExpertInterface._get_actual_available_balance(account) == 7.0
 
 
-def test_actual_balance_falls_back_to_get_balance_when_no_known_field():
+def test_actual_balance_no_longer_substitutes_equity_when_no_known_field():
+    """Equity is not buying power: an account that publishes no figure is NOT clamped (None), loudly."""
     account = _FakeAccount(1, balance=250.0, account_info={"account_number": "abc"})
-    assert MarketExpertInterface._get_actual_available_balance(account) == 250.0
+    with _ba2_logs() as logs:
+        assert MarketExpertInterface._get_actual_available_balance(account) is None
+    assert len(logs.errors) == 1 and "SKIPPED" in logs.errors[0]
 
 
-def test_actual_balance_falls_back_to_get_balance_when_account_info_raises():
+def test_actual_balance_is_none_after_bounded_retries_when_account_info_raises(no_bp_sleep):
     class _BrokenInfoAccount(_FakeAccount):
+        calls = 0
+
         def get_account_info(self):
+            type(self).calls += 1
             raise RuntimeError("broker hiccup")
 
     account = _BrokenInfoAccount(1, balance=88.0, account_info=None)
-    assert MarketExpertInterface._get_actual_available_balance(account) == 88.0
+    with _ba2_logs() as logs:
+        assert MarketExpertInterface._get_actual_available_balance(account) is None
+    assert _BrokenInfoAccount.calls == MarketExpertInterface._ACTUAL_BP_ATTEMPTS == 3
+    assert len(logs.errors) == 1                       # ONE error per sizing call, not one per attempt
+    assert "account" in logs.errors[0].lower() and "broker hiccup" in logs.errors[0]
+    assert "SKIPPED" in logs.errors[0] and "broker" in logs.errors[0]
+    assert no_bp_sleep == [1.0, 1.0]                   # short, bounded backoff between the 3 tries
 
 
 def test_actual_balance_prefers_the_snapshot_seam_over_the_raw_info_probe():
@@ -164,10 +217,81 @@ def test_actual_balance_falls_back_to_the_info_probe_when_the_snapshot_has_none(
     assert MarketExpertInterface._get_actual_available_balance(account) == 5_000.0
 
 
-def test_actual_balance_falls_back_when_the_snapshot_call_raises():
+def test_actual_balance_falls_back_when_the_snapshot_call_raises(no_bp_sleep):
     class _SnapAccount(_FakeAccount):
         def get_account_snapshot(self):
             raise RuntimeError("broker down")
 
     account = _SnapAccount(1, balance=999.0, account_info={"buying_power": 4_000.0})
     assert MarketExpertInterface._get_actual_available_balance(account) == 4_000.0
+
+
+# ---------------------------------------------------------------------------
+# Retry, then proceed LOUDLY without the clamp (2026-10-07, audit item 19)
+# ---------------------------------------------------------------------------
+class _FlakySnapshotAccount(_FakeAccount):
+    """The snapshot read raises ``failures`` times, then answers."""
+
+    def __init__(self, failures, **kw):
+        super().__init__(**kw)
+        self.failures = failures
+        self.snapshot_calls = 0
+
+    def get_account_snapshot(self):
+        self.snapshot_calls += 1
+        if self.snapshot_calls <= self.failures:
+            raise RuntimeError("transient broker error")
+        return SimpleNamespace(buying_power=10_000.0)
+
+    def get_account_info(self):
+        raise RuntimeError("info down too")
+
+
+def test_a_snapshot_that_fails_twice_then_succeeds_clamps_without_an_error(no_bp_sleep):
+    account = _FlakySnapshotAccount(2, id_val=1, balance=100_000.0, account_info=None)
+    with _ba2_logs() as logs:
+        assert MarketExpertInterface._get_actual_available_balance(account) == 10_000.0
+    assert account.snapshot_calls == 3
+    assert logs.errors == []
+    assert no_bp_sleep == [1.0, 1.0]
+
+
+def test_a_snapshot_that_never_answers_logs_one_error_and_skips_the_clamp(no_bp_sleep):
+    account = _FlakySnapshotAccount(99, id_val=7, balance=100_000.0, account_info=None)
+    with _ba2_logs() as logs:
+        assert MarketExpertInterface._get_actual_available_balance(account) is None   # no raise
+    assert account.snapshot_calls == 3
+    assert len(logs.errors) == 1
+    assert "Account 7" in logs.errors[0] and "SKIPPED" in logs.errors[0]
+
+
+@pytest.mark.usefixtures("reset_test_db")
+def test_sizing_proceeds_unclamped_when_buying_power_never_reads(no_bp_sleep):
+    """End to end: the virtual figure stands (no equity substitute clamps it), one ERROR per sizing call."""
+    from ba2_common.core.instance_resolver import get_instance_resolver, set_instance_resolver
+
+    acct_def = factories.create_account_definition()
+    inst = factories.create_expert_instance(
+        account_id=acct_def.id, expert="_BalanceExpert", virtual_equity_pct=100.0)
+    expert = _BalanceExpert(inst.id)
+    # equity (get_balance) 5_000 is LOWER than the virtual figure would be if it were a clamp:
+    # prove it is not used as one.
+    account = _FlakySnapshotAccount(99, id_val=acct_def.id, balance=100_000.0, account_info=None)
+    account.get_balance = lambda: 5_000.0
+    account.get_tradable_balance = lambda: 100_000.0
+
+    prev = get_instance_resolver()
+    try:
+        set_instance_resolver(_resolver_for(account))
+        with _ba2_logs() as logs:
+            available = expert.get_available_balance()
+    finally:
+        set_instance_resolver(prev)
+    assert available == 100_000.0
+    assert len([m for m in logs.errors if "SKIPPED" in m]) == 1
+
+
+def test_a_backtest_style_account_never_sleeps_or_retries(no_bp_sleep):
+    account = _FakeAccount(1, balance=1.0, account_info={"buying_power": 321.0})
+    assert MarketExpertInterface._get_actual_available_balance(account) == 321.0
+    assert no_bp_sleep == []

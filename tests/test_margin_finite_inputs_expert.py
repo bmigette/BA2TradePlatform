@@ -106,13 +106,14 @@ def test_a_nan_buying_power_falls_through_to_the_next_field(warnings_logged):
     assert "non-finite buying_power" in warnings_logged[0] and "Account 4" in warnings_logged[0]
 
 
-def test_a_nan_buying_power_alone_falls_back_to_get_balance(warnings_logged):
-    """Exactly as an absent or non-numeric field does today: nothing usable in the
-    info dict, so the equity figure is the (less precise, still real) cap."""
+def test_a_nan_buying_power_alone_gives_no_clamp_not_equity(warnings_logged):
+    """Nothing usable in the info dict: the clamp is SKIPPED (an ERROR is logged, the broker's own
+    check is the remaining guard). Equity is no longer substituted for buying power
+    (audit item 19, 2026-10-07)."""
     account = _Account(4, balance=250.0, tradable=250.0,
                        account_info={"buying_power": NAN})
 
-    assert MarketExpertInterface._get_actual_available_balance(account) == 250.0
+    assert MarketExpertInterface._get_actual_available_balance(account) is None
     assert len(warnings_logged) == 1
 
 
