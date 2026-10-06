@@ -3936,21 +3936,24 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # '+$X excluded' text. Static, like the count it replaces: membership changes reload the page.
             segments = label_badge_segments(view.rows, view.excluded_value)
             legend = '\n'.join(seg['tooltip'] for seg in segments[1:])
-            with ui.row().classes('items-center no-wrap gap-0 shrink-0 pf-b-count pf-seg') \
-                    .mark(MARKER_LABEL_SEGMENTS):
-                count_badge = ui.badge(str(len(view.rows))).props('color=grey-7') \
-                    .classes('pf-seg-part').mark(MARKER_LABEL_COUNT_BADGE)
-                with count_badge:
-                    ui.tooltip(SYMBOL_COUNT_BADGE_TOOLTIP_FMT.format(
-                        count=len(view.rows), label=view.label)
-                        + ('\n' + legend if legend else '')
-                        + (f"\n{segments[0]['unmeasured']} with no measurable P&L"
-                           if segments[0].get('unmeasured') else '')).style('white-space:pre-line')
-                for seg in segments[1:]:
-                    part = ui.badge(str(seg['count'])).props(f"color={seg['color']}") \
-                        .classes('pf-seg-part').mark(MARKER_SEGMENT_PREFIX + seg['key'])
-                    with part:
-                        ui.tooltip(seg['tooltip'])
+            # THE PILL SITS IN A FIXED-WIDTH SLOT (room for all four segments): its own width depends on how
+            # many segments the label has, and everything to its right (value, bar) would otherwise start at
+            # a different x on every row.
+            with ui.row().classes('items-center no-wrap shrink-0 pf-b-count').style('min-width:7.5rem'):
+                with ui.row().classes('items-center no-wrap gap-0 pf-seg').mark(MARKER_LABEL_SEGMENTS):
+                    count_badge = ui.badge(str(len(view.rows))).props('color=grey-7') \
+                        .classes('pf-seg-part').mark(MARKER_LABEL_COUNT_BADGE)
+                    with count_badge:
+                        ui.tooltip(SYMBOL_COUNT_BADGE_TOOLTIP_FMT.format(
+                            count=len(view.rows), label=view.label)
+                            + ('\n' + legend if legend else '')
+                            + (f"\n{segments[0]['unmeasured']} with no measurable P&L"
+                               if segments[0].get('unmeasured') else '')).style('white-space:pre-line')
+                    for seg in segments[1:]:
+                        part = ui.badge(str(seg['count'])).props(f"color={seg['color']}") \
+                            .classes('pf-seg-part').mark(MARKER_SEGMENT_PREFIX + seg['key'])
+                        with part:
+                            ui.tooltip(seg['tooltip'])
             widgets['count_badge'] = count_badge
             # 'freed Y% from TP/SL fills' (a share a protective fill released and left unallocated).
             extras = label_extras_text(view.excluded_value, view.excluded_count, view.freed_pct)
