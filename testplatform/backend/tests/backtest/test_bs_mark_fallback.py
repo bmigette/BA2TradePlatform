@@ -192,6 +192,7 @@ def test_bar_wins_over_bs_when_both_available(tmp_path, monkeypatch):
         extra_bar_rows=[_bar(_AMD_CALL_500, "2024-03-07", 3.2, "call", 500.0,
                               underlying="AMD", iv=0.31)],
     )
+    calls.clear()    # the entry fill's open-print screen may have priced through BS; the MARK may not
     try:
         ps.set_clock(datetime(2024, 3, 7))
         assert acct._option_positions_mtm() == pytest.approx(-320.0, abs=1.0)  # bar close, clamped
@@ -469,6 +470,9 @@ def test_happy_path_never_calls_bs(tmp_path, monkeypatch):
     )
     acct.refresh_orders()
     acct.refresh_transactions()
+    # The ENTRY FILL's open-print screen (``_screen_open_print``) reprices through BS, but only
+    # to judge/replace a print; what is pinned here is that the per-bar MARK makes no BS call.
+    calls.clear()
     try:
         for d in (datetime(2024, 3, 6), datetime(2024, 3, 7), datetime(2024, 3, 8)):
             ps.set_clock(d)

@@ -395,6 +395,9 @@ def _new_integrity_counters() -> Dict[str, Any]:
             "option_fill_prints_replaced": 0,
             "option_fill_prints_refused": 0,
             "option_fill_prints_unverified": 0,
+            # Orders that actually FILLED at a replaced print (a replaced print may still
+            # fail the limit / liquidity tests and never fill).
+            "option_fills_at_replaced_print": 0,
             "option_fill_print_examples": [],
             "option_structure_fills_refused": 0,
             "option_structure_fill_examples": []}
@@ -3614,6 +3617,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         seen.add(key)
         c = self._integrity()
         c[f"option_fill_prints_{kind}"] += 1
+        if kind == "replaced" and getattr(order, "id", None) is not None:
+            self.__dict__.setdefault("_replaced_print_days", {})[order.id] = fill_day
         if kind != "unverified":
             c["option_fill_prints_rejected"] += 1
             logger.warning("[backtest] option fill print %s: %s", kind.upper(), example)
@@ -3749,7 +3754,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             intrinsic = max(0, spot-strike) for a call / max(0, strike-spot) for a put.
             Nobody sells an option below its immediate-exercise value; a lower print is
             stale/indicative junk. (Applies to sell_to_open too — a junk-cheap CREDIT is
-            the same bad data and settles at the real intrinsic later.)
+            the same bad data and settles at the real intrinsic later.) The UPPER bound
+            below binds an ENTRY as well (premium > spot for a call, > strike for a put:
+            a guaranteed loss for a buy, a free gift for a sell).
           * EXIT (closing intent): premium > spot + tol for a CALL (a call can never cost
             more than the stock) or premium > strike + tol for a PUT (a put can never be
             worth more than the strike) — impossible premiums. A below-intrinsic CLOSE is
@@ -7291,6 +7298,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                      underlying=underlying, fill_day=fill_day)
         if self._split_basis is not None and underlying and order.id is not None:
             self._option_fill_basis[order.id] = self._as_traded_factor(underlying, fill_day)
+        replaced_days = self.__dict__.get("_replaced_print_days")
+        if (replaced_days and order.id in replaced_days
+                and replaced_days[order.id] == self._option_fill_day(order, as_of)):
+            self._integrity()["option_fills_at_replaced_print"] += 1
         order.filled_qty = qty
         order.open_price = fill_px
         order.status = OrderStatus.FILLED

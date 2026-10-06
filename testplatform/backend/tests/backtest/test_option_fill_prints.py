@@ -70,6 +70,7 @@ def test_lrcx_shape_a_garbage_low_open_never_fills_a_negative_debit():
         assert stats["option_fill_prints_rejected"] == 1
         assert stats["option_fill_prints_replaced"] == 1
         assert stats["option_fill_prints_refused"] == 0
+        assert stats["option_fills_at_replaced_print"] == 1      # the leg really filled there
         assert len(stats["option_fill_print_examples"]) == 1
         assert long_call in stats["option_fill_print_examples"][0]
         # ... and it is in the results dict the grid persists.
