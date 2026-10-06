@@ -14,6 +14,11 @@ import io
 import sys
 from typing import Optional
 
+# Process-wide secret redaction (record factory + exception formatting): covers every logger
+# and handler, including ba2_common's, requests/urllib3 and third-party ones.
+from . import log_redaction
+log_redaction.install()
+
 logger = logging.getLogger("ba2_trade_platform")
 logger.setLevel(logging.DEBUG)
 

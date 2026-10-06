@@ -211,7 +211,7 @@ def test_a_broker_without_the_feature_gets_no_shield(nicegui_client):
 def test_the_icons_live_in_the_symbol_cell_group_with_the_info_icon():
     chips = page.SYMBOL_CHIPS_TEMPLATE
     assert "$emit('protectClick', props.row.symbol)" in chips and "$emit('excludeToggle', props.row.symbol)" in chips
-    assert chips.index('icon="info"') < chips.index('icon="shield"') < chips.index('icon="visibility"')
+    assert chips.index('icon="info"') < chips.index('icon="shield"') < chips.index(':icon="props.row.excl_icon"')
     assert chips.count('size="sm"') == 3 and 'pf-icons' in chips                       # all three the same size
     template = page.symbol_card_template()
     assert 'props.row.prot_on' in template and template.index('props.row.prot_on') < template.index('class="pf-tiles"')

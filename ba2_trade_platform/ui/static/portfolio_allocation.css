@@ -115,6 +115,8 @@
 
     /* THE TP/SL SHIELD AND THE EXCLUDE EYE sit in the symbol cell's icon group, the size of the (i). */
     .pf-icons .q-btn { min-width: 0; }
+    /* the take-profit rows' fields may shrink so price + share + delete stay on one desktop line */
+    .pf-tp-row .q-field { min-width: 0; }
     /* THE LABEL HEADER'S COUNT PILL: total | profitable | losing | excluded, touching segments. */
     .pf-seg { border-radius: 10px; overflow: hidden; gap: 1px !important; }
     .pf-seg .pf-seg-part { border-radius: 0; padding: 2px 7px; font-weight: 700; }
@@ -131,6 +133,8 @@
     .pf-tp-row.pf-tp-row > .flex-grow { flex: 1 1 100% !important; }
     .pf-tp-row.pf-tp-row > .w-32 { flex: 1 1 auto !important; width: auto !important; }
     .pf-prot-dialog .q-field__control { min-height: 44px; }
+    /* the symbol head's icon buttons keep a thumb-sized target (beats .pf-icons .q-btn {min-width:0}) */
+    .pf-sym-head .pf-icons .q-btn { min-width: 40px; min-height: 40px; }
     .pf-bar-row > .pf-b-excl { order: 3; }
 
 }

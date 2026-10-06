@@ -9,26 +9,11 @@ from typing import Any, Mapping, Optional
 
 from nicegui import ui
 
-from ..utils.secret_mask import mask_secret, mask_secrets_in_data
+from ..utils.secret_mask import mask_secrets_in_data
 
 #: 40 px square: a thumb-sized tap target on a phone.
 _EYE_PROPS = 'flat round dense'
 _EYE_STYLE = 'min-width:40px;min-height:40px'
-
-
-def secret_value_label(value: Any, classes: str = 'font-mono text-sm') -> None:
-    """A label showing ``mask_secret(value)`` with an eye button that flips it to the value."""
-    state = {'shown': False}
-    with ui.row().classes('items-center gap-1 no-wrap'):
-        label = ui.label(mask_secret(value)).classes(classes)
-        button = ui.button(icon='visibility').props(_EYE_PROPS).style(_EYE_STYLE)
-
-        def toggle():
-            state['shown'] = not state['shown']
-            label.set_text('' if value is None else str(value) if state['shown'] else mask_secret(value))
-            button.props(f"icon={'visibility_off' if state['shown'] else 'visibility'}")
-
-        button.on_click(toggle)
 
 
 def masked_json_view(data: Any, definitions: Optional[Mapping[str, Mapping[str, Any]]] = None,

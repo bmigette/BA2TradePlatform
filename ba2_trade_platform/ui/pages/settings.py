@@ -55,6 +55,11 @@ from ..utils.phone_sections import (expert_card_template,
 from ..utils.responsive import PhoneTableRegistry, install_phone_listener, phone_grid_prop
 
 
+#: Keep browsers and password managers from autofilling/saving a credential field: an autofill
+#: into an empty secret input would be written by Save.
+SECRET_INPUT_PROPS = 'autocomplete=new-password data-1p-ignore data-lpignore=true data-bwignore'
+
+
 def _secret_input(label, value=''):
     """A credential input: hidden by default, eye icon to reveal (never pre-revealed).
 
@@ -62,7 +67,7 @@ def _secret_input(label, value=''):
     text, so what the form records and what Save compares/writes is unchanged.
     """
     return ui.input(label=label, value=value, password=True,
-                    password_toggle_button=True).classes(SECRET_INPUT_CLASS)
+                    password_toggle_button=True).classes(SECRET_INPUT_CLASS).props(SECRET_INPUT_PROPS)
 
 
 def phone_section(title, **kwargs):
@@ -4086,7 +4091,7 @@ class ExpertSettingsTab:
                                     _show_select_error(key, inp, select_error)
                                     self._select_checks_expert[key] = (inp, list(valid_values))
                             elif is_secret_setting(key, meta):
-                                inp = _secret_input(display_label, value)
+                                inp = _secret_input(display_label, value).classes('w-full')
                             else:
                                 inp = ui.input(label=display_label, value=value).classes('w-full')
                         elif meta["type"] == "list":
