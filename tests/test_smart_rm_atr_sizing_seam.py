@@ -25,7 +25,7 @@ class _StubExpert:
     def get_available_balance(self):
         return 100_000.0
 
-    def _available_balance_breakdown(self, exclude_transaction_id=None):
+    def _available_balance_breakdown(self, exclude_transaction_id=None, failure=None):
         """The sizing paths take ONE balance pass and reuse it for equity, the available
         cap and the capital-mapping log line (plan step 5). This stub answers it with the
         figures its two accessors above publish, so the arithmetic under test is
