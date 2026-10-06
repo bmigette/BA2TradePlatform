@@ -524,3 +524,104 @@ def test_tool_help_documents_the_per_app_commands(capsys):
     for needle in ("ba2_trade_platform-prod", "ba2_trade_platform-opt", "SHARED with the test platform",
                    "before 15:30", "--symbols"):
         assert needle in h
+
+
+# --------------------------------------------------------------------------- two stale snapshots
+# Real opt-cache (2026-09-28 15:3x Paris write) vs FMP numbers, field failure on APP 1231:
+# the 09-28 top-up appended its bar without refreshing the 09-25 snapshot taken the session before.
+# date -> (O, H, L, C, Volume)
+REAL = {
+    "AMD": {
+        "cached": {"2026-09-25": (634.535, 635.24, 631.21, 634.885, 1396608),
+                   "2026-09-28": (635.068, 635.068, 623.78, 623.78, 709375)},
+        "vendor": {"2026-09-25": (634.54, 639.00, 625.52, 630.63, 17632100),
+                   "2026-09-28": (624.90, 629.75, 596.07, 607.87, 22124100),
+                   "2026-09-29": (616.74, 624.13, 605.25, 607.57, 16513900)}},
+    "INTC": {
+        "cached": {"2026-09-25": (126.83, 126.885, 125.96, 125.96, 4934944),
+                   "2026-09-28": (126.88, 126.88, 120.655, 120.655, 4939383)},
+        "vendor": {"2026-09-25": (126.83, 126.93, 122.84, 123.00, 97728429),
+                   "2026-09-28": (120.68, 121.71, 114.71, 116.03, 112436918),
+                   "2026-09-29": (116.70, 118.75, 113.97, 115.93, 88744533)}},
+    "MU": {
+        "cached": {"2026-09-25": (1095.83, 1095.83, 1091.24, 1093.13, 954807),
+                   "2026-09-28": (1095.475, 1095.475, 1074.73, 1076.77, 1111995)},
+        "vendor": {"2026-09-25": (1095.83, 1108.72, 1073.00, 1082.28, 20947931),
+                   "2026-09-28": (1075.98, 1084.81, 1032.00, 1053.98, 22227200),
+                   "2026-09-29": (1076.69, 1082.66, 1057.70, 1065.08, 19723107)}},
+}
+D25, D28 = pd.Timestamp("2026-09-25"), pd.Timestamp("2026-09-28")
+
+
+def _real_world(symbol):
+    r = REAL[symbol]
+    vendor = _truth(r["vendor"]["2026-09-29"][3])
+    cached = None
+    for src, frame in (("vendor", vendor),):
+        for d, row in r[src].items():
+            i = frame.index[frame["Date"] == pd.Timestamp(d)][0]
+            frame.loc[i, ["Open", "High", "Low", "Close", "Volume"]] = row
+    cached = vendor[vendor["Date"] <= D28].copy().reset_index(drop=True)
+    for d, row in r["cached"].items():
+        i = cached.index[cached["Date"] == pd.Timestamp(d)][0]
+        cached.loc[i, ["Open", "High", "Low", "Close", "Volume"]] = row
+    return vendor, cached
+
+
+@pytest.mark.parametrize("symbol", sorted(REAL))
+def test_two_stale_snapshots_are_both_repaired(symbol, activity):
+    vendor, cached = _real_world(symbol)
+    path = _write(symbol, cached, stamp_day=D28.date())
+    before = pd.read_parquet(path)
+    with pytest.raises(OHLCVTopUpRefused):                                # the field failure
+        _topup(_Plain(vendor), symbol)
+    MarketDataProviderInterface._TOPUP_REFUSED.clear()
+    activity.clear()
+    _topup(_Fixed(vendor), symbol)
+    after = pd.read_parquet(path)
+    for d in (D25, D28):
+        got = after[after["Date"] == d].iloc[0]
+        want = vendor[vendor["Date"] == d].iloc[0]
+        assert (got.Open, got.High, got.Low, got.Close, got.Volume) == pytest.approx(
+            (want.Open, want.High, want.Low, want.Close, want.Volume))
+    keep = ~before["Date"].isin([D25, D28])
+    pd.testing.assert_frame_equal(after[after["Date"].isin(before.loc[keep, "Date"])].reset_index(drop=True),
+                                  before[keep].reset_index(drop=True))
+    assert after["Date"].max() == pd.Timestamp(LAST) and not activity
+
+
+def test_an_older_low_volume_bar_that_is_not_contained_refuses_and_lists_every_bar(activity):
+    vendor, cached = _real_world("AMD")
+    i = cached.index[cached["Date"] == D25][0]
+    cached.loc[i, "High"] = 650.0                         # low volume, but above the vendor's high
+    path = _write("AMD", cached, stamp_day=D28.date())
+    expect = _bytes(path)
+    with pytest.raises(OHLCVTopUpRefused) as e:
+        _topup(_Fixed(vendor), "AMD")
+    assert _bytes(path) == expect
+    msg = str(e.value)
+    assert "2026-09-25" in msg and "2026-09-28" in msg and "every bar of the newest" in msg
+    assert len(activity) == 1 and {b["date"] for b in activity[0]["data"]["bars"]} == {"2026-09-25", "2026-09-28"}
+
+
+def test_an_older_contained_bar_with_normal_volume_refuses(activity):
+    vendor, cached = _real_world("AMD")
+    i = cached.index[cached["Date"] == D25][0]
+    cached.loc[i, "Volume"] = vendor.loc[i, "Volume"]     # a settled bar that merely differs
+    path = _write("AMD", cached, stamp_day=D28.date())
+    expect = _bytes(path)
+    with pytest.raises(OHLCVTopUpRefused):
+        _topup(_Fixed(vendor), "AMD")
+    assert _bytes(path) == expect
+
+
+def test_a_rebased_low_volume_older_bar_refuses(activity):
+    vendor, cached = _real_world("AMD")
+    i = cached.index[cached["Date"] == D25][0]
+    for col in ("Open", "High", "Low", "Close"):
+        cached.loc[i, col] = round(vendor.loc[i, col] * 1.05, 3)    # rebased: scaled, volume tiny
+    path = _write("AMD", cached, stamp_day=D28.date())
+    expect = _bytes(path)
+    with pytest.raises(OHLCVTopUpRefused):
+        _topup(_Fixed(vendor), "AMD")
+    assert _bytes(path) == expect

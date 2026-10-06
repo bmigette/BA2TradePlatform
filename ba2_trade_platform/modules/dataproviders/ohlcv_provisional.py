@@ -12,24 +12,33 @@ THE FIX. Before the guarded top-up (``MarketDataProviderInterface._verified_tail
 replaced by the vendor's final bar. The guard itself is untouched: a true disagreement (a settled
 bar, an older bar, a split, a rescaled history) still refuses / re-bases exactly as before.
 
-WHY ONLY THE NEWEST BAR. A refused top-up never appends past a stuck bar, so a stuck provisional bar
-is always the newest cached bar. Any older bar that differs from the vendor is a real disagreement.
+WHY THE NEWEST BAR IS THE ANCHOR OF THE REPAIR. A refused top-up never appends past a stuck bar, so
+a stuck provisional bar is always the newest cached bar; only a file whose mtime proves that is ever
+repaired. An earlier top-up that appended a new bar did not refresh the bar BEFORE it, though, so the
+cache can hold more than one stale snapshot (AMD/INTC/MU 2026-09-25 AND 2026-09-28, field failure on
+APP 1231). Earlier bars in the newest-5 window are therefore replaced too, but only when each proves
+by CONTENT to be a partial-session snapshot (condition 3 below). Anything else that differs is a real
+disagreement and the guard refuses.
 
 THE SIGNATURE (all must hold; see :func:`find_provisional_days`):
 
-1. PROOF OF PROVENANCE: the cache file's last-modified time falls on that bar's OWN New York session
-   date and before 20:00 ET (:func:`written_mid_session`). Nothing else wrote the file since, so the
-   newest bar was captured while its session was still open. A settled bar, or a file touched on a
+1. PROOF OF PROVENANCE: the cache file's last-modified time falls on the NEWEST bar's own New York
+   session date and before 20:00 ET (:func:`written_mid_session`). Nothing else wrote the file since,
+   so that bar was captured while its session was still open. A settled bar, or a file touched on a
    later day / after the close, never matches. (Copying a cache without preserving mtimes defeats the
    proof; the bar is then simply refused as before.)
-2. it is the newest cached bar, and the vendor has a usable bar for that day that DIFFERS from it;
-3. the vendor's bar is on the same price basis: all four cached prices lie within
-   ``PROVISIONAL_RANGE_TOL`` (8%) of the vendor's day range. A split moves a bar by >= ~10%;
-4. the basis is PROVEN by anchors: every OTHER cached bar in the newest ``lookback`` the vendor also
-   holds equals the vendor's, and at least one exists. A rebase (split, spin-off: MOD 2026-10-05,
-   every window bar ~9% off) fails here and the guard decides, as before.
+2. the newest cached bar DIFFERS from the vendor's usable bar for that day and all four cached
+   prices lie within ``PROVISIONAL_RANGE_TOL`` (8%) of the vendor's day range (its open/high may
+   exceed the final high); a split moves a bar by >= ~10%;
+3. every EARLIER bar of the window the vendor also holds either equals the vendor's (an ANCHOR) or is
+   a partial-session snapshot: cached volume <= 50% of the vendor's AND O/H/L/C all CONTAINED in
+   the vendor's [Low, High] (0.5% tolerance). A partial session is necessarily inside the final
+   day's range; a rebased bar is scaled so it is not contained with its volume intact; a settled bar
+   equals the vendor's. Any other differing bar means a real disagreement: nothing is replaced.
+4. at least one anchor exists. A rebase (split, spin-off: MOD 2026-10-05, every window bar ~9% off)
+   fails here and the guard decides, as before.
 
-Only that bar is replaced; no other bar is touched. Installed by
+Only the newest bar and the partial-session snapshots are replaced; no other bar is touched. Installed by
 ``core.seam_wiring.wire_all_seams`` (live app); the test platform / backtests never run this.
 """
 from __future__ import annotations
@@ -69,7 +78,10 @@ _OHLC = ["Open", "High", "Low", "Close"]
 
 def _by_day(df: pd.DataFrame) -> pd.DataFrame:
     from ba2_common.core.ohlcv_topup_guard import day_index
-    out = df[_OHLC].apply(pd.to_numeric, errors="coerce").astype(float)
+    cols = _OHLC + (["Volume"] if "Volume" in df.columns else [])
+    out = df[cols].apply(pd.to_numeric, errors="coerce").astype(float)
+    if "Volume" not in out.columns:
+        out["Volume"] = float("nan")
     out.index = day_index(df["Date"])
     return out[~out.index.duplicated(keep="last")].sort_index()
 
@@ -100,10 +112,40 @@ def _in_vendor_range(c, v) -> bool:
     return all(lo <= getattr(c, k) <= hi for k in _OHLC)
 
 
+#: An earlier bar is a partial-session snapshot only if its volume is at most this share of the vendor's ...
+PARTIAL_VOLUME_SHARE = 0.5
+#: ... and its prices lie inside the vendor's [Low, High] widened by this fraction.
+PARTIAL_CONTAIN_TOL = 0.005
+
+
+def _is_partial_snapshot(c, v) -> bool:
+    if not (math.isfinite(c.Volume) and math.isfinite(v.Volume) and v.Volume > 0):
+        return False
+    if c.Volume > PARTIAL_VOLUME_SHARE * v.Volume:
+        return False
+    lo, hi = v.Low * (1 - PARTIAL_CONTAIN_TOL), v.High * (1 + PARTIAL_CONTAIN_TOL)
+    return all(lo <= getattr(c, k) <= hi for k in _OHLC)
+
+
+def describe_differences(cached: pd.DataFrame, vendor: pd.DataFrame, *,
+                         lookback_bars: int = PROVISIONAL_MAX_BARS) -> List[str]:
+    """One text per bar of the newest ``lookback_bars`` that differs from the vendor's, in the
+    guard's own ``DATE cached O/H/L/C ... vs vendor ...`` format (+ volumes)."""
+    c, v = _by_day(cached).tail(lookback_bars), _by_day(vendor)
+    out = []
+    for d in c.index:
+        if d in v.index and _usable(c.loc[d]) and _usable(v.loc[d]) and not _equal(c.loc[d], v.loc[d]):
+            a, b = c.loc[d], v.loc[d]
+            out.append(f"{d.date()} cached O/H/L/C {a.Open:g}/{a.High:g}/{a.Low:g}/{a.Close:g} vs vendor "
+                       f"{b.Open:g}/{b.High:g}/{b.Low:g}/{b.Close:g} (volume {a.Volume:g} vs {b.Volume:g})")
+    return out
+
+
 def find_provisional_days(cached: pd.DataFrame, vendor: pd.DataFrame, *, mtime: Optional[float],
                           lookback_bars: int = PROVISIONAL_MAX_BARS) -> List[pd.Timestamp]:
-    """``[newest cached day]`` when that bar is a stuck provisional snapshot of the vendor's bar,
-    else ``[]`` (see the module docstring for the signature)."""
+    """The earlier partial-session snapshots of the window plus the newest cached day, when the
+    newest bar is a stuck provisional snapshot of the vendor's bar; else ``[]`` (see the module
+    docstring for the signature)."""
     if cached is None or cached.empty or vendor is None or vendor.empty:
         return []
     c = _by_day(cached).tail(lookback_bars)
@@ -111,7 +153,7 @@ def find_provisional_days(cached: pd.DataFrame, vendor: pd.DataFrame, *, mtime: 
     newest = c.index.max()
     if not written_mid_session(mtime, newest) or newest not in v.index:
         return []
-    candidate, anchors = None, 0
+    candidate, partial, anchors = None, [], 0
     for d in c.index:
         if d not in v.index:
             continue
@@ -122,9 +164,13 @@ def find_provisional_days(cached: pd.DataFrame, vendor: pd.DataFrame, *, mtime: 
             anchors += 1
         elif d == newest and _in_vendor_range(cr, vr):
             candidate = d
+        elif d != newest and _is_partial_snapshot(cr, vr):
+            partial.append(d)
         else:
             return []          # any other bar that differs is a real disagreement: not ours
-    return [candidate] if candidate is not None and anchors >= 1 else []
+    if candidate is None or anchors < 1:
+        return []
+    return partial + [candidate]
 
 
 def replace_provisional_bars(df: pd.DataFrame, vendor: pd.DataFrame,
@@ -147,7 +193,8 @@ def replace_provisional_bars(df: pd.DataFrame, vendor: pd.DataFrame,
 
 def repair_provisional_bars(provider, df: pd.DataFrame, symbol: str, interval: str,
                             fetch_end: datetime, *, mtime: Optional[float],
-                            lookback_bars: int = PROVISIONAL_MAX_BARS) -> Tuple[pd.DataFrame, List[date]]:
+                            lookback_bars: int = PROVISIONAL_MAX_BARS,
+                            diag: Optional[list] = None) -> Tuple[pd.DataFrame, List[date]]:
     """Fetch the vendor's bars over the newest ``lookback_bars`` cached sessions and replace the
     newest cached bar when it is a stuck provisional snapshot. Returns ``(frame, replaced days)``;
     the frame is ``df`` itself when nothing is replaced. Writes nothing. A fetch error propagates."""
@@ -165,6 +212,8 @@ def repair_provisional_bars(provider, df: pd.DataFrame, symbol: str, interval: s
     probe["Date"] = provider._match_tz(pd.to_datetime(probe["Date"]), pd.to_datetime(df["Date"]))
     found = find_provisional_days(df, probe, mtime=mtime, lookback_bars=lookback_bars)
     if not found:
+        if diag is not None:
+            diag.extend(describe_differences(df, probe, lookback_bars=lookback_bars))
         return df, []
     out = replace_provisional_bars(df, probe, found)
     return out, [d.date() for d in found]
@@ -179,7 +228,9 @@ _ROW_RE = re.compile(r"(\d{4}-\d{2}-\d{2}) cached O/H/L/C (\S+) vs vendor ([^\s;
 def _parse_rows(message: str) -> list:
     rows = []
     for m in _ROW_RE.finditer(message):
-        rows.append({"date": m.group(1), "cached_ohlc": m.group(2), "vendor_ohlc": m.group(3)})
+        row = {"date": m.group(1), "cached_ohlc": m.group(2), "vendor_ohlc": m.group(3)}
+        if row not in rows:
+            rows.append(row)
     return rows
 
 
@@ -246,21 +297,27 @@ def install(provider_base=None) -> None:
             # ORIGINAL first: a normal top-up costs exactly the one vendor call it always did
             return orig(self, df, symbol, interval, provider_name, fetch_end,
                         raise_fetch_errors=raise_fetch_errors)
-        except OHLCVTopUpRefused:
+        except OHLCVTopUpRefused as refusal:
             if memo_live:
                 raise                      # refused moments ago: no extra vendor call here
             try:
                 from ba2_common.core import native_cache
                 path = native_cache.find_timeseries_path(provider_name, symbol, interval)
                 mtime = os.path.getmtime(path) if path else None
+                diag: list = []
                 df2, replaced = repair_provisional_bars(self, df.copy(), symbol, interval, fetch_end,
-                                                        mtime=mtime)
+                                                        mtime=mtime, diag=diag)
             except Exception as e:  # noqa: BLE001 -- the refusal stands; say why the repair did not run
                 logger.warning(f"{provider_name} {symbol} ({interval}): provisional-bar check skipped: {e}")
                 raise_original = True
+                diag = []
             else:
                 raise_original = not replaced
             if raise_original:
+                if diag:       # the whole picture: every bar of the window that differs, not just the guard's
+                    raise OHLCVTopUpRefused(
+                        f"{refusal} | every bar of the newest {PROVISIONAL_MAX_BARS} that differs from the "
+                        f"vendor: " + "; ".join(diag)) from refusal
                 raise
         # repaired: ask the guard afresh, ONCE (a second refusal propagates and is reported)
         provider_base._TOPUP_REFUSED.pop(key, None)
