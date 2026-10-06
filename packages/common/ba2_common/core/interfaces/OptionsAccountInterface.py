@@ -2693,18 +2693,74 @@ class OptionsAccountInterface(ABC):
             return None
         return bal - pool.total
 
+    def pending_option_debit_outlay(self) -> float:
+        """Dollars of CASH this account's own in-flight option ENTRIES have yet to pay.
+
+        A DEBIT entry (a bought single leg, a net-debit structure) is not a reserve: its cost
+        leaves the account when it FILLS, and until then nothing in the reserve pool knows
+        about it. Several entries decided in the same session therefore each sized
+        themselves against the SAME cash, and the sum of what they would pay could exceed
+        what the account holds (a 60 % sizing on five names is 300 %). Reading the working
+        entries here closes that window for every gate that spends cash.
+
+        Counted: working (not yet filled) option orders that OPEN a position, at
+        ``limit_price x multiplier x unfilled contracts`` -- a multi-leg PARENT prices the
+        whole structure per unit (``limit_price`` is +debit / -credit, so a credit parent
+        contributes nothing); a single leg only when it is a BUY. A filled leg has already
+        left the cash. Closing orders and the leg CHILDREN of a parent (which carry no price
+        of their own) are skipped; an order with no readable price contributes nothing, and
+        every entry builder submits a priced limit.
+        """
+        from ba2_common.core.types import OrderDirection, OrderStatus
+
+        working = OrderStatus.get_active_statuses()
+        total = 0.0
+        for o in self.open_option_orders_book_wide():
+            if getattr(o, "status", None) not in working or getattr(o, "parent_order_id", None):
+                continue
+            intent = (getattr(o, "position_intent", None) or "").lower()
+            if "close" in intent or str(getattr(o, "option_strategy", None) or "") == "close":
+                continue
+            is_single_leg = getattr(o, "contract_symbol", None) is not None
+            if is_single_leg and getattr(o, "side", None) != OrderDirection.BUY:
+                continue
+            limit = self._readable_positive_number(getattr(o, "limit_price", None))
+            quantity = self._readable_positive_number(getattr(o, "quantity", None))
+            if limit is None or quantity is None:
+                continue
+            filled = self._readable_number(getattr(o, "filled_qty", None)) or 0.0
+            remaining = max(quantity - filled, 0.0)
+            multiplier = self._readable_positive_number(getattr(o, "multiplier", None)) or 100.0
+            total += limit * multiplier * remaining
+        return total
+
+    def option_capital_headroom(self) -> Optional[float]:
+        """Cash this account can still COMMIT to a new option entry, or ``None`` when unknown.
+
+        ``available_option_buying_power()`` (the option tradable balance less every reserve of
+        a credit structure and the excess of an unbalanced debit one) less what the in-flight
+        debit entries will still pay (``pending_option_debit_outlay``). THE one answer to
+        "does this fit": debits paid plus collateral reserved can never exceed what the
+        account has, whichever mix of structures spends it. May be negative (over-committed).
+        """
+        available = self.available_option_buying_power()
+        if available is None:
+            return None
+        return available - self.pending_option_debit_outlay()
+
     def check_option_buying_power(self, required: float) -> bool:
-        """True if `required` reserve fits in available buying power.
+        """True if `required` reserve fits in the option capital headroom.
 
         A required reserve of zero always passes: reserving nothing needs no capacity,
         and refusing it would break the entire long/debit arm the moment one unrelated
         row lost its reserve. Anything above zero measured against an UNKNOWN pool
         refuses — "we cannot measure this" and "this is fine" must never be the same
-        answer.
+        answer. The headroom is net of the in-flight DEBIT entries (``option_capital_headroom``):
+        a reserve cannot be set aside from cash an unfilled debit order is about to spend.
         """
         if required <= 0:
             return True
-        available = self.available_option_buying_power()
+        available = self.option_capital_headroom()
         if available is None:
             return False
         return required <= available

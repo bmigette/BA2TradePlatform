@@ -106,6 +106,23 @@ _NEVER_HELD_LEG_STATUSES = frozenset({
 })
 
 
+#: ``_owner_rank`` tiers (higher wins). See ``BacktestAccount._option_group_bounds``.
+_OWNER_DEAD, _OWNER_CLOSING, _OWNER_PENDING_OPEN, _OWNER_FILLED_OPEN = 0, 1, 2, 3
+
+
+def _owner_rank(order) -> int:
+    """How good a claim ``order`` has to be the order that OPENED a held contract's lot."""
+    status = getattr(order, "status", None)
+    if status in _NEVER_HELD_LEG_STATUSES:
+        return _OWNER_DEAD
+    intent = (getattr(order, "position_intent", None) or "").lower()
+    if intent and "open" not in intent:
+        return _OWNER_CLOSING
+    if status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
+        return _OWNER_FILLED_OPEN
+    return _OWNER_PENDING_OPEN
+
+
 def _expiry_trigger(side: OrderDirection, itm: bool) -> OptionCloseReason:
     """The OCC event an expiring leg resolves by: OTM -> expired; ITM short -> assigned;
     ITM long -> exercised (the live OPEXP / OPASN / OPEXC)."""
@@ -369,7 +386,18 @@ def _new_integrity_counters() -> Dict[str, Any]:
             "option_orders_volume_sized": 0,
             "option_orders_volume_refused": 0,
             "option_split_rekeys": 0,
-            "option_split_rekey_refusals": 0}
+            "option_split_rekey_refusals": 0,
+            # Option FILL prints screened by ``_screen_open_print`` / the structure bound
+            # check in ``_fill_multi_leg_parent`` (distinct order-days). ``rejected`` =
+            # replaced + refused; ``unverified`` = a print the screen had no reference to
+            # judge (accepted, but counted so it is never silent).
+            "option_fill_prints_rejected": 0,
+            "option_fill_prints_replaced": 0,
+            "option_fill_prints_refused": 0,
+            "option_fill_prints_unverified": 0,
+            "option_fill_print_examples": [],
+            "option_structure_fills_refused": 0,
+            "option_structure_fill_examples": []}
 
 
 def _max_units_within(capacity: float, per_unit: float) -> int:
@@ -440,6 +468,23 @@ _OPTION_SPREAD_THIN_MULT = 2.0         # multiplier applied below that volume
 #: set FROM those same quotes can miss itself by a float ulp; a broker would fill that. Well
 #: below the $0.01 minimum option tick, so it can never let a genuinely worse net through.
 _NET_LIMIT_TOLERANCE = 1e-9
+
+#: ISOLATED OFF-MARKET OPEN PRINTS (plan: option fill prints, 2026-10-06).
+#: A daily option bar carries no timestamp for its OPEN print, and a thin contract opens on a
+#: stale or garbage trade (LRCX 2022-10-12: the 370 call "opened" at 5.06 inside a 5.06-13.35
+#: day while its neighbour opened at 9.87 -- a bull call spread filled at a NEGATIVE debit).
+#: The next-session open is accepted as a fill reference only while it is consistent with the
+#: contract's OWN session evidence: the open must lie within (``_FILL_PRINT_REL_TOL`` of the
+#: reference, floored at ``_FILL_PRINT_ABS_TOL`` dollars per share) of the interval spanned by
+#: two Black-Scholes references repriced at the UNDERLYING'S OPEN -- one at the iv implied by the
+#: fill day's own close (the session's end), one at the iv of the decision bar (the prior
+#: close). Between those two, any real open is explained by an iv drift across the session;
+#: outside both, it is an isolated print. Measured on 116k contract-days of the 90 stage-1
+#: symbols (DTE 30-60, |K/S-1| <= 12%): 0.27% of opens are rejected at these tolerances,
+#: 0.10% at 75%, 2.2% at 25%/$0.10; a delta-linear reference (no gamma, one iv) rejected 4%
+#: of opens on days the underlying moved over 4% and was dropped for this one.
+_FILL_PRINT_REL_TOL = 0.5
+_FILL_PRINT_ABS_TOL = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -1443,14 +1488,28 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # per-lot rescan below used to re-derive for EVERY held lot: that was O(held x orders)
         # on top of the two passes, and the dominant own-time in the options profile).
         owner_of: Dict[str, Any] = {}
+        owner_rank: Dict[str, int] = {}
         # ONE pass: parent/single strategy+qty, the child legs (their strikes need the completed
         # parent set), and each held contract's owning order.
         for o in orders:
             if getattr(o, "asset_class", None) != AssetClass.OPTION:
                 continue
             cs = getattr(o, "contract_symbol", None)
-            if cs is not None and cs not in owner_of:
-                owner_of[cs] = o
+            if cs is not None:
+                # WHICH ORDER OWNS A HELD CONTRACT. Not the FIRST order that names it: a DAY
+                # entry that expired unfilled leaves its (CANCELED/EXPIRED) legs on the book,
+                # and the engine re-selects the same contract the next day, so the first
+                # order was routinely a dead attempt. The held lot was then attributed to a
+                # parent with no live legs ("0 of 0 opening leg order(s)") and every
+                # defined-risk bound fell back -- 2,713 of 2,713 mark/settle calls on the
+                # stage-1 O_BULLCS winner (bt 79). The owner is the order that OPENED the lot:
+                # the latest FILLED opening order, else a still-pending opening order (the
+                # instant inside a fill), else any live order, else the first.
+                rank = _owner_rank(o)
+                best = owner_rank.get(cs)
+                if best is None or rank > best or (rank == best == _OWNER_FILLED_OPEN):
+                    owner_of[cs] = o
+                    owner_rank[cs] = rank
             if o.parent_order_id is None:
                 # multi-leg PARENT (no contract) or a single-leg option order.
                 if o.id is not None and getattr(o, "option_strategy", None):
@@ -1939,11 +1998,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         o = self._lot_order(lot.contract_symbol)
         if o is None or o.expiry is None:
             return None
-        dte_days = (o.expiry - self._as_of_date()).days
-        price = bs_price(
-            float(spot), float(strike), dte_days, float(lot.last_iv), right,
-            r=self._bs_mark_rate(),
-        )
+        return self._bs_premium_clamped(
+            strike, spot, right, o.expiry, lot.last_iv, self._as_of_date(), self._bs_mark_rate())
+
+    def _bs_premium_clamped(self, strike, spot, right, expiry, iv, on_day, rate) -> Optional[float]:
+        """Black-Scholes premium of one contract on ``on_day`` at ``spot`` and ``iv``, clamped
+        into the no-arbitrage bounds -- THE ONE stage of the price fallback chain
+        (bar close -> BS(last-known iv) -> intrinsic/entry) that prices a contract from an iv.
+
+        Shared by the mark chain (``_bs_fallback_premium``: a held lot with no bar today) and
+        the FILL chain (``_screen_open_print``: an open print rejected as off-market is repriced
+        from the decision bar's iv at the fill day's open), so the two cannot disagree on how a
+        model premium is made. None on any degenerate input (``bs_price``'s contract); the caller
+        falls through to its next stage."""
+        dte_days = (expiry - on_day).days
+        price = bs_price(float(spot), float(strike), dte_days, float(iv), right, r=rate)
         if price is None:
             return None
         return self._clamp_premium_to_no_arb(price, strike, right == OptionRight.CALL, spot)
@@ -3255,6 +3324,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             else:
                 as_of_day = as_of.date() if hasattr(as_of, "date") else as_of
                 as_of_bar = self._option_bar(order.contract_symbol, as_of_day)
+        # ISOLATED OFF-MARKET OPEN: the open is the one print a daily bar cannot timestamp, and
+        # a thin contract opens on a stale or garbage trade. Screened against the contract's
+        # own session evidence; a rejected print is repriced through the mark chain's BS stage
+        # or the order is refused -- never filled at it (``_screen_open_print``).
+        if not same_bar:
+            screened = self._screen_open_print(order, px, fill_day, bar, as_of_bar, as_of)
+            if screened is None:
+                return None
+            px = screened
         limit = getattr(order, "limit_price", None)
         ot = order.order_type
         if limit is not None and ot == OrderType.BUY_LIMIT:
@@ -3522,6 +3600,140 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             )
         return None
 
+    def _count_fill_print(self, kind: str, order, fill_day, example: str) -> bool:
+        """Record one screened fill print (``kind``: ``replaced`` / ``refused`` /
+        ``unverified``), once per (order, fill day): an order that retries on the same bar
+        must not count twice. Returns True when this was the first sight. NEVER SILENT: the
+        counters are published in the results, the first three examples are kept, and a
+        rejection is warned."""
+        seen = self.__dict__.setdefault("_fill_print_seen", set())
+        key = (kind, getattr(order, "id", None) or getattr(order, "contract_symbol", None),
+               fill_day)
+        if key in seen:
+            return False
+        seen.add(key)
+        c = self._integrity()
+        c[f"option_fill_prints_{kind}"] += 1
+        if kind != "unverified":
+            c["option_fill_prints_rejected"] += 1
+            logger.warning("[backtest] option fill print %s: %s", kind.upper(), example)
+            if len(c["option_fill_print_examples"]) < 3:
+                c["option_fill_print_examples"].append(f"{kind}: {example}")
+        return True
+
+    def _screen_open_print(self, order, px: float, fill_day, bar: dict, as_of_bar,
+                           as_of) -> Optional[float]:
+        """The premium an option fill may be priced from, given its OPEN print ``px``.
+
+        ``px`` when it is consistent with the contract's own session evidence; the Black-Scholes
+        premium of the DECISION bar's iv at the fill day's open when it is not; None -- REFUSE,
+        the order stays pending like any no-fill -- when no such premium exists.
+
+        WHY. A daily bar has no timestamp on its open, and a thin contract's open is routinely
+        an isolated trade far from where the contract then traded (LRCX 2022-10-12: the 370 call
+        "opened" at 5.06 inside a 5.06-13.35 session while the 385 opened at 9.87, so the bull
+        call spread filled at a NEGATIVE debit of 4.43; CSCO 2023-12-01: a 50 call opened at 0.10
+        against a prior bid of 0.43 and a session high of 0.44). The fill model prices every leg
+        at its OWN open, so one such print is a free option.
+
+        THE TEST (see ``_FILL_PRINT_REL_TOL`` for the measurement). Two references, both the
+        contract repriced with Black-Scholes at the UNDERLYING'S OPEN on the fill day: one at the
+        iv the fill day's own CLOSE implies (``bar['iv']``), one at the DECISION bar's iv
+        (``as_of_bar['iv']``). A real open sits between them or near them -- the iv drifted across
+        the session -- while an isolated print sits outside both. Gamma and big underlying moves
+        are inside the references (they are priced at the open's spot), which is why this is not
+        a delta-linear adjustment of the close. The print is rejected when it lies further than
+        ``max(REL x reference, ABS)`` outside their interval.
+
+        THE REPLACEMENT is the decision-bar-iv reference: ``_bs_premium_clamped``, the same BS
+        stage the mark chain uses for a held lot with no bar. Nothing else is invented: no
+        decision-bar close carried over, no intrinsic stand-in (an OTM leg's intrinsic is 0, and
+        a fill at 0 is the bug). Without a decision-bar iv, a risk-free rate or an underlying
+        open there is no defensible price and the order is refused.
+
+        NOT JUDGED (counted ``unverified``, print accepted): no reference could be built at all.
+        Not applied under ``same_bar_close`` (the caller): the print IS the session's close.
+        """
+        strike = getattr(order, "strike", None)
+        if strike is None:
+            strike = bar.get("strike")
+        right = getattr(order, "option_type", None)
+        if right is None:
+            raw = bar.get("option_type")
+            right = (OptionRight.CALL if str(raw).lower() == "call" else
+                     OptionRight.PUT if str(raw).lower() == "put" else None)
+        expiry = getattr(order, "expiry", None)
+        if expiry is None and bar.get("expiry"):
+            expiry = date.fromisoformat(str(bar["expiry"])[:10])
+        contract = getattr(order, "contract_symbol", None)
+        label = (f"{fill_day} {getattr(order, 'side', None)} {contract}: open {px:.2f}")
+        underlying = getattr(order, "underlying_symbol", None) or order.symbol
+        spot_bar = self._price.bar_at(underlying, fill_day)
+        rate_source = self.options_risk_free_rate_source()
+        if (strike is None or right is None or expiry is None or spot_bar is None
+                or rate_source is None):
+            self._count_fill_print("unverified", order, fill_day,
+                                   f"{label} (no terms / underlying open / rate to judge it)")
+            return px
+        spot = self.option_basis_price(underlying, float(spot_bar["open"]), fill_day)
+        rate = rate_source.rate_on(fill_day)
+        as_of_day = as_of.date() if hasattr(as_of, "date") else as_of
+        if as_of_bar is None:
+            as_of_bar = self._option_bar(contract, as_of_day)
+
+        def _trusted_iv(day_bar, day, day_rate) -> Optional[float]:
+            """A bar's iv, but only when it REPRODUCES that bar's own close at the underlying's
+            close of its day (the way a real inversion does). An iv in another share basis (the
+            sqlite store inverts against the split-adjusted FMP close), carried over from a
+            different snapshot, or simply inconsistent with the print cannot be repriced at
+            today's open without making a wrong reference -- it is no evidence, so unused."""
+            if not day_bar or day_bar.get("iv") is None or day_bar.get("close") is None:
+                return None
+            u_bar = self._price.bar_at(underlying, day)
+            if u_bar is None:
+                return None
+            u_close = self.option_basis_price(underlying, float(u_bar["close"]), day)
+            model = self._bs_premium_clamped(strike, u_close, right, expiry, day_bar["iv"],
+                                             day, day_rate)
+            close_px = float(day_bar["close"])
+            if model is None or abs(model - close_px) > max(0.03 * close_px, 0.05):
+                return None
+            return float(day_bar["iv"])
+
+        close_iv = _trusted_iv(bar, fill_day, rate)
+        prior_iv = _trusted_iv(as_of_bar, as_of_day, rate_source.rate_on(as_of_day))
+        close_ref = prior_ref = None
+        if close_iv is not None:
+            close_ref = self._bs_premium_clamped(strike, spot, right, expiry, close_iv,
+                                                 fill_day, rate)
+        if prior_iv is not None:
+            prior_ref = self._bs_premium_clamped(strike, spot, right, expiry, prior_iv,
+                                                 fill_day, rate)
+        refs = [r for r in (close_ref, prior_ref) if r is not None]
+        if not refs:
+            self._count_fill_print("unverified", order, fill_day,
+                                   f"{label} (no iv on the fill or decision bar to judge it)")
+            return px
+        lo_ref, hi_ref = min(refs), max(refs)
+        close = bar.get("close")
+        scale = max(lo_ref, 0.5 * float(close)) if close is not None else lo_ref
+        tol = max(_FILL_PRINT_REL_TOL * scale, _FILL_PRINT_ABS_TOL)
+        dist = lo_ref - px if px < lo_ref else (px - hi_ref if px > hi_ref else 0.0)
+        if dist <= tol:
+            return px
+        evidence = (f"{label} vs session-consistent range [{lo_ref:.2f}, {hi_ref:.2f}] "
+                    f"(tolerance {tol:.2f}; session low/high {bar.get('low')}/{bar.get('high')}, "
+                    f"close {close})")
+        if prior_ref is None:
+            self._count_fill_print("refused", order, fill_day,
+                                   f"{evidence} -> no trusted decision-bar iv to reprice from; order "
+                                   f"refused")
+            return None
+        self._count_fill_print("replaced", order, fill_day,
+                               f"{evidence} -> repriced to {prior_ref:.2f} "
+                               f"(BS at the decision-bar iv, the underlying's open)")
+        return prior_ref
+
     def _arb_fill_reject_reason(
         self, order, fill_px: float, fill_day, same_bar: bool, bar: dict
     ) -> Optional[str]:
@@ -3572,7 +3784,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # (``_no_arb_premium_bounds`` with spot=None is exactly the spot-free bound; the
         # bounds themselves live THERE, shared with the mark/settlement clamps.)
         _, upper_spotless = self._no_arb_premium_bounds(strike, is_call, None)
-        if is_close and upper_spotless is not None and fill_px > upper_spotless + _ARB_FILL_TOLERANCE:
+        # The upper bound binds an OPENING fill exactly as it binds a closing one (an entry
+        # premium above the strike for a put, or above the stock for a call below, is as
+        # impossible as an exit at it): a buy filled there is a guaranteed loss, a sell a
+        # free gift -- either way a junk print, not a market.
+        if upper_spotless is not None and fill_px > upper_spotless + _ARB_FILL_TOLERANCE:
             return (
                 f"put premium {fill_px:.4f} exceeds strike {strike:.2f} + tolerance "
                 f"{_ARB_FILL_TOLERANCE} (a put can never be worth more than its strike)"
@@ -3601,6 +3817,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     f"{_ARB_FILL_TOLERANCE} (a call can never cost more than the stock)"
                 )
             return None
+        if is_call and fill_px > upper + _ARB_FILL_TOLERANCE:
+            return (
+                f"call premium {fill_px:.4f} exceeds spot {spot:.2f} + tolerance "
+                f"{_ARB_FILL_TOLERANCE} (a call can never cost more than the stock)"
+            )
         if fill_px < intrinsic - _ARB_FILL_TOLERANCE:
             return (
                 f"premium {fill_px:.4f} is below intrinsic {intrinsic:.4f} - tolerance "
@@ -3625,6 +3846,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             and o.status not in terminal
             and o.status != OrderStatus.FILLED
         ]
+
+    def _option_fill_cash(self) -> float:
+        """Cash a DEBIT option fill may spend: the ledger cash LESS the collateral reserved by
+        open credit structures (and the excess reserved by an unbalanced debit one) -- the
+        reserve pool the entry gates already read. Debits paid plus collateral reserved can
+        never exceed the cash the account holds; the fill-time cap read the raw ledger cash and
+        so could spend a cash-secured put's collateral. The pool is a lower bound when one of
+        its rows is unreadable (``reserved_option_buying_power``), which can only over-state
+        the cash."""
+        return self._cash - self.reserved_option_buying_power()
 
     def _cap_single_leg_option_entry(self, order, fill_px: float) -> bool:
         """Cash-secured cap for a lone LONG (debit) single-leg option ENTRY.
@@ -3651,14 +3882,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if per_contract <= 0:
             return True
         cost = qty * fill_px * multiplier + commission
-        if cost <= self._cash + 1e-6:
+        cash = self._option_fill_cash()
+        if cost <= cash + 1e-6:
             return True  # affordable at full size -> no cap
-        affordable = int(self._cash // per_contract)
+        affordable = int(cash // per_contract) if cash > 0 else 0
         if affordable < 1:
             logger.error(
                 "BACKTEST option cash-secured: LONG %s %g @ %.4f (cost $%.2f) exceeds cash "
                 "$%.2f -> entry NOT opened.",
-                order.contract_symbol, qty, fill_px, cost, self._cash,
+                order.contract_symbol, qty, fill_px, cost, cash,
             )
             order.status = OrderStatus.CANCELED
             order.quantity = 0
@@ -3669,7 +3901,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         logger.error(
             "BACKTEST option cash-secured: LONG %s sized %g @ %.4f exceeds cash $%.2f -> "
             "capping to %d contract(s).",
-            order.contract_symbol, qty, fill_px, self._cash, affordable,
+            order.contract_symbol, qty, fill_px, cash, affordable,
         )
         order.quantity = float(affordable)
         self._bump_option_memo()  # in-place quantity mutation: refresh the F6 memos
@@ -3752,6 +3984,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for leg, px in priced:
             ratio = abs(float(leg.quantity or 0.0)) / structures
             net_per_share += (px if leg.side == OrderDirection.BUY else -px) * ratio
+        # --- NO-ARBITRAGE BOUNDS OF THE STRUCTURE'S NET --------------------------------
+        # Whatever each leg's own print says, the structure cannot trade outside the value
+        # range of its legs: a debit vertical's debit lies in (0, width), a credit's in
+        # (0, width) the other way. A net outside it (LRCX: a debit of -4.43, i.e. paid to
+        # open) is two inconsistent prints, never a market, and is not filled.
+        bound_reason = self._structure_net_bound_reason(parent, priced, structures, net_per_share)
+        if bound_reason is not None:
+            self._count_structure_refusal(parent, as_of, bound_reason)
+            return
         limit = getattr(parent, "limit_price", None)
         if limit is not None and net_per_share > float(limit) + _NET_LIMIT_TOLERANCE:
             logger.warning(
@@ -3794,8 +4035,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # + per-leg commission for one structure's worth of legs (flat charge per leg fill).
         per_structure_cost = debit_per_structure + commission * len(priced)
         capped = structures
+        fill_cash = self._option_fill_cash()
         if per_structure_cost > 0:
-            affordable = int((self._cash) // per_structure_cost)
+            affordable = int(fill_cash // per_structure_cost) if fill_cash > 0 else 0
             if affordable < structures:
                 if affordable < 1:
                     # Not even one structure affordable -> the combo does NOT open this bar. Cancel
@@ -3803,7 +4045,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     logger.error(
                         "BACKTEST option cash-secured: DEBIT combo %s per-structure cost $%.2f "
                         "exceeds cash $%.2f -> entry NOT opened.",
-                        getattr(parent, "option_strategy", None), per_structure_cost, self._cash,
+                        getattr(parent, "option_strategy", None), per_structure_cost, fill_cash,
                     )
                     for leg, _ in priced:
                         leg.status = OrderStatus.CANCELED
@@ -3818,7 +4060,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     "BACKTEST option cash-secured: DEBIT combo %s sized %g structures @ $%.2f "
                     "each exceeds cash $%.2f -> capping to %d.",
                     getattr(parent, "option_strategy", None), structures, per_structure_cost,
-                    self._cash, affordable,
+                    fill_cash, affordable,
                 )
                 capped = float(affordable)
 
@@ -3833,6 +4075,89 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             self._sync_transaction_quantity(parent.transaction_id, float(capped))
 
         self._apply_multi_leg_fill(parent, priced, as_of)
+
+    #: Dollars of slack when testing a structure's net against its value bounds. An OPENING
+    #: net must lie STRICTLY inside them; a net within this of an edge is on it.
+    _STRUCTURE_BOUND_EPS = 1e-6
+
+    def _structure_net_bound_reason(self, parent, priced, structures: float,
+                                    net_per_share: float) -> Optional[str]:
+        """Why a multi-leg fill's NET per structure breaks the structure's no-arbitrage value
+        range, else None.
+
+        ``net_per_share`` is the engine's one sign convention (+debit / -credit) per structure
+        per share; the range is ``option_payoff.position_value_bounds`` of the traded legs (the
+        SAME function the mark clamp, the expiry clamp and the entry ``max_loss`` stamp read),
+        for ONE structure. An OPENING net must be strictly inside ``(lo, hi)``: at or below
+        ``lo`` it is paid at least the worst the position can ever owe, at or above ``hi`` it
+        pays at least the best it can ever collect. A CLOSE is checked inclusively: a deep
+        in-the-money vertical legitimately closes at its full width with the spread modelled at
+        zero. The range is on the LEGS' own sides, so closing a bought vertical is checked as
+        the sold vertical it is. An unbounded side is no bound.
+
+        Legs that cannot be expressed (no strike / right / size) or that ``validate_legs``
+        refuses leave the net UNVERIFIED -- counted, never guessed."""
+        expiries = {getattr(leg, "expiry", None) for leg, _px in priced}
+        if len(expiries) > 1:
+            # A calendar / diagonal / PMCC roll: the legs' expiry values are not one payoff
+            # (the far leg still carries time value), so there is no single value range to
+            # bound the net by. Counted, not judged.
+            self._count_fill_print("unverified", parent, self._as_of_date(),
+                                   f"{getattr(parent, 'option_strategy', None)}: legs span "
+                                   f"{len(expiries)} expiries")
+            return None
+        legs = []
+        for leg, _px in priced:
+            if (leg.strike is None or leg.option_type not in (OptionRight.CALL, OptionRight.PUT)
+                    or not leg.quantity
+                    or leg.side not in (OrderDirection.BUY, OrderDirection.SELL)):
+                self._count_fill_print("unverified", parent, self._as_of_date(),
+                                       f"{getattr(parent, 'option_strategy', None)}: a leg has "
+                                       f"no strike/right/size; the net cannot be bounded")
+                return None
+            legs.append(PayoffLeg(
+                kind=("call" if leg.option_type == OptionRight.CALL else "put"), side=leg.side,
+                premium=0.0, strike=float(leg.strike),
+                ratio=abs(float(leg.quantity)) / structures,
+                multiplier=float(leg.multiplier or 100)))
+        try:
+            lo, hi = position_value_bounds(legs)
+        except ValueError as e:
+            self._count_fill_print("unverified", parent, self._as_of_date(),
+                                   f"{getattr(parent, 'option_strategy', None)}: {e}")
+            return None
+        net = net_per_share * float(priced[0][0].multiplier or 100)
+        eps = self._STRUCTURE_BOUND_EPS
+        closing = self._multi_leg_is_closing(parent, [leg for leg, _ in priced])
+        below = net < lo - eps if closing else net <= lo + eps
+        above = net > hi + eps if closing else net >= hi - eps
+        if not (below or above):
+            return None
+        rel = ("at or below the worst it can ever be worth" if below
+               else "at or above the best it can ever be worth")
+        return (f"net {net:+.2f} per structure ({net_per_share:+.4f}/share) is {rel}: the "
+                f"structure's value range is [{lo:.2f}, {hi:.2f}] "
+                f"({'closing' if closing else 'opening'}; legs "
+                + ", ".join(f"{leg.side.value if hasattr(leg.side, 'value') else leg.side} "
+                            f"{leg.strike:g}{'C' if leg.option_type == OptionRight.CALL else 'P'}"
+                            f"@{px:.2f}" for leg, px in priced) + ")")
+
+    def _count_structure_refusal(self, parent, as_of, reason: str) -> None:
+        """One multi-leg fill refused for its net (once per parent order per day)."""
+        day = as_of.date() if hasattr(as_of, "date") else as_of
+        seen = self.__dict__.setdefault("_structure_refusal_seen", set())
+        key = (getattr(parent, "id", None), day)
+        if key in seen:
+            return
+        seen.add(key)
+        c = self._integrity()
+        c["option_structure_fills_refused"] += 1
+        text = f"{day} {getattr(parent, 'option_strategy', None)}: {reason}"
+        if len(c["option_structure_fill_examples"]) < 3:
+            c["option_structure_fill_examples"].append(text)
+        logger.warning("[backtest] multi-leg fill REFUSED, the net breaks the structure's "
+                       "no-arbitrage bounds: %s. The order stays pending and retries the next "
+                       "bar.", text)
 
     @staticmethod
     def _multi_leg_is_closing(parent, legs) -> bool:
@@ -5244,6 +5569,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return {**c,
                 "option_clamp_fallback_examples": list(c["option_clamp_fallback_examples"]),
                 "option_mark_print_examples": list(c["option_mark_print_examples"]),
+                "option_fill_print_examples": list(c["option_fill_print_examples"]),
+                "option_structure_fill_examples": list(c["option_structure_fill_examples"]),
                 "option_ledger_mismatches": {
             "count": c["option_ledger_mismatches"]["count"],
             "examples": [dict(e) for e in c["option_ledger_mismatches"]["examples"]]}}

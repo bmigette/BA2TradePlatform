@@ -28,9 +28,10 @@ from tests.backtest.test_option_split_rekey import CFG, PUT400, PUT410, _closes,
 ON = {**CFG, "option_size_within_fill_volume": True}
 
 
-def _bars(volumes):
-    """contract -> volume, a flat 10.00 premium on every pre-split session."""
-    return {(c, d): _bar(10.0, volume=v) for c, v in volumes.items()
+def _bars(volumes, premiums=None):
+    """contract -> volume, a flat 10.00 premium on every pre-split session (``premiums``:
+    contract -> premium, for a structure whose legs must not print the SAME price)."""
+    return {(c, d): _bar((premiums or {}).get(c, 10.0), volume=v) for c, v in volumes.items()
             for d in _sessions() if d < date(2020, 8, 31)}
 
 
@@ -96,7 +97,10 @@ def test_flag_off_is_unchanged_the_order_keeps_its_size_and_expires_unfilled():
 
 def test_a_multi_leg_structure_is_capped_by_its_most_constrained_leg():
     """Short P410 volume 100 (cap 10), long P400 volume 30 (cap 3): 8 structures -> 3."""
-    with _harness(_bars({PUT410: 100, PUT400: 30}), _closes(), cfg=ON) as (engine, acct, ps):
+    # 14.00 / 10.00: a bull put spread's credit must lie inside (0, width 10) -- two equal
+    # prints (a zero credit) are an arbitrage the fill engine refuses.
+    bars = _bars({PUT410: 100, PUT400: 30}, {PUT410: 14.0, PUT400: 10.0})
+    with _harness(bars, _closes(), cfg=ON) as (engine, acct, ps):
         parent = acct.submit_option_order(
             legs=[_leg(PUT410, 410.0, OrderDirection.SELL), _leg(PUT400, 400.0, OrderDirection.BUY)],
             quantity=8, order_type="market", option_strategy="bull_put_spread")

@@ -4135,6 +4135,56 @@ class _OptionEntryAction(TradeAction):
         """
         return (expiry - self._today()).days
 
+    def _fit_debit_to_capital(self, quantity: int, commit_per_contract: float,
+                              option_strategy: str) -> "Tuple[int, Optional[Dict[str, Any]]]":
+        """``(quantity that fits, None)`` or ``(quantity, refusal)`` for a premium-sized entry.
+
+        THE CAPITAL LIMIT OF THE OPTION BOOK (owner rule, 2026-10-06): no portfolio cap, but the
+        debits paid plus the collateral reserved by every open option structure can never exceed
+        what the account has -- "like with stocks", where the entry is clamped to buying power.
+        Credit structures already refuse when their reserve does not fit
+        (``check_option_buying_power``); a debit entry sized as a percentage of the account
+        never asked, so it could spend cash a credit structure had reserved, or cash a debit
+        entry decided in the same session was about to pay.
+
+        ``account.option_capital_headroom()`` is the one answer. The size is CUT to what fits
+        (and said so in the log); REFUSED when not even one contract fits, or when the
+        headroom cannot be measured (an unreadable reserve is UNKNOWN, and unknown never reads
+        as room). Live and backtest run this same function.
+        """
+        headroom_fn = getattr(self.account, "option_capital_headroom", None)
+        if not callable(headroom_fn):
+            return quantity, None      # an account double with no reserve model
+        headroom = headroom_fn()
+        if headroom is not None and (isinstance(headroom, bool)
+                                     or not isinstance(headroom, (int, float))):
+            return quantity, None      # only a NUMBER (or None = unknown) is an answer
+        if headroom is None:
+            logger.warning(f"{option_strategy} on {self.instrument_name} REFUSED: the option "
+                           f"capital headroom is unmeasurable (an open order's reserve is "
+                           f"unreadable), so no debit can be shown to fit")
+            return quantity, self._result(
+                False, f"{option_strategy} on {self.instrument_name} refused: the account's "
+                       f"option capital headroom cannot be measured")
+        fits = int(math.floor(headroom / commit_per_contract)) if headroom > 0 else 0
+        # The same float comparison the fill makes: never one contract past the room.
+        while fits > 0 and fits * commit_per_contract > headroom:
+            fits -= 1
+        if fits >= quantity:
+            return quantity, None
+        if fits < 1:
+            logger.warning(f"{option_strategy} on {self.instrument_name} REFUSED: one contract "
+                           f"commits {commit_per_contract:.2f} but only {headroom:.2f} of option "
+                           f"capital is uncommitted")
+            return quantity, self._result(
+                False, f"Insufficient option capital for {option_strategy} on "
+                       f"{self.instrument_name}: one contract commits {commit_per_contract:.2f}, "
+                       f"{headroom:.2f} is uncommitted")
+        logger.warning(f"{option_strategy} on {self.instrument_name} DOWNSIZED {quantity} -> "
+                       f"{fits} contract(s) to fit the uncommitted option capital "
+                       f"{headroom:.2f} ({commit_per_contract:.2f} per contract)")
+        return fits, None
+
     def _size_and_submit(self, resolved) -> Dict[str, Any]:
         """Size ``resolved`` and submit it. The former tail of every ``_build_and_submit``.
 
@@ -4161,6 +4211,15 @@ class _OptionEntryAction(TradeAction):
             cost = risk.risk_per_contract
             extra_per_contract = risk.extra_beyond_outlay
         quantity = self._size_by_cost(cost, self.sizing)
+        if quantity >= 1 and resolved.sizing_basis == "premium":
+            # A DEBIT entry spends cash the account must still hold: what it pays (and, for a
+            # structure that can lose more than its debit, the excess it reserves -- ``cost``
+            # is that whole commitment per contract) cannot exceed the headroom left after the
+            # collateral reserved by credit structures and the debit entries still in flight.
+            quantity, refusal = self._fit_debit_to_capital(
+                quantity, cost, resolved.option_strategy)
+            if refusal is not None:
+                return refusal
         if quantity >= 1 and extra_per_contract > 0.0:
             # The loss beyond the debit is NOT paid at the fill, so it is reserved (the debit is
             # already out of the account). Honoured by ``reserved_option_buying_power_detail``
@@ -4680,7 +4739,7 @@ class SellCashSecuredPutAction(_OptionEntryAction):
             return self._result(False,
                                 f"Insufficient buying power to reserve {reserve} for cash_secured_put "
                                 f"on {self.instrument_name} (available="
-                                f"{self.account.available_option_buying_power()})")
+                                f"{self.account.option_capital_headroom()})")
         # ONE short put, `quantity` contracts, at contract.strike.
         quantity, refusal = self._downsize_to_delivery_capacity(
             "cash_secured_put", strike=contract.strike, quantity=quantity)
@@ -4767,7 +4826,7 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
             return self._result(False,
                                 f"Insufficient buying power to reserve {reserve} for bear_call_spread "
                                 f"on {self.instrument_name} (available="
-                                f"{self.account.available_option_buying_power()})")
+                                f"{self.account.option_capital_headroom()})")
         short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
                               position_intent="sell_to_open", option_type=self.OPTION_TYPE,
                               strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying, quote=short_c)
@@ -4871,7 +4930,7 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
             return self._result(False,
                                 f"Insufficient buying power to reserve {reserve} for bull_put_spread "
                                 f"on {self.instrument_name} (available="
-                                f"{self.account.available_option_buying_power()})")
+                                f"{self.account.option_capital_headroom()})")
         # The SHORT PUT leg (the HIGHER strike), `quantity` contracts, charged at its FULL
         # strike. The long put wing nets NOTHING off: the short leg can be assigned
         # TONIGHT, while exercising our own lower-strike put is a choice we make LATER —
@@ -5740,7 +5799,7 @@ class _BackspreadAction(_OptionEntryAction):
             return self._result(
                 False, f"Insufficient buying power to reserve {reserve} for "
                        f"{self.OPTION_STRATEGY} on {self.instrument_name} (available="
-                       f"{self.account.available_option_buying_power()})")
+                       f"{self.account.option_capital_headroom()})")
         quantity, refusal = self._assignment_capacity(short_c, quantity)
         if refusal is not None:
             return refusal
