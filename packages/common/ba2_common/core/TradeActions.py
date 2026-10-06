@@ -3049,13 +3049,13 @@ class _OptionEntryAction(TradeAction):
         return sp, sp
 
     def _virtual_equity(self) -> Optional[float]:
-        """OPTION tradable balance * virtual_equity_pct/100 (the whole option tradable
-        balance when the pct is unknown). Option entries are sized from the option
-        leverage, which is 1.0 at every supported broker today, so with the stock factor
-        at 1.8 this stays at the plain balance -- long options cannot be bought on
-        margin. None when the account cannot answer, never a guess."""
+        """The account's EQUITY (``option_capital_equity``) * virtual_equity_pct/100 -- the SAME
+        base the option capital limit is measured against, and the same in backtest and live
+        (``get_balance()`` is cash in a backtest and equity live, so a budget taken from it
+        differed after capital was deployed). Option leverage is 1.0 at every supported broker, so
+        no margin factor applies. None when the account cannot answer, never a guess."""
         try:
-            balance = self.account.get_option_tradable_balance()
+            balance = self.account.option_capital_equity()
         except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
             # WHY ONLY ValueError: that is the NAMED "unknown balance / bad margin factor"
             # signal the tradable-balance path raises. Anything else is a defect, and

@@ -263,6 +263,41 @@ def test_the_close_implied_iv_decides_accept_or_reject_but_never_prices_the_repl
         ctx.__exit__(None, None, None)
 
 
+def test_a_buy_back_with_no_iv_and_no_range_keeps_its_time_value(monkeypatch):
+    """Closing a SHORT call: buy_to_close. The garbage print (0.05) is rejected, the decision bar has
+    no iv to reprice from and the session has no usable range. Intrinsic (0.00 at a spot of 180)
+    would hand the buy-back its time value for free; the fallback is the LAST TRADED price (the
+    decision bar's close, ~3.9) -- never below intrinsic -- and is counted."""
+    from app.services.backtest.backtest_account import BacktestAccount
+    monkeypatch.setattr(BacktestAccount, "_adverse_clamp", staticmethod(lambda p, b, bar: None))
+    sym = occ("C", 185.0)
+    acct, ps, ctx, _ = build_account(overrides={
+        (sym, "2024-02-06"): {"open": 0.05},
+        (sym, "2024-02-05"): {"iv": None}})
+    try:
+        acct.submit_option_order(
+            legs=[_leg(sym, 185.0, OrderDirection.SELL, "sell_to_open")], quantity=2,
+            order_type="market", option_strategy="naked_call")
+        acct.refresh_orders()
+        acct.refresh_transactions()
+        assert acct._option_positions[sym].qty == -2
+        ps.set_clock(datetime(2024, 2, 5))
+        closing = acct.submit_option_order(
+            legs=[_leg(sym, 185.0, OrderDirection.BUY, "buy_to_close")], quantity=2,
+            order_type="market", option_strategy="close")
+        acct.refresh_orders()
+        closed = acct.get_order(closing.id)
+        assert closed.status == OrderStatus.FILLED
+        last_traded = model_price("C", 185.0, date(2024, 2, 5))
+        assert closed.open_price == pytest.approx(last_traded, abs=0.01)
+        assert closed.open_price > 3.0                      # not the 0.00 intrinsic
+        stats = acct.option_integrity_stats()
+        assert stats["option_close_buyback_last_price"] == 1
+        assert stats["option_close_prints_fallback"] == 1
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 # ----------------------------------------------------------------------------------------
 # item 9 -- owner selection
 # ----------------------------------------------------------------------------------------

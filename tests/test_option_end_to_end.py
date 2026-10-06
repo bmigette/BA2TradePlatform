@@ -15,6 +15,8 @@ from datetime import date, timedelta
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("_mock_expert_is_resolvable")
+
 from ba2_trade_platform.core.TradeActionEvaluator import TradeActionEvaluator
 from ba2_trade_platform.core.types import (
     ExpertActionType, ExpertEventType, ExpertEventRuleType,

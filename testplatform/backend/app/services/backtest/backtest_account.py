@@ -416,6 +416,7 @@ def _new_integrity_counters() -> Dict[str, Any]:
             # market-type OPENING entries expired after a refused fill.
             "option_close_prints_fallback": 0,
             "option_close_structure_fallbacks": 0,
+            "option_close_buyback_last_price": 0,
             "option_market_entries_expired": 0,
             "option_fill_print_examples": [],
             "option_structure_fills_refused": 0,
@@ -3766,10 +3767,29 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                                  fill_day, rate)
         intrinsic = self._no_arb_premium_bounds(strike, right == OptionRight.CALL, spot)[0]
 
+        def _positive(raw) -> Optional[float]:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return None
+            return value if math.isfinite(value) and value > 0 else None
+
         def _fallback(reason: str) -> Optional[float]:
             """The replacement price per the chain above, or None (refuse an open)."""
-            if force_fallback == "intrinsic" or (prior_ref is None and closing):
+            if force_fallback == "intrinsic":
                 base, source = intrinsic, "intrinsic at the underlying's open"
+            elif prior_ref is None and closing:
+                base, source = intrinsic, "intrinsic at the underlying's open"
+                if is_buy:
+                    # A BUY-BACK of a short must not ignore time value: with no prior-iv BS to
+                    # price it, the adverse stage is the LAST TRADED price (the decision bar's
+                    # close), never below intrinsic.
+                    last = _positive(as_of_bar.get("close")) if as_of_bar else None
+                    if last is not None:
+                        base = max(intrinsic, last)
+                        source = ("last traded price (decision-bar close), never below intrinsic "
+                                  "-- a buy-back keeps its time value")
+                        self._integrity()["option_close_buyback_last_price"] += 1
             elif prior_ref is not None:
                 base, source = prior_ref, "BS at the decision-bar iv, the underlying's open"
             else:
@@ -3784,7 +3804,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 f"{reason} -> repriced to {clamped:.2f} ({source}"
                 + ("" if clamped == base else f", clamped into the session range from {base:.2f}")
                 + ")")
-            if closing and first and base == intrinsic:
+            if closing and first and (prior_ref is None or force_fallback == "intrinsic"):
                 self._integrity()["option_close_prints_fallback"] += 1
             return clamped
 

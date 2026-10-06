@@ -10,6 +10,8 @@ Two coverage angles:
 """
 import pytest
 
+pytestmark = pytest.mark.usefixtures("_mock_expert_is_resolvable")
+
 from ba2_trade_platform.core.TradeActionEvaluator import TradeActionEvaluator
 from ba2_trade_platform.core.TradeActions import BuyCallAction
 from ba2_trade_platform.core.types import (

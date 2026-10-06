@@ -510,7 +510,7 @@ def _test_fakes_declare_a_greeks_source(monkeypatch):
     monkeypatch.setattr(_OAI, "OPTION_GREEKS_SOURCE", "test_fake")
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def _mock_expert_is_resolvable(monkeypatch):
     """An option entry now reads its expert's capital (``get_available_equity_balance_detail``)
     through the instance resolver, so an ``ExpertInstance`` row named ``MockExpert`` must resolve to

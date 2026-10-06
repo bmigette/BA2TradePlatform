@@ -41,6 +41,9 @@ class _Acct:
     def get_option_tradable_balance(self):
         return self._balance
 
+    def option_capital_equity(self):
+        return self._balance                  # the sizing base: equity (no positions here)
+
 
 def _sizer(*, balance=20_000.0, cap_pct=10.0, floor=None, sizing=5.0, committed=0.0):
     """A BuyCallAction with only what the sizing tail reads. ``cap_pct=None`` means no

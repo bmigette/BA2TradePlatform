@@ -144,6 +144,13 @@ def enabled_instruments_config(settings: Dict[str, Any]) -> Dict[str, Dict]:
     return {}
 
 
+#: Appended to every refusal caused by an unreadable option row, so the operator knows the repair.
+CAPITAL_REPAIR_HINT = (
+    "Repair: an open cash-secured / credit structure must carry data['option_reserve'] on its order, "
+    "a working debit entry needs a limit price (or entry_debit_per_contract), and an open option "
+    "transaction needs its open_price and strategy; fix or close the named row.")
+
+
 class CapitalUnmeasurable(ValueError):
     """The capital an expert's open or working positions commit could not be read.
 
@@ -166,22 +173,113 @@ def _readable_positive(raw) -> Optional[float]:
     return value if math.isfinite(value) and value > 0 else None
 
 
+def capital_transactions(expert_id: int) -> List[Any]:
+    """The transactions that hold an expert's capital, as the shared used-balance reads them.
+
+    WAITING and OPENED for every asset class, as the stock path always has. An OPTION transaction
+    that is CLOSING is included as well: a resting close on a cash-secured put or a spread has not
+    released its collateral (or the premium it holds) until it fills. A STOCK transaction that is
+    CLOSING stays excluded, exactly as today -- the stock path has the same gap (a resting stock close
+    drops out of ``used`` before it fills); that is reported, not changed, here."""
+    from ba2_common.core.trade_store import transactions_where
+    rows = transactions_where(
+        expert_id=expert_id,
+        statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED, TransactionStatus.CLOSING])
+    return [t for t in rows
+            if t.status != TransactionStatus.CLOSING or _is_option_transaction(t)]
+
+
+def _order_float(raw) -> float:
+    try:
+        return float(raw) if raw is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _working_entry_value(transaction: Any, orders: List[Any], *, include_filled: bool,
+                         strategy: Optional[str], unmeasurable: List[str]) -> float:
+    """Cash the DEBIT entry orders of ``transaction`` have paid or still have to pay.
+
+    ``include_filled=False`` (the transaction is OPENED/CLOSING: its position cost already carries
+    what filled): only the UNFILLED REMAINDER of orders still working -- a 20-contract limit buy that
+    filled 8 has 12 working, and those 12 are committed. ``include_filled=True`` (the transaction is
+    still WAITING, so no position cost exists yet): filled part at its fill price (the limit when no
+    fill price is recorded) plus the remainder. A market-type order is valued by the per-contract
+    debit its builder stamped on the row. Reserving (credit) structures contribute nothing here: their
+    collateral is the recorded ``option_reserve``, stamped for the ORDERED quantity, so a partial fill
+    never shrinks it. Everything unreadable is named in ``unmeasurable``; nothing is defaulted."""
+    from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+    from ba2_common.core.types import OrderStatus
+
+    if strategy in OptionsAccountInterface.RESERVING_STRATEGIES:
+        return 0.0
+    working = OrderStatus.get_active_statuses()
+    total = 0.0
+    for o in orders:
+        if (getattr(o, "parent_order_id", None) or getattr(o, "side", None) != OrderDirection.BUY):
+            continue
+        intent = str(getattr(o, "position_intent", None) or "").lower()
+        if "close" in intent or str(getattr(o, "option_strategy", None) or "") == "close":
+            continue
+        filled = max(_order_float(getattr(o, "filled_qty", None)), 0.0)
+        is_working = getattr(o, "status", None) in working
+        if not is_working and not (include_filled and filled > 0):
+            continue
+        olabel = f"order {o.id} ({strategy or 'single leg'} on {o.symbol})"
+        quantity = _readable_positive(getattr(o, "quantity", None))
+        if quantity is None:
+            unmeasurable.append(f"{olabel} is a debit entry with an unreadable quantity "
+                                f"({getattr(o, 'quantity', None)!r})")
+            continue
+        remaining = max(quantity - filled, 0.0) if is_working else 0.0
+        counted_filled = filled if include_filled else 0.0
+        if remaining <= 0 and counted_filled <= 0:
+            continue
+        limit = _readable_positive(getattr(o, "limit_price", None))
+        multiplier = _readable_positive(getattr(o, "multiplier", None))
+        data = getattr(o, "data", None)
+        stamped = _readable_positive(
+            data.get(OptionsAccountInterface.ENTRY_DEBIT_PER_CONTRACT_KEY)
+            if isinstance(data, dict) else None)
+        if limit is not None and multiplier is None:
+            unmeasurable.append(f"{olabel} is a debit entry with an unreadable multiplier "
+                                f"({getattr(o, 'multiplier', None)!r})")
+            continue
+        unit = limit * multiplier if limit is not None else stamped
+        if unit is None:
+            unmeasurable.append(
+                f"{olabel} is a debit entry with no readable limit price "
+                f"({getattr(o, 'limit_price', None)!r}) and no recorded "
+                f"{OptionsAccountInterface.ENTRY_DEBIT_PER_CONTRACT_KEY}, so its cost is UNKNOWN")
+            continue
+        total += unit * remaining
+        if counted_filled > 0:
+            fill = _readable_positive(getattr(o, "open_price", None))
+            fill_unit = (fill * multiplier) if (fill is not None and multiplier is not None) else unit
+            total += fill_unit * counted_filled
+    return total
+
+
 def option_transaction_commitment(account: Any, transaction: Any, *, loss_adjusted: bool,
                                   unmeasurable: List[str]) -> float:
     """Capital one OPTION transaction commits -- THE option arm of ``used_balance_for_transactions``.
 
     * a DEBIT (side BUY, positive price, not a reserving structure): the premium paid, ``open_price
       x quantity x multiplier`` (with ``loss_adjusted`` the stock path's cost-plus-loss, marked off
-      the option's own quote);
+      the option's own quote), PLUS the unfilled remainder of any entry order still working (a
+      PARTIALLY_FILLED 20-lot that filled 8 holds the 12 still resting);
     * a CREDIT / reserving structure (cash-secured put, credit spreads, condors, ...): its
-      COLLATERAL, the ``option_reserve`` its builder recorded on its orders -- the premium it
-      collected is not capital spent (it used to count as a negative or a small positive here);
+      COLLATERAL, the ``option_reserve`` its builder recorded on its orders (for the ORDERED size, so
+      a partial fill does not shrink it) -- the premium it collected is not capital spent;
     * a structure that can lose more than its debit (an unbalanced fly) records the EXCESS as a
       reserve: debit and reserve both;
-    * a covered call and other short non-reserving legs commit nothing beyond a recorded reserve;
-    * a WORKING (WAITING) entry has no fill price yet: a debit is its working order's
-      ``limit_price x multiplier x unfilled contracts`` (a market-type order: the per-contract debit
-      its builder stamped on the row), a reserving structure its reserve.
+    * a covered call and the other zero-reserve short legs commit nothing beyond a recorded reserve;
+    * a short option with NO strategy recorded (a legacy row) and no recorded reserve is
+      UNMEASURABLE and named: counting its premium would treat collateral as if it were spent;
+    * a WORKING (WAITING) entry has no position yet: the filled part at its fill price plus the
+      unfilled remainder at its limit (a market-type order: the per-contract debit its builder
+      stamped), a reserving structure its reserve;
+    * a CLOSING transaction (a resting close) still holds everything it held: it is counted as open.
 
     Every field that cannot be read is NAMED in ``unmeasurable`` (order / transaction id, strategy,
     symbol, why) and contributes nothing -- the caller refuses on a non-empty list.
@@ -205,85 +303,46 @@ def option_transaction_commitment(account: Any, transaction: Any, *, loss_adjust
             reserve += value
             has_reserve = True
     order_ids = ", ".join(str(o.id) for o in orders) or "none"
-    # Only a GENUINELY OPEN row can be the cause: an OPENED position, or a WAITING one with an
-    # order still working. A WAITING row whose orders are all terminal is a dead attempt that
-    # the next roll closes -- it commits nothing and is not an unknown.
-    from ba2_common.core.types import OrderStatus
+    # Only a GENUINELY OPEN row can be the cause: an OPENED / CLOSING position, or a WAITING one
+    # with an order still working. A WAITING row whose orders are all terminal is a dead attempt
+    # that the next roll closes -- it commits nothing and is not an unknown.
     working_now = any(getattr(o, "status", None) in OrderStatus.get_active_statuses()
                       for o in orders)
-    genuinely_open = (transaction.status == TransactionStatus.OPENED
+    genuinely_open = (transaction.status in (TransactionStatus.OPENED, TransactionStatus.CLOSING)
                       or (transaction.status == TransactionStatus.WAITING and working_now))
     if reserving and not has_reserve and genuinely_open:
         unmeasurable.append(f"{label} (orders {order_ids}) must reserve capital but no order "
                             f"carries a readable option_reserve")
 
     if transaction.status == TransactionStatus.WAITING:
-        committed = reserve if reserving else 0.0
-        working = OrderStatus.get_active_statuses()
-        for o in orders:
-            if (getattr(o, "parent_order_id", None) or getattr(o, "status", None) not in working
-                    or getattr(o, "side", None) != OrderDirection.BUY):
-                continue
-            intent = str(getattr(o, "position_intent", None) or "").lower()
-            if "close" in intent or str(getattr(o, "option_strategy", None) or "") == "close":
-                continue
-            if reserving:
-                continue                                  # a credit structure: the reserve above
-            olabel = f"order {o.id} ({strategy or 'single leg'} on {o.symbol})"
-            quantity = _readable_positive(getattr(o, "quantity", None))
-            if quantity is None:
-                unmeasurable.append(f"{olabel} is a working debit entry with an unreadable "
-                                    f"quantity ({getattr(o, 'quantity', None)!r})")
-                continue
-            try:
-                filled = float(getattr(o, "filled_qty", None) or 0.0)
-            except (TypeError, ValueError):
-                filled = 0.0
-            remaining = max(quantity - filled, 0.0)
-            limit = _readable_positive(getattr(o, "limit_price", None))
-            if limit is not None:
-                multiplier = _readable_positive(getattr(o, "multiplier", None))
-                if multiplier is None:
-                    unmeasurable.append(f"{olabel} is a working debit entry with an unreadable "
-                                        f"multiplier ({getattr(o, 'multiplier', None)!r})")
-                    continue
-                committed += limit * multiplier * remaining
-                continue
-            data = getattr(o, "data", None)
-            stamped = _readable_positive(
-                data.get(OptionsAccountInterface.ENTRY_DEBIT_PER_CONTRACT_KEY)
-                if isinstance(data, dict) else None)
-            if stamped is None:
-                unmeasurable.append(
-                    f"{olabel} is a working debit entry with no readable limit price "
-                    f"({getattr(o, 'limit_price', None)!r}) and no recorded "
-                    f"{OptionsAccountInterface.ENTRY_DEBIT_PER_CONTRACT_KEY}, so its cost is UNKNOWN")
-                continue
-            committed += stamped * remaining
-        return committed + (0.0 if reserving else reserve)
+        return reserve + _working_entry_value(
+            transaction, orders, include_filled=True, strategy=strategy, unmeasurable=unmeasurable)
 
-    # OPENED
+    # OPENED / CLOSING: the position, plus what its entry orders still have working
+    remainder = _working_entry_value(
+        transaction, orders, include_filled=False, strategy=strategy, unmeasurable=unmeasurable)
     if reserving:
-        return reserve
+        return reserve + remainder
     if transaction.open_price is None:
         unmeasurable.append(f"{label} is open with no open_price, so its cost is UNKNOWN")
-        return reserve
+        return reserve + remainder
     debit = transaction.side == OrderDirection.BUY and transaction.open_price > 0
-    if not debit and strategy in OptionsAccountInterface.ZERO_RESERVE_STRATEGIES:
-        return reserve                       # a covered call and the like: collateral is the shares
-    # A debit, or a short leg of NO known structure: its premium x contracts, plus the loss against
-    # its own quote when the caller's base does not already carry the marks (the stock path).
+    if not debit:
+        if strategy in OptionsAccountInterface.ZERO_RESERVE_STRATEGIES or has_reserve:
+            return reserve + remainder      # a covered call and the like: the shares are collateral
+        unmeasurable.append(f"{label} is a short option with no strategy and no recorded reserve, so "
+                            f"the collateral it holds is UNKNOWN (orders {order_ids})")
+        return remainder
     multiplier = float(transaction.multiplier) if transaction.multiplier else 100.0
     price = abs(transaction.open_price)
     cost = price * transaction.quantity * multiplier
     if loss_adjusted:
         quote = MarketExpertInterface._used_balance_option_price(account, transaction)
         current = price if quote is None else quote
-        pl = ((current - price) if transaction.side == OrderDirection.BUY
-              else (price - current)) * transaction.quantity * multiplier
+        pl = (current - price) * transaction.quantity * multiplier
         if pl < 0:
             cost += abs(pl)
-    return cost + reserve
+    return cost + reserve + remainder
 
 
 def used_balance_for_transactions(account: Any, transactions: List[Any], *,
@@ -383,9 +442,7 @@ def account_available_equity_detail(account: Any, *, exclude_transaction_id: Opt
         for expert in get_all_instances(ExpertInstance):
             if getattr(expert, "account_id", None) != account.id:
                 continue
-            rows.extend(transactions_where(
-                expert_id=expert.id,
-                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED]))
+            rows.extend(capital_transactions(expert.id))
         if exclude_transaction_id is not None:
             rows = [t for t in rows if t.id != exclude_transaction_id]
         used = used_balance_for_transactions(account, rows, loss_adjusted=False)
@@ -1462,7 +1519,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                                    "tradable equity", "equity")
 
     def _virtual_share(self, read_account_figure, figure_label: str,
-                       result_label: str) -> Optional[float]:
+                       result_label: str, failure: Optional[List[str]] = None) -> Optional[float]:
         """``read_account_figure(account) x virtual_equity_pct / 100`` for this expert's account.
 
         The shared body of get_virtual_balance / get_virtual_equity -- they differ ONLY in
@@ -1522,6 +1579,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # would size every entry this expert makes off a silent None instead of
             # surfacing it.
             absorb_if_benign(e, ValueError)
+            if failure is not None:
+                failure.append(f"expert {self.id}: the account's {figure_label} is unreadable ({e})")
             logger.error(
                 f"Error calculating virtual {result_label} for expert {self.id} "
                 f"(account {account_id}): {e}", exc_info=True)
@@ -1538,19 +1597,35 @@ class MarketExpertInterface(ExtendableSettingsInterface):
           * ``virtual`` is this expert's ``virtual_equity_pct`` slice of the account's EQUITY
             (``option_capital_equity``, no margin factor), not of ``get_balance()``, which is cash in
             a backtest and equity live; so the option book is bounded by 100 % of the expert's
-            equity share whatever a stock margin multiplier or the broker's buying power says;
+            equity share whatever a stock margin multiplier or the broker's buying power says. The
+            option SIZING budget (``TradeActions._virtual_equity``) is the same slice;
           * ``used`` (``used_balance_for_transactions``, loss adjustment off because the base already
-            carries the marks) counts the premium of open debit options, the collateral of credit
-            and cash-secured structures, the entries still working, and the stock the expert holds.
+            carries the marks) counts the premium of open debit options (and the unfilled remainder
+            of a partly filled entry), the collateral of credit and cash-secured structures (also
+            while a close is resting), the entries still working, and the stock the expert holds.
+
+        BEHAVIOUR OF AN EQUITY BASE MINUS COST (documented, deliberate):
+          * an UNREALISED LOSS counts twice relative to cash: it is already out of the equity and the
+            position's cost still counts in full, so headroom is lower than the cash left
+            (conservative; the expert cannot re-deploy capital it has marked down);
+          * an UNREALISED GAIN raises the headroom: the equity carries it and the cost does not;
+          * NEGATIVE headroom means over-committed: every gate treats it as a refusal (never a
+            negative or absurd quantity).
+
+        KNOWN LIMIT: positions that belong to NO expert (manual or foreign trades) are invisible to
+        ``used`` -- it is the sum of THIS expert's transactions, exactly as the stock path's is -- so
+        they raise nothing here unless the broker's remaining buying power (the outer clamp) sees them.
 
         ``(None, names)`` when anything could not be read: each named row (order / transaction id,
-        strategy, symbol, why) is what to repair; unknown never reads as room.
+        strategy, symbol, why) or the failed figure's cause is what to repair; unknown never reads as
+        room. The reasons travel in the RETURN VALUE (never on this cached instance).
         """
-        self._capital_failure = ()
-        breakdown = self._available_balance_breakdown(exclude_transaction_id, equity_base=True)
+        failure: List[str] = []
+        breakdown = self._available_balance_breakdown(
+            exclude_transaction_id, equity_base=True, failure=failure)
         if breakdown is None:
-            return None, (self._capital_failure
-                          or (f"expert {self.id} available balance unreadable (see the log)",))
+            return None, tuple(failure) or (f"expert {self.id} available balance unreadable "
+                                            f"(see the log)",)
         return breakdown.available, ()
 
     def get_available_balance(self, exclude_transaction_id: Optional[int] = None) -> Optional[float]:
@@ -1574,7 +1649,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         return None if breakdown is None else breakdown.available
 
     def _available_balance_breakdown(self, exclude_transaction_id: Optional[int] = None,
-                                     equity_base: bool = False) -> Optional["ExpertBalance"]:
+                                     equity_base: bool = False,
+                                     failure: Optional[List[str]] = None) -> Optional["ExpertBalance"]:
         """``get_available_balance``'s body, keeping the two intermediates it computes.
 
         Split out for ``describe_capital_mapping``, which must report virtual, used AND
@@ -1592,9 +1668,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # slice of the account's EQUITY with no margin factor -- the same figure in a
             # backtest and live, where ``get_virtual_balance`` is cash in a backtest (finding 6).
             virtual_balance = (self._virtual_share(lambda account: account.option_capital_equity(),
-                                                   "option capital equity", "equity")
+                                                   "option capital equity", "equity",
+                                                   failure=failure)
                                if equity_base else self.get_virtual_balance())
             if virtual_balance is None:
+                if failure is not None and not failure:
+                    failure.append(f"expert {self.id}: its virtual balance could not be read")
                 return None
 
             # Get expert instance and account instance to fetch current prices
@@ -1614,7 +1693,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # Calculate used balance from open transactions
             used_balance = self._calculate_used_balance(
                 account, exclude_transaction_id=exclude_transaction_id,
-                loss_adjusted=not equity_base)
+                loss_adjusted=not equity_base, failure=failure)
             if used_balance is None:
                 return None
             
@@ -1701,6 +1780,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                                  available=available_balance)
 
         except Exception as e:
+            if failure is not None:
+                failure.append(f"expert {self.id} available balance unreadable "
+                               f"({type(e).__name__}: {e})")
             logger.error(f"Error calculating available balance for expert {self.id}: {e}", exc_info=True)
             return None
 
@@ -1951,7 +2033,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
     
     def _calculate_used_balance(self, account: AccountInterface,
                                  exclude_transaction_id: Optional[int] = None,
-                                 loss_adjusted: bool = True) -> Optional[float]:
+                                 loss_adjusted: bool = True,
+                                 failure: Optional[List[str]] = None) -> Optional[float]:
         """
         Calculate the used balance from all open transactions for this expert. Uses bulk price fetching.
 
@@ -1966,22 +2049,22 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         try:
             # Get all open transactions for this expert (dual-path: the in-memory store in a
             # backtest, SQLite in live — same rows either way).
-            from ba2_common.core.trade_store import transactions_where
-            transactions = transactions_where(
-                expert_id=self.id,
-                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED])
+            transactions = capital_transactions(self.id)
             if exclude_transaction_id is not None:
                 transactions = [t for t in transactions if t.id != exclude_transaction_id]
             return used_balance_for_transactions(account, transactions,
                                                  loss_adjusted=loss_adjusted)
         except CapitalUnmeasurable as e:
-            # Named, so the refusal that follows can say which row to repair.
-            self._capital_failure = e.names
+            # Named IN THE CALL RESULT (``failure``, the caller's own list), never on this cached
+            # expert instance: the refusal that follows says which row to repair.
+            if failure is not None:
+                failure.extend(e.names)
             logger.error(f"Expert {self.id}: capital commitment unreadable: {e}")
             return None
         except Exception as e:
-            self._capital_failure = (f"expert {self.id} used balance unreadable "
-                                     f"({type(e).__name__}: {e})",)
+            if failure is not None:
+                failure.append(f"expert {self.id} used balance unreadable "
+                               f"({type(e).__name__}: {e})")
             logger.error(f"Error calculating used balance for expert {self.id}: {e}", exc_info=True)
             return None
 

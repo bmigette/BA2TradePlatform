@@ -413,9 +413,16 @@ class TradeRiskManagement:
         # the capital-mapping line below reports. Asking for those separately would run
         # the whole pass -- a transactions query and a bulk price fetch -- a second time,
         # and would explain a DIFFERENT instant than the one this sizing decision used.
-        balances = expert._available_balance_breakdown()
+        from ba2_common.core.interfaces.MarketExpertInterface import CAPITAL_REPAIR_HINT
+        capital_failure: List[str] = []
+        balances = expert._available_balance_breakdown(failure=capital_failure)
         if balances is None:
+            # An expert that HOLDS OPTIONS can reach this because one of its option rows cannot be
+            # valued (``used_balance_for_transactions`` refuses: unknown is never zero). Name it,
+            # and say how to repair it. A stock-only expert has no option row to be unreadable.
             error_msg = f"Could not get available balance for expert {expert_instance_id}"
+            if capital_failure:
+                error_msg += ": " + "; ".join(capital_failure) + ". " + CAPITAL_REPAIR_HINT
             self.logger.error(error_msg)
             raise RuntimeError(error_msg)
         available_balance = balances.available
