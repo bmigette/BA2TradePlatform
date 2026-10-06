@@ -979,6 +979,13 @@ class WorkerQueue:
                     logger.debug(f"Analysis task '{task.id}' skipped due to symbol price/balance constraints in {execution_time:.2f}s")
                     return
 
+            # Derived ATM-IV history (live-only): for an expert whose ruleset for this use case has an
+            # iv_rank condition, bring this symbol's series up to the last completed session HERE,
+            # blocking on this task's own worker thread, so it is fresh before the rule is evaluated
+            # (get_iv_rank only reads the store). Experts without such a rule pay one cached check.
+            from ..modules.dataproviders.options.atm_iv_task_hook import ensure_for_analysis_task
+            ensure_for_analysis_task(task.expert_instance_id, task.symbol, task.subtype)
+
             # Create or reuse MarketAnalysis record
             if task.market_analysis_id:
                 # Reusing existing MarketAnalysis for retry
