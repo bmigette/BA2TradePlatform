@@ -2771,6 +2771,13 @@ SYMBOL_CHIPS_TEMPLATE = r'''
 
 
 MARKER_PROTECT_ALERT = 'pf-protect-alert'
+PROTECT_CHECK_LABEL = 'Check and repair TP/SL'
+PROTECT_CHECK_CONFIRM = (
+    'This reads every protective order at the broker and can ACT on what it finds:\n'
+    '- cancel and re-place (resize) orders whose size no longer matches the position,\n'
+    '- place protection for shares nobody covers (growth),\n'
+    '- renew orders close to their expiry, and record fills.\n'
+    'It never re-places an order you cancelled on the broker\'s site. Continue?')
 MARKER_PROTECT_CHECK = 'pf-protect-check'
 MARKER_EXCLUDE_TOGGLE = 'pf-exclude-toggle'
 MARKER_LABEL_EXTRAS = 'pf-label-extras'
@@ -4056,8 +4063,18 @@ def _render_protection_banner(payload: Dict[str, Any]) -> None:
     entries = [(p, protect_svc.status_for(p, quantities.get(p.symbol, 0.0), slices))
                for p, slices in protection['items'].values()]
     alerts = protect_view.banner_lines(entries)
-    ui.button('Check TP/SL orders now', icon='fact_check',
-              on_click=lambda: _check_protection_clicked(payload.get('account_id'))
+    def _ask_check() -> None:
+        with ui.dialog() as sure, ui.card():
+            ui.label(PROTECT_CHECK_CONFIRM).classes('text-body2').style('white-space:pre-line')
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Cancel', on_click=sure.close).props('flat')
+
+                async def _yes() -> None:
+                    sure.close()
+                    await _check_protection_clicked(payload.get('account_id'))
+                ui.button('Check and repair', on_click=_yes).props('color=primary')
+        sure.open()
+    ui.button(PROTECT_CHECK_LABEL, icon='fact_check', on_click=_ask_check
               ).props('outline dense').classes('self-start').mark(MARKER_PROTECT_CHECK)
     if alerts:
         with ui.element('div').classes('alert-banner danger w-full p-3').mark(MARKER_PROTECT_ALERT):

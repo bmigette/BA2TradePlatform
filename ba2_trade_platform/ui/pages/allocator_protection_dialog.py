@@ -106,8 +106,7 @@ def slice_rows(slices: List[AllocatorProtectionOrder]) -> List[Dict[str, Any]]:
                      'tp': s.tp_price if s.tp_price is not None else '(stop only)', 'sl': s.sl_price,
                      'state': s.state, 'order': s.complex_order_id or '', 'stop': s.sl_order_id or '',
                      'tag': s.external_tag or '',
-                     'gtc': (f"{s.gtc_date:%Y-%m-%d}" + ('*' if s.gtc_date_assumed else ''))
-                     if s.gtc_date else ''})
+                     'gtc': f"{s.gtc_date:%Y-%m-%d}" if s.gtc_date else ''})
     return rows
 
 
@@ -476,7 +475,8 @@ def _build_dialog(account_id: int, data: Dict[str, Any], refresh) -> None:
                                   type='warning')
                         return
                     _confirm(f'Change the stop of {symbol} from {protection.sl_price:g} to about '
-                             f'{report.suggested_stop:,.2f} (approx.) and re-place the protective orders? '
+                             f'{report.suggested_stop:,.2f} (approx., {(price - report.suggested_stop) / price * 100:.1f}% '
+                             f'below the market) and re-place the protective orders? '
                              f'The take-profit targets stay as they are.', 'Change stop',
                              lambda: aps.change_stop_and_replace(account, symbol, report.suggested_stop))
                 ui.button('Use a stop the broker accepts', icon='tune', on_click=_use_accepted
