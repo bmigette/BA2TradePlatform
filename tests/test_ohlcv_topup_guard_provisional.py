@@ -8,7 +8,7 @@ from __future__ import annotations
 import importlib
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -36,10 +36,14 @@ CACHE_END = PROV_DAY
 
 # symbol -> (cached O/H/L/C, vendor O/H/L/C) from the 8082 error log (vendor tails truncated there)
 CASES = {
-    "AMD": ((635.068, 635.068, 623.78, 623.78), (624.9, 629.75, 596.0, 600.0)),
+    "AMD": ((635.068, 635.068, 623.78, 623.78), (624.9, 629.75, 596.07, 607.87)),
     "INTC": ((126.88, 126.88, 120.655, 120.655), (120.68, 121.71, 117.9, 118.4)),
     "MU": ((1095.47, 1095.47, 1074.73, 1076.77), (1075.98, 1084.81, 1060.2, 1068.3)),
+    "FSLR": ((179.88, 179.88, 179.88, 179.88), (178.13, 178.23, 172.2, 172.97)),
+    "CLS": ((380.51, 380.51, 361.295, 364.34), (363.93, 372.97, 349.52, 356.53)),   # close 0.8% above low
+    "QCOM": ((191.61, 191.61, 180.56, 180.56), (180.61, 195.31, 179.23, 194.23)),   # stuck 15 days
 }
+STUCK_AT = {"QCOM": SESSIONS[-12]}       # 2026-09-21 -> refreshed 15 calendar days later
 
 
 def _truth(level: float, seed: int = 5) -> pd.DataFrame:
@@ -134,11 +138,22 @@ def _world(symbol: str, cached_bar, vendor_bar, *, level: float, cache_end=CACHE
     return vendor, cached.reset_index(drop=True)
 
 
-def _write(symbol, cached) -> str:
+def _ny_epoch(day, hour, minute=0) -> float:
+    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=NY_TZ).timestamp()
+
+
+def _write(symbol, cached, stamp=(9, 31), stamp_day=None) -> str:
+    """Write the cache and set its mtime (the provenance proof): ``stamp`` = NY (hour, minute) on the
+    cache's newest bar date (or ``stamp_day``); None leaves the real (now) mtime."""
     out = cached.copy()
     out["effective_date"] = out["Date"]
     native_cache.write_timeseries(PROVIDER, symbol, "1d", out)
-    return native_cache.find_timeseries_path(PROVIDER, symbol, "1d")
+    path = native_cache.find_timeseries_path(PROVIDER, symbol, "1d")
+    if stamp is not None:
+        day = stamp_day or pd.Timestamp(cached["Date"].max()).date()
+        t = _ny_epoch(day, *stamp)
+        os.utime(path, (t, t))
+    return path
 
 
 def _topup(provider, symbol):
@@ -155,9 +170,11 @@ def _bytes(path):
 @pytest.mark.parametrize("symbol", sorted(CASES))
 def test_provisional_bar_is_replaced_and_nothing_else_touched(symbol, logged, activity):
     cbar, vbar = CASES[symbol]
-    vendor, cached = _world(symbol, cbar, vbar, level=vbar[3])
+    stuck = STUCK_AT.get(symbol, PROV_DAY)
+    vendor, cached = _world(symbol, cbar, vbar, level=vbar[3], cache_end=stuck, day=stuck)
     path = _write(symbol, cached)
     before = pd.read_parquet(path)
+    n_new = len([d for d in SESSIONS if d > stuck])
 
     # the guard as it was: refuses (the bug)
     with pytest.raises(OHLCVTopUpRefused, match="disagrees"):
@@ -168,13 +185,13 @@ def test_provisional_bar_is_replaced_and_nothing_else_touched(symbol, logged, ac
 
     out = _topup(_Fixed(vendor), symbol)
     after = pd.read_parquet(path)
-    row = after[after["Date"] == pd.Timestamp(PROV_DAY)].iloc[0]
+    row = after[after["Date"] == pd.Timestamp(stuck)].iloc[0]
     assert (row.Open, row.High, row.Low, row.Close) == pytest.approx(vbar)
     # every other previously cached bar is byte-for-byte what it was
-    others = before[before["Date"] != pd.Timestamp(PROV_DAY)]
+    others = before[before["Date"] != pd.Timestamp(stuck)]
     pd.testing.assert_frame_equal(
         after[after["Date"].isin(others["Date"])].reset_index(drop=True), others.reset_index(drop=True))
-    assert after["Date"].max() == pd.Timestamp(LAST) and len(after) == len(before) + 2
+    assert after["Date"].max() == pd.Timestamp(LAST) and len(after) == len(before) + n_new
     assert len(out) == len(after)
     infos = [m for m in logged["info"] if "provisional" in m and symbol in m]
     assert len(infos) == 1                                # ONE line per symbol
@@ -186,11 +203,11 @@ def test_exact_match_is_untouched_and_costs_no_extra_vendor_call(logged):
     symbol = "AMD"
     vendor = _truth(600.0)
     cached = vendor[vendor["Date"] <= pd.Timestamp(CACHE_END)].copy()
-    path = _write(symbol, cached)
+    path = _write(symbol, cached, stamp=(17, 0))
     fixed, plain = _Fixed(vendor), _Plain(vendor)
     _topup(plain, symbol)
     expect = _bytes(path)
-    _write(symbol, cached)
+    _write(symbol, cached, stamp=(17, 0))
     _topup(fixed, symbol)
     assert _bytes(path) == expect
     assert len(fixed.impl_calls) == len(plain.impl_calls)
@@ -260,29 +277,118 @@ def test_provisional_replace_never_swallows_a_settled_mismatch_in_the_same_topup
     assert len(activity) == 1
 
 
-def test_an_old_provisional_shaped_bar_still_refuses(activity):
+@pytest.mark.parametrize("stamp,stamp_day", [
+    ((9, 31), SESSIONS[-30]),     # file last written mid-session on ANOTHER day
+    ((17, 0), None),              # written after the close: a settled bar
+    (None, None),                 # real mtime (today), not the bar's session
+])
+def test_a_settled_or_unproven_bar_still_refuses(stamp, stamp_day, activity):
     symbol = "AMD"
-    old_end = SESSIONS[-40]                              # ~8 weeks back: outside the age window
+    old_end = SESSIONS[-40]
     cbar, vbar = CASES[symbol]
     vendor, cached = _world(symbol, cbar, vbar, level=vbar[3], cache_end=old_end, day=old_end)
-    path = _write(symbol, cached)
+    path = _write(symbol, cached, stamp=stamp, stamp_day=stamp_day)
     expect = _bytes(path)
     with pytest.raises(OHLCVTopUpRefused):
         _topup(_Fixed(vendor), symbol)
     assert _bytes(path) == expect and len(activity) == 1
 
 
+def test_probe_rebase_straddling_the_window_refuses_and_never_appends(activity):
+    """A 5% rebase (spin-off) inside the newest-5 window + a snapshot-shaped older bar: the older
+    bar must not be rewritten into agreement (that would APPEND onto a mixed basis)."""
+    symbol = "AMD"
+    vendor = _truth(600.0)
+    cached = vendor[vendor["Date"] <= pd.Timestamp(CACHE_END)].copy().reset_index(drop=True)
+    first_in_window = pd.Timestamp(SESSIONS[-7])          # ex-date is the next session
+    pre = cached["Date"] <= first_in_window
+    for col in ("Open", "High", "Low", "Close"):
+        cached.loc[pre, col] = (cached.loc[pre, col] * 1.05).round(3)
+    k = cached.index[cached["Date"] == first_in_window][0]     # that bar: snapshot shape
+    cached.loc[k, ["Open", "High"]] = cached.loc[k, "High"]
+    cached.loc[k, ["Low", "Close"]] = cached.loc[k, "Low"]
+    path = _write(symbol, cached)
+    expect = _bytes(path)
+    with pytest.raises(OHLCVTopUpRefused):
+        _topup(_Fixed(vendor), symbol)
+    assert _bytes(path) == expect
+
+
+def test_probe_settled_older_bar_three_percent_off_refuses(activity):
+    symbol = "AMD"
+    vendor = _truth(600.0)
+    cached = vendor[vendor["Date"] <= pd.Timestamp(CACHE_END)].copy().reset_index(drop=True)
+    i = cached.index[cached["Date"] == pd.Timestamp(SESSIONS[-5])][0]
+    h, lo = cached.loc[i, "High"], cached.loc[i, "Low"]
+    cached.loc[i, ["Open", "High"]] = [h * 1.03, h * 1.03]        # snapshot shape, 3% off the vendor
+    cached.loc[i, "Close"] = lo * 1.03
+    cached.loc[i, "Low"] = lo * 1.03
+    path = _write(symbol, cached)                                  # newest bar equals the vendor's
+    expect = _bytes(path)
+    with pytest.raises(OHLCVTopUpRefused):
+        _topup(_Fixed(vendor), symbol)
+    assert _bytes(path) == expect
+
+
+def test_mod_a_real_rebase_with_a_flat_newest_bar_still_refuses(activity):
+    """MOD 2026-10-05: every window bar ~9% above the vendor's, the newest a flat 195.1."""
+    symbol = "MOD"
+    vendor = _truth(165.0)
+    cached = vendor[vendor["Date"] <= pd.Timestamp(CACHE_END)].copy().reset_index(drop=True)
+    tail = cached.index[-5:]
+    for col in ("Open", "High", "Low", "Close"):
+        cached.loc[tail, col] = (cached.loc[tail, col] * 1.09).round(3)
+    cached.loc[cached.index[-1], ["Open", "High", "Low", "Close"]] = 195.1
+    path = _write(symbol, cached)
+    expect = _bytes(path)
+    with pytest.raises(OHLCVTopUpRefused):
+        _topup(_Fixed(vendor), symbol)
+    assert _bytes(path) == expect
+
+
+def test_a_refused_symbol_does_not_cost_an_extra_vendor_call_within_the_memo(activity):
+    symbol = "AMD"
+    vendor, cached = _settled_mismatch_world(symbol)
+    _write(symbol, cached)
+    p = _Fixed(vendor)
+    with pytest.raises(OHLCVTopUpRefused):
+        _topup(p, symbol)
+    calls = len(p.impl_calls)
+    with pytest.raises(OHLCVTopUpRefused):
+        _topup(p, symbol)
+    assert len(p.impl_calls) == calls
+
+
+def test_only_daily_bars_are_wrapped(monkeypatch):
+    seen = []
+    monkeypatch.setattr(prov, "repair_provisional_bars", lambda *a, **k: seen.append(1) or (a[1], []))
+    vendor = _truth(600.0)
+    p = _Fixed(vendor)
+    df = vendor[vendor["Date"] <= pd.Timestamp(CACHE_END)].copy()
+    for interval in ("1wk", "1mo"):
+        try:
+            p._verified_tail_topup(df, "AMD", interval, PROVIDER, datetime.now())
+        except Exception:  # noqa: BLE001 -- only whether the repair ran matters here
+            pass
+    assert seen == []
+    try:
+        p._verified_tail_topup(df, "AMD", "1d", PROVIDER, datetime.now())
+    except Exception:  # noqa: BLE001
+        pass
+    assert seen == [1]
+
+
 def test_a_split_rescaled_snapshot_is_not_a_provisional_bar():
     cbar, vbar = CASES["AMD"]
     vendor, cached = _world("AMD", tuple(x * 2 for x in cbar), vbar, level=vbar[3])
-    assert prov.find_provisional_days(cached, vendor) == []
+    assert prov.find_provisional_days(cached, vendor, mtime=_ny_epoch(PROV_DAY, 9, 31)) == []
 
 
 def test_without_an_anchor_nothing_is_replaced():
     cbar, vbar = CASES["AMD"]
     vendor, cached = _world("AMD", cbar, vbar, level=vbar[3])
     only = cached[cached["Date"] == pd.Timestamp(PROV_DAY)]
-    assert prov.find_provisional_days(only, vendor) == []
+    assert prov.find_provisional_days(only, vendor, mtime=_ny_epoch(PROV_DAY, 9, 31)) == []
 
 
 def test_a_real_split_is_still_rebased_by_a_full_refetch():
@@ -321,13 +427,15 @@ def _seed_two_symbols(tmp_path):
 
 def test_tool_refuses_a_live_cache_and_dry_run_writes_nothing(tmp_path, capsys):
     tool = _tool()
-    assert tool.main(["--db-file", "x"]) == 2                                   # no --cache-folder = live
-    assert tool.main(["--cache-folder", tool.live_cache_folder(), "--db-file", "x"]) == 2
-    assert "REFUSED" in capsys.readouterr().err
+    # the flag is required for EVERY run, dry runs and any cache folder (dev / prod / opt included)
+    for argv in (["--db-file", "x"], ["--cache-folder", bcfg.CACHE_FOLDER, "--db-file", "x"],
+                 ["--cache-folder", bcfg.CACHE_FOLDER, "--apply"]):
+        assert tool.main(argv, provider_factory=lambda: _Provider(_truth(1.0))) == 2
+        assert "REFUSED" in capsys.readouterr().err
     vendor = _seed_two_symbols(tmp_path)
     paths = {s: native_cache.find_timeseries_path(PROVIDER, s, "1d") for s in ("AMD", "CLEAN")}
     before = {s: _bytes(p) for s, p in paths.items()}
-    rc = tool.main(["--cache-folder", bcfg.CACHE_FOLDER], provider_factory=lambda: _Provider(vendor))
+    rc = tool.main(["--cache-folder", bcfg.CACHE_FOLDER, "--i-know-the-apps-are-stopped"], provider_factory=lambda: _Provider(vendor))
     out = capsys.readouterr().out
     assert rc == 0 and "AMD: 1 provisional" in out and "CLEAN" not in out and "DRY RUN" in out
     assert {s: _bytes(p) for s, p in paths.items()} == before
@@ -339,7 +447,7 @@ def test_tool_apply_replaces_only_the_provisional_bar(tmp_path, capsys):
     paths = {s: native_cache.find_timeseries_path(PROVIDER, s, "1d") for s in ("AMD", "CLEAN")}
     clean_before = _bytes(paths["CLEAN"])
     amd_before = pd.read_parquet(paths["AMD"])
-    rc = tool.main(["--cache-folder", bcfg.CACHE_FOLDER, "--apply"], provider_factory=lambda: _Provider(vendor))
+    rc = tool.main(["--cache-folder", bcfg.CACHE_FOLDER, "--apply", "--i-know-the-apps-are-stopped"], provider_factory=lambda: _Provider(vendor))
     assert rc == 0 and "APPLIED" in capsys.readouterr().out
     assert _bytes(paths["CLEAN"]) == clean_before
     amd = pd.read_parquet(paths["AMD"])
@@ -350,3 +458,30 @@ def test_tool_apply_replaces_only_the_provisional_bar(tmp_path, capsys):
     # and the live top-up now goes through
     _topup(_Plain(vendor), "AMD")
     assert pd.read_parquet(paths["AMD"])["Date"].max() == pd.Timestamp(LAST)
+
+
+def test_tool_never_prints_the_api_key_and_survives_a_failing_write(tmp_path, capsys, monkeypatch):
+    tool = _tool()
+    vendor = _seed_two_symbols(tmp_path)
+    secret = "SYNTH3T1CKEY0123456789"
+
+    class _Boom(_Provider):
+        def _get_ohlcv_data_impl(self, symbol, *a, **k):
+            if symbol == "CLEAN":
+                raise RuntimeError(f"401 Client Error for url: https://x.test/api/v3/hist?symbol=CLEAN&apikey={secret}")
+            return super()._get_ohlcv_data_impl(symbol, *a, **k)
+
+    real_write = native_cache.write_timeseries
+    monkeypatch.setattr(native_cache, "write_timeseries",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("replace failed")))
+    # CLEAN is not stamped mid-session -> no vendor call; stamp it so the vendor error path runs
+    path = native_cache.find_timeseries_path(PROVIDER, "CLEAN", "1d")
+    t = _ny_epoch(pd.Timestamp(pd.read_parquet(path)["Date"].max()).date(), 9, 31)
+    os.utime(path, (t, t))
+    rc = tool.main(["--cache-folder", bcfg.CACHE_FOLDER, "--apply", "--i-know-the-apps-are-stopped"],
+                   provider_factory=lambda: _Boom(vendor))
+    monkeypatch.setattr(native_cache, "write_timeseries", real_write)
+    cap = capsys.readouterr()
+    assert secret not in cap.out and secret not in cap.err
+    assert "CLEAN: ERROR RuntimeError" in cap.out and "AMD: ERROR OSError" in cap.out   # scan continued
+    assert rc == 1

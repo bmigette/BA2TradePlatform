@@ -1,21 +1,25 @@
-"""Repair FMP daily OHLCV caches stuck on a PROVISIONAL bar (AMD/INTC/MU, 2026-10-05).
+"""Repair FMP daily OHLCV caches stuck on a PROVISIONAL newest bar (AMD/INTC/MU/FSLR/QCOM/CLS, 2026-10).
 
-A one-tick snapshot (Open == High, Low == Close) cached near 09:31 New York makes the guarded
-top-up refuse the symbol forever. This tool scans ``<cache>/FMPOHLCVProvider/*_1d.parquet`` for such
-bars among the newest ``--lookback`` sessions and replaces them with the vendor's final bars, through
+A bar cached mid-session (a snapshot taken near 09:31 New York) makes the guarded top-up refuse the
+symbol forever. For every ``<cache>/FMPOHLCVProvider/*_1d.parquet`` this tool replaces the NEWEST
+cached bar with the vendor's final bar when the file proves it was written mid-session (file mtime
+on that bar's own New York session date, before 16:00 ET) and the anchors/range checks of
 ``ba2_trade_platform/modules/dataproviders/ohlcv_provisional.py`` (the same code the live top-up
-runs). Nothing else in a file is touched; a file with no repairable bar is not rewritten.
+runs) hold. Nothing else in a file is touched; a file with nothing to repair is not rewritten.
+It relies on the files' mtimes: do not copy a cache with new mtimes before running it.
 
-DEFAULT IS A DRY RUN (it does ask the vendor, read-only, so the counts are what ``--apply`` does).
+EVERY RUN (dry run included) REQUIRES ``--i-know-the-apps-are-stopped``: stop the app whose cache
+you point at (dev 8080, prod 8081, opt 8082 -- each has its own cache folder). A dry run does ask
+the vendor (read-only) so its counts are what ``--apply`` would do; it writes nothing.
+The FMP key is read (read-only sqlite3) from ``--db-file`` and never printed.
 
-SAFETY: the live cache folder (``<BA2_HOME>/common/cache``, also the default when ``--cache-folder``
-is not given) is refused unless ``--i-know-the-apps-are-stopped`` is passed. Stop 8080/8081/8082
-first. The FMP key is read (read-only sqlite3) from ``--db-file``; it is never printed.
+    --db-file       the app DB holding FMP_API_KEY (dev/prod/opt each have their own)
+    --cache-folder  that app's cache root (the folder that CONTAINS FMPOHLCVProvider/);
+                    default <BA2_HOME>/common/cache
+    --symbols       comma list, e.g. AMD,INTC,MU,FSLR,QCOM,CLS
 
-    python tools/repair_provisional_bars.py --db-file <app db> --cache-folder <folder>            # dry run
-    python tools/repair_provisional_bars.py --db-file <app db> --cache-folder <folder> --apply
-    # live caches, apps stopped:
-    python tools/repair_provisional_bars.py --db-file <app db> --i-know-the-apps-are-stopped --apply
+    python tools/repair_provisional_bars.py --db-file <db> --cache-folder <cache> --i-know-the-apps-are-stopped
+    python tools/repair_provisional_bars.py --db-file <db> --cache-folder <cache> --i-know-the-apps-are-stopped --apply
 """
 from __future__ import annotations
 
@@ -35,13 +39,6 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def live_cache_folder() -> str:
     home = os.path.abspath(os.getenv("BA2_HOME", os.path.join(os.path.expanduser("~"), "Documents", "ba2")))
     return os.path.join(home, "common", "cache")
-
-
-def is_live(cache_folder: Optional[str]) -> bool:
-    if not cache_folder:
-        return True
-    norm = lambda p: os.path.normcase(os.path.abspath(p))   # noqa: E731
-    return norm(cache_folder) == norm(live_cache_folder())
 
 
 def read_fmp_key(db_file: str) -> str:
@@ -67,19 +64,22 @@ def _load_module():
 def main(argv=None, provider_factory: Optional[Callable[[], object]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--db-file", help="app DB the FMP key is read from (read-only)")
-    ap.add_argument("--cache-folder", help="cache root holding FMPOHLCVProvider/ (default: the live one)")
-    ap.add_argument("--lookback", type=int, default=10, help="newest sessions scanned (default 10)")
+    ap.add_argument("--cache-folder", help="cache root holding FMPOHLCVProvider/ (default: <BA2_HOME>/common/cache)")
+    ap.add_argument("--lookback", type=int, default=5, help="newest sessions compared as anchors (default 5)")
     ap.add_argument("--symbols", help="comma-separated subset")
     ap.add_argument("--apply", action="store_true", help="rewrite the files (default: dry run)")
     ap.add_argument("--i-know-the-apps-are-stopped", action="store_true", dest="stopped")
     args = ap.parse_args(argv)
 
-    if is_live(args.cache_folder) and not args.stopped:
-        print("REFUSED: this is the live cache folder; stop the apps (8080/8081/8082) and pass "
-              "--i-know-the-apps-are-stopped", file=sys.stderr)
+    if not args.stopped:
+        print("REFUSED: stop the app that owns this cache (8080 dev / 8081 prod / 8082 opt) and pass "
+              "--i-know-the-apps-are-stopped (required for dry runs too)", file=sys.stderr)
         return 2
     cache = os.path.abspath(args.cache_folder) if args.cache_folder else live_cache_folder()
     os.environ["CACHE_FOLDER"] = cache          # BEFORE any ba2_common import: it reads it at import
+    # FMP HTTP errors carry ?apikey=...: redact every log line and every printed error text
+    from ba2_trade_platform import log_redaction
+    log_redaction.install()
 
     if provider_factory is None:
         if not args.db_file:
@@ -112,18 +112,18 @@ def main(argv=None, provider_factory: Optional[Callable[[], object]] = None) -> 
         try:
             df = pd.read_parquet(path)
             out, replaced = prov_mod.repair_provisional_bars(
-                provider, df, symbol, "1d", fetch_end, lookback_bars=args.lookback)
-        except Exception as e:  # noqa: BLE001 -- reported per symbol, the scan continues
+                provider, df, symbol, "1d", fetch_end, mtime=os.path.getmtime(path),
+                lookback_bars=args.lookback)
+            if not replaced:
+                continue
+            fixed += 1
+            print(f"{symbol}: {len(replaced)} provisional bar(s) {[d.isoformat() for d in replaced]}"
+                  + (" -> replaced" if args.apply else " (dry run)"))
+            if args.apply:
+                native_cache.write_timeseries(PROVIDER, symbol, "1d", out)
+        except Exception as e:  # noqa: BLE001 -- reported per symbol (redacted), the scan continues
             errors += 1
-            print(f"{symbol}: ERROR {type(e).__name__}: {e}")
-            continue
-        if not replaced:
-            continue
-        fixed += 1
-        print(f"{symbol}: {len(replaced)} provisional bar(s) {[d.isoformat() for d in replaced]}"
-              + (" -> replaced" if args.apply else " (dry run)"))
-        if args.apply:
-            native_cache.write_timeseries(PROVIDER, symbol, "1d", out)
+            print(f"{symbol}: ERROR {type(e).__name__}: {log_redaction.redact_text(str(e))}")
     mode = "APPLIED" if args.apply else "DRY RUN"
     print(f"{mode}: scanned {total} file(s), {fixed} with stuck provisional bars, {errors} error(s)")
     return 1 if errors else 0
