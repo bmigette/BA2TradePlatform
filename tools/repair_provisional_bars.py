@@ -1,9 +1,9 @@
-"""Repair FMP daily OHLCV caches stuck on a PROVISIONAL newest bar (AMD/INTC/MU/FSLR/QCOM/CLS, 2026-10).
+r"""Repair FMP daily OHLCV caches stuck on a PROVISIONAL newest bar (AMD/INTC/MU/FSLR/QCOM/CLS, 2026-10).
 
 A bar cached mid-session (a snapshot taken near 09:31 New York) makes the guarded top-up refuse the
 symbol forever. For every ``<cache>/FMPOHLCVProvider/*_1d.parquet`` this tool replaces the NEWEST
 cached bar with the vendor's final bar when the file proves it was written mid-session (file mtime
-on that bar's own New York session date, before 16:00 ET) and the anchors/range checks of
+on that bar's own New York session date, before 20:00 ET) and the anchors/range checks of
 ``ba2_trade_platform/modules/dataproviders/ohlcv_provisional.py`` (the same code the live top-up
 runs) hold. Nothing else in a file is touched; a file with nothing to repair is not rewritten.
 It relies on the files' mtimes: do not copy a cache with new mtimes before running it.
@@ -20,6 +20,21 @@ The FMP key is read (read-only sqlite3) from ``--db-file`` and never printed.
 
     python tools/repair_provisional_bars.py --db-file <db> --cache-folder <cache> --i-know-the-apps-are-stopped
     python tools/repair_provisional_bars.py --db-file <db> --cache-folder <cache> --i-know-the-apps-are-stopped --apply
+
+Bars dated today (New York) are always skipped: they are still forming.
+
+PER APP (add --symbols A,B,C and, after checking the dry run, --apply):
+  dev  8080: --db-file C:\Users\basti\Documents\ba2\trade\db.sqlite
+             --cache-folder C:\Users\basti\Documents\ba2\common\cache
+  prod 8081: --db-file C:\Users\basti\Documents\ba2_trade_platform-prod\db.sqlite
+             --cache-folder C:\Users\basti\Documents\ba2_trade_platform-prod\cache
+  opt  8082: --db-file C:\Users\basti\Documents\ba2_trade_platform-opt\db.sqlite
+             --cache-folder C:\Users\basti\Documents\ba2_trade_platform-opt\cache
+
+DEV CAVEAT: the dev cache (<BA2_HOME>/common/cache) is SHARED with the test platform. Always pass
+--symbols (never a blind scan), run between GA jobs, stop any local ba2-test fetch-cache / serve
+first, and push the cache to the workers afterwards. Run in the Paris morning before 15:30 (before
+the US open, so no bar is forming and FMP's 09:30 ET rate-limit window is avoided).
 """
 from __future__ import annotations
 
@@ -30,6 +45,7 @@ import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Callable, Optional
 
 PROVIDER = "FMPOHLCVProvider"
@@ -62,7 +78,8 @@ def _load_module():
 
 
 def main(argv=None, provider_factory: Optional[Callable[[], object]] = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(description=__doc__.split(chr(10) * 2)[0], epilog=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db-file", help="app DB the FMP key is read from (read-only)")
     ap.add_argument("--cache-folder", help="cache root holding FMPOHLCVProvider/ (default: <BA2_HOME>/common/cache)")
     ap.add_argument("--lookback", type=int, default=5, help="newest sessions compared as anchors (default 5)")
@@ -111,6 +128,9 @@ def main(argv=None, provider_factory: Optional[Callable[[], object]] = None) -> 
         total += 1
         try:
             df = pd.read_parquet(path)
+            newest = pd.Timestamp(df["Date"].max()).date()
+            if newest >= datetime.now(ZoneInfo("America/New_York")).date():
+                continue                  # today's New York bar is still forming: never touched
             out, replaced = prov_mod.repair_provisional_bars(
                 provider, df, symbol, "1d", fetch_end, mtime=os.path.getmtime(path),
                 lookback_bars=args.lookback)

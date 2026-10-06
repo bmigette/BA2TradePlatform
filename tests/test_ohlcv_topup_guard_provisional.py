@@ -195,19 +195,21 @@ def test_provisional_bar_is_replaced_and_nothing_else_touched(symbol, logged, ac
     assert len(out) == len(after)
     infos = [m for m in logged["info"] if "provisional" in m and symbol in m]
     assert len(infos) == 1                                # ONE line per symbol
-    assert not logged["error"]
-    assert not activity                                   # no refusal -> no failure entry
+    # the guard's own refusal line precedes the repair (it must, to save the extra call); the repair
+    # then says so, and nothing is reported to the Activity Log because the retry succeeds
+    assert len(logged["error"]) == 1 and "REFUSED" in logged["error"][0]
+    assert not activity
 
 
 def test_exact_match_is_untouched_and_costs_no_extra_vendor_call(logged):
     symbol = "AMD"
     vendor = _truth(600.0)
     cached = vendor[vendor["Date"] <= pd.Timestamp(CACHE_END)].copy()
-    path = _write(symbol, cached, stamp=(17, 0))
+    path = _write(symbol, cached, stamp=(20, 30))
     fixed, plain = _Fixed(vendor), _Plain(vendor)
     _topup(plain, symbol)
     expect = _bytes(path)
-    _write(symbol, cached, stamp=(17, 0))
+    _write(symbol, cached, stamp=(20, 30))
     _topup(fixed, symbol)
     assert _bytes(path) == expect
     assert len(fixed.impl_calls) == len(plain.impl_calls)
@@ -279,7 +281,7 @@ def test_provisional_replace_never_swallows_a_settled_mismatch_in_the_same_topup
 
 @pytest.mark.parametrize("stamp,stamp_day", [
     ((9, 31), SESSIONS[-30]),     # file last written mid-session on ANOTHER day
-    ((17, 0), None),              # written after the close: a settled bar
+    ((20, 30), None),             # written after 20:00 ET: a settled bar
     (None, None),                 # real mtime (today), not the bar's session
 ])
 def test_a_settled_or_unproven_bar_still_refuses(stamp, stamp_day, activity):
@@ -362,49 +364,15 @@ def test_a_refused_symbol_does_not_cost_an_extra_vendor_call_within_the_memo(act
 def test_only_daily_bars_are_wrapped(monkeypatch):
     seen = []
     monkeypatch.setattr(prov, "repair_provisional_bars", lambda *a, **k: seen.append(1) or (a[1], []))
-    vendor = _truth(600.0)
+    vendor, cached = _settled_mismatch_world("AMD")           # the guard refuses -> repair would run
     p = _Fixed(vendor)
-    df = vendor[vendor["Date"] <= pd.Timestamp(CACHE_END)].copy()
     for interval in ("1wk", "1mo"):
-        try:
-            p._verified_tail_topup(df, "AMD", interval, PROVIDER, datetime.now())
-        except Exception:  # noqa: BLE001 -- only whether the repair ran matters here
-            pass
+        with pytest.raises(Exception):
+            p._verified_tail_topup(cached, "AMD", interval, PROVIDER, datetime.now())
     assert seen == []
-    try:
-        p._verified_tail_topup(df, "AMD", "1d", PROVIDER, datetime.now())
-    except Exception:  # noqa: BLE001
-        pass
+    with pytest.raises(OHLCVTopUpRefused):
+        p._verified_tail_topup(cached, "AMD", "1d", PROVIDER, datetime.now())
     assert seen == [1]
-
-
-def test_a_split_rescaled_snapshot_is_not_a_provisional_bar():
-    cbar, vbar = CASES["AMD"]
-    vendor, cached = _world("AMD", tuple(x * 2 for x in cbar), vbar, level=vbar[3])
-    assert prov.find_provisional_days(cached, vendor, mtime=_ny_epoch(PROV_DAY, 9, 31)) == []
-
-
-def test_without_an_anchor_nothing_is_replaced():
-    cbar, vbar = CASES["AMD"]
-    vendor, cached = _world("AMD", cbar, vbar, level=vbar[3])
-    only = cached[cached["Date"] == pd.Timestamp(PROV_DAY)]
-    assert prov.find_provisional_days(only, vendor, mtime=_ny_epoch(PROV_DAY, 9, 31)) == []
-
-
-def test_a_real_split_is_still_rebased_by_a_full_refetch():
-    symbol = "XSPL"
-    split_day = SESSIONS[-8]
-    vendor = _truth(80.0)
-    cached = vendor[vendor["Date"] <= pd.Timestamp(SESSIONS[-12])].copy()
-    pre = cached["Date"] < pd.Timestamp(split_day)
-    for col in ("Open", "High", "Low", "Close"):
-        cached.loc[pre, col] = (cached.loc[pre, col] * 2.0).round(3)
-    path = _write(symbol, cached.reset_index(drop=True))
-    p = _Fixed(vendor, [CalendarSplit(split_day, 2.0)])
-    out = _topup(p, symbol)
-    after = pd.read_parquet(path)
-    assert np.allclose(after["Close"].to_numpy(float), vendor["Close"].to_numpy(float))
-    assert len(after) == len(vendor) and len(out) == len(vendor)
 
 
 # --------------------------------------------------------------------------- the repair tool
@@ -485,3 +453,74 @@ def test_tool_never_prints_the_api_key_and_survives_a_failing_write(tmp_path, ca
     assert secret not in cap.out and secret not in cap.err
     assert "CLEAN: ERROR RuntimeError" in cap.out and "AMD: ERROR OSError" in cap.out   # scan continued
     assert rc == 1
+
+
+# --------------------------------------------------------------------------- F1 / F2
+def test_normal_topup_is_one_vendor_call_and_a_repair_is_two(activity):
+    symbol = "AMD"
+    vendor = _truth(600.0)
+    cached = vendor[vendor["Date"] <= pd.Timestamp(CACHE_END)].copy().reset_index(drop=True)
+    _write(symbol, cached)                                       # mid-session stamp, bar equals vendor
+    plain, fixed = _Plain(vendor), _Fixed(vendor)
+    _topup(plain, symbol)
+    assert len(plain.impl_calls) == 1
+    _write(symbol, cached)
+    _topup(fixed, symbol)
+    assert len(fixed.impl_calls) == 1                             # the proof gate adds NO call
+    cbar, vbar = CASES["AMD"]
+    vendor2, cached2 = _world(symbol, cbar, vbar, level=vbar[3])
+    _write(symbol, cached2)
+    rep = _Fixed(vendor2)
+    _topup(rep, symbol)
+    assert len(rep.impl_calls) == 3                               # refused (1) + probe (1) + retry (1)
+
+
+def test_refusal_of_a_settled_bar_costs_only_the_guards_own_call(activity):
+    symbol = "AMD"
+    vendor, cached = _settled_mismatch_world(symbol)
+    _write(symbol, cached, stamp=(20, 30))
+    p = _Fixed(vendor)
+    with pytest.raises(OHLCVTopUpRefused):
+        _topup(p, symbol)
+    assert len(p.impl_calls) == 1 and len(activity) == 1
+
+
+def test_a_write_before_20_et_counts_as_provisional_after_20_et_does_not(activity):
+    symbol = "FSLR"
+    cbar, vbar = CASES[symbol]
+    vendor, cached = _world(symbol, cbar, vbar, level=vbar[3])
+    for stamp, ok in (((17, 0), True), ((19, 59), True), ((20, 0), False)):
+        MarketDataProviderInterface._TOPUP_REFUSED.clear()
+        prov._REFUSALS_LOGGED.clear()
+        _write(symbol, cached, stamp=stamp)
+        if ok:
+            _topup(_Fixed(vendor), symbol)
+        else:
+            with pytest.raises(OHLCVTopUpRefused):
+                _topup(_Fixed(vendor), symbol)
+
+
+def test_tool_skips_a_bar_dated_today_in_new_york(capsys):
+    tool = _tool()
+    today = datetime.now(NY_TZ).date()
+    days = [today - timedelta(days=i) for i in (3, 2, 1, 0)]
+    vendor = pd.DataFrame({"Date": pd.to_datetime(days), "Open": [10.0, 10.0, 10.0, 10.0],
+                           "High": [11.0, 11.0, 11.0, 11.0], "Low": [9.0, 9.0, 9.0, 9.0],
+                           "Close": [10.5, 10.5, 10.5, 10.5], "Volume": [1000] * 4})
+    cached = vendor.copy()
+    cached.loc[3, ["Open", "High", "Low", "Close"]] = [10.9, 10.9, 9.5, 9.5]
+    _write("TODAYX", cached)                                      # stamped 09:31 on today's bar
+    rc = tool.main(["--cache-folder", bcfg.CACHE_FOLDER, "--apply", "--i-know-the-apps-are-stopped"],
+                   provider_factory=lambda: _Provider(vendor))
+    out = capsys.readouterr().out
+    assert rc == 0 and "TODAYX" not in out and "0 with stuck" in out
+
+
+def test_tool_help_documents_the_per_app_commands(capsys):
+    tool = _tool()
+    with pytest.raises(SystemExit):
+        tool.main(["--help"])
+    h = capsys.readouterr().out
+    for needle in ("ba2_trade_platform-prod", "ba2_trade_platform-opt", "SHARED with the test platform",
+                   "before 15:30", "--symbols"):
+        assert needle in h

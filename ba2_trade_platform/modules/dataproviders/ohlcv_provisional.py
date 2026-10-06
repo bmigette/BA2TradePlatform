@@ -18,7 +18,7 @@ is always the newest cached bar. Any older bar that differs from the vendor is a
 THE SIGNATURE (all must hold; see :func:`find_provisional_days`):
 
 1. PROOF OF PROVENANCE: the cache file's last-modified time falls on that bar's OWN New York session
-   date and before 16:00 ET (:func:`written_mid_session`). Nothing else wrote the file since, so the
+   date and before 20:00 ET (:func:`written_mid_session`). Nothing else wrote the file since, so the
    newest bar was captured while its session was still open. A settled bar, or a file touched on a
    later day / after the close, never matches. (Copying a cache without preserving mtimes defeats the
    proof; the bar is then simply refused as before.)
@@ -61,6 +61,9 @@ PROVISIONAL_MAX_BARS = 5
 #: The cached prices must lie inside the vendor's day range widened by this fraction.
 PROVISIONAL_RANGE_TOL = 0.08
 
+#: FMP's end-of-day bar can keep changing until the evening: a write before this NY hour is not settled.
+SETTLED_AFTER_HOUR_ET = 20
+
 _OHLC = ["Open", "High", "Low", "Close"]
 
 
@@ -83,13 +86,13 @@ def _equal(c, v) -> bool:
 
 def written_mid_session(mtime: Optional[float], bar_day) -> bool:
     """True when a file last modified at ``mtime`` (epoch seconds) was written during the NEW YORK
-    session of ``bar_day`` (same date, before 16:00 ET): proof the bar it ends with was captured
+    session of ``bar_day`` (same date, before 20:00 ET): proof the bar it ends with was captured
     while that session was still open."""
     if mtime is None:
         return False
     from ba2_common.core.market_calendar import NY_TZ
     t = datetime.fromtimestamp(mtime, NY_TZ)
-    return t.date() == pd.Timestamp(bar_day).date() and t.hour < 16
+    return t.date() == pd.Timestamp(bar_day).date() and t.hour < SETTLED_AFTER_HOUR_ET
 
 
 def _in_vendor_range(c, v) -> bool:
@@ -238,27 +241,32 @@ def install(provider_base=None) -> None:
                         raise_fetch_errors=raise_fetch_errors)
         key = (provider_name, str(symbol).upper(), interval)
         memo = provider_base._TOPUP_REFUSED.get(key)
-        if memo is not None and time.monotonic() - memo[0] < self.TOPUP_REFUSAL_MEMO_S:
-            # refused moments ago: the guard re-raises from its memo; no extra vendor call here
-            return orig(self, df, symbol, interval, provider_name, fetch_end,
-                        raise_fetch_errors=raise_fetch_errors)
+        memo_live = memo is not None and time.monotonic() - memo[0] < self.TOPUP_REFUSAL_MEMO_S
         try:
-            from ba2_common.core import native_cache
-            path = native_cache.find_timeseries_path(provider_name, symbol, interval)
-            mtime = os.path.getmtime(path) if path else None
-            df2, replaced = repair_provisional_bars(self, df.copy(), symbol, interval, fetch_end,
-                                                    mtime=mtime)
-        except Exception as e:  # noqa: BLE001 -- the guarded top-up below decides and reports
-            logger.warning(f"{provider_name} {symbol} ({interval}): provisional-bar check skipped: {e}")
+            # ORIGINAL first: a normal top-up costs exactly the one vendor call it always did
             return orig(self, df, symbol, interval, provider_name, fetch_end,
                         raise_fetch_errors=raise_fetch_errors)
-        if not replaced:
-            return orig(self, df, symbol, interval, provider_name, fetch_end,
-                        raise_fetch_errors=raise_fetch_errors)
-        # the symbol may have been refused before the repair: ask the guard afresh
-        provider_base._TOPUP_REFUSED.pop((provider_name, str(symbol).upper(), interval), None)
-        logger.info(f"{provider_name} {symbol} ({interval}): replacing stuck provisional bar(s) "
-                    f"{[d.isoformat() for d in replaced]} with the vendor's final bar(s)")
+        except OHLCVTopUpRefused:
+            if memo_live:
+                raise                      # refused moments ago: no extra vendor call here
+            try:
+                from ba2_common.core import native_cache
+                path = native_cache.find_timeseries_path(provider_name, symbol, interval)
+                mtime = os.path.getmtime(path) if path else None
+                df2, replaced = repair_provisional_bars(self, df.copy(), symbol, interval, fetch_end,
+                                                        mtime=mtime)
+            except Exception as e:  # noqa: BLE001 -- the refusal stands; say why the repair did not run
+                logger.warning(f"{provider_name} {symbol} ({interval}): provisional-bar check skipped: {e}")
+                raise_original = True
+            else:
+                raise_original = not replaced
+            if raise_original:
+                raise
+        # repaired: ask the guard afresh, ONCE (a second refusal propagates and is reported)
+        provider_base._TOPUP_REFUSED.pop(key, None)
+        logger.info(f"{provider_name} {symbol} ({interval}): the top-up REFUSED just above was a stuck "
+                    f"provisional bar: replacing {[d.isoformat() for d in replaced]} with the "
+                    f"vendor's final bar(s) and retrying once")
         out, action = orig(self, df2, symbol, interval, provider_name, fetch_end,
                            raise_fetch_errors=raise_fetch_errors)
         # "unchanged" would drop the repair: the caller only writes on append/replaced
