@@ -165,6 +165,13 @@ def wire_all_seams() -> None:
             "market_condition_profile; no data is served for an expert whose setting is empty)"
         )
 
+        # 8) Stuck provisional daily bars (AMD/INTC/MU, 2026-10-05): replace a one-tick snapshot by
+        #    the vendor's final bar before the guarded top-up; refusals reach the Activity Log.
+        #    Live process only -- the test platform / backtests never wire seams.
+        from ..modules.dataproviders.ohlcv_provisional import install as install_provisional_repair
+
+        install_provisional_repair()
+
         _wired = True
         logger.info(
             "All ba2_common/providers/experts seams wired to live implementations"
