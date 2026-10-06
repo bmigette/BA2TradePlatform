@@ -1185,6 +1185,14 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         Returns:
             Optional[float]: The virtual balance amount, None if error occurred
         """
+        # EXPERIMENT (exp/finding6-measure, TEMPORARY, never merge): the single place the
+        # BA2_EXP_FINDING6 switch is read. ON -> every classic-stock reader of the virtual
+        # balance (available-balance breakdown, per-instrument cap, risk_atr equity, the
+        # min-balance thresholds) sees the EQUITY share, as live does, so the backtest
+        # charges an open position once, not twice.
+        import os
+        if os.environ.get("BA2_EXP_FINDING6") == "1":
+            return self.get_virtual_equity()
         return self._virtual_share(lambda account: account.get_tradable_balance(),
                                    "tradable balance", "balance")
 
