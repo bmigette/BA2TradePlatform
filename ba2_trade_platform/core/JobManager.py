@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.job import Job
@@ -85,6 +86,29 @@ def build_monthly_cron(ordinal: int, weekday: str, hour: int, minute: int,
         raise ValueError(f"invalid weekday {weekday!r}")
     return CronTrigger(day=f"{_ORDINALS[ordinal]} {wd}", hour=hour, minute=minute,
                         timezone=_MARKET_TZ if market_time else None)
+
+
+def parse_schedule_times(times: List[str]) -> List[tuple]:
+    """``[(hour, minute), ...]``: EVERY configured ``HH:MM``, de-duplicated and in clock order.
+
+    The schedule dict's ``times`` list may hold several entries (the settings UI accepts them and the
+    backtest honours them all); the parser used to schedule only the first. Raises ``ValueError`` on
+    an entry that is not ``HH:MM`` -- the caller turns that into "no job" with an ERROR, exactly as an
+    unparseable first time did."""
+    parsed = set()
+    for raw in times:
+        hour, minute = map(int, str(raw).split(':'))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(f"time {raw!r} is not a valid HH:MM")
+        parsed.add((hour, minute))
+    return sorted(parsed)
+
+
+def _one_or_all(triggers: list):
+    """The single trigger itself (identical to the single-time behaviour), or an ``OrTrigger``
+    that fires at each of them. ONE scheduler job either way, so the job id, its removal and the
+    refresh path are unchanged and cannot collide."""
+    return triggers[0] if len(triggers) == 1 else OrTrigger(triggers)
 
 
 def assemble_monthly_schedule(ordinal: int, weekday: str, times: List[str],
@@ -1235,18 +1259,19 @@ class JobManager:
                 if not times:
                     logger.warning("No times specified in monthly schedule")
                     return None
-                hour, minute = map(int, times[0].split(':'))
+                clock_times = parse_schedule_times(times)
                 market_time = schedule_setting.get('time_basis') == 'market'
                 logger.info(
                     f"Creating monthly cron trigger: ordinal={schedule_setting.get('ordinal')}, "
-                    f"weekday={schedule_setting.get('weekday')}, hour={hour}, minute={minute}, "
+                    f"weekday={schedule_setting.get('weekday')}, times={clock_times}, "
                     f"time_basis={'market' if market_time else 'local'}"
                 )
-                return build_monthly_cron(
-                    ordinal=int(schedule_setting['ordinal']),
-                    weekday=schedule_setting['weekday'],
-                    hour=hour, minute=minute, market_time=market_time,
-                )
+                return _one_or_all([
+                    build_monthly_cron(
+                        ordinal=int(schedule_setting['ordinal']),
+                        weekday=schedule_setting['weekday'],
+                        hour=hour, minute=minute, market_time=market_time)
+                    for hour, minute in clock_times])
 
             # Handle dict schedule configuration (JSON format)
             if isinstance(schedule_setting, dict) and 'days' in schedule_setting and 'times' in schedule_setting:
@@ -1261,11 +1286,13 @@ class JobManager:
                     'friday': 4, 'saturday': 5, 'sunday': 6
                 }
                 
-                # Get enabled days
-                enabled_days = []
-                for day_name, enabled in days.items():
-                    if enabled and day_name.lower() in day_mapping:
-                        enabled_days.append(day_mapping[day_name.lower()])
+                # Get enabled days. A weekday ABSENT from ``days`` is ENABLED, exactly as the
+                # backtest's ``_schedule_allows_entry`` reads it (``days.get(weekday, True)``): the
+                # settings UI and the GA deploy payload always write all seven keys, so this only
+                # decides a hand-written partial dict -- and live and backtest must agree on it.
+                present = {str(k).lower(): bool(v) for k, v in days.items()}
+                enabled_days = [number for name, number in day_mapping.items()
+                                if present.get(name, True)]
                 
                 if not enabled_days:
                     logger.warning("No days enabled in schedule")
@@ -1275,20 +1302,20 @@ class JobManager:
                     logger.warning("No times specified in schedule")
                     return None
                 
-                # Create triggers for each time on enabled days
-                # For multiple times, we'll use the first time for now
-                # TODO: In the future, we could create multiple jobs for different times
-                first_time = times[0]
-                hour, minute = map(int, first_time.split(':'))
+                # EVERY configured time fires on the enabled days (one job, an OrTrigger when there
+                # is more than one; the backtest honours them all too).
+                clock_times = parse_schedule_times(times)
 
                 # Create day_of_week string for APScheduler
                 day_of_week = ','.join(map(str, sorted(enabled_days)))
 
                 market_time = schedule_setting.get('time_basis') == 'market'
-                logger.info(f"Creating cron trigger: hour={hour}, minute={minute}, "
+                logger.info(f"Creating cron trigger: times={clock_times}, "
                             f"day_of_week={day_of_week}, time_basis={'market' if market_time else 'local'}")
-                return CronTrigger(hour=hour, minute=minute, day_of_week=day_of_week,
-                                   timezone=_MARKET_TZ if market_time else None)
+                return _one_or_all([
+                    CronTrigger(hour=hour, minute=minute, day_of_week=day_of_week,
+                                timezone=_MARKET_TZ if market_time else None)
+                    for hour, minute in clock_times])
             
             # Handle other schedule formats (string-based) - can be extended as needed
             else:
