@@ -95,12 +95,16 @@ HISTORY_FLOOR = date(2024, 1, 18)     # Alpaca option history floor (AlpacaOptio
 CALLS_PER_MINUTE = 100
 INACTIVE_TAIL_REFRESH_DAYS = 7
 DEFAULT_DEADLINE_SECONDS = 900.0      # per symbol per ensure_filled
-MAX_RETRIES = 6                       # per API call (429 / 5xx / timeout), exponential backoff
+MAX_RETRIES = 3                       # per API call (429 / 5xx / timeout), exponential backoff
+BREAKER_SYMBOLS = 3                   # consecutive symbols ending on timeout/429/5xx -> open
+BREAKER_SECONDS = 1800.0              # process-wide: every fill returns 'filling' meanwhile
+MAX_ABANDONED_CALLS = 4               # timed-out call threads still alive -> refuse new calls
+SOCKET_TIMEOUT = (10.0, 30.0)         # (connect, read) injected into the alpaca-py session
 BACKOFF_BASE_SECONDS = 2.0
 BACKOFF_CAP_SECONDS = 120.0
 MAX_SUSPECT_RERUNS = 2
 LOCK_WAIT_SECONDS = 900.0
-REQUEST_TIMEOUT_SECONDS = 60.0        # background calls; alpaca-py sets no timeout of its own
+REQUEST_TIMEOUT_SECONDS = 20.0        # background calls; alpaca-py sets no timeout of its own
 TOMBSTONE_RETRY_SESSIONS = 3          # a 'no_bar' tombstone younger than this is retried daily
 PRECEDING_SESSIONS_TRADED = 10        # "normally trades" = had a value in this many prior sessions
 STALE_TMP_SECONDS = 3600
@@ -296,6 +300,12 @@ class TokenBucket:
                 return 0.0
             return (1.0 - self._tokens) / self.rate
 
+    def penalize(self, seconds: float) -> None:
+        """A 429 anywhere drains the bucket for EVERY thread for ``seconds`` (the limit is per key)."""
+        with self._lock:
+            self._refill()
+            self._tokens = min(self._tokens, -float(seconds) * self.rate)
+
     def acquire(self, blocking: bool = True) -> bool:
         while True:
             wait = self.try_acquire()
@@ -339,7 +349,7 @@ class _Budget:
                 self.used += 1
                 return
             self.check_deadline(extra=wait)
-            self._sleep(min(wait, 1.0))
+            self._sleep(max(min(wait, 1.0), 0.001))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -363,6 +373,23 @@ def _is_rate_limited(exc: BaseException) -> bool:
     return "429" in text or "too many requests" in text or "rate limit" in text
 
 
+def _apply_socket_timeout(client: Any) -> None:
+    """alpaca-py sets NO socket timeout, so a blackholed connection blocks its thread forever
+    (``_timed`` only abandons it). Inject a (connect, read) timeout into the client's requests
+    session, once."""
+    sess = getattr(client, "_session", None)
+    if sess is None or getattr(sess, "_ba2_timeout_patched", False):
+        return
+    orig = sess.request
+
+    def request(*a, **k):
+        if k.get("timeout") is None:
+            k["timeout"] = SOCKET_TIMEOUT
+        return orig(*a, **k)
+    sess.request = request
+    sess._ba2_timeout_patched = True
+
+
 class AlpacaBarsClient:
     """``fetch(symbols, start, end) -> {occ: [BarRec]}``; RAISES on any failure.
 
@@ -380,6 +407,7 @@ class AlpacaBarsClient:
         from ba2_providers.options.alpaca import _bar_price
 
         _, dc = self._p._clients()
+        _apply_socket_timeout(dc)
         req = OptionBarsRequest(
             symbol_or_symbols=list(symbols), timeframe=TimeFrame.Day,
             start=datetime(start.year, start.month, start.day, tzinfo=timezone.utc),
@@ -410,6 +438,7 @@ class AlpacaContractLister:
         from alpaca.trading.enums import AssetStatus, ContractType
 
         tc, _ = self._p._clients()
+        _apply_socket_timeout(tc)
         req = GetOptionContractsRequest(
             underlying_symbols=[underlying.upper()],
             status=AssetStatus.INACTIVE if status == "inactive" else AssetStatus.ACTIVE,
@@ -541,6 +570,50 @@ def _symbol_lock(key: Tuple[str, str]) -> threading.Lock:
 
 _WARNED: Dict[str, date] = {}
 _SUSPECT_SEEN: set = set()
+_ABANDONED: List[threading.Thread] = []
+
+
+class _Breaker:
+    """Process-wide circuit breaker over the data API: after ``BREAKER_SYMBOLS`` symbols in a row
+    end on timeout/429/5xx, every ``ensure_filled`` returns 'filling' at once for
+    ``BREAKER_SECONDS`` (a blackholed API must not hold a worker per symbol for minutes and park
+    OPEN_POSITIONS behind the entry batch). Logs once at open and once at close."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.fails = 0
+        self.open_until = 0.0
+        self.is_open = False
+
+    def reset(self):
+        with self.lock:
+            self.fails, self.open_until, self.is_open = 0, 0.0, False
+
+    def blocked(self) -> bool:
+        with self.lock:
+            if not self.is_open:
+                return False
+            if time.monotonic() >= self.open_until:
+                self.is_open, self.fails = False, 0
+                logger.info("ATM-IV history API circuit CLOSED: fills resume")
+                return False
+            return True
+
+    def record(self, api_failure: bool, success: bool) -> None:
+        with self.lock:
+            if success:
+                self.fails = 0
+            elif api_failure:
+                self.fails += 1
+                if self.fails >= BREAKER_SYMBOLS and not self.is_open:
+                    self.is_open = True
+                    self.open_until = time.monotonic() + BREAKER_SECONDS
+                    logger.warning(f"ATM-IV history API circuit OPEN: {self.fails} symbol(s) in a row "
+                                   f"ended on timeout/429/5xx; every fill returns 'filling' for "
+                                   f"{BREAKER_SECONDS / 60:.0f} min (IV rank stays unavailable)")
+
+
+_BREAKER = _Breaker()
 
 
 def _warn_once_per_day(key: str, message: str, today: date) -> None:
@@ -603,6 +676,10 @@ class AtmIvHistoryProvider:
         """Run an API call with a hard time limit (alpaca-py has none): the call runs in a daemon
         thread and an overrun raises ApiFailure, so ``max_seconds`` is honoured on the caller."""
         limit = min(budget.remaining_seconds(REQUEST_TIMEOUT_SECONDS), REQUEST_TIMEOUT_SECONDS)
+        with _FILL_LOCK:
+            _ABANDONED[:] = [t for t in _ABANDONED if t.is_alive()]
+            if len(_ABANDONED) > MAX_ABANDONED_CALLS:
+                raise TransientApiError(f"{len(_ABANDONED)} timed-out API calls are still outstanding")
         box: Dict[str, Any] = {}
 
         def run():
@@ -614,6 +691,8 @@ class AtmIvHistoryProvider:
         t.start()
         t.join(limit)
         if t.is_alive():
+            with _FILL_LOCK:
+                _ABANDONED.append(t)
             raise TransientApiError(f"API call exceeded {limit:.1f}s")
         if "e" in box:
             raise box["e"]
@@ -707,7 +786,7 @@ class AtmIvHistoryProvider:
             self._atomic_write_parquet(merged, path)
 
     # -- window / missing -----------------------------------------------------------------
-    def _fresh_sessions(self, df: pd.DataFrame) -> set:
+    def _fresh_sessions(self, df: pd.DataFrame, include_no_spot: bool = False) -> set:
         """Sessions with a current-version row, EXCEPT a young ``no_bar`` tombstone: a thin day
         or a transient empty response looks the same on the day, so for the first
         ``TOMBSTONE_RETRY_SESSIONS`` sessions it is retried once per calendar day."""
@@ -719,7 +798,9 @@ class AtmIvHistoryProvider:
         out = set()
         for ts, reason, comp in zip(cur["session_date"], cur["reason"], cur["computed_at"]):
             d = ts.date()
-            if reason in ("no_bar", "no_spot") and ts >= young_cut and pd.notna(comp) and comp.date() < today:
+            if reason == "no_spot" and not include_no_spot:
+                continue          # a missing spot is an INPUT failure: always retried
+            if reason == "no_bar" and ts >= young_cut and pd.notna(comp) and comp.date() < today:
                 from ba2_common.core import market_calendar
                 gap = len(market_calendar.regular_session_dates(d + timedelta(days=1), comp.date()))
                 if gap < TOMBSTONE_RETRY_SESSIONS:
@@ -758,7 +839,8 @@ class AtmIvHistoryProvider:
         """The stored series only: ZERO API calls, no fill, no prerequisites."""
         window = window_sessions(end_session, lookback_days)
         df = self.read_store(symbol)
-        missing = [d for d in window if d not in self._fresh_sessions(df)]
+        fresh = self._fresh_sessions(df, include_no_spot=True)    # peek cannot know the spot
+        missing = [d for d in window if d not in fresh]
         return self._assemble(symbol, df, window, end_session,
                               STATUS_COMPLETE if not missing else STATUS_FILLING)
 
@@ -780,8 +862,12 @@ class AtmIvHistoryProvider:
         end_session = last if end_session is None else min(end_session, last)
         window = window_sessions(end_session, lookback_days)
         df = self.read_store(sym)
-        if not [d for d in window if d not in self._fresh_sessions(df)]:
+        fresh = self._fresh_sessions(df)
+        if not [d for d in window if d not in fresh]:
             return self._assemble(sym, df, window, end_session, STATUS_COMPLETE)
+        if _BREAKER.blocked():
+            return self._assemble(sym, df, window, end_session, STATUS_FILLING,
+                                  "API circuit open (recent timeouts/429/5xx); retrying later")
 
         t0 = time.monotonic()
         key = (self.cache_dir, sym)
@@ -791,9 +877,11 @@ class AtmIvHistoryProvider:
             return self._assemble(sym, self.read_store(sym), window, end_session, STATUS_FILLING,
                                   "another fill of this symbol is still running")
         status, reason = STATUS_COMPLETE, None
+        api_failed = False
         try:
             df = self.read_store(sym)             # the holder we waited for may have finished it
-            missing = [d for d in window if d not in self._fresh_sessions(df)]
+            fresh = self._fresh_sessions(df)
+            missing = [d for d in window if d not in fresh]
             if missing:
                 if len(missing) > 5:
                     logger.info(f"ATM-IV history fill started for {sym}: {len(missing)} of "
@@ -819,13 +907,16 @@ class AtmIvHistoryProvider:
                             break
                     except (BudgetExhausted, RateLimited, TransientApiError, ApiFailure) as e:
                         status, reason = STATUS_FILLING, f"{type(e).__name__}: {e}"
+                        api_failed = isinstance(e, (RateLimited, TransientApiError))
                         _warn_once_per_day(
                             f"fillstop:{key}", f"ATM-IV history fill for {sym} stopped after "
                             f"{time.monotonic() - t0:.0f}s ({reason}); progress is kept and the next "
                             f"analysis pass resumes. IV rank stays unavailable until it completes.", today)
                         break
                 df = self.read_store(sym)
-                still = [d for d in window if d not in self._fresh_sessions(df)]
+                fresh = self._fresh_sessions(df)
+                still = [d for d in window if d not in fresh]
+                _BREAKER.record(api_failure=api_failed, success=(status == STATUS_COMPLETE and budget.used > 0))
                 if status == STATUS_COMPLETE:
                     if still:
                         reason = f"{len(still)} session(s) not computable (no spot)"
@@ -847,7 +938,8 @@ class AtmIvHistoryProvider:
         rate = self._rate_source(lo, hi)           # AtmIvUnavailable -> series unavailable
         spots = self.spot_source.spots(sym, lo, hi)  # SpotUnavailable -> series unavailable
         fillable = sorted((d for d in missing if d in spots), reverse=True)   # newest first
-        nospot = [d for d in missing if d not in spots]
+        already = {ts.date() for ts, why in zip(df["session_date"], df["reason"]) if why == "no_spot"} if len(df) else set()
+        nospot = [d for d in missing if d not in spots and d not in already]
         if nospot:
             now_ts = pd.Timestamp(self._now().astimezone(timezone.utc).replace(tzinfo=None))
             self._merge_rows(sym, [self._tomb(dict(session_date=d, provenance=PROVENANCE_DERIVED,
@@ -962,6 +1054,8 @@ class AtmIvHistoryProvider:
                     if wait is None:
                         wait = min(BACKOFF_BASE_SECONDS * 2 ** attempt, BACKOFF_CAP_SECONDS)
                     wait *= 1.0 + 0.25 * self._jitter()
+                    if isinstance(err, RateLimited):
+                        self.bucket.penalize(wait)          # every thread backs off, not just this one
                     budget.check_deadline(extra=wait)
                     self._sleep(wait)
                     attempt += 1

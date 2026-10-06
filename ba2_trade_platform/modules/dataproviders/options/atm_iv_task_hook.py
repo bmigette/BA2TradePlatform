@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -46,6 +47,18 @@ def _fetched_at(path: str) -> Optional[datetime]:
         return None
 
 
+_QUERY_SECRET = re.compile(r"(?i)(api_key|apikey|key|token|secret)=[^&\s'\")]+")
+
+
+def scrub_secrets(text: str, *known: Optional[str]) -> str:
+    """``text`` with any ``api_key=...`` query value and any ``known`` secret removed."""
+    out = _QUERY_SECRET.sub(lambda m: m.group(1) + "=***", text)
+    for k in known:
+        if k:
+            out = out.replace(k, "***")
+    return out
+
+
 def ensure_dgs3mo(*, only_if_stale: bool, path: Optional[str] = None,
                   key_resolver: Optional[Callable[[], Optional[str]]] = None,
                   refresher: Optional[Callable[[str, str], int]] = None,
@@ -74,16 +87,29 @@ def ensure_dgs3mo(*, only_if_stale: bool, path: Optional[str] = None,
     try:
         rows = refresher("DGS3MO", key)
     except Exception as e:  # noqa: BLE001 - logged, the gate stays closed
-        logger.error(f"FRED DGS3MO refresh failed: {e}. Derived ATM-IV series stay unavailable "
-                     f"once the cached rate is more than 7 days old.", exc_info=True)
+        # A requests error carries the full URL INCLUDING ``api_key=``: log a scrubbed one-liner,
+        # never the exception chain / traceback.
+        logger.error(f"FRED DGS3MO refresh failed: {scrub_secrets(f'{type(e).__name__}: {e}', key)}. "
+                     f"Derived ATM-IV series stay unavailable once the cached rate is more than "
+                     f"7 days old.")
         return "failed"
     logger.info(f"FRED DGS3MO (option risk-free rate) refreshed: {rows} observation(s)")
     return "refreshed"
 
 
 def has_iv_rank_gates() -> bool:
-    from ba2_common.core.iv_rank_audit import find_iv_rank_gates
-    return bool(find_iv_rank_gates())
+    """Light check (rule-name scan over enabled instances' rulesets); does NOT resolve any
+    expert's universe the way ``find_iv_rank_gates`` does."""
+    from sqlmodel import select
+    from ba2_common.core.db import get_db
+    from ba2_common.core.iv_rank_audit import _iv_rank_rule_names
+    from ba2_common.core.models import ExpertInstance
+
+    with get_db() as session:
+        for inst in session.exec(select(ExpertInstance).where(ExpertInstance.enabled == True)).all():  # noqa: E712
+            if _iv_rank_rule_names(session, [inst.enter_market_ruleset_id, inst.open_positions_ruleset_id]):
+                return True
+    return False
 
 
 # ---- the analysis-task seam ---------------------------------------------------------------
@@ -95,7 +121,8 @@ def invalidate_gate_cache() -> None:
 def _account_id_if_iv_rank_gated(expert_instance_id: int, use_case: str) -> Optional[int]:
     """The expert instance's account id when its ruleset for ``use_case`` has an iv_rank
     condition, else None. One small query, cached per (instance, use case) for
-    ``GATE_CACHE_TTL_SECONDS`` (``invalidate_gate_cache`` clears it after a ruleset edit)."""
+    ``GATE_CACHE_TTL_SECONDS`` (5 minutes): a ruleset edit is seen within that time, or at once
+    after ``POST /api/reload`` (which calls ``invalidate_gate_cache``)."""
     key = (int(expert_instance_id), str(use_case))
     now = time.monotonic()
     with _GATE_LOCK:
@@ -124,6 +151,9 @@ def ensure_for_analysis_task(expert_instance_id: int, symbol: str, use_case: str
                              deadline_seconds: Optional[float] = None):
     """Fill the symbol's derived ATM-IV series before its analysis runs. Returns the
     ``AtmIvSeries`` or None when nothing applied. NEVER raises."""
+    from ba2_common.core.iv_rank_audit import PLACEHOLDER_SYMBOLS
+    if not symbol or symbol in PLACEHOLDER_SYMBOLS:
+        return None                   # a selection-mode sentinel ('EXPERT', ...) is not a ticker
     try:
         account_id = _account_id_if_iv_rank_gated(expert_instance_id, use_case)
         if account_id is None:

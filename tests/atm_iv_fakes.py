@@ -173,12 +173,19 @@ def make_provider(tmp_path, world: Optional[FakeWorld] = None, *, now=NOW,
     world = world or FakeWorld()
     bars = FakeBars(world)
     lister = FakeLister(world, today=now.date())
+    vclock = [0.0]                    # virtual time: sleeping advances it, so bucket debts drain instantly
+    user_sleep = sleep
+
+    def vsleep(sec):
+        vclock[0] += sec
+        if user_sleep:
+            user_sleep(sec)
     prov = H.AtmIvHistoryProvider(
         cache_dir=str(tmp_path / "AtmIvHistory"), bars_client=bars, contract_lister=lister,
         spot_source=spot_source or FakeSpots(world),
         rate_source=rate_source or (lambda a, b: FakeRate()),
-        now=lambda: now, sleep=sleep or (lambda s: None),
-        bucket=bucket or H.TokenBucket(per_minute=1e9, burst=1e9),
+        now=lambda: now, sleep=vsleep,
+        bucket=bucket or H.TokenBucket(per_minute=6e6, burst=1e6, clock=lambda: vclock[0], sleep=vsleep),
         jitter=lambda: 0.0)
     return prov, world, bars, lister
 
@@ -186,6 +193,8 @@ def make_provider(tmp_path, world: Optional[FakeWorld] = None, *, now=NOW,
 def reset_module_state():
     with H._FILL_LOCK:
         H._SYMBOL_LOCKS.clear()
+        H._BREAKER.reset()
+        H._ABANDONED.clear()
         H._WARNED.clear()
         H._SUSPECT_SEEN.clear()
 

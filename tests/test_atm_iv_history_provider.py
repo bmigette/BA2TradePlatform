@@ -191,13 +191,19 @@ def test_sessions_without_spot_are_not_computed_and_the_call_is_still_complete(t
 
 # ---- backoff / retries -------------------------------------------------------------------------
 def test_429_is_retried_with_exponential_backoff_and_jitter_then_completes(tmp_path):
-    sleeps = []
-    prov, world, bars, lister = make_provider(tmp_path, sleep=sleeps.append)
+    sleeps, clock = [], [0.0]
+
+    def sleep(sec):
+        sleeps.append(sec)
+        clock[0] += sec
+    bucket = H.TokenBucket(per_minute=6000, burst=10, clock=lambda: clock[0], sleep=sleep)
+    prov, world, bars, lister = make_provider(tmp_path, sleep=sleep, bucket=bucket)
     prov._jitter = lambda: 1.0                                 # +25%
     bars.fail_first = 3
     res = prov.ensure_filled("TEST", END, LOOK)
     assert res.status == H.STATUS_COMPLETE
-    assert sleeps[:3] == pytest.approx([2.0 * 1.25, 4.0 * 1.25, 8.0 * 1.25])
+    backoffs = [x for x in sleeps if x > 1.0]                  # (the bucket's own debt waits are <= 1 s)
+    assert backoffs[:3] == pytest.approx([2.0 * 1.25, 4.0 * 1.25, 8.0 * 1.25])
 
 
 def test_retry_after_header_is_respected_and_5xx_is_retried(tmp_path):
