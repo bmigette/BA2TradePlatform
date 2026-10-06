@@ -105,7 +105,7 @@ def exclusion_fields(exclusion: Any) -> Dict[str, Any]:
     if note:
         tip += f" ({note})"
     tip += ". Click to include again."
-    return {"excluded": True, "excl_tip": tip, "excl_icon": "visibility", "excl_hex": EXCLUDED_HEX}
+    return {"excluded": True, "excl_tip": tip, "excl_icon": "visibility_off", "excl_hex": EXCLUDED_HEX}
 
 
 def effective_weight_text(weight_pct: Optional[float], effective_pct: Optional[float]) -> str:
@@ -162,6 +162,8 @@ def label_badge_segments(rows: Iterable[Any], excluded_value: float = 0.0) -> Li
         if count > 0 or key == "total":
             out.append({"key": key, "count": count, "color": SEGMENT_COLORS[key],
                         "tooltip": f"{count} {meaning[key]}"})
+    # Symbols in the total that are in none of the coloured segments (flat, unpriced, unmeasurable P&L).
+    out[0]["unmeasured"] = total - profit - loss - excluded
     return out
 
 
