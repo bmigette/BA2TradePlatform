@@ -15,7 +15,8 @@ from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
 from ba2_common.core.interfaces.ExtendableSettingsInterface import trading_permission, coerce_bool
 from ba2_common.logger import logger
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, ExpertInstance, Transaction
-from ba2_common.core.types import OrderStatus, OrderDirection, TransactionStatus
+from ba2_common.core.types import (CAPITAL_HOLDING_TRANSACTION_STATUSES, OrderStatus, OrderDirection,
+                                   TransactionStatus)
 from ba2_common.core.db import get_instance, get_all_instances, update_instance, get_db
 from sqlmodel import select, Session
 from ba2_common.core.failure_modes import absorb_if_benign
@@ -1239,11 +1240,12 @@ class TradeRiskManagement:
         try:
             from ba2_common.core.trade_store import transactions_where, orders_where, inmem_trades_active
 
-            # Get existing transactions for this expert that are still open (dual-path: the
+            # Get existing transactions for this expert that still HOLD capital -- WAITING, OPENED and
+            # CLOSING (a resting close has not released the position; dual-path: the
             # in-memory store in a backtest, SQLite in live — same rows either way).
             transactions = transactions_where(
                 expert_id=expert_instance_id,
-                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED])
+                statuses=list(CAPITAL_HOLDING_TRANSACTION_STATUSES))
 
             for transaction in transactions:
                 symbol = transaction.symbol

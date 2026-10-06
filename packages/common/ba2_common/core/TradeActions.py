@@ -15,7 +15,7 @@ from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInt
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, TradeActionResult
 from ba2_common.core.types import (
     OrderRecommendation, ExpertActionType, OrderDirection, OrderStatus,
-    OptionRight, AssetClass, TransactionStatus, OptionCloseReason,
+    OptionRight, AssetClass, TransactionStatus, OptionCloseReason, CAPITAL_HOLDING_TRANSACTION_STATUSES,
 )
 from ba2_common.core.db import get_db, add_instance, update_instance, get_instance
 from ba2_common.core.option_economics import (
@@ -3219,7 +3219,7 @@ class _OptionEntryAction(TradeAction):
         """``(dollars this expert already has committed to self.instrument_name, None)``, or
         ``(None, why)`` when any part of it cannot be measured.
 
-        WHAT IS COUNTED -- every WAITING or OPENED transaction of this expert on the symbol
+        WHAT IS COUNTED -- every WAITING, OPENED or CLOSING transaction of this expert on the symbol
         (the same set the classic equity RM's ``_get_existing_allocations`` reads, through the
         same dual-path ``transactions_where``, so a backtest reads its in-memory store):
 
@@ -3252,7 +3252,7 @@ class _OptionEntryAction(TradeAction):
         total = 0.0
         for txn in transactions_where(
                 expert_id=instance_id, symbol=self.instrument_name,
-                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED]):
+                statuses=list(CAPITAL_HOLDING_TRANSACTION_STATUSES)):
             orders = orders_where(transaction_id=txn.id)
             fallback = next((p for o in orders
                              for p in (o.limit_price, o.open_price, o.stop_price) if p), None)

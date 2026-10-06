@@ -581,12 +581,20 @@ def test_a_closing_option_transaction_still_holds_its_collateral(world):
     assert _headroom(world, e) == pytest.approx(EQUITY - 18_000.0 - 4_000.0)
 
 
-def test_a_closing_STOCK_transaction_is_left_as_the_stock_path_has_it(world):
-    """Reported, not changed: the stock path drops a CLOSING stock row from ``used`` (its resting
-    close has not released the shares yet). Option rows are the only ones added."""
+def test_a_closing_STOCK_transaction_still_holds_its_capital(world):
+    """A resting close has not released the shares: until the sell FILLS (the row turns CLOSED) the
+    position is still held, so its cost stays in ``used`` -- exactly as a CLOSING option row does.
+    (It used to be dropped, letting the same capital fund a second entry; fixed 2026-10-07.)"""
     acct = _Live()
     e = world.expert(acct)
     _txn(e, symbol="ABC", qty=100, price=100.0, option=False, status=TransactionStatus.CLOSING)
+    assert _headroom(world, e) == EQUITY - 100 * 100.0
+
+
+def test_a_closed_stock_transaction_releases_its_capital(world):
+    acct = _Live()
+    e = world.expert(acct)
+    _txn(e, symbol="ABC", qty=100, price=100.0, option=False, status=TransactionStatus.CLOSED)
     assert _headroom(world, e) == EQUITY
 
 

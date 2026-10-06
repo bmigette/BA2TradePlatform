@@ -7,7 +7,8 @@ from typing import Any, Dict, List, NamedTuple, Optional, Protocol, runtime_chec
 from sqlmodel import Session, select
 from ba2_common.logger import logger
 from ba2_common.core.models import ExpertSetting, MarketAnalysis, Transaction, ExpertInstance
-from ba2_common.core.types import TransactionStatus, OrderDirection, Recommendation
+from ba2_common.core.types import (CAPITAL_HOLDING_TRANSACTION_STATUSES, TransactionStatus,
+                                   OrderDirection, Recommendation)
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.db import get_instance, get_db
 from ba2_common.core.failure_modes import absorb_if_benign
@@ -177,17 +178,14 @@ def _readable_positive(raw) -> Optional[float]:
 def capital_transactions(expert_id: int) -> List[Any]:
     """The transactions that hold an expert's capital, as the shared used-balance reads them.
 
-    WAITING and OPENED for every asset class, as the stock path always has. An OPTION transaction
-    that is CLOSING is included as well: a resting close on a cash-secured put or a spread has not
-    released its collateral (or the premium it holds) until it fills. A STOCK transaction that is
-    CLOSING stays excluded, exactly as today -- the stock path has the same gap (a resting stock close
-    drops out of ``used`` before it fills); that is reported, not changed, here."""
+    WAITING, OPENED and CLOSING, for every asset class (``CAPITAL_HOLDING_TRANSACTION_STATUSES``): a
+    resting close -- on a stock, a cash-secured put or a spread -- has not released the shares, the
+    collateral or the premium it holds until it FILLS, so the capital stays committed until the
+    transaction is actually CLOSED. (A CLOSING STOCK row used to be dropped here, so its capital
+    could be spent a second time while the position was still held; fixed 2026-10-07.)"""
     from ba2_common.core.trade_store import transactions_where
-    rows = transactions_where(
-        expert_id=expert_id,
-        statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED, TransactionStatus.CLOSING])
-    return [t for t in rows
-            if t.status != TransactionStatus.CLOSING or _is_option_transaction(t)]
+    return list(transactions_where(
+        expert_id=expert_id, statuses=list(CAPITAL_HOLDING_TRANSACTION_STATUSES)))
 
 
 def _order_float(raw) -> float:
