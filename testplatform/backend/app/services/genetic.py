@@ -488,6 +488,35 @@ class GeneticOptimizer:
             individual.append(value)
         return creator.Individual(individual)
 
+    def _initial_population(self, n: int) -> List:
+        """Generation 0: ``n`` random individuals, with every STRATIFIED choice gene balanced.
+
+        A choice gene declared ``"stratify": True`` (the decision-time gene) gets each of its ``k``
+        values at least ``n // k`` times in generation 0 (82 individuals, 7 values: 11 each, the
+        remaining 5 keep their free random draw), instead of whatever the uniform draw gives (a
+        value can start with 4 or 20). Done by overwriting that gene in a random subset of
+        ``k * (n // k)`` individuals, so the other genes stay iid. Fresh generation 0 ONLY: a
+        resumed checkpoint or a warm-start population goes through ``rebuild_population``
+        untouched (a warm start seeds elites from a prior run and must keep them as they are).
+        Without a stratified gene NO extra random draw is made, so every existing job's
+        generation 0 is bit-identical to before.
+        """
+        population = [self._create_individual() for _ in range(n)]
+        for i, (param_name, config) in enumerate(self.param_ranges.items()):
+            if config['type'] != 'choice' or not config.get('stratify'):
+                continue
+            k = len(config['choices'])
+            quota = n // k
+            if quota == 0:
+                logger.warning(f"choice gene {param_name!r}: population {n} < {k} choices, "
+                               f"generation 0 is not stratified")
+                continue
+            positions = list(range(n))
+            self._rng.shuffle(positions)
+            for slot, pos in enumerate(positions[:k * quota]):
+                population[pos][i] = slot % k
+        return population
+
     def _mutate_individual(self, individual: List, indpb: float = 0.2) -> Tuple[List]:
         """
         Mutate an individual with probability indpb for each gene.
@@ -543,8 +572,16 @@ class GeneticOptimizer:
             value = individual[i]
             if config['type'] == 'choice':
                 # Map the evolved int index back to the categorical VALUE (e.g. the
-                # target_price_type string). Clamp defensively to a valid index.
-                idx = int(np.clip(round(value), 0, len(config['choices']) - 1))
+                # target_price_type string). An index outside the declared list is REFUSED, not
+                # clamped: the operators never produce one, so it means the chromosome came from a
+                # job with a DIFFERENT list (a stale checkpoint / seed) and clamping would silently
+                # evaluate another value than the one the genome stands for.
+                idx = int(round(value))
+                if not 0 <= idx < len(config['choices']):
+                    raise ValueError(
+                        f"choice gene {param_name!r}: index {value!r} is outside its "
+                        f"{len(config['choices'])} declared choices {config['choices']!r} "
+                        f"(a chromosome from a job with a different list?)")
                 value = config['choices'][idx]
             else:
                 # Snap to the step lattice (int or float; see LATTICE_ANCHORS).
@@ -623,7 +660,17 @@ class GeneticOptimizer:
                 # param space) falls back to index 0 rather than raising.
                 choices = config['choices']
                 value = expanded_params[param_name]
-                value = choices.index(value) if value in choices else 0
+                if value in choices:
+                    value = choices.index(value)
+                elif config.get('stratify'):
+                    # The decision-time gene: a seed from a job with another time list must not
+                    # silently become "the first time" (every other choice gene keeps the
+                    # historical index-0 fallback above).
+                    raise ValueError(
+                        f"choice gene {param_name!r}: value {value!r} is not in this job's "
+                        f"declared choices {choices!r}")
+                else:
+                    value = 0
             else:
                 value = expanded_params.get(param_name, config['min'])
             individual.append(value)
@@ -883,7 +930,7 @@ class GeneticOptimizer:
                 f"Restored population of {len(population)} individuals "
                 f"({n_valid} already evaluated, {len(population) - n_valid} to run)")
         else:
-            population = self.toolbox.population(n=self.population_size)
+            population = self._initial_population(self.population_size)
 
         # Evaluate fitness function wrapper
         def evaluate(individual):

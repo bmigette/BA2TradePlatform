@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from ba2_common.core.knowability import DEFAULT_DECISION_TIME
+from ba2_common.core.schedule_genes import validate_decision_times
 from app.models import (
     SessionLocal,
     Strategy as StrategyModel,
@@ -1536,6 +1537,20 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 if k.startswith("schedule:")
             } or None
 
+        # DECISION-TIME gene (schedule:time): validated here, where the run's execution interval
+        # is known, in addition to the launcher's check -- a hand-written config that bypassed the
+        # launcher must not reach the GA with a time the engine cannot honour.
+        _time_spec = (schedule_cfg or {}).get("time")
+        if _time_spec and _time_spec.get("optimize"):
+            try:
+                _validated = validate_decision_times(
+                    _time_spec["choices"], backtest_cfg.get("execution_interval", "1d"))
+            except ValueError as e:
+                return _fail(opt_id, db, f"schedule:time gene: {e}")
+            if list(_time_spec["choices"]) != _validated:
+                return _fail(opt_id, db, f"schedule:time choices must be sorted ascending, got "
+                                         f"{list(_time_spec['choices'])!r}")
+
         # BYPASS expert (piece 1c): if the backtest's expert declares ``bypasses_classic_rm``
         # (e.g. FactorRanker) the search space must EXCLUDE tp/sl/cond:*/exit:* and search
         # ONLY the expert's own params (model:*). Detected from the backtest_cfg experts here so
@@ -2574,6 +2589,17 @@ def _market_condition_trial_pins(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]
     return {"market_condition_profiles": profiles, "market_condition_manifests": manifests}
 
 
+def _schedule_times_from_gene(gene_time: Optional[str]) -> Optional[Dict[str, List[str]]]:
+    """The ENTRY and the MANAGE schedule's ``times`` a decoded ``schedule:time`` gene stands for
+    (None without the gene). The ONE place the two are derived: today both are the single gene
+    value; splitting the gene into an entry time and a manage time changes only this function
+    (and the reconstruction in ``ba2_common.core.schedule_genes``), nothing else assumes they
+    are equal."""
+    if not gene_time:
+        return None
+    return {"entry": [gene_time], "manage": [gene_time]}
+
+
 def _build_daily_trial_config(
     backtest_cfg: Dict[str, Any],
     decoded: Dict[str, Any],
@@ -2792,15 +2818,33 @@ def _build_daily_trial_config(
     # static (pulled from the run-level override, unaffected by the genes) since only the day
     # selection is being optimized for now.
     base_run_sched = backtest_cfg.get("run_schedule_override")
-    if decoded.get("schedule_days"):
+    manage_schedule_override = backtest_cfg.get("manage_schedule_override")
+    gene_time = decoded.get("schedule_time")
+    gene_times = _schedule_times_from_gene(gene_time)
+    if decoded.get("schedule_days") or gene_time:
+        days = decoded.get("schedule_days") or (base_run_sched or {}).get("days")
+        if not days:
+            raise ValueError("a schedule:time gene needs the run's entry days (schedule:<day> "
+                             "genes or a run_schedule_override with days): refusing to guess")
         run_schedule_override = {
-            "days": decoded["schedule_days"],
-            # The run-level time when the run states one; else the shared default decision time
-            # (a new run only: stored rows reconstruct through schedule_genes with their own time).
-            "times": (base_run_sched or {}).get("times") or [DEFAULT_DECISION_TIME],
+            "days": days,
+            # THE DECISION-TIME GENE wins; else the run-level time when the run states one; else
+            # the shared default decision time (a new run only: stored rows reconstruct through
+            # schedule_genes with their own time).
+            "times": (gene_times["entry"] if gene_times
+                      else (base_run_sched or {}).get("times") or [DEFAULT_DECISION_TIME]),
         }
     else:
         run_schedule_override = base_run_sched
+    if gene_times:
+        # The open-positions MANAGE pass is retimed from the same gene (live deploys both
+        # schedules at the one stored time; see tools/import_deploy_payload.py). Days stay the
+        # run's own.
+        if not (manage_schedule_override or {}).get("days"):
+            raise ValueError("a schedule:time gene needs backtest.manage_schedule_override with "
+                             "days to retime: refusing to leave the manage pass on another time")
+        manage_schedule_override = {"days": dict(manage_schedule_override["days"]),
+                                    "times": gene_times["manage"]}
 
     return {
         "backtest_id": trial_id,
@@ -2823,7 +2867,7 @@ def _build_daily_trial_config(
         "subtype": backtest_cfg.get("subtype"),
         # Cadence (weekly entry) + intraday fill clock carry through to each trial's engine.
         "run_schedule_override": run_schedule_override,
-        "manage_schedule_override": backtest_cfg.get("manage_schedule_override"),
+        "manage_schedule_override": manage_schedule_override,
         "execution_interval": backtest_cfg.get("execution_interval", "1d"),
         # Per-trade profit cap (% of cost basis): the GA ranks on the ADJUSTED fitness so one
         # lucky, non-reproducible mega-winner can't win the search. None = no cap. Carried from

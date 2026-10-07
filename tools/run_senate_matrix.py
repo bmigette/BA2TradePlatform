@@ -40,7 +40,9 @@ import sys
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from matrix_flags import cap_passthrough, job_name_with_digest  # noqa: E402
+from matrix_flags import (  # noqa: E402
+    cap_passthrough, decision_times_plan, decision_times_tokens, job_name_with_digest,
+    with_decision_times_name)
 
 _UNIVERSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "senate_universe.txt")
 _EXPERT = "FMPSenateTraderWeight"
@@ -225,6 +227,11 @@ def main() -> int:
     ap.add_argument("--search-sl-loosen", action="store_true", default=False,
                     help="Forward --search-sl-loosen to every job. Folds into the job's name "
                          "digest.")
+    ap.add_argument("--decision-times", default=None, metavar="default|fixed|HH:MM,HH:MM,...",
+                    help="The DECISION TIME gene (schedule:time). DEFAULT (flag absent) = ON with "
+                         "the shared DEFAULT_DECISION_TIME_CHOICES on an intraday --interval, "
+                         "off on --interval 1d; 'fixed' = no gene; or a comma list. Adds "
+                         "'-timegene' to the job name and folds into the name digest.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -243,6 +250,8 @@ def main() -> int:
     if not os.path.exists(exe):
         exe = os.path.join(os.path.dirname(sys.executable), "ba2-test")
 
+    dt_times, dt_header = decision_times_plan(args.decision_times, args.interval)
+    print(dt_header, flush=True)
     jobs = list(_jobs(strategies, args.name_suffix))
     done = _completed_names()
     mc_tokens_preview = market_condition_passthrough(args)
@@ -289,8 +298,15 @@ def main() -> int:
         # position for a job with no new flags.
         mc_tokens = market_condition_passthrough(args)
         cmd += mc_tokens
+        # The decision-time gene (DEFAULT ON on an intraday --interval; see matrix_flags
+        # .decision_times_plan): '-timegene' in the base name, tokens last, digest on its own.
+        dt_tokens = decision_times_tokens(dt_times)
+        if dt_tokens:
+            name = with_decision_times_name(name, dt_times)
+            cmd[cmd.index("--name") + 1] = name
+        cmd += dt_tokens
         job_name = name
-        if mc_tokens:
+        if mc_tokens or dt_tokens:
             job_name = _job_name(name, cmd)
             cmd[cmd.index("--name") + 1] = job_name
         if args.dry_run:
