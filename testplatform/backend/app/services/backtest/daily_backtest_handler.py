@@ -1040,6 +1040,10 @@ def run_daily_backtest(
             from ba2_common.core.knowability import intraday_decisions
             with intraday_decisions(ps.is_intraday, scan_cutoff=ps.scan_cutoff_date):
                 engine.run()
+            # NO SILENT FAILURE at the result level: an expert whose analysis passes mostly raised
+            # (and were skipped per symbol / per bar) traded nothing for a reason that is not the
+            # strategy. Refuse the run (no result, no fitness; a GA trial reports "trial failed").
+            engine.refuse_if_analysis_failing()
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).
             results = build_results(account, config)
@@ -1070,6 +1074,7 @@ def run_daily_backtest(
             # ITS cadence, not the platform default. Done here because run_daily_backtest is the
             # single chokepoint every path goes through (trial worker, master top-N persist,
             # parallel=1), so both compute_fitness call sites get it without touching either.
+            results["analysis_failures"] = engine.analysis_failures_record()
             results.update(_car_trade_thresholds_for_experts(config))
             _record = _decision_time_record(engine, config)
             if _record is not None:

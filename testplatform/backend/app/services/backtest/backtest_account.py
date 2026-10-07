@@ -62,6 +62,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ba2_common.core.models import TradingOrder, Transaction
+from ba2_common.core.knowability import NoDecisionPrice
 from ba2_common.core.types import (
     OrderStatus,
     OrderType,
@@ -722,7 +723,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # decision price, not at the clock bar's close); see _equity_mark_price.
         self._mtm_memo_decision: Optional[tuple] = None
         # Counters of the intraday-clock rule (published in results["intraday_clock"]).
-        self.intraday_counters: Dict[str, int] = {"entries_refused_next_bar_other_session": 0}
+        # undecidable_price_reads: single-symbol price reads that found no knowable price (a basket
+        # member without a decision price is dropped; see MarketExpertInterface._decision_price).
+        self.intraday_counters: Dict[str, int] = {"entries_refused_next_bar_other_session": 0,
+                                                  "undecidable_price_reads": 0}
         # (generation, contract_group, group_bounds) memo for _option_group_bounds.
         self._group_bounds_memo: Optional[tuple] = None
         # contract_symbol -> the order carrying the contract's terms (first row with a strike,
@@ -3055,7 +3059,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 return {s: self._price.decision_price(s, now) for s in symbol_or_symbols}
             px = self._price.decision_price(symbol_or_symbols, now)
             if px is None:
-                raise ValueError(
+                self.intraday_counters["undecidable_price_reads"] += 1
+                raise NoDecisionPrice(
                     f"No backtest price for {symbol_or_symbols} at {now}: no bar has ended in the "
                     f"current or the last finished session")
             return px
@@ -3063,7 +3068,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return {s: self._price.close_at(s) for s in symbol_or_symbols}
         px = self._price.close_at(symbol_or_symbols)
         if px is None:
-            raise ValueError(
+            raise NoDecisionPrice(
                 f"No backtest price for {symbol_or_symbols} at {self._price.now()}"
             )
         return px

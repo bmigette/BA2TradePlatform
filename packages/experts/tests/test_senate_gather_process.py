@@ -2608,3 +2608,71 @@ def test_an_older_analysis_without_a_breakdown_shows_the_recommendation_reports(
     _root, texts, _tables = _render_basket_page(state)
 
     assert any("Jane Legacy" in t for t in texts), "the stored report must be shown"
+
+
+# ====================================================================
+# A basket member WITHOUT a decision price is excluded; the rest of the basket is analysed
+# (row 1645: one undecidable member used to abort the whole basket analysis, every day)
+# ====================================================================
+class _AcctWithUndecidable:
+    """Backtest-shaped account: raises the typed refusal for symbols with no knowable price."""
+
+    def __init__(self, prices):
+        self._prices = prices
+
+    def get_instrument_current_price(self, symbol):
+        from ba2_common.core.knowability import NoDecisionPrice
+        if self._prices.get(symbol) is None:
+            raise NoDecisionPrice(f"No backtest price for {symbol}")
+        return self._prices[symbol]
+
+
+def _two_symbol_trades():
+    senate = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+        _weight_trade("Alice", "Aa", "TDY", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "TDY", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history = {
+        "Alice Aa": [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-05-01", "2026-04-20")],
+        "Bob Bb": [_weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-05-02", "2026-04-21")],
+    }
+    return senate, history
+
+
+def test_weight_gather_all_excludes_a_member_without_a_decision_price():
+    senate, history = _two_symbol_trades()
+    prices = {"AAPL": 100.0, "TDY": None}
+    e = _weight_basket_expert(senate, [], history, prices, exec_price=50.0)
+    e._gather_settings = WEIGHT_SETTINGS
+    bundle = _bundle(prices)
+    e._decision_account_cache = (bundle, _AcctWithUndecidable(prices))
+    out = e._gather_all(bundle, as_of=NOW)
+    assert set(out) == {"AAPL"}                       # TDY dropped, AAPL analysed (was: the whole call raised)
+    assert out["AAPL"]["current_price"] == 100.0
+
+
+def test_copy_gather_excludes_a_member_without_a_decision_price():
+    senate = [_copy_trade("Nancy", "Pelosi", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+              _copy_trade("Nancy", "Pelosi", "TDY", "purchase", "2026-06-01", "2026-05-20")]
+    e = _copy_expert(senate, [])
+    prices = {"AAPL": 100.0, "TDY": None}
+    bundle = _bundle(prices)
+    e._decision_account_cache = (bundle, _AcctWithUndecidable(prices))
+    e.id = 1
+    out = e._gather(bundle, NOW)
+    assert out["supported_symbols"] == {"AAPL"}
+    assert out["current_price_map"]["TDY"] is None
+
+
+def test_live_basket_skips_a_member_whose_quote_is_none_loudly(caplog):
+    senate, history = _two_symbol_trades()
+    prices = {"AAPL": 100.0, "TDY": None}
+    e = _weight_basket_expert(senate, [], history, prices, exec_price=50.0)
+    e._gather_settings = WEIGHT_SETTINGS
+    with caplog.at_level(logging.WARNING, logger="test_senate"):
+        out = e._gather_all(_bundle(prices), as_of=None)
+    assert set(out) == {"AAPL"}
+    assert any("TDY" in r.getMessage() and "without a current price" in r.getMessage()
+               for r in caplog.records)

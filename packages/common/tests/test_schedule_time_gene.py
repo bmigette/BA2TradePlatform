@@ -98,3 +98,19 @@ def test_retime_moves_both_schedules_and_nothing_else():
         retime_schedules({**cfg, "manage_schedule_override": None}, "15:30")
     with pytest.raises(ValueError, match="last bar"):
         retime_schedules(cfg, "15:55")
+
+
+def test_retime_refuses_the_first_bar_unless_the_measurement_opt_in_is_given():
+    from ba2_common.core.schedule_genes import validate_decision_times
+    cfg = {"execution_interval": "5min",
+           "run_schedule_override": {"days": {"monday": True}, "times": ["10:00"]},
+           "manage_schedule_override": {"days": {"monday": True}, "times": ["10:00"]}}
+    with pytest.raises(ValueError, match="first bar"):
+        retime_schedules(cfg, "09:30")
+    out = retime_schedules(cfg, "09:30", allow_first_bar=True)
+    assert out["run_schedule_override"]["times"] == ["09:30"]
+    assert out["manage_schedule_override"]["times"] == ["09:30"]
+    with pytest.raises(ValueError, match="first bar"):       # the GA gene validation still refuses it
+        validate_decision_times(["09:30", "10:00"], "5min")
+    with pytest.raises(ValueError):                           # the opt-in never makes a daily clock valid
+        retime_schedules({**cfg, "execution_interval": "1d"}, "09:30", allow_first_bar=True)

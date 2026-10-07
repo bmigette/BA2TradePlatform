@@ -70,6 +70,10 @@ def main() -> int:
                          "this exchange-local time (days untouched), e.g. 15:30. Validated like a "
                          "--decision-times value (on the bar grid, after the first bar and before "
                          "the last). Still writes no row.")
+    ap.add_argument("--allow-first-bar", action="store_true",
+                    help="MEASUREMENT ONLY: let --decision-time 09:30 (the session's first bar) run, "
+                         "with the engine's first-bar warning, as a stored row without an override "
+                         "does. The GA gene validation still refuses 09:30.")
     ns = ap.parse_args()
     try:
         ns.window = parse_window(ns.window)
@@ -93,7 +97,7 @@ def main() -> int:
         stored_times = ((config.get("run_schedule_override") or {}).get("times"))
         if ns.decision_time:
             from ba2_common.core.schedule_genes import retime_schedules
-            config = retime_schedules(config, ns.decision_time)
+            config = retime_schedules(config, ns.decision_time, allow_first_bar=ns.allow_first_bar)
         name = bt.name
         pins = sorted(k for k in (bt.strategy_params or {}) if k.startswith("_"))
     finally:

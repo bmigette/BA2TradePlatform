@@ -190,12 +190,20 @@ def schedule_time_warnings(times: Sequence[str], time_basis: str = "market",
     return out
 
 
-def retime_schedules(config: Dict[str, Any], decision_time: str) -> Dict[str, Any]:
+def retime_schedules(config: Dict[str, Any], decision_time: str, *,
+                     allow_first_bar: bool = False) -> Dict[str, Any]:
     """``config`` with BOTH the entry and the manage schedule retimed to ``decision_time`` (days
     untouched). For tools that re-run a stored row at another time (the same two schedules the
     ``schedule:time`` gene drives). Validated against the config's own execution interval;
-    refuses a config that lacks either schedule's days. Returns a NEW dict (shallow copy)."""
-    validate_decision_times([decision_time], config["execution_interval"], min_values=1)
+    refuses a config that lacks either schedule's days. Returns a NEW dict (shallow copy).
+
+    ``allow_first_bar`` (MEASUREMENT tools only, never a gene or a deploy): lets the session's FIRST
+    bar (09:30) through, the time a stored row runs at without an override; the engine warns about it."""
+    if allow_first_bar and decision_time == _fmt(_SESSION_OPEN_MIN):
+        interval_minutes(config["execution_interval"])      # still refuses a daily clock
+        hhmm_to_minutes(decision_time)
+    else:
+        validate_decision_times([decision_time], config["execution_interval"], min_values=1)
     out = dict(config)
     for key in ("run_schedule_override", "manage_schedule_override"):
         sched = config.get(key)

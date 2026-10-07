@@ -130,6 +130,18 @@ def resolve_universe(as_of: datetime, config: Dict[str, Any], price_source) -> L
     return [s for s in universe if price_source.bar_at(s, as_of) is not None]
 
 
+#: A run in which MORE than this share of an expert's analysis passes raised (and were swallowed per
+#: symbol / per bar by the loops below) is REFUSED at the end of the run: its trades and fitness would
+#: measure a broken expert (a basket that fails every day trades nothing and looks like "no edge").
+MAX_FAILED_ANALYSIS_SHARE = 0.05
+#: ...judged only once an expert has made this many passes (a 2-pass fixture failing once is not a rate).
+MIN_ANALYSIS_PASSES_FOR_REFUSAL = 20
+
+
+class AnalysisFailureRefusal(RuntimeError):
+    """The run's analysis passes failed too often for its result to mean anything."""
+
+
 _FIRST_BAR_WARNED: set = set()   # schedule times already warned about in this process
 
 
@@ -486,6 +498,11 @@ class DailyBacktestEngine:
         # (the sessions on which a scheduled time had no bar at all, i.e. no decision that day, are
         # ``self.sessions_without_decision_bar``, published next to these.)
         self.intraday_counters: Dict[str, int] = {"undecidable_symbol_days": 0}
+        # Analysis passes per expert: {"passes": n, "failed": m, "first_error": str|None}. A pass is
+        # one ``analyze_as_of`` call (per symbol for a classic expert, per bar for a basket / bypass
+        # expert); "failed" = it raised and the loop swallowed it. Published in
+        # ``results["analysis_failures"]``; ``refuse_if_analysis_failing`` enforces the threshold.
+        self.analysis_failures: Dict[int, Dict[str, Any]] = {}
 
         # Entry-option path: when the run's enter_market action IS an option action (pure-option
         # entry, no equity leg), the option action must size + submit itself — so the entry runs
@@ -965,6 +982,43 @@ class DailyBacktestEngine:
                 if refusal:
                     raise ValueError(f"Backtest refused: expert {expert_id}'s {label} {refusal}")
 
+    def _analysis_pass(self, expert_id: int) -> None:
+        rec = self.__dict__.setdefault("analysis_failures", {}).setdefault(expert_id, {"passes": 0, "failed": 0, "first_error": None})
+        rec["passes"] += 1
+
+    def _analysis_failed(self, expert_id: int, what: str) -> None:
+        rec = self.analysis_failures[expert_id]
+        rec["failed"] += 1
+        if rec["first_error"] is None:
+            rec["first_error"] = what[:500]
+
+    def analysis_failures_record(self) -> Dict[str, Any]:
+        """The ``analysis_failures`` blob: totals plus the per-expert counts and first error."""
+        passes = sum(r["passes"] for r in self.analysis_failures.values())
+        failed = sum(r["failed"] for r in self.analysis_failures.values())
+        first = next((r["first_error"] for r in self.analysis_failures.values() if r["first_error"]), None)
+        return {"passes": passes, "failed": failed, "first_error": first,
+                "by_expert": {str(k): dict(v) for k, v in self.analysis_failures.items()}}
+
+    def refuse_if_analysis_failing(self) -> None:
+        """ONE summary WARNING when any pass failed; RAISE when an expert's failed share exceeds
+        ``MAX_FAILED_ANALYSIS_SHARE`` (judged from ``MIN_ANALYSIS_PASSES_FOR_REFUSAL`` passes on).
+        An expert that analyses fine and emits no BUY has ZERO failed passes: not a failure."""
+        rec = self.analysis_failures_record()
+        if not rec["failed"]:
+            return
+        logger.warning(
+            f"[daily_engine] ANALYSIS FAILURES: {rec['failed']} of {rec['passes']} analysis passes "
+            f"raised and were skipped; first: {rec['first_error']}")
+        for expert_id, r in self.analysis_failures.items():
+            if (r["passes"] >= MIN_ANALYSIS_PASSES_FOR_REFUSAL
+                    and r["failed"] / r["passes"] > MAX_FAILED_ANALYSIS_SHARE):
+                raise AnalysisFailureRefusal(
+                    f"Backtest refused: expert {expert_id}: {r['failed']} of {r['passes']} analysis "
+                    f"passes failed ({r['failed'] / r['passes']:.0%} > {MAX_FAILED_ANALYSIS_SHARE:.0%}); "
+                    f"the result would measure a broken expert, not the strategy. First error: "
+                    f"{r['first_error']}")
+
     def _assert_daily_reads_are_clamped(self) -> None:
         """An intraday run's OHLCV reader MUST be bound to THIS run's price source, otherwise every
         daily read the experts make returns the decision session's own finished bar (the +404%
@@ -1141,6 +1195,7 @@ class DailyBacktestEngine:
                 account=self.account,
                 subtype=self.config.get("subtype"),
             )
+            self._analysis_pass(expert_id)
             try:
                 rec = expert.analyze_as_of(as_of, ctx)
             except Exception as e:  # noqa: BLE001 — one symbol must not abort the bar
@@ -1153,6 +1208,7 @@ class DailyBacktestEngine:
                                   MacroAvailabilityUnknown)):
                     raise
                 self._log(f"analyze_as_of failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
+                self._analysis_failed(expert_id, f"{symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
 
             if self._stage_recommendation_candidate(
@@ -1365,6 +1421,7 @@ class DailyBacktestEngine:
             account=self.account,
             subtype=self.config.get("subtype"),
         )
+        self._analysis_pass(expert_id)
         try:
             recs = expert.analyze_as_of(as_of, ctx)
         except Exception as e:  # noqa: BLE001 — the whole bar aborts (no per-symbol granularity
@@ -1376,6 +1433,7 @@ class DailyBacktestEngine:
                                   MacroAvailabilityUnknown)):
                 raise
             self._log(f"basket analyze_as_of failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
+            self._analysis_failed(expert_id, f"basket @ {as_of:%Y-%m-%d}: {e}")
             return False
 
         # TYPE GUARD: a basket expert's analyze_as_of MUST return List[Recommendation] (one per
@@ -1498,6 +1556,7 @@ class DailyBacktestEngine:
                 # run once a trial opened its first position).
                 extra={"symbol": symbol},
             )
+            self._analysis_pass(expert_id)
             try:
                 rec = expert.analyze_as_of(as_of, ctx)
             except Exception as e:  # noqa: BLE001 — one symbol must not abort the bar
@@ -1513,6 +1572,7 @@ class DailyBacktestEngine:
                                   MacroAvailabilityUnknown)):
                     raise
                 self._log(f"open-pos analyze failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
+                self._analysis_failed(expert_id, f"open-pos {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
             rec_id = _recommendation_to_expert_recommendation(
                 rec, expert_instance_id=expert_id, symbol=symbol, as_of=as_of, allow_hold=True,
@@ -1696,6 +1756,7 @@ class DailyBacktestEngine:
             account=self.account,
             subtype=self.config.get("subtype"),
         )
+        self._analysis_pass(expert_id)
         try:
             rec = expert.analyze_as_of(as_of, ctx)
         except Exception as e:  # noqa: BLE001 — one bar must not abort the run
@@ -1706,6 +1767,7 @@ class DailyBacktestEngine:
                                   MacroAvailabilityUnknown)):
                 raise
             self._log(f"bypass analyze_as_of failed @ {as_of:%Y-%m-%d}: {e}")
+            self._analysis_failed(expert_id, f"bypass @ {as_of:%Y-%m-%d}: {e}")
             return
 
         if getattr(rec, "skip", False):

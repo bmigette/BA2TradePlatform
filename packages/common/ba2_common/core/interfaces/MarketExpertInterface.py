@@ -1210,7 +1210,16 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             return self._get_current_price(symbol)
         account = self._decision_account(providers)
         if account is not None:
-            return account.get_instrument_current_price(symbol)
+            # A symbol with no knowable price at this tick is NOT decidable: None, the same value a
+            # live account quote that could not be read gives (``_get_current_price`` -> None), so every
+            # caller's "no price -> skip this symbol" rule applies identically live and in a backtest.
+            # (The account counts it: ``undecidable_price_reads``.) Raising here would abort a whole
+            # BASKET analysis for one thin member.
+            from ba2_common.core.knowability import NoDecisionPrice
+            try:
+                return account.get_instrument_current_price(symbol)
+            except NoDecisionPrice:
+                return None
         # No account behind this bundle: ONLY the historical-replay tool (a recorded decision
         # re-run against the cache, no live account exists). Everything that trades has an account.
         return providers.price_at_date(symbol, as_of)

@@ -240,6 +240,14 @@ class StaleAnchorPrice(RuntimeError):
     """An order level / size was about to be built from a price that is not the decision price."""
 
 
+class NoDecisionPrice(ValueError):
+    """No price is knowable for ONE symbol at the decision instant (no bar has ended in the current or
+    the last finished session, or the symbol has no bars at all). A ValueError, so every existing
+    single-symbol caller still sees a refusal; ``MarketExpertInterface._decision_price`` turns it into
+    ``None`` -- "this symbol is not decidable at this tick" -- exactly like a live account quote that
+    is None, so a basket expert drops THAT member instead of losing the whole basket."""
+
+
 class DecisionPrice(float):
     """A float that remembers WHICH intraday bar it is the close of and the decision instant it was
     read for (``as_of``).  The bar stamp is kept as int64 nanoseconds (wall time labelled UTC, as the
