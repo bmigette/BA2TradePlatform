@@ -79,6 +79,15 @@ class BacktestMarketConditionReader(WindowMarketConditionReader):
         self._ps = price_source
 
     def _bars(self, symbol: str, session: date):
+        # DAILY bar stores only: ``window_before`` raises ValueError on an intraday store. A
+        # 5-minute run therefore needs a PINNED MANIFEST (the mapped reader serves every row and
+        # this method is never reached); without one the run is refused here, loudly. The pin must
+        # reach one session BEFORE the run's start (``window_coverage_problems(intraday=True)``).
+        if getattr(self._ps, "is_intraday", False):
+            raise ValueError(
+                f"market-condition features cannot be computed from an intraday bar store ({self._ps.interval!r}); "
+                f"an intraday-clock run must pin a market-condition manifest (mapped reader) that "
+                f"covers the sessions from one before its start_date")
         bars = self._ps.window_before(symbol, session, WINDOW)
         if bars is not None:
             return bars
@@ -406,8 +415,16 @@ def _structure_groups(trades: Any) -> Any:
 
 
 def attach_entry_states(trades: Any, entry_states: Any,
-                        max_gap_days: int = ENTRY_STATE_MAX_GAP_DAYS) -> Dict[str, int]:
+                        max_gap_days: int = ENTRY_STATE_MAX_GAP_DAYS,
+                        intraday: bool = False) -> Dict[str, int]:
     """Attach ``entry_state`` to the structures an entry-state record covers.
+
+    ``intraday``: on an INTRADAY clock a decision on bar D reads the row of the last FINISHED
+    session P(D), so a record's ``prior_session`` is P(D) and a same-day fill is ``gap_days >= 1``
+    from it BY DESIGN. There ``same_session`` counts the normal case, "bound to the last finished
+    session before the entry" (no regular session lies between the record's data session and the
+    entry date), and ``with_gap`` only the genuinely older bindings. ``gap_days`` itself and every
+    attached value are unchanged; only the counters' meaning is adjusted.
 
     Returns ``{"attached", "same_session", "with_gap", "ambiguous"}`` -- how many STRUCTURES
     were bound, and how certain each binding was. The counts are of structures throughout:
@@ -485,7 +502,12 @@ def attach_entry_states(trades: Any, entry_states: Any,
             out["ambiguous"] += 1
         head["entry_state"] = state
         out["attached"] += 1
-        out["same_session" if gap == 0 else "with_gap"] += 1
+        if intraday:
+            from ba2_common.core.market_calendar import prior_regular_session
+            normal = prior_regular_session(_date.fromisoformat(entry)).isoformat() == chosen["prior_session"]
+        else:
+            normal = gap == 0
+        out["same_session" if normal else "with_gap"] += 1
     return out
 
 
@@ -499,7 +521,10 @@ def apply_market_condition_block(results: Dict[str, Any], record: Any) -> Dict[s
     """
     if record is None:
         return results
-    record.binding = attach_entry_states(results.get("trades"), record.entry_states())
+    from app.services.backtest.price_source import _is_intraday
+    record.binding = attach_entry_states(
+        results.get("trades"), record.entry_states(),
+        intraday=_is_intraday(results.get("execution_interval") or "1d"))
     block = record.as_dict()
     block["stats"]["structures_with_entry_state"] = record.binding.get("attached", 0)
     results["market_condition"] = block

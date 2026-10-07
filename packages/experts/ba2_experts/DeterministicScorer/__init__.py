@@ -453,11 +453,26 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         current_price = data_bundle.get("current_price")
         min_hist = int(settings.get("min_history_days", 260))
 
-        if df is None or len(df) < min_hist or current_price is None:
+        if current_price is None:
+            # No decision price (live: the account returned no quote; backtest: no bar has ended).
+            # NOT a history problem and never a number to invent: refuse, say why, carry no price.
+            # Nothing downstream reads ``current_price`` of a skipped recommendation (the live
+            # run_analysis and the engine both return on ``skip`` before using it).
+            account_id = getattr(getattr(self, "instance", None), "account_id", None)
+            self.logger.error(
+                f"DeterministicScorer {symbol}: no current price from the decision-price seam "
+                f"(expert instance {getattr(self, 'id', None)}, account {account_id}, "
+                f"as_of={as_of}); skipping the analysis")
+            return Recommendation(
+                signal=OrderRecommendation.HOLD, confidence=0.0, current_price=None,
+                details=f"No current price available for {symbol} (account quote / decision price "
+                        f"missing); not analysed",
+                expected_profit_percent=0.0, skip=True, skip_reason="no_price")
+        if df is None or len(df) < min_hist:
             n = 0 if df is None else len(df)
             return Recommendation(
                 signal=OrderRecommendation.HOLD, confidence=0.0,
-                current_price=current_price or 0.0,
+                current_price=current_price,
                 details=f"Insufficient OHLCV history ({n} < {min_hist})",
                 expected_profit_percent=0.0, skip=True,
                 skip_reason="insufficient_history")

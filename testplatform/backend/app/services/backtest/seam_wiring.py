@@ -560,7 +560,11 @@ def check_market_condition_window(config: Dict[str, Any], reader: Any) -> List[s
             f"coverage was checked; the sessions were not.")
         return []
     universe = market_condition_universe(config)
-    problems = window_coverage_problems(mapped, universe, start, end)
+    from app.services.backtest.price_source import _is_intraday
+    # An intraday run reads the row of the last FINISHED session: the snapshot must reach back one
+    # session before ``start`` (see window_coverage_problems).
+    intraday = _is_intraday(config.get("execution_interval") or "1d")
+    problems = window_coverage_problems(mapped, universe, start, end, intraday=intraday)
     if not problems:
         return []
     message = (
