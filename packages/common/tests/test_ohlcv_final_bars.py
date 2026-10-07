@@ -194,3 +194,60 @@ def test_a_write_inside_the_bars_own_session_proves_a_snapshot():
     assert not fb.written_before_final("AAPL", day, ny("2026-10-06 20:00"))      # settled
     assert not fb.written_before_final("AAPL", day, ny("2026-10-06 09:00"))      # before the open: proves nothing
     assert not fb.written_before_final("AAPL", day, ny("2026-10-03 12:00"))      # backdated / inconsistent
+
+
+# --------------------------------------------------------------------------- live helpers
+def test_forming_session_day_is_the_open_to_settlement_window():
+    assert fb.forming_session_day("AAPL", ny("2026-10-06 09:29")) is None                   # before the open
+    assert fb.forming_session_day("AAPL", ny("2026-10-06 09:30")) == date(2026, 10, 6)
+    assert fb.forming_session_day("AAPL", ny("2026-10-06 19:59")) == date(2026, 10, 6)      # still settling
+    assert fb.forming_session_day("AAPL", ny("2026-10-06 20:00")) is None
+    assert fb.forming_session_day("AAPL", ny("2026-10-10 12:00")) is None                   # Saturday
+    assert fb.forming_session_day("AAPL", ny("2026-11-26 12:00")) is None                   # Thanksgiving
+    assert fb.forming_session_day("AAPL", ny("2026-11-27 16:59")) == date(2026, 11, 27)     # half day: settles at 17:00
+    assert fb.forming_session_day("AAPL", ny("2026-11-27 17:00")) is None
+    assert fb.forming_session_day("0700.HK", ny("2026-10-06 10:00")) is None                # no NYSE calendar: never guessed
+
+
+def test_last_final_session_day():
+    assert fb.last_final_session_day("AAPL", ny("2026-10-07 09:31")) == date(2026, 10, 6)
+    assert fb.last_final_session_day("AAPL", ny("2026-10-06 19:59")) == date(2026, 10, 5)
+    assert fb.last_final_session_day("AAPL", ny("2026-10-10 12:00")) == date(2026, 10, 9)
+    assert fb.last_final_session_day("0700.HK", ny("2026-10-07 09:31")) is None
+
+
+def test_last_bar_is_today_and_the_status_attribute():
+    f = daily("2026-10-05", "2026-10-06")
+    assert fb.last_bar_is_today(f, "AAPL", ny("2026-10-06 10:00")) is True
+    assert fb.last_bar_is_today(f, "AAPL", ny("2026-10-07 10:00")) is False
+    assert fb.last_bar_is_today(f.iloc[0:0], "AAPL", ny("2026-10-06 10:00")) is False
+    assert fb.forming_bar_status(f) is None
+    f.attrs[fb.FORMING_STATUS_ATTR] = "missing"
+    assert fb.forming_bar_status(f) == "missing"
+
+
+def test_the_live_overlay_switch_defaults_on_and_round_trips():
+    assert fb.live_overlay_enabled() is True
+    fb.set_live_overlay_enabled(False)
+    try:
+        assert fb.live_overlay_enabled() is False
+    finally:
+        fb.set_live_overlay_enabled(True)
+
+
+def test_final_mask_of_a_long_intraday_frame_only_judges_the_tail():
+    idx = pd.date_range("2018-10-01 09:30", periods=150_000, freq="5min")
+    big = pd.DataFrame({"Date": idx, "Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0, "Volume": 1})
+    now = ny("2118-01-01 12:00")                                     # far after every bar: all final
+    assert fb.final_mask(big, "SPY", "5min", now).all()
+    tail_now = pd.Timestamp(idx[-1] + pd.Timedelta(minutes=1)).tz_localize(NY).to_pydatetime().astimezone(timezone.utc)
+    m = fb.final_mask(big, "SPY", "5min", tail_now)
+    assert m.iloc[:-1].all() and not m.iloc[-1]                      # only the last bar is still forming
+
+
+def test_settle_after_close_is_one_documented_constant():
+    import inspect
+    src = inspect.getsource(fb)
+    assert fb.SETTLE_AFTER_CLOSE == timedelta(hours=4)
+    import re
+    assert len(re.findall(r"^SETTLE_AFTER_CLOSE = ", src, re.M)) == 1 and "Measured on FMP" in src

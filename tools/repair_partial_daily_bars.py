@@ -26,6 +26,9 @@ mtime is on/after ``--modified-since``. ``--select`` is REQUIRED:
                     file's mtime proves was written inside its own trading session);
     all-after-cutoff truncate every candidate that holds any bar dated > cutoff (the runbook's choice:
                     simple, and the guarded top-up re-appends final bars; costs one re-fetch per file).
+``--guarded-since <ISO UTC>`` is REQUIRED with ``all-after-cutoff``: files last written after the moment the
+prevention became the only writer, with every bar after the cutoff final per the calendar and nothing
+flagged, are left alone, so a re-run never re-truncates what was already repaired and re-extended.
 ``--cutoff`` is REQUIRED (no default): it must be a session before the first live top-up that wrote into
 the cache. Measured on the dev cache (m6/m7 of the 2026-10-07 refresh): earliest flagged partial bar
 2026-09-14, no file has an mtime between 2026-09-01 and 2026-09-13, flagged-bar rate on 08-10..09-11 =
@@ -101,7 +104,7 @@ def check_backup_location(backup_dir: str, cache_dir: str) -> None:
 
 
 def read_symbols(path: str) -> List[str]:
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         return sorted({tok.upper() for line in f for tok in line.split() if tok and not tok.startswith("#")})
 
 
@@ -169,6 +172,10 @@ def analyse_file(path: str, symbol: str, cutoff: dt.date) -> Dict:
         if med.iloc[i] == med.iloc[i] and med.iloc[i] >= LIQUID_MEDIAN_VOLUME and ratio.iloc[i] < LOW_VOLUME_RATIO:
             out["flagged"].append({"bar": days.iloc[i].date().isoformat(), "reason": "volume_below_5pct_of_prior_20_median",
                                    "volume": float(vol.iloc[i]), "median_volume": float(med.iloc[i])})
+    # a bar after the cutoff whose session is not final per the calendar right now
+    not_final = (~ohlcv_final_bars.final_mask(pd.DataFrame({"Date": df["Date"]}), symbol, "1d")).to_numpy() & after.to_numpy()
+    for i in np.where(not_final)[0]:
+        out["flagged"].append({"bar": days.iloc[i].date().isoformat(), "reason": "session_not_final_per_calendar"})
     newest = days.iloc[-1].date()
     written = dt.datetime.fromtimestamp(os.path.getmtime(path), dt.timezone.utc)
     if newest > cutoff and ohlcv_final_bars.written_before_final(symbol, newest, written):
@@ -280,6 +287,17 @@ def run(args: argparse.Namespace) -> int:
                                 f"files meanwhile (see --help)")
         guarded_writer_self_test()
 
+    guarded_since = None
+    if args.guarded_since:
+        guarded_since = dt.datetime.fromisoformat(args.guarded_since)
+        if guarded_since.tzinfo is None:
+            guarded_since = guarded_since.replace(tzinfo=dt.timezone.utc)
+    if args.select == "all-after-cutoff" and guarded_since is None:
+        raise RepairRefused("--select all-after-cutoff needs --guarded-since <ISO UTC time>: the moment the "
+                            "prevention code became the only writer. Files last written after it, with every "
+                            "bar after the cutoff final and nothing flagged, are left alone (re-running over "
+                            "files this tool already repaired and the guarded top-up re-extended would "
+                            "truncate and re-fetch them again). Use a time in the future to disable.")
     universe = set(read_symbols(args.store_universe)) if args.store_universe else None
     symbols = read_symbols(args.symbols_file) if args.symbols_file else None
     candidates, missing = select_candidates(cache_dir, symbols, since)
@@ -292,6 +310,12 @@ def run(args: argparse.Namespace) -> int:
         wanted = info["rows_after_cutoff"] > 0 and (args.select == "all-after-cutoff" or bool(info["flagged"]))
         if wanted and args.restrict_to_universe and universe is not None and symbol not in universe:
             info["action"], wanted = "skipped:not_in_store_universe", False
+        elif (wanted and args.select == "all-after-cutoff" and not info["flagged"]
+                and dt.datetime.fromisoformat(info["mtime_utc"]) >= guarded_since):
+            # every bar after the cutoff is final per the calendar, nothing is flagged, and the file was
+            # last written by code that cannot persist an unfinished bar: re-truncating it (and
+            # re-fetching it) would only repeat work already done
+            info["action"], wanted = "unchanged:final_and_written_by_guarded_code", False
         elif not info["rows_after_cutoff"]:
             info["action"] = "unchanged:no_bars_after_cutoff"
         elif not wanted:
@@ -413,6 +437,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--cache-dir", required=True, help="the provider folder holding <SYM>_1d.parquet (e.g. <cache>\\FMPOHLCVProvider)")
     ap.add_argument("--cutoff", required=True, help="YYYY-MM-DD: keep bars dated <= this (REQUIRED, no default)")
     ap.add_argument("--backup-dir", required=True, help="folder OUTSIDE the cache for the verified backup")
+    ap.add_argument("--guarded-since", help="ISO UTC time the guarded writer became the only writer "
+                    "(REQUIRED with --select all-after-cutoff; see --help)")
     ap.add_argument("--select", required=True, choices=("flagged", "all-after-cutoff"))
     ap.add_argument("--symbols-file", help="one symbol per line")
     ap.add_argument("--modified-since", help="YYYY-MM-DD: every daily file modified on/after (UTC date)")

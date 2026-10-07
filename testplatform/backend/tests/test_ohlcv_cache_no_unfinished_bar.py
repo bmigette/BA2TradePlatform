@@ -150,3 +150,35 @@ def test_fetch_cache_5min_during_the_session_does_not_persist_the_forming_bar():
     prov.extend_ohlcv_cache("XM5", datetime(2026, 10, 1), datetime(2026, 10, 6, 23, 59), "5min")
 
     assert _last(path) == pd.Timestamp("2026-10-05 15:55")         # the 09:30 bar ends at 09:35 > 09:31
+
+
+# --------------------------------------------------------------------------- backtest processes
+def test_building_a_backtest_provider_turns_the_live_overlay_off_and_hermetic_reads_never_touch_the_inner_provider(tmp_path):
+    """Reviewer's question: can a BACKTEST process ever see an overlaid forming bar? DeterministicScorer's
+    read is ``get_ohlcv_data(end_date=replay_now(None))`` (= LATEST on the inner provider), so:
+    (1) the hermetic reader (``cached_only=True``) never calls the inner ``get_ohlcv_data`` at all -- it
+    reads the parquet; (2) constructing ANY MemoizedOHLCVProvider switches the process's live overlay and
+    live forming-bar fetch off, so even a non-hermetic wrapper's LATEST read gets the pre-fix behaviour."""
+    from app.services.backtest.price_source import MemoizedOHLCVProvider
+
+    fb.set_live_overlay_enabled(True)
+    path = _seed("XBT", truth(PREV))
+    inner = FakeFMP(forming_today())
+
+    def _trip(self, *a, **k):
+        raise AssertionError("a hermetic backtest read reached the inner provider")
+    # the cache is keyed on the inner provider's CLASS name: keep it "FakeFMP"
+    Tripwire = type("FakeFMP", (FakeFMP,), {"get_ohlcv_data": _trip})
+    hermetic = MemoizedOHLCVProvider(Tripwire(forming_today()), datetime(2026, 1, 1), datetime(2026, 10, 6), "1d",
+                                     cached_only=True)
+    assert fb.live_overlay_enabled() is False                      # constructing it flipped the process switch
+    df, _dates = hermetic._load("XBT", "1d")
+    assert df["Date"].max() == pd.Timestamp(PREV)                  # the parquet only: no forming bar
+
+    # non-hermetic wrapper: a LATEST inner read neither overlays nor force-fetches the forming bar
+    MarketDataProviderInterface._UNFINISHED_MEMO.clear()
+    inner._remember_unfinished_bars(forming_today(), "XBT", "1d", "FakeFMP")
+    latest = inner.get_ohlcv_data("XBT", lookback_days=40, interval="1d")
+    assert pd.Timestamp(latest["Date"].max()).tz_localize(None) == pd.Timestamp(PREV)
+    assert path == native_cache.find_timeseries_path("FakeFMP", "XBT", "1d")
+    fb.set_live_overlay_enabled(True)

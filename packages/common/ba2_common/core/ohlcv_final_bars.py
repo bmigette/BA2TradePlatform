@@ -55,9 +55,23 @@ __all__ = [
     "drop_unfinished_bars",
     "uses_nyse_calendar",
     "now_utc",
+    "interval_length",
+    "is_daily_interval",
+    "forming_session_day",
+    "last_final_session_day",
+    "live_overlay_enabled",
+    "set_live_overlay_enabled",
+    "forming_bar_status",
+    "last_bar_is_today",
+    "FORMING_STATUS_ATTR",
 ]
 
-#: A session's bar stays unfinished this long after the regular close (see the module docstring).
+#: THE settlement constant: a session's bar stays unfinished this long after the regular close.
+#: Measured on FMP (2026-10-07, 10 files written 16:45 ET on 2026-09-25, i.e. 45 min after the close,
+#: against today's vendor bar): 9/10 equal in OHLC, volume still up to 5% short, one high/low 0.01 off,
+#: so 45 minutes is NOT settled. Nothing between 17:00 and 20:00 ET was observed; 4 h is the 20:00 ET
+#: convention of ``ohlcv_provisional.SETTLED_AFTER_HOUR_ET``. Every other 4-hour literal in this
+#: module is an interval length, not this constant. Changing it changes which bars may be written.
 SETTLE_AFTER_CLOSE = timedelta(hours=4)
 
 #: The most-behind UTC offset on Earth (UTC-12): local midnight of ``D + 1`` is 12:00 UTC.
@@ -72,6 +86,29 @@ _INTRADAY_LENGTH = {
 #: A row whose label is this much older than now is final under every rule (bound: 12 h offset +
 #: 4 h settle + 1 day): the per-row work is limited to the frame's tail.
 _TAIL_WINDOW = timedelta(days=4)
+
+
+#: A weekly / monthly bar can be unfinished for up to a month: its tail window is wider.
+_PERIOD_TAIL_WINDOW = timedelta(days=45)
+
+#: ``DataFrame.attrs`` key set by ``get_ohlcv_data`` on a LATEST daily frame: ``"present"`` (the last
+#: row is today's forming bar), ``"missing"`` (a session is open / settling and no forming bar could
+#: be obtained: the last row is an OLDER session, see :func:`last_bar_is_today`) or ``"not_expected"``.
+FORMING_STATUS_ATTR = "ohlcv_forming_bar"
+
+_LIVE_OVERLAY_ENABLED = True
+
+
+def live_overlay_enabled() -> bool:
+    """Whether this process serves forming bars to LATEST reads (live). A backtest process turns it off."""
+    return _LIVE_OVERLAY_ENABLED
+
+
+def set_live_overlay_enabled(enabled: bool) -> None:
+    """Process-wide switch. ``MemoizedOHLCVProvider`` (every backtest's provider) sets it False: a backtest
+    process never overlays or fetches a forming bar, whatever ``end_date`` its reads carry."""
+    global _LIVE_OVERLAY_ENABLED
+    _LIVE_OVERLAY_ENABLED = bool(enabled)
 
 
 class UnknownIntervalError(ValueError):
@@ -195,7 +232,8 @@ def _intraday_mask(df: pd.DataFrame, symbol: str, interval: str, now: datetime) 
 
 def final_mask(df: pd.DataFrame, symbol: str, interval: str, now: Optional[datetime] = None) -> pd.Series:
     """True per row where the bar is final at ``now``. Raises :class:`UnknownIntervalError` for an
-    interval without a rule."""
+    interval without a rule. Only the frame's TAIL is judged: every older row is final under every
+    rule, so a 150,000-row 5-minute frame costs one datetime conversion and one comparison."""
     from ba2_common.core.native_cache import normalize_interval
     if "Date" not in df.columns:
         raise ValueError("an OHLCV frame needs a Date column to be judged for finality")
@@ -203,15 +241,92 @@ def final_mask(df: pd.DataFrame, symbol: str, interval: str, now: Optional[datet
     canon = normalize_interval(interval)
     if df.empty:
         return pd.Series([], dtype=bool, index=df.index)
+    if canon not in _INTRADAY_LENGTH and canon not in ("1d", "1wk", "1mo"):
+        raise UnknownIntervalError(
+            f"no finality rule for interval {interval!r} (known: 1d, {sorted(_INTRADAY_LENGTH)}, 1wk, 1mo); "
+            f"refusing to persist bars whose completeness cannot be judged")
+    dates = pd.to_datetime(df["Date"])
+    naive = dates.dt.tz_convert("UTC").dt.tz_localize(None) if getattr(dates.dt, "tz", None) is not None else dates
+    span = _PERIOD_TAIL_WINDOW if canon in ("1wk", "1mo") else _TAIL_WINDOW
+    tail = (naive >= pd.Timestamp(now.astimezone(timezone.utc).replace(tzinfo=None) - span)).to_numpy()
+    out = pd.Series(True, index=df.index)
+    if not tail.any():
+        return out
+    sub = df[tail]
     if canon == "1d":
-        return _daily_mask(df, symbol, now)
-    if canon in _INTRADAY_LENGTH:
-        return _intraday_mask(df, symbol, canon, now)
-    if canon in ("1wk", "1mo"):
-        return _period_mask(df, canon, now)
-    raise UnknownIntervalError(
-        f"no finality rule for interval {interval!r} (known: 1d, {sorted(_INTRADAY_LENGTH)}, 1wk, 1mo); "
-        f"refusing to persist bars whose completeness cannot be judged")
+        m = _daily_mask(sub, symbol, now)
+    elif canon in _INTRADAY_LENGTH:
+        m = _intraday_mask(sub, symbol, canon, now)
+    else:
+        m = _period_mask(sub, canon, now)
+    out[tail] = m.to_numpy()
+    return out
+
+
+def is_daily_interval(interval: str) -> bool:
+    from ba2_common.core.native_cache import normalize_interval
+    return normalize_interval(interval) == "1d"
+
+
+def interval_length(interval: str) -> Optional[timedelta]:
+    """Length of an INTRADAY interval (any spelling), ``None`` for daily-or-longer / unknown."""
+    from ba2_common.core.native_cache import normalize_interval
+    return _INTRADAY_LENGTH.get(normalize_interval(interval))
+
+
+def forming_session_day(symbol: str, now: Optional[datetime] = None) -> Optional[date]:
+    """The NYSE session date whose daily bar is FORMING at ``now`` -- the session is open or still
+    settling (``open <= now < final``) -- else ``None`` (before the open, after the settlement, a
+    weekend / holiday, or a symbol that does not use the NYSE calendar)."""
+    now = now or now_utc()
+    if not uses_nyse_calendar(symbol):
+        return None
+    day = now.astimezone(NY_TZ).date()
+    try:
+        sessions = nyse_regular_sessions(day, day)
+    except MarketCalendarUnavailable:
+        return None
+    if not sessions:
+        return None
+    opens = sessions[0][0]
+    return day if opens <= now < session_final_at(symbol, day) else None
+
+
+def last_final_session_day(symbol: str, now: Optional[datetime] = None) -> Optional[date]:
+    """The newest NYSE session whose bar is FINAL at ``now`` (``None`` for a non-NYSE symbol)."""
+    now = now or now_utc()
+    if not uses_nyse_calendar(symbol):
+        return None
+    day = now.astimezone(NY_TZ).date() + timedelta(days=1)
+    for _ in range(15):
+        day -= timedelta(days=1)
+        try:
+            ok = is_regular_session(day)
+        except MarketCalendarUnavailable:
+            return None
+        if ok and now >= session_final_at(symbol, day):
+            return day
+    return None
+
+
+def forming_bar_status(frame) -> Optional[str]:
+    """The status ``get_ohlcv_data`` stamped on a LATEST daily frame (see ``FORMING_STATUS_ATTR``),
+    ``None`` when the frame did not come from there."""
+    return getattr(frame, "attrs", {}).get(FORMING_STATUS_ATTR)
+
+
+def last_bar_is_today(frame, symbol: str = "", now: Optional[datetime] = None) -> bool:
+    """For a live caller that prices off the frame's last close: True when the last row is the bar of
+    the CURRENT New York date (the forming bar was obtained). False when it is an older session, which
+    during an open session means the forming bar could not be fetched (``get_ohlcv_data`` has already
+    logged an ERROR). Judges the frame itself, not an attribute."""
+    if frame is None or len(frame) == 0:
+        return False
+    last = pd.Timestamp(pd.to_datetime(frame["Date"]).max())
+    if last.tzinfo is not None:
+        last = last.tz_convert("UTC").tz_localize(None)
+    now = now or now_utc()
+    return last.date() == now.astimezone(NY_TZ).date()
 
 
 def split_unfinished(df: pd.DataFrame, symbol: str, interval: str,

@@ -122,7 +122,7 @@ def check(cache_dir: str, symbols: List[str], last_session: dt.date, exceptions:
 def parse_exceptions(items: List[str], path: Optional[str]) -> Dict[str, str]:
     out = dict()
     if path:
-        for line in open(path, "r", encoding="utf-8"):
+        for line in open(path, "r", encoding="utf-8-sig"):
             line = line.strip()
             if line and not line.startswith("#"):
                 sym, _, why = line.partition(",") if "," in line else line.partition(":")
@@ -155,7 +155,7 @@ def main(argv=None) -> int:
         exceptions.update(parse_exceptions(args.exceptions, args.exceptions_file))
         now = dt.datetime.fromisoformat(args.now).replace(tzinfo=dt.timezone.utc) if args.now else None
         session = dt.date.fromisoformat(args.last_session) if args.last_session else last_final_session(now)
-        symbols = sorted({t.upper() for line in open(args.symbols_file, encoding="utf-8") for t in line.split()})
+        symbols = sorted({t.upper() for line in open(args.symbols_file, encoding="utf-8-sig") for t in line.split()})
         truncated = None
         if args.repair_report:
             rep = json.load(open(args.repair_report, encoding="utf-8"))

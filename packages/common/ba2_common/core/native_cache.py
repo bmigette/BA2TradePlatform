@@ -259,13 +259,14 @@ def read_timeseries(provider: str, symbol: str, interval: str,
     return df
 
 
-def write_timeseries(provider: str, symbol: str, interval: str, df) -> None:
+def write_timeseries(provider: str, symbol: str, interval: str, df) -> bool:
     """Atomic temp+rename parquet write. df MUST carry an effective_date column
     (for OHLCV effective_date == bar Date).
 
     NEVER persists an unfinished bar (a daily bar before its session's close + settlement, an
     intraday bar before its interval ended; ``ba2_common.core.ohlcv_final_bars``): such rows are
-    dropped here, and a write that would leave nothing writes nothing.
+    dropped here, and a write that would leave nothing writes nothing: it returns ``False`` (after an
+    INFO line naming the dropped bars) instead of creating an empty file; ``True`` when written.
 
     The target is the file that ALREADY EXISTS under any alias spelling, and only
     falls back to the canonical write path when there is none. Building the path from
@@ -285,13 +286,14 @@ def write_timeseries(provider: str, symbol: str, interval: str, df) -> None:
         logger.info(f"{provider} {symbol} ({interval}): not persisting {len(dropped)} unfinished "
                     f"bar(s) {dropped} (final {ohlcv_final_bars.SETTLE_AFTER_CLOSE} after the close)")
         if df.empty:
-            return
+            return False
     path = find_timeseries_path(provider, symbol, interval) or \
         timeseries_path(provider, symbol, interval)
     with _lock_for(path):
         tmp = path + ".tmp"
         df.to_parquet(tmp, index=False)
         os.replace(tmp, path)
+    return True
 
 
 def _as_utc(dt: datetime):

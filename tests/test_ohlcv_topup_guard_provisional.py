@@ -100,6 +100,14 @@ while hasattr(_orig, "__wrapped__"):
 _Plain._verified_tail_topup = _orig
 
 
+class _Prod(_Fixed):
+    """THE PRODUCTION COMBINATION: the in-tree wrapper installed (``wire_all_seams``) AND the base class's
+    mtime self-heal enabled (``_Provider`` switches it off to pin the wrapper alone)."""
+
+    def _unproven_tail_days(self, df, symbol, interval, provider_name):
+        return MarketDataProviderInterface._unproven_tail_days(self, df, symbol, interval, provider_name)
+
+
 @pytest.fixture(autouse=True)
 def _env(tmp_path, monkeypatch):
     cache = str(tmp_path / "cache")
@@ -635,3 +643,29 @@ def test_a_rebased_low_volume_older_bar_refuses(activity):
     with pytest.raises(OHLCVTopUpRefused):
         _topup(_Fixed(vendor), "AMD")
     assert _bytes(path) == expect
+
+
+@pytest.mark.parametrize("symbol", sorted(CASES))
+def test_production_combination_wrapper_plus_heal_gives_the_same_file_as_the_wrapper_alone(symbol, logged, activity):
+    """F6: with BOTH defences active the stuck bar is replaced by the vendor's final bar exactly once,
+    every other bar is byte-for-byte what it was, and the result equals the wrapper-only result."""
+    cbar, vbar = CASES[symbol]
+    stuck = STUCK_AT.get(symbol, PROV_DAY)
+    vendor, cached = _world(symbol, cbar, vbar, level=vbar[3], cache_end=stuck, day=stuck)
+    path = _write(symbol, cached)
+    before = pd.read_parquet(path)
+    _topup(_Fixed(vendor), symbol)
+    wrapper_only = pd.read_parquet(path)
+
+    path = _write(symbol, cached)                           # back to the contaminated file, mtime mid-session
+    logged["error"].clear()
+    activity.clear()
+    _topup(_Prod(vendor), symbol)
+    both = pd.read_parquet(path)
+
+    pd.testing.assert_frame_equal(both, wrapper_only)
+    row = both[both["Date"] == pd.Timestamp(stuck)].iloc[0]
+    assert (row.Open, row.High, row.Low, row.Close) == pytest.approx(vbar)
+    others = before[before["Date"] != pd.Timestamp(stuck)]
+    pd.testing.assert_frame_equal(both[both["Date"].isin(others["Date"])].reset_index(drop=True), others.reset_index(drop=True))
+    assert not any("REFUSED" in m for m in logged["error"]) and not activity      # healed: the guard never refused

@@ -72,8 +72,11 @@ def sha(p):
     return hashlib.sha256(open(p, "rb").read()).hexdigest()
 
 
-def run(cache, backup, *extra, apply=False, writers="stopped", select="all-after-cutoff", report=None, since="2026-09-01"):
+def run(cache, backup, *extra, apply=False, writers="stopped", select="all-after-cutoff", report=None, since="2026-09-01",
+        guarded="2099-01-01"):
     argv = ["--cache-dir", str(cache), "--cutoff", CUTOFF, "--backup-dir", str(backup), "--select", select]
+    if select == "all-after-cutoff" and guarded:
+        argv += ["--guarded-since", guarded]
     if since:
         argv += ["--modified-since", since]
     if report:
@@ -264,7 +267,7 @@ def test_apply_needs_the_writers_statement(world, capsys):
     p = put(cache, "AAA", make_frame(date(2026, 10, 5), partial_days=[date(2026, 10, 5)]), mtime_ny="2026-10-05 09:35")
     h = sha(p)
     argv = ["--cache-dir", str(cache), "--cutoff", CUTOFF, "--backup-dir", str(backup), "--select", "all-after-cutoff",
-            "--modified-since", "2026-09-01", "--apply"]
+            "--modified-since", "2026-09-01", "--guarded-since", "2099-01-01", "--apply"]
     assert tool.main(argv) == 2 and "--writers" in capsys.readouterr().err
     assert sha(p) == h
 
@@ -336,3 +339,46 @@ def test_the_truncated_file_is_extendable_by_the_guarded_top_up(world, monkeypat
     row = got[got["Date"] == pd.Timestamp(date(2026, 10, 5))].iloc[0]
     want = truth[truth["Date"] == pd.Timestamp(date(2026, 10, 5))].iloc[0]
     assert (row.Open, row.High, row.Low, row.Close, row.Volume) == pytest.approx((want.Open, want.High, want.Low, want.Close, want.Volume))
+
+
+def test_files_already_repaired_and_re_extended_by_guarded_code_are_left_alone(world):
+    cache, backup, tmp = world
+    # written after the prevention was live, every bar final, nothing flagged: the state of a repaired and
+    # re-extended file. Re-running must neither truncate nor back it up.
+    p = put(cache, "DONE", make_frame(date(2026, 10, 6)), mtime_ny="2026-10-07 06:30")
+    q = put(cache, "OLD", make_frame(date(2026, 10, 6)), mtime_ny="2026-10-06 21:00")      # before the prevention
+    h = sha(p)
+    assert run(cache, backup, apply=True, guarded="2026-10-07T08:00:00", report=tmp / "r.json", since="2026-09-01") == 0
+    assert sha(p) == h
+    by = {f["symbol"]: f["action"] for f in json.loads((tmp / "r.json").read_text())["files"]}
+    assert by == {"DONE": "unchanged:final_and_written_by_guarded_code", "OLD": "truncated"}
+
+
+def test_a_flagged_file_is_truncated_even_when_written_by_guarded_code(world):
+    cache, backup, tmp = world
+    # a guarded rewrite (fetch-cache rewrites every file it visits) does not heal an old interior snapshot
+    p = put(cache, "REWRITTEN", make_frame(date(2026, 10, 6), partial_days=[date(2026, 9, 15)]), mtime_ny="2026-10-07 06:30")
+    assert run(cache, backup, apply=True, guarded="2026-10-07T08:00:00") == 0
+    assert pd.Timestamp(pq.read_table(p).column("Date").to_pandas().max()) == pd.Timestamp(date(2026, 9, 11))
+
+
+def test_all_after_cutoff_requires_guarded_since(world, capsys):
+    cache, backup, tmp = world
+    put(cache, "AAA", make_frame(date(2026, 10, 5)), mtime_ny="2026-10-05 21:00")
+    assert run(cache, backup, guarded=None) == 2 and "--guarded-since" in capsys.readouterr().err
+
+
+def test_a_bar_whose_session_is_not_final_is_flagged_by_the_calendar_rule(world, monkeypatch):
+    cache, backup, tmp = world
+    from ba2_common.core import ohlcv_final_bars as fb
+    inst = pd.Timestamp("2026-10-06 11:00", tz=NY_TZ).to_pydatetime().astimezone(timezone.utc)
+    monkeypatch.setattr(fb, "now_utc", lambda: inst)
+    put(cache, "LIVE", make_frame(date(2026, 10, 6)), mtime_ny="2026-10-05 21:00")       # a normal-looking bar of today
+    info = tool.analyse_file(str(cache / "LIVE_1d.parquet"), "LIVE", date(2026, 9, 11))
+    assert [(f["bar"], f["reason"]) for f in info["flagged"]] == [("2026-10-06", "session_not_final_per_calendar")]
+
+
+def test_symbol_files_tolerate_crlf_and_a_bom(tmp_path):
+    f = tmp_path / "s.txt"
+    f.write_bytes(b"\xef\xbb\xbfAAA\r\nbbb\r\n\r\nCCC\r\n")
+    assert tool.read_symbols(str(f)) == ["AAA", "BBB", "CCC"]

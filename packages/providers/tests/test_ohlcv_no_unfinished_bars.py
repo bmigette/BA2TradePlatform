@@ -88,8 +88,14 @@ class _FrozenDatetime(datetime):
 @pytest.fixture
 def clock(monkeypatch):
     """``clock('2026-10-06 09:31')`` freezes 'now' at that New York wall-clock time."""
+    mono = {"t": 1000.0, "last": None}
+    monkeypatch.setattr(mdpi_mod, "_mono", lambda: mono["t"], raising=False)   # the memo's TTL clock follows the frozen one
+
     def set_now(ny_text: str) -> datetime:
         inst = pd.Timestamp(ny_text, tz=NY_TZ).to_pydatetime().astimezone(timezone.utc)
+        if mono["last"] is not None:
+            mono["t"] += (inst - mono["last"]).total_seconds()
+        mono["last"] = inst
         _FrozenDatetime.instant = inst
         monkeypatch.setattr(fb, "now_utc", lambda: _FrozenDatetime.instant)
         monkeypatch.setattr(mdpi_mod, "datetime", _FrozenDatetime)
@@ -109,14 +115,21 @@ def _own_cache(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _clean_memos():
-    for memo in (MarketDataProviderInterface._SPLIT_BASIS_REPORTED, MarketDataProviderInterface._TOPUP_REFUSED,
-                 MarketDataProviderInterface._UNFINISHED_MEMO):
-        memo.clear()
+def _live_overlay_on():
+    """Another test may have built a MemoizedOHLCVProvider (which switches the process to backtest mode)."""
+    fb.set_live_overlay_enabled(True)
     yield
-    for memo in (MarketDataProviderInterface._SPLIT_BASIS_REPORTED, MarketDataProviderInterface._TOPUP_REFUSED,
-                 MarketDataProviderInterface._UNFINISHED_MEMO):
-        memo.clear()
+    fb.set_live_overlay_enabled(True)
+
+
+@pytest.fixture(autouse=True)
+def _clean_memos():
+    def clear():
+        for name in ("_SPLIT_BASIS_REPORTED", "_TOPUP_REFUSED", "_UNFINISHED_MEMO", "_FORMING_MISSING_LOGGED"):
+            getattr(MarketDataProviderInterface, name, set()).clear()
+    clear()
+    yield
+    clear()
 
 
 # --------------------------------------------------------------------------- data
@@ -197,9 +210,9 @@ def test_a_top_up_at_0931_ny_does_not_persist_todays_bar_but_live_still_sees_it(
     assert native_cache.read_timeseries("_Provider", SYMBOL, "1d", as_of=None)["Date"].max() == pd.Timestamp(PREV)
 
 
-def test_a_second_live_read_the_same_day_makes_no_vendor_call_and_still_returns_the_forming_bar(clock):
-    # the cache already holds the last FINAL bar and its file is >24 h old: the 09:31 top-up finds
-    # only the forming bar, writes nothing (mtime stays old), and the memo must stand in for it
+def test_reads_inside_the_forming_bar_ttl_make_one_vendor_call_and_then_one_per_ttl(clock):
+    # F3: the cache already holds the last FINAL bar and its file is >24 h old: the 09:31 top-up finds
+    # only the forming bar, writes nothing (mtime stays old), and the memo throttles the next reads
     path = seed(truth(PREV), "2026-10-05 09:00")
     p = _Provider(with_forming(truth(D), D))
     clock("2026-10-06 09:31")
@@ -207,17 +220,59 @@ def test_a_second_live_read_the_same_day_makes_no_vendor_call_and_still_returns_
     assert len(p.impl_calls) == 1
     assert os.path.getmtime(path) == ny_epoch("2026-10-05 09:00")           # nothing was written
 
-    clock("2026-10-06 11:00")
+    clock("2026-10-06 09:36")                                               # 5 min later: inside the TTL
     df = p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
-
-    assert len(p.impl_calls) == 1                                           # the memo throttled it
+    df = p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    assert len(p.impl_calls) == 1                                           # the memo throttled both
     assert last_day(df) == D and df.iloc[-1].Volume == 4_000
     assert last_day(disk()) == PREV
 
-    # control: without the memo (e.g. after a restart) the vendor is asked again
-    MarketDataProviderInterface._UNFINISHED_MEMO.clear()
+    clock("2026-10-06 09:45")                                               # 14 min after the fetch: expired
+    p.vendor = with_forming(truth(D), D).assign(Volume=lambda x: x.Volume.where(x.Date != pd.Timestamp(D), 9_000))
+    df = p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    assert len(p.impl_calls) == 2 and df.iloc[-1].Volume == 9_000           # a fresh forming bar, not the 09:31 one
+    assert last_day(disk()) == PREV
+    assert getattr(mdpi_mod, 'FORMING_BAR_TTL_S', None) == 600.0
+
+
+def test_a_restart_or_a_fresh_mtime_with_an_empty_memo_still_gets_todays_forming_bar(clock):
+    # F3: exactly the state of the repaired files -- fresh by mtime (written today 06:30), memo empty
+    # (process just started). A LATEST read during the session must fetch, memoize and NOT persist.
+    path = seed(truth(PREV), "2026-10-06 06:30")
+    before = open(path, "rb").read()
+    p = _Provider(with_forming(truth(D), D))
+    clock("2026-10-06 10:00")
+    df = p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    assert len(p.impl_calls) == 1
+    assert last_day(df) == D and df.iloc[-1].Volume == 4_000
+    assert open(path, "rb").read() == before                                # the disk is untouched
+    assert fb.forming_bar_status(df) == "present" and fb.last_bar_is_today(df, SYMBOL)
+
+
+def test_during_the_session_a_missing_forming_bar_is_visible_to_the_caller(clock, monkeypatch):
+    # F3: the vendor has no bar for today yet -> the frame's last row is an OLDER session. That must not
+    # be silent: ERROR logged once per symbol per day, attrs says "missing", last_bar_is_today is False.
+    seed(truth(PREV), "2026-10-06 06:30")
+    p = _Provider(truth(PREV))                                              # no bar for D at all
+    seen = []
+    monkeypatch.setattr(mdpi_mod.logger, "error", lambda m, *a, **k: seen.append(str(m)))
+    clock("2026-10-06 10:00")
+    df = p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    assert fb.forming_bar_status(df) == "missing" and not fb.last_bar_is_today(df, SYMBOL)
+    assert len(seen) == 1 and "no forming bar could be obtained" in seen[0] and SYMBOL in seen[0]
+    clock("2026-10-06 10:20")
     p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
-    assert len(p.impl_calls) == 2
+    assert len(seen) == 1                                                   # once per symbol per day
+
+
+def test_outside_a_session_nothing_is_expected_and_nothing_is_logged(clock, monkeypatch):
+    seed(truth(PREV), "2026-10-06 06:30")
+    seen = []
+    monkeypatch.setattr(mdpi_mod.logger, "error", lambda m, *a, **k: seen.append(str(m)))
+    clock("2026-10-06 08:00")                                               # before the open
+    df = _Provider(truth(PREV)).get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    assert fb.forming_bar_status(df) == "not_expected" and seen == []
+    assert last_day(df) == PREV
 
 
 def test_the_next_day_appends_the_vendors_final_bar_and_the_tail_guard_never_trips(clock, ):
@@ -248,14 +303,24 @@ def test_the_next_day_appends_the_vendors_final_bar_and_the_tail_guard_never_tri
     assert got["Close"].to_numpy() == pytest.approx(old["Close"].to_numpy())
 
 
-def test_the_bar_of_a_stale_memo_is_not_served_once_it_is_final(clock):
+def test_once_the_session_is_final_the_snapshot_is_never_served_as_the_final_bar(clock):
     seed(truth(FRI), "2026-10-03 12:00")
     p = _Provider(with_forming(truth(D), D))
     clock("2026-10-06 09:31")
     p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
-    clock("2026-10-06 20:30")                                # settled: the snapshot must not be served as final
+    t = ny_epoch("2026-10-06 09:31")
+    os.utime(native_cache.find_timeseries_path("_Provider", SYMBOL, "1d"), (t, t))
+    clock("2026-10-06 20:30")                                # settled: the memo's snapshot is obsolete
     df = p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
-    assert last_day(df) == PREV
+    assert last_day(df) == PREV and not (df["Volume"] == 4_000).any()      # never the 09:31 snapshot
+    assert fb.forming_bar_status(df) == "not_expected"
+    # the next session's first read fetches D's FINAL bar (and persists it) plus the new forming bar
+    p.vendor = with_forming(truth(date(2026, 10, 7)), date(2026, 10, 7))
+    clock("2026-10-07 09:35")
+    df = p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    got = disk()
+    assert last_day(got) == D and got[got["Date"] == pd.Timestamp(D)].iloc[0].Volume == truth(D).iloc[-1].Volume
+    assert last_day(df) == date(2026, 10, 7)
 
 
 # --------------------------------------------------------------------------- close + delay, half day, weekend
@@ -359,6 +424,7 @@ def test_a_contaminated_newest_bar_self_heals_when_the_mtime_proves_it(clock):
 
 
 def test_a_contaminated_bar_the_mtime_cannot_prove_is_still_refused_loudly(clock):
+    """CHARACTERIZATION (passes on the pre-fix code too): the guard still refuses what mtime cannot prove."""
     # same snapshot, but the file's mtime is later than the session's settlement (e.g. a copy/touch)
     path = contaminated("2026-10-06 22:00")
     before = open(path, "rb").read()
@@ -371,6 +437,7 @@ def test_a_contaminated_bar_the_mtime_cannot_prove_is_still_refused_loudly(clock
 
 
 def test_a_backdated_mtime_before_the_session_is_not_a_proof(clock):
+    """CHARACTERIZATION (passes on the pre-fix code too): a backdated mtime must not trigger the heal."""
     path = contaminated("2026-10-03 12:00")                  # mtime BEFORE the bar's own session
     p = _Provider(truth(date(2026, 10, 7)))
     clock("2026-10-07 09:35")
@@ -481,6 +548,7 @@ def test_additive_only_switch_refuses_a_split_replacement_and_writes_nothing(clo
 
 
 def test_additive_only_switch_leaves_an_ordinary_top_up_alone(clock, monkeypatch):
+    """CHARACTERIZATION (passes on the pre-fix code too): the switch must not change an ordinary append."""
     path = seed(truth(FRI), "2026-10-03 12:00")
     monkeypatch.setenv("BA2_OHLCV_TOPUP_FULL_REFETCH", "0")
     clock("2026-10-07 09:00")
@@ -488,26 +556,230 @@ def test_additive_only_switch_leaves_an_ordinary_top_up_alone(clock, monkeypatch
     assert last_day(disk()) == D                              # appended exactly as without the switch
 
 
-def test_the_default_still_replaces_and_a_bad_switch_value_is_refused(clock, monkeypatch):
+def test_the_default_still_replaces_a_split_history(clock):
+    """CHARACTERIZATION (passes on the pre-fix code too): without the switch a split replaces the history."""
     cached, p = _split_world()
     path = seed(cached, "2026-10-03 12:00")
     clock("2026-10-07 09:00")
-    monkeypatch.setenv("BA2_OHLCV_TOPUP_FULL_REFETCH", "maybe")
-    with pytest.raises(ValueError, match="BA2_OHLCV_TOPUP_FULL_REFETCH"):
-        p._refresh_parquet_if_stale(pd.read_parquet(path), SYMBOL, "1d", "_Provider")
-    monkeypatch.delenv("BA2_OHLCV_TOPUP_FULL_REFETCH")
     p._refresh_parquet_if_stale(pd.read_parquet(path), SYMBOL, "1d", "_Provider")
-    assert read_full_fetch_marker(path) is not None            # replaced, as before
+    assert read_full_fetch_marker(path) is not None
 
 
-def test_additive_only_switch_never_rewrites_a_cached_bar_even_a_provisional_looking_one(clock, monkeypatch):
-    # a cached bar inside the guard's provisional tolerance would normally be replaced by the vendor's
-    cached = truth(FRI).copy()
-    cached.loc[cached.index[-3], "Close"] = round(cached.loc[cached.index[-3], "Close"] * 1.001, 3)
+@pytest.mark.parametrize("value", ["false", "maybe", "2", ""])
+def test_a_bad_switch_value_raises_on_every_top_up_not_only_on_a_split(clock, monkeypatch, value):
+    # F4: validated ONCE at the top of _verified_tail_topup. Before, "false" silently meant "not additive"
+    # in the appendable branch.
+    path = seed(truth(FRI), "2026-10-03 12:00")
+    before = open(path, "rb").read()
+    monkeypatch.setenv("BA2_OHLCV_TOPUP_FULL_REFETCH", value)
+    clock("2026-10-07 09:00")
+    with pytest.raises(ValueError, match="BA2_OHLCV_TOPUP_FULL_REFETCH"):
+        _Provider(truth(D))._refresh_parquet_if_stale(pd.read_parquet(path), SYMBOL, "1d", "_Provider")
+    assert open(path, "rb").read() == before
+
+
+def provisional_copy(df: pd.DataFrame, idx: int) -> pd.DataFrame:
+    """``df`` with the bar at ``idx`` replaced by a PROVISIONAL one in the guard's sense: an open that differs
+    from the vendor's by more than the equality tolerance but lies inside the vendor's day range (and within
+    3 %), high/low/close equal, volume below the vendor's."""
+    out = df.copy()
+    r = out.loc[idx]
+    out.loc[idx, "Open"] = round(r.Low + 0.2 * (r.Open - r.Low), 3)
+    out.loc[idx, "Volume"] = int(r.Volume * 0.5)
+    assert abs(out.loc[idx, "Open"] - r.Open) / r.Open > 0.005          # outside the 0.5 % equality tolerance
+    return out
+
+
+def _topup(path):
+    return _Provider(truth(D))._refresh_parquet_if_stale(pd.read_parquet(path), SYMBOL, "1d", "_Provider")
+
+
+def test_additive_only_switch_never_replaces_a_cached_bar_but_the_default_does(clock, monkeypatch):
+    # F5: a REAL provisional bar (the previous version changed a Close by 0.1 %, inside the equality
+    # tolerance, and passed with the protection deleted)
+    cached = provisional_copy(truth(FRI), len(truth(FRI)) - 3)
+    stuck_day = cached["Date"].iloc[-3]
+    clock("2026-10-07 09:00")
+
+    # default: the guard classifies it provisional and REPLACES it with the vendor's bar
+    path = seed(cached, "2026-10-03 12:00")
+    _topup(path)
+    got = disk()
+    assert got[got["Date"] == stuck_day].iloc[0].Open == pytest.approx(
+        truth(FRI)[truth(FRI)["Date"] == stuck_day].iloc[0].Open)
+
+    # additive-only: the cached bar is kept exactly, and the new bars are still appended after it
+    path = seed(cached, "2026-10-03 12:00")
+    monkeypatch.setenv("BA2_OHLCV_TOPUP_FULL_REFETCH", "0")
+    _topup(path)
+    got = disk()
+    kept = got[got["Date"] == stuck_day].iloc[0]
+    mine = cached[cached["Date"] == stuck_day].iloc[0]
+    assert kept.Open == mine.Open and kept.Volume == mine.Volume
+    assert last_day(got) == D
+
+
+def test_the_additive_refusal_names_the_heal_exception(clock, monkeypatch):
+    cached, p = _split_world()
     path = seed(cached, "2026-10-03 12:00")
     monkeypatch.setenv("BA2_OHLCV_TOPUP_FULL_REFETCH", "0")
     clock("2026-10-07 09:00")
-    _Provider(truth(D)).get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    with pytest.raises(OHLCVTopUpRefused) as e:
+        p._refresh_parquet_if_stale(pd.read_parquet(path), SYMBOL, "1d", "_Provider")
+    assert "DEFERRED" in str(e.value) and "still healed" in str(e.value)
+
+
+def test_a_provably_partial_newest_bar_is_still_healed_in_an_additive_run(clock, monkeypatch):
+    # F4: the documented exception to "strictly additive"
+    contaminated("2026-10-06 09:32")
+    monkeypatch.setenv("BA2_OHLCV_TOPUP_FULL_REFETCH", "0")
+    clock("2026-10-07 09:35")
+    p = _Provider(pd.concat([truth(D), truth(date(2026, 10, 7)).iloc[[-1]]], ignore_index=True))
+    p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
     got = disk()
-    old = got[got["Date"] <= pd.Timestamp(FRI)].reset_index(drop=True)
-    assert old["Close"].to_numpy() == pytest.approx(cached["Close"].to_numpy(), abs=0) and last_day(got) == D
+    row = got[got["Date"] == pd.Timestamp(D)].iloc[0]
+    want = truth(D).iloc[-1]
+    assert row.Volume == want.Volume and row.Open == pytest.approx(want.Open)
+
+
+# --------------------------------------------------------------------------- F1: a refused top-up stays loud
+def test_a_refused_top_up_raises_on_every_read_and_never_serves_a_mixed_basis_frame(clock, monkeypatch):
+    cached, _p = _split_world()
+    path = seed(cached, "2026-10-03 12:00")                      # old basis (x2)
+    before = open(path, "rb").read()
+    # the vendor serves the NEW basis incl. today's forming bar; the calendar lists a split => a full
+    # re-fetch is called for; the additive switch refuses it (a guard refusal behaves the same way)
+    p = _Provider(with_forming(truth(D), D), [CalendarSplit(PREV, 2.0)])
+    monkeypatch.setenv("BA2_OHLCV_TOPUP_FULL_REFETCH", "0")
+    clock("2026-10-06 09:31")
+    with pytest.raises(OHLCVTopUpRefused):
+        p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    assert not getattr(MarketDataProviderInterface, "_UNFINISHED_MEMO", {}).get(("_Provider", SYMBOL, "1d"))   # not memoized
+
+    for when in ("2026-10-06 09:35", "2026-10-06 09:50"):        # second and third reads, same process
+        clock(when)
+        with pytest.raises(OHLCVTopUpRefused):
+            p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    assert open(path, "rb").read() == before                      # the disk was never touched
+
+
+def test_a_guard_refusal_of_a_basis_mismatch_also_stays_loud_on_the_second_read(clock):
+    # same, without the switch: an unexplained disagreement (a settled bar 6 % off, no split to explain it)
+    cached = truth(FRI).copy()
+    cached.loc[cached.index[-4], "Close"] = round(cached.loc[cached.index[-4], "Close"] * 1.06, 3)
+    seed(cached, "2026-10-03 12:00")
+    p = _Provider(with_forming(truth(D), D))
+    clock("2026-10-06 09:31")
+    with pytest.raises(OHLCVTopUpRefused):
+        p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    clock("2026-10-06 09:34")
+    with pytest.raises(OHLCVTopUpRefused):
+        p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+
+
+# --------------------------------------------------------------------------- F2: intraday throttling
+def _five_minute_world():
+    prev_bars = pd.date_range("2026-10-05 09:30", "2026-10-05 15:55", freq="5min")
+    cached = minute_frame(prev_bars)
+    cached["effective_date"] = cached["Date"]
+    d = os.path.join(native_cache.CACHE_FOLDER, "_Provider")
+    os.makedirs(d, exist_ok=True)
+    f = os.path.join(d, f"{SYMBOL}_5min.parquet")
+    cached.to_parquet(f, index=False)
+    return prev_bars, f
+
+
+def test_n_intraday_reads_inside_one_bar_make_one_vendor_call(clock):
+    prev_bars, f = _five_minute_world()
+    p = _Provider(minute_frame(list(prev_bars) + list(pd.date_range("2026-10-06 09:30", "2026-10-06 09:40", freq="5min"))))
+    clock("2026-10-06 09:41")
+    df = None
+    for _ in range(6):
+        df = p.get_ohlcv_data(SYMBOL, lookback_days=5, interval="5min")
+    assert len(p.impl_calls) == 1
+    assert pd.Timestamp(df["Date"].max()).tz_localize(None) == pd.Timestamp("2026-10-06 09:40")   # live sees the forming bar
+    on_disk = pd.read_parquet(f)
+    assert pd.Timestamp(on_disk["Date"].max()) == pd.Timestamp("2026-10-06 09:35")                # the disk does not
+
+    clock("2026-10-06 09:47")                                    # 6 min later: past one bar interval
+    p.get_ohlcv_data(SYMBOL, lookback_days=5, interval="5min")
+    assert len(p.impl_calls) == 2
+
+
+# --------------------------------------------------------------------------- backtest processes
+def test_a_backtest_process_never_overlays_or_force_fetches_a_forming_bar(clock):
+    path = seed(truth(PREV), "2026-10-06 06:30")
+    before = open(path, "rb").read()
+    p = _Provider(with_forming(truth(D), D))
+    clock("2026-10-06 10:00")                                    # session open, file fresh by mtime
+    fb.set_live_overlay_enabled(False)                           # what MemoizedOHLCVProvider's constructor does
+    df = p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")   # end_date=None => is_latest, like DeterministicScorer's
+    assert last_day(df) == PREV and p.impl_calls == []           # no forced fetch, no overlay: the old behaviour
+    assert fb.forming_bar_status(df) == "not_expected"
+    assert open(path, "rb").read() == before
+    # and an overlay memoized earlier in the same process is not served either
+    p._remember_unfinished_bars(with_forming(truth(D), D), SYMBOL, "1d", "_Provider")
+    assert last_day(p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")) == PREV
+
+
+# --------------------------------------------------------------------------- heal: the live frame keeps its bar
+def test_a_healed_bar_is_not_lost_from_the_live_frame_when_the_vendor_cannot_replace_it(clock):
+    path = contaminated("2026-10-06 09:32")
+    before = open(path, "rb").read()
+    clock("2026-10-07 09:35")
+    # (a) the vendor has nothing newer than the day before the healed bar
+    df = _Provider(truth(PREV))._refresh_parquet_if_stale(pd.read_parquet(path), SYMBOL, "1d", "_Provider")
+    assert last_day(df) == D and open(path, "rb").read() == before
+
+    # (b) the fetch fails
+    class Boom(_Provider):
+        def _get_ohlcv_data_impl(self, *a, **k):
+            raise RuntimeError("vendor down")
+    df = Boom(truth(D))._refresh_parquet_if_stale(pd.read_parquet(path), SYMBOL, "1d", "_Provider")
+    assert last_day(df) == D and open(path, "rb").read() == before
+
+
+# --------------------------------------------------------------------------- minor: writer return, marker
+def test_write_timeseries_reports_when_it_wrote_nothing(clock):
+    clock("2026-10-06 09:31")
+    df = truth(D)
+    df["effective_date"] = df["Date"]
+    assert native_cache.write_timeseries("_Provider", "XRET", "1d", df) is True
+    assert native_cache.write_timeseries("_Provider", "XNEWB", "1d", df.iloc[[-1]]) is False
+
+
+def test_a_cold_fill_that_wrote_no_file_records_no_marker(clock, monkeypatch):
+    clock("2026-10-06 09:31")
+    seen = []
+    monkeypatch.setattr(mdpi_mod.logger, "info", lambda m, *a, **k: seen.append(str(m)))
+    _Provider(truth(D))._record_cold_full_fetch("_Provider", "XNOFILE", "1d")
+    assert any("no file was written" in m for m in seen)
+    assert not os.path.exists(os.path.join(native_cache.CACHE_FOLDER, "_Provider", "_split_basis"))
+
+
+# --------------------------------------------------------------------------- F7: the Senate price store
+def test_the_senate_price_store_never_persists_a_forming_row(clock):
+    import json
+    from ba2_providers import fmp_common
+    clock("2026-10-06 09:31")
+    payload = [{"date": "2026-10-06", "open": 90.0, "high": 90.0, "low": 85.0, "close": 85.0, "volume": 4000},
+               {"date": "2026-10-05", "open": 50.0, "high": 52.0, "low": 49.0, "close": 51.0, "volume": 9_000_000},
+               {"date": "2025-01-02", "open": 40.0, "high": 41.0, "low": 39.0, "close": 40.5, "volume": 1_000_000}]
+    got = fmp_common._fmp_history_disk_read_or_fetch("historical_price_full", "XSEN", lambda: [dict(r) for r in payload], 7)
+    assert [r["date"] for r in got] == ["2026-10-06", "2026-10-05", "2025-01-02"]       # the caller still gets every row
+    f = os.path.join(fmp_common._fmp_history_cache_dir(), "historical_price_full__XSEN.json")
+    assert [r["date"] for r in json.load(open(f))] == ["2026-10-05", "2025-01-02"]       # the file never holds the forming one
+    clock("2026-10-06 20:30")                                                              # after settlement the row is final
+    os.unlink(f)
+    fmp_common._fmp_history_disk_read_or_fetch("historical_price_full", "XSEN", lambda: [dict(r) for r in payload], 7)
+    assert [r["date"] for r in json.load(open(f))] == ["2026-10-06", "2026-10-05", "2025-01-02"]
+
+
+def test_other_fmp_history_namespaces_are_untouched_by_the_finality_rule(clock):
+    import json
+    from ba2_providers import fmp_common
+    clock("2026-10-06 09:31")
+    rows = [{"date": "2026-10-06", "x": 1}]
+    fmp_common._fmp_history_disk_read_or_fetch("some_other_namespace", "XOTH", lambda: rows, 7)
+    f = os.path.join(fmp_common._fmp_history_cache_dir(), "some_other_namespace__XOTH.json")
+    assert json.load(open(f)) == rows

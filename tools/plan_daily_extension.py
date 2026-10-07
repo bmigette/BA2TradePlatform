@@ -34,7 +34,7 @@ SUFFIX = "_1d.parquet"
 
 
 def read_tokens(path: str) -> List[str]:
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         return [t.upper() for line in f for t in line.replace(",", " ").split() if t and not t.startswith("#")]
 
 

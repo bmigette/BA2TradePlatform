@@ -1294,6 +1294,12 @@ class MemoizedOHLCVProvider:
         # BacktestCacheMiss (the user asked for a hard error, NOT a silent skip) so preload can
         # report exactly what to cache. cached_only=False keeps the live passthrough (fetch).
         self._cached_only = cached_only
+        # A process that builds a backtest provider is a BACKTEST process: it never serves (or goes
+        # to fetch) today's forming bar through the inner provider's LATEST path, whatever end_date a
+        # read carries (DeterministicScorer asks for end_date=replay_now(None), i.e. "latest").
+        # Hermetic runs never reach the inner get_ohlcv_data at all (cached_only reads the parquet).
+        from ba2_common.core import ohlcv_final_bars
+        ohlcv_final_bars.set_live_overlay_enabled(False)
 
     def cached_path(self, symbol: str, interval: str) -> Optional[str]:
         """The native on-disk parquet for (symbol, interval), or None when there is none to sign.
