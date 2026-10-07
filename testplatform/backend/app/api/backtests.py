@@ -47,10 +47,11 @@ def _run_schedule_override(run_schedule: Optional[str], run_schedule_day: Option
     ``run_schedule_override`` dict, mirroring the CLI launcher's daily/weekly handling.
 
       * run_schedule None or "daily"  -> None (no override; the engine analyses every bar).
-      * run_schedule "weekly"         -> {"days": {weekday: bool}, "times": ["09:30"]} with only
-        ``run_schedule_day`` (default "monday") enabled. ``times`` pins ANALYSIS to the first
-        regular-session bar so an intraday fill clock still analyses once that day (identical to
-        the CLI's _cmd_optimize/_cmd_backtest behaviour).
+      * run_schedule "weekly"         -> {"days": {weekday: bool}, "times": [DEFAULT_DECISION_TIME]}
+        with only ``run_schedule_day`` (default "monday") enabled. ``times`` pins ANALYSIS to one
+        bar so an intraday fill clock still analyses once that day (identical to the CLI's
+        _cmd_optimize/_cmd_backtest behaviour); the time is the ONE shared default decision time
+        (ba2_common.core.knowability), one bar or more after the session's first bar.
 
     Fail-early (no silent bad defaults, backend/CLAUDE.md): an unknown run_schedule or an unknown
     weekday raises ValueError (the route turns it into a 400).
@@ -62,7 +63,8 @@ def _run_schedule_override(run_schedule: Optional[str], run_schedule_day: Option
     day = (run_schedule_day or "monday").lower()
     if day not in _WEEKDAYS:
         raise ValueError(f"run_schedule_day must be one of {_WEEKDAYS}, got {run_schedule_day!r}")
-    return {"days": {d: (d == day) for d in _WEEKDAYS}, "times": ["09:30"]}
+    from ba2_common.core.knowability import DEFAULT_DECISION_TIME
+    return {"days": {d: (d == day) for d in _WEEKDAYS}, "times": [DEFAULT_DECISION_TIME]}
 
 
 class BacktestCreate(BaseModel):

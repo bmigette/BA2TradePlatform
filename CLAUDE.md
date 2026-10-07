@@ -201,6 +201,15 @@ if price is None:
     raise ValueError("Price not available")
 ```
 
+### Prices in decision code
+The current price is the ACCOUNT (`account.get_instrument_current_price`; experts: `MarketExpertInterface._decision_price`),
+the same call live and in a backtest, where it is the close of the latest intraday bar that has ENDED at the decision.
+History (indicators, ATR, factors) is the clamped OHLCV provider, which on an intraday clock returns finished sessions
+only (the unclamped read is the explicit `get_ohlcv_data_unsliced`). Never take "the price" from a bar's last row
+(`df["Close"].iloc[-1]`): `testplatform/backend/tests/test_no_bar_price_in_decision_code.py` fails on a new site unless
+it is allowlisted with a reason. Date-keyed stores (screener scans, regime flags) go through
+`metric_store.visible_scan_date` / `knowability.scan_cutoff_date`.
+
 ### Confidence Values
 Always stored as 1-100 scale (not 0-1):
 ```python

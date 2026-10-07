@@ -65,6 +65,11 @@ def main() -> int:
     ap.add_argument("backtest_id", type=int)
     ap.add_argument("--window", nargs=2, metavar=("START", "END"))
     ap.add_argument("--out", help="write the summary (and the stored row's figures) as JSON")
+    ap.add_argument("--decision-time", metavar="HH:MM",
+                    help="re-run the stored genome with its entry AND manage schedules retimed to "
+                         "this exchange-local time (days untouched), e.g. 15:30. Validated like a "
+                         "--decision-times value (on the bar grid, after the first bar and before "
+                         "the last). Still writes no row.")
     ns = ap.parse_args()
     try:
         ns.window = parse_window(ns.window)
@@ -85,6 +90,10 @@ def main() -> int:
         stored = {m: getattr(bt, m, None) for m in SUMMARY}
         stored_window = (str(bt.start_date)[:10], str(bt.end_date)[:10])
         config = rebuild_config_for_backtest(bt, db, window=ns.window)
+        stored_times = ((config.get("run_schedule_override") or {}).get("times"))
+        if ns.decision_time:
+            from ba2_common.core.schedule_genes import retime_schedules
+            config = retime_schedules(config, ns.decision_time)
         name = bt.name
         pins = sorted(k for k in (bt.strategy_params or {}) if k.startswith("_"))
     finally:
@@ -97,6 +106,8 @@ def main() -> int:
 
     print(f"row {ns.backtest_id} {name}  pins={pins}")
     print(f"window {ns.window or stored_window}  (stored row window {stored_window})", flush=True)
+    print(f"decision time {ns.decision_time or stored_times}  (stored row's own: {stored_times})",
+          flush=True)
 
     prior = logging.root.manager.disable
     logging.disable(logging.INFO)
@@ -116,6 +127,7 @@ def main() -> int:
     if ns.out:
         Path(ns.out).write_text(json.dumps(
             {"row": ns.backtest_id, "name": name, "window": ns.window or stored_window,
+             "decision_time": ns.decision_time, "stored_times": stored_times,
              "stored": stored, "stored_window": stored_window, "rerun": got,
              "preload_symbols": results.get("symbol_count")}, indent=1, default=str))
     return 0

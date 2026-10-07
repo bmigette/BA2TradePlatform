@@ -718,6 +718,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         self._book_gen: int = 0
         # (book_gen, clock, marked value) memo for _open_positions_mtm.
         self._mtm_memo: Optional[tuple] = None
+        # The same memo for the DECISION-time mark (intraday clock: positions marked at the
+        # decision price, not at the clock bar's close); see _equity_mark_price.
+        self._mtm_memo_decision: Optional[tuple] = None
+        # Counters of the intraday-clock rule (published in results["intraday_clock"]).
+        self.intraday_counters: Dict[str, int] = {"entries_refused_next_bar_other_session": 0}
         # (generation, contract_group, group_bounds) memo for _option_group_bounds.
         self._group_bounds_memo: Optional[tuple] = None
         # contract_symbol -> the order carrying the contract's terms (first row with a strike,
@@ -935,8 +940,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         lot.avg_price = 0.0
         self._touch_book()
 
-    def _open_positions_mtm(self) -> float:
+    def _open_positions_mtm(self, decision: bool = False) -> float:
         """Mark-to-market value of all open positions at the current bar's close — MEMOISED.
+
+        ``decision=True`` (INTRADAY clock only; identical to the default on a daily clock) marks
+        the equity positions at the price KNOWABLE at the decision instant instead of the clock
+        bar's close, which prints a bar later: the value a SIZER may see. The recorded equity
+        curve (``snapshot_equity``) and the final equity keep the bar close.
 
         THE MEMO (2026-09-21). Every entry candidate that reaches the live-parity equity gate
         calls ``has_sufficient_equity_for_trading`` -> ``get_available_balance`` -> this, which
@@ -971,12 +981,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # memoise -- there is no bar to key on and the un-memoised path is the old behaviour.
         current = getattr(self._price, "current", None)
         clock = current() if current is not None else None
+        decision = bool(decision) and bool(getattr(self._price, "is_intraday", False))
         if clock is None:
-            return self._compute_open_positions_mtm()
-        memo = self._mtm_memo
+            return self._compute_open_positions_mtm(decision)
+        memo = self._mtm_memo_decision if decision else self._mtm_memo
         if memo is not None and memo[0] == self._book_gen and memo[1] == clock:
             if _MTM_AUDIT:
-                fresh = self._compute_open_positions_mtm()
+                fresh = self._compute_open_positions_mtm(decision)
                 if fresh != memo[2]:
                     raise StaleMarkToMarket(
                         f"[backtest] the mark-to-market memo served {memo[2]!r} at book "
@@ -985,11 +996,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                         f"bump the book generation (see BacktestAccount._touch_book)."
                     )
             return memo[2]
-        value = self._compute_open_positions_mtm()
-        self._mtm_memo = (self._book_gen, clock, value)
+        value = self._compute_open_positions_mtm(decision)
+        if decision:
+            self._mtm_memo_decision = (self._book_gen, clock, value)
+        else:
+            self._mtm_memo = (self._book_gen, clock, value)
         return value
 
-    def _compute_open_positions_mtm(self) -> float:
+    def _compute_open_positions_mtm(self, decision: bool = False) -> float:
         """The actual mark — see ``_open_positions_mtm`` (its memoising caller) for the contract.
 
         Signed value (long positions positive, short positions negative). A held symbol
@@ -1007,16 +1021,26 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for p in self._positions.values():
             if p.qty == 0:
                 continue
-            px = self._equity_mark_price(p)
+            px = self._equity_mark_price(p, decision=decision)
             if px is not None:
                 total += p.qty * px
         return total + self._option_positions_mtm()
 
-    def _equity_mark_price(self, p: "_Position") -> Optional[float]:
+    def _equity_mark_price(self, p: "_Position", decision: bool = False) -> Optional[float]:
         """The price an equity position is marked at: this bar's close, else the last known
         close (forward-fill), else the entry price for a never-priced symbol. The ONE mark
         both the equity curve (``_compute_open_positions_mtm``) and the short borrow accrual
-        (``accrue_short_borrow``) use, so a short is charged on the value the curve shows."""
+        (``accrue_short_borrow``) use, so a short is charged on the value the curve shows.
+
+        ``decision=True`` on an INTRADAY clock: the decision price (close of the latest bar that
+        has ended at the clock) first, then the same forward-fill / entry fallbacks."""
+        if decision and getattr(self._price, "is_intraday", False):
+            px = self._price.decision_price(p.symbol, self._price.now())
+            if px is None:
+                px = self._price.close_asof(p.symbol)
+            if px is None:
+                px = getattr(p, "avg_price", None)
+            return px
         px = self._price.close_at(p.symbol)
         if px is None:
             px = self._price.close_asof(p.symbol)  # forward-fill: last known close
@@ -1637,9 +1661,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         self._group_bounds_memo = (self._option_memo_gen, contract_group, group_bounds)
         return contract_group, group_bounds
 
-    def equity(self) -> float:
-        """Net liquidating value = cash + mark-to-market of open positions."""
-        return self._cash + self._open_positions_mtm()
+    def equity(self, *, close_mark: bool = False) -> float:
+        """Net liquidating value = cash + mark-to-market of open positions.
+
+        A DECISION-time read by default (what sizing, margin and gates see): on an intraday clock
+        the positions are marked at the decision price. ``close_mark=True`` is the recorded
+        value (the bar's close): the final equity of a run."""
+        return self._cash + self._open_positions_mtm(decision=not close_mark)
 
     def deployed_equity(self) -> float:
         """Equity the SIZER may see: ``min(cap, equity())``. Uncapped when no cap is set.
@@ -2832,9 +2860,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for p in self._positions.values():
             if p.qty == 0:
                 continue
-            cur = self._price.close_at(p.symbol)
-            if cur is None:  # no exact bar this tick -> last-known close (not None/stale)
-                cur = self._price.close_asof(p.symbol)
+            if getattr(self._price, "is_intraday", False):
+                # A decision-time read (rules / conditions read position.current_price): the
+                # price knowable now, not the clock bar's own close.
+                cur = self._price.decision_price(p.symbol, self._price.now())
+                if cur is None:
+                    cur = self._price.close_asof(p.symbol)
+            else:
+                cur = self._price.close_at(p.symbol)
+                if cur is None:  # no exact bar this tick -> last-known close (not None/stale)
+                    cur = self._price.close_asof(p.symbol)
             out.append(
                 _AttrDict(
                     {
@@ -3010,6 +3045,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         Single symbol -> float (raises if unavailable, per the live no-fallback rule).
         List -> {symbol: price-or-None}.
         """
+        if getattr(self._price, "is_intraday", False):
+            # INTRADAY clock: the price KNOWABLE at the decision (``AsOfPriceSource.decision_price``:
+            # the close of the latest bar that has ENDED), the same price the experts decide on,
+            # not the clock bar's own close (printed after the decision). Equity valuation reads
+            # ``close_at`` / ``close_asof`` directly and is unaffected.
+            now = self._price.now()
+            if isinstance(symbol_or_symbols, (list, tuple, set)):
+                return {s: self._price.decision_price(s, now) for s in symbol_or_symbols}
+            px = self._price.decision_price(symbol_or_symbols, now)
+            if px is None:
+                raise ValueError(
+                    f"No backtest price for {symbol_or_symbols} at {now}: no bar has ended in the "
+                    f"current or the last finished session")
+            return px
         if isinstance(symbol_or_symbols, (list, tuple, set)):
             return {s: self._price.close_at(s) for s in symbol_or_symbols}
         px = self._price.close_at(symbol_or_symbols)
@@ -3136,6 +3185,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             bar = self._bar_for_fill(o, as_of)
             if bar is None:
                 continue
+            if self._refuse_cross_session_market_entry(o, as_of):
+                filled = True   # the order was terminalised: the engine must roll the transaction
+                continue
             trig_hi, trig_lo = self._trigger_thresholds(o)
             if not (bar["high"] >= trig_hi or bar["low"] <= trig_lo):
                 continue
@@ -3153,6 +3205,35 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # transactions (see the Step 0 note above), so report it as a book change too.
         # A market-type entry the fill screen refused is terminalised inside the loop above.
         return filled or book_changed or self.__dict__.pop("_fill_book_changed", False)
+
+    def _refuse_cross_session_market_entry(self, order, as_of) -> bool:
+        """INTRADAY clock: a MARKET order that OPENS an equity position fills at the open of the
+        next bar after the decision. For a thin symbol that bar can be in a LATER session (a
+        decision on Tuesday from Monday's last print would fill at Friday's open, stamped Tuesday,
+        with its TP/SL then tested on bars before the fill). A broker's DAY order dies at the close;
+        so this terminalises such an entry (EXPIRED, counted in
+        ``intraday_counters["entries_refused_next_bar_other_session"]``) instead of filling it.
+        Closing orders are never refused. Returns True when the order was terminalised."""
+        if not getattr(self._price, "is_intraday", False):
+            return False
+        if order.order_type != OrderType.MARKET or getattr(order, "asset_class", None) == AssetClass.OPTION:
+            return False
+        nxt = self._price.next_bar_date(order.symbol, as_of)
+        if nxt is None or nxt.date() == as_of.date():
+            return False
+        pos = self._positions.get(order.symbol)
+        sign = 1 if order.side == OrderDirection.BUY else -1
+        if pos is not None and pos.qty != 0 and (pos.qty > 0) != (sign > 0):
+            return False                    # reduces an existing position: a closing order
+        order.status = OrderStatus.EXPIRED
+        order.comment = (f"{(order.comment or '')} | day order expired: next bar {nxt} is not in the "
+                         f"decision's session").strip(" |")
+        update_instance(order)
+        self.invalidate_order_cache()
+        self.intraday_counters["entries_refused_next_bar_other_session"] += 1
+        logger.warning("[backtest] equity market entry EXPIRED: %s %s decided %s, its next bar is %s "
+                       "(another session)", order.side, order.symbol, as_of, nxt)
+        return True
 
     def _expire_stale_option_limits(self, as_of) -> bool:
         """TIME-IN-FORCE DAY for option LIMIT orders (OPT-B4).
@@ -5765,6 +5846,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     # method left). ``submit_option_order`` is concrete in the base mixin and is NOT
     # overridden; ``get_iv_rank`` IS (see below — the base reads a live-only SQL table).
     # ======================================================================
+    def intraday_volume_so_far(self, symbol: str):
+        """``(applicable, volume)``: the volume traded in the decision's own session so far (the sum
+        of the intraday bars that have ENDED at the clock), for conditions that compare "today"
+        with a baseline of finished sessions. ``(False, None)`` on a daily clock, where the clock
+        bar IS the finished day. A live account has no such method (it reads the forming bar)."""
+        if not getattr(self._price, "is_intraday", False):
+            return False, None
+        return True, self._price.volume_so_far(symbol, self._price.now())
+
     def _as_of_date(self):
         """The simulated bar's calendar date (the provider's as-of clamp boundary)."""
         return self._price.now().date()

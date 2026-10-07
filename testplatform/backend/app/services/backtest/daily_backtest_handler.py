@@ -957,6 +957,10 @@ def run_daily_backtest(
         )
 
         ps = AsOfPriceSource(ohlcv_provider=ohlcv, interval=interval)
+        # The ONE knowability rule for daily data lives on the price source (the clock owner);
+        # binding makes every DAILY read through the memoized provider obey it on an intraday
+        # clock (no-op on a daily clock). See AsOfPriceSource.knowable_daily_end.
+        ohlcv.bind_price_source(ps)
         ps.preload(
             config["enabled_instruments"],
             config["start_date"],
@@ -1030,10 +1034,24 @@ def run_daily_backtest(
                     raw_ohlcv, config["start_date"], config["end_date"]),
                 market_condition_record=market_condition_record,
             )
-            engine.run()
+            # EVENT-data half of the knowability rule: on an intraday clock the readers admit an
+            # item only from the instant it was public (ba2_common.core.knowability); the flag is
+            # thread-local and lives exactly as long as this run.
+            from ba2_common.core.knowability import intraday_decisions
+            with intraday_decisions(ps.is_intraday, scan_cutoff=ps.scan_cutoff_date):
+                engine.run()
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).
             results = build_results(account, config)
+            if ps.is_intraday:
+                # What the intraday-clock rule dropped, so a REDUCED universe / lost decision is
+                # visible in the persisted result (intraday runs only; absent on a daily clock).
+                results["intraday_clock"] = {
+                    **engine.intraday_counters,
+                    **account.intraday_counters,
+                    "sessions_without_decision_bar": dict(
+                        getattr(engine, "sessions_without_decision_bar", {})),
+                }
             # How option fills were priced (plan Part F). Options runs only, so an equity
             # run's results are exactly what they were.
             apply_option_spread_record(results, account)
@@ -1053,11 +1071,29 @@ def run_daily_backtest(
             # single chokepoint every path goes through (trial worker, master top-N persist,
             # parallel=1), so both compute_fitness call sites get it without touching either.
             results.update(_car_trade_thresholds_for_experts(config))
+            _record = _decision_time_record(engine, config)
+            if _record is not None:
+                results["decision_time"] = _record
             return results
         finally:
             # Drop the per-run OHLCV override so it never leaks into a later (non-backtest) call.
             set_backtest_ohlcv_override(None)
             clear_backtest_market_conditions()
+
+
+def _decision_time_record(engine, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ``decision_time`` section of a persisted result: the time(s) each pass ran at and how
+    many scheduled (session, time) pairs had NO bar (a 15:30 schedule on a 13:00 half day), so a
+    stored row shows the decisions it never made. None on a daily clock or without schedule times
+    (every run before the decision-time gene keeps the result shape it had)."""
+    if config.get("execution_interval", "1d") == "1d":
+        return None
+    entry = (config.get("run_schedule_override") or {}).get("times")
+    manage = (config.get("manage_schedule_override") or {}).get("times")
+    if not entry and not manage:
+        return None
+    return {"entry_times": list(entry or []), "manage_times": list(manage or []),
+            "sessions_without_decision_bar": dict(engine.sessions_without_decision_bar)}
 
 
 def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float]:

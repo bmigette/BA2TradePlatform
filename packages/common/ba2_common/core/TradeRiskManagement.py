@@ -10,6 +10,7 @@ import time
 from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 from datetime import datetime, timezone
 
+from ba2_common.core.knowability import require_decision_price
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
 from ba2_common.core.interfaces.ExtendableSettingsInterface import trading_permission, coerce_bool
@@ -1428,6 +1429,9 @@ class TradeRiskManagement:
                                      balance_after=remaining_balance)
                     updated_orders.append(order)
                     continue
+                # the anchor of the size (budget / price) and of the safeguard stop below: on an
+                # intraday clock it must be the decision price, never a daily bar
+                require_decision_price(current_price, what="position size", symbol=symbol)
                 self._trace_note(trace, price=current_price)
 
                 # THE GRID for this symbol: 1.0 (whole shares) unless the expert opted in AND

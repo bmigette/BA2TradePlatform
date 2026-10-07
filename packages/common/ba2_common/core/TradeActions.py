@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, date, timedelta
 
+from ba2_common.core.knowability import require_decision_price
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, TradeActionResult
@@ -128,12 +129,17 @@ class TradeAction(ABC):
             Current price or None if unavailable
         """
         try:
-            return self.account.get_instrument_current_price(self.instrument_name)
+            price = self.account.get_instrument_current_price(self.instrument_name)
         except Exception as e:
             absorb_if_benign(e, InstanceNotFound)
             logger.error(f"Error getting current price for {self.instrument_name}: {e}", exc_info=True)
             return None
-    
+        # every TP/SL/reference level and share count a TradeAction builds anchors on THIS price:
+        # on an intraday clock it must be the decision price (guard outside the try: it must raise)
+        if price is not None:
+            require_decision_price(price, what="TradeAction anchor", symbol=self.instrument_name)
+        return price
+
     def get_current_position(self) -> Optional[float]:
         """
         Get current position quantity for the instrument.

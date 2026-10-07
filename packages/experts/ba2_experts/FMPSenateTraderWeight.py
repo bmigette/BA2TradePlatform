@@ -30,6 +30,7 @@ from ba2_common.core.types import (
     AnalysisUseCase,
 )
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
+from ba2_common.core.knowability import intraday_decision_clock
 from ba2_common.logger import get_expert_logger
 from ba2_common.config import get_app_setting
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPCongressTradingMixin
@@ -227,6 +228,16 @@ def flush_all_scoring_caches() -> int:
         except OSError as e:
             logger.error("Failed to flush scoring shard %s: %s", path, e, exc_info=True)
     return written
+
+
+def _disclosure_ceiling(now: datetime) -> datetime:
+    """The latest disclosure DATE (midnight-anchored) visible at decision ``now``.
+
+    Legacy / live / daily clock: ``now`` itself (a disclosure dated D is visible on D). INTRADAY
+    backtest clock: FMP gives a disclosure only a date, published at an unknown time of day, so it
+    is public from the NEXT session: ``now`` minus one day makes ``D 00:00 <= ceiling`` true from
+    D+1's 00:00-anchored comparison on (see ba2_common.core.knowability)."""
+    return now - timedelta(days=1) if intraday_decision_clock() else now
 
 
 @lru_cache(maxsize=None)
@@ -696,7 +707,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         candidates it doesn't actually need are simply filtered back out downstream."""
         lo = bisect.bisect_left(index["disclose_dates"],
                                 now - timedelta(days=int(max_disclose_days) + 1))
-        hi = bisect.bisect_right(index["disclose_dates"], now)
+        hi = bisect.bisect_right(index["disclose_dates"], _disclosure_ceiling(now))
         exec_floor = now - timedelta(days=int(max_exec_days) + 1)
         return [t for _d, e, t in index["rows"][lo:hi] if exec_floor <= e <= now]
 
@@ -725,7 +736,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 except (ValueError, TypeError):
                     dates.append(None)  # unparseable -> always kept, like _disclosure_date_ok
             parse_memo[pkey] = dates
-        sliced = [t for t, d in zip(history, dates) if d is None or d <= ceiling]
+        vis = _disclosure_ceiling(ceiling)
+        sliced = [t for t, d in zip(history, dates) if d is None or d <= vis]
         day_memo[name] = sliced
         return sliced
 
@@ -824,8 +836,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
         # Live (as_of=None) reads the account/broker quote (the original live
         # source); backtest (as_of set) reads the OHLCV close-at-as_of.
-        current_price = (self._get_current_price(symbol) if as_of is None
-                         else providers.price_at_date(symbol, as_of))
+        current_price = self._decision_price(providers, symbol, as_of)
         return {
             "all_trades": all_trades,
             # still-held ONLY -- see the note where this is built; the windowed set hides
@@ -1066,7 +1077,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
                 # Preserve backtest price resolution and exception isolation. Live quotes
                 # are resolved in one account batch AFTER all historical preparation below.
-                current_price = (providers.price_at_date(symbol, as_of)
+                current_price = (self._decision_price(providers, symbol, as_of)
                                  if as_of is not None else None)
             except cache_miss_excs as e:
                 # UNPREWARMED symbol discovered dynamically from the live disclosure feed --
@@ -1175,7 +1186,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             d = _parse_ymd_utc(ds)
         except (ValueError, TypeError):
             return True
-        return d <= ceiling
+        return d <= _disclosure_ceiling(ceiling)
 
     def _process(self, data_bundle: Dict[str, Any], settings: Dict[str, Any],
                  as_of: Optional[datetime] = None) -> Recommendation:
@@ -1848,6 +1859,14 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         for offset in range(max_walk_days + 1):
             probe = date + timedelta(days=offset)
             if ceiling is not None and probe > ceiling:
+                return None
+            if ceiling is not None and intraday_decision_clock() and probe.date() >= ceiling.date():
+                # INTRADAY clock: the OPEN of the decision's own date is the opening print of a bar
+                # that has not necessarily ended at the decision instant (09:30-09:35 for a 09:30
+                # decision), and the decision-price seam is "the close of the latest ended bar",
+                # not that open. Neither is a knowable DATE price, so the forward return is not
+                # yet known and the trade is dropped from scoring (the same honest outcome as
+                # past the ceiling). A walk that reaches the decision date is cut here.
                 return None
             price = self._get_price_at_date(symbol, probe)
             if price:

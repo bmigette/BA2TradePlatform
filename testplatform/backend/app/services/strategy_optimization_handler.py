@@ -31,6 +31,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ba2_common.core.knowability import DEFAULT_DECISION_TIME, entry_times_for  # noqa: F401
+
+
+def _is_intraday_interval(interval: Any) -> bool:
+    """m / h / min suffix = an intraday clock (the engine's own split, price_source._is_intraday).
+    A missing interval is read as intraday: the safe side of ``entry_times_for`` (it raises)."""
+    if interval is None:
+        return True
+    iv = str(interval).lower()
+    return iv.endswith("m") or iv.endswith("h") or iv.endswith("min")
+from ba2_common.core.schedule_genes import validate_decision_times
 from app.models import (
     SessionLocal,
     Strategy as StrategyModel,
@@ -391,6 +402,9 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
                # "consistent by luck" blind spot the consistent-annual fitness exists to fight.
                "total_return": results.get("total_return"),
                "max_drawdown": results.get("max_drawdown"),
+               # The decision-time counter, so the MASTER can warn once per job (see
+               # ``_decision_time_missing``). Only when non-zero: other results keep their shape.
+               **_decision_time_missing(results),
                # Per-trial memory telemetry (a few psutil/len calls — negligible): RSS of
                # THIS worker process + the two per-process OHLCV caches, so a memory-driven
                # incident (e.g. WinError 1450 on the remote box) leaves a trail showing what
@@ -1535,6 +1549,20 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 if k.startswith("schedule:")
             } or None
 
+        # DECISION-TIME gene (schedule:time): validated here, where the run's execution interval
+        # is known, in addition to the launcher's check -- a hand-written config that bypassed the
+        # launcher must not reach the GA with a time the engine cannot honour.
+        _time_spec = (schedule_cfg or {}).get("time")
+        if _time_spec and _time_spec.get("optimize"):
+            try:
+                _validated = validate_decision_times(
+                    _time_spec["choices"], backtest_cfg.get("execution_interval", "1d"))
+            except ValueError as e:
+                return _fail(opt_id, db, f"schedule:time gene: {e}")
+            if list(_time_spec["choices"]) != _validated:
+                return _fail(opt_id, db, f"schedule:time choices must be sorted ascending, got "
+                                         f"{list(_time_spec['choices'])!r}")
+
         # BYPASS expert (piece 1c): if the backtest's expert declares ``bypasses_classic_rm``
         # (e.g. FactorRanker) the search space must EXCLUDE tp/sl/cond:*/exit:* and search
         # ONLY the expert's own params (model:*). Detected from the backtest_cfg experts here so
@@ -1640,6 +1668,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "robustness": (results or {}).get("robustness"),
                     "total_return": (results or {}).get("total_return"),
                     "max_drawdown": (results or {}).get("max_drawdown"),
+                    **_decision_time_missing(results or {}),
                 }
             )
             if best["fitness"] is None or fit > best["fitness"]:
@@ -1974,7 +2003,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                              "fitness_raw": out.get("fitness_raw"),
                              "robustness": out.get("robustness"),
                              "total_return": out.get("total_return"),
-                             "max_drawdown": out.get("max_drawdown")}
+                             "max_drawdown": out.get("max_drawdown"),
+                             **({"dt_missing": out["dt_missing"]} if out.get("dt_missing") else {})}
                         )
                         if is_last_gen:
                             _capture_full_result(last_gen_full_results, key, out)
@@ -2380,6 +2410,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         opt.progress = 100.0
         opt.best_params = result["best_params"]
         opt.best_fitness = result["best_fitness"]
+        _warn_decision_time_missing(opt.name, all_results)
         opt.all_results = all_results
         db.commit()
         push_optimization(opt, db)
@@ -2571,6 +2602,37 @@ def _market_condition_trial_pins(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]
 
     profiles, manifests = market_condition_pins(backtest_cfg, required=False)
     return {"market_condition_profiles": profiles, "market_condition_manifests": manifests}
+
+
+def _decision_time_missing(results: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"dt_missing": {"entry": n, "manage": n}}`` when a trial had scheduled sessions with no
+    bar at the scheduled time (e.g. 15:30 on a half day), else ``{}``."""
+    counts = ((results or {}).get("decision_time") or {}).get("sessions_without_decision_bar")
+    if counts and any(counts.values()):
+        return {"dt_missing": {"entry": int(counts["entry"]), "manage": int(counts["manage"])}}
+    return {}
+
+
+def _warn_decision_time_missing(opt_name: str, all_results: list) -> None:
+    """ONE job-level WARNING aggregating the per-trial counters (engines log them at DEBUG)."""
+    hit = [r["dt_missing"] for r in all_results if isinstance(r, dict) and r.get("dt_missing")]
+    if hit:
+        logger.warning(
+            f"[{opt_name}] {len(hit)} of {len(all_results)} trials had scheduled sessions with NO "
+            f"bar at the scheduled decision time (e.g. 15:30 on a 13:00 half day: no decision, "
+            f"no entry): per-trial entry/manage sessions skipped, total "
+            f"{sum(h['entry'] for h in hit)}/{sum(h['manage'] for h in hit)}")
+
+
+def _schedule_times_from_gene(gene_time: Optional[str]) -> Optional[Dict[str, List[str]]]:
+    """The ENTRY and the MANAGE schedule's ``times`` a decoded ``schedule:time`` gene stands for
+    (None without the gene). The ONE place the two are derived: today both are the single gene
+    value; splitting the gene into an entry time and a manage time changes only this function
+    (and the reconstruction in ``ba2_common.core.schedule_genes``), nothing else assumes they
+    are equal."""
+    if not gene_time:
+        return None
+    return {"entry": [gene_time], "manage": [gene_time]}
 
 
 def _build_daily_trial_config(
@@ -2791,13 +2853,34 @@ def _build_daily_trial_config(
     # static (pulled from the run-level override, unaffected by the genes) since only the day
     # selection is being optimized for now.
     base_run_sched = backtest_cfg.get("run_schedule_override")
-    if decoded.get("schedule_days"):
+    manage_schedule_override = backtest_cfg.get("manage_schedule_override")
+    gene_time = decoded.get("schedule_time")
+    gene_times = _schedule_times_from_gene(gene_time)
+    if decoded.get("schedule_days") or gene_time:
+        days = decoded.get("schedule_days") or (base_run_sched or {}).get("days")
+        if not days:
+            raise ValueError("a schedule:time gene needs the run's entry days (schedule:<day> "
+                             "genes or a run_schedule_override with days): refusing to guess")
         run_schedule_override = {
-            "days": decoded["schedule_days"],
-            "times": (base_run_sched or {}).get("times") or ["09:30"],
+            "days": days,
+            # THE DECISION-TIME GENE wins; else the run-level time when the run states one; else
+            # the shared default decision time (a new run only: stored rows reconstruct through
+            # schedule_genes with their own time).
+            "times": (gene_times["entry"] if gene_times
+                      else entry_times_for((base_run_sched or {}).get("times"), stored_row=False,
+                                           intraday=_is_intraday_interval(backtest_cfg.get("execution_interval")))),
         }
     else:
         run_schedule_override = base_run_sched
+    if gene_times:
+        # The open-positions MANAGE pass is retimed from the same gene (live deploys both
+        # schedules at the one stored time; see tools/import_deploy_payload.py). Days stay the
+        # run's own.
+        if not (manage_schedule_override or {}).get("days"):
+            raise ValueError("a schedule:time gene needs backtest.manage_schedule_override with "
+                             "days to retime: refusing to leave the manage pass on another time")
+        manage_schedule_override = {"days": dict(manage_schedule_override["days"]),
+                                    "times": gene_times["manage"]}
 
     return {
         "backtest_id": trial_id,
@@ -2820,7 +2903,7 @@ def _build_daily_trial_config(
         "subtype": backtest_cfg.get("subtype"),
         # Cadence (weekly entry) + intraday fill clock carry through to each trial's engine.
         "run_schedule_override": run_schedule_override,
-        "manage_schedule_override": backtest_cfg.get("manage_schedule_override"),
+        "manage_schedule_override": manage_schedule_override,
         "execution_interval": backtest_cfg.get("execution_interval", "1d"),
         # Per-trade profit cap (% of cost basis): the GA ranks on the ADJUSTED fitness so one
         # lucky, non-reproducible mega-winner can't win the search. None = no cap. Carried from
@@ -3505,6 +3588,14 @@ def _build_warm_start_population(
     if not results:
         return None
     tail = results[-target_size:] if len(results) > target_size else list(results)
+    has_stratified = any(c.get("stratify") for c in optimizer.param_ranges.values())
+    if has_stratified:
+        # A seed from a job without the decision-time gene must not silently become "the first
+        # time": the missing value is completed so generation 0 is balanced (see
+        # ``GeneticOptimizer.seeded_population``), padding included.
+        return optimizer.seeded_population(
+            [optimizer.encode_params(e.get("params") or {}, allow_missing_stratified=True)
+             for e in tail], target_size)
     population = [optimizer.encode_params(e.get("params") or {}) for e in tail]
     while len(population) < target_size:
         population.append(optimizer.toolbox.individual())

@@ -34,6 +34,64 @@ def cap_passthrough(args: Any) -> List[str]:
     return out
 
 
+#: Appended to the base name of every job that carries the decision-time gene (the launcher
+#: REQUIRES it in a ``--decision-times`` job's name; see ``ba2test_launcher._resolve_decision_times``).
+DECISION_TIMES_NAME_TOKEN = "-timegene"
+
+
+def decision_times_plan(raw: Any, interval: str) -> "tuple[list | None, str]":
+    """``(times, header)`` for a GRID DRIVER's ``--decision-times`` flag.
+
+    Drivers default to the gene ON (``when_unset="default"``: the shared
+    ``DEFAULT_DECISION_TIME_CHOICES``); ``fixed`` turns it off; a comma list overrides. On a daily
+    clock an UNSET flag resolves to "not optimizable" (an explicit one is refused). ``header`` is
+    the line the driver prints once, stating the EFFECTIVE choice."""
+    from ba2_common.core.knowability import DEFAULT_DECISION_TIME
+    from ba2_common.core.schedule_genes import interval_minutes, parse_decision_times_arg
+
+    times = parse_decision_times_arg(raw, interval, when_unset="default")
+    if times:
+        return times, f"decision times (GA gene schedule:time): {','.join(times)}"
+    try:
+        interval_minutes(interval)
+    except ValueError:
+        return None, "decision time: daily clock (not optimizable)"
+    return None, (f"decision time: fixed {DEFAULT_DECISION_TIME} "
+                  f"(DEFAULT_DECISION_TIME; --decision-times fixed)")
+
+
+def decision_times_tokens(times: "list | None") -> List[str]:
+    """``--decision-times`` tokens for one job's argv ([] when the gene is off)."""
+    return ["--decision-times", ",".join(times)] if times else []
+
+
+OPTION_DRIVER_DT_HEADER = "decision time: daily clock (not optimizable)"
+
+
+def add_refused_decision_times_flag(ap: Any) -> None:
+    """Declare ``--decision-times`` on an OPTION driver's parser purely to REFUSE it with a reason.
+
+    Option backtests run on a DAILY clock (the option price data are daily bars), so there is no
+    decision time to search; see docs/plans/2026-10-07-decision-time-gene.md section on options."""
+    ap.add_argument("--decision-times", default=None, help="REFUSED: option jobs run on a daily "
+                    "clock, the decision time is not optimizable.")
+
+
+def refuse_decision_times_and_announce(args: Any) -> None:
+    """Exit loudly if an option driver was given ``--decision-times``; else print the header."""
+    if getattr(args, "decision_times", None) is not None:
+        raise SystemExit(
+            f"--decision-times {args.decision_times!r} is refused by this option driver: option "
+            f"backtests run on a DAILY clock (one bar per session; option prices are daily "
+            f"bars), so the decision time is not optimizable.")
+    print(OPTION_DRIVER_DT_HEADER, flush=True)
+
+
+def with_decision_times_name(name: str, times: "list | None") -> str:
+    """``name`` with the gene's name token appended when the job carries the gene."""
+    return name + DECISION_TIMES_NAME_TOKEN if times and DECISION_TIMES_NAME_TOKEN not in name else name
+
+
 def job_name_with_digest(name: str, cmd: List[str]) -> str:
     """``name``, or ``name-d<digest>`` when ``cmd`` carries any token beyond the driver's base
     invocation (i.e. the caller only invokes this once it has decided a digest is warranted —

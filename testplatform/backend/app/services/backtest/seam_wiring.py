@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ba2_common.core.instance_resolver import (
     set_instance_resolver,
@@ -560,7 +560,11 @@ def check_market_condition_window(config: Dict[str, Any], reader: Any) -> List[s
             f"coverage was checked; the sessions were not.")
         return []
     universe = market_condition_universe(config)
-    problems = window_coverage_problems(mapped, universe, start, end)
+    from app.services.backtest.price_source import _is_intraday
+    # An intraday run reads the row of the last FINISHED session: the snapshot must reach back one
+    # session before ``start`` (see window_coverage_problems).
+    intraday = _is_intraday(config.get("execution_interval") or "1d")
+    problems = window_coverage_problems(mapped, universe, start, end, intraday=intraday)
     if not problems:
         return []
     message = (
@@ -746,8 +750,13 @@ class MetricStoreATRProvider:
     repeated construction is cheap.
     """
 
-    def __init__(self, store_dir: str):
+    def __init__(self, store_dir: str, session_date_fn: Optional[Callable[[Any], Any]] = None):
         self._store_dir = store_dir
+        # ``AsOfPriceSource.daily_session_date``: the newest session whose daily data is knowable
+        # at the decision instant ``end_date``. The store's row for day S holds ATR from S's
+        # FINISHED bar, so an intraday 09:30 decision on S must read the prior session's row.
+        # None (unit tests) = the date of ``end_date`` itself, the daily-clock reading.
+        self._session_date_fn = session_date_fn
 
     def get_indicator(self, symbol: str, indicator: str, start_date: Any = None,
                       end_date: Any = None, lookback_days: Any = None, interval: str = "1d",
@@ -762,7 +771,10 @@ class MetricStoreATRProvider:
         col = f"atr_{int(period)}"
         try:
             df = ms.load_store(self._store_dir)
-            day = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)[:10]
+            if self._session_date_fn is not None:
+                day = self._session_date_fn(end_date).strftime("%Y-%m-%d")
+            else:
+                day = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)[:10]
             rows = ms.metrics_as_of(df, day, [col])
         except Exception:  # noqa: BLE001 — any store issue -> safe empty (caller's no-ATR fallback)
             return empty
@@ -780,10 +792,12 @@ class MetricStoreATRProvider:
             return empty
 
 
-def make_atr_cache_indicator_provider(screener_store: Optional[str]) -> Optional[Any]:
+def make_atr_cache_indicator_provider(screener_store: Optional[str],
+                                      session_date_fn: Optional[Callable[[Any], Any]] = None
+                                      ) -> Optional[Any]:
     """``MetricStoreATRProvider`` bound to ``screener_store``, or ``None`` when no store is
     configured for this run (caller falls back to ``make_indicator_provider()``, the existing
     — currently non-hermetic in the GA path — live provider)."""
     if not screener_store:
         return None
-    return MetricStoreATRProvider(screener_store)
+    return MetricStoreATRProvider(screener_store, session_date_fn=session_date_fn)

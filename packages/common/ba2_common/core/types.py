@@ -1105,7 +1105,7 @@ class Recommendation:
     """
     signal: OrderRecommendation          # BUY/SELL/HOLD/OVERWEIGHT/UNDERWEIGHT/ERROR
     confidence: float                    # 1-100 scale (platform convention)
-    current_price: float                 # the as_of close, resolved in _gather
+    current_price: Optional[float]       # the DECISION price resolved in _gather; None only on a skip with no price
     details: str = ""
     expected_profit_percent: Optional[float] = None
     target_price: Optional[float] = None   # expert's recommended TP price (None -> backtest derives from expected_profit_percent)

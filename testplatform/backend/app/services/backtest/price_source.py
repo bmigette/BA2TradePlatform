@@ -44,6 +44,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ba2_common.core.knowability import DecisionPrice
+from ba2_providers.screener.metric_store import scan_cutoff_date as _scan_cutoff
+
 logger = logging.getLogger(__name__)
 
 
@@ -609,6 +612,8 @@ class AsOfPriceSource:
         self._interval = interval
         self._intraday = _is_intraday(interval)  # cached: interval is constant for a run
         self._clock: Optional[datetime] = None
+        self._kde: Optional[datetime] = None     # knowable_daily_end of the CLOCK (set_clock, intraday)
+        self._scan_cut: Optional[date] = None    # scan_cutoff_date of the CLOCK (set_clock, intraday)
         # COLUMNAR bar store. The old store was a per-symbol dict-of-dicts ({key: {"open",...}}) at
         # ~400 bytes/bar — for a screened union × 3yr × 5min that was ~7-9 GB/worker, almost all of
         # it the ~9M tiny inner dicts. Here each symbol keeps a sorted Python key list (date for
@@ -655,6 +660,43 @@ class AsOfPriceSource:
         # int64-ns twin of the clock key: the bar store now holds int64 keys, and bar_at/close_at
         # compare against this on every lookup. Computed once per bar, like _clock_key.
         self._clock_key64 = _key64(as_of, self._interval)
+        if self._intraday:
+            # The decision-price cut-offs, once per TICK (not per symbol): a bar is finished when
+            # its stamp <= clock - interval; a latest-finished bar older than the last finished
+            # session's midnight means "no price knowable" (halted / stale).
+            self._dp_cut = self._clock_key64 - _interval_ns(self._interval)
+            a = _to_utc(as_of)
+            fin = _finished_session_end(a)
+            self._kde = min(a, fin)
+            self._scan_cut = _scan_cutoff(a, intraday=True)
+            self._dp_floor = (fin.date() - _EPOCH_DATE).days * _NS_PER_DAY
+
+    def _dp_index(self, symbol: str) -> int:
+        """Index of the bar the decision price at the CLOCK is read from, or -1. The monotonic
+        per-symbol cursor (last key <= clock) stepped back past bars that have not ended; O(1)."""
+        k = self._keys.get(symbol)
+        if not k:
+            return -1
+        # the monotonic cursor (last key <= clock), inlined: this is the per-symbol-per-tick path
+        cursor = self._cursor
+        c = cursor.get(symbol, -1)
+        ck = self._clock_key64
+        n = len(k)
+        while c + 1 < n and k[c + 1] <= ck:
+            c += 1
+        cursor[symbol] = c
+        cut = self._dp_cut
+        while c >= 0 and k[c] > cut:
+            c -= 1
+        if c < 0 or k[c] < self._dp_floor:
+            return -1
+        return c
+
+    def has_decision_price(self, symbol: str) -> bool:
+        """Whether a price is knowable for ``symbol`` at the CLOCK (the cheap universe test)."""
+        if not self._intraday:
+            return self.bar_at(symbol) is not None
+        return self._dp_index(symbol) >= 0
 
     def now(self) -> datetime:
         if self._clock is None:
@@ -669,6 +711,120 @@ class AsOfPriceSource:
         Used by ``AsOfClampedOHLCVProvider`` to cap indicator/ATR fetches at the bar.
         """
         return self._clock
+
+    # ---- the ONE knowability rule for DAILY data and the decision price (2026-10-07) --------
+    #
+    # A daily bar for session S is stamped at S's midnight but is only KNOWN once S has closed.
+    # Daily reads were sliced ``<= as_of``, so on an INTRADAY clock (the classic GA runs at
+    # execution_interval=5min) every daily reader received the DECISION SESSION'S OWN finished bar
+    # -- close, high, low, volume -- at the open. Live at the open only has prior sessions.
+    #
+    # THE RULE, a function of the decision instant T and the bar interval only (nothing here
+    # names the open, 09:30 or a 5-minute grid):
+    #
+    #   * DAILY HISTORY at T = the sessions that have FINISHED at or before T, by the market
+    #     calendar's own close time (13:00 on a half day, not a fixed 16:00). A decision at 15:55
+    #     does not see today's bar; one at 16:05, or any time after the close, does.
+    #   * PRICE at T = the close of the latest intraday bar that has ENDED at or before T (a bar
+    #     stamped t covers [t, t + interval): the bar stamped 10:55 is finished at 11:00, the one
+    #     stamped 11:00 is not). NO special case at the session's first instant: a decision on
+    #     the first bar legitimately sees only the previous session's last bar (the cache has no
+    #     pre-market bars). That is not what a live run at the open sees (an opening quote), so
+    #     the engine WARNS when a schedule time equals the first bar, and new grids decide at
+    #     ``DEFAULT_DECISION_TIME`` (one or more bars after the open).
+    #   * The FILL is unchanged: the open of the bar AFTER the decision bar (``next_bar``).
+    #
+    # Bar stamps are EXCHANGE-LOCAL WALL TIME, labelled UTC, and mark the START of the bar
+    # (measured on the cache: first bar 09:30 with open == the daily open, last bar 15:55, no
+    # extended hours); the rule reads a stamp as New York wall time. DAILY clock
+    # (execution_interval=1d): the bar stamped D decides with D's close and fills at D+1's open,
+    # which is what live does before D+1's open: NOT a look-ahead, and every method is the
+    # identity / the old read there.
+    def knowable_daily_end(self, as_of: Any) -> Any:
+        """The latest instant a DAILY bar may be stamped at for a read made at decision ``as_of``.
+
+        Intraday clock: ``min(as_of, end of the last session FINISHED at or before as_of)``.
+        Daily clock: ``as_of`` unchanged (see the block comment above)."""
+        if not self._intraday:
+            return as_of
+        if as_of is self._clock and self._kde is not None:
+            return self._kde                                  # the clock itself: once per tick
+        a = _to_utc(as_of)
+        return min(a, _finished_session_end(a))
+
+    def daily_session_date(self, as_of: Any) -> date:
+        """The newest session whose DAILY data is knowable at decision ``as_of`` (a date).
+
+        Used for per-day stores keyed by session date (the screener metric store's scan day,
+        the market-regime calendar, the metric-store ATR). Daily clock: ``as_of``'s own date.
+        Intraday clock: the last session finished at or before ``as_of``."""
+        if not self._intraday:
+            return _to_utc(as_of).date()
+        return _finished_session_end(_to_utc(as_of)).date()
+
+    def scan_cutoff_date(self, as_of: Any) -> date:
+        """The latest DATE ``S`` such that a date-keyed store row dated ``S`` (content as of the close
+        of ``S``: screener scans, ATR columns, regime flags, factor metrics) is visible at decision
+        ``as_of`` -- INCLUSIVE.
+
+        INTRADAY clock: a row dated S is visible iff EVERY session with date <= S has FINISHED at T,
+        i.e. S is strictly before the earliest session not yet finished (the session in progress, or
+        the next one when the market is closed). So a Saturday scan is visible from Monday's open
+        (Friday is finished), a Wednesday scan only once Wednesday's session is finished (Wednesday
+        16:05 or Thursday), a holiday-dated row like a weekend-dated one. NOT "the last finished
+        session's date" (that lags every weekend-dated scan one session). DAILY clock: the bar's own
+        date, as before (decide on D's close)."""
+        if not self._intraday:
+            return _to_utc(as_of).date()
+        if as_of is self._clock and self._scan_cut is not None:
+            return self._scan_cut
+        return _scan_cutoff(_to_utc(as_of), intraday=True)
+
+    def decision_price(self, symbol: str, as_of: Any) -> Optional[float]:
+        """The price KNOWABLE at decision instant ``as_of`` from the run's own bar series.
+
+        INTRADAY clock: the close of the latest bar that has ENDED at or before ``as_of`` (the
+        previous session's last bar when none of today's has ended). Never the decision bar's
+        own close (not yet printed), never a daily close. ``None`` when nothing is knowable:
+        the caller must refuse to decide.
+
+        Daily clock: the close of the bar stamped ``as_of`` (forward-filled)."""
+        k = self._keys.get(symbol)
+        if k is None or not len(k):
+            return None
+        if self._intraday and (as_of is self._clock or (self._clock is not None and as_of == self._clock)):
+            i = self._dp_index(symbol)                      # the hot path: the clock itself
+            return None if i < 0 else DecisionPrice(float(self._c[symbol][i]), int(k[i]), as_of)
+        key = _key64(as_of, self._interval)
+        if not self._intraday:
+            i = bisect.bisect_right(k, key) - 1
+            return None if i < 0 else float(self._c[symbol][i])
+        span = _interval_ns(self._interval)
+        f = bisect.bisect_right(k, key - span) - 1        # latest bar with stamp + interval <= T
+        if f < 0:
+            return None
+        # STALENESS: the latest ended bar must belong to T's own session or to the last session
+        # finished before it (a thin name's last print may be hours old, or yesterday's close).
+        # An older one means the symbol is halted / delisted / has no data: nothing is knowable
+        # and the symbol cannot be decided, exactly as live cannot trade it.
+        if _ns_date(k[f]) < self.daily_session_date(as_of):
+            return None
+        return DecisionPrice(float(self._c[symbol][f]), int(k[f]), as_of)
+
+    def volume_so_far(self, symbol: str, as_of: Any) -> Optional[float]:
+        """Volume traded in T's own session so far: the sum over the intraday bars that have ENDED
+        at or before ``as_of`` (knowable; 0.0 when none has ended yet). Intraday clock only --
+        ``None`` on a daily clock or for a symbol with no bars."""
+        if not self._intraday:
+            return None
+        k = self._keys.get(symbol)
+        if k is None or not len(k):
+            return None
+        key = _key64(as_of, self._interval)
+        end = bisect.bisect_right(k, key - _interval_ns(self._interval))     # first bar not yet ended
+        day0 = (key // _NS_PER_DAY) * _NS_PER_DAY
+        start = bisect.bisect_left(k, day0)
+        return float(self._v[symbol][start:end].sum()) if end > start else 0.0
 
     # ---- loading -----------------------------------------------------------
     def preload(
@@ -1171,6 +1327,57 @@ def _to_utc(d: Any) -> datetime:
     raise TypeError(f"Cannot normalise {d!r} ({type(d)}) to a datetime")
 
 
+#: per calendar DAY: (that day's close as naive NY wall time or None when it is not a session, the last
+#: session before it). The calendar is consulted once per day of a run.
+_DAY_CALENDAR: Dict[date, tuple] = {}
+
+
+def _day_calendar(day: date) -> tuple:
+    ent = _DAY_CALENDAR.get(day)
+    if ent is None:
+        from ba2_common.core.market_calendar import (
+            NY_TZ, is_regular_session, prior_regular_session, regular_session_close_utc)
+        close = (regular_session_close_utc(day).astimezone(NY_TZ).replace(tzinfo=None)
+                 if is_regular_session(day) else None)
+        ent = _DAY_CALENDAR[day] = (close, prior_regular_session(day))
+    return ent
+
+
+def _finished_session_end(as_of_utc: datetime) -> datetime:
+    """End (23:59:59.999999, labelled UTC) of the last regular NYSE session that has FINISHED at
+    or before the decision instant ``as_of_utc``.
+
+    The backtest's instants are exchange-local wall time labelled UTC, so the stamp is read as
+    New York time and compared with the calendar's own close of the stamp's date (13:00 on a half
+    day). On a session day at or after its close that day counts; otherwise the last session
+    before it does (also pre-market, weekends and holidays). Raises rather than guessing when the
+    calendar cannot answer."""
+    wall = as_of_utc.replace(tzinfo=None)
+    day = wall.date()
+    close, prior = _day_calendar(day)
+    d = day if (close is not None and wall >= close) else prior
+    return datetime(d.year, d.month, d.day, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+
+_NS_PER_DAY = 86_400 * 1_000_000_000
+_EPOCH_DATE = date(1970, 1, 1)
+
+
+def _interval_ns(interval: str) -> int:
+    """A bar interval string ('1min', '5m', '15min', '1h', '4hour') in nanoseconds. Refuses an
+    interval it cannot read: the finished-bar test cannot be guessed."""
+    iv = (interval or "").strip().lower()
+    for suffix, unit in (("min", 60), ("hour", 3600), ("m", 60), ("h", 3600)):
+        if iv.endswith(suffix) and iv[: -len(suffix)].isdigit():
+            return int(iv[: -len(suffix)]) * unit * 1_000_000_000
+    raise ValueError(f"cannot read the bar length of execution_interval {interval!r}")
+
+
+def _ns_date(ns: int) -> date:
+    """The calendar date of an int64-ns bar key (exchange-local wall date)."""
+    return np.datetime64(int(ns), "ns").astype("datetime64[D]").astype(date)
+
+
 class AsOfClampedOHLCVProvider:
     """Backtest-only OHLCV wrapper that caps every ``get_ohlcv_data(end_date=...)`` at the
     price source's current as_of clock.
@@ -1294,6 +1501,33 @@ class MemoizedOHLCVProvider:
         # BacktestCacheMiss (the user asked for a hard error, NOT a silent skip) so preload can
         # report exactly what to cache. cached_only=False keeps the live passthrough (fetch).
         self._cached_only = cached_only
+        # The run's clock owner (``bind_price_source``): where the daily-knowability rule lives.
+        self._ps: Optional["AsOfPriceSource"] = None
+        # Test/regression instrument: when a list, every DAILY read appends one record (see
+        # ``get_ohlcv_data``). None in production (one attribute test per read).
+        self.audit: Optional[List[Dict[str, Any]]] = None
+        # Daily reads made on an intraday run BEFORE the first clock tick: knowability cannot be
+        # determined, so they are counted and warned about once, never silently served.
+        self.unclocked_daily_reads = 0
+
+    def bind_price_source(self, price_source: "AsOfPriceSource") -> None:
+        """Attach the run's price source so DAILY reads obey its knowability rule
+        (``AsOfPriceSource.knowable_daily_end``). The handler calls this right after building
+        both; a provider that is never bound (the regime benchmark reader, tests, standalone
+        tools) behaves exactly as before."""
+        self._ps = price_source
+
+    def knowable_daily_end(self, as_of: Any) -> Any:
+        """The hook a CACHING reader (DeterministicScorer) uses to slice its own copy of the daily
+        series: the latest stamp a daily bar may carry at decision ``as_of``. Identity when no
+        price source is bound or the run is on a daily clock."""
+        ps = self._ps
+        if ps is None:
+            if self._intraday_decision_active():
+                raise RuntimeError("knowable_daily_end asked of a MemoizedOHLCVProvider that is not "
+                                   "bound to the run's price source during an intraday backtest")
+            return as_of
+        return ps.knowable_daily_end(as_of)
 
     def cached_path(self, symbol: str, interval: str) -> Optional[str]:
         """The native on-disk parquet for (symbol, interval), or None when there is none to sign.
@@ -1435,9 +1669,59 @@ class MemoizedOHLCVProvider:
             hi = int(np.searchsorted(dates, e, side="right"))
         return df.iloc[lo:hi].reset_index(drop=True)
 
+    def _intraday_decision_active(self) -> bool:
+        from ba2_common.core.knowability import intraday_decision_clock
+        return intraday_decision_clock()
+
     def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval="1d", **kwargs):
+        """DAILY reads on an intraday run are clamped to the knowable history WHATEVER the shape of
+        ``end_date`` (None, the decision instant, the end of its day, the wall clock, the far
+        future): the clamp is the DEFAULT. A caller that slices the series itself per decision
+        opts out EXPLICITLY through :meth:`get_ohlcv_data_unsliced`."""
+        return self._read(symbol, start_date, end_date, interval, unsliced=False)
+
+    def get_ohlcv_data_unsliced(self, symbol, start_date=None, end_date=None, interval="1d", **kwargs):
+        """The stored series, NOT clamped to the decision. ONLY for a reader that caches the series
+        for the run and slices it per decision through ``knowable_daily_end`` (DeterministicScorer
+        ``fetch_ohlcv``). Flagged ``bulk`` in the audit."""
+        return self._read(symbol, start_date, end_date, interval, unsliced=True)
+
+    def _read(self, symbol, start_date, end_date, interval, *, unsliced):
         df, dates = self._full(symbol, interval)
-        return self._slice(df, dates, start_date, end_date)
+        requested_end = end_date
+        ps = self._ps
+        active = interval == "1d" and self._intraday_decision_active()
+        if active and (ps is None or not ps.is_intraday):
+            # An intraday decision clock is on but this reader has no price source to say what is
+            # knowable: refusing is the only answer that cannot leak.
+            raise RuntimeError(
+                "daily OHLCV read during an intraday backtest by a MemoizedOHLCVProvider that is not "
+                "bound to the run's price source (bind_price_source): knowability cannot be determined")
+        if ps is not None and ps.is_intraday and interval == "1d" and not unsliced:
+            clk = ps.current()
+            if clk is None:
+                if active:
+                    raise RuntimeError(
+                        f"daily OHLCV read for {symbol} before the first clock tick of an intraday "
+                        f"run: knowability cannot be determined")
+                self.unclocked_daily_reads += 1
+                if self.unclocked_daily_reads == 1:
+                    logger.warning(
+                        "daily OHLCV read for %s on an intraday run before the first clock tick "
+                        "(outside the decision loop): served unclamped, counted in "
+                        "MemoizedOHLCVProvider.unclocked_daily_reads", symbol)
+            else:
+                cap = ps.knowable_daily_end(clk)
+                if end_date is None or _to_utc(end_date) > cap:
+                    end_date = cap
+        out = self._slice(df, dates, start_date, end_date)
+        if self.audit is not None and interval == "1d":
+            self.audit.append({
+                "symbol": symbol, "clock": None if ps is None else ps.current(),
+                "requested_end": requested_end, "bulk": bool(unsliced),
+                "last_bar": (None if out is None or not len(out) else out["Date"].iloc[-1]),
+                "n": 0 if out is None else len(out)})
+        return out
 
     def __getattr__(self, name):
         return getattr(self._inner, name)

@@ -119,12 +119,45 @@ def resolve_universe(as_of: datetime, config: Dict[str, Any], price_source) -> L
     (signature + filter) is built now so the swap is body-only.
     """
     universe = config["enabled_instruments"]
+    if getattr(price_source, "is_intraday", False):
+        # INTRADAY clock: a symbol is decidable when a price is KNOWABLE at ``as_of`` (the close of
+        # its latest bar that has ended, same or last finished session), NOT only when it printed
+        # a bar stamped exactly at ``as_of``. A thin name that did not trade in this one 5-minute
+        # window is still analysed live; its order fills at its next bar's open, whenever that
+        # opens (BacktestAccount.refresh_orders reads ``next_bar``).
+        idx = price_source._dp_index                     # per-tick cut-offs + cursor: no bisect per symbol
+        return [s for s in universe if idx(s) >= 0]
     return [s for s in universe if price_source.bar_at(s, as_of) is not None]
+
+
+_FIRST_BAR_WARNED: set = set()   # schedule times already warned about in this process
+
+
+class _BacktestProviderBundle(LiveProviderBundle):
+    """``LiveProviderBundle`` whose ``price_at_date`` is the price KNOWABLE at the decision.
+
+    The inherited read is "the last DAILY close <= as_of". On an intraday clock that is wrong in
+    the one way that matters: with daily bars stamped at midnight it is the decision session's
+    own FINISHED close at 09:30 (and, once daily reads honour knowability, merely yesterday's
+    close, which is not what live's quote returns at 09:30 either). On an intraday clock this
+    answers from the run's own intraday series via ``AsOfPriceSource.decision_price`` -- the
+    close of the latest bar that has ENDED at the decision instant. On a daily clock it is the inherited read, unchanged.
+    """
+
+    def __init__(self, get_provider: Callable[..., Any], price_source: Any):
+        super().__init__(get_provider)
+        self._price_source = price_source
+
+    def price_at_date(self, symbol: str, as_of: Optional[datetime]) -> Optional[float]:
+        if as_of is not None and self._price_source.is_intraday:
+            return self._price_source.decision_price(symbol, as_of)
+        return super().price_at_date(symbol, as_of)
 
 
 def _screened_symbols_for_bar(
     screener_runtime: Optional[Dict[str, Any]], as_of_dt: datetime,
-    cache: Optional[Dict[str, List[str]]] = None,
+    cache: Optional[Dict[str, List[str]]],
+    *, intraday: bool,
 ) -> Optional[List[str]]:
     """The dynamic per-day universe of symbols ALLOWED TO ENTER on this bar.
 
@@ -160,10 +193,13 @@ def _screened_symbols_for_bar(
     store = screener_runtime["store"]
     df = ms.load_store(store)
     days = ms.scan_dates(df, store_key=store)
-    i = bisect.bisect_right(days, as_of_dt.strftime("%Y-%m-%d")) - 1
-    if i < 0:
+    # THE scan visible at this decision (``metric_store.visible_scan_date``): on an intraday clock a
+    # scan dated S is visible iff every session dated <= S has finished at the decision (a Saturday
+    # scan from Monday's open, a Wednesday scan only after Wednesday's close); on a daily clock the
+    # scan dated <= the bar's date, as before. ``intraday`` is REQUIRED: no caller may default it.
+    day = ms.visible_scan_date(days, as_of_dt, intraday=intraday)
+    if day is None:
         return []
-    day = days[i]
     if cache is not None and day in cache:
         return cache[day]
     syms = ms.screen_universe_for_day(df, day, screener_runtime["settings"],
@@ -443,6 +479,13 @@ class DailyBacktestEngine:
         # Adds the bypass manager refused under its per-symbol max-loss rule, over the run
         # (RECORDED, NOT SCORED; see FactorRanker.portfolio.ProtectiveStopError).
         self._refused_adds = 0
+        # Counters of the intraday-clock rule, published in ``results["intraday_clock"]``:
+        #   undecidable_symbol_days       -- (decision day x symbol) pairs dropped from an ENTRY pass
+        #                                    because no price was knowable at the decision (halted /
+        #                                    stale / no bars): the universe the experts really saw
+        # (the sessions on which a scheduled time had no bar at all, i.e. no decision that day, are
+        # ``self.sessions_without_decision_bar``, published next to these.)
+        self.intraday_counters: Dict[str, int] = {"undecidable_symbol_days": 0}
 
         # Entry-option path: when the run's enter_market action IS an option action (pure-option
         # entry, no equity leg), the option action must size + submit itself — so the entry runs
@@ -539,7 +582,9 @@ class DailyBacktestEngine:
         indicator_provider = self._indicator_provider
         if indicator_provider is None:
             store = (self._screener_runtime or {}).get("store") if self._screener_runtime else None
-            indicator_provider = make_atr_cache_indicator_provider(store) or make_indicator_provider()
+            indicator_provider = (
+                make_atr_cache_indicator_provider(store, session_date_fn=self.price.scan_cutoff_date)
+                or make_indicator_provider())
         self._indicator_provider = indicator_provider
 
         self._check_regime_calendar()
@@ -548,7 +593,10 @@ class DailyBacktestEngine:
         # never reached its own reset.
         reset_stressed()
 
+        self._assert_daily_reads_are_clamped()
         days = trading_days(self.config["start_date"], self.config["end_date"], self.price)
+        self._warn_if_deciding_on_the_first_bar(days)
+        self._count_sessions_without_decision_bar(days)
         total = max(len(days), 1)
         # Progress throttle: the handler's progress_cb does DB work every call (a task-queue
         # pause-check + a progress write). On a 5-minute fill clock a 1-year/8-symbol run is
@@ -566,7 +614,9 @@ class DailyBacktestEngine:
         # the analysis cadence, fills are continuous). SEPARATE sets per sub-pass: with one
         # shared set, whichever gate fired first in the day claimed the (expert, day) key and
         # STARVED the other pass whenever the entry and manage schedules pin different times
-        # (benign while both pin 09:30, but a one-line trap for any future schedule change).
+        # (the trap is closed: the sets are separate, so an entry time of 09:40 with a manage time
+        # of 09:30 / 15:30 each run once per day; the entry-time sweep in test_intraday_daily_knowability.py runs the
+        # engine at 09:30 / 09:35 / 09:40 / 09:45).
         analyzed_entry_days: set = set()
         analyzed_manage_days: set = set()
 
@@ -646,7 +696,10 @@ class DailyBacktestEngine:
             #     regime_overlay seam instead of classifying per symbol. Cheap: a bisect into the
             #     precomputed calendar. None (no calendar) publishes None = neutral, which
             #     _check_regime_calendar has already proven no expert depends on.
-            set_stressed(self._regime_calendar.at(as_of_dt) if self._regime_calendar else None)
+            #     The calendar's flag for day S is classified from S's CLOSE, so the lookup day is
+            #     the newest session whose daily data is knowable at this decision.
+            set_stressed(self._regime_calendar.at(self.price.scan_cutoff_date(as_of_dt))
+                         if self._regime_calendar else None)
 
             # 2. universe for the bar.
             universe = resolve_universe(as_of_dt, self.config, self.price)
@@ -663,7 +716,9 @@ class DailyBacktestEngine:
             #     (byte-identical to a non-screener run — the hot path is untouched).
             entry_universe = universe
             if self._screener_runtime:
-                allowed = _screened_symbols_for_bar(self._screener_runtime, as_of_dt, self._screened_cache)
+                allowed = _screened_symbols_for_bar(
+                    self._screener_runtime, as_of_dt, self._screened_cache,
+                    intraday=self.price.is_intraday)
                 if allowed is not None:
                     allowed_set = set(allowed)
                     entry_universe = [s for s in universe if s in allowed_set]
@@ -732,6 +787,9 @@ class DailyBacktestEngine:
                         continue
                 if entry_ok:
                     analyzed_entry_days.add(_day_key)
+                    if self.price.is_intraday:
+                        self.intraday_counters["undecidable_symbol_days"] += (
+                            len(self.config["enabled_instruments"]) - len(universe))
                 if manage_ok:
                     analyzed_manage_days.add(_day_key)
                 book_dirty = True  # an analysis/management pass runs -> orders may be created
@@ -906,6 +964,109 @@ class DailyBacktestEngine:
                 refusal = schedule_refusal_message(schedule)
                 if refusal:
                     raise ValueError(f"Backtest refused: expert {expert_id}'s {label} {refusal}")
+
+    def _assert_daily_reads_are_clamped(self) -> None:
+        """An intraday run's OHLCV reader MUST be bound to THIS run's price source, otherwise every
+        daily read the experts make returns the decision session's own finished bar (the +404%
+        defect). Refuses to start rather than run unclamped. No-op on a daily clock and when the
+        run has no per-run OHLCV reader (fixture runs that preload bars)."""
+        if not getattr(self.price, "is_intraday", False):
+            return
+        from app.services.backtest.seam_wiring import _current_ohlcv_override
+
+        reader = _current_ohlcv_override()
+        if reader is None or not hasattr(reader, "bind_price_source"):
+            return
+        if getattr(reader, "_ps", None) is not self.price:
+            raise RuntimeError(
+                "intraday backtest started with an OHLCV reader that is not bound to the run's price "
+                "source (MemoizedOHLCVProvider.bind_price_source): daily reads would return the "
+                "decision session's own bar. Refusing to run.")
+
+    def _warn_if_deciding_on_the_first_bar(self, days: List[Any]) -> None:
+        """ONE WARNING per run when an entry schedule time equals the first bar of a session.
+
+        The decision price is the close of the latest bar that has ENDED at the decision instant,
+        so a decision on the session's first bar sees only the PREVIOUS session's last bar -- the
+        cache has no pre-market bars -- while a live run at that instant reads the opening quote.
+        Not refused (stored rows scheduled at the open must still re-run); the run is merely not
+        what live would do. No-op on a daily clock."""
+        if not getattr(self.price, "is_intraday", False):
+            return
+        first_bar_hhmm = set()
+        seen_days = set()
+        for d in days:
+            day = d.date()
+            if day not in seen_days:
+                seen_days.add(day)
+                first_bar_hhmm.add(d.strftime("%H:%M"))
+        for expert, _eid, _settings, _ruleset in self.experts:
+            sched = self._entry_schedule(expert) or {}
+            hit = sorted(set(sched.get("times") or ()) & first_bar_hhmm)
+            if hit:
+                # ONCE PER PROCESS (a GA worker is one job's process, running many trials): the
+                # same schedule time would otherwise print one warning per trial.
+                if tuple(hit) in _FIRST_BAR_WARNED:
+                    return
+                _FIRST_BAR_WARNED.add(tuple(hit))
+                logger.warning(
+                    f"[daily_engine] entry schedule time {hit} equals the first bar of a session: "
+                    f"a decision at the session open sees the PRIOR session's close (no pre-market "
+                    f"bars; the price is the last bar that has ended), but live sees the opening "
+                    f"quote. Use a time >= the first bar + one bar (ba2_common.core.knowability."
+                    f"DEFAULT_DECISION_TIME).")
+                return
+
+    def _count_sessions_without_decision_bar(self, days: List[Any]) -> None:
+        """COUNT (and log, once per run) the scheduled sessions on which a scheduled time has no
+        bar, so the pass for that time NEVER RUNS that session.
+
+        The case this exists for: a decision time late in the day (15:30) on a SHORT session. A
+        half day closes at 13:00, its last 5-minute bar is 12:55, so a 15:30 schedule matches no
+        bar and the session gets no entry decision (and no manage pass at that time). The engine
+        has always skipped such a session silently (the loop only visits bars that exist); this
+        makes the skip explicit, counted and loud. It is deliberately NOT a refusal -- a
+        half-day skip is the conservative behaviour (no entry on a closed market) -- and it does
+        not change a decision, a fill or the results.
+
+        LIVE DIFFERS: JobManager fires a CronTrigger at the stored time with no session check
+        (``JobManager._parse_schedule``), so on a half day live would run the 15:30 pass against
+        a closed market. That asymmetry is reported in the feature notes, not hidden here.
+
+        ``self.sessions_without_decision_bar`` = ``{"entry": n, "manage": n}`` (sessions x times).
+        No-op on a daily clock."""
+        self.sessions_without_decision_bar = {"entry": 0, "manage": 0}
+        if not getattr(self.price, "is_intraday", False):
+            return
+        bars_by_day: Dict[Any, set] = {}
+        for d in days:
+            bars_by_day.setdefault(d.date(), set()).add((d.hour, d.minute))
+        examples: Dict[str, List[str]] = {"entry": [], "manage": []}
+        for expert, _eid, _settings, _ruleset in self.experts:
+            for label, sched in (("entry", self._entry_schedule(expert)),
+                                 ("manage", self._manage_schedule(expert))):
+                times = (sched or {}).get("times") or []
+                if not times:
+                    continue
+                wanted = [(t, (int(t[:2]), int(t[3:]))) for t in times]
+                enabled = (sched or {}).get("days") or {}
+                for day, hm in bars_by_day.items():
+                    if not schedule_weekday_enabled(enabled, _WEEKDAYS[day.weekday()]):
+                        continue
+                    for t, key in wanted:
+                        if key not in hm:
+                            self.sessions_without_decision_bar[label] += 1
+                            if len(examples[label]) < 5:
+                                examples[label].append(f"{day} {t}")
+        if any(self.sessions_without_decision_bar.values()):
+            # A GA trial (``_ga_trial``) logs at DEBUG: thousands of trials would repeat the same
+            # line. The MASTER aggregates the counter the trials return and warns ONCE per job
+            # (strategy_optimization_handler). A single backtest has no master, so it warns here.
+            (logger.debug if self.config.get("_ga_trial") else logger.warning)(
+                f"[daily_engine] SESSIONS WITHOUT A DECISION BAR: "
+                f"{self.sessions_without_decision_bar} (scheduled session x time with no bar at "
+                f"that time, e.g. a 15:30 decision on a 13:00 half day): the pass does not run "
+                f"on those sessions. First examples: {examples}")
 
     def _entry_schedule(self, expert: Any) -> Optional[Dict[str, Any]]:
         """The expert's ``execution_schedule_enter_market`` (common base setting), or None.
@@ -1942,8 +2103,9 @@ class DailyBacktestEngine:
         if bundle is None:
             from ba2_common.core.TradeConditions import _get_provider
 
-            bundle = LiveProviderBundle(
-                lambda category, name, **kw: _get_provider(category, name, **kw)
+            bundle = _BacktestProviderBundle(
+                lambda category, name, **kw: _get_provider(category, name, **kw),
+                self.price,
             )
             self._bundle_cache = bundle
         return bundle
@@ -1969,7 +2131,7 @@ class DailyBacktestEngine:
         return {
             "equity_history": self.account.get_balance_history(),
             "trades": self.account.get_filled_trades(),
-            "final_equity": self.account.equity(),
+            "final_equity": self.account.equity(close_mark=True),
             "initial_capital": float(self.account._cfg["starting_cash"]),
             # RECORDED, NOT SCORED -- see ``_record_uncovered_assigned``.
             "uncovered_assigned_bars": self._uncovered_assigned_metric(),

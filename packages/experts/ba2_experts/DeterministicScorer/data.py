@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from ba2_common.core.backtest_context import knowable_daily_end
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.replay import (
     ReplayMiss,
@@ -256,8 +257,13 @@ def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
     covered_from, df = _OHLCV_COVERAGE.get(key, (None, None))
     if df is None or (covered_from is not None and need_from < covered_from):
         try:
-            df = providers.ohlcv().get_ohlcv_data(
-                symbol=symbol, start_date=need_from, end_date=now, interval="1d")
+            ohlcv = providers.ohlcv()
+            # This reader caches the whole series for the run and slices it per decision through
+            # ``knowable_daily_end`` below, so on a backtest provider it asks for the UNSLICED series
+            # explicitly (every other daily read is clamped to the knowable history by default).
+            # Live providers have no such method and are read as before.
+            fetch = getattr(ohlcv, "get_ohlcv_data_unsliced", None) or ohlcv.get_ohlcv_data
+            df = fetch(symbol=symbol, start_date=need_from, end_date=now, interval="1d")
         except ReplayMiss:
             raise
         except ReplayMiss:
@@ -274,7 +280,11 @@ def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
         _OHLCV_VIEWS[key] = _build_view(symbol, df)
     if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
         return None
-    out = _slice_to_as_of(df, as_of, _OHLCV_VIEWS.get(key))
+    # Slice to what is KNOWABLE at the decision, not to the decision's own stamp: on an intraday
+    # backtest clock the decision session's daily bar is not finished at 09:30 (live holds only
+    # the prior session's). The cutoff comes from the clock owner via the OHLCV provider; it is
+    # ``as_of`` itself live and on a daily clock.
+    out = _slice_to_as_of(df, knowable_daily_end(providers, as_of), _OHLCV_VIEWS.get(key))
     if out is None or out.empty:
         return None
     return out.reset_index(drop=True)

@@ -1191,6 +1191,48 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
             return None
 
+    def _decision_price(self, providers: "ProviderBundle", symbol: str,
+                        as_of: Optional[datetime]) -> Optional[float]:
+        """THE current price an expert decides on (the owner's rule: never a daily bar).
+
+        ONE seam for live and backtest: ``as_of`` None (live) -> the account quote
+        (``_get_current_price``); ``as_of`` set (backtest) -> ``providers.price_at_date``, which
+        the backtest host answers from the engine's decision-price function (the close of the
+        latest ENDED intraday bar on an intraday clock, the as_of close on a daily clock).
+        Daily frames are HISTORY (indicators, ATR magnitude, returns), not the anchor price:
+        an expert reading ``df["Close"].iloc[-1]`` as 'now' reads a bar that is, in the
+        backtest, the previous session's close and, live, a cached (possibly partial) bar."""
+        # ONE PATH, live and backtest: the ACCOUNT interface. Live -> the broker quote; backtest ->
+        # ``BacktestAccount.get_instrument_current_price`` = the decision price of the run's price
+        # source (a DecisionPrice on an intraday clock). The expert cannot tell them apart, and a bar
+        # read anywhere else cannot become "the price now" (see CLAUDE.md "Prices in decision code").
+        if as_of is None:
+            return self._get_current_price(symbol)
+        account = self._decision_account(providers)
+        if account is not None:
+            return account.get_instrument_current_price(symbol)
+        # No account behind this bundle: ONLY the historical-replay tool (a recorded decision
+        # re-run against the cache, no live account exists). Everything that trades has an account.
+        return providers.price_at_date(symbol, as_of)
+
+    def _decision_account(self, providers: "ProviderBundle"):
+        """The account behind a backtest bundle, resolved ONCE per bundle (the bundle outlives a run;
+        a per-symbol DB lookup would be a hot-path cost) -- None when it has none."""
+        cached = getattr(self, "_decision_account_cache", None)
+        if cached is not None and cached[0] is providers:
+            return cached[1]
+        account = None
+        try:
+            from ba2_common.core.instance_resolver import get_instance_resolver
+
+            instance = get_instance(ExpertInstance, self.id)
+            if instance is not None:
+                account = get_instance_resolver().get_account_instance(instance.account_id)
+        except Exception as e:  # noqa: BLE001 -- not resolvable -> the replay fallback, said once
+            logger.warning(f"decision account for expert {self.id} not resolvable ({type(e).__name__}: {e})")
+        self._decision_account_cache = (providers, account)
+        return account
+
     # ---- Backtest contract (Phase 1) ---------------------------------
     def _gather(self, providers: "ProviderBundle", as_of: Optional[datetime]) -> Dict[str, Any]:
         """Pull every datum this expert needs via providers (never raw HTTP/DB).

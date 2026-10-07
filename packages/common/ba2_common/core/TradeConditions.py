@@ -2842,17 +2842,37 @@ class RelativeVolumeCondition(CompareCondition):
                 return False
 
             volumes = df["Volume"]
-            # W baseline bars PLUS the current one. A shorter history is UNKNOWN: averaging
-            # whatever is there would compare a spike against two quiet days and call it 10x.
-            if len(volumes) < self.BASELINE_WINDOW + 1:
-                logger.warning(
-                    f"Only {len(volumes)} bars for {self.instrument_name}; "
-                    f"relative volume needs {self.BASELINE_WINDOW + 1}")
-                self.calculated_value = None
-                return False
-
-            current = volumes.iloc[-1]
-            baseline = list(volumes.iloc[-(self.BASELINE_WINDOW + 1):-1])
+            # INTRADAY BACKTEST CLOCK: the daily history is the FINISHED sessions only (the memoized
+            # provider clamps it), so "the current bar" is not in it. Today's volume is what has
+            # traded so far (the sum of the intraday bars ended at the decision), the baseline is
+            # the last W finished sessions. Live reads today's forming daily bar the same way.
+            # A daily clock / live keeps the as-of bar = last bar of the series.
+            so_far = getattr(self.account, "intraday_volume_so_far", None)
+            applicable, so_far_volume = so_far(self.instrument_name) if callable(so_far) else (False, None)
+            if applicable:
+                if so_far_volume is None:
+                    logger.warning(f"No intraday volume so far for {self.instrument_name}")
+                    self.calculated_value = None
+                    return False
+                if len(volumes) < self.BASELINE_WINDOW:
+                    logger.warning(
+                        f"Only {len(volumes)} finished sessions for {self.instrument_name}; "
+                        f"relative volume needs {self.BASELINE_WINDOW}")
+                    self.calculated_value = None
+                    return False
+                current = so_far_volume
+                baseline = list(volumes.iloc[-self.BASELINE_WINDOW:])
+            else:
+                # W baseline bars PLUS the current one. A shorter history is UNKNOWN: averaging
+                # whatever is there would compare a spike against two quiet days and call it 10x.
+                if len(volumes) < self.BASELINE_WINDOW + 1:
+                    logger.warning(
+                        f"Only {len(volumes)} bars for {self.instrument_name}; "
+                        f"relative volume needs {self.BASELINE_WINDOW + 1}")
+                    self.calculated_value = None
+                    return False
+                current = volumes.iloc[-1]
+                baseline = list(volumes.iloc[-(self.BASELINE_WINDOW + 1):-1])
             # A NaN anywhere in the window is UNKNOWN, not something to skip past: pandas'
             # mean() drops NaNs silently, so a window with 18 of 20 bars missing would average
             # the surviving two and report a confident ratio against them.
