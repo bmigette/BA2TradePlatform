@@ -44,8 +44,14 @@ def parse_window(values):
     if len(values) != 2:
         raise ValueError(f"--window takes exactly two ISO dates (START END), got {list(values)!r}")
     parsed = []
+    import re
     for label, raw in zip(("START", "END"), values):
         try:
+            # ONLY YYYY-MM-DD: date.fromisoformat also takes "20261005" / ISO week dates, and the
+            # ORIGINAL string is what the rebuild receives, so a lenient parse could pass a form it
+            # does not read.
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(raw)):
+                raise ValueError(raw)
             parsed.append(date.fromisoformat(str(raw)))
         except ValueError:
             raise ValueError(f"--window {label} {raw!r} is not an ISO date (YYYY-MM-DD)") from None

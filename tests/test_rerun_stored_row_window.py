@@ -41,7 +41,8 @@ def test_start_must_be_before_end(tool, bad):
         tool.parse_window(bad)
 
 
-@pytest.mark.parametrize("bad", [["2026-13-01", "2026-06-30"], ["H1", "2026-06-30"], ["2026-01-01", "26/06/30"]])
+@pytest.mark.parametrize("bad", [["2026-13-01", "2026-06-30"], ["H1", "2026-06-30"], ["2026-01-01", "26/06/30"],
+                                 ["20261005", "20261231"], ["2026-W41-1", "2026-12-31"], ["2026-1-5", "2026-12-31"]])
 def test_a_non_iso_date_is_named(tool, bad):
     with pytest.raises(ValueError, match="not an ISO date"):
         tool.parse_window(bad)
