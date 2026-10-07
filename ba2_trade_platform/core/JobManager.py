@@ -22,7 +22,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.job import Job
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import select
+from sqlmodel import Session, select
 
 from ba2_common.core.utils import normalize_symbol
 from ..core.utils import get_expert_instance_from_id
@@ -1290,9 +1290,10 @@ class JobManager:
                 # backtest's ``_schedule_allows_entry`` reads it (``days.get(weekday, True)``): the
                 # settings UI and the GA deploy payload always write all seven keys, so this only
                 # decides a hand-written partial dict -- and live and backtest must agree on it.
+                from ba2_common.core.schedule_genes import schedule_weekday_enabled
                 present = {str(k).lower(): bool(v) for k, v in days.items()}
                 enabled_days = [number for name, number in day_mapping.items()
-                                if present.get(name, True)]
+                                if schedule_weekday_enabled(present, name)]
                 
                 if not enabled_days:
                     logger.warning("No days enabled in schedule")
@@ -1346,6 +1347,57 @@ class JobManager:
             logger.error(f"Safety release of parked OPEN_POSITIONS for expert "
                          f"{expert_instance_id} failed: {e}", exc_info=True)
 
+    def _session_guard_allows(self, job, scheduled_for) -> bool:
+        """True when the scheduled pass of ``job`` may run at ``scheduled_for``.
+
+        Mirrors the backtest: no bar, no decision. A 15:30 schedule on a 13:00 half day, a weekday
+        holiday and a weekend never reach the experts. ONE loud WARNING per (expert, subtype, day)
+        names the reason. Unreadable calendar -> the pass is REFUSED (logged as an ERROR), never
+        guessed. A job whose instrument is crypto is refused too: its market is not NYSE and no
+        other calendar is wired, so none is assumed. Only the expert passes go through here
+        (``_execute_scheduled_group``): the IV snapshot, FRED, warm and account-refresh jobs have
+        their own callbacks and are untouched. A manual run (``/api/run-schedule``, the UI's Run
+        Now) does not come through here either: an operator re-firing today's pass after hours is
+        the documented use of that endpoint.
+        """
+        from ba2_common.core.market_calendar import MarketCalendarUnavailable, regular_session_status
+
+        expert_id, symbol, subtype = job.args[0], job.args[1], job.args[2]
+        reason = None
+        try:
+            if self._symbol_is_crypto(symbol):
+                reason = f"instrument {symbol} is crypto: no exchange calendar is wired, not assuming NYSE"
+            else:
+                ok, why = regular_session_status(scheduled_for)
+                if not ok:
+                    reason = why
+        except MarketCalendarUnavailable as e:
+            reason = f"NYSE calendar unavailable ({e}); refusing rather than guessing"
+        if reason is None:
+            return True
+        logged = getattr(self, "_session_skip_logged", None)
+        if logged is None:
+            logged = self._session_skip_logged = set()
+        subtype_name = getattr(subtype, "value", str(subtype))
+        key = (expert_id, subtype_name, scheduled_for.astimezone(_MARKET_TZ).date())
+        if key not in logged:
+            logged.add(key)
+            logger.warning(
+                f"[SESSION GUARD] expert {expert_id} {subtype_name} pass at "
+                f"{scheduled_for.astimezone(_MARKET_TZ):%Y-%m-%d %H:%M} ET SKIPPED: {reason}")
+        return False
+
+    @staticmethod
+    def _symbol_is_crypto(symbol) -> bool:
+        """True when ``symbol`` names a stored Instrument of type crypto (placeholders such as
+        OPEN_POSITIONS/SCREENER are not instruments and answer False)."""
+        if symbol in ("DYNAMIC", "EXPERT", "OPEN_POSITIONS", "SCREENER"):
+            return False
+        from .types import InstrumentType
+        with Session(get_db().bind) as session:
+            row = session.exec(select(Instrument).where(Instrument.name == symbol)).first()
+        return row is not None and row.instrument_type == InstrumentType.CRYPTO
+
     def _execute_scheduled_group(self, expert_instance_id, symbol, subtype, scheduled_for=None):
         """One callback registers and submits every expert due at this exact fire time.
 
@@ -1368,6 +1420,11 @@ class JobManager:
                         if job_id.startswith("expert_") and job.next_run_time is not None]
             due = [job for job in jobs
                    if job.trigger.get_next_fire_time(None, scheduled_for) == scheduled_for]
+            # SESSION GUARD (fail closed): an entry / open-positions pass only runs while the
+            # exchange is in a regular session at the fire instant. A skipped pass registers no
+            # ExpertRun and submits nothing, so a parked OPEN_POSITIONS pass cannot be waiting
+            # on it (defer_open_positions_if_entry_in_flight finds no entry task in flight).
+            due = [job for job in due if self._session_guard_allows(job, scheduled_for)]
             records = {}
             for job in due:
                 expert_id = job.args[0]

@@ -1071,11 +1071,29 @@ def run_daily_backtest(
             # single chokepoint every path goes through (trial worker, master top-N persist,
             # parallel=1), so both compute_fitness call sites get it without touching either.
             results.update(_car_trade_thresholds_for_experts(config))
+            _record = _decision_time_record(engine, config)
+            if _record is not None:
+                results["decision_time"] = _record
             return results
         finally:
             # Drop the per-run OHLCV override so it never leaks into a later (non-backtest) call.
             set_backtest_ohlcv_override(None)
             clear_backtest_market_conditions()
+
+
+def _decision_time_record(engine, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ``decision_time`` section of a persisted result: the time(s) each pass ran at and how
+    many scheduled (session, time) pairs had NO bar (a 15:30 schedule on a 13:00 half day), so a
+    stored row shows the decisions it never made. None on a daily clock or without schedule times
+    (every run before the decision-time gene keeps the result shape it had)."""
+    if config.get("execution_interval", "1d") == "1d":
+        return None
+    entry = (config.get("run_schedule_override") or {}).get("times")
+    manage = (config.get("manage_schedule_override") or {}).get("times")
+    if not entry and not manage:
+        return None
+    return {"entry_times": list(entry or []), "manage_times": list(manage or []),
+            "sessions_without_decision_bar": dict(engine.sessions_without_decision_bar)}
 
 
 def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float]:

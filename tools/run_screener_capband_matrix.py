@@ -460,7 +460,9 @@ def main() -> int:
                          "grid. Adds '-timegene' to the job name and folds into the name digest "
                          "(new names, so nothing is skipped as already completed). Not applied "
                          "to the FactorRanker job (bypass: no schedule genes). Daily-clock "
-                         "(--interval 1d) runs cannot carry it.")
+                         "(--interval 1d) runs cannot carry it. NOTE: 'fixed' keeps the LEGACY job name, so "
+                         "a job whose legacy row is already completed is SKIPPED (the skip line "
+                         "says so).")
     ap.add_argument("--interval", default="5min")
     ap.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points, modeled at the fill-engine "
@@ -715,7 +717,9 @@ def main() -> int:
                   f"({expert} {strat or '(bypass)'} / {band})")
             continue
         if job_name in _completed_names():   # re-read each loop (resumable)
-            print(f"[{i}/{len(jobs)}] SKIP {job_name} (already completed)", flush=True)
+            _fixed_note = ("; NOTE --decision-times fixed keeps the legacy job name, so this is the "
+                           "completed LEGACY run, not a time-gene run" if not job_dt_times else "")
+            print(f"[{i}/{len(jobs)}] SKIP {job_name} (already completed{_fixed_note})", flush=True)
             continue
         print(f"[{i}/{len(jobs)}] RUN  {job_name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode

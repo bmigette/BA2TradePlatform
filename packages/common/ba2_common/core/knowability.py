@@ -64,6 +64,10 @@ DEFAULT_DECISION_TIME = "10:00"
 #: value is validated by ``ba2_common.core.schedule_genes.validate_decision_times``. ONE definition:
 #: the grid drivers default to it, ``--decision-times default`` means it, ``fixed`` turns the gene
 #: off. A plain ``ba2-test optimize`` without the flag stays at the single DEFAULT_DECISION_TIME.
+#: NOTE the gene is an index into this list and neighbouring indices are NOT equally spaced in time
+#: (five minutes apart in the morning, then 10:00 -> 12:00 (2 h) -> 15:30 (3.5 h) -> 15:50): an
+#: index has no ordinal meaning, which is why the GA mutates this gene (``stratify`` choice genes)
+#: by a uniform re-draw among the OTHER values instead of the Gaussian index nudge.
 DEFAULT_DECISION_TIME_CHOICES = ("09:35", "09:40", "09:45", "10:00", "12:00", "15:30", "15:50")
 
 #: The time every STORED row before 2026-10-07 ran at (the session's first bar). Used ONLY to

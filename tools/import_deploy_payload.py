@@ -309,6 +309,11 @@ def main() -> int:
                 print(f"FATAL: {label}: the stored schedule carries days but NO decision time; "
                       f"refusing to guess one (live must fire at the time the backtest decided at)")
                 return 1
+            from ba2_common.core.schedule_genes import live_deploy_time_refusal
+            _late = [m for m in (live_deploy_time_refusal(t) for t in sched_pre["times"]) if m]
+            if _late:
+                print(f"FATAL: {label}: {_late[0]}")
+                return 1
             try:
                 live_days, clock_note = live_entry_days(
                     {d: bool(v) for d, v in sched_pre["days"].items()},

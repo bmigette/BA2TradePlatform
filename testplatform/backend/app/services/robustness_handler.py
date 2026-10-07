@@ -166,17 +166,19 @@ def _time_override(hhmm: str) -> Dict[str, Any]:
 
 
 def _schedule_variants(params: Dict[str, Any], parent_times: Optional[List[str]] = None,
-                       intraday: bool = True) -> List[Dict[str, Any]]:
+                       intraday: bool = True, time_is_gene: bool = False) -> List[Dict[str, Any]]:
     """Build the list of ``{variant, override}`` from the run params.
 
     * ``day_variants=True`` -> one weekly-entry-day variant per Mon..Fri, at ``parent_times``.
-    * ``time_variants=[...]`` -> one entry-time variant per requested HH:MM.
+    * ``time_variants=[...]`` -> one entry-time variant per requested HH:MM, EXCEPT for a parent
+      whose time is a GENE (``time_is_gene``): the optimizer already explored the time, so the
+      time variants are skipped (the caller records why; see ``launch_schedule_variants``).
     """
     out: List[Dict[str, Any]] = []
     if params.get("day_variants"):
         for wd in _TRADING_DAYS:
             out.append({"variant": f"day-{wd}", "override": _day_override(wd, parent_times or [], intraday)})
-    for t in (params.get("time_variants") or []):
+    for t in ([] if time_is_gene else (params.get("time_variants") or [])):
         out.append({"variant": f"time-{t}", "override": _time_override(t)})
     return out
 
@@ -211,8 +213,16 @@ def launch_schedule_variants(robustness_run_id: int) -> List[int]:
 
             base_sp = copy.deepcopy(bt.strategy_params or {})
             _iv = str(parent_cfg.get("execution_interval") or "").lower()
+            from ba2_common.core.schedule_genes import schedule_time_from_genes
+            gene_time = schedule_time_from_genes(bt.strategy_params)
             variants = _schedule_variants(run.params or {}, parent_times,
-                                          _iv.endswith("m") or _iv.endswith("h") or _iv.endswith("min"))
+                                          _iv.endswith("m") or _iv.endswith("h") or _iv.endswith("min"),
+                                          time_is_gene=gene_time is not None)
+            if gene_time is not None and (run.params or {}).get("time_variants"):
+                note = (f"time variants SKIPPED: the parent's time ({gene_time}) is a GA gene, "
+                        f"the optimizer already explored the decision time")
+                logger.warning(f"robustness schedule run {run.id}: {note}")
+                run.params = {**(run.params or {}), "time_variants_skipped": note}
             if not variants:
                 raise ValueError("no schedule variants requested (day_variants/time_variants both empty)")
 
@@ -220,6 +230,12 @@ def launch_schedule_variants(robustness_run_id: int) -> List[int]:
             for spec in variants:
                 variant_sp = copy.deepcopy(base_sp)
                 variant_sp["runScheduleOverride"] = spec["override"]
+                if gene_time is not None:
+                    # A gene row's MANAGE pass runs at the gene-chosen time too: carry the
+                    # parent's manage schedule so the variant does not fall back to its entry
+                    # schedule or the expert default (rerun_handler reads manageScheduleOverride).
+                    variant_sp["manageScheduleOverride"] = copy.deepcopy(
+                        parent_cfg["manage_schedule_override"])
                 row = Backtest(
                     name=f"RBST-{spec['variant']}-{parent_name}",
                     engine_type="daily_expert",

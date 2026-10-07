@@ -118,6 +118,33 @@ def parse_decision_times_arg(raw: Optional[str], execution_interval: str, *,
     return validate_decision_times(values, execution_interval)
 
 
+#: LIVE DEPLOYMENT bound on a decision time (backtests may still explore any valid time).
+#: The backtest fills at the open of the bar after the decision; live submits when the analysis
+#: pass finishes. Measured on PROD (read-only, September 2026, 09:30 ET passes, trigger = 13:30
+#: UTC to the last order created that day, 27 entry passes after dropping two multi-hour
+#: manual/deploy-day outliers): median / p95 / max seconds -- FMPEarningsDrift 150/268/268,
+#: FMPRating 253/425/425, DeterministicScorer 401/422/422, FMPInsiderClusterBuy 434/506/506.
+#: FMPSenateTraderWeight has no usable sample (one 4.7 h manual run), so the bound is the
+#: LARGEST measured p95 for every expert, rounded up. A deployment is refused when
+#: ``time + LIVE_PASS_P95_SECONDS + LIVE_PASS_MARGIN_SECONDS`` falls after the regular close of a
+#: normal day. 15:30 passes (15:48:30), 15:50 does not (16:08:30).
+LIVE_PASS_P95_SECONDS = 510
+LIVE_PASS_MARGIN_SECONDS = 600
+
+
+def live_deploy_time_refusal(time_hhmm: str) -> Optional[str]:
+    """A refusal message when a live schedule at ``time_hhmm`` could not finish its pass before
+    the close of a normal day (see ``LIVE_PASS_P95_SECONDS``), else None."""
+    finish = hhmm_to_minutes(time_hhmm) * 60 + LIVE_PASS_P95_SECONDS + LIVE_PASS_MARGIN_SECONDS
+    if finish > _SESSION_CLOSE_MIN * 60:
+        return (f"schedule time {time_hhmm}: an entry pass takes up to {LIVE_PASS_P95_SECONDS}s "
+                f"(measured p95) plus a {LIVE_PASS_MARGIN_SECONDS}s margin, ending "
+                f"{finish // 3600:02d}:{finish % 3600 // 60:02d} -- after the "
+                f"{_fmt(_SESSION_CLOSE_MIN)} close; the order would miss the session the "
+                f"backtest filled it in")
+    return None
+
+
 def retime_schedules(config: Dict[str, Any], decision_time: str) -> Dict[str, Any]:
     """``config`` with BOTH the entry and the manage schedule retimed to ``decision_time`` (days
     untouched). For tools that re-run a stored row at another time (the same two schedules the
@@ -140,6 +167,14 @@ def schedule_time_from_genes(strategy_params: Optional[Dict[str, Any]]) -> Optio
     value = strategy_params[SCHEDULE_TIME_GENE]
     hhmm_to_minutes(value)  # a stored non-time value is corrupt: refuse, never reinterpret
     return value
+
+
+def schedule_weekday_enabled(days: Optional[Dict[str, Any]], weekday: str) -> bool:
+    """Whether a schedule's ``days`` dict enables ``weekday`` ("monday".."sunday"). A weekday
+    ABSENT from the dict is ENABLED: the one reading shared by the backtest engine's schedule gate
+    and the live ``JobManager._parse_schedule`` (the settings UI and the GA deploy payload always
+    write all seven keys, so this only decides a hand-written partial dict)."""
+    return bool((days or {}).get(weekday, True))
 
 
 def repair_no_weekday(days: Dict[str, bool], option_run: bool) -> Dict[str, bool]:

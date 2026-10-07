@@ -50,6 +50,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
+from ba2_common.core.schedule_genes import schedule_weekday_enabled
 from ba2_common.core.utils import as_utc_key
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 from ba2_common.core.db import add_instance, get_instance
@@ -301,7 +302,7 @@ def _schedule_allows_entry(as_of_dt: datetime, schedule: Optional[Dict[str, Any]
         ctx = _bar_date_context(as_of_dt)
     days = schedule.get("days") or {}
     wd = _WEEKDAYS[ctx.weekday]
-    if not days.get(wd, True):
+    if not days.get(wd, True):   # == schedule_genes.schedule_weekday_enabled (hot path: inlined)
         return False
     if not is_intraday:
         return True
@@ -1034,7 +1035,7 @@ class DailyBacktestEngine:
                 wanted = [(t, (int(t[:2]), int(t[3:]))) for t in times]
                 enabled = (sched or {}).get("days") or {}
                 for day, hm in bars_by_day.items():
-                    if not enabled.get(_WEEKDAYS[day.weekday()], True):
+                    if not schedule_weekday_enabled(enabled, _WEEKDAYS[day.weekday()]):
                         continue
                     for t, key in wanted:
                         if key not in hm:
@@ -1042,7 +1043,10 @@ class DailyBacktestEngine:
                             if len(examples[label]) < 5:
                                 examples[label].append(f"{day} {t}")
         if any(self.sessions_without_decision_bar.values()):
-            logger.warning(
+            # A GA trial (``_ga_trial``) logs at DEBUG: thousands of trials would repeat the same
+            # line. The MASTER aggregates the counter the trials return and warns ONCE per job
+            # (strategy_optimization_handler). A single backtest has no master, so it warns here.
+            (logger.debug if self.config.get("_ga_trial") else logger.warning)(
                 f"[daily_engine] SESSIONS WITHOUT A DECISION BAR: "
                 f"{self.sessions_without_decision_bar} (scheduled session x time with no bar at "
                 f"that time, e.g. a 15:30 decision on a 13:00 half day): the pass does not run "

@@ -176,6 +176,8 @@ def _build_standalone_rerun_config(bt: Backtest) -> Dict[str, Any]:
     }
     if sp.get("runScheduleOverride") is not None:
         payload["run_schedule_override"] = sp["runScheduleOverride"]
+    if sp.get("manageScheduleOverride") is not None:
+        payload["manage_schedule_override"] = sp["manageScheduleOverride"]
     # The option spread model the row recorded (plan Part F). Absent on a row created before
     # Part F: _build_config then applies the current model explicitly and the re-run records it.
     if sp.get("optionSpreadModel") is not None:
