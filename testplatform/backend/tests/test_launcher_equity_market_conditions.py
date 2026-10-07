@@ -475,14 +475,32 @@ def test_driver_dry_run_is_unaffected_with_no_new_flags():
     the SAME job names/order as before this change (no digest token anywhere)."""
     import re
 
+    # The decision-time gene is DEFAULT ON for this driver since 2026-10-07 (its own digest +
+    # '-timegene' token); `--decision-times fixed` is the legacy invocation this test pins.
     result = subprocess.run(
-        [sys.executable, _DRIVER, "--strategies", "S1,S6", "--bands", "large", "--dry-run"],
+        [sys.executable, _DRIVER, "--strategies", "S1,S6", "--bands", "large", "--dry-run",
+         "--decision-times", "fixed"],
         capture_output=True, text=True, cwd=os.path.normpath(os.path.join(_ROOT, "..", "..")),
     )
     assert result.returncode == 0, result.stderr
     assert not re.search(r"-d[0-9a-f]{12}\b", result.stdout)  # no digest token anywhere
     assert "scr-large-FMPRating-S1-from2022" in result.stdout
     assert "scr-large-FMPRating-S6-from2022" in result.stdout
+
+
+def test_driver_dry_run_default_carries_the_decision_time_gene_in_every_classic_name():
+    import re
+
+    result = subprocess.run(
+        [sys.executable, _DRIVER, "--strategies", "S1", "--bands", "large", "--dry-run"],
+        capture_output=True, text=True, cwd=os.path.normpath(os.path.join(_ROOT, "..", "..")),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "decision times (GA gene schedule:time): 09:35,09:40,09:45,10:00,12:00,15:30,15:50" \
+        in result.stdout
+    assert re.search(r"scr-large-FMPRating-S1-from2022-timegene-d[0-9a-f]{12}", result.stdout)
+    # the bypass FactorRanker job keeps its plain name: it has no schedule genes
+    assert re.search(r"(TODO|DONE)\s+scr-large-FactorRanker\s", result.stdout)
 
 
 

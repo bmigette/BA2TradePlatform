@@ -49,7 +49,9 @@ import sys
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from matrix_flags import cap_passthrough, job_name_with_digest  # noqa: E402
+from matrix_flags import (  # noqa: E402
+    cap_passthrough, decision_times_plan, decision_times_tokens, job_name_with_digest,
+    with_decision_times_name)
 
 _STORE = r"C:\Users\basti\Documents\ba2\common\cache\screener\metric_store"
 # A real --universe is required by the CLI but is OVERRIDDEN by the screened union when --screener
@@ -193,16 +195,14 @@ def fr_top_n_below_pool_passthrough(args) -> list:
 
 
 def decision_times_passthrough(args) -> list:
-    """Extra `optimize` CLI tokens for --decision-times ([] when not given, so an ordinary
-    invocation of this driver stays byte-identical: same argv, same job names).
+    """Extra `optimize` CLI tokens for the decision-time gene (``args.decision_times_resolved``,
+    set once in ``main`` from the DEFAULT-ON ``--decision-times`` flag).
 
-    Like the other passthroughs it triggers the job-name digest ON ITS OWN (see the call site):
-    the time list changes what the job scores, so two jobs differing only by it must not share
-    a name, a skip-completed check or a checkpoint."""
-    out: list = []
-    if getattr(args, "decision_times", None):
-        out += ["--decision-times", args.decision_times]
-    return out
+    Like the other passthroughs it triggers the job-name digest ON ITS OWN (see the call site),
+    and the job's base name gets the ``-timegene`` token: the time list changes what the job
+    scores, so two jobs differing only by it must not share a name, a skip-completed check or a
+    checkpoint."""
+    return decision_times_tokens(getattr(args, "decision_times_resolved", None))
 
 
 def _job_name(name: str, cmd: list) -> str:
@@ -452,14 +452,15 @@ def main() -> int:
                          "affected, whatever this flag says. Folds into the job's name digest "
                          "(on its own) so an opted-out run can never resume/be confused with a "
                          "repaired run's completed row under the same name.")
-    ap.add_argument("--decision-times", default=None, metavar="HH:MM,HH:MM,...",
-                    help="Search the DECISION TIME as a GA gene (schedule:time) in every job: "
-                         "a comma list of exchange-local times on the --interval grid, e.g. "
-                         "09:35,09:40,09:45,10:00,15:30 (see `ba2-test optimize --help`). "
-                         "REQUIRES --name-suffix to contain 'timegene' (enforced below). Folds "
-                         "into the job's name digest. Not forwarded to the FactorRanker job "
-                         "(bypass: no schedule genes) -- select the classic experts with "
-                         "--skip-experts.")
+    ap.add_argument("--decision-times", default=None, metavar="default|fixed|HH:MM,HH:MM,...",
+                    help="The DECISION TIME gene (schedule:time) searched by every classic job. "
+                         "DEFAULT (flag absent) = ON with the shared DEFAULT_DECISION_TIME_CHOICES "
+                         "(09:35,09:40,09:45,10:00,12:00,15:30,15:50); 'fixed' = no gene, the "
+                         "legacy single DEFAULT_DECISION_TIME; or a comma list on the --interval "
+                         "grid. Adds '-timegene' to the job name and folds into the name digest "
+                         "(new names, so nothing is skipped as already completed). Not applied "
+                         "to the FactorRanker job (bypass: no schedule genes). Daily-clock "
+                         "(--interval 1d) runs cannot carry it.")
     ap.add_argument("--interval", default="5min")
     ap.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points, modeled at the fill-engine "
@@ -560,12 +561,10 @@ def main() -> int:
                 f"'{token}' (got {args.name_suffix!r}). Otherwise the second matrix is skipped "
                 f"as already-completed. Example: --name-suffix goal2020-{token}")
 
-    if args.decision_times and "timegene" not in args.name_suffix.lower():
-        # Same reason as --sizing-mode above: without a distinguishing suffix the run is skipped
-        # as already-completed under the plain job's name (the launcher refuses it too).
-        raise SystemExit(
-            f"--decision-times requires --name-suffix to contain 'timegene' (got "
-            f"{args.name_suffix!r}). Example: --name-suffix goal2020-riskatr-timegene1")
+    # The decision-time gene is DEFAULT ON for this driver (shared DEFAULT_DECISION_TIME_CHOICES);
+    # `--decision-times fixed` restores the legacy single-time job. Resolved ONCE and announced.
+    args.decision_times_resolved, _dt_header = decision_times_plan(args.decision_times, args.interval)
+    print(_dt_header, flush=True)
 
     bands = [b.strip() for b in args.bands.split(",") if b.strip()]
     stress_by_band = _parse_stress_spread(args.stress_spread_bps)
@@ -601,12 +600,13 @@ def main() -> int:
     # command is built, so listing the pre-digest names here would show (and check "DONE"
     # against) names no job will ever have.
     for i, (name, expert, strat, band) in enumerate(jobs, 1):
-        if args.decision_times and strat is None:
-            # The FactorRanker (bypass) job has no schedule genes: it cannot carry the time gene,
-            # and running it plain under a time-gene grid would mix two kinds of job in one grid.
-            print(f"[{i}/{len(jobs)}] SKIP {name} (bypass expert: --decision-times does not "
-                  f"apply)", flush=True)
-            continue
+        # The decision-time gene reaches every classic job. The FactorRanker (bypass) job has no
+        # schedule genes: it keeps its plain name and the fixed default time, announced here.
+        job_dt_times = None if strat is None else args.decision_times_resolved
+        if strat is None and args.decision_times_resolved:
+            print(f"[{i}/{len(jobs)}] NOTE {name}: bypass expert, decision time stays fixed "
+                  f"(no schedule genes)", flush=True)
+        name = with_decision_times_name(name, job_dt_times)
         # Data-floored start (see _EXPERT_MIN_START). Announced per job so a shorter window is
         # visible in the log instead of being inferred later from a suspiciously late first trade.
         job_start = _start_for(expert, args.start)
@@ -704,7 +704,7 @@ def main() -> int:
         cmd += fr_tokens
         # --decision-times: appended last (same reasoning); digest on its own. (A bypass job was
         # skipped above: it cannot carry the gene.)
-        dt_tokens = decision_times_passthrough(args)
+        dt_tokens = decision_times_tokens(job_dt_times)
         cmd += dt_tokens
         job_name = name
         if mc_tokens or excl_tokens or fr_tokens or dt_tokens:

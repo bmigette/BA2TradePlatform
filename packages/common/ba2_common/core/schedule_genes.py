@@ -93,6 +93,31 @@ def validate_decision_times(values: Any, execution_interval: str, *, min_values:
     return [_fmt(m) for m in sorted(mins)]
 
 
+def parse_decision_times_arg(raw: Optional[str], execution_interval: str, *,
+                             when_unset: str = "fixed") -> Optional[List[str]]:
+    """The ONE reading of a ``--decision-times`` flag, shared by the launcher and every driver.
+
+    ``None`` (flag absent) means ``when_unset``: ``"fixed"`` for a plain ``optimize`` (the single
+    shared default time, no gene), ``"default"`` for a grid DRIVER. ``"fixed"`` -> None (no gene).
+    ``"default"`` -> ``DEFAULT_DECISION_TIME_CHOICES`` on an intraday interval; on a DAILY clock
+    an UNSET driver flag resolves to None (daily-clock jobs have no decision time) but an explicit
+    ``default`` or list is refused by ``validate_decision_times``. Anything else is a comma list,
+    validated and sorted. Returns the validated list or None."""
+    from ba2_common.core.knowability import DEFAULT_DECISION_TIME_CHOICES
+
+    explicit = raw is not None
+    token = (raw if explicit else when_unset).strip()
+    if token == "fixed":
+        return None
+    if token == "default":
+        if not explicit and execution_interval not in _INTERVAL_MINUTES:
+            return None
+        values: Sequence[str] = list(DEFAULT_DECISION_TIME_CHOICES)
+    else:
+        values = [t.strip() for t in token.split(",") if t.strip()]
+    return validate_decision_times(values, execution_interval)
+
+
 def retime_schedules(config: Dict[str, Any], decision_time: str) -> Dict[str, Any]:
     """``config`` with BOTH the entry and the manage schedule retimed to ``decision_time`` (days
     untouched). For tools that re-run a stored row at another time (the same two schedules the

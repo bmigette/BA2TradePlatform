@@ -83,7 +83,8 @@ from typing import Optional
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from matrix_flags import cap_passthrough  # noqa: E402
+from matrix_flags import (  # noqa: E402
+    add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce)
 from ba2_common.core.option_spread_model import (  # noqa: E402
     LEGACY_PCT_MODEL, SPREAD_MODEL_VERSION, SPREAD_MODELS)
 
@@ -703,7 +704,9 @@ def planned_jobs(args, launcher, experts, strategies, universe):
 
 def main(argv=None) -> int:
     ap = build_parser()
+    add_refused_decision_times_flag(ap)
     args = resolve_args(ap, argv)
+    refuse_decision_times_and_announce(args)
 
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]

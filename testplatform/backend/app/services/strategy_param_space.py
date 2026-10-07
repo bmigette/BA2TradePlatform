@@ -200,6 +200,8 @@ def _collect_schedule_days(schedule_cfg: Optional[Dict[str, Any]]) -> Dict[str, 
                 f"order, got {choices!r}")
         out[SCHEDULE_TIME_GENE] = {
             "type": "choice", "choices": choices, "min": 0, "max": len(choices) - 1, "step": 1,
+            # Generation 0 is balanced over the values (genetic.py ``_initial_population``).
+            "stratify": True,
         }
     return out
 

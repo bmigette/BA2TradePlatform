@@ -451,7 +451,8 @@ def test_cli_dry_run_with_both_flags(monkeypatch, tmp_path, capsys):
     argv = ["--families", "pullback_rsi", "mid_ds", "--search", "genetic",
             "--market-condition-profile", BOTH,
             "--market-condition-manifest", ",".join(f"{p}={d}" for p, d in PINS.items()),
-            "--market-exit", "tp, exit,stop", "--allow-sl-loosen", "--dry-run", "--output-dir", str(tmp_path)]
+            "--market-exit", "tp, exit,stop", "--allow-sl-loosen", "--dry-run", "--output-dir", str(tmp_path),
+            "--decision-times", "fixed"]     # the gene is default ON; this pins the market-exit manifest
     assert D.main(argv) == 0
     out = capsys.readouterr().out
     written = json.loads((tmp_path / "manifest.json").read_text())

@@ -1104,7 +1104,9 @@ DECISION_TIMES_NAME_TOKEN = "timegene"
 
 def _resolve_decision_times(raw, command: str, *, interval: str, name: "str | None",
                             bypass_jobs, option_jobs) -> "list | None":
-    """``--decision-times 09:35,09:40,...`` -> the validated, sorted list (or None when not given).
+    """``--decision-times 09:35,09:40,...|default|fixed`` -> the validated, sorted list, or None
+    (flag absent or ``fixed``: no gene, the single shared default time). ``default`` is the shared
+    ``DEFAULT_DECISION_TIME_CHOICES``.
 
     Everything refused HERE, before a row is written, so a bad flag costs nothing:
       * a daily-clock job (``--interval 1d``): a decision time means nothing with one bar a day;
@@ -1117,9 +1119,9 @@ def _resolve_decision_times(raw, command: str, *, interval: str, name: "str | No
         that run's checkpoint (the gene space also differs, so the checkpoint FINGERPRINT would
         refuse the resume, but the name guard stops the skip-by-name first).
     """
-    if raw is None:
-        return None
-    from ba2_common.core.schedule_genes import validate_decision_times
+    if raw is None or str(raw).strip() == "fixed":
+        return None   # plain optimize / explicit `fixed`: the single shared DEFAULT_DECISION_TIME
+    from ba2_common.core.schedule_genes import parse_decision_times_arg
 
     if bypass_jobs:
         sys.exit(f"ba2-test {command}: --decision-times is not supported for a bypass expert "
@@ -1129,9 +1131,8 @@ def _resolve_decision_times(raw, command: str, *, interval: str, name: "str | No
         sys.exit(f"ba2-test {command}: --decision-times is refused for option jobs "
                  f"({sorted(option_jobs)}): option backtests run on a DAILY clock, one bar per "
                  f"session, so there is no decision time to search")
-    values = [t.strip() for t in str(raw).split(",") if t.strip()]
     try:
-        times = validate_decision_times(values, interval)
+        times = parse_decision_times_arg(raw, interval)
     except ValueError as e:
         sys.exit(f"ba2-test {command}: --decision-times: {e}")
     if not name or DECISION_TIMES_NAME_TOKEN not in name:
@@ -6707,7 +6708,8 @@ def _cmd_optimize(args) -> int:
     # --decision-times: the decision-time gene. Validated (and every refusal taken) before
     # anything is built; None leaves the run byte-identical to one without the flag.
     decision_times = _resolve_decision_times(
-        getattr(args, "decision_times", None), "optimize", interval=args.interval, name=args.name,
+        getattr(args, "decision_times", None), "optimize", interval=getattr(args, "interval", None),
+        name=args.name,
         bypass_jobs=([expert] if spec.get("bypass") else []),
         option_jobs=([f"{expert}/{args.strategy}"]
                      if (spec.get("options") or args.strategy in _OPTION_STRATEGY_KEYS
@@ -7193,7 +7195,8 @@ def _cmd_optimize_batch(args) -> int:
     # job of the batch cannot carry the gene (a partial application would score some jobs on a
     # time search and others not, under one flag).
     decision_times = _resolve_decision_times(
-        getattr(args, "decision_times", None), "optimize-batch", interval=args.interval,
+        getattr(args, "decision_times", None), "optimize-batch",
+        interval=getattr(args, "interval", None),
         name=args.name_prefix or "phase1",
         bypass_jobs=[e for e, _k in jobs if _EXPERT_OPT[e].get("bypass")],
         option_jobs=[f"{e}/{k}" for e, k in jobs
@@ -8594,13 +8597,15 @@ def main(argv: "list | None" = None) -> int:
                          "via the schedule:<day> GA genes; this flag has no effect on the day "
                          "selection for those runs. Bypass experts (FactorRanker) don't get the "
                          "schedule genes, so this flag still fully controls their day(s).")
-    op.add_argument("--decision-times", default=None, metavar="HH:MM,HH:MM,...",
+    op.add_argument("--decision-times", default=None, metavar="default|fixed|HH:MM,HH:MM,...",
                     help="Search the DECISION TIME as a GA gene (schedule:time): a choice among "
                          "exactly these exchange-local times, applied to BOTH the entry and the "
                          "open-positions schedule. Each must be on the --interval bar grid, "
                          "after the session's first bar and before its last (e.g. "
-                         "09:35,09:40,09:45,10:00,15:30); >= 2 values. Without it the run decides "
-                         "at the single shared DEFAULT_DECISION_TIME. Refused for daily-clock, "
+                         "09:35,09:40,09:45,10:00,15:30); >= 2 values; 'default' = the shared "
+                         "DEFAULT_DECISION_TIME_CHOICES. Without the flag (or with 'fixed') a "
+                         "plain optimize decides at the single shared DEFAULT_DECISION_TIME "
+                         "(only the grid DRIVERS default the gene ON). Refused for daily-clock, "
                          "option and bypass (FactorRanker) jobs. REQUIRES --name to contain "
                          "'timegene'. Sessions that lack a scheduled time (15:30 on a 13:00 half "
                          "day) get no decision; they are counted and logged.")

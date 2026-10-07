@@ -2589,6 +2589,17 @@ def _market_condition_trial_pins(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]
     return {"market_condition_profiles": profiles, "market_condition_manifests": manifests}
 
 
+def _schedule_times_from_gene(gene_time: Optional[str]) -> Optional[Dict[str, List[str]]]:
+    """The ENTRY and the MANAGE schedule's ``times`` a decoded ``schedule:time`` gene stands for
+    (None without the gene). The ONE place the two are derived: today both are the single gene
+    value; splitting the gene into an entry time and a manage time changes only this function
+    (and the reconstruction in ``ba2_common.core.schedule_genes``), nothing else assumes they
+    are equal."""
+    if not gene_time:
+        return None
+    return {"entry": [gene_time], "manage": [gene_time]}
+
+
 def _build_daily_trial_config(
     backtest_cfg: Dict[str, Any],
     decoded: Dict[str, Any],
@@ -2809,6 +2820,7 @@ def _build_daily_trial_config(
     base_run_sched = backtest_cfg.get("run_schedule_override")
     manage_schedule_override = backtest_cfg.get("manage_schedule_override")
     gene_time = decoded.get("schedule_time")
+    gene_times = _schedule_times_from_gene(gene_time)
     if decoded.get("schedule_days") or gene_time:
         days = decoded.get("schedule_days") or (base_run_sched or {}).get("days")
         if not days:
@@ -2819,19 +2831,20 @@ def _build_daily_trial_config(
             # THE DECISION-TIME GENE wins; else the run-level time when the run states one; else
             # the shared default decision time (a new run only: stored rows reconstruct through
             # schedule_genes with their own time).
-            "times": ([gene_time] if gene_time
+            "times": (gene_times["entry"] if gene_times
                       else (base_run_sched or {}).get("times") or [DEFAULT_DECISION_TIME]),
         }
     else:
         run_schedule_override = base_run_sched
-    if gene_time:
-        # The same time drives the open-positions MANAGE pass (live deploys both schedules at the
-        # one stored time; see tools/import_deploy_payload.py). Days stay the run's own.
+    if gene_times:
+        # The open-positions MANAGE pass is retimed from the same gene (live deploys both
+        # schedules at the one stored time; see tools/import_deploy_payload.py). Days stay the
+        # run's own.
         if not (manage_schedule_override or {}).get("days"):
             raise ValueError("a schedule:time gene needs backtest.manage_schedule_override with "
                              "days to retime: refusing to leave the manage pass on another time")
         manage_schedule_override = {"days": dict(manage_schedule_override["days"]),
-                                    "times": [gene_time]}
+                                    "times": gene_times["manage"]}
 
     return {
         "backtest_id": trial_id,
