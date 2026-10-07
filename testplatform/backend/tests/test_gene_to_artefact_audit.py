@@ -81,6 +81,8 @@ import importlib.util
 import os
 import sys
 
+from types import SimpleNamespace
+
 import pytest
 
 from tests.test_import_deploy_payload_rm_toggle_policy import tool  # noqa: F401  (fixture)
@@ -996,3 +998,49 @@ def test_a_new_intraday_run_that_states_no_time_is_still_refused():
                                   None, option_trade_records=False)
     _build_daily_trial_config(_backtest_cfg(strat, "FMPRating", interval="1d", with_times=False),
                               decoded, None, option_trade_records=False)
+
+
+def test_a_stored_block_without_a_time_means_the_legacy_time():
+    """The mirror of the refusal: a STORED optimization block that states no entry time predates the
+    field and ran at the legacy first-bar time. Re-runs (/rerun, the persisted TOP-N rebuild,
+    robustness, walk-forward OOS) must keep working on it: ``stored_row=True``."""
+    from ba2_common.core.knowability import LEGACY_DECISION_TIME
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+    from app.services.strategy_param_space import decode_params
+
+    strat, genome = _stock_genome(_M, None)
+    trial = _build_daily_trial_config(_backtest_cfg(strat, "FMPRating", with_times=False),
+                                      decode_params(strat, genome), None,
+                                      option_trade_records=True, stored_row=True)
+    assert trial["run_schedule_override"]["times"] == [LEGACY_DECISION_TIME]
+    assert [d for d, v in trial["run_schedule_override"]["days"].items() if v] == ["tuesday", "thursday"]
+
+
+def test_the_rerun_rebuild_of_a_stored_optimization_block_passes_stored_row(monkeypatch):
+    """``rerun_handler._build_optimization_rerun_config`` rebuilds a STORED block: it must say so,
+    or a legacy block with no time raises 'refusing to guess one' on /rerun."""
+    import app.services.strategy_optimization_handler as SOH
+    import app.services.strategy_param_space as SPS
+    from app.services.backtest import rerun_handler as RH
+
+    seen = {}
+    monkeypatch.setattr(SPS, "decode_params", lambda strat, params: {})
+    monkeypatch.setattr(SOH, "_build_daily_trial_config",
+                        lambda bt_block, decoded, hoisted, **kw: seen.update(kw) or {})
+
+    class _Q:
+        def __init__(self, obj): self.obj = obj
+        def filter(self, *a, **k): return self
+        def first(self): return self.obj
+
+    opt = SimpleNamespace(id=1, strategy_id=1, optimization_config={"backtest": {
+        "start_date": "2024-02-01", "end_date": "2024-06-01"}})
+
+    class _Db:
+        def query(self, model):
+            return _Q(opt if model.__name__ == "StrategyOptimization" else SimpleNamespace(id=1))
+
+    bt = SimpleNamespace(id=5, optimization_id=1, start_date=None, end_date=None,
+                         strategy_params={}, name="row")
+    RH._build_optimization_rerun_config(_Db(), bt)
+    assert seen.get("stored_row") is True and seen.get("option_trade_records") is True

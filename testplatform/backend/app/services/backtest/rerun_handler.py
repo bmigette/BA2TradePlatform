@@ -139,7 +139,8 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None) 
     # hoisted applies the screener (genes + store) exactly as the GA did; None for non-screener opts.
     hoisted = _build_hoisted_state(bt_block) if bt_block.get("screener_opt") else None
     trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted,
-                                          option_trade_records=True)  # a persisted re-run
+                                          option_trade_records=True,
+                                          stored_row=True)  # a STORED block: an absent time = the legacy 09:30
     # Overwrite the SAME row; persist the trial sub-DB for post-mortem (matches _persist_top_backtests).
     trial_cfg["backtest_id"] = bt.id
     trial_cfg["name"] = bt.name

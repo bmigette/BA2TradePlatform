@@ -2695,9 +2695,15 @@ def _build_daily_trial_config(
     hoisted: Optional[Dict[str, Any]] = None,
     *,
     option_trade_records: bool,
+    stored_row: bool = False,
 ) -> Dict[str, Any]:
     """Assemble the ``run_daily_backtest`` config for one trial from the run-level
     backtest_cfg + the decoded trial params.
+
+    ``stored_row`` (keyword, default False = a NEW run): True when ``backtest_cfg`` is the block of
+    an optimization that was STORED (a re-run, a TOP-N rebuild, an inspection tool). A stored block
+    that states no entry time predates the field and legitimately ran at the legacy first-bar time
+    (``entry_times_for``, which a NEW intraday run without a time refuses instead of guessing).
 
     ``option_trade_records`` (REQUIRED, keyword, no default -- every caller states it): whether
     an OPTION run's trade rows carry the option trade record (entry/exit snapshots, BT/live
@@ -2921,7 +2927,7 @@ def _build_daily_trial_config(
             # the shared default decision time (a new run only: stored rows reconstruct through
             # schedule_genes with their own time).
             "times": (gene_times["entry"] if gene_times
-                      else entry_times_for((base_run_sched or {}).get("times"), stored_row=False,
+                      else entry_times_for((base_run_sched or {}).get("times"), stored_row=stored_row,
                                            intraday=_is_intraday_interval(backtest_cfg.get("execution_interval")))),
         }
     else:
