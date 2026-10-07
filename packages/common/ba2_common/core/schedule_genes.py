@@ -4,7 +4,7 @@ Moved from testplatform/backend/app/services/strategy_param_space.py (2026-09) s
 built outside the test app (the public site) reconstruct the same run_schedule_override.
 Pure: no DB, no app imports.
 """
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # Fixed order so the gene list (and therefore reproducibility) is stable across runs.
 SCHEDULE_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
@@ -12,6 +12,30 @@ SCHEDULE_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturd
 # (their genes are part of stored genomes and of the export/deploy reconstruction below), but
 # they can never produce a decision point on their own.
 WEEKDAYS = SCHEDULE_DAYS[:5]
+
+
+#: What an ABSENT weekday key in a schedule's ``days`` dict means: Monday-Friday enabled, Saturday and
+#: Sunday disabled. It is the default the settings UI shows for an absent day, and it cannot change a
+#: backtest (a backtest clock has no weekend bars). ONE definition, read by the live scheduler
+#: (``JobManager._parse_schedule``), the backtest entry gate (``daily_engine._schedule_allows_entry``)
+#: and the UI summaries/loaders.
+SCHEDULE_DAY_DEFAULTS: Dict[str, bool] = {day: day not in ("saturday", "sunday") for day in SCHEDULE_DAYS}
+
+
+def schedule_weekday_enabled(days: Dict[str, Any], weekday: str) -> bool:
+    """Whether ``weekday`` (lower-case name, ``SCHEDULE_DAYS``) is enabled in a schedule's ``days`` dict.
+
+    An explicit value wins; an absent key takes ``SCHEDULE_DAY_DEFAULTS``. Raises ``KeyError`` for a
+    name that is not a weekday (a caller bug, never a data condition). Keep this cheap: the backtest
+    calls it per bar.
+    """
+    return bool(days.get(weekday, SCHEDULE_DAY_DEFAULTS[weekday]))
+
+
+def unknown_schedule_day_keys(days: Dict[str, Any]) -> List[str]:
+    """The keys of a schedule's ``days`` dict that are not exact lower-case weekday names (a typo
+    such as "wensday"), in dict order. A caller that cannot run such a schedule refuses it loudly."""
+    return [k for k in days if k not in SCHEDULE_DAY_DEFAULTS]
 
 
 def repair_no_weekday(days: Dict[str, bool], option_run: bool) -> Dict[str, bool]:

@@ -24,6 +24,7 @@ from apscheduler.job import Job
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
+from ba2_common.core.schedule_genes import SCHEDULE_DAYS, schedule_weekday_enabled, unknown_schedule_day_keys
 from ba2_common.core.utils import normalize_symbol
 from ..core.utils import get_expert_instance_from_id
 from ..logger import logger
@@ -749,8 +750,8 @@ class JobManager:
         """Schedule the daily ATM-IV sampler that feeds ``IVRankCondition``.
 
         A dedicated job rather than a hook inside ``refresh_accounts`` (5-minute
-        interval) or inside rule evaluation (per expert-symbol-subtype, and only daily
-        by accident of ``_parse_schedule`` using ``times[0]``). ``get_iv_rank`` reads an
+        interval) or inside rule evaluation (per expert-symbol-subtype: a rule pass fires at
+        every configured schedule time, so it is not once-a-day). ``get_iv_rank`` reads an
         unweighted 252-day window, so anything faster than daily silently reweights the
         percentile toward the last few days. The recorder is idempotent per UTC day, so
         a coalesced or manually re-run job is harmless.
@@ -1213,7 +1214,11 @@ class JobManager:
             logger.debug(f"Creating scheduled job: {job_id} with schedule: {schedule_setting}")
             
             # Parse schedule setting (e.g., "daily_9:30", "hourly", "cron:0 9 * * 1-5")
-            trigger = self._parse_schedule(schedule_setting)
+            setting_name = {AnalysisUseCase.ENTER_MARKET: "execution_schedule_enter_market",
+                            AnalysisUseCase.OPEN_POSITIONS: "execution_schedule_open_positions",
+                            }.get(subtype, f"schedule for {subtype}")
+            trigger = self._parse_schedule(
+                schedule_setting, context=f"expert instance {expert_instance.id}, setting {setting_name}")
             if not trigger:
                 logger.warning(f"Invalid schedule setting '{schedule_setting}' for expert {expert_instance.id}")
                 return
@@ -1249,8 +1254,10 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error creating scheduled job for expert {expert_instance.id}, symbol {symbol}: {e}", exc_info=True)
             
-    def _parse_schedule(self, schedule_setting: str) -> Optional[Any]:
-        """Parse schedule setting into APScheduler trigger."""
+    def _parse_schedule(self, schedule_setting: str, context: str = "") -> Optional[Any]:
+        """Parse schedule setting into APScheduler trigger. ``context`` names the owner of the
+        setting (instance + setting name) for the refusal messages; None is returned, with an ERROR,
+        for a schedule that cannot be run as written."""
         try:
             # Handle monthly Nth-weekday configuration (e.g. 1st Monday).
             # Backward compatible: absence of "frequency" => weekly path below.
@@ -1286,13 +1293,23 @@ class JobManager:
                     'friday': 4, 'saturday': 5, 'sunday': 6
                 }
                 
-                # Get enabled days. A weekday ABSENT from ``days`` is ENABLED, exactly as the
-                # backtest's ``_schedule_allows_entry`` reads it (``days.get(weekday, True)``): the
-                # settings UI and the GA deploy payload always write all seven keys, so this only
-                # decides a hand-written partial dict -- and live and backtest must agree on it.
-                present = {str(k).lower(): bool(v) for k, v in days.items()}
+                # An UNKNOWN key ("wensday") is never ignored and never guessed at: the whole schedule
+                # is REFUSED with one ERROR naming the instance, the setting and the key. Running the
+                # valid days instead would let the typo'd day fall to its absent-key default and trade
+                # on a day the owner may have meant to switch off; "no run" is loud and recoverable.
+                unknown = unknown_schedule_day_keys(days)
+                if unknown:
+                    logger.error(
+                        f"Schedule REFUSED ({context or 'unnamed schedule'}): unknown day key(s) "
+                        f"{unknown!r} in 'days' (valid keys: {', '.join(SCHEDULE_DAYS)}); nothing is "
+                        f"scheduled for it until the setting is corrected")
+                    return None
+
+                # Get enabled days through the ONE shared rule (schedule_genes.schedule_weekday_enabled,
+                # also read by the backtest's ``_schedule_allows_entry`` and the settings UI): an explicit
+                # value wins, an ABSENT key is Monday-Friday enabled and Saturday/Sunday disabled.
                 enabled_days = [number for name, number in day_mapping.items()
-                                if present.get(name, True)]
+                                if schedule_weekday_enabled(days, name)]
                 
                 if not enabled_days:
                     logger.warning("No days enabled in schedule")

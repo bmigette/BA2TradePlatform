@@ -50,6 +50,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
+from ba2_common.core.schedule_genes import schedule_weekday_enabled
 from ba2_common.core.utils import as_utc_key
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 from ba2_common.core.db import add_instance, get_instance
@@ -265,7 +266,7 @@ def _schedule_allows_entry(as_of_dt: datetime, schedule: Optional[Dict[str, Any]
         ctx = _bar_date_context(as_of_dt)
     days = schedule.get("days") or {}
     wd = _WEEKDAYS[ctx.weekday]
-    if not days.get(wd, True):
+    if not schedule_weekday_enabled(days, wd):      # ONE rule, shared with the live scheduler
         return False
     if not is_intraday:
         return True

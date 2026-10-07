@@ -74,17 +74,50 @@ def test_monthly_schedules_every_time_too():
     assert [f.strftime("%Y-%m-%d %H:%M") for f in fires] == ["2026-10-05 09:30", "2026-10-05 15:30"]
 
 
-# ---- a weekday missing from ``days`` is ENABLED, as in the backtest (days.get(weekday, True)) -------
-def test_a_missing_weekday_key_is_enabled_like_the_backtest():
-    """The backtest's ``_schedule_allows_entry`` reads ``days.get(weekday, True)``; live now agrees:
-    everything except an explicit False fires."""
+# ---- a weekday missing from ``days``: Mon-Fri enabled, Sat/Sun disabled (the UI's declared default) ----
+def test_a_missing_weekday_key_follows_the_ui_default_weekdays_on_weekend_off():
+    """An absent Monday-Friday key is ENABLED and an absent Saturday/Sunday key is DISABLED -- what
+    the settings UI shows for an absent day (``settings.py`` ``_load_schedule_config``) and what the
+    backtest sees (it has no weekend bars). Explicit values always win."""
     schedule = {"days": {"monday": True, "tuesday": False}, "times": ["09:30"]}
     trigger = _jm()._parse_schedule(schedule)
     live_days = sorted({f.weekday() for f in _fires(trigger, datetime(2026, 10, 5, 0, 0), 30)})
-    assert live_days == [0, 2, 3, 4, 5, 6]
-    # an empty days dict (every key missing) is every day, as in the backtest
+    assert live_days == [0, 2, 3, 4]                       # Mon, Wed, Thu, Fri; Tue explicit False; no weekend
     every = _jm()._parse_schedule({"days": {}, "times": ["09:30"]})
-    assert sorted({f.weekday() for f in _fires(every, datetime(2026, 10, 5, 0, 0), 30)}) == list(range(7))
+    assert sorted({f.weekday() for f in _fires(every, datetime(2026, 10, 5, 0, 0), 30)}) == [0, 1, 2, 3, 4]
+
+
+def test_an_explicit_weekend_true_still_fires_on_the_weekend():
+    trigger = _jm()._parse_schedule({"days": {"saturday": True, "monday": False}, "times": ["09:30"]})
+    assert sorted({f.weekday() for f in _fires(trigger, datetime(2026, 10, 5, 0, 0), 30)}) == [1, 2, 3, 4, 5]
+
+
+@pytest.fixture
+def jm_errors(monkeypatch):
+    import ba2_trade_platform.core.JobManager as module
+    seen = []
+    monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: seen.append(str(msg)))
+    return seen
+
+
+def test_an_unknown_day_key_refuses_the_whole_schedule_with_one_loud_error(jm_errors):
+    """A typo such as "wensday" is never ignored. The schedule is REFUSED (no trigger) rather than
+    run on the valid days: the typo day would otherwise fall to its absent-key default, trading on a
+    day the owner may have meant to switch off."""
+    schedule = {"days": {**ALL_DAYS, "wensday": False}, "times": ["09:30"]}
+    assert _jm()._parse_schedule(schedule, context="expert instance 5, setting "
+                                                    "execution_schedule_enter_market") is None
+    assert len(jm_errors) == 1
+    assert "wensday" in jm_errors[0] and "expert instance 5" in jm_errors[0]
+    assert "execution_schedule_enter_market" in jm_errors[0]
+
+
+def test_a_job_with_an_unknown_day_key_is_not_created(manager, jm_errors):
+    manager._create_scheduled_job(_expert(5), "AAPL", {"days": {"mondey": True}, "times": ["09:30"]},
+                                  "enter_market")
+    assert manager._scheduler.get_jobs() == []
+    assert any("mondey" in m and "expert instance 5" in m and "execution_schedule_enter_market" in m
+               for m in jm_errors)
 
 
 def test_all_listed_weekdays_false_still_schedules_nothing():

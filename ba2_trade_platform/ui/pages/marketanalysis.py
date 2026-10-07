@@ -14,6 +14,7 @@ from ...core.types import OrderStatus
 from ...core.models import AccountDefinition
 from ...core.db import add_instance
 from ...logger import logger
+from ba2_common.core.schedule_genes import SCHEDULE_DAYS, schedule_weekday_enabled
 from ...core.utils import get_account_instance_from_id
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.SmartRiskManagerDetailDialog import SmartRiskManagerDetailDialog
@@ -3518,18 +3519,19 @@ class ScheduledJobsTab:
                     days = schedule_config.get('days', {})
                     times = schedule_config.get('times', [])
                     
-                    if not any(days.values()) or not times:
+                    # The ONE shared reading of ``days`` (an absent key = Mon-Fri on, Sat/Sun off), so
+                    # this calendar shows what the live scheduler actually fires.
+                    if not any(schedule_weekday_enabled(days, d) for d in SCHEDULE_DAYS) or not times:
                         continue
-                    
+
                     # Map days to indices
                     day_map = {
                         'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
                         'friday': 4, 'saturday': 5, 'sunday': 6
                     }
-                    
-                    for day_name, enabled in days.items():
-                        if enabled and day_name in day_map:
-                            day_idx = day_map[day_name]
+
+                    for day_name, day_idx in day_map.items():
+                        if schedule_weekday_enabled(days, day_name):
                             if day_idx not in expert_schedules[expert_instance.id]['days']:
                                 expert_schedules[expert_instance.id]['days'][day_idx] = {
                                     'enter_market': [],
@@ -3876,7 +3878,7 @@ class ScheduledJobsTab:
                             days = schedule_config.get('days', {})
 
                             # Skip if no schedule is defined
-                            if not any(days.values()) or not times:
+                            if not any(schedule_weekday_enabled(days, d) for d in SCHEDULE_DAYS) or not times:
                                 continue
 
                             # Get enabled weekdays with short names
@@ -3885,7 +3887,7 @@ class ScheduledJobsTab:
 
                             enabled_weekdays = []
                             for i, day_name in enumerate(day_names):
-                                if days.get(day_name, False):
+                                if schedule_weekday_enabled(days, day_name):
                                     enabled_weekdays.append(short_weekday_names[i])
                             weekdays_display = ', '.join(enabled_weekdays) if enabled_weekdays else 'None'
                         
