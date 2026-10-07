@@ -58,7 +58,8 @@ MINUTES = [(9, 30), (9, 35), (9, 40), (9, 45)]
 
 def _intraday_rows():
     rows, px = [], 100.0
-    for d in SESSIONS:
+    # the session BEFORE the run supplies the price knowable at the first decision of the first day
+    for d in (date(2023, 12, 29), *SESSIONS):
         for h, m in MINUTES:
             # open != close on purpose, and no price equals any daily close
             rows.append({"Date": datetime(d.year, d.month, d.day, h, m),
@@ -477,3 +478,72 @@ def test_regime_calendar_lookup_day_is_the_prior_session_on_an_intraday_clock():
     as_of = datetime(2024, 1, 3, 14, 30, tzinfo=timezone.utc)
     assert _ps("5min").daily_session_date(as_of) == date(2024, 1, 2)
     assert _ps("1d").daily_session_date(as_of) == date(2024, 1, 3)
+
+
+# --------------------------------------------------------------------------- #
+# a thin symbol with a GAP in its bars at T is still decided, and filled at its next bar
+# --------------------------------------------------------------------------- #
+
+def _thin_ps():
+    """AAPL prints every 5 minutes; THIN prints at 09:30, 09:35 and then not until 09:55; STALE's last
+    bar is three sessions before the run."""
+    ps = _ps("5min")
+    ps.load_bars("AAPL", _day_bars(date(2024, 1, 3), minutes=120, base=100.0))
+    thin = [r for r in _day_bars(date(2024, 1, 3), minutes=120, base=20.0)
+            if r["Date"].strftime("%H:%M") in ("09:30", "09:35", "09:55", "10:00")]
+    ps.load_bars("THIN", thin)
+    ps.load_bars("STALE", _day_bars(date(2023, 12, 27), minutes=60, base=5.0))
+    return ps, thin
+
+
+def test_a_symbol_without_a_bar_at_T_is_still_decidable():
+    from app.services.backtest.daily_engine import resolve_universe
+
+    ps, thin = _thin_ps()
+    cfg = {"enabled_instruments": ["AAPL", "THIN", "STALE", "NODATA"]}
+    t = _wall(2024, 1, 3, 9, 45)                    # no THIN bar is stamped 09:45
+    assert ps.bar_at("THIN", t) is None
+    ps.set_clock(t)
+    assert resolve_universe(t, cfg, ps) == ["AAPL", "THIN"]         # decidable; stale/no data are not
+    # its price is the close of its latest ENDED bar (09:35, ended 09:40), not a stale or future print
+    assert ps.decision_price("THIN", t) == thin[1]["Close"]
+
+
+def test_a_stale_symbol_is_not_decidable_but_the_prior_session_is_fine():
+    ps, _ = _thin_ps()
+    ps.load_bars("PRIOR", _day_bars(date(2024, 1, 2), minutes=390, base=7.0))
+    assert ps.decision_price("STALE", _wall(2024, 1, 3, 10, 0)) is None
+    assert ps.decision_price("PRIOR", _wall(2024, 1, 3, 9, 30)) is not None
+
+
+def test_the_account_prices_a_decision_with_the_knowable_price():
+    from app.services.backtest.backtest_account import BacktestAccount
+    from tests.backtest.test_max_loss_stop_engine import CFG
+
+    ps, thin = _thin_ps()
+    t = _wall(2024, 1, 3, 9, 45)
+    ps.set_clock(t)
+    acct = BacktestAccount(998, ps, CFG)
+    assert acct.get_instrument_current_price("THIN") == thin[1]["Close"]
+    aapl = _day_bars(date(2024, 1, 3), minutes=120, base=100.0)
+    # AAPL: the bar stamped 09:40 (the last that ended by 09:45), NOT the 09:45 bar's own close
+    assert acct.get_instrument_current_price("AAPL") == aapl[2]["Close"]
+    with pytest.raises(ValueError):
+        acct.get_instrument_current_price("STALE")
+
+
+def test_a_market_order_on_a_thin_symbol_fills_at_its_next_bar_whenever_that_opens():
+    from app.services.backtest.backtest_account import BacktestAccount
+    from tests.backtest.test_max_loss_stop_engine import CFG
+
+    ps, thin = _thin_ps()
+    t = _wall(2024, 1, 3, 9, 45)
+    ps.set_clock(t)
+    acct = BacktestAccount(997, ps, CFG)
+    nb = ps.next_bar("THIN", t)
+    assert nb["open"] == thin[2]["Open"]          # the 09:55 print: ten minutes later, still THE next open
+
+    class _O:  # the minimal order shape _bar_for_fill reads
+        symbol = "THIN"
+
+    assert acct._bar_for_fill(_O(), t)["open"] == thin[2]["Open"]

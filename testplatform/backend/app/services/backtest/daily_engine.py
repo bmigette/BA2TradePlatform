@@ -118,6 +118,13 @@ def resolve_universe(as_of: datetime, config: Dict[str, Any], price_source) -> L
     (signature + filter) is built now so the swap is body-only.
     """
     universe = config["enabled_instruments"]
+    if getattr(price_source, "is_intraday", False):
+        # INTRADAY clock: a symbol is decidable when a price is KNOWABLE at ``as_of`` (the close of
+        # its latest bar that has ended, same or last finished session), NOT only when it printed
+        # a bar stamped exactly at ``as_of``. A thin name that did not trade in this one 5-minute
+        # window is still analysed live; its order fills at its next bar's open, whenever that
+        # opens (BacktestAccount.refresh_orders reads ``next_bar``).
+        return [s for s in universe if price_source.decision_price(s, as_of) is not None]
     return [s for s in universe if price_source.bar_at(s, as_of) is not None]
 
 

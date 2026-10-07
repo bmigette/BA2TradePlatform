@@ -3010,6 +3010,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         Single symbol -> float (raises if unavailable, per the live no-fallback rule).
         List -> {symbol: price-or-None}.
         """
+        if getattr(self._price, "is_intraday", False):
+            # INTRADAY clock: the price KNOWABLE at the decision (``AsOfPriceSource.decision_price``:
+            # the close of the latest bar that has ENDED), the same price the experts decide on,
+            # not the clock bar's own close (printed after the decision). Equity valuation reads
+            # ``close_at`` / ``close_asof`` directly and is unaffected.
+            now = self._price.now()
+            if isinstance(symbol_or_symbols, (list, tuple, set)):
+                return {s: self._price.decision_price(s, now) for s in symbol_or_symbols}
+            px = self._price.decision_price(symbol_or_symbols, now)
+            if px is None:
+                raise ValueError(
+                    f"No backtest price for {symbol_or_symbols} at {now}: no bar has ended in the "
+                    f"current or the last finished session")
+            return px
         if isinstance(symbol_or_symbols, (list, tuple, set)):
             return {s: self._price.close_at(s) for s in symbol_or_symbols}
         px = self._price.close_at(symbol_or_symbols)

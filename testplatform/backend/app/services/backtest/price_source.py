@@ -736,7 +736,15 @@ class AsOfPriceSource:
             return None if i < 0 else float(self._c[symbol][i])
         span = _interval_ns(self._interval)
         f = bisect.bisect_right(k, key - span) - 1        # latest bar with stamp + interval <= T
-        return None if f < 0 else float(self._c[symbol][f])
+        if f < 0:
+            return None
+        # STALENESS: the latest ended bar must belong to T's own session or to the last session
+        # finished before it (a thin name's last print may be hours old, or yesterday's close).
+        # An older one means the symbol is halted / delisted / has no data: nothing is knowable
+        # and the symbol cannot be decided, exactly as live cannot trade it.
+        if _ns_date(k[f]) < self.daily_session_date(as_of):
+            return None
+        return float(self._c[symbol][f])
 
     # ---- loading -----------------------------------------------------------
     def preload(
