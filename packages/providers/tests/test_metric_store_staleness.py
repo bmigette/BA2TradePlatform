@@ -213,3 +213,50 @@ def test_float_cache_refetched_only_when_it_does_not_reach_end(tmp_path, monkeyp
     assert len(calls) == 1                                              # cache ended 03-01 < end
     ms.fetch_historical_float("AAA", "key", "2026-01-01", "2026-09-26")
     assert len(calls) == 1                                              # fetched_to now covers it
+
+
+# --- 6. explicit universe (--symbols-file) -------------------------------------------------------
+
+def _screen_rows(monkeypatch, rows):
+    monkeypatch.setattr(ms, "_fetch_screener_rows", lambda key: rows)
+
+
+def test_universe_symbols_restricts_build_and_ignores_floors(tmp_path, monkeypatch):
+    rows = [{"symbol": s, "marketCap": 1.0, "price": 1.0, "volume": 1.0, "sector": "Tech"}
+            for s in ("AAA", "BBB", "CCC")]
+    _screen_rows(monkeypatch, rows)
+    frames = {s: _ohlcv("2025-01-02", "2026-03-27") for s in ("AAA", "BBB", "CCC", "ZZZ")}
+    f = tmp_path / "u.txt"
+    f.write_text("AAA\nZZZ\n")
+    store = str(tmp_path / "store")
+    summary = ms.build_store(store, "k", "2026-01-03", "2026-03-28", market_cap_min=1e12,
+                             price_min=1e6, volume_min=1e12, ohlcv_get=lambda s, e: frames[s],
+                             max_workers=1, universe_symbols=["AAA", "ZZZ"],
+                             universe_symbols_path=str(f), fail_on_quality=False)
+    df = ms.load_store(store)
+    assert set(df["symbol"].astype(str)) == {"AAA", "ZZZ"}          # exactly the list, floors ignored
+    assert df.loc[df["symbol"] == "AAA", "sector"].astype(str).iloc[0] == "Tech"
+    u = json.load(open(summary["manifest"]))["builds"][-1]["universe"]
+    assert u["source"] == "symbols_file" and u["n_symbols"] == 2 and u["path"] == str(f)
+    assert u["not_in_screener"] == ["ZZZ"] and u["floors_applied"] is False
+    assert len(u["file_sha256"]) == 64 and len(u["symbols_sha256"]) == 64
+
+
+def test_universe_prebuild_check_iterates_the_exact_set(tmp_path, monkeypatch):
+    _screen_rows(monkeypatch, [{"symbol": "AAA"}, {"symbol": "OLD"}, {"symbol": "OTHER"}])
+    frames = {"AAA": _ohlcv("2025-01-02", "2026-03-27"), "OLD": _ohlcv("2025-01-02", "2025-06-01"),
+              "OTHER": _ohlcv("2025-01-02", "2025-06-01")}
+    with pytest.raises(ms.MetricStoreStaleInputError) as ei:
+        ms.build_store(str(tmp_path / "s"), "k", "2026-01-03", "2026-03-28", market_cap_min=0,
+                       price_min=0, volume_min=0, ohlcv_get=lambda s, e: frames[s], max_workers=1,
+                       universe_symbols=["AAA", "OLD"])
+    assert "OLD" in str(ei.value) and "OTHER" not in str(ei.value)
+
+
+def test_default_universe_unchanged_and_manifest_records_thresholds(tmp_path, monkeypatch):
+    _universe(monkeypatch, ["LIVE"])
+    frames = {"LIVE": _ohlcv("2025-01-02", "2026-03-27")}
+    store, summary = _build(tmp_path, frames)
+    u = json.load(open(summary["manifest"]))["builds"][-1]["universe"]
+    assert u == {"source": "screener_thresholds", "market_cap_min": 0, "price_min": 0,
+                 "volume_min": 0, "n_symbols": 1}
