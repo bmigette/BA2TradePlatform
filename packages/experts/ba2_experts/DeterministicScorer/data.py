@@ -49,6 +49,11 @@ _OHLCV_CACHE = TTLCache(_TTL_SECONDS)
 # requested window), which TTLCache's key/value shape cannot express -- so the
 # frames live here as {key: (covered_from, df)} instead.
 _OHLCV_COVERAGE: dict = {}
+# LIVE ONLY (as_of None): key -> the New York session date on which the cached frame was fetched.
+# A live frame is "history up to the last final session"; ``need_from`` only moves FORWARD with the
+# wall clock, so the coverage test alone would serve the first frame of the process for its whole life.
+# A new NY session date refetches (backtest reads are keyed by coverage only, as before).
+_OHLCV_LIVE_DAY: dict = {}
 # One OhlcvView per cached frame (same keys as _OHLCV_COVERAGE): the parsed
 # dates + column arrays + the fingerprint the technical series memo keys on.
 _OHLCV_VIEWS: dict = {}
@@ -82,6 +87,7 @@ def reset_caches() -> None:
     reset under its own lock.
     """
     _OHLCV_COVERAGE.clear()
+    _OHLCV_LIVE_DAY.clear()
     _OHLCV_VIEWS.clear()
     _INDEX_CLOSES_MEMO.clear()
     # The technical series memo is keyed on an OhlcvView fingerprint, so dropping
@@ -231,6 +237,14 @@ def _slice_to_as_of(df: pd.DataFrame, as_of: Optional[datetime],
     return df[dates <= cutoff]
 
 
+def _live_session_day(now) -> object:
+    """The New York calendar date of ``now`` (naive values are read as UTC): the refresh key of a
+    LIVE frame."""
+    ts = pd.Timestamp(now)
+    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts
+    return ts.tz_convert("America/New_York").date()
+
+
 def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
                 lookback_days: int = OHLCV_LOOKBACK_DAYS) -> Optional[pd.DataFrame]:
     """Daily OHLCV ascending by date, sliced to <= as_of (causal).
@@ -255,7 +269,9 @@ def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
     need_from = ((as_of or now) - timedelta(days=lookback_days)).replace(tzinfo=None)
     key = _ohlcv_key(symbol, lookback_days)
     covered_from, df = _OHLCV_COVERAGE.get(key, (None, None))
-    if df is None or (covered_from is not None and need_from < covered_from):
+    live_day = _live_session_day(now) if as_of is None else None
+    stale_live = as_of is None and df is not None and _OHLCV_LIVE_DAY.get(key) != live_day
+    if df is None or stale_live or (covered_from is not None and need_from < covered_from):
         try:
             ohlcv = providers.ohlcv()
             # This reader caches the whole series for the run and slices it per decision through
@@ -275,6 +291,10 @@ def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
         if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
             return None
         _OHLCV_COVERAGE[key] = (need_from, df)
+        if as_of is None:
+            _OHLCV_LIVE_DAY[key] = live_day
+        else:
+            _OHLCV_LIVE_DAY.pop(key, None)
         # A NEW payload means a NEW view and a new epoch in its fingerprint, so
         # nothing memoised against the previous frame can be served for it.
         _OHLCV_VIEWS[key] = _build_view(symbol, df)
