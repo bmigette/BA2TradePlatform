@@ -50,7 +50,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
-from ba2_common.core.schedule_genes import schedule_weekday_enabled
+from ba2_common.core.schedule_genes import schedule_refusal_message, schedule_weekday_enabled
 from ba2_common.core.utils import as_utc_key
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 from ba2_common.core.db import add_instance, get_instance
@@ -543,6 +543,7 @@ class DailyBacktestEngine:
         self._indicator_provider = indicator_provider
 
         self._check_regime_calendar()
+        self._validate_schedules_once()
         # Start from a clean regime even if a PREVIOUS trial in this worker died mid-loop and
         # never reached its own reset.
         reset_stressed()
@@ -891,6 +892,21 @@ class DailyBacktestEngine:
             return True
 
     # -- run-cadence --------------------------------------------------------
+    def _validate_schedules_once(self) -> None:
+        """Refuse, ONCE and up front, a run whose entry/manage schedule has an unknown day key.
+
+        The live scheduler refuses such a schedule (``JobManager._schedule_is_runnable``); the bar
+        loop would otherwise read the typo'd day at its default and score a cadence live would never
+        run. Called at run setup, never per bar and never mid-trial; all known schedule writers emit
+        exactly seven lower-case keys, so a valid run cannot trip it (pinned in
+        ``test_schedule_weekday_shared``)."""
+        for expert, expert_id, _s, _r in self.experts:
+            for label, schedule in (("entry", self._entry_schedule(expert)),
+                                    ("manage", self._manage_schedule(expert))):
+                refusal = schedule_refusal_message(schedule)
+                if refusal:
+                    raise ValueError(f"Backtest refused: expert {expert_id}'s {label} {refusal}")
+
     def _entry_schedule(self, expert: Any) -> Optional[Dict[str, Any]]:
         """The expert's ``execution_schedule_enter_market`` (common base setting), or None.
 

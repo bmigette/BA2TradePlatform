@@ -38,6 +38,27 @@ def unknown_schedule_day_keys(days: Dict[str, Any]) -> List[str]:
     return [k for k in days if k not in SCHEDULE_DAY_DEFAULTS]
 
 
+def schedule_refusal_message(schedule: Any) -> Optional[str]:
+    """Why a schedule dict cannot be run as written, or None when it can: the ONE sentence the live
+    scheduler, the settings page, the Scheduled Jobs views and the backtest setup all show.
+
+    Only a dict ``days`` with a key that is not an exact lower-case weekday name is refused here
+    ("schedule refused: unknown day key 'wensday'"); other shapes (monthly, no ``days``) are not this
+    check's business.
+    """
+    if not isinstance(schedule, dict):
+        return None
+    days = schedule.get("days")
+    if not isinstance(days, dict):
+        return None
+    unknown = unknown_schedule_day_keys(days)
+    if not unknown:
+        return None
+    keys = ", ".join(repr(k) for k in unknown)
+    return (f"schedule refused: unknown day key{'s' if len(unknown) > 1 else ''} {keys} "
+            f"(valid keys: {', '.join(SCHEDULE_DAYS)})")
+
+
 def repair_no_weekday(days: Dict[str, bool], option_run: bool) -> Dict[str, bool]:
     """Force the first weekday ON when the genome is a dead config; the weekend flags are left
     as they are. Shared by ``decode_params`` (what a trial runs) and

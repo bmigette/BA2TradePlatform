@@ -14,7 +14,19 @@ from ...core.types import OrderStatus
 from ...core.models import AccountDefinition
 from ...core.db import add_instance
 from ...logger import logger
-from ba2_common.core.schedule_genes import SCHEDULE_DAYS, schedule_weekday_enabled
+from ba2_common.core.schedule_genes import SCHEDULE_DAYS, schedule_refusal_message, schedule_weekday_enabled
+
+
+def _render_schedule_refusals(refusals: List[str]) -> None:
+    """A red banner listing every stored schedule the live scheduler REFUSES (unknown day key), so the
+    Scheduled Jobs views never render a refused schedule as if it ran at its defaults. Quasar classes
+    only (no page CSS), built synchronously by the caller."""
+    if not refusals:
+        return
+    with ui.card().classes('w-full mb-2 p-3 bg-red-100'):
+        ui.label('Schedules NOT running (refused by the scheduler)').classes('text-negative text-weight-bold')
+        for line in refusals:
+            ui.label(line).classes('text-negative text-sm')
 from ...core.utils import get_account_instance_from_id
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.SmartRiskManagerDetailDialog import SmartRiskManagerDetailDialog
@@ -3477,6 +3489,7 @@ class ScheduledJobsTab:
         
         # Collect schedule data per expert and day
         expert_schedules = {}  # {expert_id: {day_index: {enter_market: [times], open_positions: [times]}}}
+        calendar_refusals: List[str] = []   # stored schedules the live scheduler refuses (unknown day key)
         
         for expert_instance in enabled_experts:
             try:
@@ -3515,10 +3528,17 @@ class ScheduledJobsTab:
                     
                     if not isinstance(schedule_config, dict):
                         continue
-                    
+
+                    refusal = schedule_refusal_message(schedule_config)
+                    if refusal:
+                        # the live scheduler runs NOTHING for this setting: say so, do not draw defaults
+                        calendar_refusals.append(
+                            f"Expert instance {expert_instance.id}, {schedule_key}: {refusal}")
+                        continue
+
                     days = schedule_config.get('days', {})
                     times = schedule_config.get('times', [])
-                    
+
                     # The ONE shared reading of ``days`` (an absent key = Mon-Fri on, Sat/Sun off), so
                     # this calendar shows what the live scheduler actually fires.
                     if not any(schedule_weekday_enabled(days, d) for d in SCHEDULE_DAYS) or not times:
@@ -3552,6 +3572,8 @@ class ScheduledJobsTab:
         # Sort time slots
         sorted_times = sorted(list(all_times))
         
+        _render_schedule_refusals(calendar_refusals)
+
         # Create grid layout with days as columns and times as rows
         with ui.card().classes('w-full mb-4 p-3'):
             ui.label('Weekly Schedule Overview').classes('text-md font-bold mb-3')
@@ -3732,6 +3754,8 @@ class ScheduledJobsTab:
         if scheduled_data is None:
             scheduled_data, _ = self._get_scheduled_jobs_data()
         
+        _render_schedule_refusals(getattr(self, 'schedule_refusals', []))
+
         with ui.card().classes('w-full'):
             # Header with bulk action button
             with ui.row().classes('w-full justify-between items-center mb-2'):
@@ -3813,6 +3837,7 @@ class ScheduledJobsTab:
             
             # Group by (expert_instance_id, symbol, job_type) to create one line per combination
             jobs_by_combination = {}
+            self.schedule_refusals = []     # shown as a banner above the table (unknown day key)
             
             for expert_instance in expert_instances:
                 if not expert_instance.enabled:
@@ -3862,7 +3887,13 @@ class ScheduledJobsTab:
                         
                         if not isinstance(schedule_config, dict):
                             continue
-                        
+
+                        refusal = schedule_refusal_message(schedule_config)
+                        if refusal:
+                            self.schedule_refusals.append(
+                                f"Expert instance {expert_instance.id}, {schedule_key}: {refusal}")
+                            continue
+
                         times = schedule_config.get('times', [])
 
                         if schedule_config.get('frequency') == 'monthly':

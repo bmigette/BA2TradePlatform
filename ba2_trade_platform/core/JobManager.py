@@ -24,7 +24,7 @@ from apscheduler.job import Job
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
-from ba2_common.core.schedule_genes import SCHEDULE_DAYS, schedule_weekday_enabled, unknown_schedule_day_keys
+from ba2_common.core.schedule_genes import schedule_refusal_message, schedule_weekday_enabled
 from ba2_common.core.utils import normalize_symbol
 from ..core.utils import get_expert_instance_from_id
 from ..logger import logger
@@ -1031,6 +1031,9 @@ class JobManager:
             
             # Schedule jobs for enter_market (depends on instrument selection method)
             enter_market_schedule = self._get_expert_setting(expert_instance.id, "execution_schedule_enter_market")
+            if enter_market_schedule and not self._schedule_is_runnable(
+                    expert_instance, "execution_schedule_enter_market", enter_market_schedule):
+                enter_market_schedule = None        # refused ONCE for the setting, not once per symbol
             if enter_market_schedule:
                 logger.debug(f"Found execution_schedule_enter_market for expert {expert_instance.id}: {enter_market_schedule}")
                 
@@ -1054,6 +1057,9 @@ class JobManager:
             expert_properties = expert_class.get_expert_properties() if expert_class else {}
             if should_schedule_open_positions(expert_properties):
                 open_positions_schedule = self._get_expert_setting(expert_instance.id, "execution_schedule_open_positions")
+                if open_positions_schedule and not self._schedule_is_runnable(
+                        expert_instance, "execution_schedule_open_positions", open_positions_schedule):
+                    open_positions_schedule = None
                 if open_positions_schedule:
                     logger.debug(f"Found execution_schedule_open_positions for expert {expert_instance.id}: {open_positions_schedule}")
 
@@ -1072,6 +1078,19 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error scheduling jobs for expert instance {expert_instance.id}: {e}", exc_info=True)
             
+    @staticmethod
+    def _schedule_is_runnable(expert_instance, setting_name: str, schedule_setting: Any) -> bool:
+        """False, with exactly ONE ERROR naming the instance, the setting and the unknown key(s), when
+        the stored schedule cannot be run as written. Called once per expert and setting BEFORE the
+        per-symbol job loop, so a single typo is one ERROR rather than one per symbol (and no job is
+        created for it, so there is no per-symbol "invalid schedule" warning either)."""
+        refusal = schedule_refusal_message(schedule_setting)
+        if not refusal:
+            return True
+        logger.error(f"{refusal} (expert instance {expert_instance.id}, setting {setting_name}); "
+                     f"NO job is scheduled for this setting until it is corrected")
+        return False
+
     def trigger_live_expert(self, expert_instance_id: int) -> str:
         """
         Trigger the daily pipeline of a running live expert immediately.
@@ -1220,7 +1239,8 @@ class JobManager:
             trigger = self._parse_schedule(
                 schedule_setting, context=f"expert instance {expert_instance.id}, setting {setting_name}")
             if not trigger:
-                logger.warning(f"Invalid schedule setting '{schedule_setting}' for expert {expert_instance.id}")
+                logger.warning(f"No job created for {job_id}: the {setting_name} of expert "
+                               f"{expert_instance.id} did not parse (see the preceding error)")
                 return
                 
             logger.debug(f"Parsed trigger for {job_id}: {trigger}")
@@ -1297,12 +1317,12 @@ class JobManager:
                 # is REFUSED with one ERROR naming the instance, the setting and the key. Running the
                 # valid days instead would let the typo'd day fall to its absent-key default and trade
                 # on a day the owner may have meant to switch off; "no run" is loud and recoverable.
-                unknown = unknown_schedule_day_keys(days)
-                if unknown:
-                    logger.error(
-                        f"Schedule REFUSED ({context or 'unnamed schedule'}): unknown day key(s) "
-                        f"{unknown!r} in 'days' (valid keys: {', '.join(SCHEDULE_DAYS)}); nothing is "
-                        f"scheduled for it until the setting is corrected")
+                refusal = schedule_refusal_message(schedule_setting)
+                if refusal:
+                    # Normally unreachable from the scheduling pass (``_schedule_is_runnable`` refused it
+                    # once, before any per-symbol job); a direct caller still gets the loud refusal.
+                    logger.error(f"{refusal} ({context or 'unnamed schedule'}); nothing is scheduled "
+                                 f"for it until the setting is corrected")
                     return None
 
                 # Get enabled days through the ONE shared rule (schedule_genes.schedule_weekday_enabled,

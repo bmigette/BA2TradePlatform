@@ -112,6 +112,27 @@ def test_an_unknown_day_key_refuses_the_whole_schedule_with_one_loud_error(jm_er
     assert "execution_schedule_enter_market" in jm_errors[0]
 
 
+def test_one_typo_is_one_error_per_expert_and_setting_not_one_per_symbol(manager, jm_errors, monkeypatch):
+    """The scheduling pass validates ONCE per expert and setting, before the per-symbol loop: 40 symbols
+    make ONE ERROR (instance id, setting key, unknown key), no job, and no per-symbol warning that dumps
+    the dict."""
+    import ba2_trade_platform.core.JobManager as module
+    warnings = []
+    monkeypatch.setattr(module.logger, "warning", lambda msg, *a, **k: warnings.append(str(msg)))
+    typo = {"days": {**ALL_DAYS, "wensday": False}, "times": ["09:30"]}
+    manager._get_expert_setting = lambda iid, key: typo
+    manager._get_enabled_instruments = lambda iid: [f"SYM{i}" for i in range(40)]
+    monkeypatch.setattr(module, "should_schedule_open_positions", lambda props: True, raising=False)
+    manager._schedule_expert_jobs(SimpleNamespace(id=9, expert="NoSuchExpert"))
+    assert manager._scheduler.get_jobs() == []
+    refusals = [m for m in jm_errors if "schedule refused" in m]
+    assert len(refusals) == 2                       # enter_market + open_positions: one each, not 41
+    assert any("expert instance 9" in m and "execution_schedule_enter_market" in m and "'wensday'" in m
+               for m in refusals)
+    assert any("execution_schedule_open_positions" in m for m in refusals)
+    assert not [w for w in warnings if "wensday" in w or "days" in w]
+
+
 def test_a_job_with_an_unknown_day_key_is_not_created(manager, jm_errors):
     manager._create_scheduled_job(_expert(5), "AAPL", {"days": {"mondey": True}, "times": ["09:30"]},
                                   "enter_market")
