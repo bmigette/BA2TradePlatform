@@ -276,18 +276,113 @@ def _ps(interval):
     return AsOfPriceSource(ohlcv_provider=None, interval=interval)
 
 
+def _wall(y, m, d, hh, mm):
+    """A decision instant as the engine labels it: exchange-local wall time, tagged UTC."""
+    return datetime(y, m, d, hh, mm, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("interval", ["1min", "5min", "15min", "1h"])
 @pytest.mark.parametrize("decision, session", [
-    (datetime(2024, 1, 3, 9, 30, tzinfo=timezone.utc), date(2024, 1, 2)),    # Wed 09:30 -> Tue
-    (datetime(2024, 1, 2, 9, 30, tzinfo=timezone.utc), date(2023, 12, 29)),  # Tue after a holiday Monday -> Fri
-    (datetime(2024, 1, 8, 9, 30, tzinfo=timezone.utc), date(2024, 1, 5)),    # Monday -> Friday
-    (datetime(2024, 1, 3, 14, 30, tzinfo=timezone.utc), date(2024, 1, 2)),   # true UTC stamp of the same open
-    (datetime(2024, 7, 9, 13, 30, tzinfo=timezone.utc), date(2024, 7, 8)),   # EDT 09:30 as UTC
+    # the session's first instant, mid-session, the last bar, the close itself, after it
+    (_wall(2024, 1, 3, 9, 30), date(2024, 1, 2)),
+    (_wall(2024, 1, 3, 11, 0), date(2024, 1, 2)),
+    (_wall(2024, 1, 3, 15, 55), date(2024, 1, 2)),      # 5 minutes before the close: today's bar is NOT done
+    (_wall(2024, 1, 3, 16, 0), date(2024, 1, 3)),       # at the close it is
+    (_wall(2024, 1, 3, 16, 5), date(2024, 1, 3)),
+    (_wall(2024, 1, 3, 23, 0), date(2024, 1, 3)),
+    (_wall(2024, 1, 3, 8, 0), date(2024, 1, 2)),        # pre-market
+    # calendar edges
+    (_wall(2024, 1, 2, 9, 30), date(2023, 12, 29)),     # a holiday Monday precedes
+    (_wall(2024, 1, 8, 9, 30), date(2024, 1, 5)),       # Monday sees Friday
+    (_wall(2024, 1, 6, 12, 0), date(2024, 1, 5)),       # Saturday
+    (_wall(2024, 7, 9, 9, 30), date(2024, 7, 8)),       # summer time
+    # HALF DAY (Fri 2023-11-24 closes 13:00; Thu 11-23 is Thanksgiving): the calendar's close
+    # decides, not a fixed 16:00
+    (_wall(2023, 11, 24, 12, 55), date(2023, 11, 22)),
+    (_wall(2023, 11, 24, 13, 0), date(2023, 11, 24)),
+    (_wall(2023, 11, 24, 14, 0), date(2023, 11, 24)),
 ])
-def test_intraday_session_date(decision, session):
-    ps = _ps("5min")
+def test_intraday_session_date(decision, session, interval):
+    """Daily history at T = the sessions FINISHED at or before T, for any T and any bar length."""
+    ps = _ps(interval)
     assert ps.daily_session_date(decision) == session
     end = ps.knowable_daily_end(decision)
-    assert end.date() == session and end < decision
+    assert end.date() == session and end.replace(hour=0, minute=0, second=0, microsecond=0) <= decision
+
+
+def _day_bars(d, first=(9, 30), minutes=390, step=5, base=100.0):
+    """One session of bars stamped at their START; open and close differ so a read of the wrong
+    one is visible: open = base + n, close = base + n + 0.5."""
+    rows, t = [], datetime(d.year, d.month, d.day, *first)
+    for n in range(minutes // step):
+        rows.append({"Date": t, "Open": base + n, "High": base + n + 1, "Low": base + n - 1,
+                     "Close": base + n + 0.5, "Volume": 10})
+        t += timedelta(minutes=step)
+    return rows
+
+
+@pytest.mark.parametrize("interval, step", [("1min", 1), ("5min", 5), ("15min", 15), ("1h", 60)])
+def test_decision_price_rule_at_any_time_and_interval(interval, step):
+    """PRICE at T = the close of the latest bar that has ENDED at or before T; only when no bar
+    of T's session has ended yet, the OPEN of the bar starting at T. The same rule at the open,
+    mid-session, on the last bar and after the close."""
+    ps = _ps(interval)
+    rows = _day_bars(date(2024, 1, 2), step=step, base=50.0) + _day_bars(date(2024, 1, 3), step=step, base=100.0)
+    ps.load_bars(SYMBOL, rows)
+    n_day = 390 // step
+    day3 = rows[n_day:]
+
+    def at(hh, mm):
+        return ps.decision_price(SYMBOL, _wall(2024, 1, 3, hh, mm))
+
+    # the session's first instant: the opening print (NOT yesterday's last close)
+    assert at(9, 30) == day3[0]["Open"] != rows[n_day - 1]["Close"]
+    # mid-session: the close of the bar that ENDED at T (stamped T - step), NOT the open of the
+    # bar stamped T (which has not ended)
+    idx = 3
+    mid = day3[idx]["Date"]
+    assert at(mid.hour, mid.minute) == day3[idx - 1]["Close"]
+    assert at(mid.hour, mid.minute) not in (day3[idx]["Open"], day3[idx]["Close"])
+    # the last bar: the previous bar's close, not its own
+    last = day3[-1]
+    assert at(last["Date"].hour, last["Date"].minute) == day3[-2]["Close"]
+    # after the close: the last bar has ended
+    assert at(16, 5) == last["Close"]
+    assert at(23, 0) == last["Close"]
+    # pre-market: nothing of today's session has printed; the previous session's last close
+    assert at(8, 0) == rows[n_day - 1]["Close"]
+
+
+def test_decision_price_does_not_hardcode_the_open():
+    """A symbol whose first bar of the day is stamped LATE (thin name) gets the opening-print rule
+    at ITS first bar, not at 09:30, and at 09:30 (no bar of the session yet) the prior close. If
+    anyone hard-codes the open the two assertions swap."""
+    ps = _ps("5min")
+    prev = _day_bars(date(2024, 1, 2), base=50.0)
+    late = _day_bars(date(2024, 1, 3), first=(10, 0), minutes=300, base=100.0)
+    ps.load_bars(SYMBOL, prev + late)
+    assert ps.decision_price(SYMBOL, _wall(2024, 1, 3, 9, 30)) == prev[-1]["Close"]
+    assert ps.decision_price(SYMBOL, _wall(2024, 1, 3, 10, 0)) == late[0]["Open"]
+    assert ps.decision_price(SYMBOL, _wall(2024, 1, 3, 10, 5)) == late[0]["Close"]
+
+
+def test_decision_price_is_none_when_nothing_is_knowable():
+    ps = _ps("5min")
+    ps.load_bars(SYMBOL, _day_bars(date(2024, 1, 3)))
+    assert ps.decision_price(SYMBOL, _wall(2024, 1, 3, 8, 0)) is None
+    assert ps.decision_price("NOPE", _wall(2024, 1, 3, 9, 30)) is None
+
+
+def test_the_fill_is_still_the_next_bars_open():
+    """Unchanged: the order of a decision on the bar stamped T fills at the open of the NEXT bar,
+    so the decision price (T's opening print / the previous bar's close) and the fill price never
+    come from the same instant."""
+    ps = _ps("5min")
+    rows = _day_bars(date(2024, 1, 3))
+    ps.load_bars(SYMBOL, rows)
+    nb = ps.next_bar(SYMBOL, _wall(2024, 1, 3, 9, 30))
+    assert nb["open"] == rows[1]["Open"]
+    assert nb["open"] != ps.decision_price(SYMBOL, _wall(2024, 1, 3, 9, 30))
 
 
 def test_daily_clock_session_date_is_the_bars_own_date():
