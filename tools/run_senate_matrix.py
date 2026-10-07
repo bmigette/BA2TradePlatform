@@ -41,6 +41,7 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 from matrix_flags import (  # noqa: E402
+    finish_matrix, note_job_exit,
     cap_passthrough, decision_times_plan, decision_times_tokens, job_name_with_digest,
     with_decision_times_name)
 
@@ -116,6 +117,9 @@ def _jobs(strategies, name_suffix=""):
     """Yield (name, strategy) in priority order."""
     for s in strategies:
         yield (f"sen-{s}{name_suffix}", s)
+
+
+_FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exited non-zero
 
 
 def main() -> int:
@@ -321,8 +325,8 @@ def main() -> int:
         print(f"[{i}/{len(jobs)}] RUN  {job_name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {job_name} exit={rc}", flush=True)
-    print("senate matrix driver: done.")
-    return 0
+        note_job_exit(_FAILED_JOBS, job_name, rc)
+    return finish_matrix(_FAILED_JOBS, "senate matrix driver")
 
 
 if __name__ == "__main__":

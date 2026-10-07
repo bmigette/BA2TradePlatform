@@ -145,7 +145,16 @@ MIN_ANALYSIS_PASSES_FOR_REFUSAL = 20
 
 
 class AnalysisFailureRefusal(RuntimeError):
-    """The run's analysis passes failed too often for its result to mean anything."""
+    """The run's analysis passes failed too often for its result to mean anything.
+
+    JOB-FATAL: the GA master aborts the whole optimization on the first trial that raises it
+    (``strategy_optimization_handler.JOB_FATAL_ERROR_TYPES``). The structured fields travel in the message
+    (expert, passes, failed, share, first error) because a worker returns the TYPE NAME and the text."""
+
+    def __init__(self, message: str, *, expert_id: Any = None, passes: int = 0, failed: int = 0,
+                 first_error: Any = None):
+        super().__init__(message)
+        self.expert_id, self.passes, self.failed, self.first_error = expert_id, passes, failed, first_error
 
 
 _FIRST_BAR_WARNED: set = set()   # schedule times already warned about in this process
@@ -1042,7 +1051,9 @@ class DailyBacktestEngine:
                     f"Backtest refused: expert {expert_id}: {r['failed']} of {r['passes']} analysis "
                     f"passes failed ({r['failed'] / r['passes']:.0%} > {MAX_FAILED_ANALYSIS_SHARE:.0%}); "
                     f"the result would measure a broken expert, not the strategy. First error: "
-                    f"{r['first_error']}")
+                    f"{r['first_error']}",
+                    expert_id=expert_id, passes=r["passes"], failed=r["failed"],
+                    first_error=r["first_error"])
 
     def _assert_daily_reads_are_clamped(self) -> None:
         """An intraday run's OHLCV reader MUST be bound to THIS run's price source, otherwise every

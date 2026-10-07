@@ -84,6 +84,7 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 from matrix_flags import (  # noqa: E402
+    finish_matrix, is_analysis_failure_reason, note_job_exit,
     add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce)
 from ba2_common.core.option_spread_model import (  # noqa: E402
     LEGACY_PCT_MODEL, SPREAD_MODEL_VERSION, SPREAD_MODELS)
@@ -702,6 +703,9 @@ def planned_jobs(args, launcher, experts, strategies, universe):
             yield arm_name, expert, strategy, mode
 
 
+_FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exited non-zero
+
+
 def main(argv=None) -> int:
     ap = build_parser()
     add_refused_decision_times_flag(ap)
@@ -765,6 +769,14 @@ def main(argv=None) -> int:
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)
         if rc != 0:
+            _reason = _failure_reason(name, created_after=prior_max_id) if prior_max_id is not None else ""
+            if is_analysis_failure_reason(_reason):
+                # The job was refused for failing analysis passes: FAILED with its reason (the row is
+                # 'failed', so a re-run does not skip it as completed), and the campaign carries on.
+                note_job_exit(_FAILED_JOBS, name, rc, _reason)
+                print(f"[{i}/{len(jobs)}] {name} FAILED (analysis failures): {_reason}; "
+                      f"the campaign continues.", flush=True)
+                continue
             decision = _classify_failure(name, prior_max_id)
             if decision == "skip":
                 # A stall-only job (2026-09-21 review, G2). Its checkpoint was PRESERVED, so a later
@@ -781,8 +793,7 @@ def main(argv=None) -> int:
                 print(f"[{i}/{len(jobs)}] options matrix stopped: {name} failed; remaining jobs "
                       f"were not launched.", flush=True)
             return rc if rc > 0 else 1
-    print("options matrix driver: done.")
-    return 0
+    return finish_matrix(_FAILED_JOBS, "options matrix driver")
 
 
 if __name__ == "__main__":

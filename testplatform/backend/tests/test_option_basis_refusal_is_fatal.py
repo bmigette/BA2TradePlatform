@@ -40,5 +40,5 @@ def test_the_batch_loop_aborts_on_the_first_fatal_trial():
     """The master's rule, read from the source it runs: a fatal trial raises at once."""
     import inspect
     src = inspect.getsource(H)
-    assert 'if out.get("fatal") and fatal["msg"] is None:' in src
-    assert 'raise _FatalTrialError(out["error"])' in src
+    assert "_abort_on_fatal_trial(out, fatal, key, flat)" in src      # called in the batch loop
+    assert 'raise _FatalTrialError(fatal["msg"])' in src

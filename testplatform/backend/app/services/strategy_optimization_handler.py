@@ -21,6 +21,7 @@ Determinism (the Phase-4 core gate):
 The GA must NEVER enqueue a sub-task: ``init_task_queue(max_workers=1)`` (main.py) would
 deadlock. The fitness calls the synchronous runner in-process (confirmed in Replan).
 """
+import json as _json
 import logging
 import math as _math
 import random
@@ -402,6 +403,7 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
                # "consistent by luck" blind spot the consistent-annual fitness exists to fight.
                "total_return": results.get("total_return"),
                "max_drawdown": results.get("max_drawdown"),
+               **_analysis_failures_field(results),
                # The decision-time counter, so the MASTER can warn once per job (see
                # ``_decision_time_missing``). Only when non-zero: other results keep their shape.
                **_decision_time_missing(results),
@@ -449,16 +451,16 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         # MacroAvailabilityUnknown (ba2_providers.macro.fred_series): a macro-reading expert's FRED
         # cache is in the old observation-date format, or was fetched before the run's last
         # decision -- again one file every trial reads, so every trial refuses identically.
-        fatal = type(e).__name__ in (
-            "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
-            "SharedArrayFdExhausted", "SplitBasisRefused", "OptionSpotBasisMismatch",
-            "SpreadModelConfigError", "OptionTradeRecordsFlagMissing",
-            "MarketCalendarUnavailable", "NotARegularSession", "RiskFreeRateUnavailable",
-            "MacroAvailabilityUnknown")
+        fatal = job_fatal(e)
         snap = _trial_memory_snapshot()
         snap["option_overlays"] = released
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
-                "fatal": fatal, "mem": snap}
+                "fatal": fatal,
+                # The exception TYPE travels with the result (a remote worker's result is a plain
+                # dict over the wire, never the exception object), so the master can classify by
+                # type and not only by the ``fatal`` flag a worker computed from ITS OWN copy of the
+                # set below.
+                "error_type": type(e).__name__, "mem": snap}
     finally:
         # FINALLY, not after the happy return: a failed or CANCELLED trial is when this
         # matters most. The worker is handed another genome immediately and the abandoned
@@ -1241,6 +1243,49 @@ def _resolve_early_stop_min_rel(ga: Dict[str, Any]) -> Optional[float]:
     return validate_early_stop_min_rel(ga.get(EARLY_STOP_MIN_REL_KEY))
 
 
+from app.services.job_fatal import JOB_FATAL_ERROR_TYPES, job_fatal  # noqa: E402,F401  (ONE set)
+
+
+def _analysis_failures_field(results: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"af": {"passes": n, "failed": m}}`` for a trial that made analysis passes (a few ints), so the
+    job-level summary can aggregate them. Same shape idea as ``dt_missing``."""
+    af = (results or {}).get("analysis_failures")
+    if af and af.get("passes"):
+        return {"af": {"passes": int(af["passes"]), "failed": int(af["failed"])}}
+    return {}
+
+
+def summarise_analysis_failures(opt_name: str, all_results: list) -> Optional[Dict[str, Any]]:
+    """ONE job-level line aggregating the per-trial analysis-failure counts (below the refusal
+    threshold they would otherwise be visible only inside each trial's results). Returns the aggregate."""
+    rows = [(r["af"], r.get("key")) for r in all_results if isinstance(r, dict) and r.get("af")]
+    if not rows:
+        return None
+    passes = sum(a["passes"] for a, _ in rows)
+    failed = sum(a["failed"] for a, _ in rows)
+    worst_af, worst_key = max(rows, key=lambda x: x[0]["failed"] / max(x[0]["passes"], 1))
+    agg = {"trials": len(rows), "passes": passes, "failed": failed,
+           "worst_share": round(worst_af["failed"] / max(worst_af["passes"], 1), 4), "worst_trial": worst_key}
+    line = (f"[{opt_name}] analysis passes over {len(rows)} trial(s): {passes} total, {failed} failed "
+            f"({(failed / passes if passes else 0):.2%}); worst trial {agg['worst_share']:.2%} (key {worst_key})")
+    (logger.warning if failed else logger.info)(line)
+    return agg
+
+
+def _abort_on_fatal_trial(out: Dict[str, Any], fatal: Dict[str, Any], key: Any, flat: Dict[str, Any]) -> None:
+    """The master's rule for a FAILED trial result: if it is job-fatal (the worker's ``fatal`` flag, or
+    its ``error_type`` in ``JOB_FATAL_ERROR_TYPES``), record the reason (naming the trial that tripped it)
+    and raise ``_FatalTrialError``: no further trial is dispatched, the caller marks the job failed.
+    Anything else returns and the trial is scored at the sentinel as before."""
+    if not (out.get("fatal") or job_fatal(out.get("error_type") or "")):
+        return
+    if fatal["msg"] is None:
+        fatal["msg"] = (f"{out['error']}  [job-fatal {out.get('error_type') or 'error'}; tripped by trial "
+                        f"key {key}, params {_json.dumps(flat, default=str, sort_keys=True)[:300]}]")
+        out["error"] = fatal["msg"]
+    raise _FatalTrialError(fatal["msg"])
+
+
 class _FatalTrialError(RuntimeError):
     """A trial failed for a reason that will affect EVERY remaining trial (incomplete prewarm,
     missing OHLCV cache). Raised out of the fitness batch to stop the search immediately rather
@@ -1669,6 +1714,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "total_return": (results or {}).get("total_return"),
                     "max_drawdown": (results or {}).get("max_drawdown"),
                     **_decision_time_missing(results or {}),
+                    **_analysis_failures_field(results or {}),
                 }
             )
             if best["fitness"] is None or fit > best["fitness"]:
@@ -2004,6 +2050,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                              "robustness": out.get("robustness"),
                              "total_return": out.get("total_return"),
                              "max_drawdown": out.get("max_drawdown"),
+                             **({"af": out["af"]} if out.get("af") else {}),
                              **({"dt_missing": out["dt_missing"]} if out.get("dt_missing") else {})}
                         )
                         if is_last_gen:
@@ -2049,8 +2096,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                                 mem = out.get("mem")
                                 logger.warning(f"trial failed in worker: {out['error']}"
                                                + (f" | worker mem: {mem}" if mem else ""))
-                                if out.get("fatal") and fatal["msg"] is None:
-                                    fatal["msg"] = out["error"]
+                                # A job-fatal trial (``JOB_FATAL_ERROR_TYPES``, by flag OR by the TYPE the
+                                # worker sent back) ends the JOB at once:
                                     # ABORT NOW, not at the end. A fatal is a DATA/CONFIG problem --
                                     # an incomplete prewarm, a missing OHLCV cache -- so it affects
                                     # every remaining trial identically. Before this, fatal["msg"] was
@@ -2058,7 +2105,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                                     # when most trials happened to succeed (the goal2020 OP case) the
                                     # run ground through all 8 generations and reported a confident
                                     # winner chosen partly by which genomes dodged the broken data.
-                                    raise _FatalTrialError(out["error"])
+                                _abort_on_fatal_trial(out, fatal, key, flat)
                     if best["fitness"] is None or fit > best["fitness"]:
                         best["fitness"] = fit
                         best["params"] = flat
@@ -2352,6 +2399,12 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                       f"generation {gen_state['gen'] + 1}/{ga['generations']}")
             logger.error(f"strategy_optimization {opt_id}: ABORTING {_where} — {e}")
             return _fail(opt_id, db, str(e))
+        except Exception as e:  # noqa: BLE001 -- SERIAL path: a job-fatal error aborts the job too
+            if not job_fatal(e):
+                raise
+            logger.error(f"strategy_optimization {opt_id}: ABORTING (serial trial) -- "
+                         f"{type(e).__name__}: {e}")
+            return _fail(opt_id, db, f"{e}  [job-fatal {type(e).__name__}]")
         finally:
             _logging.disable(_prior_disable)
             if _evaluator is not None:
@@ -2411,6 +2464,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         opt.best_params = result["best_params"]
         opt.best_fitness = result["best_fitness"]
         _warn_decision_time_missing(opt.name, all_results)
+        summarise_analysis_failures(opt.name, all_results)
         opt.all_results = all_results
         db.commit()
         push_optimization(opt, db)

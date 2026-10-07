@@ -484,7 +484,7 @@ _DS_TARGETS = [{"publishedDate": "2026-06-10", "priceTarget": 120.0},
                {"publishedDate": "2026-06-04", "priceTarget": 116.0}]
 
 
-def _deterministic_scorer_case(bars=400):
+def _deterministic_scorer_case(bars=400, quote=True):
     """DeterministicScorer over the REAL data module: no ``data.*`` stubs.
 
     Every fake here sits BELOW a tapped boundary -- the OHLCV tap, the
@@ -545,6 +545,10 @@ def _deterministic_scorer_case(bars=400):
     expert._gather_index_symbol = "SPY"
     expert._gather_use_model_target = False
     expert._get_fmp_api_key = lambda: "TEST-API-KEY"
+    # The live decision price is the ACCOUNT QUOTE (``_decision_price``), like every other expert here;
+    # the quote is the frame's last close, the value the pre-seam code took from the frame. It lands in
+    # the recorded bundle as ``current_price``. ``quote=None`` is the broker-outage case (a ``no_price`` skip).
+    expert._get_current_price = (lambda symbol: float(frame["Close"].iloc[-1])) if quote else (lambda symbol: None)
     settings = {
         "w_technical": 1.0, "w_fundamental": 0.0, "w_analyst": 0.5, "w_macro": 0.0,
         "w_earnings": 0.0, "macro_mode": "off", "min_history_days": 260,
@@ -967,7 +971,7 @@ def test_fmp_rating_skip_is_recorded_with_its_reason(tmp_path):
 
 
 def test_deterministic_scorer_skip_is_recorded_with_its_reason(tmp_path):
-    """Too little OHLCV history -> _process skips; the record says so."""
+    """Too little OHLCV history (with a price) -> _process skips; the record says so."""
     case = lambda: _deterministic_scorer_case(bars=10)  # noqa: E731
     off = _run(case)
     on = _run(case, capture_root=tmp_path / "dsskip")
@@ -979,6 +983,31 @@ def test_deterministic_scorer_skip_is_recorded_with_its_reason(tmp_path):
     skipped = _decode_object(tmp_path / "dsskip", record.recommendation_object)
     assert skipped.skip is True and skipped.details.startswith("Insufficient OHLCV history")
     assert on["market_analysis"].status == MarketAnalysisStatus.SKIPPED
+
+
+def test_deterministic_scorer_no_price_skip_is_recorded_with_its_reason(tmp_path):
+    """The broker gave no quote -> the analysis is a ``no_price`` skip (NOT thin history), recorded as such,
+    and the recorded bundle carries ``current_price=None`` so a replay reproduces the same skip."""
+    case = lambda: _deterministic_scorer_case(quote=False)  # noqa: E731
+    off = _run(case)
+    on = _run(case, capture_root=tmp_path / "dsnoprice")
+    _assert_identical(off, on)
+
+    record = on["records"][0]
+    assert record.outcome == ReplayStatus.OUTCOME_SKIP
+    assert record.skip_reason == "no_price"
+    skipped = _decode_object(tmp_path / "dsnoprice", record.recommendation_object)
+    assert skipped.skip is True and skipped.current_price is None
+    assert _decode_object(tmp_path / "dsnoprice", record.bundle_object)["current_price"] is None
+
+
+def test_deterministic_scorer_records_the_decision_price_it_used(tmp_path):
+    """New recordings hold the quote the decision used, in the bundle, so they replay exactly."""
+    on = _run(lambda: _deterministic_scorer_case(), capture_root=tmp_path / "dsprice")
+    record = on["records"][0]
+    bundle = _decode_object(tmp_path / "dsprice", record.bundle_object)
+    frame_close = float(bundle["ohlcv"]["Close"].iloc[-1])
+    assert bundle["current_price"] == frame_close
 
 
 def test_an_error_inside_process_is_recorded_and_still_propagates(tmp_path):

@@ -121,3 +121,43 @@ def job_name_with_digest(name: str, cmd: List[str]) -> str:
         kept.append(tok)
     digest = hashlib.sha256(json.dumps(kept, sort_keys=False).encode()).hexdigest()[:12]
     return f"{name}-d{digest}"
+
+
+
+# --------------------------------------------------------------------------------------------------
+# Failed jobs are REPORTED, never silently dropped (owner decision 2026-10-07: a job whose analyses fail
+# en masse "should fail the job for analysis"; the job row is marked failed, so a re-run does NOT skip it
+# as completed). The driver goes on to the next job, prints every failed job in its final summary and
+# exits non-zero.
+# --------------------------------------------------------------------------------------------------
+#: A stored failure reason carrying this marker came from a job-fatal error (see
+#: ``strategy_optimization_handler.JOB_FATAL_ERROR_TYPES``); the driver prints the reason verbatim.
+JOB_FATAL_MARKER = "[job-fatal"
+ANALYSIS_REFUSAL_TYPE = "AnalysisFailureRefusal"
+
+
+def is_analysis_failure_reason(reason: str) -> bool:
+    """True when a stored failure reason says the job was refused for failing analysis passes: the one
+    job-fatal class that is a property of THAT job (its expert / data), so a campaign carries on to
+    the next job instead of stopping."""
+    return ANALYSIS_REFUSAL_TYPE in (reason or "") and JOB_FATAL_MARKER in (reason or "")
+
+
+def note_job_exit(failed: list, job_name: str, rc: int, reason: str = "") -> None:
+    """Record a job that exited non-zero (``reason`` = its stored failure text when known)."""
+    if rc != 0:
+        failed.append((job_name, rc, reason))
+
+
+def finish_matrix(failed: list, label: str) -> int:
+    """Print the final summary of failed jobs and return the driver's exit code (0 only if none
+    failed). Clears ``failed`` so a second ``main()`` in one process starts clean."""
+    jobs = list(failed)
+    failed.clear()
+    if not jobs:
+        print(f"{label}: done.")
+        return 0
+    print(f"{label}: done, but {len(jobs)} job(s) FAILED:")
+    for name, rc, reason in jobs:
+        print(f"  FAILED {name} (exit={rc})" + (f": {reason}" if reason else ""))
+    return 1

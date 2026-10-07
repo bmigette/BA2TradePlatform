@@ -995,6 +995,11 @@ class GeneticOptimizer:
                 fitness = fitness_function(params)
                 return (fitness,)
             except Exception as e:
+                from app.services.job_fatal import job_fatal
+                if job_fatal(e):
+                    # A data / config / code defect (or a look-ahead guard) hit THIS trial and would hit
+                    # every other: the job stops here, it does not score the genome at the sentinel.
+                    raise
                 logger.warning(f"Fitness evaluation failed: {e}")
                 return (FITNESS_EVALUATION_FAILED,)
 

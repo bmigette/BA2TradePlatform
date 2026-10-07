@@ -124,6 +124,10 @@ def main() -> int:
     trades = results.get("trades") or []
     symbols = sorted({t.get("symbol") for t in trades if isinstance(t, dict) and t.get("symbol")})
     got["symbols_traded"] = len(symbols)
+    # Telemetry the summary used to drop: how many analysis passes failed, what the intraday-clock rule
+    # excluded (undecidable symbol-days / prices, skipped manage steps ...), and the decision-time record.
+    for extra in ("analysis_failures", "intraday_clock", "decision_time"):
+        got[extra] = results.get(extra)
     print(f"{'metric':<20}{'stored':>14}{'re-run':>14}")
     for m in SUMMARY:
         print(f"{m:<20}{str(stored[m]):>14}{str(got[m]):>14}")

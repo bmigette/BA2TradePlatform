@@ -463,7 +463,8 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             # ``pass_price_health.summarise_pass``, called when the batch ends.
             from ba2_common.core import pass_price_health
             pass_price_health.record_no_price(getattr(self, "id", None), symbol)
-            self.logger.warning(
+            from ba2_common.logger import logger as _module_logger
+            (getattr(self, "logger", None) or _module_logger).warning(
                 f"DeterministicScorer {symbol}: no current price from the decision-price seam "
                 f"(expert instance {getattr(self, 'id', None)}, account {account_id}, "
                 f"as_of={as_of}); skipping the analysis")
