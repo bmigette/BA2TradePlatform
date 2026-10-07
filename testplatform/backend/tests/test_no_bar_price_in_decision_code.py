@@ -34,8 +34,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 DIRS = ["packages/common/ba2_common/core", "packages/experts/ba2_experts",
         "ba2_trade_platform/modules/experts", "testplatform/backend/app/services/backtest"]
-OHLC = re.compile(r"""["'](Close|Open|High|Low|close|open|high|low)["']|\.(close|open|high|low)\b"""
-                  r"""|\b(close|closes|last_close|prev_close|opens|highs|lows)\b""")
+# case-INSENSITIVE: ["Close"], .Close, .close, closes_arr, last_close, ... (``\w*close`` also hits
+# ``disclosed``-style words: a false positive is fine, it is allowlisted with its reason)
+OHLC = re.compile(r"""["'](close|open|high|low)["']|\.(close|open|high|low)\b"""
+                  r"""|\b\w*(close|closes|opens|highs|lows)\w*\b""", re.IGNORECASE)
 
 
 def _neg_one(node) -> bool:
@@ -61,9 +63,16 @@ def scan():
                 kind = None
                 if isinstance(n, ast.Subscript) and _neg_one(n.slice):
                     seg = ast.get_source_segment(src, n) or ""
-                    if OHLC.search(seg):
+                    base = n.value.value if (isinstance(n.value, ast.Attribute) and n.value.attr == "iloc") else n.value
+                    from_provider = any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                                        and c.func.attr in ("get_ohlcv_data", "get_ohlcv_data_unsliced")
+                                        for c in ast.walk(base))
+                    if OHLC.search(seg) or from_provider:
                         kind = "last-row" if (isinstance(n.value, ast.Attribute) and n.value.attr == "iloc") \
                             else "last-element"
+                elif (isinstance(n, ast.Attribute) and n.attr.lower() in ("close", "open", "high", "low")
+                      and isinstance(n.value, ast.Subscript) and _neg_one(n.value.slice)):
+                    kind = "last-row"          # frame.iloc[-1].close / bars[-1].Close
                 elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "tail"
                       and n.args and isinstance(n.args[0], ast.Constant) and n.args[0].value == 1):
                     kind = "tail(1)"
@@ -154,23 +163,33 @@ SITES[("packages/experts/ba2_experts/FMPSenateTraderWeight.py", "source-import",
        "from app.services.backtest.price_source import BacktestCacheMiss")] = \
     "imports the cache-miss EXCEPTION TYPE only (hermetic refusal), not a price"
 
+SITES[("packages/experts/ba2_experts/DeterministicScorer/macro.py", "last-row", "last = closes_matrix.iloc[-1]")] = \
+    "macro/regime INDEX closes history (finished sessions, sliced by knowable_daily_end); not a stock price"
+SITES[("packages/experts/ba2_experts/DeterministicScorer/macro.py", "last-row", "last = float(index_closes.iloc[-1])")] = \
+    "the index's last FINISHED close as macro-regime history; not a stock price"
+SITES[("packages/experts/ba2_experts/PullbackReversion.py", "last-element", "spy_last = float(spy_close[-1])")] = \
+    "SPY's last COMPLETED close in the market-regime filter history (provider clamped to finished sessions)"
+
 # every get_ohlcv_data read is HISTORY (indicators, ATR, regimes, factor inputs, display); on an intraday backtest
 # clock the provider clamps it to finished sessions by default. Counted per file so a NEW read is a review event.
-OHLCV_READS = {
-    "ba2_trade_platform/modules/experts/TradingAgentsUI.py": (1, "UI chart history (live)"),
-    "packages/common/ba2_common/core/TradeConditions.py": (4, "recent high/low, relative volume, realised vol: history of FINISHED sessions (clamped)"),
-    "packages/common/ba2_common/core/backtest_context.py": (1, "the bundle's historical close (see above)"),
-    "packages/common/ba2_common/core/interfaces/MarketDataProviderInterface.py": (1, "the provider's own implementation"),
-    "packages/experts/ba2_experts/ETFTrend.py": (1, "signal history (completed closes)"),
-    "packages/experts/ba2_experts/FactorRanker/data.py": (2, "factor input history (clamped)"),
-    "packages/experts/ba2_experts/PennyMomentumTrader/conditions.py": (1, "LIVE-ONLY expert"),
-    "packages/experts/ba2_experts/PennyMomentumTrader/screening.py": (1, "LIVE-ONLY expert"),
-    "packages/experts/ba2_experts/PullbackReversion.py": (1, "signal history (completed closes)"),
-    "packages/experts/ba2_experts/warm_fetchers.py": (1, "cache pre-warm (not a decision)"),
-    f"{ENG}/daily_backtest_handler.py": (1, "regime benchmark history (own bounded reader)"),
-    f"{ENG}/fetch_options.py": (1, "option cache build"),
-    f"{ENG}/price_source.py": (4, "the price source's own implementation (clamp + explicit unsliced read)"),
-    f"{ENG}/results.py": (1, "results/intraday drawdown refinement, not a decision"),
+OHLCV_SITES = {   # (file, first line of the call) -> (count, reason): a new read in an old file is a review event
+    ("ba2_trade_platform/modules/experts/TradingAgentsUI.py", "price_data = provider.get_ohlcv_data("): (1, "UI chart history (live)"),
+    ("packages/common/ba2_common/core/TradeConditions.py", 'df = _get_provider("ohlcv", "yfinance").get_ohlcv_data('): (4, "recent high/low, relative volume, realised vol: history of FINISHED sessions (clamped)"),
+    ("packages/common/ba2_common/core/backtest_context.py", 'df = prov.get_ohlcv_data(symbol, end_date=as_of, lookback_days=7, interval="1d")'): (1, "the bundle's historical close (see above)"),
+    ("packages/common/ba2_common/core/interfaces/MarketDataProviderInterface.py", "df = self.get_ohlcv_data("): (1, "the provider's own implementation"),
+    ("packages/experts/ba2_experts/ETFTrend.py", 'histories = {s: provider.get_ohlcv_data(s, end_date=as_of, lookback_days=calendar_days, interval="1d")'): (1, "signal history (completed closes)"),
+    ("packages/experts/ba2_experts/FactorRanker/data.py", 'df = ohlcv.get_ohlcv_data(symbol, end_date=as_of, lookback_days=400, interval="1d")'): (1, "factor input history (clamped)"),
+    ("packages/experts/ba2_experts/FactorRanker/data.py", 'df = provider.get_ohlcv_data(sym, end_date=end, lookback_days=lookback_days, interval="1d")'): (1, "factor input history (clamped)"),
+    ("packages/experts/ba2_experts/PennyMomentumTrader/conditions.py", "df = self.ohlcv_provider.get_ohlcv_data("): (1, "LIVE-ONLY expert"),
+    ("packages/experts/ba2_experts/PennyMomentumTrader/screening.py", 'df = ohlcv_provider.get_ohlcv_data(symbol, interval="1d", lookback_days=5)'): (1, "LIVE-ONLY expert"),
+    ("packages/experts/ba2_experts/PullbackReversion.py", "return provider.get_ohlcv_data(name, start_date=start, end_date=as_of,"): (1, "signal history (completed closes)"),
+    ("packages/experts/ba2_experts/warm_fetchers.py", "provider.get_ohlcv_data(symbol=requirement.symbol, start_date=window.start,"): (1, "cache pre-warm (not a decision)"),
+    (f"{ENG}/daily_backtest_handler.py", 'df = bench.get_ohlcv_data(_REGIME_BENCHMARK, interval="1d")'): (1, "regime benchmark history (own bounded reader)"),
+    (f"{ENG}/fetch_options.py", "df = ohlcv_provider.get_ohlcv_data("): (1, "option cache build"),
+    (f"{ENG}/price_source.py", "df = self._inner.get_ohlcv_data("): (2, "the price source's own implementation (clamp + explicit unsliced read)"),
+    (f"{ENG}/price_source.py", "return self._inner.get_ohlcv_data("): (1, "the price source's own implementation"),
+    (f"{ENG}/price_source.py", "return self._ohlcv.get_ohlcv_data("): (1, "the price source's own implementation"),
+    (f"{ENG}/results.py", 'df = provider.get_ohlcv_data(symbol, start_date=start_date, end_date=end_date, interval="5m")'): (1, "results/intraday drawdown refinement, not a decision"),
 }
 
 
@@ -194,19 +213,41 @@ def test_every_bar_price_site_is_allowlisted_with_a_reason():
     assert not problems, "\n".join(problems)
 
 
-def test_ohlcv_reads_per_file_match_the_audited_history_reads():
-    per_file = Counter(rel for rel, kind, _ in scan() if kind == "ohlcv-read")
+def test_ohlcv_reads_match_the_audited_history_reads_by_snippet():
+    """Pinned by (file, source text of the call), not per-file counts: a new read in an already
+    audited file changes the multiset and is a review event (it must be history, never 'the price now')."""
+    per_site = Counter((rel, text) for rel, kind, text in scan() if kind == "ohlcv-read")
     problems = []
-    for rel, n in sorted(per_file.items()):
-        if rel not in OHLCV_READS:
-            problems.append(f"NEW get_ohlcv_data reader file {rel} ({n}): history only; add it to OHLCV_READS with a reason")
-        elif OHLCV_READS[rel][0] != n:
-            problems.append(f"{rel}: {n} get_ohlcv_data calls, audited {OHLCV_READS[rel][0]}: review the new read "
-                            f"(it must be history, never 'the price now')")
-    for rel in OHLCV_READS:
-        if rel not in per_file:
-            problems.append(f"STALE OHLCV_READS entry {rel}")
+    for key, n in sorted(per_site.items()):
+        if key not in OHLCV_SITES:
+            problems.append(f"NEW get_ohlcv_data read in {key[0]}: `{key[1]}` -- history only; add it to "
+                            f"OHLCV_SITES with a reason")
+        elif OHLCV_SITES[key][0] != n:
+            problems.append(f"{key[0]}: `{key[1]}` appears {n}x, audited {OHLCV_SITES[key][0]}x")
+    for key in OHLCV_SITES:
+        if key not in per_site:
+            problems.append(f"STALE OHLCV_SITES entry {key}")
     assert not problems, "\n".join(problems)
+
+
+def test_the_widened_matcher_catches_the_reads_the_first_version_missed(tmp_path, monkeypatch):
+    import sys
+    mod = sys.modules[__name__]
+    pkg = tmp_path / "packages" / "experts" / "ba2_experts"
+    pkg.mkdir(parents=True)
+    (pkg / "Bad2.py").write_text(
+        "def f(frame, df, closes_arr, provider):\n"
+        "    a = frame.iloc[-1].close\n"
+        "    b = df.Close.iloc[-1]\n"
+        "    c = closes_arr[-1]\n"
+        "    d = df['Close'].to_numpy()[-1]\n"
+        "    e = provider.get_ohlcv_data('A')[-1]\n"
+        "    g = provider.get_ohlcv_data('A').iloc[-1]\n"
+        "    return a, b, c, d, e, g\n")
+    monkeypatch.setattr(mod, "REPO", tmp_path)
+    monkeypatch.setattr(mod, "DIRS", ["packages/experts/ba2_experts"])
+    texts = sorted(t for _, k, t in mod.scan() if k in ("last-row", "last-element"))
+    assert len(texts) == 6, texts
 
 
 def test_the_scanner_catches_the_defect_it_exists_for(tmp_path, monkeypatch):

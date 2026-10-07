@@ -724,27 +724,10 @@ class DailyBacktestEngine:
             set_stressed(self._regime_calendar.at(self.price.scan_cutoff_date(as_of_dt))
                          if self._regime_calendar else None)
 
-            # 2. universe for the bar.
-            universe = resolve_universe(as_of_dt, self.config, self.price)
-
-            # 2a. per-day DYNAMIC screener gate (screener-settings optimization). Computed ONCE
-            #     per bar from this run's effective screener settings, resolving to the latest
-            #     scan date <= the bar (the universe holds between weekly scans). When
-            #     ``allowed is not None`` it restricts which symbols may ENTER this bar — the
-            #     ENTRY candidate universe fed to ``_run_expert_bar`` is intersected with it,
-            #     PRESERVING bar order so determinism is unchanged. Open-position management /
-            #     exits are NOT gated: ``_manage_open_positions``, the bypass rebalance, ``_apply_option_expiry`` and the OCO bracket fills all
-            #     run over held positions / the full universe regardless. When no screener is
-            #     configured ``_screened_symbols_for_bar`` returns None and this is a no-op
-            #     (byte-identical to a non-screener run — the hot path is untouched).
-            entry_universe = universe
-            if self._screener_runtime:
-                allowed = _screened_symbols_for_bar(
-                    self._screener_runtime, as_of_dt, self._screened_cache,
-                    intraday=self.price.is_intraday)
-                if allowed is not None:
-                    allowed_set = set(allowed)
-                    entry_universe = [s for s in universe if s in allowed_set]
+            # 2. universe for the bar: resolved LAZILY (``_bar_universes``) by the first expert pass that
+            #    needs it, so a tick on which no expert is scheduled pays nothing for it. The equity
+            #    curve's marks never read it.
+            universe = entry_universe = None
 
             # The fill engine reads working orders from BacktestAccount's in-memory order cache
             # (no per-bar DB query). That cache only goes stale when this bar CREATES new orders —
@@ -808,6 +791,9 @@ class DailyBacktestEngine:
                         manage_ok = False
                     if not (entry_ok or manage_ok):
                         continue
+                if entry_ok or manage_ok:
+                    if universe is None:
+                        universe, entry_universe = self._bar_universes(as_of_dt)
                 if entry_ok:
                     analyzed_entry_days.add(_day_key)
                     if self.price.is_intraday:
@@ -987,6 +973,20 @@ class DailyBacktestEngine:
                 refusal = schedule_refusal_message(schedule)
                 if refusal:
                     raise ValueError(f"Backtest refused: expert {expert_id}'s {label} {refusal}")
+
+    def _bar_universes(self, as_of_dt: datetime):
+        """``(universe, entry_universe)`` for the bar: the decidable symbols, and that set intersected
+        with the per-day dynamic screener gate (entries only; management is never gated)."""
+        universe = resolve_universe(as_of_dt, self.config, self.price)
+        entry_universe = universe
+        if self._screener_runtime:
+            allowed = _screened_symbols_for_bar(
+                self._screener_runtime, as_of_dt, self._screened_cache,
+                intraday=self.price.is_intraday)
+            if allowed is not None:
+                allowed_set = set(allowed)
+                entry_universe = [s for s in universe if s in allowed_set]
+        return universe, entry_universe
 
     def _analysis_pass(self, expert_id: int) -> None:
         rec = self.__dict__.setdefault("analysis_failures", {}).setdefault(expert_id, {"passes": 0, "failed": 0, "first_error": None})

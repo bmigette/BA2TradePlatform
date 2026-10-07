@@ -811,6 +811,18 @@ class AsOfPriceSource:
             return None
         return DecisionPrice(float(self._c[symbol][f]), int(k[f]), as_of)
 
+    def last_ended_close(self, symbol: str, as_of: Any) -> Optional[float]:
+        """The close of the latest bar that has ENDED at ``as_of``, however old (no session
+        staleness cut, unlike ``decision_price``). The mark of a position that is HELD: a stale
+        mark is the truth for a halted name, and it is never the clock bar's own close (not yet
+        printed) nor the entry price. ``None`` only when no bar has ever ended."""
+        k = self._keys.get(symbol)
+        if k is None or not len(k):
+            return None
+        key = _key64(as_of, self._interval)
+        f = bisect.bisect_right(k, key - _interval_ns(self._interval)) - 1
+        return None if f < 0 else float(self._c[symbol][f])
+
     def volume_so_far(self, symbol: str, as_of: Any) -> Optional[float]:
         """Volume traded in T's own session so far: the sum over the intraday bars that have ENDED
         at or before ``as_of`` (knowable; 0.0 when none has ended yet). Intraday clock only --
@@ -1373,6 +1385,20 @@ def _interval_ns(interval: str) -> int:
     raise ValueError(f"cannot read the bar length of execution_interval {interval!r}")
 
 
+def _ended_bar_cap(ps: Any, clk: Any, interval: str) -> Any:
+    """The latest bar STAMP that is history (the bar has ENDED) at decision ``clk``, for a non-daily
+    ``interval`` on an intraday run. Intraday bars are stamped at their start: ``clk - length``.
+    A weekly bar is stamped on its Monday and ends with Friday's session; a monthly one on the 1st and
+    ends with the month. Refuses an interval it cannot read (the finished-bar test is never guessed)."""
+    iv = (interval or "").strip().lower()
+    if iv in ("1wk", "1w", "1week", "week"):
+        return ps.knowable_daily_end(clk) - timedelta(days=4)
+    if iv in ("1mo", "1month", "month"):
+        k = ps.knowable_daily_end(clk)
+        return k.replace(day=1, hour=0, minute=0, second=0, microsecond=0) - timedelta(microseconds=1)
+    return _to_utc(clk) - timedelta(microseconds=_interval_ns(interval) // 1000)
+
+
 def _ns_date(ns: int) -> date:
     """The calendar date of an int64-ns bar key (exchange-local wall date)."""
     return np.datetime64(int(ns), "ns").astype("datetime64[D]").astype(date)
@@ -1696,7 +1722,8 @@ class MemoizedOHLCVProvider:
         df, dates = self._full(symbol, interval)
         requested_end = end_date
         ps = self._ps
-        active = interval == "1d" and self._intraday_decision_active()
+        active_any = self._intraday_decision_active()
+        active = interval == "1d" and active_any
         if active and (ps is None or not ps.is_intraday):
             # An intraday decision clock is on but this reader has no price source to say what is
             # knowable: refusing is the only answer that cannot leak.
@@ -1718,6 +1745,19 @@ class MemoizedOHLCVProvider:
                         "MemoizedOHLCVProvider.unclocked_daily_reads", symbol)
             else:
                 cap = ps.knowable_daily_end(clk)
+                if end_date is None or _to_utc(end_date) > cap:
+                    end_date = cap
+        elif ps is not None and ps.is_intraday and interval != "1d" and not unsliced:
+            # Any OTHER interval on an intraday run (1wk, 1h, 15min, the run's own 5min ...): a bar is
+            # only history once it has ENDED at the decision. Cap the read at the last bar that has.
+            clk = ps.current()
+            if clk is None:
+                if active_any:
+                    raise RuntimeError(
+                        f"{interval} OHLCV read for {symbol} before the first clock tick of an intraday "
+                        f"run: knowability cannot be determined")
+            else:
+                cap = _ended_bar_cap(ps, clk, interval)
                 if end_date is None or _to_utc(end_date) > cap:
                     end_date = cap
         out = self._slice(df, dates, start_date, end_date)

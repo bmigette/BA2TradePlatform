@@ -1037,13 +1037,18 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         (``accrue_short_borrow``) use, so a short is charged on the value the curve shows.
 
         ``decision=True`` on an INTRADAY clock: the decision price (close of the latest bar that
-        has ended at the clock) first, then the same forward-fill / entry fallbacks."""
+        has ended at the clock) first, then the last ENDED close however old; raises when none ever
+        ended. Never the clock bar's own close, never the entry price."""
         if decision and getattr(self._price, "is_intraday", False):
             px = self._price.decision_price(p.symbol, self._price.now())
             if px is None:
-                px = self._price.close_asof(p.symbol)
+                # A HELD symbol with no decidable price: its last KNOWABLE close, however old (never
+                # the clock bar's own close, never the entry price).
+                px = self._price.last_ended_close(p.symbol, self._price.now())
             if px is None:
-                px = getattr(p, "avg_price", None)
+                raise ValueError(
+                    f"cannot mark held position {p.symbol} at {self._price.now()}: no bar has ever "
+                    f"ended for it")
             return px
         px = self._price.close_at(p.symbol)
         if px is None:
@@ -2869,7 +2874,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 # price knowable now, not the clock bar's own close.
                 cur = self._price.decision_price(p.symbol, self._price.now())
                 if cur is None:
-                    cur = self._price.close_asof(p.symbol)
+                    cur = self._price.last_ended_close(p.symbol, self._price.now())
+                if cur is None:
+                    raise ValueError(
+                        f"cannot read held position {p.symbol} at {self._price.now()}: no bar has "
+                        f"ever ended for it")
             else:
                 cur = self._price.close_at(p.symbol)
                 if cur is None:  # no exact bar this tick -> last-known close (not None/stale)

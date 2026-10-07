@@ -234,8 +234,13 @@ def launch_schedule_variants(robustness_run_id: int) -> List[int]:
                     # A gene row's MANAGE pass runs at the gene-chosen time too: carry the
                     # parent's manage schedule so the variant does not fall back to its entry
                     # schedule or the expert default (rerun_handler reads manageScheduleOverride).
-                    variant_sp["manageScheduleOverride"] = copy.deepcopy(
-                        parent_cfg["manage_schedule_override"])
+                    parent_manage = parent_cfg.get("manage_schedule_override")
+                    if not parent_manage:
+                        raise ValueError(
+                            f"robustness schedule run {run.id}: parent {bt.id} is a decision-time GENE row "
+                            f"({gene_time}) but its rebuilt config carries no manage_schedule_override; "
+                            f"refusing to run variants whose manage pass would fall back to another time")
+                    variant_sp["manageScheduleOverride"] = copy.deepcopy(parent_manage)
                 row = Backtest(
                     name=f"RBST-{spec['variant']}-{parent_name}",
                     engine_type="daily_expert",

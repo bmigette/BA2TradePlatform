@@ -59,7 +59,7 @@ class _BasketExpert(MarketExpertInterface):
         return recs
 
 
-def _run_basket(run_id, expert_cls=_BasketExpert):
+def _run_basket(run_id, expert_cls=_BasketExpert, universe=None, extra_bars=None, return_db_state=False):
     from app.services.backtest.backtest_account import BacktestAccount
     from app.services.backtest.backtest_db import (
         backtest_trading_db, seed_account_definition, seed_expert_instance)
@@ -83,6 +83,8 @@ def _run_basket(run_id, expert_cls=_BasketExpert):
         ps = AsOfPriceSource(ohlcv_provider=None, interval="5min")
         memo.bind_price_source(ps)
         ps.load_bars(LIVE, k._intraday_rows())            # THIN is deliberately never loaded
+        for sym, rows in (extra_bars or {}).items():
+            ps.load_bars(sym, rows)
         account = BacktestAccount(account_id, ps, CFG)
         resolver.register_account(account_id, account)
         expert = expert_cls(expert_id, ps)
@@ -102,7 +104,7 @@ def _run_basket(run_id, expert_cls=_BasketExpert):
             engine = DailyBacktestEngine(
                 account=account, experts=[(expert, expert_id, {}, ruleset_id)], price_source=ps,
                 config={"start_date": datetime(2024, 1, 2), "end_date": datetime(2024, 1, 4, 23, 59),
-                        "enabled_instruments": [LIVE, THIN], "seed": 42,
+                        "enabled_instruments": universe or [LIVE, THIN], "seed": 42,
                         "run_schedule_override": {"days": {d: True for d in (
                             "monday", "tuesday", "wednesday", "thursday", "friday")},
                             "times": ["09:40"]}},
@@ -114,7 +116,13 @@ def _run_basket(run_id, expert_cls=_BasketExpert):
         finally:
             BacktestAccount.submit_order = real
             set_backtest_ohlcv_override(None)
-        return expert, engine, account, placed
+        state = None
+        if return_db_state:
+            from ba2_common.core.trade_store import orders_where, transactions_where
+            state = {"transactions": [(t.symbol, t.status) for t in transactions_where()],
+                     "orders": [(o.symbol, o.status) for o in orders_where(account_id=account.id)]}
+            state["cash"] = account.get_balance()
+        return (expert, engine, account, placed) if not return_db_state else (expert, engine, account, placed, state)
     finally:
         ctx.__exit__(None, None, None)
 
@@ -247,3 +255,40 @@ def test_an_unresolvable_decision_account_on_an_intraday_clock_raises_instead_of
     e._decision_account_cache = None
     with intraday_decisions(False):                  # off the intraday clock: the replay fallback, as before
         assert e._decision_account(object()) is None
+
+
+# --------------------------------------------------------------------------- I3: state after an expiry
+class _BuyThin(MarketExpertInterface):
+    def __init__(self, id, price_source):
+        super().__init__(id)
+
+    @classmethod
+    def description(cls) -> str:
+        return "buys the thin name"
+
+    def render_market_analysis(self, market_analysis) -> str:
+        return ""
+
+    def run_analysis(self, symbol, market_analysis) -> None:
+        return None
+
+    def analyze_as_of(self, as_of, context):
+        px = self._decision_price(context.providers, THIN, as_of)
+        return Recommendation(signal=OrderRecommendation.BUY, confidence=80.0, current_price=px,
+                              details="buy thin", expected_profit_percent=4.0)
+
+
+def test_an_expired_cross_session_entry_leaves_no_waiting_row_and_no_reserved_cash():
+    from ba2_common.core.types import OrderStatus
+    from tests.backtest.test_intraday_daily_knowability import _intraday_rows
+    prior = [dict(r, Date=r["Date"].replace(year=2023, month=12, day=29)) for r in _intraday_rows()[:4]]
+    far = [dict(r, Date=r["Date"].replace(year=2024, month=1, day=12)) for r in _intraday_rows()[:4]]
+    expert, engine, account, placed, state = _run_basket(
+        933, expert_cls=_BuyThin, universe=[THIN], extra_bars={THIN: prior + far}, return_db_state=True)
+    assert account.intraday_counters["entries_refused_next_bar_other_session"] >= 1
+    assert state["orders"] and all(st in (OrderStatus.EXPIRED, OrderStatus.CANCELED, OrderStatus.REJECTED)
+                                   for _s, st in state["orders"]), state["orders"]
+    assert all(str(getattr(st, "value", st)).upper() not in ("WAITING", "OPENED", "OPEN")
+               for _s, st in state["transactions"]), state["transactions"]
+    from tests.backtest.test_max_loss_stop_engine import CFG
+    assert state["cash"] == pytest.approx(CFG["starting_cash"])             # nothing reserved, nothing spent

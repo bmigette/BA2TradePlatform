@@ -769,14 +769,16 @@ class MetricStoreATRProvider:
         if end_date is None:
             return empty  # never fall back to wall-clock here — see class docstring
         col = f"atr_{int(period)}"
+        # The session date comes from the clock owner / the calendar OUTSIDE the store guard: a calendar
+        # failure is a defect and must propagate, never read as "no ATR for this symbol".
+        if self._session_date_fn is not None:
+            day = self._session_date_fn(end_date).strftime("%Y-%m-%d")
+        else:
+            day = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)[:10]
         try:
             df = ms.load_store(self._store_dir)
-            if self._session_date_fn is not None:
-                day = self._session_date_fn(end_date).strftime("%Y-%m-%d")
-            else:
-                day = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)[:10]
             rows = ms.metrics_as_of(df, day, [col])
-        except Exception:  # noqa: BLE001 — any store issue -> safe empty (caller's no-ATR fallback)
+        except Exception:  # noqa: BLE001 — a STORE issue -> safe empty (caller's no-ATR fallback)
             return empty
         row = rows.get(symbol.upper()) or rows.get(symbol)
         if not row:

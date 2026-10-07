@@ -59,9 +59,10 @@ DEFAULT_DECISION_TIME = "10:00"
 
 #: The decision times a grid SEARCHES by default (the ``schedule:time`` choice gene), exchange-local,
 #: sorted ascending. Owner decision 2026-10-07: 09:35 / 09:40 / 09:45 / 10:00 (the morning
-#: neighbourhood of DEFAULT_DECISION_TIME), 12:00 (midday), 15:30 and 15:45 (late session; 15:45 is the latest the live deploy bound accepts, see
-#: ``schedule_genes.LIVE_PASS_*``; 15:50 is still a valid BACKTEST time, 
-#: the last time that still fills in the same session: the fill is at the 15:55 bar's open). Every
+#: neighbourhood of DEFAULT_DECISION_TIME), 12:00 (midday), 15:30 and 15:45 (late session). 15:45 is
+#: the latest time the LIVE deploy bound accepts (see ``schedule_genes.LIVE_PASS_*``); 15:50 is still a
+#: valid BACKTEST time, the last one that fills in the same session (the fill is at the 15:55 bar's
+#: open). Every
 #: value is validated by ``ba2_common.core.schedule_genes.validate_decision_times``. ONE definition:
 #: the grid drivers default to it, ``--decision-times default`` means it, ``fixed`` turns the gene
 #: off. A plain ``ba2-test optimize`` without the flag stays at the single DEFAULT_DECISION_TIME.
