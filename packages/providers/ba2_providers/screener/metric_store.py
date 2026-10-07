@@ -752,6 +752,8 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
                 max_lookback: int = 30, max_workers: int = 8, symbol_retries: int = 2,
                 flush_every: int = 250, fail_on_quality: bool = True,
                 allow_stale_symbols: "Optional[Iterable[str]]" = None,
+                universe_symbols: "Optional[Iterable[str]]" = None,
+                universe_symbols_path: Optional[str] = None,
                 staleness_max_days: int = STALENESS_MAX_DAYS,
                 prebuild_max_stale_days: int = PREBUILD_MAX_STALE_DAYS) -> Dict[str, Any]:
     """Build/extend the metric store for [start,end] at ``cadence_days`` (default 7 = weekly).
@@ -796,8 +798,41 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
     if not todo_months:
         return {"symbols": 0, "months_written": 0, "months_skipped": len(want_months), "cadence_days": cadence_days}
     grid_todo = grid[[d.strftime("%Y-%m") in set(todo_months) for d in grid]]
-    universe = enumerate_universe(api_key, market_cap_min, price_min, volume_min)
-    static_by_sym = {r["symbol"]: r for r in universe}
+    not_in_screener: List[str] = []
+    if universe_symbols is None:
+        universe = enumerate_universe(api_key, market_cap_min, price_min, volume_min)
+        static_by_sym = {r["symbol"]: r for r in universe}
+        universe_info: Dict[str, Any] = {
+            "source": "screener_thresholds", "market_cap_min": market_cap_min,
+            "price_min": price_min, "volume_min": volume_min, "n_symbols": len(static_by_sym)}
+    else:
+        # EXACT universe: no market-cap/price/volume floors. Static metadata (sector, ...) comes
+        # from ONE screener call restricted to the list; a listed symbol the screener no longer
+        # carries is still built (its OHLCV decides) and flagged ``not_in_screener``.
+        wanted = list(dict.fromkeys(str(x).strip() for x in universe_symbols if str(x).strip()))
+        by_screen = {r.get("symbol"): r for r in _fetch_screener_rows(api_key)}
+        static_by_sym = {}
+        for sym in wanted:
+            row = by_screen.get(sym)
+            if row is None:
+                not_in_screener.append(sym)
+                row = {"symbol": sym}
+            static_by_sym[sym] = row
+        import hashlib
+        universe_info = {
+            "source": "symbols_file" if universe_symbols_path else "symbols_list",
+            "n_symbols": len(wanted),
+            "symbols_sha256": hashlib.sha256(chr(10).join(sorted(wanted)).encode()).hexdigest(),
+            "floors_applied": False, "not_in_screener": sorted(not_in_screener),
+            "reference_thresholds_ignored": {"market_cap_min": market_cap_min,
+                                             "price_min": price_min, "volume_min": volume_min}}
+        if universe_symbols_path:
+            universe_info["path"] = str(universe_symbols_path)
+            try:
+                with open(universe_symbols_path, "rb") as _f:
+                    universe_info["file_sha256"] = hashlib.sha256(_f.read()).hexdigest()
+            except OSError:
+                pass
 
     # ---- PRE-BUILD freshness check (before any write) -------------------------------------
     last_bars, unreadable = ohlcv_last_bars(static_by_sym, ohlcv_get, end,
@@ -949,6 +984,8 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
         manifest_path = _append_build_manifest(store_dir, {
             "built_at": datetime.now().isoformat(timespec="seconds"),
             "start": start, "end": end, "cadence_days": cadence_days,
+            "universe": universe_info,
+            "drop_days": drop_days, "max_lookback": max_lookback,
             "months_written": todo_months,
             "staleness_rule": {
                 "ohlcv_row_max_age_days": int(staleness_max_days),

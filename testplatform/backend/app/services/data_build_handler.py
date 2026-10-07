@@ -58,6 +58,16 @@ def _prewarm_fred(max_age_hours: float = 24.0) -> Dict[str, Any]:
     return prewarm_fred(max_age_hours, log=logger.info, warn=logger.warning)
 
 
+def _payload_universe(payload: Dict[str, Any]):
+    """``symbols`` (list) or ``symbols_file`` (one per line) -> exact universe; neither -> None."""
+    if payload.get("symbols"):
+        return [str(x).strip().upper() for x in payload["symbols"] if str(x).strip()]
+    if payload.get("symbols_file"):
+        with open(payload["symbols_file"], encoding="utf-8") as f:
+            return [x for x in (ln.split("#")[0].strip().upper() for ln in f) if x]
+    return None
+
+
 def handle_build_screener_metrics(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Build/extend the screener METRIC store (parquet) from the as-of OHLCV cache.
 
@@ -130,6 +140,8 @@ def handle_build_screener_metrics(task_id: str, payload: Dict[str, Any]) -> Dict
             cadence_days=int(payload.get("cadence_days", 7)),
             drop_days=int(payload.get("drop_days", 1)),
             allow_stale_symbols=payload.get("allow_stale_symbols") or None,
+            universe_symbols=_payload_universe(payload),
+            universe_symbols_path=payload.get("symbols_file"),
         )
         logger.info(f"build-screener-metrics task {task_id}: {summary}")
         return {"status": "completed", "summary": summary}

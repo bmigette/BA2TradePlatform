@@ -504,6 +504,13 @@ def _cmd_prewarm(args) -> int:
     return 0
 
 
+def _read_symbols_file(path: str) -> list:
+    """One symbol per line (blank lines / ``#`` comments ignored); upper-cased, order kept."""
+    with open(path, encoding="utf-8") as f:
+        out = [ln.split("#")[0].strip().upper() for ln in f]
+    return [x for x in out if x]
+
+
 def _cmd_build_screener_metrics(args) -> int:
     """Build/extend the screener METRIC store (parquet) from the as-of OHLCV cache.
 
@@ -584,7 +591,10 @@ def _cmd_build_screener_metrics(args) -> int:
         cadence_days=args.cadence_days, drop_days=args.drop_days,
         max_lookback=getattr(args, "max_lookback", 30) or 30,
         max_workers=getattr(args, "workers", 8) or 8,
-        allow_stale_symbols=_parse_symbols_arg(getattr(args, "allow_stale_symbols", None) or ""))
+        allow_stale_symbols=_parse_symbols_arg(getattr(args, "allow_stale_symbols", None) or ""),
+        universe_symbols=(_read_symbols_file(args.symbols_file)
+                          if getattr(args, "symbols_file", None) else None),
+        universe_symbols_path=getattr(args, "symbols_file", None))
     print(f"build-screener-metrics: {summary}")
     return 0
 
@@ -8307,6 +8317,11 @@ def main(argv: "list | None" = None) -> int:
     bm.add_argument("--workers", type=int, default=8,
                     help="Parallel per-symbol fetch threads (default 8). Historical market-cap + "
                          "float fetches are disk-cached, so re-builds are fast regardless.")
+    bm.add_argument("--symbols-file", default=None, metavar="PATH",
+                    help="Build EXACTLY the symbols in this file (one per line): no market-cap/price/"
+                         "volume floors, no live-screener universe. Static metadata comes from one "
+                         "screener call restricted to the list; the file path + sha256 are recorded "
+                         "in build_manifest.json so the build is reproducible.")
     bm.add_argument("--allow-stale-symbols", default=None, metavar="SYM[,SYM...]|@FILE",
                     help="EXPLICIT opt-in for symbols whose cached last OHLCV bar is >10 days before "
                          "--end (the build otherwise REFUSES, listing them). Only for genuinely "
