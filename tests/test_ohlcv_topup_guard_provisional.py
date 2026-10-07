@@ -8,7 +8,7 @@ from __future__ import annotations
 import importlib
 import os
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -77,6 +77,12 @@ class _Provider(FMPOHLCVProvider):
     def _split_calendar(self, symbol, interval):
         return list(self.splits)
 
+    def _unproven_tail_days(self, df, symbol, interval, provider_name):
+        # These tests pin the in-tree provisional-bar WRAPPER (``prov``) and the guard as it was.
+        # The base class's own mtime self-heal (ohlcv_final_bars) would repair the same files before
+        # either is reached; it is pinned in packages/providers/tests/test_ohlcv_no_unfinished_bars.py.
+        return []
+
 
 class _Fixed(_Provider):
     """Provider with the provisional-bar repair installed (as ``wire_all_seams`` does live)."""
@@ -92,6 +98,14 @@ _orig = MarketDataProviderInterface._verified_tail_topup
 while hasattr(_orig, "__wrapped__"):
     _orig = _orig.__wrapped__
 _Plain._verified_tail_topup = _orig
+
+
+class _Prod(_Fixed):
+    """THE PRODUCTION COMBINATION: the in-tree wrapper installed (``wire_all_seams``) AND the base class's
+    mtime self-heal enabled (``_Provider`` switches it off to pin the wrapper alone)."""
+
+    def _unproven_tail_days(self, df, symbol, interval, provider_name):
+        return MarketDataProviderInterface._unproven_tail_days(self, df, symbol, interval, provider_name)
 
 
 @pytest.fixture(autouse=True)
@@ -362,6 +376,10 @@ def test_a_refused_symbol_does_not_cost_an_extra_vendor_call_within_the_memo(act
 
 
 def test_only_daily_bars_are_wrapped(monkeypatch):
+    # daily-labelled frames stand in for weekly/monthly ones here; with the clock moved on, every
+    # bar is final under the finality rule too, so only the WRAPPER's interval gate is under test
+    from ba2_common.core import ohlcv_final_bars
+    monkeypatch.setattr(ohlcv_final_bars, "now_utc", lambda: datetime(2030, 1, 1, tzinfo=timezone.utc))
     seen = []
     monkeypatch.setattr(prov, "repair_provisional_bars", lambda *a, **k: seen.append(1) or (a[1], []))
     vendor, cached = _settled_mismatch_world("AMD")           # the guard refuses -> repair would run
@@ -625,3 +643,29 @@ def test_a_rebased_low_volume_older_bar_refuses(activity):
     with pytest.raises(OHLCVTopUpRefused):
         _topup(_Fixed(vendor), "AMD")
     assert _bytes(path) == expect
+
+
+@pytest.mark.parametrize("symbol", sorted(CASES))
+def test_production_combination_wrapper_plus_heal_gives_the_same_file_as_the_wrapper_alone(symbol, logged, activity):
+    """F6: with BOTH defences active the stuck bar is replaced by the vendor's final bar exactly once,
+    every other bar is byte-for-byte what it was, and the result equals the wrapper-only result."""
+    cbar, vbar = CASES[symbol]
+    stuck = STUCK_AT.get(symbol, PROV_DAY)
+    vendor, cached = _world(symbol, cbar, vbar, level=vbar[3], cache_end=stuck, day=stuck)
+    path = _write(symbol, cached)
+    before = pd.read_parquet(path)
+    _topup(_Fixed(vendor), symbol)
+    wrapper_only = pd.read_parquet(path)
+
+    path = _write(symbol, cached)                           # back to the contaminated file, mtime mid-session
+    logged["error"].clear()
+    activity.clear()
+    _topup(_Prod(vendor), symbol)
+    both = pd.read_parquet(path)
+
+    pd.testing.assert_frame_equal(both, wrapper_only)
+    row = both[both["Date"] == pd.Timestamp(stuck)].iloc[0]
+    assert (row.Open, row.High, row.Low, row.Close) == pytest.approx(vbar)
+    others = before[before["Date"] != pd.Timestamp(stuck)]
+    pd.testing.assert_frame_equal(both[both["Date"].isin(others["Date"])].reset_index(drop=True), others.reset_index(drop=True))
+    assert not any("REFUSED" in m for m in logged["error"]) and not activity      # healed: the guard never refused

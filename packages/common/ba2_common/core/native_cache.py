@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
 from ba2_common.config import CACHE_FOLDER
+from ba2_common.core import ohlcv_final_bars
 from ba2_common.core.db import get_db
 from ba2_common.core.provider_cache_model import ProviderCache
 from ba2_common.logger import logger
@@ -258,9 +259,14 @@ def read_timeseries(provider: str, symbol: str, interval: str,
     return df
 
 
-def write_timeseries(provider: str, symbol: str, interval: str, df) -> None:
+def write_timeseries(provider: str, symbol: str, interval: str, df) -> bool:
     """Atomic temp+rename parquet write. df MUST carry an effective_date column
     (for OHLCV effective_date == bar Date).
+
+    NEVER persists an unfinished bar (a daily bar before its session's close + settlement, an
+    intraday bar before its interval ended; ``ba2_common.core.ohlcv_final_bars``): such rows are
+    dropped here, and a write that would leave nothing writes nothing: it returns ``False`` (after an
+    INFO line naming the dropped bars) instead of creating an empty file; ``True`` when written.
 
     The target is the file that ALREADY EXISTS under any alias spelling, and only
     falls back to the canonical write path when there is none. Building the path from
@@ -272,12 +278,22 @@ def write_timeseries(provider: str, symbol: str, interval: str, df) -> None:
     bars (2022-06-06..2025-12-31); 8 such pairs existed. Every read then sliced the
     stub to empty and re-downloaded the whole intraday window.
     """
+    # THE RULE (ba2_common.core.ohlcv_final_bars): a bar whose session / interval is not final is
+    # never written, by any caller. This is the ONLY OHLCV parquet writer, so every writer (live
+    # top-up, fetch-cache, prewarm, force_full_refetch, repair tools) is covered here.
+    df, dropped = ohlcv_final_bars.drop_unfinished_bars(df, symbol, interval)
+    if dropped:
+        logger.info(f"{provider} {symbol} ({interval}): not persisting {len(dropped)} unfinished "
+                    f"bar(s) {dropped} (final {ohlcv_final_bars.SETTLE_AFTER_CLOSE} after the close)")
+        if df.empty:
+            return False
     path = find_timeseries_path(provider, symbol, interval) or \
         timeseries_path(provider, symbol, interval)
     with _lock_for(path):
         tmp = path + ".tmp"
         df.to_parquet(tmp, index=False)
         os.replace(tmp, path)
+    return True
 
 
 def _as_utc(dt: datetime):

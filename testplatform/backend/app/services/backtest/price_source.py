@@ -1509,6 +1509,12 @@ class MemoizedOHLCVProvider:
         # Daily reads made on an intraday run BEFORE the first clock tick: knowability cannot be
         # determined, so they are counted and warned about once, never silently served.
         self.unclocked_daily_reads = 0
+        # A process that builds a backtest provider is a BACKTEST process: it never serves (or goes
+        # to fetch) today's forming bar through the inner provider's LATEST path, whatever end_date a
+        # read carries (DeterministicScorer asks for end_date=replay_now(None), i.e. "latest").
+        # Hermetic runs never reach the inner get_ohlcv_data at all (cached_only reads the parquet).
+        from ba2_common.core import ohlcv_final_bars
+        ohlcv_final_bars.set_live_overlay_enabled(False)
 
     def bind_price_source(self, price_source: "AsOfPriceSource") -> None:
         """Attach the run's price source so DAILY reads obey its knowability rule

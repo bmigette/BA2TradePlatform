@@ -390,6 +390,39 @@ def fmp_history_disk_cached(namespace: str, symbol: str, fetch_fn: Callable[[], 
     )
 
 
+#: The Senate expert's daily price store (``historical_price_full__SYM.json``): a list of daily rows
+#: ``{"date": "YYYY-MM-DD", "open", "high", "low", "close", "volume"}`` straight from the vendor.
+_PRICE_NAMESPACE = "historical_price_full"
+
+
+def _drop_unfinished_price_rows(symbol: str, payload: Any) -> Any:
+    """The same finality rule as the OHLCV parquet writer (``ba2_common.core.ohlcv_final_bars``): a
+    row whose session is not final is returned to the caller but NEVER persisted -- the vendor's
+    forming bar would otherwise be frozen in this JSON for the 7-day refetch age (and for ever in a
+    hermetic backtest). A payload that is not a list of dated rows is persisted unchanged."""
+    if not isinstance(payload, list):
+        return payload
+    import datetime as _dt
+    from ba2_common.core import ohlcv_final_bars as _fb
+    now = _fb.now_utc()
+    horizon = now.date() - _dt.timedelta(days=2)       # older than this is final under every rule
+    keep, dropped = [], []
+    for row in payload:
+        raw = row.get("date") if isinstance(row, dict) else None
+        try:
+            day = _dt.date.fromisoformat(str(raw)[:10]) if raw else None
+        except ValueError:
+            day = None
+        if day is not None and day > horizon and not _fb.session_is_final(symbol, day, now):
+            dropped.append(str(raw)[:10])
+        else:
+            keep.append(row)
+    if dropped:
+        logger.info(f"fmp_history {_PRICE_NAMESPACE}__{symbol}: not persisting unfinished daily row(s) {dropped}")
+        return keep
+    return payload
+
+
 def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Callable[[], Any],
                                     max_age_days: float) -> Any:
     """Disk read (if fresh) else fetch + persist — the original ``fmp_history_disk_cached`` body,
@@ -434,6 +467,8 @@ def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Calla
     #    warmed" (fatal in a hermetic backtest), so no-data instruments stop looking like prewarm
     #    gaps. The atomic tmp+replace means a concurrent reader never sees a half-written file.
     to_persist = data if data else ([] if _persist_empty_sentinel_enabled() else None)
+    if to_persist is not None and namespace == _PRICE_NAMESPACE:
+        to_persist = _drop_unfinished_price_rows(symbol, to_persist)
     if to_persist is not None:
         tmp = None
         try:
