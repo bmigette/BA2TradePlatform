@@ -43,12 +43,16 @@ import repair_partial_daily_bars as rp       # noqa: E402
 SUFFIX = rp.SUFFIX
 
 
-def scan(cache_dir: str, now: dt.datetime) -> Dict:
-    """Read-only: ``{"scanned", "candidates": [info]}``. One footer read per file."""
+def scan(cache_dir: str, now: dt.datetime, modified_since: Optional[dt.date] = None) -> Dict:
+    """Read-only: ``{"scanned", "candidates": [info]}``. One footer read per file; with ``modified_since``
+    a file whose mtime (UTC date) is older is skipped on its ``stat`` alone."""
     from ba2_common.core import ohlcv_final_bars as fb
     candidates: List[Dict] = []
     scanned = 0
     for path in sorted(glob.glob(os.path.join(cache_dir, "*" + SUFFIX))):
+        if modified_since is not None and dt.datetime.fromtimestamp(
+                os.path.getmtime(path), dt.timezone.utc).date() < modified_since:
+            continue
         scanned += 1
         symbol = os.path.basename(path)[:-len(SUFFIX)].upper()
         last = chk.last_bar_of(path)
@@ -125,7 +129,8 @@ def run(args: argparse.Namespace) -> int:
     from ba2_common.core import ohlcv_final_bars as fb
     now = dt.datetime.fromisoformat(args.now).replace(tzinfo=dt.timezone.utc) if args.now else fb.now_utc()
 
-    found = scan(cache_dir, now)
+    since = dt.date.fromisoformat(args.modified_since) if args.modified_since else None
+    found = scan(cache_dir, now, since)
     todo = []
     for c in found["candidates"]:
         drop, labels = rows_to_drop(c["path"], c["symbol"], now)
@@ -209,6 +214,9 @@ def main(argv=None) -> int:
     ap.add_argument("--backup-dir", required=True, help="OUTSIDE the cache")
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--writers", choices=rp.WRITERS_CHOICES)
+    ap.add_argument("--modified-since", help="YYYY-MM-DD (UTC): only files modified on/after. The DAILY run: yesterday's "
+                    "date (a fresh old-code re-contamination). Without it the scan also finds the legacy mid-session "
+                    "files of 2026-08-05/06 (~6,300 files, mostly outside the store universe).")
     ap.add_argument("--now", help="ISO UTC instant to judge finality at (default: the clock)")
     ap.add_argument("--report-json")
     ap.add_argument("--symbols-out")

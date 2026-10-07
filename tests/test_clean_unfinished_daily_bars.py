@@ -136,3 +136,14 @@ def test_apply_needs_writers(world, capsys):
     put(cache, "LIVE", date(2026, 10, 6), "2026-10-06 09:31")
     assert tool.main(["--cache-dir", str(cache), "--backup-dir", str(bk), "--now", NOW_MIDDAY, "--apply"]) == 2
     assert "--writers" in capsys.readouterr().err
+
+
+def test_modified_since_skips_old_files_on_their_stat_alone(world, tmp_path):
+    cache, bk, tmp = world
+    put(cache, "OLDWAVE", date(2026, 10, 6), "2026-08-05 09:35")                    # a legacy mid-session file
+    put(cache, "RECENT", date(2026, 10, 6), "2026-10-06 09:31")
+    assert run(cache, bk, NOW_MIDDAY, "--modified-since", "2026-10-06", "--report-json", str(tmp / "r.json")) == 0
+    rep = json.loads((tmp / "r.json").read_text())
+    assert rep["files_scanned"] == 1 and [f["symbol"] for f in rep["files"]] == ["RECENT"]
+    assert run(cache, bk, NOW_MIDDAY, "--report-json", str(tmp / "r2.json")) == 0
+    assert json.loads((tmp / "r2.json").read_text())["files_scanned"] == 2

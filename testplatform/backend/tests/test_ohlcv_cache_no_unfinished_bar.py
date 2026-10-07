@@ -78,10 +78,10 @@ def _env(tmp_path, monkeypatch):
     inst = pd.Timestamp("2026-10-06 09:31", tz=NY_TZ).to_pydatetime().astimezone(timezone.utc)
     monkeypatch.setattr(fb, "now_utc", lambda: inst)
     MarketDataProviderInterface._TOPUP_REFUSED.clear()
-    MarketDataProviderInterface._UNFINISHED_MEMO.clear()
+    getattr(MarketDataProviderInterface, "_UNFINISHED_MEMO", set()).clear()
     yield
     MarketDataProviderInterface._TOPUP_REFUSED.clear()
-    MarketDataProviderInterface._UNFINISHED_MEMO.clear()
+    getattr(MarketDataProviderInterface, "_UNFINISHED_MEMO", set()).clear()
 
 
 def _seed(symbol, df, interval="1d"):
