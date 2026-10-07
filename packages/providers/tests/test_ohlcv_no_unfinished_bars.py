@@ -458,3 +458,56 @@ def test_the_legacy_csv_cache_obeys_the_same_rule(clock, tmp_path):
     assert p._save_final_bars_cache(truth(D), SYMBOL, "1d", target)
     saved = pd.read_csv(target, parse_dates=["Date"])
     assert last_day(saved) == PREV
+
+
+# --------------------------------------------------------------------------- additive-only refresh switch
+def _split_world():
+    cached = truth(FRI).copy()
+    for col in ("Open", "High", "Low", "Close"):
+        cached[col] = (cached[col] * 2.0).round(3)          # the pre-split basis
+    return cached, _Provider(truth(D), [CalendarSplit(PREV, 2.0)])
+
+
+def test_additive_only_switch_refuses_a_split_replacement_and_writes_nothing(clock, monkeypatch):
+    cached, p = _split_world()
+    path = seed(cached, "2026-10-03 12:00")
+    before = open(path, "rb").read()
+    monkeypatch.setenv("BA2_OHLCV_TOPUP_FULL_REFETCH", "0")
+    clock("2026-10-07 09:00")
+    with pytest.raises(OHLCVTopUpRefused, match="DEFERRED"):
+        p._refresh_parquet_if_stale(pd.read_parquet(path), SYMBOL, "1d", "_Provider")
+    assert open(path, "rb").read() == before and read_full_fetch_marker(path) is None
+    assert not [c for c in p.impl_calls if c[1].year < 2025]        # no 15-year re-fetch was even asked for
+
+
+def test_additive_only_switch_leaves_an_ordinary_top_up_alone(clock, monkeypatch):
+    path = seed(truth(FRI), "2026-10-03 12:00")
+    monkeypatch.setenv("BA2_OHLCV_TOPUP_FULL_REFETCH", "0")
+    clock("2026-10-07 09:00")
+    _Provider(truth(D)).get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    assert last_day(disk()) == D                              # appended exactly as without the switch
+
+
+def test_the_default_still_replaces_and_a_bad_switch_value_is_refused(clock, monkeypatch):
+    cached, p = _split_world()
+    path = seed(cached, "2026-10-03 12:00")
+    clock("2026-10-07 09:00")
+    monkeypatch.setenv("BA2_OHLCV_TOPUP_FULL_REFETCH", "maybe")
+    with pytest.raises(ValueError, match="BA2_OHLCV_TOPUP_FULL_REFETCH"):
+        p._refresh_parquet_if_stale(pd.read_parquet(path), SYMBOL, "1d", "_Provider")
+    monkeypatch.delenv("BA2_OHLCV_TOPUP_FULL_REFETCH")
+    p._refresh_parquet_if_stale(pd.read_parquet(path), SYMBOL, "1d", "_Provider")
+    assert read_full_fetch_marker(path) is not None            # replaced, as before
+
+
+def test_additive_only_switch_never_rewrites_a_cached_bar_even_a_provisional_looking_one(clock, monkeypatch):
+    # a cached bar inside the guard's provisional tolerance would normally be replaced by the vendor's
+    cached = truth(FRI).copy()
+    cached.loc[cached.index[-3], "Close"] = round(cached.loc[cached.index[-3], "Close"] * 1.001, 3)
+    path = seed(cached, "2026-10-03 12:00")
+    monkeypatch.setenv("BA2_OHLCV_TOPUP_FULL_REFETCH", "0")
+    clock("2026-10-07 09:00")
+    _Provider(truth(D)).get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    got = disk()
+    old = got[got["Date"] <= pd.Timestamp(FRI)].reset_index(drop=True)
+    assert old["Close"].to_numpy() == pytest.approx(cached["Close"].to_numpy(), abs=0) and last_day(got) == D

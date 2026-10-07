@@ -21,6 +21,10 @@ from ba2_common.core import ohlcv_final_bars
 from ba2_common.core.replay.observe import observe_provider
 from ba2_common.core.replay.schemas import ReplayStatus
 
+#: ``=0`` makes the verified daily top-up REFUSE (instead of REPLACE the history) when a split since
+#: the last cached bar calls for a full re-fetch: an additive-only refresh. Unset / ``1``: unchanged.
+FULL_REFETCH_ENV = "BA2_OHLCV_TOPUP_FULL_REFETCH"
+
 # Intraday interval spellings, SHORT and provider long form (FMP writes "5min"/"1hour").
 # Single source of truth: the cache-freshness branch in get_ohlcv_data and its
 # cache-fill-range branch must agree on what counts as intraday. They were two separate
@@ -874,6 +878,8 @@ class MarketDataProviderInterface(DataProviderInterface):
             last_day = days.max()
             fresh = probe[np.asarray(probe_days > last_day)].copy()
             prov = {pd.Timestamp(d) for d in verdict.provisional_days}
+            if os.environ.get(FULL_REFETCH_ENV, "1") == "0":
+                prov = set()   # additive-only run: no cached bar is ever replaced, only appended after
             replace = probe[np.asarray(probe_days.isin(prov))].copy()
             if fresh.empty and replace.empty:
                 return df, unchanged
@@ -894,6 +900,15 @@ class MarketDataProviderInterface(DataProviderInterface):
             return df, "append"
 
         if verdict.needs_full_refetch:
+            switch = os.environ.get(FULL_REFETCH_ENV, "1")
+            if switch not in ("0", "1"):
+                raise ValueError(f"{FULL_REFETCH_ENV} must be '0' or '1', got {switch!r}")
+            if switch == "0":
+                # ADDITIVE-ONLY run (a data refresh while backtests of the old history are in
+                # flight): a split since the last cached bar would REPLACE the whole history,
+                # rescaling every old price. Deferred, loudly, and nothing is written.
+                refuse(f"{verdict.reason}; the full re-fetch that would replace the cached history is "
+                       f"DEFERRED ({FULL_REFETCH_ENV}=0, additive-only run)")
             logger.warning(
                 f"{provider_name} {symbol} ({interval}): FULL RE-FETCH instead of a top-up -- "
                 f"{verdict.reason}. Replacing the cached history (last cached bar "
