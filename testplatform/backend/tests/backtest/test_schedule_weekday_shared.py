@@ -138,16 +138,37 @@ def test_the_optimizer_decode_builds_only_valid_day_keys():
     assert "for day in SCHEDULE_DAYS" in source
 
 
-# ---- non-boolean stored values: live and backtest read them through the SAME coercion ----------------
-NON_BOOLEAN = ["1", 1, "true", "false", "0", 0, None]
-EXPECTED_ENABLED = {"1": True, 1: True, "true": True, "false": True, "0": True, 0: False, None: False}
+# ---- stored day VALUES: one table -> enabled / disabled / refused, read identically everywhere ------------
+# Real booleans are canonical. Tolerated (read by MEANING, never truthiness): the ints 1/0 and the strings
+# "true"/"false"/"1"/"0" (case-insensitive, whitespace ignored). Anything else is NOT guessed: refused.
+ENABLED, DISABLED, REFUSED = "enabled", "disabled", "refused"
+VALUE_TABLE = [
+    (True, ENABLED), (False, DISABLED),
+    (1, ENABLED), (0, DISABLED),
+    ("1", ENABLED), ("0", DISABLED),
+    ("true", ENABLED), ("false", DISABLED),
+    ("TRUE", ENABLED), ("False", DISABLED), (" true ", ENABLED), ("\t0\n", DISABLED),
+    (None, REFUSED), ("yes", REFUSED), ("no", REFUSED), ("on", REFUSED), ("", REFUSED), (" ", REFUSED),
+    (2, REFUSED), (-1, REFUSED), (1.0, REFUSED), (0.0, REFUSED), (0.5, REFUSED), ([], REFUSED),
+    ([True], REFUSED), ({}, REFUSED), ("2", REFUSED), ("truee", REFUSED),
+]
 
 
-@pytest.mark.parametrize("value", NON_BOOLEAN, ids=repr)
-def test_live_and_backtest_agree_on_a_non_boolean_monday_value(value):
-    """PINNED, not endorsed: the coercion is ``bool(value)``. So the STRINGS "false" and "0" count as
-    ENABLED (any non-empty string is truthy) while 0 and None disable the day. Changing that would change
-    behaviour; the owner decides separately."""
+@pytest.mark.parametrize("value, outcome", VALUE_TABLE, ids=lambda x: repr(x))
+def test_the_shared_function_reads_every_stored_value_by_meaning(value, outcome):
+    days = {"monday": value}
+    refusal = sg.schedule_refusal_message({"days": days, "times": ["09:30"]})
+    if outcome == REFUSED:
+        assert refusal and "monday" in refusal and "invalid" in refusal
+        with pytest.raises(ValueError):
+            sg.schedule_weekday_enabled(days, "monday")      # never a silent guess, even if asked directly
+    else:
+        assert refusal is None
+        assert sg.schedule_weekday_enabled(days, "monday") is (outcome == ENABLED)
+
+
+@pytest.mark.parametrize("value, outcome", [r for r in VALUE_TABLE if r[1] != REFUSED], ids=lambda x: repr(x))
+def test_live_and_backtest_agree_on_every_tolerated_monday_value(value, outcome):
     from ba2_trade_platform.core.JobManager import JobManager
 
     days = {"monday": value}
@@ -158,4 +179,83 @@ def test_live_and_backtest_agree_on_a_non_boolean_monday_value(value):
         nxt = trigger.get_next_fire_time(prev, now)
         live = live or nxt.weekday() == 0
         prev, now = nxt, nxt + timedelta(seconds=1)
-    assert backtest == live == EXPECTED_ENABLED[value]
+    assert backtest == live == (outcome == ENABLED)
+
+
+@pytest.mark.parametrize("value", [v for v, o in VALUE_TABLE if o == REFUSED], ids=lambda x: repr(x))
+def test_live_refuses_every_invalid_value_once_with_one_error(value, monkeypatch):
+    import ba2_trade_platform.core.JobManager as module
+    from ba2_trade_platform.core.JobManager import JobManager
+    errors = []
+    monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: errors.append(str(msg)))
+    schedule = {"days": {"monday": value}, "times": ["09:30"]}
+    assert JobManager._schedule_is_runnable(_Expert(4), "execution_schedule_enter_market", schedule) is False
+    assert len(errors) == 1 and "expert instance 4" in errors[0] and "invalid" in errors[0]
+    assert JobManager.__new__(JobManager)._parse_schedule(schedule, context="x") is None
+
+
+class _Expert:
+    def __init__(self, id_):
+        self.id = id_
+
+
+@pytest.mark.parametrize("value", [v for v, o in VALUE_TABLE if o == REFUSED], ids=lambda x: repr(x))
+def test_the_backtest_refuses_an_invalid_value_at_setup_and_never_per_bar(value):
+    import inspect
+    bad = {"days": {**{d: True for d in WEEKDAYS}, "monday": value}, "times": ["09:30"]}
+    eng = _engine({"run_schedule_override": bad}, [(_StubExpert(), 7, {}, None)])
+    with pytest.raises(ValueError) as e:
+        eng._validate_schedules_once()
+    assert "invalid" in str(e.value) and "monday" in str(e.value)
+    source = inspect.getsource(_schedule_allows_entry)
+    assert "schedule_refusal_message" not in source and "invalid_schedule_day_values" not in source
+
+
+def test_the_ui_loader_does_not_raise_on_an_invalid_value_and_shows_defaults():
+    """The editor loads a refused schedule at its defaults (and shows the refusal banner): the display
+    helper never raises."""
+    days = {"monday": None, "tuesday": "false", "saturday": "yes"}
+    assert sg.schedule_weekday_for_display(days, "monday") is True          # invalid -> the default (Mon on)
+    assert sg.schedule_weekday_for_display(days, "tuesday") is False        # tolerated -> read by meaning
+    assert sg.schedule_weekday_for_display(days, "saturday") is False       # invalid -> the default (Sat off)
+    assert sg.schedule_weekday_for_display({}, "sunday") is False
+
+
+def test_the_ui_saves_real_booleans():
+    """``_get_schedule_config`` / the enter-market and open-positions collectors write ``checkbox.value``
+    (a bool) for every day: pin the construction so a future change cannot save strings."""
+    import inspect
+    from ba2_trade_platform.ui.pages.settings import ExpertSettingsTab
+    for name in ("_get_schedule_config", "_get_enter_market_schedule_config", "_get_open_positions_schedule_config"):
+        fn = getattr(ExpertSettingsTab, name, None)
+        if fn is None:
+            continue
+        source = inspect.getsource(fn)
+        assert "= checkbox.value" in source and "str(checkbox" not in source
+
+
+def test_the_old_coercion_pin_is_gone():
+    """"false" and "0" used to read as ENABLED (``bool(v)``). They now mean DISABLED."""
+    assert sg.schedule_weekday_enabled({"monday": "false"}, "monday") is False
+    assert sg.schedule_weekday_enabled({"monday": "0"}, "monday") is False
+
+
+def test_the_tolerated_spellings_agree_with_the_repo_settings_bool_parser():
+    """The strict schedule parser is a subset of ``coerce_bool`` (the settings layer's reader), so a
+    tolerated schedule spelling can never read differently from the same spelling elsewhere."""
+    from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+    for value, outcome in VALUE_TABLE:
+        if outcome != REFUSED:
+            assert coerce_bool(value) is (outcome == ENABLED)
+
+
+def test_every_testplatform_builder_still_writes_real_booleans():
+    import ba2test_launcher as launcher
+    from app.api.backtests import _run_schedule_override
+    from app.services import robustness_handler as rh
+    built = [launcher._daily_manage_schedule()] + [_run_schedule_override("weekly", d) for d in WEEKDAYS]
+    built += [rh._day_override(d) for d in WEEKDAYS] + [rh._time_override("10:00")]
+    built += [sg.schedule_override_from_genes({f"schedule:{d}": 1}, None, weekdays_only=w, option_run=o)
+              for d in WEEKDAYS for w in (False, True) for o in (False, True)]
+    for schedule in built:
+        assert all(type(v) is bool for v in schedule["days"].values()), schedule

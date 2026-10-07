@@ -22,14 +22,66 @@ WEEKDAYS = SCHEDULE_DAYS[:5]
 SCHEDULE_DAY_DEFAULTS: Dict[str, bool] = {day: day not in ("saturday", "sunday") for day in SCHEDULE_DAYS}
 
 
+_TRUE_WORDS = frozenset({"true", "1"})
+_FALSE_WORDS = frozenset({"false", "0"})
+_INVALID = object()
+
+
+def _read_day_value(value: Any) -> Any:
+    """A stored day value read by MEANING: ``True`` / ``False``, or ``_INVALID``.
+
+    Real booleans are the canonical form. Tolerated, because this repo has a history of bools stored as
+    ``"1"`` / ``1`` (``tools/migrate_bool_settings``): the integers 1 / 0 and the strings
+    "true" / "false" / "1" / "0" (case-insensitive, surrounding whitespace ignored). NEVER truthiness
+    (``bool("false")`` is True), and never a guess: None, "yes", 2, "", a float, a list ... are invalid.
+
+    Deliberately a small pure parser here and not ``ExtendableSettingsInterface.coerce_bool``: this
+    module is pure (the public-site export imports it, ``coerce_bool`` drags in the database layer) and
+    ``coerce_bool`` also accepts "yes"/"on", floats and escaped JSON, which a schedule must refuse. The
+    tolerated set is a subset of ``coerce_bool``'s (pinned by a test), so no spelling reads differently."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value) if value in (0, 1) else _INVALID
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_WORDS:
+            return True
+        if text in _FALSE_WORDS:
+            return False
+    return _INVALID
+
+
 def schedule_weekday_enabled(days: Dict[str, Any], weekday: str) -> bool:
     """Whether ``weekday`` (lower-case name, ``SCHEDULE_DAYS``) is enabled in a schedule's ``days`` dict.
 
-    An explicit value wins; an absent key takes ``SCHEDULE_DAY_DEFAULTS``. Raises ``KeyError`` for a
-    name that is not a weekday (a caller bug, never a data condition). Keep this cheap: the backtest
-    calls it per bar.
+    An explicit value is read by meaning (``_read_day_value``); an absent key takes
+    ``SCHEDULE_DAY_DEFAULTS``. Raises ``ValueError`` for an explicit value that is not a boolean in any
+    tolerated spelling (never a silent guess; callers refuse the whole schedule up front via
+    ``schedule_refusal_message``, so this only fires on a path that skipped that check), and
+    ``KeyError`` for a name that is not a weekday (a caller bug). Cheap: the backtest calls it per bar.
     """
-    return bool(days.get(weekday, SCHEDULE_DAY_DEFAULTS[weekday]))
+    if weekday not in days:
+        return SCHEDULE_DAY_DEFAULTS[weekday]
+    read = _read_day_value(days[weekday])
+    if read is _INVALID:
+        raise ValueError(f"schedule day {weekday!r} has invalid value {days[weekday]!r} "
+                         f"(use true or false)")
+    return read
+
+
+def schedule_weekday_for_display(days: Dict[str, Any], weekday: str) -> bool:
+    """``schedule_weekday_enabled`` for a UI that must RENDER a stored schedule: an invalid value shows
+    the day's default (the editor also shows the refusal banner) instead of raising."""
+    if weekday in days and _read_day_value(days[weekday]) is _INVALID:
+        return SCHEDULE_DAY_DEFAULTS[weekday]
+    return schedule_weekday_enabled(days, weekday)
+
+
+def invalid_schedule_day_values(days: Dict[str, Any]) -> List[Any]:
+    """``[(day, value), ...]`` for known weekday keys whose stored value is not a boolean in a tolerated
+    spelling (None included: "absent" already has a defined default, an explicit null is ambiguous)."""
+    return [(d, days[d]) for d in SCHEDULE_DAYS if d in days and _read_day_value(days[d]) is _INVALID]
 
 
 def unknown_schedule_day_keys(days: Dict[str, Any]) -> List[str]:
@@ -42,9 +94,10 @@ def schedule_refusal_message(schedule: Any) -> Optional[str]:
     """Why a schedule dict cannot be run as written, or None when it can: the ONE sentence the live
     scheduler, the settings page, the Scheduled Jobs views and the backtest setup all show.
 
-    Only a dict ``days`` with a key that is not an exact lower-case weekday name is refused here
-    ("schedule refused: unknown day key 'wensday'"); other shapes (monthly, no ``days``) are not this
-    check's business.
+    A dict ``days`` is refused for a key that is not an exact lower-case weekday name ("schedule
+    refused: unknown day key 'wensday'") and for a day value that is not a boolean in a tolerated
+    spelling ("schedule refused: invalid value for day 'monday'=None"); other shapes (monthly, no
+    ``days``) are not this check's business.
     """
     if not isinstance(schedule, dict):
         return None
@@ -52,11 +105,18 @@ def schedule_refusal_message(schedule: Any) -> Optional[str]:
     if not isinstance(days, dict):
         return None
     unknown = unknown_schedule_day_keys(days)
-    if not unknown:
+    invalid = invalid_schedule_day_values(days)
+    if not unknown and not invalid:
         return None
-    keys = ", ".join(repr(k) for k in unknown)
-    return (f"schedule refused: unknown day key{'s' if len(unknown) > 1 else ''} {keys} "
-            f"(valid keys: {', '.join(SCHEDULE_DAYS)})")
+    parts = []
+    if unknown:
+        keys = ", ".join(repr(k) for k in unknown)
+        parts.append(f"unknown day key{'s' if len(unknown) > 1 else ''} {keys} "
+                     f"(valid keys: {', '.join(SCHEDULE_DAYS)})")
+    if invalid:
+        vals = ", ".join(f"{d!r}={v!r}" for d, v in invalid)
+        parts.append(f"invalid value for day {vals} (use true or false)")
+    return "schedule refused: " + "; ".join(parts)
 
 
 def repair_no_weekday(days: Dict[str, bool], option_run: bool) -> Dict[str, bool]:

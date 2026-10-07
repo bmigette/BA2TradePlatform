@@ -16,7 +16,7 @@ from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
 from ba2_common.core.option_selection_policy import WIRED_WEIGHT_BANDS
-from ba2_common.core.schedule_genes import schedule_refusal_message, schedule_weekday_enabled
+from ba2_common.core.schedule_genes import schedule_refusal_message, schedule_weekday_for_display
 from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, uses_min_one_contract, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
 from ...core.cleanup import (
     preview_cleanup, execute_cleanup, get_cleanup_statistics,
@@ -2993,7 +2993,7 @@ class ExpertSettingsTab:
         for day, checkbox in self.schedule_days.items():
             # An absent day: weekdays True, weekends False -- the ONE shared rule the live scheduler
             # and the backtest read too (schedule_genes.schedule_weekday_enabled).
-            checkbox.value = schedule_weekday_enabled(days, day)
+            checkbox.value = schedule_weekday_for_display(days, day)
         
         # Load times
         times = schedule_config.get('times', ['09:30'])
@@ -3333,7 +3333,7 @@ class ExpertSettingsTab:
             days = schedule_config.get('days', {})
             if hasattr(self, 'enter_market_schedule_days'):
                 for day, checkbox in self.enter_market_schedule_days.items():
-                    new_value = schedule_weekday_enabled(days, day)
+                    new_value = schedule_weekday_for_display(days, day)
                     checkbox.value = new_value
                     logger.debug(f'Set enter market day {day} to {new_value}')
 
@@ -3397,7 +3397,7 @@ class ExpertSettingsTab:
             days = schedule_config.get('days', {})
             if hasattr(self, 'open_positions_schedule_days'):
                 for day, checkbox in self.open_positions_schedule_days.items():
-                    new_value = schedule_weekday_enabled(days, day)
+                    new_value = schedule_weekday_for_display(days, day)
                     checkbox.value = new_value
                     logger.debug(f'Set open positions day {day} to {new_value}')
 
