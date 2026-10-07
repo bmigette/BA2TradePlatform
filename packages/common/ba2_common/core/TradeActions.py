@@ -1341,6 +1341,9 @@ class _AdjustPriceLevelAction(TradeAction):
                     data={}
                 )
 
+            # The price the level is computed from (stamped below, before it reaches the account).
+            # None = a literal target price of unknown origin.
+            anchor_price = None
             # Calculate price if not directly provided
             if self.target_price is None:
                 if self.reference_value is None or self.percent is None:
@@ -1401,6 +1404,7 @@ class _AdjustPriceLevelAction(TradeAction):
                         if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
                             base_price = expert_rec.price_at_date
                             expected_profit = expert_rec.expected_profit_percent
+                            anchor_price = base_price
 
                             logger.info(f"{self._label} Reference: EXPERT_TARGET_PRICE - base_price: ${base_price:.2f}, expected_profit: {expected_profit:.1f}%, action: {expert_rec.recommended_action}")
 
@@ -1443,6 +1447,8 @@ class _AdjustPriceLevelAction(TradeAction):
                         data={}
                     )
 
+                if anchor_price is None:
+                    anchor_price = reference_price
                 # Determine position direction: the POSITION's side (see _position_is_long)
                 is_long_position, direction_source = self._position_is_long()
                 if is_long_position is not None:
@@ -1500,6 +1506,13 @@ class _AdjustPriceLevelAction(TradeAction):
                         data={}
                     )
 
+                # Stamp the anchor BEFORE the account builds anything from the level.
+                from ba2_common.core.trade_cycle import record_level_anchor
+                record_level_anchor(transaction.id, **{self._anchor_level: anchor_price})
+                # Re-read: the account persists the object it is handed, and the copy loaded before
+                # the stamp would write the stamp's meta_data back out (stale-copy overwrite).
+                transaction = get_instance(Transaction, transaction.id) or transaction
+
                 logger.debug(f"Calling {self._label.lower()} adjustment for transaction {transaction.id} with price ${self.target_price:.2f}")
                 success = self._call_broker(transaction)
 
@@ -1555,8 +1568,17 @@ class _AdjustPriceLevelAction(TradeAction):
                 data={"order_id": self.existing_order.id if self.existing_order else None}
             )
 
+    #: "stop" / "tp": which ``tpsl_anchor`` slot this action's level lives in.
+    @property
+    def _anchor_level(self) -> str:
+        return "stop" if self._price_key_prefix == "sl" else "tp"
+
+    #: The price the last ``compute_price`` result was computed from (None = literal target).
+    last_anchor_price: Optional[float] = None
+
     def compute_price(self, order: "TradingOrder") -> Optional[float]:
         """Calculate the price for the given order without submitting to broker."""
+        self.last_anchor_price = None
         if self.target_price is not None:
             return self.target_price
 
@@ -1580,6 +1602,7 @@ class _AdjustPriceLevelAction(TradeAction):
                 if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
                     base_price = expert_rec.price_at_date
                     expected_profit = expert_rec.expected_profit_percent
+                    self.last_anchor_price = base_price
                     if expert_rec.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                         reference_price = base_price * (1 + expected_profit / 100)
                     elif expert_rec.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
@@ -1587,6 +1610,8 @@ class _AdjustPriceLevelAction(TradeAction):
 
         if reference_price is None:
             return None
+        if self.last_anchor_price is None:
+            self.last_anchor_price = reference_price
 
         is_long, _source = self._position_is_long(order)
         if is_long is None:

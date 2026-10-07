@@ -377,7 +377,12 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
     released: Dict[str, Any] = {}
     try:
         from app.services.backtest.daily_backtest_handler import run_daily_backtest
+        from app.services.backtest.backtest_account import assert_fill_rebase_enabled
         from app.services.strategy_fitness import compute_fitness
+
+        # A measurement hook that switches the fill re-base off must never reach a grid trial
+        # (raises FillRebaseDisabled, job-fatal by name).
+        assert_fill_rebase_enabled()
 
         # Wall time for THIS individual, measured inside the worker so it is pure compute and
         # excludes dispatch/queue wait. Logged next to the memory numbers because the two rise
@@ -1155,6 +1160,8 @@ def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, 
     """
     import time
     from app.services.backtest.daily_backtest_handler import run_daily_backtest
+    from app.services.backtest.backtest_account import assert_fill_rebase_enabled
+    assert_fill_rebase_enabled()      # the measurement hook is never legitimate in a persisted re-run
     last_exc: Optional[Exception] = None
     for attempt in range(_LOCAL_RETRY_ATTEMPTS):
         try:
@@ -1565,6 +1572,11 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 "(engine/datasets/date-range/initial_capital/...)",
             )
         expert_cfg = ga.get("expert_params")  # may be None (expert frozen)
+        from app.services.backtest.backtest_account import FillRebaseDisabled, assert_fill_rebase_enabled
+        try:
+            assert_fill_rebase_enabled()     # the GA master refuses to start with the hook on
+        except FillRebaseDisabled as e:
+            return _fail(opt_id, db, str(e))
         try:
             lattice_anchor = _resolve_lattice_anchor(ga)
             early_stop_min_rel = _resolve_early_stop_min_rel(ga)

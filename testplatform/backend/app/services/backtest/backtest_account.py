@@ -93,6 +93,29 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+#: The fill-time re-base counters (``BacktestAccount.fill_rebase_counters``), published in
+#: ``results["fill_rebase"]``. ``no_reference`` = an entry with a stop and NO usable anchor (its stop
+#: kept the pre-fill level): judged by ``DailyBacktestEngine.refuse_if_rebase_unanchored``.
+#: ``fallback_reference`` = the stop carried no stamp and the entry-order chain supplied the anchor.
+FILL_REBASE_COUNTER_KEYS = {
+    "entries_with_levels": 0, "entries_with_stop": 0, "rebased": 0, "stop_rebased": 0,
+    "tp_floored": 0, "fallback_reference": 0, "no_reference": 0,
+}
+
+
+class FillRebaseDisabled(RuntimeError):
+    """The measurement hook ``BacktestAccount._MEASURE_NO_FILL_REBASE`` was on in an optimization or
+    grid. JOB-FATAL: every trial would score a simulation that differs from live."""
+
+
+def assert_fill_rebase_enabled() -> None:
+    """Refuse to run a GA / grid trial with the fill re-base switched off (measurement hook only)."""
+    if BacktestAccount._MEASURE_NO_FILL_REBASE is not False:
+        raise FillRebaseDisabled(
+            "BacktestAccount._MEASURE_NO_FILL_REBASE is on: the fill-time stop/target re-base is "
+            "switched off, which is a measurement-only hook (tools/measure_variant.py +norebase) and "
+            "must never be on in an optimization or grid")
+
 
 class ComboSettlementRefused(RuntimeError):
     """A defined-risk combo cannot be settled at expiry (its held legs have no payoff bounds).
@@ -7611,6 +7634,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     #: production path: the re-base is part of the simulation, like live's.
     _MEASURE_NO_FILL_REBASE = False
 
+    def fill_rebase_record(self) -> Dict[str, Any]:
+        """The ``results["fill_rebase"]`` block: whether the re-base was on, and what it did."""
+        return {"enabled": not self._MEASURE_NO_FILL_REBASE,
+                **{k: int(v) for k, v in (self.__dict__.get("fill_rebase_counters")
+                                          or FILL_REBASE_COUNTER_KEYS).items()}}
+
     def _rebase_levels_at_entry_fill(self, order, fill_px: float) -> None:
         """Re-base the entry transaction's stop/target to the entry's REAL fill (equity only).
 
@@ -7635,7 +7664,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if self._MEASURE_NO_FILL_REBASE:
             return
         from ba2_common.core.tpsl_fill_rebase import (
-            FillRebaseRefused, rebase_levels_at_fill, resolve_tpsl_reference_price)
+            FillRebaseRefused, read_anchor, rebase_levels_at_fill, resolve_tpsl_reference_price,
+            stamp_anchor)
         done = self.__dict__.setdefault("_fill_rebased_txn_ids", set())
         txn_id = order.transaction_id
         if txn_id in done:
@@ -7647,8 +7677,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         tp, sl = txn.take_profit, txn.stop_loss
         if not tp and not sl:
             return
-        counters = self.__dict__.setdefault("fill_rebase_counters", {
-            "rebased": 0, "stop_rebased": 0, "tp_floored": 0, "no_reference": 0})
+        counters = self.__dict__.setdefault("fill_rebase_counters", dict(FILL_REBASE_COUNTER_KEYS))
+        counters["entries_with_levels"] += 1
+        counters["entries_with_stop"] += int(bool(sl))
 
         def _rec_price():
             rec_id = order.expert_recommendation_id
@@ -7658,14 +7689,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             rec = get_instance(ExpertRecommendation, rec_id)
             return rec.price_at_date if rec is not None else None
 
-        ref = resolve_tpsl_reference_price(None, order.limit_price, _rec_price, lambda: None)
+        # The price the stop was COMPUTED FROM, stamped when it was set (TradeActions / the safeguard
+        # tail); the entry-order chain below is only the fallback for a stop that carries no stamp.
+        stamped = read_anchor(txn.meta_data, "stop")
+        ref = resolve_tpsl_reference_price(None, order.limit_price, _rec_price, lambda: None,
+                                           stamped_stop_anchor=stamped)
+        if sl and stamped is None:
+            counters["fallback_reference"] += 1
         rebase_stop = bool(ref) and ref > 0
         if sl and not rebase_stop:
             counters["no_reference"] += 1
             logger.warning(
-                "[backtest] stop of %s %s NOT re-based to the fill: the entry has no reference price "
-                "(no limit price, no recommendation price_at_date); the stop keeps its pre-fill level",
-                order.symbol, txn_id)
+                "[backtest] stop of %s %s NOT re-based to the fill: no stamped anchor and the entry has "
+                "no reference price (no limit price, no recommendation price_at_date); the stop keeps "
+                "its pre-fill level", order.symbol, txn_id)
         from ba2_common.core.TradeActions import resolve_min_take_profit_pct
         try:
             adj = rebase_levels_at_fill(
@@ -7677,21 +7714,26 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             raise RuntimeError(
                 f"[backtest] cannot re-base the protective levels of {order.symbol} "
                 f"(transaction {txn_id}) to its fill: {e}") from e
-        meta = dict(txn.meta_data) if txn.meta_data else {}
-        meta["fill_rebase"] = {
+        record = {
             "reference_price": ref, "fill_price": fill_px,
             "stop_loss_pre_fill": sl, "take_profit_pre_fill": tp,
             "stop_loss": adj.stop_loss, "take_profit": adj.take_profit,
             "stop_rebased": adj.stop_rebased, "tp_floored": adj.tp_floored,
         }
+        self.__dict__.setdefault("_fill_rebase_records", {})[txn_id] = record
+        if not adj.changed:
+            return      # nothing moved: no level rewritten, nothing persisted
+        counters["rebased"] += 1
+        counters["stop_rebased"] += int(adj.stop_rebased)
+        counters["tp_floored"] += int(adj.tp_floored)
+        meta = dict(txn.meta_data) if txn.meta_data else {}
+        meta["fill_rebase"] = record
+        if adj.stop_rebased:
+            # the stop is now measured from the fill: a second pass must see no gap to re-base
+            meta = stamp_anchor(meta, stop=fill_px)
         txn.meta_data = meta
-        self.__dict__.setdefault("_fill_rebase_records", {})[txn_id] = meta["fill_rebase"]
-        if adj.changed:
-            counters["rebased"] += 1
-            counters["stop_rebased"] += int(adj.stop_rebased)
-            counters["tp_floored"] += int(adj.tp_floored)
-            txn.stop_loss = adj.stop_loss
-            txn.take_profit = adj.take_profit
+        txn.stop_loss = adj.stop_loss
+        txn.take_profit = adj.take_profit
         update_instance(txn)
 
     def _apply_option_fill(self, order, fill_px: float, as_of: datetime) -> None:

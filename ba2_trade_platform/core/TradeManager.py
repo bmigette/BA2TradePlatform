@@ -185,7 +185,8 @@ def replacement_blocked_by_qty(trigger_status, available_qty, required_qty) -> b
 
 # The re-base rules live in ba2_common (shared with the backtest). rebase_price_to_fill is
 # re-exported here because it has long been importable from TradeManager.
-from ba2_common.core.tpsl_fill_rebase import rebase_levels_at_fill, rebase_price_to_fill  # noqa: E402,F401
+from ba2_common.core.tpsl_fill_rebase import (  # noqa: E402,F401
+    read_anchor, rebase_levels_at_fill, rebase_price_to_fill, stamp_anchor)
 
 
 def resolve_entry_order(session, transaction):
@@ -1653,6 +1654,11 @@ class TradeManager:
         for attempt in range(1, self._ENTRY_SUBMIT_RETRIES + 1):
             try:
                 submit_sl = self._entry_submit_stop(order, sl_price)
+                from ba2_common.core.trade_cycle import stamp_safeguard_anchor
+                _txn = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
+                stamp_safeguard_anchor(
+                    order, (_txn.stop_loss if _txn else None), sl_price, submit_sl,
+                    lambda: account.get_instrument_current_price(order.symbol))
                 submitted = account.submit_order(order, sl_price=submit_sl)
             except Exception as e:  # noqa: BLE001 — classified immediately below
                 if "database is locked" not in str(e).lower():
@@ -1674,6 +1680,11 @@ class TradeManager:
                 if submitted:
                     from ba2_common.core.trade_cycle import record_max_loss_stop
                     record_max_loss_stop(order, sl_price)
+                    # the transaction may only exist since the submit; the fill-time re-base reads
+                    # the stamp from it either way (idempotent when already stamped before)
+                    stamp_safeguard_anchor(
+                        order, (_txn.stop_loss if _txn else None), sl_price, submit_sl,
+                        lambda: account.get_instrument_current_price(order.symbol))
                 return submitted
         self.logger.error(
             f"Entry submit for order {order.id} ({order.symbol}) ABANDONED after "
@@ -1790,6 +1801,16 @@ class TradeManager:
                                     # -- reference anchor for the stop (recorded when the exit order was built)
                                     ref_val = None
                                     ref_raw = data_dict.get("tpsl_reference_price") if data_dict else None
+                                    # The price the stop was actually COMPUTED FROM, stamped on the
+                                    # transaction when the stop was set, beats the anchor recorded on
+                                    # the exit order at build time (which a later stop update never
+                                    # refreshed) and the legacy reference chain behind it.
+                                    anchor_txn = (session.get(Transaction, dependent_order.transaction_id)
+                                                  if dependent_order.transaction_id else None)
+                                    stamped_anchor = read_anchor(
+                                        anchor_txn.meta_data if anchor_txn else None, "stop")
+                                    if stamped_anchor:
+                                        ref_raw = stamped_anchor
                                     if ref_raw:
                                         try:
                                             ref_val = float(ref_raw)
@@ -1846,6 +1867,8 @@ class TradeManager:
                                         )
                                         if txn:
                                             txn.stop_loss = new_sl
+                                            # measured from the fill now: a later pass finds nothing to re-base
+                                            txn.meta_data = stamp_anchor(txn.meta_data, stop=fill_px)
                                             session.add(txn)
                                             transaction_field_updates = True
                                         if data_dict is not None:

@@ -32,6 +32,10 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 
+#: A re-base that moves a level by no more than this is rounding noise: not a change, level not rewritten.
+REBASE_TOLERANCE = 1e-4
+
+
 class FillRebaseRefused(ValueError):
     """The inputs cannot be re-based honestly (no fill, no reference for a stop that must move, ...)."""
 
@@ -74,21 +78,64 @@ def compute_tp_floor_price(
     return None
 
 
+#: ``Transaction.meta_data`` key holding the price each protective level was COMPUTED FROM, stamped
+#: at the moment the level is set: ``{"stop": <price>, "tp": <price>}`` (a missing key = unknown).
+#: The fill-time re-base reads THIS (live and backtest alike); the preference chain below is only
+#: the fallback for levels set before the stamp existed or from a literal price.
+ANCHOR_KEY = "tpsl_anchor"
+_KEEP = object()
+
+
+def stamp_anchor(meta, *, stop=_KEEP, tp=_KEEP) -> dict:
+    """A NEW ``meta_data`` dict with the level anchors stamped (pure).
+
+    ``stop`` / ``tp``: the price that level was computed from; ``None`` CLEARS that level's anchor
+    (the level was set from a price of unknown origin, so an older stamp no longer describes it);
+    omitted = untouched. Anything else on ``meta`` is carried forward."""
+    out = dict(meta) if isinstance(meta, dict) else {}
+    anchors = dict(out.get(ANCHOR_KEY) or {})
+    for key, val in (("stop", stop), ("tp", tp)):
+        if val is _KEEP:
+            continue
+        if val is None:
+            anchors.pop(key, None)
+        else:
+            anchors[key] = _positive(val, f"{key} anchor price")
+    if anchors:
+        out[ANCHOR_KEY] = anchors
+    else:
+        out.pop(ANCHOR_KEY, None)
+    return out
+
+
+def read_anchor(meta, level: str) -> Optional[float]:
+    """The stamped anchor of ``level`` ("stop" or "tp") or None when it was never stamped."""
+    if not isinstance(meta, dict):
+        return None
+    val = (meta.get(ANCHOR_KEY) or {}).get(level)
+    return float(val) if val else None
+
+
 def resolve_tpsl_reference_price(
     entry_open_price: Optional[float],
     entry_limit_price: Optional[float],
     recommendation_price: Callable[[], Optional[float]],
     current_price: Callable[[], Optional[float]],
+    stamped_stop_anchor: Optional[float] = None,
 ) -> Optional[float]:
     """The pre-fill anchor a protective level was computed against (so it can be re-based later).
 
     Preference order: the realised fill (if the entry already has one -- then re-basing is a
-    no-op), else the entry's limit price, else the originating recommendation's ``price_at_date``,
-    else the current quote.  The last two are callables so they are only evaluated when reached
-    (each may do I/O in its caller).  Returns None when nothing resolves; the caller decides.
+    no-op), else the STAMPED anchor (the price the stop was actually computed from, recorded when
+    the stop was set), else -- the fallback for levels that carry no stamp -- the entry's limit
+    price, then the originating recommendation's ``price_at_date``, then the current quote.  The
+    last two are callables so they are only evaluated when reached (each may do I/O in its
+    caller).  Returns None when nothing resolves; the caller decides.
     """
     if entry_open_price:
         return entry_open_price
+    if stamped_stop_anchor:
+        return stamped_stop_anchor
     if entry_limit_price:
         return entry_limit_price
     rec_px = recommendation_price()
@@ -161,7 +208,7 @@ def rebase_levels_at_fill(
     if rebase_stop and sl is not None:
         ref = _positive(reference_price, "reference price (the price the stop was built from)")
         new_sl = round(fill * (sl / ref), 4)
-        if abs(new_sl - sl) > 1e-9:
+        if abs(new_sl - sl) > REBASE_TOLERANCE:
             reasons.append(f"stop re-based {sl:.4f} -> {new_sl:.4f} (ref {ref:.4f}, fill {fill:.4f})")
             sl = new_sl
             stop_rebased = True

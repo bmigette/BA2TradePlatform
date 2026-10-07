@@ -1044,6 +1044,9 @@ def run_daily_backtest(
             # (and were skipped per symbol / per bar) traded nothing for a reason that is not the
             # strategy. Refuse the run (no result, no fitness; a GA trial reports "trial failed").
             engine.refuse_if_analysis_failing()
+            # Same discipline for the fill-time stop/target re-base: one summary line, and a refusal
+            # when too many stops had no anchor to re-base from.
+            fill_rebase = engine.refuse_if_rebase_unanchored()
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).
             results = build_results(account, config)
@@ -1075,6 +1078,10 @@ def run_daily_backtest(
             # single chokepoint every path goes through (trial worker, master top-N persist,
             # parallel=1), so both compute_fitness call sites get it without touching either.
             results["analysis_failures"] = engine.analysis_failures_record()
+            # Whether the entry's stop/target were re-based to the real fill (as live does) and what
+            # that did; ``fill_rebase_enabled`` is False only under the measurement hook.
+            results["fill_rebase_enabled"] = bool(fill_rebase["enabled"])
+            results["fill_rebase"] = fill_rebase
             results.update(_car_trade_thresholds_for_experts(config))
             _record = _decision_time_record(engine, config)
             if _record is not None:

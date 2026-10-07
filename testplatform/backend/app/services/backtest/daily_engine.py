@@ -55,7 +55,7 @@ from ba2_common.core.utils import as_utc_key
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 from ba2_common.core.db import add_instance, get_instance
 from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
-from ba2_common.core.trade_cycle import record_max_loss_stop
+from ba2_common.core.trade_cycle import record_max_loss_stop, stamp_safeguard_anchor
 from ba2_common.core.types import (
     AnalysisUseCase,
     OrderDirection,
@@ -155,6 +155,19 @@ class AnalysisFailureRefusal(RuntimeError):
                  first_error: Any = None):
         super().__init__(message)
         self.expert_id, self.passes, self.failed, self.first_error = expert_id, passes, failed, first_error
+
+
+#: A run in which MORE than this share of its entries WITH A STOP could not re-base that stop to the fill
+#: (no stamped anchor and no reference price: the stop kept its pre-fill level) is REFUSED: the result
+#: would measure stops that live does not have. With every level stamping its anchor this is zero.
+MAX_UNANCHORED_STOP_SHARE = 0.05
+#: ...judged only from this many entries with a stop on (a 3-entry fixture is not a rate).
+MIN_STOP_ENTRIES_FOR_REBASE_REFUSAL = 20
+
+
+class FillRebaseRefusal(RuntimeError):
+    """Too many entries' stops could not be re-based to their fill for the result to mean anything.
+    JOB-FATAL (``app.services.job_fatal``)."""
 
 
 _FIRST_BAR_WARNED: set = set()   # schedule times already warned about in this process
@@ -1054,6 +1067,32 @@ class DailyBacktestEngine:
                     f"{r['first_error']}",
                     expert_id=expert_id, passes=r["passes"], failed=r["failed"],
                     first_error=r["first_error"])
+
+    def refuse_if_rebase_unanchored(self) -> Dict[str, Any]:
+        """The fill-time re-base's summary line, and the refusal. ONE log line per run (WARNING when
+        any stop had no usable anchor or relied on the fallback chain, INFO otherwise); RAISES
+        ``FillRebaseRefusal`` when entries whose stop could not be re-based exceed
+        ``MAX_UNANCHORED_STOP_SHARE`` of the entries with a stop (judged from
+        ``MIN_STOP_ENTRIES_FOR_REBASE_REFUSAL`` on). Returns the record."""
+        rec = self.account.fill_rebase_record()
+        line = (f"[daily_engine] fill re-base ({'ON' if rec['enabled'] else 'OFF - measurement hook'}): "
+                f"{rec['entries_with_levels']} entries with levels, {rec['entries_with_stop']} with a stop, "
+                f"{rec['stop_rebased']} stops re-based, {rec['tp_floored']} targets floored, "
+                f"{rec['fallback_reference']} stops on the fallback reference chain, "
+                f"{rec['no_reference']} stops with NO usable reference")
+        if rec["no_reference"] or rec["fallback_reference"]:
+            logger.warning(line)
+        else:
+            logger.info(line)
+        n = rec["entries_with_stop"]
+        if (n >= MIN_STOP_ENTRIES_FOR_REBASE_REFUSAL
+                and rec["no_reference"] / n > MAX_UNANCHORED_STOP_SHARE):
+            raise FillRebaseRefusal(
+                f"Backtest refused: {rec['no_reference']} of {n} entries with a stop "
+                f"({rec['no_reference'] / n:.0%} > {MAX_UNANCHORED_STOP_SHARE:.0%}) had no anchor to "
+                f"re-base the stop to the fill; those stops stayed at their pre-fill level, which live "
+                f"does not do")
+        return rec
 
     def _assert_daily_reads_are_clamped(self) -> None:
         """An intraday run's OHLCV reader MUST be bound to THIS run's price source, otherwise every
@@ -2134,11 +2173,18 @@ class DailyBacktestEngine:
                         ruleset_sl=(txn.stop_loss if txn else None),
                         safeguard_sl=safeguard,
                         is_long=(order.side == OrderDirection.BUY))
+                    stamp_safeguard_anchor(
+                        order, (txn.stop_loss if txn else None), safeguard, sl_price,
+                        lambda: self.account.get_instrument_current_price(order.symbol))
                     submitted = self.account.submit_order(order, sl_price=sl_price)
                     # Additive metadata: the stop the size was keyed off, written once as the
                     # transaction's max-loss stop (never raises; see record_max_loss_stop).
                     if submitted:
                         record_max_loss_stop(order, safeguard)
+                        # a ruleset without TP/SL has no transaction until the submit created it
+                        stamp_safeguard_anchor(
+                            order, (txn.stop_loss if txn else None), safeguard, sl_price,
+                            lambda: self.account.get_instrument_current_price(order.symbol))
                 except Exception as e:  # noqa: BLE001
                     _reraise_option_basis_refusal(e)
                     self._log(f"submit_order failed for order {order.id}: {e}")
@@ -2196,6 +2242,9 @@ class DailyBacktestEngine:
                     ruleset_sl=(txn.stop_loss if txn else None),
                     safeguard_sl=safeguard,
                     is_long=(order.side == OrderDirection.BUY))
+                stamp_safeguard_anchor(
+                    order, (txn.stop_loss if txn else None), safeguard, sl_price,
+                    lambda: self.account.get_instrument_current_price(order.symbol))
                 submitted = self.account.submit_order(order, sl_price=sl_price)
                 created_any = True
                 # Additive metadata: the stop the size was keyed off (the RM safeguard), written
@@ -2203,6 +2252,9 @@ class DailyBacktestEngine:
                 # loop; it never raises.
                 if submitted:
                     record_max_loss_stop(order, safeguard)
+                    stamp_safeguard_anchor(          # the transaction may only exist since the submit
+                        order, (txn.stop_loss if txn else None), safeguard, sl_price,
+                        lambda: self.account.get_instrument_current_price(order.symbol))
             except Exception as e:  # noqa: BLE001
                 _reraise_option_basis_refusal(e)
                 self._log(f"funded submit failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")

@@ -58,7 +58,10 @@ def _intraday_bars():
     return prior + day
 
 
-def _run_intraday(run_id):
+run_intraday_account = []     # the account of the last _run_intraday (for the counters)
+
+
+def _run_intraday(run_id, entry_actions=None):
     """Full engine.run() on a 5-minute clock; one BUY decision at 09:40 on 2024-01-02."""
     from app.services.backtest.backtest_account import BacktestAccount
     from app.services.backtest.backtest_db import (
@@ -102,7 +105,7 @@ def _run_intraday(run_id):
     try:
         seed_account_definition(run_id, CFG)
         enter_id = seed_ruleset_from_tree(None, name=f"fr-intraday-{run_id}", enable_short=False,
-                                          entry_actions=BR)
+                                          entry_actions=entry_actions or BR)
         seed_expert_instance(account_id=run_id, expert_class_name="_IntradayBuy",
                              enter_market_ruleset_id=enter_id, instance_id=run_id)
         ps = AsOfPriceSource(ohlcv_provider=None, interval="5min")
@@ -128,6 +131,7 @@ def _run_intraday(run_id):
         engine.run()
         entries = [o for o in account.get_orders() if o.depends_on_order is None and o.transaction_id]
         txns = [get_instance(Transaction, o.transaction_id) for o in entries]
+        run_intraday_account.append(account)
         return [(t.stop_loss, t.take_profit) for t in txns], account.get_round_trip_trades()
     finally:
         ctx.__exit__(None, None, None)
@@ -153,7 +157,51 @@ def test_intraday_clock_without_the_rebase_keeps_the_decision_price_stop(monkeyp
     assert [t for t in trades if t["exit_reason"] == "stop_loss"] == []
 
 
+def test_intraday_safeguard_stop_is_rebased_against_the_decision_price_it_was_sized_on(monkeypatch):
+    """No ruleset stop: the RM SAFEGUARD (8% under the decision price 100 = 92) is the stop. Its
+    anchor is stamped by the submit tail from the then-current price, so on the 09:45 fill at 103
+    the stop becomes 103 * 0.92 = 94.76 without ever touching the legacy fallback chain."""
+    from tests.backtest.test_short_selling_engine import _adjust
+    _store_mode(monkeypatch, "1")
+    run_intraday_account.clear()
+    levels, trades = _run_intraday(1340, entry_actions=[_adjust("adjust_take_profit", 10.0)])
+    [(sl, tp)] = levels
+    assert sl == pytest.approx(94.76)
+    rec = run_intraday_account[0].fill_rebase_record()
+    assert rec["stop_rebased"] == 1 and rec["fallback_reference"] == 0 and rec["no_reference"] == 0
+    [t] = [t for t in trades if t["exit_reason"] == "stop_loss"]
+    assert t["exit_price"] == pytest.approx(94.76) and t["fill_reference_price"] == pytest.approx(100.0)
+
+
 # --------------------------------------------------------------------------- options
+def test_the_stock_leg_of_a_covered_call_IS_rebased_when_its_fill_gaps_from_the_decision_price(monkeypatch):
+    """OWNER DECISION 2026-10-07: the stock legs of option strategies are re-based exactly like any
+    equity entry (live does the same). O_CC buys SHARES through the equity entry path; with a real
+    3% gap between the decision close (20) and the fill (20.6) its stop moves to the fill, and the
+    run differs from the same run with the measurement hook on. (The identity test below passes
+    only because ITS fixture fills at the decision price.)"""
+    from app.services.backtest.backtest_account import BacktestAccount
+    from tests.backtest import test_covered_call_engine as cc
+
+    gapped = list(cc.UNDERLYING)
+    d, o, h, lo, c = gapped[1]
+    gapped[1] = (d, 20.6, 20.8, 20.0, c)                 # the fill bar opens 3% above the decision close
+    monkeypatch.setattr(cc, "UNDERLYING", gapped)
+    account, orders, _calls, trips = cc._run(881)
+    rec = account.fill_rebase_record()
+    assert rec["entries_with_stop"] >= 1, rec
+    assert rec["stop_rebased"] >= 1, rec                 # the stock leg's stop WAS re-based
+    assert rec["no_reference"] == 0
+    moved = [r for r in account.__dict__["_fill_rebase_records"].values() if r["stop_rebased"]]
+    assert moved
+    r = moved[0]
+    assert r["fill_price"] == pytest.approx(20.6) and r["reference_price"] == pytest.approx(20.0)
+    assert r["stop_loss"] == pytest.approx(r["stop_loss_pre_fill"] * 20.6 / 20.0)
+    monkeypatch.setattr(BacktestAccount, "_MEASURE_NO_FILL_REBASE", True)
+    off_account, _o, _c, _t = cc._run(881)
+    assert off_account.fill_rebase_record()["stop_rebased"] == 0
+
+
 def test_a_covered_call_run_is_identical_with_and_without_the_rebase(monkeypatch):
     """O_CC buys SHARES (the equity entry path) and writes a call. On its fixture the shares fill
     at the decision close, so the re-base is a no-op and every order/trade is byte-identical

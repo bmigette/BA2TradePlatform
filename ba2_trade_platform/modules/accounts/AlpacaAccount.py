@@ -4764,7 +4764,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     data={
                         "tp_percent_target": self._calculate_tp_percent(entry_order, transaction.take_profit) if transaction.take_profit else 0,
                         "sl_percent_target": self._calculate_sl_percent(entry_order, transaction.stop_loss) if transaction.stop_loss else 0,
-                        "tpsl_reference_price": self._tpsl_reference_price(entry_order)
+                        "tpsl_reference_price": self._tpsl_reference_price(entry_order, transaction)
                     },
                     created_at=datetime.now(timezone.utc)
                 )
@@ -5508,7 +5508,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return 0.0
         return ((entry_order.open_price - sl_price) / entry_order.open_price) * 100
 
-    def _tpsl_reference_price(self, entry_order: TradingOrder):
+    def _tpsl_reference_price(self, entry_order: TradingOrder, transaction=None):
         """Best pre-fill anchor the TP/SL were computed against, so a pending OCO can be
         re-based to the entry's ACTUAL fill on trigger.
 
@@ -5540,8 +5540,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             except Exception:
                 return None
 
+        from ba2_common.core.tpsl_fill_rebase import read_anchor
         return resolve_tpsl_reference_price(
-            entry_order.open_price, entry_order.limit_price, _rec_price, _live_price)
+            entry_order.open_price, entry_order.limit_price, _rec_price, _live_price,
+            stamped_stop_anchor=read_anchor(getattr(transaction, "meta_data", None), "stop"))
 
     def _target_exit_spec(self, transaction: Transaction, entry_order: TradingOrder):
         """Decide which exit-order structure a transaction needs at the broker.
@@ -5592,7 +5594,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             data["tp_percent_target"] = self._calculate_tp_percent(entry_order, tp_price)
         if sl_price:
             data["sl_percent_target"] = self._calculate_sl_percent(entry_order, sl_price)
-        ref_price = self._tpsl_reference_price(entry_order)
+        ref_price = self._tpsl_reference_price(entry_order, transaction)
         if ref_price:
             data["tpsl_reference_price"] = ref_price
         return TradingOrder(
@@ -5652,7 +5654,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 data={
                     "tp_percent_target": self._calculate_tp_percent(entry_order, tp_price),
                     "sl_percent_target": self._calculate_sl_percent(entry_order, sl_price),
-                    "tpsl_reference_price": self._tpsl_reference_price(entry_order)
+                    "tpsl_reference_price": self._tpsl_reference_price(entry_order, transaction)
                 },
                 created_at=datetime.now(timezone.utc)
             )
