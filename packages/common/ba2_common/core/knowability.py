@@ -42,7 +42,7 @@ from __future__ import annotations
 import threading
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 #: The entry/decision time (exchange-local HH:MM) NEW stock backtests, grids and optimizations run
@@ -70,6 +70,25 @@ DEFAULT_DECISION_TIME_CHOICES = ("09:35", "09:40", "09:45", "10:00", "12:00", "1
 #: reconstruct such rows that carry no explicit time; never a default for a new run.
 LEGACY_DECISION_TIME = "09:30"
 
+def entry_times_for(stated: Optional[Sequence[str]], *, stored_row: bool, intraday: bool) -> list:
+    """THE ONE rule for a schedule that carries no time (everything else must state one).
+
+    * a stated time is used as is;
+    * an ABSENT time on a STORED row (it predates the field, every such row ran at the session's first
+      bar) legitimately means ``LEGACY_DECISION_TIME`` -- explicit, here, and the engine's first-bar
+      warning then says the run decides on the prior close;
+    * an absent time on a DAILY clock is inert (the daily bar IS the decision; ``times`` are ignored by
+      ``_schedule_allows_entry``), so the legacy label is kept: option grids are untouched;
+    * an absent time on a NEW intraday run RAISES: the time decides what the run sees, it is never guessed.
+    """
+    if stated:
+        return list(stated)
+    if stored_row or not intraday:
+        return [LEGACY_DECISION_TIME]
+    raise ValueError("a new intraday run states no decision time: refusing to guess one "
+                     "(pass --decision-times / a run schedule with `times`)")
+
+
 _NY = ZoneInfo("America/New_York")
 _tl = threading.local()
 
@@ -80,14 +99,36 @@ def intraday_decision_clock() -> bool:
 
 
 @contextmanager
-def intraday_decisions(active: bool) -> Iterator[None]:
-    """Mark this thread's backtest as running on an intraday clock (restores the prior value)."""
+def intraday_decisions(active: bool, scan_cutoff: Any = None) -> Iterator[None]:
+    """Mark this thread's backtest as running on an intraday clock (restores the prior values).
+    ``scan_cutoff`` is the run's date-store visibility function (``AsOfPriceSource.scan_cutoff_date``),
+    read back by :func:`scan_cutoff_date` for readers that have no price source in hand."""
     prior = getattr(_tl, "active", False)
+    prior_fn = getattr(_tl, "scan_cutoff", None)
     _tl.active = bool(active)
+    _tl.scan_cutoff = scan_cutoff
     try:
         yield
     finally:
         _tl.active = prior
+        _tl.scan_cutoff = prior_fn
+
+
+def scan_cutoff_date(as_of: Any) -> date:
+    """The latest DATE a date-keyed store row (content as of that day's close: screener scans, factor
+    metrics, regime flags) may carry to be visible at the decision ``as_of`` (inclusive).
+
+    Live and the daily clock: ``as_of``'s own date (unchanged). While an intraday backtest decision
+    clock is on: the run's rule (every session dated <= S finished at the decision; see
+    ``metric_store.visible_scan_date``); RAISES when the run registered no rule."""
+    if intraday_decision_clock():
+        fn = getattr(_tl, "scan_cutoff", None)
+        if fn is None:
+            raise RuntimeError("an intraday backtest decision clock is active but no scan-visibility "
+                               "rule is registered: refusing to read a date-keyed store by the "
+                               "decision's own calendar date")
+        return fn(as_of)
+    return as_of.date() if isinstance(as_of, datetime) else as_of
 
 
 def _as_naive_wall(d: Any) -> datetime:

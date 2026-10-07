@@ -232,8 +232,10 @@ def schedule_override_from_genes(
     days = repair_no_weekday(days, option_run=option_run)
     # A stored row that states no time ran at the session's first bar (every row before the
     # 2026-10-07 default moved); a NEW run always states its time (DEFAULT_DECISION_TIME).
-    from ba2_common.core.knowability import LEGACY_DECISION_TIME
+    from ba2_common.core.knowability import entry_times_for
     if chosen_time is not None:
         # The genome CHOSE its time: it wins over the run-level time (both live schedules).
         return {"days": days, "times": [chosen_time]}
-    return {"days": days, "times": (base_override or {}).get("times") or [LEGACY_DECISION_TIME]}
+    # a STORED row: an absent time is the legacy first-bar time (one explicit rule, in knowability)
+    return {"days": days, "times": entry_times_for((base_override or {}).get("times"),
+                                                   stored_row=True, intraday=True)}

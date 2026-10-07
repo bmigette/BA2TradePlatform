@@ -1038,7 +1038,7 @@ def run_daily_backtest(
             # item only from the instant it was public (ba2_common.core.knowability); the flag is
             # thread-local and lives exactly as long as this run.
             from ba2_common.core.knowability import intraday_decisions
-            with intraday_decisions(ps.is_intraday):
+            with intraday_decisions(ps.is_intraday, scan_cutoff=ps.scan_cutoff_date):
                 engine.run()
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).

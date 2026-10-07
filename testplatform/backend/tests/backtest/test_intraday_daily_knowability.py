@@ -501,9 +501,9 @@ def test_screener_scan_day_is_the_prior_session_on_an_intraday_clock(tmp_path):
     try:
         rt = {"store": "x", "settings": {}}
         ps = _ps("5min")
-        _screened_symbols_for_bar(rt, as_of, None, session_date=ps.daily_session_date(as_of))
+        _screened_symbols_for_bar(rt, as_of, None, intraday=True)
         assert seen["day"] == "2024-01-02", "an intraday 09:30 decision read its own day's scan row"
-        _screened_symbols_for_bar(rt, as_of, None)   # legacy callers: the bar's own date
+        _screened_symbols_for_bar(rt, as_of, None, intraday=False)   # daily clock: the bar's own date
         assert seen["day"] == "2024-01-03"
     finally:
         ms.load_store, ms.scan_dates, ms.screen_universe_for_day = orig_load, orig_dates, orig_screen
@@ -517,7 +517,7 @@ def test_metric_store_atr_reads_the_knowable_session(monkeypatch):
     monkeypatch.setattr(ms, "load_store", lambda d: object())
     monkeypatch.setattr(ms, "metrics_as_of", lambda df, day, cols: asked.setdefault("day", day) and {})
     as_of = datetime(2024, 1, 3, 14, 30, tzinfo=timezone.utc)
-    MetricStoreATRProvider("x", session_date_fn=_ps("5min").daily_session_date).get_indicator(
+    MetricStoreATRProvider("x", session_date_fn=_ps("5min").scan_cutoff_date).get_indicator(
         SYMBOL, "atr", end_date=as_of, period=ms.ATR_PERIODS[0])
     assert asked["day"] == "2024-01-02"
 

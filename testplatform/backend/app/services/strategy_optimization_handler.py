@@ -31,7 +31,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ba2_common.core.knowability import DEFAULT_DECISION_TIME
+from ba2_common.core.knowability import DEFAULT_DECISION_TIME, entry_times_for  # noqa: F401
+
+
+def _is_intraday_interval(interval: Any) -> bool:
+    """m / h / min suffix = an intraday clock (the engine's own split, price_source._is_intraday).
+    A missing interval is read as intraday: the safe side of ``entry_times_for`` (it raises)."""
+    if interval is None:
+        return True
+    iv = str(interval).lower()
+    return iv.endswith("m") or iv.endswith("h") or iv.endswith("min")
 from ba2_common.core.schedule_genes import validate_decision_times
 from app.models import (
     SessionLocal,
@@ -2832,7 +2841,8 @@ def _build_daily_trial_config(
             # the shared default decision time (a new run only: stored rows reconstruct through
             # schedule_genes with their own time).
             "times": (gene_times["entry"] if gene_times
-                      else (base_run_sched or {}).get("times") or [DEFAULT_DECISION_TIME]),
+                      else entry_times_for((base_run_sched or {}).get("times"), stored_row=False,
+                                           intraday=_is_intraday_interval(backtest_cfg.get("execution_interval")))),
         }
     else:
         run_schedule_override = base_run_sched

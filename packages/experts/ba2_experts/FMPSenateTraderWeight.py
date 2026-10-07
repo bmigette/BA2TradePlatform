@@ -1860,6 +1860,14 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             probe = date + timedelta(days=offset)
             if ceiling is not None and probe > ceiling:
                 return None
+            if ceiling is not None and intraday_decision_clock() and probe.date() >= ceiling.date():
+                # INTRADAY clock: the OPEN of the decision's own date is the opening print of a bar
+                # that has not necessarily ended at the decision instant (09:30-09:35 for a 09:30
+                # decision), and the decision-price seam is "the close of the latest ended bar",
+                # not that open. Neither is a knowable DATE price, so the forward return is not
+                # yet known and the trade is dropped from scoring (the same honest outcome as
+                # past the ceiling). A walk that reaches the decision date is cut here.
+                return None
             price = self._get_price_at_date(symbol, probe)
             if price:
                 return price

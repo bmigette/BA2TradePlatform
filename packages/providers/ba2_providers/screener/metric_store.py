@@ -1295,6 +1295,57 @@ def _drop_excluded(d: "pd.DataFrame", excluded_symbols: "Optional[Iterable[str]]
     return d[~d["symbol"].str.upper().isin(both)]
 
 
+# ----------------------------------------------------------------------------------------------
+# THE VISIBILITY RULE for a date-keyed scan (one pure selector; no staleness logic here).
+#
+#   A scan dated S is visible at decision instant T  <=>  every regular session dated <= S has
+#   FINISHED at T  <=>  S is strictly before the earliest session NOT yet finished at T (the session
+#   in progress, or the next one when the market is closed).
+#
+#   Saturday scan S, Monday 10:00 -> Friday is finished, Monday is in progress: VISIBLE (live on Monday
+#   morning has Friday's data). Wednesday scan W: NOT visible on Wednesday until the close (16:05 ok),
+#   visible Thursday. A holiday-dated scan behaves like a weekend-dated one. DAILY clock (``intraday``
+#   False): a decision stamped D uses D's close by convention, so S <= D, exactly as before.
+#   The ``date`` is the date the row's CONTENT is "as of the close of" (a published-on-D series follows
+#   its own convention, see fred_series).
+# ----------------------------------------------------------------------------------------------
+_SCAN_DAY_CAL: Dict[Any, tuple] = {}
+
+
+def scan_cutoff_date(decision_instant: Any, *, intraday: bool):
+    """The latest DATE a scan may carry to be visible at ``decision_instant`` (inclusive): the day
+    before the earliest session not yet finished at the instant (intraday), or the instant's own date
+    (daily clock). ``decision_instant`` is exchange-local wall time (tz label ignored, as the engine's
+    5-minute stamps are); a plain ``date`` is read as that day's midnight."""
+    if isinstance(decision_instant, datetime):
+        wall = decision_instant.replace(tzinfo=None)
+    else:
+        wall = datetime(decision_instant.year, decision_instant.month, decision_instant.day)
+    if not intraday:
+        return wall.date()
+    day = wall.date()
+    ent = _SCAN_DAY_CAL.get(day)
+    if ent is None:
+        from ba2_common.core.market_calendar import (
+            NY_TZ, is_regular_session, next_regular_session, regular_session_close_utc)
+        close = (regular_session_close_utc(day).astimezone(NY_TZ).replace(tzinfo=None)
+                 if is_regular_session(day) else None)
+        ent = _SCAN_DAY_CAL[day] = (close, next_regular_session(day))
+    close, nxt = ent
+    earliest_unfinished = day if (close is not None and wall < close) else nxt
+    return earliest_unfinished - timedelta(days=1)
+
+
+def visible_scan_date(scan_dates_sorted: "List[str]", decision_instant: Any, *, intraday: bool) -> Optional[str]:
+    """The newest scan date (``'YYYY-MM-DD'``) in the ascending ``scan_dates_sorted`` that is VISIBLE
+    at ``decision_instant`` under the rule above, or None when none is. Pure: no staleness check (the
+    store's coverage is the caller's separate question)."""
+    import bisect
+    cutoff = scan_cutoff_date(decision_instant, intraday=intraday).isoformat()
+    i = bisect.bisect_right(scan_dates_sorted, cutoff) - 1
+    return None if i < 0 else scan_dates_sorted[i]
+
+
 def _latest_scan_date_le(store_df: "pd.DataFrame", day: str) -> Optional[str]:
     """The latest scan date in ``store_df`` on or before ``day``, or None if there is none.
 

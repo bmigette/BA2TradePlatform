@@ -152,8 +152,8 @@ class _BacktestProviderBundle(LiveProviderBundle):
 
 def _screened_symbols_for_bar(
     screener_runtime: Optional[Dict[str, Any]], as_of_dt: datetime,
-    cache: Optional[Dict[str, List[str]]] = None,
-    session_date: Optional[date] = None,
+    cache: Optional[Dict[str, List[str]]],
+    *, intraday: bool,
 ) -> Optional[List[str]]:
     """The dynamic per-day universe of symbols ALLOWED TO ENTER on this bar.
 
@@ -189,15 +189,13 @@ def _screened_symbols_for_bar(
     store = screener_runtime["store"]
     df = ms.load_store(store)
     days = ms.scan_dates(df, store_key=store)
-    # ``session_date`` is the newest session whose DAILY data is knowable at this decision
-    # (``AsOfPriceSource.daily_session_date``): the bar's own date on a daily clock, the PRIOR
-    # session on an intraday one -- a scan row dated D is built from D's finished bar, which a
-    # 09:30 decision on D cannot know. Omitted (unit tests / legacy callers) = the bar's date.
-    cutoff = session_date.strftime("%Y-%m-%d") if session_date is not None else as_of_dt.strftime("%Y-%m-%d")
-    i = bisect.bisect_right(days, cutoff) - 1
-    if i < 0:
+    # THE scan visible at this decision (``metric_store.visible_scan_date``): on an intraday clock a
+    # scan dated S is visible iff every session dated <= S has finished at the decision (a Saturday
+    # scan from Monday's open, a Wednesday scan only after Wednesday's close); on a daily clock the
+    # scan dated <= the bar's date, as before. ``intraday`` is REQUIRED: no caller may default it.
+    day = ms.visible_scan_date(days, as_of_dt, intraday=intraday)
+    if day is None:
         return []
-    day = days[i]
     if cache is not None and day in cache:
         return cache[day]
     syms = ms.screen_universe_for_day(df, day, screener_runtime["settings"],
@@ -581,7 +579,7 @@ class DailyBacktestEngine:
         if indicator_provider is None:
             store = (self._screener_runtime or {}).get("store") if self._screener_runtime else None
             indicator_provider = (
-                make_atr_cache_indicator_provider(store, session_date_fn=self.price.daily_session_date)
+                make_atr_cache_indicator_provider(store, session_date_fn=self.price.scan_cutoff_date)
                 or make_indicator_provider())
         self._indicator_provider = indicator_provider
 
@@ -695,7 +693,7 @@ class DailyBacktestEngine:
             #     _check_regime_calendar has already proven no expert depends on.
             #     The calendar's flag for day S is classified from S's CLOSE, so the lookup day is
             #     the newest session whose daily data is knowable at this decision.
-            set_stressed(self._regime_calendar.at(self.price.daily_session_date(as_of_dt))
+            set_stressed(self._regime_calendar.at(self.price.scan_cutoff_date(as_of_dt))
                          if self._regime_calendar else None)
 
             # 2. universe for the bar.
@@ -715,7 +713,7 @@ class DailyBacktestEngine:
             if self._screener_runtime:
                 allowed = _screened_symbols_for_bar(
                     self._screener_runtime, as_of_dt, self._screened_cache,
-                    session_date=self.price.daily_session_date(as_of_dt))
+                    intraday=self.price.is_intraday)
                 if allowed is not None:
                     allowed_set = set(allowed)
                     entry_universe = [s for s in universe if s in allowed_set]

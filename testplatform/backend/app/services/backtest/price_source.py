@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from ba2_common.core.knowability import DecisionPrice
+from ba2_providers.screener.metric_store import scan_cutoff_date as _scan_cutoff
 
 logger = logging.getLogger(__name__)
 
@@ -612,6 +613,7 @@ class AsOfPriceSource:
         self._intraday = _is_intraday(interval)  # cached: interval is constant for a run
         self._clock: Optional[datetime] = None
         self._kde: Optional[datetime] = None     # knowable_daily_end of the CLOCK (set_clock, intraday)
+        self._scan_cut: Optional[date] = None    # scan_cutoff_date of the CLOCK (set_clock, intraday)
         # COLUMNAR bar store. The old store was a per-symbol dict-of-dicts ({key: {"open",...}}) at
         # ~400 bytes/bar — for a screened union × 3yr × 5min that was ~7-9 GB/worker, almost all of
         # it the ~9M tiny inner dicts. Here each symbol keeps a sorted Python key list (date for
@@ -666,6 +668,7 @@ class AsOfPriceSource:
             a = _to_utc(as_of)
             fin = _finished_session_end(a)
             self._kde = min(a, fin)
+            self._scan_cut = _scan_cutoff(a, intraday=True)
             self._dp_floor = (fin.date() - _EPOCH_DATE).days * _NS_PER_DAY
 
     def _dp_index(self, symbol: str) -> int:
@@ -758,6 +761,24 @@ class AsOfPriceSource:
         if not self._intraday:
             return _to_utc(as_of).date()
         return _finished_session_end(_to_utc(as_of)).date()
+
+    def scan_cutoff_date(self, as_of: Any) -> date:
+        """The latest DATE ``S`` such that a date-keyed store row dated ``S`` (content as of the close
+        of ``S``: screener scans, ATR columns, regime flags, factor metrics) is visible at decision
+        ``as_of`` -- INCLUSIVE.
+
+        INTRADAY clock: a row dated S is visible iff EVERY session with date <= S has FINISHED at T,
+        i.e. S is strictly before the earliest session not yet finished (the session in progress, or
+        the next one when the market is closed). So a Saturday scan is visible from Monday's open
+        (Friday is finished), a Wednesday scan only once Wednesday's session is finished (Wednesday
+        16:05 or Thursday), a holiday-dated row like a weekend-dated one. NOT "the last finished
+        session's date" (that lags every weekend-dated scan one session). DAILY clock: the bar's own
+        date, as before (decide on D's close)."""
+        if not self._intraday:
+            return _to_utc(as_of).date()
+        if as_of is self._clock and self._scan_cut is not None:
+            return self._scan_cut
+        return _scan_cutoff(_to_utc(as_of), intraday=True)
 
     def decision_price(self, symbol: str, as_of: Any) -> Optional[float]:
         """The price KNOWABLE at decision instant ``as_of`` from the run's own bar series.
@@ -1307,8 +1328,19 @@ def _to_utc(d: Any) -> datetime:
 
 
 #: per calendar DAY: (that day's close as naive NY wall time or None when it is not a session, the last
-#: session before it). The calendar is consulted once per day of a run, never per tick.
+#: session before it). The calendar is consulted once per day of a run.
 _DAY_CALENDAR: Dict[date, tuple] = {}
+
+
+def _day_calendar(day: date) -> tuple:
+    ent = _DAY_CALENDAR.get(day)
+    if ent is None:
+        from ba2_common.core.market_calendar import (
+            NY_TZ, is_regular_session, prior_regular_session, regular_session_close_utc)
+        close = (regular_session_close_utc(day).astimezone(NY_TZ).replace(tzinfo=None)
+                 if is_regular_session(day) else None)
+        ent = _DAY_CALENDAR[day] = (close, prior_regular_session(day))
+    return ent
 
 
 def _finished_session_end(as_of_utc: datetime) -> datetime:
@@ -1318,18 +1350,11 @@ def _finished_session_end(as_of_utc: datetime) -> datetime:
     The backtest's instants are exchange-local wall time labelled UTC, so the stamp is read as
     New York time and compared with the calendar's own close of the stamp's date (13:00 on a half
     day). On a session day at or after its close that day counts; otherwise the last session
-    before it does (also pre-market, weekends and holidays). Memoised: every symbol of a bar asks
-    for the same instant. Raises rather than guessing when the calendar cannot answer."""
+    before it does (also pre-market, weekends and holidays). Raises rather than guessing when the
+    calendar cannot answer."""
     wall = as_of_utc.replace(tzinfo=None)
     day = wall.date()
-    ent = _DAY_CALENDAR.get(day)
-    if ent is None:
-        from ba2_common.core.market_calendar import (
-            NY_TZ, is_regular_session, prior_regular_session, regular_session_close_utc)
-        close = (regular_session_close_utc(day).astimezone(NY_TZ).replace(tzinfo=None)
-                 if is_regular_session(day) else None)
-        ent = _DAY_CALENDAR[day] = (close, prior_regular_session(day))
-    close, prior = ent
+    close, prior = _day_calendar(day)
     d = day if (close is not None and wall >= close) else prior
     return datetime(d.year, d.month, d.day, 23, 59, 59, 999999, tzinfo=timezone.utc)
 
