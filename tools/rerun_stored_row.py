@@ -33,12 +33,37 @@ SUMMARY = ("total_trades", "total_return", "max_drawdown", "annualized_return", 
            "calmar_ratio", "profit_factor", "final_equity", "buy_hold_return")
 
 
+def parse_window(values):
+    """``--window START END`` -> ``(start, end)`` as ISO ``YYYY-MM-DD`` strings, or ``ValueError``.
+
+    Validated up front, before any DB or engine work: a typo otherwise surfaces minutes later as an
+    unrelated failure deep in the rebuild, or worse as a silently different window."""
+    if values is None:
+        return None
+    from datetime import date
+    if len(values) != 2:
+        raise ValueError(f"--window takes exactly two ISO dates (START END), got {list(values)!r}")
+    parsed = []
+    for label, raw in zip(("START", "END"), values):
+        try:
+            parsed.append(date.fromisoformat(str(raw)))
+        except ValueError:
+            raise ValueError(f"--window {label} {raw!r} is not an ISO date (YYYY-MM-DD)") from None
+    if not parsed[0] < parsed[1]:
+        raise ValueError(f"--window START must be before END, got {values[0]} >= {values[1]}")
+    return values[0], values[1]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("backtest_id", type=int)
     ap.add_argument("--window", nargs=2, metavar=("START", "END"))
     ap.add_argument("--out", help="write the summary (and the stored row's figures) as JSON")
     ns = ap.parse_args()
+    try:
+        ns.window = parse_window(ns.window)
+    except ValueError as e:
+        ap.error(str(e))
 
     from app.models.backtest import Backtest
     from app.models.database import SessionLocal
