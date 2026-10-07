@@ -481,7 +481,7 @@ BASELINE: dict = {
     # growing a second copy of it. The two coercions travelled verbatim.
     "packages/common/ba2_common/core/utils.py": 2,
     "packages/common/ba2_common/core/position_sizing.py": 2,
-    "packages/experts/ba2_experts/DeterministicScorer/__init__.py": 3,
+    "packages/experts/ba2_experts/DeterministicScorer/__init__.py": 2,
     # The three PROMOTED sleeve-reader coercions, moved verbatim out of
     # option_lifecycle_service (whose entry above drops to 0 by exactly this amount): a
     # filled/ordered quantity, a transaction quantity and the contract multiplier, each
@@ -506,7 +506,7 @@ BASELINE: dict = {
     # 0 entry would be a row claiming "this file is fine", which is the one thing BASELINE
     # must never say. Debt paid off leaves the register entirely.
 }
-BASELINE_TOTAL = 166
+BASELINE_TOTAL = 165
 
 
 # =========================================================================== #

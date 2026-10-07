@@ -252,7 +252,7 @@ def _read_day_value(value: Any) -> Any:
     return _INVALID
 
 
-def schedule_weekday_enabled(days: Dict[str, Any], weekday: str) -> bool:
+def schedule_weekday_enabled(days: Optional[Dict[str, Any]], weekday: str) -> bool:
     """Whether ``weekday`` (lower-case name, ``SCHEDULE_DAYS``) is enabled in a schedule's ``days`` dict.
 
     An explicit value is read by meaning (``_read_day_value``); an absent key takes
@@ -261,7 +261,7 @@ def schedule_weekday_enabled(days: Dict[str, Any], weekday: str) -> bool:
     ``schedule_refusal_message``, so this only fires on a path that skipped that check), and
     ``KeyError`` for a name that is not a weekday (a caller bug). Cheap: the backtest calls it per bar.
     """
-    if weekday not in days:
+    if not days or weekday not in days:     # None / {} = every key absent -> the per-day defaults
         return SCHEDULE_DAY_DEFAULTS[weekday]
     read = _read_day_value(days[weekday])
     if read is _INVALID:

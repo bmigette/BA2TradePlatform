@@ -121,7 +121,7 @@ def test_every_testplatform_schedule_builder_passes_the_validation():
 
     built = [launcher._daily_manage_schedule()]
     built += [_run_schedule_override("weekly", d) for d in WEEKDAYS]
-    built += [rh._day_override(d) for d in WEEKDAYS] + [rh._time_override("10:00")]
+    built += [rh._day_override(d, ["10:00"]) for d in WEEKDAYS] + [rh._time_override("10:00")]
     built += [sg.schedule_override_from_genes({f"schedule:{d}": 1}, {"times": ["09:30"]}, weekdays_only=w, option_run=o)
               for d in WEEKDAYS for w in (False, True) for o in (False, True)]
     assert built
@@ -254,7 +254,7 @@ def test_every_testplatform_builder_still_writes_real_booleans():
     from app.api.backtests import _run_schedule_override
     from app.services import robustness_handler as rh
     built = [launcher._daily_manage_schedule()] + [_run_schedule_override("weekly", d) for d in WEEKDAYS]
-    built += [rh._day_override(d) for d in WEEKDAYS] + [rh._time_override("10:00")]
+    built += [rh._day_override(d, ["10:00"]) for d in WEEKDAYS] + [rh._time_override("10:00")]
     built += [sg.schedule_override_from_genes({f"schedule:{d}": 1}, None, weekdays_only=w, option_run=o)
               for d in WEEKDAYS for w in (False, True) for o in (False, True)]
     for schedule in built:
