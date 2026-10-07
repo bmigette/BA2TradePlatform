@@ -144,15 +144,16 @@ def run_monte_carlo_for_backtest(robustness_run_id: int) -> None:
 # ---------------------------------------------------------------------------
 # Schedule variants
 # ---------------------------------------------------------------------------
-def _day_override(weekday: str, times: List[str]) -> Dict[str, Any]:
+def _day_override(weekday: str, times: List[str], intraday: bool = True) -> Dict[str, Any]:
     """run_schedule_override pinning exactly ``weekday`` (weekly entry-day variant) at the PARENT'S
     OWN entry time(s): a day variant changes the weekday only. (It used to pin a fixed 09:30,
-    which silently moved a row decided at another time.)"""
-    if not times:
-        raise ValueError("a day variant needs the parent's entry time(s); the parent states none")
+    which silently moved a row decided at another time.) A DAILY-clock parent (options) states no
+    time and needs none (the engine ignores ``times`` there): the inert legacy label is kept, as
+    before. An intraday parent without a time raises (``knowability.entry_times_for``)."""
+    from ba2_common.core.knowability import entry_times_for
     return {
         "days": {d: (d == weekday) for d in _WEEKDAYS},
-        "times": list(times),
+        "times": entry_times_for(times, stored_row=False, intraday=intraday),
     }
 
 
@@ -164,8 +165,8 @@ def _time_override(hhmm: str) -> Dict[str, Any]:
     }
 
 
-def _schedule_variants(params: Dict[str, Any], parent_times: Optional[List[str]] = None
-                       ) -> List[Dict[str, Any]]:
+def _schedule_variants(params: Dict[str, Any], parent_times: Optional[List[str]] = None,
+                       intraday: bool = True) -> List[Dict[str, Any]]:
     """Build the list of ``{variant, override}`` from the run params.
 
     * ``day_variants=True`` -> one weekly-entry-day variant per Mon..Fri, at ``parent_times``.
@@ -174,7 +175,7 @@ def _schedule_variants(params: Dict[str, Any], parent_times: Optional[List[str]]
     out: List[Dict[str, Any]] = []
     if params.get("day_variants"):
         for wd in _TRADING_DAYS:
-            out.append({"variant": f"day-{wd}", "override": _day_override(wd, parent_times or [])})
+            out.append({"variant": f"day-{wd}", "override": _day_override(wd, parent_times or [], intraday)})
     for t in (params.get("time_variants") or []):
         out.append({"variant": f"time-{t}", "override": _time_override(t)})
     return out
@@ -209,7 +210,9 @@ def launch_schedule_variants(robustness_run_id: int) -> List[int]:
             parent_times = list(((parent_cfg.get("run_schedule_override") or {}).get("times")) or [])
 
             base_sp = copy.deepcopy(bt.strategy_params or {})
-            variants = _schedule_variants(run.params or {}, parent_times)
+            _iv = str(parent_cfg.get("execution_interval") or "").lower()
+            variants = _schedule_variants(run.params or {}, parent_times,
+                                          _iv.endswith("m") or _iv.endswith("h") or _iv.endswith("min"))
             if not variants:
                 raise ValueError("no schedule variants requested (day_variants/time_variants both empty)")
 

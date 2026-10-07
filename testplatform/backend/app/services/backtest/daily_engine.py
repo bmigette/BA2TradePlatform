@@ -129,6 +129,9 @@ def resolve_universe(as_of: datetime, config: Dict[str, Any], price_source) -> L
     return [s for s in universe if price_source.bar_at(s, as_of) is not None]
 
 
+_FIRST_BAR_WARNED: set = set()   # schedule times already warned about in this process
+
+
 class _BacktestProviderBundle(LiveProviderBundle):
     """``LiveProviderBundle`` whose ``price_at_date`` is the price KNOWABLE at the decision.
 
@@ -984,6 +987,11 @@ class DailyBacktestEngine:
             sched = self._entry_schedule(expert) or {}
             hit = sorted(set(sched.get("times") or ()) & first_bar_hhmm)
             if hit:
+                # ONCE PER PROCESS (a GA worker is one job's process, running many trials): the
+                # same schedule time would otherwise print one warning per trial.
+                if tuple(hit) in _FIRST_BAR_WARNED:
+                    return
+                _FIRST_BAR_WARNED.add(tuple(hit))
                 logger.warning(
                     f"[daily_engine] entry schedule time {hit} equals the first bar of a session: "
                     f"a decision at the session open sees the PRIOR session's close (no pre-market "

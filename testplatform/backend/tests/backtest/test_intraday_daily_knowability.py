@@ -270,8 +270,11 @@ def test_a_decision_on_the_first_bar_warns_and_a_later_one_does_not(monkeypatch)
     from app.services.backtest import daily_engine
 
     seen = []
+    daily_engine._FIRST_BAR_WARNED.clear()
     monkeypatch.setattr(daily_engine.logger, "warning", lambda msg, *a, **k: seen.append(str(msg)))
     _run("5min", 710, times=["09:30"])
+    assert sum("first bar of a session" in m for m in seen) == 1
+    _run("5min", 712, times=["09:30"])          # a second trial of the same job: no second warning
     assert sum("first bar of a session" in m for m in seen) == 1
     seen.clear()
     _run("5min", 711, times=["09:40"])

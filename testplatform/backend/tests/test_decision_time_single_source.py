@@ -55,7 +55,14 @@ def test_a_robustness_day_variant_keeps_the_parents_time():
     assert len(out) == 5 and all(v["override"]["times"] == ["09:40"] for v in out)
 
 
-def test_a_robustness_day_variant_refuses_a_parent_without_a_time():
+def test_a_robustness_day_variant_refuses_an_intraday_parent_without_a_time():
     from app.services.robustness_handler import _schedule_variants
     with pytest.raises(ValueError):
-        _schedule_variants({"day_variants": True}, [])
+        _schedule_variants({"day_variants": True}, [], True)
+
+
+def test_a_robustness_day_variant_on_a_daily_clock_needs_no_time():
+    """Options / daily-clock parents state no time; the engine ignores it there: variants still work."""
+    from app.services.robustness_handler import _schedule_variants
+    out = _schedule_variants({"day_variants": True}, [], False)
+    assert len(out) == 5 and all(v["override"]["times"] for v in out)
