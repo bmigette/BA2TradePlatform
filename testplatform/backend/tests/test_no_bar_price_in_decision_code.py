@@ -135,6 +135,10 @@ SITES = {
         "engine imports an exception type (5 sites)",
     (f"{ENG}/daily_engine.py", "price_at_date", "return super().price_at_date(symbol, as_of)"):
         "_BacktestProviderBundle: the daily-clock historical close (identical to the live bundle); intraday goes to the account",
+    (f"{ENG}/market_condition_bt.py", "source-import", "from app.services.backtest.price_source import _is_intraday"):
+        "imports the interval classifier (is the run intraday?), not a price",
+    (f"{ENG}/seam_wiring.py", "source-import", "from app.services.backtest.price_source import _is_intraday"):
+        "imports the interval classifier (is the run intraday?), not a price",
     (f"{ENG}/parity_harness.py", "source-import", "from app.services.backtest.price_source import AsOfPriceSource"):
         "the parity harness builds a price source fixture",
 }
