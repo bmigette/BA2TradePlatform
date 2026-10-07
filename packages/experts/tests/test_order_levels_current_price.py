@@ -44,7 +44,10 @@ def test_deterministic_scorer_uses_the_seam_not_its_daily_frame():
     assert 'df["Close"].iloc[-1]' not in src
 
 
-def test_seam_live_is_the_quote_and_backtest_is_the_bundle():
+def test_seam_is_the_account_live_and_backtest_and_the_bundle_only_without_an_account():
+    """ONE path: the account interface. Live -> the quote; backtest -> the run's account (its decision
+    price); the bundle's historical close is reachable ONLY for a bundle with no account behind it (the
+    historical-replay tool)."""
     e = DeterministicScorer.__new__(DeterministicScorer)
     seen = []
     e._get_current_price = lambda s: seen.append(("quote", s)) or 111.0
@@ -54,9 +57,18 @@ def test_seam_live_is_the_quote_and_backtest_is_the_bundle():
             seen.append(("bundle", s, as_of))
             return 99.0
 
-    assert e._decision_price(B(), "X", None) == 111.0
-    assert e._decision_price(B(), "X", NOW) == 99.0
-    assert seen == [("quote", "X"), ("bundle", "X", NOW)]
+    class Acct:
+        def get_instrument_current_price(self, s):
+            seen.append(("account", s))
+            return 105.0
+
+    bundle = B()
+    assert e._decision_price(bundle, "X", None) == 111.0
+    e._decision_account_cache = (bundle, Acct())
+    assert e._decision_price(bundle, "X", NOW) == 105.0                 # backtest: the account
+    e._decision_account_cache = (bundle, None)
+    assert e._decision_price(bundle, "X", NOW) == 99.0                  # no account: replay fallback
+    assert seen == [("quote", "X"), ("account", "X"), ("bundle", "X", NOW)]
 
 
 # ----------------------------------------------------------------------------- (b) DeterministicScorer
