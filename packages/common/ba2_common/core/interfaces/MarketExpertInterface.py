@@ -2204,17 +2204,24 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             return _BP_UNREADABLE, None, None
 
         info = None
-        try:
-            info = account.get_account_info()
-        except Exception as e:
-            absorb_if_benign(e)
-            error = e
-            failed += 1
+        info_fn = getattr(account, "get_account_info", None)
+        if not callable(info_fn):
+            # An account (a duck-typed double, a third-party adapter) with no info source at all: this
+            # source does not exist, which is neither an answer nor a failure -- the snapshot (answered
+            # or failed above) decides alone. Same as dev, where the missing method was swallowed.
+            pass
         else:
-            if info is None or (hasattr(info, "__len__") and len(info) == 0):
-                failed += 1             # None (Alpaca) / {} (TastyTrade, IBKR): a failed read
+            try:
+                info = info_fn()
+            except Exception as e:
+                absorb_if_benign(e)
+                error = e
+                failed += 1
             else:
-                answered += 1
+                if info is None or (hasattr(info, "__len__") and len(info) == 0):
+                    failed += 1             # None (Alpaca) / {} (TastyTrade, IBKR): a failed read
+                else:
+                    answered += 1
 
         def _field(obj: Any, name: str) -> Optional[float]:
             val = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
