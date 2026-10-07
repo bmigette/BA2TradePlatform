@@ -92,6 +92,40 @@ def with_decision_times_name(name: str, times: "list | None") -> str:
     return name + DECISION_TIMES_NAME_TOKEN if times and DECISION_TIMES_NAME_TOKEN not in name else name
 
 
+#: The STATIC-UNIVERSE rule of a ``--screener`` job is part of its identity (the launcher builds the
+#: true superset, ``ba2_providers.screener.universe_superset.RULE_ID``). A job name WITHOUT this token was
+#: launched under the old cap-ranked top-50 rule: its completed row, its skip-completed check and its
+#: checkpoint (also fingerprinted, see ``checkpoint_fingerprint``) must never be taken for a superset-
+#: universe job's. Appended to EVERY screener job name by the cap-band driver.
+UNIVERSE_RULE_NAME_TOKEN = "-sup1"
+
+
+def with_universe_rule_name(name: str) -> str:
+    """``name`` with the superset-universe-rule token appended (idempotent)."""
+    return name if UNIVERSE_RULE_NAME_TOKEN in name else name + UNIVERSE_RULE_NAME_TOKEN
+
+
+def screener_dry_run_universe_note(store: str, band: str, start: str, end: str, interval: str,
+                                   _memo: dict = {}) -> str:
+    """The static-universe size of one screener job for a driver's dry-run line, e.g.
+    ``static universe 2135 symbols`` (+ the uncached names that would REFUSE the launch). Memoised per
+    (store, band, start, end, interval). Never silent: an error is printed as the note itself."""
+    key = (store, band, start, end, interval)
+    if key not in _memo:
+        try:
+            from ba2_providers.screener.universe_superset import preview_static_universe
+            r = preview_static_universe(store, band, start, end, interval)
+            note = f"static universe {r['size']} symbols"
+            if r["uncached"]:
+                note += (f"; {len(r['uncached'])} UNCACHED ({', '.join(r['uncached'][:8])}"
+                         f"{'...' if len(r['uncached']) > 8 else ''}): launch REFUSES unless "
+                         f"--exclude-uncached")
+        except Exception as e:  # noqa: BLE001 - dry-run diagnostics must say why, not vanish
+            note = f"static universe UNAVAILABLE ({type(e).__name__}: {e})"
+        _memo[key] = note
+    return _memo[key]
+
+
 def job_name_with_digest(name: str, cmd: List[str]) -> str:
     """``name``, or ``name-d<digest>`` when ``cmd`` carries any token beyond the driver's base
     invocation (i.e. the caller only invokes this once it has decided a digest is warranted —

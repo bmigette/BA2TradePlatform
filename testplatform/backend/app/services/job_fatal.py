@@ -10,6 +10,8 @@ from typing import Any
 #:   AnalysisFailureRefusal -- more than 5% of an expert's analysis passes raised (owner decision
 #:                             2026-10-07: "it should fail the job for analysis");
 #:   StaleAnchorPrice       -- the intraday anchor-price (look-ahead) guard was violated;
+#:   ScreenerUniverseRefusal -- the screener gate selected symbols outside the job's static universe
+#:                             (the superset derivation is wrong: every genome's result omits tradable picks);
 #:   StaleMarkToMarket / ComboSettlementRefused -- engine-level refusals that already end the run.
 JOB_FATAL_ERROR_TYPES = frozenset({
     "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
@@ -18,6 +20,7 @@ JOB_FATAL_ERROR_TYPES = frozenset({
     "MarketCalendarUnavailable", "NotARegularSession", "RiskFreeRateUnavailable",
     "MacroAvailabilityUnknown",
     "AnalysisFailureRefusal", "StaleAnchorPrice", "StaleMarkToMarket", "ComboSettlementRefused",
+    "ScreenerUniverseRefusal",
 })
 
 

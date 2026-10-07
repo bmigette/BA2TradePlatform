@@ -498,9 +498,9 @@ def test_driver_dry_run_default_carries_the_decision_time_gene_in_every_classic_
     assert result.returncode == 0, result.stderr
     assert "decision times (GA gene schedule:time): 09:35,09:40,09:45,10:00,12:00,15:30,15:45" \
         in result.stdout
-    assert re.search(r"scr-large-FMPRating-S1-from2022-timegene-d[0-9a-f]{12}", result.stdout)
+    assert re.search(r"scr-large-FMPRating-S1-from2022-timegene-sup1-d[0-9a-f]{12}", result.stdout)
     # the bypass FactorRanker job keeps its plain name: it has no schedule genes
-    assert re.search(r"(TODO|DONE)\s+scr-large-FactorRanker\s", result.stdout)
+    assert re.search(r"(TODO|DONE)\s+scr-large-FactorRanker-sup1\s", result.stdout)
 
 
 

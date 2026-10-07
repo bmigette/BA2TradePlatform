@@ -608,6 +608,10 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         # Screener (universe.mode=='screener'): per-bar metric_store entry gate (point-in-time,
         # cached) — same mechanism the optimizer uses. None for static runs (engine gate no-op).
         "screener_runtime": _build_screener_runtime(payload),
+        # The universe above is the union of THIS run's own screen over the visible scans, so the gate
+        # can never select outside it: the guard REFUSES if it ever does (None for static runs).
+        "screener_universe_guard": ("refuse" if (payload.get("universe") or {}).get("mode") == "screener"
+                                    else None),
         # A standalone (API/CLI) backtest is PERSISTED: its option trade rows carry the option
         # trade record (see results.require_option_trade_records).
         "option_trade_records": True,
@@ -646,8 +650,12 @@ def _resolve_enabled_instruments(
         # still restricts entries each bar; this only bounds what OHLCV gets loaded.
         df = ms.load_store(store)
         settings = _metric_store_settings(universe.get("screener_settings") or {})
-        instruments = ms.screened_symbol_union(
-            df, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), settings
+        # The scans the per-decision gate can resolve to (visible_scan_window), not "last scan <= start":
+        # on an intraday clock the first decision of start_day reads the scan dated BEFORE it.
+        from ba2_providers.screener.universe_superset import interval_is_intraday
+        instruments = ms.screened_symbol_union_visible(
+            df, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), settings,
+            intraday=interval_is_intraday(payload.get("execution_interval", "1d")),
         )
         if not instruments:
             raise ValueError(
@@ -1044,6 +1052,10 @@ def run_daily_backtest(
             # (and were skipped per symbol / per bar) traded nothing for a reason that is not the
             # strategy. Refuse the run (no result, no fitness; a GA trial reports "trial failed").
             engine.refuse_if_analysis_failing()
+            # ...and at the universe level: a gate selection outside the loaded static universe is a pick
+            # the run could never trade (the screener-universe bug). Refused (job-fatal) under the
+            # superset rule; a legacy frozen list only warns.
+            engine.refuse_if_screener_universe_outside()
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).
             results = build_results(account, config)
@@ -1075,6 +1087,9 @@ def run_daily_backtest(
             # single chokepoint every path goes through (trial worker, master top-N persist,
             # parallel=1), so both compute_fitness call sites get it without touching either.
             results["analysis_failures"] = engine.analysis_failures_record()
+            _su_rec = engine.screener_universe_record()
+            if _su_rec is not None:
+                results["screener_universe"] = _su_rec
             results.update(_car_trade_thresholds_for_experts(config))
             _record = _decision_time_record(engine, config)
             if _record is not None:

@@ -142,9 +142,10 @@ def test_dry_run_default_decision_time_gene_renames_classic_jobs_only(monkeypatc
     rc, out = _run_dry(monkeypatch, capsys, [])
     assert rc == 0
     fmp = [ln for ln in out.splitlines() if "scr-large-FMPRating-S1" in ln and "TODO" in ln]
-    assert len(fmp) == 1 and re.search(r"-timegene-d[0-9a-f]{12}\b", fmp[0]), fmp
+    # (every --screener job name also carries the static-universe rule token, ``-sup1``)
+    assert len(fmp) == 1 and re.search(r"-timegene-sup1-d[0-9a-f]{12}\b", fmp[0]), fmp
     fr = [ln for ln in out.splitlines() if ln.strip().startswith("TODO") and "FactorRanker" in ln]
-    assert len(fr) == 1 and "scr-large-FactorRanker " in fr[0] and "timegene" not in fr[0], fr
+    assert len(fr) == 1 and "scr-large-FactorRanker-sup1 " in fr[0] and "timegene" not in fr[0], fr
 
 
 def test_dry_run_with_exclude_symbols_digests_every_job_name(monkeypatch, capsys):

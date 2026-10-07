@@ -26,11 +26,15 @@ ap.add_argument("--window", nargs=2, required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--decision-time")
 ap.add_argument("--profile")
+ap.add_argument("--recompute-universe", action="store_true",
+                help="re-run with the static universe recomputed under the corrected superset rule")
 ns = ap.parse_args()
 
 argv = ["rerun_stored_row.py", str(ns.backtest_id), "--window", *ns.window, "--out", ns.out + ".rerun.json"]
 if ns.decision_time:
     argv += ["--decision-time", ns.decision_time]
+if ns.recompute_universe:
+    argv += ["--recompute-universe"]
 sys.argv = argv
 import rerun_stored_row as R  # noqa: E402  (enters the backend)
 from app.services.backtest import daily_engine as DE  # noqa: E402
@@ -84,6 +88,10 @@ try:
 except Exception:  # noqa: BLE001
     pass
 res = {"row": ns.backtest_id, "window": ns.window, "decision_time": ns.decision_time, "rc": rc,
+       "recompute_universe": ns.recompute_universe,
+       "screener_universe": rerun.get("screener_universe"),
+       "preload_symbols": (json.loads(Path(ns.out + ".rerun.json").read_text()).get("preload_symbols")
+                           if Path(ns.out + ".rerun.json").exists() else None),
        "wall_s": round(wall, 2), "cpu_s": round(cpu, 2),
        "load1_start": round(load0, 2), "load1_end": round(load1, 2),   # a noisy run is recognised by these
        "peak_rss_mb": round(ru.ru_maxrss / 1024.0, 1),      # Linux: KB; the server is Linux

@@ -157,6 +157,20 @@ class AnalysisFailureRefusal(RuntimeError):
         self.expert_id, self.passes, self.failed, self.first_error = expert_id, passes, failed, first_error
 
 
+class ScreenerUniverseRefusal(RuntimeError):
+    """The per-decision screener gate selected symbols that are NOT in the run's static universe.
+
+    JOB-FATAL (``job_fatal.JOB_FATAL_ERROR_TYPES``): under the superset rule
+    (``ba2_providers.screener.universe_superset``) the static universe contains every symbol any genome's
+    gate can select, so a non-zero count means the superset logic is wrong again (or the cache/exclusion
+    handling changed the list): every genome's result would silently omit tradable picks. The counts travel
+    in the message because a worker returns the TYPE NAME and the text."""
+
+    def __init__(self, message: str, *, gate_selected: int = 0, outside: int = 0, examples: Any = None):
+        super().__init__(message)
+        self.gate_selected, self.outside, self.examples = gate_selected, outside, examples
+
+
 _FIRST_BAR_WARNED: set = set()   # schedule times already warned about in this process
 
 
@@ -512,6 +526,16 @@ class DailyBacktestEngine:
         # set only changes per scan date (weekly cadence), so it's computed once per scan date and
         # reused for every bar in that period (vs recomputing the full-store filter every 5min bar).
         self._screened_cache: Dict[str, List[str]] = {}
+        # SCREENER UNIVERSE GUARD. ``screener_universe_guard`` is "refuse" | "warn" | absent/None. Absent by
+        # design for every run that is not a screener-universe job (no gate, a gate-only run, a bypass
+        # expert), so its absence means "not applicable", not "forgotten" (CLAUDE.md no-defaults rule is
+        # about required config). Counts every gate selection against the run's LOADED universe.
+        self._su_mode = config["screener_universe_guard"] if "screener_universe_guard" in config else None
+        if self._su_mode not in (None, "refuse", "warn"):
+            raise ValueError(f"screener_universe_guard must be 'refuse', 'warn' or None, got {self._su_mode!r}")
+        self._su_loaded = frozenset(config["enabled_instruments"]) if self._su_mode else frozenset()
+        self._su = {"decisions": 0, "gate_selected": 0, "outside_static_universe": 0,
+                    "first_examples": [], "_last_as_of": None}
         # BYPASS-expert (FactorRanker) per-run manager cache. The portfolio manager
         # holds only run-CONSTANT state (the resolver expert/account instances + ids), so building
         # it ONCE per expert avoids an ExpertInstance DB query on every rebalance bar.
@@ -1012,9 +1036,54 @@ class DailyBacktestEngine:
                 self._screener_runtime, as_of_dt, self._screened_cache,
                 intraday=self.price.is_intraday)
             if allowed is not None:
+                if self._su_mode:
+                    self._note_screener_selection(allowed, as_of_dt)
                 allowed_set = set(allowed)
                 entry_universe = [s for s in universe if s in allowed_set]
         return universe, entry_universe
+
+    def _note_screener_selection(self, allowed: List[str], as_of_dt: datetime) -> None:
+        """Count one decision's gate selection against the run's loaded universe (once per distinct
+        decision instant: several experts share it)."""
+        g = self._su
+        if g["_last_as_of"] == as_of_dt:
+            return
+        g["_last_as_of"] = as_of_dt
+        g["decisions"] += 1
+        g["gate_selected"] += len(allowed)
+        for sym in allowed:
+            if sym not in self._su_loaded:
+                g["outside_static_universe"] += 1
+                if len(g["first_examples"]) < 10 and all(e["symbol"] != sym for e in g["first_examples"]):
+                    g["first_examples"].append({"symbol": sym, "as_of": str(as_of_dt)})
+
+    def screener_universe_record(self) -> Optional[Dict[str, Any]]:
+        """``results["screener_universe"]``, or None when the guard does not apply to this run."""
+        if not self._su_mode:
+            return None
+        g = self._su
+        return {"mode": self._su_mode, "decisions": g["decisions"], "gate_selected": g["gate_selected"],
+                "outside_static_universe": g["outside_static_universe"],
+                "first_examples": list(g["first_examples"])}
+
+    def refuse_if_screener_universe_outside(self) -> None:
+        """RAISE ``ScreenerUniverseRefusal`` when the gate selected any symbol outside the loaded
+        universe and the guard is 'refuse'; with 'warn' (a stored pre-superset row that keeps its frozen
+        list) log ONE loud WARNING with the counts instead."""
+        rec = self.screener_universe_record()
+        if rec is None or not rec["outside_static_universe"]:
+            return
+        msg = (f"{rec['outside_static_universe']} of {rec['gate_selected']} screener gate selections over "
+               f"{rec['decisions']} decisions are NOT in the run's static universe "
+               f"({len(self._su_loaded)} symbols loaded) and could never be traded; first: {rec['first_examples']}")
+        if self._su_mode == "refuse":
+            raise ScreenerUniverseRefusal(
+                f"Backtest refused: {msg}. Under the superset rule the static universe holds every "
+                f"symbol any genome's gate can select, so the superset derivation is wrong or the list "
+                f"was altered.", gate_selected=rec["gate_selected"], outside=rec["outside_static_universe"],
+                examples=rec["first_examples"])
+        logger.warning(f"[daily_engine] SCREENER UNIVERSE (legacy frozen list, results are NOT "
+                       f"comparable with a superset-universe run): {msg}")
 
     def _analysis_pass(self, expert_id: int) -> None:
         rec = self.__dict__.setdefault("analysis_failures", {}).setdefault(expert_id, {"passes": 0, "failed": 0, "first_error": None})
