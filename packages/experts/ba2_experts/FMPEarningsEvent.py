@@ -683,8 +683,7 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
                 # 0 is FMP's "no count published", not a real zero-analyst estimate.
                 analyst_count = int(count) if count else None
 
-        current_price = (self._get_current_price(symbol) if as_of is None
-                         else providers.price_at_date(symbol, as_of))
+        current_price = self._decision_price(providers, symbol, as_of)
 
         # Task 8: the implied-move leg. ONE chain read, only for a symbol that HAS an
         # upcoming event -- see _fetch_implied_leg for the duck-typed seam and every

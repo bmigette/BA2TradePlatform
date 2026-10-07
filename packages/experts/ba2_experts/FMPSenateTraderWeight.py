@@ -836,8 +836,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
         # Live (as_of=None) reads the account/broker quote (the original live
         # source); backtest (as_of set) reads the OHLCV close-at-as_of.
-        current_price = (self._get_current_price(symbol) if as_of is None
-                         else providers.price_at_date(symbol, as_of))
+        current_price = self._decision_price(providers, symbol, as_of)
         return {
             "all_trades": all_trades,
             # still-held ONLY -- see the note where this is built; the windowed set hides
@@ -1078,7 +1077,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
                 # Preserve backtest price resolution and exception isolation. Live quotes
                 # are resolved in one account batch AFTER all historical preparation below.
-                current_price = (providers.price_at_date(symbol, as_of)
+                current_price = (self._decision_price(providers, symbol, as_of)
                                  if as_of is not None else None)
             except cache_miss_excs as e:
                 # UNPREWARMED symbol discovered dynamically from the live disclosure feed --

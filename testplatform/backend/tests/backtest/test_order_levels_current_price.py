@@ -121,6 +121,83 @@ def test_guard_never_fires_off_the_intraday_clock():
         assert require_decision_price(101.5, what="TP") == 101.5
 
 
+def test_an_intraday_engine_run_sizes_and_stops_on_the_decision_price(monkeypatch):
+    """End to end on the 5-minute clock: a BUY recommendation is sized by the risk manager and gets
+    its safeguard stop; every guarded builder accepts what the engine hands it (no StaleAnchorPrice)
+    and the order is placed."""
+    from ba2_common.core.types import OrderRecommendation, Recommendation
+    from app.services.backtest.backtest_account import BacktestAccount
+    from tests.backtest import test_intraday_daily_knowability as k
+
+    calls = []
+
+    def analyze_as_of(self, as_of, context):
+        px = context.providers.price_at_date(k.SYMBOL, as_of)
+        calls.append((as_of, px))
+        return Recommendation(signal=OrderRecommendation.BUY, confidence=80.0, current_price=px,
+                              details="buy", expected_profit_percent=4.0)
+
+    monkeypatch.setattr(k._ProbeExpert, "analyze_as_of", analyze_as_of)
+    orig_save = k._ProbeExpert.save_settings
+    monkeypatch.setattr(k._ProbeExpert, "save_settings", lambda self, s: orig_save(self, {
+        **s, "sizing_mode": ("risk_atr", "str"), "risk_per_trade_pct": (8.0, "float"),
+        "min_stop_loss_pct": (8.0, "float"), "use_atr_stop": (False, "bool")}))
+    from ba2_common.core import TradeRiskManagement as trm, position_sizing as psz
+    guarded = []
+    for mod in (trm, psz):
+        orig_guard = mod.require_decision_price
+
+        def counting(price, _orig=orig_guard, **kw):
+            guarded.append((kw.get("what"), type(price).__name__))
+            return _orig(price, **kw)
+
+        monkeypatch.setattr(mod, "require_decision_price", counting)
+    placed = []
+    real = BacktestAccount.submit_order
+
+    def spy(self, trading_order, *a, **kw):
+        placed.append((trading_order.symbol, trading_order.quantity, trading_order.stop_price))
+        return real(self, trading_order, *a, **kw)
+
+    monkeypatch.setattr(BacktestAccount, "submit_order", spy)
+    k._run("5min", 996, times=["09:40"])
+    assert guarded, f"the guarded sizing path was not exercised (placed={placed}, analysed={calls})"
+    assert {t for _w, t in guarded} == {"DecisionPrice"}, guarded
+    assert placed, f"no order reached the account (guards ran: {guarded})"
+    assert all(q and q > 0 for _s, q, _sl in placed)
+
+
+def _mc_resolver():
+    from ba2_common.core.market_calendar import regular_sessions_ending_at
+    from tests.backtest.test_market_condition_bt_context import _reader, _source
+    from app.services.backtest.market_condition_bt import BacktestMarketConditionResolver
+    daily = _source({"AAA": regular_sessions_ending_at(date(2025, 7, 31), 200)})
+    return BacktestMarketConditionResolver(_reader(daily))
+
+
+def test_market_condition_gate_reads_the_last_finished_session_on_an_intraday_clock():
+    """The gate reads the daily row of ``prior_session`` (close, high, low, ATR ...). On an intraday
+    clock the calendar date of the clock IS the decision session, whose row is unknown until its
+    close: a 10:00 decision on Tue 2025-06-03 must read Mon 06-02's row, never 06-03's."""
+    from types import SimpleNamespace
+    resolver = _mc_resolver()
+    intr = AsOfPriceSource(ohlcv_provider=None, interval="5min")
+    intr.set_clock(_wall(2025, 6, 3, 10, 0))
+    ctx = resolver(SimpleNamespace(_as_of_date=lambda: date(2025, 6, 3), _price=intr), "AAA", None)
+    assert ctx.prior_session == date(2025, 6, 2)
+    assert ctx.session_label == date(2025, 6, 3)
+    intr.set_clock(_wall(2025, 6, 4, 10, 0))                       # a new session -> a new context
+    ctx2 = resolver(SimpleNamespace(_as_of_date=lambda: date(2025, 6, 4), _price=intr), "AAA", None)
+    assert ctx2.prior_session == date(2025, 6, 3)
+
+
+def test_market_condition_gate_is_unchanged_on_the_daily_clock():
+    from types import SimpleNamespace
+    daily = AsOfPriceSource(ohlcv_provider=None, interval="1d")
+    ctx = _mc_resolver()(SimpleNamespace(_as_of_date=lambda: date(2025, 6, 3), _price=daily), "AAA", None)
+    assert (ctx.prior_session, ctx.session_label) == (date(2025, 6, 3), date(2025, 6, 4))
+
+
 def test_the_daily_clock_price_is_unchanged_and_unmarked():
     ps = AsOfPriceSource(ohlcv_provider=None, interval="1d")
     ps.load_bars("X", [{"Date": datetime(2024, 1, 2), "Open": 1.0, "High": 2.0, "Low": 0.5, "Close": 1.5,

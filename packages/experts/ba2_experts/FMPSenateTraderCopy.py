@@ -163,10 +163,7 @@ class FMPSenateTraderCopy(AnalysisStatusRenderMixin, FMPCongressTradingMixin, Ma
         }
         # Live (as_of=None) reads the account/broker quote per symbol (the original
         # live source); backtest (as_of set) reads the OHLCV close-at-as_of.
-        if as_of is None:
-            current_price_map = {s: self._get_current_price(s) for s in all_syms}
-        else:
-            current_price_map = {s: providers.price_at_date(s, as_of) for s in all_syms}
+        current_price_map = {s: self._decision_price(providers, s, as_of) for s in all_syms}
         supported = {s for s, p in current_price_map.items() if p}
         return {
             "senate_trades": senate,

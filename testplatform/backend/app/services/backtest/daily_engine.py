@@ -136,7 +136,7 @@ class _BacktestProviderBundle(LiveProviderBundle):
     own FINISHED close at 09:30 (and, once daily reads honour knowability, merely yesterday's
     close, which is not what live's quote returns at 09:30 either). On an intraday clock this
     answers from the run's own intraday series via ``AsOfPriceSource.decision_price`` -- the
-    open of the decision bar. On a daily clock it is the inherited read, unchanged.
+    close of the latest bar that has ENDED at the decision instant. On a daily clock it is the inherited read, unchanged.
     """
 
     def __init__(self, get_provider: Callable[..., Any], price_source: Any):

@@ -389,7 +389,8 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
 
         as_of=None => latest (live). Point-in-time is enforced by the provider
         interfaces (as_of_date/end_date semantics) and by slicing OHLCV to
-        <= as_of. The bundle carries current_price (the as_of close).
+        <= as_of. The bundle carries current_price: the DECISION price via ``_decision_price``
+        (live quote / backtest decision price), never the daily frame's last close.
         """
         symbol = self._gather_symbol
         df = data.fetch_ohlcv(providers, symbol, as_of)

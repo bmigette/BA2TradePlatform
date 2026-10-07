@@ -435,7 +435,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
                             if consensus_data is not None else None)
             if consensus_data is not None and max_age > 0:
                 analyst_grades = self._fetch_analyst_grades(symbol)
-            current_price = providers.price_at_date(symbol, as_of)
+            current_price = self._decision_price(providers, symbol, as_of)
         return {"consensus_data": consensus_data, "upgrade_data": upgrade_data,
                 "current_price": current_price, "symbol": symbol,
                 "analyst_grades": analyst_grades}

@@ -116,6 +116,14 @@ class BacktestMarketConditionResolver:
     def __call__(self, account: Any, instrument_name: str,
                  expert_recommendation: Any) -> Optional[MarketConditionContext]:
         bar = account._as_of_date()
+        ps = getattr(account, "_price", None)
+        if getattr(ps, "is_intraday", False):
+            # INTRADAY clock: the gate is a function of the last FINISHED session. The calendar
+            # date of the clock is the decision session itself, whose daily row (close, high,
+            # low, ATR, close_vs_prior_high_20_atr) is unknown until its close; reading it at
+            # 09:30..15:55 is a look-ahead. Same rule as the screener scan day, the regime
+            # calendar and the metric-store ATR (``daily_session_date``). Daily clock: unchanged.
+            bar = ps.daily_session_date(ps.now())
         ctx = self._ctx
         if ctx is not None and self._ctx_bar == bar:
             return ctx
