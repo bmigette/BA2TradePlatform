@@ -8,7 +8,7 @@ from __future__ import annotations
 import importlib
 import os
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -76,6 +76,12 @@ class _Provider(FMPOHLCVProvider):
 
     def _split_calendar(self, symbol, interval):
         return list(self.splits)
+
+    def _unproven_tail_days(self, df, symbol, interval, provider_name):
+        # These tests pin the in-tree provisional-bar WRAPPER (``prov``) and the guard as it was.
+        # The base class's own mtime self-heal (ohlcv_final_bars) would repair the same files before
+        # either is reached; it is pinned in packages/providers/tests/test_ohlcv_no_unfinished_bars.py.
+        return []
 
 
 class _Fixed(_Provider):
@@ -362,6 +368,10 @@ def test_a_refused_symbol_does_not_cost_an_extra_vendor_call_within_the_memo(act
 
 
 def test_only_daily_bars_are_wrapped(monkeypatch):
+    # daily-labelled frames stand in for weekly/monthly ones here; with the clock moved on, every
+    # bar is final under the finality rule too, so only the WRAPPER's interval gate is under test
+    from ba2_common.core import ohlcv_final_bars
+    monkeypatch.setattr(ohlcv_final_bars, "now_utc", lambda: datetime(2030, 1, 1, tzinfo=timezone.utc))
     seen = []
     monkeypatch.setattr(prov, "repair_provisional_bars", lambda *a, **k: seen.append(1) or (a[1], []))
     vendor, cached = _settled_mismatch_world("AMD")           # the guard refuses -> repair would run

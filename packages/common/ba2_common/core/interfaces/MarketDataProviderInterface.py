@@ -17,6 +17,7 @@ from ba2_common.logger import logger
 from ba2_common import config
 from ba2_common.core.provider_utils import log_provider_call, validate_date_range
 from ba2_common.core.interfaces.DataProviderInterface import DataProviderInterface
+from ba2_common.core import ohlcv_final_bars
 from ba2_common.core.replay.observe import observe_provider
 from ba2_common.core.replay.schemas import ReplayStatus
 
@@ -365,6 +366,19 @@ class MarketDataProviderInterface(DataProviderInterface):
             logger.error(f"Failed to delete cache file {cache_file}: {e}")
             return False
     
+    def _save_final_bars_cache(self, data: pd.DataFrame, symbol: str, interval: str,
+                               cache_file: str) -> bool:
+        """``_save_cache`` for an OHLCV frame of the legacy per-class CSV cache (``get_data``): the
+        same rule as the parquet store (``ba2_common.core.ohlcv_final_bars``) -- an unfinished bar is
+        served to the caller from memory but never written."""
+        keep, dropped = ohlcv_final_bars.drop_unfinished_bars(data, symbol, interval)
+        if dropped:
+            logger.info(f"{symbol} ({interval}): not persisting {len(dropped)} unfinished bar(s) "
+                        f"{dropped} to {cache_file}")
+            if keep.empty:
+                return False
+        return self._save_cache(keep, cache_file)
+
     def _save_cache(self, data: pd.DataFrame, cache_file: str) -> bool:
         """
         Save data to cache file with thread safety.
@@ -515,7 +529,7 @@ class MarketDataProviderInterface(DataProviderInterface):
                     .sort_values('Date')
                     .reset_index(drop=True)
                 )
-                self._save_cache(df, cache_file)
+                self._save_final_bars_cache(df, symbol, interval, cache_file)
                 logger.debug(
                     f"Appended {len(new_df)} new bar(s) to {symbol} ({interval}) cache"
                 )
@@ -525,6 +539,66 @@ class MarketDataProviderInterface(DataProviderInterface):
             )
 
         return df
+
+    # ---- unfinished bars: served to live from memory, never persisted ---------------------
+    #: ``(provider, SYMBOL, canonical interval) -> (monotonic time, unfinished rows)``: the forming
+    #: bar(s) the vendor returned at the last fetch. ``ba2_common.core.ohlcv_final_bars`` keeps them
+    #: OFF the disk; live (``get_ohlcv_data`` for a LATEST request) still sees them, from here, for
+    #: as long as they are unfinished. Process-local on purpose: a restart simply asks the vendor again.
+    _UNFINISHED_MEMO: dict = {}
+    _UNFINISHED_LOCK = threading.Lock()
+
+    @staticmethod
+    def _unfinished_key(provider_name: str, symbol: str, interval: str) -> tuple:
+        from ba2_common.core.native_cache import normalize_interval
+        return (provider_name, str(symbol).upper(), normalize_interval(interval))
+
+    def _remember_unfinished_bars(self, frame: Optional[pd.DataFrame], symbol: str, interval: str,
+                                  provider_name: str) -> None:
+        """Keep the unfinished bars of a freshly FETCHED frame for the live overlay (never the disk)."""
+        if frame is None or frame.empty:
+            return
+        _, unfinished = ohlcv_final_bars.split_unfinished(frame, symbol, interval)
+        if unfinished.empty:
+            return
+        import time as _time
+        with type(self)._UNFINISHED_LOCK:
+            type(self)._UNFINISHED_MEMO[self._unfinished_key(provider_name, symbol, interval)] = (
+                _time.monotonic(), unfinished.drop(columns=['effective_date'], errors='ignore').copy())
+
+    def _live_unfinished_bars(self, symbol: str, interval: str, provider_name: str):
+        """``(age_s, rows)`` of the remembered bars that are STILL unfinished now, else ``None``
+        (and a memo whose bars have become final is forgotten: the disk top-up supplies them)."""
+        import time as _time
+        key = self._unfinished_key(provider_name, symbol, interval)
+        with type(self)._UNFINISHED_LOCK:
+            entry = type(self)._UNFINISHED_MEMO.get(key)
+        if entry is None:
+            return None
+        _, still = ohlcv_final_bars.split_unfinished(entry[1], symbol, interval)
+        if still.empty:
+            with type(self)._UNFINISHED_LOCK:
+                if type(self)._UNFINISHED_MEMO.get(key) is entry:
+                    type(self)._UNFINISHED_MEMO.pop(key, None)
+            return None
+        return _time.monotonic() - entry[0], still
+
+    def _overlay_unfinished_bars(self, df: pd.DataFrame, symbol: str, interval: str,
+                                 provider_name: str) -> pd.DataFrame:
+        """Append the remembered unfinished bar(s) NEWER than ``df``'s last bar to the frame RETURNED
+        to a live caller. The disk copy is untouched."""
+        live = self._live_unfinished_bars(symbol, interval, provider_name)
+        if live is None or df is None or df.empty:
+            return df
+        rows = live[1].copy()
+        rows['Date'] = self._match_tz(pd.to_datetime(rows['Date']), pd.to_datetime(df['Date']))
+        rows = rows[np.asarray(rows['Date'] > pd.to_datetime(df['Date']).max())]
+        if rows.empty:
+            return df
+        if 'effective_date' in df.columns:
+            rows['effective_date'] = rows['Date']
+        rows = rows[[c for c in df.columns if c in rows.columns]]
+        return pd.concat([df, rows], ignore_index=True)
 
     # ---- native parquet as_of store helpers (get_ohlcv_data) -----------------
     def _write_ohlcv_parquet(self, df: pd.DataFrame, provider_name: str,
@@ -633,6 +707,10 @@ class MarketDataProviderInterface(DataProviderInterface):
             if new_df is not None and not new_df.empty:
                 new_df = self._clean_dataframe(new_df)
                 new_df['Date'] = pd.to_datetime(new_df['Date'])
+                # A forming bar is returned to the caller below but NEVER written (native_cache
+                # drops it): the top-up resumes at last_bar + interval, so a persisted forming bar
+                # would be frozen. Remember it for the live overlay.
+                self._remember_unfinished_bars(new_df, symbol, interval, provider_name)
                 # Align the fetched bars' tz-awareness to the CACHE's convention before
                 # concat. The provider may return tz-aware timestamps while the parquet
                 # holds naive ones (FMP daily does exactly this); concatenating the two
@@ -681,6 +759,29 @@ class MarketDataProviderInterface(DataProviderInterface):
                     if e.kind == ovr.KIND_EXCLUDE_CALENDAR_EVENT}
         return [s for s in splits if s.date not in excluded], False
 
+    def _unproven_tail_days(self, df: pd.DataFrame, symbol: str, interval: str,
+                            provider_name: str) -> list:
+        """``[newest cached day]`` when the file's mtime PROVES that bar was captured while its
+        session was still open or settling (``ohlcv_final_bars.written_before_final``: the last write
+        fell inside the bar's own trading window, nothing wrote the file since), else ``[]``.
+
+        Only the newest bar can be proven this way: a later write of the file moved the mtime past
+        every older bar's window. (Older stuck snapshots are the repair tool's job.) Never returns
+        every row of ``df``: the guard needs one cached bar to anchor on."""
+        from ba2_common.core import native_cache
+        from ba2_common.core import ohlcv_topup_guard as guard
+        path = native_cache.find_timeseries_path(provider_name, symbol, interval)
+        if path is None or len(df) < 2:
+            return []
+        try:
+            written = datetime.fromtimestamp(os.path.getmtime(path), timezone.utc)
+        except OSError:
+            return []
+        newest = guard.day_index(df['Date']).max()
+        if ohlcv_final_bars.written_before_final(symbol, newest.date(), written):
+            return [newest]
+        return []
+
     def _verified_tail_topup(self, df: pd.DataFrame, symbol: str, interval: str,
                              provider_name: str, fetch_end: datetime, *,
                              raise_fetch_errors: bool = False):
@@ -728,9 +829,21 @@ class MarketDataProviderInterface(DataProviderInterface):
 
         df = df.copy()
         df['Date'] = pd.to_datetime(df['Date'])
+        # SELF-HEAL of a file written by the code that persisted forming bars: a cached newest bar
+        # whose session was NOT final when the file was last written is a snapshot by construction
+        # (mtime proof; nothing wrote the file since). It is taken out of the comparison and the
+        # vendor's bar for that day, final now, replaces it. A bar the mtime cannot incriminate
+        # (written after its session settled, or older than the newest bars) is left to the guard.
+        healed = self._unproven_tail_days(df, symbol, interval, provider_name)
+        if healed:
+            logger.warning(f"{provider_name} {symbol} ({interval}): the cached bar(s) "
+                           f"{[d.date().isoformat() for d in healed]} were written before their session "
+                           f"was final (file mtime); replacing them with the vendor's final bar(s)")
+            df = df[~np.asarray(guard.day_index(df['Date']).isin(healed))].reset_index(drop=True)
         days = guard.day_index(df['Date'])
         tail_days = days[-guard.TOPUP_OVERLAP_BARS:]
         probe_start = tail_days[0].to_pydatetime()
+        unchanged = "append" if healed else "unchanged"   # healed rows must reach the disk
         try:
             probe = self._get_ohlcv_data_impl(symbol, probe_start, fetch_end, interval)
         except Exception as e:  # noqa: BLE001 -- the old top-up's policy: serve the cache, say so
@@ -744,6 +857,13 @@ class MarketDataProviderInterface(DataProviderInterface):
         if probe.empty:
             return df, "unchanged"
         probe['Date'] = self._match_tz(pd.to_datetime(probe['Date']), df['Date'])
+        # THE RULE (ohlcv_final_bars): the vendor's forming bar is never history. It is kept for
+        # live (memo, served from memory by get_ohlcv_data) and kept out of the comparison, the
+        # merge and the write, so the verdict is computed on final bars only.
+        self._remember_unfinished_bars(probe, symbol, interval, provider_name)
+        probe, _ = ohlcv_final_bars.split_unfinished(probe, symbol, interval)
+        if probe.empty:
+            return df, unchanged
         probe_days = guard.day_index(probe['Date'])
 
         splits, calendar_failed = self._topup_split_calendar(symbol, interval)
@@ -756,7 +876,7 @@ class MarketDataProviderInterface(DataProviderInterface):
             prov = {pd.Timestamp(d) for d in verdict.provisional_days}
             replace = probe[np.asarray(probe_days.isin(prov))].copy()
             if fresh.empty and replace.empty:
-                return df, "unchanged"
+                return df, unchanged
             if 'effective_date' not in df.columns:
                 df['effective_date'] = df['Date']
             if not replace.empty:
@@ -925,6 +1045,14 @@ class MarketDataProviderInterface(DataProviderInterface):
                 logger.warning(f"Could not read {existing_path} to match its timezone convention: {e}")
         out = out.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
         out['effective_date'] = out['Date']
+        # THE RULE (ohlcv_final_bars): a split-triggered re-fetch DURING a session returns today's
+        # forming bar too. It is kept for live, and out of the replacement, the verification, the
+        # write and the marker (whose last_bar must be the last FINAL session).
+        self._remember_unfinished_bars(out, symbol, interval, provider_name)
+        out, _ = ohlcv_final_bars.split_unfinished(out, symbol, interval)
+        if out.empty:
+            raise RuntimeError(f"full re-fetch of {symbol} ({interval}) returned only unfinished bars")
+        out = out.reset_index(drop=True)
         self._refuse_shorter_replacement(out, existing_path, symbol, interval, provider_name)
         if verify is not None:
             verify(out)
@@ -955,6 +1083,8 @@ class MarketDataProviderInterface(DataProviderInterface):
                 f"full re-fetch of {symbol} ({interval}): the existing cache {existing_path} "
                 f"could not be read to check the replacement against it ({e}). Refusing to "
                 f"overwrite it -- a replacement that cannot be compared is not a repair.") from e
+        # an unfinished bar a pre-fix writer left on the disk is not history the replacement must keep
+        existing, _ = ohlcv_final_bars.split_unfinished(existing, symbol, interval)
         if existing.empty:
             return
         old_rows = len(existing)
@@ -1109,7 +1239,7 @@ class MarketDataProviderInterface(DataProviderInterface):
 
             # Save to cache
             if use_cache:
-                self._save_cache(df, cache_file)
+                self._save_final_bars_cache(df, symbol, interval, cache_file)
 
         # Ensure Date column is datetime
         if 'Date' in df.columns:
@@ -1262,8 +1392,15 @@ class MarketDataProviderInterface(DataProviderInterface):
                 else:
                     cache_path = native_cache.find_timeseries_path(
                         provider_name, symbol, interval)
-                    if cache_path is None or not self._is_cache_valid(
-                            cache_path, max_cache_age_hours):
+                    # A forming bar is never written, so a top-up that only found today's
+                    # forming bar leaves the file's mtime old; the process's memo of that fetch
+                    # stands in for the mtime (same max age) while the bar is still unfinished,
+                    # or every live read of the day would hit the vendor again.
+                    live_memo = self._live_unfinished_bars(symbol, interval, provider_name)
+                    memo_fresh = (live_memo is not None
+                                  and live_memo[0] < max_cache_age_hours * 3600)
+                    if not memo_fresh and (cache_path is None or not self._is_cache_valid(
+                            cache_path, max_cache_age_hours)):
                         df = self._refresh_parquet_if_stale(
                             df, symbol, interval, provider_name)
 
@@ -1304,6 +1441,9 @@ class MarketDataProviderInterface(DataProviderInterface):
 
             # Save to the parquet as_of store (effective_date == bar Date).
             if use_cache:
+                # a cold fill during a session fetched today's forming bar too: live keeps it
+                # (overlay below), the writer never persists it
+                self._remember_unfinished_bars(df, symbol, interval, provider_name)
                 cold_file = native_cache.find_timeseries_path(provider_name, symbol, interval) is None
                 self._write_ohlcv_parquet(df, provider_name, symbol, interval)
                 if cold_file and self.WRITES_FULL_FETCH_MARKER and interval not in _INTRADAY_INTERVALS:
@@ -1314,6 +1454,11 @@ class MarketDataProviderInterface(DataProviderInterface):
                     provider_name, symbol, interval, as_of=end_date)
                 if sliced is not None and not sliced.empty:
                     df = sliced
+
+        # LIVE still sees today's forming bar (DeterministicScorer's decision price is the last
+        # close of this frame): served from the process memo, never from the disk.
+        if use_cache and is_latest:
+            df = self._overlay_unfinished_bars(df, symbol, interval, provider_name)
 
         # Drop the cache-internal effective_date column so the returned frame keeps
         # the legacy shape (Date, Open, High, Low, Close, Volume) byte-equivalently.
