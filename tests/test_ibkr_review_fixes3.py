@@ -367,6 +367,19 @@ class TestClampBuyingPowerMandatory:
         assert clamp(build(None, {}, None, balance_raises=True)) is None              # nothing: None
         assert clamp(build(None, {"equity_buying_power": 11.0}, 7.0, snap_raises=True)) == 11.0
         assert clamp(build(float("nan"), {"cash": 5.0}, 7.0)) == 5.0                  # NaN snapshot is unusable
+        # Counterpart of the cases above, which raise ConnectionError (an OSError: retried, then skipped):
+        # a NON-OSError (here RuntimeError) is no longer absorbed -- it propagates, unretried.
+        class _Sdk(Exception):
+            pass
+
+        sdk_acct = build(None, {"cash": 5.0}, 7.0)
+        sdk_acct.get_account_snapshot = lambda: (_ for _ in ()).throw(_Sdk("snap"))
+        with pytest.raises(_Sdk):
+            clamp(sdk_acct)
+        sdk_acct = build(None, {}, 7.0)
+        sdk_acct.get_account_info = lambda: (_ for _ in ()).throw(_Sdk("info"))
+        with pytest.raises(_Sdk):
+            clamp(sdk_acct)
 
 
 # ======================================================================= 6 / 7  nonce noise, refused re-submission

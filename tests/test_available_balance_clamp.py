@@ -293,6 +293,60 @@ def test_sizing_proceeds_unclamped_when_buying_power_never_reads(no_bp_sleep):
     assert f"Account {acct_def.id} (expert {inst.id})" in skipped[0] and "3 attempts" in skipped[0]
 
 
+def test_a_non_oserror_from_get_account_info_is_not_absorbed_any_more(no_bp_sleep):
+    """Counterpart of ``..._after_bounded_retries_when_account_info_raises`` (which now raises a
+    ConnectionError, an OSError): before 6a22ef8c's review a RuntimeError was absorbed, retried and
+    skipped. Under enforce mode only the OSError family is "the broker could not be read"; anything else
+    propagates, unretried."""
+    class _Broken(_FakeAccount):
+        calls = 0
+
+        def get_account_info(self):
+            type(self).calls += 1
+            raise RuntimeError("broker hiccup")
+
+    with pytest.raises(RuntimeError, match="broker hiccup"):
+        MarketExpertInterface._get_actual_available_balance(_Broken(1, balance=88.0, account_info=None))
+    assert _Broken.calls == 1 and no_bp_sleep == []
+
+
+def test_a_non_oserror_from_the_snapshot_call_is_not_absorbed_any_more(no_bp_sleep):
+    """Counterpart of ``..._falls_back_when_the_snapshot_call_raises`` (ConnectionError now)."""
+    class _SnapAccount(_FakeAccount):
+        def get_account_snapshot(self):
+            raise RuntimeError("broker down")
+
+    with pytest.raises(RuntimeError, match="broker down"):
+        MarketExpertInterface._get_actual_available_balance(
+            _SnapAccount(1, balance=999.0, account_info={"buying_power": 4_000.0}))
+    assert no_bp_sleep == []
+
+
+@pytest.mark.usefixtures("reset_test_db")
+def test_a_zero_buying_power_clamps_the_available_balance_to_zero_end_to_end():
+    """A fully deployed account (measured buying power 0.0) must clamp the expert to 0 -- through the
+    snapshot path and through the info path -- never fall through to a larger figure or skip the clamp."""
+    from ba2_common.core.account_types import AccountSnapshot
+    from ba2_common.core.instance_resolver import get_instance_resolver, set_instance_resolver
+
+    class _SnapZero(_FakeAccount):
+        def get_account_snapshot(self):
+            return AccountSnapshot(buying_power=0.0)
+
+    for build in (lambda i: _SnapZero(i, balance=100_000.0, account_info={"cash": 9_999.0}),
+                  lambda i: _FakeAccount(i, balance=100_000.0,
+                                         account_info={"buying_power": 0.0, "cash": 9_999.0})):
+        acct_def = factories.create_account_definition()
+        inst = factories.create_expert_instance(
+            account_id=acct_def.id, expert="_BalanceExpert", virtual_equity_pct=100.0)
+        prev = get_instance_resolver()
+        try:
+            set_instance_resolver(_resolver_for(build(acct_def.id)))
+            assert _BalanceExpert(inst.id).get_available_balance() == 0.0
+        finally:
+            set_instance_resolver(prev)
+
+
 def test_a_backtest_style_account_never_sleeps_or_retries(no_bp_sleep):
     account = _FakeAccount(1, balance=1.0, account_info={"buying_power": 321.0})
     assert MarketExpertInterface._get_actual_available_balance(account) == 321.0

@@ -208,6 +208,8 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
     #: An expert may not size from cash / net liquidation when IBKR's buying power cannot be derived
     #: (``AvailableFunds`` is far below net liquidation on a margin account): sizing is refused instead.
     buying_power_is_mandatory = True
+    #: IBKR's snapshot (``_snapshot_inputs``) and info (``_account_numbers``) are separate reads.
+    snapshot_is_derived_from_account_info = False
 
     #: Overridable in tests with a fake; the runtime builds the IB object ON its loop thread.
     _ib_factory = staticmethod(IB)

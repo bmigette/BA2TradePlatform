@@ -510,6 +510,17 @@ def _test_fakes_declare_a_greeks_source(monkeypatch):
     monkeypatch.setattr(_OAI, "OPTION_GREEKS_SOURCE", "test_fake")
 
 
+@pytest.fixture(autouse=True)
+def _buying_power_failure_memory_starts_empty():
+    """The buying-power read remembers a failed read per ACCOUNT ID for a few seconds
+    (``MarketExpertInterface._BP_FAILED_READS``); fake accounts here reuse small ids, so a failure
+    pinned by one test must never leak into the next."""
+    from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
+    MarketExpertInterface._BP_FAILED_READS.clear()
+    yield
+    MarketExpertInterface._BP_FAILED_READS.clear()
+
+
 @pytest.fixture
 def _mock_expert_is_resolvable(monkeypatch):
     """An option entry now reads its expert's capital (``get_available_equity_balance_detail``)

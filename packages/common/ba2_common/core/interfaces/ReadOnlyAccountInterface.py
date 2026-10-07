@@ -217,6 +217,14 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
     For trading-capable accounts, subclass AccountInterface instead (which inherits this).
     """
     SETTING_MODEL = AccountSetting
+
+    #: True when ``get_account_snapshot()`` is built from the very broker read ``get_account_info()``
+    #: makes (the base derives one from the other; AlpacaAccount's snapshot calls ``get_account_info``;
+    #: TastyTrade's both call ``get_balances``). An EMPTY snapshot from such an adapter already means
+    #: that read failed, so the buying-power clamp does not repeat it through ``get_account_info()``
+    #: (``MarketExpertInterface._read_actual_buying_power``): that doubled the REST calls and the adapter
+    #: ERROR tracebacks of every outage. An adapter whose two reads are independent sets False (IBKR).
+    snapshot_is_derived_from_account_info = True
     SETTING_LOOKUP_FIELD = "account_id"
 
     # Whether this account supports trading operations
