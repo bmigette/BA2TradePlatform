@@ -511,7 +511,26 @@ def scorer_case(analysis_id: str = SCORER_ID, bars: int = 400) -> Case:
                          for sid, rows in _SCORER_FRED.items()}, clear=True),
         mock.patch.dict(fred_series._META, _scorer_fred_meta(), clear=True),
     ]
+    # NEW-FORMAT capture: the live decision price is the ACCOUNT QUOTE (``_decision_price``), read inside the
+    # captured gather and tapped like every other broker read. It is the frame's last close, the value the
+    # pre-seam code took from the frame, so the recorded bundle (and every comparison) is unchanged.
+    # The LEGACY format (no quote, no marker) is built from this one by ``to_legacy_scorer_recording``.
+    _attach_quote(expert, TapedAccount(9000 + int(analysis_id), float(frame["Close"].iloc[-1])))
     return Case(expert, settings, patches, FakeMarketAnalysis(analysis_id, "GOOG"))
+
+
+def to_legacy_scorer_recording(bundle_dir, analysis_id: str = SCORER_ID) -> None:
+    """Rewrite a captured bundle so the scorer's analysis looks like one recorded BEFORE the decision-price
+    seam: no broker quote observation, and no ``ds_decision_price_source`` marker. Fixture data of the OTHER
+    analyses, and the scorer's recorded bundle/settings/recommendation, are untouched."""
+    from app.services.replay.gather_tape import DS_PRICE_SOURCE_FLAG
+    drop_observations(bundle_dir, analysis_id, "get_instrument_current_price")
+    root = Path(bundle_dir)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    entry = next(a for a in manifest["analyses"] if a["analysis_id"] == analysis_id)
+    flags = dict(entry.get("branch_flags") or {})
+    flags.pop(DS_PRICE_SOURCE_FLAG, None)
+    edit_analysis(bundle_dir, analysis_id, branch_flags=flags)
 
 
 def skip_case(analysis_id: str = SKIP_ID) -> Case:

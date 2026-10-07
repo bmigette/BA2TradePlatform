@@ -68,16 +68,17 @@ def test_capture_status_observations_and_clock_reads_are_broken_out(session):
 
     assert report["bundle_capture_status"] == {ReplayStatus.CAPTURE_CAPTURED: len(ALL_IDS)}
     methods = report["observations_by_provider_method"]
-    assert methods["broker.get_instrument_current_price"] == len(ALL_IDS) - 1, (
-        "every analysis reads a quote except DeterministicScorer, whose "
-        "current_price is the last close of the OHLCV frame it already fetched")
+    assert methods["broker.get_instrument_current_price"] == len(ALL_IDS), (
+        "every analysis reads a quote, DeterministicScorer included since the decision-price seam "
+        "(before it, its current_price was the last close of the OHLCV frame it already fetched; "
+        "such LEGACY recordings carry no quote and replay through the legacy rule)")
     assert methods["provider_cache.insider_get"] == 2
     assert methods["market_data.get_ohlcv_data"] == 2, (
         "the DeterministicScorer symbol and its benchmark are two recorded reads")
     assert methods["fmp.earning_calendar"] == 1
     assert sum(methods.values()) == report["totals"]["observations"]
     assert report["observations_by_provenance"][ReplayStatus.PROVENANCE_NETWORK] == (
-        len(ALL_IDS) - 1), "one fresh broker quote per analysis that reads one"
+        len(ALL_IDS)), "one fresh broker quote per analysis (the scorer reads one too since the decision-price seam)"
 
     clock = report["clock_reads"]
     assert clock["analyses_with_reads"] + clock["analyses_without_reads"] == len(ALL_IDS)

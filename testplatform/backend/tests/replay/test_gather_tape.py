@@ -10,6 +10,7 @@ contain.
 """
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from tests.replay import (
     capture_session,
     drop_observations,
     edit_analysis,
+    to_legacy_scorer_recording,
     _scorer_frame,
 )
 
@@ -317,3 +319,42 @@ def test_an_unrepresentable_identity_is_refused_not_repr_keyed(session):
         tape.take("provider_cache", "past_earnings_get", {"symbol": key_one})
     with pytest.raises(ReplayMiss):
         tape.take("provider_cache", "past_earnings_get", {"symbol": key_two})
+
+
+# --------------------------------------------------------------------------- #
+# 6. The scorer's decision price: recorded quote (new format) vs the legacy frame close
+# --------------------------------------------------------------------------- #
+def test_a_new_format_scorer_recording_serves_its_quote_from_the_tape(bundle_copy):
+    """The live gather reads the account quote INSIDE the captured gather; it is on the tape and the
+    marker says so. No legacy rule is involved."""
+    manifest = json.loads((bundle_copy / "manifest.json").read_text(encoding="utf-8"))
+    entry = next(a for a in manifest["analyses"] if a["analysis_id"] == SCORER_ID)
+    assert entry["branch_flags"].get(gather_tape.DS_PRICE_SOURCE_FLAG) == "account_quote"
+    assert any(o["method"] == "get_instrument_current_price" and SCORER_ID in o["analysis_ids"]
+               for o in manifest["observations"])
+    result = _by_id(gather_tape.run(bundle_copy))[SCORER_ID]
+    assert result.status == ReplayStatus.COVERAGE_MATCH
+    assert "legacy_frame_close" not in result.detail
+
+
+def test_a_legacy_scorer_recording_replays_as_a_match_through_the_frame_close(bundle_copy):
+    """Recorded BEFORE the seam: no quote on the tape, no marker. The replay serves the decision price the
+    original run used (the recorded frame's last close) and says so."""
+    to_legacy_scorer_recording(bundle_copy)
+    result = _by_id(gather_tape.run(bundle_copy))[SCORER_ID]
+    assert result.status == ReplayStatus.COVERAGE_MATCH, result.detail
+    assert "price_source=legacy_frame_close" in result.detail
+
+
+def test_a_new_format_scorer_recording_missing_its_quote_is_still_a_tape_miss(bundle_copy):
+    """The marker is present: the quote MUST be on the tape. No legacy fallback, no live read."""
+    assert drop_observations(bundle_copy, SCORER_ID, "get_instrument_current_price") == 1
+    result = _by_id(gather_tape.run(bundle_copy))[SCORER_ID]
+    assert result.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert "get_instrument_current_price" in result.detail
+
+
+def test_the_legacy_rule_is_the_scorers_alone(bundle_copy):
+    """Another expert missing its quote is a miss exactly as before (the rule is narrow)."""
+    assert drop_observations(bundle_copy, RATING_ID, "get_instrument_current_price") == 1
+    assert _by_id(gather_tape.run(bundle_copy))[RATING_ID].status == ReplayStatus.COVERAGE_MISSING_CAPTURE

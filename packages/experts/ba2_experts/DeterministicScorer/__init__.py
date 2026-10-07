@@ -423,6 +423,11 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         # never the price: in a backtest it is the prior session's close, live a cached bar that
         # may be today's partial one. No fallback to it: a missing price refuses the decision
         # (_process).
+        # CAPTURE FORMAT MARKER: a recording made after this change holds a broker-quote observation for
+        # the decision price (the account read below, INSIDE the captured gather). The marker tells the
+        # replay layer to demand that observation (a missing one is a tape miss) instead of applying the
+        # LEGACY rule to a recording that predates it (price = the recorded frame's last close).
+        record_branch_flag("ds_decision_price_source", "account_quote")
         px = self._decision_price(providers, symbol, as_of)
         current_price = px   # not float(): a DecisionPrice keeps its bar stamp for the guard
 

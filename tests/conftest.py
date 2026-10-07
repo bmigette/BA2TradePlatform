@@ -40,12 +40,42 @@ from ba2_trade_platform.core.interfaces.MarketExpertInterface import MarketExper
 @pytest.fixture(scope="session")
 def test_engine():
     """Create an in-memory SQLite engine shared across the entire test session."""
+    # SQLite ``:memory:`` is served by SQLAlchemy's SingletonThreadPool: ONE connection (= one private
+    # in-memory database) PER THREAD, and the pool keeps at most ``pool_size`` (default 5) of them,
+    # closing arbitrary ones beyond that. A test run that touches the DB from more than five threads
+    # (worker queues, schedulers, warm workers) can therefore close the MAIN thread's connection; its
+    # next use opens a brand-new EMPTY database and fails with "no such table: expertsetting" /
+    # "no such table: tradingorder" -- sporadic, order-dependent, and never in the test's own code.
+    # A pool this large is never evicted from within a session.
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
+        pool_size=4096,
     )
     SQLModel.metadata.create_all(engine)
     return engine
+
+
+#: Thread-name fragments of the long-lived managers a test must stop (APScheduler, the trade manager's
+#: refresh, the worker queue, the warm service). A thread of this kind still alive after its test is
+#: REPORTED (a warning naming the test), so the culprit of a cross-test DB / timing interference is
+#: named instead of discovered by bisecting a 30-minute run.
+_MANAGER_THREAD_MARKERS = ("APScheduler", "TradeManager", "WorkerQueue", "worker_queue", "warm",
+                           "JobManager", "account-refresh", "dgs3mo")
+
+
+@pytest.fixture(autouse=True)
+def _report_leaked_manager_threads(request):
+    import threading
+    import warnings
+    before = {t.ident for t in threading.enumerate()}
+    yield
+    leaked = [t.name for t in threading.enumerate()
+              if t.ident not in before and t.is_alive()
+              and any(m.lower() in t.name.lower() for m in _MANAGER_THREAD_MARKERS)]
+    if leaked:
+        warnings.warn(f"{request.node.nodeid} left manager thread(s) running: {sorted(set(leaked))}",
+                      RuntimeWarning, stacklevel=1)
 
 
 @pytest.fixture(autouse=True)
