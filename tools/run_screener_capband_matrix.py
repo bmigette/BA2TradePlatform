@@ -455,7 +455,7 @@ def main() -> int:
     ap.add_argument("--decision-times", default=None, metavar="default|fixed|HH:MM,HH:MM,...",
                     help="The DECISION TIME gene (schedule:time) searched by every classic job. "
                          "DEFAULT (flag absent) = ON with the shared DEFAULT_DECISION_TIME_CHOICES "
-                         "(09:35,09:40,09:45,10:00,12:00,15:30,15:50); 'fixed' = no gene, the "
+                         "(09:35,09:40,09:45,10:00,12:00,15:30,15:45); 'fixed' = no gene, the "
                          "legacy single DEFAULT_DECISION_TIME; or a comma list on the --interval "
                          "grid. Adds '-timegene' to the job name and folds into the name digest "
                          "(new names, so nothing is skipped as already completed). Not applied "

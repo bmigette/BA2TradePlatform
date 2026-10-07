@@ -16,7 +16,7 @@ from app.services import genetic as G
 from app.services.genetic import GeneticOptimizer
 from app.services.strategy_param_space import collect_param_space
 
-TIMES = ["09:35", "09:40", "09:45", "10:00", "12:00", "15:30", "15:50"]
+TIMES = ["09:35", "09:40", "09:45", "10:00", "12:00", "15:30", "15:45"]
 
 
 def _space(stratify=True):
@@ -252,8 +252,15 @@ def test_live_deploy_bound_is_one_constant_with_its_measurement():
     assert live_deploy_time_refusal("10:00") is None
     assert live_deploy_time_refusal("15:30") is None
     assert "after the 16:00 close" in live_deploy_time_refusal("15:50")
-    assert live_deploy_time_refusal("15:40") is None          # 15:40 + 8.5 min + 10 min = 15:58:30
-    assert live_deploy_time_refusal("15:45") is not None
+
+
+def test_every_value_of_the_default_list_is_deployable():
+    """Fails if a value is ever added to the default list that the deploy tool would refuse."""
+    from ba2_common.core.knowability import DEFAULT_DECISION_TIME_CHOICES
+    for t in DEFAULT_DECISION_TIME_CHOICES:
+        assert live_deploy_time_refusal(t) is None, t
+    assert live_deploy_time_refusal("15:45") is None          # 15:45 + 8.5 min + 5 min = 15:58:30; 15:47 ends 16:00:30
+    assert live_deploy_time_refusal("15:47") is not None
 
 
 def test_a_reused_timegene_name_with_a_different_list_is_refused(monkeypatch):

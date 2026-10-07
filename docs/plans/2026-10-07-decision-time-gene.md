@@ -9,7 +9,7 @@ the run's own. Today both get the same value; splitting into an entry time and a
 changes that function and `ba2_common.core.schedule_genes.schedule_override_from_genes` only.
 
 * Shared list: `ba2_common.core.knowability.DEFAULT_DECISION_TIME_CHOICES`
-  (09:35, 09:40, 09:45, 10:00, 12:00, 15:30, 15:50). Flag `--decision-times default|fixed|HH:MM,...`.
+  (09:35, 09:40, 09:45, 10:00, 12:00, 15:30, 15:45). Flag `--decision-times default|fixed|HH:MM,...`.
 * Grid DRIVERS (`run_screener_capband_matrix.py`, `run_senate_matrix.py`, the exploration driver)
   default to `default`; plain `ba2-test optimize` / `optimize-batch` default to fixed (an ad-hoc run
   stays a single reproducible time and needs a distinct, explicit `...timegene...` name).
@@ -23,7 +23,7 @@ changes that function and `ba2_common.core.schedule_genes.schedule_override_from
 * Decision price = close of the last bar that has ENDED at T; the order fills at the open of the first
   bar strictly after the decision bar. T=15:50 -> fills at the 15:55 open (same session). T=15:55 would
   fill at the next session's 09:30 open (refused by validation).
-* A session that has no bar at T (15:30 / 15:50 on a 13:00 half day) gets no decision and no manage
+* A session that has no bar at T (15:30 / 15:45 on a 13:00 half day) gets no decision and no manage
   pass at that time: the engine now COUNTS those sessions (`engine.sessions_without_decision_bar`) and
   logs one WARNING per run. 12:00 exists on half days.
 * Live (`JobManager._parse_schedule`) fires a cron at the stored time with no session check: on a half
@@ -54,3 +54,24 @@ Option backtests run on a DAILY clock and the drivers refuse `--decision-times`.
   artefact of the model.
 * (d) Live meaning of the daily clock: the weekday/time mapping is being established by another agent
   (open question).
+
+## Default list and the live deploy bound (owner decision 2026-10-07)
+Default list: 09:35, 09:40, 09:45, 10:00, 12:00, 15:30, **15:45** (15:50 replaced: 15:40 and 15:50 are too
+close to 15:30 / the close). `LIVE_PASS_P95_SECONDS = 510` and `LIVE_PASS_MARGIN_SECONDS = 300`
+(`schedule_genes.py`): `tools/import_deploy_payload.py` refuses a time where time + 510 s + 300 s ends
+after 16:00 on a normal day. 15:45 -> 15:58:30 accepted, 15:50 -> 16:03:30 refused. The measured maximum
+pass was 506 s (orders out by about 15:53:30 for a 15:45 decision); September passes at 09:30 on a machine
+that was often loaded. Re-measure if the expert universe or the hardware changes. A test fails if a value
+is ever added to the default list that the deploy tool would refuse.
+
+## Live session guard (JobManager)
+* The fire instant is APScheduler's scheduled run time (`ScheduledExpertExecutor`), in the trigger's own
+  timezone: a prod schedule reaches the guard as exactly 09:30:00.000 New York; the open is inclusive.
+* ERROR for a skip on a FULL regular session day or any guard fault (calendar unavailable, naive instant,
+  crypto instrument); WARNING for a weekend, a holiday or a half day after its early close.
+* Kill switch: app setting `scheduled_session_guard_enabled` (bool, declared default ON, Settings page ->
+  System Settings). State logged at startup; every skip line names the setting.
+* Audit (read-only, 2026-10-07): prod, dev and options DBs hold no enabled schedule outside 09:30-16:00
+  market time and none with a local time basis (prod 18 times, dev 56, options 2, all market basis).
+* The schedule editor shows a warning for a time outside the session ("this pass will be skipped") and
+  for one too close to the close to finish (same bound as the deploy tool); a warning only.

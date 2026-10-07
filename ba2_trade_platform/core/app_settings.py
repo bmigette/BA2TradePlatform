@@ -52,6 +52,13 @@ APP_SETTINGS_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     "account_refresh_interval": {"type": "int", "required": False, "default": 5, "min": 1,
                                  "max": 1440,
                                  "description": "Account Refresh Interval (minutes)"},
+    # OPERATOR KILL SWITCH of the live SESSION GUARD (JobManager._session_guard_allows): ON (the
+    # default) skips a scheduled entry / open-positions pass that fires outside a regular NYSE
+    # session (holiday, weekend, early close, out-of-hours schedule). Turn OFF only if the guard
+    # misbehaves: every scheduled pass then runs at its fire time with no session check.
+    "scheduled_session_guard_enabled": {
+        "type": "bool", "required": False, "default": True,
+        "description": "Skip scheduled passes outside the regular market session (session guard)"},
 }
 
 

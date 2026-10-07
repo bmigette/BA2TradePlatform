@@ -64,6 +64,14 @@ def _warnings(monkeypatch):
     return seen
 
 
+def _levels(monkeypatch):
+    """[(level, message)] for every warning/error the guard logs."""
+    seen = []
+    monkeypatch.setattr(JM.logger, "warning", lambda m, *a, **k: seen.append(("WARNING", m)))
+    monkeypatch.setattr(JM.logger, "error", lambda m, *a, **k: seen.append(("ERROR", m)))
+    return seen
+
+
 def test_normal_day_runs_and_logs_nothing(monkeypatch):
     seen = _warnings(monkeypatch)
     assert _jm()._session_guard_allows(_job(), _at(*NORMAL, 9, 30)) is True
@@ -82,23 +90,42 @@ def test_skipped_with_one_loud_line_per_expert_subtype_day(monkeypatch, day, hh,
     assert jm._session_guard_allows(_job(), when) is False          # same key: no second line
     assert jm._session_guard_allows(_job(subtype=AnalysisUseCase.OPEN_POSITIONS), when) is False
     assert len(seen) == 2 and all("SESSION GUARD" in m and needle in m for m in seen)
+    assert all("scheduled_session_guard_enabled" in m for m in seen)       # names the kill switch
     assert "ENTER_MARKET" in seen[0].upper() or "enter_market" in seen[0]
 
 
-def test_an_unreadable_calendar_refuses_the_pass(monkeypatch):
-    seen = _warnings(monkeypatch)
+def test_an_unreadable_calendar_refuses_the_pass_as_an_ERROR(monkeypatch):
+    seen = _levels(monkeypatch)
 
     def boom(instant):
         raise MC.MarketCalendarUnavailable("no pandas_market_calendars")
     monkeypatch.setattr(MC, "regular_session_status", boom)
     assert _jm()._session_guard_allows(_job(), _at(*NORMAL, 10, 0)) is False
-    assert "calendar unavailable" in seen[0]
+    assert seen[0][0] == "ERROR" and "session check failed" in seen[0][1]
+    assert "MarketCalendarUnavailable" in seen[0][1]
+
+
+def test_a_naive_fire_instant_is_refused_loudly_not_crashing_the_dispatch(monkeypatch):
+    seen = _levels(monkeypatch)
+    assert _jm()._session_guard_allows(_job(), datetime(2025, 12, 3, 9, 30)) is False
+    assert seen[0][0] == "ERROR"
 
 
 def test_a_crypto_instrument_is_refused_not_assumed_nyse(monkeypatch):
-    seen = _warnings(monkeypatch)
+    seen = _levels(monkeypatch)
     assert _jm()._session_guard_allows(_job(symbol="BTC"), _at(*NORMAL, 10, 0)) is False
-    assert "crypto" in seen[0]
+    assert seen[0][0] == "ERROR" and "crypto" in seen[0][1]
+
+
+@pytest.mark.parametrize("day, hh, mm, level", [
+    (HOLIDAY, 9, 30, "WARNING"), ((2025, 12, 6), 9, 30, "WARNING"),       # holiday, weekend
+    (HALF_DAY, 15, 30, "WARNING"), (HALF_DAY, 13, 0, "WARNING"),          # after the early close
+    (NORMAL, 8, 0, "ERROR"), (NORMAL, 16, 0, "ERROR"), (NORMAL, 17, 30, "ERROR"),  # normal day
+])
+def test_the_skip_level_separates_a_routine_closed_day_from_an_incident(monkeypatch, day, hh, mm, level):
+    seen = _levels(monkeypatch)
+    assert _jm()._session_guard_allows(_job(), _at(*day, hh, mm)) is False
+    assert [lv for lv, _ in seen] == [level]
 
 
 def test_a_skipped_group_submits_nothing_and_parks_nothing(monkeypatch):
@@ -114,6 +141,7 @@ def test_a_skipped_group_submits_nothing_and_parks_nothing(monkeypatch):
             for n, s, st in (("a", "SCREENER", AnalysisUseCase.ENTER_MARKET),
                              ("b", "OPEN_POSITIONS", AnalysisUseCase.OPEN_POSITIONS))}
     jm._scheduled_jobs = jobs
+    jm._session_guard_enabled = lambda announce=False: True
     registered, sealed, executed = [], [], []
     queue = SimpleNamespace(_expert_priority=SimpleNamespace(
         register=lambda runs: registered.append(list(runs)), seal=lambda ids: sealed.append(list(ids))))

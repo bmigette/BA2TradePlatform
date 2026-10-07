@@ -46,8 +46,8 @@ def _space(times=TIMES):
 
 
 def test_the_owners_seven_values_are_the_shared_default_and_valid():
-    assert TIMES == ["09:35", "09:40", "09:45", "10:00", "12:00", "15:30", "15:50"]
-    assert validate_decision_times(TIMES, "5min") == TIMES       # 15:50 leaves the 15:55 bar to fill on
+    assert TIMES == ["09:35", "09:40", "09:45", "10:00", "12:00", "15:30", "15:45"]
+    assert validate_decision_times(TIMES, "5min") == TIMES       # 15:45 leaves two bars after it to fill on
 
 
 # ---------------------------------------------------------------------------------------------
@@ -257,14 +257,14 @@ def test_no_decoded_key_is_ever_silently_dropped_by_the_trial_config():
 
 
 def test_the_trial_config_and_genome_survive_the_trip_to_a_remote_worker():
-    decoded = decode_params(_strategy(), _flat("15:50"))
+    decoded = decode_params(_strategy(), _flat("15:45"))
     trial = _build_daily_trial_config(_bt_cfg(), decoded, option_trade_records=False)
     wire = json.loads(json.dumps(trial))
     assert wire["run_schedule_override"] == trial["run_schedule_override"]
     assert wire["manage_schedule_override"] == trial["manage_schedule_override"]
-    assert wire["run_schedule_override"]["times"] == ["15:50"]
-    genome = json.loads(json.dumps(_flat("15:50")))
-    assert decode_params(_strategy(), genome)["schedule_time"] == "15:50"
+    assert wire["run_schedule_override"]["times"] == ["15:45"]
+    genome = json.loads(json.dumps(_flat("15:45")))
+    assert decode_params(_strategy(), genome)["schedule_time"] == "15:45"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -351,7 +351,7 @@ def _engine_run(run_times, manage_times, run_id):
         ctx.__exit__(None, None, None)
 
 
-@pytest.mark.parametrize("time", ["09:35", "10:00", "12:00", "15:30", "15:50"])
+@pytest.mark.parametrize("time", ["09:35", "10:00", "12:00", "15:30", "15:45"])
 def test_the_engine_decides_and_manages_at_the_chosen_bar(time):
     """Decoded gene -> trial config -> engine: the entry decision and the manage pass both run at
     exactly that bar on every session that HAS the bar. (2024-01-04 is a 13:00 half day: only
@@ -392,7 +392,7 @@ def test_a_session_without_the_scheduled_time_is_skipped_counted_and_loud():
 
 
 def test_a_mixed_list_is_judged_per_chosen_value_on_a_half_day():
-    """12:00 exists on the half day, 15:30 and 15:50 do not: the counter is per trial."""
+    """12:00 exists on the half day, 15:30 and 15:45 do not: the counter is per trial."""
     e1, r1, *_ = _engine_run(["12:00"], ["12:00"], run_id=831)
     assert e1.sessions_without_decision_bar == {"entry": 0, "manage": 0} and len(r1) == 3
     e2, r2, *_ = _engine_run(["15:50"], ["15:50"], run_id=832)
@@ -477,7 +477,7 @@ def test_driver_helpers_default_on_fixed_and_daily():
     import matrix_flags as mf
 
     times, header = mf.decision_times_plan(None, "5min")
-    assert times == TIMES and "09:35" in header and "15:50" in header
+    assert times == TIMES and "09:35" in header and "15:45" in header
     assert mf.decision_times_plan("fixed", "5min")[0] is None
     assert "fixed 10:00" in mf.decision_times_plan("fixed", "5min")[1]
     assert mf.decision_times_plan(None, "1d") == (None, "decision time: daily clock (not optimizable)")
