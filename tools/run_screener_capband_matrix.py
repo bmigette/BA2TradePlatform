@@ -192,6 +192,19 @@ def fr_top_n_below_pool_passthrough(args) -> list:
     return out
 
 
+def decision_times_passthrough(args) -> list:
+    """Extra `optimize` CLI tokens for --decision-times ([] when not given, so an ordinary
+    invocation of this driver stays byte-identical: same argv, same job names).
+
+    Like the other passthroughs it triggers the job-name digest ON ITS OWN (see the call site):
+    the time list changes what the job scores, so two jobs differing only by it must not share
+    a name, a skip-completed check or a checkpoint."""
+    out: list = []
+    if getattr(args, "decision_times", None):
+        out += ["--decision-times", args.decision_times]
+    return out
+
+
 def _job_name(name: str, cmd: list) -> str:
     """``name``, or ``name-d<digest>`` when ``market_condition_passthrough``,
     ``exclude_symbols_passthrough`` or ``fr_top_n_below_pool_passthrough`` added anything.
@@ -439,6 +452,14 @@ def main() -> int:
                          "affected, whatever this flag says. Folds into the job's name digest "
                          "(on its own) so an opted-out run can never resume/be confused with a "
                          "repaired run's completed row under the same name.")
+    ap.add_argument("--decision-times", default=None, metavar="HH:MM,HH:MM,...",
+                    help="Search the DECISION TIME as a GA gene (schedule:time) in every job: "
+                         "a comma list of exchange-local times on the --interval grid, e.g. "
+                         "09:35,09:40,09:45,10:00,15:30 (see `ba2-test optimize --help`). "
+                         "REQUIRES --name-suffix to contain 'timegene' (enforced below). Folds "
+                         "into the job's name digest. Not forwarded to the FactorRanker job "
+                         "(bypass: no schedule genes) -- select the classic experts with "
+                         "--skip-experts.")
     ap.add_argument("--interval", default="5min")
     ap.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points, modeled at the fill-engine "
@@ -539,6 +560,13 @@ def main() -> int:
                 f"'{token}' (got {args.name_suffix!r}). Otherwise the second matrix is skipped "
                 f"as already-completed. Example: --name-suffix goal2020-{token}")
 
+    if args.decision_times and "timegene" not in args.name_suffix.lower():
+        # Same reason as --sizing-mode above: without a distinguishing suffix the run is skipped
+        # as already-completed under the plain job's name (the launcher refuses it too).
+        raise SystemExit(
+            f"--decision-times requires --name-suffix to contain 'timegene' (got "
+            f"{args.name_suffix!r}). Example: --name-suffix goal2020-riskatr-timegene1")
+
     bands = [b.strip() for b in args.bands.split(",") if b.strip()]
     stress_by_band = _parse_stress_spread(args.stress_spread_bps)
     if stress_by_band:
@@ -567,12 +595,18 @@ def main() -> int:
     print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies="
           f"{'per --strategy-plan' if strategy_plan else strategies}); "
           f"{sum(1 for j in jobs if j[0] in done)} already completed"
-          f"{' (by base name; digest-suffixed names are checked per job)' if (market_condition_passthrough(args) or exclude_symbols_passthrough(args)) else ''}.")
+          f"{' (by base name; digest-suffixed names are checked per job)' if (market_condition_passthrough(args) or exclude_symbols_passthrough(args) or decision_times_passthrough(args)) else ''}.")
     # --dry-run walks the SAME loop below and stops short of launching: a job's final name can
     # carry a digest of its resolved argv (market-condition flags), which only exists once the
     # command is built, so listing the pre-digest names here would show (and check "DONE"
     # against) names no job will ever have.
     for i, (name, expert, strat, band) in enumerate(jobs, 1):
+        if args.decision_times and strat is None:
+            # The FactorRanker (bypass) job has no schedule genes: it cannot carry the time gene,
+            # and running it plain under a time-gene grid would mix two kinds of job in one grid.
+            print(f"[{i}/{len(jobs)}] SKIP {name} (bypass expert: --decision-times does not "
+                  f"apply)", flush=True)
+            continue
         # Data-floored start (see _EXPERT_MIN_START). Announced per job so a shorter window is
         # visible in the log instead of being inferred later from a suspiciously late first trade.
         job_start = _start_for(expert, args.start)
@@ -668,8 +702,12 @@ def main() -> int:
         # triggers the digest on its own.
         fr_tokens = fr_top_n_below_pool_passthrough(args)
         cmd += fr_tokens
+        # --decision-times: appended last (same reasoning); digest on its own. (A bypass job was
+        # skipped above: it cannot carry the gene.)
+        dt_tokens = decision_times_passthrough(args)
+        cmd += dt_tokens
         job_name = name
-        if mc_tokens or excl_tokens or fr_tokens:
+        if mc_tokens or excl_tokens or fr_tokens or dt_tokens:
             job_name = _job_name(name, cmd)
             cmd[cmd.index("--name") + 1] = job_name
         if args.dry_run:

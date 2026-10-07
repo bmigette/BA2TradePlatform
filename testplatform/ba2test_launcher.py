@@ -1098,6 +1098,57 @@ def _refuse_atr_policy_without_job_name(policy: str, name: "str | None") -> None
             f"into the wrong search or skipping a policy run as 'already completed'.")
 
 
+#: The name token a ``--decision-times`` job must carry (see ``_resolve_decision_times``).
+DECISION_TIMES_NAME_TOKEN = "timegene"
+
+
+def _resolve_decision_times(raw, command: str, *, interval: str, name: "str | None",
+                            bypass_jobs, option_jobs) -> "list | None":
+    """``--decision-times 09:35,09:40,...`` -> the validated, sorted list (or None when not given).
+
+    Everything refused HERE, before a row is written, so a bad flag costs nothing:
+      * a daily-clock job (``--interval 1d``): a decision time means nothing with one bar a day;
+      * an option job (daily clock, the option code paths must stay untouched);
+      * a bypass expert (FactorRanker): it gets no schedule genes, the gene would be dead;
+      * a value that is not HH:MM on the bar grid, strictly inside the session's first and last
+        bar (``ba2_common.core.schedule_genes.validate_decision_times``);
+      * a job name without ``timegene`` in it: the flag changes what the run scores, and a name
+        that could equal a plain run's name risks skipping as 'already completed' or resuming
+        that run's checkpoint (the gene space also differs, so the checkpoint FINGERPRINT would
+        refuse the resume, but the name guard stops the skip-by-name first).
+    """
+    if raw is None:
+        return None
+    from ba2_common.core.schedule_genes import validate_decision_times
+
+    if bypass_jobs:
+        sys.exit(f"ba2-test {command}: --decision-times is not supported for a bypass expert "
+                 f"({sorted(bypass_jobs)}): its schedule genes are not searched, the gene would "
+                 f"be dead")
+    if option_jobs:
+        sys.exit(f"ba2-test {command}: --decision-times is refused for option jobs "
+                 f"({sorted(option_jobs)}): option backtests run on a DAILY clock, one bar per "
+                 f"session, so there is no decision time to search")
+    values = [t.strip() for t in str(raw).split(",") if t.strip()]
+    try:
+        times = validate_decision_times(values, interval)
+    except ValueError as e:
+        sys.exit(f"ba2-test {command}: --decision-times: {e}")
+    if not name or DECISION_TIMES_NAME_TOKEN not in name:
+        sys.exit(f"ba2-test {command}: --decision-times requires --name (or --name-prefix) to "
+                 f"contain {DECISION_TIMES_NAME_TOKEN!r} (got {name!r}) -- the run's identity "
+                 f"must differ from a plain run of the same expert/strategy")
+    return times
+
+
+def _decision_time_gene(times: "list | None") -> dict:
+    """The ``expert_params`` entry (pre-namespaced) that declares the decision-time gene; {} when
+    no ``--decision-times`` was given, so every other job's gene space is untouched."""
+    if not times:
+        return {}
+    return {"schedule:time": {"optimize": True, "choices": list(times)}}
+
+
 def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
     """The spec's ``option_fixed_settings`` when ``strategy_kind`` is an option job, else {}.
 
@@ -6653,6 +6704,14 @@ def _cmd_optimize(args) -> int:
     rm_toggle_policy = getattr(args, "rm_toggle_policy", "pinned") or "pinned"
     _refuse_atr_policy_without_job_name(rm_toggle_policy, args.name)
     rm_toggles_unpinned = _rm_toggles_unpinned_for_policy(rm_toggle_policy)
+    # --decision-times: the decision-time gene. Validated (and every refusal taken) before
+    # anything is built; None leaves the run byte-identical to one without the flag.
+    decision_times = _resolve_decision_times(
+        getattr(args, "decision_times", None), "optimize", interval=args.interval, name=args.name,
+        bypass_jobs=([expert] if spec.get("bypass") else []),
+        option_jobs=([f"{expert}/{args.strategy}"]
+                     if (spec.get("options") or args.strategy in _OPTION_STRATEGY_KEYS
+                         or args.strategy in _OPTION_GROUPS_ALL) else []))
     # Pure-option kinds AND options experts (spec key `options` — --strategy is ignored)
     # default to the ~30%/yr goal metric; stock kinds keep sharpe_ratio.
     fitness = _resolve_fitness(args.fitness, args.strategy,
@@ -6979,6 +7038,7 @@ def _cmd_optimize(args) -> int:
         _sched_opt = (_WEEKDAY_SCHEDULE_DAY_OPT if rm_toggle_policy == "atr-searched"
                      else _SCHEDULE_DAY_OPT)
         schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _sched_opt.items()}
+        schedule_genes.update(_decision_time_gene(decision_times))   # after the days: no index shift
         cfg = {
             "populationSize": int(args.population),
             "generations": int(args.generations),
@@ -7129,6 +7189,16 @@ def _cmd_optimize_batch(args) -> int:
             jobs.append((e, "FACTOR"))
         else:
             jobs.extend((e, k) for k in strategies)
+    # --decision-times (see _cmd_optimize): one list for the whole batch, refused up front if ANY
+    # job of the batch cannot carry the gene (a partial application would score some jobs on a
+    # time search and others not, under one flag).
+    decision_times = _resolve_decision_times(
+        getattr(args, "decision_times", None), "optimize-batch", interval=args.interval,
+        name=args.name_prefix or "phase1",
+        bypass_jobs=[e for e, _k in jobs if _EXPERT_OPT[e].get("bypass")],
+        option_jobs=[f"{e}/{k}" for e, k in jobs
+                     if (_EXPERT_OPT[e].get("options") or k in _OPTION_STRATEGY_KEYS
+                         or k in _OPTION_GROUPS_ALL)])
     run_sched = None
     if args.run_schedule == "weekly":
         # --run-schedule-day accepts a comma-separated list (e.g. "monday,thursday") so a
@@ -7274,7 +7344,9 @@ def _cmd_optimize_batch(args) -> int:
                                         **{f"schedule:{k}": v for k, v in
                                            (_WEEKDAY_SCHEDULE_DAY_OPT
                                             if rm_toggle_policy == "atr-searched"
-                                            else _SCHEDULE_DAY_OPT).items()}, **_sl_loosen_gene_space()}),
+                                            else _SCHEDULE_DAY_OPT).items()},
+                                        **_decision_time_gene(decision_times),
+                                        **_sl_loosen_gene_space()}),
                 "backtest": backtest_block,
             }
             _apply_lattice_anchor(cfg, strat_kind, getattr(args, "lattice_anchor", None))
@@ -8522,6 +8594,16 @@ def main(argv: "list | None" = None) -> int:
                          "via the schedule:<day> GA genes; this flag has no effect on the day "
                          "selection for those runs. Bypass experts (FactorRanker) don't get the "
                          "schedule genes, so this flag still fully controls their day(s).")
+    op.add_argument("--decision-times", default=None, metavar="HH:MM,HH:MM,...",
+                    help="Search the DECISION TIME as a GA gene (schedule:time): a choice among "
+                         "exactly these exchange-local times, applied to BOTH the entry and the "
+                         "open-positions schedule. Each must be on the --interval bar grid, "
+                         "after the session's first bar and before its last (e.g. "
+                         "09:35,09:40,09:45,10:00,15:30); >= 2 values. Without it the run decides "
+                         "at the single shared DEFAULT_DECISION_TIME. Refused for daily-clock, "
+                         "option and bypass (FactorRanker) jobs. REQUIRES --name to contain "
+                         "'timegene'. Sessions that lack a scheduled time (15:30 on a 13:00 half "
+                         "day) get no decision; they are counted and logged.")
     op.add_argument("--name", default=None)
     op.add_argument("--rerun", action="store_true",
                     help="Run even if an optimization with this --name has already "
@@ -8739,6 +8821,10 @@ def main(argv: "list | None" = None) -> int:
                     help="Comma-separated day(s) for weekly --run-schedule (e.g. 'monday,thursday'). "
                          "NOTE: for a non-bypass expert this only seeds the static fallback — every "
                          "strategy searches WHICH day(s) itself via the schedule:<day> GA genes.")
+    ob.add_argument("--decision-times", default=None, metavar="HH:MM,HH:MM,...",
+                    help="Search the DECISION TIME as a GA gene for every job of the batch "
+                         "(see `optimize --decision-times`). REQUIRES --name-prefix to contain "
+                         "'timegene'; refused if any job is an option or bypass job.")
     ob.add_argument("--name-prefix", default=None, help="Strategy/opt name prefix (default phase1-).")
     ob.add_argument("--poll", type=int, default=15, help="Poll interval seconds (default 15).")
     ob.add_argument("--worker", action="append", default=None, metavar="NAME",

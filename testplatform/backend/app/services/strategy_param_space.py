@@ -56,6 +56,9 @@ Namespacing:
                                    per half per weight, identical keys in single-member and
                                    group jobs so stage-1 winners seed the stage-2 space
   schedule:<day>                   ON/OFF toggle for that weekday's entry scan
+  schedule:time                    DECISION TIME: choice among the job's explicit HH:MM list
+                                   (--decision-times); decoded into the ``times`` of BOTH the
+                                   entry and the manage schedule
   screener:<setting>               screener settings
   market:enabled                   MASTER GENE (int 0/1; atr_grid_2027 market master-gene
                                    addendum) -- present ONLY when the strategy template carries
@@ -80,7 +83,9 @@ from ba2_common.core.market_conditions import field_codes, field_spec
 from ba2_common.core.rule_models import MODE_OFF, NUMERIC_MODE_CHOICES, leaf_mode_kind
 from ba2_common.core.schedule_genes import (  # noqa: F401 -- re-bound for existing callers
     SCHEDULE_DAYS,
+    SCHEDULE_TIME_GENE,
     WEEKDAYS as _WEEKDAYS,
+    hhmm_to_minutes as _hhmm_to_minutes,
     repair_no_weekday as _repair_no_weekday,
     schedule_override_from_genes,
 )
@@ -181,6 +186,21 @@ def _collect_schedule_days(schedule_cfg: Optional[Dict[str, Any]]) -> Dict[str, 
     for day, spec in (schedule_cfg or {}).items():
         if day in SCHEDULE_DAYS and spec and spec.get("optimize"):
             out[f"schedule:{day}"] = _range_entry(0, 1, 1, is_int=True)
+    # THE DECISION-TIME GENE, after the day genes (so adding it never shifts a day gene's index):
+    # a categorical ``choice`` over the job's explicit list, encoded as an int index like every
+    # other choice gene (genetic.py ``_create_individual`` / ``decode_individual``).
+    time_spec = (schedule_cfg or {}).get(SCHEDULE_TIME_GENE[len("schedule:"):])
+    if time_spec and time_spec.get("optimize"):
+        choices = list(time_spec["choices"])
+        for c in choices:
+            _hhmm_to_minutes(c)
+        if len(set(choices)) != len(choices) or len(choices) < 2 or choices != sorted(choices):
+            raise ValueError(
+                f"{SCHEDULE_TIME_GENE}: choices must be >= 2 distinct HH:MM values in ascending "
+                f"order, got {choices!r}")
+        out[SCHEDULE_TIME_GENE] = {
+            "type": "choice", "choices": choices, "min": 0, "max": len(choices) - 1, "step": 1,
+        }
     return out
 
 
@@ -625,6 +645,11 @@ def collect_param_space(
     """
     space: Dict[str, Any] = {}
     space.update(_collect_expert(expert_cfg))
+    if bypass and ((schedule_cfg or {}).get("time") or {}).get("optimize"):
+        # A bypass expert's schedule genes are excluded wholesale (see the docstring); a time gene
+        # declared for one would be silently dead, so refuse it instead.
+        raise ValueError(f"{SCHEDULE_TIME_GENE} is declared for a bypass expert, whose schedule "
+                         f"genes are not searched: refusing a dead gene")
     if not bypass:
         space.update(_collect_conditions(strategy))
         space.update(_collect_schedule_days(schedule_cfg))
@@ -1052,7 +1077,8 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
       {
         'expert_overrides': {param: value},       # model:* stripped of prefix (incl. RM sizing)
         'screener_overrides': {setting: value},
-        'schedule_days': {day: bool}|None,        # None when no schedule:* genes were collected
+        'schedule_days': {day: bool}|None,        # None when no schedule:<day> genes were collected
+        'schedule_time': 'HH:MM'|None,            # the schedule:time gene's value, else None
         'entry_rules': list,                      # concrete TradeRule lists (genes applied,
         'exit_rules': list,                       #  disabled rules/actions pruned)
       }
@@ -1065,6 +1091,7 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     expert_overrides: Dict[str, Any] = {}
     screener_overrides: Dict[str, Any] = {}
     schedule_by_day: Dict[str, Any] = {}
+    schedule_time: Optional[str] = None
     optsel_by_half: Dict[str, Dict[str, Any]] = {}
     market_enabled: Optional[Any] = None
 
@@ -1083,6 +1110,9 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
             expert_overrides[key[len("model:"):]] = val
         elif key.startswith("screener:"):
             screener_overrides[key[len("screener:"):]] = val
+        elif key == SCHEDULE_TIME_GENE:
+            _hhmm_to_minutes(val)   # the decoded choice VALUE: a non-time here is corruption
+            schedule_time = val
         elif key.startswith("schedule:"):
             schedule_by_day[key[len("schedule:"):]] = bool(val)
         elif key.startswith("cond:"):
@@ -1161,6 +1191,7 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         "expert_overrides": expert_overrides,
         "screener_overrides": screener_overrides,
         "schedule_days": schedule_days,
+        "schedule_time": schedule_time,
         "entry_rules": entry_rules,
         "exit_rules": exit_rules,
     }

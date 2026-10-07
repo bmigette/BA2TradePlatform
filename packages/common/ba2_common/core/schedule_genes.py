@@ -4,7 +4,7 @@ Moved from testplatform/backend/app/services/strategy_param_space.py (2026-09) s
 built outside the test app (the public site) reconstruct the same run_schedule_override.
 Pure: no DB, no app imports.
 """
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 # Fixed order so the gene list (and therefore reproducibility) is stable across runs.
 SCHEDULE_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
@@ -12,6 +12,109 @@ SCHEDULE_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturd
 # (their genes are part of stored genomes and of the export/deploy reconstruction below), but
 # they can never produce a decision point on their own.
 WEEKDAYS = SCHEDULE_DAYS[:5]
+
+#: The DECISION-TIME gene: a categorical choice among the job's explicit list of HH:MM values
+#: (exchange-local). Decoded into the ``times`` of BOTH the entry and the manage schedule.
+SCHEDULE_TIME_GENE = "schedule:time"
+
+# Regular US session, minutes since midnight, exchange-local. Intraday bars are stamped at their
+# START, so with an N-minute interval the first bar is 09:30 and the last starts at 16:00 - N.
+_SESSION_OPEN_MIN = 9 * 60 + 30
+_SESSION_CLOSE_MIN = 16 * 60
+
+_INTERVAL_MINUTES = {"1min": 1, "5min": 5, "15min": 15, "30min": 30, "60min": 60, "1h": 60}
+
+
+def interval_minutes(execution_interval: str) -> int:
+    """Bar length in minutes for an intraday execution interval; raises for a daily clock or an
+    unknown interval (a decision TIME has no meaning on a daily clock)."""
+    if execution_interval in _INTERVAL_MINUTES:
+        return _INTERVAL_MINUTES[execution_interval]
+    raise ValueError(
+        f"a decision time needs an intraday execution interval {sorted(_INTERVAL_MINUTES)}, "
+        f"got {execution_interval!r} (a daily clock has one bar per session: nothing to time)")
+
+
+def hhmm_to_minutes(value: Any) -> int:
+    if (not isinstance(value, str) or len(value) != 5 or value[2] != ":"
+            or not (value[:2] + value[3:]).isdigit()):
+        raise ValueError(f"decision time {value!r} must be a zero-padded HH:MM string")
+    hh, mm = int(value[:2]), int(value[3:])
+    if hh > 23 or mm > 59:
+        raise ValueError(f"decision time {value!r} is not a clock time")
+    return hh * 60 + mm
+
+
+def _fmt(minutes: int) -> str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def validate_decision_times(values: Any, execution_interval: str, *, min_values: int = 2
+                            ) -> List[str]:
+    """The job's decision-time list, validated LOUDLY and returned sorted.
+
+    Every value must be HH:MM, on the bar grid of ``execution_interval`` (minutes since the
+    09:30 open divisible by the bar length), STRICTLY AFTER the session's first bar (the price at
+    a decision is the close of the latest bar that has ENDED, so a decision on the first bar only
+    sees the prior session: the engine merely warns for stored rows, a NEW job refuses), and
+    STRICTLY BEFORE the session's last bar (an order fills at the open of the first bar AFTER the
+    decision bar; a decision on the last bar would fill at the NEXT session's open, an overnight
+    gap live never takes, since live fills within seconds). At least two distinct values (one
+    value is not a gene), no duplicates. Sorted so the gene's index order, and therefore the
+    job's identity, does not depend on how the list was typed.
+
+    A time that does not exist on a SHORT session (13:00 half days) is not refused here (the
+    calendar is not known to this pure function); the engine counts and logs those sessions.
+    """
+    step = interval_minutes(execution_interval)
+    if isinstance(values, str) or not isinstance(values, Sequence):
+        raise ValueError(f"decision times must be a list of HH:MM strings, got {values!r}")
+    mins = [hhmm_to_minutes(v) for v in values]
+    if len(set(mins)) != len(mins):
+        raise ValueError(f"decision times {list(values)!r} contain a duplicate")
+    if len(mins) < min_values:
+        raise ValueError(
+            f"decision times {list(values)!r}: need at least {min_values} value(s) "
+            f"(a gene needs two: a single time is not a search)")
+    first_bar, last_bar = _SESSION_OPEN_MIN, _SESSION_CLOSE_MIN - step
+    for v, m in zip(values, mins):
+        if m < first_bar or m > last_bar or (m - first_bar) % step != 0:
+            raise ValueError(
+                f"decision time {v!r} is not on the {execution_interval} bar grid of the regular "
+                f"session ({_fmt(first_bar)}..{_fmt(last_bar)})")
+        if m == first_bar:
+            raise ValueError(
+                f"decision time {v!r} is the session's first bar: the decision price would be the "
+                f"PRIOR session's last close (use >= {_fmt(first_bar + step)})")
+        if m == last_bar:
+            raise ValueError(
+                f"decision time {v!r} is the session's last bar: the order would fill at the NEXT "
+                f"session's open (use <= {_fmt(last_bar - step)})")
+    return [_fmt(m) for m in sorted(mins)]
+
+
+def retime_schedules(config: Dict[str, Any], decision_time: str) -> Dict[str, Any]:
+    """``config`` with BOTH the entry and the manage schedule retimed to ``decision_time`` (days
+    untouched). For tools that re-run a stored row at another time (the same two schedules the
+    ``schedule:time`` gene drives). Validated against the config's own execution interval;
+    refuses a config that lacks either schedule's days. Returns a NEW dict (shallow copy)."""
+    validate_decision_times([decision_time], config["execution_interval"], min_values=1)
+    out = dict(config)
+    for key in ("run_schedule_override", "manage_schedule_override"):
+        sched = config.get(key)
+        if not sched or not sched.get("days"):
+            raise ValueError(f"cannot retime: config has no {key} with days")
+        out[key] = {"days": dict(sched["days"]), "times": [decision_time]}
+    return out
+
+
+def schedule_time_from_genes(strategy_params: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The decision time a stored genome chose (its ``schedule:time`` gene), or None."""
+    if not isinstance(strategy_params, dict) or SCHEDULE_TIME_GENE not in strategy_params:
+        return None
+    value = strategy_params[SCHEDULE_TIME_GENE]
+    hhmm_to_minutes(value)  # a stored non-time value is corrupt: refuse, never reinterpret
+    return value
 
 
 def repair_no_weekday(days: Dict[str, bool], option_run: bool) -> Dict[str, bool]:
@@ -76,13 +179,25 @@ def schedule_override_from_genes(
     """
     if not isinstance(strategy_params, dict):
         return None
+    chosen_time = schedule_time_from_genes(strategy_params)
     by_day = {
         k[len("schedule:"):]: bool(v)
         for k, v in strategy_params.items()
-        if isinstance(k, str) and k.startswith("schedule:")
+        if isinstance(k, str) and k.startswith("schedule:") and k != SCHEDULE_TIME_GENE
     }
-    if not by_day:
+    if not by_day and chosen_time is None:
         return None
+    if not by_day:
+        # A time gene with no day genes: the days are the run-level override's, untouched.
+        base_days = (base_override or {}).get("days")
+        if not base_days:
+            raise ValueError(
+                "a genome carries a schedule:time gene but no schedule:<day> genes and the run "
+                "states no days: refusing to guess a cadence")
+        days = dict(base_days)
+        if weekdays_only:
+            days = {day: (bool(value) and day in WEEKDAYS) for day, value in days.items()}
+        return {"days": days, "times": [chosen_time]}
     days = {day: by_day.get(day, False) for day in SCHEDULE_DAYS}
     if weekdays_only:
         days = {day: (value and day in WEEKDAYS) for day, value in days.items()}
@@ -93,4 +208,7 @@ def schedule_override_from_genes(
     # A stored row that states no time ran at the session's first bar (every row before the
     # 2026-10-07 default moved); a NEW run always states its time (DEFAULT_DECISION_TIME).
     from ba2_common.core.knowability import LEGACY_DECISION_TIME
+    if chosen_time is not None:
+        # The genome CHOSE its time: it wins over the run-level time (both live schedules).
+        return {"days": days, "times": [chosen_time]}
     return {"days": days, "times": (base_override or {}).get("times") or [LEGACY_DECISION_TIME]}

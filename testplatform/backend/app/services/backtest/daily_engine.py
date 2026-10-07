@@ -584,6 +584,7 @@ class DailyBacktestEngine:
 
         days = trading_days(self.config["start_date"], self.config["end_date"], self.price)
         self._warn_if_deciding_on_the_first_bar(days)
+        self._count_sessions_without_decision_bar(days)
         total = max(len(days), 1)
         # Progress throttle: the handler's progress_cb does DB work every call (a task-queue
         # pause-check + a progress write). On a 5-minute fill clock a 1-year/8-symbol run is
@@ -962,6 +963,54 @@ class DailyBacktestEngine:
                     f"quote. Use a time >= the first bar + one bar (ba2_common.core.knowability."
                     f"DEFAULT_DECISION_TIME).")
                 return
+
+    def _count_sessions_without_decision_bar(self, days: List[Any]) -> None:
+        """COUNT (and log, once per run) the scheduled sessions on which a scheduled time has no
+        bar, so the pass for that time NEVER RUNS that session.
+
+        The case this exists for: a decision time late in the day (15:30) on a SHORT session. A
+        half day closes at 13:00, its last 5-minute bar is 12:55, so a 15:30 schedule matches no
+        bar and the session gets no entry decision (and no manage pass at that time). The engine
+        has always skipped such a session silently (the loop only visits bars that exist); this
+        makes the skip explicit, counted and loud. It is deliberately NOT a refusal -- a
+        half-day skip is the conservative behaviour (no entry on a closed market) -- and it does
+        not change a decision, a fill or the results.
+
+        LIVE DIFFERS: JobManager fires a CronTrigger at the stored time with no session check
+        (``JobManager._parse_schedule``), so on a half day live would run the 15:30 pass against
+        a closed market. That asymmetry is reported in the feature notes, not hidden here.
+
+        ``self.sessions_without_decision_bar`` = ``{"entry": n, "manage": n}`` (sessions x times).
+        No-op on a daily clock."""
+        self.sessions_without_decision_bar = {"entry": 0, "manage": 0}
+        if not getattr(self.price, "is_intraday", False):
+            return
+        bars_by_day: Dict[Any, set] = {}
+        for d in days:
+            bars_by_day.setdefault(d.date(), set()).add((d.hour, d.minute))
+        examples: Dict[str, List[str]] = {"entry": [], "manage": []}
+        for expert, _eid, _settings, _ruleset in self.experts:
+            for label, sched in (("entry", self._entry_schedule(expert)),
+                                 ("manage", self._manage_schedule(expert))):
+                times = (sched or {}).get("times") or []
+                if not times:
+                    continue
+                wanted = [(t, (int(t[:2]), int(t[3:]))) for t in times]
+                enabled = (sched or {}).get("days") or {}
+                for day, hm in bars_by_day.items():
+                    if not enabled.get(_WEEKDAYS[day.weekday()], True):
+                        continue
+                    for t, key in wanted:
+                        if key not in hm:
+                            self.sessions_without_decision_bar[label] += 1
+                            if len(examples[label]) < 5:
+                                examples[label].append(f"{day} {t}")
+        if any(self.sessions_without_decision_bar.values()):
+            logger.warning(
+                f"[daily_engine] SESSIONS WITHOUT A DECISION BAR: "
+                f"{self.sessions_without_decision_bar} (scheduled session x time with no bar at "
+                f"that time, e.g. a 15:30 decision on a 13:00 half day): the pass does not run "
+                f"on those sessions. First examples: {examples}")
 
     def _entry_schedule(self, expert: Any) -> Optional[Dict[str, Any]]:
         """The expert's ``execution_schedule_enter_market`` (common base setting), or None.
