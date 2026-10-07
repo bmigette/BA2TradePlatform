@@ -48,10 +48,14 @@ from zoneinfo import ZoneInfo
 #: The entry/decision time (exchange-local HH:MM) NEW stock backtests, grids and optimizations run
 #: at, and therefore the time their deployed instances must fire at. The price at a decision is
 #: the close of the latest 5-minute bar that has ENDED, so the decision must sit at least one bar
-#: after the session's first bar: at 09:40 the 09:35 bar has ended (live reads a quote of that
-#: moment). ONE definition: the launcher, the API, the robustness suite, the UI default
-#: (frontend/src/lib/decisionTime.ts, pinned equal by a test) and the deploy tools use it.
-DEFAULT_DECISION_TIME = "09:40"
+#: after the session's first bar. 10:00 rather than 09:40 by measurement (151 sampled sessions
+#: 2020-2025, 1,715 symbols, 235k symbol-days): the share of symbol-days with a bar stamped exactly
+#: at the decision bar -- the engine skips a symbol without one -- is 88.2% (small caps) / 95.2%
+#: (mid) / 97.9% (large) at 09:40 and 90.8% / 97.0% / 98.4% at 10:00 (96.8 / 98.7 / 98.9 at 09:30,
+#: the opening bar a decision may not use). ONE definition: the launcher, the API, the robustness
+#: suite, the UI default (frontend/src/lib/decisionTime.ts, pinned equal by a test) and the
+#: deploy tools use it.
+DEFAULT_DECISION_TIME = "10:00"
 
 #: The time every STORED row before 2026-10-07 ran at (the session's first bar). Used ONLY to
 #: reconstruct such rows that carry no explicit time; never a default for a new run.
