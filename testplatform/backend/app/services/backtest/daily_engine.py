@@ -476,6 +476,13 @@ class DailyBacktestEngine:
         # Adds the bypass manager refused under its per-symbol max-loss rule, over the run
         # (RECORDED, NOT SCORED; see FactorRanker.portfolio.ProtectiveStopError).
         self._refused_adds = 0
+        # Counters of the intraday-clock rule, published in ``results["intraday_clock"]``:
+        #   undecidable_symbol_days       -- (decision day x symbol) pairs dropped from an ENTRY pass
+        #                                    because no price was knowable at the decision (halted /
+        #                                    stale / no bars): the universe the experts really saw
+        # (the sessions on which a scheduled time had no bar at all, i.e. no decision that day, are
+        # ``self.sessions_without_decision_bar``, published next to these.)
+        self.intraday_counters: Dict[str, int] = {"undecidable_symbol_days": 0}
 
         # Entry-option path: when the run's enter_market action IS an option action (pure-option
         # entry, no equity leg), the option action must size + submit itself — so the entry runs
@@ -582,6 +589,7 @@ class DailyBacktestEngine:
         # never reached its own reset.
         reset_stressed()
 
+        self._assert_daily_reads_are_clamped()
         days = trading_days(self.config["start_date"], self.config["end_date"], self.price)
         self._warn_if_deciding_on_the_first_bar(days)
         self._count_sessions_without_decision_bar(days)
@@ -775,6 +783,9 @@ class DailyBacktestEngine:
                         continue
                 if entry_ok:
                     analyzed_entry_days.add(_day_key)
+                    if self.price.is_intraday:
+                        self.intraday_counters["undecidable_symbol_days"] += (
+                            len(self.config["enabled_instruments"]) - len(universe))
                 if manage_ok:
                     analyzed_manage_days.add(_day_key)
                 book_dirty = True  # an analysis/management pass runs -> orders may be created
@@ -935,6 +946,24 @@ class DailyBacktestEngine:
             return True
 
     # -- run-cadence --------------------------------------------------------
+    def _assert_daily_reads_are_clamped(self) -> None:
+        """An intraday run's OHLCV reader MUST be bound to THIS run's price source, otherwise every
+        daily read the experts make returns the decision session's own finished bar (the +404%
+        defect). Refuses to start rather than run unclamped. No-op on a daily clock and when the
+        run has no per-run OHLCV reader (fixture runs that preload bars)."""
+        if not getattr(self.price, "is_intraday", False):
+            return
+        from app.services.backtest.seam_wiring import _current_ohlcv_override
+
+        reader = _current_ohlcv_override()
+        if reader is None or not hasattr(reader, "bind_price_source"):
+            return
+        if getattr(reader, "_ps", None) is not self.price:
+            raise RuntimeError(
+                "intraday backtest started with an OHLCV reader that is not bound to the run's price "
+                "source (MemoizedOHLCVProvider.bind_price_source): daily reads would return the "
+                "decision session's own bar. Refusing to run.")
+
     def _warn_if_deciding_on_the_first_bar(self, days: List[Any]) -> None:
         """ONE WARNING per run when an entry schedule time equals the first bar of a session.
 
@@ -2075,7 +2104,7 @@ class DailyBacktestEngine:
         return {
             "equity_history": self.account.get_balance_history(),
             "trades": self.account.get_filled_trades(),
-            "final_equity": self.account.equity(),
+            "final_equity": self.account.equity(close_mark=True),
             "initial_capital": float(self.account._cfg["starting_cash"]),
             # RECORDED, NOT SCORED -- see ``_record_uncovered_assigned``.
             "uncovered_assigned_bars": self._uncovered_assigned_metric(),

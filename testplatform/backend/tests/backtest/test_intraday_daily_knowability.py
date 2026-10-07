@@ -119,13 +119,20 @@ class _ProbeExpert(MarketExpertInterface):
         # 3. DeterministicScorer's real reader (whole series cached for the run, sliced per bar)
         rec["ds_fetch_ohlcv"] = last(ds_data.fetch_ohlcv(providers, SYMBOL, as_of))
         # 4. the whole-series (bulk) read + the cutoff hook a caching reader must slice with
-        bulk = ohlcv.get_ohlcv_data(SYMBOL, start_date=as_of - timedelta(days=30), end_date=far,
-                                    interval="1d")
-        cut = pd.Timestamp(knowable_daily_end(providers, as_of)).tz_localize(None) \
-            if pd.Timestamp(knowable_daily_end(providers, as_of)).tzinfo else \
-            pd.Timestamp(knowable_daily_end(providers, as_of))
+        # any other end shape is clamped BY DEFAULT: the far future, the end of the decision day, None
+        rec["far_end"] = last(ohlcv.get_ohlcv_data(SYMBOL, start_date=as_of - timedelta(days=30),
+                                                   end_date=far, interval="1d"))
+        rec["eod_end"] = last(ohlcv.get_ohlcv_data(
+            SYMBOL, end_date=datetime.combine(as_of.date(), datetime.max.time(), tzinfo=timezone.utc),
+            interval="1d"))
+        rec["none_end"] = last(ohlcv.get_ohlcv_data(SYMBOL, interval="1d"))
+        # the EXPLICIT opt-out: the unsliced series, which the caller slices with the hook
+        bulk = ohlcv.get_ohlcv_data_unsliced(SYMBOL, start_date=as_of - timedelta(days=30),
+                                             end_date=far, interval="1d")
+        cut = pd.Timestamp(knowable_daily_end(providers, as_of))
+        cut = cut.tz_localize(None) if cut.tzinfo else cut
         rec["bulk_sliced"] = last(bulk[pd.to_datetime(bulk["Date"]) <= cut])
-        rec["bulk_unsliced"] = last(bulk)   # documented: the CALLER slices a bulk read
+        rec["bulk_unsliced"] = last(bulk)
         # 5. the price every expert's current_price comes from
         rec["price_at_date"] = providers.price_at_date(SYMBOL, as_of)
         self.records.append(rec)
@@ -200,7 +207,8 @@ def _run(interval: str, run_id: int, times=None):
 PRIOR = {date(2024, 1, 2): date(2023, 12, 29), date(2024, 1, 3): date(2024, 1, 2),
          date(2024, 1, 4): date(2024, 1, 3)}
 #: the readers whose result must be prior-session on an intraday clock
-KNOWABLE_READERS = ("explicit_end", "clamped_none_end", "ds_fetch_ohlcv", "bulk_sliced")
+KNOWABLE_READERS = ("explicit_end", "clamped_none_end", "ds_fetch_ohlcv", "bulk_sliced",
+                    "far_end", "eod_end", "none_end")
 
 
 #: the schedule time of a decision: the session's FIRST bar (a stored row's 09:30), one bar later,
@@ -231,12 +239,13 @@ def test_no_daily_reader_sees_the_decision_sessions_own_bar(intraday_run, reader
             f"only {PRIOR[decision_day]} is a finished session at that instant")
 
 
-def test_a_bulk_read_is_the_callers_to_slice(intraday_run):
-    """A whole-series read (end past the clock) is returned whole -- caching readers slice it with
-    ``knowable_daily_end``. Pinned so nobody 'fixes' it by clamping and freezing DeterministicScorer's
-    run-long cache at its first bar."""
+def test_only_the_explicit_unsliced_read_returns_the_whole_series(intraday_run):
+    """The clamp is the DEFAULT for every shape of ``end_date``; the whole series comes back only from
+    the explicit opt-out ``get_ohlcv_data_unsliced`` (DeterministicScorer's cache), which the caller
+    slices with ``knowable_daily_end``."""
     records, _, _ = intraday_run
     assert all(rec["bulk_unsliced"] == date(2024, 1, 5) for rec in records)
+    assert all(rec["far_end"] != date(2024, 1, 5) for rec in records)
 
 
 def test_price_at_date_is_the_close_of_the_latest_bar_that_has_ended(intraday_run):
@@ -269,13 +278,56 @@ def test_a_decision_on_the_first_bar_warns_and_a_later_one_does_not(monkeypatch)
     assert not any("first bar of a session" in m for m in seen)
 
 
-def test_unclamped_run_is_the_defect(monkeypatch):
-    """Control: with the memo's price source unbound (the pre-fix behaviour) the same run DOES
-    return the decision session's own bar -- so the assertions above are not vacuous."""
+def test_an_intraday_run_with_an_unbound_reader_refuses_to_start(monkeypatch):
+    """Control + guard: a memo not bound to the run's price source is exactly the pre-fix defect (daily
+    reads return the decision session's own bar). The engine refuses to run instead of serving it."""
     monkeypatch.setattr(MemoizedOHLCVProvider, "bind_price_source", lambda self, ps: None)
-    records, _ = _run("5min", 702)
-    leaked = [r for r in records if r["explicit_end"] == r["as_of"].date()]
-    assert leaked, "an unbound memo should still serve the same-session bar (the defect)"
+    with pytest.raises(RuntimeError, match="not bound"):
+        _run("5min", 702)
+
+
+@pytest.mark.parametrize("hhmm", ["09:30", "10:00", "15:55"])
+@pytest.mark.parametrize("shape", ["none", "decision", "eod", "now", "far"])
+def test_fuzz_no_end_date_shape_returns_anything_newer_than_the_cutoff(hhmm, shape):
+    """Reviewer's fuzz: end_date in {None, as_of, end of the as_of day, wall-clock now, far future} x
+    decision times -> nothing newer than the knowable cutoff, unless the unsliced read is explicit."""
+    ps = _ps("5min")
+    memo = MemoizedOHLCVProvider(_FakeDaily(), datetime(2023, 12, 1), datetime(2024, 1, 31), interval="5min")
+    memo.bind_price_source(ps)
+    h, m = int(hhmm[:2]), int(hhmm[3:])
+    t = _wall(2024, 1, 3, h, m)
+    ps.set_clock(t)
+    end = {"none": None, "decision": t, "eod": datetime.combine(t.date(), datetime.max.time(), tzinfo=timezone.utc),
+           "now": datetime.now(timezone.utc), "far": datetime(2035, 1, 1, tzinfo=timezone.utc)}[shape]
+    df = memo.get_ohlcv_data(SYMBOL, end_date=end, interval="1d")
+    assert pd.Timestamp(df["Date"].iloc[-1]).date() == date(2024, 1, 2)       # 2024-01-03 not finished
+    full = memo.get_ohlcv_data_unsliced(SYMBOL, end_date=end, interval="1d")
+    assert pd.Timestamp(full["Date"].iloc[-1]).date() > date(2024, 1, 2)       # explicit opt-out only
+
+
+def test_while_the_intraday_clock_is_on_a_missing_hook_raises(monkeypatch):
+    """No silent fallbacks: with the intraday decision clock on, an unbound reader, a provider without
+    the hook and a read before the first tick all RAISE."""
+    from ba2_common.core.knowability import intraday_decisions
+
+    memo = MemoizedOHLCVProvider(_FakeDaily(), datetime(2023, 12, 1), datetime(2024, 1, 31), interval="5min")
+
+    class _P:
+        def __init__(self, o): self._o = o
+        def ohlcv(self): return self._o
+
+    with intraday_decisions(True):
+        with pytest.raises(RuntimeError):
+            memo.knowable_daily_end(_wall(2024, 1, 3, 10, 0))
+        with pytest.raises(RuntimeError):
+            memo.get_ohlcv_data(SYMBOL, interval="1d")
+        with pytest.raises(RuntimeError):
+            knowable_daily_end(_P(_FakeDaily()), _wall(2024, 1, 3, 10, 0))
+        memo.bind_price_source(_ps("5min"))              # bound but the clock was never set
+        with pytest.raises(RuntimeError):
+            memo.get_ohlcv_data(SYMBOL, interval="1d")
+    # flag off (live / daily clock): the identity, as before
+    assert knowable_daily_end(_P(_FakeDaily()), _wall(2024, 1, 3, 10, 0)) == _wall(2024, 1, 3, 10, 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -547,3 +599,83 @@ def test_a_market_order_on_a_thin_symbol_fills_at_its_next_bar_whenever_that_ope
         symbol = "THIN"
 
     assert acct._bar_for_fill(_O(), t)["open"] == thin[2]["Open"]
+
+
+# --------------------------------------------------------------------------- #
+# I1: decision-time marks use the decision price; the recorded curve keeps the bar close
+# --------------------------------------------------------------------------- #
+
+def _marked_account(acct_id):
+    from app.services.backtest.backtest_account import BacktestAccount
+    from tests.backtest.test_max_loss_stop_engine import CFG
+
+    ps = _ps("5min")
+    rows = _day_bars(date(2024, 1, 3), minutes=120, base=100.0)
+    ps.load_bars("AAPL", rows)
+    t = _wall(2024, 1, 3, 10, 0)
+    ps.set_clock(t)
+    acct = BacktestAccount(acct_id, ps, CFG)
+    acct._update_position("AAPL", 10, 100.0)
+    return acct, ps, rows, t
+
+
+def test_equity_for_sizing_marks_at_the_decision_price_not_the_bar_close():
+    acct, ps, rows, t = _marked_account(996)
+    wall = t.replace(tzinfo=None)
+    ended = max(r["Date"] for r in rows if r["Date"] + timedelta(minutes=5) <= wall)
+    dec = next(r["Close"] for r in rows if r["Date"] == ended)
+    clock_close = next(r["Close"] for r in rows if r["Date"] == wall)
+    assert dec != clock_close
+    assert acct.equity() - acct._cash == pytest.approx(10 * dec)                          # decision read
+    assert acct.equity(close_mark=True) - acct._cash == pytest.approx(10 * clock_close)   # recorded value
+    assert acct.snapshot_equity(t)["equity_value"] == pytest.approx(10 * clock_close)     # the curve keeps the close
+    assert acct.get_positions()[0]["current_price"] == pytest.approx(dec)                 # rules read the decision price
+
+
+def test_daily_clock_marks_are_unchanged():
+    from app.services.backtest.backtest_account import BacktestAccount
+    from tests.backtest.test_max_loss_stop_engine import CFG
+
+    ps = _ps("1d")
+    ps.load_bars(SYMBOL, [{"Date": d, "Open": o, "High": h, "Low": lo, "Close": c, "Volume": 1}
+                          for d, o, h, lo, c in DAILY if d <= date(2024, 1, 4)])
+    ps.set_clock(datetime(2024, 1, 3, tzinfo=timezone.utc))
+    acct = BacktestAccount(995, ps, CFG)
+    acct._update_position(SYMBOL, 10, 100.0)
+    assert acct.equity() - acct._cash == pytest.approx(10 * 97.75)
+    assert acct.equity(close_mark=True) == acct.equity()
+
+
+# --------------------------------------------------------------------------- #
+# I3: an equity MARKET entry whose next bar is in another session expires (DAY order), counted
+# --------------------------------------------------------------------------- #
+
+def test_a_market_entry_whose_next_bar_is_days_away_expires_instead_of_filling(monkeypatch):
+    from types import SimpleNamespace
+    from app.services.backtest import backtest_account as BA
+    from app.services.backtest.backtest_account import BacktestAccount
+    from ba2_common.core.types import AssetClass, OrderDirection, OrderStatus, OrderType
+    from tests.backtest.test_max_loss_stop_engine import CFG
+
+    ps = _ps("5min")
+    ps.load_bars("AAPL", _day_bars(date(2024, 1, 2), minutes=390) + _day_bars(date(2024, 1, 3), minutes=390))
+    # THIN last printed on 2024-01-02, its next print is Friday 2024-01-12; decision on 2024-01-03
+    ps.load_bars("THIN", _day_bars(date(2024, 1, 2), minutes=390, base=20.0)
+                 + _day_bars(date(2024, 1, 12), minutes=390, base=21.0))
+    t = _wall(2024, 1, 3, 10, 0)
+    ps.set_clock(t)
+    assert ps.decision_price("THIN", t) is not None      # decidable: last print is the prior session
+    acct = BacktestAccount(994, ps, CFG)
+    monkeypatch.setattr(BA, "update_instance", lambda o: None)
+
+    def order(sym, side=OrderDirection.BUY):
+        return SimpleNamespace(symbol=sym, side=side, order_type=OrderType.MARKET,
+                               asset_class=AssetClass.EQUITY, comment="", status=OrderStatus.ACCEPTED)
+
+    o = order("THIN")
+    assert acct._refuse_cross_session_market_entry(o, t) is True
+    assert o.status == OrderStatus.EXPIRED
+    assert acct.intraday_counters["entries_refused_next_bar_other_session"] == 1
+    assert acct._refuse_cross_session_market_entry(order("AAPL"), t) is False   # next bar same session
+    acct._update_position("THIN", 5, 20.0)
+    assert acct._refuse_cross_session_market_entry(order("THIN", OrderDirection.SELL), t) is False  # closing

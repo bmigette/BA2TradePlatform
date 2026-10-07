@@ -257,8 +257,13 @@ def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
     covered_from, df = _OHLCV_COVERAGE.get(key, (None, None))
     if df is None or (covered_from is not None and need_from < covered_from):
         try:
-            df = providers.ohlcv().get_ohlcv_data(
-                symbol=symbol, start_date=need_from, end_date=now, interval="1d")
+            ohlcv = providers.ohlcv()
+            # This reader caches the whole series for the run and slices it per decision through
+            # ``knowable_daily_end`` below, so on a backtest provider it asks for the UNSLICED series
+            # explicitly (every other daily read is clamped to the knowable history by default).
+            # Live providers have no such method and are read as before.
+            fetch = getattr(ohlcv, "get_ohlcv_data_unsliced", None) or ohlcv.get_ohlcv_data
+            df = fetch(symbol=symbol, start_date=need_from, end_date=now, interval="1d")
         except ReplayMiss:
             raise
         except ReplayMiss:

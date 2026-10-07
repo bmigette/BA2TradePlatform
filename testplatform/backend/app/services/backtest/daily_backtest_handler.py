@@ -1043,6 +1043,15 @@ def run_daily_backtest(
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).
             results = build_results(account, config)
+            if ps.is_intraday:
+                # What the intraday-clock rule dropped, so a REDUCED universe / lost decision is
+                # visible in the persisted result (intraday runs only; absent on a daily clock).
+                results["intraday_clock"] = {
+                    **engine.intraday_counters,
+                    **account.intraday_counters,
+                    "sessions_without_decision_bar": dict(
+                        getattr(engine, "sessions_without_decision_bar", {})),
+                }
             # How option fills were priced (plan Part F). Options runs only, so an equity
             # run's results are exactly what they were.
             apply_option_spread_record(results, account)

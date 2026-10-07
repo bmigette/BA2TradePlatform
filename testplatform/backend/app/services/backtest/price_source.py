@@ -748,6 +748,21 @@ class AsOfPriceSource:
             return None
         return DecisionPrice(float(self._c[symbol][f]), int(k[f]), as_of)
 
+    def volume_so_far(self, symbol: str, as_of: Any) -> Optional[float]:
+        """Volume traded in T's own session so far: the sum over the intraday bars that have ENDED
+        at or before ``as_of`` (knowable; 0.0 when none has ended yet). Intraday clock only --
+        ``None`` on a daily clock or for a symbol with no bars."""
+        if not self._intraday:
+            return None
+        k = self._keys.get(symbol)
+        if k is None or not len(k):
+            return None
+        key = _key64(as_of, self._interval)
+        end = bisect.bisect_right(k, key - _interval_ns(self._interval))     # first bar not yet ended
+        day0 = (key // _NS_PER_DAY) * _NS_PER_DAY
+        start = bisect.bisect_left(k, day0)
+        return float(self._v[symbol][start:end].sum()) if end > start else 0.0
+
     # ---- loading -----------------------------------------------------------
     def preload(
         self,
@@ -1271,6 +1286,9 @@ def _finished_session_end(as_of_utc: datetime) -> datetime:
     return datetime(d.year, d.month, d.day, 23, 59, 59, 999999, tzinfo=timezone.utc)
 
 
+_NS_PER_DAY = 86_400 * 1_000_000_000
+
+
 def _interval_ns(interval: str) -> int:
     """A bar interval string ('1min', '5m', '15min', '1h', '4hour') in nanoseconds. Refuses an
     interval it cannot read: the finished-bar test cannot be guessed."""
@@ -1430,7 +1448,12 @@ class MemoizedOHLCVProvider:
         series: the latest stamp a daily bar may carry at decision ``as_of``. Identity when no
         price source is bound or the run is on a daily clock."""
         ps = self._ps
-        return as_of if ps is None else ps.knowable_daily_end(as_of)
+        if ps is None:
+            if self._intraday_decision_active():
+                raise RuntimeError("knowable_daily_end asked of a MemoizedOHLCVProvider that is not "
+                                   "bound to the run's price source during an intraday backtest")
+            return as_of
+        return ps.knowable_daily_end(as_of)
 
     def cached_path(self, symbol: str, interval: str) -> Optional[str]:
         """The native on-disk parquet for (symbol, interval), or None when there is none to sign.
@@ -1572,39 +1595,56 @@ class MemoizedOHLCVProvider:
             hi = int(np.searchsorted(dates, e, side="right"))
         return df.iloc[lo:hi].reset_index(drop=True)
 
+    def _intraday_decision_active(self) -> bool:
+        from ba2_common.core.knowability import intraday_decision_clock
+        return intraday_decision_clock()
+
     def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval="1d", **kwargs):
+        """DAILY reads on an intraday run are clamped to the knowable history WHATEVER the shape of
+        ``end_date`` (None, the decision instant, the end of its day, the wall clock, the far
+        future): the clamp is the DEFAULT. A caller that slices the series itself per decision
+        opts out EXPLICITLY through :meth:`get_ohlcv_data_unsliced`."""
+        return self._read(symbol, start_date, end_date, interval, unsliced=False)
+
+    def get_ohlcv_data_unsliced(self, symbol, start_date=None, end_date=None, interval="1d", **kwargs):
+        """The stored series, NOT clamped to the decision. ONLY for a reader that caches the series
+        for the run and slices it per decision through ``knowable_daily_end`` (DeterministicScorer
+        ``fetch_ohlcv``). Flagged ``bulk`` in the audit."""
+        return self._read(symbol, start_date, end_date, interval, unsliced=True)
+
+    def _read(self, symbol, start_date, end_date, interval, *, unsliced):
         df, dates = self._full(symbol, interval)
         requested_end = end_date
-        bulk = False
         ps = self._ps
-        # DAILY knowability (see ``AsOfPriceSource.knowable_daily_end``): on an intraday run a
-        # daily read made at the decision clock may not return the decision session's own bar.
-        # Only an end AT OR BEFORE the clock is a decision-instant read and is clamped. An end
-        # beyond the clock (a wall-clock ``now``) or no end is a BULK read: the caller takes the
-        # whole series and slices it itself per bar (DeterministicScorer caches it for the run),
-        # so it is flagged ``bulk`` in the audit and that caller MUST slice through
-        # ``knowable_daily_end``. Clamping a bulk read would freeze the caller's cache at the
-        # first bar.
-        if ps is not None and ps.is_intraday and interval == "1d":
+        active = interval == "1d" and self._intraday_decision_active()
+        if active and (ps is None or not ps.is_intraday):
+            # An intraday decision clock is on but this reader has no price source to say what is
+            # knowable: refusing is the only answer that cannot leak.
+            raise RuntimeError(
+                "daily OHLCV read during an intraday backtest by a MemoizedOHLCVProvider that is not "
+                "bound to the run's price source (bind_price_source): knowability cannot be determined")
+        if ps is not None and ps.is_intraday and interval == "1d" and not unsliced:
             clk = ps.current()
             if clk is None:
+                if active:
+                    raise RuntimeError(
+                        f"daily OHLCV read for {symbol} before the first clock tick of an intraday "
+                        f"run: knowability cannot be determined")
                 self.unclocked_daily_reads += 1
                 if self.unclocked_daily_reads == 1:
                     logger.warning(
-                        "daily OHLCV read for %s on an intraday run before the first clock tick: "
-                        "knowability cannot be determined, served UNCLAMPED (counted in "
-                        "MemoizedOHLCVProvider.unclocked_daily_reads)", symbol)
-            elif end_date is None or _to_utc(end_date) > _to_utc(clk):
-                bulk = True
+                        "daily OHLCV read for %s on an intraday run before the first clock tick "
+                        "(outside the decision loop): served unclamped, counted in "
+                        "MemoizedOHLCVProvider.unclocked_daily_reads", symbol)
             else:
                 cap = ps.knowable_daily_end(clk)
-                if _to_utc(end_date) > cap:
+                if end_date is None or _to_utc(end_date) > cap:
                     end_date = cap
         out = self._slice(df, dates, start_date, end_date)
         if self.audit is not None and interval == "1d":
             self.audit.append({
                 "symbol": symbol, "clock": None if ps is None else ps.current(),
-                "requested_end": requested_end, "bulk": bulk,
+                "requested_end": requested_end, "bulk": bool(unsliced),
                 "last_bar": (None if out is None or not len(out) else out["Date"].iloc[-1]),
                 "n": 0 if out is None else len(out)})
         return out

@@ -115,7 +115,16 @@ def knowable_daily_end(providers: Any, as_of: Optional[datetime]) -> Optional[da
     if as_of is None:
         return None
     hook = getattr(providers.ohlcv(), "knowable_daily_end", None)
-    return as_of if hook is None else hook(as_of)
+    if hook is None:
+        from ba2_common.core.knowability import intraday_decision_clock
+        if intraday_decision_clock():
+            # An intraday backtest is deciding and this OHLCV provider cannot say what is knowable:
+            # returning ``as_of`` would silently let the decision day's own bar through.
+            raise RuntimeError(
+                f"{type(providers.ohlcv()).__name__} has no knowable_daily_end hook but an intraday "
+                f"backtest decision clock is active; refusing to slice daily bars at the decision's own date")
+        return as_of
+    return hook(as_of)
 
 
 @dataclass
