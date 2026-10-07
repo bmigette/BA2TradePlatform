@@ -231,7 +231,8 @@ def main() -> int:
                     help="The DECISION TIME gene (schedule:time). DEFAULT (flag absent) = ON with "
                          "the shared DEFAULT_DECISION_TIME_CHOICES on an intraday --interval, "
                          "off on --interval 1d; 'fixed' = no gene; or a comma list. Adds "
-                         "'-timegene' to the job name and folds into the name digest.")
+                         "'-timegene' to the job name and folds into the name digest. NOTE: 'fixed' keeps "
+                         "the LEGACY job name, so a job whose legacy row is completed is SKIPPED.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -313,7 +314,9 @@ def main() -> int:
             print(f"  {'DONE' if job_name in done else 'TODO'}  {job_name}  ({_EXPERT} {strat})")
             continue
         if job_name in _completed_names():   # re-read each loop (resumable)
-            print(f"[{i}/{len(jobs)}] SKIP {job_name} (already completed)", flush=True)
+            _fixed_note = ("; NOTE --decision-times fixed keeps the legacy job name, so this is the "
+                           "completed LEGACY run, not a time-gene run" if not dt_tokens else "")
+            print(f"[{i}/{len(jobs)}] SKIP {job_name} (already completed{_fixed_note})", flush=True)
             continue
         print(f"[{i}/{len(jobs)}] RUN  {job_name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode

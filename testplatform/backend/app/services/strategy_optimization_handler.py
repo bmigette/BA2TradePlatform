@@ -393,6 +393,9 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
                # "consistent by luck" blind spot the consistent-annual fitness exists to fight.
                "total_return": results.get("total_return"),
                "max_drawdown": results.get("max_drawdown"),
+               # The decision-time counter, so the MASTER can warn once per job (see
+               # ``_decision_time_missing``). Only when non-zero: other results keep their shape.
+               **_decision_time_missing(results),
                # Per-trial memory telemetry (a few psutil/len calls — negligible): RSS of
                # THIS worker process + the two per-process OHLCV caches, so a memory-driven
                # incident (e.g. WinError 1450 on the remote box) leaves a trail showing what
@@ -1656,6 +1659,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "robustness": (results or {}).get("robustness"),
                     "total_return": (results or {}).get("total_return"),
                     "max_drawdown": (results or {}).get("max_drawdown"),
+                    **_decision_time_missing(results or {}),
                 }
             )
             if best["fitness"] is None or fit > best["fitness"]:
@@ -1990,7 +1994,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                              "fitness_raw": out.get("fitness_raw"),
                              "robustness": out.get("robustness"),
                              "total_return": out.get("total_return"),
-                             "max_drawdown": out.get("max_drawdown")}
+                             "max_drawdown": out.get("max_drawdown"),
+                             **({"dt_missing": out["dt_missing"]} if out.get("dt_missing") else {})}
                         )
                         if is_last_gen:
                             _capture_full_result(last_gen_full_results, key, out)
@@ -2396,6 +2401,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         opt.progress = 100.0
         opt.best_params = result["best_params"]
         opt.best_fitness = result["best_fitness"]
+        _warn_decision_time_missing(opt.name, all_results)
         opt.all_results = all_results
         db.commit()
         push_optimization(opt, db)
@@ -2587,6 +2593,26 @@ def _market_condition_trial_pins(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]
 
     profiles, manifests = market_condition_pins(backtest_cfg, required=False)
     return {"market_condition_profiles": profiles, "market_condition_manifests": manifests}
+
+
+def _decision_time_missing(results: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"dt_missing": {"entry": n, "manage": n}}`` when a trial had scheduled sessions with no
+    bar at the scheduled time (e.g. 15:30 on a half day), else ``{}``."""
+    counts = ((results or {}).get("decision_time") or {}).get("sessions_without_decision_bar")
+    if counts and any(counts.values()):
+        return {"dt_missing": {"entry": int(counts["entry"]), "manage": int(counts["manage"])}}
+    return {}
+
+
+def _warn_decision_time_missing(opt_name: str, all_results: list) -> None:
+    """ONE job-level WARNING aggregating the per-trial counters (engines log them at DEBUG)."""
+    hit = [r["dt_missing"] for r in all_results if isinstance(r, dict) and r.get("dt_missing")]
+    if hit:
+        logger.warning(
+            f"[{opt_name}] {len(hit)} of {len(all_results)} trials had scheduled sessions with NO "
+            f"bar at the scheduled decision time (e.g. 15:30 on a 13:00 half day: no decision, "
+            f"no entry): per-trial entry/manage sessions skipped, total "
+            f"{sum(h['entry'] for h in hit)}/{sum(h['manage'] for h in hit)}")
 
 
 def _schedule_times_from_gene(gene_time: Optional[str]) -> Optional[Dict[str, List[str]]]:
@@ -3552,6 +3578,14 @@ def _build_warm_start_population(
     if not results:
         return None
     tail = results[-target_size:] if len(results) > target_size else list(results)
+    has_stratified = any(c.get("stratify") for c in optimizer.param_ranges.values())
+    if has_stratified:
+        # A seed from a job without the decision-time gene must not silently become "the first
+        # time": the missing value is completed so generation 0 is balanced (see
+        # ``GeneticOptimizer.seeded_population``), padding included.
+        return optimizer.seeded_population(
+            [optimizer.encode_params(e.get("params") or {}, allow_missing_stratified=True)
+             for e in tail], target_size)
     population = [optimizer.encode_params(e.get("params") or {}) for e in tail]
     while len(population) < target_size:
         population.append(optimizer.toolbox.individual())

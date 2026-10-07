@@ -530,7 +530,16 @@ class GeneticOptimizer:
         """
         for i, (param_name, config) in enumerate(self.param_ranges.items()):
             if self._rng.random() < indpb:
-                if config['type'] == 'choice':
+                if config['type'] == 'choice' and config.get('stratify'):
+                    # A STRATIFIED choice gene (the decision-time gene) is a SPARSE set whose
+                    # neighbouring indices are not neighbours in meaning (10:00 -> 12:00 ->
+                    # 15:30), so a Gaussian index nudge would mean something different at every
+                    # index and could never leave 09:35 for 15:30 in one step. Uniform re-draw
+                    # among the OTHER values. Every other choice gene keeps the nudge below.
+                    n = len(config['choices'])
+                    new = self._rng.randrange(n - 1)
+                    individual[i] = new + 1 if new >= individual[i] else new
+                elif config['type'] == 'choice':
                     # Categorical: nudge the int index, clamped to 0..len-1.
                     n = len(config['choices'])
                     sigma = max(1.0, (n - 1) / 6)
@@ -619,7 +628,47 @@ class GeneticOptimizer:
 
         return params
 
-    def encode_params(self, params: Dict) -> List:
+    def seeded_population(self, encoded: List, target_size: int) -> List:
+        """A warm-start generation 0: the ``encoded`` seeds plus random padding up to
+        ``target_size``, with every STRATIFIED choice gene balanced over the WHOLE generation.
+
+        ``encoded`` come from ``encode_params(..., allow_missing_stratified=True)``: a seed whose
+        source job had no such gene carries ``None`` there. Such a seed (and every padding
+        individual) is a FREE slot for that gene; the free slots are filled so each value reaches
+        at least ``target_size // k`` across the generation, counting the seeds that already carry
+        an explicit value. Remaining free slots keep a uniform random value. One INFO line says
+        how many seeds were completed. Without a stratified gene this is exactly
+        ``encoded`` + ``toolbox.individual()`` padding (no extra random draw).
+        """
+        population = [creator.Individual(list(e)) for e in encoded[:target_size]]
+        n_seeds = len(population)
+        while len(population) < target_size:
+            population.append(self._create_individual())
+        for i, (param_name, config) in enumerate(self.param_ranges.items()):
+            if config['type'] != 'choice' or not config.get('stratify'):
+                continue
+            k = len(config['choices'])
+            quota = target_size // k
+            fixed = [ind[i] for ind in population[:n_seeds] if ind[i] is not None]
+            free = [j for j, ind in enumerate(population) if j >= n_seeds or ind[i] is None]
+            missing_seeds = sum(1 for ind in population[:n_seeds] if ind[i] is None)
+            # Water-filling: every free slot goes to the CURRENTLY least-used value (ties drawn
+            # at random), so each value reaches ``quota`` whenever the seeds leave room for it and
+            # the shortfall is spread evenly when they do not.
+            counts = [sum(1 for x in fixed if x == v) for v in range(k)]
+            self._rng.shuffle(free)
+            for slot in free:
+                low = min(counts)
+                v = self._rng.choice([c for c in range(k) if counts[c] == low])
+                population[slot][i] = v
+                counts[v] += 1
+            if missing_seeds:
+                logger.info(f"warm start: {missing_seeds} of {n_seeds} seed(s) carried no "
+                            f"{param_name!r}; completed so generation 0 is spread over its "
+                            f"{k} values (>= {quota} each where seeds allow)")
+        return population
+
+    def encode_params(self, params: Dict, allow_missing_stratified: bool = False) -> List:
         """
         Encode parameter dictionary to individual (chromosome).
 
@@ -672,7 +721,14 @@ class GeneticOptimizer:
                 else:
                     value = 0
             else:
-                value = expanded_params.get(param_name, config['min'])
+                if (config['type'] == 'choice' and config.get('stratify')
+                        and param_name not in expanded_params):
+                    if not allow_missing_stratified:
+                        raise ValueError(f"choice gene {param_name!r} is missing from the params "
+                                         f"being encoded (a source job without it?)")
+                    value = None            # completed by seeded_population
+                else:
+                    value = expanded_params.get(param_name, config['min'])
             individual.append(value)
         return creator.Individual(individual)
 

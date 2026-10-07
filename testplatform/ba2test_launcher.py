@@ -1142,6 +1142,34 @@ def _resolve_decision_times(raw, command: str, *, interval: str, name: "str | No
     return times
 
 
+def _refuse_reused_timegene_name(name: str, times: "list | None", command: str) -> None:
+    """Refuse (exit) a run whose NAME is already a COMPLETED optimization carrying a DIFFERENT
+    decision-time list: the name is the job's identity (skip-by-name, checkpoint key), so reusing
+    it for another list would either skip the new run as 'done' or compare unlike results under
+    one name. The matrix drivers cannot hit this (the list is in their name digest); a hand-run
+    ``optimize --name ...-timegene...`` can."""
+    if not times:
+        return
+    from app.models.database import SessionLocal
+    from app.models.strategy_optimization import StrategyOptimization
+    db = SessionLocal()
+    try:
+        rows = (db.query(StrategyOptimization)
+                .filter(StrategyOptimization.name == name, StrategyOptimization.status == "completed")
+                .all())
+        stored = []
+        for r in rows:
+            spec = ((r.optimization_config or {}).get("expert_params") or {}).get("schedule:time") or {}
+            stored.append((r.id, spec.get("choices")))
+    finally:
+        db.close()
+    other = [(i, c) for i, c in stored if c != list(times)]
+    if other:
+        sys.exit(f"ba2-test {command}: name {name!r} is already a COMPLETED optimization "
+                 f"#{other[0][0]} with decision times {other[0][1]!r}, not {list(times)!r}. Use a "
+                 f"different --name: the name is the job's identity (skip-by-name, checkpoint).")
+
+
 def _decision_time_gene(times: "list | None") -> dict:
     """The ``expert_params`` entry (pre-namespaced) that declares the decision-time gene; {} when
     no ``--decision-times`` was given, so every other job's gene space is untouched."""
@@ -6775,6 +6803,7 @@ def _cmd_optimize(args) -> int:
     # because the accident this prevents is silent and costs hours of cluster time
     # while the inconvenience it causes is one flag.
     _opt_name = args.name or f"opt-{expert}"
+    _refuse_reused_timegene_name(_opt_name, decision_times, "optimize")
     if not getattr(args, "rerun", False):
         _db = SessionLocal()
         try:
