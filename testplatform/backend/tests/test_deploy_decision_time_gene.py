@@ -66,3 +66,31 @@ def test_the_deploy_writes_the_chosen_time_into_both_live_schedules(tool, tmp_pa
     assert enter["time_basis"] == "market" and manage["time_basis"] == "market"
     assert [d for d, v in enter["days"].items() if v] == ["tuesday", "thursday"]
     assert all(manage["days"][d] for d in DAYS[:5]) and not manage["days"]["saturday"]
+
+
+def test_the_deploy_refuses_a_time_whose_pass_cannot_finish_before_the_close(
+        tool, tmp_path, monkeypatch, capsys):
+    """15:50 + the measured p95 pass duration + margin falls after 16:00: refused before any write."""
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import ExpertInstance
+
+    inst_id = add_instance(ExpertInstance(
+        account_id=1, expert="FMPRating", alias="before", enabled=True, virtual_equity_pct=10.0))
+    run_sched = schedule_override_from_genes(
+        _genome("15:50"), {"days": {d: d == "monday" for d in DAYS}, "times": ["10:00"]},
+        weekdays_only=True)
+    entry = {
+        "backtest_id": 1, "target_instance_id": inst_id, "account_id": 1,
+        "virtual_equity_pct": 10.0, "expert_name": "FMPRating", "label": "late-row",
+        "ruleset": {"entry_rules": [], "exit_rules": []},
+        "settings": {"settings": {"expert_params": {"use_atr_stop": False,
+                                                    "regime_overlay_enabled": False}},
+                     "universe": None, "execution": {"run_schedule_override": run_sched},
+                     "execution_interval": "5min"},
+    }
+    path = str(tmp_path / "late.json")
+    json.dump([entry], open(path, "w"), default=str)
+    monkeypatch.setattr(sys, "argv", ["import_deploy_payload.py", path])
+    assert tool.main() == 1
+    out = capsys.readouterr().out
+    assert "FATAL: late-row" in out and "after the 16:00 close" in out
