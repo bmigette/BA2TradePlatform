@@ -12,6 +12,7 @@ Time is frozen per test (the frozen 'now' moves ``ohlcv_final_bars.now_utc`` and
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 from datetime import date, datetime, timedelta, timezone
 
@@ -117,15 +118,15 @@ def _own_cache(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _live_overlay_on():
     """Another test may have built a MemoizedOHLCVProvider (which switches the process to backtest mode)."""
-    fb.set_live_overlay_enabled(True)
+    fb.set_live_overlay_enabled(True)       # ON mode is opt-in: these tests exercise it explicitly
     yield
-    fb.set_live_overlay_enabled(True)
+    fb.set_live_overlay_enabled(False)      # the process default
 
 
 @pytest.fixture(autouse=True)
 def _clean_memos():
     def clear():
-        for name in ("_SPLIT_BASIS_REPORTED", "_TOPUP_REFUSED", "_UNFINISHED_MEMO", "_FORMING_MISSING_LOGGED"):
+        for name in ("_SPLIT_BASIS_REPORTED", "_TOPUP_REFUSED", "_UNFINISHED_MEMO", "_FORMING_MISSING_WINDOW"):
             getattr(MarketDataProviderInterface, name, set()).clear()
     clear()
     yield
@@ -251,18 +252,20 @@ def test_a_restart_or_a_fresh_mtime_with_an_empty_memo_still_gets_todays_forming
 
 def test_during_the_session_a_missing_forming_bar_is_visible_to_the_caller(clock, monkeypatch):
     # F3: the vendor has no bar for today yet -> the frame's last row is an OLDER session. That must not
-    # be silent: ERROR logged once per symbol per day, attrs says "missing", last_bar_is_today is False.
+    # be silent: ONE aggregated WARNING per burst (2026-10-07: no per-symbol ERROR), attrs says "missing",
+    # last_bar_is_today is False.
     seed(truth(PREV), "2026-10-06 06:30")
     p = _Provider(truth(PREV))                                              # no bar for D at all
     seen = []
-    monkeypatch.setattr(mdpi_mod.logger, "error", lambda m, *a, **k: seen.append(str(m)))
+    monkeypatch.setattr(mdpi_mod.logger, "warning", lambda m, *a, **k: seen.append(str(m)))
+    monkeypatch.setattr(mdpi_mod.logger, "error", lambda m, *a, **k: seen.append("ERROR " + str(m)))
+    monkeypatch.setattr(MarketDataProviderInterface, "_FORMING_MISSING_FLUSH_S", 0.0)   # flush at once
     clock("2026-10-06 10:00")
     df = p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
     assert fb.forming_bar_status(df) == "missing" and not fb.last_bar_is_today(df, SYMBOL)
-    assert len(seen) == 1 and "no forming bar could be obtained" in seen[0] and SYMBOL in seen[0]
-    clock("2026-10-06 10:20")
-    p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
-    assert len(seen) == 1                                                   # once per symbol per day
+    agg = [m for m in seen if "no forming bar could be obtained" in m]
+    assert len(agg) == 1 and "1 symbol(s)" in agg[0] and SYMBOL in agg[0]
+    assert not [m for m in seen if m.startswith("ERROR")]
 
 
 def test_outside_a_session_nothing_is_expected_and_nothing_is_logged(clock, monkeypatch):
@@ -783,3 +786,82 @@ def test_other_fmp_history_namespaces_are_untouched_by_the_finality_rule(clock):
     fmp_common._fmp_history_disk_read_or_fetch("some_other_namespace", "XOTH", lambda: rows, 7)
     f = os.path.join(fmp_common._fmp_history_cache_dir(), "some_other_namespace__XOTH.json")
     assert json.load(open(f)) == rows
+
+
+# --------------------------------------------------------------------------- L1: the overlay is OPT-IN
+def test_default_off_a_fresh_file_during_the_session_makes_no_vendor_call_and_ends_at_the_last_final_session(clock, caplog):
+    path = seed(truth(PREV), "2026-10-06 06:30")                 # fresh by mtime (< 24 h)
+    before = open(path, "rb").read()
+    p = _Provider(with_forming(truth(D), D))
+    clock("2026-10-06 10:00")                                    # session open
+    fb.set_live_overlay_enabled(False)                           # the process default
+    with caplog.at_level(logging.ERROR):
+        for _ in range(3):
+            df = p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    assert p.impl_calls == []                                    # ZERO vendor calls: the mtime gate decides, as on dev
+    assert last_day(df) == PREV                                  # history ends at the last FINAL session
+    assert df.attrs[fb.FORMING_STATUS_ATTR] == "not_expected"
+    assert not [r for r in caplog.records if "forming bar" in r.getMessage()]   # no ERROR about a missing forming bar
+    assert open(path, "rb").read() == before                     # the write-side guard is unconditional anyway
+
+
+def test_on_mode_still_force_fetches_once_per_ttl_and_overlays_the_forming_bar(clock):
+    seed(truth(PREV), "2026-10-06 06:30")
+    p = _Provider(with_forming(truth(D), D))
+    clock("2026-10-06 10:00")
+    fb.set_live_overlay_enabled(True)
+    df = p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    assert last_day(df) == D and len(p.impl_calls) == 1
+    assert fb.forming_bar_status(df) == "present"
+    p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    assert len(p.impl_calls) == 1                                # throttled by the memo
+
+
+def test_on_mode_a_vendor_exception_is_memoized_so_a_429_storm_does_not_refire_per_read(clock):
+    seed(truth(PREV), "2026-10-06 06:30", provider="Down")
+
+    class Down(_Provider):
+        def _get_ohlcv_data_impl(self, symbol, start_date, end_date, interval="1d"):
+            self.impl_calls.append(symbol)
+            raise RuntimeError("429 Too Many Requests")
+
+    p = Down(truth(D))
+    clock("2026-10-06 10:00")
+    fb.set_live_overlay_enabled(True)
+    for _ in range(5):
+        df = p.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+        assert last_day(df) == PREV
+    assert len(p.impl_calls) == 1                                # one attempt, then the memo throttles
+
+
+def test_on_mode_an_empty_vendor_answer_and_an_only_forming_answer_are_memoized_too(clock):
+    seed(truth(PREV), "2026-10-06 06:30")
+    clock("2026-10-06 10:00")
+    fb.set_live_overlay_enabled(True)
+    empty = _Provider(truth(D).iloc[0:0])
+    for _ in range(3):
+        empty.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    assert len(empty.impl_calls) == 1
+    only_forming = _Provider(with_forming(truth(D), D)[lambda d: pd.to_datetime(d["Date"]).dt.date == D])
+    MarketDataProviderInterface._UNFINISHED_MEMO.clear()
+    for _ in range(3):
+        only_forming.get_ohlcv_data(SYMBOL, lookback_days=40, interval="1d")
+    assert len(only_forming.impl_calls) == 1
+
+
+def test_on_mode_missing_forming_bars_are_ONE_aggregated_warning_not_one_error_per_symbol(clock, monkeypatch):
+    clock("2026-10-06 10:00")
+    fb.set_live_overlay_enabled(True)
+    p = _Provider(truth(PREV))
+    frame = truth(PREV)
+    seen = []
+    monkeypatch.setattr(mdpi_mod.logger, "warning", lambda m, *a, **k: seen.append(str(m)))
+    monkeypatch.setattr(mdpi_mod.logger, "error", lambda m, *a, **k: seen.append("ERROR " + str(m)))
+    monkeypatch.setattr(MarketDataProviderInterface, "_FORMING_MISSING_FLUSH_S", 0.2)
+    for sym in ("AAA", "BBB", "CCC", "DDD"):
+        p._stamp_forming_status(frame.copy(), sym, "1d")
+    import time
+    time.sleep(0.8)
+    agg = [m for m in seen if "forming bar could be obtained" in m]
+    assert len(agg) == 1 and "4 symbol(s)" in agg[0]
+    assert not [m for m in seen if m.startswith("ERROR")]

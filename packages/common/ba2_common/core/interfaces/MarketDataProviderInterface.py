@@ -591,6 +591,19 @@ class MarketDataProviderInterface(DataProviderInterface):
             type(self)._UNFINISHED_MEMO[self._unfinished_key(provider_name, symbol, interval)] = (
                 _mono(), unfinished.drop(columns=['effective_date'], errors='ignore').copy())
 
+    def _remember_failed_fetch(self, symbol: str, interval: str, provider_name: str) -> None:
+        """Overlay ON only: record that the vendor WAS asked now and gave nothing usable, so
+        ``_fetch_age`` throttles the next in-session read (one call per ``FORMING_BAR_TTL_S``) instead of
+        re-firing the call on every read during an outage / a 429 storm. Memoises "no unfinished bar"."""
+        if not ohlcv_final_bars.live_overlay_enabled():
+            return
+        key = self._unfinished_key(provider_name, symbol, interval)
+        with type(self)._UNFINISHED_LOCK:
+            previous = type(self)._UNFINISHED_MEMO.get(key)
+            # keep the forming bar an EARLIER good fetch brought (it is still shown); only the clock moves
+            kept = previous[1] if previous is not None else pd.DataFrame()
+            type(self)._UNFINISHED_MEMO[key] = (_mono(), kept)
+
     def _forget_unfinished_bars(self, symbol: str, interval: str, provider_name: str) -> None:
         with type(self)._UNFINISHED_LOCK:
             type(self)._UNFINISHED_MEMO.pop(self._unfinished_key(provider_name, symbol, interval), None)
@@ -647,8 +660,41 @@ class MarketDataProviderInterface(DataProviderInterface):
         rows = rows[[c for c in df.columns if c in rows.columns]]
         return pd.concat([df, rows], ignore_index=True)
 
-    #: ``(provider, SYMBOL, NY date)`` already reported as "session open, no forming bar" (once per day).
-    _FORMING_MISSING_LOGGED: set = set()
+    #: ``(provider class, interval) -> [symbols missing in the current burst, last bar date of the first]``.
+    #: The "session open, no forming bar" report is ONE aggregated WARNING per burst, not one ERROR per symbol.
+    _FORMING_MISSING_WINDOW: dict = {}
+    _FORMING_MISSING_FLUSH_S = 5.0
+    _FORMING_MISSING_LOCK = threading.Lock()
+
+    def _note_forming_missing(self, symbol: str, interval: str, day: Any, frame: pd.DataFrame) -> None:
+        cls = type(self)
+        key = (cls.__name__, interval)
+        last_bar = pd.Timestamp(frame['Date'].max()).date()
+        with cls._FORMING_MISSING_LOCK:
+            entry = cls._FORMING_MISSING_WINDOW.get(key)
+            start_timer = entry is None
+            if entry is None:
+                entry = cls._FORMING_MISSING_WINDOW[key] = [set(), last_bar]
+            entry[0].add(str(symbol).upper())
+
+        def flush():
+            with cls._FORMING_MISSING_LOCK:
+                done = cls._FORMING_MISSING_WINDOW.pop(key, None)
+            if done:
+                syms = sorted(done[0])
+                logger.warning(
+                    f"{cls.__name__} ({interval}): the {day} session is open or settling but no forming bar "
+                    f"could be obtained for {len(syms)} symbol(s) (e.g. {', '.join(syms[:5])}); their frames "
+                    f"end at an OLDER session (e.g. {done[1]}). A live caller pricing off the last close "
+                    f"would use it; every shipped expert prices from the account quote.")
+
+        if start_timer:
+            if cls._FORMING_MISSING_FLUSH_S <= 0:
+                flush()
+            else:
+                t = threading.Timer(cls._FORMING_MISSING_FLUSH_S, flush)
+                t.daemon = True
+                t.start()
 
     def _stamp_forming_status(self, frame: pd.DataFrame, symbol: str, interval: str) -> None:
         """Mark a LATEST daily frame for a live caller (``ohlcv_final_bars.forming_bar_status`` /
@@ -664,13 +710,10 @@ class MarketDataProviderInterface(DataProviderInterface):
                     status = "present"
                 else:
                     status = "missing"
-                    tag = (type(self).__name__, str(symbol).upper(), day)
-                    if tag not in type(self)._FORMING_MISSING_LOGGED:
-                        type(self)._FORMING_MISSING_LOGGED.add(tag)
-                        logger.error(f"{type(self).__name__} {symbol} ({interval}): the {day} session is open "
-                                     f"or settling but no forming bar could be obtained; the frame's last "
-                                     f"bar is {pd.Timestamp(frame['Date'].max()).date()}. A live caller "
-                                     f"pricing off the last close is using an OLDER session.")
+                    # ONE aggregated WARNING per burst (a pass over a basket would otherwise log one ERROR
+                    # per symbol): the first miss of a burst starts a short timer, every symbol missing
+                    # meanwhile joins the set, and the timer logs the count once.
+                    self._note_forming_missing(symbol, interval, day, frame)
         frame.attrs[ohlcv_final_bars.FORMING_STATUS_ATTR] = status
 
     # ---- native parquet as_of store helpers (get_ohlcv_data) -----------------
@@ -937,14 +980,18 @@ class MarketDataProviderInterface(DataProviderInterface):
         try:
             probe = self._get_ohlcv_data_impl(symbol, probe_start, fetch_end, interval)
         except Exception as e:  # noqa: BLE001 -- the old top-up's policy: serve the cache, say so
+            # ATTEMPTED: memoized so a 429 storm does not re-fire the call on every read (overlay ON only)
+            self._remember_failed_fetch(symbol, interval, provider_name)
             if raise_fetch_errors:
                 raise
             logger.warning(f"Failed to refresh parquet cache for {symbol} ({interval}): {e}")
             return nothing, "unchanged"
         if probe is None or probe.empty:
+            self._remember_failed_fetch(symbol, interval, provider_name)
             return nothing, "unchanged"
         probe = self._clean_dataframe(probe.copy())
         if probe.empty:
+            self._remember_failed_fetch(symbol, interval, provider_name)
             return nothing, "unchanged"
         probe['Date'] = self._match_tz(pd.to_datetime(probe['Date']), df['Date'])
         # THE RULE (ohlcv_final_bars): the vendor's forming bar is never history. It is kept out of
@@ -955,6 +1002,7 @@ class MarketDataProviderInterface(DataProviderInterface):
             # only the forming bar came back: nothing to compare it with, so it is NOT served
             logger.warning(f"{provider_name} {symbol} ({interval}): the vendor returned only an "
                            f"unfinished bar; it cannot be verified against the cache and is not used")
+            self._remember_failed_fetch(symbol, interval, provider_name)
             return nothing, "unchanged"
         if healed and not np.asarray(guard.day_index(probe['Date']).isin(healed)).any():
             return nothing, "unchanged"            # no final bar to replace the healed one with

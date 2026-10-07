@@ -226,13 +226,14 @@ def test_last_bar_is_today_and_the_status_attribute():
     assert fb.forming_bar_status(f) == "missing"
 
 
-def test_the_live_overlay_switch_defaults_on_and_round_trips():
-    assert fb.live_overlay_enabled() is True
-    fb.set_live_overlay_enabled(False)
+def test_the_live_overlay_switch_defaults_off_and_round_trips():
+    """OPT-IN (2026-10-07 live review): no forced in-session vendor fetch, no forming-bar overlay."""
+    assert fb.live_overlay_enabled() is False
+    fb.set_live_overlay_enabled(True)
     try:
-        assert fb.live_overlay_enabled() is False
+        assert fb.live_overlay_enabled() is True
     finally:
-        fb.set_live_overlay_enabled(True)
+        fb.set_live_overlay_enabled(False)
 
 
 def test_final_mask_of_a_long_intraday_frame_only_judges_the_tail():

@@ -181,4 +181,4 @@ def test_building_a_backtest_provider_turns_the_live_overlay_off_and_hermetic_re
     latest = inner.get_ohlcv_data("XBT", lookback_days=40, interval="1d")
     assert pd.Timestamp(latest["Date"].max()).tz_localize(None) == pd.Timestamp(PREV)
     assert path == native_cache.find_timeseries_path("FakeFMP", "XBT", "1d")
-    fb.set_live_overlay_enabled(True)
+    fb.set_live_overlay_enabled(False)      # the process default (ON is an explicit opt-in)

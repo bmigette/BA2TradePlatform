@@ -96,17 +96,24 @@ _PERIOD_TAIL_WINDOW = timedelta(days=45)
 #: be obtained: the last row is an OLDER session, see :func:`last_bar_is_today`) or ``"not_expected"``.
 FORMING_STATUS_ATTR = "ohlcv_forming_bar"
 
-_LIVE_OVERLAY_ENABLED = True
+#: OPT-IN, default OFF (2026-10-07 live review). ON means: a LATEST daily read during a session forces a
+#: vendor fetch (throttled by ``FORMING_BAR_TTL_S``) and overlays the one-tick forming bar on the returned
+#: frame. Nothing in live consumes the forming bar (every expert prices from the account quote), the forced
+#: fetch costs vendor calls at 09:30 on a rate-limited key, and an overlaid one-tick bar would become the
+#: last row of an indicator frame that the backtest's history (finished sessions only) never has. OFF: a
+#: LATEST daily read returns history up to the last FINAL session and uses the file-mtime freshness gate.
+#: The write-side guard (never persist an unfinished bar) does NOT depend on this switch.
+_LIVE_OVERLAY_ENABLED = False
 
 
 def live_overlay_enabled() -> bool:
-    """Whether this process serves forming bars to LATEST reads (live). A backtest process turns it off."""
+    """Whether this process serves forming bars to LATEST reads. Off unless a tool opts in."""
     return _LIVE_OVERLAY_ENABLED
 
 
 def set_live_overlay_enabled(enabled: bool) -> None:
-    """Process-wide switch. ``MemoizedOHLCVProvider`` (every backtest's provider) sets it False: a backtest
-    process never overlays or fetches a forming bar, whatever ``end_date`` its reads carry."""
+    """Process-wide switch (default OFF). ``MemoizedOHLCVProvider`` (every backtest's provider) sets it
+    False: a backtest process never overlays or fetches a forming bar, whatever ``end_date`` its reads carry."""
     global _LIVE_OVERLAY_ENABLED
     _LIVE_OVERLAY_ENABLED = bool(enabled)
 

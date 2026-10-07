@@ -86,7 +86,7 @@ def cache_dir(tmp_path, monkeypatch, request):
     from ba2_common.core import ohlcv_final_bars
     ohlcv_final_bars.set_live_overlay_enabled(False)
     MarketDataProviderInterface._UNFINISHED_MEMO.clear()
-    request.addfinalizer(lambda: ohlcv_final_bars.set_live_overlay_enabled(True))
+    request.addfinalizer(lambda: ohlcv_final_bars.set_live_overlay_enabled(False))
     return str(d)
 
 
