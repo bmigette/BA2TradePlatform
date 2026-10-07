@@ -1137,6 +1137,16 @@ class WorkerQueue:
                         except Exception as e:
                             logger.warning(f"Failed to log batch end for {task.batch_id}: {e}")
 
+                        # ONE pass-level ERROR when most of the pass's symbols could not be priced
+                        # (a broker outage); observation only, never changes what is traded.
+                        try:
+                            from ba2_common.core import pass_price_health
+                            pass_price_health.summarise_pass(
+                                task.expert_instance_id, total_jobs,
+                                account_id=locals().get("batch_account_id"), batch_id=task.batch_id)
+                        except Exception as e:
+                            logger.warning(f"Price-health summary failed for {task.batch_id}: {e}")
+
                         # Lifecycle step 3 (spec section 6): as each batch finishes,
                         # queue only the historical dependencies its analyses newly
                         # require. A no-op call when warming is off, and wrapped

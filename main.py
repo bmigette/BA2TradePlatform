@@ -73,6 +73,11 @@ def initialize_system():
     import ba2_trade_platform.config as config
     from ba2_trade_platform.version import APP_VERSION
 
+    # A MAINTENANCE switch of the OHLCV top-up must not be set in a live app's environment.
+    from ba2_common.core.interfaces.MarketDataProviderInterface import live_environment_warnings
+    for _w in live_environment_warnings():
+        logger.warning(_w)
+
     # Print the running build up-front so it's unambiguous which version/instance is
     # live (port + db) — the editable install means a process keeps the code it was
     # started with until restarted, so this is the source of truth for "what's running".

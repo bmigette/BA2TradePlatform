@@ -100,6 +100,26 @@ def test_retime_moves_both_schedules_and_nothing_else():
         retime_schedules(cfg, "15:55")
 
 
+def test_a_non_padded_time_is_normalised_at_the_tools_input_and_nothing_else_is():
+    from ba2_common.core.schedule_genes import live_deploy_time_refusal, normalise_hhmm
+    assert normalise_hhmm("9:30") == "09:30" and normalise_hhmm("09:30") == "09:30"
+    assert normalise_hhmm("15:45") == "15:45"
+    assert normalise_hhmm("930") == "930" and normalise_hhmm(3) == 3          # malformed stays malformed
+    with pytest.raises(ValueError):                                           # ...and the validator refuses it
+        live_deploy_time_refusal("9:30")
+    assert live_deploy_time_refusal(normalise_hhmm("9:30")) is None
+
+
+def test_the_maintenance_refetch_switch_in_a_live_environment_is_warned_about(monkeypatch):
+    from ba2_common.core.interfaces.MarketDataProviderInterface import (
+        FULL_REFETCH_ENV, live_environment_warnings)
+    monkeypatch.delenv(FULL_REFETCH_ENV, raising=False)
+    assert live_environment_warnings() == []
+    monkeypatch.setenv(FULL_REFETCH_ENV, "0")
+    (warning,) = live_environment_warnings()
+    assert FULL_REFETCH_ENV in warning and "LIVE" in warning
+
+
 def test_retime_refuses_the_first_bar_unless_the_measurement_opt_in_is_given():
     from ba2_common.core.schedule_genes import validate_decision_times
     cfg = {"execution_interval": "5min",

@@ -21,6 +21,10 @@ from ba2_common.core import ohlcv_final_bars
 from ba2_common.core.replay.observe import observe_provider
 from ba2_common.core.replay.schemas import ReplayStatus
 
+#: MAINTENANCE SWITCH -- MUST NOT BE SET IN A LIVE APP'S ENVIRONMENT. It exists for the data-refresh
+#: tools that run while backtests of the old history are in flight (``tools/plan_daily_extension.py``,
+#: the repair/extension scripts). A live app that carries it would REFUSE the top-up of a split name
+#: instead of repairing its history; ``main.initialize_system`` logs one WARNING when it is set.
 #: ``=0`` makes the verified daily top-up REFUSE (instead of REPLACE the history) when a split since
 #: the last cached bar calls for a full re-fetch: an additive-only refresh. Unset / ``1``: unchanged.
 #: Additive-only means: no cached bar is replaced by a vendor bar and no split replaces the history.
@@ -28,6 +32,16 @@ from ba2_common.core.replay.schemas import ReplayStatus
 #: before its session was final (``_unproven_tail_days``) is still healed -- it is a snapshot by
 #: construction, not history. Only "0", "1" or unset are accepted (anything else raises).
 FULL_REFETCH_ENV = "BA2_OHLCV_TOPUP_FULL_REFETCH"
+
+
+def live_environment_warnings() -> List[str]:
+    """Warnings for maintenance switches that are set in a LIVE app's environment (one per switch)."""
+    value = os.environ.get(FULL_REFETCH_ENV)
+    if value is None:
+        return []
+    return [f"{FULL_REFETCH_ENV}={value!r} is set in this LIVE app's environment: it is a maintenance "
+            f"switch for the data-refresh tools (a split name's top-up is refused instead of repaired). "
+            f"Unset it."]
 
 #: Live memo TTL of today's FORMING daily bar. After it a LATEST read during the open session fetches
 #: again. FMP load: one call per symbol per TTL at most, and only for symbols somebody reads. The live

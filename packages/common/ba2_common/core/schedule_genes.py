@@ -136,6 +136,14 @@ LIVE_PASS_P95_SECONDS = 510
 LIVE_PASS_MARGIN_SECONDS = 300
 
 
+def normalise_hhmm(value: Any) -> Any:
+    """``"9:30"`` -> ``"09:30"`` (the prod DB holds non-padded times on some disabled instances). Any
+    other value is returned UNCHANGED, so the strict validators still refuse a malformed time."""
+    if isinstance(value, str) and len(value) == 4 and value[1] == ":" and value[0].isdigit():
+        return "0" + value
+    return value
+
+
 def live_deploy_time_refusal(time_hhmm: str) -> Optional[str]:
     """A refusal message when a live schedule at ``time_hhmm`` could not finish its pass before
     the close of a normal day (see ``LIVE_PASS_P95_SECONDS``), else None."""
@@ -325,6 +333,26 @@ def schedule_refusal_message(schedule: Any) -> Optional[str]:
         vals = ", ".join(f"{d!r}={v!r}" for d, v in invalid)
         parts.append(f"invalid value for day {vals} (use true or false)")
     return "schedule refused: " + "; ".join(parts)
+
+
+def describe_schedule(schedule: Any) -> Optional[Dict[str, Any]]:
+    """What a stored ``{"days": {...}, "times": [...]}`` schedule will actually run, for the scheduler's
+    one INFO line per expert + setting: ``{"days": [enabled weekday abbreviations], "times": [...],
+    "basis": "market"|"local", "implied": [abbreviations of the days whose key is ABSENT]}``.
+    ``implied`` is what a partial dict takes from ``SCHEDULE_DAY_DEFAULTS`` (Mon-Fri on, Sat/Sun off).
+    None for a schedule this does not describe (a monthly / string schedule, a refused one: the
+    refusal has its own ERROR). Pure."""
+    if not isinstance(schedule, dict) or not isinstance(schedule.get("days"), dict):
+        return None
+    days = schedule["days"]
+    if schedule_refusal_message(schedule):
+        return None
+    return {
+        "days": [day[:3].capitalize() for day in SCHEDULE_DAYS if schedule_weekday_enabled(days, day)],
+        "times": [str(t) for t in (schedule.get("times") or [])],
+        "basis": "market" if schedule.get("time_basis") == "market" else "local",
+        "implied": [day[:3].capitalize() for day in SCHEDULE_DAYS if day not in days],
+    }
 
 
 def repair_no_weekday(days: Dict[str, bool], option_run: bool) -> Dict[str, bool]:

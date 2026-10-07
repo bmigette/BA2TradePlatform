@@ -459,7 +459,11 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             # Nothing downstream reads ``current_price`` of a skipped recommendation (the live
             # run_analysis and the engine both return on ``skip`` before using it).
             account_id = getattr(getattr(self, "instance", None), "account_id", None)
-            self.logger.error(
+            # WARNING per symbol; the PASS-level ERROR (one line for a broker outage) is
+            # ``pass_price_health.summarise_pass``, called when the batch ends.
+            from ba2_common.core import pass_price_health
+            pass_price_health.record_no_price(getattr(self, "id", None), symbol)
+            self.logger.warning(
                 f"DeterministicScorer {symbol}: no current price from the decision-price seam "
                 f"(expert instance {getattr(self, 'id', None)}, account {account_id}, "
                 f"as_of={as_of}); skipping the analysis")

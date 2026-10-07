@@ -1188,7 +1188,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             return account.get_instrument_current_price(symbol)
 
         except Exception as e:
-            logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
+            # WARNING per symbol (a broker outage would otherwise print one ERROR + traceback per symbol);
+            # the pass-level ERROR is ``pass_price_health.summarise_pass``.
+            from ba2_common.core import pass_price_health
+            pass_price_health.note_error(getattr(self, "id", None), str(symbol), e)
+            logger.warning(f"Error getting current price for {symbol}: {e}")
+            logger.debug(f"Error getting current price for {symbol}", exc_info=True)
             return None
 
     def _decision_price(self, providers: "ProviderBundle", symbol: str,

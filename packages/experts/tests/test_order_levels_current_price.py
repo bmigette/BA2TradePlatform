@@ -224,8 +224,13 @@ def test_live_without_a_quote_is_skipped_as_no_price_not_as_thin_history():
     assert rec.skip and rec.skip_reason == "no_price"
     assert rec.current_price is None
     assert "price" in rec.details.lower() and "history" not in rec.details.lower()
-    e.logger.error.assert_called_once()
-    assert "AAPL" in e.logger.error.call_args[0][0]
+    # per-symbol line is a WARNING now; the PASS-level ERROR is pass_price_health.summarise_pass
+    e.logger.error.assert_not_called()
+    e.logger.warning.assert_called_once()
+    assert "AAPL" in e.logger.warning.call_args[0][0]
+    from ba2_common.core import pass_price_health
+    assert pass_price_health._no_price.get(7) == ["AAPL"]
+    pass_price_health.reset()
 
 
 def test_thin_history_with_a_price_is_still_insufficient_history():
