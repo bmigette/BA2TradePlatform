@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ba2_common.core.knowability import DEFAULT_DECISION_TIME
 from app.models import (
     SessionLocal,
     Strategy as StrategyModel,
@@ -2794,7 +2795,9 @@ def _build_daily_trial_config(
     if decoded.get("schedule_days"):
         run_schedule_override = {
             "days": decoded["schedule_days"],
-            "times": (base_run_sched or {}).get("times") or ["09:30"],
+            # The run-level time when the run states one; else the shared default decision time
+            # (a new run only: stored rows reconstruct through schedule_genes with their own time).
+            "times": (base_run_sched or {}).get("times") or [DEFAULT_DECISION_TIME],
         }
     else:
         run_schedule_override = base_run_sched

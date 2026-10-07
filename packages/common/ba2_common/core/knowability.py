@@ -45,6 +45,18 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterator, Optional
 from zoneinfo import ZoneInfo
 
+#: The entry/decision time (exchange-local HH:MM) NEW stock backtests, grids and optimizations run
+#: at, and therefore the time their deployed instances must fire at. The price at a decision is
+#: the close of the latest 5-minute bar that has ENDED, so the decision must sit at least one bar
+#: after the session's first bar: at 09:40 the 09:35 bar has ended (live reads a quote of that
+#: moment). ONE definition: the launcher, the API, the robustness suite, the UI default
+#: (frontend/src/lib/decisionTime.ts, pinned equal by a test) and the deploy tools use it.
+DEFAULT_DECISION_TIME = "09:40"
+
+#: The time every STORED row before 2026-10-07 ran at (the session's first bar). Used ONLY to
+#: reconstruct such rows that carry no explicit time; never a default for a new run.
+LEGACY_DECISION_TIME = "09:30"
+
 _NY = ZoneInfo("America/New_York")
 _tl = threading.local()
 

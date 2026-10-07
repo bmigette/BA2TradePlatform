@@ -1026,7 +1026,8 @@ def _daily_manage_schedule() -> dict:
     days_opened rules each trading day even when ENTRY is weekly. (Weekends are off — no session.)"""
     wk = ("monday", "tuesday", "wednesday", "thursday", "friday")
     days = {d: (d in wk) for d in (*wk, "saturday", "sunday")}
-    return {"days": days, "times": ["09:30"]}
+    from ba2_common.core.knowability import DEFAULT_DECISION_TIME
+    return {"days": days, "times": [DEFAULT_DECISION_TIME]}
 
 
 #: Two toggles that NEVER took effect in any run to date, pinned OFF so they still don't.
@@ -6670,9 +6671,12 @@ def _cmd_optimize(args) -> int:
         days = {d: (d in sched_days) for d in
                 ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")}
         # `times` pins the ANALYSIS to the scheduled time-of-day so on a 5min fill clock the
-        # expert analyses ONCE/day (at market open) instead of every intraday bar. FMP bars are
-        # stamped in market-local 09:30-15:55, so "09:30" is the first regular-session bar.
-        run_sched = {"days": days, "times": ["09:30"]}
+        # expert analyses ONCE/day instead of every intraday bar. FMP bars are stamped in
+        # market-local 09:30-15:55 at the START of the bar and the decision price is the close of
+        # the latest bar that has ENDED, so the time is DEFAULT_DECISION_TIME (>= first bar + one
+        # bar), not the session's first bar: a decision there sees only the PRIOR close.
+        from ba2_common.core.knowability import DEFAULT_DECISION_TIME
+        run_sched = {"days": days, "times": [DEFAULT_DECISION_TIME]}
     # Open-positions MANAGEMENT runs DAILY (mirrors live, which schedules open_positions far more
     # often than enter_market): every weekday at the open bar, regardless of the (weekly) entry day.
     # So trailing-SL / close / days_opened exit rules are evaluated each trading day, not weekly.
@@ -7130,11 +7134,13 @@ def _cmd_optimize_batch(args) -> int:
         # --run-schedule-day accepts a comma-separated list (e.g. "monday,thursday") so a
         # signal that decays fast can scan more than once/week without going fully daily.
         sched_days = {d.strip().lower() for d in args.run_schedule_day.split(",") if d.strip()}
-        # `times` pins ANALYSIS to market open so a 5min fill clock analyses once/day, not per bar.
+        # `times` pins ANALYSIS to one bar so a 5min fill clock analyses once/day, not per bar;
+        # the shared default decision time (>= first bar + one bar), see _cmd_optimize.
+        from ba2_common.core.knowability import DEFAULT_DECISION_TIME
         run_sched = {"days": {d: (d in sched_days) for d in
                               ("monday", "tuesday", "wednesday", "thursday", "friday",
                                "saturday", "sunday")},
-                     "times": ["09:30"]}
+                     "times": [DEFAULT_DECISION_TIME]}
     _assert_option_window_excludes_holdout([k for _e, k in jobs], args.end)
     init_db()
     tq = get_task_queue()

@@ -24,7 +24,7 @@ Two behaviours, both keyed off a ``RobustnessRun`` row:
 
 ``run_schedule_override`` shape (what ``daily_engine._entry_schedule`` reads, mirroring
 ``app.api.backtests._run_schedule_override``): ``{"days": {weekday: bool, ...}, "times": ["HH:MM", ...]}``.
-Day variants pin exactly one weekday True with ``times=["09:30"]``; time variants keep all days True
+Day variants pin exactly one weekday True with the PARENT'S OWN ``times``; time variants keep all days True
 with a single ``times=[<HH:MM>]`` entry.
 """
 from __future__ import annotations
@@ -46,7 +46,6 @@ logger = logging.getLogger(__name__)
 # Weekday ordering — mirrors app.api.backtests._WEEKDAYS (Mon..Fri are the trading-day variants).
 _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 _TRADING_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday")
-_DEFAULT_TIME = "09:30"  # first regular-session bar; matches _run_schedule_override
 
 _TERMINAL = ("completed", "failed")
 
@@ -145,11 +144,15 @@ def run_monte_carlo_for_backtest(robustness_run_id: int) -> None:
 # ---------------------------------------------------------------------------
 # Schedule variants
 # ---------------------------------------------------------------------------
-def _day_override(weekday: str) -> Dict[str, Any]:
-    """run_schedule_override pinning exactly ``weekday`` (weekly entry-day variant)."""
+def _day_override(weekday: str, times: List[str]) -> Dict[str, Any]:
+    """run_schedule_override pinning exactly ``weekday`` (weekly entry-day variant) at the PARENT'S
+    OWN entry time(s): a day variant changes the weekday only. (It used to pin a fixed 09:30,
+    which silently moved a row decided at another time.)"""
+    if not times:
+        raise ValueError("a day variant needs the parent's entry time(s); the parent states none")
     return {
         "days": {d: (d == weekday) for d in _WEEKDAYS},
-        "times": [_DEFAULT_TIME],
+        "times": list(times),
     }
 
 
@@ -161,16 +164,17 @@ def _time_override(hhmm: str) -> Dict[str, Any]:
     }
 
 
-def _schedule_variants(params: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _schedule_variants(params: Dict[str, Any], parent_times: Optional[List[str]] = None
+                       ) -> List[Dict[str, Any]]:
     """Build the list of ``{variant, override}`` from the run params.
 
-    * ``day_variants=True`` -> one weekly-entry-day variant per Mon..Fri.
+    * ``day_variants=True`` -> one weekly-entry-day variant per Mon..Fri, at ``parent_times``.
     * ``time_variants=[...]`` -> one entry-time variant per requested HH:MM.
     """
     out: List[Dict[str, Any]] = []
     if params.get("day_variants"):
         for wd in _TRADING_DAYS:
-            out.append({"variant": f"day-{wd}", "override": _day_override(wd)})
+            out.append({"variant": f"day-{wd}", "override": _day_override(wd, parent_times or [])})
     for t in (params.get("time_variants") or []):
         out.append({"variant": f"time-{t}", "override": _time_override(t)})
     return out
@@ -201,10 +205,11 @@ def launch_schedule_variants(robustness_run_id: int) -> List[int]:
             # a daily_expert row and is reconstructible). We don't run it here — we only need the
             # persisted strategy_params to CLONE per variant; the rerun handler rebuilds+runs each
             # variant from its own row. Calling it here surfaces reconstruction errors early.
-            rebuild_config_for_backtest(bt, db)
+            parent_cfg = rebuild_config_for_backtest(bt, db)
+            parent_times = list(((parent_cfg.get("run_schedule_override") or {}).get("times")) or [])
 
             base_sp = copy.deepcopy(bt.strategy_params or {})
-            variants = _schedule_variants(run.params or {})
+            variants = _schedule_variants(run.params or {}, parent_times)
             if not variants:
                 raise ValueError("no schedule variants requested (day_variants/time_variants both empty)")
 

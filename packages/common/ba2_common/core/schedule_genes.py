@@ -90,4 +90,7 @@ def schedule_override_from_genes(
     # with. With weekdays_only the filter above has already cleared the weekend, so an
     # all-weekend genome deploys as Monday rather than as an instance that never scans at all.
     days = repair_no_weekday(days, option_run=option_run)
-    return {"days": days, "times": (base_override or {}).get("times") or ["09:30"]}
+    # A stored row that states no time ran at the session's first bar (every row before the
+    # 2026-10-07 default moved); a NEW run always states its time (DEFAULT_DECISION_TIME).
+    from ba2_common.core.knowability import LEGACY_DECISION_TIME
+    return {"days": days, "times": (base_override or {}).get("times") or [LEGACY_DECISION_TIME]}

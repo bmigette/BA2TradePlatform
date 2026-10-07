@@ -145,8 +145,13 @@ def repair_schedules(ns, test) -> int:
 
         # Keep the instance's own time-of-day and basis: only the DAY selection was optimized
         # (matching _build_daily_trial_config, which keeps the run-level ``times``).
+        if not cur.get("times"):
+            # No guessed time: the instance's own time is what this repair preserves.
+            print(f"  !! inst {inst_id}: stored schedule has no decision time -- left alone "
+                  f"(set one by hand, then re-run)")
+            continue
         new = {"days": want_days,
-               "times": cur.get("times") or ["09:30"],
+               "times": cur["times"],
                "time_basis": cur.get("time_basis") or "market"}
         note = f"   (dropping inert weekend gene: {weekend_dropped})" if weekend_dropped else ""
         print(f"  inst {inst_id} (bt {bt_id}): {_trading(cur_days)} -> "

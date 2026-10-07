@@ -92,6 +92,18 @@ def test_main_refuses_a_daily_clock_schedule_before_writing_anything(tool, capsy
     assert "FATAL: daily-row:" in out and "--shift-daily-clock-weekdays" in out
 
 
+def test_main_refuses_a_schedule_with_no_decision_time(tool, capsys, monkeypatch, tmp_path):
+    """The deployment fires at the backtest's OWN decision time; a stored schedule without one is
+    refused (no guessed 09:30), before anything is written."""
+    path = _payload(tmp_path, "5min")
+    payload = json.load(open(path))
+    payload[0]["settings"]["execution"]["run_schedule_override"].pop("times")
+    json.dump(payload, open(path, "w"))
+    monkeypatch.setattr(sys, "argv", ["import_deploy_payload.py", path])
+    assert tool.main() == 1
+    assert "NO decision time" in capsys.readouterr().out
+
+
 def test_main_refuses_a_payload_with_no_interval(tool, capsys, monkeypatch, tmp_path):
     path = _payload(tmp_path, None)
     monkeypatch.setattr(sys, "argv", ["import_deploy_payload.py", path])

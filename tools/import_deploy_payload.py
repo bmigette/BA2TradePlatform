@@ -305,6 +305,10 @@ def main() -> int:
         sched_pre = ((entry["settings"].get("execution") or {}).get("run_schedule_override") or {})
         live_days = None
         if sched_pre.get("days"):
+            if not sched_pre.get("times"):
+                print(f"FATAL: {label}: the stored schedule carries days but NO decision time; "
+                      f"refusing to guess one (live must fire at the time the backtest decided at)")
+                return 1
             try:
                 live_days, clock_note = live_entry_days(
                     {d: bool(v) for d, v in sched_pre["days"].items()},
@@ -472,7 +476,10 @@ def main() -> int:
         sched = ((entry["settings"].get("execution") or {}).get("run_schedule_override") or {})
         if sched.get("days"):
             days = dict(live_days)   # clock-resolved above (identity on the intraday clock)
-            times = sched.get("times") or ["09:30"]
+            # The deployment fires at the backtest's OWN decision time (a strategy optimized at
+            # 09:40 is deployed at 09:40): copied from the stored schedule, never defaulted. The
+            # check ran before any write (the entry-weekday block above).
+            times = list(sched["times"])
             prior = (expert.get_setting_with_interface_default(
                 "execution_schedule_enter_market", log_warning=False) or {}).get("days") or {}
             expert_params["execution_schedule_enter_market"] = {
