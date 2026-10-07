@@ -931,6 +931,60 @@ def test_two_analyses_share_the_macro_memo_and_both_record_their_reads(tmp_path)
         "entered the bundle with no observation behind them")
 
 
+def test_two_analyses_share_the_ohlcv_memos_and_both_record_their_reads(tmp_path):
+    """Capture ON: ONE provider read per frame across two analyses, and BOTH record it.
+
+    The same rule as the macro memo, for the frames: the stock's frame and the index's are fetched once
+    per process and session day and served from memory afterwards. The analysis served from memory still
+    read them (and the clock, for the window), so the recording must say so under the request identity the
+    tap writes -- otherwise a replay of its gather asks the tape for a read nobody recorded. Capture must
+    not add a provider read, and capture OFF must record (and read the clock) nothing.
+    """
+    from ba2_common.core.replay import capture_scope
+    from ba2_experts.DeterministicScorer import data
+
+    def run(root):
+        counters = {"ohlcv": 0}
+        provider = _TapedOHLCV(_ds_frame(), counters)
+        providers = LiveProviderBundle(_resolver({"ohlcv": provider}))
+        reads = {}
+        data.reset_caches()
+        try:
+            for analysis_id in ("A1", "A2"):
+                if root is None:
+                    data.fetch_ohlcv(providers, "AAPL", None)
+                    data.fetch_index_closes(providers, None, "SPY")
+                    continue
+                with root.scope(analysis_id) as context:
+                    context.set_phase(ReplayStatus.PHASE_GATHER)
+                    context.set_skip("test scope")
+                    data.fetch_ohlcv(providers, "AAPL", None)
+                    data.fetch_index_closes(providers, None, "SPY")
+                    reads[analysis_id] = sorted(
+                        p.observation.request_identity["symbol"] for p in context.observations
+                        if p.observation.method == "get_ohlcv_data")
+        finally:
+            data.reset_caches()
+        return counters["ohlcv"], reads
+
+    class _Scopes:
+        def __init__(self, store):
+            self.store = store
+
+        def scope(self, analysis_id):
+            return capture_scope(self.store, _macro_meta(analysis_id))
+
+    fetched_off, _none = run(None)
+    with capture_to(tmp_path / "ohlcv") as store:
+        fetched_on, reads = run(_Scopes(store))
+
+    assert fetched_on == fetched_off == 2, "capture changed the number of provider reads (2: AAPL, SPY)"
+    assert reads["A1"] == ["AAPL", "SPY"]
+    assert reads["A2"] == ["AAPL", "SPY"], (
+        "the analysis served from the process memos recorded no OHLCV read, so its bundle holds frames "
+        "with no observation behind them")
+
+
 # --------------------------------------------------------------------------- #
 # 3. Skip and error paths
 # --------------------------------------------------------------------------- #

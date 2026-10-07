@@ -448,8 +448,14 @@ _SCORER_TARGETS = [{"publishedDate": _days_ago_iso(2), "priceTarget": 120.0},
                    {"publishedDate": _days_ago_iso(8), "priceTarget": 116.0}]
 
 
-def scorer_case(analysis_id: str = SCORER_ID, bars: int = 400) -> Case:
+def scorer_case(analysis_id: str = SCORER_ID, bars: int = 400, *,
+                quote: Optional[float] = -1.0, reset_caches: bool = True) -> Case:
     """DeterministicScorer over its REAL data module -- no ``data.*`` stubs.
+
+    ``quote``: the account's price (default ``-1.0`` = the frame's last close); ``None`` is a broker outage
+    (the ``no_price`` skip). ``reset_caches=False`` keeps the module's per-process memos (OHLCV frames, the
+    index closes, the macro series) so a second case built this way is served from them, exactly as a second
+    live analysis in the same pass is.
 
     Every fake sits BELOW a tapped boundary: the OHLCV tap, the fundamentals-details
     provider methods, FMP's dated grades/price-target fetchers and the FRED
@@ -499,7 +505,8 @@ def scorer_case(analysis_id: str = SCORER_ID, bars: int = 400) -> Case:
     expert._gather_w_earnings = settings["w_earnings"]
     expert._gather_index_symbol = settings["index_symbol"]
     expert._gather_use_model_target = settings["use_model_target"]
-    data.reset_caches()
+    if reset_caches:
+        data.reset_caches()
     patches = [
         mock.patch.object(details_module, "fmp_history_disk_cached", fake_history),
         mock.patch.object(rating, "fmp_http_get", fake_http_get),
@@ -515,7 +522,8 @@ def scorer_case(analysis_id: str = SCORER_ID, bars: int = 400) -> Case:
     # captured gather and tapped like every other broker read. It is the frame's last close, the value the
     # pre-seam code took from the frame, so the recorded bundle (and every comparison) is unchanged.
     # The LEGACY format (no quote, no marker) is built from this one by ``to_legacy_scorer_recording``.
-    _attach_quote(expert, TapedAccount(9000 + int(analysis_id), float(frame["Close"].iloc[-1])))
+    price = float(frame["Close"].iloc[-1]) if quote == -1.0 else quote
+    _attach_quote(expert, TapedAccount(9000 + int(analysis_id), price))
     return Case(expert, settings, patches, FakeMarketAnalysis(analysis_id, "GOOG"))
 
 
@@ -558,8 +566,10 @@ CASE_BUILDERS: Tuple[Tuple[str, Callable[[], Case]], ...] = (
 # --------------------------------------------------------------------------- #
 # Building and exporting the session
 # --------------------------------------------------------------------------- #
-def capture_session(store_root, export_dir) -> Path:
-    """Record every case into ``store_root`` and export them to ``export_dir``."""
+def capture_session(store_root, export_dir, builders=None) -> Path:
+    """Record every case into ``store_root`` and export them to ``export_dir``.
+
+    ``builders``: ``(analysis_id, builder)`` pairs to record instead of :data:`CASE_BUILDERS`."""
     store = ReplayStore(store_root, writer="sync")
     store.begin_session(SessionRecord(
         session_id=SESSION_ID, instance_id="replay-test-instance",
@@ -568,7 +578,7 @@ def capture_session(store_root, export_dir) -> Path:
         source_revision="0" * 40, dirty=False))
     set_replay_store(store)
     try:
-        for _analysis_id, builder in CASE_BUILDERS:
+        for _analysis_id, builder in (CASE_BUILDERS if builders is None else builders):
             case = builder()
             # What live run_analysis pins before _gather (the gather-time symbol).
             case.expert._gather_symbol = case.market_analysis.symbol
