@@ -855,6 +855,7 @@ class AppSettingsTab:
         'alpaca_api_key': 'alpaca_key_input', 'alpaca_api_secret': 'alpaca_secret_input',
         'worker_count': 'worker_count_input',
         'account_refresh_interval': 'account_refresh_interval_input',
+        'scheduled_session_guard_enabled': 'session_guard_input',
     }
 
     def _shown_value(self, key: str):
@@ -864,6 +865,16 @@ class AppSettingsTab:
         stored = getattr(self, '_stored', {})
         if has_stored_value(stored, key):
             raw = stored[key]
+            if meta['type'] == 'bool':
+                from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+                try:
+                    return coerce_bool(raw)
+                except ValueError:
+                    logger.error(f"App setting '{key}' holds an unreadable boolean {raw!r}")
+                    ui.notify(f"App setting '{key}' holds an unreadable boolean ({raw!r}); it is "
+                              f"shown at its declared default", type='negative', timeout=0,
+                              close_button=True)
+                    return meta['default']
             if meta['type'] == 'int':
                 try:
                     return int(raw)
@@ -1013,6 +1024,13 @@ class AppSettingsTab:
                 max=1440,  # Maximum 24 hours
                 step=1
             ).classes('w-full')
+            self.session_guard_input = ui.switch(
+                'Session guard: skip scheduled passes outside the regular market session',
+                value=self._shown_value('scheduled_session_guard_enabled'))
+            ui.label('ON (default): an entry / open-positions pass that fires on a holiday, a '
+                     'weekend, after an early close or outside 09:30-16:00 New York is skipped '
+                     'and logged. Turn OFF only if the guard misbehaves; takes effect on the next '
+                     'fire.').classes('text-xs text-gray-500')
         
         # A NO-EDIT SAVE IS A NO-OP: what every control shows is recorded, and a control
         # that still shows it is not written (stored value or declared default alike).
@@ -1052,6 +1070,8 @@ class AppSettingsTab:
                     if APP_SETTINGS_DEFINITIONS[key]['type'] == 'int':
                         to_write[key] = str(numeric_setting_for_save(
                             APP_SETTINGS_DEFINITIONS, key, raw, int))
+                    elif APP_SETTINGS_DEFINITIONS[key]['type'] == 'bool':
+                        to_write[key] = 'true' if raw else 'false'
                     else:
                         to_write[key] = '' if raw is None else raw
             except NumericSettingNotSavable as e:
@@ -2862,8 +2882,9 @@ class ExpertSettingsTab:
         hint = getattr(self, f'{kind}_local_hint', None)
         if toggle is None or hint is None:
             return
+        warnings = self._session_time_warnings(kind, toggle.value == 'Market time (NYSE)')
         if toggle.value != 'Market time (NYSE)':
-            hint.text = ''
+            hint.text = ' | '.join(warnings)
             return
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -2875,7 +2896,22 @@ class ExpertSettingsTab:
             hours, minutes = map(int, time_str.split(':'))
             ny_dt = datetime.now(ny).replace(hour=hours, minute=minutes, second=0, microsecond=0)
             parts.append(f"{time_str} NYSE -> {ny_dt.astimezone(local_tz).strftime('%H:%M')} local")
-        hint.text = ('This machine\'s local time: ' + ', '.join(parts)) if parts else ''
+        hint.text = ' | '.join(([('This machine\'s local time: ' + ', '.join(parts))] if parts else [])
+                               + warnings)
+
+    def _session_time_warnings(self, kind: str, market_basis: bool) -> list:
+        """The live session guard's consequences for the times being edited: a pass outside the
+        regular session is SKIPPED by JobManager, and one too close to the close cannot finish.
+        A warning only (``schedule_genes.schedule_time_warnings``)."""
+        from datetime import datetime
+        from ba2_common.core.schedule_genes import schedule_time_warnings
+        try:
+            times = self._collect_execution_times(getattr(self, f'{kind}_execution_times', []))
+            return schedule_time_warnings(times, 'market' if market_basis else 'local',
+                                          datetime.now().astimezone().tzinfo)
+        except Exception as e:  # noqa: BLE001 -- a hint must never break the form
+            logger.warning(f"could not compute schedule time warnings: {e}")
+            return []
 
     def _update_open_positions_schedule_visibility(self):
         """Hide the open-positions schedule editor for experts that handle exits
@@ -3225,6 +3261,7 @@ class ExpertSettingsTab:
                                     int(hours), int(minutes)
                                     if 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59:
                                         time_input.props('error=false')
+                                        self._refresh_time_basis_hint('enter_market')
                                         return
                             time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
                         except ValueError:
@@ -3277,6 +3314,7 @@ class ExpertSettingsTab:
                                     int(hours), int(minutes)
                                     if 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59:
                                         time_input.props('error=false')
+                                        self._refresh_time_basis_hint('open_positions')
                                         return
                             time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
                         except ValueError:

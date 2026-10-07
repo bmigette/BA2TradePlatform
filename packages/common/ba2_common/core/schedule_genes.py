@@ -127,9 +127,13 @@ def parse_decision_times_arg(raw: Optional[str], execution_interval: str, *,
 #: FMPSenateTraderWeight has no usable sample (one 4.7 h manual run), so the bound is the
 #: LARGEST measured p95 for every expert, rounded up. A deployment is refused when
 #: ``time + LIVE_PASS_P95_SECONDS + LIVE_PASS_MARGIN_SECONDS`` falls after the regular close of a
-#: normal day. 15:30 passes (15:48:30), 15:50 does not (16:08:30).
+#: normal day. With the 300 s margin: 15:30 passes (15:43:30), 15:45 passes (15:58:30, the
+#: latest default value), 15:50 is refused (16:03:30).
+#: The measured MAXIMUM pass was 506 s (FMPInsiderClusterBuy): for a 15:45 decision the orders are
+#: out by about 15:53:30. The sample is September passes at 09:30 on a machine that was often
+#: loaded. RE-MEASURE this bound if the expert universe or the hardware changes.
 LIVE_PASS_P95_SECONDS = 510
-LIVE_PASS_MARGIN_SECONDS = 600
+LIVE_PASS_MARGIN_SECONDS = 300
 
 
 def live_deploy_time_refusal(time_hhmm: str) -> Optional[str]:
@@ -143,6 +147,47 @@ def live_deploy_time_refusal(time_hhmm: str) -> Optional[str]:
                 f"{_fmt(_SESSION_CLOSE_MIN)} close; the order would miss the session the "
                 f"backtest filled it in")
     return None
+
+
+def schedule_time_warnings(times: Sequence[str], time_basis: str = "market",
+                           local_tz: Any = None) -> List[str]:
+    """UI warnings for a live schedule's ``times`` (a WARNING only, never a refusal).
+
+    * outside the regular session (09:30 <= t < 16:00 New York): "this pass will be skipped: the
+      market is closed at that time" -- the live session guard skips it;
+    * inside it but so late that ``t + LIVE_PASS_P95_SECONDS + LIVE_PASS_MARGIN_SECONDS`` falls
+      after the close: "too close to the close to finish".
+    ``time_basis`` "market": the times are New York wall time. "local": converted from
+    ``local_tz`` (a tzinfo; required) on a reference weekday. Unparseable times are skipped (the
+    form's own validator flags them). A half day's 13:00 close is not modelled here."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    ny = ZoneInfo("America/New_York")
+    out: List[str] = []
+    for t in times:
+        try:
+            minutes = hhmm_to_minutes(t if len(t) == 5 else t.zfill(5))
+        except (ValueError, AttributeError):
+            continue
+        if time_basis != "market":
+            if local_tz is None:
+                raise ValueError("a local-basis schedule needs local_tz to be judged")
+            today = datetime.now(local_tz)
+            local = today.replace(hour=minutes // 60, minute=minutes % 60, second=0, microsecond=0)
+            ny_dt = local.astimezone(ny)
+            minutes = ny_dt.hour * 60 + ny_dt.minute
+            label = f"{t} local = {_fmt(minutes)} NYSE"
+        else:
+            label = f"{t} NYSE"
+        if not (_SESSION_OPEN_MIN <= minutes < _SESSION_CLOSE_MIN):
+            out.append(f"{label}: this pass will be skipped: the market is closed at that time "
+                       f"(regular session {_fmt(_SESSION_OPEN_MIN)}-{_fmt(_SESSION_CLOSE_MIN)} NYSE)")
+            continue
+        late = live_deploy_time_refusal(_fmt(minutes))
+        if late:
+            out.append(f"{label}: too close to the close to finish: {late}")
+    return out
 
 
 def retime_schedules(config: Dict[str, Any], decision_time: str) -> Dict[str, Any]:

@@ -59,16 +59,17 @@ DEFAULT_DECISION_TIME = "10:00"
 
 #: The decision times a grid SEARCHES by default (the ``schedule:time`` choice gene), exchange-local,
 #: sorted ascending. Owner decision 2026-10-07: 09:35 / 09:40 / 09:45 / 10:00 (the morning
-#: neighbourhood of DEFAULT_DECISION_TIME), 12:00 (midday), 15:30 and 15:50 (late session; 15:50 is
+#: neighbourhood of DEFAULT_DECISION_TIME), 12:00 (midday), 15:30 and 15:45 (late session; 15:45 is the latest the live deploy bound accepts, see
+#: ``schedule_genes.LIVE_PASS_*``; 15:50 is still a valid BACKTEST time, 
 #: the last time that still fills in the same session: the fill is at the 15:55 bar's open). Every
 #: value is validated by ``ba2_common.core.schedule_genes.validate_decision_times``. ONE definition:
 #: the grid drivers default to it, ``--decision-times default`` means it, ``fixed`` turns the gene
 #: off. A plain ``ba2-test optimize`` without the flag stays at the single DEFAULT_DECISION_TIME.
 #: NOTE the gene is an index into this list and neighbouring indices are NOT equally spaced in time
-#: (five minutes apart in the morning, then 10:00 -> 12:00 (2 h) -> 15:30 (3.5 h) -> 15:50): an
+#: (five minutes apart in the morning, then 10:00 -> 12:00 (2 h) -> 15:30 (3.5 h) -> 15:45): an
 #: index has no ordinal meaning, which is why the GA mutates this gene (``stratify`` choice genes)
 #: by a uniform re-draw among the OTHER values instead of the Gaussian index nudge.
-DEFAULT_DECISION_TIME_CHOICES = ("09:35", "09:40", "09:45", "10:00", "12:00", "15:30", "15:50")
+DEFAULT_DECISION_TIME_CHOICES = ("09:35", "09:40", "09:45", "10:00", "12:00", "15:30", "15:45")
 
 #: The time every STORED row before 2026-10-07 ran at (the session's first bar). Used ONLY to
 #: reconstruct such rows that carry no explicit time; never a default for a new run.

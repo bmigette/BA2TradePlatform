@@ -68,6 +68,9 @@ _WEEKDAY_ABBR = {
 # Absence of the key (legacy configs) means "local" -- the historical, unqualified behaviour.
 _MARKET_TZ = ZoneInfo("America/New_York")
 
+#: The operator kill switch of the live session guard (declared in ``core.app_settings``).
+SESSION_GUARD_SETTING = "scheduled_session_guard_enabled"
+
 
 def build_monthly_cron(ordinal: int, weekday: str, hour: int, minute: int,
                         market_time: bool = False) -> CronTrigger:
@@ -279,6 +282,9 @@ class JobManager:
 
         # Watch it for the rest of the process lifetime: losing this job is silent.
         self._start_account_refresh_watchdog()
+
+        # State of the session-guard kill switch, announced like the other armed/inert features.
+        self._session_guard_enabled(announce=True)
 
         # Announce which iv_rank-gated rules are still inert and which are armed.
         import threading as _th
@@ -1396,10 +1402,12 @@ class JobManager:
         Now) does not come through here either: an operator re-firing today's pass after hours is
         the documented use of that endpoint.
         """
-        from ba2_common.core.market_calendar import MarketCalendarUnavailable, regular_session_status
+        from ba2_common.core.market_calendar import (
+            closed_skip_is_expected, regular_session_status)
 
         expert_id, symbol, subtype = job.args[0], job.args[1], job.args[2]
         reason = None
+        expected = False          # an expected closed (holiday/weekend/early close) is a WARNING
         try:
             if self._symbol_is_crypto(symbol):
                 reason = f"instrument {symbol} is crypto: no exchange calendar is wired, not assuming NYSE"
@@ -1407,8 +1415,10 @@ class JobManager:
                 ok, why = regular_session_status(scheduled_for)
                 if not ok:
                     reason = why
-        except MarketCalendarUnavailable as e:
-            reason = f"NYSE calendar unavailable ({e}); refusing rather than guessing"
+                    expected = closed_skip_is_expected(scheduled_for)
+        except Exception as e:  # noqa: BLE001 -- fail CLOSED on anything: calendar unavailable,
+            #                     a naive instant, a calendar bug. The pass is refused and loud.
+            reason = f"session check failed ({type(e).__name__}: {e}); refusing rather than guessing"
         if reason is None:
             return True
         logged = getattr(self, "_session_skip_logged", None)
@@ -1418,10 +1428,40 @@ class JobManager:
         key = (expert_id, subtype_name, scheduled_for.astimezone(_MARKET_TZ).date())
         if key not in logged:
             logged.add(key)
-            logger.warning(
+            # WARNING for a routine closed day (holiday, weekend, early close); ERROR for anything
+            # else -- a skipped pass on a normal trading day (a schedule outside the session, a
+            # calendar fault, an unreadable calendar) is an incident.
+            (logger.warning if expected else logger.error)(
                 f"[SESSION GUARD] expert {expert_id} {subtype_name} pass at "
-                f"{scheduled_for.astimezone(_MARKET_TZ):%Y-%m-%d %H:%M} ET SKIPPED: {reason}")
+                f"{scheduled_for.astimezone(_MARKET_TZ):%Y-%m-%d %H:%M} ET SKIPPED: {reason} "
+                f"(disable the guard with app setting '{SESSION_GUARD_SETTING}'=false)")
         return False
+
+    def _session_guard_enabled(self, announce: bool = False) -> bool:
+        """The operator kill switch: app setting ``scheduled_session_guard_enabled`` (declared
+        default ON in ``core.app_settings``). An unreadable stored value or an unreadable database
+        keeps the guard ON (fail closed) and says so as an ERROR. ``announce`` logs the state."""
+        from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+        from .app_settings import app_setting_default
+        from .models import AppSetting
+
+        default = app_setting_default(SESSION_GUARD_SETTING)
+        source, enabled = "declared default", default
+        try:
+            with Session(get_db().bind) as session:
+                row = session.exec(select(AppSetting).where(AppSetting.key == SESSION_GUARD_SETTING)).first()
+            if row is not None and row.value_str not in (None, ""):
+                enabled, source = coerce_bool(row.value_str), "app setting"
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[SESSION GUARD] cannot read app setting '{SESSION_GUARD_SETTING}' "
+                         f"({type(e).__name__}: {e}); keeping the guard ON")
+            enabled, source = True, "unreadable setting (kept ON)"
+        if announce:
+            (logger.info if enabled else logger.warning)(
+                f"[SESSION GUARD] {'ENABLED' if enabled else 'DISABLED'} "
+                f"({source}: '{SESSION_GUARD_SETTING}'): scheduled entry / open-positions passes "
+                f"{'are skipped outside a regular NYSE session' if enabled else 'run with NO session check'}")
+        return enabled
 
     @staticmethod
     def _symbol_is_crypto(symbol) -> bool:
@@ -1460,7 +1500,12 @@ class JobManager:
             # exchange is in a regular session at the fire instant. A skipped pass registers no
             # ExpertRun and submits nothing, so a parked OPEN_POSITIONS pass cannot be waiting
             # on it (defer_open_positions_if_entry_in_flight finds no entry task in flight).
-            due = [job for job in due if self._session_guard_allows(job, scheduled_for)]
+            if self._session_guard_enabled():
+                due = [job for job in due if self._session_guard_allows(job, scheduled_for)]
+            else:
+                logger.warning(f"[SESSION GUARD] DISABLED by app setting "
+                               f"'{SESSION_GUARD_SETTING}': the {scheduled_for:%Y-%m-%d %H:%M} pass "
+                               f"runs with no market-session check")
             records = {}
             for job in due:
                 expert_id = job.args[0]

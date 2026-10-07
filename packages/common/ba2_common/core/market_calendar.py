@@ -552,6 +552,19 @@ def decision_data_session(label: date) -> date:
     return prior_regular_session(label)
 
 
+def closed_skip_is_expected(instant: datetime) -> bool:
+    """For an ``instant`` that ``regular_session_status`` calls closed: True when that is the
+    EXPECTED kind of closed (a weekend, a market holiday, or a half day's early close -- a
+    scheduled pass skipped there is routine), False when it falls on a FULL regular session day
+    (16:00 close), where a skipped pass means a schedule outside the session or a calendar fault
+    and is an incident. Raises ``MarketCalendarUnavailable`` like the status function."""
+    aware = _require_aware(instant)
+    day = aware.astimezone(NY_TZ).date()
+    if not is_regular_session(day):
+        return True
+    return regular_session_close_utc(day).astimezone(NY_TZ).hour < 16
+
+
 def regular_session_status(instant: datetime) -> Tuple[bool, str]:
     """``(True, "")`` when ``instant`` falls inside a regular NYSE session (open-inclusive,
     close-exclusive; a half day closes at 13:00 ET), else ``(False, reason)``.
