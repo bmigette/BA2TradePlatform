@@ -29,13 +29,55 @@ SEAM_EXPERTS = ["FMPEarningsDrift", "FMPInsiderClusterBuy", "FinnHubRating", "FM
 
 
 # ----------------------------------------------------------------------------- (d) parity
-@pytest.mark.parametrize("name", SEAM_EXPERTS)
-def test_expert_reads_its_price_through_the_one_seam(name):
-    src = (EXPERT_DIR / f"{name}.py").read_text(encoding="utf-8")
-    assert "self._decision_price(" in src, f"{name} does not use the shared price seam"
-    # no second live/backtest branch of its own and no direct bundle read for the anchor
-    assert "providers.price_at_date(" not in src.replace("self._decision_price(providers", ""), name
-    assert "else providers.price_at_date" not in src, name
+def _fill_missing_attrs(expert, call):
+    """Run ``call`` and give the expert the plain config attributes its ``_gather`` reads (the
+    ``_gather_*`` fields run_analysis normally sets) one AttributeError at a time."""
+    import re
+    for _ in range(40):
+        try:
+            return call()
+        except AttributeError as exc:
+            m = re.search(r"no attribute '(\w+)'", str(exc))
+            if not m:
+                raise
+            setattr(expert, m.group(1), "key" if "key" in m.group(1) else 30)
+    raise AssertionError("could not satisfy the expert's gather attributes")
+
+
+BEHAVIOURAL = ["FMPEarningsDrift", "FMPInsiderClusterBuy", "FMPEarningsEvent", "FMPRating"]
+
+
+@pytest.mark.parametrize("name", BEHAVIOURAL)
+def test_expert_gather_asks_the_seam_and_uses_its_value(name):
+    """Patch the seam: the expert's gather must call it for the symbol/instant and put ITS value in
+    the bundle, with the bundle's own ``price_at_date`` forbidden (no second source)."""
+    import importlib
+    from unittest.mock import MagicMock
+    cls = getattr(importlib.import_module(f"ba2_experts.{name}"), name)
+    e = cls.__new__(cls)
+    e.id = 1
+    e.logger = MagicMock()
+    e._gather_symbol = "AAPL"
+    seen = []
+    e._decision_price = lambda providers, symbol, as_of: seen.append((symbol, as_of)) or 123.456
+    providers = MagicMock()
+    providers.price_at_date.side_effect = AssertionError("expert read the bundle directly")
+    bundle = _fill_missing_attrs(e, lambda: e._gather(providers, NOW))
+    assert seen == [("AAPL", NOW)]
+    assert bundle["current_price"] == 123.456
+
+
+@pytest.mark.parametrize("name", [n for n in SEAM_EXPERTS if n not in BEHAVIOURAL])
+def test_remaining_experts_call_the_seam_and_never_the_bundle_directly(name):
+    """FinnHubRating and the two Senate experts need network-shaped fixtures to run ``_gather``; they
+    are checked on the syntax tree (calls, not text): a ``_decision_price`` call, no ``price_at_date``
+    call on a bundle."""
+    import ast
+    tree = ast.parse((EXPERT_DIR / f"{name}.py").read_text(encoding="utf-8"))
+    attrs = [n.func.attr for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+    assert "_decision_price" in attrs, f"{name} does not use the shared price seam"
+    assert "price_at_date" not in attrs, f"{name} reads the bundle's price directly"
 
 
 def test_deterministic_scorer_uses_the_seam_not_its_daily_frame():
@@ -165,3 +207,79 @@ def test_safeguard_stop_builder_is_guarded():
         with pytest.raises(StaleAnchorPrice):
             synthesize_safeguard_stop(110.0, True, 5.0, min_stop_pct=0.0)
     assert synthesize_safeguard_stop(110.0, True, 5.0, min_stop_pct=0.0) == pytest.approx(104.5)
+
+
+# ----------------------------------------------------------------------------- no quote: its own skip
+def test_live_without_a_quote_is_skipped_as_no_price_not_as_thin_history():
+    """The wrong reason used to be recorded (``insufficient_history``) and the price fell back to 0.0."""
+    from unittest.mock import MagicMock
+    e = DeterministicScorer.__new__(DeterministicScorer)
+    e.id = 7
+    e.logger = MagicMock()
+    rec = e._process({"symbol": "AAPL", "ohlcv": pd.DataFrame({"Close": [1.0] * 400}),
+                      "current_price": None}, {"min_history_days": 260}, None)
+    assert rec.skip and rec.skip_reason == "no_price"
+    assert rec.current_price is None
+    assert "price" in rec.details.lower() and "history" not in rec.details.lower()
+    e.logger.error.assert_called_once()
+    assert "AAPL" in e.logger.error.call_args[0][0]
+
+
+def test_thin_history_with_a_price_is_still_insufficient_history():
+    e = DeterministicScorer.__new__(DeterministicScorer)
+    rec = e._process({"symbol": "AAPL", "ohlcv": pd.DataFrame({"Close": [1.0] * 10}),
+                      "current_price": 100.0}, {"min_history_days": 260}, None)
+    assert rec.skip and rec.skip_reason == "insufficient_history" and rec.current_price == 100.0
+
+
+# ----------------------------------------------------------------------------- never absorbed
+@pytest.mark.parametrize("mode", ["enforce", "observe", "legacy"])
+def test_stale_anchor_price_is_never_absorbed_in_any_error_mode(monkeypatch, mode):
+    from ba2_common.core.failure_modes import absorb_if_benign, is_never_absorbed
+    monkeypatch.setenv("BA2_ERROR_MODE", mode)
+    exc = StaleAnchorPrice("daily close as anchor")
+    assert is_never_absorbed(exc)
+    with pytest.raises(StaleAnchorPrice):
+        try:
+            raise exc
+        except Exception as e:       # the shape of every broad handler
+            absorb_if_benign(e)
+            pytest.fail("the handler absorbed a StaleAnchorPrice")
+
+
+@pytest.mark.parametrize("mode", ["enforce", "observe", "legacy"])
+def test_the_sizing_loop_handler_lets_it_through(monkeypatch, mode):
+    """TradeRiskManagement's per-order handler routes every exception through ``absorb_if_benign``
+    (so the never-absorb rule applies to it) and the guard sits inside that try, before the price is
+    used. Checked on the syntax tree: the handler of the ``try`` containing the guard."""
+    import ast
+    from ba2_common.core import TradeRiskManagement as trm
+    monkeypatch.setenv("BA2_ERROR_MODE", mode)
+    tree = ast.parse(inspect.getsource(trm))
+    guarded = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try) and any(
+                isinstance(n, ast.Call) and getattr(n.func, "id", "") == "require_decision_price"
+                for b in node.body for n in ast.walk(b)):
+            guarded.append(node)
+    assert guarded, "no try block contains the size-anchor guard"
+    for node in guarded:
+        for h in node.handlers:
+            calls = [getattr(n.func, "id", "") for b in h.body for n in ast.walk(b) if isinstance(n, ast.Call)]
+            assert "absorb_if_benign" in calls, "the sizing handler does not apply the never-absorb rule"
+
+
+@pytest.mark.parametrize("mode", ["enforce", "observe", "legacy"])
+def test_trade_action_price_anchor_raises_in_every_mode(monkeypatch, mode):
+    from types import SimpleNamespace
+    from ba2_common.core.TradeActions import TradeAction
+
+    monkeypatch.setenv("BA2_ERROR_MODE", mode)
+    from ba2_common.core.TradeActions import AdjustTakeProfitAction
+    action = AdjustTakeProfitAction.__new__(AdjustTakeProfitAction)     # a concrete TradeAction
+    action.instrument_name = "AAPL"
+    action.account = SimpleNamespace(get_instrument_current_price=lambda s: 100.0)   # a plain float
+    with intraday_decisions(True):
+        with pytest.raises(StaleAnchorPrice):
+            action.get_current_price()
+    assert action.get_current_price() == 100.0           # live / daily clock: untouched

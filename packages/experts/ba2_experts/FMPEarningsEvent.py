@@ -155,8 +155,10 @@ near UTC midnight (that's the middle of the US trading day), so this is a real b
 negligible edge, not a practical concern.
 
 THE MOST RECENT PAST EVENT reads the as-of close. An 'amc' print dated as_of-1
-reacts during the as-of session, so its post-close IS ``Close(as_of)`` -- the very
-bar every expert on this platform already prices its decisions at. That is
+reacts during the as-of session, so its post-close IS ``Close(as_of)`` -- a DAILY
+bar of the as-of session (history, not the decision price: on an intraday backtest clock the
+daily history read here ends at the last FINISHED session, so this event's reaction is simply
+absent until the next session). That is
 platform-consistent, not a leak: the as-of close is the decision-time information
 set, and refusing it here would make this expert's history end a day earlier than
 everyone else's for no gain. LIVE CAVEAT: intraday, that as-of "close" is a PARTIAL

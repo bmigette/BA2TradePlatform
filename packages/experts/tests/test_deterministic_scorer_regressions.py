@@ -415,7 +415,7 @@ def test_backtest_pins_analyst_weight_and_index_from_settings():
     def _fake_gather(providers, as_of):
         captured["w_analyst"] = getattr(e, "_gather_w_analyst", None)
         captured["index"] = getattr(e, "_gather_index_symbol", None)
-        return {"symbol": "AAPL", "ohlcv": None, "current_price": None,
+        return {"symbol": "AAPL", "ohlcv": None, "current_price": 100.0,
                 "statements": {}, "grades_rows": [], "macro_inputs": {},
                 "index_closes": None}
 
@@ -442,7 +442,7 @@ def test_backtest_pins_use_model_target_from_settings():
 
     def _fake_gather(providers, as_of):
         captured["use_model_target"] = getattr(e, "_gather_use_model_target", None)
-        return {"symbol": "AAPL", "ohlcv": None, "current_price": None,
+        return {"symbol": "AAPL", "ohlcv": None, "current_price": 100.0,
                 "statements": {}, "grades_rows": [], "macro_inputs": {},
                 "index_closes": None}
 
@@ -463,7 +463,7 @@ def test_backtest_use_model_target_defaults_false():
 
     def _fake_gather(providers, as_of):
         captured["use_model_target"] = getattr(e, "_gather_use_model_target", None)
-        return {"symbol": "AAPL", "ohlcv": None, "current_price": None,
+        return {"symbol": "AAPL", "ohlcv": None, "current_price": 100.0,
                 "statements": {}, "grades_rows": [], "macro_inputs": {},
                 "index_closes": None}
 
