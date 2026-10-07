@@ -11,6 +11,7 @@ overhead makes the wall/CPU of THAT run unusable, the figures of the unprofiled 
 """
 import argparse
 import json
+import os
 import resource
 import sys
 import time
@@ -52,9 +53,11 @@ if ns.profile:
     import cProfile
     prof = cProfile.Profile()
     prof.enable()
+load0 = os.getloadavg()[0]
 t0, c0 = time.perf_counter(), time.process_time()
 rc = R.main()
 wall, cpu = time.perf_counter() - t0, time.process_time() - c0
+load1 = os.getloadavg()[0]
 if prof is not None:
     import io
     import pstats
@@ -70,6 +73,7 @@ except Exception:  # noqa: BLE001
     pass
 res = {"row": ns.backtest_id, "window": ns.window, "decision_time": ns.decision_time, "rc": rc,
        "wall_s": round(wall, 2), "cpu_s": round(cpu, 2),
+       "load1_start": round(load0, 2), "load1_end": round(load1, 2),   # a noisy run is recognised by these
        "peak_rss_mb": round(ru.ru_maxrss / 1024.0, 1),      # Linux: KB; the server is Linux
        **counts, "trades": rerun.get("total_trades"), "total_return": rerun.get("total_return"),
        "cpu_us_per_tick_symbol": (round(cpu / counts["tick_x_symbol"] * 1e6, 3) if counts["tick_x_symbol"] else None),
