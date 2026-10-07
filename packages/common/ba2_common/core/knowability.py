@@ -169,3 +169,65 @@ def known_at(visible_from: Optional[datetime], decision: Any) -> bool:
     if visible_from is None:
         return False
     return visible_from <= _as_naive_wall(decision)
+
+
+# ---------------------------------------------------------------------------------------------
+# THE ANCHOR-PRICE GUARD (2026-10-07).  Owner rule: every price-anchored order parameter (TP, SL,
+# limit, size, a "price > X" threshold against now) is computed from the CURRENT price knowable at
+# the decision instant, never from a daily bar.  On an intraday-clock backtest the only legitimate
+# anchor is ``AsOfPriceSource.decision_price`` (the close of the latest ENDED intraday bar), which
+# returns a ``DecisionPrice``.  A builder of a level/size calls ``require_decision_price`` on its
+# anchor: a plain float (a daily close read from a frame, a stored price_at_date, a literal)
+# is refused loudly.  The guard is a no-op unless ``intraday_decision_clock()`` is on, so LIVE and
+# the DAILY clock (option backtests, execution_interval=1d) are untouched by construction.
+# ---------------------------------------------------------------------------------------------
+class StaleAnchorPrice(RuntimeError):
+    """An order level / size was about to be built from a price that is not the decision price."""
+
+
+class DecisionPrice(float):
+    """A float that remembers WHICH intraday bar it is the close of and the decision instant it was
+    read for (``as_of``).  The bar stamp is kept as int64 nanoseconds (wall time labelled UTC, as the
+    bar store keeps it) and turned into a datetime only when read: the hot path pays nothing.
+    Arithmetic on it yields plain floats, so the marker survives only on the value that is passed
+    straight to a level/size builder."""
+
+    def __new__(cls, value: float, stamp: Any = None, as_of: Optional[datetime] = None):
+        obj = super().__new__(cls, value)
+        obj._stamp = stamp          # int ns, a datetime, or None
+        obj.as_of = as_of
+        return obj
+
+    @property
+    def stamp(self) -> Optional[datetime]:
+        s = self._stamp
+        if s is None or isinstance(s, datetime):
+            return s
+        import numpy as np
+        return np.datetime64(int(s), "ns").astype("datetime64[us]").astype(datetime)
+
+    def __reduce__(self):
+        return (DecisionPrice, (float(self), self._stamp, self.as_of))
+
+
+def require_decision_price(price: Any, *, what: str, symbol: str = "") -> Any:
+    """Refuse a non-decision price as the anchor of ``what`` while on the intraday clock.
+
+    Returns ``price`` unchanged.  Cheap (one thread-local read) off the intraday clock."""
+    if not intraday_decision_clock():
+        return price
+    if not isinstance(price, DecisionPrice):
+        raise StaleAnchorPrice(
+            f"{what}{' for ' + symbol if symbol else ''}: anchor price {price!r} is not the decision "
+            f"price (type {type(price).__name__}); on an intraday clock a level or size must be built "
+            f"from the close of the latest ENDED intraday bar, never a daily bar")
+    st = price.stamp
+    if st is None or (st.hour == 0 and st.minute == 0 and st.second == 0):
+        raise StaleAnchorPrice(
+            f"{what}{' for ' + symbol if symbol else ''}: anchor price {float(price)!r} is stamped "
+            f"{st!r}, a daily-bar stamp, not an intraday bar")
+    if price.as_of is not None and st > _as_naive_wall(price.as_of):
+        raise StaleAnchorPrice(
+            f"{what}{' for ' + symbol if symbol else ''}: anchor bar {st} is later than the decision "
+            f"instant {price.as_of} (look-ahead)")
+    return price

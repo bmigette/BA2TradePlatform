@@ -54,6 +54,7 @@ from ba2_experts.earnings_surprise import pead_score
 from .macro import (trend_score, vix_score, sahm_score, credit_score,
                     yield_curve_score, regime_composite, DEF_MW, DEF_YC_SCALE,
                     DEF_M_FLOOR, DEF_HARD_RISKOFF)
+from ba2_common.core.knowability import require_decision_price
 from .combine import (final_score, schmitt_trigger, atr_target_price,
                       atr_stop_price, resolve_target_price, confidence_from_score,
                       DEF_W_TECHNICAL, DEF_W_FUNDAMENTAL, DEF_W_ANALYST,
@@ -414,18 +415,15 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         index_closes = data.fetch_index_closes(
             providers, as_of, str(getattr(self, "_gather_index_symbol", data.INDEX_SYMBOL)))
 
-        current_price = None
-        if as_of is not None:
-            # Backtest: the price KNOWABLE at the decision instant, from the host's price source
-            # (the decision bar's open on an intraday clock, the as_of close on a daily one) --
-            # exactly what every other expert reads here. The last row of ``df`` is a FINISHED
-            # daily bar: on an intraday clock it is the PRIOR session's close, not the price at
-            # the decision. No fallback to it: a missing price refuses the decision (_process).
-            px = providers.price_at_date(symbol, as_of)
-            if px is not None:
-                current_price = float(px)
-        elif df is not None and not df.empty:
-            current_price = float(df["Close"].iloc[-1])
+        # The price the decision is made at: ONE seam shared with every other expert
+        # (``_decision_price``): live -> the account quote, backtest -> the host's decision price
+        # (the close of the latest ENDED intraday bar on an intraday clock, the as_of close on a
+        # daily one). The last row of ``df`` is a FINISHED daily bar -- HISTORY for the indicators,
+        # never the price: in a backtest it is the prior session's close, live a cached bar that
+        # may be today's partial one. No fallback to it: a missing price refuses the decision
+        # (_process).
+        px = self._decision_price(providers, symbol, as_of)
+        current_price = px   # not float(): a DecisionPrice keeps its bar stamp for the guard
 
         bundle = {
             "symbol": symbol,
@@ -547,6 +545,8 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         # DeterministicScorer's own "less accurate way of calculating... target price".
         # resolve_target_price enforces BUY-only for the model leg; stop price is ALWAYS
         # ATR-based regardless of this setting (risk management, not valuation).
+        if action in ("BUY", "SELL"):
+            require_decision_price(current_price, what="DeterministicScorer target/stop", symbol=symbol)
         model_target_price = None
         if action == "BUY" and bool(settings.get("use_model_target", False)):
             model_out = estimate_price_target(

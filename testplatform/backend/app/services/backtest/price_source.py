@@ -44,6 +44,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ba2_common.core.knowability import DecisionPrice
+
 logger = logging.getLogger(__name__)
 
 
@@ -744,7 +746,7 @@ class AsOfPriceSource:
         # and the symbol cannot be decided, exactly as live cannot trade it.
         if _ns_date(k[f]) < self.daily_session_date(as_of):
             return None
-        return float(self._c[symbol][f])
+        return DecisionPrice(float(self._c[symbol][f]), int(k[f]), as_of)
 
     # ---- loading -----------------------------------------------------------
     def preload(

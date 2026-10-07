@@ -1146,6 +1146,21 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
             return None
 
+    def _decision_price(self, providers: "ProviderBundle", symbol: str,
+                        as_of: Optional[datetime]) -> Optional[float]:
+        """THE current price an expert decides on (the owner's rule: never a daily bar).
+
+        ONE seam for live and backtest: ``as_of`` None (live) -> the account quote
+        (``_get_current_price``); ``as_of`` set (backtest) -> ``providers.price_at_date``, which
+        the backtest host answers from the engine's decision-price function (the close of the
+        latest ENDED intraday bar on an intraday clock, the as_of close on a daily clock).
+        Daily frames are HISTORY (indicators, ATR magnitude, returns), not the anchor price:
+        an expert reading ``df["Close"].iloc[-1]`` as 'now' reads a bar that is, in the
+        backtest, the previous session's close and, live, a cached (possibly partial) bar."""
+        if as_of is None:
+            return self._get_current_price(symbol)
+        return providers.price_at_date(symbol, as_of)
+
     # ---- Backtest contract (Phase 1) ---------------------------------
     def _gather(self, providers: "ProviderBundle", as_of: Optional[datetime]) -> Dict[str, Any]:
         """Pull every datum this expert needs via providers (never raw HTTP/DB).

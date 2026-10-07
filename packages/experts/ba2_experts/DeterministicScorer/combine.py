@@ -10,6 +10,8 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
+from ba2_common.core.knowability import require_decision_price
+
 DEF_W_TECHNICAL = 0.50
 DEF_W_FUNDAMENTAL = 0.30
 DEF_W_ANALYST = 0.00
@@ -251,6 +253,7 @@ def atr_target_price(price: float, atr: Optional[float], direction: str,
     multiple stretches up to ±30% with |final| (high conviction -> wider target)."""
     if price is None or atr is None or atr <= 0 or not math.isfinite(atr):
         return None
+    require_decision_price(price, what="atr_target_price")
     k = float(s.get("k_target", DEF_K_TARGET))
     if s.get("target_from_score", False) and final is not None:
         k = k * (1.0 + 0.3 * min(1.0, abs(final)))
@@ -284,6 +287,7 @@ def atr_stop_price(price: float, atr: Optional[float], direction: str,
     raw_outputs; the platform RM keeps final authority)."""
     if price is None or atr is None or atr <= 0 or not math.isfinite(atr):
         return None
+    require_decision_price(price, what="atr_stop_price")
     k = float(s.get("k_stop", DEF_K_STOP))
     if direction == "BUY":
         return float(price - k * atr)
