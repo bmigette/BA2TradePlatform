@@ -397,10 +397,13 @@ def test_different_time_processing_does_not_wait_for_earlier_callback():
 
 
 @pytest.mark.parametrize("early,late", [
-    (datetime(2026, 9, 15, 9, 30, tzinfo=timezone.utc),
-     datetime(2026, 9, 15, 10, 30, tzinfo=timezone.utc)),
-    (datetime(2026, 9, 14, 9, 30, tzinfo=timezone.utc),
-     datetime(2026, 9, 15, 9, 30, tzinfo=timezone.utc)),
+    # REAL session instants (EDT = UTC-4): 09:30 and 10:30 New York on Tue 2026-09-15. The scheduled
+    # fire is subject to the live session guard, which skips a pass outside 09:30-16:00 New York
+    # (the test's old 09:30 UTC is 05:30 New York, before the open, so it was SKIPPED by the guard).
+    (datetime(2026, 9, 15, 13, 30, tzinfo=timezone.utc),
+     datetime(2026, 9, 15, 14, 30, tzinfo=timezone.utc)),
+    (datetime(2026, 9, 14, 13, 30, tzinfo=timezone.utc),
+     datetime(2026, 9, 15, 13, 30, tzinfo=timezone.utc)),
 ], ids=["different-time-same-day", "same-time-different-day"])
 def test_later_schedule_runs_while_earlier_high_priority_is_still_analyzing(worker, monkeypatch, early, late):
     import ba2_trade_platform.core.JobManager as module

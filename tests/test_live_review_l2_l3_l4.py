@@ -233,3 +233,45 @@ def test_the_session_calendar_is_prewarmed_and_its_duration_logged(monkeypatch):
     seen = _levels(monkeypatch)
     JM.JobManager._prewarm_session_calendar()
     assert any(lvl == "INFO" and "calendar ready in" in m for lvl, m in seen)
+
+
+# ------------------------------------------------------------------ guard scope: scheduled vs manual
+def test_a_symbol_without_an_instrument_row_is_not_crypto_and_is_not_refused(monkeypatch):
+    """A screener-discovered symbol may be scheduled before the InstrumentAutoAdder adds its row: the
+    ``IN`` query simply returns no row for it. Missing row = not crypto, no error, no refusal."""
+    class FakeSession:
+        def __init__(self, bind): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def exec(self, stmt): return SimpleNamespace(all=lambda: [])
+    monkeypatch.setattr(JM, "Session", FakeSession)
+    monkeypatch.setattr(JM, "get_db", lambda: SimpleNamespace(bind=None))
+    assert JM.JobManager._crypto_symbols({"NEWSYM", "OTHER"}) == set()
+    seen = _levels(monkeypatch)
+    jm = _jm()
+    jm._session_guard_enabled = lambda announce=False: True
+    due = [_job(symbol="NEWSYM")]
+    assert jm._apply_session_guard(due, _at(*NORMAL, 10, 0)) == due
+    assert not [1 for lvl, _ in seen if lvl == "ERROR"]
+
+
+def test_only_the_scheduler_fire_goes_through_the_session_guard_a_manual_run_never_does():
+    import inspect
+    from ba2_trade_platform.ui import api_routes
+    # the manual routes call submit_market_analysis directly: they never reach the guarded group
+    assert "_execute_scheduled_group" not in inspect.getsource(api_routes)
+    assert "_apply_session_guard" not in inspect.getsource(api_routes)
+    # the guarded group REQUIRES the scheduler's fire time: a programmatic call without one is refused
+    # outright (never silently treated as "now"), so an unscheduled invocation cannot pass for a fire
+    with pytest.raises(ValueError, match="scheduler fire time"):
+        JM.JobManager.__new__(JM.JobManager)._execute_scheduled_group(1, "X", AnalysisUseCase.ENTER_MARKET)
+
+
+def test_a_scheduled_fire_outside_the_session_is_skipped_and_one_inside_runs(monkeypatch):
+    _levels(monkeypatch)
+    jm = _jm()
+    jm._session_guard_enabled = lambda announce=False: True
+    monkeypatch.setattr(JM.JobManager, "_crypto_symbols", staticmethod(lambda symbols: set()))
+    due = [_job()]
+    assert jm._apply_session_guard(due, _at(*NORMAL, 5, 30)) == []       # before the open
+    assert jm._apply_session_guard(due, _at(*NORMAL, 10, 0)) == due
