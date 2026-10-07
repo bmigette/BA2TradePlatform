@@ -5515,13 +5515,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         Prefers the realized fill if present, else the limit price, else the originating
         recommendation's snapshot price (what the rule's order_open_price/current-price
         reference resolved to for a not-yet-filled market order), else the live price.
+        The preference order is the shared ``resolve_tpsl_reference_price`` (the backtest
+        resolves the same anchor through it); only the two lookups are live-specific.
         """
-        if entry_order.open_price:
-            return entry_order.open_price
-        if entry_order.limit_price:
-            return entry_order.limit_price
-        rec_id = getattr(entry_order, "expert_recommendation_id", None)
-        if rec_id:
+        from ba2_common.core.tpsl_fill_rebase import resolve_tpsl_reference_price
+
+        def _rec_price():
+            rec_id = getattr(entry_order, "expert_recommendation_id", None)
+            if not rec_id:
+                return None
             try:
                 from ...core.db import get_instance
                 from ...core.models import ExpertRecommendation
@@ -5530,10 +5532,16 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     return rec.price_at_date
             except Exception:
                 pass
-        try:
-            return self.get_instrument_current_price(entry_order.symbol)
-        except Exception:
             return None
+
+        def _live_price():
+            try:
+                return self.get_instrument_current_price(entry_order.symbol)
+            except Exception:
+                return None
+
+        return resolve_tpsl_reference_price(
+            entry_order.open_price, entry_order.limit_price, _rec_price, _live_price)
 
     def _target_exit_spec(self, transaction: Transaction, entry_order: TradingOrder):
         """Decide which exit-order structure a transaction needs at the broker.

@@ -1208,24 +1208,8 @@ def resolve_min_take_profit_pct(expert_recommendation_id: Optional[int]) -> floa
     return float(getattr(rec, "min_take_profit_percent", None) or 2.0) if rec else 2.0
 
 
-def compute_tp_floor_price(
-    target_price: float, entry_price: float, min_pct: float, is_long: bool
-) -> Optional[float]:
-    """If `target_price` is closer to `entry_price` than `min_pct`% allows, return the
-    floor-enforced price; otherwise None (no adjustment needed). Pure, no I/O -- shared by the
-    pre-fill Phase-2 enforcement (AdjustTakeProfitAction._enforce_minimum_distance / compute_price)
-    and TradeManager's post-fill re-check of the same floor against the REAL fill price."""
-    if not entry_price:
-        return None
-    if is_long:
-        actual_pct = ((target_price - entry_price) / entry_price) * 100
-        if actual_pct < min_pct:
-            return entry_price * (1 + min_pct / 100)
-    else:
-        actual_pct = ((entry_price - target_price) / entry_price) * 100
-        if actual_pct < min_pct:
-            return entry_price * (1 - min_pct / 100)
-    return None
+# compute_tp_floor_price now lives in tpsl_fill_rebase (pure; shared with the fill-time re-base).
+from ba2_common.core.tpsl_fill_rebase import compute_tp_floor_price  # noqa: E402,F401
 
 
 class _AdjustPriceLevelAction(TradeAction):

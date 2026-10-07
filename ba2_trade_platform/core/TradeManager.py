@@ -183,19 +183,9 @@ def replacement_blocked_by_qty(trigger_status, available_qty, required_qty) -> b
     return available_qty < required_qty
 
 
-def rebase_price_to_fill(target_price, reference_price, fill_price):
-    """Re-scale a TP/SL target that was computed off a pre-fill reference so it keeps
-    the same proportional distance from the order's ACTUAL fill.
-
-    new = fill * (target / reference)
-
-    Sign-agnostic (works for stops below and targets above) and a no-op when the
-    reference already equals the fill. Returns target_price unchanged if any input
-    is missing or the reference is non-positive.
-    """
-    if not target_price or not reference_price or not fill_price or reference_price <= 0:
-        return target_price
-    return round(fill_price * (target_price / reference_price), 4)
+# The re-base rules live in ba2_common (shared with the backtest). rebase_price_to_fill is
+# re-exported here because it has long been importable from TradeManager.
+from ba2_common.core.tpsl_fill_rebase import rebase_levels_at_fill, rebase_price_to_fill  # noqa: E402,F401
 
 
 def resolve_entry_order(session, transaction):
@@ -1786,161 +1776,130 @@ class TradeManager:
                                     status_updates[dependent_order.id] = OrderStatus.ERROR
                                     continue
                             
-                            # ===== Re-base the STOP-LOSS to the parent's actual fill =====
-                            # Market entries compute TP/SL at enter time off a PRE-FILL
-                            # reference (the market order has no fill yet), so a fill that
-                            # differs from that reference leaves the stop at the wrong
-                            # distance. Re-scale the SL proportionally against the real fill
-                            # using the reference anchor stored on the order. The TP
-                            # (limit_price) is intentionally left untouched.
+                            # ===== Fill-time adjustment of the protective levels =====
+                            # The rules (stop re-based to the real fill, take-profit minimum-distance
+                            # floor from the real fill, legacy percent recalc) live in ONE pure
+                            # function shared with the backtest: ba2_common.core.tpsl_fill_rebase.
+                            # This block only gathers its inputs, calls it, and writes the result to
+                            # the order row / Transaction.
                             transaction_updated = False
                             try:
-                                ref_price = (dependent_order.data or {}).get("tpsl_reference_price") \
-                                    if isinstance(dependent_order.data, dict) else None
-                                if ref_price and parent_order.open_price and dependent_order.stop_price:
-                                    new_sl = rebase_price_to_fill(
-                                        dependent_order.stop_price, ref_price, parent_order.open_price)
-                                    if new_sl and abs(new_sl - dependent_order.stop_price) > 1e-9:
+                                fill_px = parent_order.open_price
+                                data_dict = dependent_order.data if isinstance(dependent_order.data, dict) else None
+                                if fill_px:
+                                    # -- reference anchor for the stop (recorded when the exit order was built)
+                                    ref_val = None
+                                    ref_raw = data_dict.get("tpsl_reference_price") if data_dict else None
+                                    if ref_raw:
+                                        try:
+                                            ref_val = float(ref_raw)
+                                        except (TypeError, ValueError) as rebase_err:
+                                            self.logger.warning(
+                                                f"Could not re-base SL for order {dependent_order.id}: {rebase_err}")
+                                    rebase_stop = bool(ref_val is not None and ref_val > 0)
+                                    if dependent_order.stop_price and not rebase_stop:
+                                        self.logger.warning(
+                                            f"SL of order {dependent_order.id} NOT re-based to the parent fill: "
+                                            f"no usable tpsl_reference_price on the order "
+                                            f"(data value {ref_raw!r}); the stop keeps its pre-fill level")
+                                    # -- take-profit floor inputs
+                                    side_str = str(parent_order.side.value if hasattr(parent_order.side, "value")
+                                                   else parent_order.side).upper()
+                                    is_long = side_str == "BUY"
+                                    apply_floor = bool(data_dict is not None and "tp_percent_target" in data_dict
+                                                       and dependent_order.limit_price)
+                                    min_pct = None
+                                    if apply_floor:
+                                        from ba2_common.core.TradeActions import resolve_min_take_profit_pct
+                                        min_pct = resolve_min_take_profit_pct(parent_order.expert_recommendation_id)
+                                    # -- legacy percent fields
+                                    legacy_tp = legacy_sl = None
+                                    tpsl_data = data_dict.get("TP_SL") if data_dict else None
+                                    if isinstance(tpsl_data, dict):
+                                        try:
+                                            if "tp_percent" in tpsl_data:
+                                                legacy_tp = float(tpsl_data.get("tp_percent"))
+                                            elif "sl_percent" in tpsl_data:
+                                                legacy_sl = float(tpsl_data.get("sl_percent"))
+                                        except (KeyError, TypeError, ValueError) as data_error:
+                                            self.logger.warning(
+                                                f"Could not recalculate TP/SL price for order {dependent_order.id} "
+                                                f"from data field: {data_error}")
+                                    adj = rebase_levels_at_fill(
+                                        is_long=is_long, fill_price=fill_px, reference_price=ref_val,
+                                        take_profit=dependent_order.limit_price, stop_loss=dependent_order.stop_price,
+                                        rebase_stop=rebase_stop, apply_tp_floor=apply_floor,
+                                        min_take_profit_pct=min_pct,
+                                        legacy_tp_percent=legacy_tp, legacy_sl_percent=legacy_sl)
+                                    txn = None
+                                    if (adj.stop_rebased or adj.tp_floored) and dependent_order.transaction_id:
+                                        txn = session.get(Transaction, dependent_order.transaction_id)
+
+                                    if adj.stop_rebased:
                                         old_sl = dependent_order.stop_price
+                                        new_sl = adj.stop_loss
                                         dependent_order.stop_price = new_sl
                                         self.logger.info(
                                             f"Re-based SL for order {dependent_order.id} to parent fill: "
                                             f"${old_sl:.4f} -> ${new_sl:.4f} "
-                                            f"(ref ${ref_price:.4f}, fill ${parent_order.open_price:.4f})"
+                                            f"(ref ${ref_val:.4f}, fill ${fill_px:.4f})"
                                         )
-                                        txn = session.get(Transaction, dependent_order.transaction_id) \
-                                            if dependent_order.transaction_id else None
                                         if txn:
                                             txn.stop_loss = new_sl
                                             session.add(txn)
                                             transaction_field_updates = True
-                                        if isinstance(dependent_order.data, dict):
+                                        if data_dict is not None:
                                             dependent_order.data["sl_rebased_to_fill"] = True
-                                            dependent_order.data["parent_filled_price"] = parent_order.open_price
-                            except (KeyError, TypeError, ValueError) as rebase_err:
-                                self.logger.warning(
-                                    f"Could not re-base SL for order {dependent_order.id}: {rebase_err}")
+                                            dependent_order.data["parent_filled_price"] = fill_px
 
-                            # ===== Re-check the TAKE-PROFIT floor against the parent's actual fill =====
-                            # AdjustTakeProfitAction._enforce_minimum_distance() enforces
-                            # min_take_profit_percent against the "real fill price" — but for a
-                            # MARKET-order entry it runs in Phase 2, before the order is even
-                            # submitted, so limit_price/open_price are both still None and it can
-                            # only fall back to a live quote snapshot, not the actual fill. Re-run
-                            # that same floor check now that the real fill is known, and bump the
-                            # TP up (never down) if it's under-floor. Unlike SL this is a re-check
-                            # of an existing safety floor, not a full proportional rebase: a TP
-                            # that already clears the floor is left untouched, in keeping with TP
-                            # being "intentionally left untouched" for anything that isn't a floor
-                            # violation.
-                            try:
-                                if (isinstance(dependent_order.data, dict)
-                                        and "tp_percent_target" in dependent_order.data
-                                        and parent_order.open_price and dependent_order.limit_price):
-                                    from ba2_common.core.TradeActions import (
-                                        compute_tp_floor_price, resolve_min_take_profit_pct)
-                                    min_pct = resolve_min_take_profit_pct(parent_order.expert_recommendation_id)
-                                    side_str = str(parent_order.side.value if hasattr(parent_order.side, "value")
-                                                   else parent_order.side).upper()
-                                    is_long = side_str == "BUY"
-                                    floor_price = compute_tp_floor_price(
-                                        dependent_order.limit_price, parent_order.open_price, min_pct, is_long)
-                                    if floor_price is not None:
+                                    if adj.tp_floored:
                                         old_tp = dependent_order.limit_price
-                                        dependent_order.limit_price = floor_price
+                                        dependent_order.limit_price = adj.take_profit
                                         self.logger.warning(
                                             f"TP floor re-check against real fill: order {dependent_order.id} "
                                             f"was ${old_tp:.4f} (pre-fill), below the {min_pct}% minimum from "
-                                            f"the real fill ${parent_order.open_price:.4f}. Adjusted to "
-                                            f"${floor_price:.4f}"
+                                            f"the real fill ${fill_px:.4f}. Adjusted to "
+                                            f"${adj.take_profit:.4f}"
                                         )
-                                        txn = session.get(Transaction, dependent_order.transaction_id) \
-                                            if dependent_order.transaction_id else None
                                         if txn:
-                                            txn.take_profit = floor_price
+                                            txn.take_profit = adj.take_profit
                                             session.add(txn)
                                             transaction_field_updates = True
                                         dependent_order.data["tp_floor_rechecked_at_fill"] = True
-                            except (KeyError, TypeError, ValueError) as tp_floor_err:
-                                self.logger.warning(
-                                    f"Could not re-check TP floor for order {dependent_order.id}: {tp_floor_err}")
 
-                            # ===== Legacy: percent-based recalc (kept as fallback) =====
-                            # This ensures TP/SL prices use the parent's filled price, not stale market data
-                            # If percent is not stored, it will be calculated and stored as a fallback
-                            if dependent_order.data and isinstance(dependent_order.data, dict):
-                                try:
-                                    # Check if this is a TP order (has tp_percent in data)
-                                    if dependent_order.data and "TP_SL" in dependent_order.data and "tp_percent" in dependent_order.data["TP_SL"] and parent_order.open_price:
-                                        tp_percent = dependent_order.data["TP_SL"].get("tp_percent")
+                                    # ===== Legacy: percent-based recalc (rule 3 of the shared function) =====
+                                    # Overrides the two adjustments above, exactly as it always did.
+                                    if adj.legacy_tp_applied:
                                         old_limit_price = dependent_order.limit_price
-                                        
-                                        # Recalculate TP price from parent's filled price: price = filled_price * (1 + percent/100)
-                                        new_limit_price = parent_order.open_price * (1 + tp_percent / 100)
-                                        
-                                        # Round price to 4 decimal places (standard for forex/stocks)
-                                        new_limit_price = round(new_limit_price, 4)
-                                        
-                                        # Update the limit price
-                                        dependent_order.limit_price = new_limit_price
-                                        
+                                        dependent_order.limit_price = adj.take_profit
                                         self.logger.info(
                                             f"Recalculated TP price for order {dependent_order.id}: "
-                                            f"parent filled ${parent_order.open_price:.2f} * (1 + {tp_percent:.2f}%) "
-                                            f"= ${new_limit_price:.2f} (was ${old_limit_price:.2f})"
+                                            f"parent filled ${fill_px:.2f} * (1 + {legacy_tp:.2f}%) "
+                                            f"= ${adj.take_profit:.2f} (was ${old_limit_price:.2f})"
                                         )
-                                        
-                                        # Update data field to record when recalculation happened
-                                        dependent_order.data["parent_filled_price"] = parent_order.open_price
+                                        dependent_order.data["parent_filled_price"] = fill_px
                                         dependent_order.data["recalculated_at_trigger"] = True
-                                        
-                                        # Mark transaction for update with new TP price
                                         transaction_updated = True
-                                    
-                                    # Check if this is an SL order (has sl_percent in data)
-                                    elif dependent_order.data and "TP_SL" in dependent_order.data and "sl_percent" in dependent_order.data["TP_SL"] and parent_order.open_price:
-                                        sl_percent = dependent_order.data["TP_SL"].get("sl_percent")
+                                    elif adj.legacy_sl_applied:
                                         old_stop_price = dependent_order.stop_price
-                                        
-                                        # Recalculate SL price from parent's filled price: price = filled_price * (1 + percent/100)
-                                        # For SL, percent is typically negative, so 1 + (-5/100) = 0.95 for a 5% loss
-                                        new_stop_price = parent_order.open_price * (1 + sl_percent / 100)
-                                        
-                                        # Round price to 4 decimal places
-                                        new_stop_price = round(new_stop_price, 4)
-                                        
-                                        # Update the stop price
-                                        dependent_order.stop_price = new_stop_price
-                                        
+                                        dependent_order.stop_price = adj.stop_loss
                                         self.logger.info(
                                             f"Recalculated SL price for order {dependent_order.id}: "
-                                            f"parent filled ${parent_order.open_price:.2f} * (1 + {sl_percent:.2f}%) "
-                                            f"= ${new_stop_price:.2f} (was ${old_stop_price:.2f})"
+                                            f"parent filled ${fill_px:.2f} * (1 + {legacy_sl:.2f}%) "
+                                            f"= ${adj.stop_loss:.2f} (was ${old_stop_price:.2f})"
                                         )
-                                        
-                                        # Update data field to record when recalculation happened
-                                        if "TP_SL" not in dependent_order.data:
-                                            dependent_order.data["TP_SL"] = {}
-                                        dependent_order.data["TP_SL"]["parent_filled_price"] = parent_order.open_price
+                                        dependent_order.data["TP_SL"]["parent_filled_price"] = fill_px
                                         dependent_order.data["TP_SL"]["recalculated_at_trigger"] = True
-                                        
-                                        # Mark transaction for update with new SL price
                                         transaction_updated = True
-                                    
+                                    elif data_dict is None:
+                                        # No data field yet - will be populated when account submits the order
+                                        self.logger.debug(f"No data field in order {dependent_order.id}, will ensure percent is calculated during submission")
                                     else:
-                                        # No tp_percent or sl_percent in data - try to calculate as fallback
-                                        # This handles cases where TP/SL orders were created before percent storage was implemented
                                         self.logger.debug(f"No TP/SL percent found in order {dependent_order.id}.data, attempting fallback calculation")
-                                        # Note: We can't call AccountInterface method here, but the calculation will happen
-                                        # when the account's submit_order is called in PHASE 2 below
-                                
-                                except (KeyError, TypeError, ValueError) as data_error:
-                                    self.logger.warning(
-                                        f"Could not recalculate TP/SL price for order {dependent_order.id} from data field: {data_error}"
-                                    )
-                            else:
-                                # No data field yet - will be populated when account submits the order
-                                self.logger.debug(f"No data field in order {dependent_order.id}, will ensure percent is calculated during submission")
+                            except (KeyError, TypeError, ValueError) as adjust_err:
+                                self.logger.warning(
+                                    f"Could not adjust the protective levels of order {dependent_order.id} "
+                                    f"to the parent fill (left as they were): {adjust_err}")
                             # ===== END: Price recalculation =====
                             
                             # Update the associated Transaction if TP/SL price was recalculated
