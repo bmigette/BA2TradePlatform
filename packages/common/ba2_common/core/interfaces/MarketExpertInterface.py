@@ -1208,6 +1208,14 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         # read anywhere else cannot become "the price now" (see CLAUDE.md "Prices in decision code").
         if as_of is None:
             return self._get_current_price(symbol)
+        from ba2_common.core.knowability import intraday_decision_clock
+        if not intraday_decision_clock():
+            # A backtest on a DAILY clock (and the replay tool): EXACTLY the pre-existing read, the
+            # bundle's last daily close <= as_of (forward-filled, as before). The account path below
+            # exists for the intraday clock, where the decision price is the latest ENDED bar; it is
+            # not entered here, so a daily run is bit-identical to what it was.
+            daily_price = providers.price_at_date(symbol, as_of)
+            return daily_price
         account = self._decision_account(providers)
         if account is not None:
             # A symbol with no knowable price at this tick is NOT decidable: None, the same value a
@@ -1238,7 +1246,21 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             if instance is not None:
                 account = get_instance_resolver().get_account_instance(instance.account_id)
         except Exception as e:  # noqa: BLE001 -- not resolvable -> the replay fallback, said once
+            from ba2_common.core.knowability import intraday_decision_clock
+            if intraday_decision_clock():
+                # An intraday BACKTEST must never price from the replay fallback (a plain float the
+                # anchor guard would refuse -- and a silent reduced run if the engine swallowed it):
+                # no account behind the decision price is a wiring defect. End the run loudly.
+                raise RuntimeError(
+                    f"decision account for expert {self.id} is not resolvable on an intraday clock "
+                    f"({type(e).__name__}: {e}); refusing to fall back to a bundle price") from e
             logger.warning(f"decision account for expert {self.id} not resolvable ({type(e).__name__}: {e})")
+        if account is None:
+            from ba2_common.core.knowability import intraday_decision_clock
+            if intraday_decision_clock():
+                raise RuntimeError(
+                    f"expert {self.id} has no account behind its decision price on an intraday clock; "
+                    f"refusing to fall back to a bundle price")
         self._decision_account_cache = (providers, account)
         return account
 

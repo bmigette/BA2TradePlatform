@@ -108,7 +108,9 @@ def _run_basket(run_id, expert_cls=_BasketExpert):
                             "times": ["09:40"]}},
                 indicator_provider=None)
             engine._indicator_provider = None
-            engine.run()
+            from ba2_common.core.knowability import intraday_decisions
+            with intraday_decisions(True, scan_cutoff=ps.scan_cutoff_date):   # what the handler does
+                engine.run()
         finally:
             BacktestAccount.submit_order = real
             set_backtest_ohlcv_override(None)
@@ -156,8 +158,10 @@ def test_the_seam_turns_an_undecidable_symbol_into_none_like_a_live_quote_that_i
     bundle = object()
     e._decision_account_cache = (bundle, Acct())
     now = datetime(2024, 1, 2, 10, 0, tzinfo=timezone.utc)
-    assert e._decision_price(bundle, "TDY", now) is None
-    assert e._decision_price(bundle, "AAPL", now) == 12.5
+    from ba2_common.core.knowability import intraday_decisions
+    with intraday_decisions(True):
+        assert e._decision_price(bundle, "TDY", now) is None
+        assert e._decision_price(bundle, "AAPL", now) == 12.5
 
 
 # --------------------------------------------------------------------------- result-level refusal
@@ -195,3 +199,51 @@ def test_an_expert_that_analyses_fine_and_emits_nothing_is_not_a_failure():
 def test_too_few_passes_are_not_a_rate():
     eng = _engine_with(4, 4)
     eng.refuse_if_analysis_failing()
+
+
+# --------------------------------------------------------------------------- E2: StaleAnchorPrice ends the run
+def test_every_named_broad_handler_in_the_engine_reraises_the_run_ending_refusals():
+    """Structural: an ``except Exception as e`` in daily_engine.py either re-raises or goes through
+    ``_reraise_option_basis_refusal`` (split-basis refusals AND StaleAnchorPrice)."""
+    import ast, pathlib
+    import app.services.backtest.daily_engine as de
+    tree = ast.parse(pathlib.Path(de.__file__).read_text(encoding="utf-8"))
+    lacking = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ExceptHandler) and n.name and ast.unparse(n.type) == "Exception":
+            body = ast.unparse(ast.Module(body=n.body, type_ignores=[]))
+            if "_reraise_option_basis_refusal" not in body and "raise" not in body:
+                lacking.append(n.lineno)
+    assert lacking == [], f"broad handlers that would swallow a run-ending refusal: lines {lacking}"
+
+
+def test_the_shared_helper_reraises_stale_anchor_price_and_nothing_ordinary():
+    from ba2_common.core.knowability import StaleAnchorPrice
+    from app.services.backtest.daily_engine import _reraise_option_basis_refusal
+    with pytest.raises(StaleAnchorPrice):
+        _reraise_option_basis_refusal(StaleAnchorPrice("plain float anchor"))
+    _reraise_option_basis_refusal(ValueError("an ordinary failure is still absorbed"))
+
+
+class _StaleBasket(_BasketExpert):
+    def analyze_as_of(self, as_of, context):
+        from ba2_common.core.knowability import StaleAnchorPrice
+        raise StaleAnchorPrice("anchor 1.0 is not the decision price")
+
+
+def test_a_stale_anchor_in_a_basket_analysis_fails_the_run_loudly():
+    from ba2_common.core.knowability import StaleAnchorPrice
+    with pytest.raises(StaleAnchorPrice):
+        _run_basket(932, expert_cls=_StaleBasket)
+
+
+def test_an_unresolvable_decision_account_on_an_intraday_clock_raises_instead_of_falling_back():
+    from ba2_common.core.knowability import intraday_decisions
+    e = _BasketExpert.__new__(_BasketExpert)
+    e.id = 987654                                   # no such instance -> no account
+    with intraday_decisions(True):
+        with pytest.raises(RuntimeError, match="intraday clock"):
+            e._decision_account(object())
+    e._decision_account_cache = None
+    with intraday_decisions(False):                  # off the intraday clock: the replay fallback, as before
+        assert e._decision_account(object()) is None

@@ -107,10 +107,13 @@ def test_seam_is_the_account_live_and_backtest_and_the_bundle_only_without_an_ac
     bundle = B()
     assert e._decision_price(bundle, "X", None) == 111.0
     e._decision_account_cache = (bundle, Acct())
-    assert e._decision_price(bundle, "X", NOW) == 105.0                 # backtest: the account
+    with intraday_decisions(True):
+        assert e._decision_price(bundle, "X", NOW) == 105.0             # intraday backtest: the account
+    # the DAILY clock keeps the pre-existing bundle read, the account is never asked
+    assert e._decision_price(bundle, "X", NOW) == 99.0
     e._decision_account_cache = (bundle, None)
     assert e._decision_price(bundle, "X", NOW) == 99.0                  # no account: replay fallback
-    assert seen == [("quote", "X"), ("account", "X"), ("bundle", "X", NOW)]
+    assert seen == [("quote", "X"), ("account", "X"), ("bundle", "X", NOW), ("bundle", "X", NOW)]
 
 
 # ----------------------------------------------------------------------------- (b) DeterministicScorer

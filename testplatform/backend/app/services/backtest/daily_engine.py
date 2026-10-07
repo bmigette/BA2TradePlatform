@@ -79,8 +79,12 @@ from app.services.backtest.seam_wiring import make_indicator_provider, make_atr_
 # Clock + universe hooks
 # ---------------------------------------------------------------------------
 def _reraise_option_basis_refusal(e: BaseException) -> None:
-    """Re-raise the option path's split-basis refusals out of the engine's per-symbol /
-    per-expiry ``except Exception`` handlers (plan Part E).
+    """Re-raise the refusals that must END the run out of the engine's per-symbol / per-expiry /
+    per-bar ``except Exception`` handlers: the option path's split-basis refusals (plan Part E) AND
+    ``StaleAnchorPrice`` (the intraday anchor-price guard: a plain-float or look-ahead anchor reaching
+    an order level or a size). The second kind is not a bad symbol: it means the code path builds
+    levels from the wrong price, so swallowing it as "one WARNING and a dropped entry" would return a
+    quietly reduced-universe result.
 
     Those handlers turn a failure into a log line so one bad symbol cannot abort a bar. A
     basis refusal is not that: it means every strike, greek and intrinsic value the run
@@ -88,9 +92,11 @@ def _reraise_option_basis_refusal(e: BaseException) -> None:
     hermetic cache misses those handlers already re-raise. Only the option path can raise
     these, so an equity run never reaches this."""
     from ba2_common.core.split_basis import SplitBasisRefused
+    from ba2_common.core.knowability import StaleAnchorPrice
     from app.services.backtest.option_basis_guard import OptionSpotBasisMismatch
     from app.services.backtest.backtest_account import ComboSettlementRefused
-    if isinstance(e, (SplitBasisRefused, OptionSpotBasisMismatch, ComboSettlementRefused)):
+    if isinstance(e, (SplitBasisRefused, OptionSpotBasisMismatch, ComboSettlementRefused,
+                      StaleAnchorPrice)):
         raise e
 
 
@@ -1207,6 +1213,7 @@ class DailyBacktestEngine:
                 if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
                                   MacroAvailabilityUnknown)):
                     raise
+                _reraise_option_basis_refusal(e)
                 self._log(f"analyze_as_of failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 self._analysis_failed(expert_id, f"{symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
@@ -1346,6 +1353,7 @@ class DailyBacktestEngine:
                 try:
                     ok_equity, equity_reason = equity_check()
                 except Exception as e:  # noqa: BLE001 — a wiring gap must not silently over-block
+                    _reraise_option_basis_refusal(e)
                     self._log(f"equity-gate check errored for {symbol} @ {as_of:%Y-%m-%d} "
                               f"(treating as allowed): {e}")
                     ok_equity = True
@@ -1432,6 +1440,7 @@ class DailyBacktestEngine:
             if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
                                   MacroAvailabilityUnknown)):
                 raise
+            _reraise_option_basis_refusal(e)
             self._log(f"basket analyze_as_of failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
             self._analysis_failed(expert_id, f"basket @ {as_of:%Y-%m-%d}: {e}")
             return False
@@ -1462,6 +1471,7 @@ class DailyBacktestEngine:
                 raw = getattr(rec, "raw_outputs", None) or {}
                 symbol = raw.get("symbol")
             except Exception as e:  # noqa: BLE001 — a malformed list item must not crash the bar
+                _reraise_option_basis_refusal(e)
                 self._log(f"basket recommendation item malformed for expert {expert_id} "
                           f"@ {as_of:%Y-%m-%d}: {e}")
                 continue
@@ -1494,6 +1504,7 @@ class DailyBacktestEngine:
                 if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
                                   MacroAvailabilityUnknown)):
                     raise
+                _reraise_option_basis_refusal(e)
                 self._log(f"basket item staging failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
 
@@ -1571,6 +1582,7 @@ class DailyBacktestEngine:
                 if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
                                   MacroAvailabilityUnknown)):
                     raise
+                _reraise_option_basis_refusal(e)
                 self._log(f"open-pos analyze failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 self._analysis_failed(expert_id, f"open-pos {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
@@ -1766,6 +1778,7 @@ class DailyBacktestEngine:
             if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
                                   MacroAvailabilityUnknown)):
                 raise
+            _reraise_option_basis_refusal(e)
             self._log(f"bypass analyze_as_of failed @ {as_of:%Y-%m-%d}: {e}")
             self._analysis_failed(expert_id, f"bypass @ {as_of:%Y-%m-%d}: {e}")
             return
@@ -1785,6 +1798,7 @@ class DailyBacktestEngine:
             # as live; the run carries on and counts it.
             self._refused_adds += len(pm.last_refused_adds)
         except Exception as e:  # noqa: BLE001 — a rebalance failure must not kill the run
+            _reraise_option_basis_refusal(e)
             self._log(f"bypass rebalance failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
 
     # -- option expiry / exercise / assignment ------------------------------

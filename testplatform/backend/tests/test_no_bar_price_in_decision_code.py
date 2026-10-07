@@ -97,6 +97,10 @@ SITES = {
      "return providers.price_at_date(symbol, as_of)"):
         "the ONE expert seam _decision_price: fallback ONLY for a bundle without an account (historical replay tool); "
         "every backtest/live run resolves the account first",
+    ("packages/common/ba2_common/core/interfaces/MarketExpertInterface.py", "price_at_date",
+     "daily_price = providers.price_at_date(symbol, as_of)"):
+        "the same seam on a DAILY-clock backtest (and the replay tool): the pre-existing bundle read, kept "
+        "bit-identical; the daily clock has no decision-time look-ahead (CLAUDE.md: intraday clock only)",
     ("packages/common/ba2_common/core/ohlcv_topup_guard.py", "tail(1)", "series = pd.concat([c.tail(1), new]).sort_index()"):
         "cache top-up guard (data hygiene, not a decision)",
     ("packages/common/ba2_common/core/weinstein.py", "last-element", "price = closes[-1]"):
