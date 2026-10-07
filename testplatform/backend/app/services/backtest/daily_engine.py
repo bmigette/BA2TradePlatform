@@ -124,7 +124,8 @@ def resolve_universe(as_of: datetime, config: Dict[str, Any], price_source) -> L
         # a bar stamped exactly at ``as_of``. A thin name that did not trade in this one 5-minute
         # window is still analysed live; its order fills at its next bar's open, whenever that
         # opens (BacktestAccount.refresh_orders reads ``next_bar``).
-        return [s for s in universe if price_source.decision_price(s, as_of) is not None]
+        idx = price_source._dp_index                     # per-tick cut-offs + cursor: no bisect per symbol
+        return [s for s in universe if idx(s) >= 0]
     return [s for s in universe if price_source.bar_at(s, as_of) is not None]
 
 

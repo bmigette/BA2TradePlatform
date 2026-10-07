@@ -611,6 +611,7 @@ class AsOfPriceSource:
         self._interval = interval
         self._intraday = _is_intraday(interval)  # cached: interval is constant for a run
         self._clock: Optional[datetime] = None
+        self._kde: Optional[datetime] = None     # knowable_daily_end of the CLOCK (set_clock, intraday)
         # COLUMNAR bar store. The old store was a per-symbol dict-of-dicts ({key: {"open",...}}) at
         # ~400 bytes/bar — for a screened union × 3yr × 5min that was ~7-9 GB/worker, almost all of
         # it the ~9M tiny inner dicts. Here each symbol keeps a sorted Python key list (date for
@@ -657,6 +658,42 @@ class AsOfPriceSource:
         # int64-ns twin of the clock key: the bar store now holds int64 keys, and bar_at/close_at
         # compare against this on every lookup. Computed once per bar, like _clock_key.
         self._clock_key64 = _key64(as_of, self._interval)
+        if self._intraday:
+            # The decision-price cut-offs, once per TICK (not per symbol): a bar is finished when
+            # its stamp <= clock - interval; a latest-finished bar older than the last finished
+            # session's midnight means "no price knowable" (halted / stale).
+            self._dp_cut = self._clock_key64 - _interval_ns(self._interval)
+            a = _to_utc(as_of)
+            fin = _finished_session_end(a)
+            self._kde = min(a, fin)
+            self._dp_floor = (fin.date() - _EPOCH_DATE).days * _NS_PER_DAY
+
+    def _dp_index(self, symbol: str) -> int:
+        """Index of the bar the decision price at the CLOCK is read from, or -1. The monotonic
+        per-symbol cursor (last key <= clock) stepped back past bars that have not ended; O(1)."""
+        k = self._keys.get(symbol)
+        if not k:
+            return -1
+        # the monotonic cursor (last key <= clock), inlined: this is the per-symbol-per-tick path
+        cursor = self._cursor
+        c = cursor.get(symbol, -1)
+        ck = self._clock_key64
+        n = len(k)
+        while c + 1 < n and k[c + 1] <= ck:
+            c += 1
+        cursor[symbol] = c
+        cut = self._dp_cut
+        while c >= 0 and k[c] > cut:
+            c -= 1
+        if c < 0 or k[c] < self._dp_floor:
+            return -1
+        return c
+
+    def has_decision_price(self, symbol: str) -> bool:
+        """Whether a price is knowable for ``symbol`` at the CLOCK (the cheap universe test)."""
+        if not self._intraday:
+            return self.bar_at(symbol) is not None
+        return self._dp_index(symbol) >= 0
 
     def now(self) -> datetime:
         if self._clock is None:
@@ -707,6 +744,8 @@ class AsOfPriceSource:
         Daily clock: ``as_of`` unchanged (see the block comment above)."""
         if not self._intraday:
             return as_of
+        if as_of is self._clock and self._kde is not None:
+            return self._kde                                  # the clock itself: once per tick
         a = _to_utc(as_of)
         return min(a, _finished_session_end(a))
 
@@ -732,6 +771,9 @@ class AsOfPriceSource:
         k = self._keys.get(symbol)
         if k is None or not len(k):
             return None
+        if self._intraday and (as_of is self._clock or (self._clock is not None and as_of == self._clock)):
+            i = self._dp_index(symbol)                      # the hot path: the clock itself
+            return None if i < 0 else DecisionPrice(float(self._c[symbol][i]), int(k[i]), as_of)
         key = _key64(as_of, self._interval)
         if not self._intraday:
             i = bisect.bisect_right(k, key) - 1
@@ -1264,7 +1306,11 @@ def _to_utc(d: Any) -> datetime:
     raise TypeError(f"Cannot normalise {d!r} ({type(d)}) to a datetime")
 
 
-@lru_cache(maxsize=16384)
+#: per calendar DAY: (that day's close as naive NY wall time or None when it is not a session, the last
+#: session before it). The calendar is consulted once per day of a run, never per tick.
+_DAY_CALENDAR: Dict[date, tuple] = {}
+
+
 def _finished_session_end(as_of_utc: datetime) -> datetime:
     """End (23:59:59.999999, labelled UTC) of the last regular NYSE session that has FINISHED at
     or before the decision instant ``as_of_utc``.
@@ -1274,19 +1320,22 @@ def _finished_session_end(as_of_utc: datetime) -> datetime:
     day). On a session day at or after its close that day counts; otherwise the last session
     before it does (also pre-market, weekends and holidays). Memoised: every symbol of a bar asks
     for the same instant. Raises rather than guessing when the calendar cannot answer."""
-    from ba2_common.core.market_calendar import (
-        NY_TZ, is_regular_session, prior_regular_session, regular_session_close_utc)
-
     wall = as_of_utc.replace(tzinfo=None)
     day = wall.date()
-    if is_regular_session(day) and regular_session_close_utc(day) <= wall.replace(tzinfo=NY_TZ):
-        d = day
-    else:
-        d = prior_regular_session(day)
+    ent = _DAY_CALENDAR.get(day)
+    if ent is None:
+        from ba2_common.core.market_calendar import (
+            NY_TZ, is_regular_session, prior_regular_session, regular_session_close_utc)
+        close = (regular_session_close_utc(day).astimezone(NY_TZ).replace(tzinfo=None)
+                 if is_regular_session(day) else None)
+        ent = _DAY_CALENDAR[day] = (close, prior_regular_session(day))
+    close, prior = ent
+    d = day if (close is not None and wall >= close) else prior
     return datetime(d.year, d.month, d.day, 23, 59, 59, 999999, tzinfo=timezone.utc)
 
 
 _NS_PER_DAY = 86_400 * 1_000_000_000
+_EPOCH_DATE = date(1970, 1, 1)
 
 
 def _interval_ns(interval: str) -> int:
