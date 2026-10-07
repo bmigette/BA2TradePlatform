@@ -502,7 +502,9 @@ def test_gather_fetches_estimator_inputs_only_when_use_model_target_is_on():
             return {"statements": []}
 
     class FakeOHLCV:
-        def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval="1d"):
+        # **kw: DeterministicScorer now takes its backtest current price from
+        # ``providers.price_at_date`` (the real providers accept ``lookback_days``).
+        def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval="1d", **kw):
             return pd.DataFrame({"Close": [100.0]})
 
     class FakeMacro:

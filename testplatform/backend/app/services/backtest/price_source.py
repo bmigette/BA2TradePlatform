@@ -670,6 +670,67 @@ class AsOfPriceSource:
         """
         return self._clock
 
+    # ---- the ONE knowability rule for DAILY data (2026-10-07) -------------------------------
+    #
+    # A daily bar for session S is stamped at S's midnight but is only KNOWN once S has closed.
+    # Daily reads are sliced ``<= as_of``, so on an INTRADAY clock (the classic GA runs at
+    # execution_interval=5min: decision bar 09:30 America/New_York, fill at the next bar's open)
+    # every daily reader used to receive the DECISION SESSION'S OWN finished bar -- its close,
+    # high, low and volume -- at 09:30. Live at 09:30 has only the PRIOR session's bar.
+    #
+    # The rule lives here, once, and is the platform's existing ``prior_session_v1`` policy
+    # (``ba2_common.core.market_calendar.prior_regular_session``, the same rule the option /
+    # market-condition path already uses): an INTRADAY decision on exchange-local date D may read
+    # daily data through the last regular session strictly before D. Every consumer calls these
+    # three methods (directly or through ``MemoizedOHLCVProvider`` / the engine); none
+    # re-derives it.
+    #
+    # DAILY clock (execution_interval=1d): the convention is DIFFERENT and is NOT a look-ahead --
+    # the bar stamped D decides with D's close and fills at D+1's open, which is what live does
+    # when it decides before D+1's open. The methods are the identity there.
+    def knowable_daily_end(self, as_of: Any) -> Any:
+        """The latest instant a DAILY bar may be stamped at for a read made at decision ``as_of``.
+
+        Intraday clock: ``min(as_of, end of the last session finished before as_of)``.
+        Daily clock: ``as_of`` unchanged (see the block comment above)."""
+        if not self._intraday:
+            return as_of
+        a = _to_utc(as_of)
+        return min(a, _prior_session_end(a))
+
+    def daily_session_date(self, as_of: Any) -> date:
+        """The newest session whose DAILY data is knowable at decision ``as_of`` (a date).
+
+        Used for per-day stores keyed by session date (the screener metric store's scan day,
+        the market-regime calendar). Daily clock: ``as_of``'s own date. Intraday clock: the
+        last regular session before ``as_of``'s exchange-local date."""
+        if not self._intraday:
+            return _to_utc(as_of).date()
+        return _prior_session_end(_to_utc(as_of)).date()
+
+    def decision_price(self, symbol: str, as_of: Any) -> Optional[float]:
+        """The price KNOWABLE at decision instant ``as_of``, from the run's own bar series.
+
+        INTRADAY clock: the OPEN of the bar stamped ``as_of`` (the price at the start of the
+        decision bar -- what live's quote returns when the 09:30 job fires); when the symbol has
+        no bar at that exact instant, the CLOSE of its latest earlier bar (forward fill, known by
+        then). It is NEVER the decision bar's close (printed up to one bar later, while the
+        order fills at the NEXT bar's open) and NEVER a daily bar's close. ``None`` when the
+        symbol has no bar at or before ``as_of``: the caller must refuse to decide.
+
+        Daily clock: the close of the bar stamped ``as_of`` (forward-filled), the daily-clock
+        convention (decide on D's close, fill at D+1's open)."""
+        k = self._keys.get(symbol)
+        if k is None or not len(k):
+            return None
+        key = _key64(as_of, self._interval)
+        i = bisect.bisect_right(k, key) - 1
+        if i < 0:
+            return None
+        if self._intraday and k[i] == key:
+            return float(self._o[symbol][i])
+        return float(self._c[symbol][i])
+
     # ---- loading -----------------------------------------------------------
     def preload(
         self,
@@ -1171,6 +1232,17 @@ def _to_utc(d: Any) -> datetime:
     raise TypeError(f"Cannot normalise {d!r} ({type(d)}) to a datetime")
 
 
+@lru_cache(maxsize=16384)
+def _prior_session_end(as_of_utc: datetime) -> datetime:
+    """End (23:59:59.999999 UTC) of the last regular NYSE session strictly before ``as_of_utc``'s
+    exchange-local date (``prior_session_v1``). Memoised: every symbol of a bar asks for the same
+    instant. Raises rather than guessing when the calendar cannot answer."""
+    from ba2_common.core.market_calendar import prior_regular_session
+
+    d = prior_regular_session(as_of_utc)
+    return datetime(d.year, d.month, d.day, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+
 class AsOfClampedOHLCVProvider:
     """Backtest-only OHLCV wrapper that caps every ``get_ohlcv_data(end_date=...)`` at the
     price source's current as_of clock.
@@ -1294,6 +1366,28 @@ class MemoizedOHLCVProvider:
         # BacktestCacheMiss (the user asked for a hard error, NOT a silent skip) so preload can
         # report exactly what to cache. cached_only=False keeps the live passthrough (fetch).
         self._cached_only = cached_only
+        # The run's clock owner (``bind_price_source``): where the daily-knowability rule lives.
+        self._ps: Optional["AsOfPriceSource"] = None
+        # Test/regression instrument: when a list, every DAILY read appends one record (see
+        # ``get_ohlcv_data``). None in production (one attribute test per read).
+        self.audit: Optional[List[Dict[str, Any]]] = None
+        # Daily reads made on an intraday run BEFORE the first clock tick: knowability cannot be
+        # determined, so they are counted and warned about once, never silently served.
+        self.unclocked_daily_reads = 0
+
+    def bind_price_source(self, price_source: "AsOfPriceSource") -> None:
+        """Attach the run's price source so DAILY reads obey its knowability rule
+        (``AsOfPriceSource.knowable_daily_end``). The handler calls this right after building
+        both; a provider that is never bound (the regime benchmark reader, tests, standalone
+        tools) behaves exactly as before."""
+        self._ps = price_source
+
+    def knowable_daily_end(self, as_of: Any) -> Any:
+        """The hook a CACHING reader (DeterministicScorer) uses to slice its own copy of the daily
+        series: the latest stamp a daily bar may carry at decision ``as_of``. Identity when no
+        price source is bound or the run is on a daily clock."""
+        ps = self._ps
+        return as_of if ps is None else ps.knowable_daily_end(as_of)
 
     def cached_path(self, symbol: str, interval: str) -> Optional[str]:
         """The native on-disk parquet for (symbol, interval), or None when there is none to sign.
@@ -1437,7 +1531,40 @@ class MemoizedOHLCVProvider:
 
     def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval="1d", **kwargs):
         df, dates = self._full(symbol, interval)
-        return self._slice(df, dates, start_date, end_date)
+        requested_end = end_date
+        bulk = False
+        ps = self._ps
+        # DAILY knowability (see ``AsOfPriceSource.knowable_daily_end``): on an intraday run a
+        # daily read made at the decision clock may not return the decision session's own bar.
+        # Only an end AT OR BEFORE the clock is a decision-instant read and is clamped. An end
+        # beyond the clock (a wall-clock ``now``) or no end is a BULK read: the caller takes the
+        # whole series and slices it itself per bar (DeterministicScorer caches it for the run),
+        # so it is flagged ``bulk`` in the audit and that caller MUST slice through
+        # ``knowable_daily_end``. Clamping a bulk read would freeze the caller's cache at the
+        # first bar.
+        if ps is not None and ps.is_intraday and interval == "1d":
+            clk = ps.current()
+            if clk is None:
+                self.unclocked_daily_reads += 1
+                if self.unclocked_daily_reads == 1:
+                    logger.warning(
+                        "daily OHLCV read for %s on an intraday run before the first clock tick: "
+                        "knowability cannot be determined, served UNCLAMPED (counted in "
+                        "MemoizedOHLCVProvider.unclocked_daily_reads)", symbol)
+            elif end_date is None or _to_utc(end_date) > _to_utc(clk):
+                bulk = True
+            else:
+                cap = ps.knowable_daily_end(clk)
+                if _to_utc(end_date) > cap:
+                    end_date = cap
+        out = self._slice(df, dates, start_date, end_date)
+        if self.audit is not None and interval == "1d":
+            self.audit.append({
+                "symbol": symbol, "clock": None if ps is None else ps.current(),
+                "requested_end": requested_end, "bulk": bulk,
+                "last_bar": (None if out is None or not len(out) else out["Date"].iloc[-1]),
+                "n": 0 if out is None else len(out)})
+        return out
 
     def __getattr__(self, name):
         return getattr(self._inner, name)

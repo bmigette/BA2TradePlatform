@@ -28,6 +28,7 @@ from ba2_common.core.types import (
     AnalysisUseCase,
 )
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
+from ba2_common.core.knowability import intraday_decision_clock, published_known
 from ba2_common.logger import get_expert_logger
 from ba2_common.config import get_app_setting
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPCongressTradingMixin
@@ -189,6 +190,11 @@ class FMPSenateTraderCopy(AnalysisStatusRenderMixin, FMPCongressTradingMixin, Ma
                 return False
             if d > ceiling:
                 return False
+        # INTRADAY clock: FMP gives the disclosure only a DATE, published at an unknown time of
+        # that day, so it is public from the NEXT session (conservative; the age filter below
+        # then also sees it one day older, as it would be live).
+        if intraday_decision_clock() and not published_known(trade.get('disclosureDate'), ceiling):
+            return False
         return True
 
     def _process(self, data_bundle: Dict[str, Any], settings: Dict[str, Any],

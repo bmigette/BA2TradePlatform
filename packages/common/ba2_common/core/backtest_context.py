@@ -100,6 +100,24 @@ class LiveProviderBundle:
         return float(df["Close"].iloc[-1])
 
 
+def knowable_daily_end(providers: Any, as_of: Optional[datetime]) -> Optional[datetime]:
+    """The latest stamp a DAILY bar may carry for a decision made at ``as_of``.
+
+    The rule itself lives with the clock owner (the backtest's price source:
+    ``AsOfPriceSource.knowable_daily_end``), reached through the OHLCV provider the bundle
+    hands out. A reader that caches the whole daily series and slices it per decision
+    (DeterministicScorer) must slice to THIS, not to ``as_of``: on an intraday clock a daily bar
+    stamped with the decision's own date is not finished yet.
+
+    ``as_of`` None (live) and every provider without the hook (the live providers, the daily
+    clock) return ``as_of`` unchanged -- live already holds only finished bars at decision time.
+    """
+    if as_of is None:
+        return None
+    hook = getattr(providers.ohlcv(), "knowable_daily_end", None)
+    return as_of if hook is None else hook(as_of)
+
+
 @dataclass
 class BacktestContext:
     """Carries everything analyze_as_of needs, set from OUTSIDE the expert."""

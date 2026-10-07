@@ -957,6 +957,10 @@ def run_daily_backtest(
         )
 
         ps = AsOfPriceSource(ohlcv_provider=ohlcv, interval=interval)
+        # The ONE knowability rule for daily data lives on the price source (the clock owner);
+        # binding makes every DAILY read through the memoized provider obey it on an intraday
+        # clock (no-op on a daily clock). See AsOfPriceSource.knowable_daily_end.
+        ohlcv.bind_price_source(ps)
         ps.preload(
             config["enabled_instruments"],
             config["start_date"],
@@ -1030,7 +1034,12 @@ def run_daily_backtest(
                     raw_ohlcv, config["start_date"], config["end_date"]),
                 market_condition_record=market_condition_record,
             )
-            engine.run()
+            # EVENT-data half of the knowability rule: on an intraday clock the readers admit an
+            # item only from the instant it was public (ba2_common.core.knowability); the flag is
+            # thread-local and lives exactly as long as this run.
+            from ba2_common.core.knowability import intraday_decisions
+            with intraday_decisions(ps.is_intraday):
+                engine.run()
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).
             results = build_results(account, config)

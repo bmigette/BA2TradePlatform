@@ -415,7 +415,16 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             providers, as_of, str(getattr(self, "_gather_index_symbol", data.INDEX_SYMBOL)))
 
         current_price = None
-        if df is not None and not df.empty:
+        if as_of is not None:
+            # Backtest: the price KNOWABLE at the decision instant, from the host's price source
+            # (the decision bar's open on an intraday clock, the as_of close on a daily one) --
+            # exactly what every other expert reads here. The last row of ``df`` is a FINISHED
+            # daily bar: on an intraday clock it is the PRIOR session's close, not the price at
+            # the decision. No fallback to it: a missing price refuses the decision (_process).
+            px = providers.price_at_date(symbol, as_of)
+            if px is not None:
+                current_price = float(px)
+        elif df is not None and not df.empty:
             current_price = float(df["Close"].iloc[-1])
 
         bundle = {

@@ -121,9 +121,31 @@ def resolve_universe(as_of: datetime, config: Dict[str, Any], price_source) -> L
     return [s for s in universe if price_source.bar_at(s, as_of) is not None]
 
 
+class _BacktestProviderBundle(LiveProviderBundle):
+    """``LiveProviderBundle`` whose ``price_at_date`` is the price KNOWABLE at the decision.
+
+    The inherited read is "the last DAILY close <= as_of". On an intraday clock that is wrong in
+    the one way that matters: with daily bars stamped at midnight it is the decision session's
+    own FINISHED close at 09:30 (and, once daily reads honour knowability, merely yesterday's
+    close, which is not what live's quote returns at 09:30 either). On an intraday clock this
+    answers from the run's own intraday series via ``AsOfPriceSource.decision_price`` -- the
+    open of the decision bar. On a daily clock it is the inherited read, unchanged.
+    """
+
+    def __init__(self, get_provider: Callable[..., Any], price_source: Any):
+        super().__init__(get_provider)
+        self._price_source = price_source
+
+    def price_at_date(self, symbol: str, as_of: Optional[datetime]) -> Optional[float]:
+        if as_of is not None and self._price_source.is_intraday:
+            return self._price_source.decision_price(symbol, as_of)
+        return super().price_at_date(symbol, as_of)
+
+
 def _screened_symbols_for_bar(
     screener_runtime: Optional[Dict[str, Any]], as_of_dt: datetime,
     cache: Optional[Dict[str, List[str]]] = None,
+    session_date: Optional[date] = None,
 ) -> Optional[List[str]]:
     """The dynamic per-day universe of symbols ALLOWED TO ENTER on this bar.
 
@@ -159,7 +181,12 @@ def _screened_symbols_for_bar(
     store = screener_runtime["store"]
     df = ms.load_store(store)
     days = ms.scan_dates(df, store_key=store)
-    i = bisect.bisect_right(days, as_of_dt.strftime("%Y-%m-%d")) - 1
+    # ``session_date`` is the newest session whose DAILY data is knowable at this decision
+    # (``AsOfPriceSource.daily_session_date``): the bar's own date on a daily clock, the PRIOR
+    # session on an intraday one -- a scan row dated D is built from D's finished bar, which a
+    # 09:30 decision on D cannot know. Omitted (unit tests / legacy callers) = the bar's date.
+    cutoff = session_date.strftime("%Y-%m-%d") if session_date is not None else as_of_dt.strftime("%Y-%m-%d")
+    i = bisect.bisect_right(days, cutoff) - 1
     if i < 0:
         return []
     day = days[i]
@@ -538,7 +565,9 @@ class DailyBacktestEngine:
         indicator_provider = self._indicator_provider
         if indicator_provider is None:
             store = (self._screener_runtime or {}).get("store") if self._screener_runtime else None
-            indicator_provider = make_atr_cache_indicator_provider(store) or make_indicator_provider()
+            indicator_provider = (
+                make_atr_cache_indicator_provider(store, session_date_fn=self.price.daily_session_date)
+                or make_indicator_provider())
         self._indicator_provider = indicator_provider
 
         self._check_regime_calendar()
@@ -644,7 +673,10 @@ class DailyBacktestEngine:
             #     regime_overlay seam instead of classifying per symbol. Cheap: a bisect into the
             #     precomputed calendar. None (no calendar) publishes None = neutral, which
             #     _check_regime_calendar has already proven no expert depends on.
-            set_stressed(self._regime_calendar.at(as_of_dt) if self._regime_calendar else None)
+            #     The calendar's flag for day S is classified from S's CLOSE, so the lookup day is
+            #     the newest session whose daily data is knowable at this decision.
+            set_stressed(self._regime_calendar.at(self.price.daily_session_date(as_of_dt))
+                         if self._regime_calendar else None)
 
             # 2. universe for the bar.
             universe = resolve_universe(as_of_dt, self.config, self.price)
@@ -661,7 +693,9 @@ class DailyBacktestEngine:
             #     (byte-identical to a non-screener run — the hot path is untouched).
             entry_universe = universe
             if self._screener_runtime:
-                allowed = _screened_symbols_for_bar(self._screener_runtime, as_of_dt, self._screened_cache)
+                allowed = _screened_symbols_for_bar(
+                    self._screener_runtime, as_of_dt, self._screened_cache,
+                    session_date=self.price.daily_session_date(as_of_dt))
                 if allowed is not None:
                     allowed_set = set(allowed)
                     entry_universe = [s for s in universe if s in allowed_set]
@@ -1925,8 +1959,9 @@ class DailyBacktestEngine:
         if bundle is None:
             from ba2_common.core.TradeConditions import _get_provider
 
-            bundle = LiveProviderBundle(
-                lambda category, name, **kw: _get_provider(category, name, **kw)
+            bundle = _BacktestProviderBundle(
+                lambda category, name, **kw: _get_provider(category, name, **kw),
+                self.price,
             )
             self._bundle_cache = bundle
         return bundle
