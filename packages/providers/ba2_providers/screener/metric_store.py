@@ -1682,6 +1682,79 @@ def visible_scan_date(scan_dates_sorted: "List[str]", decision_instant: Any, *, 
     cutoff = scan_cutoff_date(decision_instant, intraday=intraday).isoformat()
     i = bisect.bisect_right(scan_dates_sorted, cutoff) - 1
     return None if i < 0 else scan_dates_sorted[i]
+#: READ-side staleness: an as-of day further than this many calendar days AFTER the store's newest
+#: scan is refused (two weekly cadences). The limit never drops below this for a finer store (a
+#: daily store still has weekends/holidays) and grows to 2x the store's own cadence for a coarser one.
+SCAN_MAX_AGE_DAYS = 14
+
+
+class MetricStoreStaleError(MetricStoreQualityError):
+    """A reader asked the store for an as-of day well past its newest scan (the store ends before
+    the window): refused loudly instead of silently reusing the last scan."""
+
+
+def check_scan_freshness(as_of_day: str, newest_scan: Optional[str],
+                         dates: "Optional[Any]" = None) -> None:
+    """THE one read-side staleness rule, shared by every reader that resolves 'latest scan <=
+    as_of' (see ``resolve_scan_date`` and the testplatform daily engine).
+
+    Raises ``MetricStoreStaleError`` when ``as_of_day`` is more than ``SCAN_MAX_AGE_DAYS`` (or 2x the
+    store's own median scan gap, if larger) calendar days after ``newest_scan``. Silent for an as-of
+    day on/before the newest scan, for an empty store (``newest_scan`` None: the caller's own
+    'no scan' path decides) and within the grace window. ``dates``: sorted scan dates, or a
+    zero-arg callable returning them, used only to derive the cadence on the (rare) slow path."""
+    if newest_scan is None or as_of_day <= newest_scan:
+        return
+    age = (pd.Timestamp(as_of_day) - pd.Timestamp(newest_scan)).days
+    if age <= SCAN_MAX_AGE_DAYS:
+        return
+    limit = SCAN_MAX_AGE_DAYS
+    ds = dates() if callable(dates) else dates
+    if ds is not None and len(ds) >= 2:
+        ts = pd.to_datetime(pd.Series([str(d) for d in ds]))
+        gap = float(ts.diff().dt.days.dropna().median())
+        limit = max(SCAN_MAX_AGE_DAYS, int(2 * gap))
+        if age <= limit:
+            return
+    raise MetricStoreStaleError(
+        f"metric store is stale for as-of day {as_of_day}: its newest scan is {newest_scan} "
+        f"({age} days earlier, limit {limit}); reading it would silently reuse that scan. "
+        f"Rebuild the store with ba2-test build-screener-metrics --end <a date on/after "
+        f"{as_of_day}> (see docs: the OHLCV cache must reach that date first), or shorten the window.")
+
+
+def _present_scan_dates(store_df: "pd.DataFrame") -> "List[str]":
+    """Ascending scan dates actually PRESENT in ``store_df`` (a row-filtered frame keeps the full
+    category set but not the rows, so presence is read from the codes). Cheap on the real store's
+    ordered categorical (an int-code unique), the plain unique otherwise."""
+    s = store_df["date"]
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        codes = np.unique(s.cat.codes.to_numpy())
+        cats = s.cat.categories
+        return sorted(str(cats[int(c)]) for c in codes if c >= 0)
+    return sorted({str(d) for d in s.unique()})
+
+
+def resolve_scan_date(store_df: "pd.DataFrame", as_of_day: str) -> Optional[str]:
+    """The scan a reader asked for at ``as_of_day``, REFUSING with ``MetricStoreStaleError`` when the
+    day is past the store's coverage. The single entry point of every store reader
+    (screen_universe_as_of, metrics_as_of, screened_symbol_union, and through them FactorRanker's
+    universe/momentum reads and the backtest ATR provider).
+
+    Two steps, no duplicated logic: (1) the VISIBLE scan is ``visible_scan_date`` (the one selector)
+    with the daily-clock reading -- ``as_of_day`` is already a cutoff DATE computed by the caller
+    (``knowability.scan_cutoff_date`` for the intraday clock), so the newest scan dated <= it, exactly
+    what ``_latest_scan_date_le`` returns; (2) ``check_scan_freshness`` of that day against the
+    store's NEWEST scan. None when no scan is on/before the day (before the first scan)."""
+    from datetime import date as _date
+    dates = _present_scan_dates(store_df)
+    d = _date.fromisoformat(str(as_of_day)[:10])
+    day = visible_scan_date(dates, d, intraday=False)
+    if day is None:
+        return None            # before the first scan: unchanged behaviour
+    if str(as_of_day) > day:   # only an as-of strictly past its scan can be stale
+        check_scan_freshness(str(as_of_day), dates[-1], dates)
+    return day
 
 
 def _latest_scan_date_le(store_df: "pd.DataFrame", day: str) -> Optional[str]:
@@ -1794,7 +1867,7 @@ def screen_universe_as_of(store_df: "pd.DataFrame", as_of_day: str,
     """Same as ``screen_universe_for_day`` but resolves to the LATEST scan date <= as_of_day,
     so a bar between scan dates gets the held universe (the cadence is weekly by default). Empty
     if no scan date is on/before as_of_day. ``excluded_symbols``: see ``screen_universe_for_day``."""
-    day = _latest_scan_date_le(store_df, as_of_day)
+    day = resolve_scan_date(store_df, as_of_day)
     if day is None:
         return []
     return screen_universe_for_day(store_df, day, settings, excluded_symbols)
@@ -1809,7 +1882,7 @@ def metrics_as_of(store_df: "pd.DataFrame", as_of_day: str,
     across symbols, so the latest scan <= the day is one shared date). Lets a consumer read a
     precomputed factor (e.g. ``momentum_12_1``) or the point-in-time ``close`` point-in-time
     instead of re-fetching/re-deriving it from OHLCV. Empty if no scan date is on/before the day."""
-    day = _latest_scan_date_le(store_df, as_of_day)
+    day = resolve_scan_date(store_df, as_of_day)
     if day is None:
         return {}
     d = store_df[store_df["date"] == day]
@@ -1853,7 +1926,7 @@ def screened_symbol_union(store_df: "pd.DataFrame", start_day: str, end_day: str
     # frame (no scan date lies strictly between the last one <= end_day and end_day), but an
     # ordered categorical refuses `<=` against a day that is not one of its categories, and
     # end_day is an arbitrary backtest end.
-    hi = _latest_scan_date_le(store_df, end_day)
+    hi = resolve_scan_date(store_df, end_day)
     if hi is None:
         return []
     d = _drop_excluded(store_df[(store_df["date"] >= lo) & (store_df["date"] <= hi)], excluded_symbols)

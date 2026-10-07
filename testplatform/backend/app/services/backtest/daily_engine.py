@@ -255,6 +255,8 @@ def _screened_symbols_for_bar(
     day = ms.visible_scan_date(days, as_of_dt, intraday=intraday)
     if day is None:
         return []
+    # SAME read-side staleness rule as every other store reader (one helper, no divergence).
+    ms.check_scan_freshness(as_of_dt.strftime("%Y-%m-%d"), days[-1], days)
     if cache is not None and day in cache:
         return cache[day]
     syms = ms.screen_universe_for_day(df, day, screener_runtime["settings"],

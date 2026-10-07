@@ -778,6 +778,8 @@ class MetricStoreATRProvider:
         try:
             df = ms.load_store(self._store_dir)
             rows = ms.metrics_as_of(df, day, [col])
+        except ms.MetricStoreStaleError:
+            raise  # a stale store must fail the run loudly, not size without ATR
         except Exception:  # noqa: BLE001 — a STORE issue -> safe empty (caller's no-ATR fallback)
             return empty
         row = rows.get(symbol.upper()) or rows.get(symbol)

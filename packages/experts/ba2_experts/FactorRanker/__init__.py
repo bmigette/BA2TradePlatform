@@ -20,6 +20,7 @@ from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.models import AnalysisOutput, MarketAnalysis
 from ba2_common.core.knowability import scan_cutoff_date
 from ba2_providers.StockScreener import StockScreener
+from ba2_providers.screener.metric_store import MetricStoreStaleError
 from ba2_providers.fmp_common import FMPHermeticViolation
 from ba2_common.core.types import MarketAnalysisStatus, OrderRecommendation, Recommendation
 from ba2_common.logger import get_expert_logger
@@ -486,6 +487,8 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
                     f"(store={store}, as_of={day})"
                 )
                 return syms
+            except MetricStoreStaleError:
+                raise  # a window past the store's end must fail loudly, never fall back silently
             except Exception as e:
                 self.logger.warning(
                     f"FactorRanker: metric_store universe resolution failed ({e}); "
@@ -690,6 +693,8 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             df = ms.load_store(store)
             rows = ms.metrics_as_of(df, scan_cutoff_date(as_of).strftime("%Y-%m-%d"),
                                   ["momentum_12_1", "close"])
+        except MetricStoreStaleError:
+            raise  # stale store: fail loudly (the OHLCV fallback would hide it)
         except Exception:  # noqa: BLE001 — any store issue -> safe OHLCV fallback
             return None, None
         if not rows or not all(s in rows for s in universe):

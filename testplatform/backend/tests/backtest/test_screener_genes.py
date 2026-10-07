@@ -36,7 +36,7 @@ def test_trial_config_carries_screener_runtime(tmp_path):
 
     store = str(tmp_path / "s")
     ms.write_partitions(store, pd.DataFrame({
-        "symbol": ["AAA"], "date": ["2023-01-31"], "close": [10.0],
+        "symbol": ["AAA"], "date": ["2023-02-20"], "close": [10.0],
         "market_cap": [3e9], "relative_volume": [1.6], "price_drop_pct": [20.0],
         "sector": ["T"], "volume": [2e6], "price": [10.0]}))
     ms.clear_store_memo()  # ensure load_store reads fresh from disk
@@ -100,7 +100,7 @@ def test_trial_config_gate_only_keeps_static_universe(tmp_path):
     # AAA's store price (10) NEVER passes price_max 5 — under full screener mode the candidate
     # bound would drop it from enabled_instruments entirely.
     ms.write_partitions(store, pd.DataFrame({
-        "symbol": ["AAA"], "date": ["2023-01-31"], "close": [10.0],
+        "symbol": ["AAA"], "date": ["2023-02-20"], "close": [10.0],
         "market_cap": [3e9], "relative_volume": [1.6], "price_drop_pct": [20.0],
         "sector": ["T"], "volume": [2e6], "price": [10.0]}))
     ms.clear_store_memo()
@@ -160,7 +160,7 @@ def test_excluded_instruments_thread_into_screener_runtime_and_candidate_bound(t
 
     store = str(tmp_path / "s2")
     ms.write_partitions(store, pd.DataFrame({
-        "symbol": ["AAA", "BBB"], "date": ["2023-01-31", "2023-01-31"], "close": [10.0, 20.0],
+        "symbol": ["AAA", "BBB"], "date": ["2023-02-20", "2023-02-20"], "close": [10.0, 20.0],
         "market_cap": [3e9, 4e9], "relative_volume": [1.6, 1.6], "price_drop_pct": [20.0, 20.0],
         "sector": ["T", "T"], "volume": [2e6, 2e6], "price": [10.0, 20.0]}))
     ms.clear_store_memo()
@@ -203,7 +203,7 @@ def test_excluded_instruments_absent_leaves_screener_runtime_unchanged(tmp_path)
 
     store = str(tmp_path / "s3")
     ms.write_partitions(store, pd.DataFrame({
-        "symbol": ["AAA"], "date": ["2023-01-31"], "close": [10.0],
+        "symbol": ["AAA"], "date": ["2023-02-20"], "close": [10.0],
         "market_cap": [3e9], "relative_volume": [1.6], "price_drop_pct": [20.0],
         "sector": ["T"], "volume": [2e6], "price": [10.0]}))
     ms.clear_store_memo()
@@ -239,7 +239,7 @@ def test_excluded_instruments_pushed_onto_a_bypass_experts_own_settings(tmp_path
 
     store = str(tmp_path / "s4")
     ms.write_partitions(store, pd.DataFrame({
-        "symbol": ["AAA", "BBB"], "date": ["2023-01-31", "2023-01-31"], "close": [10.0, 20.0],
+        "symbol": ["AAA", "BBB"], "date": ["2023-02-20", "2023-02-20"], "close": [10.0, 20.0],
         "market_cap": [3e9, 4e9], "relative_volume": [1.6, 1.6], "price_drop_pct": [20.0, 20.0],
         "sector": ["T", "T"], "volume": [2e6, 2e6], "price": [10.0, 20.0]}))
     ms.clear_store_memo()
