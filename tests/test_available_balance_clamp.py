@@ -185,7 +185,7 @@ def test_actual_balance_is_none_after_bounded_retries_when_account_info_raises(n
 
         def get_account_info(self):
             type(self).calls += 1
-            raise RuntimeError("broker hiccup")
+            raise ConnectionError("broker hiccup")
 
     account = _BrokenInfoAccount(1, balance=88.0, account_info=None)
     with _ba2_logs() as logs:
@@ -194,7 +194,7 @@ def test_actual_balance_is_none_after_bounded_retries_when_account_info_raises(n
     assert len(logs.errors) == 1                       # ONE error per sizing call, not one per attempt
     assert "account" in logs.errors[0].lower() and "broker hiccup" in logs.errors[0]
     assert "SKIPPED" in logs.errors[0] and "broker" in logs.errors[0]
-    assert no_bp_sleep == [1.0, 1.0]                   # short, bounded backoff between the 3 tries
+    assert no_bp_sleep == list(MarketExpertInterface._ACTUAL_BP_BACKOFFS_S)   # short, bounded backoff between the 3 tries
 
 
 def test_actual_balance_prefers_the_snapshot_seam_over_the_raw_info_probe():
@@ -220,7 +220,7 @@ def test_actual_balance_falls_back_to_the_info_probe_when_the_snapshot_has_none(
 def test_actual_balance_falls_back_when_the_snapshot_call_raises(no_bp_sleep):
     class _SnapAccount(_FakeAccount):
         def get_account_snapshot(self):
-            raise RuntimeError("broker down")
+            raise ConnectionError("broker down")
 
     account = _SnapAccount(1, balance=999.0, account_info={"buying_power": 4_000.0})
     assert MarketExpertInterface._get_actual_available_balance(account) == 4_000.0
@@ -240,11 +240,11 @@ class _FlakySnapshotAccount(_FakeAccount):
     def get_account_snapshot(self):
         self.snapshot_calls += 1
         if self.snapshot_calls <= self.failures:
-            raise RuntimeError("transient broker error")
+            raise ConnectionError("transient broker error")
         return SimpleNamespace(buying_power=10_000.0)
 
     def get_account_info(self):
-        raise RuntimeError("info down too")
+        raise ConnectionError("info down too")
 
 
 def test_a_snapshot_that_fails_twice_then_succeeds_clamps_without_an_error(no_bp_sleep):
@@ -253,7 +253,7 @@ def test_a_snapshot_that_fails_twice_then_succeeds_clamps_without_an_error(no_bp
         assert MarketExpertInterface._get_actual_available_balance(account) == 10_000.0
     assert account.snapshot_calls == 3
     assert logs.errors == []
-    assert no_bp_sleep == [1.0, 1.0]
+    assert no_bp_sleep == list(MarketExpertInterface._ACTUAL_BP_BACKOFFS_S)
 
 
 def test_a_snapshot_that_never_answers_logs_one_error_and_skips_the_clamp(no_bp_sleep):
@@ -288,7 +288,9 @@ def test_sizing_proceeds_unclamped_when_buying_power_never_reads(no_bp_sleep):
     finally:
         set_instance_resolver(prev)
     assert available == 100_000.0
-    assert len([m for m in logs.errors if "SKIPPED" in m]) == 1
+    skipped = [m for m in logs.errors if "SKIPPED" in m]
+    assert len(skipped) == 1
+    assert f"Account {acct_def.id} (expert {inst.id})" in skipped[0] and "3 attempts" in skipped[0]
 
 
 def test_a_backtest_style_account_never_sleeps_or_retries(no_bp_sleep):

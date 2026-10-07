@@ -104,3 +104,30 @@ def test_only_the_backtest_account_overrides_the_seam():
     from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
     assert BacktestAccount._plain_balance is not ReadOnlyAccountInterface._plain_balance
     assert "deployed_equity" in inspect.getsource(BacktestAccount._plain_balance)
+
+
+def test_the_backtest_buying_power_read_takes_the_first_attempt_and_never_sleeps(monkeypatch):
+    """The live buying-power retry (``_ACTUAL_BP_BACKOFFS_S``) must be unreachable in a backtest: the
+    backtest account always carries a figure, so the read answers on attempt 1, never sleeps, never logs
+    an ERROR, and takes the same branch (snapshot figure) as a healthy live read."""
+    from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface as M
+
+    def _boom(seconds):
+        raise AssertionError(f"a backtest slept {seconds}s in the buying-power read")
+
+    monkeypatch.setattr(M, "_ACTUAL_BP_SLEEP", staticmethod(_boom))
+    acct, ctx, _ps = _acct()
+    try:
+        calls = {"snapshot": 0}
+        real = acct.get_account_snapshot
+
+        def counting():
+            calls["snapshot"] += 1
+            return real()
+
+        monkeypatch.setattr(acct, "get_account_snapshot", counting)
+        assert M._get_actual_available_balance(acct, expert_id=3) == pytest.approx(100_000.0)
+        assert calls["snapshot"] == 1
+        assert M._read_actual_buying_power(acct)[0] == "figure"
+    finally:
+        ctx.__exit__(None, None, None)

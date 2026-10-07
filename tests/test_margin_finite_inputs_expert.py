@@ -95,6 +95,15 @@ def warnings_logged(monkeypatch):
     return seen
 
 
+@pytest.fixture
+def errors_logged(monkeypatch):
+    """MarketExpertInterface's own ``logger.error`` lines (same idiom as ``warnings_logged``)."""
+    module = sys.modules["ba2_common.core.interfaces.MarketExpertInterface"]
+    seen = []
+    monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: seen.append(str(msg)))
+    return seen
+
+
 # ----- the reader, in isolation ---------------------------------------------
 
 def test_a_nan_buying_power_falls_through_to_the_next_field(warnings_logged):
@@ -106,7 +115,7 @@ def test_a_nan_buying_power_falls_through_to_the_next_field(warnings_logged):
     assert "non-finite buying_power" in warnings_logged[0] and "Account 4" in warnings_logged[0]
 
 
-def test_a_nan_buying_power_alone_gives_no_clamp_not_equity(warnings_logged):
+def test_a_nan_buying_power_alone_gives_no_clamp_not_equity(warnings_logged, errors_logged):
     """Nothing usable in the info dict: the clamp is SKIPPED (an ERROR is logged, the broker's own
     check is the remaining guard). Equity is no longer substituted for buying power
     (audit item 19, 2026-10-07)."""
@@ -115,6 +124,9 @@ def test_a_nan_buying_power_alone_gives_no_clamp_not_equity(warnings_logged):
 
     assert MarketExpertInterface._get_actual_available_balance(account) is None
     assert len(warnings_logged) == 1
+    # the broker ANSWERED (a non-empty info) but no usable figure: ONE error, saying so, no retry
+    assert len(errors_logged) == 1
+    assert "ANSWERED" in errors_logged[0] and "SKIPPED" in errors_logged[0] and "Account 4" in errors_logged[0]
 
 
 def test_finite_figures_are_read_exactly_as_before(warnings_logged):

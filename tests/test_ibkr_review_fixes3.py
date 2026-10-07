@@ -345,12 +345,12 @@ class TestClampBuyingPowerMandatory:
 
             def snap():
                 if snap_raises:
-                    raise RuntimeError("snap")
+                    raise ConnectionError("snap")
                 return SimpleNamespace(buying_power=snap_bp)
 
             def get_info():
                 if info_raises:
-                    raise RuntimeError("info")
+                    raise ConnectionError("info")
                 return info
 
             def get_balance():
