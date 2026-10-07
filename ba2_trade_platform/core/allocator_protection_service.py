@@ -44,6 +44,7 @@ from .allocator_protection_models import (
     SLICE_PLACING, SLICE_RESTING_STATES, SLICE_UNKNOWN, WEIGHT_REASON_PINNED, WEIGHT_REASON_SL_FILL,
     WEIGHT_REASON_TP_FILL,
 )
+from .portfolio_allocation import position_magnitude_and_direction
 from .db import add_instance, get_db, get_instance, log_activity, update_instance
 from .models import TradingOrder, Transaction
 from .types import (
@@ -229,15 +230,15 @@ class BrokerReadError(RuntimeError):
 
 
 def _read_position(account, symbol: str) -> Tuple[float, bool]:
-    """``(quantity, is_long)`` of ``symbol`` from a FRESH broker read; ``(0.0, True)`` when the
+    """``(share COUNT as a magnitude, is_long)`` of ``symbol`` from a FRESH broker read (a short is
+    recognised by a negative ``qty`` or a short ``side``: ``position_magnitude_and_direction``); ``(0.0, True)`` when the
     broker is readable and holds none. Raises ``BrokerReadError`` when the read failed."""
     positions = account.get_positions()
     if positions is None:
         raise BrokerReadError(f"the position fetch for account {account.id} failed")
     for pos in positions:
         if _norm(pos.symbol) == symbol:
-            qty = float(pos.qty)
-            return qty, pos.side == OrderDirection.BUY
+            return position_magnitude_and_direction(pos.side, pos.qty)
     return 0.0, True
 
 
@@ -2208,7 +2209,7 @@ def reconcile_account(account) -> ReconcileReport:
             by_symbol: Dict[str, Tuple[float, bool]] = {}
             if positions is not None:
                 for pos in positions:
-                    by_symbol[_norm(pos.symbol)] = (float(pos.qty), pos.side == OrderDirection.BUY)
+                    by_symbol[_norm(pos.symbol)] = position_magnitude_and_direction(pos.side, pos.qty)
             may_place = not _run_in_flight(account)
             for p in protections:
                 try:
