@@ -14,6 +14,7 @@ refused, never scored as "no edge".
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -292,3 +293,74 @@ def test_an_expired_cross_session_entry_leaves_no_waiting_row_and_no_reserved_ca
                for _s, st in state["transactions"]), state["transactions"]
     from tests.backtest.test_max_loss_stop_engine import CFG
     assert state["cash"] == pytest.approx(CFG["starting_cash"])             # nothing reserved, nothing spent
+
+
+# --------------------------------------------------------------------------- unpriced recommendations
+def _bare_engine():
+    from app.services.backtest.daily_engine import DailyBacktestEngine
+    eng = DailyBacktestEngine.__new__(DailyBacktestEngine)
+    eng.analysis_failures = {}
+    eng.intraday_counters = {"undecidable_symbol_days": 0, "manage_skipped_no_price_symbol_ticks": 0,
+                             "entry_skipped_no_price_symbol_ticks": 0}
+    eng._log = lambda *a, **k: None
+    eng.account = SimpleNamespace(id=1)
+    eng.config = {}
+    return eng
+
+
+def _rec(price, signal=OrderRecommendation.HOLD):
+    return Recommendation(signal=signal, confidence=70.0, current_price=price, details="d",
+                          expected_profit_percent=1.0)
+
+
+def test_the_converter_never_floats_a_missing_price_and_a_skip_stays_a_skip():
+    from app.services.backtest.daily_engine import _recommendation_to_expert_recommendation, rec_is_unpriced
+    assert rec_is_unpriced(_rec(None)) and not rec_is_unpriced(_rec(10.0))
+    skip = _rec(None)
+    skip.skip, skip.skip_reason = True, "no_price"
+    assert not rec_is_unpriced(skip)                                     # a declared skip is its own contract
+    assert _recommendation_to_expert_recommendation(
+        _rec(None), expert_instance_id=1, symbol="X", as_of=datetime(2024, 1, 2), allow_hold=True) is None
+
+
+def test_a_held_symbol_without_a_decision_price_skips_its_manage_step_and_the_others_are_managed(monkeypatch):
+    """Crash of row 1363: float(None) in the converter on the OPEN_POSITIONS pass."""
+    import app.services.backtest.daily_engine as de
+    eng = _bare_engine()
+    monkeypatch.setattr(eng, "_held_transactions", lambda expert_id: {"HELD": [object()], "OTHER": [object()]})
+    monkeypatch.setattr(eng, "_provider_bundle", lambda: object())
+    import ba2_common.core.db as dbmod
+    monkeypatch.setattr(dbmod, "get_instance",
+                        lambda model, i: SimpleNamespace(open_positions_ruleset_id=5))
+    converted = []
+    monkeypatch.setattr(de, "_recommendation_to_expert_recommendation",
+                        lambda rec, **kw: converted.append(kw["symbol"]) or None)
+
+    class Exp:
+        def analyze_as_of(self, as_of, ctx):
+            return _rec(None if ctx.extra["symbol"] == "HELD" else 11.0)
+
+    eng._manage_open_positions(Exp(), 1, {}, datetime(2024, 1, 2, 10, 0))
+    assert eng.intraday_counters["manage_skipped_no_price_symbol_ticks"] == 1
+    assert converted == ["OTHER"]                                         # HELD never reached persistence
+    assert eng.analysis_failures_record()["failed"] == 0                  # a decision of "nothing", not a failure
+
+
+def test_a_basket_item_without_a_price_is_not_staged_and_is_counted():
+    eng = _bare_engine()
+    staged = eng._stage_recommendation_candidate(
+        _rec(None, OrderRecommendation.BUY), expert=SimpleNamespace(settings={}), expert_id=1, symbol="X",
+        ruleset_id=1, as_of=datetime(2024, 1, 2, 10, 0), equity_candidates=[])
+    assert staged is False
+    assert eng.intraday_counters["entry_skipped_no_price_symbol_ticks"] == 1
+
+
+def test_live_a_none_quote_fails_that_one_analysis_cleanly_not_with_a_float_crash():
+    """Live run_analysis of the experts that need a price validates the bundle BEFORE persisting: a held
+    symbol whose quote is unavailable fails that ONE analysis loudly (ValueError, caught by the worker),
+    never a TypeError from float(None) and never a row with a fake price."""
+    from ba2_experts.FMPEarningsDrift import FMPEarningsDrift
+    from ba2_experts.FMPInsiderClusterBuy import FMPInsiderClusterBuy
+    for cls in (FMPEarningsDrift, FMPInsiderClusterBuy):
+        with pytest.raises(ValueError):
+            cls._require_current_price({"current_price": None, "symbol": "X"})

@@ -35,18 +35,30 @@ sys.argv = argv
 import rerun_stored_row as R  # noqa: E402  (enters the backend)
 from app.services.backtest import daily_engine as DE  # noqa: E402
 
-counts = {"ticks": 0, "tick_x_symbol": 0}
+# ``ticks``  = bars the engine STEPPED (the clock list ``trading_days`` returns): the same number before and
+# after the universe became lazy, so cpu_ms_per_tick stays comparable across code versions.
+# ``decision_ticks`` = ticks on which the universe was actually resolved (an expert pass ran);
+# ``tick_x_symbol`` sums the decidable universe over THOSE ticks.
+counts = {"ticks": 0, "decision_ticks": 0, "tick_x_symbol": 0}
 _orig_resolve = DE.resolve_universe
+_orig_days = DE.trading_days
 
 
 def _counting(as_of, config, price_source):
     out = _orig_resolve(as_of, config, price_source)
-    counts["ticks"] += 1
+    counts["decision_ticks"] += 1
     counts["tick_x_symbol"] += len(out)
     return out
 
 
+def _counting_days(*a, **k):
+    out = _orig_days(*a, **k)
+    counts["ticks"] += len(out)
+    return out
+
+
 DE.resolve_universe = _counting
+DE.trading_days = _counting_days
 
 prof = None
 if ns.profile:

@@ -365,6 +365,17 @@ def option_expiry_outcome(opt_type, side, *, strike, spot, qty, multiplier=100):
 # ---------------------------------------------------------------------------
 # Recommendation -> ExpertRecommendation row
 # ---------------------------------------------------------------------------
+def rec_is_unpriced(rec: Any) -> bool:
+    """True for a recommendation that carries a decision (not a skip, not an ERROR) but no price: the
+    expert's ``_decision_price`` found none at this instant (a thin name with no ended bar, a quote that
+    could not be read). Nothing can be decided or persisted for it."""
+    # a wrong-SHAPE return (a list from a per-symbol expert) is not "unpriced": it keeps failing loudly
+    # in the converter (``rec.signal``), it must not be swallowed here.
+    return (hasattr(rec, "signal") and not getattr(rec, "skip", False)
+            and getattr(rec, "signal", None) != OrderRecommendation.ERROR
+            and getattr(rec, "current_price", None) is None)
+
+
 def _recommendation_to_expert_recommendation(
     rec: Any,
     *,
@@ -387,6 +398,10 @@ def _recommendation_to_expert_recommendation(
     the ruleset position conditions and the RM query by).
     """
     if getattr(rec, "skip", False):
+        return None
+    if rec_is_unpriced(rec):
+        # No decision price: ``ExpertRecommendation.price_at_date`` is NOT nullable and a fabricated
+        # price must never be written. Not persisted, exactly like a ``skip`` (the callers count it).
         return None
     action = rec.signal
     if action == OrderRecommendation.ERROR:
@@ -503,7 +518,11 @@ class DailyBacktestEngine:
         #                                    stale / no bars): the universe the experts really saw
         # (the sessions on which a scheduled time had no bar at all, i.e. no decision that day, are
         # ``self.sessions_without_decision_bar``, published next to these.)
-        self.intraday_counters: Dict[str, int] = {"undecidable_symbol_days": 0}
+        #   manage_skipped_no_price_symbol_ticks / entry_skipped_no_price_symbol_ticks -- (tick x symbol)
+        #                                    pairs whose recommendation carried no price (nothing decided)
+        self.intraday_counters: Dict[str, int] = {"undecidable_symbol_days": 0,
+                                                  "manage_skipped_no_price_symbol_ticks": 0,
+                                                  "entry_skipped_no_price_symbol_ticks": 0}
         # Analysis passes per expert: {"passes": n, "failed": m, "first_error": str|None}. A pass is
         # one ``analyze_as_of`` call (per symbol for a classic expert, per bar for a basket / bypass
         # expert); "failed" = it raised and the loop swallowed it. Published in
@@ -1278,6 +1297,10 @@ class DailyBacktestEngine:
         from ba2_common.core.db import get_instance as _get_instance
 
         from ba2_common.core.hold_entry import evaluate_hold_entries
+        if rec_is_unpriced(rec):
+            self.intraday_counters["entry_skipped_no_price_symbol_ticks"] += 1
+            self._log(f"entry {symbol} @ {as_of:%Y-%m-%d %H:%M}: recommendation carries no price; not staged")
+            return False
         rec_id = _recommendation_to_expert_recommendation(
             rec, expert_instance_id=expert_id, symbol=symbol, as_of=as_of,
             subtype=AnalysisUseCase.ENTER_MARKET,
@@ -1585,6 +1608,15 @@ class DailyBacktestEngine:
                 _reraise_option_basis_refusal(e)
                 self._log(f"open-pos analyze failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 self._analysis_failed(expert_id, f"open-pos {symbol} @ {as_of:%Y-%m-%d}: {e}")
+                continue
+            if rec_is_unpriced(rec):
+                # A HELD symbol with no decidable price at this tick: nothing can be decided for it, so
+                # its rule-based manage step is skipped for THIS tick, counted. The position stays open;
+                # its resting stop / take-profit keep working on bars that print, and the equity mark is
+                # the last ended bar. No fabricated price, no entry-price substitute.
+                self.intraday_counters["manage_skipped_no_price_symbol_ticks"] += 1
+                self._log(f"open-pos {symbol} @ {as_of:%Y-%m-%d %H:%M}: no decidable price; manage step "
+                          f"skipped for this tick")
                 continue
             rec_id = _recommendation_to_expert_recommendation(
                 rec, expert_instance_id=expert_id, symbol=symbol, as_of=as_of, allow_hold=True,
