@@ -53,7 +53,7 @@ DAILY = [  # (date, open, high, low, close) -- every close distinct and never eq
 #: Only the 09:30 bar of each session is a scheduled decision; 09:35/09:40 give the price source
 #: later bars so the open/close of the decision bar and the next bar are distinguishable.
 SESSIONS = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)]
-MINUTES = [(9, 30), (9, 35), (9, 40)]
+MINUTES = [(9, 30), (9, 35), (9, 40), (9, 45)]
 
 
 def _intraday_rows():
@@ -133,7 +133,7 @@ class _ProbeExpert(MarketExpertInterface):
                               details="probe", expected_profit_percent=0.0)
 
 
-def _run(interval: str, run_id: int):
+def _run(interval: str, run_id: int, times=None):
     """Full engine.run() with the probe expert; returns (records, price_source)."""
     from app.services.backtest.backtest_account import BacktestAccount
     from app.services.backtest.backtest_db import (
@@ -178,7 +178,10 @@ def _run(interval: str, run_id: int):
             engine = DailyBacktestEngine(
                 account=account, experts=[(expert, expert_id, {}, ruleset_id)], price_source=ps,
                 config={"start_date": datetime(2024, 1, 2), "end_date": datetime(2024, 1, 4, 23, 59),
-                        "enabled_instruments": [SYMBOL], "seed": 42},
+                        "enabled_instruments": [SYMBOL], "seed": 42,
+                        **({"run_schedule_override": {"days": {d: True for d in (
+                            "monday", "tuesday", "wednesday", "thursday", "friday")}, "times": list(times)}}
+                           if times else {})},
                 indicator_provider=None)
             engine._indicator_provider = None
             engine.run()
@@ -199,20 +202,27 @@ PRIOR = {date(2024, 1, 2): date(2023, 12, 29), date(2024, 1, 3): date(2024, 1, 2
 KNOWABLE_READERS = ("explicit_end", "clamped_none_end", "ds_fetch_ohlcv", "bulk_sliced")
 
 
-@pytest.fixture(scope="module")
-def intraday_run():
-    return _run("5min", 701)
+#: the schedule time of a decision: the session's FIRST bar (a stored row's 09:30), one bar later,
+#: and two bars later. The daily-bar rule must be the same at each.
+DECISION_TIMES = ["09:30", "09:35", "09:40", "09:45"]
+
+
+@pytest.fixture(scope="module", params=DECISION_TIMES)
+def intraday_run(request):
+    records, ps = _run("5min", 700 + DECISION_TIMES.index(request.param), times=[request.param])
+    return records, ps, request.param
 
 
 def test_every_decision_was_recorded(intraday_run):
-    records, _ = intraday_run
-    assert len(records) == len(SESSIONS)   # one scheduled 09:30 decision per session
+    records, _, hhmm = intraday_run
+    assert len(records) == len(SESSIONS)   # one scheduled decision per session
+    assert all(r["as_of"].strftime("%H:%M") == hhmm for r in records)
 
 
 @pytest.mark.parametrize("reader", KNOWABLE_READERS)
 def test_no_daily_reader_sees_the_decision_sessions_own_bar(intraday_run, reader):
     """THE guard: at every intraday decision the newest daily bar is the PRIOR session's."""
-    records, _ = intraday_run
+    records, _, _ = intraday_run
     for rec in records:
         decision_day = rec["as_of"].date()
         assert rec[reader] == PRIOR[decision_day], (
@@ -224,20 +234,38 @@ def test_a_bulk_read_is_the_callers_to_slice(intraday_run):
     """A whole-series read (end past the clock) is returned whole -- caching readers slice it with
     ``knowable_daily_end``. Pinned so nobody 'fixes' it by clamping and freezing DeterministicScorer's
     run-long cache at its first bar."""
-    records, _ = intraday_run
+    records, _, _ = intraday_run
     assert all(rec["bulk_unsliced"] == date(2024, 1, 5) for rec in records)
 
 
-def test_price_at_date_is_the_decision_bars_open(intraday_run):
-    """The decision price is the OPEN of the bar stamped at the decision (what a live quote at
-    09:30 returns), not that bar's close (printed a bar later, when the order fills) and not any
-    daily close."""
-    records, ps = intraday_run
+def test_price_at_date_is_the_close_of_the_latest_bar_that_has_ended(intraday_run):
+    """The decision price is the close of the latest bar that ENDED at or before the decision --
+    never the decision bar's own close (not printed yet), never a daily close -- with NO special
+    case at the session open: on the first bar of a session it is the PREVIOUS session's last bar
+    (and nothing at all on the first bar of the data)."""
+    records, ps, hhmm = intraday_run
+    by_stamp = {r["Date"]: r for r in _intraday_rows()}
     for rec in records:
-        bar = ps.bar_at(SYMBOL, rec["as_of"])
-        assert rec["price_at_date"] == pytest.approx(bar["open"])
-        assert rec["price_at_date"] != pytest.approx(bar["close"])
-        assert rec["price_at_date"] not in {r[4] for r in DAILY}
+        t = rec["as_of"].replace(tzinfo=None)
+        ended = [r for stamp, r in by_stamp.items() if stamp + timedelta(minutes=5) <= t]
+        expected = ended[-1]["Close"] if ended else None
+        assert rec["price_at_date"] == expected, (rec["as_of"], rec["price_at_date"], expected)
+        if rec["price_at_date"] is not None:
+            assert rec["price_at_date"] not in {r[4] for r in DAILY}
+            assert rec["price_at_date"] != by_stamp[t]["Close"]
+
+
+def test_a_decision_on_the_first_bar_warns_and_a_later_one_does_not(monkeypatch):
+    """One WARNING per run when a schedule time equals the first bar of a session; none otherwise."""
+    from app.services.backtest import daily_engine
+
+    seen = []
+    monkeypatch.setattr(daily_engine.logger, "warning", lambda msg, *a, **k: seen.append(str(msg)))
+    _run("5min", 710, times=["09:30"])
+    assert sum("first bar of a session" in m for m in seen) == 1
+    seen.clear()
+    _run("5min", 711, times=["09:40"])
+    assert not any("first bar of a session" in m for m in seen)
 
 
 def test_unclamped_run_is_the_defect(monkeypatch):
@@ -323,9 +351,8 @@ def _day_bars(d, first=(9, 30), minutes=390, step=5, base=100.0):
 
 @pytest.mark.parametrize("interval, step", [("1min", 1), ("5min", 5), ("15min", 15), ("1h", 60)])
 def test_decision_price_rule_at_any_time_and_interval(interval, step):
-    """PRICE at T = the close of the latest bar that has ENDED at or before T; only when no bar
-    of T's session has ended yet, the OPEN of the bar starting at T. The same rule at the open,
-    mid-session, on the last bar and after the close."""
+    """PRICE at T = the close of the latest bar that has ENDED at or before T. ONE rule at the open,
+    mid-session, on the last bar and after the close: no opening-print special case anywhere."""
     ps = _ps(interval)
     rows = _day_bars(date(2024, 1, 2), step=step, base=50.0) + _day_bars(date(2024, 1, 3), step=step, base=100.0)
     ps.load_bars(SYMBOL, rows)
@@ -335,9 +362,12 @@ def test_decision_price_rule_at_any_time_and_interval(interval, step):
     def at(hh, mm):
         return ps.decision_price(SYMBOL, _wall(2024, 1, 3, hh, mm))
 
-    # the session's first instant: the opening print (NOT yesterday's last close)
-    assert at(9, 30) == day3[0]["Open"] != rows[n_day - 1]["Close"]
-    # mid-session: the close of the bar that ENDED at T (stamped T - step), NOT the open of the
+    # the session's first bar: the PREVIOUS session's last bar -- NOT the opening print of this one
+    assert at(9, 30) == rows[n_day - 1]["Close"] != day3[0]["Open"]
+    # one bar later: the first bar has ended, and its CLOSE (not its open) is the price
+    nxt = day3[1]["Date"]
+    assert at(nxt.hour, nxt.minute) == day3[0]["Close"] != day3[0]["Open"]
+    # mid-session: the close of the bar that ENDED at T (stamped T - step), NOT anything of the
     # bar stamped T (which has not ended)
     idx = 3
     mid = day3[idx]["Date"]
@@ -353,16 +383,17 @@ def test_decision_price_rule_at_any_time_and_interval(interval, step):
     assert at(8, 0) == rows[n_day - 1]["Close"]
 
 
-def test_decision_price_does_not_hardcode_the_open():
-    """A symbol whose first bar of the day is stamped LATE (thin name) gets the opening-print rule
-    at ITS first bar, not at 09:30, and at 09:30 (no bar of the session yet) the prior close. If
-    anyone hard-codes the open the two assertions swap."""
+def test_decision_price_does_not_depend_on_where_the_session_starts():
+    """A symbol whose first bar is stamped LATE (thin name) follows the same rule: until a bar of
+    today has ended the price is the previous session's last close, then the latest ended bar's
+    close. Nothing in the rule is tied to 09:30; if anyone hard-codes the open or a time the
+    assertions below move."""
     ps = _ps("5min")
     prev = _day_bars(date(2024, 1, 2), base=50.0)
     late = _day_bars(date(2024, 1, 3), first=(10, 0), minutes=300, base=100.0)
     ps.load_bars(SYMBOL, prev + late)
     assert ps.decision_price(SYMBOL, _wall(2024, 1, 3, 9, 30)) == prev[-1]["Close"]
-    assert ps.decision_price(SYMBOL, _wall(2024, 1, 3, 10, 0)) == late[0]["Open"]
+    assert ps.decision_price(SYMBOL, _wall(2024, 1, 3, 10, 0)) == prev[-1]["Close"]
     assert ps.decision_price(SYMBOL, _wall(2024, 1, 3, 10, 5)) == late[0]["Close"]
 
 
@@ -382,7 +413,7 @@ def test_the_fill_is_still_the_next_bars_open():
     ps.load_bars(SYMBOL, rows)
     nb = ps.next_bar(SYMBOL, _wall(2024, 1, 3, 9, 30))
     assert nb["open"] == rows[1]["Open"]
-    assert nb["open"] != ps.decision_price(SYMBOL, _wall(2024, 1, 3, 9, 30))
+    assert ps.decision_price(SYMBOL, _wall(2024, 1, 3, 9, 30)) is None   # nothing has ended yet
 
 
 def test_daily_clock_session_date_is_the_bars_own_date():

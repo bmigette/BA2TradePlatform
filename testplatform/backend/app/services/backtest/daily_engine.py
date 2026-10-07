@@ -576,6 +576,7 @@ class DailyBacktestEngine:
         reset_stressed()
 
         days = trading_days(self.config["start_date"], self.config["end_date"], self.price)
+        self._warn_if_deciding_on_the_first_bar(days)
         total = max(len(days), 1)
         # Progress throttle: the handler's progress_cb does DB work every call (a task-queue
         # pause-check + a progress write). On a 5-minute fill clock a 1-year/8-symbol run is
@@ -593,7 +594,9 @@ class DailyBacktestEngine:
         # the analysis cadence, fills are continuous). SEPARATE sets per sub-pass: with one
         # shared set, whichever gate fired first in the day claimed the (expert, day) key and
         # STARVED the other pass whenever the entry and manage schedules pin different times
-        # (benign while both pin 09:30, but a one-line trap for any future schedule change).
+        # (the trap is closed: the sets are separate, so an entry time of 09:40 with a manage time
+        # of 09:30 / 15:30 each run once per day; the entry-time sweep in test_intraday_daily_knowability.py runs the
+        # engine at 09:30 / 09:35 / 09:40 / 09:45).
         analyzed_entry_days: set = set()
         analyzed_manage_days: set = set()
 
@@ -924,6 +927,35 @@ class DailyBacktestEngine:
             return True
 
     # -- run-cadence --------------------------------------------------------
+    def _warn_if_deciding_on_the_first_bar(self, days: List[Any]) -> None:
+        """ONE WARNING per run when an entry schedule time equals the first bar of a session.
+
+        The decision price is the close of the latest bar that has ENDED at the decision instant,
+        so a decision on the session's first bar sees only the PREVIOUS session's last bar -- the
+        cache has no pre-market bars -- while a live run at that instant reads the opening quote.
+        Not refused (stored rows scheduled at the open must still re-run); the run is merely not
+        what live would do. No-op on a daily clock."""
+        if not getattr(self.price, "is_intraday", False):
+            return
+        first_bar_hhmm = set()
+        seen_days = set()
+        for d in days:
+            day = d.date()
+            if day not in seen_days:
+                seen_days.add(day)
+                first_bar_hhmm.add(d.strftime("%H:%M"))
+        for expert, _eid, _settings, _ruleset in self.experts:
+            sched = self._entry_schedule(expert) or {}
+            hit = sorted(set(sched.get("times") or ()) & first_bar_hhmm)
+            if hit:
+                logger.warning(
+                    f"[daily_engine] entry schedule time {hit} equals the first bar of a session: "
+                    f"a decision at the session open sees the PRIOR session's close (no pre-market "
+                    f"bars; the price is the last bar that has ended), but live sees the opening "
+                    f"quote. Use a time >= the first bar + one bar (ba2_common.core.knowability."
+                    f"DEFAULT_DECISION_TIME).")
+                return
+
     def _entry_schedule(self, expert: Any) -> Optional[Dict[str, Any]]:
         """The expert's ``execution_schedule_enter_market`` (common base setting), or None.
 

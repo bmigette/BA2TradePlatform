@@ -685,9 +685,11 @@ class AsOfPriceSource:
     #     does not see today's bar; one at 16:05, or any time after the close, does.
     #   * PRICE at T = the close of the latest intraday bar that has ENDED at or before T (a bar
     #     stamped t covers [t, t + interval): the bar stamped 10:55 is finished at 11:00, the one
-    #     stamped 11:00 is not). When NO bar of T's session has ended yet -- T is the session's first
-    #     instant -- the price is the OPEN of the bar starting at T, the opening print: that is
-    #     what a live quote is then, and the only alternative is yesterday's close.
+    #     stamped 11:00 is not). NO special case at the session's first instant: a decision on
+    #     the first bar legitimately sees only the previous session's last bar (the cache has no
+    #     pre-market bars). That is not what a live run at the open sees (an opening quote), so
+    #     the engine WARNS when a schedule time equals the first bar, and new grids decide at
+    #     ``DEFAULT_DECISION_TIME`` (one or more bars after the open).
     #   * The FILL is unchanged: the open of the bar AFTER the decision bar (``next_bar``).
     #
     # Bar stamps are EXCHANGE-LOCAL WALL TIME, labelled UTC, and mark the START of the bar
@@ -719,11 +721,10 @@ class AsOfPriceSource:
     def decision_price(self, symbol: str, as_of: Any) -> Optional[float]:
         """The price KNOWABLE at decision instant ``as_of`` from the run's own bar series.
 
-        INTRADAY clock: the close of the latest bar that has ENDED at or before ``as_of``; or,
-        when no bar of ``as_of``'s own session has ended yet and a bar starts exactly at
-        ``as_of``, that bar's OPEN (the opening print). Never the decision bar's own close (not
-        yet printed), never a daily close. ``None`` when nothing is knowable: the caller must
-        refuse to decide.
+        INTRADAY clock: the close of the latest bar that has ENDED at or before ``as_of`` (the
+        previous session's last bar when none of today's has ended). Never the decision bar's
+        own close (not yet printed), never a daily close. ``None`` when nothing is knowable:
+        the caller must refuse to decide.
 
         Daily clock: the close of the bar stamped ``as_of`` (forward-filled)."""
         k = self._keys.get(symbol)
@@ -735,12 +736,7 @@ class AsOfPriceSource:
             return None if i < 0 else float(self._c[symbol][i])
         span = _interval_ns(self._interval)
         f = bisect.bisect_right(k, key - span) - 1        # latest bar with stamp + interval <= T
-        if f >= 0 and _ns_date(k[f]) == _ns_date(key):
-            return float(self._c[symbol][f])              # a finished bar of T's own session
-        j = bisect.bisect_right(k, key) - 1
-        if j >= 0 and k[j] == key:
-            return float(self._o[symbol][j])              # T is the session's first instant
-        return None if f < 0 else float(self._c[symbol][f])   # earlier session's last close
+        return None if f < 0 else float(self._c[symbol][f])
 
     # ---- loading -----------------------------------------------------------
     def preload(
