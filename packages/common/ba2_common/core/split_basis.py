@@ -80,6 +80,15 @@ __all__ = [
     "IntradayBasisError",
     "IntradayBasisStale",
     "IntradayBasisMismatch",
+    "IntradayVendorBasisConflict",
+    "OPERATOR_HINT",
+    "intraday_rebase_path",
+    "read_intraday_rebase",
+    "write_intraday_rebase",
+    "clear_intraday_rebase",
+    "list_intraday_states",
+    "intraday_state_summary",
+    "start_intraday_state_reporter",
     "intraday_stale_marker_path",
     "read_intraday_stale",
     "write_intraday_stale",
@@ -342,17 +351,32 @@ class IntradayBasisError(RuntimeError):
     """Base of the cross-interval basis refusals (matched by NAME in ``job_fatal``)."""
 
 
+#: Appended to every refusal: these errors surface inside a chart, an indicator, a tool call or a backtest where
+#: nobody knows the cache layout, so each says what the state is and who fixes it.
+OPERATOR_HINT = (" This is a state of the local OHLCV CACHE for this one symbol, not a platform fault; daily bars "
+                 "are unaffected. Operator: `python tools/cache_health_check.py --basis-symbols <SYM>` shows it, "
+                 "`python tools/repair_intraday_basis.py plan --symbols <SYM>` says whether it can be repaired, "
+                 "`python tools/repair_intraday_basis.py markers --list` lists the stale markers.")
+
+
 class IntradayBasisStale(IntradayBasisError):
     """An intraday cache file is marked stale: the symbol's DAILY history was rewritten on a new split
     basis after the file was fetched, so its price levels are not those of the daily file. Raised by
     every read of the file (``get_ohlcv_data``), every write of it and every backtest launch / job
-    start that includes the symbol. Repair: ``force_full_refetch(symbol, <interval>)``."""
+    start that includes the symbol. Repair: ``force_full_refetch(symbol, <interval>)``, or the rebase
+    tool when the vendor cannot serve the old dates on the daily basis."""
 
 
 class IntradayBasisMismatch(IntradayBasisError):
     """An intraday cache (or a frame about to be written to it) is on a different price level than
     the symbol's daily cache: the cross-interval check (``ba2_providers.ohlcv.cross_interval_basis``)
     classified it ``constant_factor`` / ``factor_changes`` / ``noisy``."""
+
+
+class IntradayVendorBasisConflict(IntradayBasisError):
+    """The VENDOR's intraday history of a symbol disagrees with the VENDOR's own daily history (it serves
+    old dates as-traded on one endpoint and split-adjusted on the other). A refetch cannot repair this, so
+    nothing was written and the existing file was left exactly as it was: this is not a stale file."""
 
 
 def intraday_stale_marker_path(parquet_path: str) -> str:
@@ -402,6 +426,119 @@ def clear_intraday_stale(parquet_path: Optional[str]) -> bool:
         return True
     except FileNotFoundError:
         return False
+
+
+def intraday_rebase_path(parquet_path: str) -> str:
+    folder, name = os.path.split(parquet_path)
+    stem = name[:-len(".parquet")] if name.endswith(".parquet") else name
+    return os.path.join(folder, MARKER_DIRNAME, stem + ".intraday-rebase.json")
+
+
+def read_intraday_rebase(parquet_path: Optional[str]) -> Optional[dict]:
+    """The PROVENANCE sidecar of an intraday parquet whose prices were re-based by
+    ``tools/repair_intraday_basis.py`` (or adopted from an earlier ad-hoc rescale), or None. An unreadable
+    sidecar is reported as a rebase too: the file's origin is then unknown, never silently vendor data."""
+    if not parquet_path:
+        return None
+    path = intraday_rebase_path(parquet_path)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {"unreadable": f"{path}: not a JSON object"}
+    except (OSError, ValueError) as e:
+        return {"unreadable": f"{path}: {e}"}
+
+
+def write_intraday_rebase(parquet_path: str, payload: dict) -> str:
+    """Write the provenance sidecar next to the file (inside the cache, so it travels with it). Atomic."""
+    path = intraday_rebase_path(parquet_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True, indent=1, default=str)
+    os.replace(tmp, path)
+    return path
+
+
+def clear_intraday_rebase(parquet_path: Optional[str]) -> bool:
+    if not parquet_path:
+        return False
+    try:
+        os.remove(intraday_rebase_path(parquet_path))
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def list_intraday_states(provider_folder: str) -> dict:
+    """``{"stale": [{file, marked_at_utc, age_days, reason}], "rebased": [{file, applied_utc, ...}]}`` of one
+    provider folder, read from its ``_split_basis`` directory (names only; no parquet is opened)."""
+    from datetime import datetime as _dt
+    out = {"stale": [], "rebased": []}
+    d = os.path.join(provider_folder, MARKER_DIRNAME)
+    if not os.path.isdir(d):
+        return out
+    now = _dt.now(timezone.utc)
+    for name in sorted(os.listdir(d)):
+        full = os.path.join(d, name)
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            data = {"reason": f"unreadable: {e}"}
+        if name.endswith(".intraday-stale.json"):
+            age = None
+            try:
+                age = round((now - _dt.fromisoformat(data["marked_at_utc"])).total_seconds() / 86400.0, 1)
+            except (KeyError, ValueError, TypeError):
+                pass
+            out["stale"].append({"file": name[:-len(".intraday-stale.json")], "age_days": age,
+                                 "marked_at_utc": data.get("marked_at_utc"), "reason": data.get("reason")})
+        elif name.endswith(".intraday-rebase.json"):
+            segs = data.get("segments") or []
+            out["rebased"].append({
+                "file": name[:-len(".intraday-rebase.json")], "applied_utc": data.get("applied_utc"),
+                "source": data.get("source"),
+                "volume_unadjusted": any(sg.get("volume_unadjusted") for sg in segs if isinstance(sg, dict))})
+    return out
+
+
+def intraday_state_summary(provider_folder: str) -> str:
+    """ONE log line for the live app's startup / daily summary: how many intraday files are stale-marked or
+    rebased (names capped), so a refusal in a chart or tool call is not a surprise. Empty folder -> ``ok``."""
+    st = list_intraday_states(provider_folder)
+    if not st["stale"] and not st["rebased"]:
+        return "intraday cache state: no stale-marked and no rebased intraday files"
+    def names(rows):
+        n = [r["file"] for r in rows]
+        return ", ".join(n[:12]) + (f", ... (+{len(n) - 12})" if len(n) > 12 else "")
+    parts = []
+    if st["stale"]:
+        parts.append(f"{len(st['stale'])} STALE-marked (reads/writes refuse: {names(st['stale'])})")
+    if st["rebased"]:
+        parts.append(f"{len(st['rebased'])} rebased (prices re-based by the repair tool: {names(st['rebased'])})")
+    return "intraday cache state: " + "; ".join(parts)
+
+
+def start_intraday_state_reporter(provider_folder: str, log, *, interval_s: float = 86400.0):
+    """LIVE VISIBILITY. Logs ``intraday_state_summary`` once now (startup) and then every ``interval_s`` (default
+    daily) from a daemon thread, so a refusal in a chart, an indicator or a tool call that reads a stale / rebased
+    intraday file is explained by a line in the app log. Returns the stop ``Event`` (set it to end the thread)."""
+    import threading
+    stop = threading.Event()
+
+    def _run():
+        while not stop.is_set():
+            try:
+                log(intraday_state_summary(provider_folder))
+            except Exception as e:  # noqa: BLE001 -- a reporter must never take the app down; say so, once per cycle
+                log(f"intraday cache state summary failed: {type(e).__name__}: {e}")
+            stop.wait(interval_s)
+
+    threading.Thread(target=_run, name="intraday-state-reporter", daemon=True).start()
+    return stop
 
 
 # ---------------------------------------------------------------------------------------------

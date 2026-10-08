@@ -15,6 +15,7 @@ WHO IS CHECKED, and what is not:
 from __future__ import annotations
 
 import inspect
+import json
 from datetime import date, datetime
 
 import numpy as np
@@ -177,12 +178,43 @@ def test_both_refusals_are_job_fatal_by_name():
     assert {"IntradayBasisMismatch", "IntradayBasisStale"} <= JOB_FATAL_ERROR_TYPES
 
 
-def test_the_job_start_runs_the_preflight_before_any_bar_is_loaded():
-    from app.services.backtest import daily_backtest_handler as h
-    src = inspect.getsource(h.run_daily_backtest)
-    assert "require_for_config(config)" in src
-    assert src.index("require_for_config(config)") < src.index("ps.preload(")
-    assert 'results["intraday_basis_preflight"]' in src                  # recorded on the result
+def test_the_job_start_refuses_before_any_bar_is_loaded(cache, monkeypatch):
+    """Runs the real ``run_daily_backtest`` on a config whose universe holds a mismatched symbol: it raises
+    ``IntradayBasisMismatch`` and NO bar was loaded (neither the price source's preload nor any series read)."""
+    from app.models.database import Base, engine
+    from app.services.backtest import daily_backtest_handler as H
+    from app.services.backtest import price_source as PS
+    Base.metadata.create_all(bind=engine)
+    _put(cache, "BADONE", 0.5)
+    loaded = []
+    monkeypatch.setattr(PS.AsOfPriceSource, "preload", lambda self, *a, **k: loaded.append("preload"))
+    monkeypatch.setattr(PS.MemoizedOHLCVProvider, "_load", lambda self, *a, **k: loaded.append("load"))
+    payload = {"backtest_id": 987001, "name": "pf", "enabled_instruments": ["BADONE"], "experts": ["FMPEarningsDrift"],
+               "start_date": "2023-03-01", "end_date": "2023-12-29", "initial_capital": 100_000.0, "commission": 1.0,
+               "slippage": 0.0, "fill_model": "next_bar_open", "seed": 1, "execution_interval": "5min",
+               "warmup_days": 30}
+    cfg = H._build_config(payload)
+    with pytest.raises(IntradayBasisMismatch, match="BADONE: constant_factor x0.5"):
+        H.run_daily_backtest(cfg)
+    assert loaded == []
+
+
+def test_a_healthy_universe_reaches_the_preload(cache, monkeypatch):
+    from app.models.database import Base, engine
+    from app.services.backtest import daily_backtest_handler as H
+    Base.metadata.create_all(bind=engine)
+    _put(cache, "GOODONE")
+    class Reached(Exception):
+        pass
+    def stop(self, *a, **k):
+        raise Reached()
+    from app.services.backtest import price_source as PS
+    monkeypatch.setattr(PS.AsOfPriceSource, "preload", stop)
+    payload = {"backtest_id": 987002, "name": "pf", "enabled_instruments": ["GOODONE"], "experts": ["FMPEarningsDrift"],
+               "start_date": "2023-03-01", "end_date": "2023-12-29", "initial_capital": 100_000.0, "commission": 1.0,
+               "slippage": 0.0, "fill_model": "next_bar_open", "seed": 1, "execution_interval": "5min", "warmup_days": 30}
+    with pytest.raises(Reached):
+        H.run_daily_backtest(H._build_config(payload))
 
 
 def test_a_trial_that_hits_the_refusal_is_reported_fatal_to_the_master(cache):
@@ -216,3 +248,218 @@ def test_the_launcher_refuses_early_with_the_list_and_has_no_skip_flag(cache):
     L._refuse_intraday_basis_mismatch("optimize", {**block, "execution_interval": "1d"})
     src = inspect.getsource(L)
     assert "BA2_SKIP_BASIS" not in src and "skip-basis-check" not in src.lower()
+
+
+
+# ------------------------------------------------------------------------------------------ review round
+def test_M5_a_repaired_or_newly_defective_file_is_seen_without_resetting_the_memo(cache):
+    _put(cache, "LIVE1")
+    c = cfg(["LIVE1"])
+    pf.require_for_config(c)                                         # judged ok, memoised
+    _put(cache, "LIVE1", 0.5)                                        # a defect appears in a long-lived worker
+    with pytest.raises(IntradayBasisMismatch, match="LIVE1"):
+        pf.require_for_config(c)
+    _put(cache, "LIVE1", 1.0)                                        # ... and is repaired
+    assert pf.require_for_config(c).counts["ok"] == 1
+    split_basis.write_intraday_stale(str(cache / "LIVE1_5min.parquet"), reason="x")     # a marker appears
+    with pytest.raises(IntradayBasisStale):
+        pf.require_for_config(c)
+    split_basis.clear_intraday_stale(str(cache / "LIVE1_5min.parquet"))
+    assert pf.require_for_config(c) is not None
+
+
+def test_M7_the_judged_window_is_what_the_engine_reads(cache):
+    # a short job window: the provider's read guard looks 90 days back; so does the preflight
+    _put(cache, "SHORTWIN")
+    rep = pf.require_for_config({**cfg(["SHORTWIN"]), "start_date": datetime(2023, 12, 1), "warmup_days": 0})
+    lo = pd.Timestamp(rep.window_start)
+    assert lo == pd.Timestamp("2023-12-29") - pd.Timedelta(days=cib.MIN_JUDGED_DAYS)
+
+
+def test_an_insufficient_symbol_with_enough_daily_sessions_is_a_coverage_refusal(cache):
+    daily, intra = _pair()
+    daily.assign(effective_date=daily["Date"]).to_parquet(cache / "THIN_1d.parquet", index=False)
+    few = intra[(intra["Date"] >= "2023-03-01") & (intra["Date"] < "2023-03-08")]     # 5 sessions inside the window
+    few.assign(effective_date=few["Date"]).to_parquet(cache / "THIN_5min.parquet", index=False)
+    with pytest.raises(IntradayBasisMismatch) as ei:
+        pf.require_for_config(cfg(["THIN"]))
+    assert "THIN: intraday COVERAGE" in str(ei.value) and "daily sessions in the window" in str(ei.value)
+
+
+def test_no_intraday_file_is_not_a_basis_refusal_for_an_intraday_clock(cache):
+    daily, _ = _pair()
+    daily.assign(effective_date=daily["Date"]).to_parquet(cache / "NOINTRA_1d.parquet", index=False)
+    rep = pf.require_for_config(cfg(["NOINTRA"]))                     # BacktestCacheMiss's business
+    assert [r.symbol for r in rep.unjudged] == ["NOINTRA"]
+
+
+def test_options_job_with_no_intraday_bars_is_a_recorded_warning_with_the_sessions(cache):
+    daily, _ = _pair()
+    daily.assign(effective_date=daily["Date"]).to_parquet(cache / "OPTNO_1d.parquet", index=False)
+    _put(cache, "OPTOK")
+    rep = pf.require_for_config(cfg(["OPTNO", "OPTOK"], "1d", options=True))
+    d = rep.to_dict()["option_refinement_uncovered"]
+    assert d["count"] == 1 and d["symbols"][0]["symbol"] == "OPTNO" and d["symbols"][0]["class"] == "no_intraday"
+    assert d["daily_sessions_without_intraday"] > 150 and d["symbols"][0]["sessions_without_intraday"] > 150
+    assert rep.job_kind == "options"
+
+
+def test_rebased_symbols_and_remaining_bursts_are_recorded_in_the_result(cache):
+    _put(cache, "REB1")
+    split_basis.write_intraday_rebase(str(cache / "REB1_5min.parquet"), {
+        "applied_utc": "2026-10-08", "source": "mixed", "segments": [{"volume_unadjusted": True}]})
+    daily, intra = _pair()
+    odd = intra.copy()
+    for d in ("2023-05-02", "2023-06-13", "2023-07-20", "2023-09-05"):             # 4 sessions 15% off, far apart
+        m = odd["Date"].dt.normalize() == pd.Timestamp(d)
+        for c in ("Open", "High", "Low", "Close"):
+            odd.loc[m, c] = odd.loc[m, c] * 1.15
+    daily.assign(effective_date=daily["Date"]).to_parquet(cache / "BUR_1d.parquet", index=False)
+    odd.assign(effective_date=odd["Date"]).to_parquet(cache / "BUR_5min.parquet", index=False)
+    rep = pf.require_for_config(cfg(["REB1", "BUR"]))
+    d = rep.to_dict()
+    assert d["rebased_intraday"] == {"count": 1, "symbols": ["REB1"], "volume_unadjusted": ["REB1"], "sources": ["mixed"]}
+    assert d["remaining_bursts"]["count"] == 1 and d["remaining_bursts"]["symbols"][0]["symbol"] == "BUR"
+    assert d["counts"]["rebased_intraday"] == 1
+
+
+def test_the_provider_is_derived_not_hardcoded(cache, tmp_path, monkeypatch):
+    assert pf.default_provider_name() == PROV
+    other = tmp_path / "cache" / "OtherProvider"
+    other.mkdir(parents=True)
+    _put(cache, "SAMEBAD", 0.5)                                         # bad under the default provider only
+    _put(other, "SAMEBAD", 1.0)
+    pf.reset_job_memo()
+    assert pf.require_for_config(cfg(["SAMEBAD"]), provider="OtherProvider").counts["ok"] == 1
+    with pytest.raises(IntradayBasisMismatch):
+        pf.require_for_config(cfg(["SAMEBAD"]))
+
+
+def test_job_start_reports_reviewed_exclusions_applied_at_launch(cache):
+    _put(cache, "GOODX")
+    rep = pf.require_for_config({**cfg(["GOODX"]), "intraday_basis_exclusions": [{"symbol": "GONEX", "reason": "r",
+                                 "added": "2026-10-08", "reviewed_by": "Bastien"}]})
+    assert rep.to_dict()["excluded_by_reviewed_list"][0]["symbol"] == "GONEX"
+
+
+def test_job_start_refuses_a_listed_symbol_still_in_the_universe(cache, tmp_path, monkeypatch):
+    from ba2_providers.ohlcv import intraday_exclusions as ix
+    f = tmp_path / "ex.json"
+    f.write_text(json.dumps({"entries": [{"symbol": "LISTED", "reason": "vendor serves two bases", "added": "2026-10-08",
+                                          "reviewed_by": "Bastien"}]}))
+    monkeypatch.setattr(ix, "EXCLUSIONS_PATH", str(f))
+    _put(cache, "LISTED", 0.5)
+    with pytest.raises(IntradayBasisMismatch, match="remove it at launch"):
+        pf.require_for_config(cfg(["LISTED"]))
+
+
+# ------------------------------------------------------------------------------------------ the launcher
+def _exclusion_file(tmp_path, monkeypatch, reviewed_by):
+    from ba2_providers.ohlcv import intraday_exclusions as ix
+    f = tmp_path / "ex.json"
+    f.write_text(json.dumps({"entries": [{"symbol": "LST", "reason": "vendor serves old dates as-traded", "added": "2026-10-08",
+                                          "reviewed_by": reviewed_by}]}))
+    monkeypatch.setattr(ix, "EXCLUSIONS_PATH", str(f))
+
+
+def _block(symbols):
+    return {**cfg(symbols), "start_date": "2023-03-01", "end_date": "2023-12-29"}
+
+
+def test_launcher_removes_a_REVIEWED_listed_symbol_with_a_printed_line_and_a_results_entry(cache, tmp_path, monkeypatch, capsys):
+    import ba2test_launcher as L
+    _exclusion_file(tmp_path, monkeypatch, "Bastien")
+    _put(cache, "GOOD")
+    _put(cache, "LST", 0.5)
+    block = _block(["GOOD", "LST"])
+    L._refuse_intraday_basis_mismatch("optimize", block)
+    out = capsys.readouterr().out
+    assert "EXCLUDING 1 symbols on the reviewed intraday-basis exclusion list" in out and "LST (vendor serves" in out
+    assert block["enabled_instruments"] == ["GOOD"]
+    assert block["excluded_instruments"] == ["LST"]
+    assert block["intraday_basis_exclusions"][0]["symbol"] == "LST" and block["intraday_basis_exclusions"][0]["reviewed_by"] == "Bastien"
+    # the result of a job started from this block records it
+    assert pf.require_for_config(block).to_dict()["excluded_by_reviewed_list"][0]["symbol"] == "LST"
+
+
+def test_launcher_still_refuses_a_PENDING_or_unlisted_mismatched_symbol(cache, tmp_path, monkeypatch):
+    import ba2test_launcher as L
+    _exclusion_file(tmp_path, monkeypatch, "pending owner review")
+    _put(cache, "LST", 0.5)
+    _put(cache, "OTHER", 0.5)
+    with pytest.raises(SystemExit) as ei:
+        L._refuse_intraday_basis_mismatch("optimize", _block(["LST", "OTHER"]))
+    msg = str(ei.value)
+    assert "LST: constant_factor" in msg and "'pending' review" in msg and "OTHER: constant_factor" in msg
+
+
+def test_launcher_prints_a_listed_symbol_that_no_longer_needs_its_entry(cache, tmp_path, monkeypatch, capsys):
+    import ba2test_launcher as L
+    _exclusion_file(tmp_path, monkeypatch, "Bastien")
+    _put(cache, "LST", 1.0)                                              # repaired since
+    block = _block(["LST"])
+    L._refuse_intraday_basis_mismatch("optimize", block)
+    assert "no longer needed" in capsys.readouterr().out and block["enabled_instruments"] == ["LST"]
+
+
+def test_both_launch_paths_run_the_basis_preflight_then_the_coverage_preflight():
+    import inspect
+    import ba2test_launcher as L
+    for fn, tag in ((L._cmd_optimize, "optimize"), (L._cmd_optimize_batch, "optimize-batch")):
+        src = inspect.getsource(fn)
+        i_basis = src.index(f'_refuse_intraday_basis_mismatch("{tag}"')
+        i_cov = src.index(f'_coverage_preflight("{tag}"')
+        assert i_basis < i_cov, tag
+
+
+
+# ------------------------------------------------------------------------------------------ fetch-cache (extend_ohlcv_cache)
+class _Stub:
+    """FMP provider with the network replaced; bound to the backend cache layer exactly as fetch-cache does."""
+
+    @staticmethod
+    def make(tail_factor):
+        from ba2_providers.ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
+        from app.services.ohlcv_cache_provider import wrap_with_cache
+        daily, intra = _pair()
+
+        class FMPOHLCVProvider_(FMPOHLCVProvider):
+            def _get_ohlcv_data_impl(self, symbol, start_date, end_date, interval="1d"):
+                df = daily if interval in ("1d", "daily") else intra.copy()
+                if interval not in ("1d", "daily"):
+                    late = df["Date"] >= "2023-12-20"
+                    for c in ("Open", "High", "Low", "Close"):
+                        df.loc[late, c] = df.loc[late, c] * tail_factor
+                lo, hi = pd.Timestamp(start_date), pd.Timestamp(end_date) + pd.Timedelta(days=1)
+                return df[(df["Date"] >= lo) & (df["Date"] < hi)].reset_index(drop=True).copy()
+
+            def _split_calendar(self, symbol, interval):
+                return []
+        FMPOHLCVProvider_.__name__ = PROV
+        return wrap_with_cache(FMPOHLCVProvider_(api_key="k"))
+
+
+def _legacy_file(cache, symbol):
+    daily, intra = _pair()
+    old = intra.copy()
+    early = old["Date"] < "2023-12-01"
+    for c in ("Open", "High", "Low", "Close"):
+        old.loc[early, c] = old.loc[early, c] * 1.325              # a LEGACY x1.325 segment, like T
+    head = old[old["Date"] < "2023-12-20"]
+    daily.assign(effective_date=daily["Date"]).to_parquet(cache / f"{symbol}_1d.parquet", index=False)
+    head.assign(effective_date=head["Date"]).to_parquet(cache / f"{symbol}_5min.parquet", index=False)
+    return str(cache / f"{symbol}_5min.parquet")
+
+
+def test_fetch_cache_extends_a_legacy_defective_file_with_a_correct_tail_and_refuses_a_wrong_one(cache):
+    path = _legacy_file(cache, "EXT1")
+    n0 = len(pd.read_parquet(path))
+    good = _Stub.make(1.0)
+    got = good.extend_ohlcv_cache("EXT1", datetime(2023, 1, 3), datetime(2023, 12, 29), "5min")
+    assert len(pd.read_parquet(path)) > n0 and got["Date"].max() >= pd.Timestamp("2023-12-28")      # accepted
+    path2 = _legacy_file(cache, "EXT2")
+    before = open(path2, "rb").read()
+    bad = _Stub.make(2.0)                                                                           # tail on another basis
+    with pytest.raises(IntradayBasisMismatch, match="incoming bars"):
+        bad.extend_ohlcv_cache("EXT2", datetime(2023, 1, 3), datetime(2023, 12, 29), "5min")
+    assert open(path2, "rb").read() == before

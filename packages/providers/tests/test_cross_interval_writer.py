@@ -247,3 +247,120 @@ def test_the_unfinished_bar_rule_still_holds_through_the_new_guard(sym, new_basi
     now_bar["Date"] = pd.Timestamp.now().floor("5min") + pd.Timedelta(minutes=5)     # a bar that has not ended
     out = now_bar.assign(effective_date=now_bar["Date"])
     assert native_cache.write_timeseries(PROV, sym, "5min", out) is False            # dropped, nothing written
+
+
+# --------------------------------------------------------------------------------------- review round
+def _legacy_defective(sym, new_basis, cut="2023-12-01"):
+    """A 5-minute file with a LEGACY x1.325 segment (like T) before ``cut`` and a daily file on the new basis."""
+    daily, intra = new_basis
+    _put(sym, "1d", daily)
+    old = intra.copy()
+    early = old["Date"] < pd.Timestamp(cut)
+    for c in ("Open", "High", "Low", "Close"):
+        old.loc[early, c] = old.loc[early, c] * 1.325
+    head = old[old["Date"] < pd.Timestamp("2023-12-20")]
+    path = _put(sym, "5min", head)
+    return path, intra[intra["Date"] >= pd.Timestamp("2023-12-20")]
+
+
+def test_M1_a_legacy_defective_file_can_be_extended_by_a_correct_tail(sym, new_basis):
+    daily, intra = new_basis
+    path, tail = _legacy_defective(sym, new_basis)
+    assert _verdict(sym).klass == cib.KLASS_FACTOR_CHANGES                      # the file IS defective
+    p = _P({"1d": daily, "5min": intra})
+    n0 = len(pd.read_parquet(path))
+    p._write_ohlcv_parquet(tail, PROV, sym, "5min")                             # accepted: only the tail is judged
+    assert len(pd.read_parquet(path)) == n0 + len(tail)
+
+
+def test_M1_a_tail_on_the_wrong_basis_is_still_refused(sym, new_basis):
+    daily, intra = new_basis
+    path, tail = _legacy_defective(sym, new_basis)
+    p = _P({"1d": daily, "5min": intra})
+    before = _digest(path)
+    with pytest.raises(IntradayBasisMismatch, match="incoming bars"):
+        p._write_ohlcv_parquet(_by_factor(tail, 2.0), PROV, sym, "5min")
+    assert _digest(path) == before
+    # ... and so is a SHORT wrong tail (3 sessions: below the whole-history verdict, caught by the tail check)
+    short = _by_factor(tail[tail["Date"] < pd.Timestamp("2023-12-26")], 0.4)
+    with pytest.raises(IntradayBasisMismatch):
+        p._write_ohlcv_parquet(short, PROV, sym, "5min")
+    assert _digest(path) == before
+
+
+def test_M2_a_marker_that_cannot_be_written_never_fails_a_successful_daily_replacement(sym, new_basis, monkeypatch):
+    import sys
+    M = sys.modules["ba2_common.core.interfaces.MarketDataProviderInterface"]
+    daily, intra = new_basis
+    d_path, i_path = _seed_old(sym, new_basis)
+    p = _P({"1d": daily, "5min": intra})
+    errors = []
+    monkeypatch.setattr(M.logger, "error", lambda msg, *a, **k: errors.append(str(msg)))
+
+    def boom(*a, **k):
+        raise PermissionError(13, "denied")
+    monkeypatch.setattr(split_basis, "write_intraday_stale", boom)
+
+    out = p.force_full_refetch(sym, "1d")                                       # returns normally: the daily IS replaced
+    assert len(out) == len(daily)
+    assert abs(float(pd.read_parquet(d_path)["Close"].iloc[-1]) - float(daily["Close"].iloc[-1])) < 1e-9
+    assert split_basis.read_intraday_stale(i_path) is None
+    assert any("could NOT be written" in e and "PermissionError" in e and "5min" in e and "daily history IS replaced" in e
+               for e in errors), errors
+    # the price check still refuses the (now contradicted) intraday file at read time
+    with pytest.raises(IntradayBasisMismatch):
+        p.get_ohlcv_data(sym, start_date=datetime(2023, 6, 1), end_date=datetime(2023, 6, 30), interval="5min")
+
+
+def test_M2_the_split_top_up_path_does_not_report_a_false_refusal(sym, new_basis, monkeypatch):
+    """``_verified_tail_topup`` turns ANY exception of ``force_full_refetch`` into 'top-up REFUSED, cache left
+    untouched' and memoises it: after a successful replacement that would be false."""
+    daily, intra = new_basis
+    _seed_old(sym, new_basis)
+    p = _P({"1d": daily, "5min": intra})
+    monkeypatch.setattr(split_basis, "write_intraday_stale", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    p.force_full_refetch(sym, "1d")          # would raise OSError before the fix
+    from ba2_common.core.interfaces.MarketDataProviderInterface import MarketDataProviderInterface as MDP
+    assert (PROV, sym.upper(), "1d") not in MDP._TOPUP_REFUSED
+
+
+def test_M3_the_vendor_serving_two_bases_writes_nothing_and_says_so(sym, new_basis):
+    daily, intra = new_basis
+    # the cache: daily current (new basis), intraday the old as-traded history (x2); the vendor serves the daily
+    # endpoint on the NEW basis and the intraday endpoint AS-TRADED (x2) for old dates: they disagree with each other
+    d_path = _put(sym, "1d", daily)
+    i_path = _put(sym, "5min", _by_factor(intra, 2.0))
+    vendor_intra = _by_factor(intra, 2.0)
+    p = _P({"1d": daily, "5min": vendor_intra})
+    before_i, before_d = _digest(i_path), _digest(d_path)
+    with pytest.raises(split_basis.IntradayVendorBasisConflict, match="vendor's intraday basis differs from its daily basis"):
+        p.force_full_refetch(sym, "5min")
+    assert _digest(i_path) == before_i and _digest(d_path) == before_d         # NOTHING written
+    assert split_basis.read_intraday_stale(i_path) is None                      # unmarked stays unmarked
+    # a MARKED file stays marked, byte for byte
+    split_basis.write_intraday_stale(i_path, reason="earlier marker")
+    with pytest.raises(split_basis.IntradayVendorBasisConflict):
+        p.force_full_refetch(sym, "5min")
+    assert split_basis.read_intraday_stale(i_path)["reason"] == "earlier marker" and _digest(i_path) == before_i
+
+
+def test_M6_a_marker_does_not_outlive_its_file(sym, new_basis):
+    daily, intra = new_basis
+    d_path, i_path = _seed_old(sym, new_basis)
+    p = _P({"1d": daily, "5min": intra})
+    p.force_full_refetch(sym, "1d")
+    assert split_basis.read_intraday_stale(i_path) is not None
+    import os
+    os.remove(i_path)                                                           # deleted for a cold refill
+    p._write_ohlcv_parquet(intra.head(78 * 12), PROV, sym, "5min")             # cold fill: must not raise IntradayBasisStale
+    assert os.path.exists(i_path) and split_basis.read_intraday_stale(i_path) is None
+
+
+def test_the_replacement_of_a_rebased_file_by_vendor_data_clears_its_provenance(sym, new_basis):
+    daily, intra = new_basis
+    _put(sym, "1d", daily)
+    i_path = _put(sym, "5min", intra)
+    split_basis.write_intraday_rebase(i_path, {"kind": "rebased_by_tool", "segments": []})
+    p = _P({"1d": daily, "5min": intra})
+    p.force_full_refetch(sym, "5min")
+    assert split_basis.read_intraday_rebase(i_path) is None

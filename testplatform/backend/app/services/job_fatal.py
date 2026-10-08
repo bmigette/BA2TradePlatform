@@ -32,7 +32,7 @@ JOB_FATAL_ERROR_TYPES = frozenset({
     "AnalysisFailureRefusal", "StaleAnchorPrice", "StaleMarkToMarket", "ComboSettlementRefused",
     "FillRebaseRefusal", "FillRebaseDisabled",
     "ScreenerUniverseRefusal",
-    "IntradayBasisMismatch", "IntradayBasisStale",
+    "IntradayBasisMismatch", "IntradayBasisStale", "IntradayVendorBasisConflict",
     "ScreenerGenomeOutOfRange", "ScreenerDataOutage", "PanelCoverageError", "ScreenerGateRefusal",
 })
 

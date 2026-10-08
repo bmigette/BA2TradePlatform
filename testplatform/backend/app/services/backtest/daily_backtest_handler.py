@@ -975,7 +975,7 @@ def run_daily_backtest(
         # IntradayBasisMismatch / IntradayBasisStale (job-fatal) before the first bar is loaded. Once per
         # process per (universe, window): see intraday_basis_preflight.
         from app.services.backtest.intraday_basis_preflight import require_for_config
-        basis_report = require_for_config(config)
+        basis_report = require_for_config(config, provider=type(raw_ohlcv).__name__)
         ps.preload(
             config["enabled_instruments"],
             config["start_date"],

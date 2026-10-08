@@ -5570,20 +5570,46 @@ def _refuse_intraday_basis_mismatch(command: str, backtest_block: dict) -> None:
     different price level than its daily cache (``intraday_basis_preflight``; the same check re-runs at job
     start on every worker, where it is job-fatal). Applies to an intraday-clock job and to an options job
     (whose drawdown refinement reads 5-minute bars); a daily-clock equity job reads no intraday bar and is
-    untouched. Called AFTER the final universe is known (--screener, --exclude-symbols). Prints the
-    verdict counts and every symbol that could NOT be judged; REFUSES (exit) with the list of
-    (symbol, factor, class) otherwise. There is no flag that skips it: ``--exclude-symbols`` is the
-    recorded way to run without a symbol."""
+    untouched. Called AFTER the final universe is known (--screener, --exclude-symbols).
+
+    Prints the verdict counts and every symbol that could NOT be judged, is on REBASED prices, or (options job)
+    has no intraday bars to refine on. A mismatched symbol on the REVIEWED exclusion list
+    (``ba2_providers/ohlcv/intraday_basis_exclusions.json``; ``reviewed_by`` starting with "pending" is not in
+    force) is REMOVED from the universe with a printed line and recorded on the run
+    (``excluded_instruments`` + ``intraday_basis_exclusions``); any other mismatched symbol REFUSES the launch
+    with (symbol, factor, class). There is no flag that skips the check."""
     from app.services.backtest import intraday_basis_preflight as pf
     from ba2_common.core.split_basis import IntradayBasisError
+    from ba2_providers.ohlcv import intraday_exclusions as _ix
     interval = pf.interval_to_check(backtest_block)
     if interval is None:
         return
     import os as _os
+    from ba2_providers.ohlcv import cross_interval_basis as _cib
     n = len(backtest_block["enabled_instruments"])
     print(f"{command}: intraday/daily basis preflight over {n} symbols ({interval}) ...", flush=True)
+    workers = max(1, min(8, (_os.cpu_count() or 2) - 1))
+    lo, hi = _cib.judged_window(backtest_block["start_date"], backtest_block["end_date"], int(backtest_block["warmup_days"]))
+    first = pf.scan(backtest_block["enabled_instruments"], interval, lo, hi, workers=workers,
+                    job_kind=pf.job_kind_of(backtest_block))
+    force = _ix.in_force(_ix.load_exclusions())
+    bad = {r.symbol for r in first.mismatched} | {s for s, _ in first.stale}
+    listed = sorted(s for s in bad if s in force)
+    if listed:
+        applied = [{"symbol": s, "reason": force[s]["reason"], "added": force[s]["added"],
+                    "reviewed_by": force[s]["reviewed_by"], "interval": interval} for s in listed]
+        print(f"{command}: EXCLUDING {len(listed)} symbols on the reviewed intraday-basis exclusion list from the universe: "
+              + "; ".join(f"{e['symbol']} ({e['reason'][:70]}, {e['added']}, reviewed by {e['reviewed_by']})" for e in applied),
+              flush=True)
+        _apply_exclude_symbols(command, backtest_block,
+                               list(backtest_block.get("excluded_instruments") or []) + [s for s in listed])
+        backtest_block["intraday_basis_exclusions"] = applied
+    unneeded = sorted(s for s in force if s in {x.upper() for x in backtest_block["enabled_instruments"]} and s not in bad)
+    if unneeded:
+        print(f"{command}: NOTE exclusion-list entries no longer needed (the symbol passes the check now): "
+              f"{', '.join(unneeded)} -- ask for the entries to be removed", flush=True)
     try:
-        rep = pf.require_for_config(backtest_block, workers=max(1, min(8, (_os.cpu_count() or 2) - 1)))
+        rep = pf.require_for_config(backtest_block, workers=workers)
     except IntradayBasisError as e:
         sys.exit(f"{command}: REFUSED -- {e}")
     print(f"{command}: intraday basis preflight OK: "
@@ -5592,6 +5618,19 @@ def _refuse_intraday_basis_mismatch(command: str, backtest_block: dict) -> None:
         print(f"{command}: WARNING {len(rep.unjudged)} symbol(s) could not be judged (not refused, NOT ok): "
               + ", ".join(f"{r.symbol}[{r.klass}]" for r in rep.unjudged[:40])
               + (" ..." if len(rep.unjudged) > 40 else ""), flush=True)
+    if rep.rebased:
+        print(f"{command}: {len(rep.rebased)} universe symbol(s) run on REBASED intraday prices (provenance in "
+              f"_split_basis/*.intraday-rebase.json; recorded in the job result); volume NOT adjusted for: "
+              f"{', '.join(r['symbol'] for r in rep.rebased if r.get('volume_unadjusted')) or 'none'}", flush=True)
+    if rep.bursts:
+        print(f"{command}: {len(rep.bursts)} judged-ok symbol(s) carry >= 3 sessions more than 10% off the daily close "
+              f"inside this window (short bursts, not refused, recorded in the result): "
+              + ", ".join(f"{s}({k})" for s, k in rep.bursts[:25]) + (" ..." if len(rep.bursts) > 25 else ""), flush=True)
+    if rep.option_uncovered:
+        sess = sum(r.daily_sessions if r.klass == "no_intraday" else r.no_intraday_sessions for r in rep.option_uncovered)
+        print(f"{command}: WARNING OPTIONS job: {len(rep.option_uncovered)} underlying(s) have no / too thin {interval} bars, so the "
+              f"intraday drawdown refinement SKIPS them ({sess} daily sessions without an intraday bar; recorded in the "
+              f"result): " + ", ".join(f"{r.symbol}[{r.klass}]" for r in rep.option_uncovered[:30]), flush=True)
 
 
 def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: str = "") -> dict:
@@ -7200,6 +7239,7 @@ def _cmd_optimize(args) -> int:
         # Cross-interval basis: refuse a universe with a symbol whose 5-minute cache is on another price
         # level than its daily cache (decision price from one, history from the other).
         _refuse_intraday_basis_mismatch("optimize", backtest_block)
+        universe = list(backtest_block["enabled_instruments"])      # the reviewed exclusion list may have removed some
         # the FINAL universe's intraday coverage (threshold + report); the price-basis cross-check is the shared function of
         # fix/ohlcv-cross-interval-basis, not duplicated here
         _coverage_preflight("optimize", list(backtest_block["enabled_instruments"]), args)
@@ -7504,6 +7544,7 @@ def _cmd_optimize_batch(args) -> int:
                 "optimize-batch", backtest_block,
                 _resolve_exclude_symbols_arg(getattr(args, "exclude_symbols", None)))
             _refuse_intraday_basis_mismatch("optimize-batch", backtest_block)
+            _coverage_preflight("optimize-batch", list(backtest_block["enabled_instruments"]), args)
             # Market-condition gates (no-op with the profile off) — see _cmd_optimize for why this
             # sits after every block that can still rewrite enabled_instruments.
             _apply_market_conditions("optimize-batch", backtest_block, strat, strat_kind)

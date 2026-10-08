@@ -130,3 +130,42 @@ def test_basis_symbols_restricts_the_set(cache, tmp_path, monkeypatch, capsys):
     _put(cache, "BAD", 0.5)
     assert _run(monkeypatch, tmp_path, "--basis-symbols", "AAA") == 0
     assert _run(monkeypatch, tmp_path, "--basis-symbols", "AAA,BAD") == 1
+
+
+
+# ------------------------------------------------------------------------------------------ review round
+def _list(tmp_path, monkeypatch, reviewed_by, symbol="DD"):
+    from ba2_providers.ohlcv import intraday_exclusions as ix
+    f = tmp_path / "ex.json"
+    f.write_text(__import__("json").dumps({"entries": [{"symbol": symbol, "reason": "vendor serves two bases",
+                                                         "added": "2026-10-08", "reviewed_by": reviewed_by}]}))
+    monkeypatch.setattr(ix, "EXCLUSIONS_PATH", str(f))
+
+
+def test_a_reviewed_exclusion_is_reported_not_a_failure(cache, tmp_path, monkeypatch, capsys):
+    _put(cache, "DD", 1 / 3)
+    _list(tmp_path, monkeypatch, "Bastien")
+    assert _run(monkeypatch, tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "REVIEWED exclusion list" in out and "DD" in out and "ALL CHECKS PASSED" in out
+
+
+def test_a_pending_exclusion_is_not_in_force_and_still_fails(cache, tmp_path, monkeypatch, capsys):
+    _put(cache, "DD", 1 / 3)
+    _list(tmp_path, monkeypatch, "pending owner review")
+    assert _run(monkeypatch, tmp_path) == 1
+    out = capsys.readouterr().out
+    assert "'pending' review" in out and "MISMATCH DD" in out
+
+
+def test_rebased_files_and_markers_with_their_age_are_listed(cache, tmp_path, monkeypatch, capsys):
+    from ba2_common.core import split_basis
+    _put(cache, "AAA")
+    _put(cache, "BBB")
+    split_basis.write_intraday_rebase(str(cache / "AAA_5min.parquet"), {"applied_utc": "2026-10-08", "source": "mixed",
+                                                                       "segments": [{"volume_unadjusted": True}]})
+    split_basis.write_intraday_stale(str(cache / "BBB_5min.parquet"), reason="daily replaced")
+    assert _run(monkeypatch, tmp_path) == 1                     # the stale marker still fails
+    out = capsys.readouterr().out
+    assert "1 intraday file(s) were REBASED" in out and "AAA_5min" in out and "volume unadjusted for 1" in out
+    assert "STALE marker" in out and "BBB_5min" in out and "age " in out and "pushed to workers by cache_sync" in out

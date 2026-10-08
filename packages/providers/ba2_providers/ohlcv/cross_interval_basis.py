@@ -69,7 +69,7 @@ __all__ = [
     "KLASS_INSUFFICIENT", "KLASS_NO_INTRADAY", "KLASS_NO_DAILY",
     "MISMATCH_KLASSES", "UNJUDGED_KLASSES",
     "SESSION_TOL", "BASIS_TOL", "MIN_OFF_RUN", "LEVEL_TIERS", "NOISY_MAD", "TAIL_SESSIONS", "FAR_TOL",
-    "SEGMENT_MAD_TOL", "MIN_COMMON_SESSIONS",
+    "SEGMENT_MAD_TOL", "MIN_COMMON_SESSIONS", "BURST_LEVEL", "BURST_MIN_SESSIONS", "MIN_JUDGED_DAYS", "judged_window",
     "MIN_SEGMENT_SESSIONS", "SEGMENT_JUMP", "ALGORITHM_VERSION",
     "SessionTable", "BasisResult", "Segment", "interval_minutes", "reduce_sessions", "WHOLE_HISTORY",
     "classify", "BasisStore", "default_store", "store_for", "ohlcv_cache_dir", "symbol_files",
@@ -138,6 +138,19 @@ FAR_TOL = 0.10
 #: smaller re-adjustments are the stale marker's job. Measured: over a healthy symbol's whole history its
 #: worst |rolling 5-session median of x| is <= 0.08 for 99% of the ok symbols.
 TAIL_SESSIONS = 5
+#: BURSTS. A short break at ONE clean, large level is a basis break too (a few sessions around a split's ex-date
+#: where one file is adjusted and the other not): >= BURST_MIN_SESSIONS consecutive sessions with
+#: |x| >= BURST_LEVEL (about 22% off) whose own MAD is at most SEGMENT_MAD_TOL. Measured on the real cache (see
+#: the commit message) before it was added: TRVG 7 sessions at x0.20 (2023-11), AXIA 5 at 1.23, MGR 6 at 0.34,
+#: FGN 6 at 0.31-0.37, TCPA 6 at 0.26 were all classified ok.
+BURST_LEVEL = 0.20
+BURST_MIN_SESSIONS = 3
+BURST_GAP = 3            # members may be up to BURST_GAP - 1 = 2 ordinary sessions apart
+BURST_CORROBORATION = 0.15   # median |ln(high ratio) - ln(close ratio)| and the same for low, to call a burst a BASIS
+BURST_MAD_TOL = 0.08     # one level to within ~8%: wider than SEGMENT_MAD_TOL because the window is a handful of sessions
+#: The read guard (and the preflight, which must judge everything the engine will read) looks at least this many
+#: calendar days before the end of the requested window, so a short live lookback still has enough sessions.
+MIN_JUDGED_DAYS = 90
 #: fewer comparable sessions than this CANNOT be judged (reported ``insufficient``).
 MIN_COMMON_SESSIONS = 10
 #: a level must hold for at least this many consecutive sessions to be a segment (shorter runs are
@@ -168,6 +181,7 @@ def interval_minutes(interval: str) -> int:
 # --------------------------------------------------------------------------------------------------
 # The calendar: close minute (New York wall clock) of every regular session, half days included.
 # --------------------------------------------------------------------------------------------------
+_CAL_FIRST, _CAL_LAST = date(2005, 1, 3), date(2030, 12, 31)
 _CAL_LOCK = threading.Lock()
 _CAL: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
@@ -179,7 +193,7 @@ def _calendar() -> Tuple[np.ndarray, np.ndarray]:
     with _CAL_LOCK:
         if _CAL is None:
             from ba2_common.core.market_calendar import NY_TZ, nyse_regular_sessions
-            sessions = nyse_regular_sessions(date(2005, 1, 3), date(2030, 12, 31))
+            sessions = nyse_regular_sessions(_CAL_FIRST, _CAL_LAST)
             days, closes = [], []
             for _open, close_utc in sessions:
                 local = close_utc.astimezone(NY_TZ)
@@ -192,6 +206,11 @@ def _calendar() -> Tuple[np.ndarray, np.ndarray]:
 # --------------------------------------------------------------------------------------------------
 # Reduction: two frames -> one row per DAILY session
 # --------------------------------------------------------------------------------------------------
+class CalendarRangeExceeded(RuntimeError):
+    """An intraday session lies outside the NYSE calendar table (``_CAL_FIRST``..``_CAL_LAST``): whether it
+    is complete cannot be stated, and the answer is never a silent 'not complete'."""
+
+
 @dataclass
 class SessionTable:
     """One row per daily session: the comparison of that session across the two intervals.
@@ -304,6 +323,11 @@ def reduce_sessions(daily: Optional[pd.DataFrame], intraday: Optional[pd.DataFra
             for a in (close_ratio, high_ratio, low_ratio):
                 a[~np.isfinite(a) | (a <= 0)] = np.nan
             cal_days, cal_close = _calendar()
+            if s_day[-1] > cal_days[-1] or s_day[0] < cal_days[0]:
+                raise CalendarRangeExceeded(
+                    f"intraday sessions {s_day[0]}..{s_day[-1]} lie outside the NYSE calendar table "
+                    f"{cal_days[0]}..{cal_days[-1]} (_CAL_FIRST/_CAL_LAST): whether they are complete cannot be "
+                    f"stated; extend the table")
             cpos = np.searchsorted(cal_days, dday)
             cpos_c = np.minimum(cpos, len(cal_days) - 1)
             in_cal = (cpos < len(cal_days)) & (cal_days[cpos_c] == dday)
@@ -327,6 +351,12 @@ class Segment:
     last_day: str
     sessions: int
     factor: float           # intraday / daily over the segment (median close ratio)
+    mad: float = 0.0        # median absolute deviation of ln(ratio) inside the segment (its cleanliness)
+    #: "level": a stretch at one level of the close ratio; "burst_basis": a short break whose session HIGH and
+    #: LOW ratios sit at the same level as the close (the whole session is on another basis: rebasable);
+    #: "burst_prints": the close/low are off but the session high is at the daily level (single bad bars: NOT a
+    #: basis, cannot be rebased, only refetched or excluded).
+    kind: str = "level"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -464,6 +494,45 @@ def _iso(d: Any) -> str:
     return str(np.datetime64(d, "D"))
 
 
+def _bursts(days: np.ndarray, x: np.ndarray, hr: np.ndarray, lr: np.ndarray) -> List["Segment"]:
+    """Short but unmistakable basis breaks: clusters of >= BURST_MIN_SESSIONS sessions with |x| >= BURST_LEVEL,
+    the same sign, no more than ``BURST_GAP - 1`` ordinary sessions between two members, one level (the members'
+    own MAD <= BURST_MAD_TOL). The in-between allowance is real data: FGN (2026-03-06 .. 03-16) and TCPA
+    (2026-03-02 .. 03-13) alternate a wrong-basis session with a normal one."""
+    idx = np.flatnonzero(np.abs(x) >= BURST_LEVEL)
+    if len(idx) < BURST_MIN_SESSIONS:
+        return []
+    out = []
+    start = 0
+    for k in range(1, len(idx) + 1):
+        if k == len(idx) or idx[k] - idx[k - 1] > BURST_GAP:
+            members = idx[start:k]
+            start = k
+            if len(members) < BURST_MIN_SESSIONS:
+                continue
+            vals = x[members]
+            if (vals > 0).any() and (vals < 0).any():
+                continue
+            if _mad(vals) > BURST_MAD_TOL:
+                continue
+            with np.errstate(invalid="ignore", divide="ignore"):
+                dh = np.abs(np.log(hr[members]) - vals)
+                dl = np.abs(np.log(lr[members]) - vals)
+            both = np.nanmedian(dh) <= BURST_CORROBORATION and np.nanmedian(dl) <= BURST_CORROBORATION
+            out.append(Segment(_iso(days[members[0]]), _iso(days[members[-1]]), int(members[-1] - members[0] + 1),
+                               float(np.exp(np.median(vals))), _mad(vals),
+                               "burst_basis" if both else "burst_prints"))
+    return out
+
+
+def _burst_reason(bursts: List["Segment"]) -> str:
+    n_basis = sum(1 for b in bursts if b.kind == "burst_basis")
+    n_prints = len(bursts) - n_basis
+    return (f"{len(bursts)} burst(s) of >= {BURST_MIN_SESSIONS} sessions beyond x{np.exp(BURST_LEVEL):.2f}: "
+            f"{n_basis} on another basis (session high and low at the same level), {n_prints} single bad bars "
+            f"(session high at the daily level: not a basis, not rebasable)")
+
+
 def _min_run(level: float) -> int:
     """Sessions a displaced level of size ``level`` (|ln f|) must last to count (``LEVEL_TIERS``)."""
     for at_least, sessions in LEVEL_TIERS:
@@ -537,15 +606,21 @@ def classify(table: SessionTable, symbol: str, start: Any, end: Any) -> BasisRes
     displaced = np.abs(level) > BASIS_TOL
     if _longest_run(displaced) < MIN_OFF_RUN:
         spread = _mad(x)
-        if spread > NOISY_MAD:
+        bursts = _bursts(days, x, hr, lr)
+        if bursts:
+            res.klass = KLASS_FACTOR_CHANGES
+            res.segments = bursts
+            res.factor = bursts[-1].factor
+            res.reason = _burst_reason(bursts)
+        elif spread > NOISY_MAD:
             res.klass = KLASS_NOISY
             res.reason = f"median level at 1 but scatter MAD {spread:.3f} > {NOISY_MAD}"
         else:
             res.klass = KLASS_OK
         return res
     segs = _segments(x, level)
-    res.segments = [Segment(_iso(days[lo_i]), _iso(days[hi_i - 1]), int(hi_i - lo_i), float(np.exp(med)))
-                    for lo_i, hi_i, med in segs]
+    res.segments = [Segment(_iso(days[lo_i]), _iso(days[hi_i - 1]), int(hi_i - lo_i), float(np.exp(med)),
+                            _mad(x[lo_i:hi_i])) for lo_i, hi_i, med in segs]
     clean_off = [sg for sg, (lo_i, hi_i, _med) in zip(res.segments, segs)
                  if abs(np.log(sg.factor)) > BASIS_TOL
                  and sg.sessions >= _min_run(abs(np.log(sg.factor)))
@@ -565,10 +640,26 @@ def classify(table: SessionTable, symbol: str, start: Any, end: Any) -> BasisRes
         res.reason = (f"the level is displaced by up to x{np.exp(far):.3g} for a stretch but never settles on "
                       f"one level (scatter MAD > {SEGMENT_MAD_TOL} within every run): not one instrument's prices")
         return res
+    bursts = _bursts(days, x, hr, lr)
+    if bursts:
+        res.klass = KLASS_FACTOR_CHANGES
+        res.segments = bursts
+        res.factor = bursts[-1].factor
+        res.reason = _burst_reason(bursts)
+        return res
     # Stretches of scatter below FAR_TOL around a median of 1: a thin name's closing auction, not a basis.
     res.klass = KLASS_OK
     res.reason = f"scatter stretches up to {np.exp(far) - 1:.1%} off, no consistent level"
     return res
+
+
+def judged_window(start: Any, end: Any, warmup_days: int = 0) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    """The window a launch preflight must judge so that nothing the engine will read lies outside it: from
+    ``start - warmup_days`` (what the engine preloads), and at least ``MIN_JUDGED_DAYS`` before ``end`` (what the
+    provider's read guard looks at), to ``end``."""
+    hi = pd.Timestamp(end)
+    lo = min(pd.Timestamp(start) - pd.Timedelta(days=int(warmup_days)), hi - pd.Timedelta(days=MIN_JUDGED_DAYS))
+    return lo, hi
 
 
 # --------------------------------------------------------------------------------------------------
@@ -714,6 +805,20 @@ def _tail_problem(table: SessionTable, symbol: str) -> Optional[BasisResult]:
 MEM_TABLES_MAX = 256
 
 
+def alias_paths(symbol: str, interval: str, folder: Optional[str] = None) -> List[str]:
+    """EVERY existing parquet of the intraday interval under any alias spelling, in the order the readers
+    resolve them (the first wins: ``native_cache.find_timeseries_path``)."""
+    folder = folder or ohlcv_cache_dir()
+    from ba2_common.core.native_cache import _INTERVAL_ALIASES, normalize_interval
+    canon = normalize_interval(interval)
+    out = []
+    for sp in _INTERVAL_ALIASES.get(canon, [canon]):
+        p = os.path.join(folder, f"{symbol.upper()}_{sp}.parquet")
+        if os.path.exists(p):
+            out.append(p)
+    return out
+
+
 class BasisStore:
     """Per-process access to the per-symbol session tables of ONE provider's cache folder, with the memo
     layers:
@@ -779,21 +884,45 @@ class BasisStore:
         """Judge the files ON DISK over ``[start, end]`` (inclusive days)."""
         t, why = self.table(symbol, interval)
         if t is None:
-            return BasisResult(symbol=symbol, klass=why, window_start=str(pd.Timestamp(start).date()),
-                               window_end=str(pd.Timestamp(end).date()),
-                               reason=("no daily file" if why == KLASS_NO_DAILY else "no intraday file"))
-        return classify(t, symbol, start, end)
+            res = BasisResult(symbol=symbol, klass=why, window_start=str(pd.Timestamp(start).date()),
+                              window_end=str(pd.Timestamp(end).date()),
+                              reason=("no daily file" if why == KLASS_NO_DAILY else "no intraday file"))
+            if why == KLASS_NO_INTRADAY:
+                # the daily sessions that have no intraday bar because there is no intraday file at all
+                daily_p, _ = symbol_files(symbol, interval, self.folder)
+                try:
+                    d = _daily_wall(pd.read_parquet(daily_p, columns=["Date"])["Date"]).dt.normalize()
+                    res.daily_sessions = int(((d >= pd.Timestamp(start)) & (d <= pd.Timestamp(end))).sum())
+                    res.no_intraday_sessions = res.daily_sessions
+                except (OSError, ValueError, KeyError):
+                    pass
+            return res
+        res = classify(t, symbol, start, end)
+        if res.klass in (KLASS_NO_INTRADAY, KLASS_INSUFFICIENT):
+            paths = alias_paths(symbol, interval, self.folder)
+            if len(paths) > 1:
+                # the reader takes the FIRST spelling (canonical short form): a stub there hides the real file
+                res.reason += (f"; NOTE {os.path.basename(paths[0])} shadows "
+                               f"{', '.join(os.path.basename(q) for q in paths[1:])}: readers (the engine "
+                               f"included) open the first spelling only")
+        return res
 
     def check_frame(self, symbol: str, interval: str, frame: pd.DataFrame,
-                    start: Any = None, end: Any = None) -> BasisResult:
-        """Judge an intraday FRAME (about to be written) against the daily file on disk. Not memoised
-        (the frame is new data); ``start``/``end`` default to the frame's own range."""
-        daily_p, _ = symbol_files(symbol, interval, self.folder)
-        if daily_p is None:
-            return BasisResult(symbol=symbol, klass=KLASS_NO_DAILY, reason="no daily file")
+                    start: Any = None, end: Any = None, daily_frame: Optional[pd.DataFrame] = None) -> BasisResult:
+        """Judge an intraday FRAME (the INCOMING rows of a write, or a vendor replacement) against the daily
+        file on disk, or against ``daily_frame`` when given. Not memoised (the frame is new data);
+        ``start``/``end`` default to the frame's own range."""
+        if daily_frame is not None:
+            daily = daily_frame[["Date", "High", "Low", "Close"]]
+        else:
+            daily_p, _ = symbol_files(symbol, interval, self.folder)
+            if daily_p is None:
+                return BasisResult(symbol=symbol, klass=KLASS_NO_DAILY, reason="no daily file")
+            daily = None
         if frame is None or len(frame) == 0:
             return BasisResult(symbol=symbol, klass=KLASS_NO_INTRADAY, reason="empty frame")
-        daily = pd.read_parquet(daily_p, columns=["Date", "High", "Low", "Close"])
+        if daily is None:
+            daily = pd.read_parquet(daily_p, columns=["Date", "High", "Low", "Close"])
         t = reduce_sessions(daily, frame[["Date", "High", "Low", "Close"]], interval)
         lo = start if start is not None else t.intraday_first
         hi = end if end is not None else t.intraday_last

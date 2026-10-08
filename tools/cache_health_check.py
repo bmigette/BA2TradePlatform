@@ -1236,7 +1236,7 @@ def check_cross_interval_basis(start: str, end: str, interval: str = "5min", sym
     files carrying a stale marker. Returns ``(ok, results)``; ``ok`` is False when any symbol is
     mismatched (constant_factor / factor_changes / noisy) or any intraday file is marked stale."""
     import csv
-    from ba2_common.core.split_basis import MARKER_DIRNAME
+    from ba2_common.core import split_basis
     from ba2_providers.ohlcv import cross_interval_basis as cib
 
     folder = cib.ohlcv_cache_dir(provider)
@@ -1257,12 +1257,31 @@ def check_cross_interval_basis(start: str, end: str, interval: str = "5min", sym
           + ", ".join(f"{k}={classes.get(k, 0)}" for k in
                       (cib.KLASS_OK, cib.KLASS_CONSTANT_FACTOR, cib.KLASS_FACTOR_CHANGES, cib.KLASS_NOISY,
                        cib.KLASS_INSUFFICIENT, cib.KLASS_NO_INTRADAY, cib.KLASS_NO_DAILY)))
-    bad = [r for r in results if r.mismatched]
+    from ba2_providers.ohlcv import intraday_exclusions as ix
+    listed = ix.load_exclusions()
+    force, pend = ix.in_force(listed), ix.pending(listed)
+    states = split_basis.list_intraday_states(folder)
+    rebased_names = {r["file"].rsplit("_", 1)[0] for r in states["rebased"]}
+    mism = [r for r in results if r.mismatched]
+    excluded = [r for r in mism if r.symbol in force]
+    bad = [r for r in mism if r.symbol not in force]          # the failures: UNLISTED (or only 'pending') mismatches
     for r in bad[:list_limit]:
         extra = f"  boundaries {','.join(r.boundaries)}" if r.boundaries else ""
-        print(f"    MISMATCH {r.describe()}{extra}")
+        tag = (" [rebased file: still mismatched]" if r.symbol in rebased_names else
+               " [on the exclusion list but 'pending' review: not in force]" if r.symbol in pend else "")
+        print(f"    MISMATCH {r.describe()}{extra}{tag}")
     if len(bad) > list_limit:
         print(f"    ... +{len(bad) - list_limit} more (use --basis-csv for the full table)")
+    if excluded:
+        print(f"  {len(excluded)} mismatched symbol(s) are on the REVIEWED exclusion list (reported, not failures; "
+              f"removed from jobs at launch): " + ", ".join(r.symbol for r in excluded[:20]))
+    if pend:
+        print(f"  {len(pend)} exclusion-list entr(ies) are 'pending' review and NOT in force: {', '.join(sorted(pend))}")
+    if states["rebased"]:
+        print(f"  {len(states['rebased'])} intraday file(s) were REBASED by tools/repair_intraday_basis.py (reported, not "
+              f"failures; provenance in _split_basis/*.intraday-rebase.json; volume unadjusted for "
+              f"{sum(1 for x in states['rebased'] if x['volume_unadjusted'])}): "
+              + ", ".join(x["file"] for x in states["rebased"][:20]) + (" ..." if len(states["rebased"]) > 20 else ""))
     unjudged = [r for r in results if r.unjudged]
     if unjudged:
         print(f"  {len(unjudged)} symbol(s) could NOT be judged (reported, not ok): "
@@ -1273,12 +1292,14 @@ def check_cross_interval_basis(start: str, end: str, interval: str = "5min", sym
               f"{cib.FAR_TOL:.0%} off the daily close (short bursts around a split / re-adjustment; not a "
               f"lasting level, so NOT refused -- see far_sessions in --basis-csv): "
               + ", ".join(f"{r.symbol}({r.far_sessions})" for r in bursts[:12]) + (" ..." if len(bursts) > 12 else ""))
-    marker_dir = os.path.join(folder, MARKER_DIRNAME)
-    stale = sorted(n[:-len(".intraday-stale.json")] for n in os.listdir(marker_dir)
-                   if n.endswith(".intraday-stale.json")) if os.path.isdir(marker_dir) else []
-    if stale:
-        print(f"  {len(stale)} intraday file(s) carry a STALE marker (daily rewritten, intraday not "
-              f"refetched): {', '.join(stale[:15])}{' ...' if len(stale) > 15 else ''}")
+    stale = [m for m in states["stale"] if m["file"].rsplit("_", 1)[0] not in force]
+    if states["stale"]:
+        print(f"  {len(states['stale'])} intraday file(s) carry a STALE marker (daily rewritten, intraday not "
+              f"refetched); every one with its age (tools/repair_intraday_basis.py markers --list/--clear):")
+        for m in states["stale"]:
+            print(f"    {m['file']:<22} age {m['age_days']} d   {str(m['reason'])[:110]}")
+        print("    NOTE: markers live inside the cache tree and are pushed to workers by cache_sync; one cleared on the "
+              "master lingers on a worker until that worker's next push/prune.")
     if csv_path:
         rows = _basis_csv_rows(results)
         os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
@@ -1288,7 +1309,7 @@ def check_cross_interval_basis(start: str, end: str, interval: str = "5min", sym
             w.writerows(rows)
         print(f"  full table -> {csv_path}")
     ok = not bad and not stale
-    print("  basis: OK" if ok else f"  basis: {len(bad)} mismatched symbol(s), {len(stale)} stale marker(s)")
+    print("  basis: OK" if ok else f"  basis: {len(bad)} UNLISTED mismatched symbol(s), {len(stale)} stale marker(s)")
     return ok, results
 
 

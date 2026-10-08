@@ -318,11 +318,19 @@ def write_timeseries(provider: str, symbol: str, interval: str, df, *,
     if intraday and not replace_stale:
         from ba2_common.core import split_basis
         stale = split_basis.read_intraday_stale(path)
+        if stale is not None and not os.path.exists(path):
+            # A marker describes a FILE. The file is gone (deleted for a cold refill): the marker outlived
+            # it and would refuse the very write that replaces it.
+            split_basis.clear_intraday_stale(path)
+            split_basis.clear_intraday_rebase(path)
+            logger.info(f"{provider} {symbol} ({interval}): stale marker removed, its file no longer exists")
+            stale = None
         if stale is not None:
             raise split_basis.IntradayBasisStale(
                 f"{provider} {symbol} ({interval}): write REFUSED, the file is marked stale -- "
                 f"{stale.get('reason')} (marked {stale.get('marked_at_utc')}). Replace it on the "
-                f"vendor's current basis first: force_full_refetch('{symbol}', '{interval}').")
+                f"vendor's current basis first: force_full_refetch('{symbol}', '{interval}')."
+                + split_basis.OPERATOR_HINT)
     with _lock_for(path):
         tmp = path + ".tmp"
         df.to_parquet(tmp, index=False)
@@ -330,6 +338,8 @@ def write_timeseries(provider: str, symbol: str, interval: str, df, *,
         if intraday and replace_stale:
             from ba2_common.core import split_basis
             split_basis.clear_intraday_stale(path)
+            # a full replacement is vendor data again: a rebase sidecar described the file it replaced
+            split_basis.clear_intraday_rebase(path)
     return True
 
 

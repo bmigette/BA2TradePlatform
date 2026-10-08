@@ -92,7 +92,8 @@ class OHLCVCacheMixin:
         """Read a cache file by suffix (Parquet preferred; legacy CSV still supported)."""
         return pd.read_csv(path) if path.suffix == ".csv" else pd.read_parquet(path)
 
-    def _write_cache_df(self, df: pd.DataFrame, symbol: str, interval: str) -> Path:
+    def _write_cache_df(self, df: pd.DataFrame, symbol: str, interval: str,
+                        incoming: Optional[pd.DataFrame] = None) -> Path:
         """Write ``df`` to the canonical native Parquet cache and remove any legacy CSV sibling.
 
         UNIFIED CACHE: delegates to ``native_cache.write_timeseries`` — the SAME atomic
@@ -104,13 +105,13 @@ class OHLCVCacheMixin:
         out = df.copy()
         out["Date"] = pd.to_datetime(out["Date"])
         out["effective_date"] = out["Date"]
-        if not OHLCVCacheMixin._is_daily_interval(interval):
-            # CROSS-INTERVAL BASIS: a head/tail/gap extension of an intraday file fetched on the
-            # vendor's CURRENT basis must not be merged into a file (or beside a daily cache) on
-            # another one. Raises IntradayBasisMismatch; a stale-marked file refuses in write_timeseries.
+        if not OHLCVCacheMixin._is_daily_interval(interval) and incoming is not None and len(incoming):
+            # CROSS-INTERVAL BASIS: only the rows FETCHED now (head/tail/gap pieces, a cold fill) are judged,
+            # never the file already on disk: a legacy-defective file must stay extendable by a correct tail.
+            # Raises IntradayBasisMismatch; a stale-marked file refuses in write_timeseries.
             guard = getattr(self, "_guard_intraday_write", None)
             if guard is not None:
-                guard(out, symbol, interval, type(self).__name__)
+                guard(incoming, symbol, interval, type(self).__name__)
         native_cache.write_timeseries(type(self).__name__, symbol, interval, out)
         path = self._get_cache_file(symbol, interval)
         legacy = path.with_suffix(".csv")
@@ -185,7 +186,7 @@ class OHLCVCacheMixin:
             new_data = self._get_ohlcv_data_impl(symbol, start_date, end_date, interval)
             if not new_data.empty:
                 new_data['Date'] = pd.to_datetime(new_data['Date']).dt.tz_localize(None)
-                cache_file = self._write_cache_df(new_data, symbol, interval)
+                cache_file = self._write_cache_df(new_data, symbol, interval, incoming=new_data)
                 logger.info(f"Saved {len(new_data)} rows to {cache_file}")
             _report(100.0, f"{symbol}/{interval}: Done - {len(new_data)} rows")
             return new_data
@@ -234,6 +235,7 @@ class OHLCVCacheMixin:
         # Phase 1 - Fetch all gaps concurrently (max 5 workers)               #
         # ------------------------------------------------------------------ #
         gap_pieces: List[pd.DataFrame] = []
+        fetched_now: List[pd.DataFrame] = []     # every piece fetched in THIS call (what the basis guard judges)
         if gaps_to_fill:
             completed_gaps = [0]
             total_gaps = len(gaps_to_fill)
@@ -263,6 +265,7 @@ class OHLCVCacheMixin:
                         if daily:
                             OHLCVCacheMixin._check_piece_basis(existing, data, symbol, interval, "gap fill")
                         gap_pieces.append(data)
+                        fetched_now.append(data)
                     with gap_lock:
                         completed_gaps[0] += 1
                         pct = 5.0 + (completed_gaps[0] / total_gaps) * 75.0
@@ -295,6 +298,7 @@ class OHLCVCacheMixin:
                 if daily:
                     OHLCVCacheMixin._check_piece_basis(merged, left, symbol, interval, "head extension")
                 extension_pieces.append(left)
+                fetched_now.append(left)
             _report(90.0, f"{symbol}/{interval}: Left extension done")
 
         if end_ts > cache_max and not tail_verified:
@@ -308,6 +312,7 @@ class OHLCVCacheMixin:
                 if daily:
                     OHLCVCacheMixin._check_piece_basis(merged, right, symbol, interval, "tail extension")
                 extension_pieces.append(right)
+                fetched_now.append(right)
             _report(98.0, f"{symbol}/{interval}: Right extension done")
 
         final = (
@@ -318,7 +323,9 @@ class OHLCVCacheMixin:
         )
 
         if not final.empty:
-            cache_file = self._write_cache_df(final, symbol, interval)
+            cache_file = self._write_cache_df(
+                final, symbol, interval,
+                incoming=pd.concat(fetched_now, ignore_index=True) if fetched_now else None)
             logger.info(f"Saved {len(final)} rows to {cache_file}")
 
         _report(100.0, f"{symbol}/{interval}: Done - {len(final)} rows total")

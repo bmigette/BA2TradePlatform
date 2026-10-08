@@ -366,11 +366,11 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
     HAS_CROSS_INTERVAL_CHECK = True
 
     def _intraday_basis_problem(self, symbol: str, interval: str, provider_name: str, *,
-                                frame=None, window=None):
+                                frame=None, window=None, daily_frame=None):
         from ba2_providers.ohlcv import cross_interval_basis as cib
         store = cib.store_for(provider_name)
         if frame is not None:
-            res = store.check_frame(symbol, interval, frame)
+            res = store.check_frame(symbol, interval, frame, daily_frame=daily_frame)
         else:
             lo, hi = window if window is not None else cib.WHOLE_HISTORY
             res = store.check(symbol, interval, lo, hi)

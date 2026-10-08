@@ -95,6 +95,16 @@ def initialize_system():
     from ba2_trade_platform.core.seam_wiring import wire_all_seams
     wire_all_seams()
 
+    # Cross-interval basis: one line at startup and one per day naming the intraday cache files that are
+    # stale-marked (their reads/writes refuse) or rebased by the repair tool, so a failed chart / tool call that
+    # reads such a file is explained in this log. Daily bars are never affected.
+    try:
+        from ba2_common.core import native_cache as _nc
+        from ba2_common.core.split_basis import start_intraday_state_reporter
+        start_intraday_state_reporter(os.path.join(_nc.CACHE_FOLDER, "FMPOHLCVProvider"), logger.info)
+    except Exception as e:
+        logger.warning(f"intraday cache state reporter not started: {e}")
+
     # Relocate the app/UI (ba2_trade_platform) file logs next to THIS instance's DB — the
     # same <db folder>/logs that wire_all_seams()->configure_db() points ba2_common at — so
     # all of an instance's logs live together in its data folder (e.g. the prod state folder),

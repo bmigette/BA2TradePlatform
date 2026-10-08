@@ -259,7 +259,7 @@ def test_the_write_time_tail_check_catches_a_short_append_across_a_split(tmp_pat
     # verdict, but the TAIL is x2 off the daily level
     frame = scale(intra, 2.0, after="2023-12-22")
     res = store.check_frame("TAIL", "5min", frame)
-    assert res.mismatched and "last" in res.reason and res.factor == pytest.approx(2.0, rel=5e-3)
+    assert res.mismatched and res.factor == pytest.approx(2.0, rel=5e-3)
     assert store.check_frame("TAIL", "5min", intra).klass == cib.KLASS_OK
 
 
@@ -329,3 +329,85 @@ def test_check_many_keeps_input_order(cache_folder, pair):
     out = cib.check_many(["BAD", "OKS", "GONE"], "5min", FIRST, LAST, store=st)
     assert [r.symbol for r in out] == ["BAD", "OKS", "GONE"]
     assert [r.klass for r in out] == [cib.KLASS_CONSTANT_FACTOR, cib.KLASS_OK, cib.KLASS_NO_DAILY]
+
+
+# --------------------------------------------------------------------------- review round: bursts, windows, calendar, aliases
+def _scale_days(intra, factor, days, fields=("Open", "High", "Low", "Close")):
+    out = intra.copy()
+    m = out["Date"].dt.normalize().isin([pd.Timestamp(d) for d in days])
+    for c in fields:
+        out.loc[m, c] = out.loc[m, c] * factor
+    return out
+
+
+def test_a_short_basis_burst_is_flagged_with_its_dates(pair):
+    """TRVG (2023-11-07..15, 7 sessions at x0.20): fewer than the 10 sessions a level needs, but unmistakable: the
+    WHOLE session (high and low too) is on another basis."""
+    daily, intra = pair
+    days = [d for d, _ in _session_list(date(2023, 6, 5), date(2023, 6, 13))]
+    res, _ = judge(daily, _scale_days(intra, 0.2, days))
+    assert res.klass == cib.KLASS_FACTOR_CHANGES, res.reason
+    assert [s.kind for s in res.segments] == ["burst_basis"]
+    assert res.segments[0].first_day == "2023-06-05" and res.segments[0].sessions == 7
+    assert res.segments[0].factor == pytest.approx(0.2, rel=0.02)
+    assert "another basis" in res.reason
+
+
+def test_a_burst_of_single_bad_bars_is_flagged_but_marked_not_a_basis(pair):
+    """FGN / TCPA / the preferreds of 2026-03: the session LOW and the last close are at x0.3 while the session
+    HIGH is at the daily level: bad bars, not a basis (the rebase tool refuses it)."""
+    daily, intra = pair
+    out = intra.copy()
+    for d in [d for d, _ in _session_list(date(2023, 6, 5), date(2023, 6, 13))]:
+        m = out["Date"].dt.normalize() == pd.Timestamp(d)
+        last = out[m].index[-1]
+        for c in ("Open", "Low", "Close"):
+            out.loc[last, c] = out.loc[last, c] * 0.3
+    res, _ = judge(daily, out)
+    assert res.klass == cib.KLASS_FACTOR_CHANGES
+    assert [s.kind for s in res.segments] == ["burst_prints"] and "single bad bars" in res.reason
+
+
+def test_alternating_burst_sessions_still_form_a_burst(pair):
+    daily, intra = pair
+    sess = [d for d, _ in _session_list(date(2023, 6, 5), date(2023, 6, 20))]
+    res, _ = judge(daily, _scale_days(intra, 0.26, sess[0::2][:6]))          # every other session for 11 sessions
+    assert res.klass == cib.KLASS_FACTOR_CHANGES and res.segments[0].sessions >= 9
+
+
+def test_two_wrong_sessions_or_a_one_off_print_are_not_a_burst(pair):
+    daily, intra = pair
+    sess = [d for d, _ in _session_list(date(2023, 6, 5), date(2023, 6, 30))]
+    assert judge(daily, _scale_days(intra, 0.2, sess[:2]))[0].klass == cib.KLASS_OK       # < 3 sessions
+    assert judge(daily, _scale_days(intra, 0.2, [sess[0], sess[8], sess[14]]))[0].klass == cib.KLASS_OK   # too far apart
+    assert judge(daily, _scale_days(intra, 1.1, sess[:8]))[0].klass == cib.KLASS_OK       # 10% is not a burst level
+
+
+def test_the_judged_window_covers_warmup_and_the_read_guard_window():
+    lo, hi = cib.judged_window("2023-06-01", "2023-06-30", 30)
+    assert lo == pd.Timestamp("2023-06-30") - pd.Timedelta(days=cib.MIN_JUDGED_DAYS)      # 90d beats 30d warmup
+    lo, hi = cib.judged_window("2023-06-01", "2023-12-30", 365)
+    assert lo == pd.Timestamp("2022-06-01")                                                # warmup beats 90d
+    from ba2_common.core.interfaces.MarketDataProviderInterface import MarketDataProviderInterface
+    assert MarketDataProviderInterface.INTRADAY_READ_GUARD_DAYS == cib.MIN_JUDGED_DAYS    # one number, two homes
+
+
+def test_a_session_past_the_calendar_table_fails_loudly(pair, monkeypatch):
+    daily, intra = pair
+    monkeypatch.setattr(cib, "_CAL", None)
+    monkeypatch.setattr(cib, "_CAL_LAST", date(2023, 6, 30))
+    with pytest.raises(cib.CalendarRangeExceeded, match="outside the NYSE calendar table"):
+        cib.reduce_sessions(daily, intra, "5min")
+    monkeypatch.setattr(cib, "_CAL", None)                      # leave the real table for the next test
+
+
+def test_a_shadowing_alias_stub_is_named_in_the_reason(cache_folder, tmp_path, pair):
+    """DGNX / MODD / MTEK: ``<SYM>_5m.parquet`` (a June-2026 stub) shadows the real ``<SYM>_5min.parquet``; readers
+    open the first spelling only, so the check reports what the ENGINE would read, and says why."""
+    daily, intra = pair
+    _write(cache_folder, "SHD", daily, intra)
+    stub = intra[intra["Date"] >= "2023-12-20"]
+    stub.assign(effective_date=stub["Date"]).to_parquet(cache_folder / "SHD_5m.parquet", index=False)
+    st = cib.BasisStore("FMPOHLCVProvider", memo=None, folder=str(cache_folder))
+    res = st.check("SHD", "5min", FIRST, LAST)
+    assert res.klass == cib.KLASS_INSUFFICIENT and "SHD_5m.parquet shadows SHD_5min.parquet" in res.reason
