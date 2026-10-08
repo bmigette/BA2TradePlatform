@@ -5517,6 +5517,35 @@ def _apply_exclude_symbols(command: str, backtest_block: dict, exclude_symbols: 
           f"{', '.join(removed) if removed else '(none of the given symbols were in this universe)'}")
 
 
+def _refuse_intraday_basis_mismatch(command: str, backtest_block: dict) -> None:
+    """EARLY REFUSAL (master side) of a job whose universe holds a symbol whose intraday cache is on a
+    different price level than its daily cache (``intraday_basis_preflight``; the same check re-runs at job
+    start on every worker, where it is job-fatal). Applies to an intraday-clock job and to an options job
+    (whose drawdown refinement reads 5-minute bars); a daily-clock equity job reads no intraday bar and is
+    untouched. Called AFTER the final universe is known (--screener, --exclude-symbols). Prints the
+    verdict counts and every symbol that could NOT be judged; REFUSES (exit) with the list of
+    (symbol, factor, class) otherwise. There is no flag that skips it: ``--exclude-symbols`` is the
+    recorded way to run without a symbol."""
+    from app.services.backtest import intraday_basis_preflight as pf
+    from ba2_common.core.split_basis import IntradayBasisError
+    interval = pf.interval_to_check(backtest_block)
+    if interval is None:
+        return
+    import os as _os
+    n = len(backtest_block["enabled_instruments"])
+    print(f"{command}: intraday/daily basis preflight over {n} symbols ({interval}) ...", flush=True)
+    try:
+        rep = pf.require_for_config(backtest_block, workers=max(1, min(8, (_os.cpu_count() or 2) - 1)))
+    except IntradayBasisError as e:
+        sys.exit(f"{command}: REFUSED -- {e}")
+    print(f"{command}: intraday basis preflight OK: "
+          + ", ".join(f"{k}={v}" for k, v in sorted(rep.counts.items())), flush=True)
+    if rep.unjudged:
+        print(f"{command}: WARNING {len(rep.unjudged)} symbol(s) could not be judged (not refused, NOT ok): "
+              + ", ".join(f"{r.symbol}[{r.klass}]" for r in rep.unjudged[:40])
+              + (" ..." if len(rep.unjudged) > 40 else ""), flush=True)
+
+
 def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: str = "") -> dict:
     """Record the market-condition decisions on a run's backtest block, or do nothing.
 
@@ -7045,6 +7074,9 @@ def _cmd_optimize(args) -> int:
         _apply_exclude_symbols("optimize", backtest_block, _exclude_symbols)
         if _exclude_symbols:
             universe = list(backtest_block["enabled_instruments"])
+        # Cross-interval basis: refuse a universe with a symbol whose 5-minute cache is on another price
+        # level than its daily cache (decision price from one, history from the other).
+        _refuse_intraday_basis_mismatch("optimize", backtest_block)
         # Market-condition gates: record the profile + the pinned manifest on the run config
         # (persisted, so every _build_daily_trial_config consumer of this run -- trials, re-runs,
         # robustness variants, top-N persist, tools/backtest_parity.py -- carries the digest), and
@@ -7345,6 +7377,7 @@ def _cmd_optimize_batch(args) -> int:
             _apply_exclude_symbols(
                 "optimize-batch", backtest_block,
                 _resolve_exclude_symbols_arg(getattr(args, "exclude_symbols", None)))
+            _refuse_intraday_basis_mismatch("optimize-batch", backtest_block)
             # Market-condition gates (no-op with the profile off) — see _cmd_optimize for why this
             # sits after every block that can still rewrite enabled_instruments.
             _apply_market_conditions("optimize-batch", backtest_block, strat, strat_kind)

@@ -31,11 +31,24 @@ push_cache, already run automatically at the start of every optimization job):
    metric_store sync and can rot silently, see docs/plans/2026-07-15-senate-weight-fast-
    optimization.md for the Senate-specific case of this).
 
+4. CROSS-INTERVAL PRICE-LEVEL BASIS (``check_cross_interval_basis``, ON by default, ``--skip-basis``
+   to opt out): for EVERY symbol that has a daily and an intraday file, compares the two series' PRICE
+   LEVELS per session over --start/--end (``ba2_providers.ohlcv.cross_interval_basis``; the same
+   function the backtest launch and every job start refuse on). Checks 1-3 never compare levels:
+   a symbol that split after its 5-minute file was fetched has a daily file on the new basis and a
+   5-minute file on the old one, a constant (or piecewise-constant) multiple 0.10x .. 6.25x apart, and
+   passed every check above (7 of 250 random symbols over 2023, found by hand). It runs over the FULL
+   symbol set on purpose: the validity check above samples 25 symbols (--validity-symbols), and a
+   sample of 25 would have missed ~97% of the bad symbols. It also lists the intraday files carrying a
+   stale marker (daily rewritten, intraday not refetched). Exit status is non-zero when ANY symbol is
+   mismatched; ``--basis-csv PATH`` writes the full per-symbol table.
+
 Usage (test venv):
     ba2-venvs/test/Scripts/python.exe tools/cache_health_check.py [--worker NAME] [--fix]
         [--skip-workers] [--skip-gaps] [--ohlcv-interval 1d] [--max-gap-days 7] [--stale-days 10]
         [--start 2022-01-01] [--end 2026-06-30] [--skip-validity] [--validity-symbols 25]
-        [--nan-threshold 0.5]
+        [--nan-threshold 0.5] [--skip-basis] [--basis-interval 5min] [--basis-csv PATH]
+        [--basis-symbols SYM,SYM|@file] [--basis-workers N] [--basis-memo-dir DIR]
 
 --fix removes anything `push_cache` already handles (missing + stale) via the normal push/prune,
 then force-repushes any CONTENT-MISMATCH file (same rel_path/size, different crc32) — the one
@@ -1175,6 +1188,124 @@ def check_period_validity(start: str, end: str, nan_threshold: float,
     return ok
 
 
+def _read_symbols_arg(raw: str) -> List[str]:
+    """``SYM,SYM`` or ``@file`` (one per line or comma separated) -> upper-cased symbols."""
+    if raw.startswith("@"):
+        with open(raw[1:], encoding="utf-8") as f:
+            blob = f.read()
+        items = blob.replace(",", "\n").splitlines()
+    else:
+        items = raw.split(",")
+    return sorted({t.strip().strip('"').strip("'").upper() for t in items if t.strip()})
+
+
+def _num(v: float, fmt: str = "{:.6g}") -> str:
+    return "" if v != v else fmt.format(v)
+
+
+def _basis_csv_rows(results) -> list:
+    rows = []
+    for r in results:
+        rows.append({
+            "symbol": r.symbol, "class": r.klass, "factor": _num(r.factor),
+            "median_close_ratio": _num(r.median_close_ratio),
+            "median_high_ratio": _num(r.median_high_ratio), "median_low_ratio": _num(r.median_low_ratio),
+            "out_share": _num(r.out_share, "{:.4f}"), "far_sessions": r.far_sessions,
+            "common_sessions": r.common_sessions, "daily_sessions": r.daily_sessions,
+            "no_intraday_sessions": r.no_intraday_sessions, "incomplete_sessions": r.incomplete_sessions,
+            "first_day": r.first_day, "first_ratio": _num(r.first_ratio),
+            "last_day": r.last_day, "last_ratio": _num(r.last_ratio),
+            "boundaries": ";".join(r.boundaries),
+            "segments": ";".join(f"{sg.first_day}..{sg.last_day}:{sg.sessions}:x{sg.factor:.6g}" for sg in r.segments),
+            "by_year": ";".join(f"{y}:x{v['median_close_ratio']:.4g}/out{v['out_share']:.2f}"
+                                for y, v in sorted(r.by_year.items())),
+            "reason": r.reason,
+        })
+    return rows
+
+
+def check_cross_interval_basis(start: str, end: str, interval: str = "5min", symbols: Optional[List[str]] = None,
+                               workers: int = 1, csv_path: Optional[str] = None,
+                               provider: str = "FMPOHLCVProvider", list_limit: int = 40,
+                               memo_dir: Optional[str] = None):
+    """Compare the PRICE LEVEL of every symbol's intraday cache with its daily cache over [start, end].
+
+    FULL symbol set (every ``<SYM>_<interval>.parquet`` of the provider's cache folder, or ``symbols``):
+    never a sample. Prints a per-class summary, the mismatched symbols with their factors and the date
+    each factor changes, the symbols that could not be judged (never counted as ok) and the intraday
+    files carrying a stale marker. Returns ``(ok, results)``; ``ok`` is False when any symbol is
+    mismatched (constant_factor / factor_changes / noisy) or any intraday file is marked stale."""
+    import csv
+    from ba2_common.core.split_basis import MARKER_DIRNAME
+    from ba2_providers.ohlcv import cross_interval_basis as cib
+
+    folder = cib.ohlcv_cache_dir(provider)
+    print(f"\n=== CROSS-INTERVAL PRICE-LEVEL BASIS ({interval} vs daily, {start} .. {end}) ===")
+    if not os.path.isdir(folder):
+        print(f"  {folder} not found; cannot check.")
+        return False, []
+    if symbols is None:
+        suffix = f"_{interval}.parquet"
+        symbols = sorted(n[:-len(suffix)] for n in os.listdir(folder) if n.endswith(suffix))
+    t0 = time.time()
+    print(f"  {len(symbols)} symbol(s) with a {interval} file (FULL set, not a sample); workers={workers}")
+    results = cib.check_many(symbols, interval, start, end, provider=provider, workers=workers,
+                             memo_dir=memo_dir)
+    secs = time.time() - t0
+    classes = Counter(r.klass for r in results)
+    print(f"  scanned in {secs:.0f}s.  per class: "
+          + ", ".join(f"{k}={classes.get(k, 0)}" for k in
+                      (cib.KLASS_OK, cib.KLASS_CONSTANT_FACTOR, cib.KLASS_FACTOR_CHANGES, cib.KLASS_NOISY,
+                       cib.KLASS_INSUFFICIENT, cib.KLASS_NO_INTRADAY, cib.KLASS_NO_DAILY)))
+    bad = [r for r in results if r.mismatched]
+    for r in bad[:list_limit]:
+        extra = f"  boundaries {','.join(r.boundaries)}" if r.boundaries else ""
+        print(f"    MISMATCH {r.describe()}{extra}")
+    if len(bad) > list_limit:
+        print(f"    ... +{len(bad) - list_limit} more (use --basis-csv for the full table)")
+    unjudged = [r for r in results if r.unjudged]
+    if unjudged:
+        print(f"  {len(unjudged)} symbol(s) could NOT be judged (reported, not ok): "
+              + ", ".join(f"{r.symbol}[{r.klass}]" for r in unjudged[:15]) + (" ..." if len(unjudged) > 15 else ""))
+    bursts = [r for r in results if r.klass == cib.KLASS_OK and r.far_sessions >= cib.MIN_SEGMENT_SESSIONS]
+    if bursts:
+        print(f"  {len(bursts)} symbol(s) judged ok carry >= {cib.MIN_SEGMENT_SESSIONS} sessions more than "
+              f"{cib.FAR_TOL:.0%} off the daily close (short bursts around a split / re-adjustment; not a "
+              f"lasting level, so NOT refused -- see far_sessions in --basis-csv): "
+              + ", ".join(f"{r.symbol}({r.far_sessions})" for r in bursts[:12]) + (" ..." if len(bursts) > 12 else ""))
+    marker_dir = os.path.join(folder, MARKER_DIRNAME)
+    stale = sorted(n[:-len(".intraday-stale.json")] for n in os.listdir(marker_dir)
+                   if n.endswith(".intraday-stale.json")) if os.path.isdir(marker_dir) else []
+    if stale:
+        print(f"  {len(stale)} intraday file(s) carry a STALE marker (daily rewritten, intraday not "
+              f"refetched): {', '.join(stale[:15])}{' ...' if len(stale) > 15 else ''}")
+    if csv_path:
+        rows = _basis_csv_rows(results)
+        os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["symbol"])
+            w.writeheader()
+            w.writerows(rows)
+        print(f"  full table -> {csv_path}")
+    ok = not bad and not stale
+    print("  basis: OK" if ok else f"  basis: {len(bad)} mismatched symbol(s), {len(stale)} stale marker(s)")
+    return ok, results
+
+
+def _period_from_args(args):
+    """``(start, end)`` for the period-bound checks: --start/--end, each defaulting to the metric_store's
+    own earliest / latest ``ym=`` partition (None when neither is available)."""
+    from ba2_common.config import SCREENER_STORE_DIR
+    start, end = args.start, args.end
+    if start is None or end is None:
+        present = sorted(d[len("ym="):] for d in os.listdir(SCREENER_STORE_DIR)
+                         if d.startswith("ym=")) if os.path.isdir(SCREENER_STORE_DIR) else []
+        if present:
+            start = start or f"{present[0]}-01"
+            end = end or f"{present[-1]}-28"
+    return start, end
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1219,6 +1350,18 @@ def main() -> int:
                          "matching warm_options_history.py's DEFAULT_START).")
     ap.add_argument("--options-gap-end", default=None,
                     help="End of the expiry-gap oracle window, YYYY-MM-DD (default: today).")
+    ap.add_argument("--skip-basis", action="store_true",
+                    help="Skip the cross-interval price-level check (intraday vs daily, FULL symbol set). ON by default.")
+    ap.add_argument("--basis-interval", default="5min",
+                    help="Intraday interval compared with the daily cache (default 5min).")
+    ap.add_argument("--basis-csv", default=None, help="Write the full per-symbol basis table to this CSV.")
+    ap.add_argument("--basis-symbols", default=None,
+                    help="Restrict the basis check to SYM,SYM or @file (default: every symbol with an intraday file).")
+    ap.add_argument("--basis-memo-dir", default=None,
+                    help="Directory of the per-symbol scan memo (default <BA2_HOME>/common/cross_interval_basis, "
+                         "next to the cache folder; '' disables the memo).")
+    ap.add_argument("--basis-workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) - 1)),
+                    help="Process-pool size of the basis scan (default: min(8, cpus-1)).")
     args = ap.parse_args()
 
     overall_ok = True
@@ -1228,19 +1371,25 @@ def main() -> int:
             overall_ok = False
 
     if not args.skip_validity:
-        from ba2_common.config import SCREENER_STORE_DIR
-        start, end = args.start, args.end
-        if start is None or end is None:
-            present = sorted(d[len("ym="):] for d in os.listdir(SCREENER_STORE_DIR)
-                              if d.startswith("ym=")) if os.path.isdir(SCREENER_STORE_DIR) else []
-            if not present:
-                print("\n=== local data VALIDITY ===\n  metric_store empty/missing, skipping (pass --start/--end explicitly).")
-                present = None
-            if present:
-                start = start or f"{present[0]}-01"
-                end = end or f"{present[-1]}-28"
-        if start and end:
+        start, end = _period_from_args(args)
+        if not (start and end):
+            print("\n=== local data VALIDITY ===\n  metric_store empty/missing, skipping (pass --start/--end explicitly).")
+        else:
             if not check_period_validity(start, end, args.nan_threshold, args.validity_symbols, args.ohlcv_interval):
+                overall_ok = False
+
+    if not args.skip_basis:
+        b_start, b_end = _period_from_args(args)
+        if not (b_start and b_end):
+            print("\n=== CROSS-INTERVAL PRICE-LEVEL BASIS ===\n  no period: pass --start/--end (the metric_store that "
+                  "supplies the default is empty/missing). NOT checked -- pass --skip-basis to opt out explicitly.")
+            overall_ok = False
+        else:
+            b_syms = _read_symbols_arg(args.basis_symbols) if args.basis_symbols else None
+            b_ok, _ = check_cross_interval_basis(b_start, b_end, args.basis_interval, b_syms,
+                                                 args.basis_workers, args.basis_csv,
+                                                 memo_dir=args.basis_memo_dir)
+            if not b_ok:
                 overall_ok = False
 
     if args.check_options:

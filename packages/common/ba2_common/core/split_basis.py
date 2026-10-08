@@ -77,6 +77,13 @@ __all__ = [
     "read_full_fetch_marker",
     "write_full_fetch_marker",
     "SplitBasisRefused",
+    "IntradayBasisError",
+    "IntradayBasisStale",
+    "IntradayBasisMismatch",
+    "intraday_stale_marker_path",
+    "read_intraday_stale",
+    "write_intraday_stale",
+    "clear_intraday_stale",
     "SymbolSplitBasis",
     "as_traded_factor",
     "resolve_symbol_split_basis",
@@ -317,6 +324,84 @@ def write_full_fetch_marker(parquet_path: str, *, first_bar: Optional[date], las
         json.dump(payload, f, sort_keys=True)
     os.replace(tmp, path)
     return path
+
+
+# ---------------------------------------------------------------------------------------------
+# INTRADAY STALENESS (cross-interval basis, 2026-10-08)
+# ---------------------------------------------------------------------------------------------
+# The daily file of a symbol is REPLACED on a new split basis by ``force_full_refetch`` (the split-aware
+# top-up). The intraday files (``<SYM>_5min.parquet`` ...) of the same symbol are NOT refetched with it
+# (hundreds of vendor calls per file), so they keep the old basis. Measured on the real cache: 7 of 250
+# random symbols had a 5-minute history a constant multiple (0.10 .. 6.25) of the daily one. The state
+# "daily was rewritten, intraday was not" is therefore recorded EXPLICITLY, next to the intraday file, and
+# every reader / writer of that file refuses until the intraday file is replaced on the vendor's current
+# basis (``force_full_refetch`` of the intraday interval clears it).
+
+
+class IntradayBasisError(RuntimeError):
+    """Base of the cross-interval basis refusals (matched by NAME in ``job_fatal``)."""
+
+
+class IntradayBasisStale(IntradayBasisError):
+    """An intraday cache file is marked stale: the symbol's DAILY history was rewritten on a new split
+    basis after the file was fetched, so its price levels are not those of the daily file. Raised by
+    every read of the file (``get_ohlcv_data``), every write of it and every backtest launch / job
+    start that includes the symbol. Repair: ``force_full_refetch(symbol, <interval>)``."""
+
+
+class IntradayBasisMismatch(IntradayBasisError):
+    """An intraday cache (or a frame about to be written to it) is on a different price level than
+    the symbol's daily cache: the cross-interval check (``ba2_providers.ohlcv.cross_interval_basis``)
+    classified it ``constant_factor`` / ``factor_changes`` / ``noisy``."""
+
+
+def intraday_stale_marker_path(parquet_path: str) -> str:
+    folder, name = os.path.split(parquet_path)
+    stem = name[:-len(".parquet")] if name.endswith(".parquet") else name
+    return os.path.join(folder, MARKER_DIRNAME, stem + ".intraday-stale.json")
+
+
+def read_intraday_stale(parquet_path: Optional[str]) -> Optional[dict]:
+    """The stale marker of an intraday parquet, or None. An UNREADABLE marker file is reported as a
+    stale marker too (``{"reason": "unreadable marker ..."}``): a state we cannot read is not "fresh"."""
+    if not parquet_path:
+        return None
+    path = intraday_stale_marker_path(parquet_path)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        return {"reason": f"unreadable stale marker {path}: not a JSON object"}
+    except (OSError, ValueError) as e:
+        return {"reason": f"unreadable stale marker {path}: {e}"}
+
+
+def write_intraday_stale(parquet_path: str, *, reason: str, now: Optional[datetime] = None) -> str:
+    """Mark an intraday parquet stale. Atomic. Returns the marker path."""
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    path = intraday_stale_marker_path(parquet_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {"marked_at_utc": now.isoformat(), "reason": reason,
+               "file": os.path.basename(parquet_path)}
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True)
+    os.replace(tmp, path)
+    return path
+
+
+def clear_intraday_stale(parquet_path: Optional[str]) -> bool:
+    """Remove the stale marker of an intraday parquet. True when one was removed."""
+    if not parquet_path:
+        return False
+    try:
+        os.remove(intraday_stale_marker_path(parquet_path))
+        return True
+    except FileNotFoundError:
+        return False
 
 
 # ---------------------------------------------------------------------------------------------

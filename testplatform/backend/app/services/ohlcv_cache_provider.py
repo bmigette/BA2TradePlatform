@@ -104,6 +104,13 @@ class OHLCVCacheMixin:
         out = df.copy()
         out["Date"] = pd.to_datetime(out["Date"])
         out["effective_date"] = out["Date"]
+        if not OHLCVCacheMixin._is_daily_interval(interval):
+            # CROSS-INTERVAL BASIS: a head/tail/gap extension of an intraday file fetched on the
+            # vendor's CURRENT basis must not be merged into a file (or beside a daily cache) on
+            # another one. Raises IntradayBasisMismatch; a stale-marked file refuses in write_timeseries.
+            guard = getattr(self, "_guard_intraday_write", None)
+            if guard is not None:
+                guard(out, symbol, interval, type(self).__name__)
         native_cache.write_timeseries(type(self).__name__, symbol, interval, out)
         path = self._get_cache_file(symbol, interval)
         legacy = path.with_suffix(".csv")

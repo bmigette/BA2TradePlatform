@@ -969,6 +969,13 @@ def run_daily_backtest(
         # binding makes every DAILY read through the memoized provider obey it on an intraday
         # clock (no-op on a daily clock). See AsOfPriceSource.knowable_daily_end.
         ohlcv.bind_price_source(ps)
+        # CROSS-INTERVAL BASIS PREFLIGHT (job start, on THIS process: a worker's cache can differ from the
+        # master's). An intraday-clock job, or an options job whose drawdown refinement reads 5-minute bars,
+        # must find every symbol's intraday cache on the daily cache's price level; otherwise it raises
+        # IntradayBasisMismatch / IntradayBasisStale (job-fatal) before the first bar is loaded. Once per
+        # process per (universe, window): see intraday_basis_preflight.
+        from app.services.backtest.intraday_basis_preflight import require_for_config
+        basis_report = require_for_config(config)
         ps.preload(
             config["enabled_instruments"],
             config["start_date"],
@@ -1098,6 +1105,9 @@ def run_daily_backtest(
             if _su_rec is not None:
                 results["screener_universe"] = _su_rec
             results.update(_car_trade_thresholds_for_experts(config))
+            if basis_report is not None:
+                # Recorded on the result: what was judged, and every symbol that could NOT be (never ok).
+                results["intraday_basis_preflight"] = basis_report.to_dict()
             _record = _decision_time_record(engine, config)
             if _record is not None:
                 results["decision_time"] = _record
