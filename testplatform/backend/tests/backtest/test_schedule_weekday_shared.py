@@ -20,6 +20,11 @@ from app.services.backtest.daily_engine import _schedule_allows_entry
 
 WEEKDAYS = sg.SCHEDULE_DAYS
 
+# The live scheduler and the settings UI need apscheduler / nicegui, which the CI parity job does not
+# install (it installs packages/* and the backend requirements only). Those tests run wherever the
+# live app's requirements are installed.
+_LIVE_ONLY = "live-app dependency not installed (the CI parity job installs packages/* only)"
+
 
 def _old_rule(days, weekday):
     return bool(days.get(weekday, True))        # the backtest's former inline rule
@@ -169,6 +174,7 @@ def test_the_shared_function_reads_every_stored_value_by_meaning(value, outcome)
 
 @pytest.mark.parametrize("value, outcome", [r for r in VALUE_TABLE if r[1] != REFUSED], ids=lambda x: repr(x))
 def test_live_and_backtest_agree_on_every_tolerated_monday_value(value, outcome):
+    pytest.importorskip("apscheduler", reason=_LIVE_ONLY)
     from ba2_trade_platform.core.JobManager import JobManager
 
     days = {"monday": value}
@@ -184,6 +190,7 @@ def test_live_and_backtest_agree_on_every_tolerated_monday_value(value, outcome)
 
 @pytest.mark.parametrize("value", [v for v, o in VALUE_TABLE if o == REFUSED], ids=lambda x: repr(x))
 def test_live_refuses_every_invalid_value_once_with_one_error(value, monkeypatch):
+    pytest.importorskip("apscheduler", reason=_LIVE_ONLY)
     import ba2_trade_platform.core.JobManager as module
     from ba2_trade_platform.core.JobManager import JobManager
     errors = []
@@ -225,6 +232,7 @@ def test_the_ui_saves_real_booleans():
     """``_get_schedule_config`` / the enter-market and open-positions collectors write ``checkbox.value``
     (a bool) for every day: pin the construction so a future change cannot save strings."""
     import inspect
+    pytest.importorskip("nicegui", reason=_LIVE_ONLY)
     from ba2_trade_platform.ui.pages.settings import ExpertSettingsTab
     for name in ("_get_schedule_config", "_get_enter_market_schedule_config", "_get_open_positions_schedule_config"):
         fn = getattr(ExpertSettingsTab, name, None)
