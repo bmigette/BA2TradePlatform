@@ -42,6 +42,8 @@ def test_funded_entry_keeps_the_same_stop_as_backtest(side, ruleset, safeguard, 
     _, _, order = _entry(side, ruleset, safeguard)
     account = Mock()
     account.submit_order.return_value = order
+    # the safeguard stop's anchor is stamped from the account's current price before the submit
+    account.get_instrument_current_price.return_value = 100.0
     TradeManager()._submit_funded_entry_with_retry(account, order, sl_price=safeguard)
     account.submit_order.assert_called_once_with(order, sl_price=expected)
     assert order.quantity == 14.0

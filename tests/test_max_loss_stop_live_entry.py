@@ -140,6 +140,9 @@ def test_the_safeguard_is_the_recorded_max_loss_stop(monkeypatch, ruleset_sl, su
             sent.append(sl_price)
             return o
 
+        def get_instrument_current_price(self, symbol, price_type='bid'):
+            return 100.0   # the safeguard stop's anchor is stamped from it before the submit
+
     _tm(monkeypatch)._submit_funded_entry_with_retry(_Acct(), order, sl_price=92.0)
     assert sent == [submitted_sl]
     assert max_loss_stop_of(get_instance(Transaction, txn_id)) == 92.0
