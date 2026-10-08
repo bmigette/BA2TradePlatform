@@ -1805,7 +1805,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         ckpt_fingerprint = checkpoint_fingerprint(
             param_space, ga, checkpoint_expert_settings_identity(backtest_cfg),
             backtest_cfg.get("rm_toggles_unpinned"), backtest_cfg.get("screener_universe_rule"),
-            (backtest_cfg.get("screener_opt") or {}).get("criteria_version"))
+            _screener_identity(backtest_cfg.get("screener_opt")))
         # The OBJECTIVE this run is scored under, as the trials will actually see it (the trial
         # config carries the same key, and strategy_fitness._maybe_robust reads it). Written into
         # every checkpoint and compared on resume -- see _assert_checkpoint_robustness_matches.
@@ -2620,11 +2620,16 @@ def _build_hoisted_state(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
                 raise ValueError(f"screener_opt.criteria_version {screener_opt.get('criteria_version')!r} != the "
                                  f"simulated {_ls.CRITERIA_VERSION!r}: a job is only resumed or re-run under the "
                                  f"definition it was launched with")
-            _ls.require_panel(screener_opt["panel"], str(backtest_cfg["start_date"])[:10],
-                              str(backtest_cfg["end_date"])[:10])
+            if screener_opt.get("behaviour") != _ls.POST_FIX.name:
+                raise ValueError(f"screener_opt.behaviour {screener_opt.get('behaviour')!r} != {_ls.POST_FIX.name!r}")
+            # the stored reference is RELATIVE to the cache root: resolve it on THIS machine
+            panel_path = _ls.resolve_panel_path(screener_opt["panel"])
+            _ls.require_panel(panel_path, str(backtest_cfg["start_date"])[:10], str(backtest_cfg["end_date"])[:10],
+                              expect_fp=screener_opt["panel_fingerprint"])
             from app.services.backtest.screener_gate import get_panel
-            get_panel(screener_opt["panel"])                       # warms the per-worker (memory-mapped) memo
-            hoisted["screener_panel"] = screener_opt["panel"]
+            get_panel(panel_path, screener_opt["panel_fingerprint"])   # warms the per-worker (memory-mapped) memo
+            hoisted["screener_panel"] = panel_path
+            hoisted["screener_panel_fp"] = screener_opt["panel_fingerprint"]
             hoisted["screener_criteria"] = screener_opt["criteria_version"]
     return hoisted
 
@@ -2905,13 +2910,17 @@ def _build_daily_trial_config(
         # A genome outside the DECLARED ranges (warm-start seed from another job, stored pin) is refused
         # BEFORE the run, not discovered as a guard failure mid-job (universe_superset.ScreenerGenomeOutOfRange).
         from ba2_providers.screener.universe_superset import check_genes_in_declared_ranges
+        if hoisted.get("screener_panel"):
+            from ba2_providers.screener import live_sim as _lsx
+            _lsx.require_complete_settings(eff_norm, where="trial screener settings")
         check_genes_in_declared_ranges(decoded.get("screener_overrides") or {},
                                        hoisted.get("screener_declared_ranges"), where="genome")
         screener_runtime = {
             "store": hoisted["screener_store"],
             "settings": eff_norm,
             "cadence_days": hoisted.get("screener_cadence_days", 7),
-            **({"criteria_version": hoisted["screener_criteria"], "panel": hoisted["screener_panel"]}
+            **({"criteria_version": hoisted["screener_criteria"], "panel": hoisted["screener_panel"],
+                "panel_fingerprint": hoisted["screener_panel_fp"]}
                if hoisted.get("screener_panel") else {}),
             # Defence-in-depth on the classic per-bar gate (daily_engine._screened_symbols_for_bar)
             # — see excluded_instruments above. Redundant with the enabled_instruments intersection
@@ -2944,7 +2953,7 @@ def _build_daily_trial_config(
                 # function, "now" replaced by the session's [low, high], no max_stocks cut.
                 from app.services.backtest import screener_gate as _sg
                 _union = set(_sg.prune_symbols(
-                    _sg.get_panel(hoisted["screener_panel"]), _sd, _ed, eff_norm, excluded_instruments,
+                    _sg.get_panel(hoisted["screener_panel"], hoisted["screener_panel_fp"]), _sd, _ed, eff_norm, excluded_instruments,
                     intraday=_is_intraday_interval(backtest_cfg.get("execution_interval"))))
             else:
                 _df = _ms.load_store(hoisted["screener_store"])
@@ -3368,6 +3377,15 @@ def checkpoint_expert_settings_identity(backtest_cfg: Dict[str, Any]) -> Dict[st
             if key in settings and settings[key] != default:
                 out[f"{spec.get('class')}.{key}"] = settings[key]
     return out
+
+
+def _screener_identity(screener_opt: Optional[Dict[str, Any]]) -> Optional[str]:
+    """``<criteria>/<behaviour>/<panel fingerprint>`` of a live-simulation screener job (None otherwise): what the gate
+    DEFINES and which data it ran on are part of the job's identity."""
+    so = screener_opt or {}
+    if not so.get("criteria_version"):
+        return None
+    return f"{so['criteria_version']}/{so.get('behaviour')}/{so.get('panel_fingerprint')}"
 
 
 def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],

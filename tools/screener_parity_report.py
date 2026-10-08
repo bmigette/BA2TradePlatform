@@ -44,6 +44,10 @@ def main(argv=None) -> int:
                     help="VALIDATION ONLY: replace the panel's share counts by the vendor's bulk-table value of that "
                          "snapshot (constant over time = the vendor's own share history over a window of weeks in "
                          "which shares do not change) and drop symbols the vendor no longer lists")
+    ap.add_argument("--now", default="5min-open", choices=("5min-open", "5min-0935", "daily-open"),
+                    help="the screener's 'now': the open of the 09:30 five-minute bar (what a job's first-bar decision "
+                         "reads; default), that bar's close (a 09:35 decision) or the daily bar's open")
+    ap.add_argument("--scale", type=float, default=1.0, help="multiply 'now' (sensitivity runs: 0.995, 1.01, ...)")
     ap.add_argument("--json-out"); ap.add_argument("--csv-out")
     args = ap.parse_args(argv)
 
@@ -62,8 +66,8 @@ def main(argv=None) -> int:
     beh = {"legacy": ls.LEGACY_CURRENT, "post-fix": ls.POST_FIX, "live": ls.behaviour_from_live()}[args.behaviour]
     logs = args.logs or [os.path.join(os.path.dirname(os.path.abspath(args.db)), "logs", "*.log*")]
     sel, stg = lp.read_log_records(logs)
-    print(f"panel {args.panel}: {panel.manifest['n_symbols']} symbols, {panel.manifest['first_session']}.."
-          f"{panel.manifest['last_bar_date']} (criteria {panel.manifest['criteria_version']}, shares "
+    print(f"panel {os.path.basename(os.path.normpath(args.panel))}: {panel.manifest['n_symbols']} symbols, {panel.manifest['first_session']}.."
+          f"{panel.manifest['last_bar_date']} (now={args.now} x{args.scale}; criteria {panel.manifest['criteria_version']}, shares "
           f"{panel.manifest['shares_vendor_snapshot']}, lag {panel.manifest['shares_lag_days']}d); behaviour {beh.name}")
     print(f"log records: {len(sel)} LIVE SELECTION, {len(stg)} LIVE STAGES")
     out = {}
@@ -75,7 +79,7 @@ def main(argv=None) -> int:
             recs = [r for r in recs if r["day"] >= args.from_day]
         if args.to_day:
             recs = [r for r in recs if r["day"] <= args.to_day]
-        res = lp.compare(panel, settings, recs, beh)
+        res = lp.compare(panel, settings, recs, beh, now_mode=args.now, scale=args.scale)
         analysed = lp.analysed_symbols(args.db, iid)
         stages = {r["day"]: r["stages"] for r in stg}
         print(f"\n=== instance {iid}: cap {settings['market_cap_min']:.3g}..{settings['market_cap_max']:.3g} "
@@ -97,6 +101,8 @@ def main(argv=None) -> int:
             rows.append({"instance": iid, "day": d["day"], "live": d["live"], "sim": d["sim"],
                          "common": d["common"], "jaccard": d["jaccard"]})
         print("summary:", json.dumps(res["summary"]))
+        for u in res["unexplained"]:
+            print("  UNEXPLAINED:", json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in u.items()}))
         out[str(iid)] = {"settings": settings, **res}
     if args.json_out:
         with open(args.json_out, "w") as f:

@@ -385,72 +385,24 @@ def test_unsupported_settings_refuse():
             ls.select_from_columns(**cols, now=np.full(2, 1.0), settings=bad, beh=ls.POST_FIX)
 
 
-def test_cap_basis_switch_now_vs_prev_close():
-    n = 2
-    syms = np.array(["A", "B"])
-    # A: prev-close cap 4.9e9 (below the 5e9 floor) but its open prices it at 5.2e9; B the reverse
-    cols = _cols(n, symbols=syms, shares=np.full(n, 1e8), last_close=np.array([49.0, 52.0]))
-    now = np.array([52.0, 49.0])
-    st = {"market_cap_min": 5e9}
-    assert [str(syms[i]) for i in ls.select_from_columns(**cols, now=now, settings=st, beh=ls.POST_FIX,
-                                                         band_basis="prev_close")] == ["B"]
-    assert [str(syms[i]) for i in ls.select_from_columns(**cols, now=now, settings=st, beh=ls.POST_FIX,
-                                                         band_basis="now")] == ["A"]
-
-
-def test_no_history_symbols_are_dropped_counted_and_a_gap_over_10_percent_is_an_outage():
-    n = 20
-    avg = np.full(n, 1e6)
-    avg[0] = np.nan                                      # one of 20 candidates (5 %) has no bars
-    cols = _cols(n, avg20=avg, rvol=np.full(n, 2.0))
-    diag = {}
-    got = ls.select_from_columns(**cols, now=np.full(n, 100.0), settings={"relative_volume_min": 1.0},
-                                 beh=ls.POST_FIX, diag=diag)
-    assert 0 not in list(got) and len(got) == n - 1
-    assert diag["dropped_no_history"] == 1 and diag["stage1"] == n and diag["final"] == n - 1
-    # all stage-2 bounds off: a symbol with no bars passes (live: needs_bars False)
-    got2 = ls.select_from_columns(**_cols(n, avg20=avg), now=np.full(n, 100.0),
-                                  settings={"relative_volume_min": 0}, beh=ls.POST_FIX)
-    assert 0 in list(got2)
-    # 3 of 20 (15 %) > 10 %: the cache is incomplete -> outage (job-fatal), not a smaller list
-    avg3 = avg.copy(); avg3[[1, 2]] = np.nan
-    with pytest.raises(ls.ScreenerDataOutage, match="incomplete"):
-        ls.select_from_columns(**_cols(n, avg20=avg3), now=np.full(n, 100.0),
-                               settings={"relative_volume_min": 1.0}, beh=ls.POST_FIX)
-    # a TOTAL failure raises whatever the bounds
-    with pytest.raises(ls.ScreenerDataOutage):
-        ls.select_from_columns(**_cols(n, avg20=np.full(n, np.nan)), now=np.full(n, 100.0),
-                               settings={"relative_volume_min": 0}, beh=ls.POST_FIX)
-
-
-def test_stage_accounting_matches_live_stats_keys(monkeypatch):
-    world = World(11)
-    install_vendor(monkeypatch, world)
-    settings = {"market_cap_min": 1e9, "price_min": 0, "relative_volume_min": 1.0, "volume_min": 400_000.0, "volume_max": 3_000_000.0,
-                "float_min": 5e7, "price_drop_pct": 5.0, "price_drop_days": 5, "max_stocks": 30}
-    out = S.StockScreener({f"screener_{k}": v for k, v in settings.items()}).screen()
-    diag = {}
-    panel = world.panel()
-    cols = panel.columns(panel.pos(DAY))
-    pk = panel.peak_by_day(5)[panel.pos(DAY)]
-    arr = np.array([world.open_now[s] for s in world.symbols])
-    ls.select_from_columns(**cols, peak=pk, now=arr, settings=settings, beh=ls.POST_FIX, diag=diag)
-    st = out["stats"]
-    for k in ("dropped_float", "dropped_volume_min", "dropped_volume_max", "dropped_no_history", "dropped_rvol"):
-        assert diag[k] == st[k], (k, diag, st)
-    assert diag["final"] == st["final_count"]
-
-
-def test_panel_roundtrip_is_memory_mapped_and_complete(tmp_path):
-    world = World(4, n_sym=10)
-    panel = world.panel()
-    man = {"shares_vendor_snapshot": "x", "shares_lag_days": 45, "fresh_fraction": 1.0,
-           "last_bar_date": world.sessions[-2], "source_fingerprint": "f"}
-    ls.save_panel(str(tmp_path / "p"), world.symbols, world.sessions, {k: np.asarray(v) for k, v in panel.arrays.items()}, man)
-    back = ls.load_panel(str(tmp_path / "p"))
-    assert back.manifest["criteria_version"] == ls.CRITERIA_VERSION
-    for k in panel.arrays:
-        assert np.array_equal(np.asarray(back.arrays[k]), np.asarray(panel.arrays[k]), equal_nan=True), k
-    st = {"market_cap_min": 1e9, "relative_volume_min": 0.5, "max_stocks": 10}
-    now = world.now_fn()
-    assert back.select(DAY, st, ls.POST_FIX, now=now) == panel.select(DAY, st, ls.POST_FIX, now=now)
+def test_split_basis_market_cap_and_price_thresholds_use_the_as_traded_figures():
+    """The OHLCV cache is split-adjusted as of its fetch, the vendor's share count is the RAW figure as of the day:
+    a 10:1 split LATER than the morning makes the raw price 10x the cached one and the raw cap = adjusted close x raw
+    shares x 10.  ``fac`` (the as-traded factor, NaN = unknown calendar) carries it."""
+    syms = np.array(["SPL", "PLAIN", "UNK"])
+    cols = _cols(3, symbols=syms, shares=np.array([1e7, 1e8, 1e8]), last_close=np.array([100.0, 100.0, 100.0]),
+                 fac=np.array([10.0, 1.0, np.nan]))
+    now = np.array([100.0, 100.0, 100.0])
+    # SPL: raw cap 100 x 10 x 1e7 = 1e10 (inside 5-10B inclusive); PLAIN: 1e10; UNK: unknown calendar -> not a candidate
+    got = ls.select_from_columns(**cols, now=now, settings={"market_cap_min": 5e9, "market_cap_max": 1e10, "max_stocks": 9},
+                                 beh=ls.POST_FIX)
+    assert [str(syms[i]) for i in got] == ["PLAIN", "SPL"]
+    # without the factor SPL would be a 1e9 name outside the band (the pre-fix bug)
+    nofac = {k: v for k, v in cols.items() if k != "fac"}
+    got0 = ls.select_from_columns(**nofac, now=now, settings={"market_cap_min": 5e9, "market_cap_max": 1e10, "max_stocks": 9},
+                                  beh=ls.POST_FIX)
+    assert [str(syms[i]) for i in got0] == ["PLAIN", "UNK"]
+    # price ceiling compares the AS-TRADED price: SPL traded at 1000 raw, PLAIN at 100
+    got2 = ls.select_from_columns(**cols, now=now, settings={"market_cap_min": 5e9, "price_max": 500.0, "max_stocks": 9},
+                                  beh=ls.POST_FIX)
+    assert [str(syms[i]) for i in got2] == ["PLAIN"]

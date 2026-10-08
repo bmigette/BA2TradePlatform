@@ -2,50 +2,43 @@
 
 LIVE IS THE REFERENCE AND IS NOT CHANGED.  This module reproduces, for a decision day D and a finite
 universe, what ``ba2_providers.StockScreener.StockScreener(...).screen()`` (``as_of=None``) would have returned
-at the open of D, from stored data only.  Order of operations (identical to live, see ``select_from_columns``):
+at the decision instant T of D, from stored data only.  Order of operations (identical to live, see ``select_from_columns``):
 
-  1. vendor stage      band on the market cap (inclusive), price floor / ceiling on the vendor ``price`` (the
-                       quote), ``volume_min`` on the vendor ``volume`` (today's session volume so far); the
-                       vendor returns the rows sorted by market cap, descending
-  2. RVOL stage        (only when ``relative_volume_min > 0``): rvol >= min, ``volume_max`` on the last finished
-                       session's volume
+  1. vendor stage      band on the market cap (previous close x the vendor's share count, inclusive), price floor /
+                       ceiling on the quote ("now"); sorted by market cap, descending
+  1b. float            unknown float passes; ``float_min <= float <= float_max``
+  2. volume / RVOL     ALWAYS: no finished bars -> dropped; ``rvol >= rvol_min`` (if > 0), ``avg_volume >= volume_min``,
+                       ``avg_volume <= volume_max``
   3. Weinstein         (optional) stage 2 only
-  4. rank              by market cap, descending (stable)
+  4. rank              by market cap, descending (ties: symbol ascending)
   5. price drop        walk the ranked list, keep ``drop >= price_drop_pct``, stop after ``max_stocks`` passes
 
-WHAT IS IMPORTED FROM LIVE, WHAT IS RE-WRITTEN.  ``classify_weinstein_stage`` is imported from
-``ba2_common.core.weinstein`` (live calls the same function; the panel's vectorised stage is tested against it).
-The RVOL, price-drop and Weinstein-window formulas of live are entangled with HTTP (``_fetch_history_bulk``) so
-their pure equivalents live here (``rvol_scalar``, ``drop_scalar``, ``weinstein_scalar``) and
-``packages/providers/tests/test_live_sim_parity.py`` feeds the SAME bars to live's code path (HTTP faked at
-``fmp_http_get``) and to these functions, asserting equality on many random inputs; the vectorised panel is in
-turn asserted equal to the scalar functions.  ``StockScreener.screen()`` itself is run end to end against the same
-faked vendor and compared with ``select_from_columns``.
+"NOW" AND THE FORMING DAILY BAR.  Live reads FMP's daily history at the scheduled instant T: the history carries the
+session's FORMING bar (dated today).  The simulation models it as: close = the price at T ("now"), high = the highest
+high over the session's intraday bars ENDED <= T (+ the open), and uses it (i) as the last close of the Weinstein
+input, (ii) as one of the last ``n`` bars of the drop window (its high joins the peak), (iii) as the drop test's
+current price.  "now" = the close of the latest bar ended at or before T (the ``DecisionPrice`` rule), the OPENING
+PRINT only when T lies inside the session's first bar (owner-approved, screener only).  A candidate with no price
+is not a candidate: there is no fallback price.
 
-THE THREE LIVE BEHAVIOURS UNDER REVISION (branch ``fix/live-screener-quirks``) are isolated in ``LiveBehaviour``
-and the three marked functions ``float_filter_applies``, ``volume_min_test`` and ``rvol_stage_runs``; nothing else
-in this module knows about them.  ``behaviour_from_live()`` reads the capability flags the fix branch sets on
-``StockScreener`` (``SUPPORTS_FLOAT_FILTER``, ``VOLUME_MIN_IS_AVERAGE``, ``RVOL_ZERO_SKIPS_STAGE``; defaults =
-the current quirky behaviour).  ``LEGACY_CURRENT`` is the behaviour that produced the September-October 2026
-recorded live picks; it is a VALIDATION-ONLY parameter (``tools/screener_parity_report.py --behaviour legacy``),
-no job path passes it.
+WHAT IS IMPORTED FROM LIVE, WHAT IS RE-WRITTEN.  ``classify_weinstein_stage`` is imported from
+``ba2_common.core.weinstein``.  The RVOL, price-drop and Weinstein-window formulas of live are entangled with HTTP
+(``_fetch_history_bulk``) so their pure equivalents live here (``rvol_scalar``, ``drop_scalar``, ``weinstein_scalar``)
+and ``packages/providers/tests/test_live_sim_parity.py`` feeds the SAME bars to live's code path (HTTP faked at
+``fmp_http_get``) and to these functions on random worlds; ``StockScreener.screen()`` itself is run end to end against
+the same faked vendor and compared with ``select_from_columns``.
+
+JOBS SIMULATE ``POST_FIX`` (live as of ``fix/live-screener-quirks``), hard-coded; ``LEGACY_CURRENT`` (the code that
+produced the 2026-09/10 recorded picks) exists for VALIDATION only (``tools/screener_parity_report.py``).
 
 WHAT THE BACKTEST CANNOT REPRODUCE (measured sizes in ``docs/plans/2026-10-08-screener-live-sim.md``):
-  * the live quote's exact second (30-90 s after the open): "now" for the drop / price floor is the opening
-    print of the session (owner-approved exception, screener only) when the decision is on the first bar, else
-    the latest ENDED intraday bar's close at T.  Drop margins within ~1.8 % of price flip with it.
-  * the vendor's share count per past date: ``shares`` = FMP's implied share series (cached historical market cap
-    / close) delayed by ``SHARES_LAG_DAYS`` (filing lag) and scaled per symbol to the vendor's own count of the
-    most recent vendor snapshot.  The market cap used for the band is ``close(D-1) x shares``.
-  * volume so far at T: summed over ENDED intraday bars; 0 on a first-bar decision (the first minutes' volume
-    is not knowable from ended bars).  A ``volume_min`` > 0 therefore selects NOTHING on a first-bar decision.
-  * tie order of equal market caps (the vendor's order is unknown): symbol ascending.
-  * the rank key: live re-reads the cap from ``/quote`` before ranking when the RVOL stage ran; the simulation
-    ranks by the band cap (previous close x shares).  Differs only for neighbours at the ``max_stocks`` cut.
-  * a bar of D that FMP returns during the session (forming bar) is treated as absent (measured identical).
-  * missing bars of a symbol inside a window (cache gaps) are skipped; the n-session trim of the drop window is
-    applied on the common NYSE session grid.
-  * delisted / renamed names: the universe is the finite store universe.
+  * the live quote's exact second (30-90 s after the open at 09:30);
+  * the vendor's share count per past date: the vendor's own dated series when fetched
+    (``prewarm --screener-panel``), else FMP's implied series delayed by ``SHARES_LAG_DAYS``;
+  * tie order of equal market caps (the vendor's order is unknown): symbol ascending;
+  * the rank key: live ranks by the refreshed ``/quote`` cap; the simulation by previous close x shares;
+  * missing bars of a symbol inside a window (cache gaps) are skipped; the n-session trim is applied on the common
+    NYSE session grid; delisted / renamed names: the universe is the finite store universe.
 """
 from __future__ import annotations
 
@@ -64,7 +57,7 @@ CRITERIA_VERSION = "live-daily-v1"
 CRITERIA_NAME_TOKEN = "-lds1"
 #: Filing lag applied to the implied share series (days).  See ``build_shares_matrix``.
 SHARES_LAG_DAYS = 45
-PANEL_FORMAT = 3          # 3: day-major arrays (sessions x symbols): one decision day is one contiguous row
+PANEL_FORMAT = 4          # 4: day-major (sessions x symbols), + the as-traded split factor `fac`
 
 #: FMP's ``historical-price-full`` returns the session's FORMING bar when queried at ~09:31 (dated today, close =
 #: the current price).  Live's price-drop window and its Weinstein filter read bars WITHOUT dropping it (only the
@@ -117,10 +110,9 @@ LEGACY_CURRENT = LiveBehaviour("legacy-pre-fix", float_filter=False, volume_is_a
 
 
 def behaviour_from_live() -> LiveBehaviour:
-    """The behaviour of the live screener in THIS checkout: the post-fix contract when the checkout carries
-    ``ba2_providers.screener.float_filter`` (the fix's module), else the pre-fix one."""
-    import importlib.util
-    return POST_FIX if importlib.util.find_spec("ba2_providers.screener.float_filter") else LEGACY_CURRENT
+    """What JOBS simulate: ``POST_FIX``, hard-coded (never decided by which modules this checkout happens to carry);
+    its name is part of the job identity (``screener_opt.behaviour``)."""
+    return POST_FIX
 
 
 def weinstein_forming_pass(wa: np.ndarray, wp: np.ndarray, x: np.ndarray) -> np.ndarray:
@@ -245,16 +237,30 @@ def weinstein_scalar(dates: Sequence[str], closes: Sequence[float], day: str, fo
 # ======================================================================================================
 _NOW = Union[np.ndarray, Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray]]]
 
-#: Which price the vendor's / the refreshed market cap is struck on at the open.  The live verdict of the
-#: open-snapshot experiment decides; ONE-LINE SWITCH ("prev_close" | "now").  Assumed until measured:
-#: the previous close (fit of the 2026-09/10 recorded days; XENE 2026-09-18).
-BAND_CAP_BASIS = "prev_close"       # stage-1 vendor band
-RANK_CAP_BASIS = "prev_close"       # rank key after the stage-2 refresh (/quote marketCap)
+#: The rank key after the stage-2 refresh is the previous close x shares.  (A "now x shares" basis and a band struck on the
+#: quote were prototyped and DELETED: the 09:30 open-snapshot experiment has no verdict yet and an untested branch is
+#: worse than none.  When the verdict says "now", add it here with a differential test against live.)
+BAND_CAP_BASIS = "prev_close"
+RANK_CAP_BASIS = "prev_close"
 
 
 def _fnum(settings: Dict[str, Any], key: str) -> float:
     v = settings.get(key)
     return 0.0 if v is None else float(v)
+
+
+def require_complete_settings(settings: Dict[str, Any], *, where: str = "screener settings") -> None:
+    """REFUSE a settings dict that lacks any key that decides a selection.  Live would run a missing key on
+    ``StockScreener._DEFAULTS`` (price_min 20, volume_min 500,000, float_min 10M ...) while the simulation read it as
+    off: a genome would be backtested without the floors and deployed with them.  No fallback defaults."""
+    from ba2_common.core.deploy_parity import missing_screener_keys
+    miss = missing_screener_keys(settings)
+    if miss:
+        raise SimulationRefusal(
+            f"{where}: missing selection key(s) {miss}. State every one explicitly (the launcher's built-in base "
+            f"states price_min, price_max, volume_min, volume_max, float_min, float_max = 0 and sort_metric "
+            f"market_cap; override with --screener-base-json). A missing key would run on StockScreener's "
+            f"defaults live.")
 
 
 def check_settings(settings: Dict[str, Any], beh: LiveBehaviour) -> None:
@@ -273,92 +279,102 @@ def check_settings(settings: Dict[str, Any], beh: LiveBehaviour) -> None:
 def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: np.ndarray, rvol: np.ndarray,
                         last_vol: np.ndarray, avg20: np.ndarray, w2: np.ndarray, fl: np.ndarray,
                         peak: Optional[np.ndarray], now: _NOW, wa: Optional[np.ndarray] = None,
-                        wp: Optional[np.ndarray] = None,
+                        wp: Optional[np.ndarray] = None, fac: Optional[np.ndarray] = None,
                         settings: Dict[str, Any], beh: LiveBehaviour,
                         vol_today: Optional[Callable[[np.ndarray], np.ndarray]] = None,
                         valid: Optional[np.ndarray] = None, cut: bool = True,
-                        band_basis: Optional[str] = None, rank_basis: Optional[str] = None,
                         diag: Optional[Dict[str, int]] = None,
                         forming_hi: Optional[Callable[[np.ndarray], np.ndarray]] = None) -> np.ndarray:
     """Indices (into the column arrays) of the symbols live would return, IN LIVE'S ORDER.
 
-    ``now(idx)`` -> ``(now_lo, now_hi)`` per candidate: the price knowable at T (equal arrays), or the day's
-    low / high bounds for the SUPERSET (the same function, a looser input).  ``vol_today(idx)`` -> session
-    volume so far (needed only by the pre-fix ``LEGACY_CURRENT`` ``volume_min``).  ``peak`` = highest high over
-    live's drop window (``None`` when no drop filter is set).  ``cut=False`` returns every symbol that passes
-    the filters (no ``max_stocks`` cut) for the superset / prune.  Ties on the rank key: symbol ascending.
-    ``forming_hi(idx)`` -> the HIGH of the forming daily bar through the decision instant T (session open and the
-    highest high of the intraday bars ended <= T; at a first-bar decision the opening print); it joins the drop
+    ``now(idx)`` -> ``(now_lo, now_hi)`` per candidate: the price knowable at T (equal arrays), or the session's
+    low / high bounds for the SUPERSET (the same function, a looser input).  It is evaluated LAZILY, only when a
+    stage needs a price (price floor / ceiling, the forming-bar Weinstein, the drop test) and only for the
+    candidates still alive.  A candidate with no finite price is NOT a candidate (``dropped_no_price``): there is
+    no fallback price.  ``vol_today(idx)`` -> session volume so far (only the pre-fix ``LEGACY_CURRENT``
+    ``volume_min``).  ``peak`` = highest high over live's finished-session drop window (``None`` when no drop filter).
+    ``cut=False`` returns every symbol that passes the filters (no ``max_stocks`` cut) for the superset / prune.
+    Ties on the rank key: symbol ascending.
+    ``forming_hi(idx)`` -> the HIGH of the forming daily bar through the decision instant T (the session open and the
+    highest high of the intraday bars ended <= T; inside the first bar the opening print); it joins the drop
     window's peak.  ``None``: the forming bar is the single price ``now`` (high = low = close = now).  The superset
     passes the session's full-day high (>= every high-so-far).
     ``diag``, when given, receives live's stage accounting (``stage1``, ``dropped_float``, ``dropped_no_history``,
-    ``dropped_rvol``, ``dropped_volume_min``, ``dropped_volume_max``, ``weinstein``, ``price_drop``, ``final``)."""
+    ``dropped_no_price``, ``dropped_rvol``, ``dropped_volume_min``, ``dropped_volume_max``, ``weinstein``,
+    ``price_drop``, ``final``)."""
     check_settings(settings, beh)
-    band_basis = band_basis or BAND_CAP_BASIS
-    rank_basis = rank_basis or RANK_CAP_BASIS
     symbols = np.asarray(symbols)
     if symbols.dtype.kind != "U":
         symbols = symbols.astype(str)
-    mcap_prev = last_close * shares
+    # AS-TRADED BASIS of the morning: the OHLCV cache is split-adjusted as of its fetch, the vendor's share count (and the
+    # quote live compares with price_min / price_max) is the raw figure as of D; ``fac`` = product of the ratios of the
+    # splits dated AFTER D (``as_traded_factor``), NaN = the split calendar is unknown (not a candidate).
+    mcap_prev = last_close * shares * (fac if fac is not None else 1.0)
     ok = np.isfinite(mcap_prev) & (mcap_prev > 0)
     if valid is not None:
         ok &= valid
     cmin, cmax = _fnum(settings, "market_cap_min"), _fnum(settings, "market_cap_max")
-    if band_basis == "prev_close":
-        if cmin > 0:
-            ok &= mcap_prev >= cmin
-        if cmax > 0:
-            ok &= mcap_prev <= cmax
-        idx = np.flatnonzero(ok)
-    else:                                  # "now": the band is struck on the quote; pre-select loosely first
-        if cmin > 0:
-            ok &= mcap_prev >= 0.5 * cmin
-        if cmax > 0:
-            ok &= mcap_prev <= 2.0 * cmax
-        idx = np.flatnonzero(ok)
-        n_lo, _n_hi = now(idx) if callable(now) else (np.asarray(now)[idx], np.asarray(now)[idx])
-        px = np.where(np.isfinite(n_lo), n_lo, last_close[idx])
-        c_now = px * shares[idx]
-        k = np.ones(idx.size, dtype=bool)
-        if cmin > 0:
-            k &= c_now >= cmin
-        if cmax > 0:
-            k &= c_now <= cmax
-        idx = idx[k]
+    if cmin > 0:
+        ok &= mcap_prev >= cmin
+    if cmax > 0:
+        ok &= mcap_prev <= cmax
+    idx = np.flatnonzero(ok)
+    dg: Dict[str, int] = diag if diag is not None else {}
+    dg["stage1"] = int(idx.size)
+    for k_ in ("dropped_float", "dropped_no_history", "dropped_no_price", "dropped_rvol", "dropped_volume_min",
+               "dropped_volume_max"):
+        dg[k_] = 0
     if idx.size == 0:
+        dg["final"] = 0
         return idx
     idx = idx[np.lexsort((symbols[idx], -mcap_prev[idx]))]     # vendor order: cap descending, ties by symbol
-    if callable(now):
-        now_lo, now_hi = now(idx)
-    else:
-        now_lo = now_hi = np.asarray(now)[idx]
+    lo = hi = None                                             # "now" bounds, aligned with idx once evaluated
+
+    def keep(mask: np.ndarray) -> None:
+        nonlocal idx, lo, hi
+        idx = idx[mask]
+        if lo is not None:
+            lo, hi = lo[mask], hi[mask]
+
+    def need_now() -> None:
+        nonlocal lo, hi
+        if lo is None and idx.size:
+            if callable(now):
+                a, b = now(idx)
+                lo, hi = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+            else:
+                lo = hi = np.asarray(now, dtype=float)[idx]
+        if lo is not None:
+            bad = ~(np.isfinite(lo) & np.isfinite(hi) & (lo > 0))
+            if bad.any():
+                dg["dropped_no_price"] += int(bad.sum())
+                keep(~bad)
+
     pmin, pmax = _fnum(settings, "price_min"), _fnum(settings, "price_max")
-    keep = np.ones(idx.size, dtype=bool)
-    with np.errstate(invalid="ignore"):
-        if pmin > 0:
-            keep &= now_hi >= pmin
-        if pmax > 0:
-            keep &= now_lo <= pmax
+    if pmin > 0 or pmax > 0:
+        need_now()
+        f_ = fac[idx] if fac is not None else 1.0
+        with np.errstate(invalid="ignore"):
+            m = np.ones(idx.size, dtype=bool)
+            if pmin > 0:
+                m &= hi * f_ >= pmin
+            if pmax > 0:
+                m &= lo * f_ <= pmax
+        keep(m)
     vmin, vmax = _fnum(settings, "volume_min"), _fnum(settings, "volume_max")
-    if not beh.volume_is_average and vmin > 0:             # pre-fix: the VENDOR tests today's session volume
+    if not beh.volume_is_average and vmin > 0 and idx.size:     # pre-fix: the VENDOR tests today's session volume
         if vol_today is None:
             raise SimulationRefusal("pre-fix volume_min needs the session volume so far (vol_today)")
         with np.errstate(invalid="ignore"):
-            keep &= vol_today(idx) >= vmin
-    idx, now_lo, now_hi = idx[keep], now_lo[keep], now_hi[keep]
+            keep(vol_today(idx) >= vmin)
     # stage 1b: float (post-fix)
-    dg: Dict[str, int] = diag if diag is not None else {}
-    dg["stage1"] = int(idx.size)
-    dg["dropped_float"] = dg["dropped_no_history"] = dg["dropped_rvol"] = 0
-    dg["dropped_volume_min"] = dg["dropped_volume_max"] = 0
     if idx.size:
         fk = float_mask(beh, fl[idx], _fnum(settings, "float_min"), _fnum(settings, "float_max"))
         dg["dropped_float"] = int((~fk).sum())
-        idx, now_lo, now_hi = idx[fk], now_lo[fk], now_hi[fk]
+        keep(fk)
     # stage 2: rvol + average-volume filters (+ the price / cap refresh, which is the rank key below)
     rvmin = _fnum(settings, "relative_volume_min")
-    stage2 = rvol_stage_runs(beh, rvmin)
-    if idx.size and stage2:
+    if idx.size and rvol_stage_runs(beh, rvmin):
         n_in = idx.size
         needs_bars = rvol_test_applies(rvmin) or vmin > 0 or vmax > 0
         if beh.volume_is_average and not np.isfinite(avg20[idx]).any():
@@ -376,56 +392,53 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
                             f"no finished daily bars for {int(nh.sum())}/{n_in} screened candidates (limit "
                             f"{SCREENER_DATA_FAILURE_MAX_FRACTION:.0%}); first: {[str(symbols[i]) for i in idx[nh][:8]]}: "
                             f"the OHLCV cache is incomplete")
-                    idx, now_lo, now_hi = idx[~nh], now_lo[~nh], now_hi[~nh]
+                    keep(~nh)
             if rvol_test_applies(rvmin) and idx.size:
                 k = rvol[idx] >= rvmin
                 dg["dropped_rvol"] = int((~k).sum())
-                idx, now_lo, now_hi = idx[k], now_lo[k], now_hi[k]
+                keep(k)
             if beh.volume_is_average:
                 if vmin > 0 and idx.size:
                     k = np.nan_to_num(avg20[idx], nan=0.0) >= vmin
                     dg["dropped_volume_min"] = int((~k).sum())
-                    idx, now_lo, now_hi = idx[k], now_lo[k], now_hi[k]
+                    keep(k)
                 if vmax > 0 and idx.size:
                     k = ~(avg20[idx] > vmax)
                     dg["dropped_volume_max"] = int((~k).sum())
-                    idx, now_lo, now_hi = idx[k], now_lo[k], now_hi[k]
+                    keep(k)
             elif vmax > 0 and idx.size:                 # pre-fix: the last session's volume
                 k = ~(last_vol[idx] > vmax)
                 dg["dropped_volume_max"] = int((~k).sum())
-                idx, now_lo, now_hi = idx[k], now_lo[k], now_hi[k]
+                keep(k)
     wflag = settings.get("weinstein_stage2_only")
     if idx.size and wflag is not None and float(wflag) > 0:
         if FORMING_BAR_PRESENT and wa is not None:
-            # the forming bar's close is the price at T; its best case (superset bounds) is the day's high
-            x = np.where(np.isfinite(now_hi) & (now_hi > 0), now_hi, last_close[idx])
-            k = weinstein_forming_pass(wa[idx], wp[idx], x)
+            # the forming bar's close is the price at T; its best case (superset bounds) is the session high
+            need_now()
+            k = weinstein_forming_pass(wa[idx], wp[idx], hi) if idx.size else np.zeros(0, dtype=bool)
         else:
             k = w2[idx]
-        idx, now_lo, now_hi = idx[k], now_lo[k], now_hi[k]
+        keep(k)
         dg["weinstein"] = int(idx.size)
     if idx.size == 0:
         dg["final"] = 0
         return idx
     # rank: the stage-2 refresh replaced the cap by the live /quote cap (post-fix: always)
     sm = settings.get("sort_metric") or "market_cap"
-    if sm == "relative_volume":
-        order = np.lexsort((symbols[idx], -rvol[idx]))
-    elif rank_basis == "now" and stage2:
-        px = np.where(np.isfinite(now_lo) & (now_lo > 0), now_lo, last_close[idx])
-        order = np.lexsort((symbols[idx], -(px * shares[idx])))
-    else:
-        order = np.lexsort((symbols[idx], -mcap_prev[idx]))
-    idx, now_lo, now_hi = idx[order], now_lo[order], now_hi[order]
+    order = np.lexsort((symbols[idx], -(rvol[idx] if sm == "relative_volume" else mcap_prev[idx])))
+    idx = idx[order]
+    if lo is not None:
+        lo, hi = lo[order], hi[order]
     max_stocks = int(_fnum(settings, "max_stocks"))
     dpct, ddays = _fnum(settings, "price_drop_pct"), int(_fnum(settings, "price_drop_days"))
     if dpct > 0 and ddays > 0:
         if peak is None:
             raise SimulationRefusal("price_drop_pct > 0 but no peak column was supplied")
+        need_now()
+        cur = lo
         pk = peak[idx]
-        cur = np.where(np.isfinite(now_lo) & (now_lo > 0), now_lo, last_close[idx])
-        if FORMING_BAR_PRESENT:                       # the forming bar's high is part of the peak (>= the price now)
-            fh = forming_hi(idx) if forming_hi is not None else now_lo
+        if FORMING_BAR_PRESENT and idx.size:           # the forming bar's high is part of the peak (>= the price now)
+            fh = forming_hi(idx) if forming_hi is not None else lo
             pk = np.fmax(pk, np.where(np.isfinite(fh) & (fh > 0), fh, np.nan))
         with np.errstate(invalid="ignore", divide="ignore"):
             d = (pk - cur) / pk * 100.0
@@ -443,12 +456,25 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
     dg["final"] = int(idx.size)
     return idx
 
+
 # ======================================================================================================
 # The panel
 # ======================================================================================================
-_RAW = ("o", "h", "l", "c", "v", "shares", "fl")
+_RAW = ("o", "h", "l", "c", "v", "shares", "fl", "fac")
 _DERIVED = ("rvol", "avg20", "lv", "lc", "w2", "wa", "wp")
 _PANEL_FILES = {k: f"{k}.npy" for k in _RAW + _DERIVED}
+
+
+class _PeakView:
+    def __init__(self, panel: "DailyPanel", n: int, transpose: bool):
+        self._p, self._n, self._t = panel, n, transpose
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            a, b = key
+            p, i = (b, a) if self._t else (a, b)
+            return self._p.peak_row(self._n, int(p))[i]
+        return self._p.peak_row(self._n, int(key))
 
 
 class DailyPanel:
@@ -467,7 +493,9 @@ class DailyPanel:
         self.sym_index = {s: i for i, s in enumerate(symbols)}
         self._ord = np.array([date.fromisoformat(s).toordinal() for s in sessions], dtype=np.int64)
         self._sess_pos = {s: i for i, s in enumerate(sessions)}
-        self._peak: Dict[int, np.ndarray] = {}
+        import threading
+        self._lock = threading.Lock()
+        self._lo_memo: Dict[int, np.ndarray] = {}
         self._hl: Optional[np.ndarray] = None
 
     # -- geometry -----------------------------------------------------------------------------------
@@ -484,39 +512,43 @@ class DailyPanel:
         return np.searchsorted(self._ord, self._ord - (int(lookback) + CALENDAR_PAD), side="left")
 
     # -- peak(n) --------------------------------------------------------------------------------------
-    def peak(self, n: int) -> np.ndarray:
-        """(S, T) view of :meth:`peak_by_day` (symbols x sessions), for callers that index ``[symbol, day]``."""
-        return self.peak_by_day(n).T
+    def _lo_for(self, n: int) -> np.ndarray:
+        got = self._lo_memo.get(n)
+        if got is None:
+            got = self._lo_memo.setdefault(n, self._lo_index(n))
+        return got
 
-    def peak_by_day(self, n: int) -> np.ndarray:
-        """(T, S) highest high over live's drop window of lookback ``n`` for every morning (memoised per ``n``).
-        Window = sessions dated in [D-(n+5) days, D) plus the FORMING bar, the last ``n`` bars of that list (so the
-        last ``n-1`` finished sessions when the forming bar is present); NaN where there is no bar."""
-        n = int(n)
-        got = self._peak.get(n)
-        if got is not None:
-            return got
+    def _hl_arr(self) -> np.ndarray:
         if self._hl is None:
-            h = np.asarray(self.arrays["h"]); l = np.asarray(self.arrays["l"])          # (T, S)
-            hl = np.fmax(np.nan_to_num(h, nan=-np.inf), np.nan_to_num(l, nan=-np.inf))
-            hl[~np.isfinite(hl)] = np.nan
-            self._hl = hl
-        hl = self._hl
-        T, S = hl.shape
-        lo = self._lo_index(n)
-        p = np.arange(T)
-        out = np.full((T, S), np.nan)
-        lim = n - 1 if FORMING_BAR_PRESENT else n           # the forming bar takes one of live's ``bars[-n:]``
-        for j in range(1, lim + 1):
-            rows = np.flatnonzero((p - j) >= np.maximum(lo, 0))   # session p-j lies inside the calendar window
-            rows = rows[rows >= j]
-            if rows.size == 0:
-                break
-            out[rows] = np.fmax(out[rows], hl[rows - j])
-        if len(self._peak) >= 6:
-            self._peak.pop(next(iter(self._peak)))
-        self._peak[n] = out
-        return out
+            with self._lock:
+                if self._hl is None:
+                    h = np.asarray(self.arrays["h"]); l = np.asarray(self.arrays["l"])      # (T, S)
+                    hl = np.fmax(np.nan_to_num(h, nan=-np.inf), np.nan_to_num(l, nan=-np.inf))
+                    hl[~np.isfinite(hl)] = np.nan
+                    self._hl = hl
+        return self._hl
+
+    def peak_row(self, n: int, p: int) -> np.ndarray:
+        """(S,) highest ``max(high, low)`` over live's drop window of lookback ``n`` on the morning at position ``p``:
+        the finished sessions dated in [D-(n+5) days, D), the last ``n-1`` of them when the forming bar takes the
+        n-th slot (``FORMING_BAR_PRESENT``); NaN where there is no bar.  Computed per row (no per-n cache: a row costs
+        ~n x S float ops, 0.1 ms), so there is nothing to evict and nothing shared between threads but the read-only
+        ``max(high, low)`` array."""
+        n = int(n)
+        hl = self._hl_arr()
+        lim = n - 1 if FORMING_BAR_PRESENT else n
+        start = max(int(self._lo_for(n)[p]), p - lim, 0)
+        if start >= p:
+            return np.full(hl.shape[1], np.nan)
+        return np.fmax.reduce(hl[start:p], axis=0)
+
+    def peak_by_day(self, n: int) -> "_PeakView":
+        """Row-indexed view ``[p]`` / ``[p, symbol_index]`` over :meth:`peak_row` (tests and the report tool)."""
+        return _PeakView(self, int(n), transpose=False)
+
+    def peak(self, n: int) -> "_PeakView":
+        """The same view indexed ``[symbol_index, p]``."""
+        return _PeakView(self, int(n), transpose=True)
 
     # -- one day's columns ------------------------------------------------------------------------------
     def columns(self, p: int) -> Dict[str, np.ndarray]:
@@ -526,7 +558,7 @@ class DailyPanel:
                 "rvol": np.asarray(a["rvol"][p]), "last_vol": np.asarray(a["lv"][p]),
                 "avg20": np.asarray(a["avg20"][p]), "w2": np.asarray(a["w2"][p]).astype(bool),
                 "wa": np.asarray(a["wa"][p]), "wp": np.asarray(a["wp"][p]),
-                "fl": np.asarray(a["fl"][p]), "last_close": lc}
+                "fl": np.asarray(a["fl"][p]), "fac": np.asarray(a["fac"][p], dtype=np.float64), "last_close": lc}
 
     def day_bounds(self, p: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(low, high, volume) of the session AT position p: the bounds any intraday 'now' / volume so far lies in
@@ -541,23 +573,37 @@ class DailyPanel:
         p = self.pos(day)
         cols = self.columns(p)
         dpct, ddays = _fnum(settings, "price_drop_pct"), int(_fnum(settings, "price_drop_days"))
-        peak = self.peak_by_day(ddays)[p] if dpct > 0 and ddays > 0 else None
+        peak = self.peak_row(ddays, p) if dpct > 0 and ddays > 0 else None
         idx = select_from_columns(**cols, peak=peak, now=now, vol_today=vol_today, settings=settings, beh=beh,
                                   valid=valid, cut=cut, diag=diag,
                                   forming_hi=forming_hi)
         return [str(self.symbols[i]) for i in idx]
 
     def select_bounds(self, day: str, settings: Dict[str, Any], beh: LiveBehaviour, *, cut: bool = False,
-                      valid: Optional[np.ndarray] = None) -> List[str]:
-        """The SAME selection with ``now`` replaced by the session's [low, high] and the volume so far by the
-        full-day volume: a superset of what the gate returns at ANY decision time T of that session."""
+                      valid: Optional[np.ndarray] = None, daily_clock: bool = False) -> List[str]:
+        """The SAME selection with ``now`` replaced by bounds of everything the gate can read for this morning:
+        a superset of what the gate returns at ANY decision time T.
+
+        INTRADAY clock: [min(session low, previous close), max(session high, previous close)] (the previous close
+        covers a name that has not traded yet at T: its price is the last session's last bar).  The forming bar's
+        high is bounded by the session high.  DAILY clock: the gate reads session D's CLOSE, which for the morning
+        of the next session is the previous close ``lc`` itself: a degenerate interval."""
         p = self.pos(day)
-        lo, hi, vol = self.day_bounds(p)
+        a = self.arrays
+        lc = np.asarray(a["lc"][p])
+        if daily_clock:
+            lo = hi = fh = lc
+            vol = np.zeros_like(lc)
+        else:
+            lo = np.fmin(np.asarray(a["l"][p]), lc)
+            hi = np.fmax(np.asarray(a["h"][p]), lc)
+            fh = hi
+            vol = np.asarray(a["v"][p])
 
         def _now(idx):
             return lo[idx], hi[idx]
         return self.select(day, settings, beh, now=_now, vol_today=lambda idx: vol[idx], cut=cut, valid=valid,
-                           forming_hi=lambda idx: hi[idx])
+                           forming_hi=lambda idx: fh[idx])
 
 
 # ======================================================================================================
@@ -636,7 +682,7 @@ def _derive_symbol(sess_ord: np.ndarray, vi: np.ndarray, vol: np.ndarray, cl: np
 
 def build_panel_arrays(bars: Dict[str, Tuple[np.ndarray, ...]], sessions: List[str],
                        shares: Optional[np.ndarray], symbols: List[str], progress: Optional[Callable[[str], None]] = None,
-                       fl: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
+                       fl: Optional[np.ndarray] = None, fac: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
     """``bars[sym] = (session_idx, o, h, l, c, v)`` -> the raw and derived arrays.  Pure numpy."""
     S, T = len(symbols), len(sessions)
     sess_ord = np.array([date.fromisoformat(s).toordinal() for s in sessions], dtype=np.int64)
@@ -646,6 +692,7 @@ def build_panel_arrays(bars: Dict[str, Tuple[np.ndarray, ...]], sessions: List[s
     arr["wp"] = np.full((S, T), np.nan)
     arr["shares"] = np.full((S, T), np.nan) if shares is None else shares
     arr["fl"] = np.full((S, T), np.nan) if fl is None else fl
+    arr["fac"] = (np.ones((S, T), dtype=np.float32) if fac is None else np.asarray(fac, dtype=np.float32))
     lo_rv = np.searchsorted(sess_ord, sess_ord - (RVOL_LOOKBACK_DAYS + CALENDAR_PAD), side="left")
     lo_w = np.searchsorted(sess_ord, sess_ord - (WEINSTEIN_LOOKBACK_DAYS + CALENDAR_PAD), side="left")
     for s, sym in enumerate(symbols):
@@ -663,37 +710,84 @@ def build_panel_arrays(bars: Dict[str, Tuple[np.ndarray, ...]], sessions: List[s
     return {k: np.ascontiguousarray(np.asarray(v).T) for k, v in arr.items()}
 
 
-def panel_dir_for(cache_folder: str, name: str = "daily_panel") -> str:
-    return os.path.join(cache_folder, "screener", name)
+def panel_root(cache_folder: str) -> str:
+    return os.path.join(cache_folder, "screener", "daily_panel")
+
+
+def panel_dir_for(cache_folder: str, fingerprint: str) -> str:
+    """Each panel lives in its OWN directory named by its fingerprint: ``cache push`` compares (path, size), and the
+    panel's ``.npy`` files have fixed sizes, so a rebuilt panel written over the old one would never reach a worker."""
+    return os.path.join(panel_root(cache_folder), fingerprint)
+
+
+def panel_rel(cache_folder: str, path: str) -> str:
+    """The panel path RELATIVE to the cache root (what a job stores: the master's absolute path means nothing on a
+    worker)."""
+    return os.path.relpath(path, cache_folder).replace("\\", "/")
+
+
+def resolve_panel_path(stored: str, cache_folder: Optional[str] = None) -> str:
+    """The local directory of a stored panel reference (relative to THIS machine's cache root; absolute paths are
+    used as given: scratch builds and tests)."""
+    if os.path.isabs(stored):
+        return stored
+    if cache_folder is None:
+        import ba2_common.config as _cfg
+        cache_folder = _cfg.CACHE_FOLDER
+    return os.path.join(cache_folder, *stored.split("/"))
+
+
+def list_panels(cache_folder: str) -> List[Tuple[str, Dict[str, Any], float]]:
+    """``[(dir, manifest, size_mb)]`` of every complete panel under the cache, newest first."""
+    return list_panels_in(panel_root(cache_folder))
+
+
+def list_panels_in(root: str) -> List[Tuple[str, Dict[str, Any], float]]:
+    out = []
+    if os.path.isdir(root):
+        for name in os.listdir(root):
+            d = os.path.join(root, name)
+            man = read_manifest(d) if os.path.isdir(d) else None
+            if man:
+                size = sum(os.path.getsize(os.path.join(d, f)) for f in os.listdir(d)) / 1e6
+                out.append((d, man, size))
+    return sorted(out, key=lambda t: t[1].get("built_at", ""), reverse=True)
+
+
+def latest_panel(cache_folder: str) -> Optional[str]:
+    """The newest complete panel directory on THIS machine, or None.  Resolved once at LAUNCH and stamped on the job
+    (path relative to the cache + fingerprint); a job never switches panel afterwards."""
+    lp = list_panels(cache_folder)
+    return lp[0][0] if lp else None
 
 
 def save_panel(path: str, symbols: List[str], sessions: List[str], arrays: Dict[str, np.ndarray],
                manifest: Dict[str, Any]) -> None:
+    """Write the panel into ``path`` (a fingerprint-named directory).  Every file is written as ``<name>.tmp`` and
+    renamed, the manifest LAST: a directory without a manifest is not a panel, and ``.tmp`` files are never shipped by
+    ``cache push``."""
     os.makedirs(path, exist_ok=True)
-    tmp = path + ".building"
-    os.makedirs(tmp, exist_ok=True)
+
+    def _put(name: str, writer) -> None:
+        tmp = os.path.join(path, name + ".tmp")
+        with open(tmp, "wb") as f:
+            writer(f)
+        try:
+            os.replace(tmp, os.path.join(path, name))
+        except PermissionError as e:
+            raise SimulationRefusal(
+                f"cannot replace {name} of the panel at {path}: it is memory-mapped by a running process (Windows keeps "
+                f"it locked). Stop the optimizations/workers that use it. {e}") from None
+
     for k, a in arrays.items():
-        np.save(os.path.join(tmp, _PANEL_FILES[k]), a)
-    with open(os.path.join(tmp, "symbols.json"), "w") as f:
-        json.dump(symbols, f)
-    with open(os.path.join(tmp, "sessions.json"), "w") as f:
-        json.dump(sessions, f)
+        _put(_PANEL_FILES[k], lambda f, a=a: np.save(f, a))
+    _put("symbols.json", lambda f: f.write(json.dumps(symbols).encode()))
+    _put("sessions.json", lambda f: f.write(json.dumps(sessions).encode()))
     manifest = dict(manifest, criteria_version=CRITERIA_VERSION, panel_format=PANEL_FORMAT,
                     n_symbols=len(symbols), first_session=sessions[0], last_session=sessions[-1],
                     built_at=datetime.utcnow().isoformat(timespec="seconds"))
-    with open(os.path.join(tmp, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=1)
-    # swap in (the manifest is the last file written, so a half-built directory is never taken for a panel)
-    import shutil
-    try:
-        for fn in os.listdir(tmp):
-            os.replace(os.path.join(tmp, fn), os.path.join(path, fn))
-    except PermissionError as e:
-        raise SimulationRefusal(
-            f"cannot replace the panel at {path}: its files are memory-mapped by a running process (Windows keeps "
-            f"them locked). Stop the optimizations/workers that use it, or build into another directory "
-            f"(--screener-panel). {e}") from None
-    shutil.rmtree(tmp, ignore_errors=True)
+    manifest.setdefault("panel_fingerprint", str(manifest.get("source_fingerprint", ""))[:16])
+    _put("manifest.json", lambda f: f.write(json.dumps(manifest, indent=1).encode()))
 
 
 def read_manifest(path: str) -> Optional[Dict[str, Any]]:
@@ -714,6 +808,10 @@ def load_panel(path: str) -> DailyPanel:
     with open(os.path.join(path, "sessions.json")) as f:
         sessions = json.load(f)
     arrays = {k: np.load(os.path.join(path, fn), mmap_mode="r") for k, fn in _PANEL_FILES.items()}
+    bad = [f"{k} {tuple(a.shape)}" for k, a in arrays.items() if tuple(a.shape) != (len(sessions), len(symbols))]
+    if bad:
+        raise SimulationRefusal(f"panel at {path} is corrupt or half-synced: arrays {bad} do not match "
+                                f"(sessions {len(sessions)}, symbols {len(symbols)})")
     return DailyPanel(symbols, sessions, arrays, man)
 
 
@@ -730,7 +828,7 @@ def _sessions_of(path: str) -> List[str]:
 
 
 def panel_problems(path: str, start_day: str, end_day: str, *, warmup_days: int = 260,
-                   need_symbols: Optional[Iterable[str]] = None) -> List[str]:
+                   need_symbols: Optional[Iterable[str]] = None, expect_fp: Optional[str] = None) -> List[str]:
     """Every reason the panel at ``path`` cannot serve a run over [start_day, end_day] (empty = fine)."""
     man = read_manifest(path)
     if man is None:
@@ -751,14 +849,25 @@ def panel_problems(path: str, start_day: str, end_day: str, *, warmup_days: int 
                    f"(end {end_day[:10]})")
     if man["last_session"] < end_day[:10]:
         out.append(f"panel sessions end {man['last_session']}, the run ends {end_day[:10]}")
-    for need in ("shares_vendor_snapshot", "shares_lag_days", "fresh_fraction"):
+    for need in ("shares_vendor_snapshot", "shares_lag_days", "stale_listed_symbols", "panel_fingerprint"):
         if need not in man:
             out.append(f"panel manifest lacks {need!r}")
-    if man.get("fresh_fraction", 1.0) < 1.0 - SCREENER_DATA_FAILURE_MAX_FRACTION:
-        out.append(f"only {man['fresh_fraction']:.0%} of the panel's symbols have a bar within 6 days of its last bar "
-                   f"({man.get('last_bar_date')}): the OHLCV cache is incomplete (live refuses a screen with more "
-                   f"than {SCREENER_DATA_FAILURE_MAX_FRACTION:.0%} of candidates lacking history); run "
-                   f"`ba2-test fetch-cache --timeframes 1d` for the universe, then rebuild the panel")
+    if expect_fp is not None and man.get("panel_fingerprint") != expect_fp:
+        out.append(f"panel fingerprint {man.get('panel_fingerprint')!r} != the job's {expect_fp!r} (another panel was "
+                   f"built or synced under this path: a job never switches panel)")
+    if man.get("stale_listed_symbols"):
+        sl = man["stale_listed_symbols"]
+        out.append(f"{len(sl)} symbols are in the vendor's CURRENT listing but their daily bars are stale "
+                   f"(last bar > 6 days before {man.get('last_bar_date')}): {sl[:15]}; refresh them with "
+                   f"`ba2-test fetch-cache --timeframes 1d --symbols ...` and rebuild the panel (or acknowledge with "
+                   f"`--acknowledge-stale` at build time)")
+    if man.get("splits_unknown"):
+        su = man["splits_unknown"]
+        out.append(f"{len(su)} symbols have no split calendar (the as-traded basis of their market cap and price is "
+                   f"unknown): {su[:15]}; run `ba2-test prewarm --screener-panel` (it fetches the calendars)")
+    if man.get("shares_missing_listed"):
+        sm = man["shares_missing_listed"]
+        out.append(f"{len(sm)} listed symbols have no share-count source at all: {sm[:15]}")
     if need_symbols is not None:
         try:
             with open(os.path.join(path, "symbols.json")) as f:

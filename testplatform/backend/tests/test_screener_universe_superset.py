@@ -316,7 +316,7 @@ def _make_panel(cache):
     import numpy as np
     from datetime import date
     from ba2_providers.screener import live_sim as ls
-    if ls.read_manifest(str(cache / "screener" / "daily_panel")):
+    if ls.latest_panel(str(cache)):
         return                       # already built in this cache (a mapped panel cannot be replaced on Windows)
     sessions = [d.date().isoformat() for d in pd.bdate_range("2022-01-03", "2023-04-14")]
     T = len(sessions)
@@ -327,8 +327,9 @@ def _make_panel(cache):
         bars[sym] = (idx, c, c * 1.01, c * 0.99, c, np.full(idx.size, 2e6))
         shares[i] = (9.9e9 - i * 1e8) / 20.0
     arrays = ls.build_panel_arrays(bars, sessions, shares, ALL)
-    ls.save_panel(str(cache / "screener" / "daily_panel"), ALL, sessions, arrays,
-                  {"shares_vendor_snapshot": "t", "shares_lag_days": 45, "fresh_fraction": 1.0,
+    ls.save_panel(ls.panel_dir_for(str(cache), "testfp"), ALL, sessions, arrays,
+                  {"shares_vendor_snapshot": "t", "shares_lag_days": 45, "stale_listed_symbols": [],
+                   "panel_fingerprint": "testfp", "fresh_fraction": 1.0,
                    "last_bar_date": sessions[T - 16], "source_fingerprint": "t"})
 
 

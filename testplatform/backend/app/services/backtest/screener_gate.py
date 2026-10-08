@@ -32,17 +32,20 @@ class ScreenerGateRefusal(RuntimeError):
     """The panel gate cannot be built or used for this run (panel missing / wrong version / day not covered)."""
 
 
-def get_panel(path: str) -> ls.DailyPanel:
-    """The memory-mapped panel at ``path``, loaded once per process (the arrays are shared pages)."""
+def get_panel(path: str, expect_fp: Optional[str] = None) -> ls.DailyPanel:
+    """The memory-mapped panel at ``path``, loaded ONCE per process and never reloaded (a worker cannot switch gates
+    mid-job).  ``expect_fp`` = the fingerprint the job was launched with: a different panel at that path REFUSES."""
     pan = _PANEL_MEMO.get(path)
-    man = ls.read_manifest(path)
-    if pan is not None and man is not None and pan.manifest.get("source_fingerprint") == man.get("source_fingerprint"):
-        return pan
-    try:
-        pan = ls.load_panel(path)
-    except ls.SimulationRefusal as e:
-        raise ScreenerGateRefusal(str(e)) from None
-    _PANEL_MEMO[path] = pan
+    if pan is None:
+        try:
+            pan = ls.load_panel(path)
+        except ls.SimulationRefusal as e:
+            raise ScreenerGateRefusal(str(e)) from None
+        _PANEL_MEMO[path] = pan
+    if expect_fp is not None and pan.manifest.get("panel_fingerprint") != expect_fp:
+        raise ScreenerGateRefusal(
+            f"the panel at {path} has fingerprint {pan.manifest.get('panel_fingerprint')!r}, the job was launched with "
+            f"{expect_fp!r}: a job never switches panel (re-launch, or `cache push` the panel the job names)")
     return pan
 
 
@@ -87,11 +90,11 @@ def prune_symbols(panel: ls.DailyPanel, start_day: str, end_day: str, settings: 
                   beh: Optional[ls.LiveBehaviour] = None) -> List[str]:
     """Sorted union, over every morning of the window, of what the gate can return for ``settings`` at ANY decision
     time: the SAME selection as the gate, with "now" = the session's [low, high] and no ``max_stocks`` cut."""
-    beh = beh or ls.behaviour_from_live()
+    beh = beh or ls.POST_FIX
     valid = valid_mask(panel, excluded_symbols)
     out: set = set()
     for day in screen_days(panel, start_day, end_day, intraday=intraday):
-        out.update(panel.select_bounds(day, settings, beh, cut=False, valid=valid))
+        out.update(panel.select_bounds(day, settings, beh, cut=False, valid=valid, daily_clock=not intraday))
     return sorted(out)
 
 
@@ -119,16 +122,23 @@ class PanelGate:
             raise ScreenerGateRefusal(
                 f"this run was built for screener criteria {runtime['criteria_version']!r}, the code simulates "
                 f"{ls.CRITERIA_VERSION!r}: re-launch the job (a job run under another definition is a different job)")
-        self.panel = get_panel(runtime["panel"])
+        if runtime.get("panel_fingerprint") is None:
+            raise ScreenerGateRefusal("screener_runtime carries no panel_fingerprint (the job must stamp the panel it was "
+                                      "launched with)")
+        self.panel = get_panel(runtime["panel"], runtime["panel_fingerprint"])
         if self.panel.manifest.get("criteria_version") != ls.CRITERIA_VERSION:
             raise ScreenerGateRefusal(f"panel {runtime['panel']} was built with criteria "
                                       f"{self.panel.manifest.get('criteria_version')!r}, not {ls.CRITERIA_VERSION!r}")
         self.settings = dict(runtime["settings"])
         self.valid = valid_mask(self.panel, runtime.get("excluded_symbols"))
-        self.beh = beh or ls.behaviour_from_live()
+        self.beh = beh or ls.POST_FIX
+        ls.require_complete_settings(self.settings, where="PanelGate")
         self.ps = price_source
         self.intraday = intraday
         self._cache: Dict[Any, List[str]] = {}
+        self.no_price_decisions = 0
+        self.outside_preload_decisions = 0
+        self.no_price_symbols: Dict[str, int] = {}
         ls.check_settings(self.settings, self.beh)
         if float(self.settings.get("volume_min") or 0) > 0 and not self.beh.volume_is_average and not intraday:
             raise ScreenerGateRefusal("pre-fix volume_min (session volume so far) cannot be simulated on a daily clock")
@@ -149,6 +159,7 @@ class PanelGate:
 
         def _now(idx: np.ndarray):
             vals = np.empty(idx.size)
+            missing = []
             for j, i in enumerate(idx):
                 v = memo.get(i)
                 if v is None:
@@ -156,6 +167,29 @@ class PanelGate:
                     v = float("nan") if px is None else float(px)
                     memo[i] = v
                 vals[j] = v
+                if v != v:
+                    missing.append(str(syms[i]))
+            if missing:
+                # NO FALLBACK PRICE.  Two kinds of candidate without a price:
+                #  * NOT LOADED in this trial's price source: outside the per-trial prune, which is the set of every
+                #    symbol that can pass the drop / price tests at ANY price of the session, so it cannot be selected:
+                #    silently not a candidate (counted separately);
+                #  * LOADED but nothing knowable at T (no intraday bar yet in the cache, or a long halt): not a
+                #    candidate either -- the engine's own ``resolve_universe`` rule (undecidable symbol-days) -- but
+                #    COUNTED and listed in the run's results; losing more than live's data-outage share of the LOADED
+                #    candidates is a defective cache, not a screen (ScreenerDataOutage, job-fatal).
+                loaded_missing = [m_ for m_ in missing if ps.has_symbol(m_)]
+                self.outside_preload_decisions += len(missing) - len(loaded_missing)
+                if loaded_missing:
+                    self.no_price_decisions += len(loaded_missing)
+                    for m_ in loaded_missing:
+                        self.no_price_symbols[m_] = self.no_price_symbols.get(m_, 0) + 1
+                    n_loaded = sum(1 for i in idx if ps.has_symbol(str(syms[i])))
+                    if n_loaded >= 10 and len(loaded_missing) / n_loaded > ls.SCREENER_DATA_FAILURE_MAX_FRACTION:
+                        raise ls.ScreenerDataOutage(
+                            f"{len(loaded_missing)} of {n_loaded} loaded screened candidates have no knowable price at "
+                            f"{as_of_dt} (screen day {day}): {loaded_missing[:8]}; the intraday cache of this run is "
+                            f"incomplete")
             return vals, vals
 
         def _forming_hi(idx: np.ndarray) -> np.ndarray:
@@ -178,3 +212,10 @@ class PanelGate:
                            forming_hi=_forming_hi if self.intraday else None)
         self._cache[key] = res
         return res
+
+    def diagnostics(self) -> Dict[str, Any]:
+        """For ``results["screener_gate"]``: candidates dropped for want of a price (symbol -> decisions, top 20)."""
+        top = sorted(self.no_price_symbols.items(), key=lambda kv: -kv[1])[:20]
+        return {"no_price_candidate_decisions": self.no_price_decisions, "no_price_symbols": dict(top),
+                "outside_preload_candidate_decisions": self.outside_preload_decisions,
+                "no_price_symbol_count": len(self.no_price_symbols)}

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import glob
 import json
+import os
 import re
 import sqlite3
 from collections import defaultdict
@@ -127,45 +128,94 @@ def match_records(records: Sequence[Dict[str, Any]], settings: Dict[str, Any]) -
     return [by_day[d] for d in sorted(by_day)]
 
 
-def open_now(panel: ls.DailyPanel, day: str):
-    """Validation 'now' = the session's OPENING print (daily bar open), the same value the backtest's first-bar
-    decision reads from the intraday bars."""
-    o = np.asarray(panel.arrays["o"][panel.pos(day)])
+#: A residual is an EDGE (explained by the quote's second) only within this many percentage points of the threshold
+#: (drop), and within these fractions for the other criteria.  Everything else is UNEXPLAINED and is listed one by one.
+EDGE_DROP_POINTS = 0.3
+EDGE_RVOL_FRACTION = 0.02
+EDGE_BAND_FRACTION = 0.01
+
+_FIVE_MIN_CACHE: Dict[Tuple[str, str], Optional[Tuple[float, float]]] = {}
+
+
+def _five_min_day(cache_dir: str, sym: str, day: str) -> Optional[Tuple[float, float]]:
+    """``(open of the 09:30 bar, close of the 09:30 bar)`` of ``sym`` on ``day`` from the 5-minute cache, or None."""
+    key = (sym, day)
+    if key in _FIVE_MIN_CACHE:
+        return _FIVE_MIN_CACHE[key]
+    import datetime as _dt
+    import pyarrow.parquet as pq
+    res = None
+    path = os.path.join(cache_dir, f"{sym}_5min.parquet")
+    if os.path.exists(path):
+        d0 = _dt.datetime.fromisoformat(day)
+        t = pq.read_table(path, columns=["Date", "Open", "Close"],
+                          filters=[("Date", ">=", d0 + _dt.timedelta(hours=9, minutes=29)),
+                                   ("Date", "<=", d0 + _dt.timedelta(hours=9, minutes=31))])
+        if t.num_rows:
+            res = (float(t.column("Open")[0].as_py()), float(t.column("Close")[0].as_py()))
+    _FIVE_MIN_CACHE[key] = res
+    return res
+
+
+def make_now(panel: ls.DailyPanel, day: str, mode: str = "5min-open", scale: float = 1.0,
+             cache_dir: Optional[str] = None):
+    """The validation 'now' of the morning: ``5min-open`` = the open of the 09:30 five-minute bar (what a first-bar
+    decision reads in a job: ``screener_now_price``), ``5min-0935`` = that bar's close (a 09:35 decision),
+    ``daily-open`` = the daily bar's open (the earlier validation).  ``scale`` perturbs it (sensitivity runs).
+    A symbol without a value is NaN = not a candidate."""
+    if cache_dir is None:
+        import ba2_common.config as _cfg
+        cache_dir = os.path.join(_cfg.CACHE_FOLDER, "FMPOHLCVProvider")
+    syms = panel.symbols
+    daily_open = np.asarray(panel.arrays["o"][panel.pos(day)])
 
     def _now(idx):
-        return o[idx], o[idx]
+        if mode == "daily-open":
+            v = daily_open[idx].astype(float)
+        else:
+            v = np.full(len(idx), np.nan)
+            for j, i in enumerate(idx):
+                r = _five_min_day(cache_dir, str(syms[i]), day)
+                if r is not None:
+                    v[j] = r[0] if mode == "5min-open" else r[1]
+        v = v * scale
+        return v, v
     return _now
 
 
 def simulate_day(panel: ls.DailyPanel, day: str, settings: Dict[str, Any], beh: ls.LiveBehaviour, *,
-                 cut: bool = True, now=None, diag: Optional[Dict[str, int]] = None) -> List[str]:
+                 cut: bool = True, now=None, diag: Optional[Dict[str, int]] = None,
+                 now_mode: str = "5min-open", scale: float = 1.0) -> List[str]:
     vol = np.asarray(panel.arrays["v"][panel.pos(day)])
-    return panel.select(day, settings, beh, now=now or open_now(panel, day),
+    return panel.select(day, settings, beh, now=now or make_now(panel, day, now_mode, scale),
                         vol_today=lambda idx: vol[idx], cut=cut, diag=diag)
 
 
 def explain_symbol(panel: ls.DailyPanel, day: str, sym: str, settings: Dict[str, Any], beh: ls.LiveBehaviour,
-                   sim_all: Sequence[str], sim_cut: Sequence[str]) -> Dict[str, Any]:
-    """Why ``sym`` is (not) in the simulated list on ``day``: the criterion values against their thresholds and
-    a class for the residual (``edge`` = within 2 % of price / 2 % of the threshold, ``cut`` = passes every
-    filter but ranks beyond max_stocks, ``band`` = outside the cap band, ``rvol``, ``weinstein``, ``unknown``)."""
+                   sim_all: Sequence[str], sim_cut: Sequence[str], now_fn=None) -> Dict[str, Any]:
+    """Why ``sym`` is (not) in the simulated list on ``day``: the criterion values against their thresholds and a class
+    for the residual: ``*_edge`` only within EDGE_* of the threshold (explained by the quote's second), ``cut`` =
+    passes every filter but ranks beyond max_stocks, ``band`` / ``rvol`` / ``weinstein`` / ``drop`` /
+    ``sim_pick`` = far from the threshold = UNEXPLAINED (investigate), ``outside_universe`` = not in the store."""
     if sym not in panel.sym_index:
         return {"symbol": sym, "class": "outside_universe"}
     i, p = panel.sym_index[sym], panel.pos(day)
     a = panel.arrays
-    lc = float(a["lc"][p, i]); sh = float(a["shares"][p, i]); mcap = lc * sh
-    rvol = float(a["rvol"][p, i]); o = float(a["o"][p, i])
+    fac = float(a["fac"][p, i])
+    lc = float(a["lc"][p, i]); sh = float(a["shares"][p, i]); mcap = lc * sh * fac
+    rvol = float(a["rvol"][p, i])
+    nowv = float(now_fn(np.array([i]))[0][0]) if now_fn is not None else float(a["o"][p, i])
     n = int(settings["price_drop_days"])
-    pk = float(panel.peak_by_day(n)[p, i]) if float(settings["price_drop_pct"]) > 0 else float("nan")
-    if ls.FORMING_BAR_PRESENT and np.isfinite(o):
-        pk = float(np.fmax(pk, o))                      # the forming bar's high is part of live's peak
-    drop = round((pk - o) / pk * 100, 2) if pk and pk > 0 and np.isfinite(pk) and np.isfinite(o) else float("nan")
+    pk = float(panel.peak_row(n, p)[i]) if float(settings["price_drop_pct"]) > 0 else float("nan")
+    if ls.FORMING_BAR_PRESENT and np.isfinite(nowv):
+        pk = float(np.fmax(pk, nowv))                   # the forming bar's high is part of live's peak
+    drop = round((pk - nowv) / pk * 100, 2) if pk and pk > 0 and np.isfinite(pk) and np.isfinite(nowv) else float("nan")
     if ls.FORMING_BAR_PRESENT:
         w2 = bool(ls.weinstein_forming_pass(np.asarray(a["wa"][p, i:i + 1]), np.asarray(a["wp"][p, i:i + 1]),
-                                            np.array([o]))[0])
+                                            np.array([nowv]))[0])
     else:
         w2 = bool(a["w2"][p, i])
-    d = {"symbol": sym, "mcap": mcap, "rvol": rvol, "drop": drop, "weinstein": w2,
+    d = {"symbol": sym, "mcap": mcap, "rvol": rvol, "drop": drop, "now": nowv, "weinstein": w2,
          "in_sim_picks": sym in sim_cut, "passes_filters": sym in sim_all}
     cmin, cmax = float(settings["market_cap_min"]), float(settings["market_cap_max"])
     rmin, dpct = float(settings["relative_volume_min"]), float(settings["price_drop_pct"])
@@ -174,21 +224,21 @@ def explain_symbol(panel: ls.DailyPanel, day: str, sym: str, settings: Dict[str,
         cls = "no_data"
     elif (cmin > 0 and mcap < cmin) or (cmax > 0 and mcap > cmax):
         edge = min(abs(mcap - cmin) / cmin if cmin > 0 else 9, abs(mcap - cmax) / cmax if cmax > 0 else 9)
-        cls = "band_edge" if edge < 0.03 else "band"
+        cls = "band_edge" if edge <= EDGE_BAND_FRACTION else "band"
         d["band_margin_pct"] = round(edge * 100, 2)
     elif rmin > 0 and not rvol >= rmin:
-        cls = "rvol_edge" if abs(rvol - rmin) <= 0.05 * max(rmin, 1) else "rvol"
+        cls = "rvol_edge" if abs(rvol - rmin) <= EDGE_RVOL_FRACTION * max(rmin, 1) else "rvol"
     elif float(settings["weinstein_stage2_only"]) > 0 and not d["weinstein"]:
         cls = "weinstein"
     elif dpct > 0 and np.isfinite(drop) and not drop >= dpct:
         d["drop_margin_pct_of_price"] = round(dpct - drop, 2)
-        cls = "drop_edge" if dpct - drop <= 2.0 else "drop"
+        cls = "drop_edge" if dpct - drop <= EDGE_DROP_POINTS else "drop"
     elif sym in sim_all and sym not in sim_cut:
         cls = "cut"
     elif sym in sim_cut:
         if dpct > 0 and np.isfinite(drop):
             d["drop_margin_pct_of_price"] = round(drop - dpct, 2)
-        cls = "sim_pick_edge" if (dpct > 0 and np.isfinite(drop) and drop - dpct <= 2.0) else "sim_pick"
+        cls = "sim_pick_edge" if (dpct > 0 and np.isfinite(drop) and drop - dpct <= EDGE_DROP_POINTS) else "sim_pick"
     d["class"] = cls
     return d
 
@@ -199,9 +249,10 @@ def jaccard(a: Iterable[str], b: Iterable[str]) -> float:
 
 
 def compare(panel: ls.DailyPanel, settings: Dict[str, Any], records: Sequence[Dict[str, Any]],
-            beh: ls.LiveBehaviour) -> Dict[str, Any]:
+            beh: ls.LiveBehaviour, *, now_mode: str = "5min-open", scale: float = 1.0) -> Dict[str, Any]:
     """Per-day comparison of the simulation with the LIVE SELECTION records (``records`` already matched to
-    the instance).  Returns ``{"days": [...], "summary": {...}}``; every residual is explained."""
+    the instance).  Returns ``{"days": [...], "summary": {...}}``; every residual is classified, and everything
+    that is not an edge is UNEXPLAINED."""
     days = []
     for r in records:
         day = r["day"]
@@ -211,24 +262,30 @@ def compare(panel: ls.DailyPanel, settings: Dict[str, Any], records: Sequence[Di
             days.append({"day": day, "skipped": "day outside the panel"})
             continue
         diag: Dict[str, int] = {}
-        sim_cut = simulate_day(panel, day, settings, beh, diag=diag)
-        sim_all = simulate_day(panel, day, settings, beh, cut=False)
+        now_fn = make_now(panel, day, now_mode, scale)
+        sim_cut = simulate_day(panel, day, settings, beh, diag=diag, now=now_fn)
+        sim_all = simulate_day(panel, day, settings, beh, cut=False, now=now_fn)
         live = r["symbols"]
         live_only = sorted(set(live) - set(sim_cut))
         sim_only = sorted(set(sim_cut) - set(live))
         days.append({
             "day": day, "live": len(live), "sim": len(sim_cut), "common": len(set(live) & set(sim_cut)),
             "jaccard": round(jaccard(live, sim_cut), 4), "sim_stages": dict(diag),
-            "live_only": [explain_symbol(panel, day, s, settings, beh, sim_all, sim_cut) for s in live_only],
-            "sim_only": [explain_symbol(panel, day, s, settings, beh, sim_all, sim_cut) for s in sim_only],
+            "live_only": [explain_symbol(panel, day, s, settings, beh, sim_all, sim_cut, now_fn) for s in live_only],
+            "sim_only": [explain_symbol(panel, day, s, settings, beh, sim_all, sim_cut, now_fn) for s in sim_only],
         })
     ok = [d for d in days if "jaccard" in d]
     classes: Dict[str, int] = defaultdict(int)
+    unexplained: List[Dict[str, Any]] = []
     for d in ok:
-        for e in d["live_only"] + d["sim_only"]:
-            classes[e["class"]] += 1
+        for side, lst in (("live-only", d["live_only"]), ("sim-only", d["sim_only"])):
+            for e in lst:
+                classes[e["class"]] += 1
+                if e["class"] not in ("drop_edge", "sim_pick_edge", "band_edge", "rvol_edge", "cut", "outside_universe"):
+                    unexplained.append({"day": d["day"], "side": side, **e})
     tot_live = sum(d["live"] for d in ok); tot_common = sum(d["common"] for d in ok)
     summary = {"days": len(ok), "live_picks": tot_live, "reproduced": tot_common,
                "mean_jaccard": round(float(np.mean([d["jaccard"] for d in ok])), 4) if ok else None,
-               "residual_classes": dict(classes)}
-    return {"days": days, "summary": summary}
+               "residual_classes": dict(classes), "unexplained": len(unexplained),
+               "now_mode": now_mode, "scale": scale}
+    return {"days": days, "summary": summary, "unexplained": unexplained}

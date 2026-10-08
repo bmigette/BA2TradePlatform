@@ -1097,6 +1097,13 @@ def run_daily_backtest(
             _su_rec = engine.screener_universe_record()
             if _su_rec is not None:
                 results["screener_universe"] = _su_rec
+            _sr = config.get("screener_runtime") or {}
+            if _sr.get("criteria_version"):
+                # WHICH definition and WHICH data this run was gated by
+                results["screener_gate"] = {"criteria_version": _sr["criteria_version"],
+                                            "panel_fingerprint": _sr.get("panel_fingerprint"), "behaviour": "post-fix",
+                                            **(engine._screen_gate.diagnostics()
+                                               if getattr(engine, "_screen_gate", None) is not None else {})}
             results.update(_car_trade_thresholds_for_experts(config))
             _record = _decision_time_record(engine, config)
             if _record is not None:

@@ -848,8 +848,9 @@ class AsOfPriceSource:
           * a bar of T's own session has ENDED -> its close (identical to ``decision_price``);
           * none has (T is inside the session's FIRST bar) -> the OPEN of that first bar (the opening print).
         Never used for anything but the screener gate (``screener_gate``); guarded by
-        ``test_no_bar_price_in_decision_code`` (the one allowlisted call site).  ``None`` = nothing knowable
-        (the gate then falls back to the previous close, as live does without a quote).
+        ``test_no_bar_price_in_decision_code`` (the allowlisted call sites).  No bar of the session and not inside
+        its first bar (a thin name): the ``decision_price`` rule (the last ended bar of the last finished session).
+        ``None`` = nothing knowable at all; the gate then REFUSES for a loaded symbol (there is no fallback price).
         Daily clock: the close of the bar stamped ``as_of`` (``decision_price``), see the screener gate."""
         k = self._keys.get(symbol)
         if k is None or not len(k):
@@ -865,7 +866,8 @@ class AsOfPriceSource:
         i = bisect.bisect_right(k, key) - 1                     # the bar covering T
         if i >= 0 and k[i] >= day0 and key - k[i] < span and (i == 0 or k[i - 1] < day0):
             return float(self._o[symbol][i])                    # the session's opening print
-        return None
+        dp = self.decision_price(symbol, as_of)                 # no bar of this session yet: the DecisionPrice rule
+        return None if dp is None else float(dp)
 
     def screener_session_high(self, symbol: str, as_of: Any) -> Optional[float]:
         """The HIGH of the forming daily bar of T's session as the screener simulation sees it at ``as_of``: the

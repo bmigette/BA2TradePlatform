@@ -785,10 +785,12 @@ def _merge_screener_opt(cfg: dict, screener_opt: dict) -> None:
     # a request that replays an already-stamped launcher config is accepted.
     from ba2_providers.screener.universe_superset import RULE_ID as _RULE_ID
     _bt = cfg.get("backtest") or {}
+    _bypass = bool(screener_opt.get("apply_to_expert_settings"))   # FactorRanker: its universe comes from the weekly store
     _stamped = (_bt.get("screener_universe_rule") == _RULE_ID
                 and bool(_bt.get("enabled_instruments"))
-                and bool(screener_opt.get("criteria_version")) and bool(screener_opt.get("panel")))
-    if not _stamped and not screener_opt.get("apply_to_expert_settings"):
+                and (_bypass or (bool(screener_opt.get("criteria_version")) and bool(screener_opt.get("panel"))
+                                 and bool(screener_opt.get("panel_fingerprint")))))
+    if not _stamped:
         raise HTTPException(
             status_code=400,
             detail="a screener-settings optimization cannot be launched from the API: it does not build the job's "
@@ -802,7 +804,8 @@ def _merge_screener_opt(cfg: dict, screener_opt: dict) -> None:
         "base_settings": screener_opt.get("base_settings") or {},
         "cadence_days": int(screener_opt.get("cadence_days", 7)),
         "apply_to_expert_settings": bool(screener_opt.get("apply_to_expert_settings", False)),
-        **{k: screener_opt[k] for k in ("criteria_version", "panel", "declared_ranges") if k in screener_opt},
+        **{k: screener_opt[k] for k in ("criteria_version", "behaviour", "panel", "panel_fingerprint", "declared_ranges")
+           if k in screener_opt},
     }
     cfg["backtest"] = backtest
 

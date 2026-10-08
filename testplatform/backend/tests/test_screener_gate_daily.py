@@ -35,6 +35,9 @@ from ba2_providers.screener import universe_superset as us             # noqa: E
 from app.services.backtest import screener_gate as sg                  # noqa: E402
 
 BEH = ls.POST_FIX
+FULL = {"market_cap_min": 0, "market_cap_max": 0, "price_min": 0, "price_max": 0, "volume_min": 0, "volume_max": 0,
+        "float_min": 0, "float_max": 0, "relative_volume_min": 0, "price_drop_pct": 0, "price_drop_days": 5,
+        "max_stocks": 10, "sort_metric": "market_cap", "weinstein_stage2_only": 0}
 RANGES = {  # the launcher's genes, narrowed to the synthetic world
     "screener_market_cap_min": {"min": 2e9, "max": 2e10, "step": 1e9, "type": "float", "optimize": True},
     "screener_relative_volume_min": {"min": 0.0, "max": 3.0, "step": 0.1, "type": "float", "optimize": True},
@@ -132,6 +135,9 @@ class FakePS:
     def __init__(self, prices, intraday=True):
         self.prices, self.is_intraday, self.calls = prices, intraday, []
 
+    def has_symbol(self, symbol):
+        return symbol in self.prices
+
     def screener_now_price(self, symbol, as_of):
         self.calls.append((symbol, as_of))
         return self.prices.get(symbol)
@@ -141,15 +147,16 @@ class FakePS:
 
 
 def _runtime(panel_dir, settings):
-    return {"panel": panel_dir, "settings": settings, "criteria_version": ls.CRITERIA_VERSION,
-            "excluded_symbols": []}
+    man = ls.read_manifest(panel_dir)
+    return {"panel": panel_dir, "settings": {**FULL, **settings}, "criteria_version": ls.CRITERIA_VERSION,
+            "panel_fingerprint": man["panel_fingerprint"], "excluded_symbols": []}
 
 
 def test_gate_maps_the_decision_to_its_own_morning_intraday_and_daily(tmp_path):
     world, panel = _panel(2)
     d = tmp_path / "panel"
     ls.save_panel(str(d), list(panel.symbols), panel.sessions, {k: np.asarray(v) for k, v in panel.arrays.items()},
-                  {"shares_vendor_snapshot": "x", "shares_lag_days": 45, "fresh_fraction": 1.0,
+                  {"shares_vendor_snapshot": "x", "shares_lag_days": 45, "stale_listed_symbols": [], "fresh_fraction": 1.0,
                    "last_bar_date": panel.sessions[-2], "source_fingerprint": "t"})
     sg.clear_panel_memo()
     st = {"market_cap_min": 1e9, "max_stocks": 5}
@@ -172,7 +179,7 @@ def test_panel_refusals_list_what_is_missing(tmp_path):
     world, panel = _panel(2)
     d = tmp_path / "p"
     arrs = {k: np.asarray(v) for k, v in panel.arrays.items()}
-    man = {"shares_vendor_snapshot": "x", "shares_lag_days": 45, "fresh_fraction": 1.0,
+    man = {"shares_vendor_snapshot": "x", "shares_lag_days": 45, "stale_listed_symbols": [], "fresh_fraction": 1.0,
            "last_bar_date": panel.sessions[-2], "source_fingerprint": "t"}
     ls.save_panel(str(d), list(panel.symbols), panel.sessions, arrs, man)
     assert ls.panel_problems(str(d), panel.sessions[300], panel.sessions[-5]) == []
@@ -188,9 +195,14 @@ def test_panel_refusals_list_what_is_missing(tmp_path):
         ls.require_panel(str(d), panel.sessions[300], panel.sessions[-5])
     # an incomplete cache (<90 % of the symbols have a recent bar)
     m["criteria_version"] = ls.CRITERIA_VERSION
-    m["fresh_fraction"] = 0.5
+    m["stale_listed_symbols"] = ["AAA", "BBB"]
     (d / "manifest.json").write_text(json.dumps(m))
-    assert any("incomplete" in p for p in ls.panel_problems(str(d), panel.sessions[300], panel.sessions[-5]))
+    assert any("CURRENT listing" in p and "AAA" in p for p in ls.panel_problems(str(d), panel.sessions[300], panel.sessions[-5]))
+    # a different fingerprint than the job's
+    m["stale_listed_symbols"] = []
+    (d / "manifest.json").write_text(json.dumps(m))
+    assert any("never switches panel" in p for p in
+               ls.panel_problems(str(d), panel.sessions[300], panel.sessions[-5], expect_fp="other"))
 
 
 def test_out_of_range_genome_and_seed_are_refused():
@@ -241,7 +253,7 @@ def test_pre_fix_volume_min_is_refused_on_a_daily_clock(tmp_path):
     world, panel = _panel(2)
     d = tmp_path / "panel"
     ls.save_panel(str(d), list(panel.symbols), panel.sessions, {k: np.asarray(v) for k, v in panel.arrays.items()},
-                  {"shares_vendor_snapshot": "x", "shares_lag_days": 45, "fresh_fraction": 1.0,
+                  {"shares_vendor_snapshot": "x", "shares_lag_days": 45, "stale_listed_symbols": [], "fresh_fraction": 1.0,
                    "last_bar_date": panel.sessions[-2], "source_fingerprint": "t2"})
     sg.clear_panel_memo()
     with pytest.raises(sg.ScreenerGateRefusal, match="daily clock"):
@@ -288,9 +300,9 @@ def test_screener_now_price_is_the_opening_print_only_inside_the_first_bar():
     assert ps.screener_now_price("ZZZ", t) is None
 
 
-def test_screener_now_price_none_when_the_first_bar_did_not_trade():
+def test_screener_now_price_is_the_decision_price_when_the_first_bar_did_not_trade():
     ps, rows = _five_min_source(skip_first_bar_of_jan3=True)
-    assert ps.screener_now_price("AAA", _wall(9, 30)) is None      # no opening print: the gate falls back to the previous close
+    assert ps.screener_now_price("AAA", _wall(9, 30)) == float(ps.decision_price("AAA", _wall(9, 30)))   # no opening print: the DecisionPrice rule (yesterday last bar)
     assert ps.screener_now_price("AAA", _wall(9, 40)) is not None    # the 09:35 bar ended
 
 
@@ -319,7 +331,7 @@ def test_the_gate_never_fetches_anything(monkeypatch, tmp_path):
     sg.prune_symbols(panel, start, end, {"market_cap_min": 2e9, "max_stocks": 10}, None, intraday=True)
     d = tmp_path / "panel"
     ls.save_panel(str(d), list(panel.symbols), panel.sessions, {k: np.asarray(v) for k, v in panel.arrays.items()},
-                  {"shares_vendor_snapshot": "x", "shares_lag_days": 45, "fresh_fraction": 1.0,
+                  {"shares_vendor_snapshot": "x", "shares_lag_days": 45, "stale_listed_symbols": [], "fresh_fraction": 1.0,
                    "last_bar_date": panel.sessions[-2], "source_fingerprint": "hermetic"})
     sg.clear_panel_memo()
     gate = sg.PanelGate(_runtime(str(d), {"market_cap_min": 2e9, "max_stocks": 10}), FakePS(dict(world.open_now)),
@@ -412,7 +424,7 @@ def test_gate_t_1000_does_not_leak_a_later_session_high(tmp_path):
     arrays = ls.build_panel_arrays(bars, sessions, shares, ["AAA"])
     d = tmp_path / "panel"
     ls.save_panel(str(d), ["AAA"], sessions, arrays, {"shares_vendor_snapshot": "x", "shares_lag_days": 45,
-                  "fresh_fraction": 1.0, "last_bar_date": "2024-01-02", "source_fingerprint": "leak"})
+                  "stale_listed_symbols": [], "fresh_fraction": 1.0, "last_bar_date": "2024-01-02", "source_fingerprint": "leak"})
     sg.clear_panel_memo()
     st = {"market_cap_min": 1e9, "price_drop_pct": 20.0, "price_drop_days": 2, "max_stocks": 5}
     gate = sg.PanelGate(_runtime(str(d), st), ps, intraday=True)

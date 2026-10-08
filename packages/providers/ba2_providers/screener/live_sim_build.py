@@ -38,6 +38,9 @@ import numpy as np
 
 from ba2_providers.screener import live_sim as ls
 
+#: Bump when the BUILD logic changes what the panel contains for the same inputs (it is part of the panel fingerprint).
+#: 2: shares in RAW (as-traded) basis everywhere, split factors, coverage lists.
+BUILD_REV = 2
 SHARES_ALL_URL = "https://financialmodelingprep.com/api/v4/shares_float/all"
 SHARES_HIST_URL = "https://financialmodelingprep.com/api/v4/historical/shares_float"
 
@@ -237,6 +240,104 @@ def _vendor_history(cache_folder: str, sym: str) -> Optional[Tuple[np.ndarray, n
     return o[order], v[order]
 
 
+# ----------------------------------------------------------------------- split calendars (as-traded basis)
+def splits_cache_path(cache_folder: str, symbol: str) -> str:
+    return os.path.join(cache_folder, "screener_fundamentals", "splits", f"{symbol.upper()}.json")
+
+
+def load_split_calendar(cache_folder: str, symbol: str) -> Optional[List[Tuple[date, float]]]:
+    """``[(split date, ratio)]`` (ratio = numerator / denominator: 4-for-1 -> 4.0) from the own splits cache, else from
+    the market-condition warm-up's ``fmp_history/mc_stock_split__<SYM>.json`` (same FMP payload).  ``[]`` is a real
+    answer (never split); ``None`` = no calendar known for the symbol."""
+    for p in (splits_cache_path(cache_folder, symbol),
+              os.path.join(cache_folder, "fmp_history", f"mc_stock_split__{symbol.upper()}.json")):
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p) as f:
+                payload = json.load(f)
+        except Exception:  # noqa: BLE001 - unreadable = unknown
+            continue
+        from ba2_providers import symbol_info
+        return [(e.date, float(e.ratio)) for e in symbol_info.parse_splits(payload) if e.ratio]
+    return None
+
+
+def prefetch_splits(cache_folder: str, symbols: List[str], api_key: str, *, workers: int = 4,
+                    max_per_second: float = 3.0, deadline_utc: Optional[datetime] = None,
+                    log: Callable[[str], None] = print) -> Dict[str, Any]:
+    """Fetch the split calendar (``symbol_info.fetch_splits``) of every symbol that has none cached.  Resumable (a
+    cached calendar is never refetched; splits are historical facts), paced, failures counted and listed."""
+    import threading
+    from ba2_providers import symbol_info
+    todo = [s for s in symbols if load_split_calendar(cache_folder, s) is None]
+    counts = {"cached": len(symbols) - len(todo), "fetched": 0, "failed": 0, "skipped": 0}
+    failed: List[str] = []
+    gate, nxt = threading.Lock(), [0.0]
+    t0 = time.time()
+
+    def _one(sym: str):
+        if deadline_utc is not None and datetime.now(timezone.utc) >= deadline_utc:
+            return sym, "skipped", "deadline"
+        with gate:
+            now = time.time()
+            wait = nxt[0] - now
+            nxt[0] = max(now, nxt[0]) + 1.0 / max_per_second
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            payload = symbol_info.fetch_splits(api_key, sym)
+            if not isinstance(payload, (dict, list)):
+                raise RuntimeError(f"unexpected split payload {type(payload).__name__}")
+            hist = payload.get("historical", []) if isinstance(payload, dict) else payload
+            p = splits_cache_path(cache_folder, sym)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump({"symbol": sym, "fetched_on": date.today().isoformat(), "historical": hist or []}, f)
+            os.replace(tmp, p)
+            return sym, "fetched", None
+        except Exception as e:  # noqa: BLE001
+            return sym, "failed", f"{type(e).__name__}: {e}"
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        for i, (sym, status, err) in enumerate(ex.map(_one, todo), 1):
+            counts[status] += 1
+            if status == "failed":
+                failed.append(f"{sym} ({err})")
+            if i % 500 == 0:
+                log(f"split calendars: {i}/{len(todo)} {counts} ({time.time() - t0:.0f}s)")
+    counts["failed_symbols"] = failed[:20]
+    log(f"split calendars: {counts}")
+    return counts
+
+
+def build_factor_matrix(cache_folder: str, symbols: List[str], sessions: List[str], basis_ord: int
+                        ) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """``(S, T)`` as-traded multiplier of the adjusted cache for the morning of every session: the product of the ratios
+    of the splits dated AFTER the session and up to ``basis_ord`` (the last day the adjusted cache covers) -- exactly
+    ``split_basis.as_traded_factor``.  NaN for a symbol with no known split calendar (not a candidate; listed)."""
+    sess_ord = np.array([date.fromisoformat(s).toordinal() for s in sessions], dtype=np.int64)
+    out = np.ones((len(symbols), len(sessions)), dtype=np.float32)
+    unknown: List[str] = []
+    with_split: List[str] = []
+    for s, sym in enumerate(symbols):
+        cal = load_split_calendar(cache_folder, sym)
+        if cal is None:
+            out[s] = np.nan
+            unknown.append(sym)
+            continue
+        inwin = [(d, r) for d, r in cal if date.fromisoformat(sessions[0]) <= d <= date.fromordinal(basis_ord)]
+        if inwin:
+            with_split.append(sym)
+        for d, r in inwin:
+            if not (np.isfinite(r) and r > 0):
+                raise ls.SimulationRefusal(f"{sym}: split on {d} has an unusable ratio {r!r}")
+            out[s] *= np.where(sess_ord < d.toordinal(), np.float32(r), np.float32(1.0))
+    return out, {"splits_unknown": unknown, "symbols_with_split_in_window": len(with_split),
+                 "split_symbols_examples": with_split[:10]}
+
+
 # ------------------------------------------------------------------------------------------- fingerprints
 def _stat_token(path: str) -> str:
     try:
@@ -258,7 +359,7 @@ def _ohlcv_path(cache_folder: str, sym: str) -> Optional[str]:
 def source_fingerprint(cache_folder: str, symbols: List[str], first_day: str, end_day: str,
                        lag: int, snapshot: Optional[str]) -> str:
     h = hashlib.sha1()
-    h.update(f"{ls.CRITERIA_VERSION}|{ls.PANEL_FORMAT}|{first_day}|{end_day}|{lag}|"
+    h.update(f"{ls.CRITERIA_VERSION}|{ls.PANEL_FORMAT}|rev{BUILD_REV}|{first_day}|{end_day}|{lag}|"
              f"{os.path.basename(snapshot or '')}".encode())
     fund = os.path.join(cache_folder, "screener_fundamentals")
     for s in symbols:
@@ -266,7 +367,8 @@ def source_fingerprint(cache_folder: str, symbols: List[str], first_day: str, en
         h.update(f"{s}|{_stat_token(p) if p else '-'}|"
                  f"{_stat_token(os.path.join(fund, 'market_cap', s.upper() + '.parquet'))}|"
                  f"{_stat_token(shares_cache_path(cache_folder, s))}|"
-                 f"{_stat_token(os.path.join(fund, 'float', s.upper() + '.parquet'))}\n".encode())
+                 f"{_stat_token(os.path.join(fund, 'float', s.upper() + '.parquet'))}|"
+                 f"{_stat_token(splits_cache_path(cache_folder, s))}\n".encode())
     return h.hexdigest()
 
 
@@ -290,9 +392,21 @@ def store_symbols(store_dir: str) -> List[str]:
 
 
 # ----------------------------------------------------------------------------------------------- shares
-def _implied_shares(cache_folder: str, sym: str, bar_ord: np.ndarray, closes: np.ndarray
+def _factor_at(cal: List[Tuple[date, float]], ords: np.ndarray) -> np.ndarray:
+    """``split_basis.as_traded_factor`` for many dates: the product of the ratios of the splits dated AFTER each date."""
+    f = np.ones(len(ords), dtype=np.float64)
+    for d, r in cal:
+        f = f * np.where(ords < d.toordinal(), float(r), 1.0)
+    return f
+
+
+def _implied_shares(cache_folder: str, sym: str, bar_ord: np.ndarray, closes: np.ndarray,
+                    cal: Optional[List[Tuple[date, float]]] = None
                     ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """(date ordinals, implied shares) from the cached market-cap series and the bars' closes."""
+    """(date ordinals, implied ADJUSTED share count) from the cached market-cap series and the bars' closes.  The market
+    cap is as-traded and the cached closes are split-ADJUSTED, so ``cap / adjusted close`` = raw shares(t) x F(t) (F = the
+    as-traded factor): continuous ACROSS a split (the raw count steps, F steps back).  It is lagged by the filing delay
+    in this adjusted basis and divided by F(D) only afterwards (a split is known on its ex-date and must not be lagged)."""
     import pandas as pd
     p = os.path.join(cache_folder, "screener_fundamentals", "market_cap", f"{sym.upper()}.parquet")
     if not os.path.exists(p):
@@ -369,7 +483,9 @@ def build_shares_matrix(cache_folder: str, symbols: List[str], sessions: List[st
             continue
         c = b[4]
         vh = _vendor_history(cache_folder, sym)
-        imp = _implied_shares(cache_folder, sym, bar_ord[sym], c)
+        cal = load_split_calendar(cache_folder, sym) or []
+        f_sess = _factor_at(cal, sess_ord)                                 # F(D) for every session of the panel
+        imp = _implied_shares(cache_folder, sym, bar_ord[sym], c, cal)
         if vh is None and imp is None:
             src["none"] += 1
             none_syms.append(sym)
@@ -389,9 +505,10 @@ def build_shares_matrix(cache_folder: str, symbols: List[str], sessions: List[st
                 if pre.any() and imp is not None:                             # before the vendor series starts
                     mo, sh = imp
                     k_i = np.searchsorted(mo, vo[0], side="right") - 1
-                    k0 = vv[0] * k_cap / sh[max(k_i, 0)] if k_i >= 0 else vv[0] * k_cap / sh[0]
+                    f0 = float(_factor_at(cal, np.array([vo[0]]))[0])
+                    k0 = vv[0] * k_cap * f0 / sh[max(k_i, 0)] if k_i >= 0 else vv[0] * k_cap * f0 / sh[0]
                     j = np.searchsorted(mo, sess_ord - int(lg), side="right") - 1
-                    row = np.where(pre & (j >= 0), sh[np.maximum(j, 0)] * k0, row)
+                    row = np.where(pre & (j >= 0), sh[np.maximum(j, 0)] * k0 / f_sess, row)
             else:
                 mo, sh = imp
                 k = 1.0
@@ -401,7 +518,7 @@ def build_shares_matrix(cache_folder: str, symbols: List[str], sessions: List[st
                     if k_i >= 0:
                         k = now_v / sh[k_i]
                 j = np.searchsorted(mo, sess_ord - int(lg), side="right") - 1
-                row = np.where(j >= 0, sh[np.maximum(j, 0)] * k, np.nan)
+                row = np.where(j >= 0, sh[np.maximum(j, 0)] * k / f_sess, np.nan)
             outs[lg][s] = row
         if vh is not None:
             src["vendor_history_plus_fmp_pre_history" if (imp is not None and vh[0][0] > sess_ord[0]) else "vendor_history"] += 1
@@ -414,6 +531,7 @@ def build_shares_matrix(cache_folder: str, symbols: List[str], sessions: List[st
                 uncal.append(sym)
     ka = np.array(ks) if ks else np.array([1.0])
     rep = {"snapshot": os.path.basename(snapshot_path), "sources": src, "no_share_data_examples": none_syms[:10],
+           "no_share_data_symbols": none_syms,
            "uncalibrated_examples": uncal[:10], "fmp_implied_k_median": float(np.median(ka)),
            "fmp_implied_k_share_off_by_over_5pct": float(np.mean(np.abs(ka - 1) > 0.05))}
     return (outs if multi else outs[lags[0]]), rep
@@ -485,8 +603,8 @@ def load_bars(cache_folder: str, symbols: List[str], sessions: List[str], worker
 
 def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end_day: str, *,
                       lag_days: int = ls.SHARES_LAG_DAYS, workers: int = 8, force: bool = False,
-                      log: Callable[[str], None] = print, out_dir: Optional[str] = None,
-                      snapshot_dir: Optional[str] = None) -> Dict[str, Any]:
+                      log: Callable[[str], None] = print, out_root: Optional[str] = None,
+                      snapshot_dir: Optional[str] = None, acknowledged_stale: Iterable[str] = ()) -> Dict[str, Any]:
     """Build / refresh the panel for ``symbols``.  Returns the manifest (``status`` 'up_to_date' | 'built').
     ``first_day`` / ``end_day``: the session range (end extended by ten calendar days of FUTURE sessions so
     the daily clock's next-session lookup and the last decisions have a column)."""
@@ -499,12 +617,13 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
             f"no vendor share table under {snapshot_dir or vendor_dir(cache_folder)}: take one (ONE FMP call) with "
             f"`ba2-test prewarm --screener-panel` / `ba2-test build-screener-metrics --daily-panel`")
     symbols = sorted(set(symbols))
-    path = out_dir or ls.panel_dir_for(cache_folder)
     fp = source_fingerprint(cache_folder, symbols, first_day, end_day, lag_days, snap)
+    root = out_root or ls.panel_root(cache_folder)
+    path = os.path.join(root, fp[:16])
     man = ls.read_manifest(path)
     if man and not force and man.get("source_fingerprint") == fp and man.get("criteria_version") == ls.CRITERIA_VERSION:
-        log(f"daily panel: up to date ({man['n_symbols']} symbols, {man['first_session']}..{man['last_session']})")
-        return dict(man, status="up_to_date")
+        log(f"daily panel: up to date at {path} ({man['n_symbols']} symbols, {man['first_session']}..{man['last_session']})")
+        return dict(man, status="up_to_date", path=path)
     last = (date.fromisoformat(end_day) + timedelta(days=10))
     sessions = [d.isoformat() for d in regular_session_dates(date.fromisoformat(first_day), last)]
     log(f"daily panel: {len(symbols)} symbols x {len(sessions)} sessions ({sessions[0]}..{sessions[-1]})")
@@ -513,18 +632,38 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
         f"in {time.time() - t0:.0f}s")
     shares, srep = build_shares_matrix(cache_folder, symbols, sessions, bars, snap, lag_days, bar_ord)
     flt, frep = build_float_matrix(cache_folder, symbols, sessions)
+    basis = max((int(bd[-1]) for bd in bar_ord.values()), default=date.fromisoformat(first_day).toordinal())
+    fac, split_rep = build_factor_matrix(cache_folder, symbols, sessions, basis)
     arrays = ls.build_panel_arrays(bars, sessions, shares, symbols, progress=lambda m: log(f"daily panel: {m}"),
-                                   fl=flt)
+                                   fl=flt, fac=fac)
     last_bar = date.fromordinal(int(max((int(bd[-1]) for bd in bar_ord.values()),
                                         default=date.fromisoformat(first_day).toordinal()))).isoformat()
     # cache completeness: the universe is today's actively traded names, so nearly all must have a recent bar
     lb = max((int(bd[-1]) for bd in bar_ord.values()), default=0)
     fresh = sum(1 for bd in bar_ord.values() if lb - int(bd[-1]) <= 6)
-    manifest = {"source_fingerprint": fp, "shares_lag_days": lag_days, "shares_vendor_snapshot": srep["snapshot"],
+    # COVERAGE, as explicit lists (no tolerance): a symbol in the vendor's CURRENT listing whose bars are stale is a
+    # defect of the cache (refuse); a stale symbol that is not listed any more is treated as delisted (counted/listed)
+    with open(snap) as f:
+        listing = set((json.load(f).get("caps") or {}).keys())
+    ack = {str(x).upper() for x in acknowledged_stale}
+    lb_ord = max((int(bd[-1]) for bd in bar_ord.values()), default=0)
+    stale = sorted(sy for sy, bd in bar_ord.items() if lb_ord - int(bd[-1]) > 6)
+    stale_listed = [sy for sy in stale if sy in listing and sy not in ack]
+    delisted = [sy for sy in stale if sy not in listing]
+    shares_missing_listed = [sy for sy in listing & set(symbols) if sy in set(srep.get("no_share_data_symbols", []))]
+    manifest = {"source_fingerprint": fp, "panel_fingerprint": fp[:16], "stale_listed_symbols": stale_listed,
+                "delisted_symbols": delisted, "delisted_symbols_count": len(delisted),
+                "acknowledged_stale": sorted(ack), "split_report": split_rep,
+                "splits_unknown": split_rep["splits_unknown"], "shares_missing_listed": shares_missing_listed,
+                "shares_lag_days": lag_days, "shares_vendor_snapshot": srep["snapshot"],
                 "shares_report": srep, "float_report": frep, "symbols_without_daily_bars": no_data[:50],
                 "n_without_daily_bars": len(no_data), "last_bar_date": last_bar,
                 "fresh_fraction": round(fresh / max(1, len(symbols)), 4), "build_seconds": round(time.time() - t0, 1)}
     ls.save_panel(path, symbols, sessions, arrays, manifest)
     size = sum(os.path.getsize(os.path.join(path, f)) for f in os.listdir(path)) / 1e6
-    log(f"daily panel: built in {time.time() - t0:.0f}s, {size:.0f} MB, shares: {srep}")
-    return dict(ls.read_manifest(path) or {}, status="built")
+    log(f"daily panel: built at {path} in {time.time() - t0:.0f}s, {size:.0f} MB, shares: {srep['sources']}; "
+        f"{len(stale_listed)} stale listed, {len(delisted)} treated as delisted, {len(shares_missing_listed)} listed without shares")
+    for d, m, mb in ls.list_panels_in(root):
+        log(f"  panel {os.path.basename(d)}  built {m.get('built_at')}  {mb:.0f} MB" + ("  <- current" if d == path else
+            "  (older: remove by hand when no job uses it)"))
+    return dict(ls.read_manifest(path) or {}, status="built", path=path)

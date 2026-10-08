@@ -214,6 +214,52 @@ LIVE_SCREENER_SETTINGS = frozenset((
 ))
 
 
+#: THE screener settings that decide WHICH symbols a screen returns (unprefixed, the vocabulary of the backtest
+#: gate and of ``screener_opt.base_settings``; live reads them as ``screener_<key>``).  A live instance that lacks
+#: one runs it on ``StockScreener._DEFAULTS`` (price_min 20, volume_min 500,000, float_min 10,000,000, max_stocks 10,
+#: price_drop_pct 15, ...), so NOTHING may be left to those defaults: the simulation refuses a missing key, the
+#: launcher writes every key, the deploy writes every key.  Pinned equal to ``StockScreener._DEFAULTS`` and to the
+#: interface definitions by ``packages/providers/tests/test_screener_setting_keys.py``.
+SCREENER_SELECTION_KEYS = (
+    "market_cap_min", "market_cap_max", "price_min", "price_max", "volume_min", "volume_max", "float_min", "float_max",
+    "relative_volume_min", "price_drop_pct", "price_drop_days", "max_stocks", "sort_metric", "weinstein_stage2_only",
+)
+#: The keys whose backtested value is "off" when a job states nothing (the metric-store gate treated an absent bound as
+#: not enforced, and the enabled prod instances carry explicit zeros): what a deploy of a payload that omits them writes.
+SCREENER_OFF_VALUES = {"market_cap_max": 0, "price_min": 0, "price_max": 0, "volume_min": 0, "volume_max": 0,
+                       "float_min": 0, "float_max": 0, "sort_metric": "market_cap"}
+
+
+def missing_screener_keys(settings: Dict[str, Any]) -> list:
+    """The selection keys absent from ``settings`` (unprefixed OR ``screener_``-prefixed names; None = absent)."""
+    out = []
+    for k in SCREENER_SELECTION_KEYS:
+        if settings.get(k) is None and settings.get(f"screener_{k}") is None:
+            out.append(k)
+    return out
+
+
+def complete_screener_settings(expert_params: Dict[str, Any]) -> Dict[str, Any]:
+    """``{screener_<key>: value}`` for EVERY selection key, from ``expert_params`` (live names) with the "off" value
+    (what the backtest ran) for the bound keys it does not carry.  A key that has no "off" value (a gene such as
+    ``max_stocks``) and is absent raises: a deploy must not invent it."""
+    out: Dict[str, Any] = {}
+    missing = []
+    for k in SCREENER_SELECTION_KEYS:
+        v = expert_params.get(f"screener_{k}", expert_params.get(k))
+        if v is None:
+            if k in SCREENER_OFF_VALUES:
+                v = SCREENER_OFF_VALUES[k]
+            else:
+                missing.append(k)
+                continue
+        out[f"screener_{k}"] = v
+    if missing:
+        raise ValueError(f"screener setting(s) {missing} are neither in the payload nor have an 'off' value: refusing "
+                         f"to leave them to StockScreener's defaults")
+    return out
+
+
 def forced_expert_settings(facts: BacktestRunFacts) -> Dict[str, Any]:
     """{live setting: value} for every row that HAS a live analogue.
 

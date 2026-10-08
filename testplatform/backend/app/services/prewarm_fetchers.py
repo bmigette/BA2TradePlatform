@@ -657,7 +657,7 @@ PANEL_FIRST_DAY = "2019-03-01"          # the OHLCV cache starts here; a panel s
 
 
 def prewarm_screener_panel(store_dir: str, start: Optional[str], end: Optional[str], *, fmp_key: Optional[str],
-                           share_history_max_age_days: int = 7, vendor_table_max_age_days: int = 1,
+                           share_history_max_age_days: int = 7, vendor_table_max_age_days: int = 7,
                            workers: int = 4, force: bool = False,
                            log: Optional[Callable[[str], None]] = None,
                            warn: Optional[Callable[[str], None]] = None,
@@ -705,10 +705,14 @@ def prewarm_screener_panel(store_dir: str, start: Optional[str], end: Optional[s
 
     summary["share_history"] = lb.prefetch_shares(cache, symbols, fmp_key, max_age_days=share_history_max_age_days,
                                                   workers=workers, log=say)
+    failures = []
     if summary["share_history"]["failed"]:
-        complain(f"!! screener panel: {summary['share_history']['failed']} share-history fetches FAILED "
-                 f"({summary['share_history']['failed_symbols']}): those symbols fall back to FMP's implied share "
-                 f"series (counted in the panel manifest); re-run to retry")
+        failures.append(f"{summary['share_history']['failed']} share-history fetches FAILED "
+                        f"({summary['share_history']['failed_symbols']})")
+    # split calendars: the OHLCV cache is split-adjusted, the vendor's share counts are raw as of each day
+    summary["split_calendars"] = lb.prefetch_splits(cache, symbols, fmp_key, workers=workers, log=say)
+    if summary["split_calendars"]["failed"] or summary["split_calendars"]["skipped"]:
+        failures.append(f"split calendars: {summary['split_calendars']}")
 
     # FMP historical market cap + float: only where the cache file is missing altogether
     lead = (_date.fromisoformat(first_day) - _td(days=120)).isoformat()
@@ -720,11 +724,18 @@ def prewarm_screener_panel(store_dir: str, start: Optional[str], end: Optional[s
             try:
                 fn(sym, fmp_key, lead, end_day)
                 fetched[kind] += 1
-            except Exception as e:  # noqa: BLE001 - counted; the panel marks the symbol's share source
-                complain(f"!! screener panel: {kind} fetch for {sym} failed: {redact(str(e))}")
+            except Exception as e:  # noqa: BLE001 - collected; the run ENDS with an error listing them
+                failures.append(f"{kind} fetch for {sym} failed: {redact(str(e))}")
         if i % 1000 == 0:
             say(f">> market-cap/float caches: {i}/{len(symbols)} checked, fetched {fetched}")
     summary["fundamentals_fetched"] = fetched
+    if failures:
+        # a failed fundamentals fetch is an ERROR, not a warning: the panel would silently fall back to a weaker
+        # source for those symbols. Re-run to resume (everything fetched so far is cached).
+        for f_ in failures[:20]:
+            complain(f"!! screener panel: {f_}")
+        raise PrewarmConfigError(f"screener panel prewarm: {len(failures)} fetch failure(s), first: {failures[0]}. "
+                                 f"Nothing was built; re-run to resume.")
 
     no_bars = lb.symbols_without_daily_bars(cache, symbols)
     summary["without_daily_bars"] = len(no_bars)

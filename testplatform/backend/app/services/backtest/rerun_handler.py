@@ -109,7 +109,8 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
     if so.get("criteria_version"):
         # a row of the live-simulation gate: its static universe is computed by the SAME function the launch used
         from app.services.backtest import screener_gate as sg
-        new = sg.static_universe(sg.get_panel(so["panel"]), str(bt_block["start_date"])[:10],
+        from ba2_providers.screener import live_sim as _ls
+        new = sg.static_universe(sg.get_panel(_ls.resolve_panel_path(so["panel"]), so["panel_fingerprint"]), str(bt_block["start_date"])[:10],
                                  str(bt_block["end_date"])[:10], so["base_settings"], ranges,
                                  intraday=us.interval_is_intraday(interval), excluded_symbols=excluded)
     else:
@@ -238,11 +239,6 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None,
     if isinstance(so, dict) and so.get("store") and not os.path.isdir(so["store"]):
         bt_block["screener_opt"] = {**so, "store": SCREENER_STORE_DIR}
         so = bt_block["screener_opt"]
-    if isinstance(so, dict) and so.get("panel") and not os.path.isdir(so["panel"]):
-        # the daily panel lives under the cache root: on another machine it is THIS machine's copy
-        from ba2_common.config import CACHE_FOLDER
-        from ba2_providers.screener import live_sim as _ls
-        bt_block["screener_opt"] = {**so, "panel": _ls.panel_dir_for(CACHE_FOLDER)}
 
     if recompute_universe:
         if not bt_block.get("screener_opt"):

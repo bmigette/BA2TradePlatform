@@ -6939,7 +6939,12 @@ def _cmd_optimize(args) -> int:
         if getattr(args, "screener", False):
             if not args.screener_store:
                 sys.exit("optimize: --screener requires --screener-store")
-            base = json.load(open(args.screener_base_json)) if args.screener_base_json else {}
+            from ba2_providers.screener import metric_store as _msb
+            from ba2_common.core.deploy_parity import SCREENER_OFF_VALUES as _OFF
+            # EVERY selection key is stated: the grid's base is the floors OFF (explicit zeros, as the enabled prod
+            # instances carry), never left to live's defaults (price_min 20, volume_min 500,000, float_min 10M).
+            base = {**_OFF, **_msb.normalize_screener_settings(
+                json.load(open(args.screener_base_json)) if args.screener_base_json else {})}
             # Cap-band job: override the market-cap gene RANGE for the band and pin market_cap_max in
             # the base settings, so each band optimizes a DISJOINT, smaller cap universe (5min-feasible).
             # Other genes unchanged. Default (no band) keeps the original large-cap-floor behaviour.
@@ -6953,10 +6958,24 @@ def _cmd_optimize(args) -> int:
             _use_sim = not spec.get("bypass")
             _panel_dir = None
             if _use_sim:
+                from ba2_providers.screener import live_sim as _ls0
+                _all = {**base, **{(k[len("screener_"):] if k.startswith("screener_") else k): True
+                                   for k, v in _scr_opt.items() if v and v.get("optimize")}}
+                try:
+                    _ls0.require_complete_settings(_all, where="optimize --screener")
+                except _ls0.SimulationRefusal as _e:
+                    sys.exit(f"optimize: --screener REFUSED: {_e}")
+                print("optimize: screener base settings (every selection key explicit; genes override): "
+                      + json.dumps({k: base[k] for k in sorted(base)}), flush=True)
+            if _use_sim:
                 from ba2_providers.screener import live_sim as _ls
                 from ba2_common.config import CACHE_FOLDER as _CF0
-                _panel_dir = getattr(args, "screener_panel", None) or _ls.panel_dir_for(_CF0)
-                _probs = _ls.panel_problems(_panel_dir, args.start, args.end)
+                # the newest complete panel of THIS machine, resolved ONCE here and stamped on the job (path relative to
+                # the cache root + fingerprint): the job never switches panel afterwards, a worker resolves the same
+                # relative path in its own cache.
+                _panel_dir = getattr(args, "screener_panel", None) or _ls.latest_panel(_CF0)
+                _probs = (_ls.panel_problems(_panel_dir, args.start, args.end) if _panel_dir
+                          else [f"no daily criteria panel under {_ls.panel_root(_CF0)}"])
                 if _probs:
                     sys.exit("optimize: --screener REFUSED: the daily screener-criteria panel cannot serve this "
                              "job:\n  - " + "\n  - ".join(_probs) +
@@ -6968,7 +6987,10 @@ def _cmd_optimize(args) -> int:
             backtest_block["screener_opt"] = {
                 "store": args.screener_store,
                 "base_settings": base,
-                **({"criteria_version": _ls.CRITERIA_VERSION, "panel": _panel_dir} if _use_sim else {}),
+                **({"criteria_version": _ls.CRITERIA_VERSION, "behaviour": _ls.POST_FIX.name,
+                    "panel": (_ls.panel_rel(_CF0, _panel_dir) if not os.path.isabs(getattr(args, "screener_panel", None) or "")
+                              else _panel_dir),
+                    "panel_fingerprint": _ls.read_manifest(_panel_dir)["panel_fingerprint"]} if _use_sim else {}),
                 # the ranges the static universe is the superset of: a genome outside them is refused
                 "declared_ranges": {k[len("screener_"):] if k.startswith("screener_") else k:
                                     {"min": v["min"], "max": v["max"]}
