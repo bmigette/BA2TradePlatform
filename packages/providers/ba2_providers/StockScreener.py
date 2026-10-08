@@ -12,7 +12,6 @@ Pipeline stages:
     4. Filter  – bulk price-drop check on ranked list, stop at N
 """
 
-import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -39,24 +38,27 @@ from ba2_providers.fmp_common import FMPError
 #: than one request per pass.
 SCREENER_HISTORY_WINDOW_DAYS = 400
 
-#: LIVE ONLY. A history fetch whose failed symbols exceed this fraction of the symbols it had
-#: to fetch (or in which EVERY chunk failed) raises ScreenerDataError instead of returning a
-#: silently smaller list. 2026-10: four straight Monday FactorRanker screens returned 0
-#: candidates and nothing said whether the filters or an FMP failure emptied the list.
+#: LIVE ONLY. When more than this fraction of the stage-2 candidates still have no price history
+#: after one re-fetch, and a volume bound / RVOL needs that history, the screen raises
+#: ScreenerDataError instead of returning a silently smaller list. 2026-10: four straight Monday
+#: FactorRanker screens returned 0 candidates and nothing said whether the filters or an FMP
+#: failure emptied the list.
 SCREENER_DATA_FAILURE_MAX_FRACTION = 0.10
-
-#: Serialises LIVE history fetches (see ``StockScreener._fetch_history_bulk``).
-_HISTORY_SINGLE_FLIGHT = threading.Lock()
 
 
 class ScreenerDataError(FMPError):
     """The live screen could not fetch enough market data to produce a trustworthy result.
 
-    Raised (live, ``as_of is None``, only) when FMP history/volume fetches failed for more than
-    ``SCREENER_DATA_FAILURE_MAX_FRACTION`` of the requested symbols, when every history chunk
-    failed, when the FMP key is missing, or when the bulk float table could not be fetched. An
-    empty list from the screener therefore means "the filters matched nothing", never "FMP
-    failed". Never raised on the backtest path.
+    Raised (live, ``as_of is None``, only) when:
+      * the vendor screener request fails, returns a non-list body, or FMP_API_KEY is missing
+        (stage 1: an outage must not read as "0 candidates");
+      * the bulk float table cannot be fetched while a float bound is set;
+      * stage 2 finds NO price history for ANY candidate (whatever the bounds), or, when a volume
+        bound / RVOL needs history, more than ``SCREENER_DATA_FAILURE_MAX_FRACTION`` of the
+        candidates have none after one re-fetch;
+      * the price-drop or Weinstein stage finds no price history for any candidate.
+    So an empty list from a live screen means "the filters matched nothing", not "FMP failed".
+    Never raised on the as_of (backtest) path.
     """
 
 
@@ -221,6 +223,12 @@ class StockScreener:
         self._report_progress("Fetching candidates from screener...", 0.05)
         candidates = screener.screen_stocks(filters, as_of=self._as_of)
         stats["screener_candidates"] = len(candidates)
+        live = self._as_of is None
+        if live:
+            # every stage-accounting key always exists on a live run (0 = the stage dropped none),
+            # including on the early "no candidates" returns
+            stats.update(dropped_rvol=0, dropped_float=0, dropped_volume_min=0,
+                         dropped_volume_max=0, dropped_no_history=0)
         logger.info(
             f"StockScreener: stage 1 done — {len(candidates)} candidates returned"
         )
@@ -235,10 +243,6 @@ class StockScreener:
         # as_of (historical) screens keep their documented "float is approximate" behaviour.
         float_min = self._settings["screener_float_min"]
         float_max = self._settings["screener_float_max"]
-        live = self._as_of is None
-        if live:
-            # every stage-accounting key always exists on a live run (0 = the stage dropped none)
-            stats.update(dropped_float=0, dropped_volume_min=0, dropped_volume_max=0, dropped_no_history=0)
         if live and (float_min > 0 or float_max > 0):
             from ba2_providers.screener.float_filter import filter_by_float
             candidates, f_stats = filter_by_float(candidates, float_min, float_max)
@@ -470,26 +474,6 @@ class StockScreener:
         return result
 
     def _fetch_history_bulk(
-        self,
-        symbols: List[str],
-        lookback_days: int,
-        chunk_size: int = 5,
-        max_workers: int = 8,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """Single-flight wrapper (LIVE only) around ``_fetch_history_bulk_impl``.
-
-        Screens of several instances start within the same second at 09:30 and ask for
-        overlapping symbols; the per-symbol cache is only consulted BEFORE a fetch, so without
-        this they all miss together and fetch the same bars concurrently. Serialising the live
-        fetch lets the first screen fill the cache and the others read it. The as_of
-        (backtest) path is not locked.
-        """
-        if self._as_of is not None:
-            return self._fetch_history_bulk_impl(symbols, lookback_days, chunk_size, max_workers)
-        with _HISTORY_SINGLE_FLIGHT:
-            return self._fetch_history_bulk_impl(symbols, lookback_days, chunk_size, max_workers)
-
-    def _fetch_history_bulk_impl(
         self,
         symbols: List[str],
         lookback_days: int,
@@ -750,6 +734,41 @@ class StockScreener:
 
         return filters
 
+    def _require_history(
+        self, symbols: List[str], quotes_map: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        """LIVE: make a total (or large) history failure impossible to miss.
+
+        If more than ``SCREENER_DATA_FAILURE_MAX_FRACTION`` of ``symbols`` have no bars, fetch
+        those once more (failed chunks are not cached, so this is a real second attempt) and
+        recount. If NO symbol has bars, raise: every later stage (price drop, Weinstein) reads the
+        same bars, so an all-failed fetch must not flow on as "nothing passed the filters".
+        """
+        missing = [s for s in symbols if s not in quotes_map]
+        if missing and len(missing) / len(symbols) > SCREENER_DATA_FAILURE_MAX_FRACTION:
+            logger.warning(
+                f"StockScreener: no price history for {len(missing)}/{len(symbols)} candidates "
+                f"(limit {SCREENER_DATA_FAILURE_MAX_FRACTION:.0%}); re-fetching them once"
+            )
+            quotes_map = {**quotes_map, **self._quotes_from_bars(missing)}
+            missing = [s for s in symbols if s not in quotes_map]
+        if symbols and len(missing) == len(symbols):
+            raise ScreenerDataError(
+                f"StockScreener: no price history for any of the {len(symbols)} candidates "
+                f"(first 8: {symbols[:8]}); FMP history failed or was rate limited."
+            )
+        return quotes_map
+
+    def _require_any_history(self, history_map: Dict[str, List[Dict[str, Any]]], symbols: List[str],
+                             stage: str) -> None:
+        """LIVE: the price-drop / Weinstein stages must not run on a total history failure."""
+        if self._as_of is None and symbols and not any(
+                history_map.get(s.upper()) or history_map.get(s) for s in symbols):
+            raise ScreenerDataError(
+                f"StockScreener: {stage} stage found no price history for any of the "
+                f"{len(symbols)} candidates (first 8: {symbols[:8]}); FMP history failed."
+            )
+
     def _enrich_with_rvol(
         self,
         candidates: List[Dict[str, Any]],
@@ -790,6 +809,8 @@ class StockScreener:
         # signal that is IDENTICAL whether as_of is set (backtest) or None (live) — see
         # _fetch_history_bulk's anchor logic.
         quotes_map = self._quotes_from_bars(all_symbols)
+        if self._as_of is None:
+            quotes_map = self._require_history(all_symbols, quotes_map)
 
         # Price / market cap ARE legitimately live-sensitive (a stock's price is a real,
         # meaningful number the instant the market opens — nothing to "warm up" the way
@@ -893,6 +914,14 @@ class StockScreener:
         if live:
             stats["dropped_volume_min"] = dropped_volume_min
             stats["dropped_no_history"] = len(no_history)
+            # Observable headroom of the rule below, for EVERY live screen (the screener does not
+            # know its instance; the band + thresholds identify it in the log).
+            logger.info(
+                f"StockScreener: dropped_no_history={len(no_history)}/{len(all_symbols)} "
+                f"(limit {SCREENER_DATA_FAILURE_MAX_FRACTION:.0%}; needs_bars={needs_bars}; "
+                f"cap {self._settings['screener_market_cap_min']}-{self._settings['screener_market_cap_max']} "
+                f"rvol>={min_rvol} vol>={volume_min}/<={volume_max})"
+            )
             if no_history and len(no_history) / len(all_symbols) > SCREENER_DATA_FAILURE_MAX_FRACTION:
                 raise ScreenerDataError(
                     f"StockScreener: no price history for {len(no_history)}/{len(all_symbols)} "
@@ -925,6 +954,7 @@ class StockScreener:
 
         all_symbols = [c["symbol"] for c in candidates if c.get("symbol")]
         history_map = self._fetch_history_bulk(all_symbols, lookback_days)
+        self._require_any_history(history_map, all_symbols, "price-drop")
         logger.info(
             f"StockScreener: history fetched for {len(history_map)}/{total} symbols — filtering..."
         )
@@ -993,6 +1023,7 @@ class StockScreener:
         lookback_days = 250
         all_symbols = [c["symbol"] for c in candidates if c.get("symbol")]
         history_map = self._fetch_history_bulk(all_symbols, lookback_days)
+        self._require_any_history(history_map, all_symbols, "Weinstein")
 
         passed: List[Dict[str, Any]] = []
         checked = 0

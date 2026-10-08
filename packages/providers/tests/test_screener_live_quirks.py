@@ -186,8 +186,11 @@ def test_symbol_with_no_bars_is_dropped_as_no_history_whichever_bound_is_set(mon
 
 def test_no_bars_with_no_volume_bound_set_passes(monkeypatch):
     # nothing needs bars (rvol 0, no floor, no ceiling): a symbol without history is not judged
-    out, _, _ = _screen(monkeypatch, [_cand("NOBARS")], {}, bars_map={})
-    assert [r["symbol"] for r in out["results"]] == ["NOBARS"]
+    # (a TOTAL history failure still raises -- see test_all_chunks_failing_raises...; here only one
+    # of two candidates lacks bars)
+    out, _, _ = _screen(monkeypatch, [_cand("GOOD"), _cand("NOBARS")], {},
+                        bars_map={"GOOD": _bars([1_000_000] * 20)})
+    assert {r["symbol"] for r in out["results"]} == {"GOOD", "NOBARS"}
     assert out["stats"]["dropped_no_history"] == 0
 
 
@@ -221,7 +224,7 @@ def test_todays_forming_bar_is_excluded_from_the_average(monkeypatch):
 
 
 def test_every_stage_accounting_key_exists_on_a_live_run(monkeypatch):
-    out, _, _ = _screen(monkeypatch, [_cand("A")], {}, bars_map={})
+    out, _, _ = _screen(monkeypatch, [_cand("A")], {}, bars_map={"A": _bars([1_000_000] * 20)})
     for k in ("dropped_float", "dropped_volume_min", "dropped_volume_max", "dropped_no_history", "dropped_rvol"):
         assert out["stats"][k] == 0
 
@@ -260,6 +263,45 @@ def test_live_rvol_denominator_includes_the_numerator_session_unlike_the_store(m
     q = sc._quotes_from_bars(["X"])["X"]
     assert q["avgVolume"] == 1_100_000.0 and q["volume"] == 3_000_000
     assert round(q["volume"] / q["avgVolume"], 2) == 2.73       # the store would give 3.0
+
+
+# ------------------------------------------------------------------ stage 1 / early returns
+def test_stage_1_empty_return_carries_every_stats_key(monkeypatch):
+    out, _, _ = _screen(monkeypatch, [], {})
+    assert out["results"] == []
+    for k in ("screener_candidates", "dropped_rvol", "dropped_float", "dropped_volume_min",
+              "dropped_volume_max", "dropped_no_history"):
+        assert out["stats"][k] == 0
+
+
+def test_float_stage_empty_return_carries_every_stats_key(monkeypatch):
+    out, _, _ = _screen(monkeypatch, [_cand("SMALL")], {"screener_float_min": 1e7},
+                        bars_map={"SMALL": _bars([1_000_000] * 20)})
+    assert out["results"] == [] and out["stats"]["dropped_float"] == 1
+    for k in ("dropped_rvol", "dropped_volume_min", "dropped_volume_max", "dropped_no_history"):
+        assert out["stats"][k] == 0
+
+
+def _real_provider():
+    p = FMPScreenerProvider.__new__(FMPScreenerProvider)
+    p.api_key = "SECRETKEY"
+    return p
+
+
+def test_stage_1_vendor_outage_raises_through_the_screen(monkeypatch):
+    """The real provider, only the HTTP boundary faked: an outage is an error, not 0 candidates."""
+    import requests
+
+    def down(url, params=None, **kw):
+        raise requests.ConnectionError(f"boom {params['apikey']}")
+
+    import ba2_providers.fmp_common as fmp_common
+    monkeypatch.setattr(fmp_common, "fmp_http_get", down)
+    monkeypatch.setattr(ba2_providers, "get_provider", lambda cat, name, **kw: _real_provider())
+    sc = S.StockScreener({"screener_price_drop_pct": 0})
+    with pytest.raises(S.ScreenerDataError) as ei:
+        sc.screen()
+    assert "ConnectionError" in str(ei.value) and "SECRETKEY" not in str(ei.value)
 
 
 def test_volume_max_is_an_average_not_the_last_session(monkeypatch):

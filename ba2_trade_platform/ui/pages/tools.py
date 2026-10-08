@@ -14,6 +14,7 @@ import requests
 from ...config import get_app_setting
 from ...logger import logger
 from ...modules.dataproviders import get_provider
+from ba2_providers.StockScreener import ScreenerDataError
 from .symbol360 import Symbol360Tab
 
 
@@ -1206,6 +1207,12 @@ class PennyScreenerTab:
 
             self.loading_spinner.classes(add='hidden')
 
+        except ScreenerDataError as e:
+            # A vendor outage must be shown, not read as "no results" (it is a RuntimeError, so
+            # it would otherwise fall into the client-disconnect branch below).
+            logger.error(f"Penny screener search failed: {e}")
+            self.loading_spinner.classes(add='hidden')
+            ui.notify(f'Screener data error: {str(e)}', type='negative')
         except RuntimeError as e:
             if "client" in str(e).lower() and "deleted" in str(e).lower():
                 logger.debug("[PennyScreenerTab] Client disconnected during search")
