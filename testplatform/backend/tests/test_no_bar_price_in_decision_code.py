@@ -84,7 +84,7 @@ def scan():
                 elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                       and n.func.attr in ("get_ohlcv_data", "get_ohlcv_data_unsliced")):
                     kind = "ohlcv-read"
-                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "screener_now_price":
+                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("screener_now_price", "screener_session_high"):
                     kind = "screener-opening-print"      # the ONE owner-approved opening-print read (screener only)
                 elif isinstance(n, (ast.Import, ast.ImportFrom)):
                     mod = getattr(n, "module", "") or ""
@@ -163,6 +163,9 @@ SITES[(f"{ENG}/screener_gate.py", "screener-opening-print", "px = ps.screener_no
     ("owner-approved: screener simulation uses the opening print as live uses a quote ~30-90 s after the open "
      "(2026-10-08; SCREENER ONLY: the gate that reproduces live's FMP screener; every other decision keeps the "
      "ended-bars-only rule)")
+SITES[(f"{ENG}/screener_gate.py", "screener-opening-print", "h = ps.screener_session_high(str(syms[i]), as_of_dt)")] =     ("owner-approved screener exception (same as above): the forming daily bar's high through T = bars ended <= T "
+     "(+ the opening print inside the first bar); never a bar that has not ended")
+SITES[(f"{ENG}/price_source.py", "screener-opening-print", "return self.screener_now_price(symbol, as_of)")] =     "the price source's own implementation: the session-high helper falls back to the same owner-approved opening print"
 SITE_COUNTS = {("testplatform/backend/app/services/backtest/daily_engine.py", "source-import",
                 "from app.services.backtest.price_source import BacktestCacheMiss"): 5,
                ("packages/experts/ba2_experts/FMPSenateTraderWeight.py", "source-import",

@@ -325,3 +325,97 @@ def test_the_gate_never_fetches_anything(monkeypatch, tmp_path):
     gate = sg.PanelGate(_runtime(str(d), {"market_cap_min": 2e9, "max_stocks": 10}), FakePS(dict(world.open_now)),
                         intraday=True)
     assert isinstance(gate.symbols(datetime.fromisoformat(W.DAY + "T10:00:00")), list)
+
+
+# ----------------------------------------------------------------------------------------------------------
+# "now" and the FORMING daily bar at every decision time T (09:30 opening print; T >= 09:35 the ended-bar rule)
+# ----------------------------------------------------------------------------------------------------------
+def _full_session_source():
+    """One symbol, two sessions of 78 five-minute bars. Jan-3 climbs to a SPIKE HIGH at 14:00 (after any early T)."""
+    from datetime import date
+    from app.services.backtest.price_source import AsOfPriceSource
+    ps = AsOfPriceSource(ohlcv_provider=None, interval="5min")
+    rows = []
+    for d in (date(2024, 1, 2), date(2024, 1, 3)):
+        for i in range(78):
+            h, m = divmod(9 * 60 + 30 + 5 * i, 60)
+            base = 100.0 + (0.01 * i if d.day == 2 else 0.02 * i)
+            spike = 40.0 if (d.day == 3 and (h, m) == (14, 0)) else 0.0
+            rows.append({"Date": datetime(d.year, d.month, d.day, h, m), "Open": base, "High": base + 0.5 + spike,
+                         "Low": base - 0.5, "Close": base + 0.2, "Volume": 1000})
+    ps.load_bars("AAA", rows)
+    return ps, rows
+
+
+def test_forming_bar_through_T_never_sees_a_bar_that_has_not_ended():
+    ps, rows = _full_session_source()
+    day3 = [r for r in rows if r["Date"].day == 3]
+    spike_high = max(r["High"] for r in day3)
+    assert spike_high > 140
+    for (h, m) in ((9, 30), (9, 35), (10, 0), (12, 0), (15, 30), (15, 45)):
+        t = _wall(h, m)
+        ended = [r for r in day3 if r["Date"] + __import__("datetime").timedelta(minutes=5) <= datetime(2024, 1, 3, h, m)]
+        hi = ps.screener_session_high("AAA", t)
+        px = ps.screener_now_price("AAA", t)
+        if not ended:                                              # T = 09:30: the opening print
+            assert px == day3[0]["Open"] and hi == day3[0]["Open"], (h, m)
+        else:                                                      # T >= 09:35: bars ended <= T only
+            assert px == ended[-1]["Close"] == float(ps.decision_price("AAA", t)), (h, m)
+            assert hi == max(r["High"] for r in ended), (h, m)
+            assert px <= hi
+    # the 14:00 spike (bar ends 14:05) is invisible at 10:00, 12:00, 15:30 sees it only once it has ended
+    assert ps.screener_session_high("AAA", _wall(10, 0)) < 105 and ps.screener_session_high("AAA", _wall(12, 0)) < 106
+    assert ps.screener_session_high("AAA", _wall(14, 0)) < 110                  # the 14:00 bar has not ended at 14:00
+    assert ps.screener_session_high("AAA", _wall(14, 5)) == spike_high         # ... and has at 14:05
+    assert ps.screener_session_high("AAA", _wall(15, 45)) == spike_high
+
+
+def test_the_day_bounds_are_a_valid_superset_for_every_decision_time():
+    """The prune / superset passes the session's [low, high] as 'now' and the day high as the forming high: every
+    price and every high-so-far the gate can read at ANY T lies inside them."""
+    ps, rows = _full_session_source()
+    day3 = [r for r in rows if r["Date"].day == 3]
+    lo, hi = min(r["Low"] for r in day3), max(r["High"] for r in day3)
+    for hh in range(9, 16):
+        for mm in range(0, 60, 5):
+            if (hh, mm) < (9, 30) or (hh, mm) > (15, 55):
+                continue
+            t = _wall(hh, mm)
+            px, fh = ps.screener_now_price("AAA", t), ps.screener_session_high("AAA", t)
+            assert lo <= px <= hi and px <= fh <= hi, (hh, mm, px, fh)
+
+
+def test_peak_uses_the_forming_high_not_only_the_price_now():
+    """forming_hi joins the drop window's peak: with a high-so-far above the price now the drop is measured from it."""
+    n = 2
+    cols = dict(symbols=np.array(["A", "B"]), shares=np.full(n, 1e8), last_close=np.array([100.0, 100.0]),
+                rvol=np.full(n, 2.0), last_vol=np.full(n, 1e6), avg20=np.full(n, 1e6), w2=np.ones(n, bool),
+                fl=np.full(n, np.nan), peak=np.array([101.0, 101.0]))
+    st = {"market_cap_min": 1e9, "price_drop_pct": 10.0, "price_drop_days": 5, "max_stocks": 10}
+    now = np.array([95.0, 95.0])
+    # high so far 110 (A) vs 101 (B): drop A = 13.6 % passes, B = 5.9 % fails
+    got = ls.select_from_columns(**cols, now=now, settings=st, beh=ls.POST_FIX,
+                                 forming_hi=lambda idx: np.array([110.0, 101.0])[idx])
+    assert [str(cols["symbols"][i]) for i in got] == ["A"]
+    # without forming_hi the single price now is the forming bar (high = now): neither passes
+    assert list(ls.select_from_columns(**cols, now=now, settings=st, beh=ls.POST_FIX)) == []
+
+
+def test_gate_t_1000_does_not_leak_a_later_session_high(tmp_path):
+    """End to end through PanelGate with a real 5-minute price source: a stock whose session high comes AFTER
+    10:00 is not screened as a deep dip from that future high; at 15:45 (high ended) it is."""
+    ps, rows = _full_session_source()
+    sessions = ["2024-01-02", "2024-01-03", "2024-01-04"]
+    T = len(sessions)
+    bars = {"AAA": (np.arange(1), np.array([100.0]), np.array([101.0]), np.array([99.0]), np.array([100.0]), np.array([1e6]))}
+    shares = np.full((1, T), 1e8)
+    arrays = ls.build_panel_arrays(bars, sessions, shares, ["AAA"])
+    d = tmp_path / "panel"
+    ls.save_panel(str(d), ["AAA"], sessions, arrays, {"shares_vendor_snapshot": "x", "shares_lag_days": 45,
+                  "fresh_fraction": 1.0, "last_bar_date": "2024-01-02", "source_fingerprint": "leak"})
+    sg.clear_panel_memo()
+    st = {"market_cap_min": 1e9, "price_drop_pct": 20.0, "price_drop_days": 2, "max_stocks": 5}
+    gate = sg.PanelGate(_runtime(str(d), st), ps, intraday=True)
+    # peak(2) from the finished sessions is 101; the 14:00 spike (high ~141.5) would make 'now' ~102 a 28 % drop
+    assert gate.symbols(_wall(10, 0)) == []
+    assert gate.symbols(_wall(15, 45)) == ["AAA"]

@@ -278,7 +278,8 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
                         vol_today: Optional[Callable[[np.ndarray], np.ndarray]] = None,
                         valid: Optional[np.ndarray] = None, cut: bool = True,
                         band_basis: Optional[str] = None, rank_basis: Optional[str] = None,
-                        diag: Optional[Dict[str, int]] = None) -> np.ndarray:
+                        diag: Optional[Dict[str, int]] = None,
+                        forming_hi: Optional[Callable[[np.ndarray], np.ndarray]] = None) -> np.ndarray:
     """Indices (into the column arrays) of the symbols live would return, IN LIVE'S ORDER.
 
     ``now(idx)`` -> ``(now_lo, now_hi)`` per candidate: the price knowable at T (equal arrays), or the day's
@@ -286,6 +287,10 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
     volume so far (needed only by the pre-fix ``LEGACY_CURRENT`` ``volume_min``).  ``peak`` = highest high over
     live's drop window (``None`` when no drop filter is set).  ``cut=False`` returns every symbol that passes
     the filters (no ``max_stocks`` cut) for the superset / prune.  Ties on the rank key: symbol ascending.
+    ``forming_hi(idx)`` -> the HIGH of the forming daily bar through the decision instant T (session open and the
+    highest high of the intraday bars ended <= T; at a first-bar decision the opening print); it joins the drop
+    window's peak.  ``None``: the forming bar is the single price ``now`` (high = low = close = now).  The superset
+    passes the session's full-day high (>= every high-so-far).
     ``diag``, when given, receives live's stage accounting (``stage1``, ``dropped_float``, ``dropped_no_history``,
     ``dropped_rvol``, ``dropped_volume_min``, ``dropped_volume_max``, ``weinstein``, ``price_drop``, ``final``)."""
     check_settings(settings, beh)
@@ -420,7 +425,8 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
         pk = peak[idx]
         cur = np.where(np.isfinite(now_lo) & (now_lo > 0), now_lo, last_close[idx])
         if FORMING_BAR_PRESENT:                       # the forming bar's high is part of the peak (>= the price now)
-            pk = np.fmax(pk, np.where(np.isfinite(now_lo) & (now_lo > 0), now_lo, np.nan))
+            fh = forming_hi(idx) if forming_hi is not None else now_lo
+            pk = np.fmax(pk, np.where(np.isfinite(fh) & (fh > 0), fh, np.nan))
         with np.errstate(invalid="ignore", divide="ignore"):
             d = (pk - cur) / pk * 100.0
         good = np.isfinite(pk) & (pk > 0) & np.isfinite(cur)
@@ -530,13 +536,15 @@ class DailyPanel:
 
     def select(self, day: str, settings: Dict[str, Any], beh: LiveBehaviour, *, now: _NOW,
                vol_today: Optional[Callable[[np.ndarray], np.ndarray]] = None, cut: bool = True,
-               valid: Optional[np.ndarray] = None, diag: Optional[Dict[str, int]] = None) -> List[str]:
+               valid: Optional[np.ndarray] = None, diag: Optional[Dict[str, int]] = None,
+               forming_hi: Optional[Callable[[np.ndarray], np.ndarray]] = None) -> List[str]:
         p = self.pos(day)
         cols = self.columns(p)
         dpct, ddays = _fnum(settings, "price_drop_pct"), int(_fnum(settings, "price_drop_days"))
         peak = self.peak_by_day(ddays)[p] if dpct > 0 and ddays > 0 else None
         idx = select_from_columns(**cols, peak=peak, now=now, vol_today=vol_today, settings=settings, beh=beh,
-                                  valid=valid, cut=cut, diag=diag)
+                                  valid=valid, cut=cut, diag=diag,
+                                  forming_hi=forming_hi)
         return [str(self.symbols[i]) for i in idx]
 
     def select_bounds(self, day: str, settings: Dict[str, Any], beh: LiveBehaviour, *, cut: bool = False,
@@ -548,7 +556,8 @@ class DailyPanel:
 
         def _now(idx):
             return lo[idx], hi[idx]
-        return self.select(day, settings, beh, now=_now, vol_today=lambda idx: vol[idx], cut=cut, valid=valid)
+        return self.select(day, settings, beh, now=_now, vol_today=lambda idx: vol[idx], cut=cut, valid=valid,
+                           forming_hi=lambda idx: hi[idx])
 
 
 # ======================================================================================================

@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -161,15 +162,34 @@ def fetch_historical_shares(cache_folder: str, symbol: str, api_key: str, *, max
 
 
 def prefetch_shares(cache_folder: str, symbols: List[str], api_key: str, *, max_age_days: int = 7, workers: int = 4,
-                    log: Callable[[str], None] = print) -> Dict[str, Any]:
+                    log: Callable[[str], None] = print, max_per_second: Optional[float] = None,
+                    deadline_utc: Optional[datetime] = None) -> Dict[str, Any]:
     """Fetch / refresh the vendor share history of every symbol (resumable: a fresh cache file is skipped, so an
     interrupted run continues where it stopped).  Returns the counts; failures are listed, not hidden."""
-    import time
     t0 = time.time()
-    counts = {"cached": 0, "fetched": 0, "empty": 0, "failed": 0}
+    counts = {"cached": 0, "fetched": 0, "empty": 0, "failed": 0, "skipped": 0}
     failed: List[str] = []
 
+    import threading
+    gate = threading.Lock()
+    nxt = [0.0]
+    stopped = [False]
+
     def _one(sym: str):
+        if deadline_utc is not None and datetime.now(timezone.utc) >= deadline_utc:
+            stopped[0] = True
+            return sym, "skipped", "deadline reached (resume later)"
+        if max_per_second:
+            # a shared pacing clock: at most ``max_per_second`` vendor calls per second over all threads (the key is
+            # shared with the live instances); a cache hit costs nothing and is checked inside fetch_historical_shares
+            p = shares_cache_path(cache_folder, sym)
+            if not _is_fresh(p, max_age_days):
+                with gate:
+                    now = time.time()
+                    wait = nxt[0] - now
+                    nxt[0] = max(now, nxt[0]) + 1.0 / max_per_second
+                if wait > 0:
+                    time.sleep(wait)
         try:
             return sym, fetch_historical_shares(cache_folder, sym, api_key, max_age_days=max_age_days), None
         except Exception as e:  # noqa: BLE001 - counted and reported below
@@ -185,6 +205,15 @@ def prefetch_shares(cache_folder: str, symbols: List[str], api_key: str, *, max_
     counts["failed_symbols"] = failed[:20]
     log(f"vendor share history: {counts} in {time.time() - t0:.0f}s")
     return counts
+
+
+def _is_fresh(path: str, max_age_days: int) -> bool:
+    try:
+        with open(path + ".meta.json") as f:
+            fetched_on = date.fromisoformat(json.load(f)["fetched_on"])
+        return os.path.exists(path) and (date.today() - fetched_on).days <= max_age_days
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _vendor_history(cache_folder: str, sym: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:

@@ -867,6 +867,26 @@ class AsOfPriceSource:
             return float(self._o[symbol][i])                    # the session's opening print
         return None
 
+    def screener_session_high(self, symbol: str, as_of: Any) -> Optional[float]:
+        """The HIGH of the forming daily bar of T's session as the screener simulation sees it at ``as_of``: the
+        highest high of the session's intraday bars that have ENDED at or before T; inside the first bar the opening
+        print.  NEVER a bar that has not ended (a session high reached after T does not leak).  Screener-only, with
+        ``screener_now_price`` (same owner-approved exception).  Daily clock / nothing knowable: ``None`` (the gate
+        then uses the single price ``now``)."""
+        if not self._intraday:
+            return None
+        k = self._keys.get(symbol)
+        if k is None or not len(k):
+            return None
+        key = _key64(as_of, self._interval)
+        span = _interval_ns(self._interval)
+        day0 = (key // _NS_PER_DAY) * _NS_PER_DAY
+        f = bisect.bisect_right(k, key - span) - 1
+        if f >= 0 and k[f] >= day0:
+            start = bisect.bisect_left(k, day0)
+            return float(np.max(self._h[symbol][start:f + 1]))
+        return self.screener_now_price(symbol, as_of)
+
     # ---- loading -----------------------------------------------------------
     def preload(
         self,

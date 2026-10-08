@@ -145,6 +145,7 @@ class PanelGate:
             return got
         panel, ps, syms = self.panel, self.ps, self.panel.symbols
         memo: Dict[int, float] = {}
+        hmemo: Dict[int, float] = {}
 
         def _now(idx: np.ndarray):
             vals = np.empty(idx.size)
@@ -157,10 +158,23 @@ class PanelGate:
                 vals[j] = v
             return vals, vals
 
+        def _forming_hi(idx: np.ndarray) -> np.ndarray:
+            """High of the forming daily bar through T (session open + bars ended <= T), NaN -> the price now."""
+            out = np.empty(idx.size)
+            for j, i in enumerate(idx):
+                v = hmemo.get(i)
+                if v is None:
+                    h = ps.screener_session_high(str(syms[i]), as_of_dt)
+                    v = float("nan") if h is None else float(h)
+                    hmemo[i] = v
+                out[j] = v if np.isfinite(v) else memo.get(i, float("nan"))
+            return out
+
         vol = None
         if not self.beh.volume_is_average:
             def vol(idx):                                   # pre-fix validation mode only
                 return np.array([ps.volume_so_far(str(syms[i]), as_of_dt) or 0.0 for i in idx])
-        res = panel.select(day, self.settings, self.beh, now=_now, vol_today=vol, valid=self.valid)
+        res = panel.select(day, self.settings, self.beh, now=_now, vol_today=vol, valid=self.valid,
+                           forming_hi=_forming_hi if self.intraday else None)
         self._cache[key] = res
         return res
