@@ -69,7 +69,7 @@ def _bars(start, end, interval):
 
 
 @pytest.fixture
-def cache_dir(tmp_path, monkeypatch):
+def cache_dir(tmp_path, monkeypatch, request):
     """Redirect the parquet cache root so tests never touch the real cache tree."""
     d = tmp_path / "cache"
     d.mkdir()
@@ -79,6 +79,14 @@ def cache_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "CACHE_FOLDER", str(d))
     monkeypatch.setattr(native_cache, "CACHE_FOLDER", str(d))
     monkeypatch.setattr(native_cache, "_CACHE_ROOT", str(d / "datasets" / "cache"))
+    # These tests pin the file-mtime freshness gate. The live in-session rule (a LATEST daily read while a
+    # session is open fetches today's forming bar whatever the mtime says, pinned in
+    # packages/providers/tests/test_ohlcv_no_unfinished_bars.py) depends on the wall clock, so it is switched
+    # off here to keep them deterministic at any hour.
+    from ba2_common.core import ohlcv_final_bars
+    ohlcv_final_bars.set_live_overlay_enabled(False)
+    MarketDataProviderInterface._UNFINISHED_MEMO.clear()
+    request.addfinalizer(lambda: ohlcv_final_bars.set_live_overlay_enabled(False))
     return str(d)
 
 

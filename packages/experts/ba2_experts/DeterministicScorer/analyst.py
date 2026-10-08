@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from ba2_common.core.knowability import intraday_decision_clock, published_known
+
 DEF_WINDOW_DAYS = 90
 DEF_HALFLIFE_DAYS = 30
 DEF_TARGET_WINDOW_DAYS = 90
@@ -140,6 +142,10 @@ def price_target_drift(rows: Optional[List[Dict[str, Any]]], as_of: datetime,
             continue
         d = _as_utc(d)
         if d > as_of or d <= floor:
+            continue
+        # INTRADAY clock: ``publishedDate`` is a UTC timestamp; a target published after the
+        # decision instant on its own date is not yet public (see ba2_common.core.knowability).
+        if intraday_decision_clock() and not published_known(raw, as_of):
             continue
         try:
             t = float(target)

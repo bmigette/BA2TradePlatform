@@ -560,22 +560,44 @@ class TastyTradeAccount(AccountInterface):
             else:
                 current = avg_price
 
+            # DIRECTION. TastyTrade publishes ``quantity`` as an ABSOLUTE number and the direction in
+            # ``quantity_direction`` ("Long" / "Short"). The platform's Position contract (Alpaca's, and
+            # what ``get_signed_position_quantity``, the exposure gate and the breach sweep read) is
+            # SIGNED: a short has a NEGATIVE qty, cost basis and market value, and an unrealized P/L that
+            # is positive when the price FALLS. Reading the absolute figures as they came made a short
+            # look like a long of the same size. An unknown direction on a held row is an unreadable
+            # book, never a guess.
+            direction = str(getattr(pos, "quantity_direction", None) or "").strip().lower()
+            if direction == "long":
+                sign = 1.0
+            elif direction == "short":
+                sign = -1.0
+            else:
+                logger.error(
+                    f"[Account {self.id}] position {pos.symbol} has quantity {pos.quantity} but "
+                    f"quantity_direction={getattr(pos, 'quantity_direction', None)!r} (expected "
+                    f"'Long' or 'Short'); reporting the whole book as UNREADABLE (None) rather than "
+                    f"guessing a direction")
+                return None
+
             abs_qty = abs(qty)
-            cost_basis = avg_price * abs_qty * multiplier
-            market_val = current * abs_qty * multiplier
+            signed_qty = sign * abs_qty
+            cost_basis = sign * avg_price * abs_qty * multiplier
+            market_val = sign * current * abs_qty * multiplier
+            # signed market value - signed cost basis: a short that fell is a gain.
             unrealized_pl = market_val - cost_basis
-            unrealized_plpc = (unrealized_pl / cost_basis) if cost_basis else 0.0
+            unrealized_plpc = (unrealized_pl / abs(cost_basis)) if cost_basis else 0.0
 
             # INTRADAY = move since the previous close, on the position still OPEN.
             # (`realized_day_gain` is CLOSED-out P&L for the day -- a different number,
             # and what this used to report.)
             lastday_price = close_price if close_price is not None else current
             change_today = ((current - lastday_price) / lastday_price) if lastday_price else 0.0
-            intraday_pl = (current - lastday_price) * abs_qty * multiplier
+            intraday_pl = (current - lastday_price) * signed_qty * multiplier
             lastday_value = lastday_price * abs_qty * multiplier
             intraday_plpc = (intraday_pl / lastday_value) if lastday_value else 0.0
 
-            side = OrderDirection.BUY if pos.quantity_direction == "Long" else OrderDirection.SELL
+            side = OrderDirection.BUY if sign > 0 else OrderDirection.SELL
 
             positions.append(Position(
                 asset_class="Equity",
@@ -587,8 +609,8 @@ class TastyTradeAccount(AccountInterface):
                 exchange="",
                 lastday_price=lastday_price,
                 market_value=market_val,
-                qty=abs_qty,
-                qty_available=abs_qty,
+                qty=signed_qty,
+                qty_available=signed_qty,
                 side=side,
                 swap_rate=None,
                 symbol=pos.symbol,

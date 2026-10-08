@@ -120,6 +120,22 @@ def test_save_on_a_short_position_is_refused(acct, broker):
     assert broker.place_calls == []
 
 
+def test_a_short_through_the_real_sdk_shape_reads_as_short_whatever_the_sign_convention(acct, broker):
+    # The fake emits the REAL tastytrade shape (absolute quantity + quantity_direction "Short");
+    # the adapter signs it (-10), and the allocator's read must still see a SHORT of 10 shares.
+    broker.positions["ABC"] = Decimal(-10)
+    raw = acct.get_positions()
+    assert [(p.qty, p.side) for p in raw] == [(-10.0, OrderDirection.SELL)]
+    assert aps._read_position(acct, "ABC") == (10.0, False)
+    # an adapter that publishes a magnitude + side (the old IBKR / old Tasty shape) is the same short
+    from types import SimpleNamespace
+    acct.get_positions = lambda: [SimpleNamespace(symbol="ABC", qty=10.0, side=OrderDirection.SELL)]
+    assert aps._read_position(acct, "ABC") == (10.0, False)
+    # and a long stays a long
+    acct.get_positions = lambda: [SimpleNamespace(symbol="ABC", qty=10.0, side=OrderDirection.BUY)]
+    assert aps._read_position(acct, "ABC") == (10.0, True)
+
+
 def test_save_with_an_unreadable_position_is_refused_not_assumed(acct, broker):
     broker.positions_fail = True
     acct.get_positions = lambda: None

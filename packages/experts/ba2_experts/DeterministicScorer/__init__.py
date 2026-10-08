@@ -54,6 +54,7 @@ from ba2_experts.earnings_surprise import pead_score
 from .macro import (trend_score, vix_score, sahm_score, credit_score,
                     yield_curve_score, regime_composite, DEF_MW, DEF_YC_SCALE,
                     DEF_M_FLOOR, DEF_HARD_RISKOFF)
+from ba2_common.core.knowability import require_decision_price
 from .combine import (final_score, schmitt_trigger, atr_target_price,
                       atr_stop_price, resolve_target_price, confidence_from_score,
                       DEF_W_TECHNICAL, DEF_W_FUNDAMENTAL, DEF_W_ANALYST,
@@ -388,7 +389,8 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
 
         as_of=None => latest (live). Point-in-time is enforced by the provider
         interfaces (as_of_date/end_date semantics) and by slicing OHLCV to
-        <= as_of. The bundle carries current_price (the as_of close).
+        <= as_of. The bundle carries current_price: the DECISION price via ``_decision_price``
+        (live quote / backtest decision price), never the daily frame's last close.
         """
         symbol = self._gather_symbol
         df = data.fetch_ohlcv(providers, symbol, as_of)
@@ -414,9 +416,20 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         index_closes = data.fetch_index_closes(
             providers, as_of, str(getattr(self, "_gather_index_symbol", data.INDEX_SYMBOL)))
 
-        current_price = None
-        if df is not None and not df.empty:
-            current_price = float(df["Close"].iloc[-1])
+        # The price the decision is made at: ONE seam shared with every other expert
+        # (``_decision_price``): live -> the account quote, backtest -> the host's decision price
+        # (the close of the latest ENDED intraday bar on an intraday clock, the as_of close on a
+        # daily one). The last row of ``df`` is a FINISHED daily bar -- HISTORY for the indicators,
+        # never the price: in a backtest it is the prior session's close, live a cached bar that
+        # may be today's partial one. No fallback to it: a missing price refuses the decision
+        # (_process).
+        # CAPTURE FORMAT MARKER: a recording made after this change holds a broker-quote observation for
+        # the decision price (the account read below, INSIDE the captured gather). The marker tells the
+        # replay layer to demand that observation (a missing one is a tape miss) instead of applying the
+        # LEGACY rule to a recording that predates it (price = the recorded frame's last close).
+        record_branch_flag("ds_decision_price_source", "account_quote")
+        px = self._decision_price(providers, symbol, as_of)
+        current_price = px   # not float(): a DecisionPrice keeps its bar stamp for the guard
 
         bundle = {
             "symbol": symbol,
@@ -445,11 +458,31 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         current_price = data_bundle.get("current_price")
         min_hist = int(settings.get("min_history_days", 260))
 
-        if df is None or len(df) < min_hist or current_price is None:
+        if current_price is None:
+            # No decision price (live: the account returned no quote; backtest: no bar has ended).
+            # NOT a history problem and never a number to invent: refuse, say why, carry no price.
+            # Nothing downstream reads ``current_price`` of a skipped recommendation (the live
+            # run_analysis and the engine both return on ``skip`` before using it).
+            account_id = getattr(getattr(self, "instance", None), "account_id", None)
+            # WARNING per symbol; the PASS-level ERROR (one line for a broker outage) is
+            # ``pass_price_health.summarise_pass``, called when the batch ends.
+            from ba2_common.core import pass_price_health
+            pass_price_health.record_no_price(getattr(self, "id", None), symbol)
+            from ba2_common.logger import logger as _module_logger
+            (getattr(self, "logger", None) or _module_logger).warning(
+                f"DeterministicScorer {symbol}: no current price from the decision-price seam "
+                f"(expert instance {getattr(self, 'id', None)}, account {account_id}, "
+                f"as_of={as_of}); skipping the analysis")
+            return Recommendation(
+                signal=OrderRecommendation.HOLD, confidence=0.0, current_price=None,
+                details=f"No current price available for {symbol} (account quote / decision price "
+                        f"missing); not analysed",
+                expected_profit_percent=0.0, skip=True, skip_reason="no_price")
+        if df is None or len(df) < min_hist:
             n = 0 if df is None else len(df)
             return Recommendation(
                 signal=OrderRecommendation.HOLD, confidence=0.0,
-                current_price=current_price or 0.0,
+                current_price=current_price,
                 details=f"Insufficient OHLCV history ({n} < {min_hist})",
                 expected_profit_percent=0.0, skip=True,
                 skip_reason="insufficient_history")
@@ -538,6 +571,8 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         # DeterministicScorer's own "less accurate way of calculating... target price".
         # resolve_target_price enforces BUY-only for the model leg; stop price is ALWAYS
         # ATR-based regardless of this setting (risk management, not valuation).
+        if action in ("BUY", "SELL"):
+            require_decision_price(current_price, what="DeterministicScorer target/stop", symbol=symbol)
         model_target_price = None
         if action == "BUY" and bool(settings.get("use_model_target", False)):
             model_out = estimate_price_target(

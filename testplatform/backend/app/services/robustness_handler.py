@@ -24,7 +24,7 @@ Two behaviours, both keyed off a ``RobustnessRun`` row:
 
 ``run_schedule_override`` shape (what ``daily_engine._entry_schedule`` reads, mirroring
 ``app.api.backtests._run_schedule_override``): ``{"days": {weekday: bool, ...}, "times": ["HH:MM", ...]}``.
-Day variants pin exactly one weekday True with ``times=["09:30"]``; time variants keep all days True
+Day variants pin exactly one weekday True with the PARENT'S OWN ``times``; time variants keep all days True
 with a single ``times=[<HH:MM>]`` entry.
 """
 from __future__ import annotations
@@ -46,7 +46,6 @@ logger = logging.getLogger(__name__)
 # Weekday ordering — mirrors app.api.backtests._WEEKDAYS (Mon..Fri are the trading-day variants).
 _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 _TRADING_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday")
-_DEFAULT_TIME = "09:30"  # first regular-session bar; matches _run_schedule_override
 
 _TERMINAL = ("completed", "failed")
 
@@ -145,11 +144,16 @@ def run_monte_carlo_for_backtest(robustness_run_id: int) -> None:
 # ---------------------------------------------------------------------------
 # Schedule variants
 # ---------------------------------------------------------------------------
-def _day_override(weekday: str) -> Dict[str, Any]:
-    """run_schedule_override pinning exactly ``weekday`` (weekly entry-day variant)."""
+def _day_override(weekday: str, times: List[str], intraday: bool = True) -> Dict[str, Any]:
+    """run_schedule_override pinning exactly ``weekday`` (weekly entry-day variant) at the PARENT'S
+    OWN entry time(s): a day variant changes the weekday only. (It used to pin a fixed 09:30,
+    which silently moved a row decided at another time.) A DAILY-clock parent (options) states no
+    time and needs none (the engine ignores ``times`` there): the inert legacy label is kept, as
+    before. An intraday parent without a time raises (``knowability.entry_times_for``)."""
+    from ba2_common.core.knowability import entry_times_for
     return {
         "days": {d: (d == weekday) for d in _WEEKDAYS},
-        "times": [_DEFAULT_TIME],
+        "times": entry_times_for(times, stored_row=False, intraday=intraday),
     }
 
 
@@ -161,17 +165,20 @@ def _time_override(hhmm: str) -> Dict[str, Any]:
     }
 
 
-def _schedule_variants(params: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _schedule_variants(params: Dict[str, Any], parent_times: Optional[List[str]] = None,
+                       intraday: bool = True, time_is_gene: bool = False) -> List[Dict[str, Any]]:
     """Build the list of ``{variant, override}`` from the run params.
 
-    * ``day_variants=True`` -> one weekly-entry-day variant per Mon..Fri.
-    * ``time_variants=[...]`` -> one entry-time variant per requested HH:MM.
+    * ``day_variants=True`` -> one weekly-entry-day variant per Mon..Fri, at ``parent_times``.
+    * ``time_variants=[...]`` -> one entry-time variant per requested HH:MM, EXCEPT for a parent
+      whose time is a GENE (``time_is_gene``): the optimizer already explored the time, so the
+      time variants are skipped (the caller records why; see ``launch_schedule_variants``).
     """
     out: List[Dict[str, Any]] = []
     if params.get("day_variants"):
         for wd in _TRADING_DAYS:
-            out.append({"variant": f"day-{wd}", "override": _day_override(wd)})
-    for t in (params.get("time_variants") or []):
+            out.append({"variant": f"day-{wd}", "override": _day_override(wd, parent_times or [], intraday)})
+    for t in ([] if time_is_gene else (params.get("time_variants") or [])):
         out.append({"variant": f"time-{t}", "override": _time_override(t)})
     return out
 
@@ -201,10 +208,21 @@ def launch_schedule_variants(robustness_run_id: int) -> List[int]:
             # a daily_expert row and is reconstructible). We don't run it here — we only need the
             # persisted strategy_params to CLONE per variant; the rerun handler rebuilds+runs each
             # variant from its own row. Calling it here surfaces reconstruction errors early.
-            rebuild_config_for_backtest(bt, db)
+            parent_cfg = rebuild_config_for_backtest(bt, db)
+            parent_times = list(((parent_cfg.get("run_schedule_override") or {}).get("times")) or [])
 
             base_sp = copy.deepcopy(bt.strategy_params or {})
-            variants = _schedule_variants(run.params or {})
+            _iv = str(parent_cfg.get("execution_interval") or "").lower()
+            from ba2_common.core.schedule_genes import schedule_time_from_genes
+            gene_time = schedule_time_from_genes(bt.strategy_params)
+            variants = _schedule_variants(run.params or {}, parent_times,
+                                          _iv.endswith("m") or _iv.endswith("h") or _iv.endswith("min"),
+                                          time_is_gene=gene_time is not None)
+            if gene_time is not None and (run.params or {}).get("time_variants"):
+                note = (f"time variants SKIPPED: the parent's time ({gene_time}) is a GA gene, "
+                        f"the optimizer already explored the decision time")
+                logger.warning(f"robustness schedule run {run.id}: {note}")
+                run.params = {**(run.params or {}), "time_variants_skipped": note}
             if not variants:
                 raise ValueError("no schedule variants requested (day_variants/time_variants both empty)")
 
@@ -212,6 +230,17 @@ def launch_schedule_variants(robustness_run_id: int) -> List[int]:
             for spec in variants:
                 variant_sp = copy.deepcopy(base_sp)
                 variant_sp["runScheduleOverride"] = spec["override"]
+                if gene_time is not None:
+                    # A gene row's MANAGE pass runs at the gene-chosen time too: carry the
+                    # parent's manage schedule so the variant does not fall back to its entry
+                    # schedule or the expert default (rerun_handler reads manageScheduleOverride).
+                    parent_manage = parent_cfg.get("manage_schedule_override")
+                    if not parent_manage:
+                        raise ValueError(
+                            f"robustness schedule run {run.id}: parent {bt.id} is a decision-time GENE row "
+                            f"({gene_time}) but its rebuilt config carries no manage_schedule_override; "
+                            f"refusing to run variants whose manage pass would fall back to another time")
+                    variant_sp["manageScheduleOverride"] = copy.deepcopy(parent_manage)
                 row = Backtest(
                     name=f"RBST-{spec['variant']}-{parent_name}",
                     engine_type="daily_expert",

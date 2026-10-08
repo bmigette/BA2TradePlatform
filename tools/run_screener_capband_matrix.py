@@ -49,7 +49,10 @@ import sys
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from matrix_flags import cap_passthrough, job_name_with_digest  # noqa: E402
+from matrix_flags import (  # noqa: E402
+    finish_matrix, note_job_exit,
+    cap_passthrough, decision_times_plan, decision_times_tokens, job_name_with_digest,
+    screener_dry_run_universe_note, with_decision_times_name, with_universe_rule_name)
 
 _STORE = r"C:\Users\basti\Documents\ba2\common\cache\screener\metric_store"
 # A real --universe is required by the CLI but is OVERRIDDEN by the screened union when --screener
@@ -190,6 +193,17 @@ def fr_top_n_below_pool_passthrough(args) -> list:
     if getattr(args, "fr_top_n_below_pool", True) is False:
         out += ["--no-fr-top-n-below-pool"]
     return out
+
+
+def decision_times_passthrough(args) -> list:
+    """Extra `optimize` CLI tokens for the decision-time gene (``args.decision_times_resolved``,
+    set once in ``main`` from the DEFAULT-ON ``--decision-times`` flag).
+
+    Like the other passthroughs it triggers the job-name digest ON ITS OWN (see the call site),
+    and the job's base name gets the ``-timegene`` token: the time list changes what the job
+    scores, so two jobs differing only by it must not share a name, a skip-completed check or a
+    checkpoint."""
+    return decision_times_tokens(getattr(args, "decision_times_resolved", None))
 
 
 def _job_name(name: str, cmd: list) -> str:
@@ -357,6 +371,9 @@ def load_strategy_plan(path, skip_experts=frozenset()) -> dict:
     return out
 
 
+_FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exited non-zero
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bands", default="large,mid,small")
@@ -439,6 +456,17 @@ def main() -> int:
                          "affected, whatever this flag says. Folds into the job's name digest "
                          "(on its own) so an opted-out run can never resume/be confused with a "
                          "repaired run's completed row under the same name.")
+    ap.add_argument("--decision-times", default=None, metavar="default|fixed|HH:MM,HH:MM,...",
+                    help="The DECISION TIME gene (schedule:time) searched by every classic job. "
+                         "DEFAULT (flag absent) = ON with the shared DEFAULT_DECISION_TIME_CHOICES "
+                         "(09:35,09:40,09:45,10:00,12:00,15:30,15:45); 'fixed' = no gene, the "
+                         "legacy single DEFAULT_DECISION_TIME; or a comma list on the --interval "
+                         "grid. Adds '-timegene' to the job name and folds into the name digest "
+                         "(new names, so nothing is skipped as already completed). Not applied "
+                         "to the FactorRanker job (bypass: no schedule genes). Daily-clock "
+                         "(--interval 1d) runs cannot carry it. NOTE: 'fixed' keeps the LEGACY job name, so "
+                         "a job whose legacy row is already completed is SKIPPED (the skip line "
+                         "says so).")
     ap.add_argument("--interval", default="5min")
     ap.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points, modeled at the fill-engine "
@@ -524,6 +552,12 @@ def main() -> int:
                     help="Extra GA population for FMPRating jobs ONLY (its search space grew with the "
                          "price-target + analyst-recency genes). Added to --population for FMPRating. "
                          "Default 10.")
+    ap.add_argument("--exclude-uncached", action="store_true",
+                    help="Forward --screener-exclude-uncached to every job: a static-universe symbol with "
+                         "no cached OHLCV (execution interval or daily) is EXCLUDED from the screen and "
+                         "recorded on the run, instead of REFUSING the launch (the default). Needed for "
+                         "the small band (BID, GRSD, HCAC, OGG, SHOT, TRIB, VII) and the large band "
+                         "(FITB-PA) of the 2026-10-07 store until their bars are fetched.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -538,6 +572,11 @@ def main() -> int:
                 f"--sizing-mode {args.sizing_mode} requires --name-suffix to contain "
                 f"'{token}' (got {args.name_suffix!r}). Otherwise the second matrix is skipped "
                 f"as already-completed. Example: --name-suffix goal2020-{token}")
+
+    # The decision-time gene is DEFAULT ON for this driver (shared DEFAULT_DECISION_TIME_CHOICES);
+    # `--decision-times fixed` restores the legacy single-time job. Resolved ONCE and announced.
+    args.decision_times_resolved, _dt_header = decision_times_plan(args.decision_times, args.interval)
+    print(_dt_header, flush=True)
 
     bands = [b.strip() for b in args.bands.split(",") if b.strip()]
     stress_by_band = _parse_stress_spread(args.stress_spread_bps)
@@ -566,13 +605,24 @@ def main() -> int:
     done = _completed_names()
     print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies="
           f"{'per --strategy-plan' if strategy_plan else strategies}); "
-          f"{sum(1 for j in jobs if j[0] in done)} already completed"
-          f"{' (by base name; digest-suffixed names are checked per job)' if (market_condition_passthrough(args) or exclude_symbols_passthrough(args)) else ''}.")
+          f"{sum(1 for j in jobs if with_universe_rule_name(j[0]) in done)} already completed"
+          f" (by base name + universe-rule token; digest/time-gene-suffixed names are checked per job).")
     # --dry-run walks the SAME loop below and stops short of launching: a job's final name can
     # carry a digest of its resolved argv (market-condition flags), which only exists once the
     # command is built, so listing the pre-digest names here would show (and check "DONE"
     # against) names no job will ever have.
     for i, (name, expert, strat, band) in enumerate(jobs, 1):
+        # The decision-time gene reaches every classic job. The FactorRanker (bypass) job has no
+        # schedule genes: it keeps its plain name and the fixed default time, announced here.
+        job_dt_times = None if strat is None else args.decision_times_resolved
+        if strat is None and args.decision_times_resolved:
+            print(f"[{i}/{len(jobs)}] NOTE {name}: bypass expert, decision time stays fixed "
+                  f"(no schedule genes)", flush=True)
+        name = with_decision_times_name(name, job_dt_times)
+        # The static-universe RULE is part of the job's identity (every job here is a --screener job):
+        # a name without the token was launched under the old cap-ranked top-50 list and must never be
+        # skipped as "completed" or resumed as this job.
+        name = with_universe_rule_name(name)
         # Data-floored start (see _EXPERT_MIN_START). Announced per job so a shorter window is
         # visible in the log instead of being inferred later from a suspiciously late first trade.
         job_start = _start_for(expert, args.start)
@@ -668,22 +718,31 @@ def main() -> int:
         # triggers the digest on its own.
         fr_tokens = fr_top_n_below_pool_passthrough(args)
         cmd += fr_tokens
+        # --decision-times: appended last (same reasoning); digest on its own. (A bypass job was
+        # skipped above: it cannot carry the gene.)
+        dt_tokens = decision_times_tokens(job_dt_times)
+        cmd += dt_tokens
+        unc_tokens = ["--screener-exclude-uncached"] if args.exclude_uncached else []
+        cmd += unc_tokens
         job_name = name
-        if mc_tokens or excl_tokens or fr_tokens:
+        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens:
             job_name = _job_name(name, cmd)
             cmd[cmd.index("--name") + 1] = job_name
         if args.dry_run:
             print(f"  {'DONE' if job_name in done else 'TODO'}  {job_name}  "
-                  f"({expert} {strat or '(bypass)'} / {band})")
+                  f"({expert} {strat or '(bypass)'} / {band})  "
+                  f"[{screener_dry_run_universe_note(args.store, band, job_start, args.end, args.interval)}]")
             continue
         if job_name in _completed_names():   # re-read each loop (resumable)
-            print(f"[{i}/{len(jobs)}] SKIP {job_name} (already completed)", flush=True)
+            _fixed_note = ("; NOTE --decision-times fixed keeps the legacy job name, so this is the "
+                           "completed LEGACY run, not a time-gene run" if not job_dt_times else "")
+            print(f"[{i}/{len(jobs)}] SKIP {job_name} (already completed{_fixed_note})", flush=True)
             continue
         print(f"[{i}/{len(jobs)}] RUN  {job_name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {job_name} exit={rc}", flush=True)
-    print("matrix driver: done.")
-    return 0
+        note_job_exit(_FAILED_JOBS, job_name, rc)
+    return finish_matrix(_FAILED_JOBS, "matrix driver")
 
 
 if __name__ == "__main__":

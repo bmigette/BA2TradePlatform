@@ -108,7 +108,14 @@ def test_a_run_with_no_cap_is_identical_to_before_the_feature(name, make_payload
     assert got["columns"] == golden[name]["columns"]
     assert got["equity_curve"] == golden[name]["equity_curve"]
     assert got["drawdown_curve"] == golden[name]["drawdown_curve"]
-    assert got["trades"] == golden[name]["trades"]
+    # 2026-10-07: equity trade rows gained the level record of the fill-time re-base
+    # (stop_loss_at_fill / take_profit_at_fill / *_pre_fill / fill_reference_price). Like the
+    # option-term keys above it is a schema addition: it is dropped HERE, not hand-merged into the
+    # golden, so every pre-existing value (entry/exit price, pnl, ...) is still compared byte for byte.
+    level_keys = {"stop_loss_at_fill", "take_profit_at_fill", "stop_loss_pre_fill",
+                  "take_profit_pre_fill", "fill_reference_price"}
+    got_trades = [{k: v for k, v in t.items() if k not in level_keys} for t in got["trades"]]
+    assert got_trades == golden[name]["trades"]
 
 
 def test_the_golden_fixture_is_not_vacuous():

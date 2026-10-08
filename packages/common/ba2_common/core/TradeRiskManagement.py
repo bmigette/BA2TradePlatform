@@ -10,12 +10,14 @@ import time
 from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 from datetime import datetime, timezone
 
+from ba2_common.core.knowability import require_decision_price
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
 from ba2_common.core.interfaces.ExtendableSettingsInterface import trading_permission, coerce_bool
 from ba2_common.logger import logger
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, ExpertInstance, Transaction
-from ba2_common.core.types import OrderStatus, OrderDirection, TransactionStatus
+from ba2_common.core.types import (CAPITAL_HOLDING_TRANSACTION_STATUSES, OrderStatus, OrderDirection,
+                                   TransactionStatus)
 from ba2_common.core.db import get_instance, get_all_instances, update_instance, get_db
 from sqlmodel import select, Session
 from ba2_common.core.failure_modes import absorb_if_benign
@@ -1239,11 +1241,12 @@ class TradeRiskManagement:
         try:
             from ba2_common.core.trade_store import transactions_where, orders_where, inmem_trades_active
 
-            # Get existing transactions for this expert that are still open (dual-path: the
+            # Get existing transactions for this expert that still HOLD capital -- WAITING, OPENED and
+            # CLOSING (a resting close has not released the position; dual-path: the
             # in-memory store in a backtest, SQLite in live — same rows either way).
             transactions = transactions_where(
                 expert_id=expert_instance_id,
-                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED])
+                statuses=list(CAPITAL_HOLDING_TRANSACTION_STATUSES))
 
             for transaction in transactions:
                 symbol = transaction.symbol
@@ -1426,6 +1429,9 @@ class TradeRiskManagement:
                                      balance_after=remaining_balance)
                     updated_orders.append(order)
                     continue
+                # the anchor of the size (budget / price) and of the safeguard stop below: on an
+                # intraday clock it must be the decision price, never a daily bar
+                require_decision_price(current_price, what="position size", symbol=symbol)
                 self._trace_note(trace, price=current_price)
 
                 # THE GRID for this symbol: 1.0 (whole shares) unless the expert opted in AND

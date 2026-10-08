@@ -75,6 +75,11 @@ def parser():
     ap.add_argument("--allow-sl-loosen", action="store_true",
                     help="Set allow_ruleset_sl_loosen on every job's experts: ruleset stops may loosen "
                          "down to the trade's max-loss stop (default: tighten only).")
+    ap.add_argument("--decision-times", default=None, metavar="default|fixed|HH:MM,HH:MM,...",
+                    help="The DECISION TIME gene (schedule:time) for --search genetic jobs that "
+                         "search at all. DEFAULT (absent) = ON with the shared "
+                         "DEFAULT_DECISION_TIME_CHOICES; 'fixed' = off; or a comma list. "
+                         "Grid-mode manifests and fixed controls never carry it.")
     ap.add_argument("--spread-bps", type=float, help="Override every family's spread; 0 is preserved.")
     ap.add_argument("--store", help="Override the snapshot's metric-store directory.")
     ap.add_argument("--etf-symbols", nargs="+", help="Fixed ETF research universe; default SPY IEF TLT GLD.")
@@ -140,6 +145,8 @@ def main(argv=None):
     try:
         if args.job_file is not None:
             return run_child(args)
+        from ba2_common.core.schedule_genes import parse_decision_times_arg
+        decision_times = parse_decision_times_arg(args.decision_times, "5min", when_unset="default")
         manifest = build_manifest(
             families=args.families, equity=args.equity,
             equity_cap=None if args.equity_cap == 0 else args.equity_cap,
@@ -152,7 +159,11 @@ def main(argv=None):
             market_condition_manifest=args.market_condition_manifest,
             market_condition_mode=args.market_condition_mode,
             market_exit=tuple(s.strip() for s in args.market_exit.split(",") if s.strip()),
-            allow_sl_loosen=args.allow_sl_loosen)
+            allow_sl_loosen=args.allow_sl_loosen,
+            decision_times=decision_times)
+        print("decision times (GA gene schedule:time, genetic jobs that search): "
+              + (",".join(decision_times) if decision_times
+                 else "fixed (per-family schedule time; --decision-times fixed)"))
         if args.variants is not None:
             available = {j["variant"] for j in manifest["jobs"]}
             unknown = set(args.variants) - available

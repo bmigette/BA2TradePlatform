@@ -40,7 +40,10 @@ import sys
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from matrix_flags import cap_passthrough, job_name_with_digest  # noqa: E402
+from matrix_flags import (  # noqa: E402
+    finish_matrix, note_job_exit,
+    cap_passthrough, decision_times_plan, decision_times_tokens, job_name_with_digest,
+    with_decision_times_name)
 
 _UNIVERSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "senate_universe.txt")
 _EXPERT = "FMPSenateTraderWeight"
@@ -114,6 +117,9 @@ def _jobs(strategies, name_suffix=""):
     """Yield (name, strategy) in priority order."""
     for s in strategies:
         yield (f"sen-{s}{name_suffix}", s)
+
+
+_FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exited non-zero
 
 
 def main() -> int:
@@ -225,6 +231,12 @@ def main() -> int:
     ap.add_argument("--search-sl-loosen", action="store_true", default=False,
                     help="Forward --search-sl-loosen to every job. Folds into the job's name "
                          "digest.")
+    ap.add_argument("--decision-times", default=None, metavar="default|fixed|HH:MM,HH:MM,...",
+                    help="The DECISION TIME gene (schedule:time). DEFAULT (flag absent) = ON with "
+                         "the shared DEFAULT_DECISION_TIME_CHOICES on an intraday --interval, "
+                         "off on --interval 1d; 'fixed' = no gene; or a comma list. Adds "
+                         "'-timegene' to the job name and folds into the name digest. NOTE: 'fixed' keeps "
+                         "the LEGACY job name, so a job whose legacy row is completed is SKIPPED.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -243,6 +255,8 @@ def main() -> int:
     if not os.path.exists(exe):
         exe = os.path.join(os.path.dirname(sys.executable), "ba2-test")
 
+    dt_times, dt_header = decision_times_plan(args.decision_times, args.interval)
+    print(dt_header, flush=True)
     jobs = list(_jobs(strategies, args.name_suffix))
     done = _completed_names()
     mc_tokens_preview = market_condition_passthrough(args)
@@ -289,21 +303,30 @@ def main() -> int:
         # position for a job with no new flags.
         mc_tokens = market_condition_passthrough(args)
         cmd += mc_tokens
+        # The decision-time gene (DEFAULT ON on an intraday --interval; see matrix_flags
+        # .decision_times_plan): '-timegene' in the base name, tokens last, digest on its own.
+        dt_tokens = decision_times_tokens(dt_times)
+        if dt_tokens:
+            name = with_decision_times_name(name, dt_times)
+            cmd[cmd.index("--name") + 1] = name
+        cmd += dt_tokens
         job_name = name
-        if mc_tokens:
+        if mc_tokens or dt_tokens:
             job_name = _job_name(name, cmd)
             cmd[cmd.index("--name") + 1] = job_name
         if args.dry_run:
             print(f"  {'DONE' if job_name in done else 'TODO'}  {job_name}  ({_EXPERT} {strat})")
             continue
         if job_name in _completed_names():   # re-read each loop (resumable)
-            print(f"[{i}/{len(jobs)}] SKIP {job_name} (already completed)", flush=True)
+            _fixed_note = ("; NOTE --decision-times fixed keeps the legacy job name, so this is the "
+                           "completed LEGACY run, not a time-gene run" if not dt_tokens else "")
+            print(f"[{i}/{len(jobs)}] SKIP {job_name} (already completed{_fixed_note})", flush=True)
             continue
         print(f"[{i}/{len(jobs)}] RUN  {job_name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {job_name} exit={rc}", flush=True)
-    print("senate matrix driver: done.")
-    return 0
+        note_job_exit(_FAILED_JOBS, job_name, rc)
+    return finish_matrix(_FAILED_JOBS, "senate matrix driver")
 
 
 if __name__ == "__main__":

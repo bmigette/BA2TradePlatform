@@ -40,6 +40,7 @@ _BACKEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 from app.services.prewarm_fetchers import EXPERT_NAMES, SENATE_SCALPER_BOUNDS  # noqa: E402
+from ba2_providers.screener import universe_superset as _us  # noqa: E402
 
 
 def _parse_symbols_arg(raw: str) -> list:
@@ -1026,7 +1027,8 @@ def _daily_manage_schedule() -> dict:
     days_opened rules each trading day even when ENTRY is weekly. (Weekends are off — no session.)"""
     wk = ("monday", "tuesday", "wednesday", "thursday", "friday")
     days = {d: (d in wk) for d in (*wk, "saturday", "sunday")}
-    return {"days": days, "times": ["09:30"]}
+    from ba2_common.core.knowability import DEFAULT_DECISION_TIME
+    return {"days": days, "times": [DEFAULT_DECISION_TIME]}
 
 
 #: Two toggles that NEVER took effect in any run to date, pinned OFF so they still don't.
@@ -1095,6 +1097,86 @@ def _refuse_atr_policy_without_job_name(policy: str, name: "str | None") -> None
             f"contain '-atr27' (got {name!r}) -- this policy changes what the run scores, and a "
             f"job name that could collide with a pinned run's name risks resuming its checkpoint "
             f"into the wrong search or skipping a policy run as 'already completed'.")
+
+
+#: The name token a ``--decision-times`` job must carry (see ``_resolve_decision_times``).
+DECISION_TIMES_NAME_TOKEN = "timegene"
+
+
+def _resolve_decision_times(raw, command: str, *, interval: str, name: "str | None",
+                            bypass_jobs, option_jobs) -> "list | None":
+    """``--decision-times 09:35,09:40,...|default|fixed`` -> the validated, sorted list, or None
+    (flag absent or ``fixed``: no gene, the single shared default time). ``default`` is the shared
+    ``DEFAULT_DECISION_TIME_CHOICES``.
+
+    Everything refused HERE, before a row is written, so a bad flag costs nothing:
+      * a daily-clock job (``--interval 1d``): a decision time means nothing with one bar a day;
+      * an option job (daily clock, the option code paths must stay untouched);
+      * a bypass expert (FactorRanker): it gets no schedule genes, the gene would be dead;
+      * a value that is not HH:MM on the bar grid, strictly inside the session's first and last
+        bar (``ba2_common.core.schedule_genes.validate_decision_times``);
+      * a job name without ``timegene`` in it: the flag changes what the run scores, and a name
+        that could equal a plain run's name risks skipping as 'already completed' or resuming
+        that run's checkpoint (the gene space also differs, so the checkpoint FINGERPRINT would
+        refuse the resume, but the name guard stops the skip-by-name first).
+    """
+    if raw is None or str(raw).strip() == "fixed":
+        return None   # plain optimize / explicit `fixed`: the single shared DEFAULT_DECISION_TIME
+    from ba2_common.core.schedule_genes import parse_decision_times_arg
+
+    if bypass_jobs:
+        sys.exit(f"ba2-test {command}: --decision-times is not supported for a bypass expert "
+                 f"({sorted(bypass_jobs)}): its schedule genes are not searched, the gene would "
+                 f"be dead")
+    if option_jobs:
+        sys.exit(f"ba2-test {command}: --decision-times is refused for option jobs "
+                 f"({sorted(option_jobs)}): option backtests run on a DAILY clock, one bar per "
+                 f"session, so there is no decision time to search")
+    try:
+        times = parse_decision_times_arg(raw, interval)
+    except ValueError as e:
+        sys.exit(f"ba2-test {command}: --decision-times: {e}")
+    if not name or DECISION_TIMES_NAME_TOKEN not in name:
+        sys.exit(f"ba2-test {command}: --decision-times requires --name (or --name-prefix) to "
+                 f"contain {DECISION_TIMES_NAME_TOKEN!r} (got {name!r}) -- the run's identity "
+                 f"must differ from a plain run of the same expert/strategy")
+    return times
+
+
+def _refuse_reused_timegene_name(name: str, times: "list | None", command: str) -> None:
+    """Refuse (exit) a run whose NAME is already a COMPLETED optimization carrying a DIFFERENT
+    decision-time list: the name is the job's identity (skip-by-name, checkpoint key), so reusing
+    it for another list would either skip the new run as 'done' or compare unlike results under
+    one name. The matrix drivers cannot hit this (the list is in their name digest); a hand-run
+    ``optimize --name ...-timegene...`` can."""
+    if not times:
+        return
+    from app.models.database import SessionLocal
+    from app.models.strategy_optimization import StrategyOptimization
+    db = SessionLocal()
+    try:
+        rows = (db.query(StrategyOptimization)
+                .filter(StrategyOptimization.name == name, StrategyOptimization.status == "completed")
+                .all())
+        stored = []
+        for r in rows:
+            spec = ((r.optimization_config or {}).get("expert_params") or {}).get("schedule:time") or {}
+            stored.append((r.id, spec.get("choices")))
+    finally:
+        db.close()
+    other = [(i, c) for i, c in stored if c != list(times)]
+    if other:
+        sys.exit(f"ba2-test {command}: name {name!r} is already a COMPLETED optimization "
+                 f"#{other[0][0]} with decision times {other[0][1]!r}, not {list(times)!r}. Use a "
+                 f"different --name: the name is the job's identity (skip-by-name, checkpoint).")
+
+
+def _decision_time_gene(times: "list | None") -> dict:
+    """The ``expert_params`` entry (pre-namespaced) that declares the decision-time gene; {} when
+    no ``--decision-times`` was given, so every other job's gene space is untouched."""
+    if not times:
+        return {}
+    return {"schedule:time": {"optimize": True, "choices": list(times)}}
 
 
 def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
@@ -1733,26 +1815,9 @@ _WEEKDAY_SCHEDULE_DAY_OPT = {
 # dynamic ranges (RVOL / price-drop / max_stocks) may be wide. These are merged into expert_params
 # pre-namespaced with `screener:` so collect_param_space / decode_params route them to the screener
 # namespace (see _collect_screener / decode_params in strategy_param_space.py).
-_SCREENER_OPT = {
-    "screener_market_cap_min": {"min": 2e9, "max": 1e10, "step": 1e9, "type": "float", "optimize": True},
-    # Floor lowered 1.0->0.0 (2026-07-19): FactorRanker's own docs say this gate is
-    # penny-momentum-oriented and should be 0 for factor strategies, but the floor never let the
-    # GA reach 0. Measured against the live metric_store at the GA's winning mid/small-band gene
-    # combos: 0-5 candidates/week (mid), 0 candidates on 4/5 sampled dates (small) — this gate was
-    # the primary cause of small-band FactorRanker trade starvation, not a lack of factor edge.
-    # screener_price_drop_pct already floors at 0 for every expert; this brings rvol_min in line.
-    "screener_relative_volume_min": {"min": 0.0, "max": 3.0, "step": 0.1, "type": "float", "optimize": True},
-    "screener_price_drop_pct": {"min": 0.0, "max": 25.0, "step": 1.0, "type": "float", "optimize": True},
-    # Lookback window Y (trading days) for the price-drop gate: selects the precomputed
-    # price_drop_pct_<Y> column in a multi-window store (build with --max-lookback >= this max).
-    # Decodes to a bare `price_drop_days` screener override. Cap 30 matches the default max_lookback.
-    "screener_price_drop_days": {"min": 2, "max": 30, "step": 1, "type": "int", "optimize": True},
-    "screener_max_stocks": {"min": 10, "max": 50, "step": 10, "type": "int", "optimize": True},
-    # Weinstein stage-2 gate (price above a rising 30-week SMA = confirmed uptrend). Optimized
-    # as a 0/1 toggle: the GA decides whether requiring Stage-2 helps. (A richer "which stage(s)"
-    # categorical would need a multi-stage screener setting; stage2-only is the current knob.)
-    "screener_weinstein_stage2_only": {"min": 0, "max": 1, "step": 1, "type": "int", "optimize": True},
-}
+# CANONICAL definition: ba2_providers.screener.universe_superset (the drivers cannot import this
+# module, and the static-universe derivation reads the SAME ranges). Aliased, not copied.
+_SCREENER_OPT = _us.SCREENER_OPT
 
 # Per-cap-band jobs (small/mid/large): run the SAME screener gene set on a DISJOINT cap universe per
 # band, so 5min stays feasible (each band's screened union is far smaller than the whole store) and
@@ -1760,11 +1825,7 @@ _SCREENER_OPT = {
 # market_cap_max change per band; every other gene (RVOL / price-drop / max_stocks / weinstein) is
 # unchanged. Selected via --screener-cap-band. Bands (current-cap $): small $50M-$2B, mid $2B-$10B,
 # large >=$10B. The cap-min gene optimizes the floor WITHIN the band; market_cap_max pins the ceiling.
-_SCREENER_CAP_BANDS = {
-    "small": {"min": 5e7,  "max": 2e9,  "step": 1e8,  "cap_max": 2e9},
-    "mid":   {"min": 2e9,  "max": 1e10, "step": 1e9,  "cap_max": 1e10},
-    "large": {"min": 1e10, "max": 2e11, "step": 1e10, "cap_max": None},
-}
+_SCREENER_CAP_BANDS = _us.SCREENER_CAP_BANDS
 
 
 def _strategy_from_parts(name: str, buy_tree=None, exit_conditions=None, entry_actions=None):
@@ -6652,6 +6713,15 @@ def _cmd_optimize(args) -> int:
     rm_toggle_policy = getattr(args, "rm_toggle_policy", "pinned") or "pinned"
     _refuse_atr_policy_without_job_name(rm_toggle_policy, args.name)
     rm_toggles_unpinned = _rm_toggles_unpinned_for_policy(rm_toggle_policy)
+    # --decision-times: the decision-time gene. Validated (and every refusal taken) before
+    # anything is built; None leaves the run byte-identical to one without the flag.
+    decision_times = _resolve_decision_times(
+        getattr(args, "decision_times", None), "optimize", interval=getattr(args, "interval", None),
+        name=args.name,
+        bypass_jobs=([expert] if spec.get("bypass") else []),
+        option_jobs=([f"{expert}/{args.strategy}"]
+                     if (spec.get("options") or args.strategy in _OPTION_STRATEGY_KEYS
+                         or args.strategy in _OPTION_GROUPS_ALL) else []))
     # Pure-option kinds AND options experts (spec key `options` — --strategy is ignored)
     # default to the ~30%/yr goal metric; stock kinds keep sharpe_ratio.
     fitness = _resolve_fitness(args.fitness, args.strategy,
@@ -6670,9 +6740,12 @@ def _cmd_optimize(args) -> int:
         days = {d: (d in sched_days) for d in
                 ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")}
         # `times` pins the ANALYSIS to the scheduled time-of-day so on a 5min fill clock the
-        # expert analyses ONCE/day (at market open) instead of every intraday bar. FMP bars are
-        # stamped in market-local 09:30-15:55, so "09:30" is the first regular-session bar.
-        run_sched = {"days": days, "times": ["09:30"]}
+        # expert analyses ONCE/day instead of every intraday bar. FMP bars are stamped in
+        # market-local 09:30-15:55 at the START of the bar and the decision price is the close of
+        # the latest bar that has ENDED, so the time is DEFAULT_DECISION_TIME (>= first bar + one
+        # bar), not the session's first bar: a decision there sees only the PRIOR close.
+        from ba2_common.core.knowability import DEFAULT_DECISION_TIME
+        run_sched = {"days": days, "times": [DEFAULT_DECISION_TIME]}
     # Open-positions MANAGEMENT runs DAILY (mirrors live, which schedules open_positions far more
     # often than enter_market): every weekday at the open bar, regardless of the (weekly) entry day.
     # So trailing-SL / close / days_opened exit rules are evaluated each trading day, not weekly.
@@ -6710,6 +6783,7 @@ def _cmd_optimize(args) -> int:
     # because the accident this prevents is silent and costs hours of cluster time
     # while the inconvenience it causes is one flag.
     _opt_name = args.name or f"opt-{expert}"
+    _refuse_reused_timegene_name(_opt_name, decision_times, "optimize")
     if not getattr(args, "rerun", False):
         _db = SessionLocal()
         try:
@@ -6836,6 +6910,7 @@ def _cmd_optimize(args) -> int:
         # param-space router sends them to the screener namespace). The run-level universe becomes
         # the metric store's FULL symbol union so the engine has OHLCV for any per-day pick.
         screener_genes: dict = {}
+        _uncached_exclusions: list = []   # --screener-exclude-uncached: merged into --exclude-symbols below
         if getattr(args, "screener", False):
             if not args.screener_store:
                 sys.exit("optimize: --screener requires --screener-store")
@@ -6843,16 +6918,8 @@ def _cmd_optimize(args) -> int:
             # Cap-band job: override the market-cap gene RANGE for the band and pin market_cap_max in
             # the base settings, so each band optimizes a DISJOINT, smaller cap universe (5min-feasible).
             # Other genes unchanged. Default (no band) keeps the original large-cap-floor behaviour.
-            _scr_opt = _SCREENER_OPT
             _cap_band = getattr(args, "screener_cap_band", None)
-            if _cap_band:
-                _b = _SCREENER_CAP_BANDS[_cap_band]
-                _scr_opt = dict(_SCREENER_OPT)
-                _scr_opt["screener_market_cap_min"] = {"min": _b["min"], "max": _b["max"],
-                                                       "step": _b["step"], "type": "float", "optimize": True}
-                base = dict(base)
-                if _b.get("cap_max") is not None:
-                    base["market_cap_max"] = _b["cap_max"]
+            _scr_opt, base = _us.apply_cap_band(_SCREENER_OPT, base, _cap_band)
             backtest_block["screener_opt"] = {
                 "store": args.screener_store,
                 "base_settings": base,
@@ -6871,50 +6938,69 @@ def _cmd_optimize(args) -> int:
             _store_df = _ms.load_store(args.screener_store)
             if _store_df.empty:
                 sys.exit(f"optimize: --screener-store {args.screener_store!r} has no symbols")
-            # Preload only the symbols ANY individual could screen in — the union under the LOOSEST
-            # end of every screener gene (most-admitting thresholds + max_stocks at its ceiling).
-            # This is the correct superset for the whole population (tighter individuals select a
-            # subset) and is far smaller than the raw store union (e.g. ~26-150 vs 868), so the
-            # OHLCV preload doesn't load/hold ~800 never-selected symbols. The per-bar
-            # screener_runtime gate still applies each individual's actual thresholds.
-            _loosest = dict(base)   # base carries market_cap_max for a cap-band job
-            _loosest.update({
-                "market_cap_min": _scr_opt["screener_market_cap_min"]["min"],
-                "relative_volume_min": _scr_opt["screener_relative_volume_min"]["min"],
-                "price_drop_pct": _scr_opt["screener_price_drop_pct"]["min"],
-                "weinstein_stage2_only": 0,
-                "max_stocks": _scr_opt["screener_max_stocks"]["max"],
-            })
-            enabled = _ms.screened_symbol_union(_store_df, args.start, args.end, _loosest)
+            # THE STATIC UNIVERSE = the true SUPERSET (ba2_providers.screener.universe_superset): every
+            # symbol that passes the LOOSEST values of the FILTER genes on at least one scan visible
+            # during [start, end], with NO max_stocks cut and no sort. The previous rule applied the
+            # loosest max_stocks (50, by market cap) AFTER the filters, so only the 50 largest names of
+            # each weekly band entered the list; a genome with tighter filters selects names the
+            # loosest top-50 never contained, and those picks were silently untradable (measured:
+            # 13% of row 1088's own selections, 71% of row 1107's). The per-decision gate applies the
+            # genome's own filters, sort and cut. A screener gene whose range or role is unknown
+            # REFUSES the launch (ScreenerUniverseError): the loosest value is never guessed.
+            _ranges = _us.gene_ranges_from_opt(_scr_opt)
+            try:
+                enabled = _us.static_universe(
+                    _store_df, args.start, args.end, base, _ranges,
+                    intraday=_us.interval_is_intraday(args.interval))
+            except _us.ScreenerUniverseError as _e:
+                sys.exit(f"optimize: --screener REFUSED: {_e}")
             if not enabled:
                 sys.exit(f"optimize: --screener-store {args.screener_store!r} selected zero symbols "
-                         f"for {args.start}..{args.end} under the loosest gene settings")
-            # Drop screened symbols with NO cached OHLCV for the run interval. The backtest is
-            # hermetic (never fetches mid-run), so preloading a symbol without bars hard-fails the
-            # whole run. The metric store (built from DAILY) legitimately contains names with no
-            # INTRADAY series — preferred shares / baby bonds (e.g. AQNB, DUKB, ELC) and a few thin
-            # tickers. The screener can still rank them; we just can't fill what has no bars. Match
-            # the native cache file CACHE_FOLDER/FMPOHLCVProvider/<SYM>_<interval>.parquet (with the
-            # provider's symbol sanitisation: '-' -> '_'/'.').
+                         f"for {args.start}..{args.end} under the loosest filter settings")
+            print(f"optimize: screener static universe = {len(enabled)} symbols "
+                  f"(rule {_us.RULE_ID}: loosest-filter superset over the visible scans of "
+                  f"{args.start}..{args.end}, no max_stocks cut)", flush=True)
+            # HERMETIC cache check. The backtest never fetches mid-run, so every symbol of the static
+            # universe needs cached bars for the execution interval AND daily (the experts' history).
+            # The metric store (built from DAILY) legitimately contains names with no INTRADAY series
+            # (preferred shares / baby bonds, a few thin or delisted tickers). They are NOT silently
+            # dropped any more: a dropped name the gate can still select would be an untradable pick
+            # (the exact failure this rule fixes). The launch REFUSES with the list, unless
+            # --screener-exclude-uncached turns them into a RECORDED screen exclusion
+            # (backtest.excluded_instruments), which removes them from the per-decision gate too,
+            # so the run-time universe guard stays at zero and a re-run reproduces the exclusion.
+            # Match the native cache file CACHE_FOLDER/FMPOHLCVProvider/<SYM>_<interval>.parquet
+            # (with the provider's symbol sanitisation: '-' -> '_'/'.').
             import os as _os
             from ba2_common.config import CACHE_FOLDER as _CF
             _cdir = _os.path.join(_CF, "FMPOHLCVProvider")
-            _iv = args.interval
+            _ivs = sorted({args.interval, "1d"})
             def _has_bars(sym: str) -> bool:
-                for cand in (sym, sym.replace("-", "_"), sym.replace("-", ".")):
-                    if _os.path.exists(_os.path.join(_cdir, f"{cand}_{_iv}.parquet")):
-                        return True
-                return False
-            _before = len(enabled)
-            enabled = [s for s in enabled if _has_bars(s)]
-            _dropped = _before - len(enabled)
-            if _dropped:
-                print(f"optimize: dropped {_dropped}/{_before} screened symbols with no cached "
-                      f"{_iv} OHLCV (e.g. preferred/baby-bond tickers) -> {len(enabled)} tradeable.")
+                for _iv in _ivs:
+                    if not any(_os.path.exists(_os.path.join(_cdir, f"{cand}_{_iv}.parquet"))
+                               for cand in (sym, sym.replace("-", "_"), sym.replace("-", "."))):
+                        return False
+                return True
+            _uncached = [s for s in enabled if not _has_bars(s)]
+            if _uncached:
+                if not getattr(args, "screener_exclude_uncached", False):
+                    sys.exit(
+                        f"optimize: --screener REFUSED: {len(_uncached)} of the {len(enabled)} static-"
+                        f"universe symbols have no cached {'/'.join(_ivs)} OHLCV under {_cdir}: "
+                        f"{', '.join(_uncached)}. Fetch them (ba2-test fetch-cache --timeframes "
+                        f"{','.join(_ivs)} --symbols ...), or pass --screener-exclude-uncached to "
+                        f"EXCLUDE them from the screen (recorded on the run as excluded_instruments).")
+                _uncached_exclusions = list(_uncached)
+                _gone = set(_uncached)
+                enabled = [s for s in enabled if s not in _gone]
+                print(f"optimize: --screener-exclude-uncached: EXCLUDING {len(_uncached)} screened symbols "
+                      f"with no cached {'/'.join(_ivs)} OHLCV from the screen: {', '.join(_uncached)} "
+                      f"-> {len(enabled)} tradeable.", flush=True)
             if not enabled:
-                sys.exit(f"optimize: 0 of the screened union has cached {_iv} OHLCV — fetch it first "
-                         f"(ba2-test fetch-cache --timeframes {_iv} ...) or pick a different interval.")
+                sys.exit(f"optimize: 0 of the screened universe has cached {'/'.join(_ivs)} OHLCV -- fetch it "
+                         f"first (ba2-test fetch-cache --timeframes {args.interval} ...).")
             backtest_block["enabled_instruments"] = enabled
+            backtest_block["screener_universe_rule"] = _us.RULE_ID
             universe = enabled  # for the progress line / submit description below
             screener_genes = {f"screener:{k}": v for k, v in _scr_opt.items()}
 
@@ -6955,6 +7041,7 @@ def _cmd_optimize(args) -> int:
         # enabled_instruments and must be checked against the REDUCED universe, same ordering
         # reason as that check documents below).
         _exclude_symbols = _resolve_exclude_symbols_arg(getattr(args, "exclude_symbols", None))
+        _exclude_symbols = _exclude_symbols + [s for s in _uncached_exclusions if s.upper() not in _exclude_symbols]
         _apply_exclude_symbols("optimize", backtest_block, _exclude_symbols)
         if _exclude_symbols:
             universe = list(backtest_block["enabled_instruments"])
@@ -6975,6 +7062,7 @@ def _cmd_optimize(args) -> int:
         _sched_opt = (_WEEKDAY_SCHEDULE_DAY_OPT if rm_toggle_policy == "atr-searched"
                      else _SCHEDULE_DAY_OPT)
         schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _sched_opt.items()}
+        schedule_genes.update(_decision_time_gene(decision_times))   # after the days: no index shift
         cfg = {
             "populationSize": int(args.population),
             "generations": int(args.generations),
@@ -7125,16 +7213,29 @@ def _cmd_optimize_batch(args) -> int:
             jobs.append((e, "FACTOR"))
         else:
             jobs.extend((e, k) for k in strategies)
+    # --decision-times (see _cmd_optimize): one list for the whole batch, refused up front if ANY
+    # job of the batch cannot carry the gene (a partial application would score some jobs on a
+    # time search and others not, under one flag).
+    decision_times = _resolve_decision_times(
+        getattr(args, "decision_times", None), "optimize-batch",
+        interval=getattr(args, "interval", None),
+        name=args.name_prefix or "phase1",
+        bypass_jobs=[e for e, _k in jobs if _EXPERT_OPT[e].get("bypass")],
+        option_jobs=[f"{e}/{k}" for e, k in jobs
+                     if (_EXPERT_OPT[e].get("options") or k in _OPTION_STRATEGY_KEYS
+                         or k in _OPTION_GROUPS_ALL)])
     run_sched = None
     if args.run_schedule == "weekly":
         # --run-schedule-day accepts a comma-separated list (e.g. "monday,thursday") so a
         # signal that decays fast can scan more than once/week without going fully daily.
         sched_days = {d.strip().lower() for d in args.run_schedule_day.split(",") if d.strip()}
-        # `times` pins ANALYSIS to market open so a 5min fill clock analyses once/day, not per bar.
+        # `times` pins ANALYSIS to one bar so a 5min fill clock analyses once/day, not per bar;
+        # the shared default decision time (>= first bar + one bar), see _cmd_optimize.
+        from ba2_common.core.knowability import DEFAULT_DECISION_TIME
         run_sched = {"days": {d: (d in sched_days) for d in
                               ("monday", "tuesday", "wednesday", "thursday", "friday",
                                "saturday", "sunday")},
-                     "times": ["09:30"]}
+                     "times": [DEFAULT_DECISION_TIME]}
     _assert_option_window_excludes_holdout([k for _e, k in jobs], args.end)
     init_db()
     tq = get_task_queue()
@@ -7268,7 +7369,9 @@ def _cmd_optimize_batch(args) -> int:
                                         **{f"schedule:{k}": v for k, v in
                                            (_WEEKDAY_SCHEDULE_DAY_OPT
                                             if rm_toggle_policy == "atr-searched"
-                                            else _SCHEDULE_DAY_OPT).items()}, **_sl_loosen_gene_space()}),
+                                            else _SCHEDULE_DAY_OPT).items()},
+                                        **_decision_time_gene(decision_times),
+                                        **_sl_loosen_gene_space()}),
                 "backtest": backtest_block,
             }
             _apply_lattice_anchor(cfg, strat_kind, getattr(args, "lattice_anchor", None))
@@ -8516,6 +8619,18 @@ def main(argv: "list | None" = None) -> int:
                          "via the schedule:<day> GA genes; this flag has no effect on the day "
                          "selection for those runs. Bypass experts (FactorRanker) don't get the "
                          "schedule genes, so this flag still fully controls their day(s).")
+    op.add_argument("--decision-times", default=None, metavar="default|fixed|HH:MM,HH:MM,...",
+                    help="Search the DECISION TIME as a GA gene (schedule:time): a choice among "
+                         "exactly these exchange-local times, applied to BOTH the entry and the "
+                         "open-positions schedule. Each must be on the --interval bar grid, "
+                         "after the session's first bar and before its last (e.g. "
+                         "09:35,09:40,09:45,10:00,15:30); >= 2 values; 'default' = the shared "
+                         "DEFAULT_DECISION_TIME_CHOICES. Without the flag (or with 'fixed') a "
+                         "plain optimize decides at the single shared DEFAULT_DECISION_TIME "
+                         "(only the grid DRIVERS default the gene ON). Refused for daily-clock, "
+                         "option and bypass (FactorRanker) jobs. REQUIRES --name to contain "
+                         "'timegene'. Sessions that lack a scheduled time (15:30 on a 13:00 half "
+                         "day) get no decision; they are counted and logged.")
     op.add_argument("--name", default=None)
     op.add_argument("--rerun", action="store_true",
                     help="Run even if an optimization with this --name has already "
@@ -8564,6 +8679,12 @@ def main(argv: "list | None" = None) -> int:
                          "/ large >=$10B): overrides the market-cap gene range + pins market_cap_max so "
                          "each band optimizes a smaller, disjoint universe (keeps 5min feasible). Other "
                          "genes unchanged. Run one job per band.")
+    op.add_argument("--screener-exclude-uncached", action="store_true",
+                    help="--screener: a static-universe symbol with no cached OHLCV (execution interval or "
+                         "daily) REFUSES the launch by default. With this flag such names are instead "
+                         "EXCLUDED from the screen, listed in the output and recorded on the run as "
+                         "backtest.excluded_instruments (so the per-decision gate never selects them and "
+                         "a re-run reproduces the exclusion).")
     op.add_argument("--screener-gate-store", default=None,
                     help="GATE-ONLY screener mode: path to the parquet metric store used PURELY "
                          "as a per-bar entry gate — the run universe stays the static "
@@ -8733,6 +8854,10 @@ def main(argv: "list | None" = None) -> int:
                     help="Comma-separated day(s) for weekly --run-schedule (e.g. 'monday,thursday'). "
                          "NOTE: for a non-bypass expert this only seeds the static fallback — every "
                          "strategy searches WHICH day(s) itself via the schedule:<day> GA genes.")
+    ob.add_argument("--decision-times", default=None, metavar="HH:MM,HH:MM,...",
+                    help="Search the DECISION TIME as a GA gene for every job of the batch "
+                         "(see `optimize --decision-times`). REQUIRES --name-prefix to contain "
+                         "'timegene'; refused if any job is an option or bypass job.")
     ob.add_argument("--name-prefix", default=None, help="Strategy/opt name prefix (default phase1-).")
     ob.add_argument("--poll", type=int, default=15, help="Poll interval seconds (default 15).")
     ob.add_argument("--worker", action="append", default=None, metavar="NAME",

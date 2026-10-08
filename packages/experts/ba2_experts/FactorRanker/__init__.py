@@ -18,6 +18,7 @@ from ba2_common.core.interfaces.ExpertDataExportInterface import (
 )
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.models import AnalysisOutput, MarketAnalysis
+from ba2_common.core.knowability import scan_cutoff_date
 from ba2_providers.StockScreener import StockScreener
 from ba2_providers.fmp_common import FMPHermeticViolation
 from ba2_common.core.types import MarketAnalysisStatus, OrderRecommendation, Recommendation
@@ -460,7 +461,9 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             try:
                 from ba2_providers.screener import metric_store as ms  # local import (opt-in)
                 df = ms.load_store(store)
-                day = (as_of or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+                # the scan VISIBLE at the decision (an intraday backtest clock: every session dated
+                # <= the scan finished at it; live / daily clock: the as_of date, unchanged)
+                day = scan_cutoff_date(as_of or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
                 # PER-RUN exclusion (not a persisted expert setting -- pushed onto this trial's
                 # settings dict by strategy_optimization_handler._build_daily_trial_config from
                 # the launcher's --exclude-symbols / optimization_config.backtest.
@@ -685,7 +688,8 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             import pandas as pd
             from ba2_providers.screener import metric_store as ms
             df = ms.load_store(store)
-            rows = ms.metrics_as_of(df, as_of.strftime("%Y-%m-%d"), ["momentum_12_1", "close"])
+            rows = ms.metrics_as_of(df, scan_cutoff_date(as_of).strftime("%Y-%m-%d"),
+                                  ["momentum_12_1", "close"])
         except Exception:  # noqa: BLE001 — any store issue -> safe OHLCV fallback
             return None, None
         if not rows or not all(s in rows for s in universe):

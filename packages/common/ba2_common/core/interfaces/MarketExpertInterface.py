@@ -1,14 +1,19 @@
+import dataclasses
 import math
+import threading
+import time
 from abc import abstractmethod
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Dict, List, NamedTuple, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, NamedTuple, Optional, Protocol, Tuple, runtime_checkable
 from sqlmodel import Session, select
 from ba2_common.logger import logger
 from ba2_common.core.models import ExpertSetting, MarketAnalysis, Transaction, ExpertInstance
-from ba2_common.core.types import TransactionStatus, OrderDirection, Recommendation
+from ba2_common.core.types import (CAPITAL_HOLDING_TRANSACTION_STATUSES, TransactionStatus,
+                                   OrderDirection, Recommendation)
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.db import get_instance, get_db
+from ba2_common.core.account_types import AccountSnapshot
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.interfaces.ExtendableSettingsInterface import ExtendableSettingsInterface
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
@@ -176,17 +181,14 @@ def _readable_positive(raw) -> Optional[float]:
 def capital_transactions(expert_id: int) -> List[Any]:
     """The transactions that hold an expert's capital, as the shared used-balance reads them.
 
-    WAITING and OPENED for every asset class, as the stock path always has. An OPTION transaction
-    that is CLOSING is included as well: a resting close on a cash-secured put or a spread has not
-    released its collateral (or the premium it holds) until it fills. A STOCK transaction that is
-    CLOSING stays excluded, exactly as today -- the stock path has the same gap (a resting stock close
-    drops out of ``used`` before it fills); that is reported, not changed, here."""
+    WAITING, OPENED and CLOSING, for every asset class (``CAPITAL_HOLDING_TRANSACTION_STATUSES``): a
+    resting close -- on a stock, a cash-secured put or a spread -- has not released the shares, the
+    collateral or the premium it holds until it FILLS, so the capital stays committed until the
+    transaction is actually CLOSED. (A CLOSING STOCK row used to be dropped here, so its capital
+    could be spent a second time while the position was still held; fixed 2026-10-07.)"""
     from ba2_common.core.trade_store import transactions_where
-    rows = transactions_where(
-        expert_id=expert_id,
-        statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED, TransactionStatus.CLOSING])
-    return [t for t in rows
-            if t.status != TransactionStatus.CLOSING or _is_option_transaction(t)]
+    return list(transactions_where(
+        expert_id=expert_id, statuses=list(CAPITAL_HOLDING_TRANSACTION_STATUSES)))
 
 
 def _order_float(raw) -> float:
@@ -451,10 +453,52 @@ def account_available_equity_detail(account: Any, *, exclude_transaction_id: Opt
     except ValueError as e:
         return None, (f"account {account.id} capital unreadable: {e}",)
     available = virtual - used
-    actual = MarketExpertInterface._get_actual_available_balance(account)
+    try:
+        actual = MarketExpertInterface._get_actual_available_balance(account)
+    except _PROGRAMMING_ERRORS:
+        raise                                   # a defect is never a "reason"; it must be seen and fixed
+    except Exception as e:
+        # A non-OSError error escaping the buying-power read (an SDK error class from a third-party
+        # adapter; the live adapters swallow theirs). This path serves ONE expert-less option entry, and
+        # ``(None, names)`` is the contract every caller already treats as "unknown: REFUSE this entry"
+        # (``_capital_headroom`` -> ``_fit_debit_to_capital`` / ``_reserve_fits``). Refusing that one
+        # entry loudly is right: an uncaught exception would instead abort the caller's whole pass, and
+        # sizing without the broker's real figure would be guessing.
+        reason = f"account {account.id} buying power unreadable ({type(e).__name__}: {e})"
+        logger.error(f"Option entry (no expert) REFUSED: {reason}", exc_info=True)
+        return None, (reason,)
     if actual is not None and actual < available:
         available = actual
     return available, ()
+
+#: The programming errors that no handler turns into a "reason" (they are bugs, not broker conditions).
+_PROGRAMMING_ERRORS = (AttributeError, TypeError, NameError, ImportError, ZeroDivisionError,
+                       AssertionError, SyntaxError)
+
+_BP_FIGURE = "figure"
+_BP_UNREADABLE = "unreadable"
+_BP_NOT_PUBLISHED = "not_published"
+
+
+def _bp_label(account: Any, expert_id: Optional[int]) -> str:
+    """``Account 3 (expert 7)`` / ``Account 3`` for a log line about the buying-power read."""
+    base = f"Account {getattr(account, 'id', '?')}"
+    return f"{base} (expert {expert_id})" if expert_id is not None else base
+
+
+def _snapshot_is_empty(snap: Any) -> bool:
+    """True when an ``AccountSnapshot`` (or snapshot-shaped object) carries NO figure at all: the
+    value every adapter returns when its broker read failed (``AccountSnapshot()``). A snapshot with
+    any number set -- equity, cash, ... -- was a real answer, whatever it lacks."""
+    if snap is None:
+        return True
+    if dataclasses.is_dataclass(snap):
+        values = [getattr(snap, f.name) for f in dataclasses.fields(snap)]
+    elif hasattr(snap, "__dict__"):
+        values = list(vars(snap).values())
+    else:
+        values = [getattr(snap, "buying_power", None)]
+    return all(v is None or isinstance(v, bool) or (isinstance(v, dict) and not v) for v in values)
 
 
 class MarketExpertInterface(ExtendableSettingsInterface):
@@ -1144,8 +1188,86 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             return account.get_instrument_current_price(symbol)
 
         except Exception as e:
-            logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
+            # WARNING per symbol (a broker outage would otherwise print one ERROR + traceback per symbol);
+            # the pass-level ERROR is ``pass_price_health.summarise_pass``.
+            from ba2_common.core import pass_price_health
+            pass_price_health.note_error(getattr(self, "id", None), str(symbol), e)
+            logger.warning(f"Error getting current price for {symbol}: {e}")
+            logger.debug(f"Error getting current price for {symbol}", exc_info=True)
             return None
+
+    def _decision_price(self, providers: "ProviderBundle", symbol: str,
+                        as_of: Optional[datetime]) -> Optional[float]:
+        """THE current price an expert decides on (the owner's rule: never a daily bar).
+
+        ONE seam for live and backtest: ``as_of`` None (live) -> the account quote
+        (``_get_current_price``); ``as_of`` set (backtest) -> ``providers.price_at_date``, which
+        the backtest host answers from the engine's decision-price function (the close of the
+        latest ENDED intraday bar on an intraday clock, the as_of close on a daily clock).
+        Daily frames are HISTORY (indicators, ATR magnitude, returns), not the anchor price:
+        an expert reading ``df["Close"].iloc[-1]`` as 'now' reads a bar that is, in the
+        backtest, the previous session's close and, live, a cached (possibly partial) bar."""
+        # ONE PATH, live and backtest: the ACCOUNT interface. Live -> the broker quote; backtest ->
+        # ``BacktestAccount.get_instrument_current_price`` = the decision price of the run's price
+        # source (a DecisionPrice on an intraday clock). The expert cannot tell them apart, and a bar
+        # read anywhere else cannot become "the price now" (see CLAUDE.md "Prices in decision code").
+        if as_of is None:
+            return self._get_current_price(symbol)
+        from ba2_common.core.knowability import intraday_decision_clock
+        if not intraday_decision_clock():
+            # A backtest on a DAILY clock (and the replay tool): EXACTLY the pre-existing read, the
+            # bundle's last daily close <= as_of (forward-filled, as before). The account path below
+            # exists for the intraday clock, where the decision price is the latest ENDED bar; it is
+            # not entered here, so a daily run is bit-identical to what it was.
+            daily_price = providers.price_at_date(symbol, as_of)
+            return daily_price
+        account = self._decision_account(providers)
+        if account is not None:
+            # A symbol with no knowable price at this tick is NOT decidable: None, the same value a
+            # live account quote that could not be read gives (``_get_current_price`` -> None), so every
+            # caller's "no price -> skip this symbol" rule applies identically live and in a backtest.
+            # (The account counts it: ``undecidable_price_reads``.) Raising here would abort a whole
+            # BASKET analysis for one thin member.
+            from ba2_common.core.knowability import NoDecisionPrice
+            try:
+                return account.get_instrument_current_price(symbol)
+            except NoDecisionPrice:
+                return None
+        # No account behind this bundle: ONLY the historical-replay tool (a recorded decision
+        # re-run against the cache, no live account exists). Everything that trades has an account.
+        return providers.price_at_date(symbol, as_of)
+
+    def _decision_account(self, providers: "ProviderBundle"):
+        """The account behind a backtest bundle, resolved ONCE per bundle (the bundle outlives a run;
+        a per-symbol DB lookup would be a hot-path cost) -- None when it has none."""
+        cached = getattr(self, "_decision_account_cache", None)
+        if cached is not None and cached[0] is providers:
+            return cached[1]
+        account = None
+        try:
+            from ba2_common.core.instance_resolver import get_instance_resolver
+
+            instance = get_instance(ExpertInstance, self.id)
+            if instance is not None:
+                account = get_instance_resolver().get_account_instance(instance.account_id)
+        except Exception as e:  # noqa: BLE001 -- not resolvable -> the replay fallback, said once
+            from ba2_common.core.knowability import intraday_decision_clock
+            if intraday_decision_clock():
+                # An intraday BACKTEST must never price from the replay fallback (a plain float the
+                # anchor guard would refuse -- and a silent reduced run if the engine swallowed it):
+                # no account behind the decision price is a wiring defect. End the run loudly.
+                raise RuntimeError(
+                    f"decision account for expert {self.id} is not resolvable on an intraday clock "
+                    f"({type(e).__name__}: {e}); refusing to fall back to a bundle price") from e
+            logger.warning(f"decision account for expert {self.id} not resolvable ({type(e).__name__}: {e})")
+        if account is None:
+            from ba2_common.core.knowability import intraday_decision_clock
+            if intraday_decision_clock():
+                raise RuntimeError(
+                    f"expert {self.id} has no account behind its decision price on an intraday clock; "
+                    f"refusing to fall back to a bundle price")
+        self._decision_account_cache = (providers, account)
+        return account
 
     # ---- Backtest contract (Phase 1) ---------------------------------
     def _gather(self, providers: "ProviderBundle", as_of: Optional[datetime]) -> Dict[str, Any]:
@@ -1494,6 +1616,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
 
         For example, if the account's tradable balance is $10,000 and virtual_equity_pct
         is 10, the virtual balance would be $1,000 (10% of the tradable balance).
+
+        The base is the account's EQUITY in both runtimes (live ``get_balance()`` is equity; the
+        backtest account publishes its deployed equity as its sizing balance), so
+        ``available = virtual - used`` charges an open position once everywhere.
         
         Returns:
             Optional[float]: The virtual balance amount, None if error occurred
@@ -1505,11 +1631,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         """This expert's virtual_equity_pct slice of the account's EQUITY (cash plus marked
         positions, ``get_tradable_equity``), for sizing a TARGET BOOK.
 
-        ``get_virtual_balance`` answers from ``get_balance()``, which is equity live and
-        CASH in a backtest (finding 6, unchanged for the classic RM). A rebalancer that
-        sized on it read its own fully invested book as nearly empty in the backtest only,
-        and sold it. This is the same figure in both runtimes; live it equals
-        ``get_virtual_balance`` exactly.
+        ``get_virtual_balance`` is the same figure: both runtimes start from the account's EQUITY
+        (live ``get_balance()`` is equity; the backtest account's sizing balance,
+        ``BacktestAccount._plain_balance``, is its deployed equity -- finding 6, fixed 2026-10-07,
+        when it was CASH there and the classic RM charged open positions twice). This one reads the
+        snapshot's equity directly, so it also stays right for an account whose ``get_balance`` is not
+        equity; live it equals ``get_virtual_balance`` exactly.
 
         Returns:
             Optional[float]: the virtual equity, None exactly where get_virtual_balance
@@ -1595,8 +1722,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         too), with two differences that make it the same in a backtest and live:
 
           * ``virtual`` is this expert's ``virtual_equity_pct`` slice of the account's EQUITY
-            (``option_capital_equity``, no margin factor), not of ``get_balance()``, which is cash in
-            a backtest and equity live; so the option book is bounded by 100 % of the expert's
+            (``option_capital_equity``, no margin factor); the classic stock path now starts from the
+            same equity base in both runtimes (finding 6); so the option book is bounded by 100 % of the expert's
             equity share whatever a stock margin multiplier or the broker's buying power says. The
             option SIZING budget (``TradeActions._virtual_equity``) is the same slice;
           * ``used`` (``used_balance_for_transactions``, loss adjustment off because the base already
@@ -1666,7 +1793,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         try:
             # Get virtual balance first. ``equity_base`` (the OPTION entry path): this expert's
             # slice of the account's EQUITY with no margin factor -- the same figure in a
-            # backtest and live, where ``get_virtual_balance`` is cash in a backtest (finding 6).
+            # backtest and live (``get_virtual_balance`` is equity in both since finding 6).
             virtual_balance = (self._virtual_share(lambda account: account.option_capital_equity(),
                                                    "option capital equity", "equity",
                                                    failure=failure)
@@ -1707,7 +1834,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # this expert's own math never learns about, so its virtual number can overstate what
             # the account can actually spend. Cap it at the broker's real available balance so an
             # expert is never told it can afford more than the account actually has.
-            actual_available = self._get_actual_available_balance(account)
+            actual_available = self._get_actual_available_balance(account, expert_id=self.id)
             if actual_available is not None and actual_available < available_balance:
                 logger.debug(f"Expert {self.id}: virtual available=${available_balance} exceeds "
                             f"actual account available=${actual_available} (oversubscription or "
@@ -1889,60 +2016,248 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         return mapping
 
     @staticmethod
-    def _get_actual_available_balance(account: AccountInterface) -> Optional[float]:
-        """The account's REAL spendable balance, straight from the broker — not this expert's
+    def _get_actual_available_balance(account: AccountInterface,
+                                      expert_id: Optional[int] = None) -> Optional[float]:
+        """The account's REAL spendable balance, straight from the broker -- not this expert's
         virtual-equity slice. Reads ``get_account_snapshot().buying_power`` first (the adapter's
         REMAINING stock buying power), then ``get_account_info()``'s buying-power-style fields (the
         true "can I actually place this order" figure); different account implementations name it
         differently (Alpaca/backtest: ``buying_power``; IBKR: ``buying_power``; TastyTrade:
         ``equity_buying_power`` or ``cash_balance``), so several known names are tried in order.
-        Falls back to ``get_balance()`` (equity) if none are present — a real, if less precise,
-        cap; still catches an account whose overall value has genuinely dropped. None (never a
-        fabricated number) if nothing is available."""
-        # The broker-agnostic snapshot FIRST: ``AccountSnapshot.buying_power`` is each
-        # adapter's REMAINING stock buying power (Alpaca: regt_buying_power; TastyTrade:
-        # equity_buying_power; backtest/IBKR: the same figure get_account_info() carries).
-        # Probing the raw ``get_account_info()`` object first read Alpaca's TradeAccount
-        # .buying_power -- the "effective" figure, larger than the Reg-T power the account
-        # can actually hold overnight -- so this clamp and the BP the UI shows disagreed.
-        # The raw probe below stays as the fallback for adapters/fakes without a snapshot.
-        if getattr(account, "buying_power_is_mandatory", False) is True:
+
+        THREE outcomes, told apart on purpose (``_read_actual_buying_power``):
+
+        * a figure -> returned;
+        * the broker COULD NOT BE READ -> retried (``_ACTUAL_BP_ATTEMPTS`` tries, the
+          ``_ACTUAL_BP_BACKOFFS_S`` pauses, 0.75 s in all because the caller holds the per-account
+          submit lock), then ONE ERROR and ``None`` ("no clamp"; the broker's own order check is the
+          remaining guard). "Could not be read" means the call raised a network/OS error OR the
+          adapter returned its failure value: every live adapter SWALLOWS a failed read and returns
+          an EMPTY answer (an all-None ``AccountSnapshot``; ``None`` or ``{}`` for the info), so an
+          exception-only retry never fired on a real adapter;
+        * the broker ANSWERED and this account publishes no buying power -> NOT retried (asking
+          again cannot change an answer), one ERROR saying exactly that, ``None``. No live adapter
+          does this (Alpaca, TastyTrade and IBKR all publish one); it is reachable for a third-party
+          ``AccountInterface`` only.
+
+        There is NO equity (``get_balance()``) substitute -- equity is not buying power. A backtest
+        account's read always carries a figure, so it takes the first attempt and never sleeps.
+
+        EXCEPTION POLICY (enforce mode, the project rule that a broad handler names what it absorbs):
+        an ``OSError``-family error (ConnectionError, TimeoutError, ``requests`` errors ...) or an EMPTY
+        answer is "could not be read" -> retried -> clamp skipped with the ERROR. Anything else PROPAGATES:
+        a programming error, and also an SDK error class escaping a third-party adapter (alpaca-py
+        ``APIError``, ``TastytradeError``, httpx errors, ``IBKRError``, ib_async ``RequestError`` are all
+        plain ``Exception`` subclasses, NOT OSError). The three live adapters swallow their own SDK errors
+        and return empty answers, so none of those reaches this code from them. Where a propagated error
+        lands: ``get_available_balance`` -> the broad handler of ``_available_balance_breakdown`` ->
+        "cannot size" (None, with its ERROR); ``account_available_equity_detail`` -> ``(None, (reason,))``,
+        one refused entry with one ERROR (see there).
+
+        FAILURE MEMORY: a failed read (after its retries) is remembered per ACCOUNT ID for
+        ``_ACTUAL_BP_FAILURE_MEMORY_S`` seconds, so the sizing calls that follow in the same outage (one
+        per candidate per expert) neither re-read the broker nor sleep: each takes the same outcome at
+        once. Every such decision still logs its OWN ERROR (no silent failure), saying it used the
+        remembered failure. A successful read clears the memory; a backtest read never fails, so it never
+        writes it."""
+        label = _bp_label(account, expert_id)
+        mandatory = getattr(account, "buying_power_is_mandatory", False) is True
+        attempts = MarketExpertInterface._ACTUAL_BP_ATTEMPTS
+        account_key = getattr(account, "id", None)
+        remembered = MarketExpertInterface._remembered_bp_failure(account_key)
+        if remembered is not None:
+            age, made_before, detail = remembered
+            if mandatory:
+                raise ValueError(
+                    f"{label} publishes no usable buying power and declares it mandatory "
+                    f"(buying_power_is_mandatory) -- the broker could not be read {age:.1f}s ago "
+                    f"({made_before} attempts; not re-read within the "
+                    f"{MarketExpertInterface._ACTUAL_BP_FAILURE_MEMORY_S:g}s failure window): refusing "
+                    f"to size from cash or net liquidation instead")
+            logger.error(
+                f"{label}: buying power COULD NOT BE READ from the broker (remembered failure from "
+                f"{age:.1f}s ago after {made_before} attempts, {detail}; not re-read within the "
+                f"{MarketExpertInterface._ACTUAL_BP_FAILURE_MEMORY_S:g}s failure window). The "
+                f"available-balance clamp is SKIPPED for this sizing call; the broker's own order check "
+                f"is the remaining guard.")
+            return None
+        outcome = (_BP_UNREADABLE, None, None)
+        made = 0
+        for attempt in range(1, attempts + 1):
+            made = attempt
+            outcome = MarketExpertInterface._read_actual_buying_power(account, snapshot_only=mandatory)
+            status, figure, error = outcome
+            if status != _BP_UNREADABLE:
+                break
+            if attempt < attempts:
+                pause = MarketExpertInterface._ACTUAL_BP_BACKOFFS_S[attempt - 1]
+                why = f"{type(error).__name__}: {error}" if error is not None else "empty answer"
+                logger.warning(
+                    f"{label}: buying power could not be read (attempt {attempt}/{attempts}: {why}); "
+                    f"retrying in {pause:.2f}s")
+                MarketExpertInterface._ACTUAL_BP_SLEEP(pause)
+        status, figure, error = outcome
+        if status == _BP_FIGURE:
+            MarketExpertInterface._clear_bp_failure(account_key)
+            return figure
+        if status == _BP_UNREADABLE:
+            MarketExpertInterface._remember_bp_failure(
+                account_key, made,
+                f"last error {type(error).__name__}: {error}" if error is not None
+                else "every attempt returned the adapter's empty failure answer")
+        if mandatory:
             # An adapter that DECLARES its buying power mandatory (IBKR): no cash / net-liquidation
             # fallback. A missing figure raises, and the caller's own handler turns that into the loud
             # "cannot size" refusal (``None``) -- never a quietly larger number.
-            snap_bp = getattr(account.get_account_snapshot(), "buying_power", None)
-            try:
-                mandatory = float(snap_bp) if snap_bp is not None else None
-            except (TypeError, ValueError):
-                mandatory = None
-            if mandatory is None or not math.isfinite(mandatory):
-                raise ValueError(
-                    f"Account {getattr(account, 'id', '?')} publishes no usable buying power "
-                    f"({snap_bp!r}) and declares it mandatory (buying_power_is_mandatory): refusing to size "
-                    f"from cash or net liquidation instead")
-            return mandatory
+            if status == _BP_UNREADABLE:
+                what = "the broker could not be read"
+            elif error is not None:
+                what = f"the broker answered with an unusable figure ({error})"
+            else:
+                what = "the broker answered without one"
+            raise ValueError(
+                f"{label} publishes no usable buying power and declares it mandatory "
+                f"(buying_power_is_mandatory) -- {what} after {made} attempt(s): refusing to size "
+                f"from cash or net liquidation instead")
+        if status == _BP_UNREADABLE:
+            detail = (f"last error {type(error).__name__}: {error}" if error is not None
+                      else "every attempt returned the adapter's empty failure answer")
+            logger.error(
+                f"{label}: buying power COULD NOT BE READ from the broker after {made} attempts "
+                f"({detail}). The available-balance clamp is SKIPPED for this sizing call; the broker's "
+                f"own order check is the remaining guard.")
+        else:
+            logger.error(
+                f"{label}: the broker ANSWERED but this account publishes no buying power "
+                f"(neither the snapshot nor get_account_info() carries one; asked {made} time(s), not "
+                f"retried: the answer cannot change). The available-balance clamp is SKIPPED for this "
+                f"sizing call; the broker's own order check is the remaining guard.")
+        return None
+
+    #: Total tries (first read included) and the pauses BETWEEN them for the buying-power read. The
+    #: caller (``AccountInterface.submit_order`` -> ``_validate_expert_available_balance``) holds the
+    #: per-account submit lock, so the total added delay is kept at 0.75 s (<= 1 s).
+    _ACTUAL_BP_ATTEMPTS = 3
+    _ACTUAL_BP_BACKOFFS_S = (0.25, 0.5)
+    _ACTUAL_BP_SLEEP = staticmethod(time.sleep)
+
+    #: How long a failed buying-power read (after its retries) is remembered per account id, so a
+    #: burst of sizing calls in one outage costs ONE read cycle, not one per candidate. Five seconds:
+    #: longer than a whole sizing pass over a basket, short enough that a recovered broker is read again
+    #: within the next scheduling tick.
+    _ACTUAL_BP_FAILURE_MEMORY_S = 5.0
+    _ACTUAL_BP_CLOCK = staticmethod(time.monotonic)
+    _BP_FAILED_READS: Dict[Any, Tuple[float, int, str]] = {}   # account id -> (clock, attempts, detail)
+    _BP_FAILED_READS_LOCK = threading.Lock()
+
+    @staticmethod
+    def _remembered_bp_failure(account_key: Any) -> Optional[Tuple[float, int, str]]:
+        """``(age_s, attempts, detail)`` of an unexpired remembered failure for the account, else None."""
+        if account_key is None:
+            return None
+        with MarketExpertInterface._BP_FAILED_READS_LOCK:
+            entry = MarketExpertInterface._BP_FAILED_READS.get(account_key)
+            if entry is None:
+                return None
+            age = MarketExpertInterface._ACTUAL_BP_CLOCK() - entry[0]
+            if age >= MarketExpertInterface._ACTUAL_BP_FAILURE_MEMORY_S:
+                del MarketExpertInterface._BP_FAILED_READS[account_key]
+                return None
+            return age, entry[1], entry[2]
+
+    @staticmethod
+    def _remember_bp_failure(account_key: Any, attempts: int, detail: str) -> None:
+        if account_key is None:
+            return
+        with MarketExpertInterface._BP_FAILED_READS_LOCK:
+            MarketExpertInterface._BP_FAILED_READS[account_key] = (
+                MarketExpertInterface._ACTUAL_BP_CLOCK(), attempts, detail)
+
+    @staticmethod
+    def _clear_bp_failure(account_key: Any) -> None:
+        if account_key is None:
+            return
+        with MarketExpertInterface._BP_FAILED_READS_LOCK:
+            MarketExpertInterface._BP_FAILED_READS.pop(account_key, None)
+
+    @staticmethod
+    def _read_actual_buying_power(account: AccountInterface, snapshot_only: bool = False):
+        """One attempt at the buying-power figure: ``(status, figure, error)``.
+
+        ``status`` is ``_BP_FIGURE`` (``figure`` set), ``_BP_UNREADABLE`` (a source raised a
+        network/OS error or returned the adapter's empty failure answer, and no source gave a figure;
+        ``error`` is the last exception, or None for a pure empty answer) or ``_BP_NOT_PUBLISHED``
+        (every source ANSWERED and none carries a buying power). ``snapshot_only``: the snapshot is the
+        only source (an adapter that declares buying power mandatory).
+        """
+        label = _bp_label(account, None)
+        error: Optional[BaseException] = None
+        unusable: Optional[BaseException] = None   # snapshot-only mode: a figure was published but is unusable
+        answered = failed = 0
+        snapshot_failure_value = False
 
         snap_fn = getattr(account, "get_account_snapshot", None)
         if callable(snap_fn):
+            snap = None
             try:
-                snap_bp = getattr(snap_fn(), "buying_power", None)
-            except Exception:  # noqa: BLE001 — same contract as the info probe: never block sizing
-                snap_bp = None
-            if snap_bp is not None:
-                try:
-                    snap_num = float(snap_bp)
-                except (TypeError, ValueError):
-                    snap_num = None
-                if snap_num is not None and math.isfinite(snap_num):
-                    return snap_num
-                logger.warning(
-                    f"Account {getattr(account, 'id', '?')}: unusable snapshot buying_power "
-                    f"({snap_bp!r}); falling back to get_account_info() for the clamp")
+                snap = snap_fn()
+            except Exception as e:
+                absorb_if_benign(e)     # OSError family only; anything else is a defect and propagates
+                error = e
+                failed += 1
+            else:
+                if _snapshot_is_empty(snap):
+                    failed += 1         # the adapter's "I could not read the broker" value
+                    # only the real failure VALUE (an all-None AccountSnapshot) licenses skipping the
+                    # info probe below; a snapshot-shaped stub is just "no figure here"
+                    snapshot_failure_value = isinstance(snap, AccountSnapshot)
+                else:
+                    answered += 1
+                    snap_bp = getattr(snap, "buying_power", None)
+                    if snap_bp is not None:
+                        try:
+                            snap_num = float(snap_bp)
+                        except (TypeError, ValueError):
+                            snap_num = None
+                        if snap_num is not None and math.isfinite(snap_num):
+                            return _BP_FIGURE, snap_num, None
+                        if snapshot_only:
+                            # no fallback exists in this mode: say what is true
+                            unusable = ValueError(f"unusable snapshot buying_power {snap_bp!r}")
+                        else:
+                            logger.warning(
+                                f"{label}: unusable snapshot buying_power ({snap_bp!r}); "
+                                f"falling back to get_account_info() for the clamp")
+        if snapshot_only:
+            if answered and not failed:
+                return _BP_NOT_PUBLISHED, None, unusable
+            return _BP_UNREADABLE, None, error
+        if (snapshot_failure_value and failed and not answered and error is None
+                and getattr(account, "snapshot_is_derived_from_account_info", False) is True):
+            # The snapshot came back EMPTY (no raise) and this adapter builds it from the very read
+            # get_account_info() would make again: a second probe repeats the failed call (and its
+            # adapter ERROR) for nothing. Only a snapshot that ANSWERED without a figure falls through.
+            return _BP_UNREADABLE, None, None
 
-        try:
-            info = account.get_account_info()
-        except Exception:  # noqa: BLE001 — a broker hiccup here must not block the virtual figure
-            info = None
+        info = None
+        info_fn = getattr(account, "get_account_info", None)
+        if not callable(info_fn):
+            # An account (a duck-typed double, a third-party adapter) with no info source at all: this
+            # source does not exist, which is neither an answer nor a failure -- the snapshot (answered
+            # or failed above) decides alone. Same as dev, where the missing method was swallowed.
+            pass
+        else:
+            try:
+                info = info_fn()
+            except Exception as e:
+                absorb_if_benign(e)
+                error = e
+                failed += 1
+            else:
+                if info is None or (hasattr(info, "__len__") and len(info) == 0):
+                    failed += 1             # None (Alpaca) / {} (TastyTrade, IBKR): a failed read
+                else:
+                    answered += 1
 
         def _field(obj: Any, name: str) -> Optional[float]:
             val = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
@@ -1958,7 +2273,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # same as a non-numeric value: say so and fall through to the next candidate name.
             if not math.isfinite(num):
                 logger.warning(
-                    f"Account {getattr(account, 'id', '?')}: non-finite {name} ({val!r}) in "
+                    f"{label}: non-finite {name} ({val!r}) in "
                     f"get_account_info(); ignoring it for the available-balance clamp")
                 return None
             return num
@@ -1967,13 +2282,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             for name in ("buying_power", "cash", "cash_balance", "equity_buying_power"):
                 val = _field(info, name)
                 if val is not None:
-                    return val
+                    return _BP_FIGURE, val, None
 
-        try:
-            return account.get_balance()
-        except Exception:  # noqa: BLE001 — best-effort; None means "couldn't determine, don't clamp"
-            return None
-    
+        # No figure. NOT get_balance(): equity is not spendable power and substituting it hid a
+        # missing figure behind a plausible number. A source that failed makes the whole read
+        # "could not be read" (retry); only an all-answered, figure-less read is "not published".
+        if failed or not answered:
+            return _BP_UNREADABLE, None, error
+        return _BP_NOT_PUBLISHED, None, None
+
     def has_sufficient_equity_for_trading(self) -> tuple[bool, str]:
         """
         Check if expert has sufficient available equity to create new positions.

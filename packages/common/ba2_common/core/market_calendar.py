@@ -550,3 +550,45 @@ def decision_data_session(label: date) -> date:
     """
     _require_session_date(label)
     return prior_regular_session(label)
+
+
+def closed_skip_is_expected(instant: datetime) -> bool:
+    """For an ``instant`` that ``regular_session_status`` calls closed: True when that is the
+    EXPECTED kind of closed (a weekend, a market holiday, or a half day's early close -- a
+    scheduled pass skipped there is routine), False when it falls on a FULL regular session day
+    (16:00 close), where a skipped pass means a schedule outside the session or a calendar fault
+    and is an incident. Raises ``MarketCalendarUnavailable`` like the status function."""
+    aware = _require_aware(instant)
+    day = aware.astimezone(NY_TZ).date()
+    if not is_regular_session(day):
+        return True
+    return regular_session_close_utc(day).astimezone(NY_TZ).hour < 16
+
+
+def regular_session_status(instant: datetime) -> Tuple[bool, str]:
+    """``(True, "")`` when ``instant`` falls inside a regular NYSE session (open-inclusive,
+    close-exclusive; a half day closes at 13:00 ET), else ``(False, reason)``.
+
+    The LIVE scheduler asks this before it fires an entry / open-positions pass: a scheduled
+    time that does not exist on a short session (15:30 on a half day), a holiday and a weekend
+    have no bar in the backtest, so they get no decision live either.
+
+    Raises:
+        ValueError: ``instant`` is naive (no timezone is guessed).
+        MarketCalendarUnavailable: see ``_nyse_calendar`` -- the caller fails CLOSED.
+    """
+    aware = _require_aware(instant)
+    local = aware.astimezone(NY_TZ)
+    day = local.date()
+    if not is_regular_session(day):
+        kind = "weekend" if day.weekday() >= 5 else "market holiday"
+        return False, f"{day} is a {kind} (no NYSE session)"
+    close_utc = regular_session_close_utc(day)
+    open_local = datetime(day.year, day.month, day.day, 9, 30, tzinfo=NY_TZ)
+    close_local = close_utc.astimezone(NY_TZ)
+    if aware < open_local:
+        return False, f"{local:%H:%M} ET is before the {open_local:%H:%M} ET open of {day}"
+    if aware >= close_utc:
+        early = " (early close)" if close_local.hour < 16 else ""
+        return False, f"{local:%H:%M} ET is at/after the {close_local:%H:%M} ET close{early} of {day}"
+    return True, ""

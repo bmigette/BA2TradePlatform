@@ -10,12 +10,13 @@ from abc import ABC, abstractmethod
 from typing import Callable, Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, date, timedelta
 
+from ba2_common.core.knowability import require_decision_price
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, TradeActionResult
 from ba2_common.core.types import (
     OrderRecommendation, ExpertActionType, OrderDirection, OrderStatus,
-    OptionRight, AssetClass, TransactionStatus, OptionCloseReason,
+    OptionRight, AssetClass, TransactionStatus, OptionCloseReason, CAPITAL_HOLDING_TRANSACTION_STATUSES,
 )
 from ba2_common.core.db import get_db, add_instance, update_instance, get_instance
 from ba2_common.core.option_economics import (
@@ -128,12 +129,17 @@ class TradeAction(ABC):
             Current price or None if unavailable
         """
         try:
-            return self.account.get_instrument_current_price(self.instrument_name)
+            price = self.account.get_instrument_current_price(self.instrument_name)
         except Exception as e:
             absorb_if_benign(e, InstanceNotFound)
             logger.error(f"Error getting current price for {self.instrument_name}: {e}", exc_info=True)
             return None
-    
+        # every TP/SL/reference level and share count a TradeAction builds anchors on THIS price:
+        # on an intraday clock it must be the decision price (guard outside the try: it must raise)
+        if price is not None:
+            require_decision_price(price, what="TradeAction anchor", symbol=self.instrument_name)
+        return price
+
     def get_current_position(self) -> Optional[float]:
         """
         Get current position quantity for the instrument.
@@ -1202,24 +1208,8 @@ def resolve_min_take_profit_pct(expert_recommendation_id: Optional[int]) -> floa
     return float(getattr(rec, "min_take_profit_percent", None) or 2.0) if rec else 2.0
 
 
-def compute_tp_floor_price(
-    target_price: float, entry_price: float, min_pct: float, is_long: bool
-) -> Optional[float]:
-    """If `target_price` is closer to `entry_price` than `min_pct`% allows, return the
-    floor-enforced price; otherwise None (no adjustment needed). Pure, no I/O -- shared by the
-    pre-fill Phase-2 enforcement (AdjustTakeProfitAction._enforce_minimum_distance / compute_price)
-    and TradeManager's post-fill re-check of the same floor against the REAL fill price."""
-    if not entry_price:
-        return None
-    if is_long:
-        actual_pct = ((target_price - entry_price) / entry_price) * 100
-        if actual_pct < min_pct:
-            return entry_price * (1 + min_pct / 100)
-    else:
-        actual_pct = ((entry_price - target_price) / entry_price) * 100
-        if actual_pct < min_pct:
-            return entry_price * (1 - min_pct / 100)
-    return None
+# compute_tp_floor_price now lives in tpsl_fill_rebase (pure; shared with the fill-time re-base).
+from ba2_common.core.tpsl_fill_rebase import compute_tp_floor_price  # noqa: E402,F401
 
 
 class _AdjustPriceLevelAction(TradeAction):
@@ -1351,6 +1341,9 @@ class _AdjustPriceLevelAction(TradeAction):
                     data={}
                 )
 
+            # The price the level is computed from (stamped below, before it reaches the account).
+            # None = a literal target price of unknown origin.
+            anchor_price = None
             # Calculate price if not directly provided
             if self.target_price is None:
                 if self.reference_value is None or self.percent is None:
@@ -1411,6 +1404,7 @@ class _AdjustPriceLevelAction(TradeAction):
                         if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
                             base_price = expert_rec.price_at_date
                             expected_profit = expert_rec.expected_profit_percent
+                            anchor_price = base_price
 
                             logger.info(f"{self._label} Reference: EXPERT_TARGET_PRICE - base_price: ${base_price:.2f}, expected_profit: {expected_profit:.1f}%, action: {expert_rec.recommended_action}")
 
@@ -1453,6 +1447,8 @@ class _AdjustPriceLevelAction(TradeAction):
                         data={}
                     )
 
+                if anchor_price is None:
+                    anchor_price = reference_price
                 # Determine position direction: the POSITION's side (see _position_is_long)
                 is_long_position, direction_source = self._position_is_long()
                 if is_long_position is not None:
@@ -1510,6 +1506,13 @@ class _AdjustPriceLevelAction(TradeAction):
                         data={}
                     )
 
+                # Stamp the anchor BEFORE the account builds anything from the level.
+                from ba2_common.core.trade_cycle import record_level_anchor
+                record_level_anchor(transaction.id, **{self._anchor_level: anchor_price})
+                # Re-read: the account persists the object it is handed, and the copy loaded before
+                # the stamp would write the stamp's meta_data back out (stale-copy overwrite).
+                transaction = get_instance(Transaction, transaction.id) or transaction
+
                 logger.debug(f"Calling {self._label.lower()} adjustment for transaction {transaction.id} with price ${self.target_price:.2f}")
                 success = self._call_broker(transaction)
 
@@ -1565,8 +1568,17 @@ class _AdjustPriceLevelAction(TradeAction):
                 data={"order_id": self.existing_order.id if self.existing_order else None}
             )
 
+    #: "stop" / "tp": which ``tpsl_anchor`` slot this action's level lives in.
+    @property
+    def _anchor_level(self) -> str:
+        return "stop" if self._price_key_prefix == "sl" else "tp"
+
+    #: The price the last ``compute_price`` result was computed from (None = literal target).
+    last_anchor_price: Optional[float] = None
+
     def compute_price(self, order: "TradingOrder") -> Optional[float]:
         """Calculate the price for the given order without submitting to broker."""
+        self.last_anchor_price = None
         if self.target_price is not None:
             return self.target_price
 
@@ -1590,6 +1602,7 @@ class _AdjustPriceLevelAction(TradeAction):
                 if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
                     base_price = expert_rec.price_at_date
                     expected_profit = expert_rec.expected_profit_percent
+                    self.last_anchor_price = base_price
                     if expert_rec.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                         reference_price = base_price * (1 + expected_profit / 100)
                     elif expert_rec.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
@@ -1597,6 +1610,8 @@ class _AdjustPriceLevelAction(TradeAction):
 
         if reference_price is None:
             return None
+        if self.last_anchor_price is None:
+            self.last_anchor_price = reference_price
 
         is_long, _source = self._position_is_long(order)
         if is_long is None:
@@ -3219,7 +3234,7 @@ class _OptionEntryAction(TradeAction):
         """``(dollars this expert already has committed to self.instrument_name, None)``, or
         ``(None, why)`` when any part of it cannot be measured.
 
-        WHAT IS COUNTED -- every WAITING or OPENED transaction of this expert on the symbol
+        WHAT IS COUNTED -- every WAITING, OPENED or CLOSING transaction of this expert on the symbol
         (the same set the classic equity RM's ``_get_existing_allocations`` reads, through the
         same dual-path ``transactions_where``, so a backtest reads its in-memory store):
 
@@ -3252,7 +3267,7 @@ class _OptionEntryAction(TradeAction):
         total = 0.0
         for txn in transactions_where(
                 expert_id=instance_id, symbol=self.instrument_name,
-                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED]):
+                statuses=list(CAPITAL_HOLDING_TRANSACTION_STATUSES)):
             orders = orders_where(transaction_id=txn.id)
             fallback = next((p for o in orders
                              for p in (o.limit_price, o.open_price, o.stop_price) if p), None)

@@ -25,6 +25,7 @@ import math
 from datetime import datetime
 from typing import Any, Callable, Optional
 
+from ba2_common.core.knowability import require_decision_price
 from ba2_common.core.share_grid import floor_to_unit, is_whole_grid
 
 from ba2_common.logger import logger
@@ -330,6 +331,7 @@ def synthesize_safeguard_stop(
         return None
     if not risk_per_trade_pct or risk_per_trade_pct <= 0:
         return None
+    require_decision_price(current_price, what="safeguard stop")
     risk_dist = current_price * (risk_per_trade_pct / 100.0)
     candidates = [(SAFEGUARD_CANDIDATE_RISK_PCT, risk_dist)]
     if atr and atr > 0 and atr_multiplier and atr_multiplier > 0:

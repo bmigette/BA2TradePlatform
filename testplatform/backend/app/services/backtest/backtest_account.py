@@ -62,6 +62,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ba2_common.core.models import TradingOrder, Transaction
+from ba2_common.core.knowability import NoDecisionPrice
 from ba2_common.core.types import (
     OrderStatus,
     OrderType,
@@ -91,6 +92,29 @@ from .options_provider import HistoricalOptionsProvider
 import logging
 
 logger = logging.getLogger(__name__)
+
+#: The fill-time re-base counters (``BacktestAccount.fill_rebase_counters``), published in
+#: ``results["fill_rebase"]``. ``no_reference`` = an entry with a stop and NO usable anchor (its stop
+#: kept the pre-fill level): judged by ``DailyBacktestEngine.refuse_if_rebase_unanchored``.
+#: ``fallback_reference`` = the stop carried no stamp and the entry-order chain supplied the anchor.
+FILL_REBASE_COUNTER_KEYS = {
+    "entries_with_levels": 0, "entries_with_stop": 0, "rebased": 0, "stop_rebased": 0,
+    "tp_floored": 0, "fallback_reference": 0, "no_reference": 0,
+}
+
+
+class FillRebaseDisabled(RuntimeError):
+    """The measurement hook ``BacktestAccount._MEASURE_NO_FILL_REBASE`` was on in an optimization or
+    grid. JOB-FATAL: every trial would score a simulation that differs from live."""
+
+
+def assert_fill_rebase_enabled() -> None:
+    """Refuse to run a GA / grid trial with the fill re-base switched off (measurement hook only)."""
+    if BacktestAccount._MEASURE_NO_FILL_REBASE is not False:
+        raise FillRebaseDisabled(
+            "BacktestAccount._MEASURE_NO_FILL_REBASE is on: the fill-time stop/target re-base is "
+            "switched off, which is a measurement-only hook (tools/measure_variant.py +norebase) and "
+            "must never be on in an optimization or grid")
 
 
 class ComboSettlementRefused(RuntimeError):
@@ -718,6 +742,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         self._book_gen: int = 0
         # (book_gen, clock, marked value) memo for _open_positions_mtm.
         self._mtm_memo: Optional[tuple] = None
+        # The same memo for the DECISION-time mark (intraday clock: positions marked at the
+        # decision price, not at the clock bar's close); see _equity_mark_price.
+        self._mtm_memo_decision: Optional[tuple] = None
+        # Counters of the intraday-clock rule (published in results["intraday_clock"]).
+        # undecidable_price_reads: single-symbol price reads that found no knowable price (a basket
+        # member without a decision price is dropped; see MarketExpertInterface._decision_price).
+        self.intraday_counters: Dict[str, int] = {"entries_refused_next_bar_other_session": 0,
+                                                  "undecidable_price_reads": 0}
         # (generation, contract_group, group_bounds) memo for _option_group_bounds.
         self._group_bounds_memo: Optional[tuple] = None
         # contract_symbol -> the order carrying the contract's terms (first row with a strike,
@@ -935,8 +967,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         lot.avg_price = 0.0
         self._touch_book()
 
-    def _open_positions_mtm(self) -> float:
+    def _open_positions_mtm(self, decision: bool = False) -> float:
         """Mark-to-market value of all open positions at the current bar's close — MEMOISED.
+
+        ``decision=True`` (INTRADAY clock only; identical to the default on a daily clock) marks
+        the equity positions at the price KNOWABLE at the decision instant instead of the clock
+        bar's close, which prints a bar later: the value a SIZER may see. The recorded equity
+        curve (``snapshot_equity``) and the final equity keep the bar close.
 
         THE MEMO (2026-09-21). Every entry candidate that reaches the live-parity equity gate
         calls ``has_sufficient_equity_for_trading`` -> ``get_available_balance`` -> this, which
@@ -971,12 +1008,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # memoise -- there is no bar to key on and the un-memoised path is the old behaviour.
         current = getattr(self._price, "current", None)
         clock = current() if current is not None else None
+        decision = bool(decision) and bool(getattr(self._price, "is_intraday", False))
         if clock is None:
-            return self._compute_open_positions_mtm()
-        memo = self._mtm_memo
+            return self._compute_open_positions_mtm(decision)
+        memo = self._mtm_memo_decision if decision else self._mtm_memo
         if memo is not None and memo[0] == self._book_gen and memo[1] == clock:
             if _MTM_AUDIT:
-                fresh = self._compute_open_positions_mtm()
+                fresh = self._compute_open_positions_mtm(decision)
                 if fresh != memo[2]:
                     raise StaleMarkToMarket(
                         f"[backtest] the mark-to-market memo served {memo[2]!r} at book "
@@ -985,11 +1023,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                         f"bump the book generation (see BacktestAccount._touch_book)."
                     )
             return memo[2]
-        value = self._compute_open_positions_mtm()
-        self._mtm_memo = (self._book_gen, clock, value)
+        value = self._compute_open_positions_mtm(decision)
+        if decision:
+            self._mtm_memo_decision = (self._book_gen, clock, value)
+        else:
+            self._mtm_memo = (self._book_gen, clock, value)
         return value
 
-    def _compute_open_positions_mtm(self) -> float:
+    def _compute_open_positions_mtm(self, decision: bool = False) -> float:
         """The actual mark — see ``_open_positions_mtm`` (its memoising caller) for the contract.
 
         Signed value (long positions positive, short positions negative). A held symbol
@@ -1007,16 +1048,31 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for p in self._positions.values():
             if p.qty == 0:
                 continue
-            px = self._equity_mark_price(p)
+            px = self._equity_mark_price(p, decision=decision)
             if px is not None:
                 total += p.qty * px
         return total + self._option_positions_mtm()
 
-    def _equity_mark_price(self, p: "_Position") -> Optional[float]:
+    def _equity_mark_price(self, p: "_Position", decision: bool = False) -> Optional[float]:
         """The price an equity position is marked at: this bar's close, else the last known
         close (forward-fill), else the entry price for a never-priced symbol. The ONE mark
         both the equity curve (``_compute_open_positions_mtm``) and the short borrow accrual
-        (``accrue_short_borrow``) use, so a short is charged on the value the curve shows."""
+        (``accrue_short_borrow``) use, so a short is charged on the value the curve shows.
+
+        ``decision=True`` on an INTRADAY clock: the decision price (close of the latest bar that
+        has ended at the clock) first, then the last ENDED close however old; raises when none ever
+        ended. Never the clock bar's own close, never the entry price."""
+        if decision and getattr(self._price, "is_intraday", False):
+            px = self._price.decision_price(p.symbol, self._price.now())
+            if px is None:
+                # A HELD symbol with no decidable price: its last KNOWABLE close, however old (never
+                # the clock bar's own close, never the entry price).
+                px = self._price.last_ended_close(p.symbol, self._price.now())
+            if px is None:
+                raise ValueError(
+                    f"cannot mark held position {p.symbol} at {self._price.now()}: no bar has ever "
+                    f"ended for it")
+            return px
         px = self._price.close_at(p.symbol)
         if px is None:
             px = self._price.close_asof(p.symbol)  # forward-fill: last known close
@@ -1637,9 +1693,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         self._group_bounds_memo = (self._option_memo_gen, contract_group, group_bounds)
         return contract_group, group_bounds
 
-    def equity(self) -> float:
-        """Net liquidating value = cash + mark-to-market of open positions."""
-        return self._cash + self._open_positions_mtm()
+    def equity(self, *, close_mark: bool = False) -> float:
+        """Net liquidating value = cash + mark-to-market of open positions.
+
+        A DECISION-time read by default (what sizing, margin and gates see): on an intraday clock
+        the positions are marked at the decision price. ``close_mark=True`` is the recorded
+        value (the bar's close): the final equity of a run."""
+        return self._cash + self._open_positions_mtm(decision=not close_mark)
 
     def deployed_equity(self) -> float:
         """Equity the SIZER may see: ``min(cap, equity())``. Uncapped when no cap is set.
@@ -2754,6 +2814,31 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return self._cash
         return min(self._cash, self.deployed_equity())
 
+    def _plain_balance(self) -> float:
+        """The balance every SIZING / THRESHOLD / CEILING reader starts from: the deployed EQUITY.
+
+        ``ReadOnlyAccountInterface._plain_balance`` answers ``get_balance()``, which is EQUITY at
+        every live broker (a filled purchase leaves it unchanged) but CASH here (``get_balance``
+        above, which stays cash: the fill engine, the buying-power clamp and the cash ledger need
+        it). The expert math then subtracts the open positions again as ``used``
+        (``available = virtual - used``), so the backtest charged an open position TWICE where live
+        charges it once ("finding 6", fixed 2026-10-07: it moved every classic stock backtest).
+
+        This is the ONE seam: ``get_tradable_balance`` (the classic RM, the per-instrument cap, the
+        min-balance thresholds, risk_atr), ``get_option_tradable_balance`` (the option buying-power
+        gate), the margin ceiling and the capital mapping all start here, so the base is the same
+        quantity in both runtimes -- the account's equity (cash + marks), clamped by the equity cap
+        exactly as the snapshot's ``equity`` is. NOT ``true_equity()``: the cap is what may be spent.
+
+        Cash can still never go negative: the expert's actual-available clamp reads the snapshot's
+        ``buying_power`` (= cash, floored at 0), not this figure.
+        """
+        value = float(self.deployed_equity())
+        if not math.isfinite(value):
+            raise ValueError(f"account {self.id} ({type(self).__name__}) computed a non-finite "
+                             f"equity ({value!r}); cannot size with it")
+        return value
+
     def true_equity(self) -> Optional[float]:
         """The UNCAPPED equity: ``equity()`` = cash + mark-to-market. Overrides the interface.
 
@@ -2807,9 +2892,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for p in self._positions.values():
             if p.qty == 0:
                 continue
-            cur = self._price.close_at(p.symbol)
-            if cur is None:  # no exact bar this tick -> last-known close (not None/stale)
-                cur = self._price.close_asof(p.symbol)
+            if getattr(self._price, "is_intraday", False):
+                # A decision-time read (rules / conditions read position.current_price): the
+                # price knowable now, not the clock bar's own close.
+                cur = self._price.decision_price(p.symbol, self._price.now())
+                if cur is None:
+                    cur = self._price.last_ended_close(p.symbol, self._price.now())
+                if cur is None:
+                    raise ValueError(
+                        f"cannot read held position {p.symbol} at {self._price.now()}: no bar has "
+                        f"ever ended for it")
+            else:
+                cur = self._price.close_at(p.symbol)
+                if cur is None:  # no exact bar this tick -> last-known close (not None/stale)
+                    cur = self._price.close_asof(p.symbol)
             out.append(
                 _AttrDict(
                     {
@@ -2985,11 +3081,26 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         Single symbol -> float (raises if unavailable, per the live no-fallback rule).
         List -> {symbol: price-or-None}.
         """
+        if getattr(self._price, "is_intraday", False):
+            # INTRADAY clock: the price KNOWABLE at the decision (``AsOfPriceSource.decision_price``:
+            # the close of the latest bar that has ENDED), the same price the experts decide on,
+            # not the clock bar's own close (printed after the decision). Equity valuation reads
+            # ``close_at`` / ``close_asof`` directly and is unaffected.
+            now = self._price.now()
+            if isinstance(symbol_or_symbols, (list, tuple, set)):
+                return {s: self._price.decision_price(s, now) for s in symbol_or_symbols}
+            px = self._price.decision_price(symbol_or_symbols, now)
+            if px is None:
+                self.intraday_counters["undecidable_price_reads"] += 1
+                raise NoDecisionPrice(
+                    f"No backtest price for {symbol_or_symbols} at {now}: no bar has ended in the "
+                    f"current or the last finished session")
+            return px
         if isinstance(symbol_or_symbols, (list, tuple, set)):
             return {s: self._price.close_at(s) for s in symbol_or_symbols}
         px = self._price.close_at(symbol_or_symbols)
         if px is None:
-            raise ValueError(
+            raise NoDecisionPrice(
                 f"No backtest price for {symbol_or_symbols} at {self._price.now()}"
             )
         return px
@@ -3111,6 +3222,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             bar = self._bar_for_fill(o, as_of)
             if bar is None:
                 continue
+            if self._refuse_cross_session_market_entry(o, as_of):
+                filled = True   # the order was terminalised: the engine must roll the transaction
+                continue
             trig_hi, trig_lo = self._trigger_thresholds(o)
             if not (bar["high"] >= trig_hi or bar["low"] <= trig_lo):
                 continue
@@ -3128,6 +3242,35 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # transactions (see the Step 0 note above), so report it as a book change too.
         # A market-type entry the fill screen refused is terminalised inside the loop above.
         return filled or book_changed or self.__dict__.pop("_fill_book_changed", False)
+
+    def _refuse_cross_session_market_entry(self, order, as_of) -> bool:
+        """INTRADAY clock: a MARKET order that OPENS an equity position fills at the open of the
+        next bar after the decision. For a thin symbol that bar can be in a LATER session (a
+        decision on Tuesday from Monday's last print would fill at Friday's open, stamped Tuesday,
+        with its TP/SL then tested on bars before the fill). A broker's DAY order dies at the close;
+        so this terminalises such an entry (EXPIRED, counted in
+        ``intraday_counters["entries_refused_next_bar_other_session"]``) instead of filling it.
+        Closing orders are never refused. Returns True when the order was terminalised."""
+        if not getattr(self._price, "is_intraday", False):
+            return False
+        if order.order_type != OrderType.MARKET or getattr(order, "asset_class", None) == AssetClass.OPTION:
+            return False
+        nxt = self._price.next_bar_date(order.symbol, as_of)
+        if nxt is None or nxt.date() == as_of.date():
+            return False
+        pos = self._positions.get(order.symbol)
+        sign = 1 if order.side == OrderDirection.BUY else -1
+        if pos is not None and pos.qty != 0 and (pos.qty > 0) != (sign > 0):
+            return False                    # reduces an existing position: a closing order
+        order.status = OrderStatus.EXPIRED
+        order.comment = (f"{(order.comment or '')} | day order expired: next bar {nxt} is not in the "
+                         f"decision's session").strip(" |")
+        update_instance(order)
+        self.invalidate_order_cache()
+        self.intraday_counters["entries_refused_next_bar_other_session"] += 1
+        logger.warning("[backtest] equity market entry EXPIRED: %s %s decided %s, its next bar is %s "
+                       "(another session)", order.side, order.symbol, as_of, nxt)
+        return True
 
     def _expire_stale_option_limits(self, as_of) -> bool:
         """TIME-IN-FORCE DAY for option LIMIT orders (OPT-B4).
@@ -4948,6 +5091,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 row["entry_price"] = entry_px * k
                 row["exit_price"] = exit_px * k
                 row["size"] = size / k
+            # The protective levels as they stood AFTER the entry fill (what the bracket test
+            # enforced) next to the pre-fill ones: equity rows of a transaction that carried
+            # levels at its fill, nothing else (option rows and level-less rows keep their shape).
+            rb = self.__dict__.get("_fill_rebase_records", {}).get(txn_id)
+            if rb is not None and not _is_option_row(opening):
+                row["stop_loss_at_fill"] = rb["stop_loss"]
+                row["take_profit_at_fill"] = rb["take_profit"]
+                row["stop_loss_pre_fill"] = rb["stop_loss_pre_fill"]
+                row["take_profit_pre_fill"] = rb["take_profit_pre_fill"]
+                row["fill_reference_price"] = rb["reference_price"]
             trades.append(row)
             if option_records and _is_option_row(opening):
                 option_carriers[id(row)] = (
@@ -5740,6 +5893,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     # method left). ``submit_option_order`` is concrete in the base mixin and is NOT
     # overridden; ``get_iv_rank`` IS (see below — the base reads a live-only SQL table).
     # ======================================================================
+    def intraday_volume_so_far(self, symbol: str):
+        """``(applicable, volume)``: the volume traded in the decision's own session so far (the sum
+        of the intraday bars that have ENDED at the clock), for conditions that compare "today"
+        with a baseline of finished sessions. ``(False, None)`` on a daily clock, where the clock
+        bar IS the finished day. A live account has no such method (it reads the forming bar)."""
+        if not getattr(self._price, "is_intraday", False):
+            return False, None
+        return True, self._price.volume_so_far(symbol, self._price.now())
+
     def _as_of_date(self):
         """The simulated bar's calendar date (the provider's as-of clamp boundary)."""
         return self._price.now().date()
@@ -7463,6 +7625,116 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Record the SIMULATED fill bar (not wall-clock) so the trade history is deterministic.
         if order.id is not None:
             self._fill_dates[order.id] = as_of
+        # An ENTRY's protective levels were built before the fill; live re-bases them to the real
+        # fill the moment the entry is FILLED (TradeManager). Same function here (see below).
+        if order.depends_on_order is None and order.transaction_id is not None:
+            self._rebase_levels_at_entry_fill(order, fill_px)
+
+    #: MEASUREMENT HOOK ONLY (tools/measure_variant.py ``+norebase``; tests). Never set it in a
+    #: production path: the re-base is part of the simulation, like live's.
+    _MEASURE_NO_FILL_REBASE = False
+
+    def fill_rebase_record(self) -> Dict[str, Any]:
+        """The ``results["fill_rebase"]`` block: whether the re-base was on, and what it did."""
+        return {"enabled": not self._MEASURE_NO_FILL_REBASE,
+                **{k: int(v) for k, v in (self.__dict__.get("fill_rebase_counters")
+                                          or FILL_REBASE_COUNTER_KEYS).items()}}
+
+    def _rebase_levels_at_entry_fill(self, order, fill_px: float) -> None:
+        """Re-base the entry transaction's stop/target to the entry's REAL fill (equity only).
+
+        LIVE does this in ``TradeManager._check_all_waiting_trigger_orders`` when the parent entry
+        reaches FILLED; this calls the SAME pure function (``rebase_levels_at_fill``), with the
+        same inputs:
+
+          * reference = ``resolve_tpsl_reference_price`` of the entry (its limit price, else the
+            recommendation's ``price_at_date``, which in the backtest IS the decision price the
+            levels were built from -- on the intraday clock the close of the latest ended bar, on
+            the daily clock the decision day's close). The live-quote link of that chain is not
+            used: a missing reference skips the stop re-base LOUDLY (warning + counter), exactly
+            like live skips an order with no ``tpsl_reference_price``.
+          * fill = the entry's fill price (slippage included), the next bar's open.
+          * minimum take-profit % = ``resolve_min_take_profit_pct`` of the entry's recommendation.
+
+        Once per transaction, on the FIRST entry fill, and only for the levels that exist at that
+        moment (a level set after the fill was already built from the fill). The bracket test
+        (``_apply_bracket_exits``) reads the transaction, so the re-based levels are the ones tested
+        on every later bar. The pre-fill levels stay on ``transaction.meta_data["fill_rebase"]``.
+        """
+        if self._MEASURE_NO_FILL_REBASE:
+            return
+        from ba2_common.core.tpsl_fill_rebase import (
+            FillRebaseRefused, read_anchor, rebase_levels_at_fill, resolve_tpsl_reference_price,
+            stamp_anchor)
+        done = self.__dict__.setdefault("_fill_rebased_txn_ids", set())
+        txn_id = order.transaction_id
+        if txn_id in done:
+            return
+        txn = get_instance(Transaction, txn_id)
+        if txn is None or txn.side != order.side or txn.status != TransactionStatus.WAITING:
+            return  # a closer, a scale-in on an open position, or a transaction already live
+        done.add(txn_id)
+        tp, sl = txn.take_profit, txn.stop_loss
+        if not tp and not sl:
+            return
+        counters = self.__dict__.setdefault("fill_rebase_counters", dict(FILL_REBASE_COUNTER_KEYS))
+        counters["entries_with_levels"] += 1
+        counters["entries_with_stop"] += int(bool(sl))
+
+        def _rec_price():
+            rec_id = order.expert_recommendation_id
+            if not rec_id:
+                return None
+            from ba2_common.core.models import ExpertRecommendation
+            rec = get_instance(ExpertRecommendation, rec_id)
+            return rec.price_at_date if rec is not None else None
+
+        # The price the stop was COMPUTED FROM, stamped when it was set (TradeActions / the safeguard
+        # tail); the entry-order chain below is only the fallback for a stop that carries no stamp.
+        stamped = read_anchor(txn.meta_data, "stop")
+        ref = resolve_tpsl_reference_price(None, order.limit_price, _rec_price, lambda: None,
+                                           stamped_stop_anchor=stamped)
+        if sl and stamped is None:
+            counters["fallback_reference"] += 1
+        rebase_stop = bool(ref) and ref > 0
+        if sl and not rebase_stop:
+            counters["no_reference"] += 1
+            logger.warning(
+                "[backtest] stop of %s %s NOT re-based to the fill: no stamped anchor and the entry has "
+                "no reference price (no limit price, no recommendation price_at_date); the stop keeps "
+                "its pre-fill level", order.symbol, txn_id)
+        from ba2_common.core.TradeActions import resolve_min_take_profit_pct
+        try:
+            adj = rebase_levels_at_fill(
+                is_long=order.side == OrderDirection.BUY, fill_price=fill_px, reference_price=ref,
+                take_profit=tp, stop_loss=sl, rebase_stop=rebase_stop, apply_tp_floor=bool(tp),
+                min_take_profit_pct=(resolve_min_take_profit_pct(order.expert_recommendation_id)
+                                     if tp else None))
+        except FillRebaseRefused as e:
+            raise RuntimeError(
+                f"[backtest] cannot re-base the protective levels of {order.symbol} "
+                f"(transaction {txn_id}) to its fill: {e}") from e
+        record = {
+            "reference_price": ref, "fill_price": fill_px,
+            "stop_loss_pre_fill": sl, "take_profit_pre_fill": tp,
+            "stop_loss": adj.stop_loss, "take_profit": adj.take_profit,
+            "stop_rebased": adj.stop_rebased, "tp_floored": adj.tp_floored,
+        }
+        self.__dict__.setdefault("_fill_rebase_records", {})[txn_id] = record
+        if not adj.changed:
+            return      # nothing moved: no level rewritten, nothing persisted
+        counters["rebased"] += 1
+        counters["stop_rebased"] += int(adj.stop_rebased)
+        counters["tp_floored"] += int(adj.tp_floored)
+        meta = dict(txn.meta_data) if txn.meta_data else {}
+        meta["fill_rebase"] = record
+        if adj.stop_rebased:
+            # the stop is now measured from the fill: a second pass must see no gap to re-base
+            meta = stamp_anchor(meta, stop=fill_px)
+        txn.meta_data = meta
+        txn.stop_loss = adj.stop_loss
+        txn.take_profit = adj.take_profit
+        update_instance(txn)
 
     def _apply_option_fill(self, order, fill_px: float, as_of: datetime) -> None:
         """Apply a single-leg option fill to cash + option ledger and mark the order FILLED.

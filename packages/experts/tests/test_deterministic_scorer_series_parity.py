@@ -567,6 +567,10 @@ def _live_expert_and_providers(frame: pd.DataFrame, monkeypatch):
     e._gather_w_earnings = 0.0
     e._gather_index_symbol = "SPY"
     e._gather_use_model_target = False
+    # LIVE price = the account quote (``_decision_price`` -> ``_get_current_price``). These tests measure
+    # the indicator memo, not the price source, so the quote is the frame's own last close: the value the
+    # pre-seam code read from the frame, which keeps every assertion below meaning what it meant.
+    e._get_current_price = lambda symbol: float(frame["Close"].iloc[-1])
     return e, LiveProviderBundle(lambda cat, name, **kw: _FakeOhlcv() if cat == "ohlcv" else None)
 
 

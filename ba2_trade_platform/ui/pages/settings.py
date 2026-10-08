@@ -16,6 +16,7 @@ from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
 from ba2_common.core.option_selection_policy import WIRED_WEIGHT_BANDS
+from ba2_common.core.schedule_genes import schedule_refusal_message, schedule_weekday_for_display
 from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, uses_min_one_contract, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
 from ...core.cleanup import (
     preview_cleanup, execute_cleanup, get_cleanup_statistics,
@@ -854,6 +855,7 @@ class AppSettingsTab:
         'alpaca_api_key': 'alpaca_key_input', 'alpaca_api_secret': 'alpaca_secret_input',
         'worker_count': 'worker_count_input',
         'account_refresh_interval': 'account_refresh_interval_input',
+        'scheduled_session_guard_enabled': 'session_guard_input',
     }
 
     def _shown_value(self, key: str):
@@ -863,6 +865,16 @@ class AppSettingsTab:
         stored = getattr(self, '_stored', {})
         if has_stored_value(stored, key):
             raw = stored[key]
+            if meta['type'] == 'bool':
+                from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+                try:
+                    return coerce_bool(raw)
+                except ValueError:
+                    logger.error(f"App setting '{key}' holds an unreadable boolean {raw!r}")
+                    ui.notify(f"App setting '{key}' holds an unreadable boolean ({raw!r}); it is "
+                              f"shown at its declared default", type='negative', timeout=0,
+                              close_button=True)
+                    return meta['default']
             if meta['type'] == 'int':
                 try:
                     return int(raw)
@@ -1012,6 +1024,13 @@ class AppSettingsTab:
                 max=1440,  # Maximum 24 hours
                 step=1
             ).classes('w-full')
+            self.session_guard_input = ui.switch(
+                'Session guard: skip scheduled passes outside the regular market session',
+                value=self._shown_value('scheduled_session_guard_enabled'))
+            ui.label('ON (default): an entry / open-positions pass that fires on a holiday, a '
+                     'weekend, after an early close or outside 09:30-16:00 New York is skipped '
+                     'and logged. Turn OFF only if the guard misbehaves; takes effect on the next '
+                     'fire.').classes('text-xs text-gray-500')
         
         # A NO-EDIT SAVE IS A NO-OP: what every control shows is recorded, and a control
         # that still shows it is not written (stored value or declared default alike).
@@ -1051,6 +1070,8 @@ class AppSettingsTab:
                     if APP_SETTINGS_DEFINITIONS[key]['type'] == 'int':
                         to_write[key] = str(numeric_setting_for_save(
                             APP_SETTINGS_DEFINITIONS, key, raw, int))
+                    elif APP_SETTINGS_DEFINITIONS[key]['type'] == 'bool':
+                        to_write[key] = 'true' if raw else 'false'
                     else:
                         to_write[key] = '' if raw is None else raw
             except NumericSettingNotSavable as e:
@@ -2772,6 +2793,13 @@ class ExpertSettingsTab:
         ).props('no-caps').classes('mb-2')
         setattr(self, f'{kind}_frequency', freq)
 
+        # Refusal banner: shown by ``_show_schedule_refusal`` when the STORED schedule is one the live
+        # scheduler refuses (an unknown day key). Built here, synchronously, from Quasar's own classes
+        # (no page CSS to lose to an await); hidden until a loader finds a refused schedule.
+        refusal_label = ui.label('').classes('text-negative text-weight-bold mb-2 w-full')
+        refusal_label.set_visibility(False)
+        setattr(self, f'{kind}_schedule_refusal_label', refusal_label)
+
         # Weekly: day checkboxes (unchanged behaviour/output)
         weekly_container = ui.column().classes('w-full')
         setattr(self, f'{kind}_weekly_container', weekly_container)
@@ -2805,6 +2833,19 @@ class ExpertSettingsTab:
         setattr(self, f'{kind}_weekday_select', weekday_select)
 
         self._apply_schedule_frequency_visibility(kind)
+
+    def _show_schedule_refusal(self, kind: str, schedule_config):
+        """Show (or hide) the "schedule refused" banner for the stored schedule of ``kind``. The
+        checkboxes below render the typo'd day at its default and the next Save would silently rewrite
+        the seven clean keys, so the operator must be told the LIVE scheduler is not running this
+        setting. Same sentence the scheduler logs (``schedule_refusal_message``)."""
+        label = getattr(self, f'{kind}_schedule_refusal_label', None)
+        if label is None:
+            return
+        refusal = schedule_refusal_message(schedule_config)
+        if refusal:
+            label.set_text(f"{refusal}. No job runs for this setting until it is saved with valid days.")
+        label.set_visibility(bool(refusal))
 
     def _apply_schedule_frequency_visibility(self, kind: str):
         """Show the weekly day checkboxes or the monthly Nth-weekday controls."""
@@ -2841,8 +2882,9 @@ class ExpertSettingsTab:
         hint = getattr(self, f'{kind}_local_hint', None)
         if toggle is None or hint is None:
             return
+        warnings = self._session_time_warnings(kind, toggle.value == 'Market time (NYSE)')
         if toggle.value != 'Market time (NYSE)':
-            hint.text = ''
+            hint.text = ' | '.join(warnings)
             return
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -2854,7 +2896,22 @@ class ExpertSettingsTab:
             hours, minutes = map(int, time_str.split(':'))
             ny_dt = datetime.now(ny).replace(hour=hours, minute=minutes, second=0, microsecond=0)
             parts.append(f"{time_str} NYSE -> {ny_dt.astimezone(local_tz).strftime('%H:%M')} local")
-        hint.text = ('This machine\'s local time: ' + ', '.join(parts)) if parts else ''
+        hint.text = ' | '.join(([('This machine\'s local time: ' + ', '.join(parts))] if parts else [])
+                               + warnings)
+
+    def _session_time_warnings(self, kind: str, market_basis: bool) -> list:
+        """The live session guard's consequences for the times being edited: a pass outside the
+        regular session is SKIPPED by JobManager, and one too close to the close cannot finish.
+        A warning only (``schedule_genes.schedule_time_warnings``)."""
+        from datetime import datetime
+        from ba2_common.core.schedule_genes import schedule_time_warnings
+        try:
+            times = self._collect_execution_times(getattr(self, f'{kind}_execution_times', []))
+            return schedule_time_warnings(times, 'market' if market_basis else 'local',
+                                          datetime.now().astimezone().tzinfo)
+        except Exception as e:  # noqa: BLE001 -- a hint must never break the form
+            logger.warning(f"could not compute schedule time warnings: {e}")
+            return []
 
     def _update_open_positions_schedule_visibility(self):
         """Hide the open-positions schedule editor for experts that handle exits
@@ -2970,9 +3027,9 @@ class ExpertSettingsTab:
         # Load days
         days = schedule_config.get('days', {})
         for day, checkbox in self.schedule_days.items():
-            # Default weekdays to True, weekends to False if not specified
-            default_value = day not in ['saturday', 'sunday']
-            checkbox.value = days.get(day, default_value)
+            # An absent day: weekdays True, weekends False -- the ONE shared rule the live scheduler
+            # and the backtest read too (schedule_genes.schedule_weekday_enabled).
+            checkbox.value = schedule_weekday_for_display(days, day)
         
         # Load times
         times = schedule_config.get('times', ['09:30'])
@@ -3204,6 +3261,7 @@ class ExpertSettingsTab:
                                     int(hours), int(minutes)
                                     if 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59:
                                         time_input.props('error=false')
+                                        self._refresh_time_basis_hint('enter_market')
                                         return
                             time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
                         except ValueError:
@@ -3256,6 +3314,7 @@ class ExpertSettingsTab:
                                     int(hours), int(minutes)
                                     if 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59:
                                         time_input.props('error=false')
+                                        self._refresh_time_basis_hint('open_positions')
                                         return
                             time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
                         except ValueError:
@@ -3312,12 +3371,12 @@ class ExpertSettingsTab:
             days = schedule_config.get('days', {})
             if hasattr(self, 'enter_market_schedule_days'):
                 for day, checkbox in self.enter_market_schedule_days.items():
-                    default_value = day not in ['saturday', 'sunday']
-                    new_value = days.get(day, default_value)
+                    new_value = schedule_weekday_for_display(days, day)
                     checkbox.value = new_value
                     logger.debug(f'Set enter market day {day} to {new_value}')
 
         self._apply_schedule_frequency_visibility('enter_market')
+        self._show_schedule_refusal('enter_market', schedule_config)
 
         # Load time basis (defaults to 'local' -- absence means legacy/unset config)
         if hasattr(self, 'enter_market_time_basis'):
@@ -3376,12 +3435,12 @@ class ExpertSettingsTab:
             days = schedule_config.get('days', {})
             if hasattr(self, 'open_positions_schedule_days'):
                 for day, checkbox in self.open_positions_schedule_days.items():
-                    default_value = day not in ['saturday', 'sunday']
-                    new_value = days.get(day, default_value)
+                    new_value = schedule_weekday_for_display(days, day)
                     checkbox.value = new_value
                     logger.debug(f'Set open positions day {day} to {new_value}')
 
         self._apply_schedule_frequency_visibility('open_positions')
+        self._show_schedule_refusal('open_positions', schedule_config)
 
         # Load time basis (defaults to 'local' -- absence means legacy/unset config)
         if hasattr(self, 'open_positions_time_basis'):

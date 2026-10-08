@@ -66,8 +66,10 @@ def _genome_days(sp):
     closed market: behaviour no backtest ever scored. Three of the six deployed genomes carry
     one (7 and 10 saturday, 11 sunday).
     """
+    from ba2_common.core.schedule_genes import SCHEDULE_TIME_GENE
+    # ``schedule:time`` is the decision-TIME gene, not a weekday: it must never be read as a day.
     by_day = {k[len("schedule:"):]: bool(v) for k, v in sp.items()
-              if isinstance(k, str) and k.startswith("schedule:")}
+              if isinstance(k, str) and k.startswith("schedule:") and k != SCHEDULE_TIME_GENE}
     if not by_day:
         return None
     days = {d: (by_day.get(d, False) and d in DAYS[:5]) for d in DAYS}
@@ -138,15 +140,23 @@ def repair_schedules(ns, test) -> int:
         # Compare ALL SEVEN days, not just the trading ones: a stored saturday=True is
         # invisible to _trading() but arms a real Saturday cron, so a weekday-only comparison
         # would report "already ok" and leave the weekend bit in place.
-        if all(bool(cur_days.get(d)) == want_days[d] for d in DAYS):
+        from ba2_common.core.schedule_genes import schedule_time_from_genes
+        gene_time = schedule_time_from_genes(sp)     # the time the genome CHOSE, when it has one
+        if (all(bool(cur_days.get(d)) == want_days[d] for d in DAYS)
+                and (gene_time is None or cur.get("times") == [gene_time])):
             print(f"  inst {inst_id}: already {_trading(want_days)} -- ok")
             continue
         weekend_dropped = [d for d in DAYS[5:] if cur_days.get(d)]
 
         # Keep the instance's own time-of-day and basis: only the DAY selection was optimized
         # (matching _build_daily_trial_config, which keeps the run-level ``times``).
+        if not cur.get("times") and gene_time is None:
+            # No guessed time: the instance's own time is what this repair preserves.
+            print(f"  !! inst {inst_id}: stored schedule has no decision time -- left alone "
+                  f"(set one by hand, then re-run)")
+            continue
         new = {"days": want_days,
-               "times": cur.get("times") or ["09:30"],
+               "times": [gene_time] if gene_time is not None else cur["times"],
                "time_basis": cur.get("time_basis") or "market"}
         note = f"   (dropping inert weekend gene: {weekend_dropped})" if weekend_dropped else ""
         print(f"  inst {inst_id} (bt {bt_id}): {_trading(cur_days)} -> "

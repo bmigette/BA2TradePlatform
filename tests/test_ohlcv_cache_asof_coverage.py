@@ -150,7 +150,7 @@ def _fmp_like(first_bar, last_bar, freq="D"):
 
 
 @pytest.fixture
-def cache_dir(tmp_path, monkeypatch):
+def cache_dir(tmp_path, monkeypatch, request):
     """Redirect the parquet cache root AND freeze the clock.
 
     The real ~/Documents/.../cache holds 9.8 GB the user depends on -- nothing here
@@ -164,6 +164,14 @@ def cache_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(native_cache, "CACHE_FOLDER", str(d))
     monkeypatch.setattr(native_cache, "_CACHE_ROOT", str(d / "datasets" / "cache"))
     monkeypatch.setattr(mdp_mod, "datetime", _FrozenDatetime)
+    # These tests pin the file-mtime freshness gate. The live in-session rule (a LATEST daily read while a
+    # session is open fetches today's forming bar whatever the mtime says, pinned in
+    # packages/providers/tests/test_ohlcv_no_unfinished_bars.py) depends on the wall clock, so it is switched
+    # off here to keep them deterministic at any hour.
+    from ba2_common.core import ohlcv_final_bars
+    ohlcv_final_bars.set_live_overlay_enabled(False)
+    mdp_mod.MarketDataProviderInterface._UNFINISHED_MEMO.clear()
+    request.addfinalizer(lambda: ohlcv_final_bars.set_live_overlay_enabled(False))
     return str(d)
 
 

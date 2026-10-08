@@ -484,7 +484,7 @@ _DS_TARGETS = [{"publishedDate": "2026-06-10", "priceTarget": 120.0},
                {"publishedDate": "2026-06-04", "priceTarget": 116.0}]
 
 
-def _deterministic_scorer_case(bars=400):
+def _deterministic_scorer_case(bars=400, quote=True):
     """DeterministicScorer over the REAL data module: no ``data.*`` stubs.
 
     Every fake here sits BELOW a tapped boundary -- the OHLCV tap, the
@@ -545,6 +545,10 @@ def _deterministic_scorer_case(bars=400):
     expert._gather_index_symbol = "SPY"
     expert._gather_use_model_target = False
     expert._get_fmp_api_key = lambda: "TEST-API-KEY"
+    # The live decision price is the ACCOUNT QUOTE (``_decision_price``), like every other expert here;
+    # the quote is the frame's last close, the value the pre-seam code took from the frame. It lands in
+    # the recorded bundle as ``current_price``. ``quote=None`` is the broker-outage case (a ``no_price`` skip).
+    expert._get_current_price = (lambda symbol: float(frame["Close"].iloc[-1])) if quote else (lambda symbol: None)
     settings = {
         "w_technical": 1.0, "w_fundamental": 0.0, "w_analyst": 0.5, "w_macro": 0.0,
         "w_earnings": 0.0, "macro_mode": "off", "min_history_days": 260,
@@ -927,6 +931,60 @@ def test_two_analyses_share_the_macro_memo_and_both_record_their_reads(tmp_path)
         "entered the bundle with no observation behind them")
 
 
+def test_two_analyses_share_the_ohlcv_memos_and_both_record_their_reads(tmp_path):
+    """Capture ON: ONE provider read per frame across two analyses, and BOTH record it.
+
+    The same rule as the macro memo, for the frames: the stock's frame and the index's are fetched once
+    per process and session day and served from memory afterwards. The analysis served from memory still
+    read them (and the clock, for the window), so the recording must say so under the request identity the
+    tap writes -- otherwise a replay of its gather asks the tape for a read nobody recorded. Capture must
+    not add a provider read, and capture OFF must record (and read the clock) nothing.
+    """
+    from ba2_common.core.replay import capture_scope
+    from ba2_experts.DeterministicScorer import data
+
+    def run(root):
+        counters = {"ohlcv": 0}
+        provider = _TapedOHLCV(_ds_frame(), counters)
+        providers = LiveProviderBundle(_resolver({"ohlcv": provider}))
+        reads = {}
+        data.reset_caches()
+        try:
+            for analysis_id in ("A1", "A2"):
+                if root is None:
+                    data.fetch_ohlcv(providers, "AAPL", None)
+                    data.fetch_index_closes(providers, None, "SPY")
+                    continue
+                with root.scope(analysis_id) as context:
+                    context.set_phase(ReplayStatus.PHASE_GATHER)
+                    context.set_skip("test scope")
+                    data.fetch_ohlcv(providers, "AAPL", None)
+                    data.fetch_index_closes(providers, None, "SPY")
+                    reads[analysis_id] = sorted(
+                        p.observation.request_identity["symbol"] for p in context.observations
+                        if p.observation.method == "get_ohlcv_data")
+        finally:
+            data.reset_caches()
+        return counters["ohlcv"], reads
+
+    class _Scopes:
+        def __init__(self, store):
+            self.store = store
+
+        def scope(self, analysis_id):
+            return capture_scope(self.store, _macro_meta(analysis_id))
+
+    fetched_off, _none = run(None)
+    with capture_to(tmp_path / "ohlcv") as store:
+        fetched_on, reads = run(_Scopes(store))
+
+    assert fetched_on == fetched_off == 2, "capture changed the number of provider reads (2: AAPL, SPY)"
+    assert reads["A1"] == ["AAPL", "SPY"]
+    assert reads["A2"] == ["AAPL", "SPY"], (
+        "the analysis served from the process memos recorded no OHLCV read, so its bundle holds frames "
+        "with no observation behind them")
+
+
 # --------------------------------------------------------------------------- #
 # 3. Skip and error paths
 # --------------------------------------------------------------------------- #
@@ -967,7 +1025,7 @@ def test_fmp_rating_skip_is_recorded_with_its_reason(tmp_path):
 
 
 def test_deterministic_scorer_skip_is_recorded_with_its_reason(tmp_path):
-    """Too little OHLCV history -> _process skips; the record says so."""
+    """Too little OHLCV history (with a price) -> _process skips; the record says so."""
     case = lambda: _deterministic_scorer_case(bars=10)  # noqa: E731
     off = _run(case)
     on = _run(case, capture_root=tmp_path / "dsskip")
@@ -979,6 +1037,31 @@ def test_deterministic_scorer_skip_is_recorded_with_its_reason(tmp_path):
     skipped = _decode_object(tmp_path / "dsskip", record.recommendation_object)
     assert skipped.skip is True and skipped.details.startswith("Insufficient OHLCV history")
     assert on["market_analysis"].status == MarketAnalysisStatus.SKIPPED
+
+
+def test_deterministic_scorer_no_price_skip_is_recorded_with_its_reason(tmp_path):
+    """The broker gave no quote -> the analysis is a ``no_price`` skip (NOT thin history), recorded as such,
+    and the recorded bundle carries ``current_price=None`` so a replay reproduces the same skip."""
+    case = lambda: _deterministic_scorer_case(quote=False)  # noqa: E731
+    off = _run(case)
+    on = _run(case, capture_root=tmp_path / "dsnoprice")
+    _assert_identical(off, on)
+
+    record = on["records"][0]
+    assert record.outcome == ReplayStatus.OUTCOME_SKIP
+    assert record.skip_reason == "no_price"
+    skipped = _decode_object(tmp_path / "dsnoprice", record.recommendation_object)
+    assert skipped.skip is True and skipped.current_price is None
+    assert _decode_object(tmp_path / "dsnoprice", record.bundle_object)["current_price"] is None
+
+
+def test_deterministic_scorer_records_the_decision_price_it_used(tmp_path):
+    """New recordings hold the quote the decision used, in the bundle, so they replay exactly."""
+    on = _run(lambda: _deterministic_scorer_case(), capture_root=tmp_path / "dsprice")
+    record = on["records"][0]
+    bundle = _decode_object(tmp_path / "dsprice", record.bundle_object)
+    frame_close = float(bundle["ohlcv"]["Close"].iloc[-1])
+    assert bundle["current_price"] == frame_close
 
 
 def test_an_error_inside_process_is_recorded_and_still_propagates(tmp_path):

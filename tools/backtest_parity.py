@@ -767,7 +767,8 @@ def run_child(mode: str, opt_id: int, rank: Any, name: str) -> int:
         hoisted = _build_hoisted_state(bt_block) if bt_block.get("screener_opt") else None
         decoded = decode_params(strat, src["genome"])
         cfg = _build_daily_trial_config(bt_block, decoded, hoisted,
-                                        option_trade_records=True)  # persisted
+                                        option_trade_records=True,
+                                        stored_row=True)  # persisted
         cfg["name"] = name
         cfg["persist_trading_db"] = True          # keyed by backtest_id, so the two never collide
         cfg["ga_fitness"] = src["ga_fitness"]

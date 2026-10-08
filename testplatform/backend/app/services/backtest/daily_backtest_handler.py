@@ -608,6 +608,10 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         # Screener (universe.mode=='screener'): per-bar metric_store entry gate (point-in-time,
         # cached) — same mechanism the optimizer uses. None for static runs (engine gate no-op).
         "screener_runtime": _build_screener_runtime(payload),
+        # The universe above is the union of THIS run's own screen over the visible scans, so the gate
+        # can never select outside it: the guard REFUSES if it ever does (None for static runs).
+        "screener_universe_guard": ("refuse" if (payload.get("universe") or {}).get("mode") == "screener"
+                                    else None),
         # A standalone (API/CLI) backtest is PERSISTED: its option trade rows carry the option
         # trade record (see results.require_option_trade_records).
         "option_trade_records": True,
@@ -646,8 +650,12 @@ def _resolve_enabled_instruments(
         # still restricts entries each bar; this only bounds what OHLCV gets loaded.
         df = ms.load_store(store)
         settings = _metric_store_settings(universe.get("screener_settings") or {})
-        instruments = ms.screened_symbol_union(
-            df, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), settings
+        # The scans the per-decision gate can resolve to (visible_scan_window), not "last scan <= start":
+        # on an intraday clock the first decision of start_day reads the scan dated BEFORE it.
+        from ba2_providers.screener.universe_superset import interval_is_intraday
+        instruments = ms.screened_symbol_union_visible(
+            df, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), settings,
+            intraday=interval_is_intraday(payload.get("execution_interval", "1d")),
         )
         if not instruments:
             raise ValueError(
@@ -957,6 +965,10 @@ def run_daily_backtest(
         )
 
         ps = AsOfPriceSource(ohlcv_provider=ohlcv, interval=interval)
+        # The ONE knowability rule for daily data lives on the price source (the clock owner);
+        # binding makes every DAILY read through the memoized provider obey it on an intraday
+        # clock (no-op on a daily clock). See AsOfPriceSource.knowable_daily_end.
+        ohlcv.bind_price_source(ps)
         ps.preload(
             config["enabled_instruments"],
             config["start_date"],
@@ -1030,10 +1042,35 @@ def run_daily_backtest(
                     raw_ohlcv, config["start_date"], config["end_date"]),
                 market_condition_record=market_condition_record,
             )
-            engine.run()
+            # EVENT-data half of the knowability rule: on an intraday clock the readers admit an
+            # item only from the instant it was public (ba2_common.core.knowability); the flag is
+            # thread-local and lives exactly as long as this run.
+            from ba2_common.core.knowability import intraday_decisions
+            with intraday_decisions(ps.is_intraday, scan_cutoff=ps.scan_cutoff_date):
+                engine.run()
+            # NO SILENT FAILURE at the result level: an expert whose analysis passes mostly raised
+            # (and were skipped per symbol / per bar) traded nothing for a reason that is not the
+            # strategy. Refuse the run (no result, no fitness; a GA trial reports "trial failed").
+            engine.refuse_if_analysis_failing()
+            # Same discipline for the fill-time stop/target re-base: one summary line, and a refusal
+            # when too many stops had no anchor to re-base from.
+            fill_rebase = engine.refuse_if_rebase_unanchored()
+            # ...and at the universe level: a gate selection outside the loaded static universe is a pick
+            # the run could never trade (the screener-universe bug). Refused (job-fatal) under the
+            # superset rule; a legacy frozen list only warns.
+            engine.refuse_if_screener_universe_outside()
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).
             results = build_results(account, config)
+            if ps.is_intraday:
+                # What the intraday-clock rule dropped, so a REDUCED universe / lost decision is
+                # visible in the persisted result (intraday runs only; absent on a daily clock).
+                results["intraday_clock"] = {
+                    **engine.intraday_counters,
+                    **account.intraday_counters,
+                    "sessions_without_decision_bar": dict(
+                        getattr(engine, "sessions_without_decision_bar", {})),
+                }
             # How option fills were priced (plan Part F). Options runs only, so an equity
             # run's results are exactly what they were.
             apply_option_spread_record(results, account)
@@ -1052,12 +1089,38 @@ def run_daily_backtest(
             # ITS cadence, not the platform default. Done here because run_daily_backtest is the
             # single chokepoint every path goes through (trial worker, master top-N persist,
             # parallel=1), so both compute_fitness call sites get it without touching either.
+            results["analysis_failures"] = engine.analysis_failures_record()
+            # Whether the entry's stop/target were re-based to the real fill (as live does) and what
+            # that did; ``fill_rebase_enabled`` is False only under the measurement hook.
+            results["fill_rebase_enabled"] = bool(fill_rebase["enabled"])
+            results["fill_rebase"] = fill_rebase
+            _su_rec = engine.screener_universe_record()
+            if _su_rec is not None:
+                results["screener_universe"] = _su_rec
             results.update(_car_trade_thresholds_for_experts(config))
+            _record = _decision_time_record(engine, config)
+            if _record is not None:
+                results["decision_time"] = _record
             return results
         finally:
             # Drop the per-run OHLCV override so it never leaks into a later (non-backtest) call.
             set_backtest_ohlcv_override(None)
             clear_backtest_market_conditions()
+
+
+def _decision_time_record(engine, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ``decision_time`` section of a persisted result: the time(s) each pass ran at and how
+    many scheduled (session, time) pairs had NO bar (a 15:30 schedule on a 13:00 half day), so a
+    stored row shows the decisions it never made. None on a daily clock or without schedule times
+    (every run before the decision-time gene keeps the result shape it had)."""
+    if config.get("execution_interval", "1d") == "1d":
+        return None
+    entry = (config.get("run_schedule_override") or {}).get("times")
+    manage = (config.get("manage_schedule_override") or {}).get("times")
+    if not entry and not manage:
+        return None
+    return {"entry_times": list(entry or []), "manage_times": list(manage or []),
+            "sessions_without_decision_bar": dict(engine.sessions_without_decision_bar)}
 
 
 def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float]:

@@ -860,6 +860,14 @@ class TradeActionEvaluator:
                                     sl_to_send = None if sl_kept else sl_price
                                     logger.info(f"Phase 2 (merged) - Adjusting order {order.id}: TP=${tp_price:.2f}, SL=${sl_price:.2f}"
                                                 + (f" (kept: {sl_reason}; ruleset asked ${requested_sl:.2f})" if sl_kept else ""))
+                                    # Stamp where each level was computed from BEFORE the account
+                                    # builds anything from them (a kept stop keeps its anchor).
+                                    from ba2_common.core.trade_cycle import record_level_anchor
+                                    _anchors = {"tp": last_tp_action.last_anchor_price}
+                                    if sl_to_send is not None:
+                                        _anchors["stop"] = last_sl_action.last_anchor_price
+                                    record_level_anchor(transaction.id, **_anchors)
+                                    transaction = get_instance(Transaction, transaction.id) or transaction
                                     success = self.account.adjust_tp_sl(transaction, tp_price, sl_to_send, source="ruleset")
                                     if sl_kept:
                                         desc = (f"Adjusted TP=${tp_price:.2f} for {self.instrument_name}; "

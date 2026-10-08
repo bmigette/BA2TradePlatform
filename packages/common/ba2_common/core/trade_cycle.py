@@ -114,6 +114,80 @@ def _max_loss_meta(transaction: Transaction, safeguard_sl: Optional[float]):
     return new_meta, stop
 
 
+def record_level_anchor(transaction_id: Optional[int], **levels) -> bool:
+    """Stamp the price a protective level was COMPUTED FROM on ``Transaction.meta_data``.
+
+    ``levels``: ``stop=<price>`` and/or ``tp=<price>``; a value of None CLEARS that level's anchor
+    (the level now comes from a price of unknown origin, so an older stamp would mislead). Called
+    by whoever sets the level, BEFORE the level reaches the account, so the exit order built from
+    it (live) and the fill-time re-base (live and backtest) read the true anchor
+    (``tpsl_fill_rebase.read_anchor``). A single-column write, same discipline as
+    ``record_max_loss_stop``; never raises (a lost stamp falls back to the legacy reference chain
+    and is logged at ERROR). Returns True when written."""
+    if transaction_id is None or not levels:
+        return False
+    try:
+        from ba2_common.core import trade_store
+        from ba2_common.core.db import _db_write_lock, get_db, get_instance, update_instance
+        from ba2_common.core.tpsl_fill_rebase import ANCHOR_KEY, stamp_anchor
+
+        def _new_meta(txn):
+            new = stamp_anchor(txn.meta_data, **levels)
+            return None if new.get(ANCHOR_KEY) == (txn.meta_data or {}).get(ANCHOR_KEY) else new
+
+        if trade_store.inmem_trades_active():
+            txn = get_instance(Transaction, transaction_id)
+            new_meta = _new_meta(txn)
+            if new_meta is None:
+                return False
+            txn.meta_data = new_meta
+            update_instance(txn)
+            return True
+        with _db_write_lock:
+            with get_db() as session:
+                db_txn = session.get(Transaction, transaction_id)
+                if db_txn is None:
+                    logger.warning(f"Transaction {transaction_id} not found: no level anchor stamped")
+                    return False
+                new_meta = _new_meta(db_txn)
+                if new_meta is None:
+                    return False
+                db_txn.meta_data = new_meta
+                session.commit()
+                return True
+    except Exception as e:  # noqa: BLE001 -- metadata; see the docstring
+        if is_never_absorbed(e):
+            raise
+        logger.error(f"Could not stamp the level anchor {levels} on transaction {transaction_id}: {e}",
+                     exc_info=True)
+        return False
+
+
+def stamp_safeguard_anchor(order: Optional[TradingOrder], ruleset_sl: Optional[float],
+                           safeguard_sl: Optional[float], submit_sl: Optional[float],
+                           anchor_price: Any) -> bool:
+    """Stamp the stop anchor when the stop about to be attached is the RM SAFEGUARD.
+
+    ``submit_sl`` is what ``reconcile_protective_stop`` returned. When it is the safeguard (not the
+    ruleset's own stop, whose anchor its action already stamped), that stop was computed from the
+    price the RM sized on: ``anchor_price`` (a callable returning the then-current price, or the
+    price). Called BEFORE ``submit_order``. No transaction yet (a ruleset without TP/SL creates it
+    inside the submit) -> nothing to stamp; the reference chain then resolves to the recommendation
+    price, which is that same decision price."""
+    if order is None or getattr(order, "transaction_id", None) is None:
+        return False
+    if not submit_sl or not safeguard_sl or submit_sl != safeguard_sl:
+        return False
+    if ruleset_sl and ruleset_sl == submit_sl:
+        return False
+    px = anchor_price() if callable(anchor_price) else anchor_price
+    if not px:
+        logger.warning(f"No current price to stamp as the safeguard-stop anchor of order "
+                       f"{getattr(order, 'id', None)}; the fill-time re-base will use the fallback chain")
+        return False
+    return record_level_anchor(order.transaction_id, stop=float(px))
+
+
 def record_max_loss_stop(order: Optional[TradingOrder], safeguard_sl: Optional[float]) -> Optional[float]:
     """Record the stop an equity entry was SIZED on as ``Transaction.meta_data["max_loss_stop"]``.
 

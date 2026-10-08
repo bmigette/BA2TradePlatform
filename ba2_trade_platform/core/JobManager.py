@@ -17,12 +17,14 @@ from dataclasses import dataclass
 from enum import Enum
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.job import Job
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import select
+from sqlmodel import Session, select
 
+from ba2_common.core.schedule_genes import describe_schedule, schedule_refusal_message, schedule_weekday_enabled
 from ba2_common.core.utils import normalize_symbol
 from ..core.utils import get_expert_instance_from_id
 from ..logger import logger
@@ -66,6 +68,9 @@ _WEEKDAY_ABBR = {
 # Absence of the key (legacy configs) means "local" -- the historical, unqualified behaviour.
 _MARKET_TZ = ZoneInfo("America/New_York")
 
+#: The operator kill switch of the live session guard (declared in ``core.app_settings``).
+SESSION_GUARD_SETTING = "scheduled_session_guard_enabled"
+
 
 def build_monthly_cron(ordinal: int, weekday: str, hour: int, minute: int,
                         market_time: bool = False) -> CronTrigger:
@@ -85,6 +90,29 @@ def build_monthly_cron(ordinal: int, weekday: str, hour: int, minute: int,
         raise ValueError(f"invalid weekday {weekday!r}")
     return CronTrigger(day=f"{_ORDINALS[ordinal]} {wd}", hour=hour, minute=minute,
                         timezone=_MARKET_TZ if market_time else None)
+
+
+def parse_schedule_times(times: List[str]) -> List[tuple]:
+    """``[(hour, minute), ...]``: EVERY configured ``HH:MM``, de-duplicated and in clock order.
+
+    The schedule dict's ``times`` list may hold several entries (the settings UI accepts them and the
+    backtest honours them all); the parser used to schedule only the first. Raises ``ValueError`` on
+    an entry that is not ``HH:MM`` -- the caller turns that into "no job" with an ERROR, exactly as an
+    unparseable first time did."""
+    parsed = set()
+    for raw in times:
+        hour, minute = map(int, str(raw).split(':'))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(f"time {raw!r} is not a valid HH:MM")
+        parsed.add((hour, minute))
+    return sorted(parsed)
+
+
+def _one_or_all(triggers: list):
+    """The single trigger itself (identical to the single-time behaviour), or an ``OrTrigger``
+    that fires at each of them. ONE scheduler job either way, so the job id, its removal and the
+    refresh path are unchanged and cannot collide."""
+    return triggers[0] if len(triggers) == 1 else OrTrigger(triggers)
 
 
 def assemble_monthly_schedule(ordinal: int, weekday: str, times: List[str],
@@ -254,6 +282,10 @@ class JobManager:
 
         # Watch it for the rest of the process lifetime: losing this job is silent.
         self._start_account_refresh_watchdog()
+
+        # State of the session-guard kill switch, announced like the other armed/inert features.
+        self._session_guard_enabled(announce=True)
+        self._prewarm_session_calendar()
 
         # Announce which iv_rank-gated rules are still inert and which are armed.
         import threading as _th
@@ -725,8 +757,8 @@ class JobManager:
         """Schedule the daily ATM-IV sampler that feeds ``IVRankCondition``.
 
         A dedicated job rather than a hook inside ``refresh_accounts`` (5-minute
-        interval) or inside rule evaluation (per expert-symbol-subtype, and only daily
-        by accident of ``_parse_schedule`` using ``times[0]``). ``get_iv_rank`` reads an
+        interval) or inside rule evaluation (per expert-symbol-subtype: a rule pass fires at
+        every configured schedule time, so it is not once-a-day). ``get_iv_rank`` reads an
         unweighted 252-day window, so anything faster than daily silently reweights the
         percentile toward the last few days. The recorder is idempotent per UTC day, so
         a coalesced or manually re-run job is harmless.
@@ -1006,7 +1038,11 @@ class JobManager:
             
             # Schedule jobs for enter_market (depends on instrument selection method)
             enter_market_schedule = self._get_expert_setting(expert_instance.id, "execution_schedule_enter_market")
+            if enter_market_schedule and not self._schedule_is_runnable(
+                    expert_instance, "execution_schedule_enter_market", enter_market_schedule):
+                enter_market_schedule = None        # refused ONCE for the setting, not once per symbol
             if enter_market_schedule:
+                self._log_parsed_schedule(expert_instance, "enter_market", enter_market_schedule)
                 logger.debug(f"Found execution_schedule_enter_market for expert {expert_instance.id}: {enter_market_schedule}")
                 
                 # Get enabled instruments for this expert
@@ -1029,7 +1065,11 @@ class JobManager:
             expert_properties = expert_class.get_expert_properties() if expert_class else {}
             if should_schedule_open_positions(expert_properties):
                 open_positions_schedule = self._get_expert_setting(expert_instance.id, "execution_schedule_open_positions")
+                if open_positions_schedule and not self._schedule_is_runnable(
+                        expert_instance, "execution_schedule_open_positions", open_positions_schedule):
+                    open_positions_schedule = None
                 if open_positions_schedule:
+                    self._log_parsed_schedule(expert_instance, "open_positions", open_positions_schedule)
                     logger.debug(f"Found execution_schedule_open_positions for expert {expert_instance.id}: {open_positions_schedule}")
 
                     # For OPEN_POSITIONS, use special "OPEN_POSITIONS" symbol instead of enabled_instruments
@@ -1047,6 +1087,41 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error scheduling jobs for expert instance {expert_instance.id}: {e}", exc_info=True)
             
+    @staticmethod
+    def _log_parsed_schedule(expert_instance, setting_name: str, schedule_setting: Any) -> None:
+        """ONE line per expert + setting, at start and on every reschedule: the weekdays that will fire
+        (after the absent-key rule) and the parsed times, e.g.
+        ``schedule inst 7 enter_market: Mon @ 09:30 market``. A stored ``days`` dict that lacks any of
+        the seven keys logs at WARNING with the days it implies by default, so an operator can see that
+        a partial dict now means Mon-Fri. Logging only: no behaviour change."""
+        try:
+            info = describe_schedule(schedule_setting)
+        except Exception as e:  # noqa: BLE001 -- a description must never stop a job from being scheduled
+            logger.warning(f"schedule inst {expert_instance.id} {setting_name}: cannot be described ({e})")
+            return
+        if info is None:
+            logger.info(f"schedule inst {expert_instance.id} {setting_name}: {schedule_setting!r}")
+            return
+        line = (f"schedule inst {expert_instance.id} {setting_name}: {','.join(info['days']) or 'NO DAY'} "
+                f"@ {', '.join(info['times']) or 'NO TIME'} {info['basis']}")
+        if info["implied"]:
+            logger.warning(f"{line} (implied by default: {','.join(info['implied'])})")
+        else:
+            logger.info(line)
+
+    @staticmethod
+    def _schedule_is_runnable(expert_instance, setting_name: str, schedule_setting: Any) -> bool:
+        """False, with exactly ONE ERROR naming the instance, the setting and the unknown key(s), when
+        the stored schedule cannot be run as written. Called once per expert and setting BEFORE the
+        per-symbol job loop, so a single typo is one ERROR rather than one per symbol (and no job is
+        created for it, so there is no per-symbol "invalid schedule" warning either)."""
+        refusal = schedule_refusal_message(schedule_setting)
+        if not refusal:
+            return True
+        logger.error(f"{refusal} (expert instance {expert_instance.id}, setting {setting_name}); "
+                     f"NO job is scheduled for this setting until it is corrected")
+        return False
+
     def trigger_live_expert(self, expert_instance_id: int) -> str:
         """
         Trigger the daily pipeline of a running live expert immediately.
@@ -1189,9 +1264,14 @@ class JobManager:
             logger.debug(f"Creating scheduled job: {job_id} with schedule: {schedule_setting}")
             
             # Parse schedule setting (e.g., "daily_9:30", "hourly", "cron:0 9 * * 1-5")
-            trigger = self._parse_schedule(schedule_setting)
+            setting_name = {AnalysisUseCase.ENTER_MARKET: "execution_schedule_enter_market",
+                            AnalysisUseCase.OPEN_POSITIONS: "execution_schedule_open_positions",
+                            }.get(subtype, f"schedule for {subtype}")
+            trigger = self._parse_schedule(
+                schedule_setting, context=f"expert instance {expert_instance.id}, setting {setting_name}")
             if not trigger:
-                logger.warning(f"Invalid schedule setting '{schedule_setting}' for expert {expert_instance.id}")
+                logger.warning(f"No job created for {job_id}: the {setting_name} of expert "
+                               f"{expert_instance.id} did not parse (see the preceding error)")
                 return
                 
             logger.debug(f"Parsed trigger for {job_id}: {trigger}")
@@ -1225,8 +1305,10 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error creating scheduled job for expert {expert_instance.id}, symbol {symbol}: {e}", exc_info=True)
             
-    def _parse_schedule(self, schedule_setting: str) -> Optional[Any]:
-        """Parse schedule setting into APScheduler trigger."""
+    def _parse_schedule(self, schedule_setting: str, context: str = "") -> Optional[Any]:
+        """Parse schedule setting into APScheduler trigger. ``context`` names the owner of the
+        setting (instance + setting name) for the refusal messages; None is returned, with an ERROR,
+        for a schedule that cannot be run as written."""
         try:
             # Handle monthly Nth-weekday configuration (e.g. 1st Monday).
             # Backward compatible: absence of "frequency" => weekly path below.
@@ -1235,18 +1317,19 @@ class JobManager:
                 if not times:
                     logger.warning("No times specified in monthly schedule")
                     return None
-                hour, minute = map(int, times[0].split(':'))
+                clock_times = parse_schedule_times(times)
                 market_time = schedule_setting.get('time_basis') == 'market'
                 logger.info(
                     f"Creating monthly cron trigger: ordinal={schedule_setting.get('ordinal')}, "
-                    f"weekday={schedule_setting.get('weekday')}, hour={hour}, minute={minute}, "
+                    f"weekday={schedule_setting.get('weekday')}, times={clock_times}, "
                     f"time_basis={'market' if market_time else 'local'}"
                 )
-                return build_monthly_cron(
-                    ordinal=int(schedule_setting['ordinal']),
-                    weekday=schedule_setting['weekday'],
-                    hour=hour, minute=minute, market_time=market_time,
-                )
+                return _one_or_all([
+                    build_monthly_cron(
+                        ordinal=int(schedule_setting['ordinal']),
+                        weekday=schedule_setting['weekday'],
+                        hour=hour, minute=minute, market_time=market_time)
+                    for hour, minute in clock_times])
 
             # Handle dict schedule configuration (JSON format)
             if isinstance(schedule_setting, dict) and 'days' in schedule_setting and 'times' in schedule_setting:
@@ -1261,11 +1344,23 @@ class JobManager:
                     'friday': 4, 'saturday': 5, 'sunday': 6
                 }
                 
-                # Get enabled days
-                enabled_days = []
-                for day_name, enabled in days.items():
-                    if enabled and day_name.lower() in day_mapping:
-                        enabled_days.append(day_mapping[day_name.lower()])
+                # An UNKNOWN key ("wensday") is never ignored and never guessed at: the whole schedule
+                # is REFUSED with one ERROR naming the instance, the setting and the key. Running the
+                # valid days instead would let the typo'd day fall to its absent-key default and trade
+                # on a day the owner may have meant to switch off; "no run" is loud and recoverable.
+                refusal = schedule_refusal_message(schedule_setting)
+                if refusal:
+                    # Normally unreachable from the scheduling pass (``_schedule_is_runnable`` refused it
+                    # once, before any per-symbol job); a direct caller still gets the loud refusal.
+                    logger.error(f"{refusal} ({context or 'unnamed schedule'}); nothing is scheduled "
+                                 f"for it until the setting is corrected")
+                    return None
+
+                # Get enabled days through the ONE shared rule (schedule_genes.schedule_weekday_enabled,
+                # also read by the backtest's ``_schedule_allows_entry`` and the settings UI): an explicit
+                # value wins, an ABSENT key is Monday-Friday enabled and Saturday/Sunday disabled.
+                enabled_days = [number for name, number in day_mapping.items()
+                                if schedule_weekday_enabled(days, name)]
                 
                 if not enabled_days:
                     logger.warning("No days enabled in schedule")
@@ -1275,20 +1370,20 @@ class JobManager:
                     logger.warning("No times specified in schedule")
                     return None
                 
-                # Create triggers for each time on enabled days
-                # For multiple times, we'll use the first time for now
-                # TODO: In the future, we could create multiple jobs for different times
-                first_time = times[0]
-                hour, minute = map(int, first_time.split(':'))
+                # EVERY configured time fires on the enabled days (one job, an OrTrigger when there
+                # is more than one; the backtest honours them all too).
+                clock_times = parse_schedule_times(times)
 
                 # Create day_of_week string for APScheduler
                 day_of_week = ','.join(map(str, sorted(enabled_days)))
 
                 market_time = schedule_setting.get('time_basis') == 'market'
-                logger.info(f"Creating cron trigger: hour={hour}, minute={minute}, "
+                logger.info(f"Creating cron trigger: times={clock_times}, "
                             f"day_of_week={day_of_week}, time_basis={'market' if market_time else 'local'}")
-                return CronTrigger(hour=hour, minute=minute, day_of_week=day_of_week,
-                                   timezone=_MARKET_TZ if market_time else None)
+                return _one_or_all([
+                    CronTrigger(hour=hour, minute=minute, day_of_week=day_of_week,
+                                timezone=_MARKET_TZ if market_time else None)
+                    for hour, minute in clock_times])
             
             # Handle other schedule formats (string-based) - can be extended as needed
             else:
@@ -1319,6 +1414,161 @@ class JobManager:
             logger.error(f"Safety release of parked OPEN_POSITIONS for expert "
                          f"{expert_instance_id} failed: {e}", exc_info=True)
 
+    def _session_guard_allows(self, job, scheduled_for, crypto_symbols=None) -> bool:
+        """True when the scheduled pass of ``job`` may run at ``scheduled_for``.
+
+        Mirrors the backtest: no bar, no decision. A 15:30 schedule on a 13:00 half day, a weekday
+        holiday and a weekend never reach the experts. ONE loud WARNING per (expert, subtype, day)
+        names the reason. Unreadable calendar -> the pass is REFUSED (logged as an ERROR), never
+        guessed. A job whose instrument is crypto is refused too: its market is not NYSE and no
+        other calendar is wired, so none is assumed. Only the expert passes go through here
+        (``_execute_scheduled_group``): the IV snapshot, FRED, warm and account-refresh jobs have
+        their own callbacks and are untouched. A manual run (``/api/run-schedule``, the UI's Run
+        Now) does not come through here either: an operator re-firing today's pass after hours is
+        the documented use of that endpoint.
+
+        ``crypto_symbols``: the group's crypto instrument names, resolved ONCE for the whole group by
+        ``_apply_session_guard`` (one query, outside the per-job loop). None (a direct caller) resolves
+        this job's symbol on its own, as before.
+        """
+        from ba2_common.core.market_calendar import (
+            closed_skip_is_expected, regular_session_status)
+
+        expert_id, symbol, subtype = job.args[0], job.args[1], job.args[2]
+        reason = None
+        expected = False          # an expected closed (holiday/weekend/early close) is a WARNING
+        try:
+            if (symbol in crypto_symbols if crypto_symbols is not None else self._symbol_is_crypto(symbol)):
+                reason = f"instrument {symbol} is crypto: no exchange calendar is wired, not assuming NYSE"
+            else:
+                ok, why = regular_session_status(scheduled_for)
+                if not ok:
+                    reason = why
+                    expected = closed_skip_is_expected(scheduled_for)
+        except Exception as e:  # noqa: BLE001 -- fail CLOSED on anything: calendar unavailable,
+            #                     a naive instant, a calendar bug. The pass is refused and loud.
+            reason = f"session check failed ({type(e).__name__}: {e}); refusing rather than guessing"
+        if reason is None:
+            return True
+        logged = getattr(self, "_session_skip_logged", None)
+        if logged is None:
+            logged = self._session_skip_logged = set()
+        subtype_name = getattr(subtype, "value", str(subtype))
+        key = (expert_id, subtype_name, scheduled_for.astimezone(_MARKET_TZ).date())
+        if key not in logged:
+            logged.add(key)
+            # WARNING for a routine closed day (holiday, weekend, early close); ERROR for anything
+            # else -- a skipped pass on a normal trading day (a schedule outside the session, a
+            # calendar fault, an unreadable calendar) is an incident.
+            (logger.warning if expected else logger.error)(
+                f"[SESSION GUARD] expert {expert_id} {subtype_name} pass at "
+                f"{scheduled_for.astimezone(_MARKET_TZ):%Y-%m-%d %H:%M} ET SKIPPED: {reason} "
+                f"(disable the guard with app setting '{SESSION_GUARD_SETTING}'=false)")
+        return False
+
+    def _session_guard_enabled(self, announce: bool = False) -> bool:
+        """The operator kill switch: app setting ``scheduled_session_guard_enabled`` (declared
+        default ON in ``core.app_settings``). An unreadable stored value or an unreadable database
+        keeps the guard ON (fail closed) and says so as an ERROR. ``announce`` logs the state."""
+        from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+        from .app_settings import app_setting_default
+        from .models import AppSetting
+
+        default = app_setting_default(SESSION_GUARD_SETTING)
+        source, enabled = "declared default", default
+        try:
+            with Session(get_db().bind) as session:
+                row = session.exec(select(AppSetting).where(AppSetting.key == SESSION_GUARD_SETTING)).first()
+            if row is not None and row.value_str not in (None, ""):
+                enabled, source = coerce_bool(row.value_str), "app setting"
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[SESSION GUARD] cannot read app setting '{SESSION_GUARD_SETTING}' "
+                         f"({type(e).__name__}: {e}); keeping the guard ON")
+            enabled, source = True, "unreadable setting (kept ON)"
+        if announce:
+            (logger.info if enabled else logger.warning)(
+                f"[SESSION GUARD] {'ENABLED' if enabled else 'DISABLED'} "
+                f"({source}: '{SESSION_GUARD_SETTING}'): scheduled entry / open-positions passes "
+                f"{'are skipped outside a regular NYSE session' if enabled else 'run with NO session check'}")
+        return enabled
+
+    @staticmethod
+    def _prewarm_session_calendar() -> None:
+        """Build the NYSE session table NOW (it spans 1990..today+2y), not inside the first fire's
+        dispatch lock; the duration is logged. A failure is an ERROR (the guard then refuses passes:
+        fail closed) and is retried by the first fire."""
+        import time as _time
+        from ba2_common.core.market_calendar import regular_session_status
+        t0 = _time.monotonic()
+        try:
+            regular_session_status(datetime.now(timezone.utc))
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[SESSION GUARD] the NYSE session calendar could not be built at start "
+                         f"({type(e).__name__}: {e}); scheduled passes will be REFUSED until it can",
+                         exc_info=True)
+            return
+        logger.info(f"[SESSION GUARD] NYSE session calendar ready in {_time.monotonic() - t0:.2f}s")
+
+    def _apply_session_guard(self, due, scheduled_for):
+        """The jobs of this fire that may run. Group-level, so every failure is ONE loud line:
+
+        * the KILL SWITCH read raising (a defect) is logged as an ERROR naming the setting and the guard
+          is evaluated as ON (it fails CLOSED: the slot is neither lost nor run unchecked);
+        * the instrument types of the group's symbols are resolved in ONE query; if that read fails the
+          crypto check is impossible, so every job of the group is refused (fail closed), with ONE ERROR
+          carrying the number of affected jobs;
+        * the number of skipped jobs is logged once per group (the reason per expert/day is logged by
+          ``_session_guard_allows``)."""
+        try:
+            enabled = self._session_guard_enabled()
+        except Exception as e:  # noqa: BLE001 -- a defect in the switch must not lose the slot
+            logger.error(f"[SESSION GUARD] reading the kill switch '{SESSION_GUARD_SETTING}' raised "
+                         f"({type(e).__name__}: {e}); evaluating the guard as ON for the "
+                         f"{scheduled_for:%Y-%m-%d %H:%M} pass", exc_info=True)
+            enabled = True
+        if not enabled:
+            logger.warning(f"[SESSION GUARD] DISABLED by app setting "
+                           f"'{SESSION_GUARD_SETTING}': the {scheduled_for:%Y-%m-%d %H:%M} pass "
+                           f"runs with no market-session check")
+            return due
+        if not due:
+            return due
+        try:
+            crypto = self._crypto_symbols({job.args[1] for job in due})
+        except Exception as e:  # noqa: BLE001 -- the crypto check is impossible: refuse the group, once
+            logger.error(f"[SESSION GUARD] cannot read the instrument types for the "
+                         f"{scheduled_for:%Y-%m-%d %H:%M} pass ({type(e).__name__}: {e}); refusing all "
+                         f"{len(due)} job(s) of this fire rather than guessing", exc_info=True)
+            return []
+        allowed = [job for job in due if self._session_guard_allows(job, scheduled_for, crypto)]
+        if len(allowed) != len(due):
+            logger.warning(f"[SESSION GUARD] {len(due) - len(allowed)} of {len(due)} job(s) of the "
+                           f"{scheduled_for.astimezone(_MARKET_TZ):%Y-%m-%d %H:%M} ET fire skipped")
+        return allowed
+
+    @staticmethod
+    def _crypto_symbols(symbols) -> set:
+        """The names among ``symbols`` that are stored crypto Instruments: ONE query for the group
+        (placeholders such as OPEN_POSITIONS/SCREENER are not instruments)."""
+        from .types import InstrumentType
+        names = [s for s in symbols if s not in ("DYNAMIC", "EXPERT", "OPEN_POSITIONS", "SCREENER")]
+        if not names:
+            return set()
+        with Session(get_db().bind) as session:
+            rows = session.exec(select(Instrument).where(Instrument.name.in_(names))).all()
+        return {r.name for r in rows if r.instrument_type == InstrumentType.CRYPTO}
+
+    @staticmethod
+    def _symbol_is_crypto(symbol) -> bool:
+        """True when ``symbol`` names a stored Instrument of type crypto (placeholders such as
+        OPEN_POSITIONS/SCREENER are not instruments and answer False)."""
+        if symbol in ("DYNAMIC", "EXPERT", "OPEN_POSITIONS", "SCREENER"):
+            return False
+        from .types import InstrumentType
+        with Session(get_db().bind) as session:
+            row = session.exec(select(Instrument).where(Instrument.name == symbol)).first()
+        return row is not None and row.instrument_type == InstrumentType.CRYPTO
+
     def _execute_scheduled_group(self, expert_instance_id, symbol, subtype, scheduled_for=None):
         """One callback registers and submits every expert due at this exact fire time.
 
@@ -1341,6 +1591,11 @@ class JobManager:
                         if job_id.startswith("expert_") and job.next_run_time is not None]
             due = [job for job in jobs
                    if job.trigger.get_next_fire_time(None, scheduled_for) == scheduled_for]
+            # SESSION GUARD (fail closed): an entry / open-positions pass only runs while the
+            # exchange is in a regular session at the fire instant. A skipped pass registers no
+            # ExpertRun and submits nothing, so a parked OPEN_POSITIONS pass cannot be waiting
+            # on it (defer_open_positions_if_entry_in_flight finds no entry task in flight).
+            due = self._apply_session_guard(due, scheduled_for)
             records = {}
             for job in due:
                 expert_id = job.args[0]

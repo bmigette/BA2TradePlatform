@@ -633,6 +633,21 @@ def position_sign(side) -> Optional[int]:
     return None
 
 
+def position_magnitude_and_direction(side, quantity) -> Tuple[float, bool]:
+    """One broker position row's ``(abs_quantity, is_long)``, whatever sign convention it arrived in.
+
+    The platform's canonical ``Position.qty`` is SIGNED (a short is negative: Alpaca, TastyTrade
+    since e45ed98c, and the IBKR adapter), but consumers that need a share COUNT plus a direction
+    (the allocator's TP/SL guards) must not depend on that: a row is SHORT when its quantity is
+    negative OR its ``side`` says short; a long needs neither. The magnitude is always ``abs``.
+    Never invents a direction: a row that states neither sign nor side is a long (the only thing
+    a bare positive number can be).
+    """
+    qty = float(quantity)
+    is_long = not (qty < 0 or position_sign(side) == -1)
+    return abs(qty), is_long
+
+
 def signed_position_values(side, *, quantity, cost_basis,
                            market_value=None) -> Tuple[float, float, Optional[float]]:
     """One broker position row's ``(quantity, cost_basis, market_value)``, SIGNED.
@@ -643,10 +658,9 @@ def signed_position_values(side, *, quantity, cost_basis,
     something that REDUCES the allocatable base, and every sum is a plain sum.
 
     The two live brokers disagree at source and this is the single place that
-    reconciles them: Alpaca passes the broker's own negative signs straight
-    through (``AlpacaAccount.alpaca_position_to_position``) while TastyTrade
-    stores ``qty=abs_qty`` with positive money and puts the direction in ``side``
-    (``TastyTradeAccount.py:520-547``). It lives HERE, in the pure engine, because
+    reconciles them: Alpaca and TastyTrade (since e45ed98c) pass negative signs
+    straight through, and any adapter that still publishes ``qty=abs_qty`` with
+    positive money and the direction only in ``side`` is signed here. It lives HERE, in the pure engine, because
     it has two callers that must never drift apart -- the page's
     ``ui/utils/portfolio_allocation_view.positions_by_symbol`` and the live
     service's ``core/portfolio_allocation_service.build_position_states``. They

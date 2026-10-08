@@ -21,6 +21,7 @@ Determinism (the Phase-4 core gate):
 The GA must NEVER enqueue a sub-task: ``init_task_queue(max_workers=1)`` (main.py) would
 deadlock. The fitness calls the synchronous runner in-process (confirmed in Replan).
 """
+import json as _json
 import logging
 import math as _math
 import random
@@ -31,6 +32,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ba2_common.core.knowability import DEFAULT_DECISION_TIME, entry_times_for  # noqa: F401
+
+
+def _is_intraday_interval(interval: Any) -> bool:
+    """m / h / min suffix = an intraday clock (the engine's own split, price_source._is_intraday).
+    A missing interval is read as intraday: the safe side of ``entry_times_for`` (it raises)."""
+    if interval is None:
+        return True
+    iv = str(interval).lower()
+    return iv.endswith("m") or iv.endswith("h") or iv.endswith("min")
+from ba2_common.core.schedule_genes import validate_decision_times
 from app.models import (
     SessionLocal,
     Strategy as StrategyModel,
@@ -365,7 +377,12 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
     released: Dict[str, Any] = {}
     try:
         from app.services.backtest.daily_backtest_handler import run_daily_backtest
+        from app.services.backtest.backtest_account import assert_fill_rebase_enabled
         from app.services.strategy_fitness import compute_fitness
+
+        # A measurement hook that switches the fill re-base off must never reach a grid trial
+        # (raises FillRebaseDisabled, job-fatal by name).
+        assert_fill_rebase_enabled()
 
         # Wall time for THIS individual, measured inside the worker so it is pure compute and
         # excludes dispatch/queue wait. Logged next to the memory numbers because the two rise
@@ -391,6 +408,10 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
                # "consistent by luck" blind spot the consistent-annual fitness exists to fight.
                "total_return": results.get("total_return"),
                "max_drawdown": results.get("max_drawdown"),
+               **_analysis_failures_field(results),
+               # The decision-time counter, so the MASTER can warn once per job (see
+               # ``_decision_time_missing``). Only when non-zero: other results keep their shape.
+               **_decision_time_missing(results),
                # Per-trial memory telemetry (a few psutil/len calls — negligible): RSS of
                # THIS worker process + the two per-process OHLCV caches, so a memory-driven
                # incident (e.g. WinError 1450 on the remote box) leaves a trail showing what
@@ -435,16 +456,16 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         # MacroAvailabilityUnknown (ba2_providers.macro.fred_series): a macro-reading expert's FRED
         # cache is in the old observation-date format, or was fetched before the run's last
         # decision -- again one file every trial reads, so every trial refuses identically.
-        fatal = type(e).__name__ in (
-            "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
-            "SharedArrayFdExhausted", "SplitBasisRefused", "OptionSpotBasisMismatch",
-            "SpreadModelConfigError", "OptionTradeRecordsFlagMissing",
-            "MarketCalendarUnavailable", "NotARegularSession", "RiskFreeRateUnavailable",
-            "MacroAvailabilityUnknown")
+        fatal = job_fatal(e)
         snap = _trial_memory_snapshot()
         snap["option_overlays"] = released
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
-                "fatal": fatal, "mem": snap}
+                "fatal": fatal,
+                # The exception TYPE travels with the result (a remote worker's result is a plain
+                # dict over the wire, never the exception object), so the master can classify by
+                # type and not only by the ``fatal`` flag a worker computed from ITS OWN copy of the
+                # set below.
+                "error_type": type(e).__name__, "mem": snap}
     finally:
         # FINALLY, not after the happy return: a failed or CANCELLED trial is when this
         # matters most. The worker is handed another genome immediately and the abandoned
@@ -1139,6 +1160,8 @@ def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, 
     """
     import time
     from app.services.backtest.daily_backtest_handler import run_daily_backtest
+    from app.services.backtest.backtest_account import assert_fill_rebase_enabled
+    assert_fill_rebase_enabled()      # the measurement hook is never legitimate in a persisted re-run
     last_exc: Optional[Exception] = None
     for attempt in range(_LOCAL_RETRY_ATTEMPTS):
         try:
@@ -1225,6 +1248,50 @@ def _resolve_early_stop_min_rel(ga: Dict[str, Any]) -> Optional[float]:
     from app.services.genetic import EARLY_STOP_MIN_REL_KEY, validate_early_stop_min_rel
 
     return validate_early_stop_min_rel(ga.get(EARLY_STOP_MIN_REL_KEY))
+
+
+from app.services.job_fatal import JOB_FATAL_ERROR_TYPES, job_fatal  # noqa: E402,F401  (ONE set)
+from ba2_providers.screener.universe_superset import RULE_ID as _SUPERSET_RULE_ID  # noqa: E402
+
+
+def _analysis_failures_field(results: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"af": {"passes": n, "failed": m}}`` for a trial that made analysis passes (a few ints), so the
+    job-level summary can aggregate them. Same shape idea as ``dt_missing``."""
+    af = (results or {}).get("analysis_failures")
+    if af and af.get("passes"):
+        return {"af": {"passes": int(af["passes"]), "failed": int(af["failed"])}}
+    return {}
+
+
+def summarise_analysis_failures(opt_name: str, all_results: list) -> Optional[Dict[str, Any]]:
+    """ONE job-level line aggregating the per-trial analysis-failure counts (below the refusal
+    threshold they would otherwise be visible only inside each trial's results). Returns the aggregate."""
+    rows = [(r["af"], r.get("key")) for r in all_results if isinstance(r, dict) and r.get("af")]
+    if not rows:
+        return None
+    passes = sum(a["passes"] for a, _ in rows)
+    failed = sum(a["failed"] for a, _ in rows)
+    worst_af, worst_key = max(rows, key=lambda x: x[0]["failed"] / max(x[0]["passes"], 1))
+    agg = {"trials": len(rows), "passes": passes, "failed": failed,
+           "worst_share": round(worst_af["failed"] / max(worst_af["passes"], 1), 4), "worst_trial": worst_key}
+    line = (f"[{opt_name}] analysis passes over {len(rows)} trial(s): {passes} total, {failed} failed "
+            f"({(failed / passes if passes else 0):.2%}); worst trial {agg['worst_share']:.2%} (key {worst_key})")
+    (logger.warning if failed else logger.info)(line)
+    return agg
+
+
+def _abort_on_fatal_trial(out: Dict[str, Any], fatal: Dict[str, Any], key: Any, flat: Dict[str, Any]) -> None:
+    """The master's rule for a FAILED trial result: if it is job-fatal (the worker's ``fatal`` flag, or
+    its ``error_type`` in ``JOB_FATAL_ERROR_TYPES``), record the reason (naming the trial that tripped it)
+    and raise ``_FatalTrialError``: no further trial is dispatched, the caller marks the job failed.
+    Anything else returns and the trial is scored at the sentinel as before."""
+    if not (out.get("fatal") or job_fatal(out.get("error_type") or "")):
+        return
+    if fatal["msg"] is None:
+        fatal["msg"] = (f"{out['error']}  [job-fatal {out.get('error_type') or 'error'}; tripped by trial "
+                        f"key {key}, params {_json.dumps(flat, default=str, sort_keys=True)[:300]}]")
+        out["error"] = fatal["msg"]
+    raise _FatalTrialError(fatal["msg"])
 
 
 class _FatalTrialError(RuntimeError):
@@ -1506,6 +1573,11 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 "(engine/datasets/date-range/initial_capital/...)",
             )
         expert_cfg = ga.get("expert_params")  # may be None (expert frozen)
+        from app.services.backtest.backtest_account import FillRebaseDisabled, assert_fill_rebase_enabled
+        try:
+            assert_fill_rebase_enabled()     # the GA master refuses to start with the hook on
+        except FillRebaseDisabled as e:
+            return _fail(opt_id, db, str(e))
         try:
             lattice_anchor = _resolve_lattice_anchor(ga)
             early_stop_min_rel = _resolve_early_stop_min_rel(ga)
@@ -1534,6 +1606,20 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 for k, v in expert_cfg.items()
                 if k.startswith("schedule:")
             } or None
+
+        # DECISION-TIME gene (schedule:time): validated here, where the run's execution interval
+        # is known, in addition to the launcher's check -- a hand-written config that bypassed the
+        # launcher must not reach the GA with a time the engine cannot honour.
+        _time_spec = (schedule_cfg or {}).get("time")
+        if _time_spec and _time_spec.get("optimize"):
+            try:
+                _validated = validate_decision_times(
+                    _time_spec["choices"], backtest_cfg.get("execution_interval", "1d"))
+            except ValueError as e:
+                return _fail(opt_id, db, f"schedule:time gene: {e}")
+            if list(_time_spec["choices"]) != _validated:
+                return _fail(opt_id, db, f"schedule:time choices must be sorted ascending, got "
+                                         f"{list(_time_spec['choices'])!r}")
 
         # BYPASS expert (piece 1c): if the backtest's expert declares ``bypasses_classic_rm``
         # (e.g. FactorRanker) the search space must EXCLUDE tp/sl/cond:*/exit:* and search
@@ -1640,6 +1726,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "robustness": (results or {}).get("robustness"),
                     "total_return": (results or {}).get("total_return"),
                     "max_drawdown": (results or {}).get("max_drawdown"),
+                    **_decision_time_missing(results or {}),
+                    **_analysis_failures_field(results or {}),
                 }
             )
             if best["fitness"] is None or fit > best["fitness"]:
@@ -1717,7 +1805,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         ckpt_task_id = checkpoint_task_id(opt.name, opt_id)
         ckpt_fingerprint = checkpoint_fingerprint(
             param_space, ga, checkpoint_expert_settings_identity(backtest_cfg),
-            backtest_cfg.get("rm_toggles_unpinned"))
+            backtest_cfg.get("rm_toggles_unpinned"), backtest_cfg.get("screener_universe_rule"))
         # The OBJECTIVE this run is scored under, as the trials will actually see it (the trial
         # config carries the same key, and strategy_fitness._maybe_robust reads it). Written into
         # every checkpoint and compared on resume -- see _assert_checkpoint_robustness_matches.
@@ -1974,7 +2062,9 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                              "fitness_raw": out.get("fitness_raw"),
                              "robustness": out.get("robustness"),
                              "total_return": out.get("total_return"),
-                             "max_drawdown": out.get("max_drawdown")}
+                             "max_drawdown": out.get("max_drawdown"),
+                             **({"af": out["af"]} if out.get("af") else {}),
+                             **({"dt_missing": out["dt_missing"]} if out.get("dt_missing") else {})}
                         )
                         if is_last_gen:
                             _capture_full_result(last_gen_full_results, key, out)
@@ -2019,8 +2109,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                                 mem = out.get("mem")
                                 logger.warning(f"trial failed in worker: {out['error']}"
                                                + (f" | worker mem: {mem}" if mem else ""))
-                                if out.get("fatal") and fatal["msg"] is None:
-                                    fatal["msg"] = out["error"]
+                                # A job-fatal trial (``JOB_FATAL_ERROR_TYPES``, by flag OR by the TYPE the
+                                # worker sent back) ends the JOB at once:
                                     # ABORT NOW, not at the end. A fatal is a DATA/CONFIG problem --
                                     # an incomplete prewarm, a missing OHLCV cache -- so it affects
                                     # every remaining trial identically. Before this, fatal["msg"] was
@@ -2028,7 +2118,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                                     # when most trials happened to succeed (the goal2020 OP case) the
                                     # run ground through all 8 generations and reported a confident
                                     # winner chosen partly by which genomes dodged the broken data.
-                                    raise _FatalTrialError(out["error"])
+                                _abort_on_fatal_trial(out, fatal, key, flat)
                     if best["fitness"] is None or fit > best["fitness"]:
                         best["fitness"] = fit
                         best["params"] = flat
@@ -2322,6 +2412,12 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                       f"generation {gen_state['gen'] + 1}/{ga['generations']}")
             logger.error(f"strategy_optimization {opt_id}: ABORTING {_where} — {e}")
             return _fail(opt_id, db, str(e))
+        except Exception as e:  # noqa: BLE001 -- SERIAL path: a job-fatal error aborts the job too
+            if not job_fatal(e):
+                raise
+            logger.error(f"strategy_optimization {opt_id}: ABORTING (serial trial) -- "
+                         f"{type(e).__name__}: {e}")
+            return _fail(opt_id, db, f"{e}  [job-fatal {type(e).__name__}]")
         finally:
             _logging.disable(_prior_disable)
             if _evaluator is not None:
@@ -2380,6 +2476,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         opt.progress = 100.0
         opt.best_params = result["best_params"]
         opt.best_fitness = result["best_fitness"]
+        _warn_decision_time_missing(opt.name, all_results)
+        summarise_analysis_failures(opt.name, all_results)
         opt.all_results = all_results
         db.commit()
         push_optimization(opt, db)
@@ -2573,15 +2671,52 @@ def _market_condition_trial_pins(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]
     return {"market_condition_profiles": profiles, "market_condition_manifests": manifests}
 
 
+def _decision_time_missing(results: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"dt_missing": {"entry": n, "manage": n}}`` when a trial had scheduled sessions with no
+    bar at the scheduled time (e.g. 15:30 on a half day), else ``{}``."""
+    counts = ((results or {}).get("decision_time") or {}).get("sessions_without_decision_bar")
+    if counts and any(counts.values()):
+        return {"dt_missing": {"entry": int(counts["entry"]), "manage": int(counts["manage"])}}
+    return {}
+
+
+def _warn_decision_time_missing(opt_name: str, all_results: list) -> None:
+    """ONE job-level WARNING aggregating the per-trial counters (engines log them at DEBUG)."""
+    hit = [r["dt_missing"] for r in all_results if isinstance(r, dict) and r.get("dt_missing")]
+    if hit:
+        logger.warning(
+            f"[{opt_name}] {len(hit)} of {len(all_results)} trials had scheduled sessions with NO "
+            f"bar at the scheduled decision time (e.g. 15:30 on a 13:00 half day: no decision, "
+            f"no entry): per-trial entry/manage sessions skipped, total "
+            f"{sum(h['entry'] for h in hit)}/{sum(h['manage'] for h in hit)}")
+
+
+def _schedule_times_from_gene(gene_time: Optional[str]) -> Optional[Dict[str, List[str]]]:
+    """The ENTRY and the MANAGE schedule's ``times`` a decoded ``schedule:time`` gene stands for
+    (None without the gene). The ONE place the two are derived: today both are the single gene
+    value; splitting the gene into an entry time and a manage time changes only this function
+    (and the reconstruction in ``ba2_common.core.schedule_genes``), nothing else assumes they
+    are equal."""
+    if not gene_time:
+        return None
+    return {"entry": [gene_time], "manage": [gene_time]}
+
+
 def _build_daily_trial_config(
     backtest_cfg: Dict[str, Any],
     decoded: Dict[str, Any],
     hoisted: Optional[Dict[str, Any]] = None,
     *,
     option_trade_records: bool,
+    stored_row: bool = False,
 ) -> Dict[str, Any]:
     """Assemble the ``run_daily_backtest`` config for one trial from the run-level
     backtest_cfg + the decoded trial params.
+
+    ``stored_row`` (keyword, default False = a NEW run): True when ``backtest_cfg`` is the block of
+    an optimization that was STORED (a re-run, a TOP-N rebuild, an inspection tool). A stored block
+    that states no entry time predates the field and legitimately ran at the legacy first-bar time
+    (``entry_times_for``, which a NEW intraday run without a time refuses instead of guessing).
 
     ``option_trade_records`` (REQUIRED, keyword, no default -- every caller states it): whether
     an OPTION run's trade rows carry the option trade record (entry/exit snapshots, BT/live
@@ -2737,6 +2872,7 @@ def _build_daily_trial_config(
     # runs -> the engine's gating is a no-op and the config is byte-identical to before.
     screener_runtime = None
     screener_candidate: Optional[List[str]] = None
+    screener_universe_guard: Optional[str] = None   # None = no per-decision universe guard applies
     if hoisted and hoisted.get("screener_store"):
         from ba2_providers.screener import metric_store as _ms
         from ba2_providers.screener.metric_store import normalize_screener_settings
@@ -2761,21 +2897,34 @@ def _build_daily_trial_config(
             "excluded_symbols": excluded_instruments,
         }
         # CANDIDATE BOUND (non-bypass): restrict the loaded universe to the symbols THIS trial's
-        # screen can EVER select over [start,end] (screened_symbol_union with the trial's own eff
-        # settings), intersected with the band. The per-bar gate already restricts ENTRIES to a
-        # subset of this, so results are IDENTICAL — but the engine no longer preloads/analyses the
-        # whole band (e.g. 814 -> ~150 symbols), the dominant screener-opt memory + CPU cost. Matches
-        # the standalone path's _resolve_enabled_instruments. Bypass experts keep the full band (they
-        # rank the whole universe). Exact per-trial bound — no gene-tightening assumption.
+        # screen can EVER select over the run's VISIBLE scans (``screened_symbol_union_visible`` with
+        # the trial's own eff settings: its own filters, sort AND max_stocks cut), intersected with
+        # the job's static universe. The per-bar gate selects exactly a subset of this, so results
+        # are IDENTICAL to loading the whole static universe -- but the engine preloads and analyses
+        # only what this genome can trade (the dominant screener-opt memory + CPU cost), which is
+        # what keeps the per-trial cost near the old small list's now that the static universe is the
+        # true superset (``ba2_providers.screener.universe_superset``). Exact per-trial bound, no
+        # gene-tightening assumption. Bypass experts keep the full static universe (they rank the
+        # whole screened universe off the store themselves).
+        #
+        # THE INTERSECTION IS WHERE A PICK USED TO VANISH SILENTLY: a symbol the genome's gate
+        # selects that is not in the static universe was dropped here (and again by the engine's
+        # ``entry_universe`` filter) with nothing said. It is now loud: the engine counts every such
+        # gate selection against ``enabled_instruments`` (``results["screener_universe"]``) and, under
+        # the superset rule, REFUSES the run (``ScreenerUniverseRefusal``, job-fatal). A failure to
+        # compute the bound propagates; it never falls back to loading the band.
         if not bypass and not hoisted.get("screener_gate_only"):
-            try:
-                _df = _ms.load_store(hoisted["screener_store"])
-                _sd = str(backtest_cfg["start_date"])[:10]
-                _ed = str(backtest_cfg["end_date"])[:10]
-                _union = set(_ms.screened_symbol_union(_df, _sd, _ed, eff_norm, excluded_instruments))
-                screener_candidate = [s for s in backtest_cfg["enabled_instruments"] if s in _union]
-            except Exception:  # noqa: BLE001 — never break a trial on the optimization; fall back to full band
-                screener_candidate = None
+            _df = _ms.load_store(hoisted["screener_store"])
+            _sd = str(backtest_cfg["start_date"])[:10]
+            _ed = str(backtest_cfg["end_date"])[:10]
+            _union = set(_ms.screened_symbol_union_visible(
+                _df, _sd, _ed, eff_norm, excluded_instruments,
+                intraday=_is_intraday_interval(backtest_cfg.get("execution_interval"))))
+            screener_candidate = [s for s in backtest_cfg["enabled_instruments"] if s in _union]
+            # The universe guard (engine): REFUSE under the superset rule; a STORED block from before
+            # the rule keeps its frozen list and only WARNS (counts + log), see rerun_handler.
+            screener_universe_guard = ("refuse" if backtest_cfg.get("screener_universe_rule") == _SUPERSET_RULE_ID
+                                       else "warn")
 
     if not isinstance(option_trade_records, bool):
         raise TypeError(f"option_trade_records must be True or False, got "
@@ -2791,13 +2940,34 @@ def _build_daily_trial_config(
     # static (pulled from the run-level override, unaffected by the genes) since only the day
     # selection is being optimized for now.
     base_run_sched = backtest_cfg.get("run_schedule_override")
-    if decoded.get("schedule_days"):
+    manage_schedule_override = backtest_cfg.get("manage_schedule_override")
+    gene_time = decoded.get("schedule_time")
+    gene_times = _schedule_times_from_gene(gene_time)
+    if decoded.get("schedule_days") or gene_time:
+        days = decoded.get("schedule_days") or (base_run_sched or {}).get("days")
+        if not days:
+            raise ValueError("a schedule:time gene needs the run's entry days (schedule:<day> "
+                             "genes or a run_schedule_override with days): refusing to guess")
         run_schedule_override = {
-            "days": decoded["schedule_days"],
-            "times": (base_run_sched or {}).get("times") or ["09:30"],
+            "days": days,
+            # THE DECISION-TIME GENE wins; else the run-level time when the run states one; else
+            # the shared default decision time (a new run only: stored rows reconstruct through
+            # schedule_genes with their own time).
+            "times": (gene_times["entry"] if gene_times
+                      else entry_times_for((base_run_sched or {}).get("times"), stored_row=stored_row,
+                                           intraday=_is_intraday_interval(backtest_cfg.get("execution_interval")))),
         }
     else:
         run_schedule_override = base_run_sched
+    if gene_times:
+        # The open-positions MANAGE pass is retimed from the same gene (live deploys both
+        # schedules at the one stored time; see tools/import_deploy_payload.py). Days stay the
+        # run's own.
+        if not (manage_schedule_override or {}).get("days"):
+            raise ValueError("a schedule:time gene needs backtest.manage_schedule_override with "
+                             "days to retime: refusing to leave the manage pass on another time")
+        manage_schedule_override = {"days": dict(manage_schedule_override["days"]),
+                                    "times": gene_times["manage"]}
 
     return {
         "backtest_id": trial_id,
@@ -2820,7 +2990,7 @@ def _build_daily_trial_config(
         "subtype": backtest_cfg.get("subtype"),
         # Cadence (weekly entry) + intraday fill clock carry through to each trial's engine.
         "run_schedule_override": run_schedule_override,
-        "manage_schedule_override": backtest_cfg.get("manage_schedule_override"),
+        "manage_schedule_override": manage_schedule_override,
         "execution_interval": backtest_cfg.get("execution_interval", "1d"),
         # Per-trade profit cap (% of cost basis): the GA ranks on the ADJUSTED fitness so one
         # lucky, non-reproducible mega-winner can't win the search. None = no cap. Carried from
@@ -2880,6 +3050,10 @@ def _build_daily_trial_config(
         # SCREENER seam: the per-individual effective screener settings + store path the engine
         # uses to gate entries to the per-day screened universe. None for non-screener runs.
         "screener_runtime": screener_runtime,
+        # SCREENER UNIVERSE GUARD ("refuse" | "warn" | None): whether the engine REFUSES, only
+        # WARNS, or does not check that every symbol the per-decision gate selects is in this
+        # run's loaded universe. In the whitelist (this dict is rebuilt key by key).
+        "screener_universe_guard": screener_universe_guard,
         # MARKET-CONDITION entry gates (design 2026-09-15 sections 4.1/4.5). Same whitelist reason
         # as stress_spread_bps and robust_fitness above -- this dict rebuilds the trial config key
         # by key, so a knob missing HERE is inert however correctly it was parsed upstream. Both
@@ -3165,7 +3339,8 @@ def checkpoint_expert_settings_identity(backtest_cfg: Dict[str, Any]) -> Dict[st
 
 def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
                            expert_settings: Optional[Dict[str, Any]] = None,
-                           rm_toggles_unpinned: Optional[List[str]] = None) -> str:
+                           rm_toggles_unpinned: Optional[List[str]] = None,
+                           screener_universe_rule: Optional[str] = None) -> str:
     """Identity of the SEARCH ITSELF -- a checkpoint may only be resumed into a matching one.
 
     A GA checkpoint is a list of chromosomes plus an RNG state; both are meaningless against a
@@ -3200,6 +3375,12 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     explicitly so the identity does not rely on that incidental shape and so a checkpoint written
     under one policy can never be resumed into the other even if some future gene space happened
     to coincide.
+
+    ``screener_universe_rule`` (``backtest.screener_universe_rule``, e.g. ``superset-v1``) joins it the
+    same way -- ONLY when stamped, so a job from before the rule keeps its fingerprint byte for byte. The
+    static universe a screener job searches over is part of its identity: a checkpoint (and the
+    population of genomes in it, scored on the OLD cap-ranked top-50 list) must never be resumed into a
+    run on the corrected superset universe, or the other way round.
     """
     import hashlib
     import json
@@ -3214,6 +3395,8 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
         payload["expert_settings"] = sorted(expert_settings.items())
     if rm_toggles_unpinned:
         payload["rm_toggles_unpinned"] = sorted(rm_toggles_unpinned)
+    if screener_universe_rule:
+        payload["screener_universe_rule"] = screener_universe_rule
     lattice_anchor = _resolve_lattice_anchor(ga)
     if lattice_anchor != "zero":
         payload["lattice_anchor"] = lattice_anchor
@@ -3505,6 +3688,14 @@ def _build_warm_start_population(
     if not results:
         return None
     tail = results[-target_size:] if len(results) > target_size else list(results)
+    has_stratified = any(c.get("stratify") for c in optimizer.param_ranges.values())
+    if has_stratified:
+        # A seed from a job without the decision-time gene must not silently become "the first
+        # time": the missing value is completed so generation 0 is balanced (see
+        # ``GeneticOptimizer.seeded_population``), padding included.
+        return optimizer.seeded_population(
+            [optimizer.encode_params(e.get("params") or {}, allow_missing_stratified=True)
+             for e in tail], target_size)
     population = [optimizer.encode_params(e.get("params") or {}) for e in tail]
     while len(population) < target_size:
         population.append(optimizer.toolbox.individual())

@@ -87,7 +87,9 @@ import sys
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from matrix_flags import cap_passthrough  # noqa: E402
+from matrix_flags import (  # noqa: E402
+    finish_matrix, note_job_exit,
+    add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce)
 
 _UNIVERSE_FILE = os.path.join(_TOOLS_DIR, "options_universe_top100.txt")
 _PROBE = os.path.join(_TOOLS_DIR, "probe_option_chain_depth.py")
@@ -339,8 +341,14 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+_FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exited non-zero
+
+
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    ap = build_parser()
+    add_refused_decision_times_flag(ap)
+    args = ap.parse_args(argv)
+    refuse_decision_times_and_announce(args)
 
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
@@ -383,8 +391,8 @@ def main(argv=None) -> int:
         print(f"[{i}/{len(jobs)}] RUN  {name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)
-    print("options grid 2 driver: done.")
-    return 0
+        note_job_exit(_FAILED_JOBS, name, rc)
+    return finish_matrix(_FAILED_JOBS, "options grid 2 driver")
 
 
 if __name__ == "__main__":

@@ -81,7 +81,11 @@ import importlib.util
 import os
 import sys
 
+from types import SimpleNamespace
+
 import pytest
+
+from tests.test_import_deploy_payload_rm_toggle_policy import tool  # noqa: F401  (fixture)
 
 # tests/ -> backend/ -> testplatform/, then the launcher beside backend/. Resolved off
 # __file__ (see test_option_grid_foundations.py for why a CWD-relative path is wrong here).
@@ -252,28 +256,72 @@ def _sentinel(domain, taken):
     return None
 
 
-def _backtest_cfg(strat, expert):
-    return {
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday")
+_ALL_DAYS = _WEEKDAYS + ("saturday", "sunday")
+
+
+def _backtest_cfg(strat, expert, *, interval="5min", with_times=True):
+    """The run-level config the launcher's ``optimize`` writes: it ALWAYS states the execution
+    interval and, on the weekly cadence, a run schedule whose ``times`` is the shared
+    ``DEFAULT_DECISION_TIME`` plus a daily manage schedule at the same time (ba2test_launcher
+    ``_cmd_optimize``, ``_daily_manage_schedule``). A new intraday run that states NO time is
+    refused by ``entry_times_for``; ``with_times=False`` builds that caller to pin the refusal."""
+    from ba2_common.core.knowability import DEFAULT_DECISION_TIME
+
+    cfg = {
         "backtest_id": "gene-audit", "start_date": "2024-02-01", "end_date": "2024-06-01",
         "enabled_instruments": ["AAPL"],
         "experts": [{"class": expert, "settings": {}}],
         "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
         "entry_action": getattr(strat, "entry_action", None),
         "options_store": "parquet",
+        "execution_interval": interval,
+        "manage_schedule_override": {"days": {d: d in _WEEKDAYS for d in _ALL_DAYS},
+                                     "times": [DEFAULT_DECISION_TIME]},
     }
+    if with_times:
+        cfg["run_schedule_override"] = {"days": {d: d == "monday" for d in _ALL_DAYS},
+                                        "times": [DEFAULT_DECISION_TIME]}
+    return cfg
+
+
+_AUDIT_STORE: dict = {}
+
+
+def _audit_metric_store():
+    """A real (tiny) screener metric store: the candidate-bound step opens the store and, since the
+    silent fall-back to the full band was removed (``ba2_providers.screener.universe_superset``), a
+    store that cannot be read fails the trial. One symbol, weekly scans across the audited window;
+    built once per process in a temp dir removed at exit."""
+    if "path" not in _AUDIT_STORE:
+        import atexit
+        import shutil
+        import tempfile
+        import pandas as pd
+        from ba2_providers.screener import metric_store as ms
+
+        d = tempfile.mkdtemp(prefix="gene-audit-store-")
+        atexit.register(shutil.rmtree, d, True)
+        scans = pd.date_range("2024-01-06", "2024-06-01", freq="7D").strftime("%Y-%m-%d")
+        rows = [{"date": x, "symbol": "AAPL", "market_cap": 3e12, "price": 20.0, "close": 20.0,
+                 "volume": 2e6, "sector": "T", "relative_volume": 2.4, "price_drop_pct": 20.0,
+                 "price_drop_pct_22": 20.0} for x in scans]
+        path = os.path.join(d, "ms")
+        ms.write_partitions(path, pd.DataFrame(rows))
+        ms.clear_store_memo()
+        _AUDIT_STORE["path"] = path
+    return _AUDIT_STORE["path"]
 
 
 def _hoisted(screener):
     """The run-level hoisted state ``_build_daily_trial_config`` reads for a screener run.
 
-    The store PATH need not exist: the only place the file is opened is the candidate-bound
-    optimisation, which is wrapped in its own try/except and falls back to the full band. The
-    ``screener_runtime`` block this audit traces to is built before that, from
-    ``normalize_screener_settings`` alone."""
+    The store must be loadable (``_audit_metric_store``): the candidate-bound step opens it and a
+    failure to read it propagates. The ``screener_runtime`` block this audit traces to is built
+    from ``normalize_screener_settings`` alone."""
     if not screener:
         return None
-    return {"screener_store": os.path.join(os.path.dirname(_LAUNCHER_PATH),
-                                           "no-such-metric-store.parquet"),
+    return {"screener_store": _audit_metric_store(),
             "screener_base": {}, "screener_cadence_days": 7}
 
 
@@ -863,3 +911,162 @@ def test_the_sentinel_is_unique_and_in_band():
             f"{gene}: sentinel {probe} collides with another gene's value")
         checked += 1
     assert checked > 20, f"only {checked} genes exercised the sentinel contract"
+
+
+# ==================================================================================================
+# THE DECISION-TIME GENE (schedule:time) -- audited end to end
+# ==================================================================================================
+# The audit above is option-only (option jobs run on a daily clock and REFUSE the gene), so the
+# time gene needs a STOCK case. Its destination is neither a ruleset parameter nor a settings key
+# but the pair of LIVE SCHEDULES, so it is followed hop by hop:
+#
+#   genome -> trial config (entry AND manage schedule) -> persisted row (the stored genome's
+#   reconstruction) -> export payload (execution.run_schedule_override) -> the settings the deploy
+#   tool writes (execution_schedule_enter_market AND execution_schedule_open_positions).
+_TIME_CHOICES = ["09:35", "09:40", "09:45", "10:00", "12:00", "15:30", "15:45"]
+
+
+def _stock_genome(m, time):
+    """A real STOCK genome (S1 / FMPRating) as the launcher builds the space with
+    ``--decision-times`` (``time`` given) or without it (``time`` None: the fixed default)."""
+    from app.services.strategy_param_space import collect_param_space
+
+    strat = m._build_strategy("S1", "audit-S1", "FMPRating")
+    cfg = {**m._EXPERT_OPT["FMPRating"]["expert_params"], **m._rm_opt_for("S1"),
+           **{f"schedule:{k}": v for k, v in m._SCHEDULE_DAY_OPT.items()},
+           **m._decision_time_gene(_TIME_CHOICES if time else None)}
+    model_cfg = {k: v for k, v in cfg.items()
+                 if not k.startswith("screener:") and not k.startswith("schedule:")}
+    schedule_cfg = {k[len("schedule:"):]: v for k, v in cfg.items() if k.startswith("schedule:")}
+    space = collect_param_space(strat, expert_cfg=model_cfg, schedule_cfg=schedule_cfg)
+    assert ("schedule:time" in space) == bool(time), "the launcher helper and the space disagree"
+    genome = {g: _non_default(d, 0) for g, d in space.items()}
+    # Tuesday + Thursday: neither is the run-level Monday, so the days are demonstrably the genome's.
+    genome.update({f"schedule:{d}": int(d in ("tuesday", "thursday")) for d in _ALL_DAYS})
+    if time:
+        genome["schedule:time"] = time
+    return strat, genome
+
+
+def _follow_time(m, tool, tmp_path, monkeypatch, capsys, time, expected):
+    import json
+    from types import SimpleNamespace
+    from ba2_common.core.db import add_instance, get_instance
+    from ba2_common.core.models import ExpertInstance
+    from ba2_common.core.schedule_genes import schedule_override_from_genes
+    from ba2_common.export.backtest_export import build_deploy_entry, derive_export_payload
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+    from app.services.strategy_param_space import decode_params
+
+    strat, genome = _stock_genome(m, time)
+    cfg = _backtest_cfg(strat, "FMPRating")
+    # 1. genome -> trial config: BOTH the entry and the manage schedule carry the time.
+    trial = _build_daily_trial_config(cfg, decode_params(strat, genome), None,
+                                      option_trade_records=False)
+    assert trial["run_schedule_override"]["times"] == [expected]
+    assert trial["manage_schedule_override"]["times"] == [expected]
+    assert [d for d, v in trial["run_schedule_override"]["days"].items() if v] == ["tuesday", "thursday"]
+    # 2. persisted row: the stored genome reconstructs the same schedule.
+    stored = schedule_override_from_genes(genome, cfg["run_schedule_override"])
+    assert stored["times"] == [expected]
+    # 3. export payload (the Backtest row _persist_top_backtests stores: the attributes the
+    #    shared exporter reads).
+    row = SimpleNamespace(id=7, name="timegene-row", expert_name="FMPRating", engine_type="daily",
+                          strategy_params=dict(genome), start_date=None, end_date=None,
+                          initial_capital=20_000.0)
+    payload = derive_export_payload(row, "expert_settings", opt_backtest_block=cfg)
+    sched = payload["execution"]["run_schedule_override"]
+    assert sched["times"] == [expected]
+    assert [d for d, v in sched["days"].items() if v] == ["tuesday", "thursday"]
+    # 4. the deploy tool's live settings, both schedules.
+    inst_id = add_instance(ExpertInstance(
+        account_id=1, expert="FMPRating", alias="before", enabled=True, virtual_equity_pct=10.0))
+    entry = build_deploy_entry(
+        backtest_id=7, target_instance_id=inst_id, account_id=1, virtual_equity_pct=10.0,
+        expert_name="FMPRating", label="timegene-row",
+        ruleset={"entry_rules": [], "exit_rules": []},
+        settings={**payload, "universe": None})
+    path = str(tmp_path / "payload.json")
+    json.dump([entry], open(path, "w"), default=str)
+    monkeypatch.setattr(sys, "argv", ["import_deploy_payload.py", path])
+    rc = tool.main()
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    expert = tool._expert_class("FMPRating")(get_instance(ExpertInstance, inst_id).id)
+    enter = expert.get_setting_with_interface_default("execution_schedule_enter_market")
+    manage = expert.get_setting_with_interface_default("execution_schedule_open_positions")
+    assert enter["times"] == [expected] and manage["times"] == [expected]
+    assert [d for d, v in enter["days"].items() if v] == ["tuesday", "thursday"]
+
+
+@pytest.mark.parametrize("time", ["09:35", "15:30"])
+def test_a_gene_chosen_decision_time_reaches_the_live_schedules(tool, tmp_path, monkeypatch, capsys, time):
+    _follow_time(_M, tool, tmp_path, monkeypatch, capsys, time, time)
+
+
+def test_a_fixed_default_decision_time_reaches_the_live_schedules(tool, tmp_path, monkeypatch, capsys):
+    """No time gene: the run's declared time (the shared default) is what every hop carries."""
+    from ba2_common.core.knowability import DEFAULT_DECISION_TIME
+
+    _follow_time(_M, tool, tmp_path, monkeypatch, capsys, None, DEFAULT_DECISION_TIME)
+
+
+def test_a_new_intraday_run_that_states_no_time_is_still_refused():
+    """The raise stays for a caller that truly states nothing (the audit's old hand-made config);
+    a daily clock needs no time. Pins the refusal at the trial builder, not just in knowability."""
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+    from app.services.strategy_param_space import decode_params
+
+    strat, genome = _stock_genome(_M, None)
+    decoded = decode_params(strat, genome)
+    with pytest.raises(ValueError, match="refusing to guess one"):
+        _build_daily_trial_config(_backtest_cfg(strat, "FMPRating", with_times=False), decoded,
+                                  None, option_trade_records=False)
+    _build_daily_trial_config(_backtest_cfg(strat, "FMPRating", interval="1d", with_times=False),
+                              decoded, None, option_trade_records=False)
+
+
+def test_a_stored_block_without_a_time_means_the_legacy_time():
+    """The mirror of the refusal: a STORED optimization block that states no entry time predates the
+    field and ran at the legacy first-bar time. Re-runs (/rerun, the persisted TOP-N rebuild,
+    robustness, walk-forward OOS) must keep working on it: ``stored_row=True``."""
+    from ba2_common.core.knowability import LEGACY_DECISION_TIME
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+    from app.services.strategy_param_space import decode_params
+
+    strat, genome = _stock_genome(_M, None)
+    trial = _build_daily_trial_config(_backtest_cfg(strat, "FMPRating", with_times=False),
+                                      decode_params(strat, genome), None,
+                                      option_trade_records=True, stored_row=True)
+    assert trial["run_schedule_override"]["times"] == [LEGACY_DECISION_TIME]
+    assert [d for d, v in trial["run_schedule_override"]["days"].items() if v] == ["tuesday", "thursday"]
+
+
+def test_the_rerun_rebuild_of_a_stored_optimization_block_passes_stored_row(monkeypatch):
+    """``rerun_handler._build_optimization_rerun_config`` rebuilds a STORED block: it must say so,
+    or a legacy block with no time raises 'refusing to guess one' on /rerun."""
+    import app.services.strategy_optimization_handler as SOH
+    import app.services.strategy_param_space as SPS
+    from app.services.backtest import rerun_handler as RH
+
+    seen = {}
+    monkeypatch.setattr(SPS, "decode_params", lambda strat, params: {})
+    monkeypatch.setattr(SOH, "_build_daily_trial_config",
+                        lambda bt_block, decoded, hoisted, **kw: seen.update(kw) or {})
+
+    class _Q:
+        def __init__(self, obj): self.obj = obj
+        def filter(self, *a, **k): return self
+        def first(self): return self.obj
+
+    opt = SimpleNamespace(id=1, strategy_id=1, optimization_config={"backtest": {
+        "start_date": "2024-02-01", "end_date": "2024-06-01"}})
+
+    class _Db:
+        def query(self, model):
+            return _Q(opt if model.__name__ == "StrategyOptimization" else SimpleNamespace(id=1))
+
+    bt = SimpleNamespace(id=5, optimization_id=1, start_date=None, end_date=None,
+                         strategy_params={}, name="row")
+    RH._build_optimization_rerun_config(_Db(), bt)
+    assert seen.get("stored_row") is True and seen.get("option_trade_records") is True

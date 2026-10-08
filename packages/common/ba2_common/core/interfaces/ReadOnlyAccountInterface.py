@@ -217,6 +217,14 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
     For trading-capable accounts, subclass AccountInterface instead (which inherits this).
     """
     SETTING_MODEL = AccountSetting
+
+    #: True when ``get_account_snapshot()`` is built from the very broker read ``get_account_info()``
+    #: makes (the base derives one from the other; AlpacaAccount's snapshot calls ``get_account_info``;
+    #: TastyTrade's both call ``get_balances``). An EMPTY snapshot from such an adapter already means
+    #: that read failed, so the buying-power clamp does not repeat it through ``get_account_info()``
+    #: (``MarketExpertInterface._read_actual_buying_power``): that doubled the REST calls and the adapter
+    #: ERROR tracebacks of every outage. An adapter whose two reads are independent sets False (IBKR).
+    snapshot_is_derived_from_account_info = True
     SETTING_LOOKUP_FIELD = "account_id"
 
     # Whether this account supports trading operations
@@ -556,8 +564,12 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         return float(raw)
 
     def _plain_balance(self) -> float:
-        """``get_balance()``, refusing the unknown. Margin off, and the margin path's
-        first step, share this: a fabricated balance is a fabricated order size."""
+        """The sizing balance -- ``get_balance()`` (EQUITY at every live broker), refusing the
+        unknown. Margin off, and the margin path's first step, share this: a fabricated balance
+        is a fabricated order size. ``BacktestAccount`` overrides it with its deployed equity (its
+        ``get_balance()`` is cash), so every reader of this seam -- the classic RM's virtual
+        balance, the option buying-power gate, the margin ceiling -- sees the same quantity in a
+        backtest as live."""
         balance = self.get_balance()
         if balance is None:
             raise ValueError(
@@ -703,8 +715,8 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         For a sizer of a TARGET BOOK ("this name is w% of what I own"), which is a different
         question from ``get_tradable_balance``'s "what may I still spend". At every live
         broker the two are the same number (``get_balance()`` is equity there); on the
-        backtest account ``get_balance()`` is CASH (finding 6, left as is for the classic
-        RM), so a book sized on it reads a fully invested account as nearly empty.
+        backtest account ``get_balance()`` is CASH, but its sizing balance (``_plain_balance``)
+        is its deployed equity since finding 6 was fixed (2026-10-07), so they agree there too.
         ``get_account_snapshot().equity`` means cash + marks in BOTH runtimes -- the backtest
         publishes its (equity-cap-clamped) ``deployed_equity()`` there -- which is why this
         reads it.

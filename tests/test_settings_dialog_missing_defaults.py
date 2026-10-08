@@ -1187,6 +1187,16 @@ def test_app_settings_edited_fields_are_written(fake_ui):
     assert _app_rows() == [("openai_api_key", "sk-new"), ("worker_count", "3")]
 
 
+def test_app_settings_session_guard_switch_shows_its_declared_default_and_saves_a_flip(fake_ui):
+    t = _app_tab()
+    assert t.session_guard_input.value is True                       # declared default ON
+    _app_tab().save_settings()
+    assert _app_rows() == []                                          # no edit, nothing written
+    t.session_guard_input.value = False
+    t.save_settings()
+    assert _app_rows() == [("scheduled_session_guard_enabled", "false")]
+
+
 def test_runtime_readers_use_the_same_declaration(monkeypatch):
     """No row: WorkerQueue, JobManager and ModelFactory read the declared default -- the
     value the UI shows -- not literals of their own."""

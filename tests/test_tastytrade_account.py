@@ -406,23 +406,88 @@ def test_get_positions_maps_a_short_to_the_sell_side():
     assert acct.get_positions()[0].side == OrderDirection.SELL
 
 
-def test_get_positions_reports_quantity_as_a_positive_magnitude():
-    """N06/N07. Position.qty is a MAGNITUDE and `side` carries the direction -- the
-    Alpaca convention every consumer here assumes. A signed qty would make
-    market_value, cost_basis and every allocation weight negative for a short.
-    qty_available mirrors it: TastyTrade publishes no separate held-for-orders
-    quantity, so reporting anything else would understate what can be closed."""
+def test_a_long_position_is_reported_exactly_as_before():
+    """LONG positions are unchanged by the short-sign fix (TastyTrade is long-only in production):
+    positive qty / cost basis / market value, P&L = mark - cost."""
     acct = _bare_account()
     acct._account.get_positions = AsyncMock(return_value=[
-        _tt_position(symbol="AAPL", quantity="-10", direction="Short",
+        _tt_position(symbol="AAPL", quantity="10", direction="Long",
                      average_open_price="140", close_price="150", mark_price="155")])
 
-    position = acct.get_positions()[0]
+    p = acct.get_positions()[0]
 
-    assert position.qty == 10.0
-    assert position.qty_available == 10.0
-    assert position.cost_basis == pytest.approx(1400.0)
-    assert position.market_value == pytest.approx(1550.0)
+    assert p.qty == 10.0 and p.qty_available == 10.0
+    assert p.cost_basis == pytest.approx(1400.0)
+    assert p.market_value == pytest.approx(1550.0)
+    assert p.unrealized_pl == pytest.approx(150.0)
+    assert p.unrealized_plpc == pytest.approx(150.0 / 1400.0)
+    assert p.unrealized_intraday_pl == pytest.approx(50.0)      # (155 - 150) x 10
+    assert p.change_today == pytest.approx(5.0 / 150.0)
+
+
+def test_a_short_position_is_reported_signed_negative_like_alpaca():
+    """TastyTrade publishes ``quantity`` ABSOLUTE and the direction in ``quantity_direction``. The
+    platform's Position contract (Alpaca's, read by get_signed_position_quantity, the exposure gate
+    and the breach sweep) is SIGNED: a short's qty, cost basis and market value are negative, and
+    its P&L is positive when the price FALLS. (It used to report +qty and a P&L with the long sign.)"""
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="10", direction="Short",
+                     average_open_price="140", close_price="150", mark_price="155")])
+
+    p = acct.get_positions()[0]
+
+    assert p.qty == -10.0 and p.qty_available == -10.0
+    assert p.cost_basis == pytest.approx(-1400.0)
+    assert p.market_value == pytest.approx(-1550.0)
+    assert p.unrealized_pl == pytest.approx(-150.0)             # shorted at 140, now 155: a LOSS
+    assert p.unrealized_plpc == pytest.approx(-150.0 / 1400.0)
+    assert p.unrealized_intraday_pl == pytest.approx(-50.0)     # rose 5 on 10 short shares
+    assert acct.get_signed_position_quantity("AAPL") == -10.0
+
+
+def test_a_short_that_fell_is_a_gain():
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="10", direction="Short",
+                     average_open_price="140", close_price="130", mark_price="120")])
+
+    p = acct.get_positions()[0]
+
+    assert p.unrealized_pl == pytest.approx(200.0)
+    assert p.unrealized_plpc == pytest.approx(200.0 / 1400.0)
+
+
+def test_a_zero_position_row_is_skipped_and_reads_flat():
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="0", direction="Zero")])
+
+    assert acct.get_positions() == []
+    assert acct.get_signed_position_quantity("AAPL") == 0.0
+
+
+def test_a_held_row_with_an_unknown_direction_makes_the_book_unreadable():
+    """No guessing a direction: None (fetch failure) is what every caller refuses on."""
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="10", direction="Sideways")])
+
+    assert acct.get_positions() is None
+    assert acct.get_signed_position_quantity("AAPL") is None
+
+
+def test_the_allocation_sign_helper_agrees_with_the_signed_short():
+    """``signed_position_values`` is idempotent on an already-negative short, so the portfolio
+    allocation read is unchanged by the fix."""
+    from ba2_common.core.portfolio_allocation import signed_position_values
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="10", direction="Short",
+                     average_open_price="140", mark_price="155")])
+    p = acct.get_positions()[0]
+    assert signed_position_values(p.side, quantity=p.qty, cost_basis=p.cost_basis,
+                                  market_value=p.market_value) == (-10.0, -1400.0, -1550.0)
 
 
 def test_get_positions_treats_an_absent_multiplier_as_one():

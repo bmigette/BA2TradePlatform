@@ -50,11 +50,12 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
+from ba2_common.core.schedule_genes import schedule_refusal_message, schedule_weekday_enabled
 from ba2_common.core.utils import as_utc_key
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 from ba2_common.core.db import add_instance, get_instance
 from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
-from ba2_common.core.trade_cycle import record_max_loss_stop
+from ba2_common.core.trade_cycle import record_max_loss_stop, stamp_safeguard_anchor
 from ba2_common.core.types import (
     AnalysisUseCase,
     OrderDirection,
@@ -78,8 +79,12 @@ from app.services.backtest.seam_wiring import make_indicator_provider, make_atr_
 # Clock + universe hooks
 # ---------------------------------------------------------------------------
 def _reraise_option_basis_refusal(e: BaseException) -> None:
-    """Re-raise the option path's split-basis refusals out of the engine's per-symbol /
-    per-expiry ``except Exception`` handlers (plan Part E).
+    """Re-raise the refusals that must END the run out of the engine's per-symbol / per-expiry /
+    per-bar ``except Exception`` handlers: the option path's split-basis refusals (plan Part E) AND
+    ``StaleAnchorPrice`` (the intraday anchor-price guard: a plain-float or look-ahead anchor reaching
+    an order level or a size). The second kind is not a bad symbol: it means the code path builds
+    levels from the wrong price, so swallowing it as "one WARNING and a dropped entry" would return a
+    quietly reduced-universe result.
 
     Those handlers turn a failure into a log line so one bad symbol cannot abort a bar. A
     basis refusal is not that: it means every strike, greek and intrinsic value the run
@@ -87,9 +92,11 @@ def _reraise_option_basis_refusal(e: BaseException) -> None:
     hermetic cache misses those handlers already re-raise. Only the option path can raise
     these, so an equity run never reaches this."""
     from ba2_common.core.split_basis import SplitBasisRefused
+    from ba2_common.core.knowability import StaleAnchorPrice
     from app.services.backtest.option_basis_guard import OptionSpotBasisMismatch
     from app.services.backtest.backtest_account import ComboSettlementRefused
-    if isinstance(e, (SplitBasisRefused, OptionSpotBasisMismatch, ComboSettlementRefused)):
+    if isinstance(e, (SplitBasisRefused, OptionSpotBasisMismatch, ComboSettlementRefused,
+                      StaleAnchorPrice)):
         raise e
 
 
@@ -118,12 +125,94 @@ def resolve_universe(as_of: datetime, config: Dict[str, Any], price_source) -> L
     (signature + filter) is built now so the swap is body-only.
     """
     universe = config["enabled_instruments"]
+    if getattr(price_source, "is_intraday", False):
+        # INTRADAY clock: a symbol is decidable when a price is KNOWABLE at ``as_of`` (the close of
+        # its latest bar that has ended, same or last finished session), NOT only when it printed
+        # a bar stamped exactly at ``as_of``. A thin name that did not trade in this one 5-minute
+        # window is still analysed live; its order fills at its next bar's open, whenever that
+        # opens (BacktestAccount.refresh_orders reads ``next_bar``).
+        idx = price_source._dp_index                     # per-tick cut-offs + cursor: no bisect per symbol
+        return [s for s in universe if idx(s) >= 0]
     return [s for s in universe if price_source.bar_at(s, as_of) is not None]
+
+
+#: A run in which MORE than this share of an expert's analysis passes raised (and were swallowed per
+#: symbol / per bar by the loops below) is REFUSED at the end of the run: its trades and fitness would
+#: measure a broken expert (a basket that fails every day trades nothing and looks like "no edge").
+MAX_FAILED_ANALYSIS_SHARE = 0.05
+#: ...judged only once an expert has made this many passes (a 2-pass fixture failing once is not a rate).
+MIN_ANALYSIS_PASSES_FOR_REFUSAL = 20
+
+
+class AnalysisFailureRefusal(RuntimeError):
+    """The run's analysis passes failed too often for its result to mean anything.
+
+    JOB-FATAL: the GA master aborts the whole optimization on the first trial that raises it
+    (``strategy_optimization_handler.JOB_FATAL_ERROR_TYPES``). The structured fields travel in the message
+    (expert, passes, failed, share, first error) because a worker returns the TYPE NAME and the text."""
+
+    def __init__(self, message: str, *, expert_id: Any = None, passes: int = 0, failed: int = 0,
+                 first_error: Any = None):
+        super().__init__(message)
+        self.expert_id, self.passes, self.failed, self.first_error = expert_id, passes, failed, first_error
+
+
+#: A run in which MORE than this share of its entries WITH A STOP could not re-base that stop to the fill
+#: (no stamped anchor and no reference price: the stop kept its pre-fill level) is REFUSED: the result
+#: would measure stops that live does not have. With every level stamping its anchor this is zero.
+MAX_UNANCHORED_STOP_SHARE = 0.05
+#: ...judged only from this many entries with a stop on (a 3-entry fixture is not a rate).
+MIN_STOP_ENTRIES_FOR_REBASE_REFUSAL = 20
+
+
+class FillRebaseRefusal(RuntimeError):
+    """Too many entries' stops could not be re-based to their fill for the result to mean anything.
+    JOB-FATAL (``app.services.job_fatal``)."""
+
+
+
+class ScreenerUniverseRefusal(RuntimeError):
+    """The per-decision screener gate selected symbols that are NOT in the run's static universe.
+
+    JOB-FATAL (``job_fatal.JOB_FATAL_ERROR_TYPES``): under the superset rule
+    (``ba2_providers.screener.universe_superset``) the static universe contains every symbol any genome's
+    gate can select, so a non-zero count means the superset logic is wrong again (or the cache/exclusion
+    handling changed the list): every genome's result would silently omit tradable picks. The counts travel
+    in the message because a worker returns the TYPE NAME and the text."""
+
+    def __init__(self, message: str, *, gate_selected: int = 0, outside: int = 0, examples: Any = None):
+        super().__init__(message)
+        self.gate_selected, self.outside, self.examples = gate_selected, outside, examples
+
+
+_FIRST_BAR_WARNED: set = set()   # schedule times already warned about in this process
+
+
+class _BacktestProviderBundle(LiveProviderBundle):
+    """``LiveProviderBundle`` whose ``price_at_date`` is the price KNOWABLE at the decision.
+
+    The inherited read is "the last DAILY close <= as_of". On an intraday clock that is wrong in
+    the one way that matters: with daily bars stamped at midnight it is the decision session's
+    own FINISHED close at 09:30 (and, once daily reads honour knowability, merely yesterday's
+    close, which is not what live's quote returns at 09:30 either). On an intraday clock this
+    answers from the run's own intraday series via ``AsOfPriceSource.decision_price`` -- the
+    close of the latest bar that has ENDED at the decision instant. On a daily clock it is the inherited read, unchanged.
+    """
+
+    def __init__(self, get_provider: Callable[..., Any], price_source: Any):
+        super().__init__(get_provider)
+        self._price_source = price_source
+
+    def price_at_date(self, symbol: str, as_of: Optional[datetime]) -> Optional[float]:
+        if as_of is not None and self._price_source.is_intraday:
+            return self._price_source.decision_price(symbol, as_of)
+        return super().price_at_date(symbol, as_of)
 
 
 def _screened_symbols_for_bar(
     screener_runtime: Optional[Dict[str, Any]], as_of_dt: datetime,
-    cache: Optional[Dict[str, List[str]]] = None,
+    cache: Optional[Dict[str, List[str]]],
+    *, intraday: bool,
 ) -> Optional[List[str]]:
     """The dynamic per-day universe of symbols ALLOWED TO ENTER on this bar.
 
@@ -159,10 +248,13 @@ def _screened_symbols_for_bar(
     store = screener_runtime["store"]
     df = ms.load_store(store)
     days = ms.scan_dates(df, store_key=store)
-    i = bisect.bisect_right(days, as_of_dt.strftime("%Y-%m-%d")) - 1
-    if i < 0:
+    # THE scan visible at this decision (``metric_store.visible_scan_date``): on an intraday clock a
+    # scan dated S is visible iff every session dated <= S has finished at the decision (a Saturday
+    # scan from Monday's open, a Wednesday scan only after Wednesday's close); on a daily clock the
+    # scan dated <= the bar's date, as before. ``intraday`` is REQUIRED: no caller may default it.
+    day = ms.visible_scan_date(days, as_of_dt, intraday=intraday)
+    if day is None:
         return []
-    day = days[i]
     if cache is not None and day in cache:
         return cache[day]
     syms = ms.screen_universe_for_day(df, day, screener_runtime["settings"],
@@ -265,7 +357,7 @@ def _schedule_allows_entry(as_of_dt: datetime, schedule: Optional[Dict[str, Any]
         ctx = _bar_date_context(as_of_dt)
     days = schedule.get("days") or {}
     wd = _WEEKDAYS[ctx.weekday]
-    if not days.get(wd, True):
+    if not schedule_weekday_enabled(days, wd):      # ONE rule, shared with the live scheduler
         return False
     if not is_intraday:
         return True
@@ -310,6 +402,17 @@ def option_expiry_outcome(opt_type, side, *, strike, spot, qty, multiplier=100):
 # ---------------------------------------------------------------------------
 # Recommendation -> ExpertRecommendation row
 # ---------------------------------------------------------------------------
+def rec_is_unpriced(rec: Any) -> bool:
+    """True for a recommendation that carries a decision (not a skip, not an ERROR) but no price: the
+    expert's ``_decision_price`` found none at this instant (a thin name with no ended bar, a quote that
+    could not be read). Nothing can be decided or persisted for it."""
+    # a wrong-SHAPE return (a list from a per-symbol expert) is not "unpriced": it keeps failing loudly
+    # in the converter (``rec.signal``), it must not be swallowed here.
+    return (hasattr(rec, "signal") and not getattr(rec, "skip", False)
+            and getattr(rec, "signal", None) != OrderRecommendation.ERROR
+            and getattr(rec, "current_price", None) is None)
+
+
 def _recommendation_to_expert_recommendation(
     rec: Any,
     *,
@@ -332,6 +435,10 @@ def _recommendation_to_expert_recommendation(
     the ruleset position conditions and the RM query by).
     """
     if getattr(rec, "skip", False):
+        return None
+    if rec_is_unpriced(rec):
+        # No decision price: ``ExpertRecommendation.price_at_date`` is NOT nullable and a fabricated
+        # price must never be written. Not persisted, exactly like a ``skip`` (the callers count it).
         return None
     action = rec.signal
     if action == OrderRecommendation.ERROR:
@@ -433,6 +540,16 @@ class DailyBacktestEngine:
         # set only changes per scan date (weekly cadence), so it's computed once per scan date and
         # reused for every bar in that period (vs recomputing the full-store filter every 5min bar).
         self._screened_cache: Dict[str, List[str]] = {}
+        # SCREENER UNIVERSE GUARD. ``screener_universe_guard`` is "refuse" | "warn" | absent/None. Absent by
+        # design for every run that is not a screener-universe job (no gate, a gate-only run, a bypass
+        # expert), so its absence means "not applicable", not "forgotten" (CLAUDE.md no-defaults rule is
+        # about required config). Counts every gate selection against the run's LOADED universe.
+        self._su_mode = config["screener_universe_guard"] if "screener_universe_guard" in config else None
+        if self._su_mode not in (None, "refuse", "warn"):
+            raise ValueError(f"screener_universe_guard must be 'refuse', 'warn' or None, got {self._su_mode!r}")
+        self._su_loaded = frozenset(config["enabled_instruments"]) if self._su_mode else frozenset()
+        self._su = {"decisions": 0, "gate_selected": 0, "outside_static_universe": 0,
+                    "first_examples": [], "_last_as_of": None}
         # BYPASS-expert (FactorRanker) per-run manager cache. The portfolio manager
         # holds only run-CONSTANT state (the resolver expert/account instances + ids), so building
         # it ONCE per expert avoids an ExpertInstance DB query on every rebalance bar.
@@ -442,6 +559,22 @@ class DailyBacktestEngine:
         # Adds the bypass manager refused under its per-symbol max-loss rule, over the run
         # (RECORDED, NOT SCORED; see FactorRanker.portfolio.ProtectiveStopError).
         self._refused_adds = 0
+        # Counters of the intraday-clock rule, published in ``results["intraday_clock"]``:
+        #   undecidable_symbol_days       -- (decision day x symbol) pairs dropped from an ENTRY pass
+        #                                    because no price was knowable at the decision (halted /
+        #                                    stale / no bars): the universe the experts really saw
+        # (the sessions on which a scheduled time had no bar at all, i.e. no decision that day, are
+        # ``self.sessions_without_decision_bar``, published next to these.)
+        #   manage_skipped_no_price_symbol_ticks / entry_skipped_no_price_symbol_ticks -- (tick x symbol)
+        #                                    pairs whose recommendation carried no price (nothing decided)
+        self.intraday_counters: Dict[str, int] = {"undecidable_symbol_days": 0,
+                                                  "manage_skipped_no_price_symbol_ticks": 0,
+                                                  "entry_skipped_no_price_symbol_ticks": 0}
+        # Analysis passes per expert: {"passes": n, "failed": m, "first_error": str|None}. A pass is
+        # one ``analyze_as_of`` call (per symbol for a classic expert, per bar for a basket / bypass
+        # expert); "failed" = it raised and the loop swallowed it. Published in
+        # ``results["analysis_failures"]``; ``refuse_if_analysis_failing`` enforces the threshold.
+        self.analysis_failures: Dict[int, Dict[str, Any]] = {}
 
         # Entry-option path: when the run's enter_market action IS an option action (pure-option
         # entry, no equity leg), the option action must size + submit itself — so the entry runs
@@ -538,15 +671,21 @@ class DailyBacktestEngine:
         indicator_provider = self._indicator_provider
         if indicator_provider is None:
             store = (self._screener_runtime or {}).get("store") if self._screener_runtime else None
-            indicator_provider = make_atr_cache_indicator_provider(store) or make_indicator_provider()
+            indicator_provider = (
+                make_atr_cache_indicator_provider(store, session_date_fn=self.price.scan_cutoff_date)
+                or make_indicator_provider())
         self._indicator_provider = indicator_provider
 
         self._check_regime_calendar()
+        self._validate_schedules_once()
         # Start from a clean regime even if a PREVIOUS trial in this worker died mid-loop and
         # never reached its own reset.
         reset_stressed()
 
+        self._assert_daily_reads_are_clamped()
         days = trading_days(self.config["start_date"], self.config["end_date"], self.price)
+        self._warn_if_deciding_on_the_first_bar(days)
+        self._count_sessions_without_decision_bar(days)
         total = max(len(days), 1)
         # Progress throttle: the handler's progress_cb does DB work every call (a task-queue
         # pause-check + a progress write). On a 5-minute fill clock a 1-year/8-symbol run is
@@ -564,7 +703,9 @@ class DailyBacktestEngine:
         # the analysis cadence, fills are continuous). SEPARATE sets per sub-pass: with one
         # shared set, whichever gate fired first in the day claimed the (expert, day) key and
         # STARVED the other pass whenever the entry and manage schedules pin different times
-        # (benign while both pin 09:30, but a one-line trap for any future schedule change).
+        # (the trap is closed: the sets are separate, so an entry time of 09:40 with a manage time
+        # of 09:30 / 15:30 each run once per day; the entry-time sweep in test_intraday_daily_knowability.py runs the
+        # engine at 09:30 / 09:35 / 09:40 / 09:45).
         analyzed_entry_days: set = set()
         analyzed_manage_days: set = set()
 
@@ -644,27 +785,15 @@ class DailyBacktestEngine:
             #     regime_overlay seam instead of classifying per symbol. Cheap: a bisect into the
             #     precomputed calendar. None (no calendar) publishes None = neutral, which
             #     _check_regime_calendar has already proven no expert depends on.
-            set_stressed(self._regime_calendar.at(as_of_dt) if self._regime_calendar else None)
+            #     The calendar's flag for day S is classified from S's CLOSE, so the lookup day is
+            #     the newest session whose daily data is knowable at this decision.
+            set_stressed(self._regime_calendar.at(self.price.scan_cutoff_date(as_of_dt))
+                         if self._regime_calendar else None)
 
-            # 2. universe for the bar.
-            universe = resolve_universe(as_of_dt, self.config, self.price)
-
-            # 2a. per-day DYNAMIC screener gate (screener-settings optimization). Computed ONCE
-            #     per bar from this run's effective screener settings, resolving to the latest
-            #     scan date <= the bar (the universe holds between weekly scans). When
-            #     ``allowed is not None`` it restricts which symbols may ENTER this bar — the
-            #     ENTRY candidate universe fed to ``_run_expert_bar`` is intersected with it,
-            #     PRESERVING bar order so determinism is unchanged. Open-position management /
-            #     exits are NOT gated: ``_manage_open_positions``, the bypass rebalance, ``_apply_option_expiry`` and the OCO bracket fills all
-            #     run over held positions / the full universe regardless. When no screener is
-            #     configured ``_screened_symbols_for_bar`` returns None and this is a no-op
-            #     (byte-identical to a non-screener run — the hot path is untouched).
-            entry_universe = universe
-            if self._screener_runtime:
-                allowed = _screened_symbols_for_bar(self._screener_runtime, as_of_dt, self._screened_cache)
-                if allowed is not None:
-                    allowed_set = set(allowed)
-                    entry_universe = [s for s in universe if s in allowed_set]
+            # 2. universe for the bar: resolved LAZILY (``_bar_universes``) by the first expert pass that
+            #    needs it, so a tick on which no expert is scheduled pays nothing for it. The equity
+            #    curve's marks never read it.
+            universe = entry_universe = None
 
             # The fill engine reads working orders from BacktestAccount's in-memory order cache
             # (no per-bar DB query). That cache only goes stale when this bar CREATES new orders —
@@ -728,8 +857,14 @@ class DailyBacktestEngine:
                         manage_ok = False
                     if not (entry_ok or manage_ok):
                         continue
+                if entry_ok or manage_ok:
+                    if universe is None:
+                        universe, entry_universe = self._bar_universes(as_of_dt)
                 if entry_ok:
                     analyzed_entry_days.add(_day_key)
+                    if self.price.is_intraday:
+                        self.intraday_counters["undecidable_symbol_days"] += (
+                            len(self.config["enabled_instruments"]) - len(universe))
                 if manage_ok:
                     analyzed_manage_days.add(_day_key)
                 book_dirty = True  # an analysis/management pass runs -> orders may be created
@@ -890,6 +1025,248 @@ class DailyBacktestEngine:
             return True
 
     # -- run-cadence --------------------------------------------------------
+    def _validate_schedules_once(self) -> None:
+        """Refuse, ONCE and up front, a run whose entry/manage schedule has an unknown day key.
+
+        The live scheduler refuses such a schedule (``JobManager._schedule_is_runnable``); the bar
+        loop would otherwise read the typo'd day at its default and score a cadence live would never
+        run. Called at run setup, never per bar and never mid-trial; all known schedule writers emit
+        exactly seven lower-case keys, so a valid run cannot trip it (pinned in
+        ``test_schedule_weekday_shared``)."""
+        for expert, expert_id, _s, _r in self.experts:
+            for label, schedule in (("entry", self._entry_schedule(expert)),
+                                    ("manage", self._manage_schedule(expert))):
+                refusal = schedule_refusal_message(schedule)
+                if refusal:
+                    raise ValueError(f"Backtest refused: expert {expert_id}'s {label} {refusal}")
+
+    def _bar_universes(self, as_of_dt: datetime):
+        """``(universe, entry_universe)`` for the bar: the decidable symbols, and that set intersected
+        with the per-day dynamic screener gate (entries only; management is never gated)."""
+        universe = resolve_universe(as_of_dt, self.config, self.price)
+        entry_universe = universe
+        if self._screener_runtime:
+            allowed = _screened_symbols_for_bar(
+                self._screener_runtime, as_of_dt, self._screened_cache,
+                intraday=self.price.is_intraday)
+            if allowed is not None:
+                if self._su_mode:
+                    self._note_screener_selection(allowed, as_of_dt)
+                allowed_set = set(allowed)
+                entry_universe = [s for s in universe if s in allowed_set]
+        return universe, entry_universe
+
+    def _note_screener_selection(self, allowed: List[str], as_of_dt: datetime) -> None:
+        """Count one decision's gate selection against the run's loaded universe (once per distinct
+        decision instant: several experts share it)."""
+        g = self._su
+        if g["_last_as_of"] == as_of_dt:
+            return
+        g["_last_as_of"] = as_of_dt
+        g["decisions"] += 1
+        g["gate_selected"] += len(allowed)
+        for sym in allowed:
+            if sym not in self._su_loaded:
+                g["outside_static_universe"] += 1
+                if len(g["first_examples"]) < 10 and all(e["symbol"] != sym for e in g["first_examples"]):
+                    g["first_examples"].append({"symbol": sym, "as_of": str(as_of_dt)})
+
+    def screener_universe_record(self) -> Optional[Dict[str, Any]]:
+        """``results["screener_universe"]``, or None when the guard does not apply to this run."""
+        if not self._su_mode:
+            return None
+        g = self._su
+        return {"mode": self._su_mode, "decisions": g["decisions"], "gate_selected": g["gate_selected"],
+                "outside_static_universe": g["outside_static_universe"],
+                "first_examples": list(g["first_examples"])}
+
+    def refuse_if_screener_universe_outside(self) -> None:
+        """RAISE ``ScreenerUniverseRefusal`` when the gate selected any symbol outside the loaded
+        universe and the guard is 'refuse'; with 'warn' (a stored pre-superset row that keeps its frozen
+        list) log ONE loud WARNING with the counts instead."""
+        rec = self.screener_universe_record()
+        if rec is None or not rec["outside_static_universe"]:
+            return
+        msg = (f"{rec['outside_static_universe']} of {rec['gate_selected']} screener gate selections over "
+               f"{rec['decisions']} decisions are NOT in the run's static universe "
+               f"({len(self._su_loaded)} symbols loaded) and could never be traded; first: {rec['first_examples']}")
+        if self._su_mode == "refuse":
+            raise ScreenerUniverseRefusal(
+                f"Backtest refused: {msg}. Under the superset rule the static universe holds every "
+                f"symbol any genome's gate can select, so the superset derivation is wrong or the list "
+                f"was altered.", gate_selected=rec["gate_selected"], outside=rec["outside_static_universe"],
+                examples=rec["first_examples"])
+        logger.warning(f"[daily_engine] SCREENER UNIVERSE (legacy frozen list, results are NOT "
+                       f"comparable with a superset-universe run): {msg}")
+
+    def _analysis_pass(self, expert_id: int) -> None:
+        rec = self.__dict__.setdefault("analysis_failures", {}).setdefault(expert_id, {"passes": 0, "failed": 0, "first_error": None})
+        rec["passes"] += 1
+
+    def _analysis_failed(self, expert_id: int, what: str) -> None:
+        rec = self.analysis_failures[expert_id]
+        rec["failed"] += 1
+        if rec["first_error"] is None:
+            rec["first_error"] = what[:500]
+
+    def analysis_failures_record(self) -> Dict[str, Any]:
+        """The ``analysis_failures`` blob: totals plus the per-expert counts and first error."""
+        passes = sum(r["passes"] for r in self.analysis_failures.values())
+        failed = sum(r["failed"] for r in self.analysis_failures.values())
+        first = next((r["first_error"] for r in self.analysis_failures.values() if r["first_error"]), None)
+        return {"passes": passes, "failed": failed, "first_error": first,
+                "by_expert": {str(k): dict(v) for k, v in self.analysis_failures.items()}}
+
+    def refuse_if_analysis_failing(self) -> None:
+        """ONE summary WARNING when any pass failed; RAISE when an expert's failed share exceeds
+        ``MAX_FAILED_ANALYSIS_SHARE`` (judged from ``MIN_ANALYSIS_PASSES_FOR_REFUSAL`` passes on).
+        An expert that analyses fine and emits no BUY has ZERO failed passes: not a failure."""
+        rec = self.analysis_failures_record()
+        if not rec["failed"]:
+            return
+        logger.warning(
+            f"[daily_engine] ANALYSIS FAILURES: {rec['failed']} of {rec['passes']} analysis passes "
+            f"raised and were skipped; first: {rec['first_error']}")
+        for expert_id, r in self.analysis_failures.items():
+            if (r["passes"] >= MIN_ANALYSIS_PASSES_FOR_REFUSAL
+                    and r["failed"] / r["passes"] > MAX_FAILED_ANALYSIS_SHARE):
+                raise AnalysisFailureRefusal(
+                    f"Backtest refused: expert {expert_id}: {r['failed']} of {r['passes']} analysis "
+                    f"passes failed ({r['failed'] / r['passes']:.0%} > {MAX_FAILED_ANALYSIS_SHARE:.0%}); "
+                    f"the result would measure a broken expert, not the strategy. First error: "
+                    f"{r['first_error']}",
+                    expert_id=expert_id, passes=r["passes"], failed=r["failed"],
+                    first_error=r["first_error"])
+
+    def refuse_if_rebase_unanchored(self) -> Dict[str, Any]:
+        """The fill-time re-base's summary line, and the refusal. ONE log line per run (WARNING when
+        any stop had no usable anchor or relied on the fallback chain, INFO otherwise); RAISES
+        ``FillRebaseRefusal`` when entries whose stop could not be re-based exceed
+        ``MAX_UNANCHORED_STOP_SHARE`` of the entries with a stop (judged from
+        ``MIN_STOP_ENTRIES_FOR_REBASE_REFUSAL`` on). Returns the record."""
+        rec = self.account.fill_rebase_record()
+        line = (f"[daily_engine] fill re-base ({'ON' if rec['enabled'] else 'OFF - measurement hook'}): "
+                f"{rec['entries_with_levels']} entries with levels, {rec['entries_with_stop']} with a stop, "
+                f"{rec['stop_rebased']} stops re-based, {rec['tp_floored']} targets floored, "
+                f"{rec['fallback_reference']} stops on the fallback reference chain, "
+                f"{rec['no_reference']} stops with NO usable reference")
+        if rec["no_reference"] or rec["fallback_reference"]:
+            logger.warning(line)
+        else:
+            logger.info(line)
+        n = rec["entries_with_stop"]
+        if (n >= MIN_STOP_ENTRIES_FOR_REBASE_REFUSAL
+                and rec["no_reference"] / n > MAX_UNANCHORED_STOP_SHARE):
+            raise FillRebaseRefusal(
+                f"Backtest refused: {rec['no_reference']} of {n} entries with a stop "
+                f"({rec['no_reference'] / n:.0%} > {MAX_UNANCHORED_STOP_SHARE:.0%}) had no anchor to "
+                f"re-base the stop to the fill; those stops stayed at their pre-fill level, which live "
+                f"does not do")
+        return rec
+
+    def _assert_daily_reads_are_clamped(self) -> None:
+        """An intraday run's OHLCV reader MUST be bound to THIS run's price source, otherwise every
+        daily read the experts make returns the decision session's own finished bar (the +404%
+        defect). Refuses to start rather than run unclamped. No-op on a daily clock and when the
+        run has no per-run OHLCV reader (fixture runs that preload bars)."""
+        if not getattr(self.price, "is_intraday", False):
+            return
+        from app.services.backtest.seam_wiring import _current_ohlcv_override
+
+        reader = _current_ohlcv_override()
+        if reader is None or not hasattr(reader, "bind_price_source"):
+            return
+        if getattr(reader, "_ps", None) is not self.price:
+            raise RuntimeError(
+                "intraday backtest started with an OHLCV reader that is not bound to the run's price "
+                "source (MemoizedOHLCVProvider.bind_price_source): daily reads would return the "
+                "decision session's own bar. Refusing to run.")
+
+    def _warn_if_deciding_on_the_first_bar(self, days: List[Any]) -> None:
+        """ONE WARNING per run when an entry schedule time equals the first bar of a session.
+
+        The decision price is the close of the latest bar that has ENDED at the decision instant,
+        so a decision on the session's first bar sees only the PREVIOUS session's last bar -- the
+        cache has no pre-market bars -- while a live run at that instant reads the opening quote.
+        Not refused (stored rows scheduled at the open must still re-run); the run is merely not
+        what live would do. No-op on a daily clock."""
+        if not getattr(self.price, "is_intraday", False):
+            return
+        first_bar_hhmm = set()
+        seen_days = set()
+        for d in days:
+            day = d.date()
+            if day not in seen_days:
+                seen_days.add(day)
+                first_bar_hhmm.add(d.strftime("%H:%M"))
+        for expert, _eid, _settings, _ruleset in self.experts:
+            sched = self._entry_schedule(expert) or {}
+            hit = sorted(set(sched.get("times") or ()) & first_bar_hhmm)
+            if hit:
+                # ONCE PER PROCESS (a GA worker is one job's process, running many trials): the
+                # same schedule time would otherwise print one warning per trial.
+                if tuple(hit) in _FIRST_BAR_WARNED:
+                    return
+                _FIRST_BAR_WARNED.add(tuple(hit))
+                logger.warning(
+                    f"[daily_engine] entry schedule time {hit} equals the first bar of a session: "
+                    f"a decision at the session open sees the PRIOR session's close (no pre-market "
+                    f"bars; the price is the last bar that has ended), but live sees the opening "
+                    f"quote. Use a time >= the first bar + one bar (ba2_common.core.knowability."
+                    f"DEFAULT_DECISION_TIME).")
+                return
+
+    def _count_sessions_without_decision_bar(self, days: List[Any]) -> None:
+        """COUNT (and log, once per run) the scheduled sessions on which a scheduled time has no
+        bar, so the pass for that time NEVER RUNS that session.
+
+        The case this exists for: a decision time late in the day (15:30) on a SHORT session. A
+        half day closes at 13:00, its last 5-minute bar is 12:55, so a 15:30 schedule matches no
+        bar and the session gets no entry decision (and no manage pass at that time). The engine
+        has always skipped such a session silently (the loop only visits bars that exist); this
+        makes the skip explicit, counted and loud. It is deliberately NOT a refusal -- a
+        half-day skip is the conservative behaviour (no entry on a closed market) -- and it does
+        not change a decision, a fill or the results.
+
+        LIVE DIFFERS: JobManager fires a CronTrigger at the stored time with no session check
+        (``JobManager._parse_schedule``), so on a half day live would run the 15:30 pass against
+        a closed market. That asymmetry is reported in the feature notes, not hidden here.
+
+        ``self.sessions_without_decision_bar`` = ``{"entry": n, "manage": n}`` (sessions x times).
+        No-op on a daily clock."""
+        self.sessions_without_decision_bar = {"entry": 0, "manage": 0}
+        if not getattr(self.price, "is_intraday", False):
+            return
+        bars_by_day: Dict[Any, set] = {}
+        for d in days:
+            bars_by_day.setdefault(d.date(), set()).add((d.hour, d.minute))
+        examples: Dict[str, List[str]] = {"entry": [], "manage": []}
+        for expert, _eid, _settings, _ruleset in self.experts:
+            for label, sched in (("entry", self._entry_schedule(expert)),
+                                 ("manage", self._manage_schedule(expert))):
+                times = (sched or {}).get("times") or []
+                if not times:
+                    continue
+                wanted = [(t, (int(t[:2]), int(t[3:]))) for t in times]
+                enabled = (sched or {}).get("days") or {}
+                for day, hm in bars_by_day.items():
+                    if not schedule_weekday_enabled(enabled, _WEEKDAYS[day.weekday()]):
+                        continue
+                    for t, key in wanted:
+                        if key not in hm:
+                            self.sessions_without_decision_bar[label] += 1
+                            if len(examples[label]) < 5:
+                                examples[label].append(f"{day} {t}")
+        if any(self.sessions_without_decision_bar.values()):
+            # A GA trial (``_ga_trial``) logs at DEBUG: thousands of trials would repeat the same
+            # line. The MASTER aggregates the counter the trials return and warns ONCE per job
+            # (strategy_optimization_handler). A single backtest has no master, so it warns here.
+            (logger.debug if self.config.get("_ga_trial") else logger.warning)(
+                f"[daily_engine] SESSIONS WITHOUT A DECISION BAR: "
+                f"{self.sessions_without_decision_bar} (scheduled session x time with no bar at "
+                f"that time, e.g. a 15:30 decision on a 13:00 half day): the pass does not run "
+                f"on those sessions. First examples: {examples}")
+
     def _entry_schedule(self, expert: Any) -> Optional[Dict[str, Any]]:
         """The expert's ``execution_schedule_enter_market`` (common base setting), or None.
 
@@ -963,6 +1340,7 @@ class DailyBacktestEngine:
                 account=self.account,
                 subtype=self.config.get("subtype"),
             )
+            self._analysis_pass(expert_id)
             try:
                 rec = expert.analyze_as_of(as_of, ctx)
             except Exception as e:  # noqa: BLE001 — one symbol must not abort the bar
@@ -974,7 +1352,9 @@ class DailyBacktestEngine:
                 if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
                                   MacroAvailabilityUnknown)):
                     raise
+                _reraise_option_basis_refusal(e)
                 self._log(f"analyze_as_of failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
+                self._analysis_failed(expert_id, f"{symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
 
             if self._stage_recommendation_candidate(
@@ -1037,6 +1417,10 @@ class DailyBacktestEngine:
         from ba2_common.core.db import get_instance as _get_instance
 
         from ba2_common.core.hold_entry import evaluate_hold_entries
+        if rec_is_unpriced(rec):
+            self.intraday_counters["entry_skipped_no_price_symbol_ticks"] += 1
+            self._log(f"entry {symbol} @ {as_of:%Y-%m-%d %H:%M}: recommendation carries no price; not staged")
+            return False
         rec_id = _recommendation_to_expert_recommendation(
             rec, expert_instance_id=expert_id, symbol=symbol, as_of=as_of,
             subtype=AnalysisUseCase.ENTER_MARKET,
@@ -1103,14 +1487,16 @@ class DailyBacktestEngine:
             # sufficient available equity (available_balance >= minimum_equity_threshold_percent
             # of virtual balance, default 5%). Calls the SAME shared
             # MarketExpertInterface.has_sufficient_equity_for_trading the live path uses — no
-            # re-implementation. Note: BacktestAccount.get_balance() is cash (not NLV), which is
-            # the same balance BT sizing already uses (TradeRiskManagement), so the gate stays
-            # consistent with BT sizing. Stub experts without the method are treated as allowed.
+            # re-implementation. The virtual balance it reads is the expert's share of the account's
+            # EQUITY in both runtimes (BacktestAccount._plain_balance), the same base BT sizing
+            # uses, so the gate stays consistent with sizing. Stub experts without the method are
+            # treated as allowed.
             equity_check = getattr(expert, "has_sufficient_equity_for_trading", None)
             if callable(equity_check):
                 try:
                     ok_equity, equity_reason = equity_check()
                 except Exception as e:  # noqa: BLE001 — a wiring gap must not silently over-block
+                    _reraise_option_basis_refusal(e)
                     self._log(f"equity-gate check errored for {symbol} @ {as_of:%Y-%m-%d} "
                               f"(treating as allowed): {e}")
                     ok_equity = True
@@ -1186,6 +1572,7 @@ class DailyBacktestEngine:
             account=self.account,
             subtype=self.config.get("subtype"),
         )
+        self._analysis_pass(expert_id)
         try:
             recs = expert.analyze_as_of(as_of, ctx)
         except Exception as e:  # noqa: BLE001 — the whole bar aborts (no per-symbol granularity
@@ -1196,7 +1583,9 @@ class DailyBacktestEngine:
             if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
                                   MacroAvailabilityUnknown)):
                 raise
+            _reraise_option_basis_refusal(e)
             self._log(f"basket analyze_as_of failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
+            self._analysis_failed(expert_id, f"basket @ {as_of:%Y-%m-%d}: {e}")
             return False
 
         # TYPE GUARD: a basket expert's analyze_as_of MUST return List[Recommendation] (one per
@@ -1225,6 +1614,7 @@ class DailyBacktestEngine:
                 raw = getattr(rec, "raw_outputs", None) or {}
                 symbol = raw.get("symbol")
             except Exception as e:  # noqa: BLE001 — a malformed list item must not crash the bar
+                _reraise_option_basis_refusal(e)
                 self._log(f"basket recommendation item malformed for expert {expert_id} "
                           f"@ {as_of:%Y-%m-%d}: {e}")
                 continue
@@ -1257,6 +1647,7 @@ class DailyBacktestEngine:
                 if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
                                   MacroAvailabilityUnknown)):
                     raise
+                _reraise_option_basis_refusal(e)
                 self._log(f"basket item staging failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
 
@@ -1319,6 +1710,7 @@ class DailyBacktestEngine:
                 # run once a trial opened its first position).
                 extra={"symbol": symbol},
             )
+            self._analysis_pass(expert_id)
             try:
                 rec = expert.analyze_as_of(as_of, ctx)
             except Exception as e:  # noqa: BLE001 — one symbol must not abort the bar
@@ -1333,7 +1725,18 @@ class DailyBacktestEngine:
                 if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
                                   MacroAvailabilityUnknown)):
                     raise
+                _reraise_option_basis_refusal(e)
                 self._log(f"open-pos analyze failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
+                self._analysis_failed(expert_id, f"open-pos {symbol} @ {as_of:%Y-%m-%d}: {e}")
+                continue
+            if rec_is_unpriced(rec):
+                # A HELD symbol with no decidable price at this tick: nothing can be decided for it, so
+                # its rule-based manage step is skipped for THIS tick, counted. The position stays open;
+                # its resting stop / take-profit keep working on bars that print, and the equity mark is
+                # the last ended bar. No fabricated price, no entry-price substitute.
+                self.intraday_counters["manage_skipped_no_price_symbol_ticks"] += 1
+                self._log(f"open-pos {symbol} @ {as_of:%Y-%m-%d %H:%M}: no decidable price; manage step "
+                          f"skipped for this tick")
                 continue
             rec_id = _recommendation_to_expert_recommendation(
                 rec, expert_instance_id=expert_id, symbol=symbol, as_of=as_of, allow_hold=True,
@@ -1517,6 +1920,7 @@ class DailyBacktestEngine:
             account=self.account,
             subtype=self.config.get("subtype"),
         )
+        self._analysis_pass(expert_id)
         try:
             rec = expert.analyze_as_of(as_of, ctx)
         except Exception as e:  # noqa: BLE001 — one bar must not abort the run
@@ -1526,7 +1930,9 @@ class DailyBacktestEngine:
             if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
                                   MacroAvailabilityUnknown)):
                 raise
+            _reraise_option_basis_refusal(e)
             self._log(f"bypass analyze_as_of failed @ {as_of:%Y-%m-%d}: {e}")
+            self._analysis_failed(expert_id, f"bypass @ {as_of:%Y-%m-%d}: {e}")
             return
 
         if getattr(rec, "skip", False):
@@ -1544,6 +1950,7 @@ class DailyBacktestEngine:
             # as live; the run carries on and counts it.
             self._refused_adds += len(pm.last_refused_adds)
         except Exception as e:  # noqa: BLE001 — a rebalance failure must not kill the run
+            _reraise_option_basis_refusal(e)
             self._log(f"bypass rebalance failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
 
     # -- option expiry / exercise / assignment ------------------------------
@@ -1836,11 +2243,18 @@ class DailyBacktestEngine:
                         ruleset_sl=(txn.stop_loss if txn else None),
                         safeguard_sl=safeguard,
                         is_long=(order.side == OrderDirection.BUY))
+                    stamp_safeguard_anchor(
+                        order, (txn.stop_loss if txn else None), safeguard, sl_price,
+                        lambda: self.account.get_instrument_current_price(order.symbol))
                     submitted = self.account.submit_order(order, sl_price=sl_price)
                     # Additive metadata: the stop the size was keyed off, written once as the
                     # transaction's max-loss stop (never raises; see record_max_loss_stop).
                     if submitted:
                         record_max_loss_stop(order, safeguard)
+                        # a ruleset without TP/SL has no transaction until the submit created it
+                        stamp_safeguard_anchor(
+                            order, (txn.stop_loss if txn else None), safeguard, sl_price,
+                            lambda: self.account.get_instrument_current_price(order.symbol))
                 except Exception as e:  # noqa: BLE001
                     _reraise_option_basis_refusal(e)
                     self._log(f"submit_order failed for order {order.id}: {e}")
@@ -1898,6 +2312,9 @@ class DailyBacktestEngine:
                     ruleset_sl=(txn.stop_loss if txn else None),
                     safeguard_sl=safeguard,
                     is_long=(order.side == OrderDirection.BUY))
+                stamp_safeguard_anchor(
+                    order, (txn.stop_loss if txn else None), safeguard, sl_price,
+                    lambda: self.account.get_instrument_current_price(order.symbol))
                 submitted = self.account.submit_order(order, sl_price=sl_price)
                 created_any = True
                 # Additive metadata: the stop the size was keyed off (the RM safeguard), written
@@ -1905,6 +2322,9 @@ class DailyBacktestEngine:
                 # loop; it never raises.
                 if submitted:
                     record_max_loss_stop(order, safeguard)
+                    stamp_safeguard_anchor(          # the transaction may only exist since the submit
+                        order, (txn.stop_loss if txn else None), safeguard, sl_price,
+                        lambda: self.account.get_instrument_current_price(order.symbol))
             except Exception as e:  # noqa: BLE001
                 _reraise_option_basis_refusal(e)
                 self._log(f"funded submit failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
@@ -1924,8 +2344,9 @@ class DailyBacktestEngine:
         if bundle is None:
             from ba2_common.core.TradeConditions import _get_provider
 
-            bundle = LiveProviderBundle(
-                lambda category, name, **kw: _get_provider(category, name, **kw)
+            bundle = _BacktestProviderBundle(
+                lambda category, name, **kw: _get_provider(category, name, **kw),
+                self.price,
             )
             self._bundle_cache = bundle
         return bundle
@@ -1951,7 +2372,7 @@ class DailyBacktestEngine:
         return {
             "equity_history": self.account.get_balance_history(),
             "trades": self.account.get_filled_trades(),
-            "final_equity": self.account.equity(),
+            "final_equity": self.account.equity(close_mark=True),
             "initial_capital": float(self.account._cfg["starting_cash"]),
             # RECORDED, NOT SCORED -- see ``_record_uncovered_assigned``.
             "uncovered_assigned_bars": self._uncovered_assigned_metric(),

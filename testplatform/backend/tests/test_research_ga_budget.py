@@ -273,7 +273,10 @@ def test_cli_flags_default_to_not_passed():
 
 
 def test_cli_dry_run_prints_every_jobs_budget(tmp_path, capsys):
-    argv = ["--families", "pullback_rsi", "--search", "genetic", "--dry-run", "--output-dir", str(tmp_path)]
+    # `--decision-times fixed`: the time gene is default ON for genetic jobs (it adds a gene and
+    # changes the budget text); this test pins the gene-free budget arithmetic.
+    argv = ["--families", "pullback_rsi", "--search", "genetic", "--dry-run", "--output-dir", str(tmp_path),
+            "--decision-times", "fixed"]
     assert D.main(argv) == 0
     out = capsys.readouterr().out
     written = json.loads((tmp_path / "manifest.json").read_text())
@@ -293,9 +296,14 @@ def test_cli_dry_run_prints_every_jobs_budget(tmp_path, capsys):
     assert "early_stop=5 min_gain=any" in capsys.readouterr().out
     argv = ["--families", "mid_insider", "--search", "genetic", "--market-condition-profile", BOTH,
             "--market-condition-manifest", ",".join(f"{p}={d}" for p, d in PINS.items()),
-            "--market-exit", "exit,stop,tp", "--variants", "timeout", "--dry-run", "--output-dir", str(tmp_path)]
+            "--market-exit", "exit,stop,tp", "--variants", "timeout", "--dry-run", "--output-dir", str(tmp_path),
+            "--decision-times", "fixed"]
     assert D.main(argv) == 0
     assert ("budget: genes=38 (incl. market entry 30, market exit 7) population=120 generations=30 "
+            "early_stop=5 min_gain=0.01" in capsys.readouterr().out)
+    # default (gene ON): ONE more searched gene, nothing else in the budget text moves
+    assert D.main(argv[:-2]) == 0
+    assert ("budget: genes=39 (incl. market entry 30, market exit 7) population=120 generations=30 "
             "early_stop=5 min_gain=0.01" in capsys.readouterr().out)
 
 

@@ -268,6 +268,7 @@ class ParquetContractReader:
         ohlcv = MemoizedOHLCVProvider(FMPOHLCVProvider.__new__(FMPOHLCVProvider), fetch_start,
                                       inputs.end, interval=interval, cached_only=True)
         ps = AsOfPriceSource(ohlcv_provider=ohlcv, interval=interval)
+        ohlcv.bind_price_source(ps)
         try:
             # Exactly the arrays ``preload`` binds (read_window -> _ohlcv_arrays_from_df), for
             # the same [start - warmup, end] window, without its cache flush/publish.

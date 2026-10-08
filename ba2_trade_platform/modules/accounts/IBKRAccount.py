@@ -208,6 +208,8 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
     #: An expert may not size from cash / net liquidation when IBKR's buying power cannot be derived
     #: (``AvailableFunds`` is far below net liquidation on a margin account): sizing is refused instead.
     buying_power_is_mandatory = True
+    #: IBKR's snapshot (``_snapshot_inputs``) and info (``_account_numbers``) are separate reads.
+    snapshot_is_derived_from_account_info = False
 
     #: Overridable in tests with a fake; the runtime builds the IB object ON its loop thread.
     _ib_factory = staticmethod(IB)
@@ -741,22 +743,27 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
             return None
         positions = []
         for row in rows:
+            # SIGNED, like Alpaca and TastyTrade (the platform's one Position convention): a short has
+            # a NEGATIVE qty, cost basis and market value. A magnitude here made
+            # get_signed_position_quantity / the exposure gate read an IBKR short as a long.
+            sign = 1.0 if row["qty"] > 0 else -1.0
             qty = abs(row["qty"])
-            cost_basis = row["avg_cost"] * qty
-            market_value = abs(row["market_value"])
+            signed_qty = sign * qty
+            cost_basis = sign * row["avg_cost"] * qty
+            market_value = sign * abs(row["market_value"])
             last_day = row["prev_close"] if row["prev_close"] else row["mark"]
-            intraday_pl = (row["mark"] - last_day) * qty * (1 if row["qty"] > 0 else -1)
+            intraday_pl = (row["mark"] - last_day) * signed_qty
             positions.append(Position(
                 asset_class="Equity", avg_entry_price=row["avg_cost"], avg_entry_swap_rate=None,
                 change_today=((row["mark"] - last_day) / last_day) if last_day else 0.0,
                 cost_basis=cost_basis, current_price=row["mark"], exchange=row["exchange"],
-                lastday_price=last_day, market_value=market_value, qty=qty, qty_available=qty,
+                lastday_price=last_day, market_value=market_value, qty=signed_qty, qty_available=signed_qty,
                 side=OrderDirection.BUY if row["qty"] > 0 else OrderDirection.SELL,
                 swap_rate=None, symbol=row["symbol"],
                 unrealized_intraday_pl=intraday_pl,
                 unrealized_intraday_plpc=(intraday_pl / (last_day * qty)) if last_day and qty else 0.0,
                 unrealized_pl=row["unrealized"],
-                unrealized_plpc=(row["unrealized"] / cost_basis) if cost_basis else 0.0))
+                unrealized_plpc=(row["unrealized"] / abs(cost_basis)) if cost_basis else 0.0))
         return positions
 
     def refresh_positions(self) -> bool:

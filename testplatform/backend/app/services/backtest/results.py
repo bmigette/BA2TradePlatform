@@ -616,6 +616,14 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
         "multiplier": _finite(trade.get("multiplier"), "trade.multiplier",
                               default=None if _is_option_leg(trade) else 1.0),
     }
+    # The entry's protective levels AFTER the fill (what the bracket test enforced) and BEFORE it
+    # (as built from the decision price): only on equity rows of a transaction that carried levels
+    # at its entry fill (``BacktestAccount._rebase_levels_at_entry_fill``); every other row keeps
+    # exactly the keys above. None is a level that did not exist.
+    if "stop_loss_at_fill" in trade:
+        for key in ("stop_loss_at_fill", "take_profit_at_fill", "stop_loss_pre_fill",
+                    "take_profit_pre_fill", "fill_reference_price"):
+            row[key] = None if trade[key] is None else _finite(trade[key], f"trade.{key}")
     # THE OPTION TRADE RECORD (BT/live option parity, plan Part C4), OPTION ROWS ONLY and only
     # when the recorder attached it: every equity row -- and every per-FILL fallback row --
     # keeps exactly the keys above. ``option_strategy`` / ``recommendation_confidence`` ride

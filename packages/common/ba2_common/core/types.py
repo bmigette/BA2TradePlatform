@@ -380,6 +380,14 @@ class TransactionStatus(str, Enum):
     CLOSED = "CLOSED"
     FAILED = "FAILED"  # Transaction creation succeeded but order submission failed
 
+
+#: The transaction statuses whose position (or pending entry) still HOLDS the expert's capital:
+#: WAITING (entry working), OPENED, and CLOSING -- a resting close has not released the shares or the
+#: option collateral until it fills, so the position is still held and still counts. The ONE definition
+#: the used-balance, the classic per-instrument cap and the option per-underlying cap all read.
+CAPITAL_HOLDING_TRANSACTION_STATUSES = (
+    TransactionStatus.WAITING, TransactionStatus.OPENED, TransactionStatus.CLOSING)
+
 class RiskLevel(str, Enum):
     LOW = "LOW"
     MEDIUM = "MEDIUM"
@@ -1097,7 +1105,7 @@ class Recommendation:
     """
     signal: OrderRecommendation          # BUY/SELL/HOLD/OVERWEIGHT/UNDERWEIGHT/ERROR
     confidence: float                    # 1-100 scale (platform convention)
-    current_price: float                 # the as_of close, resolved in _gather
+    current_price: Optional[float]       # the DECISION price resolved in _gather; None only on a skip with no price
     details: str = ""
     expected_profit_percent: Optional[float] = None
     target_price: Optional[float] = None   # expert's recommended TP price (None -> backtest derives from expected_profit_percent)

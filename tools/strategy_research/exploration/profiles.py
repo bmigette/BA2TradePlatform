@@ -432,7 +432,8 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
                    parallel=1, seed=42,
                    workers=(), save_top=5, store=None, spread_bps=None, etf_symbols=None,
                    market_condition_profile="none", market_condition_manifest=None,
-                   market_condition_mode="search", market_exit=(), allow_sl_loosen=False):
+                   market_condition_mode="search", market_exit=(), allow_sl_loosen=False,
+                   decision_times=None):
     """Build a portable manifest. No data access; --preflight resolves the actual universe.
 
     ``market_exit`` (kinds from exit/stop/tp) appends the off-by-default market exit templates to
@@ -508,6 +509,13 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
             has_rule_gene = any(n.get("optimize") or n.get("action_value_optimize") or n.get("mode_optimize")
                                 or n.get("toggle_optimize") for n in walk(job["strategy"]))
             fixed = not expert_params and not has_rule_gene
+            if decision_times and not fixed and search == "genetic":
+                # The DECISION-TIME gene (schedule:time), only on jobs that already search (a
+                # fixed control stays a control) and only in genetic mode (a grid is exhaustive).
+                # It enters expert_params, hence searched_genes, the GA budget and the job digest.
+                from ba2_common.core.schedule_genes import validate_decision_times
+                expert_params["schedule:time"] = {"optimize": True, "choices": validate_decision_times(
+                    list(decision_times), bt["execution_interval"])}
             if fixed:
                 # The shared optimizer requires a nonempty parameter space. A one-point
                 # range preserves the actual sizing value and evaluates the control once.

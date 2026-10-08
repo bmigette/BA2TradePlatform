@@ -323,7 +323,7 @@ class FakeTastyBroker:
         if self.positions_fail:
             raise TastytradeError("positions unavailable")
         return [SimpleNamespace(
-            symbol=sym, quantity=qty, quantity_direction="Long" if qty >= 0 else "Short",
+            symbol=sym, quantity=abs(qty), quantity_direction="Long" if qty >= 0 else "Short",  # the REAL SDK shape: absolute quantity + a str direction
             average_open_price=Decimal("50"), close_price=Decimal(str(self.prices.get(sym, 50))),
             mark_price=Decimal(str(self.prices.get(sym, 50))), multiplier=1,
             instrument_type=TTInstrumentType.EQUITY, realized_day_gain=Decimal("0"))

@@ -20,6 +20,11 @@ Pins:
     ordinary invocation (no flag) prints the plain, undigested names -- even though the LAUNCHED
     FactorRanker job now behaves differently under that plain name (the repair is default-on
     inside the launcher, invisible to this driver's argv/name).
+
+The decision-time gene is DEFAULT ON in this driver (2026-10-07) and renames every CLASSIC job
+(``-timegene-<digest>``); these tests pass ``--decision-times fixed`` (legacy fixed-time naming)
+so the digest they look for can only come from the opt-out. FactorRanker is a BYPASS expert: it
+must never get the time gene, default or not (pinned below).
 """
 from __future__ import annotations
 
@@ -102,6 +107,10 @@ def test_job_name_ignores_name_parallel_workers_tokens():
 # --------------------------------------------------------------------------- #
 # End-to-end via main() --dry-run (no subprocess is ever launched under --dry-run)
 # --------------------------------------------------------------------------- #
+#: the legacy fixed-time naming (the decision-time gene is default-ON in this driver)
+_FIXED_TIME = ["--decision-times", "fixed"]
+
+
 def _run_dry(monkeypatch, capsys, extra_argv):
     d = _driver()
     argv = ["run_screener_capband_matrix.py", "--dry-run", "--bands", "large",
@@ -118,17 +127,33 @@ def test_dry_run_default_prints_plain_undigested_names(monkeypatch, capsys):
     """No flag given -- the driver's argv/job names are byte-identical to before this change,
     even though the LAUNCHED FactorRanker job now runs with the repair by default (the launcher's
     default, invisible to this driver)."""
-    rc, out = _run_dry(monkeypatch, capsys, [])
+    rc, out = _run_dry(monkeypatch, capsys, _FIXED_TIME)
     assert rc == 0
     assert "scr-large-FMPRating-S1" in out
     assert "scr-large-FactorRanker" in out
     assert not _DIGEST_RE.search(out)
 
 
+def test_dry_run_default_gene_on_never_reaches_the_factorranker_job(monkeypatch, capsys):
+    """Default naming (gene ON): the classic job is renamed ``-timegene-<digest>``, the FactorRanker
+    bypass job keeps its plain name (job_dt_times is None for it, so no --decision-times
+    token is built) and the driver prints its NOTE (a time gene on a bypass expert would be dead
+    and the launcher refuses it)."""
+    rc, out = _run_dry(monkeypatch, capsys, [])
+    assert rc == 0
+    todo = [ln for ln in out.splitlines() if ln.strip().startswith("TODO")]
+    fr = [ln for ln in todo if "FactorRanker" in ln]
+    classic = [ln for ln in todo if "FMPRating" in ln]
+    assert len(fr) == 1 and len(classic) == 1
+    assert "timegene" not in fr[0] and "scr-large-FactorRanker-sup1 " in fr[0]
+    assert re.search(r"-timegene-sup1-d[0-9a-f]{12}\b", classic[0]), classic[0]
+    assert "NOTE scr-large-FactorRanker: bypass expert, decision time stays fixed" in out
+
+
 def test_dry_run_with_opt_out_digests_every_job_name(monkeypatch, capsys):
     """Given alone (no market-condition/exclude-symbols flags), --no-fr-top-n-below-pool must
     still fold into the digest."""
-    rc, out = _run_dry(monkeypatch, capsys, ["--no-fr-top-n-below-pool"])
+    rc, out = _run_dry(monkeypatch, capsys, _FIXED_TIME + ["--no-fr-top-n-below-pool"])
     assert rc == 0
     lines = [ln for ln in out.splitlines() if ln.strip().startswith(("TODO", "DONE"))]
     assert len(lines) == 2  # FMPRating S1 + FactorRanker, per --skip-experts above
