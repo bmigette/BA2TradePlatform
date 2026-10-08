@@ -206,24 +206,44 @@ class StockScreener:
             self._report_progress("No candidates found.", 1.0)
             return {"results": [], "stats": stats}
 
-        # --- Stage 2: RVOL enrichment + client-side filters ---
+        # --- Stage 1b: share-float bounds (live only) ---
+        # The vendor screener has no float parameter, so the bound is ours: the vendor's bulk
+        # shares-float table (one cached call); an unknown float passes (as in the metric store).
+        # as_of (historical) screens keep their documented "float is approximate" behaviour.
+        float_min = self._settings["screener_float_min"]
+        float_max = self._settings["screener_float_max"]
+        if self._as_of is None and (float_min > 0 or float_max > 0):
+            from ba2_providers.screener.float_filter import filter_by_float
+            candidates, f_stats = filter_by_float(candidates, float_min, float_max)
+            stats.update(f_stats)
+            logger.info(
+                f"StockScreener: float filter [{float_min or '-'}, {float_max or '-'}] — "
+                f"{len(candidates)} candidates left ({f_stats['float_unknown']} with unknown float passed)"
+            )
+            if not candidates:
+                self._report_progress("No candidates after float filter.", 1.0)
+                return {"results": [], "stats": stats}
+
+        # --- Stage 2: volume / RVOL enrichment + live refresh + client-side filters ---
+        # ALWAYS runs. rvol_min == 0 only turns the RVOL *filter* off; the stage's other effects
+        # (average-volume floor/ceiling, and the live price + market-cap refresh that the rank
+        # key and the price-drop test read) must not depend on it.
         rvol_min = self._settings["screener_relative_volume_min"]
-        if rvol_min > 0:
-            logger.info(
-                f"StockScreener: stage 2 — RVOL enrichment on {len(candidates)} candidates "
-                f"(min RVOL={rvol_min})"
-            )
-            self._report_progress(
-                f"Fetching live prices for {len(candidates)} candidates (RVOL)...", 0.2
-            )
-            candidates, enrich_stats = self._enrich_with_rvol(candidates, rvol_min)
-            stats.update(enrich_stats)
-            logger.info(
-                f"StockScreener: stage 2 done — {len(candidates)} candidates after RVOL filter"
-            )
+        logger.info(
+            f"StockScreener: stage 2 — volume/RVOL enrichment on {len(candidates)} candidates "
+            f"(min RVOL={rvol_min})"
+        )
+        self._report_progress(
+            f"Fetching live prices for {len(candidates)} candidates (RVOL)...", 0.2
+        )
+        candidates, enrich_stats = self._enrich_with_rvol(candidates, rvol_min)
+        stats.update(enrich_stats)
+        logger.info(
+            f"StockScreener: stage 2 done — {len(candidates)} candidates after the volume filters"
+        )
 
         if not candidates:
-            self._report_progress("No candidates after RVOL filter.", 1.0)
+            self._report_progress("No candidates after volume filters.", 1.0)
             return {"results": [], "stats": stats}
 
         # --- Stage 2.5: Weinstein Stage 2 filter (optional) ---
@@ -642,10 +662,9 @@ class StockScreener:
         if price_max > 0:
             filters["price_max"] = price_max
 
-        # Volume
-        volume_min = self._settings["screener_volume_min"]
-        if volume_min > 0:
-            filters["volume_min"] = volume_min
+        # Volume floor/ceiling are NOT sent to the vendor: its ``volumeMoreThan`` tests the
+        # CURRENT session's volume so far (near zero at the 09:30 open), not an average. Both are
+        # applied in ``_enrich_with_rvol`` on the average volume of the last finished sessions.
 
         # Market cap
         mcap_min = self._settings["screener_market_cap_min"]
@@ -656,10 +675,8 @@ class StockScreener:
         if mcap_max > 0:
             filters["market_cap_max"] = mcap_max
 
-        # Float max (the provider supports float_max but not float_min)
-        float_max = self._settings["screener_float_max"]
-        if float_max > 0:
-            filters["float_max"] = float_max
+        # Float bounds are NOT sent to the vendor either (its screener has no float parameter);
+        # ``screen`` applies them as stage 1b from the bulk float table.
 
         # Restrict to US exchanges — all BA2 broker accounts are US (Alpaca), so
         # foreign listings (e.g. *.TO Toronto) are never tradable. US-listed ADRs
@@ -677,9 +694,17 @@ class StockScreener:
         min_rvol: float,
     ) -> tuple:
         """
-        Enrich candidates with volume/RVOL + a live price/market-cap/float refresh, and
-        apply client-side filters that the screener API does not support
-        (float_min, volume_max).
+        Enrich candidates with volume/RVOL + a live price/market-cap refresh, and apply the
+        client-side volume filters the vendor screener cannot express:
+
+          * RVOL:       rvol = last finished session volume / avg_volume; dropped when
+                        ``min_rvol > 0 and rvol < min_rvol`` (``min_rvol == 0`` = filter off);
+          * volume_min: dropped when ``avg_volume < screener_volume_min`` (0 = off; no bars = dropped);
+          * volume_max: dropped when ``avg_volume > screener_volume_max`` (0 = off).
+
+        ``avg_volume`` = mean volume of the last <= 20 FINISHED sessions (including the last
+        one), from the daily bars (``_quotes_from_bars``). The stage always runs: the live
+        price/market-cap refresh happens whatever ``min_rvol`` is.
         """
         all_symbols = [
             c["symbol"].upper()
@@ -687,7 +712,7 @@ class StockScreener:
             if c.get("symbol")
         ]
         if not all_symbols:
-            return [], {"dropped_rvol": 0, "dropped_float": 0, "dropped_volume_max": 0}
+            return [], {"dropped_rvol": 0, "dropped_volume_min": 0, "dropped_volume_max": 0}
 
         # volume/avgVolume/RVOL ALWAYS come from daily bars (the last COMPLETE trading
         # session's full-day volume vs. a trailing 20-day average) — live and backtest
@@ -709,11 +734,11 @@ class StockScreener:
         # refresh those three from the real-time quote when not backtesting.
         live_quotes_map = self._fetch_quotes_chunked(all_symbols) if self._as_of is None else {}
 
-        float_min = self._settings["screener_float_min"]
+        volume_min = self._settings["screener_volume_min"]
         volume_max = self._settings["screener_volume_max"]
 
         dropped_rvol = 0
-        dropped_float = 0
+        dropped_volume_min = 0
         dropped_volume_max = 0
 
         enriched: List[Dict[str, Any]] = []
@@ -741,41 +766,36 @@ class StockScreener:
             if q_mcap and q_mcap > 0:
                 c["market_cap"] = q_mcap
 
-            # Update float_shares from the live quote if available
-            q_float = live_quote.get("sharesFloat")
-            if q_float and q_float > 0:
-                c["float_shares"] = q_float
+            # (Float is NOT refreshed here: /quote has no float field. Stage 1b owns it.)
 
             # --- Client-side filters ---
 
-            if rvol < min_rvol:
+            if min_rvol > 0 and rvol < min_rvol:
                 logger.debug(f"StockScreener: dropping {sym} — RVOL {rvol} < {min_rvol}")
                 dropped_rvol += 1
                 continue
 
-            # float_min: 0 means data unavailable, don't filter those out
-            if float_min > 0:
-                stock_float = c.get("float_shares") or 0
-                if stock_float > 0 and stock_float < float_min:
-                    logger.debug(
-                        f"StockScreener: dropping {sym} — float {stock_float:,} < {float_min:,}"
-                    )
-                    dropped_float += 1
-                    continue
+            # Average-volume floor. No bars (avg 0) = cannot be verified = dropped.
+            if volume_min > 0 and avg_vol < volume_min:
+                logger.debug(
+                    f"StockScreener: dropping {sym} — avg volume {avg_vol:,.0f} < {volume_min:,}"
+                )
+                dropped_volume_min += 1
+                continue
 
-            if volume_max > 0:
-                if volume > volume_max:
-                    logger.debug(
-                        f"StockScreener: dropping {sym} — volume {volume:,} > {volume_max:,}"
-                    )
-                    dropped_volume_max += 1
-                    continue
+            # Average-volume ceiling. An unknown average (0) passes.
+            if volume_max > 0 and avg_vol > volume_max:
+                logger.debug(
+                    f"StockScreener: dropping {sym} — avg volume {avg_vol:,.0f} > {volume_max:,}"
+                )
+                dropped_volume_max += 1
+                continue
 
             enriched.append(c)
 
         stats = {
             "dropped_rvol": dropped_rvol,
-            "dropped_float": dropped_float,
+            "dropped_volume_min": dropped_volume_min,
             "dropped_volume_max": dropped_volume_max,
         }
         return enriched, stats

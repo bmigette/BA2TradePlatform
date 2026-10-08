@@ -1089,12 +1089,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "screener_volume_min": {
                     "type": "int", "required": False, "default": 500000,
                     "description": "Min avg volume (0 = disabled)",
-                    "tooltip": "Minimum average daily volume. Set to 0 to disable this filter."
+                    "tooltip": "Minimum AVERAGE daily volume: the mean volume of the last 20 finished trading sessions "
+                               "(daily bars, including the most recent finished session). Applied by the platform, not "
+                               "by the data vendor, so it does not depend on the time of day. Set to 0 to disable."
                 },
                 "screener_volume_max": {
                     "type": "int", "required": False, "default": 0,
                     "description": "Max avg volume (0 = disabled)",
-                    "tooltip": "Maximum average daily volume. Set to 0 to disable this filter."
+                    "tooltip": "Maximum AVERAGE daily volume: the mean volume of the last 20 finished trading sessions "
+                               "(daily bars, including the most recent finished session). Set to 0 to disable."
                 },
                 # Added 2026-08-07. ``dollar_volume_min`` entered the metric_store's
                 # METRIC_STORE_KEYS on 2026-08-05 (47c4b26, the dollar-volume floor that keeps
@@ -1112,12 +1115,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "screener_float_min": {
                     "type": "int", "required": False, "default": 10000000,
                     "description": "Min share float (0 = disabled)",
-                    "tooltip": "Minimum share float (shares available for trading). Set to 0 to disable this filter."
+                    "tooltip": "Minimum share float (shares available for trading), from the data vendor's daily float "
+                               "table (latest SEC filing). A symbol with no float data passes. Costs one cached vendor "
+                               "call per 6 hours. Set to 0 to disable this filter."
                 },
                 "screener_float_max": {
                     "type": "int", "required": False, "default": 0,
                     "description": "Max share float (0 = disabled)",
-                    "tooltip": "Maximum share float. Set to 0 to disable this filter."
+                    "tooltip": "Maximum share float, from the data vendor's daily float table (latest SEC filing). "
+                               "A symbol with no float data passes. Set to 0 to disable this filter."
                 },
                 "screener_price_min": {
                     "type": "float", "required": False, "default": 20.0,
@@ -1132,7 +1138,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "screener_relative_volume_min": {
                     "type": "float", "required": False, "default": 1.05,
                     "description": "Min relative volume (0 = disabled)",
-                    "tooltip": "Minimum relative volume (today's volume / avg volume). 1.05 means 5% above average. Set to 0 to disable. Enabling triggers extra API calls to fetch live quotes."
+                    "tooltip": "Minimum relative volume = the last FINISHED session's volume / the mean volume of the last 20 finished sessions "
+                               "(including that session). 1.05 means 5% above average. Set to 0 to disable this filter only; the "
+                               "volume/price/market-cap refresh of the screening stage always runs."
                 },
                 "screener_price_drop_pct": {
                     "type": "float", "required": False, "default": 15.0,

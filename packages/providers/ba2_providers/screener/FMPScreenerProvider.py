@@ -55,8 +55,11 @@ class FMPScreenerProvider(ScreenerProviderInterface):
 
         Args:
             filters: Screening criteria. Supported keys:
-                price_min, price_max, volume_min, market_cap_min,
-                market_cap_max, float_max, exchanges, sector_exclude, limit
+                price_min, price_max, volume_min (AVERAGE volume, vendor
+                ``avgVolumeMoreThan``), market_cap_min, market_cap_max,
+                float_min / float_max (applied HERE as a post-filter on the
+                vendor's bulk shares-float table: the screener endpoint has no
+                float parameter), exchanges, sector_exclude, limit
             as_of: MUST be None — this provider is live-only (the FMP
                 /stock-screener endpoint has no temporal parameter and returns
                 the CURRENT screen). A non-None ``as_of`` is rejected loudly;
@@ -112,7 +115,21 @@ class FMPScreenerProvider(ScreenerProviderInterface):
                 if (item.get("sector") or "").lower() not in exclude_lower
             ]
 
-        return [self._normalise_result(item) for item in data]
+        results = [self._normalise_result(item) for item in data]
+
+        # The vendor screener has NO float parameter (``floatSharesUnder`` is silently ignored
+        # and no float comes back), so a float bound is applied here from the bulk float table.
+        float_min = filters.get("float_min") or 0
+        float_max = filters.get("float_max") or 0
+        if float_min > 0 or float_max > 0:
+            from ba2_providers.screener.float_filter import filter_by_float
+            before = len(results)
+            results, fstats = filter_by_float(results, float_min, float_max)
+            logger.info(
+                f"FMP screener: float filter [{float_min or '-'}, {float_max or '-'}] kept "
+                f"{len(results)}/{before} ({fstats['float_unknown']} with unknown float passed)"
+            )
+        return results
 
     def _build_params(self, filters: Dict[str, Any]) -> Dict[str, Any]:
         """Build FMP API query parameters from filter dict."""
@@ -126,10 +143,11 @@ class FMPScreenerProvider(ScreenerProviderInterface):
         filter_map = {
             "price_min": "priceMoreThan",
             "price_max": "priceLowerThan",
-            "volume_min": "volumeMoreThan",
+            # AVERAGE volume. NOT ``volumeMoreThan``: that tests the ``volume`` field = the
+            # current session's volume so far (near zero at the 09:30 open).
+            "volume_min": "avgVolumeMoreThan",
             "market_cap_min": "marketCapMoreThan",
             "market_cap_max": "marketCapLowerThan",
-            "float_max": "floatSharesUnder",
         }
 
         for key, fmp_key in filter_map.items():

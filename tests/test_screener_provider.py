@@ -237,7 +237,8 @@ def test_screen_stocks_market_cap_filters(mock_get, provider):
     params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params")
     assert params["marketCapMoreThan"] == 10000000
     assert params["marketCapLowerThan"] == 500000000
-    assert params["volumeMoreThan"] == 1000000
+    assert params["avgVolumeMoreThan"] == 1000000   # AVERAGE volume, not the session-so-far volumeMoreThan
+    assert "volumeMoreThan" not in params
 
 
 def test_screen_stocks_no_api_key():
