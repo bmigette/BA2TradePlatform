@@ -19,6 +19,9 @@ from typing import Any
 #:   ScreenerDataOutage / PanelCoverageError / ScreenerGateRefusal -- the screener simulation's data is
 #:                             incomplete (more than 10 % of candidates without bars; panel absent / stale /
 #:                             built under another definition);
+#:   MetricStoreStaleError  -- the screener metric store ends well before the run window (its newest scan
+#:                             is older than the staleness limit at an as-of day): every genome would be
+#:                             screened/sized from one reused old scan;
 #:   StaleMarkToMarket / ComboSettlementRefused -- engine-level refusals that already end the run.
 JOB_FATAL_ERROR_TYPES = frozenset({
     "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
@@ -30,6 +33,7 @@ JOB_FATAL_ERROR_TYPES = frozenset({
     "FillRebaseRefusal", "FillRebaseDisabled",
     "ScreenerUniverseRefusal",
     "ScreenerGenomeOutOfRange", "ScreenerDataOutage", "PanelCoverageError", "ScreenerGateRefusal",
+    "ScreenerUniverseRefusal", "MetricStoreStaleError",
 })
 
 

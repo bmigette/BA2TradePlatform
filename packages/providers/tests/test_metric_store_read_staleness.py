@@ -93,14 +93,40 @@ def test_coarser_store_cadence_widens_the_limit():
         ms.check_scan_freshness("2026-06-01", "2026-03-01", dates)
 
 
-def test_daily_engine_reader_shares_the_rule(tmp_path):
+@pytest.mark.parametrize("intraday", [False, True])
+def test_daily_engine_reader_shares_the_rule(tmp_path, intraday):
     from datetime import datetime
     from app.services.backtest.daily_engine import _screened_symbols_for_bar
     store = str(tmp_path / "s")
     ms.write_partitions(store, _store(False))
     rt = {"store": store, "settings": {}}
-    assert _screened_symbols_for_bar(rt, datetime(2026, 6, 30)) != []
+    assert _screened_symbols_for_bar(rt, datetime(2026, 6, 30, 10, 0), None, intraday=intraday) != []
+    # Monday 09:35 right after the Saturday scan (2026-06-27): visible, never stale
+    assert _screened_symbols_for_bar(rt, datetime(2026, 6, 29, 9, 35), None, intraday=intraday) != []
     with pytest.raises(ms.MetricStoreStaleError):
-        _screened_symbols_for_bar(rt, datetime(2026, 9, 26))
-    assert _screened_symbols_for_bar(rt, datetime(2025, 12, 1)) == []
-    assert _screened_symbols_for_bar(None, datetime(2026, 9, 26)) is None
+        _screened_symbols_for_bar(rt, datetime(2026, 9, 26, 10, 0), None, intraday=intraday)
+    assert _screened_symbols_for_bar(rt, datetime(2025, 12, 1), None, intraday=intraday) == []
+    assert _screened_symbols_for_bar(None, datetime(2026, 9, 26), None, intraday=intraday) is None
+
+
+# ---- the freshness rule composed with the dev visibility selector (Saturday scans, 5-minute clock) ----
+def test_resolve_scan_date_is_the_selector_plus_freshness(df):
+    from datetime import date
+    dates = ms._present_scan_dates(df)
+    for off in (-30, 0, 1, 5, 14):                        # inside coverage / grace: == the selector
+        day = _plus(off)
+        assert ms.resolve_scan_date(df, day) == ms.visible_scan_date(
+            dates, date.fromisoformat(day), intraday=False) == ms._latest_scan_date_le(df, day)
+
+
+def test_a_pre_open_monday_after_a_saturday_scan_never_trips():
+    # Saturday scan; the cutoff of Monday 09:35 is the Sunday (Friday's session is the last finished).
+    from ba2_common.core.knowability import scan_cutoff_date
+    from datetime import datetime
+    df = _store(True)
+    sat = NEWEST                                           # 2026-06-27 is a Saturday
+    assert pd.Timestamp(sat).dayofweek == 5
+    for wk in range(0, 2):                                 # the Monday after, and the one a week later
+        mon = datetime.fromisoformat(_plus(2 + 7 * wk) + "T09:35:00")
+        cutoff = scan_cutoff_date(mon).strftime("%Y-%m-%d")
+        assert ms.resolve_scan_date(df, cutoff) == sat      # age <= 9 d: well inside the 14 d limit
