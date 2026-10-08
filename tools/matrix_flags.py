@@ -103,9 +103,9 @@ UNIVERSE_RULE_NAME_TOKEN = "-sup1"
 #: The CRITERIA the screener gate simulates (``ba2_providers.screener.live_sim.CRITERIA_VERSION``, daily live
 #: simulation) are part of the identity of every CLASSIC screener job: a name without the token was gated by the
 #: old weekly store gate and must never be skipped as "completed" or resumed as this job.  Placed right after
-#: ``-sup1`` and before the digest: ``<base>-timegene-sup1-lds1-d<digest>``.  The FactorRanker (bypass) job does not
+#: ``-sup1`` and before the digest: ``<base>-timegene-sup1-lds2-d<digest>``.  The FactorRanker (bypass) job does not
 #: use the gate and keeps ``<base>-sup1``.  Pinned equal to ``live_sim.CRITERIA_NAME_TOKEN`` by a test.
-SCREENER_CRITERIA_NAME_TOKEN = "-lds1"
+SCREENER_CRITERIA_NAME_TOKEN = "-lds2"
 
 
 def with_universe_rule_name(name: str, *, simulated: bool = True) -> str:

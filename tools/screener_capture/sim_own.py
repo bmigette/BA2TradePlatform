@@ -23,7 +23,7 @@ from sim_recorded import recorded_bars, stage  # noqa: E402
 from ba2_providers.screener import live_sim as ls  # noqa: E402
 from ba2_providers.screener.float_filter import parse_float_table  # noqa: E402
 
-PANEL_ROOT = "C:/Users/basti/AppData/Local/Temp/claude/C--Users-basti-Documents-dev-BA2TradePlatform/820f80e0-b6ea-41a0-8f76-d0176d9f7156/scratchpad/screensim/panels_real"
+PANEL_ROOT = os.environ["SCREENER_PANEL_ROOT"]      # directory holding the built daily panels (<root>/<fingerprint>/); no default
 NS = 330                                   # sessions of the panel kept for the own-input rebuild
 
 

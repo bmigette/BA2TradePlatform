@@ -280,7 +280,7 @@ def _cmd_prewarm(args) -> int:
     if not symbols and not args.screener_panel:
         sys.exit("ba2-test prewarm: --symbols is empty (or pass --screener-panel --screener-store ...).")
 
-    # SCREENER PANEL (criteria live-daily-v1): every input of the screener simulation (the vendor's share table and
+    # SCREENER PANEL (criteria live-daily-v2): every input of the screener simulation (the vendor's share table and
     # per-symbol share history, the market-cap / float caches, the daily panel itself) for the universe of
     # --screener-store.  Resumable; an up-to-date panel is a no-op.  Needed by every classic `optimize --screener`
     # job: a job whose panel is missing, stale for its window, or built under another definition REFUSES to launch.
@@ -5497,6 +5497,29 @@ def _resolve_exclude_symbols_arg(spec) -> list:
     return out
 
 
+def _coverage_report(symbols, interval: str, start: str, end: str):
+    """Per-symbol-day intraday coverage of these symbols (``ba2_providers.screener.intraday_coverage``), None on a daily clock."""
+    from ba2_common.config import CACHE_FOLDER
+    from ba2_providers.screener import intraday_coverage as _ic
+    from ba2_providers.screener.universe_superset import interval_is_intraday
+    if not interval_is_intraday(interval):
+        return None
+    return _ic.scan(symbols, os.path.join(CACHE_FOLDER, "FMPOHLCVProvider"), interval, start, end)
+
+
+def _coverage_preflight(command: str, symbols, args) -> None:
+    """LAUNCH REFUSAL (every intraday ``optimize``): more than the stated share of symbol-days without an intraday bar.  The report
+    is printed either way (the screener gate only COUNTS candidates it cannot price)."""
+    from ba2_providers.screener import intraday_coverage as _ic
+    rep = _coverage_report(symbols, args.interval, args.start, args.end)
+    if rep is None:
+        return
+    print(f"{command}: {_ic.format_report(rep)}", flush=True)
+    probs = _ic.problems(rep)
+    if probs:
+        sys.exit(f"{command}: REFUSED (intraday coverage):\n  - " + "\n  - ".join(probs))
+
+
 def _apply_exclude_symbols(command: str, backtest_block: dict, exclude_symbols: list) -> None:
     """Remove ``exclude_symbols`` from ``backtest_block['enabled_instruments']`` and persist the
     FULL requested list on ``backtest_block['excluded_instruments']``.
@@ -6950,7 +6973,7 @@ def _cmd_optimize(args) -> int:
             # Other genes unchanged. Default (no band) keeps the original large-cap-floor behaviour.
             _cap_band = getattr(args, "screener_cap_band", None)
             _scr_opt, base = _us.apply_cap_band(_SCREENER_OPT, base, _cap_band)
-            # LIVE-SIMULATION gate (criteria live-daily-v1): every CLASSIC screener job is gated by the daily
+            # LIVE-SIMULATION gate (criteria live-daily-v2): every CLASSIC screener job is gated by the daily
             # criteria panel (the live screener's own criteria, one evaluation per decision day).  The bypass
             # expert (FactorRanker) builds its universe from the weekly store itself and is NOT covered.
             # The panel must cover the job's window, carry this criteria version, and the launch REFUSES with
@@ -6973,7 +6996,8 @@ def _cmd_optimize(args) -> int:
                 # the newest complete panel of THIS machine, resolved ONCE here and stamped on the job (path relative to
                 # the cache root + fingerprint): the job never switches panel afterwards, a worker resolves the same
                 # relative path in its own cache.
-                _panel_dir = getattr(args, "screener_panel", None) or _ls.latest_panel(_CF0)
+                _panel_dir = (os.path.abspath(args.screener_panel) if getattr(args, "screener_panel", None)
+                              else _ls.latest_panel(_CF0))
                 _probs = (_ls.panel_problems(_panel_dir, args.start, args.end) if _panel_dir
                           else [f"no daily criteria panel under {_ls.panel_root(_CF0)}"])
                 if _probs:
@@ -6989,13 +7013,13 @@ def _cmd_optimize(args) -> int:
                 if _exm:
                     print(f"optimize: screener panel EXCLUDES {len(_exm)} listed symbols with knowingly unusable data (reviewed list "
                           f"ba2_providers/screener/panel_exclusions.json): "
-                          + "; ".join(f"{e['symbol']} ({e['reason'][:60]}..., {e['added']})" for e in _exm), flush=True)
+                          + "; ".join(f"{e['symbol']} ({e['reason'][:60]}..., {e['added']}, reviewed by {e['reviewed_by']})"
+                                      for e in _exm), flush=True)
             backtest_block["screener_opt"] = {
                 "store": args.screener_store,
                 "base_settings": base,
                 **({"criteria_version": _ls.CRITERIA_VERSION, "behaviour": _ls.POST_FIX.name,
-                    "panel": (_ls.panel_rel(_CF0, _panel_dir) if not os.path.isabs(getattr(args, "screener_panel", None) or "")
-                              else _panel_dir),
+                    "panel": _ls.panel_rel(_CF0, _panel_dir),
                     "panel_fingerprint": _ls.read_manifest(_panel_dir)["panel_fingerprint"]} if _use_sim else {}),
                 # the ranges the static universe is the superset of: a genome outside them is refused
                 "declared_ranges": {k[len("screener_"):] if k.startswith("screener_") else k:
@@ -7070,12 +7094,17 @@ def _cmd_optimize(args) -> int:
             if getattr(args, "print_universe", False):
                 # DRY RUN for preflights (grid scripts): the job's static universe through the SAME function the
                 # launch uses, and the symbols a launch would refuse on; nothing is submitted.
+                _cov = _coverage_report([x for x in enabled if x not in set(_uncached)], args.interval, args.start, args.end)
+                from ba2_providers.screener import intraday_coverage as _icm
+                _cov_probs = _icm.problems(_cov) if _cov else []
                 print("PRINT-UNIVERSE " + json.dumps({"static_universe_size": len(enabled),
+                                                      "intraday_missing_coverage_share": (_cov["missing_coverage_share"] if _cov else None),
+                                                      "intraday_no_file": (_cov["no_intraday_file"] if _cov else None),
                                                       "uncached": _uncached, "interval": args.interval,
                                                       "rule": _us.RULE_ID,
                                                       "criteria_version": (_ls.CRITERIA_VERSION if _use_sim else None)}),
                       flush=True)
-                sys.exit(0 if not _uncached or getattr(args, "screener_exclude_uncached", False) else 3)
+                sys.exit(0 if (not _uncached or getattr(args, "screener_exclude_uncached", False)) and not _cov_probs else 3)
             if _uncached:
                 if not getattr(args, "screener_exclude_uncached", False):
                     sys.exit(
@@ -7139,6 +7168,9 @@ def _cmd_optimize(args) -> int:
         _apply_exclude_symbols("optimize", backtest_block, _exclude_symbols)
         if _exclude_symbols:
             universe = list(backtest_block["enabled_instruments"])
+        # the FINAL universe's intraday coverage (threshold + report); the price-basis cross-check is the shared function of
+        # fix/ohlcv-cross-interval-basis, not duplicated here
+        _coverage_preflight("optimize", list(backtest_block["enabled_instruments"]), args)
         # Market-condition gates: record the profile + the pinned manifest on the run config
         # (persisted, so every _build_daily_trial_config consumer of this run -- trials, re-runs,
         # robustness variants, top-N persist, tools/backtest_parity.py -- carries the digest), and
@@ -8358,7 +8390,7 @@ def main(argv: "list | None" = None) -> int:
     pw.add_argument("--symbols", default=None,
                     help="Comma-separated symbols, or @file. Optional with --screener-panel.")
     pw.add_argument("--screener-panel", action="store_true",
-                    help="Also build / refresh the SCREENER SIMULATION data (criteria live-daily-v1) for the universe "
+                    help="Also build / refresh the SCREENER SIMULATION data (criteria live-daily-v2) for the universe "
                          "of --screener-store: the vendor's share table (1 call) and per-symbol share history, the "
                          "market-cap / float caches, and the daily criteria panel under <cache>/screener/daily_panel "
                          "(~0.8 GB; remote workers receive it with `cache push`). Uses --start/--end as the job "
@@ -8790,7 +8822,7 @@ def main(argv: "list | None" = None) -> int:
                          "genes unchanged. Run one job per band.")
     op.add_argument("--screener-panel", default=None,
                     help="Directory of the DAILY screener-criteria panel (default <cache>/screener/daily_panel). "
-                         "Classic --screener jobs are gated by it (criteria live-daily-v1); build it with "
+                         "Classic --screener jobs are gated by it (criteria live-daily-v2); build it with "
                          "`ba2-test prewarm --screener-panel` or `build-screener-metrics --daily-panel`.")
     op.add_argument("--print-universe", action="store_true",
                     help="--screener dry run: print the job's static universe size and the symbols without cached "

@@ -167,9 +167,11 @@ def test_band_is_tested_on_the_price_at_T_after_the_first_bar_and_on_the_previou
     syms = ["UP"]
     sessions = W._sessions(40)
     T = len(sessions)
-    idx = np.arange(T - 1)
-    c = np.full(T - 1, 100.0)
-    bars = {"UP": (idx, c, c * 1.01, c * 0.99, c, np.full(T - 1, 1e6))}
+    idx = np.arange(T)                                                                  # the decision day's own bar exists: low 99, high 300
+    c = np.full(T, 100.0)
+    hi_bar = c * 1.01
+    hi_bar[-1] = 300.0
+    bars = {"UP": (idx, c, hi_bar, c * 0.99, c, np.full(T, 1e6))}
     arrays = ls.build_panel_arrays(bars, sessions, np.full((1, T), 5.0e7), syms)       # prev cap = 100 x 5e7 = 5.0e9
     panel = ls.DailyPanel(syms, sessions, arrays, {})
     day = sessions[-1]
@@ -180,6 +182,46 @@ def test_band_is_tested_on_the_price_at_T_after_the_first_bar_and_on_the_previou
     # the cap CEILING uses the session LOW in the bounds, the FLOOR the session HIGH: a superset of every price between
     st2 = {**FULL, "market_cap_min": 5.2e9, "max_stocks": 5}
     lo = np.array([99.0]); hi = np.array([106.0])
+    # a 2.4x intraday move (beyond the old [0.5 x min, 2 x max] tolerance) is evaluated: the exact bound is the session high
+    big = np.array([240.0])
+    assert panel.select(day, {**FULL, "market_cap_min": 1.1e10, "max_stocks": 5}, BEH, now=big, band_at_now=True) == ["UP"]
     assert panel.select(day, st2, BEH, now=lambda i: (lo[i], hi[i]), band_at_now=True) == ["UP"]
     st3 = {**FULL, "market_cap_max": 4.9e9, "max_stocks": 5}
     assert panel.select(day, st3, BEH, now=lambda i: (lo[i], hi[i]), band_at_now=True) == []       # low 99 x 5e7 = 4.95e9 > 4.9e9: no
+
+
+def test_job_end_alarm_for_a_selectable_name_that_was_never_loaded(tmp_path):
+    """An 'outside the preload' candidate that the bounds-based selection (the prune's function) returns for that day is a missing
+    cache file, not a name the prune dropped: assert_complete() is job-fatal and names it; a clean run passes."""
+    world, panel = _panel(2)
+    d = tmp_path / "panel"
+    _save(panel, d, "alarm")
+    prices = dict(world.open_now)
+    victim = max(world.symbols, key=lambda s: world.prev_close(s) * world.shares[s])
+    del prices[victim]                                   # not loaded at all (has_symbol False)
+    st = {"market_cap_min": 1e9, "price_min": 1.0, "max_stocks": 50}
+    gate = sg.PanelGate(_runtime(str(d), st), FakePS(prices), intraday=True)
+    gate.symbols(datetime.fromisoformat(W.DAY + "T10:00:00"))
+    assert gate.diagnostics()["outside_preload_candidate_decisions"] >= 1
+    with pytest.raises(sg.ScreenerGateRefusal, match=victim):
+        gate.assert_complete()
+    clean = sg.PanelGate(_runtime(str(d), st), FakePS(dict(world.open_now)), intraday=True)
+    clean.symbols(datetime.fromisoformat(W.DAY + "T10:00:00"))
+    clean.assert_complete()
+
+
+def test_the_first_bar_rule_reads_the_price_source_interval_and_requires_it(tmp_path):
+    world, panel = _panel(2)
+    _save(panel, tmp_path / "p", "fb")
+    gate = sg.PanelGate(_runtime(str(tmp_path / "p"), {"market_cap_min": 1e9, "max_stocks": 5}),
+                        FakePS(dict(world.open_now)), intraday=True)
+    assert gate._in_first_bar(datetime.fromisoformat(W.DAY + "T09:32:00"))
+    assert not gate._in_first_bar(datetime.fromisoformat(W.DAY + "T09:35:00"))
+    gate.ps.interval = "15min"
+    assert gate._in_first_bar(datetime.fromisoformat(W.DAY + "T09:44:00"))
+    del gate.ps.interval
+    with pytest.raises(AttributeError):                 # no default: a price source without an interval is a bug
+        gate._in_first_bar(datetime.fromisoformat(W.DAY + "T09:32:00"))
+    gate.ps.interval = "weekly-ish"
+    with pytest.raises(sg.ScreenerGateRefusal):
+        gate._in_first_bar(datetime.fromisoformat(W.DAY + "T09:32:00"))

@@ -85,6 +85,8 @@ def test_gate_is_always_inside_the_prune_and_the_static_superset():
             now = lo[p] + np.random.default_rng(p).random(len(panel.symbols)) * (hi[p] - lo[p])
             now = np.where(np.isfinite(now), now, np.nan)
             got = panel.select(day, g, BEH, now=now)
+            got_b = panel.select(day, g, BEH, now=now, band_at_now=True)  # band on the price at T (decisions after the first bar)
+            assert set(got_b) <= prune, ("band_at_now", day, g, sorted(set(got_b) - prune))
             checked += 1
             nonempty += bool(got)
             assert set(got) <= prune, (day, g, sorted(set(got) - prune))
@@ -134,6 +136,7 @@ class FakePS:
 
     def __init__(self, prices, intraday=True):
         self.prices, self.is_intraday, self.calls = prices, intraday, []
+        self.interval = "5min" if intraday else "1d"
 
     def has_symbol(self, symbol):
         return symbol in self.prices
@@ -234,10 +237,10 @@ def test_job_identity_carries_the_criteria(tmp_path):
     assert checkpoint_fingerprint(space, ga, None, None, "superset-v1", None) == base       # unchanged when unstamped
     sys.path.insert(0, str(REPO / "tools"))
     import matrix_flags as mf
-    assert mf.SCREENER_CRITERIA_NAME_TOKEN == ls.CRITERIA_NAME_TOKEN == "-lds1"
-    assert mf.with_universe_rule_name("scr-mid-X-S1") == "scr-mid-X-S1-sup1-lds1"
-    assert mf.with_universe_rule_name("scr-mid-X-S1-timegene") == "scr-mid-X-S1-timegene-sup1-lds1"
-    assert mf.with_universe_rule_name("scr-mid-X-S1-sup1-lds1") == "scr-mid-X-S1-sup1-lds1"       # idempotent
+    assert mf.SCREENER_CRITERIA_NAME_TOKEN == ls.CRITERIA_NAME_TOKEN == "-lds2"
+    assert mf.with_universe_rule_name("scr-mid-X-S1") == "scr-mid-X-S1-sup1-lds2"
+    assert mf.with_universe_rule_name("scr-mid-X-S1-timegene") == "scr-mid-X-S1-timegene-sup1-lds2"
+    assert mf.with_universe_rule_name("scr-mid-X-S1-sup1-lds2") == "scr-mid-X-S1-sup1-lds2"       # idempotent
     assert mf.with_universe_rule_name("scr-large-FactorRanker", simulated=False) == "scr-large-FactorRanker-sup1"
 
 

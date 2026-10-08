@@ -146,7 +146,7 @@ def test_dry_run_default_gene_on_never_reaches_the_factorranker_job(monkeypatch,
     classic = [ln for ln in todo if "FMPRating" in ln]
     assert len(fr) == 1 and len(classic) == 1
     assert "timegene" not in fr[0] and "scr-large-FactorRanker-sup1 " in fr[0]
-    assert re.search(r"-timegene-sup1-lds1-d[0-9a-f]{12}\b", classic[0]), classic[0]
+    assert re.search(r"-timegene-sup1-lds2-d[0-9a-f]{12}\b", classic[0]), classic[0]
     assert "NOTE scr-large-FactorRanker: bypass expert, decision time stays fixed" in out
 
 

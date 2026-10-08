@@ -408,6 +408,7 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
                "total_return": results.get("total_return"),
                "max_drawdown": results.get("max_drawdown"),
                **_analysis_failures_field(results),
+               **_screener_gate_field(results),
                # The decision-time counter, so the MASTER can warn once per job (see
                # ``_decision_time_missing``). Only when non-zero: other results keep their shape.
                **_decision_time_missing(results),
@@ -1262,6 +1263,30 @@ def _analysis_failures_field(results: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _screener_gate_field(results: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"sg": {"no_price": n, "outside": m, "symbols": k}}`` for a trial whose screener gate dropped candidates for want of a
+    price (``results["screener_gate"]``), so the persisted per-trial rows and the job-level summary show it (silent otherwise)."""
+    sg = (results or {}).get("screener_gate") or {}
+    np_, out = int(sg.get("no_price_candidate_decisions") or 0), int(sg.get("outside_preload_candidate_decisions") or 0)
+    if np_ or out:
+        return {"sg": {"no_price": np_, "outside": out, "symbols": int(sg.get("no_price_symbol_count") or 0)}}
+    return {}
+
+
+def summarise_screener_gate(opt_name: str, all_results: list) -> Optional[Dict[str, Any]]:
+    """ONE job-level WARNING aggregating the screener gate's no-price counts over the trials (returned, and each trial's ``sg`` is
+    persisted in ``all_results``)."""
+    rows = [(r["sg"], r.get("key")) for r in all_results if isinstance(r, dict) and r.get("sg")]
+    if not rows:
+        return None
+    agg = {"trials": len(rows), "no_price": sum(x["no_price"] for x, _ in rows), "outside": sum(x["outside"] for x, _ in rows),
+           "max_symbols": max(x["symbols"] for x, _ in rows)}
+    logger.warning(f"[{opt_name}] screener gate: candidates without a price in {agg['trials']} trial(s): "
+                   f"{agg['no_price']} loaded-but-unpriced decisions (up to {agg['max_symbols']} symbols in one trial), "
+                   f"{agg['outside']} outside the preloaded set (see each trial's 'sg' in all_results)")
+    return agg
+
+
 def summarise_analysis_failures(opt_name: str, all_results: list) -> Optional[Dict[str, Any]]:
     """ONE job-level line aggregating the per-trial analysis-failure counts (below the refusal
     threshold they would otherwise be visible only inside each trial's results). Returns the aggregate."""
@@ -1727,6 +1752,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "max_drawdown": (results or {}).get("max_drawdown"),
                     **_decision_time_missing(results or {}),
                     **_analysis_failures_field(results or {}),
+                    **_screener_gate_field(results or {}),
                 }
             )
             if best["fitness"] is None or fit > best["fitness"]:
@@ -2064,6 +2090,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                              "total_return": out.get("total_return"),
                              "max_drawdown": out.get("max_drawdown"),
                              **({"af": out["af"]} if out.get("af") else {}),
+                             **({"sg": out["sg"]} if out.get("sg") else {}),
                              **({"dt_missing": out["dt_missing"]} if out.get("dt_missing") else {})}
                         )
                         if is_last_gen:
@@ -2478,6 +2505,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         opt.best_fitness = result["best_fitness"]
         _warn_decision_time_missing(opt.name, all_results)
         summarise_analysis_failures(opt.name, all_results)
+        summarise_screener_gate(opt.name, all_results)
         opt.all_results = all_results
         db.commit()
         push_optimization(opt, db)
@@ -2611,7 +2639,7 @@ def _build_hoisted_state(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
         # restriction so the static run universe is kept byte-identical.
         hoisted["screener_gate_only"] = bool(screener_opt.get("gate_only"))
         hoisted["screener_declared_ranges"] = screener_opt.get("declared_ranges")
-        # LIVE-SIMULATION gate (criteria live-daily-v1): the run carries the criteria version and the daily
+        # LIVE-SIMULATION gate (criteria live-daily-v2): the run carries the criteria version and the daily
         # panel it was launched against.  A panel that does not cover the window, or was built under another
         # definition, REFUSES here -- before any trial -- with the list of what is missing.
         if screener_opt.get("criteria_version") or screener_opt.get("panel"):
@@ -3434,7 +3462,7 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     population of genomes in it, scored on the OLD cap-ranked top-50 list) must never be resumed into a
     run on the corrected superset universe, or the other way round.
 
-    ``screener_criteria`` (``backtest.screener_opt.criteria_version``, e.g. ``live-daily-v1``) joins it the
+    ``screener_criteria`` (``backtest.screener_opt.criteria_version``, e.g. ``live-daily-v2``) joins it the
     same way: the DEFINITION of what the gate selects (live-simulation daily criteria vs the old weekly store
     gate) is part of the job's identity; a checkpoint scored under one must never be resumed under the other.
     """

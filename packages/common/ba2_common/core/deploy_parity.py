@@ -246,7 +246,9 @@ def complete_screener_settings(expert_params: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     missing = []
     for k in SCREENER_SELECTION_KEYS:
-        v = expert_params.get(f"screener_{k}", expert_params.get(k))
+        v = expert_params.get(f"screener_{k}")
+        if v is None:                                  # an explicit None is "not stated", never a value
+            v = expert_params.get(k)
         if v is None:
             if k in SCREENER_OFF_VALUES:
                 v = SCREENER_OFF_VALUES[k]

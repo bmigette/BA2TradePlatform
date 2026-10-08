@@ -629,6 +629,7 @@ class AsOfPriceSource:
         self._l: Dict[str, np.ndarray] = {}      # low
         self._c: Dict[str, np.ndarray] = {}      # close
         self._v: Dict[str, np.ndarray] = {}      # volume
+        self._shi: Dict[str, Tuple[Any, np.ndarray]] = {}   # symbol -> (the _h array it was built from, running session high)
         self._clock_key: Any = None      # normalised Python key of the current clock bar (set_clock)
         # Per-symbol monotonic cursor: index of the last key <= the current clock. The engine's
         # clock only ever moves forward, so a clock-based lookup advances this cursor (O(1)
@@ -885,9 +886,23 @@ class AsOfPriceSource:
         day0 = (key // _NS_PER_DAY) * _NS_PER_DAY
         f = bisect.bisect_right(k, key - span) - 1
         if f >= 0 and k[f] >= day0:
-            start = bisect.bisect_left(k, day0)
-            return float(np.max(self._h[symbol][start:f + 1]))
+            return float(self._session_running_high(symbol)[f])       # O(1) lookup after one vectorised pass per symbol
         return self.screener_now_price(symbol, as_of)
+
+    def _session_running_high(self, symbol: str) -> np.ndarray:
+        """Running (cumulative) HIGH of every bar's own session, aligned to the symbol's bars: element ``i`` = the highest
+        high of the bars of ``i``'s session up to and including ``i``.  Built ONCE per symbol per bound bar array (a pandas
+        grouped cummax, exact), so ``screener_session_high`` is a bisect + an array read instead of a slice max per
+        decision.  Costs 8 bytes per bar of a symbol the screener asked about."""
+        h = self._h[symbol]
+        got = self._shi.get(symbol)
+        if got is not None and got[0] is h:
+            return got[1]
+        import pandas as pd
+        day = _keys_np(self._keys[symbol]) // _NS_PER_DAY
+        cm = pd.Series(h).groupby(day).cummax().to_numpy()
+        self._shi[symbol] = (h, cm)
+        return cm
 
     # ---- loading -----------------------------------------------------------
     def preload(

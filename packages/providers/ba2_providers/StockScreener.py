@@ -19,7 +19,7 @@ from ba2_common.config import get_app_setting
 from ba2_common.logger import logger
 from ba2_common.core.replay.context import capture_aware_submit
 from ba2_common.core.replay.observe import observe_provider
-from ba2_providers.fmp_common import FMPError
+from ba2_providers.fmp_common import FMPError, redact
 
 
 #: ONE window per symbol per day, wide enough for every pass a screen makes.
@@ -447,9 +447,9 @@ class StockScreener:
                         if (item.get("symbol") or "").upper()
                     }
             except FMPError as e:
-                logger.warning(f"StockScreener: quote chunk {chunk_idx + 1}/{total_chunks} failed after retries: {e}")
+                logger.warning(f"StockScreener: quote chunk {chunk_idx + 1}/{total_chunks} failed after retries: {redact(e)}")
             except Exception as e:
-                logger.warning(f"StockScreener: quote chunk {chunk_idx + 1}/{total_chunks} failed: {e}")
+                logger.warning(f"StockScreener: quote chunk {chunk_idx + 1}/{total_chunks} failed: {redact(e)}")
             return {}
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -568,10 +568,10 @@ class StockScreener:
                                     endpoint="historical-price-full", timeout=15)
                 data = resp.json()
             except FMPError as e:
-                logger.warning(f"StockScreener: OHLCV chunk failed after retries: {e}")
+                logger.warning(f"StockScreener: OHLCV chunk failed after retries: {redact(e)}")
                 return {}
             except Exception as e:
-                logger.warning(f"StockScreener: OHLCV chunk failed: {e}")
+                logger.warning(f"StockScreener: OHLCV chunk failed: {redact(e)}")
                 return {}
 
             # Single symbol → {"symbol": ..., "historical": [...]}

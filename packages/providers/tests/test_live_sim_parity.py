@@ -85,6 +85,25 @@ class World:
         arrays = ls.build_panel_arrays(self.bars, self.sessions, sh, self.symbols, fl=fl)
         return ls.DailyPanel(self.symbols, self.sessions, arrays, {})
 
+    def panel_with_day_bar(self):
+        """The panel as the backtest has it: the decision day's own daily bar exists and brackets every price of the session
+        (``day_lo`` / ``day_hi`` of the exact band bound); the finished-session columns are unchanged by it."""
+        bars = dict(self.bars)
+        T = len(self.sessions)
+        for sym in self.symbols:
+            i, o, h, l, c, v = bars[sym]
+            px, lc = self.open_now[sym], float(c[-1])
+            bars[sym] = (np.append(i, T - 1), np.append(o, px), np.append(h, max(px, lc) * 1.01), np.append(l, min(px, lc) * 0.99),
+                         np.append(c, px), np.append(v, 1e6))
+        S_ = len(self.symbols)
+        sh = np.zeros((S_, T)); fl = np.full((S_, T), np.nan)
+        for s_, sym in enumerate(self.symbols):
+            sh[s_] = self.shares[sym]
+            if self.floats[sym]:
+                fl[s_] = self.floats[sym]
+        arrays = ls.build_panel_arrays(bars, self.sessions, sh, self.symbols, fl=fl)
+        return ls.DailyPanel(self.symbols, self.sessions, arrays, {})
+
     def now_fn(self):
         arr = np.array([self.open_now[s] for s in self.symbols])
         return lambda idx: (arr[idx], arr[idx])
@@ -423,7 +442,7 @@ def test_band_at_now_equals_live_when_the_vendor_cap_is_struck_on_the_price_at_T
     settings["market_cap_min"] = float(math.floor(caps[len(caps) // 3]))          # the setting is an int: keep the edge inclusive
     settings["market_cap_max"] = float(math.ceil(caps[2 * len(caps) // 3])) if seed % 2 else 0
     live = run_live(world, settings)
-    sim = world.panel().select(DAY, settings, ls.POST_FIX, now=world.now_fn(), band_at_now=True)
+    sim = world.panel_with_day_bar().select(DAY, settings, ls.POST_FIX, now=world.now_fn(), band_at_now=True)
     assert sim == live, f"seed {seed}: {settings}\n live {live}\n  sim {sim}"
 
 

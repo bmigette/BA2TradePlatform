@@ -1,4 +1,4 @@
-# The backtest's screener gate = a simulation of the LIVE FMP screener (criteria `live-daily-v1`)
+# The backtest's screener gate = a simulation of the LIVE FMP screener (criteria `live-daily-v2`)
 
 Owner's decision (2026-10-08): live keeps using the FMP screener and is the reference; the backtest simulates it, daily, on a finite
 universe. Live code is not changed by this work (its post-filters are imported or re-derived and pinned by tests).
@@ -21,13 +21,17 @@ Live's order of operations, reproduced by ONE function (`select_from_columns`), 
 | RVOL | last finished session's volume / `round(mean(last <= 20 bars in [D-35d, D)), 2)` (denominator INCLUDES the numerator), `round(.., 2)` |
 | price drop | peak = highest `max(high, low)` over the bars dated in `[D-(n+5)d, D)` PLUS the forming bar, the last `n` of them; `current` = now; `round((peak-cur)/peak*100, 2) >= pct` |
 | Weinstein | `classify_weinstein_stage` (imported) on the closes in `[D-255d, D)` PLUS the forming bar's close = now |
-| market cap | previous close x the vendor's share count, **on the as-traded basis of the morning** (section 4) |
+| market cap, BAND (vendor stage 1) | the vendor's last-trade price x its share count, **as-traded basis**: the PREVIOUS CLOSE inside the session's first bar (09:30, the names that have not printed), the PRICE AT T for every later decision (`band_at_now`); measured, section 4b |
+| market cap, RANK KEY | the refreshed `/quote` cap = price at T x the vendor's shares (`RANK_CAP_BASIS` is gone: one rule); a name without a price ranks on its previous-close cap |
 | now | see below |
 
 ### "Now" and the forming daily bar, for every decision time T
 FMP's daily history carries the session's FORMING bar when live screens. The simulation models it as: close = the price at T, high = the
 highest high of the session's intraday bars ENDED <= T (+ the open), and uses it as the last close of the Weinstein input, as one of the
 last `n` bars of the drop window (its high joins the peak) and as the drop test's current price.
+**The close is a stand-in** (measured 2026-10-08, section 4b): FMP's forming-bar close lags the quote (median 0.26 %, 95th percentile 1.1 %);
+the selection function takes the true bar close (`forming_close`) in the replay of recorded inputs, the backtest has no second price and passes
+`None`.
 
 | decision time T | "now" | forming-bar high | code |
 |---|---|---|---|
@@ -51,8 +55,9 @@ inside the static superset, intraday AND daily clock, with prices supplied ONLY 
 * the live quote's exact second (30-90 s after the open), and which print it is: the daily bar's open (the official auction print) is
   identical to the first five-minute bar's open for 43 % of names, median |diff| 0.09 %, p95 1.7 % (430 sampled pairs, June 2026);
 * the vendor's share count in the 44 symbols without a vendor history (FMP-implied fallback) and before 2021-05;
-* tie order of equal market caps: symbol ascending; the rank key: previous close x shares (live: the refreshed /quote cap; the
-  experiment on the recorded days shows no difference: i8 0.854 -> 0.864, others 0);
+* tie order of equal market caps: symbol ascending;
+* the forming bar's close (stand-in = the price at T; FMP's differs by a median 0.26 %, p95 1.1 %: MRNA / QCOM at 10:05);
+* the band at 09:30 is the previous close for every name, the vendor's is a per-symbol mix (names that have printed show the last trade);
 * cache gaps inside a window are skipped; the n-session trim is applied on the common NYSE session grid; delisted names are outside the finite universe.
 
 ## 2. Design: a daily panel, not a daily store
@@ -83,7 +88,7 @@ guard counts once per decision and says which set was violated (pruned preload v
 * The job stamps `screener_opt.panel` (relative to the cache root, resolved on each machine), `panel_fingerprint`, `behaviour` (`post-fix`) and
   `criteria_version`; the checkpoint fingerprint is `criteria/behaviour/panel fingerprint`; `get_panel` never reloads and refuses a path whose
   fingerprint differs from the job's; results carry `screener_gate`. Shapes are validated against `symbols.json` / `sessions.json` on load.
-* Job name: `<base>-timegene-sup1-lds1-d<digest>` (FactorRanker keeps `<base>-sup1`).
+* Job name: `<base>-timegene-sup1-lds2-d<digest>` (FactorRanker keeps `<base>-sup1`).
 * Older panel directories are kept; the build prints their sizes.
 
 ### Settings: nothing is left to StockScreener's defaults
@@ -157,11 +162,52 @@ from the daily open by the amounts above. Per-day tables: `reports/screener_pari
   displaced / displacing at it; re-ranking by `now x shares` instead of the previous-close cap does not remove them. **Unexplained: all of the
   above**; the stage-log request (section 6) is what would settle them. Weinstein counts agree where live logged them (2026-09-28: 230 vs 230;
   2026-10-05: 224 vs 225), so there is no aggregate bias, but 09-14 and 09-21 have no logged counts.
-* **Fitted choices, no holdout**: `FORMING_BAR_PRESENT = True` (fitted on instance 7 days 09-14 / 09-21: HOOD, WDC) and `prev_close` as the cap
-  basis (fitted on XENE 2026-09-18) were chosen on these scored days. The holdout is the coming live days: `tools/screener_parity_report.py --from
+* **Fitted choices, no holdout** (SUPERSEDED by section 4b: both were MEASURED on the live captures of 2026-10-08 and the cap basis changed;
+  the tables in this section and in `reports/screener_parity_2026-10-08/` were scored with the OLD rules, previous close x shares as the rank
+  key and the band, and are kept as history only): `FORMING_BAR_PRESENT = True` (fitted on instance 7 days 09-14 / 09-21: HOOD, WDC) and
+  `prev_close` as the cap basis (fitted on XENE 2026-09-18) were chosen on these scored days. The holdout is the coming live days: `tools/screener_parity_report.py --from
   <day> --to <day>` scores any range read-only (the screen of 2026-10-08 onward is out of sample).
 * The recorded-day fixture (`fixtures/screener_recorded_days.json`, 700 KB) was re-extracted from the real build: 5 days of instance 11 (3 exact,
   2 with the pinned residuals ORA, CGON), not selection-biased.
+
+## 4b. Live captures of 2026-10-08 (the verdicts that fixed the rules)
+`tools/screener_capture/`: the real post-fix `StockScreener.screen()` for prod instances 7, 8, 10, 11, with a recording wrapper at the vendor
+HTTP seam (<= 4 calls/s), at 09:40 ET (label `0940`, instance 7; instance 8 hit the label budget), 09:50 (`0950`: 8, 10, 11, a re-capture) and
+10:05 (`1005`: 7, 8, 10, 11). 9 cells. Offline: (a) **replay** through live `screen()` from the recorded bodies; (b) the simulation's selection
+function on the **same recorded inputs**; (c) the simulation on its **own inputs** (cache + panel).
+
+| check | result |
+|---|---|
+| (a) replay through live `screen()` | ordered picks IDENTICAL in 9 of 9 cells; stage stats equal; 0 unmatched requests |
+| (b) selection function on recorded inputs | ordered picks IDENTICAL in 9 of 9 cells, 0 term differences |
+| (c) simulation on its OWN inputs | ordered equality in 3 of 9 cells; Jaccard 0.917 - 1.0 (1005: 0.935 / 1.0 / 0.961 / 0.917 for instances 7 / 8 / 10 / 11; 0940: 1.0; 0950: 1.0 / 0.961 / 0.923) |
+
+**What (b) proves and does NOT prove.** The candidate list (the vendor stage's output), the "now" price and the share count in (b) come from LIVE'S OWN
+staged outputs of that run, and the market-cap band is switched off. So (b) validates stages 2-7 and the ordering (RVOL, floors, Weinstein, rank,
+price-drop walk, cut) and the rules found by it (rank key, forming-bar close). It does NOT validate the band, `band_at_now`, the panel's share
+counts, the as-traded factors or the cache: those are only exercised by (c).
+
+**(c): the differing names** (honest own-input result): CTVA (cache not adjusted for the 2026-10-01 spin-off: bars differ by up to 85 %),
+NEOG and LQDA (band edge / share count: the vendor's cap vs the panel's shares x price differ by 2-3 %), MRNA vs QCOM at 10:05 (the forming-bar
+close stand-in, above).
+
+**Verdicts** (rule changes in `live_sim.py`; tests in `test_live_sim_parity.py` and `test_screener_gate_review_fixes.py`):
+1. *Forming bar present*: 1,747 of 1,750 symbols have a bar dated today at 10:05; its high equals the quote's `dayHigh` (median ratio 1.0); its close differs
+   from the quote price by a median 0.26 % (p95 1.1 %). `FORMING_BAR_PRESENT = True` confirmed; the close is a lagged snapshot (MRNA / QCOM).
+2. *Rank key* = quote price x vendor shares (the quote's `marketCap` / that product: median 1.0000; against previous close x shares 0.9996). Rank on
+   the cap at the decision price.
+3. *Band cap* = the vendor's last-trade price x shares: the vendor cap is closer to quote x shares than to previous close x shares for 89 % of 2,633 names
+   at 10:05 (82 % of 617 / 2,018 at 09:41-09:54); the vendor's price equals the quote for 17 %, the previous close for 2 %. The open snapshot (50 names of
+   the 5-10 bn band, 44 usable; 09:30:07 / 09:37:49 / 10:00:01): at 09:30:07 the vendor cap equals previous close x shares (median deviation 0.09 %, against
+   0.45 % for the quote), and its price is the previous close for 21 of 44 names (the ones that have not printed); at 09:37 and 10:00 it equals the live
+   price (0.06 % / 0.11 %) with 0 of 44 at the previous close. So: band on the previous close inside the first bar, on the price at T afterwards
+   (`band_at_now`). How many band-edge names the 09:30 approximation (previous close for every name) can flip was NOT quantified.
+4. *Exact band bound*: with `band_at_now` the candidates are pre-selected on the session's low / high x shares (cap at the low <= max, cap at the high
+   >= min; widened by the previous close), the final test is the exact price at T. The first version used a hard-coded [0.5 x min, 2 x max] window
+   on the previous-close cap that silently dropped names moving more than that; it is gone.
+
+Identity: these changed the selection rules, so `CRITERIA_VERSION` is `live-daily-v2` (job-name token `-lds2`): no panel, checkpoint or re-run
+crosses a rule set. Old panels are refused (`panel criteria_version ... !=`) and must be rebuilt (same data, ~13 min).
 
 ## 5. Prewarm and builder wiring
 ```
@@ -181,6 +227,23 @@ detail by the front end was not verified in a browser).
 
 `interval_is_intraday` now treats `"1hour"` / `"4hour"` as intraday (it classified them as daily). No driver, launcher choice or doc uses those
 spellings (the cache holds `1h`, which was always intraday); the change is kept and is a no-op for every existing run.
+
+## 5b. Launch guards added in review round 2
+* **Exclusion list** (`panel_exclusions.json`): an entry whose `reviewed_by` starts with "pending" REFUSES the launch (`panel_problems`), naming the
+  entries; accepted entries are printed with their reviewer. The owner confirms an entry or it is removed after the data is repaired; nothing is
+  approved by the code.
+* **Intraday coverage** (`ba2_providers/screener/intraday_coverage.py`, run by `ba2-test optimize` for every intraday job and by `--print-universe`):
+  of the symbol-days with a daily bar, more than 5 % without an intraday bar REFUSES the launch; the report (worst symbols, symbols with no file)
+  is printed either way. The intraday-vs-daily PRICE BASIS check is the shared function of `fix/ohlcv-cross-interval-basis`.
+* **Job-end alarm**: a candidate that had no price because it was not loaded, although the bounds-based selection (the prune's function) returns it
+  for that day, is job-fatal (`PanelGate.assert_complete`, `ScreenerGateRefusal`). The no-price counts are logged at job end and every trial row
+  of the persisted `all_results` carries `sg: {no_price, outside, symbols}`.
+* **Web UI**: `Backtesting.tsx` sends `screener_opt` without the launcher's stamp (`screener_universe_rule`, `enabled_instruments`, panel); the
+  API REFUSES it (400, message names `ba2-test optimize --screener`), classic and FactorRanker alike (the UI never sends
+  `apply_to_expert_settings`). Test: `test_strategies_screener_opt_api.py`. A UI screener launch needs an owner decision.
+* Cost: `screener_session_high` is a bisect + array read after one vectorised running-high pass per symbol (+8 bytes per bar of a screened
+  symbol); the drop-window peak reads the memory-mapped high / low arrays (no 72 MB private copy per process).
+* The API key is scrubbed (`fmp_common.redact`) from the screener's request/exception log lines.
 
 ## 6. Request to the stage-log developer (`feat/screener-stage-log` @ 81b2bec7)
 It logs one `LIVE STAGES` line (counts per stage + FMP failure counters) and the existing `LIVE SELECTION` line. For a replayable parity

@@ -1098,6 +1098,12 @@ def run_daily_backtest(
             if _su_rec is not None:
                 results["screener_universe"] = _su_rec
             _sr = config.get("screener_runtime") or {}
+            if getattr(engine, "_screen_gate", None) is not None:
+                engine._screen_gate.assert_complete()                  # job-fatal: a selectable name without bars
+                _gd = engine._screen_gate.diagnostics()
+                (logger.warning if _gd["no_price_candidate_decisions"] or _gd["outside_preload_candidate_decisions"] else logger.info)(
+                    f"screener gate: {_gd['no_price_candidate_decisions']} candidate decisions without a price "
+                    f"({_gd['no_price_symbol_count']} symbols), {_gd['outside_preload_candidate_decisions']} outside the preloaded set")
             if _sr.get("criteria_version"):
                 # WHICH definition and WHICH data this run was gated by
                 results["screener_gate"] = {"criteria_version": _sr["criteria_version"],

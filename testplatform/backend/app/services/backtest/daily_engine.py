@@ -244,7 +244,7 @@ def _screened_symbols_for_bar(
     if not screener_runtime:
         return None
     if screener_runtime.get("criteria_version"):
-        # LIVE-SIMULATION gate (criteria live-daily-v1): the DAILY panel gate, evaluated for the decision's
+        # LIVE-SIMULATION gate (criteria live-daily-v2): the DAILY panel gate, evaluated for the decision's
         # own morning.  The weekly store path below is the LEGACY gate, reachable only by a run that carries
         # no criteria_version (a stored pre-simulation row); the two never share a job identity.
         if gate is None:

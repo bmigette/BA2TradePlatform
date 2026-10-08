@@ -11,14 +11,33 @@ The prod DB is opened READ-ONLY (settings + key; the key is never printed or sto
 import copy
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
 import time
 from datetime import datetime, timezone
 
+
+class _ScrubStream:
+    """stdout / stderr with every ``apikey=...`` value replaced by ``***``.  Installed BEFORE any ba2 module is imported, so the logger's
+    handlers (which bind the stream at import) write through it: a DEBUG line that embeds a request URL never leaks the key."""
+    _RE = re.compile(r"""(?i)((?:api_?key)(?:=|['"]?\s*:\s*['"]?))[^&\s'",)}]+""")
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def write(self, s):
+        return self._inner.write(self._RE.sub(r"\1***", s))
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+sys.stdout, sys.stderr = _ScrubStream(sys.stdout), _ScrubStream(sys.stderr)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB = "C:/Users/basti/Documents/ba2_trade_platform-prod/db.sqlite"
+DB = os.environ["BA2_PROD_DB"]            # path of the prod sqlite file (opened read-only); no default
 MAX_PER_SECOND = 4.0
 LABEL_BUDGET_S = float(os.environ.get("CAPTURE_BUDGET_S", "600"))   # 0940 hit the 360 s default after instance 7: 600 s from then on
 

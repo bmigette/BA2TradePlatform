@@ -1,4 +1,4 @@
-"""The backtest's screener gate on the DAILY criteria panel (``criteria_version`` ``live-daily-v1``).
+"""The backtest's screener gate on the DAILY criteria panel (``criteria_version`` ``live-daily-v2``).
 
 ONE selection function (``ba2_providers.screener.live_sim.select_from_columns``) serves three callers, so they cannot
 disagree:
@@ -140,6 +140,10 @@ class PanelGate:
         self.no_price_decisions = 0
         self.outside_preload_decisions = 0
         self.no_price_symbols: Dict[str, int] = {}
+        # names that were NOT loaded in the price source although the bounds-based selection (the prune's own function) returns them
+        # for that day: a missing cache file or a price basis the daily bounds cannot see.  Checked at job end (assert_complete).
+        self.unloaded_selectable: Dict[str, int] = {}
+        self._bounds_memo: Dict[str, set] = {}
         ls.check_settings(self.settings, self.beh)
         if float(self.settings.get("volume_min") or 0) > 0 and not self.beh.volume_is_average and not intraday:
             raise ScreenerGateRefusal("pre-fix volume_min (session volume so far) cannot be simulated on a daily clock")
@@ -148,9 +152,12 @@ class PanelGate:
         """T inside the session's first bar: the opening-print decision (the vendor's cap is struck on the previous close for
         the names that have not printed yet); from the next bar on the band is tested on the price at T."""
         from datetime import time as _t
-        iv = str(getattr(self.ps, "interval", "5min")).lower()
-        digits = "".join(ch for ch in iv if ch.isdigit()) or "5"
-        mins = int(digits) * (60 if iv.endswith(("h", "hour")) else 1)
+        import re
+        iv = str(self.ps.interval).lower()                 # required: the price source states its bar interval
+        m = re.fullmatch(r"(\d+)\s*(min|m|h|hour)", iv)
+        if not m:
+            raise ScreenerGateRefusal(f"cannot read the bar interval {iv!r} of the price source (expected e.g. '5min', '15m', '1h')")
+        mins = int(m.group(1)) * (60 if m.group(2) in ("h", "hour") else 1)
         t = as_of_dt.time()
         return _t(9, 30) <= t < (datetime(2000, 1, 1, 9, 30) + timedelta(minutes=mins)).time()
 
@@ -167,6 +174,7 @@ class PanelGate:
         panel, ps, syms = self.panel, self.ps, self.panel.symbols
         memo: Dict[int, float] = {}
         hmemo: Dict[int, float] = {}
+        outside: set = set()
 
         def _now(idx: np.ndarray):
             vals = np.empty(idx.size)
@@ -190,6 +198,8 @@ class PanelGate:
                 #    COUNTED and listed in the run's results; losing more than live's data-outage share of the LOADED
                 #    candidates is a defective cache, not a screen (ScreenerDataOutage, job-fatal).
                 loaded_missing = [m_ for m_ in missing if ps.has_symbol(m_)]
+                lm_set = set(loaded_missing)
+                outside.update(m_ for m_ in missing if m_ not in lm_set)
                 self.outside_preload_decisions += len(missing) - len(loaded_missing)
                 if loaded_missing:
                     self.no_price_decisions += len(loaded_missing)
@@ -222,12 +232,31 @@ class PanelGate:
         res = panel.select(day, self.settings, self.beh, now=_now, vol_today=vol, valid=self.valid,
                            band_at_now=self.intraday and not self._in_first_bar(as_of_dt),
                            forming_hi=_forming_hi if self.intraday else None)
+        if outside:
+            bset = self._bounds_memo.get(day)
+            if bset is None:
+                bset = self._bounds_memo[day] = set(panel.select_bounds(
+                    day, self.settings, self.beh, cut=False, valid=self.valid, daily_clock=not self.intraday))
+            for sy in outside & bset:
+                self.unloaded_selectable[sy] = self.unloaded_selectable.get(sy, 0) + 1
         self._cache[key] = res
         return res
 
+    def assert_complete(self) -> None:
+        """JOB END.  A candidate that had no price because it was not loaded, although the bounds-based selection (the prune's
+        function: every symbol that can pass at ANY price of the session) returns it for that day, means the run's price source
+        is missing a name the screen needs (no 5-minute file, or a price basis the daily bounds cannot see): the result omits
+        picks.  Job-fatal (ScreenerGateRefusal), naming them."""
+        if self.unloaded_selectable:
+            top = sorted(self.unloaded_selectable.items(), key=lambda kv: -kv[1])[:20]
+            raise ScreenerGateRefusal(
+                f"{len(self.unloaded_selectable)} screened symbols were candidates but have no bars in this run's price source "
+                f"although the screen can select them (symbol: decisions): {dict(top)}; fetch/repair their intraday cache or "
+                f"exclude them (reviewed exclusion list)")
     def diagnostics(self) -> Dict[str, Any]:
         """For ``results["screener_gate"]``: candidates dropped for want of a price (symbol -> decisions, top 20)."""
         top = sorted(self.no_price_symbols.items(), key=lambda kv: -kv[1])[:20]
         return {"no_price_candidate_decisions": self.no_price_decisions, "no_price_symbols": dict(top),
                 "outside_preload_candidate_decisions": self.outside_preload_decisions,
+                "unloaded_selectable_symbols": dict(sorted(self.unloaded_selectable.items(), key=lambda kv: -kv[1])[:20]),
                 "no_price_symbol_count": len(self.no_price_symbols)}

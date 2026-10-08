@@ -135,9 +135,10 @@ def load_float_table() -> Dict[str, float]:
             if not table:
                 raise RuntimeError("shares_float/all returned no usable rows")
         except Exception as e:  # noqa: BLE001 - typed and remembered below, never swallowed
-            _STATE.update(error=f"{type(e).__name__}: {e}", failed_at=_now())
-            logger.error(f"Float table fetch failed: {e}")
-            raise ScreenerDataError(f"float table could not be fetched: {type(e).__name__}: {e}") from e
+            from ba2_providers.fmp_common import redact
+            _STATE.update(error=f"{type(e).__name__}: {redact(e)}", failed_at=_now())
+            logger.error(f"Float table fetch failed: {redact(e)}")
+            raise ScreenerDataError(f"float table could not be fetched: {type(e).__name__}: {redact(e)}") from e
         _STATE.update(table=table, loaded_at=_now(), error=None)
         logger.info(f"Float table loaded: {len(table)} symbols with a known float")
         return table

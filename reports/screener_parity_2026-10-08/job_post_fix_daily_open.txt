@@ -1,3 +1,4 @@
+SUPERSEDED 2026-10-08 (review round 2): scored with the OLD rules (previous close x shares as the band AND the rank key, criteria live-daily-v1). Kept as history; the current rules and the live-capture verdicts are in docs/plans/2026-10-08-screener-live-sim.md section 4b.
 panel a72118eb5213007c: 4734 symbols, 2019-03-01..2026-10-06 (now=daily-open x1.0; criteria live-daily-v1, shares 2026-10-08.json, lag 45d); behaviour post-fix
 log records: 118 LIVE SELECTION, 0 LIVE STAGES
 

@@ -1,23 +1,28 @@
-"""Simulation of the LIVE FMP stock screener for the backtest gate (``criteria_version`` ``live-daily-v1``).
+"""Simulation of the LIVE FMP stock screener for the backtest gate (``criteria_version`` ``live-daily-v2``).
 
 LIVE IS THE REFERENCE AND IS NOT CHANGED.  This module reproduces, for a decision day D and a finite
 universe, what ``ba2_providers.StockScreener.StockScreener(...).screen()`` (``as_of=None``) would have returned
 at the decision instant T of D, from stored data only.  Order of operations (identical to live, see ``select_from_columns``):
 
-  1. vendor stage      band on the market cap (previous close x the vendor's share count, inclusive), price floor /
-                       ceiling on the quote ("now"); sorted by market cap, descending
+  1. vendor stage      band on the market cap = the vendor's last-trade price x its share count (inclusive): the
+                       PREVIOUS CLOSE inside the session's first bar (names that have not printed), the PRICE AT T for
+                       every later decision (``band_at_now``); price floor / ceiling on the quote ("now"); vendor order
   1b. float            unknown float passes; ``float_min <= float <= float_max``
   2. volume / RVOL     ALWAYS: no finished bars -> dropped; ``rvol >= rvol_min`` (if > 0), ``avg_volume >= volume_min``,
                        ``avg_volume <= volume_max``
   3. Weinstein         (optional) stage 2 only
-  4. rank              by market cap, descending (ties: symbol ascending)
+  4. rank              by the cap at the decision price (/quote ``marketCap`` = price now x vendor shares),
+                       descending (ties: symbol ascending)
   5. price drop        walk the ranked list, keep ``drop >= price_drop_pct``, stop after ``max_stocks`` passes
 
 "NOW" AND THE FORMING DAILY BAR.  Live reads FMP's daily history at the scheduled instant T: the history carries the
-session's FORMING bar (dated today).  The simulation models it as: close = the price at T ("now"), high = the highest
-high over the session's intraday bars ENDED <= T (+ the open), and uses it (i) as the last close of the Weinstein
-input, (ii) as one of the last ``n`` bars of the drop window (its high joins the peak), (iii) as the drop test's
-current price.  "now" = the close of the latest bar ended at or before T (the ``DecisionPrice`` rule), the OPENING
+session's FORMING bar (dated today; measured 2026-10-08: present for 1,747 of 1,750 symbols).  The simulation models
+it as: high = the highest high over the session's intraday bars ENDED <= T (+ the open), close = the price at T
+("now") as a STAND-IN, and uses it (i) as the last close of the Weinstein input, (ii) as one of the last ``n`` bars of
+the drop window (its high joins the peak), (iii) as the drop test's current price.  The stand-in is imperfect by
+measurement: FMP's forming-bar close differs from the quote by a median 0.26 % (95th percentile 1.1 %), enough to flip
+a name that sits on its SMA150 (QCOM at 10:05: live rejected it, the quote-based simulation kept it).  The selection
+function accepts the true bar close (``forming_close``); the backtest has no second price, so it passes ``None``.  "now" = the close of the latest bar ended at or before T (the ``DecisionPrice`` rule), the OPENING
 PRINT only when T lies inside the session's first bar (owner-approved, screener only).  A candidate with no price
 is not a candidate: there is no fallback price.
 
@@ -36,7 +41,7 @@ WHAT THE BACKTEST CANNOT REPRODUCE (measured sizes in ``docs/plans/2026-10-08-sc
   * the vendor's share count per past date: the vendor's own dated series when fetched
     (``prewarm --screener-panel``), else FMP's implied series delayed by ``SHARES_LAG_DAYS``;
   * tie order of equal market caps (the vendor's order is unknown): symbol ascending;
-  * the rank key: live ranks by the refreshed ``/quote`` cap; the simulation by previous close x shares;
+  * the forming bar's close (see above) and the vendor's share count at the decision instant;
   * missing bars of a symbol inside a window (cache gaps) are skipped; the n-session trim is applied on the common
     NYSE session grid; delisted / renamed names: the universe is the finite store universe.
 """
@@ -52,9 +57,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import numpy as np
 
 #: Part of every job identity that uses the simulation (name token, checkpoint fingerprint, panel manifest).
-CRITERIA_VERSION = "live-daily-v1"
+CRITERIA_VERSION = "live-daily-v2"
 #: ... and its job-name token (``tools/matrix_flags.SCREENER_CRITERIA_NAME_TOKEN`` is pinned equal by a test).
-CRITERIA_NAME_TOKEN = "-lds1"
+CRITERIA_NAME_TOKEN = "-lds2"
 #: Filing lag applied to the implied share series (days).  See ``build_shares_matrix``.
 SHARES_LAG_DAYS = 45
 PANEL_FORMAT = 4          # 4: day-major (sessions x symbols), + the as-traded split factor `fac`
@@ -244,7 +249,6 @@ _NOW = Union[np.ndarray, Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray]]]
 #:  * the stage-1 BAND cap is the vendor screener's ``price`` (last trade) x shares: at 09:30:07 the previous close for the names that have not
 #:    printed yet (mixed per symbol), from 09:35 on the price AT T.  So the band test is on the previous close at the opening-print decision
 #:    (T inside the first bar) and on the price at T for every later T: ``band_at_now`` (the gate sets it from T).
-RANK_CAP_BASIS = "now"
 
 
 def _fnum(settings: Dict[str, Any], key: str) -> float:
@@ -289,7 +293,8 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
                         diag: Optional[Dict[str, int]] = None,
                         forming_hi: Optional[Callable[[np.ndarray], np.ndarray]] = None,
                         band_at_now: bool = False,
-                        forming_close: Optional[Callable[[np.ndarray], np.ndarray]] = None) -> np.ndarray:
+                        forming_close: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                        day_lo: Optional[np.ndarray] = None, day_hi: Optional[np.ndarray] = None) -> np.ndarray:
     """Indices (into the column arrays) of the symbols live would return, IN LIVE'S ORDER.
 
     ``now(idx)`` -> ``(now_lo, now_hi)`` per candidate: the price knowable at T (equal arrays), or the session's
@@ -311,7 +316,10 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
     ``band_at_now``: the vendor's band cap is ``price at T x shares`` (every decision after the first bar) instead of
     ``previous close x shares`` (the opening-print decision).  The candidates are pre-selected on the previous-close cap within
     [0.5 x cap_min, 2 x cap_max] (a one-day move beyond that is outside the model), then tested on the price at T; with bounds as "now"
-    the min-cap test uses the HIGH and the max-cap test the LOW (a superset of every price in between).
+    the min-cap test uses the HIGH and the max-cap test the LOW (a superset of every price in between).  The candidates are
+    pre-selected on the EXACT bounds of the price at T: the session's low / high (``day_lo`` / ``day_hi``, widened by the previous
+    close) x shares: cap at the low <= max, cap at the high >= min.  No hard-coded move tolerance: a name is skipped only when no
+    price of the session could put it in the band; the final test is the exact price at T.
     ``diag``, when given, receives live's stage accounting (``stage1``, ``dropped_float``, ``dropped_no_history``,
     ``dropped_no_price``, ``dropped_rvol``, ``dropped_volume_min``, ``dropped_volume_max``, ``weinstein``,
     ``price_drop``, ``final``)."""
@@ -328,10 +336,16 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
         ok &= valid
     cmin, cmax = _fnum(settings, "market_cap_min"), _fnum(settings, "market_cap_max")
     if band_at_now:
-        if cmin > 0:
-            ok &= mcap_prev >= 0.5 * cmin
-        if cmax > 0:
-            ok &= mcap_prev <= 2.0 * cmax
+        if day_lo is None or day_hi is None:
+            raise SimulationRefusal("band_at_now needs the session low / high columns (day_lo, day_hi)")
+        f_c = fac if fac is not None else 1.0
+        with np.errstate(invalid="ignore"):
+            cap_lo = np.fmin(day_lo, last_close) * shares * f_c
+            cap_hi = np.fmax(day_hi, last_close) * shares * f_c
+            if cmin > 0:
+                ok &= cap_hi >= cmin
+            if cmax > 0:
+                ok &= cap_lo <= cmax
     else:
         if cmin > 0:
             ok &= mcap_prev >= cmin
@@ -355,7 +369,7 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
         if lo is not None:
             lo, hi = lo[mask], hi[mask]
 
-    def need_now() -> None:
+    def need_now(drop: bool = True) -> None:
         nonlocal lo, hi
         if lo is None and idx.size:
             if callable(now):
@@ -363,7 +377,7 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
                 lo, hi = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
             else:
                 lo = hi = np.asarray(now, dtype=float)[idx]
-        if lo is not None:
+        if lo is not None and drop:
             bad = ~(np.isfinite(lo) & np.isfinite(hi) & (lo > 0))
             if bad.any():
                 dg["dropped_no_price"] += int(bad.sum())
@@ -464,20 +478,13 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
     sm = settings.get("sort_metric") or "market_cap"
     if sm == "relative_volume":
         key = rvol[idx]
-    elif RANK_CAP_BASIS == "now":
+    else:
         # the refreshed cap = price now x the vendor's shares.  Ranking never DROPS a candidate (only the filters do): a name with no
         # price at T ranks on its previous-close cap.
-        if lo is None:
-            if callable(now):
-                r_lo = np.asarray(now(idx)[0], dtype=float)
-            else:
-                r_lo = np.asarray(now, dtype=float)[idx]
-        else:
-            r_lo = lo
+        need_now(drop=False)                                   # the price is read ONCE per decision (a later stage drops/counts)
+        r_lo = lo if lo is not None else np.full(idx.size, np.nan)
         fac_i = fac[idx] if fac is not None else 1.0
         key = np.where(np.isfinite(r_lo) & (r_lo > 0), r_lo * shares[idx] * fac_i, mcap_prev[idx])
-    else:
-        key = mcap_prev[idx]
     order = np.lexsort((symbols[idx], -key))
     idx = idx[order]
     if lo is not None:
@@ -549,7 +556,6 @@ class DailyPanel:
         import threading
         self._lock = threading.Lock()
         self._lo_memo: Dict[int, np.ndarray] = {}
-        self._hl: Optional[np.ndarray] = None
 
     # -- geometry -----------------------------------------------------------------------------------
     def pos(self, day: str) -> int:
@@ -571,29 +577,19 @@ class DailyPanel:
             got = self._lo_memo.setdefault(n, self._lo_index(n))
         return got
 
-    def _hl_arr(self) -> np.ndarray:
-        if self._hl is None:
-            with self._lock:
-                if self._hl is None:
-                    h = np.asarray(self.arrays["h"]); l = np.asarray(self.arrays["l"])      # (T, S)
-                    hl = np.fmax(np.nan_to_num(h, nan=-np.inf), np.nan_to_num(l, nan=-np.inf))
-                    hl[~np.isfinite(hl)] = np.nan
-                    self._hl = hl
-        return self._hl
-
     def peak_row(self, n: int, p: int) -> np.ndarray:
         """(S,) highest ``max(high, low)`` over live's drop window of lookback ``n`` on the morning at position ``p``:
         the finished sessions dated in [D-(n+5) days, D), the last ``n-1`` of them when the forming bar takes the
         n-th slot (``FORMING_BAR_PRESENT``); NaN where there is no bar.  Computed per row (no per-n cache: a row costs
-        ~n x S float ops, 0.1 ms), so there is nothing to evict and nothing shared between threads but the read-only
-        ``max(high, low)`` array."""
+        ~2 x n x S float ops, ~0.2 ms), so there is nothing to evict, and no (T, S) ``max(high, low)`` copy (72 MB private per
+        process in the first version): the memory-mapped ``h`` / ``l`` arrays are shared by every process."""
         n = int(n)
-        hl = self._hl_arr()
+        h_, l_ = self.arrays["h"], self.arrays["l"]            # memory-mapped (T, S): no private copy per process
         lim = n - 1 if FORMING_BAR_PRESENT else n
         start = max(int(self._lo_for(n)[p]), p - lim, 0)
         if start >= p:
-            return np.full(hl.shape[1], np.nan)
-        return np.fmax.reduce(hl[start:p], axis=0)
+            return np.full(h_.shape[1], np.nan)
+        return np.fmax.reduce(np.fmax(np.asarray(h_[start:p]), np.asarray(l_[start:p])), axis=0)
 
     def peak_by_day(self, n: int) -> "_PeakView":
         """Row-indexed view ``[p]`` / ``[p, symbol_index]`` over :meth:`peak_row` (tests and the report tool)."""
@@ -628,7 +624,8 @@ class DailyPanel:
         cols = self.columns(p)
         dpct, ddays = _fnum(settings, "price_drop_pct"), int(_fnum(settings, "price_drop_days"))
         peak = self.peak_row(ddays, p) if dpct > 0 and ddays > 0 else None
-        idx = select_from_columns(**cols, peak=peak, now=now, vol_today=vol_today, settings=settings, beh=beh,
+        dlo, dhi, _v = self.day_bounds(p)
+        idx = select_from_columns(**cols, peak=peak, now=now, day_lo=dlo, day_hi=dhi, vol_today=vol_today, settings=settings, beh=beh,
                                   valid=valid, cut=cut, diag=diag,
                                   forming_hi=forming_hi, band_at_now=band_at_now,
                                   forming_close=forming_close)
@@ -778,7 +775,12 @@ def panel_dir_for(cache_folder: str, fingerprint: str) -> str:
 def panel_rel(cache_folder: str, path: str) -> str:
     """The panel path RELATIVE to the cache root (what a job stores: the master's absolute path means nothing on a
     worker)."""
-    return os.path.relpath(path, cache_folder).replace("\\", "/")
+    path = os.path.abspath(path)                      # a relative argument means "relative to the working directory"
+    try:
+        rel = os.path.relpath(path, os.path.abspath(cache_folder)).replace("\\", "/")
+    except ValueError:                                # another drive
+        return path.replace("\\", "/")
+    return path.replace("\\", "/") if rel.startswith("..") else rel      # outside the cache root: the absolute path
 
 
 def resolve_panel_path(stored: str, cache_folder: Optional[str] = None) -> str:
@@ -882,6 +884,16 @@ def _sessions_of(path: str) -> List[str]:
         return []
 
 
+def pending_exclusions(man: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Entries of the panel's exclusion list that nobody has reviewed (``reviewed_by`` starts with "pending")."""
+    return [e for e in (man.get("excluded_unusable") or []) if str(e.get("reviewed_by", "")).strip().lower().startswith("pending")]
+
+
+def reviewed_exclusions(man: Dict[str, Any]) -> List[Dict[str, Any]]:
+    pend = {id(e) for e in pending_exclusions(man)}
+    return [e for e in (man.get("excluded_unusable") or []) if id(e) not in pend]
+
+
 def panel_problems(path: str, start_day: str, end_day: str, *, warmup_days: int = 260,
                    need_symbols: Optional[Iterable[str]] = None, expect_fp: Optional[str] = None) -> List[str]:
     """Every reason the panel at ``path`` cannot serve a run over [start_day, end_day] (empty = fine)."""
@@ -910,6 +922,12 @@ def panel_problems(path: str, start_day: str, end_day: str, *, warmup_days: int 
     if expect_fp is not None and man.get("panel_fingerprint") != expect_fp:
         out.append(f"panel fingerprint {man.get('panel_fingerprint')!r} != the job's {expect_fp!r} (another panel was "
                    f"built or synced under this path: a job never switches panel)")
+    pending = pending_exclusions(man)
+    if pending:
+        out.append(f"{len(pending)} entries of the exclusion list are NOT reviewed (reviewed_by starts with 'pending'): "
+                   + "; ".join(f"{e.get('symbol')} ({str(e.get('reason'))[:70]}..., added {e.get('added')})" for e in pending)
+                   + ". An unreviewed exclusion silently removes a symbol from every screen: the owner confirms an entry "
+                     "(reviewed_by = the reviewer's name) or removes it after the data is repaired, then the panel is rebuilt")
     if man.get("stale_listed_symbols"):
         sl = man["stale_listed_symbols"]
         out.append(f"{len(sl)} symbols are in the vendor's CURRENT listing but their daily bars are stale "

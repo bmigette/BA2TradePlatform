@@ -651,7 +651,7 @@ def run_prewarm(fetchers: PrewarmFetchers, experts: List[str], symbols: List[str
 
 
 # ---------------------------------------------------------------------------------------------------------
-# THE SCREENER DAILY PANEL (criteria live-daily-v1): everything the screener simulation needs
+# THE SCREENER DAILY PANEL (criteria live-daily-v2): everything the screener simulation needs
 # ---------------------------------------------------------------------------------------------------------
 PANEL_FIRST_DAY = "2019-03-01"          # the OHLCV cache starts here; a panel serves any job that starts later
 

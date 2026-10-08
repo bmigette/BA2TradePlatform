@@ -87,16 +87,16 @@ class FMPScreenerProvider(ScreenerProviderInterface):
         params = self._build_params(filters)
 
         import requests
-        from ba2_providers.fmp_common import fmp_http_get, FMPError
+        from ba2_providers.fmp_common import fmp_http_get, FMPError, redact
         url = f"{self.BASE_URL}/stock-screener"
         try:
-            logger.debug(f"FMP screener request: {url} params={params}")
+            logger.debug(f"FMP screener request: {url} params={redact(params)}")
             response = fmp_http_get(url, params=params, endpoint="stock-screener", timeout=30)
             data = response.json()
         except (FMPError, requests.RequestException, ValueError) as e:
             # FMPError = retries exhausted (429/5xx/connection); RequestException = a
             # non-retryable HTTP error (401/404/...); ValueError = a body that is not JSON.
-            msg = str(e).replace(self.api_key, "***")     # requests' HTTPError embeds the URL + key
+            msg = redact(str(e).replace(self.api_key, "***"))     # requests' HTTPError embeds the URL + key
             logger.error(f"FMP screener API request failed: {type(e).__name__}: {msg}")
             raise ScreenerDataError(
                 f"FMP screener request failed ({type(e).__name__}: {msg})") from None

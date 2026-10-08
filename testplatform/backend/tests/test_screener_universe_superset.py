@@ -216,8 +216,8 @@ def test_driver_job_names_carry_the_rule_token_and_stay_distinct_from_legacy_nam
     sys.path.insert(0, os.path.join(_ROOT, "tools"))
     import matrix_flags as mf
     # classic screener jobs also carry the criteria token (live-simulation gate); the bypass FactorRanker does not
-    assert mf.with_universe_rule_name("scr-mid-X-S1") == "scr-mid-X-S1-sup1-lds1"
-    assert mf.with_universe_rule_name("scr-mid-X-S1-sup1-lds1") == "scr-mid-X-S1-sup1-lds1"      # idempotent
+    assert mf.with_universe_rule_name("scr-mid-X-S1") == "scr-mid-X-S1-sup1-lds2"
+    assert mf.with_universe_rule_name("scr-mid-X-S1-sup1-lds2") == "scr-mid-X-S1-sup1-lds2"      # idempotent
     assert mf.with_universe_rule_name("scr-mid-FR", simulated=False) == "scr-mid-FR-sup1"
     assert mf.UNIVERSE_RULE_NAME_TOKEN == "-sup1" and us.RULE_ID == "superset-v1"
     assert mf.with_universe_rule_name("n") != "n"                                      # a completed OLD name never matches
@@ -413,7 +413,7 @@ def test_print_universe_dry_run_prints_the_launch_universe_and_exits(store, tmp_
     import json as _json
     got = _json.loads(line[len("PRINT-UNIVERSE "):])
     assert got["static_universe_size"] == N and got["uncached"] == [] and got["rule"] == us.RULE_ID
-    assert got["criteria_version"] == "live-daily-v1"
+    assert got["criteria_version"] == "live-daily-v2"
     other = tmp_path / "second"
     other.mkdir()
     with pytest.raises(SystemExit) as ei2:
