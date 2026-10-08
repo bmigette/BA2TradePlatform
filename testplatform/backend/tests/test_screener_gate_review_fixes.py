@@ -159,3 +159,27 @@ def test_the_gate_never_selects_a_symbol_of_the_reviewed_exclusion_list(tmp_path
     pan = sg.get_panel(str(d))
     v = sg.valid_mask(pan, None)
     assert not v[0] and v[1:].all()
+
+
+def test_band_is_tested_on_the_price_at_T_after_the_first_bar_and_on_the_previous_close_inside_it(tmp_path):
+    """A name whose previous-close cap is just BELOW the floor but whose price at T lifts it above: admitted at 10:00, not at 09:30
+    (where the vendor's cap is still the previous close for the names that have not printed)."""
+    syms = ["UP"]
+    sessions = W._sessions(40)
+    T = len(sessions)
+    idx = np.arange(T - 1)
+    c = np.full(T - 1, 100.0)
+    bars = {"UP": (idx, c, c * 1.01, c * 0.99, c, np.full(T - 1, 1e6))}
+    arrays = ls.build_panel_arrays(bars, sessions, np.full((1, T), 5.0e7), syms)       # prev cap = 100 x 5e7 = 5.0e9
+    panel = ls.DailyPanel(syms, sessions, arrays, {})
+    day = sessions[-1]
+    st = {**FULL, "market_cap_min": 5.2e9, "max_stocks": 5}
+    price = np.array([106.0])                                                           # cap at T = 5.3e9
+    assert panel.select(day, st, BEH, now=price, band_at_now=False) == []
+    assert panel.select(day, st, BEH, now=price, band_at_now=True) == ["UP"]
+    # the cap CEILING uses the session LOW in the bounds, the FLOOR the session HIGH: a superset of every price between
+    st2 = {**FULL, "market_cap_min": 5.2e9, "max_stocks": 5}
+    lo = np.array([99.0]); hi = np.array([106.0])
+    assert panel.select(day, st2, BEH, now=lambda i: (lo[i], hi[i]), band_at_now=True) == ["UP"]
+    st3 = {**FULL, "market_cap_max": 4.9e9, "max_stocks": 5}
+    assert panel.select(day, st3, BEH, now=lambda i: (lo[i], hi[i]), band_at_now=True) == []       # low 99 x 5e7 = 4.95e9 > 4.9e9: no

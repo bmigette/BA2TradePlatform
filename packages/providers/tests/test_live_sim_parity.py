@@ -115,8 +115,9 @@ def install_vendor(monkeypatch, world: World):
             assert "volumeMoreThan" not in params and "floatSharesUnder" not in params
             rows = []
             for sym in world.symbols:
-                cap = world.prev_close(sym) * world.shares[sym]
                 px = world.open_now[sym]
+                # the vendor's band cap is struck on its last-trade price: the previous close at the opening print, the price at T later
+                cap = (px if getattr(world, "band_now", False) else world.prev_close(sym)) * world.shares[sym]
                 if lo <= cap <= hi and plo <= px <= phi:
                     rows.append({"symbol": sym, "companyName": sym, "marketCap": cap, "price": px,
                                  "volume": 1234, "exchangeShortName": "NYSE", "isActivelyTrading": True})
@@ -127,7 +128,7 @@ def install_vendor(monkeypatch, world: World):
             for sym in url.rsplit("/", 1)[1].split(","):
                 if sym in world.open_now:
                     out.append({"symbol": sym, "price": world.open_now[sym],
-                                "marketCap": world.prev_close(sym) * world.shares[sym]})
+                                "marketCap": world.open_now[sym] * world.shares[sym]})   # measured: quote price x shares
             return _Resp(out)
         if "/historical-price-full/" in url:
             syms = url.rsplit("/", 1)[1].split(",")
@@ -406,3 +407,37 @@ def test_split_basis_market_cap_and_price_thresholds_use_the_as_traded_figures()
     got2 = ls.select_from_columns(**cols, now=now, settings={"market_cap_min": 5e9, "price_max": 500.0, "max_stocks": 9},
                                   beh=ls.POST_FIX)
     assert [str(syms[i]) for i in got2] == ["PLAIN"]
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_band_at_now_equals_live_when_the_vendor_cap_is_struck_on_the_price_at_T(seed, monkeypatch):
+    """Decision times after the first bar: the vendor's stage-1 cap = price at T x shares.  ``band_at_now`` reproduces it end to end,
+    with prices that cross the band edges (the world's quotes move +-2.5 % against the previous close)."""
+    world = World(seed)
+    world.band_now = True
+    install_vendor(monkeypatch, world)
+    settings = random_settings(random.Random(seed), world)
+    # put the band edges where one-day moves matter: around the cap of a middle symbol
+    caps = sorted(world.open_now[s] * world.shares[s] for s in world.symbols)
+    import math
+    settings["market_cap_min"] = float(math.floor(caps[len(caps) // 3]))          # the setting is an int: keep the edge inclusive
+    settings["market_cap_max"] = float(math.ceil(caps[2 * len(caps) // 3])) if seed % 2 else 0
+    live = run_live(world, settings)
+    sim = world.panel().select(DAY, settings, ls.POST_FIX, now=world.now_fn(), band_at_now=True)
+    assert sim == live, f"seed {seed}: {settings}\n live {live}\n  sim {sim}"
+
+
+def test_weinstein_last_close_is_the_forming_bar_close_not_the_quote():
+    """Measured 2026-10-08 (QCOM 10:05): FMP's forming bar close lagged the quote by 0.9 % and sat below the SMA; live used the bar."""
+    n = 200
+    c = np.linspace(100.0, 160.0, n)
+    sessions = [f"2025-{1 + i // 28:02d}-{1 + i % 28:02d}" for i in range(n)] + ["2025-08-05"]
+    bars = {"X": (np.arange(n), c, c * 1.01, c * 0.99, c, np.full(n, 1e6))}
+    arrays = ls.build_panel_arrays(bars, sessions, np.full((1, n + 1), 5.0e7), ["X"])
+    panel = ls.DailyPanel(["X"], sessions, arrays, {})
+    st = {"market_cap_min": 1e9, "weinstein_stage2_only": 1, "max_stocks": 5}
+    sma = float(np.mean(c[-150:]))
+    above, below = np.array([sma * 1.10]), np.array([sma * 0.90])
+    assert panel.select("2025-08-05", st, ls.POST_FIX, now=above) == ["X"]
+    assert panel.select("2025-08-05", st, ls.POST_FIX, now=above, forming_close=lambda i: below[i]) == []
+    assert panel.select("2025-08-05", st, ls.POST_FIX, now=below, forming_close=lambda i: above[i]) == ["X"]

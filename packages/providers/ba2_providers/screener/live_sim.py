@@ -237,11 +237,14 @@ def weinstein_scalar(dates: Sequence[str], closes: Sequence[float], day: str, fo
 # ======================================================================================================
 _NOW = Union[np.ndarray, Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray]]]
 
-#: The rank key after the stage-2 refresh is the previous close x shares.  (A "now x shares" basis and a band struck on the
-#: quote were prototyped and DELETED: the 09:30 open-snapshot experiment has no verdict yet and an untested branch is
-#: worse than none.  When the verdict says "now", add it here with a differential test against live.)
-BAND_CAP_BASIS = "prev_close"
-RANK_CAP_BASIS = "prev_close"
+#: MEASURED, 2026-10-08 (recorded live screens at 13:41-13:54 UTC = 09:41-09:54 New York, 2,018 candidates; plus the open snapshots
+#: at 09:30:07 / 09:37:49 / 10:00:01):
+#:  * the RANK KEY (the /quote ``marketCap`` stage 2 writes onto the candidate) = ``quote price x vendor shares`` (median ratio 1.0000;
+#:    vs previous close x shares 0.9993): the cap at "now", always;
+#:  * the stage-1 BAND cap is the vendor screener's ``price`` (last trade) x shares: at 09:30:07 the previous close for the names that have not
+#:    printed yet (mixed per symbol), from 09:35 on the price AT T.  So the band test is on the previous close at the opening-print decision
+#:    (T inside the first bar) and on the price at T for every later T: ``band_at_now`` (the gate sets it from T).
+RANK_CAP_BASIS = "now"
 
 
 def _fnum(settings: Dict[str, Any], key: str) -> float:
@@ -284,7 +287,9 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
                         vol_today: Optional[Callable[[np.ndarray], np.ndarray]] = None,
                         valid: Optional[np.ndarray] = None, cut: bool = True,
                         diag: Optional[Dict[str, int]] = None,
-                        forming_hi: Optional[Callable[[np.ndarray], np.ndarray]] = None) -> np.ndarray:
+                        forming_hi: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                        band_at_now: bool = False,
+                        forming_close: Optional[Callable[[np.ndarray], np.ndarray]] = None) -> np.ndarray:
     """Indices (into the column arrays) of the symbols live would return, IN LIVE'S ORDER.
 
     ``now(idx)`` -> ``(now_lo, now_hi)`` per candidate: the price knowable at T (equal arrays), or the session's
@@ -299,6 +304,14 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
     highest high of the intraday bars ended <= T; inside the first bar the opening print); it joins the drop
     window's peak.  ``None``: the forming bar is the single price ``now`` (high = low = close = now).  The superset
     passes the session's full-day high (>= every high-so-far).
+    ``forming_close(idx)`` -> the CLOSE of the forming daily bar as FMP's history returns it: the LAST CLOSE of the Weinstein input.  It is
+    NOT the quote price: MEASURED 2026-10-08 (1,750 symbols): median |bar close / quote - 1| 0.26 %, p95 1.1 % (the history's forming bar is
+    refreshed less often than the quote); QCOM at 10:05 sat 0.9 % below its quote, on the other side of its SMA150, and live (bar close)
+    rejected it where the quote would have accepted it.  ``None``: the price at T stands in for it (the backtest has no second price).
+    ``band_at_now``: the vendor's band cap is ``price at T x shares`` (every decision after the first bar) instead of
+    ``previous close x shares`` (the opening-print decision).  The candidates are pre-selected on the previous-close cap within
+    [0.5 x cap_min, 2 x cap_max] (a one-day move beyond that is outside the model), then tested on the price at T; with bounds as "now"
+    the min-cap test uses the HIGH and the max-cap test the LOW (a superset of every price in between).
     ``diag``, when given, receives live's stage accounting (``stage1``, ``dropped_float``, ``dropped_no_history``,
     ``dropped_no_price``, ``dropped_rvol``, ``dropped_volume_min``, ``dropped_volume_max``, ``weinstein``,
     ``price_drop``, ``final``)."""
@@ -314,10 +327,16 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
     if valid is not None:
         ok &= valid
     cmin, cmax = _fnum(settings, "market_cap_min"), _fnum(settings, "market_cap_max")
-    if cmin > 0:
-        ok &= mcap_prev >= cmin
-    if cmax > 0:
-        ok &= mcap_prev <= cmax
+    if band_at_now:
+        if cmin > 0:
+            ok &= mcap_prev >= 0.5 * cmin
+        if cmax > 0:
+            ok &= mcap_prev <= 2.0 * cmax
+    else:
+        if cmin > 0:
+            ok &= mcap_prev >= cmin
+        if cmax > 0:
+            ok &= mcap_prev <= cmax
     idx = np.flatnonzero(ok)
     dg: Dict[str, int] = diag if diag is not None else {}
     dg["stage1"] = int(idx.size)
@@ -350,6 +369,17 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
                 dg["dropped_no_price"] += int(bad.sum())
                 keep(~bad)
 
+    if band_at_now and (cmin > 0 or cmax > 0) and idx.size:
+        need_now()
+        f_b = fac[idx] if fac is not None else 1.0
+        with np.errstate(invalid="ignore"):
+            mb = np.ones(idx.size, dtype=bool)
+            if cmin > 0:
+                mb &= hi * shares[idx] * f_b >= cmin
+            if cmax > 0:
+                mb &= lo * shares[idx] * f_b <= cmax
+        keep(mb)
+        dg["stage1"] = int(idx.size)
     pmin, pmax = _fnum(settings, "price_min"), _fnum(settings, "price_max")
     if pmin > 0 or pmax > 0:
         need_now()
@@ -415,7 +445,14 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
         if FORMING_BAR_PRESENT and wa is not None:
             # the forming bar's close is the price at T; its best case (superset bounds) is the session high
             need_now()
-            k = weinstein_forming_pass(wa[idx], wp[idx], hi) if idx.size else np.zeros(0, dtype=bool)
+            if idx.size:
+                x_w = hi
+                if forming_close is not None:
+                    fc = np.asarray(forming_close(idx), dtype=float)
+                    x_w = np.where(np.isfinite(fc) & (fc > 0), fc, hi)
+                k = weinstein_forming_pass(wa[idx], wp[idx], x_w)
+            else:
+                k = np.zeros(0, dtype=bool)
         else:
             k = w2[idx]
         keep(k)
@@ -425,7 +462,23 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
         return idx
     # rank: the stage-2 refresh replaced the cap by the live /quote cap (post-fix: always)
     sm = settings.get("sort_metric") or "market_cap"
-    order = np.lexsort((symbols[idx], -(rvol[idx] if sm == "relative_volume" else mcap_prev[idx])))
+    if sm == "relative_volume":
+        key = rvol[idx]
+    elif RANK_CAP_BASIS == "now":
+        # the refreshed cap = price now x the vendor's shares.  Ranking never DROPS a candidate (only the filters do): a name with no
+        # price at T ranks on its previous-close cap.
+        if lo is None:
+            if callable(now):
+                r_lo = np.asarray(now(idx)[0], dtype=float)
+            else:
+                r_lo = np.asarray(now, dtype=float)[idx]
+        else:
+            r_lo = lo
+        fac_i = fac[idx] if fac is not None else 1.0
+        key = np.where(np.isfinite(r_lo) & (r_lo > 0), r_lo * shares[idx] * fac_i, mcap_prev[idx])
+    else:
+        key = mcap_prev[idx]
+    order = np.lexsort((symbols[idx], -key))
     idx = idx[order]
     if lo is not None:
         lo, hi = lo[order], hi[order]
@@ -569,14 +622,16 @@ class DailyPanel:
     def select(self, day: str, settings: Dict[str, Any], beh: LiveBehaviour, *, now: _NOW,
                vol_today: Optional[Callable[[np.ndarray], np.ndarray]] = None, cut: bool = True,
                valid: Optional[np.ndarray] = None, diag: Optional[Dict[str, int]] = None,
-               forming_hi: Optional[Callable[[np.ndarray], np.ndarray]] = None) -> List[str]:
+               forming_hi: Optional[Callable[[np.ndarray], np.ndarray]] = None, band_at_now: bool = False,
+               forming_close: Optional[Callable[[np.ndarray], np.ndarray]] = None) -> List[str]:
         p = self.pos(day)
         cols = self.columns(p)
         dpct, ddays = _fnum(settings, "price_drop_pct"), int(_fnum(settings, "price_drop_days"))
         peak = self.peak_row(ddays, p) if dpct > 0 and ddays > 0 else None
         idx = select_from_columns(**cols, peak=peak, now=now, vol_today=vol_today, settings=settings, beh=beh,
                                   valid=valid, cut=cut, diag=diag,
-                                  forming_hi=forming_hi)
+                                  forming_hi=forming_hi, band_at_now=band_at_now,
+                                  forming_close=forming_close)
         return [str(self.symbols[i]) for i in idx]
 
     def select_bounds(self, day: str, settings: Dict[str, Any], beh: LiveBehaviour, *, cut: bool = False,
@@ -603,7 +658,7 @@ class DailyPanel:
         def _now(idx):
             return lo[idx], hi[idx]
         return self.select(day, settings, beh, now=_now, vol_today=lambda idx: vol[idx], cut=cut, valid=valid,
-                           forming_hi=lambda idx: fh[idx])
+                           forming_hi=lambda idx: fh[idx], band_at_now=not daily_clock)
 
 
 # ======================================================================================================

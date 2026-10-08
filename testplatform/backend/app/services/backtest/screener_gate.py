@@ -144,6 +144,16 @@ class PanelGate:
         if float(self.settings.get("volume_min") or 0) > 0 and not self.beh.volume_is_average and not intraday:
             raise ScreenerGateRefusal("pre-fix volume_min (session volume so far) cannot be simulated on a daily clock")
 
+    def _in_first_bar(self, as_of_dt: datetime) -> bool:
+        """T inside the session's first bar: the opening-print decision (the vendor's cap is struck on the previous close for
+        the names that have not printed yet); from the next bar on the band is tested on the price at T."""
+        from datetime import time as _t
+        iv = str(getattr(self.ps, "interval", "5min")).lower()
+        digits = "".join(ch for ch in iv if ch.isdigit()) or "5"
+        mins = int(digits) * (60 if iv.endswith(("h", "hour")) else 1)
+        t = as_of_dt.time()
+        return _t(9, 30) <= t < (datetime(2000, 1, 1, 9, 30) + timedelta(minutes=mins)).time()
+
     def screen_day(self, as_of_dt: datetime) -> str:
         d = as_of_dt.date().isoformat()
         return d if self.intraday else next_session(self.panel, d)
@@ -210,6 +220,7 @@ class PanelGate:
             def vol(idx):                                   # pre-fix validation mode only
                 return np.array([ps.volume_so_far(str(syms[i]), as_of_dt) or 0.0 for i in idx])
         res = panel.select(day, self.settings, self.beh, now=_now, vol_today=vol, valid=self.valid,
+                           band_at_now=self.intraday and not self._in_first_bar(as_of_dt),
                            forming_hi=_forming_hi if self.intraday else None)
         self._cache[key] = res
         return res
