@@ -46,6 +46,22 @@ SHARES_HIST_URL = "https://financialmodelingprep.com/api/v4/historical/shares_fl
 
 
 # ----------------------------------------------------------------------------------- vendor table (1 call)
+EXCLUSIONS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panel_exclusions.json")
+
+
+def load_exclusions(path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """``{SYMBOL: entry}`` of the reviewed exclusion list.  Every entry must carry symbol, reason, added and reviewed_by."""
+    with open(path or EXCLUSIONS_PATH, encoding="utf-8") as f:
+        entries = json.load(f)["entries"]
+    out: Dict[str, Dict[str, Any]] = {}
+    for e in entries:
+        miss = [k for k in ("symbol", "reason", "added", "reviewed_by") if not e.get(k)]
+        if miss:
+            raise ls.SimulationRefusal(f"panel exclusion entry {e!r} lacks {miss}: an exclusion needs a symbol, a reason, a date and a reviewer")
+        out[str(e["symbol"]).upper()] = e
+    return out
+
+
 def vendor_dir(cache_folder: str) -> str:
     return os.path.join(cache_folder, "screener", "vendor_shares")
 
@@ -359,6 +375,11 @@ def _ohlcv_path(cache_folder: str, sym: str) -> Optional[str]:
 def source_fingerprint(cache_folder: str, symbols: List[str], first_day: str, end_day: str,
                        lag: int, snapshot: Optional[str]) -> str:
     h = hashlib.sha1()
+    try:
+        with open(EXCLUSIONS_PATH, "rb") as _f:
+            h.update(_f.read())                       # the exclusion list is part of the panel's identity
+    except OSError:
+        pass
     h.update(f"{ls.CRITERIA_VERSION}|{ls.PANEL_FORMAT}|rev{BUILD_REV}|{first_day}|{end_day}|{lag}|"
              f"{os.path.basename(snapshot or '')}".encode())
     fund = os.path.join(cache_folder, "screener_fundamentals")
@@ -604,7 +625,8 @@ def load_bars(cache_folder: str, symbols: List[str], sessions: List[str], worker
 def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end_day: str, *,
                       lag_days: int = ls.SHARES_LAG_DAYS, workers: int = 8, force: bool = False,
                       log: Callable[[str], None] = print, out_root: Optional[str] = None,
-                      snapshot_dir: Optional[str] = None, acknowledged_stale: Iterable[str] = ()) -> Dict[str, Any]:
+                      snapshot_dir: Optional[str] = None, acknowledged_stale: Iterable[str] = (),
+                      exclusions_path: Optional[str] = None) -> Dict[str, Any]:
     """Build / refresh the panel for ``symbols``.  Returns the manifest (``status`` 'up_to_date' | 'built').
     ``first_day`` / ``end_day``: the session range (end extended by ten calendar days of FUTURE sessions so
     the daily clock's next-session lookup and the last decisions have a column)."""
@@ -645,14 +667,21 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
     # defect of the cache (refuse); a stale symbol that is not listed any more is treated as delisted (counted/listed)
     with open(snap) as f:
         listing = set((json.load(f).get("caps") or {}).keys())
+    excl = load_exclusions(exclusions_path)
     ack = {str(x).upper() for x in acknowledged_stale}
     lb_ord = max((int(bd[-1]) for bd in bar_ord.values()), default=0)
     stale = sorted(sy for sy, bd in bar_ord.items() if lb_ord - int(bd[-1]) > 6)
-    stale_listed = [sy for sy in stale if sy in listing and sy not in ack]
+    stale_listed = [sy for sy in stale if sy in listing and sy not in ack and sy not in excl]
     delisted = [sy for sy in stale if sy not in listing]
-    shares_missing_listed = [sy for sy in listing & set(symbols) if sy in set(srep.get("no_share_data_symbols", []))]
+    shares_missing_listed = [sy for sy in listing & set(symbols) if sy in set(srep.get("no_share_data_symbols", [])) and sy not in excl]
+    excluded_unusable = [{"symbol": sy, **{k: e[k] for k in ("reason", "added", "reviewed_by")}} for sy, e in sorted(excl.items()) if sy in set(symbols)]
+    unneeded = [sy for sy in excl if sy in set(symbols) and sy not in stale and sy not in set(srep.get("no_share_data_symbols", []))]
+    for e in excluded_unusable:
+        log(f"daily panel: EXCLUDED (reviewed list) {e['symbol']}: {e['reason']} [{e['added']}, {e['reviewed_by']}]")
+    for sy in unneeded:
+        log(f"daily panel: NOTE exclusion {sy} is not needed by this build's data (stale/no-share condition gone): review the entry")
     manifest = {"source_fingerprint": fp, "panel_fingerprint": fp[:16], "stale_listed_symbols": stale_listed,
-                "delisted_symbols": delisted, "delisted_symbols_count": len(delisted),
+                "excluded_unusable": excluded_unusable, "exclusions_not_needed": unneeded, "delisted_symbols": delisted, "delisted_symbols_count": len(delisted),
                 "acknowledged_stale": sorted(ack), "split_report": split_rep,
                 "splits_unknown": split_rep["splits_unknown"], "shares_missing_listed": shares_missing_listed,
                 "shares_lag_days": lag_days, "shares_vendor_snapshot": srep["snapshot"],

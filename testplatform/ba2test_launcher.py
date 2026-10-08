@@ -6984,6 +6984,12 @@ def _cmd_optimize(args) -> int:
                              f"--start {args.start} --end {args.end}\n"
                              "or `ba2-test build-screener-metrics ... --daily-panel`. Remote workers receive it with "
                              "`cache push` (directory screener/daily_panel, ~0.8 GB).")
+            if _use_sim:
+                _exm = (_ls.read_manifest(_panel_dir) or {}).get("excluded_unusable") or []
+                if _exm:
+                    print(f"optimize: screener panel EXCLUDES {len(_exm)} listed symbols with knowingly unusable data (reviewed list "
+                          f"ba2_providers/screener/panel_exclusions.json): "
+                          + "; ".join(f"{e['symbol']} ({e['reason'][:60]}..., {e['added']})" for e in _exm), flush=True)
             backtest_block["screener_opt"] = {
                 "store": args.screener_store,
                 "base_settings": base,

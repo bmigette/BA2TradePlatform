@@ -93,3 +93,25 @@ def test_an_up_to_date_panel_is_a_no_op_and_force_rebuilds(cache):
 def test_a_vendor_listing_without_a_snapshot_refuses(tmp_path):
     with pytest.raises(ls.SimulationRefusal, match="no vendor share table"):
         lb.build_daily_panel(str(tmp_path), ["A"], "2023-10-02", "2024-03-28", log=lambda m: None)
+
+
+def test_reviewed_exclusion_list_replaces_a_refusal_with_a_printed_record(cache, tmp_path):
+    ex = tmp_path / "excl.json"
+    ex.write_text(json.dumps({"entries": [
+        {"symbol": "C", "reason": "top-up refused: vendor bars disagree", "added": "2026-10-08", "reviewed_by": "owner"},
+        {"symbol": "E", "reason": "no share source", "added": "2026-10-08", "reviewed_by": "owner"},
+        {"symbol": "A", "reason": "needless entry", "added": "2026-10-08", "reviewed_by": "owner"}]}))
+    logs = []
+    man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D", "E"], "2023-10-02", "2024-03-28", workers=2, log=logs.append,
+                               exclusions_path=str(ex))
+    assert man["stale_listed_symbols"] == [] and man["shares_missing_listed"] == []
+    assert [e["symbol"] for e in man["excluded_unusable"]] == ["A", "C", "E"]
+    assert man["exclusions_not_needed"] == ["A"]
+    assert any("EXCLUDED (reviewed list) C" in m for m in logs) and any("NOTE exclusion A" in m for m in logs)
+    assert ls.panel_problems(man["path"], "2024-02-01", "2024-03-20", warmup_days=20) == []
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"entries": [{"symbol": "C", "reason": "x", "added": "2026-10-08"}]}))
+    with pytest.raises(ls.SimulationRefusal, match="reviewed_by"):
+        lb.load_exclusions(str(bad))
+    shipped = lb.load_exclusions()
+    assert {"GORO", "MIDD", "MOD", "RBKB", "SNFCA", "CICC"} <= set(shipped)

@@ -1,0 +1,41 @@
+{
+ "_doc": "REVIEWED exclusion list of listed symbols whose data is knowingly unusable for the screener simulation. Read by the panel build (recorded in the manifest as excluded_unusable, printed) and by the launch (printed; the gate never selects them). Never a silent tolerance: every entry needs a symbol, a reason, a date and a reviewer; a build prints entries that were not needed.",
+ "entries": [
+  {
+   "symbol": "GORO",
+   "reason": "daily top-up REFUSED on 2026-10-07: the vendor's bars disagree with the cached bars (split-like rescale or mismatch); not forced, so the cache is stale and the symbol cannot be screened",
+   "added": "2026-10-08",
+   "reviewed_by": "pending owner review"
+  },
+  {
+   "symbol": "MIDD",
+   "reason": "daily top-up REFUSED on 2026-10-07: the vendor's bars disagree with the cached bars (split-like rescale or mismatch); not forced, so the cache is stale and the symbol cannot be screened",
+   "added": "2026-10-08",
+   "reviewed_by": "pending owner review"
+  },
+  {
+   "symbol": "MOD",
+   "reason": "daily top-up REFUSED on 2026-10-07: the vendor's bars disagree with the cached bars (split-like rescale or mismatch); not forced, so the cache is stale and the symbol cannot be screened",
+   "added": "2026-10-08",
+   "reviewed_by": "pending owner review"
+  },
+  {
+   "symbol": "RBKB",
+   "reason": "daily top-up REFUSED on 2026-10-07: the vendor's bars disagree with the cached bars (split-like rescale or mismatch); not forced, so the cache is stale and the symbol cannot be screened",
+   "added": "2026-10-08",
+   "reviewed_by": "pending owner review"
+  },
+  {
+   "symbol": "SNFCA",
+   "reason": "daily top-up REFUSED on 2026-10-07: the vendor's bars disagree with the cached bars (split-like rescale or mismatch); not forced, so the cache is stale and the symbol cannot be screened",
+   "added": "2026-10-08",
+   "reviewed_by": "pending owner review"
+  },
+  {
+   "symbol": "CICC",
+   "reason": "listed by the vendor but no share-count source (no vendor history, no FMP market-cap series): its market cap cannot be stated",
+   "added": "2026-10-08",
+   "reviewed_by": "pending owner review"
+  }
+ ]
+}

@@ -150,3 +150,12 @@ def test_panel_identity_never_switches_within_a_process(tmp_path):
     assert rel == "screener/daily_panel/idA" and ls.resolve_panel_path(rel, str(root)) == pd_
     assert ls.latest_panel(str(root)) == pd_
     assert not any(n.endswith((".tmp", ".building")) for n in os.listdir(pd_))
+
+
+def test_the_gate_never_selects_a_symbol_of_the_reviewed_exclusion_list(tmp_path):
+    world, panel = _panel(2)
+    d = tmp_path / "panel"
+    _save(panel, d, "excl", excluded_unusable=[{"symbol": str(panel.symbols[0]), "reason": "r", "added": "2026-10-08", "reviewed_by": "o"}])
+    pan = sg.get_panel(str(d))
+    v = sg.valid_mask(pan, None)
+    assert not v[0] and v[1:].all()

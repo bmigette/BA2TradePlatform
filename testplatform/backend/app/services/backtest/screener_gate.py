@@ -55,7 +55,8 @@ def clear_panel_memo() -> None:
 
 def valid_mask(panel: ls.DailyPanel, excluded_symbols: Optional[Iterable[str]]) -> np.ndarray:
     """Symbols allowed through the gate: everything but the module-level and the per-run exclusions."""
-    both = set(ms.EXCLUDED_SYMBOLS) | {str(s).upper() for s in (excluded_symbols or ())}
+    both = (set(ms.EXCLUDED_SYMBOLS) | {str(s).upper() for s in (excluded_symbols or ())}
+            | {str(e["symbol"]).upper() for e in (panel.manifest.get("excluded_unusable") or [])})   # the reviewed list
     if not both:
         return np.ones(len(panel.symbols), dtype=bool)
     return ~np.isin(np.char.upper(panel.symbols.astype(str)), np.array(sorted(both)))
