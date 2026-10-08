@@ -70,6 +70,13 @@ def main() -> int:
                          "this exchange-local time (days untouched), e.g. 15:30. Validated like a "
                          "--decision-times value (on the bar grid, after the first bar and before "
                          "the last). Still writes no row.")
+    ap.add_argument("--recompute-universe", action="store_true",
+                    help="Recompute the row's STATIC UNIVERSE under the corrected superset rule "
+                         "(ba2_providers.screener.universe_superset) from the optimization's declared "
+                         "gene ranges, instead of keeping the frozen list stored in its config. WITHOUT "
+                         "this flag a row built before the rule keeps its stored list (the numbers it "
+                         "was stored with) and a WARNING states how many of the genome's own gate "
+                         "selections fall outside that list.")
     ap.add_argument("--allow-first-bar", action="store_true",
                     help="MEASUREMENT ONLY: let --decision-time 09:30 (the session's first bar) run, "
                          "with the engine's first-bar warning, as a stored row without an override "
@@ -93,7 +100,8 @@ def main() -> int:
             return 1
         stored = {m: getattr(bt, m, None) for m in SUMMARY}
         stored_window = (str(bt.start_date)[:10], str(bt.end_date)[:10])
-        config = rebuild_config_for_backtest(bt, db, window=ns.window)
+        config = rebuild_config_for_backtest(bt, db, window=ns.window,
+                                             recompute_universe=ns.recompute_universe)
         stored_times = ((config.get("run_schedule_override") or {}).get("times"))
         if ns.decision_time:
             from ba2_common.core.schedule_genes import retime_schedules
@@ -112,6 +120,18 @@ def main() -> int:
     print(f"window {ns.window or stored_window}  (stored row window {stored_window})", flush=True)
     print(f"decision time {ns.decision_time or stored_times}  (stored row's own: {stored_times})",
           flush=True)
+    _note = config.get("screener_universe_legacy_note")
+    if _note is not None:
+        print(f"static universe: {_note['static_universe_size']} symbols, LEGACY list kept "
+              f"(no --recompute-universe)", flush=True)
+        if _note["outside_static_universe"]:
+            print(f"WARNING: {_note['outside_static_universe']} of {_note['gate_selected']} gate selections of "
+                  f"this genome fall OUTSIDE the stored static universe and can never be traded "
+                  f"(first: {_note['first_examples'][:5]}); this run is NOT the corrected-universe run",
+                  flush=True)
+    elif config.get("screener_universe_guard"):
+        print(f"static universe: {len(config['enabled_instruments'])} symbols"
+              f"{' (recomputed, --recompute-universe)' if ns.recompute_universe else ''}", flush=True)
 
     prior = logging.root.manager.disable
     logging.disable(logging.INFO)
@@ -126,7 +146,7 @@ def main() -> int:
     got["symbols_traded"] = len(symbols)
     # Telemetry the summary used to drop: how many analysis passes failed, what the intraday-clock rule
     # excluded (undecidable symbol-days / prices, skipped manage steps ...), and the decision-time record.
-    for extra in ("analysis_failures", "intraday_clock", "decision_time"):
+    for extra in ("analysis_failures", "intraday_clock", "decision_time", "screener_universe"):
         got[extra] = results.get(extra)
     print(f"{'metric':<20}{'stored':>14}{'re-run':>14}")
     for m in SUMMARY:

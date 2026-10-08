@@ -932,10 +932,26 @@ def test_build_daily_trial_config_bypass_screener_applies_to_expert_settings():
     assert backtest_cfg["experts"][0]["settings"] == {"weighting": "equal"}
 
 
-def test_build_daily_trial_config_non_bypass_screener_untouched():
+def _unit_store(tmp_path):
+    """A real tiny metric store (AAPL, MSFT on one scan). The trial builder bounds the loaded universe
+    from the store and no longer swallows a failure to read it (it used to fall back silently to the
+    whole band), so a test of the NON-bypass screener path needs a store that exists."""
+    import pandas as pd
+    from ba2_providers.screener import metric_store as ms
+    path = str(tmp_path / "mstore_unit")
+    ms.write_partitions(path, pd.DataFrame([
+        {"date": "2024-01-01", "symbol": s, "market_cap": 8e9, "price": 50.0, "close": 50.0,
+         "volume": 2e6, "sector": "T", "relative_volume": 2.0, "price_drop_pct": 15.0}
+        for s in ("AAPL", "MSFT")]))
+    ms.clear_store_memo()
+    return path
+
+
+def test_build_daily_trial_config_non_bypass_screener_untouched(tmp_path):
     """A NON-bypass screener run (apply_to_expert_settings False / absent) must NOT push
     universe_source / screener_store onto the expert settings — only the classic
     ``screener_runtime`` gate carries the screener (behaviour UNCHANGED)."""
+    store = _unit_store(tmp_path)
     backtest_cfg = {
         "backtest_id": 12,
         "start_date": "2024-01-02",
@@ -946,11 +962,11 @@ def test_build_daily_trial_config_non_bypass_screener_untouched():
         "account_settings": {"starting_cash": 100000.0},
         "warmup_days": 30,
         "seed": 42,
-        "screener_opt": {"store": "/tmp/mstore_unit", "base_settings": {}, "cadence_days": 7},
+        "screener_opt": {"store": store, "base_settings": {}, "cadence_days": 7},
     }
     hoisted = {
         "backtest_cfg": backtest_cfg,
-        "screener_store": "/tmp/mstore_unit",
+        "screener_store": store,
         "screener_base": {},
         "screener_cadence_days": 7,
         "screener_apply_to_expert_settings": False,
@@ -974,10 +990,11 @@ def test_build_daily_trial_config_non_bypass_screener_untouched():
     assert "screener_market_cap_min" not in cfg["screener_runtime"]["settings"]
 
 
-def test_build_daily_trial_config_screener_gate_applies_all_criteria():
+def test_build_daily_trial_config_screener_gate_applies_all_criteria(tmp_path):
     """Regression for the screener-settings-opt bug: every optimized screener criterion must reach
     the per-bar gate as an UNPREFIXED key (base overlaid with per-individual genes). Previously only
     ``market_cap_max`` survived because the prefixed keys were passed through verbatim."""
+    store = _unit_store(tmp_path)
     backtest_cfg = {
         "backtest_id": 13,
         "start_date": "2024-01-02",
@@ -988,11 +1005,11 @@ def test_build_daily_trial_config_screener_gate_applies_all_criteria():
         "account_settings": {"starting_cash": 100000.0},
         "warmup_days": 30,
         "seed": 42,
-        "screener_opt": {"store": "/tmp/mstore_unit", "base_settings": {"market_cap_max": 1e10}, "cadence_days": 7},
+        "screener_opt": {"store": store, "base_settings": {"market_cap_max": 1e10}, "cadence_days": 7},
     }
     hoisted = {
         "backtest_cfg": backtest_cfg,
-        "screener_store": "/tmp/mstore_unit",
+        "screener_store": store,
         "screener_base": {"market_cap_max": 1e10},  # run-level base (unprefixed here)
         "screener_cadence_days": 7,
         "screener_apply_to_expert_settings": False,

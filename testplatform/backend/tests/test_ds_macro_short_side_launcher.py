@@ -307,7 +307,8 @@ def test_the_handler_folds_the_run_settings_into_its_checkpoint_fingerprint():
     src = inspect.getsource(H).replace("\r\n", "\n")
     assert ("checkpoint_fingerprint(\n            param_space, ga, "
             "checkpoint_expert_settings_identity(backtest_cfg),\n"
-            '            backtest_cfg.get("rm_toggles_unpinned"))') in src
+            '            backtest_cfg.get("rm_toggles_unpinned"), '
+            'backtest_cfg.get("screener_universe_rule"))') in src
 
 
 # --------------------------------------------------------------------------- #

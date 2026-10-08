@@ -38,6 +38,8 @@ from app.services.backtest.daily_backtest_handler import (
 
 import logging
 
+from ba2_providers.screener.universe_superset import RULE_ID as _SUPERSET_RULE_ID
+
 logger = logging.getLogger(__name__)
 
 # Gene namespaces decode_params accepts (it RAISES on anything else). The stored strategy_params
@@ -80,7 +82,86 @@ def _gene_params(strategy_params: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None) -> Dict[str, Any]:
+def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *, row_id: Any = None
+                              ) -> Dict[str, Any]:
+    """A COPY of ``bt_block`` whose ``enabled_instruments`` is recomputed under the superset rule
+    (``ba2_providers.screener.universe_superset``) from the optimization's DECLARED gene ranges
+    (``parameter_ranges``, ``screener:<gene>`` keys), the stored base settings, the block's window and its
+    recorded exclusions, then stamped ``screener_universe_rule``. Refuses (``ScreenerUniverseError``)
+    when the ranges are absent or a gene has no role: it never guesses a loosest value.
+
+    Symbols with no cached OHLCV for the execution interval (or daily) are EXCLUDED from the screen,
+    recorded in ``excluded_instruments`` and logged as a WARNING naming them (the launch default is to
+    refuse; a re-run is a measurement and must still run, loudly)."""
+    import os
+    from ba2_common.config import CACHE_FOLDER
+    from ba2_providers.screener import metric_store as ms
+    from ba2_providers.screener import universe_superset as us
+
+    ranges = us.gene_ranges_from_parameter_ranges(parameter_ranges if isinstance(parameter_ranges, dict) else {})
+    if not ranges:
+        raise us.ScreenerUniverseError(
+            f"--recompute-universe: optimization of row {row_id} stores no screener gene ranges "
+            f"(parameter_ranges has no 'screener:*' keys): the loosest values cannot be derived")
+    so = bt_block["screener_opt"]
+    df = ms.load_store(so["store"])
+    interval = bt_block["execution_interval"]
+    excluded = list(bt_block.get("excluded_instruments") or [])
+    new = us.static_universe(df, str(bt_block["start_date"])[:10], str(bt_block["end_date"])[:10],
+                             so["base_settings"], ranges, intraday=us.interval_is_intraday(interval),
+                             excluded_symbols=excluded)
+    cdir = os.path.join(CACHE_FOLDER, "FMPOHLCVProvider")
+    ivs = sorted({interval, "1d"})
+
+    def _cached(sym: str) -> bool:
+        return all(any(os.path.exists(os.path.join(cdir, f"{c}_{iv}.parquet"))
+                       for c in (sym, sym.replace("-", "_"), sym.replace("-", ".")))
+                   for iv in ivs)
+
+    uncached = [x for x in new if not _cached(x)]
+    gone = set(uncached) | {x.upper() for x in excluded}
+    out = dict(bt_block)
+    out["enabled_instruments"] = [x for x in new if x not in gone and x.upper() not in gone]
+    if uncached:
+        out["excluded_instruments"] = excluded + [x for x in uncached if x.upper() not in {e.upper() for e in excluded}]
+        logger.warning(f"--recompute-universe row {row_id}: EXCLUDING {len(uncached)} symbols with no cached "
+                       f"{'/'.join(ivs)} OHLCV from the screen: {', '.join(uncached)}")
+    out["screener_universe_rule"] = us.RULE_ID
+    old_n = len(bt_block.get("enabled_instruments") or [])
+    logger.warning(f"--recompute-universe row {row_id}: static universe {old_n} -> "
+                   f"{len(out['enabled_instruments'])} symbols (rule {us.RULE_ID})")
+    return out
+
+
+def legacy_universe_note(bt_block: Dict[str, Any], hoisted: Dict[str, Any], decoded: Dict[str, Any], *,
+                         row_id: Any = None) -> Dict[str, Any]:
+    """For a stored block from BEFORE the superset rule that KEEPS its frozen list: how many of the
+    genome's own gate selections (over the block's window) fall outside that list. Logged as a WARNING and
+    returned (``{"gate_selected", "outside_static_universe", "first_examples", "static_universe_size"}``)
+    so the re-run tools can print it. Pure read of the store."""
+    from ba2_providers.screener import metric_store as ms
+    from ba2_providers.screener import universe_superset as us
+
+    eff = ms.normalize_screener_settings({**(hoisted.get("screener_base") or {}),
+                                          **(decoded.get("screener_overrides") or {})})
+    df = ms.load_store(hoisted["screener_store"])
+    sel = us.gate_selections(df, str(bt_block["start_date"])[:10], str(bt_block["end_date"])[:10], eff,
+                             list(bt_block.get("excluded_instruments") or []),
+                             intraday=us.interval_is_intraday(bt_block["execution_interval"]))
+    note = us.count_outside(sel, bt_block["enabled_instruments"])
+    note["static_universe_size"] = len(bt_block["enabled_instruments"])
+    if note["outside_static_universe"]:
+        share = 100.0 * note["outside_static_universe"] / max(1, note["gate_selected"])
+        logger.warning(
+            f"row {row_id}: LEGACY static universe ({note['static_universe_size']} symbols, built before the "
+            f"{us.RULE_ID} rule) is KEPT: {note['outside_static_universe']} of {note['gate_selected']} of the "
+            f"genome's own gate selections ({share:.1f}%) fall outside it and can never be traded. "
+            f"Re-run with --recompute-universe for the corrected universe. First: {note['first_examples'][:5]}")
+    return note
+
+
+def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None,
+                                    recompute_universe: bool = False) -> Dict[str, Any]:
     """Rebuild an opt-derived row's run config.
 
     Builds the SAME config the GA SCORED the individual with: ``_build_daily_trial_config`` fed the
@@ -88,6 +169,14 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None) 
     the optimized thresholds), matching the UI "Load + run". (Note: the CLI ``_persist_top_backtests``
     historically built this WITHOUT hoisted, persisting the top-N as static-universe runs — so a
     re-run intentionally CORRECTS that and re-runs the actual optimized screener config.)
+
+    STATIC UNIVERSE (screener jobs). The stored block freezes ``enabled_instruments``. A block stamped
+    ``screener_universe_rule == superset-v1`` holds the true superset and is used as stored. A block from
+    BEFORE the rule holds the old cap-ranked top-50 list: by default that list is KEPT (the row reproduces
+    the numbers it was stored with) and a WARNING states how many of the genome's own gate selections fall
+    outside it (they were untradable); ``recompute_universe=True`` (``--recompute-universe`` of the re-run
+    tools) recomputes the static universe under the corrected rule from the optimization's declared gene
+    ranges (``parameter_ranges``) and the stored base settings, window and exclusions, and stamps the rule.
     """
     import os
     from ba2_common.config import SCREENER_STORE_DIR
@@ -135,6 +224,12 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None) 
     if isinstance(so, dict) and so.get("store") and not os.path.isdir(so["store"]):
         bt_block["screener_opt"] = {**so, "store": SCREENER_STORE_DIR}
 
+    if recompute_universe:
+        if not bt_block.get("screener_opt"):
+            raise ValueError(f"--recompute-universe: backtest {bt.id} is not a screener-based row "
+                             f"(optimization #{opt.id} has no screener_opt block)")
+        bt_block = recompute_static_universe(bt_block, opt.parameter_ranges, row_id=bt.id)
+
     decoded = decode_params(strat, _gene_params(bt.strategy_params))
     # hoisted applies the screener (genes + store) exactly as the GA did; None for non-screener opts.
     hoisted = _build_hoisted_state(bt_block) if bt_block.get("screener_opt") else None
@@ -145,6 +240,9 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None) 
     trial_cfg["backtest_id"] = bt.id
     trial_cfg["name"] = bt.name
     trial_cfg["persist_trading_db"] = True
+    if hoisted is not None and bt_block.get("screener_universe_rule") != _SUPERSET_RULE_ID:
+        trial_cfg["screener_universe_legacy_note"] = legacy_universe_note(
+            bt_block, hoisted, decoded, row_id=bt.id)
     return trial_cfg
 
 
@@ -202,7 +300,8 @@ def _build_standalone_rerun_config(bt: Backtest) -> Dict[str, Any]:
     return _build_config(payload)
 
 
-def rebuild_config_for_backtest(bt: Backtest, db: Any = None, window: Any = None) -> Dict[str, Any]:
+def rebuild_config_for_backtest(bt: Backtest, db: Any = None, window: Any = None,
+                              recompute_universe: bool = False) -> Dict[str, Any]:
     """Reconstruct the ``run_daily_backtest`` config that reproduces ``bt``'s ORIGINAL run.
 
     This is the SINGLE reconstruction path shared by BOTH the ``/rerun`` handler (which
@@ -222,12 +321,14 @@ def rebuild_config_for_backtest(bt: Backtest, db: Any = None, window: Any = None
         )
     if window is not None and not bt.optimization_id:
         raise ValueError("window override is only supported for optimization-derived rows")
+    if recompute_universe and not bt.optimization_id:
+        raise ValueError("--recompute-universe is only supported for optimization-derived rows")
     if bt.optimization_id:
         if db is not None:
-            return _build_optimization_rerun_config(db, bt, window)
+            return _build_optimization_rerun_config(db, bt, window, recompute_universe)
         session = SessionLocal()
         try:
-            return _build_optimization_rerun_config(session, bt, window)
+            return _build_optimization_rerun_config(session, bt, window, recompute_universe)
         finally:
             session.close()
     return _build_standalone_rerun_config(bt)

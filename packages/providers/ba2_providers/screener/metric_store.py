@@ -1575,3 +1575,48 @@ def screened_symbol_union(store_df: "pd.DataFrame", start_day: str, end_day: str
         # intent and drops the pandas deprecation warning that comes with the default.
         d = d.groupby("date", sort=False, observed=True).head(n)
     return sorted(set(d["symbol"]))
+
+
+# ----------------------------------------------------------------------------------------------
+# VISIBLE-SCAN WINDOW (added with the screener static-universe superset fix, 2026-10-07).
+# These two functions are PURELY ADDITIVE: no existing function above was changed.
+# ----------------------------------------------------------------------------------------------
+def visible_scan_window(store_df: "pd.DataFrame", start_day: str, end_day: str, *,
+                        intraday: bool, warmup_days: int = 0) -> Optional[Tuple[str, str]]:
+    """``(lo, hi)``: the first and last SCAN DATES that are visible (``visible_scan_date``) at some
+    decision instant of a run over ``[start_day - warmup_days, end_day]``, or None when no scan is
+    visible at the end of the window at all (the per-decision gate then returns [] throughout).
+
+    Why not ``screened_symbol_union``'s own window ("last scan <= start_day .. last scan <= end_day"):
+    on an intraday clock the scan visible at the FIRST decision of ``start_day`` is the last one dated
+    BEFORE ``start_day`` (a scan dated ``start_day`` is only visible after that session closes), and
+    one dated on the end day's evening may still be visible after the last decision. The window here is
+    exactly the set of scans the engine's per-decision gate can ever resolve to: the start is read at
+    the day's midnight (earliest instant), the end at 23:59:59 (latest instant), both through the ONE
+    visibility rule. ``warmup_days`` widens the start (the engine takes no decision in warmup, so the
+    callers pass 0; it is here so a caller that does decide there is covered by one argument)."""
+    from datetime import date as _date
+    dates = scan_dates(store_df)
+    if not dates:
+        return None
+    s = _date.fromisoformat(str(start_day)[:10]) - timedelta(days=int(warmup_days))
+    e = _date.fromisoformat(str(end_day)[:10])
+    hi = visible_scan_date(dates, datetime(e.year, e.month, e.day, 23, 59, 59), intraday=intraday)
+    if hi is None:
+        return None
+    lo = visible_scan_date(dates, datetime(s.year, s.month, s.day, 0, 0, 0), intraday=intraday)
+    return (dates[0] if lo is None else lo), hi
+
+
+def screened_symbol_union_visible(store_df: "pd.DataFrame", start_day: str, end_day: str,
+                                  settings: Dict[str, Any],
+                                  excluded_symbols: "Optional[Iterable[str]]" = None, *,
+                                  intraday: bool, warmup_days: int = 0) -> List[str]:
+    """``screened_symbol_union`` over exactly the scans the per-decision gate can resolve to
+    (``visible_scan_window``). ``settings`` is applied AS GIVEN (its own ``max_stocks`` / ``sort_metric``
+    included), so this is the exact set ``screen_universe_for_day`` can return over the window for those
+    settings; strip the ordering keys first for the cut-free superset."""
+    win = visible_scan_window(store_df, start_day, end_day, intraday=intraday, warmup_days=warmup_days)
+    if win is None:
+        return []
+    return screened_symbol_union(store_df, win[0], win[1], settings, excluded_symbols)

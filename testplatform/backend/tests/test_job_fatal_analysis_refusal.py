@@ -29,7 +29,7 @@ def _refusal():
 # ----------------------------------------------------------------------- classification
 @pytest.mark.parametrize("name", ["AnalysisFailureRefusal", "StaleAnchorPrice", "StaleMarkToMarket",
                                   "ComboSettlementRefused", "BacktestCacheMiss", "SplitBasisRefused",
-                                  "MarketCalendarUnavailable"])
+                                  "MarketCalendarUnavailable", "ScreenerUniverseRefusal"])
 def test_these_types_end_the_job(name):
     assert H.job_fatal(name) and name in H.JOB_FATAL_ERROR_TYPES
 

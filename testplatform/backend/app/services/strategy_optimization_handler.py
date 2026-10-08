@@ -1251,6 +1251,7 @@ def _resolve_early_stop_min_rel(ga: Dict[str, Any]) -> Optional[float]:
 
 
 from app.services.job_fatal import JOB_FATAL_ERROR_TYPES, job_fatal  # noqa: E402,F401  (ONE set)
+from ba2_providers.screener.universe_superset import RULE_ID as _SUPERSET_RULE_ID  # noqa: E402
 
 
 def _analysis_failures_field(results: Dict[str, Any]) -> Dict[str, Any]:
@@ -1804,7 +1805,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         ckpt_task_id = checkpoint_task_id(opt.name, opt_id)
         ckpt_fingerprint = checkpoint_fingerprint(
             param_space, ga, checkpoint_expert_settings_identity(backtest_cfg),
-            backtest_cfg.get("rm_toggles_unpinned"))
+            backtest_cfg.get("rm_toggles_unpinned"), backtest_cfg.get("screener_universe_rule"))
         # The OBJECTIVE this run is scored under, as the trials will actually see it (the trial
         # config carries the same key, and strategy_fitness._maybe_robust reads it). Written into
         # every checkpoint and compared on resume -- see _assert_checkpoint_robustness_matches.
@@ -2871,6 +2872,7 @@ def _build_daily_trial_config(
     # runs -> the engine's gating is a no-op and the config is byte-identical to before.
     screener_runtime = None
     screener_candidate: Optional[List[str]] = None
+    screener_universe_guard: Optional[str] = None   # None = no per-decision universe guard applies
     if hoisted and hoisted.get("screener_store"):
         from ba2_providers.screener import metric_store as _ms
         from ba2_providers.screener.metric_store import normalize_screener_settings
@@ -2895,21 +2897,34 @@ def _build_daily_trial_config(
             "excluded_symbols": excluded_instruments,
         }
         # CANDIDATE BOUND (non-bypass): restrict the loaded universe to the symbols THIS trial's
-        # screen can EVER select over [start,end] (screened_symbol_union with the trial's own eff
-        # settings), intersected with the band. The per-bar gate already restricts ENTRIES to a
-        # subset of this, so results are IDENTICAL — but the engine no longer preloads/analyses the
-        # whole band (e.g. 814 -> ~150 symbols), the dominant screener-opt memory + CPU cost. Matches
-        # the standalone path's _resolve_enabled_instruments. Bypass experts keep the full band (they
-        # rank the whole universe). Exact per-trial bound — no gene-tightening assumption.
+        # screen can EVER select over the run's VISIBLE scans (``screened_symbol_union_visible`` with
+        # the trial's own eff settings: its own filters, sort AND max_stocks cut), intersected with
+        # the job's static universe. The per-bar gate selects exactly a subset of this, so results
+        # are IDENTICAL to loading the whole static universe -- but the engine preloads and analyses
+        # only what this genome can trade (the dominant screener-opt memory + CPU cost), which is
+        # what keeps the per-trial cost near the old small list's now that the static universe is the
+        # true superset (``ba2_providers.screener.universe_superset``). Exact per-trial bound, no
+        # gene-tightening assumption. Bypass experts keep the full static universe (they rank the
+        # whole screened universe off the store themselves).
+        #
+        # THE INTERSECTION IS WHERE A PICK USED TO VANISH SILENTLY: a symbol the genome's gate
+        # selects that is not in the static universe was dropped here (and again by the engine's
+        # ``entry_universe`` filter) with nothing said. It is now loud: the engine counts every such
+        # gate selection against ``enabled_instruments`` (``results["screener_universe"]``) and, under
+        # the superset rule, REFUSES the run (``ScreenerUniverseRefusal``, job-fatal). A failure to
+        # compute the bound propagates; it never falls back to loading the band.
         if not bypass and not hoisted.get("screener_gate_only"):
-            try:
-                _df = _ms.load_store(hoisted["screener_store"])
-                _sd = str(backtest_cfg["start_date"])[:10]
-                _ed = str(backtest_cfg["end_date"])[:10]
-                _union = set(_ms.screened_symbol_union(_df, _sd, _ed, eff_norm, excluded_instruments))
-                screener_candidate = [s for s in backtest_cfg["enabled_instruments"] if s in _union]
-            except Exception:  # noqa: BLE001 — never break a trial on the optimization; fall back to full band
-                screener_candidate = None
+            _df = _ms.load_store(hoisted["screener_store"])
+            _sd = str(backtest_cfg["start_date"])[:10]
+            _ed = str(backtest_cfg["end_date"])[:10]
+            _union = set(_ms.screened_symbol_union_visible(
+                _df, _sd, _ed, eff_norm, excluded_instruments,
+                intraday=_is_intraday_interval(backtest_cfg.get("execution_interval"))))
+            screener_candidate = [s for s in backtest_cfg["enabled_instruments"] if s in _union]
+            # The universe guard (engine): REFUSE under the superset rule; a STORED block from before
+            # the rule keeps its frozen list and only WARNS (counts + log), see rerun_handler.
+            screener_universe_guard = ("refuse" if backtest_cfg.get("screener_universe_rule") == _SUPERSET_RULE_ID
+                                       else "warn")
 
     if not isinstance(option_trade_records, bool):
         raise TypeError(f"option_trade_records must be True or False, got "
@@ -3035,6 +3050,10 @@ def _build_daily_trial_config(
         # SCREENER seam: the per-individual effective screener settings + store path the engine
         # uses to gate entries to the per-day screened universe. None for non-screener runs.
         "screener_runtime": screener_runtime,
+        # SCREENER UNIVERSE GUARD ("refuse" | "warn" | None): whether the engine REFUSES, only
+        # WARNS, or does not check that every symbol the per-decision gate selects is in this
+        # run's loaded universe. In the whitelist (this dict is rebuilt key by key).
+        "screener_universe_guard": screener_universe_guard,
         # MARKET-CONDITION entry gates (design 2026-09-15 sections 4.1/4.5). Same whitelist reason
         # as stress_spread_bps and robust_fitness above -- this dict rebuilds the trial config key
         # by key, so a knob missing HERE is inert however correctly it was parsed upstream. Both
@@ -3320,7 +3339,8 @@ def checkpoint_expert_settings_identity(backtest_cfg: Dict[str, Any]) -> Dict[st
 
 def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
                            expert_settings: Optional[Dict[str, Any]] = None,
-                           rm_toggles_unpinned: Optional[List[str]] = None) -> str:
+                           rm_toggles_unpinned: Optional[List[str]] = None,
+                           screener_universe_rule: Optional[str] = None) -> str:
     """Identity of the SEARCH ITSELF -- a checkpoint may only be resumed into a matching one.
 
     A GA checkpoint is a list of chromosomes plus an RNG state; both are meaningless against a
@@ -3355,6 +3375,12 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     explicitly so the identity does not rely on that incidental shape and so a checkpoint written
     under one policy can never be resumed into the other even if some future gene space happened
     to coincide.
+
+    ``screener_universe_rule`` (``backtest.screener_universe_rule``, e.g. ``superset-v1``) joins it the
+    same way -- ONLY when stamped, so a job from before the rule keeps its fingerprint byte for byte. The
+    static universe a screener job searches over is part of its identity: a checkpoint (and the
+    population of genomes in it, scored on the OLD cap-ranked top-50 list) must never be resumed into a
+    run on the corrected superset universe, or the other way round.
     """
     import hashlib
     import json
@@ -3369,6 +3395,8 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
         payload["expert_settings"] = sorted(expert_settings.items())
     if rm_toggles_unpinned:
         payload["rm_toggles_unpinned"] = sorted(rm_toggles_unpinned)
+    if screener_universe_rule:
+        payload["screener_universe_rule"] = screener_universe_rule
     lattice_anchor = _resolve_lattice_anchor(ga)
     if lattice_anchor != "zero":
         payload["lattice_anchor"] = lattice_anchor

@@ -12,6 +12,8 @@ from typing import Any
 #:   StaleAnchorPrice       -- the intraday anchor-price (look-ahead) guard was violated;
 #:   FillRebaseRefusal      -- too many stops could not be re-based to their fill (no anchor);
 #:   FillRebaseDisabled     -- the measurement-only no-re-base hook was on in an optimization;
+#:   ScreenerUniverseRefusal -- the screener gate selected symbols outside the job's static universe
+#:                             (the superset derivation is wrong: every genome's result omits tradable picks);
 #:   StaleMarkToMarket / ComboSettlementRefused -- engine-level refusals that already end the run.
 JOB_FATAL_ERROR_TYPES = frozenset({
     "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
@@ -21,6 +23,7 @@ JOB_FATAL_ERROR_TYPES = frozenset({
     "MacroAvailabilityUnknown",
     "AnalysisFailureRefusal", "StaleAnchorPrice", "StaleMarkToMarket", "ComboSettlementRefused",
     "FillRebaseRefusal", "FillRebaseDisabled",
+    "ScreenerUniverseRefusal",
 })
 
 

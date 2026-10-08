@@ -52,7 +52,7 @@ if _TOOLS_DIR not in sys.path:
 from matrix_flags import (  # noqa: E402
     finish_matrix, note_job_exit,
     cap_passthrough, decision_times_plan, decision_times_tokens, job_name_with_digest,
-    with_decision_times_name)
+    screener_dry_run_universe_note, with_decision_times_name, with_universe_rule_name)
 
 _STORE = r"C:\Users\basti\Documents\ba2\common\cache\screener\metric_store"
 # A real --universe is required by the CLI but is OVERRIDDEN by the screened union when --screener
@@ -552,6 +552,12 @@ def main() -> int:
                     help="Extra GA population for FMPRating jobs ONLY (its search space grew with the "
                          "price-target + analyst-recency genes). Added to --population for FMPRating. "
                          "Default 10.")
+    ap.add_argument("--exclude-uncached", action="store_true",
+                    help="Forward --screener-exclude-uncached to every job: a static-universe symbol with "
+                         "no cached OHLCV (execution interval or daily) is EXCLUDED from the screen and "
+                         "recorded on the run, instead of REFUSING the launch (the default). Needed for "
+                         "the small band (BID, GRSD, HCAC, OGG, SHOT, TRIB, VII) and the large band "
+                         "(FITB-PA) of the 2026-10-07 store until their bars are fetched.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -599,8 +605,8 @@ def main() -> int:
     done = _completed_names()
     print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies="
           f"{'per --strategy-plan' if strategy_plan else strategies}); "
-          f"{sum(1 for j in jobs if j[0] in done)} already completed"
-          f"{' (by base name; digest-suffixed names are checked per job)' if (market_condition_passthrough(args) or exclude_symbols_passthrough(args) or decision_times_passthrough(args)) else ''}.")
+          f"{sum(1 for j in jobs if with_universe_rule_name(j[0]) in done)} already completed"
+          f" (by base name + universe-rule token; digest/time-gene-suffixed names are checked per job).")
     # --dry-run walks the SAME loop below and stops short of launching: a job's final name can
     # carry a digest of its resolved argv (market-condition flags), which only exists once the
     # command is built, so listing the pre-digest names here would show (and check "DONE"
@@ -613,6 +619,10 @@ def main() -> int:
             print(f"[{i}/{len(jobs)}] NOTE {name}: bypass expert, decision time stays fixed "
                   f"(no schedule genes)", flush=True)
         name = with_decision_times_name(name, job_dt_times)
+        # The static-universe RULE is part of the job's identity (every job here is a --screener job):
+        # a name without the token was launched under the old cap-ranked top-50 list and must never be
+        # skipped as "completed" or resumed as this job.
+        name = with_universe_rule_name(name)
         # Data-floored start (see _EXPERT_MIN_START). Announced per job so a shorter window is
         # visible in the log instead of being inferred later from a suspiciously late first trade.
         job_start = _start_for(expert, args.start)
@@ -712,13 +722,16 @@ def main() -> int:
         # skipped above: it cannot carry the gene.)
         dt_tokens = decision_times_tokens(job_dt_times)
         cmd += dt_tokens
+        unc_tokens = ["--screener-exclude-uncached"] if args.exclude_uncached else []
+        cmd += unc_tokens
         job_name = name
-        if mc_tokens or excl_tokens or fr_tokens or dt_tokens:
+        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens:
             job_name = _job_name(name, cmd)
             cmd[cmd.index("--name") + 1] = job_name
         if args.dry_run:
             print(f"  {'DONE' if job_name in done else 'TODO'}  {job_name}  "
-                  f"({expert} {strat or '(bypass)'} / {band})")
+                  f"({expert} {strat or '(bypass)'} / {band})  "
+                  f"[{screener_dry_run_universe_note(args.store, band, job_start, args.end, args.interval)}]")
             continue
         if job_name in _completed_names():   # re-read each loop (resumable)
             _fixed_note = ("; NOTE --decision-times fixed keeps the legacy job name, so this is the "
