@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ba2trade-experts"
-version = "2026.10.00002"
+version = "2026.10.00003"
 description = "BA2 Trade — expert implementations"
 requires-python = ">=3.11"
 dependencies = [

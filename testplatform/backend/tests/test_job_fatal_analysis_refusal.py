@@ -216,3 +216,39 @@ def test_the_options_matrix_recognises_an_analysis_refusal_reason_and_nothing_el
     assert is_analysis_failure_reason(ok)
     assert not is_analysis_failure_reason("BacktestCacheMiss: x  [job-fatal BacktestCacheMiss; ...]")
     assert not is_analysis_failure_reason("")
+
+
+# ----------------------------------------------------------------------- stale screener metric store
+def _stale():
+    from ba2_providers.screener.metric_store import MetricStoreStaleError
+    return MetricStoreStaleError("metric store is stale for as-of day 2026-12-01: newest scan 2026-10-03")
+
+
+def test_a_stale_metric_store_ends_the_job_by_type_name():
+    assert H.job_fatal(_stale()) and "MetricStoreStaleError" in H.JOB_FATAL_ERROR_TYPES
+
+
+def test_a_stale_metric_store_travels_back_as_fatal(monkeypatch):
+    out = _worker_result(monkeypatch, _stale())
+    assert out["ok"] is False and out["fatal"] is True and out["error_type"] == "MetricStoreStaleError"
+    out["fatal"] = False                                   # an older worker build: the master still decides by type
+    with pytest.raises(H._FatalTrialError) as ei:
+        H._abort_on_fatal_trial(out, {"msg": None}, "k", {})
+    assert "job-fatal MetricStoreStaleError" in str(ei.value)
+
+
+def test_a_job_whose_trial_reads_a_stale_store_fails_and_dispatches_nothing_more(monkeypatch):
+    T = _env(monkeypatch)
+    calls = []
+
+    def stub(backtest_cfg, hoisted, decoded):
+        calls.append(1)
+        raise _stale()
+
+    monkeypatch.setattr(H, "_run_trial_backtest", stub)
+    sid = T._seed_strategy()
+    opt_id = T._seed_opt(sid, config=T._ga_config(populationSize=4, generations=3))
+    out = H.handle_strategy_optimization("t-stale-store-fatal", {"optimization_id": opt_id})
+    assert out["status"] == "failed", out
+    assert "job-fatal MetricStoreStaleError" in out["error"]
+    assert len(calls) == 1

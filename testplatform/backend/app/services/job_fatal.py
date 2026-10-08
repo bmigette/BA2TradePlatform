@@ -14,6 +14,9 @@ from typing import Any
 #:   FillRebaseDisabled     -- the measurement-only no-re-base hook was on in an optimization;
 #:   ScreenerUniverseRefusal -- the screener gate selected symbols outside the job's static universe
 #:                             (the superset derivation is wrong: every genome's result omits tradable picks);
+#:   MetricStoreStaleError  -- the screener metric store ends well before the run window (its newest scan
+#:                             is older than the staleness limit at an as-of day): every genome would be
+#:                             screened/sized from one reused old scan;
 #:   StaleMarkToMarket / ComboSettlementRefused -- engine-level refusals that already end the run.
 JOB_FATAL_ERROR_TYPES = frozenset({
     "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
@@ -23,7 +26,7 @@ JOB_FATAL_ERROR_TYPES = frozenset({
     "MacroAvailabilityUnknown",
     "AnalysisFailureRefusal", "StaleAnchorPrice", "StaleMarkToMarket", "ComboSettlementRefused",
     "FillRebaseRefusal", "FillRebaseDisabled",
-    "ScreenerUniverseRefusal",
+    "ScreenerUniverseRefusal", "MetricStoreStaleError",
 })
 
 
