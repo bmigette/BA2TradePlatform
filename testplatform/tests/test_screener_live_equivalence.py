@@ -84,7 +84,11 @@ def _patch_fmp(monkeypatch, payload):
     payload. No live FMP call, no real key — the LOGIC under test is unchanged.
     """
     import ba2_providers.fmp_common as fmp_common
-    import ba2_providers.screener.FMPScreenerProvider as prov_mod
+    import sys
+    import ba2_providers.screener.FMPScreenerProvider  # noqa: F401 - ensure imported
+    # The package re-exports the CLASS under the module's name, so "import ... as" yields the
+    # class; patch the real module (found in sys.modules) so the key read is actually faked.
+    prov_mod = sys.modules["ba2_providers.screener.FMPScreenerProvider"]
 
     class _Resp:
         def json(self):
