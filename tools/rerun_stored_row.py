@@ -132,6 +132,12 @@ def main() -> int:
     elif config.get("screener_universe_guard"):
         print(f"static universe: {len(config['enabled_instruments'])} symbols"
               f"{' (recomputed, --recompute-universe)' if ns.recompute_universe else ''}", flush=True)
+    recompute_note = config.get("screener_universe_recompute_note")
+    if recompute_note:
+        print(f"universe recompute: size {recompute_note['static_universe_size']} (previous "
+              f"{recompute_note['previous_size']}, computed {recompute_note['computed_size']}); excluded for missing "
+              f"cache files: {len(recompute_note['excluded_for_missing_cache'])} "
+              f"{recompute_note['excluded_for_missing_cache']}", flush=True)
 
     prior = logging.root.manager.disable
     logging.disable(logging.INFO)
@@ -157,7 +163,8 @@ def main() -> int:
             {"row": ns.backtest_id, "name": name, "window": ns.window or stored_window,
              "decision_time": ns.decision_time, "stored_times": stored_times,
              "stored": stored, "stored_window": stored_window, "rerun": got,
-             "preload_symbols": results.get("symbol_count")}, indent=1, default=str))
+             "preload_symbols": results.get("symbol_count"),
+             "universe_recompute": recompute_note}, indent=1, default=str))
     return 0
 
 

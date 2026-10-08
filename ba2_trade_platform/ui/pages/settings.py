@@ -3892,6 +3892,8 @@ class ExpertSettingsTab:
                 stat_items.append(f'RVOL: -{dropped_rvol}')
                 dropped_float = stats.get('dropped_float', 0)
                 stat_items.append(f'Float: -{dropped_float}')
+                dropped_vol_min = stats.get('dropped_volume_min', 0)
+                stat_items.append(f'Vol min: -{dropped_vol_min}')
                 dropped_vol = stats.get('dropped_volume_max', 0)
                 stat_items.append(f'Vol max: -{dropped_vol}')
                 dropped_drop = stats.get('dropped_price_drop', 0)

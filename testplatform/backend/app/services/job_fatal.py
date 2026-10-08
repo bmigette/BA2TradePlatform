@@ -17,6 +17,11 @@ from typing import Any
 #:   IntradayBasisMismatch / IntradayBasisStale -- a symbol's intraday cache is on a different price level
 #:                             than its daily cache (a split / re-adjustment rewrote one and not the other):
 #:                             every trial that reads the symbol decides on one basis and prices on another;
+#:   ScreenerGenomeOutOfRange -- a genome's screener gene lies outside the DECLARED range the static universe
+#:                             was derived from (a seed / pin from another job): its picks would be untradable;
+#:   ScreenerDataOutage / PanelCoverageError / ScreenerGateRefusal -- the screener simulation's data is
+#:                             incomplete (more than 10 % of candidates without bars; panel absent / stale /
+#:                             built under another definition);
 #:   StaleMarkToMarket / ComboSettlementRefused -- engine-level refusals that already end the run.
 JOB_FATAL_ERROR_TYPES = frozenset({
     "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
@@ -28,6 +33,7 @@ JOB_FATAL_ERROR_TYPES = frozenset({
     "FillRebaseRefusal", "FillRebaseDisabled",
     "ScreenerUniverseRefusal",
     "IntradayBasisMismatch", "IntradayBasisStale",
+    "ScreenerGenomeOutOfRange", "ScreenerDataOutage", "PanelCoverageError", "ScreenerGateRefusal",
 })
 
 

@@ -605,7 +605,7 @@ def main() -> int:
     done = _completed_names()
     print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies="
           f"{'per --strategy-plan' if strategy_plan else strategies}); "
-          f"{sum(1 for j in jobs if with_universe_rule_name(j[0]) in done)} already completed"
+          f"{sum(1 for j in jobs if with_universe_rule_name(j[0], simulated=j[2] is not None) in done)} already completed"
           f" (by base name + universe-rule token; digest/time-gene-suffixed names are checked per job).")
     # --dry-run walks the SAME loop below and stops short of launching: a job's final name can
     # carry a digest of its resolved argv (market-condition flags), which only exists once the
@@ -622,7 +622,7 @@ def main() -> int:
         # The static-universe RULE is part of the job's identity (every job here is a --screener job):
         # a name without the token was launched under the old cap-ranked top-50 list and must never be
         # skipped as "completed" or resumed as this job.
-        name = with_universe_rule_name(name)
+        name = with_universe_rule_name(name, simulated=strat is not None)   # FactorRanker (bypass): no gate
         # Data-floored start (see _EXPERT_MIN_START). Announced per job so a shorter window is
         # visible in the log instead of being inferred later from a suspiciously late first trade.
         job_start = _start_for(expert, args.start)

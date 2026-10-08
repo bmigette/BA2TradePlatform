@@ -405,8 +405,8 @@ def _is_intraday(interval: str) -> bool:
     """True for sub-daily bar intervals (1m/5m/15m/30m/1h/...). Daily and coarser
     (1d/1wk/1mo) are False — those keep calendar-date bar keys. Cached: the interval is
     constant for a run but this was called ~200k×/backtest (per price lookup)."""
-    iv = (interval or "1d").lower()
-    return iv.endswith("m") or iv.endswith("h") or iv.endswith("min")
+    from ba2_providers.screener.universe_superset import interval_is_intraday   # the ONE classifier
+    return interval_is_intraday(interval or "1d")
 
 
 @lru_cache(maxsize=4096)
@@ -629,6 +629,7 @@ class AsOfPriceSource:
         self._l: Dict[str, np.ndarray] = {}      # low
         self._c: Dict[str, np.ndarray] = {}      # close
         self._v: Dict[str, np.ndarray] = {}      # volume
+        self._shi: Dict[str, Tuple[Any, np.ndarray]] = {}   # symbol -> (the _h array it was built from, running session high)
         self._clock_key: Any = None      # normalised Python key of the current clock bar (set_clock)
         # Per-symbol monotonic cursor: index of the last key <= the current clock. The engine's
         # clock only ever moves forward, so a clock-based lookup advances this cursor (O(1)
@@ -837,6 +838,71 @@ class AsOfPriceSource:
         day0 = (key // _NS_PER_DAY) * _NS_PER_DAY
         start = bisect.bisect_left(k, day0)
         return float(self._v[symbol][start:end].sum()) if end > start else 0.0
+
+    def screener_now_price(self, symbol: str, as_of: Any) -> Optional[float]:
+        """"Now" for the SCREENER SIMULATION only (``ba2_providers.screener.live_sim``): what live's quote shows
+        at the instant ``as_of``.
+
+        OWNER-APPROVED EXCEPTION (2026-10-08), SCREENER ONLY, to "only bars that ended at or before the
+        decision instant": live's screener takes its quote 30-90 seconds after the open, which no ENDED bar
+        can represent.  So, on an intraday clock:
+          * a bar of T's own session has ENDED -> its close (identical to ``decision_price``);
+          * none has (T is inside the session's FIRST bar) -> the OPEN of that first bar (the opening print).
+        Never used for anything but the screener gate (``screener_gate``); guarded by
+        ``test_no_bar_price_in_decision_code`` (the allowlisted call sites).  No bar of the session and not inside
+        its first bar (a thin name): the ``decision_price`` rule (the last ended bar of the last finished session).
+        ``None`` = nothing knowable at all; the gate then REFUSES for a loaded symbol (there is no fallback price).
+        Daily clock: the close of the bar stamped ``as_of`` (``decision_price``), see the screener gate."""
+        k = self._keys.get(symbol)
+        if k is None or not len(k):
+            return None
+        if not self._intraday:
+            return self.decision_price(symbol, as_of)
+        key = _key64(as_of, self._interval)
+        span = _interval_ns(self._interval)
+        day0 = (key // _NS_PER_DAY) * _NS_PER_DAY
+        f = bisect.bisect_right(k, key - span) - 1             # latest bar that has ENDED at T
+        if f >= 0 and k[f] >= day0:
+            return float(self._c[symbol][f])
+        i = bisect.bisect_right(k, key) - 1                     # the bar covering T
+        if i >= 0 and k[i] >= day0 and key - k[i] < span and (i == 0 or k[i - 1] < day0):
+            return float(self._o[symbol][i])                    # the session's opening print
+        dp = self.decision_price(symbol, as_of)                 # no bar of this session yet: the DecisionPrice rule
+        return None if dp is None else float(dp)
+
+    def screener_session_high(self, symbol: str, as_of: Any) -> Optional[float]:
+        """The HIGH of the forming daily bar of T's session as the screener simulation sees it at ``as_of``: the
+        highest high of the session's intraday bars that have ENDED at or before T; inside the first bar the opening
+        print.  NEVER a bar that has not ended (a session high reached after T does not leak).  Screener-only, with
+        ``screener_now_price`` (same owner-approved exception).  Daily clock / nothing knowable: ``None`` (the gate
+        then uses the single price ``now``)."""
+        if not self._intraday:
+            return None
+        k = self._keys.get(symbol)
+        if k is None or not len(k):
+            return None
+        key = _key64(as_of, self._interval)
+        span = _interval_ns(self._interval)
+        day0 = (key // _NS_PER_DAY) * _NS_PER_DAY
+        f = bisect.bisect_right(k, key - span) - 1
+        if f >= 0 and k[f] >= day0:
+            return float(self._session_running_high(symbol)[f])       # O(1) lookup after one vectorised pass per symbol
+        return self.screener_now_price(symbol, as_of)
+
+    def _session_running_high(self, symbol: str) -> np.ndarray:
+        """Running (cumulative) HIGH of every bar's own session, aligned to the symbol's bars: element ``i`` = the highest
+        high of the bars of ``i``'s session up to and including ``i``.  Built ONCE per symbol per bound bar array (a pandas
+        grouped cummax, exact), so ``screener_session_high`` is a bisect + an array read instead of a slice max per
+        decision.  Costs 8 bytes per bar of a symbol the screener asked about."""
+        h = self._h[symbol]
+        got = self._shi.get(symbol)
+        if got is not None and got[0] is h:
+            return got[1]
+        import pandas as pd
+        day = _keys_np(self._keys[symbol]) // _NS_PER_DAY
+        cm = pd.Series(h).groupby(day).cummax().to_numpy()
+        self._shi[symbol] = (h, cm)
+        return cm
 
     # ---- loading -----------------------------------------------------------
     def preload(

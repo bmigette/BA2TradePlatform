@@ -212,7 +212,7 @@ class _BacktestProviderBundle(LiveProviderBundle):
 def _screened_symbols_for_bar(
     screener_runtime: Optional[Dict[str, Any]], as_of_dt: datetime,
     cache: Optional[Dict[str, List[str]]],
-    *, intraday: bool,
+    *, intraday: bool, gate: Optional[Any] = None,
 ) -> Optional[List[str]]:
     """The dynamic per-day universe of symbols ALLOWED TO ENTER on this bar.
 
@@ -243,6 +243,13 @@ def _screened_symbols_for_bar(
     """
     if not screener_runtime:
         return None
+    if screener_runtime.get("criteria_version"):
+        # LIVE-SIMULATION gate (criteria live-daily-v2): the DAILY panel gate, evaluated for the decision's
+        # own morning.  The weekly store path below is the LEGACY gate, reachable only by a run that carries
+        # no criteria_version (a stored pre-simulation row); the two never share a job identity.
+        if gate is None:
+            raise RuntimeError("screener_runtime carries criteria_version but no PanelGate was built")
+        return gate.symbols(as_of_dt)
     from ba2_providers.screener import metric_store as ms
 
     store = screener_runtime["store"]
@@ -540,6 +547,11 @@ class DailyBacktestEngine:
         # set only changes per scan date (weekly cadence), so it's computed once per scan date and
         # reused for every bar in that period (vs recomputing the full-store filter every 5min bar).
         self._screened_cache: Dict[str, List[str]] = {}
+        # The live-simulation gate (daily panel), built once per run; None for the legacy weekly gate.
+        self._screen_gate = None
+        if self._screener_runtime and self._screener_runtime.get("criteria_version"):
+            from app.services.backtest.screener_gate import PanelGate
+            self._screen_gate = PanelGate(self._screener_runtime, price_source, intraday=price_source.is_intraday)
         # SCREENER UNIVERSE GUARD. ``screener_universe_guard`` is "refuse" | "warn" | absent/None. Absent by
         # design for every run that is not a screener-universe job (no gate, a gate-only run, a bypass
         # expert), so its absence means "not applicable", not "forgotten" (CLAUDE.md no-defaults rule is
@@ -548,8 +560,12 @@ class DailyBacktestEngine:
         if self._su_mode not in (None, "refuse", "warn"):
             raise ValueError(f"screener_universe_guard must be 'refuse', 'warn' or None, got {self._su_mode!r}")
         self._su_loaded = frozenset(config["enabled_instruments"]) if self._su_mode else frozenset()
-        self._su = {"decisions": 0, "gate_selected": 0, "outside_static_universe": 0,
-                    "first_examples": [], "_last_as_of": None}
+        # The job's STATIC universe (when the trial config carries it next to the per-trial pruned list that is
+        # ``enabled_instruments``): lets a violation say WHICH set was wrong.  Absent = both are the same list.
+        self._su_static = (frozenset(config["screener_static_universe"])
+                           if self._su_mode and "screener_static_universe" in config else self._su_loaded)
+        self._su = {"decisions": 0, "gate_selected": 0, "outside_static_universe": 0, "outside_pruned_only": 0,
+                    "first_examples": [], "_last_allowed": None}
         # BYPASS-expert (FactorRanker) per-run manager cache. The portfolio manager
         # holds only run-CONSTANT state (the resolver expert/account instances + ids), so building
         # it ONCE per expert avoids an ExpertInstance DB query on every rebalance bar.
@@ -1048,7 +1064,7 @@ class DailyBacktestEngine:
         if self._screener_runtime:
             allowed = _screened_symbols_for_bar(
                 self._screener_runtime, as_of_dt, self._screened_cache,
-                intraday=self.price.is_intraday)
+                intraday=self.price.is_intraday, gate=getattr(self, "_screen_gate", None))
             if allowed is not None:
                 if self._su_mode:
                     self._note_screener_selection(allowed, as_of_dt)
@@ -1057,19 +1073,26 @@ class DailyBacktestEngine:
         return universe, entry_universe
 
     def _note_screener_selection(self, allowed: List[str], as_of_dt: datetime) -> None:
-        """Count one decision's gate selection against the run's loaded universe (once per distinct
-        decision instant: several experts share it)."""
+        """Count one gate selection against the run's loaded universe.  The gate memoises its answer per
+        decision key (screen day / time), so a repeated answer is the SAME list object: it is counted once
+        per decision, not at every bar that asks."""
         g = self._su
-        if g["_last_as_of"] == as_of_dt:
+        if g["_last_allowed"] is allowed:
             return
-        g["_last_as_of"] = as_of_dt
+        g["_last_allowed"] = allowed
         g["decisions"] += 1
         g["gate_selected"] += len(allowed)
         for sym in allowed:
-            if sym not in self._su_loaded:
-                g["outside_static_universe"] += 1
-                if len(g["first_examples"]) < 10 and all(e["symbol"] != sym for e in g["first_examples"]):
-                    g["first_examples"].append({"symbol": sym, "as_of": str(as_of_dt)})
+            if sym in self._su_loaded:
+                continue
+            if sym in self._su_static:
+                g["outside_pruned_only"] += 1           # inside the job's static universe: the PRUNE is wrong
+                kind = "outside_pruned_inside_static"
+            else:
+                g["outside_static_universe"] += 1       # outside the static universe: the SUPERSET is wrong
+                kind = "outside_static"
+            if len(g["first_examples"]) < 10 and all(e["symbol"] != sym for e in g["first_examples"]):
+                g["first_examples"].append({"symbol": sym, "as_of": str(as_of_dt), "kind": kind})
 
     def screener_universe_record(self) -> Optional[Dict[str, Any]]:
         """``results["screener_universe"]``, or None when the guard does not apply to this run."""
@@ -1077,24 +1100,32 @@ class DailyBacktestEngine:
             return None
         g = self._su
         return {"mode": self._su_mode, "decisions": g["decisions"], "gate_selected": g["gate_selected"],
-                "outside_static_universe": g["outside_static_universe"],
+                "outside_static_universe": g["outside_static_universe"] + g["outside_pruned_only"],
+                "outside_static_only": g["outside_static_universe"],
+                "outside_pruned_inside_static": g["outside_pruned_only"],
                 "first_examples": list(g["first_examples"])}
 
     def refuse_if_screener_universe_outside(self) -> None:
         """RAISE ``ScreenerUniverseRefusal`` when the gate selected any symbol outside the loaded
         universe and the guard is 'refuse'; with 'warn' (a stored pre-superset row that keeps its frozen
-        list) log ONE loud WARNING with the counts instead."""
+        list) log ONE loud WARNING with the counts instead.  The message says WHICH set was violated."""
         rec = self.screener_universe_record()
         if rec is None or not rec["outside_static_universe"]:
             return
+        which = []
+        if rec["outside_pruned_inside_static"]:
+            which.append(f"{rec['outside_pruned_inside_static']} selected symbols are outside this trial's PRUNED "
+                         f"preload but inside the job's static universe (the per-trial prune is wrong)")
+        if rec["outside_static_only"]:
+            which.append(f"{rec['outside_static_only']} selected symbols are outside the job's STATIC universe "
+                         f"(the superset derivation is wrong)")
         msg = (f"{rec['outside_static_universe']} of {rec['gate_selected']} screener gate selections over "
-               f"{rec['decisions']} decisions are NOT in the run's static universe "
-               f"({len(self._su_loaded)} symbols loaded) and could never be traded; first: {rec['first_examples']}")
+               f"{rec['decisions']} decisions are NOT in the run's loaded universe "
+               f"({len(self._su_loaded)} symbols loaded) and could never be traded: " + "; ".join(which) +
+               f"; first: {rec['first_examples']}")
         if self._su_mode == "refuse":
             raise ScreenerUniverseRefusal(
-                f"Backtest refused: {msg}. Under the superset rule the static universe holds every "
-                f"symbol any genome's gate can select, so the superset derivation is wrong or the list "
-                f"was altered.", gate_selected=rec["gate_selected"], outside=rec["outside_static_universe"],
+                f"Backtest refused: {msg}.", gate_selected=rec["gate_selected"], outside=rec["outside_static_universe"],
                 examples=rec["first_examples"])
         logger.warning(f"[daily_engine] SCREENER UNIVERSE (legacy frozen list, results are NOT "
                        f"comparable with a superset-universe run): {msg}")

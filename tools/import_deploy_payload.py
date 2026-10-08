@@ -410,6 +410,10 @@ def main() -> int:
             # The universe is part of WHAT WAS SCORED, so it wins over the run's base settings
             # for the same reason the forced gates do.
             expert_params = {**expert_params, **universe_params}
+            # NOTHING is left to StockScreener's defaults (price_min 20, volume_min 500,000, float_min 10M ...):
+            # every selection key is written explicitly (the "off" value for a bound the backtest never stated)
+            from ba2_common.core.deploy_parity import complete_screener_settings
+            expert_params = {**expert_params, **complete_screener_settings(expert_params)}   # None resolved to the table value, never written
             print(f"universe: {len(universe_params)} screener setting(s) carried into "
                   f"expert_params ({SCREENER_UNIVERSE_SETTING}="
                   f"{universe_params[SCREENER_UNIVERSE_SETTING]!r})")
