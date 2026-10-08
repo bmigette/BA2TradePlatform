@@ -25,6 +25,10 @@ import sys
 from pathlib import Path
 
 spec = sys.argv[1]
+# +norebase: MEASUREMENT ONLY -- switch off the fill-time re-base of the entry's stop/target (the
+# backtest then keeps the pre-fill levels, as it did before 2026-10-07). The pair of the fix, for A/B.
+norebase = "+norebase" in spec
+spec = spec.replace("+norebase", "")
 newskip = spec.endswith("+skip")
 spec = spec[:-5] if newskip else spec
 variant, _, vtime = spec.partition("@")
@@ -84,6 +88,8 @@ from ba2_common.core.db import get_instance as _gi  # noqa: E402
 from ba2_common.core.models import Transaction as _Tx  # noqa: E402
 from ba2_common.core.types import AssetClass as _AC  # noqa: E402
 
+if norebase:
+    _BA._MEASURE_NO_FILL_REBASE = True
 _ENTRIES = {}
 _orig_fill = _BA._apply_fill
 
@@ -103,7 +109,16 @@ def _cap_fill(self, order, fill_px, as_of):
                 "clock_bar": self._price.bar_at(order.symbol, as_of)}
     except Exception as e:  # noqa: BLE001 - never perturb the run
         _ENTRIES[-1] = {"err": repr(e)}
-    return _orig_fill(self, order, fill_px, as_of)
+    out = _orig_fill(self, order, fill_px, as_of)
+    try:
+        # "sl"/"tp" above are the PRE-fill levels; these are what is enforced after the fill.
+        if order.transaction_id in _ENTRIES:
+            tx = _gi(_Tx, order.transaction_id)
+            _ENTRIES[order.transaction_id]["sl_after_fill"] = tx.stop_loss
+            _ENTRIES[order.transaction_id]["tp_after_fill"] = tx.take_profit
+    except Exception as e:  # noqa: BLE001 - never perturb the run
+        _ENTRIES[-2] = {"err": repr(e)}
+    return out
 
 
 _BA._apply_fill = _cap_fill

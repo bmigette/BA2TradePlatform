@@ -434,8 +434,10 @@ def test_config_entry_rules_reach_build_experts_and_set_stop_loss(monkeypatch):
         # CREATED (still PENDING/unfilled) — so ``order_open_price`` falls back to the
         # CURRENT market price at evaluation time (D1's ~100, see TradeActions.py's
         # "falling back to current market price" path), not the eventual D2-open fill
-        # price. -5% of 100 -> 95.0.
-        assert txn.stop_loss == pytest.approx(95.0)
+        # price. -5% of 100 -> 95.0 ...
+        # ... and when the entry FILLS (D2 open 102) the stop is re-based to the real fill, as
+        # live does (tpsl_fill_rebase): 102 * 0.95 = 96.9. Before 2026-10-07 this stayed 95.0.
+        assert txn.stop_loss == pytest.approx(96.9)
     finally:
         ctx.__exit__(None, None, None)
 

@@ -10,6 +10,8 @@ from typing import Any
 #:   AnalysisFailureRefusal -- more than 5% of an expert's analysis passes raised (owner decision
 #:                             2026-10-07: "it should fail the job for analysis");
 #:   StaleAnchorPrice       -- the intraday anchor-price (look-ahead) guard was violated;
+#:   FillRebaseRefusal      -- too many stops could not be re-based to their fill (no anchor);
+#:   FillRebaseDisabled     -- the measurement-only no-re-base hook was on in an optimization;
 #:   StaleMarkToMarket / ComboSettlementRefused -- engine-level refusals that already end the run.
 JOB_FATAL_ERROR_TYPES = frozenset({
     "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
@@ -18,6 +20,7 @@ JOB_FATAL_ERROR_TYPES = frozenset({
     "MarketCalendarUnavailable", "NotARegularSession", "RiskFreeRateUnavailable",
     "MacroAvailabilityUnknown",
     "AnalysisFailureRefusal", "StaleAnchorPrice", "StaleMarkToMarket", "ComboSettlementRefused",
+    "FillRebaseRefusal", "FillRebaseDisabled",
 })
 
 
