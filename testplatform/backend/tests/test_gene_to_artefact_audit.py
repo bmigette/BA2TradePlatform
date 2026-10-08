@@ -285,17 +285,43 @@ def _backtest_cfg(strat, expert, *, interval="5min", with_times=True):
     return cfg
 
 
+_AUDIT_STORE: dict = {}
+
+
+def _audit_metric_store():
+    """A real (tiny) screener metric store: the candidate-bound step opens the store and, since the
+    silent fall-back to the full band was removed (``ba2_providers.screener.universe_superset``), a
+    store that cannot be read fails the trial. One symbol, weekly scans across the audited window;
+    built once per process in a temp dir removed at exit."""
+    if "path" not in _AUDIT_STORE:
+        import atexit
+        import shutil
+        import tempfile
+        import pandas as pd
+        from ba2_providers.screener import metric_store as ms
+
+        d = tempfile.mkdtemp(prefix="gene-audit-store-")
+        atexit.register(shutil.rmtree, d, True)
+        scans = pd.date_range("2024-01-06", "2024-06-01", freq="7D").strftime("%Y-%m-%d")
+        rows = [{"date": x, "symbol": "AAPL", "market_cap": 3e12, "price": 20.0, "close": 20.0,
+                 "volume": 2e6, "sector": "T", "relative_volume": 2.4, "price_drop_pct": 20.0,
+                 "price_drop_pct_22": 20.0} for x in scans]
+        path = os.path.join(d, "ms")
+        ms.write_partitions(path, pd.DataFrame(rows))
+        ms.clear_store_memo()
+        _AUDIT_STORE["path"] = path
+    return _AUDIT_STORE["path"]
+
+
 def _hoisted(screener):
     """The run-level hoisted state ``_build_daily_trial_config`` reads for a screener run.
 
-    The store PATH need not exist: the only place the file is opened is the candidate-bound
-    optimisation, which is wrapped in its own try/except and falls back to the full band. The
-    ``screener_runtime`` block this audit traces to is built before that, from
-    ``normalize_screener_settings`` alone."""
+    The store must be loadable (``_audit_metric_store``): the candidate-bound step opens it and a
+    failure to read it propagates. The ``screener_runtime`` block this audit traces to is built
+    from ``normalize_screener_settings`` alone."""
     if not screener:
         return None
-    return {"screener_store": os.path.join(os.path.dirname(_LAUNCHER_PATH),
-                                           "no-such-metric-store.parquet"),
+    return {"screener_store": _audit_metric_store(),
             "screener_base": {}, "screener_cadence_days": 7}
 
 
