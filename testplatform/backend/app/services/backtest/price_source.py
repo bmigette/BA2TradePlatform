@@ -405,8 +405,8 @@ def _is_intraday(interval: str) -> bool:
     """True for sub-daily bar intervals (1m/5m/15m/30m/1h/...). Daily and coarser
     (1d/1wk/1mo) are False — those keep calendar-date bar keys. Cached: the interval is
     constant for a run but this was called ~200k×/backtest (per price lookup)."""
-    iv = (interval or "1d").lower()
-    return iv.endswith("m") or iv.endswith("h") or iv.endswith("min")
+    from ba2_providers.screener.universe_superset import interval_is_intraday   # the ONE classifier
+    return interval_is_intraday(interval or "1d")
 
 
 @lru_cache(maxsize=4096)
@@ -837,6 +837,35 @@ class AsOfPriceSource:
         day0 = (key // _NS_PER_DAY) * _NS_PER_DAY
         start = bisect.bisect_left(k, day0)
         return float(self._v[symbol][start:end].sum()) if end > start else 0.0
+
+    def screener_now_price(self, symbol: str, as_of: Any) -> Optional[float]:
+        """"Now" for the SCREENER SIMULATION only (``ba2_providers.screener.live_sim``): what live's quote shows
+        at the instant ``as_of``.
+
+        OWNER-APPROVED EXCEPTION (2026-10-08), SCREENER ONLY, to "only bars that ended at or before the
+        decision instant": live's screener takes its quote 30-90 seconds after the open, which no ENDED bar
+        can represent.  So, on an intraday clock:
+          * a bar of T's own session has ENDED -> its close (identical to ``decision_price``);
+          * none has (T is inside the session's FIRST bar) -> the OPEN of that first bar (the opening print).
+        Never used for anything but the screener gate (``screener_gate``); guarded by
+        ``test_no_bar_price_in_decision_code`` (the one allowlisted call site).  ``None`` = nothing knowable
+        (the gate then falls back to the previous close, as live does without a quote).
+        Daily clock: the close of the bar stamped ``as_of`` (``decision_price``), see the screener gate."""
+        k = self._keys.get(symbol)
+        if k is None or not len(k):
+            return None
+        if not self._intraday:
+            return self.decision_price(symbol, as_of)
+        key = _key64(as_of, self._interval)
+        span = _interval_ns(self._interval)
+        day0 = (key // _NS_PER_DAY) * _NS_PER_DAY
+        f = bisect.bisect_right(k, key - span) - 1             # latest bar that has ENDED at T
+        if f >= 0 and k[f] >= day0:
+            return float(self._c[symbol][f])
+        i = bisect.bisect_right(k, key) - 1                     # the bar covering T
+        if i >= 0 and k[i] >= day0 and key - k[i] < span and (i == 0 or k[i - 1] < day0):
+            return float(self._o[symbol][i])                    # the session's opening print
+        return None
 
     # ---- loading -----------------------------------------------------------
     def preload(

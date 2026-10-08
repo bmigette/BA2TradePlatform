@@ -104,12 +104,19 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
             f"--recompute-universe: optimization of row {row_id} stores no screener gene ranges "
             f"(parameter_ranges has no 'screener:*' keys): the loosest values cannot be derived")
     so = bt_block["screener_opt"]
-    df = ms.load_store(so["store"])
     interval = bt_block["execution_interval"]
     excluded = list(bt_block.get("excluded_instruments") or [])
-    new = us.static_universe(df, str(bt_block["start_date"])[:10], str(bt_block["end_date"])[:10],
-                             so["base_settings"], ranges, intraday=us.interval_is_intraday(interval),
-                             excluded_symbols=excluded)
+    if so.get("criteria_version"):
+        # a row of the live-simulation gate: its static universe is computed by the SAME function the launch used
+        from app.services.backtest import screener_gate as sg
+        new = sg.static_universe(sg.get_panel(so["panel"]), str(bt_block["start_date"])[:10],
+                                 str(bt_block["end_date"])[:10], so["base_settings"], ranges,
+                                 intraday=us.interval_is_intraday(interval), excluded_symbols=excluded)
+    else:
+        df = ms.load_store(so["store"])
+        new = us.static_universe(df, str(bt_block["start_date"])[:10], str(bt_block["end_date"])[:10],
+                                 so["base_settings"], ranges, intraday=us.interval_is_intraday(interval),
+                                 excluded_symbols=excluded)
     cdir = os.path.join(CACHE_FOLDER, "FMPOHLCVProvider")
     ivs = sorted({interval, "1d"})
 
@@ -128,8 +135,15 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
                        f"{'/'.join(ivs)} OHLCV from the screen: {', '.join(uncached)}")
     out["screener_universe_rule"] = us.RULE_ID
     old_n = len(bt_block.get("enabled_instruments") or [])
+    # NEVER silent: an exclusion must not shrink a measurement's universe without being on the record (printed by
+    # the re-run tools AND written to their output JSON from ``screener_universe_recompute_note``)
+    out["_universe_recompute_note"] = {
+        "static_universe_size": len(out["enabled_instruments"]), "previous_size": old_n,
+        "computed_size": len(new), "excluded_for_missing_cache": list(uncached),
+        "criteria_version": so.get("criteria_version")}
     logger.warning(f"--recompute-universe row {row_id}: static universe {old_n} -> "
-                   f"{len(out['enabled_instruments'])} symbols (rule {us.RULE_ID})")
+                   f"{len(out['enabled_instruments'])} symbols (rule {us.RULE_ID}; computed {len(new)}, "
+                   f"{len(uncached)} excluded for missing cache files)")
     return out
 
 
@@ -223,6 +237,12 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None,
     so = bt_block.get("screener_opt")
     if isinstance(so, dict) and so.get("store") and not os.path.isdir(so["store"]):
         bt_block["screener_opt"] = {**so, "store": SCREENER_STORE_DIR}
+        so = bt_block["screener_opt"]
+    if isinstance(so, dict) and so.get("panel") and not os.path.isdir(so["panel"]):
+        # the daily panel lives under the cache root: on another machine it is THIS machine's copy
+        from ba2_common.config import CACHE_FOLDER
+        from ba2_providers.screener import live_sim as _ls
+        bt_block["screener_opt"] = {**so, "panel": _ls.panel_dir_for(CACHE_FOLDER)}
 
     if recompute_universe:
         if not bt_block.get("screener_opt"):
@@ -240,6 +260,8 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None,
     trial_cfg["backtest_id"] = bt.id
     trial_cfg["name"] = bt.name
     trial_cfg["persist_trading_db"] = True
+    if bt_block.get("_universe_recompute_note"):
+        trial_cfg["screener_universe_recompute_note"] = bt_block["_universe_recompute_note"]
     if hoisted is not None and bt_block.get("screener_universe_rule") != _SUPERSET_RULE_ID:
         trial_cfg["screener_universe_legacy_note"] = legacy_universe_note(
             bt_block, hoisted, decoded, row_id=bt.id)

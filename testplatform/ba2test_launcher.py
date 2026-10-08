@@ -275,10 +275,29 @@ def _cmd_prewarm(args) -> int:
     # ONE key resolver, shared with the API handler (env first, then the app-settings DB).
     keys = resolve_keys()
 
-    symbols = _parse_symbols_arg(args.symbols)
+    symbols = _parse_symbols_arg(args.symbols) if args.symbols else []
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
-    if not symbols:
-        sys.exit("ba2-test prewarm: --symbols is empty.")
+    if not symbols and not args.screener_panel:
+        sys.exit("ba2-test prewarm: --symbols is empty (or pass --screener-panel --screener-store ...).")
+
+    # SCREENER PANEL (criteria live-daily-v1): every input of the screener simulation (the vendor's share table and
+    # per-symbol share history, the market-cap / float caches, the daily panel itself) for the universe of
+    # --screener-store.  Resumable; an up-to-date panel is a no-op.  Needed by every classic `optimize --screener`
+    # job: a job whose panel is missing, stale for its window, or built under another definition REFUSES to launch.
+    if args.screener_panel:
+        from app.services.prewarm_fetchers import prewarm_screener_panel
+        if not args.screener_store:
+            sys.exit("ba2-test prewarm --screener-panel: --screener-store is required (it defines the universe)")
+        try:
+            panel_summary = prewarm_screener_panel(
+                args.screener_store, args.start, args.end, fmp_key=keys["fmp"], workers=args.workers,
+                force=args.force_panel, log=lambda msg: print(msg, flush=True))
+        except PrewarmConfigError as e:
+            print(f"!! ba2-test prewarm --screener-panel aborted: {e}")
+            return 1
+        print(f">> screener panel summary: {panel_summary}", flush=True)
+        if not symbols:
+            return 0
 
     # end_date bounds only the in-Python filtering (the per-symbol histories are full
     # fetches), but thread it through for correctness. Default = now. Use a tz-aware
@@ -585,6 +604,12 @@ def _cmd_build_screener_metrics(args) -> int:
         max_lookback=getattr(args, "max_lookback", 30) or 30,
         max_workers=getattr(args, "workers", 8) or 8)
     print(f"build-screener-metrics: {summary}")
+    if getattr(args, "daily_panel", False):
+        # the store's universe is now known: produce the simulation data for it (same function as prewarm)
+        from app.services.prewarm_fetchers import prewarm_screener_panel
+        ps = prewarm_screener_panel(args.store, args.start, args.end, fmp_key=api_key, workers=args.workers or 4,
+                                    log=lambda msg: print(msg, flush=True))
+        print(f"build-screener-metrics: daily panel {ps}")
     return 0
 
 
@@ -6920,9 +6945,34 @@ def _cmd_optimize(args) -> int:
             # Other genes unchanged. Default (no band) keeps the original large-cap-floor behaviour.
             _cap_band = getattr(args, "screener_cap_band", None)
             _scr_opt, base = _us.apply_cap_band(_SCREENER_OPT, base, _cap_band)
+            # LIVE-SIMULATION gate (criteria live-daily-v1): every CLASSIC screener job is gated by the daily
+            # criteria panel (the live screener's own criteria, one evaluation per decision day).  The bypass
+            # expert (FactorRanker) builds its universe from the weekly store itself and is NOT covered.
+            # The panel must cover the job's window, carry this criteria version, and the launch REFUSES with
+            # the list of what is missing (build: `ba2-test prewarm --screener-panel ...`).
+            _use_sim = not spec.get("bypass")
+            _panel_dir = None
+            if _use_sim:
+                from ba2_providers.screener import live_sim as _ls
+                from ba2_common.config import CACHE_FOLDER as _CF0
+                _panel_dir = getattr(args, "screener_panel", None) or _ls.panel_dir_for(_CF0)
+                _probs = _ls.panel_problems(_panel_dir, args.start, args.end)
+                if _probs:
+                    sys.exit("optimize: --screener REFUSED: the daily screener-criteria panel cannot serve this "
+                             "job:\n  - " + "\n  - ".join(_probs) +
+                             "\nBuild / refresh it (and the vendor share data it needs) with:\n"
+                             f"  ba2-test prewarm --screener-panel --screener-store {args.screener_store} "
+                             f"--start {args.start} --end {args.end}\n"
+                             "or `ba2-test build-screener-metrics ... --daily-panel`. Remote workers receive it with "
+                             "`cache push` (directory screener/daily_panel, ~0.8 GB).")
             backtest_block["screener_opt"] = {
                 "store": args.screener_store,
                 "base_settings": base,
+                **({"criteria_version": _ls.CRITERIA_VERSION, "panel": _panel_dir} if _use_sim else {}),
+                # the ranges the static universe is the superset of: a genome outside them is refused
+                "declared_ranges": {k[len("screener_"):] if k.startswith("screener_") else k:
+                                    {"min": v["min"], "max": v["max"]}
+                                    for k, v in _scr_opt.items() if v and v.get("optimize")},
                 "cadence_days": int(args.screener_cadence_days),  # default 7 = weekly
                 # BYPASS experts (e.g. FactorRanker) ignore the classic entry-gate path, so the
                 # CLASSIC `screener_runtime` gate (which gates entries to the per-day screened
@@ -6949,9 +6999,16 @@ def _cmd_optimize(args) -> int:
             # REFUSES the launch (ScreenerUniverseError): the loosest value is never guessed.
             _ranges = _us.gene_ranges_from_opt(_scr_opt)
             try:
-                enabled = _us.static_universe(
-                    _store_df, args.start, args.end, base, _ranges,
-                    intraday=_us.interval_is_intraday(args.interval))
+                if _use_sim:
+                    # the SAME selection function as the per-decision gate and the per-trial prune
+                    from app.services.backtest import screener_gate as _sg
+                    enabled = _sg.static_universe(
+                        _sg.get_panel(_panel_dir), args.start, args.end, base, _ranges,
+                        intraday=_us.interval_is_intraday(args.interval))
+                else:
+                    enabled = _us.static_universe(
+                        _store_df, args.start, args.end, base, _ranges,
+                        intraday=_us.interval_is_intraday(args.interval))
             except _us.ScreenerUniverseError as _e:
                 sys.exit(f"optimize: --screener REFUSED: {_e}")
             if not enabled:
@@ -6982,6 +7039,15 @@ def _cmd_optimize(args) -> int:
                         return False
                 return True
             _uncached = [s for s in enabled if not _has_bars(s)]
+            if getattr(args, "print_universe", False):
+                # DRY RUN for preflights (grid scripts): the job's static universe through the SAME function the
+                # launch uses, and the symbols a launch would refuse on; nothing is submitted.
+                print("PRINT-UNIVERSE " + json.dumps({"static_universe_size": len(enabled),
+                                                      "uncached": _uncached, "interval": args.interval,
+                                                      "rule": _us.RULE_ID,
+                                                      "criteria_version": (_ls.CRITERIA_VERSION if _use_sim else None)}),
+                      flush=True)
+                sys.exit(0 if not _uncached or getattr(args, "screener_exclude_uncached", False) else 3)
             if _uncached:
                 if not getattr(args, "screener_exclude_uncached", False):
                     sys.exit(
@@ -8261,7 +8327,18 @@ def main(argv: "list | None" = None) -> int:
     pw = sub.add_parser("prewarm",
                         help="Pre-build the per-symbol FMP history disk cache for the grid experts "
                              "(ratings/earnings/insider) before the GA pool spawns.")
-    pw.add_argument("--symbols", required=True, help="Comma-separated symbols, or @file.")
+    pw.add_argument("--symbols", default=None,
+                    help="Comma-separated symbols, or @file. Optional with --screener-panel.")
+    pw.add_argument("--screener-panel", action="store_true",
+                    help="Also build / refresh the SCREENER SIMULATION data (criteria live-daily-v1) for the universe "
+                         "of --screener-store: the vendor's share table (1 call) and per-symbol share history, the "
+                         "market-cap / float caches, and the daily criteria panel under <cache>/screener/daily_panel "
+                         "(~0.8 GB; remote workers receive it with `cache push`). Uses --start/--end as the job "
+                         "window (the panel always covers 2019-03-01..today). Resumable.")
+    pw.add_argument("--screener-store", default=None,
+                    help="Metric-store directory whose symbols are the screener universe (with --screener-panel).")
+    pw.add_argument("--force-panel", action="store_true",
+                    help="Re-fetch the vendor share table and rebuild the panel even if they look fresh.")
     pw.add_argument("--experts", default="FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy",
                     help="Comma-separated experts to pre-warm. Supported (from the shared "
                          f"fetcher table): {', '.join(EXPERT_NAMES)}. Default: the 3 core "
@@ -8306,6 +8383,10 @@ def main(argv: "list | None" = None) -> int:
     bm.add_argument("--workers", type=int, default=8,
                     help="Parallel per-symbol fetch threads (default 8). Historical market-cap + "
                          "float fetches are disk-cached, so re-builds are fast regardless.")
+    bm.add_argument("--daily-panel", action="store_true",
+                    help="After the store is built, also produce the screener-simulation data for its universe "
+                         "(vendor share table + history, daily criteria panel): same as "
+                         "`ba2-test prewarm --screener-panel --screener-store <store>`.")
 
     rs = sub.add_parser("recompute-screener-drops",
                         help="CACHE-ONLY rebuild of an existing store's price-drop columns (no FMP).")
@@ -8679,6 +8760,14 @@ def main(argv: "list | None" = None) -> int:
                          "/ large >=$10B): overrides the market-cap gene range + pins market_cap_max so "
                          "each band optimizes a smaller, disjoint universe (keeps 5min feasible). Other "
                          "genes unchanged. Run one job per band.")
+    op.add_argument("--screener-panel", default=None,
+                    help="Directory of the DAILY screener-criteria panel (default <cache>/screener/daily_panel). "
+                         "Classic --screener jobs are gated by it (criteria live-daily-v1); build it with "
+                         "`ba2-test prewarm --screener-panel` or `build-screener-metrics --daily-panel`.")
+    op.add_argument("--print-universe", action="store_true",
+                    help="--screener dry run: print the job's static universe size and the symbols without cached "
+                         "bars (JSON line 'PRINT-UNIVERSE {...}') through the launch's own function, then exit "
+                         "(0 = launchable, 3 = would refuse on uncached symbols). For grid preflights.")
     op.add_argument("--screener-exclude-uncached", action="store_true",
                     help="--screener: a static-universe symbol with no cached OHLCV (execution interval or "
                          "daily) REFUSES the launch by default. With this flag such names are instead "

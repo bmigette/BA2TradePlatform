@@ -14,6 +14,11 @@ from typing import Any
 #:   FillRebaseDisabled     -- the measurement-only no-re-base hook was on in an optimization;
 #:   ScreenerUniverseRefusal -- the screener gate selected symbols outside the job's static universe
 #:                             (the superset derivation is wrong: every genome's result omits tradable picks);
+#:   ScreenerGenomeOutOfRange -- a genome's screener gene lies outside the DECLARED range the static universe
+#:                             was derived from (a seed / pin from another job): its picks would be untradable;
+#:   ScreenerDataOutage / PanelCoverageError / ScreenerGateRefusal -- the screener simulation's data is
+#:                             incomplete (more than 10 % of candidates without bars; panel absent / stale /
+#:                             built under another definition);
 #:   StaleMarkToMarket / ComboSettlementRefused -- engine-level refusals that already end the run.
 JOB_FATAL_ERROR_TYPES = frozenset({
     "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
@@ -24,6 +29,7 @@ JOB_FATAL_ERROR_TYPES = frozenset({
     "AnalysisFailureRefusal", "StaleAnchorPrice", "StaleMarkToMarket", "ComboSettlementRefused",
     "FillRebaseRefusal", "FillRebaseDisabled",
     "ScreenerUniverseRefusal",
+    "ScreenerGenomeOutOfRange", "ScreenerDataOutage", "PanelCoverageError", "ScreenerGateRefusal",
 })
 
 

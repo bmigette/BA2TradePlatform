@@ -93,8 +93,11 @@ def _engine(config):
     mode = config["screener_universe_guard"]
     e._su_mode = mode
     e._su_loaded = frozenset(config["enabled_instruments"]) if mode else frozenset()
-    e._su = {"decisions": 0, "gate_selected": 0, "outside_static_universe": 0, "first_examples": [],
-             "_last_as_of": None}
+    e._su_static = (frozenset(config["screener_static_universe"])
+                    if mode and "screener_static_universe" in config else e._su_loaded)
+    e._su = {"decisions": 0, "gate_selected": 0, "outside_static_universe": 0, "outside_pruned_only": 0,
+             "first_examples": [], "_last_allowed": None}
+    e._screen_gate = None
     return e
 
 
@@ -141,7 +144,7 @@ def test_a_pick_outside_the_static_universe_refuses_the_run(store):
     rec = eng.screener_universe_record()
     assert rec["gate_selected"] > 0 and rec["outside_static_universe"] == rec["gate_selected"]
     assert rec["first_examples"][0]["symbol"] == "S55" and len(rec["first_examples"]) == 1
-    with pytest.raises(DE.ScreenerUniverseRefusal, match="NOT in the run's static universe") as ei:
+    with pytest.raises(DE.ScreenerUniverseRefusal, match="outside the job's STATIC universe") as ei:
         eng.refuse_if_screener_universe_outside()
     assert ei.value.outside == rec["outside_static_universe"] and ei.value.gate_selected == rec["gate_selected"]
     assert H.job_fatal(ei.value) and "ScreenerUniverseRefusal" in H.JOB_FATAL_ERROR_TYPES
@@ -212,8 +215,10 @@ def test_the_universe_rule_is_part_of_the_checkpoint_identity():
 def test_driver_job_names_carry_the_rule_token_and_stay_distinct_from_legacy_names():
     sys.path.insert(0, os.path.join(_ROOT, "tools"))
     import matrix_flags as mf
-    assert mf.with_universe_rule_name("scr-mid-X-S1") == "scr-mid-X-S1-sup1"
-    assert mf.with_universe_rule_name("scr-mid-X-S1-sup1") == "scr-mid-X-S1-sup1"      # idempotent
+    # classic screener jobs also carry the criteria token (live-simulation gate); the bypass FactorRanker does not
+    assert mf.with_universe_rule_name("scr-mid-X-S1") == "scr-mid-X-S1-sup1-lds1"
+    assert mf.with_universe_rule_name("scr-mid-X-S1-sup1-lds1") == "scr-mid-X-S1-sup1-lds1"      # idempotent
+    assert mf.with_universe_rule_name("scr-mid-FR", simulated=False) == "scr-mid-FR-sup1"
     assert mf.UNIVERSE_RULE_NAME_TOKEN == "-sup1" and us.RULE_ID == "superset-v1"
     assert mf.with_universe_rule_name("n") != "n"                                      # a completed OLD name never matches
 
@@ -231,7 +236,7 @@ def test_driver_dry_run_prints_the_static_universe_size_per_job(monkeypatch):
 
 def test_the_driver_forwards_exclude_uncached_and_digests_it():
     src = open(os.path.join(_ROOT, "tools", "run_screener_capband_matrix.py"), encoding="utf-8").read()
-    assert '"--screener-exclude-uncached"' in src and "with_universe_rule_name(name)" in src
+    assert '"--screener-exclude-uncached"' in src and "with_universe_rule_name(name, simulated=strat is not None)" in src
     assert "screener_dry_run_universe_note(args.store, band, job_start, args.end, args.interval)" in src
 
 
@@ -305,6 +310,28 @@ def test_the_rerun_tools_expose_recompute_universe():
 
 
 # ------------------------------------------------------------------- the REAL launcher, end to end
+def _make_panel(cache):
+    """A tiny DAILY criteria panel for the 60 synthetic names: every name sits in the 2-10B band all through the
+    window (close 20, shares = cap / 20), so the loosest filters select all 60."""
+    import numpy as np
+    from datetime import date
+    from ba2_providers.screener import live_sim as ls
+    if ls.read_manifest(str(cache / "screener" / "daily_panel")):
+        return                       # already built in this cache (a mapped panel cannot be replaced on Windows)
+    sessions = [d.date().isoformat() for d in pd.bdate_range("2022-01-03", "2023-04-14")]
+    T = len(sessions)
+    bars, shares = {}, np.zeros((N, T))
+    for i, sym in enumerate(ALL):
+        idx = np.arange(0, T - 15)
+        c = np.full(idx.size, 20.0)
+        bars[sym] = (idx, c, c * 1.01, c * 0.99, c, np.full(idx.size, 2e6))
+        shares[i] = (9.9e9 - i * 1e8) / 20.0
+    arrays = ls.build_panel_arrays(bars, sessions, shares, ALL)
+    ls.save_panel(str(cache / "screener" / "daily_panel"), ALL, sessions, arrays,
+                  {"shares_vendor_snapshot": "t", "shares_lag_days": 45, "fresh_fraction": 1.0,
+                   "last_bar_date": sessions[T - 16], "source_fingerprint": "t"})
+
+
 def _launch(monkeypatch, store, tmp_path, *extra, cached=None, name="sup"):
     """``ba2-test optimize --screener ...`` through ``L._cmd_optimize`` (harness as in
     test_ds_macro_short_side_launcher); returns ``(rc, persisted backtest block)``."""
@@ -321,6 +348,7 @@ def _launch(monkeypatch, store, tmp_path, *extra, cached=None, name="sup"):
     for s in (ALL if cached is None else cached):
         (cache / "FMPOHLCVProvider" / f"{s}_1d.parquet").write_bytes(b"")
     monkeypatch.setattr(bcfg, "CACHE_FOLDER", str(cache))
+    _make_panel(cache)
     monkeypatch.setattr(SOH, "handle_strategy_optimization", lambda task_id, payload: {"status": "completed"})
     monkeypatch.setattr(L, "_persist_top_backtests", lambda *a, **k: 0)
     captured = {}
@@ -372,3 +400,21 @@ def test_launcher_exclude_uncached_records_the_exclusion_on_the_run(store, tmp_p
     assert rc == 0
     assert "S10" not in block["enabled_instruments"] and len(block["enabled_instruments"]) == N - 1
     assert block["excluded_instruments"] == ["S10"]              # the gate excludes it too: guard stays at 0
+
+
+def test_print_universe_dry_run_prints_the_launch_universe_and_exits(store, tmp_path, monkeypatch, capsys):
+    """Preflights (the grid shell scripts) ask the launcher itself instead of re-deriving the universe."""
+    with pytest.raises(SystemExit) as ei:
+        _launch(monkeypatch, store, tmp_path, "--print-universe", name="supP")
+    assert ei.value.code == 0
+    out = capsys.readouterr().out
+    line = [l for l in out.splitlines() if l.startswith("PRINT-UNIVERSE ")][0]
+    import json as _json
+    got = _json.loads(line[len("PRINT-UNIVERSE "):])
+    assert got["static_universe_size"] == N and got["uncached"] == [] and got["rule"] == us.RULE_ID
+    assert got["criteria_version"] == "live-daily-v1"
+    other = tmp_path / "second"
+    other.mkdir()
+    with pytest.raises(SystemExit) as ei2:
+        _launch(monkeypatch, store, other, "--print-universe", cached=[x for x in ALL if x != "S10"], name="supQ")
+    assert ei2.value.code == 3
