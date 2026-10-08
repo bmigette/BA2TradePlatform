@@ -12,6 +12,7 @@ Pipeline stages:
     4. Filter  – bulk price-drop check on ranked list, stop at N
 """
 
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +20,7 @@ from ba2_common.config import get_app_setting
 from ba2_common.logger import logger
 from ba2_common.core.replay.context import capture_aware_submit
 from ba2_common.core.replay.observe import observe_provider
+from ba2_providers.fmp_common import FMPError
 
 
 #: ONE window per symbol per day, wide enough for every pass a screen makes.
@@ -36,6 +38,27 @@ from ba2_common.core.replay.observe import observe_provider
 #: filter without re-fragmenting the cache, and the extra bars cost one payload rather
 #: than one request per pass.
 SCREENER_HISTORY_WINDOW_DAYS = 400
+
+#: LIVE ONLY. A history fetch whose failed symbols exceed this fraction of the symbols it had
+#: to fetch (or in which EVERY chunk failed) raises ScreenerDataError instead of returning a
+#: silently smaller list. 2026-10: four straight Monday FactorRanker screens returned 0
+#: candidates and nothing said whether the filters or an FMP failure emptied the list.
+SCREENER_DATA_FAILURE_MAX_FRACTION = 0.10
+
+#: Serialises LIVE history fetches (see ``StockScreener._fetch_history_bulk``).
+_HISTORY_SINGLE_FLIGHT = threading.Lock()
+
+
+class ScreenerDataError(FMPError):
+    """The live screen could not fetch enough market data to produce a trustworthy result.
+
+    Raised (live, ``as_of is None``, only) when FMP history/volume fetches failed for more than
+    ``SCREENER_DATA_FAILURE_MAX_FRACTION`` of the requested symbols, when every history chunk
+    failed, when the FMP key is missing, or when the bulk float table could not be fetched. An
+    empty list from the screener therefore means "the filters matched nothing", never "FMP
+    failed". Never raised on the backtest path.
+    """
+
 
 class StockScreener:
     """
@@ -212,7 +235,11 @@ class StockScreener:
         # as_of (historical) screens keep their documented "float is approximate" behaviour.
         float_min = self._settings["screener_float_min"]
         float_max = self._settings["screener_float_max"]
-        if self._as_of is None and (float_min > 0 or float_max > 0):
+        live = self._as_of is None
+        if live:
+            # every stage-accounting key always exists on a live run (0 = the stage dropped none)
+            stats.update(dropped_float=0, dropped_volume_min=0, dropped_volume_max=0, dropped_no_history=0)
+        if live and (float_min > 0 or float_max > 0):
             from ba2_providers.screener.float_filter import filter_by_float
             candidates, f_stats = filter_by_float(candidates, float_min, float_max)
             stats.update(f_stats)
@@ -225,22 +252,28 @@ class StockScreener:
                 return {"results": [], "stats": stats}
 
         # --- Stage 2: volume / RVOL enrichment + live refresh + client-side filters ---
-        # ALWAYS runs. rvol_min == 0 only turns the RVOL *filter* off; the stage's other effects
-        # (average-volume floor/ceiling, and the live price + market-cap refresh that the rank
-        # key and the price-drop test read) must not depend on it.
+        # LIVE: ALWAYS runs. rvol_min == 0 only turns the RVOL *filter* off; the stage's other
+        # effects (average-volume floor/ceiling, and the live price + market-cap refresh that the
+        # rank key and the price-drop test read) must not depend on it.
+        # AS_OF (backtest): unchanged -- runs only when rvol_min > 0 (it fetches history over
+        # HTTP, which a hermetic run forbids).
         rvol_min = self._settings["screener_relative_volume_min"]
-        logger.info(
-            f"StockScreener: stage 2 — volume/RVOL enrichment on {len(candidates)} candidates "
-            f"(min RVOL={rvol_min})"
-        )
-        self._report_progress(
-            f"Fetching live prices for {len(candidates)} candidates (RVOL)...", 0.2
-        )
-        candidates, enrich_stats = self._enrich_with_rvol(candidates, rvol_min)
-        stats.update(enrich_stats)
-        logger.info(
-            f"StockScreener: stage 2 done — {len(candidates)} candidates after the volume filters"
-        )
+        if live or rvol_min > 0:
+            logger.info(
+                f"StockScreener: stage 2 — volume/RVOL enrichment on {len(candidates)} candidates "
+                f"(min RVOL={rvol_min})"
+            )
+            self._report_progress(
+                f"Fetching live prices for {len(candidates)} candidates (RVOL)...", 0.2
+            )
+            float_dropped = stats.get("dropped_float", 0)
+            candidates, enrich_stats = self._enrich_with_rvol(candidates, rvol_min)
+            stats.update(enrich_stats)
+            if live:
+                stats["dropped_float"] += float_dropped   # the float stage's drops, not the enrich's 0
+            logger.info(
+                f"StockScreener: stage 2 done — {len(candidates)} candidates after the volume filters"
+            )
 
         if not candidates:
             self._report_progress("No candidates after volume filters.", 1.0)
@@ -437,6 +470,26 @@ class StockScreener:
         return result
 
     def _fetch_history_bulk(
+        self,
+        symbols: List[str],
+        lookback_days: int,
+        chunk_size: int = 5,
+        max_workers: int = 8,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Single-flight wrapper (LIVE only) around ``_fetch_history_bulk_impl``.
+
+        Screens of several instances start within the same second at 09:30 and ask for
+        overlapping symbols; the per-symbol cache is only consulted BEFORE a fetch, so without
+        this they all miss together and fetch the same bars concurrently. Serialising the live
+        fetch lets the first screen fill the cache and the others read it. The as_of
+        (backtest) path is not locked.
+        """
+        if self._as_of is not None:
+            return self._fetch_history_bulk_impl(symbols, lookback_days, chunk_size, max_workers)
+        with _HISTORY_SINGLE_FLIGHT:
+            return self._fetch_history_bulk_impl(symbols, lookback_days, chunk_size, max_workers)
+
+    def _fetch_history_bulk_impl(
         self,
         symbols: List[str],
         lookback_days: int,
@@ -662,9 +715,14 @@ class StockScreener:
         if price_max > 0:
             filters["price_max"] = price_max
 
-        # Volume floor/ceiling are NOT sent to the vendor: its ``volumeMoreThan`` tests the
-        # CURRENT session's volume so far (near zero at the 09:30 open), not an average. Both are
+        # Volume floor/ceiling. LIVE: NOT sent to the vendor -- its ``volumeMoreThan`` tests the
+        # CURRENT session's volume so far (near zero at the 09:30 open), not an average; both are
         # applied in ``_enrich_with_rvol`` on the average volume of the last finished sessions.
+        # AS_OF: unchanged -- FMPHistoricalScreenerProvider applies ``volume_min`` itself.
+        if self._as_of is not None:
+            volume_min = self._settings["screener_volume_min"]
+            if volume_min > 0:
+                filters["volume_min"] = volume_min
 
         # Market cap
         mcap_min = self._settings["screener_market_cap_min"]
@@ -676,7 +734,11 @@ class StockScreener:
             filters["market_cap_max"] = mcap_max
 
         # Float bounds are NOT sent to the vendor either (its screener has no float parameter);
-        # ``screen`` applies them as stage 1b from the bulk float table.
+        # LIVE ``screen`` applies them as stage 1b from the bulk float table. AS_OF: unchanged.
+        if self._as_of is not None:
+            float_max = self._settings["screener_float_max"]
+            if float_max > 0:
+                filters["float_max"] = float_max
 
         # Restrict to US exchanges — all BA2 broker accounts are US (Alpaca), so
         # foreign listings (e.g. *.TO Toronto) are never tradable. US-listed ADRs
@@ -712,7 +774,8 @@ class StockScreener:
             if c.get("symbol")
         ]
         if not all_symbols:
-            return [], {"dropped_rvol": 0, "dropped_volume_min": 0, "dropped_volume_max": 0}
+            return [], {"dropped_rvol": 0, "dropped_float": 0, "dropped_volume_max": 0,
+                        **({"dropped_volume_min": 0, "dropped_no_history": 0} if self._as_of is None else {})}
 
         # volume/avgVolume/RVOL ALWAYS come from daily bars (the last COMPLETE trading
         # session's full-day volume vs. a trailing 20-day average) — live and backtest
@@ -734,16 +797,27 @@ class StockScreener:
         # refresh those three from the real-time quote when not backtesting.
         live_quotes_map = self._fetch_quotes_chunked(all_symbols) if self._as_of is None else {}
 
+        live = self._as_of is None
         volume_min = self._settings["screener_volume_min"]
         volume_max = self._settings["screener_volume_max"]
+        float_min = self._settings["screener_float_min"]   # as_of path only (see below)
+        needs_bars = min_rvol > 0 or volume_min > 0 or volume_max > 0
 
         dropped_rvol = 0
+        dropped_float = 0
         dropped_volume_min = 0
         dropped_volume_max = 0
+        no_history: List[str] = []
 
         enriched: List[Dict[str, Any]] = []
         for c in candidates:
             sym = (c.get("symbol") or "").upper()
+            # LIVE: a symbol with no finished-session bars cannot be checked against ANY volume
+            # bound. Drop it under its own label (never "low volume": a failed history chunk would
+            # otherwise empty a screen under a misleading reason) -- see the loud check below.
+            if live and needs_bars and sym not in quotes_map:
+                no_history.append(sym)
+                continue
             quote = quotes_map.get(sym, {})
             live_quote = live_quotes_map.get(sym, {})
 
@@ -766,7 +840,7 @@ class StockScreener:
             if q_mcap and q_mcap > 0:
                 c["market_cap"] = q_mcap
 
-            # (Float is NOT refreshed here: /quote has no float field. Stage 1b owns it.)
+            # (Float is NOT refreshed here: /quote has no float field. LIVE: stage 1b owns it.)
 
             # --- Client-side filters ---
 
@@ -775,29 +849,57 @@ class StockScreener:
                 dropped_rvol += 1
                 continue
 
-            # Average-volume floor. No bars (avg 0) = cannot be verified = dropped.
-            if volume_min > 0 and avg_vol < volume_min:
-                logger.debug(
-                    f"StockScreener: dropping {sym} — avg volume {avg_vol:,.0f} < {volume_min:,}"
-                )
-                dropped_volume_min += 1
-                continue
+            if live:
+                # Average-volume floor / ceiling (mean of the last <= 20 finished sessions).
+                if volume_min > 0 and avg_vol < volume_min:
+                    logger.debug(
+                        f"StockScreener: dropping {sym} — avg volume {avg_vol:,.0f} < {volume_min:,}"
+                    )
+                    dropped_volume_min += 1
+                    continue
+                if volume_max > 0 and avg_vol > volume_max:
+                    logger.debug(
+                        f"StockScreener: dropping {sym} — avg volume {avg_vol:,.0f} > {volume_max:,}"
+                    )
+                    dropped_volume_max += 1
+                    continue
+            else:
+                # AS_OF path: byte-for-byte the pre-2026-10-08 behaviour.
+                # float_min: 0 means data unavailable, don't filter those out
+                if float_min > 0:
+                    stock_float = c.get("float_shares") or 0
+                    if stock_float > 0 and stock_float < float_min:
+                        logger.debug(
+                            f"StockScreener: dropping {sym} — float {stock_float:,} < {float_min:,}"
+                        )
+                        dropped_float += 1
+                        continue
 
-            # Average-volume ceiling. An unknown average (0) passes.
-            if volume_max > 0 and avg_vol > volume_max:
-                logger.debug(
-                    f"StockScreener: dropping {sym} — avg volume {avg_vol:,.0f} > {volume_max:,}"
-                )
-                dropped_volume_max += 1
-                continue
+                if volume_max > 0:
+                    if volume > volume_max:
+                        logger.debug(
+                            f"StockScreener: dropping {sym} — volume {volume:,} > {volume_max:,}"
+                        )
+                        dropped_volume_max += 1
+                        continue
 
             enriched.append(c)
 
         stats = {
             "dropped_rvol": dropped_rvol,
-            "dropped_volume_min": dropped_volume_min,
+            "dropped_float": dropped_float,
             "dropped_volume_max": dropped_volume_max,
         }
+        if live:
+            stats["dropped_volume_min"] = dropped_volume_min
+            stats["dropped_no_history"] = len(no_history)
+            if no_history and len(no_history) / len(all_symbols) > SCREENER_DATA_FAILURE_MAX_FRACTION:
+                raise ScreenerDataError(
+                    f"StockScreener: no price history for {len(no_history)}/{len(all_symbols)} "
+                    f"candidate(s) (limit {SCREENER_DATA_FAILURE_MAX_FRACTION:.0%}); first 8: "
+                    f"{no_history[:8]}. FMP history likely failed or was rate limited; refusing to "
+                    f"return a silently smaller list."
+                )
         return enriched, stats
 
     def _filter_by_price_drop(

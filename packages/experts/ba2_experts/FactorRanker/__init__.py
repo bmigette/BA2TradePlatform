@@ -19,7 +19,7 @@ from ba2_common.core.interfaces.ExpertDataExportInterface import (
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.models import AnalysisOutput, MarketAnalysis
 from ba2_common.core.knowability import scan_cutoff_date
-from ba2_providers.StockScreener import StockScreener
+from ba2_providers.StockScreener import ScreenerDataError, StockScreener
 from ba2_providers.fmp_common import FMPHermeticViolation
 from ba2_common.core.types import MarketAnalysisStatus, OrderRecommendation, Recommendation
 from ba2_common.logger import get_expert_logger
@@ -439,7 +439,9 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         Default (``screener_store`` unset): runs the configured ``StockScreener``,
         reading the expert's ``screener_*`` settings (part of the base interface) and
         returning the matched symbols (uppercased). Failures degrade to an empty
-        universe rather than raising, so one bad screen doesn't crash the rebalance.
+        universe rather than raising, so one bad screen doesn't crash the rebalance --
+        EXCEPT a LIVE (as_of None) ``ScreenerDataError`` (FMP data could not be fetched),
+        which propagates so the analysis fails with the reason.
 
         ``as_of`` is threaded into both paths so the BACKTEST screens the point-in-time
         universe for that date (the store resolves to the latest scan date <= as_of;
@@ -511,6 +513,11 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             raise
         except Exception as e:
             self.logger.error(f"FactorRanker: screener universe resolution failed: {e}", exc_info=True)
+            if as_of is None and isinstance(e, ScreenerDataError):
+                # LIVE ONLY: a data-fetch failure is not "the filters matched nothing". Let the
+                # analysis fail visibly with the reason instead of a silent empty universe.
+                # Backtests (as_of set) keep the degrade-to-empty behaviour byte-for-byte.
+                raise
             return []
 
     def _resolve_universe_source(self) -> str:

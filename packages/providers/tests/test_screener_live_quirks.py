@@ -108,10 +108,12 @@ def test_screen_applies_float_bounds(monkeypatch):
 
 
 def test_screen_with_float_bound_fails_loudly_when_the_table_is_unavailable(monkeypatch):
+    from ba2_providers.StockScreener import ScreenerDataError
+
     def boom():
-        raise RuntimeError("shares_float/all unavailable")
+        raise ScreenerDataError("shares_float/all unavailable")
     monkeypatch.setattr(ff, "load_float_table", boom)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ScreenerDataError):
         _screen(monkeypatch, [_cand("OK")], {"screener_float_min": 1e7},
                 bars_map={"OK": _bars([1_000_000] * 20)})
 
@@ -164,9 +166,100 @@ def test_volume_min_uses_the_mean_of_the_last_20_finished_sessions(monkeypatch):
     assert out["results"] == []
 
 
-def test_volume_min_drops_a_symbol_with_no_bars(monkeypatch):
-    out, _, _ = _screen(monkeypatch, [_cand("NOBARS")], {"screener_volume_min": 500_000}, bars_map={})
+def _twenty(extra_nobars=0):
+    rows = [_cand(f"S{i}") for i in range(20 - extra_nobars)] + [_cand(f"NB{i}") for i in range(extra_nobars)]
+    bars = {f"S{i}": _bars([1_000_000] * 20) for i in range(20 - extra_nobars)}
+    return rows, bars
+
+
+@pytest.mark.parametrize("setting", [{"screener_volume_min": 500_000}, {"screener_volume_max": 9e9},
+                                     {"screener_relative_volume_min": 0.5}])
+def test_symbol_with_no_bars_is_dropped_as_no_history_whichever_bound_is_set(monkeypatch, setting):
+    # 1 of 20 without bars = 5% <= 10%: dropped under its OWN label, never as "low volume"
+    rows, bars = _twenty(); rows.append(_cand("NOBARS"))
+    out, _, _ = _screen(monkeypatch, rows[:19] + [rows[-1]], setting, bars_map={k: v for k, v in bars.items() if k != "S19"})
+    st = out["stats"]
+    assert "NOBARS" not in {r["symbol"] for r in out["results"]}
+    assert st["dropped_no_history"] == 1
+    assert st["dropped_volume_min"] == 0 and st["dropped_volume_max"] == 0 and st["dropped_rvol"] == 0
+
+
+def test_no_bars_with_no_volume_bound_set_passes(monkeypatch):
+    # nothing needs bars (rvol 0, no floor, no ceiling): a symbol without history is not judged
+    out, _, _ = _screen(monkeypatch, [_cand("NOBARS")], {}, bars_map={})
+    assert [r["symbol"] for r in out["results"]] == ["NOBARS"]
+    assert out["stats"]["dropped_no_history"] == 0
+
+
+def test_too_many_symbols_without_history_fails_loudly(monkeypatch):
+    from ba2_providers.StockScreener import ScreenerDataError, SCREENER_DATA_FAILURE_MAX_FRACTION
+    assert SCREENER_DATA_FAILURE_MAX_FRACTION == 0.10
+    rows, bars = _twenty(extra_nobars=3)          # 15% without history
+    with pytest.raises(ScreenerDataError, match="3/20"):
+        _screen(monkeypatch, rows, {"screener_volume_min": 500_000}, bars_map=bars)
+    rows, bars = _twenty(extra_nobars=2)          # exactly 10%: tolerated
+    out, _, _ = _screen(monkeypatch, rows, {"screener_volume_min": 500_000}, bars_map=bars)
+    assert out["stats"]["dropped_no_history"] == 2
+
+
+def test_fewer_than_20_bars_uses_the_mean_of_what_exists(monkeypatch):
+    bars = {"NEW": _bars([600_000, 800_000, 1_000_000])}          # 3 finished sessions
+    out, _, _ = _screen(monkeypatch, [_cand("NEW")], {"screener_volume_min": 700_000}, bars_map=bars)
+    assert out["results"][0]["avg_volume"] == 800_000.0
+    out, _, _ = _screen(monkeypatch, [_cand("NEW")], {"screener_volume_min": 900_000}, bars_map=bars)
     assert out["results"] == []
+
+
+def test_todays_forming_bar_is_excluded_from_the_average(monkeypatch):
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    bars = _bars([1_000_000] * 20)
+    bars.append({"date": today, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 900_000_000})
+    out, _, _ = _screen(monkeypatch, [_cand("F")], {"screener_volume_max": 5_000_000}, bars_map={"F": bars})
+    assert [r["symbol"] for r in out["results"]] == ["F"]
+    assert out["results"][0]["avg_volume"] == 1_000_000.0
+
+
+def test_every_stage_accounting_key_exists_on_a_live_run(monkeypatch):
+    out, _, _ = _screen(monkeypatch, [_cand("A")], {}, bars_map={})
+    for k in ("dropped_float", "dropped_volume_min", "dropped_volume_max", "dropped_no_history", "dropped_rvol"):
+        assert out["stats"][k] == 0
+
+
+def test_dropped_float_is_the_float_stage_count_after_stage_2(monkeypatch):
+    rows = [_cand("SMALL"), _cand("OK")]
+    bars = {s: _bars([1_000_000] * 20) for s in ("SMALL", "OK")}
+    out, _, _ = _screen(monkeypatch, rows, {"screener_float_min": 1e7}, bars_map=bars)
+    assert out["stats"]["dropped_float"] == 1      # not overwritten by stage 2's own 0
+
+
+# ------------------------------------------------------------------ live vs metric store
+def test_live_avg_volume_equals_the_metric_store_volume_column(monkeypatch):
+    """Live ``avg_volume`` (mean of the last <= 20 finished sessions INCLUDING the latest) is
+    the store's ``volume`` column (``rolling(20, min_periods=1).mean()`` including the day)."""
+    import pandas as pd
+    from ba2_providers.screener.metric_store import compute_daily_metrics
+    vols = [1_000_000 + 37_000 * i + (i % 3) * 11_111 for i in range(45)]
+    idx = pd.date_range("2020-01-01", periods=len(vols), freq="B")
+    ohlcv = pd.DataFrame({"Open": 10.0, "High": 11.0, "Low": 9.0, "Close": 10.0, "Volume": vols}, index=idx)
+    store_vol = compute_daily_metrics(ohlcv)["volume"]
+    sc = S.StockScreener({})
+    bars = [{"date": d.strftime("%Y-%m-%d"), "open": 10, "high": 11, "low": 9, "close": 10, "volume": v}
+            for d, v in zip(idx, vols)]
+    for n in (3, 19, 20, 33, 45):                    # incl. fewer than 20 sessions
+        monkeypatch.setattr(sc, "_fetch_history_bulk", lambda syms, lookback_days, n=n: {"X": bars[:n]})
+        live = sc._quotes_from_bars(["X"])["X"]["avgVolume"]
+        assert live == pytest.approx(round(float(store_vol.iloc[n - 1]), 2))
+
+
+def test_live_rvol_denominator_includes_the_numerator_session_unlike_the_store(monkeypatch):
+    """Documented difference the simulation must mirror: live rvol = V[-1] / mean(last 20 incl. V[-1])."""
+    sc = S.StockScreener({})
+    bars = _bars([1_000_000] * 19 + [3_000_000])
+    monkeypatch.setattr(sc, "_fetch_history_bulk", lambda syms, lookback_days: {"X": bars})
+    q = sc._quotes_from_bars(["X"])["X"]
+    assert q["avgVolume"] == 1_100_000.0 and q["volume"] == 3_000_000
+    assert round(q["volume"] / q["avgVolume"], 2) == 2.73       # the store would give 3.0
 
 
 def test_volume_max_is_an_average_not_the_last_session(monkeypatch):

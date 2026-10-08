@@ -17,15 +17,40 @@ side, and a symbol whose float is UNKNOWN passes.
 
 ``apply_float_filter`` is PURE (no I/O) so the backtest simulation can import it.
 """
+import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from ba2_common.config import get_app_setting
 from ba2_common.logger import logger
 
 FLOAT_ALL_URL = "https://financialmodelingprep.com/api/v4/shares_float/all"
-_FLOAT_TABLE_KEY = "screener:float_table:v4_all"
 # The vendor refreshes daily; share the table across every screen/instance in the process.
 _FLOAT_TABLE_TTL_S = 6 * 3600.0
+#: One download is ~11.6 MB and took ~5 s when measured. Bounded retry: at most 2 attempts of
+#: 45 s with a 5 s pause = ~95 s worst case (the generic helper default would be 4 x 120 s +
+#: 50 s of backoff = ~8.5 min per screen, with the shared vendor gate backing off every other
+#: call in the process meanwhile).
+FLOAT_FETCH_TIMEOUT_S = 45
+FLOAT_FETCH_DELAYS = (5,)
+#: A failed fetch is remembered this long: later screens re-raise the stored error at once
+#: instead of each re-downloading against a vendor that is already refusing us.
+FLOAT_FAILURE_MEMO_S = 300.0
+
+# Single-flight: ~10 instances start screening within half a second at 09:30; the cold load must
+# happen ONCE while the others wait for its result (or its remembered failure).
+_LOCK = threading.Lock()
+_STATE: Dict[str, Any] = {"table": None, "loaded_at": 0.0, "error": None, "failed_at": 0.0}
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+def reset_float_table_cache() -> None:
+    """Forget the cached table and any remembered failure (tests / an explicit refresh)."""
+    with _LOCK:
+        _STATE.update(table=None, loaded_at=0.0, error=None, failed_at=0.0)
 
 
 def apply_float_filter(
@@ -82,25 +107,40 @@ def parse_float_table(rows: Any) -> Dict[str, float]:
 def load_float_table() -> Dict[str, float]:
     """The vendor's bulk float table, cached in-process for 6 h (ONE vendor call per refresh).
 
-    Raises (never returns an empty table silently): a float bound the operator configured must
-    not quietly turn into a no-op because the table could not be fetched.
+    Single-flight (one thread downloads, the others wait on the lock and read the result) and
+    failure-memoising (``FLOAT_FAILURE_MEMO_S``). Raises ``ScreenerDataError`` -- never returns an
+    empty table silently: a float bound the operator configured must not quietly turn into a
+    no-op, and an empty screen must not be read as "the filters matched nothing".
     """
-    from ba2_providers.fmp_common import fmp_http_get, fmp_live_cached
+    from ba2_providers.StockScreener import ScreenerDataError
+    from ba2_providers.fmp_common import fmp_http_get
 
-    api_key = get_app_setting("FMP_API_KEY")
-    if not api_key:
-        raise RuntimeError("float filter configured but FMP_API_KEY is not set")
-
-    def _fetch() -> Dict[str, float]:
-        resp = fmp_http_get(FLOAT_ALL_URL, params={"apikey": api_key, "page": 0},
-                            endpoint="shares-float-all", timeout=120)
-        table = parse_float_table(resp.json())
-        if not table:
-            raise RuntimeError("shares_float/all returned no usable rows")
+    with _LOCK:
+        now = _now()
+        if _STATE["table"] is not None and now - _STATE["loaded_at"] < _FLOAT_TABLE_TTL_S:
+            return _STATE["table"]
+        if _STATE["error"] is not None and now - _STATE["failed_at"] < FLOAT_FAILURE_MEMO_S:
+            raise ScreenerDataError(
+                f"float table unavailable (failure remembered for another "
+                f"{FLOAT_FAILURE_MEMO_S - (now - _STATE['failed_at']):.0f}s): {_STATE['error']}"
+            )
+        try:
+            api_key = get_app_setting("FMP_API_KEY")
+            if not api_key:
+                raise RuntimeError("FMP_API_KEY is not set")
+            resp = fmp_http_get(FLOAT_ALL_URL, params={"apikey": api_key, "page": 0},
+                                endpoint="shares-float-all", timeout=FLOAT_FETCH_TIMEOUT_S,
+                                delays=FLOAT_FETCH_DELAYS)
+            table = parse_float_table(resp.json())
+            if not table:
+                raise RuntimeError("shares_float/all returned no usable rows")
+        except Exception as e:  # noqa: BLE001 - typed and remembered below, never swallowed
+            _STATE.update(error=f"{type(e).__name__}: {e}", failed_at=_now())
+            logger.error(f"Float table fetch failed: {e}")
+            raise ScreenerDataError(f"float table could not be fetched: {type(e).__name__}: {e}") from e
+        _STATE.update(table=table, loaded_at=_now(), error=None)
         logger.info(f"Float table loaded: {len(table)} symbols with a known float")
         return table
-
-    return fmp_live_cached(_FLOAT_TABLE_KEY, _fetch, ttl_seconds=_FLOAT_TABLE_TTL_S)
 
 
 def filter_by_float(

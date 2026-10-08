@@ -104,9 +104,16 @@ def _patch_fmp(monkeypatch, payload):
 
 
 def _no_stage2_data(monkeypatch, sc):
-    """Stage 2 (volume/RVOL/live refresh) always runs; give it no bars and no quotes."""
-    monkeypatch.setattr(sc, "_fetch_history_bulk", lambda syms, lookback_days: {})
-    monkeypatch.setattr(sc, "_fetch_quotes_chunked", lambda syms, *a, **k: {})
+    """Stage 2 (volume/RVOL/live refresh) always runs. Feed it data that is NEUTRAL: 20 finished
+    sessions whose volume equals the payload's volume, and a live quote equal to the payload's
+    price / market cap -- so it must leave every provider value exactly as it was and only ADD
+    ``avg_volume`` (= the volume) and ``relative_volume`` (= 1.0)."""
+    bars = {r["symbol"]: [{"date": f"2020-01-{i + 1:02d}", "open": r["price"], "high": r["price"],
+                           "low": r["price"], "close": r["price"], "volume": r["volume"]}
+                          for i in range(20)] for r in _FMP_SCREENER_PAYLOAD}
+    quotes = {r["symbol"]: {"price": r["price"], "marketCap": r["marketCap"]} for r in _FMP_SCREENER_PAYLOAD}
+    monkeypatch.setattr(sc, "_fetch_history_bulk", lambda syms, lookback_days: bars)
+    monkeypatch.setattr(sc, "_fetch_quotes_chunked", lambda syms, *a, **k: quotes)
 
 
 def test_live_provider_byte_equal_through_pipeline(monkeypatch):
@@ -144,6 +151,10 @@ def test_live_provider_byte_equal_through_pipeline(monkeypatch):
         # Stage 2 always runs now and ADDS avg_volume / relative_volume; every provider key
         # keeps its value.
         assert {k: by_symbol_pipeline[sym][k] for k in drow} == drow
+        # ... and nothing else changes except the two keys stage 2 adds.
+        assert set(by_symbol_pipeline[sym]) - set(drow) == {"avg_volume", "relative_volume"}
+        assert by_symbol_pipeline[sym]["avg_volume"] == drow["volume"]
+        assert by_symbol_pipeline[sym]["relative_volume"] == 1.0
 
     # Live-pipeline ordering contract (rank by market_cap desc) is preserved.
     mcaps = [r["market_cap"] for r in pipeline_results]
