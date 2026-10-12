@@ -297,6 +297,7 @@ class JobManager:
         import threading as _th
         _th.Thread(target=self._ensure_dgs3mo, args=(True,), name="dgs3mo-startup", daemon=True).start()
         self._report_iv_rank_readiness()
+        self._iv_warm_catchup_if_due()
 
         logger.info("JobManager started successfully")
         
@@ -837,6 +838,18 @@ class JobManager:
                         f"{IV_WARM_MINUTE:02d} America/New_York, Mon-Fri (deadline 09:20)")
         except Exception as e:
             logger.error(f"Error scheduling the pre-open ATM-IV warm job: {e}", exc_info=True)
+
+    def _iv_warm_catchup_if_due(self):
+        """An app (re)started between 08:31 and 09:15 ET on a weekday missed the 08:30 cron: run the
+        warm once now, on its own thread (same window/deadline rules as the cron run)."""
+        try:
+            from ..modules.dataproviders.options import atm_iv_task_hook as atm_iv_warm
+            if atm_iv_warm.warm_catchup_due():
+                import threading as _th
+                logger.info("Pre-open ATM-IV warm: app started inside the warm window; running it now")
+                _th.Thread(target=self._execute_iv_warm, name="iv-warm-catchup", daemon=True).start()
+        except Exception as e:
+            logger.error(f"Error starting the ATM-IV warm catch-up: {e}", exc_info=True)
 
     def _execute_iv_warm(self):
         try:
