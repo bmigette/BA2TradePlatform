@@ -108,6 +108,9 @@ REQUEST_TIMEOUT_SECONDS = 20.0        # background calls; alpaca-py sets no time
 TOMBSTONE_RETRY_SESSIONS = 3          # a 'no_bar' tombstone younger than this is retried daily
 PRECEDING_SESSIONS_TRADED = 10        # "normally trades" = had a value in this many prior sessions
 STALE_TMP_SECONDS = 3600
+SPOT_RETRIES = 4                      # transient spot-source failures retried per ensure_filled
+SPOT_BACKOFF_BASE_SECONDS = 5.0
+SPOT_BACKOFF_CAP_SECONDS = 60.0
 
 STATUS_COMPLETE = "complete"
 STATUS_FILLING = "filling"
@@ -127,6 +130,17 @@ class AtmIvUnavailable(RuntimeError):
 
 class SpotUnavailable(AtmIvUnavailable):
     pass
+
+
+class SpotSourceTransient(RuntimeError):
+    """The spot source FAILED to answer (FMP 429/5xx/timeout/connection error, split-calendar fetch
+    failure, a top-up that did not land). That is NOT a statement that the market has no spot:
+    it must never become a ``no_spot`` tombstone. ``ensure_filled`` retries with backoff and, if it
+    still fails, leaves the sessions unresolved (status ``filling``)."""
+
+    @property
+    def cause_name(self) -> str:
+        return type(self.__cause__).__name__ if self.__cause__ is not None else type(self).__name__
 
 
 class BudgetExhausted(RuntimeError):
@@ -461,6 +475,27 @@ class AlpacaContractLister:
 # ---------------------------------------------------------------------------------------------
 # Default spot source: FMP daily close x as-traded split factor
 # ---------------------------------------------------------------------------------------------
+def check_topup_landed(symbol: str, df: pd.DataFrame, end: date,
+                       probe: Callable[[date, date], List[date]]) -> None:
+    """The provider's top-up SWALLOWS an FMP failure (logs a warning, serves the stale parquet), so a
+    cache that ends before ``end`` is ambiguous: the vendor may genuinely have no newer bar, or the
+    top-up may have failed (429). ``probe(after, upto)`` asks the vendor directly (its own errors
+    propagate and are classed transient). Raises ``SpotSourceTransient`` when the vendor HAS bars the
+    cache lacks; returns when it has none (the missing session is then a real ``no_spot``)."""
+    if df is None or df.empty:
+        return
+    d = pd.to_datetime(df["Date"])
+    if getattr(d.dt, "tz", None) is not None:
+        d = d.dt.tz_localize(None)
+    last = d.max().date()
+    if last >= end:
+        return
+    newer = [x for x in probe(last + timedelta(days=1), end + timedelta(days=1)) if x > last]
+    if newer:
+        raise SpotSourceTransient(
+            f"{symbol}: FMP has bars through {max(newer)} but the cache ends {last}: the top-up did not land")
+
+
 class FmpSpotSource:
     """``spots(symbol, start, end) -> {session: as-traded close}``; RAISES SpotUnavailable.
 
@@ -491,7 +526,20 @@ class FmpSpotSource:
         path = os.path.join(config.CACHE_FOLDER, "FMPOHLCVProvider", f"{symbol.upper()}_1d.parquet")
         if not os.path.exists(path):
             raise SpotUnavailable(f"{symbol}: no FMP daily cache at {path}")
-        return pd.read_parquet(path, columns=["Date", "Open", "High", "Low", "Close"]), path
+        df = pd.read_parquet(path, columns=["Date", "Open", "High", "Low", "Close"])
+
+        def probe(after: date, upto: date) -> List[date]:
+            from ba2_providers.fmp_common import fmp_http_get
+            resp = fmp_http_get(f"{provider.BASE_URL}/historical-price-full/{symbol}",
+                                params={"apikey": provider.api_key, "from": after.isoformat(),
+                                        "to": upto.isoformat()},
+                                symbol=symbol, endpoint="historical-price-full")
+            data = resp.json()
+            hist = data.get("historical") if isinstance(data, dict) else None
+            return [pd.Timestamp(r["date"]).date() for r in (hist or [])]
+
+        check_topup_landed(symbol, df, end, probe)
+        return df, path
 
     @staticmethod
     def _default_splits(symbol: str):
@@ -514,7 +562,13 @@ class FmpSpotSource:
     def spots(self, symbol: str, start: date, end: date) -> Dict[date, float]:
         from ba2_common.core.split_basis import (SplitBasisRefused, read_full_fetch_marker,
                                                   resolve_symbol_split_basis)
-        df, path = self._ohlcv_loader(symbol, start, end)
+        try:
+            df, path = self._ohlcv_loader(symbol, start, end)
+        except (AtmIvUnavailable, SpotSourceTransient):
+            raise
+        except Exception as e:  # noqa: BLE001 - a failed fetch is not 'no spot'
+            logger.warning(f"{symbol}: FMP spot fetch failed ({type(e).__name__}: {e}); retried, never tombstoned")
+            raise SpotSourceTransient(f"{symbol}: spot fetch failed: {type(e).__name__}: {e}") from e
         if df is None or df.empty:
             raise SpotUnavailable(f"{symbol}: no daily OHLCV")
         d = pd.to_datetime(df["Date"])
@@ -535,6 +589,11 @@ class FmpSpotSource:
                                                marker=marker)
         except SplitBasisRefused as e:
             raise SpotUnavailable(f"{symbol}: split basis refused: {e}") from e
+        except (AtmIvUnavailable, SpotSourceTransient):
+            raise
+        except Exception as e:  # noqa: BLE001 - split-calendar fetch failure (429/5xx/timeout)
+            logger.warning(f"{symbol}: FMP split calendar failed ({type(e).__name__}: {e}); retried, never tombstoned")
+            raise SpotSourceTransient(f"{symbol}: split calendar failed: {type(e).__name__}: {e}") from e
         out: Dict[date, float] = {}
         for ts, px in zip(pd.DatetimeIndex(days), c):
             day = ts.date()
@@ -888,6 +947,7 @@ class AtmIvHistoryProvider:
                                 f"{len(window)} session(s) to derive")
                 budget = _Budget(max(deadline_seconds - (time.monotonic() - t0), 1.0), self.bucket, self._sleep)
                 reruns = 0
+                spot_tries = 0
                 while True:
                     before = len(self._fresh_sessions(self.read_store(sym)))
                     try:
@@ -897,6 +957,17 @@ class AtmIvHistoryProvider:
                         status, reason = STATUS_UNAVAILABLE, str(e)
                         _warn_once_per_day(f"unavail:{key}", f"ATM-IV history unavailable for {sym}: {e}", today)
                         break
+                    except SpotSourceTransient as e:
+                        spot_tries += 1
+                        spot_reason = f"spot source failing: {e.cause_name}"
+                        delay = self._spot_backoff(spot_tries)
+                        if spot_tries > SPOT_RETRIES or budget.remaining_seconds(1e9) <= delay + 1.0:
+                            status, reason = STATUS_FILLING, spot_reason
+                            _warn_once_per_day(
+                                f"spotfail:{key}", f"ATM-IV history for {sym}: {spot_reason} ({e}); the sessions stay "
+                                f"UNRESOLVED (no tombstone written) and the next pass retries.", today)
+                            break
+                        self._sleep(delay)
                     except SuspectEmpty as e:
                         # reruns count only attempts that persisted nothing new (each chunk may
                         # legitimately ask to look again once)
@@ -926,6 +997,17 @@ class AtmIvHistoryProvider:
         finally:
             lock.release()
         return self._assemble(sym, self.read_store(sym), window, end_session, status, reason)
+
+    def _spot_backoff(self, attempt: int) -> float:
+        """Exponential backoff with jitter, never shorter than FMP's shared cooldown."""
+        base = min(SPOT_BACKOFF_CAP_SECONDS, SPOT_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)))
+        delay = base * (0.5 + self._jitter())
+        try:
+            from ba2_providers.fmp_common import gate_remaining_seconds
+            delay = max(delay, gate_remaining_seconds())
+        except ImportError:
+            pass
+        return delay
 
     # -- the fill -------------------------------------------------------------------------
     def _run_fill(self, sym: str, window: List[date], budget: _Budget) -> None:

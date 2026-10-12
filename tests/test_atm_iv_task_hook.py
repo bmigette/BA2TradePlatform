@@ -100,6 +100,6 @@ def test_worker_queue_runs_the_fill_before_the_expert_analysis():
     """The ordering the rule depends on: hook first, run_analysis second, in the same task."""
     from ba2_trade_platform.core.WorkerQueue import WorkerQueue
     src = inspect.getsource(WorkerQueue._execute_task)
-    hook = src.index("ensure_for_analysis_task(task.expert_instance_id, task.symbol, task.subtype)")
+    hook = src.index("ensure_for_analysis_task(task.expert_instance_id, task.symbol, task.subtype, batch_id=task.batch_id)")
     run = src.index("expert.run_analysis(task.symbol, market_analysis)")
     assert hook < run

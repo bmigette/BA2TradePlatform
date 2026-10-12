@@ -984,7 +984,7 @@ class WorkerQueue:
             # blocking on this task's own worker thread, so it is fresh before the rule is evaluated
             # (get_iv_rank only reads the store). Experts without such a rule pay one cached check.
             from ..modules.dataproviders.options.atm_iv_task_hook import ensure_for_analysis_task
-            ensure_for_analysis_task(task.expert_instance_id, task.symbol, task.subtype)
+            ensure_for_analysis_task(task.expert_instance_id, task.symbol, task.subtype, batch_id=task.batch_id)
 
             # Create or reuse MarketAnalysis record
             if task.market_analysis_id:
@@ -1569,6 +1569,11 @@ class WorkerQueue:
                     return
                 
                 logger.info(f"[RISK_MGR_TRIGGER] No pending {use_case.value} tasks for expert {expert_instance_id}, proceeding with risk manager check")
+
+                if use_case == AnalysisUseCase.ENTER_MARKET:
+                    # ONE "IV gate closed for N of M symbols" line + Activity Log entry per pass
+                    from ..modules.dataproviders.options.atm_iv_task_hook import flush_gate_report
+                    flush_gate_report(expert_instance_id, batch_id)
                 
                 if not has_pending:
                     # Mark this expert as being processed
