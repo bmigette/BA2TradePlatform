@@ -270,5 +270,11 @@ Reviewed by the owner (B. Migette) on 2026-10-12. `panel_exclusions.json` entrie
   is part of the panel fingerprint (the file's bytes always were), and a `pending` reviewer refuses the launch like a pending exclusion.
   Before this change the only way out was the build-time `acknowledged_stale` argument, which no CLI flag reached, was not recorded with a
   reviewer and did not stop the symbol being selected in live's 35-day window after its last bar.
+Stale-listed symbols are judged against the JOB WINDOW (2026-10-12): `panel_problems` refuses a listed symbol only if its last bar is more than
+`STALE_LISTED_DAYS` (6) calendar days before min(window end, panel last bar); the message names symbol, last bar and the reference date. A
+window ending before the symbol's last bar never refuses. The build still RECORDS every currently stale-listed symbol (manifest
+`stale_listed_symbols`, `stale_listed_last_bar`, `stale_listed_count`; printed "RECORDED stale-listed"). A window reaching the panel's last
+bar is refused as before. `BUILD_REV` is 3.
+
 The 85 symbols "treated as delisted" (not in the vendor listing) are unchanged: they keep history and are not masked after their last bar
 (their previous close can linger in the 35-day window). Listing them as `delisted` entries would mask them.

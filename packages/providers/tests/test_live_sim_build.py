@@ -165,3 +165,24 @@ def test_acknowledged_delisting_with_the_wrong_last_session_or_pending_review_re
     bad.write_text(json.dumps({"entries": [{"symbol": "C", "kind": "delisted", "reason": "x", "added": "d", "reviewed_by": "o"}]}))
     with pytest.raises(ls.SimulationRefusal, match="last_session"):
         lb.load_entries(str(bad))
+
+
+def test_stale_listed_is_judged_against_the_job_window_not_today(cache):
+    logs = []
+    man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2, log=logs.append)
+    last = SESSIONS[20].isoformat()                                    # C's last bar (listed by the vendor, stale)
+    # the manifest RECORDS it (count, names, last bar) and the build prints it, whatever window a job reads
+    assert man["stale_listed_symbols"] == ["C"] and man["stale_listed_count"] == 1 and man["stale_listed_last_bar"] == {"C": last}
+    assert any("RECORDED stale-listed C" in m and last in m for m in logs)
+    assert man["delisted_symbols"] == ["D"]                            # the "treated as delisted" class is untouched
+    path = man["path"]
+
+    def probs(end):
+        return [p for p in ls.panel_problems(path, "2023-10-02", end, warmup_days=0) if "CURRENT listing" in p]
+    assert probs("2023-10-20") == []                                  # the window ends BEFORE its last bar: never a problem
+    assert probs(SESSIONS[22].isoformat()) == []                       # ends 2 days after: inside the 6-day tolerance
+    inside = probs("2024-01-31")                                       # stale INSIDE the window: a problem, rule named
+    assert len(inside) == 1 and "C (last bar " + last + ")" in inside[0] and "reference date 2024-01-31" in inside[0]
+    reach = probs("2024-03-28")                                        # a window reaching the panel end: refuses
+    assert len(reach) == 1 and "reference date 2024-03-28" in reach[0]
+    assert len(probs("2024-04-05")) == 1 and "reference date 2024-03-28" in probs("2024-04-05")[0]   # past the last bar: judged at it

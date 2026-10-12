@@ -39,8 +39,9 @@ import numpy as np
 from ba2_providers.screener import live_sim as ls
 
 #: Bump when the BUILD logic changes what the panel contains for the same inputs (it is part of the panel fingerprint).
+#: 3: manifest records stale_listed_last_bar (the stale-listed refusal is judged against the job window).
 #: 2: shares in RAW (as-traded) basis everywhere, split factors, coverage lists.
-BUILD_REV = 2
+BUILD_REV = 3
 SHARES_ALL_URL = "https://financialmodelingprep.com/api/v4/shares_float/all"
 SHARES_HIST_URL = "https://financialmodelingprep.com/api/v4/historical/shares_float"
 
@@ -697,7 +698,7 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
                                         default=date.fromisoformat(first_day).toordinal()))).isoformat()
     # cache completeness: the universe is today's actively traded names, so nearly all must have a recent bar
     lb = max((int(bd[-1]) for bd in bar_ord.values()), default=0)
-    fresh = sum(1 for bd in bar_ord.values() if lb - int(bd[-1]) <= 6)
+    fresh = sum(1 for bd in bar_ord.values() if lb - int(bd[-1]) <= ls.STALE_LISTED_DAYS)
     # COVERAGE, as explicit lists (no tolerance): a symbol in the vendor's CURRENT listing whose bars are stale is a
     # defect of the cache (refuse); a stale symbol that is not listed any more is treated as delisted (counted/listed)
     with open(snap) as f:
@@ -706,7 +707,7 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
     ackd = load_acknowledged_delistings(exclusions_path)
     ack = {str(x).upper() for x in acknowledged_stale}
     lb_ord = max((int(bd[-1]) for bd in bar_ord.values()), default=0)
-    stale = sorted(sy for sy, bd in bar_ord.items() if lb_ord - int(bd[-1]) > 6)
+    stale = sorted(sy for sy, bd in bar_ord.items() if lb_ord - int(bd[-1]) > ls.STALE_LISTED_DAYS)
     stale_listed = [sy for sy in stale if sy in listing and sy not in ack and sy not in excl and sy not in ackd]
     delisted = [sy for sy in stale if sy not in listing]
     shares_missing_listed = [sy for sy in listing & set(symbols) if sy in set(srep.get("no_share_data_symbols", [])) and sy not in excl]
@@ -728,11 +729,16 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
         log(f"daily panel: ACKNOWLEDGED DELISTING (reviewed list) {sy}: history kept through {lbar}, never selected after "
             f"[{e['reason']}; {e['added']}, {e['reviewed_by']}]")
     ackd_unneeded = [sy for sy in ackd if sy in set(symbols) and sy not in bar_ord]
+    for sy in stale_listed:
+        log(f"daily panel: RECORDED stale-listed {sy}: last bar {date.fromordinal(int(bar_ord[sy][-1])).isoformat()} (listed by the vendor; "
+            f"refuses only a job whose window reaches it)")
     for e in excluded_unusable:
         log(f"daily panel: EXCLUDED (reviewed list) {e['symbol']}: {e['reason']} [{e['added']}, {e['reviewed_by']}]")
     for sy in unneeded:
         log(f"daily panel: NOTE exclusion {sy} is not needed by this build's data (stale/no-share condition gone): review the entry")
     manifest = {"source_fingerprint": fp, "panel_fingerprint": fp[:16], "stale_listed_symbols": stale_listed,
+                "stale_listed_last_bar": {sy: date.fromordinal(int(bar_ord[sy][-1])).isoformat() for sy in stale_listed},
+                "stale_listed_count": len(stale_listed),
                 "excluded_unusable": excluded_unusable, "acknowledged_delisted": acknowledged_delisted,
                 "acknowledged_delisted_not_needed": ackd_unneeded, "exclusions_not_needed": unneeded, "delisted_symbols": delisted, "delisted_symbols_count": len(delisted),
                 "acknowledged_stale": sorted(ack), "split_report": split_rep,

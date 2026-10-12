@@ -884,6 +884,10 @@ def _sessions_of(path: str) -> List[str]:
         return []
 
 
+#: A listed symbol whose last daily bar is more than this many CALENDAR days before the reference date is stale.
+STALE_LISTED_DAYS = 6
+
+
 def pending_exclusions(man: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Entries of the panel's exclusion list that nobody has reviewed (``reviewed_by`` starts with "pending")."""
     return [e for e in list(man.get("excluded_unusable") or []) + list(man.get("acknowledged_delisted") or [])
@@ -930,11 +934,26 @@ def panel_problems(path: str, start_day: str, end_day: str, *, warmup_days: int 
                    + ". An unreviewed exclusion silently removes a symbol from every screen: the owner confirms an entry "
                      "(reviewed_by = the reviewer's name) or removes it after the data is repaired, then the panel is rebuilt")
     if man.get("stale_listed_symbols"):
-        sl = man["stale_listed_symbols"]
-        out.append(f"{len(sl)} symbols are in the vendor's CURRENT listing but their daily bars are stale "
-                   f"(last bar > 6 days before {man.get('last_bar_date')}): {sl[:15]}; refresh them with "
-                   f"`ba2-test fetch-cache --timeframes 1d --symbols ...` and rebuild the panel (or acknowledge with "
-                   f"`--acknowledge-stale` at build time)")
+        # judged against the WINDOW the job reads, not against today: a listed symbol whose bars stop after the window's end
+        # cannot affect the run.  Reference = min(window end, the panel's last bar); a symbol is a problem when its last bar is
+        # more than STALE_LISTED_DAYS calendar days before it.  (Recording is the manifest's job: it lists every one.)
+        ref = min(end_day[:10], str(man.get("last_bar_date") or end_day[:10]))
+        ref_ord = date.fromisoformat(ref).toordinal()
+        lastbar = man.get("stale_listed_last_bar") or {}
+        bad = []
+        for sy in man["stale_listed_symbols"]:
+            lb_ = lastbar.get(sy)
+            if lb_ is None:
+                bad.append((sy, "unknown"))          # a manifest without the date: judge as today (the old rule)
+            elif ref_ord - date.fromisoformat(lb_).toordinal() > STALE_LISTED_DAYS:
+                bad.append((sy, lb_))
+        if bad:
+            out.append(f"{len(bad)} symbols are in the vendor's CURRENT listing but their daily bars are stale relative to this job's window "
+                       f"(last bar more than {STALE_LISTED_DAYS} days before the reference date {ref} = min(window end {end_day[:10]}, "
+                       f"panel last bar {man.get('last_bar_date')})): "
+                       + ", ".join(f"{sy} (last bar {d})" for sy, d in bad[:15]) +
+                       "; refresh them with `ba2-test fetch-cache --timeframes 1d --symbols ...` and rebuild the panel (or acknowledge "
+                       "a known delisting in panel_exclusions.json)")
     if man.get("splits_unknown"):
         su = man["splits_unknown"]
         out.append(f"{len(su)} symbols have no split calendar (the as-traded basis of their market cap and price is "
