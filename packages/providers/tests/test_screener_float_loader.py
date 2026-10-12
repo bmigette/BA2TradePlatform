@@ -114,7 +114,10 @@ def test_error_is_an_fmp_error_and_empty_payload_is_a_failure(monkeypatch):
     _patch_http(monkeypatch, lambda n: _Resp([]))
     with pytest.raises(S.ScreenerDataError):
         ff.load_float_table()
-    assert issubclass(S.ScreenerDataError, fmp_common.FMPError)
+    # By the class StockScreener bound at import, not ``fmp_common.FMPError``: test_hermetic_miss_policy
+    # ``importlib.reload``s fmp_common, which rebinds that name to a NEW class object mid-session.
+    assert issubclass(S.ScreenerDataError, S.FMPError)
+    assert fmp_common.FMPError.__name__ in [c.__name__ for c in S.ScreenerDataError.__mro__]
 
 
 # ----------------------------------------------------------------------------------------------
