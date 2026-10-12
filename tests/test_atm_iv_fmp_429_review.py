@@ -35,7 +35,8 @@ class FlakySpots:
     def spots(self, symbol, start, end):
         self.calls += 1
         if self.always:
-            raise H.SpotSourceTransient("TEST: spot fetch failed: FMPError: HTTP 429") from RuntimeError("429")
+            import ba2_providers.fmp_common as fc
+            raise H.SpotSourceTransient("TEST: spot fetch failed: FMPError: HTTP 429") from fc.FMPError("HTTP 429")
         return self.inner.spots(symbol, start, end)
 
 
@@ -176,7 +177,7 @@ def test_one_spot_fetch_is_bounded_and_worst_case_per_symbol_is_stated(tmp_path,
     res = prov.ensure_filled("TEST", END, LOOK, deadline_seconds=60)
     took = time.monotonic() - t0
     release.set()
-    assert res.status == H.STATUS_FILLING and "TimeoutError" in res.reason
+    assert res.status == H.STATUS_FILLING and res.reason.startswith("spot source failing")
     assert took < 2.0
 
 
@@ -196,7 +197,7 @@ def test_guard_stops_the_fill_before_any_spot_call(tmp_path):
 def test_warm_catchup_window():
     mon = lambda h, m: datetime(2026, 10, 12, h, m, tzinfo=NY)
     assert K.warm_catchup_due(mon(8, 45)) and K.warm_catchup_due(mon(9, 14))
-    assert not K.warm_catchup_due(mon(8, 30)) and not K.warm_catchup_due(mon(9, 15))
+    assert not K.warm_catchup_due(mon(9, 15))
     assert not K.warm_catchup_due(datetime(2026, 10, 10, 8, 45, tzinfo=NY))       # Saturday
 
 
@@ -245,3 +246,174 @@ def test_worker_queue_emits_the_gate_summary_outside_the_risk_manager_lock(monke
     wq._process_expert_recommendations(9, AnalysisUseCase.ENTER_MARKET, "bb")
     assert seen == {"locked": False, "n": 1}
     assert K._PASS == {}
+
+
+# ---- F1: permanent failures never open the breaker ------------------------------------------------
+def test_permanent_no_data_symbols_do_not_open_the_breaker_and_a_healthy_symbol_still_fills(tmp_path):
+    world = FakeWorld()
+
+    class Mixed:
+        inner = FakeSpots(world)
+
+        def spots(self, sym, lo, hi):
+            if sym.startswith("BAD"):
+                raise H.SpotUnavailable(f"{sym}: FMP has no daily data for this symbol")
+            return self.inner.spots(sym, lo, hi)
+    prov, *_ = make_provider(tmp_path, world, spot_source=Mixed(), sleep=lambda s: None)
+    for sym in ("BADA", "BADB", "BADC", "BADD"):
+        r = prov.ensure_filled(sym, END, LOOK)
+        assert r.status == H.STATUS_UNAVAILABLE
+        assert prov.read_store(sym).empty                      # no tombstone
+    assert not H._BREAKER.is_open and H._BREAKER.fails == 0
+    assert prov.ensure_filled("TEST", END, LOOK).status == H.STATUS_COMPLETE
+
+
+def test_cold_fetch_that_returns_nothing_is_unavailable_not_transient(fmp_world):
+    """The provider's bare Exception('Failed to fetch data ...') (no HTTP cause) -> SpotUnavailable."""
+    fmp_world.bars.clear()                                    # FMP answers 200 with no rows at all
+    with pytest.raises(H.SpotUnavailable) as ei:
+        H.FmpSpotSource().spots("BRK.B", date(2026, 2, 9), date(2026, 2, 12))
+    assert "dotted" in str(ei.value)
+
+
+def test_three_real_429_failures_open_the_breaker_and_a_success_in_between_resets_it(tmp_path):
+    world = FakeWorld()
+
+    class Src:
+        inner = FakeSpots(world)
+
+        def spots(self, sym, lo, hi):
+            if sym != "OKAY":
+                import ba2_providers.fmp_common as fc
+                try:
+                    raise fc.FMPError("FMP historical-price-full failed after 4 attempts (last: HTTP 429)")
+                except fc.FMPError as e:
+                    raise H.SpotSourceTransient(f"{sym}: spot fetch failed: FMPError") from e
+            return self.inner.spots(sym, lo, hi)
+    prov, *_ = make_provider(tmp_path, world, spot_source=Src(), sleep=lambda s: None)
+    prov.ensure_filled("F1", END, LOOK)
+    prov.ensure_filled("F2", END, LOOK)
+    assert H._BREAKER.fails == 2
+    assert prov.ensure_filled("OKAY", END, LOOK).status == H.STATUS_COMPLETE      # success resets
+    assert H._BREAKER.fails == 0
+    for sym in ("F3", "F4", "F5"):
+        prov.ensure_filled(sym, END, LOOK)
+    assert H._BREAKER.is_open
+
+
+def test_already_complete_symbol_resets_the_streak(tmp_path):
+    prov, *_ = make_provider(tmp_path)
+    prov.ensure_filled("TEST", END, LOOK)
+    H._BREAKER.fails = 2
+    prov.ensure_filled("TEST", END, LOOK)                       # fully fresh: zero work
+    assert H._BREAKER.fails == 0
+
+
+# ---- F3 / F4: what does not count -----------------------------------------------------------------
+def test_a_fetch_cut_by_the_remaining_deadline_does_not_count_toward_the_breaker(tmp_path):
+    release = threading.Event()
+
+    class Hung:
+        def spots(self, s, a, b):
+            release.wait(5)
+            return {}
+    prov, *_ = make_provider(tmp_path, spot_source=Hung(), sleep=lambda s: None)
+    # deadline (1 s) is far below SPOT_CALL_LIMIT_SECONDS (40 s): the cut is the deadline's, not the API's
+    res = prov.ensure_filled("TEST", END, LOOK, deadline_seconds=1.0)
+    release.set()
+    assert res.status == H.STATUS_FILLING and H._BREAKER.fails == 0
+
+
+def test_a_fetch_cut_by_its_own_limit_counts(tmp_path, monkeypatch):
+    monkeypatch.setattr(H, "SPOT_CALL_LIMIT_SECONDS", 0.2)
+    release = threading.Event()
+
+    class Hung:
+        def spots(self, s, a, b):
+            release.wait(5)
+            return {}
+    prov, *_ = make_provider(tmp_path, spot_source=Hung(), sleep=lambda s: None)
+    prov.ensure_filled("TEST", END, LOOK, deadline_seconds=60, spot_retries=0)
+    release.set()
+    assert H._BREAKER.fails == 1
+
+
+def test_cache_write_oserror_is_retried_once_then_transient_and_not_counted(fmp_world, monkeypatch):
+    import ba2_common.core.native_cache as nc
+    fmp_world.seed(date(2026, 2, 6))
+    writes = []
+
+    def boom(*a, **k):
+        writes.append(1)
+        raise OSError("disk full")
+    monkeypatch.setattr(nc, "write_timeseries", boom)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    with pytest.raises(H.SpotSourceTransient) as ei:
+        H.FmpSpotSource().spots("TEST", date(2026, 2, 9), date(2026, 2, 12))
+    assert len(writes) == 2 and ei.value.cause_name == "OSError" and not ei.value.counts_toward_breaker
+
+
+# ---- F2: leftover threads ----------------------------------------------------------------------------
+def test_no_duplicate_spot_fetch_for_a_symbol_whose_previous_fetch_is_still_alive(tmp_path, monkeypatch):
+    monkeypatch.setattr(H, "SPOT_CALL_LIMIT_SECONDS", 0.2)
+    release = threading.Event()
+    started = []
+
+    class Hung:
+        def spots(self, s, a, b):
+            started.append(s)
+            release.wait(5)
+            return {}
+    prov, *_ = make_provider(tmp_path, spot_source=Hung(), sleep=lambda s: None)
+    prov.ensure_filled("TEST", END, LOOK, deadline_seconds=60, spot_retries=3)
+    release.set()
+    assert started == ["TEST"]            # retries found the abandoned fetch alive: no second thread
+    assert len(H._ABANDONED) <= H.MAX_ABANDONED_CALLS + 1
+
+
+def test_abandoned_spot_threads_stay_within_the_documented_bound_under_concurrency(tmp_path, monkeypatch):
+    monkeypatch.setattr(H, "SPOT_CALL_LIMIT_SECONDS", 0.2)
+    release = threading.Event()
+
+    class Hung:
+        def spots(self, s, a, b):
+            release.wait(5)
+            return {}
+    prov, *_ = make_provider(tmp_path, spot_source=Hung(), sleep=lambda s: None)
+    workers = 8
+    ts = [threading.Thread(target=lambda i=i: prov.ensure_filled(f"S{i}", END, LOOK, deadline_seconds=30, spot_retries=0))
+          for i in range(workers)]
+    [t.start() for t in ts]
+    [t.join(10) for t in ts]
+    release.set()
+    assert len(H._ABANDONED) <= H.MAX_ABANDONED_CALLS + workers          # documented strict bound
+
+
+# ---- F5: catch-up --------------------------------------------------------------------------------------
+def test_catchup_window_is_inclusive_of_0830():
+    mon = lambda h, m: datetime(2026, 10, 12, h, m, tzinfo=NY)
+    assert K.warm_catchup_due(mon(8, 30)) and not K.warm_catchup_due(mon(8, 29))
+
+
+def test_catchup_logs_and_starts_nothing_without_gates(monkeypatch):
+    from ba2_trade_platform.core import JobManager as JM
+    jm = JM.JobManager.__new__(JM.JobManager)
+    monkeypatch.setattr(K, "warm_catchup_due", lambda now=None: True)
+    monkeypatch.setattr(K, "has_iv_rank_gates", lambda: False)
+    monkeypatch.setattr(threading, "Thread", lambda *a, **k: pytest.fail("no thread without gates"))
+    jm._iv_warm_catchup_if_due()
+
+
+def test_run_warm_once_is_not_reentrant_and_runs_once_per_day(monkeypatch):
+    K._WARM_DONE.clear()
+    calls = []
+    monkeypatch.setattr(K, "warm_iv_history", lambda **kw: calls.append(1) or {"complete": 1})
+    assert K.run_warm_once() == {"complete": 1}
+    assert K.run_warm_once() is None and calls == [1]            # already done today
+    K._WARM_DONE.clear()
+    assert K._WARM_RUN.acquire(blocking=False)
+    try:
+        assert K.run_warm_once() is None and calls == [1]       # one in progress
+    finally:
+        K._WARM_RUN.release()
+    K._WARM_DONE.clear()
