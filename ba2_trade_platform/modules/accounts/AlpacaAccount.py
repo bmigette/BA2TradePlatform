@@ -6689,6 +6689,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return 0
         return int(st["n"])
 
+    #: symbol -> reason the latest ``get_iv_rank`` returned None (display only; one source with
+    #: the 'IV rank for X unavailable: ...' warning). Class-level dict shared by design: the
+    #: condition reads it right after the call on the same account object.
+    _iv_rank_reasons: Dict[str, str] = {}
+
+    def iv_rank_unavailable_reason(self, underlying: str) -> Optional[str]:
+        return self._iv_rank_reasons.get(underlying)
+
     def get_iv_rank(self, underlying: str, lookback_days: Optional[int] = None,
                     min_samples: int = 20, current: Optional[float] = None) -> Optional[float]:
         """IV percentile of the LAST COMPLETED SESSION's derived ATM IV against the trailing
@@ -6707,7 +6715,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         st = self._iv_rank_state(underlying, lookback_days)
         today = _date.today()
 
+        self._iv_rank_reasons.pop(underlying, None)
+
         def _none(why: str):
+            self._iv_rank_reasons[underlying] = why
             _warn_once_per_day(f"ivrank:{self.id}:{underlying}",
                                f"IV rank for {underlying} unavailable: {why}", today)
             return None

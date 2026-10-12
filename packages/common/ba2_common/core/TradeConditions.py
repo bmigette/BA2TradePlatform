@@ -2751,7 +2751,11 @@ class IVRankCondition(CompareCondition):
     # account default so a rank is available early in an instrument's history.
     IV_RANK_MIN_SAMPLES = 5
 
+    #: Display-only reason the rank is unavailable (None when a rank exists or no reason is known).
+    unavailable_reason: Optional[str] = None
+
     def evaluate(self) -> bool:
+        self.unavailable_reason = None
         try:
             from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 
@@ -2760,6 +2764,7 @@ class IVRankCondition(CompareCondition):
                     f"Account does not support options; cannot compute IV rank for "
                     f"{self.instrument_name}")
                 self.calculated_value = None
+                self.unavailable_reason = "account does not support options"
                 return False
 
             rank = self.account.get_iv_rank(
@@ -2767,6 +2772,12 @@ class IVRankCondition(CompareCondition):
             if rank is None:
                 logger.warning(f"IV rank unavailable for {self.instrument_name}")
                 self.calculated_value = None
+                try:
+                    self.unavailable_reason = self.account.iv_rank_unavailable_reason(
+                        self.instrument_name)
+                except Exception as reason_err:  # display-only; must never break evaluation
+                    logger.debug(f"iv_rank_unavailable_reason failed: {reason_err}")
+                    self.unavailable_reason = None
                 return False
 
             self.calculated_value = rank
@@ -2787,6 +2798,8 @@ class IVRankCondition(CompareCondition):
 
     def get_actual_value_display(self) -> Optional[str]:
         if self.calculated_value is None:
+            if self.unavailable_reason:
+                return f"unavailable: {self.unavailable_reason}"
             return None
         return f"{self.calculated_value:.1f}"
 

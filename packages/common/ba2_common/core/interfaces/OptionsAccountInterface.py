@@ -1288,6 +1288,13 @@ class OptionsAccountInterface(ABC):
             current = self.get_atm_implied_volatility(underlying)
         return self._iv_rank_from_series(series, current, min_samples)
 
+    def iv_rank_unavailable_reason(self, underlying: str) -> Optional[str]:
+        """WHY the most recent ``get_iv_rank(underlying)`` returned None, for display only
+        (the rule-evaluation dialog). Default None = no reason known (the backtest account
+        keeps this default, so its decisions and records are unchanged). Never used in a
+        decision."""
+        return None
+
     # --- Cash / buying-power reserve (short-premium defense-in-depth) -------
     #: Reg-T / CBOE naked-option initial-margin fraction of the underlying notional.
     #: A NAKED short option is NOT cash-secured (only an assigned cash-secured PUT is);
