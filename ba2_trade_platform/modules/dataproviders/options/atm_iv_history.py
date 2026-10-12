@@ -108,9 +108,12 @@ REQUEST_TIMEOUT_SECONDS = 20.0        # background calls; alpaca-py sets no time
 TOMBSTONE_RETRY_SESSIONS = 3          # a 'no_bar' tombstone younger than this is retried daily
 PRECEDING_SESSIONS_TRADED = 10        # "normally trades" = had a value in this many prior sessions
 STALE_TMP_SECONDS = 3600
-SPOT_RETRIES = 4                      # transient spot-source failures retried per ensure_filled
+SPOT_RETRIES_IN_TASK = 1              # the 09:30 analysis path: at most ONE retry (workers are held)
+SPOT_RETRIES_WARM = 4                 # the pre-open warm job: deep retries
+SPOT_CALL_LIMIT_SECONDS = 40.0        # hard bound of ONE spot fetch (fmp_http_get alone can take ~110 s)
 SPOT_BACKOFF_BASE_SECONDS = 5.0
 SPOT_BACKOFF_CAP_SECONDS = 60.0
+SPOT_GATE_WAIT_CAP_SECONDS = 30.0     # honour FMP's global cooldown, but never sleep longer than this
 
 STATUS_COMPLETE = "complete"
 STATUS_FILLING = "filling"
@@ -137,6 +140,11 @@ class SpotSourceTransient(RuntimeError):
     failure, a top-up that did not land). That is NOT a statement that the market has no spot:
     it must never become a ``no_spot`` tombstone. ``ensure_filled`` retries with backoff and, if it
     still fails, leaves the sessions unresolved (status ``filling``)."""
+
+    @property
+    def retryable(self) -> bool:
+        """False for a programming/config error (retrying cannot help); True for HTTP/connection/timeout."""
+        return not isinstance(self.__cause__, (ValueError, KeyError, TypeError, AttributeError))
 
     @property
     def cause_name(self) -> str:
@@ -342,6 +350,8 @@ class _Budget:
     def __init__(self, max_seconds: Optional[float], bucket: TokenBucket,
                  sleep: Callable[[float], None] = time.sleep):
         self.deadline = None if max_seconds is None else time.monotonic() + max_seconds
+        #: optional caller veto checked before every FMP/Alpaca call: returns a reason to stop, else None
+        self.guard: Optional[Callable[[], Optional[str]]] = None
         self.bucket = bucket
         self._sleep = sleep
         self.used = 0
@@ -475,27 +485,6 @@ class AlpacaContractLister:
 # ---------------------------------------------------------------------------------------------
 # Default spot source: FMP daily close x as-traded split factor
 # ---------------------------------------------------------------------------------------------
-def check_topup_landed(symbol: str, df: pd.DataFrame, end: date,
-                       probe: Callable[[date, date], List[date]]) -> None:
-    """The provider's top-up SWALLOWS an FMP failure (logs a warning, serves the stale parquet), so a
-    cache that ends before ``end`` is ambiguous: the vendor may genuinely have no newer bar, or the
-    top-up may have failed (429). ``probe(after, upto)`` asks the vendor directly (its own errors
-    propagate and are classed transient). Raises ``SpotSourceTransient`` when the vendor HAS bars the
-    cache lacks; returns when it has none (the missing session is then a real ``no_spot``)."""
-    if df is None or df.empty:
-        return
-    d = pd.to_datetime(df["Date"])
-    if getattr(d.dt, "tz", None) is not None:
-        d = d.dt.tz_localize(None)
-    last = d.max().date()
-    if last >= end:
-        return
-    newer = [x for x in probe(last + timedelta(days=1), end + timedelta(days=1)) if x > last]
-    if newer:
-        raise SpotSourceTransient(
-            f"{symbol}: FMP has bars through {max(newer)} but the cache ends {last}: the top-up did not land")
-
-
 class FmpSpotSource:
     """``spots(symbol, start, end) -> {session: as-traded close}``; RAISES SpotUnavailable.
 
@@ -514,32 +503,48 @@ class FmpSpotSource:
     # -- defaults -------------------------------------------------------------------------
     @staticmethod
     def _default_ohlcv(symbol: str, start: date, end: date):
-        """Top up through the provider, then read the daily parquet (the basis proof needs the
-        whole file, not a slice)."""
+        """A REAL top-up of the daily parquet, then the whole file (the basis proof needs it all).
+
+        Why not ``provider.get_ohlcv_data(.., end_date=<past session + 1 day>)``: the provider only
+        tops up a LATEST request (end within an hour of now) and an old pinned end is read straight
+        from the parquet, so the cache never advanced before the hook read it (2026-10-12: sessions
+        10-06..10-09 missing). Here the cache is checked against ``end`` itself: only when its newest
+        bar is older than ``end`` is the vendor asked (one overlap-verified ``historical-price-full``
+        plus the split calendar, ``raise_fetch_errors=True`` so a 429 raises instead of being logged
+        and swallowed). A cache that already reaches ``end`` costs ZERO FMP requests. After a
+        SUCCESSFUL top-up a cache still short of ``end`` means the vendor has no such bar (the
+        provider already retried an empty-200 three times): that session is a real ``no_spot``."""
+        from ba2_common.core import native_cache
+        from ba2_common.core.ohlcv_topup_guard import OHLCVTopUpRefused
         from ba2_providers.ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
-        from ba2_trade_platform import config
 
         provider = FMPOHLCVProvider()
-        provider.get_ohlcv_data(symbol, start_date=datetime(start.year, start.month, start.day) - timedelta(days=7),
-                                end_date=datetime(end.year, end.month, end.day) + timedelta(days=1),
-                                interval="1d")
-        path = os.path.join(config.CACHE_FOLDER, "FMPOHLCVProvider", f"{symbol.upper()}_1d.parquet")
-        if not os.path.exists(path):
-            raise SpotUnavailable(f"{symbol}: no FMP daily cache at {path}")
-        df = pd.read_parquet(path, columns=["Date", "Open", "High", "Low", "Close"])
-
-        def probe(after: date, upto: date) -> List[date]:
-            from ba2_providers.fmp_common import fmp_http_get
-            resp = fmp_http_get(f"{provider.BASE_URL}/historical-price-full/{symbol}",
-                                params={"apikey": provider.api_key, "from": after.isoformat(),
-                                        "to": upto.isoformat()},
-                                symbol=symbol, endpoint="historical-price-full")
-            data = resp.json()
-            hist = data.get("historical") if isinstance(data, dict) else None
-            return [pd.Timestamp(r["date"]).date() for r in (hist or [])]
-
-        check_topup_landed(symbol, df, end, probe)
-        return df, path
+        name = type(provider).__name__
+        cached = native_cache.read_timeseries(name, symbol, "1d", as_of=None)
+        if cached is None or cached.empty:
+            # cold: the provider's own live fill (end_date=None is a LATEST request); it raises on failure
+            provider.get_ohlcv_data(symbol, start_date=datetime(start.year, start.month, start.day) - timedelta(days=7),
+                                    end_date=None, interval="1d")
+            cached = native_cache.read_timeseries(name, symbol, "1d", as_of=None)
+            if cached is None or cached.empty:
+                raise SpotUnavailable(f"{symbol}: FMP returned no daily bars")
+        else:
+            d = pd.to_datetime(cached["Date"])
+            if getattr(d.dt, "tz", None) is not None:
+                d = d.dt.tz_localize(None)
+            if d.max().date() < end:
+                try:
+                    merged, action = provider._verified_tail_topup(
+                        cached, symbol, "1d", name, datetime.now() + timedelta(days=1),
+                        raise_fetch_errors=True)
+                except OHLCVTopUpRefused as e:
+                    raise SpotUnavailable(f"{symbol}: daily top-up refused: {e}") from e
+                if action == "append":
+                    native_cache.write_timeseries(name, symbol, "1d", merged)
+        path = native_cache.find_timeseries_path(name, symbol, "1d")
+        if path is None:
+            raise SpotUnavailable(f"{symbol}: no FMP daily cache")
+        return pd.read_parquet(path, columns=["Date", "Open", "High", "Low", "Close"]), path
 
     @staticmethod
     def _default_splits(symbol: str):
@@ -757,6 +762,36 @@ class AtmIvHistoryProvider:
             raise box["e"]
         return box["v"]
 
+    def _timed_spot(self, budget: "_Budget", sym: str, lo: date, hi: date):
+        """One spot fetch with a HARD bound (min of the remaining deadline and SPOT_CALL_LIMIT_SECONDS):
+        ``fmp_http_get`` alone sleeps/retries for ~110 s, which would hold a worker well past the deadline."""
+        if budget.guard is not None:
+            why = budget.guard()
+            if why:
+                raise BudgetExhausted(why)
+        limit = min(budget.remaining_seconds(SPOT_CALL_LIMIT_SECONDS), SPOT_CALL_LIMIT_SECONDS)
+        with _FILL_LOCK:
+            _ABANDONED[:] = [t for t in _ABANDONED if t.is_alive()]
+            if len(_ABANDONED) > MAX_ABANDONED_CALLS:
+                raise SpotSourceTransient(f"{sym}: {len(_ABANDONED)} timed-out spot fetches still outstanding")
+        box: Dict[str, Any] = {}
+
+        def run():
+            try:
+                box["v"] = self.spot_source.spots(sym, lo, hi)
+            except BaseException as e:  # noqa: BLE001
+                box["e"] = e
+        t = threading.Thread(target=run, name="atm-iv-spot-fetch", daemon=True)
+        t.start()
+        t.join(limit)
+        if t.is_alive():
+            with _FILL_LOCK:
+                _ABANDONED.append(t)
+            raise SpotSourceTransient(f"{sym}: spot fetch exceeded {limit:.0f}s") from TimeoutError()
+        if "e" in box:
+            raise box["e"]
+        return box["v"]
+
     # -- clients --------------------------------------------------------------------------
     def _bars(self):
         if self._bars_client is None:
@@ -908,7 +943,9 @@ class AtmIvHistoryProvider:
         return last_completed_session(self._now())
 
     def ensure_filled(self, symbol: str, end_session: Optional[date] = None, lookback_days: int = 365,
-                      deadline_seconds: float = DEFAULT_DEADLINE_SECONDS) -> AtmIvSeries:
+                      deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
+                      spot_retries: int = SPOT_RETRIES_IN_TASK,
+                      guard: Optional[Callable[[], Optional[str]]] = None) -> AtmIvSeries:
         """Bring ``symbol``'s series up to the last completed session, BLOCKING (analysis thread).
 
         Incremental: only missing sessions are computed. Returns ``complete`` (also when the only
@@ -946,6 +983,7 @@ class AtmIvHistoryProvider:
                     logger.info(f"ATM-IV history fill started for {sym}: {len(missing)} of "
                                 f"{len(window)} session(s) to derive")
                 budget = _Budget(max(deadline_seconds - (time.monotonic() - t0), 1.0), self.bucket, self._sleep)
+                budget.guard = guard
                 reruns = 0
                 spot_tries = 0
                 while True:
@@ -961,8 +999,10 @@ class AtmIvHistoryProvider:
                         spot_tries += 1
                         spot_reason = f"spot source failing: {e.cause_name}"
                         delay = self._spot_backoff(spot_tries)
-                        if spot_tries > SPOT_RETRIES or budget.remaining_seconds(1e9) <= delay + 1.0:
+                        if (not e.retryable or spot_tries > spot_retries
+                                or budget.remaining_seconds(1e9) <= delay + SPOT_CALL_LIMIT_SECONDS / 2):
                             status, reason = STATUS_FILLING, spot_reason
+                            api_failed = True      # counts toward the process-wide breaker (B2)
                             _warn_once_per_day(
                                 f"spotfail:{key}", f"ATM-IV history for {sym}: {spot_reason} ({e}); the sessions stay "
                                 f"UNRESOLVED (no tombstone written) and the next pass retries.", today)
@@ -1004,7 +1044,7 @@ class AtmIvHistoryProvider:
         delay = base * (0.5 + self._jitter())
         try:
             from ba2_providers.fmp_common import gate_remaining_seconds
-            delay = max(delay, gate_remaining_seconds())
+            delay = max(delay, min(gate_remaining_seconds(), SPOT_GATE_WAIT_CAP_SECONDS))
         except ImportError:
             pass
         return delay
@@ -1018,7 +1058,7 @@ class AtmIvHistoryProvider:
             return
         lo, hi = min(missing), max(missing)
         rate = self._rate_source(lo, hi)           # AtmIvUnavailable -> series unavailable
-        spots = self.spot_source.spots(sym, lo, hi)  # SpotUnavailable -> series unavailable
+        spots = self._timed_spot(budget, sym, lo, hi)  # SpotUnavailable -> series unavailable
         fillable = sorted((d for d in missing if d in spots), reverse=True)   # newest first
         already = {ts.date() for ts, why in zip(df["session_date"], df["reason"]) if why == "no_spot"} if len(df) else set()
         nospot = [d for d in missing if d not in spots and d not in already]

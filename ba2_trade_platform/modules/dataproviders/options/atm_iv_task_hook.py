@@ -186,36 +186,52 @@ def record_gate_outcome(expert_instance_id: int, batch_id: Any, symbol: str, ser
             entry["closed"].pop(symbol, None)
 
 
-def flush_gate_report(expert_instance_id: int, batch_id: Any) -> Optional[str]:
-    """At the end of an expert's ENTER_MARKET batch: ONE log line + ONE Activity Log entry
-    ``IV gate closed for N of M symbols: <reason counts>`` when any symbol's gate is closed.
-    Pops the pass, so it fires once per pass (a second call finds nothing). Never raises."""
-    try:
-        with _PASS_LOCK:
-            entry = _PASS.pop((int(expert_instance_id), batch_id), None)
-        if not entry or not entry["closed"]:
-            return None
-        counts: Dict[str, int] = {}
-        for r in entry["closed"].values():
-            counts[r] = counts.get(r, 0) + 1
-        n, m = len(entry["closed"]), len(entry["total"])
-        detail = "; ".join(f"{r} x{c}" for r, c in sorted(counts.items(), key=lambda kv: -kv[1]))
-        msg = f"IV gate closed for {n} of {m} symbols: {detail}"
-        all_closed = n >= m
-        full = f"[Expert {expert_instance_id}] {msg}"
-        (logger.error if all_closed else logger.warning)(
-            full + (" -- NO iv_rank-gated entry can fire this pass" if all_closed else ""))
-        from ba2_common.core.db import log_activity
-        from ba2_common.core.types import ActivityLogSeverity, ActivityLogType
-        log_activity(ActivityLogSeverity.FAILURE if all_closed else ActivityLogSeverity.WARNING,
-                     ActivityLogType.ANALYSIS_FAILED, msg,
-                     data={"closed": n, "total": m, "reasons": counts,
-                           "symbols": sorted(entry["closed"])[:200], "batch_id": str(batch_id)},
-                     source_expert_id=int(expert_instance_id))
-        return msg
-    except Exception as e:  # noqa: BLE001 - reporting must never break order processing
-        logger.error(f"IV gate summary failed for expert {expert_instance_id}: {e}", exc_info=True)
-        return None
+_ALL = object()
+
+
+def pop_gate_reports(expert_instance_id: int, batch_id: Any = _ALL) -> list:
+    """Remove and return the recorded passes of the expert (memory only, no IO: safe under a lock).
+    With the default every batch of the expert is returned: the caller runs when NO ENTER_MARKET task
+    of the expert is pending, so every recorded batch is finished and none may leak."""
+    with _PASS_LOCK:
+        keys = [k for k in _PASS if k[0] == int(expert_instance_id) and (batch_id is _ALL or k[1] == batch_id)]
+        return [(k[0], k[1], _PASS.pop(k)) for k in keys]
+
+
+def emit_gate_reports(popped: list) -> list:
+    """ONE log line + ONE Activity Log entry ``IV gate closed for N of M symbols: <reason counts>`` per
+    popped pass that has a closed gate. Does IO: call OUTSIDE any lock. Never raises."""
+    out = []
+    for expert_id, batch_id, entry in popped:
+        try:
+            if not entry["closed"]:
+                continue
+            counts: Dict[str, int] = {}
+            for r in entry["closed"].values():
+                counts[r] = counts.get(r, 0) + 1
+            n, m = len(entry["closed"]), len(entry["total"])
+            detail = "; ".join(f"{r} x{c}" for r, c in sorted(counts.items(), key=lambda kv: -kv[1]))
+            msg = f"IV gate closed for {n} of {m} symbols: {detail}"
+            all_closed = n >= m
+            (logger.error if all_closed else logger.warning)(
+                f"[Expert {expert_id}] {msg}" + (" -- NO iv_rank-gated entry can fire this pass" if all_closed else ""))
+            from ba2_common.core.db import log_activity
+            from ba2_common.core.types import ActivityLogSeverity, ActivityLogType
+            log_activity(ActivityLogSeverity.FAILURE if all_closed else ActivityLogSeverity.WARNING,
+                         ActivityLogType.ANALYSIS_FAILED, msg,
+                         data={"closed": n, "total": m, "reasons": counts,
+                               "symbols": sorted(entry["closed"])[:200], "batch_id": str(batch_id)},
+                         source_expert_id=int(expert_id))
+            out.append(msg)
+        except Exception as e:  # noqa: BLE001 - reporting must never break order processing
+            logger.error(f"IV gate summary failed for expert {expert_id}: {e}", exc_info=True)
+    return out
+
+
+def flush_gate_report(expert_instance_id: int, batch_id: Any = _ALL) -> Optional[str]:
+    """pop + emit in one call (tests / callers holding no lock). Returns the first message or None."""
+    msgs = emit_gate_reports(pop_gate_reports(expert_instance_id, batch_id))
+    return msgs[0] if msgs else None
 
 
 def ensure_for_analysis_task(expert_instance_id: int, symbol: str, use_case: str, *,
@@ -254,8 +270,20 @@ def ensure_for_analysis_task(expert_instance_id: int, symbol: str, use_case: str
 # ---- pre-open warm ---------------------------------------------------------------------------
 WARM_DEADLINE_ET = (9, 20)            # the warm must be finished by 09:20 America/New_York
 WARM_FORBIDDEN_ET = ((9, 25), (9, 45))  # never run inside the FMP 09:30 collision window
+WARM_CATCHUP_ET = ((8, 31), (9, 15))  # an app (re)started in this window runs the warm once, at once
 WARM_PER_SYMBOL_SECONDS = 180.0
 WARM_PACE_SECONDS = 1.0               # between symbols: FMP-friendly (sequential, no concurrency)
+
+
+def _ny():
+    from zoneinfo import ZoneInfo
+    return ZoneInfo("America/New_York")
+
+
+def warm_catchup_due(now: Optional[datetime] = None) -> bool:
+    """True on a weekday between 08:31 and 09:15 ET: a restart after the 08:30 cron missed the warm."""
+    t = (now or datetime.now(_ny())).astimezone(_ny())
+    return t.weekday() < 5 and WARM_CATCHUP_ET[0] <= (t.hour, t.minute) < WARM_CATCHUP_ET[1]
 
 
 def warm_iv_history(*, targets: Optional[Dict[int, list]] = None,
@@ -265,17 +293,21 @@ def warm_iv_history(*, targets: Optional[Dict[int, list]] = None,
                     pace_seconds: float = WARM_PACE_SECONDS) -> Dict[str, Any]:
     """Pre-open pass: for every iv_rank-gated symbol (sequentially, paced) run the same
     ``ensure_filled`` the 09:30 analysis would (FMP OHLCV top-up + split calendar included), so
-    the 09:30 pass finds the store warm. Stops at ``WARM_DEADLINE_ET`` and logs ONE INFO summary
-    (complete / filling / failed with reasons). Never raises. Returns the summary dict."""
-    from zoneinfo import ZoneInfo
-    ny = ZoneInfo("America/New_York")
+    the 09:30 pass finds the store warm. Deep spot retries (the in-task path gets one). The deadline
+    (09:20) and the 09:25-09:45 window are re-checked between symbols AND before every FMP call
+    (``guard``). Logs ONE INFO summary (complete / filling / failed with reasons). Never raises."""
+    from .atm_iv_history import SPOT_RETRIES_WARM
+    ny = _ny()
     clock = now or (lambda: datetime.now(ny))
     summary: Dict[str, Any] = {"complete": 0, "filling": 0, "failed": 0, "skipped_deadline": 0,
                                "reasons": {}, "total": 0}
+
+    def in_window(t: datetime) -> bool:
+        return WARM_FORBIDDEN_ET[0] <= (t.hour, t.minute) < WARM_FORBIDDEN_ET[1]
+
     try:
         t0 = clock().astimezone(ny)
-        hm = (t0.hour, t0.minute)
-        if WARM_FORBIDDEN_ET[0] <= hm < WARM_FORBIDDEN_ET[1]:
+        if in_window(t0):
             logger.warning(f"IV warm skipped: started {t0:%H:%M} ET inside the 09:25-09:45 FMP collision window")
             summary["skipped_window"] = True
             return summary
@@ -293,6 +325,14 @@ def warm_iv_history(*, targets: Optional[Dict[int, list]] = None,
         work = [(account_id, sym) for account_id, symbols in sorted(targets.items()) for sym in symbols]
         summary["total"] = len(work)
 
+        def guard() -> Optional[str]:
+            t = clock().astimezone(ny)
+            if t >= deadline:
+                return "warm deadline 09:20 ET reached"
+            if in_window(t):
+                return "inside the 09:25-09:45 ET FMP collision window"
+            return None
+
         def note(kind: str, reason: Optional[str] = None, sym: str = ""):
             summary[kind] += 1
             if reason:
@@ -300,8 +340,7 @@ def warm_iv_history(*, targets: Optional[Dict[int, list]] = None,
                 summary["reasons"][r] = summary["reasons"].get(r, 0) + 1
 
         for i, (account_id, sym) in enumerate(work):
-            cur = clock().astimezone(ny)
-            if cur >= deadline:
+            if guard() is not None:
                 summary["skipped_deadline"] = len(work) - i
                 break
             try:
@@ -309,9 +348,10 @@ def warm_iv_history(*, targets: Optional[Dict[int, list]] = None,
                 if account is None or not hasattr(account, "_atm_iv_history"):
                     note("failed", "account has no ATM-IV history provider", sym)
                     continue
-                left = (deadline - cur).total_seconds()
+                left = (deadline - clock().astimezone(ny)).total_seconds()
                 series = account._atm_iv_history().ensure_filled(
-                    sym, deadline_seconds=max(1.0, min(WARM_PER_SYMBOL_SECONDS, left)))
+                    sym, deadline_seconds=max(1.0, min(WARM_PER_SYMBOL_SECONDS, left)),
+                    spot_retries=SPOT_RETRIES_WARM, guard=guard)
                 if series.status == "complete" and series.end_session in series.values:
                     note("complete")
                 elif series.status == "filling":
@@ -325,7 +365,7 @@ def warm_iv_history(*, targets: Optional[Dict[int, list]] = None,
         reasons = "; ".join(f"{r} x{c}" for r, c in sorted(summary["reasons"].items(), key=lambda kv: -kv[1]))
         logger.info(f"IV warm summary: {summary['complete']} complete / {summary['filling']} filling / "
                     f"{summary['failed']} failed of {summary['total']} symbol(s)"
-                    + (f"; {summary['skipped_deadline']} not reached before 09:20 ET deadline"
+                    + (f"; {summary['skipped_deadline']} not reached before the 09:20 ET deadline"
                        if summary["skipped_deadline"] else "")
                     + (f"; reasons: {reasons}" if reasons else ""))
     except Exception as e:  # noqa: BLE001

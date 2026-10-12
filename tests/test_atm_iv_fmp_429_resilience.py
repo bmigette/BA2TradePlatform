@@ -56,8 +56,8 @@ def test_persistent_spot_failure_leaves_sessions_unresolved_then_next_call_fills
     assert res.status == H.STATUS_FILLING
     assert res.reason.startswith("spot source failing:")
     assert "no_spot" not in _reasons(prov) and _reasons(prov) == []      # nothing persisted at all
-    assert spots.calls == H.SPOT_RETRIES + 1 and len(sleeps) == H.SPOT_RETRIES
-    assert sleeps == sorted(sleeps) and sleeps[0] > 0                    # exponential backoff
+    assert spots.calls == H.SPOT_RETRIES_IN_TASK + 1 and len(sleeps) == H.SPOT_RETRIES_IN_TASK
+    assert sleeps[0] > 0
     assert res.coverage.startswith("0/")
     # the source recovers: the very next call resumes and completes
     spots.always = False
@@ -70,16 +70,18 @@ def test_transient_failure_that_clears_within_the_retries_completes_in_one_call(
     world = FakeWorld()
     spots = FlakySpots(world, fail_first=2)
     prov, *_ = make_provider(tmp_path, world, spot_source=spots)
-    res = prov.ensure_filled("TEST", END, LOOK)
+    res = prov.ensure_filled("TEST", END, LOOK, spot_retries=H.SPOT_RETRIES_WARM)
     assert res.status == H.STATUS_COMPLETE and res.reason is None
     assert spots.calls == 3 and "no_spot" not in _reasons(prov)
 
 
 def test_backoff_honours_the_fmp_global_cooldown(tmp_path, monkeypatch):
     import ba2_providers.fmp_common as fc
-    monkeypatch.setattr(fc, "gate_remaining_seconds", lambda: 42.0)
+    monkeypatch.setattr(fc, "gate_remaining_seconds", lambda: 20.0)
     prov, *_ = make_provider(tmp_path)
-    assert prov._spot_backoff(1) == pytest.approx(42.0)
+    assert prov._spot_backoff(1) == pytest.approx(20.0)
+    monkeypatch.setattr(fc, "gate_remaining_seconds", lambda: 99.0)
+    assert prov._spot_backoff(1) == pytest.approx(H.SPOT_GATE_WAIT_CAP_SECONDS)     # never sleeps longer than the cap
 
 
 def test_successful_fetch_lacking_the_bar_still_writes_the_no_spot_tombstone(tmp_path):
@@ -107,23 +109,6 @@ def test_fmp_spot_source_wraps_loader_and_split_failures_as_transient():
         raise RuntimeError("FMP stock_split 429")
     with pytest.raises(H.SpotSourceTransient):
         H.FmpSpotSource(ohlcv_loader=lambda s, a, b: (df, None), split_loader=bad_splits).spots("AAPL", END, END)
-
-
-def test_topup_check_distinguishes_a_failed_topup_from_a_vendor_without_the_bar():
-    df = pd.DataFrame({"Date": pd.to_datetime(["2026-03-04", "2026-03-05"]), "Open": [1.0] * 2,
-                       "High": [1.0] * 2, "Low": [1.0] * 2, "Close": [1.0] * 2})
-    # cache ends 03-05, vendor HAS 03-06: the top-up silently failed -> transient
-    with pytest.raises(H.SpotSourceTransient):
-        H.check_topup_landed("X", df, date(2026, 3, 6), lambda a, b: [date(2026, 3, 6)])
-    # vendor has nothing newer: genuine, no raise
-    H.check_topup_landed("X", df, date(2026, 3, 6), lambda a, b: [])
-    # cache already reaches `end`: the vendor is not even asked
-    H.check_topup_landed("X", df, date(2026, 3, 5), lambda a, b: pytest.fail("probe must not run"))
-
-    def probe_429(a, b):
-        raise RuntimeError("429")
-    with pytest.raises(RuntimeError):      # a probe failure propagates (classed transient upstream)
-        H.check_topup_landed("X", df, date(2026, 3, 6), probe_429)
 
 
 # ---- (2) pre-open warm -------------------------------------------------------------------------
