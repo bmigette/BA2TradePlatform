@@ -201,7 +201,7 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     Required payload keys: symbols (list). Optional: experts (list; default the 3 core
     rating/signal experts), workers (default 5), end (ISO; default now).
     """
-    if payload.get("symbols") is None:
+    if payload.get("symbols") is None and not payload.get("screener_panel"):
         return {"status": "failed", "error": "payload.symbols is required"}
 
     try:
@@ -211,6 +211,13 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             PrewarmConfigError, PrewarmFetchers, resolve_keys, run_prewarm,
         )
 
+        if payload.get("symbols") is None:
+            # panel-only task (payload.screener_panel without per-symbol experts)
+            from app.services.prewarm_fetchers import prewarm_screener_panel, resolve_keys as _rk
+            sp = payload["screener_panel"]
+            ps = prewarm_screener_panel(sp["store"], sp.get("start"), sp.get("end"), fmp_key=_rk()["fmp"],
+                                        workers=int(payload.get("workers", 4)), log=logger.info, warn=logger.warning)
+            return {"status": "completed", "summary": {"screener_panel": ps}}
         symbols = payload["symbols"]
         if isinstance(symbols, str):
             symbols = [s.strip() for s in symbols.split(",") if s.strip()]
@@ -250,6 +257,14 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"prewarm task {task_id}: fractionable {fractionable_summary}")
 
         keys = resolve_keys()
+        panel_summary = None
+        if payload.get("screener_panel"):
+            # the SAME function `ba2-test prewarm --screener-panel` calls: payload.screener_panel =
+            # {"store": <metric-store dir>, "start": ISO, "end": ISO}
+            from app.services.prewarm_fetchers import prewarm_screener_panel
+            sp = payload["screener_panel"]
+            panel_summary = prewarm_screener_panel(sp["store"], sp.get("start"), sp.get("end"), fmp_key=keys["fmp"],
+                                                   workers=workers, log=logger.info, warn=logger.warning)
         try:
             fetchers = PrewarmFetchers(fmp_key=keys["fmp"], end_date=end_date,
                                        finnhub_key=keys["finnhub"], log=logger.info)
@@ -261,6 +276,7 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             return {"status": "failed", "error": str(e)}
 
         summary["fred"] = fred_summary
+        summary["screener_panel"] = panel_summary
         logger.info(f"prewarm task {task_id}: {summary}")
         return {"status": "completed", "summary": summary}
     except Exception as e:  # noqa: BLE001

@@ -235,7 +235,7 @@ def test_enrich_with_rvol_live_path_uses_bars_for_volume_and_quotes_for_price(mo
 
     def fake_quotes(symbols, *a, **k):
         called["quotes"] = True
-        return {"KEEP": {"price": 51.0, "marketCap": 5_000_000_000, "sharesFloat": 10_000_000}}
+        return {"KEEP": {"price": 51.0, "marketCap": 5_000_000_000}}
 
     def fake_bars(symbols, *a, **k):
         called["bars"] = True
@@ -253,4 +253,4 @@ def test_enrich_with_rvol_live_path_uses_bars_for_volume_and_quotes_for_price(mo
     assert kept["relative_volume"] == 2.0
     assert kept["price"] == 51.0  # from the LIVE quote, not the bar's 50.5
     assert kept["market_cap"] == 5_000_000_000
-    assert kept["float_shares"] == 10_000_000
+    assert "float_shares" not in kept  # /quote has no float field; the float stage owns it

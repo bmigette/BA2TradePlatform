@@ -30,6 +30,7 @@ through the editor's own change handler, ``_save_rule`` is really called, and th
 are made on the dict that reaches ``update_instance``. Every mutation above now fails it.
 """
 import inspect
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -84,8 +85,13 @@ class _Editor:
         self.errors = []
         monkeypatch.setattr(settings, 'update_instance',
                             lambda rule: self.saved.append(rule.actions))
+        # ``settings.logger`` is the process-wide logger: a background thread of an earlier test (the
+        # TradeManager market-regime retry runs every 300 s) can log an ERROR while this patch is live.
+        # Only errors raised on the thread driving the editor are ``_save_rule``'s own.
+        owner = threading.get_ident()
         monkeypatch.setattr(settings.logger, 'error',
-                            lambda msg, *a, **k: self.errors.append(str(msg)))
+                            lambda msg, *a, **k: (self.errors.append(str(msg))
+                                                  if threading.get_ident() == owner else None))
 
         tab = object.__new__(settings.TradeSettingsTab)
         tab.actions = {}

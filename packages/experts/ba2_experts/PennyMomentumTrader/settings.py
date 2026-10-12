@@ -67,8 +67,8 @@ SETTINGS_DEFINITIONS: Dict[str, Any] = {
                 "type": "int",
                 "required": True,
                 "default": 500000,
-                "description": "Minimum average volume for screener",
-                "tooltip": "Stocks with lower average volume are excluded.",
+                "description": "Minimum vendor average volume for screener",
+                "tooltip": "Stocks whose average volume (as reported by the data vendor, about 3 months) is lower are excluded.",
             },
             "scan_market_cap_min": {
                 "type": "float",

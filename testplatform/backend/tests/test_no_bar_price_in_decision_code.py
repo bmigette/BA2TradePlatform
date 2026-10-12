@@ -19,6 +19,8 @@ implementation / live-only):
   * ``price_at_date`` a call to a bundle's ``price_at_date`` (a bar-based read that is NOT "now")
   * ``source-import`` a direct import of the backtest price source from decision code
   * ``ohlcv-read``    a ``get_ohlcv_data`` call (counted per file: every read must be history)
+  * ``screener-opening-print`` a call to ``price_source.screener_now_price`` (the SCREENER-ONLY exception that reads
+                      the session's opening print when the decision sits on the first bar; allowlisted ONCE)
 
 The allowlist keys are the stripped SOURCE TEXT of the site (not line numbers), so an unrelated edit
 above a site does not break it; moving or adding a site, or leaving a stale entry, does. Be pragmatic:
@@ -82,6 +84,8 @@ def scan():
                 elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                       and n.func.attr in ("get_ohlcv_data", "get_ohlcv_data_unsliced")):
                     kind = "ohlcv-read"
+                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("screener_now_price", "screener_session_high"):
+                    kind = "screener-opening-print"      # the ONE owner-approved opening-print read (screener only)
                 elif isinstance(n, (ast.Import, ast.ImportFrom)):
                     mod = getattr(n, "module", "") or ""
                     names = " ".join(a.name for a in n.names)
@@ -155,6 +159,13 @@ SITES = {
     (f"{ENG}/parity_harness.py", "source-import", "from app.services.backtest.price_source import AsOfPriceSource"):
         "the parity harness builds a price source fixture",
 }
+SITES[(f"{ENG}/screener_gate.py", "screener-opening-print", "px = ps.screener_now_price(str(syms[i]), as_of_dt)")] = \
+    ("owner-approved: screener simulation uses the opening print as live uses a quote ~30-90 s after the open "
+     "(2026-10-08; SCREENER ONLY: the gate that reproduces live's FMP screener; every other decision keeps the "
+     "ended-bars-only rule)")
+SITES[(f"{ENG}/screener_gate.py", "screener-opening-print", "h = ps.screener_session_high(str(syms[i]), as_of_dt)")] =     ("owner-approved screener exception (same as above): the forming daily bar's high through T = bars ended <= T "
+     "(+ the opening print inside the first bar); never a bar that has not ended")
+SITES[(f"{ENG}/price_source.py", "screener-opening-print", "return self.screener_now_price(symbol, as_of)")] =     "the price source's own implementation: the session-high helper falls back to the same owner-approved opening print"
 SITE_COUNTS = {("testplatform/backend/app/services/backtest/daily_engine.py", "source-import",
                 "from app.services.backtest.price_source import BacktestCacheMiss"): 5,
                ("packages/experts/ba2_experts/FMPSenateTraderWeight.py", "source-import",

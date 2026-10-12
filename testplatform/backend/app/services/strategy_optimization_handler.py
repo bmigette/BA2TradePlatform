@@ -36,12 +36,11 @@ from ba2_common.core.knowability import DEFAULT_DECISION_TIME, entry_times_for  
 
 
 def _is_intraday_interval(interval: Any) -> bool:
-    """m / h / min suffix = an intraday clock (the engine's own split, price_source._is_intraday).
-    A missing interval is read as intraday: the safe side of ``entry_times_for`` (it raises)."""
-    if interval is None:
-        return True
-    iv = str(interval).lower()
-    return iv.endswith("m") or iv.endswith("h") or iv.endswith("min")
+    """The engine's own split, ONE function (``universe_superset.interval_is_intraday``; the price source and
+    the launcher read the same one).  A missing interval is read as intraday: the safe side of
+    ``entry_times_for`` (it raises)."""
+    from ba2_providers.screener.universe_superset import interval_is_intraday
+    return interval_is_intraday(interval)
 from ba2_common.core.schedule_genes import validate_decision_times
 from app.models import (
     SessionLocal,
@@ -409,6 +408,7 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
                "total_return": results.get("total_return"),
                "max_drawdown": results.get("max_drawdown"),
                **_analysis_failures_field(results),
+               **_screener_gate_field(results),
                # The decision-time counter, so the MASTER can warn once per job (see
                # ``_decision_time_missing``). Only when non-zero: other results keep their shape.
                **_decision_time_missing(results),
@@ -1263,6 +1263,30 @@ def _analysis_failures_field(results: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _screener_gate_field(results: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"sg": {"no_price": n, "outside": m, "symbols": k}}`` for a trial whose screener gate dropped candidates for want of a
+    price (``results["screener_gate"]``), so the persisted per-trial rows and the job-level summary show it (silent otherwise)."""
+    sg = (results or {}).get("screener_gate") or {}
+    np_, out = int(sg.get("no_price_candidate_decisions") or 0), int(sg.get("outside_preload_candidate_decisions") or 0)
+    if np_ or out:
+        return {"sg": {"no_price": np_, "outside": out, "symbols": int(sg.get("no_price_symbol_count") or 0)}}
+    return {}
+
+
+def summarise_screener_gate(opt_name: str, all_results: list) -> Optional[Dict[str, Any]]:
+    """ONE job-level WARNING aggregating the screener gate's no-price counts over the trials (returned, and each trial's ``sg`` is
+    persisted in ``all_results``)."""
+    rows = [(r["sg"], r.get("key")) for r in all_results if isinstance(r, dict) and r.get("sg")]
+    if not rows:
+        return None
+    agg = {"trials": len(rows), "no_price": sum(x["no_price"] for x, _ in rows), "outside": sum(x["outside"] for x, _ in rows),
+           "max_symbols": max(x["symbols"] for x, _ in rows)}
+    logger.warning(f"[{opt_name}] screener gate: candidates without a price in {agg['trials']} trial(s): "
+                   f"{agg['no_price']} loaded-but-unpriced decisions (up to {agg['max_symbols']} symbols in one trial), "
+                   f"{agg['outside']} outside the preloaded set (see each trial's 'sg' in all_results)")
+    return agg
+
+
 def summarise_analysis_failures(opt_name: str, all_results: list) -> Optional[Dict[str, Any]]:
     """ONE job-level line aggregating the per-trial analysis-failure counts (below the refusal
     threshold they would otherwise be visible only inside each trial's results). Returns the aggregate."""
@@ -1728,6 +1752,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "max_drawdown": (results or {}).get("max_drawdown"),
                     **_decision_time_missing(results or {}),
                     **_analysis_failures_field(results or {}),
+                    **_screener_gate_field(results or {}),
                 }
             )
             if best["fitness"] is None or fit > best["fitness"]:
@@ -1805,7 +1830,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         ckpt_task_id = checkpoint_task_id(opt.name, opt_id)
         ckpt_fingerprint = checkpoint_fingerprint(
             param_space, ga, checkpoint_expert_settings_identity(backtest_cfg),
-            backtest_cfg.get("rm_toggles_unpinned"), backtest_cfg.get("screener_universe_rule"))
+            backtest_cfg.get("rm_toggles_unpinned"), backtest_cfg.get("screener_universe_rule"),
+            _screener_identity(backtest_cfg.get("screener_opt")))
         # The OBJECTIVE this run is scored under, as the trials will actually see it (the trial
         # config carries the same key, and strategy_fitness._maybe_robust reads it). Written into
         # every checkpoint and compared on resume -- see _assert_checkpoint_robustness_matches.
@@ -2064,6 +2090,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                              "total_return": out.get("total_return"),
                              "max_drawdown": out.get("max_drawdown"),
                              **({"af": out["af"]} if out.get("af") else {}),
+                             **({"sg": out["sg"]} if out.get("sg") else {}),
                              **({"dt_missing": out["dt_missing"]} if out.get("dt_missing") else {})}
                         )
                         if is_last_gen:
@@ -2478,6 +2505,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         opt.best_fitness = result["best_fitness"]
         _warn_decision_time_missing(opt.name, all_results)
         summarise_analysis_failures(opt.name, all_results)
+        summarise_screener_gate(opt.name, all_results)
         opt.all_results = all_results
         db.commit()
         push_optimization(opt, db)
@@ -2610,6 +2638,27 @@ def _build_hoisted_state(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
         # per-bar entry gate — _build_daily_trial_config skips its candidate-bound universe
         # restriction so the static run universe is kept byte-identical.
         hoisted["screener_gate_only"] = bool(screener_opt.get("gate_only"))
+        hoisted["screener_declared_ranges"] = screener_opt.get("declared_ranges")
+        # LIVE-SIMULATION gate (criteria live-daily-v2): the run carries the criteria version and the daily
+        # panel it was launched against.  A panel that does not cover the window, or was built under another
+        # definition, REFUSES here -- before any trial -- with the list of what is missing.
+        if screener_opt.get("criteria_version") or screener_opt.get("panel"):
+            from ba2_providers.screener import live_sim as _ls
+            if screener_opt.get("criteria_version") != _ls.CRITERIA_VERSION:
+                raise ValueError(f"screener_opt.criteria_version {screener_opt.get('criteria_version')!r} != the "
+                                 f"simulated {_ls.CRITERIA_VERSION!r}: a job is only resumed or re-run under the "
+                                 f"definition it was launched with")
+            if screener_opt.get("behaviour") != _ls.POST_FIX.name:
+                raise ValueError(f"screener_opt.behaviour {screener_opt.get('behaviour')!r} != {_ls.POST_FIX.name!r}")
+            # the stored reference is RELATIVE to the cache root: resolve it on THIS machine
+            panel_path = _ls.resolve_panel_path(screener_opt["panel"])
+            _ls.require_panel(panel_path, str(backtest_cfg["start_date"])[:10], str(backtest_cfg["end_date"])[:10],
+                              expect_fp=screener_opt["panel_fingerprint"])
+            from app.services.backtest.screener_gate import get_panel
+            get_panel(panel_path, screener_opt["panel_fingerprint"])   # warms the per-worker (memory-mapped) memo
+            hoisted["screener_panel"] = panel_path
+            hoisted["screener_panel_fp"] = screener_opt["panel_fingerprint"]
+            hoisted["screener_criteria"] = screener_opt["criteria_version"]
     return hoisted
 
 
@@ -2886,10 +2935,21 @@ def _build_daily_trial_config(
         # silently ignored every criterion except ``market_cap_max`` — the screener-settings-opt
         # bug. This makes the optimizer gate apply the SAME criteria as the standalone/UI path.
         eff_norm = normalize_screener_settings(eff)
+        # A genome outside the DECLARED ranges (warm-start seed from another job, stored pin) is refused
+        # BEFORE the run, not discovered as a guard failure mid-job (universe_superset.ScreenerGenomeOutOfRange).
+        from ba2_providers.screener.universe_superset import check_genes_in_declared_ranges
+        if hoisted.get("screener_panel"):
+            from ba2_providers.screener import live_sim as _lsx
+            _lsx.require_complete_settings(eff_norm, where="trial screener settings")
+        check_genes_in_declared_ranges(decoded.get("screener_overrides") or {},
+                                       hoisted.get("screener_declared_ranges"), where="genome")
         screener_runtime = {
             "store": hoisted["screener_store"],
             "settings": eff_norm,
             "cadence_days": hoisted.get("screener_cadence_days", 7),
+            **({"criteria_version": hoisted["screener_criteria"], "panel": hoisted["screener_panel"],
+                "panel_fingerprint": hoisted["screener_panel_fp"]}
+               if hoisted.get("screener_panel") else {}),
             # Defence-in-depth on the classic per-bar gate (daily_engine._screened_symbols_for_bar)
             # — see excluded_instruments above. Redundant with the enabled_instruments intersection
             # below for a non-bypass expert, but threaded through so this gate can never be the one
@@ -2914,12 +2974,20 @@ def _build_daily_trial_config(
         # the superset rule, REFUSES the run (``ScreenerUniverseRefusal``, job-fatal). A failure to
         # compute the bound propagates; it never falls back to loading the band.
         if not bypass and not hoisted.get("screener_gate_only"):
-            _df = _ms.load_store(hoisted["screener_store"])
             _sd = str(backtest_cfg["start_date"])[:10]
             _ed = str(backtest_cfg["end_date"])[:10]
-            _union = set(_ms.screened_symbol_union_visible(
-                _df, _sd, _ed, eff_norm, excluded_instruments,
-                intraday=_is_intraday_interval(backtest_cfg.get("execution_interval"))))
+            if hoisted.get("screener_panel"):
+                # ONE code path with the gate and the static superset (screener_gate): the same selection
+                # function, "now" replaced by the session's [low, high], no max_stocks cut.
+                from app.services.backtest import screener_gate as _sg
+                _union = set(_sg.prune_symbols(
+                    _sg.get_panel(hoisted["screener_panel"], hoisted["screener_panel_fp"]), _sd, _ed, eff_norm, excluded_instruments,
+                    intraday=_is_intraday_interval(backtest_cfg.get("execution_interval"))))
+            else:
+                _df = _ms.load_store(hoisted["screener_store"])
+                _union = set(_ms.screened_symbol_union_visible(
+                    _df, _sd, _ed, eff_norm, excluded_instruments,
+                    intraday=_is_intraday_interval(backtest_cfg.get("execution_interval"))))
             screener_candidate = [s for s in backtest_cfg["enabled_instruments"] if s in _union]
             # The universe guard (engine): REFUSE under the superset rule; a STORED block from before
             # the rule keeps its frozen list and only WARNS (counts + log), see rerun_handler.
@@ -3054,6 +3122,8 @@ def _build_daily_trial_config(
         # WARNS, or does not check that every symbol the per-decision gate selects is in this
         # run's loaded universe. In the whitelist (this dict is rebuilt key by key).
         "screener_universe_guard": screener_universe_guard,
+        **({"screener_static_universe": list(backtest_cfg["enabled_instruments"])}
+           if screener_universe_guard and screener_candidate is not None else {}),
         # MARKET-CONDITION entry gates (design 2026-09-15 sections 4.1/4.5). Same whitelist reason
         # as stress_spread_bps and robust_fitness above -- this dict rebuilds the trial config key
         # by key, so a knob missing HERE is inert however correctly it was parsed upstream. Both
@@ -3337,10 +3407,20 @@ def checkpoint_expert_settings_identity(backtest_cfg: Dict[str, Any]) -> Dict[st
     return out
 
 
+def _screener_identity(screener_opt: Optional[Dict[str, Any]]) -> Optional[str]:
+    """``<criteria>/<behaviour>/<panel fingerprint>`` of a live-simulation screener job (None otherwise): what the gate
+    DEFINES and which data it ran on are part of the job's identity."""
+    so = screener_opt or {}
+    if not so.get("criteria_version"):
+        return None
+    return f"{so['criteria_version']}/{so.get('behaviour')}/{so.get('panel_fingerprint')}"
+
+
 def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
                            expert_settings: Optional[Dict[str, Any]] = None,
                            rm_toggles_unpinned: Optional[List[str]] = None,
-                           screener_universe_rule: Optional[str] = None) -> str:
+                           screener_universe_rule: Optional[str] = None,
+                           screener_criteria: Optional[str] = None) -> str:
     """Identity of the SEARCH ITSELF -- a checkpoint may only be resumed into a matching one.
 
     A GA checkpoint is a list of chromosomes plus an RNG state; both are meaningless against a
@@ -3381,6 +3461,10 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     static universe a screener job searches over is part of its identity: a checkpoint (and the
     population of genomes in it, scored on the OLD cap-ranked top-50 list) must never be resumed into a
     run on the corrected superset universe, or the other way round.
+
+    ``screener_criteria`` (``backtest.screener_opt.criteria_version``, e.g. ``live-daily-v2``) joins it the
+    same way: the DEFINITION of what the gate selects (live-simulation daily criteria vs the old weekly store
+    gate) is part of the job's identity; a checkpoint scored under one must never be resumed under the other.
     """
     import hashlib
     import json
@@ -3397,6 +3481,8 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
         payload["rm_toggles_unpinned"] = sorted(rm_toggles_unpinned)
     if screener_universe_rule:
         payload["screener_universe_rule"] = screener_universe_rule
+    if screener_criteria:
+        payload["screener_criteria"] = screener_criteria
     lattice_anchor = _resolve_lattice_anchor(ga)
     if lattice_anchor != "zero":
         payload["lattice_anchor"] = lattice_anchor
@@ -3662,6 +3748,22 @@ def _load_checkpoint(task_id: str, fingerprint: Optional[str] = None) -> Optiona
         db.close()
 
 
+def assert_population_screener_genes_in_range(optimizer: Any, population: list) -> None:
+    """Refuse, AT JOB SETUP, a warm-start population holding a screener gene outside the declared range the
+    static universe was derived from (the declared ranges are the optimizer's own ``screener:*`` gene ranges).
+    The superset is derived from them, so a seed outside would select names the job never loaded."""
+    from ba2_providers.screener.universe_superset import check_genes_in_declared_ranges
+    declared = {k[len("screener:"):]: {"min": v["min"], "max": v["max"]}
+                for k, v in optimizer.param_ranges.items() if k.startswith("screener:") and v.get("type") != "choice"}
+    if not declared:
+        return
+    names = list(optimizer.param_ranges.keys())
+    for n, ind in enumerate(population):
+        vals = {names[i][len("screener:"):]: ind[i] for i in range(len(names))
+                if names[i].startswith("screener:") and ind[i] is not None}
+        check_genes_in_declared_ranges(vals, declared, where=f"warm-start individual #{n}")
+
+
 def _build_warm_start_population(
     source_opt: StrategyOptimization, optimizer: GeneticOptimizer, target_size: int
 ) -> Optional[list]:
@@ -3697,6 +3799,7 @@ def _build_warm_start_population(
             [optimizer.encode_params(e.get("params") or {}, allow_missing_stratified=True)
              for e in tail], target_size)
     population = [optimizer.encode_params(e.get("params") or {}) for e in tail]
+    assert_population_screener_genes_in_range(optimizer, population)
     while len(population) < target_size:
         population.append(optimizer.toolbox.individual())
     return population[:target_size]

@@ -64,9 +64,10 @@ _FMP_SCREENER_PAYLOAD = [
 _NO_NETWORK_SETTINGS = {
     "screener_provider": "fmp",
     "screener_market_cap_min": 50_000_000_000,
-    "screener_volume_min": 1_000_000,
+    "screener_volume_min": 0,            # an average-volume floor needs bars (stage 2); off here
+    "screener_float_min": 0,             # a float bound needs the float table; off here
     "screener_price_min": 20.0,
-    "screener_relative_volume_min": 0,   # disable Stage 2 (no /quote calls)
+    "screener_relative_volume_min": 0,   # RVOL filter off (stage 2 still runs; faked empty below)
     "screener_price_drop_pct": 0,        # disable Stage 4 (no /historical calls)
     "screener_max_stocks": 100,          # large -> no trim drift
     "screener_sort_metric": "market_cap",
@@ -83,7 +84,11 @@ def _patch_fmp(monkeypatch, payload):
     payload. No live FMP call, no real key — the LOGIC under test is unchanged.
     """
     import ba2_providers.fmp_common as fmp_common
-    import ba2_providers.screener.FMPScreenerProvider as prov_mod
+    import sys
+    import ba2_providers.screener.FMPScreenerProvider  # noqa: F401 - ensure imported
+    # The package re-exports the CLASS under the module's name, so "import ... as" yields the
+    # class; patch the real module (found in sys.modules) so the key read is actually faked.
+    prov_mod = sys.modules["ba2_providers.screener.FMPScreenerProvider"]
 
     class _Resp:
         def json(self):
@@ -96,6 +101,19 @@ def _patch_fmp(monkeypatch, payload):
     # __init__ reads FMP_API_KEY via this name -> give it a dummy so validate_config passes.
     monkeypatch.setattr(prov_mod, "get_app_setting", lambda k: "dummy-key", raising=False)
     return fake_get
+
+
+def _no_stage2_data(monkeypatch, sc):
+    """Stage 2 (volume/RVOL/live refresh) always runs. Feed it data that is NEUTRAL: 20 finished
+    sessions whose volume equals the payload's volume, and a live quote equal to the payload's
+    price / market cap -- so it must leave every provider value exactly as it was and only ADD
+    ``avg_volume`` (= the volume) and ``relative_volume`` (= 1.0)."""
+    bars = {r["symbol"]: [{"date": f"2020-01-{i + 1:02d}", "open": r["price"], "high": r["price"],
+                           "low": r["price"], "close": r["price"], "volume": r["volume"]}
+                          for i in range(20)] for r in _FMP_SCREENER_PAYLOAD}
+    quotes = {r["symbol"]: {"price": r["price"], "marketCap": r["marketCap"]} for r in _FMP_SCREENER_PAYLOAD}
+    monkeypatch.setattr(sc, "_fetch_history_bulk", lambda syms, lookback_days: bars)
+    monkeypatch.setattr(sc, "_fetch_quotes_chunked", lambda syms, *a, **k: quotes)
 
 
 def test_live_provider_byte_equal_through_pipeline(monkeypatch):
@@ -111,6 +129,7 @@ def test_live_provider_byte_equal_through_pipeline(monkeypatch):
     _patch_fmp(monkeypatch, _FMP_SCREENER_PAYLOAD)
 
     sc = StockScreener(_NO_NETWORK_SETTINGS)        # no as_of -> live path
+    _no_stage2_data(monkeypatch, sc)
     assert sc._as_of is None
     out = sc.screen()
     pipeline_results = out["results"]
@@ -129,7 +148,13 @@ def test_live_provider_byte_equal_through_pipeline(monkeypatch):
     by_symbol_pipeline = {r["symbol"]: r for r in pipeline_results}
     by_symbol_direct = {d["symbol"]: d for d in direct}
     for sym, drow in by_symbol_direct.items():
-        assert by_symbol_pipeline[sym] == drow      # identical dict shape AND values
+        # Stage 2 always runs now and ADDS avg_volume / relative_volume; every provider key
+        # keeps its value.
+        assert {k: by_symbol_pipeline[sym][k] for k in drow} == drow
+        # ... and nothing else changes except the two keys stage 2 adds.
+        assert set(by_symbol_pipeline[sym]) - set(drow) == {"avg_volume", "relative_volume"}
+        assert by_symbol_pipeline[sym]["avg_volume"] == drow["volume"]
+        assert by_symbol_pipeline[sym]["relative_volume"] == 1.0
 
     # Live-pipeline ordering contract (rank by market_cap desc) is preserved.
     mcaps = [r["market_cap"] for r in pipeline_results]
@@ -141,7 +166,9 @@ def test_live_provider_normalised_keys_unchanged(monkeypatch):
     from ba2_providers.StockScreener import StockScreener
 
     _patch_fmp(monkeypatch, _FMP_SCREENER_PAYLOAD)
-    out = StockScreener(_NO_NETWORK_SETTINGS).screen()
+    sc = StockScreener(_NO_NETWORK_SETTINGS)
+    _no_stage2_data(monkeypatch, sc)
+    out = sc.screen()
     assert out["results"], "fixture should yield survivors"
     expected = {
         "symbol", "company_name", "price", "volume", "market_cap", "sector",
@@ -149,7 +176,7 @@ def test_live_provider_normalised_keys_unchanged(monkeypatch):
         "float_shares",
     }
     for row in out["results"]:
-        assert set(row.keys()) == expected
+        assert set(row.keys()) == expected | {"avg_volume", "relative_volume"}
 
 
 def test_as_of_none_routes_to_configured_live_provider(monkeypatch):

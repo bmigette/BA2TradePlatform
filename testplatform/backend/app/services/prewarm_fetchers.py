@@ -648,3 +648,104 @@ def run_prewarm(fetchers: PrewarmFetchers, experts: List[str], symbols: List[str
         "end": end.isoformat(),
         "elapsed_seconds": round(time.time() - t0, 1),
     }
+
+
+# ---------------------------------------------------------------------------------------------------------
+# THE SCREENER DAILY PANEL (criteria live-daily-v2): everything the screener simulation needs
+# ---------------------------------------------------------------------------------------------------------
+PANEL_FIRST_DAY = "2019-03-01"          # the OHLCV cache starts here; a panel serves any job that starts later
+
+
+def prewarm_screener_panel(store_dir: str, start: Optional[str], end: Optional[str], *, fmp_key: Optional[str],
+                           share_history_max_age_days: int = 7, vendor_table_max_age_days: int = 7,
+                           workers: int = 4, force: bool = False,
+                           log: Optional[Callable[[str], None]] = None,
+                           warn: Optional[Callable[[str], None]] = None,
+                           cache_folder: Optional[str] = None) -> Dict[str, Any]:
+    """Produce / refresh every input of the screener simulation for the universe of ``store_dir`` and BUILD the
+    daily criteria panel (``ba2_providers.screener.live_sim_build``).  Resumable and idempotent: a fresh cache
+    file is never fetched twice, an up-to-date panel is a no-op.  The steps (each printed):
+
+      1. the vendor's bulk share table                  (ONE call, skipped while < ``vendor_table_max_age_days`` old)
+      2. the vendor's share history of every symbol     (one call per symbol, skipped while < N days old)
+      3. FMP historical market cap + float per symbol   (the metric-store caches; fetched only where missing)
+      4. a check that every symbol has cached DAILY bars (the data this does NOT fetch: ``ba2-test fetch-cache``)
+      5. the panel itself
+
+    The run never ends silently short: a symbol whose share history failed, or that lacks daily bars, is listed
+    in the summary, and the panel's own coverage check (``live_sim.panel_problems``) refuses a job that needs more.
+    """
+    from datetime import date as _date, timedelta as _td
+    import ba2_common.config as _cfg
+    from ba2_providers.screener import live_sim_build as lb, metric_store as ms
+
+    say = log if log is not None else logger.info
+    complain = warn if warn is not None else (log if log is not None else logger.warning)
+    if not fmp_key:
+        raise PrewarmConfigError("screener panel prewarm needs the FMP key (env FMP_API_KEY or the app-settings DB)")
+    cache = cache_folder or _cfg.CACHE_FOLDER
+    symbols = lb.store_symbols(store_dir)
+    if not symbols:
+        raise PrewarmConfigError(f"screener store {store_dir!r} holds no symbols: build it first "
+                                 f"(ba2-test build-screener-metrics)")
+    today = _date.today().isoformat()
+    end_day = max((end or today)[:10], today)          # the panel must serve today's runs too
+    first_day = min(PANEL_FIRST_DAY, (_date.fromisoformat((start or PANEL_FIRST_DAY)[:10]) - _td(days=300)).isoformat())
+    summary: Dict[str, Any] = {"symbols": len(symbols), "first_day": first_day, "end_day": end_day}
+    say(f">> screener panel: universe {len(symbols)} symbols (store {store_dir}); window {first_day}..{end_day}")
+
+    snap = lb.latest_vendor_snapshot(cache)
+    if force or not lb.vendor_snapshot_is_fresh(snap, vendor_table_max_age_days):
+        snap = lb.fetch_vendor_snapshot(cache, fmp_key)
+        say(f">> vendor share table: fetched {os.path.basename(snap)} (1 call)")
+        summary["vendor_table"] = "fetched"
+    else:
+        say(f">> vendor share table: {os.path.basename(snap)} is fresh")
+        summary["vendor_table"] = "fresh"
+
+    summary["share_history"] = lb.prefetch_shares(cache, symbols, fmp_key, max_age_days=share_history_max_age_days,
+                                                  workers=workers, log=say)
+    failures = []
+    if summary["share_history"]["failed"]:
+        failures.append(f"{summary['share_history']['failed']} share-history fetches FAILED "
+                        f"({summary['share_history']['failed_symbols']})")
+    # split calendars: the OHLCV cache is split-adjusted, the vendor's share counts are raw as of each day
+    summary["split_calendars"] = lb.prefetch_splits(cache, symbols, fmp_key, workers=workers, log=say)
+    if summary["split_calendars"]["failed"] or summary["split_calendars"]["skipped"]:
+        failures.append(f"split calendars: {summary['split_calendars']}")
+
+    # FMP historical market cap + float: only where the cache file is missing altogether
+    lead = (_date.fromisoformat(first_day) - _td(days=120)).isoformat()
+    fetched = {"market_cap": 0, "float": 0}
+    for i, sym in enumerate(symbols, 1):
+        for kind, fn in (("market_cap", ms.fetch_historical_market_cap), ("float", ms.fetch_historical_float)):
+            if os.path.exists(ms._fund_cache_path(kind, sym)):
+                continue
+            try:
+                fn(sym, fmp_key, lead, end_day)
+                fetched[kind] += 1
+            except Exception as e:  # noqa: BLE001 - collected; the run ENDS with an error listing them
+                failures.append(f"{kind} fetch for {sym} failed: {redact(str(e))}")
+        if i % 1000 == 0:
+            say(f">> market-cap/float caches: {i}/{len(symbols)} checked, fetched {fetched}")
+    summary["fundamentals_fetched"] = fetched
+    if failures:
+        # a failed fundamentals fetch is an ERROR, not a warning: the panel would silently fall back to a weaker
+        # source for those symbols. Re-run to resume (everything fetched so far is cached).
+        for f_ in failures[:20]:
+            complain(f"!! screener panel: {f_}")
+        raise PrewarmConfigError(f"screener panel prewarm: {len(failures)} fetch failure(s), first: {failures[0]}. "
+                                 f"Nothing was built; re-run to resume.")
+
+    no_bars = lb.symbols_without_daily_bars(cache, symbols)
+    summary["without_daily_bars"] = len(no_bars)
+    if no_bars:
+        complain(f"!! screener panel: {len(no_bars)} universe symbols have NO cached daily bars "
+                 f"({no_bars[:12]}...): run `ba2-test fetch-cache --timeframes 1d --start {first_day} "
+                 f"--end {end_day} --symbols <them>`; the panel carries them as unscreenable")
+    man = lb.build_daily_panel(cache, symbols, first_day, end_day, force=force, log=say)
+    summary["panel"] = {k: man.get(k) for k in ("status", "first_session", "last_session", "last_bar_date",
+                                                "n_symbols", "fresh_fraction", "criteria_version", "build_seconds")}
+    summary["shares_sources"] = (man.get("shares_report") or {}).get("sources")
+    say(f">> screener panel: {summary['panel']}; share sources {summary['shares_sources']}")
+    return summary

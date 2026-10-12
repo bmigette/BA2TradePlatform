@@ -100,9 +100,21 @@ def with_decision_times_name(name: str, times: "list | None") -> str:
 UNIVERSE_RULE_NAME_TOKEN = "-sup1"
 
 
-def with_universe_rule_name(name: str) -> str:
-    """``name`` with the superset-universe-rule token appended (idempotent)."""
-    return name if UNIVERSE_RULE_NAME_TOKEN in name else name + UNIVERSE_RULE_NAME_TOKEN
+#: The CRITERIA the screener gate simulates (``ba2_providers.screener.live_sim.CRITERIA_VERSION``, daily live
+#: simulation) are part of the identity of every CLASSIC screener job: a name without the token was gated by the
+#: old weekly store gate and must never be skipped as "completed" or resumed as this job.  Placed right after
+#: ``-sup1`` and before the digest: ``<base>-timegene-sup1-lds2-d<digest>``.  The FactorRanker (bypass) job does not
+#: use the gate and keeps ``<base>-sup1``.  Pinned equal to ``live_sim.CRITERIA_NAME_TOKEN`` by a test.
+SCREENER_CRITERIA_NAME_TOKEN = "-lds2"
+
+
+def with_universe_rule_name(name: str, *, simulated: bool = True) -> str:
+    """``name`` with the superset-universe-rule token appended and, for a job that runs through the live-
+    simulation gate (``simulated``, every classic screener job), the criteria token (idempotent)."""
+    out = name if UNIVERSE_RULE_NAME_TOKEN in name else name + UNIVERSE_RULE_NAME_TOKEN
+    if simulated and SCREENER_CRITERIA_NAME_TOKEN not in out:
+        out += SCREENER_CRITERIA_NAME_TOKEN
+    return out
 
 
 def screener_dry_run_universe_note(store: str, band: str, start: str, end: str, interval: str,

@@ -25,6 +25,16 @@ import requests
 
 from ba2_common.logger import logger
 
+import re as _re
+
+_APIKEY_RE = _re.compile(r"""(?i)((?:api_?key|apikey)(?:=|['"]?\s*:\s*['"]?))[^&\s'",)}]+""")
+
+
+def redact(text: Any) -> str:
+    """``text`` with every ``apikey=...`` / ``'apikey': '...'`` value replaced by ``***`` (request URLs, params dicts and requests'
+    exception messages all carry the key).  Use it on ANY log line or error message that can embed a URL or params."""
+    return _APIKEY_RE.sub(r"\1***", str(text))
+
 
 # --- backtest cache freeze -------------------------------------------------
 # When frozen, every TTLCache treats already-stored entries as NON-expiring for the
@@ -941,11 +951,11 @@ def fmp_http_get(
         try:
             resp = getter(url, params=params, timeout=timeout)
         except requests.exceptions.RequestException as e:
-            last_reason = e
+            last_reason = redact(e)                      # requests' messages embed the URL with the key
             _gate_arm(delays[min(attempt, len(delays) - 1)])  # brief global pause on transient err
             logger.warning(
                 f"FMP {endpoint or 'call'} request error for {symbol or '?'} "
-                f"(attempt {attempt + 1}/{total_attempts}): {e}"
+                f"(attempt {attempt + 1}/{total_attempts}): {last_reason}"
             )
             continue
 

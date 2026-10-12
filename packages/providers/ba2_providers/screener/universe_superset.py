@@ -58,12 +58,48 @@ def interval_is_intraday(interval: Any) -> bool:
     missing one)."""
     if interval is None:
         return True
-    iv = str(interval).lower()
-    return iv.endswith("m") or iv.endswith("h") or iv.endswith("min")
+    iv = str(interval).strip().lower()
+    # "min" / "hour" spellings end in n / r, so they are listed (the engine's _interval_ns reads both): a
+    # 1hour clock is intraday.  ONE function: the handler, the price source and the launcher call this.
+    return iv.endswith(("m", "h", "min", "hour"))
 
 
 class ScreenerUniverseError(ValueError):
     """The static universe cannot be derived (unknown gene, missing range). The launch must REFUSE."""
+
+
+class ScreenerGenomeOutOfRange(ScreenerUniverseError):
+    """A genome carries a screener gene outside the DECLARED range the job's static universe was derived from
+    (a warm-start seed taken from another cap band's job, a stored row's pinned gene, a stage-2 job seeded from
+    stage 1).  Its picks could lie outside the superset and could never be traded.  JOB-FATAL, raised when the
+    genome is first used (and for the whole warm-start population at job setup): never discovered mid-run."""
+
+
+def check_genes_in_declared_ranges(overrides: Dict[str, Any], declared: Optional[Dict[str, Dict[str, Any]]],
+                                   *, where: str = "genome") -> None:
+    """Raise ``ScreenerGenomeOutOfRange`` for every override (``{gene: value}``, gene names as in
+    ``SCREENER_OPT``) outside its declared ``{min, max}`` (a tolerance of a billionth of the span for float noise).
+    ``declared`` None (a job from before the declaration) = nothing to check."""
+    if not declared:
+        return
+    def _bare(name: str) -> str:
+        return name[len("screener_"):] if name.startswith("screener_") else name
+
+    norm = {_bare(k): v for k, v in declared.items()}
+    bad = []
+    for gene, val in (overrides or {}).items():
+        spec = norm.get(_bare(gene))
+        if not spec or val is None:
+            continue
+        lo, hi = float(spec["min"]), float(spec["max"])
+        tol = 1e-9 * max(1.0, abs(hi - lo))
+        if not (lo - tol <= float(val) <= hi + tol):
+            bad.append(f"{gene}={val!r} outside [{lo}, {hi}]")
+    if bad:
+        raise ScreenerGenomeOutOfRange(
+            f"{where}: " + "; ".join(bad) + ". The job's static universe is the superset of the DECLARED gene ranges; "
+            f"a value outside them can select names outside it (they could never be traded). Re-seed with values "
+            f"inside this job's ranges, or launch the job with ranges that contain them.")
 
 
 # --- gene roles: gene name (unprefixed ``screener_`` form) -> the store setting key it drives -------

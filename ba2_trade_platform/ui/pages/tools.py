@@ -14,6 +14,7 @@ import requests
 from ...config import get_app_setting
 from ...logger import logger
 from ...modules.dataproviders import get_provider
+from ba2_providers.StockScreener import ScreenerDataError
 from .symbol360 import Symbol360Tab
 
 
@@ -987,8 +988,10 @@ class PennyScreenerTab:
                         label='Price Max', value=self._price_max, format='%.2f', step=0.01
                     ).classes('w-28')
                     self.volume_min_input = ui.number(
-                        label='Volume Min', value=self._volume_min, format='%.0f', step=100000
-                    ).classes('w-36')
+                        label='Vendor Avg Volume Min', value=self._volume_min, format='%.0f', step=100000
+                    ).classes('w-36').tooltip(
+                        "The data vendor's average volume (about 3 months). Not the 20-session "
+                        "average the StockScreener-based experts use.")
                     self.mcap_min_input = ui.number(
                         label='Market Cap Min', value=self._mcap_min, format='%.0f', step=1000000
                     ).classes('w-36')
@@ -998,7 +1001,9 @@ class PennyScreenerTab:
                     self.float_max_input = ui.number(
                         label='Float Max', value=self._float_max, format='%.0f', step=10000000,
                         placeholder='e.g. 50M'
-                    ).classes('w-36')
+                    ).classes('w-36').tooltip(
+                        "Applied after the vendor's result limit, so fewer results than the "
+                        "limit can come back. A symbol with no float data passes.")
                     self.min_rvol_input = ui.number(
                         label='Min RVOL', value=self._min_rvol, format='%.1f', step=0.1
                     ).classes('w-28')
@@ -1202,6 +1207,12 @@ class PennyScreenerTab:
 
             self.loading_spinner.classes(add='hidden')
 
+        except ScreenerDataError as e:
+            # A vendor outage must be shown, not read as "no results" (it is a RuntimeError, so
+            # it would otherwise fall into the client-disconnect branch below).
+            logger.error(f"Penny screener search failed: {e}")
+            self.loading_spinner.classes(add='hidden')
+            ui.notify(f'Screener data error: {str(e)}', type='negative')
         except RuntimeError as e:
             if "client" in str(e).lower() and "deleted" in str(e).lower():
                 logger.debug("[PennyScreenerTab] Client disconnected during search")

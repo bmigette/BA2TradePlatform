@@ -777,6 +777,25 @@ def _merge_screener_opt(cfg: dict, screener_opt: dict) -> None:
     """
     import os as _os
     from ba2_common.config import SCREENER_STORE_DIR as _DEFAULT_SCREENER_STORE
+    # THIS PATH CANNOT BUILD THE JOB'S STATIC UNIVERSE (the superset of the gene ranges over the daily criteria
+    # panel, ``universe_superset`` / ``screener_gate.static_universe``): it takes ``enabled_instruments`` as the
+    # request gives it and would stamp no rule, so the run-time guard would only WARN and every genome would be
+    # scored on a list that omits its own picks (the 2026-10-07 defect).  A screener optimization is launched
+    # through `ba2-test optimize --screener` (it builds the universe, checks the panel and stamps the rule);
+    # a request that replays an already-stamped launcher config is accepted.
+    from ba2_providers.screener.universe_superset import RULE_ID as _RULE_ID
+    _bt = cfg.get("backtest") or {}
+    _bypass = bool(screener_opt.get("apply_to_expert_settings"))   # FactorRanker: its universe comes from the weekly store
+    _stamped = (_bt.get("screener_universe_rule") == _RULE_ID
+                and bool(_bt.get("enabled_instruments"))
+                and (_bypass or (bool(screener_opt.get("criteria_version")) and bool(screener_opt.get("panel"))
+                                 and bool(screener_opt.get("panel_fingerprint")))))
+    if not _stamped:
+        raise HTTPException(
+            status_code=400,
+            detail="a screener-settings optimization cannot be launched from the API: it does not build the job's "
+                   f"static universe (rule {_RULE_ID}) nor check the daily criteria panel. Launch it with "
+                   "`ba2-test optimize --screener ...` (after `ba2-test prewarm --screener-panel`).")
     store = screener_opt.get("store")
     store = _os.path.expanduser(str(store)) if store else _os.path.expanduser(str(_DEFAULT_SCREENER_STORE))
     backtest = dict(cfg.get("backtest") or {})
@@ -785,6 +804,8 @@ def _merge_screener_opt(cfg: dict, screener_opt: dict) -> None:
         "base_settings": screener_opt.get("base_settings") or {},
         "cadence_days": int(screener_opt.get("cadence_days", 7)),
         "apply_to_expert_settings": bool(screener_opt.get("apply_to_expert_settings", False)),
+        **{k: screener_opt[k] for k in ("criteria_version", "behaviour", "panel", "panel_fingerprint", "declared_ranges")
+           if k in screener_opt},
     }
     cfg["backtest"] = backtest
 

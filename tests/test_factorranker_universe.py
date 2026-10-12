@@ -95,7 +95,7 @@ def _record_store(monkeypatch, symbols=("msft",)):
     calls = []
     monkeypatch.setattr(ms, "load_store", lambda store: calls.append(store) or "DF")
     monkeypatch.setattr(ms, "screen_universe_as_of",
-                        lambda df, day, settings: list(symbols))
+                        lambda df, day, settings, excluded_symbols=None: list(symbols))   # FactorRanker passes the per-run exclusions as a 4th argument
     return calls
 
 
