@@ -1049,6 +1049,7 @@ const Backtesting: React.FC = () => {
         execution_interval: executionInterval,
         commission,
         slippage,
+        fill_model: fillModel,  // the server builds the job's account settings from it (no server-side default)
         enable_short: allowShort,  // seed symmetric short entry + RM sell gate when shorting on
         // Fitness cap/scale knobs (Task 5/7) — read per-trial by strategy_optimization_handler.
         // Trade-scale is force-off for metrics that don't support it (max_drawdown / CAR).
@@ -2735,6 +2736,7 @@ const Backtesting: React.FC = () => {
             execution_interval: executionInterval,
             commission,
             slippage,
+            fill_model: fillModel,  // the server builds the job's account settings from it (no server-side default)
             enable_short: allowShort,  // seed symmetric short entry + RM sell gate when shorting on
             ...fitnessKnobs,
           }

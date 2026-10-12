@@ -5499,25 +5499,19 @@ def _resolve_exclude_symbols_arg(spec) -> list:
 
 def _coverage_report(symbols, interval: str, start: str, end: str):
     """Per-symbol-day intraday coverage of these symbols (``ba2_providers.screener.intraday_coverage``), None on a daily clock."""
-    from ba2_common.config import CACHE_FOLDER
-    from ba2_providers.screener import intraday_coverage as _ic
-    from ba2_providers.screener.universe_superset import interval_is_intraday
-    if not interval_is_intraday(interval):
-        return None
-    return _ic.scan(symbols, os.path.join(CACHE_FOLDER, "FMPOHLCVProvider"), interval, start, end)
+    from app.services.backtest import screener_launch as _sl
+    return _sl.coverage_report(symbols, interval, start, end)
 
 
 def _coverage_preflight(command: str, symbols, args) -> None:
     """LAUNCH REFUSAL (every intraday ``optimize``): more than the stated share of symbol-days without an intraday bar.  The report
-    is printed either way (the screener gate only COUNTS candidates it cannot price)."""
-    from ba2_providers.screener import intraday_coverage as _ic
-    rep = _coverage_report(symbols, args.interval, args.start, args.end)
-    if rep is None:
-        return
-    print(f"{command}: {_ic.format_report(rep)}", flush=True)
-    probs = _ic.problems(rep)
-    if probs:
-        sys.exit(f"{command}: REFUSED (intraday coverage):\n  - " + "\n  - ".join(probs))
+    is printed either way (the screener gate only COUNTS candidates it cannot price).  The check is the function the web API
+    shares (``screener_launch.intraday_coverage_preflight``)."""
+    from app.services.backtest import screener_launch as _sl
+    try:
+        _sl.intraday_coverage_preflight(symbols, args.interval, args.start, args.end, command=command)
+    except _sl.ScreenerLaunchRefused as e:
+        sys.exit(f"{command}: " + e.body)
 
 
 def _apply_exclude_symbols(command: str, backtest_block: dict, exclude_symbols: list) -> None:
@@ -6962,170 +6956,45 @@ def _cmd_optimize(args) -> int:
         if getattr(args, "screener", False):
             if not args.screener_store:
                 sys.exit("optimize: --screener requires --screener-store")
-            from ba2_providers.screener import metric_store as _msb
-            from ba2_common.core.deploy_parity import SCREENER_OFF_VALUES as _OFF
-            # EVERY selection key is stated: the grid's base is the floors OFF (explicit zeros, as the enabled prod
-            # instances carry), never left to live's defaults (price_min 20, volume_min 500,000, float_min 10M).
-            base = {**_OFF, **_msb.normalize_screener_settings(
-                json.load(open(args.screener_base_json)) if args.screener_base_json else {})}
-            # Cap-band job: override the market-cap gene RANGE for the band and pin market_cap_max in
-            # the base settings, so each band optimizes a DISJOINT, smaller cap universe (5min-feasible).
-            # Other genes unchanged. Default (no band) keeps the original large-cap-floor behaviour.
-            _cap_band = getattr(args, "screener_cap_band", None)
-            _scr_opt, base = _us.apply_cap_band(_SCREENER_OPT, base, _cap_band)
-            # LIVE-SIMULATION gate (criteria live-daily-v2): every CLASSIC screener job is gated by the daily
-            # criteria panel (the live screener's own criteria, one evaluation per decision day).  The bypass
-            # expert (FactorRanker) builds its universe from the weekly store itself and is NOT covered.
-            # The panel must cover the job's window, carry this criteria version, and the launch REFUSES with
-            # the list of what is missing (build: `ba2-test prewarm --screener-panel ...`).
-            _use_sim = not spec.get("bypass")
-            _panel_dir = None
-            if _use_sim:
-                from ba2_providers.screener import live_sim as _ls0
-                _all = {**base, **{(k[len("screener_"):] if k.startswith("screener_") else k): True
-                                   for k, v in _scr_opt.items() if v and v.get("optimize")}}
-                try:
-                    _ls0.require_complete_settings(_all, where="optimize --screener")
-                except _ls0.SimulationRefusal as _e:
-                    sys.exit(f"optimize: --screener REFUSED: {_e}")
-                print("optimize: screener base settings (every selection key explicit; genes override): "
-                      + json.dumps({k: base[k] for k in sorted(base)}), flush=True)
-            if _use_sim:
-                from ba2_providers.screener import live_sim as _ls
-                from ba2_common.config import CACHE_FOLDER as _CF0
-                # the newest complete panel of THIS machine, resolved ONCE here and stamped on the job (path relative to
-                # the cache root + fingerprint): the job never switches panel afterwards, a worker resolves the same
-                # relative path in its own cache.
-                _panel_dir = (os.path.abspath(args.screener_panel) if getattr(args, "screener_panel", None)
-                              else _ls.latest_panel(_CF0))
-                _probs = (_ls.panel_problems(_panel_dir, args.start, args.end) if _panel_dir
-                          else [f"no daily criteria panel under {_ls.panel_root(_CF0)}"])
-                if _probs:
-                    sys.exit("optimize: --screener REFUSED: the daily screener-criteria panel cannot serve this "
-                             "job:\n  - " + "\n  - ".join(_probs) +
-                             "\nBuild / refresh it (and the vendor share data it needs) with:\n"
-                             f"  ba2-test prewarm --screener-panel --screener-store {args.screener_store} "
-                             f"--start {args.start} --end {args.end}\n"
-                             "or `ba2-test build-screener-metrics ... --daily-panel`. Remote workers receive it with "
-                             "`cache push` (directory screener/daily_panel, ~0.8 GB).")
-            if _use_sim:
-                _exm = (_ls.read_manifest(_panel_dir) or {}).get("excluded_unusable") or []
-                if _exm:
-                    print(f"optimize: screener panel EXCLUDES {len(_exm)} listed symbols with knowingly unusable data (reviewed list "
-                          f"ba2_providers/screener/panel_exclusions.json): "
-                          + "; ".join(f"{e['symbol']} ({e['reason'][:60]}..., {e['added']}, reviewed by {e['reviewed_by']})"
-                                      for e in _exm), flush=True)
-            backtest_block["screener_opt"] = {
-                "store": args.screener_store,
-                "base_settings": base,
-                **({"criteria_version": _ls.CRITERIA_VERSION, "behaviour": _ls.POST_FIX.name,
-                    "panel": _ls.panel_rel(_CF0, _panel_dir),
-                    "panel_fingerprint": _ls.read_manifest(_panel_dir)["panel_fingerprint"]} if _use_sim else {}),
-                # the ranges the static universe is the superset of: a genome outside them is refused
-                "declared_ranges": {k[len("screener_"):] if k.startswith("screener_") else k:
-                                    {"min": v["min"], "max": v["max"]}
-                                    for k, v in _scr_opt.items() if v and v.get("optimize")},
-                "cadence_days": int(args.screener_cadence_days),  # default 7 = weekly
-                # BYPASS experts (e.g. FactorRanker) ignore the classic entry-gate path, so the
-                # CLASSIC `screener_runtime` gate (which gates entries to the per-day screened
-                # universe) has no effect on them. Instead they read `universe_source` /
-                # `screener_store` / `screener_*` straight off their OWN expert settings to build
-                # their DYNAMIC universe from the fast metric_store. This flag tells
-                # `_build_daily_trial_config` to push the store + decoded screener genes onto the
-                # bypass expert's per-trial settings each generation. For NON-bypass experts the
-                # flag is False and only the classic `screener_runtime` path applies (unchanged).
-                "apply_to_expert_settings": bool(spec.get("bypass")),
-            }
-            from ba2_providers.screener import metric_store as _ms
-            _store_df = _ms.load_store(args.screener_store)
-            if _store_df.empty:
-                sys.exit(f"optimize: --screener-store {args.screener_store!r} has no symbols")
-            # THE STATIC UNIVERSE = the true SUPERSET (ba2_providers.screener.universe_superset): every
-            # symbol that passes the LOOSEST values of the FILTER genes on at least one scan visible
-            # during [start, end], with NO max_stocks cut and no sort. The previous rule applied the
-            # loosest max_stocks (50, by market cap) AFTER the filters, so only the 50 largest names of
-            # each weekly band entered the list; a genome with tighter filters selects names the
-            # loosest top-50 never contained, and those picks were silently untradable (measured:
-            # 13% of row 1088's own selections, 71% of row 1107's). The per-decision gate applies the
-            # genome's own filters, sort and cut. A screener gene whose range or role is unknown
-            # REFUSES the launch (ScreenerUniverseError): the loosest value is never guessed.
-            _ranges = _us.gene_ranges_from_opt(_scr_opt)
+            # The launch preparation is ONE function shared with the web API
+            # (app.services.backtest.screener_launch): base settings, the daily-panel gate (classic jobs; the bypass
+            # expert FactorRanker keeps the weekly store gate), the superset static universe, the hermetic cache
+            # check.  Every refusal is a ScreenerLaunchRefused whose CLI text is the historical one.
+            from app.services.backtest import screener_launch as _sl
+            _sreq = _sl.ScreenerLaunchRequest(
+                store=args.screener_store, start=args.start, end=args.end, interval=args.interval,
+                base_settings=(json.load(open(args.screener_base_json)) if args.screener_base_json else {}),
+                scr_opt=_SCREENER_OPT, cadence_days=int(args.screener_cadence_days),   # default 7 = weekly
+                bypass=bool(spec.get("bypass")), surface=_sl.CLI,
+                cap_band=getattr(args, "screener_cap_band", None),
+                panel=(os.path.abspath(args.screener_panel) if getattr(args, "screener_panel", None) else None),
+                exclude_uncached=bool(getattr(args, "screener_exclude_uncached", False)))
             try:
-                if _use_sim:
-                    # the SAME selection function as the per-decision gate and the per-trial prune
-                    from app.services.backtest import screener_gate as _sg
-                    enabled = _sg.static_universe(
-                        _sg.get_panel(_panel_dir), args.start, args.end, base, _ranges,
-                        intraday=_us.interval_is_intraday(args.interval))
-                else:
-                    enabled = _us.static_universe(
-                        _store_df, args.start, args.end, base, _ranges,
-                        intraday=_us.interval_is_intraday(args.interval))
-            except _us.ScreenerUniverseError as _e:
-                sys.exit(f"optimize: --screener REFUSED: {_e}")
-            if not enabled:
-                sys.exit(f"optimize: --screener-store {args.screener_store!r} selected zero symbols "
-                         f"for {args.start}..{args.end} under the loosest filter settings")
-            print(f"optimize: screener static universe = {len(enabled)} symbols "
-                  f"(rule {_us.RULE_ID}: loosest-filter superset over the visible scans of "
-                  f"{args.start}..{args.end}, no max_stocks cut)", flush=True)
-            # HERMETIC cache check. The backtest never fetches mid-run, so every symbol of the static
-            # universe needs cached bars for the execution interval AND daily (the experts' history).
-            # The metric store (built from DAILY) legitimately contains names with no INTRADAY series
-            # (preferred shares / baby bonds, a few thin or delisted tickers). They are NOT silently
-            # dropped any more: a dropped name the gate can still select would be an untradable pick
-            # (the exact failure this rule fixes). The launch REFUSES with the list, unless
-            # --screener-exclude-uncached turns them into a RECORDED screen exclusion
-            # (backtest.excluded_instruments), which removes them from the per-decision gate too,
-            # so the run-time universe guard stays at zero and a re-run reproduces the exclusion.
-            # Match the native cache file CACHE_FOLDER/FMPOHLCVProvider/<SYM>_<interval>.parquet
-            # (with the provider's symbol sanitisation: '-' -> '_'/'.').
-            import os as _os
-            from ba2_common.config import CACHE_FOLDER as _CF
-            _cdir = _os.path.join(_CF, "FMPOHLCVProvider")
-            _ivs = sorted({args.interval, "1d"})
-            def _has_bars(sym: str) -> bool:
-                for _iv in _ivs:
-                    if not any(_os.path.exists(_os.path.join(_cdir, f"{cand}_{_iv}.parquet"))
-                               for cand in (sym, sym.replace("-", "_"), sym.replace("-", "."))):
-                        return False
-                return True
-            _uncached = [s for s in enabled if not _has_bars(s)]
-            if getattr(args, "print_universe", False):
-                # DRY RUN for preflights (grid scripts): the job's static universe through the SAME function the
-                # launch uses, and the symbols a launch would refuse on; nothing is submitted.
-                _cov = _coverage_report([x for x in enabled if x not in set(_uncached)], args.interval, args.start, args.end)
-                from ba2_providers.screener import intraday_coverage as _icm
-                _cov_probs = _icm.problems(_cov) if _cov else []
-                print("PRINT-UNIVERSE " + json.dumps({"static_universe_size": len(enabled),
-                                                      "intraday_missing_coverage_share": (_cov["missing_coverage_share"] if _cov else None),
-                                                      "intraday_no_file": (_cov["no_intraday_file"] if _cov else None),
-                                                      "uncached": _uncached, "interval": args.interval,
-                                                      "rule": _us.RULE_ID,
-                                                      "criteria_version": (_ls.CRITERIA_VERSION if _use_sim else None)}),
-                      flush=True)
-                sys.exit(0 if (not _uncached or getattr(args, "screener_exclude_uncached", False)) and not _cov_probs else 3)
-            if _uncached:
-                if not getattr(args, "screener_exclude_uncached", False):
-                    sys.exit(
-                        f"optimize: --screener REFUSED: {len(_uncached)} of the {len(enabled)} static-"
-                        f"universe symbols have no cached {'/'.join(_ivs)} OHLCV under {_cdir}: "
-                        f"{', '.join(_uncached)}. Fetch them (ba2-test fetch-cache --timeframes "
-                        f"{','.join(_ivs)} --symbols ...), or pass --screener-exclude-uncached to "
-                        f"EXCLUDE them from the screen (recorded on the run as excluded_instruments).")
-                _uncached_exclusions = list(_uncached)
-                _gone = set(_uncached)
-                enabled = [s for s in enabled if s not in _gone]
-                print(f"optimize: --screener-exclude-uncached: EXCLUDING {len(_uncached)} screened symbols "
-                      f"with no cached {'/'.join(_ivs)} OHLCV from the screen: {', '.join(_uncached)} "
-                      f"-> {len(enabled)} tradeable.", flush=True)
-            if not enabled:
-                sys.exit(f"optimize: 0 of the screened universe has cached {'/'.join(_ivs)} OHLCV -- fetch it "
-                         f"first (ba2-test fetch-cache --timeframes {args.interval} ...).")
-            backtest_block["enabled_instruments"] = enabled
-            backtest_block["screener_universe_rule"] = _us.RULE_ID
-            universe = enabled  # for the progress line / submit description below
-            screener_genes = {f"screener:{k}": v for k, v in _scr_opt.items()}
+                _prep = _sl.prepare_screener_launch(_sreq)
+                if getattr(args, "print_universe", False):
+                    # DRY RUN for preflights (grid scripts): the job's static universe through the SAME function the
+                    # launch uses, and the symbols a launch would refuse on; nothing is submitted.
+                    _uncached, enabled = _prep.uncached, _prep.enabled
+                    _cov = _coverage_report([x for x in enabled if x not in set(_uncached)], args.interval, args.start, args.end)
+                    from ba2_providers.screener import intraday_coverage as _icm
+                    _cov_probs = _icm.problems(_cov) if _cov else []
+                    print("PRINT-UNIVERSE " + json.dumps({"static_universe_size": len(enabled),
+                                                          "intraday_missing_coverage_share": (_cov["missing_coverage_share"] if _cov else None),
+                                                          "intraday_no_file": (_cov["no_intraday_file"] if _cov else None),
+                                                          "uncached": _uncached, "interval": args.interval,
+                                                          "rule": _us.RULE_ID,
+                                                          "criteria_version": _prep.criteria_version}),
+                          flush=True)
+                    sys.exit(0 if (not _uncached or getattr(args, "screener_exclude_uncached", False)) and not _cov_probs else 3)
+                _launch = _sl.apply_uncached_policy(_prep)
+            except _sl.ScreenerLaunchRefused as _e:
+                sys.exit(_e.text)
+            backtest_block["screener_opt"] = _launch.screener_opt
+            backtest_block["enabled_instruments"] = _launch.enabled_instruments
+            backtest_block["screener_universe_rule"] = _launch.universe_rule
+            _uncached_exclusions = list(_launch.uncached_exclusions)
+            universe = _launch.enabled_instruments  # for the progress line / submit description below
+            screener_genes = dict(_launch.genes)
 
         # GATE-ONLY screener (--screener-gate-store): attach the metric store PURELY as a
         # per-bar entry gate (the options grid's max-stock-price cap) — the run universe stays

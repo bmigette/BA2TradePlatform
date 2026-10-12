@@ -245,8 +245,13 @@ def test_launcher_screener_block_builds_the_superset_and_stamps_the_rule():
     import ba2test_launcher as L
     assert L._SCREENER_OPT is us.SCREENER_OPT and L._SCREENER_CAP_BANDS is us.SCREENER_CAP_BANDS
     src = open(L.__file__, encoding="utf-8").read()
-    assert "_us.static_universe(" in src and 'backtest_block["screener_universe_rule"] = _us.RULE_ID' in src
-    assert "screened_symbol_union(_store_df" not in src          # the old cap-ranked rule is gone
+    # The universe build + stamping moved into the function the web API shares (app.services.backtest.screener_launch);
+    # the launcher calls it and writes the stamps it returns.
+    from app.services.backtest import screener_launch as sl
+    shared = open(sl.__file__, encoding="utf-8").read()
+    assert "_us.static_universe(" in shared and "universe_rule=_us.RULE_ID" in shared
+    assert "_sl.prepare_screener_launch" in src and 'backtest_block["screener_universe_rule"] = _launch.universe_rule' in src
+    assert "screened_symbol_union(_store_df" not in src + shared          # the old cap-ranked rule is gone
 
 
 def _block(store, instruments, rule=None):
