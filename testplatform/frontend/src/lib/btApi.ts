@@ -10,9 +10,19 @@ async function jget<T>(path: string): Promise<T> {
   if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
   return r.json();
 }
+// A string `detail` (the API's refusals, e.g. a screener launch the simulation cannot serve) is shown as the
+// message itself, so a dialog prints the server's text rather than a raw JSON body.
+async function postErrorMessage(r: Response): Promise<string> {
+  const text = await r.text();
+  try {
+    const detail = JSON.parse(text)?.detail;
+    if (typeof detail === 'string' && detail) return detail;
+  } catch { /* not JSON: fall through to the raw body */ }
+  return `${r.status} ${text}`;
+}
 async function jpost<T>(path: string, body: unknown): Promise<T> {
   const r = await fetch(`${API_BASE}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  if (!r.ok) throw new Error(await postErrorMessage(r));
   return r.json();
 }
 async function jdelete<T>(path: string): Promise<T> {

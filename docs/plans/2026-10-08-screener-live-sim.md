@@ -221,9 +221,8 @@ is missing, does not cover `[start - 260 d, end]` (bars through the last session
 format, lists a symbol that is in the vendor's CURRENT listing but has stale bars (the build lists the symbols treated as delisted: 85 now) or has
 no share source / no split calendar (acknowledge with `acknowledged_stale` at build time). Today's real build is refused for 8 stale listed
 symbols (DBRG, GORO, IPEXR, IPEXU, MIDD, MOD, RBKB, SNFCA: `fetch-cache` them) and CICC (no share source).
-The API route `_merge_screener_opt` refuses any screener optimization that is not already stamped with the rule (+ criteria and panel for
-classic experts); the web UI's optimization form receives that HTTP 400 text (the request is rejected before a job exists; rendering of the
-detail by the front end was not verified in a browser).
+The API route `_merge_screener_opt` no longer redirects to the CLI: the SERVER builds the job's universe and stamps with the CLI's own
+functions (section 5b, "Web UI"); the refusals above come back as HTTP 409 with the CLI's text.
 
 `interval_is_intraday` now treats `"1hour"` / `"4hour"` as intraday (it classified them as daily). No driver, launcher choice or doc uses those
 spellings (the cache holds `1h`, which was always intraday); the change is kept and is a no-op for every existing run.
@@ -238,9 +237,46 @@ spellings (the cache holds `1h`, which was always intraday); the change is kept 
 * **Job-end alarm**: a candidate that had no price because it was not loaded, although the bounds-based selection (the prune's function) returns it
   for that day, is job-fatal (`PanelGate.assert_complete`, `ScreenerGateRefusal`). The no-price counts are logged at job end and every trial row
   of the persisted `all_results` carries `sg: {no_price, outside, symbols}`.
-* **Web UI**: `Backtesting.tsx` sends `screener_opt` without the launcher's stamp (`screener_universe_rule`, `enabled_instruments`, panel); the
-  API REFUSES it (400, message names `ba2-test optimize --screener`), classic and FactorRanker alike (the UI never sends
-  `apply_to_expert_settings`). Test: `test_strategies_screener_opt_api.py`. A UI screener launch needs an owner decision.
+* **Web UI** (changed by `fix/ui-screener-launch`; the owner approved a UI launch, which supersedes the refusal this note first recorded).
+  `Backtesting.tsx` still sends `screener_opt = {param_ranges, cadence_days, base_settings[, store]}` without any stamp; the SERVER now builds
+  the stamps with the SAME code as `ba2-test optimize --screener`: `app/services/backtest/screener_launch.py` (`prepare_screener_launch` /
+  `apply_uncached_policy` / `intraday_coverage_preflight`; the launcher's `_cmd_optimize` calls it and writes the stamps it returns) and
+  `screener_job_request.apply_screener_request` (UI request -> stamped config; called by `strategies._merge_screener_opt` for
+  `POST /{id}/optimize` and `/optimize-batch`). Stamped: `screener_universe_rule`, `enabled_instruments` (the superset), `excluded_instruments`
+  (uncached names, when the request says `screener_opt.exclude_uncached`), `screener_opt.{criteria_version, behaviour, panel (relative),
+  panel_fingerprint, declared_ranges, apply_to_expert_settings}`, the `screener:screener_<gene>` genes; the job name gets `-sup1` (+ `-lds2`
+  for a panel-gated job). The grid drivers' `-timegene` and `-d<digest>` tokens belong to a driver's argv and are not added. Tests:
+  `test_screener_launch_shared.py` (identical stamps, universe, genes, name tokens and checkpoint fingerprint from the CLI and the API for the
+  same request) and `test_strategies_screener_opt_api.py`.
+  * Refusals reach the UI as **409** with the CLI's body (prefix `screener optimization REFUSED:` instead of `optimize: --screener REFUSED:`;
+    the remedy names the request field, e.g. `screener_opt.exclude_uncached`, not the flag): selection keys not stated
+    (`screener_opt.base_settings`), no panel / another criteria version / window not covered / stale-listed symbols / pending exclusion entries
+    (one `\n  - ` line per problem), an unknown gene (no declared role), zero symbols, uncached symbols (the list), intraday coverage below 95 %,
+    a warm start whose seeds lie outside the declared ranges (`warmStartFromOptimizationId`, checked at launch; the handler keeps its own
+    job-fatal check). **400** for a malformed request (missing `cadence_days` / `base_settings` / window / `execution_interval` /
+    `fill_model`, no searched range, unknown `cap_band`, a `panel` outside the panel root, `apply_to_expert_settings` contradicting the expert,
+    `gate_only`). Nothing is enqueued on a refusal; a batch builds and validates every job before it enqueues any.
+  * A request that carries stamps (a replayed config) is VERIFIED against the server's own build, never trusted: rule id, `criteria_version`,
+    `behaviour`, `panel` (must be the panel the server resolves, under the cache's panel root), `panel_fingerprint` (through
+    `panel_problems(expect_fp=...)`: a job never switches panel), `declared_ranges`, and `enabled_instruments` (equal, as a set, to the universe
+    rebuilt from that panel). The server always writes its own values.
+  * FactorRanker (bypass expert, detected from the class): weekly-store universe, `apply_to_expert_settings: True`, no panel stamp, name `-sup1`.
+    `apply_to_expert_settings` is what makes `_build_daily_trial_config` push the store and the decoded screener genes onto a bypass expert's own
+    settings (it resolves its universe from the store, not from `enabled_instruments`). It is a property of the EXPERT, so the server derives it
+    and refuses a request that states the opposite (the old route copied it from the request; the UI never sent it). Option jobs: a gate-only
+    request (`screener_opt.gate_only`, the option grids' per-strategy price cap) is refused naming `--screener-gate-store`, whose per-strategy
+    caps live in the launcher's option tables; a request without `screener_opt` is not touched.
+  * The UI's optimization block (`expert` + `universe`) is not the shape the handler reads (`experts`, `enabled_instruments`,
+    `account_settings`, `warmup_days`, `seed`; see `_build_daily_trial_config`). The screener path completes exactly what the CLI derives from
+    the same inputs (`seed` = the GA seed, `warmup_days` = `derive_warmup_days`, `account_settings` from the form's capital / commission /
+    slippage / `fill_model`, `experts` from `expert`) and refuses (400) when a key is still missing, instead of enqueueing a job that fails every
+    trial. Both dialogs now send `fill_model` (the form's existing value); `btApi.jpost` shows a string `detail` as the message (the batch
+    dialog printed the raw JSON body; the single dialog already showed `detail`). Needs a front-end build (not run here: no node_modules).
+  * Cost: the routes are plain `def`, so FastAPI runs the build in its threadpool (the event loop is never blocked); one lock serialises
+    builds; a batch builds once per distinct job. Measured (this machine, no daily panel exists locally): the refusal for a missing panel 0.22 s;
+    FactorRanker over the real weekly store (1.28 M rows, window 2025H1, 2 028 symbols) 23.9 s cold (store load, held in the server process
+    afterwards) and 0.3 s warm; a synthetic 2 000-symbol panel (330 sessions) 0.37 s. A real classic launch (panel of ~1 500 sessions plus the
+    intraday coverage scan of ~2 000 symbols) was NOT measured.
 * Cost: `screener_session_high` is a bisect + array read after one vectorised running-high pass per symbol (+8 bytes per bar of a screened
   symbol); the drop-window peak reads the memory-mapped high / low arrays (no 72 MB private copy per process).
 * The API key is scrubbed (`fmp_common.redact`) from the screener's request/exception log lines.
