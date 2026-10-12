@@ -255,3 +255,20 @@ hash); (3) per candidate after stage 2: the `/quote` price and market cap used, 
 symbol, peak, current, drop; (6) per Weinstein candidate: the number of closes, SMA150, SMA150 20 bars earlier, slope, last close; (7) the
 resolved settings dict. `tools/screener_parity_report.py` reads `LIVE SELECTION` and `LIVE STAGES` and prints the stage counts next to the
 simulation's `diag` (same keys as live's stats).
+
+## 5c. Exclusion list settled 2026-10-12; acknowledged delistings
+Reviewed by the owner (B. Migette) on 2026-10-12. `panel_exclusions.json` entries now carry an optional `kind`:
+* `exclude` (default): the data is unusable, the gate never selects the symbol. Settled: GORO (vendor history is another / spliced company,
+  cache frozen 2026-06-30), PARA (reused ticker, vendor splices Paramount with Banzai, cache ends 2025-08-08), CICC (7.5 % baby bond, not an equity).
+  MIDD, MOD, RBKB, SNFCA were removed: their daily history was refetched on 2026-10-08 and is consistent.
+* `delisted` + `last_session` (the symbol's last traded session = its last cached bar): a KNOWN delisting with sound data (DBRG 2026-09-29,
+  IPEXR and IPEXU 2026-09-25, QRVO 2026-10-02). The symbol keeps its whole history and is a candidate on every morning up to and including
+  `last_session`; on later mornings its previous close and share count are masked (`live_sim_build.mask_after_last_session`), so it is never
+  selected (live's vendor lists only actively trading names). It stops being "stale-listed" (a delisted name the vendor's listing still shows),
+  which otherwise refuses the launch. The build REFUSES when `last_session` differs from the symbol's last cached bar (the reviewer saw other
+  data). The entry is recorded in the manifest (`acknowledged_delisted`, with the reviewer), printed by the build and by `optimize --screener`,
+  is part of the panel fingerprint (the file's bytes always were), and a `pending` reviewer refuses the launch like a pending exclusion.
+  Before this change the only way out was the build-time `acknowledged_stale` argument, which no CLI flag reached, was not recorded with a
+  reviewer and did not stop the symbol being selected in live's 35-day window after its last bar.
+The 85 symbols "treated as delisted" (not in the vendor listing) are unchanged: they keep history and are not masked after their last bar
+(their previous close can linger in the 35-day window). Listing them as `delisted` entries would mask them.

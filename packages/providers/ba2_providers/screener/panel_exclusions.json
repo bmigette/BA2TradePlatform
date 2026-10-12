@@ -1,41 +1,58 @@
 {
- "_doc": "REVIEWED exclusion list of listed symbols whose data is knowingly unusable for the screener simulation. Read by the panel build (recorded in the manifest as excluded_unusable, printed) and by the launch (printed; the gate never selects them). Never a silent tolerance: every entry needs a symbol, a reason, a date and a reviewer; a build prints entries that were not needed.",
+ "_doc": "REVIEWED list of symbols the screener simulation treats specially. Read by the panel build (recorded in the manifest, printed) and by the launch (printed). Never a silent tolerance: every entry needs a symbol, a reason, a date and a reviewer; an entry whose reviewed_by starts with 'pending' REFUSES the launch. kind 'exclude' (default): the symbol's data is knowingly unusable, the gate never selects it. kind 'delisted' (needs last_session = the last session the symbol traded = its last cached daily bar): a KNOWN delisting with sound data; the symbol keeps its history and is a candidate on every morning up to and including last_session, never after; it stops counting as 'stale-listed' (a delisted name the vendor's listing still shows). Delisting entries must match the cached bars exactly or the build refuses. The file's bytes are part of the panel fingerprint.",
  "entries": [
   {
    "symbol": "GORO",
-   "reason": "daily top-up REFUSED on 2026-10-07: the vendor's bars disagree with the cached bars (split-like rescale or mismatch); not forced, so the cache is stale and the symbol cannot be screened",
-   "added": "2026-10-08",
-   "reviewed_by": "pending owner review"
+   "kind": "exclude",
+   "reason": "vendor history unusable: the vendor series is a different / spliced company (profile names Goldgroup Mining; ratio to our cache wanders 0.07-8.2 over time); the cache is frozen at 2026-06-30",
+   "added": "2026-10-12",
+   "reviewed_by": "owner (B. Migette) 2026-10-12"
   },
   {
-   "symbol": "MIDD",
-   "reason": "daily top-up REFUSED on 2026-10-07: the vendor's bars disagree with the cached bars (split-like rescale or mismatch); not forced, so the cache is stale and the symbol cannot be screened",
-   "added": "2026-10-08",
-   "reviewed_by": "pending owner review"
-  },
-  {
-   "symbol": "MOD",
-   "reason": "daily top-up REFUSED on 2026-10-07: the vendor's bars disagree with the cached bars (split-like rescale or mismatch); not forced, so the cache is stale and the symbol cannot be screened",
-   "added": "2026-10-08",
-   "reviewed_by": "pending owner review"
-  },
-  {
-   "symbol": "RBKB",
-   "reason": "daily top-up REFUSED on 2026-10-07: the vendor's bars disagree with the cached bars (split-like rescale or mismatch); not forced, so the cache is stale and the symbol cannot be screened",
-   "added": "2026-10-08",
-   "reviewed_by": "pending owner review"
-  },
-  {
-   "symbol": "SNFCA",
-   "reason": "daily top-up REFUSED on 2026-10-07: the vendor's bars disagree with the cached bars (split-like rescale or mismatch); not forced, so the cache is stale and the symbol cannot be screened",
-   "added": "2026-10-08",
-   "reviewed_by": "pending owner review"
+   "symbol": "PARA",
+   "kind": "exclude",
+   "reason": "reused ticker: the vendor splices the old Paramount with Banzai (symbol change 2026-08-07); our cache holds Paramount only, ending 2025-08-08",
+   "added": "2026-10-12",
+   "reviewed_by": "owner (B. Migette) 2026-10-12"
   },
   {
    "symbol": "CICC",
-   "reason": "listed by the vendor but no share-count source (no vendor history, no FMP market-cap series): its market cap cannot be stated",
-   "added": "2026-10-08",
-   "reviewed_by": "pending owner review"
+   "kind": "exclude",
+   "reason": "not an equity: a 7.5% baby bond (notes); the vendor has no share count for it",
+   "added": "2026-10-12",
+   "reviewed_by": "owner (B. Migette) 2026-10-12"
+  },
+  {
+   "symbol": "DBRG",
+   "kind": "delisted",
+   "last_session": "2026-09-29",
+   "reason": "delisted 2026-09-30; vendor and cache histories identical and both end at the last bar; a valid member of the universe until then",
+   "added": "2026-10-12",
+   "reviewed_by": "owner (B. Migette) 2026-10-12"
+  },
+  {
+   "symbol": "IPEXR",
+   "kind": "delisted",
+   "last_session": "2026-09-25",
+   "reason": "delisted 2026-09-25 (right of IPEX); vendor and cache histories identical and both end at the last bar",
+   "added": "2026-10-12",
+   "reviewed_by": "owner (B. Migette) 2026-10-12"
+  },
+  {
+   "symbol": "IPEXU",
+   "kind": "delisted",
+   "last_session": "2026-09-25",
+   "reason": "delisted 2026-09-25 (unit of IPEX); vendor and cache histories identical and both end at the last bar",
+   "added": "2026-10-12",
+   "reviewed_by": "owner (B. Migette) 2026-10-12"
+  },
+  {
+   "symbol": "QRVO",
+   "kind": "delisted",
+   "last_session": "2026-10-02",
+   "reason": "delisted 2026-10-06; vendor and cache histories identical and both end at the last bar (2026-10-02); a valid, tradeable member of the universe 2020-2025",
+   "added": "2026-10-12",
+   "reviewed_by": "owner (B. Migette) 2026-10-12"
   }
  ]
 }

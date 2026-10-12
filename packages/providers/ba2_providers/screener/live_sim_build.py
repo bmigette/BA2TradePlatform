@@ -49,17 +49,52 @@ SHARES_HIST_URL = "https://financialmodelingprep.com/api/v4/historical/shares_fl
 EXCLUSIONS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panel_exclusions.json")
 
 
-def load_exclusions(path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-    """``{SYMBOL: entry}`` of the reviewed exclusion list.  Every entry must carry symbol, reason, added and reviewed_by."""
+def load_entries(path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Every entry of the reviewed file, validated.  An entry needs symbol, reason, added and reviewed_by.
+    ``kind`` is ``"exclude"`` (default: the symbol is removed from every screen) or ``"delisted"`` (the symbol was
+    delisted and its data is fine: it KEEPS its history up to ``last_session`` -- required, an ISO date, the last
+    session it traded -- and is a candidate on no morning after it).  One entry per symbol."""
     with open(path or EXCLUSIONS_PATH, encoding="utf-8") as f:
         entries = json.load(f)["entries"]
-    out: Dict[str, Dict[str, Any]] = {}
+    seen: set = set()
     for e in entries:
         miss = [k for k in ("symbol", "reason", "added", "reviewed_by") if not e.get(k)]
         if miss:
             raise ls.SimulationRefusal(f"panel exclusion entry {e!r} lacks {miss}: an exclusion needs a symbol, a reason, a date and a reviewer")
-        out[str(e["symbol"]).upper()] = e
-    return out
+        kind = e.get("kind", "exclude")
+        if kind not in ("exclude", "delisted"):
+            raise ls.SimulationRefusal(f"panel exclusion entry {e!r}: kind {kind!r} is neither 'exclude' nor 'delisted'")
+        if kind == "delisted":
+            try:
+                date.fromisoformat(str(e.get("last_session")))
+            except ValueError:
+                raise ls.SimulationRefusal(f"panel entry {e!r}: kind 'delisted' needs last_session (ISO date of the last session traded)") from None
+        sym = str(e["symbol"]).upper()
+        if sym in seen:
+            raise ls.SimulationRefusal(f"panel exclusion file lists {sym} twice")
+        seen.add(sym)
+    return entries
+
+
+def load_exclusions(path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """``{SYMBOL: entry}`` of the symbols REMOVED from every screen (``kind`` exclude)."""
+    return {str(e["symbol"]).upper(): e for e in load_entries(path) if e.get("kind", "exclude") == "exclude"}
+
+
+def load_acknowledged_delistings(path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """``{SYMBOL: entry}`` of the KNOWN delistings (``kind`` delisted): history kept up to ``last_session``."""
+    return {str(e["symbol"]).upper(): e for e in load_entries(path) if e.get("kind") == "delisted"}
+
+
+def mask_after_last_session(arrays: Dict[str, np.ndarray], sessions: List[str], s: int, last_session: str) -> None:
+    """Make symbol column ``s`` unselectable on every morning AFTER ``last_session`` (it keeps its bars and derived
+    values up to and including the morning of ``last_session``): no previous close and no share count = no candidate."""
+    if last_session not in sessions:
+        raise ls.SimulationRefusal(f"last_session {last_session} is not a session of the panel ({sessions[0]}..{sessions[-1]})")
+    p = sessions.index(last_session) + 1
+    for k in ("lc", "rvol", "avg20", "lv", "wa", "wp", "shares", "fl"):
+        arrays[k][p:, s] = np.nan
+    arrays["w2"][p:, s] = 0
 
 
 def vendor_dir(cache_folder: str) -> str:
@@ -373,10 +408,10 @@ def _ohlcv_path(cache_folder: str, sym: str) -> Optional[str]:
 
 
 def source_fingerprint(cache_folder: str, symbols: List[str], first_day: str, end_day: str,
-                       lag: int, snapshot: Optional[str]) -> str:
+                       lag: int, snapshot: Optional[str], exclusions_path: Optional[str] = None) -> str:
     h = hashlib.sha1()
     try:
-        with open(EXCLUSIONS_PATH, "rb") as _f:
+        with open(exclusions_path or EXCLUSIONS_PATH, "rb") as _f:
             h.update(_f.read())                       # the exclusion list is part of the panel's identity
     except OSError:
         pass
@@ -639,7 +674,7 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
             f"no vendor share table under {snapshot_dir or vendor_dir(cache_folder)}: take one (ONE FMP call) with "
             f"`ba2-test prewarm --screener-panel` / `ba2-test build-screener-metrics --daily-panel`")
     symbols = sorted(set(symbols))
-    fp = source_fingerprint(cache_folder, symbols, first_day, end_day, lag_days, snap)
+    fp = source_fingerprint(cache_folder, symbols, first_day, end_day, lag_days, snap, exclusions_path)
     root = out_root or ls.panel_root(cache_folder)
     path = os.path.join(root, fp[:16])
     man = ls.read_manifest(path)
@@ -668,20 +703,38 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
     with open(snap) as f:
         listing = set((json.load(f).get("caps") or {}).keys())
     excl = load_exclusions(exclusions_path)
+    ackd = load_acknowledged_delistings(exclusions_path)
     ack = {str(x).upper() for x in acknowledged_stale}
     lb_ord = max((int(bd[-1]) for bd in bar_ord.values()), default=0)
     stale = sorted(sy for sy, bd in bar_ord.items() if lb_ord - int(bd[-1]) > 6)
-    stale_listed = [sy for sy in stale if sy in listing and sy not in ack and sy not in excl]
+    stale_listed = [sy for sy in stale if sy in listing and sy not in ack and sy not in excl and sy not in ackd]
     delisted = [sy for sy in stale if sy not in listing]
     shares_missing_listed = [sy for sy in listing & set(symbols) if sy in set(srep.get("no_share_data_symbols", [])) and sy not in excl]
     excluded_unusable = [{"symbol": sy, **{k: e[k] for k in ("reason", "added", "reviewed_by")}} for sy, e in sorted(excl.items()) if sy in set(symbols)]
     unneeded = [sy for sy in excl if sy in set(symbols) and sy not in stale and sy not in set(srep.get("no_share_data_symbols", []))]
+    # ACKNOWLEDGED DELISTINGS: the entry's last_session must BE the symbol's last cached bar (a different date means the
+    # evidence the reviewer saw is not this data: refuse), and the symbol is masked on every morning after it.
+    acknowledged_delisted = []
+    for sy, e in sorted(ackd.items()):
+        if sy not in bar_ord:
+            continue
+        lbar = date.fromordinal(int(bar_ord[sy][-1])).isoformat()
+        if lbar != str(e["last_session"]):
+            raise ls.SimulationRefusal(f"{sy}: acknowledged delisting says last_session {e['last_session']} but the cached daily bars end "
+                                       f"{lbar}: the entry does not describe this data (review it)")
+        mask_after_last_session(arrays, sessions, symbols.index(sy), lbar)
+        acknowledged_delisted.append({"symbol": sy, "last_session": lbar, **{k: e[k] for k in ("reason", "added", "reviewed_by")},
+                                      "listed_by_vendor": sy in listing})
+        log(f"daily panel: ACKNOWLEDGED DELISTING (reviewed list) {sy}: history kept through {lbar}, never selected after "
+            f"[{e['reason']}; {e['added']}, {e['reviewed_by']}]")
+    ackd_unneeded = [sy for sy in ackd if sy in set(symbols) and sy not in bar_ord]
     for e in excluded_unusable:
         log(f"daily panel: EXCLUDED (reviewed list) {e['symbol']}: {e['reason']} [{e['added']}, {e['reviewed_by']}]")
     for sy in unneeded:
         log(f"daily panel: NOTE exclusion {sy} is not needed by this build's data (stale/no-share condition gone): review the entry")
     manifest = {"source_fingerprint": fp, "panel_fingerprint": fp[:16], "stale_listed_symbols": stale_listed,
-                "excluded_unusable": excluded_unusable, "exclusions_not_needed": unneeded, "delisted_symbols": delisted, "delisted_symbols_count": len(delisted),
+                "excluded_unusable": excluded_unusable, "acknowledged_delisted": acknowledged_delisted,
+                "acknowledged_delisted_not_needed": ackd_unneeded, "exclusions_not_needed": unneeded, "delisted_symbols": delisted, "delisted_symbols_count": len(delisted),
                 "acknowledged_stale": sorted(ack), "split_report": split_rep,
                 "splits_unknown": split_rep["splits_unknown"], "shares_missing_listed": shares_missing_listed,
                 "shares_lag_days": lag_days, "shares_vendor_snapshot": srep["snapshot"],

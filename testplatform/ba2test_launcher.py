@@ -7015,6 +7015,13 @@ def _cmd_optimize(args) -> int:
                           f"ba2_providers/screener/panel_exclusions.json): "
                           + "; ".join(f"{e['symbol']} ({e['reason'][:60]}..., {e['added']}, reviewed by {e['reviewed_by']})"
                                       for e in _exm), flush=True)
+            if _use_sim:
+                _ackd = (_ls.read_manifest(_panel_dir) or {}).get("acknowledged_delisted") or []
+                if _ackd:
+                    print(f"optimize: screener panel ACKNOWLEDGES {len(_ackd)} known delistings (history kept through each last session, "
+                          f"never selected after; reviewed list ba2_providers/screener/panel_exclusions.json): "
+                          + "; ".join(f"{e['symbol']} (last session {e['last_session']}, {e['added']}, reviewed by {e['reviewed_by']})"
+                                      for e in _ackd), flush=True)
             backtest_block["screener_opt"] = {
                 "store": args.screener_store,
                 "base_settings": base,

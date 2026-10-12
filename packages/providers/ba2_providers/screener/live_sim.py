@@ -886,7 +886,8 @@ def _sessions_of(path: str) -> List[str]:
 
 def pending_exclusions(man: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Entries of the panel's exclusion list that nobody has reviewed (``reviewed_by`` starts with "pending")."""
-    return [e for e in (man.get("excluded_unusable") or []) if str(e.get("reviewed_by", "")).strip().lower().startswith("pending")]
+    return [e for e in list(man.get("excluded_unusable") or []) + list(man.get("acknowledged_delisted") or [])
+            if str(e.get("reviewed_by", "")).strip().lower().startswith("pending")]
 
 
 def reviewed_exclusions(man: Dict[str, Any]) -> List[Dict[str, Any]]:
