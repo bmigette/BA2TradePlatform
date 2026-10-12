@@ -270,7 +270,7 @@ def ensure_for_analysis_task(expert_instance_id: int, symbol: str, use_case: str
 # ---- pre-open warm ---------------------------------------------------------------------------
 WARM_DEADLINE_ET = (9, 20)            # the warm must be finished by 09:20 America/New_York
 WARM_FORBIDDEN_ET = ((9, 25), (9, 45))  # never run inside the FMP 09:30 collision window
-WARM_CATCHUP_ET = ((8, 31), (9, 15))  # an app (re)started in this window runs the warm once, at once
+WARM_CATCHUP_ET = ((8, 30), (9, 15))  # an app (re)started in this window runs the warm once, at once
 WARM_PER_SYMBOL_SECONDS = 180.0
 WARM_PACE_SECONDS = 1.0               # between symbols: FMP-friendly (sequential, no concurrency)
 
@@ -281,7 +281,8 @@ def _ny():
 
 
 def warm_catchup_due(now: Optional[datetime] = None) -> bool:
-    """True on a weekday between 08:31 and 09:15 ET: a restart after the 08:30 cron missed the warm."""
+    """True on a weekday from 08:30 (inclusive) to 09:15 ET: an app started then has no cron run of its own
+    today (the job is added after the 08:30:00 fire time). Duplicates are prevented by ``run_warm_once``."""
     t = (now or datetime.now(_ny())).astimezone(_ny())
     return t.weekday() < 5 and WARM_CATCHUP_ET[0] <= (t.hour, t.minute) < WARM_CATCHUP_ET[1]
 
@@ -372,3 +373,27 @@ def warm_iv_history(*, targets: Optional[Dict[int, list]] = None,
         logger.error(f"IV warm pass aborted: {e}", exc_info=True)
         summary["aborted"] = f"{type(e).__name__}: {e}"
     return summary
+
+
+_WARM_RUN = threading.Lock()
+_WARM_DONE: Dict[str, Any] = {}
+
+
+def run_warm_once(**kw) -> Optional[Dict[str, Any]]:
+    """The cron job and the startup catch-up both call this: a run already in progress, or one that
+    already completed today, makes the second caller a no-op (so catching up from 08:30 inclusive can
+    never double the FMP load)."""
+    if not _WARM_RUN.acquire(blocking=False):
+        logger.debug("IV warm already running; skipped")
+        return None
+    try:
+        today = datetime.now(_ny()).date()
+        if _WARM_DONE.get("date") == today and not kw:
+            logger.debug("IV warm already completed today; skipped")
+            return None
+        out = warm_iv_history(**kw)
+        if not out.get("skipped_window") and not out.get("aborted"):
+            _WARM_DONE["date"] = today
+        return out
+    finally:
+        _WARM_RUN.release()

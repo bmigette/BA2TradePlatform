@@ -137,14 +137,38 @@ class SpotUnavailable(AtmIvUnavailable):
 
 class SpotSourceTransient(RuntimeError):
     """The spot source FAILED to answer (FMP 429/5xx/timeout/connection error, split-calendar fetch
-    failure, a top-up that did not land). That is NOT a statement that the market has no spot:
-    it must never become a ``no_spot`` tombstone. ``ensure_filled`` retries with backoff and, if it
-    still fails, leaves the sessions unresolved (status ``filling``)."""
+    failure). That is NOT a statement that the market has no spot: it must never become a ``no_spot``
+    tombstone. ``ensure_filled`` retries with backoff and, if it still fails, leaves the sessions
+    unresolved (status ``filling``).
+
+    ``counts`` says whether giving up counts toward the process-wide breaker; None = decide from the
+    cause: only a real vendor/network failure does (FMP HTTP error after retries, connection error,
+    timeout). A deadline cut, a local disk error or an unknown exception never opens the breaker."""
+
+    def __init__(self, msg: str = "", *, counts: Optional[bool] = None):
+        super().__init__(msg)
+        self.counts = counts
 
     @property
     def retryable(self) -> bool:
-        """False for a programming/config error (retrying cannot help); True for HTTP/connection/timeout."""
+        """False for a programming/config error (retrying cannot help)."""
         return not isinstance(self.__cause__, (ValueError, KeyError, TypeError, AttributeError))
+
+    @property
+    def counts_toward_breaker(self) -> bool:
+        if self.counts is not None:
+            return self.counts
+        cause = self.__cause__
+        if cause is None:
+            return False
+        try:
+            from ba2_providers.fmp_common import FMPError
+            if isinstance(cause, FMPError):
+                return True
+        except ImportError:
+            pass
+        import requests
+        return isinstance(cause, (requests.exceptions.RequestException, ConnectionError, TimeoutError))
 
     @property
     def cause_name(self) -> str:
@@ -523,8 +547,18 @@ class FmpSpotSource:
         cached = native_cache.read_timeseries(name, symbol, "1d", as_of=None)
         if cached is None or cached.empty:
             # cold: the provider's own live fill (end_date=None is a LATEST request); it raises on failure
-            provider.get_ohlcv_data(symbol, start_date=datetime(start.year, start.month, start.day) - timedelta(days=7),
-                                    end_date=None, interval="1d")
+            try:
+                provider.get_ohlcv_data(symbol, start_date=datetime(start.year, start.month, start.day) - timedelta(days=7),
+                                        end_date=None, interval="1d")
+            except Exception as e:  # noqa: BLE001
+                # A COLD symbol FMP answers with nothing (dotted tickers such as BRK.B are not translated
+                # by the provider layer; delisted names) raises a bare ``Exception("Failed to fetch
+                # data ...")`` with no HTTP cause. That is a permanent fact for this pass, not a transient.
+                if type(e) is Exception and str(e).startswith("Failed to fetch data"):
+                    raise SpotUnavailable(
+                        f"{symbol}: FMP has no daily data for this symbol (cold fetch returned nothing"
+                        f"{'; dotted tickers are not translated to FMP form' if '.' in symbol else ''})") from e
+                raise
             cached = native_cache.read_timeseries(name, symbol, "1d", as_of=None)
             if cached is None or cached.empty:
                 raise SpotUnavailable(f"{symbol}: FMP returned no daily bars")
@@ -540,7 +574,15 @@ class FmpSpotSource:
                 except OHLCVTopUpRefused as e:
                     raise SpotUnavailable(f"{symbol}: daily top-up refused: {e}") from e
                 if action == "append":
-                    native_cache.write_timeseries(name, symbol, "1d", merged)
+                    for attempt in (1, 2):
+                        try:
+                            native_cache.write_timeseries(name, symbol, "1d", merged)
+                            break
+                        except OSError as e:     # dev's refresh serves the verified frame; we retry once
+                            if attempt == 2:
+                                raise SpotSourceTransient(
+                                    f"{symbol}: could not write the daily cache: {e}", counts=False) from e
+                            time.sleep(0.5)
         path = native_cache.find_timeseries_path(name, symbol, "1d")
         if path is None:
             raise SpotUnavailable(f"{symbol}: no FMP daily cache")
@@ -769,11 +811,23 @@ class AtmIvHistoryProvider:
             why = budget.guard()
             if why:
                 raise BudgetExhausted(why)
-        limit = min(budget.remaining_seconds(SPOT_CALL_LIMIT_SECONDS), SPOT_CALL_LIMIT_SECONDS)
+        remaining = budget.remaining_seconds(SPOT_CALL_LIMIT_SECONDS)
+        limit = min(remaining, SPOT_CALL_LIMIT_SECONDS)
+        cut_by_deadline = remaining < SPOT_CALL_LIMIT_SECONDS
+        tname = f"atm-iv-spot-fetch:{sym}"
+        # LEFTOVER THREADS: a fetch cut at the limit cannot be killed (fmp_http_get is blocking), so it
+        # keeps running to its own end (at most ~110 s) and is parked in ``_ABANDONED``. Bounds: (1) no
+        # DUPLICATE for a symbol whose previous fetch is still alive (refused here), and (2) once more
+        # than MAX_ABANDONED_CALLS are alive no new fetch starts. The check happens before the start, so
+        # the strict bound is MAX_ABANDONED_CALLS + the number of fetches that were in flight together
+        # (<= the worker count); it never grows further because new fetches are refused.
         with _FILL_LOCK:
             _ABANDONED[:] = [t for t in _ABANDONED if t.is_alive()]
+            if any(t.name == tname for t in _ABANDONED):
+                raise SpotSourceTransient(f"{sym}: the previous spot fetch is still running", counts=False)
             if len(_ABANDONED) > MAX_ABANDONED_CALLS:
-                raise SpotSourceTransient(f"{sym}: {len(_ABANDONED)} timed-out spot fetches still outstanding")
+                raise SpotSourceTransient(f"{sym}: {len(_ABANDONED)} timed-out spot fetches still outstanding",
+                                          counts=False)
         box: Dict[str, Any] = {}
 
         def run():
@@ -781,13 +835,15 @@ class AtmIvHistoryProvider:
                 box["v"] = self.spot_source.spots(sym, lo, hi)
             except BaseException as e:  # noqa: BLE001
                 box["e"] = e
-        t = threading.Thread(target=run, name="atm-iv-spot-fetch", daemon=True)
+        t = threading.Thread(target=run, name=tname, daemon=True)
         t.start()
         t.join(limit)
         if t.is_alive():
             with _FILL_LOCK:
                 _ABANDONED.append(t)
-            raise SpotSourceTransient(f"{sym}: spot fetch exceeded {limit:.0f}s") from TimeoutError()
+            # a fetch cut by the REMAINING DEADLINE (not by its own limit) is not evidence that the API fails
+            raise SpotSourceTransient(f"{sym}: spot fetch exceeded {limit:.0f}s",
+                                      counts=not cut_by_deadline) from TimeoutError()
         if "e" in box:
             raise box["e"]
         return box["v"]
@@ -960,6 +1016,7 @@ class AtmIvHistoryProvider:
         df = self.read_store(sym)
         fresh = self._fresh_sessions(df)
         if not [d for d in window if d not in fresh]:
+            _BREAKER.record(api_failure=False, success=True)    # a healthy symbol ends the failure streak
             return self._assemble(sym, df, window, end_session, STATUS_COMPLETE)
         if _BREAKER.blocked():
             return self._assemble(sym, df, window, end_session, STATUS_FILLING,
@@ -1002,7 +1059,7 @@ class AtmIvHistoryProvider:
                         if (not e.retryable or spot_tries > spot_retries
                                 or budget.remaining_seconds(1e9) <= delay + SPOT_CALL_LIMIT_SECONDS / 2):
                             status, reason = STATUS_FILLING, spot_reason
-                            api_failed = True      # counts toward the process-wide breaker (B2)
+                            api_failed = e.counts_toward_breaker      # only a real vendor/network failure
                             _warn_once_per_day(
                                 f"spotfail:{key}", f"ATM-IV history for {sym}: {spot_reason} ({e}); the sessions stay "
                                 f"UNRESOLVED (no tombstone written) and the next pass retries.", today)
@@ -1027,7 +1084,7 @@ class AtmIvHistoryProvider:
                 df = self.read_store(sym)
                 fresh = self._fresh_sessions(df)
                 still = [d for d in window if d not in fresh]
-                _BREAKER.record(api_failure=api_failed, success=(status == STATUS_COMPLETE and budget.used > 0))
+                _BREAKER.record(api_failure=api_failed, success=(status == STATUS_COMPLETE))
                 if status == STATUS_COMPLETE:
                     if still:
                         reason = f"{len(still)} session(s) not computable (no spot)"

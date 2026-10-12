@@ -844,7 +844,7 @@ class JobManager:
         warm once now, on its own thread (same window/deadline rules as the cron run)."""
         try:
             from ..modules.dataproviders.options import atm_iv_task_hook as atm_iv_warm
-            if atm_iv_warm.warm_catchup_due():
+            if atm_iv_warm.warm_catchup_due() and atm_iv_warm.has_iv_rank_gates():
                 import threading as _th
                 logger.info("Pre-open ATM-IV warm: app started inside the warm window; running it now")
                 _th.Thread(target=self._execute_iv_warm, name="iv-warm-catchup", daemon=True).start()
@@ -857,7 +857,7 @@ class JobManager:
             if not atm_iv_warm.has_iv_rank_gates():
                 logger.debug("Pre-open ATM-IV warm: no iv_rank gates; skipped")
                 return
-            atm_iv_warm.warm_iv_history()
+            atm_iv_warm.run_warm_once()
         except Exception as e:
             logger.error(f"Error executing the pre-open ATM-IV warm: {e}", exc_info=True)
 
