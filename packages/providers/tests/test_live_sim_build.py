@@ -114,4 +114,75 @@ def test_reviewed_exclusion_list_replaces_a_refusal_with_a_printed_record(cache,
     with pytest.raises(ls.SimulationRefusal, match="reviewed_by"):
         lb.load_exclusions(str(bad))
     shipped = lb.load_exclusions()
-    assert {"GORO", "MIDD", "MOD", "RBKB", "SNFCA", "CICC"} <= set(shipped)
+    assert {"GORO", "PARA", "CICC"} <= set(shipped) and not ({"MIDD", "MOD", "RBKB", "SNFCA"} & set(shipped))
+    assert not any(str(e["reviewed_by"]).lower().startswith("pending") for e in lb.load_entries() if e["symbol"] in {"GORO", "PARA", "CICC"})
+    assert {"DBRG", "IPEXR", "IPEXU", "QRVO"} <= set(lb.load_acknowledged_delistings())
+
+
+def _ack_file(tmp_path, *, last_session, reviewed_by="owner", name="ack.json"):
+    ex = tmp_path / name
+    ex.write_text(json.dumps({"entries": [{"symbol": "C", "kind": "delisted", "last_session": last_session,
+                                           "reason": "delisted, data fine", "added": "2026-10-12", "reviewed_by": reviewed_by}]}))
+    return str(ex)
+
+
+def test_acknowledged_delisting_keeps_history_and_is_never_selectable_after(cache, tmp_path):
+    last = SESSIONS[20].isoformat()
+    logs = []
+    man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2, log=logs.append,
+                               exclusions_path=_ack_file(tmp_path, last_session=last))
+    assert man["stale_listed_symbols"] == [] and [e["symbol"] for e in man["acknowledged_delisted"]] == ["C"]
+    assert man["acknowledged_delisted"][0]["last_session"] == last and man["excluded_unusable"] == []
+    assert any("ACKNOWLEDGED DELISTING (reviewed list) C" in m for m in logs)
+    assert ls.panel_problems(man["path"], "2024-02-01", "2024-03-20", warmup_days=20) == []
+    pan = ls.load_panel(man["path"])
+    i = pan.sym_index["C"]
+
+    def candidate(day):
+        c = pan.columns(pan.pos(day))
+        return bool(np.isfinite(c["last_close"][i] * c["shares"][i]))
+    assert candidate(SESSIONS[20].isoformat()) and candidate(SESSIONS[5].isoformat())       # on days it has bars
+    assert not candidate(SESSIONS[21].isoformat()) and not candidate(SESSIONS[22].isoformat())   # never after
+    assert np.isfinite(pan.arrays["c"][pan.pos(SESSIONS[20].isoformat()), i])                # the history is kept
+    # the same symbol WITHOUT the entry is a refusal (stale-listed), and its previous close lingers in live's 35-day window
+    man0 = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None)
+    assert man0["stale_listed_symbols"] == ["C"]
+    assert man0["panel_fingerprint"] != man["panel_fingerprint"]          # the file is part of the identity
+    pan0 = ls.load_panel(man0["path"])
+    assert np.isfinite(pan0.arrays["lc"][pan0.pos(SESSIONS[22].isoformat()), pan0.sym_index["C"]])
+
+
+def test_acknowledged_delisting_with_the_wrong_last_session_or_pending_review_refuses(cache, tmp_path):
+    with pytest.raises(ls.SimulationRefusal, match="does not describe this data"):
+        lb.build_daily_panel(str(cache), ["A", "C"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None,
+                             exclusions_path=_ack_file(tmp_path, last_session=SESSIONS[19].isoformat()))
+    man = lb.build_daily_panel(str(cache), ["A", "C"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None,
+                               exclusions_path=_ack_file(tmp_path, last_session=SESSIONS[20].isoformat(),
+                                                         reviewed_by="pending owner review", name="p.json"))
+    probs = ls.panel_problems(man["path"], "2024-02-01", "2024-03-20", warmup_days=20)
+    assert any("NOT reviewed" in p and "C" in p for p in probs)
+    bad = tmp_path / "bad2.json"
+    bad.write_text(json.dumps({"entries": [{"symbol": "C", "kind": "delisted", "reason": "x", "added": "d", "reviewed_by": "o"}]}))
+    with pytest.raises(ls.SimulationRefusal, match="last_session"):
+        lb.load_entries(str(bad))
+
+
+def test_stale_listed_is_judged_against_the_job_window_not_today(cache):
+    logs = []
+    man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2, log=logs.append)
+    last = SESSIONS[20].isoformat()                                    # C's last bar (listed by the vendor, stale)
+    # the manifest RECORDS it (count, names, last bar) and the build prints it, whatever window a job reads
+    assert man["stale_listed_symbols"] == ["C"] and man["stale_listed_count"] == 1 and man["stale_listed_last_bar"] == {"C": last}
+    assert any("RECORDED stale-listed C" in m and last in m for m in logs)
+    assert man["delisted_symbols"] == ["D"]                            # the "treated as delisted" class is untouched
+    path = man["path"]
+
+    def probs(end):
+        return [p for p in ls.panel_problems(path, "2023-10-02", end, warmup_days=0) if "CURRENT listing" in p]
+    assert probs("2023-10-20") == []                                  # the window ends BEFORE its last bar: never a problem
+    assert probs(SESSIONS[22].isoformat()) == []                       # ends 2 days after: inside the 6-day tolerance
+    inside = probs("2024-01-31")                                       # stale INSIDE the window: a problem, rule named
+    assert len(inside) == 1 and "C (last bar " + last + ")" in inside[0] and "reference date 2024-01-31" in inside[0]
+    reach = probs("2024-03-28")                                        # a window reaching the panel end: refuses
+    assert len(reach) == 1 and "reference date 2024-03-28" in reach[0]
+    assert len(probs("2024-04-05")) == 1 and "reference date 2024-03-28" in probs("2024-04-05")[0]   # past the last bar: judged at it
