@@ -52,6 +52,12 @@ FRED_PREOPEN_JOB_ID = "fred_preopen_refresh_job"
 # instant they run (entries are weekly: one failed 09:30 costs a week). A read that still finds
 # a file not covering today refetches it itself (guarded, with a backoff) and otherwise REFUSES.
 FRED_PREOPEN_HOUR, FRED_PREOPEN_MINUTE = 9, 0
+
+# Scheduler id of the pre-open ATM-IV history warm (incident 2026-10-12: the 09:30 pass hit FMP's
+# 429 window and every iv_rank gate stayed closed). 08:30 America/New_York, Mon-Fri; the job stops by
+# 09:20 ET and never runs inside the 09:25-09:45 collision window.
+IV_WARM_JOB_ID = "iv_history_preopen_warm_job"
+IV_WARM_HOUR, IV_WARM_MINUTE = 8, 30
 from .types import AnalysisUseCase
 
 
@@ -680,6 +686,7 @@ class JobManager:
         self._schedule_account_refresh_job()
         self._schedule_iv_snapshot_job()
         self._schedule_fred_preopen_job()
+        self._schedule_iv_warm_job()
         self._schedule_warm_jobs()
 
     def _schedule_warm_jobs(self):
@@ -807,6 +814,39 @@ class JobManager:
                 f"{FRED_PREOPEN_MINUTE:02d} America/New_York, Mon-Fri")
         except Exception as e:
             logger.error(f"Error scheduling the pre-open FRED refresh job: {e}", exc_info=True)
+
+    def _schedule_iv_warm_job(self):
+        """Schedule the 08:30 ET (Mon-Fri) pre-open warm of the derived ATM-IV history.
+
+        Always scheduled (independent of any DeterministicScorer); the job itself is a no-op
+        unless an enabled expert has an iv_rank gate."""
+        try:
+            trigger = CronTrigger(hour=IV_WARM_HOUR, minute=IV_WARM_MINUTE,
+                                  day_of_week='mon-fri', timezone=_MARKET_TZ)
+            job = self._scheduler.add_job(
+                func=self._execute_iv_warm,
+                trigger=trigger,
+                id=IV_WARM_JOB_ID,
+                name="Pre-open ATM-IV History Warm Job",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+            self._scheduled_jobs[IV_WARM_JOB_ID] = job
+            logger.info(f"Pre-open ATM-IV history warm scheduled for {IV_WARM_HOUR:02d}:"
+                        f"{IV_WARM_MINUTE:02d} America/New_York, Mon-Fri (deadline 09:20)")
+        except Exception as e:
+            logger.error(f"Error scheduling the pre-open ATM-IV warm job: {e}", exc_info=True)
+
+    def _execute_iv_warm(self):
+        try:
+            from ..modules.dataproviders.options import atm_iv_task_hook as atm_iv_warm
+            if not atm_iv_warm.has_iv_rank_gates():
+                logger.debug("Pre-open ATM-IV warm: no iv_rank gates; skipped")
+                return
+            atm_iv_warm.warm_iv_history()
+        except Exception as e:
+            logger.error(f"Error executing the pre-open ATM-IV warm: {e}", exc_info=True)
 
     def _ensure_dgs3mo(self, only_if_stale: bool):
         """Keep the option risk-free rate (FRED DGS3MO) cached whenever an iv_rank gate exists."""

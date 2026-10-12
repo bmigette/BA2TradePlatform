@@ -146,18 +146,92 @@ def _account_id_if_iv_rank_gated(expert_instance_id: int, use_case: str) -> Opti
     return result
 
 
+# ---- operator visibility: one summary per ENTER_MARKET pass ---------------------------------
+_PASS_LOCK = threading.Lock()
+#: (expert id, batch id) -> {"total": {symbols}, "closed": {symbol: normalised reason}}
+_PASS: Dict[Tuple[int, Any], Dict[str, Any]] = {}
+
+
+def _normalise_reason(symbol: str, reason: str) -> str:
+    r = re.sub(re.escape(symbol), "<sym>", reason or "unknown", flags=re.IGNORECASE)
+    r = re.sub(r"\d{4}-\d{2}-\d{2}", "<date>", r)
+    r = re.sub(r"\d+", "#", r)
+    return r[:120]
+
+
+def gate_closed_reason(series, error: Optional[BaseException] = None) -> Optional[str]:
+    """Why the iv_rank gate cannot open for this symbol after its fill, or None when it can.
+    (The sample-count floor is not judged here; this names the DATA failures.)"""
+    if error is not None:
+        return f"ensure_filled raised {type(error).__name__}"
+    if series is None:
+        return "no ATM-IV series produced"
+    if series.status != "complete":
+        return f"{series.status}: {series.reason or 'no reason given'}"
+    if series.end_session not in series.values:
+        kind = "tombstone (no bar)" if series.end_session in series.tombstone_days else "no_spot"
+        return f"no derived ATM IV for the last completed session ({kind})"
+    return None
+
+
+def record_gate_outcome(expert_instance_id: int, batch_id: Any, symbol: str, series,
+                        error: Optional[BaseException] = None) -> None:
+    reason = gate_closed_reason(series, error)
+    with _PASS_LOCK:
+        entry = _PASS.setdefault((int(expert_instance_id), batch_id), {"total": set(), "closed": {}})
+        entry["total"].add(symbol)
+        if reason is not None:
+            entry["closed"][symbol] = _normalise_reason(symbol, reason)
+        else:
+            entry["closed"].pop(symbol, None)
+
+
+def flush_gate_report(expert_instance_id: int, batch_id: Any) -> Optional[str]:
+    """At the end of an expert's ENTER_MARKET batch: ONE log line + ONE Activity Log entry
+    ``IV gate closed for N of M symbols: <reason counts>`` when any symbol's gate is closed.
+    Pops the pass, so it fires once per pass (a second call finds nothing). Never raises."""
+    try:
+        with _PASS_LOCK:
+            entry = _PASS.pop((int(expert_instance_id), batch_id), None)
+        if not entry or not entry["closed"]:
+            return None
+        counts: Dict[str, int] = {}
+        for r in entry["closed"].values():
+            counts[r] = counts.get(r, 0) + 1
+        n, m = len(entry["closed"]), len(entry["total"])
+        detail = "; ".join(f"{r} x{c}" for r, c in sorted(counts.items(), key=lambda kv: -kv[1]))
+        msg = f"IV gate closed for {n} of {m} symbols: {detail}"
+        all_closed = n >= m
+        full = f"[Expert {expert_instance_id}] {msg}"
+        (logger.error if all_closed else logger.warning)(
+            full + (" -- NO iv_rank-gated entry can fire this pass" if all_closed else ""))
+        from ba2_common.core.db import log_activity
+        from ba2_common.core.types import ActivityLogSeverity, ActivityLogType
+        log_activity(ActivityLogSeverity.FAILURE if all_closed else ActivityLogSeverity.WARNING,
+                     ActivityLogType.ANALYSIS_FAILED, msg,
+                     data={"closed": n, "total": m, "reasons": counts,
+                           "symbols": sorted(entry["closed"])[:200], "batch_id": str(batch_id)},
+                     source_expert_id=int(expert_instance_id))
+        return msg
+    except Exception as e:  # noqa: BLE001 - reporting must never break order processing
+        logger.error(f"IV gate summary failed for expert {expert_instance_id}: {e}", exc_info=True)
+        return None
+
+
 def ensure_for_analysis_task(expert_instance_id: int, symbol: str, use_case: str, *,
                              account_resolver: Optional[Callable[[int], Any]] = None,
-                             deadline_seconds: Optional[float] = None):
+                             deadline_seconds: Optional[float] = None, batch_id: Any = None):
     """Fill the symbol's derived ATM-IV series before its analysis runs. Returns the
     ``AtmIvSeries`` or None when nothing applied. NEVER raises."""
     from ba2_common.core.iv_rank_audit import PLACEHOLDER_SYMBOLS
     if not symbol or symbol in PLACEHOLDER_SYMBOLS:
         return None                   # a selection-mode sentinel ('EXPERT', ...) is not a ticker
+    gated = False
     try:
         account_id = _account_id_if_iv_rank_gated(expert_instance_id, use_case)
         if account_id is None:
             return None
+        gated = True
         if account_resolver is None:
             from ba2_trade_platform.core.utils import get_account_instance_from_id as account_resolver
         account = account_resolver(account_id)
@@ -165,8 +239,96 @@ def ensure_for_analysis_task(expert_instance_id: int, symbol: str, use_case: str
             return None               # not an Alpaca account: this derivation does not apply
         prov = account._atm_iv_history()
         kw = {} if deadline_seconds is None else {"deadline_seconds": deadline_seconds}
-        return prov.ensure_filled(symbol, **kw)
+        series = prov.ensure_filled(symbol, **kw)
+        if str(use_case).lower().endswith("enter_market"):
+            record_gate_outcome(expert_instance_id, batch_id, symbol, series)
+        return series
     except Exception as e:  # noqa: BLE001 - the analysis must run; the gate stays closed
         logger.error(f"ATM-IV history update failed for {symbol} (expert {expert_instance_id}): {e}",
                      exc_info=True)
+        if gated and str(use_case).lower().endswith("enter_market"):
+            record_gate_outcome(expert_instance_id, batch_id, symbol, None, error=e)
         return None
+
+
+# ---- pre-open warm ---------------------------------------------------------------------------
+WARM_DEADLINE_ET = (9, 20)            # the warm must be finished by 09:20 America/New_York
+WARM_FORBIDDEN_ET = ((9, 25), (9, 45))  # never run inside the FMP 09:30 collision window
+WARM_PER_SYMBOL_SECONDS = 180.0
+WARM_PACE_SECONDS = 1.0               # between symbols: FMP-friendly (sequential, no concurrency)
+
+
+def warm_iv_history(*, targets: Optional[Dict[int, list]] = None,
+                    account_resolver: Optional[Callable[[int], Any]] = None,
+                    now: Optional[Callable[[], datetime]] = None,
+                    sleep: Callable[[float], None] = time.sleep,
+                    pace_seconds: float = WARM_PACE_SECONDS) -> Dict[str, Any]:
+    """Pre-open pass: for every iv_rank-gated symbol (sequentially, paced) run the same
+    ``ensure_filled`` the 09:30 analysis would (FMP OHLCV top-up + split calendar included), so
+    the 09:30 pass finds the store warm. Stops at ``WARM_DEADLINE_ET`` and logs ONE INFO summary
+    (complete / filling / failed with reasons). Never raises. Returns the summary dict."""
+    from zoneinfo import ZoneInfo
+    ny = ZoneInfo("America/New_York")
+    clock = now or (lambda: datetime.now(ny))
+    summary: Dict[str, Any] = {"complete": 0, "filling": 0, "failed": 0, "skipped_deadline": 0,
+                               "reasons": {}, "total": 0}
+    try:
+        t0 = clock().astimezone(ny)
+        hm = (t0.hour, t0.minute)
+        if WARM_FORBIDDEN_ET[0] <= hm < WARM_FORBIDDEN_ET[1]:
+            logger.warning(f"IV warm skipped: started {t0:%H:%M} ET inside the 09:25-09:45 FMP collision window")
+            summary["skipped_window"] = True
+            return summary
+        if targets is None:
+            from ba2_common.core.iv_rank_audit import find_iv_rank_gates, recording_targets
+            gates = find_iv_rank_gates()
+            blind = [g for g in gates if not g.universe_is_known]
+            if blind:
+                logger.warning(f"IV warm cannot see the universe of {len(blind)} iv_rank-gated expert(s) "
+                               f"({', '.join(str(g.expert_id) for g in blind)}); their symbols are not warmed")
+            targets = recording_targets(gates)
+        if account_resolver is None:
+            from ba2_trade_platform.core.utils import get_account_instance_from_id as account_resolver
+        deadline = t0.replace(hour=WARM_DEADLINE_ET[0], minute=WARM_DEADLINE_ET[1], second=0, microsecond=0)
+        work = [(account_id, sym) for account_id, symbols in sorted(targets.items()) for sym in symbols]
+        summary["total"] = len(work)
+
+        def note(kind: str, reason: Optional[str] = None, sym: str = ""):
+            summary[kind] += 1
+            if reason:
+                r = _normalise_reason(sym, reason)
+                summary["reasons"][r] = summary["reasons"].get(r, 0) + 1
+
+        for i, (account_id, sym) in enumerate(work):
+            cur = clock().astimezone(ny)
+            if cur >= deadline:
+                summary["skipped_deadline"] = len(work) - i
+                break
+            try:
+                account = account_resolver(account_id)
+                if account is None or not hasattr(account, "_atm_iv_history"):
+                    note("failed", "account has no ATM-IV history provider", sym)
+                    continue
+                left = (deadline - cur).total_seconds()
+                series = account._atm_iv_history().ensure_filled(
+                    sym, deadline_seconds=max(1.0, min(WARM_PER_SYMBOL_SECONDS, left)))
+                if series.status == "complete" and series.end_session in series.values:
+                    note("complete")
+                elif series.status == "filling":
+                    note("filling", series.reason or "filling", sym)
+                else:
+                    note("failed", gate_closed_reason(series), sym)
+            except Exception as e:  # noqa: BLE001 - one symbol never stops the pass
+                logger.error(f"IV warm failed for {sym}: {e}", exc_info=True)
+                note("failed", f"{type(e).__name__}", sym)
+            sleep(pace_seconds)
+        reasons = "; ".join(f"{r} x{c}" for r, c in sorted(summary["reasons"].items(), key=lambda kv: -kv[1]))
+        logger.info(f"IV warm summary: {summary['complete']} complete / {summary['filling']} filling / "
+                    f"{summary['failed']} failed of {summary['total']} symbol(s)"
+                    + (f"; {summary['skipped_deadline']} not reached before 09:20 ET deadline"
+                       if summary["skipped_deadline"] else "")
+                    + (f"; reasons: {reasons}" if reasons else ""))
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"IV warm pass aborted: {e}", exc_info=True)
+        summary["aborted"] = f"{type(e).__name__}: {e}"
+    return summary
