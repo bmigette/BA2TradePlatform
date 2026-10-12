@@ -120,6 +120,16 @@ def _strategy_is_option_run(strategy) -> bool:
 #: full evidence trail, including why an option job cannot run on the sqlite store at all.
 OPTION_SELECTION_WEIGHTS = ("w_premium", "w_iv", "w_rvol")
 
+#: EVERY gene namespace ``decode_params`` accepts (the ``<ns>:`` head of a gene key; ``tp``/``sl``
+#: are the two bare keys). The ONE list: ``rerun_handler._gene_params`` filters a stored
+#: ``strategy_params`` by it, so a namespace added to ``decode_params`` and not here is silently
+#: STRIPPED from every re-run (it happened three times: ``schedule`` 2026-09-07, ``market``, and
+#: ``optsel`` 2026-10-13, where a stored +8,649% row re-ran as +1,493% on default selection
+#: weights). ``test_rerun_keeps_every_gene_namespace.py`` pins it against decode_params' own
+#: dispatch and against every strategy the launcher builds.
+DECODE_GENE_NAMESPACES = ("model", "screener", "schedule", "cond", "entry", "exit", "optsel",
+                          "market")
+
 # Actions that must NEVER be dropped by a per-action toggle: removing the open action would
 # turn an entry rule into a no-op bracket; guards must stay. (Rule-level toggles can still
 # drop the whole rule.)

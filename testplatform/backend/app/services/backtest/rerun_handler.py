@@ -40,6 +40,8 @@ import logging
 
 from ba2_providers.screener.universe_superset import RULE_ID as _SUPERSET_RULE_ID
 
+from app.services.strategy_param_space import DECODE_GENE_NAMESPACES
+
 logger = logging.getLogger(__name__)
 
 # Gene namespaces decode_params accepts (it RAISES on anything else). The stored strategy_params
@@ -63,7 +65,12 @@ logger = logging.getLogger(__name__)
 # cond:*:mode / exit:*:enabled gene honoured unchanged) however the master gene actually
 # resolved when the GA scored it -- exactly the "gene namespace added to the search must be
 # added here" trap this comment already warns about.
-_GENE_PREFIXES = ("model", "screener", "cond", "exit", "entry", "schedule", "market")
+#
+# "optsel" WAS MISSING HERE until 2026-10-13: the three option selection weights
+# (``optsel:<half>:w_*``) were stripped, decode_params used the default weights, and a stored
+# stage-1 row (+8,648.6%) re-ran as +1,492.6%. The list is therefore no longer kept here at all:
+# it IS strategy_param_space.DECODE_GENE_NAMESPACES, defined next to decode_params' dispatch.
+_GENE_PREFIXES = DECODE_GENE_NAMESPACES
 
 # Legacy-row fallbacks: standalone rows created before the run knobs were persisted don't carry a
 # seed / fill model. The re-run uses these so it can still execute (may differ slightly from the
