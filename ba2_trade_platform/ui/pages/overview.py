@@ -5919,11 +5919,13 @@ class AccountGrowthTab:
             # Loading state
             loading_label = ui.label('Loading account growth data...').classes('text-sm text-gray-500')
             charts_container = ui.column().classes('w-full')
+            self._show_skeleton(charts_container)
 
             def reload_page(message):
                 charts_container.clear()
                 with charts_container:
                     reloading = ui.label(message).classes('text-sm text-gray-500')
+                self._show_skeleton(charts_container)
                 asyncio.create_task(self._load_growth_data(reloading, charts_container, selected_account_id))
 
 
@@ -5992,6 +5994,31 @@ class AccountGrowthTab:
             range_toggle.on_value_change(on_range_change)
             asyncio.create_task(self._load_growth_data(loading_label, charts_container, selected_account_id))
 
+    _skeleton = None
+
+    def _show_skeleton(self, container):
+        """Animated placeholder cards where the charts will be, until they are drawn.
+
+        The fetch, the price download and the chart maths take seconds; before this the page
+        showed one grey line of text and then a blank gap until everything was ready.
+        """
+        with container:
+            holder = ui.column().classes('w-full gap-4')
+            with holder:
+                for height in (200, 300, 300):
+                    with ui.card().classes('w-full p-4'):
+                        ui.skeleton(type='text', width='35%')
+                        ui.skeleton(type='rect', height=f'{height}px').classes('w-full')
+        self._skeleton = holder
+
+    def _hide_skeleton(self):
+        holder, self._skeleton = self._skeleton, None
+        if holder is not None:
+            try:
+                holder.delete()
+            except RuntimeError:
+                pass        # the client is gone
+
     async def _load_growth_data(self, loading_label, charts_container, selected_account_id):
         """Load all growth data asynchronously.
 
@@ -6013,6 +6040,7 @@ class AccountGrowthTab:
         try:
             target_accounts, problem = self._resolve_target_accounts(selected_account_id)
             if problem:
+                self._hide_skeleton()
                 loading_label.set_text(problem)
                 return
 
@@ -6116,6 +6144,7 @@ class AccountGrowthTab:
             self._forecast = forecast
 
             try:
+                self._hide_skeleton()
                 with charts_container:
                     scope_holder = ui.column().classes('w-full')
                     chart_holder = ui.column().classes('w-full')
@@ -6155,6 +6184,7 @@ class AccountGrowthTab:
 
         except Exception as e:
             logger.error(f"Error loading account growth data: {e}", exc_info=True)
+            self._hide_skeleton()
             try:
                 loading_label.set_text(f'Error loading growth data: {str(e)}')
             except RuntimeError:
