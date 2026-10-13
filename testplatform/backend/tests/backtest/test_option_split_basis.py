@@ -481,7 +481,11 @@ def test_an_itm_expiry_is_judged_on_the_as_traded_close(covered_call):
     ps.set_clock(datetime(2024, 3, 15))
     engine._apply_option_expiry(datetime(2024, 3, 15))
     opt = [t for t in acct.get_round_trip_trades() if t["contract_symbol"] == _CALL_OCC]
-    assert len(opt) == 1 and opt[0]["exit_price"] == pytest.approx(200.0)   # intrinsic 2000-1800
+    # ITM was judged on the as-traded close: the call is ASSIGNED (not expired worthless), and an
+    # assigned short option closes at 0 -- the intrinsic 200 is carried by the share leg at the
+    # strike (test_assigned_option_row_pnl.py), the same convention live uses.
+    assert len(opt) == 1 and opt[0]["exit_reason"] == "assigned"
+    assert opt[0]["exit_price"] == pytest.approx(0.0)
 
 
 # ---- guard window (5 sessions) --------------------------------------------------------------------

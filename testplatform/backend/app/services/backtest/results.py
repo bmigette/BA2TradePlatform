@@ -210,6 +210,11 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     trades = [_trade_row(t) for t in raw_trades]
 
     final = equity_curve[-1]["equity"] if equity_curve else initial
+    if _cap is None and getattr(account, "has_options_provider", False) is True:
+        # Reported, never raised: see ``warn_if_rows_do_not_tie_to_equity``.
+        metrics_gap = warn_if_rows_do_not_tie_to_equity(trades, initial=initial, final=final)
+    else:
+        metrics_gap = None
 
     # The cap goes in explicitly: on a capped run ``drawdown_curve`` is cap-denominated, and the
     # refinement's dips must be measured on that same denominator (see refine_max_drawdown).
@@ -220,6 +225,7 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     metrics["equity_curve"] = equity_curve
     metrics["drawdown_curve"] = drawdown_curve
     metrics["trades"] = trades
+    metrics["trade_rows_equity_gap"] = metrics_gap
     # See BacktestAccount.snapshot_equity / DailyBacktestEngine.run: the sim stops early the
     # moment net_liquidating_value hits zero, since anything simulated past that point is
     # meaningless. strategy_fitness.compute_fitness reads this to invalidate the trial instead
@@ -258,6 +264,42 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
         if callable(stats):
             metrics.update(stats())
     return metrics
+
+
+# A run whose trade rows and equity disagree by more than this share of the starting capital is
+# reported. Measured runs leave small UNEXPLAINED residuals (0.2-1.3% on other strategies), so this
+# is a smoke alarm for a bookkeeping defect like the assigned-option double count (which was 28% of
+# capital on the measured wheel run), not a proof of tie-out.
+ROWS_EQUITY_GAP_TOLERANCE_PCT = 0.5
+
+
+def warn_if_rows_do_not_tie_to_equity(trades: List[Dict[str, Any]], *, initial: float,
+                                      final: float) -> Optional[float]:
+    """Compare sum(round-trip row P&L) with the equity change and WARN, loudly, on a gap.
+
+    Rows include positions still open at the end (``open_at_end`` rows are marked), so the
+    identity is ``sum(pnl) == final - initial``. Returns ``sum(pnl) - (final - initial)`` in
+    dollars (None when it cannot be computed), recorded in the results as
+    ``trade_rows_equity_gap``. NEVER raises: it reports, it does not gate.
+    """
+    try:
+        row_sum = sum(float(t["pnl"]) for t in trades)
+        gap = row_sum - (float(final) - float(initial))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(gap):
+        return None
+    tolerance = abs(float(initial)) * ROWS_EQUITY_GAP_TOLERANCE_PCT / 100.0
+    if abs(gap) > max(tolerance, 1.0):
+        logger.warning(
+            "[backtest] TRADE ROWS DO NOT TIE TO EQUITY: sum of round-trip P&L is $%.2f but "
+            "equity moved $%.2f (gap $%.2f = %.2f%% of starting capital, tolerance %.1f%%). "
+            "Every metric built from the trade rows (win rate, profit factor, profit-cap "
+            "adjusted_*, fitness robustness screens) is off by about this much.",
+            row_sum, float(final) - float(initial), gap,
+            100.0 * abs(gap) / abs(float(initial)) if initial else float("inf"),
+            ROWS_EQUITY_GAP_TOLERANCE_PCT)
+    return round(gap, 2)
 
 
 def _short_borrow_echo(account: Any, config: Dict[str, Any]) -> Dict[str, float]:
