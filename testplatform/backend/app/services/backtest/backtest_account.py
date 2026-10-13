@@ -6765,8 +6765,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if position.side == OrderDirection.SELL:
             # SHORT ITM -> ALWAYS physically assigned (called away / put to us) at the strike.
             share_side = OrderDirection.SELL if is_call else OrderDirection.BUY
+            # The option leg closes at 0 on a PHYSICAL assignment: the premium is kept in full
+            # and the intrinsic value is not paid in cash -- it is carried by the share leg,
+            # which moves cash AT THE STRIKE and whose lot starts there. Closing the option
+            # row at ``intrinsic`` as well counted the assignment loss twice in the trade
+            # rows (cash/equity were right). This is LIVE's convention
+            # (``AlpacaAccount._record_option_settlement_order``: settlement ``open_price=0.0``,
+            # the equity lot opened at the strike), so sum(row P&L) == the change in equity.
             ok = self.settle_option_expiry(
-                position, close_premium=intrinsic,
+                position, close_premium=0.0,
                 share_side=share_side, shares=shares, share_price=strike,
                 trigger=OptionCloseReason.ASSIGNED,
             )
