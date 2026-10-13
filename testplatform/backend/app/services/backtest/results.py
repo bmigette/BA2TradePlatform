@@ -210,11 +210,13 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     trades = [_trade_row(t) for t in raw_trades]
 
     final = equity_curve[-1]["equity"] if equity_curve else initial
-    if _cap is None and getattr(account, "has_options_provider", False) is True:
-        # Reported, never raised: see ``warn_if_rows_do_not_tie_to_equity``.
+    # Options runs only. A CAPPED run is excluded: its curve is restated on the cap
+    # denominator, so ``final - initial`` is no longer the account's dollar P&L.
+    # Reported, never raised: see ``warn_if_rows_do_not_tie_to_equity``.
+    metrics_gap = None
+    check_rows_tie = _cap is None and getattr(account, "has_options_provider", False) is True
+    if check_rows_tie:
         metrics_gap = warn_if_rows_do_not_tie_to_equity(trades, initial=initial, final=final)
-    else:
-        metrics_gap = None
 
     # The cap goes in explicitly: on a capped run ``drawdown_curve`` is cap-denominated, and the
     # refinement's dips must be measured on that same denominator (see refine_max_drawdown).
@@ -225,7 +227,8 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     metrics["equity_curve"] = equity_curve
     metrics["drawdown_curve"] = drawdown_curve
     metrics["trades"] = trades
-    metrics["trade_rows_equity_gap"] = metrics_gap
+    if check_rows_tie:
+        metrics["trade_rows_equity_gap"] = metrics_gap
     # See BacktestAccount.snapshot_equity / DailyBacktestEngine.run: the sim stops early the
     # moment net_liquidating_value hits zero, since anything simulated past that point is
     # meaningless. strategy_fitness.compute_fitness reads this to invalidate the trial instead
@@ -282,22 +285,25 @@ def warn_if_rows_do_not_tie_to_equity(trades: List[Dict[str, Any]], *, initial: 
     dollars (None when it cannot be computed), recorded in the results as
     ``trade_rows_equity_gap``. NEVER raises: it reports, it does not gate.
     """
-    try:
-        row_sum = sum(float(t["pnl"]) for t in trades)
-        gap = row_sum - (float(final) - float(initial))
-    except (KeyError, TypeError, ValueError):
-        return None
+    row_sum = sum(float(t["pnl"]) for t in trades)
+    gap = row_sum - (float(final) - float(initial))
     if not math.isfinite(gap):
+        logger.error(
+            "[backtest] trade-row/equity tie-out is NON-FINITE: sum of row P&L=%r, initial=%r, "
+            "final=%r, gap=%r.", row_sum, initial, final, gap)
         return None
-    tolerance = abs(float(initial)) * ROWS_EQUITY_GAP_TOLERANCE_PCT / 100.0
+    # The base is the LARGER of start and end capital: a $20k run that ends at $1.7M must not be
+    # held to a fixed $100.
+    base = max(abs(float(initial)), abs(float(final)))
+    tolerance = base * ROWS_EQUITY_GAP_TOLERANCE_PCT / 100.0
     if abs(gap) > max(tolerance, 1.0):
         logger.warning(
             "[backtest] TRADE ROWS DO NOT TIE TO EQUITY: sum of round-trip P&L is $%.2f but "
-            "equity moved $%.2f (gap $%.2f = %.2f%% of starting capital, tolerance %.1f%%). "
+            "equity moved $%.2f (gap $%.2f = %.2f%% of max(start, end) equity, tolerance %.1f%%). "
             "Every metric built from the trade rows (win rate, profit factor, profit-cap "
             "adjusted_*, fitness robustness screens) is off by about this much.",
             row_sum, float(final) - float(initial), gap,
-            100.0 * abs(gap) / abs(float(initial)) if initial else float("inf"),
+            100.0 * abs(gap) / base if base else float("inf"),
             ROWS_EQUITY_GAP_TOLERANCE_PCT)
     return round(gap, 2)
 

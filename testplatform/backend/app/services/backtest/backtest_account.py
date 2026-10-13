@@ -93,6 +93,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# ``TradingOrder.data`` key marking a book-keeping fill that moved no cash commission (option
+# expiry/assignment closes, the assignment-created stock lot, forced stock liquidations).
+# ``get_round_trip_trades`` skips these when charging commission per fill.
+SYNTHETIC_FILL_KEY = "synthetic_fill"
+
 #: The fill-time re-base counters (``BacktestAccount.fill_rebase_counters``), published in
 #: ``results["fill_rebase"]``. ``no_reference`` = an entry with a stop and NO usable anchor (its stop
 #: kept the pre-fill level): judged by ``DailyBacktestEngine.refuse_if_rebase_unanchored``.
@@ -2709,6 +2714,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             broker_order_id=self._next_broker_id(),
             comment=comment,
             created_at=as_of,
+            data={SYNTHETIC_FILL_KEY: True},
         )
         new_id = add_instance(order)
         if new_id is not None:
@@ -4987,7 +4993,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # a scaled/partial exit, a multi-fill open still held at run end -- was undercharged
             # in the trade rows while the equity curve had already paid the real amount. A
             # one-sided error: it can only ever flatter the reported P&L, never penalise it.
-            comm = commission * (len(entries) + len(exits))
+            # ...but ONLY the fills that actually paid one. Settlement / assignment / forced
+            # liquidation records (``_record_option_expiry_close``, ``_open_assigned_stock_
+            # transaction``, ``_record_stock_liquidation_close``) are book-keeping rows written
+            # AFTER cash moved without a commission; they carry ``SYNTHETIC_FILL_KEY`` in
+            # ``order.data``. Charging them overcharged the rows against the cash ledger.
+            comm = commission * sum(
+                1 for o in (*entries, *exits)
+                if not (isinstance(o.data, dict) and o.data.get(SYNTHETIC_FILL_KEY)))
 
             # Options quote premium PER SHARE but a contract controls ``multiplier`` (100)
             # shares, so realised option P&L scales by the contract multiplier. The NULL fallback
@@ -6517,8 +6530,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         ``exit_record`` and, when this settlement flattens the transaction, is its
         ``close_reason`` -- the same values the live OCC-activity reconciler writes.
 
-        Closes the option leg's OPENED transaction at ``close_premium`` (per-share intrinsic
-        value, or 0 for worthless) and zeroes its lot in the option ledger, then — for an
+        Closes the option leg's OPENED transaction at ``close_premium`` (0 for worthless AND
+        for a physical assignment -- the intrinsic is carried by the share leg at the strike;
+        only a long sell-to-close and a forced liquidation pass a non-zero premium) and zeroes its lot in the option ledger, then — for an
         exercise/assignment — converts to shares in the EQUITY ledger settled at ``share_price``
         (the STRIKE). The option premium paid/collected at entry is already in cash, so the
         conversion only moves cash for the share leg (qty x strike); the resulting equity
@@ -6584,7 +6598,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         #    single-leg option this is immediate; for a multi-leg spread the transaction stays
         #    OPENED until the last leg settles so each leg can still find it in step 1.
         if self._all_legs_resolved(txn):
-            txn.close_price = float(close_premium)
+            close_reason = settlement_close_reason(
+                [trigger] + self._settled_leg_triggers(txn))
+            # An ASSIGNED transaction has no close price, exactly like live (``_close_txn`` on
+            # OPASN passes none): its value moved to the share leg at the strike, and
+            # ``calculate_transaction_pnl`` answers None (unknown) rather than a premium-only P&L.
+            txn.close_price = (None if close_reason == OptionCloseReason.ASSIGNED.value
+                               else float(close_premium))
             if not txn.close_date:
                 txn.close_date = self._price.now()
             close_transaction_with_logging(
@@ -6593,8 +6613,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 # A structure whose legs settled one by one (a strangle) closes under the
                 # most consequential of its settlements -- the live reconciler's rule
                 # (``settlement_close_reason``); a single leg closes under its own.
-                close_reason=settlement_close_reason(
-                    [trigger] + self._settled_leg_triggers(txn)),
+                close_reason=close_reason,
                 additional_data={"contract_symbol": position.contract_symbol},
             )
             update_instance(txn)
@@ -6716,6 +6735,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             broker_order_id=self._next_broker_id(),
             comment="option_assignment",
             created_at=as_of,
+            data={SYNTHETIC_FILL_KEY: True},
         )
         new_id = add_instance(order)
         if new_id is not None:
@@ -7073,10 +7093,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         The closing side is the opposite of how the leg was opened (a SHORT leg is bought back,
         a LONG leg is sold), the fill quantity is the leg's contract count, and ``open_price`` is
-        the per-share settlement premium (intrinsic, or 0 for worthless). This is a BOOK-KEEPING
-        order only: it records the round-trip close so ``get_round_trip_trades`` pairs the option's
-        open and close with the correct realised premium P&L. It moves NO cash (the premium was
-        settled at entry; the exercise/assignment share leg carries the intrinsic value).
+        the per-share settlement premium (0 for worthless AND for an assigned short, whose intrinsic
+        is carried by the share leg; non-zero only for a long sell-to-close / forced liquidation).
+        This is a BOOK-KEEPING order only: it records the round-trip close so
+        ``get_round_trip_trades`` pairs the option's open and close with the correct realised
+        premium P&L. It moves NO cash and no commission (marked ``SYNTHETIC_FILL_KEY``).
 
         It carries the leg's ``exit_record`` (``option_trade_record.exit_record``) with
         ``trigger`` -- the SAME record every option close writes, so the trade row reads WHY
@@ -7116,7 +7137,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             broker_order_id=self._next_broker_id(),
             comment="option_expiry_close",
             created_at=as_of,
-            data={"exit_record": record},
+            data={"exit_record": record, SYNTHETIC_FILL_KEY: True},
         )
         new_id = add_instance(order)
         if new_id is not None:
