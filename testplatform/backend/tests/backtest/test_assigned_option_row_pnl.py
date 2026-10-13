@@ -203,3 +203,121 @@ def test_the_tie_out_check_is_silent_when_rows_tie(caplog):
             [{"pnl": 600.0}], initial=100_000.0, final=100_600.0)
     assert gap == 0.0
     assert not [r for r in caplog.records if "DO NOT TIE" in r.getMessage()]
+
+
+def test_the_tolerance_scales_with_a_growing_run(caplog):
+    """$20k -> $1.7M: 0.5% of the STARTING capital is a fixed $100; the base is max(start, end)."""
+    import logging
+    from app.services.backtest.results import warn_if_rows_do_not_tie_to_equity
+
+    with caplog.at_level(logging.WARNING):
+        # gap $500 on a $1.7M run is 0.03%: silent (a start-based base would shout).
+        warn_if_rows_do_not_tie_to_equity([{"pnl": 1_680_500.0}], initial=20_000.0,
+                                          final=1_700_000.0)
+    assert not [r for r in caplog.records if "DO NOT TIE" in r.getMessage()]
+    with caplog.at_level(logging.WARNING):
+        gap = warn_if_rows_do_not_tie_to_equity([{"pnl": 1_660_000.0}], initial=20_000.0,
+                                                final=1_700_000.0)
+    assert gap == pytest.approx(-20_000.0)
+    (msg,) = [r.getMessage() for r in caplog.records if "DO NOT TIE" in r.getMessage()]
+    assert "1.18%" in msg                                     # 20,000 / 1,700,000
+
+
+def test_a_malformed_row_surfaces_and_a_non_finite_gap_logs_an_error(caplog):
+    import logging
+    from app.services.backtest.results import warn_if_rows_do_not_tie_to_equity
+
+    with pytest.raises(KeyError):
+        warn_if_rows_do_not_tie_to_equity([{"size": 1}], initial=1.0, final=1.0)
+    with caplog.at_level(logging.ERROR):
+        assert warn_if_rows_do_not_tie_to_equity(
+            [{"pnl": float("nan")}], initial=100.0, final=100.0) is None
+    assert [r for r in caplog.records
+            if r.levelno == logging.ERROR and "NON-FINITE" in r.getMessage()]
+
+
+def test_assigned_put_cycle_ties_to_the_cent_with_commission(tmp_path):
+    """Settlement and the assignment liquidation charge no commission, so the rows must not."""
+    cfg = {**_BASE_CFG, "commission_per_trade": 1.0}
+    acct, ps, ctx = _build(tmp_path, "rowcomm1", 86, cfg)
+    try:
+        _sell_the_put(acct)
+        _assign_the_put(acct, ps, cfg)
+        ps.set_clock(datetime(2024, 3, 11))
+        assert acct.process_pending_assignment_liquidations() is True
+        acct.refresh_transactions()
+        assert acct._cash == pytest.approx(100_599.0)         # the put sale paid $1; nothing else
+        assert _row_sum(acct) == pytest.approx(599.0)
+        assert _row_sum(acct) == pytest.approx(acct.equity() - _START)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_called_away_cycle_ties_to_the_cent_with_commission(tmp_path):
+    cfg = {**_BASE_CFG, "commission_per_trade": 1.0, "hold_assigned_stock": True}
+    acct, ps, ctx = _build(tmp_path, "rowcomm2", 87, cfg)
+    try:
+        _sell_the_put(acct)
+        _assign_the_put(acct, ps, cfg)
+        ps.set_clock(datetime(2024, 3, 11))
+        acct.process_pending_assignment_liquidations()
+        _write_the_call(acct, occ=_CALL170, strike=170.0)
+        ps.set_clock(datetime(2024, 3, 28))
+        _engine(acct, ps, cfg)._apply_option_expiry(datetime(2024, 3, 28))
+        acct.refresh_transactions()
+        assert acct._cash == pytest.approx(101_698.0)         # two option sales, $1 each
+        assert _row_sum(acct) == pytest.approx(1_698.0)
+        assert _row_sum(acct) == pytest.approx(acct.equity() - _START)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_short_strangle_one_leg_assigned_other_worthless_ties_to_equity(tmp_path):
+    """Call 180 sold at 4.00 is assigned (spot 200: short 100 @180); put 160 sold at 2.50 expires
+    worthless; the short shares are bought back at the next open (200).
+    cash: +400 +250 (premia) +18,000 (shares sold at the strike) -20,000 (buy back) = -1,350."""
+    from ba2_common.core.option_types import OptionLeg
+    from ba2_common.core.types import OptionRight, OrderDirection
+    from datetime import date
+    from tests.backtest import test_option_assignment as ta
+
+    legs = [
+        OptionLeg(contract_symbol=ta._CALL_OCC, side=OrderDirection.SELL,
+                  position_intent="sell_to_open", option_type=OptionRight.CALL,
+                  strike=180.0, expiry=date(2024, 3, 15), underlying="AAPL"),
+        OptionLeg(contract_symbol=ta._PUT_OCC, side=OrderDirection.SELL,
+                  position_intent="sell_to_open", option_type=OptionRight.PUT,
+                  strike=160.0, expiry=date(2024, 3, 15), underlying="AAPL"),
+    ]
+    engine, acct, ps, ctx = ta._make_engine(tmp_path, legs, "short_strangle")
+    try:
+        ps.set_clock(datetime(2024, 3, 15))
+        engine._apply_option_expiry(datetime(2024, 3, 15))
+        ps.set_clock(datetime(2024, 3, 18))
+        assert acct.process_pending_assignment_liquidations() is True
+        acct.refresh_transactions()
+        assert acct._cash == pytest.approx(98_650.0)
+        assert acct.equity() == pytest.approx(98_650.0)
+        pnls = sorted(float(r["pnl"]) for r in _rows(acct))
+        assert pnls == pytest.approx([-2_000.0, 250.0, 400.0])   # stock 180 -> 200 short
+        assert _row_sum(acct) == pytest.approx(-1_350.0)
+        assert _row_sum(acct) == pytest.approx(acct.equity() - _START)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_an_assigned_option_transaction_has_no_close_price_like_live(tmp_path):
+    """Live closes the OPASN option transaction with no close price (``_close_txn``)."""
+    from ba2_common.core.trade_store import transactions_where
+    from ba2_common.core.types import AssetClass, TransactionStatus
+
+    cfg = dict(_BASE_CFG)
+    acct, ps, ctx = _build(tmp_path, "rowclosepx", 88, cfg)
+    try:
+        _sell_the_put(acct)
+        _assign_the_put(acct, ps, cfg)
+        (t,) = [t for t in transactions_where(status=TransactionStatus.CLOSED)
+                if t.asset_class == AssetClass.OPTION]
+        assert t.close_price is None
+    finally:
+        ctx.__exit__(None, None, None)
