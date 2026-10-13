@@ -442,7 +442,7 @@ class _FloatingPLWidgetBase:
                 ).all()
                 if any(getattr(order, 'contract_symbol', None) for order in orders):
                     measured = self._option_transaction_pl(
-                        trans, orders, account, account_id, option_quotes)
+                        trans, orders, account, account_id, option_quotes, prices)
                 else:
                     measured = self._transaction_pl(trans, prices, session)
             except Exception as e:
@@ -467,7 +467,7 @@ class _FloatingPLWidgetBase:
 
     @staticmethod
     def _option_transaction_pl(trans: Transaction, orders, account, account_id,
-                               quotes: Dict) -> Optional[float]:
+                               quotes: Dict, marks: Dict[str, float]) -> Optional[float]:
         """An OPTION transaction's floating P/L, or ``None`` if it holds but is unquoted.
 
         Through ``open_structure_pnl`` -- the Options tab's own rule (option premium, contract
@@ -480,7 +480,10 @@ class _FloatingPLWidgetBase:
         from ...core.option_pnl_display import (
             UNAVAILABLE_FLAT, UNAVAILABLE_NO_FILLS, open_structure_pnl, quote_caching_account,
         )
-        priced = open_structure_pnl(quote_caching_account(account, quotes, account_id),
+        # Each held contract at the BROKER's position price (``marks``) -- what the equity
+        # path and the positions table use -- not at a bid/ask liquidation quote, which on
+        # the indicative feed put the cards $1,400 away from the table.
+        priced = open_structure_pnl(quote_caching_account(account, quotes, account_id, marks),
                                     trans, orders)
         if priced.available:
             return priced.amount
