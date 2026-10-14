@@ -8,8 +8,10 @@ Guarantees
 - A chunk (one symbol's daily history, one symbol-year of intraday bars, one month of corporate
   actions) is fetched completely, validated, and only then written: temp file + os.replace, then
   the manifest. A crash, a failed page or a refused chunk leaves no file a reader could take for data.
-- An intraday chunk that lacks bars on a day the symbol has a daily bar is REFUSED (nothing written,
-  the days are listed in the manifest). Use --retry-refused to try such chunks again.
+- An intraday chunk that lacks bars on a day the symbol has a daily bar with trades is REFUSED (nothing
+  written, the days are listed in the manifest). Use --retry-refused to try such chunks again. A daily bar
+  with volume 0 and 0 trades is Alpaca's placeholder for a day nothing traded: no intraday bar is expected
+  on it, and the chunk's manifest entry counts those days (zero_trade_daily_days).
 - Transport errors, HTTP 5xx and 429 are retried with exponential backoff (429 honours Retry-After /
   X-RateLimit-Reset). A chunk whose retries run out is left untouched and fetched on the next run.
 - Resume: a chunk with a manifest entry for the same window whose file is present is skipped.
@@ -68,6 +70,8 @@ CA_TYPES = ("forward_split,reverse_split,unit_split,stock_dividend,cash_dividend
 STATUS_COMPLETE = "complete"
 STATUS_NO_DATA = "no_data"
 STATUS_NO_DAILY_DAYS = "no_daily_days"
+REPLACE_ATTEMPTS = 20      # os.replace tries before a held target file stops the run
+REPLACE_WAIT_S = 0.25
 UTC = dt.timezone.utc
 
 
@@ -103,7 +107,16 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    # Windows refuses the swap while another process (a reader, an indexer, a virus scan) holds the
+    # target open; that hold is brief, so wait it out a bounded number of times, then raise.
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(REPLACE_WAIT_S)
 
 
 def atomic_write_json(path: Path, payload: object) -> None:
@@ -465,27 +478,33 @@ class Downloader:
             return
         self._write_bars(manifest, key, window, path, frame, pages)
 
-    def _daily_days(self, symbol: str, manifest: SymbolManifest) -> Optional[set]:
-        """Session dates from the stored daily file; None when there is no usable daily chunk."""
+    def _daily_days(self, symbol: str, manifest: SymbolManifest) -> Optional[tuple]:
+        """(traded days, zero-trade days) from the stored daily file; None when there is no usable daily chunk.
+
+        Alpaca serves a placeholder daily bar on a day nothing traded (volume 0, 0 trades, flat price); no
+        intraday bar can exist on such a day, so it is not a day an intraday chunk must cover."""
         key = f"{DAILY_TIMEFRAME}/all"
         window = self._window(self.start, self.end_exclusive)
         entry = manifest.entry(key)
         if entry is None or {name: entry.get(name) for name in window} != window:
             return None
         if entry["status"] == STATUS_NO_DATA:
-            return set()
+            return set(), set()
         if entry["status"] != STATUS_COMPLETE:
             return None
-        return session_days(pd.read_parquet(self.store / entry["file"], columns=["t"]))
+        frame = pd.read_parquet(self.store / entry["file"], columns=["t", "v", "n"])
+        no_trade = (frame["v"] == 0) & (frame["n"] == 0)
+        return session_days(frame[~no_trade]), session_days(frame[no_trade])
 
     # --- intraday ------------------------------------------------------------------------------
     def intraday(self, symbol: str) -> None:
         manifest = SymbolManifest(self.store, symbol)
-        days = self._daily_days(symbol, manifest)
-        if days is None:
+        daily = self._daily_days(symbol, manifest)
+        if daily is None:
             # No verified daily series means no way to tell a complete intraday chunk from a holed one.
             log(f"SKIP {symbol} {INTRADAY_TIMEFRAME}: no complete daily chunk for this window to check against")
             return
+        days, zero_trade_days = daily
         for chunk_start, chunk_end in year_chunks(self.start, self.end_exclusive):
             key = f"{INTRADAY_TIMEFRAME}/{chunk_start.year}"
             window = self._window(chunk_start, chunk_end)
@@ -494,6 +513,7 @@ class Downloader:
                 self.counts["skipped"] += 1
                 continue
             expected = {day for day in days if chunk_start.date() <= day < _ceil_date(chunk_end)}
+            zero_trade = {day for day in zero_trade_days if chunk_start.date() <= day < _ceil_date(chunk_end)}
             if not expected:
                 if (manifest.entry(key) or {}).get("status") == STATUS_COMPLETE:
                     self._refuse(manifest, key, window, path,
@@ -522,7 +542,8 @@ class Downloader:
             self.consecutive_failures = 0
             extra_days = len(session_days(frame) - expected)
             self._write_bars(manifest, key, window, path, frame, pages,
-                             {"daily_days": len(expected), "days_without_daily_bar": extra_days})
+                             {"daily_days": len(expected), "zero_trade_daily_days": len(zero_trade),
+                              "days_without_daily_bar": extra_days})
             log(f"  {symbol} {key}: {len(frame):,} bars, {pages} pages, {time.time() - began:.1f}s")
 
     # --- corporate actions ---------------------------------------------------------------------

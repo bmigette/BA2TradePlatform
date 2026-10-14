@@ -187,6 +187,49 @@ def test_a_year_with_a_day_that_has_no_intraday_bars_is_refused(tmp_path):
     assert run.counts["written"] == 1 and _chunks(tmp_path)["5Min/2019"]["status"] == "complete"
 
 
+def test_a_zero_trade_placeholder_day_needs_no_intraday_bars(tmp_path):
+    fake = _fake(intraday_days=[DAYS[0], DAYS[2], DAYS[3]])
+    placeholder = fake.bars[("ABC", "1Day")][1]  # 2019-12-31: Alpaca's flat bar for a day nothing traded
+    placeholder.update(o=10.5, h=10.5, l=10.5, c=10.5, v=0, n=0, vw=0.0)
+    run = _run(tmp_path, fake)
+    assert run.counts["refused"] == 0
+    entry = _chunks(tmp_path)["5Min/2019"]
+    assert entry["status"] == "complete"
+    assert entry["daily_days"] == 1 and entry["zero_trade_daily_days"] == 1
+
+
+def test_a_day_with_trades_but_no_volume_is_still_expected(tmp_path):
+    fake = _fake(intraday_days=[DAYS[0], DAYS[2], DAYS[3]])
+    fake.bars[("ABC", "1Day")][1].update(v=0, n=2)  # not the placeholder shape: the day must have intraday bars
+    _run(tmp_path, fake)
+    assert _chunks(tmp_path)["5Min/2019"]["status"] == "refused_days_without_intraday_bars"
+
+
+def test_a_briefly_held_target_file_is_replaced_once_released(tmp_path, monkeypatch):
+    real_replace, calls = dl.os.replace, []
+
+    def held_twice(src, dst):
+        calls.append(dst)
+        if len(calls) <= 2:
+            raise PermissionError(5, "Access is denied")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(dl.os, "replace", held_twice)
+    monkeypatch.setattr(dl.time, "sleep", lambda _s: None)
+    dl.atomic_write_json(tmp_path / "progress.json", {"a": 1})
+    assert json.loads((tmp_path / "progress.json").read_text()) == {"a": 1} and len(calls) == 3
+
+
+def test_a_target_file_held_for_good_stops_the_run(tmp_path, monkeypatch):
+    def always_held(src, dst):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(dl.os, "replace", always_held)
+    monkeypatch.setattr(dl.time, "sleep", lambda _s: None)
+    with pytest.raises(PermissionError):
+        dl.atomic_write_json(tmp_path / "progress.json", {"a": 1})
+
+
 def test_a_duplicated_bar_refuses_the_chunk(tmp_path):
     fake = _fake()
     bars = fake.bars[("ABC", "5Min")]
