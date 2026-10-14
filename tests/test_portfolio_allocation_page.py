@@ -4320,12 +4320,13 @@ def test_the_swatch_only_ever_takes_a_PARSED_colour(monkeypatch, nicegui_client,
 def test_the_reserve_controls_can_express_a_two_decimal_reserve(nicegui_client,
                                                                 account_id):
     """The slider steps in whole percent because dragging a 10,000-notch track is
-    unusable; the BOX is what makes 12.5 reachable, so its step has to allow it."""
+    unusable; the BOX is what makes 12.5 reachable. ``step=any`` keeps every decimal valid
+    while the browser's spinner arrows move it by a whole 1 (not 0.01)."""
     root = _draw(nicegui_client, account_id, _one_label(account_id))
     slider, number = _reserve_controls(root)
 
     assert slider._props['step'] == 1
-    assert number._props['step'] == 0.01
+    assert number._props['step'] == 'any'
     assert (slider._props['min'], slider._props['max']) == (0, 100)
     assert (number._props['min'], number._props['max']) == (0, 100)
 

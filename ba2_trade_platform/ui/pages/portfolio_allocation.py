@@ -2826,7 +2826,7 @@ SYMBOL_CARD = (
 #: with no decimal point on some versions.
 CARD_WEIGHT_INPUT_TEMPLATE = r"""
     <q-input :key="props.row.weight_key" :model-value="props.row.weight_pct"
-             type="number" inputmode="decimal" dense outlined
+             type="number" step="any" inputmode="decimal" dense outlined
              label="Share of label %" input-class="text-right" class="full-width"
              debounce="__DEBOUNCE__"
              @update:model-value="(val) => $parent.$emit('weightChange', props.row.symbol, val)">
@@ -3412,10 +3412,10 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # account sat at 0 while the table below printed a share of nothing.
         target_input = ui.number(
             label='Portfolio target %', value=view.target_pct, min=0, max=100,
-            step=0.01, suffix='%',
+            suffix='%',
             on_change=lambda e, lbl=view.label: _save_label_target(
                 account_id, live, lbl, e.value)
-        ).props(f'dense outlined debounce={TARGET_DEBOUNCE_MS}').classes('w-44')
+        ).props(f'dense outlined step=any debounce={TARGET_DEBOUNCE_MS}').classes('w-44')
         live['label_inputs'][view.label] = target_input
         ui.input('Label comment', value=view.comment or '',
                  on_change=lambda e, lbl=view.label: _save_label_comment(account_id, lbl, e.value)
@@ -3596,7 +3596,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     table.add_slot('body-cell-weight_pct', r'''
         <q-td :props="props">
             <q-input :key="props.row.weight_key" :model-value="props.value"
-                     type="number" inputmode="decimal" dense borderless input-class="text-right"
+                     type="number" step="any" inputmode="decimal" dense borderless input-class="text-right"
                      class="full-width"
                      debounce="''' + str(TARGET_DEBOUNCE_MS) + r'''"
                      @update:model-value="(val) => $parent.$emit('weightChange', props.row.symbol, val)">
@@ -3776,8 +3776,8 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
         with ui.row().classes(f'items-center gap-3 no-wrap {WRAP_ROW_CLASS}'):
             slider = ui.slider(min=0, max=100, step=1,
                                value=live['unallocated_pct']).classes('w-40')
-            number = ui.number(value=live['unallocated_pct'], min=0, max=100, step=0.01,
-                               suffix='%').props('dense outlined').classes('w-28') \
+            number = ui.number(value=live['unallocated_pct'], min=0, max=100,
+                               suffix='%').props('dense outlined step=any').classes('w-28') \
                 .style(TABULAR_NUMS)
         live['reserve_slider'] = slider
         live['reserve_number'] = number
