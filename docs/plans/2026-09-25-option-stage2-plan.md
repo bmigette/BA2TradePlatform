@@ -103,6 +103,39 @@ Measured 2026-09-25:
 5. **Per-year and concentration report** at the end: per-year returns (2020 and 2022 especially) and
    top1/top5 concentration on structures. The soft30 consistency floor is ×0.25, so a single good
    year can carry a score.
+6. **Asymmetric iron condor** (user, 2026-10-15). `OpenIronCondorAction` places the put and call
+   short strikes at the SAME `option_strike_param` %OTM, with the SAME `option_wing_width_pct`. That
+   is a simplification: put skew makes the put side richer, so the best condor often sits farther
+   out on the put side than on the call side.
+   - Add separate put/call genes (`option_strike_param_put` / `_call`, and the same split for the
+     wing): 2 more genes per condor member.
+   - Keep the symmetric pair as the default, so a stage-1 O_IC seed still decodes.
+   - Mirror the split in the live builder (one shared action, BT = live) and in `option_reserve_required` /
+     `_downsize_to_delivery_capacity`: the width is the wider of the two wings.
+   - Stage 1 (`-joint-rules1` O_IC, relaunched 2026-10-15) stays symmetric. Do not change a running
+     job.
+7. **Neutral entry arms share their gate genes** (accepted for stage 1, 2026-10-15; revisit here).
+   Under `--neutral-entry-modes joint`, O_IC/O_STRD/O_STRG carry two entry rules: a HOLD arm (no
+   expected-profit gate, since a HOLD's expected profit is 0) and a low-confidence arm. They share
+   every other gate id (`iv_rank`, `iv_rv`, `rel_volume`, market-condition gates): only `signal` and
+   `low_confidence` are split. That is sound while the gates describe the premium environment
+   (the same question whichever signal fired). If a stage-1 winner keeps BOTH arms on, consider
+   per-arm gate ids in stage 2 so each arm can learn its own thresholds.
+8. **Per-instrument cap ranges** (user, 2026-10-13: "leave as is for phase 1 but remember to adjust
+   for phase 2"). Before launch, narrow `_OPTION_RM_OVERRIDE`
+   (`max_virtual_equity_per_instrument_percent`, 5..50 step 5 in stage 1) per structure:
+   - debit structures (long call/put, verticals, butterfly, straddle/strangle): about 5..25;
+   - keep 50 only for the full-collateral ones (wheel, CSP, jade lizard, ratio spread).
+
+   Stage 1 picked 45-50 because a high cap costs the fitness nothing, and one-contract entries
+   reached 36% of equity (TSLA 2020-07). Also owed: the cap checks only the NEW ticket
+   (`_size_by_cost`), not the exposure already open on the same underlying. Propose the ranges to
+   the user; do not change the stage-1 jobs or the 8082 instances.
+
+**Assignment-capacity rule changed mid stage 1 (dev 5a3fcc5c, 2026-10-15).** A long put of the same
+expiry now nets a short put down to the wing width; before, the full short strike was charged.
+O_BULLPS (opt 20) and every earlier stage-1 put-spread result ran under the OLD rule. Re-run them
+before using them as stage-2 seeds, or seed only from jobs run on `2183554d` or later.
 
 ## 4. Cost estimate (to be MEASURED in a pilot before launch)
 
