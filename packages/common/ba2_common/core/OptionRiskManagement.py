@@ -127,11 +127,11 @@ from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ba2_common.core.option_book import (
-    RAIL_OK, BookTotals, BreakerState, CandidateStructure, RailVerdict, admit, book_totals,
-    rearm, update_breaker,
+    RAIL_OK, BookTotals, BreakerState, CandidateStructure, RailVerdict, _short_put_assignment,
+    admit, book_totals, rearm, update_breaker,
 )
 from ba2_common.core.option_lifecycle import (
-    LifecycleLeg, OptionStructure, put_assignment_cost, structure_metrics,
+    LifecycleLeg, OptionStructure, structure_metrics,
 )
 from ba2_common.core.option_request import (
     OPTION_RAILS_UNCONFIGURED_REFUSAL, OPTION_RAIL_REFUSAL, validate_refusal_phrase,
@@ -633,7 +633,7 @@ def candidate_from_entry(*, underlying: str, option_strategy: str, legs: Sequenc
     ``notional`` and ``is_defined_risk`` come from ``structure_metrics`` over the candidate's
     own legs — the SAME arithmetic the book side uses, deliberately, because a second
     formula for short-side notional is precisely the divergence ``structure_metrics`` was
-    promoted to end. ``short_put_assignment`` is ``put_assignment_cost`` per short put leg,
+    promoted to end. ``short_put_assignment`` is ``option_book._short_put_assignment``,
     the single shared definition.
 
     ``stock_cover_price`` is the covered-call seam (2026-08-31, operator decision): the
@@ -668,20 +668,10 @@ def candidate_from_entry(*, underlying: str, option_strategy: str, legs: Sequenc
         # only over a measured False -- an unmeasurable metrics answer stays None.
         is_defined_risk = True
 
-    assignment: Optional[float] = 0.0
-    for leg in structure.held_legs:
-        if not leg.is_short:
-            continue
-        if leg.option_type is None:
-            assignment = None       # unknown right: unknown is not "not a put"
-            break
-        if leg.option_type != OptionRight.PUT:
-            continue
-        cost = put_assignment_cost(leg.strike, abs(leg.net_qty), multiplier)
-        if cost is None:
-            assignment = None
-            break
-        assignment += cost
+    # The SAME per-structure rule the book side uses (a long put of the same expiry nets a
+    # short down to the wing width), so a candidate and the structure it becomes once held
+    # are charged one number. None = unmeasurable (an untyped short, an unpriceable leg).
+    assignment, _why = _short_put_assignment(structure)
 
     max_loss = (None if max_loss_per_contract is None
                 else float(max_loss_per_contract) * float(quantity))

@@ -7,4 +7,4 @@
 # BUMP THIS on EVERY change to the shipped code under `packages/common/ba2_common/`. Whether the test-platform
 # GA workers must also re-sync is a SEPARATE decision (`testplatform/required_package_versions.py`);
 # see CLAUDE.md "Versioning" and docs/plans/2026-10-03-package-versioning-design.md.
-PACKAGE_VERSION = "2026.10.00006"
+PACKAGE_VERSION = "2026.10.00008"

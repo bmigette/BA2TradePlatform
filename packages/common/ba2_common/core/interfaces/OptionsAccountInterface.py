@@ -11,7 +11,7 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ba2_common.core.option_expiry import PMCC_STRATEGY, is_multi_expiry_strategy
 from ba2_common.core.option_lifecycle import PMCC_ROLL_STRATEGY
@@ -2759,6 +2759,9 @@ class OptionsAccountInterface(ABC):
 
         Netting is per contract symbol over EXECUTED orders (BUY ``+``, SELL ``−``), the
         same netting the close paths perform, so a short bought back stops counting.
+        A held LONG put of the same underlying and expiry then covers a held short down
+        to the wing width (``netted_put_assignment_cost``; operator decision 2026-10-15),
+        so a put vertical or condor owes its width here, not its short strike.
         A submitted-but-unfilled SELL is added on top without netting: it can fill at any
         moment and can only ever ADD an obligation, whereas an unfilled BUY-to-close has
         closed nothing and must not hand capacity back early.
@@ -2779,7 +2782,8 @@ class OptionsAccountInterface(ABC):
         assigned. The remaining contract nets like any fill (so a buy-to-close relieves
         it) and grows no in-flight remainder, because nothing of that order is working.
         """
-        from ba2_common.core.option_lifecycle import put_assignment_cost
+        from ba2_common.core.option_lifecycle import (netted_put_assignment_cost,
+                                                      put_assignment_cost)
         from ba2_common.core.types import OrderDirection, OrderStatus
 
         executed = OrderStatus.get_executed_statuses()
@@ -2852,21 +2856,49 @@ class OptionsAccountInterface(ABC):
 
         cost = 0.0
         contracts = 0.0
+        # Held shorts and held longs, grouped by (underlying, expiry, multiplier): a held long
+        # put of the same expiry covers a held short down to the wing width
+        # (``netted_put_assignment_cost``, operator decision 2026-10-15). A short whose
+        # underlying or expiry is unrecorded cannot be matched, so it gets a group of its
+        # own and pays its full strike; a long with either unrecorded covers nothing. Both
+        # only ever OVERSTATE the bill, the safe direction.
+        groups: dict = {}
         for contract in sorted(net):
             held = net[contract]
-            if held >= -_ASSIGNMENT_EPS:      # flat, or net LONG: nothing can be put to us
-                continue
             o = meta[contract]
-            leg = put_assignment_cost(o.strike, abs(held), getattr(o, "multiplier", None))
+            mult = getattr(o, "multiplier", None)
+            underlying = getattr(o, "underlying_symbol", None)
+            expiry = getattr(o, "expiry", None)
+            if held > _ASSIGNMENT_EPS:          # net LONG put: may cover a short
+                if underlying is not None and expiry is not None and o.strike is not None:
+                    groups.setdefault((underlying, expiry, mult), ([], []))[1].append(
+                        (o.strike, held))
+                continue
+            if held >= -_ASSIGNMENT_EPS:        # flat: nothing can be put to us
+                continue
+            leg = put_assignment_cost(o.strike, abs(held), mult)
             if leg is None:
                 blind.append(
                     f"order {getattr(o, 'id', '?')} ({contract}) is a held SHORT PUT but "
                     f"its strike ({o.strike!r}) / contract count ({held!r}) / multiplier "
-                    f"({getattr(o, 'multiplier', None)!r}) cannot price delivery — the "
+                    f"({mult!r}) cannot price delivery — the "
                     f"cash it would take to accept assignment is unmeasurable")
                 continue
-            cost += leg
+            key = ((underlying, expiry, mult) if underlying is not None and expiry is not None
+                   else ("unmatched", contract, mult))
+            groups.setdefault(key, ([], []))[0].append((o.strike, abs(held)))
             contracts += abs(held)
+        for key in sorted(groups, key=str):
+            shorts, longs = groups[key]
+            if not shorts:
+                continue
+            group_cost = netted_put_assignment_cost(shorts, longs, key[2])
+            if group_cost is None:
+                blind.append(
+                    f"held puts {key!r} cannot be priced for delivery net of their long "
+                    f"wings — the cash it would take to accept assignment is unmeasurable")
+                continue
+            cost += group_cost
 
         for o, qty in pending_shorts:
             leg = put_assignment_cost(o.strike, qty, getattr(o, "multiplier", None))
@@ -3009,6 +3041,7 @@ class OptionsAccountInterface(ABC):
     def check_short_put_assignment_capacity(
         self, *, strike: Optional[float], contracts: Optional[float],
         multiplier: Optional[int] = 100,
+        long_puts: Sequence[Tuple[Optional[float], Optional[float]]] = (),
     ) -> "AssignmentCapacity":
         """Capacity verdict for a CANDIDATE short put, priced from its LEG facts.
 
@@ -3023,10 +3056,18 @@ class OptionsAccountInterface(ABC):
         A candidate that cannot be priced REFUSES and says which field was missing. A
         structure whose delivery cost we cannot compute is not a structure that costs
         nothing.
+
+        ``long_puts`` are the candidate's OWN long put legs of the same expiry, as
+        ``(strike, contracts)`` for the whole order: they net the short down to the wing
+        width (``netted_put_assignment_cost``, operator decision 2026-10-15), the same
+        rule ``short_put_assignment_exposure`` applies once the structure is held.
         """
-        from ba2_common.core.option_lifecycle import put_assignment_cost
+        from ba2_common.core.option_lifecycle import (netted_put_assignment_cost,
+                                                      put_assignment_cost)
 
         cost = put_assignment_cost(strike, contracts, multiplier)
+        if cost is not None and long_puts:
+            cost = netted_put_assignment_cost([(strike, contracts)], long_puts, multiplier)
         if cost is None:
             return AssignmentCapacity(
                 False,
