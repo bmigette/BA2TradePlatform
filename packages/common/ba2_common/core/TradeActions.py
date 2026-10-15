@@ -3434,6 +3434,7 @@ class _OptionEntryAction(TradeAction):
                                        strike: Optional[float],
                                        quantity: Optional[int],
                                        contracts_per_unit: int = 1,
+                                       long_puts_per_unit: "Tuple[Tuple[float, int], ...]" = (),
                                        ) -> "Tuple[Optional[int], Optional[Dict[str, Any]]]":
         """ENFORCING assignment-capacity gate. Returns ``(admitted_quantity, refusal)``.
 
@@ -3465,26 +3466,36 @@ class _OptionEntryAction(TradeAction):
         extended to say the downsize was attempted), and every UNMEASURABLE verdict
         (no room figure exists to clamp to; unknown is still not 'fine').
 
+        ``long_puts_per_unit`` are the structure's own long put legs of the same expiry,
+        ``(strike, contracts per unit)``: they net the short down to the wing width
+        (operator decision 2026-10-15), so a condor or put vertical owes its width here,
+        the same figure the backtest settles it at and the held-book view charges it.
+
         Placed AFTER ``check_option_buying_power`` deliberately: an entry that the
         pre-existing gate already refuses keeps the message it has always had, so no
         decline already on record is re-labelled. A downsized entry needs LESS buying
         power than the full size that already passed, so the earlier BP verdict holds a
         fortiori (callers re-derive the reserve for the clamped size).
         """
+        def _longs(units):
+            return tuple((k, n * units) for k, n in long_puts_per_unit)
+
         total = None
         if quantity is not None and contracts_per_unit:
             total = contracts_per_unit * quantity
         verdict = self.account.check_short_put_assignment_capacity(
-            strike=strike, contracts=total)
+            strike=strike, contracts=total,
+            long_puts=_longs(quantity) if quantity is not None else ())
         if verdict.ok:
             return quantity, None
         downsize_attempted = False
         if (verdict.held_cost is not None and verdict.cash is not None
                 and verdict.candidate_cost is not None
                 and quantity is not None and quantity >= 1):
-            from ba2_common.core.option_lifecycle import put_assignment_cost
+            from ba2_common.core.option_lifecycle import netted_put_assignment_cost
 
-            per_unit = put_assignment_cost(strike, contracts_per_unit, 100)
+            per_unit = netted_put_assignment_cost(
+                [(strike, contracts_per_unit)], _longs(1), 100)
             if per_unit is not None and per_unit > 0:
                 downsize_attempted = True
                 room = verdict.cash - verdict.held_cost
@@ -3498,7 +3509,8 @@ class _OptionEntryAction(TradeAction):
                     if units < 1:
                         break
                     clamped = self.account.check_short_put_assignment_capacity(
-                        strike=strike, contracts=contracts_per_unit * units)
+                        strike=strike, contracts=contracts_per_unit * units,
+                        long_puts=_longs(units))
                     if clamped.ok:
                         logger.warning(
                             f"{self._action_type_value()} for {self.instrument_name}: "
@@ -4922,9 +4934,9 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
     as buying power. Bullish/neutral: it pays while the underlying stays ABOVE the short
     strike.
 
-    ASSIGNMENT. The short leg is a PUT, so this structure can have shares put to it and
-    is charged the full short strike by ``_downsize_to_delivery_capacity``. The long
-    wing nets NOTHING off that bill — see the comment at the gate below.
+    ASSIGNMENT. The short leg is a PUT, so this structure can have shares put to it.
+    ``_downsize_to_delivery_capacity`` charges it the spread width: the long wing of the
+    same expiry nets the short strike down (see the comment at the gate below).
     """
 
     OPTION_TYPE = OptionRight.PUT
@@ -5000,13 +5012,13 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
                                 f"Insufficient buying power to reserve {reserve} for bull_put_spread "
                                 f"on {self.instrument_name} (available="
                                 f"{self._capital_headroom()[0]})")
-        # The SHORT PUT leg (the HIGHER strike), `quantity` contracts, charged at its FULL
-        # strike. The long put wing nets NOTHING off: the short leg can be assigned
-        # TONIGHT, while exercising our own lower-strike put is a choice we make LATER —
-        # after the shares have already been paid for. Netting the width here would price
-        # a $9,500 obligation at $500 and wave every entry through.
+        # The SHORT PUT leg (the HIGHER strike), `quantity` contracts, netted by the long
+        # put wing down to the spread width (operator decision 2026-10-15, superseding the
+        # full-strike charge): what a broker margins a put vertical at, and what the
+        # backtest settles it at (``settle_defined_risk_combo_expiry``).
         quantity, refusal = self._downsize_to_delivery_capacity(
-            "bull_put_spread", strike=short_c.strike, quantity=quantity)
+            "bull_put_spread", strike=short_c.strike, quantity=quantity,
+            long_puts_per_unit=((long_c.strike, 1),))
         if refusal is not None:
             return refusal
         reserve = self.account.option_reserve_required(
@@ -5424,13 +5436,14 @@ class OpenIronCondorAction(_OptionEntryAction):
             "iron_condor", quantity, spread_width=width, net_credit=net_credit)
         if not self._reserve_fits(reserve):
             return self._result(False, f"Insufficient BP for iron condor on {self.instrument_name}")
-        # The SHORT PUT leg (sp), `quantity` contracts. The long put WING (lp) nets
-        # NOTHING off: the short leg can be assigned tonight, while exercising our own
-        # put is a choice we make LATER — after the shares have already been paid for.
-        # A condor is sized off its wing width, which is why it is the structure this
-        # gate bites hardest.
+        # The SHORT PUT leg (sp), `quantity` contracts, netted by the long put WING (lp)
+        # down to the put-side width (operator decision 2026-10-15). Charging the full
+        # short strike capped a $20k account at about one condor and bounded the whole
+        # structure's search to ~2%/yr; the backtest settles a condor at its net payoff
+        # and never delivers shares, so the full strike guarded an event it cannot model.
         quantity, refusal = self._downsize_to_delivery_capacity(
-            "iron_condor", strike=sp.strike, quantity=quantity)
+            "iron_condor", strike=sp.strike, quantity=quantity,
+            long_puts_per_unit=((lp.strike, 1),))
         if refusal is not None:
             return refusal
         reserve = self.account.option_reserve_required(
@@ -5685,12 +5698,12 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
             "put_ratio_spread", quantity, strike=short_p.strike, net_credit=net_credit)
         if not self._reserve_fits(reserve):
             return self._result(False, f"Insufficient BP for ratio spread on {self.instrument_name}")
-        # TWO short puts per structure (`ratio_qty=2` on the short leg below), so the
-        # delivery bill is 2 x quantity contracts at the SHORT strike. The single long
-        # put at the higher strike nets nothing off, same as the condor's wing.
+        # TWO short puts per structure (`ratio_qty=2` on the short leg below). The single
+        # long put at the HIGHER strike covers one of them in full (operator decision
+        # 2026-10-15); the other is naked and owes its full short strike.
         quantity, refusal = self._downsize_to_delivery_capacity(
             "put_ratio_spread", strike=short_p.strike, quantity=quantity,
-            contracts_per_unit=2)
+            contracts_per_unit=2, long_puts_per_unit=((long_p.strike, 1),))
         if refusal is not None:
             return refusal
         reserve = self.account.option_reserve_required(
@@ -5869,7 +5882,7 @@ class _BackspreadAction(_OptionEntryAction):
                 False, f"Insufficient buying power to reserve {reserve} for "
                        f"{self.OPTION_STRATEGY} on {self.instrument_name} (available="
                        f"{self._capital_headroom()[0]})")
-        quantity, refusal = self._assignment_capacity(short_c, quantity)
+        quantity, refusal = self._assignment_capacity(short_c, quantity, long_c)
         if refusal is not None:
             return refusal
         reserve = self.account.option_reserve_required(
@@ -5877,7 +5890,7 @@ class _BackspreadAction(_OptionEntryAction):
         return self._submit_option_order(legs, quantity, net, self.OPTION_STRATEGY,
                                          option_reserve=reserve)
 
-    def _assignment_capacity(self, short_c, quantity):
+    def _assignment_capacity(self, short_c, quantity, long_c):
         """The short-put delivery gate, for the right that has one. ``(quantity, refusal)``.
 
         Overridden by the PUT subclass. A CALL backspread's short leg is a CALL: assignment
@@ -5921,18 +5934,18 @@ class OpenPutBackspreadAction(_BackspreadAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_PUT_BACKSPREAD.value
 
-    def _assignment_capacity(self, short_c, quantity):
+    def _assignment_capacity(self, short_c, quantity, long_c):
         """CHARGED, exactly like every other builder carrying a short put.
 
-        One short put per unit (``BACKSPREAD_SHORT_RATIO``), and the two long puts net
-        NOTHING off the delivery bill -- the same fact the bull put spread's wing is pinned
-        on: a long put is OUR right, exercisable on a LATER day, after the shares have
-        already been paid for at the short strike tonight. So the bill is
-        ``short strike x 100 x units`` and the gate downsizes to what the cash can deliver.
+        One short put per unit (``BACKSPREAD_SHORT_RATIO``), netted by the lower-strike
+        long puts of the same expiry down to the width (operator decision 2026-10-15, the
+        same rule as the bull put spread's wing). The gate downsizes to what the cash can
+        deliver on that net bill.
         """
         return self._downsize_to_delivery_capacity(
             self.OPTION_STRATEGY, strike=short_c.strike, quantity=quantity,
-            contracts_per_unit=BACKSPREAD_SHORT_RATIO)
+            contracts_per_unit=BACKSPREAD_SHORT_RATIO,
+            long_puts_per_unit=((long_c.strike, BACKSPREAD_LONG_RATIO),))
 
     def get_description(self) -> str:
         return f"Open put backspread on {self.instrument_name}"
