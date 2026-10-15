@@ -20,7 +20,6 @@ from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.models import AnalysisOutput, MarketAnalysis
 from ba2_common.core.knowability import scan_cutoff_date
 from ba2_providers.StockScreener import ScreenerDataError, StockScreener
-from ba2_providers.StockScreener import StockScreener
 from ba2_providers.screener.metric_store import MetricStoreStaleError
 from ba2_providers.fmp_common import FMPHermeticViolation
 from ba2_common.core.types import MarketAnalysisStatus, OrderRecommendation, Recommendation

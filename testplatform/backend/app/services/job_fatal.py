@@ -33,7 +33,7 @@ JOB_FATAL_ERROR_TYPES = frozenset({
     "FillRebaseRefusal", "FillRebaseDisabled",
     "ScreenerUniverseRefusal",
     "ScreenerGenomeOutOfRange", "ScreenerDataOutage", "PanelCoverageError", "ScreenerGateRefusal",
-    "ScreenerUniverseRefusal", "MetricStoreStaleError",
+    "MetricStoreStaleError",
 })
 
 
