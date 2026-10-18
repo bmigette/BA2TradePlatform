@@ -678,3 +678,86 @@ def test_a_reserve_refusal_stops_the_entry_and_submits_nothing(monkeypatch):
     with pytest.raises(ValueError, match="option_reserve_required"):
         action.execute()
     assert acct.submitted == []
+
+
+# --------------------------------------------------------------------------------------
+# Iron condor / jade lizard: every leg on ONE expiry (the short strangle's pin, shared).
+# --------------------------------------------------------------------------------------
+_E1 = date(2024, 6, 21)   # 20 DTE
+_E2 = date(2024, 7, 12)   # 41 DTE... inside the 20-45 window below
+
+
+class _SplitExpiryAccount(FakeAccount):
+    """Chain where the UNPINNED 10%-OTM picks land on DIFFERENT expiries.
+
+    spot=100 -> target call 110, target put 90. The call at exactly 110 exists only on
+    _E1 and the put at exactly 90 only on _E2, so independent ``select_single`` calls
+    pick (call _E1, put _E2). ``put_strikes_e1`` / ``call_strikes_e1`` control what the
+    pinned expiry (the call's, _E1) still offers.
+    """
+    def __init__(self, put_strikes_e1=(85.0, 80.0), call_strikes_e1=(110.0, 115.0)):
+        super().__init__()
+        self._put_e1 = put_strikes_e1
+        self._call_e1 = call_strikes_e1
+
+    def get_option_chain(self, underlying, expiry_min, expiry_max, option_type,
+                         strike_min=None, strike_max=None):
+        is_call = option_type == OptionRight.CALL
+        rows = []
+        e1 = self._call_e1 if is_call else self._put_e1
+        e2 = (105.0, 108.0) if is_call else (90.0, 95.0)
+        for expiry, strikes in ((_E1, e1), (_E2, e2)):
+            for s in strikes:
+                otm = abs(s - self._spot)
+                bid = max(0.2, 5.0 - 0.08 * otm)
+                rows.append(OptionContract(
+                    symbol=f"{underlying}{expiry:%y%m%d}{int(s)}{'C' if is_call else 'P'}",
+                    underlying=underlying, option_type=option_type, strike=s, expiry=expiry,
+                    bid=round(bid, 4), ask=round(bid + 0.2, 4), last=round(bid, 4),
+                    open_interest=1000, delta=None, implied_volatility=None))
+        return rows
+
+
+def _mk_split(action_type, acct, **kw):
+    rec = SimpleNamespace(id=1, instance_id=None)
+    act = create_action(ExpertActionType(action_type), "AAPL", acct,
+                        SimpleNamespace(), None, rec, **kw)
+    act.submit_to_broker = True
+    return act
+
+
+_KW = dict(strike_method="percent_otm", strike_param=10.0, dte_min=15, dte_max=45,
+           sizing=5.0, wing_width_pct=5.0)
+
+
+def test_split_expiry_fixture_would_pick_different_expiries_unpinned():
+    from ba2_common.core.option_selector import select_single
+    acct = _SplitExpiryAccount()
+    kw = dict(method="percent_otm", strike_param=10.0, spot=100.0, dte_min=15, dte_max=45,
+              today=date(2024, 6, 1))
+    c = select_single(acct.get_option_chain("AAPL", None, None, OptionRight.CALL),
+                      option_type=OptionRight.CALL, **kw)
+    p = select_single(acct.get_option_chain("AAPL", None, None, OptionRight.PUT),
+                      option_type=OptionRight.PUT, **kw)
+    assert c.expiry != p.expiry
+
+
+@pytest.mark.parametrize("action_type,nlegs", [("open_iron_condor", 4), ("open_jade_lizard", 3)])
+def test_condor_and_lizard_put_every_leg_on_one_expiry(action_type, nlegs):
+    acct = _SplitExpiryAccount()
+    res = _mk_split(action_type, acct, **{**_KW, "sizing": 5.0 if nlegs == 4 else 20.0}).execute()
+    assert res["success"], res["message"]
+    legs = acct.submitted[0]["legs"]
+    assert len(legs) == nlegs
+    assert len({l.expiry for l in legs}) == 1
+
+
+@pytest.mark.parametrize("action_type", ["open_iron_condor", "open_jade_lizard"])
+def test_condor_and_lizard_refuse_when_pinned_expiry_lacks_the_put(action_type):
+    # The call sits on _E1; _E1 offers no put at all, only _E2 does. No fallback to
+    # another expiry and no unhandled "single expiry" ValueError: a loud refusal.
+    acct = _SplitExpiryAccount(put_strikes_e1=())
+    res = _mk_split(action_type, acct, **_KW).execute()
+    assert not res["success"]
+    assert "share one expiry" in res["message"]
+    assert acct.submitted == []
