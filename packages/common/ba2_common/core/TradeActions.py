@@ -2983,29 +2983,30 @@ class _OptionEntryAction(TradeAction):
         return self.account.get_option_chain(
             self.instrument_name, expiry_min, expiry_max, option_type)
 
-    def _select_short_pair_one_expiry(self, call_chain, put_chain, *, otm, spot, liq, label):
-        """Pick the short call and short put of a two-short structure on ONE expiry.
+    def _select_call_put_pair_one_expiry(self, call_chain, put_chain, *, param, spot, liq,
+                                         label, method="percent_otm", role="short"):
+        """Pick a call and a put (two-leg or two-short structures) on ONE expiry.
 
         The call is chosen first; the put is then chosen from the put chain restricted to
         the call's expiry (the OpenShortStrangleAction rule). Two independent
         ``select_single`` calls can land on different expiries, which the account layer
-        rejects with an uncaught "single expiry" ValueError. No expiry on which the put
-        cannot be found means a refusal, never a different expiry.
+        rejects with an uncaught "single expiry" ValueError. No put on that expiry means a
+        refusal, never a different expiry. ``role`` ("short"/"long") only words the refusal.
         Returns ``(call, put, refusal)``; ``refusal`` is a result dict or ``None``.
         """
-        sc = select_single(call_chain, method="percent_otm", strike_param=otm, spot=spot,
+        sc = select_single(call_chain, method=method, strike_param=param, spot=spot,
                            option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
                            today=self._today(), policy=self.selection_policy, **liq)
         if sc is None:
             return None, None, self._result(
-                False, f"No liquid short legs for {label} on {self.instrument_name}")
+                False, f"No liquid {role} legs for {label} on {self.instrument_name}")
         sp = select_single([c for c in put_chain if c.expiry == sc.expiry],
-                           method="percent_otm", strike_param=otm, spot=spot,
+                           method=method, strike_param=param, spot=spot,
                            option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
                            today=self._today(), policy=self.selection_policy, **liq)
         if sp is None:
             return None, None, self._result(
-                False, f"No liquid short put on the short call's expiry ({sc.expiry}); "
+                False, f"No liquid {role} put on the call's expiry ({sc.expiry}); "
                        f"{label} legs must share one expiry on {self.instrument_name}")
         return sc, sp, None
 
@@ -5180,20 +5181,11 @@ class OpenStrangleAction(_OptionEntryAction):
         method = str(self.strike_method or "percent_otm")
         default_param = self.DEFAULT_DELTA if method == "delta" else self.DEFAULT_OTM_PCT
         width = self.strike_param if self.strike_param is not None else default_param
-        call_c = select_single(
-            call_chain, method=method, strike_param=width, spot=spot,
-            option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), target_price=None,
-            policy=self.selection_policy, **liq)
-        if call_c is None:
-            return self._result(False, f"No liquid OTM call for strangle on {self.instrument_name}")
-        put_c = select_single(
-            put_chain, method=method, strike_param=width, spot=spot,
-            option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), target_price=None,
-            policy=self.selection_policy, **liq)
-        if put_c is None:
-            return self._result(False, f"No liquid OTM put for strangle on {self.instrument_name}")
+        call_c, put_c, refusal = self._select_call_put_pair_one_expiry(
+            call_chain, put_chain, param=width, spot=spot, liq=liq, label="strangle",
+            method=method, role="long")
+        if refusal is not None:
+            return refusal
         if call_c.ask is None or put_c.ask is None:
             return self._result(False, f"Missing ask quote for strangle legs on {self.instrument_name}")
         net_debit = round(call_c.ask + put_c.ask, 4)        # buy both at ASK
@@ -5422,8 +5414,8 @@ class OpenIronCondorAction(_OptionEntryAction):
         spot = self._spot()
         otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
-        sc, sp, refusal = self._select_short_pair_one_expiry(
-            call_chain, put_chain, otm=otm, spot=spot, liq=liq, label="iron condor")
+        sc, sp, refusal = self._select_call_put_pair_one_expiry(
+            call_chain, put_chain, param=otm, spot=spot, liq=liq, label="iron condor")
         if refusal is not None:
             return refusal
         # Wings farther OTM, same expiry as the matching short leg.
@@ -5508,8 +5500,8 @@ class OpenJadeLizardAction(_OptionEntryAction):
         spot = self._spot()
         otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
-        sc, sp, refusal = self._select_short_pair_one_expiry(
-            call_chain, put_chain, otm=otm, spot=spot, liq=liq, label="jade lizard")
+        sc, sp, refusal = self._select_call_put_pair_one_expiry(
+            call_chain, put_chain, param=otm, spot=spot, liq=liq, label="jade lizard")
         if refusal is not None:
             return refusal
         lc = select_wing(call_chain, center_strike=sc.strike, width_pct=wing,

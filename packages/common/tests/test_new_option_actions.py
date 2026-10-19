@@ -761,3 +761,34 @@ def test_condor_and_lizard_refuse_when_pinned_expiry_lacks_the_put(action_type):
     assert not res["success"]
     assert "share one expiry" in res["message"]
     assert acct.submitted == []
+
+
+def test_long_strangle_puts_both_legs_on_one_expiry():
+    acct = _SplitExpiryAccount()
+    res = _mk_split("open_strangle", acct, **{**_KW, "sizing": 5.0}).execute()
+    assert res["success"], res["message"]
+    legs = acct.submitted[0]["legs"]
+    assert len(legs) == 2
+    assert len({l.expiry for l in legs}) == 1
+
+
+def test_long_strangle_refuses_when_pinned_expiry_lacks_the_put():
+    acct = _SplitExpiryAccount(put_strikes_e1=())
+    res = _mk_split("open_strangle", acct, **{**_KW, "sizing": 5.0}).execute()
+    assert not res["success"]
+    assert "share one expiry" in res["message"]
+    assert acct.submitted == []
+
+
+@pytest.mark.parametrize("action_type", ["open_straddle", "open_short_straddle",
+                                         "open_short_strangle"])
+def test_other_call_put_pairs_never_split_expiries(action_type):
+    # Already pinned before this change (straddles: call's strike AND expiry; short
+    # strangle: call's expiry). Pinned here so a regression is a refusal/one-expiry
+    # result, never the account layer's single-expiry ValueError.
+    acct = _SplitExpiryAccount()
+    res = _mk_split(action_type, acct, **{**_KW, "sizing": 5.0}).execute()
+    if res["success"]:
+        assert len({l.expiry for l in acct.submitted[0]["legs"]}) == 1
+    else:
+        assert acct.submitted == []
