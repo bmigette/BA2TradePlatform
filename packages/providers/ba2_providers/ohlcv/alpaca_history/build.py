@@ -33,6 +33,15 @@ SEMANTICS (the plan's "Semantics fixed", the split_table docstring wins on a con
     the store's ``days_without_intraday_bars`` per year are carried into the manifest.  Volume float64 like the FMP files.
   * COLUMNS exactly like the FMP files: ``Date, Open, High, Low, Close, Volume, effective_date`` (``effective_date = Date``).
 
+DAILY BAD PRINTS (``repair_daily``).  A daily High/Low can be a bad print (NVDA 2024-06-10: High 195.95 against 123.10).  The 5-minute store
+  (ALL sessions, extended hours included -- a daily bar covers them) gives the day's envelope; High' = max(5-minute high, Open, Close),
+  Low' = min(5-minute low, Open, Close), all on the adjusted basis.  A daily High is REPAIRED to High' only when it exceeds High' by more
+  than REPAIR_TOL (2 %) AND the FMP daily High, put on our basis with that day's ratio (our Close / FMP Close), agrees with High' within
+  WITNESS_TOL (1 %); Low symmetric.  Without the FMP witness (no FMP file / no FMP bar) nothing is repaired.  Open, Close and Volume are
+  never touched.  Every repair is a row of ``<out>/_meta/bar_repairs.csv`` (symbol, date, field, old, new, envelope, fmp, run_id) and of the
+  manifest entry; the adjusted all-session envelope of each symbol is kept in ``<out>/_meta/envelope/<SYM>.parquet`` (Date, High, Low) for
+  the verify check ``hl_envelope``.  A daily value outside the envelope that is not repaired stays as it is (verify reports it).
+
 OUTPUT.  ``<out>/<SYM>_1d.parquet``, ``<out>/<SYM>_5min.parquet`` (atomic: temp file + os.replace) and
 ``<out>/_meta/build_manifest.json`` (the only thing this step writes under ``_meta``): the stores' asof, the split table's
 run_id / sha256 / inputs_sha256 / overrides_sha256, the input chunk hashes, per symbol the first/last date and bar count of
@@ -69,6 +78,9 @@ PRICE_COLUMNS = ["Open", "High", "Low", "Close"]
 RENAME = {"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"}
 MANIFEST_NAME = "build_manifest.json"
 SPLIT_TABLE_NAME = "split_table.json"
+REPAIR_TOL = 0.02                # a daily High/Low must be this far outside the envelope to be repaired ...
+WITNESS_TOL = 0.01               # ... and the FMP value on our basis must agree with the envelope value within this
+REPAIR_COLUMNS = ["symbol", "date", "field", "old", "new", "envelope", "fmp", "run_id"]
 RUN_ID_CSVS = ("split_review.csv", "split_accepted.csv", "split_vs_fmp.csv", "fmp_daily_inputs.csv", "yahoo_inputs.csv")
 
 
@@ -201,6 +213,51 @@ def to_native_5min(store_5min: pd.DataFrame, what: str = "5min") -> pd.DataFrame
     return out[["Date", "Open", "High", "Low", "Close", "Volume"]]
 
 
+def split_5min(store_5min: pd.DataFrame, what: str = "5min") -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """(regular-session bars as ``to_native_5min``, the ALL-session envelope per New York day: index ``Date`` (midnight), High, Low)."""
+    allb = _to_native(store_5min, what)
+    d = allb["Date"]
+    env = allb.assign(day=d.dt.normalize()).groupby("day").agg(High=("High", "max"), Low=("Low", "min"))
+    env.index.name = "Date"
+    minute = d.dt.hour * 60 + d.dt.minute
+    out = allb[(minute >= RTH_FIRST_MIN) & (minute <= RTH_LAST_MIN)]
+    if out["Date"].duplicated().any():
+        raise BuildError(f"{what}: duplicate bar start {out['Date'][out['Date'].duplicated()].iloc[0]}")
+    out = out.sort_values("Date", kind="stable").reset_index(drop=True)
+    return out[["Date", "Open", "High", "Low", "Close", "Volume"]], env
+
+
+def price_divisor(days: pd.Series, splits: Sequence[Tuple[str, float]], spinoffs: Sequence[Tuple[str, float]]) -> np.ndarray:
+    return cumulative_factor(days, splits) * cumulative_factor(days, spinoffs)
+
+
+def repair_daily(daily: pd.DataFrame, env: pd.DataFrame, fmp: Optional[pd.DataFrame]) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """Repair bad daily High/Low prints (see the module docstring).  ``daily``: adjusted Date/Open/High/Low/Close/Volume; ``env``: adjusted
+    all-session envelope indexed by midnight Date (High, Low); ``fmp``: the FMP daily frame (Date, High, Low, Close) or None.
+    Returns (frame, repairs); each repair is {date, field, old, new, envelope, fmp}."""
+    out = daily.copy()
+    repairs: List[Dict[str, Any]] = []
+    if fmp is None or not len(out) or not len(env):
+        return out, repairs
+    day = out["Date"].dt.normalize()
+    e = env.reindex(day)
+    hi_p = np.maximum(np.maximum(e["High"].values, out["Open"].values), out["Close"].values)
+    lo_p = np.minimum(np.minimum(e["Low"].values, out["Open"].values), out["Close"].values)
+    f = fmp.assign(day=fmp["Date"].dt.normalize()).drop_duplicates("day").set_index("day").reindex(day)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = out["Close"].values / f["Close"].values
+        fmp_h, fmp_l = f["High"].values * ratio, f["Low"].values * ratio
+        bad_h = (out["High"].values > hi_p * (1 + REPAIR_TOL)) & (np.abs(fmp_h / hi_p - 1) <= WITNESS_TOL)
+        bad_l = (out["Low"].values < lo_p * (1 - REPAIR_TOL)) & (np.abs(fmp_l / lo_p - 1) <= WITNESS_TOL)
+    for field, bad, new, wit in (("High", bad_h, hi_p, fmp_h), ("Low", bad_l, lo_p, fmp_l)):
+        for i in np.flatnonzero(bad):
+            repairs.append({"date": str(out["Date"].iloc[i].date()), "field": field, "old": float(out[field].iloc[i]), "new": float(new[i]),
+                            "envelope": float(new[i]), "fmp": float(wit[i])})
+        out.loc[out.index[bad], field] = new[bad]
+    repairs.sort(key=lambda r: (r["date"], r["field"]))
+    return out, repairs
+
+
 def apply_break(frame: pd.DataFrame, break_date: Optional[str]) -> Tuple[pd.DataFrame, int]:
     """Keep the bars whose session is on/after ``break_date``; returns (kept, number dropped)."""
     if break_date is None or frame.empty:
@@ -271,7 +328,8 @@ def file_names(symbol: str) -> Tuple[str, str]:
     return f"{s}_1d.parquet", f"{s}_5min.parquet"
 
 
-def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str, table: SplitTable) -> Dict[str, Any]:
+def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str, table: SplitTable,
+                 fmp_dir: Optional[str] = None) -> Dict[str, Any]:
     """Build both files of one symbol; returns its manifest entry.  One symbol at a time: memory is one symbol's bars."""
     t0 = time.time()
     entry: Dict[str, Any] = {"symbol": symbol}
@@ -298,6 +356,7 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     gap_days: Dict[str, Any] = {}
     refused: Dict[str, str] = {}
     intr = None
+    env_raw = None
     dropped_5m = 0
     if year_files:
         i_manifest = _read_manifest(intraday_store, symbol)
@@ -309,7 +368,11 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
         listed = {k.split("/")[1] + ".parquet" for k in chunks if chunks[k]["bars"] > 0}
         if listed != set(year_files):
             raise BuildError(f"{symbol}: 5Min files {sorted(year_files)} differ from the manifest's {sorted(listed)}")
-        frames = [to_native_5min(pd.read_parquet(os.path.join(i_dir, f)), f"{symbol} {f}") for f in year_files]
+        parts = [split_5min(pd.read_parquet(os.path.join(i_dir, f)), f"{symbol} {f}") for f in year_files]
+        frames = [a for a, _ in parts]
+        env_raw = pd.concat([b for _, b in parts]).groupby(level=0).agg(High=("High", "max"), Low=("Low", "min"))   # a NY day can span two UTC year files
+        if brk is not None:
+            env_raw = env_raw[env_raw.index >= pd.Timestamp(brk)]
         intr = pd.concat(frames, ignore_index=True)
         if intr["Date"].duplicated().any():
             raise BuildError(f"{symbol}: a 5-minute bar start appears in two year files")
@@ -332,10 +395,26 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     ev_s = [[d, f] for d, f in splits if first_day is not None and pd.Timestamp(d) > first_day]
     ev_o = [[d, f] for d, f in spinoffs if first_day is not None and pd.Timestamp(d) > first_day]
     entry["events"] = {"splits": ev_s, "spinoffs": ev_o}
+    entry["repairs"] = []
+    entry["fmp_daily_sha256"] = None
     f1, f5 = file_names(symbol)
     entry["files"] = {}
     if len(daily):
-        d_out = finish(adjust(daily, splits, spinoffs), "1d")
+        d_adj = adjust(daily, splits, spinoffs)
+        repairs: List[Dict[str, Any]] = []
+        if env_raw is not None and len(env_raw):
+            div = price_divisor(env_raw.index.to_series(), splits, spinoffs)
+            env = pd.DataFrame({"High": env_raw["High"].values / div, "Low": env_raw["Low"].values / div}, index=env_raw.index)
+            fp = os.path.join(fmp_dir, f"{symbol}_1d.parquet") if fmp_dir else None
+            fmp_df = None
+            if fp and os.path.isfile(fp):
+                fmp_df = pd.read_parquet(fp, columns=["Date", "High", "Low", "Close"])
+                with open(fp, "rb") as fh:
+                    entry["fmp_daily_sha256"] = hashlib.sha256(fh.read()).hexdigest()
+            d_adj, repairs = repair_daily(d_adj, env, fmp_df)
+            atomic_write(os.path.join(out, "_meta", "envelope", f"{symbol}.parquet"), parquet_bytes(env.reset_index()))
+        entry["repairs"] = repairs
+        d_out = finish(d_adj, "1d")
         atomic_write(os.path.join(out, f1), parquet_bytes(d_out))
         entry["1d"] = {"first": str(d_out["Date"].iloc[0].date()), "last": str(d_out["Date"].iloc[-1].date()), "bars": len(d_out)}
         entry["files"]["1d"] = f1
@@ -354,10 +433,10 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     return entry
 
 
-def _task(args: Tuple[str, str, str, str, "SplitTable"]) -> Dict[str, Any]:
-    symbol, daily_store, intraday_store, out, table = args
+def _task(args: Tuple[str, str, str, str, "SplitTable", Optional[str]]) -> Dict[str, Any]:
+    symbol, daily_store, intraday_store, out, table, fmp_dir = args
     try:
-        return build_symbol(symbol, daily_store=daily_store, intraday_store=intraday_store, out=out, table=table)
+        return build_symbol(symbol, daily_store=daily_store, intraday_store=intraday_store, out=out, table=table, fmp_dir=fmp_dir)
     except Exception as e:                       # reported per symbol; the run finishes and then fails, named
         return {"symbol": symbol, "error": f"{type(e).__name__}: {e}"}
 
@@ -392,6 +471,7 @@ def list_symbols(daily_store: str, intraday_store: str) -> List[str]:
 
 def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str = DEFAULT_INTRADAY_STORE,
                 out: str = DEFAULT_OUT, symbols: Optional[Sequence[str]] = None, workers: int = 4,
+                fmp_daily_dir: Optional[str] = None,
                 log: Callable[[str], None] = lambda m: None) -> Dict[str, Any]:
     """Build the cache for every store symbol (or ``symbols``) and write the manifest.  Raises ``BuildError`` on a bad input and
     when any symbol failed (after the others finished and the manifest was written)."""
@@ -412,7 +492,7 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
     os.makedirs(os.path.join(out, "_meta"), exist_ok=True)
     log(f"build: {len(todo)} symbols, {workers} workers, split table {table.run_id}")
     results: List[Dict[str, Any]] = []
-    jobs = [(s, daily_store, intraday_store, out, table) for s in todo]
+    jobs = [(s, daily_store, intraday_store, out, table, fmp_daily_dir) for s in todo]
     if workers <= 1:
         for i, j in enumerate(jobs, 1):
             results.append(_task(j))
@@ -433,7 +513,8 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
     if symbols is not None and os.path.isfile(mpath):
         with open(mpath, encoding="utf-8") as f:
             old = json.load(f)
-        if old["split_table"]["run_id"] == table.run_id and old["split_table"]["sha256"] == table.sha256:
+        if (old["split_table"]["run_id"] == table.run_id and old["split_table"]["sha256"] == table.sha256
+                and all("repairs" in e for e in old["symbols"].values())):
             entries = dict(old["symbols"])
     entries.update(built)
     covered = {n for e in entries.values() for n in e["files"].values()}
@@ -448,6 +529,8 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
             "5min": {"path": intraday_store, "STORE_INFO_sha256": _file_sha256(os.path.join(intraday_store, "STORE_INFO.json"))}},
         "input_chunks_sha256": hashlib.sha256("\n".join(f"{s}:{e['inputs_sha256']}" for s, e in sorted(entries.items())).encode()).hexdigest(),
         "subset": symbols is not None,
+        "fmp_daily_dir": fmp_daily_dir,
+        "repairs": sum(len(e["repairs"]) for e in entries.values()),
         "failed": failed,
         "skipped_no_bars": skipped,
         "unlisted_files": sorted(on_disk - covered),
@@ -456,12 +539,14 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
         "symbols": entries,
     }
     atomic_write(mpath, json.dumps(manifest, indent=1).encode("utf-8"))
+    rows = [{"symbol": sym, **r, "run_id": table.run_id} for sym, e in sorted(entries.items()) for r in e["repairs"]]
+    atomic_write(os.path.join(out, "_meta", "bar_repairs.csv"), pd.DataFrame(rows, columns=REPAIR_COLUMNS).to_csv(index=False).encode("utf-8"))
     summary = {"symbols_requested": len(todo), "built": len(built), "skipped_no_bars": len(skipped), "failed": len(failed),
                "files_1d": sum("1d" in e for e in built.values()), "files_5min": sum("5min" in e for e in built.values()),
                "bars_1d": sum(e["1d"]["bars"] for e in built.values() if "1d" in e),
                "bars_5min": sum(e["5min"]["bars"] for e in built.values() if "5min" in e),
                "dropped_by_break": sum(sum(e["dropped_by_break"].values()) for e in built.values()),
-               "unlisted_files": len(manifest["unlisted_files"]), "elapsed_s": manifest["elapsed_s"], "manifest": mpath,
+               "unlisted_files": len(manifest["unlisted_files"]), "bar_repairs": manifest["repairs"], "elapsed_s": manifest["elapsed_s"], "manifest": mpath,
                "run_id": table.run_id,
                "per_symbol_s": {s: e["elapsed_s"] for s, e in built.items()}}
     if failed:

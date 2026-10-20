@@ -481,3 +481,99 @@ def test_fmp_download_wraps_fetch_cache_and_needs_its_arguments(tmp_path, monkey
     monkeypatch.setattr(ph.subprocess, "run", lambda argv, cwd: type("P", (), {"returncode": 3})())
     with pytest.raises(RuntimeError, match="exited 3"):
         ph.step_fmp_download(a, lambda m: None)
+
+
+# ---------------------------------------------------------------------------
+# bad daily prints
+# ---------------------------------------------------------------------------
+BAD_DAY = "2024-01-04"
+
+
+def repair_env(env, tmp_path, daily_high=20.0, daily_low=None, fmp_high=10.5, fmp_low=9.5, fmp_scale=1.0, with_fmp=True, close=10.0):
+    """One symbol, five sessions; on BAD_DAY the daily High (and Low) is set to a (bad) print.  5-minute envelope: 9.5 .. 10.5."""
+    daily, intr, out = env
+    days = sessions("2024-01-02", "2024-01-08")
+    write_symbol(daily, intr, "ABC", days, days)
+    p = daily / "bars" / "1Day" / "symbol=ABC" / "all.parquet"
+    f = pd.read_parquet(p)
+    i = f.index[f["t"] == ny_to_utc(pd.Timestamp(BAD_DAY))][0]
+    f.loc[i, "h"] = daily_high
+    if daily_low is not None:
+        f.loc[i, "l"] = daily_low
+    f.to_parquet(p, index=False)
+    make_table(out)
+    fmp = tmp_path / "fmp"
+    fmp.mkdir(parents=True)
+    if with_fmp:
+        rows = [{"Date": pd.Timestamp(d), "High": fmp_high * fmp_scale, "Low": fmp_low * fmp_scale, "Close": close * fmp_scale} for d in days]
+        pd.DataFrame(rows).to_parquet(fmp / "ABC_1d.parquet", index=False)
+    s = bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, fmp_daily_dir=str(fmp))
+    return pd.read_parquet(out / "ABC_1d.parquet").set_index("Date"), s
+
+
+def test_bad_high_with_fmp_witness_is_repaired_and_recorded(env, tmp_path):
+    d, s = repair_env(env, tmp_path)
+    out = env[2]
+    row = d.loc[BAD_DAY]
+    assert row["High"] == 10.5 and row["Open"] == 10.0 and row["Close"] == 10.0 and row["Volume"] == 1000
+    assert s["bar_repairs"] >= 1
+
+
+def test_repair_row_is_recorded_in_the_csv(env, tmp_path):
+    repair_env(env, tmp_path)
+    r = pd.read_csv(env[2] / "_meta" / "bar_repairs.csv", keep_default_na=False)
+    row = r[r["date"] == BAD_DAY].iloc[0]
+    assert (row["symbol"], row["field"], row["old"], row["new"], row["envelope"], row["fmp"], row["run_id"]) == ("ABC", "High", 20.0, 10.5, 10.5, 10.5, "RUN1")
+    assert (env[2] / "_meta" / "envelope" / "ABC.parquet").is_file()
+    assert list(r.columns) == bld.REPAIR_COLUMNS
+
+
+def test_no_repair_without_the_fmp_witness(env, tmp_path):
+    d, s = repair_env(env, tmp_path, with_fmp=False)
+    assert d.loc[BAD_DAY, "High"] == 20.0 and s["bar_repairs"] == 0
+
+
+def test_no_repair_when_fmp_disagrees_with_the_envelope(env, tmp_path):
+    d, s = repair_env(env, tmp_path, fmp_high=20.0)                                  # FMP shows the same high: not a bad print we can witness
+    assert d.loc[BAD_DAY, "High"] == 20.0
+
+
+def test_witness_uses_the_days_ratio_to_fmp(env, tmp_path):
+    d, _ = repair_env(env, tmp_path, fmp_scale=2.0)                                  # FMP on another basis: x2 everywhere
+    assert d.loc[BAD_DAY, "High"] == 10.5
+
+
+def test_a_high_explained_by_the_close_is_not_repaired(env, tmp_path):
+    # Close == High outside the 5-minute envelope (missing late bars / closing auction): High' = max(env, Open, Close) = Close
+    sub = (tmp_path / "e2")
+    for n in ("daily", "intra", "out"):
+        (sub / n).mkdir(parents=True)
+        if n != "out":
+            (sub / n / "STORE_INFO.json").write_text(json.dumps({"asof": "2026-10-12"}))
+            (sub / n / "bars" / "1Day").mkdir(parents=True)
+            (sub / n / "bars" / "5Min").mkdir(parents=True)
+    days = sessions("2024-01-02", "2024-01-08")
+    write_symbol(sub / "daily", sub / "intra", "ABC", days, days, close=10.0)
+    p = sub / "daily" / "bars" / "1Day" / "symbol=ABC" / "all.parquet"
+    f = pd.read_parquet(p)
+    f.loc[:, ["o", "h", "c"]] = 12.0
+    f.loc[:, "l"] = 11.9
+    f.to_parquet(p, index=False)
+    make_table(sub / "out")
+    fmp = tmp_path / "fmp2"
+    fmp.mkdir()
+    pd.DataFrame([{"Date": pd.Timestamp(x), "High": 10.5, "Low": 9.5, "Close": 12.0} for x in days]).to_parquet(fmp / "ABC_1d.parquet", index=False)
+    s = bld.build_cache(daily_store=str(sub / "daily"), intraday_store=str(sub / "intra"), out=str(sub / "out"), workers=1, fmp_daily_dir=str(fmp))
+    assert s["bar_repairs"] == 0
+
+
+def test_a_high_within_two_percent_is_left_alone(env, tmp_path):
+    d, s = repair_env(env, tmp_path, daily_high=10.6)
+    assert d.loc[BAD_DAY, "High"] == 10.6
+
+
+def test_bad_low_is_repaired_symmetrically(env, tmp_path):
+    d, _ = repair_env(env, tmp_path, daily_high=10.5, daily_low=1.0)
+    assert d.loc[BAD_DAY, "Low"] == 9.5 and d.loc[BAD_DAY, "High"] == 10.5
+    r = pd.read_csv(env[2] / "_meta" / "bar_repairs.csv", keep_default_na=False)
+    assert "Low" in set(r["field"])

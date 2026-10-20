@@ -304,7 +304,7 @@ def _symbol_list(a: argparse.Namespace) -> Optional[List[str]]:
 def step_build(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, Any]:
     from ba2_providers.ohlcv.alpaca_history import build as bld
     result = bld.build_cache(daily_store=a.store, intraday_store=a.store_5min, out=a.out, symbols=_symbol_list(a),
-                             workers=a.workers, log=log)
+                             workers=a.workers, fmp_daily_dir=a.fmp_daily_dir, log=log)
     per = result.pop("per_symbol_s")
     result["seconds_per_symbol"] = round(sum(per.values()) / max(len(per), 1), 3)
     result["slowest"] = sorted(per.items(), key=lambda kv: -kv[1])[:5]
@@ -350,8 +350,9 @@ def step_verify(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, 
     breaks = ver.load_breaks(os.path.join(a.out, "_meta")) if a.source == "alpaca" else {}
     spinoffs = ver.load_spinoffs(os.path.join(a.out, "_meta")) if a.source == "alpaca" else {}
     splits = ver.load_splits(os.path.join(a.out, "_meta")) if a.source == "alpaca" else None
+    proven = ver.load_proven_events(os.path.join(a.out, "_meta")) if a.source == "alpaca" else None
     results = ver.run_gate(cache, other=other, out_dir=out_dir, symbols=symbols, panel=panel, years=_years(a.verify_years),
-                           breaks=breaks, spinoffs=spinoffs, splits=splits, workers=a.workers, yahoo=yahoo, yahoo_sample=a.yahoo_sample_size, yahoo_seed=a.yahoo_seed,
+                           breaks=breaks, spinoffs=spinoffs, splits=splits, proven_events=proven, workers=a.workers, yahoo=yahoo, yahoo_sample=a.yahoo_sample_size, yahoo_seed=a.yahoo_seed,
                            min_coverage=a.min_coverage, max_selfcons_bad=a.max_selfcons_bad, log=log)
     for name, r in results.items():
         print(f"{r['status']:5s} {name}: {json.dumps(r['summary'], default=str)[:1500]}")

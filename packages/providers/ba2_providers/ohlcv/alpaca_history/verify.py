@@ -45,9 +45,18 @@ CHECKS (constants below; the coordinator and the owner set the final thresholds)
                    factor within 10 % of Yahoo's -- or whose FMP / ours ratio is, is ``convention`` (the vendors compute the factor differently;
                    non-blocking); a run whose ratio ours / Yahoo equals, within 0.5 %, the cumulative factor of the events of OUR table
                    at the run's end (within YAHOO_EVENT_DAYS after it) that Yahoo's own split list lacks (a Yahoo split within +-5 days and 1 % of the factor counts as listed) is
-                   ``yahoo_missing_event``; a run on a Yahoo series answered under a successor ticker (the old folder is a pre-rename duplicate)
+                   ``yahoo_missing_event`` -- but only for an event that is INDEPENDENTLY PROVEN in the split table (``split_accepted.csv``:
+                   verdict proven_by_fmp_step, or both vendors listed it with FMP's step equals_f, or a reviewed override); an event the price and FMP's
+                   step do not confirm (AIV 2019-02-21) never whitewashes a mismatch; a run on a Yahoo series answered under a successor ticker (the old folder is a pre-rename duplicate)
                    whose ratio equals the product of the successor's table events dated after our last bar is ``successor_later_event``; both are
                    non-blocking and list their event ids (``events`` column); the remaining runs (``unexplained``) decide PASS / FAIL.  All three groups are reported.
+  8 hl_envelope    daily High/Low against the day's 5-minute envelope (the ALL-session envelope the build kept in ``<cache>/_meta/envelope``; the build already
+                   repaired the witnessed bad prints, ``_meta/bar_repairs.csv``).  A daily High more than 2 % above (Low below) the envelope is
+                   ``boundary`` (informational) when Open/Close explain it (the 2 % test is made against max(envelope, Open, Close): a close at the
+                   high outside the envelope = late bars or the closing auction), else an unrepaired outlier: ``outlier_2_5`` (informational) or
+                   ``outlier_gt5`` (more than 5 % beyond that bound: BLOCKING for panel symbols).  Reverse: a regular-session 5-minute bar outside
+                   the daily range by more than 2 % is a bad 5-minute print (``bad_5min_print``; reported, never repaired, informational).
+                   CSVs ``hl_envelope.csv`` / ``hl_envelope_5min_prints.csv``; INFO "no envelope" when the cache has none (the FMP cache).
   7 readiness      INFORMATIONAL (ED-11): per year the panel symbols with no built daily file / daily bars, or no 5-minute file / 5-minute bars
                    (``readiness.csv``, one row per symbol-year that lacks something).
 """
@@ -155,9 +164,38 @@ def _read(path: str, columns: Optional[List[str]] = None) -> Optional[pd.DataFra
     return pd.read_parquet(path, columns=columns) if os.path.isfile(path) else None
 
 
+HL_OUTSIDE = 0.02
+HL_BLOCK = 0.05
+
+
+def hl_envelope_rows(symbol: str, d1: pd.DataFrame, env: pd.DataFrame, d5: Optional[pd.DataFrame]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """(daily High/Low outside the envelope rows, 5-minute bars outside the daily range rows) for one symbol; see the module docstring."""
+    e = env.assign(day=env["Date"].dt.normalize()).set_index("day")
+    d = d1.assign(day=d1["Date"].dt.normalize()).set_index("day").join(e[["High", "Low"]], rsuffix="_env", how="inner")
+    rows: List[Dict[str, Any]] = []
+    oc_hi, oc_lo = np.maximum(d["Open"], d["Close"]), np.minimum(d["Open"], d["Close"])
+    bound_hi, bound_lo = np.maximum(d["High_env"], oc_hi), np.minimum(d["Low_env"], oc_lo)
+    for field, outside, val, env_v, bound, ex in (
+            ("High", d["High"] > d["High_env"] * (1 + HL_OUTSIDE), d["High"], d["High_env"], bound_hi, d["High"] / bound_hi - 1),
+            ("Low", d["Low"] < d["Low_env"] * (1 - HL_OUTSIDE), d["Low"], d["Low_env"], bound_lo, bound_lo / d["Low"] - 1)):
+        for day in d.index[outside]:
+            excess = float(ex[day])
+            cls = "boundary" if excess <= HL_OUTSIDE else ("outlier_gt5" if excess > HL_BLOCK else "outlier_2_5")
+            rows.append({"symbol": symbol, "date": str(day.date()), "field": field, "daily": float(val[day]), "envelope": float(env_v[day]),
+                         "bound": float(bound[day]), "excess": excess, "class": cls})
+    rev: List[Dict[str, Any]] = []
+    if d5 is not None and len(d5):
+        r5 = d5[_rth_mask(d5["Date"])].assign(day=lambda x: x["Date"].dt.normalize()).groupby("day").agg(h=("High", "max"), l=("Low", "min"))
+        j = r5.join(d[["High", "Low"]], how="inner")
+        for field, m, v5, vd in (("High", j["h"] > j["High"] * (1 + HL_OUTSIDE), j["h"], j["High"]), ("Low", j["l"] < j["Low"] * (1 - HL_OUTSIDE), j["l"], j["Low"])):
+            for day in j.index[m]:
+                rev.append({"symbol": symbol, "date": str(day.date()), "field": field, "bar_5min": float(v5[day]), "daily": float(vd[day])})
+    return rows, rev
+
+
 def scan_symbol(args: Tuple[str, str, Optional[str], Tuple[int, ...], Optional[str]]) -> Dict[str, Any]:
     symbol, cache, other, years, break_date = args
-    res: Dict[str, Any] = {"symbol": symbol, "median_dollar_volume": math.nan, "structural": [], "year_rows": [], "jumps": [], "ratio_steps": [], "readiness": [],
+    res: Dict[str, Any] = {"symbol": symbol, "hl_have_env": False, "hl_rows": [], "hl_reverse": [], "median_dollar_volume": math.nan, "structural": [], "year_rows": [], "jumps": [], "ratio_steps": [], "readiness": [],
                            "error": None}
     try:
         d1 = _read(os.path.join(cache, f"{symbol}_1d.parquet"))
@@ -166,6 +204,11 @@ def scan_symbol(args: Tuple[str, str, Optional[str], Tuple[int, ...], Optional[s
             if df is not None:
                 for name, n, first in structural_issues(df, "5min" if iv == "5min" else "1d", break_date):
                     res["structural"].append({"symbol": symbol, "file": iv, "issue": name, "count": n, "first": first})
+        if d1 is not None and len(d1):
+            envp = os.path.join(cache, "_meta", "envelope", f"{symbol}.parquet")
+            if os.path.isfile(envp):
+                res["hl_have_env"] = True
+                res["hl_rows"], res["hl_reverse"] = hl_envelope_rows(symbol, d1, pd.read_parquet(envp), d5)
         day1 = _daily_series(d1, "Close") if d1 is not None and len(d1) else None
         if day1 is not None:
             dv = (d1["Close"] * d1["Volume"])[d1["Date"].dt.year.isin(list(years))]
@@ -322,7 +365,7 @@ def classify_run(date_from: str, date_to: str, median_ratio: float, spinoffs: Se
 
 def classify_event_run(end_date: str, median_ratio: float, events: Sequence[Tuple[str, float]],
                        yahoo_splits: Optional[Sequence[Tuple[str, float]]], successor_events: Optional[Sequence[Tuple[str, float]]],
-                       last_bar: pd.Timestamp) -> Tuple[str, str]:
+                       last_bar: pd.Timestamp, proven: Optional[Set[str]] = None) -> Tuple[str, str]:
     """(``yahoo_missing_event`` | ``successor_later_event`` | ``unexplained``, event ids) for a run no other class explains."""
     end = pd.Timestamp(end_date)
     if successor_events is not None:                                 # Yahoo answered under a successor ticker
@@ -334,7 +377,7 @@ def classify_event_run(end_date: str, median_ratio: float, events: Sequence[Tupl
     if yahoo_splits is not None:
         missing = []
         for d, f in events:
-            if end < pd.Timestamp(d) <= end + pd.Timedelta(days=YAHOO_EVENT_DAYS) and not any(abs((pd.Timestamp(yd) - pd.Timestamp(d)).days) <= YAHOO_LISTED_DAYS and abs(yf / f - 1) <= 0.01
+            if proven is not None and d in proven and end < pd.Timestamp(d) <= end + pd.Timedelta(days=YAHOO_EVENT_DAYS) and not any(abs((pd.Timestamp(yd) - pd.Timestamp(d)).days) <= YAHOO_LISTED_DAYS and abs(yf / f - 1) <= 0.01
                                                  for yd, yf in yahoo_splits):
                 missing.append((d, f))
         if missing:
@@ -347,7 +390,7 @@ def classify_event_run(end_date: str, median_ratio: float, events: Sequence[Tupl
 def compare_yahoo(ours: pd.DataFrame, yahoo: pd.DataFrame, spinoffs: Sequence[Tuple[str, float]] = (),
                   break_date: Optional[str] = None, fmp: Optional[pd.Series] = None,
                   events: Sequence[Tuple[str, float]] = (), yahoo_splits: Optional[Sequence[Tuple[str, float]]] = None,
-                  successor_events: Optional[Sequence[Tuple[str, float]]] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+                  successor_events: Optional[Sequence[Tuple[str, float]]] = None, proven: Optional[Set[str]] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """(per-symbol stats, mismatch runs) of our daily Close vs Yahoo's on common days.  A run is a maximal stretch of consecutive common
     days off by > 0.5 % (cut at each of our spin-off dates), classified by ``classify_run``; the stats count only the unexplained days as
     mismatches (``match_days`` = common days minus unexplained mismatch days)."""
@@ -385,7 +428,7 @@ def compare_yahoo(ours: pd.DataFrame, yahoo: pd.DataFrame, spinoffs: Sequence[Tu
             r["events"] = ""
             if r["classification"] == "unexplained":
                 r["classification"], r["events"] = classify_event_run(r["date_to"], r["median_ratio"], events, yahoo_splits, successor_events,
-                                                                      a.index.max())
+                                                                      a.index.max(), proven)
             if r["classification"] != "unexplained":
                 explained[start:i] = True
                 stats[r["classification"] + "_days"] += i - start
@@ -434,6 +477,21 @@ def load_breaks(meta_dir: str) -> Dict[str, str]:
         return {}
     with open(p, encoding="utf-8") as f:
         return {s: max(v) for s, v in json.load(f)["breaks"].items()}
+
+
+def load_proven_events(meta_dir: str) -> Dict[str, Set[str]]:
+    """symbol -> dates of the split events of ``split_accepted.csv`` that are independently proven: verdict ``proven_by_fmp_step``, or both
+    vendors listed it and FMP's step equals the factor, or a reviewed override (``override_accept``; a pending one refuses the build)."""
+    from ba2_providers.ohlcv.alpaca_history.split_build import read_csv_frame
+    p = os.path.join(meta_dir, "split_accepted.csv")
+    if not os.path.isfile(p):
+        return {}
+    df = read_csv_frame(p)
+    out: Dict[str, Set[str]] = {}
+    for r in df[df["kind"] == "split"].itertuples():
+        if r.verdict in ("proven_by_fmp_step", "override_accept") or (r.source == "both" and str(r.fmp_step).endswith("equals_f")):
+            out.setdefault(r.symbol, set()).add(str(r.date))
+    return out
 
 
 def load_splits(meta_dir: str) -> Dict[str, List[Tuple[str, float]]]:
@@ -488,6 +546,7 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
              panel: Optional[Iterable[str]] = None, years: Sequence[int] = DEFAULT_YEARS, breaks: Optional[Dict[str, str]] = None,
              workers: int = 4, spinoffs: Optional[Dict[str, List[Tuple[str, float]]]] = None,
              splits: Optional[Dict[str, List[Tuple[str, float]]]] = None,
+             proven_events: Optional[Dict[str, Set[str]]] = None,
              yahoo: Optional[YahooDaily] = None, yahoo_sample: int = YAHOO_SAMPLE, yahoo_seed: int = YAHOO_SEED,
              min_coverage: float = MIN_COVERAGE, max_selfcons_bad: float = MAX_SELFCONS_BAD,
              log: Callable[[str], None] = lambda m: None) -> Dict[str, Dict[str, Any]]:
@@ -627,6 +686,23 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
     rby = rd[rd["panel"].astype(bool)].groupby("year").agg(missing_daily=("missing_daily", "sum"), missing_5min=("missing_5min", "sum")).reset_index()
     res["readiness"] = {"status": STATUS_INFO, "csv": os.path.join(out_dir, "readiness.csv"),
                         "summary": {int(r.year): {"missing_daily": int(r.missing_daily), "missing_5min": int(r.missing_5min)} for r in rby.itertuples()}}
+    # 8 hl_envelope
+    hl_rows = [r for sc in scans for r in sc["hl_rows"]]
+    hl_rev = [r for sc in scans for r in sc["hl_reverse"]]
+    if any(sc["hl_have_env"] for sc in scans):
+        hl = pd.DataFrame(hl_rows, columns=["symbol", "date", "field", "daily", "envelope", "bound", "excess", "class"])
+        hl["panel"] = hl["symbol"].map(in_panel).astype(bool)
+        _csv(hl.sort_values("excess", ascending=False), os.path.join(out_dir, "hl_envelope.csv"))
+        rv = pd.DataFrame(hl_rev, columns=["symbol", "date", "field", "bar_5min", "daily"])
+        _csv(rv, os.path.join(out_dir, "hl_envelope_5min_prints.csv"))
+        blocking = hl[hl["panel"] & (hl["class"] == "outlier_gt5")]
+        rp = os.path.join(cache, "_meta", "bar_repairs.csv")
+        res["hl_envelope"] = {"status": STATUS_FAIL if len(blocking) else STATUS_PASS, "csv": os.path.join(out_dir, "hl_envelope.csv"),
+                              "summary": {"by_class_panel": hl[hl["panel"]]["class"].value_counts().to_dict(), "by_class_all": hl["class"].value_counts().to_dict(),
+                                          "blocking": len(blocking), "worst": hl[hl["class"] != "boundary"].head(10)[["symbol", "date", "field", "daily", "bound", "excess"]].to_dict("records"),
+                                          "bad_5min_prints": len(rv), "repairs_recorded": int(len(pd.read_csv(rp))) if os.path.isfile(rp) else 0}}
+    else:
+        res["hl_envelope"] = {"status": STATUS_INFO, "csv": None, "summary": {"skipped": "no envelope under _meta/envelope in this cache"}}
     # 6 yahoo
     if yahoo is not None:
         sample = choose_yahoo_sample(built, panel_set, symbols, yahoo_sample, yahoo_seed)
@@ -645,7 +721,8 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
                 fser = _daily_series(pd.read_parquet(os.path.join(other, f"{s}_1d.parquet"), columns=["Date", "Close"]), "Close")
             stats, rr = compare_yahoo(pd.read_parquet(p1, columns=["Date", "Close"]), ydf, (spinoffs or {}).get(s, ()), brk.get(s), fser,
                                     events=(splits or {}).get(s, ()), yahoo_splits=yahoo_split_list(ydf),
-                                    successor_events=(splits or {}).get(note, ()) if note != s and splits is not None else None)
+                                    successor_events=(splits or {}).get(note, ()) if note != s and splits is not None else None,
+                                    proven=(proven_events or {}).get(s, set()))
             rows.append({"symbol": s, "yahoo_ticker": note, **stats})
             runs += [{"symbol": s, **r} for r in rr]
             tot += stats["common_days"]
