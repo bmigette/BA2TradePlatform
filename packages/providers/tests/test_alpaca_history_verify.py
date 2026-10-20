@@ -234,7 +234,7 @@ def yahoo_for(frames, calls=None, successors=None, tmp=None, refresh=False):
         if calls is not None:
             calls.append(t)
         f = frames.get(t)
-        return None if f is None else pd.DataFrame({"day": f["Date"], "Close": f["Close"]})
+        return None if f is None else pd.DataFrame({"day": f["Date"], "Close": f["Close"], "High": f["Close"], "Low": f["Close"]})
     return ver.YahooDaily(str(tmp / "yd"), fetch=fetch, sleep=lambda s: None, refresh=refresh,
                           successors=successors or (lambda s: []))
 
@@ -436,7 +436,7 @@ def test_yahoo_inputs_csv_records_what_was_used(tmp_path):
 def _yahoo_frames(frames, splits=None):
     out = {}
     for t, closes in frames.items():
-        f = pd.DataFrame({"day": DAYS, "Close": closes})
+        f = pd.DataFrame({"day": DAYS, "Close": closes, "High": closes, "Low": closes})
         f["Splits"] = 0.0
         for d, v in (splits or {}).get(t, []):
             f.loc[f["day"] == pd.Timestamp(d), "Splits"] = v
@@ -595,3 +595,22 @@ def test_hl_envelope_is_informational_when_the_cache_has_no_envelope(tmp_path):
     cache = tmp_path / "c"
     put(cache, "AAA", daily(DAYS, 10.0), five(DAYS, 10.0))
     assert gate(cache, tmp_path)["hl_envelope"]["status"] == "INFO"
+
+
+def test_hl_envelope_lists_a_consolidated_print_and_does_not_block(tmp_path):
+    cache = tmp_path / "c"
+    d1 = daily(DAYS, 10.0)
+    d1["Open"] = d1["Close"] = 10.0
+    d1["High"], d1["Low"] = 10.1, 9.9
+    d1.loc[20, "High"] = 12.0
+    put(cache, "AAA", d1, five(DAYS, 10.0))
+    (cache / "_meta" / "envelope").mkdir(parents=True)
+    pd.DataFrame({"Date": DAYS, "High": 10.1, "Low": 9.9}).to_parquet(cache / "_meta" / "envelope" / "AAA.parquet", index=False)
+    r = gate(cache, tmp_path / "a", panel=["AAA"])["hl_envelope"]
+    assert r["status"] == "FAIL"
+    day = str(DAYS[20].date())
+    (cache / "_meta" / "consolidated_prints.csv").write_text(chr(10).join(
+        ["symbol,date,field,daily,envelope,fmp,yahoo,run_id", f"AAA,{day},High,12.0,10.1,12.0,12.0,R"]) + chr(10))
+    ver._CONSOLIDATED.clear()
+    r = gate(cache, tmp_path / "b", panel=["AAA"])["hl_envelope"]
+    assert r["status"] == "PASS" and r["summary"]["by_class_panel"] == {"consolidated_print": 1}

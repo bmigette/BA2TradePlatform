@@ -40,7 +40,12 @@ DAILY BAD PRINTS (``repair_daily``).  A daily High/Low can be a bad print (NVDA 
   WITNESS_TOL (1 %); Low symmetric.  Without the FMP witness (no FMP file / no FMP bar) nothing is repaired.  Open, Close and Volume are
   never touched.  Every repair is a row of ``<out>/_meta/bar_repairs.csv`` (symbol, date, field, old, new, envelope, fmp, run_id) and of the
   manifest entry; the adjusted all-session envelope of each symbol is kept in ``<out>/_meta/envelope/<SYM>.parquet`` (Date, High, Low) for
-  the verify check ``hl_envelope``.  A daily value outside the envelope that is not repaired stays as it is (verify reports it).
+  the verify check ``hl_envelope``.  A daily value outside the envelope that the FMP witness does not settle is looked at again with
+  YAHOO as the second witness (only when a ``YahooDaily`` source is given; cache and provenance as in verify): Yahoo's High/Low on our basis
+  (that day's ratio of our Close to Yahoo's) within WITNESS_TOL of the envelope value repairs the bar (witness ``yahoo``); Yahoo AND FMP both
+  within WITNESS_TOL of the DAILY value keep it as a ``consolidated_print`` (``_meta/consolidated_prints.csv``, non-blocking, listed);
+  Yahoo unavailable or agreeing with neither leaves it as it is (verify reports it, blocking above 5 %).  The Yahoo files consulted are in
+  ``_meta/build_yahoo_inputs.csv``.
 
 OUTPUT.  ``<out>/<SYM>_1d.parquet``, ``<out>/<SYM>_5min.parquet`` (atomic: temp file + os.replace) and
 ``<out>/_meta/build_manifest.json`` (the only thing this step writes under ``_meta``): the stores' asof, the split table's
@@ -56,6 +61,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -80,7 +86,8 @@ MANIFEST_NAME = "build_manifest.json"
 SPLIT_TABLE_NAME = "split_table.json"
 REPAIR_TOL = 0.02                # a daily High/Low must be this far outside the envelope to be repaired ...
 WITNESS_TOL = 0.01               # ... and the FMP value on our basis must agree with the envelope value within this
-REPAIR_COLUMNS = ["symbol", "date", "field", "old", "new", "envelope", "fmp", "run_id"]
+REPAIR_COLUMNS = ["symbol", "date", "field", "old", "new", "envelope", "fmp", "yahoo", "witness", "run_id"]
+CONSOLIDATED_COLUMNS = ["symbol", "date", "field", "daily", "envelope", "fmp", "yahoo", "run_id"]
 RUN_ID_CSVS = ("split_review.csv", "split_accepted.csv", "split_vs_fmp.csv", "fmp_daily_inputs.csv", "yahoo_inputs.csv")
 
 
@@ -231,31 +238,76 @@ def price_divisor(days: pd.Series, splits: Sequence[Tuple[str, float]], spinoffs
     return cumulative_factor(days, splits) * cumulative_factor(days, spinoffs)
 
 
-def repair_daily(daily: pd.DataFrame, env: pd.DataFrame, fmp: Optional[pd.DataFrame]) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+def repair_daily(daily: pd.DataFrame, env: pd.DataFrame, fmp: Optional[pd.DataFrame]
+                 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Repair bad daily High/Low prints (see the module docstring).  ``daily``: adjusted Date/Open/High/Low/Close/Volume; ``env``: adjusted
     all-session envelope indexed by midnight Date (High, Low); ``fmp``: the FMP daily frame (Date, High, Low, Close) or None.
-    Returns (frame, repairs); each repair is {date, field, old, new, envelope, fmp}."""
+    Returns (frame, repairs, unwitnessed); each repair is {date, field, old, new, envelope, fmp, yahoo, witness}; ``unwitnessed`` lists the
+    values still more than REPAIR_TOL outside the bound (date, field, old, bound, fmp on our basis or NaN) for the second witness."""
     out = daily.copy()
     repairs: List[Dict[str, Any]] = []
-    if fmp is None or not len(out) or not len(env):
-        return out, repairs
+    unwitnessed: List[Dict[str, Any]] = []
+    if not len(out) or not len(env):
+        return out, repairs, unwitnessed
     day = out["Date"].dt.normalize()
     e = env.reindex(day)
     hi_p = np.maximum(np.maximum(e["High"].values, out["Open"].values), out["Close"].values)
     lo_p = np.minimum(np.minimum(e["Low"].values, out["Open"].values), out["Close"].values)
-    f = fmp.assign(day=fmp["Date"].dt.normalize()).drop_duplicates("day").set_index("day").reindex(day)
+    if fmp is not None:
+        f = fmp.assign(day=fmp["Date"].dt.normalize()).drop_duplicates("day").set_index("day").reindex(day)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = out["Close"].values / f["Close"].values
+            fmp_h, fmp_l = f["High"].values * ratio, f["Low"].values * ratio
+    else:
+        fmp_h = fmp_l = np.full(len(out), np.nan)
     with np.errstate(divide="ignore", invalid="ignore"):
-        ratio = out["Close"].values / f["Close"].values
-        fmp_h, fmp_l = f["High"].values * ratio, f["Low"].values * ratio
-        bad_h = (out["High"].values > hi_p * (1 + REPAIR_TOL)) & (np.abs(fmp_h / hi_p - 1) <= WITNESS_TOL)
-        bad_l = (out["Low"].values < lo_p * (1 - REPAIR_TOL)) & (np.abs(fmp_l / lo_p - 1) <= WITNESS_TOL)
-    for field, bad, new, wit in (("High", bad_h, hi_p, fmp_h), ("Low", bad_l, lo_p, fmp_l)):
+        out_h = out["High"].values > hi_p * (1 + REPAIR_TOL)
+        out_l = out["Low"].values < lo_p * (1 - REPAIR_TOL)
+        bad_h = out_h & (np.abs(fmp_h / hi_p - 1) <= WITNESS_TOL)
+        bad_l = out_l & (np.abs(fmp_l / lo_p - 1) <= WITNESS_TOL)
+    for field, bad, outside, new, wit in (("High", bad_h, out_h, hi_p, fmp_h), ("Low", bad_l, out_l, lo_p, fmp_l)):
         for i in np.flatnonzero(bad):
             repairs.append({"date": str(out["Date"].iloc[i].date()), "field": field, "old": float(out[field].iloc[i]), "new": float(new[i]),
-                            "envelope": float(new[i]), "fmp": float(wit[i])})
+                            "envelope": float(new[i]), "fmp": float(wit[i]), "yahoo": math.nan, "witness": "fmp"})
+        for i in np.flatnonzero(outside & ~bad):
+            unwitnessed.append({"date": str(out["Date"].iloc[i].date()), "field": field, "old": float(out[field].iloc[i]),
+                                "bound": float(new[i]), "fmp": float(wit[i])})
         out.loc[out.index[bad], field] = new[bad]
     repairs.sort(key=lambda r: (r["date"], r["field"]))
-    return out, repairs
+    return out, repairs, unwitnessed
+
+
+def yahoo_second_pass(out_dir: str, symbol: str, unwitnessed: Sequence[Dict[str, Any]], ydf: Optional[pd.DataFrame]
+                      ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Yahoo as the second witness for the daily values the FMP witness did not settle (see the module docstring).  Rewrites the symbol's
+    built daily file when it repairs.  Returns (repairs, consolidated prints, still unwitnessed)."""
+    if ydf is None or "High" not in ydf.columns or "Low" not in ydf.columns or not unwitnessed:
+        return [], [], list(unwitnessed)
+    path = os.path.join(out_dir, file_names(symbol)[0])
+    df = pd.read_parquet(path)
+    y = ydf.assign(day=ydf["day"].dt.normalize()).drop_duplicates("day").set_index("day")
+    repairs: List[Dict[str, Any]] = []
+    consolidated: List[Dict[str, Any]] = []
+    left: List[Dict[str, Any]] = []
+    for o in unwitnessed:
+        day = pd.Timestamp(o["date"])
+        row = df.index[df["Date"] == day]
+        if day not in y.index or not len(row) or not (y.loc[day, "Close"] > 0):
+            left.append(o)
+            continue
+        i = row[0]
+        yv = float(y.loc[day, o["field"]] * (df.loc[i, "Close"] / y.loc[day, "Close"]))
+        if abs(yv / o["bound"] - 1) <= WITNESS_TOL:
+            df.loc[i, o["field"]] = o["bound"]
+            repairs.append({"date": o["date"], "field": o["field"], "old": o["old"], "new": o["bound"], "envelope": o["bound"],
+                            "fmp": o["fmp"], "yahoo": yv, "witness": "yahoo"})
+        elif abs(yv / o["old"] - 1) <= WITNESS_TOL and abs(o["fmp"] / o["old"] - 1) <= WITNESS_TOL:
+            consolidated.append({"date": o["date"], "field": o["field"], "daily": o["old"], "envelope": o["bound"], "fmp": o["fmp"], "yahoo": yv})
+        else:
+            left.append(o)
+    if repairs:
+        atomic_write(path, parquet_bytes(df))
+    return repairs, consolidated, left
 
 
 def apply_break(frame: pd.DataFrame, break_date: Optional[str]) -> Tuple[pd.DataFrame, int]:
@@ -396,12 +448,14 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     ev_o = [[d, f] for d, f in spinoffs if first_day is not None and pd.Timestamp(d) > first_day]
     entry["events"] = {"splits": ev_s, "spinoffs": ev_o}
     entry["repairs"] = []
+    entry["unwitnessed"] = []
     entry["fmp_daily_sha256"] = None
     f1, f5 = file_names(symbol)
     entry["files"] = {}
     if len(daily):
         d_adj = adjust(daily, splits, spinoffs)
         repairs: List[Dict[str, Any]] = []
+        entry["unwitnessed"] = []
         if env_raw is not None and len(env_raw):
             div = price_divisor(env_raw.index.to_series(), splits, spinoffs)
             env = pd.DataFrame({"High": env_raw["High"].values / div, "Low": env_raw["Low"].values / div}, index=env_raw.index)
@@ -411,7 +465,8 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
                 fmp_df = pd.read_parquet(fp, columns=["Date", "High", "Low", "Close"])
                 with open(fp, "rb") as fh:
                     entry["fmp_daily_sha256"] = hashlib.sha256(fh.read()).hexdigest()
-            d_adj, repairs = repair_daily(d_adj, env, fmp_df)
+            d_adj, repairs, unwitnessed = repair_daily(d_adj, env, fmp_df)
+            entry["unwitnessed"] = unwitnessed
             atomic_write(os.path.join(out, "_meta", "envelope", f"{symbol}.parquet"), parquet_bytes(env.reset_index()))
         entry["repairs"] = repairs
         d_out = finish(d_adj, "1d")
@@ -471,7 +526,7 @@ def list_symbols(daily_store: str, intraday_store: str) -> List[str]:
 
 def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str = DEFAULT_INTRADAY_STORE,
                 out: str = DEFAULT_OUT, symbols: Optional[Sequence[str]] = None, workers: int = 4,
-                fmp_daily_dir: Optional[str] = None,
+                fmp_daily_dir: Optional[str] = None, yahoo: Optional[Any] = None,
                 log: Callable[[str], None] = lambda m: None) -> Dict[str, Any]:
     """Build the cache for every store symbol (or ``symbols``) and write the manifest.  Raises ``BuildError`` on a bad input and
     when any symbol failed (after the others finished and the manifest was written)."""
@@ -514,8 +569,16 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
         with open(mpath, encoding="utf-8") as f:
             old = json.load(f)
         if (old["split_table"]["run_id"] == table.run_id and old["split_table"]["sha256"] == table.sha256
-                and all("repairs" in e for e in old["symbols"].values())):
+                and all("unwitnessed" in e and "consolidated_prints" in e for e in old["symbols"].values())):
             entries = dict(old["symbols"])
+    consolidated_rows: List[Dict[str, Any]] = []
+    for sym, e in built.items():
+        e["consolidated_prints"] = []
+        if e["unwitnessed"] and yahoo is not None:
+            ydf, _ = yahoo.get(sym)
+            rep, cons, left = yahoo_second_pass(out, sym, e["unwitnessed"], ydf)
+            e["repairs"] = sorted(e["repairs"] + rep, key=lambda r: (r["date"], r["field"]))
+            e["consolidated_prints"], e["unwitnessed"] = cons, left
     entries.update(built)
     covered = {n for e in entries.values() for n in e["files"].values()}
     on_disk = {n for n in os.listdir(out) if n.endswith("_1d.parquet") or n.endswith("_5min.parquet")}
@@ -541,12 +604,19 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
     atomic_write(mpath, json.dumps(manifest, indent=1).encode("utf-8"))
     rows = [{"symbol": sym, **r, "run_id": table.run_id} for sym, e in sorted(entries.items()) for r in e["repairs"]]
     atomic_write(os.path.join(out, "_meta", "bar_repairs.csv"), pd.DataFrame(rows, columns=REPAIR_COLUMNS).to_csv(index=False).encode("utf-8"))
+    rows = [{"symbol": sym, **r, "run_id": table.run_id} for sym, e in sorted(entries.items()) for r in e["consolidated_prints"]]
+    atomic_write(os.path.join(out, "_meta", "consolidated_prints.csv"),
+                 pd.DataFrame(rows, columns=CONSOLIDATED_COLUMNS).to_csv(index=False).encode("utf-8"))
+    if yahoo is not None:
+        atomic_write(os.path.join(out, "_meta", "build_yahoo_inputs.csv"), yahoo.inputs().to_csv(index=False).encode("utf-8"))
     summary = {"symbols_requested": len(todo), "built": len(built), "skipped_no_bars": len(skipped), "failed": len(failed),
                "files_1d": sum("1d" in e for e in built.values()), "files_5min": sum("5min" in e for e in built.values()),
                "bars_1d": sum(e["1d"]["bars"] for e in built.values() if "1d" in e),
                "bars_5min": sum(e["5min"]["bars"] for e in built.values() if "5min" in e),
                "dropped_by_break": sum(sum(e["dropped_by_break"].values()) for e in built.values()),
-               "unlisted_files": len(manifest["unlisted_files"]), "bar_repairs": manifest["repairs"], "elapsed_s": manifest["elapsed_s"], "manifest": mpath,
+               "unlisted_files": len(manifest["unlisted_files"]), "bar_repairs": manifest["repairs"],
+               "consolidated_prints": sum(len(e["consolidated_prints"]) for e in built.values()),
+               "unwitnessed_outliers": sum(len(e["unwitnessed"]) for e in built.values()), "elapsed_s": manifest["elapsed_s"], "manifest": mpath,
                "run_id": table.run_id,
                "per_symbol_s": {s: e["elapsed_s"] for s, e in built.items()}}
     if failed:

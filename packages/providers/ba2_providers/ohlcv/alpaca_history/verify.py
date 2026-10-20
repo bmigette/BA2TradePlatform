@@ -54,7 +54,8 @@ CHECKS (constants below; the coordinator and the owner set the final thresholds)
                    repaired the witnessed bad prints, ``_meta/bar_repairs.csv``).  A daily High more than 2 % above (Low below) the envelope is
                    ``boundary`` (informational) when Open/Close explain it (the 2 % test is made against max(envelope, Open, Close): a close at the
                    high outside the envelope = late bars or the closing auction), else an unrepaired outlier: ``outlier_2_5`` (informational) or
-                   ``outlier_gt5`` (more than 5 % beyond that bound: BLOCKING for panel symbols).  Reverse: a regular-session 5-minute bar outside
+                   ``outlier_gt5`` (more than 5 % beyond that bound: BLOCKING for panel symbols), or ``consolidated_print`` (the build found FMP and Yahoo both carry the
+                   print, ``_meta/consolidated_prints.csv``: kept, listed, non-blocking).  Reverse: a regular-session 5-minute bar outside
                    the daily range by more than 2 % is a bad 5-minute print (``bad_5min_print``; reported, never repaired, informational).
                    CSVs ``hl_envelope.csv`` / ``hl_envelope_5min_prints.csv``; INFO "no envelope" when the cache has none (the FMP cache).
   7 readiness      INFORMATIONAL (ED-11): per year the panel symbols with no built daily file / daily bars, or no 5-minute file / 5-minute bars
@@ -168,7 +169,23 @@ HL_OUTSIDE = 0.02
 HL_BLOCK = 0.05
 
 
-def hl_envelope_rows(symbol: str, d1: pd.DataFrame, env: pd.DataFrame, d5: Optional[pd.DataFrame]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+_CONSOLIDATED: Dict[str, Dict[str, Set[Tuple[str, str]]]] = {}
+
+
+def _consolidated(cache: str) -> Dict[str, Set[Tuple[str, str]]]:
+    """symbol -> {(date, field)} of the build's ``_meta/consolidated_prints.csv`` (the print FMP and Yahoo both carry), memoised per process."""
+    if cache not in _CONSOLIDATED:
+        p = os.path.join(cache, "_meta", "consolidated_prints.csv")
+        out: Dict[str, Set[Tuple[str, str]]] = {}
+        if os.path.isfile(p):
+            for r in pd.read_csv(p, keep_default_na=False).itertuples():
+                out.setdefault(r.symbol, set()).add((str(r.date), r.field))
+        _CONSOLIDATED[cache] = out
+    return _CONSOLIDATED[cache]
+
+
+def hl_envelope_rows(symbol: str, d1: pd.DataFrame, env: pd.DataFrame, d5: Optional[pd.DataFrame],
+                     consolidated: Set[Tuple[str, str]] = frozenset()) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """(daily High/Low outside the envelope rows, 5-minute bars outside the daily range rows) for one symbol; see the module docstring."""
     e = env.assign(day=env["Date"].dt.normalize()).set_index("day")
     d = d1.assign(day=d1["Date"].dt.normalize()).set_index("day").join(e[["High", "Low"]], rsuffix="_env", how="inner")
@@ -181,6 +198,8 @@ def hl_envelope_rows(symbol: str, d1: pd.DataFrame, env: pd.DataFrame, d5: Optio
         for day in d.index[outside]:
             excess = float(ex[day])
             cls = "boundary" if excess <= HL_OUTSIDE else ("outlier_gt5" if excess > HL_BLOCK else "outlier_2_5")
+            if cls != "boundary" and (str(day.date()), field) in consolidated:
+                cls = "consolidated_print"
             rows.append({"symbol": symbol, "date": str(day.date()), "field": field, "daily": float(val[day]), "envelope": float(env_v[day]),
                          "bound": float(bound[day]), "excess": excess, "class": cls})
     rev: List[Dict[str, Any]] = []
@@ -208,7 +227,7 @@ def scan_symbol(args: Tuple[str, str, Optional[str], Tuple[int, ...], Optional[s
             envp = os.path.join(cache, "_meta", "envelope", f"{symbol}.parquet")
             if os.path.isfile(envp):
                 res["hl_have_env"] = True
-                res["hl_rows"], res["hl_reverse"] = hl_envelope_rows(symbol, d1, pd.read_parquet(envp), d5)
+                res["hl_rows"], res["hl_reverse"] = hl_envelope_rows(symbol, d1, pd.read_parquet(envp), d5, _consolidated(cache).get(symbol, set()))
         day1 = _daily_series(d1, "Close") if d1 is not None and len(d1) else None
         if day1 is not None:
             dv = (d1["Close"] * d1["Volume"])[d1["Date"].dt.year.isin(list(years))]
@@ -279,7 +298,8 @@ def yfinance_daily(ticker: str) -> Optional[pd.DataFrame]:
     if h is None or h.empty:
         return None
     idx = h.index.tz_localize(None) if h.index.tz is None else h.index.tz_convert("America/New_York").tz_localize(None)
-    return pd.DataFrame({"day": idx.normalize(), "Close": h["Close"].values, "Splits": h["Stock Splits"].values})
+    return pd.DataFrame({"day": idx.normalize(), "Close": h["Close"].values, "High": h["High"].values, "Low": h["Low"].values,
+                         "Splits": h["Stock Splits"].values})
 
 
 class YahooDaily:
@@ -318,8 +338,10 @@ class YahooDaily:
         from ba2_providers.ohlcv.alpaca_history.split_build import atomic_write
         pq, meta = os.path.join(self.cache_dir, f"{symbol}.parquet"), os.path.join(self.cache_dir, f"{symbol}.json")
         if not self.refresh and os.path.isfile(pq) and os.path.isfile(meta):
-            with open(meta, encoding="utf-8") as f:
-                return pd.read_parquet(pq), json.load(f)["ticker"]
+            cached = pd.read_parquet(pq)
+            if "High" in cached.columns:                      # a cache written before High/Low were kept is fetched again
+                with open(meta, encoding="utf-8") as f:
+                    return cached, json.load(f)["ticker"]
         notes = []
         for t in [symbol] + list(self.successors(symbol)):
             self.sleep(self.min_interval)

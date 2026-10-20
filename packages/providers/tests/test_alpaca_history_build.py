@@ -577,3 +577,62 @@ def test_bad_low_is_repaired_symmetrically(env, tmp_path):
     assert d.loc[BAD_DAY, "Low"] == 9.5 and d.loc[BAD_DAY, "High"] == 10.5
     r = pd.read_csv(env[2] / "_meta" / "bar_repairs.csv", keep_default_na=False)
     assert "Low" in set(r["field"])
+
+
+# ---------------------------------------------------------------------------
+# Yahoo as the second witness
+# ---------------------------------------------------------------------------
+def yahoo_witness(tmp_path, high=None, low=None, available=True):
+    from ba2_providers.ohlcv.alpaca_history import verify as ver
+    days = [pd.Timestamp(d) for d in sessions("2024-01-02", "2024-01-08")]
+    frame = pd.DataFrame({"day": days, "Close": 10.0, "High": 10.5 if high is None else high, "Low": 9.5 if low is None else low})
+    return ver.YahooDaily(str(tmp_path / "yd"), fetch=lambda t: frame if available else None, sleep=lambda s: None)
+
+
+def second_witness(env, tmp_path, yahoo, fmp_high, daily_high=20.0):
+    """FMP carries ``fmp_high`` on the bad day (not the envelope value: the first witness does not settle it); the daily High is bad."""
+    daily, intr, out = env
+    days = sessions("2024-01-02", "2024-01-08")
+    write_symbol(daily, intr, "ABC", days, days)
+    p = daily / "bars" / "1Day" / "symbol=ABC" / "all.parquet"
+    f = pd.read_parquet(p)
+    f.loc[f["t"] == ny_to_utc(pd.Timestamp(BAD_DAY)), "h"] = daily_high
+    f["h"] = f["h"].where(f["t"] == ny_to_utc(pd.Timestamp(BAD_DAY)), 10.5)       # the other days are clean
+    f["l"] = 9.5
+    f.to_parquet(p, index=False)
+    make_table(out)
+    fmp = tmp_path / "fmp"
+    fmp.mkdir(parents=True)
+    rows = [{"Date": pd.Timestamp(d), "High": fmp_high if d == BAD_DAY else 10.5, "Low": 9.5, "Close": 10.0} for d in days]
+    pd.DataFrame(rows).to_parquet(fmp / "ABC_1d.parquet", index=False)
+    s = bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, fmp_daily_dir=str(fmp), yahoo=yahoo)
+    return pd.read_parquet(out / "ABC_1d.parquet").set_index("Date"), s
+
+
+def test_yahoo_agreeing_with_the_envelope_repairs_and_is_recorded_as_the_witness(env, tmp_path):
+    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, high=10.5), fmp_high=20.0)
+    assert d.loc[BAD_DAY, "High"] == 10.5 and s["bar_repairs"] == 1 and s["unwitnessed_outliers"] == 0
+    r = pd.read_csv(env[2] / "_meta" / "bar_repairs.csv", keep_default_na=False)
+    assert list(r.columns) == bld.REPAIR_COLUMNS and r["witness"].tolist() == ["yahoo"]
+    assert r["old"].iloc[0] == 20.0 and r["new"].iloc[0] == 10.5 and r["yahoo"].iloc[0] == 10.5 and r["fmp"].iloc[0] == 20.0
+    assert (env[2] / "_meta" / "build_yahoo_inputs.csv").is_file()
+
+
+def test_yahoo_and_fmp_both_carrying_the_print_keep_it_as_a_consolidated_print(env, tmp_path):
+    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, high=20.0), fmp_high=20.0)
+    assert d.loc[BAD_DAY, "High"] == 20.0 and s["bar_repairs"] == 0 and s["consolidated_prints"] == 1 and s["unwitnessed_outliers"] == 0
+    c = pd.read_csv(env[2] / "_meta" / "consolidated_prints.csv", keep_default_na=False)
+    assert c["date"].tolist() == [BAD_DAY] and c["field"].tolist() == ["High"] and c["daily"].tolist() == [20.0]
+
+
+def test_yahoo_unavailable_or_agreeing_with_neither_leaves_the_bar_unwitnessed(env, tmp_path):
+    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, available=False), fmp_high=20.0)
+    assert d.loc[BAD_DAY, "High"] == 20.0 and s["unwitnessed_outliers"] == 1 and s["bar_repairs"] == 0
+    d, s = second_witness(env, tmp_path / "n", yahoo_witness(tmp_path / "n", high=15.0), fmp_high=20.0)
+    assert d.loc[BAD_DAY, "High"] == 20.0 and s["unwitnessed_outliers"] == 1 and s["consolidated_prints"] == 0
+
+
+def test_a_print_only_yahoo_carries_is_not_consolidated(env, tmp_path):
+    # FMP agrees with neither the envelope nor the daily value: Yahoo alone does not make it a consolidated print
+    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, high=20.0), fmp_high=15.0)
+    assert d.loc[BAD_DAY, "High"] == 20.0 and s["consolidated_prints"] == 0 and s["unwitnessed_outliers"] == 1
