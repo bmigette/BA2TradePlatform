@@ -91,7 +91,12 @@ def root(tmp_path):
 @pytest.fixture
 def tool(monkeypatch):
     m = _tool()
-    monkeypatch.setattr(m, "make_source", lambda cache_root: _NoFetchSource())
+    monkeypatch.setattr(m, "make_source", lambda cache_root, history_source: _NoFetchSource())
+    # The flag is REQUIRED on the real CLI; these tests are about everything else, so they run on fmp.
+    # ``main_raw`` is the real entry point (the flag tests below use it).
+    m.main_raw = m.main
+    m.main = lambda argv: m.main_raw(argv if "--ohlcv-history-source" in argv
+                                     else [*argv, "--ohlcv-history-source", "fmp"])
     return m
 
 
@@ -242,7 +247,7 @@ class _BrokenCalendarSource(_NoFetchSource):
 
 def test_unreadable_split_calendar_exits_one_until_exclusions_are_allowed(tool, root, universe_file,
                                                                           tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(tool, "make_source", lambda cache_root: _BrokenCalendarSource())
+    monkeypatch.setattr(tool, "make_source", lambda cache_root, history_source: _BrokenCalendarSource())
     out = str(tmp_path / "plan.json")
     assert tool.main(_plan_args(root, universe_file, out)) == 1
     printed = json.loads(capsys.readouterr().out)
@@ -261,3 +266,181 @@ def test_unreadable_split_calendar_exits_one_until_exclusions_are_allowed(tool, 
     from ba2_common.core.market_condition_store import MarketConditionStore
     m = MarketConditionStore(root).read_manifest(report["manifest_digest"])
     assert m["coverage"]["BBB"]["exceptions"][0]["kind"] == "split_calendar_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# --ohlcv-history-source: the vendor is a required, explicit choice and selects the source profile
+ALPACA_DIR = "AlpacaHistoryOHLCVProvider"
+
+
+def _write_alpaca(root, sym, df):
+    p = Path(root) / ALPACA_DIR / f"{sym}_1d.parquet"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    out = df.copy()
+    out["effective_date"] = out["Date"]
+    out.to_parquet(p, index=False)
+    return p
+
+
+def _write_build_manifest(root, events):
+    """``events``: {symbol: [[iso date, factor], ...]} -- the splits the Alpaca build APPLIED."""
+    meta = Path(root) / ALPACA_DIR / "_meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / "build_manifest.json").write_text(json.dumps(
+        {"symbols": {s: {"events": {"splits": ev, "spinoffs": []}} for s, ev in events.items()}}), encoding="utf-8")
+
+
+@pytest.fixture
+def alpaca_root(root):
+    """``root`` (fmp cache) plus an Alpaca cache of the same symbols with DIFFERENT prices."""
+    for i, sym in enumerate(UNIVERSE):
+        _write_alpaca(root, sym, _frame(_sessions(date(2023, 9, 1), date(2024, 6, 28)), seed=i + 40))
+    _write_alpaca(root, "AAPL", _frame(_sessions(date(2020, 6, 1), date(2020, 10, 30)), seed=1, base=120.0))
+    _write_alpaca(root, "NVDA", _frame(_sessions(date(2024, 4, 1), date(2024, 8, 30)), seed=2, base=110.0))
+    _write_build_manifest(root, {s: [] for s in UNIVERSE})
+    return root
+
+
+def _vendor_plan_args(root, universe_file, out, vendor, profile="ohlcv-v1"):
+    return _plan_args(root, universe_file, out, profile=profile) + ["--ohlcv-history-source", vendor]
+
+
+def test_the_history_source_flag_is_required_on_every_subcommand_and_typos_are_refused(tool, root, universe_file,
+                                                                                       tmp_path, capsys):
+    out = str(tmp_path / "plan.json")
+    base = {"plan": ["plan", "--profile", "ohlcv-v1", "--universe-file", universe_file, "--start", "2024-06-03",
+                     "--end", "2024-06-28", "--cache-root", root, "--out", out],
+            "build": ["build", "--plan", out, "--cache-only"],
+            "verify": ["verify", "--manifest", "0" * 64, "--cache-root", root],
+            "prepare-host": ["prepare-host", "--manifest", "0" * 64, "--cache-root", root]}
+    for name, argv in base.items():
+        assert tool.main_raw(["--quiet", *argv]) == 2, f"{name} accepted a missing --ohlcv-history-source"
+        for bad in ("alpca", "FMP", "", "both"):
+            assert tool.main_raw(["--quiet", *argv, "--ohlcv-history-source", bad]) == 2, (name, bad)
+    assert not Path(out).exists()
+    capsys.readouterr()
+
+
+def test_alpaca_round_trip_records_the_alpaca_source_profile_and_never_fetches(tool, monkeypatch, alpaca_root,
+                                                                                universe_file, tmp_path, capsys):
+    from ba2_common.core.market_condition_source import SOURCE_PROFILE_ALPACA_DAILY
+    from ba2_common.core.market_condition_store import MarketConditionStore
+    monkeypatch.undo()                      # the REAL make_source: the Alpaca source, no stub
+    out = str(tmp_path / "plan.json")
+    assert tool.main_raw(_vendor_plan_args(alpaca_root, universe_file, out, "alpaca")) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["plan"]["universe"] == 3 and not printed["preflight_errors"]
+    plan = json.loads(Path(out).read_text())
+    assert plan["source_profile"] == SOURCE_PROFILE_ALPACA_DAILY
+    assert plan["certification"]["source_profile"] == SOURCE_PROFILE_ALPACA_DAILY and plan["certification"]["consistent"]
+    assert all(s["cache_file"].replace("\\", "/").split("/")[-2] == ALPACA_DIR for s in plan["symbols"])
+
+    assert tool.main_raw(["--quiet", "build", "--plan", out, "--cache-only", "--ohlcv-history-source", "alpaca"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    digest = report["manifest_digest"]
+    assert report["ok"] and report["counters"]["provider_calls"] == 0
+    assert MarketConditionStore(alpaca_root).read_manifest(digest)["source_profile"] == SOURCE_PROFILE_ALPACA_DAILY
+
+    for argv in (["verify", "--manifest", digest], ["prepare-host", "--manifest", digest, "--profile", "ohlcv-v1"]):
+        assert tool.main_raw(["--quiet", *argv, "--cache-root", alpaca_root, "--ohlcv-history-source", "alpaca"]) == 0
+        assert json.loads(capsys.readouterr().out)["ok"]
+        # ... and the same digest under the OTHER vendor is refused, not silently accepted.
+        assert tool.main_raw(["--quiet", *argv, "--cache-root", alpaca_root, "--ohlcv-history-source", "fmp"]) == 1
+        capsys.readouterr()
+
+
+def test_a_plan_and_a_build_must_agree_on_the_vendor_and_alpaca_cannot_fetch(tool, monkeypatch, alpaca_root,
+                                                                           universe_file, tmp_path, capsys):
+    monkeypatch.undo()
+    out = str(tmp_path / "plan.json")
+    assert tool.main_raw(_vendor_plan_args(alpaca_root, universe_file, out, "alpaca")) == 0
+    capsys.readouterr()
+    assert tool.main_raw(["--quiet", "build", "--plan", out, "--cache-only", "--ohlcv-history-source", "fmp"]) == 2
+    assert tool.main_raw(["--quiet", "build", "--plan", out, "--fetch-missing", "--ohlcv-history-source", "alpaca"]) == 2
+    err = capsys.readouterr().err
+    assert "prepare_history.py" in err
+
+
+def test_alpaca_without_a_build_manifest_is_a_configuration_error(tool, monkeypatch, root, universe_file, tmp_path,
+                                                                  capsys):
+    """The split-basis preflight must not pass vacuously: no record of the applied splits, no plan."""
+    monkeypatch.undo()
+    _write_alpaca(root, "AAA", _frame(_sessions(date(2023, 9, 1), date(2024, 6, 28)), seed=1))
+    assert tool.main_raw(_vendor_plan_args(root, universe_file, str(tmp_path / "plan.json"), "alpaca")) == 2
+    assert "prepare_history.py" in capsys.readouterr().err
+
+
+def test_alpaca_preflight_catches_a_split_the_build_claims_but_the_series_does_not_absorb(
+        tool, monkeypatch, alpaca_root, universe_file, tmp_path, capsys):
+    """Equivalent of the FMP split-basis preflight: the applied splits (build manifest) are checked against the
+    stored series. A 4:1 split on 2024-03-15 that the manifest lists, with the close still dropping 4x there,
+    is an un-absorbed split -> actionable plan, nothing built."""
+    monkeypatch.undo()
+    days = _sessions(date(2023, 9, 1), date(2024, 6, 28))
+    df = _frame(days, seed=7, base=100.0)
+    cut = pd.Timestamp("2024-03-15")
+    for col in ("Open", "High", "Low", "Close"):
+        df.loc[df["Date"] >= cut, col] = df.loc[df["Date"] >= cut, col] / 4.0
+    _write_alpaca(alpaca_root, "BBB", df)
+    _write_build_manifest(alpaca_root, {"AAA": [], "BBB": [["2024-03-15", 4.0]], "CCC": []})
+    out = str(tmp_path / "plan.json")
+    assert tool.main_raw(_vendor_plan_args(alpaca_root, universe_file, out, "alpaca")) == 1
+    printed = json.loads(capsys.readouterr().out)
+    bbb = [s for s in json.loads(Path(out).read_text())["symbols"] if s["symbol"] == "BBB"][0]
+    assert bbb["split_events"] == [["2024-03-15", 4.0]]
+    assert bbb["split_checks"] and printed["inventory"]
+
+
+def test_the_two_sources_never_collide_in_the_feature_store(tool, monkeypatch, alpaca_root, universe_file, tmp_path,
+                                                            capsys):
+    """Same cache root, same symbols/profile/window, different prices per vendor: the manifests, the feature
+    objects and the raw shards are disjoint; neither build reuses a row of the other; both still verify."""
+    from ba2_common.core.market_condition_store import MarketConditionStore
+    digests, manifests = {}, {}
+    for vendor in ("fmp", "alpaca"):
+        if vendor == "alpaca":
+            monkeypatch.undo()
+        out = str(tmp_path / f"plan.{vendor}.json")
+        assert tool.main_raw(_vendor_plan_args(alpaca_root, universe_file, out, vendor)) == 0
+        capsys.readouterr()
+        assert tool.main_raw(["--quiet", "build", "--plan", out, "--cache-only", "--ohlcv-history-source", vendor]) == 0
+        rep = json.loads(capsys.readouterr().out)
+        assert rep["counters"].get("rows_reused", 0) == 0, f"{vendor} reused rows it did not compute"
+        digests[vendor] = rep["manifest_digest"]
+        manifests[vendor] = MarketConditionStore(alpaca_root).read_manifest(digests[vendor])
+    assert digests["fmp"] != digests["alpaca"]
+    assert manifests["fmp"]["source_profile"] != manifests["alpaca"]["source_profile"]
+    shas = {v: {o["sha256"] for o in m["objects"]} for v, m in manifests.items()}
+    raws = {v: {o["sha256"] for o in m["raw_objects"]} for v, m in manifests.items()}
+    assert shas["fmp"] and shas["alpaca"] and not (shas["fmp"] & shas["alpaca"])
+    assert raws["fmp"] and raws["alpaca"] and not (raws["fmp"] & raws["alpaca"])
+    for vendor, digest in digests.items():
+        assert tool.main_raw(["--quiet", "verify", "--manifest", digest, "--cache-root", alpaca_root,
+                              "--ohlcv-history-source", vendor]) == 0
+        capsys.readouterr()
+
+
+def test_identical_bars_of_two_sources_are_never_offered_as_reusable_rows(tool, monkeypatch, root, universe_file,
+                                                                          tmp_path, capsys):
+    """Even with byte-identical prices the plan of the second vendor reports no reusable rows from the first
+    vendor's manifest: reuse is within one source profile (the store still dedups identical bytes)."""
+    for i, sym in enumerate(UNIVERSE):
+        _write_alpaca(root, sym, _frame(_sessions(date(2023, 9, 1), date(2024, 6, 28)), seed=i + 3))  # == fmp frames
+    _write_alpaca(root, "AAPL", _frame(_sessions(date(2020, 6, 1), date(2020, 10, 30)), seed=1, base=120.0))
+    _write_alpaca(root, "NVDA", _frame(_sessions(date(2024, 4, 1), date(2024, 8, 30)), seed=2, base=110.0))
+    _write_build_manifest(root, {s: [] for s in UNIVERSE})
+    out = str(tmp_path / "plan.fmp.json")
+    assert tool.main_raw(_vendor_plan_args(root, universe_file, out, "fmp")) == 0
+    capsys.readouterr()
+    assert tool.main_raw(["--quiet", "build", "--plan", out, "--cache-only", "--ohlcv-history-source", "fmp"]) == 0
+    capsys.readouterr()
+    reusable_fmp_replan = None
+    assert tool.main_raw(_vendor_plan_args(root, universe_file, str(tmp_path / "again.fmp.json"), "fmp")) == 0
+    capsys.readouterr()
+    reusable_fmp_replan = sum(s["rows_reusable"] for s in json.loads((tmp_path / "again.fmp.json").read_text())["symbols"])
+    assert reusable_fmp_replan > 0                      # the control: the SAME vendor does reuse its rows
+    monkeypatch.undo()
+    out2 = str(tmp_path / "plan.alpaca.json")
+    assert tool.main_raw(_vendor_plan_args(root, universe_file, out2, "alpaca")) == 0
+    capsys.readouterr()
+    assert sum(s["rows_reusable"] for s in json.loads(Path(out2).read_text())["symbols"]) == 0

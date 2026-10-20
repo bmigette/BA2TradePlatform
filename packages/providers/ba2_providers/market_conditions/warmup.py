@@ -504,8 +504,10 @@ class _ManifestIndex:
     entries of the plan's own symbols are kept, instead of re-reading every manifest for every
     symbol and retaining an ``ObjectEntry`` for every object of every manifest ever published."""
 
-    def __init__(self, store: MarketConditionStore, profile: str, universe: Iterable[str]):
+    def __init__(self, store: MarketConditionStore, profile: str, universe: Iterable[str],
+                 source_profile: Optional[str] = None):
         self.store, self.profile = store, profile
+        self.source_profile = source_profile
         self.universe = {s.upper() for s in universe}
         spec = PROFILES[profile]
         self.calc_version = spec.calc_version
@@ -514,6 +516,12 @@ class _ManifestIndex:
         self._lock = threading.Lock()
 
     def compatible(self, manifest: Mapping[str, Any]) -> bool:
+        # A row is reused only inside ONE price source: objects are content-addressed, so two sources
+        # can never overwrite each other, but a candidate from another vendor's manifest must not be
+        # offered either (its window digest matching would be a coincidence of identical bars, and the
+        # manifest we publish must be explainable from its own source profile alone).
+        if self.source_profile is not None and manifest.get("source_profile") != self.source_profile:
+            return False
         return (manifest.get("calc_version") == self.calc_version
                 and manifest.get("schema_version") == SCHEMA_VERSION
                 and list(manifest.get("fields", ())) == self.fields)
@@ -746,7 +754,7 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
         preflight.append(f"source certification failed for {source_profile}: {bad}")
 
     store = MarketConditionStore(cache_root)
-    index = _ManifestIndex(store, profile, symbols)
+    index = _ManifestIndex(store, profile, symbols, source_profile)
     fields = [f.name for f in PROFILES[profile].fields]
     inventories = []
     for sym in symbols:
@@ -1262,6 +1270,10 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
     if plan_.profile not in PROFILES or PROFILES[plan_.profile].calc_version != plan_.calc_version:
         raise WarmupConfigError(f"plan profile {plan_.profile!r} at {plan_.calc_version!r} is not registered "
                                 f"(registered: {[(p, s.calc_version) for p, s in PROFILES.items()]})")
+    if fetch_missing and plan_.source_profile != SOURCE_PROFILE_FMP_DAILY:
+        raise WarmupConfigError(
+            f"source profile {plan_.source_profile!r} cannot be fetched by a warmup: its cache is built only "
+            f"by tools/prepare_history.py (build with --cache-only)")
     fatal = plan_.fatal_preflight_errors()
     if fatal:
         report.errors = fatal
@@ -1319,7 +1331,7 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
     # -- build
     t_build = time.monotonic()
     store = MarketConditionStore(plan_.cache_root)
-    index = _ManifestIndex(store, plan_.profile, plan_.universe)
+    index = _ManifestIndex(store, plan_.profile, plan_.universe, plan_.source_profile)
     results: Dict[str, _SymbolResult] = {}
     errors: List[str] = []
     waited: List[str] = []
