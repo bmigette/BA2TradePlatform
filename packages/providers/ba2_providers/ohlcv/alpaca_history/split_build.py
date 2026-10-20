@@ -247,9 +247,11 @@ class YahooSplitSource:
     def __init__(self, cache_dir: str, renames: Mapping[str, Sequence[Tuple[date, str]]], *, refresh: bool = False,
                  fetch: Callable[[str], Optional[List[Tuple[str, float]]]] = yfinance_fetch,
                  sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
-                 min_interval: float = 1.0, retries: int = 3, backoff: Sequence[float] = (2.0, 5.0, 15.0)):
+                 min_interval: float = 1.0, retries: int = 3, backoff: Sequence[float] = (2.0, 5.0, 15.0),
+                 bars_end: Optional[Callable[[str], Optional[date]]] = None):
         self.cache_dir, self.renames, self.refresh, self.fetch = cache_dir, renames, refresh, fetch
         self.sleep, self.clock, self.min_interval, self.retries, self.backoff = sleep, clock, min_interval, retries, backoff
+        self.bars_end = bars_end
         self.records: Dict[str, Dict[str, Any]] = {}       # symbol -> row of yahoo_inputs.csv, for the symbols consulted
         self._last = -1e18
         self.fetched = 0
@@ -269,11 +271,15 @@ class YahooSplitSource:
                     self.sleep(self.backoff[min(attempt, len(self.backoff) - 1)])
         raise YahooUnavailable(f"{ticker}: {type(last).__name__}: {last}")
 
+    def _successors(self, symbol: str) -> List[str]:
+        """The rename successors Yahoo may answer under: renamed on/after the symbol's last bar (see rename_successors)."""
+        return rename_successors(symbol, self.renames, self.bars_end(symbol) if self.bars_end is not None else None)
+
     def _fetch_symbol(self, symbol: str) -> Dict[str, Any]:
         tried: List[str] = []
         empty_ok: Optional[str] = None
         try:
-            for ticker in [symbol] + rename_successors(symbol, self.renames):
+            for ticker in [symbol] + self._successors(symbol):
                 got = self._call(ticker)
                 if got is None:
                     tried.append(f"{ticker}: not found")
@@ -302,10 +308,13 @@ class YahooSplitSource:
                 raw = json.dumps(data, indent=1).encode("utf-8")
                 atomic_write(path, raw)
             self.fetched += 1
-        self.records[symbol] = {"symbol": symbol, "ticker": data["ticker"] or "", "status": data["status"],
+        status = data["status"]
+        if status == "ok" and data["ticker"] not in [symbol] + self._successors(symbol):
+            status = "foreign_ticker"                      # Yahoo answered as a ticker that is not this company's: never trusted
+        self.records[symbol] = {"symbol": symbol, "ticker": data["ticker"] or "", "status": status,
                                 "n_splits": len(data["splits"]), "fetched_at": data["fetched_at"],
                                 "sha256": hashlib.sha256(raw).hexdigest() if raw else ""}
-        return {"available": data["status"] == "ok", "ticker": data["ticker"], "splits": data["splits"]}
+        return {"available": status == "ok", "ticker": data["ticker"], "splits": data["splits"] if status == "ok" else []}
 
     def inputs(self) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """The rows of yahoo_inputs.csv (sorted by symbol) and the summary for split_table.json."""
@@ -353,9 +362,17 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     months = read_corporate_actions(store)
     renames = build_rename_map(months)
     bars_dir = os.path.join(store, "bars", "1Day")
-    store_names = {n[len("symbol="):] for n in os.listdir(bars_dir)
-                   if n.startswith("symbol=") and os.path.isfile(os.path.join(bars_dir, n, "all.parquet"))}
-    in_store = store_names.__contains__
+    bars, bars_sha = load_store_bars(store, symbols)
+    ranges: Dict[str, Tuple[date, date]] = {}
+    for sym, frame in bars.items():
+        t = pd.to_datetime(frame["t"])
+        t = t.dt.tz_convert("America/New_York") if t.dt.tz is not None else t
+        if len(t):
+            ranges[sym] = (t.min().date(), t.max().date())
+
+    def in_store(sym: str, day: date) -> bool:
+        """the store's bars of ``sym`` cover ``day`` (an event follows the chain symbol that actually holds its bars)"""
+        return sym in ranges and ranges[sym][0] <= day <= ranges[sym][1]
     alpaca = alpaca_events_from_actions(months, renames, stats, in_store)
     spinoffs = spinoff_events_from_actions(months, renames, stats, in_store)
     if stats["alpaca_forward_splits"] + stats["alpaca_reverse_splits"] <= 0:
@@ -373,7 +390,6 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     cal_used: List[str] = []
     cal_rows = fetch_fmp_calendar(date.fromisoformat(fmp_from), date.fromisoformat(fmp_to), cal_dir, get, stats, cal_used)
     fmp = fmp_events_from_rows(cal_rows, renames, stats, in_store)
-    bars, bars_sha = load_store_bars(store, symbols)
     fmp_daily, fmp_files, fmp_records = load_fmp_daily(fmp_daily_dir, bars)
     log(f"loaded {len(bars)} symbols, {len(alpaca)} Alpaca and {len(fmp)} FMP listings, {fmp_files['count']} FMP daily "
         f"files in {time.time() - t0:.0f}s")
@@ -386,8 +402,16 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
         path = os.path.join(bars_dir, f"symbol={sym}", "all.parquet")
         return pd.read_parquet(path, columns=["t", "o", "c"]) if os.path.isfile(path) else None
 
+    def bars_end(sym: str) -> Optional[date]:
+        if sym not in bars:
+            return None
+        t = pd.to_datetime(bars[sym]["t"])
+        t = t.dt.tz_convert("America/New_York") if t.dt.tz is not None else t
+        return t.max().date() if len(t) else None
+
     yahoo = YahooSplitSource(os.path.join(meta, "yahoo_splits"), renames, refresh=refresh_yahoo,
-                             fetch=yahoo_fetch or yfinance_fetch, sleep=yahoo_sleep, min_interval=yahoo_min_interval)
+                             fetch=yahoo_fetch or yfinance_fetch, sleep=yahoo_sleep, min_interval=yahoo_min_interval,
+                             bars_end=bars_end)
     accepted, review = decide_splits(bars, alpaca, fmp, overrides, stats, fmp_daily=fmp_daily, breaks=breaks,
                                      spinoffs=spinoffs, yahoo=yahoo, spinco_frame=spinco_frame,
                                      missing_spincos=missing_spincos)

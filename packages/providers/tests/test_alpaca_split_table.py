@@ -1329,22 +1329,29 @@ def test_small_single_vendor_event_needs_yahoo_within_half_a_percent():
 def test_a_ticker_renamed_after_its_bars_end_keeps_its_events_on_the_old_symbol():
     ren = st.build_rename_map([{"name_changes": [{"old_symbol": "OP", "new_symbol": "SVRN", "process_date": "2025-11-17"}]}])
     day = date(2023, 6, 8)
+    ranges = {"OP": (date(2021, 11, 30), date(2025, 11, 14)), "SVRN": (date(2025, 11, 17), date(2026, 10, 9))}
+
+    def cover(s, d):
+        return s in ranges and ranges[s][0] <= d <= ranges[s][1]
     assert st.map_to_current("OP", day, ren) == "SVRN"                                   # the plain mapping (no store knowledge)
-    assert st.map_to_current("OP", day, ren, {"OP"}.__contains__) == "OP"               # the store holds OP only
-    assert st.map_to_current("OP", day, ren, {"OP", "SVRN"}.__contains__) == "SVRN"     # the store holds both: the newest
-    assert st.map_to_current("OP", day, ren, set().__contains__) == "SVRN"              # in neither: unchanged behaviour
+    assert st.map_to_current("OP", day, ren, cover) == "OP"                              # SVRN's bars start 2025-11-17: OP holds 2023
+    assert st.map_to_current("SVRN", date(2026, 3, 30), ren, cover) == "SVRN"            # an event listed under the new ticker
+    assert st.map_to_current("OP", day, ren, lambda s, d: False) == "SVRN"               # covered by neither: unchanged behaviour
     month = {"reverse_splits": [{"symbol": "OP", "ex_date": "2023-06-08", "old_rate": 20, "new_rate": 1}]}
     stats = Counter()
-    ev = st.alpaca_events_from_actions([month], ren, stats, {"OP"}.__contains__)
+    ev = st.alpaca_events_from_actions([month], ren, stats, cover)
     assert ev == [L("OP", day, 0.05)] and stats["events_mapped_to_older_symbol"] == 1
     assert st.alpaca_events_from_actions([month], ren, Counter())[0].symbol == "SVRN"
 
 
 def test_build_applies_an_alpaca_listed_split_of_a_renamed_symbol(tmp_path):
     store, fmpd, raw = tiny_store(tmp_path, symbol="AA", asof="2021-01-30", listed=False)
+    later = store / "bars" / "1Day" / "symbol=BB"                            # the renamed ticker's bars start only after the rename
+    later.mkdir(parents=True)
+    bars(sessions=SESSIONS[79:80]).assign(h=1.0, l=1.0).to_parquet(later / "all.parquet")
     with _gzip.open(store / "corporate_actions" / "ym=2021-03.json.gz", "wt", encoding="utf-8") as f:
         json.dump({"forward_splits": [{"symbol": "AA", "ex_date": D.isoformat(), "old_rate": 1, "new_rate": 4}],
-                   "name_changes": [{"old_symbol": "AA", "new_symbol": "BB", "process_date": "2021-04-01"}]}, f)
+                   "name_changes": [{"old_symbol": "AA", "new_symbol": "BB", "process_date": "2021-04-20"}]}, f)
     out = tmp_path / "out"
     cal = out / "_meta" / "fmp_split_calendar"
     cal.mkdir(parents=True)
@@ -1356,3 +1363,22 @@ def test_build_applies_an_alpaca_listed_split_of_a_renamed_symbol(tmp_path):
     assert table["splits"] == {"AA": [[D.isoformat(), 4.0]]} and res["stats"]["events_mapped_to_older_symbol"] == 1
     acc = sb.read_csv_frame(str(out / "_meta" / "split_accepted.csv"))
     assert acc["source"].tolist() == ["alpaca"] and acc["absorbed"].tolist() == [""]
+
+
+def test_yahoo_answers_from_a_foreign_ticker_are_never_trusted(tmp_path):
+    # OP renamed SVRN on 2025-11-17, after its last bar (2025-11-14): the successor is the same company (same CUSIP)
+    ren = st.build_rename_map([{"name_changes": [{"old_symbol": "OP", "new_symbol": "SVRN", "process_date": "2025-11-17"}]}])
+    table = {"OP": None, "SVRN": [("2023-06-08", 0.05)], "ZZZ": [("2023-06-08", 0.05)]}
+    src = sb.YahooSplitSource(str(tmp_path / "a"), ren, fetch=fake_yahoo(table), sleep=lambda s: None, clock=lambda: 0.0,
+                              bars_end=lambda s: date(2025, 11, 14))
+    assert src("OP") == {"available": True, "ticker": "SVRN", "splits": [["2023-06-08", 0.05]]}
+    # a rename that happened BEFORE the symbol's last bar belongs to an earlier company that held the ticker: not a successor
+    reused = sb.YahooSplitSource(str(tmp_path / "b"), ren, fetch=fake_yahoo(table), sleep=lambda s: None, clock=lambda: 0.0,
+                                 bars_end=lambda s: date(2026, 9, 30))
+    assert reused("OP") == {"available": False, "ticker": None, "splits": []} and reused.records["OP"]["status"] == "not_found"
+    # a cached answer from a ticker that is neither the symbol nor a chain successor is refused, whatever the cache says
+    os.makedirs(tmp_path / "c")
+    (tmp_path / "c" / "OP.json").write_text(json.dumps({"symbol": "OP", "status": "ok", "ticker": "ZZZ", "splits": [["2023-06-08", 0.05]],
+                                                        "tried": [], "fetched_at": "2026-10-20T00:00:00Z"}), encoding="utf-8")
+    foreign = sb.YahooSplitSource(str(tmp_path / "c"), ren, fetch=fake_yahoo({}), sleep=lambda s: None, bars_end=lambda s: date(2025, 11, 14))
+    assert foreign("OP") == {"available": False, "ticker": "ZZZ", "splits": []} and foreign.records["OP"]["status"] == "foreign_ticker"

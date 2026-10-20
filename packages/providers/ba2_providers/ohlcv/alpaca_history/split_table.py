@@ -110,9 +110,10 @@ THE RULES (tolerances are module constants)
     ``absorbed_factor`` columns and in ``absorbed_spinoffs`` of split_table.json) when the split is a reviewed override or FMP's
     step agrees (within 10 %) with the split alone or with split x spin-off.  Otherwise NEITHER is applied and the pair goes
     to the review file as ``split_spinoff_conflict`` (decide it with an override).
-  * STORE SYMBOLS.  An event is mapped to the LAST symbol of its name-change chain that has bars in the store, not blindly to
+  * STORE SYMBOLS.  An event is mapped to the LAST symbol of its name-change chain whose bars cover its date, not blindly to
     the current ticker: OP was renamed SVRN on 2025-11-17, after its bars end (2025-11-14), so its 1:10, 1:20 and 1:25 reverse
-    splits stay on OP (counted: ``events_mapped_to_older_symbol``).
+    splits stay on OP (counted: ``events_mapped_to_older_symbol``); a symbol "has bars" for an event when its first bar is on/before
+    the event date and its last bar on/after it.
   * BOTH-VENDORS RULE (``both_listed_jump_within_1_5``): a big event with ``|ln f| >= ln 2`` that BOTH vendors list at the
     same ratio (within 1 %) is accepted when the raw jump is within x1.5 of f, with or without a matching FMP step (tried
     after the jump proof and the guarded step proof).
@@ -125,7 +126,9 @@ THE RULES (tolerances are module constants)
     ``inferred_unconfirmed`` review row, NOT applied; Yahoo unreachable / symbol unknown ->  ``yahoo_unavailable`` review row,
     NOT applied.  A not-applied candidate beyond x5 is still a series break.  YAHOO IS USED FOR THIS and to confirm a SMALL single-vendor event
     (above), never for the other listed events (both-vendor, FMP-only proven, big events, ...).  Yahoo uses CURRENT tickers: a symbol it does not know is retried under its
-    renamed successors from the Alpaca name-change chain (TPX -> SGI) and the answering ticker is recorded.  Requests are
+    renamed successors from the Alpaca name-change chain (TPX -> SGI) and the answering ticker is recorded.  An answer from a
+    ticker that is NOT the requested one or a rename successor of it (renamed on/after the symbol's last bar: OP -> SVRN, same
+    CUSIP) is never accepted: the symbol is treated as unavailable (status ``foreign_ticker`` in yahoo_inputs.csv).  Requests are
     paced (~1/s) and retried; the raw result per symbol is cached in ``<out>/_meta/yahoo_splits/<SYM>.json`` (with
     ``fetched_at``), so a rerun is offline; ``--refresh-yahoo`` fetches again.  A transient failure is not cached.
   * SERIES BREAKS (``series_break``): any unexplained raw overnight jump still left after all of the above with
@@ -216,7 +219,7 @@ import math
 import os
 import re
 from collections import Counter
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
@@ -350,29 +353,31 @@ def build_rename_map(corporate_actions: Iterable[Mapping[str, Any]]) -> Dict[str
 
 
 def map_to_current(symbol: str, on: date, renames: Mapping[str, Sequence[Tuple[date, str]]],
-                   in_store: Optional[Callable[[str], bool]] = None) -> str:
+                   in_store: Optional[Callable[[str, date], bool]] = None) -> str:
     """The symbol the bars of ``symbol`` as of ``on`` sit under: follow every rename effective AFTER ``on`` (a same-day one is ambiguous: tickers swap on a date),
     in date order (the store was fetched as-of a later date, so a renamed ticker's whole history is under its
-    CURRENT symbol).  With ``in_store`` the result is the LAST symbol of the chain whose bars the store holds: a ticker renamed
-    after the store's bars end (OP -> SVRN, 2025-11-17, bars end 2025-11-14) keeps its history under the OLD symbol, and its
-    events must follow it there (the bar-range check then drops any that a reused ticker could not have)."""
+    CURRENT symbol).  With ``in_store(symbol, day)`` the result is the LAST symbol of the chain whose bars COVER ``on``: a ticker
+    renamed after the store's bars end (OP -> SVRN, 2025-11-17; OP's bars end 2025-11-14 and SVRN's start 2025-11-17) keeps its
+    history under the OLD symbol, and its events must follow it there."""
     cur, at = _norm_symbol(symbol), on
-    best = cur if (in_store is not None and in_store(cur)) else None
+    best = cur if (in_store is not None and in_store(cur, on)) else None
     for _ in range(25):
         nxt = next(((d, n) for d, n in renames.get(cur, ()) if d > at), None)
         if nxt is None:
             return best if best is not None else cur
         at, cur = nxt
-        if in_store is not None and in_store(cur):
+        if in_store is not None and in_store(cur, on):
             best = cur
     raise ValueError(f"rename chain of {symbol} from {on} does not end (cycle?)")
 
 
-def rename_successors(symbol: str, renames: Mapping[str, Sequence[Tuple[date, str]]]) -> List[str]:
+def rename_successors(symbol: str, renames: Mapping[str, Sequence[Tuple[date, str]]],
+                      not_before: Optional[date] = None) -> List[str]:
     """The tickers ``symbol`` was renamed to LATER, oldest first (the name-change chain followed to its end): a vendor that
-    uses current tickers (Yahoo) may only know the last of them."""
+    uses current tickers (Yahoo) may only know the last of them.  With ``not_before`` only renames dated on/after it count: a
+    rename BEFORE the symbol's last bar belongs to an earlier company that held the ticker (a reused ticker), not to this one."""
     out: List[str] = []
-    cur, at = _norm_symbol(symbol), date.min
+    cur, at = _norm_symbol(symbol), (date.min if not_before is None else not_before - timedelta(days=1))
     for _ in range(25):
         nxt = next(((d, n) for d, n in renames.get(cur, ()) if d > at), None)
         if nxt is None:
@@ -383,7 +388,7 @@ def rename_successors(symbol: str, renames: Mapping[str, Sequence[Tuple[date, st
 
 
 def _map(symbol: str, day: date, renames: Mapping[str, Sequence[Tuple[date, str]]],
-         in_store: Optional[Callable[[str], bool]], stats: Counter) -> str:
+         in_store: Optional[Callable[[str, date], bool]], stats: Counter) -> str:
     """map_to_current, counting the events that stay on an OLDER symbol because the store holds no bars under the current one."""
     sym = map_to_current(symbol, day, renames, in_store)
     if in_store is not None and sym != map_to_current(symbol, day, renames):
@@ -394,7 +399,7 @@ def _map(symbol: str, day: date, renames: Mapping[str, Sequence[Tuple[date, str]
 def alpaca_events_from_actions(corporate_actions: Iterable[Mapping[str, Any]],
                                renames: Mapping[str, Sequence[Tuple[date, str]]],
                                stats: Optional[Counter] = None,
-                               in_store: Optional[Callable[[str], bool]] = None) -> List[ListedSplit]:
+                               in_store: Optional[Callable[[str, date], bool]] = None) -> List[ListedSplit]:
     """Factor events of the Alpaca corporate-action files, mapped to current symbols.  Spin-offs, cash dividends and
     mergers are not price adjustments here (same convention as FMP close) and are ignored; a unit split into a
     DIFFERENT symbol (SPAC unit separation) is not a factor event of either symbol."""
@@ -426,7 +431,7 @@ def alpaca_events_from_actions(corporate_actions: Iterable[Mapping[str, Any]],
 def spinoff_events_from_actions(corporate_actions: Iterable[Mapping[str, Any]],
                                 renames: Mapping[str, Sequence[Tuple[date, str]]],
                                 stats: Optional[Counter] = None,
-                                in_store: Optional[Callable[[str], bool]] = None) -> List[SpinOff]:
+                                in_store: Optional[Callable[[str, date], bool]] = None) -> List[SpinOff]:
     """Alpaca ``spin_offs`` (source_symbol, new_symbol, ex_date, new_rate, source_rate), parent and spinco both mapped to
     their current symbols through the name changes (like every other event)."""
     stats = stats if stats is not None else Counter()
@@ -449,7 +454,7 @@ def spinoff_events_from_actions(corporate_actions: Iterable[Mapping[str, Any]],
 def fmp_events_from_rows(rows: Iterable[Mapping[str, Any]],
                          renames: Mapping[str, Sequence[Tuple[date, str]]],
                          stats: Optional[Counter] = None,
-                         in_store: Optional[Callable[[str], bool]] = None) -> List[ListedSplit]:
+                         in_store: Optional[Callable[[str, date], bool]] = None) -> List[ListedSplit]:
     """Events of FMP split-calendar rows (``date, symbol, numerator, denominator``).  A row with a missing or zero
     side has no ratio and is counted, never read as a 0-for-1 split."""
     stats = stats if stats is not None else Counter()
