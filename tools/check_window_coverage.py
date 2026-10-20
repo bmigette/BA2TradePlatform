@@ -33,6 +33,9 @@ import random
 import sys
 from datetime import datetime, timedelta
 
+from ba2_common.config import CACHE_FOLDER
+from ba2_common.core.ohlcv_history import DEFAULT_BT_HISTORY_SOURCE, HISTORY_SOURCES, history_cache_dirname
+
 
 def _first_bar(path: str):
     import pandas as pd
@@ -48,8 +51,12 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--interval", default="5min", help="Bar interval the GRID will run (not 1d unless it is).")
     ap.add_argument("--start", required=True, help="Grid window start, ISO.")
+    ap.add_argument("--source", choices=sorted(HISTORY_SOURCES), default=DEFAULT_BT_HISTORY_SOURCE,
+                    help="OHLCV history source whose cache folder is checked (default "
+                         f"{DEFAULT_BT_HISTORY_SOURCE}): fmp -> CACHE_FOLDER/FMPOHLCVProvider, "
+                         "alpaca -> CACHE_FOLDER/AlpacaHistoryOHLCVProvider.")
     ap.add_argument("--cache-dir", default=None,
-                    help="Provider cache dir (default CACHE_FOLDER/FMPOHLCVProvider).")
+                    help="Provider cache dir; overrides --source (default CACHE_FOLDER/<source folder>).")
     ap.add_argument("--symbols", default=None,
                     help="Comma-separated list or @file. Default: sample the whole cache.")
     ap.add_argument("--sample", type=int, default=40, help="Symbols to sample (default 40).")
@@ -66,8 +73,7 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=1337, help="Sampling seed, so a run is reproducible.")
     args = ap.parse_args()
 
-    cache_dir = args.cache_dir or os.path.join(
-        os.path.expanduser("~"), "Documents", "ba2", "common", "cache", "FMPOHLCVProvider")
+    cache_dir = args.cache_dir or os.path.join(CACHE_FOLDER, history_cache_dirname(args.source))
     if not os.path.isdir(cache_dir):
         print(f"coverage: FATAL cache dir not found: {cache_dir}")
         return 2

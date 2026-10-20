@@ -492,7 +492,8 @@ def test_driver_dry_run_default_carries_the_decision_time_gene_in_every_classic_
     import re
 
     result = subprocess.run(
-        [sys.executable, _DRIVER, "--strategies", "S1", "--bands", "large", "--dry-run"],
+        [sys.executable, _DRIVER, "--strategies", "S1", "--bands", "large", "--dry-run",
+         "--ohlcv-history-source", "fmp"],      # fmp = the legacy name layout this test pins
         capture_output=True, text=True, cwd=os.path.normpath(os.path.join(_ROOT, "..", "..")),
     )
     assert result.returncode == 0, result.stderr

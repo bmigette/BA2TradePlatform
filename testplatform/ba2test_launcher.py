@@ -1298,6 +1298,82 @@ def _apply_options_seam(spec: dict, backtest_block: dict) -> None:
         backtest_block["options_cache_db"] = default_options_cache_db()
 
 
+#: ``--ohlcv-history-source`` help, shared by every subcommand that creates a job.
+_HISTORY_SOURCE_HELP = (
+    "OHLCV history the job reads and is STAMPED with (ohlcv_history_source on the run config, in the "
+    "checkpoint fingerprint, and in a matrix driver's job name): fmp = CACHE_FOLDER/FMPOHLCVProvider, "
+    "alpaca = CACHE_FOLDER/AlpacaHistoryOHLCVProvider (raw SIP bars + the verified split table). "
+    "Default: alpaca for EQUITY jobs; fmp for OPTION jobs (an option expert or an option strategy) "
+    "because ThetaData strikes are as-traded and the split-basis converter still reads FMP's split "
+    "calendar -- an option job stated as alpaca is REFUSED at launch, before any trial.")
+
+
+def _add_history_source_arg(parser) -> None:
+    """``--ohlcv-history-source {fmp,alpaca}`` (None = not stated; ``_resolve_history_source`` decides)."""
+    from ba2_common.core.ohlcv_history import HISTORY_SOURCES
+    parser.add_argument("--ohlcv-history-source", choices=sorted(HISTORY_SOURCES), default=None,
+                        help=_HISTORY_SOURCE_HELP)
+
+
+def _is_option_job(spec: dict, strategy_kind: "str | None") -> bool:
+    """An OPTION job: an options expert, or an option strategy / strategy group (the same test
+    ``_resolve_decision_times`` is given)."""
+    return bool(spec.get("options")) or bool(strategy_kind) and (
+        strategy_kind in _OPTION_STRATEGY_KEYS or strategy_kind in _OPTION_GROUPS_ALL)
+
+
+def _resolve_history_source(args, command: str, spec: dict, strategy_kind: "str | None") -> str:
+    """The OHLCV history source this job runs on.
+
+    Stated -> as stated (an unknown name never gets here: argparse ``choices``). Not stated ->
+    ``DEFAULT_BT_HISTORY_SOURCE`` for an equity job and ``fmp`` for an option job, so the option
+    grids behave exactly as before. An option job STATED as anything but fmp refuses here, before
+    the job row, the strategy or any trial exists (``OptionHistorySourceUnsupported``)."""
+    from ba2_common.core.ohlcv_history import DEFAULT_BT_HISTORY_SOURCE
+    from app.services.backtest.history_source import (
+        OPTION_SUPPORTED_SOURCE, OptionHistorySourceUnsupported, refuse_option_job_on_unsupported_source)
+    option_job = _is_option_job(spec, strategy_kind)
+    stated = getattr(args, "ohlcv_history_source", None)
+    source = stated if stated is not None else (
+        OPTION_SUPPORTED_SOURCE if option_job else DEFAULT_BT_HISTORY_SOURCE)
+    try:
+        refuse_option_job_on_unsupported_source(
+            {"ohlcv_history_source": source}, uses_options=option_job, where=command)
+    except OptionHistorySourceUnsupported as e:
+        sys.exit(f"ba2-test {command}: REFUSED: {e}")
+    return source
+
+
+def _refuse_reused_history_source_name(name: str, source: str, command: str) -> None:
+    """Refuse (exit) a run whose NAME is already a COMPLETED optimization stamped with a DIFFERENT
+    history source: the name is the job's identity (skip-by-name, checkpoint key), so reusing it
+    would skip the new run as 'done' or compare results of two histories under one name. A stored
+    optimization without the stamp ran on the legacy source (fmp). Matrix drivers put the source in
+    the name (``matrix_flags.with_history_source_name``) and cannot hit this."""
+    from ba2_common.core.ohlcv_history import LEGACY_HISTORY_SOURCE
+    from app.models.database import SessionLocal
+    from app.models.strategy_optimization import StrategyOptimization
+    from app.services.backtest.history_source import find_history_stamp
+    db = SessionLocal()
+    try:
+        rows = (db.query(StrategyOptimization)
+                .filter(StrategyOptimization.name == name, StrategyOptimization.status == "completed")
+                .all())
+        clashes = []
+        for r in rows:
+            stored = find_history_stamp(r.optimization_config or {})
+            stored = LEGACY_HISTORY_SOURCE if stored is None else stored
+            if stored != source:
+                clashes.append((r.id, stored))
+    finally:
+        db.close()
+    if clashes:
+        sys.exit(f"ba2-test {command}: REFUSED: --name {name!r} is already a completed optimization "
+                 f"{clashes} (id, history source) but this run is on {source!r}. Use a name that "
+                 f"differs (the matrix drivers add the source to the name); one name must not stand "
+                 f"for two price histories.")
+
+
 def _apply_options_store(args, backtest_block: dict) -> None:
     """Write the RESOLVED option store onto the run's backtest block (--options-store, else
     ``BACKTEST_OPTIONS_STORE``, else ``sqlite`` — resolve_options_store owns that order).
@@ -5508,21 +5584,23 @@ def _resolve_exclude_symbols_arg(spec) -> list:
     return out
 
 
-def _coverage_report(symbols, interval: str, start: str, end: str):
-    """Per-symbol-day intraday coverage of these symbols (``ba2_providers.screener.intraday_coverage``), None on a daily clock."""
+def _coverage_report(symbols, interval: str, start: str, end: str, history_source: str):
+    """Per-symbol-day intraday coverage of these symbols (``ba2_providers.screener.intraday_coverage``) in the cache of
+    ``history_source`` (REQUIRED: the job's own history), None on a daily clock."""
     from ba2_common.config import CACHE_FOLDER
+    from ba2_common.core.ohlcv_history import history_cache_dirname
     from ba2_providers.screener import intraday_coverage as _ic
     from ba2_providers.screener.universe_superset import interval_is_intraday
     if not interval_is_intraday(interval):
         return None
-    return _ic.scan(symbols, os.path.join(CACHE_FOLDER, "FMPOHLCVProvider"), interval, start, end)
+    return _ic.scan(symbols, os.path.join(CACHE_FOLDER, history_cache_dirname(history_source)), interval, start, end)
 
 
-def _coverage_preflight(command: str, symbols, args) -> None:
+def _coverage_preflight(command: str, symbols, args, history_source: str) -> None:
     """LAUNCH REFUSAL (every intraday ``optimize``): more than the stated share of symbol-days without an intraday bar.  The report
     is printed either way (the screener gate only COUNTS candidates it cannot price)."""
     from ba2_providers.screener import intraday_coverage as _ic
-    rep = _coverage_report(symbols, args.interval, args.start, args.end)
+    rep = _coverage_report(symbols, args.interval, args.start, args.end, history_source)
     if rep is None:
         return
     print(f"{command}: {_ic.format_report(rep)}", flush=True)
@@ -6809,6 +6887,8 @@ def _cmd_optimize(args) -> int:
     # often than enter_market): every weekday at the open bar, regardless of the (weekly) entry day.
     # So trailing-SL / close / days_opened exit rules are evaluated each trading day, not weekly.
     manage_sched = _daily_manage_schedule()
+    # The OHLCV history source, resolved (and an option job on alpaca refused) before anything is built.
+    history_source = _resolve_history_source(args, "optimize", spec, args.strategy)
 
     init_db()
 
@@ -6843,6 +6923,7 @@ def _cmd_optimize(args) -> int:
     # while the inconvenience it causes is one flag.
     _opt_name = args.name or f"opt-{expert}"
     _refuse_reused_timegene_name(_opt_name, decision_times, "optimize")
+    _refuse_reused_history_source_name(_opt_name, history_source, "optimize")
     if not getattr(args, "rerun", False):
         _db = SessionLocal()
         try:
@@ -6915,6 +6996,8 @@ def _cmd_optimize(args) -> int:
             "run_schedule_override": run_sched,
             "manage_schedule_override": manage_sched,
             "execution_interval": args.interval,
+            # Which OHLCV history every trial of this job reads (also in the checkpoint fingerprint).
+            "ohlcv_history_source": history_source,
             "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
             "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
             "stress_spread_bps": (float(args.stress_spread_bps) if getattr(args, "stress_spread_bps", 0) else 0.0),
@@ -7096,11 +7179,12 @@ def _cmd_optimize(args) -> int:
             # --screener-exclude-uncached turns them into a RECORDED screen exclusion
             # (backtest.excluded_instruments), which removes them from the per-decision gate too,
             # so the run-time universe guard stays at zero and a re-run reproduces the exclusion.
-            # Match the native cache file CACHE_FOLDER/FMPOHLCVProvider/<SYM>_<interval>.parquet
+            # Match the native cache file CACHE_FOLDER/<the job's history folder>/<SYM>_<interval>.parquet
             # (with the provider's symbol sanitisation: '-' -> '_'/'.').
             import os as _os
             from ba2_common.config import CACHE_FOLDER as _CF
-            _cdir = _os.path.join(_CF, "FMPOHLCVProvider")
+            from ba2_common.core.ohlcv_history import history_cache_dirname as _hcd
+            _cdir = _os.path.join(_CF, _hcd(history_source))
             _ivs = sorted({args.interval, "1d"})
             def _has_bars(sym: str) -> bool:
                 for _iv in _ivs:
@@ -7112,7 +7196,8 @@ def _cmd_optimize(args) -> int:
             if getattr(args, "print_universe", False):
                 # DRY RUN for preflights (grid scripts): the job's static universe through the SAME function the
                 # launch uses, and the symbols a launch would refuse on; nothing is submitted.
-                _cov = _coverage_report([x for x in enabled if x not in set(_uncached)], args.interval, args.start, args.end)
+                _cov = _coverage_report([x for x in enabled if x not in set(_uncached)], args.interval, args.start, args.end,
+                                        history_source)
                 from ba2_providers.screener import intraday_coverage as _icm
                 _cov_probs = _icm.problems(_cov) if _cov else []
                 print("PRINT-UNIVERSE " + json.dumps({"static_universe_size": len(enabled),
@@ -7188,7 +7273,7 @@ def _cmd_optimize(args) -> int:
             universe = list(backtest_block["enabled_instruments"])
         # the FINAL universe's intraday coverage (threshold + report); the price-basis cross-check is the shared function of
         # fix/ohlcv-cross-interval-basis, not duplicated here
-        _coverage_preflight("optimize", list(backtest_block["enabled_instruments"]), args)
+        _coverage_preflight("optimize", list(backtest_block["enabled_instruments"]), args, history_source)
         # Market-condition gates: record the profile + the pinned manifest on the run config
         # (persisted, so every _build_daily_trial_config consumer of this run -- trials, re-runs,
         # robustness variants, top-N persist, tools/backtest_parity.py -- carries the digest), and
@@ -7381,6 +7466,10 @@ def _cmd_optimize_batch(args) -> int:
                                "saturday", "sunday")},
                      "times": [DEFAULT_DECISION_TIME]}
     _assert_option_window_excludes_holdout([k for _e, k in jobs], args.end)
+    # every job's history source resolved up front: an option job stated as alpaca refuses the whole
+    # batch BEFORE the first job is enqueued, not midway
+    for _e, _k in jobs:
+        _resolve_history_source(args, "optimize-batch", _EXPERT_OPT[_e], _k)
     init_db()
     tq = get_task_queue()
     print(f"optimize-batch: {len(jobs)} job(s) {jobs} x {len(universe)} syms, "
@@ -7401,6 +7490,8 @@ def _cmd_optimize_batch(args) -> int:
                                    "consistent_annual_return" if spec.get("options") else "calmar_ratio")
         _refuse_convex_fitness_mismatch("optimize-batch", strat_kind, fitness)
         name = f"{prefix}-{expert}-{strat_kind}-{fitness}"
+        history_source = _resolve_history_source(args, "optimize-batch", spec, strat_kind)
+        _refuse_reused_history_source_name(name, history_source, "optimize-batch")
         db = SessionLocal()
         try:
             neutral_mode = getattr(args, "neutral_entry_mode", "legacy")
@@ -7444,6 +7535,8 @@ def _cmd_optimize_batch(args) -> int:
                 "run_schedule_override": run_sched,
                 "manage_schedule_override": _daily_manage_schedule(),
                 "execution_interval": args.interval,
+                # Which OHLCV history every trial of this job reads (see _cmd_optimize).
+                "ohlcv_history_source": history_source,
                 "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
                 "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
             "stress_spread_bps": (float(args.stress_spread_bps) if getattr(args, "stress_spread_bps", 0) else 0.0),
@@ -8777,6 +8870,7 @@ def main(argv: "list | None" = None) -> int:
                          "which do not enter through the option rule. Not for a real grid: the "
                          "entry then fires on every evaluated symbol.")
     op.add_argument("--fill-model", default="next_bar_open")
+    _add_history_source_arg(op)
     op.add_argument("--interval", default="5min", help="Execution/fill clock interval (default 5min for "
                     "precise intraday TP/SL; analysis cadence is set by --run-schedule).")
     op.add_argument("--run-schedule", default="weekly", choices=["daily", "weekly"])
@@ -9024,6 +9118,7 @@ def main(argv: "list | None" = None) -> int:
                          "trials out to remote workers, and no environment travels with a "
                          "trial -- state the store here.")
     ob.add_argument("--fill-model", default="next_bar_open")
+    _add_history_source_arg(ob)
     ob.add_argument("--interval", default="5min",
                     help="Fill-clock interval (default 5min for precise intraday TP/SL).")
     ob.add_argument("--run-schedule", default="weekly", choices=["daily", "weekly"])

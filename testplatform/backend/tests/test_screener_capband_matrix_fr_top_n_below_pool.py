@@ -116,6 +116,8 @@ def _run_dry(monkeypatch, capsys, extra_argv):
     argv = ["run_screener_capband_matrix.py", "--dry-run", "--bands", "large",
            "--strategies", "S1",
            "--skip-experts", "FMPEarningsDrift,FMPInsiderClusterBuy,DeterministicScorer",
+           # fmp = the legacy name layout these tests pin (the default alpaca adds a name token)
+           "--ohlcv-history-source", "fmp",
            ] + extra_argv
     monkeypatch.setattr(sys, "argv", argv)
     rc = d.main()

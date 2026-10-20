@@ -120,6 +120,8 @@ def _run_dry(monkeypatch, capsys, extra_argv):
     argv = ["run_screener_capband_matrix.py", "--dry-run", "--bands", "large",
            "--strategies", "S1",
            "--skip-experts", "FMPEarningsDrift,FMPInsiderClusterBuy,DeterministicScorer",
+           # fmp = the legacy name layout these tests pin (the default alpaca adds a name token)
+           "--ohlcv-history-source", "fmp",
            ] + extra_argv
     monkeypatch.setattr(sys, "argv", argv)
     rc = d.main()
@@ -158,3 +160,14 @@ def test_dry_run_with_exclude_symbols_digests_every_job_name(monkeypatch, capsys
     assert len(lines) == 2  # FMPRating S1 + FactorRanker, per --skip-experts above
     for ln in lines:
         assert _DIGEST_RE.search(ln), f"job line missing exclude-symbols digest suffix: {ln!r}"
+
+
+def test_dry_run_history_source_is_part_of_every_job_name(monkeypatch, capsys):
+    """The OHLCV history source is job identity: default alpaca puts ``-hsalpaca`` in every name (before the
+    digest), fmp keeps the legacy name, so an alpaca job never skips as, or resumes the checkpoint of, an fmp job."""
+    monkeypatch.setattr(sys, "argv", ["run_screener_capband_matrix.py", "--dry-run", "--bands", "large",
+                                      "--strategies", "S1", "--decision-times", "fixed",
+                                      "--skip-experts", "FMPEarningsDrift,FMPInsiderClusterBuy,DeterministicScorer"])
+    assert _driver().main() == 0
+    todo = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip().startswith("TODO")]
+    assert todo and all("-hsalpaca" in ln for ln in todo), todo

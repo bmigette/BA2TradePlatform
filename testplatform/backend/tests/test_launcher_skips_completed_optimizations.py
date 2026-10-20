@@ -39,7 +39,9 @@ def _args(**over):
               fitness="consistent_annual_return", universe="AAPL,MSFT",
               start="2020-01-01", end="2025-12-31", run_schedule="daily",
               run_schedule_day="monday", name="sen-S1-goal2020-risk_atr",
-              rerun=False, option_min_volume=0, gates_off=False)
+              rerun=False, option_min_volume=0, gates_off=False,
+              # the completed fixture row predates the history-source stamp, so it ran on fmp
+              ohlcv_history_source="fmp")
     kw.update(over)
     return argparse.Namespace(**kw)
 
