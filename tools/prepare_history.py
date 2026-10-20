@@ -70,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fmp-from", default="2016-01-01", help="first day of the FMP split calendar fetch")
     ap.add_argument("--fmp-to", default="2026-10-13", help="last day of the FMP split calendar fetch")
     ap.add_argument("--overrides", default=st.OVERRIDES_PATH, help="reviewed split overrides (default: %(default)s)")
-    ap.add_argument("--report-dir", help="where prepare_report.json goes (default: <out>/_meta)")
+    ap.add_argument("--report-dir", help="where prepare_history_<source>_report.json goes (default: <out>/_meta)")
     return ap
 
 

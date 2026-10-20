@@ -101,10 +101,16 @@ VERDICT CODES (``VERDICTS``; counted in the printed summary as ``verdict_<code>`
 
 OUTPUTS (``<out>/_meta``, atomic temp + os.replace; read the CSVs with ``read_csv_frame`` -- pandas' default NA parsing
 turns the symbol "NA" into NaN)
-  split_table.json     {asof, inputs_sha256, overrides_sha256, fmp_daily_files {dir, count, sha256 over (name, size,
-                       mtime_ns)}, splits {symbol: [[date, factor], ...]}} events sorted; factor = new/old shares, prices
-                       BEFORE the date are divided by it
-  split_review.csv     REVIEW_COLUMNS: symbol, event_date, alpaca_ratio, fmp_ratio, jump, fmp_step, verdict, applied, reason
+  split_table.json     {run_id, asof, inputs_sha256, overrides_sha256, fmp_daily_files {dir, count, sha256 over (name,
+                       size, mtime_ns), content_sha256 over (name, size, sha256 of the bytes), inputs_csv},
+                       splits {symbol: [[date, factor], ...]}} events sorted; factor = new/old shares, prices BEFORE the
+                       date are divided by it.  Written LAST.
+  RUN COHERENCE        every run has a run_id (UTC timestamp + 8 hex of a hash of the inputs); it is in split_table.json and
+                       the last column ("run_id") of every CSV below.  The CSVs are written first, the table last, so a
+                       crash never leaves a table newer than its CSVs; the cache build checks that the run_ids match.
+  fmp_daily_inputs.csv file, size, mtime_ns, mtime_utc, sha256 (of the bytes) of every FMP daily file read: the record of
+                       exactly which bytes were used (that cache is archived after the build)
+  split_review.csv     REVIEW_COLUMNS (+ run_id): symbol, event_date, alpaca_ratio, fmp_ratio, jump, fmp_step, verdict, applied, reason
   split_accepted.csv   ACCEPTED_COLUMNS: symbol, date, factor, source (alpaca|fmp|both|override), verdict, jump, fmp_step
   split_vs_fmp.csv     COMPARE_COLUMNS: symbol, date, our_factor, fmp_ratio, alpaca_ratio, jump, fmp_step, verdict, class;
                        class agree | ratio_differs | ours_only | fmp_only_accepted (ours and FMP, Alpaca does not list it)
@@ -125,7 +131,7 @@ import sqlite3
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
@@ -986,10 +992,15 @@ def sha256_files(paths: List[str]) -> str:
     return h.hexdigest()
 
 
-def load_fmp_daily(fmp_dir: str, symbols: Iterable[str]) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
-    """The FMP ADJUSTED daily file (``<SYM>_1d.parquet``, Date + Close) of each symbol that has one, and the record of
-    the files read: ``{"dir", "count", "sha256"}`` where sha256 covers (name, size, mtime_ns) of each, sorted -- stored in
-    split_table.json because that cache is archived after the build."""
+FMP_INPUT_COLUMNS = ["file", "size", "mtime_ns", "mtime_utc", "sha256"]
+
+
+def load_fmp_daily(fmp_dir: str, symbols: Iterable[str]
+                   ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any], List[Dict[str, Any]]]:
+    """The FMP ADJUSTED daily file (``<SYM>_1d.parquet``, Date + Close) of each symbol that has one; the summary
+    ``{"dir", "count", "sha256", "content_sha256"}`` (sha256 over name|size|mtime_ns of each file, content_sha256 over
+    name|size|sha256-of-the-bytes) and the per-file records (FMP_INPUT_COLUMNS, sorted by file) -- the record of exactly
+    which bytes were read, kept because that cache is archived after the build."""
     names = sorted(symbols)
 
     def read(sym: str):
@@ -997,26 +1008,31 @@ def load_fmp_daily(fmp_dir: str, symbols: Iterable[str]) -> Tuple[Dict[str, pd.D
         if not os.path.isfile(path):
             return sym, None, None
         stt = os.stat(path)
-        df = pd.read_parquet(path, columns=["Date", "Close"])
-        return sym, df, f"{os.path.basename(path)}|{stt.st_size}|{stt.st_mtime_ns}"
+        with open(path, "rb") as f:
+            raw = f.read()
+        df = pd.read_parquet(io.BytesIO(raw), columns=["Date", "Close"])
+        return sym, df, {"file": os.path.basename(path), "size": len(raw), "mtime_ns": stt.st_mtime_ns,
+                         "mtime_utc": datetime.fromtimestamp(stt.st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                         "sha256": hashlib.sha256(raw).hexdigest()}
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         res = list(ex.map(read, names))
-    h = hashlib.sha256()
-    n = 0
-    for _, df, sig in res:
-        if df is not None:
-            h.update(sig.encode() + b"\n")
-            n += 1
+    records = sorted((r for _, _, r in res if r is not None), key=lambda r: r["file"])
+    meta_h, content_h = hashlib.sha256(), hashlib.sha256()
+    for r in records:
+        meta_h.update(f"{r['file']}|{r['size']}|{r['mtime_ns']}\n".encode())
+        content_h.update(f"{r['file']}|{r['size']}|{r['sha256']}\n".encode())
     return ({sym: df for sym, df, _ in res if df is not None},
-            {"dir": fmp_dir, "count": n, "sha256": h.hexdigest()})
+            {"dir": fmp_dir, "count": len(records), "sha256": meta_h.hexdigest(), "content_sha256": content_h.hexdigest()},
+            records)
 
 
-def _csv_bytes(columns: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> bytes:
+def _csv_bytes(columns: Sequence[str], rows: Iterable[Mapping[str, Any]], run_id: str) -> bytes:
+    """The rows as CSV with the run's ``run_id`` as the last column of every row."""
     buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=list(columns), lineterminator="\n")
+    w = csv.DictWriter(buf, fieldnames=list(columns) + ["run_id"], lineterminator="\n")
     w.writeheader()
-    w.writerows(rows)
+    w.writerows({**r, "run_id": run_id} for r in rows)
     return buf.getvalue().encode("utf-8")
 
 
@@ -1049,7 +1065,7 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     cal_rows = fetch_fmp_calendar(date.fromisoformat(fmp_from), date.fromisoformat(fmp_to), cal_dir, get, stats)
     fmp = fmp_events_from_rows(cal_rows, renames, stats)
     bars, bars_sha = load_store_bars(store, symbols)
-    fmp_daily, fmp_files = load_fmp_daily(fmp_daily_dir, bars)
+    fmp_daily, fmp_files, fmp_records = load_fmp_daily(fmp_daily_dir, bars)
     log(f"loaded {len(bars)} symbols, {len(alpaca)} Alpaca and {len(fmp)} FMP listings, {fmp_files['count']} FMP daily "
         f"files in {time.time() - t0:.0f}s")
 
@@ -1061,16 +1077,21 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     for part in (bars_sha, sha256_files([os.path.join(ca_dir, n) for n in os.listdir(ca_dir)]),
                  sha256_files([os.path.join(cal_dir, n) for n in os.listdir(cal_dir)]), f"{fmp_from}|{fmp_to}"):
         h.update(part.encode())
-    table = {"asof": info["asof"], "inputs_sha256": h.hexdigest(), "overrides_sha256": overrides_sha,
-             "fmp_daily_files": fmp_files, "splits": splits_by_symbol(accepted)}
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id = f"{stamp}-{hashlib.sha256((stamp + h.hexdigest() + overrides_sha + fmp_files['content_sha256']).encode()).hexdigest()[:8]}"
+    table = {"run_id": run_id, "asof": info["asof"], "inputs_sha256": h.hexdigest(), "overrides_sha256": overrides_sha,
+             "fmp_daily_files": {**fmp_files, "inputs_csv": "fmp_daily_inputs.csv"}, "splits": splits_by_symbol(accepted)}
+    # one coherent set: every CSV carries the run_id, and split_table.json is written LAST, so a crash never leaves a table
+    # newer than its CSVs (a reader checks that the run_ids of the table and the CSVs match)
+    atomic_write(os.path.join(meta, "split_review.csv"), _csv_bytes(REVIEW_COLUMNS, review, run_id))
+    atomic_write(os.path.join(meta, "split_accepted.csv"), _csv_bytes(ACCEPTED_COLUMNS, accepted, run_id))
+    atomic_write(os.path.join(meta, "split_vs_fmp.csv"), _csv_bytes(COMPARE_COLUMNS, cmp_rows, run_id))
+    atomic_write(os.path.join(meta, "fmp_daily_inputs.csv"), _csv_bytes(FMP_INPUT_COLUMNS, fmp_records, run_id))
     atomic_write(os.path.join(meta, "split_table.json"), json.dumps(table, indent=1).encode("utf-8"))
-    atomic_write(os.path.join(meta, "split_review.csv"), _csv_bytes(REVIEW_COLUMNS, review))
-    atomic_write(os.path.join(meta, "split_accepted.csv"), _csv_bytes(ACCEPTED_COLUMNS, accepted))
-    atomic_write(os.path.join(meta, "split_vs_fmp.csv"), _csv_bytes(COMPARE_COLUMNS, cmp_rows))
     for (src, verdict), k in sorted(Counter((a["source"], a["verdict"]) for a in accepted).items()):
         stats[f"accepted_{verdict}_from_{src}"] += k
     classes = ("agree", "ratio_differs", "ours_only", "fmp_only_accepted", "fmp_only_rejected")
-    return {"meta": meta, "asof": info["asof"], "symbols_judged": len(bars), "symbols_with_splits": len(table["splits"]),
+    return {"meta": meta, "run_id": run_id, "asof": info["asof"], "symbols_judged": len(bars), "symbols_with_splits": len(table["splits"]),
             "accepted": len(accepted), "review_rows": len(review), "review_applied": sum(r["applied"] for r in review),
             "fmp_daily_files": fmp_files, "stats": dict(sorted(stats.items())),
             "compare": {c: sum(1 for r in cmp_rows if r["class"] == c) for c in classes},

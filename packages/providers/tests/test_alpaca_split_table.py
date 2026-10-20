@@ -540,3 +540,54 @@ def test_csv_reader_keeps_the_symbol_NA(tmp_path):
 def test_every_verdict_code_is_documented_in_the_module_docstring():
     for v in st.VERDICTS:
         assert v in st.__doc__, v
+
+
+def test_stability_waiver_counts_listed_neighbours_even_when_they_are_rejected():
+    # the waiver uses LISTED events of other units, not accepted ones: a neighbour listing that is later rejected
+    # (here: a contradicted 2.0 listing two sessions earlier) still waives the stability check of the main event
+    raw = bars(40, 0.12)
+    f = fmp(raw, {40: 0.1}, wobble={38: 1.05})                  # r jumps 5 % at session 38: an unstable side
+    acc, rev, _ = runf({"X": raw}, {"X": f}, [L("X", D, 0.1)], [L("X", D, 0.1)])
+    assert acc == [] and one(rev, "unresolved")["fmp_step"].endswith("unstable")            # no neighbour: no waiver
+    neighbour = L("X", SESSIONS[38].date(), 2.0)                # flat raw jump there: contradicted, never accepted
+    acc, rev, _ = runf({"X": raw}, {"X": f}, [L("X", D, 0.1), neighbour], [L("X", D, 0.1)])
+    assert [(a["factor"], a["verdict"]) for a in acc] == [(0.1, "proven_by_fmp_step")]
+    assert not any(r["applied"] and r["alpaca_ratio"] == 2.0 for r in rev)             # the neighbour stays unapplied
+
+
+def test_pipeline_outputs_are_one_coherent_set(tmp_path, monkeypatch):
+    store = tmp_path / "store"
+    raw = bars(40, 4.0)
+    d = store / "bars" / "1Day" / "symbol=AA"
+    d.mkdir(parents=True)
+    raw.assign(h=raw["o"], l=raw["o"]).to_parquet(d / "all.parquet")
+    (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2026-10-12"}), encoding="utf-8")
+    (store / "corporate_actions").mkdir()
+    fmpd = tmp_path / "fmpd"
+    fmpd.mkdir()
+    fmp(raw, {40: 4.0}).to_parquet(fmpd / "AA_1d.parquet")
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    (cal / "2021-01-01_2021-01-30.json").write_text("[]", encoding="utf-8")
+    import gzip
+    with gzip.open(store / "corporate_actions" / "ym=2021-01.json.gz", "wt", encoding="utf-8") as f:
+        json.dump({"forward_splits": [{"symbol": "AA", "ex_date": D.isoformat(), "old_rate": 1, "new_rate": 4}]}, f)
+    written = []
+    real = st.atomic_write
+    monkeypatch.setattr(st, "atomic_write", lambda path, data: (written.append(path.replace("\\", "/").rsplit("/", 1)[-1]),
+                                                                real(path, data)))
+    res = st.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01",
+                               fmp_to="2021-01-30", log=lambda m: None)
+    assert written[-1] == "split_table.json" and written.count("split_table.json") == 1       # the table is written LAST
+    meta = out / "_meta"
+    table = json.loads((meta / "split_table.json").read_text(encoding="utf-8"))
+    assert table["run_id"] == res["run_id"] and len(res["run_id"].split("-")[1]) == 8
+    for name in ("split_review.csv", "split_accepted.csv", "split_vs_fmp.csv", "fmp_daily_inputs.csv"):
+        df = st.read_csv_frame(str(meta / name))
+        assert df.columns[-1] == "run_id" and set(df["run_id"]) <= {table["run_id"]}, name
+    inp = st.read_csv_frame(str(meta / "fmp_daily_inputs.csv"))
+    import hashlib
+    assert inp["file"].tolist() == ["AA_1d.parquet"]
+    assert inp["sha256"][0] == hashlib.sha256((fmpd / "AA_1d.parquet").read_bytes()).hexdigest()
+    assert table["fmp_daily_files"]["count"] == 1 and table["fmp_daily_files"]["content_sha256"]
