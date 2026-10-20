@@ -66,6 +66,13 @@ _INTRADAY_INTERVALS = (
     '1min', '5min', '15min', '30min', '1hour', '4hour',
 )
 
+#: ``force_full_refetch(keep_newer_cached_tail=True)``: at most this many cached bars dated after
+#: the vendor's last bar may be kept (a few sessions of vendor lag, not a different history) ...
+KEEP_TAIL_MAX_BARS = 5
+#: ... and the last this-many sessions the two files share must agree within
+#: ``split_basis_overrides.ANCHOR_TOLERANCE`` (the plateau convention's 60-session window).
+KEEP_TAIL_OVERLAP_SESSIONS = 60
+
 
 # --------------------------------------------------------------------------- #
 # Replay capture (spec step 2): OHLCV provenance.
@@ -1157,7 +1164,8 @@ class MarketDataProviderInterface(DataProviderInterface):
 
     def force_full_refetch(self, symbol: str, interval: str = '1d',
                            provider_name: Optional[str] = None, *,
-                           verify=None) -> pd.DataFrame:
+                           verify=None,
+                           keep_newer_cached_tail: bool = False) -> pd.DataFrame:
         """REPLACE (never merge) the cached daily history of ``symbol`` with a fresh full-history
         fetch -- the same 15-year window as the cold fill -- and record the full-fetch marker.
 
@@ -1175,10 +1183,16 @@ class MarketDataProviderInterface(DataProviderInterface):
         anything is written; it raises to refuse the replacement (the verified top-up uses it to
         demand that the re-fetch reproduces the vendor answer that triggered it).
 
+        ``keep_newer_cached_tail`` (opt-in, logged; stage-2 repair 2026-09-25, SATS): when the
+        vendor's history ENDS before the cache's, keep the cache's own bars after the vendor's
+        last one instead of refusing, under the checks of :meth:`_append_newer_cached_tail`
+        (few bars, no split event among them, the shared recent sessions agree). A later FIRST
+        bar or fewer rows overall is still refused.
+
         Raises:
             RuntimeError: the fetch returned nothing, or returned less than the cache already
-                holds, or ``verify`` refused it (the existing file is left untouched in every
-                case)."""
+                holds, or ``verify`` refused it, or a requested tail keep failed its checks (the
+                existing file is left untouched in every case)."""
         from ba2_common.core import native_cache
         from ba2_common.core.split_basis import write_full_fetch_marker
 
@@ -1220,6 +1234,8 @@ class MarketDataProviderInterface(DataProviderInterface):
         if out.empty:
             raise RuntimeError(f"full re-fetch of {symbol} ({interval}) returned only unfinished bars")
         out = out.reset_index(drop=True)
+        if keep_newer_cached_tail and existing_path is not None:
+            out = self._append_newer_cached_tail(out, existing_path, symbol, interval)
         self._refuse_shorter_replacement(out, existing_path, symbol, interval, provider_name)
         if verify is not None:
             verify(out)
@@ -1232,13 +1248,105 @@ class MarketDataProviderInterface(DataProviderInterface):
         self._remember_unfinished_bars(forming, symbol, interval, provider_name)   # only after a verified, written replacement
         return out
 
+    def _append_newer_cached_tail(self, out: pd.DataFrame, existing_path: str, symbol: str,
+                                  interval: str) -> pd.DataFrame:
+        """``out`` plus the cached bars dated after its last bar, or ``RuntimeError``.
+
+        The kept bars must be provably on ``out``'s basis, so every check refuses rather than
+        guesses: at most ``KEEP_TAIL_MAX_BARS`` of them; a split calendar that can be read and
+        holds no event after ``out``'s last bar up to the cache's last bar; the last
+        ``KEEP_TAIL_OVERLAP_SESSIONS`` sessions the two files share agree on the close within
+        ``ANCHOR_TOLERANCE``; every column of ``out`` present in the cached bars."""
+        from ba2_common.core.split_basis_overrides import ANCHOR_TOLERANCE
+
+        try:
+            old = pd.read_parquet(existing_path)
+        except Exception as e:
+            raise RuntimeError(f"full re-fetch of {symbol} ({interval}): the existing cache "
+                               f"{existing_path} could not be read to keep its newer bars ({e}); "
+                               f"refusing.") from e
+        new_last = pd.Timestamp(out['Date'].max())
+        old_dates = pd.to_datetime(old['Date'])
+        tail = old[old_dates > new_last].copy()
+        if tail.empty:
+            return out
+        tail_first = pd.Timestamp(pd.to_datetime(tail['Date']).min())
+        tail_last = pd.Timestamp(pd.to_datetime(tail['Date']).max())
+
+        def refuse(why: str):
+            raise RuntimeError(
+                f"full re-fetch of {symbol} ({interval}): keeping the {len(tail)} cached bar(s) "
+                f"{tail_first.date()}..{tail_last.date()} after the vendor's last bar "
+                f"{new_last.date()} REFUSED -- {why}. The cache file and its split-basis marker "
+                f"are left untouched.")
+
+        if len(tail) > KEEP_TAIL_MAX_BARS:
+            refuse(f"more than {KEEP_TAIL_MAX_BARS} bars is a different history, not vendor lag")
+        missing = [c for c in out.columns if c != 'effective_date' and c not in tail.columns]
+        if missing:
+            refuse(f"the cached bars lack column(s) {missing}")
+        try:
+            splits = self._split_calendar(symbol, interval)
+        except Exception as e:
+            refuse(f"the split calendar could not be read ({type(e).__name__}: {e}), so nothing "
+                   f"proves the kept bars share the fresh file's basis")
+        if splits is None:
+            refuse("this provider has no split calendar to prove the kept bars share the fresh "
+                   "file's basis")
+        in_gap = [s for s in splits if new_last.date() < s.date <= tail_last.date()]
+        if in_gap:
+            refuse(f"split event(s) {[(s.date.isoformat(), s.ratio) for s in in_gap]} fall among "
+                   f"them: they are on another basis than the fresh file")
+
+        def norm(d):
+            d = pd.to_datetime(d)
+            if getattr(d.dt, 'tz', None) is not None:
+                d = d.dt.tz_localize(None)
+            return d.dt.normalize()
+        a = pd.DataFrame({'d': norm(old['Date']), 'c_old': old['Close'].astype(float)})
+        b = pd.DataFrame({'d': norm(out['Date']), 'c_new': out['Close'].astype(float)})
+        shared = a.merge(b, on='d').sort_values('d').tail(KEEP_TAIL_OVERLAP_SESSIONS)
+        if len(shared) < KEEP_TAIL_OVERLAP_SESSIONS:
+            refuse(f"only {len(shared)} shared session(s), fewer than the "
+                   f"{KEEP_TAIL_OVERLAP_SESSIONS} the basis check needs")
+        dev = float((shared['c_new'] / shared['c_old'] - 1.0).abs().max())
+        if not dev <= ANCHOR_TOLERANCE:
+            refuse(f"the last {len(shared)} shared sessions disagree by up to {dev:.2%} "
+                   f"(tolerance {ANCHOR_TOLERANCE:.1%}): the two files are not on one basis "
+                   f"where they meet")
+        tail['effective_date'] = tail['Date']
+        merged = pd.concat([out, tail[list(out.columns)]], ignore_index=True)
+        merged = merged.sort_values('Date').reset_index(drop=True)
+        # Defence in depth: the merged frame itself must show no split-basis break.
+        from ba2_common.core import split_basis as _sb
+        checks = _sb.check_split_basis(norm(merged['Date']).to_numpy(dtype='datetime64[ns]'),
+                                       merged['Open'], merged['High'], merged['Low'],
+                                       merged['Close'], splits, symbol=symbol, marker=None)
+        broken = [c for c in checks if c.verdict in (_sb.VERDICT_DRIFT, _sb.VERDICT_MIXED_BASIS)]
+        if broken:
+            refuse(f"the merged frame fails the split-basis check "
+                   f"({[(c.split_date.isoformat(), c.verdict) for c in broken]})")
+        if not hasattr(self, 'kept_tails'):
+            self.kept_tails = {}
+        self.kept_tails[str(symbol).upper()] = {
+            "count": int(len(tail)), "first": tail_first.date().isoformat(),
+            "last": tail_last.date().isoformat(), "vendor_last": new_last.date().isoformat()}
+        logger.warning(
+            f"full re-fetch of {symbol} ({interval}): the vendor's history ends {new_last.date()}; "
+            f"kept {len(tail)} cached bar(s) {tail_first.date()}..{tail_last.date()} "
+            f"(keep_newer_cached_tail): no split event among them, the last {len(shared)} shared "
+            f"sessions agree within {dev:.2e}")
+        return merged
+
     @staticmethod
     def _refuse_shorter_replacement(out: pd.DataFrame, existing_path: Optional[str], symbol: str,
                                     interval: str, provider_name: str) -> None:
         """Refuse a full-refetch replacement that holds LESS history than the file it replaces.
 
-        Compared on both axes, because either alone can be satisfied by a bad answer: the ROW
-        COUNT (a capped response) and the FIRST BAR (a vendor that shortened its history window).
+        Compared on three axes, because each alone can be satisfied by a bad answer: the ROW
+        COUNT (a capped response), the FIRST BAR (a vendor that shortened its history window) and
+        the LAST BAR (a vendor file that ends earlier -- more old rows must not buy the right to
+        drop the newest ones; ``keep_newer_cached_tail`` is the checked way to keep them).
         A file that cannot be read is not treated as "no history" -- that would turn the one
         failure this guards into a silent pass -- so an unreadable existing file refuses too.
         """
@@ -1256,14 +1364,19 @@ class MarketDataProviderInterface(DataProviderInterface):
         if existing.empty:
             return
         old_rows = len(existing)
-        old_first = pd.Timestamp(pd.to_datetime(existing['Date']).min()).date()
+        old_dates = pd.to_datetime(existing['Date'])
+        new_dates = pd.to_datetime(out['Date'])
+        old_first = pd.Timestamp(old_dates.min()).date()
+        old_last = pd.Timestamp(old_dates.max()).date()
         new_rows = len(out)
-        new_first = pd.Timestamp(pd.to_datetime(out['Date']).min()).date()
-        if new_rows >= old_rows and new_first <= old_first:
+        new_first = pd.Timestamp(new_dates.min()).date()
+        new_last = pd.Timestamp(new_dates.max()).date()
+        if new_rows >= old_rows and new_first <= old_first and new_last >= old_last:
             return
         raise RuntimeError(
             f"full re-fetch of {symbol} ({interval}) returned LESS history than the cache holds "
-            f"({new_rows} rows from {new_first}, cached {old_rows} rows from {old_first}) -- "
+            f"({new_rows} rows from {new_first}, cached {old_rows} rows from {old_first}; last "
+            f"bar {new_last} vs cached {old_last}) -- "
             f"refusing to replace {provider_name}'s cache and lose the difference. This is what "
             f"a capped plan, a partial payload or a shortened vendor window looks like; the "
             f"cache file and its split-basis marker are left untouched.")

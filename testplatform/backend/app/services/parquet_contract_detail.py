@@ -312,7 +312,7 @@ class ParquetContractReader:
 
     # -- the reader contract ---------------------------------------------------
     def latest_bar_on_or_before(self, occ_symbol: str, on_or_before: str) -> Optional[Dict[str, Any]]:
-        from app.services.backtest.option_basis_guard import BasisGuard, OptionSpotBasisMismatch
+        from app.services.backtest.option_basis_guard import OptionSpotBasisMismatch
         from app.services.backtest.parquet_options_provider import _underlying_of
 
         underlying = _underlying_of(occ_symbol)   # the provider's own routing (get_bar)
@@ -327,9 +327,11 @@ class ParquetContractReader:
         bar_day = u.raw.date_of_ord[u.bar_ord_l[i]]
         spot_source = ctx.provider.spot_source
 
-        # The E4 check on THIS bar's session. A fresh guard each time: a guard samples after
-        # its first evaluable session, and every bar shown here must be checked.
-        guard = BasisGuard(spot_source)
+        # The E4 check on THIS bar's session. A fresh guard each time (a guard samples after
+        # its first evaluable session, and every bar shown here must be checked), wired like
+        # the run's own -- split dates and dividend source included -- so a bar the run passed
+        # is not refused here.
+        guard = ctx.provider.new_basis_guard()
         try:
             guard.check(u, underlying, bar_day)
         except OptionSpotBasisMismatch as exc:

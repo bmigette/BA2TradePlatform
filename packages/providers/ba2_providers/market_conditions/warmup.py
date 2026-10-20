@@ -981,6 +981,75 @@ def _fetch_phase(plan_: MarketConditionWarmPlan, source: WarmupSource, concurren
     return errors
 
 
+def _recheck_refetched(plan_: MarketConditionWarmPlan) -> Dict[str, List[Dict[str, Any]]]:
+    """Re-run the split-basis check of every ``refetch_required`` symbol on its file as it is
+    NOW (after the fetch phase), update the plan in place, and return ``{symbol: checks}`` for
+    the ones still not verifiably on one basis."""
+    still: Dict[str, List[Dict[str, Any]]] = {}
+    for inv in plan_.symbols:
+        if inv.refetch_required:
+            snap, _ = _read_snapshot(plan_.cache_root, inv.symbol)
+            events = [CalendarSplit(date.fromisoformat(d), float(r)) for d, r in inv.split_events]
+            checks = _split_checks_for(snap, events, inv.symbol)
+            inv.split_checks = [c.to_dict() for c in checks]
+            inv.refetch_required = any(c.verdict in REFETCH_VERDICTS for c in checks)
+            if inv.refetch_required:
+                still[inv.symbol] = inv.split_checks
+    return still
+
+
+def repair(plan_: MarketConditionWarmPlan, *, source: Optional[WarmupSource] = None, concurrency: int = 4,
+           log: Callable[[str], None] = _log_noop) -> Dict[str, Any]:
+    """The FMP repair step ALONE (stage-2 data repair, 2026-09-26): the fetch phase ``build``
+    runs with ``fetch_missing`` -- a FULL re-fetch of every ``refetch_required`` symbol, a range
+    fetch of missing coverage -- then the same split-basis re-check. Nothing is built or
+    published, so it can run before the other data steps and the manifests are built later,
+    cache-only, from the repaired files.
+
+    Returns a JSON-able report; ``ok`` is False when a fetch failed or a symbol is still not
+    verifiably on one basis (``still_refused``: its checks). Those need a human decision: a
+    split-basis override with anchors, a vendor re-try (``keep_newer_cached_tail`` for a vendor
+    file that ends early), or an exclusion. A symbol whose split calendar cannot be read is
+    listed under ``split_calendar_errors`` and is not fetched."""
+    t0 = time.monotonic()
+    fatal = plan_.fatal_preflight_errors()
+    if fatal:
+        # Like ``build``: a failed source certification means nothing here can be trusted to fix
+        # it -- fetch nothing.
+        log(f"repair refused: preflight failed: {fatal}")
+        return {"ok": False, "profile": plan_.profile, "fatal_preflight_errors": fatal,
+                "refetched": [], "range_fetched": [], "fetch_errors": {}, "still_refused": {},
+                "split_calendar_errors": {}, "kept_tails": {}, "provider_calls": 0,
+                "provider_bytes": 0, "elapsed_s": round(time.monotonic() - t0, 3)}
+    if source is None:
+        from ba2_providers.market_conditions.fmp_source import FMPWarmupSource
+        source = FMPWarmupSource(plan_.cache_root)
+    calls0, bytes0 = source.calls, source.bytes
+    counters = _Counters()
+    kinds = {inv.symbol: ("full" if inv.refetch_required else "range" if inv.fetch_needed else None)
+             for inv in plan_.symbols}
+    fetch_errors = _fetch_phase(plan_, source, concurrency, counters, log)
+    still = _recheck_refetched(plan_)
+    cal_errors = {inv.symbol: inv.split_calendar_error for inv in plan_.symbols if inv.split_calendar_error}
+    report = {
+        "ok": not fetch_errors and not still and not cal_errors,
+        "profile": plan_.profile,
+        "refetched": sorted(s for s, k in kinds.items() if k == "full" and s not in fetch_errors),
+        "range_fetched": sorted(s for s, k in kinds.items() if k == "range" and s not in fetch_errors),
+        "fetch_errors": dict(sorted(fetch_errors.items())),
+        "still_refused": dict(sorted(still.items())),
+        "split_calendar_errors": dict(sorted(cal_errors.items())),
+        "fatal_preflight_errors": [],
+        "kept_tails": dict(sorted((getattr(source, "kept_tails", None) or {}).items())),
+        "provider_calls": int(source.calls - calls0),
+        "provider_bytes": int(source.bytes - bytes0),
+        "elapsed_s": round(time.monotonic() - t0, 3),
+    }
+    log(f"repair: {len(report['refetched'])} re-fetched, {len(report['range_fetched'])} topped up, "
+        f"{len(fetch_errors)} failed, {len(still)} still refused")
+    return report
+
+
 @dataclass
 class _SymbolResult:
     symbol: str
@@ -1293,15 +1362,8 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
     excluded: Dict[str, List[Dict[str, Any]]] = {}
     if blocking and fetch_missing:
         fetch_errors = _fetch_phase(plan_, source, concurrency, counters, log)
-        for inv in plan_.symbols:
-            if inv.refetch_required:
-                snap, _ = _read_snapshot(plan_.cache_root, inv.symbol)
-                events = [CalendarSplit(date.fromisoformat(d), float(r)) for d, r in inv.split_events]
-                checks = _split_checks_for(snap, events, inv.symbol)
-                inv.split_checks = [c.to_dict() for c in checks]
-                inv.refetch_required = any(c.verdict in REFETCH_VERDICTS for c in checks)
-                if inv.refetch_required:
-                    excluded[inv.symbol] = [{"kind": "split_basis_unverified", "checks": inv.split_checks}]
+        for sym, checks in _recheck_refetched(plan_).items():
+            excluded[sym] = [{"kind": "split_basis_unverified", "checks": checks}]
     for inv in plan_.symbols:
         if inv.split_calendar_error:
             excluded[inv.symbol] = [{"kind": "split_calendar_unavailable", "error": inv.split_calendar_error}]

@@ -47,7 +47,7 @@ import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ba2_common.core.interfaces.OptionsDataProviderInterface import OptionEodBar
 from ba2_common.logger import logger
@@ -111,9 +111,64 @@ class OptionHistoryParquetStore:
     )
 
     def __init__(self, root: Optional[str] = None,
-                 clock: Optional[Callable[[], datetime]] = None):
+                 clock: Optional[Callable[[], datetime]] = None, *,
+                 manifest_extra: Optional[Callable[[str], dict]] = None,
+                 stale_reason: Optional[Callable[..., Optional[str]]] = None,
+                 empty_overwrite_ok: Optional[Callable[[str, date], bool]] = None):
+        """``manifest_extra(underlying)`` adds fields to every manifest this store writes, and
+        ``stale_reason(underlying, expiry, manifest, bar_range)`` (``bar_range()`` reads the
+        partition's (first, last) bar dates lazily, None when it holds no bar) may declare a
+        finished partition STALE -- a WRITER's hooks (the ThetaData warm passes the
+        root-history ones, ``thetadata.parquet_store_hooks``); a reader passes neither and
+        sees exactly the old behaviour. Reasons are kept in ``stale_reasons``.
+
+        ``empty_overwrite_ok(underlying, old_first_bar, old_last_bar)``: with it, an EMPTY
+        write over a partition that holds rows is refused unless the hook allows it (rows all
+        inside a None-root segment). The old file and manifest stay (not signed) and the partition
+        is listed in ``kept_nonempty`` -- a vendor hiccup or a wrong alias must not erase data."""
         self._root = root
         self._clock = clock or _utcnow
+        self._manifest_extra = manifest_extra
+        self._stale_reason = stale_reason
+        self._empty_overwrite_ok = empty_overwrite_ok
+        self.stale_reasons: Dict[Tuple[str, date], str] = {}
+        self.kept_nonempty: Dict[Tuple[str, date], str] = {}
+
+    def manifest_extra(self, underlying: str) -> dict:
+        return dict(self._manifest_extra(underlying.upper())) if self._manifest_extra else {}
+
+    def bar_range(self, underlying: str, expiry: date) -> Optional[Tuple[date, date]]:
+        """(first, last) ``bar_date`` of a partition, or None when it holds no bar."""
+        path = self.bars_path(underlying, expiry)
+        if not os.path.exists(path):
+            return None
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
+        col = pq.read_table(path, columns=["bar_date"]).column("bar_date")
+        if len(col) == 0:
+            return None
+        mm = pc.min_max(col).as_py()
+
+        def _d(v):
+            if isinstance(v, str):
+                return date.fromisoformat(v[:10])
+            return v.date() if isinstance(v, datetime) else v
+        return _d(mm["min"]), _d(mm["max"])
+
+    def first_bar_date(self, underlying: str, expiry: date) -> Optional[date]:
+        """The earliest ``bar_date`` of a partition, or None when it holds no bar."""
+        path = self.bars_path(underlying, expiry)
+        if not os.path.exists(path):
+            return None
+        import pyarrow.parquet as pq
+        col = pq.read_table(path, columns=["bar_date"]).column("bar_date")
+        if len(col) == 0:
+            return None
+        import pyarrow.compute as pc
+        v = pc.min(col).as_py()
+        if isinstance(v, str):                     # bar_date is stored as an ISO string
+            return date.fromisoformat(v[:10])
+        return v.date() if isinstance(v, datetime) else v
 
     # -- layout ---------------------------------------------------------
     @property
@@ -157,6 +212,12 @@ class OptionHistoryParquetStore:
         got_start, got_end = m.get("start"), m.get("end")
         if not got_start or not got_end:
             return PartitionState.STALE
+        if self._stale_reason is not None:
+            u = underlying.upper()
+            why = self._stale_reason(u, expiry, m, lambda: self.bar_range(u, expiry))
+            if why:
+                self.stale_reasons[(u, expiry)] = why
+                return PartitionState.STALE
         # THE END WE NEED IS min(end, expiry), NOT end. A contract cannot print a bar
         # after it expires, so once a partition has been fetched through its own expiry
         # it is FINAL -- a later window end asks for days on which this contract did not
@@ -222,6 +283,16 @@ class OptionHistoryParquetStore:
         underlying = underlying.upper()
         d = self.partition_dir(underlying, expiry)
         os.makedirs(d, exist_ok=True)
+        if not bars and self._empty_overwrite_ok is not None:
+            old = self.read_manifest(underlying, expiry)
+            if old and old.get("status") == "complete" and os.path.exists(self.bars_path(underlying, expiry)):
+                rng = self.bar_range(underlying, expiry)
+                last = rng[1] if rng else None
+                if rng is not None and not self._empty_overwrite_ok(underlying, *rng):
+                    why = (f"the re-fetch returned no row for a partition holding {old.get('rows')} "
+                           f"row(s) to {last}: kept, not overwritten or signed")
+                    self.kept_nonempty[(underlying, expiry)] = why
+                    return dict(old, kept_old=why)
 
         bars_path = self.bars_path(underlying, expiry)
         if bars:
@@ -261,6 +332,7 @@ class OptionHistoryParquetStore:
             "empty_contracts": sorted(empty_contracts),
             "written_at": self._clock().isoformat(),
         }
+        manifest.update(self.manifest_extra(underlying))
         self._write_manifest(underlying, expiry, manifest)
         return manifest
 

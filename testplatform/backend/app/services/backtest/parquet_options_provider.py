@@ -1250,7 +1250,8 @@ class ParquetOptionsProvider:
 
     def __init__(self, root: str, *, spot_source: Callable[[str, date], Optional[float]],
                  risk_free_rate: Any, spot_scope: str, basis_guard: bool = False,
-                 basis_guard_split_dates: Optional[Callable[[str], Any]] = None):
+                 basis_guard_split_dates: Optional[Callable[[str], Any]] = None,
+                 basis_guard_dividends: Optional[Callable[[str, Any], Any]] = None):
         """``spot_scope`` — the identity of what ``spot_source`` will answer.
 
         REQUIRED, and it is the one non-obvious argument. The worker-level cache holds the
@@ -1302,9 +1303,18 @@ class ParquetOptionsProvider:
         #: (``options_store.build_options_provider`` sets it whenever the run has a split
         #: basis), off for fixture readers whose synthetic chains imply no spot. Per run.
         self._basis_guard = None
+        self._guard_split_dates = basis_guard_split_dates
+        self._guard_dividends = basis_guard_dividends
         if basis_guard:
-            from .option_basis_guard import BasisGuard
-            self._basis_guard = BasisGuard(spot_source, split_dates=basis_guard_split_dates)
+            self._basis_guard = self.new_basis_guard()
+
+    def new_basis_guard(self):
+        """A FRESH E4 guard wired exactly like this run's (spot, split dates, dividend source):
+        what a view that re-checks a single bar (``parquet_contract_detail``) must use, so it
+        never refuses a bar the run passed."""
+        from .option_basis_guard import BasisGuard
+        return BasisGuard(self.spot_source, split_dates=self._guard_split_dates,
+                          dividends=self._guard_dividends)
 
     def basis_guard_stats(self) -> Optional[Dict[str, Any]]:
         """This run's E4 guard counters and time spent (None when the guard is off)."""
