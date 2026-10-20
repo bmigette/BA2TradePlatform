@@ -91,7 +91,7 @@ def root(tmp_path):
 @pytest.fixture
 def tool(monkeypatch):
     m = _tool()
-    monkeypatch.setattr(m, "make_source", lambda cache_root, history_source: _NoFetchSource())
+    monkeypatch.setattr(m, "make_source", lambda cache_root, history_source, **kw: _NoFetchSource())
     # The flag is REQUIRED on the real CLI; these tests are about everything else, so they run on fmp.
     # ``main_raw`` is the real entry point (the flag tests below use it).
     m.main_raw = m.main
@@ -444,3 +444,69 @@ def test_identical_bars_of_two_sources_are_never_offered_as_reusable_rows(tool, 
     assert tool.main_raw(_vendor_plan_args(root, universe_file, out2, "alpaca")) == 0
     capsys.readouterr()
     assert sum(s["rows_reusable"] for s in json.loads(Path(out2).read_text())["symbols"]) == 0
+
+
+# ----------------------------------------------------------------- repair (stage-2, 2026-09-26)
+def test_repair_with_nothing_to_repair_exits_zero_and_fetches_nothing(tool, root, universe_file,
+                                                                       tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(tool, "us_session_open", lambda: False)
+    out = str(tmp_path / "plan.json")
+    assert tool.main(_plan_args(root, universe_file, out) + ["--ohlcv-history-source", "fmp"]) == 0
+    capsys.readouterr()
+    assert tool.main(["--quiet", "repair", "--ohlcv-history-source", "fmp", "--plan", out]) == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["ok"] and rep["refetched"] == [] and rep["still_refused"] == {}
+
+
+def test_repair_says_a_rerun_after_the_close_is_required_when_the_session_was_open(
+        tool, root, universe_file, tmp_path, monkeypatch, capsys):
+    out = str(tmp_path / "plan.json")
+    assert tool.main(_plan_args(root, universe_file, out) + ["--ohlcv-history-source", "fmp"]) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(tool, "us_session_open", lambda: True)
+    assert tool.main(["--quiet", "repair", "--ohlcv-history-source", "fmp", "--plan", out, "--allow-open-session"]) == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["rerun_after_close_required"] is True
+
+
+def test_repair_refuses_while_the_us_session_is_open_unless_allowed(tool, root, universe_file,
+                                                                     tmp_path, monkeypatch, capsys):
+    """A full re-fetch during the session stores that day's PARTIAL bar (stage-2 pass A). The
+    repair waits for the close unless the operator says otherwise."""
+    out = str(tmp_path / "plan.json")
+    assert tool.main(_plan_args(root, universe_file, out) + ["--ohlcv-history-source", "fmp"]) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(tool, "us_session_open", lambda: True)
+    assert tool.main(["--quiet", "repair", "--ohlcv-history-source", "fmp", "--plan", out]) == 2
+    assert "session" in capsys.readouterr().err
+    assert tool.main(["--quiet", "repair", "--ohlcv-history-source", "fmp", "--plan", out, "--allow-open-session"]) == 0
+
+
+def test_repair_hands_the_tail_keep_to_the_source(tool, root, universe_file, tmp_path, monkeypatch, capsys):
+    seen = []
+
+    def make(cache_root, history_source, **kw):
+        seen.append(kw)
+        return _NoFetchSource()
+
+    monkeypatch.setattr(tool, "make_source", make)
+    monkeypatch.setattr(tool, "us_session_open", lambda: False)
+    out = str(tmp_path / "plan.json")
+    assert tool.main(_plan_args(root, universe_file, out) + ["--ohlcv-history-source", "fmp"]) == 0
+    seen.clear()
+    capsys.readouterr()
+    assert tool.main(["--quiet", "repair", "--ohlcv-history-source", "fmp", "--plan", out, "--keep-newer-cached-tail", "sats,Xyz"]) == 0
+    assert seen == [{"keep_newer_cached_tail": ["SATS", "XYZ"]}]
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["keep_newer_cached_tail"] == ["SATS", "XYZ"] and rep["kept_tails"] == {}
+
+
+def test_repair_refuses_alpaca_and_needs_the_flag(tool, root, universe_file, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(tool, "us_session_open", lambda: False)
+    out = str(tmp_path / "plan.json")
+    assert tool.main(_plan_args(root, universe_file, out) + ["--ohlcv-history-source", "fmp"]) == 0
+    capsys.readouterr()
+    assert tool.main_raw(["--quiet", "repair", "--plan", out]) == 2                 # flag missing
+    capsys.readouterr()
+    assert tool.main(["--quiet", "repair", "--plan", out, "--ohlcv-history-source", "alpaca"]) == 2
+    assert "prepare_history.py" in capsys.readouterr().err

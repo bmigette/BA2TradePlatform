@@ -15,6 +15,7 @@ from ba2_common.core.types import (
     OrderRecommendation, ExpertEventType, ExpertActionType, OptionCloseReason, AssetClass,
     get_option_action_values,
     get_option_entry_action_values,
+    ACTION_ADJUST_TP_SL,
 )
 from ba2_common.core.db import get_db, get_instance, InstanceNotFound
 from ba2_common.logger import logger
@@ -658,7 +659,7 @@ class TradeActionEvaluator:
                     from ba2_common.core.utils import log_trade_action_activity
                     expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
                     log_trade_action_activity(
-                        action_type=str(action_type),
+                        action_type=action_type,
                         symbol=self.instrument_name,
                         account_id=self.account.id,
                         expert_id=expert_id,
@@ -884,7 +885,9 @@ class TradeActionEvaluator:
                                     }
                                     action_results.append(result_dict)
                                     log_trade_action_activity(
-                                        action_type=str(ExpertActionType.ADJUST_TAKE_PROFIT),
+                                        # Log what was actually adjusted: a kept stop means only the TP moved.
+                                        action_type=(ExpertActionType.ADJUST_TAKE_PROFIT if sl_kept
+                                                     else ACTION_ADJUST_TP_SL),
                                         symbol=self.instrument_name,
                                         account_id=self.account.id,
                                         expert_id=expert_id,
@@ -933,7 +936,7 @@ class TradeActionEvaluator:
                                 }
                                 action_results.append(result_dict)
                                 log_trade_action_activity(
-                                    action_type=str(action_type),
+                                    action_type=action_type,
                                     symbol=self.instrument_name,
                                     account_id=self.account.id,
                                     expert_id=expert_id,
@@ -977,7 +980,7 @@ class TradeActionEvaluator:
                     from ba2_common.core.utils import log_trade_action_activity
                     expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
                     log_trade_action_activity(
-                        action_type=str(action_type),
+                        action_type=action_type,
                         symbol=self.instrument_name,
                         account_id=self.account.id,
                         expert_id=expert_id,

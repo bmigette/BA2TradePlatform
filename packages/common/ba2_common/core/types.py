@@ -714,6 +714,57 @@ class ActivityLogType(str, Enum):
     TRADE_ACTION_OPEN = "trade_action_open"
     TRADE_ACTION_NEW = "trade_action_new"
 
+_ACTIVITY_TYPE_LABELS = {
+    ActivityLogType.TRADE_ACTION_OPEN.value: "Trade Action (Open Position)",
+    ActivityLogType.TRADE_ACTION_NEW.value: "Trade Action (New Entry)",
+    ActivityLogType.TP_SL_ADJUSTED.value: "TP/SL Adjusted",
+}
+
+
+def get_activity_type_display_label(activity_type):
+    """User-facing label for an ``ActivityLogType`` (or its value string).
+
+    The single place the Activity Monitor gets its type labels from. Types without an explicit
+    entry keep the generic title-case of their value.
+    """
+    value = activity_type.value if isinstance(activity_type, ActivityLogType) else activity_type
+    try:
+        return _ACTIVITY_TYPE_LABELS[value]
+    except KeyError:
+        return value.replace("_", " ").title()
+
+
+# Pseudo action for ONE merged TP+SL adjust call (no ExpertActionType member exists for it and the
+# enum is stored in the DB, so it is not added there). Accepted only by the trade-action activity log.
+ACTION_ADJUST_TP_SL = "adjust_tp_sl"
+
+_TRADE_ACTION_LABELS = {
+    ExpertActionType.BUY.value: "Buy",
+    ExpertActionType.SELL.value: "Sell",
+    ExpertActionType.CLOSE.value: "Close",
+    ExpertActionType.ADJUST_TAKE_PROFIT.value: "Adjust Take Profit",
+    ExpertActionType.ADJUST_STOP_LOSS.value: "Adjust Stop Loss",
+    ACTION_ADJUST_TP_SL: "Adjust TP/SL",
+}
+
+
+def get_trade_action_display_label(action):
+    """Readable label for an ``ExpertActionType`` (or its value, or ``ACTION_ADJUST_TP_SL``).
+
+    Raises ``ValueError`` for anything that is not a known action: a bad action type is a
+    programming error and must not be logged as garbage text.
+    """
+    value = action.value if isinstance(action, ExpertActionType) else action
+    if isinstance(value, str) and value in _TRADE_ACTION_LABELS:
+        return _TRADE_ACTION_LABELS[value]
+    if isinstance(value, str):
+        try:
+            return ExpertActionType(value).value.replace("_", " ").title()
+        except ValueError:
+            pass
+    raise ValueError(f"Unknown trade action type for activity log: {action!r}")
+
+
 def get_reference_value_options():
     """Return dictionary of reference value options with user-friendly labels."""
     return {

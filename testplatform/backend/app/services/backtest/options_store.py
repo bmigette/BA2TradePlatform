@@ -320,7 +320,44 @@ def build_options_provider(config: Dict[str, Any], *, price_source: Any, split_b
         risk_free_rate=rate,
         spot_scope=spot_scope(config, split_basis),
         basis_guard=split_basis is not None,
-        basis_guard_split_dates=None if split_basis is None else _split_dates_of(split_basis))
+        basis_guard_split_dates=None if split_basis is None else _split_dates_of(split_basis),
+        basis_guard_dividends=None if split_basis is None else _dividends_of(split_basis))
+
+
+#: How far past a session the guard's dividend source looks (the carry separation uses the two
+#: nearest usable expiries, well inside this).
+_DIVIDEND_HORIZON_DAYS = 400
+
+
+def _dividends_of(split_basis: Any):
+    """``(symbol, session) -> [DividendRow(ex-date, amount in the session's as-traded basis or
+    None, declaration date or None)]`` for the guard's carry separation
+    (``option_basis_guard``), or None when the symbol has no cached dividend calendar.
+    ``adjDividend`` is split-adjusted like the FMP close, so it is converted with the run's
+    as-traded factor of the session -- the spot's own conversion. Every row with an ex-date in
+    (session, session + horizon] is served WITH its declaration date: the carry measure reads
+    the calendar as of the session (a row declared later is not added back; one of unknown
+    declaration refuses). Calendars are read once per symbol per run."""
+    from datetime import timedelta
+    from ba2_common.core.option_carry import DividendRow
+    from .option_split_basis import load_cached_dividend_calendar
+
+    cache: Dict[str, Any] = {}
+
+    def dividends(symbol: str, session: date):
+        sym = str(symbol).upper()
+        if sym not in cache:
+            cache[sym] = load_cached_dividend_calendar(sym)
+        cal = cache[sym]
+        if cal is None:
+            return None
+        horizon = session + timedelta(days=_DIVIDEND_HORIZON_DAYS)
+        rows = [r for r in cal if session < r[0] <= horizon]
+        if not rows:
+            return []
+        f = float(split_basis.factor(sym, session))
+        return [DividendRow(d, None if a is None else a * f, decl) for d, a, decl in rows]
+    return dividends
 
 
 def _split_dates_of(split_basis: Any):

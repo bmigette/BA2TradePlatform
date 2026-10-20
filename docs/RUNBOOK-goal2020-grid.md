@@ -564,7 +564,7 @@ prefix, an unconfirmed pivot). If the refusal names a symbol with "no usable obs
 anywhere", that symbol belongs out of the universe (as SPCX now is) or needs its source history
 repaired. If a future universe change reintroduces uncovered symbols, the two ways forward are
 the same: re-fetch
-(`warm_market_conditions.py build --plan <plan> --fetch-missing`, a real provider bill — size it
+(`warm_market_conditions.py build --plan <plan> --fetch-missing --ohlcv-history-source fmp`, a real provider bill — size it
 with `plan` first), then re-publish and re-pin; or trim the universe to the covered set and pass
 that file to the driver.
 
@@ -682,7 +682,7 @@ pinning it, and renew it as dates advance.
   as such.
 * **Live refresh reports split-basis drift; it does not automatically replace history.** The
   automatic repair was reversed by operator decision. Inventory the live universe with
-  `warm_market_conditions.py plan`, then use the explicit warmup `--fetch-missing` repair path
+  `warm_market_conditions.py plan --ohlcv-history-source fmp`, then use the explicit warmup `--fetch-missing` repair path
   when required. That path can call `force_full_refetch`; the earlier option-universe repair
   involved 13 symbols. Do not assume restarting the platform repairs the source cache.
 * Market leaves are refused on open-positions / exit rulesets, and an unresolved mode gene is
