@@ -971,7 +971,7 @@ def test_spinoff_events_follow_name_changes():
                             "source_rate": 1}], "name_changes": [{"old_symbol": "OLD", "new_symbol": "NEW", "process_date": "2021-01-04"}]}
     ren = st.build_rename_map([month])
     stats = Counter()
-    assert st.spinoff_events_from_actions([month], ren, stats) == [SpinOff("NEW", date(2020, 3, 2), "KID", 0.4)]
+    assert st.spinoff_events_from_actions([month], ren, stats) == [SpinOff("NEW", date(2020, 3, 2), "KID", 0.4, "KID")]
     assert stats["alpaca_spin_offs"] == 1
     with pytest.raises(st.SplitTableBuildError):
         st.spinoff_events_from_actions([{"spin_offs": [{"source_symbol": "A", "new_symbol": "B", "ex_date": "2020-03-02",
@@ -1193,3 +1193,94 @@ def test_build_records_the_yahoo_inputs(tmp_path):
     assert inp["symbol"].tolist() == ["CC"] and inp["status"].tolist() == ["ok"] and inp["run_id"][0] == table["run_id"]
     sb.build_split_table(**kw, yahoo_fetch=fake_yahoo({}, calls), yahoo_sleep=lambda s: None)       # offline rerun: no new fetch
     assert calls == ["CC"]
+
+
+# ---- spun-off companies: lookup, -WI, CVR / warrant / right, FMP-step fallback, the missing list -------------------------
+def test_cvr_warrant_right_classification():
+    f = st.is_cvr_warrant_right
+    assert f("092CVR018", "P", False) and f("67012E104", "P", True)                # 9-char CUSIP-like with a digit
+    assert f("ABC-WS", "P", True) and f("OPENW", "OPEN", True) and f("OPENZ", "OPEN", True) and f("OPENL", "OPEN", False)
+    assert f("DFDVW", "DFDV", True) and f("SAVAW", "AAA", False) and f("XRXDW", "XRX", False)
+    assert not f("SAVAW", "AAA", True)                      # ends in W but has bars: a real company
+    assert not f("KLG", "K", False) and not f("ABCDEFGHI", "P", False)       # no digit: not CUSIP-like
+    assert not f("APE", "AMC", False) and not f("VYLR", "CTVA", False) and not f("TOOLONGW", "P", False)
+
+
+def test_cvr_warrant_spinoffs_are_counted_not_adjusted_and_have_no_row():
+    raw = parent_bars()
+    for sec in ("092CVR018", "S-WS", "PW", "SAVAW"):
+        acc, rev, stats, _ = run_so({"P": raw}, None, spin=(SpinOff("P", D, sec, 1.0),))
+        assert acc == [] and rev == [] and stats["verdict_spinoff_not_adjusted_cvr_warrant"] == 1, sec
+    # a same-ticker spin-off stays a refused review row
+    acc, rev, _, _ = run_so({"P": raw}, None, spin=(SpinOff("P", D, "P", 1.0),))
+    assert acc == [] and one(rev, "spinoff_no_spinco_price")
+
+
+def test_spinco_bars_are_read_for_any_symbol_in_the_store_and_wi_maps_to_the_base_ticker():
+    raw = parent_bars()
+    stats = Counter()
+    acc, _ = st.decide_splits({"P": raw}, [], [], [], stats, spinoffs=[SO], spinco_frame=lambda s: spinco_bars() if s == "S" else None)
+    assert [a["kind"] for a in acc] == ["spinoff"]                       # S is not among the judged symbols
+    ren = st.build_rename_map([{}])
+    month = {"spin_offs": [{"source_symbol": "P", "new_symbol": "AIRC.WI", "ex_date": "2020-12-15", "new_rate": 1, "source_rate": 1}]}
+    assert st.spinoff_events_from_actions([month], ren)[0].spinco == "AIRC"
+    # a CUSIP-like id that a name change maps to a ticker is still a CUSIP: judged BEFORE the mapping (INPX -> 23248B208 -> CXAI)
+    m2 = {"spin_offs": [{"source_symbol": "P", "new_symbol": "23248B208", "ex_date": "2020-12-15", "new_rate": 1, "source_rate": 1}],
+          "name_changes": [{"old_symbol": "23248B208", "new_symbol": "CXAI", "process_date": "2023-01-02"}]}
+    so = st.spinoff_events_from_actions([m2], st.build_rename_map([m2]))[0]
+    assert so.spinco == "CXAI" and so.security == "23248B208"
+    acc, rev, stats, _ = run_so({"P": raw, "CXAI": spinco_bars()}, None, spin=(so,))
+    assert acc == [] and rev == [] and stats["verdict_spinoff_not_adjusted_cvr_warrant"] == 1
+
+
+def test_spinoff_without_a_spinco_price_uses_a_non_flat_fmp_step_as_the_factor():
+    raw = parent_bars()
+    acc, rev, stats, _ = run_so({"P": raw}, {"P": fmp(raw, {40: 1.2})})                 # no S bars at all
+    assert [(a["verdict"], a["factor"], a["kind"], a["source"]) for a in acc] == [("spinoff_from_fmp_step", pytest.approx(1.2),
+                                                                                    "spinoff", "fmp_step")]
+    assert one(rev, "spinoff_from_fmp_step")["applied"] is True and stats["verdict_spinoff_from_fmp_step"] == 1
+    for fd in ({"P": fmp(raw)}, None, {"P": fmp(raw, {40: 0.8})}):                       # flat / no data / a step below 1
+        acc, rev, _, _ = run_so({"P": raw}, fd)
+        assert acc == [] and one(rev, "spinoff_no_spinco_price")["applied"] is False
+    acc, rev, _, _ = run_so({"P": raw}, {"P": fmp(raw, {40: 1.2})}, spin=(SpinOff("P", D, "P", 1.0),))   # same ticker: no fallback
+    assert acc == [] and one(rev, "spinoff_no_spinco_price")
+
+
+def test_missing_spincos_lists_only_real_tickers_without_bars():
+    raw = parent_bars()
+    missing = set()
+    spins = [SpinOff("P", D, "S", 0.5), SpinOff("P", D, "GONE", 0.5), SpinOff("P", D, "P", 1.0), SpinOff("P", D, "GONEW", 1.0),
+             SpinOff("P", D, "092CVR018", 1.0), SpinOff("P", D, "PW", 1.0)]
+    st.decide_splits({"P": raw, "S": spinco_bars()}, [], [], [], Counter(), spinoffs=spins, missing_spincos=missing)
+    assert missing == {"GONE"}
+
+
+def test_build_writes_the_missing_spinco_list(tmp_path):
+    store = tmp_path / "store"
+    for sym, frame in (("P", parent_bars()),):
+        d = store / "bars" / "1Day" / f"symbol={sym}"
+        d.mkdir(parents=True)
+        frame.assign(h=frame["o"], l=frame["o"]).to_parquet(d / "all.parquet")
+    d = store / "bars" / "1Day" / "symbol=S"                    # present in the store but NOT in a symbols list: still found
+    d.mkdir(parents=True)
+    spinco_bars().assign(h=1.0, l=1.0).to_parquet(d / "all.parquet")
+    (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2021-03-31"}), encoding="utf-8")
+    (store / "corporate_actions").mkdir()
+    with _gzip.open(store / "corporate_actions" / "ym=2021-03.json.gz", "wt", encoding="utf-8") as f:
+        json.dump({"forward_splits": [{"symbol": "S", "ex_date": "2021-03-31", "old_rate": 1, "new_rate": 2}],
+                   "spin_offs": [{"source_symbol": "P", "new_symbol": "S", "ex_date": D.isoformat(), "new_rate": 0.5, "source_rate": 1},
+                                 {"source_symbol": "P", "new_symbol": "OTCX", "ex_date": D.isoformat(), "new_rate": 0.1, "source_rate": 1},
+                                 {"source_symbol": "P", "new_symbol": "P.WS", "ex_date": D.isoformat(), "new_rate": 1, "source_rate": 1}]}, f)
+    fmpd = tmp_path / "fmpd"
+    fmpd.mkdir()
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    for w in ("2021-01-01_2021-01-30", "2021-01-31_2021-03-01", "2021-03-02_2021-03-31", "2021-04-01_2021-04-01"):
+        (cal / f"{w}.json").write_text("[]", encoding="utf-8")
+    res = sb.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01",
+                               fmp_to="2021-04-01", log=lambda m: None, symbols=["P"])
+    lines = (out / "_meta" / "spinco_symbols_missing.txt").read_text(encoding="utf-8").splitlines()
+    table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
+    assert lines[0] == f"# run_id: {table['run_id']}" and [x for x in lines if not x.startswith("#")] == ["OTCX"]
+    assert table["spinoffs"] == {"P": [[D.isoformat(), 1.125]]} and res["spinco_symbols_missing"] == 1

@@ -366,10 +366,19 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
         f"files in {time.time() - t0:.0f}s")
 
     breaks: Dict[str, List[str]] = {}
+    missing_spincos: set = set()
+    bars_dir = os.path.join(store, "bars", "1Day")
+
+    def spinco_frame(sym: str) -> Optional[pd.DataFrame]:
+        """ANY symbol whose bars exist in the store's bars dir (not only those judged / in symbols.txt)"""
+        path = os.path.join(bars_dir, f"symbol={sym}", "all.parquet")
+        return pd.read_parquet(path, columns=["t", "o", "c"]) if os.path.isfile(path) else None
+
     yahoo = YahooSplitSource(os.path.join(meta, "yahoo_splits"), renames, refresh=refresh_yahoo,
                              fetch=yahoo_fetch or yfinance_fetch, sleep=yahoo_sleep, min_interval=yahoo_min_interval)
     accepted, review = decide_splits(bars, alpaca, fmp, overrides, stats, fmp_daily=fmp_daily, breaks=breaks,
-                                     spinoffs=spinoffs, yahoo=yahoo)
+                                     spinoffs=spinoffs, yahoo=yahoo, spinco_frame=spinco_frame,
+                                     missing_spincos=missing_spincos)
     yahoo_rows, yahoo_files = yahoo.inputs()
     stats["yahoo_symbols_consulted"] = len(yahoo_rows)
     stats["yahoo_symbols_fetched"] = yahoo.fetched
@@ -391,6 +400,9 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     atomic_write(os.path.join(meta, "split_vs_fmp.csv"), _csv_bytes(COMPARE_COLUMNS, cmp_rows, run_id))
     atomic_write(os.path.join(meta, "fmp_daily_inputs.csv"), _csv_bytes(FMP_INPUT_COLUMNS, fmp_records, run_id))
     atomic_write(os.path.join(meta, "yahoo_inputs.csv"), _csv_bytes(YAHOO_INPUT_COLUMNS, yahoo_rows, run_id))
+    atomic_write(os.path.join(meta, "spinco_symbols_missing.txt"),
+                 (f"# run_id: {run_id}\n# real spun-off tickers with no daily bars in the store (one per line); the "
+                  f"download step reads this list\n" + "".join(f"{x}\n" for x in sorted(missing_spincos))).encode("utf-8"))
     atomic_write(os.path.join(meta, "split_table.json"), json.dumps(table, indent=1).encode("utf-8"))
     for (src, verdict), k in sorted(Counter((a["source"], a["verdict"]) for a in accepted).items()):
         stats[f"accepted_{verdict}_from_{src}"] += k
@@ -399,6 +411,7 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
             "symbols_with_splits": len(table["splits"]),
             "spinoffs_applied": sum(len(v) for v in table["spinoffs"].values()), "series_breaks": sum(len(v) for v in breaks.values()), "accepted": len(accepted), "review_rows": len(review),
             "review_applied": sum(r["applied"] for r in review),
-            "fmp_daily_files": fmp_files, "yahoo_files": yahoo_files, "stats": dict(sorted(stats.items())),
+            "fmp_daily_files": fmp_files, "yahoo_files": yahoo_files,
+            "spinco_symbols_missing": len(missing_spincos), "stats": dict(sorted(stats.items())),
             "compare": {c: sum(1 for r in cmp_rows if r["class"] == c) for c in classes},
             "compare_examples": {c: [r for r in cmp_rows if r["class"] == c][:10] for c in classes if c != "agree"}}

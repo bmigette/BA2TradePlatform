@@ -89,7 +89,15 @@ THE RULES (tolerances are module constants)
     the near misses) -> ``spinoff_fmp_agrees``, OUR computed factor is applied and the deviation is recorded in ``fmp_step``; ``flat`` (FMP did not adjust it,
     e.g. CTVA) -> applied anyway, ``spinoff_fmp_flat`` + an informational row; no or unstable FMP data -> applied,
     ``spinoff_fmp_unverified`` + row; any other step -> ``spinoff_fmp_mismatch`` review row, NOT applied.  No spinco bar within
-    3 sessions -> ``spinoff_no_spinco_price`` review row, not applied.  A spin-off position explains nearby jumps.  A split
+    3 sessions -> if FMP's step across the ex-date is NOT flat (and above 1) it is the factor (``spinoff_from_fmp_step``,
+    applied, informational row: the OTC spinco names Alpaca does not carry); otherwise ``spinoff_no_spinco_price`` review row,
+    not applied.  The spinco's bars are read for ANY symbol present in the store's bars dir (not only the judged / listed
+    ones); a ``-WI`` (when-issued) suffix maps to the base ticker (AIRC-WI -> AIRC).  A same-ticker spin-off (the spinco maps
+    to the parent itself: CR, INBX, MSGE) is refused with ``spinoff_no_spinco_price``, no fallback.  CVRs, warrants and
+    rights are NOT adjusted (like cash dividends): ``spinoff_not_adjusted_cvr_warrant``, counted, no review row.  A spun-off
+    security is one when its id is a 9-character CUSIP-like code containing a digit (092CVR018, 67012E104), ends in ``-WS``,
+    is the parent ticker + W / Z / L (OPENW, OPENZ, OPENL), or is any other 3-5 letter ticker ending in W that has no bars
+    (SAVAW, XRXDW).  The real spun-off tickers still lacking bars are written to ``_meta/spinco_symbols_missing.txt`` (below).  A spin-off position explains nearby jumps.  A split
     listing within 3 sessions of an APPLIED spin-off whose ratio is within 2 % of its factor is that same event listed as a
     split by a vendor: it is absorbed (``listings_absorbed_by_spinoff``), never adjusted twice; a split that still gets
     accepted with the spin-off's factor (e.g. through an override) stops the build.  Split overrides that REJECT a listing
@@ -136,7 +144,9 @@ VERDICT CODES (``VERDICTS``; counted in the printed summary as ``verdict_<code>`
              both_listed_jump_within_1_5  both vendors list a big (>= x2) ratio and the jump is within x1.5 of it (no step needed)
              inferred_confirmed_by_yahoo  an UNLISTED split: clean FMP step + raw jump within x1.5 + Yahoo lists it (+ info row)
              spinoff_fmp_agrees / spinoff_fmp_flat / spinoff_fmp_unverified   applied spin-off (kind "spinoff"), by FMP vote
+             spinoff_from_fmp_step   spin-off whose spinco has no price: FMP's non-flat step is the factor (+ info row)
   rejected without a review row:
+             spinoff_not_adjusted_cvr_warrant  a spun-off CVR / warrant / right (counted, never adjusted)
              override_reject         decided by an override entry
              rejected_confirmed      listing contradicted by the raw jump AND flat in FMP's step: no split anywhere
              jump_explained_by_market (an unexplained jump, not an event) flat FMP step: a real price move
@@ -168,6 +178,10 @@ turns the symbol "NA" into NaN)
   RUN COHERENCE        every run has a run_id (UTC timestamp + 8 hex of a hash of the inputs); it is in split_table.json and
                        the last column ("run_id") of every CSV below.  The CSVs are written first, the table last, so a
                        crash never leaves a table newer than its CSVs; the cache build checks that the run_ids match.
+  spinco_symbols_missing.txt  the real spun-off tickers (parent in the store, not a CVR / warrant / right, not the parent's own
+                       ticker) that still have NO daily bars in the store, one per line after two ``#`` comment lines (the first is
+                       ``# run_id: <id>``).  The pipeline ``download`` step reads this list and fetches those symbols (Alpaca
+                       carries no OTC names: they stay on the list and get the FMP-step fallback).
   yahoo_inputs.csv     symbol, ticker (the one that answered), status, n_splits, fetched_at, sha256 of every Yahoo cache file
                        consulted by this run
   fmp_daily_inputs.csv file, size, mtime_ns, mtime_utc, sha256 (of the bytes) of every FMP daily file read: the record of
@@ -186,6 +200,7 @@ import gzip
 import json
 import math
 import os
+import re
 from collections import Counter
 from datetime import date
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
@@ -219,7 +234,7 @@ VERDICTS = ("proven", "fmp_only_proven", "proven_by_fmp_step", "ratio_mismatch_r
             "both_contradicted", "unresolved", "fmp_step_without_jump", "small_single_vendor", "ratio_mismatch", "no_price_data",
             "unexplained_jump", "overlapping_accepts", "both_listed_jump_within_1_5", "inferred_confirmed_by_yahoo", "inferred_unconfirmed", "yahoo_unavailable", "series_break",
             "spinoff_fmp_agrees", "spinoff_fmp_flat", "spinoff_fmp_unverified", "spinoff_fmp_mismatch",
-            "spinoff_no_spinco_price")
+            "spinoff_no_spinco_price", "spinoff_not_adjusted_cvr_warrant", "spinoff_from_fmp_step")
 REVIEW_COLUMNS = ["symbol", "event_date", "alpaca_ratio", "fmp_ratio", "jump", "fmp_step", "verdict", "applied", "reason"]
 ACCEPTED_COLUMNS = ["symbol", "date", "kind", "factor", "source", "verdict", "jump", "fmp_step"]
 
@@ -235,6 +250,18 @@ class SpinOff(NamedTuple):
     date: date              # ex-date
     spinco: str             # the spun-off company's current ticker (its bars are in the same store)
     ratio: float            # new_rate / source_rate: spinco shares received per parent share
+    security: str = ""      # the listed id BEFORE the name-change mapping (a CUSIP stays a CUSIP); "" = the spinco ticker
+
+
+def is_cvr_warrant_right(spinco: str, parent: str, has_bars: bool) -> bool:
+    """A spun-off SECURITY that is a CVR, warrant or right, not a company: not adjusted (like a cash dividend).  Its id is
+    a 9-character CUSIP-like code containing a digit (092CVR018, 67012E104); or it ends in ``-WS``; or it is the parent
+    ticker plus W / Z / L (OPENW, OPENZ, OPENL); or any other 3-5 letter ticker ending in W that has no bars (SAVAW)."""
+    if re.fullmatch(r"[A-Z0-9]{9}", spinco) and any(ch.isdigit() for ch in spinco):
+        return True
+    if spinco.endswith("-WS") or spinco in (parent + "W", parent + "Z", parent + "L"):
+        return True
+    return bool(re.fullmatch(r"[A-Z]{2,4}W", spinco)) and not has_bars
 
 
 class SplitTableBuildError(RuntimeError):
@@ -379,8 +406,11 @@ def spinoff_events_from_actions(corporate_actions: Iterable[Mapping[str, Any]],
                 raise SplitTableBuildError(f"alpaca spin_off {e['source_symbol']} {e['ex_date']}: unusable rates {nr!r}/{sr!r}")
             day = date.fromisoformat(e["ex_date"])
             stats["alpaca_spin_offs"] += 1
+            new = _norm_symbol(e["new_symbol"])
+            if new.endswith("-WI"):                  # when-issued line (AIRC.WI, BAM.WI): the bars sit under the base ticker
+                new = new[:-3]
             out.append(SpinOff(map_to_current(e["source_symbol"], day, renames), day,
-                               map_to_current(e["new_symbol"], day, renames), float(nr) / float(sr)))
+                               map_to_current(new, day, renames), float(nr) / float(sr), new))
     return out
 
 
@@ -669,7 +699,9 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
                   fmp_daily: Optional[Mapping[str, pd.DataFrame]] = None,
                   breaks: Optional[Dict[str, List[str]]] = None,
                   spinoffs: Iterable[SpinOff] = (),
-                  yahoo: Optional[Callable[[str], Mapping[str, Any]]] = None
+                  yahoo: Optional[Callable[[str], Mapping[str, Any]]] = None,
+                  spinco_frame: Optional[Callable[[str], Optional[pd.DataFrame]]] = None,
+                  missing_spincos: Optional[set] = None
                   ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Judge every candidate event by the raw price jump across it, and by the FMP step when ``fmp_daily`` is given.
 
@@ -683,7 +715,9 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
     ``spinoffs``: the Alpaca spin-offs; each becomes an accepted event of ``kind`` "spinoff" with a COMPUTED factor (or a review
     row), see SPIN-OFFS in the module docstring.  ``yahoo``: ``symbol -> {"available": bool, "ticker": answering ticker, "splits": [[iso date, ratio], ...]}``, the
     confirmation source of the UNLISTED (inferred) splits only; None = no Yahoo, every inferred candidate is
-    ``yahoo_unavailable``.  ``breaks``: filled with ``{symbol: [session date, ...]}`` of the series breaks (verdict ``series_break``)."""
+    ``yahoo_unavailable``.  ``spinco_frame``: ``symbol -> daily frame or None``, read for a spun-off company whose bars exist in the store
+    but that is not among ``raw_daily`` (a subset run); ``missing_spincos``: filled with the real spun-off tickers that still
+    have no bars anywhere (the ``spinco_symbols_missing.txt`` list).  ``breaks``: filled with ``{symbol: [session date, ...]}`` of the series breaks (verdict ``series_break``)."""
     stats = stats if stats is not None else Counter()
     by_sym: Dict[str, List[Tuple[str, ListedSplit]]] = {}
     for src, evs in (("alpaca", alpaca_events), ("fmp", fmp_events)):
@@ -711,13 +745,12 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
             stats["spinoffs_symbol_not_in_store"] += 1
             continue
         so_by_sym.setdefault(so.symbol, []).append(so)
-    bars_cache: Dict[str, _Bars] = {}
+    bars_cache: Dict[str, Optional[_Bars]] = {}
 
     def bars_of(sym: str) -> Optional[_Bars]:
-        if sym not in raw_daily:
-            return None
         if sym not in bars_cache:
-            bars_cache[sym] = _bars(raw_daily[sym], stats, sym)
+            frame = raw_daily[sym] if sym in raw_daily else (spinco_frame(sym) if spinco_frame is not None else None)
+            bars_cache[sym] = _bars(frame, stats, sym) if frame is not None else None
         return bars_cache[sym]
 
     accepted: List[Dict[str, Any]] = []
@@ -731,7 +764,8 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
             if rser is None:
                 stats["fmp_daily_missing_symbol"] += 1
         a, r = _decide_symbol(sym, bars, by_sym.get(sym, []), ov_by_sym.get(sym, []), stats, rser,
-                              fmp_daily is not None, breaks, so_by_sym.get(sym, []), bars_of, yahoo)
+                              fmp_daily is not None, breaks, so_by_sym.get(sym, []), bars_of, yahoo,
+                              missing_spincos)
         accepted += a
         rows += r
     accepted.sort(key=lambda x: (x["symbol"], x["date"]))
@@ -743,7 +777,8 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
                    stats: Counter, rser: Optional[_RatioSeries] = None, step_on: bool = False,
                    breaks: Optional[Dict[str, List[str]]] = None, spinoffs: Sequence[SpinOff] = (),
                    bars_of: Optional[Callable[[str], Optional[_Bars]]] = None,
-                   yahoo: Optional[Callable[[str], Mapping[str, Any]]] = None
+                   yahoo: Optional[Callable[[str], Mapping[str, Any]]] = None,
+                   missing_spincos: Optional[set] = None
                    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     acc: List[Dict[str, Any]] = []
     rows: List[Dict[str, Any]] = []
@@ -784,6 +819,12 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
     so_applied: List[Tuple[int, float]] = []          # (position, f) of the applied ones
     so_dates = sorted({so.date for so in spinoffs})
     for so in spinoffs:
+        has_bars = bars_of is not None and so.spinco != sym and bars_of(so.spinco) is not None
+        if is_cvr_warrant_right(so.security or so.spinco, sym, has_bars):
+            stats["verdict_spinoff_not_adjusted_cvr_warrant"] += 1      # a CVR / warrant / right: not adjusted, no row
+            continue
+        if not has_bars and so.spinco != sym and missing_spincos is not None:
+            missing_spincos.add(so.spinco)                             # a real ticker the store still lacks
         if n == 0 or so.date <= bars.days[0].astype(object) or so.date > bars.days[-1].astype(object):
             stats["outside_range_spinoff"] += 1
             continue
@@ -793,6 +834,16 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
         sc = bars_of(so.spinco) if bars_of is not None and so.spinco != sym else None   # spinco == parent: a reused / renamed ticker
         k = int(np.searchsorted(sc.days, bars.days[iD])) if sc is not None else 0
         if sc is None or k >= len(sc.days) or sc.days[k] > bars.days[min(iD + NEAR_SESSIONS, n - 1)]:
+            if so.spinco != sym and rser is not None:
+                # no price for the spun-off company (an OTC name): FMP's step, when it is NOT flat (and above 1), is the factor
+                v, ok = rser.step(D, [x for x in listed_dates + ov_dates + so_dates if x != D])
+                if v is not None and ok and _step_vote(v, ok, None) == "other" and v > 1.0:
+                    accept(D, v, "fmp_step", "spinoff_from_fmp_step", _fmt_step(v, "other"), kind="spinoff")
+                    so_applied.append((iD, v))
+                    review(D, None, None, None, "spinoff_from_fmp_step", True,
+                           f"spin-off of {so.spinco} (ratio {so.ratio:.6g}) has no {so.spinco} price; FMP's step {v:.6g} across "
+                           f"the ex-date is used as the factor", count=False, step=_fmt_step(v, "other"))
+                    continue
             review(D, None, None, None, "spinoff_no_spinco_price", False,
                    f"spin-off of {so.spinco} (ratio {so.ratio:.6g}): no {so.spinco} bar within {NEAR_SESSIONS} sessions of "
                    f"the ex-date (or the spinco's current ticker is the parent's own), the factor cannot be computed", step="")
