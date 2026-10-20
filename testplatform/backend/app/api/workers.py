@@ -428,8 +428,11 @@ def import_workers(data: WorkerExport, db: Session = Depends(get_db)):
 
 
 @router.post("/{worker_id}/sync-cache")
-def sync_worker_cache(worker_id: int, db: Session = Depends(get_db)):
-    """Push the master's cache (diff, as one tar stream) to a remote worker."""
+def sync_worker_cache(worker_id: int, ohlcv_history_source: str, db: Session = Depends(get_db)):
+    """Push the master's cache (diff, as one tar stream) to a remote worker.
+
+    ``ohlcv_history_source`` (query parameter, required) names the OHLCV history to replicate;
+    the other source's folder is pruned off the worker, so there is no default."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:
         raise HTTPException(status_code=404, detail="Worker not found")
@@ -437,7 +440,8 @@ def sync_worker_cache(worker_id: int, db: Session = Depends(get_db)):
         return {"status": "skipped", "message": "Local worker shares the master cache"}
     from app.services import worker_client
     try:
-        res = worker_client.push_cache(_worker_dict(worker))
+        res = worker_client.push_cache(
+            _worker_dict(worker), history_source=ohlcv_history_source)
         return {"status": "ok", **res}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"cache push failed: {e}")

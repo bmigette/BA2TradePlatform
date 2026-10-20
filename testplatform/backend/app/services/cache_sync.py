@@ -117,7 +117,8 @@ def _crc32_file(p: Path, chunk: int = 1 << 20) -> int:
     return crc
 
 
-def build_manifest(root: Optional[str] = None, with_hash: bool = False) -> dict:
+def build_manifest(root: Optional[str] = None, with_hash: bool = False,
+                   exclude_dirnames: Iterable[str] = ()) -> dict:
     """Enumerate every syncable cache file under *root* (default ``CACHE_FOLDER``).
 
     Returns ``{root, count, total_bytes, files:[{rel_path, size, mtime[, crc32]}]}`` with
@@ -133,8 +134,15 @@ def build_manifest(root: Optional[str] = None, with_hash: bool = False) -> dict:
     only needs ``(rel_path, size)`` and reading every file is disk-IO-heavy; use it for the
     periodic cache-integrity check, which needs to catch a same-size-different-content drift that
     (rel_path, size) alone can't see (e.g. a rebuild that rewrites a file at its old byte size).
+
+    ``exclude_dirnames`` names TOP-LEVEL cache folders (direct children of *root*) that are left
+    out of the manifest, e.g. the OHLCV history folder of the source a job does NOT run on. Unlike
+    ``_derived`` this is a per-call choice: excluded from a push manifest, the folder is not copied
+    and ``diff_stale`` lists the worker's copy for pruning. Only a top-level match counts, so a
+    same-named directory deeper in the tree stays ordinary cache content.
     """
     base = cache_root(root)
+    exclude_top = frozenset(exclude_dirnames)
     files: List[dict] = []
     if base.is_dir():
         # os.walk (not rglob) so a skipped directory is PRUNED from the descent: a derived cache
@@ -146,8 +154,10 @@ def build_manifest(root: Optional[str] = None, with_hash: bool = False) -> dict:
         # and a symlinked-in subtree is symmetric on master and worker so it never reaches
         # diff_stale.
         for dirpath, dirnames, filenames in os.walk(base):
-            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRNAMES]
             rel_dir = Path(dirpath).relative_to(base)
+            at_root = rel_dir == Path(".")
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRNAMES
+                           and not (at_root and d in exclude_top)]
             for fn in filenames:
                 rel = rel_dir / fn
                 if not _is_syncable(rel):
@@ -228,6 +238,16 @@ def diff_content_mismatch(local_files: List[dict], remote_manifest: dict) -> Lis
         if rh is not None and lh is not None and rh != lh:
             out.append(f["rel_path"])
     return out
+
+
+def assert_prunable(rel_paths: Iterable[str], root: Optional[str] = None) -> None:
+    """Refuse (``ValueError``) unless every one of *rel_paths* stays inside the cache root.
+
+    The stale list comes from the REMOTE manifest, i.e. from another machine; the worker's own
+    ``prune_paths`` skips an escaping path, but the master must not even ask for one.
+    """
+    for rel in rel_paths:
+        safe_resolve(rel, root)
 
 
 def iter_tar(rel_paths: Iterable[str], root: Optional[str] = None,

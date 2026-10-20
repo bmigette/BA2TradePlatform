@@ -174,7 +174,8 @@ class DistributedEvaluator:
                  governor: Optional[Any] = None,
                  market_condition_manifests: Optional[Dict[str, str]] = None,
                  required_packages: Optional[Dict[str, str]] = None,
-                 master_packages: Optional[Dict[str, str]] = None):
+                 master_packages: Optional[Dict[str, str]] = None,
+                 history_source: Optional[str] = None):
         self.pool = submit_pool
         self._pool_factory = pool_factory
         # Dynamic worker allocation. When set, consumers above governor.current PARK
@@ -197,6 +198,9 @@ class DistributedEvaluator:
         # job (this evaluator is one job).
         self.required_packages = required_packages
         self.master_packages = master_packages
+        # The job's OHLCV history source (resolve_job_history_source(job_config)); the cache push
+        # replicates only that source's folder. Never defaulted: push_cache refuses None.
+        self.history_source = history_source
         self._drift_seen: set = set()
         self.log = log
         # Per-run ceiling on concurrent remote slots PER WORKER, regardless of the worker's
@@ -367,7 +371,7 @@ class DistributedEvaluator:
                     required_packages=self.required_packages,
                     master_packages=self.master_packages, drift_seen=self._drift_seen):
                 return False
-            worker_client.push_cache(w, log=self.log)
+            worker_client.push_cache(w, history_source=self.history_source, log=self.log)
             worker_client.push_secrets(w, secrets, log=self.log)
             if self.market_condition_manifests and not self._prepare_market_conditions(w):
                 return False

@@ -8246,7 +8246,8 @@ def _cmd_sync_cache(args) -> int:
     """Push the master's cache (diff, one tar stream) to a configured remote worker."""
     from app.services import worker_client
     worker = _resolve_worker_names([args.worker])[0]
-    res = worker_client.push_cache(worker, log=print)
+    res = worker_client.push_cache(
+        worker, history_source=args.ohlcv_history_source, log=print)
     print(json.dumps(res, indent=2, default=str))
     return 0
 
@@ -9055,6 +9056,10 @@ def main(argv: "list | None" = None) -> int:
     # sync-cache: push the master's cache (diff, one tar) to a configured remote worker.
     sc = sub.add_parser("sync-cache", help="Push the master's cache to a configured worker.")
     sc.add_argument("--worker", required=True, help="Worker NAME (as configured on the master).")
+    sc.add_argument("--ohlcv-history-source", required=True, choices=("fmp", "alpaca"),
+                    help="Which OHLCV history to replicate. Required: only that history's folder "
+                         "is pushed and the OTHER one is pruned off the worker (pushing alpaca "
+                         "removes the worker's FMP folder).")
 
     # Split out the backtest passthrough before full parsing.
     if argv and argv[0] == "backtest":

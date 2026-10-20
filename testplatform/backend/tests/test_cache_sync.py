@@ -284,3 +284,76 @@ def test_prune_paths_survives_an_undeletable_file(tmp_path, monkeypatch):
     assert not (tmp_path / "after.parquet").exists()   # the loop continued past the failure
     assert (tmp_path / "locked.parquet").exists()
     assert len(warned) == 1 and "locked.parquet" in warned[0], warned
+
+
+# --------------------------------------------------------------------------------------------
+# History-source scoped pushes
+# --------------------------------------------------------------------------------------------
+def _hist_cache(tmp_path, fmp=True, alpaca=True):
+    if fmp:
+        _write(tmp_path / "FMPOHLCVProvider" / "AAPL_1d.parquet", b"f" * 10)
+    if alpaca:
+        _write(tmp_path / "AlpacaHistoryOHLCVProvider" / "AAPL_1d.parquet", b"a" * 10)
+    _write(tmp_path / "options" / "o.sqlite", b"o")
+    _write(tmp_path / "_derived" / "x" / "a.npy", b"d")
+    return tmp_path
+
+
+def test_exclude_dirnames_is_top_level_only(tmp_path):
+    _write(tmp_path / "FMPOHLCVProvider" / "a.parquet", b"1")
+    _write(tmp_path / "nested" / "FMPOHLCVProvider" / "b.parquet", b"2")
+    man = cache_sync.build_manifest(str(tmp_path), exclude_dirnames=("FMPOHLCVProvider",))
+    assert {f["rel_path"] for f in man["files"]} == {"nested/FMPOHLCVProvider/b.parquet"}
+
+
+def test_history_manifest_alpaca_excludes_fmp_and_derived(tmp_path, monkeypatch):
+    from app.services import worker_client
+    _hist_cache(tmp_path)
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(tmp_path))
+    local = worker_client._history_manifest("alpaca")
+    rels = {f["rel_path"] for f in local["files"]}
+    assert rels == {"AlpacaHistoryOHLCVProvider/AAPL_1d.parquet", "options/o.sqlite"}
+    # the worker's FMP copy is stale against this manifest, so the existing prune removes it
+    remote = {"files": [{"rel_path": "FMPOHLCVProvider/AAPL_1d.parquet", "size": 10}]}
+    assert cache_sync.diff_stale(local["files"], remote) == ["FMPOHLCVProvider/AAPL_1d.parquet"]
+
+
+def test_history_manifest_fmp_keeps_fmp_excludes_alpaca(tmp_path, monkeypatch):
+    from app.services import worker_client
+    _hist_cache(tmp_path)
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(tmp_path))
+    rels = {f["rel_path"] for f in worker_client._history_manifest("fmp")["files"]}
+    assert rels == {"FMPOHLCVProvider/AAPL_1d.parquet", "options/o.sqlite"}
+
+
+def test_alpaca_push_without_local_alpaca_folder_refuses(tmp_path, monkeypatch):
+    from app.services import worker_client
+    _hist_cache(tmp_path, alpaca=False)
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(tmp_path))
+    with pytest.raises(ValueError, match="AlpacaHistoryOHLCVProvider"):
+        worker_client.push_cache({"name": "w", "url": "http://w"}, history_source="alpaca")
+
+
+def test_push_without_a_history_source_refuses():
+    from app.services import worker_client
+    with pytest.raises(TypeError):
+        worker_client.push_cache({"name": "w", "url": "http://w"})
+    with pytest.raises(Exception, match="unknown OHLCV history source"):
+        worker_client.push_cache({"name": "w", "url": "http://w"}, history_source=None)
+
+
+def test_prune_guard_refuses_paths_outside_the_cache_root(tmp_path):
+    with pytest.raises(ValueError):
+        cache_sync.assert_prunable(["../outside.txt"], str(tmp_path))
+    with pytest.raises(ValueError):
+        cache_sync.assert_prunable([str(tmp_path.parent / "abs.txt")], str(tmp_path))
+    cache_sync.assert_prunable(["FMPOHLCVProvider/a.parquet"], str(tmp_path))
+
+
+def test_cli_sync_cache_requires_history_source(monkeypatch, capsys):
+    import ba2test_launcher
+    assert ba2test_launcher.__file__.replace("\\", "/").find("ah-t9") >= 0
+    with pytest.raises(SystemExit) as e:
+        ba2test_launcher.main(["sync-cache", "--worker", "w1"])
+    assert e.value.code == 2
+    assert "--ohlcv-history-source" in capsys.readouterr().err

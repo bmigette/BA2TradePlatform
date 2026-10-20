@@ -14,6 +14,7 @@ from typing import Callable, Mapping, Optional
 import httpx
 
 from ba2_common.core.db_maintenance import format_bytes
+from ba2_common.core.ohlcv_history import history_cache_dirname, other_history_cache_dirnames
 
 from app.services import cache_sync, package_versions, self_update
 
@@ -284,14 +285,39 @@ def run_trial_full(worker: dict, config: dict, fitness_metric: str, timeout: flo
     return _submit_and_poll(worker, "/submit-trial-full", payload, timeout)
 
 
-def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
+def _history_manifest(history_source: str) -> dict:
+    """The master's cache manifest for a push of *history_source*'s OHLCV history.
+
+    The OTHER sources' history folders are left out of the manifest, so they are neither copied
+    nor kept: ``diff_stale`` lists the worker's copy and the prune removes it (the FMP cache is
+    archived, not replicated). Because that prune deletes a whole history, a master that does not
+    hold the source's own folder (not built yet) REFUSES instead of wiping the worker's history.
+    """
+    own = history_cache_dirname(history_source)        # raises UnknownHistorySource on a bad name
+    local = cache_sync.build_manifest(
+        exclude_dirnames=other_history_cache_dirnames(history_source))
+    if local["files"] and not any(f["rel_path"].startswith(own + "/") for f in local["files"]):
+        raise ValueError(
+            f"cache push refused: the master has no {own}/ folder under {local['root']} "
+            f"(history source {history_source!r}); pushing would prune the worker's other history "
+            f"and leave it with none. Build the {history_source} history first.")
+    return local
+
+
+def push_cache(worker: dict, *, history_source: str,
+               log: Callable[[str], None] = logger.info) -> dict:
     """Diff the master's cache against the worker's manifest and stream the missing files as ONE
     tar, THEN prune anything the worker has that the master's CURRENT manifest no longer lists
     (leftovers from a local rebuild/compaction, e.g. old screener metric_store fragments — see
     ``cache_sync.diff_stale``). Returns ``{pushed, pruned, ...}``.
 
+    *history_source* (``fmp`` | ``alpaca``, required, never defaulted) is the OHLCV history the
+    pushed job runs on: only that source's folder is replicated, the other source's folder is
+    pruned off the worker (see ``_history_manifest``).
+
     The prune step is skipped outright when the master's own manifest is empty (see below).
     """
+    local = _history_manifest(history_source)
     base, headers = _base(worker), _headers(worker)
     # Manifest GET: a worker with a very large cache (remote150: 312k files / 36GB) enumerates
     # from disk on a cold call (~140s on Windows FS). Warm workers answer in ms; this timeout
@@ -301,7 +327,6 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
         r = c.get(f"{base}/cache/manifest", headers=headers)
         r.raise_for_status()
         remote = r.json()
-    local = cache_sync.build_manifest()
     missing = cache_sync.diff_missing(local["files"], remote)
     res = {"pushed": 0, "extracted": 0}
     if not missing:
@@ -330,6 +355,7 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
         return {**res, "pruned": 0}
 
     stale = cache_sync.diff_stale(local["files"], remote)
+    cache_sync.assert_prunable(stale, local["root"])   # nothing outside the cache root, ever
     if stale:
         log(f"cache prune -> {worker['name']}: removing {len(stale)} stale leftover file(s)...")
         with httpx.Client(timeout=120.0) as c:
@@ -436,7 +462,7 @@ def _poll_prepare(worker: dict, job_id: str, deadline: float,
             time.sleep(_PREPARE_POLL_S)
 
 
-def check_cache_integrity(worker: dict, timeout: float = 600.0) -> dict:
+def check_cache_integrity(worker: dict, *, history_source: str, timeout: float = 600.0) -> dict:
     """Deep, content-hash-based comparison of the master's cache against *worker*'s.
 
     Unlike ``push_cache`` (fast, size-only — the normal per-job pre-flight path), this reads +
@@ -447,14 +473,20 @@ def check_cache_integrity(worker: dict, timeout: float = 600.0) -> dict:
     much faster non-cryptographic checksum is the right tradeoff at cache-wide scale.
 
     Returns ``{ok, missing, stale, content_mismatch, local_count, remote_count}`` — ``ok`` is
-    True only when all three lists are empty.
+    True only when all three lists are empty. *history_source* (required) selects the OHLCV
+    history compared, exactly as in ``push_cache``: the other source's folder is not expected on
+    the worker and shows up as stale.
     """
     base, headers = _base(worker), _headers(worker)
     with httpx.Client(timeout=timeout) as c:
         r = c.get(f"{base}/cache/manifest", headers=headers, params={"with_hash": "true"})
         r.raise_for_status()
         remote = r.json()
-    local = cache_sync.build_manifest(with_hash=True)
+    own = history_cache_dirname(history_source)
+    local = cache_sync.build_manifest(
+        with_hash=True, exclude_dirnames=other_history_cache_dirnames(history_source))
+    if local["files"] and not any(f["rel_path"].startswith(own + "/") for f in local["files"]):
+        raise ValueError(f"cache integrity check refused: the master has no {own}/ folder")
     missing = cache_sync.diff_missing(local["files"], remote)
     stale = cache_sync.diff_stale(local["files"], remote)
     mismatch = cache_sync.diff_content_mismatch(local["files"], remote)
