@@ -1,0 +1,4 @@
+{
+ "_doc": "REVIEWED decisions on individual split events, applied by split_table.decide_splits. An entry decides the event of its symbol on event_date (any date a vendor lists for it, or a date nobody lists: an 'accept' then ADDS the split) outright, whatever the price jump says. Never a silent tolerance: every entry needs symbol, event_date (ISO), decision ('accept' needs a ratio = new shares / old shares; 'reject' drops the event), reason, added and reviewed_by; an entry whose reviewed_by starts with 'pending' REFUSES the build. A 'reject' also silences the 'unexplained_jump' review row at its date. The file's bytes are part of the split table's fingerprint.",
+ "entries": []
+}
