@@ -50,6 +50,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
+from ba2_common.core.ohlcv_history import resolve_job_history_source
 from ba2_common.core.schedule_genes import schedule_refusal_message, schedule_weekday_enabled
 from ba2_common.core.utils import as_utc_key
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
@@ -553,7 +554,13 @@ class DailyBacktestEngine:
         self._screen_gate = None
         if self._screener_runtime and self._screener_runtime.get("criteria_version"):
             from app.services.backtest.screener_gate import PanelGate
-            self._screen_gate = PanelGate(self._screener_runtime, price_source, intraday=price_source.is_intraday)
+            self._screen_gate = PanelGate(self._screener_runtime, price_source, intraday=price_source.is_intraday,
+                                          history_source=resolve_job_history_source(config))
+        elif self._screener_runtime and self._screener_runtime.get("store"):
+            # the legacy weekly gate reads a metric store: it must come from the job's OHLCV history
+            from ba2_providers.screener import metric_store as _ms_hist
+            _ms_hist.require_store_history_source(self._screener_runtime["store"],
+                                                  resolve_job_history_source(config))
         # SCREENER UNIVERSE GUARD. ``screener_universe_guard`` is "refuse" | "warn" | absent/None. Absent by
         # design for every run that is not a screener-universe job (no gate, a gate-only run, a bypass
         # expert), so its absence means "not applicable", not "forgotten" (CLAUDE.md no-defaults rule is

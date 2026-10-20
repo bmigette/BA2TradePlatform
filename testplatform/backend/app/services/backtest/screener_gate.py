@@ -22,6 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from ba2_common.core.ohlcv_history_stamp import HistorySourceMismatch, require_matching_history_source
 from ba2_providers.screener import live_sim as ls
 from ba2_providers.screener import metric_store as ms
 
@@ -32,9 +33,11 @@ class ScreenerGateRefusal(RuntimeError):
     """The panel gate cannot be built or used for this run (panel missing / wrong version / day not covered)."""
 
 
-def get_panel(path: str, expect_fp: Optional[str] = None) -> ls.DailyPanel:
+def get_panel(path: str, expect_fp: Optional[str] = None, *, history_source: str) -> ls.DailyPanel:
     """The memory-mapped panel at ``path``, loaded ONCE per process and never reloaded (a worker cannot switch gates
-    mid-job).  ``expect_fp`` = the fingerprint the job was launched with: a different panel at that path REFUSES."""
+    mid-job).  ``expect_fp`` = the fingerprint the job was launched with: a different panel at that path REFUSES.
+    ``history_source`` = the OHLCV history the job runs on (``resolve_job_history_source(job_config)``): a panel
+    built from the other history REFUSES (a panel without the stamp is an fmp panel)."""
     pan = _PANEL_MEMO.get(path)
     if pan is None:
         try:
@@ -42,6 +45,10 @@ def get_panel(path: str, expect_fp: Optional[str] = None) -> ls.DailyPanel:
         except ls.SimulationRefusal as e:
             raise ScreenerGateRefusal(str(e)) from None
         _PANEL_MEMO[path] = pan
+    try:
+        require_matching_history_source(pan.manifest, history_source, what=f"the panel at {path}")
+    except HistorySourceMismatch as e:
+        raise ScreenerGateRefusal(str(e)) from None
     if expect_fp is not None and pan.manifest.get("panel_fingerprint") != expect_fp:
         raise ScreenerGateRefusal(
             f"the panel at {path} has fingerprint {pan.manifest.get('panel_fingerprint')!r}, the job was launched with "
@@ -117,7 +124,7 @@ class PanelGate:
     """Per-run gate.  ``runtime`` = the engine's ``screener_runtime`` ({"panel", "settings", "excluded_symbols",
     "criteria_version"}); ``price_source`` supplies "now"."""
 
-    def __init__(self, runtime: Dict[str, Any], price_source: Any, *, intraday: bool,
+    def __init__(self, runtime: Dict[str, Any], price_source: Any, *, intraday: bool, history_source: str,
                  beh: Optional[ls.LiveBehaviour] = None):
         if runtime["criteria_version"] != ls.CRITERIA_VERSION:
             raise ScreenerGateRefusal(
@@ -126,7 +133,7 @@ class PanelGate:
         if runtime.get("panel_fingerprint") is None:
             raise ScreenerGateRefusal("screener_runtime carries no panel_fingerprint (the job must stamp the panel it was "
                                       "launched with)")
-        self.panel = get_panel(runtime["panel"], runtime["panel_fingerprint"])
+        self.panel = get_panel(runtime["panel"], runtime["panel_fingerprint"], history_source=history_source)
         if self.panel.manifest.get("criteria_version") != ls.CRITERIA_VERSION:
             raise ScreenerGateRefusal(f"panel {runtime['panel']} was built with criteria "
                                       f"{self.panel.manifest.get('criteria_version')!r}, not {ls.CRITERIA_VERSION!r}")

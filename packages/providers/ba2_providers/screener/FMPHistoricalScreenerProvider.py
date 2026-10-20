@@ -44,6 +44,7 @@ from typing import Any, Dict, List, Optional
 
 from ba2_common.core.interfaces.ScreenerProviderInterface import ScreenerProviderInterface
 from ba2_common.config import get_app_setting
+from ba2_common.core.ohlcv_history import LEGACY_HISTORY_SOURCE, check_history_source, history_registry_key
 from ba2_common.logger import logger
 
 from .universe import broad_universe, index_universe, fetch_lifecycle_map
@@ -54,7 +55,10 @@ _HIST_MCAP_URL = "https://financialmodelingprep.com/api/v3/historical-market-cap
 class FMPHistoricalScreenerProvider(ScreenerProviderInterface):
     """Reconstructed historical screener (survivorship-free, point-in-time)."""
 
-    def __init__(self, universe_mode: str = "broad"):
+    def __init__(self, universe_mode: str = "broad", ohlcv_history_source: str = LEGACY_HISTORY_SOURCE):
+        # the OHLCV history the as-of close/volume come from (``fmp`` | ``alpaca``); fundamentals/shares stay FMP.
+        # The registry builds this class with no arguments, so the default is the history it always used.
+        self.ohlcv_history_source = check_history_source(ohlcv_history_source)
         self.api_key = get_app_setting("FMP_API_KEY")
         # 'broad' | 'sp500' | 'nasdaq' (validated lazily in screen_stocks)
         self.universe_mode = universe_mode
@@ -72,7 +76,7 @@ class FMPHistoricalScreenerProvider(ScreenerProviderInterface):
     def _ohlcv_provider(self):
         """The Phase-2 OHLCV provider used for the as-of close/volume reconstruction."""
         from ba2_providers import get_provider
-        return get_provider("ohlcv", "fmp")
+        return get_provider("ohlcv", history_registry_key(self.ohlcv_history_source))
 
     def _details_provider(self):
         """The Phase-2 fundamentals-details provider (income statement -> shares)."""

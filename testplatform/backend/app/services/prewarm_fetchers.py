@@ -661,7 +661,7 @@ def prewarm_screener_panel(store_dir: str, start: Optional[str], end: Optional[s
                            workers: int = 4, force: bool = False,
                            log: Optional[Callable[[str], None]] = None,
                            warn: Optional[Callable[[str], None]] = None,
-                           cache_folder: Optional[str] = None) -> Dict[str, Any]:
+                           cache_folder: Optional[str] = None, history_source: str) -> Dict[str, Any]:
     """Produce / refresh every input of the screener simulation for the universe of ``store_dir`` and BUILD the
     daily criteria panel (``ba2_providers.screener.live_sim_build``).  Resumable and idempotent: a fresh cache
     file is never fetched twice, an up-to-date panel is a no-op.  The steps (each printed):
@@ -671,6 +671,9 @@ def prewarm_screener_panel(store_dir: str, start: Optional[str], end: Optional[s
       3. FMP historical market cap + float per symbol   (the metric-store caches; fetched only where missing)
       4. a check that every symbol has cached DAILY bars (the data this does NOT fetch: ``ba2-test fetch-cache``)
       5. the panel itself
+
+    ``history_source`` (REQUIRED, ``fmp`` | ``alpaca``) is the OHLCV history the panel is built from; the panel
+    records it and a job on the other history refuses it.  The share/float/split fetches stay FMP.
 
     The run never ends silently short: a symbol whose share history failed, or that lacks daily bars, is listed
     in the summary, and the panel's own coverage check (``live_sim.panel_problems``) refuses a job that needs more.
@@ -737,13 +740,14 @@ def prewarm_screener_panel(store_dir: str, start: Optional[str], end: Optional[s
         raise PrewarmConfigError(f"screener panel prewarm: {len(failures)} fetch failure(s), first: {failures[0]}. "
                                  f"Nothing was built; re-run to resume.")
 
-    no_bars = lb.symbols_without_daily_bars(cache, symbols)
+    no_bars = lb.symbols_without_daily_bars(cache, symbols, history_source)
     summary["without_daily_bars"] = len(no_bars)
     if no_bars:
         complain(f"!! screener panel: {len(no_bars)} universe symbols have NO cached daily bars "
                  f"({no_bars[:12]}...): run `ba2-test fetch-cache --timeframes 1d --start {first_day} "
                  f"--end {end_day} --symbols <them>`; the panel carries them as unscreenable")
-    man = lb.build_daily_panel(cache, symbols, first_day, end_day, force=force, log=say)
+    man = lb.build_daily_panel(cache, symbols, first_day, end_day, force=force, log=say,
+                               history_source=history_source)
     summary["panel"] = {k: man.get(k) for k in ("status", "first_session", "last_session", "last_bar_date",
                                                 "n_symbols", "fresh_fraction", "criteria_version", "build_seconds")}
     summary["shares_sources"] = (man.get("shares_report") or {}).get("sources")

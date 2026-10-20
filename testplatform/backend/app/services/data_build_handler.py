@@ -113,7 +113,9 @@ def handle_build_screener_metrics(task_id: str, payload: Dict[str, Any]) -> Dict
             if sym and cap > 0 and px > 0:
                 shares_by_sym[sym] = cap / px
 
-        prov = get_provider("ohlcv", "fmp")
+        from ba2_common.core.ohlcv_history import history_registry_key
+        history_source = payload["ohlcv_history_source"]      # REQUIRED: a store names its history
+        prov = get_provider("ohlcv", history_registry_key(history_source))
 
         def _ohlcv(sym, end):
             df = ohlcv_get(prov, sym, as_of=_dt.fromisoformat(end), lookback=4000)
@@ -136,6 +138,7 @@ def handle_build_screener_metrics(task_id: str, payload: Dict[str, Any]) -> Dict
             price_min=float(payload.get("price_min", 0.0)),
             volume_min=float(payload.get("volume_min", 0.0)),
             ohlcv_get=_ohlcv,
+            ohlcv_history_source=history_source,
             shares_get=_shares,
             cadence_days=int(payload.get("cadence_days", 7)),
             drop_days=int(payload.get("drop_days", 1)),
@@ -229,7 +232,8 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             from app.services.prewarm_fetchers import prewarm_screener_panel, resolve_keys as _rk
             sp = payload["screener_panel"]
             ps = prewarm_screener_panel(sp["store"], sp.get("start"), sp.get("end"), fmp_key=_rk()["fmp"],
-                                        workers=int(payload.get("workers", 4)), log=logger.info, warn=logger.warning)
+                                        workers=int(payload.get("workers", 4)), log=logger.info, warn=logger.warning,
+                                        history_source=sp["ohlcv_history_source"])
             return {"status": "completed", "summary": {"screener_panel": ps}}
         symbols = payload["symbols"]
         if isinstance(symbols, str):
@@ -277,7 +281,8 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             from app.services.prewarm_fetchers import prewarm_screener_panel
             sp = payload["screener_panel"]
             panel_summary = prewarm_screener_panel(sp["store"], sp.get("start"), sp.get("end"), fmp_key=keys["fmp"],
-                                                   workers=workers, log=logger.info, warn=logger.warning)
+                                                   workers=workers, log=logger.info, warn=logger.warning,
+                                                   history_source=sp["ohlcv_history_source"])
         try:
             fetchers = PrewarmFetchers(fmp_key=keys["fmp"], end_date=end_date,
                                        finnhub_key=keys["finnhub"], log=logger.info)

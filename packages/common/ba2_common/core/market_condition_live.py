@@ -201,7 +201,8 @@ def _reader_profiles(reader: Any) -> Tuple[str, ...]:
 
 
 def _fmp_cache_reader(profile: str, cache_root: Optional[str] = None, *,
-                      manifest_digest: Optional[str] = None, gap_fill: Optional[str] = None) -> Any:
+                      manifest_digest: Optional[str] = None, gap_fill: Optional[str] = None,
+                      source_profile: str = SOURCE_PROFILE_FMP_DAILY) -> Any:
     """One profile's live reader. Indirection so a test can build resolvers without a cache.
 
     ``gap_fill`` only matters when ``manifest_digest`` is None (research mode): a pinned
@@ -210,8 +211,10 @@ def _fmp_cache_reader(profile: str, cache_root: Optional[str] = None, *,
     from ba2_common.core.market_condition_readers import FMPCacheMarketConditionReader
 
     if cache_root is None:
-        return FMPCacheMarketConditionReader(profile, manifest_digest=manifest_digest, gap_fill=gap_fill)
-    return FMPCacheMarketConditionReader(profile, cache_root, manifest_digest=manifest_digest, gap_fill=gap_fill)
+        return FMPCacheMarketConditionReader(profile, manifest_digest=manifest_digest, gap_fill=gap_fill,
+                                             source_profile=source_profile)
+    return FMPCacheMarketConditionReader(profile, cache_root, manifest_digest=manifest_digest, gap_fill=gap_fill,
+                                         source_profile=source_profile)
 
 
 def assert_profile_env_retired(environ: Optional[Any] = None) -> None:
@@ -1054,6 +1057,9 @@ def resolver_for_profiles(profiles: Sequence[str], *,
         # tests monkeypatch with a simpler stand-in) never had to know about this parameter, and
         # the default (None) must not force them to.
         reader_kwargs["gap_fill"] = gap_fill
+    if source_profile != SOURCE_PROFILE_FMP_DAILY:
+        # the reader must read the cache of the profile the resolver stamps on its capture
+        reader_kwargs["source_profile"] = source_profile
     readers = [_fmp_cache_reader(name, cache_root, manifest_digest=digests.get(name), **reader_kwargs)
                for name in names]
     return LiveMarketConditionResolver(

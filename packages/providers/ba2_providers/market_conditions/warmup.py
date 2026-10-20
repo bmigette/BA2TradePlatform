@@ -73,6 +73,7 @@ from ba2_common.core.market_calendar import NY_TZ, nyse_regular_sessions, prior_
     regular_session_close_utc, regular_sessions_ending_at
 from ba2_common.core.market_condition_context import TIMING_POLICY_PRIOR_SESSION_V1
 from ba2_common.core.market_condition_source import (
+    SOURCE_PROFILE_BY_HISTORY,
     SOURCE_PROFILE_FMP_DAILY,
     GapFillResult,
     assemble_window,
@@ -423,9 +424,10 @@ def _apply_gap_fill_to_inventory(inv: SymbolInventory, fstats: GapFillResult) ->
                                   if fstats.unfilled_hole_at_start is not None else None)
 
 
-def _read_snapshot(cache_root: str, symbol: str) -> Tuple[Optional[_Snapshot], int]:
-    """(snapshot | None when there is no cache file, retries used)."""
-    path = fmp_daily_cache_path(symbol, cache_root)
+def _read_snapshot(cache_root: str, symbol: str,
+                   source_profile: str = SOURCE_PROFILE_FMP_DAILY) -> Tuple[Optional[_Snapshot], int]:
+    """(snapshot | None when there is no cache file, retries used), read from ``source_profile``'s cache."""
+    path = fmp_daily_cache_path(symbol, cache_root, source_profile=source_profile)
     if path is None:
         return None, 0
     for attempt in range(SNAPSHOT_RETRIES + 1):
@@ -695,8 +697,9 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     validate_gap_fill(gap_fill)
     if profile not in PROFILES or profile not in COMPUTE_BY_PROFILE:
         raise WarmupConfigError(f"unknown market-condition profile {profile!r}; registered: {sorted(PROFILES)}")
-    if source_profile != SOURCE_PROFILE_FMP_DAILY:
-        raise WarmupConfigError(f"unsupported source profile {source_profile!r}; only {SOURCE_PROFILE_FMP_DAILY!r}")
+    if source_profile not in SOURCE_PROFILE_BY_HISTORY.values():
+        raise WarmupConfigError(f"unsupported source profile {source_profile!r}; "
+                                f"known: {sorted(SOURCE_PROFILE_BY_HISTORY.values())}")
     if end < start:
         raise WarmupConfigError(f"end {end} is before start {start}")
     if cache_root is None:
@@ -724,13 +727,17 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     first_row, last_row = prior_regular_session(decisions[0]), decisions[-1]
     n_rows = len(decisions) + 1
     cal = _calendar_span(first_row, last_row, n_rows)
+    if source is None and source_profile != SOURCE_PROFILE_FMP_DAILY:
+        raise WarmupConfigError(
+            f"source profile {source_profile!r} has no default WarmupSource (the FMP one would fetch FMP "
+            f"splits and bars into the wrong tree): pass the source that serves it")
     if source is None:
         from ba2_providers.market_conditions.fmp_source import FMPWarmupSource
         source = FMPWarmupSource(cache_root)
     calls0, bytes0 = source.calls, source.bytes
 
     preflight: List[str] = []
-    cert = certify_source_columns(cache_root)
+    cert = certify_source_columns(cache_root, source_profile=source_profile)
     cert_dict = {"source_profile": cert.source_profile, "consistent": cert.consistent,
                  "symbols": [{"symbol": s.symbol, "split_date": s.split_date.isoformat(), "basis": s.basis,
                               "consistent": s.consistent, "reason": s.reason} for s in cert.symbols]}
@@ -744,7 +751,7 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     inventories = []
     for sym in symbols:
         inv = SymbolInventory(symbol=sym)
-        snap, _retries = _read_snapshot(cache_root, sym)
+        snap, _retries = _read_snapshot(cache_root, sym, source_profile)
         fill_snap = None
         if gap_fill is not None and snap is not None and len(snap.days):
             try:
@@ -1113,7 +1120,7 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
     sym = inv.symbol
     n_rows = plan_.row_sessions
 
-    snap, retries = _read_snapshot(plan_.cache_root, sym)
+    snap, retries = _read_snapshot(plan_.cache_root, sym, plan_.source_profile)
     counters.add("snapshot_retries", retries)
     if snap is None or not len(snap.days):
         counters.add("symbols_excluded")
@@ -1295,7 +1302,7 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
         fetch_errors = _fetch_phase(plan_, source, concurrency, counters, log)
         for inv in plan_.symbols:
             if inv.refetch_required:
-                snap, _ = _read_snapshot(plan_.cache_root, inv.symbol)
+                snap, _ = _read_snapshot(plan_.cache_root, inv.symbol, plan_.source_profile)
                 events = [CalendarSplit(date.fromisoformat(d), float(r)) for d, r in inv.split_events]
                 checks = _split_checks_for(snap, events, inv.symbol)
                 inv.split_checks = [c.to_dict() for c in checks]

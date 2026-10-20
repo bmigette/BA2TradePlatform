@@ -2625,6 +2625,8 @@ def _build_hoisted_state(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
     if screener_opt:
         from ba2_providers.screener import metric_store as _ms
 
+        from ba2_common.core.ohlcv_history import resolve_job_history_source as _job_history_source
+        _ms.require_store_history_source(screener_opt["store"], _job_history_source(backtest_cfg))
         _ms.load_store(screener_opt["store"])  # warms the per-worker memo
         hoisted["screener_store"] = screener_opt["store"]
         hoisted["screener_base"] = screener_opt.get("base_settings", {})
@@ -2657,7 +2659,8 @@ def _build_hoisted_state(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
             _ls.require_panel(panel_path, str(backtest_cfg["start_date"])[:10], str(backtest_cfg["end_date"])[:10],
                               expect_fp=screener_opt["panel_fingerprint"])
             from app.services.backtest.screener_gate import get_panel
-            get_panel(panel_path, screener_opt["panel_fingerprint"])   # warms the per-worker (memory-mapped) memo
+            get_panel(panel_path, screener_opt["panel_fingerprint"],
+                      history_source=_job_history_source(backtest_cfg))   # warms the per-worker (memory-mapped) memo
             hoisted["screener_panel"] = panel_path
             hoisted["screener_panel_fp"] = screener_opt["panel_fingerprint"]
             hoisted["screener_criteria"] = screener_opt["criteria_version"]
@@ -2982,8 +2985,10 @@ def _build_daily_trial_config(
                 # ONE code path with the gate and the static superset (screener_gate): the same selection
                 # function, "now" replaced by the session's [low, high], no max_stocks cut.
                 from app.services.backtest import screener_gate as _sg
+                from ba2_common.core.ohlcv_history import resolve_job_history_source as _job_hist
                 _union = set(_sg.prune_symbols(
-                    _sg.get_panel(hoisted["screener_panel"], hoisted["screener_panel_fp"]), _sd, _ed, eff_norm, excluded_instruments,
+                    _sg.get_panel(hoisted["screener_panel"], hoisted["screener_panel_fp"],
+                                  history_source=_job_hist(backtest_cfg)), _sd, _ed, eff_norm, excluded_instruments,
                     intraday=_is_intraday_interval(backtest_cfg.get("execution_interval"))))
             else:
                 _df = _ms.load_store(hoisted["screener_store"])
