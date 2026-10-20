@@ -586,13 +586,13 @@ MARKET_CONDITION_PROFILE=ohlcv-v1 tools/stage1_run.sh --dry-run    # prints the 
 resolved window and universe. Run those four, in order, on the master:
 
 ```bash
-$PY tools/warm_market_conditions.py plan  --profile ohlcv-v1 \
+$PY tools/warm_market_conditions.py plan  --profile ohlcv-v1 --ohlcv-history-source fmp \
       --universe-file tools/options_universe_top100.txt \
       --start 2020-01-01 --end 2025-12-31 --out market_conditions_plan.json
-$PY tools/warm_market_conditions.py build --plan market_conditions_plan.json \
+$PY tools/warm_market_conditions.py build --plan market_conditions_plan.json --ohlcv-history-source fmp \
       --cache-only --print-digest          # stdout = the digest; the JSON report is on stderr
-$PY tools/warm_market_conditions.py verify       --manifest <digest>
-$PY tools/warm_market_conditions.py prepare-host --manifest <digest> --profile ohlcv-v1
+$PY tools/warm_market_conditions.py verify       --manifest <digest> --ohlcv-history-source fmp
+$PY tools/warm_market_conditions.py prepare-host --manifest <digest> --profile ohlcv-v1 --ohlcv-history-source fmp
 ```
 
 * `plan` is an inventory plus a source preflight; a plan that reports missing coverage is

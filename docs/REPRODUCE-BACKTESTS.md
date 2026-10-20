@@ -374,7 +374,7 @@ python tools/prepare_option_universe.py --universe-file <universe.txt> \
 
 | # | Step | What it does |
 |---|---|---|
-| 1 | `split-check` | `warm_market_conditions.py plan --profile ohlcv-v1`: split calendars plus the split-basis check per FMP file |
+| 1 | `split-check` | `warm_market_conditions.py plan --profile ohlcv-v1 --ohlcv-history-source fmp`: split calendars plus the split-basis check per FMP file |
 | 2 | `dividends` | `warm_dividend_calendars.py`: FMP dividend calendars for the guard's carry separation |
 | 3 | `fmp-repair` | Force-refetches refused names, then re-checks. **Refuses while the US session is open.** |
 | 4 | `thetadata` | `warm_options_history.py --provider thetadata --wide`: missing partitions, plus partitions made stale by a `ROOT_HISTORY` alias |
