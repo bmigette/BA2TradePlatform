@@ -865,27 +865,29 @@ def test_series_break_for_an_unexplained_jump_beyond_x5_that_the_step_does_not_e
     assert one(rev, "series_break")
 
 
-def test_shipped_overrides_are_the_reviewed_ones_and_the_cbsh_ones_still_refuse():
-    entries = json.load(open(SHIPPED_OVERRIDES, encoding="utf-8"))["entries"]
-    by = {(e["symbol"], e["event_date"]): e for e in entries}
-    pending = {k for k, e in by.items() if e["reviewed_by"].lower().startswith("pending")}
-    assert pending == {("CBSH", "2016-11-30"), ("CBSH", "2017-11-29"), ("CBSH", "2019-12-02")}
-    assert all(by[k]["decision"] == "accept" and by[k]["ratio"] == 1.05 and "sec.gov" in by[k]["reason"] for k in pending)
-    with pytest.raises(st.SplitOverridesPending, match="CBSH 2016-11-30"):
-        st.load_overrides(SHIPPED_OVERRIDES)                    # a pending entry REFUSES the build until the owner flips it
-    reviewed = {k: e for k, e in by.items() if k not in pending}
-    assert len(entries) == 22 and all(e["reviewed_by"] == "owner (B. Migette) 2026-10-20" and e["added"] == "2026-10-20"
-                                      for e in reviewed.values())
-    assert ("HON", "2026-06-28") not in by                      # the 1:2 reverse split is real (Honeywell 8-K): no reject
-    assert by[("VTOL", "2020-06-12")]["ratio"] == pytest.approx(1 / 3) and by[("WHWK", "2021-08-27")]["ratio"] == pytest.approx(1 / 15)
-    assert by[("ENOV", "2022-04-05")]["ratio"] == pytest.approx(1 / 3) and by[("IRON", "2022-12-30")]["ratio"] == 0.1
-    assert by[("JBIO", "2025-04-29")]["ratio"] == pytest.approx(1 / 35)
-    assert {k for k, e in by.items() if e["decision"] == "reject"} == {
-        ("AMC", "2022-08-22"), ("BIP", "2020-03-31"), ("NVS", "2019-04-09"), ("ADEA", "2022-10-03"), ("CRESY", "2025-11-28"),
-        ("CTVA", "2026-10-01"), ("SM", "2020-03-09"), ("DBVT", "2020-03-17"), ("RLMD", "2024-12-04"), ("CLSK", "2020-04-09"),
-        ("FWDI", "2018-01-19")}
-    assert by[("QH", "2022-08-12")]["ratio"] == pytest.approx(0.1) and by[("STSS", "2025-04-28")]["ratio"] == pytest.approx(1 / 300)
-    assert by[("JFB", "2026-03-25")]["ratio"] == 2.0 and "Yahoo" in by[("QH", "2022-08-12")]["reason"]
+def test_shipped_overrides_are_all_owner_reviewed():
+    entries = st.load_overrides(SHIPPED_OVERRIDES)               # raises while any entry is still pending
+    by = {(e["symbol"], e["event_date"], e["kind"] if "kind" in e else "split"): e for e in entries}
+    assert len(entries) == 27 and all(e["reviewed_by"] == "owner (B. Migette) 2026-10-20" for e in entries)
+    assert all(e["added"] in ("2026-10-20", "2026-10-21") for e in entries)
+    assert ("HON", "2026-06-28", "split") not in by              # the 1:2 reverse split is real (Honeywell 8-K): no reject
+    cbsh = [by[("CBSH", d, "split")] for d in ("2016-11-30", "2017-11-29", "2019-12-02")]
+    assert all(e["decision"] == "accept" and e["ratio"] == 1.05 and "sec.gov" in e["reason"] for e in cbsh)
+    assert by[("CENT", "2024-02-09", "split")]["decision"] == "reject" and by[("CENT", "2024-02-09", "spinoff")]["decision"] == "reject"
+    assert by[("CRESY", "2023-12-06", "split")]["decision"] == "reject"
+    assert by[("VGR", "2021-12-30", "split")]["decision"] == "reject"                    # FMP applied its own 1.41: the spin-off decides
+    assert by[("VGR", "2021-12-30", "spinoff")]["decision"] == "accept" and by[("VGR", "2021-12-30", "spinoff")]["ratio"] == 1.5367
+    assert by[("VTOL", "2020-06-12", "split")]["ratio"] == pytest.approx(1 / 3) and by[("WHWK", "2021-08-27", "split")]["ratio"] == pytest.approx(1 / 15)
+    assert by[("ENOV", "2022-04-05", "split")]["ratio"] == pytest.approx(1 / 3) and by[("IRON", "2022-12-30", "split")]["ratio"] == 0.1
+    assert by[("JBIO", "2025-04-29", "split")]["ratio"] == pytest.approx(1 / 35)
+    assert by[("QH", "2022-08-12", "split")]["ratio"] == pytest.approx(0.1) and by[("STSS", "2025-04-28", "split")]["ratio"] == pytest.approx(1 / 300)
+    assert by[("JFB", "2026-03-25", "split")]["ratio"] == 2.0 and "Yahoo" in by[("QH", "2022-08-12", "split")]["reason"]
+
+
+def test_pending_overrides_refuse_the_build(tmp_path):
+    p = write_ov(tmp_path, [ov("accept", 2.0), ov("reject", d=SESSIONS[41].date(), reviewed_by="pending (owner confirmation)")])
+    with pytest.raises(st.SplitOverridesPending, match="X 2021-03-02"):
+        st.load_overrides(p)
 
 
 def test_breaks_are_written_to_the_table(tmp_path):
@@ -1365,8 +1367,12 @@ def test_joint_decision_composed_split_and_spinoff_on_the_post_split_basis():
     assert got == {("split", "split_composed_with_spinoff"): 0.5, ("spinoff", "spinoff_composed_with_split"): pytest.approx(1.96656, rel=1e-4)}
     assert one(rev, "spinoff_composed_with_split")["applied"] is True and not any(r["verdict"] == "split_spinoff_conflict" for r in rev)
     assert st.splits_by_symbol(acc) == {"P": [[D.isoformat(), 0.5]]} and list(st.splits_by_symbol(acc, "spinoff")) == ["P"]
-    # the same listings without FMP data cannot be told apart: refused, never guessed
+    # without FMP data the RAW JUMP (1.019) stands in as the evidence: it supports the composed pair (0.983), nothing else
     acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars(price=220.19)}, None, spin=(spin,), alp=[L("P", D, 0.5)])
+    assert {(a["kind"], a["verdict"]) for a in acc} == {("split", "split_composed_with_spinoff"), ("spinoff", "spinoff_composed_with_split")}
+    assert "raw jump" in acc[0]["fmp_step"]
+    # evidence that supports nothing: refused, never guessed
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars(price=60.0)}, None, spin=(spin,), alp=[L("P", D, 0.5)])
     assert acc == [] and one(rev, "split_spinoff_conflict")
 
 
@@ -1445,3 +1451,96 @@ def test_yahoo_answers_from_a_foreign_ticker_are_never_trusted(tmp_path):
                                                         "tried": [], "fetched_at": "2026-10-20T00:00:00Z"}), encoding="utf-8")
     foreign = sb.YahooSplitSource(str(tmp_path / "c"), ren, fetch=fake_yahoo({}), sleep=lambda s: None, bars_end=lambda s: date(2025, 11, 14))
     assert foreign("OP") == {"available": False, "ticker": "ZZZ", "splits": []} and foreign.records["OP"]["status"] == "foreign_ticker"
+
+
+# ---- follow-ups: small both-listed jump rule, spin-off overrides, FTI / UL / VGR / CRESY cases -------------------------
+def test_small_both_listed_factor_is_accepted_when_the_raw_jump_is_closer_to_f_than_to_one():
+    def case(jump, f):
+        raw = bars(40, jump)
+        return runf({"X": raw}, {"X": fmp(raw)}, [L("X", D, f)], [L("X", D, f)])        # FMP's own series is flat
+    acc, rev, stats = case(1.101, 1.1)                                                    # BBDO
+    assert [(a["verdict"], a["source"]) for a in acc] == [("small_both_jump_agrees", "both")] and stats["verdict_small_both_jump_agrees"] == 1
+    for jump, f in ((1.0055, 0.9697), (0.998, 1.1), (0.9938, 1.0256), (1.0217, 1.0447)):   # AIV, GBCI, METCB, PHG: closer to 1
+        acc, rev, _ = case(jump, f)
+        assert acc == [] and one(rev, "small_both_price_disagrees"), (jump, f)
+    acc, rev, _ = case(0.908, 0.9)                                                        # a reverse-direction small factor
+    assert [a["verdict"] for a in acc] == ["small_both_jump_agrees"]
+
+
+def test_spinoff_override_rejects_or_accepts_the_spinoff_alone_of_a_symbol_and_date():
+    raw = parent_bars()
+    own = lambda dec, **kw: ov(dec, symbol="P", kind="spinoff", **kw)                    # noqa: E731
+    # CENT: both the split listing and the spin-off rejected; FMP is flat, so nothing would be applied by the rules either
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw)}, alp=[L("P", D, 1.3)], fm=[L("P", D, 1.3)],
+                                ov=[ov("reject", symbol="P"), own("reject")])
+    assert acc == [] and {r["verdict"] for r in rev} == {"override_reject"} and len(rev) == 2
+    # a spin-off reject alone drops the adjustment (CTVA-style 'flat' would apply it) but leaves a listed split to the rules
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw)}, ov=[own("reject")])
+    assert acc == [] and one(rev, "override_reject")["applied"] is False
+    # accept applies the given factor as a spin-off and absorbs split listings there
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=[L("P", D, 1.3)], ov=[own("accept", ratio=1.2)])
+    assert [(a["kind"], a["verdict"], a["factor"]) for a in acc] == [("spinoff", "override_accept", 1.2)]
+    # an override for a spin-off that does not exist is counted, not silent
+    acc, rev, stats, _ = run_so({"P": raw}, None, spin=(), ov=[own("reject")])
+    assert stats["spinoff_overrides_unused"] == 1
+    # the kind is validated and part of the identity of an entry
+    with pytest.raises(ValueError, match="kind"):
+        st.load_overrides(write_ov(__import__("pathlib").Path(str(__import__("tempfile").mkdtemp())), [ov("reject", kind="dividend")]))
+
+
+def test_a_split_the_owner_rejected_is_no_candidate_and_the_spinoff_stands_alone():
+    # CRESY 2023-12-06: a 1.00985 stock dividend (rejected) and the IRS spin-off of the same day (factor ~1.037, FMP step 1.0093)
+    raw = parent_bars(before=100.0, after=96.0)
+    spin = SpinOff("P", D, "S", 0.2)                                                      # f = 1 + 0.2 * 20 / 96 = 1.04167
+    fd = {"P": fmp(raw, {40: 1.0093})}
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, fd, spin=(spin,), alp=[L("P", D, 1.00985)], fm=[L("P", D, 1.00985)],
+                            ov=[ov("reject", symbol="P")])
+    assert [(a["kind"], a["verdict"]) for a in acc] == [("spinoff", "spinoff_fmp_flat")] and acc[0]["factor"] == pytest.approx(1.04167, rel=1e-4)
+    assert not any(r["verdict"] == "split_spinoff_conflict" for r in rev)
+
+
+def test_a_spinoff_without_a_spinco_price_absorbs_the_split_listing_of_the_same_step():
+    # FTI 2021-02-16: no price for THNPF, FMP's step 1.22156 IS the spin-off factor; FMP lists 1.344 as a "split" there.  The old
+    # text said FMP agreed with neither candidate although the spin-off factor was derived from that very step.
+    raw = parent_bars()
+    fd = {"P": fmp(raw, {40: 1.22156})}
+    acc, rev, stats, _ = run_so({"P": raw}, fd, fm=[L("P", D, 1.344)])
+    assert [(a["kind"], a["verdict"]) for a in acc] == [("spinoff", "spinoff_from_fmp_step")] and acc[0]["factor"] == pytest.approx(1.22156)
+    assert not any(r["verdict"] == "split_spinoff_conflict" for r in rev) and stats["listings_absorbed_by_spinoff"] == 1
+    # the leftover reconcile (an accepted split with a spin-off of the same session) now also scores the spin-off alone
+    acc2, rev2, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw, {40: 1.124})}, alp=[L("P", D, 1.3)], fm=[L("P", D, 1.3)],
+                              ov=[ov("accept", 1.3, symbol="P")])
+    assert [a["kind"] for a in acc2] == ["split"]                                          # a reviewed override on the split wins
+
+
+def test_an_adr_ratio_change_the_session_after_the_spinoff_is_a_separate_event():
+    # UL 2025-12-08/09: the Magnum spin-off (0.2 MICC at 14.92 per share) on D, the 8:9 consolidation (0.8889) one session later
+    rows = []
+    for i, d in enumerate(SESSIONS):
+        p = 59.48 if i < 40 else (55.30 if i == 40 else 64.04)
+        rows.append({"t": pd.Timestamp(d).tz_localize("America/New_York").tz_convert("UTC"), "o": p, "c": p})
+    raw = pd.DataFrame(rows, columns=["t", "o", "c"])
+    fd = {"P": fmp(raw, {41: 0.88889})}                                                    # FMP does not adjust the spin-off
+    both = [L("P", D, 0.88889)]
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars(price=14.92)}, fd, spin=(SpinOff("P", D, "S", 0.2),), alp=both, fm=both)
+    got = {(a["kind"], a["date"]) for a in acc}
+    assert got == {("spinoff", D.isoformat()), ("split", SESSIONS[41].date().isoformat())}, got
+    # the spin-off's FMP window straddles the next session's step, so its vote is "unverified" (applied either way)
+    assert {a["verdict"] for a in acc if a["kind"] == "spinoff"} <= {"spinoff_fmp_flat", "spinoff_fmp_unverified"}
+    assert [a["verdict"] for a in acc if a["kind"] == "split"] == ["small_both"]
+    assert [a["factor"] for a in acc if a["kind"] == "spinoff"] == [pytest.approx(1 + 0.2 * 14.92 / 55.30)]
+    assert stats["splits_on_another_session_than_a_spinoff"] == 1 and stats["splits_moved_to_jump_session"] == 1
+    assert not any(r["verdict"] in ("split_spinoff_conflict", "spinoff_absorbed_by_split") for r in rev)
+
+
+def test_a_spinoff_and_a_split_are_scored_on_the_raw_jump_when_fmp_has_no_data():
+    # VGR 2021-12-30: no FMP file; the raw jump 1.519 supports the spin-off 1.5367, not the listed 1.41 split
+    rows = []
+    for i, d in enumerate(SESSIONS):
+        p = 17.16 if i < 40 else 11.30
+        rows.append({"t": pd.Timestamp(d).tz_localize("America/New_York").tz_convert("UTC"), "o": p, "c": p})
+    raw = pd.DataFrame(rows, columns=["t", "o", "c"])
+    both = [L("P", D, 1.41)]
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars(price=12.13)}, None, spin=(SpinOff("P", D, "S", 0.5),), alp=both, fm=both)
+    assert [(a["kind"], a["factor"]) for a in acc] == [("spinoff", pytest.approx(1 + 0.5 * 12.13 / 11.30))]
+    assert stats["listings_absorbed_by_spinoff"] == 2 and not any(r["verdict"] == "split_spinoff_conflict" for r in rev)

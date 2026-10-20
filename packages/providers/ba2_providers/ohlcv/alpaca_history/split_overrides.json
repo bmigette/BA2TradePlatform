@@ -168,7 +168,7 @@
    "ratio": 1.05,
    "reason": "5% stock dividend listed by FMP only (FMP step equals it); the company's 10-K confirms it: FY2016 10-K: '23rd consecutive year', distributed 2016-12-19 (https://www.sec.gov/Archives/edgar/data/0000022356/000002235617000009/cbsh1231201610k.htm)",
    "added": "2026-10-21",
-   "reviewed_by": "pending (owner confirmation)"
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
   },
   {
    "symbol": "CBSH",
@@ -177,7 +177,7 @@
    "ratio": 1.05,
    "reason": "5% stock dividend listed by FMP only (FMP step equals it); the company's 10-K confirms it: FY2017 10-K: '24th', distributed 2017-12-18 (https://www.sec.gov/Archives/edgar/data/0000022356/000002235618000015/cbsh1231201710k.htm)",
    "added": "2026-10-21",
-   "reviewed_by": "pending (owner confirmation)"
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
   },
   {
    "symbol": "CBSH",
@@ -186,7 +186,50 @@
    "ratio": 1.05,
    "reason": "5% stock dividend listed by FMP only (FMP step equals it); the company's 10-K confirms it: FY2019 10-K: '26 years' (https://www.sec.gov/Archives/edgar/data/22356/000002235620000009/cbsh1231201910k.htm)",
    "added": "2026-10-21",
-   "reviewed_by": "pending (owner confirmation)"
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CENT",
+   "event_date": "2024-02-09",
+   "decision": "reject",
+   "reason": "split LISTING rejected: the 1.277 split is the CENTA spin-off listed as a split; there is no corporate action: raw close 49.82 -> 41.43 (0.832), CENTA 43.31 -> 35.90 (0.829) the same day (earnings), FMP flat",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CENT",
+   "event_date": "2024-02-09",
+   "decision": "reject",
+   "kind": "spinoff",
+   "reason": "spin-off adjustment rejected: CENT and CENTA fell together (0.832 / 0.829) on earnings, FMP's series is flat: no corporate action",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CRESY",
+   "event_date": "2023-12-06",
+   "decision": "reject",
+   "reason": "split LISTING rejected (the owner's earlier decision, as for 2025-11-28): a 1.00985 stock dividend, immaterial and not adjusted; the IRS spin-off of the same day is adjusted by the spin-off rule (factor ~1.0368, FMP adj/raw step ~1.0093)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "VGR",
+   "event_date": "2021-12-30",
+   "decision": "reject",
+   "reason": "split LISTING rejected: the 1.41 'split' is the Douglas Elliman (DOUG) spin-off; raw close 17.16 -> 11.30 (1/1.519) is the spin-off drop (0.5 x 12.13 / 11.30 + 1 = 1.5367), no price support beyond it; FMP applied its own 1.41 listing",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "VGR",
+   "event_date": "2021-12-30",
+   "kind": "spinoff",
+   "decision": "accept",
+   "ratio": 1.5367,
+   "reason": "Douglas Elliman (DOUG) spin-off, 0.5 DOUG per VGR share: factor 1 + 0.5 x 12.13 / 11.30 = 1.5367; the raw drop 17.16 -> 11.30 (1/1.519) matches",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
   }
  ]
 }
