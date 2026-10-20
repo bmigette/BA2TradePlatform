@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.job import Job
 from sqlalchemy.exc import IntegrityError
@@ -52,6 +53,9 @@ FRED_PREOPEN_JOB_ID = "fred_preopen_refresh_job"
 # instant they run (entries are weekly: one failed 09:30 costs a week). A read that still finds
 # a file not covering today refetches it itself (guarded, with a backoff) and otherwise REFUSES.
 FRED_PREOPEN_HOUR, FRED_PREOPEN_MINUTE = 9, 0
+#: Minutes after 09:00 at which the series that failed the pre-open refresh are tried again
+#: (09:10, 09:20), so a FRED outage burst does not reach the 09:30 pass.
+FRED_PREOPEN_RETRY_DELAYS_MIN = (10, 10)
 
 # Scheduler id of the pre-open ATM-IV history warm (incident 2026-10-12: the 09:30 pass hit FMP's
 # 429 window and every iv_rank gate stayed closed). 08:30 America/New_York, Mon-Fri; the job stops by
@@ -894,8 +898,34 @@ class JobManager:
 
             result = fred_series.refresh_for_live_decision(list(MACRO_SERIES_IDS))
             logger.info(f"Pre-open FRED refresh: {result}")
+            if result["failed"]:
+                self._schedule_fred_preopen_retry(list(result["failed"]), 0)
         except Exception as e:
             logger.error(f"Error executing the pre-open FRED refresh: {e}", exc_info=True)
+
+    def _schedule_fred_preopen_retry(self, sids, attempt):
+        """One-off retry of the series that failed the pre-open refresh, after the next delay of
+        ``FRED_PREOPEN_RETRY_DELAYS_MIN`` (none left: the failure stays logged at ERROR)."""
+        if attempt >= len(FRED_PREOPEN_RETRY_DELAYS_MIN):
+            return
+        run_at = datetime.now(timezone.utc) + timedelta(minutes=FRED_PREOPEN_RETRY_DELAYS_MIN[attempt])
+        self._scheduler.add_job(
+            func=self._execute_fred_preopen_retry, trigger=DateTrigger(run_date=run_at),
+            args=[list(sids), attempt], id=f"{FRED_PREOPEN_JOB_ID}_retry_{attempt}",
+            name=f"Pre-open FRED retry {attempt + 1}", replace_existing=True, max_instances=1)
+        logger.info(f"Pre-open FRED retry {attempt + 1} for {sids} at {run_at.isoformat()}")
+
+    def _execute_fred_preopen_retry(self, sids, attempt):
+        """Refresh only *sids*; whatever still fails is retried once more."""
+        try:
+            from ba2_providers.macro import fred_series
+
+            result = fred_series.refresh_for_live_decision(list(sids))
+            logger.info(f"Pre-open FRED retry {attempt + 1}: {result}")
+            if result["failed"]:
+                self._schedule_fred_preopen_retry(list(result["failed"]), attempt + 1)
+        except Exception as e:
+            logger.error(f"Error executing the pre-open FRED retry: {e}", exc_info=True)
 
     def _execute_iv_snapshot(self):
         """Run the daily ATM-IV recorder."""

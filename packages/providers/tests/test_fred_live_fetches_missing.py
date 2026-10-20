@@ -454,3 +454,47 @@ class TestThePreOpenRefresh:
     def test_the_same_day_rate_series_is_refused(self):
         with pytest.raises(ValueError, match="first-release"):
             fred_series.refresh_for_live_decision(["DGS3MO"])
+
+
+# ---- one FRED GET retries a transient failure (2026-10-20: a 502 burst refused a 09:30 pass) ----
+class _Resp:
+    def __init__(self, status, payload=None):
+        self.status_code, self._p, self.content = status, payload or {"observations": []}, b"{}"
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(f"{self.status_code}", response=self)
+
+    def json(self):
+        return self._p
+
+
+def _retry_env(monkeypatch, statuses):
+    from ba2_providers.macro import fred_series as fs
+    seq, waits = list(statuses), []
+    monkeypatch.setattr(fs.requests, "get", lambda *a, **k: _Resp(seq.pop(0)))
+    monkeypatch.setattr(fs, "_sleep", waits.append)
+    return fs, seq, waits
+
+
+def test_a_502_burst_is_retried_and_the_fetch_succeeds(monkeypatch):
+    fs, seq, waits = _retry_env(monkeypatch, [502, 502, 200])
+    assert fs._fred_get("u", {}, "UNRATE") == {"observations": []}
+    assert waits == [2.0, 5.0] and seq == []
+
+
+def test_a_persistent_502_still_raises_after_the_last_wait(monkeypatch):
+    import requests
+    fs, seq, waits = _retry_env(monkeypatch, [502, 502, 502, 502])
+    with pytest.raises(requests.HTTPError):
+        fs._fred_get("u", {}, "UNRATE")
+    assert waits == [2.0, 5.0, 15.0]
+
+
+def test_a_400_is_final_and_not_retried(monkeypatch):
+    import requests
+    fs, seq, waits = _retry_env(monkeypatch, [400])
+    with pytest.raises(requests.HTTPError):
+        fs._fred_get("u", {}, "UNRATE")
+    assert waits == []
