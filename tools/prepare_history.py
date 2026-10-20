@@ -6,9 +6,49 @@ steps, ``--steps`` / ``--from-step``, ``--dry-run``, a JSON report, exit codes 0
 
 REQUIRED ``--source {alpaca,fmp}``.  Steps valid per source (in this order):
     alpaca: download, split-table, build, verify        fmp: download, verify
-  IMPLEMENTED today: alpaca / split-table ONLY.  Every other valid step (and the default "all steps") refuses with
-  "not implemented yet (plan Task 4)", exit 2, before anything runs; a step that is not valid for the source also refuses
-  (exit 2).  Never a silent no-op.
+  Every step is implemented.  A step that is not valid for the source refuses (exit 2).  Never a silent no-op.  The default
+  (no ``--steps``) runs EVERY step of the source, ``download`` first: it makes network requests (alpaca: resume-safe, ~0 requests
+  over complete stores) -- pass ``--steps`` to run less.
+
+STEP alpaca / download
+  download      Runs ``tools/alpaca_history_download.py`` three times with the RECORDED arguments (code constants ``ALPACA_DOWNLOADS``:
+                this is the runbook's source of truth).  Keys and account come from the arguments below.
+                  1. 5-minute store ``--store-5min``: ``<store>/symbols.txt``, start 2019-01-01, end 2026-10-13, phases default
+                     (corporate_actions, daily, intraday), max-gap-days 5;
+                  2. daily store ``--store``: ``<store>/symbols.txt``, start 2016-01-01, end 2026-10-13, asof 2026-10-12, phases
+                     corporate_actions,daily, max-gap-days 5;
+                  3. the same daily store, phases daily, symbols ``<store>/symbols_spinco_20261020.txt`` plus
+                     ``<out>/_meta/spinco_symbols_missing.txt`` (the split-table step's list of spin-off companies without bars)
+                     if that file exists (merged, de-duplicated, order kept).
+                Common: ``--keys-db`` (default: ``--db``) ``--account-id 1 --rpm 150 --min-remaining 60``.  A rerun over complete
+                stores makes ~0 data requests; a run that exits non-zero fails the step.
+    python tools/prepare_history.py --source alpaca --steps download
+
+STEP alpaca / build
+  build         Builds ``<out>/<SYM>_1d.parquet`` and ``<out>/<SYM>_5min.parquet`` (the FMP file layout) from the RAW daily store
+                (``--store``), the RAW 5-minute store (``--store-5min``) and ``<out>/_meta/split_table.json``, with a process pool
+                (``--workers``, one symbol at a time per worker).  Adjustment, break and session rules, file naming, the refusals
+                (run_id of the table vs its CSVs, asof) and the manifest ``<out>/_meta/build_manifest.json``: module docstring of
+                ``ba2_providers/ohlcv/alpaca_history/build.py``.  ``--symbols A,B`` builds a subset.
+    python tools/prepare_history.py --source alpaca --steps build --workers 6
+
+STEP alpaca|fmp / verify
+  verify        DATA-QUALITY GATE over the BUILT cache (alpaca: ``--out``; fmp: ``--fmp-daily-dir``): structural checks of every file,
+                5-minute coverage and self-consistency of the panel, residual overnight discontinuities vs the other vendor, the
+                cross-vendor ratio stability, an independent Yahoo daily check on a seeded sample, and ED-11 readiness.  Each check
+                writes its CSV under ``<report-dir>/verify/`` (default ``<out>/_meta/verify``); the step prints PASS / FAIL / INFO per check
+                and exits 1 on any FAIL.  Checks, thresholds and CSVs: docstring of ``ba2_providers/ohlcv/alpaca_history/verify.py``.
+                ``--panel-symbols`` (JSON list) selects the population the thresholds judge; ``--symbols`` restricts the run (the Yahoo
+                sample is then those symbols); ``--refresh-yahoo`` re-fetches Yahoo.
+    python tools/prepare_history.py --source alpaca --steps verify --panel-symbols panel_symbols.json
+    python tools/prepare_history.py --source fmp --steps verify --panel-symbols panel_symbols.json
+
+STEP fmp / download
+  download      Wraps ``ba2-test fetch-cache`` (runbook 4.1 step 1) with the arguments given here -- the symbol universe and the window are
+                the operator's, so they are REQUIRED (``--fmp-symbols-file`` ``--fmp-start`` ``--fmp-end``; no default universe):
+                    python testplatform/ba2test_launcher.py fetch-cache --provider fmp --timeframes 5min,1d --start <fmp-start>                         --end <fmp-end> --symbols @<fmp-symbols-file> --workers <fmp-workers, default 5>
+                The FMP key is read by ba2-test as everywhere else.  Non-zero exit of fetch-cache fails the step.
+    python tools/prepare_history.py --source fmp --steps download --fmp-symbols-file universe.txt --fmp-start 2020-01-01 --fmp-end 2025-12-31
 
 STEP alpaca / split-table
   split-table   Judge every Alpaca / FMP split candidate by the raw price jump (and FMP's adjusted-close step) and write
@@ -42,22 +82,39 @@ Exit codes: 0 every step passed; 1 a step failed (named in the report and on std
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from datetime import date, datetime
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCE_STEPS = {"alpaca": ("download", "split-table", "build", "verify"), "fmp": ("download", "verify")}
-IMPLEMENTED = {("alpaca", "split-table")}
+SPINCO_SYMBOLS_FILE = "symbols_spinco_20261020.txt"       # in the daily store: spin-off companies fetched by hand on 2026-10-20
+SPINCO_MISSING_FILE = "spinco_symbols_missing.txt"        # <out>/_meta, written by the split-table step
+DOWNLOAD_END = "2026-10-13"                                # first day NOT fetched (the stores' asof is the day before)
+DOWNLOAD_ASOF = "2026-10-12"
+#: THE RECORDED ``alpaca_history_download.py`` runs (runbook source of truth).  store: which store argument; symbols: file name in
+#: the store (None = the spin-off list, see ``_spinco_symbols``); a None asof / phases is left to the downloader's default.
+ALPACA_DOWNLOADS = (
+    {"label": "5-minute store", "store": "5min", "symbols": "symbols.txt", "start": "2019-01-01", "end": DOWNLOAD_END,
+     "asof": None, "phases": None, "max_gap_days": 5},
+    {"label": "daily store + corporate actions", "store": "daily", "symbols": "symbols.txt", "start": "2016-01-01",
+     "end": DOWNLOAD_END, "asof": DOWNLOAD_ASOF, "phases": "corporate_actions,daily", "max_gap_days": 5},
+    {"label": "daily store, spin-off companies", "store": "daily", "symbols": None, "start": "2016-01-01", "end": DOWNLOAD_END,
+     "asof": DOWNLOAD_ASOF, "phases": "daily", "max_gap_days": 5},
+)
+FMP_TIMEFRAMES = "5min,1d"
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
 
 
 def build_parser() -> argparse.ArgumentParser:
-    from ba2_providers.ohlcv.alpaca_history import split_build as sb, split_table as st
+    from ba2_providers.ohlcv.alpaca_history import build as bld, split_build as sb, split_table as st, verify as ver
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--source", required=True, choices=sorted(SOURCE_STEPS), help="the vendor whose history to prepare")
     ap.add_argument("--steps", help="comma list of steps to run (default: every step of the source). Steps: "
@@ -68,12 +125,30 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out", default=sb.DEFAULT_OUT, help="cache folder; outputs under <out>/_meta (default: %(default)s)")
     ap.add_argument("--fmp-daily-dir", default=sb.DEFAULT_FMP_DAILY, help="FMP adjusted daily files (default: %(default)s)")
     ap.add_argument("--db", default=sb.DEFAULT_DB, help="SQLite DB holding the AppSetting FMP_API_KEY (read-only)")
-    ap.add_argument("--symbols", help="comma-separated subset to judge (quick run)")
+    ap.add_argument("--store-5min", default=bld.DEFAULT_INTRADAY_STORE,
+                    help="raw Alpaca 5-minute store (download, build; default: %(default)s)")
+    ap.add_argument("--workers", type=int, default=4, help="build / verify process pool size (default: %(default)s)")
+    ap.add_argument("--keys-db", help="SQLite DB with the Alpaca market-data keys (download; default: --db)")
+    ap.add_argument("--account-id", type=int, default=1, help="account whose market-data keys the download uses (default: %(default)s)")
+    ap.add_argument("--rpm", type=float, default=150, help="download request ceiling per minute (default: %(default)s)")
+    ap.add_argument("--min-remaining", type=int, default=60, help="download: pause when fewer calls remain (default: %(default)s)")
+    ap.add_argument("--fmp-symbols-file", help="fmp download: universe file, one symbol per line (REQUIRED for that step)")
+    ap.add_argument("--fmp-start", help="fmp download: first day (REQUIRED for that step)")
+    ap.add_argument("--fmp-end", help="fmp download: last day (REQUIRED for that step)")
+    ap.add_argument("--fmp-workers", type=int, default=5, help="fmp download: fetch-cache --workers (default: %(default)s)")
+    ap.add_argument("--verify-years", default="2019-2025", help="verify: year or range YYYY-YYYY (default: %(default)s)")
+    ap.add_argument("--panel-symbols", help="verify: JSON list of the screener panel's symbols (the population the thresholds judge)")
+    ap.add_argument("--yahoo-sample-size", type=int, default=ver.YAHOO_SAMPLE, help="verify: random panel symbols for the Yahoo check")
+    ap.add_argument("--yahoo-seed", type=int, default=ver.YAHOO_SEED, help="verify: seed of that sample")
+    ap.add_argument("--min-coverage", type=float, default=ver.MIN_COVERAGE, help="verify threshold (default: %(default)s)")
+    ap.add_argument("--max-selfcons-bad", type=float, default=ver.MAX_SELFCONS_BAD,
+                    help="verify threshold: share of days whose last 5-minute close is > 2%% off the daily close (default: %(default)s)")
+    ap.add_argument("--symbols", help="comma-separated subset (quick run; split-table, build, verify)")
     ap.add_argument("--fmp-from", default="2016-01-01", help="first day of the FMP split calendar fetch")
     ap.add_argument("--fmp-to", help="last day of the FMP split calendar fetch (default: the store's asof + 1 day; "
                     "a value before the asof is refused)")
     ap.add_argument("--refresh-yahoo", action="store_true",
-                    help="fetch Yahoo's split history again for the rule-B candidates (default: use <out>/_meta/yahoo_splits)")
+                    help="fetch Yahoo again: split-table (rule-B split history, default: use <out>/_meta/yahoo_splits) and verify (daily closes, default: use <report>/verify/yahoo_daily)")
     ap.add_argument("--overrides", default=st.OVERRIDES_PATH, help="reviewed split overrides (default: %(default)s)")
     ap.add_argument("--report-dir", help="where prepare_history_<source>_report.json goes (default: <out>/_meta)")
     return ap
@@ -127,8 +202,181 @@ def plan_split_table(a: argparse.Namespace) -> List[str]:
             f"split-table: would write split_table.json, split_review.csv, split_accepted.csv, split_vs_fmp.csv under {meta}"]
 
 
-RUNNERS: Dict[str, Callable[[argparse.Namespace, Callable[[str], None]], Dict[str, Any]]] = {"split-table": step_split_table}
-PLANNERS: Dict[str, Callable[[argparse.Namespace], List[str]]] = {"split-table": plan_split_table}   # alpaca only
+def _load_downloader():
+    """tools/alpaca_history_download.py as a module (it is a script beside this file, not a package)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alpaca_history_download.py")
+    spec = importlib.util.spec_from_file_location("alpaca_history_download", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _read_symbol_lines(path: str) -> List[str]:
+    with open(path, encoding="utf-8") as f:
+        return [ln.strip() for ln in f if ln.strip()]
+
+
+def _spinco_symbols(a: argparse.Namespace) -> List[str]:
+    """The spin-off list of the store plus the split-table step's missing-spinco list (if present): merged, de-duplicated."""
+    syms = _read_symbol_lines(os.path.join(a.store, SPINCO_SYMBOLS_FILE))
+    missing = os.path.join(a.out, "_meta", SPINCO_MISSING_FILE)
+    if os.path.isfile(missing):
+        syms += _read_symbol_lines(missing)
+    return list(dict.fromkeys(syms))
+
+
+def download_argv(a: argparse.Namespace, spec: Dict[str, Any], symbols_file: str) -> List[str]:
+    """The argv of one recorded downloader run."""
+    store = a.store_5min if spec["store"] == "5min" else a.store
+    argv = ["--store", store, "--symbols-file", symbols_file, "--start", spec["start"], "--end", spec["end"]]
+    if spec["asof"]:
+        argv += ["--asof", spec["asof"]]
+    if spec["phases"]:
+        argv += ["--phases", spec["phases"]]
+    argv += ["--max-gap-days", str(spec["max_gap_days"]), "--keys-db", a.keys_db or a.db, "--account-id", str(a.account_id),
+             "--rpm", f"{a.rpm:g}", "--min-remaining", str(a.min_remaining)]
+    return argv
+
+
+def step_alpaca_download(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, Any]:
+    dl = _load_downloader()
+    runs = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for spec in ALPACA_DOWNLOADS:
+            store = a.store_5min if spec["store"] == "5min" else a.store
+            if spec["symbols"]:
+                symbols_file = os.path.join(store, spec["symbols"])
+            else:
+                symbols_file = os.path.join(tmp, "symbols_spinco_merged.txt")
+                with open(symbols_file, "w", encoding="utf-8") as f:
+                    f.write("\n".join(_spinco_symbols(a)) + "\n")
+            argv = download_argv(a, spec, symbols_file)
+            log(f"download: {spec['label']}: alpaca_history_download.py {' '.join(argv)}")
+            code = dl.main(argv)
+            runs.append({"label": spec["label"], "argv": argv, "exit_code": code})
+            if code != 0:
+                raise RuntimeError(f"alpaca_history_download.py exited {code} for '{spec['label']}' (see its log above)")
+    return {"runs": runs}
+
+
+def plan_alpaca_download(a: argparse.Namespace) -> List[str]:
+    lines = []
+    for spec in ALPACA_DOWNLOADS:
+        store = a.store_5min if spec["store"] == "5min" else a.store
+        sym = spec["symbols"] or f"<{SPINCO_SYMBOLS_FILE} + {SPINCO_MISSING_FILE} merged>"
+        if not os.path.isdir(store):
+            raise FileNotFoundError(f"store not found: {store}")
+        lines.append("download: alpaca_history_download.py " + " ".join(download_argv(a, spec, os.path.join(store, sym))))
+    _spinco_symbols(a)                                           # raises if the spin-off list is missing
+    return lines
+
+
+def fmp_download_argv(a: argparse.Namespace) -> List[str]:
+    missing = [n for n, v in (("--fmp-symbols-file", a.fmp_symbols_file), ("--fmp-start", a.fmp_start), ("--fmp-end", a.fmp_end)) if not v]
+    if missing:
+        raise ValueError(f"fmp download needs {', '.join(missing)}")
+    date.fromisoformat(a.fmp_start)
+    date.fromisoformat(a.fmp_end)
+    if not os.path.isfile(a.fmp_symbols_file):
+        raise FileNotFoundError(f"--fmp-symbols-file not found: {a.fmp_symbols_file}")
+    launcher = os.path.join(REPO, "testplatform", "ba2test_launcher.py")
+    return [sys.executable, launcher, "fetch-cache", "--provider", "fmp", "--timeframes", FMP_TIMEFRAMES, "--start", a.fmp_start,
+            "--end", a.fmp_end, "--symbols", "@" + os.path.abspath(a.fmp_symbols_file), "--workers", str(a.fmp_workers)]
+
+
+def step_fmp_download(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, Any]:
+    argv = fmp_download_argv(a)
+    log("download: " + " ".join(argv))
+    proc = subprocess.run(argv, cwd=REPO)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ba2-test fetch-cache exited {proc.returncode}")
+    return {"argv": argv, "exit_code": proc.returncode}
+
+
+def plan_fmp_download(a: argparse.Namespace) -> List[str]:
+    return ["download: " + " ".join(fmp_download_argv(a))]
+
+
+def _symbol_list(a: argparse.Namespace) -> Optional[List[str]]:
+    return [x.strip() for x in a.symbols.split(",") if x.strip()] if a.symbols else None
+
+
+def step_build(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, Any]:
+    from ba2_providers.ohlcv.alpaca_history import build as bld
+    result = bld.build_cache(daily_store=a.store, intraday_store=a.store_5min, out=a.out, symbols=_symbol_list(a),
+                             workers=a.workers, log=log)
+    per = result.pop("per_symbol_s")
+    result["seconds_per_symbol"] = round(sum(per.values()) / max(len(per), 1), 3)
+    result["slowest"] = sorted(per.items(), key=lambda kv: -kv[1])[:5]
+    for k, v in result.items():
+        print(f"  {k}: {v}")
+    return result
+
+
+def plan_build(a: argparse.Namespace) -> List[str]:
+    from ba2_providers.ohlcv.alpaca_history import build as bld
+    table = bld.load_split_table(a.out)                       # raises BuildError on a missing table / run_id mismatch
+    for label, path in (("daily store", a.store), ("5-minute store", a.store_5min)):
+        if not os.path.isdir(os.path.join(path, "bars")):
+            raise FileNotFoundError(f"{label} not found: {path}")
+    return [f"build: split table {table.run_id} (asof {table.asof}); would write <SYM>_1d/_5min.parquet and "
+            f"build_manifest.json under {a.out} with {a.workers} workers"]
+
+
+def _years(text: str) -> List[int]:
+    lo, _, hi = text.partition("-")
+    return list(range(int(lo), int(hi or lo) + 1))
+
+
+def _verify_dirs(a: argparse.Namespace) -> Tuple[str, Optional[str], str]:
+    """(cache to verify, the other vendor's cache, output dir)."""
+    cache = a.out if a.source == "alpaca" else a.fmp_daily_dir
+    other = a.fmp_daily_dir if a.source == "alpaca" else (a.out if os.path.isdir(a.out) else None)
+    return cache, other, os.path.join(a.report_dir or os.path.join(a.out, "_meta"), "verify")
+
+
+def step_verify(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, Any]:
+    from ba2_providers.ohlcv.alpaca_history import verify as ver
+    from ba2_providers.ohlcv.alpaca_history.split_table import build_rename_map, read_corporate_actions, rename_successors
+    cache, other, out_dir = _verify_dirs(a)
+    panel = None
+    if a.panel_symbols:
+        with open(a.panel_symbols, encoding="utf-8") as f:
+            panel = [s.strip().upper().replace(".", "-") for s in json.load(f)]
+    renames = build_rename_map(read_corporate_actions(a.store))
+    yahoo = ver.YahooDaily(os.path.join(out_dir, "yahoo_daily"), refresh=a.refresh_yahoo,
+                           successors=lambda s: rename_successors(s, renames))
+    symbols = [x.strip().upper().replace(".", "-") for x in a.symbols.split(",") if x.strip()] if a.symbols else None
+    breaks = ver.load_breaks(os.path.join(a.out, "_meta")) if a.source == "alpaca" else {}
+    spinoffs = ver.load_spinoffs(os.path.join(a.out, "_meta")) if a.source == "alpaca" else {}
+    results = ver.run_gate(cache, other=other, out_dir=out_dir, symbols=symbols, panel=panel, years=_years(a.verify_years),
+                           breaks=breaks, spinoffs=spinoffs, workers=a.workers, yahoo=yahoo, yahoo_sample=a.yahoo_sample_size, yahoo_seed=a.yahoo_seed,
+                           min_coverage=a.min_coverage, max_selfcons_bad=a.max_selfcons_bad, log=log)
+    for name, r in results.items():
+        print(f"{r['status']:5s} {name}: {json.dumps(r['summary'], default=str)[:1500]}")
+        if r["csv"]:
+            print(f"       {r['csv']}")
+    failed = ver.gate_failed(results)
+    out = {"checks": {k: {"status": v["status"], "summary": v["summary"], "csv": v["csv"]} for k, v in results.items()}, "failed": failed}
+    if failed:
+        raise RuntimeError("verify FAILED: " + ", ".join(failed))
+    return out
+
+
+def plan_verify(a: argparse.Namespace) -> List[str]:
+    cache, other, out_dir = _verify_dirs(a)
+    if not os.path.isdir(cache):
+        raise FileNotFoundError(f"cache not found: {cache}")
+    _years(a.verify_years)
+    return [f"verify: would read {cache} (other vendor: {other}) years {a.verify_years}, write the check CSVs under {out_dir}"]
+
+
+RUNNERS: Dict[Tuple[str, str], Callable[[argparse.Namespace, Callable[[str], None]], Dict[str, Any]]] = {
+    ("alpaca", "download"): step_alpaca_download, ("alpaca", "split-table"): step_split_table, ("alpaca", "build"): step_build,
+    ("alpaca", "verify"): step_verify, ("fmp", "download"): step_fmp_download, ("fmp", "verify"): step_verify}
+PLANNERS: Dict[Tuple[str, str], Callable[[argparse.Namespace], List[str]]] = {
+    ("alpaca", "download"): plan_alpaca_download, ("alpaca", "split-table"): plan_split_table, ("alpaca", "build"): plan_build,
+    ("alpaca", "verify"): plan_verify, ("fmp", "download"): plan_fmp_download, ("fmp", "verify"): plan_verify}
 
 
 def main(argv: Optional[List[str]] = None, *, log: Optional[Callable[[str], None]] = None) -> int:
@@ -156,12 +404,6 @@ def main(argv: Optional[List[str]] = None, *, log: Optional[Callable[[str], None
         steps = list(valid[valid.index(a.from_step):])
     else:
         steps = list(valid)
-    todo = [x for x in steps if (a.source, x) not in IMPLEMENTED]
-    if todo:
-        done = ", ".join(f"{src}/{st_}" for src, st_ in sorted(IMPLEMENTED))
-        print(f"step(s) {todo} of --source {a.source}: not implemented yet (plan Task 4); nothing was run. "
-              f"Implemented: {done}", file=sys.stderr)
-        return EXIT_CONFIG
     try:
         date.fromisoformat(a.fmp_from)
         if a.fmp_to:
@@ -171,16 +413,17 @@ def main(argv: Optional[List[str]] = None, *, log: Optional[Callable[[str], None
         return EXIT_CONFIG
 
     from ba2_providers.fmp_common import redact
+    from ba2_providers.ohlcv.alpaca_history.build import BuildError
     from ba2_providers.ohlcv.alpaca_history.split_table import SplitOverridesPending
     if a.dry_run:
         try:
             for s in steps:
-                for line in PLANNERS[s](a):
+                for line in PLANNERS[(a.source, s)](a):
                     print(line)
         except SplitOverridesPending as e:
             print(f"REFUSED: {e}", file=sys.stderr)
             return EXIT_CONFIG
-        except FileNotFoundError as e:
+        except (FileNotFoundError, ValueError, BuildError) as e:
             print(str(e), file=sys.stderr)
             return EXIT_CONFIG
         return EXIT_OK
@@ -193,11 +436,11 @@ def main(argv: Optional[List[str]] = None, *, log: Optional[Callable[[str], None
         t0 = time.time()
         entry: Dict[str, Any] = {"step": s}
         try:
-            entry["result"] = RUNNERS[s](a, log)
+            entry["result"] = RUNNERS[(a.source, s)](a, log)
             entry["status"] = "ok"
-        except SplitOverridesPending as e:
+        except (SplitOverridesPending, BuildError) as e:
             print(f"REFUSED: {e}", file=sys.stderr)
-            return EXIT_CONFIG                                   # nothing ran, nothing to report
+            return EXIT_CONFIG                                   # a refused input: nothing (more) to report
         except Exception as e:                                   # a failed step stops the pipeline, named
             # the traceback and message go to the report and stderr REDACTED (a request error can embed the key)
             entry["status"], entry["error"] = "failed", redact(f"{type(e).__name__}: {e}")

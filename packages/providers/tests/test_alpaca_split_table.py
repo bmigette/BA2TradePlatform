@@ -335,14 +335,11 @@ def test_pipeline_source_and_step_validation(tmp_path, capsys):
     assert cli.main(["--source", "fmp", "--from-step", "build"] + base) == 2
     assert cli.main(["--source", "alpaca", "--steps", "split-table", "--from-step", "split-table"] + base) == 2
     assert cli.main(["--source", "alpaca", "--steps", "split-table", "--fmp-from", "yesterday"] + base) == 2
-    # valid but not implemented: refuse loudly, run nothing, write nothing
-    for src, step in (("alpaca", "download"), ("alpaca", "build"), ("alpaca", "verify"), ("fmp", "download"),
-                      ("fmp", "verify")):
-        assert cli.main(["--source", src, "--steps", step] + base) == 2
-        assert "not implemented yet (plan Task 4)" in capsys.readouterr().err
-    assert cli.main(["--source", "alpaca", "--steps", "split-table,build"] + base) == 2   # one unimplemented step refuses all
-    assert cli.main(["--source", "alpaca"] + base) == 2                           # default = every step: refuses
-    assert cli.main(["--source", "fmp", "--dry-run"] + base) == 2
+    # every step is implemented; a dry run of one whose inputs are missing refuses (exit 2) and writes nothing
+    assert cli.main(["--source", "fmp", "--steps", "download", "--dry-run"] + base) == 2         # needs --fmp-symbols-file etc.
+    assert "--fmp-symbols-file" in capsys.readouterr().err
+    assert cli.main(["--source", "alpaca", "--steps", "build", "--dry-run"] + base) == 2         # no split table yet
+    assert cli.main(["--source", "alpaca", "--steps", "verify", "--dry-run"] + base) == 2        # no cache folder
     assert not (tmp_path / "out").exists()
 
 
