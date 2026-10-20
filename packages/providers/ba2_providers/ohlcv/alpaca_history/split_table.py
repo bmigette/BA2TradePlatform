@@ -104,7 +104,20 @@ THE RULES (tolerances are module constants)
     split by a vendor: it is absorbed (``listings_absorbed_by_spinoff``), never adjusted twice; a split that still gets
     accepted with the spin-off's factor (e.g. through an override) stops the build.  Split overrides that REJECT a listing
     (NVS, HON, ADEA, BIP, CTVA, AMC) reject the SPLIT listing only; they never block a spin-off adjustment.
-  * SPLIT + SPIN-OFF ON ONE EX-DATE.  A split and a spin-off of one symbol within 3 sessions are ONE price event (AIV 2020-12-15:
+  * SPLIT + SPIN-OFF, JOINT DECISION.  When a split is LISTED within 3 sessions of a spin-off's ex-date (HON 2026-06-29: a 1:2
+    reverse split and the HONA spin-off, 1 HONA per 2 HON), the price shows one combined move.  Three candidates are
+    scored by FMP's step across the date: the split alone (step = f), the spin-off alone (step = S), and the two COMPOSED
+    (step = f x S', where the spin rate is converted to the post-split share basis: S' = 1 + (rate / f) x spinco_close /
+    parent_close).  The ONE candidate within 10 % of the step is kept (several within 10 %: the closest wins only when it is
+    within 2 % and the others are not); none or an ambiguous tie -> ``split_spinoff_conflict`` review row, neither applied.
+    Split alone: the listed split is decided by the normal rules and the spin-off is absorbed
+    (``spinoff_absorbed_by_split``).  Spin-off alone: the listing was the spin-off listed as a split (a listed ratio within 2 %
+    of the spin-off factor is always that).  Composed: BOTH are applied -- the split (``split_composed_with_spinoff``) and the
+    spin-off at S' (``spinoff_composed_with_split``) -- because volume is multiplied by the split and not by the spin-off.
+    Only Alpaca's listed ratios are split candidates when Alpaca lists any (FMP's own composite "split" is not).  A reviewed
+    override on the listing decides it (the split is kept, the spin-off absorbed).  An override decision always leaves a row
+    (``override_accept`` / ``override_reject``): a listed event never disappears silently.
+  * SPLIT + SPIN-OFF ON ONE EX-DATE (leftovers).  A split and a spin-off of one symbol within 3 sessions are ONE price event (AIV 2020-12-15:
     the vendors list the spin-off as a 9.295 split, Alpaca lists the spin-off itself): never both.  The SPLIT is kept and the
     spin-off absorbed (``spinoff_absorbed_by_split``, informational row; recorded in the split's ``absorbed`` /
     ``absorbed_factor`` columns and in ``absorbed_spinoffs`` of split_table.json) when the split is a reviewed override or FMP's
@@ -114,6 +127,9 @@ THE RULES (tolerances are module constants)
     the current ticker: OP was renamed SVRN on 2025-11-17, after its bars end (2025-11-14), so its 1:10, 1:20 and 1:25 reverse
     splits stay on OP (counted: ``events_mapped_to_older_symbol``); a symbol "has bars" for an event when its first bar is on/before
     the event date and its last bar on/after it.
+  * SMALL BOTH-LISTED FACTORS need the price to agree: FMP's step equals the factor (within 2 %) -> ``small_both``; else Yahoo
+    lists it (3 sessions, 0.5 %) -> ``small_confirmed_by_yahoo`` (source ``both+yahoo``); else ``small_both_price_disagrees``
+    review row, NOT applied (AIV 2019-02-21: flat raw jump, flat FMP series, Yahoo's series matches ours only without it).
   * BOTH-VENDORS RULE (``both_listed_jump_within_1_5``): a big event with ``|ln f| >= ln 2`` that BOTH vendors list at the
     same ratio (within 1 %) is accepted when the raw jump is within x1.5 of f, with or without a matching FMP step (tried
     after the jump proof and the guarded step proof).
@@ -153,7 +169,7 @@ VERDICT CODES (``VERDICTS``; counted in the printed summary as ``verdict_<code>`
              proven_by_fmp_step      big, jump does not prove it but FMP's step equals f and the guard holds: accepted (FMP-only: + review row)
              ratio_mismatch_resolved           vendors disagree; the jump proves one ratio
              ratio_mismatch_resolved_by_fmp_step  vendors disagree; the step equals one, the jump does not contradict it
-             small_both              small, both vendors list it
+             small_both              small, both vendors list it AND FMP's step equals it
              small_confirmed_by_yahoo  small, one vendor lists it and Yahoo lists it within 0.5 % (+ Yahoo is consulted)
              override_accept         decided by an override entry
              both_listed_jump_within_1_5  both vendors list a big (>= x2) ratio and the jump is within x1.5 of it (no step needed)
@@ -177,6 +193,9 @@ VERDICT CODES (``VERDICTS``; counted in the printed summary as ``verdict_<code>`
              inferred_unconfirmed    candidate unlisted split that Yahoo does not list (not applied)
              yahoo_unavailable       candidate unlisted split Yahoo could not confirm (not applied)
              spinoff_absorbed_by_split  informational (applied): the spin-off was absorbed by the split on the same ex-date
+             split_composed_with_spinoff / spinoff_composed_with_split  the composed pair, both applied (see JOINT DECISION)
+             small_both_price_disagrees  small, both vendors list it but the price does not support it (not applied)
+             override_accept / override_reject  informational row of every override decision (listings it decided)
              split_spinoff_conflict  split and spin-off on one ex-date that FMP's step does not support: neither applied
              spinoff_fmp_mismatch    spin-off whose computed factor FMP's step contradicts (not applied)
              spinoff_no_spinco_price spin-off whose spinco has no bar within 3 sessions of the ex-date (not applied)
@@ -249,7 +268,8 @@ VERDICTS = ("proven", "fmp_only_proven", "proven_by_fmp_step", "ratio_mismatch_r
             "ratio_mismatch_resolved_by_fmp_step", "small_both", "override_accept", "override_reject",
             "rejected_confirmed", "jump_explained_by_market", "alpaca_contradicted", "fmp_contradicted",
             "both_contradicted", "unresolved", "fmp_step_without_jump", "small_single_vendor", "small_confirmed_by_yahoo", "spinoff_absorbed_by_split",
-            "split_spinoff_conflict", "ratio_mismatch", "no_price_data",
+            "split_spinoff_conflict", "split_composed_with_spinoff",
+            "spinoff_composed_with_split", "small_both_price_disagrees", "ratio_mismatch", "no_price_data",
             "unexplained_jump", "overlapping_accepts", "both_listed_jump_within_1_5", "inferred_confirmed_by_yahoo", "inferred_unconfirmed", "yahoo_unavailable", "series_break",
             "spinoff_fmp_agrees", "spinoff_fmp_flat", "spinoff_fmp_unverified", "spinoff_fmp_mismatch",
             "spinoff_no_spinco_price", "spinoff_not_adjusted_cvr_warrant", "spinoff_from_fmp_step")
@@ -850,6 +870,21 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
             continue
         placed.append((src, ev, _first_session_on_or_after(bars, ev.date)))
 
+    units = _units(_cluster(placed))
+    consumed: set = set()                                # ids of the listing groups a spin-off decision already settled
+    pending_absorb: List[Tuple[SpinOff, float, int, date]] = []
+    composed_ids: set = set()                            # ids of the accepted dicts of a composed split + spin-off pair
+
+    def idx_of(a: Mapping[str, Any]) -> int:
+        return _first_session_on_or_after(bars, date.fromisoformat(a["date"]))
+
+    def yahoo_lists(ratio: float, i0: int) -> bool:
+        """Yahoo lists a split within NEAR_SESSIONS sessions of session ``i0`` with a ratio within 0.5 % (CLEAN_TOL)"""
+        y = yahoo(sym) if yahoo is not None else None
+        return bool(y is not None and y["available"]
+                    and any(abs(_first_session_on_or_after(bars, date.fromisoformat(yd)) - i0) <= NEAR_SESSIONS
+                            and abs(math.log(float(yr)) - math.log(ratio)) <= CLEAN_TOL for yd, yr in y["splits"]))
+
     # ---- spin-offs: the factor is COMPUTED, f = 1 + (new_rate / source_rate) * spinco_close(D) / parent_close(D), D = the
     # ex-date session, spinco_close = the close of the spinco's first session on/after D within NEAR_SESSIONS sessions.  The
     # jump and big-factor rules do not apply.  FMP's step across D is a cross-check, not the source.
@@ -886,7 +921,65 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
                    f"spin-off of {so.spinco} (ratio {so.ratio:.6g}): no {so.spinco} bar within {NEAR_SESSIONS} sessions of "
                    f"the ex-date (or the spinco's current ticker is the parent's own), the factor cannot be computed", step="")
             continue
-        f = 1.0 + so.ratio * float(sc.c[k]) / float(bars.c[iD])
+        pc = float(sc.c[k]) / float(bars.c[iD])
+        f = 1.0 + so.ratio * pc
+        # ---- a split LISTED within NEAR_SESSIONS sessions of the ex-date: one price event, never both counted.  Candidates
+        # (FMP's step across the date must be within 10 % of one, decisively): the split alone, the spin-off alone, or the
+        # two composed -- the spin-off rate then converted to the POST-split share basis (rate / split ratio: Honeywell's 1 HONA
+        # per 2 HON, after the 1:2 reverse split, is 1 per new share).  Units a reviewed override covers are left to it.
+        near = [g for g in units if id(g) not in consumed and any(abs(m[2] - iD) <= NEAR_SESSIONS for m in g)
+                and not any(date.fromisoformat(o["event_date"]) in {m[1].date for m in g} for o in overrides)]
+        if near:
+            members = [m for g in near for m in g]
+            R = _distinct([m[1].ratio for m in members if m[0] == "alpaca"]) or _distinct([m[1].ratio for m in members])
+            if any(abs(math.log(r) - math.log(f)) <= STEP_TOL for r in R):
+                # a vendor lists the spin-off itself as a split (GE, MMM): adjusted ONCE, as the spin-off
+                stats["listings_absorbed_by_spinoff"] += len(members)
+                consumed.update(id(g) for g in near)
+            else:
+                cands = []                                        # (kind, step it predicts, split ratio, spin-off factor)
+                for r in R:
+                    sprime = 1.0 + (so.ratio / r) * pc
+                    cands.append(("split", r, r, None))
+                    cands.append(("composed", r * sprime, r, sprime))
+                cands.append(("spinoff", f, None, f))
+                v, ok = rser.step(D, [x for x in listed_dates + ov_dates + so_dates if x != D]) if rser is not None else (None, True)
+                devs = [(abs(math.log(v) - math.log(c[1])), c) for c in cands] if (v is not None and ok) else []
+                agree = sorted((dv, c) for dv, c in devs if dv <= SPINOFF_FMP_TOL)
+                pick = None
+                if len(agree) == 1 or (len(agree) > 1 and agree[0][0] <= STEP_TOL < agree[1][0]):
+                    pick = agree[0][1]
+                if pick is None:
+                    consumed.update(id(g) for g in near)
+                    stats["listings_absorbed_by_spinoff"] += 0
+                    review(D, None, None, None, "split_spinoff_conflict", False,
+                           f"listed split(s) {R} and the spin-off of {so.spinco} (factor {f:.6g}, ratio {so.ratio:.6g}) fall on "
+                           f"one ex-date; FMP's step {('none' if v is None else format(v, '.6g'))} agrees with "
+                           + ("none of" if not agree else "several of") + " the candidates (split alone, spin-off alone, composed "
+                           "with the spin rate on the post-split basis): NEITHER is applied (decide it with an override)",
+                           step=_fmt_step(v, "other") if v is not None else "none")
+                    continue
+                kind, _target, r_pick, s_pick = pick
+                step_txt = f"{v:.6g} agrees with {kind} (target {_target:.6g})"
+                if kind == "split":
+                    pending_absorb.append((so, f, iD, D))        # the units stay with the loop below; the spin-off is absorbed
+                    continue
+                consumed.update(id(g) for g in near)
+                if kind == "composed":
+                    sd = min(m[1].date for m in members if m[0] == "alpaca" or not any(mm[0] == "alpaca" for mm in members)
+                             if abs(math.log(m[1].ratio) - math.log(r_pick)) <= RATIO_TOL)
+                    accept(bars.days[_first_session_on_or_after(bars, sd)].astype(object), r_pick, "alpaca", "split_composed_with_spinoff",
+                           step_txt)
+                    composed_ids.add(id(acc[-1]))
+                    accept(D, s_pick, "alpaca_spinoff", "spinoff_composed_with_split", step_txt, kind="spinoff")
+                    composed_ids.add(id(acc[-1]))
+                    so_applied.append((iD, s_pick))
+                    review(D, None, None, None, "spinoff_composed_with_split", True,
+                           f"split {r_pick:.6g} and spin-off of {so.spinco} on one ex-date, composed: spin rate {so.ratio:.6g} per old "
+                           f"share = {so.ratio / r_pick:.6g} per new share, factor {s_pick:.6g}; FMP's step {v:.6g} vs split x spin-off "
+                           f"{_target:.6g}", count=False, step=step_txt)
+                    continue
+                stats["listings_absorbed_by_spinoff"] += len(members)         # kind == "spinoff": FMP supports the spin-off alone
         step = "none" if step_on else ""
         vote = "none"
         if rser is not None:
@@ -914,8 +1007,10 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
     ov_used = set()
     ov_positions: List[int] = []
     event_positions: List[int] = []
-    for grp in _units(_cluster(placed)):
+    for grp in units:
         event_positions += [m[2] for m in grp]
+        if id(grp) in consumed:
+            continue
         dates = sorted({m[1].date for m in grp})
         # ---- override: decides the event outright
         matches = [o for o in overrides if date.fromisoformat(o["event_date"]) in dates]
@@ -925,6 +1020,7 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
         if matches:
             ov = matches[0]
             stats["listings_absorbed_by_override"] += len(grp)
+            what = "; ".join(f"{m[0]} lists {m[1].ratio:.6g} on {m[1].date}" for m in grp)
             if id(ov) in ov_used:                     # the same event listed twice (e.g. with an inverted ratio): decided once
                 continue
             ov_used.add(id(ov))
@@ -932,6 +1028,9 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
                 accept(date.fromisoformat(ov["event_date"]), float(ov["ratio"]), "override", "override_accept")
             else:
                 stats["verdict_override_reject"] += 1
+            review(date.fromisoformat(ov["event_date"]), None, None, None, "override_" + ov["decision"],
+                   ov["decision"] == "accept", f"reviewed override ({ov['reviewed_by']}) decides the listing(s) [{what}]: {ov['reason']}",
+                   count=False)
             continue
         if any(abs(m[2] - p) <= NEAR_SESSIONS and abs(math.log(m[1].ratio) - math.log(f)) <= STEP_TOL
                for m in grp for p, f in so_applied):
@@ -980,12 +1079,17 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
         both = a_r is not None and f_r is not None
         if abs(math.log(ratio)) < BIG_MIN:
             if both:
-                accept(d0, ratio, "both", "small_both", ctx.step_str(ratio, d0))
+                sv, sok = ctx.rser.step(d0, ctx.others) if ctx.rser is not None else (None, True)
+                if _step_vote(sv, sok, ratio) == "equals_f":
+                    accept(d0, ratio, "both", "small_both", ctx.step_str(ratio, d0))
+                elif yahoo_lists(ratio, ctx.idxs[d0]):
+                    accept(d0, ratio, "both+yahoo", "small_confirmed_by_yahoo", ctx.step_str(ratio, d0))
+                else:
+                    review(d0, a_r, f_r, ctx.shown(), "small_both_price_disagrees", False,
+                           f"small ratio {ratio:.6g} listed by both vendors, but FMP's own series does not step by it and Yahoo "
+                           f"does not list it: the price does not support it, NOT applied", step=ctx.step_str(ratio, d0))
             else:
-                y = yahoo(sym) if yahoo is not None else None
-                if (y is not None and y["available"]
-                        and any(abs(_first_session_on_or_after(bars, date.fromisoformat(yd)) - ctx.idxs[d0]) <= NEAR_SESSIONS
-                                and abs(math.log(float(yr)) - math.log(ratio)) <= CLEAN_TOL for yd, yr in y["splits"])):
+                if yahoo_lists(ratio, ctx.idxs[d0]):
                     # the price cannot prove a small ratio and only one vendor lists it, but Yahoo lists it too (0.5 %)
                     accept(d0, ratio, f"{src}+yahoo", "small_confirmed_by_yahoo", ctx.step_str(ratio, d0))
                     continue
@@ -1048,6 +1152,8 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
             accept(d, float(o["ratio"]), "override", "override_accept")
         else:
             stats["verdict_override_reject"] += 1
+        review(d, None, None, None, "override_" + o["decision"], o["decision"] == "accept",
+               f"reviewed override ({o['reviewed_by']}), no vendor lists it: {o['reason']}", count=False)
     positions = event_positions + ov_positions + so_positions
 
     # ---- two big accepts in the same direction within NEAR_SESSIONS sessions would adjust one split twice (the
@@ -1073,12 +1179,22 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
     # ---- a split and a spin-off within NEAR_SESSIONS sessions are ONE price event: never apply both.  Keep the SPLIT, absorb
     # the spin-off (recorded in provenance), when the split is an override, or when the FMP step agrees (within 10 %) with
     # the split alone or with split x spin-off; otherwise refuse both into the review file.
+    for so, f_so, iD, D in pending_absorb:           # FMP's step supports the listed SPLIT alone: keep it, absorb the spin-off
+        x = next((a for a in acc if a["kind"] == "split" and abs(idx_of(a) - iD) <= NEAR_SESSIONS), None)
+        if x is None:
+            review(D, None, None, None, "split_spinoff_conflict", False,
+                   f"FMP's step supports the listed split alone, but no split was accepted at the spin-off of {so.spinco} "
+                   f"(factor {f_so:.6g}): neither is applied", step="")
+            continue
+        x["absorbed"] = f"spin-off of {so.spinco} factor {f_so:.6g} on {D.isoformat()} (FMP's step supports the split alone)"
+        x["absorbed_factor"] = f_so
+        review(D, None, None, None, "spinoff_absorbed_by_split", True,
+               f"the spin-off of {so.spinco} (factor {f_so:.6g}) and the split {x['factor']:.6g} ({x['verdict']}) fall on the same "
+               f"ex-date: ONE event is applied, the split (FMP's step supports it alone)", step=x["fmp_step"])
     if n and any(a["kind"] == "spinoff" for a in acc):
-        def idx_of(a: Mapping[str, Any]) -> int:
-            return _first_session_on_or_after(bars, date.fromisoformat(a["date"]))
-
-        for sp in [a for a in acc if a["kind"] == "spinoff"]:
-            for x in [a for a in acc if a["kind"] == "split" and abs(idx_of(a) - idx_of(sp)) <= NEAR_SESSIONS]:
+        for sp in [a for a in acc if a["kind"] == "spinoff" and id(a) not in composed_ids]:
+            for x in [a for a in acc if a["kind"] == "split" and id(a) not in composed_ids
+                      and abs(idx_of(a) - idx_of(sp)) <= NEAR_SESSIONS]:
                 if sp not in acc:
                     break
                 xd, sd = date.fromisoformat(x["date"]), date.fromisoformat(sp["date"])

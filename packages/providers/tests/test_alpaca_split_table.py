@@ -10,6 +10,18 @@ import pytest
 from ba2_providers.ohlcv.alpaca_history import split_build as sb, split_table as st
 from ba2_providers.ohlcv.alpaca_history.split_table import ListedSplit as L
 
+SHIPPED_OVERRIDES = st.OVERRIDES_PATH
+
+
+@pytest.fixture(autouse=True)
+def _no_pending_overrides(tmp_path_factory, monkeypatch):
+    """The shipped overrides hold entries pending review (they REFUSE a build): tests that build use an empty file."""
+    p = tmp_path_factory.mktemp("ov") / "none.json"
+    p.write_text(json.dumps({"_doc": "d", "entries": []}), encoding="utf-8")
+    monkeypatch.setattr(st, "OVERRIDES_PATH", str(p))
+    monkeypatch.setattr(sb, "OVERRIDES_PATH", str(p))
+
+
 SESSIONS = list(pd.bdate_range("2021-01-04", periods=80))
 D = SESSIONS[40].date()            # the event session in most tests
 
@@ -83,7 +95,8 @@ def test_big_event_between_proven_and_contradicted_is_unresolved():
 
 def test_small_event_needs_both_vendors():
     f = {"X": bars()}
-    acc, rev, _ = run(f, [L("X", D, 1.05)], [L("X", D, 1.0505)])
+    fd = {"X": fmp(f["X"], {40: 1.05})}                          # FMP's own series steps by 1.05 there
+    acc, rev, _ = runf(f, fd, [L("X", D, 1.05)], [L("X", D, 1.0505)])
     assert [a["verdict"] for a in acc] == ["small_both"] and rev == []
     acc, rev, _ = run(f, [L("X", D, 1.05)])
     assert acc == [] and one(rev, "small_single_vendor")["applied"] is False
@@ -91,6 +104,19 @@ def test_small_event_needs_both_vendors():
     assert acc == [] and one(rev, "small_single_vendor")["fmp_ratio"] == 1.05
     acc, rev, _ = run(f, [L("X", D, 1.05)], [L("X", D, 1.10)])
     assert acc == [] and one(rev, "ratio_mismatch")["applied"] is False
+
+
+def test_small_both_listed_factor_needs_fmp_step_or_yahoo():
+    # AIV 2019-02-21: both vendors list 0.9697 but the price is flat in the raw bars AND in FMP's own series
+    f = {"X": bars()}
+    acc, rev, _ = runf(f, {"X": fmp(f["X"])}, [L("X", D, 0.97)], [L("X", D, 0.97)])
+    assert acc == [] and one(rev, "small_both_price_disagrees")["applied"] is False
+    acc, rev, _ = run(f, [L("X", D, 0.97)], [L("X", D, 0.97)])                           # no FMP data at all
+    assert acc == [] and one(rev, "small_both_price_disagrees")
+    acc, rev, stats = runf(f, {"X": fmp(f["X"])}, [L("X", D, 0.97)], [L("X", D, 0.97)], yahoo=yhoo((D, 0.9703)))
+    assert [(a["verdict"], a["source"]) for a in acc] == [("small_confirmed_by_yahoo", "both+yahoo")]
+    acc, _, _ = runf(f, {"X": fmp(f["X"])}, [L("X", D, 0.97)], [L("X", D, 0.97)], yahoo=yhoo((D, 0.95)))   # Yahoo disagrees
+    assert acc == []
 
 
 def test_small_event_is_not_proven_by_a_matching_jump():
@@ -205,18 +231,19 @@ def ov(decision, ratio=None, d=D, **kw):
 
 def test_override_decides_its_event_outright():
     acc, rev, _ = run({"X": bars()}, [L("X", D, 2.0)], [L("X", D, 2.0)], [ov("accept", 2.0)])   # price says no split
-    assert [(a["factor"], a["verdict"]) for a in acc] == [(2.0, "override_accept")] and rev == []
+    assert [(a["factor"], a["verdict"]) for a in acc] == [(2.0, "override_accept")]
+    assert [r["verdict"] for r in rev] == ["override_accept"] and "alpaca lists 2" in rev[0]["reason"]      # never silent
     acc, rev, _ = run({"X": bars(40, 4.0)}, [L("X", D, 4.0)], [], [ov("reject")])               # price proves it
-    assert acc == [] and rev == []
+    assert acc == [] and [r["verdict"] for r in rev] == ["override_reject"] and rev[0]["applied"] is False
     acc, _, _ = run({"X": bars(40, 4.0)}, [L("X", D, 4.0)], [], [ov("accept", 5.0)])            # override ratio wins
     assert acc[0]["factor"] == 5.0
 
 
 def test_override_without_a_listing_adds_or_silences():
     acc, rev, _ = run({"X": bars(40, 2.5)}, [], [], [ov("accept", 2.5, d=SESSIONS[40].date())])
-    assert [a["factor"] for a in acc] == [2.5] and rev == []
+    assert [a["factor"] for a in acc] == [2.5] and [r["verdict"] for r in rev] == ["override_accept"]
     acc, rev, _ = run({"X": bars(40, 2.5)}, [], [], [ov("reject", d=SESSIONS[40].date())])
-    assert acc == [] and rev == []                              # the jump row is silenced by the reviewed reject
+    assert acc == [] and [r["verdict"] for r in rev] == ["override_reject"]       # the jump row is replaced by the reviewed reject
 
 
 def test_override_for_a_symbol_outside_the_run_is_counted():
@@ -838,17 +865,25 @@ def test_series_break_for_an_unexplained_jump_beyond_x5_that_the_step_does_not_e
     assert one(rev, "series_break")
 
 
-def test_shipped_overrides_are_the_reviewed_ones():
-    entries = st.load_overrides()
+def test_shipped_overrides_are_the_reviewed_ones_and_the_cbsh_ones_still_refuse():
+    entries = json.load(open(SHIPPED_OVERRIDES, encoding="utf-8"))["entries"]
     by = {(e["symbol"], e["event_date"]): e for e in entries}
-    assert len(entries) == 20 and all(e["reviewed_by"] == "owner (B. Migette) 2026-10-20" and e["added"] == "2026-10-20"
-                                      for e in entries)
+    pending = {k for k, e in by.items() if e["reviewed_by"].lower().startswith("pending")}
+    assert pending == {("CBSH", "2016-11-30"), ("CBSH", "2017-11-29"), ("CBSH", "2019-12-02")}
+    assert all(by[k]["decision"] == "accept" and by[k]["ratio"] == 1.05 and "sec.gov" in by[k]["reason"] for k in pending)
+    with pytest.raises(st.SplitOverridesPending, match="CBSH 2016-11-30"):
+        st.load_overrides(SHIPPED_OVERRIDES)                    # a pending entry REFUSES the build until the owner flips it
+    reviewed = {k: e for k, e in by.items() if k not in pending}
+    assert len(entries) == 22 and all(e["reviewed_by"] == "owner (B. Migette) 2026-10-20" and e["added"] == "2026-10-20"
+                                      for e in reviewed.values())
+    assert ("HON", "2026-06-28") not in by                      # the 1:2 reverse split is real (Honeywell 8-K): no reject
     assert by[("VTOL", "2020-06-12")]["ratio"] == pytest.approx(1 / 3) and by[("WHWK", "2021-08-27")]["ratio"] == pytest.approx(1 / 15)
     assert by[("ENOV", "2022-04-05")]["ratio"] == pytest.approx(1 / 3) and by[("IRON", "2022-12-30")]["ratio"] == 0.1
     assert by[("JBIO", "2025-04-29")]["ratio"] == pytest.approx(1 / 35)
     assert {k for k, e in by.items() if e["decision"] == "reject"} == {
-        ("AMC", "2022-08-22"), ("BIP", "2020-03-31"), ("NVS", "2019-04-09"), ("HON", "2026-06-28"), ("ADEA", "2022-10-03"), ("CRESY", "2025-11-28"), ("CTVA", "2026-10-01"),
-        ("SM", "2020-03-09"), ("DBVT", "2020-03-17"), ("RLMD", "2024-12-04"), ("CLSK", "2020-04-09"), ("FWDI", "2018-01-19")}
+        ("AMC", "2022-08-22"), ("BIP", "2020-03-31"), ("NVS", "2019-04-09"), ("ADEA", "2022-10-03"), ("CRESY", "2025-11-28"),
+        ("CTVA", "2026-10-01"), ("SM", "2020-03-09"), ("DBVT", "2020-03-17"), ("RLMD", "2024-12-04"), ("CLSK", "2020-04-09"),
+        ("FWDI", "2018-01-19")}
     assert by[("QH", "2022-08-12")]["ratio"] == pytest.approx(0.1) and by[("STSS", "2025-04-28")]["ratio"] == pytest.approx(1 / 300)
     assert by[("JFB", "2026-03-25")]["ratio"] == 2.0 and "Yahoo" in by[("QH", "2022-08-12")]["reason"]
 
@@ -1288,29 +1323,57 @@ def test_build_writes_the_missing_spinco_list(tmp_path):
 
 
 # ---- gate fixes: split + spin-off on one ex-date, small single-vendor events confirmed by Yahoo, older store symbols ------
-def aiv_case(step_applied):
+def aiv_case(step_applied, split=1.3):
     raw = parent_bars()                                          # P falls 100 -> 80; the spin-off factor is 1.125
     fd = {"P": fmp(raw, {40: step_applied}) if step_applied else fmp(raw)}
-    split = [L("P", D, 1.3)]                                     # both vendors list the spin-off as a 1.3 "split" (AIV style)
-    return run_so({"P": raw, "S": spinco_bars()}, fd, alp=split, fm=split)
+    both = [L("P", D, split)]                                    # both vendors list the spin-off as a 1.3 "split" (AIV style)
+    return run_so({"P": raw, "S": spinco_bars()}, fd, alp=both, fm=both)
 
 
-def test_split_and_spinoff_on_one_ex_date_keep_the_split_and_absorb_the_spinoff_when_fmp_agrees():
-    acc, rev, stats, _ = aiv_case(1.2)
+def test_joint_decision_split_alone_keeps_the_split_and_absorbs_the_spinoff():
+    acc, rev, stats, _ = aiv_case(1.29)                          # FMP's step equals the listed split (AIV: 9.2949 vs 9.295)
     assert [(a["kind"], a["verdict"], a["factor"]) for a in acc] == [("split", "proven", 1.3)]
-    assert acc[0]["absorbed_factor"] == pytest.approx(1.125) and "spin-off factor 1.125" in acc[0]["absorbed"]
+    assert acc[0]["absorbed_factor"] == pytest.approx(1.125) and "spin-off" in acc[0]["absorbed"]
     assert one(rev, "spinoff_absorbed_by_split")["applied"] is True
-    assert stats["verdict_spinoff_fmp_agrees"] == 0 and stats["verdict_spinoff_absorbed_by_split"] == 1   # counts follow the result
+    assert stats["verdict_spinoff_fmp_agrees"] == 0 and stats["verdict_spinoff_absorbed_by_split"] == 1
     assert st.splits_by_symbol(acc, "spinoff") == {} and st.splits_by_symbol(acc) == {"P": [[D.isoformat(), 1.3]]}
 
 
-def test_split_and_spinoff_on_one_ex_date_are_refused_when_fmp_agrees_with_neither():
-    # FMP applied 1.12 (agrees with the 1.125 spin-off, the spin-off applies) but not the 1.3 split: split alone (1.3) and combined (1.46)
-    # are both far from the step, the spin-off is 1.125: the split is the conflicting one
-    acc, rev, stats, _ = aiv_case(1.12)
-    assert acc == [] and one(rev, "split_spinoff_conflict")["applied"] is False
-    assert stats["verdict_split_spinoff_conflict"] == 1 and stats["verdict_proven"] == 0 and stats["verdict_spinoff_fmp_agrees"] == 0
-    assert not any(r["applied"] for r in rev)
+def test_joint_decision_spinoff_alone_when_fmp_supports_it():
+    acc, rev, stats, _ = aiv_case(1.12)                          # the step equals the spin-off factor, not the 1.3 split
+    assert [(a["kind"], a["verdict"]) for a in acc] == [("spinoff", "spinoff_fmp_agrees")]
+    assert stats["listings_absorbed_by_spinoff"] == 2
+
+
+def test_joint_decision_conflict_when_fmp_agrees_with_no_candidate_or_with_several():
+    for step_applied in (None, 1.2):                             # flat; or 1.2 (6.7 % from 1.125, 8.3 % from 1.3: ambiguous)
+        acc, rev, stats, _ = aiv_case(step_applied)
+        assert acc == [] and one(rev, "split_spinoff_conflict")["applied"] is False, step_applied
+        assert stats["verdict_split_spinoff_conflict"] == 1 and not any(r["applied"] for r in rev)
+
+
+def test_joint_decision_composed_split_and_spinoff_on_the_post_split_basis():
+    # Honeywell 2026-06-29: a 1:2 reverse split AND the HONA spin-off (0.5 HONA per OLD share = 1 per NEW share).  Raw closes
+    # 232.21 -> 227.80; HONA 220.19.  Spin factor on the post-split basis S' = 1 + (0.5 / 0.5) * 220.19 / 227.80 = 1.9666;
+    # composed step = 0.5 * 1.9666 = 0.9833; FMP's step is 0.9535 (3.1 % away).  FMP also lists its OWN composite 0.9535 as a split.
+    raw = parent_bars(before=232.21, after=227.80)
+    fd = {"P": fmp(raw, {40: 0.9535})}
+    spin = SpinOff("P", D, "S", 0.5)
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars(price=220.19)}, fd, spin=(spin,), alp=[L("P", D, 0.5)],
+                                fm=[L("P", SESSIONS[39].date(), 0.9535)])
+    got = {(a["kind"], a["verdict"]): a["factor"] for a in acc}
+    assert got == {("split", "split_composed_with_spinoff"): 0.5, ("spinoff", "spinoff_composed_with_split"): pytest.approx(1.96656, rel=1e-4)}
+    assert one(rev, "spinoff_composed_with_split")["applied"] is True and not any(r["verdict"] == "split_spinoff_conflict" for r in rev)
+    assert st.splits_by_symbol(acc) == {"P": [[D.isoformat(), 0.5]]} and list(st.splits_by_symbol(acc, "spinoff")) == ["P"]
+    # the same listings without FMP data cannot be told apart: refused, never guessed
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars(price=220.19)}, None, spin=(spin,), alp=[L("P", D, 0.5)])
+    assert acc == [] and one(rev, "split_spinoff_conflict")
+
+
+def test_joint_decision_leaves_a_reviewed_override_to_the_override():
+    acc, rev, _, _ = run_so({"P": parent_bars(), "S": spinco_bars()}, None, alp=[L("P", D, 0.5)],
+                            ov=[ov("accept", 0.5, symbol="P")])
+    assert [a["kind"] for a in acc] == ["split"] and one(rev, "spinoff_absorbed_by_split")
 
 
 def test_small_single_vendor_event_needs_yahoo_within_half_a_percent():

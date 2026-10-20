@@ -79,14 +79,6 @@
    "reviewed_by": "owner (B. Migette) 2026-10-20"
   },
   {
-   "symbol": "HON",
-   "event_date": "2026-06-28",
-   "decision": "reject",
-   "reason": "split LISTING rejected: Alpaca's 0.5 split is spurious (Solstice spin-off); the spin-off is adjusted by the spin-off rule",
-   "added": "2026-10-20",
-   "reviewed_by": "owner (B. Migette) 2026-10-20"
-  },
-  {
    "symbol": "ADEA",
    "event_date": "2022-10-03",
    "decision": "reject",
@@ -168,6 +160,33 @@
    "reason": "no split found in 2018 (Forward Industries' only reverse split is 1-for-10 on 2024-06-18); FMP data error",
    "added": "2026-10-20",
    "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CBSH",
+   "event_date": "2016-11-30",
+   "decision": "accept",
+   "ratio": 1.05,
+   "reason": "5% stock dividend listed by FMP only (FMP step equals it); the company's 10-K confirms it: FY2016 10-K: '23rd consecutive year', distributed 2016-12-19 (https://www.sec.gov/Archives/edgar/data/0000022356/000002235617000009/cbsh1231201610k.htm)",
+   "added": "2026-10-21",
+   "reviewed_by": "pending (owner confirmation)"
+  },
+  {
+   "symbol": "CBSH",
+   "event_date": "2017-11-29",
+   "decision": "accept",
+   "ratio": 1.05,
+   "reason": "5% stock dividend listed by FMP only (FMP step equals it); the company's 10-K confirms it: FY2017 10-K: '24th', distributed 2017-12-18 (https://www.sec.gov/Archives/edgar/data/0000022356/000002235618000015/cbsh1231201710k.htm)",
+   "added": "2026-10-21",
+   "reviewed_by": "pending (owner confirmation)"
+  },
+  {
+   "symbol": "CBSH",
+   "event_date": "2019-12-02",
+   "decision": "accept",
+   "ratio": 1.05,
+   "reason": "5% stock dividend listed by FMP only (FMP step equals it); the company's 10-K confirms it: FY2019 10-K: '26 years' (https://www.sec.gov/Archives/edgar/data/22356/000002235620000009/cbsh1231201910k.htm)",
+   "added": "2026-10-21",
+   "reviewed_by": "pending (owner confirmation)"
   }
  ]
 }
