@@ -355,7 +355,7 @@ def test_yahoo_spinoff_convention_run_is_expected_not_a_failure(tmp_path):
     ours = [10.0 / 1.25] * cut + [10.0] * (len(DAYS) - cut)                  # we divided the prices before the spin-off by 1.25
     theirs = [10.0] * len(DAYS)                                              # Yahoo did not
     y = _yahoo_gate(tmp_path, ours, theirs, spinoffs={"AAA": [(str(DAYS[cut].date()), 1.25)]})
-    assert y["status"] == "PASS" and y["summary"]["runs_by_class"] == {"spinoff_convention": 1, "series_break": 0, "unexplained": 0}
+    assert y["status"] == "PASS" and y["summary"]["runs_by_class"] == {"spinoff_convention": 1, "series_break": 0, "convention": 0, "unexplained": 0}
     runs = pd.read_csv(tmp_path / "verify" / "yahoo_mismatch_runs.csv")
     assert runs["classification"].tolist() == ["spinoff_convention"] and runs["days"].iloc[0] == cut
     # the same mismatch with a factor we did not apply is unexplained and fails
@@ -371,3 +371,59 @@ def test_yahoo_run_at_a_series_break_is_classified_apart(tmp_path):
     theirs = [10.0] * len(DAYS)
     y = _yahoo_gate(tmp_path, ours, theirs, breaks={"AAA": str(DAYS[cut].date())})
     assert y["status"] == "PASS" and y["summary"]["runs_by_class"]["series_break"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Yahoo as the tie-breaker; convention; provenance
+# ---------------------------------------------------------------------------
+def _tie(tmp_path, yahoo_closes):
+    """ours: a real 60 % crash at day 30; the other vendor shows NO crash (it invented a split)."""
+    cache, other = tmp_path / "c", tmp_path / "o"
+    put(cache, "AAA", daily(DAYS, jump_series()), five(DAYS, 10.0))
+    put(other, "AAA", daily(DAYS, [4.0] * len(DAYS)))
+    frames = {} if yahoo_closes is None else {"AAA": daily(DAYS, yahoo_closes)}
+    y = yahoo_for(frames, tmp=tmp_path)
+    res = gate(cache, tmp_path, other=str(other), panel=["AAA"], yahoo=y, symbols=["AAA"])
+    jp = pd.read_csv(tmp_path / "verify" / "residual_jumps.csv", keep_default_na=False)
+    return res["residual_jumps"], jp["resolution"].tolist()
+
+
+def test_yahoo_agreeing_with_ours_makes_the_jump_a_vendor_error_and_passes(tmp_path):
+    r, resolution = _tie(tmp_path, jump_series())
+    assert resolution == ["vendor_error_fmp"] and r["status"] == "PASS" and r["summary"]["blocking"] == 0
+    assert r["summary"]["vendor_error_fmp"][0]["symbol"] == "AAA"
+
+
+def test_yahoo_agreeing_with_the_other_vendor_makes_ours_suspect_and_blocks(tmp_path):
+    r, resolution = _tie(tmp_path / "a", [4.0] * len(DAYS))
+    assert resolution == ["ours_suspect"] and r["status"] == "FAIL"
+
+
+def test_yahoo_unavailable_leaves_the_jump_unresolved_and_blocks(tmp_path):
+    r, resolution = _tie(tmp_path / "b", None)
+    assert resolution == ["unresolved"] and r["status"] == "FAIL"
+    r, resolution = _tie(tmp_path / "c", jump_series(factor=0.7))                  # Yahoo agrees with neither
+    assert resolution == ["unresolved"] and r["status"] == "FAIL"
+
+
+def test_spinoff_factor_within_ten_percent_of_yahoos_is_a_convention(tmp_path):
+    cut = 40
+    theirs = [10.0] * len(DAYS)
+    ours = [10.0 / 6.43 * 1.036] * cut + [10.0] * (len(DAYS) - cut)           # we adjusted by 6.43, Yahoo by 6.66 (3.6 % apart)
+    y = _yahoo_gate(tmp_path, ours, [10.0 / 6.66 * 1.0] * cut + theirs[cut:], spinoffs={"AAA": [(str(DAYS[cut].date()), 6.43)]})
+    assert y["status"] == "PASS" and y["summary"]["runs_by_class"]["convention"] == 1 and y["summary"]["runs_by_class"]["unexplained"] == 0
+    far = _yahoo_gate(tmp_path / "far", [10.0 / 6.43] * cut + [10.0] * (len(DAYS) - cut), [10.0 / 3.0] * cut + theirs[cut:],
+                      spinoffs={"AAA": [(str(DAYS[cut].date()), 6.43)]})        # 2x apart: not a convention
+    assert far["status"] == "FAIL" and far["summary"]["runs_by_class"]["unexplained"] == 1
+
+
+def test_yahoo_inputs_csv_records_what_was_used(tmp_path):
+    cache = tmp_path / "c"
+    put(cache, "AAA", daily(DAYS, 10.0), five(DAYS, 10.0))
+    gate(cache, tmp_path, yahoo=yahoo_for({"AAA": daily(DAYS, 10.0)}, tmp=tmp_path), symbols=["AAA"])
+    inp = pd.read_csv(tmp_path / "verify" / "yahoo_inputs.csv", keep_default_na=False)
+    row = inp.iloc[0]
+    assert row["symbol"] == "AAA" and row["status"] == "ok" and row["rows"] == len(DAYS) and len(row["sha256"]) == 64
+    assert row["first_day"] == str(DAYS[0].date()) and row["fetched_at"].endswith("Z")
+    import hashlib
+    assert row["sha256"] == hashlib.sha256((tmp_path / "yd" / "AAA.parquet").read_bytes()).hexdigest()

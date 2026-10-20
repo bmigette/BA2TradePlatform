@@ -25,7 +25,10 @@ CHECKS (constants below; the coordinator and the owner set the final thresholds)
   4 residual       the MOST IMPORTANT: every overnight ratio open(D) / close(D-1) beyond x1.8 or x0.55 of the built daily series (``residual_jumps.csv``)
                    with the other cache's view: r = other close / our close on D-1 and D; class ``flat`` (|ln(r_D / r_D-1)| <= ln 1.02: the other
                    series shows the same move, so it is a real market move), ``step`` (the vendors disagree: one has a split error), ``unverifiable``
-                   (the other cache has no bar on D-1 or D: listed separately, neither a pass nor a fail).  FAIL when a PANEL jump since 2019-01-01 is a ``step``.
+                   (the other cache has no bar on D-1 or D: listed separately, neither a pass nor a fail).  A PANEL jump since 2019-01-01 that is a ``step`` is
+                   settled by YAHOO as the tie-breaker (``resolution`` column): Yahoo's close-to-close move over D-1 -> D equal to ours within 2 % =
+                   ``vendor_error_fmp`` (FMP invented or missed a split; non-blocking); equal to the other vendor's =
+                   ``ours_suspect`` (blocking); Yahoo has neither (or is unavailable) = ``unresolved`` (blocking).  FAIL on any blocking jump.
   5 vendor_ratio   INFORMATIONAL: r(t) = other close / our close on common days; steps of r beyond 2 % per symbol (``vendor_ratio_steps.csv``,
                    ``vendor_ratio_symbols.csv``, ``vendor_ratio_by_year.csv``); the top 50 panel symbols by step count are printed.
   6 yahoo          independent daily Close check against Yahoo (``yfinance``, ``auto_adjust=False``: Yahoo's ``Close`` is split-adjusted and NOT
@@ -38,7 +41,9 @@ CHECKS (constants below; the coordinator and the owner set the final thresholds)
                    spin-off convention difference).  Yahoo's Close is not spin-off adjusted, so a run that ends within YAHOO_EVENT_DAYS before one of
                    OUR applied spin-offs with a median ratio within 2 % of 1 / (the product of our spin-off factors after the run, or the factor of the one that ends it) is
                    ``spinoff_convention``; a run that touches one of our series breaks (within YAHOO_EVENT_DAYS) is ``series_break``; both are
-                   expected and do not count; the remaining runs (``unexplained``) decide PASS / FAIL.  All three groups are reported.
+                   expected and do not count; a run before one of our spin-offs whose ratio ours / Yahoo is within YAHOO_CONVENTION_TOL (10 %) of 1 -- our
+                   factor within 10 % of Yahoo's -- or whose FMP / ours ratio is, is ``convention`` (the vendors compute the factor differently;
+                   non-blocking); the remaining runs (``unexplained``) decide PASS / FAIL.  All three groups are reported.
   7 readiness      INFORMATIONAL (ED-11): per year the panel symbols with no built daily file / daily bars, or no 5-minute file / 5-minute bars
                    (``readiness.csv``, one row per symbol-year that lacks something).
 """
@@ -50,7 +55,7 @@ import os
 import random
 import time
 from concurrent.futures import ProcessPoolExecutor
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -73,6 +78,7 @@ YAHOO_OFF_TOL = 0.02
 YAHOO_RUN_DAYS = 20
 YAHOO_EVENT_DAYS = 5              # a mismatch run ending this many calendar days before one of our spin-off dates / breaks is explained by it
 YAHOO_FACTOR_TOL = 0.02
+YAHOO_CONVENTION_TOL = 0.10      # spin-off factors of ours and of Yahoo / FMP within 10 %: a convention difference
 DEFAULT_YEARS = tuple(range(2019, 2026))
 RTH_FIRST_MIN = 9 * 60 + 30
 RTH_LAST_MIN = 15 * 60 + 55
@@ -236,8 +242,29 @@ class YahooDaily:
                  min_interval: float = 0.5):
         self.cache_dir, self.refresh, self.fetch, self.successors = cache_dir, refresh, fetch, successors
         self.sleep, self.min_interval = sleep, min_interval
+        self.records: Dict[str, Dict[str, Any]] = {}      # symbol -> row of yahoo_inputs.csv (every symbol asked for)
 
     def get(self, symbol: str) -> Tuple[Optional[pd.DataFrame], str]:
+        df, note = self._get(symbol)
+        rec: Dict[str, Any] = {"symbol": symbol, "ticker": "", "status": "not_found", "rows": 0, "first_day": "", "last_day": "",
+                               "fetched_at": "", "sha256": "", "note": note}
+        if df is not None:
+            import hashlib
+            pq = os.path.join(self.cache_dir, f"{symbol}.parquet")
+            with open(pq, "rb") as f:
+                sha = hashlib.sha256(f.read()).hexdigest()
+            with open(os.path.join(self.cache_dir, f"{symbol}.json"), encoding="utf-8") as f:
+                fetched = json.load(f).get("fetched_at", "")
+            rec.update(ticker=note, status="ok", rows=len(df), first_day=str(df["day"].min().date()), last_day=str(df["day"].max().date()),
+                       fetched_at=fetched, sha256=sha, note="")
+        self.records[symbol] = rec
+        return df, note
+
+    def inputs(self) -> pd.DataFrame:
+        cols = ["symbol", "ticker", "status", "rows", "first_day", "last_day", "fetched_at", "sha256", "note"]
+        return pd.DataFrame([self.records[k] for k in sorted(self.records)], columns=cols)
+
+    def _get(self, symbol: str) -> Tuple[Optional[pd.DataFrame], str]:
         """(frame or None, answering ticker or a note)."""
         from ba2_providers.ohlcv.alpaca_history.split_build import atomic_write
         pq, meta = os.path.join(self.cache_dir, f"{symbol}.parquet"), os.path.join(self.cache_dir, f"{symbol}.json")
@@ -255,7 +282,7 @@ class YahooDaily:
             if df is not None and len(df):
                 buf = df.to_parquet(index=False)
                 atomic_write(pq, buf)
-                atomic_write(meta, json.dumps({"ticker": t}).encode())
+                atomic_write(meta, json.dumps({"ticker": t, "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}).encode())
                 return df, t
             notes.append(f"{t}: no data")
         return None, "; ".join(notes)
@@ -269,8 +296,9 @@ def _cum_spin(spinoffs: Sequence[Tuple[str, float]], after: pd.Timestamp) -> flo
     return f
 
 
-def classify_run(date_from: str, date_to: str, median_ratio: float, spinoffs: Sequence[Tuple[str, float]], break_date: Optional[str]) -> str:
-    """``spinoff_convention`` / ``series_break`` / ``unexplained`` for one mismatch run (ours / Yahoo)."""
+def classify_run(date_from: str, date_to: str, median_ratio: float, spinoffs: Sequence[Tuple[str, float]], break_date: Optional[str],
+                 fmp_median_ratio: Optional[float] = None) -> str:
+    """``spinoff_convention`` / ``series_break`` / ``convention`` / ``unexplained`` for one mismatch run (ours / Yahoo; FMP / ours)."""
     end, start = pd.Timestamp(date_to), pd.Timestamp(date_from)
     near = pd.Timedelta(days=YAHOO_EVENT_DAYS)
     if any(end < pd.Timestamp(d) <= end + near for d, _ in spinoffs):
@@ -280,11 +308,14 @@ def classify_run(date_from: str, date_to: str, median_ratio: float, spinoffs: Se
                 return "spinoff_convention"
     if break_date is not None and (start <= pd.Timestamp(break_date) <= end + near):
         return "series_break"
+    if any(pd.Timestamp(d) > end for d, _ in spinoffs):          # our series is spin-off adjusted over the run
+        if abs(median_ratio - 1) <= YAHOO_CONVENTION_TOL or (fmp_median_ratio is not None and abs(fmp_median_ratio - 1) <= YAHOO_CONVENTION_TOL):
+            return "convention"
     return "unexplained"
 
 
 def compare_yahoo(ours: pd.DataFrame, yahoo: pd.DataFrame, spinoffs: Sequence[Tuple[str, float]] = (),
-                  break_date: Optional[str] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+                  break_date: Optional[str] = None, fmp: Optional[pd.Series] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """(per-symbol stats, mismatch runs) of our daily Close vs Yahoo's on common days.  A run is a maximal stretch of consecutive common
     days off by > 0.5 % (cut at each of our spin-off dates), classified by ``classify_run``; the stats count only the unexplained days as
     mismatches (``match_days`` = common days minus unexplained mismatch days)."""
@@ -293,7 +324,7 @@ def compare_yahoo(ours: pd.DataFrame, yahoo: pd.DataFrame, spinoffs: Sequence[Tu
     j = pd.concat([a, y], axis=1, join="inner", keys=["u", "y"]).dropna()
     j = j[(j["u"] > 0) & (j["y"] > 0)]
     stats = {"common_days": len(j), "match_days": 0, "longest_off_run": 0, "spinoff_convention_days": 0, "series_break_days": 0,
-             "unexplained_days": 0}
+             "convention_days": 0, "unexplained_days": 0}
     runs: List[Dict[str, Any]] = []
     if not len(j):
         return stats, runs
@@ -313,7 +344,11 @@ def compare_yahoo(ours: pd.DataFrame, yahoo: pd.DataFrame, spinoffs: Sequence[Tu
             r = {"date_from": str(idx[start].date()), "date_to": str(idx[i - 1].date()), "days": i - start,
                  "median_ratio": float(seg.median()), "min_ratio": float(seg.min()), "max_ratio": float(seg.max()),
                  "days_off_over_2pct": int(big[start:i].sum())}
-            r["classification"] = classify_run(r["date_from"], r["date_to"], r["median_ratio"], spinoffs, break_date)
+            fr = None
+            if fmp is not None:
+                fx = fmp.reindex(a.index[(a.index >= idx[start]) & (a.index <= idx[i - 1])])
+                fr = float((fx / a.reindex(fx.index)).median()) if fx.notna().any() else None
+            r["classification"] = classify_run(r["date_from"], r["date_to"], r["median_ratio"], spinoffs, break_date, fr)
             if r["classification"] != "unexplained":
                 explained[start:i] = True
                 stats[r["classification"] + "_days"] += i - start
@@ -370,6 +405,30 @@ def load_spinoffs(meta_dir: str) -> Dict[str, List[Tuple[str, float]]]:
         return {}
     with open(p, encoding="utf-8") as f:
         return {s: [(d, float(v)) for d, v in e] for s, e in json.load(f)["spinoffs"].items()}
+
+
+def resolve_with_yahoo(jump: Any, yahoo: Optional["YahooDaily"]) -> Tuple[str, float]:
+    """Yahoo as the tie-breaker for one jump the two vendors disagree on: (resolution, Yahoo's close D / close D-1).
+    ``vendor_error_fmp``: Yahoo's move equals ours within 2 %; ``ours_suspect``: it equals the other vendor's; ``unresolved``: neither, or
+    Yahoo has no bar on both days / is unavailable."""
+    if yahoo is None:
+        return "unresolved", math.nan
+    ydf, _ = yahoo.get(jump["symbol"])
+    if ydf is None:
+        return "unresolved", math.nan
+    y = ydf.drop_duplicates("day").set_index("day")["Close"]
+    d, p = pd.Timestamp(jump["date"]), pd.Timestamp(jump["prev_date"])
+    if d not in y.index or p not in y.index or not (y[p] > 0):
+        return "unresolved", math.nan
+    yr = float(y[d] / y[p])
+    ours = float(jump["our_close"] / jump["our_close_prev"])
+    other = ours * float(jump["step"])                    # the other vendor's close-to-close move = ours x r_now / r_prev
+    tol = math.log(1 + STEP_TOL)
+    if abs(math.log(yr / ours)) <= tol:
+        return "vendor_error_fmp", yr
+    if abs(math.log(yr / other)) <= tol:
+        return "ours_suspect", yr
+    return "unresolved", yr
 
 
 def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: Optional[Sequence[str]] = None,
@@ -470,12 +529,20 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
     jp["panel"] = jp["symbol"].map(in_panel)
     jp["since_2019"] = jp["date"] >= JUMP_SINCE
     _csv(jp.sort_values(["symbol", "date"]), os.path.join(out_dir, "residual_jumps.csv"))
-    bad = jp[jp["panel"].astype(bool) & jp["since_2019"].astype(bool) & (jp["class"] == "step")]
+    jp["yahoo_ratio"] = math.nan
+    jp["resolution"] = ""
+    cand = jp["panel"].astype(bool) & jp["since_2019"].astype(bool) & (jp["class"] == "step")
+    for i in jp.index[cand]:
+        jp.loc[i, ["resolution", "yahoo_ratio"]] = resolve_with_yahoo(jp.loc[i], yahoo)
+    _csv(jp.sort_values(["symbol", "date"]), os.path.join(out_dir, "residual_jumps.csv"))
+    bad = jp[cand & jp["resolution"].isin(["ours_suspect", "unresolved"])]
     res["residual_jumps"] = {"status": STATUS_FAIL if len(bad) else STATUS_PASS, "csv": os.path.join(out_dir, "residual_jumps.csv"),
                              "summary": {"jumps": len(jp), "by_class": jp["class"].value_counts().to_dict(),
+                                         "resolutions": jp[cand]["resolution"].value_counts().to_dict(),
+                                         "vendor_error_fmp": jp[cand & (jp["resolution"] == "vendor_error_fmp")][["symbol", "date", "overnight_ratio", "step"]].head(50).to_dict("records"),
                                          "unverifiable_panel_since_2019": jp[jp["panel"].astype(bool) & jp["since_2019"].astype(bool) & (jp["class"] == "unverifiable")][["symbol", "date", "overnight_ratio"]].head(50).to_dict("records"),
-                                         "panel_since_2019_vendor_disagreement": len(bad),
-                                         "disagreements": bad[["symbol", "date", "overnight_ratio", "step"]].head(50).to_dict("records")}}
+                                         "blocking": len(bad),
+                                         "disagreements": bad[["symbol", "date", "overnight_ratio", "step", "resolution", "yahoo_ratio"]].head(50).to_dict("records")}}
     # 5 vendor ratio
     rs = flat("ratio_steps")
     if not len(rs):
@@ -519,7 +586,10 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
             if ydf is None:
                 unknown.append({"symbol": s, "note": note})
                 continue
-            stats, rr = compare_yahoo(pd.read_parquet(p1, columns=["Date", "Close"]), ydf, (spinoffs or {}).get(s, ()), brk.get(s))
+            fser = None
+            if other is not None and os.path.isfile(os.path.join(other, f"{s}_1d.parquet")):
+                fser = _daily_series(pd.read_parquet(os.path.join(other, f"{s}_1d.parquet"), columns=["Date", "Close"]), "Close")
+            stats, rr = compare_yahoo(pd.read_parquet(p1, columns=["Date", "Close"]), ydf, (spinoffs or {}).get(s, ()), brk.get(s), fser)
             rows.append({"symbol": s, "yahoo_ticker": note, **stats})
             runs += [{"symbol": s, **r} for r in rr]
             tot += stats["common_days"]
@@ -537,12 +607,14 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
         res["yahoo"] = {"status": STATUS_PASS if ok else STATUS_FAIL, "csv": os.path.join(out_dir, "yahoo_mismatch_runs.csv"),
                         "summary": {"sample": len(sample), "compared": len(ys), "yahoo_unavailable": len(unknown), "common_days": tot,
                                     "match_share": share, "min": YAHOO_MATCH, "sustained_mismatch_symbols": sustained["symbol"].tolist(),
-                                    "runs_by_class": {c: sum(r["classification"] == c for r in runs) for c in ("spinoff_convention", "series_break", "unexplained")},
+                                    "runs_by_class": {c: sum(r["classification"] == c for r in runs) for c in ("spinoff_convention", "series_break", "convention", "unexplained")},
                                     "listed": {c: [{k: r[k] for k in ("symbol", "date_from", "date_to", "days", "median_ratio")} for r in runs if r["classification"] == c][:40]
-                                               for c in ("spinoff_convention", "series_break", "unexplained")},
+                                               for c in ("spinoff_convention", "series_break", "convention", "unexplained")},
                                     "symbols_with_unexplained_runs": sorted({r["symbol"] for r in runs if r["classification"] == "unexplained"})}}
     else:
         res["yahoo"] = {"status": STATUS_INFO, "summary": {"skipped": "no Yahoo source given"}, "csv": None}
+    if yahoo is not None:
+        _csv(yahoo.inputs(), os.path.join(out_dir, "yahoo_inputs.csv"))          # provenance: what Yahoo said, with the cache files' sha256
     return res
 
 
