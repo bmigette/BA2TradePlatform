@@ -34,7 +34,8 @@ from ba2_common.core.types import is_option_action
 from app.models.backtest import Backtest
 from app.models.database import SessionLocal
 from app.services.backtest.equity_cap import validate_equity_cap
-from app.services.backtest.history_source import job_history_provider, refuse_option_job_on_unsupported_source
+from app.services.backtest.history_source import (
+    job_history_provider, load_job_store, refuse_option_job_on_unsupported_source)
 from app.services.task_queue import get_task_queue
 
 logger = logging.getLogger(__name__)
@@ -658,7 +659,7 @@ def _resolve_enabled_instruments(
         # preloading the full store loads/holds OHLCV for ~800 never-touched symbols (huge memory
         # + load time, and one data-less symbol aborts the run). The per-bar screener_runtime gate
         # still restricts entries each bar; this only bounds what OHLCV gets loaded.
-        df = ms.load_store(store)
+        df = load_job_store(store, payload)  # refuses a store built from the other OHLCV history
         settings = _metric_store_settings(universe.get("screener_settings") or {})
         # The scans the per-decision gate can resolve to (visible_scan_window), not "last scan <= start":
         # on an intraday clock the first decision of start_day reads the scan dated BEFORE it.
@@ -973,7 +974,7 @@ def run_daily_backtest(
         refuse_option_job_on_unsupported_source(
             config, uses_options=bool(config.get("options_cache_db")), where="run_daily_backtest")
         raw_ohlcv = job_history_provider(config)
-        set_backtest_history_source(config[OHLCV_HISTORY_SOURCE_KEY])
+        set_backtest_history_source(resolve_job_history_source(config))
         fetch_start = config["start_date"] - timedelta(days=int(config["warmup_days"]))
         # cached_only=True: a backtest is HERMETIC — serve bars from the on-disk caches only and
         # raise a clear BacktestCacheMiss (aggregated by preload) for any symbol absent from every

@@ -628,6 +628,34 @@ def optimize_strategy(
     return {"optimizationId": row.id, "taskId": task_id, **row.to_dict()}
 
 
+def _stamp_new_optimization_source(cfg: dict, strategy_id: int, db: Session) -> dict:
+    """``cfg`` with ``backtest.ohlcv_history_source`` stamped for a NEW optimization (UI/API create path).
+
+    An explicit value in the payload wins; absent -> alpaca for an equity job, fmp for an option job (the
+    launcher's rule: ``history_source.new_job_history_source``). An unknown name, or an option job stated
+    as alpaca, refuses with HTTP 400. Returns a copy; ``cfg`` is not mutated."""
+    from ba2_common.core.ohlcv_history import OHLCV_HISTORY_SOURCE_KEY
+    from app.services.backtest.daily_backtest_handler import strategy_uses_options
+    from app.services.backtest.history_source import new_job_history_source
+
+    out = dict(cfg)
+    if not out.get("backtest"):
+        return out  # the handler refuses a config without a backtest block; do not fabricate one
+    bt = dict(out["backtest"])
+    strategy = db.query(Strategy).filter(Strategy.id == strategy_id).first()
+    probe = {"exit_rules": getattr(strategy, "exit_rules", None), "entry_rules": getattr(strategy, "entry_rules", None),
+             "entry_action": bt.get("entry_action")}
+    try:
+        bt[OHLCV_HISTORY_SOURCE_KEY] = new_job_history_source(
+            bt.get(OHLCV_HISTORY_SOURCE_KEY),
+            uses_options=bool(bt.get("options_cache_db")) or strategy_uses_options(probe),
+            where="optimization create")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    out["backtest"] = bt
+    return out
+
+
 def _enqueue_optimization(
     db: Session,
     *,
@@ -646,6 +674,7 @@ def _enqueue_optimization(
     /optimize-batch fan-out, so a batched job is byte-identical to a single one. Returns
     (row, task_id).
     """
+    cfg = _stamp_new_optimization_source(cfg, strategy_id, db)
     row = StrategyOptimization(
         strategy_id=strategy_id,
         name=name,

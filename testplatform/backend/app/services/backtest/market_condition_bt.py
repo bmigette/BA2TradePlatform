@@ -62,7 +62,13 @@ class BacktestMarketConditionReader(WindowMarketConditionReader):
     """``MarketConditionReader`` over one run's ``AsOfPriceSource``."""
 
     def __init__(self, price_source: Any, profile: str, *, memo_size: int = MEMO_SIZE,
-                 manifest_digest: Optional[str] = None, cache_root: Optional[str] = None):
+                 manifest_digest: Optional[str] = None, cache_root: Optional[str] = None,
+                 source_profile: str = SOURCE_PROFILE_FMP_DAILY):
+        """``source_profile`` = the market-condition source profile of the JOB's OHLCV history
+        (``source_profile_for_history(resolve_job_history_source(config))``). A pinned manifest built from another
+        source profile refuses (``HistorySourceMismatch``): its rows hold numbers the job's history would not
+        reproduce. Without a manifest the reader computes from the run's own price source, which IS the job's."""
+        self.source_profile = source_profile
         mapped = None
         if manifest_digest:
             from ba2_common.core.market_condition_reader import MappedMarketConditionReader
@@ -74,6 +80,14 @@ class BacktestMarketConditionReader(WindowMarketConditionReader):
             # memo_size=0: the WindowMarketConditionReader base memoises the same
             # (symbol, session) key, so a second memo would only double the residency.
             mapped = MappedMarketConditionReader(root, manifest_digest, profile, memo_size=0)
+            built_from = mapped.manifest["source_profile"]
+            if built_from != source_profile:
+                from ba2_common.core.ohlcv_history_stamp import HistorySourceMismatch
+                raise HistorySourceMismatch(
+                    f"market-condition manifest {manifest_digest} (profile {profile!r}) was built from source "
+                    f"profile {built_from!r}, the job runs on {source_profile!r}: a job never reads a snapshot "
+                    f"built from the other OHLCV history (re-warm it for this history, or run the job on the "
+                    f"history the snapshot was built from)")
         super().__init__(profile, memo_size=memo_size, retain_windows=False, mapped=mapped)
         self.manifest_digest = manifest_digest
         self._ps = price_source
@@ -113,9 +127,11 @@ class BacktestMarketConditionResolver:
     the live ``DecisionState`` by ``test_market_condition_bt_live_session_parity``.
     """
 
-    def __init__(self, reader: Any, *, source_profile: str = SOURCE_PROFILE_FMP_DAILY):
+    def __init__(self, reader: Any, *, source_profile: Optional[str] = None):
         self.reader = reader
-        self.source_profile = source_profile
+        # ONE answer: the reader's own source profile unless the caller states the job's explicitly
+        self.source_profile = source_profile if source_profile is not None else getattr(
+            reader, "source_profile", SOURCE_PROFILE_FMP_DAILY)
         self._ctx: Optional[MarketConditionContext] = None
         #: The BAR the cached context was built for. Compared instead of ``ctx.session_label``,
         #: which is the NEXT session and never equals the bar.

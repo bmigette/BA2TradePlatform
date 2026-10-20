@@ -349,7 +349,10 @@ def test_prune_guard_refuses_paths_outside_the_cache_root(tmp_path):
 
 def test_cli_sync_cache_requires_history_source(monkeypatch, capsys):
     import ba2test_launcher
-    assert ba2test_launcher.__file__.replace("\\", "/").find("ah-t9") >= 0
+    # the launcher under test is THIS checkout's (the venv's editable install points at the main clone)
+    import os
+    here = os.path.normcase(os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "..")))
+    assert os.path.normcase(os.path.realpath(ba2test_launcher.__file__)).startswith(here)
     with pytest.raises(SystemExit) as e:
         ba2test_launcher.main(["sync-cache", "--worker", "w1"])
     assert e.value.code == 2

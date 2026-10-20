@@ -105,6 +105,7 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
     from ba2_common.core.ohlcv_history import history_cache_dirname, resolve_job_history_source
     from ba2_providers.screener import metric_store as ms
     from ba2_providers.screener import universe_superset as us
+    from app.services.backtest.history_source import load_job_store
 
     ranges = us.gene_ranges_from_parameter_ranges(parameter_ranges if isinstance(parameter_ranges, dict) else {})
     if not ranges:
@@ -123,7 +124,7 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
                                  str(bt_block["end_date"])[:10], so["base_settings"], ranges,
                                  intraday=us.interval_is_intraday(interval), excluded_symbols=excluded)
     else:
-        df = ms.load_store(so["store"])
+        df = load_job_store(so["store"], bt_block)
         new = us.static_universe(df, str(bt_block["start_date"])[:10], str(bt_block["end_date"])[:10],
                                  so["base_settings"], ranges, intraday=us.interval_is_intraday(interval),
                                  excluded_symbols=excluded)
@@ -166,10 +167,11 @@ def legacy_universe_note(bt_block: Dict[str, Any], hoisted: Dict[str, Any], deco
     so the re-run tools can print it. Pure read of the store."""
     from ba2_providers.screener import metric_store as ms
     from ba2_providers.screener import universe_superset as us
+    from app.services.backtest.history_source import load_job_store
 
     eff = ms.normalize_screener_settings({**(hoisted.get("screener_base") or {}),
                                           **(decoded.get("screener_overrides") or {})})
-    df = ms.load_store(hoisted["screener_store"])
+    df = load_job_store(hoisted["screener_store"], bt_block)
     sel = us.gate_selections(df, str(bt_block["start_date"])[:10], str(bt_block["end_date"])[:10], eff,
                              list(bt_block.get("excluded_instruments") or []),
                              intraday=us.interval_is_intraday(bt_block["execution_interval"]))

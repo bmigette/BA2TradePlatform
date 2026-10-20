@@ -463,6 +463,11 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
     # and nothing anywhere would say so. So an optimizer-assembled config (``_ga_trial``: GA trial,
     # re-run, robustness variant and top-N persist alike -- see
     # strategy_optimization_handler._build_daily_trial_config) is REFUSED here instead.
+    # The market-condition source profile of THIS job's OHLCV history (fmp | alpaca): the reader refuses a
+    # pinned manifest built from the other one, and the context carries it.
+    from ba2_common.core.market_condition_source import source_profile_for_history
+    from ba2_common.core.ohlcv_history import resolve_job_history_source
+    job_source_profile = source_profile_for_history(resolve_job_history_source(config))
     readers = []
     for profile in profiles:
         digest = manifests.get(profile)
@@ -475,14 +480,16 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
                     f"every digest into every trial; computing 128-session indicators per trial "
                     f"is not a fallback this path takes.")
             warn_research_mode(profile, "backtest reader")
-        reader = BacktestMarketConditionReader(price_source, profile, manifest_digest=digest)
+        reader = BacktestMarketConditionReader(price_source, profile, manifest_digest=digest,
+                                           source_profile=job_source_profile)
         # PER PROFILE: each snapshot was warmed separately and can cover a different set of
         # symbols (and a different window), so "is this run served" is a question with one answer
         # per profile -- both halves of it.
         check_market_condition_coverage(config, reader)
         check_market_condition_window(config, reader)
         readers.append(reader)
-    resolver = BacktestMarketConditionResolver(market_condition_reader_for(readers))
+    resolver = BacktestMarketConditionResolver(market_condition_reader_for(readers),
+                                                source_profile=job_source_profile)
     if TradeConditions.get_market_condition_context_resolver() is not _dispatch_market_condition_context:
         TradeConditions.set_market_condition_context_resolver(_dispatch_market_condition_context)
     _market_condition_tl.resolver = resolver

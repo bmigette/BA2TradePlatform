@@ -556,8 +556,9 @@ class DailyBacktestEngine:
             from app.services.backtest.screener_gate import PanelGate
             self._screen_gate = PanelGate(self._screener_runtime, price_source, intraday=price_source.is_intraday,
                                           history_source=resolve_job_history_source(config))
-        elif self._screener_runtime and self._screener_runtime.get("store"):
-            # the legacy weekly gate reads a metric store: it must come from the job's OHLCV history
+        if self._screener_runtime and self._screener_runtime.get("store"):
+            # the legacy weekly gate, the ATR cache and the bypass experts read the metric store: it must come
+            # from the job's OHLCV history (also under the panel gate, which still carries a store)
             from ba2_providers.screener import metric_store as _ms_hist
             _ms_hist.require_store_history_source(self._screener_runtime["store"],
                                                   resolve_job_history_source(config))

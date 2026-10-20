@@ -1599,6 +1599,21 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 "optimization_config.backtest is required "
                 "(engine/datasets/date-range/initial_capital/...)",
             )
+        # An OPTION optimization on an OHLCV history other than fmp refuses NOW, before any trial (the per-trial
+        # check in _build_daily_trial_config stays as the backstop for option genes decoded later). A UI/API job
+        # that carries the alpaca stamp but names an option strategy / options cache fails here, not mid-GA.
+        from app.services.backtest.daily_backtest_handler import strategy_uses_options as _uses_options
+        from app.services.backtest.history_source import (
+            OptionHistorySourceUnsupported, refuse_option_job_on_unsupported_source as _refuse_option_source)
+        try:
+            _refuse_option_source(
+                {OHLCV_HISTORY_SOURCE_KEY: resolve_job_history_source(backtest_cfg)},
+                uses_options=bool(backtest_cfg.get("options_cache_db")) or _uses_options(
+                    {"exit_rules": strategy.exit_rules, "entry_rules": strategy.entry_rules,
+                     "entry_action": backtest_cfg.get("entry_action")}),
+                where="handle_strategy_optimization")
+        except (OptionHistorySourceUnsupported, ValueError) as e:  # ValueError: UnknownHistorySource
+            return _fail(opt_id, db, str(e))
         expert_cfg = ga.get("expert_params")  # may be None (expert frozen)
         from app.services.backtest.backtest_account import FillRebaseDisabled, assert_fill_rebase_enabled
         try:
@@ -3007,7 +3022,8 @@ def _build_daily_trial_config(
                                   history_source=_job_hist(backtest_cfg)), _sd, _ed, eff_norm, excluded_instruments,
                     intraday=_is_intraday_interval(backtest_cfg.get("execution_interval"))))
             else:
-                _df = _ms.load_store(hoisted["screener_store"])
+                from app.services.backtest.history_source import load_job_store
+                _df = load_job_store(hoisted["screener_store"], backtest_cfg)
                 _union = set(_ms.screened_symbol_union_visible(
                     _df, _sd, _ed, eff_norm, excluded_instruments,
                     intraday=_is_intraday_interval(backtest_cfg.get("execution_interval"))))

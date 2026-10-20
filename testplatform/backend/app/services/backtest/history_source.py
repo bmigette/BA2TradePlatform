@@ -20,6 +20,7 @@ import os
 from typing import Any, Mapping, Optional
 
 from ba2_common.core.ohlcv_history import (
+    DEFAULT_BT_HISTORY_SOURCE,
     LEGACY_HISTORY_SOURCE,
     OHLCV_HISTORY_SOURCE_KEY,
     check_history_source,
@@ -107,3 +108,28 @@ def stored_history_source(backtest: Any, session: Any = None) -> str:
         if optimization is not None:
             stamp = find_history_stamp(_blob(getattr(optimization, "optimization_config", None)))
     return LEGACY_HISTORY_SOURCE if stamp is None else check_history_source(stamp)
+
+
+def load_job_store(store_dir: str, config: Mapping) -> Any:
+    """``metric_store.load_store(store_dir)`` for a job whose history source is ``config``'s.
+
+    A job never reads a metric store built from the other OHLCV history: the store's build manifest
+    must carry the job's source (``require_store_history_source``; a store without one is legacy fmp)."""
+    from ba2_providers.screener import metric_store as ms
+
+    ms.require_store_history_source(store_dir, resolve_job_history_source(config))
+    return ms.load_store(store_dir)
+
+
+def new_job_history_source(stated: Optional[str], *, uses_options: bool, where: str) -> str:
+    """The source a NEW backtest / optimization is stamped with (the launcher and the API share this).
+
+    Stated -> as stated (an unknown name refuses: ``UnknownHistorySource``); not stated ->
+    ``DEFAULT_BT_HISTORY_SOURCE`` for an equity job and ``fmp`` for an option job. An option job
+    resolved to anything but fmp refuses (``OptionHistorySourceUnsupported``)."""
+    if stated is not None:
+        source = check_history_source(stated)
+    else:
+        source = OPTION_SUPPORTED_SOURCE if uses_options else DEFAULT_BT_HISTORY_SOURCE
+    refuse_option_job_on_unsupported_source({OHLCV_HISTORY_SOURCE_KEY: source}, uses_options=uses_options, where=where)
+    return source

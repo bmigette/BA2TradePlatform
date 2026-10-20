@@ -1337,19 +1337,12 @@ def _resolve_history_source(args, command: str, spec: dict, strategy_kind: "str 
     ``DEFAULT_BT_HISTORY_SOURCE`` for an equity job and ``fmp`` for an option job, so the option
     grids behave exactly as before. An option job STATED as anything but fmp refuses here, before
     the job row, the strategy or any trial exists (``OptionHistorySourceUnsupported``)."""
-    from ba2_common.core.ohlcv_history import DEFAULT_BT_HISTORY_SOURCE
-    from app.services.backtest.history_source import (
-        OPTION_SUPPORTED_SOURCE, OptionHistorySourceUnsupported, refuse_option_job_on_unsupported_source)
-    option_job = _is_option_job(spec, strategy_kind)
-    stated = getattr(args, "ohlcv_history_source", None)
-    source = stated if stated is not None else (
-        OPTION_SUPPORTED_SOURCE if option_job else DEFAULT_BT_HISTORY_SOURCE)
+    from app.services.backtest.history_source import OptionHistorySourceUnsupported, new_job_history_source
     try:
-        refuse_option_job_on_unsupported_source(
-            {"ohlcv_history_source": source}, uses_options=option_job, where=command)
+        return new_job_history_source(getattr(args, "ohlcv_history_source", None),
+                                      uses_options=_is_option_job(spec, strategy_kind), where=command)
     except OptionHistorySourceUnsupported as e:
         sys.exit(f"ba2-test {command}: REFUSED: {e}")
-    return source
 
 
 def _refuse_reused_history_source_name(name: str, source: str, command: str) -> None:
@@ -7145,8 +7138,8 @@ def _cmd_optimize(args) -> int:
                 # flag is False and only the classic `screener_runtime` path applies (unchanged).
                 "apply_to_expert_settings": bool(spec.get("bypass")),
             }
-            from ba2_providers.screener import metric_store as _ms
-            _store_df = _ms.load_store(args.screener_store)
+            from app.services.backtest.history_source import load_job_store as _load_job_store
+            _store_df = _load_job_store(args.screener_store, {"ohlcv_history_source": history_source})
             if _store_df.empty:
                 sys.exit(f"optimize: --screener-store {args.screener_store!r} has no symbols")
             # THE STATIC UNIVERSE = the true SUPERSET (ba2_providers.screener.universe_superset): every
@@ -7248,7 +7241,8 @@ def _cmd_optimize(args) -> int:
         if _gate_opt:
             backtest_block["screener_opt"] = _gate_opt
             from ba2_providers.screener import metric_store as _gate_ms
-            _gate_df = _gate_ms.load_store(_gate_opt["store"])
+            from app.services.backtest.history_source import load_job_store as _load_job_store_g
+            _gate_df = _load_job_store_g(_gate_opt["store"], {"ohlcv_history_source": history_source})
             if _gate_df.empty:
                 sys.exit(f"optimize: --screener-gate-store {_gate_opt['store']!r} has no symbols")
             # Coverage guard: a symbol with no store row can NEVER pass the per-bar gate, so a
