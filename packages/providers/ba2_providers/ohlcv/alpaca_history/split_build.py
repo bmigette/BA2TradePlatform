@@ -28,9 +28,9 @@ import requests
 from ba2_common import config as _cfg
 from ba2_providers.fmp_common import fmp_http_get, redact
 from ba2_providers.ohlcv.alpaca_history.split_table import (
-    ACCEPTED_COLUMNS, COMPARE_COLUMNS, OVERRIDES_PATH, REVIEW_COLUMNS, SplitTableBuildError, alpaca_events_from_actions,
+    ACCEPTED_COLUMNS, COMPARE_COLUMNS, OVERRIDES_PATH, REVIEW_COLUMNS, SplitTableBuildError, alpaca_events_from_actions, spinoff_events_from_actions,
     build_rename_map, compare_with_fmp, corporate_action_paths, decide_splits, fmp_events_from_rows, load_overrides,
-    read_corporate_actions, splits_by_symbol)
+    read_corporate_actions, rename_successors, splits_by_symbol)
 
 
 def read_csv_frame(path: str) -> pd.DataFrame:
@@ -217,10 +217,113 @@ def _csv_bytes(columns: Sequence[str], rows: Iterable[Mapping[str, Any]], run_id
     return buf.getvalue().encode("utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Yahoo: the confirmation source of UNLISTED (inferred) splits only
+# ---------------------------------------------------------------------------
+YAHOO_INPUT_COLUMNS = ["symbol", "ticker", "status", "n_splits", "fetched_at", "sha256"]
+
+
+class YahooUnavailable(RuntimeError):
+    """Yahoo could not be reached for a ticker after the retries (transient: never cached)."""
+
+
+def yfinance_fetch(ticker: str) -> Optional[List[Tuple[str, float]]]:
+    """``[(iso date, ratio), ...]`` of Yahoo's split history for ``ticker`` (new/old shares, 4-for-1 -> 4.0); ``[]`` for a
+    known ticker with no split; None when Yahoo does not know the ticker (it answers 404)."""
+    import yfinance as yf
+    sp = yf.Ticker(ticker).splits
+    if sp is None:
+        return None
+    return [((ts.tz_convert("America/New_York") if ts.tzinfo else ts).date().isoformat(), float(v)) for ts, v in sp.items()]
+
+
+class YahooSplitSource:
+    """``source(symbol) -> {"available", "ticker", "splits"}`` for ``decide_splits(yahoo=...)``.  Per-symbol raw results are
+    cached as JSON in ``cache_dir`` (``fetched_at`` inside), so a rerun is offline; ``refresh`` fetches again.  Yahoo uses
+    CURRENT tickers: when a symbol is unknown (404) or lists no split, its renamed successors (Alpaca name-change chain) are
+    tried in turn and the answering ticker is recorded.  Requests are paced to ``min_interval`` seconds and retried; a
+    symbol still failing is ``available: False`` and is NOT cached (a rerun tries it again)."""
+
+    def __init__(self, cache_dir: str, renames: Mapping[str, Sequence[Tuple[date, str]]], *, refresh: bool = False,
+                 fetch: Callable[[str], Optional[List[Tuple[str, float]]]] = yfinance_fetch,
+                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+                 min_interval: float = 1.0, retries: int = 3, backoff: Sequence[float] = (2.0, 5.0, 15.0)):
+        self.cache_dir, self.renames, self.refresh, self.fetch = cache_dir, renames, refresh, fetch
+        self.sleep, self.clock, self.min_interval, self.retries, self.backoff = sleep, clock, min_interval, retries, backoff
+        self.records: Dict[str, Dict[str, Any]] = {}       # symbol -> row of yahoo_inputs.csv, for the symbols consulted
+        self._last = -1e18
+        self.fetched = 0
+
+    def _call(self, ticker: str) -> Optional[List[Tuple[str, float]]]:
+        last: Optional[BaseException] = None
+        for attempt in range(self.retries + 1):
+            wait = self.min_interval - (self.clock() - self._last)
+            if wait > 0:
+                self.sleep(wait)
+            self._last = self.clock()
+            try:
+                return self.fetch(ticker)
+            except Exception as e:                      # a transient network / rate-limit error: retry, then give up loudly
+                last = e
+                if attempt < self.retries:
+                    self.sleep(self.backoff[min(attempt, len(self.backoff) - 1)])
+        raise YahooUnavailable(f"{ticker}: {type(last).__name__}: {last}")
+
+    def _fetch_symbol(self, symbol: str) -> Dict[str, Any]:
+        tried: List[str] = []
+        empty_ok: Optional[str] = None
+        try:
+            for ticker in [symbol] + rename_successors(symbol, self.renames):
+                got = self._call(ticker)
+                if got is None:
+                    tried.append(f"{ticker}: not found")
+                    continue
+                if got:
+                    return {"status": "ok", "ticker": ticker, "splits": [[d, r] for d, r in got], "tried": tried}
+                tried.append(f"{ticker}: no splits")
+                empty_ok = empty_ok or ticker
+        except YahooUnavailable as e:
+            return {"status": "error", "ticker": None, "splits": [], "tried": tried + [str(e)]}
+        if empty_ok is not None:
+            return {"status": "ok", "ticker": empty_ok, "splits": [], "tried": tried}
+        return {"status": "not_found", "ticker": None, "splits": [], "tried": tried}
+
+    def __call__(self, symbol: str) -> Dict[str, Any]:
+        path = os.path.join(self.cache_dir, f"{symbol}.json")
+        if not self.refresh and os.path.exists(path):
+            with open(path, "rb") as f:
+                raw = f.read()
+            data = json.loads(raw)
+        else:
+            data = self._fetch_symbol(symbol)
+            data = {"symbol": symbol, **data, "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+            raw = b""
+            if data["status"] != "error":
+                raw = json.dumps(data, indent=1).encode("utf-8")
+                atomic_write(path, raw)
+            self.fetched += 1
+        self.records[symbol] = {"symbol": symbol, "ticker": data["ticker"] or "", "status": data["status"],
+                                "n_splits": len(data["splits"]), "fetched_at": data["fetched_at"],
+                                "sha256": hashlib.sha256(raw).hexdigest() if raw else ""}
+        return {"available": data["status"] == "ok", "ticker": data["ticker"], "splits": data["splits"]}
+
+    def inputs(self) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """The rows of yahoo_inputs.csv (sorted by symbol) and the summary for split_table.json."""
+        rows = [self.records[s] for s in sorted(self.records)]
+        h = hashlib.sha256()
+        for r in rows:
+            if r["sha256"]:
+                h.update(f"{r['symbol']}|{r['sha256']}\n".encode())
+        return rows, {"dir": self.cache_dir, "count": len(rows), "content_sha256": h.hexdigest(),
+                      "inputs_csv": "yahoo_inputs.csv"}
+
+
 def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db: str = DEFAULT_DB,
                       fmp_daily_dir: str = DEFAULT_FMP_DAILY, symbols: Optional[List[str]] = None,
                       fmp_from: str = "2016-01-01", fmp_to: Optional[str] = None,
-                      overrides_path: str = OVERRIDES_PATH, log: Callable[[str], None] = print) -> Dict[str, Any]:
+                      overrides_path: str = OVERRIDES_PATH, log: Callable[[str], None] = print,
+                      refresh_yahoo: bool = False, yahoo_fetch: Optional[Callable] = None, yahoo_min_interval: float = 1.0,
+                      yahoo_sleep: Callable[[float], None] = time.sleep) -> Dict[str, Any]:
     """Build and write ``<out>/_meta/split_table.json`` (+ review / accepted / vs-FMP CSVs).  Returns a summary:
     ``{"meta", "asof", "symbols_judged", "symbols_with_splits", "accepted", "review_rows", "review_applied",
     "stats", "compare", "compare_examples"}``.  Raises ``SplitOverridesPending`` while an override is pending.
@@ -241,6 +344,7 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     months = read_corporate_actions(store)
     renames = build_rename_map(months)
     alpaca = alpaca_events_from_actions(months, renames, stats)
+    spinoffs = spinoff_events_from_actions(months, renames, stats)
     if stats["alpaca_forward_splits"] + stats["alpaca_reverse_splits"] <= 0:
         raise SplitTableBuildError(f"the store's corporate actions hold no forward or reverse split at all ({store}): "
                                    f"the files are empty or have changed shape")
@@ -261,29 +365,40 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     log(f"loaded {len(bars)} symbols, {len(alpaca)} Alpaca and {len(fmp)} FMP listings, {fmp_files['count']} FMP daily "
         f"files in {time.time() - t0:.0f}s")
 
-    accepted, review = decide_splits(bars, alpaca, fmp, overrides, stats, fmp_daily=fmp_daily)
+    breaks: Dict[str, List[str]] = {}
+    yahoo = YahooSplitSource(os.path.join(meta, "yahoo_splits"), renames, refresh=refresh_yahoo,
+                             fetch=yahoo_fetch or yfinance_fetch, sleep=yahoo_sleep, min_interval=yahoo_min_interval)
+    accepted, review = decide_splits(bars, alpaca, fmp, overrides, stats, fmp_daily=fmp_daily, breaks=breaks,
+                                     spinoffs=spinoffs, yahoo=yahoo)
+    yahoo_rows, yahoo_files = yahoo.inputs()
+    stats["yahoo_symbols_consulted"] = len(yahoo_rows)
+    stats["yahoo_symbols_fetched"] = yahoo.fetched
     cmp_rows = compare_with_fmp(bars, accepted, review, alpaca, fmp, fmp_daily)
 
     h = hashlib.sha256()          # the inputs actually read: the store's action files, the calendar windows used
     for part in (bars_sha, sha256_files(corporate_action_paths(store)), sha256_files(cal_used), f"{fmp_from}|{fmp_to}"):
         h.update(part.encode())
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_id = f"{stamp}-{hashlib.sha256((stamp + h.hexdigest() + overrides_sha + fmp_files['content_sha256']).encode()).hexdigest()[:8]}"
+    run_id = f"{stamp}-{hashlib.sha256((stamp + h.hexdigest() + overrides_sha + fmp_files['content_sha256'] + yahoo_files['content_sha256']).encode()).hexdigest()[:8]}"
     table = {"run_id": run_id, "asof": info["asof"], "inputs_sha256": h.hexdigest(), "overrides_sha256": overrides_sha,
-             "fmp_daily_files": {**fmp_files, "inputs_csv": "fmp_daily_inputs.csv"}, "splits": splits_by_symbol(accepted)}
+             "fmp_daily_files": {**fmp_files, "inputs_csv": "fmp_daily_inputs.csv"}, "yahoo_files": yahoo_files,
+             "breaks": {k: sorted(v) for k, v in sorted(breaks.items())},
+             "spinoffs": splits_by_symbol(accepted, "spinoff"), "splits": splits_by_symbol(accepted, "split")}
     # one coherent set: every CSV carries the run_id, and split_table.json is written LAST, so a crash never leaves a table
     # newer than its CSVs (a reader checks that the run_ids of the table and the CSVs match)
     atomic_write(os.path.join(meta, "split_review.csv"), _csv_bytes(REVIEW_COLUMNS, review, run_id))
     atomic_write(os.path.join(meta, "split_accepted.csv"), _csv_bytes(ACCEPTED_COLUMNS, accepted, run_id))
     atomic_write(os.path.join(meta, "split_vs_fmp.csv"), _csv_bytes(COMPARE_COLUMNS, cmp_rows, run_id))
     atomic_write(os.path.join(meta, "fmp_daily_inputs.csv"), _csv_bytes(FMP_INPUT_COLUMNS, fmp_records, run_id))
+    atomic_write(os.path.join(meta, "yahoo_inputs.csv"), _csv_bytes(YAHOO_INPUT_COLUMNS, yahoo_rows, run_id))
     atomic_write(os.path.join(meta, "split_table.json"), json.dumps(table, indent=1).encode("utf-8"))
     for (src, verdict), k in sorted(Counter((a["source"], a["verdict"]) for a in accepted).items()):
         stats[f"accepted_{verdict}_from_{src}"] += k
     classes = ("agree", "ratio_differs", "ours_only", "fmp_only_accepted", "fmp_only_rejected")
     return {"meta": meta, "run_id": run_id, "asof": info["asof"], "fmp_to": fmp_to, "symbols_judged": len(bars),
-            "symbols_with_splits": len(table["splits"]), "accepted": len(accepted), "review_rows": len(review),
+            "symbols_with_splits": len(table["splits"]),
+            "spinoffs_applied": sum(len(v) for v in table["spinoffs"].values()), "series_breaks": sum(len(v) for v in breaks.values()), "accepted": len(accepted), "review_rows": len(review),
             "review_applied": sum(r["applied"] for r in review),
-            "fmp_daily_files": fmp_files, "stats": dict(sorted(stats.items())),
+            "fmp_daily_files": fmp_files, "yahoo_files": yahoo_files, "stats": dict(sorted(stats.items())),
             "compare": {c: sum(1 for r in cmp_rows if r["class"] == c) for c in classes},
             "compare_examples": {c: [r for r in cmp_rows if r["class"] == c][:10] for c in classes if c != "agree"}}

@@ -60,6 +60,20 @@
    "reason": "reused ticker: Bed Bath & Beyond (bankrupt 2023) and Beyond Inc (ticker from 2025) under one symbol; the vendor daily series runs unbroken 2011-2026 while the 5-min cache has no 2024 bars and its 2020-2023 closes are off the daily close on 98-100% of days",
    "added": "2026-10-20",
    "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "IAC",
+   "kind": "exclude",
+   "reason": "spliced ticker: on 2020-07-01 the IAC symbol passed to the new IAC (Match separation; old IAC became MTCH); raw overnight jump x3.14 with no split or spin-off listed, so one series holds two companies",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "ADEA",
+   "kind": "exclude",
+   "reason": "spliced ticker: Xperi/Adeia separation on 2022-10-03 (ADEAV -> ADEA); raw overnight jump x2.13 with no spin-off listed, so one series holds two companies",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
   }
  ]
 }

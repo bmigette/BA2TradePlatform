@@ -241,10 +241,6 @@ def test_load_overrides_validates_and_refuses_pending(tmp_path):
         st.load_overrides(write_ov(tmp_path, [ov("reject"), ov("reject")]))
 
 
-def test_shipped_overrides_file_loads_and_is_empty():
-    assert st.load_overrides() == []
-
-
 # ---- listings -----------------------------------------------------------------------------------------------
 MONTH = {
     "forward_splits": [{"symbol": "AAPL", "ex_date": "2020-08-31", "old_rate": 1, "new_rate": 4},
@@ -339,14 +335,11 @@ def test_pipeline_source_and_step_validation(tmp_path, capsys):
     assert cli.main(["--source", "fmp", "--from-step", "build"] + base) == 2
     assert cli.main(["--source", "alpaca", "--steps", "split-table", "--from-step", "split-table"] + base) == 2
     assert cli.main(["--source", "alpaca", "--steps", "split-table", "--fmp-from", "yesterday"] + base) == 2
-    # valid but not implemented: refuse loudly, run nothing, write nothing
-    for src, step in (("alpaca", "download"), ("alpaca", "build"), ("alpaca", "verify"), ("fmp", "download"),
-                      ("fmp", "verify")):
-        assert cli.main(["--source", src, "--steps", step] + base) == 2
-        assert "not implemented yet (plan Task 4)" in capsys.readouterr().err
-    assert cli.main(["--source", "alpaca", "--steps", "split-table,build"] + base) == 2   # one unimplemented step refuses all
-    assert cli.main(["--source", "alpaca"] + base) == 2                           # default = every step: refuses
-    assert cli.main(["--source", "fmp", "--dry-run"] + base) == 2
+    # every step is implemented; a dry run of one whose inputs are missing refuses (exit 2) and writes nothing
+    assert cli.main(["--source", "fmp", "--steps", "download", "--dry-run"] + base) == 2         # needs --fmp-symbols-file etc.
+    assert "--fmp-symbols-file" in capsys.readouterr().err
+    assert cli.main(["--source", "alpaca", "--steps", "build", "--dry-run"] + base) == 2         # no split table yet
+    assert cli.main(["--source", "alpaca", "--steps", "verify", "--dry-run"] + base) == 2        # no cache folder
     assert not (tmp_path / "out").exists()
 
 
@@ -380,8 +373,12 @@ def test_pipeline_end_to_end_on_a_tiny_store_is_offline_and_reproducible(tmp_pat
     assert table["splits"] == {"NA": [[D.isoformat(), 4.0]]} and table["fmp_daily_files"]["count"] == 1
     acc = sb.read_csv_frame(str(out / "_meta" / "split_accepted.csv"))
     assert list(acc["symbol"]) == ["NA"] and acc["fmp_step"][0].endswith("equals_f")
+    import re as _re
+
+    def stable(b):                                              # the run_id carries a timestamp: everything else is reproducible
+        return _re.sub(rb'"run_id": "[^"]*"', b"", b)
     first = (out / "_meta" / "split_table.json").read_bytes()
-    assert cli.main(argv) == 0 and (out / "_meta" / "split_table.json").read_bytes() == first
+    assert cli.main(argv) == 0 and stable((out / "_meta" / "split_table.json").read_bytes()) == stable(first)
     report = json.loads((out / "_meta" / "prepare_history_alpaca_report.json").read_text(encoding="utf-8"))
     assert report["steps"][0]["status"] == "ok"
 
@@ -400,14 +397,21 @@ def fmp(raw, applied=None, wobble=None):
                                   for t in raw["t"]], "Close": close})
 
 
-def runf(frames, fmp_frames, alp=(), fm=(), ov=()):
+def yhoo(*splits, available=True, ticker="X"):
+    """A fake Yahoo source: the given (date, ratio) splits for every symbol."""
+    def source(sym):
+        return {"available": available, "ticker": ticker, "splits": [[d.isoformat(), r] for d, r in splits]}
+    return source
+
+
+def runf(frames, fmp_frames, alp=(), fm=(), ov=(), yahoo=None):
     stats = Counter()
-    acc, rev = st.decide_splits(frames, list(alp), list(fm), list(ov), stats, fmp_daily=fmp_frames)
+    acc, rev = st.decide_splits(frames, list(alp), list(fm), list(ov), stats, fmp_daily=fmp_frames, yahoo=yahoo)
     return acc, rev, stats
 
 
 def test_reverse_split_whose_jump_misses_by_20_percent_is_proven_by_the_fmp_step():
-    raw = bars(40, 0.12)                                        # 0.12 vs 0.1: outside the 15 % jump tolerance
+    raw = bars(40, 0.18)                                        # 0.18 vs 0.1: x1.8 off, so neither the jump proof nor the x1.5 rule applies
     acc, rev, _ = run({"X": raw}, [L("X", D, 0.1)], [L("X", D, 0.1)])
     assert acc == [] and one(rev, "unresolved")                 # the jump alone cannot decide it
     acc, rev, stats = runf({"X": raw}, {"X": fmp(raw, {40: 0.1})}, [L("X", D, 0.1)], [L("X", D, 0.1)])
@@ -490,7 +494,7 @@ def test_mismatch_resolved_by_the_step():
 
 
 def test_unstable_side_gives_no_vote_unless_another_event_is_near():
-    raw = bars(40, 0.12)
+    raw = bars(40, 0.18)
     f = fmp(raw, {40: 0.1}, wobble={38: 1.05})                  # r jumps 5 % two sessions before D
     acc, rev, _ = runf({"X": raw}, {"X": f}, [L("X", D, 0.1)], [L("X", D, 0.1)])
     assert acc == [] and one(rev, "unresolved")["fmp_step"].endswith("unstable")
@@ -500,7 +504,7 @@ def test_unstable_side_gives_no_vote_unless_another_event_is_near():
 
 
 def test_no_fmp_data_leaves_the_decision_to_the_jump():
-    raw = bars(40, 0.12)
+    raw = bars(40, 0.18)
     for fd in (None, {}, {"X": fmp(raw).iloc[0:0]}):
         acc, rev, _ = runf({"X": raw}, fd, [L("X", D, 0.1)], [L("X", D, 0.1)])
         assert acc == [] and one(rev, "unresolved")
@@ -546,7 +550,7 @@ def test_every_verdict_code_is_documented_in_the_module_docstring():
 def test_stability_waiver_counts_listed_neighbours_even_when_they_are_rejected():
     # the waiver uses LISTED events of other units, not accepted ones: a neighbour listing that is later rejected
     # (here: a contradicted 2.0 listing two sessions earlier) still waives the stability check of the main event
-    raw = bars(40, 0.12)
+    raw = bars(40, 0.18)
     f = fmp(raw, {40: 0.1}, wobble={38: 1.05})                  # r jumps 5 % at session 38: an unstable side
     acc, rev, _ = runf({"X": raw}, {"X": f}, [L("X", D, 0.1)], [L("X", D, 0.1)])
     assert acc == [] and one(rev, "unresolved")["fmp_step"].endswith("unstable")            # no neighbour: no waiver
@@ -724,17 +728,17 @@ def test_unexplained_jump_scan_skips_pairs_further_apart_than_the_gap_limit():
 
 def test_two_accepted_events_on_one_date_are_refused():
     with pytest.raises(st.SplitTableBuildError, match="two accepted events"):
-        st.splits_by_symbol([{"symbol": "X", "date": "2021-03-01", "factor": 2.0},
-                             {"symbol": "X", "date": "2021-03-01", "factor": 1.1}])
+        st.splits_by_symbol([{"symbol": "X", "date": "2021-03-01", "kind": "split", "factor": 2.0},
+                             {"symbol": "X", "date": "2021-03-01", "kind": "split", "factor": 1.1}])
 
 
 def test_override_matching_several_groups_is_refused_and_absorbed_listings_are_counted():
     raw = bars(40, 4.0)
     _, _, stats = run({"X": raw}, [L("X", D, 4.0), L("X", D, 4.0)], [], [ov("reject")])
     assert stats["listings_absorbed_by_override"] == 2          # both listings of the one group
-    # two listings of different ratios on the SAME date are two groups: one override cannot decide both
-    with pytest.raises(st.SplitTableBuildError, match="ambiguous"):
-        run({"X": raw}, [L("X", D, 4.0), L("X", D, 1.1)], [L("X", D, 4.0), L("X", D, 1.1)], [ov("reject")])
+    # the same event listed with different ratios on one date (an inverted ratio): the one override decides it once
+    acc, _, stats = run({"X": raw}, [L("X", D, 4.0)], [L("X", D, 0.25)], [ov("accept", 4.0)])
+    assert [(a["factor"], a["verdict"]) for a in acc] == [(4.0, "override_accept")]
     # two overrides matching the dates of one group
     with pytest.raises(st.SplitTableBuildError, match="ambiguous"):
         run({"X": raw}, [L("X", D, 4.0), L("X", SESSIONS[41].date(), 4.0)], [],
@@ -760,3 +764,429 @@ def test_symbols_option_is_normalized(tmp_path):
     assert _cli().main(argv) == 0
     table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
     assert list(table["splits"]) == ["BRK-B"]
+
+
+# ---- A: both_listed_jump_within_1_5, B: inferred_from_fmp_step, C: the reviewed overrides, D: series breaks -----------
+def test_both_vendors_listing_a_big_ratio_with_a_jump_within_x1_5_is_accepted_without_the_step():
+    raw = bars(40, 3.0)                                          # f=4: outside the 15 % jump tolerance, inside x1.5
+    acc, rev, stats = run({"X": raw}, [L("X", D, 4.0)], [L("X", D, 4.0)])
+    assert [(a["verdict"], a["source"]) for a in acc] == [("both_listed_jump_within_1_5", "both")] and rev == []
+    assert stats["verdict_both_listed_jump_within_1_5"] == 1
+    acc, rev, _ = run({"X": bars(40, 2.0)}, [L("X", D, 4.0)], [L("X", D, 4.0)])         # x2 off f: not accepted
+    assert acc == [] and one(rev, "unresolved")
+    acc, rev, _ = run({"X": raw}, [L("X", D, 4.0)], [])                                  # one vendor only: not accepted
+    assert acc == [] and one(rev, "unresolved")
+    acc, rev, _ = run({"X": bars(40, 1.5)}, [L("X", D, 1.8)], [L("X", D, 1.8)])          # |ln f| < ln 2: not this rule
+    assert acc == [] and rev and rev[0]["verdict"] != "both_listed_jump_within_1_5"
+    acc, rev, _ = run({"X": raw}, [L("X", D, 4.0)], [L("X", D, 3.0)])                    # different ratios: not this rule
+    assert [a["verdict"] for a in acc] != ["both_listed_jump_within_1_5"]
+
+
+def test_clean_ratios():
+    assert st._nearest_clean_ratio(0.1003) == pytest.approx(0.1) and st._nearest_clean_ratio(3.99) == 4
+    assert st._nearest_clean_ratio(1.5) == 1.5 and st._nearest_clean_ratio(0.6667) == pytest.approx(2 / 3)
+    assert st._nearest_clean_ratio(1000.0) == 1000 and st._nearest_clean_ratio(0.001) == pytest.approx(0.001)
+    for off in (0.13, 1.0, 2.5, 6.5, 1001.0, 0.0009, 3.054, 3.02, 0.1011):
+        assert st._nearest_clean_ratio(off) is None, off
+
+
+def test_unlisted_split_is_inferred_from_a_clean_fmp_step_and_a_matching_jump():
+    raw = bars(40, 0.081)                                        # jump 0.081, FMP applied 0.1 (OP 2022-12-22 style)
+    acc, rev, stats = runf({"X": raw}, {"X": fmp(raw, {40: 0.1})}, yahoo=yhoo((D, 0.1)))
+    assert [(a["factor"], a["verdict"], a["source"]) for a in acc] == [(0.1, "inferred_confirmed_by_yahoo", "fmp_step+yahoo")]
+    r = one(rev, "inferred_confirmed_by_yahoo")
+    assert r["applied"] is True and r["fmp_step"].endswith("equals_f") is False and "0.1" in r["fmp_step"]
+    assert stats["verdict_inferred_confirmed_by_yahoo"] == 1
+    # a jump x2.5 away from the clean ratio: not inferred (and 4x is not a series break)
+    raw = bars(40, 0.25)
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 0.1})})
+    assert acc == [] and one(rev, "unexplained_jump")
+    # the step is not a clean ratio
+    raw = bars(40, 0.4)
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 0.4})})
+    assert acc == [] and one(rev, "unexplained_jump")
+    # no FMP data: nothing to infer from (a x12 collapse with no explanation is then a series break)
+    acc, rev, _ = run({"X": bars(40, 0.081)})
+    assert acc == [] and one(rev, "series_break")
+
+
+def test_series_break_for_an_unexplained_jump_beyond_x5_that_the_step_does_not_explain():
+    raw = bars(40, 8.0)
+    breaks = {}
+    stats = Counter()
+    acc, rev = st.decide_splits({"X": raw}, [], [], [], stats, fmp_daily={"X": fmp(raw, {40: 6.5})}, breaks=breaks)
+    assert acc == [] and one(rev, "series_break")["applied"] is False
+    assert breaks == {"X": [SESSIONS[40].date().isoformat()]} and stats["verdict_series_break"] == 1
+    # FMP's step is flat there (a real market move): never a break
+    breaks = {}
+    acc, rev = st.decide_splits({"X": raw}, [], [], [], Counter(), fmp_daily={"X": fmp(raw)}, breaks=breaks)
+    assert rev == [] and breaks == {}
+    # an inferred split is not a break
+    acc, rev = st.decide_splits({"X": raw}, [], [], [], Counter(), fmp_daily={"X": fmp(raw, {40: 8.0})}, breaks=breaks,
+                                yahoo=yhoo((D, 8.0)))
+    assert [a["verdict"] for a in acc] == ["inferred_confirmed_by_yahoo"] and breaks == {}
+    # between x1.8 and x5 stays an ordinary unexplained jump; without FMP data a x8 jump is a break
+    breaks = {}
+    _, rev = st.decide_splits({"X": bars(40, 3.0)}, [], [], [], Counter(), breaks=breaks)
+    assert one(rev, "unexplained_jump") and breaks == {}
+    _, rev = st.decide_splits({"X": raw}, [], [], [], Counter(), breaks=breaks)
+    assert one(rev, "series_break") and list(breaks) == ["X"]
+    _, rev = st.decide_splits({"X": bars(40, 0.1)}, [], [], [], Counter(), breaks=breaks)   # a collapse is a break too
+    assert one(rev, "series_break")
+
+
+def test_shipped_overrides_are_the_reviewed_ones():
+    entries = st.load_overrides()
+    by = {(e["symbol"], e["event_date"]): e for e in entries}
+    assert len(entries) == 20 and all(e["reviewed_by"] == "owner (B. Migette) 2026-10-20" and e["added"] == "2026-10-20"
+                                      for e in entries)
+    assert by[("VTOL", "2020-06-12")]["ratio"] == pytest.approx(1 / 3) and by[("WHWK", "2021-08-27")]["ratio"] == pytest.approx(1 / 15)
+    assert by[("ENOV", "2022-04-05")]["ratio"] == pytest.approx(1 / 3) and by[("IRON", "2022-12-30")]["ratio"] == 0.1
+    assert by[("JBIO", "2025-04-29")]["ratio"] == pytest.approx(1 / 35)
+    assert {k for k, e in by.items() if e["decision"] == "reject"} == {
+        ("AMC", "2022-08-22"), ("BIP", "2020-03-31"), ("NVS", "2019-04-09"), ("HON", "2026-06-28"), ("ADEA", "2022-10-03"), ("CRESY", "2025-11-28"), ("CTVA", "2026-10-01"),
+        ("SM", "2020-03-09"), ("DBVT", "2020-03-17"), ("RLMD", "2024-12-04"), ("CLSK", "2020-04-09"), ("FWDI", "2018-01-19")}
+    assert by[("QH", "2022-08-12")]["ratio"] == pytest.approx(0.1) and by[("STSS", "2025-04-28")]["ratio"] == pytest.approx(1 / 300)
+    assert by[("JFB", "2026-03-25")]["ratio"] == 2.0 and "Yahoo" in by[("QH", "2022-08-12")]["reason"]
+
+
+def test_breaks_are_written_to_the_table(tmp_path):
+    store, fmpd, raw = tiny_store(tmp_path, asof="2021-01-30")
+    sym2 = store / "bars" / "1Day" / "symbol=ZZ"
+    sym2.mkdir()
+    bars(30, 9.0).assign(h=1.0, l=1.0).to_parquet(sym2 / "all.parquet")      # a x9 overnight jump, no listing
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    (cal / "2021-01-01_2021-01-30.json").write_text("[]", encoding="utf-8")
+    (cal / "2021-01-31_2021-01-31.json").write_text("[]", encoding="utf-8")
+    sb.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01",
+                         log=lambda m: None)
+    table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
+    assert table["breaks"] == {"ZZ": [SESSIONS[30].date().isoformat()]} and "AA" in table["splits"]
+
+
+# ---- spin-offs (computed factor, own event kind), tightened rule B, series breaks across gaps -----------------------
+from ba2_providers.ohlcv.alpaca_history.split_table import SpinOff
+
+
+def parent_bars(drop_at=40, before=100.0, after=80.0, sessions=SESSIONS):
+    """A parent that falls from `before` to `after` on session `drop_at` (the spun-off value leaves)."""
+    rows = []
+    for i, d in enumerate(sessions):
+        p = before if i < drop_at else after
+        rows.append({"t": pd.Timestamp(d).tz_localize("America/New_York").tz_convert("UTC"), "o": p, "c": p})
+    return pd.DataFrame(rows, columns=["t", "o", "c"])
+
+
+def spinco_bars(start=0, price=20.0):
+    rows = [{"t": pd.Timestamp(d).tz_localize("America/New_York").tz_convert("UTC"), "o": price, "c": price}
+            for d in SESSIONS[start:]]
+    return pd.DataFrame(rows, columns=["t", "o", "c"])
+
+
+SO = SpinOff("P", D, "S", 0.5)                      # f = 1 + 0.5 * 20 / 80 = 1.125
+
+
+def run_so(frames, fmp_frames=None, spin=(SO,), alp=(), fm=(), ov=()):
+    stats, breaks = Counter(), {}
+    acc, rev = st.decide_splits(frames, list(alp), list(fm), list(ov), stats, fmp_daily=fmp_frames, breaks=breaks,
+                                spinoffs=list(spin))
+    return acc, rev, stats, breaks
+
+
+def test_spinoff_factor_is_computed_and_kept_apart_from_splits():
+    raw = parent_bars()
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw, {40: 1.125})})
+    assert [(a["kind"], a["verdict"], a["factor"], a["source"]) for a in acc] == [("spinoff", "spinoff_fmp_agrees", 1.125,
+                                                                                    "alpaca_spinoff")]
+    assert rev == [] and stats["verdict_spinoff_fmp_agrees"] == 1
+    assert st.splits_by_symbol(acc) == {} and st.splits_by_symbol(acc, "spinoff") == {"P": [[D.isoformat(), 1.125]]}
+
+
+def test_spinoff_fmp_flat_is_applied_with_an_informational_row_and_a_contradicting_step_is_not():
+    raw = parent_bars()
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw)})              # FMP did not adjust (CTVA)
+    assert [a["verdict"] for a in acc] == ["spinoff_fmp_flat"]
+    r = one(rev, "spinoff_fmp_flat")
+    assert r["applied"] is True and r["fmp_step"].endswith("flat")
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw, {40: 1.3})})   # FMP adjusted by another factor
+    assert acc == [] and one(rev, "spinoff_fmp_mismatch")["applied"] is False
+    # within 10 % of OUR factor 1.125: ours is applied, the deviation is recorded; beyond 10 % it is a mismatch
+    for applied_by_fmp, ok in ((1.18, True), (1.2, True), (1.05, True), (1.23, True), (1.26, False)):
+        acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw, {40: applied_by_fmp})})
+        if ok:
+            assert [(a["verdict"], a["factor"]) for a in acc] == [("spinoff_fmp_agrees", 1.125)], applied_by_fmp
+            assert "deviation" in acc[0]["fmp_step"] and "agrees" in acc[0]["fmp_step"] and rev == []
+        else:
+            assert acc == [] and one(rev, "spinoff_fmp_mismatch"), applied_by_fmp
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, None)                          # no FMP data: unverified
+    assert [a["verdict"] for a in acc] == ["spinoff_fmp_unverified"] and one(rev, "spinoff_fmp_unverified")["applied"] is True
+
+
+def test_spinoff_needs_a_spinco_price_within_three_sessions():
+    raw = parent_bars()
+    for frames in ({"P": raw}, {"P": raw, "S": spinco_bars(start=46)}):                    # no spinco / starts 6 sessions late
+        acc, rev, _, _ = run_so(frames, None)
+        assert acc == [] and one(rev, "spinoff_no_spinco_price")["applied"] is False
+    acc, rev, _, _ = run_so({"P": raw}, None, spin=(SpinOff("P", D, "P", 1.0),))          # the spinco maps to the parent itself
+    assert acc == [] and one(rev, "spinoff_no_spinco_price")
+    acc, _, _, _ = run_so({"P": raw, "S": spinco_bars(start=42, price=40.0)}, None)         # starts 2 sessions late: its close
+    assert acc[0]["factor"] == pytest.approx(1 + 0.5 * 40.0 / 80.0)
+
+
+def test_a_vendor_listing_of_the_spinoff_as_a_split_is_absorbed_never_applied_twice():
+    raw = parent_bars()
+    both = [L("P", D, 1.12)]
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=both, fm=both)
+    assert [a["kind"] for a in acc] == ["spinoff"] and rev and all(r["verdict"] == "spinoff_fmp_unverified" for r in rev)
+    assert stats["listings_absorbed_by_spinoff"] == 2
+    # a split with another ratio on the same day is a different event and is decided on its own
+    other = [L("P", D, 0.5)]
+    acc, _, stats, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=other, fm=other, ov=[ov("accept", 0.5, symbol="P")])
+    assert sorted(a["kind"] for a in acc) == ["spinoff", "split"]
+    # an override that would accept the same event as a split is refused
+    with pytest.raises(st.SplitTableBuildError, match="adjust it twice"):
+        run_so({"P": raw, "S": spinco_bars()}, None, alp=both, ov=[ov("accept", 1.12, symbol="P")])
+
+
+def test_a_split_override_reject_never_blocks_the_spinoff():
+    raw = parent_bars()
+    acc, _, stats, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=[L("P", D, 0.5)],
+                              ov=[ov("reject", symbol="P")])
+    assert [a["kind"] for a in acc] == ["spinoff"] and stats["verdict_override_reject"] == 1
+
+
+def test_a_spinoff_explains_a_big_jump_so_it_is_not_a_series_break():
+    raw = parent_bars(after=10.0)                                # x10 collapse on the ex-date
+    acc, rev, _, breaks = run_so({"P": raw, "S": spinco_bars(price=80.0)}, None, spin=(SpinOff("P", D, "S", 1.0),))
+    assert breaks == {} and not any(r["verdict"] in ("series_break", "unexplained_jump") for r in rev)
+
+
+def test_spinoff_events_follow_name_changes():
+    month = {"spin_offs": [{"source_symbol": "OLD", "new_symbol": "KID", "ex_date": "2020-03-02", "new_rate": 0.4,
+                            "source_rate": 1}], "name_changes": [{"old_symbol": "OLD", "new_symbol": "NEW", "process_date": "2021-01-04"}]}
+    ren = st.build_rename_map([month])
+    stats = Counter()
+    assert st.spinoff_events_from_actions([month], ren, stats) == [SpinOff("NEW", date(2020, 3, 2), "KID", 0.4)]
+    assert stats["alpaca_spin_offs"] == 1
+    with pytest.raises(st.SplitTableBuildError):
+        st.spinoff_events_from_actions([{"spin_offs": [{"source_symbol": "A", "new_symbol": "B", "ex_date": "2020-03-02",
+                                                        "new_rate": 0.4, "source_rate": 0}]}], {})
+
+
+def test_compare_marks_an_fmp_listing_explained_by_a_spinoff():
+    raw = parent_bars()
+    frames = {"P": raw, "S": spinco_bars()}
+    acc, rev, _, _ = run_so(frames, None, fm=[L("P", D, 1.12)])
+    rows = st.compare_with_fmp(frames, acc, rev, [], [L("P", D, 1.12)], None)
+    assert [(r["class"], r["verdict"]) for r in rows] == [("fmp_only_rejected", "explained_by_spinoff")]
+
+
+def test_inferred_split_needs_the_step_within_half_a_percent_of_a_clean_ratio():
+    raw = bars(40, 3.1)
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 3.054})})             # IAC's Match separation: 3.054 is not a 3:1 split
+    assert acc == [] and one(rev, "unexplained_jump")
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 3.01})}, yahoo=yhoo((D, 3.0)))
+    assert [a["verdict"] for a in acc] == ["inferred_confirmed_by_yahoo"]
+
+
+def test_series_break_also_scans_pairs_across_a_data_gap():
+    sess = SESSIONS[:30] + SESSIONS[70:]                         # a 3-month hole; the price is x8 after it
+    raw = bars(30, 8.0, sessions=sess)
+    breaks = {}
+    _, rev = st.decide_splits({"X": raw}, [], [], [], Counter(), breaks=breaks)
+    assert one(rev, "series_break") and breaks == {"X": [SESSIONS[70].date().isoformat()]}
+    breaks = {}
+    _, rev = st.decide_splits({"X": bars(30, 3.0, sessions=sess)}, [], [], [], Counter(), breaks=breaks)
+    assert rev == [] and breaks == {}                            # a x3 gap jump is neither a review row nor a break
+    breaks = {}
+    _, rev = st.decide_splits({"X": raw}, [L("X", SESSIONS[70].date(), 8.0)], [], [], Counter(), breaks=breaks)
+    assert not any(r["verdict"] == "series_break" for r in rev) and breaks == {}      # a listed event there explains it
+
+
+def test_build_writes_spinoffs_apart_from_splits(tmp_path):
+    store = tmp_path / "store"
+    for sym, frame in (("P", parent_bars()), ("S", spinco_bars())):
+        d = store / "bars" / "1Day" / f"symbol={sym}"
+        d.mkdir(parents=True)
+        frame.assign(h=frame["o"], l=frame["o"]).to_parquet(d / "all.parquet")
+    (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2021-03-31"}), encoding="utf-8")
+    (store / "corporate_actions").mkdir()
+    with _gzip.open(store / "corporate_actions" / "ym=2021-03.json.gz", "wt", encoding="utf-8") as f:
+        json.dump({"forward_splits": [{"symbol": "S", "ex_date": "2021-03-31", "old_rate": 1, "new_rate": 2}],
+                   "spin_offs": [{"source_symbol": "P", "new_symbol": "S", "ex_date": D.isoformat(), "new_rate": 0.5,
+                                  "source_rate": 1}]}, f)
+    fmpd = tmp_path / "fmpd"
+    fmpd.mkdir()
+    fmp(parent_bars(), {40: 1.125}).to_parquet(fmpd / "P_1d.parquet")
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    for w in ("2021-01-01_2021-01-30", "2021-01-31_2021-03-01", "2021-03-02_2021-03-31", "2021-04-01_2021-04-01"):
+        (cal / f"{w}.json").write_text("[]", encoding="utf-8")
+    res = sb.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01",
+                               fmp_to="2021-04-01", log=lambda m: None)
+    table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
+    assert table["spinoffs"] == {"P": [[D.isoformat(), 1.125]]} and "P" not in table["splits"] and res["spinoffs_applied"] == 1
+    acc = sb.read_csv_frame(str(out / "_meta" / "split_accepted.csv"))
+    assert acc["kind"].tolist() == ["spinoff"]
+
+
+def test_spinoff_flat_step_is_classified_first_even_for_a_small_factor():
+    # f = 1 + 0.12 * 20 / 40 = 1.06; FMP did not adjust (step 1.00): "flat", not "agrees" although 1.00 is within 10 % of 1.06
+    raw = parent_bars(after=40.0)
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw)}, spin=(SpinOff("P", D, "S", 0.12),))
+    assert [(a["verdict"], round(a["factor"], 6)) for a in acc] == [("spinoff_fmp_flat", 1.06)]
+    assert one(rev, "spinoff_fmp_flat")["applied"] is True
+    # a non-flat step within 10 % of f still agrees
+    acc, _, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw, {40: 1.08})}, spin=(SpinOff("P", D, "S", 0.12),))
+    assert [a["verdict"] for a in acc] == ["spinoff_fmp_agrees"]
+
+
+# ---- Yahoo: the confirmation source of unlisted (inferred) splits ----------------------------------------------------
+def candidate():
+    raw = bars(40, 0.081)                                        # unlisted; FMP applied 0.1; jump 0.081 (OP style)
+    return raw, {"X": fmp(raw, {40: 0.1})}
+
+
+def test_inferred_split_is_applied_only_when_yahoo_lists_it():
+    raw, fd = candidate()
+    acc, rev, stats = runf({"X": raw}, fd, yahoo=yhoo((SESSIONS[41].date(), 0.1005)))      # a day off, ratio within 1 %
+    assert [(a["verdict"], a["source"]) for a in acc] == [("inferred_confirmed_by_yahoo", "fmp_step+yahoo")]
+    assert one(rev, "inferred_confirmed_by_yahoo")["applied"] is True
+    # Yahoo lists nothing: a suspicious "split" nobody lists is NOT applied (SM 2020-03-09 style)
+    acc, rev, stats = runf({"X": raw}, fd, yahoo=yhoo())
+    assert acc == [] and one(rev, "inferred_unconfirmed")["applied"] is False and stats["verdict_inferred_unconfirmed"] == 1
+    assert not any(r["verdict"] == "unexplained_jump" for r in rev)                        # the candidate row is the explanation
+    # a split with another ratio, or more than 3 sessions away, does not confirm it
+    for bad in ((D, 0.2), (SESSIONS[45].date(), 0.1), (D, 0.102)):
+        acc, rev, _ = runf({"X": raw}, fd, yahoo=yhoo(bad))
+        assert acc == [] and one(rev, "inferred_unconfirmed"), bad
+
+
+def test_yahoo_unavailable_leaves_an_inferred_candidate_unapplied():
+    raw, fd = candidate()
+    for y in (yhoo(available=False), None):
+        acc, rev, stats = runf({"X": raw}, fd, yahoo=y)
+        assert acc == [] and one(rev, "yahoo_unavailable")["applied"] is False and stats["verdict_yahoo_unavailable"] == 1
+
+
+def test_an_unconfirmed_candidate_beyond_x5_is_still_a_series_break():
+    raw = bars(40, 0.081)
+    breaks = {}
+    _, rev = st.decide_splits({"X": raw}, [], [], [], Counter(), fmp_daily={"X": fmp(raw, {40: 0.1})}, breaks=breaks,
+                              yahoo=yhoo())
+    assert {r["verdict"] for r in rev} == {"inferred_unconfirmed", "series_break"} and list(breaks) == ["X"]
+
+
+def test_yahoo_is_not_consulted_for_listed_events():
+    calls = []
+
+    def spy(sym):
+        calls.append(sym)
+        return {"available": False, "ticker": None, "splits": []}
+    raw = bars(40, 4.0)
+    acc, _, _ = runf({"X": raw}, None, [L("X", D, 4.0)], [L("X", D, 4.0)], yahoo=spy)
+    assert [a["verdict"] for a in acc] == ["proven"] and calls == []
+
+
+def test_rename_successors_follow_the_chain():
+    ren = st.build_rename_map([{"name_changes": [{"old_symbol": "TPX", "new_symbol": "SGI", "process_date": "2023-01-02"},
+                                                  {"old_symbol": "SGI", "new_symbol": "SGII", "process_date": "2024-01-02"}]}])
+    assert st.rename_successors("tpx", ren) == ["SGI", "SGII"] and st.rename_successors("AAPL", ren) == []
+
+
+def fake_yahoo(table, log=None):
+    """fetch(ticker) -> list | None | raises: table maps ticker -> list, None (404) or an Exception."""
+    def fetch(ticker):
+        if log is not None:
+            log.append(ticker)
+        v = table[ticker]
+        if isinstance(v, Exception):
+            raise v
+        return v
+    return fetch
+
+
+def source(tmp_path, table, renames=None, log=None, **kw):
+    sleeps = []
+    src = sb.YahooSplitSource(str(tmp_path / "yahoo"), renames or {}, fetch=fake_yahoo(table, log), sleep=sleeps.append,
+                              clock=lambda: 0.0, **kw)
+    return src, sleeps
+
+
+def test_yahoo_source_falls_back_to_the_renamed_successor_and_records_who_answered(tmp_path):
+    ren = st.build_rename_map([{"name_changes": [{"old_symbol": "TPX", "new_symbol": "SGI", "process_date": "2023-01-02"}]}])
+    log = []
+    src, _ = source(tmp_path, {"TPX": None, "SGI": [("2020-11-24", 4.0)]}, ren, log)
+    assert src("TPX") == {"available": True, "ticker": "SGI", "splits": [["2020-11-24", 4.0]]} and log == ["TPX", "SGI"]
+    cached = json.loads((tmp_path / "yahoo" / "TPX.json").read_text(encoding="utf-8"))
+    assert cached["ticker"] == "SGI" and cached["fetched_at"] and cached["tried"] == ["TPX: not found"]
+    # a known ticker with no splits is available with an empty list; an unknown one is unavailable
+    src2, _ = source(tmp_path / "b", {"AAA": [], "ZZZ": None})
+    assert src2("AAA") == {"available": True, "ticker": "AAA", "splits": []}
+    assert src2("ZZZ") == {"available": False, "ticker": None, "splits": []}
+
+
+def test_yahoo_source_rerun_is_offline_and_refresh_fetches_again(tmp_path):
+    log = []
+    src, _ = source(tmp_path, {"AAA": [("2021-01-04", 2.0)]}, None, log)
+    src("AAA")
+    assert log == ["AAA"]
+    offline = sb.YahooSplitSource(str(tmp_path / "yahoo"), {}, fetch=fake_yahoo({}, log), sleep=lambda s: None)
+    assert offline("AAA")["splits"] == [["2021-01-04", 2.0]] and log == ["AAA"]            # served from the cache, no fetch
+    again = sb.YahooSplitSource(str(tmp_path / "yahoo"), {}, refresh=True, fetch=fake_yahoo({"AAA": []}, log),
+                                sleep=lambda s: None)
+    assert again("AAA")["splits"] == [] and log == ["AAA", "AAA"]
+
+
+def test_yahoo_source_retries_transient_errors_paces_requests_and_does_not_cache_a_failure(tmp_path):
+    state = {"n": 0}
+
+    def flaky(ticker):
+        state["n"] += 1
+        if state["n"] < 3:
+            raise ConnectionError("reset")
+        return [("2021-01-04", 2.0)]
+    sleeps = []
+    src = sb.YahooSplitSource(str(tmp_path / "y"), {}, fetch=flaky, sleep=sleeps.append, clock=lambda: 0.0, min_interval=1.0,
+                              backoff=(7.0,))
+    assert src("AAA")["available"] is True and state["n"] == 3 and 7.0 in sleeps and 1.0 in sleeps      # backoff and pacing
+    dead = sb.YahooSplitSource(str(tmp_path / "z"), {}, fetch=fake_yahoo({"BBB": ConnectionError("down")}),
+                               sleep=lambda s: None, retries=2)
+    assert dead("BBB") == {"available": False, "ticker": None, "splits": []}
+    assert not (tmp_path / "z" / "BBB.json").exists()                                                  # a rerun tries it again
+    assert dead.records["BBB"]["status"] == "error"
+
+
+def test_build_records_the_yahoo_inputs(tmp_path):
+    store, fmpd, raw = tiny_store(tmp_path, asof="2021-01-30")
+    # an unlisted jump with a clean FMP step in a second symbol: the only Yahoo candidate
+    cand = bars(30, 0.4).assign(h=1.0, l=1.0)
+    d = store / "bars" / "1Day" / "symbol=CC"
+    d.mkdir()
+    cand.to_parquet(d / "all.parquet")
+    fmp(cand, {30: 0.4}).to_parquet(fmpd / "CC_1d.parquet")
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    (cal / "2021-01-01_2021-01-30.json").write_text("[]", encoding="utf-8")
+    (cal / "2021-01-31_2021-01-31.json").write_text("[]", encoding="utf-8")
+    kw = dict(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01", log=lambda m: None)
+    calls = []
+    sb.build_split_table(**kw, yahoo_fetch=fake_yahoo({"CC": []}, calls), yahoo_sleep=lambda s: None)
+    assert calls == []                                           # 0.4 is no clean ratio: no candidate, Yahoo never asked
+    fmp(cand, {30: 0.5}).to_parquet(fmpd / "CC_1d.parquet")      # now a clean 1:2 step and a jump within x1.5 of it
+    cand2 = bars(30, 0.45).assign(h=1.0, l=1.0)
+    cand2.to_parquet(d / "all.parquet")
+    fmp(cand2, {30: 0.5}).to_parquet(fmpd / "CC_1d.parquet")
+    res = sb.build_split_table(**kw, yahoo_fetch=fake_yahoo({"CC": []}, calls), yahoo_sleep=lambda s: None)
+    assert calls == ["CC"] and res["stats"]["verdict_inferred_unconfirmed"] == 1
+    table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
+    assert table["yahoo_files"]["count"] == 1 and table["yahoo_files"]["inputs_csv"] == "yahoo_inputs.csv"
+    assert table["yahoo_files"]["content_sha256"] and "CC" not in table["splits"]
+    inp = sb.read_csv_frame(str(out / "_meta" / "yahoo_inputs.csv"))
+    assert inp["symbol"].tolist() == ["CC"] and inp["status"].tolist() == ["ok"] and inp["run_id"][0] == table["run_id"]
+    sb.build_split_table(**kw, yahoo_fetch=fake_yahoo({}, calls), yahoo_sleep=lambda s: None)       # offline rerun: no new fetch
+    assert calls == ["CC"]
