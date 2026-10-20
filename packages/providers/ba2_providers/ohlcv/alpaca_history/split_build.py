@@ -28,7 +28,7 @@ import requests
 from ba2_common import config as _cfg
 from ba2_providers.fmp_common import fmp_http_get, redact
 from ba2_providers.ohlcv.alpaca_history.split_table import (
-    ACCEPTED_COLUMNS, COMPARE_COLUMNS, OVERRIDES_PATH, REVIEW_COLUMNS, SplitTableBuildError, alpaca_events_from_actions,
+    ACCEPTED_COLUMNS, COMPARE_COLUMNS, OVERRIDES_PATH, REVIEW_COLUMNS, SplitTableBuildError, alpaca_events_from_actions, spinoff_events_from_actions,
     build_rename_map, compare_with_fmp, corporate_action_paths, decide_splits, fmp_events_from_rows, load_overrides,
     read_corporate_actions, splits_by_symbol)
 
@@ -241,6 +241,7 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     months = read_corporate_actions(store)
     renames = build_rename_map(months)
     alpaca = alpaca_events_from_actions(months, renames, stats)
+    spinoffs = spinoff_events_from_actions(months, renames, stats)
     if stats["alpaca_forward_splits"] + stats["alpaca_reverse_splits"] <= 0:
         raise SplitTableBuildError(f"the store's corporate actions hold no forward or reverse split at all ({store}): "
                                    f"the files are empty or have changed shape")
@@ -262,7 +263,8 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
         f"files in {time.time() - t0:.0f}s")
 
     breaks: Dict[str, List[str]] = {}
-    accepted, review = decide_splits(bars, alpaca, fmp, overrides, stats, fmp_daily=fmp_daily, breaks=breaks)
+    accepted, review = decide_splits(bars, alpaca, fmp, overrides, stats, fmp_daily=fmp_daily, breaks=breaks,
+                                     spinoffs=spinoffs)
     cmp_rows = compare_with_fmp(bars, accepted, review, alpaca, fmp, fmp_daily)
 
     h = hashlib.sha256()          # the inputs actually read: the store's action files, the calendar windows used
@@ -272,7 +274,8 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     run_id = f"{stamp}-{hashlib.sha256((stamp + h.hexdigest() + overrides_sha + fmp_files['content_sha256']).encode()).hexdigest()[:8]}"
     table = {"run_id": run_id, "asof": info["asof"], "inputs_sha256": h.hexdigest(), "overrides_sha256": overrides_sha,
              "fmp_daily_files": {**fmp_files, "inputs_csv": "fmp_daily_inputs.csv"},
-             "breaks": {k: sorted(v) for k, v in sorted(breaks.items())}, "splits": splits_by_symbol(accepted)}
+             "breaks": {k: sorted(v) for k, v in sorted(breaks.items())},
+             "spinoffs": splits_by_symbol(accepted, "spinoff"), "splits": splits_by_symbol(accepted, "split")}
     # one coherent set: every CSV carries the run_id, and split_table.json is written LAST, so a crash never leaves a table
     # newer than its CSVs (a reader checks that the run_ids of the table and the CSVs match)
     atomic_write(os.path.join(meta, "split_review.csv"), _csv_bytes(REVIEW_COLUMNS, review, run_id))
@@ -284,7 +287,8 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
         stats[f"accepted_{verdict}_from_{src}"] += k
     classes = ("agree", "ratio_differs", "ours_only", "fmp_only_accepted", "fmp_only_rejected")
     return {"meta": meta, "run_id": run_id, "asof": info["asof"], "fmp_to": fmp_to, "symbols_judged": len(bars),
-            "symbols_with_splits": len(table["splits"]), "series_breaks": sum(len(v) for v in breaks.values()), "accepted": len(accepted), "review_rows": len(review),
+            "symbols_with_splits": len(table["splits"]),
+            "spinoffs_applied": sum(len(v) for v in table["spinoffs"].values()), "series_breaks": sum(len(v) for v in breaks.values()), "accepted": len(accepted), "review_rows": len(review),
             "review_applied": sum(r["applied"] for r in review),
             "fmp_daily_files": fmp_files, "stats": dict(sorted(stats.items())),
             "compare": {c: sum(1 for r in cmp_rows if r["class"] == c) for c in classes},

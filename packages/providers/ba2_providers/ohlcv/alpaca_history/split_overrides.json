@@ -1,5 +1,5 @@
 {
- "_doc": "REVIEWED decisions on individual split events, applied by split_table.decide_splits. An entry decides the event of its symbol on event_date (any date a vendor lists for it, or a date nobody lists: an 'accept' then ADDS the split) outright, whatever the price jump says. Never a silent tolerance: every entry needs symbol, event_date (ISO), decision ('accept' needs a ratio = new shares / old shares; 'reject' drops the event), reason, added and reviewed_by; an entry whose reviewed_by starts with 'pending' REFUSES the build. A 'reject' also silences the 'unexplained_jump' review row at its date. The file's bytes are part of the split table's fingerprint.",
+ "_doc": "REVIEWED decisions on individual split events, applied by split_table.decide_splits. An entry decides the event of its symbol on event_date (any date a vendor lists for it, or a date nobody lists: an 'accept' then ADDS the split) outright, whatever the price jump says. Never a silent tolerance: every entry needs symbol, event_date (ISO), decision ('accept' needs a ratio = new shares / old shares; 'reject' drops the event), reason, added and reviewed_by; an entry whose reviewed_by starts with 'pending' REFUSES the build. A 'reject' also silences the 'unexplained_jump' review row at its date. The file's bytes are part of the split table's fingerprint. A 'reject' decides a split LISTING only: spin-off adjustments are computed from Alpaca's spin_offs and are never blocked by an override.",
  "entries": [
   {
    "symbol": "VTOL",
@@ -58,7 +58,7 @@
    "symbol": "AMC",
    "event_date": "2022-08-22",
    "decision": "reject",
-   "reason": "APE preferred-unit distribution, a different security",
+   "reason": "split LISTING rejected: FMP lists the APE preferred-unit distribution as a 2:1 split; it is not one (any spin-off adjustment is separate)",
    "added": "2026-10-20",
    "reviewed_by": "owner (B. Migette) 2026-10-20"
   },
@@ -66,7 +66,7 @@
    "symbol": "BIP",
    "event_date": "2020-03-31",
    "decision": "reject",
-   "reason": "BIPC share distribution, not a split",
+   "reason": "split LISTING rejected: the BIPC share distribution is not a split",
    "added": "2026-10-20",
    "reviewed_by": "owner (B. Migette) 2026-10-20"
   },
@@ -74,7 +74,7 @@
    "symbol": "NVS",
    "event_date": "2019-04-09",
    "decision": "reject",
-   "reason": "Alcon spin-off",
+   "reason": "split LISTING rejected: FMP lists the Alcon spin-off as a split; the spin-off is adjusted by the spin-off rule where Alpaca lists it",
    "added": "2026-10-20",
    "reviewed_by": "owner (B. Migette) 2026-10-20"
   },
@@ -82,7 +82,7 @@
    "symbol": "HON",
    "event_date": "2026-06-28",
    "decision": "reject",
-   "reason": "Solstice spin-off; Alpaca's 0.5 is spurious",
+   "reason": "split LISTING rejected: Alpaca's 0.5 split is spurious (Solstice spin-off); the spin-off is adjusted by the spin-off rule",
    "added": "2026-10-20",
    "reviewed_by": "owner (B. Migette) 2026-10-20"
   },
@@ -90,7 +90,7 @@
    "symbol": "ADEA",
    "event_date": "2022-10-03",
    "decision": "reject",
-   "reason": "Xperi/Adeia separation",
+   "reason": "split LISTING rejected: FMP lists the Xperi/Adeia separation as a 3.78 split",
    "added": "2026-10-20",
    "reviewed_by": "owner (B. Migette) 2026-10-20"
   },
@@ -98,7 +98,7 @@
    "symbol": "CTVA",
    "event_date": "2026-10-01",
    "decision": "reject",
-   "reason": "Vylr spin-off (Alpaca spin_offs lists VYLR); FMP lists it as a split but did not apply it",
+   "reason": "split LISTING rejected: FMP lists the Vylr spin-off as a split but did not apply it; the spin-off is adjusted by the spin-off rule (Alpaca spin_offs lists VYLR)",
    "added": "2026-10-20",
    "reviewed_by": "owner (B. Migette) 2026-10-20"
   }

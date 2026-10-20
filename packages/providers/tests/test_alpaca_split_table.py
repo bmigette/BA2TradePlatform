@@ -376,8 +376,12 @@ def test_pipeline_end_to_end_on_a_tiny_store_is_offline_and_reproducible(tmp_pat
     assert table["splits"] == {"NA": [[D.isoformat(), 4.0]]} and table["fmp_daily_files"]["count"] == 1
     acc = sb.read_csv_frame(str(out / "_meta" / "split_accepted.csv"))
     assert list(acc["symbol"]) == ["NA"] and acc["fmp_step"][0].endswith("equals_f")
+    import re as _re
+
+    def stable(b):                                              # the run_id carries a timestamp: everything else is reproducible
+        return _re.sub(rb'"run_id": "[^"]*"', b"", b)
     first = (out / "_meta" / "split_table.json").read_bytes()
-    assert cli.main(argv) == 0 and (out / "_meta" / "split_table.json").read_bytes() == first
+    assert cli.main(argv) == 0 and stable((out / "_meta" / "split_table.json").read_bytes()) == stable(first)
     report = json.loads((out / "_meta" / "prepare_history_alpaca_report.json").read_text(encoding="utf-8"))
     assert report["steps"][0]["status"] == "ok"
 
@@ -720,8 +724,8 @@ def test_unexplained_jump_scan_skips_pairs_further_apart_than_the_gap_limit():
 
 def test_two_accepted_events_on_one_date_are_refused():
     with pytest.raises(st.SplitTableBuildError, match="two accepted events"):
-        st.splits_by_symbol([{"symbol": "X", "date": "2021-03-01", "factor": 2.0},
-                             {"symbol": "X", "date": "2021-03-01", "factor": 1.1}])
+        st.splits_by_symbol([{"symbol": "X", "date": "2021-03-01", "kind": "split", "factor": 2.0},
+                             {"symbol": "X", "date": "2021-03-01", "kind": "split", "factor": 1.1}])
 
 
 def test_override_matching_several_groups_is_refused_and_absorbed_listings_are_counted():
@@ -778,7 +782,7 @@ def test_clean_ratios():
     assert st._nearest_clean_ratio(0.1003) == pytest.approx(0.1) and st._nearest_clean_ratio(3.99) == 4
     assert st._nearest_clean_ratio(1.5) == 1.5 and st._nearest_clean_ratio(0.6667) == pytest.approx(2 / 3)
     assert st._nearest_clean_ratio(1000.0) == 1000 and st._nearest_clean_ratio(0.001) == pytest.approx(0.001)
-    for off in (0.13, 1.0, 2.5, 6.5, 1001.0, 0.0009):
+    for off in (0.13, 1.0, 2.5, 6.5, 1001.0, 0.0009, 3.054, 3.02, 0.1011):
         assert st._nearest_clean_ratio(off) is None, off
 
 
@@ -852,3 +856,162 @@ def test_breaks_are_written_to_the_table(tmp_path):
                          log=lambda m: None)
     table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
     assert table["breaks"] == {"ZZ": [SESSIONS[30].date().isoformat()]} and "AA" in table["splits"]
+
+
+# ---- spin-offs (computed factor, own event kind), tightened rule B, series breaks across gaps -----------------------
+from ba2_providers.ohlcv.alpaca_history.split_table import SpinOff
+
+
+def parent_bars(drop_at=40, before=100.0, after=80.0, sessions=SESSIONS):
+    """A parent that falls from `before` to `after` on session `drop_at` (the spun-off value leaves)."""
+    rows = []
+    for i, d in enumerate(sessions):
+        p = before if i < drop_at else after
+        rows.append({"t": pd.Timestamp(d).tz_localize("America/New_York").tz_convert("UTC"), "o": p, "c": p})
+    return pd.DataFrame(rows, columns=["t", "o", "c"])
+
+
+def spinco_bars(start=0, price=20.0):
+    rows = [{"t": pd.Timestamp(d).tz_localize("America/New_York").tz_convert("UTC"), "o": price, "c": price}
+            for d in SESSIONS[start:]]
+    return pd.DataFrame(rows, columns=["t", "o", "c"])
+
+
+SO = SpinOff("P", D, "S", 0.5)                      # f = 1 + 0.5 * 20 / 80 = 1.125
+
+
+def run_so(frames, fmp_frames=None, spin=(SO,), alp=(), fm=(), ov=()):
+    stats, breaks = Counter(), {}
+    acc, rev = st.decide_splits(frames, list(alp), list(fm), list(ov), stats, fmp_daily=fmp_frames, breaks=breaks,
+                                spinoffs=list(spin))
+    return acc, rev, stats, breaks
+
+
+def test_spinoff_factor_is_computed_and_kept_apart_from_splits():
+    raw = parent_bars()
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw, {40: 1.125})})
+    assert [(a["kind"], a["verdict"], a["factor"], a["source"]) for a in acc] == [("spinoff", "spinoff_fmp_agrees", 1.125,
+                                                                                    "alpaca_spinoff")]
+    assert rev == [] and stats["verdict_spinoff_fmp_agrees"] == 1
+    assert st.splits_by_symbol(acc) == {} and st.splits_by_symbol(acc, "spinoff") == {"P": [[D.isoformat(), 1.125]]}
+
+
+def test_spinoff_fmp_flat_is_applied_with_an_informational_row_and_a_contradicting_step_is_not():
+    raw = parent_bars()
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw)})              # FMP did not adjust (CTVA)
+    assert [a["verdict"] for a in acc] == ["spinoff_fmp_flat"]
+    r = one(rev, "spinoff_fmp_flat")
+    assert r["applied"] is True and r["fmp_step"].endswith("flat")
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw, {40: 1.3})})   # FMP adjusted by another factor
+    assert acc == [] and one(rev, "spinoff_fmp_mismatch")["applied"] is False
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, None)                          # no FMP data: unverified
+    assert [a["verdict"] for a in acc] == ["spinoff_fmp_unverified"] and one(rev, "spinoff_fmp_unverified")["applied"] is True
+
+
+def test_spinoff_needs_a_spinco_price_within_three_sessions():
+    raw = parent_bars()
+    for frames in ({"P": raw}, {"P": raw, "S": spinco_bars(start=46)}):                    # no spinco / starts 6 sessions late
+        acc, rev, _, _ = run_so(frames, None)
+        assert acc == [] and one(rev, "spinoff_no_spinco_price")["applied"] is False
+    acc, rev, _, _ = run_so({"P": raw}, None, spin=(SpinOff("P", D, "P", 1.0),))          # the spinco maps to the parent itself
+    assert acc == [] and one(rev, "spinoff_no_spinco_price")
+    acc, _, _, _ = run_so({"P": raw, "S": spinco_bars(start=42, price=40.0)}, None)         # starts 2 sessions late: its close
+    assert acc[0]["factor"] == pytest.approx(1 + 0.5 * 40.0 / 80.0)
+
+
+def test_a_vendor_listing_of_the_spinoff_as_a_split_is_absorbed_never_applied_twice():
+    raw = parent_bars()
+    both = [L("P", D, 1.12)]
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=both, fm=both)
+    assert [a["kind"] for a in acc] == ["spinoff"] and rev and all(r["verdict"] == "spinoff_fmp_unverified" for r in rev)
+    assert stats["listings_absorbed_by_spinoff"] == 2
+    # a split with another ratio on the same day is a different event and is decided on its own
+    other = [L("P", D, 0.5)]
+    acc, _, stats, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=other, fm=other, ov=[ov("accept", 0.5, symbol="P")])
+    assert sorted(a["kind"] for a in acc) == ["spinoff", "split"]
+    # an override that would accept the same event as a split is refused
+    with pytest.raises(st.SplitTableBuildError, match="adjust it twice"):
+        run_so({"P": raw, "S": spinco_bars()}, None, alp=both, ov=[ov("accept", 1.12, symbol="P")])
+
+
+def test_a_split_override_reject_never_blocks_the_spinoff():
+    raw = parent_bars()
+    acc, _, stats, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=[L("P", D, 0.5)],
+                              ov=[ov("reject", symbol="P")])
+    assert [a["kind"] for a in acc] == ["spinoff"] and stats["verdict_override_reject"] == 1
+
+
+def test_a_spinoff_explains_a_big_jump_so_it_is_not_a_series_break():
+    raw = parent_bars(after=10.0)                                # x10 collapse on the ex-date
+    acc, rev, _, breaks = run_so({"P": raw, "S": spinco_bars(price=80.0)}, None, spin=(SpinOff("P", D, "S", 1.0),))
+    assert breaks == {} and not any(r["verdict"] in ("series_break", "unexplained_jump") for r in rev)
+
+
+def test_spinoff_events_follow_name_changes():
+    month = {"spin_offs": [{"source_symbol": "OLD", "new_symbol": "KID", "ex_date": "2020-03-02", "new_rate": 0.4,
+                            "source_rate": 1}], "name_changes": [{"old_symbol": "OLD", "new_symbol": "NEW", "process_date": "2021-01-04"}]}
+    ren = st.build_rename_map([month])
+    stats = Counter()
+    assert st.spinoff_events_from_actions([month], ren, stats) == [SpinOff("NEW", date(2020, 3, 2), "KID", 0.4)]
+    assert stats["alpaca_spin_offs"] == 1
+    with pytest.raises(st.SplitTableBuildError):
+        st.spinoff_events_from_actions([{"spin_offs": [{"source_symbol": "A", "new_symbol": "B", "ex_date": "2020-03-02",
+                                                        "new_rate": 0.4, "source_rate": 0}]}], {})
+
+
+def test_compare_marks_an_fmp_listing_explained_by_a_spinoff():
+    raw = parent_bars()
+    frames = {"P": raw, "S": spinco_bars()}
+    acc, rev, _, _ = run_so(frames, None, fm=[L("P", D, 1.12)])
+    rows = st.compare_with_fmp(frames, acc, rev, [], [L("P", D, 1.12)], None)
+    assert [(r["class"], r["verdict"]) for r in rows] == [("fmp_only_rejected", "explained_by_spinoff")]
+
+
+def test_inferred_split_needs_the_step_within_half_a_percent_of_a_clean_ratio():
+    raw = bars(40, 3.1)
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 3.054})})             # IAC's Match separation: 3.054 is not a 3:1 split
+    assert acc == [] and one(rev, "unexplained_jump")
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 3.01})})
+    assert [a["verdict"] for a in acc] == ["inferred_from_fmp_step"]
+
+
+def test_series_break_also_scans_pairs_across_a_data_gap():
+    sess = SESSIONS[:30] + SESSIONS[70:]                         # a 3-month hole; the price is x8 after it
+    raw = bars(30, 8.0, sessions=sess)
+    breaks = {}
+    _, rev = st.decide_splits({"X": raw}, [], [], [], Counter(), breaks=breaks)
+    assert one(rev, "series_break") and breaks == {"X": [SESSIONS[70].date().isoformat()]}
+    breaks = {}
+    _, rev = st.decide_splits({"X": bars(30, 3.0, sessions=sess)}, [], [], [], Counter(), breaks=breaks)
+    assert rev == [] and breaks == {}                            # a x3 gap jump is neither a review row nor a break
+    breaks = {}
+    _, rev = st.decide_splits({"X": raw}, [L("X", SESSIONS[70].date(), 8.0)], [], [], Counter(), breaks=breaks)
+    assert not any(r["verdict"] == "series_break" for r in rev) and breaks == {}      # a listed event there explains it
+
+
+def test_build_writes_spinoffs_apart_from_splits(tmp_path):
+    store = tmp_path / "store"
+    for sym, frame in (("P", parent_bars()), ("S", spinco_bars())):
+        d = store / "bars" / "1Day" / f"symbol={sym}"
+        d.mkdir(parents=True)
+        frame.assign(h=frame["o"], l=frame["o"]).to_parquet(d / "all.parquet")
+    (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2021-03-31"}), encoding="utf-8")
+    (store / "corporate_actions").mkdir()
+    with _gzip.open(store / "corporate_actions" / "ym=2021-03.json.gz", "wt", encoding="utf-8") as f:
+        json.dump({"forward_splits": [{"symbol": "S", "ex_date": "2021-03-31", "old_rate": 1, "new_rate": 2}],
+                   "spin_offs": [{"source_symbol": "P", "new_symbol": "S", "ex_date": D.isoformat(), "new_rate": 0.5,
+                                  "source_rate": 1}]}, f)
+    fmpd = tmp_path / "fmpd"
+    fmpd.mkdir()
+    fmp(parent_bars(), {40: 1.125}).to_parquet(fmpd / "P_1d.parquet")
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    for w in ("2021-01-01_2021-01-30", "2021-01-31_2021-03-01", "2021-03-02_2021-03-31", "2021-04-01_2021-04-01"):
+        (cal / f"{w}.json").write_text("[]", encoding="utf-8")
+    res = sb.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01",
+                               fmp_to="2021-04-01", log=lambda m: None)
+    table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
+    assert table["spinoffs"] == {"P": [[D.isoformat(), 1.125]]} and "P" not in table["splits"] and res["spinoffs_applied"] == 1
+    acc = sb.read_csv_frame(str(out / "_meta" / "split_accepted.csv"))
+    assert acc["kind"].tolist() == ["spinoff"]
