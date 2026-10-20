@@ -337,9 +337,9 @@ The command for an Alpaca job, per source, both profiles, with the universe (`to
 for the 97-name option universe; the 753-name stage-2 universe file for stage 2, see 4.4):
 
 ```bash
-python tools/prepare_history.py --source alpaca --steps market-conditions \r
+python tools/prepare_history.py --source alpaca --steps market-conditions \
     --universe-file tools/options_universe_top100.txt --start 2020-01-02 --end 2025-12-31
-python tools/prepare_history.py --source alpaca --steps market-conditions \r
+python tools/prepare_history.py --source alpaca --steps market-conditions \
     --universe-file <universe_stage2.txt> --start 2020-01-02 --end 2025-12-31
 python tools/prepare_history.py --source fmp --steps market-conditions --universe-file <universe.txt> --start ... --end ...
 ```
