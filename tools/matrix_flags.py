@@ -92,6 +92,34 @@ def with_decision_times_name(name: str, times: "list | None") -> str:
     return name + DECISION_TIMES_NAME_TOKEN if times and DECISION_TIMES_NAME_TOKEN not in name else name
 
 
+#: Appended to the name of every job whose OHLCV history is not the legacy ``fmp`` (a job name WITHOUT it ran on
+#: FMP history). The source is part of a job's identity: an ``alpaca`` job must never be skipped as "completed",
+#: nor resume the GA checkpoint of, an ``fmp`` job of the same expert/strategy/band (plan 2026-10-20 Task 7).
+HISTORY_SOURCE_NAME_TOKENS = {"alpaca": "-hsalpaca"}
+
+
+def add_history_source_flag(ap: Any) -> None:
+    """``--ohlcv-history-source`` on a GRID DRIVER's parser (EQUITY drivers only: option jobs stay on fmp)."""
+    from ba2_common.core.ohlcv_history import DEFAULT_BT_HISTORY_SOURCE, HISTORY_SOURCES
+    ap.add_argument("--ohlcv-history-source", choices=sorted(HISTORY_SOURCES), default=DEFAULT_BT_HISTORY_SOURCE,
+                    help=f"OHLCV history of every job (default {DEFAULT_BT_HISTORY_SOURCE}): forwarded to "
+                         "`ba2-test optimize` (stamped on the run config and its checkpoint fingerprint) and "
+                         "part of the job NAME (and so of its digest) unless fmp, so the two histories never "
+                         "share a name, a skip-if-completed check or a checkpoint.")
+
+
+def history_source_tokens(source: str) -> List[str]:
+    """``--ohlcv-history-source`` tokens for one job's argv (always stated: a job's source is never implicit)."""
+    return ["--ohlcv-history-source", source]
+
+
+def with_history_source_name(name: str, source: str) -> str:
+    """``name`` with the history-source token appended for a non-fmp source (idempotent); fmp keeps the legacy name."""
+    from ba2_common.core.ohlcv_history import check_history_source
+    token = HISTORY_SOURCE_NAME_TOKENS.get(check_history_source(source))
+    return name if token is None or token in name else name + token
+
+
 #: The STATIC-UNIVERSE rule of a ``--screener`` job is part of its identity (the launcher builds the
 #: true superset, ``ba2_providers.screener.universe_superset.RULE_ID``). A job name WITHOUT this token was
 #: launched under the old cap-ranked top-50 rule: its completed row, its skip-completed check and its

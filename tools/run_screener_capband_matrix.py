@@ -51,8 +51,9 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 from matrix_flags import (  # noqa: E402
     finish_matrix, note_job_exit,
-    cap_passthrough, decision_times_plan, decision_times_tokens, job_name_with_digest,
-    screener_dry_run_universe_note, with_decision_times_name, with_universe_rule_name)
+    add_history_source_flag, cap_passthrough, decision_times_plan, decision_times_tokens, history_source_tokens,
+    job_name_with_digest, screener_dry_run_universe_note, with_decision_times_name, with_history_source_name,
+    with_universe_rule_name)
 
 _STORE = r"C:\Users\basti\Documents\ba2\common\cache\screener\metric_store"
 # A real --universe is required by the CLI but is OVERRIDDEN by the screened union when --screener
@@ -468,6 +469,7 @@ def main() -> int:
                          "a job whose legacy row is already completed is SKIPPED (the skip line "
                          "says so).")
     ap.add_argument("--interval", default="5min")
+    add_history_source_flag(ap)
     ap.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points, modeled at the fill-engine "
                          "level (widens LIMIT/TP trigger thresholds + degrades MARKET/STOP fill "
@@ -623,6 +625,8 @@ def main() -> int:
         # a name without the token was launched under the old cap-ranked top-50 list and must never be
         # skipped as "completed" or resumed as this job.
         name = with_universe_rule_name(name, simulated=strat is not None)   # FactorRanker (bypass): no gate
+        # The OHLCV history is part of the job's identity too (an alpaca job never resumes an fmp one).
+        name = with_history_source_name(name, args.ohlcv_history_source)
         # Data-floored start (see _EXPERT_MIN_START). Announced per job so a shorter window is
         # visible in the log instead of being inferred later from a suspiciously late first trade.
         job_start = _start_for(expert, args.start)
@@ -650,7 +654,8 @@ def main() -> int:
                # signal data does not reach --start would otherwise burn the early years as dead
                # window and bucket empty calendar years into the consistency fitness.
                "--start", job_start, "--end", args.end, "--fitness", args.fitness,
-               "--interval", args.interval, "--population", str(population),
+               "--interval", args.interval, *history_source_tokens(args.ohlcv_history_source),
+               "--population", str(population),
                "--generations", str(generations), "--screener-cadence-days", str(args.cadence_days),
                # --run-schedule-day now only seeds the STATIC fallback (used as a base for the
                # scan time-of-day, and for any bypass expert that skips the per-day genes

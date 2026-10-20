@@ -49,15 +49,16 @@ def _interval_token(axis) -> str:
     return "1d"
 
 
-def _closes_on_axis(symbol: str, interval: str, axis):
+def _closes_on_axis(symbol: str, interval: str, axis, provider_dir: str):
     """Return the symbol's close series re-indexed onto ``axis`` (forward-filled), or None if the
     on-disk OHLCV cache has no parquet for it. Read directly from the native cache — hermetic, no
-    network — matching the engine's ``cached_only`` price source."""
+    network — matching the engine's ``cached_only`` price source. ``provider_dir`` is the row's
+    history folder (``history_cache_dirname`` of its source)."""
     import pandas as pd
 
     try:
         from ba2_common.core import native_cache
-        p = native_cache.find_timeseries_path("FMPOHLCVProvider", symbol, interval)
+        p = native_cache.find_timeseries_path(provider_dir, symbol, interval)
     except Exception:  # noqa: BLE001
         p = None
     if not p:
@@ -81,15 +82,21 @@ def recompute_curves(
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
     exclude_ids: Optional[Iterable[int]] = None,
+    *,
+    history_source: str,
 ) -> Dict[str, Any]:
     """Reconstruct equity_curve / drawdown_curve / metrics from the trade ledger + OHLCV cache,
     excluding the 1-based trade ids in ``exclude_ids`` (matching the API's id = index+1 scheme).
 
     ``trades`` are the INTERNAL stored rows (entry_time/exit_time/direction/entry_price/size/pnl/
     pnl_pct/...). Returns a dict with ``equity_curve``, ``drawdown_curve`` and every reused metric
-    column (same keys/rounding as the live runner's ``_compute_metrics``)."""
+    column (same keys/rounding as the live runner's ``_compute_metrics``).
+
+    ``history_source`` (REQUIRED, ``fmp`` | ``alpaca``): the history the ROW ran on
+    (``history_source.stored_history_source``). The marks must come from that cache, not another."""
     import numpy as np
     import pandas as pd
+    from ba2_common.core.ohlcv_history import history_cache_dirname
 
     if not equity_curve:
         raise ValueError("backtest has no stored equity_curve to recompute against")
@@ -131,7 +138,7 @@ def recompute_curves(
         if xi > ei:
             sym = t.get("symbol")
             if sym not in close_cache:
-                close_cache[sym] = _closes_on_axis(sym, interval, axis)
+                close_cache[sym] = _closes_on_axis(sym, interval, axis, history_cache_dirname(history_source))
             cs = close_cache[sym]
             size = float(t.get("size") or 0.0)
             epx = float(t.get("entry_price") or 0.0)

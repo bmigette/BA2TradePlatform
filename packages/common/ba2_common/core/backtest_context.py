@@ -23,6 +23,12 @@ from datetime import datetime
 from typing import Any, Callable, Dict, Optional, Protocol, runtime_checkable
 
 
+#: The registry key of the LIVE OHLCV provider. A bundle built for a backtest names that run's
+#: history provider instead (``ohlcv_history.history_registry_key``); in a backtest the host's
+#: resolver additionally returns the run's own OHLCV override, whatever name is asked for.
+LIVE_OHLCV_PROVIDER = "fmp"
+
+
 @runtime_checkable
 class ProviderBundle(Protocol):
     """Typed accessor over the provider set an expert needs. Methods return the
@@ -43,8 +49,9 @@ class LiveProviderBundle:
     edge to ba2_providers. price_at_date resolves the as_of close via the ohlcv
     provider's get_ohlcv_data (Decision 1: one price source for all experts)."""
 
-    def __init__(self, get_provider: Callable[..., Any]):
+    def __init__(self, get_provider: Callable[..., Any], ohlcv_name: str = LIVE_OHLCV_PROVIDER):
         self._get = get_provider
+        self._ohlcv_name = ohlcv_name
         self._memo: Dict[str, Any] = {}
 
     def _once(self, category: str, name: str):
@@ -81,7 +88,7 @@ class LiveProviderBundle:
             self._memo[key] = provider
         return provider
 
-    def ohlcv(self): return self._get("ohlcv", "fmp")
+    def ohlcv(self): return self._get("ohlcv", self._ohlcv_name)
     def fundamentals_details(self): return self._once("fundamentals_details", "fmp")
     def fundamentals_overview(self): return self._once("fundamentals_overview", "fmp")
     def insider(self): return self._once("insider", "fmp")

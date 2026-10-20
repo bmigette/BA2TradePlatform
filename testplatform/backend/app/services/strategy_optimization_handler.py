@@ -43,6 +43,8 @@ def _is_intraday_interval(interval: Any) -> bool:
     from ba2_providers.screener.universe_superset import interval_is_intraday
     return interval_is_intraday(interval)
 from ba2_common.core.schedule_genes import validate_decision_times
+from ba2_common.core.ohlcv_history import (
+    LEGACY_HISTORY_SOURCE, OHLCV_HISTORY_SOURCE_KEY, check_history_source, resolve_job_history_source)
 from app.models import (
     SessionLocal,
     Strategy as StrategyModel,
@@ -1832,7 +1834,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         ckpt_fingerprint = checkpoint_fingerprint(
             param_space, ga, checkpoint_expert_settings_identity(backtest_cfg),
             backtest_cfg.get("rm_toggles_unpinned"), backtest_cfg.get("screener_universe_rule"),
-            _screener_identity(backtest_cfg.get("screener_opt")))
+            _screener_identity(backtest_cfg.get("screener_opt")),
+            resolve_job_history_source(backtest_cfg))
         # The OBJECTIVE this run is scored under, as the trials will actually see it (the trial
         # config carries the same key, and strategy_fitness._maybe_robust reads it). Written into
         # every checkpoint and compared on resume -- see _assert_checkpoint_robustness_matches.
@@ -2844,6 +2847,19 @@ def _build_daily_trial_config(
     options_store = resolve_options_store(backtest_cfg)
     validate_options_window(backtest_cfg["start_date"], bool(options_cache_db),
                             backtest_options_provider(backtest_cfg))
+    # The OHLCV history this trial reads (fmp | alpaca): the run's stamp, resolved HERE and written
+    # into the trial config below (this dict is a whitelist; a distributed trial ships only the
+    # config). A stored block without the stamp predates the switch and resolves to fmp. An option
+    # trial on any other source refuses before it starts (ThetaData strikes are as-traded and the
+    # split-basis converter reads FMP's calendar).
+    from app.services.backtest.history_source import refuse_option_job_on_unsupported_source
+    history_source = resolve_job_history_source(backtest_cfg)
+    refuse_option_job_on_unsupported_source(
+        {OHLCV_HISTORY_SOURCE_KEY: history_source},
+        uses_options=bool(options_cache_db) or strategy_uses_options(
+            {"exit_rules": decoded.get("exit_rules"), "entry_rules": decoded.get("entry_rules"),
+             "entry_action": entry_action}),
+        where="_build_daily_trial_config")
 
     # BYPASS-expert screener wiring: a bypass expert (e.g. FactorRanker) builds its DYNAMIC
     # universe from the fast metric_store by reading ``universe_source`` / ``screener_store`` /
@@ -3046,6 +3062,9 @@ def _build_daily_trial_config(
 
     return {
         "backtest_id": trial_id,
+        # Which OHLCV history the trial reads (see above). In the whitelist: a key missing here is
+        # silently dropped and the trial would read the legacy history whatever the job says.
+        OHLCV_HISTORY_SOURCE_KEY: history_source,
         "name": backtest_cfg.get("name", f"opt-trial-{trial_id}"),
         "start_date": backtest_cfg["start_date"],
         "end_date": backtest_cfg["end_date"],
@@ -3427,7 +3446,8 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
                            expert_settings: Optional[Dict[str, Any]] = None,
                            rm_toggles_unpinned: Optional[List[str]] = None,
                            screener_universe_rule: Optional[str] = None,
-                           screener_criteria: Optional[str] = None) -> str:
+                           screener_criteria: Optional[str] = None,
+                           ohlcv_history_source: Optional[str] = None) -> str:
     """Identity of the SEARCH ITSELF -- a checkpoint may only be resumed into a matching one.
 
     A GA checkpoint is a list of chromosomes plus an RNG state; both are meaningless against a
@@ -3472,6 +3492,10 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     ``screener_criteria`` (``backtest.screener_opt.criteria_version``, e.g. ``live-daily-v2``) joins it the
     same way: the DEFINITION of what the gate selects (live-simulation daily criteria vs the old weekly store
     gate) is part of the job's identity; a checkpoint scored under one must never be resumed under the other.
+
+    ``ohlcv_history_source`` (``backtest.ohlcv_history_source``) joins it the same way, but ONLY when it is not
+    the legacy ``fmp``: the price history a genome was scored on is part of its identity, so an ``alpaca`` job
+    never resumes an ``fmp`` job's checkpoint, while every job from before the switch keeps its fingerprint.
     """
     import hashlib
     import json
@@ -3490,6 +3514,8 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
         payload["screener_universe_rule"] = screener_universe_rule
     if screener_criteria:
         payload["screener_criteria"] = screener_criteria
+    if ohlcv_history_source is not None and ohlcv_history_source != LEGACY_HISTORY_SOURCE:
+        payload["ohlcv_history_source"] = check_history_source(ohlcv_history_source)
     lattice_anchor = _resolve_lattice_anchor(ga)
     if lattice_anchor != "zero":
         payload["lattice_anchor"] = lattice_anchor

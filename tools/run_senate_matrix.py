@@ -42,8 +42,8 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 from matrix_flags import (  # noqa: E402
     finish_matrix, note_job_exit,
-    cap_passthrough, decision_times_plan, decision_times_tokens, job_name_with_digest,
-    with_decision_times_name)
+    add_history_source_flag, cap_passthrough, decision_times_plan, decision_times_tokens, history_source_tokens,
+    job_name_with_digest, with_decision_times_name, with_history_source_name)
 
 _UNIVERSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "senate_universe.txt")
 _EXPERT = "FMPSenateTraderWeight"
@@ -152,6 +152,7 @@ def main() -> int:
                     help="Per-gene mutation probability passthrough (default: launcher's).")
     ap.add_argument("--interval", default="1d",
                     help="Daily is the right clock: disclosures lag execution by 30-45 days.")
+    add_history_source_flag(ap)
     ap.add_argument("--fitness", default="calmar_ratio")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL)
     ap.add_argument("--name-suffix", default="",
@@ -266,10 +267,13 @@ def main() -> int:
           f"{' (by base name; digest-suffixed names are checked per job)' if mc_tokens_preview else ''}.")
 
     for i, (name, strat) in enumerate(jobs, 1):
+        # The OHLCV history is part of the job's identity (an alpaca job never resumes an fmp one).
+        name = with_history_source_name(name, args.ohlcv_history_source)
         cmd = [exe, "optimize", "--expert", _EXPERT, "--universe", universe,
                "--strategy", strat,
                "--start", args.start, "--end", args.end, "--fitness", args.fitness,
-               "--interval", args.interval, "--population", str(args.population),
+               "--interval", args.interval, *history_source_tokens(args.ohlcv_history_source),
+               "--population", str(args.population),
                "--generations", str(args.generations),
                "--initial-capital", str(args.initial_capital),
                "--run-schedule", "weekly", "--name", name, "--parallel", str(args.parallel)]

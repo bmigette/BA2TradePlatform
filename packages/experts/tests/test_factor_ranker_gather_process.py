@@ -130,8 +130,7 @@ def test_fetch_close_prices_passes_end_date_equal_as_of(monkeypatch):
     """The Task 9 gap #1 fix: fetch_close_prices(as_of=X) must call the OHLCV
     provider with end_date == X (point-in-time anchor)."""
     fake = FakeOHLCV()
-    monkeypatch.setattr(_ohlcv_module(), "FMPOHLCVProvider", lambda: fake)
-    out = data.fetch_close_prices(["AAA", "BBB"], lookback_days=400, as_of=NOW)
+    out = data.fetch_close_prices(["AAA", "BBB"], lookback_days=400, as_of=NOW, ohlcv_provider=fake)
     assert set(out) == {"AAA", "BBB"}
     assert all(c["end_date"] == NOW for c in fake.calls), fake.calls
     assert all(c["lookback_days"] == 400 for c in fake.calls)
@@ -140,13 +139,17 @@ def test_fetch_close_prices_passes_end_date_equal_as_of(monkeypatch):
 def test_fetch_close_prices_asof_none_uses_now(monkeypatch):
     """as_of=None (live) maps end_date to 'now' (byte-identical to old live fetch)."""
     fake = FakeOHLCV()
-    monkeypatch.setattr(_ohlcv_module(), "FMPOHLCVProvider", lambda: fake)
+    import ba2_providers
+    asked = []
+    monkeypatch.setattr(ba2_providers, "get_provider",
+                        lambda category, name, **kw: asked.append((category, name)) or fake)
     before = datetime.now(timezone.utc)
     data.fetch_close_prices(["AAA"], as_of=None)
     after = datetime.now(timezone.utc)
     assert len(fake.calls) == 1
     end = fake.calls[0]["end_date"]
     assert before <= end <= after, "end_date must be ~now when as_of=None"
+    assert asked == [("ohlcv", "fmp")]      # live reads the live registry's provider
 
 
 # --------------------------------------------------------------------------- #

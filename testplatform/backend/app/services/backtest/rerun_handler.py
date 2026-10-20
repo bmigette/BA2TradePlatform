@@ -102,7 +102,7 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
     refuse; a re-run is a measurement and must still run, loudly)."""
     import os
     from ba2_common.config import CACHE_FOLDER
-    from ba2_common.core.ohlcv_history import resolve_job_history_source
+    from ba2_common.core.ohlcv_history import history_cache_dirname, resolve_job_history_source
     from ba2_providers.screener import metric_store as ms
     from ba2_providers.screener import universe_superset as us
 
@@ -127,7 +127,8 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
         new = us.static_universe(df, str(bt_block["start_date"])[:10], str(bt_block["end_date"])[:10],
                                  so["base_settings"], ranges, intraday=us.interval_is_intraday(interval),
                                  excluded_symbols=excluded)
-    cdir = os.path.join(CACHE_FOLDER, "FMPOHLCVProvider")
+    # the history folder of the STORED block's source (no stamp: it ran on fmp)
+    cdir = os.path.join(CACHE_FOLDER, history_cache_dirname(resolve_job_history_source(bt_block)))
     ivs = sorted({interval, "1d"})
 
     def _cached(sym: str) -> bool:

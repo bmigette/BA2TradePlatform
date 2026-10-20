@@ -360,6 +360,8 @@ def _launch(monkeypatch, store, tmp_path, *extra, cached=None, name="sup"):
         assert L.main(["optimize", "--expert", "FMPRating", "--strategy", "S1", "--universe", "AAPL",
                        "--start", "2023-03-06", "--end", "2023-03-24", "--population", "2",
                        "--generations", "1", "--rerun", "--interval", "1d",
+                       # this fixture's cached bars live under FMPOHLCVProvider/
+                       "--ohlcv-history-source", "fmp",
                        "--screener", "--screener-store", store, "--screener-cap-band", "mid",
                        "--name", f"{name}-{os.getpid()}", *extra]) == 0
     finally:

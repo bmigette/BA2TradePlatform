@@ -101,7 +101,7 @@ def clear_worker_5m_bars_cache() -> None:
 def _get_5m_bars_cached(provider: Any, symbol: str, start_date: Any, end_date: Any) -> Any:
     """Worker-cached ``provider.get_ohlcv_data(symbol, ..., interval="5m")`` for the whole
     [start_date, end_date] window -- see the cache docstring above."""
-    key = (symbol, start_date, end_date)
+    key = (symbol, start_date, end_date, type(provider).__name__)   # the provider class IS the history folder
     df = _WORKER_5M_BARS_CACHE.get(key)
     if df is not None:
         _WORKER_5M_BARS_CACHE.move_to_end(key)  # LRU: mark most-recently-used
@@ -385,9 +385,10 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any], *,
     commission = float(config["account_settings"]["commission_per_trade"])
     # get_provider() constructs a FRESH provider instance every call (no internal caching) --
     # build it ONCE per backtest here, not once per flagged trade inside _bars_5m_between.
-    from ba2_providers import get_provider
+    from app.services.backtest.history_source import job_history_provider
 
-    ohlcv_5m_provider = get_provider("ohlcv", "fmp")
+    # The job's own history source (an option job is fmp-only: it refuses any other at job start).
+    ohlcv_5m_provider = job_history_provider(config)
     window_start = config.get("start_date")
     window_end = config.get("end_date")
 

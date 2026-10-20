@@ -112,16 +112,37 @@ def _flag_value(cmd: list[str], flag: str):
 # Byte-identity: no new flags -> no new tokens, no digest.
 # --------------------------------------------------------------------------- #
 def test_ordinary_invocation_is_unchanged(driver, captured, monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["run_senate_matrix.py", "--strategies", "S2"])
+    # --ohlcv-history-source fmp = the legacy invocation: same job NAME as before the switch
+    monkeypatch.setattr(sys, "argv", ["run_senate_matrix.py", "--strategies", "S2",
+                                      "--ohlcv-history-source", "fmp"])
     assert driver.main() == 0
     assert captured, "the driver launched no optimize job"
     cmd = captured[0]
     assert _flag_value(cmd, "--name") == "sen-S2"
+    assert _flag_value(cmd, "--ohlcv-history-source") == "fmp"
     for flag in ("--sizing-mode", "--early-stop", "--early-stop-min-rel", "--rm-toggle-policy",
                  "--stress-spread-bps", "--no-robust-fitness", "--market-condition-profile",
                  "--market-condition-manifest", "--market-exit", "--market-condition-mode",
                  "--search-sl-loosen"):
         assert flag not in cmd, f"{flag} leaked into an ordinary invocation"
+
+
+def test_history_source_is_forwarded_and_part_of_the_job_name(driver, captured, monkeypatch):
+    """Default alpaca: stated on the launcher argv and in the NAME; fmp keeps the legacy name, so the two
+    sources never share a name (skip-if-completed, GA checkpoint key)."""
+    names = {}
+    for source in ("alpaca", "fmp"):
+        captured.clear()
+        monkeypatch.setattr(sys, "argv", ["run_senate_matrix.py", "--strategies", "S2",
+                                          "--ohlcv-history-source", source])
+        assert driver.main() == 0
+        names[source] = _flag_value(captured[0], "--name")
+        assert _flag_value(captured[0], "--ohlcv-history-source") == source
+    assert names == {"alpaca": "sen-S2-hsalpaca", "fmp": "sen-S2"}
+    captured.clear()
+    monkeypatch.setattr(sys, "argv", ["run_senate_matrix.py", "--strategies", "S2"])
+    assert driver.main() == 0
+    assert _flag_value(captured[0], "--ohlcv-history-source") == "alpaca"
 
 
 def test_dry_run_without_new_flags_prints_plain_undigested_names(driver, monkeypatch, capsys):
@@ -257,7 +278,7 @@ def test_market_condition_profile_forwarded_and_digests_the_job_name(driver, cap
     assert _flag_value(cmd, "--market-exit") == "exit,stop,tp"
     assert "--search-sl-loosen" in cmd
     name = _flag_value(cmd, "--name")
-    assert name.startswith("sen-S1-d")
+    assert name.startswith("sen-S1-hsalpaca-d")     # the history source is in the name (default alpaca)
     assert _DIGEST_RE.search(name)
 
 

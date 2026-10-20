@@ -156,6 +156,32 @@ def _require_statement(result, key: str, label: str) -> dict:
     return items[0]
 
 
+class OhlcvHistoryUnavailable(ValueError):
+    """A point-in-time OHLCV read with no provider supplied: refused, and NOT swallowed per symbol."""
+
+
+def _history_provider(ohlcv_provider, as_of: Optional[datetime], where: str):
+    """The OHLCV provider a fetcher reads, through the registry and never a hard-coded class.
+
+    A caller-supplied provider (the backtest's in-memory ``MemoizedOHLCVProvider``, which already
+    reads the JOB's history source) is used as is. Without one:
+
+    * ``as_of`` given = a point-in-time (backtest / replay) read. The expert cannot know which
+      history the job runs on, and defaulting to FMP here would silently price an Alpaca-history
+      job from the FMP cache, so it REFUSES.
+    * ``as_of`` None = live, which always reads the live registry's OHLCV provider (``fmp``).
+    """
+    if ohlcv_provider is not None:
+        return ohlcv_provider
+    if as_of is not None:
+        raise OhlcvHistoryUnavailable(
+            f"{where}: a point-in-time read (as_of={as_of}) needs the run's OHLCV provider "
+            f"(ohlcv_provider=); refusing to fall back to a history source the job did not choose")
+    from ba2_common.core.backtest_context import LIVE_OHLCV_PROVIDER
+    from ba2_providers import get_provider
+    return get_provider("ohlcv", LIVE_OHLCV_PROVIDER)
+
+
 def fetch_close_prices(symbols, lookback_days: int = 400,
                        as_of: Optional[datetime] = None,
                        ohlcv_provider=None) -> Dict[str, pd.Series]:
@@ -172,13 +198,9 @@ def fetch_close_prices(symbols, lookback_days: int = 400,
     ``FMPOHLCVProvider``. The fetch semantics are unchanged (same ``end_date=as_of``,
     ``lookback_days``, ``interval="1d"``); only the provider object differs, so the
     closes — and therefore momentum — are results-identical. ``None`` (live) falls
-    back to ``FMPOHLCVProvider()`` exactly as before.
+    back to the live registry provider (``_history_provider``); with an ``as_of`` it refuses.
     """
-    if ohlcv_provider is not None:
-        provider = ohlcv_provider
-    else:
-        from ba2_providers.ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
-        provider = FMPOHLCVProvider()
+    provider = _history_provider(ohlcv_provider, as_of, "FactorRanker.fetch_close_prices")
     end = as_of or datetime.now(timezone.utc)
     out: Dict[str, pd.Series] = {}
     for sym in symbols:
@@ -216,9 +238,10 @@ def fetch_value_inputs(symbols, as_of: Optional[datetime] = None,
     read from it instead of a fresh ``FMPOHLCVProvider``. Same fetch semantics
     (``end_date=as_of``, ``lookback_days=400``, ``interval="1d"``), so the value-factor
     price reuses the memoized series and stays results-identical. ``None`` (live) falls
-    back to ``FMPOHLCVProvider()`` as before.
+    back to the live registry's OHLCV provider (``_history_provider``).
     """
     from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
+    explicit_as_of = as_of
     as_of = as_of or datetime.now(timezone.utc)
     details = FMPCompanyDetailsProvider()
     # LAZY: only construct a real FMPOHLCVProvider if some symbol actually falls through to
@@ -231,11 +254,8 @@ def fetch_value_inputs(symbols, as_of: Optional[datetime] = None,
 
     def _get_ohlcv():
         if "provider" not in _ohlcv_cache:
-            if ohlcv_provider is not None:
-                _ohlcv_cache["provider"] = ohlcv_provider
-            else:
-                from ba2_providers.ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
-                _ohlcv_cache["provider"] = FMPOHLCVProvider()
+            _ohlcv_cache["provider"] = _history_provider(
+                ohlcv_provider, explicit_as_of, "FactorRanker.fetch_value_inputs")
         return _ohlcv_cache["provider"]
 
     out: Dict[str, dict] = {}
@@ -295,7 +315,7 @@ def fetch_value_inputs(symbols, as_of: Optional[datetime] = None,
                 total_debt=total_debt,
                 cash=balance.get("cash_and_cash_equivalents"),
             )
-        except FMPError:
+        except (FMPError, OhlcvHistoryUnavailable):
             raise  # quota/rate-limit hits every symbol -- one loud failure, not a silent batch drop
         except Exception as e:
             logger.warning(

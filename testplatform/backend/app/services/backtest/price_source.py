@@ -925,6 +925,11 @@ class AsOfPriceSource:
             )
         fetch_start = start - timedelta(days=warmup_days)
         win = (self._interval, fetch_start.isoformat(), end.isoformat())
+        # The in-process bar cache outlives a job (a long-lived worker serves many), so its key also
+        # names the HISTORY the bars were read from: an fmp job's bars must never be adopted by an
+        # alpaca job over the same symbols and window. ``win`` alone keys the on-disk derived set
+        # (which already lives beside its own provider's parquet tree).
+        cache_win = (*win, _history_cache_dirname_of(self._ohlcv))
         # One preload == one individual. Bump the counter FIRST so every touch below (hit or
         # insert) stamps this individual's seq, and the end-of-preload sweep can tell "used by
         # the last N individuals" from "carried over from older ones".
@@ -942,7 +947,7 @@ class AsOfPriceSource:
         # estimate crosses the threshold does anything get logged at all, so the steady-state
         # warm-cache case (nearly every individual, once a worker is past its first one) stays
         # completely silent.
-        _to_load_estimate = sum(1 for sym in symbols if (sym, *win) not in _WORKER_BAR_CACHE)
+        _to_load_estimate = sum(1 for sym in symbols if (sym, *cache_win) not in _WORKER_BAR_CACHE)
         _bulk = _to_load_estimate >= _PRELOAD_BULK_LOG_MIN
         _t0 = time.monotonic()
         if _bulk:
@@ -954,14 +959,14 @@ class AsOfPriceSource:
         for sym in symbols:
             # Worker-persistent reuse: a prior individual in this worker already parsed this
             # symbol's bar index for the same window -> adopt it (no re-fetch, no re-parse).
-            cached = _WORKER_BAR_CACHE.get((sym, *win))
+            cached = _WORKER_BAR_CACHE.get((sym, *cache_win))
             if cached is not None:
                 _hits += 1
-                _WORKER_BAR_CACHE.move_to_end((sym, *win))  # LRU: mark most-recently-used
+                _WORKER_BAR_CACHE.move_to_end((sym, *cache_win))  # LRU: mark most-recently-used
                 # Stamp only entries that actually exist in the cache: a symbol that turns out to
                 # be a hermetic MISS below never gets stored, and stamping it here would leave a
                 # key in the tracking dict with nothing behind it.
-                _BAR_CACHE_LAST_USED[(sym, *win)] = _TRIAL_SEQ
+                _BAR_CACHE_LAST_USED[(sym, *cache_win)] = _TRIAL_SEQ
                 (self._keys[sym], self._o[sym], self._h[sym],
                  self._l[sym], self._c[sym], self._v[sym]) = cached
                 continue
@@ -980,11 +985,11 @@ class AsOfPriceSource:
                 self._set_empty(sym)
             else:
                 self._bind_arrays(sym, arrays)
-            _WORKER_BAR_CACHE[(sym, *win)] = (
+            _WORKER_BAR_CACHE[(sym, *cache_win)] = (
                 self._keys[sym], self._o[sym], self._h[sym],
                 self._l[sym], self._c[sym], self._v[sym],
             )
-            _BAR_CACHE_LAST_USED[(sym, *win)] = _TRIAL_SEQ
+            _BAR_CACHE_LAST_USED[(sym, *cache_win)] = _TRIAL_SEQ
             # Count cap: now only a BACKSTOP behind the recency sweep below (it could never fire
             # on the goal2020 ED job, whose 1368-symbol universe sits under the 1500 default).
             # Kept so a pathological single individual still cannot outrun the bound.
@@ -1029,8 +1034,7 @@ class AsOfPriceSource:
                     f"{', '.join(missing[:20])}{'…' if len(missing) > 20 else ''}. "
                     f"The run continues on the REDUCED universe -- its results are not "
                     f"comparable with a run that had full coverage. Cache them with: "
-                    f"ba2-test fetch-cache --provider fmp --timeframes {self._interval} "
-                    f"--symbols {' '.join(missing[:10])}"
+                    f"{_history_populate_hint(self._ohlcv, self._interval, missing[:10])}"
                 )
                 missing = []
 
@@ -1041,10 +1045,10 @@ class AsOfPriceSource:
                 f"OHLCV cache miss: {len(missing)} of {len(symbols)} symbol(s) have no cached "
                 f"{interval} bars on disk (e.g. {sample}). A backtest is hermetic — it never "
                 f"fetches during a run. Populate the cache first, e.g.:\n"
-                f"    ba2-test fetch-cache --provider fmp --timeframes {interval} "
-                f"--symbols {' '.join(missing[:5])}{' …' if len(missing) > 5 else ''}\n"
-                f"Expected at CACHE_FOLDER/FMPOHLCVProvider/<SYM>_{interval}.parquet "
-                f"(native OHLCV cache)."
+                f"    {_history_populate_hint(self._ohlcv, interval, missing[:5])}"
+                f"{' …' if len(missing) > 5 else ''}\n"
+                f"Expected at CACHE_FOLDER/{_history_cache_dirname_of(self._ohlcv)}/<SYM>_{interval}.parquet "
+                f"(native OHLCV cache of this job's history source)."
             )
 
     def _read_window_df(self, symbol: str, fetch_start: datetime, end: datetime) -> Any:
@@ -1567,6 +1571,29 @@ def evict_memo_if_working_set_changed(sig: Any) -> bool:
     return True
 
 
+def _history_cache_dirname_of(provider: Any) -> str:
+    """The native-cache folder ``provider`` reads: its (inner) class name, which IS the folder
+    (``native_cache`` keys on it). Names the JOB's source in an error, not a hard-coded "FMP"."""
+    return type(getattr(provider, "_inner", provider)).__name__
+
+
+def _history_populate_hint(provider: Any, interval: str, symbols: List[str]) -> str:
+    """How to populate the cache of the history source ``provider`` reads (error text)."""
+    from ba2_common.core.ohlcv_history import HISTORY_SOURCES
+
+    dirname = _history_cache_dirname_of(provider)
+    syms = " ".join(symbols)
+    for source, (registry_key, folder) in HISTORY_SOURCES.items():
+        if folder != dirname:
+            continue
+        if source == "fmp":
+            return f"ba2-test fetch-cache --provider {registry_key} --timeframes {interval} --symbols {syms}"
+        return (f"tools/prepare_history.py --source {source} (history source {source!r}, cache "
+                f"{folder}/) for interval {interval}, symbols {syms}")
+    return (f"ba2-test fetch-cache --provider <registry key of {dirname}> --timeframes {interval} "
+            f"--symbols {syms}")
+
+
 class MemoizedOHLCVProvider:
     """Wrap an OHLCV provider so each symbol's full [bounds] series is fetched ONCE per worker
     process and every ``get_ohlcv_data`` call is served by an in-memory date-range slice.
@@ -1746,7 +1773,8 @@ class MemoizedOHLCVProvider:
     def _full(self, symbol: str, interval: str):
         """Memoized variant of ``_load`` — the persistent per-symbol series cache shared across GA
         individuals. Populated LAZILY by genuine ``get_ohlcv_data`` requests (NOT by preload)."""
-        key = (symbol, interval, _to_utc(self._bs).isoformat(), _to_utc(self._be).isoformat())
+        key = (symbol, interval, _to_utc(self._bs).isoformat(), _to_utc(self._be).isoformat(),
+               _history_cache_dirname_of(self))
         hit = _FULL_SERIES_MEMO.get(key)
         if hit is None:
             hit = self._load(symbol, interval)
