@@ -246,8 +246,11 @@ Rules to know:
 - An intraday symbol-year missing at most 5 traded days is stored with the days listed
   (`days_without_intraday_bars`, kept empty by the build); more is refused. Zero-trade daily bars are Alpaca
   placeholders and expect no intraday bars.
-- Adjusted: splits, reverse splits, same-symbol unit splits, stock dividends. Not adjusted: cash dividends,
-  spin-offs (FMP's `close` convention).
+- Adjusted: splits, reverse splits, same-symbol unit splits, stock dividends, and spin-offs (factor 1 + rate x
+  spun-off close / parent close on the ex-date, prices only: the engine does not credit spun-off shares, so an
+  unadjusted parent would show a fake loss, e.g. IAC 2020-07-01). Not adjusted: cash dividends. Reused tickers and
+  bankruptcy re-listings (an unexplained overnight jump beyond x5) are series breaks: only the segment after the last
+  break is kept.
 - Split decision, per event with factor f: proven by the raw overnight jump (within x1.15 of f, |ln f| >= ln 1.25)
   or by the **FMP step** (FMP adjusted close / Alpaca raw close steps by f within 2% across the date: the market
   move cancels out, so it measures exactly what FMP applied). Small factors only when both vendors list them.
