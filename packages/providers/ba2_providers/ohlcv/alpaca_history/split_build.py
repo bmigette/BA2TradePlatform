@@ -318,6 +318,15 @@ class YahooSplitSource:
                       "inputs_csv": "yahoo_inputs.csv"}
 
 
+def _absorbed(accepted: Sequence[Mapping[str, Any]]) -> Dict[str, List[List[Any]]]:
+    """{symbol: [[date, f], ...]} of the spin-offs absorbed by a split on their ex-date (provenance)."""
+    out: Dict[str, List[List[Any]]] = {}
+    for a in accepted:
+        if a["absorbed_factor"] is not None:
+            out.setdefault(a["symbol"], []).append([a["date"], a["absorbed_factor"]])
+    return out
+
+
 def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db: str = DEFAULT_DB,
                       fmp_daily_dir: str = DEFAULT_FMP_DAILY, symbols: Optional[List[str]] = None,
                       fmp_from: str = "2016-01-01", fmp_to: Optional[str] = None,
@@ -343,8 +352,12 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     t0 = time.time()
     months = read_corporate_actions(store)
     renames = build_rename_map(months)
-    alpaca = alpaca_events_from_actions(months, renames, stats)
-    spinoffs = spinoff_events_from_actions(months, renames, stats)
+    bars_dir = os.path.join(store, "bars", "1Day")
+    store_names = {n[len("symbol="):] for n in os.listdir(bars_dir)
+                   if n.startswith("symbol=") and os.path.isfile(os.path.join(bars_dir, n, "all.parquet"))}
+    in_store = store_names.__contains__
+    alpaca = alpaca_events_from_actions(months, renames, stats, in_store)
+    spinoffs = spinoff_events_from_actions(months, renames, stats, in_store)
     if stats["alpaca_forward_splits"] + stats["alpaca_reverse_splits"] <= 0:
         raise SplitTableBuildError(f"the store's corporate actions hold no forward or reverse split at all ({store}): "
                                    f"the files are empty or have changed shape")
@@ -359,7 +372,7 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
 
     cal_used: List[str] = []
     cal_rows = fetch_fmp_calendar(date.fromisoformat(fmp_from), date.fromisoformat(fmp_to), cal_dir, get, stats, cal_used)
-    fmp = fmp_events_from_rows(cal_rows, renames, stats)
+    fmp = fmp_events_from_rows(cal_rows, renames, stats, in_store)
     bars, bars_sha = load_store_bars(store, symbols)
     fmp_daily, fmp_files, fmp_records = load_fmp_daily(fmp_daily_dir, bars)
     log(f"loaded {len(bars)} symbols, {len(alpaca)} Alpaca and {len(fmp)} FMP listings, {fmp_files['count']} FMP daily "
@@ -367,7 +380,6 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
 
     breaks: Dict[str, List[str]] = {}
     missing_spincos: set = set()
-    bars_dir = os.path.join(store, "bars", "1Day")
 
     def spinco_frame(sym: str) -> Optional[pd.DataFrame]:
         """ANY symbol whose bars exist in the store's bars dir (not only those judged / in symbols.txt)"""
@@ -392,7 +404,8 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     table = {"run_id": run_id, "asof": info["asof"], "inputs_sha256": h.hexdigest(), "overrides_sha256": overrides_sha,
              "fmp_daily_files": {**fmp_files, "inputs_csv": "fmp_daily_inputs.csv"}, "yahoo_files": yahoo_files,
              "breaks": {k: sorted(v) for k, v in sorted(breaks.items())},
-             "spinoffs": splits_by_symbol(accepted, "spinoff"), "splits": splits_by_symbol(accepted, "split")}
+             "spinoffs": splits_by_symbol(accepted, "spinoff"),
+             "absorbed_spinoffs": _absorbed(accepted), "splits": splits_by_symbol(accepted, "split")}
     # one coherent set: every CSV carries the run_id, and split_table.json is written LAST, so a crash never leaves a table
     # newer than its CSVs (a reader checks that the run_ids of the table and the CSVs match)
     atomic_write(os.path.join(meta, "split_review.csv"), _csv_bytes(REVIEW_COLUMNS, review, run_id))

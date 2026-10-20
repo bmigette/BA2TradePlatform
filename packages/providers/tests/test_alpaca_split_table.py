@@ -946,11 +946,12 @@ def test_a_vendor_listing_of_the_spinoff_as_a_split_is_absorbed_never_applied_tw
     assert stats["listings_absorbed_by_spinoff"] == 2
     # a split with another ratio on the same day is a different event and is decided on its own
     other = [L("P", D, 0.5)]
-    acc, _, stats, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=other, fm=other, ov=[ov("accept", 0.5, symbol="P")])
-    assert sorted(a["kind"] for a in acc) == ["spinoff", "split"]
-    # an override that would accept the same event as a split is refused
-    with pytest.raises(st.SplitTableBuildError, match="adjust it twice"):
-        run_so({"P": raw, "S": spinco_bars()}, None, alp=both, ov=[ov("accept", 1.12, symbol="P")])
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=other, fm=other, ov=[ov("accept", 0.5, symbol="P")])
+    assert [a["kind"] for a in acc] == ["split"] and acc[0]["absorbed_factor"] == pytest.approx(1.125)    # ONE event: the split
+    assert one(rev, "spinoff_absorbed_by_split")["applied"] is True
+    # an override that accepts the same event as a split decides it: the split stays, the spin-off is absorbed (never both)
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=both, ov=[ov("accept", 1.12, symbol="P")])
+    assert [a["kind"] for a in acc] == [("split")] and one(rev, "spinoff_absorbed_by_split")
 
 
 def test_a_split_override_reject_never_blocks_the_spinoff():
@@ -1284,3 +1285,74 @@ def test_build_writes_the_missing_spinco_list(tmp_path):
     table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
     assert lines[0] == f"# run_id: {table['run_id']}" and [x for x in lines if not x.startswith("#")] == ["OTCX"]
     assert table["spinoffs"] == {"P": [[D.isoformat(), 1.125]]} and res["spinco_symbols_missing"] == 1
+
+
+# ---- gate fixes: split + spin-off on one ex-date, small single-vendor events confirmed by Yahoo, older store symbols ------
+def aiv_case(step_applied):
+    raw = parent_bars()                                          # P falls 100 -> 80; the spin-off factor is 1.125
+    fd = {"P": fmp(raw, {40: step_applied}) if step_applied else fmp(raw)}
+    split = [L("P", D, 1.3)]                                     # both vendors list the spin-off as a 1.3 "split" (AIV style)
+    return run_so({"P": raw, "S": spinco_bars()}, fd, alp=split, fm=split)
+
+
+def test_split_and_spinoff_on_one_ex_date_keep_the_split_and_absorb_the_spinoff_when_fmp_agrees():
+    acc, rev, stats, _ = aiv_case(1.2)
+    assert [(a["kind"], a["verdict"], a["factor"]) for a in acc] == [("split", "proven", 1.3)]
+    assert acc[0]["absorbed_factor"] == pytest.approx(1.125) and "spin-off factor 1.125" in acc[0]["absorbed"]
+    assert one(rev, "spinoff_absorbed_by_split")["applied"] is True
+    assert stats["verdict_spinoff_fmp_agrees"] == 0 and stats["verdict_spinoff_absorbed_by_split"] == 1   # counts follow the result
+    assert st.splits_by_symbol(acc, "spinoff") == {} and st.splits_by_symbol(acc) == {"P": [[D.isoformat(), 1.3]]}
+
+
+def test_split_and_spinoff_on_one_ex_date_are_refused_when_fmp_agrees_with_neither():
+    # FMP applied 1.12 (agrees with the 1.125 spin-off, the spin-off applies) but not the 1.3 split: split alone (1.3) and combined (1.46)
+    # are both far from the step, the spin-off is 1.125: the split is the conflicting one
+    acc, rev, stats, _ = aiv_case(1.12)
+    assert acc == [] and one(rev, "split_spinoff_conflict")["applied"] is False
+    assert stats["verdict_split_spinoff_conflict"] == 1 and stats["verdict_proven"] == 0 and stats["verdict_spinoff_fmp_agrees"] == 0
+    assert not any(r["applied"] for r in rev)
+
+
+def test_small_single_vendor_event_needs_yahoo_within_half_a_percent():
+    f = {"X": bars()}
+    acc, rev, _ = run(f, [L("X", D, 1.05)])                                              # no Yahoo: review, as before
+    assert acc == [] and one(rev, "small_single_vendor")
+    acc, rev = st.decide_splits(f, [L("X", D, 1.05)], [], [], Counter(), yahoo=yhoo((SESSIONS[41].date(), 1.0503)))
+    assert [(a["verdict"], a["source"]) for a in acc] == [("small_confirmed_by_yahoo", "alpaca+yahoo")] and rev == []
+    acc, _ = st.decide_splits(f, [], [L("X", D, 1.05)], [], Counter(), yahoo=yhoo((D, 1.05)))
+    assert [a["source"] for a in acc] == ["fmp+yahoo"]
+    for bad in (yhoo((D, 1.06)), yhoo((SESSIONS[46].date(), 1.05)), yhoo(), yhoo(available=False), None):    # 1 %, 6 sessions off, none
+        acc, rev = st.decide_splits(f, [L("X", D, 1.05)], [], [], Counter(), yahoo=bad)
+        assert acc == [] and one(rev, "small_single_vendor")
+
+
+def test_a_ticker_renamed_after_its_bars_end_keeps_its_events_on_the_old_symbol():
+    ren = st.build_rename_map([{"name_changes": [{"old_symbol": "OP", "new_symbol": "SVRN", "process_date": "2025-11-17"}]}])
+    day = date(2023, 6, 8)
+    assert st.map_to_current("OP", day, ren) == "SVRN"                                   # the plain mapping (no store knowledge)
+    assert st.map_to_current("OP", day, ren, {"OP"}.__contains__) == "OP"               # the store holds OP only
+    assert st.map_to_current("OP", day, ren, {"OP", "SVRN"}.__contains__) == "SVRN"     # the store holds both: the newest
+    assert st.map_to_current("OP", day, ren, set().__contains__) == "SVRN"              # in neither: unchanged behaviour
+    month = {"reverse_splits": [{"symbol": "OP", "ex_date": "2023-06-08", "old_rate": 20, "new_rate": 1}]}
+    stats = Counter()
+    ev = st.alpaca_events_from_actions([month], ren, stats, {"OP"}.__contains__)
+    assert ev == [L("OP", day, 0.05)] and stats["events_mapped_to_older_symbol"] == 1
+    assert st.alpaca_events_from_actions([month], ren, Counter())[0].symbol == "SVRN"
+
+
+def test_build_applies_an_alpaca_listed_split_of_a_renamed_symbol(tmp_path):
+    store, fmpd, raw = tiny_store(tmp_path, symbol="AA", asof="2021-01-30", listed=False)
+    with _gzip.open(store / "corporate_actions" / "ym=2021-03.json.gz", "wt", encoding="utf-8") as f:
+        json.dump({"forward_splits": [{"symbol": "AA", "ex_date": D.isoformat(), "old_rate": 1, "new_rate": 4}],
+                   "name_changes": [{"old_symbol": "AA", "new_symbol": "BB", "process_date": "2021-04-01"}]}, f)
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    (cal / "2021-01-01_2021-01-30.json").write_text("[]", encoding="utf-8")
+    (cal / "2021-01-31_2021-01-31.json").write_text("[]", encoding="utf-8")
+    res = sb.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01",
+                               log=lambda m: None)
+    table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
+    assert table["splits"] == {"AA": [[D.isoformat(), 4.0]]} and res["stats"]["events_mapped_to_older_symbol"] == 1
+    acc = sb.read_csv_frame(str(out / "_meta" / "split_accepted.csv"))
+    assert acc["source"].tolist() == ["alpaca"] and acc["absorbed"].tolist() == [""]
