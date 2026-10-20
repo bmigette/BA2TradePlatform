@@ -215,3 +215,25 @@ def test_the_merged_frame_is_split_checked_before_it_is_written(tmp_path, monkey
     with pytest.raises(RuntimeError, match="split-basis"):
         p.force_full_refetch("XCHK", "1d", provider_name="FMPOHLCVProvider", keep_newer_cached_tail=True)
     assert open(path, "rb").read() == before and read_full_fetch_marker(path) is None
+
+
+def test_a_forming_bar_in_the_kept_cached_tail_never_reaches_the_marker_or_the_result(tmp_path, monkeypatch):
+    """The kept tail comes from the CACHE, which may predate the unfinished-bar guard (merge review
+    2026-10-20): THE RULE is applied to it too, so the marker's last_bar is the last FINAL session."""
+    import sys
+    from ba2_common.core import ohlcv_final_bars as fb
+    truth, cached, path = _sats_shape("XSATS9")
+    last = truth["Date"].iloc[-1].date()
+    # 'now' = 14:00 New York on the cache's last session: that bar is still forming.
+    monkeypatch.setattr(fb, "now_utc", lambda: pd.Timestamp(datetime(last.year, last.month, last.day, 14), tz=NY_TZ)
+                        .tz_convert("UTC").to_pydatetime())
+    mdpi = sys.modules[MarketDataProviderInterface.__module__]
+    warned = []
+    monkeypatch.setattr(mdpi.logger, "warning", lambda msg, *a, **k: warned.append(str(msg)))
+    p = _LaggingVendor(truth, [CalendarSplit(SPLIT_DAY, 1.234)], lag=4)
+
+    out = p.force_full_refetch("XSATS9", "1d", provider_name="FMPOHLCVProvider", keep_newer_cached_tail=True)
+
+    assert out["Date"].iloc[-1] == truth["Date"].iloc[-2]
+    assert read_full_fetch_marker(path)["last_bar"] == truth["Date"].iloc[-2].date().isoformat()
+    assert any("unfinished bar(s) found in the kept cached tail" in m for m in warned)

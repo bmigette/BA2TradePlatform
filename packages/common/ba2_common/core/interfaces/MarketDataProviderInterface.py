@@ -1236,6 +1236,13 @@ class MarketDataProviderInterface(DataProviderInterface):
         out = out.reset_index(drop=True)
         if keep_newer_cached_tail and existing_path is not None:
             out = self._append_newer_cached_tail(out, existing_path, symbol, interval)
+            # The kept tail comes from the CACHE file, which may predate the unfinished-bar guard:
+            # apply THE RULE to it too, so no forming bar reaches the marker or the returned frame.
+            out, tail_forming = ohlcv_final_bars.split_unfinished(out, symbol, interval)
+            if not tail_forming.empty:
+                logger.warning(f"{provider_name} {symbol} ({interval}): dropped {len(tail_forming)} unfinished "
+                               f"bar(s) found in the kept cached tail")
+            out = out.reset_index(drop=True)
         self._refuse_shorter_replacement(out, existing_path, symbol, interval, provider_name)
         if verify is not None:
             verify(out)
