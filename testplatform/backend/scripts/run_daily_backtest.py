@@ -56,6 +56,7 @@ BACKEND_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.services.sync_client import push_backtest
+from ba2_common.core.ohlcv_history import DEFAULT_BT_HISTORY_SOURCE, HISTORY_SOURCES, OHLCV_HISTORY_SOURCE_KEY
 
 # Load .env so a configured FMP_API_KEY (project root or backend/.env) is picked up before
 # any provider resolution. Mirrors scripts/test_amgn_gaps.py. Absent files are a no-op.
@@ -131,6 +132,15 @@ def _parse_args(argv: list) -> argparse.Namespace:
         help="Engine type. Only 'daily_expert' is supported by this CLI.",
     )
     p.add_argument("--seed", type=int, default=42, help="RNG seed (run determinism).")
+    p.add_argument(
+        "--ohlcv-history-source",
+        choices=sorted(HISTORY_SOURCES),
+        default=DEFAULT_BT_HISTORY_SOURCE,
+        help=f"OHLCV history the run reads and is stamped with (default {DEFAULT_BT_HISTORY_SOURCE}): "
+        "fmp = CACHE_FOLDER/FMPOHLCVProvider, alpaca = CACHE_FOLDER/AlpacaHistoryOHLCVProvider. "
+        "An option run on alpaca is refused (ThetaData strikes are as-traded; the split-basis "
+        "converter still reads FMP's calendar).",
+    )
     p.add_argument(
         "--initial-capital", type=float, default=100_000.0, help="Starting cash."
     )
@@ -230,6 +240,7 @@ def _build_real_config(args: argparse.Namespace) -> dict:
         "execution_interval": str(args.interval),
         "seed": int(args.seed),
         "subtype": "daily_expert",
+        OHLCV_HISTORY_SOURCE_KEY: args.ohlcv_history_source,
     }
     override = _run_schedule_override(args.run_schedule, args.run_schedule_day)
     if override:

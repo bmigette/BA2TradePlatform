@@ -191,6 +191,26 @@ def set_backtest_ohlcv_override(provider: Optional[Any]) -> None:
     _ohlcv_override_tl.provider = provider
 
 
+# The OHLCV HISTORY SOURCE of the run in this thread (``fmp`` | ``alpaca``; ba2_common.core.
+# ohlcv_history). Set by run_daily_backtest next to the override above. It exists for the moments
+# the override is NOT installed (before it is set, or after a caller cleared it): an ("ohlcv", *)
+# request then resolves to THIS run's history provider, never to the hard-coded "fmp" the expert
+# bundle asks for (``LiveProviderBundle.ohlcv``). Thread-local for the same reason as the override.
+_history_source_tl = threading.local()
+
+
+def _current_history_source() -> Optional[str]:
+    return getattr(_history_source_tl, "source", None)
+
+
+def set_backtest_history_source(source: Optional[str]) -> None:
+    """Install (or clear, with None) this thread's run history source; an unknown name refuses."""
+    if source is not None:
+        from ba2_common.core.ohlcv_history import check_history_source
+        check_history_source(source)
+    _history_source_tl.source = source
+
+
 # Market-condition entry gates (design 2026-09-15 section 4.1). OPT-IN per run: only a config
 # that pins at least one registered profile installs anything, and only then is the adapter
 # module imported. A run may pin MORE THAN ONE (Task 10) -- one reader each, joined by
@@ -706,6 +726,13 @@ def _wire_provider_resolver() -> None:
         override = _current_ohlcv_override()
         if category == "ohlcv" and override is not None:
             return override
+        if category == "ohlcv":
+            # A backtest never reads a history other than its own: the name an expert's bundle
+            # asks for ("fmp") is the LIVE registry key and is not honoured while a run is active.
+            source = _current_history_source()
+            if source is not None:
+                from ba2_common.core.ohlcv_history import history_registry_key
+                return get_provider(category, history_registry_key(source), **kwargs)
         return get_provider(category, name, **kwargs)
 
     TradeConditions.set_provider_resolver(_resolve)
@@ -722,13 +749,19 @@ def make_indicator_provider(ohlcv_provider: Any = None) -> Any:
 
     Args:
         ohlcv_provider: the OHLCV provider to back the indicator calc. If omitted, the
-            default ohlcv/"fmp" provider is constructed. The backtest engine passes its
+            default provider is constructed (the running backtest's history source, else ohlcv/"fmp"). The backtest engine passes its
             as_of-aware OHLCV provider so ATR is computed against the backtest cache.
     """
     from ba2_providers import get_provider
 
     if ohlcv_provider is None:
-        ohlcv_provider = get_provider("ohlcv", "fmp")
+        # The running backtest's history when there is one, else the live default (fmp).
+        source = _current_history_source()
+        if source is None:
+            ohlcv_provider = get_provider("ohlcv", "fmp")
+        else:
+            from ba2_common.core.ohlcv_history import history_registry_key
+            ohlcv_provider = get_provider("ohlcv", history_registry_key(source))
     return get_provider("indicators", "pandas", ohlcv_provider=ohlcv_provider)
 
 

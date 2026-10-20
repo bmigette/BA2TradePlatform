@@ -903,8 +903,10 @@ def backtest_whatif(
         raise HTTPException(status_code=400,
                             detail="Backtest has no stored equity_curve/trades to recompute")
     from app.services.backtest.whatif import recompute_curves
+    from app.services.backtest.history_source import stored_history_source
     try:
         res = recompute_curves(
+            history_source=stored_history_source(backtest, db),
             initial_capital=backtest.initial_capital,
             trades=backtest.trades,
             equity_curve=backtest.equity_curve,

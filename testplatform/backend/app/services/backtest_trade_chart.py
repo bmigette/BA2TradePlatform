@@ -45,7 +45,9 @@ INTERVAL = "1d"
 #: listed. An unlisted engine reports ``unavailable`` rather than guessing: reading
 #: another provider's directory would silently chart a different instrument's
 #: history, which is worse than an empty chart with a reason.
-PROVIDER_BY_ENGINE = {"daily_expert": "FMPOHLCVProvider"}
+#: Engines whose bars come from the OHLCV history cache of the ROW's history source
+#: (``ohlcv_history``: ``FMPOHLCVProvider`` or ``AlpacaHistoryOHLCVProvider``; an unstamped row ran on fmp).
+HISTORY_CACHE_ENGINES = frozenset({"daily_expert"})
 
 #: Fields the recorder may have published on a leg. Absent => None, never a default.
 _MONEY_FIELDS = (
@@ -680,14 +682,24 @@ def build_trade_chart_context(backtest: Any, trade_id: int, session: Any = None)
         )
 
     engine_type = _text(getattr(backtest, "engine_type", None)) or ""
-    provider = PROVIDER_BY_ENGINE.get(engine_type)
+    provider = None
+    source_problem = None
+    if engine_type in HISTORY_CACHE_ENGINES:
+        from ba2_common.core.ohlcv_history import history_cache_dirname
+        from app.services.backtest.history_source import stored_history_source
+        try:
+            provider = history_cache_dirname(stored_history_source(backtest, session))
+        except ValueError as exc:
+            # No session to read the optimization's stamp from: guessing fmp could chart another
+            # history's bars under this row's name, so the chart says why it shows none.
+            source_problem = str(exc)
     underlying_symbol = _underlying_symbol(rows)
 
     notices: List[Dict[str, str]] = []
     if provider is None:
         notices.append({
             "code": "source_unresolved",
-            "message": (
+            "message": source_problem or (
                 f"No cached dataset is registered for engine '{engine_type or 'unknown'}', "
                 "so no underlying history is shown."
             ),

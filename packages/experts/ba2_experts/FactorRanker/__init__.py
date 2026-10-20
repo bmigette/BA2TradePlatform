@@ -738,7 +738,7 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         # Thread it into every OHLCV-using fetcher so the daily closes are sliced from
         # memory instead of re-reading + re-parsing the parquet on every analysis bar.
         # On the LIVE path ``providers.ohlcv()`` is the plain FMP provider, so behaviour
-        # is unchanged; the fetchers fall back to ``FMPOHLCVProvider()`` if it is None.
+        # is unchanged; the fetchers fall back to the live registry provider if it is None (refused with an as_of).
         ohlcv_provider = providers.ohlcv()
 
         universe = self._resolve_universe(as_of)

@@ -28,11 +28,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ba2_common.core.deploy_parity import BacktestRunFacts, forced_expert_settings
 from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+from ba2_common.core.ohlcv_history import OHLCV_HISTORY_SOURCE_KEY, resolve_job_history_source
 from ba2_common.core.types import is_option_action
 
 from app.models.backtest import Backtest
 from app.models.database import SessionLocal
 from app.services.backtest.equity_cap import validate_equity_cap
+from app.services.backtest.history_source import job_history_provider, refuse_option_job_on_unsupported_source
 from app.services.task_queue import get_task_queue
 
 logger = logging.getLogger(__name__)
@@ -548,8 +550,16 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         _default_option_spread_model(account_settings, payload.get("backtest_id"))
     validate_options_window(start_date, uses_options or bool(options_cache_db),
                             backtest_options_provider(payload))
+    # WHICH OHLCV history the run reads (ohlcv_history.py): the payload's stamp, else the legacy
+    # source. The caller stamps a NEW run (the CLI's --ohlcv-history-source); a payload without a
+    # stamp is a stored/legacy one and runs on fmp, never on a silently different history.
+    history_source = resolve_job_history_source(payload)
+    refuse_option_job_on_unsupported_source(
+        {OHLCV_HISTORY_SOURCE_KEY: history_source},
+        uses_options=uses_options or bool(options_cache_db), where="_build_config")
 
     return {
+        OHLCV_HISTORY_SOURCE_KEY: history_source,
         "backtest_id": payload["backtest_id"],
         "name": payload.get("name", f"daily-backtest-{payload['backtest_id']}"),
         "start_date": start_date,
@@ -837,7 +847,6 @@ def run_daily_backtest(
     """
     from ba2_common.core.db import activity_logging_disabled
     from ba2_common.logger import file_logging_disabled
-    from ba2_providers import get_provider
     from ba2_providers.fmp_common import frozen_ttl_cache, hermetic_fmp_history
 
     from app.services.backtest.backtest_account import BacktestAccount
@@ -859,6 +868,7 @@ def run_daily_backtest(
         install_backtest_market_conditions,
         make_indicator_provider,
         normalize_market_condition_keys,
+        set_backtest_history_source,
         set_backtest_ohlcv_override,
         wire_backtest_seams,
     )
@@ -872,6 +882,9 @@ def run_daily_backtest(
         **config,
         "start_date": _parse_dt(config["start_date"], "start_date"),
         "end_date": _parse_dt(config["end_date"], "end_date"),
+        # The OHLCV history this run reads, resolved ONCE (unstamped = the legacy fmp; an unknown
+        # stamp refuses) and written back so every later reader of this config agrees.
+        OHLCV_HISTORY_SOURCE_KEY: resolve_job_history_source(config),
         # Per-day DYNAMIC screener universe (screener-settings optimization). The optimizer's
         # trial config sets ``screener_runtime`` ({"store", "settings"[, "cadence_days"]}); the
         # engine reads it (``self._screener_runtime``) to gate ENTRIES to the per-day screened
@@ -902,6 +915,7 @@ def run_daily_backtest(
         config.get("execution_interval", "1d"),
         str(config["start_date"]), str(config["end_date"]),
         int(config.get("warmup_days") or 0),
+        config[OHLCV_HISTORY_SOURCE_KEY],
     ))
 
     # Options seam: a present ``options_cache_db`` flags an options run. Validate the SERVING
@@ -954,7 +968,12 @@ def run_daily_backtest(
         # re-reading + re-parsing the disk cache on every bar (the dominant cost — ~370s of an
         # 836s 6-month profile). Used by the fill-engine preload, the expert price/data path
         # (via the seam override below) AND the clamped indicator/ATR path.
-        raw_ohlcv = get_provider("ohlcv", "fmp")
+        # The job's own history (fmp | alpaca): the ONE place the raw provider is chosen. Option
+        # runs on a source other than fmp refuse here, before any bar is read.
+        refuse_option_job_on_unsupported_source(
+            config, uses_options=bool(config.get("options_cache_db")), where="run_daily_backtest")
+        raw_ohlcv = job_history_provider(config)
+        set_backtest_history_source(config[OHLCV_HISTORY_SOURCE_KEY])
         fetch_start = config["start_date"] - timedelta(days=int(config["warmup_days"]))
         # cached_only=True: a backtest is HERMETIC — serve bars from the on-disk caches only and
         # raise a clear BacktestCacheMiss (aggregated by preload) for any symbol absent from every
@@ -1118,6 +1137,7 @@ def run_daily_backtest(
         finally:
             # Drop the per-run OHLCV override so it never leaks into a later (non-backtest) call.
             set_backtest_ohlcv_override(None)
+            set_backtest_history_source(None)
             clear_backtest_market_conditions()
 
 

@@ -900,6 +900,7 @@ def test_option_round_trip_with_a_real_multiplier_is_unaffected(option_round_tri
 # ===========================================================================
 def _whatif_args(initial_capital):
     return {
+        "history_source": "fmp",
         "initial_capital": initial_capital,
         "trades": [{"symbol": "AAA", "entry_time": D1.isoformat(), "exit_time": D2.isoformat(),
                     "direction": "buy", "entry_price": 10.0, "size": 5.0, "pnl": 100.0,
