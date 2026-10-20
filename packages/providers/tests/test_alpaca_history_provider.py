@@ -85,3 +85,17 @@ def test_a_read_beyond_the_cache_raises_and_writes_nothing(cache_root):
         p.get_ohlcv_data("ZZZ", start_date=datetime(2024, 1, 1), end_date=datetime(2024, 2, 1),
                          interval="1d")
     assert list(cache_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("interval,freq,start", [("1d", "D", "2024-01-02"),
+                                                  ("5min", "5min", "2024-01-02 09:30")])
+def test_latest_read_of_a_stale_cache_raises_but_a_pinned_read_does_not(cache_root, interval, freq, start):
+    from ba2_providers.ohlcv.AlpacaHistoryOHLCVProvider import (
+        AlpacaHistoryOHLCVProvider, HistoryTopUpUnavailable)
+    _bars(start, 6, freq).to_parquet(cache_root / f"AAA_{interval}.parquet", index=False)
+    p = AlpacaHistoryOHLCVProvider()
+    with pytest.raises(HistoryTopUpUnavailable):
+        p.get_ohlcv_data("AAA", start_date=datetime(2024, 1, 1), interval=interval)   # end_date=None
+    pinned = p.get_ohlcv_data("AAA", start_date=datetime(2024, 1, 1),
+                              end_date=datetime(2024, 1, 31), interval=interval)
+    assert len(pinned) == 6

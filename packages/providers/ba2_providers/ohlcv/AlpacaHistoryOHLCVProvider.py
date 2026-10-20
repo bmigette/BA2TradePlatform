@@ -52,6 +52,25 @@ class AlpacaHistoryOHLCVProvider(MarketDataProviderInterface):
             f"{start_date} .. {end_date} is not in the prepared cache (or the cache is stale). "
             f"Build it with `tools/prepare_history.py --source alpaca`.")
 
+    def _is_cache_valid(self, cache_file: str, max_age_hours: int = 24) -> bool:
+        """File age says nothing here: the cache is an offline build, so a fresh mtime can sit on bars
+        that lag the calendar. Never "valid by mtime", so a latest daily read always reaches
+        ``_refresh_parquet_if_stale``, which compares the last bar with the current one."""
+        return False
+
+    def _refresh_parquet_if_stale(self, df, symbol, interval, provider_name):
+        """A LATEST read (``end_date=None``) whose cache lags the current bar needs a top-up, and this
+        provider has none: raise instead of the base's warn-and-serve-stale. A cache already current
+        to the expected bar is returned as is. Pinned (backtest) reads never get here."""
+        last = pd.to_datetime(df['Date']).iloc[-1]
+        last = last.to_pydatetime().replace(tzinfo=None)
+        if last >= self.normalize_time_to_interval(datetime.now(), interval):
+            return df
+        raise HistoryTopUpUnavailable(
+            f"{symbol} ({interval}): the prepared Alpaca history ends {last} and a latest read needs "
+            f"newer bars; this provider has no live top-up. Rebuild with "
+            f"`tools/prepare_history.py --source alpaca`, or read a pinned end_date.")
+
     def get_provider_name(self) -> str:
         """Get the provider name."""
         return "alpaca_hist"
