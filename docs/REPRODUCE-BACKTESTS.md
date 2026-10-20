@@ -219,6 +219,56 @@ Run everything from the repo root with the test venv (`~/ba2-venvs/test`, instal
 `install.ps1 -TestOnly -Editable` / `install.sh --test-only --editable`). `ba2-test` is that
 venv's console script for `testplatform/ba2test_launcher.py`.
 
+### 4.0 Price history: the Alpaca-built OHLCV cache (equity backtests from 2026-10-20)
+
+*Status 2026-10-20: download done, split table in progress, the `build`/`verify` steps and the
+`--ohlcv-history-source` switch are being built on `feat/alpaca-history-source`; until they merge, equity jobs
+still read the FMP cache (step 1 of §4.1). Plan: [plans/2026-10-20-alpaca-history-source.md](plans/2026-10-20-alpaca-history-source.md).*
+
+One command, resumable, stops for a human at the split review:
+
+```bash
+python tools/prepare_alpaca_history.py --steps download,split-table,build,verify [--dry-run] [--from-step X]
+```
+
+| # | Step | What it does | Inputs -> outputs |
+|---|---|---|---|
+| 1 | `download` | `tools/alpaca_history_download.py` with the recorded arguments: RAW (unadjusted) SIP bars + market-wide corporate actions, resumable chunk by chunk | -> `~/Documents/ba2/alpaca_store` (1Day + 5Min from 2019-01-01, 7,048 symbols) and `~/Documents/ba2/alpaca_store_daily2016` (1Day + corporate actions from 2016-01-01, 11,621 symbols); both `asof 2026-10-12`, `--end 2026-10-13`, `--max-gap-days 5`, dev account-1 market-data keys |
+| 2 | `split-table` | Judges every split listed by Alpaca or FMP (FMP splits calendar, cached) against prices; rule set in `ba2_providers/ohlcv/alpaca_history/split_table.py` | -> `<cache>/AlpacaHistoryOHLCVProvider/_meta/split_table.json`, `split_accepted.csv`, `split_review.csv`, `split_vs_fmp.csv` |
+| 3 | `build` | Applies the table (prices / factor, volume x factor), New York-naive dates, 5-min regular session only, same files and columns as the FMP cache | -> `<cache>/AlpacaHistoryOHLCVProvider/<SYM>_1d.parquet`, `<SYM>_5min.parquet`, `_meta/build_manifest.json` |
+| 4 | `verify` | Coverage per symbol-year, 5-min last close vs daily close, comparison with the FMP cache | -> report |
+
+Rules to know:
+- **Same `--end` on every resume** of the download, or every daily file is fetched again. The download refuses
+  an end after today 00:00 UTC (no unfinished day is ever stored). Never mix stores with a different `asof`
+  (the ticker-mapping date: a renamed company's history sits under its current symbol).
+- An intraday symbol-year missing at most 5 traded days is stored with the days listed
+  (`days_without_intraday_bars`, kept empty by the build); more is refused. Zero-trade daily bars are Alpaca
+  placeholders and expect no intraday bars.
+- Adjusted: splits, reverse splits, same-symbol unit splits, stock dividends. Not adjusted: cash dividends,
+  spin-offs (FMP's `close` convention).
+- Split decision, per event with factor f: proven by the raw overnight jump (within x1.15 of f, |ln f| >= ln 1.25)
+  or by the **FMP step** (FMP adjusted close / Alpaca raw close steps by f within 2% across the date: the market
+  move cancels out, so it measures exactly what FMP applied). Small factors only when both vendors list them.
+  Undecided events are NOT applied and land in `split_review.csv`; owner decisions go in
+  `ba2_providers/ohlcv/alpaca_history/split_overrides.json` (a `pending` reviewer refuses the run).
+- Vendor list defects this guards against: Alpaca lists spurious events (HON, NVS, IR, DRS) and misses splits (KOD,
+  UHAL, SNX, RTX); FMP has CRWD mixed basis, META before 2022-06, and adjusts spin-offs (HON, IAC).
+
+Why the switch (measured 2026-10-20 on the 4,465 screener-panel symbols with data, 2020-2025): days with 5-min
+bars FMP 84% / 93% / 97% vs Alpaca 94% / 97% / 98% (2020 / 2023 / 2025); symbols whose 5-min close misses the same
+vendor's daily close by > 2% on > 50% of days (wrong split basis, e.g. AMC x5/x10): FMP 144 (435 symbol-years),
+Alpaca 0. The free Alpaca plan only refuses SIP data from the last 15 minutes, so finished-session history is the
+full SIP tape.
+
+Runs of record:
+
+| Date | Step | Result |
+|---|---|---|
+| 2026-10-13..16 | download (`alpaca_store`) | 7,048 symbols, 0 failed, 232 refused chunks, 7.6 GB |
+| 2026-10-20 | download (`alpaca_store_daily2016`) | 11,621 symbols: 7,984 written, 3,767 empty (funds/OTC without Alpaca bars), 0 failed, 12,075 requests, 425 MB, 1 h 31 min |
+| 2026-10-20 | split-table (raw jump only) | 7,854 symbols, 1,620 events accepted, 2,311 review rows; superseded by the FMP-step run |
+
 ### 4.1 Equity (goal2020 and single equity backtests)
 
 | Step | Command | Notes |
@@ -542,6 +592,7 @@ recovers. So:
 | Option engine fixes, **2026-09-24/25** (`3b3465c8`, TEST 0089) | Split-crossing lots, DD refinement, option activity stepping, the <2-trade loophole. **Every option grid result before them is void.** |
 | Option fitness family | `option_consistent_annual_return`, `option_car_over_risk`, `option_car_target`, `option_car_target_soft30` and `option_convex` are mutually incomparable |
 | FMPRating window | Starts 2022; never mix it with full-window rows in per-year comparisons |
+| OHLCV history source fmp -> alpaca, **2026-10-20** (§4.0) | Equity jobs stamp `ohlcv_history_source`; a row without the stamp ran on the FMP cache. Different price history, so never compare across it |
 
 ### 6.4 Determinism caveats
 

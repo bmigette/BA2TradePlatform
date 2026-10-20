@@ -101,9 +101,15 @@ Steps: failing tests for each branch above (synthetic frames) -> implement -> pa
 `CACHE_FOLDER/AlpacaHistoryOHLCVProvider/_meta/split_table.json` (`{symbol: [[date, factor], ...]}` + store asof +
 sha256 of inputs) and `_meta/split_review.csv` -> commit.
 
-### Task 4: Cache builder
-**Files:** Create `.../alpaca_history/build.py`, `tools/build_alpaca_history_cache.py`; Test
-`packages/providers/tests/test_alpaca_history_build.py`.
+> **Owner rule (2026-10-20): one pipeline, one runbook.** Every step is a `--steps` step of ONE CLI,
+> `tools/prepare_alpaca_history.py` (`download`, `split-table`, `build`, `verify`; pattern
+> `tools/prepare_option_universe.py`), documented in `docs/REPRODUCE-BACKTESTS.md` §4.0. No standalone tools, no
+> separate runbook, no scratchpad-only measurement: the 2026-10-20 FMP-vs-Alpaca comparison
+> (`compare_fmp_alpaca.py`) becomes the `verify` step.
+
+### Task 4: Cache builder (pipeline steps `download`, `build`, `verify`)
+**Files:** Create `.../alpaca_history/build.py`, `.../alpaca_history/verify.py`; extend `tools/prepare_alpaca_history.py`;
+Test `packages/providers/tests/test_alpaca_history_build.py`.
 - `adjust(frame, events)`: cumulative factor F(t) = product of f over events with date > t; prices / F, volume * F.
 - `to_native_daily(store_daily)` / `to_native_5min(store_5min_years, manifest)`: UTC -> America/New_York naive;
   5-min keeps 09:30 <= start <= 15:55; columns `Date, Open, High, Low, Close, Volume, effective_date`.
