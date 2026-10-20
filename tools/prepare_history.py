@@ -1,10 +1,16 @@
 #!/usr/bin/env python
-"""Prepare the Alpaca history data for backtests: ONE pipeline CLI, ONE report.
+"""Prepare the history data for backtests, per vendor: ONE pipeline CLI, ONE report per source.
 
 Runbook: docs/REPRODUCE-BACKTESTS.md section 4 (data preparation).  Modelled on tools/prepare_option_universe.py: named
 steps, ``--steps`` / ``--from-step``, ``--dry-run``, a JSON report, exit codes 0 / 1 / 2.
 
-STEPS (in this order; later tasks add download, build and verify)
+REQUIRED ``--source {alpaca,fmp}``.  Steps valid per source (in this order):
+    alpaca: download, split-table, build, verify        fmp: download, verify
+  IMPLEMENTED today: alpaca / split-table ONLY.  Every other valid step (and the default "all steps") refuses with
+  "not implemented yet (plan Task 4)", exit 2, before anything runs; a step that is not valid for the source also refuses
+  (exit 2).  Never a silent no-op.
+
+STEP alpaca / split-table
   split-table   Judge every Alpaca / FMP split candidate by the raw price jump (and FMP's adjusted-close step) and write
                 our verified split table.  All rules, verdict codes, inputs and output columns are documented in the module
                 docstring of ``ba2_providers/ohlcv/alpaca_history/split_table.py``; the logic lives there, this file only
@@ -14,18 +20,18 @@ STEPS (in this order; later tasks add download, build and verify)
                 split_accepted.csv, split_vs_fmp.csv.
 
 FULL COMMAND (the defaults are the production paths; every path is overridable)
-    python tools/prepare_alpaca_history.py --steps split-table \
+    python tools/prepare_history.py --source alpaca --steps split-table \
         --store ~/Documents/ba2/alpaca_store_daily2016 \
         --out ~/Documents/ba2/common/cache/AlpacaHistoryOHLCVProvider \
         --fmp-daily-dir ~/Documents/ba2/common/cache/FMPOHLCVProvider \
         --db ~/Documents/ba2/trade/db.sqlite --fmp-from 2016-01-01 --fmp-to 2026-10-13
 RE-RUN OFFLINE (identical command: every calendar window is in the cache, so the FMP key is never read and no request is
 made; the result is byte-identical for identical inputs)
-    python tools/prepare_alpaca_history.py --steps split-table
+    python tools/prepare_history.py --source alpaca --steps split-table
 QUICK SUBSET   add ``--symbols AAPL,NVDA,TSLA``.   PLAN ONLY   add ``--dry-run`` (checks the inputs and the overrides
 file, writes nothing).
 
-REPORT.  ``<report-dir>/prepare_report.json`` (default report dir = ``<out>/_meta``): per step its status, elapsed
+REPORT.  ``<report-dir>/prepare_history_<source>_report.json`` (default report dir = ``<out>/_meta``): per step its status, elapsed
 seconds, and result (symbols judged, accepted events, review rows, the verdict counters, the comparison with FMP's calendar
 by class with up to 10 examples each, the FMP daily files used) -- or the error that stopped it.
 
@@ -43,15 +49,18 @@ from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STEPS = ("split-table",)
+SOURCE_STEPS = {"alpaca": ("download", "split-table", "build", "verify"), "fmp": ("download", "verify")}
+IMPLEMENTED = {("alpaca", "split-table")}
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
 
 
 def build_parser() -> argparse.ArgumentParser:
     from ba2_providers.ohlcv.alpaca_history import split_table as st
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--steps", help=f"comma list of steps to run (default: all). Steps: {', '.join(STEPS)}")
-    ap.add_argument("--from-step", choices=STEPS, help="run this step and every later one")
+    ap.add_argument("--source", required=True, choices=sorted(SOURCE_STEPS), help="the vendor whose history to prepare")
+    ap.add_argument("--steps", help="comma list of steps to run (default: every step of the source). Steps: "
+                    + "; ".join(f"{k}: {', '.join(v)}" for k, v in SOURCE_STEPS.items()))
+    ap.add_argument("--from-step", help="run this step and every later one of the source")
     ap.add_argument("--dry-run", action="store_true", help="check the inputs and the overrides, write nothing")
     ap.add_argument("--store", default=st.DEFAULT_STORE, help="raw Alpaca daily store (default: %(default)s)")
     ap.add_argument("--out", default=st.DEFAULT_OUT, help="cache folder; outputs under <out>/_meta (default: %(default)s)")
@@ -111,7 +120,7 @@ def plan_split_table(a: argparse.Namespace) -> List[str]:
 
 
 RUNNERS: Dict[str, Callable[[argparse.Namespace, Callable[[str], None]], Dict[str, Any]]] = {"split-table": step_split_table}
-PLANNERS: Dict[str, Callable[[argparse.Namespace], List[str]]] = {"split-table": plan_split_table}
+PLANNERS: Dict[str, Callable[[argparse.Namespace], List[str]]] = {"split-table": plan_split_table}   # alpaca only
 
 
 def main(argv: Optional[List[str]] = None, *, log: Optional[Callable[[str], None]] = None) -> int:
@@ -120,20 +129,31 @@ def main(argv: Optional[List[str]] = None, *, log: Optional[Callable[[str], None
     except SystemExit as e:
         return EXIT_CONFIG if e.code else EXIT_OK
     log = log or (lambda m: print(f"[{datetime.now():%H:%M:%S}] {m}", file=sys.stderr, flush=True))
+    valid = SOURCE_STEPS[a.source]
     if a.steps and a.from_step:
         print("pass --steps or --from-step, not both", file=sys.stderr)
         return EXIT_CONFIG
     if a.steps:
-        want = [s.strip() for s in a.steps.split(",") if s.strip()]
-        bad = [s for s in want if s not in STEPS]
+        want = [x.strip() for x in a.steps.split(",") if x.strip()]
+        bad = [x for x in want if x not in valid]
         if bad:
-            print(f"unknown step(s) {bad}; steps: {', '.join(STEPS)}", file=sys.stderr)
+            print(f"step(s) {bad} are not valid for --source {a.source}; valid: {', '.join(valid)}", file=sys.stderr)
             return EXIT_CONFIG
-        steps = [s for s in STEPS if s in want]
+        steps = [x for x in valid if x in want]
     elif a.from_step:
-        steps = list(STEPS[STEPS.index(a.from_step):])
+        if a.from_step not in valid:
+            print(f"--from-step {a.from_step!r} is not valid for --source {a.source}; valid: {', '.join(valid)}",
+                  file=sys.stderr)
+            return EXIT_CONFIG
+        steps = list(valid[valid.index(a.from_step):])
     else:
-        steps = list(STEPS)
+        steps = list(valid)
+    todo = [x for x in steps if (a.source, x) not in IMPLEMENTED]
+    if todo:
+        done = ", ".join(f"{src}/{st_}" for src, st_ in sorted(IMPLEMENTED))
+        print(f"step(s) {todo} of --source {a.source}: not implemented yet (plan Task 4); nothing was run. "
+              f"Implemented: {done}", file=sys.stderr)
+        return EXIT_CONFIG
     try:
         date.fromisoformat(a.fmp_from), date.fromisoformat(a.fmp_to)
     except ValueError as e:
@@ -154,7 +174,7 @@ def main(argv: Optional[List[str]] = None, *, log: Optional[Callable[[str], None
             return EXIT_CONFIG
         return EXIT_OK
 
-    report_path = os.path.join(a.report_dir or os.path.join(a.out, "_meta"), "prepare_report.json")
+    report_path = os.path.join(a.report_dir or os.path.join(a.out, "_meta"), f"prepare_history_{a.source}_report.json")
     report: Dict[str, Any] = {"started": datetime.now().isoformat(timespec="seconds"), "argv": argv if argv is not None
                               else sys.argv[1:], "steps": []}
     code = EXIT_OK

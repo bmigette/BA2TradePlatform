@@ -290,8 +290,8 @@ def test_splits_by_symbol_layout():
 def _cli():
     import importlib.util
     import pathlib
-    path = pathlib.Path(__file__).resolve().parents[3] / "tools" / "prepare_alpaca_history.py"
-    spec = importlib.util.spec_from_file_location("prepare_alpaca_history", path)
+    path = pathlib.Path(__file__).resolve().parents[3] / "tools" / "prepare_history.py"
+    spec = importlib.util.spec_from_file_location("prepare_history", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -321,16 +321,32 @@ def test_fmp_calendar_windows_split_when_full_cache_and_check_dates(tmp_path):
 def test_pipeline_refuses_a_pending_override(tmp_path, capsys):
     cli = _cli()
     p = write_ov(tmp_path, [ov("reject", reviewed_by="pending")])
-    assert cli.main(["--overrides", p, "--out", str(tmp_path / "out")]) == 2
+    assert cli.main(["--source", "alpaca", "--steps", "split-table", "--overrides", p, "--out", str(tmp_path / "out")]) == 2
     assert "pending" in capsys.readouterr().err
-    assert cli.main(["--overrides", p, "--out", str(tmp_path / "out"), "--dry-run"]) == 2
+    assert cli.main(["--source", "alpaca", "--steps", "split-table", "--overrides", p, "--out", str(tmp_path / "out"), "--dry-run"]) == 2
 
 
-def test_pipeline_step_selection_errors(tmp_path):
+def test_pipeline_source_and_step_validation(tmp_path, capsys):
     cli = _cli()
-    assert cli.main(["--steps", "nope"]) == 2
-    assert cli.main(["--steps", "split-table", "--from-step", "split-table"]) == 2
-    assert cli.main(["--fmp-from", "yesterday"]) == 2
+    base = ["--out", str(tmp_path / "out")]
+    assert cli.main(base) == 2                                                    # --source is required
+    assert cli.main(["--source", "yahoo"] + base) == 2
+    assert cli.main(["--source", "alpaca", "--steps", "nope"] + base) == 2
+    assert "not valid for --source alpaca" in capsys.readouterr().err
+    assert cli.main(["--source", "fmp", "--steps", "split-table"] + base) == 2    # valid only for alpaca
+    assert "not valid for --source fmp" in capsys.readouterr().err
+    assert cli.main(["--source", "fmp", "--from-step", "build"] + base) == 2
+    assert cli.main(["--source", "alpaca", "--steps", "split-table", "--from-step", "split-table"] + base) == 2
+    assert cli.main(["--source", "alpaca", "--steps", "split-table", "--fmp-from", "yesterday"] + base) == 2
+    # valid but not implemented: refuse loudly, run nothing, write nothing
+    for src, step in (("alpaca", "download"), ("alpaca", "build"), ("alpaca", "verify"), ("fmp", "download"),
+                      ("fmp", "verify")):
+        assert cli.main(["--source", src, "--steps", step] + base) == 2
+        assert "not implemented yet (plan Task 4)" in capsys.readouterr().err
+    assert cli.main(["--source", "alpaca", "--steps", "split-table,build"] + base) == 2   # one unimplemented step refuses all
+    assert cli.main(["--source", "alpaca"] + base) == 2                           # default = every step: refuses
+    assert cli.main(["--source", "fmp", "--dry-run"] + base) == 2
+    assert not (tmp_path / "out").exists()
 
 
 def test_pipeline_end_to_end_on_a_tiny_store_is_offline_and_reproducible(tmp_path):
@@ -354,7 +370,7 @@ def test_pipeline_end_to_end_on_a_tiny_store_is_offline_and_reproducible(tmp_pat
     (cal / "2021-01-01_2021-01-30.json").write_text("[]", encoding="utf-8")
     (cal / "2021-01-31_2021-03-01.json").write_text("[]", encoding="utf-8")
     (cal / "2021-03-02_2021-03-31.json").write_text("[]", encoding="utf-8")
-    argv = ["--store", str(store), "--out", str(out), "--fmp-daily-dir", str(fmpd), "--db", str(tmp_path / "no.db"),
+    argv = ["--source", "alpaca", "--steps", "split-table", "--store", str(store), "--out", str(out), "--fmp-daily-dir", str(fmpd), "--db", str(tmp_path / "no.db"),
             "--fmp-from", "2021-01-01", "--fmp-to", "2021-03-31"]
     cli = _cli()
     assert cli.main(argv + ["--dry-run"]) == 0 and not (out / "_meta" / "split_table.json").exists()
@@ -365,7 +381,7 @@ def test_pipeline_end_to_end_on_a_tiny_store_is_offline_and_reproducible(tmp_pat
     assert list(acc["symbol"]) == ["NA"] and acc["fmp_step"][0].endswith("equals_f")
     first = (out / "_meta" / "split_table.json").read_bytes()
     assert cli.main(argv) == 0 and (out / "_meta" / "split_table.json").read_bytes() == first
-    report = json.loads((out / "_meta" / "prepare_report.json").read_text(encoding="utf-8"))
+    report = json.loads((out / "_meta" / "prepare_history_alpaca_report.json").read_text(encoding="utf-8"))
     assert report["steps"][0]["status"] == "ok"
 
 

@@ -3,7 +3,7 @@
 Runbook: docs/REPRODUCE-BACKTESTS.md section 4 (data preparation).  Run it through the pipeline CLI, step ``split-table``
 (offline once the FMP calendar windows are cached):
 
-    python tools/prepare_alpaca_history.py --steps split-table
+    python tools/prepare_history.py --source alpaca --steps split-table
 
 WHY.  Neither vendor's split list is trusted: Alpaca lists spurious events (HON, NVS, STRR, SNEX, BIP, DRS, IR) and misses
 real ones (KOD, UHAL, SNX, IAC, RTX); FMP has mixed-basis series (CRWD, META before 2022-06).  The bars here are RAW, so a
@@ -864,7 +864,7 @@ def read_csv_frame(path: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# the build: inputs -> <out>/_meta files (run by tools/prepare_alpaca_history.py, step split-table)
+# the build: inputs -> <out>/_meta files (run by tools/prepare_history.py --source alpaca, step split-table)
 # ---------------------------------------------------------------------------
 DEFAULT_STORE = os.path.expanduser("~/Documents/ba2/alpaca_store_daily2016")
 DEFAULT_OUT = os.path.expanduser("~/Documents/ba2/common/cache/AlpacaHistoryOHLCVProvider")
