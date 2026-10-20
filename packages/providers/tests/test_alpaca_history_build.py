@@ -481,3 +481,120 @@ def test_fmp_download_wraps_fetch_cache_and_needs_its_arguments(tmp_path, monkey
     monkeypatch.setattr(ph.subprocess, "run", lambda argv, cwd: type("P", (), {"returncode": 3})())
     with pytest.raises(RuntimeError, match="exited 3"):
         ph.step_fmp_download(a, lambda m: None)
+
+
+# ---------------------------------------------------------------------------
+# the pipeline: market-conditions step (the last step of BOTH sources)
+# ---------------------------------------------------------------------------
+import sys
+
+
+def mc_setup(ph, tmp_path, source="alpaca"):
+    """A cache root with the source's provider folder, a universe file, and the CLI args to run the step on it."""
+    root = tmp_path / "cache"
+    folder = root / ("AlpacaHistoryOHLCVProvider" if source == "alpaca" else "FMPOHLCVProvider")
+    (folder / "_meta").mkdir(parents=True)
+    uni = tmp_path / "uni.txt"
+    uni.write_text("AAA\nBBB\n")
+    flag = "--out" if source == "alpaca" else "--fmp-daily-dir"
+    other = ["--out", str(tmp_path / "out")] if source == "fmp" else []
+    argv = ["--source", source, flag, str(folder), *other, "--mc-cache-root", str(root), "--universe-file", str(uni),
+            "--start", "2024-06-03", "--end", "2024-06-28", "--report-dir", str(tmp_path / "rep"), "--workers", "3"]
+    return argv, root
+
+
+class FakeWarm:
+    """Stands in for tools/warm_market_conditions.py: records every argv, prints what the real CLI prints."""
+
+    def __init__(self, fail=None):
+        self.calls, self.fail = [], fail
+
+    def main(self, argv):
+        self.calls.append(list(argv))
+        cmd = argv[0]
+        profile = argv[argv.index("--profile") + 1] if "--profile" in argv else None
+        if profile is None and "--plan" in argv:
+            profile = os.path.basename(argv[argv.index("--plan") + 1]).split(".")[1]
+        if self.fail == (cmd, profile):
+            print("something is missing", file=sys.stderr if cmd == "build" else sys.stdout)
+            return 1
+        if cmd == "build":
+            print(json.dumps({"ok": True}), file=sys.stderr)
+            print("d" * 8 + profile)                   # --print-digest: the digest and nothing else on stdout
+        else:
+            print(json.dumps({"ok": True}))
+        return 0
+
+
+def test_market_conditions_is_the_last_step_of_both_sources(tmp_path):
+    ph = load_prepare_history()
+    assert ph.SOURCE_STEPS["alpaca"][-1] == "market-conditions" and ph.SOURCE_STEPS["fmp"][-1] == "market-conditions"
+    assert ph.SOURCE_STEPS["alpaca"] == ("download", "split-table", "build", "verify", "market-conditions")
+    assert ph.SOURCE_STEPS["fmp"] == ("download", "verify", "market-conditions")
+
+
+@pytest.mark.parametrize("source", ["alpaca", "fmp"])
+def test_market_conditions_is_refused_without_universe_start_and_end(tmp_path, source, capsys):
+    ph = load_prepare_history()
+    argv, _root = mc_setup(ph, tmp_path, source)
+    for name in ("--universe-file", "--start", "--end"):
+        i = argv.index(name)
+        cut = argv[:i] + argv[i + 2:]
+        assert ph.main([*cut, "--steps", "market-conditions"]) == ph.EXIT_CONFIG, name
+        assert name in capsys.readouterr().err
+        assert not (tmp_path / "rep").exists()                      # refused before anything ran
+
+
+def test_market_conditions_refuses_a_cache_that_is_not_the_one_the_warm_tool_reads(tmp_path, capsys):
+    ph = load_prepare_history()
+    argv, root = mc_setup(ph, tmp_path)
+    argv[argv.index("--out") + 1] = str(tmp_path / "elsewhere")
+    assert ph.main([*argv, "--steps", "market-conditions"]) == ph.EXIT_CONFIG
+    assert "--mc-cache-root" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("source", ["alpaca", "fmp"])
+def test_market_conditions_runs_plan_build_verify_prepare_host_for_both_profiles_and_records_digests(
+        tmp_path, monkeypatch, source):
+    ph = load_prepare_history()
+    argv, root = mc_setup(ph, tmp_path, source)
+    warm = FakeWarm()
+    monkeypatch.setattr(ph, "_load_warm", lambda: warm)
+    assert ph.main([*argv, "--steps", "market-conditions"]) == ph.EXIT_OK
+    assert [c[0] for c in warm.calls] == ["plan", "build", "verify", "prepare-host"] * 2
+    for c in warm.calls:                                            # the vendor is stated on EVERY call, nothing defaulted
+        assert c[c.index("--ohlcv-history-source") + 1] == source and c[c.index("--cache-root") + 1] == str(root)
+    plan0 = warm.calls[0]
+    assert plan0[plan0.index("--profile") + 1] == "ohlcv-v1" and plan0[plan0.index("--start") + 1] == "2024-06-03"
+    assert plan0[plan0.index("--end") + 1] == "2024-06-28" and plan0[plan0.index("--universe-file") + 1].endswith("uni.txt")
+    assert "--cache-only" in warm.calls[1] and "--fetch-missing" not in warm.calls[1] and "--print-digest" in warm.calls[1]
+    assert warm.calls[2][warm.calls[2].index("--manifest") + 1] == "ddddddddohlcv-v1"
+    prep = warm.calls[7]
+    assert prep[prep.index("--profile") + 1] == "ta-structure-v1" and prep[prep.index("--jobs") + 1] == "3"
+    report = json.loads((tmp_path / "rep" / f"prepare_history_{source}_report.json").read_text())
+    res = report["steps"][-1]["result"]
+    assert report["steps"][-1]["step"] == "market-conditions" and report["steps"][-1]["status"] == "ok"
+    assert res["digests"] == {"ohlcv-v1": "ddddddddohlcv-v1", "ta-structure-v1": "ddddddddta-structure-v1"}
+
+
+def test_market_conditions_exit_is_nonzero_when_any_profile_fails_but_both_are_reported(tmp_path, monkeypatch):
+    ph = load_prepare_history()
+    argv, _root = mc_setup(ph, tmp_path)
+    warm = FakeWarm(fail=("plan", "ohlcv-v1"))      # the second profile must still run and be reported
+    monkeypatch.setattr(ph, "_load_warm", lambda: warm)
+    assert ph.main([*argv, "--steps", "market-conditions"]) == ph.EXIT_FAILED
+    assert [c[0] for c in warm.calls] == ["plan", "plan", "build", "verify", "prepare-host"]
+    entry = json.loads((tmp_path / "rep" / "prepare_history_alpaca_report.json").read_text())["steps"][-1]
+    assert entry["status"] == "failed" and "ohlcv-v1 at plan" in entry["error"]
+    res = entry["result"]
+    assert res["digests"] == {"ohlcv-v1": None, "ta-structure-v1": "ddddddddta-structure-v1"}
+    assert res["profiles"]["ohlcv-v1"]["failed"] == "plan" and "failed" not in res["profiles"]["ta-structure-v1"]
+
+
+def test_market_conditions_dry_run_lists_the_eight_commands_and_writes_nothing(tmp_path, capsys):
+    ph = load_prepare_history()
+    argv, _root = mc_setup(ph, tmp_path)
+    assert ph.main([*argv, "--steps", "market-conditions", "--dry-run"]) == ph.EXIT_OK
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("market-conditions:")]
+    assert len(lines) == 8 and all("--ohlcv-history-source alpaca" in ln for ln in lines)
+    assert not (tmp_path / "rep").exists()

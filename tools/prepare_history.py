@@ -5,7 +5,7 @@ Runbook: docs/REPRODUCE-BACKTESTS.md section 4 (data preparation).  Modelled on 
 steps, ``--steps`` / ``--from-step``, ``--dry-run``, a JSON report, exit codes 0 / 1 / 2.
 
 REQUIRED ``--source {alpaca,fmp}``.  Steps valid per source (in this order):
-    alpaca: download, split-table, build, verify        fmp: download, verify
+    alpaca: download, split-table, build, verify, market-conditions        fmp: download, verify, market-conditions
   Every step is implemented.  A step that is not valid for the source refuses (exit 2).  Never a silent no-op.  The default
   (no ``--steps``) runs EVERY step of the source, ``download`` first: it makes network requests (alpaca: resume-safe, ~0 requests
   over complete stores) -- pass ``--steps`` to run less.
@@ -49,6 +49,19 @@ STEP fmp / download
                     python testplatform/ba2test_launcher.py fetch-cache --provider fmp --timeframes 5min,1d --start <fmp-start>                         --end <fmp-end> --symbols @<fmp-symbols-file> --workers <fmp-workers, default 5>
                 The FMP key is read by ba2-test as everywhere else.  Non-zero exit of fetch-cache fails the step.
     python tools/prepare_history.py --source fmp --steps download --fmp-symbols-file universe.txt --fmp-start 2020-01-01 --fmp-end 2025-12-31
+
+STEP alpaca|fmp / market-conditions
+  market-conditions   The LAST step: warms, verifies and prepares the market-condition feature snapshots on this source's cache.
+                For BOTH profiles (``ohlcv-v1``, ``ta-structure-v1``) it runs ``tools/warm_market_conditions.py`` ``plan`` -> ``build
+                --cache-only`` -> ``verify`` -> ``prepare-host`` with ``--ohlcv-history-source <source>`` (alpaca / fmp), over
+                ``--universe-file`` and the decision window ``--start`` / ``--end`` (ALL THREE REQUIRED: the step is refused, exit 2,
+                without them).  It never fetches (the caches are built by the earlier steps).  The price folder the warm tool reads is
+                ``<--mc-cache-root>/AlpacaHistoryOHLCVProvider`` (alpaca) or ``.../FMPOHLCVProvider`` (fmp), default ``--mc-cache-root``
+                = the platform CACHE_FOLDER; ``--out`` (alpaca) / ``--fmp-daily-dir`` (fmp) must be that same folder or the step refuses.
+                The JSON report records, per profile, the manifest digest and the plan / build / verify / prepare-host outcome; the step
+                (and the run) exits 1 when ANY profile fails.  Digests differ per source and per host (runbook 4.3).
+    python tools/prepare_history.py --source alpaca --steps market-conditions \
+        --universe-file tools/options_universe_top100.txt --start 2020-01-02 --end 2025-12-31
 
 STEP alpaca / split-table
   split-table   Judge every Alpaca / FMP split candidate by the raw price jump (and FMP's adjusted-close step) and write
@@ -94,7 +107,9 @@ from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOURCE_STEPS = {"alpaca": ("download", "split-table", "build", "verify"), "fmp": ("download", "verify")}
+SOURCE_STEPS = {"alpaca": ("download", "split-table", "build", "verify", "market-conditions"),
+                "fmp": ("download", "verify", "market-conditions")}
+MC_PROFILES = ("ohlcv-v1", "ta-structure-v1")
 SPINCO_SYMBOLS_FILE = "symbols_spinco_20261020.txt"       # in the daily store: spin-off companies fetched by hand on 2026-10-20
 SPINCO_MISSING_FILE = "spinco_symbols_missing.txt"        # <out>/_meta, written by the split-table step
 DOWNLOAD_END = "2026-10-13"                                # first day NOT fetched (the stores' asof is the day before)
@@ -150,6 +165,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--refresh-yahoo", action="store_true",
                     help="fetch Yahoo again: split-table (rule-B split history, default: use <out>/_meta/yahoo_splits) and verify (daily closes, default: use <report>/verify/yahoo_daily)")
     ap.add_argument("--overrides", default=st.OVERRIDES_PATH, help="reviewed split overrides (default: %(default)s)")
+    ap.add_argument("--universe-file", help="market-conditions: universe file, one symbol per line (REQUIRED for that step)")
+    ap.add_argument("--start", help="market-conditions: first DECISION session, ISO date (REQUIRED for that step)")
+    ap.add_argument("--end", help="market-conditions: last DECISION session, ISO date, a COMPLETED session (REQUIRED for that step)")
+    ap.add_argument("--mc-cache-root", help="market-conditions: CACHE_FOLDER holding the provider folders and market_conditions/ "
+                    "(default: the platform CACHE_FOLDER; the step refuses an --out / --fmp-daily-dir that is not inside it)")
     ap.add_argument("--report-dir", help="where prepare_history_<source>_report.json goes (default: <out>/_meta)")
     return ap
 
@@ -371,12 +391,121 @@ def plan_verify(a: argparse.Namespace) -> List[str]:
     return [f"verify: would read {cache} (other vendor: {other}) years {a.verify_years}, write the check CSVs under {out_dir}"]
 
 
+def _load_warm():
+    """tools/warm_market_conditions.py as a module (a script beside this file, not a package); the seam tests replace."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "warm_market_conditions.py")
+    spec = importlib.util.spec_from_file_location("warm_market_conditions", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def mc_inputs(a: argparse.Namespace) -> Tuple[str, str, str, str, str]:
+    """(universe file, start, end, cache root, price folder) of the market-conditions step, or ValueError (a config error)."""
+    from ba2_common.core.market_condition_source import provider_dir_for_source_profile, source_profile_for_history
+    missing = [n for n, v in (("--universe-file", a.universe_file), ("--start", a.start), ("--end", a.end)) if not v]
+    if missing:
+        raise ValueError(f"market-conditions needs {', '.join(missing)} (the universe and the decision window are the operator's)")
+    if date.fromisoformat(a.end) < date.fromisoformat(a.start):
+        raise ValueError(f"--end {a.end} is before --start {a.start}")
+    if not os.path.isfile(a.universe_file):
+        raise FileNotFoundError(f"--universe-file not found: {a.universe_file}")
+    if a.mc_cache_root:
+        root = os.path.abspath(a.mc_cache_root)
+    else:
+        from ba2_common import config
+        root = os.path.abspath(config.CACHE_FOLDER)
+    folder = os.path.join(root, provider_dir_for_source_profile(source_profile_for_history(a.source)))
+    have = a.out if a.source == "alpaca" else a.fmp_daily_dir
+    if os.path.normcase(os.path.abspath(have)) != os.path.normcase(folder):
+        raise ValueError(f"market-conditions would read {folder} but the {'--out' if a.source == 'alpaca' else '--fmp-daily-dir'} "
+                         f"cache is {have}: pass --mc-cache-root so both name the same folder")
+    return a.universe_file, a.start, a.end, root, folder
+
+
+class StepFailed(RuntimeError):
+    """A step that failed but has a result worth reporting (``result``)."""
+
+    def __init__(self, message: str, result: Dict[str, Any]):
+        super().__init__(message)
+        self.result = result
+
+
+def mc_commands(a: argparse.Namespace, profile: str, plan_path: str, digest: str = "<digest>") -> List[List[str]]:
+    """The four warm_market_conditions argv lists (without the program) of one profile; runbook 4.3 in code."""
+    universe, start, end, root, _folder = mc_inputs(a)
+    hs = ["--ohlcv-history-source", a.source, "--cache-root", root, "--quiet"]
+    return [["plan", "--profile", profile, "--universe-file", universe, "--start", start, "--end", end, "--out", plan_path, *hs],
+            ["build", "--plan", plan_path, "--cache-only", "--print-digest", *hs],
+            ["verify", "--manifest", digest, *hs],
+            ["prepare-host", "--manifest", digest, "--profile", profile, "--jobs", str(a.workers), *hs]]
+
+
+def _run_warm(warm, argv: List[str]) -> Tuple[int, str, str]:
+    """warm.main(argv) in-process; (exit code, stdout, stderr)."""
+    import contextlib
+    import io
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = warm.main(argv)
+    return code, out.getvalue(), err.getvalue()
+
+
+def step_market_conditions(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, Any]:
+    mc_inputs(a)                                              # validates; a ValueError here is a failed step, not a silent skip
+    warm = _load_warm()
+    plan_dir = os.path.join(a.report_dir or os.path.join(a.out, "_meta"), "market_conditions")
+    os.makedirs(plan_dir, exist_ok=True)
+    profiles: Dict[str, Dict[str, Any]] = {}
+    for profile in MC_PROFILES:
+        plan_path = os.path.join(plan_dir, f"plan.{profile}.{a.source}.json")
+        res: Dict[str, Any] = {"plan": plan_path, "digest": None}
+        profiles[profile] = res
+        digest = "<digest>"
+        for i, name in enumerate(("plan", "build", "verify", "prepare-host")):
+            argv = mc_commands(a, profile, plan_path, digest)[i]
+            log(f"market-conditions {profile}: warm_market_conditions.py {' '.join(argv)}")
+            code, out, err = _run_warm(warm, argv)
+            res[name] = {"exit_code": code}
+            if name == "build" and code == 0:
+                lines = [ln for ln in out.splitlines() if ln.strip()]
+                digest = lines[-1].strip() if lines else ""
+                if not digest:
+                    res[name]["error"] = "build published no manifest digest"
+                    code = 1
+                res["digest"] = digest or None
+            if code != 0:
+                tail = (out if name != "build" else err).strip()
+                res[name]["output"] = tail[-4000:]
+                res["failed"] = name
+                print(f"market-conditions {profile}: {name} FAILED (exit {code}): {tail[-2000:]}", file=sys.stderr)
+                break                                         # the next profile still runs: a report with BOTH outcomes
+    failed = {p: r["failed"] for p, r in profiles.items() if "failed" in r}
+    result = {"source": a.source, "universe_file": a.universe_file, "start": a.start, "end": a.end,
+              "digests": {p: r["digest"] for p, r in profiles.items()}, "profiles": profiles}
+    for p, r in profiles.items():
+        print(f"  {p}: digest {r['digest']}" + (f"  FAILED at {r['failed']}" if "failed" in r else ""))
+    if failed:
+        raise StepFailed("market-conditions FAILED: " + ", ".join(f"{p} at {n}" for p, n in failed.items()), result)
+    return result
+
+
+def plan_market_conditions(a: argparse.Namespace) -> List[str]:
+    lines = []
+    for profile in MC_PROFILES:
+        for argv in mc_commands(a, profile, f"<plan.{profile}.{a.source}.json>"):
+            lines.append("market-conditions: warm_market_conditions.py " + " ".join(argv))
+    return lines
+
+
 RUNNERS: Dict[Tuple[str, str], Callable[[argparse.Namespace, Callable[[str], None]], Dict[str, Any]]] = {
     ("alpaca", "download"): step_alpaca_download, ("alpaca", "split-table"): step_split_table, ("alpaca", "build"): step_build,
-    ("alpaca", "verify"): step_verify, ("fmp", "download"): step_fmp_download, ("fmp", "verify"): step_verify}
+    ("alpaca", "verify"): step_verify, ("fmp", "download"): step_fmp_download, ("fmp", "verify"): step_verify,
+    ("alpaca", "market-conditions"): step_market_conditions, ("fmp", "market-conditions"): step_market_conditions}
 PLANNERS: Dict[Tuple[str, str], Callable[[argparse.Namespace], List[str]]] = {
     ("alpaca", "download"): plan_alpaca_download, ("alpaca", "split-table"): plan_split_table, ("alpaca", "build"): plan_build,
-    ("alpaca", "verify"): plan_verify, ("fmp", "download"): plan_fmp_download, ("fmp", "verify"): plan_verify}
+    ("alpaca", "verify"): plan_verify, ("fmp", "download"): plan_fmp_download, ("fmp", "verify"): plan_verify,
+    ("alpaca", "market-conditions"): plan_market_conditions, ("fmp", "market-conditions"): plan_market_conditions}
 
 
 def main(argv: Optional[List[str]] = None, *, log: Optional[Callable[[str], None]] = None) -> int:
@@ -412,6 +541,13 @@ def main(argv: Optional[List[str]] = None, *, log: Optional[Callable[[str], None
         print(f"bad --fmp-from/--fmp-to: {e}", file=sys.stderr)
         return EXIT_CONFIG
 
+    if "market-conditions" in steps:
+        try:
+            mc_inputs(a)
+        except (ValueError, FileNotFoundError) as e:
+            print(f"REFUSED: step market-conditions: {e}", file=sys.stderr)
+            return EXIT_CONFIG
+
     from ba2_providers.fmp_common import redact
     from ba2_providers.ohlcv.alpaca_history.build import BuildError
     from ba2_providers.ohlcv.alpaca_history.split_table import SplitOverridesPending
@@ -444,6 +580,8 @@ def main(argv: Optional[List[str]] = None, *, log: Optional[Callable[[str], None
         except Exception as e:                                   # a failed step stops the pipeline, named
             # the traceback and message go to the report and stderr REDACTED (a request error can embed the key)
             entry["status"], entry["error"] = "failed", redact(f"{type(e).__name__}: {e}")
+            if isinstance(e, StepFailed):
+                entry["result"] = e.result
             entry["traceback"] = redact(traceback.format_exc())
             print(f"step {s} FAILED: {entry['error']}", file=sys.stderr)
             code = EXIT_FAILED
