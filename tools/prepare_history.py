@@ -349,8 +349,9 @@ def step_verify(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, 
     symbols = [x.strip().upper().replace(".", "-") for x in a.symbols.split(",") if x.strip()] if a.symbols else None
     breaks = ver.load_breaks(os.path.join(a.out, "_meta")) if a.source == "alpaca" else {}
     spinoffs = ver.load_spinoffs(os.path.join(a.out, "_meta")) if a.source == "alpaca" else {}
+    splits = ver.load_splits(os.path.join(a.out, "_meta")) if a.source == "alpaca" else None
     results = ver.run_gate(cache, other=other, out_dir=out_dir, symbols=symbols, panel=panel, years=_years(a.verify_years),
-                           breaks=breaks, spinoffs=spinoffs, workers=a.workers, yahoo=yahoo, yahoo_sample=a.yahoo_sample_size, yahoo_seed=a.yahoo_seed,
+                           breaks=breaks, spinoffs=spinoffs, splits=splits, workers=a.workers, yahoo=yahoo, yahoo_sample=a.yahoo_sample_size, yahoo_seed=a.yahoo_seed,
                            min_coverage=a.min_coverage, max_selfcons_bad=a.max_selfcons_bad, log=log)
     for name, r in results.items():
         print(f"{r['status']:5s} {name}: {json.dumps(r['summary'], default=str)[:1500]}")

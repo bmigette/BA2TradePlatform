@@ -43,7 +43,11 @@ CHECKS (constants below; the coordinator and the owner set the final thresholds)
                    ``spinoff_convention``; a run that touches one of our series breaks (within YAHOO_EVENT_DAYS) is ``series_break``; both are
                    expected and do not count; a run before one of our spin-offs whose ratio ours / Yahoo is within YAHOO_CONVENTION_TOL (10 %) of 1 -- our
                    factor within 10 % of Yahoo's -- or whose FMP / ours ratio is, is ``convention`` (the vendors compute the factor differently;
-                   non-blocking); the remaining runs (``unexplained``) decide PASS / FAIL.  All three groups are reported.
+                   non-blocking); a run whose ratio ours / Yahoo equals, within 0.5 %, the cumulative factor of the events of OUR table
+                   at the run's end (within YAHOO_EVENT_DAYS after it) that Yahoo's own split list lacks (a Yahoo split within +-5 days and 1 % of the factor counts as listed) is
+                   ``yahoo_missing_event``; a run on a Yahoo series answered under a successor ticker (the old folder is a pre-rename duplicate)
+                   whose ratio equals the product of the successor's table events dated after our last bar is ``successor_later_event``; both are
+                   non-blocking and list their event ids (``events`` column); the remaining runs (``unexplained``) decide PASS / FAIL.  All three groups are reported.
   7 readiness      INFORMATIONAL (ED-11): per year the panel symbols with no built daily file / daily bars, or no 5-minute file / 5-minute bars
                    (``readiness.csv``, one row per symbol-year that lacks something).
 """
@@ -78,6 +82,8 @@ YAHOO_OFF_TOL = 0.02
 YAHOO_RUN_DAYS = 20
 YAHOO_EVENT_DAYS = 5              # a mismatch run ending this many calendar days before one of our spin-off dates / breaks is explained by it
 YAHOO_FACTOR_TOL = 0.02
+YAHOO_EVENT_RATIO_TOL = 0.005    # yahoo_missing_event / successor_later_event: the ratio equals the events' factor within 0.5 %
+YAHOO_LISTED_DAYS = 5
 YAHOO_CONVENTION_TOL = 0.10      # spin-off factors of ours and of Yahoo / FMP within 10 %: a convention difference
 DEFAULT_YEARS = tuple(range(2019, 2026))
 RTH_FIRST_MIN = 9 * 60 + 30
@@ -223,14 +229,14 @@ def scan_symbol(args: Tuple[str, str, Optional[str], Tuple[int, ...], Optional[s
 # check 6: Yahoo
 # ---------------------------------------------------------------------------
 def yfinance_daily(ticker: str) -> Optional[pd.DataFrame]:
-    """Yahoo's daily history of ``ticker`` as a frame ``day, Close`` (``auto_adjust=False``: split-adjusted, not dividend-adjusted),
+    """Yahoo's daily history of ``ticker`` as a frame ``day, Close, Splits`` (``auto_adjust=False``: split-adjusted, not dividend-adjusted),
     or None when Yahoo has nothing for it."""
     import yfinance as yf
     h = yf.Ticker(ticker).history(start="2015-12-01", auto_adjust=False)
     if h is None or h.empty:
         return None
     idx = h.index.tz_localize(None) if h.index.tz is None else h.index.tz_convert("America/New_York").tz_localize(None)
-    return pd.DataFrame({"day": idx.normalize(), "Close": h["Close"].values})
+    return pd.DataFrame({"day": idx.normalize(), "Close": h["Close"].values, "Splits": h["Stock Splits"].values})
 
 
 class YahooDaily:
@@ -314,8 +320,34 @@ def classify_run(date_from: str, date_to: str, median_ratio: float, spinoffs: Se
     return "unexplained"
 
 
+def classify_event_run(end_date: str, median_ratio: float, events: Sequence[Tuple[str, float]],
+                       yahoo_splits: Optional[Sequence[Tuple[str, float]]], successor_events: Optional[Sequence[Tuple[str, float]]],
+                       last_bar: pd.Timestamp) -> Tuple[str, str]:
+    """(``yahoo_missing_event`` | ``successor_later_event`` | ``unexplained``, event ids) for a run no other class explains."""
+    end = pd.Timestamp(end_date)
+    if successor_events is not None:                                 # Yahoo answered under a successor ticker
+        later = [(d, f) for d, f in successor_events if pd.Timestamp(d) > last_bar]
+        if later:
+            prod = float(np.prod([f for _, f in later]))
+            if abs(median_ratio / prod - 1) <= YAHOO_EVENT_RATIO_TOL:
+                return "successor_later_event", "; ".join(f"{d} x{f:g}" for d, f in later)
+    if yahoo_splits is not None:
+        missing = []
+        for d, f in events:
+            if end < pd.Timestamp(d) <= end + pd.Timedelta(days=YAHOO_EVENT_DAYS) and not any(abs((pd.Timestamp(yd) - pd.Timestamp(d)).days) <= YAHOO_LISTED_DAYS and abs(yf / f - 1) <= 0.01
+                                                 for yd, yf in yahoo_splits):
+                missing.append((d, f))
+        if missing:
+            prod = float(np.prod([f for _, f in missing]))
+            if abs(median_ratio * prod - 1) <= YAHOO_EVENT_RATIO_TOL:      # ours divided by the factor, Yahoo not
+                return "yahoo_missing_event", "; ".join(f"{d} x{f:g}" for d, f in missing)
+    return "unexplained", ""
+
+
 def compare_yahoo(ours: pd.DataFrame, yahoo: pd.DataFrame, spinoffs: Sequence[Tuple[str, float]] = (),
-                  break_date: Optional[str] = None, fmp: Optional[pd.Series] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+                  break_date: Optional[str] = None, fmp: Optional[pd.Series] = None,
+                  events: Sequence[Tuple[str, float]] = (), yahoo_splits: Optional[Sequence[Tuple[str, float]]] = None,
+                  successor_events: Optional[Sequence[Tuple[str, float]]] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """(per-symbol stats, mismatch runs) of our daily Close vs Yahoo's on common days.  A run is a maximal stretch of consecutive common
     days off by > 0.5 % (cut at each of our spin-off dates), classified by ``classify_run``; the stats count only the unexplained days as
     mismatches (``match_days`` = common days minus unexplained mismatch days)."""
@@ -324,7 +356,8 @@ def compare_yahoo(ours: pd.DataFrame, yahoo: pd.DataFrame, spinoffs: Sequence[Tu
     j = pd.concat([a, y], axis=1, join="inner", keys=["u", "y"]).dropna()
     j = j[(j["u"] > 0) & (j["y"] > 0)]
     stats = {"common_days": len(j), "match_days": 0, "longest_off_run": 0, "spinoff_convention_days": 0, "series_break_days": 0,
-             "convention_days": 0, "unexplained_days": 0}
+             "convention_days": 0, "yahoo_missing_event_days": 0, "successor_later_event_days": 0,
+             "unexplained_days": 0}
     runs: List[Dict[str, Any]] = []
     if not len(j):
         return stats, runs
@@ -349,6 +382,10 @@ def compare_yahoo(ours: pd.DataFrame, yahoo: pd.DataFrame, spinoffs: Sequence[Tu
                 fx = fmp.reindex(a.index[(a.index >= idx[start]) & (a.index <= idx[i - 1])])
                 fr = float((fx / a.reindex(fx.index)).median()) if fx.notna().any() else None
             r["classification"] = classify_run(r["date_from"], r["date_to"], r["median_ratio"], spinoffs, break_date, fr)
+            r["events"] = ""
+            if r["classification"] == "unexplained":
+                r["classification"], r["events"] = classify_event_run(r["date_to"], r["median_ratio"], events, yahoo_splits, successor_events,
+                                                                      a.index.max())
             if r["classification"] != "unexplained":
                 explained[start:i] = True
                 stats[r["classification"] + "_days"] += i - start
@@ -399,6 +436,22 @@ def load_breaks(meta_dir: str) -> Dict[str, str]:
         return {s: max(v) for s, v in json.load(f)["breaks"].items()}
 
 
+def load_splits(meta_dir: str) -> Dict[str, List[Tuple[str, float]]]:
+    p = os.path.join(meta_dir, "split_table.json")
+    if not os.path.isfile(p):
+        return {}
+    with open(p, encoding="utf-8") as f:
+        return {s: [(d, float(v)) for d, v in e] for s, e in json.load(f)["splits"].items()}
+
+
+def yahoo_split_list(ydf: pd.DataFrame) -> Optional[List[Tuple[str, float]]]:
+    """Yahoo's split events from the frame's ``Splits`` column; None for a cache written before that column existed."""
+    if "Splits" not in ydf.columns:
+        return None
+    sp = ydf[(ydf["Splits"] > 0) & (ydf["Splits"] != 1)]
+    return [(str(d.date()), float(v)) for d, v in zip(sp["day"], sp["Splits"])]
+
+
 def load_spinoffs(meta_dir: str) -> Dict[str, List[Tuple[str, float]]]:
     p = os.path.join(meta_dir, "split_table.json")
     if not os.path.isfile(p):
@@ -434,6 +487,7 @@ def resolve_with_yahoo(jump: Any, yahoo: Optional["YahooDaily"]) -> Tuple[str, f
 def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: Optional[Sequence[str]] = None,
              panel: Optional[Iterable[str]] = None, years: Sequence[int] = DEFAULT_YEARS, breaks: Optional[Dict[str, str]] = None,
              workers: int = 4, spinoffs: Optional[Dict[str, List[Tuple[str, float]]]] = None,
+             splits: Optional[Dict[str, List[Tuple[str, float]]]] = None,
              yahoo: Optional[YahooDaily] = None, yahoo_sample: int = YAHOO_SAMPLE, yahoo_seed: int = YAHOO_SEED,
              min_coverage: float = MIN_COVERAGE, max_selfcons_bad: float = MAX_SELFCONS_BAD,
              log: Callable[[str], None] = lambda m: None) -> Dict[str, Dict[str, Any]]:
@@ -589,7 +643,9 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
             fser = None
             if other is not None and os.path.isfile(os.path.join(other, f"{s}_1d.parquet")):
                 fser = _daily_series(pd.read_parquet(os.path.join(other, f"{s}_1d.parquet"), columns=["Date", "Close"]), "Close")
-            stats, rr = compare_yahoo(pd.read_parquet(p1, columns=["Date", "Close"]), ydf, (spinoffs or {}).get(s, ()), brk.get(s), fser)
+            stats, rr = compare_yahoo(pd.read_parquet(p1, columns=["Date", "Close"]), ydf, (spinoffs or {}).get(s, ()), brk.get(s), fser,
+                                    events=(splits or {}).get(s, ()), yahoo_splits=yahoo_split_list(ydf),
+                                    successor_events=(splits or {}).get(note, ()) if note != s and splits is not None else None)
             rows.append({"symbol": s, "yahoo_ticker": note, **stats})
             runs += [{"symbol": s, **r} for r in rr]
             tot += stats["common_days"]
@@ -597,7 +653,7 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
         ys = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["symbol", "yahoo_ticker", "common_days", "match_days", "longest_off_run",
                                                                   "spinoff_convention_days", "series_break_days", "unexplained_days"])
         _csv(ys, os.path.join(out_dir, "yahoo_symbols.csv"))
-        _csv(pd.DataFrame(runs, columns=["symbol", "date_from", "date_to", "days", "median_ratio", "min_ratio", "max_ratio", "days_off_over_2pct", "classification"]),
+        _csv(pd.DataFrame(runs, columns=["symbol", "date_from", "date_to", "days", "median_ratio", "min_ratio", "max_ratio", "days_off_over_2pct", "classification", "events"]),
              os.path.join(out_dir, "yahoo_mismatch_runs.csv"))
         if unknown:
             _csv(pd.DataFrame(unknown), os.path.join(out_dir, "yahoo_unavailable.csv"))
@@ -607,9 +663,9 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
         res["yahoo"] = {"status": STATUS_PASS if ok else STATUS_FAIL, "csv": os.path.join(out_dir, "yahoo_mismatch_runs.csv"),
                         "summary": {"sample": len(sample), "compared": len(ys), "yahoo_unavailable": len(unknown), "common_days": tot,
                                     "match_share": share, "min": YAHOO_MATCH, "sustained_mismatch_symbols": sustained["symbol"].tolist(),
-                                    "runs_by_class": {c: sum(r["classification"] == c for r in runs) for c in ("spinoff_convention", "series_break", "convention", "unexplained")},
-                                    "listed": {c: [{k: r[k] for k in ("symbol", "date_from", "date_to", "days", "median_ratio")} for r in runs if r["classification"] == c][:40]
-                                               for c in ("spinoff_convention", "series_break", "convention", "unexplained")},
+                                    "runs_by_class": {c: sum(r["classification"] == c for r in runs) for c in ("spinoff_convention", "series_break", "convention", "yahoo_missing_event", "successor_later_event", "unexplained")},
+                                    "listed": {c: [{k: r[k] for k in ("symbol", "date_from", "date_to", "days", "median_ratio", "events")} for r in runs if r["classification"] == c][:40]
+                                               for c in ("spinoff_convention", "series_break", "convention", "yahoo_missing_event", "successor_later_event", "unexplained")},
                                     "symbols_with_unexplained_runs": sorted({r["symbol"] for r in runs if r["classification"] == "unexplained"})}}
     else:
         res["yahoo"] = {"status": STATUS_INFO, "summary": {"skipped": "no Yahoo source given"}, "csv": None}

@@ -355,7 +355,8 @@ def test_yahoo_spinoff_convention_run_is_expected_not_a_failure(tmp_path):
     ours = [10.0 / 1.25] * cut + [10.0] * (len(DAYS) - cut)                  # we divided the prices before the spin-off by 1.25
     theirs = [10.0] * len(DAYS)                                              # Yahoo did not
     y = _yahoo_gate(tmp_path, ours, theirs, spinoffs={"AAA": [(str(DAYS[cut].date()), 1.25)]})
-    assert y["status"] == "PASS" and y["summary"]["runs_by_class"] == {"spinoff_convention": 1, "series_break": 0, "convention": 0, "unexplained": 0}
+    assert y["status"] == "PASS" and y["summary"]["runs_by_class"] == {"spinoff_convention": 1, "series_break": 0, "convention": 0, "yahoo_missing_event": 0,
+                                                              "successor_later_event": 0, "unexplained": 0}
     runs = pd.read_csv(tmp_path / "verify" / "yahoo_mismatch_runs.csv")
     assert runs["classification"].tolist() == ["spinoff_convention"] and runs["days"].iloc[0] == cut
     # the same mismatch with a factor we did not apply is unexplained and fails
@@ -427,3 +428,79 @@ def test_yahoo_inputs_csv_records_what_was_used(tmp_path):
     assert row["first_day"] == str(DAYS[0].date()) and row["fetched_at"].endswith("Z")
     import hashlib
     assert row["sha256"] == hashlib.sha256((tmp_path / "yd" / "AAA.parquet").read_bytes()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# yahoo_missing_event / successor_later_event
+# ---------------------------------------------------------------------------
+def _yahoo_frames(frames, splits=None):
+    out = {}
+    for t, closes in frames.items():
+        f = pd.DataFrame({"day": DAYS, "Close": closes})
+        f["Splits"] = 0.0
+        for d, v in (splits or {}).get(t, []):
+            f.loc[f["day"] == pd.Timestamp(d), "Splits"] = v
+        out[t] = f
+    return out
+
+
+def _event_gate(tmp_path, ours, yahoo_closes, events, yahoo_splits, yahoo_ticker=None, table_splits=None, sym="AAA"):
+    cache = tmp_path / "c"
+    put(cache, sym, daily(DAYS, ours), five(DAYS, 10.0))
+    frames = _yahoo_frames({yahoo_ticker or sym: yahoo_closes}, {yahoo_ticker or sym: yahoo_splits})
+    y = ver.YahooDaily(str(tmp_path / "yd"), fetch=lambda t: frames.get(t), sleep=lambda s: None,
+                       successors=lambda s: [yahoo_ticker] if yahoo_ticker else [])
+    table = {sym: events}
+    table.update(table_splits or {})
+    return gate(cache, tmp_path, yahoo=y, symbols=[sym], splits=table)["yahoo"], pd.read_csv(tmp_path / "verify" / "yahoo_mismatch_runs.csv",
+                                                                                             keep_default_na=False)
+
+
+def test_event_our_table_has_and_yahoo_lacks_is_yahoo_missing_event(tmp_path):
+    cut = 40
+    d = str(DAYS[cut].date())
+    ours = [10.0 / 1.05] * cut + [10.0] * (len(DAYS) - cut)                  # we applied a 5 % stock dividend; Yahoo did not
+    y, runs = _event_gate(tmp_path, ours, [10.0] * len(DAYS), [(d, 1.05)], yahoo_splits=[])
+    assert y["status"] == "PASS" and y["summary"]["runs_by_class"]["yahoo_missing_event"] == 1
+    assert runs["classification"].tolist() == ["yahoo_missing_event"] and runs["events"].iloc[0] == f"{d} x1.05"
+
+
+def test_event_yahoo_lists_is_not_missing_and_a_wrong_ratio_is_unexplained(tmp_path):
+    cut = 40
+    d = str(DAYS[cut].date())
+    ours = [10.0 / 1.05] * cut + [10.0] * (len(DAYS) - cut)
+    y, runs = _event_gate(tmp_path / "a", ours, [10.0] * len(DAYS), [(d, 1.05)], yahoo_splits=[(d, 1.05)])      # Yahoo lists it: not "missing"
+    assert y["status"] == "FAIL" and runs["classification"].tolist() == ["unexplained"]
+    y, runs = _event_gate(tmp_path / "b", [10.0 / 1.2] * cut + [10.0] * (len(DAYS) - cut), [10.0] * len(DAYS), [(d, 1.05)], yahoo_splits=[])
+    assert y["status"] == "FAIL" and runs["classification"].tolist() == ["unexplained"]                          # ratio is not 1/1.05
+    ycache = _event_gate(tmp_path / "c", ours, [10.0] * len(DAYS), [(d, 1.05)], yahoo_splits=[])[0]
+    assert ycache["status"] == "PASS"
+
+
+def test_old_yahoo_cache_without_a_split_list_cannot_claim_a_missing_event(tmp_path):
+    cut = 40
+    d = str(DAYS[cut].date())
+    ours = [10.0 / 1.05] * cut + [10.0] * (len(DAYS) - cut)
+    cache = tmp_path / "c"
+    put(cache, "AAA", daily(DAYS, ours), five(DAYS, 10.0))
+    y = yahoo_for({"AAA": daily(DAYS, 10.0)}, tmp=tmp_path)                    # frames without a Splits column
+    res = gate(cache, tmp_path, yahoo=y, symbols=["AAA"], splits={"AAA": [(d, 1.05)]})
+    assert res["yahoo"]["status"] == "FAIL"
+
+
+def test_successor_series_carrying_a_later_reverse_split_is_successor_later_event(tmp_path):
+    n = len(DAYS)
+    cut = 60
+    last_old = DAYS[cut - 1]
+    # OLD is a pre-rename duplicate that stops at cut; Yahoo answered with NEW's series, adjusted for NEW's later 0.05 reverse split
+    cache = tmp_path / "c"
+    put(cache, "OLD", daily(DAYS[:cut], 2.0), five(DAYS[:cut], 2.0))
+    frames = _yahoo_frames({"NEW": [40.0] * n})
+    y = ver.YahooDaily(str(tmp_path / "yd"), fetch=lambda t: frames.get(t), sleep=lambda s: None, successors=lambda s: ["NEW"])
+    later = str((last_old + pd.Timedelta(days=30)).date())
+    res = gate(cache, tmp_path, yahoo=y, symbols=["OLD"], splits={"OLD": [], "NEW": [(later, 0.05), ("2020-01-02", 2.0)]})
+    runs = pd.read_csv(tmp_path / "verify" / "yahoo_mismatch_runs.csv", keep_default_na=False)
+    assert res["yahoo"]["status"] == "PASS" and runs["classification"].tolist() == ["successor_later_event"]
+    assert runs["events"].iloc[0] == f"{later} x0.05"
+    res = gate(cache, tmp_path / "x", yahoo=y, symbols=["OLD"], splits={"OLD": [], "NEW": [(later, 0.5)]})      # factor does not match: unexplained
+    assert res["yahoo"]["status"] == "FAIL"
