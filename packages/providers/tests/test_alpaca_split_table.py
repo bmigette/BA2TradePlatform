@@ -904,6 +904,14 @@ def test_spinoff_fmp_flat_is_applied_with_an_informational_row_and_a_contradicti
     assert r["applied"] is True and r["fmp_step"].endswith("flat")
     acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw, {40: 1.3})})   # FMP adjusted by another factor
     assert acc == [] and one(rev, "spinoff_fmp_mismatch")["applied"] is False
+    # within 10 % of OUR factor 1.125: ours is applied, the deviation is recorded; beyond 10 % it is a mismatch
+    for applied_by_fmp, ok in ((1.18, True), (1.2, True), (1.05, True), (1.23, True), (1.26, False)):
+        acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw, {40: applied_by_fmp})})
+        if ok:
+            assert [(a["verdict"], a["factor"]) for a in acc] == [("spinoff_fmp_agrees", 1.125)], applied_by_fmp
+            assert "deviation" in acc[0]["fmp_step"] and "agrees" in acc[0]["fmp_step"] and rev == []
+        else:
+            assert acc == [] and one(rev, "spinoff_fmp_mismatch"), applied_by_fmp
     acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, None)                          # no FMP data: unverified
     assert [a["verdict"] for a in acc] == ["spinoff_fmp_unverified"] and one(rev, "spinoff_fmp_unverified")["applied"] is True
 

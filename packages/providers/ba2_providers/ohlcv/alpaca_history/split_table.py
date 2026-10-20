@@ -84,7 +84,8 @@ THE RULES (tolerances are module constants)
     (the share count is unchanged, unlike a split): spin-offs are therefore a separate event kind, the top-level
     ``spinoffs`` of split_table.json (``{symbol: [[date, f], ...]}``), never mixed into ``splits``.  The jump and big-factor
     rules do not apply (the factor is computed, not listed); small factors (HON/Garrett ~1.01-1.03) are adjusted too.
-    FMP CROSS-CHECK on its step across D: ``equals_f`` (within 2 %) -> ``spinoff_fmp_agrees``; ``flat`` (FMP did not adjust it,
+    FMP CROSS-CHECK on its step across D: within 10 % of f (SPINOFF_FMP_TOL; gaps and jumps around the ex-date explain
+    the near misses) -> ``spinoff_fmp_agrees``, OUR computed factor is applied and the deviation is recorded in ``fmp_step``; ``flat`` (FMP did not adjust it,
     e.g. CTVA) -> applied anyway, ``spinoff_fmp_flat`` + an informational row; no or unstable FMP data -> applied,
     ``spinoff_fmp_unverified`` + row; any other step -> ``spinoff_fmp_mismatch`` review row, NOT applied.  No spinco bar within
     3 sessions -> ``spinoff_no_spinco_price`` review row, not applied.  A spin-off position explains nearby jumps.  A split
@@ -193,6 +194,7 @@ STEP_TOL = math.log(1.02)          # FMP step: |ln step - ln f| within this -> "
 STEP_JUMP_MAX = math.log(1.5)      # a step-proven accept also needs the raw jump within this of ln f (and not flat)
 BOTH_BIG_MIN = math.log(2)         # the both-vendors-listed rule needs |ln f| of at least this
 SERIES_BREAK = math.log(5)         # an unexplained overnight jump beyond x5 either way is a series break
+SPINOFF_FMP_TOL = math.log(1.10)   # FMP's step within 10 % of a spin-off's computed factor agrees with it (we apply OUR factor)
 CLEAN_TOL = math.log(1.005)        # the FMP step must be this close (0.5 %) to a clean ratio for an inferred split
 CLEAN_K_MAX = 1000                 # clean ratios: k or 1/k for integer k in 2..CLEAN_K_MAX, and 3/2, 2/3
 STEP_STABLE = 0.02                 # FMP step: r may vary by at most 2 % within each 3-session side of the event
@@ -768,8 +770,12 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
         vote = "none"
         if rser is not None:
             v, ok = rser.step(D, [x for x in listed_dates + ov_dates + so_dates if x != D])
-            vote = _step_vote(v, ok, f)
-            step = _fmt_step(v, vote)
+            vote = _step_vote(v, ok, None)                      # flat / other / none / unstable
+            if v is not None and ok and abs(math.log(v) - math.log(f)) <= SPINOFF_FMP_TOL:
+                vote = "equals_f"                                # within 10 %: gaps and jumps around the ex-date explain it
+                step = f"{v:.6g} agrees (deviation {v / f - 1.0:+.1%} from f)"
+            else:
+                step = _fmt_step(v, vote)
         info = (f"spin-off of {so.spinco} (ratio {so.ratio:.6g}), factor {f:.6g} = 1 + ratio * {so.spinco} close "
                 f"{float(sc.c[k]):.6g} / {sym} close {float(bars.c[iD]):.6g}; FMP step vote {vote}")
         if vote == "other":
