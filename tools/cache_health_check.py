@@ -1179,6 +1179,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--worker", default=None, help="Check only this worker NAME (default: all enabled, non-local).")
+    ap.add_argument("--ohlcv-history-source", choices=("fmp", "alpaca"), default=None,
+                    help="OHLCV history the worker cache check compares and (--fix) pushes. REQUIRED "
+                         "unless --skip-workers: the other history's folder is neither copied nor pruned.")
     ap.add_argument("--fix", action="store_true", help="Push/prune/repush anything found out of sync (worker check only).")
     ap.add_argument("--skip-workers", action="store_true", help="Skip the remote-worker cache-sync check.")
     ap.add_argument("--skip-gaps", action="store_true", help="Skip the local data-gap check.")
@@ -1258,6 +1261,10 @@ def main() -> int:
         print("ALL CHECKS PASSED." if overall_ok else "ISSUES FOUND (see above).")
         return 0 if overall_ok else 1
 
+    if not args.ohlcv_history_source:
+        ap.error("--ohlcv-history-source {fmp,alpaca} is required for the worker cache check "
+                 "(or pass --skip-workers)")
+
     from app.models.database import SessionLocal
     from app.models import Worker
     from app.services import worker_client
@@ -1280,7 +1287,7 @@ def main() -> int:
     for w in workers:
         print(f"\n=== {w['name']} ({w['url']}) ===")
         try:
-            res = worker_client.check_cache_integrity(w)
+            res = worker_client.check_cache_integrity(w, history_source=args.ohlcv_history_source)
         except Exception as e:  # noqa: BLE001
             print(f"  UNREACHABLE / check failed: {e!r}")
             overall_ok = False
@@ -1308,11 +1315,11 @@ def main() -> int:
 
         print("  fixing...")
         if res["missing"] or res["stale"]:
-            worker_client.push_cache(w, log=print)
+            worker_client.push_cache(w, history_source=args.ohlcv_history_source, log=print)
         if res["content_mismatch"]:
             _force_repush(w, res["content_mismatch"], log=print)
         # Re-check after fixing so the report reflects reality, not intent.
-        res2 = worker_client.check_cache_integrity(w)
+        res2 = worker_client.check_cache_integrity(w, history_source=args.ohlcv_history_source)
         print(f"  post-fix: ok={res2['ok']} missing={len(res2['missing'])} "
               f"stale={len(res2['stale'])} content_mismatch={len(res2['content_mismatch'])}")
         if not res2["ok"]:

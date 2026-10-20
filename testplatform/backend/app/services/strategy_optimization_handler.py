@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from ba2_common.core.knowability import DEFAULT_DECISION_TIME, entry_times_for  # noqa: F401
+from ba2_common.core.ohlcv_history import resolve_job_history_source
 
 
 def _is_intraday_interval(interval: Any) -> bool:
@@ -2375,6 +2376,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     workers=_workers, master_version=_master_version,
                     required_packages=_master_info.get("required_package_versions"),
                     master_packages=_master_info.get("package_versions"),
+                    history_source=resolve_job_history_source(backtest_cfg),
                     pool_factory=_make_pool if parallel >= 1 else None,
                     max_remote_slots_per_worker=_max_remote_slots,
                     governor=_governor,
