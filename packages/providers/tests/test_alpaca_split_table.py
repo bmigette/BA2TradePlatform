@@ -841,13 +841,16 @@ def test_series_break_for_an_unexplained_jump_beyond_x5_that_the_step_does_not_e
 def test_shipped_overrides_are_the_reviewed_ones():
     entries = st.load_overrides()
     by = {(e["symbol"], e["event_date"]): e for e in entries}
-    assert len(entries) == 12 and all(e["reviewed_by"] == "owner (B. Migette) 2026-10-20" and e["added"] == "2026-10-20"
+    assert len(entries) == 20 and all(e["reviewed_by"] == "owner (B. Migette) 2026-10-20" and e["added"] == "2026-10-20"
                                       for e in entries)
     assert by[("VTOL", "2020-06-12")]["ratio"] == pytest.approx(1 / 3) and by[("WHWK", "2021-08-27")]["ratio"] == pytest.approx(1 / 15)
     assert by[("ENOV", "2022-04-05")]["ratio"] == pytest.approx(1 / 3) and by[("IRON", "2022-12-30")]["ratio"] == 0.1
     assert by[("JBIO", "2025-04-29")]["ratio"] == pytest.approx(1 / 35)
     assert {k for k, e in by.items() if e["decision"] == "reject"} == {
-        ("AMC", "2022-08-22"), ("BIP", "2020-03-31"), ("NVS", "2019-04-09"), ("HON", "2026-06-28"), ("ADEA", "2022-10-03"), ("CRESY", "2025-11-28"), ("CTVA", "2026-10-01")}
+        ("AMC", "2022-08-22"), ("BIP", "2020-03-31"), ("NVS", "2019-04-09"), ("HON", "2026-06-28"), ("ADEA", "2022-10-03"), ("CRESY", "2025-11-28"), ("CTVA", "2026-10-01"),
+        ("SM", "2020-03-09"), ("DBVT", "2020-03-17"), ("RLMD", "2024-12-04"), ("CLSK", "2020-04-09"), ("FWDI", "2018-01-19")}
+    assert by[("QH", "2022-08-12")]["ratio"] == pytest.approx(0.1) and by[("STSS", "2025-04-28")]["ratio"] == pytest.approx(1 / 300)
+    assert by[("JFB", "2026-03-25")]["ratio"] == 2.0 and "Yahoo" in by[("QH", "2022-08-12")]["reason"]
 
 
 def test_breaks_are_written_to_the_table(tmp_path):
