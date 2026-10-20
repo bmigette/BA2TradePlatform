@@ -13,7 +13,7 @@ REQUIRED ``--source {alpaca,fmp}``.  Steps valid per source (in this order):
 STEP alpaca / split-table
   split-table   Judge every Alpaca / FMP split candidate by the raw price jump (and FMP's adjusted-close step) and write
                 our verified split table.  All rules, verdict codes, inputs and output columns are documented in the module
-                docstring of ``ba2_providers/ohlcv/alpaca_history/split_table.py``; the logic lives there, this file only
+                docstring of ``ba2_providers/ohlcv/alpaca_history/split_table.py``; the rules live there, the build / I-O in ``split_build.py``; this file only
                 runs it.  Reads the RAW daily store (``--store``), the FMP split calendar (fetched once, then cached under
                 ``<out>/_meta/fmp_split_calendar/`` -- a rerun is OFFLINE), the FMP daily cache (``--fmp-daily-dir``) and
                 ``split_overrides.json``.  Writes under ``<out>/_meta``: split_table.json, split_review.csv,
@@ -24,7 +24,7 @@ FULL COMMAND (the defaults are the production paths; every path is overridable)
         --store ~/Documents/ba2/alpaca_store_daily2016 \
         --out ~/Documents/ba2/common/cache/AlpacaHistoryOHLCVProvider \
         --fmp-daily-dir ~/Documents/ba2/common/cache/FMPOHLCVProvider \
-        --db ~/Documents/ba2/trade/db.sqlite --fmp-from 2016-01-01 --fmp-to 2026-10-13
+        --db ~/Documents/ba2/trade/db.sqlite --fmp-from 2016-01-01 --fmp-to <store asof + 1 day>
 RE-RUN OFFLINE (identical command: every calendar window is in the cache, so the FMP key is never read and no request is
 made; the result is byte-identical for identical inputs)
     python tools/prepare_history.py --source alpaca --steps split-table
@@ -45,6 +45,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional
 
@@ -55,27 +56,28 @@ EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
 
 
 def build_parser() -> argparse.ArgumentParser:
-    from ba2_providers.ohlcv.alpaca_history import split_table as st
+    from ba2_providers.ohlcv.alpaca_history import split_build as sb, split_table as st
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--source", required=True, choices=sorted(SOURCE_STEPS), help="the vendor whose history to prepare")
     ap.add_argument("--steps", help="comma list of steps to run (default: every step of the source). Steps: "
                     + "; ".join(f"{k}: {', '.join(v)}" for k, v in SOURCE_STEPS.items()))
     ap.add_argument("--from-step", help="run this step and every later one of the source")
     ap.add_argument("--dry-run", action="store_true", help="check the inputs and the overrides, write nothing")
-    ap.add_argument("--store", default=st.DEFAULT_STORE, help="raw Alpaca daily store (default: %(default)s)")
-    ap.add_argument("--out", default=st.DEFAULT_OUT, help="cache folder; outputs under <out>/_meta (default: %(default)s)")
-    ap.add_argument("--fmp-daily-dir", default=st.DEFAULT_FMP_DAILY, help="FMP adjusted daily files (default: %(default)s)")
-    ap.add_argument("--db", default=st.DEFAULT_DB, help="SQLite DB holding the AppSetting FMP_API_KEY (read-only)")
+    ap.add_argument("--store", default=sb.DEFAULT_STORE, help="raw Alpaca daily store (default: %(default)s)")
+    ap.add_argument("--out", default=sb.DEFAULT_OUT, help="cache folder; outputs under <out>/_meta (default: %(default)s)")
+    ap.add_argument("--fmp-daily-dir", default=sb.DEFAULT_FMP_DAILY, help="FMP adjusted daily files (default: %(default)s)")
+    ap.add_argument("--db", default=sb.DEFAULT_DB, help="SQLite DB holding the AppSetting FMP_API_KEY (read-only)")
     ap.add_argument("--symbols", help="comma-separated subset to judge (quick run)")
     ap.add_argument("--fmp-from", default="2016-01-01", help="first day of the FMP split calendar fetch")
-    ap.add_argument("--fmp-to", default="2026-10-13", help="last day of the FMP split calendar fetch")
+    ap.add_argument("--fmp-to", help="last day of the FMP split calendar fetch (default: the store's asof + 1 day; "
+                    "a value before the asof is refused)")
     ap.add_argument("--overrides", default=st.OVERRIDES_PATH, help="reviewed split overrides (default: %(default)s)")
     ap.add_argument("--report-dir", help="where prepare_history_<source>_report.json goes (default: <out>/_meta)")
     return ap
 
 
 def _write_report(path: str, report: Dict[str, Any]) -> None:
-    from ba2_providers.ohlcv.alpaca_history.split_table import atomic_write
+    from ba2_providers.ohlcv.alpaca_history.split_build import atomic_write
     atomic_write(path, json.dumps(report, indent=1, default=str).encode("utf-8"))
 
 
@@ -94,9 +96,10 @@ def _print_split_table_summary(r: Dict[str, Any]) -> None:
 
 
 def step_split_table(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, Any]:
-    from ba2_providers.ohlcv.alpaca_history import split_table as st
-    symbols = [s.strip().upper() for s in a.symbols.split(",") if s.strip()] if a.symbols else None
-    result = st.build_split_table(store=a.store, out=a.out, db=a.db, fmp_daily_dir=a.fmp_daily_dir, symbols=symbols,
+    from ba2_providers.ohlcv.alpaca_history import split_build as sb
+    from ba2_providers.ohlcv.alpaca_history.split_table import _norm_symbol
+    symbols = [_norm_symbol(x) for x in a.symbols.split(",") if x.strip()] if a.symbols else None
+    result = sb.build_split_table(store=a.store, out=a.out, db=a.db, fmp_daily_dir=a.fmp_daily_dir, symbols=symbols,
                                   fmp_from=a.fmp_from, fmp_to=a.fmp_to, overrides_path=a.overrides, log=log)
     _print_split_table_summary(result)
     return result
@@ -104,8 +107,8 @@ def step_split_table(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[
 
 def plan_split_table(a: argparse.Namespace) -> List[str]:
     """Dry run: what the step would read and write; raises on a missing input."""
-    from ba2_providers.ohlcv.alpaca_history import split_table as st
-    entries = st.load_overrides(a.overrides)                     # raises SplitOverridesPending
+    from ba2_providers.ohlcv.alpaca_history.split_table import load_overrides
+    entries = load_overrides(a.overrides)                     # raises SplitOverridesPending
     for label, path in (("store", os.path.join(a.store, "STORE_INFO.json")),
                         ("corporate actions", os.path.join(a.store, "corporate_actions")),
                         ("FMP daily dir", a.fmp_daily_dir)):
@@ -155,11 +158,14 @@ def main(argv: Optional[List[str]] = None, *, log: Optional[Callable[[str], None
               f"Implemented: {done}", file=sys.stderr)
         return EXIT_CONFIG
     try:
-        date.fromisoformat(a.fmp_from), date.fromisoformat(a.fmp_to)
+        date.fromisoformat(a.fmp_from)
+        if a.fmp_to:
+            date.fromisoformat(a.fmp_to)
     except ValueError as e:
         print(f"bad --fmp-from/--fmp-to: {e}", file=sys.stderr)
         return EXIT_CONFIG
 
+    from ba2_providers.fmp_common import redact
     from ba2_providers.ohlcv.alpaca_history.split_table import SplitOverridesPending
     if a.dry_run:
         try:
@@ -188,7 +194,9 @@ def main(argv: Optional[List[str]] = None, *, log: Optional[Callable[[str], None
             print(f"REFUSED: {e}", file=sys.stderr)
             return EXIT_CONFIG                                   # nothing ran, nothing to report
         except Exception as e:                                   # a failed step stops the pipeline, named
-            entry["status"], entry["error"] = "failed", f"{type(e).__name__}: {e}"
+            # the traceback and message go to the report and stderr REDACTED (a request error can embed the key)
+            entry["status"], entry["error"] = "failed", redact(f"{type(e).__name__}: {e}")
+            entry["traceback"] = redact(traceback.format_exc())
             print(f"step {s} FAILED: {entry['error']}", file=sys.stderr)
             code = EXIT_FAILED
         entry["elapsed_s"] = round(time.time() - t0, 1)

@@ -1,12 +1,13 @@
 """The verified split table: every branch of split_table.decide_splits on synthetic RAW bars."""
 import json
+import os
 from collections import Counter
 from datetime import date, timedelta
 
 import pandas as pd
 import pytest
 
-from ba2_providers.ohlcv.alpaca_history import split_table as st
+from ba2_providers.ohlcv.alpaca_history import split_build as sb, split_table as st
 from ba2_providers.ohlcv.alpaca_history.split_table import ListedSplit as L
 
 SESSIONS = list(pd.bdate_range("2021-01-04", periods=80))
@@ -18,7 +19,7 @@ def bars(jump_at=None, jump=1.0, price=100.0, sessions=SESSIONS, tz=True):
     rows = []
     for i, d in enumerate(sessions):
         p = price / jump if (jump_at is not None and i >= jump_at) else price
-        t = pd.Timestamp(d).tz_localize("UTC") + pd.Timedelta(hours=5) if tz else pd.Timestamp(d)
+        t = pd.Timestamp(d).tz_localize("America/New_York").tz_convert("UTC") if tz else pd.Timestamp(d)   # 00:00 New York
         rows.append({"t": t, "o": p, "c": p})
     return pd.DataFrame(rows, columns=["t", "o", "c"])
 
@@ -302,20 +303,20 @@ def test_fmp_calendar_windows_split_when_full_cache_and_check_dates(tmp_path):
 
     def get(a, b):
         calls.append((a, b))
-        n = st.FMP_ROW_CAP if (b - a).days >= 10 else 2
+        n = sb.FMP_ROW_CAP if (b - a).days >= 10 else 2
         return [{"date": a.isoformat(), "symbol": f"S{i}", "numerator": 2, "denominator": 1} for i in range(n)]
 
     stats = Counter()
-    rows = st.fetch_fmp_calendar(date(2021, 1, 1), date(2021, 1, 30), str(tmp_path), get, stats)
+    rows = sb.fetch_fmp_calendar(date(2021, 1, 1), date(2021, 1, 30), str(tmp_path), get, stats)
     assert stats["fmp_windows_split"] >= 1 and all(b - a < timedelta(days=10) for a, b in calls[-2:])
     n_calls = len(calls)
-    again = st.fetch_fmp_calendar(date(2021, 1, 1), date(2021, 1, 30), str(tmp_path), get, Counter())
+    again = sb.fetch_fmp_calendar(date(2021, 1, 1), date(2021, 1, 30), str(tmp_path), get, Counter())
     assert len(calls) == n_calls and again == rows            # a rerun is offline
 
     def outside(a, b):
         return [{"date": "2000-01-01", "symbol": "X", "numerator": 2, "denominator": 1}]
     with pytest.raises(st.SplitTableBuildError):
-        st.fetch_fmp_calendar(date(2021, 2, 1), date(2021, 2, 5), str(tmp_path / "o"), outside, Counter())
+        sb.fetch_fmp_calendar(date(2021, 2, 1), date(2021, 2, 5), str(tmp_path / "o"), outside, Counter())
 
 
 def test_pipeline_refuses_a_pending_override(tmp_path, capsys):
@@ -355,7 +356,7 @@ def test_pipeline_end_to_end_on_a_tiny_store_is_offline_and_reproducible(tmp_pat
     d = store / "bars" / "1Day" / "symbol=NA"                   # the symbol "NA" must survive the CSVs
     d.mkdir(parents=True)
     raw.assign(h=raw["o"], l=raw["o"]).to_parquet(d / "all.parquet")
-    (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2026-10-12"}), encoding="utf-8")
+    (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2021-03-31"}), encoding="utf-8")
     ca = store / "corporate_actions"
     ca.mkdir()
     import gzip
@@ -377,7 +378,7 @@ def test_pipeline_end_to_end_on_a_tiny_store_is_offline_and_reproducible(tmp_pat
     assert cli.main(argv) == 0
     table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
     assert table["splits"] == {"NA": [[D.isoformat(), 4.0]]} and table["fmp_daily_files"]["count"] == 1
-    acc = st.read_csv_frame(str(out / "_meta" / "split_accepted.csv"))
+    acc = sb.read_csv_frame(str(out / "_meta" / "split_accepted.csv"))
     assert list(acc["symbol"]) == ["NA"] and acc["fmp_step"][0].endswith("equals_f")
     first = (out / "_meta" / "split_table.json").read_bytes()
     assert cli.main(argv) == 0 and (out / "_meta" / "split_table.json").read_bytes() == first
@@ -532,7 +533,7 @@ def test_csv_reader_keeps_the_symbol_NA(tmp_path):
     p.write_text("symbol,event_date,alpaca_ratio,fmp_ratio,jump,fmp_step,verdict,applied,reason\n"
                  "NA,2020-01-02,,2.0,1.1,2 equals_f,unresolved,False,r\nNAN,2020-01-02,0.5,,,none,x,False,r\n",
                  encoding="utf-8")
-    df = st.read_csv_frame(str(p))
+    df = sb.read_csv_frame(str(p))
     assert list(df["symbol"]) == ["NA", "NAN"] and df["alpaca_ratio"].isna().tolist() == [True, False]
     assert df["fmp_step"].tolist() == ["2 equals_f", "none"]
 
@@ -561,7 +562,7 @@ def test_pipeline_outputs_are_one_coherent_set(tmp_path, monkeypatch):
     d = store / "bars" / "1Day" / "symbol=AA"
     d.mkdir(parents=True)
     raw.assign(h=raw["o"], l=raw["o"]).to_parquet(d / "all.parquet")
-    (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2026-10-12"}), encoding="utf-8")
+    (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2021-01-30"}), encoding="utf-8")
     (store / "corporate_actions").mkdir()
     fmpd = tmp_path / "fmpd"
     fmpd.mkdir()
@@ -574,20 +575,188 @@ def test_pipeline_outputs_are_one_coherent_set(tmp_path, monkeypatch):
     with gzip.open(store / "corporate_actions" / "ym=2021-01.json.gz", "wt", encoding="utf-8") as f:
         json.dump({"forward_splits": [{"symbol": "AA", "ex_date": D.isoformat(), "old_rate": 1, "new_rate": 4}]}, f)
     written = []
-    real = st.atomic_write
-    monkeypatch.setattr(st, "atomic_write", lambda path, data: (written.append(path.replace("\\", "/").rsplit("/", 1)[-1]),
+    real = sb.atomic_write
+    monkeypatch.setattr(sb, "atomic_write", lambda path, data: (written.append(path.replace("\\", "/").rsplit("/", 1)[-1]),
                                                                 real(path, data)))
-    res = st.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01",
+    res = sb.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01",
                                fmp_to="2021-01-30", log=lambda m: None)
     assert written[-1] == "split_table.json" and written.count("split_table.json") == 1       # the table is written LAST
     meta = out / "_meta"
     table = json.loads((meta / "split_table.json").read_text(encoding="utf-8"))
     assert table["run_id"] == res["run_id"] and len(res["run_id"].split("-")[1]) == 8
     for name in ("split_review.csv", "split_accepted.csv", "split_vs_fmp.csv", "fmp_daily_inputs.csv"):
-        df = st.read_csv_frame(str(meta / name))
+        df = sb.read_csv_frame(str(meta / name))
         assert df.columns[-1] == "run_id" and set(df["run_id"]) <= {table["run_id"]}, name
-    inp = st.read_csv_frame(str(meta / "fmp_daily_inputs.csv"))
+    inp = sb.read_csv_frame(str(meta / "fmp_daily_inputs.csv"))
     import hashlib
     assert inp["file"].tolist() == ["AA_1d.parquet"]
     assert inp["sha256"][0] == hashlib.sha256((fmpd / "AA_1d.parquet").read_bytes()).hexdigest()
     assert table["fmp_daily_files"]["count"] == 1 and table["fmp_daily_files"]["content_sha256"]
+
+
+# ---- review fixes: key leak, timestamps, store end, stray files, structure ------------------------------------
+import gzip as _gzip
+
+
+def tiny_store(tmp_path, symbol="AA", asof="2021-01-30", listed=True):
+    store = tmp_path / "store"
+    raw = bars(40, 4.0)
+    d = store / "bars" / "1Day" / f"symbol={symbol}"
+    d.mkdir(parents=True)
+    raw.assign(h=raw["o"], l=raw["o"]).to_parquet(d / "all.parquet")
+    (store / "STORE_INFO.json").write_text(json.dumps({"asof": asof}), encoding="utf-8")
+    (store / "corporate_actions").mkdir()
+    sp = [{"symbol": symbol, "ex_date": D.isoformat(), "old_rate": 1, "new_rate": 4}] if listed else []
+    with _gzip.open(store / "corporate_actions" / "ym=2021-03.json.gz", "wt", encoding="utf-8") as f:
+        json.dump({"forward_splits": sp}, f)
+    fmpd = tmp_path / "fmpd"
+    fmpd.mkdir()
+    fmp(raw, {40: 4.0}).to_parquet(fmpd / f"{symbol}_1d.parquet")
+    return store, fmpd, raw
+
+
+def test_http_error_never_leaks_the_api_key(tmp_path, monkeypatch, capsys):
+    import requests
+    key = "SECRETKEY123"
+    store, fmpd, _ = tiny_store(tmp_path)
+    monkeypatch.setattr(sb, "read_fmp_key", lambda db: key)
+
+    class Resp:
+        status_code = 401
+        headers = {}
+
+        def raise_for_status(self):
+            raise requests.HTTPError(f"401 Client Error: Unauthorized for url: https://x/api?from=a&apikey={key}")
+    monkeypatch.setattr(requests, "get", lambda url, params=None, timeout=None: Resp())
+    with pytest.raises(st.SplitTableBuildError) as ei:
+        sb.make_fmp_getter(key)(date(2021, 1, 1), date(2021, 1, 30))
+    assert key not in str(ei.value) and "***" in str(ei.value)
+    out = tmp_path / "out"
+    argv = ["--source", "alpaca", "--steps", "split-table", "--store", str(store), "--out", str(out),
+            "--fmp-daily-dir", str(fmpd), "--db", str(tmp_path / "x.db"), "--fmp-from", "2021-01-01"]
+    assert _cli().main(argv) == 1
+    report = (out / "_meta" / "prepare_history_alpaca_report.json").read_text(encoding="utf-8")
+    assert key not in report and key not in capsys.readouterr().err
+    entry = json.loads(report)["steps"][0]
+    assert entry["status"] == "failed" and "SplitTableBuildError" in entry["traceback"]
+
+
+def test_daily_bar_timestamps_must_be_midnight_new_york():
+    summer = pd.DataFrame({"t": [pd.Timestamp("2021-07-06 04:00", tz="UTC")], "o": [1.0], "c": [1.0]})   # 00:00 EDT
+    winter = pd.DataFrame({"t": [pd.Timestamp("2021-01-06 05:00", tz="UTC")], "o": [1.0], "c": [1.0]})   # 00:00 EST
+    assert len(st._bars(summer, Counter(), "X").days) == 1 and len(st._bars(winter, Counter(), "X").days) == 1
+    for bad in ("2021-07-06 00:00", "2021-01-06 00:00", "2021-07-06 05:00"):        # 00:00Z, and winter time in summer
+        df = pd.DataFrame({"t": [pd.Timestamp(bad, tz="UTC")], "o": [1.0], "c": [1.0]})
+        with pytest.raises(st.SplitTableBuildError, match="00:00 New York"):
+            st._bars(df, Counter(), "X")
+    dup = pd.concat([winter, winter], ignore_index=True)
+    with pytest.raises(st.SplitTableBuildError, match="more than once"):
+        st._bars(dup, Counter(), "X")
+
+
+def test_fmp_to_defaults_to_the_store_end_and_is_refused_before_the_asof(tmp_path):
+    store, fmpd, _ = tiny_store(tmp_path, asof="2021-01-30")
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    (cal / "2021-01-01_2021-01-30.json").write_text("[]", encoding="utf-8")
+    (cal / "2021-01-31_2021-01-31.json").write_text("[]", encoding="utf-8")     # asof + 1 day = 2021-01-31
+    res = sb.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01",
+                               log=lambda m: None)
+    assert res["fmp_to"] == "2021-01-31"
+    with pytest.raises(st.SplitTableBuildError, match="before the store"):
+        sb.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd),
+                             fmp_from="2021-01-01", fmp_to="2021-01-29", log=lambda m: None)
+
+
+def test_a_store_without_any_split_is_refused(tmp_path):
+    store, fmpd, _ = tiny_store(tmp_path, asof="2021-01-30", listed=False)
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    (cal / "2021-01-01_2021-01-30.json").write_text("[]", encoding="utf-8")
+    (cal / "2021-01-31_2021-01-31.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(st.SplitTableBuildError, match="no forward or reverse split"):
+        sb.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd),
+                             fmp_from="2021-01-01", log=lambda m: None)
+
+
+def test_stray_temp_files_do_not_change_the_input_hash(tmp_path):
+    store, fmpd, _ = tiny_store(tmp_path, asof="2021-01-30")
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    (cal / "2021-01-01_2021-01-30.json").write_text("[]", encoding="utf-8")
+    (cal / "2021-01-31_2021-01-31.json").write_text("[]", encoding="utf-8")
+    kw = dict(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01",
+              log=lambda m: None)
+    sb.build_split_table(**kw)
+    first = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))["inputs_sha256"]
+    (cal / "2021-01-01_2021-01-30.json.tmp4242").write_text("junk", encoding="utf-8")
+    (store / "corporate_actions" / "ym=2021-03.json.gz.tmp4242").write_bytes(b"junk")
+    sb.build_split_table(**kw)
+    assert json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))["inputs_sha256"] == first
+
+
+def test_atomic_write_removes_its_temp_file_on_failure(tmp_path, monkeypatch):
+    target = tmp_path / "t.json"
+
+    def boom(a, b):
+        raise OSError("disk full")
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        sb.atomic_write(str(target), b"x")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_default_paths_come_from_the_ba2_home_config():
+    from ba2_common import config as cfg
+    assert sb.DEFAULT_STORE == os.path.join(cfg.BA2_HOME, "alpaca_store_daily2016")
+    assert os.path.basename(sb.DEFAULT_OUT) == "AlpacaHistoryOHLCVProvider" and sb.DEFAULT_DB == os.path.join(cfg.TRADE_DIR, "db.sqlite")
+
+
+def test_unexplained_jump_scan_skips_pairs_further_apart_than_the_gap_limit():
+    sess = SESSIONS[:30] + SESSIONS[70:]                       # a 3-month hole; the price is 3x after it
+    raw = bars(30, 3.0, sessions=sess)
+    _, rev, _ = run({"X": raw})
+    assert rev == []                                            # the pair across the hole observes no overnight
+
+
+def test_two_accepted_events_on_one_date_are_refused():
+    with pytest.raises(st.SplitTableBuildError, match="two accepted events"):
+        st.splits_by_symbol([{"symbol": "X", "date": "2021-03-01", "factor": 2.0},
+                             {"symbol": "X", "date": "2021-03-01", "factor": 1.1}])
+
+
+def test_override_matching_several_groups_is_refused_and_absorbed_listings_are_counted():
+    raw = bars(40, 4.0)
+    _, _, stats = run({"X": raw}, [L("X", D, 4.0), L("X", D, 4.0)], [], [ov("reject")])
+    assert stats["listings_absorbed_by_override"] == 2          # both listings of the one group
+    # two listings of different ratios on the SAME date are two groups: one override cannot decide both
+    with pytest.raises(st.SplitTableBuildError, match="ambiguous"):
+        run({"X": raw}, [L("X", D, 4.0), L("X", D, 1.1)], [L("X", D, 4.0), L("X", D, 1.1)], [ov("reject")])
+    # two overrides matching the dates of one group
+    with pytest.raises(st.SplitTableBuildError, match="ambiguous"):
+        run({"X": raw}, [L("X", D, 4.0), L("X", SESSIONS[41].date(), 4.0)], [],
+            [ov("reject"), ov("reject", d=SESSIONS[41].date())])
+
+
+def test_fmp_rows_with_bool_or_negative_sides_are_refused():
+    for bad in ({"numerator": True, "denominator": 1}, {"numerator": -2, "denominator": 1},
+                {"numerator": 2, "denominator": -1}):
+        with pytest.raises(st.SplitTableBuildError):
+            st.fmp_events_from_rows([{"date": "2022-01-03", "symbol": "X", **bad}], {})
+
+
+def test_symbols_option_is_normalized(tmp_path):
+    store, fmpd, _ = tiny_store(tmp_path, symbol="BRK-B", asof="2021-01-30")
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    (cal / "2021-01-01_2021-01-30.json").write_text("[]", encoding="utf-8")
+    (cal / "2021-01-31_2021-01-31.json").write_text("[]", encoding="utf-8")
+    argv = ["--source", "alpaca", "--steps", "split-table", "--store", str(store), "--out", str(out), "--fmp-daily-dir",
+            str(fmpd), "--db", str(tmp_path / "x.db"), "--fmp-from", "2021-01-01", "--symbols", "brk.b"]
+    assert _cli().main(argv) == 0
+    table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
+    assert list(table["splits"]) == ["BRK-B"]
