@@ -83,13 +83,13 @@ def test_a_candidate_without_a_price_at_T_is_counted_and_a_defective_cache_is_an
     victim = max(world.symbols, key=lambda s: world.prev_close(s) * world.shares[s])
     prices[victim] = None
     st = {"market_cap_min": 1e9, "price_min": 1.0, "max_stocks": 50}
-    gate = sg.PanelGate(_runtime(str(d), st), FakePS(prices), intraday=True)
+    gate = sg.PanelGate(_runtime(str(d), st), FakePS(prices), intraday=True, history_source="fmp")
     got = gate.symbols(datetime.fromisoformat(W.DAY + "T10:00:00"))
     assert victim not in got and gate.diagnostics()["no_price_symbols"] == {victim: 1}
     assert gate.diagnostics()["no_price_candidate_decisions"] == 1
     for s_ in list(prices)[:20]:
         prices[s_] = None                                   # a broken intraday cache: most candidates lack a price
-    gate2 = sg.PanelGate(_runtime(str(d), st), FakePS(prices), intraday=True)
+    gate2 = sg.PanelGate(_runtime(str(d), st), FakePS(prices), intraday=True, history_source="fmp")
     with pytest.raises(ls.ScreenerDataOutage, match="no knowable price"):
         gate2.symbols(datetime.fromisoformat(W.DAY + "T10:00:00"))
     from app.services.job_fatal import JOB_FATAL_ERROR_TYPES
@@ -123,17 +123,17 @@ def test_incomplete_settings_reach_the_gate_as_a_refusal(tmp_path):
     rt = _runtime(str(d), {})
     rt["settings"] = {"market_cap_min": 1e9}                       # incomplete: no floors stated
     with pytest.raises(ls.SimulationRefusal, match="missing selection key"):
-        sg.PanelGate(rt, FakePS({}), intraday=True)
+        sg.PanelGate(rt, FakePS({}), intraday=True, history_source="fmp")
 
 
 def test_panel_identity_never_switches_within_a_process(tmp_path):
     world, panel = _panel(2)
     d = tmp_path / "panel"
     _save(panel, d, "idA")
-    pa = sg.get_panel(str(d), "idA")
-    assert sg.get_panel(str(d), "idA") is pa
+    pa = sg.get_panel(str(d), "idA", history_source="fmp")
+    assert sg.get_panel(str(d), "idA", history_source="fmp") is pa
     with pytest.raises(sg.ScreenerGateRefusal, match="never switches panel"):
-        sg.get_panel(str(d), "idB")
+        sg.get_panel(str(d), "idB", history_source="fmp")
     arr = {k: np.asarray(v) for k, v in panel.arrays.items()}
     man = {"shares_vendor_snapshot": "x", "shares_lag_days": 45, "stale_listed_symbols": [],
            "last_bar_date": panel.sessions[-2], "source_fingerprint": "idA"}
@@ -142,7 +142,7 @@ def test_panel_identity_never_switches_within_a_process(tmp_path):
     np.save(str(bad / "rvol.npy"), np.zeros((3, 3)))
     sg.clear_panel_memo()
     with pytest.raises(sg.ScreenerGateRefusal, match="corrupt or half-synced"):
-        sg.get_panel(str(bad))
+        sg.get_panel(str(bad), history_source="fmp")
     root = tmp_path / "cache"
     pd_ = ls.panel_dir_for(str(root), "idA")
     ls.save_panel(pd_, list(panel.symbols), panel.sessions, arr, man)
@@ -156,7 +156,7 @@ def test_the_gate_never_selects_a_symbol_of_the_reviewed_exclusion_list(tmp_path
     world, panel = _panel(2)
     d = tmp_path / "panel"
     _save(panel, d, "excl", excluded_unusable=[{"symbol": str(panel.symbols[0]), "reason": "r", "added": "2026-10-08", "reviewed_by": "o"}])
-    pan = sg.get_panel(str(d))
+    pan = sg.get_panel(str(d), history_source="fmp")
     v = sg.valid_mask(pan, None)
     assert not v[0] and v[1:].all()
 
@@ -200,12 +200,12 @@ def test_job_end_alarm_for_a_selectable_name_that_was_never_loaded(tmp_path):
     victim = max(world.symbols, key=lambda s: world.prev_close(s) * world.shares[s])
     del prices[victim]                                   # not loaded at all (has_symbol False)
     st = {"market_cap_min": 1e9, "price_min": 1.0, "max_stocks": 50}
-    gate = sg.PanelGate(_runtime(str(d), st), FakePS(prices), intraday=True)
+    gate = sg.PanelGate(_runtime(str(d), st), FakePS(prices), intraday=True, history_source="fmp")
     gate.symbols(datetime.fromisoformat(W.DAY + "T10:00:00"))
     assert gate.diagnostics()["outside_preload_candidate_decisions"] >= 1
     with pytest.raises(sg.ScreenerGateRefusal, match=victim):
         gate.assert_complete()
-    clean = sg.PanelGate(_runtime(str(d), st), FakePS(dict(world.open_now)), intraday=True)
+    clean = sg.PanelGate(_runtime(str(d), st), FakePS(dict(world.open_now)), intraday=True, history_source="fmp")
     clean.symbols(datetime.fromisoformat(W.DAY + "T10:00:00"))
     clean.assert_complete()
 
@@ -214,7 +214,7 @@ def test_the_first_bar_rule_reads_the_price_source_interval_and_requires_it(tmp_
     world, panel = _panel(2)
     _save(panel, tmp_path / "p", "fb")
     gate = sg.PanelGate(_runtime(str(tmp_path / "p"), {"market_cap_min": 1e9, "max_stocks": 5}),
-                        FakePS(dict(world.open_now)), intraday=True)
+                        FakePS(dict(world.open_now)), intraday=True, history_source="fmp")
     assert gate._in_first_bar(datetime.fromisoformat(W.DAY + "T09:32:00"))
     assert not gate._in_first_bar(datetime.fromisoformat(W.DAY + "T09:35:00"))
     gate.ps.interval = "15min"

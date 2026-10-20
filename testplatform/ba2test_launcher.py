@@ -288,10 +288,14 @@ def _cmd_prewarm(args) -> int:
         from app.services.prewarm_fetchers import prewarm_screener_panel
         if not args.screener_store:
             sys.exit("ba2-test prewarm --screener-panel: --screener-store is required (it defines the universe)")
+        if not args.ohlcv_history_source:
+            sys.exit("ba2-test prewarm --screener-panel: --ohlcv-history-source {fmp,alpaca} is required "
+                     "(the panel is built from one OHLCV history and records it)")
         try:
             panel_summary = prewarm_screener_panel(
                 args.screener_store, args.start, args.end, fmp_key=keys["fmp"], workers=args.workers,
-                force=args.force_panel, log=lambda msg: print(msg, flush=True))
+                force=args.force_panel, log=lambda msg: print(msg, flush=True),
+                history_source=args.ohlcv_history_source)
         except PrewarmConfigError as e:
             print(f"!! ba2-test prewarm --screener-panel aborted: {e}")
             return 1
@@ -564,7 +568,8 @@ def _cmd_build_screener_metrics(args) -> int:
         if _sym and _cap > 0 and _px > 0:
             _shares_by_sym[_sym] = _cap / _px
 
-    prov = get_provider("ohlcv", "fmp")
+    from ba2_common.core.ohlcv_history import history_registry_key
+    prov = get_provider("ohlcv", history_registry_key(args.ohlcv_history_source))
 
     def _ohlcv(sym, end):
         # The as-of OHLCV cache returns a DataFrame with a `Date` COLUMN + int index, rows not
@@ -606,7 +611,7 @@ def _cmd_build_screener_metrics(args) -> int:
     summary = ms.build_store(
         args.store, api_key, args.start, args.end,
         market_cap_min=args.market_cap_min, price_min=args.price_min, volume_min=args.volume_min,
-        ohlcv_get=_ohlcv, mcap_get=_mcap, float_get=_float, shares_get=_shares,
+        ohlcv_get=_ohlcv, ohlcv_history_source=args.ohlcv_history_source, mcap_get=_mcap, float_get=_float, shares_get=_shares,
         cadence_days=args.cadence_days, drop_days=args.drop_days,
         max_lookback=getattr(args, "max_lookback", 30) or 30,
         max_workers=getattr(args, "workers", 8) or 8,
@@ -619,7 +624,8 @@ def _cmd_build_screener_metrics(args) -> int:
         # the store's universe is now known: produce the simulation data for it (same function as prewarm)
         from app.services.prewarm_fetchers import prewarm_screener_panel
         ps = prewarm_screener_panel(args.store, args.start, args.end, fmp_key=api_key, workers=args.workers or 4,
-                                    log=lambda msg: print(msg, flush=True))
+                                    log=lambda msg: print(msg, flush=True),
+                                    history_source=args.ohlcv_history_source)
         print(f"build-screener-metrics: daily panel {ps}")
     return 0
 
@@ -628,7 +634,7 @@ def _cmd_recompute_screener_drops(args) -> int:
     """CACHE-ONLY rebuild of ONLY the price-drop columns of an existing screener store — no FMP.
 
     Reads each store symbol's DAILY OHLCV straight from the native parquet cache
-    (CACHE_FOLDER/FMPOHLCVProvider/<SYM>_1d.parquet) — NEVER calls the network — recomputes the
+    (CACHE_FOLDER/<the store's history folder>/<SYM>_1d.parquet) — NEVER calls the network — recomputes the
     legacy ``price_drop_pct`` (window --drop-days) AND the per-window ``price_drop_pct_2..max``
     columns, and writes them back in place (other metrics untouched). Use it to (1) fix a store
     built with a degenerate window (the old drop_days=1 -> all-zero bug) and (2) add the
@@ -642,7 +648,9 @@ def _cmd_recompute_screener_drops(args) -> int:
     store = args.store or _cfg.SCREENER_STORE_DIR
     if not os.path.isdir(store):
         sys.exit(f"recompute-screener-drops: store not found: {store}")
-    ohlcv_dir = os.path.join(_cfg.CACHE_FOLDER, "FMPOHLCVProvider")
+    # the store's OWN history (its build_manifest.json stamp; unstamped = fmp): never the other one's bars
+    from ba2_common.core.ohlcv_history import history_cache_dirname
+    ohlcv_dir = os.path.join(_cfg.CACHE_FOLDER, history_cache_dirname(ms.store_history_source(store)))
 
     def _ohlcv_cached(sym):
         # Direct parquet read = guaranteed offline (bypasses the provider's fetch-on-miss). Same
@@ -7072,8 +7080,10 @@ def _cmd_optimize(args) -> int:
                 if _use_sim:
                     # the SAME selection function as the per-decision gate and the per-trial prune
                     from app.services.backtest import screener_gate as _sg
+                    from ba2_common.core.ohlcv_history import resolve_job_history_source as _resolve_job_history_source
                     enabled = _sg.static_universe(
-                        _sg.get_panel(_panel_dir), args.start, args.end, base, _ranges,
+                        _sg.get_panel(_panel_dir, history_source=_resolve_job_history_source(backtest_block)),
+                        args.start, args.end, base, _ranges,
                         intraday=_us.interval_is_intraday(args.interval))
                 else:
                     enabled = _us.static_universe(
@@ -8415,6 +8425,9 @@ def main(argv: "list | None" = None) -> int:
                          "window (the panel always covers 2019-03-01..today). Resumable.")
     pw.add_argument("--screener-store", default=None,
                     help="Metric-store directory whose symbols are the screener universe (with --screener-panel).")
+    pw.add_argument("--ohlcv-history-source", choices=["fmp", "alpaca"], default=None,
+                    help="OHLCV history the --screener-panel is built from (REQUIRED with --screener-panel, no default): "
+                         "a derived store names its history and a job refuses a panel built from the other one.")
     pw.add_argument("--force-panel", action="store_true",
                     help="Re-fetch the vendor share table and rebuild the panel even if they look fresh.")
     pw.add_argument("--experts", default="FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy",
@@ -8441,6 +8454,9 @@ def main(argv: "list | None" = None) -> int:
     bm = sub.add_parser("build-screener-metrics", help="Build/extend the screener METRIC store (parquet).")
     bm.add_argument("--store", default=_DEFAULT_SCREENER_STORE_DIR,
                     help=f"Path to the parquet metric-store dir (default {_DEFAULT_SCREENER_STORE_DIR}).")
+    bm.add_argument("--ohlcv-history-source", required=True, choices=["fmp", "alpaca"],
+                    help="OHLCV history the store (and its --daily-panel) is built from. REQUIRED, no default: the "
+                         "store records it in build_manifest.json and a job refuses a store built from the other one.")
     bm.add_argument("--start", required=True)
     bm.add_argument("--end", required=True)
     bm.add_argument("--market-cap-min", type=float, required=True, help="LOOSEST cap bound (shortlist superset).")

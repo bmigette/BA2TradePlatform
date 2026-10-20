@@ -37,6 +37,7 @@ from typing import Any, Dict, Hashable, Iterable, Mapping, Optional, Sequence, T
 import numpy as np
 
 from ba2_common.core.market_condition_source import (
+    SOURCE_PROFILE_FMP_DAILY,
     WindowResult,
     assemble_window,
     fill_gaps_previous,
@@ -322,8 +323,12 @@ class FMPCacheMarketConditionReader(WindowMarketConditionReader):
     """
 
     def __init__(self, profile: str, cache_root: Optional[str] = None, *, memo_size: int = MEMO_SIZE,
-                 manifest_digest: Optional[str] = None, gap_fill: Optional[str] = None):
-        """``manifest_digest`` pins the published snapshot this reader serves (design section 4.5:
+                 manifest_digest: Optional[str] = None, gap_fill: Optional[str] = None,
+                 source_profile: str = SOURCE_PROFILE_FMP_DAILY):
+        """``source_profile`` selects the daily cache this reads (``SOURCE_PROFILE_FMP_DAILY`` |
+        ``SOURCE_PROFILE_ALPACA_DAILY``; same layout, own folder).
+
+        ``manifest_digest`` pins the published snapshot this reader serves (design section 4.5:
         a scheduled analysis consumes a pinned manifest). With it the FMP cache is never read and
         nothing is calculated; without it the reader computes on a miss and says so once.
 
@@ -348,10 +353,11 @@ class FMPCacheMarketConditionReader(WindowMarketConditionReader):
         super().__init__(profile, memo_size=memo_size, mapped=mapped, gap_fill=gap_fill)
         self.manifest_digest = manifest_digest
         self._cache_root = cache_root
+        self._source_profile = source_profile
 
     def _path(self, symbol: str) -> Optional[str]:
         # The SAME lookup certification uses (legacy interval spellings included).
-        return fmp_daily_cache_path(symbol, self._cache_root)
+        return fmp_daily_cache_path(symbol, self._cache_root, source_profile=self._source_profile)
 
     def _memo_key(self, symbol: str, session: date) -> Hashable:
         if self._mapped is not None:

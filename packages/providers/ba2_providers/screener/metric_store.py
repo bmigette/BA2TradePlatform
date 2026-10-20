@@ -17,6 +17,10 @@ import numpy as np
 import pandas as pd
 
 from ba2_common.core import shared_arrays as _sa
+from ba2_common.core.ohlcv_history import (
+    LEGACY_HISTORY_SOURCE, OHLCV_HISTORY_SOURCE_KEY, check_history_source)
+from ba2_common.core.ohlcv_history_stamp import (
+    HistorySourceMismatch, require_matching_history_source, stamp_history_source, stored_history_source)
 from ba2_providers.fmp_common import fmp_http_get
 from ba2_common.logger import logger
 
@@ -745,9 +749,39 @@ def _append_build_manifest(store_dir: str, entry: Dict[str, Any]) -> str:
     return path
 
 
+def store_history_source(store_dir: str) -> str:
+    """The OHLCV history ``store_dir`` was built from, read from ``build_manifest.json``.
+
+    A build record without the stamp, or a store without a manifest, predates the switch and is
+    ``LEGACY_HISTORY_SOURCE`` (fmp). Records of two different histories refuse (a mixed store)."""
+    path = os.path.join(store_dir, "build_manifest.json")
+    if not os.path.exists(path):
+        return LEGACY_HISTORY_SOURCE
+    with open(path, encoding="utf-8") as f:
+        builds = json.load(f)["builds"]
+    sources = {stored_history_source(b) for b in builds}
+    if len(sources) > 1:
+        raise HistorySourceMismatch(
+            f"metric store {store_dir} mixes OHLCV histories {sorted(sources)} across its builds: rebuild it")
+    return sources.pop() if sources else LEGACY_HISTORY_SOURCE
+
+
+def require_store_history_source(store_dir: str, job_source: str, *, building: bool = False) -> str:
+    """``job_source`` if the store was built from it, else ``HistorySourceMismatch``.
+
+    ``building=True``: a NEW store (no manifest and no partitions) matches any source; partitions without
+    a manifest are a legacy (fmp) store."""
+    if (building and not os.path.exists(os.path.join(store_dir, "build_manifest.json"))
+            and not existing_months(store_dir)):
+        return job_source
+    return require_matching_history_source(
+        {OHLCV_HISTORY_SOURCE_KEY: store_history_source(store_dir)}, job_source,
+        what=f"metric store {store_dir}")
+
+
 def build_store(store_dir: str, api_key: str, start: str, end: str, *,
                 market_cap_min: float, price_min: float, volume_min: float,
-                ohlcv_get, mcap_get=None, float_get=None, shares_get=None,
+                ohlcv_get, ohlcv_history_source: str, mcap_get=None, float_get=None, shares_get=None,
                 cadence_days: int = 7, rvol_window: int = 20, drop_days: int = 5,
                 max_lookback: int = 30, max_workers: int = 8, symbol_retries: int = 2,
                 flush_every: int = 250, fail_on_quality: bool = True,
@@ -760,7 +794,9 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
     SKIPS months already present (incremental).
 
     Per-symbol POINT-IN-TIME inputs (each disk-cached so a re-build never re-fetches):
-      * ``ohlcv_get(symbol, end_date)`` -> OHLCV up to end_date (as-of cache).
+      * ``ohlcv_get(symbol, end_date)`` -> OHLCV up to end_date (as-of cache), read from the
+        ``ohlcv_history_source`` history (``fmp`` | ``alpaca``, REQUIRED): each build record in
+        ``build_manifest.json`` names it, and a store never mixes histories.
       * ``mcap_get(symbol)``  -> date-indexed historical market-cap Series (optional).
       * ``float_get(symbol)`` -> date-indexed historical free-float Series (optional).
       * ``shares_get(symbol)``-> latest-filing shares (legacy mcap fallback only).
@@ -791,6 +827,9 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
       * ``<store>/build_manifest.json`` records the rule, the OHLCV last-bar distribution and the
         dropped-row counts of every build.
     """
+    check_history_source(ohlcv_history_source)
+    # an incremental build never mixes histories: extending a store of the other history REFUSES
+    require_store_history_source(store_dir, ohlcv_history_source, building=True)
     grid = scan_date_grid(start, end, cadence_days)
     want_months = sorted({d.strftime("%Y-%m") for d in grid})
     have = existing_months(store_dir)
@@ -984,6 +1023,7 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
         manifest_path = _append_build_manifest(store_dir, {
             "built_at": datetime.now().isoformat(timespec="seconds"),
             "start": start, "end": end, "cadence_days": cadence_days,
+            **stamp_history_source(ohlcv_history_source),
             "universe": universe_info,
             "drop_days": drop_days, "max_lookback": max_lookback,
             "months_written": todo_months,

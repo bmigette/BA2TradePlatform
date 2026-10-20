@@ -285,7 +285,9 @@ def preview_static_universe(store_path: str, cap_band: Optional[str], start_day:
     if cache_dir is None:
         import os
         from ba2_common.config import CACHE_FOLDER
-        cache_dir = os.path.join(CACHE_FOLDER, "FMPOHLCVProvider")
+        from ba2_common.core.ohlcv_history import history_cache_dirname
+        # the cache a job on this store reads: the store's OWN history (build_manifest stamp; unstamped = fmp)
+        cache_dir = os.path.join(CACHE_FOLDER, history_cache_dirname(_ms.store_history_source(store_path)))
     opt, base = apply_cap_band(SCREENER_OPT, {}, cap_band)
     uni = static_universe(_ms.load_store(store_path), start_day, end_day, base, gene_ranges_from_opt(opt),
                           intraday=interval_is_intraday(interval))

@@ -55,7 +55,7 @@ def cache(tmp_path):
 
 
 def test_build_writes_a_fingerprint_directory_with_explicit_coverage_lists(cache):
-    man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D", "E"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None)
+    man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D", "E"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None, history_source="fmp")
     path = man["path"]
     assert os.path.basename(path) == man["panel_fingerprint"] and os.path.dirname(path) == ls.panel_root(str(cache))
     assert not any(n.endswith((".tmp", ".building")) for n in os.listdir(path))
@@ -67,14 +67,14 @@ def test_build_writes_a_fingerprint_directory_with_explicit_coverage_lists(cache
     assert any("CURRENT listing" in p and "C" in p for p in probs) and any("no share-count source" in p for p in probs)
     # rebuilt with the stale symbol acknowledged and the share-less one dropped from the universe: clean
     man2 = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2,
-                                log=lambda m: None, acknowledged_stale=["C"])
+                                log=lambda m: None, acknowledged_stale=["C"], history_source="fmp")
     assert ls.panel_problems(man2["path"], "2024-02-01", "2024-03-20", warmup_days=20) == []
     assert man2["panel_fingerprint"] != man["panel_fingerprint"]       # another universe -> another directory
     assert {d for d, _, _ in ls.list_panels(str(cache))} == {man["path"], man2["path"]}
 
 
 def test_split_name_keeps_one_as_traded_cap_across_the_split(cache):
-    man = lb.build_daily_panel(str(cache), ["A", "B"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None)
+    man = lb.build_daily_panel(str(cache), ["A", "B"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None, history_source="fmp")
     pan = ls.load_panel(man["path"])
     i = pan.sym_index["B"]
     for day in ("2024-02-13", "2024-02-14", "2024-02-15", "2024-02-16", "2024-03-20"):
@@ -85,14 +85,14 @@ def test_split_name_keeps_one_as_traded_cap_across_the_split(cache):
 
 def test_an_up_to_date_panel_is_a_no_op_and_force_rebuilds(cache):
     logs = []
-    m1 = lb.build_daily_panel(str(cache), ["A", "B"], "2023-10-02", "2024-03-28", workers=2, log=logs.append)
-    m2 = lb.build_daily_panel(str(cache), ["A", "B"], "2023-10-02", "2024-03-28", workers=2, log=logs.append)
+    m1 = lb.build_daily_panel(str(cache), ["A", "B"], "2023-10-02", "2024-03-28", workers=2, log=logs.append, history_source="fmp")
+    m2 = lb.build_daily_panel(str(cache), ["A", "B"], "2023-10-02", "2024-03-28", workers=2, log=logs.append, history_source="fmp")
     assert m1["status"] == "built" and m2["status"] == "up_to_date" and m1["path"] == m2["path"]
 
 
 def test_a_vendor_listing_without_a_snapshot_refuses(tmp_path):
     with pytest.raises(ls.SimulationRefusal, match="no vendor share table"):
-        lb.build_daily_panel(str(tmp_path), ["A"], "2023-10-02", "2024-03-28", log=lambda m: None)
+        lb.build_daily_panel(str(tmp_path), ["A"], "2023-10-02", "2024-03-28", log=lambda m: None, history_source="fmp")
 
 
 def test_reviewed_exclusion_list_replaces_a_refusal_with_a_printed_record(cache, tmp_path):
@@ -103,7 +103,7 @@ def test_reviewed_exclusion_list_replaces_a_refusal_with_a_printed_record(cache,
         {"symbol": "A", "reason": "needless entry", "added": "2026-10-08", "reviewed_by": "owner"}]}))
     logs = []
     man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D", "E"], "2023-10-02", "2024-03-28", workers=2, log=logs.append,
-                               exclusions_path=str(ex))
+                               exclusions_path=str(ex), history_source="fmp")
     assert man["stale_listed_symbols"] == [] and man["shares_missing_listed"] == []
     assert [e["symbol"] for e in man["excluded_unusable"]] == ["A", "C", "E"]
     assert man["exclusions_not_needed"] == ["A"]
@@ -130,7 +130,7 @@ def test_acknowledged_delisting_keeps_history_and_is_never_selectable_after(cach
     last = SESSIONS[20].isoformat()
     logs = []
     man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2, log=logs.append,
-                               exclusions_path=_ack_file(tmp_path, last_session=last))
+                               exclusions_path=_ack_file(tmp_path, last_session=last), history_source="fmp")
     assert man["stale_listed_symbols"] == [] and [e["symbol"] for e in man["acknowledged_delisted"]] == ["C"]
     assert man["acknowledged_delisted"][0]["last_session"] == last and man["excluded_unusable"] == []
     assert any("ACKNOWLEDGED DELISTING (reviewed list) C" in m for m in logs)
@@ -145,7 +145,7 @@ def test_acknowledged_delisting_keeps_history_and_is_never_selectable_after(cach
     assert not candidate(SESSIONS[21].isoformat()) and not candidate(SESSIONS[22].isoformat())   # never after
     assert np.isfinite(pan.arrays["c"][pan.pos(SESSIONS[20].isoformat()), i])                # the history is kept
     # the same symbol WITHOUT the entry is a refusal (stale-listed), and its previous close lingers in live's 35-day window
-    man0 = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None)
+    man0 = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None, history_source="fmp")
     assert man0["stale_listed_symbols"] == ["C"]
     assert man0["panel_fingerprint"] != man["panel_fingerprint"]          # the file is part of the identity
     pan0 = ls.load_panel(man0["path"])
@@ -155,10 +155,10 @@ def test_acknowledged_delisting_keeps_history_and_is_never_selectable_after(cach
 def test_acknowledged_delisting_with_the_wrong_last_session_or_pending_review_refuses(cache, tmp_path):
     with pytest.raises(ls.SimulationRefusal, match="does not describe this data"):
         lb.build_daily_panel(str(cache), ["A", "C"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None,
-                             exclusions_path=_ack_file(tmp_path, last_session=SESSIONS[19].isoformat()))
+                             exclusions_path=_ack_file(tmp_path, last_session=SESSIONS[19].isoformat()), history_source="fmp")
     man = lb.build_daily_panel(str(cache), ["A", "C"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None,
                                exclusions_path=_ack_file(tmp_path, last_session=SESSIONS[20].isoformat(),
-                                                         reviewed_by="pending owner review", name="p.json"))
+                                                         reviewed_by="pending owner review", name="p.json"), history_source="fmp")
     probs = ls.panel_problems(man["path"], "2024-02-01", "2024-03-20", warmup_days=20)
     assert any("NOT reviewed" in p and "C" in p for p in probs)
     bad = tmp_path / "bad2.json"
@@ -169,7 +169,7 @@ def test_acknowledged_delisting_with_the_wrong_last_session_or_pending_review_re
 
 def test_stale_listed_is_judged_against_the_job_window_not_today(cache):
     logs = []
-    man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2, log=logs.append)
+    man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2, log=logs.append, history_source="fmp")
     last = SESSIONS[20].isoformat()                                    # C's last bar (listed by the vendor, stale)
     # the manifest RECORDS it (count, names, last bar) and the build prints it, whatever window a job reads
     assert man["stale_listed_symbols"] == ["C"] and man["stale_listed_count"] == 1 and man["stale_listed_last_bar"] == {"C": last}

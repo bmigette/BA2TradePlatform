@@ -36,7 +36,7 @@ def _build(tmp_path, frames, **kw):
     return store, ms.build_store(
         store, "key", "2026-01-03", "2026-03-28", market_cap_min=0, price_min=0, volume_min=0,
         ohlcv_get=lambda sym, end: frames[sym], cadence_days=7, max_workers=1,
-        symbol_retries=0, fail_on_quality=kw.pop("fail_on_quality", False), **kw)
+        symbol_retries=0, fail_on_quality=kw.pop("fail_on_quality", False), **kw, ohlcv_history_source="fmp")
 
 
 # --- 1. staleness limit on the scan-date reindex ------------------------------------------------
@@ -89,7 +89,7 @@ def test_prebuild_check_fails_loudly_and_writes_nothing(tmp_path, monkeypatch):
     store = str(tmp_path / "store")
     with pytest.raises(ms.MetricStoreStaleInputError) as ei:
         ms.build_store(store, "key", "2026-01-03", "2026-03-28", market_cap_min=0, price_min=0,
-                       volume_min=0, ohlcv_get=lambda s, e: frames[s], max_workers=1)
+                       volume_min=0, ohlcv_get=lambda s, e: frames[s], max_workers=1, ohlcv_history_source="fmp")
     msg = str(ei.value)
     assert "STALE1" in msg and "STALE2" in msg and "LIVE:" not in msg
     assert "--allow-stale-symbols" in msg
@@ -232,7 +232,7 @@ def test_universe_symbols_restricts_build_and_ignores_floors(tmp_path, monkeypat
     summary = ms.build_store(store, "k", "2026-01-03", "2026-03-28", market_cap_min=1e12,
                              price_min=1e6, volume_min=1e12, ohlcv_get=lambda s, e: frames[s],
                              max_workers=1, universe_symbols=["AAA", "ZZZ"],
-                             universe_symbols_path=str(f), fail_on_quality=False)
+                             universe_symbols_path=str(f), fail_on_quality=False, ohlcv_history_source="fmp")
     df = ms.load_store(store)
     assert set(df["symbol"].astype(str)) == {"AAA", "ZZZ"}          # exactly the list, floors ignored
     assert df.loc[df["symbol"] == "AAA", "sector"].astype(str).iloc[0] == "Tech"
@@ -249,7 +249,7 @@ def test_universe_prebuild_check_iterates_the_exact_set(tmp_path, monkeypatch):
     with pytest.raises(ms.MetricStoreStaleInputError) as ei:
         ms.build_store(str(tmp_path / "s"), "k", "2026-01-03", "2026-03-28", market_cap_min=0,
                        price_min=0, volume_min=0, ohlcv_get=lambda s, e: frames[s], max_workers=1,
-                       universe_symbols=["AAA", "OLD"])
+                       universe_symbols=["AAA", "OLD"], ohlcv_history_source="fmp")
     assert "OLD" in str(ei.value) and "OTHER" not in str(ei.value)
 
 

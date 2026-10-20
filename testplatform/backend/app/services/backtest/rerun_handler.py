@@ -102,6 +102,7 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
     refuse; a re-run is a measurement and must still run, loudly)."""
     import os
     from ba2_common.config import CACHE_FOLDER
+    from ba2_common.core.ohlcv_history import resolve_job_history_source
     from ba2_providers.screener import metric_store as ms
     from ba2_providers.screener import universe_superset as us
 
@@ -117,7 +118,8 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
         # a row of the live-simulation gate: its static universe is computed by the SAME function the launch used
         from app.services.backtest import screener_gate as sg
         from ba2_providers.screener import live_sim as _ls
-        new = sg.static_universe(sg.get_panel(_ls.resolve_panel_path(so["panel"]), so["panel_fingerprint"]), str(bt_block["start_date"])[:10],
+        new = sg.static_universe(sg.get_panel(_ls.resolve_panel_path(so["panel"]), so["panel_fingerprint"],
+                                                  history_source=resolve_job_history_source(bt_block)), str(bt_block["start_date"])[:10],
                                  str(bt_block["end_date"])[:10], so["base_settings"], ranges,
                                  intraday=us.interval_is_intraday(interval), excluded_symbols=excluded)
     else:

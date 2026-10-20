@@ -165,14 +165,14 @@ def test_gate_maps_the_decision_to_its_own_morning_intraday_and_daily(tmp_path):
     st = {"market_cap_min": 1e9, "max_stocks": 5}
     prices = dict(world.open_now)
     day = datetime.fromisoformat(W.DAY + "T10:00:00")
-    gate = sg.PanelGate(_runtime(str(d), st), FakePS(prices), intraday=True)
+    gate = sg.PanelGate(_runtime(str(d), st), FakePS(prices), intraday=True, history_source="fmp")
     assert gate.screen_day(day) == W.DAY                                   # the decision's OWN morning
     got = gate.symbols(day)
     assert got is gate.symbols(day)                                        # memoised: the same list object
     assert got == panel.select(W.DAY, st, BEH, now=np.array([prices[s] for s in panel.symbols]))
     # daily clock: the decision stamped D screens the NEXT session's morning with data through D
     prev = panel.sessions[panel.pos(W.DAY) - 2]
-    gate_d = sg.PanelGate(_runtime(str(d), st), FakePS(prices, intraday=False), intraday=False)
+    gate_d = sg.PanelGate(_runtime(str(d), st), FakePS(prices, intraday=False), intraday=False, history_source="fmp")
     assert gate_d.screen_day(datetime.fromisoformat(prev + "T00:00:00")) == panel.sessions[panel.pos(prev) + 1]
 
 
@@ -260,7 +260,7 @@ def test_pre_fix_volume_min_is_refused_on_a_daily_clock(tmp_path):
                    "last_bar_date": panel.sessions[-2], "source_fingerprint": "t2"})
     sg.clear_panel_memo()
     with pytest.raises(sg.ScreenerGateRefusal, match="daily clock"):
-        sg.PanelGate(_runtime(str(d), {"volume_min": 1e5}), FakePS({}, False), intraday=False, beh=ls.LEGACY_CURRENT)
+        sg.PanelGate(_runtime(str(d), {"volume_min": 1e5}), FakePS({}, False), intraday=False, beh=ls.LEGACY_CURRENT, history_source="fmp")
 
 
 def _five_min_source(skip_first_bar_of_jan3=False):
@@ -338,7 +338,7 @@ def test_the_gate_never_fetches_anything(monkeypatch, tmp_path):
                    "last_bar_date": panel.sessions[-2], "source_fingerprint": "hermetic"})
     sg.clear_panel_memo()
     gate = sg.PanelGate(_runtime(str(d), {"market_cap_min": 2e9, "max_stocks": 10}), FakePS(dict(world.open_now)),
-                        intraday=True)
+                        intraday=True, history_source="fmp")
     assert isinstance(gate.symbols(datetime.fromisoformat(W.DAY + "T10:00:00")), list)
 
 
@@ -430,7 +430,7 @@ def test_gate_t_1000_does_not_leak_a_later_session_high(tmp_path):
                   "stale_listed_symbols": [], "fresh_fraction": 1.0, "last_bar_date": "2024-01-02", "source_fingerprint": "leak"})
     sg.clear_panel_memo()
     st = {"market_cap_min": 1e9, "price_drop_pct": 20.0, "price_drop_days": 2, "max_stocks": 5}
-    gate = sg.PanelGate(_runtime(str(d), st), ps, intraday=True)
+    gate = sg.PanelGate(_runtime(str(d), st), ps, intraday=True, history_source="fmp")
     # peak(2) from the finished sessions is 101; the 14:00 spike (high ~141.5) would make 'now' ~102 a 28 % drop
     assert gate.symbols(_wall(10, 0)) == []
     assert gate.symbols(_wall(15, 45)) == ["AAA"]

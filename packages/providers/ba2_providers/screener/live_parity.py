@@ -165,7 +165,10 @@ def make_now(panel: ls.DailyPanel, day: str, mode: str = "5min-open", scale: flo
     A symbol without a value is NaN = not a candidate."""
     if cache_dir is None:
         import ba2_common.config as _cfg
-        cache_dir = os.path.join(_cfg.CACHE_FOLDER, "FMPOHLCVProvider")
+        from ba2_common.core.ohlcv_history import history_cache_dirname
+        from ba2_common.core.ohlcv_history_stamp import stored_history_source
+        # the 5-minute bars of the SAME history the panel was built from (manifest stamp; unstamped = fmp)
+        cache_dir = os.path.join(_cfg.CACHE_FOLDER, history_cache_dirname(stored_history_source(panel.manifest)))
     syms = panel.symbols
     daily_open = np.asarray(panel.arrays["o"][panel.pos(day)])
 

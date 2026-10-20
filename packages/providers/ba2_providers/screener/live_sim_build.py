@@ -2,7 +2,8 @@
 
 Inputs, all produced by the platform's cache tooling (``ba2-test prewarm --screener-panel`` /
 ``ba2-test build-screener-metrics --daily-panel``):
-  * ``<cache>/FMPOHLCVProvider/<SYM>_1d.parquet``                daily bars (``ba2-test fetch-cache``)
+  * ``<cache>/<history folder>/<SYM>_1d.parquet``                daily bars of the chosen OHLCV history
+                                                                 (``FMPOHLCVProvider`` | ``AlpacaHistoryOHLCVProvider``; ``ba2-test fetch-cache``)
   * ``<cache>/screener_fundamentals/shares/<SYM>.parquet``       the VENDOR's own outstanding-share history
                                                                  (``api/v4/historical/shares_float``, one call per symbol)
   * ``<cache>/screener_fundamentals/float/<SYM>.parquet``        free float, effective-dated (metric-store tooling)
@@ -36,6 +37,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+from ba2_common.core.ohlcv_history import (
+    LEGACY_HISTORY_SOURCE, OHLCV_HISTORY_SOURCE_KEY, check_history_source, history_cache_dirname)
+from ba2_common.core.ohlcv_history_stamp import stamp_history_source
 from ba2_providers.screener import live_sim as ls
 
 #: Bump when the BUILD logic changes what the panel contains for the same inputs (it is part of the panel fingerprint).
@@ -399,8 +403,8 @@ def _stat_token(path: str) -> str:
         return "-"
 
 
-def _ohlcv_path(cache_folder: str, sym: str) -> Optional[str]:
-    d = os.path.join(cache_folder, "FMPOHLCVProvider")
+def _ohlcv_path(cache_folder: str, sym: str, history_source: str) -> Optional[str]:
+    d = os.path.join(cache_folder, history_cache_dirname(history_source))
     for cand in (sym, sym.replace("-", "_"), sym.replace("-", ".")):
         p = os.path.join(d, f"{cand}_1d.parquet")
         if os.path.exists(p):
@@ -409,7 +413,12 @@ def _ohlcv_path(cache_folder: str, sym: str) -> Optional[str]:
 
 
 def source_fingerprint(cache_folder: str, symbols: List[str], first_day: str, end_day: str,
-                       lag: int, snapshot: Optional[str], exclusions_path: Optional[str] = None) -> str:
+                       lag: int, snapshot: Optional[str], exclusions_path: Optional[str] = None, *,
+                       history_source: str) -> str:
+    """The panel's identity.  The OHLCV history is part of it, so an alpaca panel never lands in (and
+    overwrites) an fmp panel's directory.  The legacy source adds nothing: an existing fmp panel keeps the
+    fingerprint its stored jobs name."""
+    check_history_source(history_source)
     h = hashlib.sha1()
     try:
         with open(exclusions_path or EXCLUSIONS_PATH, "rb") as _f:
@@ -418,9 +427,11 @@ def source_fingerprint(cache_folder: str, symbols: List[str], first_day: str, en
         pass
     h.update(f"{ls.CRITERIA_VERSION}|{ls.PANEL_FORMAT}|rev{BUILD_REV}|{first_day}|{end_day}|{lag}|"
              f"{os.path.basename(snapshot or '')}".encode())
+    if history_source != LEGACY_HISTORY_SOURCE:
+        h.update(f"|{OHLCV_HISTORY_SOURCE_KEY}={history_source}".encode())
     fund = os.path.join(cache_folder, "screener_fundamentals")
     for s in symbols:
-        p = _ohlcv_path(cache_folder, s)
+        p = _ohlcv_path(cache_folder, s, history_source)
         h.update(f"{s}|{_stat_token(p) if p else '-'}|"
                  f"{_stat_token(os.path.join(fund, 'market_cap', s.upper() + '.parquet'))}|"
                  f"{_stat_token(shares_cache_path(cache_folder, s))}|"
@@ -429,9 +440,9 @@ def source_fingerprint(cache_folder: str, symbols: List[str], first_day: str, en
     return h.hexdigest()
 
 
-def symbols_without_daily_bars(cache_folder: str, symbols: List[str]) -> List[str]:
+def symbols_without_daily_bars(cache_folder: str, symbols: List[str], history_source: str) -> List[str]:
     """Universe symbols with no cached daily-bar file (the panel cannot screen them; ``fetch-cache`` fixes it)."""
-    return [s for s in symbols if _ohlcv_path(cache_folder, s) is None]
+    return [s for s in symbols if _ohlcv_path(cache_folder, s, history_source) is None]
 
 
 def store_symbols(store_dir: str) -> List[str]:
@@ -627,12 +638,12 @@ def build_float_matrix(cache_folder: str, symbols: List[str], sessions: List[str
     return out, {"symbols_with_float_series": n}
 
 
-def load_bars(cache_folder: str, symbols: List[str], sessions: List[str], workers: int = 8
-              ) -> Tuple[Dict[str, Tuple[np.ndarray, ...]], Dict[str, np.ndarray], List[str]]:
+def load_bars(cache_folder: str, symbols: List[str], sessions: List[str], workers: int = 8, *,
+              history_source: str) -> Tuple[Dict[str, Tuple[np.ndarray, ...]], Dict[str, np.ndarray], List[str]]:
     """``bars[sym] = (session_idx, o, h, l, c, v)`` restricted to the panel's sessions, and the bars'
     date ordinals."""
     sess_ord = np.array([date.fromisoformat(s).toordinal() for s in sessions], dtype=np.int64)
-    cdir = os.path.join(cache_folder, "FMPOHLCVProvider")
+    cdir = os.path.join(cache_folder, history_cache_dirname(history_source))
 
     def _one(sym: str):
         r = ls._read_daily(cdir, sym)
@@ -662,8 +673,9 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
                       lag_days: int = ls.SHARES_LAG_DAYS, workers: int = 8, force: bool = False,
                       log: Callable[[str], None] = print, out_root: Optional[str] = None,
                       snapshot_dir: Optional[str] = None, acknowledged_stale: Iterable[str] = (),
-                      exclusions_path: Optional[str] = None) -> Dict[str, Any]:
-    """Build / refresh the panel for ``symbols``.  Returns the manifest (``status`` 'up_to_date' | 'built').
+                      exclusions_path: Optional[str] = None, history_source: str) -> Dict[str, Any]:
+    """Build / refresh the panel for ``symbols`` from the ``history_source`` OHLCV history (``fmp`` | ``alpaca``,
+    REQUIRED; recorded in the manifest as ``ohlcv_history_source``).  Returns the manifest (``status`` 'up_to_date' | 'built').
     ``first_day`` / ``end_day``: the session range (end extended by ten calendar days of FUTURE sessions so
     the daily clock's next-session lookup and the last decisions have a column)."""
     import time
@@ -675,7 +687,9 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
             f"no vendor share table under {snapshot_dir or vendor_dir(cache_folder)}: take one (ONE FMP call) with "
             f"`ba2-test prewarm --screener-panel` / `ba2-test build-screener-metrics --daily-panel`")
     symbols = sorted(set(symbols))
-    fp = source_fingerprint(cache_folder, symbols, first_day, end_day, lag_days, snap, exclusions_path)
+    check_history_source(history_source)
+    fp = source_fingerprint(cache_folder, symbols, first_day, end_day, lag_days, snap, exclusions_path,
+                            history_source=history_source)
     root = out_root or ls.panel_root(cache_folder)
     path = os.path.join(root, fp[:16])
     man = ls.read_manifest(path)
@@ -685,7 +699,7 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
     last = (date.fromisoformat(end_day) + timedelta(days=10))
     sessions = [d.isoformat() for d in regular_session_dates(date.fromisoformat(first_day), last)]
     log(f"daily panel: {len(symbols)} symbols x {len(sessions)} sessions ({sessions[0]}..{sessions[-1]})")
-    bars, bar_ord, no_data = load_bars(cache_folder, symbols, sessions, workers=workers)
+    bars, bar_ord, no_data = load_bars(cache_folder, symbols, sessions, workers=workers, history_source=history_source)
     log(f"daily panel: bars read for {len(bars)} symbols ({len(no_data)} without cached daily bars) "
         f"in {time.time() - t0:.0f}s")
     shares, srep = build_shares_matrix(cache_folder, symbols, sessions, bars, snap, lag_days, bar_ord)
@@ -736,7 +750,7 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
         log(f"daily panel: EXCLUDED (reviewed list) {e['symbol']}: {e['reason']} [{e['added']}, {e['reviewed_by']}]")
     for sy in unneeded:
         log(f"daily panel: NOTE exclusion {sy} is not needed by this build's data (stale/no-share condition gone): review the entry")
-    manifest = {"source_fingerprint": fp, "panel_fingerprint": fp[:16], "stale_listed_symbols": stale_listed,
+    manifest = {"source_fingerprint": fp, "panel_fingerprint": fp[:16], **stamp_history_source(history_source), "stale_listed_symbols": stale_listed,
                 "stale_listed_last_bar": {sy: date.fromordinal(int(bar_ord[sy][-1])).isoformat() for sy in stale_listed},
                 "stale_listed_count": len(stale_listed),
                 "excluded_unusable": excluded_unusable, "acknowledged_delisted": acknowledged_delisted,
