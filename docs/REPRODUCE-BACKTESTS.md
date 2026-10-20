@@ -230,6 +230,8 @@ One command, resumable, stops for a human at the split review:
 ```bash
 python tools/prepare_history.py --source alpaca --steps download,split-table,build,verify [--dry-run] [--from-step X]
 python tools/prepare_history.py --source fmp --steps download,verify      # the FMP cache, same layout
+# last step of BOTH sources: market-condition manifests on that cache (needs --universe-file --start --end, see 4.3)
+python tools/prepare_history.py --source alpaca --steps market-conditions --universe-file <universe.txt> --start 2020-01-02 --end 2025-12-31
 ```
 
 | # | Step | What it does | Inputs -> outputs |
@@ -238,6 +240,7 @@ python tools/prepare_history.py --source fmp --steps download,verify      # the 
 | 2 | `split-table` | Judges every split listed by Alpaca or FMP (FMP splits calendar, cached) against prices; rule set in `ba2_providers/ohlcv/alpaca_history/split_table.py` | -> `<cache>/AlpacaHistoryOHLCVProvider/_meta/split_table.json`, `split_accepted.csv`, `split_review.csv`, `split_vs_fmp.csv` |
 | 3 | `build` | Applies the table (prices / factor, volume x factor), New York-naive dates, 5-min regular session only, same files and columns as the FMP cache | -> `<cache>/AlpacaHistoryOHLCVProvider/<SYM>_1d.parquet`, `<SYM>_5min.parquet`, `_meta/build_manifest.json` |
 | 4 | `verify` | Coverage per symbol-year, 5-min last close vs daily close, comparison with the FMP cache | -> report |
+| 5 | `market-conditions` | `warm_market_conditions.py plan -> build --cache-only -> verify -> prepare-host` for `ohlcv-v1` and `ta-structure-v1` on this source's cache (§4.3); refused without `--universe-file --start --end`; exit 1 if any profile fails | -> `<cache>/market_conditions/` manifests; digests per profile in the JSON report |
 
 Rules to know:
 - **Same `--end` on every resume** of the download, or every daily file is fetched again. The download refuses
@@ -313,19 +316,45 @@ A manifest pins the immutable feature objects every trial reads (profiles `ohlcv
 caches differ. Each host warms and verifies its own, and a job pins the digest in its name.
 
 ```bash
-python tools/warm_market_conditions.py plan --profile ohlcv-v1 \
+python tools/warm_market_conditions.py plan --profile ohlcv-v1 --ohlcv-history-source fmp \
     --universe-file tools/options_universe_top100.txt --start 2020-01-01 --end 2025-12-31 --out plan.ohlcv-v1.json
-python tools/warm_market_conditions.py build --plan plan.ohlcv-v1.json --cache-only --print-digest
-python tools/warm_market_conditions.py verify --manifest <digest>
-python tools/warm_market_conditions.py prepare-host --manifest <digest> --profile ohlcv-v1
+python tools/warm_market_conditions.py build --plan plan.ohlcv-v1.json --cache-only --print-digest --ohlcv-history-source fmp
+python tools/warm_market_conditions.py verify --manifest <digest> --ohlcv-history-source fmp
+python tools/warm_market_conditions.py prepare-host --manifest <digest> --profile ohlcv-v1 --ohlcv-history-source fmp
 ```
 
-Repeat for `ta-structure-v1`. Pinned digests of record:
+Repeat for `ta-structure-v1`. **Every `warm_market_conditions.py` subcommand needs
+`--ohlcv-history-source {fmp,alpaca}`** (required, no default: an omission or a typo exits 2, so a vendor is
+never picked silently). It selects the manifest's source profile and the price folder: `fmp` =
+`<CACHE>/FMPOHLCVProvider` (profile `fmp-daily-split-adjusted-v1`), `alpaca` = `<CACHE>/AlpacaHistoryOHLCVProvider`
+(profile `alpaca-daily-split-verified-v1`). `build` refuses a plan of the other source, `verify` and `prepare-host`
+refuse a digest of the other source, and a job pinned to a manifest of another source profile refuses to start.
+For `alpaca`, `build --fetch-missing` is refused (that cache is built only by `tools/prepare_history.py`) and `plan`
+runs the same split-basis preflight against the splits the Alpaca build applied (`_meta/build_manifest.json`): a
+split it lists that the stored series did not absorb makes the plan actionable (exit 1).
 
-| Universe / host | `ohlcv-v1` | `ta-structure-v1` |
-|---|---|---|
-| 97 names, remote227, stage 1 since 2026-09-23 | `ca4d65d4…` (full digest in the job config, **not recorded in the repo**) | `2b6e8ca8…` (same) |
-| 753 names (stage 2), local, synced to remote227 | `105278717aecf5471e9c01ef365a436eeaa917248e34c44e2af10643cf2489bd` | `dbac2c668a9a398c5efe000a6c260e81ee3a32279d2b7d0087862c7f4faf494e` |
+The command for an Alpaca job, per source, both profiles, with the universe (`tools/options_universe_top100.txt`
+for the 97-name option universe; the 753-name stage-2 universe file for stage 2, see 4.4):
+
+```bash
+python tools/prepare_history.py --source alpaca --steps market-conditions \r
+    --universe-file tools/options_universe_top100.txt --start 2020-01-02 --end 2025-12-31
+python tools/prepare_history.py --source alpaca --steps market-conditions \r
+    --universe-file <universe_stage2.txt> --start 2020-01-02 --end 2025-12-31
+python tools/prepare_history.py --source fmp --steps market-conditions --universe-file <universe.txt> --start ... --end ...
+```
+
+It runs the four commands above for `ohlcv-v1` then `ta-structure-v1` (with `--ohlcv-history-source alpaca`), writes
+each plan under `<report-dir>/market_conditions/`, and records both digests in
+`prepare_history_alpaca_report.json` (`steps[-1].result.digests`). Digests differ **per source** (the manifest records
+its source profile, and the prices differ) **and per host** whenever the price caches differ; feature objects are
+content-addressed, so the two sources never overwrite or reuse each other's rows. Option jobs stay on `fmp` (the
+launcher refuses an option job on `alpaca`). Pinned digests of record:
+
+| Universe / host | `ohlcv-v1` (fmp) | `ta-structure-v1` (fmp) | `ohlcv-v1` (alpaca) | `ta-structure-v1` (alpaca) |
+|---|---|---|---|---|
+| 97 names, remote227, stage 1 since 2026-09-23 | `ca4d65d4…` (full digest in the job config, **not recorded in the repo**) | `2b6e8ca8…` (same) | (to be filled by the 2026-10-20 run) | (to be filled by the 2026-10-20 run) |
+| 753 names (stage 2), local, synced to remote227 | `105278717aecf5471e9c01ef365a436eeaa917248e34c44e2af10643cf2489bd` | `dbac2c668a9a398c5efe000a6c260e81ee3a32279d2b7d0087862c7f4faf494e` | (to be filled by the 2026-10-20 run) | (to be filled by the 2026-10-20 run) |
 
 The 98-name workstation digests in the goal2020 runbook (`c9ba981f…`, `3c3020d0…`) predate the
 2026-09-23 data repairs. To reproduce a specific job, read the digests from that job's
