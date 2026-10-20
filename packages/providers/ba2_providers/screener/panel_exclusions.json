@@ -53,6 +53,13 @@
    "reason": "delisted 2026-10-06; vendor and cache histories identical and both end at the last bar (2026-10-02); a valid, tradeable member of the universe 2020-2025",
    "added": "2026-10-12",
    "reviewed_by": "owner (B. Migette) 2026-10-12"
+  },
+  {
+   "symbol": "BBBY",
+   "kind": "exclude",
+   "reason": "reused ticker: Bed Bath & Beyond (bankrupt 2023) and Beyond Inc (ticker from 2025) under one symbol; the vendor daily series runs unbroken 2011-2026 while the 5-min cache has no 2024 bars and its 2020-2023 closes are off the daily close on 98-100% of days",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
   }
  ]
 }

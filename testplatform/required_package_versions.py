@@ -19,6 +19,6 @@
 # a plain dict literal of str -> str.
 REQUIRED_PACKAGE_VERSIONS = {
     "ba2_common": "2026.10.00010",
-    "ba2_providers": "2026.10.00008",
+    "ba2_providers": "2026.10.00009",
     "ba2_experts": "2026.10.00004",
 }
