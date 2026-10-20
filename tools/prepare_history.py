@@ -434,11 +434,12 @@ class StepFailed(RuntimeError):
 def mc_commands(a: argparse.Namespace, profile: str, plan_path: str, digest: str = "<digest>") -> List[List[str]]:
     """The four warm_market_conditions argv lists (without the program) of one profile; runbook 4.3 in code."""
     universe, start, end, root, _folder = mc_inputs(a)
-    hs = ["--ohlcv-history-source", a.source, "--cache-root", root, "--quiet"]
-    return [["plan", "--profile", profile, "--universe-file", universe, "--start", start, "--end", end, "--out", plan_path, *hs],
+    hs = ["--ohlcv-history-source", a.source, "--quiet"]
+    cr = ["--cache-root", root]                                # build takes none: it reads the plan's own cache_root
+    return [["plan", "--profile", profile, "--universe-file", universe, "--start", start, "--end", end, "--out", plan_path, *cr, *hs],
             ["build", "--plan", plan_path, "--cache-only", "--print-digest", *hs],
-            ["verify", "--manifest", digest, *hs],
-            ["prepare-host", "--manifest", digest, "--profile", profile, "--jobs", str(a.workers), *hs]]
+            ["verify", "--manifest", digest, *cr, *hs],
+            ["prepare-host", "--manifest", digest, "--profile", profile, "--jobs", str(a.workers), *cr, *hs]]
 
 
 def _run_warm(warm, argv: List[str]) -> Tuple[int, str, str]:

@@ -503,6 +503,13 @@ def mc_setup(ph, tmp_path, source="alpaca"):
     return argv, root
 
 
+def _real_warm_parser():
+    spec = importlib.util.spec_from_file_location("warm_market_conditions_real", REPO / "tools" / "warm_market_conditions.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.build_parser()
+
+
 class FakeWarm:
     """Stands in for tools/warm_market_conditions.py: records every argv, prints what the real CLI prints."""
 
@@ -511,6 +518,7 @@ class FakeWarm:
 
     def main(self, argv):
         self.calls.append(list(argv))
+        _real_warm_parser().parse_args(argv)           # every argv must be accepted by the REAL tool's parser
         cmd = argv[0]
         profile = argv[argv.index("--profile") + 1] if "--profile" in argv else None
         if profile is None and "--plan" in argv:
@@ -563,7 +571,11 @@ def test_market_conditions_runs_plan_build_verify_prepare_host_for_both_profiles
     assert ph.main([*argv, "--steps", "market-conditions"]) == ph.EXIT_OK
     assert [c[0] for c in warm.calls] == ["plan", "build", "verify", "prepare-host"] * 2
     for c in warm.calls:                                            # the vendor is stated on EVERY call, nothing defaulted
-        assert c[c.index("--ohlcv-history-source") + 1] == source and c[c.index("--cache-root") + 1] == str(root)
+        assert c[c.index("--ohlcv-history-source") + 1] == source
+        if c[0] == "build":                          # build reads the plan's own cache_root and has no such flag
+            assert "--cache-root" not in c
+        else:
+            assert c[c.index("--cache-root") + 1] == str(root)
     plan0 = warm.calls[0]
     assert plan0[plan0.index("--profile") + 1] == "ohlcv-v1" and plan0[plan0.index("--start") + 1] == "2024-06-03"
     assert plan0[plan0.index("--end") + 1] == "2024-06-28" and plan0[plan0.index("--universe-file") + 1].endswith("uni.txt")
