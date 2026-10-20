@@ -241,10 +241,6 @@ def test_load_overrides_validates_and_refuses_pending(tmp_path):
         st.load_overrides(write_ov(tmp_path, [ov("reject"), ov("reject")]))
 
 
-def test_shipped_overrides_file_loads_and_is_empty():
-    assert st.load_overrides() == []
-
-
 # ---- listings -----------------------------------------------------------------------------------------------
 MONTH = {
     "forward_splits": [{"symbol": "AAPL", "ex_date": "2020-08-31", "old_rate": 1, "new_rate": 4},
@@ -407,7 +403,7 @@ def runf(frames, fmp_frames, alp=(), fm=(), ov=()):
 
 
 def test_reverse_split_whose_jump_misses_by_20_percent_is_proven_by_the_fmp_step():
-    raw = bars(40, 0.12)                                        # 0.12 vs 0.1: outside the 15 % jump tolerance
+    raw = bars(40, 0.18)                                        # 0.18 vs 0.1: x1.8 off, so neither the jump proof nor the x1.5 rule applies
     acc, rev, _ = run({"X": raw}, [L("X", D, 0.1)], [L("X", D, 0.1)])
     assert acc == [] and one(rev, "unresolved")                 # the jump alone cannot decide it
     acc, rev, stats = runf({"X": raw}, {"X": fmp(raw, {40: 0.1})}, [L("X", D, 0.1)], [L("X", D, 0.1)])
@@ -490,7 +486,7 @@ def test_mismatch_resolved_by_the_step():
 
 
 def test_unstable_side_gives_no_vote_unless_another_event_is_near():
-    raw = bars(40, 0.12)
+    raw = bars(40, 0.18)
     f = fmp(raw, {40: 0.1}, wobble={38: 1.05})                  # r jumps 5 % two sessions before D
     acc, rev, _ = runf({"X": raw}, {"X": f}, [L("X", D, 0.1)], [L("X", D, 0.1)])
     assert acc == [] and one(rev, "unresolved")["fmp_step"].endswith("unstable")
@@ -500,7 +496,7 @@ def test_unstable_side_gives_no_vote_unless_another_event_is_near():
 
 
 def test_no_fmp_data_leaves_the_decision_to_the_jump():
-    raw = bars(40, 0.12)
+    raw = bars(40, 0.18)
     for fd in (None, {}, {"X": fmp(raw).iloc[0:0]}):
         acc, rev, _ = runf({"X": raw}, fd, [L("X", D, 0.1)], [L("X", D, 0.1)])
         assert acc == [] and one(rev, "unresolved")
@@ -546,7 +542,7 @@ def test_every_verdict_code_is_documented_in_the_module_docstring():
 def test_stability_waiver_counts_listed_neighbours_even_when_they_are_rejected():
     # the waiver uses LISTED events of other units, not accepted ones: a neighbour listing that is later rejected
     # (here: a contradicted 2.0 listing two sessions earlier) still waives the stability check of the main event
-    raw = bars(40, 0.12)
+    raw = bars(40, 0.18)
     f = fmp(raw, {40: 0.1}, wobble={38: 1.05})                  # r jumps 5 % at session 38: an unstable side
     acc, rev, _ = runf({"X": raw}, {"X": f}, [L("X", D, 0.1)], [L("X", D, 0.1)])
     assert acc == [] and one(rev, "unresolved")["fmp_step"].endswith("unstable")            # no neighbour: no waiver
@@ -732,9 +728,9 @@ def test_override_matching_several_groups_is_refused_and_absorbed_listings_are_c
     raw = bars(40, 4.0)
     _, _, stats = run({"X": raw}, [L("X", D, 4.0), L("X", D, 4.0)], [], [ov("reject")])
     assert stats["listings_absorbed_by_override"] == 2          # both listings of the one group
-    # two listings of different ratios on the SAME date are two groups: one override cannot decide both
-    with pytest.raises(st.SplitTableBuildError, match="ambiguous"):
-        run({"X": raw}, [L("X", D, 4.0), L("X", D, 1.1)], [L("X", D, 4.0), L("X", D, 1.1)], [ov("reject")])
+    # the same event listed with different ratios on one date (an inverted ratio): the one override decides it once
+    acc, _, stats = run({"X": raw}, [L("X", D, 4.0)], [L("X", D, 0.25)], [ov("accept", 4.0)])
+    assert [(a["factor"], a["verdict"]) for a in acc] == [(4.0, "override_accept")]
     # two overrides matching the dates of one group
     with pytest.raises(st.SplitTableBuildError, match="ambiguous"):
         run({"X": raw}, [L("X", D, 4.0), L("X", SESSIONS[41].date(), 4.0)], [],
@@ -760,3 +756,99 @@ def test_symbols_option_is_normalized(tmp_path):
     assert _cli().main(argv) == 0
     table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
     assert list(table["splits"]) == ["BRK-B"]
+
+
+# ---- A: both_listed_jump_within_1_5, B: inferred_from_fmp_step, C: the reviewed overrides, D: series breaks -----------
+def test_both_vendors_listing_a_big_ratio_with_a_jump_within_x1_5_is_accepted_without_the_step():
+    raw = bars(40, 3.0)                                          # f=4: outside the 15 % jump tolerance, inside x1.5
+    acc, rev, stats = run({"X": raw}, [L("X", D, 4.0)], [L("X", D, 4.0)])
+    assert [(a["verdict"], a["source"]) for a in acc] == [("both_listed_jump_within_1_5", "both")] and rev == []
+    assert stats["verdict_both_listed_jump_within_1_5"] == 1
+    acc, rev, _ = run({"X": bars(40, 2.0)}, [L("X", D, 4.0)], [L("X", D, 4.0)])         # x2 off f: not accepted
+    assert acc == [] and one(rev, "unresolved")
+    acc, rev, _ = run({"X": raw}, [L("X", D, 4.0)], [])                                  # one vendor only: not accepted
+    assert acc == [] and one(rev, "unresolved")
+    acc, rev, _ = run({"X": bars(40, 1.5)}, [L("X", D, 1.8)], [L("X", D, 1.8)])          # |ln f| < ln 2: not this rule
+    assert acc == [] and rev and rev[0]["verdict"] != "both_listed_jump_within_1_5"
+    acc, rev, _ = run({"X": raw}, [L("X", D, 4.0)], [L("X", D, 3.0)])                    # different ratios: not this rule
+    assert [a["verdict"] for a in acc] != ["both_listed_jump_within_1_5"]
+
+
+def test_clean_ratios():
+    assert st._nearest_clean_ratio(0.1003) == pytest.approx(0.1) and st._nearest_clean_ratio(3.99) == 4
+    assert st._nearest_clean_ratio(1.5) == 1.5 and st._nearest_clean_ratio(0.6667) == pytest.approx(2 / 3)
+    assert st._nearest_clean_ratio(1000.0) == 1000 and st._nearest_clean_ratio(0.001) == pytest.approx(0.001)
+    for off in (0.13, 1.0, 2.5, 6.5, 1001.0, 0.0009):
+        assert st._nearest_clean_ratio(off) is None, off
+
+
+def test_unlisted_split_is_inferred_from_a_clean_fmp_step_and_a_matching_jump():
+    raw = bars(40, 0.081)                                        # jump 0.081, FMP applied 0.1 (OP 2022-12-22 style)
+    acc, rev, stats = runf({"X": raw}, {"X": fmp(raw, {40: 0.1})})
+    assert [(a["factor"], a["verdict"], a["source"]) for a in acc] == [(0.1, "inferred_from_fmp_step", "fmp_step")]
+    r = one(rev, "inferred_from_fmp_step")
+    assert r["applied"] is True and r["fmp_step"].endswith("equals_f") is False and "0.1" in r["fmp_step"]
+    assert stats["verdict_inferred_from_fmp_step"] == 1
+    # a jump x2.5 away from the clean ratio: not inferred (and 4x is not a series break)
+    raw = bars(40, 0.25)
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 0.1})})
+    assert acc == [] and one(rev, "unexplained_jump")
+    # the step is not a clean ratio
+    raw = bars(40, 0.4)
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 0.4})})
+    assert acc == [] and one(rev, "unexplained_jump")
+    # no FMP data: nothing to infer from (a x12 collapse with no explanation is then a series break)
+    acc, rev, _ = run({"X": bars(40, 0.081)})
+    assert acc == [] and one(rev, "series_break")
+
+
+def test_series_break_for_an_unexplained_jump_beyond_x5_that_the_step_does_not_explain():
+    raw = bars(40, 8.0)
+    breaks = {}
+    stats = Counter()
+    acc, rev = st.decide_splits({"X": raw}, [], [], [], stats, fmp_daily={"X": fmp(raw, {40: 6.5})}, breaks=breaks)
+    assert acc == [] and one(rev, "series_break")["applied"] is False
+    assert breaks == {"X": [SESSIONS[40].date().isoformat()]} and stats["verdict_series_break"] == 1
+    # FMP's step is flat there (a real market move): never a break
+    breaks = {}
+    acc, rev = st.decide_splits({"X": raw}, [], [], [], Counter(), fmp_daily={"X": fmp(raw)}, breaks=breaks)
+    assert rev == [] and breaks == {}
+    # an inferred split is not a break
+    acc, rev = st.decide_splits({"X": raw}, [], [], [], Counter(), fmp_daily={"X": fmp(raw, {40: 8.0})}, breaks=breaks)
+    assert [a["verdict"] for a in acc] == ["inferred_from_fmp_step"] and breaks == {}
+    # between x1.8 and x5 stays an ordinary unexplained jump; without FMP data a x8 jump is a break
+    breaks = {}
+    _, rev = st.decide_splits({"X": bars(40, 3.0)}, [], [], [], Counter(), breaks=breaks)
+    assert one(rev, "unexplained_jump") and breaks == {}
+    _, rev = st.decide_splits({"X": raw}, [], [], [], Counter(), breaks=breaks)
+    assert one(rev, "series_break") and list(breaks) == ["X"]
+    _, rev = st.decide_splits({"X": bars(40, 0.1)}, [], [], [], Counter(), breaks=breaks)   # a collapse is a break too
+    assert one(rev, "series_break")
+
+
+def test_shipped_overrides_are_the_reviewed_ones():
+    entries = st.load_overrides()
+    by = {(e["symbol"], e["event_date"]): e for e in entries}
+    assert len(entries) == 12 and all(e["reviewed_by"] == "owner (B. Migette) 2026-10-20" and e["added"] == "2026-10-20"
+                                      for e in entries)
+    assert by[("VTOL", "2020-06-12")]["ratio"] == pytest.approx(1 / 3) and by[("WHWK", "2021-08-27")]["ratio"] == pytest.approx(1 / 15)
+    assert by[("ENOV", "2022-04-05")]["ratio"] == pytest.approx(1 / 3) and by[("IRON", "2022-12-30")]["ratio"] == 0.1
+    assert by[("JBIO", "2025-04-29")]["ratio"] == pytest.approx(1 / 35)
+    assert {k for k, e in by.items() if e["decision"] == "reject"} == {
+        ("AMC", "2022-08-22"), ("BIP", "2020-03-31"), ("NVS", "2019-04-09"), ("HON", "2026-06-28"), ("ADEA", "2022-10-03"), ("CRESY", "2025-11-28"), ("CTVA", "2026-10-01")}
+
+
+def test_breaks_are_written_to_the_table(tmp_path):
+    store, fmpd, raw = tiny_store(tmp_path, asof="2021-01-30")
+    sym2 = store / "bars" / "1Day" / "symbol=ZZ"
+    sym2.mkdir()
+    bars(30, 9.0).assign(h=1.0, l=1.0).to_parquet(sym2 / "all.parquet")      # a x9 overnight jump, no listing
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    (cal / "2021-01-01_2021-01-30.json").write_text("[]", encoding="utf-8")
+    (cal / "2021-01-31_2021-01-31.json").write_text("[]", encoding="utf-8")
+    sb.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01",
+                         log=lambda m: None)
+    table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
+    assert table["breaks"] == {"ZZ": [SESSIONS[30].date().isoformat()]} and "AA" in table["splits"]

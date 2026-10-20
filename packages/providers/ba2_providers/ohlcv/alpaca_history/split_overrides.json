@@ -1,4 +1,106 @@
 {
  "_doc": "REVIEWED decisions on individual split events, applied by split_table.decide_splits. An entry decides the event of its symbol on event_date (any date a vendor lists for it, or a date nobody lists: an 'accept' then ADDS the split) outright, whatever the price jump says. Never a silent tolerance: every entry needs symbol, event_date (ISO), decision ('accept' needs a ratio = new shares / old shares; 'reject' drops the event), reason, added and reviewed_by; an entry whose reviewed_by starts with 'pending' REFUSES the build. A 'reject' also silences the 'unexplained_jump' review row at its date. The file's bytes are part of the split table's fingerprint.",
- "entries": []
+ "entries": [
+  {
+   "symbol": "VTOL",
+   "event_date": "2020-06-12",
+   "decision": "accept",
+   "ratio": 0.3333333333333333,
+   "reason": "Bristow/Era 1:3; FMP lists 0.5 but applied 0.333; jump 0.316",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "WHWK",
+   "event_date": "2021-08-27",
+   "decision": "accept",
+   "ratio": 0.06666666666666667,
+   "reason": "FMP lists the ratio inverted (15) but applied 1/15; jump 0.073",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "ENOV",
+   "event_date": "2022-04-05",
+   "decision": "accept",
+   "ratio": 0.3333333333333333,
+   "reason": "Colfax 1:3 reverse split on the day of the ESAB spin-off; the jump mixes both",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "IRON",
+   "event_date": "2022-12-30",
+   "decision": "accept",
+   "ratio": 0.1,
+   "reason": "FMP-only, FMP applied it; jump 0.065 just outside x1.5",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "JBIO",
+   "event_date": "2025-04-29",
+   "decision": "accept",
+   "ratio": 0.02857142857142857,
+   "reason": "Aerovate 1:35 reverse split with the Jade merger; both vendors list it",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CRESY",
+   "event_date": "2025-11-28",
+   "decision": "reject",
+   "reason": "0.85% share distribution, not a split; immaterial, not adjusted (owner 2026-10-20)",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "AMC",
+   "event_date": "2022-08-22",
+   "decision": "reject",
+   "reason": "APE preferred-unit distribution, a different security",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "BIP",
+   "event_date": "2020-03-31",
+   "decision": "reject",
+   "reason": "BIPC share distribution, not a split",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "NVS",
+   "event_date": "2019-04-09",
+   "decision": "reject",
+   "reason": "Alcon spin-off",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "HON",
+   "event_date": "2026-06-28",
+   "decision": "reject",
+   "reason": "Solstice spin-off; Alpaca's 0.5 is spurious",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "ADEA",
+   "event_date": "2022-10-03",
+   "decision": "reject",
+   "reason": "Xperi/Adeia separation",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CTVA",
+   "event_date": "2026-10-01",
+   "decision": "reject",
+   "reason": "Vylr spin-off (Alpaca spin_offs lists VYLR); FMP lists it as a split but did not apply it",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  }
+ ]
 }

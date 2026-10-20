@@ -261,7 +261,8 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     log(f"loaded {len(bars)} symbols, {len(alpaca)} Alpaca and {len(fmp)} FMP listings, {fmp_files['count']} FMP daily "
         f"files in {time.time() - t0:.0f}s")
 
-    accepted, review = decide_splits(bars, alpaca, fmp, overrides, stats, fmp_daily=fmp_daily)
+    breaks: Dict[str, List[str]] = {}
+    accepted, review = decide_splits(bars, alpaca, fmp, overrides, stats, fmp_daily=fmp_daily, breaks=breaks)
     cmp_rows = compare_with_fmp(bars, accepted, review, alpaca, fmp, fmp_daily)
 
     h = hashlib.sha256()          # the inputs actually read: the store's action files, the calendar windows used
@@ -270,7 +271,8 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"{stamp}-{hashlib.sha256((stamp + h.hexdigest() + overrides_sha + fmp_files['content_sha256']).encode()).hexdigest()[:8]}"
     table = {"run_id": run_id, "asof": info["asof"], "inputs_sha256": h.hexdigest(), "overrides_sha256": overrides_sha,
-             "fmp_daily_files": {**fmp_files, "inputs_csv": "fmp_daily_inputs.csv"}, "splits": splits_by_symbol(accepted)}
+             "fmp_daily_files": {**fmp_files, "inputs_csv": "fmp_daily_inputs.csv"},
+             "breaks": {k: sorted(v) for k, v in sorted(breaks.items())}, "splits": splits_by_symbol(accepted)}
     # one coherent set: every CSV carries the run_id, and split_table.json is written LAST, so a crash never leaves a table
     # newer than its CSVs (a reader checks that the run_ids of the table and the CSVs match)
     atomic_write(os.path.join(meta, "split_review.csv"), _csv_bytes(REVIEW_COLUMNS, review, run_id))
@@ -282,7 +284,7 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
         stats[f"accepted_{verdict}_from_{src}"] += k
     classes = ("agree", "ratio_differs", "ours_only", "fmp_only_accepted", "fmp_only_rejected")
     return {"meta": meta, "run_id": run_id, "asof": info["asof"], "fmp_to": fmp_to, "symbols_judged": len(bars),
-            "symbols_with_splits": len(table["splits"]), "accepted": len(accepted), "review_rows": len(review),
+            "symbols_with_splits": len(table["splits"]), "series_breaks": sum(len(v) for v in breaks.values()), "accepted": len(accepted), "review_rows": len(review),
             "review_applied": sum(r["applied"] for r in review),
             "fmp_daily_files": fmp_files, "stats": dict(sorted(stats.items())),
             "compare": {c: sum(1 for r in cmp_rows if r["class"] == c) for c in classes},

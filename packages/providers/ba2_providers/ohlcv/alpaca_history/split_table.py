@@ -75,14 +75,25 @@ THE RULES (tolerances are module constants)
   * UNEXPLAINED JUMPS: an overnight close(t-1)/open(t) > 1.8 or < 0.55 with no listed event (or override) within 3 sessions
     is a review row, unless the FMP step there is ``flat`` (``jump_explained_by_market``: a real price move, counted).
     A pair of bars further apart than MAX_GAP_DAYS observes no overnight and is skipped.
+  * BOTH-VENDORS RULE (``both_listed_jump_within_1_5``): a big event with ``|ln f| >= ln 2`` that BOTH vendors list at the
+    same ratio (within 1 %) is accepted when the raw jump is within x1.5 of f, with or without a matching FMP step (tried
+    after the jump proof and the guarded step proof).
+  * INFERRED SPLITS (``inferred_from_fmp_step``): an unexplained jump (no listed event near) whose FMP step is stable and
+    within 2 % of a CLEAN ratio r -- k or 1/k for an integer k in 2..1000, or 3/2, 2/3 -- and whose raw jump is within x1.5 of
+    r is accepted at r (source ``fmp_step``), with an informational review row (applied True).
+  * SERIES BREAKS (``series_break``): any unexplained raw overnight jump still left after all of the above with
+    ``|ln jump| >= ln 5`` (beyond x5 either way) is a spliced series (a reused ticker, new equity after a bankruptcy), never
+    a split: review row (applied False) and an entry in the top-level ``breaks`` of split_table.json.  A jump that FMP's step
+    explains as a market move (``flat``) is never a break.  The cache build keeps only the segment AFTER the last break of a
+    symbol: a ticker means the company it names at the store's asof, which is also the company FMP's fundamentals describe.
   * Two accepted BIG events in the same direction within 3 sessions would adjust one split twice (the vendors list slightly
     different ratios, both "proven"): both are retracted (``overlapping_accepts``).
   * OVERRIDES (``split_overrides.json``, reviewed, same rules as screener/panel_exclusions.json): ``_doc`` + ``entries``
     with symbol, event_date (ISO), decision accept|reject, reason, added, reviewed_by, and ``ratio`` for accept (> 0, != 1).
     An entry decides the event of its symbol that lists event_date (any date of the cluster) outright; one matching no listing
-    ADDS the split (accept) or silences the unexplained-jump row at its date (reject).  An override that matches more than one
-    listing group (or two overrides one group) is ambiguous and stops the build; the listings an override absorbs are counted
-    (``listings_absorbed_by_override``).  A reviewed_by starting with
+    ADDS the split (accept) or silences the unexplained-jump row at its date (reject).  Two overrides matching one listing group are
+    ambiguous and stop the build; one override decides every listing group dated on its event_date (the same event listed
+    twice, e.g. with an inverted ratio) once, and the listings it absorbs are counted (``listings_absorbed_by_override``).  A reviewed_by starting with
     'pending' REFUSES the build (``SplitOverridesPending``; the pipeline exits 2).  The file's sha256 is in the table.
 
 VERDICT CODES (``VERDICTS``; counted in the printed summary as ``verdict_<code>``)
@@ -93,6 +104,8 @@ VERDICT CODES (``VERDICTS``; counted in the printed summary as ``verdict_<code>`
              ratio_mismatch_resolved_by_fmp_step  vendors disagree; the step equals one, the jump does not contradict it
              small_both              small, both vendors list it
              override_accept         decided by an override entry
+             both_listed_jump_within_1_5  both vendors list a big (>= x2) ratio and the jump is within x1.5 of it (no step needed)
+             inferred_from_fmp_step  an UNLISTED split read from a clean FMP step plus a raw jump within x1.5 (+ info row)
   rejected without a review row:
              override_reject         decided by an override entry
              rejected_confirmed      listing contradicted by the raw jump AND flat in FMP's step: no split anywhere
@@ -107,11 +120,12 @@ VERDICT CODES (``VERDICTS``; counted in the printed summary as ``verdict_<code>`
              no_price_data           no usable bars, or none within 30 days on both sides of the event
              unexplained_jump        raw overnight jump > x1.8 / < x0.55 with no event near and the step not flat
              overlapping_accepts     see above (both retracted)
+             series_break            unexplained raw jump beyond x5 (see SERIES BREAKS); also listed in split_table.json "breaks"
   (applied True review rows are the informational ones of fmp_only_proven, proven_by_fmp_step and the two resolved verdicts)
 
 OUTPUTS (``<out>/_meta``, atomic temp + os.replace; read the CSVs with ``read_csv_frame`` -- pandas' default NA parsing
 turns the symbol "NA" into NaN)
-  split_table.json     {run_id, asof, inputs_sha256, overrides_sha256, fmp_daily_files {dir, count, sha256 over (name,
+  split_table.json     {run_id, asof, breaks {symbol: [session date, ...]}, inputs_sha256, overrides_sha256, fmp_daily_files {dir, count, sha256 over (name,
                        size, mtime_ns), content_sha256 over (name, size, sha256 of the bytes), inputs_csv},
                        splits {symbol: [[date, factor], ...]}} events sorted; factor = new/old shares, prices BEFORE the
                        date are divided by it.  Written LAST.  Two accepted events of one symbol on one date stop the build (decide them with an
@@ -155,13 +169,16 @@ JUMP_LO = 0.55
 MAX_GAP_DAYS = 30                  # bars further apart than this do not observe an event between them
 STEP_TOL = math.log(1.02)          # FMP step: |ln step - ln f| within this -> "equals_f"; |ln step| within this -> "flat"
 STEP_JUMP_MAX = math.log(1.5)      # a step-proven accept also needs the raw jump within this of ln f (and not flat)
+BOTH_BIG_MIN = math.log(2)         # the both-vendors-listed rule needs |ln f| of at least this
+SERIES_BREAK = math.log(5)         # an unexplained overnight jump beyond x5 either way is a series break
+CLEAN_K_MAX = 1000                 # clean ratios: k or 1/k for integer k in 2..CLEAN_K_MAX, and 3/2, 2/3
 STEP_STABLE = 0.02                 # FMP step: r may vary by at most 2 % within each 3-session side of the event
 
 VERDICTS = ("proven", "fmp_only_proven", "proven_by_fmp_step", "ratio_mismatch_resolved",
             "ratio_mismatch_resolved_by_fmp_step", "small_both", "override_accept", "override_reject",
             "rejected_confirmed", "jump_explained_by_market", "alpaca_contradicted", "fmp_contradicted",
             "both_contradicted", "unresolved", "fmp_step_without_jump", "small_single_vendor", "ratio_mismatch", "no_price_data",
-            "unexplained_jump", "overlapping_accepts")
+            "unexplained_jump", "overlapping_accepts", "both_listed_jump_within_1_5", "inferred_from_fmp_step", "series_break")
 REVIEW_COLUMNS = ["symbol", "event_date", "alpaca_ratio", "fmp_ratio", "jump", "fmp_step", "verdict", "applied", "reason"]
 ACCEPTED_COLUMNS = ["symbol", "date", "factor", "source", "verdict", "jump", "fmp_step"]
 
@@ -415,6 +432,17 @@ def _fmt_step(step: Optional[float], vote: str) -> str:
     return "none" if step is None else f"{step:.6g} {vote}"
 
 
+def _nearest_clean_ratio(step: float) -> Optional[float]:
+    """The clean ratio (k or 1/k for an integer k in 2..CLEAN_K_MAX, or 3/2, 2/3) within STEP_TOL of ``step``, else None."""
+    cands = [1.5, 2.0 / 3.0]
+    x = step if step >= 1.0 else 1.0 / step
+    for k in {int(x), int(x) + 1}:
+        if 2 <= k <= CLEAN_K_MAX:
+            cands.append(float(k) if step >= 1.0 else 1.0 / k)
+    ok = [c for c in cands if abs(math.log(step) - math.log(c)) <= STEP_TOL]
+    return min(ok, key=lambda c: abs(math.log(step) - math.log(c))) if ok else None
+
+
 def _same_ratio(a: float, b: float) -> bool:
     return abs(a / b - 1.0) <= RATIO_TOL
 
@@ -557,7 +585,8 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
                   fmp_events: Iterable[ListedSplit],
                   overrides: Sequence[Mapping[str, Any]],
                   stats: Optional[Counter] = None,
-                  fmp_daily: Optional[Mapping[str, pd.DataFrame]] = None
+                  fmp_daily: Optional[Mapping[str, pd.DataFrame]] = None,
+                  breaks: Optional[Dict[str, List[str]]] = None
                   ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Judge every candidate event by the raw price jump across it, and by the FMP step when ``fmp_daily`` is given.
 
@@ -567,7 +596,8 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
     outside_range, dup_listings_collapsed, events_symbol_not_in_store, overrides_unused, ...).
 
     ``fmp_daily``: symbol -> FMP daily frame (``Date``, ``Close`` ADJUSTED).  None = the FMP-step arbiter is off (every
-    vote is "none"); a symbol missing from it is counted in ``fmp_daily_missing_symbol`` and votes "none"."""
+    vote is "none"); a symbol missing from it is counted in ``fmp_daily_missing_symbol`` and votes "none".
+    ``breaks``: filled with ``{symbol: [session date, ...]}`` of the series breaks (verdict ``series_break``)."""
     stats = stats if stats is not None else Counter()
     by_sym: Dict[str, List[Tuple[str, ListedSplit]]] = {}
     for src, evs in (("alpaca", alpaca_events), ("fmp", fmp_events)):
@@ -600,7 +630,7 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
             if rser is None:
                 stats["fmp_daily_missing_symbol"] += 1
         a, r = _decide_symbol(sym, bars, by_sym.get(sym, []), ov_by_sym.get(sym, []), stats, rser,
-                           fmp_daily is not None)
+                              fmp_daily is not None, breaks)
         accepted += a
         rows += r
     accepted.sort(key=lambda x: (x["symbol"], x["date"]))
@@ -609,7 +639,8 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
 
 
 def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]], overrides: List[Mapping[str, Any]],
-                   stats: Counter, rser: Optional[_RatioSeries] = None, step_on: bool = False) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+                   stats: Counter, rser: Optional[_RatioSeries] = None, step_on: bool = False,
+                   breaks: Optional[Dict[str, List[str]]] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     acc: List[Dict[str, Any]] = []
     rows: List[Dict[str, Any]] = []
     n = len(bars.days)
@@ -650,13 +681,15 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
         dates = sorted({m[1].date for m in grp})
         # ---- override: decides the event outright
         matches = [o for o in overrides if date.fromisoformat(o["event_date"]) in dates]
-        if len(matches) > 1 or (matches and id(matches[0]) in ov_used):
-            raise SplitTableBuildError(f"{sym}: override(s) {[o['event_date'] for o in overrides if o in matches]} match more "
-                                       f"than one event / listing group around {dates[0]}: ambiguous, split the entries")
+        if len(matches) > 1:
+            raise SplitTableBuildError(f"{sym}: overrides {[o['event_date'] for o in matches]} all match the listings around "
+                                       f"{dates[0]}: ambiguous, keep one entry per event")
         if matches:
             ov = matches[0]
-            ov_used.add(id(ov))
             stats["listings_absorbed_by_override"] += len(grp)
+            if id(ov) in ov_used:                     # the same event listed twice (e.g. with an inverted ratio): decided once
+                continue
+            ov_used.add(id(ov))
             if ov["decision"] == "accept":
                 accept(date.fromisoformat(ov["event_date"]), float(ov["ratio"]), "override", "override_accept")
             else:
@@ -720,6 +753,11 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
                        "Alpaca missed this split; the jump proves it", count=False, step=ctx.step_str(ratio, pd_))
             continue
         ps = ctx.step_proving(ratio, guard=True, both=both)
+        if ps is None and both and abs(math.log(ratio)) >= BOTH_BIG_MIN:
+            j = ctx.shown()
+            if abs(math.log(j) - math.log(ratio)) <= STEP_JUMP_MAX:       # both vendors list it, the jump is within x1.5
+                accept(d0, ratio, "both", "both_listed_jump_within_1_5", ctx.step_str(ratio, d0))
+                continue
         if ps is None:
             pe = ctx.step_proving(ratio)
             if pe is not None:                       # FMP applied it, but the raw bars barely show it: not applied
@@ -799,6 +837,23 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
                     stats["verdict_jump_explained_by_market"] += 1
                     continue
                 step = _fmt_step(v, vote)
+                clean = _nearest_clean_ratio(v) if (v is not None and vote != "unstable") else None
+                if clean is not None and abs(math.log(float(ratio_[k])) - math.log(clean)) <= STEP_JUMP_MAX:
+                    # an UNLISTED split: FMP applied a clean ratio and the raw jump is within x1.5 of it
+                    accept(day, clean, "fmp_step", "inferred_from_fmp_step", step)
+                    review(day, None, None, float(ratio_[k]), "inferred_from_fmp_step", True,
+                           f"no vendor lists it; FMP applied {clean:.6g} (step {v:.6g}) and the raw jump {ratio_[k]:.4g} is "
+                           f"within x{math.exp(STEP_JUMP_MAX):.2g} of it", count=False, step=step)
+                    continue
+            if abs(math.log(float(ratio_[k]))) >= SERIES_BREAK:
+                # beyond x5 and nothing above explains it: a spliced series (reused ticker, new equity after a bankruptcy)
+                review(day, None, None, float(ratio_[k]), "series_break", False,
+                       f"overnight close/open {ratio_[k]:.4g} beyond x{math.exp(SERIES_BREAK):.2g}, unlisted and not explained "
+                       f"by FMP's step: the series is spliced here; only the segment after the last break is used",
+                       step=step)
+                if breaks is not None:
+                    breaks.setdefault(sym, []).append(day.isoformat())
+                continue
             review(day, None, None, float(ratio_[k]), "unexplained_jump", False,
                    f"overnight close/open {ratio_[k]:.4g} with no listed split within {NEAR_SESSIONS} sessions",
                    step=step)
