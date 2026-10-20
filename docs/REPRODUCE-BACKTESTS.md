@@ -228,7 +228,8 @@ still read the FMP cache (step 1 of §4.1). Plan: [plans/2026-10-20-alpaca-histo
 One command, resumable, stops for a human at the split review:
 
 ```bash
-python tools/prepare_alpaca_history.py --steps download,split-table,build,verify [--dry-run] [--from-step X]
+python tools/prepare_history.py --source alpaca --steps download,split-table,build,verify [--dry-run] [--from-step X]
+python tools/prepare_history.py --source fmp --steps download,verify      # the FMP cache, same layout
 ```
 
 | # | Step | What it does | Inputs -> outputs |

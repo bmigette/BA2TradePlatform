@@ -34,7 +34,7 @@ Example
       --start 2019-01-01 --end 2026-10-13 --keys-db ~/Documents/ba2/trade/db.sqlite --account-id 1 --max-gap-days 5
 
 Resume with the SAME --end: without it the end defaults to today, every daily chunk's window changes and every
-daily file is fetched again. Normally run through `tools/prepare_alpaca_history.py --steps download` (the
+daily file is fetched again. Normally run through `tools/prepare_history.py --source alpaca --steps download` (the
 recorded arguments of both stores); the stores, results and later steps: docs/REPRODUCE-BACKTESTS.md §4.0.
 """
 from __future__ import annotations

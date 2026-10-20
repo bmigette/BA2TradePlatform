@@ -102,13 +102,14 @@ Steps: failing tests for each branch above (synthetic frames) -> implement -> pa
 sha256 of inputs) and `_meta/split_review.csv` -> commit.
 
 > **Owner rule (2026-10-20): one pipeline, one runbook.** Every step is a `--steps` step of ONE CLI,
-> `tools/prepare_alpaca_history.py` (`download`, `split-table`, `build`, `verify`; pattern
+> `tools/prepare_history.py --source {alpaca,fmp}` (alpaca: `download`, `split-table`, `build`, `verify`;
+> fmp: `download`, `verify`; pattern
 > `tools/prepare_option_universe.py`), documented in `docs/REPRODUCE-BACKTESTS.md` §4.0. No standalone tools, no
 > separate runbook, no scratchpad-only measurement: the 2026-10-20 FMP-vs-Alpaca comparison
 > (`compare_fmp_alpaca.py`) becomes the `verify` step.
 
 ### Task 4: Cache builder (pipeline steps `download`, `build`, `verify`)
-**Files:** Create `.../alpaca_history/build.py`, `.../alpaca_history/verify.py`; extend `tools/prepare_alpaca_history.py`;
+**Files:** Create `.../alpaca_history/build.py`, `.../alpaca_history/verify.py`; extend `tools/prepare_history.py`;
 Test `packages/providers/tests/test_alpaca_history_build.py`.
 - `adjust(frame, events)`: cumulative factor F(t) = product of f over events with date > t; prices / F, volume * F.
 - `to_native_daily(store_daily)` / `to_native_5min(store_5min_years, manifest)`: UTC -> America/New_York naive;
@@ -244,6 +245,25 @@ Measured 2026-10-20: Alpaca `delayed_sip` latest trade AND quote are 15.0 min ol
    (default) and `--store <new metric store>`; push the cache to remote150 (prunes its FMP copy); expect a NEW job
    name (the source is in the digest); preflight coverage must pass; TRLV/OGC simply have no pre-2026 history in this
    source (no exclusion needed); BBBY is excluded (04a11f53).
+
+## Phase 4 -- one runbook, few pipelines (after the Phase 3 hand-off; audit 2026-10-20)
+
+Owner rule: every backtest-preparation step is reproducible from `docs/REPRODUCE-BACKTESTS.md` and a few `--steps`
+pipelines. The 2026-10-20 audit found 35 prep scripts/commands (11 documented, 5 partly, 19 orphaned) and 9 other docs
+with prep steps.
+1. `tools/prepare_history.py --source fmp`: the FMP `download` (fetch-cache with recorded arguments) and `verify`
+   steps, plus the daily-bar hygiene checks (partial / provisional / unfinished bars) as a `hygiene` step.
+2. `tools/prepare_equity_data.py --steps prewarm,fred,screener-store,screener-panel,coverage-check`: wraps the existing
+   `ba2-test` subcommands and tools (no logic rewritten), includes the Senate JSONL conversion and the FMP/FRED
+   `first_release_v1` format check.
+3. Merge `data/stage2-universe-repair` (31 commits, unpushed, 4 conflicts against dev as of 2026-10-20:
+   `MarketDataProviderInterface.py`, `split_basis_overrides.py`, `parquet_options_provider.py`,
+   `warm_options_history.py`); commit the 753-name stage-2 universe and an exclusion list with a reason per name; add
+   `fred-rate`, `shared-arrays` (twice), `prepare-host` steps to `prepare_option_universe.py`. Required before stage 2.
+4. Fold the other docs into REPRODUCE-BACKTESTS.md (goal2020 runbook data sections, option data runbook, screener fix
+   note), add the cache-push prune rule, and a runs-of-record table generated from each pipeline's report JSON.
+5. Delete dead scripts in a separate commit after a grep of CI and docs (`cache_health_check.py`,
+   `grid_prepare_2020_stress.sh`, finished migrations, legacy grid scripts).
 
 ## Run log
 (fill in: Task 2 counts, split-table review size, build coverage, archive time, hand-off SHA)
