@@ -16,8 +16,9 @@ STEP alpaca / split-table
                 docstring of ``ba2_providers/ohlcv/alpaca_history/split_table.py``; the rules live there, the build / I-O in ``split_build.py``; this file only
                 runs it.  Reads the RAW daily store (``--store``), the FMP split calendar (fetched once, then cached under
                 ``<out>/_meta/fmp_split_calendar/`` -- a rerun is OFFLINE), the FMP daily cache (``--fmp-daily-dir``) and
-                ``split_overrides.json``.  Writes under ``<out>/_meta``: split_table.json, split_review.csv,
-                split_accepted.csv, split_vs_fmp.csv.
+                ``split_overrides.json``.  Yahoo (``yfinance``, cached under ``<out>/_meta/yahoo_splits/``, ``--refresh-yahoo`` to fetch
+                again) is consulted ONLY to confirm unlisted (inferred) splits -- never for listed events.  Writes under ``<out>/_meta``: split_table.json, split_review.csv,
+                split_accepted.csv, split_vs_fmp.csv, fmp_daily_inputs.csv, yahoo_inputs.csv.
 
 FULL COMMAND (the defaults are the production paths; every path is overridable)
     python tools/prepare_history.py --source alpaca --steps split-table \
@@ -71,6 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fmp-from", default="2016-01-01", help="first day of the FMP split calendar fetch")
     ap.add_argument("--fmp-to", help="last day of the FMP split calendar fetch (default: the store's asof + 1 day; "
                     "a value before the asof is refused)")
+    ap.add_argument("--refresh-yahoo", action="store_true",
+                    help="fetch Yahoo's split history again for the rule-B candidates (default: use <out>/_meta/yahoo_splits)")
     ap.add_argument("--overrides", default=st.OVERRIDES_PATH, help="reviewed split overrides (default: %(default)s)")
     ap.add_argument("--report-dir", help="where prepare_history_<source>_report.json goes (default: <out>/_meta)")
     return ap
@@ -91,6 +94,7 @@ def _print_split_table_summary(r: Dict[str, Any]) -> None:
         print(f"  {cls}: {n}")
         for row in r["compare_examples"].get(cls, []):
             print("     " + "  ".join(f"{k}={v}" for k, v in row.items() if k != "class"))
+    print(f"Yahoo symbols consulted (unlisted-split candidates only): {r['yahoo_files']['count']}")
     print(f"FMP daily files used: {r['fmp_daily_files']['count']} (sha256 {r['fmp_daily_files']['sha256'][:16]}...)")
     print(f"wrote {r['meta']}")
 
@@ -100,7 +104,8 @@ def step_split_table(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[
     from ba2_providers.ohlcv.alpaca_history.split_table import _norm_symbol
     symbols = [_norm_symbol(x) for x in a.symbols.split(",") if x.strip()] if a.symbols else None
     result = sb.build_split_table(store=a.store, out=a.out, db=a.db, fmp_daily_dir=a.fmp_daily_dir, symbols=symbols,
-                                  fmp_from=a.fmp_from, fmp_to=a.fmp_to, overrides_path=a.overrides, log=log)
+                                  fmp_from=a.fmp_from, fmp_to=a.fmp_to, overrides_path=a.overrides, log=log,
+                                  refresh_yahoo=a.refresh_yahoo)
     _print_split_table_summary(result)
     return result
 

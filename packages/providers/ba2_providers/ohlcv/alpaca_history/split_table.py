@@ -97,9 +97,18 @@ THE RULES (tolerances are module constants)
   * BOTH-VENDORS RULE (``both_listed_jump_within_1_5``): a big event with ``|ln f| >= ln 2`` that BOTH vendors list at the
     same ratio (within 1 %) is accepted when the raw jump is within x1.5 of f, with or without a matching FMP step (tried
     after the jump proof and the guarded step proof).
-  * INFERRED SPLITS (``inferred_from_fmp_step``): an unexplained jump (no listed event near) whose FMP step is stable and
-    within 0.5 % of a CLEAN ratio r -- k or 1/k for an integer k in 2..1000, or 3/2, 2/3 -- and whose raw jump is within x1.5 of
-    r is accepted at r (source ``fmp_step``), with an informational review row (applied True).
+  * INFERRED SPLITS (candidates).  An unexplained jump (no listed event near) whose FMP step is stable and within 0.5 % of
+    a CLEAN ratio r -- k or 1/k for an integer k in 2..1000, or 3/2, 2/3 -- and whose raw jump is within x1.5 of r is a
+    CANDIDATE unlisted split.  A split that NEITHER vendor list contains is suspicious (FMP data errors turn market gaps into
+    "splits": SM 2020-03-09, DBVT 2020-03-17), so a candidate needs a THIRD source: Yahoo (``yfinance`` ``Ticker.splits``).
+    It is accepted at r only when Yahoo lists a split within 3 sessions of the date with a ratio within 1 % of r
+    (``inferred_confirmed_by_yahoo``, source ``fmp_step+yahoo``, + informational row); Yahoo lists none ->
+    ``inferred_unconfirmed`` review row, NOT applied; Yahoo unreachable / symbol unknown ->  ``yahoo_unavailable`` review row,
+    NOT applied.  A not-applied candidate beyond x5 is still a series break.  YAHOO IS USED FOR THIS ONLY, never for listed
+    events (both-vendor, FMP-only proven, ...).  Yahoo uses CURRENT tickers: a symbol it does not know is retried under its
+    renamed successors from the Alpaca name-change chain (TPX -> SGI) and the answering ticker is recorded.  Requests are
+    paced (~1/s) and retried; the raw result per symbol is cached in ``<out>/_meta/yahoo_splits/<SYM>.json`` (with
+    ``fetched_at``), so a rerun is offline; ``--refresh-yahoo`` fetches again.  A transient failure is not cached.
   * SERIES BREAKS (``series_break``): any unexplained raw overnight jump still left after all of the above with
     ``|ln jump| >= ln 5`` (beyond x5 either way) is a spliced series (a reused ticker, new equity after a bankruptcy), never
     a split: review row (applied False) and an entry in the top-level ``breaks`` of split_table.json.  A jump that FMP's step
@@ -125,7 +134,7 @@ VERDICT CODES (``VERDICTS``; counted in the printed summary as ``verdict_<code>`
              small_both              small, both vendors list it
              override_accept         decided by an override entry
              both_listed_jump_within_1_5  both vendors list a big (>= x2) ratio and the jump is within x1.5 of it (no step needed)
-             inferred_from_fmp_step  an UNLISTED split read from a clean FMP step plus a raw jump within x1.5 (+ info row)
+             inferred_confirmed_by_yahoo  an UNLISTED split: clean FMP step + raw jump within x1.5 + Yahoo lists it (+ info row)
              spinoff_fmp_agrees / spinoff_fmp_flat / spinoff_fmp_unverified   applied spin-off (kind "spinoff"), by FMP vote
   rejected without a review row:
              override_reject         decided by an override entry
@@ -140,6 +149,8 @@ VERDICT CODES (``VERDICTS``; counted in the printed summary as ``verdict_<code>`
              ratio_mismatch          vendors disagree and neither jump nor step settles it (or both are proven)
              no_price_data           no usable bars, or none within 30 days on both sides of the event
              unexplained_jump        raw overnight jump > x1.8 / < x0.55 with no event near and the step not flat
+             inferred_unconfirmed    candidate unlisted split that Yahoo does not list (not applied)
+             yahoo_unavailable       candidate unlisted split Yahoo could not confirm (not applied)
              spinoff_fmp_mismatch    spin-off whose computed factor FMP's step contradicts (not applied)
              spinoff_no_spinco_price spin-off whose spinco has no bar within 3 sessions of the ex-date (not applied)
              overlapping_accepts     see above (both retracted)
@@ -148,7 +159,7 @@ VERDICT CODES (``VERDICTS``; counted in the printed summary as ``verdict_<code>`
 
 OUTPUTS (``<out>/_meta``, atomic temp + os.replace; read the CSVs with ``read_csv_frame`` -- pandas' default NA parsing
 turns the symbol "NA" into NaN)
-  split_table.json     {run_id, asof, spinoffs {symbol: [[date, f], ...]} (prices before date / f, volume unchanged),
+  split_table.json     {run_id, asof, yahoo_files {dir, count, content_sha256 over (symbol, sha256 of the cache file), inputs_csv}, spinoffs {symbol: [[date, f], ...]} (prices before date / f, volume unchanged),
                        breaks {symbol: [session date, ...]}, inputs_sha256, overrides_sha256, fmp_daily_files {dir, count, sha256 over (name,
                        size, mtime_ns), content_sha256 over (name, size, sha256 of the bytes), inputs_csv},
                        splits {symbol: [[date, factor], ...]}} events sorted; factor = new/old shares, prices BEFORE the
@@ -157,6 +168,8 @@ turns the symbol "NA" into NaN)
   RUN COHERENCE        every run has a run_id (UTC timestamp + 8 hex of a hash of the inputs); it is in split_table.json and
                        the last column ("run_id") of every CSV below.  The CSVs are written first, the table last, so a
                        crash never leaves a table newer than its CSVs; the cache build checks that the run_ids match.
+  yahoo_inputs.csv     symbol, ticker (the one that answered), status, n_splits, fetched_at, sha256 of every Yahoo cache file
+                       consulted by this run
   fmp_daily_inputs.csv file, size, mtime_ns, mtime_utc, sha256 (of the bytes) of every FMP daily file read: the record of
                        exactly which bytes were used (that cache is archived after the build)
   split_review.csv     REVIEW_COLUMNS (+ run_id): symbol, event_date, alpaca_ratio, fmp_ratio, jump, fmp_step, verdict, applied, reason
@@ -204,7 +217,7 @@ VERDICTS = ("proven", "fmp_only_proven", "proven_by_fmp_step", "ratio_mismatch_r
             "ratio_mismatch_resolved_by_fmp_step", "small_both", "override_accept", "override_reject",
             "rejected_confirmed", "jump_explained_by_market", "alpaca_contradicted", "fmp_contradicted",
             "both_contradicted", "unresolved", "fmp_step_without_jump", "small_single_vendor", "ratio_mismatch", "no_price_data",
-            "unexplained_jump", "overlapping_accepts", "both_listed_jump_within_1_5", "inferred_from_fmp_step", "series_break",
+            "unexplained_jump", "overlapping_accepts", "both_listed_jump_within_1_5", "inferred_confirmed_by_yahoo", "inferred_unconfirmed", "yahoo_unavailable", "series_break",
             "spinoff_fmp_agrees", "spinoff_fmp_flat", "spinoff_fmp_unverified", "spinoff_fmp_mismatch",
             "spinoff_no_spinco_price")
 REVIEW_COLUMNS = ["symbol", "event_date", "alpaca_ratio", "fmp_ratio", "jump", "fmp_step", "verdict", "applied", "reason"]
@@ -305,6 +318,20 @@ def map_to_current(symbol: str, on: date, renames: Mapping[str, Sequence[Tuple[d
             return cur
         at, cur = nxt
     raise ValueError(f"rename chain of {symbol} from {on} does not end (cycle?)")
+
+
+def rename_successors(symbol: str, renames: Mapping[str, Sequence[Tuple[date, str]]]) -> List[str]:
+    """The tickers ``symbol`` was renamed to LATER, oldest first (the name-change chain followed to its end): a vendor that
+    uses current tickers (Yahoo) may only know the last of them."""
+    out: List[str] = []
+    cur, at = _norm_symbol(symbol), date.min
+    for _ in range(25):
+        nxt = next(((d, n) for d, n in renames.get(cur, ()) if d > at), None)
+        if nxt is None:
+            return out
+        at, cur = nxt
+        out.append(cur)
+    raise ValueError(f"rename chain of {symbol} does not end (cycle?)")
 
 
 def alpaca_events_from_actions(corporate_actions: Iterable[Mapping[str, Any]],
@@ -641,7 +668,8 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
                   stats: Optional[Counter] = None,
                   fmp_daily: Optional[Mapping[str, pd.DataFrame]] = None,
                   breaks: Optional[Dict[str, List[str]]] = None,
-                  spinoffs: Iterable[SpinOff] = ()
+                  spinoffs: Iterable[SpinOff] = (),
+                  yahoo: Optional[Callable[[str], Mapping[str, Any]]] = None
                   ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Judge every candidate event by the raw price jump across it, and by the FMP step when ``fmp_daily`` is given.
 
@@ -653,7 +681,9 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
     ``fmp_daily``: symbol -> FMP daily frame (``Date``, ``Close`` ADJUSTED).  None = the FMP-step arbiter is off (every
     vote is "none"); a symbol missing from it is counted in ``fmp_daily_missing_symbol`` and votes "none".
     ``spinoffs``: the Alpaca spin-offs; each becomes an accepted event of ``kind`` "spinoff" with a COMPUTED factor (or a review
-    row), see SPIN-OFFS in the module docstring.  ``breaks``: filled with ``{symbol: [session date, ...]}`` of the series breaks (verdict ``series_break``)."""
+    row), see SPIN-OFFS in the module docstring.  ``yahoo``: ``symbol -> {"available": bool, "ticker": answering ticker, "splits": [[iso date, ratio], ...]}``, the
+    confirmation source of the UNLISTED (inferred) splits only; None = no Yahoo, every inferred candidate is
+    ``yahoo_unavailable``.  ``breaks``: filled with ``{symbol: [session date, ...]}`` of the series breaks (verdict ``series_break``)."""
     stats = stats if stats is not None else Counter()
     by_sym: Dict[str, List[Tuple[str, ListedSplit]]] = {}
     for src, evs in (("alpaca", alpaca_events), ("fmp", fmp_events)):
@@ -701,7 +731,7 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
             if rser is None:
                 stats["fmp_daily_missing_symbol"] += 1
         a, r = _decide_symbol(sym, bars, by_sym.get(sym, []), ov_by_sym.get(sym, []), stats, rser,
-                              fmp_daily is not None, breaks, so_by_sym.get(sym, []), bars_of)
+                              fmp_daily is not None, breaks, so_by_sym.get(sym, []), bars_of, yahoo)
         accepted += a
         rows += r
     accepted.sort(key=lambda x: (x["symbol"], x["date"]))
@@ -712,7 +742,8 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
 def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]], overrides: List[Mapping[str, Any]],
                    stats: Counter, rser: Optional[_RatioSeries] = None, step_on: bool = False,
                    breaks: Optional[Dict[str, List[str]]] = None, spinoffs: Sequence[SpinOff] = (),
-                   bars_of: Optional[Callable[[str], Optional[_Bars]]] = None
+                   bars_of: Optional[Callable[[str], Optional[_Bars]]] = None,
+                   yahoo: Optional[Callable[[str], Mapping[str, Any]]] = None
                    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     acc: List[Dict[str, Any]] = []
     rows: List[Dict[str, Any]] = []
@@ -963,6 +994,7 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
                 continue
             day = bars.days[t].astype(object)
             gap = not observed[k]
+            candidate_row = False
             step = "none" if step_on else ""
             if rser is not None:
                 v, ok = rser.step(day, listed_dates + ov_dates + so_dates)
@@ -973,12 +1005,28 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
                 step = _fmt_step(v, vote)
                 clean = _nearest_clean_ratio(v) if (v is not None and vote != "unstable") else None
                 if clean is not None and not gap and abs(math.log(float(ratio_[k])) - math.log(clean)) <= STEP_JUMP_MAX:
-                    # an UNLISTED split: FMP applied a clean ratio (within 0.5 %) and the raw jump is within x1.5 of it
-                    accept(day, clean, "fmp_step", "inferred_from_fmp_step", step)
-                    review(day, None, None, float(ratio_[k]), "inferred_from_fmp_step", True,
-                           f"no vendor lists it; FMP applied {clean:.6g} (step {v:.6g}) and the raw jump {ratio_[k]:.4g} is "
-                           f"within x{math.exp(STEP_JUMP_MAX):.2g} of it", count=False, step=step)
-                    continue
+                    # a CANDIDATE unlisted split: FMP applied a clean ratio (within 0.5 %) and the raw jump is within x1.5 of
+                    # it.  A split that NEITHER vendor list contains is suspicious (an FMP data error turns a market gap
+                    # into a "split"): only Yahoo listing it (within 3 sessions, ratio within 1 %) makes it one.
+                    y = yahoo(sym) if yahoo is not None else None
+                    what = (f"no vendor lists it; FMP applied {clean:.6g} (step {v:.6g}) and the raw jump {ratio_[k]:.4g} is "
+                            f"within x{math.exp(STEP_JUMP_MAX):.2g} of it")
+                    if y is None or not y["available"]:
+                        review(day, None, None, float(ratio_[k]), "yahoo_unavailable", False,
+                               what + "; Yahoo could not be consulted, so it is NOT applied", step=step)
+                        candidate_row = True
+                    elif any(abs(_first_session_on_or_after(bars, date.fromisoformat(yd)) - t) <= NEAR_SESSIONS
+                             and _same_ratio(float(yr), clean) for yd, yr in y["splits"]):
+                        accept(day, clean, "fmp_step+yahoo", "inferred_confirmed_by_yahoo", step)
+                        review(day, None, None, float(ratio_[k]), "inferred_confirmed_by_yahoo", True,
+                               what + f"; Yahoo ({y['ticker']}) lists a {clean:.6g} split within {NEAR_SESSIONS} sessions",
+                               count=False, step=step)
+                        continue
+                    else:
+                        review(day, None, None, float(ratio_[k]), "inferred_unconfirmed", False,
+                               what + f"; Yahoo ({y['ticker']}) lists no such split: NOT applied (an FMP data error?)",
+                               step=step)
+                        candidate_row = True
             if abs(math.log(float(ratio_[k]))) >= SERIES_BREAK:
                 # beyond x5 and nothing above explains it: a spliced series (reused ticker, new equity after a bankruptcy);
                 # this includes pairs across a data gap longer than MAX_GAP_DAYS
@@ -989,6 +1037,8 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
                 if breaks is not None:
                     breaks.setdefault(sym, []).append(day.isoformat())
                 continue
+            if candidate_row:
+                continue                                      # the candidate's own row already explains it
             review(day, None, None, float(ratio_[k]), "unexplained_jump", False,
                    f"overnight close/open {ratio_[k]:.4g} with no listed split within {NEAR_SESSIONS} sessions",
                    step=step)

@@ -400,9 +400,16 @@ def fmp(raw, applied=None, wobble=None):
                                   for t in raw["t"]], "Close": close})
 
 
-def runf(frames, fmp_frames, alp=(), fm=(), ov=()):
+def yhoo(*splits, available=True, ticker="X"):
+    """A fake Yahoo source: the given (date, ratio) splits for every symbol."""
+    def source(sym):
+        return {"available": available, "ticker": ticker, "splits": [[d.isoformat(), r] for d, r in splits]}
+    return source
+
+
+def runf(frames, fmp_frames, alp=(), fm=(), ov=(), yahoo=None):
     stats = Counter()
-    acc, rev = st.decide_splits(frames, list(alp), list(fm), list(ov), stats, fmp_daily=fmp_frames)
+    acc, rev = st.decide_splits(frames, list(alp), list(fm), list(ov), stats, fmp_daily=fmp_frames, yahoo=yahoo)
     return acc, rev, stats
 
 
@@ -788,11 +795,11 @@ def test_clean_ratios():
 
 def test_unlisted_split_is_inferred_from_a_clean_fmp_step_and_a_matching_jump():
     raw = bars(40, 0.081)                                        # jump 0.081, FMP applied 0.1 (OP 2022-12-22 style)
-    acc, rev, stats = runf({"X": raw}, {"X": fmp(raw, {40: 0.1})})
-    assert [(a["factor"], a["verdict"], a["source"]) for a in acc] == [(0.1, "inferred_from_fmp_step", "fmp_step")]
-    r = one(rev, "inferred_from_fmp_step")
+    acc, rev, stats = runf({"X": raw}, {"X": fmp(raw, {40: 0.1})}, yahoo=yhoo((D, 0.1)))
+    assert [(a["factor"], a["verdict"], a["source"]) for a in acc] == [(0.1, "inferred_confirmed_by_yahoo", "fmp_step+yahoo")]
+    r = one(rev, "inferred_confirmed_by_yahoo")
     assert r["applied"] is True and r["fmp_step"].endswith("equals_f") is False and "0.1" in r["fmp_step"]
-    assert stats["verdict_inferred_from_fmp_step"] == 1
+    assert stats["verdict_inferred_confirmed_by_yahoo"] == 1
     # a jump x2.5 away from the clean ratio: not inferred (and 4x is not a series break)
     raw = bars(40, 0.25)
     acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 0.1})})
@@ -818,8 +825,9 @@ def test_series_break_for_an_unexplained_jump_beyond_x5_that_the_step_does_not_e
     acc, rev = st.decide_splits({"X": raw}, [], [], [], Counter(), fmp_daily={"X": fmp(raw)}, breaks=breaks)
     assert rev == [] and breaks == {}
     # an inferred split is not a break
-    acc, rev = st.decide_splits({"X": raw}, [], [], [], Counter(), fmp_daily={"X": fmp(raw, {40: 8.0})}, breaks=breaks)
-    assert [a["verdict"] for a in acc] == ["inferred_from_fmp_step"] and breaks == {}
+    acc, rev = st.decide_splits({"X": raw}, [], [], [], Counter(), fmp_daily={"X": fmp(raw, {40: 8.0})}, breaks=breaks,
+                                yahoo=yhoo((D, 8.0)))
+    assert [a["verdict"] for a in acc] == ["inferred_confirmed_by_yahoo"] and breaks == {}
     # between x1.8 and x5 stays an ordinary unexplained jump; without FMP data a x8 jump is a break
     breaks = {}
     _, rev = st.decide_splits({"X": bars(40, 3.0)}, [], [], [], Counter(), breaks=breaks)
@@ -979,8 +987,8 @@ def test_inferred_split_needs_the_step_within_half_a_percent_of_a_clean_ratio():
     raw = bars(40, 3.1)
     acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 3.054})})             # IAC's Match separation: 3.054 is not a 3:1 split
     assert acc == [] and one(rev, "unexplained_jump")
-    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 3.01})})
-    assert [a["verdict"] for a in acc] == ["inferred_from_fmp_step"]
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 3.01})}, yahoo=yhoo((D, 3.0)))
+    assert [a["verdict"] for a in acc] == ["inferred_confirmed_by_yahoo"]
 
 
 def test_series_break_also_scans_pairs_across_a_data_gap():
@@ -1034,3 +1042,151 @@ def test_spinoff_flat_step_is_classified_first_even_for_a_small_factor():
     # a non-flat step within 10 % of f still agrees
     acc, _, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw, {40: 1.08})}, spin=(SpinOff("P", D, "S", 0.12),))
     assert [a["verdict"] for a in acc] == ["spinoff_fmp_agrees"]
+
+
+# ---- Yahoo: the confirmation source of unlisted (inferred) splits ----------------------------------------------------
+def candidate():
+    raw = bars(40, 0.081)                                        # unlisted; FMP applied 0.1; jump 0.081 (OP style)
+    return raw, {"X": fmp(raw, {40: 0.1})}
+
+
+def test_inferred_split_is_applied_only_when_yahoo_lists_it():
+    raw, fd = candidate()
+    acc, rev, stats = runf({"X": raw}, fd, yahoo=yhoo((SESSIONS[41].date(), 0.1005)))      # a day off, ratio within 1 %
+    assert [(a["verdict"], a["source"]) for a in acc] == [("inferred_confirmed_by_yahoo", "fmp_step+yahoo")]
+    assert one(rev, "inferred_confirmed_by_yahoo")["applied"] is True
+    # Yahoo lists nothing: a suspicious "split" nobody lists is NOT applied (SM 2020-03-09 style)
+    acc, rev, stats = runf({"X": raw}, fd, yahoo=yhoo())
+    assert acc == [] and one(rev, "inferred_unconfirmed")["applied"] is False and stats["verdict_inferred_unconfirmed"] == 1
+    assert not any(r["verdict"] == "unexplained_jump" for r in rev)                        # the candidate row is the explanation
+    # a split with another ratio, or more than 3 sessions away, does not confirm it
+    for bad in ((D, 0.2), (SESSIONS[45].date(), 0.1), (D, 0.102)):
+        acc, rev, _ = runf({"X": raw}, fd, yahoo=yhoo(bad))
+        assert acc == [] and one(rev, "inferred_unconfirmed"), bad
+
+
+def test_yahoo_unavailable_leaves_an_inferred_candidate_unapplied():
+    raw, fd = candidate()
+    for y in (yhoo(available=False), None):
+        acc, rev, stats = runf({"X": raw}, fd, yahoo=y)
+        assert acc == [] and one(rev, "yahoo_unavailable")["applied"] is False and stats["verdict_yahoo_unavailable"] == 1
+
+
+def test_an_unconfirmed_candidate_beyond_x5_is_still_a_series_break():
+    raw = bars(40, 0.081)
+    breaks = {}
+    _, rev = st.decide_splits({"X": raw}, [], [], [], Counter(), fmp_daily={"X": fmp(raw, {40: 0.1})}, breaks=breaks,
+                              yahoo=yhoo())
+    assert {r["verdict"] for r in rev} == {"inferred_unconfirmed", "series_break"} and list(breaks) == ["X"]
+
+
+def test_yahoo_is_not_consulted_for_listed_events():
+    calls = []
+
+    def spy(sym):
+        calls.append(sym)
+        return {"available": False, "ticker": None, "splits": []}
+    raw = bars(40, 4.0)
+    acc, _, _ = runf({"X": raw}, None, [L("X", D, 4.0)], [L("X", D, 4.0)], yahoo=spy)
+    assert [a["verdict"] for a in acc] == ["proven"] and calls == []
+
+
+def test_rename_successors_follow_the_chain():
+    ren = st.build_rename_map([{"name_changes": [{"old_symbol": "TPX", "new_symbol": "SGI", "process_date": "2023-01-02"},
+                                                  {"old_symbol": "SGI", "new_symbol": "SGII", "process_date": "2024-01-02"}]}])
+    assert st.rename_successors("tpx", ren) == ["SGI", "SGII"] and st.rename_successors("AAPL", ren) == []
+
+
+def fake_yahoo(table, log=None):
+    """fetch(ticker) -> list | None | raises: table maps ticker -> list, None (404) or an Exception."""
+    def fetch(ticker):
+        if log is not None:
+            log.append(ticker)
+        v = table[ticker]
+        if isinstance(v, Exception):
+            raise v
+        return v
+    return fetch
+
+
+def source(tmp_path, table, renames=None, log=None, **kw):
+    sleeps = []
+    src = sb.YahooSplitSource(str(tmp_path / "yahoo"), renames or {}, fetch=fake_yahoo(table, log), sleep=sleeps.append,
+                              clock=lambda: 0.0, **kw)
+    return src, sleeps
+
+
+def test_yahoo_source_falls_back_to_the_renamed_successor_and_records_who_answered(tmp_path):
+    ren = st.build_rename_map([{"name_changes": [{"old_symbol": "TPX", "new_symbol": "SGI", "process_date": "2023-01-02"}]}])
+    log = []
+    src, _ = source(tmp_path, {"TPX": None, "SGI": [("2020-11-24", 4.0)]}, ren, log)
+    assert src("TPX") == {"available": True, "ticker": "SGI", "splits": [["2020-11-24", 4.0]]} and log == ["TPX", "SGI"]
+    cached = json.loads((tmp_path / "yahoo" / "TPX.json").read_text(encoding="utf-8"))
+    assert cached["ticker"] == "SGI" and cached["fetched_at"] and cached["tried"] == ["TPX: not found"]
+    # a known ticker with no splits is available with an empty list; an unknown one is unavailable
+    src2, _ = source(tmp_path / "b", {"AAA": [], "ZZZ": None})
+    assert src2("AAA") == {"available": True, "ticker": "AAA", "splits": []}
+    assert src2("ZZZ") == {"available": False, "ticker": None, "splits": []}
+
+
+def test_yahoo_source_rerun_is_offline_and_refresh_fetches_again(tmp_path):
+    log = []
+    src, _ = source(tmp_path, {"AAA": [("2021-01-04", 2.0)]}, None, log)
+    src("AAA")
+    assert log == ["AAA"]
+    offline = sb.YahooSplitSource(str(tmp_path / "yahoo"), {}, fetch=fake_yahoo({}, log), sleep=lambda s: None)
+    assert offline("AAA")["splits"] == [["2021-01-04", 2.0]] and log == ["AAA"]            # served from the cache, no fetch
+    again = sb.YahooSplitSource(str(tmp_path / "yahoo"), {}, refresh=True, fetch=fake_yahoo({"AAA": []}, log),
+                                sleep=lambda s: None)
+    assert again("AAA")["splits"] == [] and log == ["AAA", "AAA"]
+
+
+def test_yahoo_source_retries_transient_errors_paces_requests_and_does_not_cache_a_failure(tmp_path):
+    state = {"n": 0}
+
+    def flaky(ticker):
+        state["n"] += 1
+        if state["n"] < 3:
+            raise ConnectionError("reset")
+        return [("2021-01-04", 2.0)]
+    sleeps = []
+    src = sb.YahooSplitSource(str(tmp_path / "y"), {}, fetch=flaky, sleep=sleeps.append, clock=lambda: 0.0, min_interval=1.0,
+                              backoff=(7.0,))
+    assert src("AAA")["available"] is True and state["n"] == 3 and 7.0 in sleeps and 1.0 in sleeps      # backoff and pacing
+    dead = sb.YahooSplitSource(str(tmp_path / "z"), {}, fetch=fake_yahoo({"BBB": ConnectionError("down")}),
+                               sleep=lambda s: None, retries=2)
+    assert dead("BBB") == {"available": False, "ticker": None, "splits": []}
+    assert not (tmp_path / "z" / "BBB.json").exists()                                                  # a rerun tries it again
+    assert dead.records["BBB"]["status"] == "error"
+
+
+def test_build_records_the_yahoo_inputs(tmp_path):
+    store, fmpd, raw = tiny_store(tmp_path, asof="2021-01-30")
+    # an unlisted jump with a clean FMP step in a second symbol: the only Yahoo candidate
+    cand = bars(30, 0.4).assign(h=1.0, l=1.0)
+    d = store / "bars" / "1Day" / "symbol=CC"
+    d.mkdir()
+    cand.to_parquet(d / "all.parquet")
+    fmp(cand, {30: 0.4}).to_parquet(fmpd / "CC_1d.parquet")
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    (cal / "2021-01-01_2021-01-30.json").write_text("[]", encoding="utf-8")
+    (cal / "2021-01-31_2021-01-31.json").write_text("[]", encoding="utf-8")
+    kw = dict(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01", log=lambda m: None)
+    calls = []
+    sb.build_split_table(**kw, yahoo_fetch=fake_yahoo({"CC": []}, calls), yahoo_sleep=lambda s: None)
+    assert calls == []                                           # 0.4 is no clean ratio: no candidate, Yahoo never asked
+    fmp(cand, {30: 0.5}).to_parquet(fmpd / "CC_1d.parquet")      # now a clean 1:2 step and a jump within x1.5 of it
+    cand2 = bars(30, 0.45).assign(h=1.0, l=1.0)
+    cand2.to_parquet(d / "all.parquet")
+    fmp(cand2, {30: 0.5}).to_parquet(fmpd / "CC_1d.parquet")
+    res = sb.build_split_table(**kw, yahoo_fetch=fake_yahoo({"CC": []}, calls), yahoo_sleep=lambda s: None)
+    assert calls == ["CC"] and res["stats"]["verdict_inferred_unconfirmed"] == 1
+    table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
+    assert table["yahoo_files"]["count"] == 1 and table["yahoo_files"]["inputs_csv"] == "yahoo_inputs.csv"
+    assert table["yahoo_files"]["content_sha256"] and "CC" not in table["splits"]
+    inp = sb.read_csv_frame(str(out / "_meta" / "yahoo_inputs.csv"))
+    assert inp["symbol"].tolist() == ["CC"] and inp["status"].tolist() == ["ok"] and inp["run_id"][0] == table["run_id"]
+    sb.build_split_table(**kw, yahoo_fetch=fake_yahoo({}, calls), yahoo_sleep=lambda s: None)       # offline rerun: no new fetch
+    assert calls == ["CC"]
