@@ -440,10 +440,18 @@ def test_step_without_a_matching_jump_is_not_applied():
     acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 2.0})}, [L("X", D, 2.0)])
     r = one(rev, "fmp_step_without_jump")
     assert acc == [] and r["applied"] is False and r["fmp_step"].endswith("equals_f")
-    # the jump is in the right direction but x2 off f (JBIO / NEUP): not applied either
+    # FMP-only, the jump in the right direction but x2 off f (NEUP style): (i) fails and (ii) needs both vendors
     raw = bars(40, 2.0)
-    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 4.0})}, [L("X", D, 4.0)], [L("X", D, 4.0)])
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 4.0})}, [], [L("X", D, 4.0)])
     assert acc == [] and one(rev, "fmp_step_without_jump")["jump"] == pytest.approx(2.0, rel=1e-4)
+    # (ii) both vendors list f and the jump is closer to f than to 1 (x1.9 off f=0.05, jump 0.095 vs 1): applied
+    raw = bars(40, 0.095)
+    acc, _, _ = runf({"X": raw}, {"X": fmp(raw, {40: 0.05})}, [L("X", D, 0.05)], [L("X", D, 0.05)])
+    assert [a["verdict"] for a in acc] == ["proven_by_fmp_step"]
+    # (ii) fails, JBIO style: both list f=0.02857 but the jump 0.21 is closer to 1 than to f
+    raw = bars(40, 0.21)
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 0.02857})}, [L("X", D, 0.02857)], [L("X", D, 0.02857)])
+    assert acc == [] and one(rev, "fmp_step_without_jump")
     # the same on the far side, x1.4 off f (inside x1.5, outside the 15 % jump tolerance): applied
     raw = bars(40, 4.0 / 1.4)
     acc, _, _ = runf({"X": raw}, {"X": fmp(raw, {40: 4.0})}, [L("X", D, 4.0)], [L("X", D, 4.0)])

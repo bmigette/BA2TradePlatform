@@ -58,7 +58,9 @@ THE RULES (tolerances are module constants)
     when the arbiter is off).  Candidate sessions for the step are searched like the jump's.  CAVEAT: step == f shows FMP
     APPLIED the factor, not that the market had the split; that is why a step-proven accept is GUARDED (below) and the step is
     recorded per event (``fmp_step``).  GUARD: ``proven_by_fmp_step`` needs the step equal to f within 2 % AND the raw jump
-    within x1.5 of f (STEP_JUMP_MAX) and not within ln 1.10 of 1; otherwise the event is NOT applied and gets the review verdict
+    EITHER (i) within x1.5 of f (STEP_JUMP_MAX) and not within ln 1.10 of 1, OR (ii) BOTH vendors list f (within 1 %) and the
+    jump is closer to f than to 1 in log terms (|ln jump - ln f| < |ln jump|: a reverse split on a day the stock also moved
+    hard); otherwise the event is NOT applied and gets the review verdict
     ``fmp_step_without_jump`` (FMP adjusted for a separation / spin-off the raw bars barely show: ADEA, JBIO, NEUP, RGC, TJGC).
   * both vendors list DIFFERENT ratios (not within 1 %): the ratio the jump proves wins if exactly one is proven
     (``ratio_mismatch_resolved``); else the ratio FMP's step equals wins if exactly one does and the jump does not contradict
@@ -89,7 +91,7 @@ VERDICT CODES (``VERDICTS``; counted in the printed summary as ``verdict_<code>`
              alpaca_contradicted / fmp_contradicted / both_contradicted   listed by that vendor(s), the raw price does not
                                      jump and FMP's step is not flat (or is unstable/none)
              unresolved              listed, the jump neither proves nor contradicts it, the step does not equal f
-             fmp_step_without_jump   the step equals f but the raw jump is flat or further than x1.5 from f (guard above)
+             fmp_step_without_jump   the step equals f but neither guard condition (i) nor (ii) holds
              small_single_vendor     small, only one vendor lists it
              ratio_mismatch          vendors disagree and neither jump nor step settles it (or both are proven)
              no_price_data           no usable bars, or none within 30 days on both sides of the event
@@ -593,9 +595,10 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
             v, ok = rser.step(d, others)
             return _fmt_step(v, _step_vote(v, ok, ratio))
 
-        def step_proving(ratio: float, guard: bool = False) -> Optional[date]:
+        def step_proving(ratio: float, guard: bool = False, both: bool = False) -> Optional[date]:
             """the session whose FMP step equals ``ratio`` (big events only), searched like ``proving``; with ``guard``
-            also the raw jump there must be within STEP_JUMP_MAX of ``ratio`` and not within CONTRADICT_TOL of 1"""
+            also the raw jump there must (i) be within STEP_JUMP_MAX of ``ratio`` and not within CONTRADICT_TOL of 1, or
+            (ii) ``both`` vendors list it and the jump is closer to ``ratio`` than to 1 in log terms"""
             if rser is None or abs(math.log(ratio)) < BIG_MIN:
                 return None
             for off in (0, 1, -1, 2, -2, 3, -3):
@@ -606,8 +609,10 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
                         v, ok = rser.step(day, others)
                         if _step_vote(v, ok, ratio) == "equals_f":
                             j = _jump_idx(bars, i)
-                            if guard and not (j is not None and abs(math.log(j) - math.log(ratio)) <= STEP_JUMP_MAX
-                                              and abs(math.log(j)) > CONTRADICT_TOL):
+                            if guard and not (j is not None and (
+                                    (abs(math.log(j) - math.log(ratio)) <= STEP_JUMP_MAX
+                                     and abs(math.log(j)) > CONTRADICT_TOL)
+                                    or (both and abs(math.log(j) - math.log(ratio)) < abs(math.log(j))))):
                                 continue
                             return day
             return None
@@ -664,13 +669,14 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
                 review(pd_, a_r, f_r, shown(pd_), "fmp_only_proven", True,
                        "Alpaca missed this split; the jump proves it", count=False, step=step_str(ratio, pd_))
             continue
-        ps = step_proving(ratio, guard=True)
+        ps = step_proving(ratio, guard=True, both=both)
         if ps is None:
             pe = step_proving(ratio)
             if pe is not None:                       # FMP applied it, but the raw bars barely show it: not applied
                 review(pe, a_r, f_r, shown(pe), "fmp_step_without_jump", False,
-                       f"FMP's step equals the listed ratio {ratio:.6g} but the raw jump {shown(pe):.4g} is not within "
-                       f"x{math.exp(STEP_JUMP_MAX):.2g} of it (or is flat): a separation or spin-off adjustment, not a split",
+                       f"FMP's step equals the listed ratio {ratio:.6g} but the raw jump {shown(pe):.4g} does not support it "
+                       f"(not within x{math.exp(STEP_JUMP_MAX):.2g} of it, nor, for a both-vendor listing, closer to it than to 1): "
+                       f"a separation or spin-off adjustment, not a split",
                        step=step_str(ratio, pe))
                 continue
         if ps is not None:
