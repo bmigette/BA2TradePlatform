@@ -391,3 +391,33 @@ class TestAnUnknownCloseBlocksThePass:
         results = _run(account, txn, sell, *_bind(account, _sl()))
         assert account.closed == [] and account.adjusted == [("sl", txn.id)]
         assert _skips(results, "close_outcome_unknown") == []
+
+
+# --------------------------------------------------------------------------- #
+# the activity log records WHICH adjustment ran (not always "Adjust Take Profit")
+# --------------------------------------------------------------------------- #
+
+def _logged_actions(monkeypatch):
+    from ba2_common.core import utils as _U
+    seen = []
+    monkeypatch.setattr(_U, "log_trade_action_activity", lambda **kw: seen.append(kw["action_type"]))
+    return seen
+
+
+def test_activity_log_names_sl_only_adjustment(monkeypatch):
+    from ba2_common.core.types import ExpertActionType
+    seen = _logged_actions(monkeypatch)
+    txn = _position(OrderDirection.BUY)
+    account = _Account([{"symbol": SYMBOL, "qty": 100.0}])
+    _run(account, txn, *_bind(account, _sl()))
+    assert seen == [ExpertActionType.ADJUST_STOP_LOSS]
+
+
+def test_activity_log_names_merged_tp_sl_adjustment(monkeypatch):
+    from ba2_common.core.types import ACTION_ADJUST_TP_SL
+    seen = _logged_actions(monkeypatch)
+    txn = _position(OrderDirection.BUY)
+    account = _Account([{"symbol": SYMBOL, "qty": 100.0}])
+    _run(account, txn, *_bind(account, _sl(), _tp()))
+    assert account.adjusted == [("tp_sl", txn.id)]
+    assert seen == [ACTION_ADJUST_TP_SL]
