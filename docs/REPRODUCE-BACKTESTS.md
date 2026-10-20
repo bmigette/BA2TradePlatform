@@ -282,12 +282,11 @@ The 98-name workstation digests in the goal2020 runbook (`c9ba981f…`, `3c3020d
 
 ### 4.4 Options (stage 2: 753 names) — the one-command pipeline
 
-After branch `data/stage2-universe-repair` merges, follow
-[RUNBOOK-option-universe-data.md](RUNBOOK-option-universe-data.md) (not on dev yet; read it with
-`git show data/stage2-universe-repair:docs/RUNBOOK-option-universe-data.md`). The command is:
+Follow [RUNBOOK-option-universe-data.md](RUNBOOK-option-universe-data.md). The universe is the
+committed `tools/options_universe_stage2.txt`. The command is:
 
 ```bash
-python tools/prepare_option_universe.py --universe-file <universe.txt> \
+python tools/prepare_option_universe.py --universe-file tools/options_universe_stage2.txt \
     --start 2020-01-01 --end 2025-12-31 --report-dir reports/prep-<date> [--db <sqlite with the ThetaData key>] \
     [--dry-run] [--steps a,b] [--from-step X] [--procs 2] [--theta-concurrency 1]
 ```
@@ -309,10 +308,10 @@ exclusion). `prepare-host` on each grid host and syncing the tree are **not** pa
 neither is the option risk-free rate: run `tools/refresh_fred_cache.py --series DGS3MO` and
 `--check-rate-window` (step 3b above) and sync `<CACHE_FOLDER>/fred/DGS3MO.json` to every host.
 
-The 753-name universe is the 820-name `tools/options_universe_large_cap.txt` minus 67 recorded
-exclusions: 55 with no listed options 2020-2025, CBUS, BNT, BMNR, QXO, RGC and 7 ex-SPACs. **The
-753-name file is not committed** (it sits in a session scratch folder as `universe_stage2.txt`).
-Commit it with the data branch.
+The 753-name universe, `tools/options_universe_stage2.txt`, is the 820-name
+`tools/options_universe_large_cap.txt` minus 67 recorded exclusions: 55 with no usable option chain
+2020-2025, CBUS, BNT, BMNR, QXO, RGC and 7 ex-SPACs. The 67 names and the reason for each are in
+`tools/options_universe_stage2_excluded.txt` (`SYMBOL<TAB>reason`, one per line).
 
 Measured on 2026-09-25/26 (local box, from the data runbook and the repair log):
 
