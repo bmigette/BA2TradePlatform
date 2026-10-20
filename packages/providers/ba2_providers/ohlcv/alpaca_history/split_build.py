@@ -339,13 +339,14 @@ def _absorbed(accepted: Sequence[Mapping[str, Any]]) -> Dict[str, List[List[Any]
 def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db: str = DEFAULT_DB,
                       fmp_daily_dir: str = DEFAULT_FMP_DAILY, symbols: Optional[List[str]] = None,
                       fmp_from: str = "2016-01-01", fmp_to: Optional[str] = None,
-                      overrides_path: str = OVERRIDES_PATH, log: Callable[[str], None] = print,
+                      overrides_path: Optional[str] = None, log: Callable[[str], None] = print,
                       refresh_yahoo: bool = False, yahoo_fetch: Optional[Callable] = None, yahoo_min_interval: float = 1.0,
                       yahoo_sleep: Callable[[float], None] = time.sleep) -> Dict[str, Any]:
     """Build and write ``<out>/_meta/split_table.json`` (+ review / accepted / vs-FMP CSVs).  Returns a summary:
     ``{"meta", "asof", "symbols_judged", "symbols_with_splits", "accepted", "review_rows", "review_applied",
     "stats", "compare", "compare_examples"}``.  Raises ``SplitOverridesPending`` while an override is pending.
     ``fmp_to`` defaults to the store's end (STORE_INFO asof + 1 day); a value before the store's asof is refused."""
+    overrides_path = overrides_path or OVERRIDES_PATH
     overrides = load_overrides(overrides_path)
     with open(overrides_path, "rb") as f:
         overrides_sha = hashlib.sha256(f.read()).hexdigest()
