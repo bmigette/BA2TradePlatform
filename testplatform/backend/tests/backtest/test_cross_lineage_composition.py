@@ -28,9 +28,10 @@ DIVIDES that 20,000 by:
 
   * the SIZER divides by COLLATERAL      -- 90 % of 20,000 over a 136.00 per-contract
     reserve wants **132** condors;
-  * the CAPACITY gate divides by DELIVERY -- 20,000 against a 100-strike short put,
-    10,000 of delivery per unit, so **2** units fit and 3 do not;
-  * the RISK MANAGER must see **2**.
+  * the CAPACITY gate divides by DELIVERY -- 20,000 against a 2-wide netted put spread,
+    200 of NETTED delivery per unit (the long put covers all but the wing width, since
+    5a3fcc5c), so **100** units fit and 101 do not;
+  * the RISK MANAGER must see **100**.
 
 The cap is load-bearing in both: on the uncapped 30,000 the same two formulas want 198
 and admit 3. So this is one run in which the equity cap, the collateral sizer and the
@@ -85,13 +86,15 @@ WIDTH = 2.0
 NET_CREDIT = 0.64
 #: (width - credit) x 100. The per-contract collateral AND the measured max loss.
 RESERVE_PER_CONTRACT = (WIDTH - NET_CREDIT) * 100.0            # 136.00
-#: What ONE unit costs to take delivery on, if the short put is assigned.
-DELIVERY_PER_UNIT = SHORT_PUT * 100.0                          # 10,000.00
+#: What ONE unit costs to take delivery on, if the short put is assigned. Since 5a3fcc5c
+#: (operator decision 2026-10-15) the protective long put of the same expiry NETS the short
+#: put's bill to the wing width: (100 - 98) x 100, not the full 100-strike 10,000.
+DELIVERY_PER_UNIT = (SHORT_PUT - LONG_PUT) * 100.0             # 200.00
 
 #: floor(CAP x SIZING_PCT% / RESERVE_PER_CONTRACT) = floor(18,000 / 136) = 132.
 WANTED = 132
-#: floor(CAP / DELIVERY_PER_UNIT) = floor(20,000 / 10,000) = 2.
-ADMITTED = 2
+#: floor(CAP / DELIVERY_PER_UNIT) = floor(20,000 / 200) = 100 (was 2 before 5a3fcc5c).
+ADMITTED = 100
 
 START = datetime(2024, 2, 1)
 END = datetime(2024, 2, 6)
@@ -112,7 +115,9 @@ CHAIN = [
 
 RAILS: Dict[str, Any] = {
     "max_concurrent_structures": 10,
-    "max_deployment_pct": 40.0,
+    # 100 x 136 = 13,600 reserve is 68 % of the 20,000 cap: the old 40 % rail would refuse
+    # the admitted size and the entry would never reach the order row.
+    "max_deployment_pct": 100.0,
     # Deliberately slack: the rail under test is the QUANTITY the gate is handed, and a
     # candidate that also tripped leverage would pass this test for the wrong reason.
     "max_notional_leverage": 100.0,
@@ -168,6 +173,12 @@ def _bar_rows(rows):
             for (d, o, h, low, c) in rows]
 
 
+#: The backtest fill model caps participation at 10 % of the bar volume, so 100 contracts
+#: need >= 1,000. At the old 400 the 100-lot (admitted since 5a3fcc5c) was rejected as
+#: illiquid, expired unfilled, and the entry was retried (and re-admitted) every day.
+BAR_VOLUME = 5000
+
+
 def _seed_cache(db_path: str) -> None:
     """The four condor legs, quoted on every run date and marked on every bar."""
     from app.services.backtest.options_cache import OptionsHistoryCache
@@ -185,7 +196,7 @@ def _seed_cache(db_path: str) -> None:
         mid = (bid + ask) / 2
         for d in RUN_DATES:
             bars.append({"occ_symbol": occ, "date": d.isoformat(), "open": mid,
-                         "high": ask, "low": bid, "close": mid, "volume": 400,
+                         "high": ask, "low": bid, "close": mid, "volume": BAR_VOLUME,
                          "underlying": "AAPL", "option_type": right, "strike": strike,
                          "expiry": EXPIRY.isoformat()})
     cache.write_bar_rows(bars)
@@ -320,7 +331,8 @@ def _capacity_probe(account) -> Dict[int, bool]:
     at the instant the entry is being decided.
     """
     return {n: account.check_short_put_assignment_capacity(
-        strike=SHORT_PUT, contracts=n).ok for n in (WANTED, ADMITTED, ADMITTED + 1)}
+        strike=SHORT_PUT, contracts=n,
+        long_puts=[(LONG_PUT, n)]).ok for n in (WANTED, ADMITTED, ADMITTED + 1)}
 
 
 # =========================================================================== #
@@ -339,9 +351,9 @@ def test_the_capacity_gate_really_binds_at_two_units():
     assert run.true_equity > CAP                        # the ledger holds more than the cap
     assert run.capped_balance == pytest.approx(CAP)      # ...and every reader sees 20,000
 
-    assert run.capacity_at_entry[WANTED] is False        # 132 units cannot take delivery
-    assert run.capacity_at_entry[ADMITTED + 1] is False  # nor can 3
-    assert run.capacity_at_entry[ADMITTED] is True       # 2 can
+    assert run.capacity_at_entry[WANTED] is False        # 132 units: 26,400 of netted delivery
+    assert run.capacity_at_entry[ADMITTED + 1] is False  # nor can 101
+    assert run.capacity_at_entry[ADMITTED] is True       # 100 can
 
 
 def test_the_risk_manager_is_handed_the_DOWNSIZED_quantity():
@@ -377,13 +389,13 @@ def test_the_order_row_carries_the_downsized_size_and_both_entry_facts():
 
     assert parent.quantity == ADMITTED, parent.quantity
     data = parent.data or {}
-    # Re-derived for the CLAMPED size: 2 x 136, not 132 x 136.
+    # Re-derived for the CLAMPED size: 100 x 136, not 132 x 136.
     assert data["option_reserve"] == pytest.approx(RESERVE_PER_CONTRACT * ADMITTED)
     assert data["max_loss_per_contract"] == pytest.approx(RESERVE_PER_CONTRACT)
 
 
 def test_every_leg_row_is_written_at_the_downsized_size_too():
-    """A parent clamped to 2 over legs still written at 132 would be a book the account
+    """A parent clamped to 100 over legs still written at 132 would be a book the account
     cannot pay for, assembled out of two individually-correct lineages."""
     run = _engine_run(account_id=9404, expert_id=9404)
 
