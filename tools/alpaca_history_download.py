@@ -8,8 +8,9 @@ Guarantees
 - A chunk (one symbol's daily history, one symbol-year of intraday bars, one month of corporate
   actions) is fetched completely, validated, and only then written: temp file + os.replace, then
   the manifest. A crash, a failed page or a refused chunk leaves no file a reader could take for data.
-- An intraday chunk that lacks bars on a day the symbol has a daily bar with trades is REFUSED (nothing
-  written, the days are listed in the manifest). Use --retry-refused to try such chunks again. A daily bar
+- An intraday chunk that lacks bars on MORE than --max-gap-days days where the symbol has a daily bar with
+  trades is REFUSED (nothing written, the days are listed in the manifest). Up to that many such days, the
+  chunk is stored and its manifest entry lists them (days_without_intraday_bars); readers must honour it. Use --retry-refused to try such chunks again. A daily bar
   with volume 0 and 0 trades is Alpaca's placeholder for a day nothing traded: no intraday bar is expected
   on it, and the chunk's manifest entry counts those days (zero_trade_daily_days).
 - Transport errors, HTTP 5xx and 429 are retried with exponential backoff (429 honours Retry-After /
@@ -359,7 +360,7 @@ class SymbolManifest:
 
 class Downloader:
     def __init__(self, store: Path, transport: Transport, *, start: dt.datetime, end_exclusive: dt.datetime,
-                 asof: str, retry_refused: bool, max_consecutive_failures: int):
+                 asof: str, retry_refused: bool, max_consecutive_failures: int, max_gap_days: int):
         self.store = store
         self.transport = transport
         self.start = start
@@ -367,6 +368,7 @@ class Downloader:
         self.asof = asof
         self.retry_refused = retry_refused
         self.max_consecutive_failures = max_consecutive_failures
+        self.max_gap_days = max_gap_days
         self.counts = {"written": 0, "skipped": 0, "refused": 0, "failed": 0, "empty": 0}
         self.consecutive_failures = 0
         self.started = time.time()
@@ -529,10 +531,9 @@ class Downloader:
                                          chunk_start, chunk_end, self.asof)
                 frame = bars_to_frame(bars, chunk_start, chunk_end)
                 missing = sorted(expected - session_days(frame))
-                if missing:
-                    raise ChunkRefused("days_without_intraday_bars",
-                                       {"count": len(missing), "of": len(expected),
-                                        "days": [day.isoformat() for day in missing[:400]]})
+                gaps = {"count": len(missing), "of": len(expected), "days": [day.isoformat() for day in missing[:400]]}
+                if missing and (len(missing) > self.max_gap_days or frame.empty):
+                    raise ChunkRefused("days_without_intraday_bars", gaps)
             except ChunkRefused as error:
                 self._refuse(manifest, key, window, path, error)
                 continue
@@ -543,7 +544,7 @@ class Downloader:
             extra_days = len(session_days(frame) - expected)
             self._write_bars(manifest, key, window, path, frame, pages,
                              {"daily_days": len(expected), "zero_trade_daily_days": len(zero_trade),
-                              "days_without_daily_bar": extra_days})
+                              "days_without_daily_bar": extra_days, "days_without_intraday_bars": gaps})
             log(f"  {symbol} {key}: {len(frame):,} bars, {pages} pages, {time.time() - began:.1f}s")
 
     # --- corporate actions ---------------------------------------------------------------------
@@ -696,6 +697,8 @@ def main(argv: Optional[list] = None) -> int:
                         help="pause until the vendor's window resets when fewer calls than this remain")
     parser.add_argument("--max-attempts", type=int, default=8, help="attempts per request")
     parser.add_argument("--max-consecutive-failures", type=int, default=5)
+    parser.add_argument("--max-gap-days", type=int, required=True,
+                        help="store an intraday year missing at most this many traded days (listed in the manifest)")
     parser.add_argument("--retry-refused", action="store_true", help="fetch chunks again that an earlier run refused")
     parser.add_argument("--keys-db")
     parser.add_argument("--account-id", type=int)
@@ -724,7 +727,7 @@ def main(argv: Optional[list] = None) -> int:
                               min_remaining=args.min_remaining)
         run = Downloader(args.store, transport, start=start, end_exclusive=end_exclusive, asof=asof,
                          retry_refused=args.retry_refused,
-                         max_consecutive_failures=args.max_consecutive_failures)
+                         max_consecutive_failures=args.max_consecutive_failures, max_gap_days=args.max_gap_days)
         log(f"store {args.store} | {len(symbols)} symbols | {iso_z(start)} .. {iso_z(end_exclusive)} (exclusive) | "
             f"asof {asof} | phases {phases} | rpm {args.rpm:g} | swept {removed} temp files | pid {os.getpid()}")
         try:

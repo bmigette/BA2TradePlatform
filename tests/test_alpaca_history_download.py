@@ -86,12 +86,12 @@ class FakeAlpaca:
         return _Response({"bars": {query["symbols"]: page} if page else {}, "next_page_token": token})
 
 
-def _run(tmp_path, fake, *, end=END, retry_refused=False, max_attempts=3, sleeps=None):
+def _run(tmp_path, fake, *, end=END, retry_refused=False, max_attempts=3, sleeps=None, max_gap_days=0):
     transport = dl.Transport("KEY", "SECRET", rpm=1e9, max_attempts=max_attempts, min_remaining=10,
                              opener=fake, sleep=(sleeps.append if sleeps is not None else lambda _s: None))
     asof = dl.open_store(tmp_path, START, None, "2020-01-03")
     run = dl.Downloader(tmp_path, transport, start=START, end_exclusive=end, asof=asof,
-                        retry_refused=retry_refused, max_consecutive_failures=99)
+                        retry_refused=retry_refused, max_consecutive_failures=99, max_gap_days=max_gap_days)
     run.daily("ABC")
     run.intraday("ABC")
     return run
@@ -228,6 +228,27 @@ def test_a_target_file_held_for_good_stops_the_run(tmp_path, monkeypatch):
     monkeypatch.setattr(dl.time, "sleep", lambda _s: None)
     with pytest.raises(PermissionError):
         dl.atomic_write_json(tmp_path / "progress.json", {"a": 1})
+
+
+def test_a_year_missing_few_traded_days_is_stored_with_the_days_listed(tmp_path):
+    fake = _fake(intraday_days=[DAYS[0], DAYS[2], DAYS[3]])
+    run = _run(tmp_path, fake, max_gap_days=1)
+    entry = _chunks(tmp_path)["5Min/2019"]
+    assert run.counts["refused"] == 0 and entry["status"] == "complete"
+    assert entry["days_without_intraday_bars"] == {"count": 1, "of": 2, "days": ["2019-12-31"]}
+    assert _chunks(tmp_path)["5Min/2020"]["days_without_intraday_bars"]["count"] == 0
+
+
+def test_a_year_missing_more_than_the_limit_is_refused(tmp_path):
+    fake = _fake(intraday_days=[DAYS[2], DAYS[3]])  # both 2019 days missing
+    _run(tmp_path, fake, max_gap_days=1)
+    assert _chunks(tmp_path)["5Min/2019"]["status"] == "refused_days_without_intraday_bars"
+
+
+def test_a_year_with_no_intraday_bar_at_all_is_refused_even_under_the_limit(tmp_path):
+    fake = _fake(intraday_days=[DAYS[2], DAYS[3]])
+    _run(tmp_path, fake, max_gap_days=5)
+    assert _chunks(tmp_path)["5Min/2019"]["status"] == "refused_days_without_intraday_bars"
 
 
 def test_a_duplicated_bar_refuses_the_chunk(tmp_path):
