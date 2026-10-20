@@ -434,10 +434,20 @@ def test_contradicted_listing_with_a_flat_step_is_rejected_without_a_row():
     assert one(rev, "alpaca_contradicted")["fmp_step"] == "1.5 other"
 
 
-def test_contradicted_listing_that_fmp_applied_is_accepted_and_counted():
-    raw = bars()                                                # no jump in the raw bars, but FMP applied the 2.0
-    acc, rev, stats = runf({"X": raw}, {"X": fmp(raw, {40: 2.0})}, [L("X", D, 2.0)])
-    assert [a["verdict"] for a in acc] == ["proven_by_fmp_step"] and stats["step_accepted_with_flat_jump"] == 1
+def test_step_without_a_matching_jump_is_not_applied():
+    # guard: the step equals f but the raw jump is flat (ADEA / TJGC) -> review row, NOT applied
+    raw = bars()
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 2.0})}, [L("X", D, 2.0)])
+    r = one(rev, "fmp_step_without_jump")
+    assert acc == [] and r["applied"] is False and r["fmp_step"].endswith("equals_f")
+    # the jump is in the right direction but x2 off f (JBIO / NEUP): not applied either
+    raw = bars(40, 2.0)
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 4.0})}, [L("X", D, 4.0)], [L("X", D, 4.0)])
+    assert acc == [] and one(rev, "fmp_step_without_jump")["jump"] == pytest.approx(2.0, rel=1e-4)
+    # the same on the far side, x1.4 off f (inside x1.5, outside the 15 % jump tolerance): applied
+    raw = bars(40, 4.0 / 1.4)
+    acc, _, _ = runf({"X": raw}, {"X": fmp(raw, {40: 4.0})}, [L("X", D, 4.0)], [L("X", D, 4.0)])
+    assert [a["verdict"] for a in acc] == ["proven_by_fmp_step"] and acc[0]["jump"] == pytest.approx(4.0 / 1.4, rel=1e-4)
 
 
 def test_mismatch_resolved_by_the_step():
