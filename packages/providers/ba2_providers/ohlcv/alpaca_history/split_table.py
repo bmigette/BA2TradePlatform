@@ -1,35 +1,127 @@
-"""Our own split table over the RAW Alpaca daily store: every candidate event is judged by the raw price jump.
+"""Our own split table over the RAW Alpaca daily store: every candidate split is judged by the raw price.
 
-Neither vendor's split list is trusted (Alpaca lists spurious events -- HON, NVS, STRR, SNEX, BIP, DRS, IR -- and
-misses real ones -- KOD, UHAL, SNX, IAC, RTX; FMP has mixed-basis series).  The bars are RAW, so a real split shows
-as an overnight jump ``close(D-1) / open(D)`` about equal to the factor ``f`` (new shares / old shares; a reverse
-split has f < 1).  ``decide_splits`` accepts an event the price proves, rejects (with a review row) one the price
-contradicts, and sends everything it cannot settle to a review row that is NOT applied.  Nothing is dropped
-quietly: the counts of what was set aside (outside the bar range, not in the store, ...) go into ``stats``.
+Runbook: docs/REPRODUCE-BACKTESTS.md section 4 (data preparation).  Run it through the pipeline CLI, step ``split-table``
+(offline once the FMP calendar windows are cached):
 
-The rules (``PROVEN_TOL`` etc. below):
-  * big event (``|ln f| >= ln 1.25``): PROVEN when ``|ln(jump) - ln(f)| <= ln 1.15`` -> accepted, whatever the source
-    (FMP-only and proven gets a review row, "Alpaca missed").  CONTRADICTED when the jump is within ``ln 1.10`` of 1
-    -> rejected + review row.  In between -> review row, not applied.
-  * small event (stock dividends, small unit splits): price cannot prove it.  Accepted when BOTH vendors list it
-    (ratios within 1 %); otherwise review row, not applied.
-  * both vendors list one event with different ratios: the ratio the jump proves wins (review row); if the jump
-    proves neither or both, review row, not applied.
-  * a cluster where a vendor lists several ratios is several events, one per ratio, each decided on its own;
-    no usable bars on the two sides of it: review row, not applied.
-  * duplicate listings (same event within ``NEAR_SESSIONS`` sessions, ratio within 1 %) are one event.
-  * an unexplained overnight jump (> x1.8 or < x0.55) with no listed event within 3 sessions: review row.
-  * an override (``split_overrides.json``) decides its event outright.
+    python tools/prepare_alpaca_history.py --steps split-table
+
+WHY.  Neither vendor's split list is trusted: Alpaca lists spurious events (HON, NVS, STRR, SNEX, BIP, DRS, IR) and misses
+real ones (KOD, UHAL, SNX, IAC, RTX); FMP has mixed-basis series (CRWD, META before 2022-06).  The bars here are RAW, so a
+real split shows as an overnight jump ``close(D-1) / open(D)`` about equal to the factor ``f`` (new shares / old shares; a
+reverse split has f < 1).  Task 4 (the cache build) reads only ``_meta/split_table.json``.
+
+INPUTS (all read-only)
+  * ``--store`` (default ~/Documents/ba2/alpaca_store_daily2016): ``bars/1Day/symbol=<S>/all.parquet`` (t UTC bar start, o,
+    h, l, c, v, n, vw; folder names use '-' as in BRK-B), ``corporate_actions/ym=YYYY-MM.json.gz``, ``STORE_INFO.json``.
+  * FMP split calendar ``/api/v3/stock_split_calendar`` (date, symbol, numerator, denominator), fetched in 30-day windows
+    (a window of 1000+ rows is halved down to one day; a row more than a day outside its window is refused) and cached raw
+    in ``<out>/_meta/fmp_split_calendar/<from>_<to>.json``.  The key is the AppSetting FMP_API_KEY of ``--db`` (read-only),
+    read only when a window is not cached, never printed.
+  * FMP ADJUSTED daily files ``<FMP daily dir>/<SYM>_1d.parquet`` (Date, Close; '.' written '-') for the FMP step.
+  * ``split_overrides.json`` (below).
+
+LISTINGS -> EVENTS.  Alpaca: forward_splits and reverse_splits (ex_date, f = new_rate/old_rate), stock_dividends (ex_date,
+f = rate), unit_splits ONLY when old_symbol == new_symbol (effective_date, f = new_rate/old_rate; a unit separated into a
+different symbol is ignored and counted).  IGNORED, because FMP's close does not adjust for them either: spin_offs,
+cash_dividends, mergers (cash, stock, stock_and_cash), rights_distributions, redemptions, worthless_removals.  FMP:
+numerator/denominator (a row with a missing or zero side is counted, never read as a split).  An absent kind in a monthly
+file means none that month.  f == 1 events are counted and dropped.
+NAME CHANGES.  The bars were fetched as-of 2026-10-12, so a renamed ticker's whole history sits under its CURRENT symbol,
+while a split before the rename is listed under the OLD one: an event is mapped to the current symbol by following the
+``name_changes`` chain old -> new in process_date order, using only renames whose process_date is AFTER the event date (a
+same-day rename is ambiguous -- tickers swap on a date -- and is not followed); a rename to the same ticker (CUSIP-only) is
+skipped.  Symbols are upper-cased with '.' written '-'.  Events of symbols not in the store are counted, not judged.
+
+THE RULES (tolerances are module constants)
+  * Event placement: listings of one symbol whose first sessions on/after their dates are at most NEAR_SESSIONS = 3
+    sessions apart (chained) form a cluster.  A cluster where each vendor lists at most one ratio is ONE event; where a
+    vendor lists several ratios it is one event per ratio (AMC 2023-08: a 1.13333 distribution and the 1:10 reverse split).
+    Duplicate listings (ratio within RATIO_TOL = 1 %) are one (``dup_listings_collapsed``).
+  * An event dated on/before the symbol's first bar or after its last cannot affect its prices: counted
+    (``outside_range_<source>``), not reviewed.
+  * ``jump`` = close(D-1) / open(D), D = the first session on/after the event date.  The jump needs a bar before D and at
+    most MAX_GAP_DAYS = 30 days between the two bars; else the price cannot observe the event (``no_price_data``).
+  * BIG event: ``|ln f| >= ln 1.25`` (BIG_MIN).  PROVEN BY JUMP when ``|ln jump - ln f| <= ln 1.15`` (PROVEN_TOL), looked
+    for at the listed dates first, then up to 3 sessions either side (a vendor's ex-date can be a day or two off); the
+    accepted date is the session that jumped.  CONTRADICTED when every jump is within ``ln 1.10`` of 1 (CONTRADICT_TOL).
+  * SMALL event (``|ln f| < ln 1.25``: stock dividends, small unit splits): the price cannot prove it.  Accepted only when
+    BOTH vendors list it (ratios within 1 %); otherwise review, not applied.  The FMP step is NOT used for these (it also
+    reflects spin-off adjustments such as HON's, which our convention does not apply).
+  * THE FMP STEP (second arbiter).  r(t) = FMP ADJUSTED close / Alpaca RAW close on the sessions both have.  FMP divides
+    its history by the factors it applied, so across an event the market move cancels in r and
+    ``step = r(D) / r(D-1)`` equals the factor FMP applied (1.0 if none); D-1 = the last common session before D, D the first
+    on/after it.  STABILITY: also take the 2 common sessions before D-1 and the 2 after D; if r varies by more than 2 %
+    (STEP_STABLE) within either 3-session side the vote is ``unstable`` -- unless another LISTED event (of another unit, an
+    override) lies in those sessions, then only D-1 and D count.  (Not "accepted": the verdicts of the neighbours are not
+    known yet.)  VOTE: ``equals_f`` when ``|ln step - ln f| <= ln 1.02`` (STEP_TOL), ``flat`` when ``|ln step| <= ln 1.02``,
+    ``other``, ``none`` (no FMP data on both sides), ``unstable``.  Column ``fmp_step`` = "<step> <vote>" (or "none"; empty
+    when the arbiter is off).  Candidate sessions for the step are searched like the jump's.  CAVEAT: step == f shows FMP
+    APPLIED the factor, not that the market had the split; that is why it is recorded per event (``fmp_step``), and why
+    ``step_accepted_with_flat_jump`` counts the accepts whose raw jump was flat.
+  * both vendors list DIFFERENT ratios (not within 1 %): the ratio the jump proves wins if exactly one is proven
+    (``ratio_mismatch_resolved``); else the ratio FMP's step equals wins if exactly one does and the jump does not contradict
+    it (``ratio_mismatch_resolved_by_fmp_step``); else ``ratio_mismatch``.
+  * UNEXPLAINED JUMPS: an overnight close(t-1)/open(t) > 1.8 or < 0.55 with no listed event (or override) within 3 sessions
+    is a review row, unless the FMP step there is ``flat`` (``jump_explained_by_market``: a real price move, counted).
+  * Two accepted BIG events in the same direction within 3 sessions would adjust one split twice (the vendors list slightly
+    different ratios, both "proven"): both are retracted (``overlapping_accepts``).
+  * OVERRIDES (``split_overrides.json``, reviewed, same rules as screener/panel_exclusions.json): ``_doc`` + ``entries``
+    with symbol, event_date (ISO), decision accept|reject, reason, added, reviewed_by, and ``ratio`` for accept (> 0, != 1).
+    An entry decides the event of its symbol that lists event_date (any date of the cluster) outright; one matching no listing
+    ADDS the split (accept) or silences the unexplained-jump row at its date (reject).  A reviewed_by starting with
+    'pending' REFUSES the build (``SplitOverridesPending``; the pipeline exits 2).  The file's sha256 is in the table.
+
+VERDICT CODES (``VERDICTS``; counted in the printed summary as ``verdict_<code>``)
+  accepted:  proven                  big, jump proves it (any source; FMP-only gets fmp_only_proven)
+             fmp_only_proven         FMP-only and proven by the jump: accepted + review row "Alpaca missed"
+             proven_by_fmp_step      big, jump does not prove it but FMP's step equals f: accepted (FMP-only: + review row)
+             ratio_mismatch_resolved           vendors disagree; the jump proves one ratio
+             ratio_mismatch_resolved_by_fmp_step  vendors disagree; the step equals one, the jump does not contradict it
+             small_both              small, both vendors list it
+             override_accept         decided by an override entry
+  rejected without a review row:
+             override_reject         decided by an override entry
+             rejected_confirmed      listing contradicted by the raw jump AND flat in FMP's step: no split anywhere
+             jump_explained_by_market (an unexplained jump, not an event) flat FMP step: a real price move
+  review rows (``split_review.csv``; applied False unless noted):
+             alpaca_contradicted / fmp_contradicted / both_contradicted   listed by that vendor(s), the raw price does not
+                                     jump and FMP's step is not flat (or is unstable/none)
+             unresolved              listed, the jump neither proves nor contradicts it, the step does not equal f
+             small_single_vendor     small, only one vendor lists it
+             ratio_mismatch          vendors disagree and neither jump nor step settles it (or both are proven)
+             no_price_data           no usable bars, or none within 30 days on both sides of the event
+             unexplained_jump        raw overnight jump > x1.8 / < x0.55 with no event near and the step not flat
+             overlapping_accepts     see above (both retracted)
+  (applied True review rows are the informational ones of fmp_only_proven, proven_by_fmp_step and the two resolved verdicts)
+
+OUTPUTS (``<out>/_meta``, atomic temp + os.replace; read the CSVs with ``read_csv_frame`` -- pandas' default NA parsing
+turns the symbol "NA" into NaN)
+  split_table.json     {asof, inputs_sha256, overrides_sha256, fmp_daily_files {dir, count, sha256 over (name, size,
+                       mtime_ns)}, splits {symbol: [[date, factor], ...]}} events sorted; factor = new/old shares, prices
+                       BEFORE the date are divided by it
+  split_review.csv     REVIEW_COLUMNS: symbol, event_date, alpaca_ratio, fmp_ratio, jump, fmp_step, verdict, applied, reason
+  split_accepted.csv   ACCEPTED_COLUMNS: symbol, date, factor, source (alpaca|fmp|both|override), verdict, fmp_step
+  split_vs_fmp.csv     COMPARE_COLUMNS: symbol, date, our_factor, fmp_ratio, alpaca_ratio, jump, fmp_step, verdict, class;
+                       class agree | ratio_differs | ours_only | fmp_only_accepted (ours and FMP, Alpaca does not list it)
+                       | fmp_only_rejected (verdict = our review verdict, outside_range, rejected_confirmed or no_row)
+  fmp_split_calendar/  the raw calendar windows (reruns are offline)
 """
+
 from __future__ import annotations
 
+import csv
 import gzip
+import hashlib
+import io
 import json
 import math
 import os
+import sqlite3
+import time
 from collections import Counter
-from datetime import date
-from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timedelta
+from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -45,14 +137,26 @@ NEAR_SESSIONS = 3                  # listings / unexplained jumps this close are
 JUMP_HI = 1.8                      # unexplained overnight jump bounds
 JUMP_LO = 0.55
 MAX_GAP_DAYS = 30                  # bars further apart than this do not observe an event between them
+STEP_TOL = math.log(1.02)          # FMP step: |ln step - ln f| within this -> "equals_f"; |ln step| within this -> "flat"
+STEP_STABLE = 0.02                 # FMP step: r may vary by at most 2 % within each 3-session side of the event
 
-REVIEW_COLUMNS = ["symbol", "event_date", "alpaca_ratio", "fmp_ratio", "jump", "verdict", "applied", "reason"]
+VERDICTS = ("proven", "fmp_only_proven", "proven_by_fmp_step", "ratio_mismatch_resolved",
+            "ratio_mismatch_resolved_by_fmp_step", "small_both", "override_accept", "override_reject",
+            "rejected_confirmed", "jump_explained_by_market", "alpaca_contradicted", "fmp_contradicted",
+            "both_contradicted", "unresolved", "small_single_vendor", "ratio_mismatch", "no_price_data",
+            "unexplained_jump", "overlapping_accepts")
+REVIEW_COLUMNS = ["symbol", "event_date", "alpaca_ratio", "fmp_ratio", "jump", "fmp_step", "verdict", "applied", "reason"]
+ACCEPTED_COLUMNS = ["symbol", "date", "factor", "source", "verdict", "fmp_step"]
 
 
 class ListedSplit(NamedTuple):
     symbol: str
     date: date
     ratio: float            # new shares / old shares: 4-for-1 -> 4.0, 1-for-10 -> 0.1
+
+
+class SplitTableBuildError(RuntimeError):
+    """An input is missing or has changed shape: the build stops (the pipeline step fails)."""
 
 
 class SplitOverridesPending(ValueError):
@@ -219,6 +323,63 @@ def _bars(df: pd.DataFrame, stats: Counter) -> _Bars:
     return _Bars(days[ok][order], o[ok][order], c[ok][order])
 
 
+class _RatioSeries:
+    """r(t) = FMP ADJUSTED daily close / Alpaca RAW daily close on the sessions both have.  FMP divides its history
+    by the factors it applied, so across an event the market move cancels in r: ``step = r(D) / r(D-1)`` equals the
+    factor FMP applied (1.0 when it applied none)."""
+
+    def __init__(self, days: np.ndarray, vals: np.ndarray):
+        self.days, self.vals = days, vals
+
+    @classmethod
+    def build(cls, bars: _Bars, fmp_df: pd.DataFrame) -> Optional["_RatioSeries"]:
+        cols = {c.lower(): c for c in fmp_df.columns}
+        if "date" not in cols or "close" not in cols:
+            raise ValueError(f"FMP daily frame needs Date and Close columns, has {list(fmp_df.columns)}")
+        idx = pd.DatetimeIndex(pd.to_datetime(fmp_df[cols["date"]])).tz_localize(None).normalize()
+        f = pd.Series(fmp_df[cols["close"]].to_numpy(dtype=float), index=idx)
+        a = pd.Series(bars.c, index=pd.DatetimeIndex(bars.days))
+        r = (f[~f.index.duplicated()] / a[~a.index.duplicated()]).dropna()
+        r = r[np.isfinite(r) & (r > 0)].sort_index()
+        if not len(r):
+            return None
+        return cls(r.index.to_numpy().astype("datetime64[D]"), r.to_numpy(dtype=float))
+
+    def step(self, on: date, others: Sequence[date]) -> Tuple[Optional[float], bool]:
+        """``(r(D) / r(D-1), stable)`` with D-1 = the last common session before ``on`` and D the first on/after it;
+        ``(None, True)`` when there is none on a side.  ``stable`` is False when r varies by more than STEP_STABLE
+        within the 3 common sessions before D or the 3 from D on -- unless another event lies in those sessions (then
+        only D-1 and D count)."""
+        pos = int(np.searchsorted(self.days, np.datetime64(on, "D"), side="left"))
+        if pos < 1 or pos >= len(self.days):
+            return None, True
+        if int((self.days[pos] - self.days[pos - 1]).astype(int)) > MAX_GAP_DAYS:
+            return None, True
+        lo, hi = max(0, pos - 3), min(len(self.days), pos + 3)
+        waived = any(self.days[lo] <= np.datetime64(o, "D") <= self.days[hi - 1] for o in others)
+        stable = waived or all(side.max() / side.min() - 1.0 <= STEP_STABLE
+                               for side in (self.vals[lo:pos], self.vals[pos:hi]))
+        return float(self.vals[pos] / self.vals[pos - 1]), stable
+
+
+def _step_vote(step: Optional[float], stable: bool, f: Optional[float]) -> str:
+    """none (no FMP data on both sides) | unstable | equals_f (|ln step - ln f| <= ln 1.02) | flat | other"""
+    if step is None:
+        return "none"
+    if not stable:
+        return "unstable"
+    ls = math.log(step)
+    if f is not None and abs(ls - math.log(f)) <= STEP_TOL:
+        return "equals_f"
+    if abs(ls) <= STEP_TOL:
+        return "flat"
+    return "other"
+
+
+def _fmt_step(step: Optional[float], vote: str) -> str:
+    return "none" if step is None else f"{step:.6g} {vote}"
+
+
 def _same_ratio(a: float, b: float) -> bool:
     return abs(a / b - 1.0) <= RATIO_TOL
 
@@ -238,9 +399,10 @@ def _first_session_on_or_after(bars: _Bars, on: date) -> int:
 
 
 def _row(sym: str, d: date, a: Optional[float], f: Optional[float], jump: Optional[float], verdict: str,
-         applied: bool, reason: str) -> Dict[str, Any]:
+         applied: bool, reason: str, step: str = "") -> Dict[str, Any]:
     return {"symbol": sym, "event_date": d.isoformat(), "alpaca_ratio": a, "fmp_ratio": f,
-            "jump": None if jump is None else round(jump, 6), "verdict": verdict, "applied": applied, "reason": reason}
+            "jump": None if jump is None else round(jump, 6), "fmp_step": step, "verdict": verdict,
+            "applied": applied, "reason": reason}
 
 
 def _cluster(listings: List[Tuple[str, ListedSplit, int]]) -> List[List[Tuple[str, ListedSplit, int]]]:
@@ -283,13 +445,18 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
                   alpaca_events: Iterable[ListedSplit],
                   fmp_events: Iterable[ListedSplit],
                   overrides: Sequence[Mapping[str, Any]],
-                  stats: Optional[Counter] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Judge every candidate event by the raw price jump across it.
+                  stats: Optional[Counter] = None,
+                  fmp_daily: Optional[Mapping[str, pd.DataFrame]] = None
+                  ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Judge every candidate event by the raw price jump across it, and by the FMP step when ``fmp_daily`` is given.
 
     ``raw_daily``: symbol -> frame with ``t`` (bar start), ``o``, ``c`` of RAW bars.  Events: current symbols.
     Returns ``(accepted, review_rows)``: accepted = ``[{symbol, date, factor, source, verdict}]`` sorted;
     review rows have REVIEW_COLUMNS.  Everything set aside or decided is counted in ``stats`` (verdict_<code>,
-    outside_range, dup_listings_collapsed, events_symbol_not_in_store, overrides_unused, ...)."""
+    outside_range, dup_listings_collapsed, events_symbol_not_in_store, overrides_unused, ...).
+
+    ``fmp_daily``: symbol -> FMP daily frame (``Date``, ``Close`` ADJUSTED).  None = the FMP-step arbiter is off (every
+    vote is "none"); a symbol missing from it is counted in ``fmp_daily_missing_symbol`` and votes "none"."""
     stats = stats if stats is not None else Counter()
     by_sym: Dict[str, List[Tuple[str, ListedSplit]]] = {}
     for src, evs in (("alpaca", alpaca_events), ("fmp", fmp_events)):
@@ -314,7 +481,15 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
     accepted: List[Dict[str, Any]] = []
     rows: List[Dict[str, Any]] = []
     for sym in sorted(raw_daily):
-        a, r = _decide_symbol(sym, _bars(raw_daily[sym], stats), by_sym.get(sym, []), ov_by_sym.get(sym, []), stats)
+        bars = _bars(raw_daily[sym], stats)
+        rser = None
+        if fmp_daily is not None:
+            if sym in fmp_daily:
+                rser = _RatioSeries.build(bars, fmp_daily[sym])
+            if rser is None:
+                stats["fmp_daily_missing_symbol"] += 1
+        a, r = _decide_symbol(sym, bars, by_sym.get(sym, []), ov_by_sym.get(sym, []), stats, rser,
+                           fmp_daily is not None)
         accepted += a
         rows += r
     accepted.sort(key=lambda x: (x["symbol"], x["date"]))
@@ -323,20 +498,25 @@ def decide_splits(raw_daily: Mapping[str, pd.DataFrame],
 
 
 def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]], overrides: List[Mapping[str, Any]],
-                   stats: Counter) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+                   stats: Counter, rser: Optional[_RatioSeries] = None, step_on: bool = False) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     acc: List[Dict[str, Any]] = []
     rows: List[Dict[str, Any]] = []
     n = len(bars.days)
 
-    def accept(d: date, f: float, source: str, verdict: str) -> None:
+    def accept(d: date, f: float, source: str, verdict: str, step: str = "") -> None:
         stats[f"verdict_{verdict}"] += 1
-        acc.append({"symbol": sym, "date": d.isoformat(), "factor": f, "source": source, "verdict": verdict})
+        acc.append({"symbol": sym, "date": d.isoformat(), "factor": f, "source": source, "verdict": verdict,
+                    "fmp_step": step})
 
     def review(d: date, a: Optional[float], fm: Optional[float], jump: Optional[float], verdict: str,
-               applied: bool, reason: str, count: bool = True) -> None:
+               applied: bool, reason: str, count: bool = True, step: str = "") -> None:
         if count:
             stats[f"verdict_{verdict}"] += 1
-        rows.append(_row(sym, d, a, fm, jump, verdict, applied, reason))
+        rows.append(_row(sym, d, a, fm, jump, verdict, applied, reason, step))
+
+    # every listed date of the symbol: an event of ANOTHER unit near a step's sessions waives the stability check
+    listed_dates = sorted({ev.date for _, ev in listed})
+    ov_dates = [date.fromisoformat(o["event_date"]) for o in overrides]
 
     # position of each listing; a listing the bars cannot be affected by is counted, not judged
     placed: List[Tuple[str, ListedSplit, int]] = []
@@ -399,16 +579,59 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
                 return _jump_idx(bars, _first_session_on_or_after(bars, d))
             return next(j for j in jumps.values() if j is not None)
 
+        others = [d for d in listed_dates if d not in dates] + ov_dates
+        jump_contra = all(j is None or abs(math.log(j)) <= CONTRADICT_TOL for j in jumps.values())
+
+        def step_str(ratio: Optional[float], d: date) -> str:
+            if rser is None:
+                return "none" if step_on else ""
+            v, ok = rser.step(d, others)
+            return _fmt_step(v, _step_vote(v, ok, ratio))
+
+        def step_proving(ratio: float) -> Optional[date]:
+            """the session whose FMP step equals ``ratio`` (big events only), searched like ``proving``"""
+            if rser is None or abs(math.log(ratio)) < BIG_MIN:
+                return None
+            for off in (0, 1, -1, 2, -2, 3, -3):
+                for d in dates:
+                    i = idxs[d] + off
+                    if 0 <= i < n:
+                        day = bars.days[i].astype(object)
+                        v, ok = rser.step(day, others)
+                        if _step_vote(v, ok, ratio) == "equals_f":
+                            return day
+            return None
+
+        def step_flat() -> bool:
+            """the FMP step is flat at every listed date that has FMP data on both sides (and at one at least)"""
+            if rser is None:
+                return False
+            votes = []
+            for d in dates:
+                v, ok = rser.step(bars.days[idxs[d]].astype(object), others)
+                votes.append(_step_vote(v, ok, None))
+            return "flat" in votes and all(x in ("flat", "none") for x in votes)
+
         if a_r is not None and f_r is not None and not _same_ratio(a_r, f_r):
             pa, pf = proving(a_r), proving(f_r)
             if (pa is None) != (pf is None):
                 d, r, src = (pa, a_r, "alpaca") if pa is not None else (pf, f_r, "fmp")
-                accept(d, r, src, "ratio_mismatch_resolved")
+                accept(d, r, src, "ratio_mismatch_resolved", step_str(r, d))
                 review(d, a_r, f_r, shown(d), "ratio_mismatch_resolved", True,
-                       f"vendors disagree ({src} ratio {r:.6g} is the one the jump proves)", count=False)
+                       f"vendors disagree ({src} ratio {r:.6g} is the one the jump proves)", count=False,
+                       step=step_str(r, d))
+                continue
+            sa, sf = step_proving(a_r), step_proving(f_r)
+            if (sa is None) != (sf is None) and not jump_contra:
+                d, r, src = (sa, a_r, "alpaca") if sa is not None else (sf, f_r, "fmp")
+                accept(d, r, src, "ratio_mismatch_resolved_by_fmp_step", step_str(r, d))
+                review(d, a_r, f_r, shown(d), "ratio_mismatch_resolved_by_fmp_step", True,
+                       f"vendors disagree ({src} ratio {r:.6g} is the one FMP's step equals; the jump does not contradict it)",
+                       count=False, step=step_str(r, d))
             else:
                 review(d0, a_r, f_r, shown(), "ratio_mismatch", False,
-                       "vendors list different ratios and the jump proves " + ("both" if pa is not None else "neither"))
+                       "vendors list different ratios and the jump proves " + ("both" if pa is not None else "neither"),
+                       step=step_str(a_r, d0))
             continue
 
         ratio = a_r if a_r is not None else f_r
@@ -416,27 +639,43 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
         both = a_r is not None and f_r is not None
         if abs(math.log(ratio)) < BIG_MIN:
             if both:
-                accept(d0, ratio, "both", "small_both")
+                accept(d0, ratio, "both", "small_both", step_str(ratio, d0))
             else:
                 review(d0, a_r, f_r, shown(), "small_single_vendor", False,
-                       f"small ratio {ratio:.6g}: the price cannot prove it and only {src} lists it")
+                       f"small ratio {ratio:.6g}: the price cannot prove it and only {src} lists it",
+                       step=step_str(ratio, d0))
             continue
         pd_ = proving(ratio)
         if pd_ is not None:
             if both or src == "alpaca":
-                accept(pd_, ratio, "both" if both else "alpaca", "proven")
+                accept(pd_, ratio, "both" if both else "alpaca", "proven", step_str(ratio, pd_))
             else:
-                accept(pd_, ratio, "fmp", "fmp_only_proven")
+                accept(pd_, ratio, "fmp", "fmp_only_proven", step_str(ratio, pd_))
                 review(pd_, a_r, f_r, shown(pd_), "fmp_only_proven", True,
-                       "Alpaca missed this split; the jump proves it", count=False)
+                       "Alpaca missed this split; the jump proves it", count=False, step=step_str(ratio, pd_))
             continue
-        if all(j is None or abs(math.log(j)) <= CONTRADICT_TOL for j in jumps.values()):
+        ps = step_proving(ratio)
+        if ps is not None:
+            accept(ps, ratio, "both" if both else src, "proven_by_fmp_step", step_str(ratio, ps))
+            if jump_contra:
+                stats["step_accepted_with_flat_jump"] += 1
+            if not both and src == "fmp":
+                review(ps, a_r, f_r, shown(ps), "proven_by_fmp_step", True,
+                       "Alpaca missed this split; FMP's step equals it (the jump alone does not prove it)",
+                       count=False, step=step_str(ratio, ps))
+            continue
+        if jump_contra:
+            if step_flat():
+                stats["verdict_rejected_confirmed"] += 1       # price flat in the raw bars AND in FMP's: no split
+                continue
             v = "both_contradicted" if both else f"{src}_contradicted"
             review(d0, a_r, f_r, shown(), v, False,
-                   f"listed ratio {ratio:.6g} but the raw price does not jump (jump {shown():.4g})")
+                   f"listed ratio {ratio:.6g} but the raw price does not jump (jump {shown():.4g})",
+                   step=step_str(ratio, d0))
         else:
             review(d0, a_r, f_r, shown(), "unresolved", False,
-                   f"listed ratio {ratio:.6g}, jump {shown():.4g}: neither proves nor contradicts it")
+                   f"listed ratio {ratio:.6g}, jump {shown():.4g}: neither proves nor contradicts it",
+                   step=step_str(ratio, d0))
 
     # ---- overrides no listing led to: an 'accept' ADDS the split, a 'reject' silences the jump row at its date
     for o in overrides:
@@ -478,8 +717,18 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
             t = int(k) + 1
             if any(abs(t - p) <= NEAR_SESSIONS for p in positions):
                 continue
-            review(bars.days[t].astype(object), None, None, float(ratio_[k]), "unexplained_jump", False,
-                   f"overnight close/open {ratio_[k]:.4g} with no listed split within {NEAR_SESSIONS} sessions")
+            day = bars.days[t].astype(object)
+            step = "none" if step_on else ""
+            if rser is not None:
+                v, ok = rser.step(day, listed_dates + ov_dates)
+                vote = _step_vote(v, ok, None)
+                if vote == "flat":                            # FMP's adjusted/raw ratio did not move: a real price move
+                    stats["verdict_jump_explained_by_market"] += 1
+                    continue
+                step = _fmt_step(v, vote)
+            review(day, None, None, float(ratio_[k]), "unexplained_jump", False,
+                   f"overnight close/open {ratio_[k]:.4g} with no listed split within {NEAR_SESSIONS} sessions",
+                   step=step)
     return acc, rows
 
 
@@ -494,7 +743,7 @@ def splits_by_symbol(accepted: Sequence[Mapping[str, Any]]) -> Dict[str, List[Li
 # ---------------------------------------------------------------------------
 # comparison with FMP's split list
 # ---------------------------------------------------------------------------
-COMPARE_COLUMNS = ["symbol", "date", "our_factor", "fmp_ratio", "alpaca_ratio", "jump", "verdict", "class"]
+COMPARE_COLUMNS = ["symbol", "date", "our_factor", "fmp_ratio", "alpaca_ratio", "jump", "fmp_step", "verdict", "class"]
 COMPARE_DAYS = 5          # an FMP listing and one of our events this many calendar days apart are the same event
 
 
@@ -504,13 +753,15 @@ def near(d1: date, d2: date) -> bool:
 
 def compare_with_fmp(raw_daily: Mapping[str, pd.DataFrame], accepted: Sequence[Mapping[str, Any]],
                      review_rows: Sequence[Mapping[str, Any]], alpaca_events: Iterable[ListedSplit],
-                     fmp_events: Iterable[ListedSplit]) -> List[Dict[str, Any]]:
+                     fmp_events: Iterable[ListedSplit],
+                     fmp_daily: Optional[Mapping[str, pd.DataFrame]] = None) -> List[Dict[str, Any]]:
     """One row per (symbol, event) across our table and FMP's list (symbols of ``raw_daily`` only).
 
     class: ``agree`` (ours and FMP, ratios within 1 %), ``ratio_differs``, ``ours_only`` (applied, FMP does not list
     it), ``fmp_only_accepted`` (ours and FMP, and Alpaca does not list it: Alpaca missed it), ``fmp_only_rejected``
     (FMP lists it, we did not apply it; ``verdict`` = our review verdict, ``outside_range`` for an event no bar
-    can show, ``no_row`` if nothing else explains it).  ``jump`` = close(D-1)/open(D) at the event, when observable."""
+    can show, ``rejected_confirmed`` when no row exists and FMP's step is flat there, else ``no_row``).  ``jump`` =
+    close(D-1)/open(D) at the event, when observable; ``fmp_step`` = FMP step value and vote (see _RatioSeries)."""
     stats: Counter = Counter()
     by_sym: Dict[str, Dict[str, list]] = {}
     for key, evs in (("fmp", fmp_events), ("alp", alpaca_events)):
@@ -529,6 +780,16 @@ def compare_with_fmp(raw_daily: Mapping[str, pd.DataFrame], accepted: Sequence[M
     out: List[Dict[str, Any]] = []
     for sym, g in sorted(by_sym.items()):
         bars = _bars(raw_daily[sym], stats)
+        rser = (_RatioSeries.build(bars, fmp_daily[sym]) if fmp_daily is not None and sym in fmp_daily else None)
+        all_dates = ([e.date for e in g["fmp"]] + [e.date for e in g["alp"]]
+                     + [date.fromisoformat(o["date"]) for o in g["ours"]])
+
+        def step(d: date, f: Optional[float]) -> Tuple[str, str]:
+            if rser is None:
+                return "none", "none"
+            v, ok = rser.step(d, [x for x in all_dates if x != d])
+            vote = _step_vote(v, ok, f)
+            return _fmt_step(v, vote), vote
 
         def jump(d: date) -> Optional[float]:
             if not len(bars.days) or d <= bars.days[0].astype(object) or d > bars.days[-1].astype(object):
@@ -556,7 +817,7 @@ def compare_with_fmp(raw_daily: Mapping[str, pd.DataFrame], accepted: Sequence[M
                 cls = "agree"
             out.append({"symbol": sym, "date": o["date"], "our_factor": o["factor"],
                         "fmp_ratio": None if m is None else m.ratio, "alpaca_ratio": a_r, "jump": jump(od),
-                        "verdict": o["verdict"], "class": cls})
+                        "fmp_step": step(od, o["factor"])[0], "verdict": o["verdict"], "class": cls})
         for m in free_fmp:
             row = next((r for r in g["rev"] if near(date.fromisoformat(r["event_date"]), m.date)), None)
             if row is not None:
@@ -564,9 +825,231 @@ def compare_with_fmp(raw_daily: Mapping[str, pd.DataFrame], accepted: Sequence[M
             elif len(bars.days) and (m.date <= bars.days[0].astype(object) or m.date > bars.days[-1].astype(object)):
                 verdict = "outside_range"
             else:
-                verdict = "no_row"
+                verdict = "rejected_confirmed" if step(m.date, m.ratio)[1] == "flat" else "no_row"
             out.append({"symbol": sym, "date": m.date.isoformat(), "our_factor": None, "fmp_ratio": m.ratio,
-                        "alpaca_ratio": alp_near(m.date), "jump": jump(m.date), "verdict": verdict,
+                        "alpaca_ratio": alp_near(m.date), "jump": jump(m.date),
+                        "fmp_step": step(m.date, m.ratio)[0], "verdict": verdict,
                         "class": "fmp_only_rejected"})
     out.sort(key=lambda r: (r["symbol"], r["date"]))
     return out
+
+
+def read_csv_frame(path: str) -> pd.DataFrame:
+    """Read one of the tool's CSVs.  ``keep_default_na=False``: pandas' default would turn the symbol "NA" (and "NAN",
+    "NULL", ...) into NaN.  Only the numeric columns read an empty cell as NaN; symbols and text stay strings."""
+    numeric = {c: [""] for c in ("alpaca_ratio", "fmp_ratio", "jump", "factor", "our_factor")}
+    return pd.read_csv(path, keep_default_na=False, na_values=numeric, dtype={"symbol": str, "fmp_step": str})
+
+
+# ---------------------------------------------------------------------------
+# the build: inputs -> <out>/_meta files (run by tools/prepare_alpaca_history.py, step split-table)
+# ---------------------------------------------------------------------------
+DEFAULT_STORE = os.path.expanduser("~/Documents/ba2/alpaca_store_daily2016")
+DEFAULT_OUT = os.path.expanduser("~/Documents/ba2/common/cache/AlpacaHistoryOHLCVProvider")
+DEFAULT_DB = os.path.expanduser("~/Documents/ba2/trade/db.sqlite")
+DEFAULT_FMP_DAILY = os.path.expanduser("~/Documents/ba2/common/cache/FMPOHLCVProvider")
+FMP_URL = "https://financialmodelingprep.com/api/v3/stock_split_calendar"
+FMP_WINDOW_DAYS = 30            # the endpoint clamps a range to its last ~90 days: stay far inside it
+FMP_ROW_CAP = 1000              # a window returning this many rows may be truncated: split it (1 day is the floor)
+
+
+def atomic_write(path: str, data: bytes) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def read_fmp_key(db: str) -> str:
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        row = con.execute("select value_str from appsetting where key = 'FMP_API_KEY'").fetchone()
+    finally:
+        con.close()
+    if not row or not row[0]:
+        raise SplitTableBuildError(f"no FMP_API_KEY in {db}")
+    return row[0]
+
+
+def fetch_fmp_calendar(start: date, end: date, cache_dir: str,
+                       get: Callable[[date, date], List[Dict[str, Any]]],
+                       stats: Counter) -> List[Dict[str, Any]]:
+    """Every row of FMP's split calendar over [start, end], in windows of FMP_WINDOW_DAYS; a window that returns
+    FMP_ROW_CAP rows or more may be truncated and is split in halves (down to one day, where it is refused).  The
+    raw response of each window is cached in ``cache_dir`` and read back on a rerun."""
+    rows: List[Dict[str, Any]] = []
+
+    def window(a: date, b: date) -> None:
+        path = os.path.join(cache_dir, f"{a.isoformat()}_{b.isoformat()}.json")
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                got = json.load(f)
+            stats["fmp_windows_cached"] += 1
+        else:
+            got = get(a, b)
+            atomic_write(path, json.dumps(got).encode("utf-8"))
+            stats["fmp_windows_fetched"] += 1
+        # measured: the endpoint's `to` can spill ONE day past the window (a 2024-06-17 row for ..06-16); that row
+        # belongs to the next window, which asks for it itself.  Anything further out is a change we refuse.
+        lo, hi = (a - timedelta(days=1)).isoformat(), (b + timedelta(days=1)).isoformat()
+        far = [r for r in got if not (lo <= r["date"][:10] <= hi)]
+        if far:
+            raise SplitTableBuildError(f"FMP split calendar {a}..{b} returned {len(far)} row(s) outside the window "
+                             f"(first: {far[0]['date']}): the endpoint's range handling changed")
+        spill = [r for r in got if not (a.isoformat() <= r["date"][:10] <= b.isoformat())]
+        stats["fmp_rows_spilled_to_next_window_dropped"] += len(spill)
+        got_in = [r for r in got if a.isoformat() <= r["date"][:10] <= b.isoformat()]
+        if len(got) >= FMP_ROW_CAP:
+            if a == b:
+                raise SplitTableBuildError(f"FMP split calendar for the single day {a} returned {len(got)} rows (>= {FMP_ROW_CAP}): "
+                                 f"cannot rule out truncation")
+            mid = a + (b - a) // 2
+            stats["fmp_windows_split"] += 1
+            window(a, mid)
+            window(mid + timedelta(days=1), b)
+            return
+        rows.extend(got_in)
+
+    a = start
+    while a <= end:
+        b = min(a + timedelta(days=FMP_WINDOW_DAYS - 1), end)
+        window(a, b)
+        a = b + timedelta(days=1)
+    return rows
+
+
+def make_fmp_getter(key: str) -> Callable[[date, date], List[Dict[str, Any]]]:
+    from ba2_providers.fmp_common import fmp_http_get
+
+    def get(a: date, b: date) -> List[Dict[str, Any]]:
+        r = fmp_http_get(FMP_URL, params={"from": a.isoformat(), "to": b.isoformat(), "apikey": key},
+                         endpoint="stock_split_calendar", timeout=120)
+        j = r.json()
+        if not isinstance(j, list):
+            raise SplitTableBuildError(f"FMP split calendar {a}..{b}: unexpected payload {str(j)[:200]!r}")
+        return j
+    return get
+
+
+def load_store_bars(store: str, symbols: Optional[List[str]]) -> Tuple[Dict[str, pd.DataFrame], str]:
+    """symbol -> frame(t, o, c) and a sha256 over every bar file's bytes (symbol-ordered)."""
+    root = os.path.join(store, "bars", "1Day")
+    names = sorted(d[len("symbol="):] for d in os.listdir(root) if d.startswith("symbol="))
+    if symbols is not None:
+        missing = sorted(set(symbols) - set(names))
+        if missing:
+            raise SplitTableBuildError(f"--symbols not in the store: {missing}")
+        names = sorted(symbols)
+
+    def read(sym: str) -> Tuple[str, pd.DataFrame, str]:
+        with open(os.path.join(root, f"symbol={sym}", "all.parquet"), "rb") as f:
+            raw = f.read()
+        df = pd.read_parquet(io.BytesIO(raw), columns=["t", "o", "c"])
+        return sym, df, hashlib.sha256(raw).hexdigest()
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        res = list(ex.map(read, names))
+    h = hashlib.sha256()
+    for sym, _, d in res:
+        h.update(f"{sym}:{d}\n".encode())
+    return {sym: df for sym, df, _ in res}, h.hexdigest()
+
+
+def sha256_files(paths: List[str]) -> str:
+    h = hashlib.sha256()
+    for p in sorted(paths):
+        with open(p, "rb") as f:
+            h.update(os.path.basename(p).encode() + b":" + hashlib.sha256(f.read()).digest())
+    return h.hexdigest()
+
+
+def load_fmp_daily(fmp_dir: str, symbols: Iterable[str]) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    """The FMP ADJUSTED daily file (``<SYM>_1d.parquet``, Date + Close) of each symbol that has one, and the record of
+    the files read: ``{"dir", "count", "sha256"}`` where sha256 covers (name, size, mtime_ns) of each, sorted -- stored in
+    split_table.json because that cache is archived after the build."""
+    names = sorted(symbols)
+
+    def read(sym: str):
+        path = os.path.join(fmp_dir, f"{sym.replace('.', '-')}_1d.parquet")
+        if not os.path.isfile(path):
+            return sym, None, None
+        stt = os.stat(path)
+        df = pd.read_parquet(path, columns=["Date", "Close"])
+        return sym, df, f"{os.path.basename(path)}|{stt.st_size}|{stt.st_mtime_ns}"
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        res = list(ex.map(read, names))
+    h = hashlib.sha256()
+    n = 0
+    for _, df, sig in res:
+        if df is not None:
+            h.update(sig.encode() + b"\n")
+            n += 1
+    return ({sym: df for sym, df, _ in res if df is not None},
+            {"dir": fmp_dir, "count": n, "sha256": h.hexdigest()})
+
+
+def _csv_bytes(columns: Sequence[str], rows: Iterable[Mapping[str, Any]]) -> bytes:
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=list(columns), lineterminator="\n")
+    w.writeheader()
+    w.writerows(rows)
+    return buf.getvalue().encode("utf-8")
+
+
+def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db: str = DEFAULT_DB,
+                      fmp_daily_dir: str = DEFAULT_FMP_DAILY, symbols: Optional[List[str]] = None,
+                      fmp_from: str = "2016-01-01", fmp_to: str = "2026-10-13",
+                      overrides_path: str = OVERRIDES_PATH, log: Callable[[str], None] = print) -> Dict[str, Any]:
+    """Build and write ``<out>/_meta/split_table.json`` (+ review / accepted / vs-FMP CSVs).  Returns a summary:
+    ``{"meta", "asof", "symbols_judged", "symbols_with_splits", "accepted", "review_rows", "review_applied",
+    "stats", "compare", "compare_examples"}``.  Raises ``SplitOverridesPending`` while an override is pending."""
+    overrides = load_overrides(overrides_path)
+    with open(overrides_path, "rb") as f:
+        overrides_sha = hashlib.sha256(f.read()).hexdigest()
+    with open(os.path.join(store, "STORE_INFO.json"), encoding="utf-8") as f:
+        info = json.load(f)
+    stats: Counter = Counter()
+    t0 = time.time()
+    months = read_corporate_actions(store)
+    renames = build_rename_map(months)
+    alpaca = alpaca_events_from_actions(months, renames, stats)
+    meta = os.path.join(out, "_meta")
+    cal_dir = os.path.join(meta, "fmp_split_calendar")
+    lazy: Dict[str, Any] = {}
+
+    def get(a: date, b: date) -> List[Dict[str, Any]]:     # key read (and requests built) only for an uncached window
+        if "get" not in lazy:
+            lazy["get"] = make_fmp_getter(read_fmp_key(db))
+        return lazy["get"](a, b)
+
+    cal_rows = fetch_fmp_calendar(date.fromisoformat(fmp_from), date.fromisoformat(fmp_to), cal_dir, get, stats)
+    fmp = fmp_events_from_rows(cal_rows, renames, stats)
+    bars, bars_sha = load_store_bars(store, symbols)
+    fmp_daily, fmp_files = load_fmp_daily(fmp_daily_dir, bars)
+    log(f"loaded {len(bars)} symbols, {len(alpaca)} Alpaca and {len(fmp)} FMP listings, {fmp_files['count']} FMP daily "
+        f"files in {time.time() - t0:.0f}s")
+
+    accepted, review = decide_splits(bars, alpaca, fmp, overrides, stats, fmp_daily=fmp_daily)
+    cmp_rows = compare_with_fmp(bars, accepted, review, alpaca, fmp, fmp_daily)
+
+    ca_dir = os.path.join(store, "corporate_actions")
+    h = hashlib.sha256()
+    for part in (bars_sha, sha256_files([os.path.join(ca_dir, n) for n in os.listdir(ca_dir)]),
+                 sha256_files([os.path.join(cal_dir, n) for n in os.listdir(cal_dir)]), f"{fmp_from}|{fmp_to}"):
+        h.update(part.encode())
+    table = {"asof": info["asof"], "inputs_sha256": h.hexdigest(), "overrides_sha256": overrides_sha,
+             "fmp_daily_files": fmp_files, "splits": splits_by_symbol(accepted)}
+    atomic_write(os.path.join(meta, "split_table.json"), json.dumps(table, indent=1).encode("utf-8"))
+    atomic_write(os.path.join(meta, "split_review.csv"), _csv_bytes(REVIEW_COLUMNS, review))
+    atomic_write(os.path.join(meta, "split_accepted.csv"), _csv_bytes(ACCEPTED_COLUMNS, accepted))
+    atomic_write(os.path.join(meta, "split_vs_fmp.csv"), _csv_bytes(COMPARE_COLUMNS, cmp_rows))
+    for (src, verdict), k in sorted(Counter((a["source"], a["verdict"]) for a in accepted).items()):
+        stats[f"accepted_{verdict}_from_{src}"] += k
+    classes = ("agree", "ratio_differs", "ours_only", "fmp_only_accepted", "fmp_only_rejected")
+    return {"meta": meta, "asof": info["asof"], "symbols_judged": len(bars), "symbols_with_splits": len(table["splits"]),
+            "accepted": len(accepted), "review_rows": len(review), "review_applied": sum(r["applied"] for r in review),
+            "fmp_daily_files": fmp_files, "stats": dict(sorted(stats.items())),
+            "compare": {c: sum(1 for r in cmp_rows if r["class"] == c) for c in classes},
+            "compare_examples": {c: [r for r in cmp_rows if r["class"] == c][:10] for c in classes if c != "agree"}}

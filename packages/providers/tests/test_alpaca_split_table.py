@@ -287,40 +287,222 @@ def test_splits_by_symbol_layout():
 
 
 # ---- the tool -----------------------------------------------------------------------------------------------
-def _tool():
+def _cli():
     import importlib.util
     import pathlib
-    path = pathlib.Path(__file__).resolve().parents[3] / "tools" / "build_alpaca_split_table.py"
-    spec = importlib.util.spec_from_file_location("build_alpaca_split_table", path)
+    path = pathlib.Path(__file__).resolve().parents[3] / "tools" / "prepare_alpaca_history.py"
+    spec = importlib.util.spec_from_file_location("prepare_alpaca_history", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
 def test_fmp_calendar_windows_split_when_full_cache_and_check_dates(tmp_path):
-    tool = _tool()
     calls = []
 
     def get(a, b):
         calls.append((a, b))
-        n = tool.FMP_ROW_CAP if (b - a).days >= 10 else 2
+        n = st.FMP_ROW_CAP if (b - a).days >= 10 else 2
         return [{"date": a.isoformat(), "symbol": f"S{i}", "numerator": 2, "denominator": 1} for i in range(n)]
 
     stats = Counter()
-    rows = tool.fetch_fmp_calendar(date(2021, 1, 1), date(2021, 1, 30), str(tmp_path), get, stats)
+    rows = st.fetch_fmp_calendar(date(2021, 1, 1), date(2021, 1, 30), str(tmp_path), get, stats)
     assert stats["fmp_windows_split"] >= 1 and all(b - a < timedelta(days=10) for a, b in calls[-2:])
     n_calls = len(calls)
-    again = tool.fetch_fmp_calendar(date(2021, 1, 1), date(2021, 1, 30), str(tmp_path), get, Counter())
+    again = st.fetch_fmp_calendar(date(2021, 1, 1), date(2021, 1, 30), str(tmp_path), get, Counter())
     assert len(calls) == n_calls and again == rows            # a rerun is offline
 
     def outside(a, b):
         return [{"date": "2000-01-01", "symbol": "X", "numerator": 2, "denominator": 1}]
-    with pytest.raises(SystemExit):
-        tool.fetch_fmp_calendar(date(2021, 2, 1), date(2021, 2, 5), str(tmp_path / "o"), outside, Counter())
+    with pytest.raises(st.SplitTableBuildError):
+        st.fetch_fmp_calendar(date(2021, 2, 1), date(2021, 2, 5), str(tmp_path / "o"), outside, Counter())
 
 
-def test_tool_refuses_a_pending_override(tmp_path, capsys):
-    tool = _tool()
+def test_pipeline_refuses_a_pending_override(tmp_path, capsys):
+    cli = _cli()
     p = write_ov(tmp_path, [ov("reject", reviewed_by="pending")])
-    assert tool.main(["--overrides", p, "--out", str(tmp_path / "out")]) == 2
+    assert cli.main(["--overrides", p, "--out", str(tmp_path / "out")]) == 2
     assert "pending" in capsys.readouterr().err
+    assert cli.main(["--overrides", p, "--out", str(tmp_path / "out"), "--dry-run"]) == 2
+
+
+def test_pipeline_step_selection_errors(tmp_path):
+    cli = _cli()
+    assert cli.main(["--steps", "nope"]) == 2
+    assert cli.main(["--steps", "split-table", "--from-step", "split-table"]) == 2
+    assert cli.main(["--fmp-from", "yesterday"]) == 2
+
+
+def test_pipeline_end_to_end_on_a_tiny_store_is_offline_and_reproducible(tmp_path):
+    store = tmp_path / "store"
+    raw = bars(40, 4.0)
+    d = store / "bars" / "1Day" / "symbol=NA"                   # the symbol "NA" must survive the CSVs
+    d.mkdir(parents=True)
+    raw.assign(h=raw["o"], l=raw["o"]).to_parquet(d / "all.parquet")
+    (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2026-10-12"}), encoding="utf-8")
+    ca = store / "corporate_actions"
+    ca.mkdir()
+    import gzip
+    with gzip.open(ca / "ym=2021-03.json.gz", "wt", encoding="utf-8") as f:
+        json.dump({"forward_splits": [{"symbol": "NA", "ex_date": D.isoformat(), "old_rate": 1, "new_rate": 4}]}, f)
+    fmpd = tmp_path / "fmpd"
+    fmpd.mkdir()
+    fmp(raw, {40: 4.0}).to_parquet(fmpd / "NA_1d.parquet")
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    (cal / "2021-01-01_2021-01-30.json").write_text("[]", encoding="utf-8")
+    (cal / "2021-01-31_2021-03-01.json").write_text("[]", encoding="utf-8")
+    (cal / "2021-03-02_2021-03-31.json").write_text("[]", encoding="utf-8")
+    argv = ["--store", str(store), "--out", str(out), "--fmp-daily-dir", str(fmpd), "--db", str(tmp_path / "no.db"),
+            "--fmp-from", "2021-01-01", "--fmp-to", "2021-03-31"]
+    cli = _cli()
+    assert cli.main(argv + ["--dry-run"]) == 0 and not (out / "_meta" / "split_table.json").exists()
+    assert cli.main(argv) == 0
+    table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
+    assert table["splits"] == {"NA": [[D.isoformat(), 4.0]]} and table["fmp_daily_files"]["count"] == 1
+    acc = st.read_csv_frame(str(out / "_meta" / "split_accepted.csv"))
+    assert list(acc["symbol"]) == ["NA"] and acc["fmp_step"][0].endswith("equals_f")
+    first = (out / "_meta" / "split_table.json").read_bytes()
+    assert cli.main(argv) == 0 and (out / "_meta" / "split_table.json").read_bytes() == first
+    report = json.loads((out / "_meta" / "prepare_report.json").read_text(encoding="utf-8"))
+    assert report["steps"][0]["status"] == "ok"
+
+
+# ---- the FMP step arbiter -----------------------------------------------------------------------------------
+def fmp(raw, applied=None, wobble=None):
+    """FMP ADJUSTED daily frame over the same sessions: `applied` = {session index: factor FMP applied there}; closes
+    before such a session are divided by the factor (so r = adj / raw steps by `factor` across it).  `wobble` =
+    {session index: multiplier} perturbs single closes (an unstable side)."""
+    close = raw["c"].to_numpy(dtype=float).copy()
+    for k, f in (applied or {}).items():
+        close[:k] = close[:k] / f
+    for k, m in (wobble or {}).items():
+        close[k] *= m
+    return pd.DataFrame({"Date": [pd.Timestamp(t).tz_convert("America/New_York").tz_localize(None).normalize()
+                                  for t in raw["t"]], "Close": close})
+
+
+def runf(frames, fmp_frames, alp=(), fm=(), ov=()):
+    stats = Counter()
+    acc, rev = st.decide_splits(frames, list(alp), list(fm), list(ov), stats, fmp_daily=fmp_frames)
+    return acc, rev, stats
+
+
+def test_reverse_split_whose_jump_misses_by_20_percent_is_proven_by_the_fmp_step():
+    raw = bars(40, 0.12)                                        # 0.12 vs 0.1: outside the 15 % jump tolerance
+    acc, rev, _ = run({"X": raw}, [L("X", D, 0.1)], [L("X", D, 0.1)])
+    assert acc == [] and one(rev, "unresolved")                 # the jump alone cannot decide it
+    acc, rev, stats = runf({"X": raw}, {"X": fmp(raw, {40: 0.1})}, [L("X", D, 0.1)], [L("X", D, 0.1)])
+    assert [(a["factor"], a["verdict"], a["source"]) for a in acc] == [(0.1, "proven_by_fmp_step", "both")]
+    assert acc[0]["fmp_step"].endswith("equals_f") and rev == []
+    assert stats["verdict_proven_by_fmp_step"] == 1
+
+
+def test_fmp_only_listing_proven_by_the_step_gets_a_review_row():
+    raw = bars(40, 0.12)
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 0.1})}, [], [L("X", D, 0.1)])
+    assert len(acc) == 1 and acc[0]["source"] == "fmp"
+    assert one(rev, "proven_by_fmp_step")["applied"] is True
+
+
+def test_jump_proof_still_comes_first():
+    raw = bars(40, 4.0)
+    acc, _, _ = runf({"X": raw}, {"X": fmp(raw, {40: 4.0})}, [L("X", D, 4.0)])
+    assert [a["verdict"] for a in acc] == ["proven"]
+
+
+def test_unexplained_jump_with_a_flat_step_is_the_market():
+    raw = bars(40, 2.5)
+    acc, rev, stats = runf({"X": raw}, {"X": fmp(raw)})
+    assert acc == [] and rev == [] and stats["verdict_jump_explained_by_market"] == 1
+    # FMP applied a 2.5 there (step "other" against f=1): the jump stays a review row, with the step shown
+    _, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 2.5})})
+    assert one(rev, "unexplained_jump")["fmp_step"] == "2.5 other"
+    _, rev, _ = runf({"X": raw}, {})                            # no FMP data
+    assert one(rev, "unexplained_jump")["fmp_step"] == "none"
+    _, rev, _ = run({"X": raw})                                 # arbiter off
+    assert one(rev, "unexplained_jump")["fmp_step"] == ""
+
+
+def test_contradicted_listing_with_a_flat_step_is_rejected_without_a_row():
+    raw = bars()
+    acc, rev, stats = runf({"X": raw}, {"X": fmp(raw)}, [L("X", D, 2.0)])
+    assert acc == [] and rev == [] and stats["verdict_rejected_confirmed"] == 1
+    # FMP applied something else (1.5): not flat, not equal -> the usual contradicted row, with the step
+    _, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 1.5})}, [L("X", D, 2.0)])
+    assert one(rev, "alpaca_contradicted")["fmp_step"] == "1.5 other"
+
+
+def test_contradicted_listing_that_fmp_applied_is_accepted_and_counted():
+    raw = bars()                                                # no jump in the raw bars, but FMP applied the 2.0
+    acc, rev, stats = runf({"X": raw}, {"X": fmp(raw, {40: 2.0})}, [L("X", D, 2.0)])
+    assert [a["verdict"] for a in acc] == ["proven_by_fmp_step"] and stats["step_accepted_with_flat_jump"] == 1
+
+
+def test_mismatch_resolved_by_the_step():
+    raw = bars(40, 1.25)                                        # proves neither 2.0 nor 4.0, contradicts neither
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 4.0})}, [L("X", D, 2.0)], [L("X", D, 4.0)])
+    assert [(a["factor"], a["verdict"], a["source"]) for a in acc] == [(4.0, "ratio_mismatch_resolved_by_fmp_step", "fmp")]
+    assert one(rev, "ratio_mismatch_resolved_by_fmp_step")["applied"] is True
+    # the step equals neither ratio: still a mismatch
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 3.0})}, [L("X", D, 2.0)], [L("X", D, 4.0)])
+    assert acc == [] and one(rev, "ratio_mismatch")
+    # the jump CONTRADICTS the ratio the step equals: not resolved
+    flat = bars()
+    acc, rev, _ = runf({"X": flat}, {"X": fmp(flat, {40: 4.0})}, [L("X", D, 2.0)], [L("X", D, 4.0)])
+    assert acc == [] and one(rev, "ratio_mismatch")
+
+
+def test_unstable_side_gives_no_vote_unless_another_event_is_near():
+    raw = bars(40, 0.12)
+    f = fmp(raw, {40: 0.1}, wobble={38: 1.05})                  # r jumps 5 % two sessions before D
+    acc, rev, _ = runf({"X": raw}, {"X": f}, [L("X", D, 0.1)], [L("X", D, 0.1)])
+    assert acc == [] and one(rev, "unresolved")["fmp_step"].endswith("unstable")
+    other = L("X", SESSIONS[38].date(), 1.05)                   # a small event in those sessions: only D-1 and D count
+    acc, rev, _ = runf({"X": raw}, {"X": f}, [L("X", D, 0.1), other], [L("X", D, 0.1), other])
+    assert {a["verdict"] for a in acc} == {"proven_by_fmp_step", "small_both"}
+
+
+def test_no_fmp_data_leaves_the_decision_to_the_jump():
+    raw = bars(40, 0.12)
+    for fd in (None, {}, {"X": fmp(raw).iloc[0:0]}):
+        acc, rev, _ = runf({"X": raw}, fd, [L("X", D, 0.1)], [L("X", D, 0.1)])
+        assert acc == [] and one(rev, "unresolved")
+    one_sided = fmp(raw).iloc[:40]                              # FMP stops before the event
+    acc, rev, _ = runf({"X": raw}, {"X": one_sided}, [L("X", D, 0.1)], [L("X", D, 0.1)])
+    assert acc == [] and one(rev, "unresolved")["fmp_step"] == "none"
+
+
+def test_small_factors_ignore_the_step():
+    raw = bars()
+    acc, rev, _ = runf({"X": raw}, {"X": fmp(raw, {40: 1.05})}, [L("X", D, 1.05)])
+    assert acc == [] and one(rev, "small_single_vendor")
+
+
+def test_compare_rows_carry_the_step():
+    raw = bars(40, 0.12)
+    fd = {"X": fmp(raw, {40: 0.1})}
+    acc, rev, _ = runf({"X": raw}, fd, [L("X", D, 0.1)], [L("X", D, 0.1)])
+    rows = st.compare_with_fmp({"X": raw}, acc, rev, [L("X", D, 0.1)], [L("X", D, 0.1)], fd)
+    assert rows[0]["class"] == "agree" and rows[0]["fmp_step"].endswith("equals_f")
+    flat = bars()
+    fd = {"X": fmp(flat)}
+    acc, rev, _ = runf({"X": flat}, fd, [], [L("X", D, 2.0)])
+    rows = st.compare_with_fmp({"X": flat}, acc, rev, [], [L("X", D, 2.0)], fd)
+    assert rows[0]["class"] == "fmp_only_rejected" and rows[0]["verdict"] == "rejected_confirmed"
+
+
+def test_csv_reader_keeps_the_symbol_NA(tmp_path):
+    p = tmp_path / "r.csv"
+    p.write_text("symbol,event_date,alpaca_ratio,fmp_ratio,jump,fmp_step,verdict,applied,reason\n"
+                 "NA,2020-01-02,,2.0,1.1,2 equals_f,unresolved,False,r\nNAN,2020-01-02,0.5,,,none,x,False,r\n",
+                 encoding="utf-8")
+    df = st.read_csv_frame(str(p))
+    assert list(df["symbol"]) == ["NA", "NAN"] and df["alpaca_ratio"].isna().tolist() == [True, False]
+    assert df["fmp_step"].tolist() == ["2 equals_f", "none"]
+
+
+def test_every_verdict_code_is_documented_in_the_module_docstring():
+    for v in st.VERDICTS:
+        assert v in st.__doc__, v
