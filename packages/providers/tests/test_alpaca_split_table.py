@@ -10,6 +10,18 @@ import pytest
 from ba2_providers.ohlcv.alpaca_history import split_build as sb, split_table as st
 from ba2_providers.ohlcv.alpaca_history.split_table import ListedSplit as L
 
+SHIPPED_OVERRIDES = st.OVERRIDES_PATH
+
+
+@pytest.fixture(autouse=True)
+def _no_pending_overrides(tmp_path_factory, monkeypatch):
+    """The shipped overrides hold entries pending review (they REFUSE a build): tests that build use an empty file."""
+    p = tmp_path_factory.mktemp("ov") / "none.json"
+    p.write_text(json.dumps({"_doc": "d", "entries": []}), encoding="utf-8")
+    monkeypatch.setattr(st, "OVERRIDES_PATH", str(p))
+    monkeypatch.setattr(sb, "OVERRIDES_PATH", str(p))
+
+
 SESSIONS = list(pd.bdate_range("2021-01-04", periods=80))
 D = SESSIONS[40].date()            # the event session in most tests
 
@@ -83,7 +95,8 @@ def test_big_event_between_proven_and_contradicted_is_unresolved():
 
 def test_small_event_needs_both_vendors():
     f = {"X": bars()}
-    acc, rev, _ = run(f, [L("X", D, 1.05)], [L("X", D, 1.0505)])
+    fd = {"X": fmp(f["X"], {40: 1.05})}                          # FMP's own series steps by 1.05 there
+    acc, rev, _ = runf(f, fd, [L("X", D, 1.05)], [L("X", D, 1.0505)])
     assert [a["verdict"] for a in acc] == ["small_both"] and rev == []
     acc, rev, _ = run(f, [L("X", D, 1.05)])
     assert acc == [] and one(rev, "small_single_vendor")["applied"] is False
@@ -91,6 +104,19 @@ def test_small_event_needs_both_vendors():
     assert acc == [] and one(rev, "small_single_vendor")["fmp_ratio"] == 1.05
     acc, rev, _ = run(f, [L("X", D, 1.05)], [L("X", D, 1.10)])
     assert acc == [] and one(rev, "ratio_mismatch")["applied"] is False
+
+
+def test_small_both_listed_factor_needs_fmp_step_or_yahoo():
+    # AIV 2019-02-21: both vendors list 0.9697 but the price is flat in the raw bars AND in FMP's own series
+    f = {"X": bars()}
+    acc, rev, _ = runf(f, {"X": fmp(f["X"])}, [L("X", D, 0.97)], [L("X", D, 0.97)])
+    assert acc == [] and one(rev, "small_both_price_disagrees")["applied"] is False
+    acc, rev, _ = run(f, [L("X", D, 0.97)], [L("X", D, 0.97)])                           # no FMP data at all
+    assert acc == [] and one(rev, "small_both_price_disagrees")
+    acc, rev, stats = runf(f, {"X": fmp(f["X"])}, [L("X", D, 0.97)], [L("X", D, 0.97)], yahoo=yhoo((D, 0.9703)))
+    assert [(a["verdict"], a["source"]) for a in acc] == [("small_confirmed_by_yahoo", "both+yahoo")]
+    acc, _, _ = runf(f, {"X": fmp(f["X"])}, [L("X", D, 0.97)], [L("X", D, 0.97)], yahoo=yhoo((D, 0.95)))   # Yahoo disagrees
+    assert acc == []
 
 
 def test_small_event_is_not_proven_by_a_matching_jump():
@@ -205,18 +231,19 @@ def ov(decision, ratio=None, d=D, **kw):
 
 def test_override_decides_its_event_outright():
     acc, rev, _ = run({"X": bars()}, [L("X", D, 2.0)], [L("X", D, 2.0)], [ov("accept", 2.0)])   # price says no split
-    assert [(a["factor"], a["verdict"]) for a in acc] == [(2.0, "override_accept")] and rev == []
+    assert [(a["factor"], a["verdict"]) for a in acc] == [(2.0, "override_accept")]
+    assert [r["verdict"] for r in rev] == ["override_accept"] and "alpaca lists 2" in rev[0]["reason"]      # never silent
     acc, rev, _ = run({"X": bars(40, 4.0)}, [L("X", D, 4.0)], [], [ov("reject")])               # price proves it
-    assert acc == [] and rev == []
+    assert acc == [] and [r["verdict"] for r in rev] == ["override_reject"] and rev[0]["applied"] is False
     acc, _, _ = run({"X": bars(40, 4.0)}, [L("X", D, 4.0)], [], [ov("accept", 5.0)])            # override ratio wins
     assert acc[0]["factor"] == 5.0
 
 
 def test_override_without_a_listing_adds_or_silences():
     acc, rev, _ = run({"X": bars(40, 2.5)}, [], [], [ov("accept", 2.5, d=SESSIONS[40].date())])
-    assert [a["factor"] for a in acc] == [2.5] and rev == []
+    assert [a["factor"] for a in acc] == [2.5] and [r["verdict"] for r in rev] == ["override_accept"]
     acc, rev, _ = run({"X": bars(40, 2.5)}, [], [], [ov("reject", d=SESSIONS[40].date())])
-    assert acc == [] and rev == []                              # the jump row is silenced by the reviewed reject
+    assert acc == [] and [r["verdict"] for r in rev] == ["override_reject"]       # the jump row is replaced by the reviewed reject
 
 
 def test_override_for_a_symbol_outside_the_run_is_counted():
@@ -835,19 +862,29 @@ def test_series_break_for_an_unexplained_jump_beyond_x5_that_the_step_does_not_e
     assert one(rev, "series_break")
 
 
-def test_shipped_overrides_are_the_reviewed_ones():
-    entries = st.load_overrides()
-    by = {(e["symbol"], e["event_date"]): e for e in entries}
-    assert len(entries) == 20 and all(e["reviewed_by"] == "owner (B. Migette) 2026-10-20" and e["added"] == "2026-10-20"
-                                      for e in entries)
-    assert by[("VTOL", "2020-06-12")]["ratio"] == pytest.approx(1 / 3) and by[("WHWK", "2021-08-27")]["ratio"] == pytest.approx(1 / 15)
-    assert by[("ENOV", "2022-04-05")]["ratio"] == pytest.approx(1 / 3) and by[("IRON", "2022-12-30")]["ratio"] == 0.1
-    assert by[("JBIO", "2025-04-29")]["ratio"] == pytest.approx(1 / 35)
-    assert {k for k, e in by.items() if e["decision"] == "reject"} == {
-        ("AMC", "2022-08-22"), ("BIP", "2020-03-31"), ("NVS", "2019-04-09"), ("HON", "2026-06-28"), ("ADEA", "2022-10-03"), ("CRESY", "2025-11-28"), ("CTVA", "2026-10-01"),
-        ("SM", "2020-03-09"), ("DBVT", "2020-03-17"), ("RLMD", "2024-12-04"), ("CLSK", "2020-04-09"), ("FWDI", "2018-01-19")}
-    assert by[("QH", "2022-08-12")]["ratio"] == pytest.approx(0.1) and by[("STSS", "2025-04-28")]["ratio"] == pytest.approx(1 / 300)
-    assert by[("JFB", "2026-03-25")]["ratio"] == 2.0 and "Yahoo" in by[("QH", "2022-08-12")]["reason"]
+def test_shipped_overrides_are_all_owner_reviewed():
+    entries = st.load_overrides(SHIPPED_OVERRIDES)               # raises while any entry is still pending
+    by = {(e["symbol"], e["event_date"], e["kind"] if "kind" in e else "split"): e for e in entries}
+    assert len(entries) == 27 and all(e["reviewed_by"] == "owner (B. Migette) 2026-10-20" for e in entries)
+    assert all(e["added"] in ("2026-10-20", "2026-10-21") for e in entries)
+    assert ("HON", "2026-06-28", "split") not in by              # the 1:2 reverse split is real (Honeywell 8-K): no reject
+    cbsh = [by[("CBSH", d, "split")] for d in ("2016-11-30", "2017-11-29", "2019-12-02")]
+    assert all(e["decision"] == "accept" and e["ratio"] == 1.05 and "sec.gov" in e["reason"] for e in cbsh)
+    assert by[("CENT", "2024-02-09", "split")]["decision"] == "reject" and by[("CENT", "2024-02-09", "spinoff")]["decision"] == "reject"
+    assert by[("CRESY", "2023-12-06", "split")]["decision"] == "reject"
+    assert by[("VGR", "2021-12-30", "split")]["decision"] == "reject"                    # FMP applied its own 1.41: the spin-off decides
+    assert by[("VGR", "2021-12-30", "spinoff")]["decision"] == "accept" and by[("VGR", "2021-12-30", "spinoff")]["ratio"] == 1.5367
+    assert by[("VTOL", "2020-06-12", "split")]["ratio"] == pytest.approx(1 / 3) and by[("WHWK", "2021-08-27", "split")]["ratio"] == pytest.approx(1 / 15)
+    assert by[("ENOV", "2022-04-05", "split")]["ratio"] == pytest.approx(1 / 3) and by[("IRON", "2022-12-30", "split")]["ratio"] == 0.1
+    assert by[("JBIO", "2025-04-29", "split")]["ratio"] == pytest.approx(1 / 35)
+    assert by[("QH", "2022-08-12", "split")]["ratio"] == pytest.approx(0.1) and by[("STSS", "2025-04-28", "split")]["ratio"] == pytest.approx(1 / 300)
+    assert by[("JFB", "2026-03-25", "split")]["ratio"] == 2.0 and "Yahoo" in by[("QH", "2022-08-12", "split")]["reason"]
+
+
+def test_pending_overrides_refuse_the_build(tmp_path):
+    p = write_ov(tmp_path, [ov("accept", 2.0), ov("reject", d=SESSIONS[41].date(), reviewed_by="pending (owner confirmation)")])
+    with pytest.raises(st.SplitOverridesPending, match="X 2021-03-02"):
+        st.load_overrides(p)
 
 
 def test_breaks_are_written_to_the_table(tmp_path):
@@ -943,11 +980,12 @@ def test_a_vendor_listing_of_the_spinoff_as_a_split_is_absorbed_never_applied_tw
     assert stats["listings_absorbed_by_spinoff"] == 2
     # a split with another ratio on the same day is a different event and is decided on its own
     other = [L("P", D, 0.5)]
-    acc, _, stats, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=other, fm=other, ov=[ov("accept", 0.5, symbol="P")])
-    assert sorted(a["kind"] for a in acc) == ["spinoff", "split"]
-    # an override that would accept the same event as a split is refused
-    with pytest.raises(st.SplitTableBuildError, match="adjust it twice"):
-        run_so({"P": raw, "S": spinco_bars()}, None, alp=both, ov=[ov("accept", 1.12, symbol="P")])
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=other, fm=other, ov=[ov("accept", 0.5, symbol="P")])
+    assert [a["kind"] for a in acc] == ["split"] and acc[0]["absorbed_factor"] == pytest.approx(1.125)    # ONE event: the split
+    assert one(rev, "spinoff_absorbed_by_split")["applied"] is True
+    # an override that accepts the same event as a split decides it: the split stays, the spin-off is absorbed (never both)
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=both, ov=[ov("accept", 1.12, symbol="P")])
+    assert [a["kind"] for a in acc] == [("split")] and one(rev, "spinoff_absorbed_by_split")
 
 
 def test_a_split_override_reject_never_blocks_the_spinoff():
@@ -968,7 +1006,7 @@ def test_spinoff_events_follow_name_changes():
                             "source_rate": 1}], "name_changes": [{"old_symbol": "OLD", "new_symbol": "NEW", "process_date": "2021-01-04"}]}
     ren = st.build_rename_map([month])
     stats = Counter()
-    assert st.spinoff_events_from_actions([month], ren, stats) == [SpinOff("NEW", date(2020, 3, 2), "KID", 0.4)]
+    assert st.spinoff_events_from_actions([month], ren, stats) == [SpinOff("NEW", date(2020, 3, 2), "KID", 0.4, "KID")]
     assert stats["alpaca_spin_offs"] == 1
     with pytest.raises(st.SplitTableBuildError):
         st.spinoff_events_from_actions([{"spin_offs": [{"source_symbol": "A", "new_symbol": "B", "ex_date": "2020-03-02",
@@ -1190,3 +1228,316 @@ def test_build_records_the_yahoo_inputs(tmp_path):
     assert inp["symbol"].tolist() == ["CC"] and inp["status"].tolist() == ["ok"] and inp["run_id"][0] == table["run_id"]
     sb.build_split_table(**kw, yahoo_fetch=fake_yahoo({}, calls), yahoo_sleep=lambda s: None)       # offline rerun: no new fetch
     assert calls == ["CC"]
+
+
+# ---- spun-off companies: lookup, -WI, CVR / warrant / right, FMP-step fallback, the missing list -------------------------
+def test_cvr_warrant_right_classification():
+    f = st.is_cvr_warrant_right
+    assert f("092CVR018", "P", False) and f("67012E104", "P", True)                # 9-char CUSIP-like with a digit
+    assert f("ABC-WS", "P", True) and f("OPENW", "OPEN", True) and f("OPENZ", "OPEN", True) and f("OPENL", "OPEN", False)
+    assert f("DFDVW", "DFDV", True) and f("SAVAW", "AAA", False) and f("XRXDW", "XRX", False)
+    assert not f("SAVAW", "AAA", True)                      # ends in W but has bars: a real company
+    assert not f("KLG", "K", False) and not f("ABCDEFGHI", "P", False)       # no digit: not CUSIP-like
+    assert not f("APE", "AMC", False) and not f("VYLR", "CTVA", False) and not f("TOOLONGW", "P", False)
+
+
+def test_cvr_warrant_spinoffs_are_counted_not_adjusted_and_have_no_row():
+    raw = parent_bars()
+    for sec in ("092CVR018", "S-WS", "PW", "SAVAW"):
+        acc, rev, stats, _ = run_so({"P": raw}, None, spin=(SpinOff("P", D, sec, 1.0),))
+        assert acc == [] and rev == [] and stats["verdict_spinoff_not_adjusted_cvr_warrant"] == 1, sec
+    # a same-ticker spin-off stays a refused review row
+    acc, rev, _, _ = run_so({"P": raw}, None, spin=(SpinOff("P", D, "P", 1.0),))
+    assert acc == [] and one(rev, "spinoff_no_spinco_price")
+
+
+def test_spinco_bars_are_read_for_any_symbol_in_the_store_and_wi_maps_to_the_base_ticker():
+    raw = parent_bars()
+    stats = Counter()
+    acc, _ = st.decide_splits({"P": raw}, [], [], [], stats, spinoffs=[SO], spinco_frame=lambda s: spinco_bars() if s == "S" else None)
+    assert [a["kind"] for a in acc] == ["spinoff"]                       # S is not among the judged symbols
+    ren = st.build_rename_map([{}])
+    month = {"spin_offs": [{"source_symbol": "P", "new_symbol": "AIRC.WI", "ex_date": "2020-12-15", "new_rate": 1, "source_rate": 1}]}
+    assert st.spinoff_events_from_actions([month], ren)[0].spinco == "AIRC"
+    # a CUSIP-like id that a name change maps to a ticker is still a CUSIP: judged BEFORE the mapping (INPX -> 23248B208 -> CXAI)
+    m2 = {"spin_offs": [{"source_symbol": "P", "new_symbol": "23248B208", "ex_date": "2020-12-15", "new_rate": 1, "source_rate": 1}],
+          "name_changes": [{"old_symbol": "23248B208", "new_symbol": "CXAI", "process_date": "2023-01-02"}]}
+    so = st.spinoff_events_from_actions([m2], st.build_rename_map([m2]))[0]
+    assert so.spinco == "CXAI" and so.security == "23248B208"
+    acc, rev, stats, _ = run_so({"P": raw, "CXAI": spinco_bars()}, None, spin=(so,))
+    assert acc == [] and rev == [] and stats["verdict_spinoff_not_adjusted_cvr_warrant"] == 1
+
+
+def test_spinoff_without_a_spinco_price_uses_a_non_flat_fmp_step_as_the_factor():
+    raw = parent_bars()
+    acc, rev, stats, _ = run_so({"P": raw}, {"P": fmp(raw, {40: 1.2})})                 # no S bars at all
+    assert [(a["verdict"], a["factor"], a["kind"], a["source"]) for a in acc] == [("spinoff_from_fmp_step", pytest.approx(1.2),
+                                                                                    "spinoff", "fmp_step")]
+    assert one(rev, "spinoff_from_fmp_step")["applied"] is True and stats["verdict_spinoff_from_fmp_step"] == 1
+    for fd in ({"P": fmp(raw)}, None, {"P": fmp(raw, {40: 0.8})}):                       # flat / no data / a step below 1
+        acc, rev, _, _ = run_so({"P": raw}, fd)
+        assert acc == [] and one(rev, "spinoff_no_spinco_price")["applied"] is False
+    acc, rev, _, _ = run_so({"P": raw}, {"P": fmp(raw, {40: 1.2})}, spin=(SpinOff("P", D, "P", 1.0),))   # same ticker: no fallback
+    assert acc == [] and one(rev, "spinoff_no_spinco_price")
+
+
+def test_missing_spincos_lists_only_real_tickers_without_bars():
+    raw = parent_bars()
+    missing = set()
+    spins = [SpinOff("P", D, "S", 0.5), SpinOff("P", D, "GONE", 0.5), SpinOff("P", D, "P", 1.0), SpinOff("P", D, "GONEW", 1.0),
+             SpinOff("P", D, "092CVR018", 1.0), SpinOff("P", D, "PW", 1.0)]
+    st.decide_splits({"P": raw, "S": spinco_bars()}, [], [], [], Counter(), spinoffs=spins, missing_spincos=missing)
+    assert missing == {"GONE"}
+
+
+def test_build_writes_the_missing_spinco_list(tmp_path):
+    store = tmp_path / "store"
+    for sym, frame in (("P", parent_bars()),):
+        d = store / "bars" / "1Day" / f"symbol={sym}"
+        d.mkdir(parents=True)
+        frame.assign(h=frame["o"], l=frame["o"]).to_parquet(d / "all.parquet")
+    d = store / "bars" / "1Day" / "symbol=S"                    # present in the store but NOT in a symbols list: still found
+    d.mkdir(parents=True)
+    spinco_bars().assign(h=1.0, l=1.0).to_parquet(d / "all.parquet")
+    (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2021-03-31"}), encoding="utf-8")
+    (store / "corporate_actions").mkdir()
+    with _gzip.open(store / "corporate_actions" / "ym=2021-03.json.gz", "wt", encoding="utf-8") as f:
+        json.dump({"forward_splits": [{"symbol": "S", "ex_date": "2021-03-31", "old_rate": 1, "new_rate": 2}],
+                   "spin_offs": [{"source_symbol": "P", "new_symbol": "S", "ex_date": D.isoformat(), "new_rate": 0.5, "source_rate": 1},
+                                 {"source_symbol": "P", "new_symbol": "OTCX", "ex_date": D.isoformat(), "new_rate": 0.1, "source_rate": 1},
+                                 {"source_symbol": "P", "new_symbol": "P.WS", "ex_date": D.isoformat(), "new_rate": 1, "source_rate": 1}]}, f)
+    fmpd = tmp_path / "fmpd"
+    fmpd.mkdir()
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    for w in ("2021-01-01_2021-01-30", "2021-01-31_2021-03-01", "2021-03-02_2021-03-31", "2021-04-01_2021-04-01"):
+        (cal / f"{w}.json").write_text("[]", encoding="utf-8")
+    res = sb.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01",
+                               fmp_to="2021-04-01", log=lambda m: None, symbols=["P"])
+    lines = (out / "_meta" / "spinco_symbols_missing.txt").read_text(encoding="utf-8").splitlines()
+    table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
+    assert lines[0] == f"# run_id: {table['run_id']}" and [x for x in lines if not x.startswith("#")] == ["OTCX"]
+    assert table["spinoffs"] == {"P": [[D.isoformat(), 1.125]]} and res["spinco_symbols_missing"] == 1
+
+
+# ---- gate fixes: split + spin-off on one ex-date, small single-vendor events confirmed by Yahoo, older store symbols ------
+def aiv_case(step_applied, split=1.3):
+    raw = parent_bars()                                          # P falls 100 -> 80; the spin-off factor is 1.125
+    fd = {"P": fmp(raw, {40: step_applied}) if step_applied else fmp(raw)}
+    both = [L("P", D, split)]                                    # both vendors list the spin-off as a 1.3 "split" (AIV style)
+    return run_so({"P": raw, "S": spinco_bars()}, fd, alp=both, fm=both)
+
+
+def test_joint_decision_split_alone_keeps_the_split_and_absorbs_the_spinoff():
+    acc, rev, stats, _ = aiv_case(1.29)                          # FMP's step equals the listed split (AIV: 9.2949 vs 9.295)
+    assert [(a["kind"], a["verdict"], a["factor"]) for a in acc] == [("split", "proven", 1.3)]
+    assert acc[0]["absorbed_factor"] == pytest.approx(1.125) and "spin-off" in acc[0]["absorbed"]
+    assert one(rev, "spinoff_absorbed_by_split")["applied"] is True
+    assert stats["verdict_spinoff_fmp_agrees"] == 0 and stats["verdict_spinoff_absorbed_by_split"] == 1
+    assert st.splits_by_symbol(acc, "spinoff") == {} and st.splits_by_symbol(acc) == {"P": [[D.isoformat(), 1.3]]}
+
+
+def test_joint_decision_spinoff_alone_when_fmp_supports_it():
+    acc, rev, stats, _ = aiv_case(1.12)                          # the step equals the spin-off factor, not the 1.3 split
+    assert [(a["kind"], a["verdict"]) for a in acc] == [("spinoff", "spinoff_fmp_agrees")]
+    assert stats["listings_absorbed_by_spinoff"] == 2
+
+
+def test_joint_decision_conflict_when_fmp_agrees_with_no_candidate_or_with_several():
+    for step_applied in (None, 1.2):                             # flat; or 1.2 (6.7 % from 1.125, 8.3 % from 1.3: ambiguous)
+        acc, rev, stats, _ = aiv_case(step_applied)
+        assert acc == [] and one(rev, "split_spinoff_conflict")["applied"] is False, step_applied
+        assert stats["verdict_split_spinoff_conflict"] == 1 and not any(r["applied"] for r in rev)
+
+
+def test_joint_decision_composed_split_and_spinoff_on_the_post_split_basis():
+    # Honeywell 2026-06-29: a 1:2 reverse split AND the HONA spin-off (0.5 HONA per OLD share = 1 per NEW share).  Raw closes
+    # 232.21 -> 227.80; HONA 220.19.  Spin factor on the post-split basis S' = 1 + (0.5 / 0.5) * 220.19 / 227.80 = 1.9666;
+    # composed step = 0.5 * 1.9666 = 0.9833; FMP's step is 0.9535 (3.1 % away).  FMP also lists its OWN composite 0.9535 as a split.
+    raw = parent_bars(before=232.21, after=227.80)
+    fd = {"P": fmp(raw, {40: 0.9535})}
+    spin = SpinOff("P", D, "S", 0.5)
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars(price=220.19)}, fd, spin=(spin,), alp=[L("P", D, 0.5)],
+                                fm=[L("P", SESSIONS[39].date(), 0.9535)])
+    got = {(a["kind"], a["verdict"]): a["factor"] for a in acc}
+    assert got == {("split", "split_composed_with_spinoff"): 0.5, ("spinoff", "spinoff_composed_with_split"): pytest.approx(1.96656, rel=1e-4)}
+    assert one(rev, "spinoff_composed_with_split")["applied"] is True and not any(r["verdict"] == "split_spinoff_conflict" for r in rev)
+    assert st.splits_by_symbol(acc) == {"P": [[D.isoformat(), 0.5]]} and list(st.splits_by_symbol(acc, "spinoff")) == ["P"]
+    # without FMP data the RAW JUMP (1.019) stands in as the evidence: it supports the composed pair (0.983), nothing else
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars(price=220.19)}, None, spin=(spin,), alp=[L("P", D, 0.5)])
+    assert {(a["kind"], a["verdict"]) for a in acc} == {("split", "split_composed_with_spinoff"), ("spinoff", "spinoff_composed_with_split")}
+    assert "raw jump" in acc[0]["fmp_step"]
+    # evidence that supports nothing: refused, never guessed
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars(price=60.0)}, None, spin=(spin,), alp=[L("P", D, 0.5)])
+    assert acc == [] and one(rev, "split_spinoff_conflict")
+
+
+def test_joint_decision_leaves_a_reviewed_override_to_the_override():
+    acc, rev, _, _ = run_so({"P": parent_bars(), "S": spinco_bars()}, None, alp=[L("P", D, 0.5)],
+                            ov=[ov("accept", 0.5, symbol="P")])
+    assert [a["kind"] for a in acc] == ["split"] and one(rev, "spinoff_absorbed_by_split")
+
+
+def test_small_single_vendor_event_needs_yahoo_within_half_a_percent():
+    f = {"X": bars()}
+    acc, rev, _ = run(f, [L("X", D, 1.05)])                                              # no Yahoo: review, as before
+    assert acc == [] and one(rev, "small_single_vendor")
+    acc, rev = st.decide_splits(f, [L("X", D, 1.05)], [], [], Counter(), yahoo=yhoo((SESSIONS[41].date(), 1.0503)))
+    assert [(a["verdict"], a["source"]) for a in acc] == [("small_confirmed_by_yahoo", "alpaca+yahoo")] and rev == []
+    acc, _ = st.decide_splits(f, [], [L("X", D, 1.05)], [], Counter(), yahoo=yhoo((D, 1.05)))
+    assert [a["source"] for a in acc] == ["fmp+yahoo"]
+    for bad in (yhoo((D, 1.06)), yhoo((SESSIONS[46].date(), 1.05)), yhoo(), yhoo(available=False), None):    # 1 %, 6 sessions off, none
+        acc, rev = st.decide_splits(f, [L("X", D, 1.05)], [], [], Counter(), yahoo=bad)
+        assert acc == [] and one(rev, "small_single_vendor")
+
+
+def test_a_ticker_renamed_after_its_bars_end_keeps_its_events_on_the_old_symbol():
+    ren = st.build_rename_map([{"name_changes": [{"old_symbol": "OP", "new_symbol": "SVRN", "process_date": "2025-11-17"}]}])
+    day = date(2023, 6, 8)
+    ranges = {"OP": (date(2021, 11, 30), date(2025, 11, 14)), "SVRN": (date(2025, 11, 17), date(2026, 10, 9))}
+
+    def cover(s, d):
+        return s in ranges and ranges[s][0] <= d <= ranges[s][1]
+    assert st.map_to_current("OP", day, ren) == "SVRN"                                   # the plain mapping (no store knowledge)
+    assert st.map_to_current("OP", day, ren, cover) == "OP"                              # SVRN's bars start 2025-11-17: OP holds 2023
+    assert st.map_to_current("SVRN", date(2026, 3, 30), ren, cover) == "SVRN"            # an event listed under the new ticker
+    assert st.map_to_current("OP", day, ren, lambda s, d: False) == "SVRN"               # covered by neither: unchanged behaviour
+    month = {"reverse_splits": [{"symbol": "OP", "ex_date": "2023-06-08", "old_rate": 20, "new_rate": 1}]}
+    stats = Counter()
+    ev = st.alpaca_events_from_actions([month], ren, stats, cover)
+    assert ev == [L("OP", day, 0.05)] and stats["events_mapped_to_older_symbol"] == 1
+    assert st.alpaca_events_from_actions([month], ren, Counter())[0].symbol == "SVRN"
+
+
+def test_build_applies_an_alpaca_listed_split_of_a_renamed_symbol(tmp_path):
+    store, fmpd, raw = tiny_store(tmp_path, symbol="AA", asof="2021-01-30", listed=False)
+    later = store / "bars" / "1Day" / "symbol=BB"                            # the renamed ticker's bars start only after the rename
+    later.mkdir(parents=True)
+    bars(sessions=SESSIONS[79:80]).assign(h=1.0, l=1.0).to_parquet(later / "all.parquet")
+    with _gzip.open(store / "corporate_actions" / "ym=2021-03.json.gz", "wt", encoding="utf-8") as f:
+        json.dump({"forward_splits": [{"symbol": "AA", "ex_date": D.isoformat(), "old_rate": 1, "new_rate": 4}],
+                   "name_changes": [{"old_symbol": "AA", "new_symbol": "BB", "process_date": "2021-04-20"}]}, f)
+    out = tmp_path / "out"
+    cal = out / "_meta" / "fmp_split_calendar"
+    cal.mkdir(parents=True)
+    (cal / "2021-01-01_2021-01-30.json").write_text("[]", encoding="utf-8")
+    (cal / "2021-01-31_2021-01-31.json").write_text("[]", encoding="utf-8")
+    res = sb.build_split_table(store=str(store), out=str(out), db="unused", fmp_daily_dir=str(fmpd), fmp_from="2021-01-01",
+                               log=lambda m: None)
+    table = json.loads((out / "_meta" / "split_table.json").read_text(encoding="utf-8"))
+    assert table["splits"] == {"AA": [[D.isoformat(), 4.0]]} and res["stats"]["events_mapped_to_older_symbol"] == 1
+    acc = sb.read_csv_frame(str(out / "_meta" / "split_accepted.csv"))
+    assert acc["source"].tolist() == ["alpaca"] and acc["absorbed"].tolist() == [""]
+
+
+def test_yahoo_answers_from_a_foreign_ticker_are_never_trusted(tmp_path):
+    # OP renamed SVRN on 2025-11-17, after its last bar (2025-11-14): the successor is the same company (same CUSIP)
+    ren = st.build_rename_map([{"name_changes": [{"old_symbol": "OP", "new_symbol": "SVRN", "process_date": "2025-11-17"}]}])
+    table = {"OP": None, "SVRN": [("2023-06-08", 0.05)], "ZZZ": [("2023-06-08", 0.05)]}
+    src = sb.YahooSplitSource(str(tmp_path / "a"), ren, fetch=fake_yahoo(table), sleep=lambda s: None, clock=lambda: 0.0,
+                              bars_end=lambda s: date(2025, 11, 14))
+    assert src("OP") == {"available": True, "ticker": "SVRN", "splits": [["2023-06-08", 0.05]]}
+    # a rename that happened BEFORE the symbol's last bar belongs to an earlier company that held the ticker: not a successor
+    reused = sb.YahooSplitSource(str(tmp_path / "b"), ren, fetch=fake_yahoo(table), sleep=lambda s: None, clock=lambda: 0.0,
+                                 bars_end=lambda s: date(2026, 9, 30))
+    assert reused("OP") == {"available": False, "ticker": None, "splits": []} and reused.records["OP"]["status"] == "not_found"
+    # a cached answer from a ticker that is neither the symbol nor a chain successor is refused, whatever the cache says
+    os.makedirs(tmp_path / "c")
+    (tmp_path / "c" / "OP.json").write_text(json.dumps({"symbol": "OP", "status": "ok", "ticker": "ZZZ", "splits": [["2023-06-08", 0.05]],
+                                                        "tried": [], "fetched_at": "2026-10-20T00:00:00Z"}), encoding="utf-8")
+    foreign = sb.YahooSplitSource(str(tmp_path / "c"), ren, fetch=fake_yahoo({}), sleep=lambda s: None, bars_end=lambda s: date(2025, 11, 14))
+    assert foreign("OP") == {"available": False, "ticker": "ZZZ", "splits": []} and foreign.records["OP"]["status"] == "foreign_ticker"
+
+
+# ---- follow-ups: small both-listed jump rule, spin-off overrides, FTI / UL / VGR / CRESY cases -------------------------
+def test_small_both_listed_factor_is_accepted_when_the_raw_jump_is_closer_to_f_than_to_one():
+    def case(jump, f):
+        raw = bars(40, jump)
+        return runf({"X": raw}, {"X": fmp(raw)}, [L("X", D, f)], [L("X", D, f)])        # FMP's own series is flat
+    acc, rev, stats = case(1.101, 1.1)                                                    # BBDO
+    assert [(a["verdict"], a["source"]) for a in acc] == [("small_both_jump_agrees", "both")] and stats["verdict_small_both_jump_agrees"] == 1
+    for jump, f in ((1.0055, 0.9697), (0.998, 1.1), (0.9938, 1.0256), (1.0217, 1.0447)):   # AIV, GBCI, METCB, PHG: closer to 1
+        acc, rev, _ = case(jump, f)
+        assert acc == [] and one(rev, "small_both_price_disagrees"), (jump, f)
+    acc, rev, _ = case(0.908, 0.9)                                                        # a reverse-direction small factor
+    assert [a["verdict"] for a in acc] == ["small_both_jump_agrees"]
+
+
+def test_spinoff_override_rejects_or_accepts_the_spinoff_alone_of_a_symbol_and_date():
+    raw = parent_bars()
+    own = lambda dec, **kw: ov(dec, symbol="P", kind="spinoff", **kw)                    # noqa: E731
+    # CENT: both the split listing and the spin-off rejected; FMP is flat, so nothing would be applied by the rules either
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw)}, alp=[L("P", D, 1.3)], fm=[L("P", D, 1.3)],
+                                ov=[ov("reject", symbol="P"), own("reject")])
+    assert acc == [] and {r["verdict"] for r in rev} == {"override_reject"} and len(rev) == 2
+    # a spin-off reject alone drops the adjustment (CTVA-style 'flat' would apply it) but leaves a listed split to the rules
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw)}, ov=[own("reject")])
+    assert acc == [] and one(rev, "override_reject")["applied"] is False
+    # accept applies the given factor as a spin-off and absorbs split listings there
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=[L("P", D, 1.3)], ov=[own("accept", ratio=1.2)])
+    assert [(a["kind"], a["verdict"], a["factor"]) for a in acc] == [("spinoff", "override_accept", 1.2)]
+    # an override for a spin-off that does not exist is counted, not silent
+    acc, rev, stats, _ = run_so({"P": raw}, None, spin=(), ov=[own("reject")])
+    assert stats["spinoff_overrides_unused"] == 1
+    # the kind is validated and part of the identity of an entry
+    with pytest.raises(ValueError, match="kind"):
+        st.load_overrides(write_ov(__import__("pathlib").Path(str(__import__("tempfile").mkdtemp())), [ov("reject", kind="dividend")]))
+
+
+def test_a_split_the_owner_rejected_is_no_candidate_and_the_spinoff_stands_alone():
+    # CRESY 2023-12-06: a 1.00985 stock dividend (rejected) and the IRS spin-off of the same day (factor ~1.037, FMP step 1.0093)
+    raw = parent_bars(before=100.0, after=96.0)
+    spin = SpinOff("P", D, "S", 0.2)                                                      # f = 1 + 0.2 * 20 / 96 = 1.04167
+    fd = {"P": fmp(raw, {40: 1.0093})}
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, fd, spin=(spin,), alp=[L("P", D, 1.00985)], fm=[L("P", D, 1.00985)],
+                            ov=[ov("reject", symbol="P")])
+    assert [(a["kind"], a["verdict"]) for a in acc] == [("spinoff", "spinoff_fmp_flat")] and acc[0]["factor"] == pytest.approx(1.04167, rel=1e-4)
+    assert not any(r["verdict"] == "split_spinoff_conflict" for r in rev)
+
+
+def test_a_spinoff_without_a_spinco_price_absorbs_the_split_listing_of_the_same_step():
+    # FTI 2021-02-16: no price for THNPF, FMP's step 1.22156 IS the spin-off factor; FMP lists 1.344 as a "split" there.  The old
+    # text said FMP agreed with neither candidate although the spin-off factor was derived from that very step.
+    raw = parent_bars()
+    fd = {"P": fmp(raw, {40: 1.22156})}
+    acc, rev, stats, _ = run_so({"P": raw}, fd, fm=[L("P", D, 1.344)])
+    assert [(a["kind"], a["verdict"]) for a in acc] == [("spinoff", "spinoff_from_fmp_step")] and acc[0]["factor"] == pytest.approx(1.22156)
+    assert not any(r["verdict"] == "split_spinoff_conflict" for r in rev) and stats["listings_absorbed_by_spinoff"] == 1
+    # the leftover reconcile (an accepted split with a spin-off of the same session) now also scores the spin-off alone
+    acc2, rev2, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw, {40: 1.124})}, alp=[L("P", D, 1.3)], fm=[L("P", D, 1.3)],
+                              ov=[ov("accept", 1.3, symbol="P")])
+    assert [a["kind"] for a in acc2] == ["split"]                                          # a reviewed override on the split wins
+
+
+def test_an_adr_ratio_change_the_session_after_the_spinoff_is_a_separate_event():
+    # UL 2025-12-08/09: the Magnum spin-off (0.2 MICC at 14.92 per share) on D, the 8:9 consolidation (0.8889) one session later
+    rows = []
+    for i, d in enumerate(SESSIONS):
+        p = 59.48 if i < 40 else (55.30 if i == 40 else 64.04)
+        rows.append({"t": pd.Timestamp(d).tz_localize("America/New_York").tz_convert("UTC"), "o": p, "c": p})
+    raw = pd.DataFrame(rows, columns=["t", "o", "c"])
+    fd = {"P": fmp(raw, {41: 0.88889})}                                                    # FMP does not adjust the spin-off
+    both = [L("P", D, 0.88889)]
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars(price=14.92)}, fd, spin=(SpinOff("P", D, "S", 0.2),), alp=both, fm=both)
+    got = {(a["kind"], a["date"]) for a in acc}
+    assert got == {("spinoff", D.isoformat()), ("split", SESSIONS[41].date().isoformat())}, got
+    # the spin-off's FMP window straddles the next session's step, so its vote is "unverified" (applied either way)
+    assert {a["verdict"] for a in acc if a["kind"] == "spinoff"} <= {"spinoff_fmp_flat", "spinoff_fmp_unverified"}
+    assert [a["verdict"] for a in acc if a["kind"] == "split"] == ["small_both"]
+    assert [a["factor"] for a in acc if a["kind"] == "spinoff"] == [pytest.approx(1 + 0.2 * 14.92 / 55.30)]
+    assert stats["splits_on_another_session_than_a_spinoff"] == 1 and stats["splits_moved_to_jump_session"] == 1
+    assert not any(r["verdict"] in ("split_spinoff_conflict", "spinoff_absorbed_by_split") for r in rev)
+
+
+def test_a_spinoff_and_a_split_are_scored_on_the_raw_jump_when_fmp_has_no_data():
+    # VGR 2021-12-30: no FMP file; the raw jump 1.519 supports the spin-off 1.5367, not the listed 1.41 split
+    rows = []
+    for i, d in enumerate(SESSIONS):
+        p = 17.16 if i < 40 else 11.30
+        rows.append({"t": pd.Timestamp(d).tz_localize("America/New_York").tz_convert("UTC"), "o": p, "c": p})
+    raw = pd.DataFrame(rows, columns=["t", "o", "c"])
+    both = [L("P", D, 1.41)]
+    acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars(price=12.13)}, None, spin=(SpinOff("P", D, "S", 0.5),), alp=both, fm=both)
+    assert [(a["kind"], a["factor"]) for a in acc] == [("spinoff", pytest.approx(1 + 0.5 * 12.13 / 11.30))]
+    assert stats["listings_absorbed_by_spinoff"] == 2 and not any(r["verdict"] == "split_spinoff_conflict" for r in rev)

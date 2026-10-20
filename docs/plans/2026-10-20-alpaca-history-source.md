@@ -23,8 +23,11 @@ table; the remote227 stage-1 option grid finishes on FMP; archive the FMP cache 
 derived stores; then the ED-11 job (opt 556) relaunches on Alpaca data.
 
 **Semantics fixed by this plan**
-- Adjustment = splits, reverse splits, unit splits and stock dividends (back-adjusted to the store's asof basis).
-  Cash dividends and spin-offs are NOT adjusted -- the same convention as FMP's `close` today.
+- Adjustment = splits, reverse splits, unit splits and stock dividends (back-adjusted to the store's asof basis),
+  AND spin-offs (owner 2026-10-20: the engine does not credit spun-off shares, so an unadjusted parent shows a fake
+  loss; FMP adjusts many spin-offs too): factor 1 + rate x spinco close / parent close on the ex-date, prices only,
+  volume unchanged. Cash dividends are NOT adjusted. Series breaks (reused tickers, bankruptcies): only the segment
+  after the last break is kept.
 - 5-minute files hold the regular session only (bar starts 09:30..15:55 America/New_York), NY-naive `Date`,
   `effective_date = Date`, like the FMP files. Daily files: NY-naive midnight `Date`.
 - Volume is multiplied by the same factor the prices are divided by.
@@ -173,8 +176,8 @@ resolver); `testplatform/ba2test_launcher.py` (`--ohlcv-history-source {fmp,alpa
 ### Task 9: Cache push replicates only the selected history folder
 **Files:** `testplatform/backend/app/services/cache_sync.py:81,120-160,479`; Test the existing cache_sync tests file.
 - `build_manifest(..., exclude_dirnames=())`; the push of a job passes the OTHER source's folder
-  (`FMPOHLCVProvider` for an `alpaca` job): it is not copied, and the worker's copy is removed by the existing prune
-  (owner: "not replicated").
+  (`FMPOHLCVProvider` for an `alpaca` job): it is neither copied NOR pruned on the worker (owner 2026-10-20: option
+  jobs on shared workers still read FMP until Task 12).
 - Test: an `alpaca` push manifest has no `FMPOHLCVProvider/` entry and prunes the worker's copy.
 
 ### Task 10: Versions, guard, full suites
@@ -235,8 +238,9 @@ Measured 2026-10-20: Alpaca `delayed_sip` latest trade AND quote are 15.0 min ol
 2. Build the cache (all store symbols). Verify: coverage per symbol-year (expect ~96.5% of symbol-days, the
    2026-10-20 measurement), 5-min last close vs daily close on the same basis (<= 1% of days off by > 2%), and a
    spot check vs FMP on symbols FMP has right (ratio 1.000 after adjustment for >= 90% of symbol-years).
-3. Archive: check no local master is running (`ba2test_launcher.py optimize` processes), then move
-   `~/Documents/ba2/common/cache/FMPOHLCVProvider` -> `~/Documents/ba2/archive/FMPOHLCVProvider-20261020`.
+3. Archive: DEFERRED until Task 12 ships (owner 2026-10-20: option backtests still read FMP). Then, with no local
+   master running, move `~/Documents/ba2/common/cache/FMPOHLCVProvider` -> `~/Documents/ba2/archive/FMPOHLCVProvider-<date>`.
+   Until then no new equity job reads the FMP folder.
    Live apps re-fetch FMP on demand into a fresh folder, which Task 9 keeps out of `alpaca` pushes.
 4. Rebuild with `--ohlcv-history-source alpaca`: the screener daily panel, a NEW metric store
    (`metric_store_alpaca_20261020`, the live store is not swapped here), market-condition stores; `_derived` shared

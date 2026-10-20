@@ -610,3 +610,158 @@ def test_market_conditions_dry_run_lists_the_eight_commands_and_writes_nothing(t
     lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("market-conditions:")]
     assert len(lines) == 8 and all("--ohlcv-history-source alpaca" in ln for ln in lines)
     assert not (tmp_path / "rep").exists()
+
+
+# ---------------------------------------------------------------------------
+# bad daily prints
+# ---------------------------------------------------------------------------
+BAD_DAY = "2024-01-04"
+
+
+def repair_env(env, tmp_path, daily_high=20.0, daily_low=None, fmp_high=10.5, fmp_low=9.5, fmp_scale=1.0, with_fmp=True, close=10.0):
+    """One symbol, five sessions; on BAD_DAY the daily High (and Low) is set to a (bad) print.  5-minute envelope: 9.5 .. 10.5."""
+    daily, intr, out = env
+    days = sessions("2024-01-02", "2024-01-08")
+    write_symbol(daily, intr, "ABC", days, days)
+    p = daily / "bars" / "1Day" / "symbol=ABC" / "all.parquet"
+    f = pd.read_parquet(p)
+    i = f.index[f["t"] == ny_to_utc(pd.Timestamp(BAD_DAY))][0]
+    f.loc[i, "h"] = daily_high
+    if daily_low is not None:
+        f.loc[i, "l"] = daily_low
+    f.to_parquet(p, index=False)
+    make_table(out)
+    fmp = tmp_path / "fmp"
+    fmp.mkdir(parents=True)
+    if with_fmp:
+        rows = [{"Date": pd.Timestamp(d), "High": fmp_high * fmp_scale, "Low": fmp_low * fmp_scale, "Close": close * fmp_scale} for d in days]
+        pd.DataFrame(rows).to_parquet(fmp / "ABC_1d.parquet", index=False)
+    s = bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, fmp_daily_dir=str(fmp))
+    return pd.read_parquet(out / "ABC_1d.parquet").set_index("Date"), s
+
+
+def test_bad_high_with_fmp_witness_is_repaired_and_recorded(env, tmp_path):
+    d, s = repair_env(env, tmp_path)
+    out = env[2]
+    row = d.loc[BAD_DAY]
+    assert row["High"] == 10.5 and row["Open"] == 10.0 and row["Close"] == 10.0 and row["Volume"] == 1000
+    assert s["bar_repairs"] >= 1
+
+
+def test_repair_row_is_recorded_in_the_csv(env, tmp_path):
+    repair_env(env, tmp_path)
+    r = pd.read_csv(env[2] / "_meta" / "bar_repairs.csv", keep_default_na=False)
+    row = r[r["date"] == BAD_DAY].iloc[0]
+    assert (row["symbol"], row["field"], row["old"], row["new"], row["envelope"], row["fmp"], row["run_id"]) == ("ABC", "High", 20.0, 10.5, 10.5, 10.5, "RUN1")
+    assert (env[2] / "_meta" / "envelope" / "ABC.parquet").is_file()
+    assert list(r.columns) == bld.REPAIR_COLUMNS
+
+
+def test_no_repair_without_the_fmp_witness(env, tmp_path):
+    d, s = repair_env(env, tmp_path, with_fmp=False)
+    assert d.loc[BAD_DAY, "High"] == 20.0 and s["bar_repairs"] == 0
+
+
+def test_no_repair_when_fmp_disagrees_with_the_envelope(env, tmp_path):
+    d, s = repair_env(env, tmp_path, fmp_high=20.0)                                  # FMP shows the same high: not a bad print we can witness
+    assert d.loc[BAD_DAY, "High"] == 20.0
+
+
+def test_witness_uses_the_days_ratio_to_fmp(env, tmp_path):
+    d, _ = repair_env(env, tmp_path, fmp_scale=2.0)                                  # FMP on another basis: x2 everywhere
+    assert d.loc[BAD_DAY, "High"] == 10.5
+
+
+def test_a_high_explained_by_the_close_is_not_repaired(env, tmp_path):
+    # Close == High outside the 5-minute envelope (missing late bars / closing auction): High' = max(env, Open, Close) = Close
+    sub = (tmp_path / "e2")
+    for n in ("daily", "intra", "out"):
+        (sub / n).mkdir(parents=True)
+        if n != "out":
+            (sub / n / "STORE_INFO.json").write_text(json.dumps({"asof": "2026-10-12"}))
+            (sub / n / "bars" / "1Day").mkdir(parents=True)
+            (sub / n / "bars" / "5Min").mkdir(parents=True)
+    days = sessions("2024-01-02", "2024-01-08")
+    write_symbol(sub / "daily", sub / "intra", "ABC", days, days, close=10.0)
+    p = sub / "daily" / "bars" / "1Day" / "symbol=ABC" / "all.parquet"
+    f = pd.read_parquet(p)
+    f.loc[:, ["o", "h", "c"]] = 12.0
+    f.loc[:, "l"] = 11.9
+    f.to_parquet(p, index=False)
+    make_table(sub / "out")
+    fmp = tmp_path / "fmp2"
+    fmp.mkdir()
+    pd.DataFrame([{"Date": pd.Timestamp(x), "High": 10.5, "Low": 9.5, "Close": 12.0} for x in days]).to_parquet(fmp / "ABC_1d.parquet", index=False)
+    s = bld.build_cache(daily_store=str(sub / "daily"), intraday_store=str(sub / "intra"), out=str(sub / "out"), workers=1, fmp_daily_dir=str(fmp))
+    assert s["bar_repairs"] == 0
+
+
+def test_a_high_within_two_percent_is_left_alone(env, tmp_path):
+    d, s = repair_env(env, tmp_path, daily_high=10.6)
+    assert d.loc[BAD_DAY, "High"] == 10.6
+
+
+def test_bad_low_is_repaired_symmetrically(env, tmp_path):
+    d, _ = repair_env(env, tmp_path, daily_high=10.5, daily_low=1.0)
+    assert d.loc[BAD_DAY, "Low"] == 9.5 and d.loc[BAD_DAY, "High"] == 10.5
+    r = pd.read_csv(env[2] / "_meta" / "bar_repairs.csv", keep_default_na=False)
+    assert "Low" in set(r["field"])
+
+
+# ---------------------------------------------------------------------------
+# Yahoo as the second witness
+# ---------------------------------------------------------------------------
+def yahoo_witness(tmp_path, high=None, low=None, available=True):
+    from ba2_providers.ohlcv.alpaca_history import verify as ver
+    days = [pd.Timestamp(d) for d in sessions("2024-01-02", "2024-01-08")]
+    frame = pd.DataFrame({"day": days, "Close": 10.0, "High": 10.5 if high is None else high, "Low": 9.5 if low is None else low})
+    return ver.YahooDaily(str(tmp_path / "yd"), fetch=lambda t: frame if available else None, sleep=lambda s: None)
+
+
+def second_witness(env, tmp_path, yahoo, fmp_high, daily_high=20.0):
+    """FMP carries ``fmp_high`` on the bad day (not the envelope value: the first witness does not settle it); the daily High is bad."""
+    daily, intr, out = env
+    days = sessions("2024-01-02", "2024-01-08")
+    write_symbol(daily, intr, "ABC", days, days)
+    p = daily / "bars" / "1Day" / "symbol=ABC" / "all.parquet"
+    f = pd.read_parquet(p)
+    f.loc[f["t"] == ny_to_utc(pd.Timestamp(BAD_DAY)), "h"] = daily_high
+    f["h"] = f["h"].where(f["t"] == ny_to_utc(pd.Timestamp(BAD_DAY)), 10.5)       # the other days are clean
+    f["l"] = 9.5
+    f.to_parquet(p, index=False)
+    make_table(out)
+    fmp = tmp_path / "fmp"
+    fmp.mkdir(parents=True)
+    rows = [{"Date": pd.Timestamp(d), "High": fmp_high if d == BAD_DAY else 10.5, "Low": 9.5, "Close": 10.0} for d in days]
+    pd.DataFrame(rows).to_parquet(fmp / "ABC_1d.parquet", index=False)
+    s = bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, fmp_daily_dir=str(fmp), yahoo=yahoo)
+    return pd.read_parquet(out / "ABC_1d.parquet").set_index("Date"), s
+
+
+def test_yahoo_agreeing_with_the_envelope_repairs_and_is_recorded_as_the_witness(env, tmp_path):
+    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, high=10.5), fmp_high=20.0)
+    assert d.loc[BAD_DAY, "High"] == 10.5 and s["bar_repairs"] == 1 and s["unwitnessed_outliers"] == 0
+    r = pd.read_csv(env[2] / "_meta" / "bar_repairs.csv", keep_default_na=False)
+    assert list(r.columns) == bld.REPAIR_COLUMNS and r["witness"].tolist() == ["yahoo"]
+    assert r["old"].iloc[0] == 20.0 and r["new"].iloc[0] == 10.5 and r["yahoo"].iloc[0] == 10.5 and r["fmp"].iloc[0] == 20.0
+    assert (env[2] / "_meta" / "build_yahoo_inputs.csv").is_file()
+
+
+def test_yahoo_and_fmp_both_carrying_the_print_keep_it_as_a_consolidated_print(env, tmp_path):
+    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, high=20.0), fmp_high=20.0)
+    assert d.loc[BAD_DAY, "High"] == 20.0 and s["bar_repairs"] == 0 and s["consolidated_prints"] == 1 and s["unwitnessed_outliers"] == 0
+    c = pd.read_csv(env[2] / "_meta" / "consolidated_prints.csv", keep_default_na=False)
+    assert c["date"].tolist() == [BAD_DAY] and c["field"].tolist() == ["High"] and c["daily"].tolist() == [20.0]
+
+
+def test_yahoo_unavailable_or_agreeing_with_neither_leaves_the_bar_unwitnessed(env, tmp_path):
+    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, available=False), fmp_high=20.0)
+    assert d.loc[BAD_DAY, "High"] == 20.0 and s["unwitnessed_outliers"] == 1 and s["bar_repairs"] == 0
+    d, s = second_witness(env, tmp_path / "n", yahoo_witness(tmp_path / "n", high=15.0), fmp_high=20.0)
+    assert d.loc[BAD_DAY, "High"] == 20.0 and s["unwitnessed_outliers"] == 1 and s["consolidated_prints"] == 0
+
+
+def test_a_print_only_yahoo_carries_is_not_consolidated(env, tmp_path):
+    # FMP agrees with neither the envelope nor the daily value: Yahoo alone does not make it a consolidated print
+    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, high=20.0), fmp_high=15.0)
+    assert d.loc[BAD_DAY, "High"] == 20.0 and s["consolidated_prints"] == 0 and s["unwitnessed_outliers"] == 1

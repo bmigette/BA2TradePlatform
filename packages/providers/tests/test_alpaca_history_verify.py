@@ -63,7 +63,7 @@ def test_clean_cache_passes_every_check(clean, tmp_path):
     put(other, "AAA", daily(DAYS, 10.0))
     res = gate(clean, tmp_path, other=str(other), panel=["AAA"])
     assert status(res) == {"structural": "PASS", "coverage": "PASS", "selfcons": "PASS", "residual_jumps": "PASS", "vendor_ratio": "INFO",
-                           "readiness": "INFO", "yahoo": "INFO"}
+                           "readiness": "INFO", "yahoo": "INFO", "hl_envelope": "INFO"}
     assert res["coverage"]["summary"]["panel_coverage"] == 1.0 and ver.gate_failed(res) == []
     for name in ("structural", "coverage_symbol_year", "coverage_by_year", "selfcons", "residual_jumps", "vendor_ratio_steps", "readiness"):
         assert (tmp_path / "verify" / f"{name}.csv").is_file()
@@ -234,7 +234,7 @@ def yahoo_for(frames, calls=None, successors=None, tmp=None, refresh=False):
         if calls is not None:
             calls.append(t)
         f = frames.get(t)
-        return None if f is None else pd.DataFrame({"day": f["Date"], "Close": f["Close"]})
+        return None if f is None else pd.DataFrame({"day": f["Date"], "Close": f["Close"], "High": f["Close"], "Low": f["Close"]})
     return ver.YahooDaily(str(tmp / "yd"), fetch=fetch, sleep=lambda s: None, refresh=refresh,
                           successors=successors or (lambda s: []))
 
@@ -355,7 +355,8 @@ def test_yahoo_spinoff_convention_run_is_expected_not_a_failure(tmp_path):
     ours = [10.0 / 1.25] * cut + [10.0] * (len(DAYS) - cut)                  # we divided the prices before the spin-off by 1.25
     theirs = [10.0] * len(DAYS)                                              # Yahoo did not
     y = _yahoo_gate(tmp_path, ours, theirs, spinoffs={"AAA": [(str(DAYS[cut].date()), 1.25)]})
-    assert y["status"] == "PASS" and y["summary"]["runs_by_class"] == {"spinoff_convention": 1, "series_break": 0, "unexplained": 0}
+    assert y["status"] == "PASS" and y["summary"]["runs_by_class"] == {"spinoff_convention": 1, "series_break": 0, "convention": 0, "yahoo_missing_event": 0,
+                                                              "successor_later_event": 0, "unexplained": 0}
     runs = pd.read_csv(tmp_path / "verify" / "yahoo_mismatch_runs.csv")
     assert runs["classification"].tolist() == ["spinoff_convention"] and runs["days"].iloc[0] == cut
     # the same mismatch with a factor we did not apply is unexplained and fails
@@ -371,3 +372,245 @@ def test_yahoo_run_at_a_series_break_is_classified_apart(tmp_path):
     theirs = [10.0] * len(DAYS)
     y = _yahoo_gate(tmp_path, ours, theirs, breaks={"AAA": str(DAYS[cut].date())})
     assert y["status"] == "PASS" and y["summary"]["runs_by_class"]["series_break"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Yahoo as the tie-breaker; convention; provenance
+# ---------------------------------------------------------------------------
+def _tie(tmp_path, yahoo_closes):
+    """ours: a real 60 % crash at day 30; the other vendor shows NO crash (it invented a split)."""
+    cache, other = tmp_path / "c", tmp_path / "o"
+    put(cache, "AAA", daily(DAYS, jump_series()), five(DAYS, 10.0))
+    put(other, "AAA", daily(DAYS, [4.0] * len(DAYS)))
+    frames = {} if yahoo_closes is None else {"AAA": daily(DAYS, yahoo_closes)}
+    y = yahoo_for(frames, tmp=tmp_path)
+    res = gate(cache, tmp_path, other=str(other), panel=["AAA"], yahoo=y, symbols=["AAA"])
+    jp = pd.read_csv(tmp_path / "verify" / "residual_jumps.csv", keep_default_na=False)
+    return res["residual_jumps"], jp["resolution"].tolist()
+
+
+def test_yahoo_agreeing_with_ours_makes_the_jump_a_vendor_error_and_passes(tmp_path):
+    r, resolution = _tie(tmp_path, jump_series())
+    assert resolution == ["vendor_error_fmp"] and r["status"] == "PASS" and r["summary"]["blocking"] == 0
+    assert r["summary"]["vendor_error_fmp"][0]["symbol"] == "AAA"
+
+
+def test_yahoo_agreeing_with_the_other_vendor_makes_ours_suspect_and_blocks(tmp_path):
+    r, resolution = _tie(tmp_path / "a", [4.0] * len(DAYS))
+    assert resolution == ["ours_suspect"] and r["status"] == "FAIL"
+
+
+def test_yahoo_unavailable_leaves_the_jump_unresolved_and_blocks(tmp_path):
+    r, resolution = _tie(tmp_path / "b", None)
+    assert resolution == ["unresolved"] and r["status"] == "FAIL"
+    r, resolution = _tie(tmp_path / "c", jump_series(factor=0.7))                  # Yahoo agrees with neither
+    assert resolution == ["unresolved"] and r["status"] == "FAIL"
+
+
+def test_spinoff_factor_within_ten_percent_of_yahoos_is_a_convention(tmp_path):
+    cut = 40
+    theirs = [10.0] * len(DAYS)
+    ours = [10.0 / 6.43 * 1.036] * cut + [10.0] * (len(DAYS) - cut)           # we adjusted by 6.43, Yahoo by 6.66 (3.6 % apart)
+    y = _yahoo_gate(tmp_path, ours, [10.0 / 6.66 * 1.0] * cut + theirs[cut:], spinoffs={"AAA": [(str(DAYS[cut].date()), 6.43)]})
+    assert y["status"] == "PASS" and y["summary"]["runs_by_class"]["convention"] == 1 and y["summary"]["runs_by_class"]["unexplained"] == 0
+    far = _yahoo_gate(tmp_path / "far", [10.0 / 6.43] * cut + [10.0] * (len(DAYS) - cut), [10.0 / 3.0] * cut + theirs[cut:],
+                      spinoffs={"AAA": [(str(DAYS[cut].date()), 6.43)]})        # 2x apart: not a convention
+    assert far["status"] == "FAIL" and far["summary"]["runs_by_class"]["unexplained"] == 1
+
+
+def test_yahoo_inputs_csv_records_what_was_used(tmp_path):
+    cache = tmp_path / "c"
+    put(cache, "AAA", daily(DAYS, 10.0), five(DAYS, 10.0))
+    gate(cache, tmp_path, yahoo=yahoo_for({"AAA": daily(DAYS, 10.0)}, tmp=tmp_path), symbols=["AAA"])
+    inp = pd.read_csv(tmp_path / "verify" / "yahoo_inputs.csv", keep_default_na=False)
+    row = inp.iloc[0]
+    assert row["symbol"] == "AAA" and row["status"] == "ok" and row["rows"] == len(DAYS) and len(row["sha256"]) == 64
+    assert row["first_day"] == str(DAYS[0].date()) and row["fetched_at"].endswith("Z")
+    import hashlib
+    assert row["sha256"] == hashlib.sha256((tmp_path / "yd" / "AAA.parquet").read_bytes()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# yahoo_missing_event / successor_later_event
+# ---------------------------------------------------------------------------
+def _yahoo_frames(frames, splits=None):
+    out = {}
+    for t, closes in frames.items():
+        f = pd.DataFrame({"day": DAYS, "Close": closes, "High": closes, "Low": closes})
+        f["Splits"] = 0.0
+        for d, v in (splits or {}).get(t, []):
+            f.loc[f["day"] == pd.Timestamp(d), "Splits"] = v
+        out[t] = f
+    return out
+
+
+def _event_gate(tmp_path, ours, yahoo_closes, events, yahoo_splits, yahoo_ticker=None, table_splits=None, sym="AAA", proven=True):
+    cache = tmp_path / "c"
+    put(cache, sym, daily(DAYS, ours), five(DAYS, 10.0))
+    frames = _yahoo_frames({yahoo_ticker or sym: yahoo_closes}, {yahoo_ticker or sym: yahoo_splits})
+    y = ver.YahooDaily(str(tmp_path / "yd"), fetch=lambda t: frames.get(t), sleep=lambda s: None,
+                       successors=lambda s: [yahoo_ticker] if yahoo_ticker else [])
+    table = {sym: events}
+    table.update(table_splits or {})
+    pv = {sym: {d for d, _ in events}} if proven else {}
+    return gate(cache, tmp_path, yahoo=y, symbols=[sym], splits=table, proven_events=pv)["yahoo"], pd.read_csv(tmp_path / "verify" / "yahoo_mismatch_runs.csv",
+                                                                                             keep_default_na=False)
+
+
+def test_event_our_table_has_and_yahoo_lacks_is_yahoo_missing_event(tmp_path):
+    cut = 40
+    d = str(DAYS[cut].date())
+    ours = [10.0 / 1.05] * cut + [10.0] * (len(DAYS) - cut)                  # we applied a 5 % stock dividend; Yahoo did not
+    y, runs = _event_gate(tmp_path, ours, [10.0] * len(DAYS), [(d, 1.05)], yahoo_splits=[])
+    assert y["status"] == "PASS" and y["summary"]["runs_by_class"]["yahoo_missing_event"] == 1
+    assert runs["classification"].tolist() == ["yahoo_missing_event"] and runs["events"].iloc[0] == f"{d} x1.05"
+
+
+def test_event_yahoo_lists_is_not_missing_and_a_wrong_ratio_is_unexplained(tmp_path):
+    cut = 40
+    d = str(DAYS[cut].date())
+    ours = [10.0 / 1.05] * cut + [10.0] * (len(DAYS) - cut)
+    y, runs = _event_gate(tmp_path / "a", ours, [10.0] * len(DAYS), [(d, 1.05)], yahoo_splits=[(d, 1.05)])      # Yahoo lists it: not "missing"
+    assert y["status"] == "FAIL" and runs["classification"].tolist() == ["unexplained"]
+    y, runs = _event_gate(tmp_path / "b", [10.0 / 1.2] * cut + [10.0] * (len(DAYS) - cut), [10.0] * len(DAYS), [(d, 1.05)], yahoo_splits=[])
+    assert y["status"] == "FAIL" and runs["classification"].tolist() == ["unexplained"]                          # ratio is not 1/1.05
+    ycache = _event_gate(tmp_path / "c", ours, [10.0] * len(DAYS), [(d, 1.05)], yahoo_splits=[])[0]
+    assert ycache["status"] == "PASS"
+
+
+def test_old_yahoo_cache_without_a_split_list_cannot_claim_a_missing_event(tmp_path):
+    cut = 40
+    d = str(DAYS[cut].date())
+    ours = [10.0 / 1.05] * cut + [10.0] * (len(DAYS) - cut)
+    cache = tmp_path / "c"
+    put(cache, "AAA", daily(DAYS, ours), five(DAYS, 10.0))
+    y = yahoo_for({"AAA": daily(DAYS, 10.0)}, tmp=tmp_path)                    # frames without a Splits column
+    res = gate(cache, tmp_path, yahoo=y, symbols=["AAA"], splits={"AAA": [(d, 1.05)]}, proven_events={"AAA": {d}})
+    assert res["yahoo"]["status"] == "FAIL"
+
+
+def test_successor_series_carrying_a_later_reverse_split_is_successor_later_event(tmp_path):
+    n = len(DAYS)
+    cut = 60
+    last_old = DAYS[cut - 1]
+    # OLD is a pre-rename duplicate that stops at cut; Yahoo answered with NEW's series, adjusted for NEW's later 0.05 reverse split
+    cache = tmp_path / "c"
+    put(cache, "OLD", daily(DAYS[:cut], 2.0), five(DAYS[:cut], 2.0))
+    frames = _yahoo_frames({"NEW": [40.0] * n})
+    y = ver.YahooDaily(str(tmp_path / "yd"), fetch=lambda t: frames.get(t), sleep=lambda s: None, successors=lambda s: ["NEW"])
+    later = str((last_old + pd.Timedelta(days=30)).date())
+    res = gate(cache, tmp_path, yahoo=y, symbols=["OLD"], splits={"OLD": [], "NEW": [(later, 0.05), ("2020-01-02", 2.0)]})
+    runs = pd.read_csv(tmp_path / "verify" / "yahoo_mismatch_runs.csv", keep_default_na=False)
+    assert res["yahoo"]["status"] == "PASS" and runs["classification"].tolist() == ["successor_later_event"]
+    assert runs["events"].iloc[0] == f"{later} x0.05"
+    res = gate(cache, tmp_path / "x", yahoo=y, symbols=["OLD"], splits={"OLD": [], "NEW": [(later, 0.5)]})      # factor does not match: unexplained
+    assert res["yahoo"]["status"] == "FAIL"
+
+
+def test_unproven_event_never_whitewashes_a_mismatch_aiv_case(tmp_path):
+    # AIV 2019-02-21: both vendors list 0.9697 but the raw jump and FMP's step are flat; Yahoo lacks it; the event is not independently proven
+    cut = 40
+    d = str(DAYS[cut].date())
+    ours = [10.0 / 0.9697] * cut + [10.0] * (len(DAYS) - cut)
+    y, runs = _event_gate(tmp_path, ours, [10.0] * len(DAYS), [(d, 0.9697)], yahoo_splits=[], proven=False)
+    assert y["status"] == "FAIL" and runs["classification"].tolist() == ["unexplained"]
+    y, runs = _event_gate(tmp_path / "p", ours, [10.0] * len(DAYS), [(d, 0.9697)], yahoo_splits=[], proven=True)
+    assert runs["classification"].tolist() == ["yahoo_missing_event"]
+
+
+def test_proven_events_are_read_from_the_accepted_csv(tmp_path):
+    meta = tmp_path / "m"
+    meta.mkdir()
+    rows = ["symbol,date,kind,factor,source,verdict,jump,fmp_step,run_id",
+            "AIV,2019-02-21,split,0.9697,both,small_both,1.0,1 flat,R",
+            "CBSH,2022-12-01,split,1.05,both,small_both,1.0,1.05 equals_f,R",
+            "XXX,2020-01-02,split,2,alpaca,proven_by_fmp_step,1.9,2.0 equals_f,R",
+            "OVR,2020-01-02,split,2,override,override_accept,1.0,none,R",
+            "OTH,2020-01-02,split,2,alpaca,proven,2.0,2.0 equals_f,R",
+            "SPN,2020-01-02,spinoff,1.2,alpaca_spinoff,spinoff_fmp_agrees,1.0,1.2 equals_f,R"]
+    (meta / "split_accepted.csv").write_text(chr(10).join(rows) + chr(10))
+    got = ver.load_proven_events(str(meta))
+    assert got == {"CBSH": {"2022-12-01"}, "XXX": {"2020-01-02"}, "OVR": {"2020-01-02"}}
+
+
+# ---------------------------------------------------------------------------
+# hl_envelope
+# ---------------------------------------------------------------------------
+def _hl(tmp_path, high=None, low=None, open_close=None, five_close=10.0, bad_5min_high=None, envelope=True, panel=("AAA",)):
+    cache = tmp_path / "c"
+    d1 = daily(DAYS, 10.0)
+    d1["Open"] = d1["Close"] = 10.0
+    d1["High"], d1["Low"] = 10.1, 9.9
+    i = 20
+    if high is not None:
+        d1.loc[i, "High"] = high
+    if low is not None:
+        d1.loc[i, "Low"] = low
+    if open_close is not None:
+        d1.loc[i, ["Open", "Close"]] = open_close
+        d1.loc[i, "High"] = max(d1.loc[i, "High"], open_close)
+    d5 = five(DAYS, 10.0)                                       # 5-minute envelope per day: 9.9 .. 10.1
+    if bad_5min_high is not None:
+        d5.loc[d5["Date"] == DAYS[i] + pd.Timedelta(hours=10), "High"] = bad_5min_high
+    put(cache, "AAA", d1, d5)
+    if envelope:
+        meta = cache / "_meta" / "envelope"
+        meta.mkdir(parents=True)
+        pd.DataFrame({"Date": DAYS, "High": 10.1, "Low": 9.9}).to_parquet(meta / "AAA.parquet", index=False)
+    return gate(cache, tmp_path, panel=list(panel))["hl_envelope"], pd.read_csv(tmp_path / "verify" / "hl_envelope.csv", keep_default_na=False) if envelope else None
+
+
+def test_hl_envelope_clean_passes(tmp_path):
+    r, df = _hl(tmp_path)
+    assert r["status"] == "PASS" and r["summary"]["blocking"] == 0 and len(df) == 0
+
+
+def test_hl_envelope_unrepaired_outlier_beyond_five_percent_blocks_a_panel_symbol(tmp_path):
+    r, df = _hl(tmp_path, high=12.0)                             # 12 vs 10.1 (bound 10.1): 18.8 %
+    assert r["status"] == "FAIL" and df["class"].tolist() == ["outlier_gt5"] and r["summary"]["blocking"] == 1
+    r, _ = _hl(tmp_path / "np", high=12.0, panel=("ZZZ",))        # not a panel symbol: informational
+    assert r["status"] == "PASS" and r["summary"]["by_class_all"] == {"outlier_gt5": 1}
+    r, df = _hl(tmp_path / "low", low=7.0)
+    assert r["status"] == "FAIL" and df["field"].tolist() == ["Low"]
+
+
+def test_hl_envelope_two_to_five_percent_is_informational(tmp_path):
+    r, df = _hl(tmp_path, high=10.5)                             # 10.5 / 10.1 = 3.96 %
+    assert r["status"] == "PASS" and df["class"].tolist() == ["outlier_2_5"]
+    assert df["excess"].iloc[0] == pytest.approx(10.5 / 10.1 - 1) and r["summary"]["by_class_panel"] == {"outlier_2_5": 1}
+
+
+def test_hl_envelope_close_on_the_boundary_is_informational_not_an_outlier(tmp_path):
+    r, df = _hl(tmp_path, open_close=12.0)                        # Open = Close = High = 12: late bars / closing auction
+    assert r["status"] == "PASS" and set(df["class"]) == {"boundary"}
+
+
+def test_bad_5min_print_outside_the_daily_range_is_reported_not_blocking(tmp_path):
+    r, _ = _hl(tmp_path, bad_5min_high=14.0)
+    rv = pd.read_csv(tmp_path / "verify" / "hl_envelope_5min_prints.csv")
+    assert r["status"] == "PASS" and r["summary"]["bad_5min_prints"] == 1 and rv["field"].tolist() == ["High"]
+
+
+def test_hl_envelope_is_informational_when_the_cache_has_no_envelope(tmp_path):
+    cache = tmp_path / "c"
+    put(cache, "AAA", daily(DAYS, 10.0), five(DAYS, 10.0))
+    assert gate(cache, tmp_path)["hl_envelope"]["status"] == "INFO"
+
+
+def test_hl_envelope_lists_a_consolidated_print_and_does_not_block(tmp_path):
+    cache = tmp_path / "c"
+    d1 = daily(DAYS, 10.0)
+    d1["Open"] = d1["Close"] = 10.0
+    d1["High"], d1["Low"] = 10.1, 9.9
+    d1.loc[20, "High"] = 12.0
+    put(cache, "AAA", d1, five(DAYS, 10.0))
+    (cache / "_meta" / "envelope").mkdir(parents=True)
+    pd.DataFrame({"Date": DAYS, "High": 10.1, "Low": 9.9}).to_parquet(cache / "_meta" / "envelope" / "AAA.parquet", index=False)
+    r = gate(cache, tmp_path / "a", panel=["AAA"])["hl_envelope"]
+    assert r["status"] == "FAIL"
+    day = str(DAYS[20].date())
+    (cache / "_meta" / "consolidated_prints.csv").write_text(chr(10).join(
+        ["symbol,date,field,daily,envelope,fmp,yahoo,run_id", f"AAA,{day},High,12.0,10.1,12.0,12.0,R"]) + chr(10))
+    ver._CONSOLIDATED.clear()
+    r = gate(cache, tmp_path / "b", panel=["AAA"])["hl_envelope"]
+    assert r["status"] == "PASS" and r["summary"]["by_class_panel"] == {"consolidated_print": 1}
