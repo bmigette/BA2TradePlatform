@@ -1023,3 +1023,14 @@ def test_build_writes_spinoffs_apart_from_splits(tmp_path):
     assert table["spinoffs"] == {"P": [[D.isoformat(), 1.125]]} and "P" not in table["splits"] and res["spinoffs_applied"] == 1
     acc = sb.read_csv_frame(str(out / "_meta" / "split_accepted.csv"))
     assert acc["kind"].tolist() == ["spinoff"]
+
+
+def test_spinoff_flat_step_is_classified_first_even_for_a_small_factor():
+    # f = 1 + 0.12 * 20 / 40 = 1.06; FMP did not adjust (step 1.00): "flat", not "agrees" although 1.00 is within 10 % of 1.06
+    raw = parent_bars(after=40.0)
+    acc, rev, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw)}, spin=(SpinOff("P", D, "S", 0.12),))
+    assert [(a["verdict"], round(a["factor"], 6)) for a in acc] == [("spinoff_fmp_flat", 1.06)]
+    assert one(rev, "spinoff_fmp_flat")["applied"] is True
+    # a non-flat step within 10 % of f still agrees
+    acc, _, _, _ = run_so({"P": raw, "S": spinco_bars()}, {"P": fmp(raw, {40: 1.08})}, spin=(SpinOff("P", D, "S", 0.12),))
+    assert [a["verdict"] for a in acc] == ["spinoff_fmp_agrees"]
