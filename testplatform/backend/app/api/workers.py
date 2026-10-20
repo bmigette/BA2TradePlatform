@@ -432,7 +432,7 @@ def sync_worker_cache(worker_id: int, ohlcv_history_source: str, db: Session = D
     """Push the master's cache (diff, as one tar stream) to a remote worker.
 
     ``ohlcv_history_source`` (query parameter, required) names the OHLCV history to replicate;
-    the other source's folder is pruned off the worker, so there is no default."""
+    the other source's history folder is neither copied nor pruned, so there is no default."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:
         raise HTTPException(status_code=404, detail="Worker not found")

@@ -288,10 +288,10 @@ def run_trial_full(worker: dict, config: dict, fitness_metric: str, timeout: flo
 def _history_manifest(history_source: str) -> dict:
     """The master's cache manifest for a push of *history_source*'s OHLCV history.
 
-    The OTHER sources' history folders are left out of the manifest, so they are neither copied
-    nor kept: ``diff_stale`` lists the worker's copy and the prune removes it (the FMP cache is
-    archived, not replicated). Because that prune deletes a whole history, a master that does not
-    hold the source's own folder (not built yet) REFUSES instead of wiping the worker's history.
+    The OTHER sources' history folders are left out of the manifest, so they are not copied; the
+    callers also drop them from the stale list, so the worker's copy is not pruned either (option
+    jobs still read the FMP cache and share workers with equity jobs). A master that does not hold
+    the source's own folder (not built yet) REFUSES: the job would have no history on the worker.
     """
     own = history_cache_dirname(history_source)        # raises UnknownHistorySource on a bad name
     local = cache_sync.build_manifest(
@@ -312,8 +312,8 @@ def push_cache(worker: dict, *, history_source: str,
     ``cache_sync.diff_stale``). Returns ``{pushed, pruned, ...}``.
 
     *history_source* (``fmp`` | ``alpaca``, required, never defaulted) is the OHLCV history the
-    pushed job runs on: only that source's folder is replicated, the other source's folder is
-    pruned off the worker (see ``_history_manifest``).
+    pushed job runs on: only that source's folder is replicated; the other source's history
+    folder is neither copied nor pruned (see ``_history_manifest``).
 
     The prune step is skipped outright when the master's own manifest is empty (see below).
     """
@@ -354,7 +354,8 @@ def push_cache(worker: dict, *, history_source: str,
         logger.warning(msg)
         return {**res, "pruned": 0}
 
-    stale = cache_sync.diff_stale(local["files"], remote)
+    stale = cache_sync.without_dirs(cache_sync.diff_stale(local["files"], remote),
+                                    other_history_cache_dirnames(history_source))
     cache_sync.assert_prunable(stale, local["root"])   # nothing outside the cache root, ever
     if stale:
         log(f"cache prune -> {worker['name']}: removing {len(stale)} stale leftover file(s)...")
@@ -474,8 +475,8 @@ def check_cache_integrity(worker: dict, *, history_source: str, timeout: float =
 
     Returns ``{ok, missing, stale, content_mismatch, local_count, remote_count}`` — ``ok`` is
     True only when all three lists are empty. *history_source* (required) selects the OHLCV
-    history compared, exactly as in ``push_cache``: the other source's folder is not expected on
-    the worker and shows up as stale.
+    history compared, exactly as in ``push_cache``: the other source's history folder is neither
+    compared nor reported stale.
     """
     base, headers = _base(worker), _headers(worker)
     with httpx.Client(timeout=timeout) as c:
@@ -488,7 +489,8 @@ def check_cache_integrity(worker: dict, *, history_source: str, timeout: float =
     if local["files"] and not any(f["rel_path"].startswith(own + "/") for f in local["files"]):
         raise ValueError(f"cache integrity check refused: the master has no {own}/ folder")
     missing = cache_sync.diff_missing(local["files"], remote)
-    stale = cache_sync.diff_stale(local["files"], remote)
+    stale = cache_sync.without_dirs(cache_sync.diff_stale(local["files"], remote),
+                                    other_history_cache_dirnames(history_source))
     mismatch = cache_sync.diff_content_mismatch(local["files"], remote)
     return {
         "ok": not (missing or stale or mismatch),

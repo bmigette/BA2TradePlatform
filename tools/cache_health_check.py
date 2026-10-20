@@ -1181,7 +1181,7 @@ def main() -> int:
     ap.add_argument("--worker", default=None, help="Check only this worker NAME (default: all enabled, non-local).")
     ap.add_argument("--ohlcv-history-source", choices=("fmp", "alpaca"), default=None,
                     help="OHLCV history the worker cache check compares and (--fix) pushes. REQUIRED "
-                         "unless --skip-workers: a push prunes the other history's folder off the worker.")
+                         "unless --skip-workers: the other history's folder is neither copied nor pruned.")
     ap.add_argument("--fix", action="store_true", help="Push/prune/repush anything found out of sync (worker check only).")
     ap.add_argument("--skip-workers", action="store_true", help="Skip the remote-worker cache-sync check.")
     ap.add_argument("--skip-gaps", action="store_true", help="Skip the local data-gap check.")

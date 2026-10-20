@@ -313,9 +313,6 @@ def test_history_manifest_alpaca_excludes_fmp_and_derived(tmp_path, monkeypatch)
     local = worker_client._history_manifest("alpaca")
     rels = {f["rel_path"] for f in local["files"]}
     assert rels == {"AlpacaHistoryOHLCVProvider/AAPL_1d.parquet", "options/o.sqlite"}
-    # the worker's FMP copy is stale against this manifest, so the existing prune removes it
-    remote = {"files": [{"rel_path": "FMPOHLCVProvider/AAPL_1d.parquet", "size": 10}]}
-    assert cache_sync.diff_stale(local["files"], remote) == ["FMPOHLCVProvider/AAPL_1d.parquet"]
 
 
 def test_history_manifest_fmp_keeps_fmp_excludes_alpaca(tmp_path, monkeypatch):
@@ -357,3 +354,45 @@ def test_cli_sync_cache_requires_history_source(monkeypatch, capsys):
         ba2test_launcher.main(["sync-cache", "--worker", "w1"])
     assert e.value.code == 2
     assert "--ohlcv-history-source" in capsys.readouterr().err
+
+
+def _push_with_remote(monkeypatch, tmp_path, source, remote_rels):
+    from app.services import worker_client
+    _hist_cache(tmp_path)
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(tmp_path))
+    calls = []
+
+    class _R:
+        def __init__(self, p): self.p = p
+        def raise_for_status(self): pass
+        def json(self): return self.p
+
+    class _C:
+        def __init__(self, **_k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url, **_k): return _R({"files": [{"rel_path": r, "size": 10} for r in remote_rels]})
+        def post(self, url, **k):
+            calls.append((url, k.get("json")))
+            return _R({"pruned": 1})
+
+    monkeypatch.setattr(worker_client.httpx, "Client", _C)
+    worker_client.push_cache({"name": "w", "url": "http://w"}, history_source=source,
+                             log=lambda _m: None)
+    return [c for c in calls if c[0].endswith("/cache/prune")]
+
+
+@pytest.mark.parametrize("source,other", [("alpaca", "FMPOHLCVProvider"),
+                                          ("fmp", "AlpacaHistoryOHLCVProvider")])
+def test_push_leaves_other_history_untouched_but_prunes_elsewhere(tmp_path, monkeypatch, source, other):
+    own = "AlpacaHistoryOHLCVProvider" if source == "alpaca" else "FMPOHLCVProvider"
+    remote = [f"{own}/AAPL_1d.parquet", "options/o.sqlite", f"{other}/AAPL_1d.parquet",
+              f"{other}/OLD_1d.parquet", "options/old.sqlite"]
+    prunes = _push_with_remote(monkeypatch, tmp_path, source, remote)
+    assert [p[1] for p in prunes] == [{"rel_paths": ["options/old.sqlite"]}]
+
+
+def test_push_with_only_other_history_stale_sends_no_prune(tmp_path, monkeypatch):
+    remote = ["AlpacaHistoryOHLCVProvider/AAPL_1d.parquet", "options/o.sqlite",
+              "FMPOHLCVProvider/AAPL_1d.parquet"]
+    assert _push_with_remote(monkeypatch, tmp_path, "alpaca", remote) == []

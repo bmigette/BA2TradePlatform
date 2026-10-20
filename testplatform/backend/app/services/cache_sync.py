@@ -137,8 +137,8 @@ def build_manifest(root: Optional[str] = None, with_hash: bool = False,
 
     ``exclude_dirnames`` names TOP-LEVEL cache folders (direct children of *root*) that are left
     out of the manifest, e.g. the OHLCV history folder of the source a job does NOT run on. Unlike
-    ``_derived`` this is a per-call choice: excluded from a push manifest, the folder is not copied
-    and ``diff_stale`` lists the worker's copy for pruning. Only a top-level match counts, so a
+    ``_derived`` this is a per-call choice: the folder is not copied, and the push caller drops it
+    from the stale list too (``without_dirs``), so it is neither copied nor pruned. Only a top-level match counts, so a
     same-named directory deeper in the tree stays ordinary cache content.
     """
     base = cache_root(root)
@@ -238,6 +238,13 @@ def diff_content_mismatch(local_files: List[dict], remote_manifest: dict) -> Lis
         if rh is not None and lh is not None and rh != lh:
             out.append(f["rel_path"])
     return out
+
+
+def without_dirs(rel_paths: Iterable[str], dirnames: Iterable[str]) -> List[str]:
+    """*rel_paths* minus everything under the top-level folders *dirnames* (the folders a push
+    does not replicate: neither copied nor pruned)."""
+    prefixes = tuple(d + "/" for d in dirnames)
+    return [r for r in rel_paths if not r.replace("\\", "/").startswith(prefixes)]
 
 
 def assert_prunable(rel_paths: Iterable[str], root: Optional[str] = None) -> None:

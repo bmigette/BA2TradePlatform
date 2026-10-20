@@ -9058,8 +9058,8 @@ def main(argv: "list | None" = None) -> int:
     sc.add_argument("--worker", required=True, help="Worker NAME (as configured on the master).")
     sc.add_argument("--ohlcv-history-source", required=True, choices=("fmp", "alpaca"),
                     help="Which OHLCV history to replicate. Required: only that history's folder "
-                         "is pushed and the OTHER one is pruned off the worker (pushing alpaca "
-                         "removes the worker's FMP folder).")
+                         "is pushed; the other source's history folder is neither copied nor "
+                         "pruned.")
 
     # Split out the backtest passthrough before full parsing.
     if argv and argv[0] == "backtest":
