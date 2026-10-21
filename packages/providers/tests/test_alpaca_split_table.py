@@ -865,13 +865,14 @@ def test_series_break_for_an_unexplained_jump_beyond_x5_that_the_step_does_not_e
 def test_shipped_overrides_are_all_owner_reviewed():
     entries = st.load_overrides(SHIPPED_OVERRIDES)               # raises while any entry is still pending
     by = {(e["symbol"], e["event_date"], e["kind"] if "kind" in e else "split"): e for e in entries}
-    assert len(entries) == 31 and all(e["reviewed_by"] in ("owner (B. Migette) 2026-10-20", "owner (B. Migette) 2026-10-21") for e in entries)
+    assert len(entries) == 32 and all(e["reviewed_by"] in ("owner (B. Migette) 2026-10-20", "owner (B. Migette) 2026-10-21") for e in entries)
     assert all(e["added"] in ("2026-10-20", "2026-10-21") for e in entries)
     assert ("HON", "2026-06-28", "split") not in by              # the 1:2 reverse split is real (Honeywell 8-K): no reject
     cbsh = [by[("CBSH", d, "split")] for d in ("2016-11-30", "2017-11-29", "2019-12-02")]
     assert all(e["decision"] == "accept" and e["ratio"] == 1.05 and "sec.gov" in e["reason"] for e in cbsh)
     assert by[("CENT", "2024-02-09", "split")]["decision"] == "reject" and by[("CENT", "2024-02-09", "spinoff")]["decision"] == "reject"
     assert by[("CRESY", "2023-12-06", "split")]["decision"] == "reject"
+    assert by[("SPRB", "2025-08-05", "split")]["ratio"] == pytest.approx(1 / 75) and "sec.gov" in by[("SPRB", "2025-08-05", "split")]["reason"]
     assert by[("VGR", "2021-12-30", "split")]["decision"] == "reject"                    # FMP applied its own 1.41: the spin-off decides
     assert by[("VGR", "2021-12-30", "spinoff")]["decision"] == "accept" and by[("VGR", "2021-12-30", "spinoff")]["ratio"] == 1.5367
     assert by[("VTOL", "2020-06-12", "split")]["ratio"] == pytest.approx(1 / 3) and by[("WHWK", "2021-08-27", "split")]["ratio"] == pytest.approx(1 / 15)
