@@ -241,6 +241,15 @@
    "reviewed_by": "owner (B. Migette) 2026-10-21"
   },
   {
+   "symbol": "SPRB",
+   "event_date": "2025-08-05",
+   "decision": "accept",
+   "ratio": 0.013333333333333334,
+   "reason": "Spruce Biosciences 1-for-75 reverse split effective 2025-08-04 (SEC 8-K https://www.sec.gov/Archives/edgar/data/1683553/000095017025098340/sprb-20250722.htm); OTC as SPRBD from 2025-08-07, back on Nasdaq as SPRB 2025-09-15 (10-Q https://www.sec.gov/Archives/edgar/data/1683553/000119312525274234/sprb-20250930.htm). FMP lists it on 2025-08-05; Alpaca has no traded bar 2025-04-29..2025-09-12, so the jump cannot prove it",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
    "symbol": "LENZ",
    "event_date": "2024-03-22",
    "decision": "accept",

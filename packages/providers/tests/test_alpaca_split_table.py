@@ -1477,9 +1477,14 @@ def test_spinoff_override_rejects_or_accepts_the_spinoff_alone_of_a_symbol_and_d
     # accept applies the given factor as a spin-off and absorbs split listings there
     acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars()}, None, alp=[L("P", D, 1.3)], ov=[own("accept", ratio=1.2)])
     assert [(a["kind"], a["verdict"], a["factor"]) for a in acc] == [("spinoff", "override_accept", 1.2)]
-    # an override for a spin-off that does not exist is counted, not silent
+    # a spin-off override no spin-off listing names: an accept ADDS the spin-off, a reject leaves a review row (never silent)
     acc, rev, stats, _ = run_so({"P": raw}, None, spin=(), ov=[own("reject")])
-    assert stats["spinoff_overrides_unused"] == 1
+    assert acc == [] and one(rev, "override_reject")["applied"] is False
+    acc, rev, stats, _ = run_so({"P": raw}, None, spin=(), ov=[own("accept", ratio=1.2)])
+    assert [(a["kind"], a["verdict"], a["factor"]) for a in acc] == [("spinoff", "override_accept", 1.2)]
+    assert one(rev, "override_accept")["applied"] is True
+    with pytest.raises(st.SplitTableBuildError, match="outside the bars"):
+        run_so({"P": raw}, None, spin=(), ov=[own("accept", ratio=1.2, d=date(2030, 1, 2))])
     # the kind is validated and part of the identity of an entry
     with pytest.raises(ValueError, match="kind"):
         st.load_overrides(write_ov(__import__("pathlib").Path(str(__import__("tempfile").mkdtemp())), [ov("reject", kind="dividend")]))
@@ -1558,6 +1563,11 @@ def test_enov_split_override_and_spinoff_override_on_one_day_compose():
     assert st.splits_by_symbol(acc) == {"P": [[D.isoformat(), pytest.approx(1 / 3)]]}
     assert st.splits_by_symbol(acc, "spinoff") == {"P": [[D.isoformat(), 1.743]]}
     assert not any(r["verdict"] in ("split_spinoff_conflict", "spinoff_absorbed_by_split") for r in rev) and breaks == {}
+    # the real ENOV case: no Alpaca spin-off listing under ENOV (ESAB is listed under Colfax's old ticker); both still apply
+    acc, rev, stats, breaks = run_so({"P": raw}, None, spin=(),
+                                     ov=[ov("accept", 1 / 3, symbol="P"), ov("accept", 1.743, symbol="P", kind="spinoff")])
+    assert {(a["kind"], round(a["factor"], 6), a["source"]) for a in acc} == {("split", round(1 / 3, 6), "override"),
+                                                                              ("spinoff", 1.743, "override")}
 
 
 def test_bar_cap_overrides_are_validated_apart_and_never_reach_decide_splits(tmp_path):

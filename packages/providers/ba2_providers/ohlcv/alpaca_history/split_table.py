@@ -130,7 +130,9 @@ THE RULES (tolerances are module constants)
     the adjustment, accept applies ``ratio`` as the factor (and absorbs split listings there).  The default kind is "split".
     A split override and a spin-off override on one symbol / date are independent (CENT 2024-02-09 rejects both).  An ACCEPT of each on
     one date (ENOV 2022-04-05: the 1:3 reverse split and the ESAB spin-off 1.743) applies BOTH as decided, each factor on its own basis
-    (prices divided by the split factor and by the spin-off factor); neither is absorbed by the other.
+    (prices divided by the split factor and by the spin-off factor); neither is absorbed by the other.  A spin-off override no
+    Alpaca spin-off listing names (ENOV: ESAB is listed under Colfax's old ticker) still decides: accept ADDS the spin-off,
+    reject leaves a review row; one dated outside the symbol's bars is a build error.
   * SPLIT + SPIN-OFF ON ONE EX-DATE (leftovers).  A split and a spin-off of one symbol within 3 sessions are ONE price event (AIV 2020-12-15:
     the vendors list the spin-off as a 9.295 split, Alpaca lists the spin-off itself): never both.  The SPLIT is kept and the
     spin-off absorbed (``spinoff_absorbed_by_split``, informational row; recorded in the split's ``absorbed`` /
@@ -1257,11 +1259,24 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
                    f"listed ratio {ratio:.6g}, jump {ctx.shown():.4g}: neither proves nor contradicts it",
                    step=ctx.step_str(ratio, d0))
 
-    # ---- overrides no listing led to: an 'accept' ADDS the split, a 'reject' silences the jump row at its date
+    # ---- overrides no listing led to: an 'accept' ADDS the split / spin-off, a 'reject' silences the jump row at its date
     for o in overrides:
         if _ov_kind(o) == "spinoff":
-            if id(o) not in so_ov_used:
-                stats["spinoff_overrides_unused"] += 1       # no spin-off listing at that date: counted, never silent
+            if id(o) in so_ov_used:
+                continue
+            # no Alpaca spin-off listing at that date (ENOV: Colfax's ESAB distribution is listed under the old ticker)
+            d = date.fromisoformat(o["event_date"])
+            if n == 0 or d <= bars.days[0].astype(object) or d > bars.days[-1].astype(object):
+                raise SplitTableBuildError(f"{sym}: spin-off override {d} lies outside the bars, it cannot be applied")
+            iD = _first_session_on_or_after(bars, d)
+            D = bars.days[iD].astype(object)
+            so_positions.append(iD)
+            if o["decision"] == "accept":
+                accept(D, float(o["ratio"]), "override", "override_accept", "", kind="spinoff")
+            else:
+                stats["verdict_override_reject"] += 1
+            review(D, None, None, None, "override_" + o["decision"], o["decision"] == "accept",
+                   f"reviewed spin-off override ({o['reviewed_by']}), no spin-off listing names it: {o['reason']}", count=False)
             continue
         if id(o) in ov_used:
             continue
