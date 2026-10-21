@@ -944,3 +944,23 @@ def test_enov_split_and_spinoff_on_one_day_adjust_to_0_574_of_the_split_only_ser
     assert (both["Close"].iloc[0] / split_only["Close"].iloc[0]) == pytest.approx(1 / 1.743) and 1 / 1.743 == pytest.approx(0.5737, abs=1e-4)
     assert both["Volume"].iloc[0] == split_only["Volume"].iloc[0]                     # a spin-off leaves the share count alone
     assert both["Close"].iloc[1] == 51.6
+
+
+def test_the_gate_certificate_reads_the_manifest_the_build_writes(env):
+    # the certificate is tied to the manifest a REAL build writes (a guessed schema once crashed the full gate: KeyError run_id)
+    from ba2_providers.ohlcv.alpaca_history import verify as ver
+    daily, intr, out = env
+    days = sessions("2024-01-02", "2024-01-05")
+    write_symbol(daily, intr, "ABC", days)
+    make_table(out)
+    build(env)
+    meta = str(out / "_meta")
+    cert = ver.write_gate_certificate(meta, {"structural": {"status": ver.STATUS_PASS}})
+    assert cert["status"] == ver.STATUS_PASS and cert["build_run_id"].startswith("RUN1 built ")
+    assert ver.read_gate_certificate(meta)["build_manifest_sha256"] == cert["build_manifest_sha256"]
+    build(env)                                                            # a rebuild after the gate: the certificate is stale
+    with pytest.raises(ver.GateCertificateError, match="re-run the gate"):
+        ver.read_gate_certificate(meta)
+    ver.write_gate_certificate(meta, {"yahoo": {"status": ver.STATUS_FAIL}})
+    with pytest.raises(ver.GateCertificateError, match="FAILED"):
+        ver.read_gate_certificate(meta)

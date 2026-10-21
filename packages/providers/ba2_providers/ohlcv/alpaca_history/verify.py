@@ -924,7 +924,8 @@ def write_gate_certificate(meta_dir: str, results: Dict[str, Dict[str, Any]]) ->
     from ba2_providers.ohlcv.alpaca_history.split_build import atomic_write
     manifest = os.path.join(meta_dir, BUILD_MANIFEST_NAME)
     with open(manifest, encoding="utf-8") as f:
-        run_id = json.load(f)["run_id"]
+        m = json.load(f)
+    run_id = f"{m['split_table']['run_id']} built {m['built_at']}"      # the build's identity: its split table + build time
     failed = gate_failed(results)
     cert = {"status": STATUS_FAIL if failed else STATUS_PASS, "failed": failed,
             "build_run_id": run_id, "build_manifest_sha256": _sha256_file(manifest),

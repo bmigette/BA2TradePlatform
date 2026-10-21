@@ -287,7 +287,7 @@ def _write_build_manifest(root, events, certify=True, run_id="test-build"):
     meta = Path(root) / ALPACA_DIR / "_meta"
     meta.mkdir(parents=True, exist_ok=True)
     (meta / "build_manifest.json").write_text(json.dumps(
-        {"run_id": run_id, "symbols": {s: {"events": {"splits": ev, "spinoffs": []}} for s, ev in events.items()}}),
+        {"split_table": {"run_id": run_id}, "built_at": "2026-10-21T10:00:00+00:00", "subset": False, "symbols": {s: {"events": {"splits": ev, "spinoffs": []}} for s, ev in events.items()}}),
         encoding="utf-8")
     if certify:                          # the full gate's PASS certificate of this manifest (prepare_history --steps verify)
         from ba2_providers.ohlcv.alpaca_history import verify as ver
@@ -414,7 +414,7 @@ def test_alpaca_plan_needs_a_pass_gate_certificate_of_the_current_build(tool, mo
     assert "re-run the gate" in json.dumps(json.loads(capsys.readouterr().out)["preflight_errors"])
     _write_build_manifest(alpaca_root, {s: [] for s in UNIVERSE})
     assert tool.main_raw(_vendor_plan_args(alpaca_root, universe_file, out, "alpaca")) == 0
-    assert json.loads(Path(out).read_text())["certification"]["gate"]["build_run_id"] == "test-build"
+    assert json.loads(Path(out).read_text())["certification"]["gate"]["build_run_id"] == "test-build built 2026-10-21T10:00:00+00:00"
 
 
 def test_alpaca_split_checks_that_ask_for_a_refetch_are_informational_once_the_gate_passed(
