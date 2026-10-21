@@ -378,8 +378,12 @@ launcher refuses an option job on `alpaca`). Pinned digests of record:
 
 | Universe / host | `ohlcv-v1` (fmp) | `ta-structure-v1` (fmp) | `ohlcv-v1` (alpaca) | `ta-structure-v1` (alpaca) |
 |---|---|---|---|---|
-| 97 names, remote227, stage 1 since 2026-09-23 | `ca4d65d4…` (full digest in the job config, **not recorded in the repo**) | `2b6e8ca8…` (same) | (to be filled by the 2026-10-20 run) | (to be filled by the 2026-10-20 run) |
-| 753 names (stage 2), local, synced to remote227 | `105278717aecf5471e9c01ef365a436eeaa917248e34c44e2af10643cf2489bd` | `dbac2c668a9a398c5efe000a6c260e81ee3a32279d2b7d0087862c7f4faf494e` | (to be filled by the 2026-10-20 run) | (to be filled by the 2026-10-20 run) |
+| 97 names, remote227, stage 1 since 2026-09-23 | `ca4d65d4…` (full digest in the job config, **not recorded in the repo**) | `2b6e8ca8…` (same) | `32b94b836098fe8cb76c79a430117b5f686f87d3af58c8a70979135001147364` | `61ea5c16e34be4b14548320debb20bac1093ac344c79ed1aa50a5c21a9a4173c` |
+| 753 names (stage 2), local, synced to remote227 | `105278717aecf5471e9c01ef365a436eeaa917248e34c44e2af10643cf2489bd` | `dbac2c668a9a398c5efe000a6c260e81ee3a32279d2b7d0087862c7f4faf494e` | `d00d1c523f566282672dc64a41e3d38a5a88f0820b6bad2b8aa79f774148aad6` | `1b627b4ca879b2eec38baa1175128a4b6c17c90143ca08b349203693d5545319` |
+
+The alpaca digests are those of the local workstation on the Alpaca cache of split table run `20261021T135237Z-4de54841`
+(gate certificate PASS, 2026-10-21), window 2020-01-02..2025-12-31, `--gap-fill previous`. They were identical on the
+two builds before it (same prices), and a worker that holds the pushed cache reproduces them.
 
 The 98-name workstation digests in the goal2020 runbook (`c9ba981f…`, `3c3020d0…`) predate the
 2026-09-23 data repairs. To reproduce a specific job, read the digests from that job's
