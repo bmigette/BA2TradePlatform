@@ -190,15 +190,98 @@ def test_engine_settlement_pass_liquidates_and_rolls_the_transaction():
         ctx.__exit__(None, None, None)
 
 
-def test_handler_reads_events_for_alpaca_only(tmp_path, monkeypatch):
+@pytest.fixture
+def _cert_cache(tmp_path, monkeypatch):
+    from app.services.backtest import history_source
+    from tests.alpaca_certified_cache import write_certified_meta
+    history_source._CERTIFIED_MEMO.clear()
+    monkeypatch.setattr(history_source, "job_history_cache_dir", lambda cfg: str(tmp_path))
+    write_certified_meta(tmp_path, {"X": [["2024-01-04", None, "delisted", 9, None]]})
+    yield tmp_path
+    history_source._CERTIFIED_MEMO.clear()
+
+
+ALPACA = {"ohlcv_history_source": "alpaca"}
+
+
+def test_handler_reads_events_for_alpaca_only(_cert_cache):
+    from app.services.backtest import daily_backtest_handler as h
+    assert h._suspension_events_for({"ohlcv_history_source": "fmp"}) == {}
+    assert h._suspension_events_for(ALPACA) == {"X": ((date(2024, 1, 4), None),)}
+
+
+def test_fmp_source_needs_no_certificate(tmp_path, monkeypatch):
+    from app.services.backtest import daily_backtest_handler as h, history_source
+    monkeypatch.setattr(history_source, "job_history_cache_dir", lambda cfg: str(tmp_path / "nothing"))
+    assert h._suspension_events_for({"ohlcv_history_source": "fmp"}) == {} and h._suspension_events_for({}) == {}
+
+
+def test_alpaca_run_without_a_certificate_is_refused(_cert_cache):
+    from app.services.backtest import daily_backtest_handler as h
+    from app.services.backtest.history_source import AlpacaCacheNotCertified
+    (_cert_cache / "_meta" / "gate_certificate.json").unlink()
+    with pytest.raises(AlpacaCacheNotCertified, match="not certified.*gate_certificate.json not found"):
+        h._suspension_events_for(ALPACA)
+
+
+def test_alpaca_run_without_suspensions_file_is_refused_not_silently_event_free(_cert_cache):
+    from app.services.backtest import daily_backtest_handler as h
+    from app.services.backtest.history_source import AlpacaCacheNotCertified
+    (_cert_cache / "_meta" / "suspensions.json").unlink()
+    with pytest.raises(AlpacaCacheNotCertified):
+        h._suspension_events_for(ALPACA)
+
+
+def test_alpaca_run_on_a_failed_gate_is_refused(_cert_cache):
+    from app.services.backtest import daily_backtest_handler as h
+    from app.services.backtest.history_source import AlpacaCacheNotCertified
+    from tests.alpaca_certified_cache import write_certified_meta
+    write_certified_meta(_cert_cache, status_pass=False)
+    with pytest.raises(AlpacaCacheNotCertified, match="FAILED"):
+        h._suspension_events_for(ALPACA)
+
+
+def test_alpaca_run_on_a_certificate_of_another_build_is_refused(_cert_cache):
+    from app.services.backtest import daily_backtest_handler as h
+    from app.services.backtest.history_source import AlpacaCacheNotCertified
+    from tests.alpaca_certified_cache import write_certified_meta
+    cert = (_cert_cache / "_meta" / "gate_certificate.json").read_bytes()
+    write_certified_meta(_cert_cache, run_id="new-build", certify=False)         # rebuilt after the gate
+    (_cert_cache / "_meta" / "gate_certificate.json").write_bytes(cert)
+    with pytest.raises(AlpacaCacheNotCertified, match="re-run the gate"):
+        h._suspension_events_for(ALPACA)
+
+
+def test_suspensions_changed_after_the_gate_is_refused(_cert_cache):
     import json
     from app.services.backtest import daily_backtest_handler as h
-    (tmp_path / "_meta").mkdir()
-    (tmp_path / "_meta" / "suspensions.json").write_text(json.dumps(
-        {"build": "R built t", "rule": {}, "symbols": {"X": [["2024-01-04", None, "delisted", 9, None]]}}))
+    from app.services.backtest.history_source import AlpacaCacheNotCertified
+    assert h._suspension_events_for(ALPACA)                                     # verified and memoized
+    p = _cert_cache / "_meta" / "suspensions.json"
+    d = json.loads(p.read_text())
+    d["symbols"]["Y"] = [["2024-02-01", None, "delisted", 9, None]]
+    p.write_text(json.dumps(d))                                                 # another copy: the memo must not hide it
+    with pytest.raises(AlpacaCacheNotCertified, match="other suspension events"):
+        h._suspension_events_for(ALPACA)
+
+
+def test_suspensions_of_another_build_than_the_certificate_is_refused(_cert_cache):
+    import json
+    from app.services.backtest import daily_backtest_handler as h
+    from app.services.backtest.history_source import AlpacaCacheNotCertified
+    from ba2_providers.ohlcv.alpaca_history import verify as ver
+    p = _cert_cache / "_meta" / "suspensions.json"
+    d = json.loads(p.read_text())
+    d["build"] = "other built t"
+    p.write_text(json.dumps(d))
+    ver.write_gate_certificate(str(_cert_cache / "_meta"), {"structural": {"status": ver.STATUS_PASS}})   # certifies THIS file
+    with pytest.raises(AlpacaCacheNotCertified, match="is of build 'other built t'"):
+        h._suspension_events_for(ALPACA)
+
+
+def test_certificate_check_is_memoized_per_process(_cert_cache, monkeypatch):
     from app.services.backtest import history_source
-    monkeypatch.setattr(history_source, "job_history_cache_dir", lambda cfg: str(tmp_path))
-    assert h._suspension_events_for({"ohlcv_history_source": "fmp"}) == {}
-    assert h._suspension_events_for({"ohlcv_history_source": "alpaca"}) == {"X": ((date(2024, 1, 4), None),)}
-    (tmp_path / "_meta" / "suspensions.json").unlink()
-    assert h._suspension_events_for({"ohlcv_history_source": "alpaca"}) == {}
+    from ba2_providers.ohlcv.alpaca_history import verify as ver
+    history_source.verify_alpaca_cache_certified(str(_cert_cache))
+    monkeypatch.setattr(ver, "read_gate_certificate", lambda meta: pytest.fail("re-verified an unchanged cache"))
+    history_source.verify_alpaca_cache_certified(str(_cert_cache))

@@ -700,18 +700,20 @@ _SUSPENSION_EVENTS_MEMO: Dict[Any, Any] = {}
 def _suspension_events_for(config: Dict[str, Any]) -> Dict[str, Any]:
     """The run's exchange suspension / delisting events (``ba2_common.core.suspension_events``).
 
-    ``{}`` for any source but ``alpaca`` -- FMP carries OTC prices, so an FMP run is byte-identical to before -- and for an
-    Alpaca cache without ``_meta/suspensions.json``.  Every GA worker reads its OWN local cache copy (the same
-    ``run_daily_backtest`` runs in workers), so a worker gets the events its cache was built with; a malformed file raises."""
+    ``{}`` for any source but ``alpaca`` -- FMP carries OTC prices, so an FMP run is byte-identical to before.  An ``alpaca`` run
+    REFUSES (``AlpacaCacheNotCertified``) unless the cache's gate certificate covers its current manifest and suspensions.json:
+    every GA worker reads its OWN local cache copy (the same ``run_daily_backtest`` runs in workers), and a copy without the
+    events (or with older ones) would otherwise trade without the liquidations the master applies.  A malformed file raises."""
     from ba2_common.core.suspension_events import SUSPENSIONS_FILE, load_suspension_events
-    from app.services.backtest.history_source import job_history_cache_dir
+    from app.services.backtest.history_source import job_history_cache_dir, verify_alpaca_cache_certified
 
     if resolve_job_history_source(config) != "alpaca":
         return {}
     cache_dir = job_history_cache_dir(config)
+    verify_alpaca_cache_certified(cache_dir)           # raises AlpacaCacheNotCertified: the events below are the certified ones
     path = os.path.join(cache_dir, SUSPENSIONS_FILE)
-    st = os.stat(path) if os.path.isfile(path) else None
-    key = (path, None if st is None else (st.st_mtime_ns, st.st_size))
+    st = os.stat(path)
+    key = (path, st.st_mtime_ns, st.st_size)
     if key not in _SUSPENSION_EVENTS_MEMO:
         _SUSPENSION_EVENTS_MEMO.clear()
         _SUSPENSION_EVENTS_MEMO[key] = load_suspension_events(cache_dir)

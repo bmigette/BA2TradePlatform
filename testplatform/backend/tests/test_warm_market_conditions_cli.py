@@ -289,6 +289,8 @@ def _write_build_manifest(root, events, certify=True, run_id="test-build"):
     (meta / "build_manifest.json").write_text(json.dumps(
         {"split_table": {"run_id": run_id}, "built_at": "2026-10-21T10:00:00+00:00", "subset": False, "symbols": {s: {"events": {"splits": ev, "spinoffs": []}} for s, ev in events.items()}}),
         encoding="utf-8")
+    (meta / "suspensions.json").write_text(json.dumps(          # the build writes it next to the manifest; the certificate hashes it
+        {"build": f"{run_id} built 2026-10-21T10:00:00+00:00", "rule": {}, "symbols": {}, "undecided": {}}), encoding="utf-8")
     if certify:                          # the full gate's PASS certificate of this manifest (prepare_history --steps verify)
         from ba2_providers.ohlcv.alpaca_history import verify as ver
         ver.write_gate_certificate(str(meta), {"structural": {"status": ver.STATUS_PASS}})

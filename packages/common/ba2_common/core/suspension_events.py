@@ -6,7 +6,11 @@ whole period (FMP, which carries OTC, shows trading) and, marked at its stale la
 docstring "EXCHANGE SUSPENSIONS / DELISTINGS") and writes ``<cache dir>/_meta/suspensions.json``::
 
     {"build": "<run_id> built <ts>", "rule": {...},
-     "symbols": {SYM: [[last_session, resume_session|null, kind, missing_sessions, fmp_traded_share|null], ...]}}
+     "symbols": {SYM: [[last_session, resume_session|null, kind, missing_sessions, fmp_traded_share|null], ...]},
+     "undecided": {SYM: [[last_session, resume_session, missing_sessions, reason], ...]}}
+
+``undecided`` lists the >= 20-session gaps the build could not judge (no FMP file / FMP not covering): visibility only, NOT
+suspensions; the loader ignores it.
 
 A backtest holding SYM on a session strictly after ``last_session`` (and before ``resume_session``, when there is one) closes
 it at the last exchange close and does not re-enter until the symbol trades again.  Pure: BT today, a live caller may use the

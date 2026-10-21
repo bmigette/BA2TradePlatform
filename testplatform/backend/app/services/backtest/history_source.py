@@ -11,7 +11,10 @@ the testplatform's thin side of it, so every switch point asks ONE place:
   before the switch has no stamp);
 * ``refuse_option_job_on_unsupported_source`` -- an OPTION job stamped ``alpaca`` raises
   ``OptionHistorySourceUnsupported`` (ThetaData strikes are as-traded and the split-basis
-  converter still reads FMP's calendar; plan Task 12 lifts this).
+  converter still reads FMP's calendar; plan Task 12 lifts this);
+* ``verify_alpaca_cache_certified(cache_dir)`` -- an ``alpaca`` run refuses (``AlpacaCacheNotCertified``) unless the cache
+  carries a PASS gate certificate of its CURRENT build manifest AND suspension events (every GA worker runs on its own copy of
+  the cache: an uncertified or older copy would silently trade without the suspension liquidations the master has).
 """
 from __future__ import annotations
 
@@ -31,6 +34,10 @@ from ba2_common.core.ohlcv_history import (
 
 #: The only source an option job may run on until the split-basis converter reads the verified table.
 OPTION_SUPPORTED_SOURCE = "fmp"
+
+
+class AlpacaCacheNotCertified(RuntimeError):
+    """An Alpaca-source backtest was launched on a cache the gate has not certified (or whose files changed since)."""
 
 
 class OptionHistorySourceUnsupported(ValueError):
@@ -133,3 +140,42 @@ def new_job_history_source(stated: Optional[str], *, uses_options: bool, where: 
         source = OPTION_SUPPORTED_SOURCE if uses_options else DEFAULT_BT_HISTORY_SOURCE
     refuse_option_job_on_unsupported_source({OHLCV_HISTORY_SOURCE_KEY: source}, uses_options=uses_options, where=where)
     return source
+
+
+#: Process memo of the verified certificate, keyed on the identity (path, mtime_ns, size) of the three files it covers, so the
+#: sha256 of the tens-of-MB manifest is computed once per process and a rebuilt / re-certified / hand-edited file re-verifies.
+_CERTIFIED_MEMO: dict = {}
+
+
+def verify_alpaca_cache_certified(cache_dir: str) -> dict:
+    """The PASS gate certificate of ``cache_dir`` (``ba2_providers...verify.read_gate_certificate``), else
+    ``AlpacaCacheNotCertified``; also refuses a ``suspensions.json`` whose ``build`` is not the certificate's ``build_run_id``.
+    Memoized per process (see ``_CERTIFIED_MEMO``); a failure is never memoized."""
+    from ba2_providers.ohlcv.alpaca_history.verify import (
+        BUILD_MANIFEST_NAME, GATE_CERTIFICATE_NAME, SUSPENSIONS_NAME, GateCertificateError, read_gate_certificate)
+
+    meta = os.path.join(cache_dir, "_meta")
+    paths = [os.path.join(meta, n) for n in (BUILD_MANIFEST_NAME, SUSPENSIONS_NAME, GATE_CERTIFICATE_NAME)]
+
+    def identity() -> Optional[tuple]:
+        try:
+            return tuple((p, st.st_mtime_ns, st.st_size) for p, st in ((p, os.stat(p)) for p in paths))
+        except FileNotFoundError:
+            return None                                  # a missing file is refused by read_gate_certificate below
+
+    key = identity()
+    if key is not None and key in _CERTIFIED_MEMO:
+        return _CERTIFIED_MEMO[key]
+    try:
+        cert = read_gate_certificate(meta)
+    except GateCertificateError as e:
+        raise AlpacaCacheNotCertified(
+            f"the Alpaca history cache {cache_dir} is not certified, refusing to run an alpaca-source backtest on it (this "
+            f"machine's copy may differ from the master's): {e}") from e
+    with open(paths[1], encoding="utf-8") as f:
+        build = json.load(f)["build"]
+    if build != cert["build_run_id"]:
+        raise AlpacaCacheNotCertified(f"{paths[1]} is of build {build!r}, the gate certified {cert['build_run_id']!r}: rebuild and re-run the gate")
+    _CERTIFIED_MEMO.clear()
+    _CERTIFIED_MEMO[identity()] = cert
+    return cert

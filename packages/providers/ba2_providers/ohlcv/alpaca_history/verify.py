@@ -905,6 +905,7 @@ def gate_failed(results: Dict[str, Dict[str, Any]]) -> List[str]:
 
 GATE_CERTIFICATE_NAME = "gate_certificate.json"
 BUILD_MANIFEST_NAME = "build_manifest.json"
+SUSPENSIONS_NAME = "suspensions.json"          # the build's exchange suspension events: part of what the gate certifies
 
 
 class GateCertificateError(RuntimeError):
@@ -921,16 +922,22 @@ def _sha256_file(path: str) -> str:
 
 
 def write_gate_certificate(meta_dir: str, results: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """``<meta>/gate_certificate.json``: the FULL gate's verdict on the build manifest it read (its sha256 and run_id).  Written
-    on PASS and on FAIL (a FAIL replaces an older PASS); only a full-cache gate writes it (a ``--symbols`` subset never does)."""
+    """``<meta>/gate_certificate.json``: the FULL gate's verdict on the build manifest it read (its sha256 and run_id) and on the
+    ``suspensions.json`` next to it (its sha256: a backtest that liquidates suspended names must run on the events the gate saw, on
+    every machine).  Written on PASS and on FAIL (a FAIL replaces an older PASS); only a full-cache gate writes it (a ``--symbols``
+    subset never does).  An Alpaca build always writes suspensions.json, so a missing one is GateCertificateError."""
     from ba2_providers.ohlcv.alpaca_history.split_build import atomic_write
     manifest = os.path.join(meta_dir, BUILD_MANIFEST_NAME)
+    susp = os.path.join(meta_dir, SUSPENSIONS_NAME)
+    if not os.path.isfile(susp):
+        raise GateCertificateError(f"{susp} not found: the build writes it next to the manifest; rebuild the Alpaca history cache")
     with open(manifest, encoding="utf-8") as f:
         m = json.load(f)
     run_id = f"{m['split_table']['run_id']} built {m['built_at']}"      # the build's identity: its split table + build time
     failed = gate_failed(results)
     cert = {"status": STATUS_FAIL if failed else STATUS_PASS, "failed": failed,
             "build_run_id": run_id, "build_manifest_sha256": _sha256_file(manifest),
+            "suspensions_sha256": _sha256_file(susp),
             "checks": {k: v["status"] for k, v in results.items()},
             "verified_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     atomic_write(os.path.join(meta_dir, GATE_CERTIFICATE_NAME), json.dumps(cert, indent=1).encode("utf-8"))
@@ -939,7 +946,7 @@ def write_gate_certificate(meta_dir: str, results: Dict[str, Dict[str, Any]]) ->
 
 def read_gate_certificate(meta_dir: str) -> Dict[str, Any]:
     """The PASS certificate of the CURRENT build manifest, or GateCertificateError: none, FAIL, or for another build (the
-    manifest changed since the gate ran)."""
+    manifest or the suspension events changed since the gate ran)."""
     path, manifest = os.path.join(meta_dir, GATE_CERTIFICATE_NAME), os.path.join(meta_dir, BUILD_MANIFEST_NAME)
     if not os.path.isfile(path):
         raise GateCertificateError(f"{path} not found: run `python tools/prepare_history.py --source alpaca --steps verify` "
@@ -950,4 +957,9 @@ def read_gate_certificate(meta_dir: str) -> Dict[str, Any]:
         raise GateCertificateError(f"the gate FAILED on this build ({', '.join(cert['failed'])}): {path}")
     if not os.path.isfile(manifest) or _sha256_file(manifest) != cert["build_manifest_sha256"]:
         raise GateCertificateError(f"{path} certifies build {cert['build_run_id']}, not the current {manifest}: re-run the gate")
+    susp = os.path.join(meta_dir, SUSPENSIONS_NAME)
+    if "suspensions_sha256" not in cert:
+        raise GateCertificateError(f"{path} predates the suspension-events certification: re-run the gate")
+    if not os.path.isfile(susp) or _sha256_file(susp) != cert["suspensions_sha256"]:
+        raise GateCertificateError(f"{path} certifies other suspension events than the current {susp}: re-run the gate")
     return cert

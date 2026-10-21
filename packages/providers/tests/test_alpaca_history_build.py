@@ -1051,3 +1051,87 @@ def test_fmp_naive_dates_keeps_daily_labels_converts_intraday_and_refuses_a_time
         fmp_naive_dates(bar, False, "x")
     naive = pd.Series(pd.to_datetime(["2024-03-01"]))
     assert fmp_naive_dates(naive, False, "x") is naive
+
+
+def test_gaps_fmp_cannot_judge_are_recorded_as_undecided_not_as_suspensions(env, tmp_path):
+    drop = sessions("2024-03-01", "2024-05-15")
+    f, s = _susp_env(env, tmp_path, "NOF", drop, fmp_days=None)
+    assert f["symbols"] == {} and f["undecided"]["NOF"] == [["2024-02-29", "2024-05-16", len(drop) - 1, "no_fmp_file"]]
+    m = json.loads((env[2] / "_meta" / "build_manifest.json").read_text())
+    assert m["undecided_gaps"] == 1 and m["symbols"]["NOF"]["undecided_gaps"] == f["undecided"]["NOF"]
+    assert s["undecided_gaps"] == 1 and s["symbols_with_undecided_gaps"] == 1 and s["suspension_events"] == 0
+    f, _ = _susp_env(env, tmp_path, "NOF", drop, fmp_days=sessions("2024-01-02", "2024-03-20"))
+    assert f["symbols"] == {} and f["undecided"]["NOF"][0][3] == "fmp_not_covering"
+    f, _ = _susp_env(env, tmp_path, "NOF", drop, fmp_volume=0)           # judged (no FMP volume): neither suspended nor undecided
+    assert f["symbols"] == {} and f["undecided"] == {}
+    f, _ = _susp_env(env, tmp_path, "NOF", sessions("2024-03-01", "2024-03-26"), fmp_days=None)   # < 20 sessions: nothing to judge
+    assert f["undecided"] == {}
+
+
+def test_detect_exchange_events_returns_events_and_undecided():
+    dates = pd.to_datetime(sessions("2024-01-02", "2024-02-29") + sessions("2024-05-16", "2026-10-12"))
+    ev, und = bld.detect_exchange_events(dates, None, "2026-10-12")
+    assert ev == [] and und[0][:2] == ["2024-02-29", "2024-05-16"] and und[0][3] == "no_fmp_file"
+
+
+def test_subset_build_does_not_merge_entries_judged_against_another_fmp_dir(env, tmp_path):
+    drop = sessions("2024-03-01", "2024-05-15")
+    _susp_env(env, tmp_path, "AAA", drop)
+    daily, intr, out = env
+    write_symbol(daily, intr, "BBB", sessions("2024-01-02", "2026-10-12"))
+    other = tmp_path / "fmp_other"
+    other.mkdir()
+    bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, symbols=["BBB"], fmp_daily_dir=str(other))
+    m = json.loads((out / "_meta" / "build_manifest.json").read_text())
+    assert sorted(m["symbols"]) == ["BBB"] and m["fmp_daily_dir"] == str(other)       # AAA's entries are not carried over
+    f = json.loads((out / "_meta" / "suspensions.json").read_text())
+    assert f["symbols"] == {} and f["undecided"] == {}
+
+
+def test_subset_build_does_not_merge_an_old_manifest_without_undecided_gaps(env, tmp_path):
+    _susp_env(env, tmp_path, "AAA", sessions("2024-03-01", "2024-05-15"))
+    daily, intr, out = env
+    mp = out / "_meta" / "build_manifest.json"
+    m = json.loads(mp.read_text())
+    del m["symbols"]["AAA"]["undecided_gaps"]
+    mp.write_text(json.dumps(m))
+    write_symbol(daily, intr, "BBB", sessions("2024-01-02", "2026-10-12"))
+    bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, symbols=["BBB"], fmp_daily_dir=str(tmp_path / "fmp"))
+    assert sorted(json.loads(mp.read_text())["symbols"]) == ["BBB"]
+
+
+def test_the_gate_certificate_also_certifies_the_suspension_events(env):
+    from ba2_providers.ohlcv.alpaca_history import verify as ver
+    daily, intr, out = env
+    write_symbol(daily, intr, "ABC", sessions("2024-01-02", "2024-01-05"))
+    make_table(out)
+    build(env)
+    meta = out / "_meta"
+    cert = ver.write_gate_certificate(str(meta), {"structural": {"status": ver.STATUS_PASS}})
+    assert len(cert["suspensions_sha256"]) == 64 and ver.read_gate_certificate(str(meta)) == cert
+    f = json.loads((meta / "suspensions.json").read_text())
+    f["symbols"]["ABC"] = [["2024-01-03", None, "delisted", 9, None]]
+    (meta / "suspensions.json").write_text(json.dumps(f))                      # edited / older copy after the gate
+    with pytest.raises(ver.GateCertificateError, match="suspension events.*re-run the gate"):
+        ver.read_gate_certificate(str(meta))
+    (meta / "suspensions.json").unlink()
+    with pytest.raises(ver.GateCertificateError, match="re-run the gate"):
+        ver.read_gate_certificate(str(meta))
+    with pytest.raises(ver.GateCertificateError, match="suspensions.json not found"):
+        ver.write_gate_certificate(str(meta), {"structural": {"status": ver.STATUS_PASS}})
+
+
+def test_a_certificate_without_suspensions_sha256_is_refused(env):
+    from ba2_providers.ohlcv.alpaca_history import verify as ver
+    daily, intr, out = env
+    write_symbol(daily, intr, "ABC", sessions("2024-01-02", "2024-01-05"))
+    make_table(out)
+    build(env)
+    meta = out / "_meta"
+    ver.write_gate_certificate(str(meta), {"structural": {"status": ver.STATUS_PASS}})
+    cp = meta / "gate_certificate.json"
+    c = json.loads(cp.read_text())
+    del c["suspensions_sha256"]
+    cp.write_text(json.dumps(c))
+    with pytest.raises(ver.GateCertificateError, match="predates"):
+        ver.read_gate_certificate(str(meta))

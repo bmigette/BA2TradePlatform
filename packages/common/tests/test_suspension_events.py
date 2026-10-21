@@ -55,3 +55,15 @@ def test_symbols_to_liquidate_keeps_order_and_is_empty_without_events():
     ev = {"A": ((date(2024, 3, 1), None),), "C": ((date(2024, 3, 1), date(2024, 6, 3)),)}
     assert symbols_to_liquidate(["C", "B", "A"], date(2024, 4, 1), ev) == ["C", "A"]
     assert symbols_to_liquidate(["A"], date(2024, 4, 1), {}) == []
+
+
+def test_undecided_block_is_ignored_by_the_loader(tmp_path):
+    d = _write(tmp_path, {"GONE": [["2024-05-31", None, "delisted", 90, None]]},
+               undecided={"THIN": [["2024-02-29", "2024-05-16", 55, "no_fmp_file"]]})
+    assert sorted(load_suspension_events(d)) == ["GONE"]
+
+
+def test_loader_still_validates_symbols_when_an_undecided_block_is_present(tmp_path):
+    d = _write(tmp_path, {"X": [["2024-05-31", None, "weird", 90, None]]}, undecided={})
+    with pytest.raises(ValueError, match="malformed"):
+        load_suspension_events(d)
