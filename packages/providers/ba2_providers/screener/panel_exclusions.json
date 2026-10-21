@@ -73,6 +73,83 @@
    "reason": "spliced ticker: Xperi/Adeia separation on 2022-10-03 (ADEAV -> ADEA); raw overnight jump x2.13 with no spin-off listed, so one series holds two companies",
    "added": "2026-10-20",
    "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "GRAF",
+   "kind": "exclude",
+   "reason": "reused ticker: GRAF 2018-10..2024 is an earlier company (SPAC) and the Alpaca name change GRAF->TONT 2026-07-27 belongs to the 2024 listing; one symbol holds two companies (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "IPOD",
+   "kind": "exclude",
+   "reason": "reused ticker: IPOD 2020-11..2025 is an earlier SPAC; the 2025-06 IPODU->IPOD unit split and the IPOD->CCAQ rename 2026-05-27 belong to a later listing; one symbol holds two companies (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "HLX",
+   "kind": "exclude",
+   "reason": "unclean rename: Helix renamed HLX->HOS 2026-09-02, but the vendor's HOS history is Hornbeck Offshore (2010-2019): the successor ticker is reused, so the company cannot be carried under one ticker (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "SVII",
+   "kind": "exclude",
+   "reason": "unclean rename: SVII->SVIIF (OTC) 2025-10-21 ->NUCL, NUCL starts 2026-02-25 with no overlap: the successor cannot be verified as the same series (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "BBCQ",
+   "kind": "exclude",
+   "reason": "unclean rename: BBCQ->PSQL 2026-08-28 changes CUSIP (SPAC merger) and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "COLA",
+   "kind": "exclude",
+   "reason": "unclean rename: COLA->SAIQ 2026-10-02 changes CUSIP (SPAC merger) and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "HVII",
+   "kind": "exclude",
+   "reason": "unclean rename: HVII->ONEN 2026-09-24 changes CUSIP (SPAC merger) and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "IPCX",
+   "kind": "exclude",
+   "reason": "unclean rename: IPCX->WATR 2026-08-17 changes CUSIP (SPAC merger) and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "IPEX",
+   "kind": "exclude",
+   "reason": "unclean rename: IPEX->GOW 2026-09-28 changes CUSIP (SPAC merger) and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "JFB",
+   "kind": "exclude",
+   "reason": "unclean rename: JFB->XTND 2026-09-04 changes CUSIP and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "NHIC",
+   "kind": "exclude",
+   "reason": "unclean rename: NHIC->NWCL 2026-09-22 changes CUSIP (SPAC merger) and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
   }
  ]
 }
