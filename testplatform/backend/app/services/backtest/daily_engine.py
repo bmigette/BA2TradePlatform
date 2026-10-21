@@ -1073,7 +1073,7 @@ class DailyBacktestEngine:
         """``(universe, entry_universe)`` for the bar: the decidable symbols, and that set intersected
         with the per-day dynamic screener gate (entries only; management is never gated)."""
         universe = resolve_universe(as_of_dt, self.config, self.price)
-        events = getattr(self.account, "_suspension_events", None)
+        events = getattr(getattr(self, "account", None), "_suspension_events", None)   # a __new__ engine double has no account
         if events:
             # No (re-)entry while a symbol is suspended from its exchange (it has no bars anyway on a daily clock; an
             # intraday clock can still see a price older than the suspension).  The resume session is NOT filtered.
