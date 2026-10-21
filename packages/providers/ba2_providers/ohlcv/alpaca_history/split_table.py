@@ -237,6 +237,17 @@ turns the symbol "NA" into NaN)
                        ticker) that still have NO daily bars in the store, one per line after two ``#`` comment lines (the first is
                        ``# run_id: <id>``).  The pipeline ``download`` step reads this list and fetches those symbols (Alpaca
                        carries no OTC names: they stay on the list and get the FMP-step fallback).
+  rename_successors.csv  RENAME_SUCCESSOR_COLUMNS (+ run_id): old, new, process_date, old_last_bar, new_in_store, new_in_5min (yes|no: the daily /
+                       the 5-minute store holds ``symbol=<new>`` bars; the 5-minute store is ``intraday_store``): every store symbol
+                       whose last real daily bar (placeholders dropped) lies within RENAME_WINDOW_DAYS = 15 calendar days BEFORE a name change
+                       of that symbol (Alpaca ``name_changes``; DOMO -> HUCK 2026-09-24), ``new`` = the chain's FINAL ticker, ``process_date``
+                       = the first rename's.  Alpaca keys history by the CURRENT ticker, so the old series ends at the rename and ``new``
+                       holds the full history -- or ``new`` is an OTC destination without Alpaca bars (a delisting, not a rename: the
+                       ``renames`` step decides from the built cache, which of the two it is).
+  rename_successors_missing_daily.txt, rename_successors_missing_5min.txt  the ``new`` tickers absent from the DAILY / the 5-MINUTE store
+                       (computed PER STORE: a successor may have daily bars and no 5-minute ones), one per line after two ``#`` comment lines
+                       (the first is ``# run_id: <id>``); the ``download`` step fetches each list into its own store.  Without an
+                       ``intraday_store`` the 5-minute columns read "unknown" and the 5-minute list is not written.
   yahoo_inputs.csv     symbol, ticker (the one that answered), status, n_splits, fetched_at, sha256 of every Yahoo cache file
                        consulted by this run
   fmp_daily_inputs.csv file, size, mtime_ns, mtime_utc, sha256 (of the bytes) of every FMP daily file read: the record of
@@ -460,6 +471,32 @@ def rename_successors(symbol: str, renames: Mapping[str, Sequence[Tuple[date, st
         at, cur = nxt
         out.append(cur)
     raise ValueError(f"rename chain of {symbol} does not end (cycle?)")
+
+
+RENAME_SUCCESSOR_COLUMNS = ["old", "new", "process_date", "old_last_bar", "new_in_store", "new_in_5min"]
+RENAME_WINDOW_DAYS = 15          # a series that ends this many calendar days (or fewer) before a name change of its symbol ended BY it
+
+
+def rename_successor_rows(last_bars: Mapping[str, date], renames: Mapping[str, Sequence[Tuple[date, str]]],
+                          new_in_store: Callable[[str], bool], new_in_5min: Optional[Callable[[str], bool]] = None,
+                          window_days: int = RENAME_WINDOW_DAYS) -> List[Dict[str, Any]]:
+    """One row per store symbol whose series ENDED at a rename: ``last_bars`` = symbol -> its last REAL daily bar (placeholders
+    dropped); the first name change ``process_date`` of that symbol on/after the last bar must lie within ``window_days``
+    calendar days of it, and the row's ``new`` is the FINAL ticker of the chain (``rename_successors(..., not_before=last bar)``).
+    ``process_date`` is the first rename's date.  ``new_in_store`` / ``new_in_5min`` = the daily / the 5-minute store holds bars under ``new`` ("yes"/"no"; "unknown" for the
+    5-minute store when no callable is given).  A
+    series that goes on past its rename date (the ticker was reused) or ended long before it is not a successor.  Sorted by old."""
+    rows = []
+    for old in sorted(last_bars):
+        last = last_bars[old]
+        first = next(((d, n) for d, n in renames.get(old, ()) if d >= last), None)
+        if first is None or (first[0] - last).days > window_days:
+            continue
+        new = rename_successors(old, renames, not_before=last)[-1]
+        rows.append({"old": old, "new": new, "process_date": first[0].isoformat(), "old_last_bar": last.isoformat(),
+                     "new_in_store": "yes" if new_in_store(new) else "no",
+                     "new_in_5min": "unknown" if new_in_5min is None else ("yes" if new_in_5min(new) else "no")})
+    return rows
 
 
 def _map(symbol: str, day: date, renames: Mapping[str, Sequence[Tuple[date, str]]],

@@ -11,7 +11,7 @@ REQUIRED ``--source {alpaca,fmp}``.  Steps valid per source (in this order):
   over complete stores) -- pass ``--steps`` to run less.
 
 STEP alpaca / download
-  download      Runs ``tools/alpaca_history_download.py`` three times with the RECORDED arguments (code constants ``ALPACA_DOWNLOADS``:
+  download      Runs ``tools/alpaca_history_download.py`` up to five times with the RECORDED arguments (code constants ``ALPACA_DOWNLOADS``:
                 this is the runbook's source of truth).  Keys and account come from the arguments below.
                   1. 5-minute store ``--store-5min``: ``<store>/symbols.txt``, start 2019-01-01, end 2026-10-13, phases default
                      (corporate_actions, daily, intraday), max-gap-days 5;
@@ -19,7 +19,15 @@ STEP alpaca / download
                      corporate_actions,daily, max-gap-days 5;
                   3. the same daily store, phases daily, symbols ``<store>/symbols_spinco_20261020.txt`` plus
                      ``<out>/_meta/spinco_symbols_missing.txt`` (the split-table step's list of spin-off companies without bars)
-                     if that file exists (merged, de-duplicated, order kept).
+                     if that file exists (merged, de-duplicated, order kept);
+                  4. the 5-minute store, phases daily,intraday, start 2019-01-01, symbols ``<out>/_meta/rename_successors_missing_5min.txt``
+                     (the split-table step's list of rename successors absent from the 5-MINUTE store: the NEW ticker of a name change
+                     holds the full history, computed per store, a successor can have daily bars and no
+                     5-minute ones), and
+                  5. the daily store, phases daily, start 2016-01-01, asof as run 2, symbols ``rename_successors_missing_daily.txt``
+                     (absent from the DAILY store).
+                  Run 4 / 5 runs only when its file exists and lists a symbol (otherwise it is logged as skipped).  The build covers
+                  every symbol with bars in either store, so a downloaded successor is built (``_1d`` and ``_5min``) and gated like any other.
                 Common: ``--keys-db`` (default: ``--db``) ``--account-id 1 --rpm 150 --min-remaining 60``.  A rerun over complete
                 stores makes ~0 data requests; a run that exits non-zero fails the step.
     python tools/prepare_history.py --source alpaca --steps download
@@ -115,17 +123,24 @@ SOURCE_STEPS = {"alpaca": ("download", "split-table", "build", "verify", "market
 MC_PROFILES = ("ohlcv-v1", "ta-structure-v1")
 SPINCO_SYMBOLS_FILE = "symbols_spinco_20261020.txt"       # in the daily store: spin-off companies fetched by hand on 2026-10-20
 SPINCO_MISSING_FILE = "spinco_symbols_missing.txt"        # <out>/_meta, written by the split-table step
+RENAME_MISSING_FILES = {"renames_daily": "rename_successors_missing_daily.txt",     # <out>/_meta, written by the split-table step: the rename
+                        "renames_5min": "rename_successors_missing_5min.txt"}       # successors absent from the daily / the 5-minute store
 DOWNLOAD_END = "2026-10-13"                                # first day NOT fetched (the stores' asof is the day before)
 DOWNLOAD_ASOF = "2026-10-12"
 #: THE RECORDED ``alpaca_history_download.py`` runs (runbook source of truth).  store: which store argument; symbols: file name in
-#: the store (None = the spin-off list, see ``_spinco_symbols``); a None asof / phases is left to the downloader's default.
+#: the store (None = the generated list named by ``list``: "spinco" = ``_spinco_symbols``, "renames_daily" / "renames_5min" = ``_rename_symbols``, which is
+#: conditional: no run while that list is empty); a None asof / phases is left to the downloader's default.
 ALPACA_DOWNLOADS = (
     {"label": "5-minute store", "store": "5min", "symbols": "symbols.txt", "start": "2019-01-01", "end": DOWNLOAD_END,
      "asof": None, "phases": None, "max_gap_days": 5},
     {"label": "daily store + corporate actions", "store": "daily", "symbols": "symbols.txt", "start": "2016-01-01",
      "end": DOWNLOAD_END, "asof": DOWNLOAD_ASOF, "phases": "corporate_actions,daily", "max_gap_days": 5},
-    {"label": "daily store, spin-off companies", "store": "daily", "symbols": None, "start": "2016-01-01", "end": DOWNLOAD_END,
-     "asof": DOWNLOAD_ASOF, "phases": "daily", "max_gap_days": 5},
+    {"label": "daily store, spin-off companies", "store": "daily", "symbols": None, "list": "spinco", "start": "2016-01-01",
+     "end": DOWNLOAD_END, "asof": DOWNLOAD_ASOF, "phases": "daily", "max_gap_days": 5},
+    {"label": "5-minute store, rename successors", "store": "5min", "symbols": None, "list": "renames_5min", "start": "2019-01-01",
+     "end": DOWNLOAD_END, "asof": None, "phases": "daily,intraday", "max_gap_days": 5},
+    {"label": "daily store, rename successors", "store": "daily", "symbols": None, "list": "renames_daily", "start": "2016-01-01",
+     "end": DOWNLOAD_END, "asof": DOWNLOAD_ASOF, "phases": "daily", "max_gap_days": 5},
 )
 FMP_TIMEFRAMES = "5min,1d"
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
@@ -192,6 +207,8 @@ def _print_split_table_summary(r: Dict[str, Any]) -> None:
         print(f"  {cls}: {n}")
         for row in r["compare_examples"].get(cls, []):
             print("     " + "  ".join(f"{k}={v}" for k, v in row.items() if k != "class"))
+    print(f"rename successors (old series ended at a name change): {r['rename_successors']}; absent from the daily store: "
+          f"{r['rename_successors_missing_daily']}, from the 5-minute store: {r['rename_successors_missing_5min']} (the download step fetches them)")
     print(f"Yahoo symbols consulted (unlisted-split candidates only): {r['yahoo_files']['count']}")
     print(f"FMP daily files used: {r['fmp_daily_files']['count']} (sha256 {r['fmp_daily_files']['sha256'][:16]}...)")
     print(f"wrote {r['meta']}")
@@ -203,7 +220,7 @@ def step_split_table(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[
     symbols = [_norm_symbol(x) for x in a.symbols.split(",") if x.strip()] if a.symbols else None
     result = sb.build_split_table(store=a.store, out=a.out, db=a.db, fmp_daily_dir=a.fmp_daily_dir, symbols=symbols,
                                   fmp_from=a.fmp_from, fmp_to=a.fmp_to, overrides_path=a.overrides, log=log,
-                                  refresh_yahoo=a.refresh_yahoo)
+                                  refresh_yahoo=a.refresh_yahoo, intraday_store=a.store_5min)
     _print_split_table_summary(result)
     return result
 
@@ -249,6 +266,20 @@ def _spinco_symbols(a: argparse.Namespace) -> List[str]:
     return list(dict.fromkeys(syms))
 
 
+def _rename_symbols(a: argparse.Namespace, which: str) -> List[str]:
+    """The split-table step's rename-successor list of one store (``<out>/_meta/rename_successors_missing_{daily,5min}.txt``), ``#`` comment
+    lines dropped; [] when the file does not exist (the split-table step has not run yet): the run is then skipped, loudly."""
+    path = os.path.join(a.out, "_meta", RENAME_MISSING_FILES[which])
+    if not os.path.isfile(path):
+        return []
+    return list(dict.fromkeys(x for x in _read_symbol_lines(path) if not x.startswith("#")))
+
+
+def _download_symbols(a: argparse.Namespace, spec: Dict[str, Any]) -> List[str]:
+    """The symbols of a generated-list run (``spec["list"]``)."""
+    return _spinco_symbols(a) if spec["list"] == "spinco" else _rename_symbols(a, spec["list"])
+
+
 def download_argv(a: argparse.Namespace, spec: Dict[str, Any], symbols_file: str) -> List[str]:
     """The argv of one recorded downloader run."""
     store = a.store_5min if spec["store"] == "5min" else a.store
@@ -264,32 +295,45 @@ def download_argv(a: argparse.Namespace, spec: Dict[str, Any], symbols_file: str
 
 def step_alpaca_download(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, Any]:
     dl = _load_downloader()
-    runs = []
+    runs, skipped = [], []
     with tempfile.TemporaryDirectory() as tmp:
         for spec in ALPACA_DOWNLOADS:
             store = a.store_5min if spec["store"] == "5min" else a.store
             if spec["symbols"]:
                 symbols_file = os.path.join(store, spec["symbols"])
             else:
-                symbols_file = os.path.join(tmp, "symbols_spinco_merged.txt")
+                syms = _download_symbols(a, spec)
+                if spec["list"] in RENAME_MISSING_FILES and not syms:
+                    log(f"download: {spec['label']}: SKIPPED, {RENAME_MISSING_FILES[spec['list']]} is absent or lists no symbol")
+                    skipped.append(spec["label"])
+                    continue
+                symbols_file = os.path.join(tmp, f"symbols_{spec['list']}_{spec['store']}.txt")
                 with open(symbols_file, "w", encoding="utf-8") as f:
-                    f.write("\n".join(_spinco_symbols(a)) + "\n")
+                    f.write("\n".join(syms) + "\n")
             argv = download_argv(a, spec, symbols_file)
             log(f"download: {spec['label']}: alpaca_history_download.py {' '.join(argv)}")
             code = dl.main(argv)
             runs.append({"label": spec["label"], "argv": argv, "exit_code": code})
             if code != 0:
                 raise RuntimeError(f"alpaca_history_download.py exited {code} for '{spec['label']}' (see its log above)")
-    return {"runs": runs}
+    return {"runs": runs, "skipped": skipped}
 
 
 def plan_alpaca_download(a: argparse.Namespace) -> List[str]:
     lines = []
     for spec in ALPACA_DOWNLOADS:
         store = a.store_5min if spec["store"] == "5min" else a.store
-        sym = spec["symbols"] or f"<{SPINCO_SYMBOLS_FILE} + {SPINCO_MISSING_FILE} merged>"
         if not os.path.isdir(store):
             raise FileNotFoundError(f"store not found: {store}")
+        if spec["symbols"]:
+            sym = spec["symbols"]
+        elif spec["list"] == "spinco":
+            sym = f"<{SPINCO_SYMBOLS_FILE} + {SPINCO_MISSING_FILE} merged>"
+        else:
+            sym = f"<{RENAME_MISSING_FILES[spec['list']]}>"
+            if not _rename_symbols(a, spec["list"]):
+                lines.append(f"download: {spec['label']}: would be SKIPPED ({RENAME_MISSING_FILES[spec['list']]} absent or lists no symbol)")
+                continue
         lines.append("download: alpaca_history_download.py " + " ".join(download_argv(a, spec, os.path.join(store, sym))))
     _spinco_symbols(a)                                           # raises if the spin-off list is missing
     return lines

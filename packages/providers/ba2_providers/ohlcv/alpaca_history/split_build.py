@@ -29,7 +29,7 @@ from ba2_common import config as _cfg
 from ba2_providers.fmp_common import fmp_http_get, redact
 from ba2_providers.ohlcv.alpaca_history.split_table import (
     ACCEPTED_COLUMNS, COMPARE_COLUMNS, OVERRIDES_PATH, REVIEW_COLUMNS, SplitTableBuildError, alpaca_events_from_actions, spinoff_events_from_actions,
-    build_rename_map, compare_with_fmp, corporate_action_paths, decide_splits, fmp_events_from_rows, load_overrides,
+    RENAME_SUCCESSOR_COLUMNS, build_rename_map, compare_with_fmp, rename_successor_rows, corporate_action_paths, decide_splits, fmp_events_from_rows, load_overrides,
     read_corporate_actions, rename_successors, splits_by_symbol)
 
 
@@ -41,6 +41,7 @@ def read_csv_frame(path: str) -> pd.DataFrame:
 
 
 DEFAULT_STORE = os.path.join(_cfg.BA2_HOME, "alpaca_store_daily2016")
+DEFAULT_INTRADAY_STORE = os.path.join(_cfg.BA2_HOME, "alpaca_store")      # the 5-minute store (rename-successor coverage only)
 DEFAULT_OUT = os.path.join(_cfg.CACHE_FOLDER, "AlpacaHistoryOHLCVProvider")
 DEFAULT_DB = os.path.join(_cfg.TRADE_DIR, "db.sqlite")
 DEFAULT_FMP_DAILY = os.path.join(_cfg.CACHE_FOLDER, "FMPOHLCVProvider")
@@ -383,7 +384,7 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
                       fmp_daily_dir: str = DEFAULT_FMP_DAILY, symbols: Optional[List[str]] = None,
                       fmp_from: str = "2016-01-01", fmp_to: Optional[str] = None,
                       overrides_path: Optional[str] = None, log: Callable[[str], None] = print,
-                      refresh_yahoo: bool = False, yahoo_fetch: Optional[Callable] = None, yahoo_min_interval: float = 1.0,
+                      refresh_yahoo: bool = False, intraday_store: Optional[str] = None, yahoo_fetch: Optional[Callable] = None, yahoo_min_interval: float = 1.0,
                       yahoo_sleep: Callable[[float], None] = time.sleep) -> Dict[str, Any]:
     """Build and write ``<out>/_meta/split_table.json`` (+ review / accepted / vs-FMP CSVs).  Returns a summary:
     ``{"meta", "asof", "symbols_judged", "symbols_with_splits", "accepted", "review_rows", "review_applied",
@@ -486,6 +487,22 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     atomic_write(os.path.join(meta, "spinco_symbols_missing.txt"),
                  (f"# run_id: {run_id}\n# real spun-off tickers with no daily bars in the store (one per line); the "
                   f"download step reads this list\n" + "".join(f"{x}\n" for x in sorted(missing_spincos))).encode("utf-8"))
+    m5_dir = os.path.join(intraday_store, "bars", "5Min") if intraday_store else None
+    if m5_dir is not None and not os.path.isdir(m5_dir):
+        raise SplitTableBuildError(f"5-minute store not found: {m5_dir}")
+    succ_rows = rename_successor_rows({s: r[1] for s, r in ranges.items()}, renames,
+                                      lambda n: os.path.isfile(os.path.join(bars_dir, f"symbol={n}", "all.parquet")),
+                                      None if m5_dir is None else (lambda n: os.path.isdir(os.path.join(m5_dir, f"symbol={n}"))))
+    succ_missing = sorted({r["new"] for r in succ_rows if r["new_in_store"] == "no"})
+    succ_missing_5 = sorted({r["new"] for r in succ_rows if r["new_in_5min"] == "no"})
+    atomic_write(os.path.join(meta, "rename_successors.csv"), _csv_bytes(RENAME_SUCCESSOR_COLUMNS, succ_rows, run_id))
+    for name, what, syms in (("daily", "daily", succ_missing), ("5min", "5-minute", succ_missing_5)):
+        if name == "5min" and m5_dir is None:
+            continue
+        atomic_write(os.path.join(meta, f"rename_successors_missing_{name}.txt"),
+                     (f"# run_id: {run_id}" + "\n" + f"# rename successors (final ticker of a name change) with no bars in the {what} store (one per line); "
+                      f"the download step reads this list" + "\n" + "".join(f"{x}" + "\n" for x in syms)).encode("utf-8"))
+    stats["rename_successors"] = len(succ_rows)
     atomic_write(os.path.join(meta, "split_table.json"), json.dumps(table, indent=1).encode("utf-8"))
     for (src, verdict), k in sorted(Counter((a["source"], a["verdict"]) for a in accepted).items()):
         stats[f"accepted_{verdict}_from_{src}"] += k
@@ -495,6 +512,8 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
             "spinoffs_applied": sum(len(v) for v in table["spinoffs"].values()), "series_breaks": sum(len(v) for v in breaks.values()), "accepted": len(accepted), "review_rows": len(review),
             "review_applied": sum(r["applied"] for r in review),
             "fmp_daily_files": fmp_files, "yahoo_files": yahoo_files,
-            "spinco_symbols_missing": len(missing_spincos), "stats": dict(sorted(stats.items())),
+            "spinco_symbols_missing": len(missing_spincos), "rename_successors": len(succ_rows),
+            "rename_successors_missing_daily": len(succ_missing),
+            "rename_successors_missing_5min": len(succ_missing_5), "stats": dict(sorted(stats.items())),
             "compare": {c: sum(1 for r in cmp_rows if r["class"] == c) for c in classes},
             "compare_examples": {c: [r for r in cmp_rows if r["class"] == c][:10] for c in classes if c != "agree"}}

@@ -57,7 +57,7 @@ def _parse_symbols_arg(raw: str) -> list:
     a comma or a space, so accepting both separators cannot be ambiguous.
     """
     if raw.startswith("@"):
-        with open(raw[1:], encoding="utf-8") as f:
+        with open(_caller_path(raw[1:]), encoding="utf-8") as f:       # relative to where the user ran, not backend/
             raw = f.read()
     return [s.strip().upper() for s in raw.replace(",", " ").split() if s.strip()]
 
@@ -528,8 +528,9 @@ def _cmd_prewarm(args) -> int:
 
 
 def _read_symbols_file(path: str) -> list:
-    """One symbol per line (blank lines / ``#`` comments ignored); upper-cased, order kept."""
-    with open(path, encoding="utf-8") as f:
+    """One symbol per line (blank lines / ``#`` comments ignored); upper-cased, order kept.  A relative ``path`` is resolved against the
+    directory the user ran from (``_caller_path``): the command chdirs into backend/ first."""
+    with open(_caller_path(path), encoding="utf-8") as f:
         out = [ln.split("#")[0].strip().upper() for ln in f]
     return [x for x in out if x]
 
@@ -618,7 +619,7 @@ def _cmd_build_screener_metrics(args) -> int:
         allow_stale_symbols=_parse_symbols_arg(getattr(args, "allow_stale_symbols", None) or ""),
         universe_symbols=(_read_symbols_file(args.symbols_file)
                           if getattr(args, "symbols_file", None) else None),
-        universe_symbols_path=getattr(args, "symbols_file", None))
+        universe_symbols_path=(_caller_path(args.symbols_file) if getattr(args, "symbols_file", None) else None))
     print(f"build-screener-metrics: {summary}")
     if getattr(args, "daily_panel", False):
         # the store's universe is now known: produce the simulation data for it (same function as prewarm)
