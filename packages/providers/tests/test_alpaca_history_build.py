@@ -958,7 +958,8 @@ def test_the_gate_certificate_reads_the_manifest_the_build_writes(env):
     cert = ver.write_gate_certificate(meta, {"structural": {"status": ver.STATUS_PASS}})
     assert cert["status"] == ver.STATUS_PASS and cert["build_run_id"].startswith("RUN1 built ")
     assert ver.read_gate_certificate(meta)["build_manifest_sha256"] == cert["build_manifest_sha256"]
-    build(env)                                                            # a rebuild after the gate: the certificate is stale
+    write_symbol(daily, intr, "ABD", days)                                # a rebuild after the gate with other content (a rebuild of
+    build(env)                                                            # identical bytes in the same second IS the certified build)
     with pytest.raises(ver.GateCertificateError, match="re-run the gate"):
         ver.read_gate_certificate(meta)
     ver.write_gate_certificate(meta, {"yahoo": {"status": ver.STATUS_FAIL}})
