@@ -1077,10 +1077,12 @@ class DailyBacktestEngine:
         if events:
             # No (re-)entry while a symbol is suspended from its exchange (it has no bars anyway on a daily clock; an
             # intraday clock can still see a price older than the suspension).  The resume session is NOT filtered.
+            # The events table holds every delisted symbol of the cache (thousands), far more than a bar's universe, so
+            # it is never scanned per bar: a C-level key intersection, then the rule on the few universe names with events.
             session = as_of_dt.date()
-            blocked = {s for s in events if is_suspended(s, session, events)}      # events are far fewer than the universe
+            blocked = {s for s in events.keys() & universe if is_suspended(s, session, events)}
             if blocked:
-                fresh = (blocked & set(universe)) - self._suspension_noted    # one line per symbol, not one per bar
+                fresh = blocked - self._suspension_noted                      # one line per symbol, not one per bar
                 if fresh:
                     self._suspension_noted |= fresh
                     logger.warning("[backtest] %s: not decidable (suspended from their exchange, no entry until they "
