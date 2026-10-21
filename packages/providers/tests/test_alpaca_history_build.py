@@ -969,7 +969,7 @@ def test_the_gate_certificate_reads_the_manifest_the_build_writes(env):
 # ---------------------------------------------------------------------------
 # exchange suspensions / delistings (_meta/suspensions.json)
 # ---------------------------------------------------------------------------
-def _susp_env(env, tmp_path, sym, drop, fmp_days="all", fmp_volume=500, end="2026-10-12"):
+def _susp_env(env, tmp_path, sym, drop, fmp_days="all", fmp_volume=500, end="2026-10-12", fmp_tz=None):
     """One symbol with bars every session 2024-01-02..``end`` except the ``drop`` days; an FMP file over ``fmp_days`` (all sessions)."""
     daily, intr, out = env
     all_days = sessions("2024-01-02", end)
@@ -979,7 +979,8 @@ def _susp_env(env, tmp_path, sym, drop, fmp_days="all", fmp_volume=500, end="202
     fmp.mkdir(exist_ok=True)
     if fmp_days is not None:
         fd = all_days if fmp_days == "all" else fmp_days
-        pd.DataFrame({"Date": pd.to_datetime(fd), "Volume": [fmp_volume] * len(fd)}).to_parquet(fmp / f"{sym}_1d.parquet", index=False)
+        dates = pd.to_datetime(fd) if fmp_tz is None else pd.to_datetime(fd).tz_localize(fmp_tz)
+        pd.DataFrame({"Date": dates, "Volume": [fmp_volume] * len(fd)}).to_parquet(fmp / f"{sym}_1d.parquet", index=False)
     s = bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, fmp_daily_dir=str(fmp))
     f = json.loads((out / "_meta" / "suspensions.json").read_text())
     return f, s
@@ -1029,3 +1030,24 @@ def test_subset_build_merges_suspensions_like_the_manifest(env, tmp_path):
     bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, symbols=["BBB"], fmp_daily_dir=str(tmp_path / "fmp"))
     f = json.loads((out / "_meta" / "suspensions.json").read_text())
     assert sorted(f["symbols"]) == ["AAA"] and f["symbols"]["AAA"][0][2] == "otc_suspension"      # AAA kept, BBB has none
+
+
+def test_an_fmp_file_with_utc_midnight_labels_reads_as_its_wall_dates(env, tmp_path):
+    # 11k FMP daily files (945 symbols this cache builds, mostly ETFs: SPMO, BRKH...) carry tz-aware UTC midnights; compared
+    # with naive days they once matched nothing (witness / step / gate silently off) and crashed the suspension detector
+    drop = sessions("2024-03-01", "2024-05-15")
+    f, _ = _susp_env(env, tmp_path, "SPMO", drop, fmp_tz="UTC")
+    (last, resume, kind, _missing, share), = f["symbols"]["SPMO"]
+    assert (last, resume, kind, share) == ("2024-02-29", "2024-05-16", "otc_suspension", 1.0)
+
+
+def test_fmp_naive_dates_keeps_daily_labels_converts_intraday_and_refuses_a_timed_daily_stamp():
+    from ba2_providers.ohlcv.alpaca_history.split_build import fmp_naive_dates
+    utc = pd.Series(pd.to_datetime(["2024-03-01", "2024-03-04"]).tz_localize("UTC"))
+    assert list(fmp_naive_dates(utc, False, "x")) == list(pd.to_datetime(["2024-03-01", "2024-03-04"]))     # not 02-29 20:00
+    bar = pd.Series(pd.to_datetime(["2024-03-01 14:30"]).tz_localize("UTC"))
+    assert list(fmp_naive_dates(bar, True, "x")) == [pd.Timestamp("2024-03-01 09:30")]
+    with pytest.raises(ValueError, match="not a midnight"):
+        fmp_naive_dates(bar, False, "x")
+    naive = pd.Series(pd.to_datetime(["2024-03-01"]))
+    assert fmp_naive_dates(naive, False, "x") is naive

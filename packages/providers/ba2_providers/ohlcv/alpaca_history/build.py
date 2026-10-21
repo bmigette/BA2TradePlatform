@@ -98,7 +98,7 @@ import numpy as np
 import pandas as pd
 
 from ba2_common import config as _cfg
-from ba2_providers.ohlcv.alpaca_history.split_build import DEFAULT_OUT, atomic_write, drop_placeholder_bars
+from ba2_providers.ohlcv.alpaca_history.split_build import DEFAULT_OUT, atomic_write, drop_placeholder_bars, read_fmp_frame
 from ba2_providers.ohlcv.alpaca_history.split_table import OVERRIDES_PATH, load_bar_caps
 
 DEFAULT_DAILY_STORE = os.path.join(_cfg.BA2_HOME, "alpaca_store_daily2016")
@@ -470,7 +470,7 @@ def file_names(symbol: str) -> Tuple[str, str]:
 def _fmp_volume_frame(fmp_dir: Optional[str], symbol: str) -> Optional[pd.DataFrame]:
     """The symbol's FMP daily (Date, Volume), read only when ``fmp_dir`` has the file (None otherwise: no suspension can be told)."""
     fp = os.path.join(fmp_dir, f"{symbol}_1d.parquet") if fmp_dir else None
-    return pd.read_parquet(fp, columns=["Date", "Volume"]) if fp and os.path.isfile(fp) else None
+    return read_fmp_frame(fp, ["Date", "Volume"]) if fp and os.path.isfile(fp) else None
 
 
 def detect_exchange_events(dates: Sequence[pd.Timestamp], fmp: Optional[pd.DataFrame], store_asof: str) -> List[List[Any]]:
@@ -601,7 +601,7 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
             fp = os.path.join(fmp_dir, f"{symbol}_1d.parquet") if fmp_dir else None
             fmp_df = None
             if fp and os.path.isfile(fp):
-                fmp_df = pd.read_parquet(fp, columns=["Date", "High", "Low", "Close"])
+                fmp_df = read_fmp_frame(fp, ["Date", "High", "Low", "Close"])
                 with open(fp, "rb") as fh:
                     entry["fmp_daily_sha256"] = hashlib.sha256(fh.read()).hexdigest()
             d_adj, repairs, unwitnessed = repair_daily(d_adj, env, fmp_df)

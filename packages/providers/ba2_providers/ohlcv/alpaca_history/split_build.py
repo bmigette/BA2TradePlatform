@@ -50,6 +50,32 @@ FMP_WINDOW_DAYS = 30            # the endpoint clamps a range to its last ~90 da
 FMP_ROW_CAP = 1000              # a window returning this many rows may be truncated: split it (1 day is the floor)
 
 
+def fmp_naive_dates(stamps: pd.Series, intraday: bool, what: str) -> pd.Series:
+    """An FMP cache ``Date`` column as NAIVE New York stamps, the form every comparison here uses.  Most FMP files are naive
+    already; 11k daily files (945 of the symbols this cache builds, mostly ETFs) carry UTC-midnight session LABELS and one
+    5-min file a tz.  Daily: a tz-aware midnight is its own wall date (the session label; converting it to New York would move
+    it to the previous day), any other time of day is REFUSED rather than guessed (the rule of
+    ``ba2_common.core.market_condition_source.read_fmp_daily_cache``).  Intraday: converted to New York wall time.  A tz-aware
+    column compared with naive days used to match NOTHING (the FMP witness / step / comparisons were silently off for those
+    symbols) or raise."""
+    if stamps.dt.tz is None:
+        return stamps
+    if intraday:
+        return stamps.dt.tz_convert("America/New_York").dt.tz_localize(None)
+    wall = stamps.dt.tz_localize(None)
+    timed = wall != wall.dt.normalize()
+    if bool(timed.any()):
+        raise ValueError(f"{what}: tz-aware daily date {stamps[timed].iloc[0]!r} is not a midnight session label; refusing to guess")
+    return wall
+
+
+def read_fmp_frame(path: str, columns: List[str], intraday: bool = False) -> pd.DataFrame:
+    """One FMP cache parquet (``Date`` among ``columns``) with ``fmp_naive_dates`` applied."""
+    df = pd.read_parquet(path, columns=columns)
+    df["Date"] = fmp_naive_dates(df["Date"], intraday, path)
+    return df
+
+
 def atomic_write(path: str, data: bytes) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.tmp{os.getpid()}"
@@ -208,6 +234,7 @@ def load_fmp_daily(fmp_dir: str, symbols: Iterable[str]
         with open(path, "rb") as f:
             raw = f.read()
         df = pd.read_parquet(io.BytesIO(raw), columns=["Date", "Close"])
+        df["Date"] = fmp_naive_dates(df["Date"], False, path)
         return sym, df, {"file": os.path.basename(path), "size": len(raw), "mtime_ns": stt.st_mtime_ns,
                          "mtime_utc": datetime.fromtimestamp(stt.st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
                          "sha256": hashlib.sha256(raw).hexdigest()}

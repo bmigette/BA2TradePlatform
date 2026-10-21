@@ -89,6 +89,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 import numpy as np
 import pandas as pd
 
+from ba2_providers.ohlcv.alpaca_history.split_build import read_fmp_frame
+
 MIN_COVERAGE = 0.95
 COVERAGE_TARGET = 0.965
 MAX_SELFCONS_BAD = 0.01
@@ -297,7 +299,7 @@ def scan_symbol(args: Tuple[str, str, Optional[str], Tuple[int, ...], Optional[s
             if other is not None:
                 po = os.path.join(other, f"{symbol}_1d.parquet")
                 if os.path.isfile(po):
-                    odf = pd.read_parquet(po, columns=["Date", "Close"])
+                    odf = read_fmp_frame(po, ["Date", "Close"])
                     oth = _daily_series(odf, "Close")
             for day, rt in big.items():
                 pday = day1.index[day1.index.get_loc(day) - 1]
@@ -541,7 +543,7 @@ def outage_symbol(args: Tuple[str, str, str, Tuple[int, ...]]) -> Dict[str, Any]
         po, pt = os.path.join(cache, f"{symbol}_5min.parquet"), os.path.join(other, f"{symbol}_5min.parquet")
         if not (os.path.isfile(po) and os.path.isfile(pt)):
             return {"symbol": symbol, "rows": [], "compared": False, "error": None}
-        return {"symbol": symbol, "rows": outage_rows(symbol, pd.read_parquet(po, columns=["Date"]), pd.read_parquet(pt, columns=["Date"]), years),
+        return {"symbol": symbol, "rows": outage_rows(symbol, pd.read_parquet(po, columns=["Date"]), read_fmp_frame(pt, ["Date"], intraday=True), years),
                 "compared": True, "error": None}
     except Exception as e:
         return {"symbol": symbol, "rows": [], "compared": False, "error": f"{type(e).__name__}: {e}"}
@@ -835,7 +837,7 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
                 continue
             fser = None
             if other is not None and os.path.isfile(os.path.join(other, f"{s}_1d.parquet")):
-                fser = _daily_series(pd.read_parquet(os.path.join(other, f"{s}_1d.parquet"), columns=["Date", "Close"]), "Close")
+                fser = _daily_series(read_fmp_frame(os.path.join(other, f"{s}_1d.parquet"), ["Date", "Close"]), "Close")
             stats, rr = compare_yahoo(pd.read_parquet(p1, columns=["Date", "Close"]), ydf, (spinoffs or {}).get(s, ()), brk.get(s), fser,
                                     events=(splits or {}).get(s, ()), yahoo_splits=yahoo_split_list(ydf),
                                     successor_events=(splits or {}).get(note, ()) if note != s and splits is not None else None,
