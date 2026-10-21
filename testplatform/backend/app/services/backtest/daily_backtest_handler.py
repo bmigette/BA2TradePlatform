@@ -693,6 +693,31 @@ _REGIME_BENCHMARK = "SPY"
 # derived from indicator lookbacks and is far shorter. 800 sessions of slack in calendar days.
 _REGIME_LOOKBACK_DAYS = 1200
 
+# Worker-process memo of the Alpaca cache's exchange suspension events, keyed on the file's identity so a rebuilt cache is re-read.
+_SUSPENSION_EVENTS_MEMO: Dict[Any, Any] = {}
+
+
+def _suspension_events_for(config: Dict[str, Any]) -> Dict[str, Any]:
+    """The run's exchange suspension / delisting events (``ba2_common.core.suspension_events``).
+
+    ``{}`` for any source but ``alpaca`` -- FMP carries OTC prices, so an FMP run is byte-identical to before -- and for an
+    Alpaca cache without ``_meta/suspensions.json``.  Every GA worker reads its OWN local cache copy (the same
+    ``run_daily_backtest`` runs in workers), so a worker gets the events its cache was built with; a malformed file raises."""
+    from ba2_common.core.suspension_events import SUSPENSIONS_FILE, load_suspension_events
+    from app.services.backtest.history_source import job_history_cache_dir
+
+    if resolve_job_history_source(config) != "alpaca":
+        return {}
+    cache_dir = job_history_cache_dir(config)
+    path = os.path.join(cache_dir, SUSPENSIONS_FILE)
+    st = os.stat(path) if os.path.isfile(path) else None
+    key = (path, None if st is None else (st.st_mtime_ns, st.st_size))
+    if key not in _SUSPENSION_EVENTS_MEMO:
+        _SUSPENSION_EVENTS_MEMO.clear()
+        _SUSPENSION_EVENTS_MEMO[key] = load_suspension_events(cache_dir)
+    return _SUSPENSION_EVENTS_MEMO[key]
+
+
 # Worker-process memo: the calendar is market-wide and identical for every GA individual of a
 # run, so building it once per (benchmark, window) instead of once per trial keeps it off the hot
 # path entirely. Keyed on the window because a grid may run several date ranges in one worker.
@@ -1019,6 +1044,7 @@ def run_daily_backtest(
             option_trade_records=(require_option_trade_records(config) if uses_options
                                   else True),
         )
+        account.set_suspension_events(_suspension_events_for(config))
         resolver.register_account(account_id, account)
 
         experts = _build_experts(config, resolver, account_id)

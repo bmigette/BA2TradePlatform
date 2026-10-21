@@ -53,6 +53,7 @@ import numpy as np
 from ba2_common.core.ohlcv_history import resolve_job_history_source
 from ba2_common.core.schedule_genes import schedule_refusal_message, schedule_weekday_enabled
 from ba2_common.core.utils import as_utc_key
+from ba2_common.core.suspension_events import is_suspended
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 from ba2_common.core.db import add_instance, get_instance
 from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
@@ -550,6 +551,8 @@ class DailyBacktestEngine:
         # set only changes per scan date (weekly cadence), so it's computed once per scan date and
         # reused for every bar in that period (vs recomputing the full-store filter every 5min bar).
         self._screened_cache: Dict[str, List[str]] = {}
+        # Symbols already reported as suspended-and-undecidable (one log line each; _bar_universes).
+        self._suspension_noted: set = set()
         # The live-simulation gate (daily panel), built once per run; None for the legacy weekly gate.
         self._screen_gate = None
         if self._screener_runtime and self._screener_runtime.get("criteria_version"):
@@ -1070,6 +1073,19 @@ class DailyBacktestEngine:
         """``(universe, entry_universe)`` for the bar: the decidable symbols, and that set intersected
         with the per-day dynamic screener gate (entries only; management is never gated)."""
         universe = resolve_universe(as_of_dt, self.config, self.price)
+        events = getattr(self.account, "_suspension_events", None)
+        if events:
+            # No (re-)entry while a symbol is suspended from its exchange (it has no bars anyway on a daily clock; an
+            # intraday clock can still see a price older than the suspension).  The resume session is NOT filtered.
+            session = as_of_dt.date()
+            blocked = {s for s in events if is_suspended(s, session, events)}      # events are far fewer than the universe
+            if blocked:
+                fresh = (blocked & set(universe)) - self._suspension_noted    # one line per symbol, not one per bar
+                if fresh:
+                    self._suspension_noted |= fresh
+                    logger.warning("[backtest] %s: not decidable (suspended from their exchange, no entry until they "
+                                   "resume): %s", as_of_dt, ", ".join(sorted(fresh)))
+                universe = [s for s in universe if s not in blocked]
         entry_universe = universe
         if self._screener_runtime:
             allowed = _screened_symbols_for_bar(
@@ -2058,6 +2074,15 @@ class DailyBacktestEngine:
         #     modelled — options resolve at expiry.
         if self._apply_option_expiry(as_of_dt):
             settled = True
+
+        # 4a-ter. Exchange suspension / delisting (Alpaca history cache only): a position in a symbol
+        #     suspended from its exchange is CLOSED at its last exchange close and its working orders
+        #     are cancelled (BacktestAccount.liquidate_suspended_positions).  Before the margin check so
+        #     that sees the book without the stale-marked position.  An account with no events (the FMP
+        #     source, any cache without _meta/suspensions.json) pays one truthiness check.
+        if getattr(self.account, "_suspension_events", None):
+            if self.account.liquidate_suspended_positions(as_of_dt):
+                settled = True
 
         # 4a-bis. Broker-style maintenance-margin check + forced liquidation. After marking
         #     this bar, if net-liquidating-value has fallen below the book's maintenance-margin

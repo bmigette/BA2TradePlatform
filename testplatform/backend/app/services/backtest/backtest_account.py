@@ -79,6 +79,7 @@ from ba2_common.core.option_trade_record import (
 )
 from ba2_common.core.market_calendar import backtest_decision_label, decision_data_session
 from ba2_common.core.utils import as_utc_key
+from ba2_common.core.suspension_events import is_suspended, symbols_to_liquidate
 from ba2_common.core.failure_modes import must_measure
 from ba2_common.core.option_bs import bs_price
 from ba2_common.core.option_payoff import PayoffLeg, position_value_bounds
@@ -670,6 +671,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                                 _osm.SOURCE_MODEL: 0}
         # symbol -> signed-position ledger.
         self._positions: Dict[str, _Position] = {}
+        # Exchange suspension / delisting events (set_suspension_events); {} = feature off (FMP source).
+        self._suspension_events: Dict[str, Any] = {}
         # The equity curve: one snapshot per simulated bar (engine appends via snapshot_equity).
         self._equity_snapshots: List[Dict[str, Any]] = []
         # Parallel ascending list of snapshot dates (snapshots are appended in clock order) so
@@ -2647,9 +2650,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             multiplier=lot.multiplier,
         )
 
-    def _liquidate_stock_position(self, pos: "_Position") -> bool:
-        """Close a stock position at the current close; book cash + realise P&L via the ledger."""
-        px = self._price.close_at(pos.symbol)
+    def _liquidate_stock_position(
+        self, pos: "_Position", price: Optional[float] = None, comment: str = "margin_call_liquidation",
+    ) -> bool:
+        """Close a stock position at the current close (or at ``price``); book cash + realise P&L via the ledger.
+
+        ``price``/``comment`` serve the exchange-suspension close (``liquidate_suspended_positions``): the
+        last exchange close, and the reason the round-trip row carries.  The margin-call caller passes neither."""
+        px = price
+        if px is None:
+            px = self._price.close_at(pos.symbol)
         if px is None:
             px = self._price.close_asof(pos.symbol)
         if px is None:
@@ -2663,12 +2673,65 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Persist a synthetic FILLED closing order (the option-lot path already records one via
         # _record_option_expiry_close) so the equity jump shows up as a trade in
         # get_round_trip_trades/reports instead of an unexplained cash move.
-        self._record_stock_liquidation_close(pos.symbol, closed_qty, was_long, float(px))
-        logger.warning(
-            "[backtest] margin_call_liquidation: closed STOCK %g x %s @ %.4f to satisfy "
-            "maintenance margin.", closed_qty, pos.symbol, float(px),
-        )
+        self._record_stock_liquidation_close(pos.symbol, closed_qty, was_long, float(px), comment=comment)
+        if comment == "margin_call_liquidation":
+            logger.warning(
+                "[backtest] margin_call_liquidation: closed STOCK %g x %s @ %.4f to satisfy "
+                "maintenance margin.", closed_qty, pos.symbol, float(px),
+            )
         return True
+
+    def set_suspension_events(self, events: Any) -> None:
+        """Install the run's exchange suspension / delisting events (``ba2_common.core.suspension_events``).  Empty (the
+        FMP source, or an Alpaca cache without the file) leaves every path exactly as it was."""
+        self._suspension_events = dict(events)
+
+    def liquidate_suspended_positions(self, as_of: datetime) -> bool:
+        """Close every held STOCK position whose symbol is suspended from its exchange on ``as_of``'s session, and cancel
+        every working order of such a symbol; True when the book changed.
+
+        The Alpaca feed has no bars while a symbol trades OTC (or after a delisting), so a position would be marked at its
+        stale last close for months and jump on relisting.  It is instead CLOSED at the last exchange close (``close_asof``:
+        no bar exists after ``last_session``, so that IS the last real close) on the first bar after the suspension starts,
+        comment ``suspension_liquidation`` (``delisting_liquidation`` when the symbol never comes back), synthetic fill, no
+        commission -- the same book-keeping as a margin-call stock close.  Working orders are cancelled so nothing waits on a
+        bar that never comes (a market entry would otherwise fill at the relisted open).  The rule is
+        ``suspension_events.symbols_to_liquidate`` / ``is_suspended`` (one pure function).  No events -> one truthiness check.
+
+        A held symbol with no close at all raises (a live number is never invented).  Option legs are keyed by contract
+        symbol and are not touched (options run on FMP only)."""
+        events = self._suspension_events
+        if not events:
+            return False
+        session = as_of.date()
+        changed = False
+        held = [p for p in self._positions.values() if p.qty != 0]
+        for sym in symbols_to_liquidate([p.symbol for p in held], session, events):
+            pos = self._positions[sym]
+            dated = self._price.close_asof_dated(sym)
+            if dated is None:
+                raise ValueError(f"[backtest] {sym} is suspended at {as_of} but has no last close to liquidate at")
+            px, bar_day = dated
+            last_session = max(last for last, _r in events[sym] if last < session)
+            if bar_day > last_session:
+                raise ValueError(f"[backtest] {sym} is suspended after {last_session} but the price source has a bar of {bar_day}: "
+                                 f"the suspension table does not match the cache it is run on (rebuild the cache)")
+            gone = any(last < session and resume is None for last, resume in events[sym])   # the event in effect never resumes
+            comment = "delisting_liquidation" if gone else "suspension_liquidation"
+            qty = pos.qty
+            self._liquidate_stock_position(pos, price=float(px), comment=comment)
+            logger.warning(
+                "[backtest] %s: closed STOCK %g x %s @ %.4f (last exchange close) -- suspended from its exchange on %s; "
+                "cash now $%.2f.", comment, qty, sym, float(px), session, self._cash)
+            changed = True
+        for o in list(self._active_orders()):
+            sym = o.symbol
+            if sym in events and is_suspended(sym, session, events):
+                self.cancel_order(o.id)
+                logger.warning("[backtest] suspension: cancelled working order %s (%s %g x %s) -- %s is suspended from its "
+                               "exchange on %s.", o.id, o.side, o.quantity, sym, sym, session)
+                changed = True
+        return changed
 
     def _record_stock_liquidation_close(
         self, symbol: str, qty: float, was_long: bool, px: float,
@@ -5137,6 +5200,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         EQUITY ROWS ONLY. Option rows read their recorded ``exit_record`` trigger instead: a
         close_option ticket is a limit order with no stop, so this guess labelled every option
         close -- stop-loss and DTE exits included -- ``take_profit``."""
+        if exit_order.comment in ("suspension_liquidation", "delisting_liquidation"):
+            return exit_order.comment                   # the exchange-suspension close names itself
         tp = exit_order.limit_price
         sl = exit_order.stop_price
         if tp is not None and sl is not None:
@@ -5229,6 +5294,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     # ======================================================================
     #: Class default so a double built with ``__new__`` (no ``__init__``) is the identity too.
     _split_basis = None
+    _suspension_events: Dict[str, Any] = {}
     #: Same, for ``records_option_trades``: a ``__new__`` double records fully, like a fixture.
     _option_trade_records = True
 

@@ -654,7 +654,7 @@ def repair_env(env, tmp_path, daily_high=20.0, daily_low=None, fmp_high=10.5, fm
     fmp = tmp_path / "fmp"
     fmp.mkdir(parents=True)
     if with_fmp:
-        rows = [{"Date": pd.Timestamp(d), "High": fmp_high * fmp_scale, "Low": fmp_low * fmp_scale, "Close": close * fmp_scale} for d in days]
+        rows = [{"Date": pd.Timestamp(d), "High": fmp_high * fmp_scale, "Low": fmp_low * fmp_scale, "Close": close * fmp_scale, "Volume": 1000} for d in days]
         pd.DataFrame(rows).to_parquet(fmp / "ABC_1d.parquet", index=False)
     s = bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, fmp_daily_dir=str(fmp))
     return pd.read_parquet(out / "ABC_1d.parquet").set_index("Date"), s
@@ -711,7 +711,7 @@ def test_a_high_explained_by_the_close_is_not_repaired(env, tmp_path):
     make_table(sub / "out")
     fmp = tmp_path / "fmp2"
     fmp.mkdir()
-    pd.DataFrame([{"Date": pd.Timestamp(x), "High": 10.5, "Low": 9.5, "Close": 12.0} for x in days]).to_parquet(fmp / "ABC_1d.parquet", index=False)
+    pd.DataFrame([{"Date": pd.Timestamp(x), "High": 10.5, "Low": 9.5, "Close": 12.0, "Volume": 1000} for x in days]).to_parquet(fmp / "ABC_1d.parquet", index=False)
     s = bld.build_cache(daily_store=str(sub / "daily"), intraday_store=str(sub / "intra"), out=str(sub / "out"), workers=1, fmp_daily_dir=str(fmp))
     assert s["bar_repairs"] == 0
 
@@ -752,7 +752,7 @@ def second_witness(env, tmp_path, yahoo, fmp_high, daily_high=20.0):
     make_table(out)
     fmp = tmp_path / "fmp"
     fmp.mkdir(parents=True)
-    rows = [{"Date": pd.Timestamp(d), "High": fmp_high if d == BAD_DAY else 10.5, "Low": 9.5, "Close": 10.0} for d in days]
+    rows = [{"Date": pd.Timestamp(d), "High": fmp_high if d == BAD_DAY else 10.5, "Low": 9.5, "Close": 10.0, "Volume": 1000} for d in days]
     pd.DataFrame(rows).to_parquet(fmp / "ABC_1d.parquet", index=False)
     s = bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, fmp_daily_dir=str(fmp), yahoo=yahoo)
     return pd.read_parquet(out / "ABC_1d.parquet").set_index("Date"), s
@@ -816,7 +816,7 @@ def test_yahoo_only_witness_with_no_fmp_bar_beyond_the_envelope_is_consolidated(
     make_table(out)
     fmp = tmp_path / "fmp"
     fmp.mkdir()
-    pd.DataFrame([{"Date": pd.Timestamp(d), "High": 10.5, "Low": 9.5, "Close": 10.0} for d in days if d != BAD_DAY]).to_parquet(fmp / "ABC_1d.parquet", index=False)
+    pd.DataFrame([{"Date": pd.Timestamp(d), "High": 10.5, "Low": 9.5, "Close": 10.0, "Volume": 1000} for d in days if d != BAD_DAY]).to_parquet(fmp / "ABC_1d.parquet", index=False)
     s = bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, fmp_daily_dir=str(fmp),
                         yahoo=yahoo_witness(tmp_path, high=20.0))
     assert s["consolidated_prints"] == 1 and s["unwitnessed_outliers"] == 0
@@ -964,3 +964,68 @@ def test_the_gate_certificate_reads_the_manifest_the_build_writes(env):
     ver.write_gate_certificate(meta, {"yahoo": {"status": ver.STATUS_FAIL}})
     with pytest.raises(ver.GateCertificateError, match="FAILED"):
         ver.read_gate_certificate(meta)
+
+
+# ---------------------------------------------------------------------------
+# exchange suspensions / delistings (_meta/suspensions.json)
+# ---------------------------------------------------------------------------
+def _susp_env(env, tmp_path, sym, drop, fmp_days="all", fmp_volume=500, end="2026-10-12"):
+    """One symbol with bars every session 2024-01-02..``end`` except the ``drop`` days; an FMP file over ``fmp_days`` (all sessions)."""
+    daily, intr, out = env
+    all_days = sessions("2024-01-02", end)
+    write_symbol(daily, intr, sym, [d for d in all_days if d not in set(drop)])
+    make_table(out)
+    fmp = tmp_path / "fmp"
+    fmp.mkdir(exist_ok=True)
+    if fmp_days is not None:
+        fd = all_days if fmp_days == "all" else fmp_days
+        pd.DataFrame({"Date": pd.to_datetime(fd), "Volume": [fmp_volume] * len(fd)}).to_parquet(fmp / f"{sym}_1d.parquet", index=False)
+    s = bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, fmp_daily_dir=str(fmp))
+    f = json.loads((out / "_meta" / "suspensions.json").read_text())
+    return f, s
+
+
+def test_an_otc_run_with_fmp_trading_is_a_suspension(env, tmp_path):
+    drop = sessions("2024-03-01", "2024-05-15")                         # 55 sessions with no Alpaca bar, FMP traded every day
+    f, s = _susp_env(env, tmp_path, "NESR", drop)
+    assert f["build"].startswith("RUN1 built ") and f["rule"]["min_sessions"] == 20
+    (last, resume, kind, missing, share), = f["symbols"]["NESR"]
+    assert (last, resume, kind, share) == ("2024-02-29", "2024-05-16", "otc_suspension", 1.0) and missing == len(drop) - 1     # Good Friday 03-29 is no session
+    m = json.loads((env[2] / "_meta" / "build_manifest.json").read_text())
+    assert m["suspension_events"] == 1 and s["suspension_events"] == 1 and s["symbols_with_suspensions"] == 1
+
+
+def test_a_gap_without_fmp_trading_or_fmp_file_is_not_a_suspension(env, tmp_path):
+    drop = sessions("2024-03-01", "2024-05-15")
+    f, _ = _susp_env(env, tmp_path, "THIN", drop, fmp_volume=0)         # FMP has rows but no volume: a normal no-trade gap
+    assert f["symbols"] == {}
+    f, _ = _susp_env(env, tmp_path, "THIN", drop, fmp_days=None)        # no FMP file at all
+    assert f["symbols"] == {}
+    f, _ = _susp_env(env, tmp_path, "THIN", drop, fmp_days=sessions("2024-01-02", "2024-03-20"))   # FMP does not cover the run
+    assert f["symbols"] == {}
+
+
+def test_a_short_gap_is_not_a_suspension(env, tmp_path):
+    f, _ = _susp_env(env, tmp_path, "SHORT", sessions("2024-03-01", "2024-03-26"))    # 18 sessions < 20
+    assert f["symbols"] == {}
+    f, _ = _susp_env(env, tmp_path, "SHORT", sessions("2024-03-01", "2024-03-28"))    # 20 sessions (Good Friday is 03-29)
+    assert [e[3] for e in f["symbols"]["SHORT"]] == [20]
+
+
+def test_a_symbol_whose_bars_stop_long_before_the_store_end_is_delisted(env, tmp_path):
+    f, _ = _susp_env(env, tmp_path, "GONE", sessions("2024-06-03", "2026-10-12"), fmp_days=None)
+    (last, resume, kind, missing, share), = f["symbols"]["GONE"]
+    assert (last, resume, kind, share) == ("2024-05-31", None, "delisted", None) and missing > 5
+    # a tail quiet for <= 5 sessions is inside the slack
+    f, _ = _susp_env(env, tmp_path, "QUIET", sessions("2026-10-06", "2026-10-12"), fmp_days=None)
+    assert "QUIET" not in f["symbols"]
+
+
+def test_subset_build_merges_suspensions_like_the_manifest(env, tmp_path):
+    drop = sessions("2024-03-01", "2024-05-15")
+    _susp_env(env, tmp_path, "AAA", drop)
+    daily, intr, out = env
+    write_symbol(daily, intr, "BBB", sessions("2024-01-02", "2026-10-12"))
+    bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, symbols=["BBB"], fmp_daily_dir=str(tmp_path / "fmp"))
+    f = json.loads((out / "_meta" / "suspensions.json").read_text())
+    assert sorted(f["symbols"]) == ["AAA"] and f["symbols"]["AAA"][0][2] == "otc_suspension"      # AAA kept, BBB has none

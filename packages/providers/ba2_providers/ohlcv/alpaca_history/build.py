@@ -59,6 +59,20 @@ PLACEHOLDER DAILY BARS.  A raw daily bar with v == 0 AND n == 0 is Alpaca's plac
   total in the run summary.  The 5-minute files are untouched.  Market conditions that need a continuous series carry the previous bar forward
   themselves (``--gap-fill previous``, prepare_history ``market-conditions``).
 
+EXCHANGE SUSPENSIONS / DELISTINGS (``<out>/_meta/suspensions.json``; read by the backtest engine through
+  ``ba2_common.core.suspension_events``).  Alpaca's feed carries exchange prints only: a symbol suspended from its exchange trades OTC and
+  has NO bars for the whole period while FMP (which carries OTC) shows trading; marked at its stale last close it then jumps on relisting
+  (NESR +257%, MDXG +98%, SMCI +73%).  Per symbol, on its final daily series (after the placeholder drop and the break): an
+  ``otc_suspension`` is a run of >= SUSPENSION_MIN_SESSIONS (20) NYSE regular sessions with no bar strictly between two real bars where the
+  FMP daily file (``fmp_daily_dir``) has a bar with Volume > 0 on >= SUSPENSION_MIN_FMP_SHARE (80 %) of those sessions and COVERS the
+  run (FMP's first date <= the run's first session, last date >= its last session).  No FMP file / not covering -> NOT a suspension (thin
+  names have hundreds of 10+ session gaps that are only no trades).  A ``delisted`` event is a symbol whose last real bar is more than
+  DELISTED_SLACK_SESSIONS (5) regular sessions before the store's last session (last session <= the split table's asof): the slack absorbs
+  a late final print and placeholder-dropped no-trade days at the tail (a name quiet for <= 5 sessions is not delisted); a longer quiet
+  tail is treated as gone, the conservative reading for a position (closed at the last real close, no re-entry).  Each event is
+  ``[last_session, resume_session | null, kind, missing_sessions, fmp_traded_share | null]``; the file also carries the build identity
+  (split table run_id + built_at, like the gate certificate) and the rule.  A subset run merges like the manifest (the events ride in
+  each symbol's manifest entry).  Counted in the manifest and the run summary.
 OUTPUT.  ``<out>/<SYM>_1d.parquet``, ``<out>/<SYM>_5min.parquet`` (atomic: temp file + os.replace) and
 ``<out>/_meta/build_manifest.json`` (the only thing this step writes under ``_meta``): the stores' asof, the split table's
 run_id / sha256 / inputs_sha256 / overrides_sha256, the input chunk hashes, per symbol the first/last date and bar count of
@@ -103,6 +117,11 @@ REPAIR_COLUMNS = ["symbol", "date", "field", "old", "new", "envelope", "fmp", "y
 CONSOLIDATED_COLUMNS = ["symbol", "date", "field", "daily", "envelope", "fmp", "yahoo", "rule", "witnesses", "run_id"]
 RULE_BOTH_AGREE = "fmp_and_yahoo_agree_with_daily"
 RULE_ALL_BEYOND = "all_witnesses_beyond_envelope"
+SUSPENSIONS_NAME = "suspensions.json"
+SUSPENSION_MIN_SESSIONS = 20     # a gap of at least this many regular sessions between two real bars ...
+SUSPENSION_MIN_FMP_SHARE = 0.80  # ... where FMP traded (Volume > 0) on at least this share of the missing sessions is an OTC suspension
+DELISTED_SLACK_SESSIONS = 5      # last bar more than this many sessions before the store's last session = delisted
+KIND_SUSPENSION, KIND_DELISTED = "otc_suspension", "delisted"
 RUN_ID_CSVS = ("split_review.csv", "split_accepted.csv", "split_vs_fmp.csv", "fmp_daily_inputs.csv", "yahoo_inputs.csv")
 
 
@@ -448,6 +467,47 @@ def file_names(symbol: str) -> Tuple[str, str]:
     return f"{s}_1d.parquet", f"{s}_5min.parquet"
 
 
+def _fmp_volume_frame(fmp_dir: Optional[str], symbol: str) -> Optional[pd.DataFrame]:
+    """The symbol's FMP daily (Date, Volume), read only when ``fmp_dir`` has the file (None otherwise: no suspension can be told)."""
+    fp = os.path.join(fmp_dir, f"{symbol}_1d.parquet") if fmp_dir else None
+    return pd.read_parquet(fp, columns=["Date", "Volume"]) if fp and os.path.isfile(fp) else None
+
+
+def detect_exchange_events(dates: Sequence[pd.Timestamp], fmp: Optional[pd.DataFrame], store_asof: str) -> List[List[Any]]:
+    """Suspension / delisting events of one symbol's final daily series (module docstring, EXCHANGE SUSPENSIONS / DELISTINGS).
+
+    ``dates``: the real bars' NY-naive session midnights, ascending; ``fmp``: the symbol's FMP daily frame (Date, Volume) or None.
+    Returns ``[[last_session, resume_session|None, kind, missing_sessions, fmp_traded_share|None], ...]`` (ISO dates).  The NYSE
+    calendar is asked only for gaps that can hold SUSPENSION_MIN_SESSIONS sessions (>= 28 calendar days between bars), so the
+    common symbol costs one numpy diff."""
+    from ba2_common.core.market_calendar import regular_session_dates
+    if not len(dates):
+        return []
+    days = pd.DatetimeIndex(dates).normalize()
+    events: List[List[Any]] = []
+    gaps = np.flatnonzero(np.diff(days.values.astype("datetime64[D]")).astype("int64") >= 28)
+    fmp_vol: Optional[pd.Series] = None
+    for i in gaps:
+        a, b = days[i], days[i + 1]
+        missing = regular_session_dates((a + pd.Timedelta(days=1)).date(), (b - pd.Timedelta(days=1)).date())
+        if len(missing) < SUSPENSION_MIN_SESSIONS or fmp is None or not len(fmp):
+            continue
+        if fmp_vol is None:
+            fmp_vol = pd.Series(fmp["Volume"].to_numpy(dtype="float64"), index=pd.DatetimeIndex(fmp["Date"]).normalize())
+            fmp_vol = fmp_vol[~fmp_vol.index.duplicated(keep="last")]
+        if not (fmp_vol.index.min() <= pd.Timestamp(missing[0]) and fmp_vol.index.max() >= pd.Timestamp(missing[-1])):
+            continue                                   # FMP does not cover the run: cannot tell a suspension from no trades
+        share = float((fmp_vol.reindex(pd.DatetimeIndex(missing)).fillna(0.0) > 0).mean())
+        if share >= SUSPENSION_MIN_FMP_SHARE:
+            events.append([str(a.date()), str(b.date()), KIND_SUSPENSION, len(missing), round(share, 4)])
+    last, asof_d = days[-1], pd.Timestamp(store_asof)
+    if last < asof_d:
+        tail = regular_session_dates((last + pd.Timedelta(days=1)).date(), asof_d.date())
+        if len(tail) > DELISTED_SLACK_SESSIONS:
+            events.append([str(last.date()), None, KIND_DELISTED, len(tail), None])
+    return events
+
+
 def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str, table: SplitTable,
                  fmp_dir: Optional[str] = None, bar_caps: Sequence[Mapping[str, Any]] = ()) -> Dict[str, Any]:
     """Build both files of one symbol; returns its manifest entry.  One symbol at a time: memory is one symbol's bars."""
@@ -528,6 +588,7 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     entry["repairs"] = []
     entry["unwitnessed"] = []
     entry["fmp_daily_sha256"] = None
+    entry["suspensions"] = []
     f1, f5 = file_names(symbol)
     entry["files"] = {}
     if len(daily):
@@ -559,6 +620,7 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
         atomic_write(os.path.join(out, f1), parquet_bytes(d_out))
         entry["1d"] = {"first": str(d_out["Date"].iloc[0].date()), "last": str(d_out["Date"].iloc[-1].date()), "bars": len(d_out)}
         entry["files"]["1d"] = f1
+        entry["suspensions"] = detect_exchange_events(d_out["Date"], _fmp_volume_frame(fmp_dir, symbol), table.asof)
     elif os.path.isfile(os.path.join(out, f1)):
         os.remove(os.path.join(out, f1))
         entry["removed_stale"] = entry.get("removed_stale", []) + [f1]
@@ -661,7 +723,7 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
         with open(mpath, encoding="utf-8") as f:
             old = json.load(f)
         if (old["split_table"]["run_id"] == table.run_id and old["split_table"]["sha256"] == table.sha256
-                and all("unwitnessed" in e and "consolidated_prints" in e and "dropped_placeholders" in e for e in old["symbols"].values())):
+                and all("unwitnessed" in e and "consolidated_prints" in e and "dropped_placeholders" in e and "suspensions" in e for e in old["symbols"].values())):
             entries = dict(old["symbols"])
     consolidated_rows: List[Dict[str, Any]] = []
     for sym, e in built.items():
@@ -687,6 +749,7 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
         "fmp_daily_dir": fmp_daily_dir,
         "repairs": sum(len(e["repairs"]) for e in entries.values()),
         "dropped_placeholders": sum(e["dropped_placeholders"] for e in entries.values()),
+        "suspension_events": sum(len(e["suspensions"]) for e in entries.values()),
         "overrides_path": overrides_path,
         "failed": failed,
         "skipped_no_bars": skipped,
@@ -696,6 +759,12 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
         "symbols": entries,
     }
     atomic_write(mpath, json.dumps(manifest, indent=1).encode("utf-8"))
+    susp = {sym: e["suspensions"] for sym, e in sorted(entries.items()) if e["suspensions"]}
+    atomic_write(os.path.join(out, "_meta", SUSPENSIONS_NAME), json.dumps({
+        "build": f"{table.run_id} built {manifest['built_at']}",
+        "rule": {"min_sessions": SUSPENSION_MIN_SESSIONS, "min_fmp_traded_share": SUSPENSION_MIN_FMP_SHARE,
+                 "delisted_slack_sessions": DELISTED_SLACK_SESSIONS, "store_asof": table.asof},
+        "symbols": susp}, indent=1).encode("utf-8"))
     rows = [{"symbol": sym, **r, "run_id": table.run_id} for sym, e in sorted(entries.items()) for r in e["repairs"]]
     atomic_write(os.path.join(out, "_meta", "bar_repairs.csv"), pd.DataFrame(rows, columns=REPAIR_COLUMNS).to_csv(index=False).encode("utf-8"))
     rows = [{"symbol": sym, **r, "run_id": table.run_id} for sym, e in sorted(entries.items()) for r in e["consolidated_prints"]]
@@ -710,6 +779,8 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
                "dropped_by_break": sum(sum(e["dropped_by_break"].values()) for e in built.values()),
                "dropped_placeholders": sum(e["dropped_placeholders"] for e in built.values()),
                "symbols_with_placeholders": sum(e["dropped_placeholders"] > 0 for e in built.values()),
+               "suspension_events": sum(len(e["suspensions"]) for e in built.values()),
+               "symbols_with_suspensions": sum(bool(e["suspensions"]) for e in built.values()),
                "unlisted_files": len(manifest["unlisted_files"]), "bar_repairs": manifest["repairs"],
                "consolidated_prints": sum(len(e["consolidated_prints"]) for e in built.values()),
                "unwitnessed_outliers": sum(len(e["unwitnessed"]) for e in built.values()), "elapsed_s": manifest["elapsed_s"], "manifest": mpath,
