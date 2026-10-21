@@ -282,12 +282,16 @@ def _write_alpaca(root, sym, df):
     return p
 
 
-def _write_build_manifest(root, events):
+def _write_build_manifest(root, events, certify=True, run_id="test-build"):
     """``events``: {symbol: [[iso date, factor], ...]} -- the splits the Alpaca build APPLIED."""
     meta = Path(root) / ALPACA_DIR / "_meta"
     meta.mkdir(parents=True, exist_ok=True)
     (meta / "build_manifest.json").write_text(json.dumps(
-        {"symbols": {s: {"events": {"splits": ev, "spinoffs": []}} for s, ev in events.items()}}), encoding="utf-8")
+        {"run_id": run_id, "symbols": {s: {"events": {"splits": ev, "spinoffs": []}} for s, ev in events.items()}}),
+        encoding="utf-8")
+    if certify:                          # the full gate's PASS certificate of this manifest (prepare_history --steps verify)
+        from ba2_providers.ohlcv.alpaca_history import verify as ver
+        ver.write_gate_certificate(str(meta), {"structural": {"status": ver.STATUS_PASS}})
 
 
 @pytest.fixture
@@ -389,6 +393,40 @@ def test_alpaca_preflight_catches_a_split_the_build_claims_but_the_series_does_n
     bbb = [s for s in json.loads(Path(out).read_text())["symbols"] if s["symbol"] == "BBB"][0]
     assert bbb["split_events"] == [["2024-03-15", 4.0]]
     assert bbb["split_checks"] and printed["inventory"]
+
+
+def test_alpaca_plan_needs_a_pass_gate_certificate_of_the_current_build(tool, monkeypatch, alpaca_root, universe_file,
+                                                                         tmp_path, capsys):
+    """The gate certifies the Alpaca cache's split basis: no certificate, a FAIL one, or one of another build -> refused."""
+    from ba2_providers.ohlcv.alpaca_history import verify as ver
+    monkeypatch.undo()
+    out = str(tmp_path / "plan.json")
+    meta = Path(alpaca_root) / ALPACA_DIR / "_meta"
+    (meta / ver.GATE_CERTIFICATE_NAME).unlink()
+    assert tool.main_raw(_vendor_plan_args(alpaca_root, universe_file, out, "alpaca")) == 1
+    assert "gate certificate" in json.dumps(json.loads(capsys.readouterr().out)["preflight_errors"])
+    ver.write_gate_certificate(str(meta), {"yahoo": {"status": ver.STATUS_FAIL}})
+    assert tool.main_raw(_vendor_plan_args(alpaca_root, universe_file, out, "alpaca")) == 1
+    assert "FAILED" in json.dumps(json.loads(capsys.readouterr().out)["preflight_errors"])
+    ver.write_gate_certificate(str(meta), {"yahoo": {"status": ver.STATUS_PASS}})
+    _write_build_manifest(alpaca_root, {s: [] for s in UNIVERSE}, certify=False, run_id="rebuilt")  # after the gate ran
+    assert tool.main_raw(_vendor_plan_args(alpaca_root, universe_file, out, "alpaca")) == 1
+    assert "re-run the gate" in json.dumps(json.loads(capsys.readouterr().out)["preflight_errors"])
+    _write_build_manifest(alpaca_root, {s: [] for s in UNIVERSE})
+    assert tool.main_raw(_vendor_plan_args(alpaca_root, universe_file, out, "alpaca")) == 0
+    assert json.loads(Path(out).read_text())["certification"]["gate"]["build_run_id"] == "test-build"
+
+
+def test_alpaca_split_checks_that_ask_for_a_refetch_are_informational_once_the_gate_passed(
+        tool, monkeypatch, alpaca_root, universe_file, tmp_path, capsys):
+    """A small applied factor (a 1.01 stock dividend) is ``undetectable`` from prices: on FMP that asks for a re-fetch,
+    on the gate-certified Alpaca cache it is recorded and does not block (SCCO, ITUB 2026-10-21)."""
+    monkeypatch.undo()
+    _write_build_manifest(alpaca_root, {"AAA": [], "BBB": [["2024-03-15", 1.01]], "CCC": []})
+    out = str(tmp_path / "plan.json")
+    assert tool.main_raw(_vendor_plan_args(alpaca_root, universe_file, out, "alpaca")) == 0
+    bbb = [s for s in json.loads(Path(out).read_text())["symbols"] if s["symbol"] == "BBB"][0]
+    assert [c["verdict"] for c in bbb["split_checks"]] == ["undetectable"] and bbb["refetch_required"] is False
 
 
 def test_the_two_sources_never_collide_in_the_feature_store(tool, monkeypatch, alpaca_root, universe_file, tmp_path,

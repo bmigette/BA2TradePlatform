@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from ba2_common.core.market_condition_source import SOURCE_PROFILE_ALPACA_DAILY, provider_dir_for_source_profile
 from ba2_common.core.split_basis import CalendarSplit
@@ -50,6 +50,18 @@ class AlpacaHistoryWarmupSource:
                 sym.upper(): [CalendarSplit(date.fromisoformat(d), float(r)) for d, r in entry["events"]["splits"]]
                 for sym, entry in symbols.items()}
         return self._events
+
+    def basis_certificate(self) -> Dict[str, Any]:
+        """The PASS gate certificate of the current build (``_meta/gate_certificate.json``), else WarmupConfigError.  The gate
+        (residual jumps with the FMP / Yahoo tie-break, vendor ratio, Yahoo runs) is what certifies this cache's split basis;
+        the warmup's price-only split check stays informational on this source (its ``drift`` / ``undetectable`` verdicts ask
+        for a re-fetch, which this cache never does)."""
+        from ba2_providers.market_conditions.warmup import WarmupConfigError
+        from ba2_providers.ohlcv.alpaca_history.verify import GateCertificateError, read_gate_certificate
+        try:
+            return read_gate_certificate(os.path.dirname(self.manifest_path))
+        except GateCertificateError as e:
+            raise WarmupConfigError(str(e)) from e
 
     def split_calendar(self, symbol: str) -> List[CalendarSplit]:
         events = self._load()

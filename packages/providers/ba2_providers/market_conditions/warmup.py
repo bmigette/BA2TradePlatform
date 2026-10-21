@@ -27,6 +27,13 @@ PHASES
      cannot be READ is a preflight error for that symbol: without it nothing can tell an appended
      mixed basis from a clean one, so the symbol is refused rather than warmed on an unproven
      basis.
+   * a source with ``basis_certificate()`` (the Alpaca history cache) is certified by its own gate instead: the
+     certificate must be a PASS for the current build (else a preflight error, nothing is built); the split checks
+     still run and are recorded per symbol, and only an UN-ABSORBED split (``drift`` on the ``unadjusted`` basis: the
+     build claims it, the full raw jump is still there) sets ``refetch_required``; ``undetectable``, ``mixed_basis`` and
+     the ``mixed`` drift are informational there (they ask for a re-fetch, which that cache never does; 54 of the 753
+     stage-2 names on 2026-10-21, every one on FMP's basis across the date; the gate's residual-jump / vendor-ratio /
+     Yahoo checks are what proved its basis).  The certificate is kept in ``certification["gate"]``.
 
 EXCLUSIONS ARE NEVER SILENT. A symbol that ends up unusable (no split calendar, a basis still
 unverifiable after a full re-fetch, no source data at all) blocks the publication: ``build``
@@ -73,6 +80,7 @@ from ba2_common.core.market_calendar import NY_TZ, nyse_regular_sessions, prior_
     regular_session_close_utc, regular_sessions_ending_at
 from ba2_common.core.market_condition_context import TIMING_POLICY_PRIOR_SESSION_V1
 from ba2_common.core.market_condition_source import (
+    BASIS_UNADJUSTED,
     SOURCE_PROFILE_BY_HISTORY,
     SOURCE_PROFILE_FMP_DAILY,
     GapFillResult,
@@ -104,6 +112,7 @@ from ba2_common.core.market_conditions import (
 from ba2_common.core.market_conditions_batch import BATCH_BY_PROFILE
 from ba2_common.core.split_basis import (
     REFETCH_VERDICTS,
+    VERDICT_DRIFT,
     CalendarSplit,
     SplitBasisCheck,
     check_split_basis,
@@ -254,6 +263,11 @@ class SymbolInventory:
             items.append({"symbol": self.symbol, "kind": "refetch_required",
                           "splits": [c for c in self.split_checks if c["verdict"] in REFETCH_VERDICTS]})
         return items
+
+
+def _blocks_gate_certified(check) -> bool:
+    """On a gate-certified source: only a split the build claims but the series does not absorb blocks (module docstring)."""
+    return check.verdict == VERDICT_DRIFT and check.basis == BASIS_UNADJUSTED
 
 
 @dataclass
@@ -752,6 +766,13 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     if not cert.consistent:
         bad = [f"{s.symbol} {s.split_date}: {s.basis} ({s.reason})" for s in cert.symbols if not s.consistent]
         preflight.append(f"source certification failed for {source_profile}: {bad}")
+    gate_certified = hasattr(source, "basis_certificate")
+    if gate_certified:
+        try:
+            cert_dict["gate"] = source.basis_certificate()
+        except WarmupConfigError as e:     # no PASS certificate for this build: refused, never warmed on an unproven basis
+            cert_dict["gate"] = None
+            preflight.append(f"gate certificate: {e}")
 
     store = MarketConditionStore(cache_root)
     index = _ManifestIndex(store, profile, symbols, source_profile)
@@ -775,7 +796,8 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
             inv.split_events = [[e.date.isoformat(), float(e.ratio)] for e in events]
             checks = _split_checks_for(snap, events, sym)
             inv.split_checks = [c.to_dict() for c in checks]
-            inv.refetch_required = any(c.verdict in REFETCH_VERDICTS for c in checks)
+            inv.refetch_required = any(_blocks_gate_certified(c) if gate_certified else c.verdict in REFETCH_VERDICTS
+                                       for c in checks)
         except Exception as e:  # noqa: BLE001 -- a preflight error for this symbol, never a note
             inv.split_calendar_error = f"{type(e).__name__}: {e}"
             preflight.append(inv.split_calendar_preflight_message())

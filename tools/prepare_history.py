@@ -394,6 +394,9 @@ def step_verify(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, 
             print(f"       {r['csv']}")
     failed = ver.gate_failed(results)
     out = {"checks": {k: {"status": v["status"], "summary": v["summary"], "csv": v["csv"]} for k, v in results.items()}, "failed": failed}
+    if a.source == "alpaca" and symbols is None:    # the full gate signs the build manifest; the market-conditions plan requires it
+        out["certificate"] = ver.write_gate_certificate(os.path.join(a.out, "_meta"), results)
+        log(f"gate certificate: {out['certificate']['status']} for build {out['certificate']['build_run_id']}")
     if failed:
         raise RuntimeError("verify FAILED: " + ", ".join(failed))
     return out

@@ -899,3 +899,52 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
 
 def gate_failed(results: Dict[str, Dict[str, Any]]) -> List[str]:
     return [k for k, v in results.items() if v["status"] == STATUS_FAIL]
+
+
+GATE_CERTIFICATE_NAME = "gate_certificate.json"
+BUILD_MANIFEST_NAME = "build_manifest.json"
+
+
+class GateCertificateError(RuntimeError):
+    """The Alpaca cache has no PASS gate certificate for its current build manifest."""
+
+
+def _sha256_file(path: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write_gate_certificate(meta_dir: str, results: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """``<meta>/gate_certificate.json``: the FULL gate's verdict on the build manifest it read (its sha256 and run_id).  Written
+    on PASS and on FAIL (a FAIL replaces an older PASS); only a full-cache gate writes it (a ``--symbols`` subset never does)."""
+    from ba2_providers.ohlcv.alpaca_history.split_build import atomic_write
+    manifest = os.path.join(meta_dir, BUILD_MANIFEST_NAME)
+    with open(manifest, encoding="utf-8") as f:
+        run_id = json.load(f)["run_id"]
+    failed = gate_failed(results)
+    cert = {"status": STATUS_FAIL if failed else STATUS_PASS, "failed": failed,
+            "build_run_id": run_id, "build_manifest_sha256": _sha256_file(manifest),
+            "checks": {k: v["status"] for k, v in results.items()},
+            "verified_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    atomic_write(os.path.join(meta_dir, GATE_CERTIFICATE_NAME), json.dumps(cert, indent=1).encode("utf-8"))
+    return cert
+
+
+def read_gate_certificate(meta_dir: str) -> Dict[str, Any]:
+    """The PASS certificate of the CURRENT build manifest, or GateCertificateError: none, FAIL, or for another build (the
+    manifest changed since the gate ran)."""
+    path, manifest = os.path.join(meta_dir, GATE_CERTIFICATE_NAME), os.path.join(meta_dir, BUILD_MANIFEST_NAME)
+    if not os.path.isfile(path):
+        raise GateCertificateError(f"{path} not found: run `python tools/prepare_history.py --source alpaca --steps verify` "
+                                   f"(the full gate) on this build")
+    with open(path, encoding="utf-8") as f:
+        cert = json.load(f)
+    if cert["status"] != STATUS_PASS:
+        raise GateCertificateError(f"the gate FAILED on this build ({', '.join(cert['failed'])}): {path}")
+    if not os.path.isfile(manifest) or _sha256_file(manifest) != cert["build_manifest_sha256"]:
+        raise GateCertificateError(f"{path} certifies build {cert['build_run_id']}, not the current {manifest}: re-run the gate")
+    return cert

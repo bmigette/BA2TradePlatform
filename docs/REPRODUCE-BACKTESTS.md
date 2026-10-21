@@ -239,7 +239,7 @@ python tools/prepare_history.py --source alpaca --steps market-conditions --univ
 | 1 | `download` | `tools/alpaca_history_download.py` with the recorded arguments: RAW (unadjusted) SIP bars + market-wide corporate actions, resumable chunk by chunk | -> `~/Documents/ba2/alpaca_store` (1Day + 5Min from 2019-01-01, 7,048 symbols) and `~/Documents/ba2/alpaca_store_daily2016` (1Day + corporate actions from 2016-01-01, 11,621 symbols); both `asof 2026-10-12`, `--end 2026-10-13`, `--max-gap-days 5`, dev account-1 market-data keys |
 | 2 | `split-table` | Judges every split listed by Alpaca or FMP (FMP splits calendar, cached) against prices; rule set in `ba2_providers/ohlcv/alpaca_history/split_table.py` | -> `<cache>/AlpacaHistoryOHLCVProvider/_meta/split_table.json`, `split_accepted.csv`, `split_review.csv`, `split_vs_fmp.csv` |
 | 3 | `build` | Applies the table (prices / factor, volume x factor), New York-naive dates, 5-min regular session only, same files and columns as the FMP cache. **Drops Alpaca's placeholder daily bars** (`v == 0` and `n == 0`: a flat no-trade day; no backfill, counted per symbol as `dropped_placeholders` in the manifest and in the run summary; the split-table step drops them too). Repairs bad daily High/Low prints against the 5-min envelope (`_meta/bar_repairs.csv`, witness `fmp`, `yahoo` or `override`; unsettled prints that every available witness also carries beyond the envelope are `_meta/consolidated_prints.csv`) | -> `<cache>/AlpacaHistoryOHLCVProvider/<SYM>_1d.parquet`, `<SYM>_5min.parquet`, `_meta/build_manifest.json` |
-| 4 | `verify` | Data-quality gate: structure, coverage, 5-min last close vs daily close, residual jumps, High/Low envelope, Yahoo, `intraday_outage` (liquid names' regular 5-min bars vs FMP's per session), comparison with the FMP cache; known vendor-event days and the screener's excluded symbols (below) | -> `<report>/verify/*.csv`, exit 1 on any FAIL |
+| 4 | `verify` | Data-quality gate: structure, coverage, 5-min last close vs daily close, residual jumps, High/Low envelope, Yahoo, `intraday_outage` (liquid names' regular 5-min bars vs FMP's per session), comparison with the FMP cache; known vendor-event days and the screener's excluded symbols (below) | -> `<report>/verify/*.csv`, exit 1 on any FAIL; a full run (no `--symbols`) writes `<cache>/AlpacaHistoryOHLCVProvider/_meta/gate_certificate.json` (PASS/FAIL + build manifest sha256), which the `market-conditions` step requires |
 | 5 | `market-conditions` | `warm_market_conditions.py plan -> build --cache-only -> verify -> prepare-host` for `ohlcv-v1` and `ta-structure-v1` on this source's cache (§4.3); refused without `--universe-file --start --end`; exit 1 if any profile fails | -> `<cache>/market_conditions/` manifests; digests per profile in the JSON report |
 
 Rules to know:
@@ -346,8 +346,13 @@ never picked silently). It selects the manifest's source profile and the price f
 (profile `alpaca-daily-split-verified-v1`). `build` refuses a plan of the other source, `verify` and `prepare-host`
 refuse a digest of the other source, and a job pinned to a manifest of another source profile refuses to start.
 For `alpaca`, `build --fetch-missing` is refused (that cache is built only by `tools/prepare_history.py`) and `plan`
-runs the same split-basis preflight against the splits the Alpaca build applied (`_meta/build_manifest.json`): a
-split it lists that the stored series did not absorb makes the plan actionable (exit 1).
+requires the gate's PASS certificate of the current build (`_meta/gate_certificate.json`, written by the full
+`verify` step with the build manifest's sha256; none, a FAIL, or a manifest rebuilt since -> exit 1). The gate is what
+certifies this cache's split basis. `plan` still runs the split-basis check against the splits the build applied
+(`_meta/build_manifest.json`) and records it per symbol, but only a split the build lists that the stored series did
+not absorb (`drift` on the `unadjusted` basis) makes the plan actionable; `undetectable` (factors below x1.5, stock
+dividends), `mixed_basis` and `mixed` drift ask for a re-fetch, which this cache never does, so they are informational
+(54 of the 753 stage-2 names on 2026-10-21, every one on FMP's basis across the date).
 
 For `--source alpaca` the step plans with `--gap-fill previous` (the `fmp` path keeps its default, no fill): the
 build drops Alpaca's placeholder daily bars, so thin names have real gaps in their series, and the previous valid bar
