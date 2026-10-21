@@ -63,7 +63,8 @@ def test_clean_cache_passes_every_check(clean, tmp_path):
     put(other, "AAA", daily(DAYS, 10.0))
     res = gate(clean, tmp_path, other=str(other), panel=["AAA"])
     assert status(res) == {"structural": "PASS", "coverage": "PASS", "selfcons": "PASS", "residual_jumps": "PASS", "vendor_ratio": "INFO",
-                           "readiness": "INFO", "yahoo": "INFO", "hl_envelope": "INFO"}
+                           "readiness": "INFO", "yahoo": "INFO", "hl_envelope": "INFO", "intraday_outage": "INFO",
+                           "excluded": "INFO"}
     assert res["coverage"]["summary"]["panel_coverage"] == 1.0 and ver.gate_failed(res) == []
     for name in ("structural", "coverage_symbol_year", "coverage_by_year", "selfcons", "residual_jumps", "vendor_ratio_steps", "readiness"):
         assert (tmp_path / "verify" / f"{name}.csv").is_file()
@@ -356,7 +357,7 @@ def test_yahoo_spinoff_convention_run_is_expected_not_a_failure(tmp_path):
     theirs = [10.0] * len(DAYS)                                              # Yahoo did not
     y = _yahoo_gate(tmp_path, ours, theirs, spinoffs={"AAA": [(str(DAYS[cut].date()), 1.25)]})
     assert y["status"] == "PASS" and y["summary"]["runs_by_class"] == {"spinoff_convention": 1, "series_break": 0, "convention": 0, "yahoo_missing_event": 0,
-                                                              "successor_later_event": 0, "unexplained": 0}
+                                                              "successor_later_event": 0, "known_vendor_event": 0, "unexplained": 0}
     runs = pd.read_csv(tmp_path / "verify" / "yahoo_mismatch_runs.csv")
     assert runs["classification"].tolist() == ["spinoff_convention"] and runs["days"].iloc[0] == cut
     # the same mismatch with a factor we did not apply is unexplained and fails
@@ -614,3 +615,143 @@ def test_hl_envelope_lists_a_consolidated_print_and_does_not_block(tmp_path):
     ver._CONSOLIDATED.clear()
     r = gate(cache, tmp_path / "b", panel=["AAA"])["hl_envelope"]
     assert r["status"] == "PASS" and r["summary"]["by_class_panel"] == {"consolidated_print": 1}
+
+
+# ---------------------------------------------------------------------------
+# known vendor-event days (non-blocking, listed)
+# ---------------------------------------------------------------------------
+def _known(monkeypatch, *idx, reason="test event"):
+    monkeypatch.setattr(ver, "KNOWN_VENDOR_EVENT_DAYS", {str(DAYS[i].date()): reason for i in idx})
+
+
+def test_the_shipped_known_vendor_event_days_are_the_owner_list():
+    k = ver.KNOWN_VENDOR_EVENT_DAYS
+    assert sorted(k) == ["2019-08-12", "2020-03-09", "2020-03-12", "2020-03-16", "2020-03-18", "2021-04-19", "2021-10-25", "2022-01-24",
+                         "2022-03-08", "2023-01-24"]
+    assert "SUPV" in k["2019-08-12"] and "circuit-breaker" in k["2020-03-16"] and "~60%" in k["2022-03-08"] and "auction" in k["2023-01-24"]
+
+
+def test_hl_envelope_row_on_a_known_day_is_a_known_vendor_event_and_not_blocking(tmp_path, monkeypatch):
+    _known(monkeypatch, 20)                                      # _hl puts its outlier on DAYS[20]
+    r, df = _hl(tmp_path, high=12.0)
+    assert r["status"] == "PASS" and df["class"].tolist() == ["known_vendor_event"] and r["summary"]["known_vendor_event"] == 1
+    k = pd.read_csv(tmp_path / "verify" / "known_vendor_events.csv", keep_default_na=False)
+    assert list(k.columns) == ver.KNOWN_EVENT_COLUMNS and k["check"].tolist() == ["hl_envelope"] and k["reason"].tolist() == ["test event"]
+    assert k["date"].tolist() == [str(DAYS[20].date())] and "daily=12" in k["numbers"].iloc[0]
+
+
+def test_hl_envelope_on_any_other_day_still_blocks(tmp_path, monkeypatch):
+    _known(monkeypatch, 5)
+    r, df = _hl(tmp_path, high=12.0)
+    assert r["status"] == "FAIL" and df["class"].tolist() == ["outlier_gt5"]
+
+
+@pytest.mark.parametrize("known_idx", [30, 29])                    # the jump date D = DAYS[30], prev_date = DAYS[29]
+def test_residual_step_on_a_known_date_or_prev_date_is_a_known_vendor_event(tmp_path, monkeypatch, known_idx):
+    _known(monkeypatch, known_idx)
+    cache, other = tmp_path / "c", tmp_path / "o"
+    put(cache, "AAA", daily(DAYS, jump_series()), five(DAYS, 10.0))
+    put(other, "AAA", daily(DAYS, [4.0] * len(DAYS)))
+    res = gate(cache, tmp_path, other=str(other), panel=["AAA"])
+    jp = pd.read_csv(tmp_path / "verify" / "residual_jumps.csv", keep_default_na=False)
+    assert jp["class"].tolist() == ["step"] and jp["resolution"].tolist() == ["known_vendor_event"]
+    assert res["residual_jumps"]["status"] == "PASS" and res["residual_jumps"]["summary"]["known_vendor_event"] == 1
+    k = pd.read_csv(tmp_path / "verify" / "known_vendor_events.csv", keep_default_na=False)
+    assert k["check"].tolist() == ["residual_jumps"] and "overnight_ratio=0.4" in k["numbers"].iloc[0]
+
+
+def test_residual_step_on_an_unknown_date_still_fails_with_a_known_list_present(tmp_path, monkeypatch):
+    _known(monkeypatch, 5)
+    cache, other = tmp_path / "c", tmp_path / "o"
+    put(cache, "AAA", daily(DAYS, jump_series()), five(DAYS, 10.0))
+    put(other, "AAA", daily(DAYS, [4.0] * len(DAYS)))
+    assert gate(cache, tmp_path, other=str(other), panel=["AAA"])["residual_jumps"]["status"] == "FAIL"
+
+
+def test_yahoo_mismatch_run_made_only_of_known_days_is_a_known_vendor_event(tmp_path, monkeypatch):
+    theirs = [10.0] * len(DAYS)
+    ours = list(theirs)
+    for i in (10, 11, 12):
+        ours[i] = 11.0                                           # 10 % off on three consecutive days
+    base = _yahoo_gate(tmp_path / "base", ours, theirs)
+    assert base["summary"]["runs_by_class"]["unexplained"] == 1 and base["status"] == "FAIL"
+    _known(monkeypatch, 10, 11, 12)
+    y = _yahoo_gate(tmp_path / "known", ours, theirs)
+    assert y["summary"]["runs_by_class"]["known_vendor_event"] == 1 and y["status"] == "PASS"
+    k = pd.read_csv(tmp_path / "known" / "verify" / "known_vendor_events.csv", keep_default_na=False)
+    assert k["check"].tolist() == ["yahoo"] and k["date"].tolist() == [str(DAYS[10].date())]
+    _known(monkeypatch, 10, 11)                                   # a run that is only PARTLY known stays unexplained
+    assert _yahoo_gate(tmp_path / "part", ours, theirs)["summary"]["runs_by_class"]["unexplained"] == 1
+
+
+# ---------------------------------------------------------------------------
+# intraday_outage
+# ---------------------------------------------------------------------------
+def _outage_caches(tmp_path, n_symbols=63, n_out=63, bad_day=40, other_bars_ok=True):
+    cache, other = tmp_path / "c", tmp_path / "o"
+    d5 = five(DAYS, 10.0)
+    minute = d5["Date"].dt.hour * 60 + d5["Date"].dt.minute
+    thin = d5[(d5["Date"].dt.normalize() != DAYS[bad_day]) | (minute < 9 * 60 + 80)]            # ~10 bars left that day
+    full_other = d5 if other_bars_ok else d5[d5["Date"].dt.normalize() != DAYS[bad_day]]
+    syms = [f"S{i:02d}" for i in range(n_symbols)]
+    for i, sym in enumerate(syms):
+        d1 = daily(DAYS, 10.0)
+        d1["Volume"] = np.int64(1000 * (i + 1))                  # S62 is the most liquid: the high tercile is the last 21
+        put(cache, sym, d1, thin if i >= n_symbols - n_out else d5)
+        put(other, sym, daily(DAYS, 10.0), full_other)
+    return cache, other, syms
+
+
+def test_intraday_outage_day_not_in_the_known_list_fails(tmp_path):
+    cache, other, syms = _outage_caches(tmp_path)
+    res = gate(cache, tmp_path, other=str(other), panel=syms)
+    o = res["intraday_outage"]
+    assert o["status"] == "FAIL" and [r["date"] for r in o["summary"]["blocking_days"]] == [str(DAYS[40].date())]
+    df = pd.read_csv(tmp_path / "verify" / "intraday_outage.csv", keep_default_na=False)
+    assert set(df["class"]) == {"outage"} and set(df["date"]) == {str(DAYS[40].date())} and len(df) == 21     # liquid tercile only
+    assert df["ours"].max() < 0.5 * df["other"].min() and df["other"].iloc[0] == 78
+    assert "intraday_outage" in ver.gate_failed(res)
+
+
+def test_intraday_outage_on_a_known_day_is_a_known_vendor_event(tmp_path, monkeypatch):
+    _known(monkeypatch, 40)
+    cache, other, syms = _outage_caches(tmp_path)
+    o = gate(cache, tmp_path, other=str(other), panel=syms)["intraday_outage"]
+    assert o["status"] == "PASS" and o["summary"]["known_vendor_event_days"] == 1 and o["summary"]["blocking_days"] == []
+    k = pd.read_csv(tmp_path / "verify" / "known_vendor_events.csv", keep_default_na=False)
+    assert k["check"].tolist() == ["intraday_outage"] and k["numbers"].tolist() == ["outage_symbols=21"]
+
+
+def test_a_few_thin_symbols_are_rows_but_not_an_outage_day(tmp_path):
+    cache, other, syms = _outage_caches(tmp_path, n_out=5)
+    o = gate(cache, tmp_path, other=str(other), panel=syms)["intraday_outage"]
+    assert o["status"] == "PASS" and o["summary"]["outage_days"] == 0 and o["summary"]["symbol_days"] == 5
+    assert set(pd.read_csv(tmp_path / "verify" / "intraday_outage.csv")["class"]) == {"symbol_day"}
+
+
+def test_no_outage_when_the_other_cache_has_fewer_than_60_bars_or_none(tmp_path):
+    cache, other, syms = _outage_caches(tmp_path, other_bars_ok=False)        # the other cache has no bars that day either
+    assert gate(cache, tmp_path, other=str(other), panel=syms)["intraday_outage"]["status"] == "PASS"
+    assert ver.outage_rows("X", five(DAYS[:1], 10.0).head(10), five(DAYS[:1], 10.0).head(50), (2024,)) == []      # FMP has 50 < 60 bars
+
+
+# ---------------------------------------------------------------------------
+# universe exclusions
+# ---------------------------------------------------------------------------
+def test_excluded_symbols_are_never_panel_symbols_and_are_listed(tmp_path):
+    import shutil
+    r_in, _ = _hl(tmp_path / "in", high=12.0)
+    assert r_in["status"] == "FAIL"
+    cache = tmp_path / "ex" / "c"
+    (tmp_path / "ex").mkdir()
+    shutil.copytree(tmp_path / "in" / "c", cache)            # same cache, but AAA is in the panel file AND in the exclusion list
+    res = ver.run_gate(str(cache), out_dir=str(tmp_path / "ex" / "verify"), years=(2024,), workers=1, panel=["AAA"], excluded={"AAA": "spliced ticker"})
+    assert res["hl_envelope"]["status"] == "PASS" and res["hl_envelope"]["summary"]["blocking"] == 0
+    assert res["excluded"]["summary"]["skipped_symbols"] == ["AAA"] and res["excluded"]["summary"]["reasons"] == {"AAA": "spliced ticker"}
+    res = ver.run_gate(str(cache), out_dir=str(tmp_path / "ex" / "verify2"), years=(2024,), workers=1, excluded={"aaa": "x"})      # no panel file at all
+    assert res["hl_envelope"]["status"] == "PASS" and res["excluded"]["summary"]["skipped_symbols"] == ["AAA"]
+
+
+def test_the_pipeline_reads_the_screener_exclusion_list():
+    from ba2_providers.screener.live_sim_build import load_exclusions
+    assert {"IAC", "ADEA", "IPEXR"} <= set(load_exclusions())

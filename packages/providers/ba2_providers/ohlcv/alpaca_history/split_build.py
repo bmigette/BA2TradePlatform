@@ -140,8 +140,21 @@ def make_fmp_getter(key: str, getter: Optional[Callable] = None) -> Callable[[da
     return get
 
 
-def load_store_bars(store: str, symbols: Optional[List[str]]) -> Tuple[Dict[str, pd.DataFrame], str]:
-    """symbol -> frame(t, o, c) and a sha256 over every bar file's bytes (symbol-ordered)."""
+def drop_placeholder_bars(df: pd.DataFrame, what: str = "daily") -> Tuple[pd.DataFrame, int]:
+    """(frame without Alpaca's PLACEHOLDER daily bars, how many were dropped).  A raw daily bar with ``v == 0`` AND ``n == 0`` is Alpaca's
+    placeholder for a no-trade day (a flat price carried over): it is not a session the market traded, so the build and the split table
+    both drop it (no backfill from another vendor); an overnight jump across a dropped run is then measured between the real bars on
+    either side.  The columns ``v`` and ``n`` are required: a store without them STOPS rather than keep placeholders unnoticed."""
+    missing = [c for c in ("v", "n") if c not in df.columns]
+    if missing:
+        raise SplitTableBuildError(f"{what}: columns {missing} missing: cannot tell Alpaca's no-trade placeholder bars (v == 0 and n == 0) apart")
+    ph = ((df["v"] == 0) & (df["n"] == 0)).to_numpy()
+    return (df[~ph].reset_index(drop=True) if ph.any() else df), int(ph.sum())
+
+
+def load_store_bars(store: str, symbols: Optional[List[str]], stats: Optional[Counter] = None) -> Tuple[Dict[str, pd.DataFrame], str]:
+    """symbol -> frame(t, o, c) WITHOUT the placeholder daily bars (counted in ``stats["placeholder_bars_dropped"]``) and a sha256 over
+    every bar file's bytes (symbol-ordered)."""
     root = os.path.join(store, "bars", "1Day")
     names = sorted(d[len("symbol="):] for d in os.listdir(root)
                    if d.startswith("symbol=") and os.path.isfile(os.path.join(root, d, "all.parquet")))
@@ -154,8 +167,11 @@ def load_store_bars(store: str, symbols: Optional[List[str]]) -> Tuple[Dict[str,
     def read(sym: str) -> Tuple[str, pd.DataFrame, str]:
         with open(os.path.join(root, f"symbol={sym}", "all.parquet"), "rb") as f:
             raw = f.read()
-        df = pd.read_parquet(io.BytesIO(raw), columns=["t", "o", "c"])
-        return sym, df, hashlib.sha256(raw).hexdigest()
+        df, k = drop_placeholder_bars(pd.read_parquet(io.BytesIO(raw), columns=["t", "o", "c", "v", "n"]), f"{sym} daily")
+        if stats is not None and k:
+            stats["placeholder_bars_dropped"] += k
+            stats["placeholder_symbols"] += 1
+        return sym, df[["t", "o", "c"]], hashlib.sha256(raw).hexdigest()
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         res = list(ex.map(read, names))
@@ -363,7 +379,7 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     months = read_corporate_actions(store)
     renames = build_rename_map(months)
     bars_dir = os.path.join(store, "bars", "1Day")
-    bars, bars_sha = load_store_bars(store, symbols)
+    bars, bars_sha = load_store_bars(store, symbols, stats)
     ranges: Dict[str, Tuple[date, date]] = {}
     for sym, frame in bars.items():
         t = pd.to_datetime(frame["t"])
@@ -401,7 +417,9 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     def spinco_frame(sym: str) -> Optional[pd.DataFrame]:
         """ANY symbol whose bars exist in the store's bars dir (not only those judged / in symbols.txt)"""
         path = os.path.join(bars_dir, f"symbol={sym}", "all.parquet")
-        return pd.read_parquet(path, columns=["t", "o", "c"]) if os.path.isfile(path) else None
+        if not os.path.isfile(path):
+            return None
+        return drop_placeholder_bars(pd.read_parquet(path, columns=["t", "o", "c", "v", "n"]), f"{sym} daily")[0][["t", "o", "c"]]
 
     def bars_end(sym: str) -> Optional[date]:
         if sym not in bars:

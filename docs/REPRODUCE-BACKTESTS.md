@@ -238,8 +238,8 @@ python tools/prepare_history.py --source alpaca --steps market-conditions --univ
 |---|---|---|---|
 | 1 | `download` | `tools/alpaca_history_download.py` with the recorded arguments: RAW (unadjusted) SIP bars + market-wide corporate actions, resumable chunk by chunk | -> `~/Documents/ba2/alpaca_store` (1Day + 5Min from 2019-01-01, 7,048 symbols) and `~/Documents/ba2/alpaca_store_daily2016` (1Day + corporate actions from 2016-01-01, 11,621 symbols); both `asof 2026-10-12`, `--end 2026-10-13`, `--max-gap-days 5`, dev account-1 market-data keys |
 | 2 | `split-table` | Judges every split listed by Alpaca or FMP (FMP splits calendar, cached) against prices; rule set in `ba2_providers/ohlcv/alpaca_history/split_table.py` | -> `<cache>/AlpacaHistoryOHLCVProvider/_meta/split_table.json`, `split_accepted.csv`, `split_review.csv`, `split_vs_fmp.csv` |
-| 3 | `build` | Applies the table (prices / factor, volume x factor), New York-naive dates, 5-min regular session only, same files and columns as the FMP cache | -> `<cache>/AlpacaHistoryOHLCVProvider/<SYM>_1d.parquet`, `<SYM>_5min.parquet`, `_meta/build_manifest.json` |
-| 4 | `verify` | Coverage per symbol-year, 5-min last close vs daily close, comparison with the FMP cache | -> report |
+| 3 | `build` | Applies the table (prices / factor, volume x factor), New York-naive dates, 5-min regular session only, same files and columns as the FMP cache. **Drops Alpaca's placeholder daily bars** (`v == 0` and `n == 0`: a flat no-trade day; no backfill, counted per symbol as `dropped_placeholders` in the manifest and in the run summary; the split-table step drops them too). Repairs bad daily High/Low prints against the 5-min envelope (`_meta/bar_repairs.csv`, witness `fmp`, `yahoo` or `override`; unsettled prints that every available witness also carries beyond the envelope are `_meta/consolidated_prints.csv`) | -> `<cache>/AlpacaHistoryOHLCVProvider/<SYM>_1d.parquet`, `<SYM>_5min.parquet`, `_meta/build_manifest.json` |
+| 4 | `verify` | Data-quality gate: structure, coverage, 5-min last close vs daily close, residual jumps, High/Low envelope, Yahoo, `intraday_outage` (liquid names' regular 5-min bars vs FMP's per session), comparison with the FMP cache; known vendor-event days and the screener's excluded symbols (below) | -> `<report>/verify/*.csv`, exit 1 on any FAIL |
 | 5 | `market-conditions` | `warm_market_conditions.py plan -> build --cache-only -> verify -> prepare-host` for `ohlcv-v1` and `ta-structure-v1` on this source's cache (§4.3); refused without `--universe-file --start --end`; exit 1 if any profile fails | -> `<cache>/market_conditions/` manifests; digests per profile in the JSON report |
 
 Rules to know:
@@ -258,7 +258,20 @@ Rules to know:
   or by the **FMP step** (FMP adjusted close / Alpaca raw close steps by f within 2% across the date: the market
   move cancels out, so it measures exactly what FMP applied). Small factors only when both vendors list them.
   Undecided events are NOT applied and land in `split_review.csv`; owner decisions go in
-  `ba2_providers/ohlcv/alpaca_history/split_overrides.json` (a `pending` reviewer refuses the run).
+  `ba2_providers/ohlcv/alpaca_history/split_overrides.json` (a `pending` reviewer refuses the run). Override
+  `kind`s: `split` (default: accept with a `ratio` / reject a listing), `spinoff` (ratio = the factor prices before the
+  date are divided by; composes with a split override on the same day, e.g. ENOV 2022-04-05) and `bar_cap`
+  (`field` High|Low: the build caps that daily value at the 5-min all-session envelope bound, a row of
+  `bar_repairs.csv` with witness `override`; KORE 2023-05-23 Low, SHMD 2024-04-23 High). The file is hashed into the
+  split table (`overrides_sha256`); the build refuses when it changed since `split-table`.
+- **`verify` classes that do not block** (all listed, never silent): `known_vendor_event` days
+  (`KNOWN_VENDOR_EVENT_DAYS` in `verify.py`: the 2019-08-12 Argentine ADR crash, the 2020-03 circuit-breaker days,
+  2021-04-19 / 2021-10-25 / 2022-01-24 / 2022-03-08 where Alpaca history misses most of the session for ~60% of
+  liquid names, the 2023-01-24 NYSE auction glitch) in `hl_envelope`, `residual_jumps`, the Yahoo mismatch runs and
+  `intraday_outage` -> `verify/known_vendor_events.csv`; every other day keeps the blocking rules. An `intraday_outage`
+  day outside that list (>= 20 liquid symbols with < 50% of FMP's >= 60 bars) FAILs. Symbols excluded from the
+  universe (`screener/panel_exclusions.json`, kind `exclude`: IAC, ADEA, IPEXR, ...; the same list the screener
+  reads) are never panel symbols in the gate and are listed in its `excluded` summary.
 - Vendor list defects this guards against: Alpaca lists spurious events (HON, NVS, IR, DRS) and misses splits (KOD,
   UHAL, SNX, RTX); FMP has CRWD mixed basis, META before 2022-06, and adjusts spin-offs (HON, IAC).
 
@@ -335,6 +348,10 @@ refuse a digest of the other source, and a job pinned to a manifest of another s
 For `alpaca`, `build --fetch-missing` is refused (that cache is built only by `tools/prepare_history.py`) and `plan`
 runs the same split-basis preflight against the splits the Alpaca build applied (`_meta/build_manifest.json`): a
 split it lists that the stored series did not absorb makes the plan actionable (exit 1).
+
+For `--source alpaca` the step plans with `--gap-fill previous` (the `fmp` path keeps its default, no fill): the
+build drops Alpaca's placeholder daily bars, so thin names have real gaps in their series, and the previous valid bar
+is carried forward inside the market-condition calculation only (the history files keep the gaps).
 
 The command for an Alpaca job, per source, both profiles, with the universe (`tools/options_universe_top100.txt`
 for the 97-name option universe; the 753-name stage-2 universe file for stage 2, see 4.4):

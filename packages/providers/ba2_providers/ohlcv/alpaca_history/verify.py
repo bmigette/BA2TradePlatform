@@ -60,6 +60,20 @@ CHECKS (constants below; the coordinator and the owner set the final thresholds)
                    CSVs ``hl_envelope.csv`` / ``hl_envelope_5min_prints.csv``; INFO "no envelope" when the cache has none (the FMP cache).
   7 readiness      INFORMATIONAL (ED-11): per year the panel symbols with no built daily file / daily bars, or no 5-minute file / 5-minute bars
                    (``readiness.csv``, one row per symbol-year that lacks something).
+  9 intraday_outage  per regular session, the LIQUID panel symbols (the "high" selfcons tercile) whose regular 5-minute bars are fewer than
+                   OUTAGE_RATIO (50 %) of the other cache's (FMP) bars that day, while FMP has >= OUTAGE_FMP_MIN (60) (``intraday_outage.csv``, one row per
+                   such symbol-day; Agilent 2022-03-08 has 1 regular bar against FMP's 78, which the coverage check cannot see).  A session with >= OUTAGE_MIN_SYMBOLS (20)
+                   such symbols is an OUTAGE DAY: in KNOWN_VENDOR_EVENT_DAYS -> ``known_vendor_event`` (non-blocking), any other -> FAIL.  Only the Date column of
+                   the 5-minute files is read.  INFO "skipped" without an FMP 5-minute cache.
+
+KNOWN VENDOR-EVENT DAYS (``KNOWN_VENDOR_EVENT_DAYS``: date -> reason, decided by the owner 2026-10-21).  Rows on these days are NON-BLOCKING and listed in
+``known_vendor_events.csv`` (check, symbol, date, reason, numbers) and counted in each check's summary: ``hl_envelope`` rows of a known date (class
+``known_vendor_event``), ``residual_jumps`` whose date or prev_date is known (resolution ``known_vendor_event``, the Yahoo tie-break is not asked), a ``yahoo``
+mismatch run made only of known days (classification ``known_vendor_event``) and an ``intraday_outage`` day.  Every other day keeps its blocking rules.
+
+UNIVERSE EXCLUSIONS.  ``run_gate(excluded=...)``: the symbols of the screener panel's reviewed exclusion list (``screener/panel_exclusions.json``, kind
+``exclude``: IAC, ADEA, IPEXR, ...; the pipeline passes ``live_sim_build.load_exclusions()``, ONE source of truth) are never panel symbols, even when the
+``--panel-symbols`` file lists them: they feed no threshold and no blocking decision, and the result ``excluded`` lists the ones it skipped.
 """
 from __future__ import annotations
 
@@ -95,6 +109,22 @@ YAHOO_FACTOR_TOL = 0.02
 YAHOO_EVENT_RATIO_TOL = 0.005    # yahoo_missing_event / successor_later_event: the ratio equals the events' factor within 0.5 %
 YAHOO_LISTED_DAYS = 5
 YAHOO_CONVENTION_TOL = 0.10      # spin-off factors of ours and of Yahoo / FMP within 10 %: a convention difference
+OUTAGE_RATIO = 0.5               # intraday_outage: our regular bars < this share of the other cache's that day ...
+OUTAGE_FMP_MIN = 60              # ... while the other cache has at least this many
+OUTAGE_MIN_SYMBOLS = 20          # a session with this many such symbols is an outage day
+KNOWN_VENDOR_EVENT_DAYS: Dict[str, str] = {
+    "2019-08-12": "Argentine ADR crash: Alpaca closing prints differ from FMP and Yahoo (SUPV, TGS)",
+    "2020-03-09": "market-wide circuit-breaker day: Alpaca opens/ranges differ from FMP and Yahoo",
+    "2020-03-12": "market-wide circuit-breaker day: Alpaca opens/ranges differ from FMP and Yahoo",
+    "2020-03-16": "market-wide circuit-breaker day: Alpaca opens/ranges differ from FMP and Yahoo",
+    "2020-03-18": "market-wide circuit-breaker day: Alpaca opens/ranges differ from FMP and Yahoo",
+    "2021-04-19": "Alpaca history is missing most of the session for ~60% of liquid names (confirmed on Alpaca's live API; kept as is by owner decision)",
+    "2021-10-25": "Alpaca history is missing most of the session for ~60% of liquid names (confirmed on Alpaca's live API; kept as is by owner decision)",
+    "2022-01-24": "Alpaca history is missing most of the session for ~60% of liquid names (confirmed on Alpaca's live API; kept as is by owner decision)",
+    "2022-03-08": "Alpaca history is missing most of the session for ~60% of liquid names (confirmed on Alpaca's live API; kept as is by owner decision)",
+    "2023-01-24": "NYSE opening-auction glitch: Alpaca keeps prints FMP and Yahoo removed (kept as is by owner decision)",
+}
+KNOWN_EVENT_COLUMNS = ["check", "symbol", "date", "reason", "numbers"]
 DEFAULT_YEARS = tuple(range(2019, 2026))
 RTH_FIRST_MIN = 9 * 60 + 30
 RTH_LAST_MIN = 15 * 60 + 55
@@ -185,8 +215,10 @@ def _consolidated(cache: str) -> Dict[str, Set[Tuple[str, str]]]:
 
 
 def hl_envelope_rows(symbol: str, d1: pd.DataFrame, env: pd.DataFrame, d5: Optional[pd.DataFrame],
-                     consolidated: Set[Tuple[str, str]] = frozenset()) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+                     consolidated: Set[Tuple[str, str]] = frozenset(), known: Optional[Dict[str, str]] = None
+                     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """(daily High/Low outside the envelope rows, 5-minute bars outside the daily range rows) for one symbol; see the module docstring."""
+    known = KNOWN_VENDOR_EVENT_DAYS if known is None else known
     e = env.assign(day=env["Date"].dt.normalize()).set_index("day")
     d = d1.assign(day=d1["Date"].dt.normalize()).set_index("day").join(e[["High", "Low"]], rsuffix="_env", how="inner")
     rows: List[Dict[str, Any]] = []
@@ -200,6 +232,8 @@ def hl_envelope_rows(symbol: str, d1: pd.DataFrame, env: pd.DataFrame, d5: Optio
             cls = "boundary" if excess <= HL_OUTSIDE else ("outlier_gt5" if excess > HL_BLOCK else "outlier_2_5")
             if cls != "boundary" and (str(day.date()), field) in consolidated:
                 cls = "consolidated_print"
+            if cls != "boundary" and str(day.date()) in known:
+                cls = "known_vendor_event"
             rows.append({"symbol": symbol, "date": str(day.date()), "field": field, "daily": float(val[day]), "envelope": float(env_v[day]),
                          "bound": float(bound[day]), "excess": excess, "class": cls})
     rev: List[Dict[str, Any]] = []
@@ -412,17 +446,20 @@ def classify_event_run(end_date: str, median_ratio: float, events: Sequence[Tupl
 def compare_yahoo(ours: pd.DataFrame, yahoo: pd.DataFrame, spinoffs: Sequence[Tuple[str, float]] = (),
                   break_date: Optional[str] = None, fmp: Optional[pd.Series] = None,
                   events: Sequence[Tuple[str, float]] = (), yahoo_splits: Optional[Sequence[Tuple[str, float]]] = None,
-                  successor_events: Optional[Sequence[Tuple[str, float]]] = None, proven: Optional[Set[str]] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+                  successor_events: Optional[Sequence[Tuple[str, float]]] = None, proven: Optional[Set[str]] = None,
+                  known: Optional[Dict[str, str]] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """(per-symbol stats, mismatch runs) of our daily Close vs Yahoo's on common days.  A run is a maximal stretch of consecutive common
     days off by > 0.5 % (cut at each of our spin-off dates), classified by ``classify_run``; the stats count only the unexplained days as
-    mismatches (``match_days`` = common days minus unexplained mismatch days)."""
+    mismatches (``match_days`` = common days minus unexplained mismatch days).  A run that is still unexplained and consists ONLY of days in
+    ``KNOWN_VENDOR_EVENT_DAYS`` is ``known_vendor_event`` (non-blocking)."""
+    known = KNOWN_VENDOR_EVENT_DAYS if known is None else known
     a = _daily_series(ours, "Close")
     y = yahoo.drop_duplicates("day").set_index("day")["Close"]
     j = pd.concat([a, y], axis=1, join="inner", keys=["u", "y"]).dropna()
     j = j[(j["u"] > 0) & (j["y"] > 0)]
     stats = {"common_days": len(j), "match_days": 0, "longest_off_run": 0, "spinoff_convention_days": 0, "series_break_days": 0,
              "convention_days": 0, "yahoo_missing_event_days": 0, "successor_later_event_days": 0,
-             "unexplained_days": 0}
+             "known_vendor_event_days": 0, "unexplained_days": 0}
     runs: List[Dict[str, Any]] = []
     if not len(j):
         return stats, runs
@@ -451,6 +488,9 @@ def compare_yahoo(ours: pd.DataFrame, yahoo: pd.DataFrame, spinoffs: Sequence[Tu
             if r["classification"] == "unexplained":
                 r["classification"], r["events"] = classify_event_run(r["date_to"], r["median_ratio"], events, yahoo_splits, successor_events,
                                                                       a.index.max(), proven)
+            if r["classification"] == "unexplained" and all(str(d.date()) in known for d in idx[start:i]):
+                r["classification"] = "known_vendor_event"
+                r["events"] = "; ".join(sorted({known[str(d.date())] for d in idx[start:i]}))
             if r["classification"] != "unexplained":
                 explained[start:i] = True
                 stats[r["classification"] + "_days"] += i - start
@@ -477,6 +517,48 @@ def choose_yahoo_sample(available: Sequence[str], panel: Optional[Set[str]], sym
     rng = random.Random(seed)
     pick = set(rng.sample(pool, min(size, len(pool))))
     return sorted(pick | (set(YAHOO_EXTRA) & have))
+
+
+# ---------------------------------------------------------------------------
+# check 9: intraday outage (one worker task per liquid symbol: reads only the Date column of both 5-minute files)
+# ---------------------------------------------------------------------------
+def outage_rows(symbol: str, ours: pd.DataFrame, theirs: pd.DataFrame, years: Sequence[int]) -> List[Dict[str, Any]]:
+    """Symbol-days on which our regular 5-minute bars are fewer than OUTAGE_RATIO of the other cache's, which has >= OUTAGE_FMP_MIN."""
+    def per_day(df: pd.DataFrame) -> pd.Series:
+        r = df[_rth_mask(df["Date"])]
+        return r.groupby(r["Date"].dt.normalize()).size()
+
+    a, b = per_day(ours), per_day(theirs)
+    b = b[(b >= OUTAGE_FMP_MIN) & b.index.year.isin(list(years))]
+    j = pd.concat([a.reindex(b.index).fillna(0).astype(int), b], axis=1, keys=["ours", "other"])
+    bad = j[j["ours"] < OUTAGE_RATIO * j["other"]]
+    return [{"symbol": symbol, "date": str(day.date()), "ours": int(r.ours), "other": int(r.other)} for day, r in bad.iterrows()]
+
+
+def outage_symbol(args: Tuple[str, str, str, Tuple[int, ...]]) -> Dict[str, Any]:
+    symbol, cache, other, years = args
+    try:
+        po, pt = os.path.join(cache, f"{symbol}_5min.parquet"), os.path.join(other, f"{symbol}_5min.parquet")
+        if not (os.path.isfile(po) and os.path.isfile(pt)):
+            return {"symbol": symbol, "rows": [], "compared": False, "error": None}
+        return {"symbol": symbol, "rows": outage_rows(symbol, pd.read_parquet(po, columns=["Date"]), pd.read_parquet(pt, columns=["Date"]), years),
+                "compared": True, "error": None}
+    except Exception as e:
+        return {"symbol": symbol, "rows": [], "compared": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def classify_outage_days(rows: Sequence[Dict[str, Any]], known: Optional[Dict[str, str]] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """(symbol-day rows with ``outage_day`` / ``class`` columns, one row per OUTAGE DAY with its symbol count and class).  Class of a day:
+    ``known_vendor_event`` (in KNOWN_VENDOR_EVENT_DAYS) or ``outage`` (blocking)."""
+    known = KNOWN_VENDOR_EVENT_DAYS if known is None else known
+    df = pd.DataFrame(list(rows), columns=["symbol", "date", "ours", "other"])
+    counts = df.groupby("date").size() if len(df) else pd.Series(dtype=int)
+    days = counts[counts >= OUTAGE_MIN_SYMBOLS]
+    dd = pd.DataFrame({"date": days.index, "symbols": days.values})
+    dd["class"] = ["known_vendor_event" if d in known else "outage" for d in dd["date"]]
+    df["outage_day"] = df["date"].isin(set(dd["date"]))
+    df["class"] = np.where(~df["outage_day"], "symbol_day", df["date"].map(lambda d: "known_vendor_event" if d in known else "outage"))
+    return df, dd
 
 
 # ---------------------------------------------------------------------------
@@ -568,15 +650,18 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
              panel: Optional[Iterable[str]] = None, years: Sequence[int] = DEFAULT_YEARS, breaks: Optional[Dict[str, str]] = None,
              workers: int = 4, spinoffs: Optional[Dict[str, List[Tuple[str, float]]]] = None,
              splits: Optional[Dict[str, List[Tuple[str, float]]]] = None,
-             proven_events: Optional[Dict[str, Set[str]]] = None,
+             proven_events: Optional[Dict[str, Set[str]]] = None, excluded: Optional[Dict[str, str]] = None,
              yahoo: Optional[YahooDaily] = None, yahoo_sample: int = YAHOO_SAMPLE, yahoo_seed: int = YAHOO_SEED,
              min_coverage: float = MIN_COVERAGE, max_selfcons_bad: float = MAX_SELFCONS_BAD,
              log: Callable[[str], None] = lambda m: None) -> Dict[str, Dict[str, Any]]:
     """Run all checks; returns ``{check: {"status", "summary", "csv"...}}``.  Writes the CSVs under ``out_dir``."""
     os.makedirs(out_dir, exist_ok=True)
+    excl = {k.strip().upper().replace(".", "-"): v for k, v in (excluded or {}).items()}
     panel_set: Optional[Set[str]] = set(panel) if panel is not None else None
-    in_panel = (lambda s: True) if panel_set is None else (lambda s: s in panel_set)
+    in_panel = (lambda s: s not in excl) if panel_set is None else (lambda s: s in panel_set and s not in excl)
+    panel_set_clean = None if panel_set is None else {s for s in panel_set if s not in excl}
     built = list_cache_symbols(cache)
+    kve: List[Dict[str, Any]] = []                  # known_vendor_events.csv rows
     if symbols is not None:
         todo = sorted({s.strip().upper() for s in symbols})
     else:
@@ -666,9 +751,15 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
     _csv(jp.sort_values(["symbol", "date"]), os.path.join(out_dir, "residual_jumps.csv"))
     jp["yahoo_ratio"] = math.nan
     jp["resolution"] = ""
+    jp["known_reason"] = pd.Series([KNOWN_VENDOR_EVENT_DAYS.get(d, KNOWN_VENDOR_EVENT_DAYS.get(pd_, "")) for d, pd_ in zip(jp["date"], jp["prev_date"])],
+                                   index=jp.index, dtype=object)
     cand = jp["panel"].astype(bool) & jp["since_2019"].astype(bool) & (jp["class"] == "step")
-    for i in jp.index[cand]:
+    cand_known = cand & (jp["known_reason"] != "")
+    for i in jp.index[cand & ~cand_known]:
         jp.loc[i, ["resolution", "yahoo_ratio"]] = resolve_with_yahoo(jp.loc[i], yahoo)
+    jp.loc[cand_known, "resolution"] = "known_vendor_event"
+    kve += [{"check": "residual_jumps", "symbol": r.symbol, "date": r.date, "reason": r.known_reason,
+             "numbers": f"prev_date={r.prev_date}; overnight_ratio={r.overnight_ratio:.4g}; step={r.step:.4g}"} for r in jp[cand_known].itertuples()]
     _csv(jp.sort_values(["symbol", "date"]), os.path.join(out_dir, "residual_jumps.csv"))
     bad = jp[cand & jp["resolution"].isin(["ours_suspect", "unresolved"])]
     res["residual_jumps"] = {"status": STATUS_FAIL if len(bad) else STATUS_PASS, "csv": os.path.join(out_dir, "residual_jumps.csv"),
@@ -676,7 +767,7 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
                                          "resolutions": jp[cand]["resolution"].value_counts().to_dict(),
                                          "vendor_error_fmp": jp[cand & (jp["resolution"] == "vendor_error_fmp")][["symbol", "date", "overnight_ratio", "step"]].head(50).to_dict("records"),
                                          "unverifiable_panel_since_2019": jp[jp["panel"].astype(bool) & jp["since_2019"].astype(bool) & (jp["class"] == "unverifiable")][["symbol", "date", "overnight_ratio"]].head(50).to_dict("records"),
-                                         "blocking": len(bad),
+                                         "blocking": len(bad), "known_vendor_event": int(cand_known.sum()),
                                          "disagreements": bad[["symbol", "date", "overnight_ratio", "step", "resolution", "yahoo_ratio"]].head(50).to_dict("records")}}
     # 5 vendor ratio
     rs = flat("ratio_steps")
@@ -718,16 +809,20 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
         rv = pd.DataFrame(hl_rev, columns=["symbol", "date", "field", "bar_5min", "daily"])
         _csv(rv, os.path.join(out_dir, "hl_envelope_5min_prints.csv"))
         blocking = hl[hl["panel"] & (hl["class"] == "outlier_gt5")]
+        kve += [{"check": "hl_envelope", "symbol": r.symbol, "date": r.date, "reason": KNOWN_VENDOR_EVENT_DAYS[r.date],
+                 "numbers": f"field={r.field}; daily={r.daily:.6g}; envelope={r.envelope:.6g}; bound={r.bound:.6g}; excess={r.excess:.4g}"}
+                for r in hl[hl["class"] == "known_vendor_event"].itertuples()]
         rp = os.path.join(cache, "_meta", "bar_repairs.csv")
         res["hl_envelope"] = {"status": STATUS_FAIL if len(blocking) else STATUS_PASS, "csv": os.path.join(out_dir, "hl_envelope.csv"),
                               "summary": {"by_class_panel": hl[hl["panel"]]["class"].value_counts().to_dict(), "by_class_all": hl["class"].value_counts().to_dict(),
-                                          "blocking": len(blocking), "worst": hl[hl["class"] != "boundary"].head(10)[["symbol", "date", "field", "daily", "bound", "excess"]].to_dict("records"),
+                                          "blocking": len(blocking), "known_vendor_event": int((hl["class"] == "known_vendor_event").sum()),
+                                          "worst": hl[hl["class"] != "boundary"].head(10)[["symbol", "date", "field", "daily", "bound", "excess"]].to_dict("records"),
                                           "bad_5min_prints": len(rv), "repairs_recorded": int(len(pd.read_csv(rp))) if os.path.isfile(rp) else 0}}
     else:
         res["hl_envelope"] = {"status": STATUS_INFO, "csv": None, "summary": {"skipped": "no envelope under _meta/envelope in this cache"}}
     # 6 yahoo
     if yahoo is not None:
-        sample = choose_yahoo_sample(built, panel_set, symbols, yahoo_sample, yahoo_seed)
+        sample = [s for s in choose_yahoo_sample(built, panel_set_clean, symbols, yahoo_sample, yahoo_seed) if s not in excl]
         rows, runs, unknown = [], [], []
         tot = match = 0
         for s in sample:
@@ -756,18 +851,47 @@ def run_gate(cache: str, *, other: Optional[str] = None, out_dir: str, symbols: 
              os.path.join(out_dir, "yahoo_mismatch_runs.csv"))
         if unknown:
             _csv(pd.DataFrame(unknown), os.path.join(out_dir, "yahoo_unavailable.csv"))
+        kve += [{"check": "yahoo", "symbol": r["symbol"], "date": r["date_from"], "reason": r["events"],
+                 "numbers": f"date_to={r['date_to']}; days={r['days']}; median_ratio={r['median_ratio']:.4g}"}
+                for r in runs if r["classification"] == "known_vendor_event"]
         share = match / tot if tot else math.nan
         sustained = ys[ys["longest_off_run"] > YAHOO_RUN_DAYS] if len(ys) else ys
         ok = bool(tot) and share >= YAHOO_MATCH and not len(sustained)
         res["yahoo"] = {"status": STATUS_PASS if ok else STATUS_FAIL, "csv": os.path.join(out_dir, "yahoo_mismatch_runs.csv"),
                         "summary": {"sample": len(sample), "compared": len(ys), "yahoo_unavailable": len(unknown), "common_days": tot,
                                     "match_share": share, "min": YAHOO_MATCH, "sustained_mismatch_symbols": sustained["symbol"].tolist(),
-                                    "runs_by_class": {c: sum(r["classification"] == c for r in runs) for c in ("spinoff_convention", "series_break", "convention", "yahoo_missing_event", "successor_later_event", "unexplained")},
+                                    "runs_by_class": {c: sum(r["classification"] == c for r in runs) for c in ("spinoff_convention", "series_break", "convention", "yahoo_missing_event", "successor_later_event", "known_vendor_event", "unexplained")},
                                     "listed": {c: [{k: r[k] for k in ("symbol", "date_from", "date_to", "days", "median_ratio", "events")} for r in runs if r["classification"] == c][:40]
-                                               for c in ("spinoff_convention", "series_break", "convention", "yahoo_missing_event", "successor_later_event", "unexplained")},
+                                               for c in ("spinoff_convention", "series_break", "convention", "yahoo_missing_event", "successor_later_event", "known_vendor_event", "unexplained")},
                                     "symbols_with_unexplained_runs": sorted({r["symbol"] for r in runs if r["classification"] == "unexplained"})}}
     else:
         res["yahoo"] = {"status": STATUS_INFO, "summary": {"skipped": "no Yahoo source given"}, "csv": None}
+    # 9 intraday outage
+    if other is None or not any(n.endswith("_5min.parquet") for n in os.listdir(other)):
+        res["intraday_outage"] = {"status": STATUS_INFO, "csv": None, "summary": {"skipped": "no other cache with 5-minute files to compare with"}}
+    else:
+        liquid = sorted(worst[worst["panel"].astype(bool) & (worst["band"] == "high")]["symbol"])
+        ojobs = [(s, cache, other, tuple(years)) for s in liquid]
+        if workers <= 1 or len(ojobs) < 2:
+            ores = [outage_symbol(j) for j in ojobs]
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                ores = list(ex.map(outage_symbol, ojobs, chunksize=8))
+        oerr = [{"symbol": r["symbol"], "error": r["error"]} for r in ores if r["error"]]
+        sd, od = classify_outage_days([x for r in ores for x in r["rows"]])
+        _csv(sd.sort_values(["date", "symbol"]) if len(sd) else sd, os.path.join(out_dir, "intraday_outage.csv"))
+        bad_days = od[od["class"] == "outage"]
+        kve += [{"check": "intraday_outage", "symbol": "*", "date": r.date, "reason": KNOWN_VENDOR_EVENT_DAYS[r.date],
+                 "numbers": f"outage_symbols={r.symbols}"} for r in od[od["class"] == "known_vendor_event"].itertuples()]
+        res["intraday_outage"] = {"status": STATUS_FAIL if (len(bad_days) or oerr) else STATUS_PASS, "csv": os.path.join(out_dir, "intraday_outage.csv"),
+                                  "summary": {"liquid_symbols": len(liquid), "compared_symbols": sum(r["compared"] for r in ores), "symbol_days": len(sd),
+                                              "outage_days": len(od), "known_vendor_event_days": int((od["class"] == "known_vendor_event").sum()),
+                                              "blocking_days": bad_days[["date", "symbols"]].head(50).to_dict("records"), "errors": oerr[:10],
+                                              "min_symbols": OUTAGE_MIN_SYMBOLS}}
+    # skipped universe exclusions
+    skipped = sorted(s for s in excl if s in built or (panel_set is not None and s in panel_set) or (symbols is not None and s in {x.strip().upper() for x in symbols}))
+    res["excluded"] = {"status": STATUS_INFO, "csv": None, "summary": {"skipped_symbols": skipped, "reasons": {s: excl[s] for s in skipped}}}
+    _csv(pd.DataFrame(kve, columns=KNOWN_EVENT_COLUMNS).sort_values(["check", "date", "symbol"]), os.path.join(out_dir, "known_vendor_events.csv"))
     if yahoo is not None:
         _csv(yahoo.inputs(), os.path.join(out_dir, "yahoo_inputs.csv"))          # provenance: what Yahoo said, with the cache files' sha256
     return res

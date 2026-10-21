@@ -15,7 +15,9 @@ reverse split has f < 1).  Task 4 (the cache build) reads only ``_meta/split_tab
 
 INPUTS (all read-only)
   * ``--store`` (default ~/Documents/ba2/alpaca_store_daily2016): ``bars/1Day/symbol=<S>/all.parquet`` (t UTC bar start, o,
-    h, l, c, v, n, vw; folder names use '-' as in BRK-B), ``corporate_actions/ym=YYYY-MM.json.gz``, ``STORE_INFO.json``.  Every daily ``t`` must
+    h, l, c, v, n, vw; folder names use '-' as in BRK-B).  PLACEHOLDER bars (v == 0 AND n == 0: Alpaca's no-trade day, flat price) are DROPPED
+    on reading (like the build does), so a jump across a dropped run is measured between the real bars on either side and a long dropped run
+    becomes a data gap (the pair is skipped beyond MAX_GAP_DAYS unless it jumps beyond x5, a series break); ``corporate_actions/ym=YYYY-MM.json.gz``, ``STORE_INFO.json``.  Every daily ``t`` must
     be exactly 00:00 New York time (04:00Z in summer, 05:00Z in winter; the session is its date) and each session may appear
     once, else the build STOPS (SplitTableBuildError); the corporate actions must hold at least one forward or reverse split.
     The calendar is fetched from ``--fmp-from`` to ``--fmp-to`` (default: the store's asof + 1 day; earlier than the asof is
@@ -126,7 +128,9 @@ THE RULES (tolerances are module constants)
     spin-off listed as a split: absorbed, adjusted once.
   * SPIN-OFF OVERRIDES: an override entry with ``"kind": "spinoff"`` decides the SPIN-OFF of its symbol / ex-date: reject drops
     the adjustment, accept applies ``ratio`` as the factor (and absorbs split listings there).  The default kind is "split".
-    A split override and a spin-off override on one symbol / date are independent (CENT 2024-02-09 rejects both).
+    A split override and a spin-off override on one symbol / date are independent (CENT 2024-02-09 rejects both).  An ACCEPT of each on
+    one date (ENOV 2022-04-05: the 1:3 reverse split and the ESAB spin-off 1.743) applies BOTH as decided, each factor on its own basis
+    (prices divided by the split factor and by the spin-off factor); neither is absorbed by the other.
   * SPLIT + SPIN-OFF ON ONE EX-DATE (leftovers).  A split and a spin-off of one symbol within 3 sessions are ONE price event (AIV 2020-12-15:
     the vendors list the spin-off as a 9.295 split, Alpaca lists the spin-off itself): never both.  The SPLIT is kept and the
     spin-off absorbed (``spinoff_absorbed_by_split``, informational row; recorded in the split's ``absorbed`` /
@@ -330,8 +334,11 @@ def _norm_symbol(s: str) -> str:
 # ---------------------------------------------------------------------------
 # overrides
 # ---------------------------------------------------------------------------
+BAR_CAP_KIND = "bar_cap"
+
+
 def _ov_kind(o: Mapping[str, Any]) -> str:
-    """"split" (default) | "spinoff": which listing the override decides.  A spinoff override REJECTS the spin-off adjustment
+    """"split" (default) | "spinoff" | "bar_cap" (a daily High/Low cap, applied by the build, never seen by ``decide_splits``): which listing the override decides.  A spinoff override REJECTS the spin-off adjustment
     of that symbol / ex-date, or ACCEPTS it with ``ratio`` = the factor (prices before the date are divided by it)."""
     return o["kind"] if "kind" in o else "split"
 
@@ -345,9 +352,9 @@ def _pick(v: float, cands: Sequence[Tuple[str, float]]) -> Optional[str]:
     return None
 
 
-def load_overrides(path: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Every entry of the reviewed overrides file, validated.  Raises ``SplitOverridesPending`` while any entry's
-    ``reviewed_by`` starts with 'pending', ``ValueError`` for a malformed entry."""
+def _load_entries(path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Every entry of the reviewed overrides file (split, spinoff and bar_cap kinds), validated.  Raises ``SplitOverridesPending`` while any
+    entry's ``reviewed_by`` starts with 'pending', ``ValueError`` for a malformed entry."""
     with open(path or OVERRIDES_PATH, encoding="utf-8") as f:
         entries = json.load(f)["entries"]
     seen = set()
@@ -360,14 +367,18 @@ def load_overrides(path: Optional[str] = None) -> List[Dict[str, Any]]:
             raise ValueError(f"split override {e['symbol']} {e['event_date']}: decision must be accept|reject, "
                              f"got {e['decision']!r}")
         date.fromisoformat(e["event_date"])
-        if "kind" in e and e["kind"] not in ("split", "spinoff"):
-            raise ValueError(f"split override {e['symbol']} {e['event_date']}: kind must be split|spinoff, got {e['kind']!r}")
-        if e["decision"] == "accept":
+        if "kind" in e and e["kind"] not in ("split", "spinoff", BAR_CAP_KIND):
+            raise ValueError(f"split override {e['symbol']} {e['event_date']}: kind must be split|spinoff|{BAR_CAP_KIND}, got {e['kind']!r}")
+        if _ov_kind(e) == BAR_CAP_KIND:
+            if e["decision"] != "accept" or e.get("field") not in ("High", "Low"):
+                raise ValueError(f"bar_cap override {e['symbol']} {e['event_date']}: needs decision 'accept' and field High|Low, "
+                                 f"got {e['decision']!r} / {e.get('field')!r}")
+        elif e["decision"] == "accept":
             r = e.get("ratio")
             if not isinstance(r, (int, float)) or not math.isfinite(r) or r <= 0 or r == 1:
                 raise ValueError(f"split override {e['symbol']} {e['event_date']}: 'accept' needs a ratio > 0 and != 1, "
                                  f"got {r!r}")
-        key = (_norm_symbol(e["symbol"]), e["event_date"], _ov_kind(e))
+        key = (_norm_symbol(e["symbol"]), e["event_date"], _ov_kind(e)) + ((e["field"],) if _ov_kind(e) == BAR_CAP_KIND else ())
         if key in seen:
             raise ValueError(f"split override {key} is listed twice")
         seen.add(key)
@@ -377,6 +388,18 @@ def load_overrides(path: Optional[str] = None) -> List[Dict[str, Any]]:
             f"{len(pending)} split override(s) pending review ({', '.join(e['symbol'] + ' ' + e['event_date'] for e in pending)}): "
             f"set reviewed_by in {path or OVERRIDES_PATH} before building")
     return entries
+
+
+def load_overrides(path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """The SPLIT and SPIN-OFF entries of the reviewed overrides file, validated (``decide_splits`` decides these).  The ``bar_cap`` entries
+    are validated with them (a pending one refuses here too) but belong to the build: ``load_bar_caps``."""
+    return [e for e in _load_entries(path) if _ov_kind(e) != BAR_CAP_KIND]
+
+
+def load_bar_caps(path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """The ``bar_cap`` entries of the reviewed overrides file: cap one daily High / Low at the 5-minute all-session envelope bound (the build
+    applies them, witness ``override``)."""
+    return [e for e in _load_entries(path) if _ov_kind(e) == BAR_CAP_KIND]
 
 
 # ---------------------------------------------------------------------------
@@ -1293,6 +1316,8 @@ def _decide_symbol(sym: str, bars: _Bars, listed: List[Tuple[str, ListedSplit]],
             for x in [a for a in acc if a["kind"] == "split" and id(a) not in composed_ids and idx_of(a) == idx_of(sp)]:
                 if sp not in acc:
                     break
+                if sp["source"] == "override" and x["source"] == "override":
+                    continue                       # BOTH reviewed (ENOV 2022-04-05): independent events, both applied as decided
                 xd, sd = date.fromisoformat(x["date"]), date.fromisoformat(sp["date"])
                 v, ok = rser.step(xd, [d for d in listed_dates + ov_dates + so_dates if d != xd]) if rser is not None else (None, True)
                 if v is None:

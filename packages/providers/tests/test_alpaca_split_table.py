@@ -375,7 +375,7 @@ def test_pipeline_end_to_end_on_a_tiny_store_is_offline_and_reproducible(tmp_pat
     raw = bars(40, 4.0)
     d = store / "bars" / "1Day" / "symbol=NA"                   # the symbol "NA" must survive the CSVs
     d.mkdir(parents=True)
-    raw.assign(h=raw["o"], l=raw["o"]).to_parquet(d / "all.parquet")
+    raw.assign(h=raw["o"], l=raw["o"], v=1.0, n=1).to_parquet(d / "all.parquet")
     (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2021-03-31"}), encoding="utf-8")
     ca = store / "corporate_actions"
     ca.mkdir()
@@ -592,7 +592,7 @@ def test_pipeline_outputs_are_one_coherent_set(tmp_path, monkeypatch):
     raw = bars(40, 4.0)
     d = store / "bars" / "1Day" / "symbol=AA"
     d.mkdir(parents=True)
-    raw.assign(h=raw["o"], l=raw["o"]).to_parquet(d / "all.parquet")
+    raw.assign(h=raw["o"], l=raw["o"], v=1.0, n=1).to_parquet(d / "all.parquet")
     (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2021-01-30"}), encoding="utf-8")
     (store / "corporate_actions").mkdir()
     fmpd = tmp_path / "fmpd"
@@ -634,7 +634,7 @@ def tiny_store(tmp_path, symbol="AA", asof="2021-01-30", listed=True):
     raw = bars(40, 4.0)
     d = store / "bars" / "1Day" / f"symbol={symbol}"
     d.mkdir(parents=True)
-    raw.assign(h=raw["o"], l=raw["o"]).to_parquet(d / "all.parquet")
+    raw.assign(h=raw["o"], l=raw["o"], v=1.0, n=1).to_parquet(d / "all.parquet")
     (store / "STORE_INFO.json").write_text(json.dumps({"asof": asof}), encoding="utf-8")
     (store / "corporate_actions").mkdir()
     sp = [{"symbol": symbol, "ex_date": D.isoformat(), "old_rate": 1, "new_rate": 4}] if listed else []
@@ -865,7 +865,7 @@ def test_series_break_for_an_unexplained_jump_beyond_x5_that_the_step_does_not_e
 def test_shipped_overrides_are_all_owner_reviewed():
     entries = st.load_overrides(SHIPPED_OVERRIDES)               # raises while any entry is still pending
     by = {(e["symbol"], e["event_date"], e["kind"] if "kind" in e else "split"): e for e in entries}
-    assert len(entries) == 27 and all(e["reviewed_by"] == "owner (B. Migette) 2026-10-20" for e in entries)
+    assert len(entries) == 31 and all(e["reviewed_by"] in ("owner (B. Migette) 2026-10-20", "owner (B. Migette) 2026-10-21") for e in entries)
     assert all(e["added"] in ("2026-10-20", "2026-10-21") for e in entries)
     assert ("HON", "2026-06-28", "split") not in by              # the 1:2 reverse split is real (Honeywell 8-K): no reject
     cbsh = [by[("CBSH", d, "split")] for d in ("2016-11-30", "2017-11-29", "2019-12-02")]
@@ -891,7 +891,7 @@ def test_breaks_are_written_to_the_table(tmp_path):
     store, fmpd, raw = tiny_store(tmp_path, asof="2021-01-30")
     sym2 = store / "bars" / "1Day" / "symbol=ZZ"
     sym2.mkdir()
-    bars(30, 9.0).assign(h=1.0, l=1.0).to_parquet(sym2 / "all.parquet")      # a x9 overnight jump, no listing
+    bars(30, 9.0).assign(h=1.0, l=1.0, v=1.0, n=1).to_parquet(sym2 / "all.parquet")      # a x9 overnight jump, no listing
     out = tmp_path / "out"
     cal = out / "_meta" / "fmp_split_calendar"
     cal.mkdir(parents=True)
@@ -1048,7 +1048,7 @@ def test_build_writes_spinoffs_apart_from_splits(tmp_path):
     for sym, frame in (("P", parent_bars()), ("S", spinco_bars())):
         d = store / "bars" / "1Day" / f"symbol={sym}"
         d.mkdir(parents=True)
-        frame.assign(h=frame["o"], l=frame["o"]).to_parquet(d / "all.parquet")
+        frame.assign(h=frame["o"], l=frame["o"], v=1.0, n=1).to_parquet(d / "all.parquet")
     (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2021-03-31"}), encoding="utf-8")
     (store / "corporate_actions").mkdir()
     with _gzip.open(store / "corporate_actions" / "ym=2021-03.json.gz", "wt", encoding="utf-8") as f:
@@ -1201,7 +1201,7 @@ def test_yahoo_source_retries_transient_errors_paces_requests_and_does_not_cache
 def test_build_records_the_yahoo_inputs(tmp_path):
     store, fmpd, raw = tiny_store(tmp_path, asof="2021-01-30")
     # an unlisted jump with a clean FMP step in a second symbol: the only Yahoo candidate
-    cand = bars(30, 0.4).assign(h=1.0, l=1.0)
+    cand = bars(30, 0.4).assign(h=1.0, l=1.0, v=1.0, n=1)
     d = store / "bars" / "1Day" / "symbol=CC"
     d.mkdir()
     cand.to_parquet(d / "all.parquet")
@@ -1216,7 +1216,7 @@ def test_build_records_the_yahoo_inputs(tmp_path):
     sb.build_split_table(**kw, yahoo_fetch=fake_yahoo({"CC": []}, calls), yahoo_sleep=lambda s: None)
     assert calls == []                                           # 0.4 is no clean ratio: no candidate, Yahoo never asked
     fmp(cand, {30: 0.5}).to_parquet(fmpd / "CC_1d.parquet")      # now a clean 1:2 step and a jump within x1.5 of it
-    cand2 = bars(30, 0.45).assign(h=1.0, l=1.0)
+    cand2 = bars(30, 0.45).assign(h=1.0, l=1.0, v=1.0, n=1)
     cand2.to_parquet(d / "all.parquet")
     fmp(cand2, {30: 0.5}).to_parquet(fmpd / "CC_1d.parquet")
     res = sb.build_split_table(**kw, yahoo_fetch=fake_yahoo({"CC": []}, calls), yahoo_sleep=lambda s: None)
@@ -1295,10 +1295,10 @@ def test_build_writes_the_missing_spinco_list(tmp_path):
     for sym, frame in (("P", parent_bars()),):
         d = store / "bars" / "1Day" / f"symbol={sym}"
         d.mkdir(parents=True)
-        frame.assign(h=frame["o"], l=frame["o"]).to_parquet(d / "all.parquet")
+        frame.assign(h=frame["o"], l=frame["o"], v=1.0, n=1).to_parquet(d / "all.parquet")
     d = store / "bars" / "1Day" / "symbol=S"                    # present in the store but NOT in a symbols list: still found
     d.mkdir(parents=True)
-    spinco_bars().assign(h=1.0, l=1.0).to_parquet(d / "all.parquet")
+    spinco_bars().assign(h=1.0, l=1.0, v=1.0, n=1).to_parquet(d / "all.parquet")
     (store / "STORE_INFO.json").write_text(json.dumps({"asof": "2021-03-31"}), encoding="utf-8")
     (store / "corporate_actions").mkdir()
     with _gzip.open(store / "corporate_actions" / "ym=2021-03.json.gz", "wt", encoding="utf-8") as f:
@@ -1414,7 +1414,7 @@ def test_build_applies_an_alpaca_listed_split_of_a_renamed_symbol(tmp_path):
     store, fmpd, raw = tiny_store(tmp_path, symbol="AA", asof="2021-01-30", listed=False)
     later = store / "bars" / "1Day" / "symbol=BB"                            # the renamed ticker's bars start only after the rename
     later.mkdir(parents=True)
-    bars(sessions=SESSIONS[79:80]).assign(h=1.0, l=1.0).to_parquet(later / "all.parquet")
+    bars(sessions=SESSIONS[79:80]).assign(h=1.0, l=1.0, v=1.0, n=1).to_parquet(later / "all.parquet")
     with _gzip.open(store / "corporate_actions" / "ym=2021-03.json.gz", "wt", encoding="utf-8") as f:
         json.dump({"forward_splits": [{"symbol": "AA", "ex_date": D.isoformat(), "old_rate": 1, "new_rate": 4}],
                    "name_changes": [{"old_symbol": "AA", "new_symbol": "BB", "process_date": "2021-04-20"}]}, f)
@@ -1541,3 +1541,67 @@ def test_a_spinoff_and_a_split_are_scored_on_the_raw_jump_when_fmp_has_no_data()
     acc, rev, stats, _ = run_so({"P": raw, "S": spinco_bars(price=12.13)}, None, spin=(SpinOff("P", D, "S", 0.5),), alp=both, fm=both)
     assert [(a["kind"], a["factor"]) for a in acc] == [("spinoff", pytest.approx(1 + 0.5 * 12.13 / 11.30))]
     assert stats["listings_absorbed_by_spinoff"] == 2 and not any(r["verdict"] == "split_spinoff_conflict" for r in rev)
+
+
+def test_enov_split_override_and_spinoff_override_on_one_day_compose():
+    # ENOV 2022-04-05: Colfax 1:3 reverse split (reviewed split override, vendors list none) AND the ESAB spin-off (reviewed spin-off override
+    # 1.743) on the same ex-date: BOTH are applied, the spin-off never absorbed by the split and the split never by the spin-off
+    rows = []
+    for i, d in enumerate(SESSIONS):
+        p = 30.0 if i < 40 else 3 * 30.0 / 1.743
+        rows.append({"t": pd.Timestamp(d).tz_localize("America/New_York").tz_convert("UTC"), "o": p, "c": p})
+    raw = pd.DataFrame(rows, columns=["t", "o", "c"])
+    acc, rev, stats, breaks = run_so({"P": raw, "S": spinco_bars(price=14.0)}, None, spin=(SpinOff("P", D, "S", 0.33333),),
+                                     ov=[ov("accept", 1 / 3, symbol="P"), ov("accept", 1.743, symbol="P", kind="spinoff")])
+    got = {(a["kind"], round(a["factor"], 6), a["source"]) for a in acc}
+    assert got == {("split", round(1 / 3, 6), "override"), ("spinoff", 1.743, "override")}, got
+    assert st.splits_by_symbol(acc) == {"P": [[D.isoformat(), pytest.approx(1 / 3)]]}
+    assert st.splits_by_symbol(acc, "spinoff") == {"P": [[D.isoformat(), 1.743]]}
+    assert not any(r["verdict"] in ("split_spinoff_conflict", "spinoff_absorbed_by_split") for r in rev) and breaks == {}
+
+
+def test_bar_cap_overrides_are_validated_apart_and_never_reach_decide_splits(tmp_path):
+    import json as _json
+    base = {"symbol": "KORE", "event_date": "2023-05-23", "kind": "bar_cap", "field": "Low", "decision": "accept", "reason": "r",
+            "added": "2026-10-21", "reviewed_by": "owner"}
+    f = tmp_path / "o.json"
+    f.write_text(_json.dumps({"entries": [ov("accept", 2.0, symbol="A"), base]}), encoding="utf-8")
+    assert [e["symbol"] for e in st.load_overrides(str(f))] == ["A"]
+    assert [(e["symbol"], e["field"]) for e in st.load_bar_caps(str(f))] == [("KORE", "Low")]
+    for bad in ({**base, "field": "Close"}, {**base, "decision": "reject"}, {**base, "reviewed_by": "pending"}):
+        f.write_text(_json.dumps({"entries": [bad]}), encoding="utf-8")
+        with pytest.raises((ValueError, st.SplitOverridesPending)):
+            st.load_bar_caps(str(f))
+    f.write_text(_json.dumps({"entries": [base, {**base}]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="twice"):
+        st.load_overrides(str(f))
+
+
+def test_the_shipped_overrides_load_and_carry_the_2026_10_21_decisions():
+    kinds = {(e["symbol"], e["event_date"], e["kind"] if "kind" in e else "split") for e in st.load_overrides(SHIPPED_OVERRIDES)}
+    assert {("KG", "2025-05-28", "split"), ("LENZ", "2024-03-22", "split"), ("ENLV", "2017-09-25", "split"),
+            ("ENOV", "2022-04-05", "split"), ("ENOV", "2022-04-05", "spinoff")} <= kinds
+    assert {(e["symbol"], e["event_date"], e["field"]) for e in st.load_bar_caps(SHIPPED_OVERRIDES)} == {("KORE", "2023-05-23", "Low"), ("SHMD", "2024-04-23", "High")}
+
+
+def test_placeholder_daily_bars_are_dropped_before_the_split_table_reads_them(tmp_path):
+    df = bars(40, 4.0).assign(h=1.0, l=1.0, v=5.0, n=3)
+    df.loc[10:20, ["v", "n"]] = 0                                   # a run of no-trade placeholders
+    kept, k = sb.drop_placeholder_bars(df)
+    assert k == 11 and len(kept) == len(df) - 11
+    store, _, _ = tiny_store(tmp_path)
+    p = store / "bars" / "1Day" / "symbol=AA" / "all.parquet"
+    df.to_parquet(p)
+    stats = Counter()
+    frames, _ = sb.load_store_bars(str(store), None, stats)
+    assert len(frames["AA"]) == len(df) - 11 and list(frames["AA"].columns) == ["t", "o", "c"]
+    assert stats["placeholder_bars_dropped"] == 11 and stats["placeholder_symbols"] == 1
+    # the jump (at index 15) lies after a dropped run (10..14): the pair across the run is the real bars either side
+    df2 = bars(15, 4.0).assign(h=1.0, l=1.0, v=5.0, n=3)
+    df2.loc[10:14, ["v", "n"]] = 0
+    kept2, _ = sb.drop_placeholder_bars(df2)
+    assert len(kept2) == len(df2) - 5
+    acc, rev, _ = run({"AA": kept2[["t", "o", "c"]]}, [L("AA", SESSIONS[15].date(), 4.0)], [L("AA", SESSIONS[15].date(), 4.0)])
+    assert [a["verdict"] for a in acc] == ["proven"]
+    with pytest.raises(st.SplitTableBuildError, match="placeholder"):
+        sb.drop_placeholder_bars(df2.drop(columns=["n"]))

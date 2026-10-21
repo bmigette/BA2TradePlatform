@@ -65,11 +65,17 @@ def write_symbol(daily_root, intraday_root, sym, daily_days, intraday_days=(), g
         (Path(intraday_root) / "manifest" / f"symbol={sym}.json").write_text(json.dumps({"chunks": chunks}))
 
 
-def make_table(out, splits=None, spinoffs=None, breaks=None, run_id="RUN1", csv_run_id=None, asof="2026-10-12"):
+def _sha(path):
+    import hashlib
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def make_table(out, splits=None, spinoffs=None, breaks=None, run_id="RUN1", csv_run_id=None, asof="2026-10-12", overrides_path=None):
+    from ba2_providers.ohlcv.alpaca_history.split_table import OVERRIDES_PATH
     meta = Path(out) / "_meta"
     meta.mkdir(parents=True, exist_ok=True)
     (meta / "split_table.json").write_text(json.dumps({
-        "run_id": run_id, "asof": asof, "inputs_sha256": "a", "overrides_sha256": "b", "splits": splits or {}, "spinoffs": spinoffs or {},
+        "run_id": run_id, "asof": asof, "inputs_sha256": "a", "overrides_sha256": _sha(overrides_path or OVERRIDES_PATH), "splits": splits or {}, "spinoffs": spinoffs or {},
         "breaks": breaks or {}}))
     for name in bld.RUN_ID_CSVS:
         with open(meta / name, "w", newline="") as f:
@@ -589,6 +595,20 @@ def test_market_conditions_runs_plan_build_verify_prepare_host_for_both_profiles
     assert res["digests"] == {"ohlcv-v1": "ddddddddohlcv-v1", "ta-structure-v1": "ddddddddta-structure-v1"}
 
 
+@pytest.mark.parametrize("source,expected", [("alpaca", "previous"), ("fmp", None)])
+def test_market_conditions_plan_uses_gap_fill_previous_for_alpaca_only(tmp_path, monkeypatch, source, expected):
+    ph = load_prepare_history()
+    argv, _root = mc_setup(ph, tmp_path, source)
+    warm = FakeWarm()
+    monkeypatch.setattr(ph, "_load_warm", lambda: warm)
+    assert ph.main([*argv, "--steps", "market-conditions"]) == ph.EXIT_OK
+    plans = [c for c in warm.calls if c[0] == "plan"]
+    assert len(plans) == 2
+    for c in plans:
+        assert (c[c.index("--gap-fill") + 1] if "--gap-fill" in c else None) == expected
+    assert all("--gap-fill" not in c for c in warm.calls if c[0] != "plan")      # build must match the plan, it never overrides it
+
+
 def test_market_conditions_exit_is_nonzero_when_any_profile_fails_but_both_are_reported(tmp_path, monkeypatch):
     ph = load_prepare_history()
     argv, _root = mc_setup(ph, tmp_path)
@@ -754,14 +774,173 @@ def test_yahoo_and_fmp_both_carrying_the_print_keep_it_as_a_consolidated_print(e
     assert c["date"].tolist() == [BAD_DAY] and c["field"].tolist() == ["High"] and c["daily"].tolist() == [20.0]
 
 
-def test_yahoo_unavailable_or_agreeing_with_neither_leaves_the_bar_unwitnessed(env, tmp_path):
-    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, available=False), fmp_high=20.0)
-    assert d.loc[BAD_DAY, "High"] == 20.0 and s["unwitnessed_outliers"] == 1 and s["bar_repairs"] == 0
-    d, s = second_witness(env, tmp_path / "n", yahoo_witness(tmp_path / "n", high=15.0), fmp_high=20.0)
-    assert d.loc[BAD_DAY, "High"] == 20.0 and s["unwitnessed_outliers"] == 1 and s["consolidated_prints"] == 0
+def test_a_witness_inside_the_envelope_that_does_not_settle_it_leaves_the_bar_unwitnessed(env, tmp_path):
+    # Yahoo 10.65: not within 1 % of the bound (no repair) and not beyond it by 2 % (not a consolidated print): left as it is
+    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, high=10.65), fmp_high=20.0)
+    assert d.loc[BAD_DAY, "High"] == 20.0 and s["unwitnessed_outliers"] == 1 and s["consolidated_prints"] == 0 and s["bar_repairs"] == 0
 
 
-def test_a_print_only_yahoo_carries_is_not_consolidated(env, tmp_path):
-    # FMP agrees with neither the envelope nor the daily value: Yahoo alone does not make it a consolidated print
-    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, high=20.0), fmp_high=15.0)
+def test_a_print_only_yahoo_carries_is_not_consolidated_when_fmp_is_inside_the_envelope(env, tmp_path):
+    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, high=20.0), fmp_high=10.0)
     assert d.loc[BAD_DAY, "High"] == 20.0 and s["consolidated_prints"] == 0 and s["unwitnessed_outliers"] == 1
+
+
+def test_every_available_witness_beyond_the_envelope_is_a_consolidated_print(env, tmp_path):
+    # Yahoo unavailable (no frame at all): FMP alone, beyond the envelope on the same side
+    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, available=False), fmp_high=20.0)
+    assert d.loc[BAD_DAY, "High"] == 20.0 and s["consolidated_prints"] == 1 and s["unwitnessed_outliers"] == 0 and s["bar_repairs"] == 0
+    c = pd.read_csv(env[2] / "_meta" / "consolidated_prints.csv", keep_default_na=False)
+    assert list(c.columns) == bld.CONSOLIDATED_COLUMNS
+    assert c["rule"].tolist() == [bld.RULE_ALL_BEYOND] and c["witnesses"].tolist() == ["fmp"]
+
+
+def test_both_witnesses_beyond_the_envelope_but_neither_equal_to_the_daily_value_is_consolidated(env, tmp_path):
+    # CRDF 2018-12-31: FMP 3.391, Yahoo 3.42, daily 3.44, bound 3.246 -> here FMP 15, Yahoo 12, daily 20, bound 10.5
+    d, s = second_witness(env, tmp_path, yahoo_witness(tmp_path, high=12.0), fmp_high=15.0)
+    assert d.loc[BAD_DAY, "High"] == 20.0 and s["consolidated_prints"] == 1 and s["unwitnessed_outliers"] == 0
+    c = pd.read_csv(env[2] / "_meta" / "consolidated_prints.csv", keep_default_na=False)
+    assert c["rule"].tolist() == [bld.RULE_ALL_BEYOND] and c["witnesses"].tolist() == ["fmp+yahoo"]
+
+
+def test_yahoo_only_witness_with_no_fmp_bar_beyond_the_envelope_is_consolidated(env, tmp_path):
+    # CIRC / SUIG: Yahoo = daily, no FMP bar that day
+    import numpy as np
+    daily, intr, out = env
+    days = sessions("2024-01-02", "2024-01-08")
+    write_symbol(daily, intr, "ABC", days, days)
+    p = daily / "bars" / "1Day" / "symbol=ABC" / "all.parquet"
+    f = pd.read_parquet(p)
+    f["h"] = np.where(f["t"] == ny_to_utc(pd.Timestamp(BAD_DAY)), 20.0, 10.5)
+    f["l"] = 9.5
+    f.to_parquet(p, index=False)
+    make_table(out)
+    fmp = tmp_path / "fmp"
+    fmp.mkdir()
+    pd.DataFrame([{"Date": pd.Timestamp(d), "High": 10.5, "Low": 9.5, "Close": 10.0} for d in days if d != BAD_DAY]).to_parquet(fmp / "ABC_1d.parquet", index=False)
+    s = bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, fmp_daily_dir=str(fmp),
+                        yahoo=yahoo_witness(tmp_path, high=20.0))
+    assert s["consolidated_prints"] == 1 and s["unwitnessed_outliers"] == 0
+    c = pd.read_csv(out / "_meta" / "consolidated_prints.csv", keep_default_na=False)
+    assert c["witnesses"].tolist() == ["yahoo"]
+
+
+def test_a_low_beyond_the_envelope_with_every_witness_beyond_it_is_consolidated():
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        df = pd.DataFrame({"Date": [pd.Timestamp("2019-10-01")], "Open": [17.5], "High": [17.6], "Low": [15.55], "Close": [17.5],
+                           "Volume": [1], "effective_date": [pd.Timestamp("2019-10-01")]})
+        df.to_parquet(os.path.join(t, "FNWB_1d.parquet"), index=False)
+        y = pd.DataFrame({"day": [pd.Timestamp("2019-10-01")], "Close": [17.5], "High": [17.6], "Low": [13.86]})
+        o = {"date": "2019-10-01", "field": "Low", "old": 15.55, "bound": 17.007, "fmp": 15.55}
+        rep, cons, left = bld.yahoo_second_pass(t, "FNWB", [o], y)
+        assert rep == [] and left == [] and [c["rule"] for c in cons] == [bld.RULE_ALL_BEYOND]
+
+
+# ---------------------------------------------------------------------------
+# placeholder daily bars (v == 0 and n == 0) are dropped
+# ---------------------------------------------------------------------------
+def test_placeholder_daily_bars_are_dropped_counted_and_never_backfilled(env):
+    daily, intr, out = env
+    days = sessions("2024-01-02", "2024-01-12")
+    write_symbol(daily, intr, "ABC", days, days)
+    write_symbol(daily, intr, "XYZ", days, days[:2])
+    p = daily / "bars" / "1Day" / "symbol=ABC" / "all.parquet"
+    f = pd.read_parquet(p)
+    ph = f["t"].isin([ny_to_utc(pd.Timestamp(d)) for d in days[2:5]])
+    f.loc[ph, ["v", "n"]] = 0                                       # a flat no-trade run
+    f.loc[f["t"] == ny_to_utc(pd.Timestamp(days[6])), "v"] = 0      # volume 0 but trades counted: a real bar, kept
+    f.to_parquet(p, index=False)
+    make_table(out)
+    s = build(env)
+    d = pd.read_parquet(out / "ABC_1d.parquet")
+    assert set(d["Date"].dt.strftime("%Y-%m-%d")) == set(days) - set(days[2:5])
+    assert len(pd.read_parquet(out / "XYZ_1d.parquet")) == len(days)
+    m = json.loads((out / "_meta" / "build_manifest.json").read_text())
+    assert m["symbols"]["ABC"]["dropped_placeholders"] == 3 and m["symbols"]["XYZ"]["dropped_placeholders"] == 0
+    assert m["dropped_placeholders"] == 3 and s["dropped_placeholders"] == 3 and s["symbols_with_placeholders"] == 1
+    assert s["bars_1d"] == len(d) + len(days)
+
+
+def test_placeholder_count_covers_only_bars_after_the_series_break(env):
+    daily, intr, out = env
+    days = sessions("2024-01-02", "2024-01-12")
+    write_symbol(daily, intr, "ABC", days, days)
+    p = daily / "bars" / "1Day" / "symbol=ABC" / "all.parquet"
+    f = pd.read_parquet(p)
+    f.loc[f["t"].isin([ny_to_utc(pd.Timestamp(d)) for d in (days[0], days[7])]), ["v", "n"]] = 0
+    f.to_parquet(p, index=False)
+    make_table(out, breaks={"ABC": [days[3]]})
+    build(env)
+    m = json.loads((out / "_meta" / "build_manifest.json").read_text())
+    assert m["symbols"]["ABC"]["dropped_placeholders"] == 1
+
+
+# ---------------------------------------------------------------------------
+# bar_cap overrides
+# ---------------------------------------------------------------------------
+def _overrides_file(tmp_path, entries):
+    p = tmp_path / "ov.json"
+    p.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+    return p
+
+
+def _cap(field, day=BAD_DAY, reviewed_by="owner (B. Migette) 2026-10-21", symbol="ABC"):
+    return {"symbol": symbol, "event_date": day, "kind": "bar_cap", "field": field, "decision": "accept", "reason": "bad print",
+            "added": "2026-10-21", "reviewed_by": reviewed_by}
+
+
+def _cap_env(env, tmp_path, entries, **kw):
+    daily, intr, out = env
+    days = sessions("2024-01-02", "2024-01-08")
+    write_symbol(daily, intr, "ABC", days, days)
+    p = daily / "bars" / "1Day" / "symbol=ABC" / "all.parquet"
+    f = pd.read_parquet(p)
+    f["h"], f["l"] = 10.5, 9.5                                                       # the other days are clean
+    i = f.index[f["t"] == ny_to_utc(pd.Timestamp(BAD_DAY))][0]
+    f.loc[i, "h"], f.loc[i, "l"] = 20.0, 1.0
+    f.to_parquet(p, index=False)
+    ov = _overrides_file(tmp_path, entries)
+    make_table(out, overrides_path=ov)
+    return build(env, overrides_path=str(ov), **kw), out
+
+
+def test_bar_cap_override_caps_the_field_at_the_envelope_and_records_witness_override(env, tmp_path):
+    s, out = _cap_env(env, tmp_path, [_cap("High")])
+    d = pd.read_parquet(out / "ABC_1d.parquet").set_index("Date")
+    assert d.loc[BAD_DAY, "High"] == 10.5 and d.loc[BAD_DAY, "Low"] == 1.0          # only the named field
+    r = pd.read_csv(out / "_meta" / "bar_repairs.csv", keep_default_na=False)
+    assert r["witness"].tolist() == ["override"] and r["field"].tolist() == ["High"] and r["old"].iloc[0] == 20.0 and r["new"].iloc[0] == 10.5
+    assert s["bar_repairs"] == 1 and s["unwitnessed_outliers"] == 1                  # the Low is still an unwitnessed outlier
+
+
+def test_bar_cap_removes_the_value_from_the_unwitnessed_list_and_caps_a_low(env, tmp_path):
+    s, out = _cap_env(env, tmp_path, [_cap("High"), _cap("Low")])
+    d = pd.read_parquet(out / "ABC_1d.parquet").set_index("Date")
+    assert d.loc[BAD_DAY, "High"] == 10.5 and d.loc[BAD_DAY, "Low"] == 9.5 and s["unwitnessed_outliers"] == 0 and s["bar_repairs"] == 2
+
+
+def test_bar_cap_on_a_day_without_a_bar_stops_the_build_and_a_changed_overrides_file_is_refused(env, tmp_path):
+    with pytest.raises(bld.BuildError, match="no built daily bar"):
+        _cap_env(env, tmp_path, [_cap("High", day="2024-02-01")])
+    daily, intr, out = env
+    ov = _overrides_file(tmp_path, [_cap("High")])
+    make_table(out, overrides_path=ov)
+    ov.write_text(ov.read_text() + " ", encoding="utf-8")
+    with pytest.raises(bld.BuildError, match="changed since the split table"):
+        build(env, overrides_path=str(ov))
+
+
+def test_a_pending_bar_cap_refuses_the_build(env, tmp_path):
+    from ba2_providers.ohlcv.alpaca_history.split_table import SplitOverridesPending
+    with pytest.raises(SplitOverridesPending):
+        _cap_env(env, tmp_path, [_cap("High", reviewed_by="pending")])
+
+
+def test_enov_split_and_spinoff_on_one_day_adjust_to_0_574_of_the_split_only_series():
+    d = pd.DataFrame({"Date": pd.to_datetime(["2022-04-04", "2022-04-05"]), "Open": [30.0, 51.6], "High": [30.0, 51.6], "Low": [30.0, 51.6],
+                      "Close": [30.0, 51.6], "Volume": [100, 100]})
+    both = bld.adjust(d, [("2022-04-05", 1 / 3)], [("2022-04-05", 1.743)])
+    split_only = bld.adjust(d, [("2022-04-05", 1 / 3)])
+    assert (both["Close"].iloc[0] / split_only["Close"].iloc[0]) == pytest.approx(1 / 1.743) and 1 / 1.743 == pytest.approx(0.5737, abs=1e-4)
+    assert both["Volume"].iloc[0] == split_only["Volume"].iloc[0]                     # a spin-off leaves the share count alone
+    assert both["Close"].iloc[1] == 51.6

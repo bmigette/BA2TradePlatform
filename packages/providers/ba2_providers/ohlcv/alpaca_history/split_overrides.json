@@ -1,5 +1,5 @@
 {
- "_doc": "REVIEWED decisions on individual split events, applied by split_table.decide_splits. An entry decides the event of its symbol on event_date (any date a vendor lists for it, or a date nobody lists: an 'accept' then ADDS the split) outright, whatever the price jump says. Never a silent tolerance: every entry needs symbol, event_date (ISO), decision ('accept' needs a ratio = new shares / old shares; 'reject' drops the event), reason, added and reviewed_by; an entry whose reviewed_by starts with 'pending' REFUSES the build. A 'reject' also silences the 'unexplained_jump' review row at its date. The file's bytes are part of the split table's fingerprint. A 'reject' decides a split LISTING only: spin-off adjustments are computed from Alpaca's spin_offs and are never blocked by an override.",
+ "_doc": "REVIEWED decisions on individual split events, applied by split_table.decide_splits. An entry decides the event of its symbol on event_date (any date a vendor lists for it, or a date nobody lists: an 'accept' then ADDS the split) outright, whatever the price jump says. Never a silent tolerance: every entry needs symbol, event_date (ISO), decision ('accept' needs a ratio = new shares / old shares; 'reject' drops the event), reason, added and reviewed_by; an entry whose reviewed_by starts with 'pending' REFUSES the build. A 'reject' also silences the 'unexplained_jump' review row at its date. The file's bytes are part of the split table's fingerprint. A 'reject' decides a split LISTING only: spin-off adjustments are computed from Alpaca's spin_offs and are never blocked by an override. KINDS: 'split' (default), 'spinoff' (ratio = the factor prices before the date are divided by; a split and a spinoff entry on one symbol/date compose, both applied) and 'bar_cap' (needs field High|Low and decision 'accept', no ratio): the BUILD caps that daily High/Low at the 5-minute all-session envelope bound, no witness needed (a row of bar_repairs.csv with witness 'override'); split_table.decide_splits never sees bar_cap entries.",
  "entries": [
   {
    "symbol": "VTOL",
@@ -230,6 +230,63 @@
    "reason": "Douglas Elliman (DOUG) spin-off, 0.5 DOUG per VGR share: factor 1 + 0.5 x 12.13 / 11.30 = 1.5367; the raw drop 17.16 -> 11.30 (1/1.519) matches",
    "added": "2026-10-21",
    "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "KG",
+   "event_date": "2025-05-28",
+   "decision": "accept",
+   "ratio": 0.05,
+   "reason": "1-for-20: Maiden Holdings -> Kestrel Group combination, Kestrel began trading as KG on 2025-05-28; sources https://us.trendlyne.com/us/equity/corporate-actions/KG/3120360/kestrel-group-ltd and https://www.digrin.com/stocks/detail/KG/stock_split; FMP lists 0.05",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "LENZ",
+   "event_date": "2024-03-22",
+   "decision": "accept",
+   "ratio": 0.14285714285714285,
+   "reason": "Graphite Bio 1-for-7 reverse split with the LENZ merger, split-adjusted trading from 2024-03-22 (SEC 8-K https://www.sec.gov/Archives/edgar/data/1815776/000162828024012633/lenz-20240321.htm)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "ENLV",
+   "event_date": "2017-09-25",
+   "decision": "accept",
+   "ratio": 0.2,
+   "reason": "Bioblast Pharma 1-for-5 reverse split effective 2017-09-25 (https://www.biospace.com/bioblast-pharma-announces-effectiveness-of-five-to-one-reverse-split); FMP and Yahoo both apply it",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "ENOV",
+   "event_date": "2022-04-05",
+   "kind": "spinoff",
+   "decision": "accept",
+   "ratio": 1.743,
+   "reason": "ESAB distribution (1 ESAB per 3 Colfax shares) on the same day as the accepted 1:3 reverse split: composes with it; factor 1.743 = FMP's adjustment step (prices before the date are divided by it)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "KORE",
+   "event_date": "2023-05-23",
+   "kind": "bar_cap",
+   "field": "Low",
+   "decision": "accept",
+   "reason": "bad print: daily Low 0.60 against the 5-minute all-session envelope 8.1; FMP carries the same bad print, Yahoo has no data; capped at the envelope bound",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "SHMD",
+   "event_date": "2024-04-23",
+   "kind": "bar_cap",
+   "field": "High",
+   "decision": "accept",
+   "reason": "bad print: daily High 11.42 against the 5-minute all-session envelope 10.82; no witness available (pre-listing day); capped at the envelope bound",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
   }
  ]
 }

@@ -116,7 +116,8 @@ def test_reviewed_exclusion_list_replaces_a_refusal_with_a_printed_record(cache,
     shipped = lb.load_exclusions()
     assert {"GORO", "PARA", "CICC"} <= set(shipped) and not ({"MIDD", "MOD", "RBKB", "SNFCA"} & set(shipped))
     assert not any(str(e["reviewed_by"]).lower().startswith("pending") for e in lb.load_entries() if e["symbol"] in {"GORO", "PARA", "CICC"})
-    assert {"DBRG", "IPEXR", "IPEXU", "QRVO"} <= set(lb.load_acknowledged_delistings())
+    assert {"DBRG", "IPEXU", "QRVO"} <= set(lb.load_acknowledged_delistings())
+    assert {"IAC", "ADEA", "IPEXR"} <= set(lb.load_exclusions()) and "IPEXR" not in lb.load_acknowledged_delistings()
 
 
 def _ack_file(tmp_path, *, last_session, reviewed_by="owner", name="ack.json"):

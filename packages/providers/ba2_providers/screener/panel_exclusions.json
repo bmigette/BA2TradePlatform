@@ -32,11 +32,10 @@
   },
   {
    "symbol": "IPEXR",
-   "kind": "delisted",
-   "last_session": "2026-09-25",
-   "reason": "delisted 2026-09-25 (right of IPEX); vendor and cache histories identical and both end at the last bar",
-   "added": "2026-10-12",
-   "reviewed_by": "owner (B. Migette) 2026-10-12"
+   "kind": "exclude",
+   "reason": "not a share: a rights issue (right of IPEX), delisted 2026-09-25; excluded from the universe (owner 2026-10-21; was an acknowledged delisting)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
   },
   {
    "symbol": "IPEXU",

@@ -58,6 +58,9 @@ STEP alpaca|fmp / market-conditions
                 without them).  It never fetches (the caches are built by the earlier steps).  The price folder the warm tool reads is
                 ``<--mc-cache-root>/AlpacaHistoryOHLCVProvider`` (alpaca) or ``.../FMPOHLCVProvider`` (fmp), default ``--mc-cache-root``
                 = the platform CACHE_FOLDER; ``--out`` (alpaca) / ``--fmp-daily-dir`` (fmp) must be that same folder or the step refuses.
+                For ``--source alpaca`` the plan is made with ``--gap-fill previous`` (the build drops Alpaca's no-trade placeholder daily
+                bars, so thin names have real gaps; the previous bar is carried forward inside the market-condition calculation only);
+                ``--source fmp`` keeps the warm tool's default (no fill).
                 The JSON report records, per profile, the manifest digest and the plan / build / verify / prepare-host outcome; the step
                 (and the run) exits 1 when ANY profile fails.  Digests differ per source and per host (runbook 4.3).
     python tools/prepare_history.py --source alpaca --steps market-conditions \
@@ -207,8 +210,9 @@ def step_split_table(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[
 
 def plan_split_table(a: argparse.Namespace) -> List[str]:
     """Dry run: what the step would read and write; raises on a missing input."""
-    from ba2_providers.ohlcv.alpaca_history.split_table import load_overrides
-    entries = load_overrides(a.overrides)                     # raises SplitOverridesPending
+    from ba2_providers.ohlcv.alpaca_history.split_table import load_bar_caps, load_overrides
+    entries = load_overrides(a.overrides)
+    caps = load_bar_caps(a.overrides)                     # raises SplitOverridesPending
     for label, path in (("store", os.path.join(a.store, "STORE_INFO.json")),
                         ("corporate actions", os.path.join(a.store, "corporate_actions")),
                         ("FMP daily dir", a.fmp_daily_dir)):
@@ -217,7 +221,7 @@ def plan_split_table(a: argparse.Namespace) -> List[str]:
     cal = os.path.join(a.out, "_meta", "fmp_split_calendar")
     cached = len(os.listdir(cal)) if os.path.isdir(cal) else 0
     meta = os.path.join(a.out, "_meta")
-    return [f"split-table: {len(entries)} reviewed override(s); {cached} cached FMP calendar window(s) "
+    return [f"split-table: {len(entries)} reviewed split/spin-off override(s) + {len(caps)} bar_cap override(s) (applied by build); {cached} cached FMP calendar window(s) "
             f"({'offline' if cached else 'the FMP key will be read from ' + a.db})",
             f"split-table: would write split_table.json, split_review.csv, split_accepted.csv, split_vs_fmp.csv under {meta}"]
 
@@ -333,7 +337,7 @@ def step_build(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, A
     from ba2_providers.ohlcv.alpaca_history import build as bld
     yahoo = _make_yahoo(a, _verify_dirs(a)[2])
     result = bld.build_cache(daily_store=a.store, intraday_store=a.store_5min, out=a.out, symbols=_symbol_list(a),
-                             workers=a.workers, fmp_daily_dir=a.fmp_daily_dir, yahoo=yahoo, log=log)
+                             workers=a.workers, fmp_daily_dir=a.fmp_daily_dir, yahoo=yahoo, overrides_path=a.overrides, log=log)
     per = result.pop("per_symbol_s")
     result["seconds_per_symbol"] = round(sum(per.values()) / max(len(per), 1), 3)
     result["slowest"] = sorted(per.items(), key=lambda kv: -kv[1])[:5]
@@ -345,6 +349,7 @@ def step_build(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, A
 def plan_build(a: argparse.Namespace) -> List[str]:
     from ba2_providers.ohlcv.alpaca_history import build as bld
     table = bld.load_split_table(a.out)                       # raises BuildError on a missing table / run_id mismatch
+    bld.load_bar_caps(a.overrides)                            # raises SplitOverridesPending on a pending override (bar_cap entries included)
     for label, path in (("daily store", a.store), ("5-minute store", a.store_5min)):
         if not os.path.isdir(os.path.join(path, "bars")):
             raise FileNotFoundError(f"{label} not found: {path}")
@@ -373,13 +378,15 @@ def step_verify(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, 
         with open(a.panel_symbols, encoding="utf-8") as f:
             panel = [s.strip().upper().replace(".", "-") for s in json.load(f)]
     yahoo = _make_yahoo(a, out_dir)
+    from ba2_providers.screener.live_sim_build import load_exclusions       # ONE source of truth: the screener panel's reviewed exclusions
+    excluded = {s: str(e["reason"]) for s, e in load_exclusions().items()}
     symbols = [x.strip().upper().replace(".", "-") for x in a.symbols.split(",") if x.strip()] if a.symbols else None
     breaks = ver.load_breaks(os.path.join(a.out, "_meta")) if a.source == "alpaca" else {}
     spinoffs = ver.load_spinoffs(os.path.join(a.out, "_meta")) if a.source == "alpaca" else {}
     splits = ver.load_splits(os.path.join(a.out, "_meta")) if a.source == "alpaca" else None
     proven = ver.load_proven_events(os.path.join(a.out, "_meta")) if a.source == "alpaca" else None
     results = ver.run_gate(cache, other=other, out_dir=out_dir, symbols=symbols, panel=panel, years=_years(a.verify_years),
-                           breaks=breaks, spinoffs=spinoffs, splits=splits, proven_events=proven, workers=a.workers, yahoo=yahoo, yahoo_sample=a.yahoo_sample_size, yahoo_seed=a.yahoo_seed,
+                           breaks=breaks, spinoffs=spinoffs, splits=splits, proven_events=proven, excluded=excluded, workers=a.workers, yahoo=yahoo, yahoo_sample=a.yahoo_sample_size, yahoo_seed=a.yahoo_seed,
                            min_coverage=a.min_coverage, max_selfcons_bad=a.max_selfcons_bad, log=log)
     for name, r in results.items():
         print(f"{r['status']:5s} {name}: {json.dumps(r['summary'], default=str)[:1500]}")
@@ -443,9 +450,13 @@ class StepFailed(RuntimeError):
 def mc_commands(a: argparse.Namespace, profile: str, plan_path: str, digest: str = "<digest>") -> List[List[str]]:
     """The four warm_market_conditions argv lists (without the program) of one profile; runbook 4.3 in code."""
     universe, start, end, root, _folder = mc_inputs(a)
+    from ba2_common.core.market_condition_source import GAP_FILL_PREVIOUS
     hs = ["--ohlcv-history-source", a.source, "--quiet"]
     cr = ["--cache-root", root]                                # build takes none: it reads the plan's own cache_root
-    return [["plan", "--profile", profile, "--universe-file", universe, "--start", start, "--end", end, "--out", plan_path, *cr, *hs],
+    # alpaca: the build drops Alpaca's no-trade placeholder daily bars, so thin names have real gaps; the plan carries the previous
+    # valid bar forward inside the market-condition calculation only (the history files keep the gaps).  fmp keeps its default.
+    gap = ["--gap-fill", GAP_FILL_PREVIOUS] if a.source == "alpaca" else []
+    return [["plan", "--profile", profile, "--universe-file", universe, "--start", start, "--end", end, "--out", plan_path, *cr, *hs, *gap],
             ["build", "--plan", plan_path, "--cache-only", "--print-digest", *hs],
             ["verify", "--manifest", digest, *cr, *hs],
             ["prepare-host", "--manifest", digest, "--profile", profile, "--jobs", str(a.workers), *cr, *hs]]

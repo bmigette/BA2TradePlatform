@@ -43,9 +43,21 @@ DAILY BAD PRINTS (``repair_daily``).  A daily High/Low can be a bad print (NVDA 
   the verify check ``hl_envelope``.  A daily value outside the envelope that the FMP witness does not settle is looked at again with
   YAHOO as the second witness (only when a ``YahooDaily`` source is given; cache and provenance as in verify): Yahoo's High/Low on our basis
   (that day's ratio of our Close to Yahoo's) within WITNESS_TOL of the envelope value repairs the bar (witness ``yahoo``); Yahoo AND FMP both
-  within WITNESS_TOL of the DAILY value keep it as a ``consolidated_print`` (``_meta/consolidated_prints.csv``, non-blocking, listed);
-  Yahoo unavailable or agreeing with neither leaves it as it is (verify reports it, blocking above 5 %).  The Yahoo files consulted are in
-  ``_meta/build_yahoo_inputs.csv``.
+  within WITNESS_TOL of the DAILY value keep it as a ``consolidated_print`` (``_meta/consolidated_prints.csv``, non-blocking, listed; rule
+  ``fmp_and_yahoo_agree_with_daily``).  A value is also a ``consolidated_print`` when EVERY available witness (FMP on our basis, Yahoo on our
+  basis; NaN / no bar that day = unavailable; at least one must be available) is itself beyond the envelope bound on the SAME side by more than
+  REPAIR_TOL (rule ``all_witnesses_beyond_envelope``: the print is consolidated-tape, not a bad print; the CSV's ``rule`` / ``witnesses`` columns
+  say which rule and which vendors).  Anything else (a witness inside the envelope that does not settle it, or no witness at all) is left as it is
+  (verify reports it, blocking above 5 %).  The Yahoo files consulted are in ``_meta/build_yahoo_inputs.csv``.
+BAR OVERRIDES.  ``split_overrides.json`` entries of kind ``bar_cap`` (symbol, event_date, field High|Low, reason, added, reviewed_by; a pending one
+  REFUSES the build) cap that daily High / Low at the all-session envelope bound (High' / Low' above) with no witness: each applied cap is a row of
+  ``bar_repairs.csv`` with witness ``override`` and of the manifest entry; a cap on a day the build has no bar or envelope for STOPS the build.  The
+  file is read at build time and its sha256 must equal the split table's ``overrides_sha256`` (else: rerun split-table).
+PLACEHOLDER DAILY BARS.  A raw daily bar with v == 0 AND n == 0 is Alpaca's placeholder for a no-trade day (a flat price carried over).  The build
+  DROPS them from ``<SYM>_1d.parquet`` (no backfill from any vendor; the split-table step drops them too, so a jump across a dropped run is measured
+  between the real bars on either side).  Counted per symbol (``dropped_placeholders``, bars on/after the series break only) in the manifest and as a
+  total in the run summary.  The 5-minute files are untouched.  Market conditions that need a continuous series carry the previous bar forward
+  themselves (``--gap-fill previous``, prepare_history ``market-conditions``).
 
 OUTPUT.  ``<out>/<SYM>_1d.parquet``, ``<out>/<SYM>_5min.parquet`` (atomic: temp file + os.replace) and
 ``<out>/_meta/build_manifest.json`` (the only thing this step writes under ``_meta``): the stores' asof, the split table's
@@ -72,7 +84,8 @@ import numpy as np
 import pandas as pd
 
 from ba2_common import config as _cfg
-from ba2_providers.ohlcv.alpaca_history.split_build import DEFAULT_OUT, atomic_write
+from ba2_providers.ohlcv.alpaca_history.split_build import DEFAULT_OUT, atomic_write, drop_placeholder_bars
+from ba2_providers.ohlcv.alpaca_history.split_table import OVERRIDES_PATH, load_bar_caps
 
 DEFAULT_DAILY_STORE = os.path.join(_cfg.BA2_HOME, "alpaca_store_daily2016")
 DEFAULT_INTRADAY_STORE = os.path.join(_cfg.BA2_HOME, "alpaca_store")
@@ -87,7 +100,9 @@ SPLIT_TABLE_NAME = "split_table.json"
 REPAIR_TOL = 0.02                # a daily High/Low must be this far outside the envelope to be repaired ...
 WITNESS_TOL = 0.01               # ... and the FMP value on our basis must agree with the envelope value within this
 REPAIR_COLUMNS = ["symbol", "date", "field", "old", "new", "envelope", "fmp", "yahoo", "witness", "run_id"]
-CONSOLIDATED_COLUMNS = ["symbol", "date", "field", "daily", "envelope", "fmp", "yahoo", "run_id"]
+CONSOLIDATED_COLUMNS = ["symbol", "date", "field", "daily", "envelope", "fmp", "yahoo", "rule", "witnesses", "run_id"]
+RULE_BOTH_AGREE = "fmp_and_yahoo_agree_with_daily"
+RULE_ALL_BEYOND = "all_witnesses_beyond_envelope"
 RUN_ID_CSVS = ("split_review.csv", "split_accepted.csv", "split_vs_fmp.csv", "fmp_daily_inputs.csv", "yahoo_inputs.csv")
 
 
@@ -277,37 +292,90 @@ def repair_daily(daily: pd.DataFrame, env: pd.DataFrame, fmp: Optional[pd.DataFr
     return out, repairs, unwitnessed
 
 
+def _beyond(field: str, value: float, bound: float) -> bool:
+    """``value`` lies beyond the envelope ``bound`` on the side of ``field`` by more than REPAIR_TOL (NaN = no)."""
+    if not math.isfinite(value):
+        return False
+    return value > bound * (1 + REPAIR_TOL) if field == "High" else value < bound * (1 - REPAIR_TOL)
+
+
 def yahoo_second_pass(out_dir: str, symbol: str, unwitnessed: Sequence[Dict[str, Any]], ydf: Optional[pd.DataFrame]
                       ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Yahoo as the second witness for the daily values the FMP witness did not settle (see the module docstring).  Rewrites the symbol's
-    built daily file when it repairs.  Returns (repairs, consolidated prints, still unwitnessed)."""
-    if ydf is None or "High" not in ydf.columns or "Low" not in ydf.columns or not unwitnessed:
+    built daily file when it repairs.  Returns (repairs, consolidated prints, still unwitnessed).  A Yahoo frame without the day (a delisted
+    name answers with one row), or no Yahoo frame at all, makes Yahoo UNAVAILABLE for that value; FMP alone can then still classify it."""
+    if not unwitnessed:
         return [], [], list(unwitnessed)
     path = os.path.join(out_dir, file_names(symbol)[0])
     df = pd.read_parquet(path)
-    y = ydf.assign(day=ydf["day"].dt.normalize()).drop_duplicates("day").set_index("day")
+    if ydf is not None and "High" in ydf.columns and "Low" in ydf.columns:
+        y = ydf.assign(day=ydf["day"].dt.normalize()).drop_duplicates("day").set_index("day")
+    else:
+        y = pd.DataFrame(columns=["Close", "High", "Low"], index=pd.DatetimeIndex([], name="day"))
     repairs: List[Dict[str, Any]] = []
     consolidated: List[Dict[str, Any]] = []
     left: List[Dict[str, Any]] = []
     for o in unwitnessed:
         day = pd.Timestamp(o["date"])
         row = df.index[df["Date"] == day]
-        if day not in y.index or not len(row) or not (y.loc[day, "Close"] > 0):
+        if not len(row):
             left.append(o)
             continue
         i = row[0]
-        yv = float(y.loc[day, o["field"]] * (df.loc[i, "Close"] / y.loc[day, "Close"]))
-        if abs(yv / o["bound"] - 1) <= WITNESS_TOL:
+        yv = math.nan
+        if day in y.index and y.loc[day, "Close"] > 0:
+            yv = float(y.loc[day, o["field"]] * (df.loc[i, "Close"] / y.loc[day, "Close"]))
+        if math.isfinite(yv) and abs(yv / o["bound"] - 1) <= WITNESS_TOL:
             df.loc[i, o["field"]] = o["bound"]
             repairs.append({"date": o["date"], "field": o["field"], "old": o["old"], "new": o["bound"], "envelope": o["bound"],
                             "fmp": o["fmp"], "yahoo": yv, "witness": "yahoo"})
-        elif abs(yv / o["old"] - 1) <= WITNESS_TOL and abs(o["fmp"] / o["old"] - 1) <= WITNESS_TOL:
-            consolidated.append({"date": o["date"], "field": o["field"], "daily": o["old"], "envelope": o["bound"], "fmp": o["fmp"], "yahoo": yv})
-        else:
+            continue
+        fmp_v = o["fmp"]
+        witnesses = [n for n, v in (("fmp", fmp_v), ("yahoo", yv)) if math.isfinite(v)]
+        rule = None
+        if math.isfinite(yv) and abs(yv / o["old"] - 1) <= WITNESS_TOL and math.isfinite(fmp_v) and abs(fmp_v / o["old"] - 1) <= WITNESS_TOL:
+            rule = RULE_BOTH_AGREE
+        elif witnesses and all(_beyond(o["field"], v, o["bound"]) for v in (fmp_v, yv) if math.isfinite(v)):
+            rule = RULE_ALL_BEYOND
+        if rule is None:
             left.append(o)
+        else:
+            consolidated.append({"date": o["date"], "field": o["field"], "daily": o["old"], "envelope": o["bound"], "fmp": fmp_v, "yahoo": yv,
+                                 "rule": rule, "witnesses": "+".join(witnesses)})
     if repairs:
         atomic_write(path, parquet_bytes(df))
     return repairs, consolidated, left
+
+
+def _norm(symbol: str) -> str:
+    return symbol.strip().upper().replace(".", "-")
+
+
+def apply_bar_caps(daily: pd.DataFrame, env: pd.DataFrame, caps: Sequence[Mapping[str, Any]], symbol: str
+                   ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """Apply the reviewed ``bar_cap`` overrides of one symbol: the day's High (Low) is set to the all-session envelope bound
+    max(envelope High, Open, Close) (min(envelope Low, Open, Close)) when it lies beyond it.  Returns (frame, repair rows with witness
+    ``override``).  A cap whose day has no built bar or no envelope STOPS the build (a reviewed override never vanishes silently); a value
+    already inside the bound is left alone and produces no row."""
+    out = daily.copy()
+    rows: List[Dict[str, Any]] = []
+    for c in caps:
+        day, field = pd.Timestamp(c["event_date"]), c["field"]
+        idx = out.index[out["Date"].dt.normalize() == day]
+        if not len(idx) or day not in env.index:
+            raise BuildError(f"{symbol}: bar_cap override {field} {c['event_date']} has no built daily bar / 5-minute envelope that day")
+        i = idx[0]
+        if field == "High":
+            bound = float(max(env.loc[day, "High"], out.loc[i, "Open"], out.loc[i, "Close"]))
+            beyond = out.loc[i, "High"] > bound
+        else:
+            bound = float(min(env.loc[day, "Low"], out.loc[i, "Open"], out.loc[i, "Close"]))
+            beyond = out.loc[i, "Low"] < bound
+        if beyond:
+            rows.append({"date": c["event_date"], "field": field, "old": float(out.loc[i, field]), "new": bound, "envelope": bound,
+                         "fmp": math.nan, "yahoo": math.nan, "witness": "override"})
+            out.loc[i, field] = bound
+    return out, rows
 
 
 def apply_break(frame: pd.DataFrame, break_date: Optional[str]) -> Tuple[pd.DataFrame, int]:
@@ -381,7 +449,7 @@ def file_names(symbol: str) -> Tuple[str, str]:
 
 
 def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str, table: SplitTable,
-                 fmp_dir: Optional[str] = None) -> Dict[str, Any]:
+                 fmp_dir: Optional[str] = None, bar_caps: Sequence[Mapping[str, Any]] = ()) -> Dict[str, Any]:
     """Build both files of one symbol; returns its manifest entry.  One symbol at a time: memory is one symbol's bars."""
     t0 = time.time()
     entry: Dict[str, Any] = {"symbol": symbol}
@@ -402,7 +470,16 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     digest, d_chunks, _ = _chunk_digest(d_manifest, "1Day", f"{symbol} daily")
     if not d_chunks:
         raise BuildError(f"{symbol}: a daily file exists but its manifest has no complete 1Day chunk")
-    daily = to_native_daily(pd.read_parquet(d_path), f"{symbol} daily")
+    raw_daily = pd.read_parquet(d_path)
+    if "n" not in raw_daily.columns:
+        raise BuildError(f"{symbol} daily: column 'n' missing (have {list(raw_daily.columns)}): cannot tell placeholder bars apart")
+    ph_mask = ((raw_daily["v"] == 0) & (raw_daily["n"] == 0)).to_numpy()
+    n_placeholders = int(ph_mask.sum())
+    if n_placeholders and brk is not None:
+        ph_days = raw_daily.loc[ph_mask, "t"].dt.tz_convert(NY).dt.tz_localize(None).dt.normalize()
+        n_placeholders = int((ph_days >= pd.Timestamp(brk)).sum())
+    raw_daily, _ = drop_placeholder_bars(raw_daily, f"{symbol} daily")
+    daily = to_native_daily(raw_daily, f"{symbol} daily")
     daily, dropped_1d = apply_break(daily, brk)
 
     gap_days: Dict[str, Any] = {}
@@ -440,6 +517,7 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     entry["inputs_sha256"] = hashlib.sha256("\n".join(digest).encode()).hexdigest()
     entry["break_date"] = brk
     entry["dropped_by_break"] = {"1d": dropped_1d, "5min": dropped_5m}
+    entry["dropped_placeholders"] = n_placeholders
     entry["days_without_intraday_bars"] = gap_days
     entry["refused_5min_years"] = refused
 
@@ -466,9 +544,17 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
                 with open(fp, "rb") as fh:
                     entry["fmp_daily_sha256"] = hashlib.sha256(fh.read()).hexdigest()
             d_adj, repairs, unwitnessed = repair_daily(d_adj, env, fmp_df)
+            d_adj, capped = apply_bar_caps(d_adj, env, [c for c in bar_caps if _norm(c["symbol"]) == symbol], symbol)
+            if capped:
+                repairs = sorted(repairs + capped, key=lambda r: (r["date"], r["field"]))
+                done = {(r["date"], r["field"]) for r in capped}
+                unwitnessed = [u for u in unwitnessed if (u["date"], u["field"]) not in done]
+                entry["unwitnessed"] = unwitnessed
             entry["unwitnessed"] = unwitnessed
             atomic_write(os.path.join(out, "_meta", "envelope", f"{symbol}.parquet"), parquet_bytes(env.reset_index()))
         entry["repairs"] = repairs
+        if not (env_raw is not None and len(env_raw)) and any(_norm(c["symbol"]) == symbol for c in bar_caps):
+            raise BuildError(f"{symbol}: a bar_cap override but no 5-minute envelope to cap at")
         d_out = finish(d_adj, "1d")
         atomic_write(os.path.join(out, f1), parquet_bytes(d_out))
         entry["1d"] = {"first": str(d_out["Date"].iloc[0].date()), "last": str(d_out["Date"].iloc[-1].date()), "bars": len(d_out)}
@@ -488,10 +574,11 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     return entry
 
 
-def _task(args: Tuple[str, str, str, str, "SplitTable", Optional[str]]) -> Dict[str, Any]:
-    symbol, daily_store, intraday_store, out, table, fmp_dir = args
+def _task(args: Tuple[str, str, str, str, "SplitTable", Optional[str], Sequence[Mapping[str, Any]]]) -> Dict[str, Any]:
+    symbol, daily_store, intraday_store, out, table, fmp_dir, bar_caps = args
     try:
-        return build_symbol(symbol, daily_store=daily_store, intraday_store=intraday_store, out=out, table=table, fmp_dir=fmp_dir)
+        return build_symbol(symbol, daily_store=daily_store, intraday_store=intraday_store, out=out, table=table, fmp_dir=fmp_dir,
+                            bar_caps=bar_caps)
     except Exception as e:                       # reported per symbol; the run finishes and then fails, named
         return {"symbol": symbol, "error": f"{type(e).__name__}: {e}"}
 
@@ -526,7 +613,7 @@ def list_symbols(daily_store: str, intraday_store: str) -> List[str]:
 
 def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str = DEFAULT_INTRADAY_STORE,
                 out: str = DEFAULT_OUT, symbols: Optional[Sequence[str]] = None, workers: int = 4,
-                fmp_daily_dir: Optional[str] = None, yahoo: Optional[Any] = None,
+                fmp_daily_dir: Optional[str] = None, yahoo: Optional[Any] = None, overrides_path: Optional[str] = None,
                 log: Callable[[str], None] = lambda m: None) -> Dict[str, Any]:
     """Build the cache for every store symbol (or ``symbols``) and write the manifest.  Raises ``BuildError`` on a bad input and
     when any symbol failed (after the others finished and the manifest was written)."""
@@ -535,6 +622,11 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
     d_asof, i_asof = _store_asof(daily_store), _store_asof(intraday_store)
     if not (d_asof == i_asof == table.asof):
         raise BuildError(f"asof differs: daily store {d_asof}, 5-minute store {i_asof}, split table {table.asof}")
+    overrides_path = overrides_path or OVERRIDES_PATH
+    bar_caps = load_bar_caps(overrides_path)                    # raises SplitOverridesPending while any override is pending
+    if _file_sha256(overrides_path) != table.overrides_sha256:
+        raise BuildError(f"{overrides_path} changed since the split table was built (sha256 differs from the table's overrides_sha256): "
+                         f"rerun the split-table step")
     universe = list_symbols(daily_store, intraday_store)
     if symbols is not None:
         want = [s.strip().upper().replace(".", "-") for s in symbols]
@@ -547,7 +639,7 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
     os.makedirs(os.path.join(out, "_meta"), exist_ok=True)
     log(f"build: {len(todo)} symbols, {workers} workers, split table {table.run_id}")
     results: List[Dict[str, Any]] = []
-    jobs = [(s, daily_store, intraday_store, out, table, fmp_daily_dir) for s in todo]
+    jobs = [(s, daily_store, intraday_store, out, table, fmp_daily_dir, bar_caps) for s in todo]
     if workers <= 1:
         for i, j in enumerate(jobs, 1):
             results.append(_task(j))
@@ -569,7 +661,7 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
         with open(mpath, encoding="utf-8") as f:
             old = json.load(f)
         if (old["split_table"]["run_id"] == table.run_id and old["split_table"]["sha256"] == table.sha256
-                and all("unwitnessed" in e and "consolidated_prints" in e for e in old["symbols"].values())):
+                and all("unwitnessed" in e and "consolidated_prints" in e and "dropped_placeholders" in e for e in old["symbols"].values())):
             entries = dict(old["symbols"])
     consolidated_rows: List[Dict[str, Any]] = []
     for sym, e in built.items():
@@ -594,6 +686,8 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
         "subset": symbols is not None,
         "fmp_daily_dir": fmp_daily_dir,
         "repairs": sum(len(e["repairs"]) for e in entries.values()),
+        "dropped_placeholders": sum(e["dropped_placeholders"] for e in entries.values()),
+        "overrides_path": overrides_path,
         "failed": failed,
         "skipped_no_bars": skipped,
         "unlisted_files": sorted(on_disk - covered),
@@ -614,6 +708,8 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
                "bars_1d": sum(e["1d"]["bars"] for e in built.values() if "1d" in e),
                "bars_5min": sum(e["5min"]["bars"] for e in built.values() if "5min" in e),
                "dropped_by_break": sum(sum(e["dropped_by_break"].values()) for e in built.values()),
+               "dropped_placeholders": sum(e["dropped_placeholders"] for e in built.values()),
+               "symbols_with_placeholders": sum(e["dropped_placeholders"] > 0 for e in built.values()),
                "unlisted_files": len(manifest["unlisted_files"]), "bar_repairs": manifest["repairs"],
                "consolidated_prints": sum(len(e["consolidated_prints"]) for e in built.values()),
                "unwitnessed_outliers": sum(len(e["unwitnessed"]) for e in built.values()), "elapsed_s": manifest["elapsed_s"], "manifest": mpath,
