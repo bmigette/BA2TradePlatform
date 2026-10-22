@@ -866,7 +866,8 @@ def test_shipped_overrides_are_all_owner_reviewed():
     entries = st.load_overrides(SHIPPED_OVERRIDES)               # raises while any entry is still pending
     by = {(e["symbol"], e["event_date"], e["kind"] if "kind" in e else "split"): e for e in entries}
     assert len(entries) == 33 and all(e["reviewed_by"] in ("owner (B. Migette) 2026-10-20", "owner (B. Migette) 2026-10-21", "owner (B. Migette) 2026-10-22") for e in entries)
-    assert all(e["added"] in ("2026-10-20", "2026-10-21") for e in entries)
+    assert all(e["added"] in ("2026-10-20", "2026-10-21", "2026-10-22") for e in entries)
+    assert by[("TIGO", "2022-05-20", "split")]["ratio"] == 1.273 and "sec.gov" in by[("TIGO", "2022-05-20", "split")]["reason"]   # rights offering
     assert ("HON", "2026-06-28", "split") not in by              # the 1:2 reverse split is real (Honeywell 8-K): no reject
     cbsh = [by[("CBSH", d, "split")] for d in ("2016-11-30", "2017-11-29", "2019-12-02")]
     assert all(e["decision"] == "accept" and e["ratio"] == 1.05 and "sec.gov" in e["reason"] for e in cbsh)
