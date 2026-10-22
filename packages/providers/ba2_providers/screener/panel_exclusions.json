@@ -150,6 +150,41 @@
    "reason": "unclean rename: NHIC->NWCL 2026-09-22 changes CUSIP (SPAC merger) and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
    "added": "2026-10-21",
    "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "CCZ",
+   "kind": "exclude",
+   "reason": "unclean reused ticker (ipo_after_resume in _meta/reused_tickers.json ambiguous list): Comcast Holdings ZONES (exchangeable notes, not common stock); FMP ipoDate 2020-01-21 after the 2016 series start, five 2017-2018 gaps (gap/reuse audit 2026-10-22)",
+   "added": "2026-10-22",
+   "reviewed_by": "owner (B. Migette) 2026-10-21 rule: reused or unclean tickers are excluded"
+  },
+  {
+   "symbol": "FRMM",
+   "kind": "exclude",
+   "reason": "unclean reused ticker (ipo_after_resume in _meta/reused_tickers.json ambiguous list): FMP profile Forum Markets (ipoDate 2025-08-18) but Alpaca bars from 2017-06-27 with 2020 gaps: series likely joins two issuers (gap/reuse audit 2026-10-22)",
+   "added": "2026-10-22",
+   "reviewed_by": "owner (B. Migette) 2026-10-21 rule: reused or unclean tickers are excluded"
+  },
+  {
+   "symbol": "LION",
+   "kind": "exclude",
+   "reason": "unclean reused ticker (ipo_after_resume in _meta/reused_tickers.json ambiguous list): FMP profile Lionsgate Studios (ipoDate 2022-03-01) but Alpaca bars from 2016 (Fidelity Southern used LION until 2019) with a 2019-06-28..2021-12-09 gap: several issuers (gap/reuse audit 2026-10-22)",
+   "added": "2026-10-22",
+   "reviewed_by": "owner (B. Migette) 2026-10-21 rule: reused or unclean tickers are excluded"
+  },
+  {
+   "symbol": "NATL",
+   "kind": "exclude",
+   "reason": "unclean reused ticker (ipo_after_resume in _meta/reused_tickers.json ambiguous list): FMP profile NCR Atleos (ipoDate 2023-11-30) but Alpaca bars from 2016 with a 2016-11-10..2023-10-17 gap; ipoDate is 6 weeks after the resume so the build cannot prove the reuse (gap/reuse audit 2026-10-22)",
+   "added": "2026-10-22",
+   "reviewed_by": "owner (B. Migette) 2026-10-21 rule: reused or unclean tickers are excluded"
+  },
+  {
+   "symbol": "NUAI",
+   "kind": "exclude",
+   "reason": "unclean reused ticker (ipo_after_resume in _meta/reused_tickers.json ambiguous list): FMP profile New Era Energy & Digital (ipoDate 2025-08-13) but Alpaca bars from 2022-01-06 with a 2024-09-10..10-10 gap: series likely joins two issuers (gap/reuse audit 2026-10-22)",
+   "added": "2026-10-22",
+   "reviewed_by": "owner (B. Migette) 2026-10-21 rule: reused or unclean tickers are excluded"
   }
  ]
 }
