@@ -78,6 +78,7 @@ Environment overrides (so a longer/shorter search does not need a code edit):
     BA2_GRID2_POPULATION, BA2_GRID2_GENERATIONS
 """
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -255,6 +256,8 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
     ]
     if args.early_stop is not None:
         cmd += ["--early-stop", str(args.early_stop)]
+    # Always forwarded: absent, the launcher falls back to the legacy rule (any strict gain resets).
+    cmd += ["--early-stop-min-rel", str(args.early_stop_min_rel)]
     if args.mutation_prob is not None:
         cmd += ["--mutation-prob", str(args.mutation_prob)]
     # "Pass 0 to disable": a 0 must be FORWARDED, or the launcher re-applies its own default.
@@ -265,6 +268,14 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
     if args.workers:
         cmd += ["--workers", args.workers]
     return cmd
+
+
+def _min_rel(text: str) -> float:
+    """``--early-stop-min-rel``: finite and in (0, 1); 0 would be the legacy rule under a new name."""
+    v = float(text)
+    if not math.isfinite(v) or not 0 < v < 1:
+        raise argparse.ArgumentTypeError("must be finite and in (0, 1) (a fraction: 0.01 means 1%)")
+    return v
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -296,6 +307,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--generations", type=int, default=_DEFAULT_GENERATIONS,
                     help=f"GA generations (default {_DEFAULT_GENERATIONS}; "
                          f"$BA2_GRID2_GENERATIONS overrides).")
+    ap.add_argument("--early-stop-min-rel", type=_min_rel, default=0.01,
+                    help="Minimum RELATIVE gain (a fraction in (0, 1): 0.01 = 1%%) for a generation to "
+                         "reset the --early-stop patience (default 0.01, the owner's GA budget rule: "
+                         "patience 5 + 1%%). Always forwarded to the launcher.")
     ap.add_argument("--early-stop", type=int, default=None,
                     help="Generations without improvement before a job stops. Omitted -> "
                          "launcher default.")

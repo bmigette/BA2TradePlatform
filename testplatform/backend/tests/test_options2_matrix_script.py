@@ -213,14 +213,15 @@ def test_the_launched_command_is_exactly_this():
     assert cmd == [
         "/x/ba2-test", "optimize", "--expert", "FMPRating",
         "--universe", "AAPL,MSFT", "--strategy", "O_LEAPC",
-        "--start", "2023-01-01", "--end", "2025-12-31",
+        "--start", "2020-01-01", "--end", "2025-12-31",
         "--interval", "1d", "--population", "40", "--generations", "6",
         "--initial-capital", "20000.0",
-        "--options-store", "parquet",
+        "--options-store", "thetadata",
         "--ohlcv-history-source", "alpaca",
         "--fitness", "option_car",
         "--run-schedule", "daily", "--name", "opt2-FMPRating-O_LEAPC",
         "--parallel", "4",
+        "--early-stop-min-rel", "0.01",
         "--profit-cap-pct", "2000.0", "--profit-share-cap-pct", "25.0",
     ]
 
@@ -266,3 +267,13 @@ def test_the_history_source_is_always_stated_and_defaults_to_alpaca():
     assert cmd[cmd.index("--ohlcv-history-source") + 1] == "alpaca"
     cmd = d.build_cmd(_args(d, ohlcv_history_source="fmp"), "/x/ba2-test", "n", "FMPRating", "O_X", ["AAPL"])
     assert cmd[cmd.index("--ohlcv-history-source") + 1] == "fmp"
+
+
+def test_the_early_stop_min_rel_is_always_forwarded_and_defaults_to_one_percent():
+    """Absent, the launcher applies the legacy rule (any strict gain resets the patience); the
+    owner's GA budget is patience 5 + a 1% minimum relative gain, so the driver always states it."""
+    d = _driver()
+    cmd = d.build_cmd(_args(d), "/x/ba2-test", "n", "FMPRating", "O_X", ["AAPL"])
+    assert cmd[cmd.index("--early-stop-min-rel") + 1] == "0.01"
+    with pytest.raises(SystemExit):
+        d.build_parser().parse_args(["--early-stop-min-rel", "0"])
