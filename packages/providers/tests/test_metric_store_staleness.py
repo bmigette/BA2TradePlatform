@@ -132,6 +132,56 @@ def test_frozen_runs_exempt_zero_volume_and_isolated_per_symbol():
     assert ms.find_frozen_runs(mixed).empty                                # runs never span symbols
 
 
+def _bar_scans(bars, sym="X", vol=100.0, rvol=1.0, close=10.25):
+    """Identical scan rows (close, 20d average, RVOL) read from ``bars`` = [(bar_date, bar_signature)] one per weekly scan."""
+    return pd.DataFrame({"symbol": sym, "date": [f"2026-07-{d:02d}" for d in range(1, 1 + len(bars))], "close": close, "volume": vol,
+                         "relative_volume": rvol, "_bar_date": [b[0] for b in bars], "_bar_sig": [b[1] for b in bars]})
+
+
+def test_one_bar_carried_over_scans_and_two_identical_prints_are_not_a_frozen_feed():
+    # BDCIU 2026-06/07: a 100-share print at 10.25 on 06-24 and again on 07-07, nothing between; the weekly scans of 06-24, 07-01 (the
+    # 06-24 bar carried inside the 7-day tolerance) and 07-08 are identical in close / 20d average / RVOL but come from TWO bars
+    f = ms.find_frozen_runs(_bar_scans([("2026-06-24", 7), ("2026-06-24", 7), ("2026-07-07", 7)]))
+    assert f.empty
+    assert ms.check_frame_quality(_bar_scans([("2026-06-24", 7), ("2026-06-24", 7), ("2026-07-07", 7)]), thresholds={}) == {}
+    # without the bar columns (a stored frame) the scan-level rule is unchanged: the same rows ARE flagged
+    bare = _bar_scans([("2026-06-24", 7), ("2026-06-24", 7), ("2026-07-07", 7)]).drop(columns=list(ms.BAR_COLUMNS))
+    assert len(ms.find_frozen_runs(bare)) == 1
+
+
+def test_three_distinct_bars_that_repeat_in_full_are_still_a_frozen_feed():
+    runs = ms.find_frozen_runs(_bar_scans([("2026-06-24", 7), ("2026-07-01", 7), ("2026-07-08", 7), ("2026-07-15", 7)]))
+    assert len(runs) == 1 and runs.iloc[0]["n_scans"] == 4
+    assert ms.check_frame_quality(_bar_scans([("2026-06-24", 7), ("2026-07-01", 7), ("2026-07-08", 7)]), thresholds={}).get("frozen_runs") == 3.0
+
+
+def test_bars_that_differ_in_ohlcv_are_not_a_repeat_even_if_the_scan_columns_coincide():
+    # same close / 20d average / RVOL on three scans, but the bars' Open/High/Low differ: real prints
+    assert ms.find_frozen_runs(_bar_scans([("2026-06-24", 1), ("2026-07-01", 2), ("2026-07-08", 3)])).empty
+
+
+def _thin(high_step):
+    """A thin unit that prints 100 shares at 10.25 on a Friday only; ``high_step`` 0 = the very same bar every week."""
+    idx = pd.date_range("2026-01-02", "2026-03-27", freq="7D")
+    return pd.DataFrame({"Open": 10.25, "High": 10.25 + high_step * np.arange(len(idx)), "Low": 10.25, "Close": 10.25, "Volume": 100.0}, index=idx)
+
+
+def test_build_passes_real_identical_prints_that_differ_in_the_bar_and_flags_a_repeated_bar(tmp_path, monkeypatch):
+    _universe(monkeypatch, ["REAL"])
+    store, summary = _build(tmp_path, {"REAL": _thin(0.01)})          # same close / 20d volume / RVOL every week, different High
+    assert "__frozen_runs__" not in summary["quality_failures"]
+    df = ms.load_store(store)
+    assert not [c for c in df.columns if c.startswith("_bar")] and len(df) > 10      # the bookkeeping columns are never written
+    _universe(monkeypatch, ["COPY"])
+    (tmp_path / "copy").mkdir()
+    _store, summary = _build(tmp_path / "copy", {"COPY": _thin(0.0)})
+    assert summary["quality_failures"]["__frozen_runs__"]["n_symbols"] == 1                 # the same complete bar on new dates is a frozen feed
+
+
+def test_bar_columns_name():
+    assert ms.BAR_COLUMNS == ("_bar_date", "_bar_sig")
+
+
 def test_build_fails_on_frozen_rows_even_when_staleness_gate_is_bypassed(tmp_path, monkeypatch):
     """A flat, constant-volume symbol (what a frozen cache looks like) fails the build."""
     _universe(monkeypatch, ["FLAT"])

@@ -36,6 +36,20 @@ def test_malformed_file_raises(tmp_path, bad):
         load_suspension_events(_write(tmp_path, bad))
 
 
+def test_exchange_gap_is_a_resumable_event_like_an_otc_suspension(tmp_path):
+    # owner decision 2026-10-22: any >= 20-session run without an Alpaca bar is an event; the kind says whether FMP traded through it
+    d = _write(tmp_path, {"VG": [["2022-07-20", "2025-01-24", "exchange_gap", 630, None]], "NBIS": [["2022-02-25", "2024-10-21", "exchange_gap", 665, 0.0]]})
+    ev = load_suspension_events(d)
+    assert ev["VG"] == ((date(2022, 7, 20), date(2025, 1, 24)),)
+    assert is_suspended("VG", date(2023, 1, 3), ev) and not is_suspended("VG", date(2025, 1, 24), ev) and not is_suspended("VG", date(2022, 7, 20), ev)
+    assert symbols_to_liquidate(["VG", "AAPL"], date(2023, 1, 3), ev) == ["VG"]
+
+
+def test_exchange_gap_without_a_resume_is_malformed(tmp_path):
+    with pytest.raises(ValueError, match="malformed"):
+        load_suspension_events(_write(tmp_path, {"X": [["2024-05-31", None, "exchange_gap", 90, None]]}))
+
+
 def test_missing_keys_raise(tmp_path):
     (tmp_path / "_meta").mkdir()
     (tmp_path / "_meta" / "suspensions.json").write_text(json.dumps({"symbols": {}}))

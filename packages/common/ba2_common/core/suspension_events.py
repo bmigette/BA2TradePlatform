@@ -6,11 +6,13 @@ whole period (FMP, which carries OTC, shows trading) and, marked at its stale la
 docstring "EXCHANGE SUSPENSIONS / DELISTINGS") and writes ``<cache dir>/_meta/suspensions.json``::
 
     {"build": "<run_id> built <ts>", "rule": {...},
-     "symbols": {SYM: [[last_session, resume_session|null, kind, missing_sessions, fmp_traded_share|null], ...]},
-     "undecided": {SYM: [[last_session, resume_session, missing_sessions, reason], ...]}}
+     "symbols": {SYM: [[last_session, resume_session|null, kind, missing_sessions, fmp_traded_share|null], ...]}}
 
-``undecided`` lists the >= 20-session gaps the build could not judge (no FMP file / FMP not covering): visibility only, NOT
-suspensions; the loader ignores it.
+``otc_suspension``: a run of >= 20 NYSE sessions with no Alpaca bar where FMP traded on >= 80% of them.  ``exchange_gap``: any other such
+run (FMP shows no trading, does not cover it, or there is no FMP file; the cause is unknown: halt, delist-and-relist, merger, no trades).
+``delisted``: the last bar is > 5 sessions before the store's last session (no resume).  The backtest treats all three alike.  The build
+also writes ``_meta/reused_tickers.json`` (tickers whose pre-gap bars it DROPPED because the current company listed at the gap's end, and
+the gaps it could not judge); the loader does not read it.
 
 A backtest holding SYM on a session strictly after ``last_session`` (and before ``resume_session``, when there is one) closes
 it at the last exchange close and does not re-enter until the symbol trades again.  Pure: BT today, a live caller may use the
@@ -25,7 +27,7 @@ from datetime import date
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 SUSPENSIONS_FILE = os.path.join("_meta", "suspensions.json")
-KINDS = ("otc_suspension", "delisted")
+KINDS = ("otc_suspension", "exchange_gap", "delisted")
 
 #: ``{symbol: ((last_session, resume_session | None), ...)}`` -- ascending, non-overlapping.
 SuspensionEvents = Mapping[str, Tuple[Tuple[date, Optional[date]], ...]]

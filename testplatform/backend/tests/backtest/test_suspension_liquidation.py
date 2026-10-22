@@ -210,6 +210,38 @@ def test_handler_reads_events_for_alpaca_only(_cert_cache):
     assert h._suspension_events_for(ALPACA) == {"X": ((date(2024, 1, 4), None),)}
 
 
+def test_exchange_gap_event_of_the_certified_cache_closes_a_position_and_blocks_entries_like_an_otc_suspension(tmp_path, monkeypatch):
+    # owner decision 2026-10-22: a >= 20-session run with no Alpaca bar and no FMP trading is an ``exchange_gap`` event; the engine
+    # treats it exactly as it treats ``otc_suspension`` (close at the last exchange close, no entry until bars resume)
+    from app.services.backtest import daily_backtest_handler as h, history_source
+    from tests.alpaca_certified_cache import write_certified_meta
+    history_source._CERTIFIED_MEMO.clear()
+    monkeypatch.setattr(history_source, "job_history_cache_dir", lambda cfg: str(tmp_path))
+    write_certified_meta(tmp_path, {"AAPL": [["2024-01-04", "2024-03-01", "exchange_gap", 39, None]]})
+    try:
+        events = h._suspension_events_for(ALPACA)
+        assert events == EVENTS
+        acct, ctx, ps = _acct(events)
+        try:
+            _hold(acct, ps)
+            cash_after_entry = acct.get_balance()
+            ps.set_clock(AFTER)
+            assert acct.liquidate_suspended_positions(AFTER) is True
+            acct.refresh_transactions()
+            assert acct.get_positions() == [] and acct.get_balance() == pytest.approx(cash_after_entry + 10 * 150.0)
+            (trade,) = acct.get_round_trip_trades()
+            assert trade["exit_reason"] == "suspension_liquidation"
+            e = _engine(acct, ps)
+            ps.bar_at = lambda s, t=None: {"close": 150.0}
+            assert e._bar_universes(AFTER)[0] == []                                  # blocked inside the gap
+            ps.set_clock(RESUME)
+            assert acct.liquidate_suspended_positions(RESUME) is False and e._bar_universes(RESUME)[0] == ["AAPL"]   # decidable on the resume session
+        finally:
+            ctx.__exit__(None, None, None)
+    finally:
+        history_source._CERTIFIED_MEMO.clear()
+
+
 def test_fmp_source_needs_no_certificate(tmp_path, monkeypatch):
     from app.services.backtest import daily_backtest_handler as h, history_source
     monkeypatch.setattr(history_source, "job_history_cache_dir", lambda cfg: str(tmp_path / "nothing"))

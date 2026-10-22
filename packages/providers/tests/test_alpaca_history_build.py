@@ -543,7 +543,7 @@ class FakeWarm:
 def test_market_conditions_is_the_last_step_of_both_sources(tmp_path):
     ph = load_prepare_history()
     assert ph.SOURCE_STEPS["alpaca"][-1] == "market-conditions" and ph.SOURCE_STEPS["fmp"][-1] == "market-conditions"
-    assert ph.SOURCE_STEPS["alpaca"] == ("download", "split-table", "build", "verify", "market-conditions")
+    assert ph.SOURCE_STEPS["alpaca"] == ("download", "split-table", "ipo-dates", "build", "verify", "market-conditions")
     assert ph.SOURCE_STEPS["fmp"] == ("download", "verify", "market-conditions")
 
 
@@ -970,11 +970,15 @@ def test_the_gate_certificate_reads_the_manifest_the_build_writes(env):
 # ---------------------------------------------------------------------------
 # exchange suspensions / delistings (_meta/suspensions.json)
 # ---------------------------------------------------------------------------
-def _susp_env(env, tmp_path, sym, drop, fmp_days="all", fmp_volume=500, end="2026-10-12", fmp_tz=None):
-    """One symbol with bars every session 2024-01-02..``end`` except the ``drop`` days; an FMP file over ``fmp_days`` (all sessions)."""
+def _susp_env(env, tmp_path, sym, drop, fmp_days="all", fmp_volume=500, end="2026-10-12", fmp_tz=None, ipo="absent", intraday=False):
+    """One symbol with bars every session 2024-01-02..``end`` except the ``drop`` days; an FMP file over ``fmp_days`` (all sessions).
+    ``ipo``: "absent" = no ipo_dates.json; else the profile ipoDate of the symbol (None = a profile without one) in that file."""
     daily, intr, out = env
+    if ipo != "absent":
+        _write_ipo(out, {sym: ipo})
     all_days = sessions("2024-01-02", end)
-    write_symbol(daily, intr, sym, [d for d in all_days if d not in set(drop)])
+    i_days = sessions("2024-02-01", "2024-02-29") + sessions("2024-05-16", "2024-06-14") if intraday else ()
+    write_symbol(daily, intr, sym, [d for d in all_days if d not in set(drop)], intraday_days=i_days)
     make_table(out)
     fmp = tmp_path / "fmp"
     fmp.mkdir(exist_ok=True)
@@ -987,6 +991,11 @@ def _susp_env(env, tmp_path, sym, drop, fmp_days="all", fmp_volume=500, end="202
     return f, s
 
 
+def _write_ipo(out, symbols):
+    (out / "_meta").mkdir(parents=True, exist_ok=True)
+    (out / "_meta" / "ipo_dates.json").write_text(json.dumps({"fetched_at": "x", "source": "test", "symbols": symbols}))
+
+
 def test_an_otc_run_with_fmp_trading_is_a_suspension(env, tmp_path):
     drop = sessions("2024-03-01", "2024-05-15")                         # 55 sessions with no Alpaca bar, FMP traded every day
     f, s = _susp_env(env, tmp_path, "NESR", drop)
@@ -997,14 +1006,19 @@ def test_an_otc_run_with_fmp_trading_is_a_suspension(env, tmp_path):
     assert m["suspension_events"] == 1 and s["suspension_events"] == 1 and s["symbols_with_suspensions"] == 1
 
 
-def test_a_gap_without_fmp_trading_or_fmp_file_is_not_a_suspension(env, tmp_path):
+def test_a_gap_without_fmp_trading_or_fmp_file_is_an_exchange_gap_event(env, tmp_path):
+    # owner decision 2026-10-22: EVERY >= 20-session run without an Alpaca bar is an event; otc_suspension only when FMP traded through it
     drop = sessions("2024-03-01", "2024-05-15")
-    f, _ = _susp_env(env, tmp_path, "THIN", drop, fmp_volume=0)         # FMP has rows but no volume: a normal no-trade gap
-    assert f["symbols"] == {}
-    f, _ = _susp_env(env, tmp_path, "THIN", drop, fmp_days=None)        # no FMP file at all
-    assert f["symbols"] == {}
-    f, _ = _susp_env(env, tmp_path, "THIN", drop, fmp_days=sessions("2024-01-02", "2024-03-20"))   # FMP does not cover the run
-    assert f["symbols"] == {}
+    want = ["2024-02-29", "2024-05-16", "exchange_gap", len(drop) - 1]
+    f, _ = _susp_env(env, tmp_path, "THIN", drop, fmp_volume=0)         # FMP has rows but no volume: judged, share 0.0
+    assert f["symbols"]["THIN"] == [want + [0.0]]
+    f, _ = _susp_env(env, tmp_path, "NOF", drop, fmp_days=None)         # no FMP file at all: share unknown
+    assert f["symbols"]["NOF"] == [want + [None]]
+    f, _ = _susp_env(env, tmp_path, "PART", drop, fmp_days=sessions("2024-01-02", "2024-03-20"))   # FMP does not cover the run
+    assert f["symbols"]["PART"] == [want + [None]]
+    f, _ = _susp_env(env, tmp_path, "FULL", drop, fmp_volume=500)       # FMP traded every session: the stricter kind
+    assert f["symbols"]["FULL"][0][2] == "otc_suspension"
+    assert "undecided" not in f
 
 
 def test_a_short_gap_is_not_a_suspension(env, tmp_path):
@@ -1054,25 +1068,100 @@ def test_fmp_naive_dates_keeps_daily_labels_converts_intraday_and_refuses_a_time
     assert fmp_naive_dates(naive, False, "x") is naive
 
 
-def test_gaps_fmp_cannot_judge_are_recorded_as_undecided_not_as_suspensions(env, tmp_path):
-    drop = sessions("2024-03-01", "2024-05-15")
-    f, s = _susp_env(env, tmp_path, "NOF", drop, fmp_days=None)
-    assert f["symbols"] == {} and f["undecided"]["NOF"] == [["2024-02-29", "2024-05-16", len(drop) - 1, "no_fmp_file"]]
-    m = json.loads((env[2] / "_meta" / "build_manifest.json").read_text())
-    assert m["undecided_gaps"] == 1 and m["symbols"]["NOF"]["undecided_gaps"] == f["undecided"]["NOF"]
-    assert s["undecided_gaps"] == 1 and s["symbols_with_undecided_gaps"] == 1 and s["suspension_events"] == 0
-    f, _ = _susp_env(env, tmp_path, "NOF", drop, fmp_days=sessions("2024-01-02", "2024-03-20"))
-    assert f["symbols"] == {} and f["undecided"]["NOF"][0][3] == "fmp_not_covering"
-    f, _ = _susp_env(env, tmp_path, "NOF", drop, fmp_volume=0)           # judged (no FMP volume): neither suspended nor undecided
-    assert f["symbols"] == {} and f["undecided"] == {}
-    f, _ = _susp_env(env, tmp_path, "NOF", sessions("2024-03-01", "2024-03-26"), fmp_days=None)   # < 20 sessions: nothing to judge
-    assert f["undecided"] == {}
-
-
-def test_detect_exchange_events_returns_events_and_undecided():
+def test_detect_exchange_events_returns_a_flat_event_list():
     dates = pd.to_datetime(sessions("2024-01-02", "2024-02-29") + sessions("2024-05-16", "2026-10-12"))
-    ev, und = bld.detect_exchange_events(dates, None, "2026-10-12")
-    assert ev == [] and und[0][:2] == ["2024-02-29", "2024-05-16"] and und[0][3] == "no_fmp_file"
+    ev = bld.detect_exchange_events(dates, None, "2026-10-12")
+    assert ev == [["2024-02-29", "2024-05-16", "exchange_gap", ev[0][3], None]] and ev[0][3] >= 20
+
+
+def test_event_counts_by_kind_are_in_the_summary_and_the_manifest(env, tmp_path):
+    f, s = _susp_env(env, tmp_path, "THIN", sessions("2024-03-01", "2024-05-15"), fmp_days=None)
+    m = json.loads((env[2] / "_meta" / "build_manifest.json").read_text())
+    assert s["suspension_events"] == 1 and s["suspension_events_by_kind"] == {"exchange_gap": 1} and m["suspension_events"] == 1
+
+
+# ---------------------------------------------------------------------------
+# reused tickers (_meta/reused_tickers.json, input _meta/ipo_dates.json)
+# ---------------------------------------------------------------------------
+GAP = sessions("2024-03-01", "2024-05-15")                    # resume 2024-05-16
+
+
+def _reused(env):
+    return json.loads((env[2] / "_meta" / "reused_tickers.json").read_text())
+
+
+def test_a_ticker_whose_company_listed_at_the_end_of_the_gap_drops_the_bars_before_it(env, tmp_path):
+    f, s = _susp_env(env, tmp_path, "VG", GAP, ipo="2024-05-16", intraday=True, fmp_days=None)
+    daily, intr, out = env
+    d1 = pd.read_parquet(out / "VG_1d.parquet")
+    d5 = pd.read_parquet(out / "VG_5min.parquet")
+    assert str(d1["Date"].iloc[0].date()) == "2024-05-16" and str(d5["Date"].iloc[0].date()) == "2024-05-16"      # both series start at the relist
+    assert d5["Date"].dt.normalize().nunique() == len(sessions("2024-05-16", "2024-06-14")) and not (d5["Date"].dt.normalize() < "2024-05-16").any()
+    r = _reused(env)["reused"]["VG"]
+    assert r["gap"] == ["2024-02-29", "2024-05-16"] and r["missing_sessions"] == len(GAP) - 1
+    assert r["dropped"]["last"] == "2024-02-29" and r["dropped"]["first"] == "2024-01-02" and r["dropped"]["1d"] > 0 and r["dropped"]["5min"] > 0
+    assert r["evidence"]["ipo_date"] == "2024-05-16" and r["evidence"]["days_from_resume"] == 0
+    assert "VG" not in f["symbols"] and _reused(env)["ambiguous"] == {}                  # the gap is gone with the old company's bars
+    assert s["reused_tickers"] == ["VG"]
+    m = json.loads((out / "_meta" / "build_manifest.json").read_text())
+    assert m["reused_tickers"] == 1 and m["symbols"]["VG"]["1d"]["first"] == "2024-05-16"
+
+
+def test_the_ipo_date_may_be_a_few_days_either_side_of_the_resume(env, tmp_path):
+    _susp_env(env, tmp_path, "VG", GAP, ipo="2024-05-20")                                 # +4 days
+    assert "VG" in _reused(env)["reused"]
+    _susp_env(env, tmp_path, "VG", GAP, ipo="2024-05-12")                                 # -4 days
+    assert "VG" in _reused(env)["reused"]
+    _susp_env(env, tmp_path, "VG", GAP, ipo="2024-05-09")                                 # -7 days: the tolerance edge
+    assert "VG" in _reused(env)["reused"]
+    _susp_env(env, tmp_path, "VG", GAP, ipo="2024-05-08")                                 # -8 days: ambiguous, not reused
+    assert _reused(env)["reused"] == {}
+
+
+def test_the_same_company_after_a_long_suspension_keeps_its_history_and_the_event(env, tmp_path):
+    f, _ = _susp_env(env, tmp_path, "NBIS", GAP, fmp_days=None, ipo="2011-05-24")
+    d1 = pd.read_parquet(env[2] / "NBIS_1d.parquet")
+    assert str(d1["Date"].iloc[0].date()) == "2024-01-02"
+    assert f["symbols"]["NBIS"][0][:3] == ["2024-02-29", "2024-05-16", "exchange_gap"]
+    assert _reused(env)["reused"] == {} and _reused(env)["ambiguous"] == {}               # judged: not listed anywhere
+
+
+@pytest.mark.parametrize("ipo,reason", [(None, "no_ipo_date"), ("2024-04-10", "ipo_inside_gap"), ("2024-08-01", "ipo_after_resume"),
+                                         ("absent", "no_ipo_dates_file")])
+def test_ambiguous_evidence_is_not_truncated_and_is_listed_for_review(env, tmp_path, ipo, reason):
+    f, s = _susp_env(env, tmp_path, "AMB", GAP, ipo=ipo)
+    d1 = pd.read_parquet(env[2] / "AMB_1d.parquet")
+    assert str(d1["Date"].iloc[0].date()) == "2024-01-02"                                # never guess: nothing dropped
+    assert f["symbols"]["AMB"][0][2] in ("exchange_gap", "otc_suspension")             # the gap is still an event
+    assert _reused(env)["reused"] == {} and _reused(env)["ambiguous"]["AMB"] == [["2024-02-29", "2024-05-16", len(GAP) - 1, reason]]
+    assert s["gaps_for_review"]["AMB"][0][3] == reason and (s["ipo_dates_file"] is None) == (ipo == "absent")
+
+
+def test_only_gaps_after_the_reuse_cut_are_events_and_the_old_ones_go_with_the_old_company(env, tmp_path):
+    daily, intr, out = env
+    all_days = sessions("2024-01-02", "2026-10-12")
+    drop = set(sessions("2024-03-01", "2024-05-15")) | set(sessions("2025-03-03", "2025-05-30"))
+    write_symbol(daily, intr, "TWO", [d for d in all_days if d not in drop])
+    make_table(out)
+    _write_ipo(out, {"TWO": "2025-06-02"})                                                # the SECOND gap's end
+    bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1)
+    f = json.loads((out / "_meta" / "suspensions.json").read_text())
+    assert _reused(env)["reused"]["TWO"]["gap"][1] == "2025-06-02" and "TWO" not in f["symbols"]      # both old gaps are before the cut
+    _write_ipo(out, {"TWO": "2024-05-16"})                                                # the FIRST gap's end: the second gap is after the cut
+    bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1)
+    f = json.loads((out / "_meta" / "suspensions.json").read_text())
+    assert _reused(env)["reused"]["TWO"]["gap"][1] == "2024-05-16"
+    assert [e[:2] for e in f["symbols"]["TWO"]] == [["2025-02-28", "2025-06-02"]] and _reused(env)["ambiguous"] == {}   # ipo <= its first bar: same company
+
+
+def test_a_malformed_ipo_dates_file_stops_the_build(env, tmp_path):
+    daily, intr, out = env
+    write_symbol(daily, intr, "ABC", sessions("2024-01-02", "2024-01-05"))
+    make_table(out)
+    (out / "_meta").mkdir(exist_ok=True)
+    (out / "_meta" / "ipo_dates.json").write_text(json.dumps({"symbols": {"ABC": "not-a-date"}}))
+    with pytest.raises(Exception, match="malformed"):
+        bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1)
 
 
 def test_subset_build_does_not_merge_entries_judged_against_another_fmp_dir(env, tmp_path):
@@ -1086,15 +1175,15 @@ def test_subset_build_does_not_merge_entries_judged_against_another_fmp_dir(env,
     m = json.loads((out / "_meta" / "build_manifest.json").read_text())
     assert sorted(m["symbols"]) == ["BBB"] and m["fmp_daily_dir"] == str(other)       # AAA's entries are not carried over
     f = json.loads((out / "_meta" / "suspensions.json").read_text())
-    assert f["symbols"] == {} and f["undecided"] == {}
+    assert f["symbols"] == {}
 
 
-def test_subset_build_does_not_merge_an_old_manifest_without_undecided_gaps(env, tmp_path):
+def test_subset_build_does_not_merge_an_old_manifest_without_reused_ticker_entries(env, tmp_path):
     _susp_env(env, tmp_path, "AAA", sessions("2024-03-01", "2024-05-15"))
     daily, intr, out = env
     mp = out / "_meta" / "build_manifest.json"
     m = json.loads(mp.read_text())
-    del m["symbols"]["AAA"]["undecided_gaps"]
+    del m["symbols"]["AAA"]["reused_ticker"]
     mp.write_text(json.dumps(m))
     write_symbol(daily, intr, "BBB", sessions("2024-01-02", "2026-10-12"))
     bld.build_cache(daily_store=str(daily), intraday_store=str(intr), out=str(out), workers=1, symbols=["BBB"], fmp_daily_dir=str(tmp_path / "fmp"))

@@ -5,7 +5,7 @@ Runbook: docs/REPRODUCE-BACKTESTS.md section 4 (data preparation).  Modelled on 
 steps, ``--steps`` / ``--from-step``, ``--dry-run``, a JSON report, exit codes 0 / 1 / 2.
 
 REQUIRED ``--source {alpaca,fmp}``.  Steps valid per source (in this order):
-    alpaca: download, split-table, build, verify, market-conditions        fmp: download, verify, market-conditions
+    alpaca: download, split-table, ipo-dates, build, verify, market-conditions        fmp: download, verify, market-conditions
   Every step is implemented.  A step that is not valid for the source refuses (exit 2).  Never a silent no-op.  The default
   (no ``--steps``) runs EVERY step of the source, ``download`` first: it makes network requests (alpaca: resume-safe, ~0 requests
   over complete stores) -- pass ``--steps`` to run less.
@@ -31,6 +31,14 @@ STEP alpaca / download
                 Common: ``--keys-db`` (default: ``--db``) ``--account-id 1 --rpm 150 --min-remaining 60``.  A rerun over complete
                 stores makes ~0 data requests; a run that exits non-zero fails the step.
     python tools/prepare_history.py --source alpaca --steps download
+
+STEP alpaca / ipo-dates
+  ipo-dates     Caches the FMP company-profile ``ipoDate`` of every symbol of the stores in ``<out>/_meta/ipo_dates.json`` (FMP
+                ``/api/v3/profile``, 100 symbols per request; the key is read from ``--db`` only when a symbol is missing from the file).
+                This is the evidence the build needs to tell a REUSED ticker (the current company listed at the end of a >= 20-session
+                gap: the bars before the gap are dropped) from a long suspension of the same company.  A rerun is OFFLINE;
+                ``--refresh-ipo-dates`` fetches again.  Module docstring of ``ba2_providers/ohlcv/alpaca_history/ipo_dates.py``.
+    python tools/prepare_history.py --source alpaca --steps ipo-dates
 
 STEP alpaca / build
   build         Builds ``<out>/<SYM>_1d.parquet`` and ``<out>/<SYM>_5min.parquet`` (the FMP file layout) from the RAW daily store
@@ -118,7 +126,7 @@ from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOURCE_STEPS = {"alpaca": ("download", "split-table", "build", "verify", "market-conditions"),
+SOURCE_STEPS = {"alpaca": ("download", "split-table", "ipo-dates", "build", "verify", "market-conditions"),
                 "fmp": ("download", "verify", "market-conditions")}
 MC_PROFILES = ("ohlcv-v1", "ta-structure-v1")
 SPINCO_SYMBOLS_FILE = "symbols_spinco_20261020.txt"       # in the daily store: spin-off companies fetched by hand on 2026-10-20
@@ -182,6 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "a value before the asof is refused)")
     ap.add_argument("--refresh-yahoo", action="store_true",
                     help="fetch Yahoo again: split-table (rule-B split history, default: use <out>/_meta/yahoo_splits) and verify (daily closes, default: use <report>/verify/yahoo_daily)")
+    ap.add_argument("--refresh-ipo-dates", action="store_true", help="ipo-dates: fetch every profile again (default: only symbols missing from the cache file)")
     ap.add_argument("--overrides", default=st.OVERRIDES_PATH, help="reviewed split overrides (default: %(default)s)")
     ap.add_argument("--universe-file", help="market-conditions: universe file, one symbol per line (REQUIRED for that step)")
     ap.add_argument("--start", help="market-conditions: first DECISION session, ISO date (REQUIRED for that step)")
@@ -363,6 +372,36 @@ def step_fmp_download(a: argparse.Namespace, log: Callable[[str], None]) -> Dict
 
 def plan_fmp_download(a: argparse.Namespace) -> List[str]:
     return ["download: " + " ".join(fmp_download_argv(a))]
+
+
+def step_ipo_dates(a: argparse.Namespace, log: Callable[[str], None]) -> Dict[str, Any]:
+    from ba2_providers.ohlcv.alpaca_history import build as bld, ipo_dates as ipo, split_build as sb
+    symbols = _symbol_list(a)
+    symbols = [s.strip().upper().replace(".", "-") for s in symbols] if symbols else bld.list_symbols(a.store, a.store_5min)
+    result = ipo.fetch_ipo_dates(symbols, a.out, _LazyProfileGetter(sb.read_fmp_key, a.db), refresh=a.refresh_ipo_dates, log=log)
+    for k, v in result.items():
+        print(f"  {k}: {v}")
+    return result
+
+
+class _LazyProfileGetter:
+    """The FMP key is read (from the DB) at the first request only: a rerun over a complete cache never opens the DB."""
+    def __init__(self, read_key: Callable[[str], str], db: str):
+        self._read_key, self._db, self._get = read_key, db, None
+
+    def __call__(self, symbols: List[str]):
+        if self._get is None:
+            from ba2_providers.ohlcv.alpaca_history import ipo_dates as ipo
+            self._get = ipo.make_profile_getter(self._read_key(self._db))
+        return self._get(symbols)
+
+
+def plan_ipo_dates(a: argparse.Namespace) -> List[str]:
+    from ba2_providers.ohlcv.alpaca_history import build as bld, ipo_dates as ipo
+    n = len(bld.list_symbols(a.store, a.store_5min))
+    have = ipo.load_ipo_dates(ipo.ipo_dates_path(a.out))
+    return [f"ipo-dates: {n} store symbols; {'no cache file' if have is None else str(len(have)) + ' symbols already cached'} "
+            f"({'FMP key read from ' + a.db if have is None or a.refresh_ipo_dates else 'offline unless a symbol is missing'})"]
 
 
 def _symbol_list(a: argparse.Namespace) -> Optional[List[str]]:
@@ -567,11 +606,11 @@ def plan_market_conditions(a: argparse.Namespace) -> List[str]:
 
 
 RUNNERS: Dict[Tuple[str, str], Callable[[argparse.Namespace, Callable[[str], None]], Dict[str, Any]]] = {
-    ("alpaca", "download"): step_alpaca_download, ("alpaca", "split-table"): step_split_table, ("alpaca", "build"): step_build,
+    ("alpaca", "download"): step_alpaca_download, ("alpaca", "split-table"): step_split_table, ("alpaca", "ipo-dates"): step_ipo_dates, ("alpaca", "build"): step_build,
     ("alpaca", "verify"): step_verify, ("fmp", "download"): step_fmp_download, ("fmp", "verify"): step_verify,
     ("alpaca", "market-conditions"): step_market_conditions, ("fmp", "market-conditions"): step_market_conditions}
 PLANNERS: Dict[Tuple[str, str], Callable[[argparse.Namespace], List[str]]] = {
-    ("alpaca", "download"): plan_alpaca_download, ("alpaca", "split-table"): plan_split_table, ("alpaca", "build"): plan_build,
+    ("alpaca", "download"): plan_alpaca_download, ("alpaca", "split-table"): plan_split_table, ("alpaca", "ipo-dates"): plan_ipo_dates, ("alpaca", "build"): plan_build,
     ("alpaca", "verify"): plan_verify, ("fmp", "download"): plan_fmp_download, ("fmp", "verify"): plan_verify,
     ("alpaca", "market-conditions"): plan_market_conditions, ("fmp", "market-conditions"): plan_market_conditions}
 

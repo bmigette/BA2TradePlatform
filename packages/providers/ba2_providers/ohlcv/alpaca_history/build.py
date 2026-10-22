@@ -62,22 +62,30 @@ PLACEHOLDER DAILY BARS.  A raw daily bar with v == 0 AND n == 0 is Alpaca's plac
 EXCHANGE SUSPENSIONS / DELISTINGS (``<out>/_meta/suspensions.json``; read by the backtest engine through
   ``ba2_common.core.suspension_events``).  Alpaca's feed carries exchange prints only: a symbol suspended from its exchange trades OTC and
   has NO bars for the whole period while FMP (which carries OTC) shows trading; marked at its stale last close it then jumps on relisting
-  (NESR +257%, MDXG +98%, SMCI +73%).  Per symbol, on its final daily series (after the placeholder drop and the break): an
-  ``otc_suspension`` is a run of >= SUSPENSION_MIN_SESSIONS (20) NYSE regular sessions with no bar strictly between two real bars where the
-  FMP daily file (``fmp_daily_dir``) has a bar with Volume > 0 on >= SUSPENSION_MIN_FMP_SHARE (80 %) of those sessions and COVERS the
-  run (FMP's first date <= the run's first session, last date >= its last session).  No FMP file / not covering -> NOT a suspension (thin
-  names have hundreds of 10+ session gaps that are only no trades) -- but such a >= 20-session gap that cannot be judged is RECORDED as
-  an UNDECIDED gap (visibility only: it is not a suspension and blocks nothing, owner decision 2026-10-21 to keep the 80 % rule):
-  per symbol ``entry["undecided_gaps"] = [[last_session, resume_session, missing_sessions, reason], ...]`` with reason ``no_fmp_file``
-  (no file, or an empty one) | ``fmp_not_covering``; the manifest's top-level ``undecided_gaps`` count, the run summary's
-  ``undecided_gaps`` / ``symbols_with_undecided_gaps`` and an ``"undecided": {SYM: [...]}`` block of suspensions.json (ignored by the
-  engine's loader).  A ``delisted`` event is a symbol whose last real bar is more than
-  DELISTED_SLACK_SESSIONS (5) regular sessions before the store's last session (last session <= the split table's asof): the slack absorbs
-  a late final print and placeholder-dropped no-trade days at the tail (a name quiet for <= 5 sessions is not delisted); a longer quiet
-  tail is treated as gone, the conservative reading for a position (closed at the last real close, no re-entry).  Each event is
-  ``[last_session, resume_session | null, kind, missing_sessions, fmp_traded_share | null]``; the file also carries the build identity
-  (split table run_id + built_at, like the gate certificate) and the rule.  A subset run merges like the manifest (the events ride in
-  each symbol's manifest entry).  Counted in the manifest and the run summary.
+  (NESR +257%, MDXG +98%, SMCI +73%).  Per symbol, on its final daily series (after the placeholder drop, the break and the reused-ticker
+  truncation): EVERY run of >= SUSPENSION_MIN_SESSIONS (20) NYSE regular sessions with no bar strictly between two real bars is an
+  EVENT (owner decision 2026-10-22; before it only runs FMP traded through were events and the rest was "undecided", which let a held
+  position ride through the gap).  Its kind: ``otc_suspension`` when the FMP daily file (``fmp_daily_dir``) COVERS the run (FMP's first
+  date <= the run's first session, last date >= its last session) and has a bar with Volume > 0 on >= SUSPENSION_MIN_FMP_SHARE (80 %) of
+  the run's sessions; ``exchange_gap`` otherwise (FMP shows no trading, does not cover the run, or there is no FMP file: the name was
+  halted, delisted-and-relisted, merged away or just untraded -- the backtest cannot tell, and treats it the same).  The engine closes a
+  held position at the last exchange close before the gap and blocks entries until bars resume, for both kinds.  A ``delisted`` event is
+  a symbol whose last real bar is more than DELISTED_SLACK_SESSIONS (5) regular sessions before the store's last session (last session <=
+  the split table's asof): the slack absorbs a late final print and placeholder-dropped no-trade days at the tail; a longer quiet tail is
+  treated as gone, the conservative reading for a position (closed at the last real close, no re-entry).  Each event is
+  ``[last_session, resume_session | null, kind, missing_sessions, fmp_traded_share | null]`` (the share is null when FMP could not judge
+  the run); the file also carries the build identity (split table run_id + built_at, like the gate certificate) and the rule.  A subset
+  run merges like the manifest (the events ride in each symbol's manifest entry).  Counted in the manifest and the run summary.
+REUSED TICKERS (``<out>/_meta/reused_tickers.json``; input ``<out>/_meta/ipo_dates.json`` from the ``ipo-dates`` step).  A ticker's series can
+  join two companies (VG: Vonage until 2022-07, Venture Global from its 2025-01-24 IPO).  For each gap above, the symbol's FMP profile
+  ``ipoDate`` is the evidence: within REUSE_IPO_TOL_DAYS (7) calendar days of the gap's END (the first bar after it) = the current company
+  listed there = the bars BEFORE the gap are another company's: the build DROPS them (daily and 5-minute, like a series break at the
+  resume session; where several gaps match, the last one) and records ``{symbol, gap [last, resume], missing_sessions, dropped
+  {1d, 5min, first, last}, evidence {ipo_date, source, days_from_resume}}``.  ``ipoDate`` on/before the gap's first bar = the same company
+  (a long suspension: history kept, the gap stays an event).  Anything else -- no profile / no ipoDate / no ``ipo_dates.json`` / an ipoDate
+  inside the gap or after its end -- is AMBIGUOUS: nothing is dropped (the gap stays an event) and the gap is listed under ``ambiguous`` of
+  reused_tickers.json (``[last, resume, missing, reason]``, reason ``no_ipo_dates_file`` | ``no_ipo_date`` | ``ipo_inside_gap`` |
+  ``ipo_after_resume``), in the manifest entry (``gap_review``) and in the run summary for a human to decide.  Never a guess.
 OUTPUT.  ``<out>/<SYM>_1d.parquet``, ``<out>/<SYM>_5min.parquet`` (atomic: temp file + os.replace) and
 ``<out>/_meta/build_manifest.json`` (the only thing this step writes under ``_meta``): the stores' asof, the split table's
 run_id / sha256 / inputs_sha256 / overrides_sha256, the input chunk hashes, per symbol the first/last date and bar count of
@@ -95,6 +103,7 @@ import json
 import math
 import os
 import time
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -103,6 +112,7 @@ import numpy as np
 import pandas as pd
 
 from ba2_common import config as _cfg
+from ba2_providers.ohlcv.alpaca_history.ipo_dates import load_ipo_dates
 from ba2_providers.ohlcv.alpaca_history.split_build import DEFAULT_OUT, atomic_write, drop_placeholder_bars, read_fmp_frame
 from ba2_providers.ohlcv.alpaca_history.split_table import OVERRIDES_PATH, load_bar_caps
 
@@ -126,8 +136,11 @@ SUSPENSIONS_NAME = "suspensions.json"
 SUSPENSION_MIN_SESSIONS = 20     # a gap of at least this many regular sessions between two real bars ...
 SUSPENSION_MIN_FMP_SHARE = 0.80  # ... where FMP traded (Volume > 0) on at least this share of the missing sessions is an OTC suspension
 DELISTED_SLACK_SESSIONS = 5      # last bar more than this many sessions before the store's last session = delisted
-KIND_SUSPENSION, KIND_DELISTED = "otc_suspension", "delisted"
-UNDECIDED_NO_FMP, UNDECIDED_NOT_COVERING = "no_fmp_file", "fmp_not_covering"
+KIND_SUSPENSION, KIND_DELISTED, KIND_GAP = "otc_suspension", "delisted", "exchange_gap"
+REUSE_IPO_TOL_DAYS = 7           # a profile ipoDate this close to the END of a gap (calendar days, both sides) = the current company listed there
+REUSED_NAME = "reused_tickers.json"
+REVIEW_NO_FILE, REVIEW_NO_IPO, REVIEW_INSIDE, REVIEW_AFTER = "no_ipo_dates_file", "no_ipo_date", "ipo_inside_gap", "ipo_after_resume"
+IPO_DATES_FILE = "ipo_dates.json"
 RUN_ID_CSVS = ("split_review.csv", "split_accepted.csv", "split_vs_fmp.csv", "fmp_daily_inputs.csv", "yahoo_inputs.csv")
 
 
@@ -479,53 +492,84 @@ def _fmp_volume_frame(fmp_dir: Optional[str], symbol: str) -> Optional[pd.DataFr
     return read_fmp_frame(fp, ["Date", "Volume"]) if fp and os.path.isfile(fp) else None
 
 
-def detect_exchange_events(dates: Sequence[pd.Timestamp], fmp: Optional[pd.DataFrame],
-                           store_asof: str) -> Tuple[List[List[Any]], List[List[Any]]]:
-    """Suspension / delisting events of one symbol's final daily series (module docstring, EXCHANGE SUSPENSIONS / DELISTINGS).
-
-    ``dates``: the real bars' NY-naive session midnights, ascending; ``fmp``: the symbol's FMP daily frame (Date, Volume) or None.
-    Returns ``[[last_session, resume_session|None, kind, missing_sessions, fmp_traded_share|None], ...]`` (ISO dates).  The NYSE
-    calendar is asked only for gaps that can hold SUSPENSION_MIN_SESSIONS sessions (>= 28 calendar days between bars), so the
-    common symbol costs one numpy diff.
-
-    Returns ``(events, undecided)``; ``undecided`` is ``[[last_session, resume_session, missing_sessions, reason], ...]`` for the
-    >= SUSPENSION_MIN_SESSIONS gaps FMP cannot judge (reason ``no_fmp_file`` | ``fmp_not_covering``): recorded, never a suspension."""
+def find_gaps(dates: Sequence[pd.Timestamp]) -> List[Tuple[pd.Timestamp, pd.Timestamp, List[Any]]]:
+    """Every run of >= SUSPENSION_MIN_SESSIONS regular sessions with no bar between two consecutive bars of ``dates`` (ascending
+    session midnights): ``(last bar before, first bar after, the missing session dates)``.  The NYSE calendar is asked only for gaps
+    that can hold that many sessions (>= 28 calendar days between bars), so the common symbol costs one numpy diff."""
     from ba2_common.core.market_calendar import regular_session_dates
     if not len(dates):
-        return [], []
+        return []
     days = pd.DatetimeIndex(dates).normalize()
-    events: List[List[Any]] = []
-    undecided: List[List[Any]] = []
-    gaps = np.flatnonzero(np.diff(days.values.astype("datetime64[D]")).astype("int64") >= 28)
-    fmp_vol: Optional[pd.Series] = None
-    for i in gaps:
+    out = []
+    for i in np.flatnonzero(np.diff(days.values.astype("datetime64[D]")).astype("int64") >= 28):
         a, b = days[i], days[i + 1]
         missing = regular_session_dates((a + pd.Timedelta(days=1)).date(), (b - pd.Timedelta(days=1)).date())
-        if len(missing) < SUSPENSION_MIN_SESSIONS:
-            continue
-        if fmp is None or not len(fmp):
-            undecided.append([str(a.date()), str(b.date()), len(missing), UNDECIDED_NO_FMP])
-            continue
-        if fmp_vol is None:
-            fmp_vol = pd.Series(fmp["Volume"].to_numpy(dtype="float64"), index=pd.DatetimeIndex(fmp["Date"]).normalize())
-            fmp_vol = fmp_vol[~fmp_vol.index.duplicated(keep="last")]
-        if not (fmp_vol.index.min() <= pd.Timestamp(missing[0]) and fmp_vol.index.max() >= pd.Timestamp(missing[-1])):
-            undecided.append([str(a.date()), str(b.date()), len(missing), UNDECIDED_NOT_COVERING])   # cannot tell a suspension from no trades
-            continue
-        share = float((fmp_vol.reindex(pd.DatetimeIndex(missing)).fillna(0.0) > 0).mean())
-        if share >= SUSPENSION_MIN_FMP_SHARE:
-            events.append([str(a.date()), str(b.date()), KIND_SUSPENSION, len(missing), round(share, 4)])
+        if len(missing) >= SUSPENSION_MIN_SESSIONS:
+            out.append((a, b, missing))
+    return out
+
+
+def gap_evidence(last: pd.Timestamp, resume: pd.Timestamp, ipo_date: Optional[str], have_file: bool) -> str:
+    """``"reused"`` | ``"same_company"`` | a REVIEW_* reason (module docstring, REUSED TICKERS)."""
+    if not have_file:
+        return REVIEW_NO_FILE
+    if ipo_date is None:
+        return REVIEW_NO_IPO
+    ipo = pd.Timestamp(ipo_date)
+    if abs((ipo - resume).days) <= REUSE_IPO_TOL_DAYS:
+        return "reused"
+    if ipo <= last:
+        return "same_company"
+    return REVIEW_INSIDE if ipo < resume else REVIEW_AFTER
+
+
+def judge_reuse(gaps: Sequence[Tuple[pd.Timestamp, pd.Timestamp, List[Any]]], ipo_date: Optional[str], have_file: bool
+                ) -> Tuple[Optional[Tuple[pd.Timestamp, pd.Timestamp, int]], List[List[Any]]]:
+    """(the LAST gap whose end is the current company's listing, as ``(last, resume, missing_sessions)`` or None; the review rows
+    ``[last, resume, missing, reason]`` of the AMBIGUOUS gaps after it -- gaps before a reused one are the old company's)."""
+    ev = [gap_evidence(a, b, ipo_date, have_file) for a, b, _ in gaps]
+    cut = max((i for i, e in enumerate(ev) if e == "reused"), default=None)
+    reused = None if cut is None else (gaps[cut][0], gaps[cut][1], len(gaps[cut][2]))
+    start = 0 if cut is None else cut + 1
+    review = [[str(gaps[i][0].date()), str(gaps[i][1].date()), len(gaps[i][2]), ev[i]]
+              for i in range(start, len(gaps)) if ev[i] not in ("reused", "same_company")]
+    return reused, review
+
+
+def detect_exchange_events(dates: Sequence[pd.Timestamp], fmp: Optional[pd.DataFrame], store_asof: str) -> List[List[Any]]:
+    """Suspension / gap / delisting events of one symbol's final daily series (module docstring, EXCHANGE SUSPENSIONS / DELISTINGS).
+
+    ``dates``: the real bars' NY-naive session midnights, ascending; ``fmp``: the symbol's FMP daily frame (Date, Volume) or None.
+    Returns ``[[last_session, resume_session|None, kind, missing_sessions, fmp_traded_share|None], ...]`` (ISO dates)."""
+    from ba2_common.core.market_calendar import regular_session_dates
+    if not len(dates):
+        return []
+    days = pd.DatetimeIndex(dates).normalize()
+    events: List[List[Any]] = []
+    fmp_vol: Optional[pd.Series] = None
+    for a, b, missing in find_gaps(days):
+        share = None
+        if fmp is not None and len(fmp):
+            if fmp_vol is None:
+                fmp_vol = pd.Series(fmp["Volume"].to_numpy(dtype="float64"), index=pd.DatetimeIndex(fmp["Date"]).normalize())
+                fmp_vol = fmp_vol[~fmp_vol.index.duplicated(keep="last")]
+            if fmp_vol.index.min() <= pd.Timestamp(missing[0]) and fmp_vol.index.max() >= pd.Timestamp(missing[-1]):
+                share = round(float((fmp_vol.reindex(pd.DatetimeIndex(missing)).fillna(0.0) > 0).mean()), 4)
+        kind = KIND_SUSPENSION if share is not None and share >= SUSPENSION_MIN_FMP_SHARE else KIND_GAP
+        events.append([str(a.date()), str(b.date()), kind, len(missing), share])
     last, asof_d = days[-1], pd.Timestamp(store_asof)
     if last < asof_d:
         tail = regular_session_dates((last + pd.Timedelta(days=1)).date(), asof_d.date())
         if len(tail) > DELISTED_SLACK_SESSIONS:
             events.append([str(last.date()), None, KIND_DELISTED, len(tail), None])
-    return events, undecided
+    return events
 
 
 def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str, table: SplitTable,
-                 fmp_dir: Optional[str] = None, bar_caps: Sequence[Mapping[str, Any]] = ()) -> Dict[str, Any]:
-    """Build both files of one symbol; returns its manifest entry.  One symbol at a time: memory is one symbol's bars."""
+                 fmp_dir: Optional[str] = None, bar_caps: Sequence[Mapping[str, Any]] = (),
+                 ipo_dates: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, Any]:
+    """Build both files of one symbol; returns its manifest entry.  One symbol at a time: memory is one symbol's bars.
+    ``ipo_dates``: the ipo-dates step's ``{symbol: ISO date | None}`` (None = no such file: every gap is listed for review)."""
     t0 = time.time()
     entry: Dict[str, Any] = {"symbol": symbol}
     splits, spinoffs = table.events(symbol)
@@ -556,6 +600,21 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     raw_daily, _ = drop_placeholder_bars(raw_daily, f"{symbol} daily")
     daily = to_native_daily(raw_daily, f"{symbol} daily")
     daily, dropped_1d = apply_break(daily, brk)
+    # REUSED TICKER: the current company listed at the end of a >= 20-session gap -> the bars before it are another company's
+    reused, gap_review = judge_reuse(find_gaps(daily["Date"]), None if ipo_dates is None else ipo_dates.get(symbol), ipo_dates is not None)
+    reuse_record = None
+    eff_brk = brk
+    if reused is not None:
+        r_last, r_resume, r_missing = reused
+        first_bar = str(daily["Date"].iloc[0].date())
+        daily, d_reuse = apply_break(daily, str(r_resume.date()))
+        dropped_1d += d_reuse
+        eff_brk = str(r_resume.date()) if brk is None else max(brk, str(r_resume.date()))
+        ipo = ipo_dates[symbol]
+        reuse_record = {"gap": [str(r_last.date()), str(r_resume.date())], "missing_sessions": r_missing,
+                        "dropped": {"1d": d_reuse, "5min": 0, "first": first_bar, "last": str(r_last.date())},
+                        "evidence": {"ipo_date": ipo, "source": "fmp /api/v3/profile ipoDate",
+                                     "days_from_resume": (pd.Timestamp(ipo) - r_resume).days}}
 
     gap_days: Dict[str, Any] = {}
     refused: Dict[str, str] = {}
@@ -575,18 +634,21 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
         parts = [split_5min(pd.read_parquet(os.path.join(i_dir, f)), f"{symbol} {f}") for f in year_files]
         frames = [a for a, _ in parts]
         env_raw = pd.concat([b for _, b in parts]).groupby(level=0).agg(High=("High", "max"), Low=("Low", "min"))   # a NY day can span two UTC year files
-        if brk is not None:
-            env_raw = env_raw[env_raw.index >= pd.Timestamp(brk)]
+        if eff_brk is not None:
+            env_raw = env_raw[env_raw.index >= pd.Timestamp(eff_brk)]
         intr = pd.concat(frames, ignore_index=True)
         if intr["Date"].duplicated().any():
             raise BuildError(f"{symbol}: a 5-minute bar start appears in two year files")
         intr = intr.sort_values("Date", kind="stable").reset_index(drop=True)
         intr, dropped_5m = apply_break(intr, brk)
+        if reuse_record is not None:
+            intr, reuse_record["dropped"]["5min"] = apply_break(intr, reuse_record["gap"][1])
+            dropped_5m += reuse_record["dropped"]["5min"]
         for k, c in chunks.items():
             if "days_without_intraday_bars" not in c:
                 continue
             g = c["days_without_intraday_bars"]
-            days = [d for d in g["days"] if brk is None or d >= brk]
+            days = [d for d in g["days"] if eff_brk is None or d >= eff_brk]
             if days or g["count"] == 0:
                 gap_days[k.split("/")[1]] = {"count": len(days), "of": g["of"], "days": days}
     entry["inputs_sha256"] = hashlib.sha256("\n".join(digest).encode()).hexdigest()
@@ -604,7 +666,8 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     entry["unwitnessed"] = []
     entry["fmp_daily_sha256"] = None
     entry["suspensions"] = []
-    entry["undecided_gaps"] = []
+    entry["reused_ticker"] = reuse_record
+    entry["gap_review"] = []
     f1, f5 = file_names(symbol)
     entry["files"] = {}
     if len(daily):
@@ -636,8 +699,8 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
         atomic_write(os.path.join(out, f1), parquet_bytes(d_out))
         entry["1d"] = {"first": str(d_out["Date"].iloc[0].date()), "last": str(d_out["Date"].iloc[-1].date()), "bars": len(d_out)}
         entry["files"]["1d"] = f1
-        entry["suspensions"], entry["undecided_gaps"] = detect_exchange_events(
-            d_out["Date"], _fmp_volume_frame(fmp_dir, symbol), table.asof)
+        entry["suspensions"] = detect_exchange_events(d_out["Date"], _fmp_volume_frame(fmp_dir, symbol), table.asof)
+        entry["gap_review"] = gap_review
     elif os.path.isfile(os.path.join(out, f1)):
         os.remove(os.path.join(out, f1))
         entry["removed_stale"] = entry.get("removed_stale", []) + [f1]
@@ -653,11 +716,12 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     return entry
 
 
-def _task(args: Tuple[str, str, str, str, "SplitTable", Optional[str], Sequence[Mapping[str, Any]]]) -> Dict[str, Any]:
-    symbol, daily_store, intraday_store, out, table, fmp_dir, bar_caps = args
+def _task(args: Tuple[str, str, str, str, "SplitTable", Optional[str], Sequence[Mapping[str, Any]], Optional[Mapping[str, Optional[str]]]]
+          ) -> Dict[str, Any]:
+    symbol, daily_store, intraday_store, out, table, fmp_dir, bar_caps, ipo_dates = args
     try:
         return build_symbol(symbol, daily_store=daily_store, intraday_store=intraday_store, out=out, table=table, fmp_dir=fmp_dir,
-                            bar_caps=bar_caps)
+                            bar_caps=bar_caps, ipo_dates=ipo_dates)
     except Exception as e:                       # reported per symbol; the run finishes and then fails, named
         return {"symbol": symbol, "error": f"{type(e).__name__}: {e}"}
 
@@ -693,6 +757,7 @@ def list_symbols(daily_store: str, intraday_store: str) -> List[str]:
 def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str = DEFAULT_INTRADAY_STORE,
                 out: str = DEFAULT_OUT, symbols: Optional[Sequence[str]] = None, workers: int = 4,
                 fmp_daily_dir: Optional[str] = None, yahoo: Optional[Any] = None, overrides_path: Optional[str] = None,
+                ipo_dates_path: Optional[str] = None,
                 log: Callable[[str], None] = lambda m: None) -> Dict[str, Any]:
     """Build the cache for every store symbol (or ``symbols``) and write the manifest.  Raises ``BuildError`` on a bad input and
     when any symbol failed (after the others finished and the manifest was written)."""
@@ -718,7 +783,12 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
     os.makedirs(os.path.join(out, "_meta"), exist_ok=True)
     log(f"build: {len(todo)} symbols, {workers} workers, split table {table.run_id}")
     results: List[Dict[str, Any]] = []
-    jobs = [(s, daily_store, intraday_store, out, table, fmp_daily_dir, bar_caps) for s in todo]
+    ipo_path = ipo_dates_path or os.path.join(out, "_meta", IPO_DATES_FILE)
+    ipo_all = load_ipo_dates(ipo_path)                           # None = no file: every gap is listed for review, nothing is dropped
+    if ipo_all is None:
+        log(f"build: {ipo_path} not found: reused tickers cannot be told (run the ipo-dates step); every gap is listed for review")
+    jobs = [(s, daily_store, intraday_store, out, table, fmp_daily_dir, bar_caps,
+             None if ipo_all is None else {s: ipo_all.get(s)}) for s in todo]
     if workers <= 1:
         for i, j in enumerate(jobs, 1):
             results.append(_task(j))
@@ -735,16 +805,17 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
     built = {r["symbol"]: {k: v for k, v in r.items() if k != "symbol"} for r in results if "error" not in r and "skipped" not in r}
 
     mpath = os.path.join(out, "_meta", MANIFEST_NAME)
+    ipo_sha = _file_sha256(ipo_path) if ipo_all is not None else None
     entries: Dict[str, Any] = {}
     if symbols is not None and os.path.isfile(mpath):
         with open(mpath, encoding="utf-8") as f:
             old = json.load(f)
-        # the old entries' suspensions / undecided gaps were judged against the OLD fmp_daily_dir: merging them under another one
+        # the old entries' suspensions were judged against the OLD fmp_daily_dir / ipo dates: merging them under another one
         # would mix two FMP inputs in one suspensions.json
         if (old["split_table"]["run_id"] == table.run_id and old["split_table"]["sha256"] == table.sha256
-                and old["fmp_daily_dir"] == fmp_daily_dir
+                and old["fmp_daily_dir"] == fmp_daily_dir and "ipo_dates_sha256" in old and old["ipo_dates_sha256"] == ipo_sha
                 and all("unwitnessed" in e and "consolidated_prints" in e and "dropped_placeholders" in e and "suspensions" in e
-                        and "undecided_gaps" in e for e in old["symbols"].values())):
+                        and "reused_ticker" in e and "gap_review" in e for e in old["symbols"].values())):
             entries = dict(old["symbols"])
     consolidated_rows: List[Dict[str, Any]] = []
     for sym, e in built.items():
@@ -771,7 +842,9 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
         "repairs": sum(len(e["repairs"]) for e in entries.values()),
         "dropped_placeholders": sum(e["dropped_placeholders"] for e in entries.values()),
         "suspension_events": sum(len(e["suspensions"]) for e in entries.values()),
-        "undecided_gaps": sum(len(e["undecided_gaps"]) for e in entries.values()),
+        "reused_tickers": sum(e["reused_ticker"] is not None for e in entries.values()),
+        "gap_review": sum(len(e["gap_review"]) for e in entries.values()),
+        "ipo_dates_sha256": ipo_sha,
         "overrides_path": overrides_path,
         "failed": failed,
         "skipped_no_bars": skipped,
@@ -786,8 +859,12 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
         "build": f"{table.run_id} built {manifest['built_at']}",
         "rule": {"min_sessions": SUSPENSION_MIN_SESSIONS, "min_fmp_traded_share": SUSPENSION_MIN_FMP_SHARE,
                  "delisted_slack_sessions": DELISTED_SLACK_SESSIONS, "store_asof": table.asof},
-        "symbols": susp,
-        "undecided": {sym: e["undecided_gaps"] for sym, e in sorted(entries.items()) if e["undecided_gaps"]}}, indent=1).encode("utf-8"))
+        "symbols": susp}, indent=1).encode("utf-8"))
+    atomic_write(os.path.join(out, "_meta", REUSED_NAME), json.dumps({
+        "build": f"{table.run_id} built {manifest['built_at']}",
+        "rule": {"ipo_tolerance_days": REUSE_IPO_TOL_DAYS, "min_gap_sessions": SUSPENSION_MIN_SESSIONS, "ipo_dates_sha256": ipo_sha},
+        "reused": {sym: e["reused_ticker"] for sym, e in sorted(entries.items()) if e["reused_ticker"]},
+        "ambiguous": {sym: e["gap_review"] for sym, e in sorted(entries.items()) if e["gap_review"]}}, indent=1).encode("utf-8"))
     rows = [{"symbol": sym, **r, "run_id": table.run_id} for sym, e in sorted(entries.items()) for r in e["repairs"]]
     atomic_write(os.path.join(out, "_meta", "bar_repairs.csv"), pd.DataFrame(rows, columns=REPAIR_COLUMNS).to_csv(index=False).encode("utf-8"))
     rows = [{"symbol": sym, **r, "run_id": table.run_id} for sym, e in sorted(entries.items()) for r in e["consolidated_prints"]]
@@ -804,8 +881,10 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
                "symbols_with_placeholders": sum(e["dropped_placeholders"] > 0 for e in built.values()),
                "suspension_events": sum(len(e["suspensions"]) for e in built.values()),
                "symbols_with_suspensions": sum(bool(e["suspensions"]) for e in built.values()),
-               "undecided_gaps": sum(len(e["undecided_gaps"]) for e in built.values()),
-               "symbols_with_undecided_gaps": sum(bool(e["undecided_gaps"]) for e in built.values()),
+               "suspension_events_by_kind": dict(sorted(Counter(ev[2] for e in built.values() for ev in e["suspensions"]).items())),
+               "reused_tickers": sorted(sym for sym, e in built.items() if e["reused_ticker"]),
+               "gaps_for_review": {sym: e["gap_review"] for sym, e in sorted(built.items()) if e["gap_review"]},
+               "ipo_dates_file": ipo_path if ipo_all is not None else None,
                "unlisted_files": len(manifest["unlisted_files"]), "bar_repairs": manifest["repairs"],
                "consolidated_prints": sum(len(e["consolidated_prints"]) for e in built.values()),
                "unwitnessed_outliers": sum(len(e["unwitnessed"]) for e in built.values()), "elapsed_s": manifest["elapsed_s"], "manifest": mpath,

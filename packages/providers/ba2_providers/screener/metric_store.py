@@ -60,9 +60,13 @@ FLOAT_MAX_AGE_DAYS = 120
 #: Pre-build check: a symbol whose cached last bar is more than this many days before the build
 #: --end is stale input and fails the build unless explicitly allowed (see build_store).
 PREBUILD_MAX_STALE_DAYS = 10
-#: >= this many consecutive scans with identical close+volume+relative_volume (volume > 0) is
-#: a frozen forward-fill, never a market.
+#: >= this many consecutive scans with identical close+volume+relative_volume (volume > 0), served by
+#: that many DISTINCT bars that are themselves identical in Open/High/Low/Close/Volume, is a frozen
+#: forward-fill, never a market (see ``find_frozen_runs``).
 FROZEN_RUN_MIN = 3
+#: Build-time bookkeeping columns of a scan frame (the date and the OHLCV fingerprint of the bar a
+#: scan row was read from).  Used by ``find_frozen_runs``; NEVER written to the store.
+BAR_COLUMNS = ("_bar_date", "_bar_sig")
 
 
 def _date_chunks(start: str, end: str, chunk_days: int) -> List[Tuple[str, str]]:
@@ -703,12 +707,26 @@ def find_frozen_runs(df: "pd.DataFrame", min_run: int = FROZEN_RUN_MIN) -> "pd.D
     for weeks (measured on the 2026-H1 scratch build: BEBE, LPAAU). Such rows are real bars; the
     7-day row limit and the pre-build last-bar check are what guard them against staleness.
 
+    THE SAME UNDERLYING BAR (2026-10-22).  The scan columns alone cannot tell a stale copy from a
+    thin name that really prints the same thing: BDCIU (a SPAC unit) printed 100 shares at 10.25 on
+    2026-06-24 and again on 2026-07-07 with nothing in between, so the weekly scans of 06-24, 07-01
+    (the 06-24 bar carried inside the 7-day tolerance) and 07-08 are identical in close, 20-day
+    average and RVOL, and the old rule dropped the whole symbol.  When the frame carries ``_bar_date``
+    and ``_bar_sig`` (the date of the bar a scan row was read from and a hash of that bar's
+    Open/High/Low/Close/Volume; the build adds them, ``BAR_COLUMNS``), a run is frozen only if
+    (a) every row's bar has the SAME OHLCV fingerprint as the previous row's, and (b) the run is
+    served by at least ``min_run`` DISTINCT bar dates: one bar carried over several scans is the
+    staleness tolerance at work (the 7-day row limit bounds it), not a frozen feed; a feed that
+    repeats complete bars on new dates is.  Without those columns (a stored frame) the scan-level
+    rule above applies unchanged.
+
     Returns one row per offending run: symbol, first_date, last_date, n_scans."""
     cols = ["symbol", "first_date", "last_date", "n_scans"]
     need = {"symbol", "date", "close", "volume", "relative_volume"}
     if df is None or df.empty or not need.issubset(df.columns):
         return pd.DataFrame(columns=cols)
-    d = df[["symbol", "date", "close", "volume", "relative_volume"]].copy()
+    bars = all(c in df.columns for c in BAR_COLUMNS)
+    d = df[["symbol", "date", "close", "volume", "relative_volume", *(BAR_COLUMNS if bars else ())]].copy()
     d["symbol"] = d["symbol"].astype(str)
     d["date"] = d["date"].astype(str)
     d = d.sort_values(["symbol", "date"], kind="mergesort").reset_index(drop=True)
@@ -716,13 +734,15 @@ def find_frozen_runs(df: "pd.DataFrame", min_run: int = FROZEN_RUN_MIN) -> "pd.D
             & (d["volume"] == d["volume"].shift())
             & (d["relative_volume"] == d["relative_volume"].shift())
             & (d["volume"] > 0) & (d["relative_volume"] > 0))
+    if bars:
+        same &= d["_bar_sig"] == d["_bar_sig"].shift()
     # a row is in a run if it repeats its predecessor OR its successor repeats it; the run id
     # increments at every row that does not repeat its predecessor.
     in_run = same | same.shift(-1, fill_value=False)
     run_id = (~same).cumsum()
     runs = []
     for _rid, g in d[in_run].groupby(run_id[in_run]):
-        if len(g) >= int(min_run):
+        if len(g) >= int(min_run) and (not bars or g["_bar_date"].nunique() >= int(min_run)):
             runs.append({"symbol": g["symbol"].iloc[0], "first_date": g["date"].iloc[0],
                          "last_date": g["date"].iloc[-1], "n_scans": int(len(g))})
     return pd.DataFrame(runs, columns=cols)
@@ -912,6 +932,13 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
         m = compute_daily_metrics(df, market_cap_series=mcap_s, float_series=flt_s,
                                   shares=shares, rvol_window=rvol_window, drop_days=drop_days,
                                   max_lookback=max_lookback)
+        # which bar each scan row is read from, and that bar's OHLCV fingerprint (find_frozen_runs; dropped before the write).
+        # The hash is cut to 52 bits so it survives the float64 round trip of the as-of reindex below exactly.
+        sig = pd.Series(pd.util.hash_pandas_object(df[["Open", "High", "Low", "Close", "Volume"]], index=False).to_numpy() % (1 << 52),
+                        index=df.index)
+        sig = sig[~sig.index.duplicated(keep="last")]
+        m["_bar_sig"] = sig.reindex(m.index).to_numpy()
+        m["_bar_date"] = m.index.strftime("%Y-%m-%d")
         # value AS-OF each scan date, but NEVER carried more than ``staleness_max_days`` past the
         # symbol's last bar (a stale cache / delisted ticker must not be forward-filled).
         eligible = grid_todo[grid_todo >= m.index.min()]      # scan dates with any history at all
@@ -977,7 +1004,7 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
         if not frames:
             return
         flush_seq += 1
-        write_partitions(store_dir, pd.concat(frames, ignore_index=True),
+        write_partitions(store_dir, pd.concat(frames, ignore_index=True).drop(columns=list(BAR_COLUMNS), errors="ignore"),
                          part_name=f"part-{flush_seq:05d}.parquet")
         written += len(frames)
         logger.info(f"metric-store: flushed {len(frames)} symbols "
