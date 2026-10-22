@@ -40,14 +40,13 @@ Jobs are named `convex-<expert>-O_CONVEX[suffix]` and are IDEMPOTENT/RESUMABLE: 
 StrategyOptimization row is already `completed` is skipped, so the driver can be killed and
 re-run to continue.
 
-Prereqs: the TastyTrade options PARQUET tree must cover the window (`--options-store parquet`
-is forced below, same reasoning as grid 2's driver), plus the usual OHLCV/FMP prewarm for the
-expert signals.
+Prereqs: the ThetaData options tree must cover the window (`--options-store thetadata` by default,
+2020-01-01..2025-12-31 like grid 2's driver), plus the usual OHLCV prewarm for the expert signals.
 
 Usage (test venv; FMP_API_KEY/DB_FILE in env):
     ba2-venvs/test/Scripts/python.exe tools/run_convex_matrix.py \
         [--experts FMPRating,DeterministicScorer] \
-        [--start 2023-01-01] [--end 2025-12-31] \
+        [--start 2020-01-01] [--end 2025-12-31] \
         [--population 40] [--generations 6] [--dry-run]
 
 Environment overrides (so a longer/shorter search does not need a code edit):
@@ -226,8 +225,8 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
         "--population", str(args.population),
         "--generations", str(args.generations),
         "--initial-capital", str(args.initial_capital),
-        # THE PARQUET STORE, ALWAYS -- same reasoning as grid 2's driver: the sqlite/Alpaca
-        # store's history floor is 2024-01-18 and cannot serve the design's 2023-01 start.
+        # The options store is always stated (default thetadata, the 2020 window): the sqlite/Alpaca
+        # store's history floor is 2024-01-18 and tastytrade's 2022-10-01.
         "--options-store", args.options_store,
         # The underlyings' OHLCV history (fmp | alpaca): option jobs default to fmp in the launcher,
         # so the source is ALWAYS stated here (owner 2026-10-22: this grid runs on alpaca).
@@ -291,8 +290,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--experts", default=",".join(_DEFAULT_EXPERTS),
                     help="Comma list of stage-1 experts (default FMPRating,DeterministicScorer "
                          "-- both have measured large-cap results on this options universe).")
-    ap.add_argument("--start", default="2023-01-01",
-                    help="Backtest start (design Section 5 window; needs the parquet store).")
+    ap.add_argument("--start", default="2020-01-01",
+                    help="Backtest start (the goal2020 window, served by the thetadata store whose floor is "
+                         "2018-09-14; operator checklist item 1, owner 2026-10-22: every option grid on thetadata).")
     ap.add_argument("--end", default="2025-12-31",
                     help="Backtest end (2026 is the reserved walk-forward holdout and the "
                          "launcher refuses to search into it).")
@@ -322,9 +322,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ohlcv-history-source", choices=("alpaca", "fmp"), default="alpaca",
                     help="OHLCV history of the underlyings (default alpaca, owner 2026-10-22; the as-traded "
                          "split basis then comes from the verified split table of the alpaca cache).")
-    ap.add_argument("--options-store", default="tastytrade",
-                    help="Options store serving the run (default tastytrade -- floor 2022-10-01, "
-                         "reaches this driver's 2023 start; 'parquet' is its accepted alias).")
+    ap.add_argument("--options-store", default="thetadata",
+                    help="Options store serving the run (default thetadata -- floor 2018-09-14, the only "
+                         "vendor whose history reaches the 2020 start; tastytrade floors at 2022-10-01).")
     ap.add_argument("--universe-file", default=_UNIVERSE_FILE,
                     help="Symbol list probed and then passed to each job.")
     ap.add_argument("--probe-out-dir", default=_TOOLS_DIR,

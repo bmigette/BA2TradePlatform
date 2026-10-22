@@ -168,7 +168,7 @@ def _args(d, **over):
 def test_the_launched_command_is_exactly_this():
     """THE ARGV GOLDEN.
 
-      --options-store tastytrade  the store 4d246e16 renamed `parquet` to; `parquet` stays an
+      --options-store thetadata   the 2020 window (owner 2026-10-22: every option grid on thetadata; tastytrade, which 4d246e16 renamed `parquet` to, stays an
                                 accepted CLI alias, so a runbook that spells the old name still
                                 resolves here. Same reasoning as grid 2's driver (history floor).
       --fitness option_convex   design §3/§8: the ONLY fitness this driver may pass.
@@ -182,10 +182,10 @@ def test_the_launched_command_is_exactly_this():
     assert cmd == [
         "/x/ba2-test", "optimize", "--expert", "FMPRating",
         "--universe", "AAPL,MSFT", "--strategy", "O_CONVEX",
-        "--start", "2023-01-01", "--end", "2025-12-31",
+        "--start", "2020-01-01", "--end", "2025-12-31",
         "--interval", "1d", "--population", "40", "--generations", "6",
         "--initial-capital", "20000.0",
-        "--options-store", "tastytrade",
+        "--options-store", "thetadata",
         "--ohlcv-history-source", "alpaca",
         "--fitness", "option_convex",
         "--run-schedule", "daily", "--name", "convex-FMPRating-O_CONVEX",
