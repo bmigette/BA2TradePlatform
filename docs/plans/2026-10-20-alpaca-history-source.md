@@ -230,6 +230,18 @@ Measured 2026-10-20: Alpaca `delayed_sip` latest trade AND quote are 15.0 min ol
 ### Task 12: Option split basis from the verified table
 - `split_basis.resolve_symbol_split_basis` gains a table-backed path for `alpaca` (factor = product of accepted events
   after the day), which removes the FMP-calendar overrides for that source; then lift the Task 7 refusal.
+- DONE (branch `feat/option-basis-alpaca`, TEST 2026.09.0144; no `packages/` change). Implemented in
+  `testplatform/backend/app/services/backtest/option_split_basis.py::build_alpaca_run_split_basis`
+  (`build_run_split_basis(..., history_source="alpaca", cache_dir=...)`), not in `split_basis.py`: the FMP proof machinery does
+  not apply. factor(D) = product of the factors of EVERY event the build applied dated after D, splits AND spin-offs
+  (`build.adjust` divides prices by split F x spin-off F), read from `build_manifest.json` `symbols[S].events` and
+  cross-checked against `split_table.json` (`build.load_split_table`; sha/run_id must match the manifest). Zero events in the
+  manifest = proven 1; symbol missing from manifest / no daily file / table disagreeing / uncertified cache = REFUSE (all named).
+  The digest carries table run_id + sha and the certified manifest sha. `OPTION_SUPPORTED_SOURCES = (fmp, alpaca)`; the default
+  source of a NEW option job stays fmp. Also followed the source: `parquet_contract_detail` (stored run's source), trade chart
+  `as_traded_bars`. Unchanged and still FMP by design: the dividend calendar (`fmp_history/mc_stock_split__` /
+  `mc_dividend__`; `adjDividend` x factor, equal to the as-declared amount wherever FMP's and our table's events agree).
+  `tools/option_universe_preflight.py` is an FMP-basis preflight and was not ported.
 
 ## Phase 3 -- build, archive, hand-off (operations, after Phase 1 is merged)
 

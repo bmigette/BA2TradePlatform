@@ -277,9 +277,15 @@ def build_options_run(config: Dict[str, Any], *, price_source: Any, ohlcv_provid
     if "execution_interval" not in config:
         raise ValueError("an OPTIONS run must state 'execution_interval'; it is absent from "
                          "this run config")
+    from ba2_common.core.ohlcv_history import resolve_job_history_source
+    from .history_source import job_history_cache_dir
     from .option_split_basis import build_run_split_basis
+    # The basis follows the job's OHLCV history (``fmp`` | ``alpaca``): FMP's calendar plus a
+    # proof of the FMP parquet, or the verified split table the alpaca cache was built with.
+    source = resolve_job_history_source(config)
     basis = build_run_split_basis(config.get("enabled_instruments") or [], ohlcv_provider,
-                                  interval=config["execution_interval"])
+                                  interval=config["execution_interval"], history_source=source,
+                                  cache_dir=job_history_cache_dir(config) if source == "alpaca" else None)
     return build_options_provider(config, price_source=price_source, split_basis=basis), basis
 
 

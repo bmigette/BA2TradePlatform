@@ -25,11 +25,24 @@ WHAT THIS MODULE DOES. Builds, ONCE per run (memoised per worker process), one
 
 A factor of 1 is NEVER assumed for a symbol that could not be resolved: that is the exact
 silent 10x/40x mis-strike this exists to remove.
+
+THE ALPACA SOURCE (plan ``2026-10-20-alpaca-history-source`` Task 12). The ``alpaca`` history
+cache is built by us from RAW Alpaca bars, back-adjusted with our own verified split table
+(``alpaca_history.build.adjust``): prices are divided by the product of the factors of EVERY
+accepted split-table event dated after the bar -- splits, reverse splits, unit splits, stock
+dividends AND spin-offs (the table's ``spinoffs``; apart from volume they scale prices exactly
+like splits). The as-traded factor of a day is therefore that same product, so
+``adjusted_close x factor`` reproduces the raw close. ``build_alpaca_run_split_basis`` derives it
+from what the BUILD recorded (the build manifest's per-symbol ``events``, cross-checked against
+the split table the build read), with no FMP calendar, FMP overrides or FMP-file proof on this
+path. A symbol the manifest lists with zero applied events has a PROVEN factor of 1; a symbol the
+manifest or table does not know, or an uncertified cache, REFUSES.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import threading
 from datetime import date
@@ -47,7 +60,7 @@ from ba2_providers.market_conditions.fmp_source import (
     DIVIDEND_CALENDAR_NAMESPACE, SPLIT_CALENDAR_NAMESPACE,
 )
 
-__all__ = ["RunSplitBasis", "build_run_split_basis", "split_calendar_path",
+__all__ = ["RunSplitBasis", "build_run_split_basis", "build_alpaca_run_split_basis", "split_calendar_path",
            "load_cached_split_calendar", "clear_split_basis_memo", "dividend_calendar_path",
            "load_cached_dividend_calendar"]
 
@@ -211,8 +224,102 @@ def _resolve_one(symbol: str, parquet_path: str) -> SymbolSplitBasis:
     return basis
 
 
+def _alpaca_symbol(symbol: str) -> str:
+    """The cache's spelling: upper-case, '.' written '-' (BRK.B -> BRK-B), like the build."""
+    return str(symbol).strip().upper().replace(".", "-")
+
+
+#: (cache_dir, manifest sha, table stat) -> (manifest, SplitTable): the 8 MB manifest is parsed once per process; a rebuilt
+#: cache changes the key.
+_ALPACA_MEMO: Dict[tuple, Tuple[dict, Any]] = {}
+
+
+def _load_alpaca_build(cache_dir: str) -> Tuple[dict, Any, dict]:
+    """``(manifest, SplitTable, certificate)`` of a CERTIFIED alpaca cache, else ``SplitBasisRefused``."""
+    from ba2_providers.ohlcv.alpaca_history.build import BuildError, load_split_table
+    from .history_source import AlpacaCacheNotCertified, verify_alpaca_cache_certified
+
+    try:
+        cert = verify_alpaca_cache_certified(cache_dir)
+    except AlpacaCacheNotCertified as e:
+        raise SplitBasisRefused(f"the as-traded split basis of the alpaca history cache cannot be stated: {e}") from e
+    meta = os.path.join(cache_dir, "_meta")
+    key = (os.path.normcase(os.path.abspath(cache_dir)), cert["build_manifest_sha256"],
+           *_stat_key(os.path.join(meta, "split_table.json")))
+    with _MEMO_LOCK:
+        hit = _ALPACA_MEMO.get(key)
+    if hit is not None:
+        return hit[0], hit[1], cert
+    try:
+        table = load_split_table(cache_dir)
+    except (BuildError, OSError, ValueError, KeyError) as e:
+        raise SplitBasisRefused(
+            f"the alpaca split table under {meta} cannot be read ({e}); the as-traded split basis is unknown") from e
+    with open(os.path.join(meta, "build_manifest.json"), encoding="utf-8") as f:
+        manifest = json.load(f)
+    built = manifest["split_table"]
+    if built["sha256"] != table.sha256 or built["run_id"] != table.run_id:
+        raise SplitBasisRefused(
+            f"the split table {table.run_id} (sha256 {table.sha256[:12]}) is not the one the cache was built with "
+            f"({built['run_id']}, {built['sha256'][:12]}): rebuild the cache or restore the table")
+    with _MEMO_LOCK:
+        _ALPACA_MEMO.clear()
+        _ALPACA_MEMO[key] = (manifest, table)
+    return manifest, table, cert
+
+
+def build_alpaca_run_split_basis(symbols: Iterable[str], cache_dir: str, *, interval: str = "1d") -> RunSplitBasis:
+    """The as-traded basis of an ``alpaca``-history run, from the verified split table the cache was built with.
+
+    ``cache_dir`` is ``CACHE_FOLDER/AlpacaHistoryOHLCVProvider``. factor(D) = the product of the factors of every
+    price-scaling event the build applied dated after D (``build.adjust``: splits AND spin-offs), so adjusted x factor = the
+    raw as-traded close. Refuses ALL problems at once: an uncertified cache, a missing/unreadable table, a symbol the manifest
+    or the table does not carry, a symbol with no daily file, an event list that disagrees with the one the build recorded."""
+    if str(interval) != "1d":
+        raise SplitBasisRefused(
+            f"an options run prices its underlyings at execution_interval={interval!r}; the as-traded split basis is only "
+            f"stated for the daily clock ('1d'). Refusing rather than converting a series whose adjustment nobody checked.")
+    manifest, table, cert = _load_alpaca_build(cache_dir)
+    msyms = manifest["symbols"]
+    version = f"alpaca-split-table:{table.run_id}:{table.sha256[:12]}:build:{cert['build_manifest_sha256'][:12]}"
+    asof = date.fromisoformat(table.asof)
+    bases: Dict[str, SymbolSplitBasis] = {}
+    problems: List[str] = []
+    for raw in sorted({str(s).strip().upper() for s in symbols if s and str(s).strip()}):
+        sym = _alpaca_symbol(raw)
+        entry = msyms[sym] if sym in msyms else None
+        if entry is None:
+            problems.append(f"{raw}: not in the alpaca build manifest (no history was built for it)")
+            continue
+        if "1d" not in entry or "events" not in entry:
+            problems.append(f"{raw}: the alpaca build has no daily file for it")
+            continue
+        first = entry["1d"]["first"]
+        ts, to = table.events(sym)
+        from_table = {"splits": [[d, f] for d, f in ts if d > first], "spinoffs": [[d, f] for d, f in to if d > first]}
+        applied = {k: [[d, float(f)] for d, f in entry["events"][k]] for k in ("splits", "spinoffs")}
+        if from_table != applied:
+            problems.append(f"{raw}: the split table's events {from_table} differ from those the build applied {applied}")
+            continue
+        events = sorted((date.fromisoformat(d), float(f)) for d, f in applied["splits"] + applied["spinoffs"])
+        bad = [e for e in events if not (math.isfinite(e[1]) and e[1] > 0)]
+        if bad:
+            problems.append(f"{raw}: unusable factor(s) {bad}")
+            continue
+        bases[raw] = SymbolSplitBasis(
+            symbol=raw, splits=tuple(CalendarSplit(d, f) for d, f in events),
+            basis_date=max([asof] + [d for d, _ in events]),
+            evidence=f"alpaca split table {table.run_id}: {len(events)} applied price event(s)", overrides_version=version)
+    if problems:
+        raise SplitBasisRefused(
+            "Refusing the options run: the as-traded split basis of the alpaca history cache (option strikes are as traded, "
+            "the cache is split-adjusted by our verified table) cannot be stated for every symbol -- " + " | ".join(problems))
+    return RunSplitBasis(bases)
+
+
 def build_run_split_basis(symbols: Iterable[str], ohlcv_provider: Any, *,
-                          interval: str = "1d") -> RunSplitBasis:
+                          interval: str = "1d", history_source: str = "fmp",
+                          cache_dir: Optional[str] = None) -> RunSplitBasis:
     """Resolve the split basis of every symbol a run's option path may price.
 
     ``ohlcv_provider`` is the run's hermetic OHLCV reader (``MemoizedOHLCVProvider``): its
@@ -220,7 +327,17 @@ def build_run_split_basis(symbols: Iterable[str], ohlcv_provider: Any, *,
     verified on the bytes being converted and nothing else.
 
     Refuses ALL problems at once (every symbol, every reason) rather than the first, so one
-    run tells the operator the whole repair list."""
+    run tells the operator the whole repair list.
+
+    ``history_source`` selects the basis: ``fmp`` (the default, unchanged) reads the FMP calendar
+    and proves the FMP parquet; ``alpaca`` reads the verified split table of ``cache_dir`` (the
+    alpaca cache folder) and ignores ``ohlcv_provider``. Any other source refuses."""
+    if history_source == "alpaca":
+        if not cache_dir:
+            raise SplitBasisRefused("history_source='alpaca' needs the alpaca cache folder (cache_dir)")
+        return build_alpaca_run_split_basis(symbols, cache_dir, interval=interval)
+    if history_source != "fmp":
+        raise SplitBasisRefused(f"no as-traded split basis is defined for OHLCV history source {history_source!r}")
     if str(interval) != "1d":
         raise SplitBasisRefused(
             f"an options run prices its underlyings at execution_interval={interval!r}; the "

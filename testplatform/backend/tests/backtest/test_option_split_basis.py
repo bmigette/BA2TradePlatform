@@ -662,3 +662,20 @@ def test_intraday_refinement_prices_the_move_in_the_as_traded_basis(run, monkeyp
     assert seen["entry"] == pytest.approx(551.7)
     assert seen["bars"][0]["Low"] == pytest.approx(546.7)
     assert seen["bars"][0]["High"] == pytest.approx(553.0)
+
+
+# ---- Task 12: the fmp path is byte-identical -------------------------------------------------------
+def test_fmp_path_is_unchanged_by_the_alpaca_option(cache, monkeypatch):
+    """An explicit ``history_source='fmp'`` and the legacy call (no kwargs) are the same basis, and the alpaca loader is
+    never touched on the fmp path."""
+    from app.services.backtest import option_split_basis as osb
+
+    def _boom(*a, **k):
+        raise AssertionError("the fmp path must not read the alpaca cache")
+
+    monkeypatch.setattr(osb, "_load_alpaca_build", _boom)
+    legacy = osb.build_run_split_basis(["NFLX"], cache[1])
+    explicit = osb.build_run_split_basis(["NFLX"], cache[1], history_source="fmp")
+    assert legacy.digest() == explicit.digest()
+    assert legacy.factor("NFLX", date(2024, 5, 1)) == explicit.factor("NFLX", date(2024, 5, 1)) == 10.0
+    assert legacy.basis_of("NFLX").identity() == explicit.basis_of("NFLX").identity()

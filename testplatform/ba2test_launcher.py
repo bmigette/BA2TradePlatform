@@ -1313,8 +1313,9 @@ _HISTORY_SOURCE_HELP = (
     "checkpoint fingerprint, and in a matrix driver's job name): fmp = CACHE_FOLDER/FMPOHLCVProvider, "
     "alpaca = CACHE_FOLDER/AlpacaHistoryOHLCVProvider (raw SIP bars + the verified split table). "
     "Default: alpaca for EQUITY jobs; fmp for OPTION jobs (an option expert or an option strategy) "
-    "because ThetaData strikes are as-traded and the split-basis converter still reads FMP's split "
-    "calendar -- an option job stated as alpaca is REFUSED at launch, before any trial.")
+    "(unchanged); an option job MAY be stated as alpaca: ThetaData strikes are as-traded and the "
+    "split basis then comes from the verified split table of the alpaca cache (a missing symbol or "
+    "an uncertified cache refuses, naming it).")
 
 
 def _add_history_source_arg(parser) -> None:

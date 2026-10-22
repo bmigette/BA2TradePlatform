@@ -158,8 +158,8 @@ def test_new_job_source_rule():
     assert new_job_history_source(None, uses_options=False, where="t") == "alpaca"
     assert new_job_history_source(None, uses_options=True, where="t") == "fmp"
     assert new_job_history_source("fmp", uses_options=False, where="t") == "fmp"
-    with pytest.raises(OptionHistorySourceUnsupported):
-        new_job_history_source("alpaca", uses_options=True, where="t")
+    # Task 12: an option job MAY run on alpaca (its split basis is the verified table); the default stays fmp
+    assert new_job_history_source("alpaca", uses_options=True, where="t") == "alpaca"
     with pytest.raises(UnknownHistorySource):
         new_job_history_source("yahoo", uses_options=False, where="t")
 
@@ -172,7 +172,8 @@ def test_api_stamps_new_backtests_and_refuses_bad_ones():
     assert _new_job_history_source("fmp", {}, "t") == "fmp"
     option_probe = {"exit_rules": [{"action_type": "buy_call"}]}
     assert _new_job_history_source(None, option_probe, "t") == "fmp"
-    for stated, probe in (("yahoo", {}), ("alpaca", option_probe)):
+    assert _new_job_history_source("alpaca", option_probe, "t") == "alpaca"
+    for stated, probe in (("yahoo", {}),):
         with pytest.raises(HTTPException) as e:
             _new_job_history_source(stated, probe, "t")
         assert e.value.status_code == 400
@@ -199,7 +200,9 @@ def test_api_stamps_new_optimizations(monkeypatch):
     assert S._stamp_new_optimization_source(cfg, 1, _Db(option))["backtest"][OHLCV_HISTORY_SOURCE_KEY] == "fmp"
     explicit = {"backtest": {OHLCV_HISTORY_SOURCE_KEY: "fmp"}}
     assert S._stamp_new_optimization_source(explicit, 1, _Db(equity))["backtest"][OHLCV_HISTORY_SOURCE_KEY] == "fmp"
-    for bad, strategy in (("yahoo", equity), ("alpaca", option)):
+    assert S._stamp_new_optimization_source(
+        {"backtest": {OHLCV_HISTORY_SOURCE_KEY: "alpaca"}}, 1, _Db(option))["backtest"][OHLCV_HISTORY_SOURCE_KEY] == "alpaca"
+    for bad, strategy in (("yahoo", equity),):
         with pytest.raises(HTTPException):
             S._stamp_new_optimization_source({"backtest": {OHLCV_HISTORY_SOURCE_KEY: bad}}, 1, _Db(strategy))
     assert S._stamp_new_optimization_source({}, 1, _Db(equity)) == {}
@@ -219,7 +222,10 @@ def test_manifest_of_the_other_source_profile_refuses_with_a_mapped_reader(monke
 # ------------------------------------------------ an option optimization on alpaca fails at job start
 
 
-def test_option_optimization_stamped_alpaca_fails_before_any_trial():
+def test_option_optimization_on_a_source_without_a_split_basis_fails_before_any_trial(monkeypatch):
+    # alpaca is supported since Task 12; a source outside OPTION_SUPPORTED_SOURCES still refuses at job start
+    from app.services.backtest import history_source as _hs
+    monkeypatch.setattr(_hs, "OPTION_SUPPORTED_SOURCES", ("fmp",))
     from app.models.database import Base, SessionLocal, engine
     from app.models.strategy import Strategy
     from app.models.strategy_optimization import StrategyOptimization

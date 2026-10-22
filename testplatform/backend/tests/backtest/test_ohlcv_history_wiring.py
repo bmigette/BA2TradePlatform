@@ -120,21 +120,30 @@ def test_run_refuses_an_unknown_stamp_before_reading_anything(monkeypatch):
 # ---------------------------------------------------------------- option jobs
 
 
-def test_option_trial_stamped_alpaca_refuses_before_any_trial():
+def test_option_trial_stamped_alpaca_is_accepted_since_task_12():
+    block = _block(options_cache_db="x.sqlite", **{OHLCV_HISTORY_SOURCE_KEY: "alpaca"})
+    assert _trial(block)[OHLCV_HISTORY_SOURCE_KEY] == "alpaca"
+
+
+def test_option_trial_on_a_source_without_a_split_basis_refuses_before_any_trial(monkeypatch):
+    from app.services.backtest import history_source as _hs
     from app.services.backtest.history_source import OptionHistorySourceUnsupported
 
+    monkeypatch.setattr(_hs, "OPTION_SUPPORTED_SOURCES", ("fmp",))
     block = _block(options_cache_db="x.sqlite", **{OHLCV_HISTORY_SOURCE_KEY: "alpaca"})
     with pytest.raises(OptionHistorySourceUnsupported):
         _trial(block)
 
 
-def test_option_run_stamped_alpaca_refuses_before_reading_bars(monkeypatch):
+def test_option_run_on_a_source_without_a_split_basis_refuses_before_reading_bars(monkeypatch):
     from app.services.backtest import daily_backtest_handler as H
+    from app.services.backtest import history_source as _hs
     from app.services.backtest.history_source import OptionHistorySourceUnsupported
     from tests.backtest.fixtures.e2e_support import ensure_host_schema
 
     ensure_host_schema()
     seen = _record_keys(monkeypatch)
+    monkeypatch.setattr(_hs, "OPTION_SUPPORTED_SOURCES", ("fmp",))
     config = {**_trial(_block()), "options_cache_db": "x.sqlite", OHLCV_HISTORY_SOURCE_KEY: "alpaca"}
     with pytest.raises(OptionHistorySourceUnsupported):
         H.run_daily_backtest(config)
@@ -174,7 +183,14 @@ def test_launcher_defaults_equity_to_alpaca_and_options_to_fmp(launcher):
         assert launcher._resolve_history_source(_args(), "optimize", options_expert, None) == "fmp"
 
 
-def test_launcher_refuses_an_option_job_stated_as_alpaca(launcher):
+def test_launcher_accepts_an_option_job_stated_as_alpaca(launcher):
+    classic = next(s for s in launcher._EXPERT_OPT.values() if not s.get("options") and not s.get("bypass"))
+    assert launcher._resolve_history_source(_args("alpaca"), "optimize", classic, "O_LC") == "alpaca"
+
+
+def test_launcher_refuses_an_option_job_on_a_source_without_a_split_basis(launcher, monkeypatch):
+    from app.services.backtest import history_source as _hs
+    monkeypatch.setattr(_hs, "OPTION_SUPPORTED_SOURCES", ("fmp",))
     classic = next(s for s in launcher._EXPERT_OPT.values() if not s.get("options") and not s.get("bypass"))
     with pytest.raises(SystemExit) as e:
         launcher._resolve_history_source(_args("alpaca"), "optimize", classic, "O_LC")

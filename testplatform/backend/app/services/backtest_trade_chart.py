@@ -563,7 +563,15 @@ def as_traded_bars(
 
     path = native_cache.find_timeseries_path(provider, symbol, INTERVAL)
     try:
-        basis = build_run_split_basis([symbol], _OneFile(path), interval=INTERVAL)
+        import os
+        from ba2_common.config import CACHE_FOLDER
+        from ba2_common.core.ohlcv_history import history_cache_dirname
+        if provider == history_cache_dirname("alpaca"):
+            # The alpaca cache is adjusted by our verified table, not FMP's calendar: same source the run's basis came from.
+            basis = build_run_split_basis([symbol], None, interval=INTERVAL, history_source="alpaca",
+                                          cache_dir=os.path.join(CACHE_FOLDER, provider))
+        else:
+            basis = build_run_split_basis([symbol], _OneFile(path), interval=INTERVAL)
         factors = [basis.factor(symbol, date.fromisoformat(bar["date"])) for bar in bars]
     except SplitBasisRefused as exc:
         return bars, str(exc), False

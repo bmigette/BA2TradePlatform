@@ -9,9 +9,10 @@ the testplatform's thin side of it, so every switch point asks ONE place:
 * ``stored_history_source(backtest, session)`` -- the source of a STORED row (re-run, what-if,
   chart): the row's own stamp, else its optimization's, else the legacy ``fmp`` (a row from
   before the switch has no stamp);
-* ``refuse_option_job_on_unsupported_source`` -- an OPTION job stamped ``alpaca`` raises
-  ``OptionHistorySourceUnsupported`` (ThetaData strikes are as-traded and the split-basis
-  converter still reads FMP's calendar; plan Task 12 lifts this);
+* ``refuse_option_job_on_unsupported_source`` -- an OPTION job on a source outside
+  ``OPTION_SUPPORTED_SOURCES`` raises ``OptionHistorySourceUnsupported`` (ThetaData strikes are
+  as-traded; ``option_split_basis`` converts ``fmp`` from FMP's calendar and ``alpaca`` from the
+  verified split table, plan Task 12);
 * ``verify_alpaca_cache_certified(cache_dir)`` -- an ``alpaca`` run refuses (``AlpacaCacheNotCertified``) unless the cache
   carries a PASS gate certificate of its CURRENT build manifest AND suspension events (every GA worker runs on its own copy of
   the cache: an uncertified or older copy would silently trade without the suspension liquidations the master has).
@@ -32,8 +33,10 @@ from ba2_common.core.ohlcv_history import (
     resolve_job_history_source,
 )
 
-#: The only source an option job may run on until the split-basis converter reads the verified table.
-OPTION_SUPPORTED_SOURCE = "fmp"
+#: The sources an option job may run on: those ``option_split_basis.build_run_split_basis`` can state an as-traded basis for.
+OPTION_SUPPORTED_SOURCES = ("fmp", "alpaca")
+#: What a NEW option job is stamped with when the caller states nothing (unchanged: fmp).
+OPTION_DEFAULT_SOURCE = "fmp"
 
 
 class AlpacaCacheNotCertified(RuntimeError):
@@ -59,15 +62,15 @@ def job_history_cache_dir(config: Mapping) -> str:
 
 
 def refuse_option_job_on_unsupported_source(config: Mapping, *, uses_options: bool, where: str) -> None:
-    """Raise ``OptionHistorySourceUnsupported`` for an option job whose source is not ``fmp``."""
+    """Raise ``OptionHistorySourceUnsupported`` for an option job whose source has no as-traded split basis."""
     if not uses_options:
         return
     source = resolve_job_history_source(config)
-    if source != OPTION_SUPPORTED_SOURCE:
+    if source not in OPTION_SUPPORTED_SOURCES:
         raise OptionHistorySourceUnsupported(
             f"{where}: an option job cannot run on OHLCV history source {source!r}: ThetaData strikes "
-            f"are as-traded and the split-basis converter still reads FMP's split calendar. Use "
-            f"{OHLCV_HISTORY_SOURCE_KEY}={OPTION_SUPPORTED_SOURCE!r} for option jobs.")
+            f"are as-traded and no split basis is defined for it. Use "
+            f"{OHLCV_HISTORY_SOURCE_KEY} in {OPTION_SUPPORTED_SOURCES} for option jobs.")
 
 
 def _blob(value: Any) -> Any:
@@ -133,11 +136,11 @@ def new_job_history_source(stated: Optional[str], *, uses_options: bool, where: 
 
     Stated -> as stated (an unknown name refuses: ``UnknownHistorySource``); not stated ->
     ``DEFAULT_BT_HISTORY_SOURCE`` for an equity job and ``fmp`` for an option job. An option job
-    resolved to anything but fmp refuses (``OptionHistorySourceUnsupported``)."""
+    resolved to a source without a split basis refuses (``OptionHistorySourceUnsupported``)."""
     if stated is not None:
         source = check_history_source(stated)
     else:
-        source = OPTION_SUPPORTED_SOURCE if uses_options else DEFAULT_BT_HISTORY_SOURCE
+        source = OPTION_DEFAULT_SOURCE if uses_options else DEFAULT_BT_HISTORY_SOURCE
     refuse_option_job_on_unsupported_source({OHLCV_HISTORY_SOURCE_KEY: source}, uses_options=uses_options, where=where)
     return source
 

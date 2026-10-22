@@ -78,6 +78,9 @@ class ParquetRunInputs:
     #: print up to its end date). The rebuilt reader must produce the same one, or today's
     #: FRED cache is not the one the run priced with and its greeks cannot be reproduced.
     rate_identity: Optional[str] = None
+    #: The OHLCV history the run read (``fmp`` | ``alpaca``): the closes the greeks were inverted
+    #: against, and the split basis they were converted with, come from it.
+    history_source: str = "fmp"
 
     def run_config(self, underlying: str) -> Dict[str, Any]:
         """The run config, narrowed to ONE underlying.
@@ -87,6 +90,7 @@ class ParquetRunInputs:
         ``spot_scope`` string, which only keys caches -- and this overlay is private anyway.
         """
         return {
+            "ohlcv_history_source": self.history_source,
             "options_cache_db": self.options_cache_db,
             "options_store": self.store,
             "options_parquet_root": self.parquet_root,
@@ -190,8 +194,14 @@ def parquet_run_inputs(provenance: Any, backtest: Any) -> Tuple[Optional[Parquet
     else:
         as_traded = False
 
+    from app.services.backtest.history_source import stored_history_source
+
+    try:
+        history_source = stored_history_source(backtest)
+    except ValueError as exc:
+        return None, f"its OHLCV history source cannot be established ({exc})"
     return ParquetRunInputs(
-        store=store, options_cache_db=provenance.db_path or _OPTIONS_RUN_FLAG,
+        history_source=history_source, store=store, options_cache_db=provenance.db_path or _OPTIONS_RUN_FLAG,
         parquet_root=provenance.parquet_root, risk_free_rate=rate,
         execution_interval=str(interval), warmup_days=warmup_days,
         start=start, end=end, as_traded=as_traded, rate_origin=rate_origin,
@@ -246,7 +256,8 @@ class ParquetContractReader:
 
     def _build_context(self, underlying: str) -> _UnderlyingContext:
         from ba2_common.core.split_basis import SplitBasisRefused
-        from ba2_providers.ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
+        from ba2_common.core.ohlcv_history import history_registry_key
+        from ba2_providers import get_provider
 
         from ba2_providers.macro.risk_free_rate import RiskFreeRateUnavailable
 
@@ -265,7 +276,8 @@ class ParquetContractReader:
         # In cached_only mode it uses the inner provider for its CLASS NAME (the cache
         # directory) and never calls it; constructing a real one would read the API key and
         # create the cache folder, so an uninitialised instance of the same class stands in.
-        ohlcv = MemoizedOHLCVProvider(FMPOHLCVProvider.__new__(FMPOHLCVProvider), fetch_start,
+        inner = type(get_provider("ohlcv", history_registry_key(inputs.history_source)))
+        ohlcv = MemoizedOHLCVProvider(inner.__new__(inner), fetch_start,
                                       inputs.end, interval=interval, cached_only=True)
         ps = AsOfPriceSource(ohlcv_provider=ohlcv, interval=interval)
         ohlcv.bind_price_source(ps)
@@ -276,7 +288,7 @@ class ParquetContractReader:
                                                           interval))
         except BacktestCacheMiss:
             raise ContractDetailRefused(
-                f"no cached {interval} FMP bars for {underlying} on this host, and the greeks "
+                f"no cached {interval} {inputs.history_source} bars for {underlying} on this host, and the greeks "
                 f"are inverted against them")
         try:
             if inputs.as_traded:
