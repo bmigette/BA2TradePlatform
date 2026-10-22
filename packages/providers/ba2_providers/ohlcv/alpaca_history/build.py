@@ -78,14 +78,16 @@ EXCHANGE SUSPENSIONS / DELISTINGS (``<out>/_meta/suspensions.json``; read by the
   run merges like the manifest (the events ride in each symbol's manifest entry).  Counted in the manifest and the run summary.
 REUSED TICKERS (``<out>/_meta/reused_tickers.json``; input ``<out>/_meta/ipo_dates.json`` from the ``ipo-dates`` step).  A ticker's series can
   join two companies (VG: Vonage until 2022-07, Venture Global from its 2025-01-24 IPO).  For each gap above, the symbol's FMP profile
-  ``ipoDate`` is the evidence: within REUSE_IPO_TOL_DAYS (7) calendar days of the gap's END (the first bar after it) = the current company
-  listed there = the bars BEFORE the gap are another company's: the build DROPS them (daily and 5-minute, like a series break at the
-  resume session; where several gaps match, the last one) and records ``{symbol, gap [last, resume], missing_sessions, dropped
-  {1d, 5min, first, last}, evidence {ipo_date, source, days_from_resume}}``.  ``ipoDate`` on/before the gap's first bar = the same company
-  (a long suspension: history kept, the gap stays an event).  Anything else -- no profile / no ipoDate / no ``ipo_dates.json`` / an ipoDate
-  inside the gap or after its end -- is AMBIGUOUS: nothing is dropped (the gap stays an event) and the gap is listed under ``ambiguous`` of
-  reused_tickers.json (``[last, resume, missing, reason]``, reason ``no_ipo_dates_file`` | ``no_ipo_date`` | ``ipo_inside_gap`` |
-  ``ipo_after_resume``), in the manifest entry (``gap_review``) and in the run summary for a human to decide.  Never a guess.
+  ``ipoDate`` is the evidence: an ipoDate in (last bar before the gap, resume + REUSE_IPO_TOL_DAYS (7) calendar days] = the current company
+  listed after the old series ended and by the gap's END (the first bar after it) = the bars BEFORE the gap predate it, are another
+  company's, and dropping them only loses data, never mixes companies: the build DROPS them (daily and 5-minute, like a series break at
+  the resume session; where several gaps match, the last one) and records ``{symbol, gap [last, resume], missing_sessions, dropped
+  {1d, 5min, first, last}, evidence {ipo_date, source, days_from_resume}}`` (days_from_resume is negative for an ipo inside the gap).
+  ``ipoDate`` on/before the last bar before the gap = the same company (a long suspension: history kept, the gap stays an event).
+  Anything else -- no profile / no ipoDate / no ``ipo_dates.json`` / an ipoDate more than 7 days after the gap's end -- is AMBIGUOUS:
+  nothing is dropped (the gap stays an event) and the gap is listed under ``ambiguous`` of reused_tickers.json (``[last, resume,
+  missing, reason]``, reason ``no_ipo_dates_file`` | ``no_ipo_date`` | ``ipo_after_resume``), in the manifest entry (``gap_review``)
+  and in the run summary for a human to decide.  Never a guess.
 OUTPUT.  ``<out>/<SYM>_1d.parquet``, ``<out>/<SYM>_5min.parquet`` (atomic: temp file + os.replace) and
 ``<out>/_meta/build_manifest.json`` (the only thing this step writes under ``_meta``): the stores' asof, the split table's
 run_id / sha256 / inputs_sha256 / overrides_sha256, the input chunk hashes, per symbol the first/last date and bar count of
@@ -113,7 +115,7 @@ import pandas as pd
 
 from ba2_common import config as _cfg
 from ba2_providers.ohlcv.alpaca_history.ipo_dates import load_ipo_dates
-from ba2_providers.ohlcv.alpaca_history.split_build import DEFAULT_OUT, atomic_write, drop_placeholder_bars, read_fmp_frame
+from ba2_providers.ohlcv.alpaca_history.split_build import DEFAULT_OUT, atomic_write, sha256_text_file, drop_placeholder_bars, read_fmp_frame
 from ba2_providers.ohlcv.alpaca_history.split_table import OVERRIDES_PATH, load_bar_caps
 
 DEFAULT_DAILY_STORE = os.path.join(_cfg.BA2_HOME, "alpaca_store_daily2016")
@@ -139,7 +141,7 @@ DELISTED_SLACK_SESSIONS = 5      # last bar more than this many sessions before 
 KIND_SUSPENSION, KIND_DELISTED, KIND_GAP = "otc_suspension", "delisted", "exchange_gap"
 REUSE_IPO_TOL_DAYS = 7           # a profile ipoDate this close to the END of a gap (calendar days, both sides) = the current company listed there
 REUSED_NAME = "reused_tickers.json"
-REVIEW_NO_FILE, REVIEW_NO_IPO, REVIEW_INSIDE, REVIEW_AFTER = "no_ipo_dates_file", "no_ipo_date", "ipo_inside_gap", "ipo_after_resume"
+REVIEW_NO_FILE, REVIEW_NO_IPO, REVIEW_AFTER = "no_ipo_dates_file", "no_ipo_date", "ipo_after_resume"
 IPO_DATES_FILE = "ipo_dates.json"
 RUN_ID_CSVS = ("split_review.csv", "split_accepted.csv", "split_vs_fmp.csv", "fmp_daily_inputs.csv", "yahoo_inputs.csv")
 
@@ -516,11 +518,11 @@ def gap_evidence(last: pd.Timestamp, resume: pd.Timestamp, ipo_date: Optional[st
     if ipo_date is None:
         return REVIEW_NO_IPO
     ipo = pd.Timestamp(ipo_date)
-    if abs((ipo - resume).days) <= REUSE_IPO_TOL_DAYS:
-        return "reused"
     if ipo <= last:
         return "same_company"
-    return REVIEW_INSIDE if ipo < resume else REVIEW_AFTER
+    if ipo <= resume + pd.Timedelta(days=REUSE_IPO_TOL_DAYS):
+        return "reused"                     # listed after the last pre-gap bar and by the resume: those bars predate the company
+    return REVIEW_AFTER
 
 
 def judge_reuse(gaps: Sequence[Tuple[pd.Timestamp, pd.Timestamp, List[Any]]], ipo_date: Optional[str], have_file: bool
@@ -768,7 +770,7 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
         raise BuildError(f"asof differs: daily store {d_asof}, 5-minute store {i_asof}, split table {table.asof}")
     overrides_path = overrides_path or OVERRIDES_PATH
     bar_caps = load_bar_caps(overrides_path)                    # raises SplitOverridesPending while any override is pending
-    if _file_sha256(overrides_path) != table.overrides_sha256:
+    if sha256_text_file(overrides_path) != table.overrides_sha256:
         raise BuildError(f"{overrides_path} changed since the split table was built (sha256 differs from the table's overrides_sha256): "
                          f"rerun the split-table step")
     universe = list_symbols(daily_store, intraday_store)
@@ -805,7 +807,7 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
     built = {r["symbol"]: {k: v for k, v in r.items() if k != "symbol"} for r in results if "error" not in r and "skipped" not in r}
 
     mpath = os.path.join(out, "_meta", MANIFEST_NAME)
-    ipo_sha = _file_sha256(ipo_path) if ipo_all is not None else None
+    ipo_sha = sha256_text_file(ipo_path) if ipo_all is not None else None
     entries: Dict[str, Any] = {}
     if symbols is not None and os.path.isfile(mpath):
         with open(mpath, encoding="utf-8") as f:

@@ -208,6 +208,13 @@ def load_store_bars(store: str, symbols: Optional[List[str]], stats: Optional[Co
     return {sym: df for sym, df, _ in res}, h.hexdigest()
 
 
+def sha256_text_file(path: str) -> str:
+    """sha256 of a TEXT file kept in the repository, every CRLF read as LF: a checkout with core.autocrlf=true gives the same
+    fingerprint as the LF file of record (an LF file keeps its sha)."""
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def sha256_files(paths: Iterable[str]) -> str:
     h = hashlib.sha256()
     for p in sorted(paths):
@@ -392,8 +399,7 @@ def build_split_table(*, store: str = DEFAULT_STORE, out: str = DEFAULT_OUT, db:
     ``fmp_to`` defaults to the store's end (STORE_INFO asof + 1 day); a value before the store's asof is refused."""
     overrides_path = overrides_path or OVERRIDES_PATH
     overrides = load_overrides(overrides_path)
-    with open(overrides_path, "rb") as f:
-        overrides_sha = hashlib.sha256(f.read()).hexdigest()
+    overrides_sha = sha256_text_file(overrides_path)
     with open(os.path.join(store, "STORE_INFO.json"), encoding="utf-8") as f:
         info = json.load(f)
     store_end = (date.fromisoformat(info["asof"]) + timedelta(days=1)).isoformat()

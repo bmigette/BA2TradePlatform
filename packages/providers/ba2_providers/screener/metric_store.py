@@ -889,7 +889,7 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
             universe_info["path"] = str(universe_symbols_path)
             try:
                 with open(universe_symbols_path, "rb") as _f:
-                    universe_info["file_sha256"] = hashlib.sha256(_f.read()).hexdigest()
+                    universe_info["file_sha256"] = hashlib.sha256(_f.read().replace(b"\r\n", b"\n")).hexdigest()   # a CRLF checkout = the LF sha
             except OSError:
                 pass
 

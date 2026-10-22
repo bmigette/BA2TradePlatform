@@ -67,7 +67,17 @@ def write_symbol(daily_root, intraday_root, sym, daily_days, intraday_days=(), g
 
 def _sha(path):
     import hashlib
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return hashlib.sha256(Path(path).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
+def test_a_crlf_and_an_lf_copy_of_a_fingerprinted_text_file_have_the_same_sha(tmp_path):
+    # core.autocrlf=true checks split_overrides.json out with CRLF; the split table was built from the LF file
+    import hashlib
+    from ba2_providers.ohlcv.alpaca_history.split_build import sha256_text_file
+    lf = b'{' + b"\n" + b' "entries": []' + b"\n" + b'}' + b"\n"
+    (tmp_path / "lf.json").write_bytes(lf)
+    (tmp_path / "crlf.json").write_bytes(lf.replace(b"\n", b"\r\n"))
+    assert sha256_text_file(str(tmp_path / "crlf.json")) == sha256_text_file(str(tmp_path / "lf.json")) == hashlib.sha256(lf).hexdigest()
 
 
 def make_table(out, splits=None, spinoffs=None, breaks=None, run_id="RUN1", csv_run_id=None, asof="2026-10-12", overrides_path=None):
@@ -1107,15 +1117,15 @@ def test_a_ticker_whose_company_listed_at_the_end_of_the_gap_drops_the_bars_befo
     assert m["reused_tickers"] == 1 and m["symbols"]["VG"]["1d"]["first"] == "2024-05-16"
 
 
-def test_the_ipo_date_may_be_a_few_days_either_side_of_the_resume(env, tmp_path):
-    _susp_env(env, tmp_path, "VG", GAP, ipo="2024-05-20")                                 # +4 days
-    assert "VG" in _reused(env)["reused"]
-    _susp_env(env, tmp_path, "VG", GAP, ipo="2024-05-12")                                 # -4 days
-    assert "VG" in _reused(env)["reused"]
-    _susp_env(env, tmp_path, "VG", GAP, ipo="2024-05-09")                                 # -7 days: the tolerance edge
-    assert "VG" in _reused(env)["reused"]
-    _susp_env(env, tmp_path, "VG", GAP, ipo="2024-05-08")                                 # -8 days: ambiguous, not reused
-    assert _reused(env)["reused"] == {}
+def test_an_ipo_after_the_last_old_bar_and_up_to_a_week_after_the_resume_is_reused(env, tmp_path):
+    for ipo in ("2024-05-20", "2024-05-23", "2024-05-12", "2024-04-10", "2024-03-01"):    # +4, +7 days, then inside the gap
+        _susp_env(env, tmp_path, "VG", GAP, ipo=ipo)
+        assert "VG" in _reused(env)["reused"], ipo
+    assert _reused(env)["reused"]["VG"]["evidence"]["days_from_resume"] == (pd.Timestamp("2024-03-01") - pd.Timestamp("2024-05-16")).days
+    _susp_env(env, tmp_path, "VG", GAP, ipo="2024-05-24")                                 # +8 days: ambiguous, not reused
+    assert _reused(env)["reused"] == {} and _reused(env)["ambiguous"]["VG"][0][3] == "ipo_after_resume"
+    _susp_env(env, tmp_path, "VG", GAP, ipo="2024-02-29")                                 # the last old bar's own day: the same company
+    assert _reused(env)["reused"] == {} and _reused(env)["ambiguous"] == {}
 
 
 def test_the_same_company_after_a_long_suspension_keeps_its_history_and_the_event(env, tmp_path):
@@ -1126,7 +1136,7 @@ def test_the_same_company_after_a_long_suspension_keeps_its_history_and_the_even
     assert _reused(env)["reused"] == {} and _reused(env)["ambiguous"] == {}               # judged: not listed anywhere
 
 
-@pytest.mark.parametrize("ipo,reason", [(None, "no_ipo_date"), ("2024-04-10", "ipo_inside_gap"), ("2024-08-01", "ipo_after_resume"),
+@pytest.mark.parametrize("ipo,reason", [(None, "no_ipo_date"), ("2024-08-01", "ipo_after_resume"),
                                          ("absent", "no_ipo_dates_file")])
 def test_ambiguous_evidence_is_not_truncated_and_is_listed_for_review(env, tmp_path, ipo, reason):
     f, s = _susp_env(env, tmp_path, "AMB", GAP, ipo=ipo)
