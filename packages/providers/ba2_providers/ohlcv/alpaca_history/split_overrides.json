@@ -250,6 +250,15 @@
    "reviewed_by": "owner (B. Migette) 2026-10-21"
   },
   {
+   "symbol": "TIGO",
+   "event_date": "2022-05-20",
+   "decision": "accept",
+   "ratio": 1.273,
+   "reason": "Millicom rights offering, 7 new shares per 10 at USD 10.61, record date 2022-05-23 (ex 2022-05-20; SEC FWP https://www.sec.gov/Archives/edgar/data/912958/000095010322008225/dp172826_fwp.htm); TERP factor (10 x 22.195 + 7 x 10.61) / 17 -> 1.274; FMP lists 1.273 as a split and does not adjust its prices, Yahoo does not adjust either (gate yahoo run 2019-01-09..2022-05-19 at 0.7855 = 1 / 1.273); adjusted like a split so a holder does not book the rights' value as a loss",
+   "added": "2026-10-22",
+   "reviewed_by": "owner (B. Migette) 2026-10-22"
+  },
+  {
    "symbol": "LENZ",
    "event_date": "2024-03-22",
    "decision": "accept",
