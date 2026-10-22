@@ -186,6 +186,7 @@ def test_the_launched_command_is_exactly_this():
         "--interval", "1d", "--population", "40", "--generations", "6",
         "--initial-capital", "20000.0",
         "--options-store", "tastytrade",
+        "--ohlcv-history-source", "alpaca",
         "--fitness", "option_convex",
         "--run-schedule", "daily", "--name", "convex-FMPRating-O_CONVEX",
         "--parallel", "4",
@@ -316,3 +317,13 @@ def test_the_help_text_no_longer_advertises_a_refusal():
                   if a.dest == "stress_spread_bps")
     assert "REFUSED" not in (action.help or "")
     assert "total_return" in (action.help or "")
+
+
+def test_the_history_source_is_always_stated_and_defaults_to_alpaca():
+    """Option jobs default to fmp in the launcher, so the driver must STATE the source; this grid
+    runs on the alpaca history (owner 2026-10-22), and fmp stays one explicit flag away."""
+    d = _driver()
+    cmd = d.build_cmd(_args(d), "/x/ba2-test", "n", "FMPRating", "O_X", ["AAPL"])
+    assert cmd[cmd.index("--ohlcv-history-source") + 1] == "alpaca"
+    cmd = d.build_cmd(_args(d, ohlcv_history_source="fmp"), "/x/ba2-test", "n", "FMPRating", "O_X", ["AAPL"])
+    assert cmd[cmd.index("--ohlcv-history-source") + 1] == "fmp"

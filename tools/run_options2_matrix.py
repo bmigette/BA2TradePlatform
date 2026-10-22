@@ -245,6 +245,9 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
         # the serving vendor's history floor, and the sqlite/Alpaca store's is 2024-01-18 --
         # so the design's 2023-01 start RAISES before the job runs on the default store.
         "--options-store", args.options_store,
+        # The underlyings' OHLCV history (fmp | alpaca): option jobs default to fmp in the launcher,
+        # so the source is ALWAYS stated here (owner 2026-10-22: this grid runs on alpaca).
+        "--ohlcv-history-source", args.ohlcv_history_source,
         "--fitness", args.fitness,
         # Daily cadence: option entries want the day's signal, and O_ERN's entry window is
         # 1-5 days wide, which a weekly scan would miss outright.
@@ -306,6 +309,9 @@ def build_parser() -> argparse.ArgumentParser:
                          f"uses option_convex and must not be crossed with it).")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f}).")
+    ap.add_argument("--ohlcv-history-source", choices=("alpaca", "fmp"), default="alpaca",
+                    help="OHLCV history of the underlyings (default alpaca, owner 2026-10-22; the as-traded "
+                         "split basis then comes from the verified split table of the alpaca cache).")
     ap.add_argument("--options-store", default="thetadata",
                     help="Options store serving the run (default thetadata -- floor 2018-09-14, "
                          "the only vendor whose history reaches the 2020 start this grid "

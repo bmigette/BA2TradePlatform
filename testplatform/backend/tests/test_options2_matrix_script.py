@@ -217,6 +217,7 @@ def test_the_launched_command_is_exactly_this():
         "--interval", "1d", "--population", "40", "--generations", "6",
         "--initial-capital", "20000.0",
         "--options-store", "parquet",
+        "--ohlcv-history-source", "alpaca",
         "--fitness", "option_car",
         "--run-schedule", "daily", "--name", "opt2-FMPRating-O_LEAPC",
         "--parallel", "4",
@@ -255,3 +256,13 @@ def test_the_window_stops_short_of_the_reserved_holdout():
     args = _args(d)
     assert args.end == "2025-12-31"
     m._assert_option_window_excludes_holdout(["O_LEAPC"], args.end)  # must not raise
+
+
+def test_the_history_source_is_always_stated_and_defaults_to_alpaca():
+    """Option jobs default to fmp in the launcher, so the driver must STATE the source; this grid
+    runs on the alpaca history (owner 2026-10-22), and fmp stays one explicit flag away."""
+    d = _driver()
+    cmd = d.build_cmd(_args(d), "/x/ba2-test", "n", "FMPRating", "O_X", ["AAPL"])
+    assert cmd[cmd.index("--ohlcv-history-source") + 1] == "alpaca"
+    cmd = d.build_cmd(_args(d, ohlcv_history_source="fmp"), "/x/ba2-test", "n", "FMPRating", "O_X", ["AAPL"])
+    assert cmd[cmd.index("--ohlcv-history-source") + 1] == "fmp"

@@ -228,6 +228,9 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
         # THE PARQUET STORE, ALWAYS -- same reasoning as grid 2's driver: the sqlite/Alpaca
         # store's history floor is 2024-01-18 and cannot serve the design's 2023-01 start.
         "--options-store", args.options_store,
+        # The underlyings' OHLCV history (fmp | alpaca): option jobs default to fmp in the launcher,
+        # so the source is ALWAYS stated here (owner 2026-10-22: this grid runs on alpaca).
+        "--ohlcv-history-source", args.ohlcv_history_source,
         "--fitness", args.fitness,
         # Daily cadence, matching grid 2's driver: option entries want the day's signal.
         "--run-schedule", "daily", "--name", name, "--parallel", str(args.parallel),
@@ -301,6 +304,9 @@ def build_parser() -> argparse.ArgumentParser:
                          f"refuses any other metric for --strategy O_CONVEX).")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f}).")
+    ap.add_argument("--ohlcv-history-source", choices=("alpaca", "fmp"), default="alpaca",
+                    help="OHLCV history of the underlyings (default alpaca, owner 2026-10-22; the as-traded "
+                         "split basis then comes from the verified split table of the alpaca cache).")
     ap.add_argument("--options-store", default="tastytrade",
                     help="Options store serving the run (default tastytrade -- floor 2022-10-01, "
                          "reaches this driver's 2023 start; 'parquet' is its accepted alias).")
