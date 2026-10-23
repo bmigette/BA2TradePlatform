@@ -315,19 +315,38 @@ def push_cache(worker: dict, *, history_source: str,
     pushed job runs on: only that source's folder is replicated; the other source's history
     folder is neither copied nor pruned (see ``_history_manifest``).
 
+    The source's own history folder is rebuilt IN PLACE, so it is also compared by crc32 on both
+    ends (``cache_sync.add_crc32``): a file rewritten at its old size is re-sent. A worker that
+    reports no crc32 there (older code) is REFUSED, never assumed equal.
+
     The prune step is skipped outright when the master's own manifest is empty (see below).
     """
-    local = _history_manifest(history_source)
+    crc_dirs = (history_cache_dirname(history_source),)
+    local = cache_sync.add_crc32(_history_manifest(history_source), crc_dirs)
     base, headers = _base(worker), _headers(worker)
     # Manifest GET: a worker with a very large cache (remote150: 312k files / 36GB) enumerates
-    # from disk on a cold call (~140s on Windows FS). Warm workers answer in ms; this timeout
-    # just has to survive the cold case after a restart. (Workers >= 2026.08.0054 cache the
-    # manifest server-side, so this is belt-and-braces.)
-    with httpx.Client(timeout=300.0) as c:
-        r = c.get(f"{base}/cache/manifest", headers=headers)
+    # from disk on a cold call (~140s on Windows FS), and the first content check after this change
+    # (or after a rebuild) crc32s the whole history folder there (~20 GB, a few minutes); later
+    # calls take the unchanged files' crc from the worker's cache. The timeout covers the cold case.
+    with httpx.Client(timeout=1800.0) as c:
+        r = c.get(f"{base}/cache/manifest", headers=headers,
+                  params={"hash_dirs": ",".join(crc_dirs)})
         r.raise_for_status()
         remote = r.json()
+    unverifiable = cache_sync.missing_crc32(local["files"], remote, crc_dirs)
+    if unverifiable:
+        raise ValueError(
+            f"cache push refused: worker {worker['name']} reports no crc32 for "
+            f"{len(unverifiable)} file(s) under {', '.join(crc_dirs)} (e.g. {unverifiable[0]}), "
+            f"so a file rebuilt at its old size could not be told apart. Its code predates the "
+            f"content check: update the worker, then push again.")
     missing = cache_sync.diff_missing(local["files"], remote)
+    changed = cache_sync.diff_content_mismatch(local["files"], remote)
+    if changed:
+        log(f"cache push -> {worker['name']}: {len(changed)} file(s) under {', '.join(crc_dirs)} "
+            f"changed content at the same size (e.g. {changed[0]}); re-sending them")
+        already = set(missing)
+        missing = missing + [p for p in changed if p not in already]
     res = {"pushed": 0, "extracted": 0}
     if not missing:
         log(f"cache push -> {worker['name']}: already in sync ({local['count']} files)")

@@ -103,6 +103,11 @@ def _fake_transport(monkeypatch, remote, local):
                         lambda **kw: _FakeClient(calls, remote, **kw))
     monkeypatch.setattr(worker_client.cache_sync, "build_manifest",
                         lambda *a, **k: local)
+    # no files on disk behind the fake manifest: the history folder's crc is a fixed 0 here
+    monkeypatch.setattr(worker_client.cache_sync, "add_crc32",
+                        lambda m, dirs, root=None: {**m, "files": [
+                            {**f, "crc32": 0} if f["rel_path"].startswith(tuple(d + "/" for d in dirs))
+                            else f for f in m["files"]]})
     return calls
 
 
@@ -133,7 +138,7 @@ def test_push_cache_still_prunes_stale_files_on_a_non_empty_manifest(monkeypatch
              "files": [{"rel_path": "a.parquet", "size": 10},
                        {"rel_path": "FMPOHLCVProvider/AAPL_1d.parquet", "size": 10}]}
     remote = {"files": [{"rel_path": "a.parquet", "size": 10},          # in sync -> no push
-                        {"rel_path": "FMPOHLCVProvider/AAPL_1d.parquet", "size": 10},
+                        {"rel_path": "FMPOHLCVProvider/AAPL_1d.parquet", "size": 10, "crc32": 0},
                         {"rel_path": "old-fragment.parquet", "size": 4}]}  # stale -> prune
     calls = _fake_transport(monkeypatch, remote, local)
 

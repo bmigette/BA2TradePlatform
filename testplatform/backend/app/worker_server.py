@@ -1111,10 +1111,21 @@ def market_conditions_prepare(req: PrepareMarketConditionsReq, request: Request,
 
 
 @worker_app.get("/cache/manifest")
-def cache_manifest(request: Request, with_hash: bool = False,
+def cache_manifest(request: Request, with_hash: bool = False, hash_dirs: Optional[str] = None,
                    authorization: str = Header(default=None)):
+    """The worker's cache file list. ``hash_dirs`` (comma-separated TOP-LEVEL folder names) adds a
+    ``crc32`` to the entries under those folders only -- the push's content check of the folders
+    rebuilt in place (``cache_sync.add_crc32``; unchanged files come from the per-host crc cache).
+    ``with_hash`` hashes EVERY file (the slow full integrity check)."""
     _verify(authorization, request)
-    return _cached_manifest(with_hash=with_hash)
+    manifest = _cached_manifest(with_hash=with_hash)
+    if not hash_dirs or with_hash:
+        return manifest
+    dirnames = [d for d in hash_dirs.split(",") if d]
+    bad = [d for d in dirnames if d in (".", "..") or "/" in d or "\\" in d]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"hash_dirs must be top-level folder names: {bad}")
+    return cache_sync.add_crc32(manifest, dirnames)
 
 
 @worker_app.post("/cache/push")
