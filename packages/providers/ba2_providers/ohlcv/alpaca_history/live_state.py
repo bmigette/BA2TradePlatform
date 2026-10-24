@@ -119,12 +119,30 @@ def _marker(symbol: str) -> str:
     return os.path.join(_meta(), "locks", f"{symbol.upper()}.rebase.json")
 
 
+_EVENTS_MEMO: dict = {}          # manifest path -> ((mtime_ns, size), {SYMBOL: [Event, ...]})
+
+
+def _events_by_symbol() -> dict:
+    """``{SYMBOL: [events]}`` of the manifest; the 8 MB file is parsed once per (mtime, size) and only the events are kept."""
+    path = os.path.join(_meta(), build.MANIFEST_NAME)
+    st = os.stat(path)
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _EVENTS_MEMO.get(path)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    with open(path, encoding="utf-8") as f:
+        symbols = json.load(f)["symbols"]
+    out = {s: ([(d, float(x), "split") for d, x in e["events"]["splits"]]
+               + [(d, float(x), "spinoff") for d, x in e["events"]["spinoffs"]])
+           for s, e in symbols.items() if "events" in e}
+    _EVENTS_MEMO[path] = (key, out)
+    return out
+
+
 def manifest_events(symbol: str) -> List[Event]:
-    """The events the files of ``symbol`` are on, from the manifest (``[]`` when it has none)."""
-    with open(os.path.join(_meta(), build.MANIFEST_NAME), encoding="utf-8") as f:
-        entry = json.load(f)["symbols"][symbol.upper()]
-    ev = entry["events"]
-    return ([(d, float(x), "split") for d, x in ev["splits"]] + [(d, float(x), "spinoff") for d, x in ev["spinoffs"]])
+    """The events the files of ``symbol`` are on, from the manifest (``[]`` when it has none). ``KeyError`` when the
+    manifest does not list the symbol (not in the build)."""
+    return list(_events_by_symbol()[symbol.upper()])
 
 
 def extend_manifest(symbol: str, events: Sequence[Event], *, now: datetime) -> bool:

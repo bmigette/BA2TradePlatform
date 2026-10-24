@@ -9,12 +9,16 @@ Volume, effective_date``; the 5-min files hold the regular session only), and th
 (``MarketDataProviderInterface.get_ohlcv_data``) serves them. The ``_meta/`` folder of the build is
 not a bar file and is never read.
 
-CACHE-ONLY: there is no vendor behind this class. A read the cache cannot answer, and any top-up of a
-stale cache, raises ``HistoryTopUpUnavailable``. It needs no key and has no split calendar: the split
-basis is the build's, not re-checked against a vendor calendar.
+WITHOUT credentials it is CACHE-ONLY (backtests, GA workers): a read the cache cannot answer, and any
+top-up of a stale cache, raises ``HistoryTopUpUnavailable``; it needs no key and has no split calendar.
+
+WITH credentials (an account's Alpaca keys; plan 2026-10-24-history-source-task11) a LATEST read appends the
+finished sessions Alpaca has beyond the file's last bar, in place and ungated (owner decision), under the
+rules of ``alpaca_history.live_topup`` (contiguous, split table applied, no mixed basis) and the per-symbol
+cross-process lock of ``alpaca_history.live_state``. A pinned (backtest) read never reaches the top-up.
 """
 
-from typing import Annotated
+from typing import Annotated, Any, Callable, Optional
 from datetime import datetime
 import pandas as pd
 
@@ -36,9 +40,21 @@ class AlpacaHistoryOHLCVProvider(MarketDataProviderInterface):
     fetch ever happens, so there is no marker to write) and ``_split_calendar`` returns None (no
     vendor calendar to compare the build's basis with)."""
 
-    def __init__(self):
+    def __init__(self, api_key: Optional[str] = None, api_secret: Optional[str] = None, *,
+                 fetcher: Optional[Any] = None, clock: Optional[Callable[[], datetime]] = None,
+                 corporate_actions_refresher: Optional[Callable[[str], None]] = None):
         super().__init__()
-        logger.debug("Initialized AlpacaHistoryOHLCVProvider (cache-only)")
+        self._fetcher = fetcher
+        if self._fetcher is None and api_key and api_secret:
+            from ba2_providers.ohlcv.alpaca_history.live_fetch import AlpacaLiveBars
+            self._fetcher = AlpacaLiveBars(api_key, api_secret)
+        self._clock = clock
+        self._refresher = corporate_actions_refresher
+        logger.debug(f"Initialized AlpacaHistoryOHLCVProvider ({'live top-up' if self._fetcher else 'cache-only'})")
+
+    @property
+    def live(self) -> bool:
+        return self._fetcher is not None
 
     def _get_ohlcv_data_impl(
         self,
@@ -47,6 +63,11 @@ class AlpacaHistoryOHLCVProvider(MarketDataProviderInterface):
         end_date: Annotated[datetime, "End date for data"],
         interval: Annotated[str, "Data interval"] = "1d",
     ) -> pd.DataFrame:
+        if self.live:
+            from ba2_providers.ohlcv.alpaca_history.live_topup import SymbolNotInHistory
+            raise SymbolNotInHistory(
+                f"{symbol} ({interval}): not in the prepared Alpaca history (not in the build); live reads "
+                f"only extend an existing history, they never backfill one")
         raise HistoryTopUpUnavailable(
             f"AlpacaHistoryOHLCVProvider has no live source: {symbol} ({interval}) "
             f"{start_date} .. {end_date} is not in the prepared cache (or the cache is stale). "
@@ -58,10 +79,21 @@ class AlpacaHistoryOHLCVProvider(MarketDataProviderInterface):
         ``_refresh_parquet_if_stale``, which compares the last bar with the current one."""
         return False
 
+    def _live_interval(self, interval: str, symbol: str) -> str:
+        from ba2_common.core import native_cache
+        canon = native_cache.normalize_interval(interval)
+        if canon == "1d":
+            return "1d"
+        if canon == "5m":
+            return "5min"
+        raise HistoryTopUpUnavailable(f"{symbol}: the live Alpaca top-up supports '1d' and '5min', not {interval!r}")
+
     def _refresh_parquet_if_stale(self, df, symbol, interval, provider_name):
-        """A LATEST read (``end_date=None``) whose cache lags the current bar needs a top-up, and this
-        provider has none: raise instead of the base's warn-and-serve-stale. A cache already current
-        to the expected bar is returned as is. Pinned (backtest) reads never get here."""
+        """A LATEST read (``end_date=None``) whose cache lags the newest finished session is topped up when this
+        provider has account credentials, else it raises (the cache-only behaviour). A cache already current is
+        returned as is. Pinned (backtest) reads never get here."""
+        if self.live:
+            return self._live_topup(df, symbol, interval, provider_name)
         last = pd.to_datetime(df['Date']).iloc[-1]
         last = last.to_pydatetime().replace(tzinfo=None)
         if last >= self.normalize_time_to_interval(datetime.now(), interval):
@@ -70,6 +102,43 @@ class AlpacaHistoryOHLCVProvider(MarketDataProviderInterface):
             f"{symbol} ({interval}): the prepared Alpaca history ends {last} and a latest read needs "
             f"newer bars; this provider has no live top-up. Rebuild with "
             f"`tools/prepare_history.py --source alpaca`, or read a pinned end_date.")
+
+    def _live_topup(self, df, symbol, interval, provider_name):
+        from ba2_common.core import native_cache, ohlcv_final_bars
+        from ba2_providers.ohlcv.alpaca_history import live_state, live_topup
+        key = self._live_interval(interval, symbol)
+        now = self._clock() if self._clock is not None else ohlcv_final_bars.now_utc()
+        newest = ohlcv_final_bars.last_final_session_day(symbol, now)
+        last_day = pd.to_datetime(df['Date']).max().date()
+        if newest is None or newest <= last_day:
+            return df                                      # nothing finished beyond the file: no lock, no fetch
+        fetch = self._fetcher.daily if key == "1d" else self._fetcher.intraday_5min
+
+        def attempt():
+            with live_state.locked_symbol(symbol):
+                cur = native_cache.read_timeseries(provider_name, symbol, interval, as_of=None)
+                try:
+                    events = live_state.manifest_events(symbol)
+                except KeyError:
+                    raise live_topup.SymbolNotInHistory(
+                        f"{symbol} ({interval}): not in the Alpaca build manifest; the live top-up does not backfill")
+                splits = [(d, f) for d, f, k in events if k == "split"]
+                spinoffs = [(d, f) for d, f, k in events if k == "spinoff"]
+                merged, rep = live_topup.topup_frame(
+                    cur, lambda a, b: fetch(symbol, a, b), splits, spinoffs,
+                    interval=key, now_utc=now, symbol=symbol)
+                if rep["appended"]:
+                    native_cache.write_timeseries(provider_name, symbol, interval, merged)
+                    logger.info(f"{symbol} ({interval}): appended {rep['appended']} live bar(s), sessions "
+                                f"{rep['sessions'][0]}..{rep['sessions'][-1]}")
+                return merged
+        try:
+            return attempt()
+        except live_topup.PendingCorporateAction:
+            if self._refresher is None:
+                raise
+            self._refresher(symbol)                        # outside the lock: the refresh re-bases under it
+            return attempt()                               # one retry; a second failure propagates
 
     def get_provider_name(self) -> str:
         """Get the provider name."""
