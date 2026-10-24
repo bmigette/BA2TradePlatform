@@ -249,3 +249,49 @@ def reset_benchmark_regime() -> None:
     global _REGIME_NOW, _FAILURE_NOW
     _REGIME_NOW = None
     _FAILURE_NOW = None
+
+
+# ---------------------------------------------------------------------------------------------
+# Deploy: what a gated run tells the importer about its SPY series
+# ---------------------------------------------------------------------------------------------
+#: The history source LIVE reads SPY from (owner decision 2026-10-24: the same FMP source as the
+#: stock prices). A backtest on another source can classify a few days differently; see
+#: ``test_files/probe_spy_regime_source_disagreement.py``.
+LIVE_BENCHMARK_HISTORY_SOURCE = "fmp"
+
+
+def _has_benchmark_leaf(node: Any) -> bool:
+    if isinstance(node, dict):
+        if node.get("field") in (TREND_FIELD, VOL_FIELD):
+            return True
+        return any(_has_benchmark_leaf(v) for v in node.values())
+    if isinstance(node, (list, tuple)):
+        return any(_has_benchmark_leaf(v) for v in node)
+    return False
+
+
+def benchmark_deploy_block(backtest_block: Any) -> Optional[dict]:
+    """The ``benchmark_regime`` block a deploy payload carries: ``{"symbol", "history_source"}`` when the
+    run's backtest block says it was gated, else None (the payload then has no such key at all)."""
+    from ba2_common.core.ohlcv_history import resolve_job_history_source
+
+    if not isinstance(backtest_block, dict) or not backtest_block.get("benchmark_regime_gates"):
+        return None
+    return {"symbol": BENCHMARK_SYMBOL, "history_source": resolve_job_history_source(backtest_block)}
+
+
+def benchmark_import_warnings(block: Any, entry_rules: Any, exit_rules: Any) -> List[str]:
+    """Warnings (NOT refusals) for a payload whose rules carry a SPY regime leaf: the source its
+    backtest read SPY from differs from the one live reads, or is unknown. Empty when the rules carry
+    no such leaf. A different source can flip the SMA200 / vol-rank state on a few days."""
+    if not (_has_benchmark_leaf(entry_rules) or _has_benchmark_leaf(exit_rules)):
+        return []
+    if not isinstance(block, dict) or not block.get("history_source"):
+        return [f"SPY regime gate deployed but the payload does not say which history source its "
+                f"backtest read {BENCHMARK_SYMBOL} from (unknown); live reads "
+                f"{LIVE_BENCHMARK_HISTORY_SOURCE.upper()}"]
+    source = str(block["history_source"])
+    if source == LIVE_BENCHMARK_HISTORY_SOURCE:
+        return []
+    return [f"SPY regime gate: the backtest read {BENCHMARK_SYMBOL} from {source!r} but live reads "
+            f"{LIVE_BENCHMARK_HISTORY_SOURCE!r}; the SMA200 / vol-rank state can differ on a few days"]

@@ -332,6 +332,12 @@ def derive_export_payload(
         # fixture, stays byte-identical.
         if fr_top_n_repaired:
             payload["fr_top_n_repaired"] = True
+        # Only a run gated on the SPY regime says where its SPY series came from (live reads FMP;
+        # the importer warns on a different source). Absent for every other run.
+        from ba2_common.core.benchmark_regime import benchmark_deploy_block
+        _bench = benchmark_deploy_block(bt_block)
+        if _bench is not None:
+            payload["benchmark_regime"] = _bench
         return payload
 
     if kind == "ruleset":
