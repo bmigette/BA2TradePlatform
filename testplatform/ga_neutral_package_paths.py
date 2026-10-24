@@ -17,6 +17,8 @@ GA_NEUTRAL_GLOBS = [
     "packages/common/ba2_common/core/ibkr_*.py",
     "packages/common/ba2_common/core/protective_legs.py",
     "packages/common/tests/test_ibkr_*.py",
+    # PennyMomentumTrader live price fetch (vendor_live_price=fmp): intraday live trader, never run by GA/backtest.
+    "packages/experts/ba2_experts/PennyMomentumTrader/data_gathering.py",
     # Tests, docs and READMEs never ship to GA code paths.
     "packages/*/tests/*",
     "packages/*/test_files/*",

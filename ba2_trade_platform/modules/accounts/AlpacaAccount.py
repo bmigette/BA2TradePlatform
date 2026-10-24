@@ -455,7 +455,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 "default": "fmp",
                 "description": "Live stock price source",
                 "valid_values": ["fmp", "delayed_sip", "sip", "iex", "otc"],
-                "tooltip": "fmp = real-time FMP quote (last price; needs the FMP API key; never falls back to Alpaca). delayed_sip = 15-min delayed (free Alpaca tier). sip = real-time consolidated (paid). iex = real-time IEX (paid). otc = OTC data.",
+                "tooltip": "fmp = real-time FMP quote (last price; needs the FMP API key; never falls back to Alpaca; no bid/ask). delayed_sip = 15 min late (free Alpaca tier). iex = real-time IEX-only prints, free. sip = real-time consolidated, paid. otc = OTC data.",
             },
             "options_feed": {"type": "str", "required": False, "default": "indicative",
                              "valid_values": ["indicative", "opra"],
@@ -2928,9 +2928,16 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 f"valid values: {', '.join(feed_names)}")
 
         if feed_setting == "fmp":
-            # Real-time FMP /quote LAST price for every price_type: FMP /quote has no bid/ask,
-            # and the Alpaca path below already prefers the last trade over bid/ask whenever one
-            # exists, so bid/ask/mid/mark all mean "last" here. No Alpaca call, no fallback.
+            # Real-time FMP /quote LAST price. FMP /quote carries no bid/ask. 'bid' is the
+            # interface DEFAULT price_type (every plain get_instrument_current_price(sym) call
+            # arrives as 'bid' and means "the price"), so it cannot be refused: it is the last
+            # price, like mid/avg/mark/trade. An explicit 'ask' is a quote SIDE we do not have:
+            # refused loudly, never answered with a last price or an Alpaca quote.
+            if price_type == "ask":
+                raise ValueError(
+                    f"data_feed 'fmp' cannot serve price_type 'ask': FMP /quote has no ask "
+                    f"(account {self.id}). Use the default/'mid'/'mark' for a last price, or "
+                    f"switch the account's data_feed to an Alpaca feed.")
             return self._fmp_current_price(symbol_or_symbols)
 
         if not self._check_authentication():

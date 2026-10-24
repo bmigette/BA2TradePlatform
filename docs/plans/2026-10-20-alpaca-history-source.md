@@ -209,6 +209,8 @@ Measured 2026-10-20: Alpaca `delayed_sip` latest trade AND quote are 15.0 min ol
 - Ops: switch the EXISTING accounts on dev, prod and options to `fmp` (state the prod effect: real-time decision
   prices and TP/SL checks), then `/api/reload`.
 
+**Done 2026-10-24, branch feat/fmp-price-feed** (APP 2026.09.1249, ba2_experts 2026.10.00006): `fmp` default in AlpacaAccount via `core/fmp_live_price.py` (fmpsdk.quote, 100/batch, no cache); FMP failure -> None, never Alpaca; unknown data_feed raises. FMP /quote has no bid/ask: explicit `ask` is refused (ValueError); `bid` is the interface DEFAULT price_type ("the price"), so it returns the last price. Option quotes untouched (`options_feed`). PennyMomentumTrader: missing FMP key -> ERROR + no prices (account fallback removed; `vendor_live_price=account` stays an explicit choice). Ops step (switch existing accounts + `/api/reload`) still OWED.
+
 ### Task 11 (amended): per-account HISTORY source, separate from the price source
 
 ### Task 11: Live ACCOUNT setting + top-up

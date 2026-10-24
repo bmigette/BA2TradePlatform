@@ -102,7 +102,7 @@ def test_default_feed_is_fmp_and_listed():
     assert "fmp" in d["tooltip"].lower() and "delayed" in d["tooltip"].lower()
 
 
-@pytest.mark.parametrize("ptype", ["bid", "ask", "mid", "avg", "mark"])
+@pytest.mark.parametrize("ptype", ["bid", "mid", "avg", "mark", "trade"])
 def test_fmp_feed_never_touches_alpaca_and_returns_last(ptype):
     acct = _acct("fmp")
     with _with_feed("fmp"), \
@@ -141,3 +141,40 @@ def test_blank_feed_means_declared_default_fmp():
             "ba2_trade_platform.modules.accounts.AlpacaAccount.fetch_fmp_last_prices",
             return_value={"AAPL": 5.0}):
         assert acct._get_instrument_current_price_impl("AAPL") == 5.0
+
+
+@pytest.mark.parametrize("ptype", ["ask"])
+def test_ask_refused_loudly_with_fmp_feed(ptype):
+    """FMP /quote carries no ask (and "bid" is the interface DEFAULT meaning "the price", so it is last): refuse, never answer with a last price or an Alpaca quote."""
+    acct = _acct("fmp")
+    with _with_feed("fmp"),          patch("alpaca.data.historical.StockHistoricalDataClient") as client,          patch("ba2_trade_platform.modules.accounts.AlpacaAccount.fetch_fmp_last_prices") as f:
+        with pytest.raises(ValueError, match="ask"):
+            acct._get_instrument_current_price_impl("AAPL", ptype)
+        with pytest.raises(ValueError, match="ask"):
+            acct._get_instrument_current_price_impl(["AAPL"], ptype)
+    client.assert_not_called()
+    f.assert_not_called()
+
+
+def test_non_fmp_feed_still_serves_ask():
+    """Only the fmp feed refuses bid/ask; the Alpaca feeds keep their quote handling."""
+    acct = _acct("delayed_sip")
+    with _with_feed("delayed_sip"),          patch.object(AlpacaAccount, "_check_authentication", return_value=False):
+        assert acct._get_instrument_current_price_impl("AAPL", "ask") is None
+
+
+def test_penny_fmp_quotes_without_key_gives_no_prices_and_never_asks_the_account(caplog):
+    """PennyMomentumTrader vendor_live_price=fmp: a missing key is an ERROR + no prices, not account prices."""
+    from ba2_experts.PennyMomentumTrader.data_gathering import DataGatheringMixin
+
+    class _P(DataGatheringMixin):
+        logger = __import__("logging").getLogger("penny-test")
+        instance = MagicMock()
+
+    with patch("ba2_common.config.get_app_setting", return_value=None), \
+         patch("ba2_common.core.instance_resolver.get_instance_resolver") as resolver, \
+         caplog.at_level("ERROR"):
+        out = _P()._get_fmp_quotes(["AAPL", "MSFT"])
+    assert out == {"AAPL": None, "MSFT": None}
+    resolver.assert_not_called()
+    assert "FMP_API_KEY" in caplog.text
