@@ -65,6 +65,8 @@ def live(tmp_path, monkeypatch):
     (root / "_meta").mkdir()
     (root / "_meta" / "build_manifest.json").write_text(
         json.dumps({"symbols": {"AAA": {"events": {"splits": [], "spinoffs": []}}}}))
+    (root / "_meta" / "corporate_actions_live.json").write_text(json.dumps(       # the daily job ran on the previous session
+        {"run_date": "2026-10-23", "symbols_checked": ["AAA"], "applied": [], "pending": [], "review": []}))
     return root, now
 
 
@@ -182,3 +184,26 @@ def test_pending_action_without_a_refresher_raises_at_once(live):
     with pytest.raises(PendingCorporateAction):
         _provider(FakeBars(daily=_raw_daily(WEEK, px=5.0)), now).get_ohlcv_data(
             "AAA", start_date=START, interval="1d")
+
+
+def test_stale_corporate_actions_run_blocks_the_topup(live):
+    root, now = live
+    (root / "_meta" / "corporate_actions_live.json").write_text(json.dumps(
+        {"run_date": "2026-10-20", "symbols_checked": [], "applied": [], "pending": [], "review": []}))
+    bars = FakeBars(daily=_raw_daily(WEEK))
+    from ba2_providers.ohlcv.alpaca_history.corporate_actions import CorporateActionsStale
+    with pytest.raises(CorporateActionsStale):
+        _provider(bars, now).get_ohlcv_data("AAA", START, None, "1d")
+    assert bars.calls == []
+
+
+def test_symbol_under_review_is_refused_without_a_fetch(live):
+    root, now = live
+    (root / "_meta" / "corporate_actions_live.json").write_text(json.dumps(
+        {"run_date": "2026-10-23", "symbols_checked": ["AAA"], "applied": [], "pending": [],
+         "review": [{"symbol": "AAA", "row": {"event_date": "2026-10-20", "verdict": "both_contradicted"}}]}))
+    bars = FakeBars(daily=_raw_daily(WEEK))
+    from ba2_providers.ohlcv.alpaca_history.live_topup import PendingCorporateAction
+    with pytest.raises(PendingCorporateAction, match="under review"):
+        _provider(bars, now).get_ohlcv_data("AAA", START, None, "1d")
+    assert bars.calls == []

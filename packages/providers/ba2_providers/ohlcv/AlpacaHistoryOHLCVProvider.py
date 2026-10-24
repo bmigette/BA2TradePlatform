@@ -112,9 +112,12 @@ class AlpacaHistoryOHLCVProvider(MarketDataProviderInterface):
         last_day = pd.to_datetime(df['Date']).max().date()
         if newest is None or newest <= last_day:
             return df                                      # nothing finished beyond the file: no lock, no fetch
+        from ba2_providers.ohlcv.alpaca_history import corporate_actions
+        corporate_actions.assert_fresh(now)                # a dead daily refresh stops the live reads, loudly
         fetch = self._fetcher.daily if key == "1d" else self._fetcher.intraday_5min
 
         def attempt():
+            corporate_actions.assert_not_in_review(symbol)  # an undecided corporate action blocks this symbol
             with live_state.locked_symbol(symbol):
                 cur = native_cache.read_timeseries(provider_name, symbol, interval, as_of=None)
                 try:

@@ -62,6 +62,15 @@ FRED_PREOPEN_RETRY_DELAYS_MIN = (10, 10)
 # 09:20 ET and never runs inside the 09:25-09:45 collision window.
 IV_WARM_JOB_ID = "iv_history_preopen_warm_job"
 IV_WARM_HOUR, IV_WARM_MINUTE = 8, 30
+
+# Scheduler id of the daily corporate-actions refresh of the Alpaca history cache (plan
+# 2026-10-24-history-source-task11, Task 6). 08:30 America/New_York, Mon-Fri: after Alpaca posts overnight
+# actions, before the 09:30 entry window and never ON 09:30 (FMP collision). Armed only while an account
+# has ohlcv_history_source = alpaca; a failed run is retried every 15 minutes, 3 times.
+HISTORY_CA_JOB_ID = "history_corporate_actions_job"
+HISTORY_CA_HOUR, HISTORY_CA_MINUTE = 8, 30
+HISTORY_CA_RETRY_DELAY_MIN = 15
+HISTORY_CA_MAX_RETRIES = 3
 from .types import AnalysisUseCase
 
 
@@ -692,6 +701,7 @@ class JobManager:
         self._schedule_iv_snapshot_job()
         self._schedule_fred_preopen_job()
         self._schedule_iv_warm_job()
+        self._schedule_history_corporate_actions_job()
         self._schedule_warm_jobs()
 
     def _schedule_warm_jobs(self):
@@ -819,6 +829,68 @@ class JobManager:
                 f"{FRED_PREOPEN_MINUTE:02d} America/New_York, Mon-Fri")
         except Exception as e:
             logger.error(f"Error scheduling the pre-open FRED refresh job: {e}", exc_info=True)
+
+    def _schedule_history_corporate_actions_job(self):
+        """Arm the 08:30 ET corporate-actions refresh of the Alpaca history cache, if an account uses that source.
+
+        Idempotent (``replace_existing=True``) and part of ``_schedule_system_jobs``, so every path that wipes the
+        non-expert jobs brings it back. With no ``alpaca`` history account the job is not scheduled (and a
+        previously armed one is removed). When the last run is older than the staleness gate allows, one catch-up
+        run is armed 30 s from now, so switching an account does not leave its reads refused until tomorrow."""
+        try:
+            from . import account_history
+            if not account_history.alpaca_history_accounts():
+                if HISTORY_CA_JOB_ID in self._scheduled_jobs:
+                    self._remove_scheduled_job(HISTORY_CA_JOB_ID)
+                logger.info("History corporate-actions refresh not scheduled: no alpaca history account")
+                return
+            trigger = CronTrigger(hour=HISTORY_CA_HOUR, minute=HISTORY_CA_MINUTE,
+                                  day_of_week='mon-fri', timezone=_MARKET_TZ)
+            job = self._scheduler.add_job(
+                func=self._execute_history_corporate_actions_refresh, trigger=trigger, id=HISTORY_CA_JOB_ID,
+                name="Alpaca history corporate-actions refresh", replace_existing=True, max_instances=1, coalesce=True)
+            self._scheduled_jobs[HISTORY_CA_JOB_ID] = job
+            logger.info(f"Alpaca history corporate-actions refresh scheduled for {HISTORY_CA_HOUR:02d}:"
+                        f"{HISTORY_CA_MINUTE:02d} America/New_York, Mon-Fri")
+            if not account_history.history_job_is_fresh():
+                self._scheduler.add_job(
+                    func=self._execute_history_corporate_actions_refresh,
+                    trigger=DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(seconds=30)),
+                    id=f"{HISTORY_CA_JOB_ID}_catchup", name="Alpaca history corporate-actions catch-up",
+                    replace_existing=True, max_instances=1)
+                logger.warning("Alpaca history corporate-actions status is stale or missing: catch-up run armed in 30 s")
+        except Exception as e:
+            logger.error(f"Error scheduling the Alpaca history corporate-actions job: {e}", exc_info=True)
+
+    def _execute_history_corporate_actions_refresh(self, attempt: int = 0):
+        """Run the refresh; any error entry or exception is an ERROR and is retried (15 min, up to 3 times); after
+        that the ERROR stands and the staleness gate refuses the live Alpaca history reads."""
+        try:
+            from . import account_history
+            report = account_history.run_corporate_actions_refresh()
+            if report is None:
+                logger.info("History corporate-actions refresh: no alpaca history account; nothing to do")
+                return
+            failed = bool(report["errors"])
+            if failed:
+                logger.error(f"History corporate-actions refresh attempt {attempt + 1}: {report['errors']}")
+            else:
+                logger.info(f"History corporate-actions refresh: applied {report['applied']}")
+        except Exception as e:
+            failed = True
+            logger.error(f"History corporate-actions refresh attempt {attempt + 1} raised: {e}", exc_info=True)
+        if not failed:
+            return
+        if attempt >= HISTORY_CA_MAX_RETRIES:
+            logger.error(f"History corporate-actions refresh: giving up after {attempt + 1} attempts; live Alpaca "
+                         f"history reads are refused until a run succeeds")
+            return
+        run_at = datetime.now(timezone.utc) + timedelta(minutes=HISTORY_CA_RETRY_DELAY_MIN)
+        self._scheduler.add_job(
+            func=self._execute_history_corporate_actions_refresh, trigger=DateTrigger(run_date=run_at), args=[attempt + 1],
+            id=f"{HISTORY_CA_JOB_ID}_retry_{attempt}", name=f"Alpaca history corporate-actions retry {attempt + 1}",
+            replace_existing=True, max_instances=1)
+        logger.info(f"History corporate-actions retry {attempt + 1} at {run_at.isoformat()}")
 
     def _schedule_iv_warm_job(self):
         """Schedule the 08:30 ET (Mon-Fri) pre-open warm of the derived ATM-IV history.

@@ -119,11 +119,12 @@ def _marker(symbol: str) -> str:
     return os.path.join(_meta(), "locks", f"{symbol.upper()}.rebase.json")
 
 
-_EVENTS_MEMO: dict = {}          # manifest path -> ((mtime_ns, size), {SYMBOL: [Event, ...]})
+_EVENTS_MEMO: dict = {}          # manifest path -> ((mtime_ns, size), view)
 
 
-def _events_by_symbol() -> dict:
-    """``{SYMBOL: [events]}`` of the manifest; the 8 MB file is parsed once per (mtime, size) and only the events are kept."""
+def _manifest_view() -> dict:
+    """``{"store_asof", "events": {SYMBOL: [Event, ...]}, "effective": {SYMBOL: iso date}}`` of the manifest; the 8 MB file is
+    parsed once per (mtime, size) and only these parts are kept."""
     path = os.path.join(_meta(), build.MANIFEST_NAME)
     st = os.stat(path)
     key = (st.st_mtime_ns, st.st_size)
@@ -131,12 +132,27 @@ def _events_by_symbol() -> dict:
     if hit is not None and hit[0] == key:
         return hit[1]
     with open(path, encoding="utf-8") as f:
-        symbols = json.load(f)["symbols"]
-    out = {s: ([(d, float(x), "split") for d, x in e["events"]["splits"]]
-               + [(d, float(x), "spinoff") for d, x in e["events"]["spinoffs"]])
-           for s, e in symbols.items() if "events" in e}
-    _EVENTS_MEMO[path] = (key, out)
-    return out
+        manifest = json.load(f)
+    symbols = manifest["symbols"]
+    view = {"store_asof": manifest["store_asof"] if "store_asof" in manifest else None,
+            "events": {s: ([(d, float(x), "split") for d, x in e["events"]["splits"]]
+                           + [(d, float(x), "spinoff") for d, x in e["events"]["spinoffs"]])
+                       for s, e in symbols.items() if "events" in e},
+            "effective": {s: e["live"]["effective"] for s, e in symbols.items() if "live" in e}}
+    _EVENTS_MEMO[path] = (key, view)
+    return view
+
+
+def _events_by_symbol() -> dict:
+    return _manifest_view()["events"]
+
+
+def store_asof() -> str:
+    """The build's end date (``YYYY-MM-DD``); ``KeyError`` when the manifest records none."""
+    v = _manifest_view()["store_asof"]
+    if v is None:
+        raise KeyError("store_asof")
+    return v
 
 
 def manifest_events(symbol: str) -> List[Event]:
@@ -145,9 +161,26 @@ def manifest_events(symbol: str) -> List[Event]:
     return list(_events_by_symbol()[symbol.upper()])
 
 
-def extend_manifest(symbol: str, events: Sequence[Event], *, now: datetime) -> bool:
+def _extend_split_table(sym: str, todo: Sequence[Event], manifest: dict) -> None:
+    """Add ``todo`` to ``split_table.json`` (atomic, ``.bak``) and record the new file hash in the manifest's
+    ``split_table`` block: the option split-basis check compares the table's events and hash with the manifest's."""
+    tpath = os.path.join(_meta(), build.SPLIT_TABLE_NAME)
+    with open(tpath, encoding="utf-8") as f:
+        table = json.load(f)
+    shutil.copyfile(tpath, tpath + ".bak")
+    for d, fac, kind in todo:
+        bucket = table["splits" if kind == "split" else "spinoffs"]
+        rows = bucket[sym] if sym in bucket else []
+        if [d, fac] not in [list(x) for x in rows]:
+            bucket[sym] = sorted(rows + [[d, fac]])
+    _atomic_json(tpath, table)
+    manifest["split_table"]["sha256"] = _sha256(tpath)
+
+
+def extend_manifest(symbol: str, events: Sequence[Event], *, now: datetime, sync_split_table: bool = False) -> bool:
     """Append ``events`` to the manifest entry of ``symbol`` (atomic, ``.bak`` backup, lock) and re-stamp the gate
-    certificate. ``False`` (nothing written) when every event is already recorded."""
+    certificate. ``sync_split_table`` adds the same events to ``split_table.json`` and the manifest's hash of it, in the
+    same locked section. ``False`` (nothing written) when every event is already recorded."""
     sym = symbol.upper()
     mpath = os.path.join(_meta(), build.MANIFEST_NAME)
     with locked_manifest():
@@ -158,6 +191,8 @@ def extend_manifest(symbol: str, events: Sequence[Event], *, now: datetime) -> b
         if not todo:
             return False
         shutil.copyfile(mpath, mpath + ".bak")
+        if sync_split_table:
+            _extend_split_table(sym, todo, manifest)
         for d, fac, kind in todo:
             key = "splits" if kind == "split" else "spinoffs"
             ev[key] = sorted(ev[key] + [[d, fac]])
@@ -175,7 +210,7 @@ def extend_manifest(symbol: str, events: Sequence[Event], *, now: datetime) -> b
         return True
 
 
-def rebase_symbol(symbol: str, events: Sequence[Event], *, now: datetime) -> bool:
+def rebase_symbol(symbol: str, events: Sequence[Event], *, now: datetime, sync_split_table: bool = False) -> bool:
     """Bring the files of ``symbol`` onto the basis that includes ``events`` (accepted after the last re-base).
     ``False`` = already recorded, nothing done. Raises ``BasisRecordMismatch`` after an interrupted earlier re-base."""
     sym = symbol.upper()
@@ -200,6 +235,6 @@ def rebase_symbol(symbol: str, events: Sequence[Event], *, now: datetime) -> boo
             df = pd.read_parquet(path)
             native_cache.write_timeseries(PROVIDER, sym, interval,
                                           build.finish(build.adjust(df, splits, spinoffs), interval))
-        extend_manifest(sym, todo, now=now)
+        extend_manifest(sym, todo, now=now, sync_split_table=sync_split_table)
         os.remove(_marker(sym))
         return True

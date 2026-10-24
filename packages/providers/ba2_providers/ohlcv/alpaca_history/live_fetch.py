@@ -80,19 +80,17 @@ class AlpacaLiveBars:
         self._transport = transport if transport is not None else UrllibTransport()
         self._sleep = sleep
 
-    def _get(self, params: Dict[str, Any]) -> dict:
-        url = f"{DATA_HOST}{BARS_PATH}?{urllib.parse.urlencode(params)}"
+    def _request_json(self, path: str, params: Dict[str, Any]) -> Any:
+        """GET ``path`` with the retry rules (429/5xx at most ``MAX_ATTEMPTS`` times, other 4xx at once) and parse the JSON."""
+        url = f"{DATA_HOST}{path}?{urllib.parse.urlencode(params)}"
         last = "no attempt"
         for attempt in range(1, MAX_ATTEMPTS + 1):
             status, body = self._transport.get(url, self._headers)
             if status == 200:
                 try:
-                    payload = json.loads(body)
+                    return json.loads(body)
                 except ValueError as e:
                     raise AlpacaLiveFetchError(f"malformed JSON from Alpaca: {e}") from e
-                if not isinstance(payload, dict) or "bars" not in payload or "next_page_token" not in payload:
-                    raise AlpacaLiveFetchError(f"unexpected response shape from Alpaca: {str(payload)[:120]}")
-                return payload
             text = body.decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) else str(body)
             last = f"HTTP {status}: {text[:200]}"
             if status == 429 or status >= 500:
@@ -101,6 +99,12 @@ class AlpacaLiveBars:
                 continue
             raise AlpacaLiveFetchError(last)                 # other 4xx: retrying cannot help
         raise AlpacaLiveFetchError(f"retries exhausted after {MAX_ATTEMPTS} attempts: {last}")
+
+    def _get(self, params: Dict[str, Any]) -> dict:
+        payload = self._request_json(BARS_PATH, params)
+        if not isinstance(payload, dict) or "bars" not in payload or "next_page_token" not in payload:
+            raise AlpacaLiveFetchError(f"unexpected response shape from Alpaca: {str(payload)[:120]}")
+        return payload
 
     def _bars(self, symbol: str, timeframe: str, start: dt.datetime, end_exclusive: dt.datetime) -> pd.DataFrame:
         sym = alpaca_symbol(symbol)
