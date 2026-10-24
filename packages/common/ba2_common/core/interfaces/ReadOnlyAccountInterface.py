@@ -277,7 +277,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     "tooltip": "fmp = FMP daily / 5-min history (cache topped up from FMP). alpaca = Alpaca-derived, "
                                "split-verified history (the cache backtests use), topped up with raw finished sessions; "
                                "needs Alpaca market-data keys (Alpaca accounts only). Current prices are set by the price "
-                               "feed, not this. A changed value applies after /api/reload.",
+                               "feed, not this. Expert and ATR history reads follow a change on the next read; the option IV history of an Alpaca account and the daily corporate-actions job follow after /api/reload.",
                 },
             }
 

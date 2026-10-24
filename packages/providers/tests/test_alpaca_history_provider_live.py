@@ -66,7 +66,7 @@ def live(tmp_path, monkeypatch):
     (root / "_meta" / "build_manifest.json").write_text(
         json.dumps({"symbols": {"AAA": {"events": {"splits": [], "spinoffs": []}}}}))
     (root / "_meta" / "corporate_actions_live.json").write_text(json.dumps(       # the daily job ran on the previous session
-        {"run_date": "2026-10-23", "symbols_checked": ["AAA"], "applied": [], "pending": [], "review": []}))
+        {"run_date": "2026-10-23", "symbols_checked": ["AAA"], "checked_on": {"AAA": "2026-10-23"}, "applied": [], "pending": [], "review": []}))
     return root, now
 
 
@@ -200,7 +200,7 @@ def test_stale_corporate_actions_run_blocks_the_topup(live):
 def test_symbol_under_review_is_refused_without_a_fetch(live):
     root, now = live
     (root / "_meta" / "corporate_actions_live.json").write_text(json.dumps(
-        {"run_date": "2026-10-23", "symbols_checked": ["AAA"], "applied": [], "pending": [],
+        {"run_date": "2026-10-23", "symbols_checked": ["AAA"], "checked_on": {"AAA": "2026-10-23"}, "applied": [], "pending": [],
          "review": [{"symbol": "AAA", "row": {"event_date": "2026-10-20", "verdict": "both_contradicted"}}]}))
     bars = FakeBars(daily=_raw_daily(WEEK))
     from ba2_providers.ohlcv.alpaca_history.live_topup import PendingCorporateAction

@@ -22,6 +22,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from ba2_common.core.ohlcv_history import HistoryUnavailable
+
 from ba2_providers.ohlcv.alpaca_history import build
 
 DATA_HOST = "https://data.alpaca.markets"
@@ -36,7 +38,7 @@ NY = ZoneInfo("America/New_York")
 UTC = dt.timezone.utc
 
 
-class AlpacaLiveFetchError(RuntimeError):
+class AlpacaLiveFetchError(HistoryUnavailable):
     """A live Alpaca bar request failed or answered something unusable. Nothing was written."""
 
 

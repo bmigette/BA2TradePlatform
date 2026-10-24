@@ -852,6 +852,9 @@ class JobManager:
             self._scheduled_jobs[HISTORY_CA_JOB_ID] = job
             logger.info(f"Alpaca history corporate-actions refresh scheduled for {HISTORY_CA_HOUR:02d}:"
                         f"{HISTORY_CA_MINUTE:02d} America/New_York, Mon-Fri")
+            problem = account_history.build_age_problem()
+            if problem:
+                logger.error(f"Alpaca history: {problem}")
             if not account_history.history_job_is_fresh():
                 self._scheduler.add_job(
                     func=self._execute_history_corporate_actions_refresh,

@@ -80,16 +80,3 @@ def test_stored_alpaca_account_is_listed_with_its_keys_and_others_are_not():
     _set(b.id, KEY, "fmp")
     _set(t.id, KEY, "alpaca")                                           # a stored illegal value: ERROR, left out
     assert account_history.alpaca_history_accounts() == [{"id": a.id, "api_key": "k%d" % a.id, "api_secret": "s%d" % a.id}]
-
-
-def test_held_or_traded_symbols_cover_orders_and_live_transactions_of_those_accounts_only():
-    a = create_account_definition(name="A", provider="Alpaca")
-    b = create_account_definition(name="B", provider="Alpaca")
-    ea, eb = create_expert_instance(a.id), create_expert_instance(b.id)
-    create_trading_order(a.id, symbol="AAA")
-    create_trading_order(a.id, symbol="AAPL260116C00200000")           # an OCC contract string is not a ticker
-    create_trading_order(b.id, symbol="BBB")
-    create_transaction(symbol="CCC", expert_id=ea.id)
-    create_transaction(symbol="DDD", expert_id=eb.id)
-    assert account_history.held_or_traded_symbols([a.id]) == ["AAA", "CCC"]
-    assert account_history.held_or_traded_symbols([]) == []

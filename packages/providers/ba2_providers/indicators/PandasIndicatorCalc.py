@@ -24,12 +24,16 @@ _FIXED_WINDOWS = {"rsi": 14, "atr": 14, "mfi": 14, "boll": 20, "boll_ub": 20, "b
                   "macd": 26, "macds": 35, "macdh": 35}
 
 
-def required_bars(indicator: str) -> int:
-    """Bars needed for ``indicator`` (0 = unknown name: no guard)."""
+def required_bars(indicator: str, period: Optional[int] = None) -> int:
+    """Bars needed for ``indicator`` (0 = unknown name: no guard). A caller-declared ``period`` (atr / rsi / mfi: the window it
+    sizes by) raises the need above the stockstats default: ATR(20) needs 20 bars, not 14."""
     m = _WINDOW_FROM_NAME.match(indicator)
     if m:
         return int(m.group(1))
-    return _FIXED_WINDOWS.get(indicator, 0)
+    need = _FIXED_WINDOWS.get(indicator, 0)
+    if period is not None and indicator in ("atr", "rsi", "mfi"):
+        need = max(need, int(period))
+    return need
 
 
 class PandasIndicatorCalc(MarketIndicatorsInterface):
@@ -93,7 +97,8 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
         indicator: str,
         start_date: datetime,
         end_date: datetime,
-        interval: str = "1d"
+        interval: str = "1d",
+        period: Optional[int] = None,
     ) -> pd.DataFrame:
         """
         Calculate technical indicator for a date range using stockstats.
@@ -132,7 +137,7 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
         
         # A series shorter than the indicator's window is NOT computed: stockstats would return a value from the
         # bars that exist (a 200-period average of 120 bars) and a caller would trade on it. Shared by backtest and live.
-        need = required_bars(indicator)
+        need = required_bars(indicator, period)
         if len(data) < need:
             raise InsufficientHistory(symbol, indicator, len(data), need)
 
@@ -261,7 +266,8 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
                 indicator=indicator,
                 start_date=actual_start_date,
                 end_date=end_date,
-                interval=interval
+                interval=interval,
+                period=period
             )
             
             # Convert DataFrame to data points list and extract arrays for structured format

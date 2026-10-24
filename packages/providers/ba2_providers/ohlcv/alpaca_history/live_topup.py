@@ -14,12 +14,15 @@ Owner decisions 2026-10-24 (plan Task 0): live bars append IN PLACE and UNGATED,
 """
 from __future__ import annotations
 
+import json
+import os
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
 from ba2_common.core import ohlcv_final_bars
+from ba2_common.core.ohlcv_history import HistoryUnavailable
 from ba2_common.core.market_calendar import regular_session_dates
 from ba2_common.logger import logger
 from ba2_providers.ohlcv.alpaca_history import build
@@ -31,7 +34,11 @@ MAX_BACKFILL_SESSIONS = 30
 Fetch = Callable[[date, date], pd.DataFrame]          # (first_session, end_exclusive) -> RAW native frame
 
 
-class TopUpRefused(RuntimeError):
+GAP_HELP = ("if the symbol was really halted that day, add a reviewed entry to ba2_providers/ohlcv/alpaca_history/known_gaps.json "
+            "(see its _doc); otherwise the next read retries")
+
+
+class TopUpRefused(HistoryUnavailable):
     """Nothing was appended; the file is untouched."""
 
 
@@ -39,7 +46,7 @@ class TopUpGap(TopUpRefused):
     def __init__(self, symbol: str, interval: str, missing: Sequence[date]):
         self.symbol, self.interval, self.missing = symbol, interval, list(missing)
         super().__init__(f"{symbol} ({interval}): Alpaca returned no bars for session(s) "
-                         f"{[d.isoformat() for d in self.missing]}; nothing appended")
+                         f"{[d.isoformat() for d in self.missing]}; nothing appended; {GAP_HELP}")
 
 
 class TopUpTooFarBehind(TopUpRefused):
@@ -52,6 +59,25 @@ class PendingCorporateAction(TopUpRefused):
 
 class SymbolNotInHistory(TopUpRefused):
     """The symbol has no cached history (it is not in the build)."""
+
+
+GAPS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "known_gaps.json")
+_GAP_FIELDS = ("symbol", "session", "reason", "added", "reviewed_by")
+
+
+def known_gaps(symbol: str, path: Optional[str] = None) -> set:
+    """Reviewed sessions (``date``) on which ``symbol`` has no bars (``known_gaps.json``); strict: an entry missing a field or
+    with a non-ISO date refuses to load."""
+    with open(path or GAPS_PATH, encoding="utf-8") as f:
+        entries = json.load(f)["entries"]
+    out = set()
+    for e in entries:
+        missing = [k for k in _GAP_FIELDS if k not in e or not str(e[k]).strip()]
+        if missing:
+            raise ValueError(f"known_gaps.json entry {e!r}: missing {missing}")
+        if e["symbol"].upper() == symbol.upper():
+            out.add(date.fromisoformat(e["session"]))
+    return out
 
 
 def _days(frame: pd.DataFrame) -> pd.Series:
@@ -69,7 +95,8 @@ def unexplained_jump(frame: pd.DataFrame, prev_close: Optional[float] = None) ->
         return None
     i = int(bad.index[0])
     return (f"the bar at {frame['Date'].iloc[i]} opens x{float(bad.iloc[0]):.3f} of the previous close with no accepted "
-            f"corporate action explaining it")
+            f"corporate action explaining it (a real split is applied by the daily refresh; a verified data error is decided with a "
+            f"reviewed 'reject'/'accept' entry in ba2_providers/ohlcv/alpaca_history/split_overrides.json)")
 
 
 def topup_frame(cached: pd.DataFrame, fetch: Fetch, splits: Sequence[Tuple[str, float]],
@@ -100,10 +127,10 @@ def topup_frame(cached: pd.DataFrame, fetch: Fetch, splits: Sequence[Tuple[str, 
     stray = sorted(have - exp)
     if stray:
         raise TopUpRefused(f"{symbol} ({interval}): Alpaca returned bars outside the finished sessions {stray}")
-    missing = [d for d in expected if d not in have]
+    missing = [d for d in expected if d not in have and d not in known_gaps(symbol)]
     if missing:
         logger.error(f"{symbol} ({interval}): live top-up refused, Alpaca has no bars for session(s) "
-                     f"{[d.isoformat() for d in missing]}; the file is untouched, the next refresh retries")
+                     f"{[d.isoformat() for d in missing]}; the file is untouched; {GAP_HELP}")
         raise TopUpGap(symbol, interval, missing)
     new = build.adjust(new.sort_values("Date", kind="stable").reset_index(drop=True), splits, spinoffs)
     err = unexplained_jump(new, float(cached.sort_values("Date")["Close"].iloc[-1]))

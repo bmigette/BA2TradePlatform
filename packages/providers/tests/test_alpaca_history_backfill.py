@@ -89,7 +89,7 @@ def cache(tmp_path, monkeypatch):
     (meta / "gate_certificate.json").write_text(json.dumps(
         {"status": "PASS", "build_manifest_sha256": sha(meta / "build_manifest.json")}))
     (meta / "corporate_actions_live.json").write_text(json.dumps(
-        {"run_date": "2026-10-23", "symbols_checked": [], "applied": [], "pending": [], "review": []}))
+        {"run_date": "2026-10-23", "symbols_checked": [], "checked_on": {}, "applied": [], "pending": [], "review": []}))
     return root
 
 

@@ -23,10 +23,11 @@ from datetime import datetime
 import pandas as pd
 
 from ba2_common.core.interfaces.MarketDataProviderInterface import MarketDataProviderInterface
+from ba2_common.core.ohlcv_history import HistoryUnavailable
 from ba2_common.logger import logger
 
 
-class HistoryTopUpUnavailable(RuntimeError):
+class HistoryTopUpUnavailable(HistoryUnavailable):
     """The Alpaca history cache cannot answer a read, and this provider has no live source to ask."""
 
 
@@ -144,12 +145,18 @@ class AlpacaHistoryOHLCVProvider(MarketDataProviderInterface):
         if newest is None or newest <= last_day:
             return df                                      # nothing finished beyond the file: no lock, no fetch
         from ba2_providers.ohlcv.alpaca_history import corporate_actions
-        corporate_actions.assert_fresh(now)                # a dead daily refresh stops the live reads, loudly
         fetch = self._fetcher.daily if key == "1d" else self._fetcher.intraday_5min
 
         def attempt():
-            corporate_actions.assert_not_in_review(symbol)  # an undecided corporate action blocks this symbol
+            try:
+                live_state.manifest_events(symbol)
+            except KeyError:
+                raise live_topup.SymbolNotInHistory(
+                    f"{symbol} ({interval}): not in the Alpaca build manifest; the live top-up does not backfill")
+            # the daily refresh alive, THIS symbol checked, no unapplied corporate action up to the newest session
+            corporate_actions.assert_clear_to_append(symbol, now, newest, self._refresher)
             with live_state.locked_symbol(symbol):
+                live_state.assert_no_interrupted_rebase(symbol)
                 cur = native_cache.read_timeseries(provider_name, symbol, interval, as_of=None)
                 try:
                     events = live_state.manifest_events(symbol)
@@ -162,7 +169,7 @@ class AlpacaHistoryOHLCVProvider(MarketDataProviderInterface):
                     cur, lambda a, b: fetch(symbol, a, b), splits, spinoffs,
                     interval=key, now_utc=now, symbol=symbol)
                 if rep["appended"]:
-                    native_cache.write_timeseries(provider_name, symbol, interval, merged)
+                    live_state.write_timeseries_with_retry(provider_name, symbol, interval, merged)
                     logger.info(f"{symbol} ({interval}): appended {rep['appended']} live bar(s), sessions "
                                 f"{rep['sessions'][0]}..{rep['sessions'][-1]}")
                 return merged

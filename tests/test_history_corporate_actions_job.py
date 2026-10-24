@@ -27,6 +27,7 @@ def jm(monkeypatch):
 def stub_accounts(monkeypatch, accounts):
     monkeypatch.setattr(account_history, "alpaca_history_accounts", lambda: accounts)
     monkeypatch.setattr(account_history, "history_job_is_fresh", lambda now=None: True)
+    monkeypatch.setattr(account_history, "build_age_problem", lambda today=None: None)
 
 
 def test_job_scheduled_only_if_an_account_is_alpaca(jm, monkeypatch):
@@ -40,6 +41,15 @@ def test_job_scheduled_only_if_an_account_is_alpaca(jm, monkeypatch):
     f = {x.name: str(x) for x in job.trigger.fields}
     assert f["hour"] == "8" and f["minute"] == "30" and f["day_of_week"] == "mon-fri"
     assert str(job.trigger.timezone) == "America/New_York"
+
+
+def test_scheduling_logs_an_error_when_the_build_is_older_than_the_backfill_limit(jm, monkeypatch):
+    stub_accounts(monkeypatch, [{"id": 1, "api_key": "k", "api_secret": "s"}])
+    monkeypatch.setattr(account_history, "build_age_problem", lambda today=None: "build ends 2026-10-12, 40 sessions ago")
+    errors = []
+    monkeypatch.setattr(JM.logger, "error", lambda m, *a, **k: errors.append(m))
+    jm._schedule_history_corporate_actions_job()
+    assert any("40 sessions ago" in m for m in errors)
 
 
 def test_job_removed_when_the_last_alpaca_account_goes(jm, monkeypatch):

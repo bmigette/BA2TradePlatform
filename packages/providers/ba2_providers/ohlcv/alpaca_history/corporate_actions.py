@@ -104,7 +104,7 @@ def _write_status(status: dict) -> None:
         w.writeheader()
         for r in rows:
             w.writerow(r)
-    os.replace(path + ".tmp", path)
+    live_state.replace_with_retry(path + ".tmp", path)
 
 
 def _previous_session(now: datetime) -> date:
@@ -129,6 +129,7 @@ def assert_fresh(now: datetime) -> None:
 
 
 def assert_not_in_review(symbol: str) -> None:
+    live_state.assert_no_interrupted_rebase(symbol)
     status = read_status()
     if status is None:
         return
@@ -138,6 +139,67 @@ def assert_not_in_review(symbol: str) -> None:
                 f"{symbol}: the corporate action {entry['row']['event_date']} (verdict {entry['row']['verdict']}) is "
                 f"under review and not applied; add an override to split_overrides.json (see {REVIEW_CSV_NAME}); "
                 f"nothing appended")
+
+
+def _symbol_issue(symbol: str, now: datetime, newest_final: date) -> Optional[str]:
+    """Why ``symbol`` may not be topped up right now, or None. It must have been CHECKED by a run no older than the previous
+    session, have no review verdict, and no pending corporate action dated on or before the newest session the append would
+    add (an ex-date bar must not be appended on the old basis)."""
+    sym = symbol.upper()
+    status = read_status()
+    need = _previous_session(now)
+    on = status["checked_on"][sym] if status is not None and sym in status["checked_on"] else None
+    if on is None or date.fromisoformat(on) < need:
+        return (f"{sym}: its corporate actions were not checked since the previous session ({need}); last check "
+                f"{on or 'never'}")
+    for entry in status["review"]:
+        if entry["symbol"] == sym:
+            return (f"{sym}: the corporate action {entry['row']['event_date']} (verdict {entry['row']['verdict']}) is under "
+                    f"review and not applied; add an override to split_overrides.json (see {REVIEW_CSV_NAME})")
+    for p in status["pending"]:
+        if p["symbol"] == sym and p["date"] <= newest_final.isoformat():
+            return f"{sym}: the corporate action dated {p['date']} ({p['kind']}) is pending and not applied"
+    return None
+
+
+def assert_clear_to_append(symbol: str, now: datetime, newest_final: date,
+                           refresher: Optional[Callable[[str], None]] = None) -> None:
+    """The gate of every live top-up: no interrupted re-base, the daily refresh alive (``assert_fresh``), and THIS symbol checked
+    / without an unapplied corporate action up to the newest session. A symbol with an issue is refreshed on demand once
+    (``refresher``) and re-judged; still an issue -> ``CorporateActionsStale`` / ``PendingCorporateAction``."""
+    live_state.assert_no_interrupted_rebase(symbol)
+    assert_fresh(now)
+    issue = _symbol_issue(symbol, now, newest_final)
+    if issue is not None and refresher is not None:
+        logger.warning(f"{issue}; refreshing its corporate actions now")
+        refresher(symbol)
+        issue = _symbol_issue(symbol, now, newest_final)
+    if issue is not None:
+        raise (PendingCorporateAction if "review" in issue or "pending" in issue else CorporateActionsStale)(
+            issue + "; nothing appended")
+
+
+def build_age_sessions(today: date) -> int:
+    """NYSE sessions between the build's ``store_asof`` and ``today``."""
+    return len(regular_session_dates(date.fromisoformat(live_state.store_asof()) + timedelta(days=1), today))
+
+
+def build_age_problem(today: date) -> Optional[str]:
+    """A message when the build is further behind than a single append may cover (``MAX_BACKFILL_SESSIONS``): the live top-up then
+    refuses every symbol that has not been read since, until the cache is rebuilt / pushed."""
+    from ba2_providers.ohlcv.alpaca_history.live_topup import MAX_BACKFILL_SESSIONS
+    n = build_age_sessions(today)
+    if n <= MAX_BACKFILL_SESSIONS:
+        return None
+    return (f"the Alpaca history build ends {live_state.store_asof()}, {n} sessions ago, beyond MAX_BACKFILL_SESSIONS="
+            f"{MAX_BACKFILL_SESSIONS}: symbols not read since will be refused (TopUpTooFarBehind); rebuild the history")
+
+
+def all_symbols_with_files() -> List[str]:
+    """Every manifest symbol that has a daily file in the cache: the refresh covers ALL of them (a 3:2 split or a stock dividend
+    stays inside the seam bounds, so only the corporate-action list can tell)."""
+    have = {n[:-len("_1d.parquet")] for n in os.listdir(live_state.cache_dir()) if n.endswith("_1d.parquet")}
+    return sorted(s for s in live_state._events_by_symbol() if s in have)
 
 
 # --------------------------------------------------------------------------- the refresh
@@ -155,6 +217,8 @@ def refresh(symbols: Iterable[str], *, today: date, now: datetime, ca_client: An
     native daily frame; ``fmp_rows(start, end)`` -> FMP split-calendar rows (None: no FMP key, said in the report).
     ``full_run=False`` (one symbol, on demand) does not move ``run_date``."""
     overrides = list(overrides) if overrides is not None else load_overrides()
+    if full_run:
+        live_state.repair_consistency(now)              # an interrupted earlier live update must not outlive this run
     asof = date.fromisoformat(live_state.store_asof())
     known, unknown = [], []
     for s in sorted({x.strip().upper() for x in symbols if x and x.strip()}):
@@ -280,7 +344,14 @@ def _merge_and_write(report: dict, checked: Sequence[str], full_run: bool) -> No
     prior = read_status()
     touched = set(checked)
     if prior is None:
-        prior = {"run_date": None, "run_at": None, "symbols_checked": [], "applied": [], "pending": [], "review": []}
+        prior = {"run_date": None, "run_at": None, "symbols_checked": [], "checked_on": {}, "applied": [], "pending": [],
+                 "review": []}
+    checked_on = dict(prior["checked_on"]) if "checked_on" in prior else {}
+    stamp_day = report["run_date"]
+    failed = {e["symbol"] for e in report["errors"]}
+    for sym in checked:
+        if sym not in failed:                       # a symbol whose check errored is NOT checked
+            checked_on[sym] = stamp_day
     status = {
         "run_date": report["run_date"] if full_run else (prior["run_date"] if prior["run_date"] else None),
         "run_at": datetime.now(timezone.utc).isoformat(),
@@ -288,6 +359,7 @@ def _merge_and_write(report: dict, checked: Sequence[str], full_run: bool) -> No
         "applied": report["applied"] if full_run else prior["applied"] + report["applied"],
         "pending": [p for p in prior["pending"] if p["symbol"] not in touched] + report["pending"],
         "review": [r for r in prior["review"] if r["symbol"] not in touched] + report["review"],
+        "checked_on": checked_on,
         "errors": report["errors"], "fmp": report["fmp"], "not_in_history": report["not_in_history"],
     }
     if status["run_date"] is None:

@@ -94,7 +94,13 @@ def account_history_source(settings: Mapping) -> str:
     return check_history_source(raw.strip().lower())
 
 
-class InsufficientHistory(ValueError):
+class HistoryUnavailable(RuntimeError):
+    """A named reason the OHLCV history a decision depends on cannot be used right now (a lock timeout, a gap, stale corporate
+    actions, a failed fetch, a symbol too new). Callers that size or protect an order from history must REFUSE the order on
+    this type; a handler that turns it into "no value" would silently trade without the input (owner: no silent failure)."""
+
+
+class InsufficientHistory(HistoryUnavailable, ValueError):
     """A symbol has fewer bars than an indicator's window needs (an IPO 120 sessions old asked for a 200-period average).
 
     Shared by the backtest and the live path: the indicator is NOT computed on the short series, and the caller must not

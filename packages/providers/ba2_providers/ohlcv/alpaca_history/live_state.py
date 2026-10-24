@@ -22,13 +22,16 @@ import hashlib
 import json
 import os
 import shutil
+import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
 from ba2_common.core import native_cache
+from ba2_common.core.ohlcv_history import HistoryUnavailable
 from ba2_common.logger import logger
 from ba2_providers.ohlcv.alpaca_history import build
 
@@ -41,11 +44,11 @@ STALE_LOCK_S = 600.0
 Event = Tuple[str, float, str]
 
 
-class BasisRecordMismatch(RuntimeError):
+class BasisRecordMismatch(HistoryUnavailable):
     """A previous re-base of this symbol was interrupted: the files and the manifest may disagree. Nothing was changed."""
 
 
-class LockTimeout(RuntimeError):
+class LockTimeout(HistoryUnavailable):
     pass
 
 
@@ -57,38 +60,96 @@ def _meta() -> str:
     return os.path.join(cache_dir(), "_meta")
 
 
+def replace_with_retry(src: str, dst: str, *, attempts: int = 8, sleep: Callable[[float], None] = time.sleep) -> None:
+    """``os.replace`` that survives a Windows sharing violation (a reader holding the target open): bounded retry with
+    backoff, then the PermissionError is raised -- the caller's write fails loudly and the next read retries."""
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            sleep(0.05 * (2 ** i))
+
+
+def write_timeseries_with_retry(provider: str, symbol: str, interval: str, frame: pd.DataFrame, *,
+                                attempts: int = 8, sleep: Callable[[float], None] = time.sleep) -> None:
+    """``native_cache.write_timeseries`` retried on a Windows sharing violation (its ``os.replace`` onto a file a reader has open)."""
+    for i in range(attempts):
+        try:
+            native_cache.write_timeseries(provider, symbol, interval, frame)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            sleep(0.05 * (2 ** i))
+
+
+def _read_token(path: str) -> Optional[str]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)["token"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 @contextlib.contextmanager
 def _file_lock(path: str, *, timeout: float = LOCK_TIMEOUT_S, stale_after: float = STALE_LOCK_S,
                poll: float = 0.05, clock: Callable[[], float] = time.time,
                sleep: Callable[[float], None] = time.sleep) -> Iterator[None]:
+    """Cross-process lock file. The file holds a random TOKEN: only its owner removes it, a stale lock is taken over by an
+    ATOMIC rename to a unique name (exactly one taker wins), a heartbeat keeps the mtime fresh while a slow holder works, and
+    a Windows PermissionError on creation (delete-pending file) is just "busy"."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    token = uuid.uuid4().hex
     started = clock()
     while True:
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             break
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
             try:
                 age = clock() - os.path.getmtime(path)
-            except FileNotFoundError:
-                continue
+            except (FileNotFoundError, PermissionError):
+                age = 0.0
             if age > stale_after:
+                grave = f"{path}.stale.{token}"
+                try:
+                    os.rename(path, grave)                      # atomic: of several takers exactly one succeeds
+                except OSError:
+                    continue                                   # somebody else took it (or it was released): look again
                 logger.warning(f"taking over stale lock {path} (untouched for {age:.0f}s)")
-                with contextlib.suppress(FileNotFoundError):
-                    os.remove(path)
+                with contextlib.suppress(OSError):
+                    os.remove(grave)
                 continue
             if clock() - started > timeout:
                 raise LockTimeout(f"could not get {path} within {timeout}s")
             sleep(poll)
     try:
-        os.write(fd, json.dumps({"pid": os.getpid(), "at": datetime.now(timezone.utc).isoformat()}).encode())
+        os.write(fd, json.dumps({"pid": os.getpid(), "token": token,
+                                 "at": datetime.now(timezone.utc).isoformat()}).encode())
     finally:
         os.close(fd)
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.wait(max(0.05, min(stale_after / 4.0, 30.0))):
+            if _read_token(path) == token:
+                with contextlib.suppress(OSError):
+                    os.utime(path)
+    heart = threading.Thread(target=beat, name="ba2-lock-heartbeat", daemon=True)
+    heart.start()
     try:
         yield
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(path)
+        stop.set()
+        heart.join(timeout=2.0)
+        if _read_token(path) == token:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(path)
+        else:
+            logger.error(f"lock {path} is no longer ours (taken over as stale while held); left untouched")
 
 
 def locked_symbol(symbol: str, **kw):
@@ -112,7 +173,7 @@ def _atomic_json(path: str, obj: dict) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=1)
-    os.replace(tmp, path)
+    replace_with_retry(tmp, path)
 
 
 def _marker(symbol: str) -> str:
@@ -203,6 +264,52 @@ def _extend_split_table(sym: str, todo: Sequence[Event], manifest: dict) -> None
     manifest["split_table"]["sha256"] = _sha256(tpath)
 
 
+def _restamp_certificate(mpath: str, now: datetime) -> bool:
+    """Make the gate certificate pin the CURRENT manifest hash (backup first). True when it had to change."""
+    cpath = os.path.join(_meta(), CERTIFICATE_NAME)
+    if not os.path.isfile(cpath):
+        return False
+    with open(cpath, encoding="utf-8") as f:
+        cert = json.load(f)
+    actual = _sha256(mpath)
+    if cert["build_manifest_sha256"] == actual:
+        return False
+    shutil.copyfile(cpath, cpath + ".bak")
+    cert["build_manifest_sha256"] = actual
+    cert["live_extended_at"] = now.astimezone(timezone.utc).isoformat()
+    _atomic_json(cpath, cert)
+    return True
+
+
+def _repair_locked(manifest: dict, mpath: str, now: datetime) -> bool:
+    """IDEMPOTENT consistency repair (manifest lock held): the manifest must record the real hash of ``split_table.json`` and the
+    certificate must pin the real hash of the manifest. A crash between the table, manifest and certificate writes leaves one of
+    them behind; every call fixes it, also when there is nothing else to do."""
+    changed = False
+    tpath = os.path.join(_meta(), build.SPLIT_TABLE_NAME)
+    if os.path.isfile(tpath) and "split_table" in manifest:
+        actual = _sha256(tpath)
+        if manifest["split_table"]["sha256"] != actual:
+            logger.warning("repairing the manifest's split_table hash (an interrupted live update left it behind)")
+            shutil.copyfile(mpath, mpath + ".bak")
+            manifest["split_table"]["sha256"] = actual
+            _atomic_json(mpath, manifest)
+            changed = True
+    if _restamp_certificate(mpath, now):
+        logger.warning("repairing the gate certificate (an interrupted live update left it behind)")
+        changed = True
+    return changed
+
+
+def repair_consistency(now: datetime) -> bool:
+    """Run the idempotent repair under the manifest lock (the daily refresh calls it first)."""
+    mpath = os.path.join(_meta(), build.MANIFEST_NAME)
+    with locked_manifest():
+        with open(mpath, encoding="utf-8") as f:
+            manifest = json.load(f)
+        return _repair_locked(manifest, mpath, now)
+
+
 def extend_manifest(symbol: str, events: Sequence[Event], *, now: datetime, sync_split_table: bool = False) -> bool:
     """Append ``events`` to the manifest entry of ``symbol`` (atomic, ``.bak`` backup, lock) and re-stamp the gate
     certificate. ``sync_split_table`` adds the same events to ``split_table.json`` and the manifest's hash of it, in the
@@ -215,6 +322,7 @@ def extend_manifest(symbol: str, events: Sequence[Event], *, now: datetime, sync
         ev = manifest["symbols"][sym]["events"]
         todo = [e for e in events if [e[0], e[1]] not in [list(x) for x in ev["splits" if e[2] == "split" else "spinoffs"]]]
         if not todo:
+            _repair_locked(manifest, mpath, now)
             return False
         shutil.copyfile(mpath, mpath + ".bak")
         if sync_split_table:
@@ -225,15 +333,17 @@ def extend_manifest(symbol: str, events: Sequence[Event], *, now: datetime, sync
         manifest["symbols"][sym]["live"] = {"effective": max(e[0] for e in events),
                                             "extended_at": now.astimezone(timezone.utc).isoformat()}
         _atomic_json(mpath, manifest)
-        cpath = os.path.join(_meta(), CERTIFICATE_NAME)
-        if os.path.isfile(cpath):
-            with open(cpath, encoding="utf-8") as f:
-                cert = json.load(f)
-            shutil.copyfile(cpath, cpath + ".bak")
-            cert["build_manifest_sha256"] = _sha256(mpath)
-            cert["live_extended_at"] = now.astimezone(timezone.utc).isoformat()
-            _atomic_json(cpath, cert)
+        _restamp_certificate(mpath, now)
         return True
+
+
+def assert_no_interrupted_rebase(symbol: str) -> None:
+    """``BasisRecordMismatch`` while an interrupted re-base of ``symbol`` left its intent marker: the files and the manifest may
+    disagree, so nothing may read-modify-write this symbol (top-up, backfill, review check, another re-base)."""
+    if os.path.exists(_marker(symbol)):
+        raise BasisRecordMismatch(
+            f"{symbol.upper()}: an earlier re-base was interrupted ({_marker(symbol)}); files and manifest may disagree. "
+            f"Restore the symbol from the build or clear the marker after checking; nothing changed.")
 
 
 def rebase_symbol(symbol: str, events: Sequence[Event], *, now: datetime, sync_split_table: bool = False) -> bool:
@@ -241,10 +351,7 @@ def rebase_symbol(symbol: str, events: Sequence[Event], *, now: datetime, sync_s
     ``False`` = already recorded, nothing done. Raises ``BasisRecordMismatch`` after an interrupted earlier re-base."""
     sym = symbol.upper()
     with locked_symbol(sym):
-        if os.path.exists(_marker(sym)):
-            raise BasisRecordMismatch(
-                f"{sym}: an earlier re-base was interrupted ({_marker(sym)}); files and manifest may disagree. "
-                f"Restore the symbol from the build or clear the marker after checking; nothing changed.")
+        assert_no_interrupted_rebase(sym)
         recorded = {(d, round(f, 12), k) for d, f, k in manifest_events(sym)}
         todo = [e for e in events if (e[0], round(e[1], 12), e[2]) not in recorded]
         if not todo:
@@ -259,19 +366,22 @@ def rebase_symbol(symbol: str, events: Sequence[Event], *, now: datetime, sync_s
             if path is None:
                 continue
             df = pd.read_parquet(path)
-            native_cache.write_timeseries(PROVIDER, sym, interval,
-                                          build.finish(build.adjust(df, splits, spinoffs), interval))
+            write_timeseries_with_retry(PROVIDER, sym, interval,
+                                        build.finish(build.adjust(df, splits, spinoffs), interval))
         extend_manifest(sym, todo, now=now, sync_split_table=sync_split_table)
         os.remove(_marker(sym))
         return True
 
 
 def register_backfilled_symbol(symbol: str, interval: str, events: Sequence[Event], first: str, last: str, bars: int, *,
-                               now: datetime, file_name: str, covered_from: str, origin: str = "live_backfill") -> bool:
+                               now: datetime, file_name: str, covered_from: str, origin: str = "live_backfill",
+                               stamp_update: bool = True) -> bool:
     """Record a symbol (or one more interval of it) that was backfilled from Alpaca after the build: manifest entry
     (events, per-interval first / last / bars, origin marker + date), the same events in ``split_table.json`` and its hash,
     and the gate certificate re-stamp -- ONE locked section, ``.bak`` backups, atomic replaces (the transaction of
-    ``extend_manifest``). Idempotent: a repeat adds nothing new and returns False. Call BEFORE the bar file is written:
+    ``extend_manifest``). Idempotent: a repeat adds nothing new and returns False, and still repairs a stale split-table hash /
+    certificate. ``stamp_update=False`` records only the events (the backward extension records its events BEFORE writing the
+    file and moves the coverage claim only AFTER, so a crash never claims coverage the file lacks). Call BEFORE the bar file is written:
     an entry without a file is simply backfilled again, a file without an entry would be refused as 'not in the build'."""
     sym = symbol.upper()
     mpath = os.path.join(_meta(), build.MANIFEST_NAME)
@@ -286,7 +396,8 @@ def register_backfilled_symbol(symbol: str, interval: str, events: Sequence[Even
         have = {(k, d, round(float(x), 12)) for k, rows in entry["events"].items() for d, x in rows}
         todo = [e for e in events if ("splits" if e[2] == "split" else "spinoffs", e[0], round(e[1], 12)) not in have]
         stamp = {"first": first, "last": last, "bars": bars, "covered_from": covered_from, "partial": True}
-        if not new_entry and not todo and interval in entry and entry[interval] == stamp:
+        if not new_entry and not todo and (not stamp_update or (interval in entry and entry[interval] == stamp)):
+            _repair_locked(manifest, mpath, now)
             return False
         shutil.copyfile(mpath, mpath + ".bak")
         if todo:
@@ -295,16 +406,10 @@ def register_backfilled_symbol(symbol: str, interval: str, events: Sequence[Even
                 key = "splits" if kind == "split" else "spinoffs"
                 entry["events"][key] = sorted(entry["events"][key] + [[d, fac]])
             entry["live"] = {"effective": max(e[0] for e in todo), "extended_at": now.astimezone(timezone.utc).isoformat()}
-        entry[interval] = stamp
-        entry["files"][interval] = file_name
+        if stamp_update:
+            entry[interval] = stamp
+            entry.setdefault("files", {})[interval] = file_name
         manifest["symbols"][sym] = entry
         _atomic_json(mpath, manifest)
-        cpath = os.path.join(_meta(), CERTIFICATE_NAME)
-        if os.path.isfile(cpath):
-            with open(cpath, encoding="utf-8") as f:
-                cert = json.load(f)
-            shutil.copyfile(cpath, cpath + ".bak")
-            cert["build_manifest_sha256"] = _sha256(mpath)
-            cert["live_extended_at"] = now.astimezone(timezone.utc).isoformat()
-            _atomic_json(cpath, cert)
+        _restamp_certificate(mpath, now)
         return True

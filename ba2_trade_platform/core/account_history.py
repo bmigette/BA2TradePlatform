@@ -7,7 +7,6 @@ error, never a silent FMP read.
 """
 from __future__ import annotations
 
-import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -18,10 +17,7 @@ from ba2_common.core.ohlcv_history import ACCOUNT_HISTORY_SOURCE_KEY, account_hi
 
 from ..logger import logger
 from .db import InstanceNotFound, get_all_instances, get_db, get_instance
-from .models import AccountDefinition, AccountSetting, ExpertInstance, TradingOrder, Transaction
-
-_PLAIN_TICKER = re.compile(r"^[A-Z][A-Z0-9]{0,5}([.\-][A-Z])?$")    # an equity ticker (not an OCC contract string)
-
+from .models import AccountDefinition, AccountSetting, ExpertInstance, TradingOrder
 
 class HistorySourceNeedsAlpacaKeys(ValueError):
     """``alpaca`` was chosen for an account that holds no Alpaca api_key / api_secret."""
@@ -138,22 +134,6 @@ def alpaca_history_accounts() -> List[Dict[str, Any]]:
     return out
 
 
-def held_or_traded_symbols(account_ids: List[int]) -> List[str]:
-    """Equity tickers ordered on, or with a live transaction of an expert of, the given accounts."""
-    if not account_ids:
-        return []
-    from .types import TransactionStatus
-    live = (TransactionStatus.WAITING, TransactionStatus.OPENED, TransactionStatus.CLOSING)
-    symbols = set()
-    with get_db() as session:
-        symbols.update(session.exec(select(TradingOrder.symbol).where(TradingOrder.account_id.in_(account_ids))).all())
-        expert_ids = session.exec(select(ExpertInstance.id).where(ExpertInstance.account_id.in_(account_ids))).all()
-        if expert_ids:
-            symbols.update(session.exec(select(Transaction.symbol).where(
-                Transaction.expert_id.in_(expert_ids), Transaction.status.in_(live))).all())
-    return sorted(s.upper() for s in symbols if s and _PLAIN_TICKER.match(s.upper()))
-
-
 def _fmp_rows_getter():
     """FMP split-calendar rows for a date range (30-day windows), or None when no FMP key is stored."""
     from ..config import get_app_setting
@@ -194,7 +174,7 @@ def run_corporate_actions_refresh(now: Optional[datetime] = None) -> Optional[di
         return None
     now = now or datetime.now(timezone.utc)
     ca_client, raw_fetcher = _refresh_clients(accounts)
-    symbols = held_or_traded_symbols([a["id"] for a in accounts])
+    symbols = corporate_actions.all_symbols_with_files()      # EVERY cached symbol: a 3:2 split hides inside the seam bounds
     return corporate_actions.refresh(symbols, today=now.astimezone(ZoneInfo("America/New_York")).date(), now=now,
                                      ca_client=ca_client, raw_fetcher=raw_fetcher, fmp_rows=_fmp_rows_getter())
 
@@ -220,3 +200,13 @@ def history_job_is_fresh(now: Optional[datetime] = None) -> bool:
         return True
     except corporate_actions.CorporateActionsStale:
         return False
+
+
+def build_age_problem(today=None) -> Optional[str]:
+    """A message when the Alpaca history build is further behind than ``MAX_BACKFILL_SESSIONS`` (None when fine or no manifest)."""
+    from datetime import date as _date
+    from ba2_providers.ohlcv.alpaca_history import corporate_actions
+    try:
+        return corporate_actions.build_age_problem(today or _date.today())
+    except (FileNotFoundError, KeyError) as e:
+        return f"the Alpaca history manifest cannot be read ({type(e).__name__}: {e}); live Alpaca history reads will fail"

@@ -30,7 +30,7 @@ from ba2_common.core.share_grid import floor_to_unit, is_whole_grid
 
 from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
-from ba2_common.core.ohlcv_history import InsufficientHistory
+from ba2_common.core.ohlcv_history import HistoryUnavailable
 from ba2_common.core.replay import replay_now
 
 
@@ -501,10 +501,10 @@ def get_latest_atr(symbol: str, indicator_provider, period: int = 14, interval: 
                 return float(v)
         logger.warning(f"get_latest_atr: no ATR value returned for {symbol}")
         return None
-    except InsufficientHistory as e:
-        # a symbol too new for the ATR window: no ATR (the caller falls back to its risk%-only stop), said at WARNING
-        logger.warning(f"get_latest_atr: {e}")
-        return None
+    except HistoryUnavailable:
+        # a named history refusal (too new, lock timeout, gap, stale corporate actions, failed live fetch) is NOT "no ATR":
+        # falling back to a risk-only stop would trade without the input. The caller refuses the order.
+        raise
     except Exception as e:
         # Let CODE DEFECTS through. This handler previously absorbed a tz naive/aware TypeError
         # and returned None, which is indistinguishable from "this symbol has no ATR" -- so ATR

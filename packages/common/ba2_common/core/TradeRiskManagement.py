@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 from datetime import datetime, timezone
 
 from ba2_common.core.knowability import require_decision_price
+from ba2_common.core.ohlcv_history import HistoryUnavailable
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
 from ba2_common.core.interfaces.ExtendableSettingsInterface import trading_permission, coerce_bool
@@ -1499,28 +1500,37 @@ class TradeRiskManagement:
                     updated_orders.append(order)
                     continue
 
-                # RISK-BASED SIZING (risk_atr): size by the distance to the stop so the
-                # dollar loss if stopped out is capped at risk_per_trade_pct of equity.
-                sized_by_risk = False
-                quantity = 0
-                if sizing_mode == 'risk_atr':
-                    sized_by_risk = True
-                    quantity = self._risk_atr_quantity(
-                        order, symbol, current_price, expert,
-                        max_position_value=available_for_instrument,
-                        available_balance=remaining_balance,
-                        account=account,
-                        trace=trace,
-                        context=context,
-                        quantity_unit=unit,
-                    )
-                else:
-                    # notional mode still sizes purely by equity/balance below (unaffected), but
-                    # a strategy whose exit conditions set NO stop-loss must not trade fully
-                    # unprotected just because it isn't in risk_atr mode -- attach the same
-                    # safeguard stop here (quantity-neutral: it only sets order.stop_price so the
-                    # existing bracket mechanism creates a protective SL leg).
-                    self._ensure_safeguard_stop(order, symbol, current_price, expert, trace=trace)
+                try:
+                    # RISK-BASED SIZING (risk_atr): size by the distance to the stop so the
+                    # dollar loss if stopped out is capped at risk_per_trade_pct of equity.
+                    sized_by_risk = False
+                    quantity = 0
+                    if sizing_mode == 'risk_atr':
+                        sized_by_risk = True
+                        quantity = self._risk_atr_quantity(
+                            order, symbol, current_price, expert,
+                            max_position_value=available_for_instrument,
+                            available_balance=remaining_balance,
+                            account=account,
+                            trace=trace,
+                            context=context,
+                            quantity_unit=unit,
+                        )
+                    else:
+                        # notional mode still sizes purely by equity/balance below (unaffected), but
+                        # a strategy whose exit conditions set NO stop-loss must not trade fully
+                        # unprotected just because it isn't in risk_atr mode -- attach the same
+                        # safeguard stop here (quantity-neutral: it only sets order.stop_price so the
+                        # existing bracket mechanism creates a protective SL leg).
+                        self._ensure_safeguard_stop(order, symbol, current_price, expert, trace=trace)
+                except HistoryUnavailable as e:
+                    # the history the stop / size depends on is not usable (lock timeout, gap, stale corporate actions, a symbol too new for
+                    # the window): the order is REFUSED loudly, never sized or protected on a silently missing ATR
+                    self.logger.error(f"  Order {order.id} ({symbol}) REFUSED: history unavailable ({type(e).__name__}: {e})")
+                    order.quantity = 0
+                    self._trace_note(trace, binding="history_unavailable", quantity=0, balance_after=remaining_balance)
+                    updated_orders.append(order)
+                    continue
 
                 if not sized_by_risk:
                     # Calculate maximum affordable quantity based on available equity per instrument

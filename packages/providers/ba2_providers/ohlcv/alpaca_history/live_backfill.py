@@ -29,10 +29,11 @@ from typing import Any, Callable, List, Optional
 import pandas as pd
 
 from ba2_common.core import native_cache, ohlcv_final_bars
+from ba2_common.core.ohlcv_history import HistoryUnavailable
 from ba2_common.core.market_calendar import regular_session_dates
 from ba2_common.logger import logger
 from ba2_providers.ohlcv.alpaca_history import build, corporate_actions, live_state
-from ba2_providers.ohlcv.alpaca_history.live_topup import TopUpGap, TopUpRefused, unexplained_jump
+from ba2_providers.ohlcv.alpaca_history.live_topup import GAP_HELP, TopUpGap, TopUpRefused, known_gaps, unexplained_jump
 from ba2_providers.ohlcv.alpaca_history.split_table import fmp_events_from_rows, load_overrides
 
 _US_TICKER = re.compile(r"^[A-Z][A-Z0-9]{0,5}(-[A-Z])?$")      # a plain US ticker; pairs (BTC/USD) and suffixed names are not
@@ -43,7 +44,7 @@ class SymbolUnavailable(TopUpRefused):
     """Alpaca has no bars for the symbol (or it is not on the NYSE calendar): it cannot be backfilled."""
 
 
-class PartialLiveBackfill(ValueError):
+class PartialLiveBackfill(HistoryUnavailable, ValueError):
     """A backtest asked a live-backfilled (partial) file for a window that starts before what was downloaded."""
 
 
@@ -73,10 +74,11 @@ def _prefetch_checks(sym: str, key: str, raw: pd.DataFrame, last_expected: date)
     stray = sorted(have - set(expected))
     if stray:
         raise TopUpRefused(f"{sym} ({key}): Alpaca returned bars outside NYSE sessions {stray[:5]}; nothing written")
-    missing = [d for d in expected if d not in have]
+    allowed = known_gaps(sym)
+    missing = [d for d in expected if d not in have and d not in allowed]
     if missing:
         logger.error(f"{sym} ({key}): backfill refused, Alpaca has no bars for {len(missing)} session(s) after the first bar "
-                     f"{first_day}: {[d.isoformat() for d in missing[:10]]}; nothing written, the next read retries")
+                     f"{first_day}: {[d.isoformat() for d in missing[:10]]}; nothing written; {GAP_HELP}")
         raise TopUpGap(sym, key, missing)
     return first_day
 
@@ -94,7 +96,16 @@ def ensure_coverage(symbol: str, key: str, want_start: date, *, fetcher: Any, no
     sym = symbol.upper()
     if not _US_TICKER.match(sym) or not ohlcv_final_bars.uses_nyse_calendar(sym):
         raise SymbolUnavailable(f"{sym}: not an NYSE-calendar US ticker; the Alpaca history does not backfill it")
+    live_state.assert_no_interrupted_rebase(sym)
+    # FAST PATH, no lock and no parquet read: decided from the memoised manifest and the file's existence
+    if native_cache.find_timeseries_path(live_state.PROVIDER, sym, key) is not None:
+        quick = live_state.partial_coverage(sym, key)
+        if quick is None:
+            return False                                       # a built (full) file
+        if max(want_start, date.fromisoformat(live_state.build_history_start(key))) >= date.fromisoformat(quick["covered_from"]):
+            return False                                       # a partial file that already covers the request
     with live_state.locked_symbol(sym):
+        live_state.assert_no_interrupted_rebase(sym)
         existing = native_cache.read_timeseries(live_state.PROVIDER, sym, key, as_of=None)
         have_file = existing is not None and not existing.empty
         stamp = None
@@ -124,7 +135,7 @@ def ensure_coverage(symbol: str, key: str, want_start: date, *, fetcher: Any, no
         live_state.register_backfilled_symbol(
             sym, key, events, first_day.isoformat(), pd.to_datetime(frame["Date"]).max().date().isoformat(), len(frame),
             now=now, file_name=f"{sym}_{key}.parquet", covered_from=start.isoformat())
-        native_cache.write_timeseries(live_state.PROVIDER, sym, key, frame)
+        live_state.write_timeseries_with_retry(live_state.PROVIDER, sym, key, frame)
         logger.info(f"{sym} ({key}): backfilled {len(frame)} bars {first_day}..{newest} (asked from {want_start}; "
                     f"events {events}); registered in the manifest as a partial live_backfill")
         return True
@@ -166,10 +177,15 @@ def _extend_backwards(sym: str, key: str, start: date, existing: pd.DataFrame, s
         raise corporate_actions.PendingCorporateAction(
             f"{sym} ({key}): backward extension refused at the seam: {err}; nothing written")
     merged = pd.concat([chunk, ex[list(chunk.columns)]], ignore_index=True)
+    # 1. the new events (a crash after this leaves the OLD coverage claim, which the file still satisfies)
+    live_state.register_backfilled_symbol(
+        sym, key, all_events, stamp["first"], stamp["last"], stamp["bars"], now=now,
+        file_name=f"{sym}_{key}.parquet", covered_from=stamp["covered_from"], stamp_update=False)
+    # 2. the file, 3. only THEN the coverage claim: a crash between 2 and 3 claims less than the file holds
+    live_state.write_timeseries_with_retry(live_state.PROVIDER, sym, key, merged)
     live_state.register_backfilled_symbol(
         sym, key, all_events, first_day.isoformat(), stamp["last"], len(merged), now=now,
         file_name=f"{sym}_{key}.parquet", covered_from=start.isoformat())
-    native_cache.write_timeseries(live_state.PROVIDER, sym, key, merged)
     logger.info(f"{sym} ({key}): extended backwards by {len(chunk)} bars {first_day}..{prev_session} (asked from {start})")
     return True
 
