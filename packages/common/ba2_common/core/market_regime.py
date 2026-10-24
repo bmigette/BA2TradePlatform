@@ -76,6 +76,14 @@ STRESSED = "stressed"
 # 200 sessions ~= the widely-watched 200-day moving average. Chosen on measured consistency
 # (never below 7.1 points of forward-vol separation in any sub-period), not on convention.
 _TREND_SMA_PERIOD = 200
+
+# 4-state trend: position vs SMA200 crossed with the SMA50 slope (rising = SMA50[t] - SMA50[t-10] > 0).
+TREND_UP = "up"                  # above SMA200, SMA50 rising
+TREND_PULLBACK = "pullback"      # above SMA200, SMA50 falling
+TREND_BEAR_RALLY = "bear_rally"  # below SMA200, SMA50 rising
+TREND_DOWN = "down"              # below SMA200, SMA50 falling
+_SLOPE_SMA = 50
+_SLOPE_LAG = 10
 # 20 sessions ~= 1 month of realized vol, ranked within ~2 years of its own history. The
 # rank (not the level) is what makes this comparable across eras -- a 15% VIX-equivalent
 # meant something different in 2017 than in 2022.
@@ -117,6 +125,44 @@ def classify_trend_regime(closes: List[float], sma_period: int = _TREND_SMA_PERI
         "sma": round(sma, 4), "price": price,
         "distance_pct": round((price / sma - 1.0) * 100.0, 3),
     })
+    return out
+
+
+def classify_trend_state(closes: List[float], sma_period: int = _TREND_SMA_PERIOD,
+                         slope_sma: int = _SLOPE_SMA, slope_lag: int = _SLOPE_LAG) -> dict:
+    """4-state trend: close vs the long SMA crossed with the direction of the medium SMA.
+
+    ``above`` is the SAME strict ``price > sma200`` test as :func:`classify_trend_regime` (a close
+    equal to the SMA is below), so up|pullback == RISK_ON for every prefix. ``rising`` is
+    ``SMA50[t] - SMA50[t-lag] > 0``; a flat slope is falling. Arithmetic goes through ``_sma`` on
+    slices so a precomputed calendar can reproduce it bit for bit.
+
+    Like :func:`classify_trend_regime` this is a RISK filter the GA searches, not a direction
+    forecast (see the module docstring). ``closes``: oldest first, cut at the caller's as-of date.
+    Returns ``{state, sma, price, sma50, sma50_lag, slope_rising, reason}``; ``state`` is None when
+    there is not enough history.
+    """
+    out = {"state": None, "sma": None, "price": None, "sma50": None, "sma50_lag": None,
+           "slope_rising": None, "reason": ""}
+    vals = [float(c) for c in closes if c is not None]
+    need = max(sma_period, slope_sma + slope_lag)
+    if len(vals) < need:
+        out["reason"] = f"insufficient history ({len(vals)} bars, need {need})"
+        return out
+    sma = _sma(vals, sma_period)
+    if not sma or sma <= 0:
+        out["reason"] = "could not compute SMA"
+        return out
+    now50 = _sma(vals, slope_sma)
+    lag50 = _sma(vals[:-slope_lag], slope_sma)
+    price = vals[-1]
+    rising = (now50 - lag50) > 0
+    if price > sma:
+        state = TREND_UP if rising else TREND_PULLBACK
+    else:
+        state = TREND_BEAR_RALLY if rising else TREND_DOWN
+    out.update({"state": state, "sma": round(sma, 4), "price": price, "sma50": now50,
+                "sma50_lag": lag50, "slope_rising": rising})
     return out
 
 

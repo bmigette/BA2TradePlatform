@@ -149,3 +149,54 @@ def test_helpers_agree_with_the_classifiers():
     assert is_risk_on(_ramp(300)) is True
     assert is_risk_on(_ramp(300, start=250.0, step=-0.5)) is False
     assert is_stressed(_vol_series(600, loud_tail=25)) is True
+
+
+# --------------------------------------------------------------------------- #
+# 4-state trend (SMA200 position x SMA50 slope) -- the SPY regime gate's trend axis
+# --------------------------------------------------------------------------- #
+from ba2_common.core import market_regime as mr
+
+
+def _lin(n, start=100.0, step=0.1):
+    return [start + step * i for i in range(n)]
+
+
+def test_trend_state_up_pullback_bear_rally_down():
+    assert mr.classify_trend_state(_lin(260))["state"] == mr.TREND_UP
+    assert mr.classify_trend_state(list(reversed(_lin(260))))["state"] == mr.TREND_DOWN
+    # long uptrend, then 12 sessions of decline that stays above SMA200 but turns SMA50 down
+    base = _lin(300, step=0.3)
+    pull = base + [base[-1] - 2.0 * (i + 1) for i in range(12)]
+    assert mr.classify_trend_state(pull)["state"] == mr.TREND_PULLBACK
+    # long downtrend, then 12 sessions of bounce that stays below SMA200 but turns SMA50 up
+    dbase = list(reversed(_lin(300, step=0.3)))
+    rally = dbase + [dbase[-1] + 2.0 * (i + 1) for i in range(12)]
+    assert mr.classify_trend_state(rally)["state"] == mr.TREND_BEAR_RALLY
+
+
+def test_trend_state_insufficient_history_is_none_with_reason():
+    out = mr.classify_trend_state(_lin(199))          # SMA200 binds; the SMA50 slope needs only 60
+    assert out["state"] is None and "insufficient" in out["reason"]
+    assert mr.classify_trend_state(_lin(200))["state"] is not None   # boundary: exactly enough
+
+
+def test_trend_state_close_equal_sma200_is_below_like_classify_trend_regime():
+    closes = [100.0] * 260
+    assert mr.classify_trend_regime(closes)["regime"] == mr.RISK_OFF
+    assert mr.classify_trend_state(closes)["state"] in (mr.TREND_DOWN, mr.TREND_BEAR_RALLY)
+
+
+def test_slope_exactly_zero_is_falling():            # spec: "> 0 = rising"
+    assert mr.classify_trend_state([100.0] * 260)["slope_rising"] is False
+
+
+def test_above_axis_matches_classify_trend_regime_every_prefix():
+    import random
+    r = random.Random(3)
+    px, closes = 100.0, []
+    for _ in range(500):
+        px *= 1 + r.gauss(0, 0.01)
+        closes.append(px)
+    for i in range(199, 500):
+        above = mr.classify_trend_state(closes[:i + 1])["state"] in (mr.TREND_UP, mr.TREND_PULLBACK)
+        assert above == (mr.classify_trend_regime(closes[:i + 1])["regime"] == mr.RISK_ON)
