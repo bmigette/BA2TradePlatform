@@ -650,8 +650,28 @@ OHLCV_V1 = ProfileSpec(name="ohlcv-v1", calc_version=CALC_VERSION, fields=(
 PROFILES: Dict[str, ProfileSpec] = {OHLCV_V1.name: OHLCV_V1}
 
 
+def _build_benchmark_fields() -> Dict[str, FieldSpec]:
+    """The BENCHMARK (SPY) regime fields. NOT a profile: they are market-wide, need no manifest,
+    feature store or coverage check, and a PROFILES entry would drag all three in. The mode/code
+    tables are owned by ``benchmark_regime`` (a persisted contract); the import is function-local
+    so that module may import this one."""
+    from ba2_common.core import benchmark_regime as br
+
+    return {
+        br.TREND_FIELD: FieldSpec(name=br.TREND_FIELD, kind="categorical", short="spy-trend",
+                                  searched=True, codes=br.TREND_MODE_CODES,
+                                  ui_name="SPY trend regime"),
+        br.VOL_FIELD: FieldSpec(name=br.VOL_FIELD, kind="categorical", short="spy-vol",
+                                searched=True, codes=br.VOL_MODE_CODES,
+                                ui_name="SPY volatility regime"),
+    }
+
+
+BENCHMARK_FIELDS: Dict[str, FieldSpec] = _build_benchmark_fields()
+
+
 def _known_fields() -> List[str]:
-    return [f.name for prof in PROFILES.values() for f in prof.fields]
+    return [f.name for prof in PROFILES.values() for f in prof.fields] + list(BENCHMARK_FIELDS)
 
 
 def _unknown_field(field: str) -> KeyError:
@@ -672,6 +692,8 @@ def field_spec(field: str) -> FieldSpec:
         for f in prof.fields:
             if f.name == field:
                 return f
+    if field in BENCHMARK_FIELDS:
+        return BENCHMARK_FIELDS[field]
     raise _unknown_field(field)
 
 

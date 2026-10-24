@@ -266,6 +266,11 @@ def _market_field_description(spec: Any) -> str:
     leading restatement of the name went with it: the bold line directly above already says it.
     """
     codes = spec.codes
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS
+
+    if spec.name in BENCHMARK_FIELDS:
+        legend = ", ".join(f"{name}={code}" for name, code in codes.items())
+        return f"SPY market regime, a CODE compared with '=='. Codes: {legend}."
     if codes is not None:
         legend = ", ".join(f"{name}={code}" for name, code in codes.items())
         return (f"A regime CODE, compared with '=='. Codes: {legend} "
@@ -281,9 +286,9 @@ def _market_field_description(spec: Any) -> str:
 
 def _market_field_specs() -> Dict[str, Any]:
     """``field -> FieldSpec`` for every field this process's registry declares."""
-    from ba2_common.core.market_conditions import PROFILES
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS, PROFILES
 
-    return {f.name: f for prof in PROFILES.values() for f in prof.fields}
+    return {**{f.name: f for prof in PROFILES.values() for f in prof.fields}, **BENCHMARK_FIELDS}
 
 
 def _market_field_kinds_and_profiles() -> Tuple[Dict[str, str], Dict[str, str]]:
@@ -300,7 +305,7 @@ def _market_field_kinds_and_profiles() -> Tuple[Dict[str, str], Dict[str, str]]:
     both maps. It is still offered, still filed under Market, and simply names no profile,
     because this process genuinely does not know which one serves it.
     """
-    from ba2_common.core.market_conditions import PROFILES
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS, PROFILES
 
     kinds: Dict[str, str] = {}
     profiles: Dict[str, str] = {}
@@ -308,13 +313,17 @@ def _market_field_kinds_and_profiles() -> Tuple[Dict[str, str], Dict[str, str]]:
         for field in profile.fields:
             kinds[field.name] = field.kind
             profiles[field.name] = profile.name
+    # Benchmark (SPY) fields: a kind, but deliberately NO profile (nothing to configure).
+    for field in BENCHMARK_FIELDS.values():
+        kinds[field.name] = field.kind
     return kinds, profiles
 
 
 def _ui_names() -> Dict[str, str]:
-    from ba2_common.core.market_conditions import PROFILES
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS, PROFILES
 
-    return {f.name: f.ui_name for prof in PROFILES.values() for f in prof.fields}
+    return {**{f.name: f.ui_name for prof in PROFILES.values() for f in prof.fields},
+            **{f.name: f.ui_name for f in BENCHMARK_FIELDS.values()}}
 
 
 # ---------------------------------------------------------------------------------------------

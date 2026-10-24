@@ -618,6 +618,13 @@ class ExpertEventType(str, Enum):
     N_STRUCTURE_STATE = "structure_state"
     N_STRUCTURE_BARS_SINCE_BOS = "structure_bars_since_bos"
     N_STRUCTURE_BARS_SINCE_CHOCH = "structure_bars_since_choch"
+    # BENCHMARK (SPY) REGIME ENTRY GATES (plan docs/plans/2026-10-24-spy-regime-gate.md). Two
+    # CATEGORICAL fields compared with ``==`` against a mode code (``benchmark_regime`` tables);
+    # they read the market-wide regime, not a per-instrument feature row, so they are NOT in
+    # ``market_conditions.PROFILES`` (see ``BENCHMARK_FIELDS``). Enum members cannot be added at
+    # runtime, hence declared here. An unknown regime never passes.
+    N_SPY_TREND_REGIME = "spy_trend_regime"
+    N_SPY_VOL_REGIME = "spy_vol_regime"
 
 
 class ExpertActionType(str, Enum):

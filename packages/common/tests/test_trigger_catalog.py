@@ -110,12 +110,12 @@ def test_the_counts_the_design_agreed():
     """Pinned as NUMBERS because the chips show them: a count that drifts from the design's
     table means somebody re-filed a trigger without saying so."""
     assert category_counts() == {
-        "all": 80,
+        "all": 82,
         "position": 18,
         "signal": 26,
         "targets": 10,
         "options": 13,
-        "market": 19,
+        "market": 21,
         "timing": 12,
     }
 
@@ -332,7 +332,7 @@ def test_an_unreadable_kind_is_refused_rather_than_guessed():
 
 def test_the_categorical_market_field_is_the_only_categorical_trigger():
     categorical = {e.value for e in trigger_catalog() if e.kind == KIND_CATEGORICAL}
-    assert categorical == {"structure_state"}
+    assert categorical == {"structure_state", "spy_trend_regime", "spy_vol_regime"}
 
 
 def test_a_flag_trigger_and_a_number_trigger_read_as_expected():

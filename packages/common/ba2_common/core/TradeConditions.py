@@ -18,6 +18,7 @@ from ba2_common.core.db import get_db
 from ba2_common.logger import logger
 from sqlmodel import select
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core import benchmark_regime as _br
 # The established vocabulary for "the broker's position fetch FAILED" — reused rather
 # than re-invented so the engine, the live service, the UI and the conditions all raise
 # and catch the same class. See its docstring for the 2026-07-03 incident.
@@ -4467,6 +4468,86 @@ RATING_CHANGE_CONDITIONS: Dict[ExpertEventType, tuple] = {
 # every entry here must have a rule_builders.FIELD_EVENT / FLAG_FIELD_EVENT mapping or a
 # rule leaf naming it is silently dropped before the engine ever sees it. That invariant is
 # enforced by tests/test_condition_registry_coverage.py.
+class BenchmarkRegimeCompare(CompareCondition):
+    """Base of the SPY benchmark regime gates (``SpyTrendRegimeCondition``/``SpyVolRegimeCondition``).
+    Plan 2026-10-24-spy-regime-gate.
+
+    ONE set-membership leaf: ``field == mode code`` (the code a ``benchmark_regime`` mode table
+    names; ``above_200`` accepts both ``up`` and ``pullback``). It reads the regime the host
+    published through ``benchmark_regime.set_benchmark_regime`` -- the backtest from its
+    precomputed calendar, live from FINISHED SPY sessions -- never a per-instrument feature row,
+    so there is no context, reader or recorder here.
+
+    UNKNOWN NEVER PASSES and says why: nothing published (``no_regime``, with the host's failure
+    reason when it set one) or this axis unclassifiable (``insufficient_history``, the axis
+    reason). A stale mode code raises at construction, not at the first evaluation.
+    """
+
+    #: Canonical field name (== ExpertEventType value). Set by the subclass.
+    FIELD: str = ""
+    #: Axis word used in the description. Set by the subclass.
+    AXIS: str = ""
+
+    def __init__(self, account: AccountInterface, instrument_name: str,
+                 expert_recommendation: ExpertRecommendation, operator_str: str, value: float,
+                 existing_order: Optional[TradingOrder] = None):
+        super().__init__(account, instrument_name, expert_recommendation, operator_str, value,
+                         existing_order)
+        if not self.FIELD:
+            raise TypeError(f"{type(self).__name__} has no FIELD: use SpyTrendRegimeCondition or "
+                            f"SpyVolRegimeCondition")
+        if operator_str != "==":
+            raise ValueError(f"{self.FIELD} (categorical) accepts only ['=='], got {operator_str!r}")
+        self.mode = _br.mode_for_code(self.FIELD, value)   # ValueError on an unknown code
+        self.state: Optional[str] = None
+        self.last_status: Optional[str] = None
+        self.last_reason: str = ""
+
+    def _unknown(self, status: str, reason: str) -> bool:
+        self.calculated_value = None
+        self.state = None
+        self.last_status = status
+        self.last_reason = reason
+        logger.debug("Benchmark regime %s for %s is unknown (%s): %s",
+                     self.FIELD, self.instrument_name, status, reason)
+        return False
+
+    def evaluate(self) -> bool:
+        regime = _br.get_benchmark_regime()
+        if regime is None:
+            why = _br.get_benchmark_regime_failure() or "the host published none for this decision"
+            return self._unknown("no_regime", f"no benchmark regime is published for this decision: {why}")
+        axis = "trend" if self.FIELD == _br.TREND_FIELD else "vol"
+        state = getattr(regime, axis)
+        if state is None:
+            return self._unknown("insufficient_history",
+                                 getattr(regime, f"{axis}_reason") or f"{self.FIELD} is unknown")
+        self.state = state
+        self.calculated_value = float(_br.CODES_BY_FIELD[self.FIELD][state])
+        self.last_status = "valid"
+        self.last_reason = ""
+        return _br.state_matches(self.FIELD, self.value, state)
+
+    def get_description(self) -> str:
+        members = ", ".join(sorted(_br.MODE_STATES[self.FIELD][self.mode]))
+        return f"Check if the SPY {self.AXIS} regime is {self.mode} ({members})"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.state is not None:
+            return self.state
+        return f"unknown ({self.last_status})" if self.last_status else None
+
+
+class SpyTrendRegimeCondition(BenchmarkRegimeCompare):
+    FIELD = _br.TREND_FIELD
+    AXIS = "trend"
+
+
+class SpyVolRegimeCondition(BenchmarkRegimeCompare):
+    FIELD = _br.VOL_FIELD
+    AXIS = "volatility"
+
+
 CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.F_BEARISH: BearishCondition,
     ExpertEventType.F_BULLISH: BullishCondition,
@@ -4527,6 +4608,9 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,
     ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,
     ExpertEventType.F_HAS_ASSIGNED_SHARES: HasAssignedSharesCondition,
+    # Not generated from PROFILES (the benchmark fields are no profile); see BenchmarkRegimeCompare.
+    ExpertEventType.N_SPY_TREND_REGIME: SpyTrendRegimeCondition,
+    ExpertEventType.N_SPY_VOL_REGIME: SpyVolRegimeCondition,
 }
 
 

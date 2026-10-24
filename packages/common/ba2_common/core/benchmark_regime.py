@@ -40,6 +40,8 @@ TREND_MODE_CODES = OrderedDict([("up", 1), ("pullback", 2), ("bear_rally", 3), (
 VOL_MODE_CODES = OrderedDict([("calm", 1), ("normal", 2), ("stressed", 3),
                               ("not_stressed", 4), ("not_calm", 5)])
 _MODE_CODES = {TREND_FIELD: TREND_MODE_CODES, VOL_FIELD: VOL_MODE_CODES}
+#: field -> mode table. The IDENTITY modes are named like the state they accept, so this also maps a state to its code.
+CODES_BY_FIELD = _MODE_CODES
 
 #: mode -> the states it accepts. Identity modes accept exactly their own state.
 MODE_STATES = {
