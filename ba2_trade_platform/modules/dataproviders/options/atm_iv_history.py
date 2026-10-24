@@ -650,6 +650,52 @@ class FmpSpotSource:
         return out
 
 
+class AlpacaHistorySpotSource:
+    """``spots(symbol, start, end) -> {session: as-traded close}`` from the account's ALPACA history (plan
+    2026-10-24-history-source-task11).
+
+    ``history`` is a live ``AlpacaHistoryOHLCVProvider`` (an account's keys): a LATEST read tops the cache up with the
+    finished sessions. Its closes are on the build's basis (split table applied), so the as-traded close is the adjusted
+    close x the product of the factors (splits AND spin-offs) of the events dated after the bar, taken from the basis
+    record the cache itself keeps (``live_state.manifest_events``) -- never the FMP split calendar. A fetch / refusal is
+    ``SpotSourceTransient`` (retried, never tombstoned); a symbol that is not in the build is ``SpotUnavailable``. FMP is
+    never consulted.
+    """
+
+    def __init__(self, history: Any):
+        self._history = history
+
+    def spots(self, symbol: str, start: date, end: date) -> Dict[date, float]:
+        from ba2_providers.ohlcv.alpaca_history import build, live_state
+        from ba2_providers.ohlcv.alpaca_history.live_topup import SymbolNotInHistory
+        try:
+            df = self._history.get_ohlcv_data(
+                symbol, start_date=datetime(start.year, start.month, start.day) - timedelta(days=7),
+                end_date=None, interval="1d")
+            events = live_state.manifest_events(symbol)
+        except SymbolNotInHistory as e:
+            raise SpotUnavailable(f"{symbol}: not in the Alpaca history build: {e}") from e
+        except KeyError as e:
+            raise SpotUnavailable(f"{symbol}: not in the Alpaca build manifest ({e})") from e
+        except Exception as e:  # noqa: BLE001 - AlpacaLiveFetchError, TopUpRefused, CorporateActionsStale, HistoryTopUpUnavailable ...
+            logger.warning(f"{symbol}: Alpaca history spot read failed ({type(e).__name__}: {e}); retried, never tombstoned")
+            raise SpotSourceTransient(f"{symbol}: Alpaca history read failed: {type(e).__name__}: {e}") from e
+        if df is None or df.empty:
+            raise SpotUnavailable(f"{symbol}: no daily OHLCV in the Alpaca history")
+        days = pd.to_datetime(df["Date"]).dt.normalize()
+        if getattr(days.dt, "tz", None) is not None:
+            days = days.dt.tz_localize(None)
+        splits = [(d, f) for d, f, k in events if k == "split"]
+        spinoffs = [(d, f) for d, f, k in events if k == "spinoff"]
+        factor = build.cumulative_factor(days, splits) * build.cumulative_factor(days, spinoffs)
+        out: Dict[date, float] = {}
+        for ts, px, fac in zip(days, df["Close"].to_numpy(dtype=float), factor):
+            day = ts.date()
+            if start <= day <= end and math.isfinite(px) and px > 0:
+                out[day] = float(px) * float(fac)
+        return out
+
+
 def _default_rate_source(start: date, end: date):
     from ba2_providers.macro.risk_free_rate import RiskFreeRateUnavailable, fred_dgs3mo_rate
     try:
@@ -1381,17 +1427,29 @@ def merge_snapshots(series: AtmIvSeries, snapshots: Dict[date, float],
 # Per-credential provider registry (the account objects are rebuilt often; the provider's
 # state -- bucket, fills, background thread -- is process-wide anyway)
 # ---------------------------------------------------------------------------------------------
-_REGISTRY: Dict[Tuple[str, bool], AtmIvHistoryProvider] = {}
+_REGISTRY: Dict[Tuple[str, bool, str], AtmIvHistoryProvider] = {}
 _REGISTRY_LOCK = threading.Lock()
 
 
-def get_provider_for_credentials(api_key: str, api_secret: str, paper: bool) -> AtmIvHistoryProvider:
+def get_provider_for_credentials(api_key: str, api_secret: str, paper: bool, *, history_source: str) -> AtmIvHistoryProvider:
+    """One provider per (credentials, paper, history source). ``history_source`` is REQUIRED: the account's
+    ``ohlcv_history_source``; ``fmp`` keeps ``AtmIvHistoryProvider``'s own FMP spot source byte for byte, ``alpaca``
+    reads the account's Alpaca history (``AlpacaHistorySpotSource``)."""
+    from ba2_common.core.ohlcv_history import check_history_source
     from ba2_providers.options.alpaca import AlpacaOptionsProvider
-    k = (api_key, bool(paper))
+    source = check_history_source(history_source)
+    k = (api_key, bool(paper), source)
     with _REGISTRY_LOCK:
         p = _REGISTRY.get(k)
         if p is None:
+            extra = {}
+            if source == "alpaca":
+                from ba2_providers import get_provider
+                from ba2_trade_platform.core.account_history import corporate_actions_refresher
+                extra["spot_source"] = AlpacaHistorySpotSource(get_provider(
+                    "ohlcv", "alpaca_hist", api_key=api_key, api_secret=api_secret,
+                    corporate_actions_refresher=corporate_actions_refresher()))
             p = AtmIvHistoryProvider(options_provider=AlpacaOptionsProvider(
-                api_key=api_key, api_secret=api_secret, paper=bool(paper)))
+                api_key=api_key, api_secret=api_secret, paper=bool(paper)), **extra)
             _REGISTRY[k] = p
         return p

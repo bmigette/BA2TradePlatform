@@ -6686,8 +6686,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         p = getattr(self, "_atm_iv_history_provider", None)
         if p is None:
             from ..dataproviders.options.atm_iv_history import get_provider_for_credentials
+            from ba2_common.core.ohlcv_history import account_history_source
             p = get_provider_for_credentials(self.settings["api_key"], self.settings["api_secret"],
-                                             bool(self.settings["paper_account"]))
+                                             bool(self.settings["paper_account"]),
+                                             history_source=account_history_source(self.settings))
             self._atm_iv_history_provider = p
         return p
 

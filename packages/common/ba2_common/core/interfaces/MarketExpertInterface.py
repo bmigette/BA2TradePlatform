@@ -1487,9 +1487,13 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         startup. For the Phase-1 golden harness the test injects get_provider via
         the same seam. Used by every expert's live run_analysis to feed _gather.
         """
-        from ba2_common.core.backtest_context import LiveProviderBundle
+        from ba2_common.core.backtest_context import LiveProviderBundle, live_history_spec
         from ba2_common.core.TradeConditions import _get_provider
-        return LiveProviderBundle(lambda category, name, **kw: _get_provider(category, name, **kw))
+        # The OHLCV history is the expert's ACCOUNT's choice (fmp | alpaca); a backtest host resolver returns the run's own
+        # provider whatever is named here.
+        ohlcv_name, ohlcv_kwargs = live_history_spec(self.id)
+        return LiveProviderBundle(lambda category, name, **kw: _get_provider(category, name, **kw),
+                                  ohlcv_name=ohlcv_name, ohlcv_kwargs=ohlcv_kwargs)
 
     @classmethod
     @abstractmethod

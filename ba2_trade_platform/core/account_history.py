@@ -17,7 +17,7 @@ from ba2_common.core.interfaces.ExtendableSettingsInterface import decode_settin
 from ba2_common.core.ohlcv_history import ACCOUNT_HISTORY_SOURCE_KEY, account_history_source
 
 from ..logger import logger
-from .db import get_all_instances, get_db, get_instance
+from .db import InstanceNotFound, get_all_instances, get_db, get_instance
 from .models import AccountDefinition, AccountSetting, ExpertInstance, TradingOrder, Transaction
 
 _PLAIN_TICKER = re.compile(r"^[A-Z][A-Z0-9]{0,5}([.\-][A-Z])?$")    # an equity ticker (not an OCC contract string)
@@ -31,9 +31,10 @@ def account_settings(account_id: int) -> Dict[str, Any]:
     """The typed settings dict of an account, read from its rows WITHOUT instantiating the account (an instance of a
     broker class may open a session); every declared key is present (None when unset)."""
     from ..modules.accounts import get_account_class
-    definition = get_instance(AccountDefinition, account_id)
-    if definition is None:
-        raise ValueError(f"account {account_id} does not exist")
+    try:
+        definition = get_instance(AccountDefinition, account_id)
+    except InstanceNotFound as e:
+        raise ValueError(f"account {account_id} does not exist") from e
     account_cls = get_account_class(definition.provider)
     if account_cls is None:
         raise ValueError(f"account {account_id}: unknown provider {definition.provider!r}")
@@ -55,6 +56,71 @@ def validate_account_history_source(settings: Dict[str, Any]) -> str:
         raise HistorySourceNeedsAlpacaKeys(
             "ohlcv_history_source 'alpaca' needs Alpaca market-data keys (api_key and api_secret); this account has none")
     return source
+
+
+def history_source_for_account(account_id: int) -> str:
+    """``fmp`` | ``alpaca`` for an account (declared default ``fmp`` when unset). Raises for an unknown account, an
+    unknown stored value, or ``alpaca`` without Alpaca keys: there is no fallback to another source."""
+    return validate_account_history_source(account_settings(account_id))
+
+
+def history_spec_for_account(account_id: int):
+    """``(registry name, constructor kwargs)`` of the OHLCV history provider of ``account_id``."""
+    settings = account_settings(account_id)
+    if validate_account_history_source(settings) == "fmp":
+        return "fmp", {}
+    return "alpaca_hist", {**alpaca_keys(settings), "corporate_actions_refresher": corporate_actions_refresher()}
+
+
+def history_provider_for_account(account_id: int):
+    from ..modules.dataproviders import get_provider
+    name, kwargs = history_spec_for_account(account_id)
+    return get_provider("ohlcv", name, **kwargs)
+
+
+def _expert_account_id(expert_id: int) -> int:
+    try:
+        return get_instance(ExpertInstance, expert_id).account_id
+    except InstanceNotFound as e:
+        raise ValueError(f"expert instance {expert_id} does not exist; its history source cannot be resolved") from e
+
+
+def history_spec_for_expert(expert_id: int):
+    return history_spec_for_account(_expert_account_id(expert_id))
+
+
+def history_provider_for_expert(expert_id: int):
+    return history_provider_for_account(_expert_account_id(expert_id))
+
+
+def _transaction_account_id(transaction_id: int) -> int:
+    with get_db() as session:
+        order = session.exec(select(TradingOrder).where(TradingOrder.transaction_id == transaction_id).limit(1)).first()
+    if order is None:
+        raise ValueError(f"transaction {transaction_id} has no order, so no account; its history source cannot be resolved")
+    return order.account_id
+
+
+def history_spec_for_transaction(transaction_id: int):
+    return history_spec_for_account(_transaction_account_id(transaction_id))
+
+
+def history_provider_for_transaction(transaction_id: int):
+    return history_provider_for_account(_transaction_account_id(transaction_id))
+
+
+def indicator_provider_for_expert(expert_id: int):
+    """The ATR indicator provider of an expert's account: built on the account's Alpaca history for an ``alpaca`` account;
+    ``None`` for an ``fmp`` account, which keeps the default (yfinance) stack exactly as before (owner 2026-10-24)."""
+    return indicator_provider_for_account(_expert_account_id(expert_id))
+
+
+def indicator_provider_for_account(account_id: int):
+    from ..modules.dataproviders import get_provider
+    name, kwargs = history_spec_for_account(account_id)
+    if name == "fmp":
+        return None
+    return get_provider("indicators", "pandas", ohlcv_provider=get_provider("ohlcv", name, **kwargs))
 
 
 def alpaca_history_accounts() -> List[Dict[str, Any]]:

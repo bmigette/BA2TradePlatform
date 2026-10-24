@@ -1945,7 +1945,10 @@ class SmartRiskManagerToolkit:
             if not sl_price and use_atr_stop:
                 try:
                     from .seam_helpers import get_default_indicator_provider
-                    indicator_provider = get_default_indicator_provider()
+                    from .account_history import indicator_provider_for_expert
+                    # ATR follows the expert's account history source: an alpaca account reads Alpaca history,
+                    # an fmp account keeps the default (yfinance) stack as before.
+                    indicator_provider = indicator_provider_for_expert(self.expert.id) or get_default_indicator_provider()
                 except Exception as e:
                     logger.warning(f"could not build indicator provider for ATR sizing of {symbol}: {e}")
             atr = None if (sl_price or not use_atr_stop) else get_latest_atr(symbol, indicator_provider, period=atr_period)

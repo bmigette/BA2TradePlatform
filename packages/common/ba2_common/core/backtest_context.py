@@ -29,6 +29,30 @@ from typing import Any, Callable, Dict, Optional, Protocol, runtime_checkable
 LIVE_OHLCV_PROVIDER = "fmp"
 
 
+#: Host seam: ``fn(expert_id) -> (registry name, constructor kwargs)`` of the OHLCV HISTORY provider a LIVE expert reads
+#: (the expert's account decides: plan 2026-10-24-history-source-task11). Unwired (tests, packages alone, the test
+#: platform) the live bundle keeps ``LIVE_OHLCV_PROVIDER`` with no kwargs. A backtest's host resolver returns the run's own
+#: OHLCV override whatever name is asked, so naming a source here can never leak a live source into a backtest.
+_live_history_resolver: Optional[Callable[[int], Any]] = None
+
+
+def set_live_history_resolver(fn: Optional[Callable[[int], Any]]) -> None:
+    global _live_history_resolver
+    _live_history_resolver = fn
+
+
+def get_live_history_resolver() -> Optional[Callable[[int], Any]]:
+    return _live_history_resolver
+
+
+def live_history_spec(expert_id: int):
+    """``(name, kwargs)`` of the live OHLCV history provider of ``expert_id``; the default pair when no resolver is wired.
+    The resolver RAISES for an expert it cannot resolve (no fallback to another source)."""
+    if _live_history_resolver is None:
+        return LIVE_OHLCV_PROVIDER, {}
+    return _live_history_resolver(expert_id)
+
+
 @runtime_checkable
 class ProviderBundle(Protocol):
     """Typed accessor over the provider set an expert needs. Methods return the
@@ -49,9 +73,11 @@ class LiveProviderBundle:
     edge to ba2_providers. price_at_date resolves the as_of close via the ohlcv
     provider's get_ohlcv_data (Decision 1: one price source for all experts)."""
 
-    def __init__(self, get_provider: Callable[..., Any], ohlcv_name: str = LIVE_OHLCV_PROVIDER):
+    def __init__(self, get_provider: Callable[..., Any], ohlcv_name: str = LIVE_OHLCV_PROVIDER,
+                 ohlcv_kwargs: Optional[Dict[str, Any]] = None):
         self._get = get_provider
         self._ohlcv_name = ohlcv_name
+        self._ohlcv_kwargs = dict(ohlcv_kwargs) if ohlcv_kwargs else {}
         self._memo: Dict[str, Any] = {}
 
     def _once(self, category: str, name: str):
@@ -88,7 +114,7 @@ class LiveProviderBundle:
             self._memo[key] = provider
         return provider
 
-    def ohlcv(self): return self._get("ohlcv", self._ohlcv_name)
+    def ohlcv(self): return self._get("ohlcv", self._ohlcv_name, **self._ohlcv_kwargs)
     def fundamentals_details(self): return self._once("fundamentals_details", "fmp")
     def fundamentals_overview(self): return self._once("fundamentals_overview", "fmp")
     def insider(self): return self._once("insider", "fmp")

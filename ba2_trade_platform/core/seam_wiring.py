@@ -121,6 +121,16 @@ def wire_all_seams() -> None:
 
         TradeConditions.set_provider_resolver(get_provider)
 
+        # 4b) Per-account live OHLCV history source (plan 2026-10-24-history-source-task11): the expert bundle's
+        #     OHLCV provider and the classic RM's ATR provider follow the expert's account setting.
+        from ba2_common.core import TradeRiskManagement as _rm_module
+        from ba2_common.core.backtest_context import set_live_history_resolver
+
+        from . import account_history
+
+        set_live_history_resolver(account_history.history_spec_for_expert)
+        _rm_module.set_indicator_provider_resolver(account_history.indicator_provider_for_expert)
+
         # 5) Instrument auto-adder hook (Penny screening queues symbols via ba2_experts).
         import ba2_experts
 

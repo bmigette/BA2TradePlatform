@@ -92,11 +92,15 @@ def topup_frame(cached: pd.DataFrame, fetch: Fetch, splits: Sequence[Tuple[str, 
                      f"{[d.isoformat() for d in missing]}; the file is untouched, the next refresh retries")
         raise TopUpGap(symbol, interval, missing)
     new = build.adjust(new.sort_values("Date", kind="stable").reset_index(drop=True), splits, spinoffs)
-    seam = float(new["Open"].iloc[0]) / float(cached.sort_values("Date")["Close"].iloc[-1])
-    if not (JUMP_LO <= seam <= JUMP_HI):
+    prev_close = pd.concat([pd.Series([float(cached.sort_values("Date")["Close"].iloc[-1])]),
+                            new["Close"].iloc[:-1].astype(float)], ignore_index=True)
+    jumps = new["Open"].astype(float).reset_index(drop=True) / prev_close      # the seam AND every step inside the append
+    bad = jumps[(jumps < JUMP_LO) | (jumps > JUMP_HI)]
+    if len(bad):
+        i = int(bad.index[0])
         raise PendingCorporateAction(
-            f"{symbol} ({interval}): the first new bar opens x{seam:.3f} of the last cached close with no accepted "
-            f"corporate action explaining it; nothing appended")
+            f"{symbol} ({interval}): the bar at {new['Date'].iloc[i]} opens x{float(bad.iloc[0]):.3f} of the previous close "
+            f"with no accepted corporate action explaining it; nothing appended")
     new = build.finish(new, interval)
     merged = pd.concat([cached, new[list(cached.columns)]], ignore_index=True)
     if not pd.to_datetime(merged["Date"]).is_monotonic_increasing or merged["Date"].duplicated().any():

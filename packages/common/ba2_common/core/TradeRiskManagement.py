@@ -146,6 +146,20 @@ def apply_lot_size(order_data: dict, quantity: int) -> int | None:
     return (int(quantity) // lot) * lot
 
 
+#: Host seam: ``fn(expert_id) -> indicator provider | None`` (plan 2026-10-24-history-source-task11: ATR follows the
+#: account's history source; None = the default stack). Unwired = always the injected provider.
+_indicator_provider_resolver = None
+
+
+def set_indicator_provider_resolver(fn) -> None:
+    global _indicator_provider_resolver
+    _indicator_provider_resolver = fn
+
+
+def get_indicator_provider_resolver():
+    return _indicator_provider_resolver
+
+
 class TradeRiskManagement:
     """
     Risk management system for automated trading orders.
@@ -179,6 +193,15 @@ class TradeRiskManagement:
         self.logger = logger
         self.indicator_provider = indicator_provider
         self.as_of = as_of
+
+    def _indicator_provider_for(self, expert):
+        """The ATR indicator provider for ``expert``'s orders. LIVE only (``as_of`` None): the host seam may name a
+        provider built on the expert's account history source (an ``alpaca`` account); None (an ``fmp`` account, no seam)
+        keeps the injected default, exactly as before. A backtest (``as_of`` given) always uses its injected provider."""
+        if self.as_of is not None or _indicator_provider_resolver is None:
+            return self.indicator_provider
+        override = _indicator_provider_resolver(expert.id)
+        return override if override is not None else self.indicator_provider
     
     def review_and_prioritize_pending_orders(self, expert_instance_id: int) -> List[TradingOrder]:
         """
@@ -1843,7 +1866,7 @@ class TradeRiskManagement:
         sl_atr = None
         if use_atr_stop:
             sl_atr = get_latest_atr(
-                symbol, self.indicator_provider, period=atr_period, end_date=self.as_of)
+                symbol, self._indicator_provider_for(expert), period=atr_period, end_date=self.as_of)
         _synth_trace: Dict[str, Any] = {}
         sl = synthesize_safeguard_stop(
             current_price, order.side == OrderDirection.BUY, risk_pct,
