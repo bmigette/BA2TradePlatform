@@ -1253,7 +1253,22 @@ def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, 
     last_exc: Optional[Exception] = None
     for attempt in range(_LOCAL_RETRY_ATTEMPTS):
         try:
-            return {"ok": True, "results": run_daily_backtest(config)}
+            # HEARTBEAT + CANCEL, exactly like _trial_worker: the engine's throttled progress_cb
+            # publishes ``bars`` on the control block, which /job-status reports. Without it a
+            # remote persist re-run showed bars == 0 for its whole life and the master's
+            # worker_client watchdog cancelled any run past _NEVER_STARTED_GRACE (420 s) as
+            # "accepted but never started" -- a false stall on every long TOP-N re-run. A fresh
+            # callback per attempt (its throttle state is per call). ``None`` for no ctl keeps the
+            # old call byte-identical.
+            _cb = _cancel_progress_cb(ctl)
+            return {"ok": True,
+                    "results": (run_daily_backtest(config) if _cb is None
+                                else run_daily_backtest(config, progress_cb=_cb))}
+        except TrialCancelled:
+            # The master abandoned this re-run: not a defect, and retrying (with backoff) would
+            # only hold the slot for a result nobody collects.
+            return {"ok": False, "error": "cancelled", "cancelled": True, "retryable": True,
+                    "fatal": False}
         except Exception as e:  # noqa: BLE001 — surface as a failed re-run, keep the others going
             last_exc = e
             if attempt < _LOCAL_RETRY_ATTEMPTS - 1:
