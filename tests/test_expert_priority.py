@@ -508,7 +508,64 @@ def test_one_expert_failing_to_load_is_skipped_alone(worker, monkeypatch, caplog
         jm._execute_scheduled_group(1, "EXPERT", AnalysisUseCase.ENTER_MARKET, scheduled_for=slot)
     assert sorted(calls) == [1, 3]
     assert slot.isoformat() in jm._dispatched_slots
-    assert any("2" in r.getMessage() and "broken expert 2" in r.getMessage()
+    assert any("Scheduled expert 2 FAILED TO LOAD" in r.getMessage() and "broken expert 2" in r.getMessage()
                and r.levelno == logging.ERROR for r in caplog.records)
     jm._execute_scheduled_group(3, "EXPERT", AnalysisUseCase.ENTER_MARKET, scheduled_for=slot)
     assert sorted(calls) == [1, 3]   # slot claimed: no double run
+
+
+def _group_fixture(worker, monkeypatch, loader, prio=None):
+    import ba2_trade_platform.core.JobManager as module
+    jm = module.JobManager.__new__(module.JobManager)
+    jm._lock, jm._dispatch_lock, jm._dispatched_slots = Lock(), Lock(), set()
+    slot = datetime(2026, 9, 15, 13, 30, tzinfo=timezone.utc)
+    trigger = CronTrigger(hour=13, minute=30, timezone=timezone.utc)
+    jm._scheduled_jobs = {f"expert_{i}": SimpleNamespace(trigger=trigger, next_run_time=slot,
+        args=[i, "EXPERT", AnalysisUseCase.ENTER_MARKET]) for i in [1, 2, 3]}
+    records = {i: SimpleNamespace(id=i, account_id=1, enabled=True, priority=10) for i in [1, 2, 3]}
+    monkeypatch.setattr(module, "get_instance", lambda _, i: records[i])
+    monkeypatch.setattr(module, "get_worker_queue", lambda: worker)
+    if prio:
+        monkeypatch.setattr("ba2_trade_platform.core.ExpertPriority.validate_expert_priority", prio)
+    from ba2_trade_platform.core import utils
+    monkeypatch.setattr(utils, "get_expert_instance_from_id", loader)
+    monkeypatch.setattr(utils, "expert_uses_risk_manager", lambda cls: True)
+    calls = []
+    monkeypatch.setattr(jm, "_execute_scheduled_analysis", lambda i, *a, **k: calls.append(i))
+    return jm, slot, calls
+
+
+def test_every_expert_failing_raises_critical_and_does_not_claim_slot(worker, monkeypatch, caplog):
+    import logging
+    def load(i):
+        raise ValueError("boom")
+    jm, slot, calls = _group_fixture(worker, monkeypatch, load)
+    with caplog.at_level(logging.CRITICAL):
+        with pytest.raises(RuntimeError, match="ALL 3"):
+            jm._execute_scheduled_group(1, "EXPERT", AnalysisUseCase.ENTER_MARKET, scheduled_for=slot)
+    assert calls == [] and jm._dispatched_slots == set()
+    assert any(r.levelno == logging.CRITICAL for r in caplog.records)
+
+
+def test_infrastructure_errors_propagate_not_skip(worker, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+    def load(i):
+        raise OperationalError("select", {}, Exception("db locked"))
+    jm, slot, calls = _group_fixture(worker, monkeypatch, load)
+    with pytest.raises(OperationalError):
+        jm._execute_scheduled_group(1, "EXPERT", AnalysisUseCase.ENTER_MARKET, scheduled_for=slot)
+    assert jm._dispatched_slots == set()
+
+
+def test_priority_validation_failure_skips_that_expert_only(worker, monkeypatch):
+    import ba2_trade_platform.core.ExpertPriority as ep
+    real = ep.validate_expert_priority
+    n = {"c": 0}
+    def prio(p):
+        n["c"] += 1
+        if n["c"] == 2:
+            raise ValueError("bad priority")
+        return real(p)
+    jm, slot, calls = _group_fixture(worker, monkeypatch, lambda i: SimpleNamespace(), prio=prio)
+    jm._execute_scheduled_group(1, "EXPERT", AnalysisUseCase.ENTER_MARKET, scheduled_for=slot)
+    assert len(calls) == 2 and slot.isoformat() in jm._dispatched_slots

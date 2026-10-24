@@ -3155,7 +3155,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 )
             ).all()
             pending = [
-                (r.id, r.broker_order_id, r.symbol, get_pending_cancel_since(r.data)) for r in rows
+                (r.id, r.broker_order_id, r.symbol, dict(r.data) if r.data else None) for r in rows
                 if r.broker_order_id is None or r.broker_order_id not in covered
             ]
             skipped_free = len(rows) - len(pending)
@@ -3180,10 +3180,20 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         # stamp existed). Their true start is unknown; created_at is NOT it (it made every
         # cancelled leg of a long-held position look 24 h old at once). Start the clock NOW:
         # never reset on this pass, and say so once (the stamp ends the repetition).
-        for idx, (order_id, broker_order_id, symbol, since) in enumerate(pending):
-            if since is None:
-                since = self._stamp_legacy_pending_cancel(order_id, symbol)
-                pending[idx] = (order_id, broker_order_id, symbol, since)
+        # A failure on ONE row (corrupt stamp, DB write) must not abort the others: that row
+        # is treated as starting now, so it is never reset on this pass.
+        for idx, (order_id, broker_order_id, symbol, raw_data) in enumerate(pending):
+            try:
+                since = get_pending_cancel_since(raw_data)
+                if since is None:
+                    since = self._stamp_legacy_pending_cancel(order_id, symbol)
+            except Exception as e:
+                logger.error(
+                    f"Order {order_id} ({symbol}): cannot read/record pending_cancel_since "
+                    f"({type(e).__name__}: {e}); treating the cancel as starting now so the "
+                    f"order is not reset on this pass", exc_info=True)
+                since = datetime.now(timezone.utc)
+            pending[idx] = (order_id, broker_order_id, symbol, since)
 
         pending.sort(key=_oldest_first)
         if len(pending) > _PENDING_CANCEL_LOOKUP_BUDGET:
@@ -3304,6 +3314,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 f"not overwriting")
             return False
         fresh.status = new_status
+        if new_status != OrderStatus.PENDING_CANCEL and fresh.data and PENDING_CANCEL_SINCE_KEY in fresh.data:
+            fresh.data = {k: v for k, v in fresh.data.items() if k != PENDING_CANCEL_SINCE_KEY}
         if broker_order is not None:
             if broker_order.filled_qty is not None:
                 fresh.filled_qty = float(broker_order.filled_qty)
@@ -5874,7 +5886,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if type_change_needed:
                 logger.info(f"Order type transition detected: {old_order_type} → {new_order_type.value}. Canceling old order and creating new one.")
                 # Can't replace when order type changes - must cancel and create new
-                existing_sl.status = OrderStatus.PENDING_CANCEL
+                mark_pending_cancel(existing_sl)
                 session.add(existing_sl)
                 
                 # Create new pending order with correct type
@@ -5891,7 +5903,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     depends_on_order=existing_sl.id,
                     open_type=OrderOpenType.AUTOMATIC,
                     comment=f"SL order (type change: {old_order_type}→{new_order_type.value}, pending cancel of {existing_sl.id})",
-                    data=existing_sl.data.copy() if existing_sl.data else {},
+                    data={k: v for k, v in (existing_sl.data or {}).items() if k != PENDING_CANCEL_SINCE_KEY},
                     created_at=datetime.now(timezone.utc)
                 )
                 session.add(new_sl)
@@ -5913,7 +5925,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 if "cannot replace order" in error_msg or "42210000" in error_msg:
                     logger.warning(f"Cannot replace SL order {existing_sl.id} (error: {e}), creating PENDING_CANCEL order")
                     
-                    existing_sl.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(existing_sl)
                     session.add(existing_sl)
                     
                     new_sl = TradingOrder(
@@ -5929,7 +5941,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         depends_on_order=existing_sl.id,
                         open_type=OrderOpenType.AUTOMATIC,
                         comment=f"SL order (pending cancel of {existing_sl.id})",
-                        data=existing_sl.data.copy() if existing_sl.data else {},
+                        data={k: v for k, v in (existing_sl.data or {}).items() if k != PENDING_CANCEL_SINCE_KEY},
                         created_at=datetime.now(timezone.utc)
                     )
                     session.add(new_sl)
@@ -6005,7 +6017,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     logger.warning(f"Cannot replace OCO order {existing_oco.id} (error: {e}), creating PENDING_CANCEL order")
                     
                     # Mark existing order as PENDING_CANCEL
-                    existing_oco.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(existing_oco)
                     session.add(existing_oco)
                     
                     # Validate TP/SL prices before creating replacement OCO order

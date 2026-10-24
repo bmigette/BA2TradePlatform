@@ -22,7 +22,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.job import Job
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import Session, select
 
 from ba2_common.core.schedule_genes import describe_schedule, schedule_refusal_message, schedule_weekday_enabled
@@ -1687,6 +1687,7 @@ class JobManager:
                     if record is not None and record.enabled:
                         records[expert_id] = record
             runs = []
+            due_count = len(records)
             for record in list(records.values()):
                 # ONE expert that cannot be loaded must not take down the whole cohort:
                 # entries are weekly, so a skipped expert costs a week. Skip it ALONE and
@@ -1699,6 +1700,10 @@ class JobManager:
                         raise ValueError(f"Cannot load scheduled expert {record.id}")
                     uses_rm = expert_uses_risk_manager(type(expert))
                     priority = validate_expert_priority(record.priority)
+                except (OperationalError, OSError):
+                    # Infrastructure (DB / filesystem) failure, not a bad expert: it would hit
+                    # every expert alike, so it must propagate rather than become a skip.
+                    raise
                 except Exception as e:
                     del records[record.id]
                     logger.error(
@@ -1710,6 +1715,13 @@ class JobManager:
                     batch_id=f"{record.id}_{scheduled_for.astimezone().strftime('%H%M_%Y%m%d')}",
                     cohort=slot, expert_id=record.id, account_id=record.account_id,
                     priority=priority, self_trading=not uses_rm))
+            if due_count and not runs:
+                # EVERY due expert failed: that is systemic, not a per-expert problem. Refuse
+                # BEFORE claiming the slot so it is loud and retryable, not a silently lost week.
+                msg = (f"ALL {due_count} scheduled expert(s) due at slot {slot} failed to load; "
+                       f"nothing will run for this slot")
+                logger.critical(msg)
+                raise RuntimeError(msg)
             worker_queue = get_worker_queue()
             worker_queue._expert_priority.register(runs)
             self._dispatched_slots.add(slot)
