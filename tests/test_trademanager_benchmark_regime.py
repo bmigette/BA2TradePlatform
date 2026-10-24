@@ -280,3 +280,27 @@ def test_no_warning_when_every_alpaca_account_prices_from_fmp(monkeypatch, caplo
     with caplog.at_level(logging.WARNING):
         tm._publish_benchmark_regime(now=at_ny(THU, 17))
     assert not any("SPY regime reads FMP" in r.getMessage() for r in caplog.records)
+
+
+# ------------------------------------------------------------------- parity with the backtest calendar
+# (local date, hh, mm, the session the backtest calendar reads at that instant). The backtest half of the
+# same table is testplatform/backend/tests/test_benchmark_regime_bt_live_parity.py.
+PARITY_CASES = [
+    (date(2026, 10, 23), 9, 30, date(2026, 10, 22)),        # Friday open
+    (date(2026, 10, 23), 16, 5, date(2026, 10, 23)),        # Friday after the close
+    (date(2026, 10, 24), 12, 0, date(2026, 10, 23)),        # Saturday
+    (date(2026, 10, 26), 9, 30, date(2026, 10, 23)),        # Monday open
+    (date(2026, 11, 26), 10, 0, date(2026, 11, 25)),        # Thanksgiving holiday
+    (date(2026, 11, 27), 12, 59, date(2026, 11, 25)),       # half day, before its 13:00 close
+    (date(2026, 11, 27), 13, 5, date(2026, 11, 27)),        # half day, after it
+]
+
+
+@pytest.mark.parametrize("day,hh,mm,session", PARITY_CASES)
+def test_live_publisher_equals_the_backtest_calendar_at_the_same_instant(monkeypatch, day, hh, mm, session):
+    f = Fetcher(date(2026, 12, 31))
+    cal = br.BenchmarkRegimeCalendar(f.dates, f.closes)
+    tm_mod._reset_benchmark_regime_cache()
+    make(monkeypatch, f)._publish_benchmark_regime(now=at_ny(day, hh, mm))
+    assert br.get_benchmark_regime_failure() is None
+    assert br.get_benchmark_regime() == cal.at(session)
