@@ -322,6 +322,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Options store serving the run, forwarded to the launcher per job "
                          "(default thetadata -- floor 2018-09-14, the only vendor reaching a "
                          "2020 start; tastytrade floors at 2022-10-01, alpaca at 2024-01-18).")
+    ap.add_argument("--ohlcv-history-source", choices=("alpaca", "fmp"), default=None,
+                    help="OHLCV history of the underlyings, forwarded to the launcher per job only "
+                         "when given (absent: the launcher's own default, fmp for option jobs, and "
+                         "every existing job name/digest is unchanged). Stage 1 ran without it "
+                         "(fmp); its re-runs on the Alpaca cache pass alpaca.")
     ap.add_argument("--option-spread-model", default=SPREAD_MODEL_VERSION, choices=SPREAD_MODELS,
                     help="Option fill spread model, forwarded to the launcher per job (default "
                          f"{SPREAD_MODEL_VERSION}: the decision bar's real quote, else the "
@@ -593,7 +598,8 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
     # and therefore every discovery digest -- made without it is unchanged.
     for field, flag in (("fitness", "--fitness"), ("early_stop", "--early-stop"),
                         ("early_stop_min_rel", "--early-stop-min-rel"),
-                        ("mutation_prob", "--mutation-prob"), ("equity_cap", "--equity-cap")):
+                        ("mutation_prob", "--mutation-prob"), ("equity_cap", "--equity-cap"),
+                        ("ohlcv_history_source", "--ohlcv-history-source")):
         value = getattr(args, field)
         if value is not None:
             cmd += [flag, str(value)]
