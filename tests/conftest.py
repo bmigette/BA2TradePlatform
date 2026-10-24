@@ -198,6 +198,21 @@ _wire_package_seams_for_tests()
 
 
 @pytest.fixture(autouse=True)
+def history_source_seams_unwired():
+    """The per-account history-source seams (wire_all_seams step 4b) resolve an expert's ACCOUNT in the DB; most tests use stub
+    experts / ``MockAccount`` rows that no real resolver can classify. Every test starts with them unwired (the pre-feature
+    behaviour); the tests of the feature wire them explicitly."""
+    from ba2_common.core import TradeRiskManagement as rm_module
+    from ba2_common.core import backtest_context as bc
+    before = (bc.get_live_history_resolver(), rm_module.get_indicator_provider_resolver())
+    bc.set_live_history_resolver(None)
+    rm_module.set_indicator_provider_resolver(None)
+    yield
+    bc.set_live_history_resolver(before[0])
+    rm_module.set_indicator_provider_resolver(before[1])
+
+
+@pytest.fixture(autouse=True)
 def patch_db_engine(test_engine):
     """Point the DB engine at the in-memory test DB so all code uses it.
 

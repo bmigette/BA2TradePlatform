@@ -178,3 +178,11 @@ def test_classic_rm_uses_the_per_expert_provider_live_but_not_in_a_backtest():
         assert bt._indicator_provider_for(SimpleNamespace(id=7)) is default       # a backtest never consults the live seam
     finally:
         T.set_indicator_provider_resolver(before)
+
+
+def test_wire_all_seams_installs_both_resolvers():
+    import inspect
+    from ba2_trade_platform.core import seam_wiring
+    src = inspect.getsource(seam_wiring.wire_all_seams)
+    assert "set_live_history_resolver(account_history.history_spec_for_expert)" in src
+    assert "set_indicator_provider_resolver(account_history.indicator_provider_for_expert)" in src
