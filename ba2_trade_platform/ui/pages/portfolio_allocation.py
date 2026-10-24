@@ -110,6 +110,7 @@ from nicegui import ui
 from sqlmodel import select
 
 from ...config import get_app_setting
+from ...core import allocator_csv
 from ...core import allocator_exclusion as exclusion_store
 from ...core import allocator_protection_service as protect_svc
 from ...core import portfolio_allocation_service as svc
@@ -2465,6 +2466,69 @@ async def _persist_managed_labels(account_id: int, current: List[str],
         logger.error(f"Counting stored weights for {to_remove} failed: {exc}", exc_info=True)
         counts = {}
     _confirm_unmanage(to_remove, counts, _write, restore)
+
+
+def _export_allocation_csv(account_id: int) -> None:
+    """Download the account's labels, symbols and percentages as CSV."""
+    try:
+        text = allocator_csv.export_allocation_csv(account_id)
+    except Exception as e:
+        logger.error(f"Allocator CSV export for account {account_id} failed: {e}", exc_info=True)
+        ui.notify(f'Export failed: {e}', type='negative')
+        return
+    ui.download(text.encode('utf-8'), filename=f'allocator_account_{account_id}.csv')
+
+
+def _open_import_dialog(account_id: int, refresh) -> None:
+    """Pick a CSV, confirm, and REPLACE the account's labels, symbols and percentages."""
+    state: Dict[str, Any] = {'text': None}
+    with ui.dialog() as dialog, ui.card().classes('min-w-[420px]'):
+        ui.label('Import allocator CSV').classes('text-h6')
+        ui.label('Replaces the managed labels of this account, their symbols and percentages '
+                 'with the file. Labels and symbols not in the file are removed (instrument '
+                 'labels are shared with other accounts). This cannot be undone.'
+                 ).classes('text-sm')
+        status = ui.label('').classes('text-sm')
+
+        async def _on_upload(e) -> None:
+            raw = await e.file.read()
+            try:
+                text = raw.decode('utf-8-sig')
+                parsed = allocator_csv.parse_allocation_csv(text)
+            except Exception as ex:
+                state['text'] = None
+                status.set_text(f'Rejected: {ex}')
+                status.classes(replace='text-sm text-negative')
+                return
+            state['text'] = text
+            n_sym = sum(len(x['symbols']) for x in parsed)
+            status.set_text(f'{len(parsed)} label(s), {n_sym} symbol(s) ready to import.')
+            status.classes(replace='text-sm')
+
+        (ui.upload(label='CSV file', on_upload=_on_upload, auto_upload=True)
+            .props('accept=.csv flat bordered').classes('w-full'))
+
+        async def _go() -> None:
+            if state['text'] is None:
+                ui.notify('Choose a valid CSV first', type='warning')
+                return
+            try:
+                summary = allocator_csv.import_allocation_csv(account_id, state['text'])
+            except Exception as ex:
+                logger.error(f"Allocator CSV import for account {account_id} failed: {ex}",
+                             exc_info=True)
+                ui.notify(f'Import failed: {ex}', type='negative')
+                return
+            dialog.close()
+            ui.notify(f"Imported {summary['labels']} label(s); "
+                      f"{summary['symbols_added']} symbol(s) labelled, "
+                      f"{summary['symbols_removed']} unlabelled", type='positive')
+            await refresh()
+
+        with ui.row().classes('w-full justify-end gap-2 mt-4'):
+            ui.button('Cancel', on_click=dialog.close).props('flat')
+            ui.button('Replace', on_click=_go).props('color=negative')
+    dialog.open()
 
 
 def _open_label_picker(account_id: int, refresh) -> None:
@@ -4870,6 +4934,10 @@ async def content() -> None:
                 .props('dense outlined hide-bottom-space').classes('w-44')
             ui.button('Manage labels', icon='pie_chart',
                       on_click=lambda: _open_label_picker(account_id, _refresh)).props('outline')
+            ui.button('Export CSV', icon='download',
+                      on_click=lambda: _export_allocation_csv(account_id)).props('outline')
+            ui.button('Import CSV', icon='upload',
+                      on_click=lambda: _open_import_dialog(account_id, _refresh)).props('outline')
             refresh_button(_refresh)
             # The what-if control sits in the TOOLBAR, beside Valuation: both change
             # how every number below is computed, and neither is a number itself.
