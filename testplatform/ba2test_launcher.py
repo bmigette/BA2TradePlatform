@@ -5258,6 +5258,29 @@ def _market_condition_setting_profiles() -> tuple:
     return parse_profile_setting(_market_condition_setting_value())
 
 
+#: ``--benchmark-regime-gates``: append the two SPY regime leaves (spy-trend, spy-vol) to every
+#: pure option structure's initial-entry tree. OFF by default = today's rules, genes, stored
+#: config and job identity byte for byte. Module-level for the same reason as
+#: ``_MARKET_CONDITION_PROFILES``: the builders run far from the parsed args.
+_BENCHMARK_REGIME_GATES: bool = False
+
+
+def _resolve_benchmark_regime_gates(raw, command: str) -> bool:
+    """Parse ``--benchmark-regime-gates``; sets the module global and returns it."""
+    global _BENCHMARK_REGIME_GATES
+    _BENCHMARK_REGIME_GATES = bool(raw)
+    return _BENCHMARK_REGIME_GATES
+
+
+def _benchmark_regime_gates(m: str) -> list:
+    """The SPY regime entry leaves for rule prefix ``m`` ([] unless the flag is on)."""
+    if not _BENCHMARK_REGIME_GATES:
+        return []
+    from ba2_common.core.market_condition_templates import benchmark_regime_leaves
+
+    return benchmark_regime_leaves(m)
+
+
 def _market_condition_gates(m: str) -> list:
     """The market-condition entry leaves for rule prefix ``m`` ([] with no profile selected).
 
@@ -5339,11 +5362,13 @@ def _rename_market_condition_gates(strategy, frm: str, to: str):
     Design section 5: the wheel gets wheel-specific ids even though its entry is the CSP's, so a
     later composed strategy can demand one regime for the wheel and another for a bare CSP.
     """
-    if not _MARKET_CONDITION_PROFILES:
+    if not _MARKET_CONDITION_PROFILES and not _BENCHMARK_REGIME_GATES:
         return strategy
-    from ba2_common.core.market_conditions import PROFILES
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS, PROFILES
 
     fields = {f.name for prof in PROFILES.values() for f in prof.fields}
+    # the SPY regime leaves are re-prefixed too (``<frm>-spy-trend`` -> ``<to>-spy-trend``)
+    bench = {spec.name: spec.short for spec in BENCHMARK_FIELDS.values()}
     old, new = f"{frm}-market-", f"{to}-market-"
 
     def walk(node):
@@ -5358,6 +5383,9 @@ def _rename_market_condition_gates(strategy, frm: str, to: str):
         # ``<member>-market-something`` must keep its id, or a gene key would move under it.
         if isinstance(cid, str) and cid.startswith(old) and node.get("field") in fields:
             node["id"] = new + cid[len(old):]
+        elif (isinstance(cid, str) and node.get("field") in bench
+              and cid == f"{frm}-{bench[node['field']]}"):
+            node["id"] = f"{to}-{bench[node['field']]}"
         for v in node.values():
             walk(v)
 
@@ -5817,6 +5845,39 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
     return recorded
 
 
+def _apply_benchmark_regime(command: str, backtest_block: dict, strat, kind: str = "") -> dict:
+    """Record the SPY regime gate on a run's backtest block, or do nothing.
+
+    NOTHING is written (and ``{}`` returned) with the flag off: the stored config, its digest and
+    the checkpoint identity of every existing run stay unchanged. With it on:
+
+    * REFUSED for a key whose builders emit no SPY leaves (anything outside
+      ``_PURE_OPTION_STRATEGIES``): the job would be labelled gated and search no such gene;
+    * REQUIRES the job's resolved ``ohlcv_history_source``: the SPY series the regime is computed
+      from is the job's own history, so it is stamped here and printed.
+    """
+    if not _BENCHMARK_REGIME_GATES:
+        return {}
+    if kind and kind not in _PURE_OPTION_STRATEGIES:
+        sys.exit(f"{command}: --benchmark-regime-gates: {kind!r} emits no SPY regime gates "
+                 f"(gated keys: {sorted(_PURE_OPTION_STRATEGIES)}). Drop the flag, or run the "
+                 f"gated keys in a job of their own.")
+    source = backtest_block.get("ohlcv_history_source")
+    if not source:
+        sys.exit(f"{command}: --benchmark-regime-gates needs the job's resolved "
+                 f"ohlcv_history_source (the SPY series is read from it); none on the run config")
+    from app.services.strategy_param_space import collect_param_space
+
+    genes = sorted(g for g in collect_param_space(strat) if "-spy-" in g)
+    recorded = {"symbol": "SPY", "history_source": source, "trend": "sma200+sma50slope10",
+                "vol": "rv20-rank504", "genes": genes, "gene_count": len(genes)}
+    backtest_block["benchmark_regime_gates"] = True
+    backtest_block["benchmark_regime"] = recorded
+    print(f"{command}: benchmark regime gates on (SPY, {source}); {len(genes)} added genes; "
+          f"population and generations are NOT scaled")
+    return recorded
+
+
 def _resolve_market_condition_mode(raw, command: str) -> str:
     """Parse ``--market-condition-mode``; sets and returns the module global.
 
@@ -6180,6 +6241,9 @@ def _option_entry_rule(member: str, *, toggleable: bool = False,
             # profile `none` emits a byte-identical rule and an older gene key still names the
             # same gate. Design section 6: the initial-entry tree only -- never an exit rule.
             *_market_condition_gates(m),
+            # SPY REGIME gates (--benchmark-regime-gates; [] by default), after the market
+            # gates: appending keeps every existing leaf at its current index.
+            *_benchmark_regime_gates(m),
         ]},
         "actions": [_option_entry_action_for(member)],
         "continue_processing": False,
@@ -6827,6 +6891,7 @@ def _cmd_optimize(args) -> int:
     _OPTION_GATES_OFF = bool(getattr(args, "gates_off", False))
     # Read BEFORE _build_strategy too: the market gates are appended by the same builders.
     _resolve_market_condition_profiles(getattr(args, "market_condition_profile", None), "optimize")
+    _resolve_benchmark_regime_gates(getattr(args, "benchmark_regime_gates", False), "optimize")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None), "optimize")
     _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize")
     _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize")
@@ -7290,6 +7355,7 @@ def _cmd_optimize(args) -> int:
         # Checked before that rewrite, a run whose real universe the snapshot does not cover would
         # pass -- exactly the silent miss this check exists to prevent.
         _apply_market_conditions("optimize", backtest_block, strat, args.strategy)
+        _apply_benchmark_regime("optimize", backtest_block, strat, args.strategy)
         # Per-weekday entry-scan toggle genes (schedule:<day>) for every non-bypass strategy
         # (S1-S7) — FactorRanker (bypass) has no per-day entry-scan gate, so it never gets these.
         # D8 under the ATR-searched policy: weekdays only (_WEEKDAY_SCHEDULE_DAY_OPT drops the
@@ -7416,6 +7482,8 @@ def _cmd_optimize_batch(args) -> int:
     _OPTION_GATES_OFF = bool(getattr(args, "gates_off", False))
     _resolve_market_condition_profiles(getattr(args, "market_condition_profile", None),
                                        "optimize-batch")
+    _resolve_benchmark_regime_gates(getattr(args, "benchmark_regime_gates", False),
+                                    "optimize-batch")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None),
                                         "optimize-batch")
     _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize-batch")
@@ -7591,6 +7659,7 @@ def _cmd_optimize_batch(args) -> int:
             # Market-condition gates (no-op with the profile off) — see _cmd_optimize for why this
             # sits after every block that can still rewrite enabled_instruments.
             _apply_market_conditions("optimize-batch", backtest_block, strat, strat_kind)
+            _apply_benchmark_regime("optimize-batch", backtest_block, strat, strat_kind)
             pop_for_strat = int(round(args.population * _STRATEGY_POP_FACTOR.get(strat_kind, 1.0)))
             cfg = {
                 "populationSize": pop_for_strat,
@@ -8426,6 +8495,15 @@ def _add_market_condition_args(p) -> None:
                         "each worker would compute the indicators from whatever cache it "
                         "happened to hold. Refused at launch when it does not cover the run's "
                         "universe.")
+    p.add_argument("--benchmark-regime-gates", action="store_true", default=False,
+                   help="OPT-IN, option structures only (O_*, groups, O_WHEEL; refused for any "
+                        "other key). Append two SPY-regime entry gates to every member's "
+                        "INITIAL-ENTRY tree: <member>-spy-trend (off/up/pullback/bear_rally/down/"
+                        "above_200/below_200) and <member>-spy-vol (off/calm/normal/stressed/"
+                        "not_stressed/not_calm), one categorical mode gene each (2 added genes "
+                        "per member; population/generations are NOT scaled). The SPY series is "
+                        "the job's own ohlcv history source. Folds into the job identity in "
+                        "tools/run_options_matrix.py. Absent = today's rules and genes.")
     p.add_argument("--market-exit", default=None, metavar="KIND[,KIND...]",
                    help="EQUITY (S1-S7) ONLY. Append market-condition EXIT/STOP/TP rules "
                         "(kinds: exit,stop,tp -- ba2_common.core.market_condition_templates."
