@@ -584,6 +584,8 @@ Current values: `PACKAGE_VERSION` ba2_common `2026.10.00014`, `TEST_APP_VERSION 
 
 The stage-2 O_STYLE expert lives on `origin/plan/option-stage2` (unmerged). When it merges, its member entry-rule builder must append `*_benchmark_regime_gates(m)` after its market-condition gates exactly as `_option_entry_rule` does, and its `_PURE_OPTION_STRATEGIES`-style membership must include the style members so `_apply_benchmark_regime` accepts them. Because the gate is registry- and template-driven (`benchmark_regime_leaves(prefix)`), nothing in `ba2_common` changes. Add one line to the stage-2 plan doc after both are on dev.
 
+**Status 2026-10-24 (docs only, nothing in code).** The stage-2 plan doc is not on this branch or on dev, so the line is OWED to whoever merges `origin/plan/option-stage2` after this branch. Exact text to paste into that plan: *"SPY regime gate (docs/plans/2026-10-24-spy-regime-gate.md, Task 16): the O_STYLE member entry rule must append `*_benchmark_regime_gates(m)` AFTER its market-condition gates (as `_option_entry_rule` does), and the style members must be in `_PURE_OPTION_STRATEGIES` so `_apply_benchmark_regime` accepts them under `--benchmark-regime-gates`; add a stage-2 test that the flag-off rule is byte-identical and the flag-on rule appends exactly the two spy leaves last."* Hooks to reuse, none to change: `market_condition_templates.benchmark_regime_leaves(prefix)` (leaf/gene templates, registry-driven), launcher `_benchmark_regime_gates(m)` / `_apply_benchmark_regime(...)`. Genes would be `cond:<member>-spy-trend:mode` / `cond:<member>-spy-vol:mode`, so the stage-2 member prefix must be a valid leaf-id prefix.
+
 ---
 
 ## Open questions / risks
