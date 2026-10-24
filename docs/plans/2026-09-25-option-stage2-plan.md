@@ -131,6 +131,25 @@ Measured 2026-09-25:
    reached 36% of equity (TSLA 2020-07). Also owed: the cap checks only the NEW ticket
    (`_size_by_cost`), not the exposure already open on the same underlying. Propose the ranges to
    the user; do not change the stage-1 jobs or the 8082 instances.
+9. **No stock-price caps; bound by risk only** (user, 2026-10-24: "for stage 2 we need to remove this
+   and stick on the risk. For example it's ok to buy more expensive stock on long calls because we
+   just risk premium paid"). Stage 1 gated entries with the screener `price_max` per strategy
+   (`screener_gate_base` in `_OPTION_STRATS`, `testplatform/ba2test_launcher.py`): $100 for O_CSP,
+   O_WHEEL, O_JL and O_RS, $300 for O_SSTG/O_SSTD, none for the rest. Stage 2 drops every
+   `price_max` and lets sizing decide. A $500 stock is fine for a long call (the risk is the
+   premium) and is refused for a cash-secured put only when one contract's risk does not fit.
+   Before launch, check that each structure's sizing cost is its real worst-case risk:
+   - debit structures: the premium paid (already so);
+   - credit spreads / condors: the wing width minus the credit;
+   - CSP / wheel / ratio spread / jade lizard: the assignment notional (strike x 100 minus the
+     credit), not the premium. Otherwise an uncapped $500 name would size as if it were cheap.
+
+   `_size_by_cost` (`ba2_common/core/TradeActions.py`) sizes `floor(min(sizing budget,
+   per-instrument cap) / cost_per_contract)`. The `min_one_contract` floor still needs the
+   per-instrument cap and the room left on that underlying. So with the §3.8 cap ranges this is
+   the risk bound. Test it: one contract of a high-priced name is refused when its risk is
+   above the cap, and taken when it fits. Live parity: deployed full-collateral instances then
+   need no `screener_price_max` either.
 
 **Assignment-capacity rule changed mid stage 1 (dev 5a3fcc5c, 2026-10-15).** A long put of the same
 expiry now nets a short put down to the wing width; before, the full short strike was charged.
