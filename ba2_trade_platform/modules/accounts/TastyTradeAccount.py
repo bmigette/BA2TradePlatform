@@ -18,6 +18,7 @@ from sqlmodel import select
 from ...logger import logger
 from ...core.db import add_instance, get_db, get_instance, update_instance, InstanceNotFound
 from ...core.models import Position, TradingOrder, Transaction
+from ...core.pending_cancel import mark_pending_cancel
 from ...core.types import BrokerOrderErrorReason, OrderDirection, OrderStatus
 from ...core.types import OrderType as CoreOrderType
 from ...core.account_types import (
@@ -1410,7 +1411,7 @@ class TastyTradeAccount(AccountInterface):
         # refresh_orders promotes it once the broker confirms and the qty is actually
         # released -- same rule as AlpacaAccount.cancel_order.
         fresh_order = get_instance(TradingOrder, db_order.id)
-        fresh_order.status = OrderStatus.PENDING_CANCEL
+        mark_pending_cancel(fresh_order)
         update_instance(fresh_order)
         logger.info(
             f"[Account {self.id}] Requested cancel of TastyTrade order "

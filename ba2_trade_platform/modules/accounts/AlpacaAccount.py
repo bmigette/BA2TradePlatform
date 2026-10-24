@@ -16,6 +16,8 @@ from ...core.fmp_live_price import fetch_fmp_last_prices, FMPPriceError
 from ba2_providers.fmp_common import FMPHermeticViolation, redact
 from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
+from ...core.pending_cancel import (
+    mark_pending_cancel, get_pending_cancel_since, PENDING_CANCEL_SINCE_KEY)
 from ...core.types import (
     OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType, TransactionStatus,
     # Aliased: the module-level `AssetClass` imported above from alpaca.trading.enums is
@@ -1960,7 +1962,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if db_order_id:
                 db_order = get_instance(TradingOrder, db_order_id)
                 if db_order:
-                    db_order.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(db_order)   # status + the moment the cancel was SENT
                     update_instance(db_order)
 
             return True
@@ -3153,7 +3155,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 )
             ).all()
             pending = [
-                (r.id, r.broker_order_id, r.symbol, r.created_at) for r in rows
+                (r.id, r.broker_order_id, r.symbol, get_pending_cancel_since(r.data)) for r in rows
                 if r.broker_order_id is None or r.broker_order_id not in covered
             ]
             skipped_free = len(rows) - len(pending)
@@ -3173,6 +3175,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         def _oldest_first(row):
             age = self._order_age_hours(row[3])
             return (age is None, -age if age is not None else 0.0)
+
+        # LEGACY ROWS: PENDING_CANCEL with no recorded cancel moment (written before the
+        # stamp existed). Their true start is unknown; created_at is NOT it (it made every
+        # cancelled leg of a long-held position look 24 h old at once). Start the clock NOW:
+        # never reset on this pass, and say so once (the stamp ends the repetition).
+        for idx, (order_id, broker_order_id, symbol, since) in enumerate(pending):
+            if since is None:
+                since = self._stamp_legacy_pending_cancel(order_id, symbol)
+                pending[idx] = (order_id, broker_order_id, symbol, since)
 
         pending.sort(key=_oldest_first)
         if len(pending) > _PENDING_CANCEL_LOOKUP_BUDGET:
@@ -3260,6 +3271,24 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     f"Error reconciling PENDING_CANCEL order {order_id}: {e}", exc_info=True)
 
         return resolved_count
+
+    @staticmethod
+    def _stamp_legacy_pending_cancel(order_id: int, symbol) -> datetime:
+        """Record 'now' as the cancel moment of a PENDING_CANCEL row that has none."""
+        now = datetime.now(timezone.utc)
+        fresh = get_instance(TradingOrder, order_id)
+        if fresh is not None and fresh.status == OrderStatus.PENDING_CANCEL:
+            data = dict(fresh.data) if fresh.data else {}
+            if get_pending_cancel_since(data) is None:
+                data[PENDING_CANCEL_SINCE_KEY] = now.isoformat()
+                fresh.data = data
+                update_instance(fresh)
+                logger.warning(
+                    f"Order {order_id} ({symbol}) is PENDING_CANCEL with no pending_cancel_since "
+                    f"(legacy row): its true cancel time is unknown, so the "
+                    f"{_PENDING_CANCEL_MAX_AGE_HOURS}h timeout now starts from this moment "
+                    f"instead of from created_at")
+        return now
 
     def _write_pending_cancel_result(self, order_id: int, new_status, broker_order) -> bool:
         """Persist the broker's answer onto a PENDING_CANCEL order. Returns True if written.
@@ -5451,7 +5480,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if type_change_needed:
                 logger.info(f"Order type transition detected: {old_order_type} → {new_order_type.value}. Canceling old order and creating new one.")
                 # Can't replace when order type changes - must cancel and create new
-                existing_tp.status = OrderStatus.PENDING_CANCEL
+                mark_pending_cancel(existing_tp)
                 session.add(existing_tp)
                 
                 # Create new pending order with correct type
@@ -5468,7 +5497,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     depends_on_order=existing_tp.id,
                     open_type=OrderOpenType.AUTOMATIC,
                     comment=f"TP order (type change: {old_order_type}→{new_order_type.value}, pending cancel of {existing_tp.id})",
-                    data=existing_tp.data.copy() if existing_tp.data else {},
+                    data={k: v for k, v in (existing_tp.data or {}).items() if k != PENDING_CANCEL_SINCE_KEY},
                     created_at=datetime.now(timezone.utc)
                 )
                 session.add(new_tp)
@@ -5492,7 +5521,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     logger.warning(f"Cannot replace TP order {existing_tp.id} (error: {e}), creating PENDING_CANCEL order")
                     
                     # Mark existing order as PENDING_CANCEL
-                    existing_tp.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(existing_tp)
                     session.add(existing_tp)
                     
                     # Create new pending TP order to replace it
@@ -5509,7 +5538,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         depends_on_order=existing_tp.id,  # Depends on old order being cancelled
                         open_type=OrderOpenType.AUTOMATIC,
                         comment=f"TP order (pending cancel of {existing_tp.id})",
-                        data=existing_tp.data.copy() if existing_tp.data else {},
+                        data={k: v for k, v in (existing_tp.data or {}).items() if k != PENDING_CANCEL_SINCE_KEY},
                         created_at=datetime.now(timezone.utc)
                     )
                     session.add(new_tp)

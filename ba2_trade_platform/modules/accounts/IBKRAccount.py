@@ -39,6 +39,7 @@ from ...core.db import InstanceNotFound, add_instance, get_db, get_instance, upd
 from ...core.interfaces import AccountInterface
 from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ...core.models import Position, TradingOrder, Transaction
+from ...core.pending_cancel import mark_pending_cancel
 from ...core.types import (
     AssetClass as CoreAssetClass, BrokerOrderErrorReason, OrderDirection, OrderOpenType,
     OrderStatus)
@@ -1892,7 +1893,7 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
             for target in targets:
                 if results.get(target.broker_order_id):
                     fresh = get_instance(TradingOrder, target.id)
-                    fresh.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(fresh)
                     update_instance(fresh)
             if ok:
                 logger.info(f"[Account {self.id}] requested cancel of IBKR order "

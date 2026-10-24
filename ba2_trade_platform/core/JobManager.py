@@ -1687,15 +1687,29 @@ class JobManager:
                     if record is not None and record.enabled:
                         records[expert_id] = record
             runs = []
-            for record in records.values():
-                expert = get_expert_instance_from_id(record.id)
-                if expert is None:
-                    raise ValueError(f"Cannot load scheduled expert {record.id}")
+            for record in list(records.values()):
+                # ONE expert that cannot be loaded must not take down the whole cohort:
+                # entries are weekly, so a skipped expert costs a week. Skip it ALONE and
+                # loudly (it is dropped from ``records`` so it is neither registered nor
+                # dispatched); every other due expert still runs and the slot is claimed
+                # as for a clean group. Any exception type is a load failure here.
+                try:
+                    expert = get_expert_instance_from_id(record.id)
+                    if expert is None:
+                        raise ValueError(f"Cannot load scheduled expert {record.id}")
+                    uses_rm = expert_uses_risk_manager(type(expert))
+                    priority = validate_expert_priority(record.priority)
+                except Exception as e:
+                    del records[record.id]
+                    logger.error(
+                        f"Scheduled expert {record.id} FAILED TO LOAD for slot {slot} and is "
+                        f"SKIPPED (the other {len(records)} due expert(s) still run): "
+                        f"{type(e).__name__}: {e}", exc_info=True)
+                    continue
                 runs.append(ExpertRun(
                     batch_id=f"{record.id}_{scheduled_for.astimezone().strftime('%H%M_%Y%m%d')}",
                     cohort=slot, expert_id=record.id, account_id=record.account_id,
-                    priority=validate_expert_priority(record.priority),
-                    self_trading=not expert_uses_risk_manager(type(expert))))
+                    priority=priority, self_trading=not uses_rm))
             worker_queue = get_worker_queue()
             worker_queue._expert_priority.register(runs)
             self._dispatched_slots.add(slot)
