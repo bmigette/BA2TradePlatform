@@ -151,6 +151,26 @@ Measured 2026-09-25:
    above the cap, and taken when it fits. Live parity: deployed full-collateral instances then
    need no `screener_price_max` either.
 
+   **Turn the option risk manager on** (user, 2026-10-24). Set `risk_manager_mode =
+   classic_options` (`ba2_common/core/OptionRiskManagement.py`, one implementation for live and
+   backtest) on the stage-2 expert specs. A spec key, `risk_manager_mode`, is plumbed by the
+   launcher but selected by no shipped spec. Stage 1 never ran with it, so its rails become the
+   portfolio-level risk bound that the price cap used to approximate:
+   - `max_deployment_pct`: share of sleeve equity committed;
+   - `max_notional_leverage`;
+   - `undefined_risk_max_pct`: sub-cap on undefined-risk structures;
+   - `max_concurrent_structures`, plus one structure per underlying;
+   - `circuit_breaker_pct`: sleeve drawdown breaker; its latch gates entries in both runtimes.
+
+   Every required rail must be declared (an expert missing one is refused). Fix them first, then
+   search at most a few (e.g. `max_deployment_pct`, `circuit_breaker_pct`). The rest is not worth
+   their population cost.
+   - Update `test_no_shipped_expert_spec_selects_a_risk_manager_mode` deliberately.
+   - PILOT it in the §4 pilot: count the entries the RM refuses, and check that it does not
+     strangle the book (zero trades scores 0 and the GA can't tell why).
+   - Compare one stage-1 winner re-run with the RM on and off before trusting the rails.
+   - Deploying a stage-2 winner then needs the same rails on the 8082 instance.
+
 **Assignment-capacity rule changed mid stage 1 (dev 5a3fcc5c, 2026-10-15).** A long put of the same
 expiry now nets a short put down to the wing width; before, the full short strike was charged.
 O_BULLPS (opt 20) and every earlier stage-1 put-spread result ran under the OLD rule. Re-run them
