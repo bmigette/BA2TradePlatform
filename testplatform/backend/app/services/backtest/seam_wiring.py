@@ -606,6 +606,37 @@ def check_market_condition_window(config: Dict[str, Any], reader: Any) -> List[s
     return problems
 
 
+def named_field_leaves_in(config: Any, names: Any, path: str = "config") -> List[Tuple[str, str]]:
+    """``(label, field)`` for every condition leaf anywhere in ``config`` whose ``field`` is one of
+    ``names``. Walks dicts, lists and JSON-encoded rule trees held as strings; a string that names
+    a field but does not parse yields ``(path, "")`` so callers refuse rather than walk past it."""
+    import json
+
+    names = set(names)
+    hits: List[Tuple[str, str]] = []
+
+    def walk(node: Any, path: str) -> None:
+        if isinstance(node, dict):
+            field = node.get("field")
+            if isinstance(field, str) and field in names:
+                hits.append(((str(node["id"]) if node.get("id") else path), field))
+            for key, value in node.items():
+                walk(value, f"{path}.{key}")
+        elif isinstance(node, (list, tuple)):
+            for i, value in enumerate(node):
+                walk(value, f"{path}[{i}]")
+        elif isinstance(node, str) and node[:1] in ("{", "[") and any(f in node for f in names):
+            try:
+                decoded = json.loads(node)
+            except ValueError:
+                hits.append((path, ""))  # names a field, unparseable: refuse it too
+                return
+            walk(decoded, path)
+
+    walk(config, path)
+    return hits
+
+
 def market_condition_leaf_fields_in(config: Any, path: str = "config"
                                    ) -> List[Tuple[str, str]]:
     """``(label, field)`` for every condition leaf anywhere in ``config`` whose ``field`` is a
@@ -613,36 +644,13 @@ def market_condition_leaf_fields_in(config: Any, path: str = "config"
     has none. Walks dicts and lists, and JSON-encoded rule trees held as strings (expert
     settings store trees that way).
 
-    A string that NAMES a market field but does not parse as a tree yields ``(path, "")`` -- an
-    unservable field name, so every caller refuses it rather than walking past something it
+    A string that NAMES a market field but does not parse as a tree yields ``(path, "")`` --
+    an unservable field name, so every caller refuses it rather than walking past something it
     could not read."""
-    import json
-
     from ba2_common.core.market_conditions import PROFILES
 
-    fields = {f.name for prof in PROFILES.values() for f in prof.fields}
-    hits: List[Tuple[str, str]] = []
-
-    def walk(node: Any, path: str) -> None:
-        if isinstance(node, dict):
-            field = node.get("field")
-            if isinstance(field, str) and field in fields:
-                hits.append(((str(node["id"]) if node.get("id") else path), field))
-            for key, value in node.items():
-                walk(value, f"{path}.{key}")
-        elif isinstance(node, (list, tuple)):
-            for i, value in enumerate(node):
-                walk(value, f"{path}[{i}]")
-        elif isinstance(node, str) and node[:1] in ("{", "[") and any(f in node for f in fields):
-            try:
-                decoded = json.loads(node)
-            except ValueError:
-                hits.append((path, ""))  # names a market field, unparseable: refuse it too
-                return
-            walk(decoded, path)
-
-    walk(config, path)
-    return hits
+    return named_field_leaves_in(
+        config, {f.name for prof in PROFILES.values() for f in prof.fields}, path)
 
 
 def market_condition_leaves_in(config: Any) -> List[str]:

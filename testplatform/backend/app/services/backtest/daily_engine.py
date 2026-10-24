@@ -71,6 +71,7 @@ from ba2_common.core.types import (
 from ba2_common.core.OptionRiskManagement import (
     option_risk_manager_enabled, update_sleeve_breaker,
 )
+from ba2_common.core.benchmark_regime import reset_benchmark_regime, set_benchmark_regime
 from ba2_common.core.regime_overlay import reset_stressed, set_stressed
 from ba2_common.logger import logger
 
@@ -530,6 +531,8 @@ class DailyBacktestEngine:
         indicator_provider: Any = None,
         regime_calendar: Any = None,
         market_condition_record: Any = None,
+        benchmark_calendar: Any = None,
+        benchmark_regime_required: bool = False,
     ) -> None:
         self.account = account
         self.experts = experts
@@ -542,6 +545,12 @@ class DailyBacktestEngine:
         # or None when the benchmark history was unreadable. run() refuses to start in the
         # None case IF any expert enables the overlay -- see _check_regime_calendar.
         self._regime_calendar = regime_calendar
+        # SPY trend/vol regime for the ``spy-trend`` / ``spy-vol`` entry gates
+        # (ba2_common.core.benchmark_regime.BenchmarkRegimeCalendar), published per bar through its own
+        # seam. ``benchmark_regime_required`` is True when the run is gated: a missing calendar is then
+        # fatal (_check_regime_calendar); otherwise the run pays nothing and the seam stays None.
+        self._benchmark_calendar = benchmark_calendar
+        self._benchmark_regime_required = bool(benchmark_regime_required)
         # Per-day dynamic screener universe (screener-settings optimization). The optimizer's
         # trial config sets ``screener_runtime`` ({"store", "settings"[, "cadence_days"]}); when
         # absent (every non-screener run) this is None and the per-bar entry gate is a no-op, so
@@ -666,6 +675,14 @@ class DailyBacktestEngine:
         """
         from ba2_common.core.regime_overlay import overlay_enabled
 
+        if self._benchmark_regime_required and self._benchmark_calendar is None:
+            wanted = [eid for _expert, eid, _s, _r in self.experts]
+            raise RuntimeError(
+                f"the run is gated on the SPY benchmark regime (spy-trend / spy-vol) for expert "
+                f"instance(s) {wanted} but no benchmark regime calendar could be built: no SPY daily "
+                f"history could be read from the {resolve_job_history_source(self.config)} cache; the "
+                f"gates would read unknown everywhere and the GA would search dead genes. "
+                f"Pre-cache SPY daily bars and re-run.")
         if self._regime_calendar is not None:
             return
         wanted = [eid for expert, eid, _s, _r in self.experts if overlay_enabled(expert)]
@@ -675,6 +692,28 @@ class DailyBacktestEngine:
                 f"regime calendar could be built — the overlay would silently do nothing. "
                 f"Pre-cache the benchmark's daily bars (`ba2-test fetch-cache`) and re-run."
             )
+
+    def _warn_benchmark_warmup(self) -> None:
+        """One WARNING when the first decision day has no benchmark regime yet (warm-up): those bars
+        read unknown (a gate never passes on unknown), so the effective window is shorter than
+        configured. Says the first date a regime exists. NOT a refusal: warm-up is legitimate; only
+        TOTAL absence is fatal."""
+        cal = self._benchmark_calendar
+        if cal is None:
+            return
+        start = self.config["start_date"]
+        if cal.at(start).trend is not None and cal.at(start).vol is not None:
+            return
+        first = None
+        for d in cal._dates:
+            r = cal.at(d)
+            if r.trend is not None or r.vol is not None:
+                first = d
+                break
+        logger.warning(
+            f"benchmark regime: no regime is known at the run start {start}; the first date a regime "
+            f"exists is {first} (trend/vol need 210/524 SPY sessions of history). Gated entries read "
+            f"unknown (never pass) until then.")
 
     def run(self) -> Dict[str, Any]:
         """Run the full simulation and return a results dict (Task 5 ``build_results`` shape).
@@ -706,10 +745,12 @@ class DailyBacktestEngine:
         self._indicator_provider = indicator_provider
 
         self._check_regime_calendar()
+        self._warn_benchmark_warmup()
         self._validate_schedules_once()
         # Start from a clean regime even if a PREVIOUS trial in this worker died mid-loop and
         # never reached its own reset.
         reset_stressed()
+        reset_benchmark_regime()
 
         self._assert_daily_reads_are_clamped()
         days = trading_days(self.config["start_date"], self.config["end_date"], self.price)
@@ -818,6 +859,10 @@ class DailyBacktestEngine:
             #     the newest session whose daily data is knowable at this decision.
             set_stressed(self._regime_calendar.at(self.price.scan_cutoff_date(as_of_dt))
                          if self._regime_calendar else None)
+            #     The SPY benchmark regime rides the SAME lookup day (daily clock: this bar's date;
+            #     intraday: the last FINISHED session), so a 09:30 decision never reads the day's own close.
+            set_benchmark_regime(self._benchmark_calendar.at(self.price.scan_cutoff_date(as_of_dt))
+                                 if self._benchmark_calendar else None)
 
             # 2. universe for the bar: resolved LAZILY (``_bar_universes``) by the first expert pass that
             #    needs it, so a tick on which no expert is scheduled pays nothing for it. The equity
@@ -1016,6 +1061,7 @@ class DailyBacktestEngine:
         # worker across individuals -- clear it so the next trial cannot inherit this run's last
         # bar before its own first set_stressed.
         reset_stressed()
+        reset_benchmark_regime()
         # Task 13: the same ledger check once more at run end (open_at_end rows are priced from
         # the transactions, the final equity from the ledger).
         if (hasattr(self.account, "check_option_ledger")
