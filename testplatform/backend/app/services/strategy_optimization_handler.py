@@ -3181,6 +3181,11 @@ def _build_daily_trial_config(
         #   Decoded through the ONE reader of both shapes, so a genome persisted before Task 10
         #   (singular ``market_condition_profile``/``_manifest``) re-runs unchanged.
         **_market_condition_trial_pins(backtest_cfg),
+        # SPY regime gates (--benchmark-regime-gates): the run-level opt-in the backtest handler
+        # reads to build and publish the SPY regime calendar. Written ONLY when on, so the trial
+        # config of every existing run stays key-for-key identical. The calendar itself is NOT
+        # shipped: each worker builds it from its own local cache, like StressedCalendar.
+        **({"benchmark_regime_gates": True} if backtest_cfg.get("benchmark_regime_gates") else {}),
         # This config was assembled by the OPTIMIZER (GA trial, re-run, robustness variant or
         # top-N persist), not by the single-backtest path. The market-condition seam reads it to
         # tell "a research run may compute on a miss" from "a search may not".
