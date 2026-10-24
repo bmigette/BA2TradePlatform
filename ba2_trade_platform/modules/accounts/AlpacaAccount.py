@@ -12,6 +12,7 @@ import time
 import threading
 import functools
 
+from ...core.fmp_live_price import fetch_fmp_last_prices
 from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
 from ...core.types import (
@@ -451,10 +452,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             "data_feed": {
                 "type": "str",
                 "required": False,
-                "default": "delayed_sip",
-                "description": "Alpaca market data feed",
-                "valid_values": ["delayed_sip", "sip", "iex", "otc"],
-                "tooltip": "delayed_sip = 15-min delayed (free tier). sip = real-time consolidated (paid). iex = real-time IEX (paid). otc = OTC data.",
+                "default": "fmp",
+                "description": "Live stock price source",
+                "valid_values": ["fmp", "delayed_sip", "sip", "iex", "otc"],
+                "tooltip": "fmp = real-time FMP quote (last price; needs the FMP API key; never falls back to Alpaca). delayed_sip = 15-min delayed (free Alpaca tier). sip = real-time consolidated (paid). iex = real-time IEX (paid). otc = OTC data.",
             },
             "options_feed": {"type": "str", "required": False, "default": "indicative",
                              "valid_values": ["indicative", "opra"],
@@ -2886,6 +2887,19 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         
         return results
 
+    def _fmp_current_price(self, symbol_or_symbols):
+        """FMP last price(s); None for any symbol FMP did not price (never another source)."""
+        single = isinstance(symbol_or_symbols, str)
+        symbols = [symbol_or_symbols] if single else list(symbol_or_symbols)
+        try:
+            prices = fetch_fmp_last_prices(symbols)
+        except Exception as e:
+            logger.error(f"[Account {self.id}] FMP price feed failed for {symbols}: {e}", exc_info=True)
+            prices = {}
+        if single:
+            return prices.get(symbol_or_symbols)
+        return {s: prices.get(s) for s in symbols}
+
     @alpaca_api_retry
     def _get_instrument_current_price_impl(self, symbol_or_symbols, price_type='bid'):
         """
@@ -2906,6 +2920,19 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 - If symbol_or_symbols is str: Returns Optional[float] (single price or None)
                 - If symbol_or_symbols is List[str]: Returns Dict[str, Optional[float]] (symbol -> price mapping)
         """
+        feed_setting = (self.settings.get("data_feed") or "fmp").lower()
+        feed_names = ("fmp", "delayed_sip", "sip", "iex", "otc")
+        if feed_setting not in feed_names:
+            raise ValueError(
+                f"Unknown Alpaca data_feed {feed_setting!r} (account {self.id}); "
+                f"valid values: {', '.join(feed_names)}")
+
+        if feed_setting == "fmp":
+            # Real-time FMP /quote LAST price for every price_type: FMP /quote has no bid/ask,
+            # and the Alpaca path below already prefers the last trade over bid/ask whenever one
+            # exists, so bid/ask/mid/mark all mean "last" here. No Alpaca call, no fallback.
+            return self._fmp_current_price(symbol_or_symbols)
+
         if not self._check_authentication():
             # Return appropriate type based on input
             if isinstance(symbol_or_symbols, str):
@@ -2927,14 +2954,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             is_single_symbol = isinstance(symbol_or_symbols, str)
             symbols_list = [symbol_or_symbols] if is_single_symbol else symbol_or_symbols
 
-            feed_setting = (self.settings.get("data_feed") or "delayed_sip").lower()
             feed_map = {
                 "delayed_sip": DataFeed.DELAYED_SIP,
                 "sip": DataFeed.SIP,
                 "iex": DataFeed.IEX,
                 "otc": DataFeed.OTC,
             }
-            feed = feed_map.get(feed_setting, DataFeed.DELAYED_SIP)
+            feed = feed_map[feed_setting]
 
             # Fetch last trade prices — these match what the Alpaca broker displays and are
             # reliable even for thinly traded stocks where bid/ask can be stale.
