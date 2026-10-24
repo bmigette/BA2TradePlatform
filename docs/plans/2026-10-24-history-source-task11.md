@@ -51,13 +51,40 @@ Facts the design rests on (all from the code):
 
 ---
 
-## Task 0: Owner decisions that change the code (read before Task 1)
+## Task 0: Owner decisions (2026-10-24, ANSWERED; they override the drafts below)
 
-No code. Confirm or override the defaults below (they are the plan's assumptions; the full list is "Open questions").
-1. Live top-up writes IN PLACE into `CACHE_FOLDER/AlpacaHistoryOHLCVProvider/` (the spec). Default taken.
-2. `alpaca` is accepted only on accounts that hold Alpaca keys (AlpacaAccount). TastyTrade / IBKR carry the setting
-   (spec) but `alpaca` on them refuses with a named error until the owner chooses a key source. Default taken.
-3. `TradeManager` SPY regime read (global, account-less) stays FMP. Default taken.
+1. **Live bars append IN PLACE, UNGATED.** Live-fetched Alpaca bars are appended to `CACHE_FOLDER/AlpacaHistoryOHLCVProvider/`
+   files (no overlay folder, no build-gate verification on top-ups). Backtests past the build end (2026-10-12) may read
+   live-appended bars; the owner accepts this. Safety kept: finished sessions only (`ohlcv_final_bars`), the split table
+   applied (`build.adjust`), never a silent basis mix (per-symbol effective basis in the manifest, see 3), a cross-process
+   per-symbol file lock against concurrent writers (readers rely on `os.replace` atomicity).
+   **Continuity rule (owner addition, hard):** an append starts at the FIRST regular NYSE session after the file's last bar
+   (holidays / half days / weekends are not gaps; `ba2_common.core.market_calendar`) and covers EVERY finished session up
+   to the newest one. Alpaca's series missing any session in that range -> append NOTHING for that symbol/interval, log
+   ERROR naming symbol, interval and the missing sessions, file untouched, the next refresh retries. No duplicate /
+   overlapping rows (an already-present session is not re-appended); timestamps strictly increasing after the append. A file
+   more than `MAX_BACKFILL_SESSIONS = 30` sessions behind is still back-filled in one contiguous append if Alpaca returns the
+   full range; beyond that it is refused (named error). 5-min files: every appended SESSION must be present; Alpaca emits no
+   bar for a slot without trades, so slots are NOT required. Chosen completeness rule = the build's own
+   (`tools/alpaca_history_download.py`, `days_without_intraday_bars`: every session that has a daily bar must have at least one
+   regular-session 5-min bar), regular session only (09:30..15:55 starts, `build.to_native_5min`); the build's selfcons check
+   (`verify.SELFCONS_TOL`, last 5-min close vs daily close) is a report there, not a rejection, so it is not one here either.
+2. **ATR follows the account's history source.** `alpaca` accounts read ATR from the Alpaca history; `fmp` accounts keep the
+   yfinance stack (no behaviour change on deploy). (Task 7/8.)
+3. **Live splits EXTEND `_meta/build_manifest.json` directly** (no `live_state.json`): a re-base appends the accepted event to
+   the symbol's `events.splits` (and sets `live.effective`), atomically, under a lock, with a `.bak` backup, idempotently.
+   Consequences the implementer MUST handle (found while reading `verify.py` / `option_split_basis.py`): (a) the PASS gate
+   certificate pins `sha256(build_manifest.json)`, so every manifest extension re-stamps `gate_certificate.json`
+   (`build_manifest_sha256`, plus `live_extended_at`) in the same locked section, backing it up too; (b) the option check
+   compares the table's events with the manifest's, so the corporate-actions job (Task 6) must extend `split_table.json` for the
+   same event and update `manifest["split_table"]["sha256"]` in the same transaction. Plain top-ups do NOT touch the manifest
+   (8 MB; only a re-base changes the basis).
+4. **Rollout:** ALL accounts switch to `alpaca` at once after deploy (dev 1-3, prod 1, options 1 Alpaca accounts). The
+   operator switches them, not the implementer. Consequence: a symbol absent from the build is refused (loud), see Task 12.
+
+Defaults kept: global regime-overlay SPY read stays FMP; TastyTrade/IBKR refuse `alpaca` (no Alpaca keys); the
+corporate-actions job covers only symbols held/traded by `alpaca` accounts at 08:30 ET; symbols not in the build are refused
+rather than backfilled; the 5-minute top-up stays.
 
 ---
 
@@ -154,11 +181,12 @@ now_utc, symbol) -> (merged, report)`:
    `ohlcv_final_bars.session_is_final(symbol, day, now)` (daily; for 5-min the last bar whose interval ended and is final).
    NEVER a session that is not final (the free key's 15-min SIP delay and settlement then never touch history).
 2. `raw_new` rows dated outside that range -> `TopUpRefused` (a forming bar is never written; `native_cache` also drops it).
+2b. **Continuity (Task 0 item 1):** `expected_sessions(symbol, after_last_bar, newest_final)` from the NYSE calendar; any expected session missing from `raw_new` (daily), or without >= 1 regular 5-min bar (5min), -> `TopUpGap` (ERROR log naming symbol/interval/sessions), nothing appended. Rows already present are dropped, never re-appended; the result must be strictly increasing. More than `MAX_BACKFILL_SESSIONS` (30) behind -> `TopUpTooFarBehind`.
 3. Adjust `raw_new` with `build.adjust(raw_new, [e for e in events if e.date > bar_date])`: for bars after the last
    known event the factor is 1; events dated AFTER the cache end exist only if the refresh job already accepted them
    (Task 5), and then the file was re-based first (Task 4), so the invariant holds: **file and appended bars are on ONE
    basis = "all accepted events with date <= `effective` applied"**.
-4. Overlap check, the existing guard: ask the fetcher for the last `ohlcv_topup_guard.TOPUP_OVERLAP_BARS` CACHED
+4. (Owner decision 1: UNGATED. The overlap probe + `verify_topup` below is dropped; the seam/unexplained-jump check in 5 is the only price check.) Draft, superseded: Overlap check, the existing guard: ask the fetcher for the last `ohlcv_topup_guard.TOPUP_OVERLAP_BARS` CACHED
    sessions as well, adjust them the same way, and `verify_topup` against the cache; `basis_change` /
    `vendor_unadjusted` / `unexplained` / `no_overlap` -> `OHLCVTopUpRefused` (nothing written), exactly like FMP.
 5. Unexplained raw overnight jump at the seam (the first appended Open vs the last cached Close beyond
@@ -190,20 +218,19 @@ def test_5min_rth_only_and_78_bars(...)
 - Test `packages/providers/tests/test_alpaca_history_live_state.py` (new)
 
 Pieces:
-- **Basis record** `_meta/live_state.json`: `{"schema":1,"store_asof":"2026-10-12","symbols":{SYM:{"effective":"2026-10-12","events":[[date,factor],...],"last_topup":"..."}}}`.
+- **Basis record = the build manifest (owner decision 3):** `_meta/build_manifest.json` `symbols[SYM].events.{splits,spinoffs}` is the basis of the files; `symbols[SYM].live = {"effective": date of the last re-base}` is added by a re-base. (Superseded draft: `live_state.json`; not created.)
   `effective` = the date through which accepted events are applied to that symbol's files. Read on every top-up; a file
   whose record is missing is initialised from `build_manifest.json` (`store_asof`, `symbols[S].events`), never guessed.
-  (`build_manifest.json` itself is NOT rewritten: Task 12 option split basis cross-checks it against `split_table.json`.
-  Open question 6.)
+  (The manifest IS extended by a re-base, with `.bak`, lock, atomic replace, certificate re-stamp; see Task 0 item 3.)
 - **Lock**: `locked_symbol(cache_dir, symbol)` context manager, cross-process (`os.open(O_CREAT|O_EXCL)` lock file under
   `_meta/locks/<SYM>.lock` with pid + timestamp, stale-lock takeover after N minutes with a WARNING; no new dependency).
   Held across read-check-fetch-write of ONE symbol (both intervals). Readers (backtests, `native_cache.read_timeseries`)
   take NO lock: they rely on `os.replace` atomicity (a reader sees the old or the new complete file). Test that.
-- **Re-base** `rebase_symbol(cache_dir, symbol, new_events)`: under the lock, for BOTH files divide pre-event prices by the
+- **Re-base** `rebase_symbol(cache_dir, symbol, new_events)` (also: `file basis != manifest` detection): under the lock, for BOTH files divide pre-event prices by the
   new factor and multiply volume (`build.adjust` with only the new events), write each file atomically via
   `native_cache.write_timeseries` (so the final-bar rule applies), THEN update the basis record. Crash between the file
   writes and the record: the next call detects `file basis != record` by comparing the seam ratio at the event date and
-  REFUSES (named `BasisRecordMismatch`), never re-divides blindly. Order: daily file, 5-min file, record.
+  REFUSES (named `BasisRecordMismatch`), never re-divides blindly. Order: daily file, 5-min file, manifest (+ certificate).
 - Idempotence: re-basing for an event already in `record.events` is a no-op returning `False`.
 
 **Step 1: failing tests** (tmp cache dir, real parquet):
@@ -477,7 +504,9 @@ Commit `test(history): BT/live parity for the Alpaca live top-up and re-base`.
 - Code-review subagent on the branch diff; fix.
 - Commit `chore: versions for task 11 (APP, ba2_common, ba2_providers[, ba2_experts])`.
 
-## Task 12: Deploy steps (owner decides the values; default `fmp` = no behaviour change)
+## Task 12: Deploy steps
+
+> Owner 2026-10-24: after deploy ALL accounts (dev 1-3, prod 1, options 1 Alpaca accounts) are switched to `alpaca` at once by the operator. A symbol not in the build is then refused; quantify it first (see the Task 1-5 report). (owner decides the values; default `fmp` = no behaviour change)
 
 1. Merge only with no masters mid-job (CLAUDE.md boundary checklist item 5); push; confirm `unsyncable_reason` is silent.
 2. **Backups first** on each instance: `python tools/backup_dbs.py` (prod + test DBs, daily task writes to
@@ -523,21 +552,14 @@ Commit `test(history): BT/live parity for the Alpaca live top-up and re-base`.
    change for those accounts only; `fmp` accounts keep yfinance (no change on deploy).
 8. **Stale lock files** after a crash: takeover rule + WARNING; tested.
 
-## Open questions for the owner
+## Open questions for the owner (ANSWERED 2026-10-24, see Task 0)
 
-1. Where do live bars live: append in place in `AlpacaHistoryOHLCVProvider/` (spec, default taken) or a separate overlay
-   folder that backtests never see (safer for reproducibility and cache push, costs a two-folder read)?
-2. ATR/indicator history: it is `yfinance` today for the classic RM / SmartRM, not FMP. Should `alpaca` accounts' ATR follow
-   the account (plan) and should `fmp` accounts keep yfinance (plan), or move to FMP?
-3. TradeManager regime overlay SPY read (global, account-less): stay FMP (plan) or follow the SPY gate decision?
-   The SPY gate stays FMP by your 2026-10-24 decision; Task 11 does not change it.
-4. TastyTrade / IBKR carry the setting but have no Alpaca keys: refuse `alpaca` there (plan), or add a "market-data keys
-   from account X" setting / separate keys entry?
-5. Corporate-actions job: symbols = held + traded by `alpaca` accounts (plan) vs the whole store; time 08:30 ET OK?
-6. May the live job extend `build_manifest.json` events (breaks the Task 12 hash cross-check) or must it keep
-   `live_state.json` separate (plan) and teach the option basis resolver to read it?
-7. A symbol not in the build (new IPO, new listing): refuse `SymbolNotInHistory` (plan) or backfill from Alpaca raw +
-   split table on first read (needs the daily-2016 store logic live)?
-8. 5-minute live top-up: included (Task 3/5) because the provider serves both intervals; drop it if no live site reads
-   intraday history from an `alpaca` account.
-9. Rollout order and the first `alpaca` account (dev paper?) are yours; nothing is switched by this plan.
+1. ANSWERED: append in place, ungated, continuity rule.
+2. ANSWERED: alpaca accounts' ATR from Alpaca history; fmp accounts keep yfinance.
+3. Default kept: SPY regime read stays FMP.
+4. Default kept: TastyTrade/IBKR refuse `alpaca`.
+5. Default kept: held/traded symbols of alpaca accounts, 08:30 ET.
+6. ANSWERED: extend `build_manifest.json` directly (plus certificate re-stamp and split table, Task 0 item 3).
+7. Default kept: symbols not in the build are refused.
+8. Default kept: 5-min top-up stays (build completeness rule).
+9. ANSWERED: all accounts switch to `alpaca` at once after deploy, by the operator (Task 12).
