@@ -242,6 +242,8 @@ _last_gen_full_results_by_opt: Dict[int, Dict[str, Any]] = {}
 # Seconds between ctl-proxy reads on the progress hook. Module-level so tests can drop it to 0;
 # see _cancel_progress_cb for why reading a Manager proxy per call is not acceptable.
 _CANCEL_CHECK_INTERVAL_S = 5.0
+#: Longest traceback carried back in a failed trial's result (master log + /job-status).
+_TRACEBACK_MAX_CHARS = 6000
 
 
 class TrialCancelled(Exception):
@@ -462,8 +464,18 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         fatal = job_fatal(e)
         snap = _trial_memory_snapshot()
         snap["option_overlays"] = released
+        # The traceback TRAVELS with the result (a pool child's own logging is disabled, so the
+        # result dict -- and, for a remote worker, /job-status -- is the only channel the master
+        # has). Bounded: it rides the pickled/JSON payload of every failed trial.
+        import traceback as _tb
+        _tb_text = _tb.format_exc()[-_TRACEBACK_MAX_CHARS:]
+        try:
+            from app.services.backtest import price_source as _ps
+            _ps._worker_log(f"!! trial raised {type(e).__name__}: {e}\n{_tb_text}")
+        except Exception:  # noqa: BLE001 -- the worker log channel must never mask the trial error
+            pass
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
-                "fatal": fatal,
+                "fatal": fatal, "traceback": _tb_text,
                 # The exception TYPE travels with the result (a remote worker's result is a plain
                 # dict over the wire, never the exception object), so the master can classify by
                 # type and not only by the ``fatal`` flag a worker computed from ITS OWN copy of the
@@ -1380,6 +1392,41 @@ def summarise_analysis_failures(opt_name: str, all_results: list) -> Optional[Di
     return agg
 
 
+class _TrialErrorTally:
+    """Per-generation record of trials that FAILED (raised, or reported ``ok: False``).
+
+    A failed trial is still scored as a failure (ZERO_TRADE_SENTINEL) -- that is unchanged -- but
+    it is never silent: ``record`` logs each one at ERROR with the genome key/params, where it
+    ran, the exception type, message and traceback; ``summary`` is the one line the generation
+    summary carries (count + types), so a defect that hits many trials reads as a defect and not
+    as a poor population.
+    """
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.types: Dict[str, int] = {}
+
+    def record(self, out: Dict[str, Any], key: Any, flat: Dict[str, Any], gen: Optional[int] = None,
+               n_gens: Optional[int] = None) -> None:
+        self.n += 1
+        etype = str(out.get("error_type") or "error")
+        self.types[etype] = self.types.get(etype, 0) + 1
+        where = f"gen {gen + 1}/{n_gens} " if gen is not None and n_gens else ""
+        mem = out.get("mem")
+        logger.error(
+            f"TRIAL ERROR {where}[{etype}] on {out.get('origin') or 'unknown origin'}: "
+            f"{out.get('error') or 'no error text'} | key {key} | params "
+            f"{_json.dumps(flat, default=str, sort_keys=True)[:400]}"
+            + (f" | worker mem: {mem}" if mem else "")
+            + (f"\n{out['traceback']}" if out.get("traceback") else ""))
+
+    def summary(self, total: int) -> str:
+        if not self.n:
+            return f"0 trial error(s) of {total}"
+        kinds = ", ".join(f"{t} x{c}" for t, c in sorted(self.types.items()))
+        return f"{self.n} of {total} trial(s) FAILED ({kinds})"
+
+
 def _abort_on_fatal_trial(out: Dict[str, Any], fatal: Dict[str, Any], key: Any, flat: Dict[str, Any]) -> None:
     """The master's rule for a FAILED trial result: if it is job-fatal (the worker's ``fatal`` flag, or
     its ``error_type`` in ``JOB_FATAL_ERROR_TYPES``), record the reason (naming the trial that tripped it)
@@ -2004,6 +2051,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 if tq.is_task_paused(task_id):
                     raise InterruptedError("paused/cancelled")
                 fits: list = [None] * len(param_dicts)
+                tally = _TrialErrorTally()
                 jobs = []  # (idx, decoded_flat, key, config)
                 n_gens = 1 if brute_force else int(ga["generations"])
                 is_last_gen = False if brute_force else gen_state["gen"] == n_gens - 1
@@ -2174,10 +2222,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         else:
                             fit = ZERO_TRADE_SENTINEL
                             fits[i] = fit
-                            if out.get("error"):
-                                mem = out.get("mem")
-                                logger.warning(f"trial failed in worker: {out['error']}"
-                                               + (f" | worker mem: {mem}" if mem else ""))
+                            if out.get("error") or out.get("error_type") or out.get("traceback"):
+                                tally.record(out, key, flat, gen=gen, n_gens=n_gens)
                                 # A job-fatal trial (``JOB_FATAL_ERROR_TYPES``, by flag OR by the TYPE the
                                 # worker sent back) ends the JOB at once:
                                     # ABORT NOW, not at the end. A fatal is a DATA/CONFIG problem --
@@ -2228,6 +2274,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 # blind and the makespan win is imaginary, which is worth seeing in the log
                 # instead of inferring from wall times months later.
                 _cost_model.report(gen, n_gens)
+                # Per-generation error count, ALWAYS (a zero is information too). WARNING level:
+                # the run installs logging.disable(INFO).
+                (logger.error if tally.n else logger.warning)(
+                    f"Gen {gen + 1}/{n_gens} trial errors: {tally.summary(total_in_batch)}")
                 return fits
 
             return batch_fitness
