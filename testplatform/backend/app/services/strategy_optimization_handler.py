@@ -716,6 +716,79 @@ class MemoryGovernor:
 _ABANDON_KILL_GRACE_S = 5.0
 
 
+def _dispatch_with_stall_guard(jobs, pool, worker_fn, metric, stall_s: float, max_retries: int,
+                               clock=None):
+    """Feed ``jobs`` ((idx, flat, key, config)) to ``pool`` keeping every slot busy, YIELDING
+    ``(idx, flat, key, out)`` as each resolves, with a PER-TRIAL stall guard.
+
+    P6 (2026-10-24). The guard used to be one ``wait(timeout=stall_s)`` over the whole in-flight
+    set: when nothing completed for ``stall_s`` EVERY pending trial -- including ones that had
+    started seconds before -- was written off at ``STALLED_SENTINEL``, and the handler memoized
+    that sentinel so the genome was never evaluated again in the job. Now each trial has its own
+    clock (time since it was handed to its slot). One past ``stall_s`` has its slot respawned
+    (``pool.abandon_slot``) and is RE-QUEUED, up to ``max_retries`` times, before it is yielded as
+    ``stalled`` (for that generation only; the handler does not memoize it). Every step is logged
+    at ERROR.
+    """
+    from concurrent.futures import wait as _fwait, FIRST_COMPLETED
+    from collections import deque
+    clock = clock or _time.monotonic
+    jobs = list(jobs)
+    queue = deque(range(len(jobs)))
+    attempts = [0] * len(jobs)
+    pending: dict = {}      # future -> (position in jobs, started_at)
+    while queue or pending:
+        for slot in pool.idle_slots():
+            if not queue:
+                break
+            pos = queue.popleft()
+            attempts[pos] += 1
+            pending[pool.submit(slot, worker_fn, jobs[pos][3], metric)] = (pos, clock())
+        if not pending:
+            break
+        now = clock()
+        timeout = max(0.0, min(st for _, st in pending.values()) + stall_s - now)
+        done, _ = _fwait(list(pending), timeout=timeout, return_when=FIRST_COMPLETED)
+        for fut in done:
+            pos, _st = pending.pop(fut)
+            pool.mark_done(fut)
+            i, flat, key, _cfg = jobs[pos]
+            yield (i, flat, key, fut.result())
+        now = clock()
+        for fut, (pos, st) in list(pending.items()):
+            if fut in done or now - st < stall_s:
+                continue
+            del pending[fut]
+            i, flat, key, _cfg = jobs[pos]
+            slot = pool.abandon_slot(fut)
+            if attempts[pos] <= max_retries:
+                logger.error(
+                    f"LOCAL POOL STALLED: individual {i} (key {str(key)[:12]}) made no progress "
+                    f"in {stall_s:.0f}s on attempt {attempts[pos]}/{max_retries + 1}; slot {slot} "
+                    f"respawned, trial REQUEUED (attempt {attempts[pos] + 1}/{max_retries + 1})")
+                queue.appendleft(pos)
+                continue
+            from app.services.strategy_fitness import STALLED_SENTINEL
+            logger.error(
+                f"LOCAL POOL STALLED: individual {i} (key {str(key)[:12]}) stalled on all "
+                f"{attempts[pos]} attempt(s) of {stall_s:.0f}s -> scored {STALLED_SENTINEL:.0e} "
+                f"(STALLED) for this generation only (NOT memoized); slot {slot} respawned, "
+                f"job CONTINUES")
+            yield (i, flat, key, {
+                "ok": False,
+                "stalled": True,
+                "fitness": STALLED_SENTINEL,
+                "fitness_raw": STALLED_SENTINEL,
+                "trades": 0,
+                "total_return": 0.0,
+                "max_drawdown": 0.0,
+                "secs": stall_s * attempts[pos],
+                "slot": slot,
+                "attempts": attempts[pos],
+                "error": f"stalled: no progress in {stall_s:.0f}s on {attempts[pos]} attempt(s)",
+            })
+
+
 class _SlotPools:
     """One SINGLE-WORKER pool per slot, so a worker can be recycled without a global barrier.
 
@@ -1903,65 +1976,14 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             recycle happens while that slot is idle and the other slots keep running. There is no
             chunk barrier and no point at which the fleet waits on one slow genome.
             """
-            from concurrent.futures import wait as _fwait, FIRST_COMPLETED
-            # STALL GUARD. If a pool ever wedges again this must abort loudly rather than sit in
-            # wait() forever with no error and no log line (opt 328 sat 2h25m). Sized off the
-            # slowest trial actually observed here (1104s) with a wide margin.
+            # STALL GUARD, PER TRIAL (see _dispatch_with_stall_guard). If a pool ever wedges this
+            # must recover loudly rather than sit in wait() forever (opt 328 sat 2h25m). Sized off
+            # the slowest trial actually observed here (1104s) with a wide margin. A stalled
+            # trial is re-queued BT_LOCAL_STALL_RETRIES times before it is scored as stalled.
             _stall_s = float(_os.getenv("BT_LOCAL_STALL_TIMEOUT_S", "5400"))
-            jobs = list(jobs)
-            pending: dict = {}      # future -> (idx, flat, key)
-            nxt = 0
-            while nxt < len(jobs) or pending:
-                for slot in _pool.idle_slots():
-                    if nxt >= len(jobs):
-                        break
-                    i, flat, key, cfg = jobs[nxt]
-                    nxt += 1
-                    pending[_pool.submit(slot, _trial_worker, cfg, opt.fitness_metric)] = (
-                        i, flat, key)
-                if not pending:
-                    break
-                done, _ = _fwait(list(pending), timeout=_stall_s,
-                                 return_when=FIRST_COMPLETED)
-                if not done:
-                    # SURGICAL STALL RECOVERY (2026-09-21, operator decision: "a stall should not
-                    # kill grid"). The old behaviour raised TimeoutError, which failed the WHOLE
-                    # job: one wedged genome killed a 16-job matrix at job 1/16 (2026-09-20
-                    # 21:54Z) and cost 7.5h of downtime. Now the wedged individual is scored at
-                    # STALLED_SENTINEL -- a value DISTINCT from the other sentinels so the
-                    # frequency stays countable in all_results -- and its slot is RESPAWNED (the
-                    # wedged worker is terminated, see _SlotPools.abandon_slot) so the next
-                    # generation cannot inherit a dead slot. The job continues.
-                    from app.services.strategy_fitness import STALLED_SENTINEL
-                    n_stalled = len(pending)
-                    for fut in list(pending):
-                        i, flat, key = pending.pop(fut)
-                        slot = _pool.abandon_slot(fut)
-                        logger.error(
-                            f"LOCAL POOL STALLED: individual {i} (key {str(key)[:12]}) made no "
-                            f"progress in {_stall_s:.0f}s -> scored {STALLED_SENTINEL:.0e} "
-                            f"(STALLED), slot {slot} respawned; job CONTINUES")
-                        yield (i, flat, key, {
-                            "ok": False,
-                            "stalled": True,
-                            "fitness": STALLED_SENTINEL,
-                            "fitness_raw": STALLED_SENTINEL,
-                            "trades": 0,
-                            "total_return": 0.0,
-                            "max_drawdown": 0.0,
-                            "secs": _stall_s,
-                            "slot": slot,
-                            "error": f"stalled: no progress in {_stall_s:.0f}s",
-                        })
-                    logger.error(
-                        f"LOCAL POOL STALLED: {n_stalled} individual(s) marked STALLED "
-                        f"({STALLED_SENTINEL:.0e}) after {_stall_s:.0f}s; slots respawned, "
-                        f"job continues")
-                    continue
-                for fut in done:
-                    i, flat, key = pending.pop(fut)
-                    _pool.mark_done(fut)
-                    yield (i, flat, key, fut.result())
+            _stall_retries = int(_os.getenv("BT_LOCAL_STALL_RETRIES", "2"))
+            yield from _dispatch_with_stall_guard(
+                jobs, _pool, _trial_worker, opt.fitness_metric, _stall_s, _stall_retries)
 
         def make_batch_fitness(execute_jobs, brute_force: bool = False):
             """*brute_force* (the exhaustive grid's single batch, see _evaluate_brute_force_batch)
@@ -2122,17 +2144,17 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         # of the genome, so a re-selection should re-run it.
                         from app.services.strategy_fitness import ZERO_TRADE_SENTINEL
                         if out.get("stalled"):
-                            # A STALL is not a genome property either, but it IS reproducible
-                            # in-process: this genome wedged once, so re-selecting it would burn
-                            # another _stall_s of the batch -- up to 8-15 generations of it. So:
-                            # score it at the DEDICATED sentinel (distinct, so the frequency is
-                            # COUNTABLE in all_results -- the operator asked to see how often this
-                            # happens), memoize it, and record it. A crash stays un-memoized below.
+                            # A STALL is not a measurement of the genome: it already got
+                            # BT_LOCAL_STALL_RETRIES fresh attempts (_dispatch_with_stall_guard).
+                            # Scored at the DEDICATED sentinel (distinct, so the frequency is
+                            # COUNTABLE in all_results) for THIS generation only. NOT memoized
+                            # (P6, 2026-10-24): a memoized sentinel blocked every later
+                            # generation from ever re-evaluating the genome. NOT reported to the
+                            # GA as an evaluated individual either, so a mid-generation
+                            # checkpoint re-runs it after a restart, like a crash.
                             from app.services.strategy_fitness import STALLED_SENTINEL
                             fit = STALLED_SENTINEL
                             fits[i] = fit
-                            memo.put(key, fit)
-                            _report_trial_result(on_result, i, fit)
                             all_results.append({
                                 "params": flat, "fitness": fit, "key": key, "trades": 0,
                                 "fitness_raw": fit, "robustness": None,
@@ -2145,8 +2167,9 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                                 "status": "stalled",
                                 "stall_reason": out.get("error"),
                                 "stall_secs": out.get("secs"),
-                                "stall_slot": out.get("slot")})
-                            logger.error(f"trial STALLED (scored {fit:.0e}, memoized): "
+                                "stall_slot": out.get("slot"),
+                                "stall_attempts": out.get("attempts")})
+                            logger.error(f"trial STALLED (scored {fit:.0e}, NOT memoized): "
                                          f"{out.get('error')}")
                         else:
                             fit = ZERO_TRADE_SENTINEL
