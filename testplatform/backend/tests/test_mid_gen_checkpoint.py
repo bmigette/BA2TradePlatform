@@ -520,10 +520,10 @@ def test_a_boundary_resume_re_evaluates_nothing():
     fitness was persisted, invalid_ind was the entire population and every resume re-ran it:
     ~3h of compute on the small cap band, for a result the checkpoint already contained.
 
-    (The resumed generation does no NEW work either way -- the checkpoint is taken before
-    selection/crossover, so that generation's offspring were never persisted. That lost
-    generation is pre-existing behaviour; what changes here is that it now costs nothing
-    instead of a full round of backtests.)
+    (Since the P5 fix a boundary resume BREEDS first: the checkpoint is taken before
+    selection/crossover, so the next generation's offspring are the only individuals that need
+    scoring. The elites and every carried-over individual keep their persisted fitness; the
+    resumed generation used to re-record the old best as a phantom generation instead.)
     """
     opt = _opt()
     saved: dict = {}
@@ -555,10 +555,11 @@ def test_a_boundary_resume_re_evaluates_nothing():
     opt2.optimize(fitness_function=lambda p: 0.0, batch_fitness=batch_fitness2,
                   start_generation=start_gen, initial_population=pop, restored_fitnesses=fits)
 
-    assert batches == [], (
-        f"a boundary resume dispatched {batches} trials for a population that was already fully "
-        "scored in the checkpoint; before fitness was persisted this was the WHOLE population, "
-        "every single time")
+    assert sum(batches) < len(pop), (
+        f"a boundary resume dispatched {batches} trials for a population of {len(pop)} that was "
+        "already fully scored in the checkpoint; only the NEW offspring may run (the elites keep "
+        "their persisted fitness)")
+    assert len(batches) <= 1
 
 
 # ---------------------------------------------------------------------------------------------

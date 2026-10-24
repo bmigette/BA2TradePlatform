@@ -949,6 +949,38 @@ class GeneticOptimizer:
                                         else early_stop_threshold(baseline, min_rel))
         return data
 
+    def _reproduce(self, population: list, gen: int) -> None:
+        """Elitism + selection + crossover + mutation: turn the evaluated ``population`` of
+        generation ``gen`` into the next generation's (in place)."""
+        # ELITISM: Preserve the best individuals unchanged
+        n_elite = max(1, int((self.elitism_percent / 100.0) * len(population)))
+        elites = tools.selBest(population, n_elite)
+        # Clone elites to preserve them unchanged
+        elites = [self.toolbox.clone(ind) for ind in elites]
+
+        logger.debug(f"Gen {gen}: Preserving {n_elite} elite individuals (best fitness: {elites[0].fitness.values[0]:.4f})")
+
+        # Selection and reproduction for the remaining slots
+        n_offspring = len(population) - n_elite
+        offspring = self.toolbox.select(population, n_offspring)
+        offspring = list(map(self.toolbox.clone, offspring))
+
+        # Crossover
+        for child1, child2 in zip(offspring[::2], offspring[1::2]):
+            if self._rng.random() < self.crossover_prob:
+                self.toolbox.mate(child1, child2)
+                del child1.fitness.values
+                del child2.fitness.values
+
+        # Mutation
+        for mutant in offspring:
+            if self._rng.random() < self.mutation_prob:
+                self.toolbox.mutate(mutant)
+                del mutant.fitness.values
+
+        # Combine elites (unchanged) with new offspring
+        population[:] = elites + offspring
+
     def optimize(
         self,
         fitness_function: Callable[[Dict], float],
@@ -1017,6 +1049,36 @@ class GeneticOptimizer:
 
         # Restore best fitness history from resumed state
         if self.history:
+            best_fitness_history = [h['best_fitness'] for h in self.history]
+
+        # RESUME FROM AN END-OF-GENERATION CHECKPOINT. The checkpoint of generation k is written
+        # after k is evaluated and recorded in ``history`` but BEFORE the best/patience update and
+        # BEFORE reproduction. Starting the loop at k + 1 with that fully evaluated population
+        # used to evaluate nothing, re-record k's best as a phantom generation k + 1 and burn a
+        # patience unit (P5). Finish what the interrupted run was about to do instead: apply the
+        # best update, take the stop decision, then breed. The patience counter / baseline were
+        # already derived from ``history`` (which includes k), so they are not touched here. A
+        # PARTIAL checkpoint has no history entry for its generation, so it is not this case.
+        last_done = self.history[-1]['generation'] if self.history else None
+        if (initial_population and start_generation > 0 and last_done == start_generation - 1
+                and all(ind.fitness.valid for ind in population)):
+            best_ind = tools.selBest(population, 1)[0]
+            best_fit = best_ind.fitness.values[0]
+            if self.best_fitness is None or best_fit > self.best_fitness:
+                self.best_fitness = best_fit
+                self.best_individual = list(best_ind)
+            if no_improvement_count >= self.early_stopping_generations:
+                logger.warning(
+                    f"Resumed after generation {last_done}, whose patience "
+                    f"{no_improvement_count}/{self.early_stopping_generations} had already "
+                    f"stopped the run: nothing left to run (best={self.best_fitness:.4f})")
+                start_generation = self.n_generations
+            elif start_generation < self.n_generations:
+                logger.warning(
+                    f"Resumed after generation {last_done}: patience {no_improvement_count}/"
+                    f"{self.early_stopping_generations}; breeding generation {start_generation} "
+                    f"(no phantom re-record of generation {last_done})")
+                self._reproduce(population, last_done)
             best_fitness_history = [h['best_fitness'] for h in self.history]
 
         # Evolution loop
@@ -1155,34 +1217,7 @@ class GeneticOptimizer:
 
             best_fitness_history.append(best_fit)
 
-            # ELITISM: Preserve the best individuals unchanged
-            n_elite = max(1, int((self.elitism_percent / 100.0) * len(population)))
-            elites = tools.selBest(population, n_elite)
-            # Clone elites to preserve them unchanged
-            elites = [self.toolbox.clone(ind) for ind in elites]
-
-            logger.debug(f"Gen {gen}: Preserving {n_elite} elite individuals (best fitness: {elites[0].fitness.values[0]:.4f})")
-
-            # Selection and reproduction for the remaining slots
-            n_offspring = len(population) - n_elite
-            offspring = self.toolbox.select(population, n_offspring)
-            offspring = list(map(self.toolbox.clone, offspring))
-
-            # Crossover
-            for child1, child2 in zip(offspring[::2], offspring[1::2]):
-                if self._rng.random() < self.crossover_prob:
-                    self.toolbox.mate(child1, child2)
-                    del child1.fitness.values
-                    del child2.fitness.values
-
-            # Mutation
-            for mutant in offspring:
-                if self._rng.random() < self.mutation_prob:
-                    self.toolbox.mutate(mutant)
-                    del mutant.fitness.values
-
-            # Combine elites (unchanged) with new offspring
-            population[:] = elites + offspring
+            self._reproduce(population, gen)
 
         # Final best
         best_params = self.decode_individual(self.best_individual)
