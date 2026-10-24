@@ -12,7 +12,8 @@ import time
 import threading
 import functools
 
-from ...core.fmp_live_price import fetch_fmp_last_prices
+from ...core.fmp_live_price import fetch_fmp_last_prices, FMPPriceError
+from ba2_providers.fmp_common import FMPHermeticViolation, redact
 from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
 from ...core.types import (
@@ -2893,8 +2894,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         symbols = [symbol_or_symbols] if single else list(symbol_or_symbols)
         try:
             prices = fetch_fmp_last_prices(symbols)
+        except FMPHermeticViolation:
+            raise
+        except FMPPriceError as e:
+            logger.error(f"[Account {self.id}] FMP price feed unavailable: {e}")
+            prices = {}
         except Exception as e:
-            logger.error(f"[Account {self.id}] FMP price feed failed for {symbols}: {e}", exc_info=True)
+            logger.error(f"[Account {self.id}] FMP price feed failed for {symbols}: {redact(e)}")
             prices = {}
         if single:
             return prices.get(symbol_or_symbols)
