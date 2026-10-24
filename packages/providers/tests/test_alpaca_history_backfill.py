@@ -127,7 +127,7 @@ def test_new_ipo_after_the_build_start_is_backfilled_from_its_first_bar(cache):
     assert bars.calls[0][2] == date(2026, 8, 3)                       # asked from the build start, answered from the IPO
     m = meta_consistent(cache)["symbols"]["NEW"]
     assert m["origin"] == "live_backfill" and m["backfilled_on"] == "2026-10-24" and m["events"] == {"splits": [], "spinoffs": []}
-    assert m["1d"] == {"first": "2026-09-15", "last": "2026-10-23", "bars": len(days)}
+    assert m["1d"] == {"first": "2026-09-15", "last": "2026-10-23", "bars": len(days), "covered_from": "2026-08-03", "partial": True}
 
 
 def test_old_symbol_absent_from_the_build_starts_at_the_build_start(cache):

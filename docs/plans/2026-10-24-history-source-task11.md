@@ -94,6 +94,28 @@ Facts the design rests on (all from the code):
    with the manifest's events (one basis per symbol). Non-US-ticker / non-NYSE symbols and symbols Alpaca does not have stay refused
    (`SymbolUnavailable`). The daily 5-min history is large (build start to now): it is fetched only when the 5-min interval is read.
 
+6. **Amendment (owner 2026-10-24): download no more than needed; BT fetches "aside".** The first read of a symbol with no file
+   fetches ONLY the requested interval (daily OR 5-minute) for ONLY the caller's requested range, `[start_date, newest finished
+   session]` (clipped to the build's own start), contiguous within that range, splits judged for that range. A later read needing
+   an earlier start extends the file BACKWARDS by just the missing range (contiguous with the existing first bar, the new
+   range's splits judged, the seam checked); later sessions arrive through the normal top-up. The manifest marks the symbol
+   `origin: live_backfill` and each interval `partial: true` with `covered_from` (the earliest date the file was asked to cover;
+   an IPO's first bar may be later). The BACKTEST reader (the keyless `AlpacaHistoryOHLCVProvider`) REFUSES, naming the symbol and
+   the rebuild (`PartialLiveBackfill`), a window starting before `covered_from`; a backtest therefore never treats a live-backfilled
+   partial file as a built symbol (it is downloaded aside by a rebuild). This changes the keyless read -> `ba2_providers` minimum raised.
+7. **Warm-up and short history (owner: "Still need 200 days for EMA. New symbol with not enough history should not trade.").**
+   The backfill range is the caller's start, and every account-bound reader already puts its warm-up in that start:
+   `PandasIndicatorCalc` (ATR, SMA/EMA, RSI, ...) fetches 365 calendar days before the visible window, DeterministicScorer 600,
+   FactorRanker 400, ETFTrend `ceil(max(momentum+1, trend)*7/5)+120`, FMPEarningsEvent 900; pinned by a test (a first 200-SMA
+   read fetches >= 300 days before the window). A history shorter than an indicator's window raises `InsufficientHistory`
+   (`ba2_common.core.ohlcv_history`) from `PandasIndicatorCalc` (shared by BT and live; the BT metric-store ATR already returns
+   no value) and `get_latest_atr` turns it into "no ATR" at WARNING. Per expert, what exists today: DeterministicScorer refuses
+   (`min_history_days` 260 -> `skip_reason=insufficient_history`); PullbackReversion raises "Insufficient history" (MIN_BARS);
+   ETFTrend raises "Insufficient ETF warmup"; FactorRanker returns no factor for a series shorter than its lookback
+   (`factors.py`) and needs `k` measured factors; FMPRating / FMPEarningsDrift / FMPInsiderClusterBuy / FMPSenateTraderWeight /
+   FMPSenateTraderCopy compute no OHLCV-window indicator (the price at the decision date only), FMPEarningsEvent measures
+   historical event moves from earnings rows: none of these changed.
+
 Defaults kept: global regime-overlay SPY read stays FMP; TastyTrade/IBKR refuse `alpaca` (no Alpaca keys); the
 corporate-actions job covers only symbols held/traded by `alpaca` accounts at 08:30 ET; the 5-minute top-up stays.
 
@@ -517,7 +539,7 @@ Commit `test(history): BT/live parity for the Alpaca live top-up and re-base`.
 
 ## Task 12: Deploy steps
 
-> Owner 2026-10-24: after deploy ALL accounts (dev 1-3, prod 1, options 1 Alpaca accounts) are switched to `alpaca` at once by the operator. A symbol not in the build is then refused; quantify it first (see the Task 1-5 report). (owner decides the values; default `fmp` = no behaviour change)
+> Owner 2026-10-24: after deploy ALL accounts (dev 1-3, prod 1, options 1 Alpaca accounts) are switched to `alpaca` at once by the operator. New symbols are backfilled on first read (Task 0 items 5-7). (owner decides the values; default `fmp` = no behaviour change)
 
 1. Merge only with no masters mid-job (CLAUDE.md boundary checklist item 5); push; confirm `unsyncable_reason` is silent.
 2. **Backups first** on each instance: `python tools/backup_dbs.py` (prod + test DBs, daily task writes to

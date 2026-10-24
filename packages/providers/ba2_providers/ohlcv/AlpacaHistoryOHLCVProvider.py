@@ -72,16 +72,37 @@ class AlpacaHistoryOHLCVProvider(MarketDataProviderInterface):
         interval: Annotated[str, "Data interval"] = "1d",
     ) -> pd.DataFrame:
         if self.live:
-            # No file for this symbol / interval: backfill it on first read (owner 2026-10-24, new symbols are supported)
-            from ba2_common.core import ohlcv_final_bars
-            from ba2_providers.ohlcv.alpaca_history import live_backfill
-            now = self._clock() if self._clock is not None else ohlcv_final_bars.now_utc()
-            return live_backfill.backfill(symbol, self._live_interval(interval, symbol), fetcher=self._fetcher, now=now,
-                                          ca_client=self._ca_client, fmp_rows=self._fmp_split_rows)
+            # get_ohlcv_data ensured the requested coverage first; reaching a cold miss here means that did not produce a file
+            from ba2_providers.ohlcv.alpaca_history.live_topup import SymbolNotInHistory
+            raise SymbolNotInHistory(f"{symbol} ({interval}): no file after the live backfill was attempted")
         raise HistoryTopUpUnavailable(
             f"AlpacaHistoryOHLCVProvider has no live source: {symbol} ({interval}) "
             f"{start_date} .. {end_date} is not in the prepared cache (or the cache is stale). "
             f"Build it with `tools/prepare_history.py --source alpaca`.")
+
+    def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval='1d', use_cache=True,
+                       max_cache_age_hours=24, lookback_days=30):
+        """The base read, preceded by the coverage rule for the REQUESTED start (indicator warm-up included by the caller):
+        a live provider downloads only what the request needs (a symbol with no file, or a partial live file starting later
+        than asked); a cache-only provider (backtests) REFUSES a window starting before a partial live backfill."""
+        from ba2_common.core.provider_utils import validate_date_range
+        try:
+            key = self._live_interval(interval, symbol)
+        except HistoryTopUpUnavailable:
+            key = None
+        if key is not None:
+            want_start = validate_date_range(start_date, end_date, lookback_days)[0].date()
+            from ba2_providers.ohlcv.alpaca_history import live_backfill
+            if self.live:
+                from ba2_common.core import ohlcv_final_bars
+                now = self._clock() if self._clock is not None else ohlcv_final_bars.now_utc()
+                live_backfill.ensure_coverage(symbol, key, want_start, fetcher=self._fetcher, now=now,
+                                              ca_client=self._ca_client, fmp_rows=self._fmp_split_rows)
+            else:
+                live_backfill.check_backtest_window(symbol.upper(), key, want_start)
+        return super().get_ohlcv_data(symbol, start_date=start_date, end_date=end_date, interval=interval,
+                                      use_cache=use_cache, max_cache_age_hours=max_cache_age_hours,
+                                      lookback_days=lookback_days)
 
     def _is_cache_valid(self, cache_file: str, max_age_hours: int = 24) -> bool:
         """File age says nothing here: the cache is an offline build, so a fresh mtime can sit on bars

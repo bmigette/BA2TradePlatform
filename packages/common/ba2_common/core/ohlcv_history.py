@@ -92,3 +92,14 @@ def account_history_source(settings: Mapping) -> str:
         raise UnknownHistorySource(
             f"{ACCOUNT_HISTORY_SOURCE_KEY} must be a string, got {type(raw).__name__} {raw!r}")
     return check_history_source(raw.strip().lower())
+
+
+class InsufficientHistory(ValueError):
+    """A symbol has fewer bars than an indicator's window needs (an IPO 120 sessions old asked for a 200-period average).
+
+    Shared by the backtest and the live path: the indicator is NOT computed on the short series, and the caller must not
+    trade on it (owner 2026-10-24: "New symbol with not enough history should not trade")."""
+
+    def __init__(self, symbol: str, indicator: str, have: int, need: int):
+        self.symbol, self.indicator, self.have, self.need = symbol, indicator, have, need
+        super().__init__(f"insufficient history for {symbol}: {indicator} needs {need} bars, only {have} exist")

@@ -30,6 +30,7 @@ from ba2_common.core.share_grid import floor_to_unit, is_whole_grid
 
 from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.ohlcv_history import InsufficientHistory
 from ba2_common.core.replay import replay_now
 
 
@@ -499,6 +500,10 @@ def get_latest_atr(symbol: str, indicator_provider, period: int = 14, interval: 
             if v is not None:
                 return float(v)
         logger.warning(f"get_latest_atr: no ATR value returned for {symbol}")
+        return None
+    except InsufficientHistory as e:
+        # a symbol too new for the ATR window: no ATR (the caller falls back to its risk%-only stop), said at WARNING
+        logger.warning(f"get_latest_atr: {e}")
         return None
     except Exception as e:
         # Let CODE DEFECTS through. This handler previously absorbed a tz naive/aware TypeError

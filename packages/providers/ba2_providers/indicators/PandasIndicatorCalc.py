@@ -7,13 +7,29 @@ Calculates indicators from historical price data.
 
 from typing import Dict, Any, Literal, Optional, Annotated
 from datetime import datetime, timedelta
+import re
 import pandas as pd
 from stockstats import wrap
 
 from ba2_common.core.interfaces import MarketIndicatorsInterface
 from ba2_common.core.interfaces.MarketDataProviderInterface import MarketDataProviderInterface
 from ba2_common.core.provider_utils import validate_date_range, log_provider_call
+from ba2_common.core.ohlcv_history import InsufficientHistory
 from ba2_common.logger import logger
+
+
+_WINDOW_FROM_NAME = re.compile(r"^close_(\d+)_(?:sma|ema)$")
+#: bars each fixed-window indicator needs before its first meaningful value (stockstats defaults)
+_FIXED_WINDOWS = {"rsi": 14, "atr": 14, "mfi": 14, "boll": 20, "boll_ub": 20, "boll_lb": 20, "vwma": 20,
+                  "macd": 26, "macds": 35, "macdh": 35}
+
+
+def required_bars(indicator: str) -> int:
+    """Bars needed for ``indicator`` (0 = unknown name: no guard)."""
+    m = _WINDOW_FROM_NAME.match(indicator)
+    if m:
+        return int(m.group(1))
+    return _FIXED_WINDOWS.get(indicator, 0)
 
 
 class PandasIndicatorCalc(MarketIndicatorsInterface):
@@ -114,6 +130,12 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
             interval=interval
         )
         
+        # A series shorter than the indicator's window is NOT computed: stockstats would return a value from the
+        # bars that exist (a 200-period average of 120 bars) and a caller would trade on it. Shared by backtest and live.
+        need = required_bars(indicator)
+        if len(data) < need:
+            raise InsufficientHistory(symbol, indicator, len(data), need)
+
         # Check if original data has timezone info
         has_tz = False
         if 'Date' in data.columns:

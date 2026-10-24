@@ -24,7 +24,7 @@ import os
 import shutil
 import time
 from datetime import datetime, timezone
-from typing import Callable, Iterator, List, Sequence, Tuple
+from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -142,7 +142,10 @@ def _manifest_view() -> dict:
             "events": {s: ([(d, float(x), "split") for d, x in e["events"]["splits"]]
                            + [(d, float(x), "spinoff") for d, x in e["events"]["spinoffs"]])
                        for s, e in symbols.items() if "events" in e},
-            "effective": {s: e["live"]["effective"] for s, e in symbols.items() if "live" in e}}
+            "effective": {s: e["live"]["effective"] for s, e in symbols.items() if "live" in e},
+            "partial": {s: {iv: dict(e[iv]) for iv in ("1d", "5min") if iv in e and "partial" in e[iv] and e[iv]["partial"]}
+                        for s, e in symbols.items()
+                        if any(iv in e and "partial" in e[iv] and e[iv]["partial"] for iv in ("1d", "5min"))}}
     _EVENTS_MEMO[path] = (key, view)
     return view
 
@@ -165,6 +168,17 @@ def build_history_start(interval: str) -> str:
     if v is None:
         raise KeyError(f"the manifest records no first bar for {interval}")
     return v
+
+
+def partial_coverage(symbol: str, interval: str) -> Optional[dict]:
+    """The stamp ``{"first", "last", "bars", "covered_from", "partial": True}`` of an interval that was backfilled live for
+    only the range a caller asked for; None for a fully built interval, a symbol or manifest the cache does not have."""
+    try:
+        view = _manifest_view()
+    except FileNotFoundError:
+        return None
+    sym = view["partial"][symbol.upper()] if symbol.upper() in view["partial"] else {}
+    return sym[interval] if interval in sym else None
 
 
 def manifest_events(symbol: str) -> List[Event]:
@@ -253,7 +267,7 @@ def rebase_symbol(symbol: str, events: Sequence[Event], *, now: datetime, sync_s
 
 
 def register_backfilled_symbol(symbol: str, interval: str, events: Sequence[Event], first: str, last: str, bars: int, *,
-                               now: datetime, file_name: str, origin: str = "live_backfill") -> bool:
+                               now: datetime, file_name: str, covered_from: str, origin: str = "live_backfill") -> bool:
     """Record a symbol (or one more interval of it) that was backfilled from Alpaca after the build: manifest entry
     (events, per-interval first / last / bars, origin marker + date), the same events in ``split_table.json`` and its hash,
     and the gate certificate re-stamp -- ONE locked section, ``.bak`` backups, atomic replaces (the transaction of
@@ -271,7 +285,7 @@ def register_backfilled_symbol(symbol: str, interval: str, events: Sequence[Even
                      "backfilled_on": now.astimezone(timezone.utc).date().isoformat()}
         have = {(k, d, round(float(x), 12)) for k, rows in entry["events"].items() for d, x in rows}
         todo = [e for e in events if ("splits" if e[2] == "split" else "spinoffs", e[0], round(e[1], 12)) not in have]
-        stamp = {"first": first, "last": last, "bars": bars}
+        stamp = {"first": first, "last": last, "bars": bars, "covered_from": covered_from, "partial": True}
         if not new_entry and not todo and interval in entry and entry[interval] == stamp:
             return False
         shutil.copyfile(mpath, mpath + ".bak")
