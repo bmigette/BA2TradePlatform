@@ -365,7 +365,16 @@ def account_settings_error(dynamic_settings: Dict[str, Any]) -> Optional[str]:
     """
     from ba2_common.core.interfaces.ReadOnlyAccountInterface import margin_factor_error
     if "margin_factor" in dynamic_settings:
-        return margin_factor_error(dynamic_settings["margin_factor"])
+        problem = margin_factor_error(dynamic_settings["margin_factor"])
+        if problem:
+            return problem
+    if "ohlcv_history_source" in dynamic_settings:
+        # unknown value, or alpaca on an account without Alpaca keys: named, nothing saved
+        from ba2_trade_platform.core.account_history import validate_account_history_source
+        try:
+            validate_account_history_source(dynamic_settings)
+        except ValueError as e:                      # UnknownHistorySource and HistorySourceNeedsAlpacaKeys
+            return f"Not saved: {e}"
     return None
 
 

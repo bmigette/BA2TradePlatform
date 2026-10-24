@@ -13,6 +13,7 @@ from ba2_common.core.account_types import (
 )
 from threading import Lock
 from ba2_common.logger import logger
+from ba2_common.core.ohlcv_history import ACCOUNT_DEFAULT_HISTORY_SOURCE, ACCOUNT_HISTORY_SOURCE_KEY, HISTORY_SOURCES
 from ba2_common.core.models import AccountSetting
 from ba2_common.core.types import AssetClass, OrderStatus
 from ba2_common.core.interfaces.ExtendableSettingsInterface import (
@@ -264,6 +265,19 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     "default": 1.8,
                     "description": "Margin factor (max exposure / balance)",
                     "tooltip": "Ceiling on total exposure as a multiple of balance: 1.8 means a $10k account never holds more than $18k of positions. Capped by the broker's multiplier. Ignored when margin trading is off. Minimum 1.0."
+                },
+                # ONE definition for every account type (plan 2026-10-24-history-source-task11); the default and the
+                # valid values come from ohlcv_history, the only place that spells them.
+                ACCOUNT_HISTORY_SOURCE_KEY: {
+                    "type": "str",
+                    "required": False,
+                    "default": ACCOUNT_DEFAULT_HISTORY_SOURCE,
+                    "description": "Live OHLCV history source",
+                    "valid_values": sorted(HISTORY_SOURCES),
+                    "tooltip": "fmp = FMP daily / 5-min history (cache topped up from FMP). alpaca = Alpaca-derived, "
+                               "split-verified history (the cache backtests use), topped up with raw finished sessions; "
+                               "needs Alpaca market-data keys (Alpaca accounts only). Current prices are set by the price "
+                               "feed, not this. A changed value applies after /api/reload.",
                 },
             }
 
