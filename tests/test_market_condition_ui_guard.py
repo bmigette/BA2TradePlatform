@@ -361,3 +361,33 @@ def test_both_halves_of_the_exit_refusal_still_hold(rules_tab):
     rules_tab[2] = _rule(2, "gated", ADX)
     with pytest.raises(ValueError, match=REFUSED):
         _RulesTab(rules_tab)._refuse("open_positions", [2])
+
+
+# --------------------------------------------------------------------------- SPY regime leaves
+SPY_TREND = "spy_trend_regime"
+
+
+def test_a_spy_regime_leaf_needs_no_profile_on_either_door(tab):
+    """The SPY gates are published by the host, not served by a profile: an empty setting is fine
+    on the entry door, and on the exit door when the rule only closes."""
+    tab.rulesets[7] = (("entry.cond_1", SPY_TREND),)
+    assert tab._refuse_unserved_market_gates(7, None) is None
+    tab.rulesets[9] = (("exit.cond_1", SPY_TREND),)
+    tab.contents[9] = (("exit", {"cond_1": {"event_type": SPY_TREND, "operator": "==",
+                                            "value": 5.0}}, CLOSE),)
+    assert tab._refuse_unserved_market_gates(7, 9) is None
+
+
+def test_a_spy_regime_leaf_on_a_buy_exit_rule_is_still_refused(tab):
+    tab.rulesets[9] = (("exit.cond_1", SPY_TREND),)
+    tab.contents[9] = (("exit", {"cond_1": {"event_type": SPY_TREND, "operator": "==",
+                                            "value": 5.0}}, BUY),)
+    with pytest.raises(ValueError, match=REFUSED):
+        tab._refuse_unserved_market_gates(None, 9)
+
+
+def test_an_ordinary_leaf_beside_a_spy_leaf_is_still_judged_by_the_profile(tab):
+    tab.rulesets[7] = (("entry.cond_1", ADX), ("entry.cond_2", SPY_TREND))
+    with pytest.raises(ValueError) as e:
+        tab._refuse_unserved_market_gates(7, None)
+    assert ADX in str(e.value) and SPY_TREND not in str(e.value)

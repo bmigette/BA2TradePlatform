@@ -335,6 +335,15 @@ def test_the_categorical_market_field_is_the_only_categorical_trigger():
     assert categorical == {"structure_state", "spy_trend_regime", "spy_vol_regime"}
 
 
+def test_the_spy_regime_triggers_are_market_categorical_and_need_no_profile():
+    by_value = {e.value: e for e in trigger_catalog()}
+    for value in ("spy_trend_regime", "spy_vol_regime"):
+        entry = by_value[value]
+        assert entry.kind == KIND_CATEGORICAL
+        assert "market" in entry.categories
+        assert not entry.requires_profile
+
+
 def test_a_flag_trigger_and_a_number_trigger_read_as_expected():
     by_value = {e.value: e for e in trigger_catalog()}
     assert by_value["has_position"].kind == KIND_FLAG
