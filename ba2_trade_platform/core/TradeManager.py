@@ -38,6 +38,22 @@ _LIVE_REGIME_CACHE = {"day": None, "stressed": None, "retry_after": None, "failu
 # the HTTP call itself; this spaces the attempts of a refresh loop that runs many times a day.
 _REGIME_RETRY_SECONDS = 300
 
+# SPY benchmark regime for the ``spy-trend`` / ``spy-vol`` entry gates (TradeManager._publish_benchmark_regime).
+# ``session`` is the newest FINISHED session whose regime is cached (NOT a calendar day: after the 16:00
+# close the key changes and the new close is picked up the same evening); ``retry_after``/``failures``
+# mirror _LIVE_REGIME_CACHE; ``failure`` is the reason the last attempt published nothing usable;
+# ``feed_warned_day`` is the day the source-consistency WARNING last fired.
+_BENCHMARK_REGIME_CACHE = {"session": None, "regime": None, "retry_after": None, "failures": 0,
+                           "failure": None, "feed_warned_day": None}
+#: Calendar days of SPY daily history to fetch (~825 sessions, above the 524 the vol axis needs).
+_BENCHMARK_LOOKBACK_DAYS = 1200
+
+
+def _reset_benchmark_regime_cache() -> None:
+    """Forget the cached regime / failure / warning day (tests, and a clean start)."""
+    _BENCHMARK_REGIME_CACHE.update({"session": None, "regime": None, "retry_after": None,
+                                    "failures": 0, "failure": None, "feed_warned_day": None})
+
 # Wash-trade lock lifetime. A lock is a WAIT, and a wait that outlives its signal is a
 # deadlock: an entry blocked by a protective stop on an open position can never clear on
 # its own, because that stop stays working at the broker for the life of the position.
@@ -312,6 +328,177 @@ class TradeManager:
 
         set_stressed(_LIVE_REGIME_CACHE["stressed"])
 
+    def _benchmark_regime_needed(self) -> bool:
+        """True when some ENABLED expert's entry or exit ruleset carries a ``spy_trend_regime`` /
+        ``spy_vol_regime`` leaf. A platform with no gated ruleset makes no SPY provider call."""
+        from ba2_common.core.market_condition_live import benchmark_leaves_in_ruleset
+
+        for expert in get_all_instances(ExpertInstance):
+            if not expert.enabled:
+                continue
+            for ruleset_id in (expert.enter_market_ruleset_id, expert.open_positions_ruleset_id):
+                if ruleset_id is not None and benchmark_leaves_in_ruleset(ruleset_id):
+                    return True
+        return False
+
+    def _fetch_benchmark_daily(self, now):
+        """``(dates, closes)`` of SPY DAILY bars up to ``now`` from the history provider.
+
+        FMP, deliberately: owner decision 2026-10-24 -- the SPY regime reads the same source as the
+        stock price, which is FMP on all three live instances. (The provider may include a partial
+        TODAY bar after the open; ``knowable_closes`` drops it.)"""
+        from datetime import timedelta
+
+        import pandas as pd
+        from ba2_providers import get_provider
+
+        df = get_provider("ohlcv", "fmp").get_ohlcv_data(
+            _REGIME_BENCHMARK,
+            start_date=now - timedelta(days=_BENCHMARK_LOOKBACK_DAYS),
+            end_date=now,
+            interval="1d",
+        )
+        if df is None or not len(df):
+            return [], []
+        return ([pd.Timestamp(d).date() for d in df["Date"].tolist()],
+                [None if pd.isna(c) else float(c) for c in df["Close"].tolist()])
+
+    def _warn_benchmark_source_mismatch(self, today) -> None:
+        """WARNING (never a refusal), once per day: the SPY regime reads FMP, so an Alpaca account that
+        trades with a stored ``data_feed`` other than ``fmp`` prices its stocks from a different source
+        than the regime the gate decides on. Unset = the declared default (``delayed_sip``)."""
+        if _BENCHMARK_REGIME_CACHE["feed_warned_day"] == today:
+            return
+        from sqlmodel import select
+
+        from .db import get_db
+        from .models import AccountDefinition, AccountSetting
+
+        from ..modules.accounts.AlpacaAccount import AlpacaAccount
+
+        default_feed = AlpacaAccount.get_settings_definitions()["data_feed"]["default"]
+        with get_db() as session:
+            feeds = {s.account_id: s.value_str for s in session.exec(
+                select(AccountSetting).where(AccountSetting.key == "data_feed")).all()}
+        trading_accounts = {e.account_id for e in get_all_instances(ExpertInstance) if e.enabled}
+        mismatched = []
+        for account in get_all_instances(AccountDefinition):
+            if account.provider != "AlpacaAccount" or account.id not in trading_accounts:
+                continue
+            feed = (feeds.get(account.id) or default_feed).lower()
+            if feed != "fmp":
+                mismatched.append(f"{account.name} (id {account.id}) prices from {feed}")
+        _BENCHMARK_REGIME_CACHE["feed_warned_day"] = today
+        if mismatched:
+            self.logger.warning(
+                "SPY regime reads FMP but " + "; ".join(mismatched) + ". The SPY regime gates classify FMP "
+                "daily closes while these accounts price stocks from another feed; set the account's "
+                "data_feed to fmp so live decides on the data the backtest assumed.")
+
+    def _publish_benchmark_regime(self, now=None) -> None:
+        """Publish the SPY trend/vol regime from FINISHED sessions on the ``benchmark_regime`` seam.
+
+        Live counterpart of the backtest engine's per-bar ``set_benchmark_regime(calendar.at(...))``: the
+        SAME ``classify_benchmark_regime`` the calendar is asserted equal to, fed the closes of finished
+        sessions only (``knowable_closes`` drops a partial TODAY bar), so a live decision sees exactly
+        the last close the backtest's decision at that instant would.
+
+        Cached under the newest FINISHED session (not the calendar day) on success only. A FAILURE
+        (exception, no bars, nothing finished, calendar outage, data more than one session stale)
+        publishes NOTHING usable -- ``None`` plus a reason the gate reports -- logs an ERROR, and is
+        retried once ``_REGIME_RETRY_SECONDS`` have passed. The gate then reads ``no_regime`` and never
+        passes, which is loud, not silent. Never raises into the caller: an entry/exit pass must go on.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from ba2_common.core import benchmark_regime as br
+        from ba2_common.core.market_calendar import regular_session_close_utc, regular_session_dates
+
+        cache = _BENCHMARK_REGIME_CACHE
+        now = datetime.now(timezone.utc) if now is None else now
+        try:
+            if not self._benchmark_regime_needed():
+                br.reset_benchmark_regime()
+                return
+        except Exception as e:  # noqa: BLE001 -- detection must never block a pass
+            self.logger.error(f"Benchmark regime: could not tell whether a ruleset needs it ({e}); "
+                              f"publishing nothing", exc_info=True)
+            br.set_benchmark_regime(None)
+            br.set_benchmark_regime_failure(f"{type(e).__name__}: {e}")
+            return
+        try:
+            self._warn_benchmark_source_mismatch(now.date())
+        except Exception as e:  # noqa: BLE001 -- a diagnostic, never a blocker
+            self.logger.warning(f"Benchmark regime: source-consistency check failed: {e}")
+
+        failure = None
+        lagged = False
+        regime = None
+        newest = None
+        try:
+            sessions = regular_session_dates(now.date() - timedelta(days=12), now.date())
+            finished = [d for d in sessions if regular_session_close_utc(d) <= now]
+            if len(finished) < 2:
+                raise RuntimeError(f"no finished NYSE session found before {now.isoformat()}")
+            newest, previous = finished[-1], finished[-2]
+
+            if cache["session"] == newest and cache["regime"] is not None:
+                br.set_benchmark_regime(cache["regime"])
+                br.set_benchmark_regime_failure(None)
+                return
+            if cache["retry_after"] is not None and now < cache["retry_after"]:
+                # inside the retry window: no fetch; republish what the last attempt left (a lagged
+                # regime stays published; a failure stays None plus its reason)
+                br.set_benchmark_regime(cache["regime"] if cache["failure"] is None else None)
+                br.set_benchmark_regime_failure(cache["failure"])
+                return
+
+            dates, closes = self._fetch_benchmark_daily(now)
+            if not len(dates):
+                failure = f"no {_REGIME_BENCHMARK} daily bars returned"
+            else:
+                dates, closes = br.knowable_closes(dates, closes, now)
+                if not len(dates):
+                    failure = f"no finished {_REGIME_BENCHMARK} session among the returned bars"
+                elif dates[-1] < previous:
+                    failure = (f"stale {_REGIME_BENCHMARK} data: newest finished bar is {dates[-1]}, "
+                               f"expected {newest} (at most one session of lag is tolerated)")
+                else:
+                    regime = br.classify_benchmark_regime(closes, session=dates[-1])
+                    lagged = dates[-1] < newest
+        except Exception as e:  # noqa: BLE001 -- the regime must never block an entry/exit pass
+            failure = f"{type(e).__name__}: {e}"
+            self.logger.error(f"Benchmark regime fetch failed: {failure}", exc_info=True)
+
+        if failure is not None:
+            cache["failures"] += 1
+            cache.update({"session": None, "regime": None, "failure": failure,
+                          "retry_after": now + timedelta(seconds=_REGIME_RETRY_SECONDS)})
+            br.set_benchmark_regime(None)
+            br.set_benchmark_regime_failure(failure)
+            self.logger.error(
+                f"Benchmark regime is UNCLASSIFIED (attempt {cache['failures']}: {failure}). The "
+                f"spy-trend / spy-vol gates read no_regime and will NOT pass until it is classified; "
+                f"retrying in {_REGIME_RETRY_SECONDS}s.")
+            return
+
+        cache["failures"] = 0
+        cache["failure"] = None
+        cache["regime"] = regime
+        if lagged:
+            # published, but not cached: the missing session may arrive within minutes
+            cache["session"] = None
+            cache["retry_after"] = now + timedelta(seconds=_REGIME_RETRY_SECONDS)
+            self.logger.warning(
+                f"Benchmark regime uses {regime.session}, one session behind {newest} (provider lag); "
+                f"retrying in {_REGIME_RETRY_SECONDS}s.")
+        else:
+            cache["session"] = newest
+            cache["retry_after"] = None
+            self.logger.info(f"Benchmark regime as of {regime.session}: trend={regime.trend} vol={regime.vol}")
+        br.set_benchmark_regime(regime)
+        br.set_benchmark_regime_failure(None)
+
     def refresh_accounts(self):
         """
         Refresh account information for all registered accounts.
@@ -332,6 +519,7 @@ class TradeManager:
             # backtest engine's per-bar set_stressed(); cached per calendar day (the classifier
             # reads DAILY benchmark closes, so it cannot change intraday).
             self._publish_market_regime()
+            self._publish_benchmark_regime()
 
             from .models import AccountDefinition
             from ..modules.accounts import get_account_class
@@ -2551,6 +2739,9 @@ class TradeManager:
 
         try:
             self.logger.debug(f"Acquired processing lock for expert {expert_instance_id} (enter_market)")
+            # The SPY regime the spy-trend / spy-vol entry gates read, from FINISHED sessions, BEFORE any
+            # rule is evaluated (the pass can run outside a refresh).
+            self._publish_benchmark_regime()
             
             from sqlmodel import select
             from .db import get_db
@@ -3388,6 +3579,8 @@ class TradeManager:
         
         try:
             self.logger.debug(f"Acquired processing lock for expert {expert_instance_id} (open_positions)")
+            # Exit rules may read the SPY regime too: publish before they are evaluated.
+            self._publish_benchmark_regime()
             
             from sqlmodel import select
             from .db import get_db
