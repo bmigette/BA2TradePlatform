@@ -82,9 +82,20 @@ Facts the design rests on (all from the code):
 4. **Rollout:** ALL accounts switch to `alpaca` at once after deploy (dev 1-3, prod 1, options 1 Alpaca accounts). The
    operator switches them, not the implementer. Consequence: a symbol absent from the build is refused (loud), see Task 12.
 
+5. **New symbols are SUPPORTED (owner 2026-10-24, overrides "symbols not in the build are refused").** A live provider asked for
+   an interval of a symbol with no file BACKFILLS it on first read (`alpaca_history/live_backfill.py`): RAW bars from the build's
+   own history start (earliest first bar in the manifest, per interval) or the symbol's first Alpaca bar, whichever is LATER, to
+   the newest finished session; the SAME contiguity rule as top-ups (a missing session after the first bar -> nothing written,
+   ERROR); the symbol's corporate actions fetched once and judged by `decide_splits` (`corporate_actions.decide_events`); an event
+   sent to review, or an unexplained overnight jump, refuses the backfill. Written under the symbol lock; the manifest entry
+   (`origin: "live_backfill"`, `backfilled_on`, events, per-interval first/last/bars), `split_table.json` + its sha256 in the
+   manifest and the gate certificate are updated in ONE locked section BEFORE the bar file is written (an entry without a file is
+   backfilled again; a file without an entry would be refused). A 5-minute backfill of a symbol already in the manifest is adjusted
+   with the manifest's events (one basis per symbol). Non-US-ticker / non-NYSE symbols and symbols Alpaca does not have stay refused
+   (`SymbolUnavailable`). The daily 5-min history is large (build start to now): it is fetched only when the 5-min interval is read.
+
 Defaults kept: global regime-overlay SPY read stays FMP; TastyTrade/IBKR refuse `alpaca` (no Alpaca keys); the
-corporate-actions job covers only symbols held/traded by `alpaca` accounts at 08:30 ET; symbols not in the build are refused
-rather than backfilled; the 5-minute top-up stays.
+corporate-actions job covers only symbols held/traded by `alpaca` accounts at 08:30 ET; the 5-minute top-up stays.
 
 ---
 

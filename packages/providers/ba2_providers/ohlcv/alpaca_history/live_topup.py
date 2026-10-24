@@ -15,7 +15,7 @@ Owner decisions 2026-10-24 (plan Task 0): live bars append IN PLACE and UNGATED,
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
-from typing import Any, Callable, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -58,6 +58,20 @@ def _days(frame: pd.DataFrame) -> pd.Series:
     return pd.to_datetime(frame["Date"]).dt.normalize()
 
 
+def unexplained_jump(frame: pd.DataFrame, prev_close: Optional[float] = None) -> Optional[str]:
+    """A message when some bar of the (adjusted, ascending) ``frame`` opens beyond the split bounds of the previous close
+    (``prev_close`` for the first bar; none = the first bar is not checked): a corporate action nobody accepted."""
+    closes = frame["Close"].astype(float).reset_index(drop=True)
+    prev = pd.concat([pd.Series([prev_close] if prev_close is not None else [float("nan")]), closes.iloc[:-1]], ignore_index=True)
+    jumps = frame["Open"].astype(float).reset_index(drop=True) / prev
+    bad = jumps[(jumps < JUMP_LO) | (jumps > JUMP_HI)]
+    if not len(bad):
+        return None
+    i = int(bad.index[0])
+    return (f"the bar at {frame['Date'].iloc[i]} opens x{float(bad.iloc[0]):.3f} of the previous close with no accepted "
+            f"corporate action explaining it")
+
+
 def topup_frame(cached: pd.DataFrame, fetch: Fetch, splits: Sequence[Tuple[str, float]],
                 spinoffs: Sequence[Tuple[str, float]], *, interval: str, now_utc: datetime, symbol: str
                 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -92,15 +106,9 @@ def topup_frame(cached: pd.DataFrame, fetch: Fetch, splits: Sequence[Tuple[str, 
                      f"{[d.isoformat() for d in missing]}; the file is untouched, the next refresh retries")
         raise TopUpGap(symbol, interval, missing)
     new = build.adjust(new.sort_values("Date", kind="stable").reset_index(drop=True), splits, spinoffs)
-    prev_close = pd.concat([pd.Series([float(cached.sort_values("Date")["Close"].iloc[-1])]),
-                            new["Close"].iloc[:-1].astype(float)], ignore_index=True)
-    jumps = new["Open"].astype(float).reset_index(drop=True) / prev_close      # the seam AND every step inside the append
-    bad = jumps[(jumps < JUMP_LO) | (jumps > JUMP_HI)]
-    if len(bad):
-        i = int(bad.index[0])
-        raise PendingCorporateAction(
-            f"{symbol} ({interval}): the bar at {new['Date'].iloc[i]} opens x{float(bad.iloc[0]):.3f} of the previous close "
-            f"with no accepted corporate action explaining it; nothing appended")
+    err = unexplained_jump(new, float(cached.sort_values("Date")["Close"].iloc[-1]))
+    if err is not None:
+        raise PendingCorporateAction(f"{symbol} ({interval}): {err}; nothing appended")
     new = build.finish(new, interval)
     merged = pd.concat([cached, new[list(cached.columns)]], ignore_index=True)
     if not pd.to_datetime(merged["Date"]).is_monotonic_increasing or merged["Date"].duplicated().any():

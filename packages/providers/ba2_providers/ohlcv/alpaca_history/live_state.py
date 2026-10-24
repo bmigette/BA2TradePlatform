@@ -134,7 +134,11 @@ def _manifest_view() -> dict:
     with open(path, encoding="utf-8") as f:
         manifest = json.load(f)
     symbols = manifest["symbols"]
+    def _earliest(interval: str):
+        firsts = [e[interval]["first"] for e in symbols.values() if interval in e and "first" in e[interval]]
+        return min(firsts) if firsts else None
     view = {"store_asof": manifest["store_asof"] if "store_asof" in manifest else None,
+            "first": {"1d": _earliest("1d"), "5min": _earliest("5min")},
             "events": {s: ([(d, float(x), "split") for d, x in e["events"]["splits"]]
                            + [(d, float(x), "spinoff") for d, x in e["events"]["spinoffs"]])
                        for s, e in symbols.items() if "events" in e},
@@ -152,6 +156,14 @@ def store_asof() -> str:
     v = _manifest_view()["store_asof"]
     if v is None:
         raise KeyError("store_asof")
+    return v
+
+
+def build_history_start(interval: str) -> str:
+    """The earliest first bar of any built symbol for ``interval`` ('1d' | '5min'): the build's own history start."""
+    v = _manifest_view()["first"][interval]
+    if v is None:
+        raise KeyError(f"the manifest records no first bar for {interval}")
     return v
 
 
@@ -237,4 +249,48 @@ def rebase_symbol(symbol: str, events: Sequence[Event], *, now: datetime, sync_s
                                           build.finish(build.adjust(df, splits, spinoffs), interval))
         extend_manifest(sym, todo, now=now, sync_split_table=sync_split_table)
         os.remove(_marker(sym))
+        return True
+
+
+def register_backfilled_symbol(symbol: str, interval: str, events: Sequence[Event], first: str, last: str, bars: int, *,
+                               now: datetime, file_name: str, origin: str = "live_backfill") -> bool:
+    """Record a symbol (or one more interval of it) that was backfilled from Alpaca after the build: manifest entry
+    (events, per-interval first / last / bars, origin marker + date), the same events in ``split_table.json`` and its hash,
+    and the gate certificate re-stamp -- ONE locked section, ``.bak`` backups, atomic replaces (the transaction of
+    ``extend_manifest``). Idempotent: a repeat adds nothing new and returns False. Call BEFORE the bar file is written:
+    an entry without a file is simply backfilled again, a file without an entry would be refused as 'not in the build'."""
+    sym = symbol.upper()
+    mpath = os.path.join(_meta(), build.MANIFEST_NAME)
+    with locked_manifest():
+        with open(mpath, encoding="utf-8") as f:
+            manifest = json.load(f)
+        entry = manifest["symbols"][sym] if sym in manifest["symbols"] else None
+        new_entry = entry is None
+        if new_entry:
+            entry = {"events": {"splits": [], "spinoffs": []}, "files": {}, "origin": origin,
+                     "backfilled_on": now.astimezone(timezone.utc).date().isoformat()}
+        have = {(k, d, round(float(x), 12)) for k, rows in entry["events"].items() for d, x in rows}
+        todo = [e for e in events if ("splits" if e[2] == "split" else "spinoffs", e[0], round(e[1], 12)) not in have]
+        stamp = {"first": first, "last": last, "bars": bars}
+        if not new_entry and not todo and interval in entry and entry[interval] == stamp:
+            return False
+        shutil.copyfile(mpath, mpath + ".bak")
+        if todo:
+            _extend_split_table(sym, todo, manifest)
+            for d, fac, kind in todo:
+                key = "splits" if kind == "split" else "spinoffs"
+                entry["events"][key] = sorted(entry["events"][key] + [[d, fac]])
+            entry["live"] = {"effective": max(e[0] for e in todo), "extended_at": now.astimezone(timezone.utc).isoformat()}
+        entry[interval] = stamp
+        entry["files"][interval] = file_name
+        manifest["symbols"][sym] = entry
+        _atomic_json(mpath, manifest)
+        cpath = os.path.join(_meta(), CERTIFICATE_NAME)
+        if os.path.isfile(cpath):
+            with open(cpath, encoding="utf-8") as f:
+                cert = json.load(f)
+            shutil.copyfile(cpath, cpath + ".bak")
+            cert["build_manifest_sha256"] = _sha256(mpath)
+            cert["live_extended_at"] = now.astimezone(timezone.utc).isoformat()
+            _atomic_json(cpath, cert)
         return True

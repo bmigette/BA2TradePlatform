@@ -19,6 +19,8 @@ from ba2_trade_platform.core.types import OrderDirection
 class _StubExpert:
     """Minimal expert exposing only what _auto_size_by_risk reads."""
 
+    id = 1
+
     def get_virtual_balance(self):
         return 100_000.0
 
@@ -84,6 +86,8 @@ def test_auto_size_no_sl_threads_indicator_provider(monkeypatch):
     import ba2_trade_platform.core.position_sizing as ps
     monkeypatch.setattr(sh, "get_default_indicator_provider", fake_get_default_indicator_provider)
     monkeypatch.setattr(ps, "get_latest_atr", fake_get_latest_atr)
+    import ba2_trade_platform.core.account_history as ah
+    monkeypatch.setattr(ah, "indicator_provider_for_expert", lambda expert_id: None)     # an fmp account: default stack
 
     tk = _make_toolkit()
     result = tk._auto_size_by_risk("AAPL", OrderDirection.BUY, sl_price=None)
@@ -140,3 +144,17 @@ def test_auto_size_provider_build_failure_degrades_to_none(monkeypatch):
     result = tk._auto_size_by_risk("AAPL", OrderDirection.BUY, sl_price=None)
     assert captured["indicator_provider"] is None
     assert "quantity" in result
+
+
+def test_alpaca_account_atr_follows_its_history_provider(monkeypatch):
+    """An expert on an alpaca-history account sizes with ATR from the account's own provider, not the default stack."""
+    captured = {}
+    account_provider = object()
+    import ba2_trade_platform.core.seam_helpers as sh
+    import ba2_trade_platform.core.position_sizing as ps
+    import ba2_trade_platform.core.account_history as ah
+    monkeypatch.setattr(sh, "get_default_indicator_provider", lambda: object())
+    monkeypatch.setattr(ah, "indicator_provider_for_expert", lambda expert_id: account_provider)
+    monkeypatch.setattr(ps, "get_latest_atr", lambda symbol, p, period=14, interval="1d": captured.setdefault("p", p) and 2.5)
+    _make_toolkit()._auto_size_by_risk("AAPL", OrderDirection.BUY, sl_price=None)
+    assert captured["p"] is account_provider

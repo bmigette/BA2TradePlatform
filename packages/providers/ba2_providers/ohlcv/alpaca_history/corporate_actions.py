@@ -199,59 +199,81 @@ def refresh(symbols: Iterable[str], *, today: date, now: datetime, ca_client: An
     return report
 
 
-def _judge_symbol(sym: str, cand: Dict[str, list], fmp_all: List[ListedSplit], overrides: Sequence[dict], stats: Counter, *,
-                  today: date, now: datetime, raw_fetcher: Callable, report: dict) -> None:
-    recorded = {(d, round(f, 12)) for d, f, _ in live_state.manifest_events(sym)}
+def decide_events(sym: str, cand: Dict[str, list], fmp_all: List[ListedSplit], overrides: Sequence[dict], stats: Counter, *,
+                  today: date, raw_fetcher: Callable, raw_native: Optional[pd.DataFrame] = None,
+                  recorded_dates: Sequence[str] = ()) -> Dict[str, list]:
+    """Judge the candidate events of ONE symbol with ``decide_splits`` (the ONE rule, shared by the daily refresh and the
+    first-read backfill). ``raw_native``: the symbol's RAW daily frame (fetched around the first event when None).
+    Returns ``{"accepted": [(date, factor, kind)], "review": [entry], "pending": [entry]}``; an event with no verdict is
+    reported as pending, never dropped."""
     first = min(e.date for e in cand["splits"] + cand["spinoffs"])
-    raw = raw_fetcher(sym, first - timedelta(days=LOOKBACK_DAYS), today + timedelta(days=1))
+    lookback = timedelta(days=LOOKBACK_DAYS)
+    raw = raw_native if raw_native is not None else raw_fetcher(sym, first - lookback, today + timedelta(days=1))
     frame = _decide_frame(raw) if raw is not None and len(raw) else None
     last_bar = pd.to_datetime(raw["Date"]).max().date() if frame is not None else None
+    out: Dict[str, list] = {"accepted": [], "review": [], "pending": []}
     provable_splits, provable_spins = [], []
-    for kind, evs, out in (("split", cand["splits"], provable_splits), ("spinoff", cand["spinoffs"], provable_spins)):
+    for kind, evs, bucket in (("split", cand["splits"], provable_splits), ("spinoff", cand["spinoffs"], provable_spins)):
         for e in evs:
             if last_bar is None or e.date > last_bar:
-                report["pending"].append({"symbol": sym, "date": e.date.isoformat(), "kind": kind,
-                                          "reason": "no bar on or after the ex-date yet"})
+                out["pending"].append({"symbol": sym, "date": e.date.isoformat(), "kind": kind,
+                                       "reason": "no bar on or after the ex-date yet"})
             else:
-                out.append(e)
+                bucket.append(e)
     if not provable_splits and not provable_spins:
-        return
+        return out
     spinco_cache: Dict[str, Optional[pd.DataFrame]] = {}
 
     def spinco_frame(name: str) -> Optional[pd.DataFrame]:
         if name not in spinco_cache:
-            r = raw_fetcher(name, first - timedelta(days=LOOKBACK_DAYS), today + timedelta(days=1))
+            r = raw_fetcher(name, first - lookback, today + timedelta(days=1))
             spinco_cache[name] = _decide_frame(r) if r is not None and len(r) else None
         return spinco_cache[name]
 
     fmp_events = [e for e in fmp_all if e.symbol == sym]
-    breaks: Dict[str, List[str]] = {}
-    accepted, review = decide_splits({sym: frame}, provable_splits, fmp_events, overrides, stats, breaks=breaks,
+    accepted, review = decide_splits({sym: frame}, provable_splits, fmp_events, overrides, stats, breaks={},
                                      spinoffs=provable_spins, spinco_frame=spinco_frame)
     decided = set()
-    todo = []
+    done = set(recorded_dates)
     for a in accepted:
         decided.add(a["date"])
-        if (a["date"], round(float(a["factor"]), 12)) in recorded:
-            continue
-        todo.append((a["date"], float(a["factor"]), a["kind"]))
+        if a["date"] not in done:
+            out["accepted"].append((a["date"], float(a["factor"]), a["kind"]))
     for r in review:
         decided.add(r["event_date"])
         if r["applied"]:
             continue                                    # decided and applied through an accepted row above
-        report["review"].append({"symbol": sym, "row": {**r, "symbol": sym}})
-        logger.error(f"corporate-actions refresh: {sym} {r['event_date']} needs review (verdict {r['verdict']}: "
-                     f"{r['reason']}); NOT applied, live top-ups of {sym} are refused until an override decides it")
+        out["review"].append({"symbol": sym, "row": {**r, "symbol": sym}})
     for e in provable_splits + provable_spins:
         if e.date.isoformat() not in decided:
-            logger.warning(f"corporate-actions refresh: {sym} {e.date} ratio {e.ratio} produced no verdict (see stats)")
-            report["pending"].append({"symbol": sym, "date": e.date.isoformat(), "kind": "?",
-                                      "reason": "decide_splits gave no verdict (event outside the bars or ratio 1)"})
-    if todo:
-        live_state.rebase_symbol(sym, todo, now=now, sync_split_table=True)
-        for d, f, k in todo:
+            logger.warning(f"corporate-actions: {sym} {e.date} ratio {e.ratio} produced no verdict (see stats)")
+            out["pending"].append({"symbol": sym, "date": e.date.isoformat(), "kind": "?",
+                                   "reason": "decide_splits gave no verdict (event outside the bars or ratio 1)"})
+    return out
+
+
+def _judge_symbol(sym: str, cand: Dict[str, list], fmp_all: List[ListedSplit], overrides: Sequence[dict], stats: Counter, *,
+                  today: date, now: datetime, raw_fetcher: Callable, report: dict) -> None:
+    recorded = [d for d, _, _ in live_state.manifest_events(sym)]
+    res = decide_events(sym, cand, fmp_all, overrides, stats, today=today, raw_fetcher=raw_fetcher, recorded_dates=recorded)
+    report["pending"] += res["pending"]
+    for entry in res["review"]:
+        r = entry["row"]
+        report["review"].append(entry)
+        logger.error(f"corporate-actions refresh: {sym} {r['event_date']} needs review (verdict {r['verdict']}: "
+                     f"{r['reason']}); NOT applied, live top-ups of {sym} are refused until an override decides it")
+    if res["accepted"]:
+        live_state.rebase_symbol(sym, res["accepted"], now=now, sync_split_table=True)
+        for d, f, k in res["accepted"]:
             report["applied"].append({"symbol": sym, "date": d, "factor": f, "kind": k})
-        logger.info(f"corporate-actions refresh: {sym} re-based for {todo}")
+        logger.info(f"corporate-actions refresh: {sym} re-based for {res['accepted']}")
+
+
+def candidate_events(month: Dict[str, list], symbol: str, stats: Counter) -> Dict[str, list]:
+    """The listed splits / spin-offs of ``symbol`` in an Alpaca corporate-actions answer."""
+    listed = [e for e in alpaca_events_from_actions([month], {}, stats) if e.symbol == symbol]
+    spins = [e for e in spinoff_events_from_actions([month], {}, stats) if e.symbol == symbol]
+    return {"splits": listed, "spinoffs": spins}
 
 
 def _merge_and_write(report: dict, checked: Sequence[str], full_run: bool) -> None:

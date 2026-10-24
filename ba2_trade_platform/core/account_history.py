@@ -69,7 +69,8 @@ def history_spec_for_account(account_id: int):
     settings = account_settings(account_id)
     if validate_account_history_source(settings) == "fmp":
         return "fmp", {}
-    return "alpaca_hist", {**alpaca_keys(settings), "corporate_actions_refresher": corporate_actions_refresher()}
+    return "alpaca_hist", {**alpaca_keys(settings), "corporate_actions_refresher": corporate_actions_refresher(),
+                           "fmp_split_rows": _fmp_rows_getter()}
 
 
 def history_provider_for_account(account_id: int):

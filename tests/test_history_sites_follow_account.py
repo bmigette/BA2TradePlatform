@@ -69,7 +69,7 @@ def test_expert_bundle_ohlcv_follows_the_account(wired_history_resolver):
     calls = []
     got_a = _expert_bundle(ea.id, calls).ohlcv()
     got_f = _expert_bundle(ef.id, calls).ohlcv()
-    assert (got_a.name, sorted(got_a.kw)) == ("alpaca_hist", ["api_key", "api_secret", "corporate_actions_refresher"])
+    assert (got_a.name, sorted(got_a.kw)) == ("alpaca_hist", ["api_key", "api_secret", "corporate_actions_refresher", "fmp_split_rows"])
     assert (got_f.name, got_f.kw) == ("fmp", {})
 
 

@@ -42,12 +42,20 @@ class AlpacaHistoryOHLCVProvider(MarketDataProviderInterface):
 
     def __init__(self, api_key: Optional[str] = None, api_secret: Optional[str] = None, *,
                  fetcher: Optional[Any] = None, clock: Optional[Callable[[], datetime]] = None,
-                 corporate_actions_refresher: Optional[Callable[[str], None]] = None):
+                 corporate_actions_refresher: Optional[Callable[[str], None]] = None,
+                 corporate_actions_client: Optional[Any] = None,
+                 fmp_split_rows: Optional[Callable[..., list]] = None):
         super().__init__()
         self._fetcher = fetcher
-        if self._fetcher is None and api_key and api_secret:
-            from ba2_providers.ohlcv.alpaca_history.live_fetch import AlpacaLiveBars
-            self._fetcher = AlpacaLiveBars(api_key, api_secret)
+        self._ca_client = corporate_actions_client
+        self._fmp_split_rows = fmp_split_rows
+        if api_key and api_secret:
+            if self._fetcher is None:
+                from ba2_providers.ohlcv.alpaca_history.live_fetch import AlpacaLiveBars
+                self._fetcher = AlpacaLiveBars(api_key, api_secret)
+            if self._ca_client is None:
+                from ba2_providers.ohlcv.alpaca_history.corporate_actions import AlpacaCorporateActions
+                self._ca_client = AlpacaCorporateActions(api_key, api_secret)
         self._clock = clock
         self._refresher = corporate_actions_refresher
         logger.debug(f"Initialized AlpacaHistoryOHLCVProvider ({'live top-up' if self._fetcher else 'cache-only'})")
@@ -64,10 +72,12 @@ class AlpacaHistoryOHLCVProvider(MarketDataProviderInterface):
         interval: Annotated[str, "Data interval"] = "1d",
     ) -> pd.DataFrame:
         if self.live:
-            from ba2_providers.ohlcv.alpaca_history.live_topup import SymbolNotInHistory
-            raise SymbolNotInHistory(
-                f"{symbol} ({interval}): not in the prepared Alpaca history (not in the build); live reads "
-                f"only extend an existing history, they never backfill one")
+            # No file for this symbol / interval: backfill it on first read (owner 2026-10-24, new symbols are supported)
+            from ba2_common.core import ohlcv_final_bars
+            from ba2_providers.ohlcv.alpaca_history import live_backfill
+            now = self._clock() if self._clock is not None else ohlcv_final_bars.now_utc()
+            return live_backfill.backfill(symbol, self._live_interval(interval, symbol), fetcher=self._fetcher, now=now,
+                                          ca_client=self._ca_client, fmp_rows=self._fmp_split_rows)
         raise HistoryTopUpUnavailable(
             f"AlpacaHistoryOHLCVProvider has no live source: {symbol} ({interval}) "
             f"{start_date} .. {end_date} is not in the prepared cache (or the cache is stale). "
