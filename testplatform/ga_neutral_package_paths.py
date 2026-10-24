@@ -19,6 +19,13 @@ GA_NEUTRAL_GLOBS = [
     "packages/common/tests/test_ibkr_*.py",
     # PennyMomentumTrader live price fetch (vendor_live_price=fmp): intraday live trader, never run by GA/backtest.
     "packages/experts/ba2_experts/PennyMomentumTrader/data_gathering.py",
+    # Alpaca history LIVE top-up / backfill / corporate-actions refresh (plan 2026-10-24-history-source-task11): modules that
+    # exist only behind account API keys. The backtest builds AlpacaHistoryOHLCVProvider WITHOUT keys (cache-only), where
+    # every one of these is unreachable; the provider file keeps its keyless behaviour byte for byte (pinned by
+    # test_alpaca_history_provider.py: HistoryTopUpUnavailable, no fetch) and only gains the keyed branches.
+    "packages/providers/ba2_providers/ohlcv/alpaca_history/live_*.py",
+    "packages/providers/ba2_providers/ohlcv/alpaca_history/corporate_actions.py",
+    "packages/providers/ba2_providers/ohlcv/AlpacaHistoryOHLCVProvider.py",
     # Tests, docs and READMEs never ship to GA code paths.
     "packages/*/tests/*",
     "packages/*/test_files/*",
