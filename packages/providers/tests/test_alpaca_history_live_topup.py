@@ -1,5 +1,5 @@
 """Top-up core: finished sessions, continuity, split table, seam (synthetic frames, fake fetcher, no network)."""
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
@@ -7,7 +7,7 @@ import pytest
 from ba2_common.core.market_calendar import regular_session_dates
 from ba2_providers.ohlcv.alpaca_history import live_topup
 from ba2_providers.ohlcv.alpaca_history.live_topup import (
-    MAX_BACKFILL_SESSIONS, PendingCorporateAction, SymbolNotInHistory, TopUpGap, TopUpTooFarBehind, topup_frame)
+    CHUNK_SESSIONS, PendingCorporateAction, SymbolNotInHistory, TopUpGap, topup_frame)
 
 
 def utc(y, m, d, h=12):
@@ -159,22 +159,62 @@ def test_explained_split_seam_is_accepted_when_table_has_it():
     assert len(merged) == 6                       # seam on the event date: the bar on the event date is not adjusted
 
 
-def test_symbol_not_in_history_and_too_far_behind():
+def test_symbol_not_in_history():
     with pytest.raises(SymbolNotInHistory):
         run(daily_cached("2026-10-16").iloc[0:0], Fetcher(raw_daily([])), utc(2026, 10, 24))
-    cached = daily_cached("2026-01-02")
-    with pytest.raises(TopUpTooFarBehind):
-        run(cached, Fetcher(raw_daily([])), utc(2026, 10, 24))
 
 
-def test_backfill_within_the_limit_is_one_contiguous_append():
-    cached = daily_cached("2026-09-04")
-    days = regular_session_dates(date(2026, 9, 8), date(2026, 10, 23))
-    assert 0 < len(days) <= MAX_BACKFILL_SESSIONS + 5
-    cached = daily_cached(days[-(MAX_BACKFILL_SESSIONS)].isoformat())          # 29 sessions behind
-    exp = regular_session_dates(date.fromisoformat(str(cached["Date"].max().date())), date(2026, 10, 23))[1:]
-    merged, rep = run(cached, Fetcher(raw_daily(exp)), utc(2026, 10, 24))
-    assert rep["sessions"] == exp and merged["Date"].is_monotonic_increasing
+@pytest.mark.parametrize("behind", [60, 250])
+def test_a_long_gap_is_appended_contiguously_in_bounded_chunks(behind):
+    last = regular_session_dates(date(2024, 1, 2), date(2026, 10, 23))[-(behind + 1)]
+    cached = daily_cached(last.isoformat())
+    exp = regular_session_dates(last, date(2026, 10, 23))[1:]
+    assert len(exp) == behind
+    f = Fetcher(raw_daily(exp))
+    merged, rep = run(cached, f, utc(2026, 10, 24))
+    assert rep["sessions"] == exp and rep["appended"] == behind
+    assert merged["Date"].is_monotonic_increasing and not merged["Date"].duplicated().any()
+    assert len(f.calls) == -(-behind // CHUNK_SESSIONS)                      # ceil(behind / 30) requests
+    sizes = [len(regular_session_dates(a, b - timedelta(days=1))) for a, b in f.calls]
+    assert max(sizes) <= CHUNK_SESSIONS and sum(sizes) == behind
+
+
+def test_one_failing_chunk_appends_nothing():
+    last = regular_session_dates(date(2025, 1, 2), date(2026, 10, 23))[-101]
+    cached = daily_cached(last.isoformat())
+    exp = regular_session_dates(last, date(2026, 10, 23))[1:]
+    inner = Fetcher(raw_daily(exp))
+
+    def flaky(start, end):
+        if len(inner.calls) == 2:
+            raise RuntimeError("HTTP 500 on chunk 3")
+        return inner(start, end)
+    with pytest.raises(RuntimeError, match="chunk 3"):
+        run(cached, flaky, utc(2026, 10, 24))
+    assert len(cached) == 5                                                  # the cached frame itself is untouched
+
+
+def test_a_missing_session_in_a_late_chunk_appends_nothing(errors):
+    last = regular_session_dates(date(2025, 1, 2), date(2026, 10, 23))[-101]
+    cached = daily_cached(last.isoformat())
+    exp = regular_session_dates(last, date(2026, 10, 23))[1:]
+    with pytest.raises(TopUpGap):
+        run(cached, Fetcher(raw_daily([d for d in exp if d != exp[75]])), utc(2026, 10, 24))
+    assert errors
+
+
+def test_a_split_inside_a_long_range_is_applied_like_a_short_one():
+    last = regular_session_dates(date(2025, 1, 2), date(2026, 10, 23))[-101]
+    cached = daily_cached(last.isoformat(), close=20.0)
+    exp = regular_session_dates(last, date(2026, 10, 23))[1:]
+    split_day = exp[60]
+    raw = raw_daily(exp, px=40.0)
+    raw.loc[pd.to_datetime(raw["Date"]) >= pd.Timestamp(split_day), ["Open", "High", "Low", "Close"]] /= 2     # raw price halves
+    merged, _ = run(cached, Fetcher(raw), utc(2026, 10, 24), splits=[(split_day.isoformat(), 2.0)])
+    new = merged.iloc[len(cached):]
+    assert new["Close"].round(6).eq(20.0).all()                              # pre-event bars divided, post-event as traded: one basis
+    with pytest.raises(PendingCorporateAction):                              # the same range with the split NOT accepted
+        run(cached, Fetcher(raw), utc(2026, 10, 24))
 
 
 def test_5min_appends_whole_sessions_regular_hours():

@@ -185,14 +185,14 @@ def build_age_sessions(today: date) -> int:
 
 
 def build_age_problem(today: date) -> Optional[str]:
-    """A message when the build is further behind than a single append may cover (``MAX_BACKFILL_SESSIONS``): the live top-up then
-    refuses every symbol that has not been read since, until the cache is rebuilt / pushed."""
-    from ba2_providers.ohlcv.alpaca_history.live_topup import MAX_BACKFILL_SESSIONS
+    """A WARNING text when the build is older than one top-up chunk (``CHUNK_SESSIONS``): every symbol not read since is
+    caught up in several requests on its first read (slower, never refused)."""
+    from ba2_providers.ohlcv.alpaca_history.live_topup import CHUNK_SESSIONS
     n = build_age_sessions(today)
-    if n <= MAX_BACKFILL_SESSIONS:
+    if n <= CHUNK_SESSIONS:
         return None
-    return (f"the Alpaca history build ends {live_state.store_asof()}, {n} sessions ago, beyond MAX_BACKFILL_SESSIONS="
-            f"{MAX_BACKFILL_SESSIONS}: symbols not read since will be refused (TopUpTooFarBehind); rebuild the history")
+    return (f"the Alpaca history build ends {live_state.store_asof()}, {n} sessions ago: symbols not read since are caught up "
+            f"in chunks of {CHUNK_SESSIONS} sessions on their first read; consider pushing a fresher build")
 
 
 def all_symbols_with_files() -> List[str]:

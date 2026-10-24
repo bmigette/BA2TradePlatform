@@ -312,12 +312,12 @@ def test_a_known_gap_entry_without_a_reason_refuses_to_load(tmp_path):
     assert live_topup.known_gaps("X") == set()                                              # the shipped file is valid and empty
 
 
-# ---- important 8: the build must be within MAX_BACKFILL_SESSIONS ------------------------------------------------------------
+# ---- important 8: the build must be within CHUNK_SESSIONS ------------------------------------------------------------
 def test_build_age_in_sessions(cache):
     assert ca.build_age_sessions(date(2026, 10, 24)) == 9                                   # store_asof 2026-10-12
-    assert ca.build_age_sessions(date(2026, 12, 24)) > live_topup.MAX_BACKFILL_SESSIONS
+    assert ca.build_age_sessions(date(2026, 12, 24)) > live_topup.CHUNK_SESSIONS
     assert ca.build_age_problem(date(2026, 10, 24)) is None
-    assert "MAX_BACKFILL_SESSIONS" in ca.build_age_problem(date(2026, 12, 24))
+    assert "chunks of 30" in ca.build_age_problem(date(2026, 12, 24))
 
 
 # ---- minor: the FMP key never reaches a log or an error --------------------------------------------------------------------

@@ -63,8 +63,8 @@ Facts the design rests on (all from the code):
    to the newest one. Alpaca's series missing any session in that range -> append NOTHING for that symbol/interval, log
    ERROR naming symbol, interval and the missing sessions, file untouched, the next refresh retries. No duplicate /
    overlapping rows (an already-present session is not re-appended); timestamps strictly increasing after the append. A file
-   more than `MAX_BACKFILL_SESSIONS = 30` sessions behind is still back-filled in one contiguous append if Alpaca returns the
-   full range; beyond that it is refused (named error). 5-min files: every appended SESSION must be present; Alpaca emits no
+   of ANY age is caught up in one contiguous append, fetched in requests of at most `CHUNK_SESSIONS = 30` sessions and appended
+   only when the whole range is in (owner 2026-10-24: no refusal by age; the build-age startup check is a WARNING only). 5-min files: every appended SESSION must be present; Alpaca emits no
    bar for a slot without trades, so slots are NOT required. Chosen completeness rule = the build's own
    (`tools/alpaca_history_download.py`, `days_without_intraday_bars`: every session that has a daily bar must have at least one
    regular-session 5-min bar), regular session only (09:30..15:55 starts, `build.to_native_5min`); the build's selfcons check

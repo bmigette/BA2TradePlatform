@@ -43,13 +43,13 @@ def test_job_scheduled_only_if_an_account_is_alpaca(jm, monkeypatch):
     assert str(job.trigger.timezone) == "America/New_York"
 
 
-def test_scheduling_logs_an_error_when_the_build_is_older_than_the_backfill_limit(jm, monkeypatch):
+def test_scheduling_warns_when_the_build_is_older_than_one_topup_chunk(jm, monkeypatch):
     stub_accounts(monkeypatch, [{"id": 1, "api_key": "k", "api_secret": "s"}])
     monkeypatch.setattr(account_history, "build_age_problem", lambda today=None: "build ends 2026-10-12, 40 sessions ago")
-    errors = []
-    monkeypatch.setattr(JM.logger, "error", lambda m, *a, **k: errors.append(m))
+    warned = []
+    monkeypatch.setattr(JM.logger, "warning", lambda m, *a, **k: warned.append(m))
     jm._schedule_history_corporate_actions_job()
-    assert any("40 sessions ago" in m for m in errors)
+    assert any("40 sessions ago" in m for m in warned)
 
 
 def test_job_removed_when_the_last_alpaca_account_goes(jm, monkeypatch):

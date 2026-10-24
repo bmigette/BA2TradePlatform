@@ -203,7 +203,7 @@ def history_job_is_fresh(now: Optional[datetime] = None) -> bool:
 
 
 def build_age_problem(today=None) -> Optional[str]:
-    """A message when the Alpaca history build is further behind than ``MAX_BACKFILL_SESSIONS`` (None when fine or no manifest)."""
+    """A message when the Alpaca history build is older than one top-up chunk (None when fine or no manifest)."""
     from datetime import date as _date
     from ba2_providers.ohlcv.alpaca_history import corporate_actions
     try:

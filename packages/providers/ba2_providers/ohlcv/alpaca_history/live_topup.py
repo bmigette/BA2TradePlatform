@@ -29,7 +29,8 @@ from ba2_providers.ohlcv.alpaca_history import build
 from ba2_providers.ohlcv.alpaca_history.split_table import JUMP_HI, JUMP_LO
 
 #: A file further behind than this many sessions is refused rather than back-filled (owner: "e.g. 30").
-MAX_BACKFILL_SESSIONS = 30
+#: A top-up of any length is fetched in requests of at most this many sessions and appended only when ALL are in.
+CHUNK_SESSIONS = 30
 
 Fetch = Callable[[date, date], pd.DataFrame]          # (first_session, end_exclusive) -> RAW native frame
 
@@ -47,10 +48,6 @@ class TopUpGap(TopUpRefused):
         self.symbol, self.interval, self.missing = symbol, interval, list(missing)
         super().__init__(f"{symbol} ({interval}): Alpaca returned no bars for session(s) "
                          f"{[d.isoformat() for d in self.missing]}; nothing appended; {GAP_HELP}")
-
-
-class TopUpTooFarBehind(TopUpRefused):
-    pass
 
 
 class PendingCorporateAction(TopUpRefused):
@@ -116,11 +113,13 @@ def topup_frame(cached: pd.DataFrame, fetch: Fetch, splits: Sequence[Tuple[str, 
     expected = regular_session_dates(last_day + timedelta(days=1), newest)
     if not expected:
         return cached, {"appended": 0, "sessions": []}
-    if len(expected) > MAX_BACKFILL_SESSIONS:
-        raise TopUpTooFarBehind(f"{symbol} ({interval}): {len(expected)} sessions behind (max {MAX_BACKFILL_SESSIONS})")
-    raw = fetch(expected[0], expected[-1] + timedelta(days=1))
-    if raw is None:
-        raw = cached.iloc[0:0]
+    parts = []
+    for i in range(0, len(expected), CHUNK_SESSIONS):          # bounded requests; ANY failure raises and nothing is appended
+        chunk = expected[i:i + CHUNK_SESSIONS]
+        part = fetch(chunk[0], chunk[-1] + timedelta(days=1))
+        if part is not None and len(part):
+            parts.append(part)
+    raw = pd.concat(parts, ignore_index=True) if parts else cached.iloc[0:0]
     exp = set(expected)
     new = raw[~pd.to_datetime(raw["Date"]).isin(set(pd.to_datetime(cached["Date"])))] if len(raw) else raw
     have = set(_days(new).dt.date) if len(new) else set()
