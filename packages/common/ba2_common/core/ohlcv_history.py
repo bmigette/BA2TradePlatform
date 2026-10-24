@@ -71,3 +71,24 @@ def other_history_cache_dirnames(source: str) -> Tuple[str, ...]:
     """The cache folders of every source except ``source`` (what a push for a ``source`` job leaves out)."""
     check_history_source(source)
     return tuple(sorted(folder for name, (_key, folder) in HISTORY_SOURCES.items() if name != source))
+
+
+#: The account setting that selects the live history source of that account's experts / transactions.
+ACCOUNT_HISTORY_SOURCE_KEY = "ohlcv_history_source"
+
+#: What an account with no (or a cleared) setting reads: the only place that spells this default
+#: (owner 2026-10-20: live stays FMP until an account is switched).
+ACCOUNT_DEFAULT_HISTORY_SOURCE = "fmp"
+
+
+def account_history_source(settings: Mapping) -> str:
+    """The history source of an account from its settings dict: absent / ``None`` -> the declared default;
+    a string -> its trimmed lower-case spelling, which must be known; anything else refuses
+    (``UnknownHistorySource``). An empty string refuses (the settings loader maps a stored empty to ``None``)."""
+    raw = settings[ACCOUNT_HISTORY_SOURCE_KEY] if ACCOUNT_HISTORY_SOURCE_KEY in settings else None
+    if raw is None:
+        return ACCOUNT_DEFAULT_HISTORY_SOURCE
+    if not isinstance(raw, str):
+        raise UnknownHistorySource(
+            f"{ACCOUNT_HISTORY_SOURCE_KEY} must be a string, got {type(raw).__name__} {raw!r}")
+    return check_history_source(raw.strip().lower())
