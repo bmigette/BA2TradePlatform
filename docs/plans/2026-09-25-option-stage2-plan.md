@@ -18,6 +18,113 @@ from the stage-1 (and LEAPS-grid) winners.
 
 ---
 
+## 0. Stage-1 review and the stage-2 job set (user-approved 2026-10-24)
+
+Evidence: `reports/stage1_review_2026-10-24/` holds three reports.
+- `A_genome_convergence.md`: which genes converged.
+- `B_trades_regimes.md`: trades, SPY regimes, correlations and blends.
+- `C_ruleset_capabilities.md`: what the ruleset layer and `O_STYLE` can express.
+
+All of it comes from the stage-1 `-st1fix` TOP1 rows in the local test DB (opt 117-133 since the
+2026-10-24 merge; DeterministicScorer, 97 names, 2020-2025, $20k).
+
+### 0.1 What stage 1 says
+
+1. **Five return engines; the rest is carry.**
+
+   | Structure | CAR | Max DD | Where it earns |
+   |---|---|---|---|
+   | O_LC | 109% | -41% | calm uptrend; 2022: -28% |
+   | O_BULLCS | 66% | -34% | uptrend and pullback; 2022: +3% |
+   | O_STRG | 66% | -39% | DOWN, PULLBACK and vol shocks; 2020 crash +129%, 2022 +31% |
+   | O_BF | 53% | -29% | uptrend with expanding vol |
+   | O_STRD | 42% | -25% | DOWN and PULLBACK; 2022 +38% |
+
+   CSP, WHEEL, CC, PP, RS, JL, IC, BULLPS and VERT make 4-32%/yr. WHEEL, CC and PP track SPY
+   (daily correlation 0.80, 0.75 and 0.36). The PP option legs lose money.
+2. **Regime switching is justified.**
+   - No pair of TOP1 monthly-return series correlates above 0.57.
+   - An equal-weight daily blend of LC+BULLCS+BF+STRG gives about 84%/yr at -15% DD, against
+     LC alone at 109% / -41%. That blend is not a shared-capital expert, but it bounds what
+     regime routing can gain.
+3. **Entries are decided by market-condition gates, not by the DS signal.** Only O_LC needs DS
+   bullishness.
+   - The most used gate is the 5d/20d realised-vol ratio: calm (< 1.25-1.5) for LC, BULLPS,
+     RS and STRD; expanding (> 1 for BF, > 1.5 for STRG).
+   - Then 50d slope, swing structure, distance to support/resistance and ADX: IC < 15,
+     STRD > 30.
+   - **Every gate reads the underlying only. Nothing reads the market (SPY)**, yet the SPY
+     trend x vol regime is what separates the engines (B §2).
+4. **All of stage 1 is mid-term.**
+   - Median hold is 17-56 days and p90 is at most 67; nothing goes past 90 days.
+   - DTE genes were pinned at the range maximum for BULLCS (60), STRD (55) and JL (50), and at
+     the minimum (20) for the WHEEL put.
+   - There is no short-term evidence. The long term needs stage 1.5: O_LEAP (opt 1) is at 75%
+     with best 19.19, against O_LC's 25.5.
+5. **Caveats.**
+   - **Compounding:** O_LC's +8,160% is mostly size growth (88% of its dollar P&L comes from
+     2024-25). Its best trade is +$151k on 40 cheap LRCX calls, with liquidity not modelled.
+   - **Concentration:** the top-5 underlyings make 41-75% of P&L in every strategy.
+   - **Assignment cost:** stock taken on assignment and sold 3 days later costs 70% of the JL
+     credit.
+   - **Dead genes everywhere:** `k_stop`, `k_target`, `atr_*`, `min_stop_loss_pct`,
+     `regime_*`, `risk_per_trade_pct` and the weekend `schedule:*` genes.
+
+### 0.2 The stage-2 job set (one style expert per HORIZON, members routed by regime)
+
+Each job is an `O_STYLE` expert (§3 item 1). Members are ordered (first passing rule wins) and
+their regime gates are disjoint. That is required: a refused action does NOT fall through to the
+next member (`TradeActionEvaluator.py:446-500`). One job per horizon also avoids the "same
+structure key twice" limit of the style loader.
+
+**A. MID: 30-90 DTE, about 3-8 week holds. The main job, built first.** Members in priority order:
+
+| # | Member | Regime (gates) | Structure / exits (seed from stage 1) |
+|---|---|---|---|
+| 1 | O_STRG, then O_STRD | vol shock or down market: stock 5d/20d RV > about 1.5, OR SPY below SMA200 with SMA50 falling | long strangle / straddle, 30-60 DTE |
+| 2 | O_BULLCS | pullback in an uptrend: SPY above SMA200, stock slope > 0, near support, iv_rank < 30 | debit call spread, 45-90 DTE, TP +100-125% |
+| 3 | O_BF | uptrend, vol expanding: bull swing structure, RV ratio > 1 | call butterfly, 25-45 DTE, TP +100% |
+| 4 | O_LC | calm uptrend with a bullish DS: confidence > 50, RV ratio < 1.25, SPY trend UP | long call, 30-60 DTE, TP +75% |
+
+The GA searches each member's thresholds and toggles, seeded from the stage-1 TOP genomes. The
+seeding rule is still a §5 decision.
+
+**B. SHORT: 7-21 DTE. Pilot first, no evidence yet.**
+- Single-structure jobs O_LC, O_BULLCS and O_STRG at DTE 7-21, with fast exits: time exit after
+  5-10 days, TP +50-100%.
+- A short style expert only if those hold up.
+- The fill model is weakest here: daily bars, constant parquet spreads, no real quotes.
+
+**C. LONG: 90-365+ DTE. After stage 1.5.** Members are O_LEAP, O_PMCC, O_CONVEX and O_BULLCS at
+90-180 DTE; membership is settled from the 1.5 results.
+
+**Premium / carry styles are dropped from stage 2** (user goal: high risk/reward). They are low CAR
+and partly SPY beta. They may return later as a separate low-DD carry job.
+
+### 0.3 Changes common to every stage-2 job
+
+1. **A SPY (benchmark) regime gate**: SPY trend (above/below SMA200, SMA50 slope) and SPY
+   realised vol, read point-in-time from the prior session. Today's gates only observe the
+   instrument (C §3). It is built on its own branch (2026-10-24 go: "implement spy regime if
+   needed") and merged at a job boundary.
+2. No stock-price caps; sizing on worst-case risk; the option RM on (§3 item 9). Per-instrument
+   cap ranges per §3 item 8.
+3. Widen the DTE ranges that pinned at their bound (per horizon above). Drop the dead genes of
+   0.1 item 5.
+4. Fitness with an equity cap (`--equity-cap`), so compounding into illiquid sizes is not rewarded.
+5. The 753-name universe (the §1 table and the universe decision); measure the cost in the §4
+   pilot.
+
+### 0.4 Order (user 2026-10-24)
+
+1. Now: this section; the SPY regime gate on a branch (TDD).
+2. **Wait for stage 1.5 to finish**, then finalize the member lists (C needs it) and implement
+   the drivers (§3 items 2-3: seeding and `--profile style`).
+3. Pilots: B's single-structure short jobs, plus A's cost and option-RM pilot (§4, §3 item 9).
+4. Launch A, then B's style if the pilots hold up, then C.
+
+---
+
 ## 1. Decisions already taken (do not re-litigate)
 
 | Topic | Decision | Source |
