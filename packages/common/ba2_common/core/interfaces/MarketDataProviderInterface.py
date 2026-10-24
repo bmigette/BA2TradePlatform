@@ -18,6 +18,7 @@ from ba2_common import config
 from ba2_common.core.provider_utils import log_provider_call, validate_date_range
 from ba2_common.core.interfaces.DataProviderInterface import DataProviderInterface
 from ba2_common.core import ohlcv_final_bars
+from ba2_common.core.split_basis import IntradayBasisError
 from ba2_common.core.replay.observe import observe_provider
 from ba2_common.core.replay.schemas import ReplayStatus
 
@@ -737,6 +738,174 @@ class MarketDataProviderInterface(DataProviderInterface):
                     self._note_forming_missing(symbol, interval, day, frame)
         frame.attrs[ohlcv_final_bars.FORMING_STATUS_ATTR] = status
 
+    # ---- cross-interval basis (daily vs intraday price levels) ------------------------------
+    #: A provider whose cache has a daily AND intraday series, and which implements
+    #: :meth:`_intraday_basis_problem`, sets this. Without a check the daily rewrite cannot tell whether an
+    #: intraday file is still consistent, so it marks EVERY intraday file of the symbol stale (the safe
+    #: direction); with one, only a file that actually disagrees with the new daily levels is marked.
+    HAS_CROSS_INTERVAL_CHECK = False
+
+    #: Calendar days before the end of a read window that the read guard still judges (a short live lookback
+    #: has too few sessions to be judged on its own). MUST equal ``cross_interval_basis.MIN_JUDGED_DAYS``, which
+    #: the launch preflight uses so that it judges everything the engine will read (a test pins the equality;
+    #: ba2_common may not import ba2_providers).
+    INTRADAY_READ_GUARD_DAYS = 90
+
+    def _intraday_basis_problem(self, symbol: str, interval: str, provider_name: str, *,
+                                frame: Optional[pd.DataFrame] = None,
+                                window: Optional[tuple] = None,
+                                daily_frame: Optional[pd.DataFrame] = None) -> Optional[str]:
+        """A description of how the symbol's INTRADAY cache (``interval``; or ``frame``, INCOMING rows about
+        to be written to it) sits on a different price level than its DAILY cache (the file on disk, or
+        ``daily_frame`` when given), or ``None`` when they agree or cannot be compared (no daily file, too few
+        common sessions). ``window`` = ``(start, end)`` limits the judgement of the file. This base class has
+        no such check; ``FMPOHLCVProvider`` implements it with ``ba2_providers.ohlcv.cross_interval_basis``."""
+        return None
+
+    def _guard_intraday_read(self, symbol: str, interval: str, provider_name: str,
+                             start: datetime, end: datetime) -> None:
+        """Refuse to SERVE an intraday series whose file is marked stale, or whose price levels disagree
+        with the daily file over the requested window (extended back to at least
+        ``INTRADAY_READ_GUARD_DAYS`` so a short live lookback still has enough sessions to be judged). Raises
+        ``IntradayBasisStale`` / ``IntradayBasisMismatch``; a file that is absent is not this guard's business."""
+        from ba2_common.core import native_cache, split_basis
+        path = native_cache.find_timeseries_path(provider_name, symbol, interval)
+        if path is None:
+            return
+        stale = split_basis.read_intraday_stale(path)
+        if stale is not None:
+            raise split_basis.IntradayBasisStale(
+                f"{provider_name} {symbol} ({interval}): READ REFUSED, the cached file is marked stale -- "
+                f"{stale.get('reason')} (marked {stale.get('marked_at_utc')}). Its prices are not on the "
+                f"daily file's split basis. Replace it: force_full_refetch('{symbol}', '{interval}')."
+                + split_basis.OPERATOR_HINT)
+        def _naive(ts):
+            t = pd.Timestamp(ts)
+            return t.tz_localize(None) if t.tzinfo else t
+        hi = _naive(end)
+        lo = min(_naive(start), hi - timedelta(days=self.INTRADAY_READ_GUARD_DAYS))
+        problem = self._intraday_basis_problem(symbol, interval, provider_name, window=(lo, hi))
+        if problem:
+            raise split_basis.IntradayBasisMismatch(
+                f"{provider_name} {symbol} ({interval}): READ REFUSED, the intraday cache is on a different "
+                f"price level than the daily cache -- {problem}. Replace it: "
+                f"force_full_refetch('{symbol}', '{interval}')." + split_basis.OPERATOR_HINT)
+
+    def _guard_intraday_write(self, incoming: pd.DataFrame, symbol: str, interval: str,
+                              provider_name: str) -> None:
+        """Refuse to PERSIST INCOMING intraday rows whose price levels disagree with the symbol's daily file
+        (the vendor's basis today vs a daily cache still on the old one, or the reverse). ONLY the rows being
+        written are judged (plus the continuity of their last sessions with the daily file): the history already
+        in the file is judged by the read guard and the launch preflight, which are window-based. Judging the
+        merged file would make every already-defective file un-extendable by any writer, even with a correct
+        tail. Raises ``IntradayBasisMismatch``; nothing is written."""
+        from ba2_common.core import split_basis
+        problem = self._intraday_basis_problem(symbol, interval, provider_name, frame=incoming)
+        if problem:
+            raise split_basis.IntradayBasisMismatch(
+                f"{provider_name} {symbol} ({interval}): WRITE REFUSED, the incoming bars are on a "
+                f"different price level than the daily cache -- {problem}. The cache file is untouched."
+                + split_basis.OPERATOR_HINT)
+
+    def _after_daily_replaced(self, symbol: str, provider_name: str, reason: str) -> None:
+        """The DAILY file of ``symbol`` was just REPLACED by a full re-fetch (a split / re-adjustment).
+        Every intraday file of the symbol was fetched on the OLD basis, so it is marked stale unless the
+        cross-interval check shows it still agrees with the new daily levels (then: logged, not marked).
+        No vendor call, no data change: the state is made explicit and the readers/writers refuse it.
+
+        THIS RUNS AFTER A SUCCESSFUL REPLACEMENT and must never turn it into a failure: the daily file and its
+        full-fetch marker are already written, and the caller (``_verified_tail_topup``, inside a live daily
+        read) would report 'top-up REFUSED, cache left untouched', which would be false. A marker that cannot be
+        written (``OSError``: permissions, disk full, a locked folder) is logged at ERROR naming the file and the
+        consequence, and the daily path returns normally; the reader-side price check still refuses that file."""
+        from ba2_common.core import native_cache, split_basis
+        try:
+            paths = native_cache.intraday_paths(provider_name, symbol)
+        except OSError as e:
+            logger.error(f"{provider_name} {symbol}: daily history was replaced, but the intraday files could not be "
+                         f"listed to be checked/marked ({type(e).__name__}: {e}). They may be on the old basis; "
+                         f"the readers' price check still refuses a file that disagrees with the daily levels.")
+            return
+        for path in paths:
+            spelling = os.path.basename(path)[len(symbol) + 1:-len(".parquet")]
+            problem = None
+            if self.HAS_CROSS_INTERVAL_CHECK:
+                try:
+                    problem = self._intraday_basis_problem(symbol, spelling, provider_name)
+                except Exception as e:  # noqa: BLE001 -- a check that cannot run must not clear the file:
+                    problem = f"the cross-interval check itself failed ({type(e).__name__}: {e})"
+                if problem is None:
+                    logger.info(f"{provider_name} {symbol}: daily history replaced; the {spelling} file "
+                                f"still agrees with the new daily price levels -- not marked stale")
+                    continue
+            why = (f"daily history replaced by a full re-fetch ({reason}); {spelling} file not refetched"
+                   + (f"; cross-interval check: {problem}" if problem else ""))
+            try:
+                split_basis.write_intraday_stale(path, reason=why)
+            except OSError as e:
+                logger.error(f"{provider_name} {symbol} ({spelling}): the stale marker for {path} could NOT be written "
+                             f"({type(e).__name__}: {e}). The daily history IS replaced; this intraday file is "
+                             f"probably on the old basis but is NOT marked, so only the readers' price check "
+                             f"(a >1.2% level difference) protects it. Mark/repair it by hand: "
+                             f"tools/repair_intraday_basis.py markers; reason would have been: {why}")
+                continue
+            logger.warning(f"{provider_name} {symbol} ({spelling}): intraday cache MARKED STALE -- {why}. "
+                           f"Readers and writers of it refuse until force_full_refetch('{symbol}', "
+                           f"'{spelling}') replaces it.")
+
+    def _vet_incoming_intraday(self, symbol: str, interval: str, provider_name: str, incoming: pd.DataFrame):
+        """BEFORE an intraday file is replaced by the vendor's history: is the incoming frame on the daily
+        file's basis? Returns None when it is (or cannot be compared, or this provider has no check), or the
+        vendor-current DAILY frame when the cached daily file is the stale side (the incoming frame agrees with
+        a fresh daily fetch). RAISES ``IntradayVendorBasisConflict`` when the incoming frame disagrees with the
+        vendor's OWN fresh daily history too: the vendor serves the two endpoints on different bases, a refetch
+        can never fix it, and NOTHING is written (the existing file stays exactly as it was: marked or not)."""
+        if not self.HAS_CROSS_INTERVAL_CHECK:
+            return None
+        from ba2_common.core import split_basis
+        problem = self._intraday_basis_problem(symbol, interval, provider_name, frame=incoming)
+        if problem is None:
+            return None
+        logger.warning(f"{provider_name} {symbol} ({interval}): the incoming vendor history disagrees with the "
+                       f"cached DAILY file ({problem}); checking it against a fresh vendor daily fetch")
+        now = datetime.now()
+        fresh = self._get_ohlcv_data_impl(symbol, now - timedelta(days=365 * 15), now, '1d')
+        if fresh is None or fresh.empty:
+            raise RuntimeError(f"{provider_name} {symbol} ({interval}): the incoming intraday history disagrees with "
+                               f"the cached daily file and the vendor returned no daily history to decide which "
+                               f"side is stale; nothing was written")
+        fresh = self._clean_dataframe(fresh.copy())
+        problem2 = self._intraday_basis_problem(symbol, interval, provider_name, frame=incoming, daily_frame=fresh)
+        if problem2 is not None:
+            raise split_basis.IntradayVendorBasisConflict(
+                f"{provider_name} {symbol} ({interval}): the vendor's intraday basis differs from its daily basis "
+                f"for {problem2}. The vendor serves old dates as-traded on one endpoint and split-adjusted on the "
+                f"other; a refetch cannot repair it. NOTHING was written: the existing file is untouched (and its "
+                f"stale marker, if any, unchanged). Options: tools/repair_intraday_basis.py (rebase to the daily "
+                f"basis, with provenance) or the reviewed exclusion list." + split_basis.OPERATOR_HINT)
+        return fresh
+
+    def _after_intraday_replaced(self, symbol: str, interval: str, provider_name: str,
+                                 daily_was_stale: bool) -> None:
+        """An intraday file was just REPLACED on the vendor's current basis. When the cached DAILY file was the
+        stale side (``_vet_incoming_intraday``), re-fetch it as well (one cheap call) and verify the pair; a
+        pair that still disagrees afterwards is marked and fails LOUDLY."""
+        if not (self.HAS_CROSS_INTERVAL_CHECK and daily_was_stale):
+            return
+        from ba2_common.core import native_cache, split_basis
+        logger.warning(f"{provider_name} {symbol} ({interval}): the intraday history was just replaced on the "
+                       f"vendor's current basis; the cached DAILY file was the stale side, re-fetching it too")
+        self.force_full_refetch(symbol, '1d', provider_name=provider_name, mark_intraday=False)
+        problem = self._intraday_basis_problem(symbol, interval, provider_name)
+        if problem is not None:
+            path = native_cache.find_timeseries_path(provider_name, symbol, interval)
+            if path is not None:
+                split_basis.write_intraday_stale(path, reason=f"still disagrees with the re-fetched daily history: {problem}")
+            raise split_basis.IntradayBasisMismatch(
+                f"{provider_name} {symbol} ({interval}): the intraday and the daily history still disagree "
+                f"after BOTH were re-fetched from the vendor -- {problem}. The intraday file is marked stale."
+                + split_basis.OPERATOR_HINT)
+
     # ---- native parquet as_of store helpers (get_ohlcv_data) -----------------
     def _write_ohlcv_parquet(self, df: pd.DataFrame, provider_name: str,
                              symbol: str, interval: str) -> None:
@@ -756,6 +925,10 @@ class MarketDataProviderInterface(DataProviderInterface):
         out = df.copy()
         out['Date'] = pd.to_datetime(out['Date'])
         out['effective_date'] = out['Date']
+        if interval in _INTRADAY_INTERVALS:
+            # only the INCOMING rows are judged (the history already in the file is the read guard's / the
+            # preflight's business): see _guard_intraday_write
+            self._guard_intraday_write(out, symbol, interval, provider_name)
 
         existing = None
         path = native_cache.find_timeseries_path(provider_name, symbol, interval)
@@ -873,7 +1046,12 @@ class MarketDataProviderInterface(DataProviderInterface):
                         .sort_values('Date')
                         .reset_index(drop=True))
                 from ba2_common.core import native_cache
+                self._guard_intraday_write(new_df, symbol, interval, provider_name)   # incoming rows only
                 native_cache.write_timeseries(provider_name, symbol, interval, df)
+        except IntradayBasisError:
+            # NOT swallowed with the vendor/IO failures below: serving the freshly merged frame
+            # would hand a caller a series whose levels the daily cache contradicts.
+            raise
         except Exception as e:
             logger.warning(
                 f"Failed to refresh parquet cache for {symbol} ({interval}): {e}"
@@ -1165,9 +1343,18 @@ class MarketDataProviderInterface(DataProviderInterface):
     def force_full_refetch(self, symbol: str, interval: str = '1d',
                            provider_name: Optional[str] = None, *,
                            verify=None,
-                           keep_newer_cached_tail: bool = False) -> pd.DataFrame:
+                           keep_newer_cached_tail: bool = False,
+                           mark_intraday: bool = True) -> pd.DataFrame:
         """REPLACE (never merge) the cached daily history of ``symbol`` with a fresh full-history
         fetch -- the same 15-year window as the cold fill -- and record the full-fetch marker.
+
+        CROSS-INTERVAL BASIS. A DAILY replacement is the moment the symbol's daily levels move to a new
+        split basis, so the symbol's intraday files (never refetched here: hundreds of vendor calls
+        each) are checked and, when they are not on the new levels, MARKED STALE
+        (:meth:`_after_daily_replaced`): their readers and writers refuse until they are replaced.
+        ``mark_intraday=False`` skips that (the intraday-replacement path, which has just replaced the
+        intraday file itself). An INTRADAY replacement clears the file's stale marker and then checks
+        the daily file against it (:meth:`_after_intraday_replaced`).
 
         Merging would keep the stale pre-split bars, which is exactly what this repairs.
 
@@ -1243,16 +1430,28 @@ class MarketDataProviderInterface(DataProviderInterface):
                 logger.warning(f"{provider_name} {symbol} ({interval}): dropped {len(tail_forming)} unfinished "
                                f"bar(s) found in the kept cached tail")
             out = out.reset_index(drop=True)
+        intraday = interval in _INTRADAY_INTERVALS
+        # BEFORE touching the existing file: is the vendor's intraday history on the daily file's basis? (it may
+        # not be: the vendor serves old dates as-traded on its intraday endpoint for many symbols)
+        daily_was_stale = False
+        if intraday:
+            daily_was_stale = self._vet_incoming_intraday(symbol, interval, provider_name, out) is not None
         self._refuse_shorter_replacement(out, existing_path, symbol, interval, provider_name)
         if verify is not None:
             verify(out)
-        native_cache.write_timeseries(provider_name, symbol, interval, out)
+        native_cache.write_timeseries(provider_name, symbol, interval, out, replace_stale=intraday)
         path = native_cache.find_timeseries_path(provider_name, symbol, interval)
         write_full_fetch_marker(path, first_bar=pd.Timestamp(out['Date'].iloc[0]).date(),
                                 last_bar=pd.Timestamp(out['Date'].iloc[-1]).date(), rows=len(out))
         logger.info(f"{provider_name} {symbol} ({interval}): replaced the cache with {len(out)} "
                     f"freshly fetched bars")
         self._remember_unfinished_bars(forming, symbol, interval, provider_name)   # only after a verified, written replacement
+        if intraday:
+            self._after_intraday_replaced(symbol, interval, provider_name, daily_was_stale)
+        elif mark_intraday:
+            self._after_daily_replaced(
+                symbol, provider_name,
+                f"{len(out)} bars from {pd.Timestamp(out['Date'].iloc[0]).date()}")
         return out
 
     def _append_newer_cached_tail(self, out: pd.DataFrame, existing_path: str, symbol: str,
@@ -1631,6 +1830,9 @@ class MarketDataProviderInterface(DataProviderInterface):
 
         provider_name = type(self).__name__
         df = None
+        if use_cache and interval in _INTRADAY_INTERVALS:
+            # A stale or price-level-contradicted intraday file is never served (cross-interval basis).
+            self._guard_intraday_read(symbol, interval, provider_name, normalized_start, end_date)
         if use_cache:
             df = native_cache.read_timeseries(provider_name, symbol, interval, as_of=end_date)
             if df is not None and df.empty:
