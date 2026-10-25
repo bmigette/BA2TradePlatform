@@ -154,6 +154,8 @@ SITES = {
         "_BacktestProviderBundle: the daily-clock historical close (identical to the live bundle); intraday goes to the account",
     (f"{ENG}/market_condition_bt.py", "source-import", "from app.services.backtest.price_source import _is_intraday"):
         "imports the interval classifier (is the run intraday?), not a price",
+    (f"{ENG}/intraday_basis_preflight.py", "source-import", "from app.services.backtest.price_source import _is_intraday"):
+        "imports the interval classifier (is the run intraday?), not a price",
     (f"{ENG}/seam_wiring.py", "source-import", "from app.services.backtest.price_source import _is_intraday"):
         "imports the interval classifier (is the run intraday?), not a price",
     (f"{ENG}/parity_harness.py", "source-import", "from app.services.backtest.price_source import AsOfPriceSource"):
@@ -168,6 +170,8 @@ SITES[(f"{ENG}/screener_gate.py", "screener-opening-print", "h = ps.screener_ses
 SITES[(f"{ENG}/price_source.py", "screener-opening-print", "return self.screener_now_price(symbol, as_of)")] =     "the price source's own implementation: the session-high helper falls back to the same owner-approved opening print"
 SITE_COUNTS = {("testplatform/backend/app/services/backtest/daily_engine.py", "source-import",
                 "from app.services.backtest.price_source import BacktestCacheMiss"): 5,
+               ("testplatform/backend/app/services/backtest/intraday_basis_preflight.py", "source-import",
+                "from app.services.backtest.price_source import _is_intraday"): 2,
                ("packages/experts/ba2_experts/FMPSenateTraderWeight.py", "source-import",
                 "from app.services.backtest.price_source import BacktestCacheMiss"): 1}
 SITES[("packages/experts/ba2_experts/FMPSenateTraderWeight.py", "source-import",
