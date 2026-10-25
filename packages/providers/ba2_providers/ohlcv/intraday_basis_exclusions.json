@@ -1,0 +1,4 @@
+{
+ "_doc": "REVIEWED exclusion list of symbols whose INTRADAY price basis is knowingly broken and cannot be repaired (the cross-interval check flags them, the vendor cannot re-serve them on the daily basis, and tools/repair_intraday_basis.py refuses or has not been applied). Read by tools/cache_health_check.py (reported, not a failure) and by the launch (the symbol is REMOVED from the job's universe with a printed line and a results entry via excluded_instruments; a mismatched symbol that is NOT listed still refuses the launch). Same schema and the same rule as ba2_providers/screener/panel_exclusions.json: every entry needs a symbol, a reason, a date (added) and a reviewer (reviewed_by); an entry whose reviewed_by starts with 'pending' is NOT in force (the launch still refuses that symbol). Never a silent tolerance.",
+ "entries": []
+}

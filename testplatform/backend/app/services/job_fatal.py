@@ -14,6 +14,9 @@ from typing import Any
 #:   FillRebaseDisabled     -- the measurement-only no-re-base hook was on in an optimization;
 #:   ScreenerUniverseRefusal -- the screener gate selected symbols outside the job's static universe
 #:                             (the superset derivation is wrong: every genome's result omits tradable picks);
+#:   IntradayBasisMismatch / IntradayBasisStale -- a symbol's intraday cache is on a different price level
+#:                             than its daily cache (a split / re-adjustment rewrote one and not the other):
+#:                             every trial that reads the symbol decides on one basis and prices on another;
 #:   ScreenerGenomeOutOfRange -- a genome's screener gene lies outside the DECLARED range the static universe
 #:                             was derived from (a seed / pin from another job): its picks would be untradable;
 #:   ScreenerDataOutage / PanelCoverageError / ScreenerGateRefusal -- the screener simulation's data is
@@ -32,6 +35,7 @@ JOB_FATAL_ERROR_TYPES = frozenset({
     "AnalysisFailureRefusal", "StaleAnchorPrice", "StaleMarkToMarket", "ComboSettlementRefused",
     "FillRebaseRefusal", "FillRebaseDisabled",
     "ScreenerUniverseRefusal",
+    "IntradayBasisMismatch", "IntradayBasisStale", "IntradayVendorBasisConflict",
     "ScreenerGenomeOutOfRange", "ScreenerDataOutage", "PanelCoverageError", "ScreenerGateRefusal",
     "MetricStoreStaleError",
 })
