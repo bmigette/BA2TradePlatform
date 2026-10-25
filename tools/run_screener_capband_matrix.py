@@ -37,12 +37,31 @@ Usage (test venv; FMP_API_KEY/DB_FILE in env):
         [--bands large,mid,small] [--strategies S1,S2,S3,S4] \
         [--start 2023-01-01] [--end 2026-01-01] [--population 40] [--generations 8] \
         [--interval 5min] [--fitness calmar_ratio] [--include-no-data] [--dry-run]
+
+WALK-FORWARD (goal2027, design docs/plans/2026-10-25-goal2027-grid-design.md 1.2 / 2.5): with
+`--walk-forward` every cell is NOT one optimize job but a chain, built from the cell's own flags:
+
+    <cell>-wf1   train 2020-01-01..2023-12-31  (cold start, --wf-first-generations)   test 2024
+    <cell>-wf2   train ..2024-12-31            (seeded from wf1's final population)    test 2025
+    <cell>-wf3   train ..2025-12-31            (seeded from wf2's final population)    test 2026
+    <cell>-refit train ..2026-12-31            (seeded from wf3; PASSING cells only)
+
+`<cell>` is the name the cell has without --walk-forward. --wf-next-generations budgets wf2, wf3 and
+the refit; --generations and the per-strategy budget overrides are not used. FMPRating's data floor
+(_EXPERT_MIN_START) moves its train start (names keep -from2022). Resume is by name: a completed fold
+is skipped and its stored report (<--wf-report-dir>/<cell>/fold<k>.json) reused. Pass rule:
+--pass-min-oos-return / --pass-max-dd-mult / --pass-min-folds (no defaults) and --pass-require-fold
+<test-year> (repeatable). --wf-data-end clamps the last test window and the refit end (rehearsal on
+data that stops short). Out-of-sample re-runs are local, ~14 GB each. Reports: per cell
+<--wf-report-dir>/<cell>/{cell,report}.json + report.md, grid-wide <--wf-report-dir>/summary.{json,md}.
 """
 import argparse
 import json
 import os
 import subprocess
 import sys
+from datetime import date
+from types import SimpleNamespace
 
 # Sibling helper in tools/ (shared by all three matrix drivers). The directory is put on the
 # path explicitly so the import works however the script is reached (path, -m, or a test import).
@@ -395,6 +414,50 @@ def load_strategy_plan(path, skip_experts=frozenset()) -> dict:
 _FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exited non-zero
 
 
+_WF_STRIP = ("--start", "--end", "--name", "--generations")
+
+
+def wf_optimize_args(cmd: list) -> list:
+    """A cell's base ``optimize`` args for the walk-forward chain: the command the plain driver
+    would run, minus the executable, ``optimize`` and the four flags the chain sets per job
+    (``--start --end --name --generations``). Everything else (cap band, screener, strategy,
+    spread, stress, time genes, early stop, ...) is the cell's own and rides on every job."""
+    out, skip = [], False
+    for tok in cmd[2:]:
+        if skip:
+            skip = False
+            continue
+        if tok in _WF_STRIP:
+            skip = True
+            continue
+        out.append(tok)
+    return out
+
+
+def _wf_selection_defaults() -> dict:
+    import run_walk_forward as RWF
+    return RWF.selection_defaults()
+
+
+def _make_wf_runner(args):
+    """The real runner (ba2-test subprocess + test DB), shared by every cell."""
+    import run_walk_forward as RWF
+    ns = SimpleNamespace(**_wf_selection_defaults(), min_free_gb=args.wf_min_free_gb,
+                         force_memory=args.wf_force_memory)
+    return RWF.RealRunner(ns)
+
+
+def _wf_import():
+    """The walk-forward modules live in the test backend; import them lazily so an ordinary run of
+    this driver never touches the backend."""
+    backend = os.path.join(os.path.dirname(_TOOLS_DIR), "testplatform", "backend")
+    if backend not in sys.path:
+        sys.path.insert(0, backend)
+    from app.services import walk_forward as WF
+    from app.services import wf_chain as C
+    return WF, C
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bands", default="large,mid,small")
@@ -592,7 +655,79 @@ def main() -> int:
                          "the small band (BID, GRSD, HCAC, OGG, SHOT, TRIB, VII) and the large band "
                          "(FITB-PA) of the 2026-10-07 store until their bars are fetched.")
     ap.add_argument("--dry-run", action="store_true")
+    # ----------------------------------------------------------------------------------------
+    # goal2027 walk-forward (docs/plans/2026-10-25-goal2027-walk-forward-plan.md). Every flag below
+    # except --walk-forward itself is REFUSED without --walk-forward, and the pass thresholds, the
+    # report dir and the top-N have NO defaults: a verdict is only as honest as its thresholds.
+    # ----------------------------------------------------------------------------------------
+    ap.add_argument("--walk-forward", action="store_true",
+                    help="Run each cell as a walk-forward chain <cell>-wf1/-wf2/-wf3 (+ -refit for "
+                         "a passing cell) instead of one optimize job. See the module docstring.")
+    ap.add_argument("--wf-train-start", default=None, metavar="YYYY-MM-DD",
+                    help="First day every fold trains from (default 2020-01-01; an expert's data "
+                         "floor, e.g. FMPRating 2022-01-01, moves it later).")
+    ap.add_argument("--wf-test-years", default=None, metavar="Y,Y,..",
+                    help="Test years, one fold each (default 2024,2025,2026).")
+    ap.add_argument("--wf-data-end", default=None, metavar="YYYY-MM-DD",
+                    help="Last day of data: clamps the LAST test window and the refit end "
+                         "(rehearsal). Refused when it leaves that window empty.")
+    ap.add_argument("--wf-first-generations", type=int, default=None,
+                    help="Generation budget of fold 1 (cold start; default 30).")
+    ap.add_argument("--wf-next-generations", type=int, default=None,
+                    help="Generation budget of folds 2, 3 and the refit (default 15).")
+    ap.add_argument("--wf-top-n", type=int, default=None,
+                    help="Distinct top genomes per fold re-run out of sample (REQUIRED).")
+    ap.add_argument("--wf-report-dir", default=None,
+                    help="Directory for the per-cell reports, the stored fold reports and the grid "
+                         "summary (REQUIRED).")
+    ap.add_argument("--wf-test-parallel", type=int, default=None,
+                    help="Out-of-sample re-runs at a time (default 1; ~14 GB RAM each).")
+    ap.add_argument("--wf-min-free-gb", type=float, default=None,
+                    help="Free-memory floor for the out-of-sample re-runs (default 20).")
+    ap.add_argument("--wf-force-memory", action="store_true",
+                    help="Ignore --wf-min-free-gb.")
+    ap.add_argument("--pass-min-oos-return", type=float, default=None,
+                    help="Percent: a fold's TOTAL out-of-sample return must reach this (REQUIRED).")
+    ap.add_argument("--pass-max-dd-mult", type=float, default=None,
+                    help="OOS |maxDD| must be <= this x IS |maxDD| (REQUIRED).")
+    ap.add_argument("--pass-min-folds", type=int, default=None,
+                    help="Fold winners that must pass for the cell to pass (REQUIRED).")
+    ap.add_argument("--pass-require-fold", type=int, action="append", default=[], metavar="YEAR",
+                    help="A test year whose fold winner MUST pass (repeatable; the cell fails "
+                         "otherwise even when --pass-min-folds is met).")
     args = ap.parse_args()
+
+    # Walk-forward flags: required with --walk-forward, refused without it.
+    _wf_opt = ("wf_train_start", "wf_test_years", "wf_data_end", "wf_first_generations",
+               "wf_next_generations", "wf_top_n", "wf_report_dir", "wf_test_parallel",
+               "wf_min_free_gb", "pass_min_oos_return", "pass_max_dd_mult", "pass_min_folds")
+    if not args.walk_forward:
+        _stray = [("--" + k.replace("_", "-")) for k in _wf_opt if getattr(args, k) is not None]
+        _stray += ["--wf-force-memory"] if args.wf_force_memory else []
+        _stray += ["--pass-require-fold"] if args.pass_require_fold else []
+        if _stray:
+            ap.error(f"{', '.join(_stray)} need --walk-forward")
+    else:
+        _need = [("--" + k.replace("_", "-")) for k in
+                 ("wf_top_n", "wf_report_dir", "pass_min_oos_return", "pass_max_dd_mult",
+                  "pass_min_folds") if getattr(args, k) is None]
+        if _need:
+            ap.error(f"--walk-forward requires {', '.join(_need)} (no defaults: the verdict is "
+                     f"only as honest as its thresholds)")
+        if args.wf_top_n < 1:
+            ap.error("--wf-top-n must be >= 1")
+        args.wf_train_start = args.wf_train_start or "2020-01-01"
+        args.wf_test_years = args.wf_test_years or "2024,2025,2026"
+        args.wf_first_generations = args.wf_first_generations or 30
+        args.wf_next_generations = args.wf_next_generations or 15
+        args.wf_test_parallel = args.wf_test_parallel or 1
+        args.wf_min_free_gb = 20.0 if args.wf_min_free_gb is None else args.wf_min_free_gb
+        try:
+            args.wf_train_start_d = date.fromisoformat(args.wf_train_start)
+            args.wf_data_end_d = date.fromisoformat(args.wf_data_end) if args.wf_data_end else None
+            args.wf_years_l = [int(y) for y in args.wf_test_years.split(",") if y.strip()]
+        except ValueError as e:
+            ap.error(f"--wf-train-start/--wf-data-end/--wf-test-years: {e}")
 
     # A sizing-mode matrix MUST be name-distinguished from its sibling. Jobs are skipped by NAME
     # when already `completed`, so running notional and risk_atr under the same --name-suffix
@@ -675,6 +810,9 @@ def main() -> int:
     # carry a digest of its resolved argv (market-condition flags), which only exists once the
     # command is built, so listing the pre-digest names here would show (and check "DONE"
     # against) names no job will ever have.
+    wf_specs: list = []
+    if args.walk_forward:
+        WF, WFC = _wf_import()
     for i, (name, expert, strat, band) in enumerate(jobs, 1):
         # The decision-time gene reaches every classic job. The FactorRanker (bypass) job has no
         # schedule genes: it keeps its plain name and the fixed default time, announced here.
@@ -693,9 +831,24 @@ def main() -> int:
         # Data-floored start (see _EXPERT_MIN_START). Announced per job so a shorter window is
         # visible in the log instead of being inferred later from a suspiciously late first trade.
         job_start = _start_for(expert, args.start)
-        if job_start != args.start:
-            print(f"[{i}/{len(jobs)}] NOTE {expert}: start floored {args.start} -> {job_start} "
-                  f"(signal data does not reach {args.start})", flush=True)
+        job_end = args.end
+        if args.walk_forward:
+            # The chain's window comes from the fold spec, not --start/--end. The cell's own base
+            # command (and therefore its name digest) carries the chain's overall span.
+            WF, WFC = _wf_import()
+            _floor = _EXPERT_MIN_START.get(expert)
+            try:
+                wf_folds = WFC.build_cell_folds(args.wf_train_start_d, args.wf_years_l,
+                                                args.wf_data_end_d,
+                                                date.fromisoformat(_floor) if _floor else None)
+            except WF.WalkForwardError as e:
+                raise SystemExit(f"--walk-forward: {e}")
+            job_start = wf_folds[0].train_start.isoformat()
+            job_end = WFC.refit_window(wf_folds)[1].isoformat()
+        _ref_start = args.wf_train_start if args.walk_forward else args.start
+        if job_start != _ref_start:
+            print(f"[{i}/{len(jobs)}] NOTE {expert}: start floored {_ref_start} -> {job_start} "
+                  f"(signal data does not reach {_ref_start})", flush=True)
         # FMPRating's search space grew (price-target + analyst-recency genes), so give it extra
         # population to explore the larger space; other experts use the base --population.
         population = args.population + (args.fmp_population_bonus if expert == "FMPRating" else 0)
@@ -716,7 +869,7 @@ def main() -> int:
                # Per-expert floor, not the raw --start: see _EXPERT_MIN_START. An expert whose
                # signal data does not reach --start would otherwise burn the early years as dead
                # window and bucket empty calendar years into the consistency fitness.
-               "--start", job_start, "--end", args.end, "--fitness", args.fitness,
+               "--start", job_start, "--end", job_end, "--fitness", args.fitness,
                "--interval", args.interval, *history_source_tokens(args.ohlcv_history_source),
                "--population", str(population),
                "--generations", str(generations), "--screener-cadence-days", str(args.cadence_days),
@@ -810,6 +963,24 @@ def main() -> int:
         if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens:
             job_name = _job_name(name, cmd)
             cmd[cmd.index("--name") + 1] = job_name
+        if args.walk_forward:
+            wf_specs.append(WFC.CellSpec(
+                name=job_name, optimize_args=wf_optimize_args(cmd), launcher=exe,
+                train_start=args.wf_train_start_d, test_years=args.wf_years_l,
+                data_end=args.wf_data_end_d, first_generations=args.wf_first_generations,
+                next_generations=args.wf_next_generations, top_n=args.wf_top_n,
+                thresholds=WF.Thresholds(args.pass_min_oos_return, args.pass_max_dd_mult,
+                                         args.pass_min_folds),
+                require_test_years=tuple(args.pass_require_fold),
+                test_parallel=args.wf_test_parallel, selection=_wf_selection_defaults(),
+                expert=expert, strategy=strat, band=band,
+                floor=date.fromisoformat(_EXPERT_MIN_START[expert])
+                if expert in _EXPERT_MIN_START else None))
+            try:
+                WFC.make_cell_plan(wf_specs[-1])      # refuse a bad spec before anything runs
+            except WF.WalkForwardError as e:
+                raise SystemExit(f"--walk-forward {job_name}: {e}")
+            continue
         if args.dry_run:
             print(f"  {'DONE' if job_name in done else 'TODO'}  {job_name}  "
                   f"({expert} {strat or '(bypass)'} / {band})  "
@@ -824,7 +995,31 @@ def main() -> int:
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {job_name} exit={rc}", flush=True)
         note_job_exit(_FAILED_JOBS, job_name, rc)
+    if args.walk_forward:
+        return _run_walk_forward_cells(args, wf_specs, WF, WFC)
     return finish_matrix(_FAILED_JOBS, "matrix driver")
+
+
+def _run_walk_forward_cells(args, specs, WF, WFC) -> int:
+    """Dry-run: print each cell's chain. Otherwise run every cell's chain in order with ONE shared
+    runner, write the per-cell and grid reports, and exit non-zero when a cell ERRORed."""
+    print(f"walk-forward: {len(specs)} cell(s); reports under {args.wf_report_dir}", flush=True)
+    if args.dry_run:
+        for spec in specs:
+            plan, folds = WFC.make_cell_plan(spec)
+            print(f"\n=== cell {spec.name} ({spec.expert} {spec.strategy or '(bypass)'} / "
+                  f"{spec.band}) ===")
+            print(WF.render_dry_run(plan))
+            print("  refit (only if the cell passes): " + " ".join(WFC.refit_command(spec, folds)))
+        return 0
+    runner = _make_wf_runner(args)
+    cells = WFC.run_cells(specs, lambda _spec: runner, args.wf_report_dir)
+    for c in cells:
+        print(f"  {c['verdict']:5s} {c['cell']}" + (f"  refit={c['refit_job']}" if c["refit_job"] else "")
+              + (f"  ({c['error']})" if c.get("error") else ""), flush=True)
+        if c["verdict"] == "ERROR":
+            note_job_exit(_FAILED_JOBS, c["cell"], 1, c["error"])
+    return finish_matrix(_FAILED_JOBS, "matrix driver (walk-forward)")
 
 
 if __name__ == "__main__":

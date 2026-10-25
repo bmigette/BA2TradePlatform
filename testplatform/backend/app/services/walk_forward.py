@@ -537,6 +537,21 @@ def render_dry_run(plan: Plan) -> str:
     return "\n".join(lines)
 
 
+def check_seed_lineage(plan: Plan, runner: Any, f: Fold, name: str) -> None:
+    """A chained job must RECORD the seed it was planned with (``seededFrom`` on its row, read back
+    by the runner's optional ``seed_lineage``): a seed that was silently not applied would make the
+    whole chain a set of cold starts that look seeded. Skipped for runners without the reader."""
+    read = getattr(runner, "seed_lineage", None)
+    if not plan.seed_chain or not callable(read):
+        return
+    prev = plan.previous_fold(f)
+    want = train_job_name(plan.prefix, prev.index) if prev else None
+    got = read(name)
+    if got != want:
+        raise WalkForwardError(
+            f"fold {f.index}: {name!r} recorded seed source {got!r}, expected {want!r}")
+
+
 def run_fold(plan: Plan, runner: Runner, f: Fold, log: Callable[[str], None] = print
              ) -> List[GenomeFold]:
     """Train (or skip when completed), select, re-run out of sample and evaluate ONE fold."""
@@ -559,6 +574,7 @@ def run_fold(plan: Plan, runner: Runner, f: Fold, log: Callable[[str], None] = p
         runner.run_train(cmd, name)
         if not runner.train_completed(name):
             raise WalkForwardError(f"training job {name!r} did not reach status 'completed'")
+    check_seed_lineage(plan, runner, f, name)
     picks = runner.select(name, plan.top_n)
     if not picks:
         raise WalkForwardError(f"fold {f.index}: {name!r} has no eligible genome to test")

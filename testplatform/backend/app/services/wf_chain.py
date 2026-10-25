@@ -226,6 +226,10 @@ def run_cell(spec: CellSpec, runner: Any, report_dir: str,
                 raise WalkForwardError(f"refit job {refit_job!r} did not reach status 'completed'")
         start, end = refit_window(folds)
         src = WF.train_job_name(spec.name, folds[-1].index)
+        read = getattr(runner, "seed_lineage", None)
+        if callable(read) and read(refit_job) != src:
+            raise WalkForwardError(f"refit {refit_job!r} recorded seed source "
+                                   f"{read(refit_job)!r}, expected {src!r}")
         refit_block = {"job": refit_job, "train": [start.isoformat(), end.isoformat()],
                        "seeded_from": _lineage(runner, spec, refit_job, src)}
     else:

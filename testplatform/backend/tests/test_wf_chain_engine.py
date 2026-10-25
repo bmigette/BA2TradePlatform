@@ -137,3 +137,57 @@ def test_run_walk_forward_passes_the_plan_requirement_through():
     oos = {(k, r): (BAD if k == 3 else GOOD) for k in (1, 2, 3) for r in (1, 2)}
     res = WF.run_walk_forward(plan, FakeRunner(is_picks=picks, oos=oos), log=lambda *_: None)
     assert res.overall_passed is False and res.required_failed == [2026]
+
+
+# ------------------------------------------------------------------ lineage is checked, not assumed
+
+
+class _Seeded(FakeRunner):
+    def __init__(self, recorded, **kw):
+        super().__init__(**kw)
+        self.recorded = recorded
+
+    def seed_lineage(self, name):
+        return self.recorded.get(name)
+
+
+def _chain_inputs():
+    picks = {f"cell-wf{k}": [_pick(1), _pick(2)] for k in (1, 2, 3)}
+    oos = {(k, r): _oos(10.0, -10.0) for k in (1, 2, 3) for r in (1, 2)}
+    return dict(is_picks=picks, oos=oos)
+
+
+def test_recorded_lineage_matching_the_plan_is_accepted():
+    r = _Seeded({"cell-wf1": None, "cell-wf2": "cell-wf1", "cell-wf3": "cell-wf2"},
+                **_chain_inputs())
+    WF.run_walk_forward(_plan(seed_chain=True), r, log=lambda *_: None)
+
+
+def test_a_job_that_did_not_record_its_seed_stops_the_chain():
+    r = _Seeded({"cell-wf1": None, "cell-wf2": None}, **_chain_inputs())     # wf2 ran cold
+    with pytest.raises(WF.WalkForwardError, match="cell-wf2.*recorded seed source None"):
+        WF.run_walk_forward(_plan(seed_chain=True), r, log=lambda *_: None)
+
+
+def test_cli_dry_run_renders_chain_seed_and_required_fold(capsys):
+    import importlib.util
+    from tests.test_walk_forward import _tool
+    tool = _tool()
+    rc = tool.main(["--prefix", "wfx", "--train-start", "2020-01-01", "--test-years",
+                    "2024,2025,2026", "--top-n", "2", "--pass-min-oos-return", "0",
+                    "--pass-max-dd-mult", "1.5", "--pass-min-folds", "2", "--pass-require-fold",
+                    "2026", "--chain-seed", "--launcher", "ba2-test", "--dry-run", "--",
+                    "--expert", "FMPRating"], runner=FakeRunner())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "--chain-seed-from wfx-wf1 --start 2020-01-01 --end 2024-12-31 --name wfx-wf2" in out
+    assert "the 2026 fold(s) MUST pass" in out
+
+
+def test_cli_refuses_a_required_year_outside_the_plan(capsys):
+    from tests.test_walk_forward import _tool
+    rc = _tool().main(["--prefix", "wfx", "--train-start", "2020-01-01", "--test-years", "2024",
+                       "--top-n", "2", "--pass-min-oos-return", "0", "--pass-max-dd-mult", "1.5",
+                       "--pass-min-folds", "1", "--pass-require-fold", "2031", "--dry-run", "--",
+                       "--expert", "FMPRating"], runner=FakeRunner())
+    assert rc == 2 and "2031" in capsys.readouterr().err

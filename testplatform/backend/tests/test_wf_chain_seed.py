@@ -214,3 +214,15 @@ def test_chain_seed_and_warm_start_are_mutually_exclusive():
     tgt, out = _run(sid, "cell-wf2", chainSeedFromOptimizationId=src,
                     warmStartFromOptimizationId=src)
     assert out["status"] == "failed" and "mutually exclusive" in out["error"]
+
+
+def test_real_runner_reads_back_the_recorded_seed_source(monkeypatch):
+    from tests.test_walk_forward import _tool
+    sid = T._seed_strategy()
+    src = _source(sid, name="lin-wf1")
+    tgt, out = _run(sid, "lin-wf2", populationSize=8, generations=1, chainSeedFromOptimizationId=src)
+    assert out["status"] == "completed", out
+    rr = _tool().RealRunner(None)
+    monkeypatch.setattr(rr, "_tool", lambda: None)
+    assert rr.seed_lineage("lin-wf1") is None            # cold start
+    assert rr.seed_lineage("lin-wf2") == "lin-wf1"
