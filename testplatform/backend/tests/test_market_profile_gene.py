@@ -548,3 +548,50 @@ class TestExportValidatesTheValue:
             assert "market:profile" in str(e.value.detail)
         finally:
             db.close()
+
+
+# ----------------------------------------------------------------------------- export writes only the selected profiles
+class TestExportServesOnlyTheSelectedProfiles:
+    _EXPECT = {"off": "", "ohlcv-v1": "ohlcv-v1", "ta-structure-v1": "ta-structure-v1",
+               "both": "ohlcv-v1,ta-structure-v1"}
+
+    @staticmethod
+    def _settings(sp):
+        from datetime import datetime
+        from app.api.backtests import _derive_export_payload
+        from app.models.backtest import Backtest
+        bt = Backtest(name="TOP1-mp", expert_name="FMPRating", engine_type="daily_expert",
+                      strategy_params=sp, start_date=datetime(2024, 1, 1),
+                      end_date=datetime(2024, 6, 1), initial_capital=10_000.0, optimization_id=None)
+        return _derive_export_payload(bt, "expert_settings", db=None)["settings"]["expert_params"]
+
+    @pytest.mark.parametrize("value", list(_EXPECT))
+    def test_each_value_exports_the_right_profile_setting(self, value):
+        sp = {"market:profile": value, "model:risk_per_trade_pct": 2.0,
+              "expertFixedSettings": {"market_condition_profile": "ohlcv-v1,ta-structure-v1"}}
+        assert self._settings(sp)["market_condition_profile"] == self._EXPECT[value]
+
+    @pytest.mark.parametrize("value", list(_EXPECT))
+    def test_the_exported_ruleset_is_served_by_exactly_that_profile_set(self, strat_profile, value):
+        from app.services.backtest.seam_wiring import (
+            assert_each_expert_serves_its_gates, market_condition_leaf_fields_in)
+        from ba2_common.core.market_condition_rules import assert_fields_served, parse_profile_setting
+        from ba2_common.core.market_conditions import PROFILES
+        d = decode_params(strat_profile, _genome(collect_param_space(strat_profile), **{"market:profile": value}))
+        used = market_condition_leaf_fields_in({"entry_rules": d["entry_rules"], "exit_rules": d["exit_rules"]})
+        setting = self._EXPECT[value]
+        profiles = parse_profile_setting(setting)
+        assert_fields_served(used, profiles, where="export")
+        assert_each_expert_serves_its_gates({"entry_rules": d["entry_rules"], "exit_rules": d["exit_rules"],
+                                             "experts": [{"class": "FMPRating",
+                                                          "settings": {"market_condition_profile": setting}}]})
+        if value == "off":
+            assert used == []
+        else:   # exactly: every selected profile is actually read, nothing else is
+            read = {p for p, spec in PROFILES.items() for f in spec.fields if f.name in {u[1] for u in used}}
+            assert read <= set(profiles)
+
+    def test_old_rows_keep_their_stored_setting(self):
+        sp = {"model:risk_per_trade_pct": 2.0,
+              "expertFixedSettings": {"market_condition_profile": "ohlcv-v1,ta-structure-v1"}}
+        assert self._settings(sp)["market_condition_profile"] == "ohlcv-v1,ta-structure-v1"

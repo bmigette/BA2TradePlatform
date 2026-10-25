@@ -1247,7 +1247,7 @@ def _refuse_market_profile_row_without_gene(backtest: Backtest, db: Any) -> None
                     f"market:profile gene; exporting would deploy every market gene unrestricted. Refusing."))
 
 
-def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dict:
+def _derive_export_payload_shared(backtest: Backtest, kind: str, db: Any = None) -> dict:
     """Build the chosen read-only export payload from a backtest's strategy_params.
 
     Thin wrapper (site plan P0a): the derivation lives in
@@ -1274,6 +1274,29 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
         )
     except (ExportRefused, UnsupportedExportKind) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dict:
+    """The shared derivation plus the goal2027 ``market:profile`` setting narrowing (see
+    ``_serve_only_selected_market_profiles``)."""
+    payload = _derive_export_payload_shared(backtest, kind, db)
+    if kind == "expert_settings":
+        _serve_only_selected_market_profiles(backtest, payload)
+    return payload
+
+
+def _serve_only_selected_market_profiles(backtest: Backtest, payload: dict) -> None:
+    """goal2027 2.2: a ``market:profile`` row deploys with ``market_condition_profile`` = exactly the SELECTED
+    profile(s) (off -> empty, single -> that one, both -> both, registry order), so a live expert never needs a
+    snapshot its ruleset does not read (the run itself served both). Rows without the gene are untouched."""
+    sp = backtest.strategy_params
+    if not isinstance(sp, dict) or sp.get("market:profile") is None:
+        return
+    from app.services.strategy_param_space import MARKET_PROFILE_CHOICES, market_profile_selection
+    from ba2_common.core.market_condition_rules import PROFILE_SETTING
+    selected = market_profile_selection(sp["market:profile"])
+    payload["settings"]["expert_params"][PROFILE_SETTING] = ",".join(
+        p for p in MARKET_PROFILE_CHOICES if p in selected)
 
 
 @router.get("/{backtest_id}/export")
