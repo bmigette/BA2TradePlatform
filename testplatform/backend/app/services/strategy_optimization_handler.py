@@ -27,7 +27,7 @@ import math as _math
 import random
 import sys as _sys
 import time as _time
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -49,12 +49,16 @@ from app.models import (
     SessionLocal,
     Strategy as StrategyModel,
     StrategyOptimization,
+    StrategyOptimizationPopulation,
     TaskQueue,
 )
 from app.models.task_queue import TaskStatus
 from app.services.genetic import GeneticOptimizer, DEAP_AVAILABLE
+from app.services.chain_seed import (  # noqa: E402
+    CHAIN_SEED_KEY, SEEDED_FROM_KEY, ChainSeedError,
+    build_chain_seed_population, final_population_record, stored_record)
 from app.services.task_queue import get_task_queue
-from app.services.strategy_param_space import collect_param_space, decode_params
+from app.services.strategy_param_space import collect_param_space, decode_params, market_profile_members
 from app.services.strategy_fitness import compute_fitness, ZERO_TRADE_SENTINEL
 from app.services.trial_memo import trial_key, TrialMemo
 from app.services.sync_client import push_optimization
@@ -1514,7 +1518,14 @@ def mode_anchor_index(strategy) -> Dict[str, Any]:
     return out
 
 
-def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]) -> Dict[str, Any]:
+def market_members_for_space(strategy, space: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The market-profile member map, computed ONLY when the job's space searches ``market:profile`` (every older job
+    skips it and keeps its memo keys untouched)."""
+    return market_profile_members(strategy) if "market:profile" in space else None
+
+
+def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any],
+                           market_members: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The genome AS A PHENOTYPE: an inactive threshold is replaced by its authored anchor.
 
     A leaf whose mode decoded to ``off`` is REMOVED from the tree, so its ``cond:<id>:value`` gene
@@ -1530,6 +1541,12 @@ def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]
     Returns ``decoded_flat`` ITSELF when nothing needs rewriting, which is the whole guard for
     older jobs: no mode leaves, no copy, no change of key.
     """
+    # goal2027 2.1: genes dead under the genome's sizing mode (identity when there is no sizing gene).
+    from app.services.strategy_param_space import neutralise_sizing_genes
+    decoded_flat = neutralise_sizing_genes(decoded_flat)
+    # goal2027 2.2: whatever belongs to an unselected market profile (identity without market:profile).
+    from app.services.strategy_param_space import neutralise_market_profile_genes
+    decoded_flat = neutralise_market_profile_genes(decoded_flat, market_members)
     if not anchors:
         return decoded_flat
     from app.services.strategy_param_space import mode_token
@@ -1787,16 +1804,17 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # DECISION-TIME gene (schedule:time): validated here, where the run's execution interval
         # is known, in addition to the launcher's check -- a hand-written config that bypassed the
         # launcher must not reach the GA with a time the engine cannot honour.
-        _time_spec = (schedule_cfg or {}).get("time")
-        if _time_spec and _time_spec.get("optimize"):
-            try:
-                _validated = validate_decision_times(
-                    _time_spec["choices"], backtest_cfg.get("execution_interval", "1d"))
-            except ValueError as e:
-                return _fail(opt_id, db, f"schedule:time gene: {e}")
-            if list(_time_spec["choices"]) != _validated:
-                return _fail(opt_id, db, f"schedule:time choices must be sorted ascending, got "
-                                         f"{list(_time_spec['choices'])!r}")
+        for _tkey in ("time", "entry_time", "manage_time"):      # entry/manage: goal2027 2.4 split genes
+            _time_spec = (schedule_cfg or {}).get(_tkey)
+            if _time_spec and _time_spec.get("optimize"):
+                try:
+                    _validated = validate_decision_times(
+                        _time_spec["choices"], backtest_cfg.get("execution_interval", "1d"))
+                except ValueError as e:
+                    return _fail(opt_id, db, f"schedule:{_tkey} gene: {e}")
+                if list(_time_spec["choices"]) != _validated:
+                    return _fail(opt_id, db, f"schedule:{_tkey} choices must be sorted ascending, got "
+                                             f"{list(_time_spec['choices'])!r}")
 
         # BYPASS expert (piece 1c): if the backtest's expert declares ``bypasses_classic_rm``
         # (e.g. FactorRanker) the search space must EXCLUDE tp/sl/cond:*/exit:* and search
@@ -1829,6 +1847,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # template ONCE; ``{}`` for every strategy without mode genes, and then
         # ``canonical_trial_params`` is the identity function and the keys are today's.
         mode_anchors = mode_anchor_index(strategy)
+        market_members = market_members_for_space(strategy, param_space)   # goal2027 2.2: None unless market:profile is searched
 
         # --- DETERMINISM: seed both RNGs (Task 4 / determinism_rule) ---
         seed = int(ga["seed"])
@@ -1882,7 +1901,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "start": str(backtest_cfg.get("start_date")),
                     "end": str(backtest_cfg.get("end_date")),
                     "seed": backtest_cfg.get("seed"),
-                    "params": canonical_trial_params(mode_anchors, decoded_flat),
+                    "params": canonical_trial_params(mode_anchors, decoded_flat, market_members),
                 }
             )
             cached = memo.get(key)
@@ -2015,7 +2034,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "start": str(backtest_cfg.get("start_date")),
                     "end": str(backtest_cfg.get("end_date")),
                     "seed": backtest_cfg.get("seed"),
-                    "params": canonical_trial_params(mode_anchors, decoded_flat),
+                    "params": canonical_trial_params(mode_anchors, decoded_flat, market_members),
                 }
             )
 
@@ -2340,6 +2359,36 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             # Re-seeding from the checkpoint's bounded elite slice fixes that. Cheap, contrary to
             # the note this replaces -- see _elite_slice.
             _seed_all_results_from_checkpoint(ckpt, all_results)
+            if ga.get(CHAIN_SEED_KEY):
+                # This relaunch inserted a NEW row, so the lineage of the first launch is not on
+                # it: record what is known (the source), flagged as a checkpoint resume.
+                _src_name = db.query(StrategyOptimization.name).filter(
+                    StrategyOptimization.id == int(ga[CHAIN_SEED_KEY])).scalar()
+                _record_chain_lineage(db, opt, {
+                    "kind": "chain", "optimization_id": int(ga[CHAIN_SEED_KEY]),
+                    "name": _src_name, "resumed_from_checkpoint": True})
+        elif not is_brute_force and ga.get(CHAIN_SEED_KEY):
+            if ga.get("warmStartFromOptimizationId"):
+                return _fail(opt_id, db, f"{CHAIN_SEED_KEY} and warmStartFromOptimizationId are "
+                                         f"mutually exclusive")
+            chain_src = db.query(StrategyOptimization).filter(
+                StrategyOptimization.id == int(ga[CHAIN_SEED_KEY])).first()
+            if chain_src is None:
+                return _fail(opt_id, db,
+                             f"chain seed source optimization {ga[CHAIN_SEED_KEY]} not found")
+            try:
+                _end_raw = backtest_cfg.get("end_date")
+                init_pop, _lineage = build_chain_seed_population(
+                    chain_src, stored_record(db.get(StrategyOptimizationPopulation, chain_src.id)),
+                    optimizer, int(ga["populationSize"]),
+                    date.fromisoformat(str(_end_raw)[:10]) if _end_raw else None)
+            except ChainSeedError as e:
+                return _fail(opt_id, db, f"chain seed refused: {e}")
+            _record_chain_lineage(db, opt, _lineage)
+            logger.warning(
+                f"strategy_optimization {opt_id}: chain-seeded population "
+                f"({len(init_pop)} individuals; {_lineage['filled_random']} filled randomly) from "
+                f"optimization {chain_src.id} ({chain_src.name!r})")
         elif not is_brute_force:
             # Warm-start (NOT resume): seed this job's population from a DIFFERENT, already-run
             # optimization's individuals, but run this job's OWN fresh --generations budget from
@@ -2600,6 +2649,18 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 "config) before trusting any result.",
             )
 
+        _fp = None
+        if not is_brute_force:
+            # The last EVALUATED generation, so a walk-forward chain can seed the next fold from
+            # it (chain_seed.build_chain_seed_population). Reassigned, not mutated: SQLAlchemy
+            # does not see in-place changes to a JSON column.
+            _fp = final_population_record(optimizer.param_ranges, result.get("final_population"))
+            if _fp is None and (ga.get("requireFinalPopulation") or ga.get(CHAIN_SEED_KEY)):
+                # A chain job exists to hand its population on; completing without one would let
+                # the next fold fail (or worse, start cold) hours later. The checkpoint is kept.
+                return _fail(opt_id, db, "this job must persist a final population (walk-forward "
+                                         "chain) but the search produced none")
+
         # The search finished: drop the checkpoint so a later re-run of this name starts a fresh
         # search instead of resuming from the final generation of a completed one. (A brute-force
         # grid never read or wrote one.)
@@ -2615,6 +2676,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         summarise_analysis_failures(opt.name, all_results)
         summarise_screener_gate(opt.name, all_results)
         opt.all_results = all_results
+        if _fp is not None:
+            db.merge(StrategyOptimizationPopulation(
+                optimization_id=opt_id, gene_space_signature=_fp["gene_space"],
+                population=_fp["population"]))
         db.commit()
         push_optimization(opt, db)
         logger.info(
@@ -2851,15 +2916,23 @@ def _warn_decision_time_missing(opt_name: str, all_results: list) -> None:
             f"{sum(h['entry'] for h in hit)}/{sum(h['manage'] for h in hit)}")
 
 
-def _schedule_times_from_gene(gene_time: Optional[str]) -> Optional[Dict[str, List[str]]]:
-    """The ENTRY and the MANAGE schedule's ``times`` a decoded ``schedule:time`` gene stands for
-    (None without the gene). The ONE place the two are derived: today both are the single gene
-    value; splitting the gene into an entry time and a manage time changes only this function
-    (and the reconstruction in ``ba2_common.core.schedule_genes``), nothing else assumes they
-    are equal."""
-    if not gene_time:
-        return None
-    return {"entry": [gene_time], "manage": [gene_time]}
+def _schedule_times_from_decoded(decoded: Dict[str, Any]) -> Optional[Dict[str, List[str]]]:
+    """The ENTRY and the MANAGE schedule's ``times`` a decoded genome stands for (None without a time
+    gene). The ONE place the two are derived: the single ``schedule:time`` gene drives both with one
+    value; the split genes (goal2027 2.4, ``schedule:entry_time`` / ``schedule:manage_time``) give each
+    its own. Nothing else assumes they are equal."""
+    gene_time = decoded.get("schedule_time")
+    entry, manage = decoded.get("schedule_entry_time"), decoded.get("schedule_manage_time")
+    if gene_time and (entry or manage):
+        raise ValueError("schedule:time and the split schedule:entry_time / schedule:manage_time genes "
+                         "are mutually exclusive")
+    if gene_time:
+        return {"entry": [gene_time], "manage": [gene_time]}
+    if entry or manage:
+        if not (entry and manage):
+            raise ValueError("a split decision-time genome needs both entry_time and manage_time")
+        return {"entry": [entry], "manage": [manage]}
+    return None
 
 
 def _build_daily_trial_config(
@@ -3136,12 +3209,11 @@ def _build_daily_trial_config(
     # selection is being optimized for now.
     base_run_sched = backtest_cfg.get("run_schedule_override")
     manage_schedule_override = backtest_cfg.get("manage_schedule_override")
-    gene_time = decoded.get("schedule_time")
-    gene_times = _schedule_times_from_gene(gene_time)
-    if decoded.get("schedule_days") or gene_time:
+    gene_times = _schedule_times_from_decoded(decoded)
+    if decoded.get("schedule_days") or gene_times:
         days = decoded.get("schedule_days") or (base_run_sched or {}).get("days")
         if not days:
-            raise ValueError("a schedule:time gene needs the run's entry days (schedule:<day> "
+            raise ValueError("a decision-time gene needs the run's entry days (schedule:<day> "
                              "genes or a run_schedule_override with days): refusing to guess")
         run_schedule_override = {
             "days": days,
@@ -3159,7 +3231,7 @@ def _build_daily_trial_config(
         # schedules at the one stored time; see tools/import_deploy_payload.py). Days stay the
         # run's own.
         if not (manage_schedule_override or {}).get("days"):
-            raise ValueError("a schedule:time gene needs backtest.manage_schedule_override with "
+            raise ValueError("a decision-time gene needs backtest.manage_schedule_override with "
                              "days to retime: refusing to leave the manage pass on another time")
         manage_schedule_override = {"days": dict(manage_schedule_override["days"]),
                                     "times": gene_times["manage"]}
@@ -3904,6 +3976,12 @@ def assert_population_screener_genes_in_range(optimizer: Any, population: list) 
         vals = {names[i][len("screener:"):]: ind[i] for i in range(len(names))
                 if names[i].startswith("screener:") and ind[i] is not None}
         check_genes_in_declared_ranges(vals, declared, where=f"warm-start individual #{n}")
+
+
+def _record_chain_lineage(db, opt: StrategyOptimization, lineage: Dict[str, Any]) -> None:
+    """Write the ``seededFrom`` block on the new row (reassigned: JSON columns are not mutation-tracked)."""
+    opt.optimization_config = {**(opt.optimization_config or {}), SEEDED_FROM_KEY: lineage}
+    db.commit()
 
 
 def _build_warm_start_population(

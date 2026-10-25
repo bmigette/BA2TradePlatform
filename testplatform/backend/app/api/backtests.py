@@ -1199,7 +1199,82 @@ def _is_bypass_expert_class(expert_name: Optional[str]) -> bool:
     return bool(getattr(expert_cls, "bypasses_classic_rm", False))
 
 
-def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dict:
+def _refuse_sizing_gene_row_without_gene(backtest: Backtest, db: Any) -> None:
+    """No silent default: the risk manager reads an ABSENT ``sizing_mode`` as notional. A row whose run
+    searched the sizing mode (its optimization's parameter_ranges carry ``model:sizing_mode``, goal2027
+    item 2.1) but whose ``strategy_params`` lost that gene would deploy as notional whatever the GA chose,
+    so it is refused instead. Rows of pinned runs (no such gene in the space) are unaffected."""
+    if db is None or backtest.optimization_id is None:
+        return
+    from app.models.strategy_optimization import StrategyOptimization
+    so = db.query(StrategyOptimization).filter(
+        StrategyOptimization.id == backtest.optimization_id).first()
+    ranges = so.parameter_ranges if so is not None else None
+    if not isinstance(ranges, dict) or "model:sizing_mode" not in ranges:
+        return
+    sp = backtest.strategy_params
+    if not isinstance(sp, dict) or sp.get("model:sizing_mode") is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: its optimization searched sizing_mode but this row has no "
+                    f"model:sizing_mode gene; exporting would deploy it as notional by default. Refusing."))
+
+
+def _refuse_market_profile_row_without_gene(backtest: Backtest, db: Any) -> None:
+    """No silent default: decode treats an ABSENT ``market:profile`` as "no profile restriction" (every market
+    gene as individually decoded), a different phenotype from whatever the GA chose. A row whose run searched the
+    profile (its optimization's parameter_ranges carry ``market:profile``, goal2027 item 2.2) but whose
+    ``strategy_params`` lost that gene is refused. Rows of older runs (no such gene in the space) are unaffected."""
+    if db is None or backtest.optimization_id is None:
+        return
+    from app.models.strategy_optimization import StrategyOptimization
+    so = db.query(StrategyOptimization).filter(
+        StrategyOptimization.id == backtest.optimization_id).first()
+    ranges = so.parameter_ranges if so is not None else None
+    if not isinstance(ranges, dict) or "market:profile" not in ranges:
+        return
+    sp = backtest.strategy_params
+    from app.services.strategy_param_space import MARKET_PROFILE_CHOICES
+    if isinstance(sp, dict) and sp.get("market:profile") is not None and sp["market:profile"] not in MARKET_PROFILE_CHOICES:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: stored market:profile {sp['market:profile']!r} is not one of "
+                    f"{list(MARKET_PROFILE_CHOICES)}. Refusing."))
+    if not isinstance(sp, dict) or sp.get("market:profile") is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: its optimization searched the market profile but this row has no "
+                    f"market:profile gene; exporting would deploy every market gene unrestricted. Refusing."))
+
+
+
+def _refuse_split_time_row_without_genes(backtest: Backtest, db: Any) -> None:
+    """No silent default for the decision times: a run that searched the SPLIT genes (its optimization's
+    parameter_ranges carry ``schedule:entry_time`` / ``schedule:manage_time``, goal2027 item 2.4) but whose
+    row lost either one would deploy the entry and manage schedules at a time the GA never chose. Refused.
+    Rows of runs without the split genes are unaffected."""
+    if db is None or backtest.optimization_id is None:
+        return
+    from ba2_common.core.schedule_genes import SCHEDULE_ENTRY_TIME_GENE, SCHEDULE_MANAGE_TIME_GENE
+    from app.models.strategy_optimization import StrategyOptimization
+    so = db.query(StrategyOptimization).filter(
+        StrategyOptimization.id == backtest.optimization_id).first()
+    ranges = so.parameter_ranges if so is not None else None
+    if not isinstance(ranges, dict) or not (
+            SCHEDULE_ENTRY_TIME_GENE in ranges or SCHEDULE_MANAGE_TIME_GENE in ranges):
+        return
+    sp = backtest.strategy_params if isinstance(backtest.strategy_params, dict) else {}
+    missing = [g for g in (SCHEDULE_ENTRY_TIME_GENE, SCHEDULE_MANAGE_TIME_GENE) if sp.get(g) is None]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: its optimization searched the split decision times "
+                    f"({SCHEDULE_ENTRY_TIME_GENE} and {SCHEDULE_MANAGE_TIME_GENE}) but this row has no "
+                    f"{', '.join(missing)}; exporting would deploy a time the GA never chose. Refusing."))
+
+
+
+def _derive_export_payload_shared(backtest: Backtest, kind: str, db: Any = None) -> dict:
     """Build the chosen read-only export payload from a backtest's strategy_params.
 
     Thin wrapper (site plan P0a): the derivation lives in
@@ -1215,6 +1290,9 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
     bt_block = None
     if kind == "expert_settings":
         bt_block, _strat = _opt_backtest_block(backtest, db)
+        _refuse_sizing_gene_row_without_gene(backtest, db)
+        _refuse_market_profile_row_without_gene(backtest, db)
+        _refuse_split_time_row_without_genes(backtest, db)
     try:
         return derive_export_payload(
             backtest, kind,
@@ -1224,6 +1302,29 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
         )
     except (ExportRefused, UnsupportedExportKind) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dict:
+    """The shared derivation plus the goal2027 ``market:profile`` setting narrowing (see
+    ``_serve_only_selected_market_profiles``)."""
+    payload = _derive_export_payload_shared(backtest, kind, db)
+    if kind == "expert_settings":
+        _serve_only_selected_market_profiles(backtest, payload)
+    return payload
+
+
+def _serve_only_selected_market_profiles(backtest: Backtest, payload: dict) -> None:
+    """goal2027 2.2: a ``market:profile`` row deploys with ``market_condition_profile`` = exactly the SELECTED
+    profile(s) (off -> empty, single -> that one, both -> both, registry order), so a live expert never needs a
+    snapshot its ruleset does not read (the run itself served both). Rows without the gene are untouched."""
+    sp = backtest.strategy_params
+    if not isinstance(sp, dict) or sp.get("market:profile") is None:
+        return
+    from app.services.strategy_param_space import MARKET_PROFILE_CHOICES, market_profile_selection
+    from ba2_common.core.market_condition_rules import PROFILE_SETTING
+    selected = market_profile_selection(sp["market:profile"])
+    payload["settings"]["expert_params"][PROFILE_SETTING] = ",".join(
+        p for p in MARKET_PROFILE_CHOICES if p in selected)
 
 
 @router.get("/{backtest_id}/export")

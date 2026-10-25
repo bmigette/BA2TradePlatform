@@ -241,7 +241,8 @@ def test_no_decoded_key_is_ever_silently_dropped_by_the_trial_config():
     test_screener_genes)."""
     decoded = decode_params(_strategy(), _flat("15:30", **{"model:x": 2.0}))
     assert set(decoded) == {"expert_overrides", "screener_overrides", "schedule_days",
-                            "schedule_time", "entry_rules", "exit_rules"}, \
+                            "schedule_time", "schedule_entry_time", "schedule_manage_time",
+                            "entry_rules", "exit_rules"}, \
         "decode_params grew a key: add its consumer check below"
     base = _build_daily_trial_config(_bt_cfg(), {**decoded, "schedule_days": None,
                                                  "schedule_time": None, "expert_overrides": {}},
@@ -250,6 +251,12 @@ def test_no_decoded_key_is_ever_silently_dropped_by_the_trial_config():
     assert full["experts"][0]["settings"]["x"] == 2.0 and "x" not in base["experts"][0]["settings"]
     assert full["run_schedule_override"] != base["run_schedule_override"]       # schedule_days
     assert full["manage_schedule_override"] != base["manage_schedule_override"]  # schedule_time
+    # the split pair (goal2027 2.4) is read by the same seam: entry -> entry schedule, manage -> manage schedule
+    split = _build_daily_trial_config(
+        _bt_cfg(), {**decoded, "schedule_time": None, "schedule_entry_time": "09:45",
+                    "schedule_manage_time": "15:30"}, option_trade_records=False)
+    assert split["run_schedule_override"]["times"] == ["09:45"]
+    assert split["manage_schedule_override"]["times"] == ["15:30"]
     sentinel = [{"id": "sentinel-rule"}]
     out = _build_daily_trial_config(_bt_cfg(), {**decoded, "entry_rules": sentinel,
                                                 "exit_rules": sentinel}, option_trade_records=False)

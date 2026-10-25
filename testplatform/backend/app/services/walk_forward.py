@@ -39,6 +39,7 @@ FORBIDDEN_OPTIMIZE_FLAGS = {
     "--name": "the engine names each fold's job",
     "--warm-start-from": "it imports another job's population, which may have seen the test "
                          "window (look-ahead); seeding goes through initial_population_for_fold",
+    "--chain-seed-from": "the engine renders it itself (chain seeding, initial_population_for_fold)",
     "--rerun": "it creates a second optimization under the same name and breaks resume",
     "--submit": "it queues the job and returns before it is completed, so the fold cannot "
                 "continue",
@@ -196,28 +197,47 @@ def oos_labels(k: int) -> List[str]:
     return [OOS_LABELS[0], f"wf-fold-{k}", OOS_LABELS[1]]
 
 
-def initial_population_for_fold(fold: Fold) -> Optional[Any]:
-    """EXTENSION POINT (seeding, NOT implemented). Returns None today = every fold's GA starts
-    from the optimize job's own initial population.
-
-    The seed population will be defined later. When it is, it plugs in HERE: the returned value
-    is rendered into the fold's ``ba2-test optimize`` command by ``train_command`` (the optimize
-    CLI's seeding flag, whichever it ends up being) before the ``--start/--end/--name`` tail.
-    ``train_command`` refuses (NotImplementedError) a non-None return until that rendering exists,
-    so a half-wired seed can never be silently ignored."""
-    return None
+@dataclass(frozen=True)
+class SeedSpec:
+    """Where fold k+1's starting population comes from: the FINAL population of fold k's train job
+    (read by the handler from that job's stored GA state, see app.services.chain_seed)."""
+    source_job: str
+    source_fold: int
+    source_train_end: date
 
 
-def train_command(launcher: Any, user_args: Sequence[str], prefix: str, fold: Fold) -> List[str]:
-    """``launcher`` is the ba2-test executable, or an argv prefix list (``[python, script.py]``)."""
-    seed = initial_population_for_fold(fold)
-    if seed is not None:
-        raise NotImplementedError(
-            "initial_population_for_fold returned a seed but train_command does not render it "
-            "into the optimize command yet")
+def initial_population_for_fold(fold: Fold, prev: Optional[Fold] = None,
+                                prefix: Optional[str] = None) -> Optional[SeedSpec]:
+    """SEEDING HOOK. None = the fold's GA starts from its own random population (fold 1, or a
+    plan that does not chain). With the previous fold ``prev`` and the job ``prefix`` it returns
+    the seed spec: ``<prefix>-wf<prev.index>``'s final population.
+
+    NO LOOK-AHEAD, asserted here: the seed's train window must end BEFORE this fold's test window
+    starts, so the seed never saw the year this fold will be tested on. (For ordered anchored folds
+    this holds by construction; the assertion is what keeps a hand-written fold list honest.)"""
+    if prev is None or prefix is None:
+        return None
+    if prev.train_end >= fold.test_start:
+        raise WalkForwardError(
+            f"fold {fold.index}: seed source fold {prev.index} trained to {prev.train_end}, not "
+            f"before this fold's test start {fold.test_start} (look-ahead)")
+    return SeedSpec(train_job_name(prefix, prev.index), prev.index, prev.train_end)
+
+
+def train_command(launcher: Any, user_args: Sequence[str], prefix: str, fold: Fold, *,
+                  prev: Optional[Fold] = None, seed_chain: bool = False,
+                  extra_args: Sequence[str] = ()) -> List[str]:
+    """``launcher`` is the ba2-test executable, or an argv prefix list (``[python, script.py]``).
+    ``extra_args`` are this fold's own optimize args (e.g. its generation budget); the chain seed
+    is rendered as ``--chain-seed-from <previous fold's job>`` when ``seed_chain`` and ``prev``."""
+    seed = initial_population_for_fold(fold, prev if seed_chain else None, prefix)
     head = [launcher] if isinstance(launcher, str) else list(launcher)
-    return [*head, "optimize", *user_args, "--start", fold.train_start.isoformat(),
-            "--end", fold.train_end.isoformat(), "--name", train_job_name(prefix, fold.index)]
+    # Every job of a chain stores its final population (fold 1 has no seed but seeds fold 2).
+    seed_args = (["--chain-seed-from", seed.source_job] if seed is not None
+                 else ["--persist-final-population"] if seed_chain else [])
+    return [*head, "optimize", *user_args, *extra_args, *seed_args, "--start",
+            fold.train_start.isoformat(), "--end", fold.train_end.isoformat(), "--name",
+            train_job_name(prefix, fold.index)]
 
 
 # --------------------------------------------------------------------------------- records
@@ -292,7 +312,8 @@ def efficiency(oos_car: float, is_car: float) -> Optional[float]:
     return oos_car / is_car if is_car > 0 else None
 
 
-def evaluate_genome(fold: Fold, pick: IsPick, oos: OosMetrics, th: Thresholds) -> GenomeFold:
+def evaluate_genome(fold: Fold, pick: IsPick, oos: OosMetrics, th: Thresholds,
+                    exclusive_return: bool = False) -> GenomeFold:
     where = f"fold {fold.index} rank {pick.rank}"
     is_ret = _need(pick.total_return, f"{where} IS total_return")
     is_car = _need(pick.car, f"{where} IS CAR")
@@ -308,8 +329,9 @@ def evaluate_genome(fold: Fold, pick: IsPick, oos: OosMetrics, th: Thresholds) -
     reasons: List[str] = []
     if o_trades == 0:
         reasons.append("zero OOS trades")
-    if o_ret < th.min_oos_return:
-        reasons.append(f"OOS return {o_ret:.2f}% < {th.min_oos_return:g}%")
+    if (o_ret <= th.min_oos_return) if exclusive_return else (o_ret < th.min_oos_return):
+        reasons.append(f"OOS return {o_ret:.2f}% "
+                       f"{'<=' if exclusive_return else '<'} {th.min_oos_return:g}%")
     if abs(o_dd) > th.max_dd_mult * abs(is_dd):
         reasons.append(f"OOS |maxDD| {abs(o_dd):.2f}% > {th.max_dd_mult:g} x IS |maxDD| "
                        f"{abs(is_dd):.2f}%")
@@ -376,6 +398,9 @@ class WalkForwardResult:
     complete: bool                          # every planned fold was run
     overall_passed: Optional[bool]          # None = incomplete (--only-fold)
     notes: List[str]
+    require_test_years: Tuple[int, ...] = ()    # --pass-require-fold
+    required_failed: List[int] = field(default_factory=list)   # required years whose winner failed
+    exclusive_return: bool = False      # the return threshold was strict (>)
 
     def fold_winner(self, k: int) -> GenomeFold:
         return next(g for g in self.genomes if g.fold == k and g.rank == 1)
@@ -383,7 +408,9 @@ class WalkForwardResult:
 
 def aggregate(prefix: str, folds: Sequence[Fold], planned_folds: int, top_n: int,
               genomes: Sequence[GenomeFold], th: Thresholds,
-              selection: Optional[Dict[str, Any]] = None) -> WalkForwardResult:
+              selection: Optional[Dict[str, Any]] = None,
+              require_test_years: Sequence[int] = (), exclusive_return: bool = False
+              ) -> WalkForwardResult:
     by_fold = {f.index: f for f in folds}
     notes: List[str] = []
     ranks = sorted({g.rank for g in genomes})
@@ -400,13 +427,17 @@ def aggregate(prefix: str, folds: Sequence[Fold], planned_folds: int, top_n: int
     winner_stitch = stitch(winners)
     passed = sum(1 for _, g in winners if g.passed)
     complete = len(folds) == planned_folds
+    required_failed = sorted(y for y in set(require_test_years)
+                             if not any(f.test_start.year == y and g.passed for f, g in winners))
     if not complete:
         notes.append(f"PARTIAL RUN: {len(folds)} of {planned_folds} folds; no overall verdict")
     return WalkForwardResult(
         prefix=prefix, thresholds=th, top_n=top_n, folds=list(folds), planned_folds=planned_folds,
         genomes=list(genomes), rank_stitches=rank_stitches, winner_stitch=winner_stitch,
         winners_passed=passed, selection=dict(selection or {}), complete=complete,
-        overall_passed=(passed >= th.min_folds) if complete else None, notes=notes)
+        overall_passed=((passed >= th.min_folds) and not required_failed) if complete else None,
+        notes=notes, require_test_years=tuple(sorted(set(require_test_years))),
+        required_failed=required_failed if complete else [], exclusive_return=exclusive_return)
 
 
 # --------------------------------------------------------------------------------- runner
@@ -435,6 +466,19 @@ class Plan:
     only_fold: Optional[int] = None
     embargo_days: int = 0
     selection: Dict[str, Any] = field(default_factory=dict)   # the selection knobs USED
+    seed_chain: bool = False            # fold k+1 starts from fold k's final population
+    fold_extra_args: Dict[int, List[str]] = field(default_factory=dict)   # per-fold optimize args
+    require_test_years: Tuple[int, ...] = ()   # --pass-require-fold: these folds must pass
+    exclusive_return: bool = False      # --pass-min-oos-return-exclusive: return must be ABOVE the threshold
+
+    def previous_fold(self, fold: Fold) -> Optional[Fold]:
+        before = [f for f in self.folds if f.index < fold.index]
+        return before[-1] if before else None
+
+    def command_for(self, fold: Fold) -> List[str]:
+        return train_command(self.launcher, self.optimize_args, self.prefix, fold,
+                             prev=self.previous_fold(fold), seed_chain=self.seed_chain,
+                             extra_args=self.fold_extra_args.get(fold.index, ()))
 
     def selected_folds(self) -> List[Fold]:
         if self.only_fold is None:
@@ -448,7 +492,9 @@ class Plan:
 
 def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], launcher: Any,
               top_n: int, thresholds: Thresholds, *, test_parallel: int, skip_train: bool,
-              only_fold: Optional[int], embargo_days: int, selection: Dict[str, Any]) -> Plan:
+              only_fold: Optional[int], embargo_days: int, selection: Dict[str, Any],
+              seed_chain: bool = False, fold_extra_args: Optional[Dict[int, List[str]]] = None,
+              require_test_years: Sequence[int] = (), exclusive_return: bool = False) -> Plan:
     """Validate everything BEFORE any run: a refusal here costs nothing."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix or ""):
         raise WalkForwardError(f"--prefix {prefix!r}: use letters, digits, '_', '.', '-'")
@@ -459,8 +505,15 @@ def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], 
     check_user_optimize_args(optimize_args)
     validate_folds(folds, embargo_days)
     thresholds.validate(len(folds))
+    have = sorted({f.test_start.year for f in folds})
+    missing = [y for y in require_test_years if y not in have]
+    if missing:
+        raise WalkForwardError(f"--pass-require-fold {missing}: no fold tests that year "
+                               f"(the plan tests {have})")
     plan = Plan(prefix, list(folds), list(optimize_args), launcher, top_n, thresholds,
-                test_parallel, skip_train, only_fold, embargo_days, dict(selection))
+                test_parallel, skip_train, only_fold, embargo_days, dict(selection),
+                seed_chain, {k: list(v) for k, v in (fold_extra_args or {}).items()},
+                tuple(sorted(set(require_test_years))), exclusive_return)
     plan.selected_folds()          # refuses an unknown --only-fold
     return plan
 
@@ -470,7 +523,9 @@ def render_dry_run(plan: Plan) -> str:
     lines = [f"walk-forward plan '{plan.prefix}': {len(plan.folds)} fold(s), top-n {plan.top_n}, "
              f"embargo {plan.embargo_days}d, test-parallel {plan.test_parallel}",
              f"thresholds: OOS return >= {th.min_oos_return:g}% per fold, OOS |maxDD| <= "
-             f"{th.max_dd_mult:g} x IS |maxDD|, >= {th.min_folds} fold winner(s) must pass"]
+             f"{th.max_dd_mult:g} x IS |maxDD|, >= {th.min_folds} fold winner(s) must pass"
+             + (f", and the {', '.join(map(str, plan.require_test_years))} fold(s) MUST pass"
+                if plan.require_test_years else "")]
     for f in plan.selected_folds():
         name = train_job_name(plan.prefix, f.index)
         lines.append(f"\nfold {f.index}: train {f.train_start}..{f.train_end} "
@@ -480,8 +535,7 @@ def render_dry_run(plan: Plan) -> str:
             lines.append("  train: SKIPPED (--skip-train; the job must already be completed)")
         else:
             lines.append(f"  train job: {name}  (skipped when already completed)")
-            lines.append("  train cmd: " + " ".join(train_command(plan.launcher, plan.optimize_args,
-                                                                  plan.prefix, f)))
+            lines.append("  train cmd: " + " ".join(plan.command_for(f)))
         lines.append(f"  select: top {plan.top_n} behaviour-distinct genomes "
                      f"(tools/persist_distinct_topn.py selection; {plan.selection})")
         lines.append(f"  test: re-run each once on {f.test_start}..{f.test_end} as "
@@ -490,40 +544,73 @@ def render_dry_run(plan: Plan) -> str:
     return "\n".join(lines)
 
 
+def check_seed_lineage(plan: Plan, runner: Any, f: Fold, name: str) -> None:
+    """A chained job must RECORD the seed it was planned with (``seededFrom`` on its row, read back
+    by the runner's optional ``seed_lineage``): a seed that was silently not applied would make the
+    whole chain a set of cold starts that look seeded. Skipped for runners without the reader."""
+    read = getattr(runner, "seed_lineage", None)
+    if not plan.seed_chain or not callable(read):
+        return
+    prev = plan.previous_fold(f)
+    want = train_job_name(plan.prefix, prev.index) if prev else None
+    got = read(name)
+    if got != want:
+        raise WalkForwardError(
+            f"fold {f.index}: {name!r} recorded seed source {got!r}, expected {want!r}")
+
+
+def run_fold(plan: Plan, runner: Runner, f: Fold, log: Callable[[str], None] = print
+             ) -> List[GenomeFold]:
+    """Train (or skip when completed), select, re-run out of sample and evaluate ONE fold."""
+    name = train_job_name(plan.prefix, f.index)
+    if plan.skip_train:
+        if not runner.train_completed(name):
+            raise WalkForwardError(f"--skip-train: training job {name!r} is not completed")
+    elif runner.train_completed(name):
+        log(f"fold {f.index}: training job {name} already completed -- skipping the train run")
+    else:
+        cmd = plan.command_for(f)           # asserts no look-ahead for a chained seed
+        prev = plan.previous_fold(f)
+        if plan.seed_chain and prev is not None:
+            src = train_job_name(plan.prefix, prev.index)
+            if not runner.train_completed(src):
+                raise WalkForwardError(
+                    f"fold {f.index}: seed source {src!r} is not completed (chain seeding needs "
+                    f"fold {prev.index} first)")
+        log(f"fold {f.index}: training {name} on {f.train_start}..{f.train_end}")
+        runner.run_train(cmd, name)
+        if not runner.train_completed(name):
+            raise WalkForwardError(f"training job {name!r} did not reach status 'completed'")
+    check_seed_lineage(plan, runner, f, name)
+    picks = runner.select(name, plan.top_n)
+    if not picks:
+        raise WalkForwardError(f"fold {f.index}: {name!r} has no eligible genome to test")
+    if sorted(p.rank for p in picks)[0] != 1:
+        raise WalkForwardError(f"fold {f.index}: selection has no rank 1")
+    if len(picks) < plan.top_n:
+        log(f"fold {f.index}: only {len(picks)} behaviour-distinct genome(s) (< --top-n "
+            f"{plan.top_n})")
+    log(f"fold {f.index}: testing {len(picks)} genome(s) on {f.test_start}..{f.test_end}")
+    oos = runner.run_oos(name, f, picks, oos_name_prefix(f.index), oos_labels(f.index),
+                         plan.test_parallel)
+    out = []
+    for p in picks:
+        if p.rank not in oos:
+            raise WalkForwardError(
+                f"fold {f.index} rank {p.rank}: no out-of-sample result was produced")
+        out.append(evaluate_genome(f, p, oos[p.rank], plan.thresholds, plan.exclusive_return))
+    return out
+
+
 def run_walk_forward(plan: Plan, runner: Runner, log: Callable[[str], None] = print
                      ) -> WalkForwardResult:
     folds = plan.selected_folds()
     genomes: List[GenomeFold] = []
     for f in folds:
-        name = train_job_name(plan.prefix, f.index)
-        if plan.skip_train:
-            if not runner.train_completed(name):
-                raise WalkForwardError(f"--skip-train: training job {name!r} is not completed")
-        elif runner.train_completed(name):
-            log(f"fold {f.index}: training job {name} already completed -- skipping the train run")
-        else:
-            log(f"fold {f.index}: training {name} on {f.train_start}..{f.train_end}")
-            runner.run_train(train_command(plan.launcher, plan.optimize_args, plan.prefix, f), name)
-            if not runner.train_completed(name):
-                raise WalkForwardError(f"training job {name!r} did not reach status 'completed'")
-        picks = runner.select(name, plan.top_n)
-        if not picks:
-            raise WalkForwardError(f"fold {f.index}: {name!r} has no eligible genome to test")
-        if sorted(p.rank for p in picks)[0] != 1:
-            raise WalkForwardError(f"fold {f.index}: selection has no rank 1")
-        if len(picks) < plan.top_n:
-            log(f"fold {f.index}: only {len(picks)} behaviour-distinct genome(s) (< --top-n "
-                f"{plan.top_n})")
-        log(f"fold {f.index}: testing {len(picks)} genome(s) on {f.test_start}..{f.test_end}")
-        oos = runner.run_oos(name, f, picks, oos_name_prefix(f.index), oos_labels(f.index),
-                             plan.test_parallel)
-        for p in picks:
-            if p.rank not in oos:
-                raise WalkForwardError(
-                    f"fold {f.index} rank {p.rank}: no out-of-sample result was produced")
-            genomes.append(evaluate_genome(f, p, oos[p.rank], plan.thresholds))
+        genomes.extend(run_fold(plan, runner, f, log))
     return aggregate(plan.prefix, folds, len(plan.folds), plan.top_n, genomes, plan.thresholds,
-                     plan.selection)
+                     plan.selection, require_test_years=plan.require_test_years,
+                     exclusive_return=plan.exclusive_return)
 
 
 # --------------------------------------------------------------------------------- report
@@ -546,6 +633,9 @@ def result_to_json(res: WalkForwardResult) -> Dict[str, Any]:
         "complete": res.complete,
         "overall_passed": res.overall_passed,
         "winners_passed": res.winners_passed,
+        "exclusive_return": res.exclusive_return,
+        "require_test_years": list(res.require_test_years),
+        "required_failed": list(res.required_failed),
         "notes": res.notes,
         "folds": [{"index": f.index, "train_start": f.train_start.isoformat(),
                    "train_end": f.train_end.isoformat(), "test_start": f.test_start.isoformat(),
@@ -564,11 +654,13 @@ def render_markdown(res: WalkForwardResult) -> str:
            f"**Overall verdict: {verdict}** -- {res.winners_passed} of {len(res.folds)} fold "
            f"winner(s) passed (need {th.min_folds}).", "",
            "## Thresholds used", "",
-           f"- `--pass-min-oos-return` {th.min_oos_return:g}% (per-fold TOTAL OOS return over that "
+           f"- `--pass-min-oos-return{'-exclusive' if res.exclusive_return else ''}` {th.min_oos_return:g}% (per-fold TOTAL OOS return over that "
            f"fold's test window, NOT annualised; window lengths are in each fold heading)",
            f"- `--pass-max-dd-mult` {th.max_dd_mult:g} (OOS |max DD| <= mult x IS |max DD|)",
            f"- `--pass-min-folds` {th.min_folds} (fold winners that must pass)",
            "- a genome with zero OOS trades FAILS",
+           *([f"- `--pass-require-fold` {', '.join(map(str, res.require_test_years))} (these test "
+              f"years' fold winners must pass)"] if res.require_test_years else []),
            f"- top-n {res.top_n}; selection knobs used: "
            + (", ".join(f"{k}={v}" for k, v in res.selection.items()) or "n/a"), ""]
     for n in res.notes:

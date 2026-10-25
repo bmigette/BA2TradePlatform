@@ -317,7 +317,17 @@ def main() -> int:
                 return 1
             from ba2_common.core.schedule_genes import live_deploy_time_refusal, normalise_hhmm
             sched_pre["times"][:] = [normalise_hhmm(t) for t in sched_pre["times"]]   # '9:30' -> '09:30'
-            _late = [m for m in (live_deploy_time_refusal(t) for t in sched_pre["times"]) if m]
+            # goal2027 2.4: a split-gene payload carries the MANAGE time(s) separately (execution.manage_times);
+            # absent -> the manage schedule uses the entry times, as before. BOTH lists face the same refusal.
+            _manage_pre = (entry["settings"].get("execution") or {}).get("manage_times")
+            if _manage_pre is not None:
+                if not _manage_pre:
+                    print(f"FATAL: {label}: execution.manage_times is present but empty; refusing to guess "
+                          f"the open-positions time")
+                    return 1
+                _manage_pre[:] = [normalise_hhmm(t) for t in _manage_pre]
+            _late = [m for m in (live_deploy_time_refusal(t)
+                                 for t in list(sched_pre["times"]) + list(_manage_pre or [])) if m]
             if _late:
                 print(f"FATAL: {label}: {_late[0]}")
                 return 1
@@ -496,6 +506,7 @@ def main() -> int:
             # 09:40 is deployed at 09:40): copied from the stored schedule, never defaulted. The
             # check ran before any write (the entry-weekday block above).
             times = list(sched["times"])
+            manage_times = list((entry["settings"].get("execution") or {}).get("manage_times") or times)
             prior = (expert.get_setting_with_interface_default(
                 "execution_schedule_enter_market", log_warning=False) or {}).get("days") or {}
             expert_params["execution_schedule_enter_market"] = {
@@ -506,7 +517,7 @@ def main() -> int:
             # leave live positions unmanaged for the rest of the week.
             expert_params["execution_schedule_open_positions"] = {
                 "days": {d: d not in ("saturday", "sunday") for d in days},
-                "times": times, "time_basis": "market"}
+                "times": manage_times, "time_basis": "market"}
             on = sorted(d for d, v in days.items() if v)
             was = sorted(d for d, v in prior.items() if v)
             if was and was != on:

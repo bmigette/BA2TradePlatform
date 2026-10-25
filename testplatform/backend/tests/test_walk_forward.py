@@ -392,12 +392,12 @@ def test_dry_run_runs_nothing():
     assert r.trained == [] and r.tested == []
 
 
-def test_seed_extension_point_is_none_and_never_silently_ignored(monkeypatch):
+def test_seed_hook_is_none_without_a_chain_and_never_renders_a_seed_flag():
+    """Seeding is implemented (tests/test_wf_chain_engine.py); a plan that does not chain must
+    still render no seed flag, and fold 1 has no predecessor to seed from."""
     f = WF.build_year_folds(D("2020-01-01"), [2024])[0]
     assert WF.initial_population_for_fold(f) is None
-    monkeypatch.setattr(WF, "initial_population_for_fold", lambda fold: ["seed"])
-    with pytest.raises(NotImplementedError):
-        WF.train_command("ba2-test", [], "p", f)
+    assert "--chain-seed-from" not in WF.train_command("ba2-test", [], "p", f)
 
 
 # ------------------------------------------------------------------ the option holdout rail

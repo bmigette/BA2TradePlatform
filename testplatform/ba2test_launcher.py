@@ -1146,13 +1146,24 @@ def _refuse_atr_policy_without_job_name(policy: str, name: "str | None") -> None
 
 #: The name token a ``--decision-times`` job must carry (see ``_resolve_decision_times``).
 DECISION_TIMES_NAME_TOKEN = "timegene"
+#: ``--decision-times split`` (goal2027 2.4): the ENTRY time and the MANAGE time are searched as two genes.
+#: A different gene space is a different job, so it carries its own name token.
+DECISION_TIMES_SPLIT = "split"
+DECISION_TIMES_SPLIT_NAME_TOKEN = "timesplit"
+
+
+def _decision_times_is_split(raw) -> bool:
+    """True for ``--decision-times split`` (the default seven values, as TWO genes)."""
+    return raw is not None and str(raw).strip() == DECISION_TIMES_SPLIT
 
 
 def _resolve_decision_times(raw, command: str, *, interval: str, name: "str | None",
                             bypass_jobs, option_jobs) -> "list | None":
-    """``--decision-times 09:35,09:40,...|default|fixed`` -> the validated, sorted list, or None
+    """``--decision-times 09:35,09:40,...|default|split|fixed`` -> the validated, sorted list, or None
     (flag absent or ``fixed``: no gene, the single shared default time). ``default`` is the shared
-    ``DEFAULT_DECISION_TIME_CHOICES``.
+    ``DEFAULT_DECISION_TIME_CHOICES``; ``split`` is the same seven values searched as TWO genes
+    (``schedule:entry_time`` + ``schedule:manage_time``, goal2027 2.4) and requires ``timesplit`` in the
+    name instead of ``timegene``.
 
     Everything refused HERE, before a row is written, so a bad flag costs nothing:
       * a daily-clock job (``--interval 1d``): a decision time means nothing with one bar a day;
@@ -1177,18 +1188,21 @@ def _resolve_decision_times(raw, command: str, *, interval: str, name: "str | No
         sys.exit(f"ba2-test {command}: --decision-times is refused for option jobs "
                  f"({sorted(option_jobs)}): option backtests run on a DAILY clock, one bar per "
                  f"session, so there is no decision time to search")
+    split = _decision_times_is_split(raw)
     try:
-        times = parse_decision_times_arg(raw, interval)
+        times = parse_decision_times_arg("default" if split else raw, interval)
     except ValueError as e:
         sys.exit(f"ba2-test {command}: --decision-times: {e}")
-    if not name or DECISION_TIMES_NAME_TOKEN not in name:
-        sys.exit(f"ba2-test {command}: --decision-times requires --name (or --name-prefix) to "
-                 f"contain {DECISION_TIMES_NAME_TOKEN!r} (got {name!r}) -- the run's identity "
+    token = DECISION_TIMES_SPLIT_NAME_TOKEN if split else DECISION_TIMES_NAME_TOKEN
+    if not name or token not in name:
+        sys.exit(f"ba2-test {command}: --decision-times {'split ' if split else ''}requires --name (or "
+                 f"--name-prefix) to contain {token!r} (got {name!r}) -- the run's identity "
                  f"must differ from a plain run of the same expert/strategy")
     return times
 
 
-def _refuse_reused_timegene_name(name: str, times: "list | None", command: str) -> None:
+def _refuse_reused_timegene_name(name: str, times: "list | None", command: str, *,
+                                 split: bool = False) -> None:
     """Refuse (exit) a run whose NAME is already a COMPLETED optimization carrying a DIFFERENT
     decision-time list: the name is the job's identity (skip-by-name, checkpoint key), so reusing
     it for another list would either skip the new run as 'done' or compare unlike results under
@@ -1205,8 +1219,18 @@ def _refuse_reused_timegene_name(name: str, times: "list | None", command: str) 
                 .all())
         stored = []
         for r in rows:
-            spec = ((r.optimization_config or {}).get("expert_params") or {}).get("schedule:time") or {}
-            stored.append((r.id, spec.get("choices")))
+            params = (r.optimization_config or {}).get("expert_params") or {}
+            if split:
+                # a split job is the SAME job only when it also searched the split pair over this list
+                ent = (params.get("schedule:entry_time") or {}).get("choices")
+                man = (params.get("schedule:manage_time") or {}).get("choices")
+                stored.append((r.id, ent if ent == man else (ent, man)))
+            else:
+                if "schedule:entry_time" in params or "schedule:manage_time" in params:
+                    stored.append((r.id, "split entry/manage genes"))
+                    continue
+                spec = params.get("schedule:time") or {}
+                stored.append((r.id, spec.get("choices")))
     finally:
         db.close()
     other = [(i, c) for i, c in stored if c != list(times)]
@@ -1216,11 +1240,16 @@ def _refuse_reused_timegene_name(name: str, times: "list | None", command: str) 
                  f"different --name: the name is the job's identity (skip-by-name, checkpoint).")
 
 
-def _decision_time_gene(times: "list | None") -> dict:
-    """The ``expert_params`` entry (pre-namespaced) that declares the decision-time gene; {} when
-    no ``--decision-times`` was given, so every other job's gene space is untouched."""
+def _decision_time_gene(times: "list | None", *, split: bool = False) -> dict:
+    """The ``expert_params`` entries (pre-namespaced) that declare the decision-time gene(s); {} when
+    no ``--decision-times`` was given, so every other job's gene space is untouched. ``split``
+    (goal2027 2.4) declares ``schedule:entry_time`` and ``schedule:manage_time`` instead of the single
+    ``schedule:time`` (never both)."""
     if not times:
         return {}
+    if split:
+        return {"schedule:entry_time": {"optimize": True, "choices": list(times)},
+                "schedule:manage_time": {"optimize": True, "choices": list(times)}}
     return {"schedule:time": {"optimize": True, "choices": list(times)}}
 
 
@@ -1240,19 +1269,19 @@ def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
 
 def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None, *,
                          strategy_kind: "str | None" = None,
-                         rm_toggles_unpinned: "list | None" = None) -> dict:
+                         rm_toggles_unpinned: "list | None" = None,
+                         sizing_mode_searched: bool = False) -> dict:
     """Expert settings for a run: the spec's fixed_settings, plus the run universe injected into
     the expert's own universe setting when the spec names one (``universe_setting`` — for an
     expert that reads its universe from a setting, not from enabled_instruments; no current
     spec names one since PremiumSeller's removal, 2026-08-31).
 
     ``overrides`` wins over fixed_settings. Used by ``--sizing-mode`` so the SAME expert spec can
-    be run once per sizing mode without editing _EXPERT_OPT: sizing_mode is a 2-value categorical
-    the GA has never searched (it is pinned risk_atr for the classic experts), and it is
-    deliberately compared as two separate runs rather than made a gene — under notional the five
-    ATR genes face no selection pressure and drift random, so a crossover that flips the mode
-    would judge it with unselected parameters and bias the comparison toward whichever mode
-    happens to dominate the population.
+    be run once per sizing mode without editing _EXPERT_OPT. (``--search-sizing-mode`` now offers the
+    gene alternative, goal2027 item 2.1: under notional only ``atr_risk_budget_pct`` is dead; the stop
+    genes act in both modes since ``_ensure_safeguard_stop`` runs in notional too. Decode drops the
+    budget, so a crossover that flips the mode no longer scores it with an unselected budget. The older
+    "five ATR genes are inert under notional" argument for two matrices predates that.)
 
     ``risk_manager_mode`` (review finding M5, 2026-09-01) is plumbed here and NOWHERE ELSE:
     a spec that names one has it written onto the run's expert settings, from which
@@ -1276,8 +1305,17 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     serve both the equity grids and the option grids with a setting the option grids need
     (DeterministicScorer's ``macro_short_side``) without moving any equity job. No kind given
     (bypass experts, ad-hoc callers) = not an option job = the plain ``fixed_settings``.
+
+    ``sizing_mode_searched`` (``--search-sizing-mode``, goal2027 item 2.1): the spec's pinned ``sizing_mode``
+    is REMOVED, so the ``model:sizing_mode`` gene is the only source (no pin to disagree with it, none
+    persisted into ``expertFixedSettings``). Under notional only ``atr_risk_budget_pct`` is dead -- the
+    stop-distance genes still act through ``_ensure_safeguard_stop`` -- see
+    docs/plans/2026-10-25-goal2027-sizing-gene-plan.md; decode neutralises it
+    (``strategy_param_space.neutralise_sizing_genes``).
     """
     settings = dict(spec["fixed_settings"])
+    if sizing_mode_searched:
+        settings.pop("sizing_mode", None)
     settings.update(_option_fixed_settings_for(spec, strategy_kind))
     # HISTORICALLY INERT, PINNED SO THEY STAY THAT WAY -- unless a run policy unpinned one.
     # See _INERT_RM_TOGGLES / _pinned_rm_toggles.
@@ -1836,6 +1874,8 @@ def _effective_sizing_mode(spec: dict, args) -> "str | None":
     ``fixed_settings``. None means "unknown" and callers must treat it as the permissive case --
     never guess ``notional`` from absence, because that would silently drop a live gene.
     """
+    if _SEARCH_SIZING_MODE:
+        return None     # searched: unknown per genome -- keep atr_risk_budget_pct in the space
     mode = getattr(args, "sizing_mode", None)
     if mode:
         return mode
@@ -1875,6 +1915,10 @@ def _rm_opt_for(kind: str, sizing_mode: "str | None" = None, *, atr_searched: bo
     # It was NOT dead before the wiring fix -- while the two genes drove each other's jobs this
     # one set the stop distance, which applies in BOTH modes -- so this gating only becomes
     # correct alongside that fix, and would have silently changed notional results before it.
+    #
+    # Under ``--search-sizing-mode`` the mode is NOT known here (``_effective_sizing_mode`` returns None),
+    # so the gene stays in the space and is instead decoded away per genome:
+    # ``strategy_param_space.neutralise_sizing_genes`` drops it from a notional genome (decode + memo key).
     #
     # Dropped ONLY when the mode is positively known to be notional. Unknown stays permissive:
     # inferring notional from absence would delete a live gene from a risk_atr run.
@@ -5586,6 +5630,19 @@ _MARKET_EXIT_KINDS_SELECTED: "tuple[str, ...]" = ()
 _SEARCH_SL_LOOSEN: bool = False
 _SL_LOOSEN_SETTING = "allow_ruleset_sl_loosen"
 
+#: ``--search-sizing-mode`` (goal2027 item 2.1): searches ``sizing_mode`` as ONE ``model:sizing_mode`` choice gene
+#: over ("risk_atr", "notional"). Mutually exclusive with an explicit ``--sizing-mode`` (the pin). Decode-time
+#: neutralisation of the genes that are dead under notional lives in
+#: ``strategy_param_space.neutralise_sizing_genes``.
+_SEARCH_SIZING_MODE: bool = False
+
+#: ``--search-market-profile`` (goal2027 item 2.2): replaces the ``market:enabled`` master gene by ONE
+#: ``market:profile`` choice gene over (off, ohlcv-v1, ta-structure-v1, both). The builders stamp the
+#: ``market_profile_gene`` rule marker when it is on; the decode-time rules live in
+#: ``strategy_param_space.decode_params`` / ``neutralise_market_profile_genes``.
+_SEARCH_MARKET_PROFILE: bool = False
+_MARKET_PROFILE_GENE_PROFILES = ("ohlcv-v1", "ta-structure-v1")
+
 
 def _resolve_exclude_symbols_arg(spec) -> list:
     """Parse ``--exclude-symbols``: a comma list, or ``@path`` to a file.
@@ -6014,6 +6071,83 @@ def _sl_loosen_gene_space() -> dict:
         "optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"}}
 
 
+def _resolve_search_sizing_mode(raw, explicit_mode, command: str) -> bool:
+    """Parse ``--search-sizing-mode``; sets and returns the module global. Refuses (exit) together with an
+    explicit ``--sizing-mode``: one says "pin the mode", the other "search it".
+
+    Always ASSIGNS the global (False included) on purpose: the launcher is reused within one process
+    (tests, optimize-batch, in-process drivers), and a value left over from a previous command would
+    silently add the gene to, or drop the pin from, an unrelated run. Every command entry resets it."""
+    global _SEARCH_SIZING_MODE
+    if raw and explicit_mode:
+        sys.exit(f"{command}: --search-sizing-mode and --sizing-mode {explicit_mode} are mutually exclusive "
+                 f"(search the mode, or pin it; not both)")
+    _SEARCH_SIZING_MODE = bool(raw)
+    return _SEARCH_SIZING_MODE
+
+
+def _resolve_search_market_profile(raw, command: str) -> bool:
+    """Parse ``--search-market-profile``; sets and returns the module global. MUST run after the profile, manifest
+    and mode resolvers. Refuses (exit) unless BOTH profiles are selected with BOTH manifests pinned and the
+    ``searched`` arm: the gene chooses between the profiles, so a missing profile (or an unpinned manifest) would be a
+    choice value that could never be evaluated honestly.
+
+    Always ASSIGNS the global (False included): the launcher is reused within one process, and a value left over
+    from a previous command would silently change an unrelated run's gene space."""
+    global _SEARCH_MARKET_PROFILE
+    _SEARCH_MARKET_PROFILE = False
+    if not raw:
+        return False
+    need = _MARKET_PROFILE_GENE_PROFILES
+    if tuple(sorted(_MARKET_CONDITION_PROFILES)) != tuple(sorted(need)):
+        sys.exit(f"{command}: --search-market-profile needs --market-condition-profile {','.join(need)} "
+                 f"(both profiles); got {list(_MARKET_CONDITION_PROFILES)!r}")
+    unpinned = [p for p in need if not _MARKET_CONDITION_MANIFESTS.get(p)]
+    if unpinned:
+        sys.exit(f"{command}: --search-market-profile needs a --market-condition-manifest for BOTH profiles; "
+                 f"no manifest pinned for {unpinned!r}")
+    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+        sys.exit(f"{command}: --search-market-profile searches the market genes; --market-condition-mode "
+                 f"{_MARKET_CONDITION_MODE!r} is the no-impact control and cannot carry it")
+    _SEARCH_MARKET_PROFILE = True
+    return True
+
+
+def _refuse_market_profile_gene_unsupported(command: str, kind: str, bypass: bool) -> None:
+    """The gene is for the classic equity S1-S7 experts only (the strategies that carry the market master gene);
+    a bypass expert (FactorRanker) and the option strategies would search it dead -- refused, not inert."""
+    if not _SEARCH_MARKET_PROFILE:
+        return
+    if bypass:
+        sys.exit(f"{command}: --search-market-profile: {kind!r} is a bypass expert that carries no market "
+                 f"genes; the gene would be searched but dead")
+    if kind not in _EQUITY_MARKET_CONDITION_STRATEGIES:
+        sys.exit(f"{command}: --search-market-profile: {kind!r} is not an equity S1-S7 strategy "
+                 f"({sorted(_EQUITY_MARKET_CONDITION_STRATEGIES)}); the gene is for those only")
+
+
+def _sizing_mode_gene_space() -> dict:
+    """The ONE ``sizing_mode`` choice gene (``model:sizing_mode`` once collected) ``--search-sizing-mode`` adds
+    ({} when off). The choice ORDER is a persisted contract (the GA stores the index)."""
+    if not _SEARCH_SIZING_MODE:
+        return {}
+    return {"sizing_mode": {"optimize": True, "type": "choice", "choices": ["risk_atr", "notional"]}}
+
+
+def _refuse_sizing_gene_unsupported(command: str, kind: str, bypass: bool) -> None:
+    """The gene is for the classic S1-S7 experts only: a bypass expert (FactorRanker) never reads
+    ``sizing_mode`` and an option strategy sizes by its own structure rules, so the gene would be searched but
+    dead -- refused rather than silently inert (same convention as ``_refuse_sl_loosen_on_bypass``)."""
+    if not _SEARCH_SIZING_MODE:
+        return
+    if bypass:
+        sys.exit(f"{command}: --search-sizing-mode: {kind!r} is a bypass expert that never reads "
+                 f"sizing_mode; the gene would be searched but dead")
+    if kind in _OPTION_STRATEGY_KEYS:
+        sys.exit(f"{command}: --search-sizing-mode: {kind!r} is an option strategy; the gene is for the "
+                 f"classic equity strategies S1-S7 only")
+
+
 def _refuse_sl_loosen_on_bypass(command: str, kind: str, bypass: bool) -> None:
     """``allow_ruleset_sl_loosen`` only affects the classic ruleset stop-loss policy
     (``TradeActions.ruleset_stop_policy``); a bypass expert (FactorRanker) has no ruleset SL to
@@ -6091,6 +6225,8 @@ def _append_equity_market_condition_gates(strategy, kind: str):
         # never through THIS function, so they never carry the marker and never collect the
         # master gene (``strategy_param_space._strategy_opts_into_market_master_gene``).
         rule["market_master_gene"] = True
+        if _SEARCH_MARKET_PROFILE:
+            rule["market_profile_gene"] = True   # goal2027 2.2: market:profile replaces market:enabled
     strategy.entry_rules = normalize_trade_rules(rules)
     return strategy
 
@@ -6179,6 +6315,8 @@ def _append_equity_market_exit_rules(strategy, kind: str):
     # to stamp anyway -- market_exit_rules' leaves are fixed/resolved, design section 5.2).
     for rule in rules:
         rule["market_master_gene"] = True
+        if _SEARCH_MARKET_PROFILE:
+            rule["market_profile_gene"] = True   # goal2027 2.2
     merged, omitted = _insert_equity_market_exit_rules(strategy.exit_rules, rules)
     strategy.exit_rules = normalize_trade_rules(merged)
     assert_market_rule_actions(strategy.exit_rules, f"{kind} exit rules")
@@ -6938,6 +7076,29 @@ def _apply_neutral_entry_setting(backtest_block, mode):
             expert["settings"]["evaluate_entry_rules_on_hold"] = True
 
 
+def _resolve_chain_seed_source(db, name: str, warm_start_from) -> int:
+    """``--chain-seed-from NAME`` -> the id of the ONE completed optimization of that name.
+
+    Walk-forward chain seeding (docs/plans/2026-10-25-goal2027-walk-forward-plan.md): the handler
+    reads that row's stored final population. Refused here, before any row is created, when the
+    name is unknown, ambiguous or not completed, or when --warm-start-from is also given.
+    """
+    from app.models.strategy_optimization import StrategyOptimization
+    if warm_start_from is not None:
+        sys.exit("optimize: --chain-seed-from and --warm-start-from are mutually exclusive")
+    rows = db.query(StrategyOptimization.id, StrategyOptimization.status).filter(
+        StrategyOptimization.name == name).order_by(StrategyOptimization.id).all()
+    if not rows:
+        sys.exit(f"optimize: --chain-seed-from {name!r}: no optimization has that name")
+    if len(rows) > 1:
+        sys.exit(f"optimize: --chain-seed-from {name!r}: {len(rows)} optimizations share that name "
+                 f"({', '.join(f'id={i} {st}' for i, st in rows)}); delete the unwanted rows")
+    if rows[0][1] != "completed":
+        sys.exit(f"optimize: --chain-seed-from {name!r}: optimization {rows[0][0]} is "
+                 f"{rows[0][1]!r}, not completed")
+    return int(rows[0][0])
+
+
 def _cmd_optimize(args) -> int:
     """Create a Strategy + StrategyOptimization and run a joint genetic optimization headless.
 
@@ -6957,6 +7118,9 @@ def _cmd_optimize(args) -> int:
     _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize")
     _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize")
     _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize")
+    _resolve_search_sizing_mode(getattr(args, "search_sizing_mode", False),
+                                getattr(args, "sizing_mode", None), "optimize")
+    _resolve_search_market_profile(getattr(args, "search_market_profile", False), "optimize")
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -7051,7 +7215,8 @@ def _cmd_optimize(args) -> int:
     # because the accident this prevents is silent and costs hours of cluster time
     # while the inconvenience it causes is one flag.
     _opt_name = args.name or f"opt-{expert}"
-    _refuse_reused_timegene_name(_opt_name, decision_times, "optimize")
+    _refuse_reused_timegene_name(_opt_name, decision_times, "optimize",
+                                 split=_decision_times_is_split(getattr(args, "decision_times", None)))
     _refuse_reused_history_source_name(_opt_name, history_source, "optimize")
     if not getattr(args, "rerun", False):
         _db = SessionLocal()
@@ -7073,6 +7238,8 @@ def _cmd_optimize(args) -> int:
     try:
         bypass = bool(spec.get("bypass"))
         _refuse_sl_loosen_on_bypass("optimize", args.strategy, bypass)
+        _refuse_sizing_gene_unsupported("optimize", args.strategy, bypass)
+        _refuse_market_profile_gene_unsupported("optimize", args.strategy, bypass)
         _sname = args.name or f"opt-{expert}-{args.strategy}"
         # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
         # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
@@ -7094,7 +7261,8 @@ def _cmd_optimize(args) -> int:
             "experts": [{"class": expert, "settings": _expert_run_settings(
                 spec, universe, _sizing_overrides(args),
                 strategy_kind=None if bypass else args.strategy,
-                rm_toggles_unpinned=rm_toggles_unpinned)}],
+                rm_toggles_unpinned=rm_toggles_unpinned,
+                sizing_mode_searched=_SEARCH_SIZING_MODE)}],
             "start_date": args.start, "end_date": args.end,
             "initial_capital": float(args.initial_capital),
             "account_settings": {
@@ -7294,7 +7462,8 @@ def _cmd_optimize(args) -> int:
         _sched_opt = (_WEEKDAY_SCHEDULE_DAY_OPT if rm_toggle_policy == "atr-searched"
                      else _SCHEDULE_DAY_OPT)
         schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _sched_opt.items()}
-        schedule_genes.update(_decision_time_gene(decision_times))   # after the days: no index shift
+        schedule_genes.update(_decision_time_gene(          # after the days: no index shift
+            decision_times, split=_decision_times_is_split(getattr(args, "decision_times", None))))
         cfg = {
             "populationSize": int(args.population),
             "generations": int(args.generations),
@@ -7311,13 +7480,19 @@ def _cmd_optimize(args) -> int:
                               else {**spec["expert_params"],
                                     **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args),
                                                  atr_searched=(rm_toggle_policy == "atr-searched")),
-                                    **screener_genes, **schedule_genes, **_sl_loosen_gene_space()}),
+                                    **screener_genes, **schedule_genes, **_sl_loosen_gene_space(),
+                                    **_sizing_mode_gene_space()}),
             "backtest": backtest_block,
         }
         _apply_lattice_anchor(cfg, args.strategy, getattr(args, "lattice_anchor", None))
         _apply_early_stop_min_rel(cfg, getattr(args, "early_stop_min_rel", None))
         if getattr(args, "warm_start_from", None) is not None:
             cfg["warmStartFromOptimizationId"] = int(args.warm_start_from)
+        if getattr(args, "chain_seed_from", None):
+            cfg["chainSeedFromOptimizationId"] = _resolve_chain_seed_source(
+                db, args.chain_seed_from, getattr(args, "warm_start_from", None))
+        if getattr(args, "persist_final_population", False) or getattr(args, "chain_seed_from", None):
+            cfg["requireFinalPopulation"] = True
         _worker_ids = _worker_ids_from_args(args)
         opt = StrategyOptimization(
             strategy_id=strat.id, name=args.name or f"opt-{expert}",
@@ -7420,6 +7595,8 @@ def _cmd_optimize_batch(args) -> int:
     _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize-batch")
     _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize-batch")
     _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize-batch")
+    _resolve_search_sizing_mode(False, None, "optimize-batch")   # the gene is optimize-only; reset the global
+    _resolve_search_market_profile(False, "optimize-batch")      # likewise
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     batch_worker_ids = _worker_ids_from_args(args)  # resolved once; applied to every job
@@ -7513,7 +7690,8 @@ def _cmd_optimize_batch(args) -> int:
                 "experts": [{"class": expert, "settings": _expert_run_settings(
                     spec, universe, _sizing_overrides(args),
                     strategy_kind=None if bypass else strat_kind,
-                    rm_toggles_unpinned=rm_toggles_unpinned)}],
+                    rm_toggles_unpinned=rm_toggles_unpinned,
+                    sizing_mode_searched=_SEARCH_SIZING_MODE)}],
                 "start_date": args.start, "end_date": args.end,
                 "initial_capital": float(args.initial_capital),
                 "account_settings": {
@@ -7615,7 +7793,9 @@ def _cmd_optimize_batch(args) -> int:
                                            (_WEEKDAY_SCHEDULE_DAY_OPT
                                             if rm_toggle_policy == "atr-searched"
                                             else _SCHEDULE_DAY_OPT).items()},
-                                        **_decision_time_gene(decision_times),
+                                        **_decision_time_gene(
+                                            decision_times,
+                                            split=_decision_times_is_split(getattr(args, "decision_times", None))),
                                         **_sl_loosen_gene_space()}),
                 "backtest": backtest_block,
             }
@@ -8794,6 +8974,19 @@ def main(argv: "list | None" = None) -> int:
                          "from the same starting point). Use to keep evolving a converged/"
                          "plateaued run instead of re-searching from scratch. Default: off "
                          "(fresh random population).")
+    op.add_argument("--chain-seed-from", default=None, metavar="JOB_NAME",
+                    help="Walk-forward CHAIN SEEDING: seed this job's STARTING population from the "
+                         "stored FINAL population (last evaluated generation) of the completed "
+                         "optimization of this exact name. Unlike --warm-start-from it refuses "
+                         "(fails the job) on a gene-space mismatch, a source without a stored "
+                         "final population, or a source whose window ends after this job's "
+                         "(look-ahead); a short population is padded randomly (count logged and "
+                         "recorded as optimization_config.seededFrom). Mutually exclusive with "
+                         "--warm-start-from.")
+    op.add_argument("--persist-final-population", action="store_true",
+                    help="Fail the job at completion unless its final evaluated population was "
+                         "stored (strategy_optimization_populations). Implied by --chain-seed-from; "
+                         "the walk-forward engine passes it to fold 1, which seeds fold 2.")
     op.add_argument("--initial-capital", type=float, default=10000.0)
     op.add_argument("--equity-cap", type=float, default=None,
                     help="Optional FIXED equity the risk manager sizes against, in dollars "
@@ -8906,7 +9099,7 @@ def main(argv: "list | None" = None) -> int:
                          "via the schedule:<day> GA genes; this flag has no effect on the day "
                          "selection for those runs. Bypass experts (FactorRanker) don't get the "
                          "schedule genes, so this flag still fully controls their day(s).")
-    op.add_argument("--decision-times", default=None, metavar="default|fixed|HH:MM,HH:MM,...",
+    op.add_argument("--decision-times", default=None, metavar="default|split|fixed|HH:MM,HH:MM,...",
                     help="Search the DECISION TIME as a GA gene (schedule:time): a choice among "
                          "exactly these exchange-local times, applied to BOTH the entry and the "
                          "open-positions schedule. Each must be on the --interval bar grid, "
@@ -8916,7 +9109,11 @@ def main(argv: "list | None" = None) -> int:
                          "plain optimize decides at the single shared DEFAULT_DECISION_TIME "
                          "(only the grid DRIVERS default the gene ON). Refused for daily-clock, "
                          "option and bypass (FactorRanker) jobs. REQUIRES --name to contain "
-                         "'timegene'. Sessions that lack a scheduled time (15:30 on a 13:00 half "
+                         "'timegene'. 'split' (goal2027 2.4) searches the ENTRY time "
+                         "(schedule:entry_time) and the MANAGE time (schedule:manage_time) as two "
+                         "genes over the default seven values instead of one shared gene; REQUIRES "
+                         "--name to contain 'timesplit'. When both fire in the same minute, manage "
+                         "runs before entry. Sessions that lack a scheduled time (15:30 on a 13:00 half "
                          "day) get no decision; they are counted and logged.")
     op.add_argument("--name", default=None)
     op.add_argument("--rerun", action="store_true",
@@ -8930,15 +9127,34 @@ def main(argv: "list | None" = None) -> int:
                     help="Override the expert spec's pinned sizing_mode for this run. Omit to "
                          "keep the spec default (risk_atr for the classic experts). Exists so "
                          "notional vs risk_atr can be compared as TWO separate optimizations "
-                         "instead of one gene: under notional the five ATR genes "
+                         "instead of one gene: under notional only atr_risk_budget_pct (the "
+                         "risk_atr size budget) is inert; the safeguard-stop genes "
                          "(risk_per_trade_pct, atr_multiplier, atr_period, min_stop_loss_pct, "
-                         "use_atr_stop) are inert and drift random, so a crossover that flipped "
-                         "the mode would score it with unselected parameters and bias the "
-                         "comparison toward whichever mode dominates the population. No effect "
+                         "use_atr_stop) act in both modes. To search the mode as ONE gene instead, "
+                         "use --search-sizing-mode (exclusive with this flag). No effect "
                          "on bypass experts (FactorRanker) — they skip "
                          "TradeRiskManagement entirely, so sizing_mode is never read. ALWAYS "
                          "give the two runs different --name suffixes, or the second is SKIPped "
                          "as an already-completed run.")
+    op.add_argument("--search-sizing-mode", action="store_true", default=False,
+                    help="Search sizing_mode (risk_atr | notional) as ONE model:sizing_mode choice gene "
+                         "instead of pinning it (goal2027 item 2.1). Mutually exclusive with "
+                         "--sizing-mode. Genes with no effect under notional (atr_risk_budget_pct, the "
+                         "risk_atr size budget) decode to one canonical value (absent) so the trial memo "
+                         "dedups them; the stop-distance genes and "
+                         "max_virtual_equity_per_instrument_percent stay searched in both modes. "
+                         "Classic S1-S7 only: refused for bypass experts (FactorRanker) and option "
+                         "strategies. Name the job distinctly ('sizegene'): its gene space differs from a "
+                         "pinned run's.")
+    op.add_argument("--search-market-profile", action="store_true", default=False,
+                    help="Search the market-condition PROFILE as ONE market:profile choice gene (off | ohlcv-v1 | "
+                         "ta-structure-v1 | both) instead of the on/off market:enabled master gene (goal2027 "
+                         "item 2.2). Requires --market-condition-profile ohlcv-v1,ta-structure-v1 with BOTH "
+                         "manifests pinned (--market-condition-manifest ohlcv-v1=D1,ta-structure-v1=D2) and the "
+                         "'searched' arm. The leaf genes and the --market-exit rules of a profile that is not "
+                         "selected decode to off (a profile you did not pick cannot drive an exit); 'off' is "
+                         "exactly market:enabled=0. Equity S1-S7 only: refused for bypass experts and option "
+                         "strategies. Name the job distinctly ('mktprof').")
     op.add_argument("--rm-toggle-policy", choices=_RM_TOGGLE_POLICIES, default="pinned",
                     help="'pinned' (default): use_atr_stop/regime_overlay_enabled are pinned OFF "
                          "for this run, exactly as every run on record -- byte-identical to "
@@ -9150,10 +9366,10 @@ def main(argv: "list | None" = None) -> int:
                     help="Comma-separated day(s) for weekly --run-schedule (e.g. 'monday,thursday'). "
                          "NOTE: for a non-bypass expert this only seeds the static fallback — every "
                          "strategy searches WHICH day(s) itself via the schedule:<day> GA genes.")
-    ob.add_argument("--decision-times", default=None, metavar="HH:MM,HH:MM,...",
+    ob.add_argument("--decision-times", default=None, metavar="HH:MM,HH:MM,...|default|split",
                     help="Search the DECISION TIME as a GA gene for every job of the batch "
                          "(see `optimize --decision-times`). REQUIRES --name-prefix to contain "
-                         "'timegene'; refused if any job is an option or bypass job.")
+                         "'timegene' ('split': 'timesplit'); refused if any job is an option or bypass job.")
     ob.add_argument("--name-prefix", default=None, help="Strategy/opt name prefix (default phase1-).")
     ob.add_argument("--poll", type=int, default=15, help="Poll interval seconds (default 15).")
     ob.add_argument("--worker", action="append", default=None, metavar="NAME",

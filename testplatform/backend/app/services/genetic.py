@@ -371,6 +371,8 @@ class GeneticOptimizer:
         self.best_individual = None
         self.best_fitness = None
         self.history = []
+        # Last evaluated generation (genes + fitnesses); see optimize(). None until one ran.
+        self.last_evaluated_population = None
         self._resumed_no_improvement = 0
 
         # Write a partial checkpoint every N completed trials within a generation. Bounds what a
@@ -1150,6 +1152,15 @@ class GeneticOptimizer:
                 'stats': record
             })
 
+            # The last EVALUATED population, for chain seeding (walk-forward). Taken here, right
+            # after evaluation: the loop below evolves one more generation whose offspring were
+            # never scored, so the population at loop exit is NOT a result.
+            self.last_evaluated_population = {
+                'generation': gen,
+                'genes': [list(ind) for ind in population],
+                'fitnesses': [float(ind.fitness.values[0]) for ind in population],
+            }
+
             # Call callback if provided
             if callback:
                 callback(gen, best_fit, best_params)
@@ -1219,6 +1230,15 @@ class GeneticOptimizer:
 
             self._reproduce(population, gen)
 
+        if self.last_evaluated_population is None and initial_population and not                 [1 for ind in population if not ind.fitness.valid]:
+            # A resume that starts at (or past) the last generation runs no generation, but the
+            # restored population IS fully evaluated: it is the final population.
+            self.last_evaluated_population = {
+                'generation': start_generation - 1,
+                'genes': [list(ind) for ind in population],
+                'fitnesses': [float(ind.fitness.values[0]) for ind in population],
+            }
+
         # Final best
         best_params = self.decode_individual(self.best_individual)
 
@@ -1229,7 +1249,9 @@ class GeneticOptimizer:
             'best_params': best_params,
             'best_fitness': self.best_fitness,
             'generations_run': len(self.history),
-            'history': self.history
+            'history': self.history,
+            # None when no generation ran (a resume past the last generation).
+            'final_population': self.last_evaluated_population,
         }
 
     def get_progress(self) -> Dict:

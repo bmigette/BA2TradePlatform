@@ -59,6 +59,9 @@ Namespacing:
   schedule:time                    DECISION TIME: choice among the job's explicit HH:MM list
                                    (--decision-times); decoded into the ``times`` of BOTH the
                                    entry and the manage schedule
+  schedule:entry_time              SPLIT decision times (--decision-times split, goal2027 2.4):
+  schedule:manage_time             two choice genes, entry time -> the entry schedule, manage time
+                                   -> the manage schedule; mutually exclusive with schedule:time
   screener:<setting>               screener settings
   market:enabled                   MASTER GENE (int 0/1; atr_grid_2027 market master-gene
                                    addendum) -- present ONLY when the strategy template carries
@@ -83,6 +86,8 @@ from ba2_common.core.market_conditions import field_codes, field_spec
 from ba2_common.core.rule_models import MODE_OFF, NUMERIC_MODE_CHOICES, leaf_mode_kind
 from ba2_common.core.schedule_genes import (  # noqa: F401 -- re-bound for existing callers
     SCHEDULE_DAYS,
+    SCHEDULE_ENTRY_TIME_GENE,
+    SCHEDULE_MANAGE_TIME_GENE,
     SCHEDULE_TIME_GENE,
     WEEKDAYS as _WEEKDAYS,
     hhmm_to_minutes as _hhmm_to_minutes,
@@ -129,6 +134,159 @@ OPTION_SELECTION_WEIGHTS = ("w_premium", "w_iv", "w_rvol")
 #: dispatch and against every strategy the launcher builds.
 DECODE_GENE_NAMESPACES = ("model", "screener", "schedule", "cond", "entry", "exit", "optsel",
                           "market")
+
+#: goal2027 item 2.1 -- the sizing-mode gene. ``--search-sizing-mode`` adds ``model:sizing_mode`` as a
+#: choice gene over ``SIZING_MODES`` (this ORDER is a persisted contract: the GA stores the index).
+SIZING_MODE_GENE = "model:sizing_mode"
+SIZING_MODES = ("risk_atr", "notional")
+
+#: Genes with NO effect under ``sizing_mode == "notional"`` (audit:
+#: docs/plans/2026-10-25-goal2027-sizing-gene-plan.md). ``atr_risk_budget_pct`` is the risk_atr SIZE budget
+#: and only ``_risk_atr_quantity`` reads it. The stop-distance genes (risk_per_trade_pct, atr_multiplier,
+#: atr_period, min_stop_loss_pct, use_atr_stop) drive the safeguard stop in BOTH modes, and
+#: ``max_virtual_equity_per_instrument_percent`` is the notional sizer itself, so none of those belong here.
+NOTIONAL_INERT_MODEL_GENES = ("model:atr_risk_budget_pct",)
+
+
+def neutralise_sizing_genes(flat_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Canonicalise a decoded genome by its sizing mode: under ``notional`` every gene in
+    ``NOTIONAL_INERT_MODEL_GENES`` is REMOVED (canonical value = absent), so two genomes that differ only in
+    a dead gene decode to the same trial and the same memo key. Absent is also exactly what a fixed
+    ``--sizing-mode notional`` run builds (its gene space has no such gene), so the trial config equals that
+    run's. Under ``risk_atr`` nothing is dropped.
+
+    Returns ``flat_params`` ITSELF when nothing changes (no gene, risk_atr, or nothing to drop): older jobs
+    keep their keys and their decode untouched. Never mutates the input. Refuses an unknown mode."""
+    if SIZING_MODE_GENE not in flat_params:
+        return flat_params
+    mode = flat_params[SIZING_MODE_GENE]
+    if mode not in SIZING_MODES:
+        raise ValueError(f"{SIZING_MODE_GENE}: unknown sizing_mode {mode!r}; expected one of {SIZING_MODES}")
+    if mode != "notional" or not any(k in flat_params for k in NOTIONAL_INERT_MODEL_GENES):
+        return flat_params
+    return {k: v for k, v in flat_params.items() if k not in NOTIONAL_INERT_MODEL_GENES}
+
+
+#: goal2027 item 2.2 -- the market-profile gene. ``--search-market-profile`` adds ``market:profile`` as a choice gene
+#: over ``MARKET_PROFILE_CHOICES`` (this ORDER is a persisted contract: the GA stores the index). It REPLACES the
+#: ``market:enabled`` master gene for the jobs that use it. ``off`` selects no profile (everything market is off,
+#: exactly what ``market:enabled == 0`` does); ``both`` selects both.
+MARKET_PROFILE_GENE = "market:profile"
+MARKET_PROFILE_OHLCV = "ohlcv-v1"
+MARKET_PROFILE_STRUCTURE = "ta-structure-v1"
+MARKET_PROFILE_CHOICES = ("off", MARKET_PROFILE_OHLCV, MARKET_PROFILE_STRUCTURE, "both")
+_MARKET_PROFILE_SELECTION = {
+    "off": frozenset(),
+    MARKET_PROFILE_OHLCV: frozenset({MARKET_PROFILE_OHLCV}),
+    MARKET_PROFILE_STRUCTURE: frozenset({MARKET_PROFILE_STRUCTURE}),
+    "both": frozenset({MARKET_PROFILE_OHLCV, MARKET_PROFILE_STRUCTURE}),
+}
+
+
+def assert_market_profiles_covered() -> None:
+    """Every profile in the market-condition registry must be one ``market:profile`` can select. A third profile
+    would otherwise decode as "not selected" (silently off) in every genome; fail loudly instead."""
+    from ba2_common.core.market_conditions import PROFILES
+
+    known = {MARKET_PROFILE_OHLCV, MARKET_PROFILE_STRUCTURE}
+    extra = sorted(set(PROFILES) - known)
+    if extra:
+        raise ValueError(f"market-condition profile(s) {extra} are registered but MARKET_PROFILE_CHOICES "
+                         f"{MARKET_PROFILE_CHOICES} cannot select them; extend the choice list (a persisted "
+                         f"contract) before using {MARKET_PROFILE_GENE}")
+
+
+def market_profile_selection(value: Any) -> frozenset:
+    """The profiles a decoded ``market:profile`` value selects. Refuses an unknown value (no silent default)."""
+    try:
+        return _MARKET_PROFILE_SELECTION[value]
+    except (KeyError, TypeError):
+        raise ValueError(f"{MARKET_PROFILE_GENE}: unknown value {value!r}; expected one of "
+                         f"{MARKET_PROFILE_CHOICES}") from None
+
+
+def market_profile_members(strategy) -> Dict[str, Any]:
+    """Which profile each market-condition LEAF and each toggled market RULE of a Strategy TEMPLATE belongs to.
+
+    ``{"leaf_profile": {leaf_id: profile}, "rule_profiles": {rule_id: frozenset(profiles)},
+    "rule_leaves": {rule_id: [leaf_id, ...]}}``. A leaf's profile is the registered profile that owns its ``field``
+    (a field belongs to exactly one profile, refused otherwise). A market EXIT rule (membership as in
+    ``_market_condition_members``: rule-level ``toggle_optimize`` plus a market leaf) belongs to the profiles of
+    ALL its market leaves, so an exit rule can only run when every profile it reads is selected.
+    """
+    from ba2_common.core.market_conditions import PROFILES
+
+    assert_market_profiles_covered()
+    owner: Dict[str, str] = {}
+    for pname, prof in PROFILES.items():
+        for f in prof.fields:
+            if f.name in owner and owner[f.name] != pname:
+                raise ValueError(f"market field {f.name!r} is owned by both {owner[f.name]!r} and {pname!r}")
+            owner[f.name] = pname
+    leaf_profile: Dict[str, str] = {}
+    rule_leaves: Dict[str, list] = {}
+    _, rule_ids = _market_condition_members(strategy)
+
+    def walk(node, sink: list) -> None:
+        if not isinstance(node, dict):
+            return
+        for child in (node.get("conditions") or []):
+            walk(child, sink)
+        cid = node.get("id")
+        if cid and node.get("field") in owner:
+            leaf_profile[cid] = owner[node["field"]]
+            sink.append(cid)
+
+    for attr in ("entry_rules", "exit_rules"):
+        for rule in (getattr(strategy, attr, None) or []):
+            if not isinstance(rule, dict):
+                continue
+            sink: list = []
+            walk(rule.get("conditions"), sink)
+            # EXIT rules only: an equity ENTRY rule (S1's conviction tiers carry a rule-level toggle) holds the
+            # market leaves among its ordinary gates, so gating the RULE would drop the whole entry.
+            if attr == "exit_rules" and rule.get("id") in rule_ids:
+                rule_leaves[rule["id"]] = sink
+    rule_profiles = {rid: frozenset(leaf_profile[c] for c in leaves) for rid, leaves in rule_leaves.items()}
+    return {"leaf_profile": leaf_profile, "rule_profiles": rule_profiles, "rule_leaves": rule_leaves}
+
+
+def neutralise_market_profile_genes(flat_params: Dict[str, Any], members: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Canonicalise a decoded genome by its ``market:profile`` for the TRIAL MEMO KEY: whatever belongs to an
+    UNSELECTED profile cannot act (decode forces it off), so two genomes differing only there must share one key.
+
+    * an entry leaf of an unselected profile: ``cond:<id>:mode`` -> ``off`` (its value gene then follows the
+      existing mode-anchor pass in ``canonical_trial_params``);
+    * a market rule reading any unselected profile: ``exit:<rid>:enabled`` -> 0 and its action genes
+      (``exit:<rid>:a*``) and leaf genes (``cond:<leaf>:*``) are REMOVED.
+
+    Returns ``flat_params`` ITSELF when there is no ``market:profile`` gene (every older job) or nothing changes.
+    Never mutates the input."""
+    if MARKET_PROFILE_GENE not in flat_params:
+        return flat_params
+    selected = market_profile_selection(flat_params[MARKET_PROFILE_GENE])
+    if not members:
+        return flat_params
+    out = dict(flat_params)
+    rule_leaf_ids = {c for leaves in members["rule_leaves"].values() for c in leaves}
+    for cid, prof in members["leaf_profile"].items():
+        key = f"cond:{cid}:mode"
+        if prof not in selected and cid not in rule_leaf_ids and key in out:
+            cur = out[key]
+            out[key] = MODE_OFF if isinstance(cur, str) else 0   # index 0 is ``off`` in every mode choice list
+    for rid, profs in members["rule_profiles"].items():
+        if profs <= selected:
+            continue
+        for ns in ("exit", "entry"):
+            if f"{ns}:{rid}:enabled" in out:
+                out[f"{ns}:{rid}:enabled"] = 0
+            for k in [k for k in out if k.startswith(f"{ns}:{rid}:a")]:
+                del out[k]
+        for cid in members["rule_leaves"][rid]:
+            for k in [k for k in out if k.startswith(f"cond:{cid}:")]:
+                del out[k]
+    return flat_params if out == flat_params else out
+
 
 # Actions that must NEVER be dropped by a per-action toggle: removing the open action would
 # turn an entry rule into a no-op bracket; guards must stay. (Rule-level toggles can still
@@ -199,16 +357,25 @@ def _collect_schedule_days(schedule_cfg: Optional[Dict[str, Any]]) -> Dict[str, 
     # THE DECISION-TIME GENE, after the day genes (so adding it never shifts a day gene's index):
     # a categorical ``choice`` over the job's explicit list, encoded as an int index like every
     # other choice gene (genetic.py ``_create_individual`` / ``decode_individual``).
-    time_spec = (schedule_cfg or {}).get(SCHEDULE_TIME_GENE[len("schedule:"):])
-    if time_spec and time_spec.get("optimize"):
-        choices = list(time_spec["choices"])
+    # goal2027 2.4: the SPLIT pair (entry_time, manage_time) replaces the single gene; the two modes are
+    # mutually exclusive and the pair is all-or-nothing.
+    declared = [g for g in (SCHEDULE_TIME_GENE, SCHEDULE_ENTRY_TIME_GENE, SCHEDULE_MANAGE_TIME_GENE)
+                if ((schedule_cfg or {}).get(g[len("schedule:"):]) or {}).get("optimize")]
+    if SCHEDULE_TIME_GENE in declared and len(declared) > 1:
+        raise ValueError(f"{SCHEDULE_TIME_GENE} and {SCHEDULE_ENTRY_TIME_GENE} / "
+                         f"{SCHEDULE_MANAGE_TIME_GENE} are mutually exclusive")
+    if SCHEDULE_TIME_GENE not in declared and 0 < len(declared) < 2:
+        raise ValueError(f"the split decision-time genes need both {SCHEDULE_ENTRY_TIME_GENE} and "
+                         f"{SCHEDULE_MANAGE_TIME_GENE}, got only {declared}")
+    for gene in declared:
+        choices = list(schedule_cfg[gene[len("schedule:"):]]["choices"])
         for c in choices:
             _hhmm_to_minutes(c)
         if len(set(choices)) != len(choices) or len(choices) < 2 or choices != sorted(choices):
             raise ValueError(
-                f"{SCHEDULE_TIME_GENE}: choices must be >= 2 distinct HH:MM values in ascending "
+                f"{gene}: choices must be >= 2 distinct HH:MM values in ascending "
                 f"order, got {choices!r}")
-        out[SCHEDULE_TIME_GENE] = {
+        out[gene] = {
             "type": "choice", "choices": choices, "min": 0, "max": len(choices) - 1, "step": 1,
             # Generation 0 is balanced over the values (genetic.py ``_initial_population``).
             "stratify": True,
@@ -552,6 +719,20 @@ def _market_condition_field_names() -> set:
 _MARKET_MASTER_GENE_MARKER = "market_master_gene"
 
 
+#: goal2027 2.2 marker, stamped (next to ``market_master_gene``) by the launcher under ``--search-market-profile``:
+#: the strategy collects ``market:profile`` INSTEAD OF ``market:enabled``. Same rule-level survival as above.
+_MARKET_PROFILE_GENE_MARKER = "market_profile_gene"
+
+
+def _strategy_opts_into_market_profile_gene(strategy) -> bool:
+    for attr in ("entry_rules", "exit_rules"):
+        for rule in (getattr(strategy, attr, None) or []):
+            if isinstance(rule, dict) and (rule.get(_MARKET_PROFILE_GENE_MARKER)
+                                           or rule.get("marketProfileGene")):
+                return True
+    return False
+
+
 def _strategy_opts_into_market_master_gene(strategy) -> bool:
     """Whether ANY rule of this strategy TEMPLATE carries :data:`_MARKET_MASTER_GENE_MARKER`.
 
@@ -589,11 +770,12 @@ def _market_condition_members(strategy) -> "tuple[set, set]":
       market-condition fields (``ba2_common.core.market_conditions.PROFILES``), however deep it
       sits inside a mixed AND tree (the entry gates are appended into the SAME tree as the
       strategy's ordinary confidence/price gates — design section 5.1);
-    * a RULE (entry or exit) is a market-condition rule when it DECLARES ITS OWN rule-level
-      ``toggle_optimize`` (the ``exit:<rid>:enabled`` gene) AND at least one of its own
-      condition leaves is a market-condition leaf. The ``toggle_optimize`` requirement is not
-      redundant: the equity S1-S7 entry rule (design section 5.1) has NO rule-level toggle of
-      its own — the market leaves are appended INTO its ordinary, always-present tree alongside
+    * a RULE is a market-condition rule only when it is an EXIT rule that DECLARES ITS OWN rule-level
+      ``toggle_optimize`` (the ``exit:<rid>:enabled`` gene) AND at least one of its own condition leaves is a
+      market-condition leaf. Entry rules are NEVER market rules, even though S1's three conviction-tier entry
+      rules DO carry ``toggle_optimize`` (the market leaves sit among their ordinary gates, so dropping the rule
+      would drop the strategy's entry; only the individual market leaf is switched off). The older text below
+      claimed the equity entry rule has NO rule-level toggle of its own; that is false for S1 — the market leaves are appended INTO its ordinary, always-present tree alongside
       the strategy's own confidence/price gates — so treating "contains a market leaf" alone as
       rule membership would make the master gene drop that WHOLE entry rule (every ordinary gate
       with it) via a rule-level ``enabled`` gene the template never declared, instead of leaving
@@ -631,7 +813,10 @@ def _market_condition_members(strategy) -> "tuple[set, set]":
                 continue
             has_market_leaf = _walk_tree(rule.get("conditions"))
             rule_toggleable = bool(rule.get("toggle_optimize") or rule.get("toggleOptimize"))
-            if has_market_leaf and rule_toggleable and rule.get("id"):
+            # EXIT rules only (fixed 2026-10-25). An equity ENTRY rule can carry a rule-level toggle too (S1's three
+            # conviction-tier rules do, ``entry:buy-N:enabled``) while holding the market leaves among its ordinary
+            # gates; counting it as a market RULE made market:enabled == 0 drop the whole entry (0 S1 entries).
+            if attr == "exit_rules" and has_market_leaf and rule_toggleable and rule.get("id"):
                 rule_ids.add(rule["id"])
     return leaf_ids, rule_ids
 
@@ -657,11 +842,12 @@ def collect_param_space(
     """
     space: Dict[str, Any] = {}
     space.update(_collect_expert(expert_cfg))
-    if bypass and ((schedule_cfg or {}).get("time") or {}).get("optimize"):
+    if bypass and any(((schedule_cfg or {}).get(k) or {}).get("optimize")
+                      for k in ("time", "entry_time", "manage_time")):
         # A bypass expert's schedule genes are excluded wholesale (see the docstring); a time gene
         # declared for one would be silently dead, so refuse it instead.
-        raise ValueError(f"{SCHEDULE_TIME_GENE} is declared for a bypass expert, whose schedule "
-                         f"genes are not searched: refusing a dead gene")
+        raise ValueError(f"{SCHEDULE_TIME_GENE} (or the split entry/manage time genes) is declared for "
+                         f"a bypass expert, whose schedule genes are not searched: refusing a dead gene")
     if not bypass:
         space.update(_collect_conditions(strategy))
         space.update(_collect_schedule_days(schedule_cfg))
@@ -682,7 +868,12 @@ def collect_param_space(
     # finding, 2026-09-29). bypass experts never collect cond:*/entry:*/exit:* at all (see
     # above), so they get no master gene either -- there is nothing for it to control.
     if not bypass and _strategy_opts_into_market_master_gene(strategy):
-        space["market:enabled"] = _range_entry(0, 1, 1, is_int=True)
+        if _strategy_opts_into_market_profile_gene(strategy):
+            # goal2027 2.2: the profile choice REPLACES the on/off master gene (never both).
+            space[MARKET_PROFILE_GENE] = {"type": "choice", "choices": list(MARKET_PROFILE_CHOICES),
+                                          "min": 0, "max": len(MARKET_PROFILE_CHOICES) - 1, "step": 1}
+        else:
+            space["market:enabled"] = _range_entry(0, 1, 1, is_int=True)
     if not space:
         raise ValueError(
             "No optimizable parameters found: "
@@ -1076,6 +1267,8 @@ def _decode_rule_list(rules, ns: str,
         # not a template").
         rule.pop("market_master_gene", None)
         rule.pop("marketMasterGene", None)
+        rule.pop("market_profile_gene", None)
+        rule.pop("marketProfileGene", None)
         out.append(rule)
     return out
 
@@ -1091,6 +1284,8 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         'screener_overrides': {setting: value},
         'schedule_days': {day: bool}|None,        # None when no schedule:<day> genes were collected
         'schedule_time': 'HH:MM'|None,            # the schedule:time gene's value, else None
+        'schedule_entry_time': 'HH:MM'|None,      # the split genes' values (goal2027 2.4), else None
+        'schedule_manage_time': 'HH:MM'|None,
         'entry_rules': list,                      # concrete TradeRule lists (genes applied,
         'exit_rules': list,                       #  disabled rules/actions pruned)
       }
@@ -1104,8 +1299,11 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     screener_overrides: Dict[str, Any] = {}
     schedule_by_day: Dict[str, Any] = {}
     schedule_time: Optional[str] = None
+    schedule_entry_time: Optional[str] = None
+    schedule_manage_time: Optional[str] = None
     optsel_by_half: Dict[str, Dict[str, Any]] = {}
     market_enabled: Optional[Any] = None
+    market_profile: Optional[Any] = None
 
     def _rule_gene(store: Dict[str, Dict[str, Any]], rid: str, rest: str, val: Any) -> None:
         genes = store.setdefault(rid, {})
@@ -1117,6 +1315,10 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         else:
             raise ValueError(f"Unknown rule gene field {rest!r} for rule {rid!r}")
 
+    # Sizing-mode canonicalisation (goal2027 2.1) -- the ONE decode path, so GA, top-N persist, re-run,
+    # robustness variant and export all see the same neutralised genome. Identity for any job without the gene.
+    flat_params = neutralise_sizing_genes(flat_params)
+
     for key, val in flat_params.items():
         if key.startswith("model:"):
             expert_overrides[key[len("model:"):]] = val
@@ -1125,6 +1327,12 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         elif key == SCHEDULE_TIME_GENE:
             _hhmm_to_minutes(val)   # the decoded choice VALUE: a non-time here is corruption
             schedule_time = val
+        elif key in (SCHEDULE_ENTRY_TIME_GENE, SCHEDULE_MANAGE_TIME_GENE):
+            _hhmm_to_minutes(val)
+            if key == SCHEDULE_ENTRY_TIME_GENE:
+                schedule_entry_time = val
+            else:
+                schedule_manage_time = val
         elif key.startswith("schedule:"):
             schedule_by_day[key[len("schedule:"):]] = bool(val)
         elif key.startswith("cond:"):
@@ -1141,10 +1349,13 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
             optsel_by_half.setdefault(half, {})[w] = val
         elif key.startswith("market:"):
             field = key[len("market:"):]
-            if field != "enabled":
+            if field == "enabled":
+                market_enabled = val
+            elif field == "profile":
+                market_profile = val
+            else:
                 raise ValueError(
-                    f"Unknown market gene field {field!r} (only 'market:enabled' exists)")
-            market_enabled = val
+                    f"Unknown market gene field {field!r} (only 'market:enabled' and 'market:profile' exist)")
         else:
             raise ValueError(f"Unknown decoded param namespace: {key!r}")
 
@@ -1157,6 +1368,22 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     # persisted strategy is already the resolved, off-switched shape -- live never needs to know
     # the master gene exists. enabled=1 (or the gene simply absent, e.g. a genome predating it,
     # or a strategy with no market genes at all) leaves every individual gene exactly as decoded.
+    if market_enabled is not None and market_profile is not None:
+        raise ValueError("a genome carries both market:enabled and market:profile; the profile gene REPLACES the "
+                         "on/off master gene, so refusing an ambiguous genome")
+    if market_profile is not None:
+        # goal2027 2.2: the leaves/rules of every profile NOT selected are forced off, exactly as
+        # market:enabled == 0 forces ALL of them (``off`` selects nothing, so it IS that case). A market exit
+        # rule reads fields of its profile only, so an unselected profile cannot drive an exit.
+        selected = market_profile_selection(market_profile)
+        members = market_profile_members(strategy)
+        for cid, prof in members["leaf_profile"].items():
+            if prof not in selected:
+                cond_by_id.setdefault(cid, {})["mode"] = MODE_OFF
+        for rid, profs in members["rule_profiles"].items():
+            if not profs <= selected:
+                entry_genes.setdefault(rid, {})["enabled"] = 0
+                exit_genes.setdefault(rid, {})["enabled"] = 0
     if market_enabled is not None and int(market_enabled) == 0:
         market_leaf_ids, market_rule_ids = _market_condition_members(strategy)
         for cid in market_leaf_ids:
@@ -1188,6 +1415,13 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     # rather than wasting a trial evaluating it. What counts as dead differs by run kind --
     # no WEEKDAY on for an option run, all seven off for an equity run (unchanged) -- see
     # _repair_no_weekday.
+    # goal2027 2.4: the single gene and the split pair are mutually exclusive; the pair is all-or-nothing.
+    if schedule_time is not None and (schedule_entry_time is not None or schedule_manage_time is not None):
+        raise ValueError(f"{SCHEDULE_TIME_GENE} and {SCHEDULE_ENTRY_TIME_GENE} / "
+                         f"{SCHEDULE_MANAGE_TIME_GENE} are mutually exclusive")
+    if (schedule_entry_time is None) != (schedule_manage_time is None):
+        raise ValueError(f"a genome needs both {SCHEDULE_ENTRY_TIME_GENE} and "
+                         f"{SCHEDULE_MANAGE_TIME_GENE} or neither")
     schedule_days: Optional[Dict[str, bool]] = None
     if schedule_by_day:
         days = {day: schedule_by_day.get(day, False) for day in SCHEDULE_DAYS}
@@ -1204,6 +1438,8 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         "screener_overrides": screener_overrides,
         "schedule_days": schedule_days,
         "schedule_time": schedule_time,
+        "schedule_entry_time": schedule_entry_time,
+        "schedule_manage_time": schedule_manage_time,
         "entry_rules": entry_rules,
         "exit_rules": exit_rules,
     }
