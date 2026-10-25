@@ -1146,13 +1146,24 @@ def _refuse_atr_policy_without_job_name(policy: str, name: "str | None") -> None
 
 #: The name token a ``--decision-times`` job must carry (see ``_resolve_decision_times``).
 DECISION_TIMES_NAME_TOKEN = "timegene"
+#: ``--decision-times split`` (goal2027 2.4): the ENTRY time and the MANAGE time are searched as two genes.
+#: A different gene space is a different job, so it carries its own name token.
+DECISION_TIMES_SPLIT = "split"
+DECISION_TIMES_SPLIT_NAME_TOKEN = "timesplit"
+
+
+def _decision_times_is_split(raw) -> bool:
+    """True for ``--decision-times split`` (the default seven values, as TWO genes)."""
+    return raw is not None and str(raw).strip() == DECISION_TIMES_SPLIT
 
 
 def _resolve_decision_times(raw, command: str, *, interval: str, name: "str | None",
                             bypass_jobs, option_jobs) -> "list | None":
-    """``--decision-times 09:35,09:40,...|default|fixed`` -> the validated, sorted list, or None
+    """``--decision-times 09:35,09:40,...|default|split|fixed`` -> the validated, sorted list, or None
     (flag absent or ``fixed``: no gene, the single shared default time). ``default`` is the shared
-    ``DEFAULT_DECISION_TIME_CHOICES``.
+    ``DEFAULT_DECISION_TIME_CHOICES``; ``split`` is the same seven values searched as TWO genes
+    (``schedule:entry_time`` + ``schedule:manage_time``, goal2027 2.4) and requires ``timesplit`` in the
+    name instead of ``timegene``.
 
     Everything refused HERE, before a row is written, so a bad flag costs nothing:
       * a daily-clock job (``--interval 1d``): a decision time means nothing with one bar a day;
@@ -1177,18 +1188,21 @@ def _resolve_decision_times(raw, command: str, *, interval: str, name: "str | No
         sys.exit(f"ba2-test {command}: --decision-times is refused for option jobs "
                  f"({sorted(option_jobs)}): option backtests run on a DAILY clock, one bar per "
                  f"session, so there is no decision time to search")
+    split = _decision_times_is_split(raw)
     try:
-        times = parse_decision_times_arg(raw, interval)
+        times = parse_decision_times_arg("default" if split else raw, interval)
     except ValueError as e:
         sys.exit(f"ba2-test {command}: --decision-times: {e}")
-    if not name or DECISION_TIMES_NAME_TOKEN not in name:
-        sys.exit(f"ba2-test {command}: --decision-times requires --name (or --name-prefix) to "
-                 f"contain {DECISION_TIMES_NAME_TOKEN!r} (got {name!r}) -- the run's identity "
+    token = DECISION_TIMES_SPLIT_NAME_TOKEN if split else DECISION_TIMES_NAME_TOKEN
+    if not name or token not in name:
+        sys.exit(f"ba2-test {command}: --decision-times {'split ' if split else ''}requires --name (or "
+                 f"--name-prefix) to contain {token!r} (got {name!r}) -- the run's identity "
                  f"must differ from a plain run of the same expert/strategy")
     return times
 
 
-def _refuse_reused_timegene_name(name: str, times: "list | None", command: str) -> None:
+def _refuse_reused_timegene_name(name: str, times: "list | None", command: str, *,
+                                 split: bool = False) -> None:
     """Refuse (exit) a run whose NAME is already a COMPLETED optimization carrying a DIFFERENT
     decision-time list: the name is the job's identity (skip-by-name, checkpoint key), so reusing
     it for another list would either skip the new run as 'done' or compare unlike results under
@@ -1205,8 +1219,18 @@ def _refuse_reused_timegene_name(name: str, times: "list | None", command: str) 
                 .all())
         stored = []
         for r in rows:
-            spec = ((r.optimization_config or {}).get("expert_params") or {}).get("schedule:time") or {}
-            stored.append((r.id, spec.get("choices")))
+            params = (r.optimization_config or {}).get("expert_params") or {}
+            if split:
+                # a split job is the SAME job only when it also searched the split pair over this list
+                ent = (params.get("schedule:entry_time") or {}).get("choices")
+                man = (params.get("schedule:manage_time") or {}).get("choices")
+                stored.append((r.id, ent if ent == man else (ent, man)))
+            else:
+                if "schedule:entry_time" in params or "schedule:manage_time" in params:
+                    stored.append((r.id, "split entry/manage genes"))
+                    continue
+                spec = params.get("schedule:time") or {}
+                stored.append((r.id, spec.get("choices")))
     finally:
         db.close()
     other = [(i, c) for i, c in stored if c != list(times)]
@@ -1216,11 +1240,16 @@ def _refuse_reused_timegene_name(name: str, times: "list | None", command: str) 
                  f"different --name: the name is the job's identity (skip-by-name, checkpoint).")
 
 
-def _decision_time_gene(times: "list | None") -> dict:
-    """The ``expert_params`` entry (pre-namespaced) that declares the decision-time gene; {} when
-    no ``--decision-times`` was given, so every other job's gene space is untouched."""
+def _decision_time_gene(times: "list | None", *, split: bool = False) -> dict:
+    """The ``expert_params`` entries (pre-namespaced) that declare the decision-time gene(s); {} when
+    no ``--decision-times`` was given, so every other job's gene space is untouched. ``split``
+    (goal2027 2.4) declares ``schedule:entry_time`` and ``schedule:manage_time`` instead of the single
+    ``schedule:time`` (never both)."""
     if not times:
         return {}
+    if split:
+        return {"schedule:entry_time": {"optimize": True, "choices": list(times)},
+                "schedule:manage_time": {"optimize": True, "choices": list(times)}}
     return {"schedule:time": {"optimize": True, "choices": list(times)}}
 
 
@@ -6985,7 +7014,8 @@ def _cmd_optimize(args) -> int:
     # because the accident this prevents is silent and costs hours of cluster time
     # while the inconvenience it causes is one flag.
     _opt_name = args.name or f"opt-{expert}"
-    _refuse_reused_timegene_name(_opt_name, decision_times, "optimize")
+    _refuse_reused_timegene_name(_opt_name, decision_times, "optimize",
+                                 split=_decision_times_is_split(getattr(args, "decision_times", None)))
     _refuse_reused_history_source_name(_opt_name, history_source, "optimize")
     if not getattr(args, "rerun", False):
         _db = SessionLocal()
@@ -7359,7 +7389,8 @@ def _cmd_optimize(args) -> int:
         _sched_opt = (_WEEKDAY_SCHEDULE_DAY_OPT if rm_toggle_policy == "atr-searched"
                      else _SCHEDULE_DAY_OPT)
         schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _sched_opt.items()}
-        schedule_genes.update(_decision_time_gene(decision_times))   # after the days: no index shift
+        schedule_genes.update(_decision_time_gene(          # after the days: no index shift
+            decision_times, split=_decision_times_is_split(getattr(args, "decision_times", None))))
         cfg = {
             "populationSize": int(args.population),
             "generations": int(args.generations),
@@ -7678,7 +7709,9 @@ def _cmd_optimize_batch(args) -> int:
                                            (_WEEKDAY_SCHEDULE_DAY_OPT
                                             if rm_toggle_policy == "atr-searched"
                                             else _SCHEDULE_DAY_OPT).items()},
-                                        **_decision_time_gene(decision_times),
+                                        **_decision_time_gene(
+                                            decision_times,
+                                            split=_decision_times_is_split(getattr(args, "decision_times", None))),
                                         **_sl_loosen_gene_space()}),
                 "backtest": backtest_block,
             }
@@ -8960,7 +8993,7 @@ def main(argv: "list | None" = None) -> int:
                          "via the schedule:<day> GA genes; this flag has no effect on the day "
                          "selection for those runs. Bypass experts (FactorRanker) don't get the "
                          "schedule genes, so this flag still fully controls their day(s).")
-    op.add_argument("--decision-times", default=None, metavar="default|fixed|HH:MM,HH:MM,...",
+    op.add_argument("--decision-times", default=None, metavar="default|split|fixed|HH:MM,HH:MM,...",
                     help="Search the DECISION TIME as a GA gene (schedule:time): a choice among "
                          "exactly these exchange-local times, applied to BOTH the entry and the "
                          "open-positions schedule. Each must be on the --interval bar grid, "
@@ -8970,7 +9003,11 @@ def main(argv: "list | None" = None) -> int:
                          "plain optimize decides at the single shared DEFAULT_DECISION_TIME "
                          "(only the grid DRIVERS default the gene ON). Refused for daily-clock, "
                          "option and bypass (FactorRanker) jobs. REQUIRES --name to contain "
-                         "'timegene'. Sessions that lack a scheduled time (15:30 on a 13:00 half "
+                         "'timegene'. 'split' (goal2027 2.4) searches the ENTRY time "
+                         "(schedule:entry_time) and the MANAGE time (schedule:manage_time) as two "
+                         "genes over the default seven values instead of one shared gene; REQUIRES "
+                         "--name to contain 'timesplit'. When both fire in the same minute, manage "
+                         "runs before entry. Sessions that lack a scheduled time (15:30 on a 13:00 half "
                          "day) get no decision; they are counted and logged.")
     op.add_argument("--name", default=None)
     op.add_argument("--rerun", action="store_true",
@@ -9214,10 +9251,10 @@ def main(argv: "list | None" = None) -> int:
                     help="Comma-separated day(s) for weekly --run-schedule (e.g. 'monday,thursday'). "
                          "NOTE: for a non-bypass expert this only seeds the static fallback — every "
                          "strategy searches WHICH day(s) itself via the schedule:<day> GA genes.")
-    ob.add_argument("--decision-times", default=None, metavar="HH:MM,HH:MM,...",
+    ob.add_argument("--decision-times", default=None, metavar="HH:MM,HH:MM,...|default|split",
                     help="Search the DECISION TIME as a GA gene for every job of the batch "
                          "(see `optimize --decision-times`). REQUIRES --name-prefix to contain "
-                         "'timegene'; refused if any job is an option or bypass job.")
+                         "'timegene' ('split': 'timesplit'); refused if any job is an option or bypass job.")
     ob.add_argument("--name-prefix", default=None, help="Strategy/opt name prefix (default phase1-).")
     ob.add_argument("--poll", type=int, default=15, help="Poll interval seconds (default 15).")
     ob.add_argument("--worker", action="append", default=None, metavar="NAME",

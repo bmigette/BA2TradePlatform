@@ -51,7 +51,8 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 from matrix_flags import (  # noqa: E402
     finish_matrix, note_job_exit,
-    add_history_source_flag, cap_passthrough, decision_times_plan, decision_times_tokens, history_source_tokens,
+    add_history_source_flag, cap_passthrough, decision_times_plan, decision_times_split, decision_times_tokens,
+    history_source_tokens,
     job_name_with_digest, screener_dry_run_universe_note, with_decision_times_name, with_history_source_name,
     with_universe_rule_name)
 
@@ -213,7 +214,8 @@ def decision_times_passthrough(args) -> list:
     and the job's base name gets the ``-timegene`` token: the time list changes what the job
     scores, so two jobs differing only by it must not share a name, a skip-completed check or a
     checkpoint."""
-    return decision_times_tokens(getattr(args, "decision_times_resolved", None))
+    return decision_times_tokens(getattr(args, "decision_times_resolved", None),
+                                 split=decision_times_split(getattr(args, "decision_times", None)))
 
 
 def _job_name(name: str, cmd: list) -> str:
@@ -466,7 +468,7 @@ def main() -> int:
                          "affected, whatever this flag says. Folds into the job's name digest "
                          "(on its own) so an opted-out run can never resume/be confused with a "
                          "repaired run's completed row under the same name.")
-    ap.add_argument("--decision-times", default=None, metavar="default|fixed|HH:MM,HH:MM,...",
+    ap.add_argument("--decision-times", default=None, metavar="default|split|fixed|HH:MM,HH:MM,...",
                     help="The DECISION TIME gene (schedule:time) searched by every classic job. "
                          "DEFAULT (flag absent) = ON with the shared DEFAULT_DECISION_TIME_CHOICES "
                          "(09:35,09:40,09:45,10:00,12:00,15:30,15:45); 'fixed' = no gene, the "
@@ -642,7 +644,8 @@ def main() -> int:
         if strat is None and args.decision_times_resolved:
             print(f"[{i}/{len(jobs)}] NOTE {name}: bypass expert, decision time stays fixed "
                   f"(no schedule genes)", flush=True)
-        name = with_decision_times_name(name, job_dt_times)
+        name = with_decision_times_name(name, job_dt_times,
+                                        split=decision_times_split(args.decision_times))
         # The static-universe RULE is part of the job's identity (every job here is a --screener job):
         # a name without the token was launched under the old cap-ranked top-50 list and must never be
         # skipped as "completed" or resumed as this job.
@@ -747,7 +750,7 @@ def main() -> int:
         cmd += fr_tokens
         # --decision-times: appended last (same reasoning); digest on its own. (A bypass job was
         # skipped above: it cannot carry the gene.)
-        dt_tokens = decision_times_tokens(job_dt_times)
+        dt_tokens = decision_times_tokens(job_dt_times, split=decision_times_split(args.decision_times))
         cmd += dt_tokens
         unc_tokens = ["--screener-exclude-uncached"] if args.exclude_uncached else []
         cmd += unc_tokens

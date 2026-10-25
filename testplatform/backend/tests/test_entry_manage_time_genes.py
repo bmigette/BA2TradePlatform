@@ -304,7 +304,7 @@ class TestExport:
         from app.api.backtests import _derive_export_payload
         db, bt = self._opt_and_bt(_flat("09:45", "15:30"), self._RANGES)
         try:
-            ex = _derive_export_payload(bt, "expert_settings", db)["settings"]["execution"]
+            ex = _derive_export_payload(bt, "expert_settings", db)["execution"]
             assert ex["run_schedule_override"]["times"] == ["09:45"]
             assert ex["manage_times"] == ["15:30"]
         finally:
@@ -330,7 +330,7 @@ class TestExport:
         sp[SCHEDULE_TIME_GENE] = "12:00"
         db, bt = self._opt_and_bt(sp, {SCHEDULE_TIME_GENE: {"type": "choice"}})
         try:
-            ex = _derive_export_payload(bt, "expert_settings", db)["settings"]["execution"]
+            ex = _derive_export_payload(bt, "expert_settings", db)["execution"]
             assert ex["run_schedule_override"]["times"] == ["12:00"] and "manage_times" not in ex
         finally:
             db.close()

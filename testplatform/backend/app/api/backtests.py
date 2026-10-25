@@ -1220,6 +1220,31 @@ def _refuse_sizing_gene_row_without_gene(backtest: Backtest, db: Any) -> None:
                     f"model:sizing_mode gene; exporting would deploy it as notional by default. Refusing."))
 
 
+def _refuse_split_time_row_without_genes(backtest: Backtest, db: Any) -> None:
+    """No silent default for the decision times: a run that searched the SPLIT genes (its optimization's
+    parameter_ranges carry ``schedule:entry_time`` / ``schedule:manage_time``, goal2027 item 2.4) but whose
+    row lost either one would deploy the entry and manage schedules at a time the GA never chose. Refused.
+    Rows of runs without the split genes are unaffected."""
+    if db is None or backtest.optimization_id is None:
+        return
+    from ba2_common.core.schedule_genes import SCHEDULE_ENTRY_TIME_GENE, SCHEDULE_MANAGE_TIME_GENE
+    from app.models.strategy_optimization import StrategyOptimization
+    so = db.query(StrategyOptimization).filter(
+        StrategyOptimization.id == backtest.optimization_id).first()
+    ranges = so.parameter_ranges if so is not None else None
+    if not isinstance(ranges, dict) or not (
+            SCHEDULE_ENTRY_TIME_GENE in ranges or SCHEDULE_MANAGE_TIME_GENE in ranges):
+        return
+    sp = backtest.strategy_params if isinstance(backtest.strategy_params, dict) else {}
+    missing = [g for g in (SCHEDULE_ENTRY_TIME_GENE, SCHEDULE_MANAGE_TIME_GENE) if sp.get(g) is None]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: its optimization searched the split decision times "
+                    f"({SCHEDULE_ENTRY_TIME_GENE} and {SCHEDULE_MANAGE_TIME_GENE}) but this row has no "
+                    f"{', '.join(missing)}; exporting would deploy a time the GA never chose. Refusing."))
+
+
 def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dict:
     """Build the chosen read-only export payload from a backtest's strategy_params.
 
@@ -1237,6 +1262,7 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
     if kind == "expert_settings":
         bt_block, _strat = _opt_backtest_block(backtest, db)
         _refuse_sizing_gene_row_without_gene(backtest, db)
+        _refuse_split_time_row_without_genes(backtest, db)
     try:
         return derive_export_payload(
             backtest, kind,
