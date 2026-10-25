@@ -1199,6 +1199,27 @@ def _is_bypass_expert_class(expert_name: Optional[str]) -> bool:
     return bool(getattr(expert_cls, "bypasses_classic_rm", False))
 
 
+def _refuse_sizing_gene_row_without_gene(backtest: Backtest, db: Any) -> None:
+    """No silent default: the risk manager reads an ABSENT ``sizing_mode`` as notional. A row whose run
+    searched the sizing mode (its optimization's parameter_ranges carry ``model:sizing_mode``, goal2027
+    item 2.1) but whose ``strategy_params`` lost that gene would deploy as notional whatever the GA chose,
+    so it is refused instead. Rows of pinned runs (no such gene in the space) are unaffected."""
+    if db is None or backtest.optimization_id is None:
+        return
+    from app.models.strategy_optimization import StrategyOptimization
+    so = db.query(StrategyOptimization).filter(
+        StrategyOptimization.id == backtest.optimization_id).first()
+    ranges = so.parameter_ranges if so is not None else None
+    if not isinstance(ranges, dict) or "model:sizing_mode" not in ranges:
+        return
+    sp = backtest.strategy_params
+    if not isinstance(sp, dict) or sp.get("model:sizing_mode") is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: its optimization searched sizing_mode but this row has no "
+                    f"model:sizing_mode gene; exporting would deploy it as notional by default. Refusing."))
+
+
 def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dict:
     """Build the chosen read-only export payload from a backtest's strategy_params.
 
@@ -1215,6 +1236,7 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
     bt_block = None
     if kind == "expert_settings":
         bt_block, _strat = _opt_backtest_block(backtest, db)
+        _refuse_sizing_gene_row_without_gene(backtest, db)
     try:
         return derive_export_payload(
             backtest, kind,

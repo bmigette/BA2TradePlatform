@@ -283,3 +283,71 @@ class TestDriver:
     def test_requires_the_sizegene_name_token(self):
         r = self._run("--search-sizing-mode", "--name-suffix", "plain")
         assert r.returncode != 0 and "sizegene" in r.stderr
+
+
+# ----------------------------------------------------------------------------- no silent default to notional
+class TestExportRefusesAGeneRowWithoutTheGene:
+    """TradeRiskManagement reads an absent sizing_mode as notional. A row from a gene run that lost its
+    model:sizing_mode must therefore refuse to export, not deploy as a silent notional."""
+
+    @pytest.fixture(autouse=True)
+    def _db(self):
+        from app.models.database import Base, engine
+        Base.metadata.create_all(bind=engine)
+
+    @staticmethod
+    def _opt_and_bt(strategy_params, ranges):
+        from datetime import datetime
+        from app.models.backtest import Backtest
+        from app.models.database import SessionLocal
+        from app.models.strategy import Strategy
+        from app.models.strategy_optimization import StrategyOptimization
+        db = SessionLocal()
+        strat = Strategy(name="sg-strat", entry_rules=[], exit_rules=[])
+        db.add(strat); db.commit(); db.refresh(strat)
+        opt = StrategyOptimization(
+            strategy_id=strat.id, name="sg-opt", fitness_metric="sharpe", optimization_type="genetic",
+            optimization_config={"backtest": {"backtest_id": 1, "enabled_instruments": ["AAPL"],
+                                              "experts": [{"class": "FMPRating", "settings": {}}],
+                                              "account_settings": {}, "warmup_days": 30, "seed": 42}},
+            parameter_ranges=ranges, all_results=[], best_params={}, best_fitness=1.0,
+            status="completed")
+        db.add(opt); db.commit(); db.refresh(opt)
+        bt = Backtest(name="TOP1-sg", expert_name="FMPRating", engine_type="daily_expert",
+                      strategy_params=strategy_params, start_date=datetime(2024, 1, 1),
+                      end_date=datetime(2024, 6, 1), initial_capital=10_000.0,
+                      optimization_id=opt.id)
+        return db, bt
+
+    def test_gene_run_row_without_the_gene_is_refused(self):
+        from fastapi import HTTPException
+        from app.api.backtests import _derive_export_payload
+        db, bt = self._opt_and_bt({"model:risk_per_trade_pct": 2.0},
+                                  {"model:sizing_mode": {"type": "choice"}})
+        try:
+            with pytest.raises(HTTPException) as e:
+                _derive_export_payload(bt, "expert_settings", db)
+            assert "sizing_mode" in str(e.value.detail)
+        finally:
+            db.close()
+
+    def test_gene_run_row_with_the_gene_exports(self):
+        from app.api.backtests import _derive_export_payload
+        db, bt = self._opt_and_bt({"model:sizing_mode": "notional"},
+                                  {"model:sizing_mode": {"type": "choice"}})
+        try:
+            p = _derive_export_payload(bt, "expert_settings", db)
+            assert p["settings"]["expert_params"]["sizing_mode"] == "notional"
+        finally:
+            db.close()
+
+    def test_pinned_run_row_is_unaffected(self):
+        from app.api.backtests import _derive_export_payload
+        db, bt = self._opt_and_bt({"model:risk_per_trade_pct": 2.0,
+                                   "expertFixedSettings": {"sizing_mode": "risk_atr"}},
+                                  {"model:risk_per_trade_pct": {"type": "float"}})
+        try:
+            p = _derive_export_payload(bt, "expert_settings", db)
+            assert p["settings"]["expert_params"]["sizing_mode"] == "risk_atr"
+        finally:
+            db.close()
