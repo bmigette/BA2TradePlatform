@@ -1234,6 +1234,12 @@ def _refuse_market_profile_row_without_gene(backtest: Backtest, db: Any) -> None
     if not isinstance(ranges, dict) or "market:profile" not in ranges:
         return
     sp = backtest.strategy_params
+    from app.services.strategy_param_space import MARKET_PROFILE_CHOICES
+    if isinstance(sp, dict) and sp.get("market:profile") is not None and sp["market:profile"] not in MARKET_PROFILE_CHOICES:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: stored market:profile {sp['market:profile']!r} is not one of "
+                    f"{list(MARKET_PROFILE_CHOICES)}. Refusing."))
     if not isinstance(sp, dict) or sp.get("market:profile") is None:
         raise HTTPException(
             status_code=400,

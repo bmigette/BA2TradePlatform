@@ -178,6 +178,19 @@ _MARKET_PROFILE_SELECTION = {
 }
 
 
+def assert_market_profiles_covered() -> None:
+    """Every profile in the market-condition registry must be one ``market:profile`` can select. A third profile
+    would otherwise decode as "not selected" (silently off) in every genome; fail loudly instead."""
+    from ba2_common.core.market_conditions import PROFILES
+
+    known = {MARKET_PROFILE_OHLCV, MARKET_PROFILE_STRUCTURE}
+    extra = sorted(set(PROFILES) - known)
+    if extra:
+        raise ValueError(f"market-condition profile(s) {extra} are registered but MARKET_PROFILE_CHOICES "
+                         f"{MARKET_PROFILE_CHOICES} cannot select them; extend the choice list (a persisted "
+                         f"contract) before using {MARKET_PROFILE_GENE}")
+
+
 def market_profile_selection(value: Any) -> frozenset:
     """The profiles a decoded ``market:profile`` value selects. Refuses an unknown value (no silent default)."""
     try:
@@ -198,6 +211,7 @@ def market_profile_members(strategy) -> Dict[str, Any]:
     """
     from ba2_common.core.market_conditions import PROFILES
 
+    assert_market_profiles_covered()
     owner: Dict[str, str] = {}
     for pname, prof in PROFILES.items():
         for f in prof.fields:
@@ -742,11 +756,12 @@ def _market_condition_members(strategy) -> "tuple[set, set]":
       market-condition fields (``ba2_common.core.market_conditions.PROFILES``), however deep it
       sits inside a mixed AND tree (the entry gates are appended into the SAME tree as the
       strategy's ordinary confidence/price gates — design section 5.1);
-    * a RULE (entry or exit) is a market-condition rule when it DECLARES ITS OWN rule-level
-      ``toggle_optimize`` (the ``exit:<rid>:enabled`` gene) AND at least one of its own
-      condition leaves is a market-condition leaf. The ``toggle_optimize`` requirement is not
-      redundant: the equity S1-S7 entry rule (design section 5.1) has NO rule-level toggle of
-      its own — the market leaves are appended INTO its ordinary, always-present tree alongside
+    * a RULE is a market-condition rule only when it is an EXIT rule that DECLARES ITS OWN rule-level
+      ``toggle_optimize`` (the ``exit:<rid>:enabled`` gene) AND at least one of its own condition leaves is a
+      market-condition leaf. Entry rules are NEVER market rules, even though S1's three conviction-tier entry
+      rules DO carry ``toggle_optimize`` (the market leaves sit among their ordinary gates, so dropping the rule
+      would drop the strategy's entry; only the individual market leaf is switched off). The older text below
+      claimed the equity entry rule has NO rule-level toggle of its own; that is false for S1 — the market leaves are appended INTO its ordinary, always-present tree alongside
       the strategy's own confidence/price gates — so treating "contains a market leaf" alone as
       rule membership would make the master gene drop that WHOLE entry rule (every ordinary gate
       with it) via a rule-level ``enabled`` gene the template never declared, instead of leaving
@@ -784,7 +799,10 @@ def _market_condition_members(strategy) -> "tuple[set, set]":
                 continue
             has_market_leaf = _walk_tree(rule.get("conditions"))
             rule_toggleable = bool(rule.get("toggle_optimize") or rule.get("toggleOptimize"))
-            if has_market_leaf and rule_toggleable and rule.get("id"):
+            # EXIT rules only (fixed 2026-10-25). An equity ENTRY rule can carry a rule-level toggle too (S1's three
+            # conviction-tier rules do, ``entry:buy-N:enabled``) while holding the market leaves among its ordinary
+            # gates; counting it as a market RULE made market:enabled == 0 drop the whole entry (0 S1 entries).
+            if attr == "exit_rules" and has_market_leaf and rule_toggleable and rule.get("id"):
                 rule_ids.add(rule["id"])
     return leaf_ids, rule_ids
 

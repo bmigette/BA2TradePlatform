@@ -1379,6 +1379,12 @@ def mode_anchor_index(strategy) -> Dict[str, Any]:
     return out
 
 
+def market_members_for_space(strategy, space: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The market-profile member map, computed ONLY when the job's space searches ``market:profile`` (every older job
+    skips it and keeps its memo keys untouched)."""
+    return market_profile_members(strategy) if "market:profile" in space else None
+
+
 def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any],
                            market_members: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The genome AS A PHENOTYPE: an inactive threshold is replaced by its authored anchor.
@@ -1701,7 +1707,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # template ONCE; ``{}`` for every strategy without mode genes, and then
         # ``canonical_trial_params`` is the identity function and the keys are today's.
         mode_anchors = mode_anchor_index(strategy)
-        market_members = market_profile_members(strategy)   # goal2027 2.2 (only read under market:profile)
+        market_members = market_members_for_space(strategy, param_space)   # goal2027 2.2: None unless market:profile is searched
 
         # --- DETERMINISM: seed both RNGs (Task 4 / determinism_rule) ---
         seed = int(ga["seed"])

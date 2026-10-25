@@ -5,7 +5,7 @@ docs/plans/2026-10-25-goal2027-market-profile-gene-plan.md.
 
 What this pins:
 * ``market:profile`` REPLACES ``market:enabled`` (never both) and is the last gene;
-* ``off`` decodes exactly like ``market:enabled = 0``; a selected profile decodes exactly like a run that only
+* ``off`` decodes exactly like ``market:enabled = 0`` (S1 included since the entry-rule fix); a selected profile decodes exactly like a run that only
   carries that profile's leaves (the other profile's leaves off, its exit rules off);
 * a market exit rule can only run when every profile it reads is selected;
 * two genomes differing only in what belongs to an unselected profile share one trial-memo key;
@@ -475,3 +475,76 @@ class TestExport:
         assert "s3-mkt-exit-structure" in ids and "s3-mkt-tp" not in ids
         assert "s3-market-slope" not in _leaf_ids(d["entry_rules"])
         assert "s3-market-structure" in _leaf_ids(d["entry_rules"])
+
+
+# ----------------------------------------------------------------------------- market:enabled entry-rule fix
+class TestMarketEnabledKeepsEntryRules:
+    """S1's tier entry rules carry a rule-level toggle AND the market leaves among their ordinary gates.
+    market:enabled == 0 used to disable those whole rules (0 entries decoded for S1)."""
+
+    @pytest.mark.parametrize("kind", ["S1", "S2", "S3", "S4", "S5", "S6", "S7"])
+    def test_enabled_zero_keeps_entry_rules_with_market_leaves_off(self, kind):
+        s = _strategy(False, kind)
+        g = _genome(collect_param_space(s))
+        on = decode_params(s, {**g, "market:enabled": 1})
+        off = decode_params(s, {**g, "market:enabled": 0})
+        assert len(off["entry_rules"]) == len(on["entry_rules"]) > 0
+        members = market_profile_members(s)
+        assert not set(members["leaf_profile"]) & set(_leaf_ids(off["entry_rules"]) + _leaf_ids(off["exit_rules"]))
+        assert set(members["leaf_profile"]) & set(_leaf_ids(on["entry_rules"]))
+        assert not [r for r in off["exit_rules"] if "mkt" in r["id"]]
+
+    def test_s1_profile_off_equals_enabled_zero(self, strat_profile):
+        s1p, s1e = _strategy(True, "S1"), _strategy(False, "S1")
+        gp = _genome(collect_param_space(s1p), **{"market:profile": "off"})
+        ge = {k: v for k, v in gp.items() if k != "market:profile"}
+        a = decode_params(s1p, gp)
+        b = decode_params(s1e, {**ge, "market:enabled": 0})
+        assert _rules(a) == _rules(b) and len(a["entry_rules"]) == 3
+
+
+# ----------------------------------------------------------------------------- registry coverage / validation
+class TestRegistryCoverage:
+    def test_every_registered_profile_is_covered_by_the_choices(self):
+        from app.services.strategy_param_space import assert_market_profiles_covered
+        assert_market_profiles_covered()      # today: ohlcv-v1 and ta-structure-v1 only
+
+    def test_a_third_profile_fails_loudly(self):
+        from ba2_common.core.market_conditions import FieldSpec, ProfileSpec, registered_profile
+        from app.services.strategy_param_space import assert_market_profiles_covered
+        spec = ProfileSpec(name="third-v1", calc_version="t/1", fields=(
+            FieldSpec(name="third_state", kind="categorical", short="third3", searched=True,
+                      codes={"a": 1, "b": 2}, ui_name="t"),))
+        with registered_profile(spec):
+            with pytest.raises(ValueError, match="third-v1"):
+                assert_market_profiles_covered()
+            with pytest.raises(ValueError, match="third-v1"):
+                market_profile_members(_strategy_template_only())
+
+    def test_members_only_computed_when_the_space_has_the_gene(self, strat_profile, strat_enabled):
+        from app.services.strategy_optimization_handler import market_members_for_space
+        assert market_members_for_space(strat_enabled, collect_param_space(strat_enabled)) is None
+        assert market_members_for_space(strat_profile, collect_param_space(strat_profile)) is not None
+
+
+def _strategy_template_only():
+    return SimpleNamespace(entry_rules=[], exit_rules=[])
+
+
+class TestExportValidatesTheValue:
+    @pytest.fixture(autouse=True)
+    def _db(self):
+        from app.models.database import Base, engine
+        Base.metadata.create_all(bind=engine)
+
+    @pytest.mark.parametrize("bad", ["ta-structure-v2", 1, ""])
+    def test_an_unknown_stored_value_is_refused(self, bad):
+        from fastapi import HTTPException
+        from app.api.backtests import _refuse_market_profile_row_without_gene
+        db, bt = TestExport._opt_and_bt({"market:profile": bad}, {"market:profile": {"type": "choice"}})
+        try:
+            with pytest.raises(HTTPException) as e:
+                _refuse_market_profile_row_without_gene(bt, db)
+            assert "market:profile" in str(e.value.detail)
+        finally:
+            db.close()

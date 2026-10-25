@@ -41,3 +41,16 @@ stacked on `feat/goal2027-sizing-gene` (same shape: opt-in flag, name token, can
 2. Launcher flag, requirements, refusals, marker stamp, gene space merge.
 3. Capband driver token/passthrough.
 4. Export refusal, version bump, regression runs, check_package_versions.
+
+## Amendments (review, 2026-10-25)
+
+- **`market:enabled` entry-rule fix.** `_market_condition_members` counted S1's three tier entry rules (rule-level
+  `toggle_optimize` plus market leaves) as market rules, so `market:enabled == 0` decoded 0 S1 entries. Only EXIT rules
+  are market rules now (same split as `market_profile_members`); `market:profile=off` equals `market:enabled=0` on S1-S7.
+  This changes GA results of future `market:enabled` jobs (no stored run or running job used it).
+- **`mkt-stop` is not always present.** `market_exit_rules` omits the stop rule for a strategy that ends with a catch-all
+  `adjust_stop_loss` exit (S1 `s1_sl_hold`, S3 `exit_stoploss`). This is pre-existing, so `both` does not imply a market
+  stop on those strategies.
+- **Guards.** `assert_market_profiles_covered()` fails loudly if the registry holds a profile `MARKET_PROFILE_CHOICES`
+  cannot select. `market_profile_members` runs only when the space contains `market:profile`
+  (`market_members_for_space`). Export also refuses a stored `market:profile` outside the four choices.
