@@ -6951,6 +6951,29 @@ def _apply_neutral_entry_setting(backtest_block, mode):
             expert["settings"]["evaluate_entry_rules_on_hold"] = True
 
 
+def _resolve_chain_seed_source(db, name: str, warm_start_from) -> int:
+    """``--chain-seed-from NAME`` -> the id of the ONE completed optimization of that name.
+
+    Walk-forward chain seeding (docs/plans/2026-10-25-goal2027-walk-forward-plan.md): the handler
+    reads that row's stored final population. Refused here, before any row is created, when the
+    name is unknown, ambiguous or not completed, or when --warm-start-from is also given.
+    """
+    from app.models.strategy_optimization import StrategyOptimization
+    if warm_start_from is not None:
+        sys.exit("optimize: --chain-seed-from and --warm-start-from are mutually exclusive")
+    rows = db.query(StrategyOptimization.id, StrategyOptimization.status).filter(
+        StrategyOptimization.name == name).order_by(StrategyOptimization.id).all()
+    if not rows:
+        sys.exit(f"optimize: --chain-seed-from {name!r}: no optimization has that name")
+    if len(rows) > 1:
+        sys.exit(f"optimize: --chain-seed-from {name!r}: {len(rows)} optimizations share that name "
+                 f"({', '.join(f'id={i} {st}' for i, st in rows)}); delete the unwanted rows")
+    if rows[0][1] != "completed":
+        sys.exit(f"optimize: --chain-seed-from {name!r}: optimization {rows[0][0]} is "
+                 f"{rows[0][1]!r}, not completed")
+    return int(rows[0][0])
+
+
 def _cmd_optimize(args) -> int:
     """Create a Strategy + StrategyOptimization and run a joint genetic optimization headless.
 
@@ -7468,6 +7491,9 @@ def _cmd_optimize(args) -> int:
         _apply_early_stop_min_rel(cfg, getattr(args, "early_stop_min_rel", None))
         if getattr(args, "warm_start_from", None) is not None:
             cfg["warmStartFromOptimizationId"] = int(args.warm_start_from)
+        if getattr(args, "chain_seed_from", None):
+            cfg["chainSeedFromOptimizationId"] = _resolve_chain_seed_source(
+                db, args.chain_seed_from, getattr(args, "warm_start_from", None))
         _worker_ids = _worker_ids_from_args(args)
         opt = StrategyOptimization(
             strategy_id=strat.id, name=args.name or f"opt-{expert}",
@@ -8935,6 +8961,15 @@ def main(argv: "list | None" = None) -> int:
                          "from the same starting point). Use to keep evolving a converged/"
                          "plateaued run instead of re-searching from scratch. Default: off "
                          "(fresh random population).")
+    op.add_argument("--chain-seed-from", default=None, metavar="JOB_NAME",
+                    help="Walk-forward CHAIN SEEDING: seed this job's STARTING population from the "
+                         "stored FINAL population (last evaluated generation) of the completed "
+                         "optimization of this exact name. Unlike --warm-start-from it refuses "
+                         "(fails the job) on a gene-space mismatch, a source without a stored "
+                         "final population, or a source whose window ends after this job's "
+                         "(look-ahead); a short population is padded randomly (count logged and "
+                         "recorded as optimization_config.seededFrom). Mutually exclusive with "
+                         "--warm-start-from.")
     op.add_argument("--initial-capital", type=float, default=10000.0)
     op.add_argument("--equity-cap", type=float, default=None,
                     help="Optional FIXED equity the risk manager sizes against, in dollars "

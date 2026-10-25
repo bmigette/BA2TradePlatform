@@ -27,7 +27,7 @@ import math as _math
 import random
 import sys as _sys
 import time as _time
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -53,6 +53,9 @@ from app.models import (
 )
 from app.models.task_queue import TaskStatus
 from app.services.genetic import GeneticOptimizer, DEAP_AVAILABLE
+from app.services.chain_seed import (  # noqa: E402
+    CHAIN_SEED_KEY, FINAL_POPULATION_KEY, SEEDED_FROM_KEY, ChainSeedError,
+    build_chain_seed_population, final_population_record)
 from app.services.task_queue import get_task_queue
 from app.services.strategy_param_space import collect_param_space, decode_params, market_profile_members
 from app.services.strategy_fitness import compute_fitness, ZERO_TRADE_SENTINEL
@@ -2267,6 +2270,33 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             # Re-seeding from the checkpoint's bounded elite slice fixes that. Cheap, contrary to
             # the note this replaces -- see _elite_slice.
             _seed_all_results_from_checkpoint(ckpt, all_results)
+            if ga.get(CHAIN_SEED_KEY):
+                # This relaunch inserted a NEW row, so the lineage of the first launch is not on
+                # it: record what is known (the source), flagged as a checkpoint resume.
+                _record_chain_lineage(db, opt, {
+                    "kind": "chain", "optimization_id": int(ga[CHAIN_SEED_KEY]),
+                    "resumed_from_checkpoint": True})
+        elif not is_brute_force and ga.get(CHAIN_SEED_KEY):
+            if ga.get("warmStartFromOptimizationId"):
+                return _fail(opt_id, db, f"{CHAIN_SEED_KEY} and warmStartFromOptimizationId are "
+                                         f"mutually exclusive")
+            chain_src = db.query(StrategyOptimization).filter(
+                StrategyOptimization.id == int(ga[CHAIN_SEED_KEY])).first()
+            if chain_src is None:
+                return _fail(opt_id, db,
+                             f"chain seed source optimization {ga[CHAIN_SEED_KEY]} not found")
+            try:
+                _end_raw = backtest_cfg.get("end_date")
+                init_pop, _lineage = build_chain_seed_population(
+                    chain_src, optimizer, int(ga["populationSize"]),
+                    date.fromisoformat(str(_end_raw)[:10]) if _end_raw else None)
+            except ChainSeedError as e:
+                return _fail(opt_id, db, f"chain seed refused: {e}")
+            _record_chain_lineage(db, opt, _lineage)
+            logger.warning(
+                f"strategy_optimization {opt_id}: chain-seeded population "
+                f"({len(init_pop)} individuals; {_lineage['filled_random']} filled randomly) from "
+                f"optimization {chain_src.id} ({chain_src.name!r})")
         elif not is_brute_force:
             # Warm-start (NOT resume): seed this job's population from a DIFFERENT, already-run
             # optimization's individuals, but run this job's OWN fresh --generations budget from
@@ -2533,6 +2563,14 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         if not is_brute_force:
             _clear_checkpoint(ckpt_task_id)
 
+        if not is_brute_force:
+            # The last EVALUATED generation, so a walk-forward chain can seed the next fold from
+            # it (chain_seed.build_chain_seed_population). Reassigned, not mutated: SQLAlchemy
+            # does not see in-place changes to a JSON column.
+            _fp = final_population_record(optimizer.param_ranges, result.get("final_population"))
+            if _fp is not None:
+                opt.optimization_config = {**(opt.optimization_config or {}),
+                                           FINAL_POPULATION_KEY: _fp}
         opt.status = "completed"
         opt.completed_at = datetime.now()
         opt.progress = 100.0
@@ -3833,6 +3871,12 @@ def assert_population_screener_genes_in_range(optimizer: Any, population: list) 
         vals = {names[i][len("screener:"):]: ind[i] for i in range(len(names))
                 if names[i].startswith("screener:") and ind[i] is not None}
         check_genes_in_declared_ranges(vals, declared, where=f"warm-start individual #{n}")
+
+
+def _record_chain_lineage(db, opt: StrategyOptimization, lineage: Dict[str, Any]) -> None:
+    """Write the ``seededFrom`` block on the new row (reassigned: JSON columns are not mutation-tracked)."""
+    opt.optimization_config = {**(opt.optimization_config or {}), SEEDED_FROM_KEY: lineage}
+    db.commit()
 
 
 def _build_warm_start_population(
