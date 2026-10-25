@@ -4,7 +4,7 @@ Moved from testplatform/backend/app/services/strategy_param_space.py (2026-09) s
 built outside the test app (the public site) reconstruct the same run_schedule_override.
 Pure: no DB, no app imports.
 """
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Fixed order so the gene list (and therefore reproducibility) is stable across runs.
 SCHEDULE_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
@@ -16,6 +16,14 @@ WEEKDAYS = SCHEDULE_DAYS[:5]
 #: The DECISION-TIME gene: a categorical choice among the job's explicit list of HH:MM values
 #: (exchange-local). Decoded into the ``times`` of BOTH the entry and the manage schedule.
 SCHEDULE_TIME_GENE = "schedule:time"
+
+#: SPLIT decision-time genes (goal2027 2.4, opt-in via ``--decision-times split``): the ENTRY schedule's time and
+#: the MANAGE (open-positions) schedule's time searched independently. Mutually exclusive with
+#: ``SCHEDULE_TIME_GENE`` (which drives both).
+SCHEDULE_ENTRY_TIME_GENE = "schedule:entry_time"
+SCHEDULE_MANAGE_TIME_GENE = "schedule:manage_time"
+#: Every ``schedule:*`` key that is a TIME gene, never a weekday toggle.
+SCHEDULE_TIME_GENES = (SCHEDULE_TIME_GENE, SCHEDULE_ENTRY_TIME_GENE, SCHEDULE_MANAGE_TIME_GENE)
 
 # Regular US session, minutes since midnight, exchange-local. Intraday bars are stamped at their
 # START, so with an N-minute interval the first bar is 09:30 and the last starts at 16:00 - N.
@@ -230,6 +238,42 @@ def schedule_time_from_genes(strategy_params: Optional[Dict[str, Any]]) -> Optio
     return value
 
 
+def split_times_from_genes(strategy_params: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
+    """``(entry_time, manage_time)`` of a SPLIT-gene genome (``schedule:entry_time`` +
+    ``schedule:manage_time``), or None when it carries neither. Refuses (ValueError) a genome that carries
+    only one of the pair, one that also carries the single ``schedule:time`` gene (the two modes are mutually
+    exclusive) and a stored value that is not an HH:MM time."""
+    if not isinstance(strategy_params, dict):
+        return None
+    has_entry = SCHEDULE_ENTRY_TIME_GENE in strategy_params
+    has_manage = SCHEDULE_MANAGE_TIME_GENE in strategy_params
+    if not (has_entry or has_manage):
+        return None
+    if SCHEDULE_TIME_GENE in strategy_params:
+        raise ValueError(f"{SCHEDULE_TIME_GENE} and the split genes {SCHEDULE_ENTRY_TIME_GENE} / "
+                         f"{SCHEDULE_MANAGE_TIME_GENE} are mutually exclusive")
+    if has_entry != has_manage:
+        raise ValueError(f"a split decision-time genome needs both {SCHEDULE_ENTRY_TIME_GENE} and "
+                         f"{SCHEDULE_MANAGE_TIME_GENE}; it carries only "
+                         f"{SCHEDULE_ENTRY_TIME_GENE if has_entry else SCHEDULE_MANAGE_TIME_GENE}")
+    entry, manage = strategy_params[SCHEDULE_ENTRY_TIME_GENE], strategy_params[SCHEDULE_MANAGE_TIME_GENE]
+    hhmm_to_minutes(entry)
+    hhmm_to_minutes(manage)
+    return entry, manage
+
+
+def entry_time_from_genes(strategy_params: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The time the genome's ENTRY schedule ran at: the split entry time, else the single gene, else None."""
+    split = split_times_from_genes(strategy_params)
+    return split[0] if split else schedule_time_from_genes(strategy_params)
+
+
+def manage_time_from_genes(strategy_params: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The time the genome's MANAGE schedule ran at: the split manage time, else the single gene, else None."""
+    split = split_times_from_genes(strategy_params)
+    return split[1] if split else schedule_time_from_genes(strategy_params)
+
+
 #: What an ABSENT weekday key in a schedule's ``days`` dict means: Monday-Friday enabled, Saturday and
 #: Sunday disabled. It is the default the settings UI shows for an absent day, and it cannot change a
 #: backtest (a backtest clock has no weekend bars). ONE definition, read by the live scheduler
@@ -417,11 +461,11 @@ def schedule_override_from_genes(
     """
     if not isinstance(strategy_params, dict):
         return None
-    chosen_time = schedule_time_from_genes(strategy_params)
+    chosen_time = entry_time_from_genes(strategy_params)    # the single gene, or a split genome's ENTRY time
     by_day = {
         k[len("schedule:"):]: bool(v)
         for k, v in strategy_params.items()
-        if isinstance(k, str) and k.startswith("schedule:") and k != SCHEDULE_TIME_GENE
+        if isinstance(k, str) and k.startswith("schedule:") and k not in SCHEDULE_TIME_GENES
     }
     if not by_day and chosen_time is None:
         return None

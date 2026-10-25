@@ -43,6 +43,7 @@ if _TOOLS_DIR not in sys.path:
 from matrix_flags import (  # noqa: E402
     finish_matrix, note_job_exit,
     add_history_source_flag, cap_passthrough, decision_times_plan, decision_times_tokens, history_source_tokens,
+    refuse_split_decision_times,
     job_name_with_digest, with_decision_times_name, with_history_source_name)
 
 _UNIVERSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "senate_universe.txt")
@@ -256,6 +257,7 @@ def main() -> int:
     if not os.path.exists(exe):
         exe = os.path.join(os.path.dirname(sys.executable), "ba2-test")
 
+    refuse_split_decision_times(args, "run_senate_matrix.py")
     dt_times, dt_header = decision_times_plan(args.decision_times, args.interval)
     print(dt_header, flush=True)
     jobs = list(_jobs(strategies, args.name_suffix))

@@ -17,7 +17,7 @@ from ba2_common.core.market_condition_rules import (
     assert_market_conditions_resolved, assert_market_rule_actions,
 )
 from ba2_common.core.rule_models import normalize_trade_rules, trade_rules_from_legacy
-from ba2_common.core.schedule_genes import schedule_override_from_genes
+from ba2_common.core.schedule_genes import schedule_override_from_genes, split_times_from_genes
 from ba2_common.logger import logger
 
 EXPORT_KINDS = ("expert_settings", "ruleset")
@@ -290,6 +290,13 @@ def derive_export_payload(
                 logger.warning(f"backtest {backtest.id}: model:{name}={raw!r} is not a boolean "
                                f"spelling; exporting it OFF, as every run on record was")
                 return False
+
+        # SPLIT decision-time genes (goal2027 2.4): the entry time rode ``run_schedule_override`` above; the
+        # MANAGE time travels as ``manage_times`` so the deploy writes it to the open-positions schedule.
+        # Added ONLY for a split genome: every other payload stays byte-identical.
+        _split_times = split_times_from_genes(sp)
+        if _split_times is not None:
+            execution = {**execution, "manage_times": [_split_times[1]]}
 
         facts = BacktestRunFacts(
             enable_short=bool(execution.get("enable_short")),

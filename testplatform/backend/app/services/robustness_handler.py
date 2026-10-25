@@ -213,8 +213,8 @@ def launch_schedule_variants(robustness_run_id: int) -> List[int]:
 
             base_sp = copy.deepcopy(bt.strategy_params or {})
             _iv = str(parent_cfg.get("execution_interval") or "").lower()
-            from ba2_common.core.schedule_genes import schedule_time_from_genes
-            gene_time = schedule_time_from_genes(bt.strategy_params)
+            from ba2_common.core.schedule_genes import entry_time_from_genes
+            gene_time = entry_time_from_genes(bt.strategy_params)      # the single gene, or a split genome's ENTRY time
             variants = _schedule_variants(run.params or {}, parent_times,
                                           _iv.endswith("m") or _iv.endswith("h") or _iv.endswith("min"),
                                           time_is_gene=gene_time is not None)

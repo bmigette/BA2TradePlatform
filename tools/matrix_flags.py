@@ -37,6 +37,13 @@ def cap_passthrough(args: Any) -> List[str]:
 #: Appended to the base name of every job that carries the decision-time gene (the launcher
 #: REQUIRES it in a ``--decision-times`` job's name; see ``ba2test_launcher._resolve_decision_times``).
 DECISION_TIMES_NAME_TOKEN = "-timegene"
+#: ``--decision-times split`` (goal2027 2.4): entry and manage time as two genes -- a different job identity.
+DECISION_TIMES_SPLIT_NAME_TOKEN = "-timesplit"
+
+
+def decision_times_split(raw: Any) -> bool:
+    """True when a driver's ``--decision-times`` is ``split`` (the default seven values as TWO genes)."""
+    return raw is not None and str(raw).strip() == "split"
 
 
 def decision_times_plan(raw: Any, interval: str) -> "tuple[list | None, str]":
@@ -49,7 +56,11 @@ def decision_times_plan(raw: Any, interval: str) -> "tuple[list | None, str]":
     from ba2_common.core.knowability import DEFAULT_DECISION_TIME
     from ba2_common.core.schedule_genes import interval_minutes, parse_decision_times_arg
 
-    times = parse_decision_times_arg(raw, interval, when_unset="default")
+    split = decision_times_split(raw)
+    times = parse_decision_times_arg("default" if split else raw, interval, when_unset="default")
+    if times and split:
+        return times, (f"decision times (GA genes schedule:entry_time + schedule:manage_time, split): "
+                       f"{','.join(times)}")
     if times:
         return times, f"decision times (GA gene schedule:time): {','.join(times)}"
     try:
@@ -60,9 +71,18 @@ def decision_times_plan(raw: Any, interval: str) -> "tuple[list | None, str]":
                   f"(DEFAULT_DECISION_TIME; --decision-times fixed)")
 
 
-def decision_times_tokens(times: "list | None") -> List[str]:
+def decision_times_tokens(times: "list | None", *, split: bool = False) -> List[str]:
     """``--decision-times`` tokens for one job's argv ([] when the gene is off)."""
-    return ["--decision-times", ",".join(times)] if times else []
+    if not times:
+        return []
+    return ["--decision-times", "split" if split else ",".join(times)]
+
+
+def refuse_split_decision_times(args: Any, driver: str) -> None:
+    """Exit loudly if a driver that has no split-gene support was given ``--decision-times split``."""
+    if decision_times_split(getattr(args, "decision_times", None)):
+        raise SystemExit(f"{driver}: --decision-times split is not supported by this driver (it would "
+                         f"silently run the single shared gene); use run_screener_capband_matrix.py")
 
 
 OPTION_DRIVER_DT_HEADER = "decision time: daily clock (not optimizable)"
@@ -87,9 +107,10 @@ def refuse_decision_times_and_announce(args: Any) -> None:
     print(OPTION_DRIVER_DT_HEADER, flush=True)
 
 
-def with_decision_times_name(name: str, times: "list | None") -> str:
-    """``name`` with the gene's name token appended when the job carries the gene."""
-    return name + DECISION_TIMES_NAME_TOKEN if times and DECISION_TIMES_NAME_TOKEN not in name else name
+def with_decision_times_name(name: str, times: "list | None", *, split: bool = False) -> str:
+    """``name`` with the gene's name token appended when the job carries the gene(s)."""
+    token = DECISION_TIMES_SPLIT_NAME_TOKEN if split else DECISION_TIMES_NAME_TOKEN
+    return name + token if times and token not in name else name
 
 
 #: Appended to the name of every job whose OHLCV history is not the legacy ``fmp`` (a job name WITHOUT it ran on
