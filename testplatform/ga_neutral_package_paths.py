@@ -21,13 +21,9 @@ GA_NEUTRAL_GLOBS = [
     "packages/common/ba2_common/core/ml_forecast/*",
     # PennyMomentumTrader live price fetch (vendor_live_price=fmp): intraday live trader, never run by GA/backtest.
     "packages/experts/ba2_experts/PennyMomentumTrader/data_gathering.py",
-    # Alpaca history LIVE top-up / backfill / corporate-actions refresh (plan 2026-10-24-history-source-task11): modules that
-    # exist only behind account API keys. The backtest builds AlpacaHistoryOHLCVProvider WITHOUT keys (cache-only), where
-    # every one of these is unreachable. (live_state.py / live_backfill.py are NOT listed: the backtest read path calls them; nor AlpacaHistoryOHLCVProvider.py: its keyless read now refuses a
-    # window before a partial live backfill, and PandasIndicatorCalc raises InsufficientHistory -> ba2_providers minimum raised.)
-    "packages/providers/ba2_providers/ohlcv/alpaca_history/live_fetch.py",
-    "packages/providers/ba2_providers/ohlcv/alpaca_history/live_topup.py",
-    "packages/providers/ba2_providers/ohlcv/alpaca_history/corporate_actions.py",
+    # (Alpaca history live_fetch / live_topup / corporate_actions are deliberately NOT listed: GA-relevant
+    # AlpacaHistoryOHLCVProvider and live_backfill import them, even if lazily and keyless-unreachable; the
+    # entry-point guard test_package_versions_entry_points forbids a neutral module behind a GA entry point.)
     # Tests, docs and READMEs never ship to GA code paths.
     "packages/*/tests/*",
     "packages/*/test_files/*",
