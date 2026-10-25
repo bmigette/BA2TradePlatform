@@ -59,6 +59,9 @@ Namespacing:
   schedule:time                    DECISION TIME: choice among the job's explicit HH:MM list
                                    (--decision-times); decoded into the ``times`` of BOTH the
                                    entry and the manage schedule
+  schedule:entry_time              SPLIT decision times (--decision-times split, goal2027 2.4):
+  schedule:manage_time             two choice genes, entry time -> the entry schedule, manage time
+                                   -> the manage schedule; mutually exclusive with schedule:time
   screener:<setting>               screener settings
   market:enabled                   MASTER GENE (int 0/1; atr_grid_2027 market master-gene
                                    addendum) -- present ONLY when the strategy template carries
@@ -83,6 +86,8 @@ from ba2_common.core.market_conditions import field_codes, field_spec
 from ba2_common.core.rule_models import MODE_OFF, NUMERIC_MODE_CHOICES, leaf_mode_kind
 from ba2_common.core.schedule_genes import (  # noqa: F401 -- re-bound for existing callers
     SCHEDULE_DAYS,
+    SCHEDULE_ENTRY_TIME_GENE,
+    SCHEDULE_MANAGE_TIME_GENE,
     SCHEDULE_TIME_GENE,
     WEEKDAYS as _WEEKDAYS,
     hhmm_to_minutes as _hhmm_to_minutes,
@@ -231,16 +236,25 @@ def _collect_schedule_days(schedule_cfg: Optional[Dict[str, Any]]) -> Dict[str, 
     # THE DECISION-TIME GENE, after the day genes (so adding it never shifts a day gene's index):
     # a categorical ``choice`` over the job's explicit list, encoded as an int index like every
     # other choice gene (genetic.py ``_create_individual`` / ``decode_individual``).
-    time_spec = (schedule_cfg or {}).get(SCHEDULE_TIME_GENE[len("schedule:"):])
-    if time_spec and time_spec.get("optimize"):
-        choices = list(time_spec["choices"])
+    # goal2027 2.4: the SPLIT pair (entry_time, manage_time) replaces the single gene; the two modes are
+    # mutually exclusive and the pair is all-or-nothing.
+    declared = [g for g in (SCHEDULE_TIME_GENE, SCHEDULE_ENTRY_TIME_GENE, SCHEDULE_MANAGE_TIME_GENE)
+                if ((schedule_cfg or {}).get(g[len("schedule:"):]) or {}).get("optimize")]
+    if SCHEDULE_TIME_GENE in declared and len(declared) > 1:
+        raise ValueError(f"{SCHEDULE_TIME_GENE} and {SCHEDULE_ENTRY_TIME_GENE} / "
+                         f"{SCHEDULE_MANAGE_TIME_GENE} are mutually exclusive")
+    if SCHEDULE_TIME_GENE not in declared and 0 < len(declared) < 2:
+        raise ValueError(f"the split decision-time genes need both {SCHEDULE_ENTRY_TIME_GENE} and "
+                         f"{SCHEDULE_MANAGE_TIME_GENE}, got only {declared}")
+    for gene in declared:
+        choices = list(schedule_cfg[gene[len("schedule:"):]]["choices"])
         for c in choices:
             _hhmm_to_minutes(c)
         if len(set(choices)) != len(choices) or len(choices) < 2 or choices != sorted(choices):
             raise ValueError(
-                f"{SCHEDULE_TIME_GENE}: choices must be >= 2 distinct HH:MM values in ascending "
+                f"{gene}: choices must be >= 2 distinct HH:MM values in ascending "
                 f"order, got {choices!r}")
-        out[SCHEDULE_TIME_GENE] = {
+        out[gene] = {
             "type": "choice", "choices": choices, "min": 0, "max": len(choices) - 1, "step": 1,
             # Generation 0 is balanced over the values (genetic.py ``_initial_population``).
             "stratify": True,
@@ -689,11 +703,12 @@ def collect_param_space(
     """
     space: Dict[str, Any] = {}
     space.update(_collect_expert(expert_cfg))
-    if bypass and ((schedule_cfg or {}).get("time") or {}).get("optimize"):
+    if bypass and any(((schedule_cfg or {}).get(k) or {}).get("optimize")
+                      for k in ("time", "entry_time", "manage_time")):
         # A bypass expert's schedule genes are excluded wholesale (see the docstring); a time gene
         # declared for one would be silently dead, so refuse it instead.
-        raise ValueError(f"{SCHEDULE_TIME_GENE} is declared for a bypass expert, whose schedule "
-                         f"genes are not searched: refusing a dead gene")
+        raise ValueError(f"{SCHEDULE_TIME_GENE} (or the split entry/manage time genes) is declared for "
+                         f"a bypass expert, whose schedule genes are not searched: refusing a dead gene")
     if not bypass:
         space.update(_collect_conditions(strategy))
         space.update(_collect_schedule_days(schedule_cfg))
@@ -1123,6 +1138,8 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         'screener_overrides': {setting: value},
         'schedule_days': {day: bool}|None,        # None when no schedule:<day> genes were collected
         'schedule_time': 'HH:MM'|None,            # the schedule:time gene's value, else None
+        'schedule_entry_time': 'HH:MM'|None,      # the split genes' values (goal2027 2.4), else None
+        'schedule_manage_time': 'HH:MM'|None,
         'entry_rules': list,                      # concrete TradeRule lists (genes applied,
         'exit_rules': list,                       #  disabled rules/actions pruned)
       }
@@ -1136,6 +1153,8 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     screener_overrides: Dict[str, Any] = {}
     schedule_by_day: Dict[str, Any] = {}
     schedule_time: Optional[str] = None
+    schedule_entry_time: Optional[str] = None
+    schedule_manage_time: Optional[str] = None
     optsel_by_half: Dict[str, Dict[str, Any]] = {}
     market_enabled: Optional[Any] = None
 
@@ -1161,6 +1180,12 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         elif key == SCHEDULE_TIME_GENE:
             _hhmm_to_minutes(val)   # the decoded choice VALUE: a non-time here is corruption
             schedule_time = val
+        elif key in (SCHEDULE_ENTRY_TIME_GENE, SCHEDULE_MANAGE_TIME_GENE):
+            _hhmm_to_minutes(val)
+            if key == SCHEDULE_ENTRY_TIME_GENE:
+                schedule_entry_time = val
+            else:
+                schedule_manage_time = val
         elif key.startswith("schedule:"):
             schedule_by_day[key[len("schedule:"):]] = bool(val)
         elif key.startswith("cond:"):
@@ -1224,6 +1249,13 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     # rather than wasting a trial evaluating it. What counts as dead differs by run kind --
     # no WEEKDAY on for an option run, all seven off for an equity run (unchanged) -- see
     # _repair_no_weekday.
+    # goal2027 2.4: the single gene and the split pair are mutually exclusive; the pair is all-or-nothing.
+    if schedule_time is not None and (schedule_entry_time is not None or schedule_manage_time is not None):
+        raise ValueError(f"{SCHEDULE_TIME_GENE} and {SCHEDULE_ENTRY_TIME_GENE} / "
+                         f"{SCHEDULE_MANAGE_TIME_GENE} are mutually exclusive")
+    if (schedule_entry_time is None) != (schedule_manage_time is None):
+        raise ValueError(f"a genome needs both {SCHEDULE_ENTRY_TIME_GENE} and "
+                         f"{SCHEDULE_MANAGE_TIME_GENE} or neither")
     schedule_days: Optional[Dict[str, bool]] = None
     if schedule_by_day:
         days = {day: schedule_by_day.get(day, False) for day in SCHEDULE_DAYS}
@@ -1240,6 +1272,8 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         "screener_overrides": screener_overrides,
         "schedule_days": schedule_days,
         "schedule_time": schedule_time,
+        "schedule_entry_time": schedule_entry_time,
+        "schedule_manage_time": schedule_manage_time,
         "entry_rules": entry_rules,
         "exit_rules": exit_rules,
     }

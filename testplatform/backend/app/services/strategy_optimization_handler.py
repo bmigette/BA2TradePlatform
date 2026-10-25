@@ -1655,16 +1655,17 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # DECISION-TIME gene (schedule:time): validated here, where the run's execution interval
         # is known, in addition to the launcher's check -- a hand-written config that bypassed the
         # launcher must not reach the GA with a time the engine cannot honour.
-        _time_spec = (schedule_cfg or {}).get("time")
-        if _time_spec and _time_spec.get("optimize"):
-            try:
-                _validated = validate_decision_times(
-                    _time_spec["choices"], backtest_cfg.get("execution_interval", "1d"))
-            except ValueError as e:
-                return _fail(opt_id, db, f"schedule:time gene: {e}")
-            if list(_time_spec["choices"]) != _validated:
-                return _fail(opt_id, db, f"schedule:time choices must be sorted ascending, got "
-                                         f"{list(_time_spec['choices'])!r}")
+        for _tkey in ("time", "entry_time", "manage_time"):      # entry/manage: goal2027 2.4 split genes
+            _time_spec = (schedule_cfg or {}).get(_tkey)
+            if _time_spec and _time_spec.get("optimize"):
+                try:
+                    _validated = validate_decision_times(
+                        _time_spec["choices"], backtest_cfg.get("execution_interval", "1d"))
+                except ValueError as e:
+                    return _fail(opt_id, db, f"schedule:{_tkey} gene: {e}")
+                if list(_time_spec["choices"]) != _validated:
+                    return _fail(opt_id, db, f"schedule:{_tkey} choices must be sorted ascending, got "
+                                             f"{list(_time_spec['choices'])!r}")
 
         # BYPASS expert (piece 1c): if the backtest's expert declares ``bypasses_classic_rm``
         # (e.g. FactorRanker) the search space must EXCLUDE tp/sl/cond:*/exit:* and search
@@ -2766,15 +2767,23 @@ def _warn_decision_time_missing(opt_name: str, all_results: list) -> None:
             f"{sum(h['entry'] for h in hit)}/{sum(h['manage'] for h in hit)}")
 
 
-def _schedule_times_from_gene(gene_time: Optional[str]) -> Optional[Dict[str, List[str]]]:
-    """The ENTRY and the MANAGE schedule's ``times`` a decoded ``schedule:time`` gene stands for
-    (None without the gene). The ONE place the two are derived: today both are the single gene
-    value; splitting the gene into an entry time and a manage time changes only this function
-    (and the reconstruction in ``ba2_common.core.schedule_genes``), nothing else assumes they
-    are equal."""
-    if not gene_time:
-        return None
-    return {"entry": [gene_time], "manage": [gene_time]}
+def _schedule_times_from_decoded(decoded: Dict[str, Any]) -> Optional[Dict[str, List[str]]]:
+    """The ENTRY and the MANAGE schedule's ``times`` a decoded genome stands for (None without a time
+    gene). The ONE place the two are derived: the single ``schedule:time`` gene drives both with one
+    value; the split genes (goal2027 2.4, ``schedule:entry_time`` / ``schedule:manage_time``) give each
+    its own. Nothing else assumes they are equal."""
+    gene_time = decoded.get("schedule_time")
+    entry, manage = decoded.get("schedule_entry_time"), decoded.get("schedule_manage_time")
+    if gene_time and (entry or manage):
+        raise ValueError("schedule:time and the split schedule:entry_time / schedule:manage_time genes "
+                         "are mutually exclusive")
+    if gene_time:
+        return {"entry": [gene_time], "manage": [gene_time]}
+    if entry or manage:
+        if not (entry and manage):
+            raise ValueError("a split decision-time genome needs both entry_time and manage_time")
+        return {"entry": [entry], "manage": [manage]}
+    return None
 
 
 def _build_daily_trial_config(
@@ -3051,12 +3060,11 @@ def _build_daily_trial_config(
     # selection is being optimized for now.
     base_run_sched = backtest_cfg.get("run_schedule_override")
     manage_schedule_override = backtest_cfg.get("manage_schedule_override")
-    gene_time = decoded.get("schedule_time")
-    gene_times = _schedule_times_from_gene(gene_time)
-    if decoded.get("schedule_days") or gene_time:
+    gene_times = _schedule_times_from_decoded(decoded)
+    if decoded.get("schedule_days") or gene_times:
         days = decoded.get("schedule_days") or (base_run_sched or {}).get("days")
         if not days:
-            raise ValueError("a schedule:time gene needs the run's entry days (schedule:<day> "
+            raise ValueError("a decision-time gene needs the run's entry days (schedule:<day> "
                              "genes or a run_schedule_override with days): refusing to guess")
         run_schedule_override = {
             "days": days,
@@ -3074,7 +3082,7 @@ def _build_daily_trial_config(
         # schedules at the one stored time; see tools/import_deploy_payload.py). Days stay the
         # run's own.
         if not (manage_schedule_override or {}).get("days"):
-            raise ValueError("a schedule:time gene needs backtest.manage_schedule_override with "
+            raise ValueError("a decision-time gene needs backtest.manage_schedule_override with "
                              "days to retime: refusing to leave the manage pass on another time")
         manage_schedule_override = {"days": dict(manage_schedule_override["days"]),
                                     "times": gene_times["manage"]}
