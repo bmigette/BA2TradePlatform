@@ -11,7 +11,9 @@ Entry (``map_forecast``), in gate order:
 Probability used:
   * decile models: ``p_up_from_deciles`` (below); the bearish probability is ``1 - p_up``.
   * path models (row carries a P(TP before SL) grid): the cell nearest to the TP/SL distances implied by the chosen
-    quantiles, in the direction traded (long: TP = q[tp_quantile], SL = q[sl_quantile]; short mirrored).
+    quantiles, in the direction traded (long: TP = q[tp_quantile], SL = q[sl_quantile]; short mirrored). A distance
+    outside the grid range, more than half a grid step from its cell, or on the wrong side of the entry gives
+    HOLD with gate=grid (no silent snapping onto a different TP/SL pair).
 
 TP/SL prices come from the quantiles (long: TP = price * (1 + q[tp_quantile]), SL = price * (1 + q[sl_quantile]);
 short: mirrored through ``100 - level``). A forecast TP/SL that is on the wrong side of the entry (a very
@@ -124,8 +126,15 @@ def p_up_from_deciles(deciles: Sequence[float]) -> float:
     raise AssertionError(f"unreachable: deciles not monotone? {r}")   # ForecastRow guarantees monotone
 
 
-def _nearest(grid: Sequence[int], value_pct: float) -> int:
-    return min(grid, key=lambda g: (abs(g - value_pct), g))
+def _snap(grid: Sequence[int], value_pct: float) -> Optional[int]:
+    """Nearest grid cell, or None when the value is outside [grid[0], grid[-1]] or farther from the nearest cell
+    than half of that cell's smallest adjacent step."""
+    if value_pct < grid[0] or value_pct > grid[-1]:
+        return None
+    g = min(grid, key=lambda c: (abs(c - value_pct), c))
+    i = grid.index(g)
+    steps = [abs(grid[k] - g) for k in (i - 1, i + 1) if 0 <= k < len(grid)]
+    return g if abs(g - value_pct) <= min(steps) / 2.0 + 1e-9 else None
 
 
 def _conf(p: float) -> float:
@@ -175,8 +184,17 @@ def map_forecast(row: ForecastRow, genes: MappingGenes, decision_price: float, a
 
     cell = ""
     if row.has_paths:
-        tp_cell = _nearest(TP_GRID_PCT, abs(tp_ret) * 100.0)
-        sl_cell = _nearest(SL_GRID_PCT, abs(sl_ret) * 100.0)
+        # the exit distances the quantiles imply must sit on the grid: no silent snapping onto another TP/SL pair
+        profit_ok = (tp_ret > 0) if long_ else (tp_ret < 0)
+        loss_ok = (sl_ret < 0) if long_ else (sl_ret > 0)
+        if not (profit_ok and loss_ok):
+            return _hold(lead, "HOLD gate=grid: forecast TP/SL quantile is on the wrong side of the entry, "
+                               "no P(TP before SL) grid cell applies")
+        tp_cell = _snap(TP_GRID_PCT, abs(tp_ret) * 100.0)
+        sl_cell = _snap(SL_GRID_PCT, abs(sl_ret) * 100.0)
+        if tp_cell is None or sl_cell is None:
+            return _hold(lead, f"HOLD gate=grid: implied TP {abs(tp_ret) * 100:.2f}% / SL {abs(sl_ret) * 100:.2f}% "
+                               f"is outside the grid or more than half a grid step from a cell")
         p = row.path_prob(side, h, tp_cell, sl_cell)
         cell = f" P(TP<SL)[{side} tp_cell={tp_cell} sl_cell={sl_cell}]"
     else:

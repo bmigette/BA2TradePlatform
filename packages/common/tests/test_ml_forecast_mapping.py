@@ -197,6 +197,33 @@ def test_path_model_nearest_cell_rounding():
     assert r.confidence == pytest.approx(90.0)
 
 
+def _dist_row(tp_ret, sl_ret):
+    """Deciles with q80 = tp_ret and q20 = sl_ret (linear elsewhere), bullish."""
+    d = [sl_ret - 0.01, sl_ret, 0.0, 0.5 * tp_ret * 0.5, 0.5 * tp_ret, 0.75 * tp_ret, 0.9 * tp_ret, tp_ret, tp_ret + 0.01]
+    return row(tuple(d), probs=grid_probs(0.9))
+
+
+@pytest.mark.parametrize("tp_ret,sl_ret", [
+    (0.20, -0.01),     # TP beyond the grid
+    (0.05, -0.005),    # SL below the grid
+    (0.04, -0.01),     # TP halfway between cells 3 and 5: more than half a step from the nearest
+    (0.05, -0.04),     # SL halfway between cells 3 and 5
+])
+def test_path_model_off_grid_distance_holds_with_grid_gate(tp_ret, sl_ret):
+    r = map_forecast(_dist_row(tp_ret, sl_ret), genes(min_edge_pct=0.1, max_uncertainty=100), 100.0, 2.0)
+    assert r.signal == OR.HOLD and "gate=grid" in r.reason
+
+
+def test_path_model_stop_on_profit_side_holds_with_grid_gate():
+    r = map_forecast(row(STRONG, probs=grid_probs(0.9)), genes(), 100.0, 2.0)
+    assert r.signal == OR.HOLD and "gate=grid" in r.reason
+
+
+def test_path_model_on_grid_distance_passes():
+    r = map_forecast(_dist_row(0.05, -0.02), genes(min_edge_pct=0.1, max_uncertainty=100), 100.0, 2.0)
+    assert r.signal == OR.BUY and r.confidence == pytest.approx(90.0)
+
+
 def test_path_model_short_uses_short_columns():
     probs = grid_probs(0.5, {("short", 5, 5, 1): 0.8, ("long", 5, 5, 1): 0.1})
     r = map_forecast(row(BEAR, probs=probs), genes(), 100.0, 2.0)
