@@ -275,6 +275,17 @@ Rules to know:
   reads) are never panel symbols in the gate and are listed in its `excluded` summary.
 - Vendor list defects this guards against: Alpaca lists spurious events (HON, NVS, IR, DRS) and misses splits (KOD,
   UHAL, SNX, RTX); FMP has CRWD mixed basis, META before 2022-06, and adjusts spin-offs (HON, IAC).
+- **Known limitation, accepted (owner 2026-10-25): some Alpaca daily closes are not the official close.** On a few
+  days the 1Day bar's close is a print from outside regular hours (late or after-hours), not the closing auction.
+  Example: SPY 2020-03-12, Alpaca daily close 255.24, its own last regular-session 5-min close 248.10, FMP / official
+  248.11 (+2.9%). Measured 2026-10-24 on 99 symbols (SPY, QQQ, the 97-name option universe), 2020-2025: the daily
+  close differs from the last regular 5-min close by > 0.1% on a median 2.3% of days and by > 0.5% on 0.27%; the
+  worst are the 2020-03 crash days (SPY 2.9%, TTE 8.8%, BAC 4.2%) and ADRs (SAN: 53% of days > 0.1%). The build does
+  NOT replace them and `verify` does not block on them (they sit under its blocking threshold). Effect: logic that
+  reads daily closes (indicators, SMA/RV regimes, ATR) is slightly off on those days; the SPY regime calendar built
+  on Alpaca vs FMP closes differs on 0.07% (trend) / 0.80% (vol) of 2020-2025 sessions
+  (`test_files/probe_spy_regime_source_disagreement.py`, arrives with the SPY-gate merge). Intraday decision prices (the 5-min bar that ended) are
+  unaffected.
 
 Why the switch (measured 2026-10-20 on the 4,465 screener-panel symbols with data, 2020-2025): days with 5-min
 bars FMP 84% / 93% / 97% vs Alpaca 94% / 97% / 98% (2020 / 2023 / 2025); symbols whose 5-min close misses the same
