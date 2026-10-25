@@ -246,3 +246,59 @@ def test_exclusive_return_flows_through_the_cell_and_its_stored_fold_key(tmp_pat
     r2 = ChainRunner([flat, flat, flat], completed={"cell-wf1", "cell-wf2", "cell-wf3"})
     res2 = C.run_cell(_spec(exclusive_return=True), r2, str(tmp_path / "b"), log=lambda *_: None)
     assert res2.verdict == "FAIL" and [e[0] for e in r2.events] == ["oos", "oos", "oos"]
+
+
+# ------------------------------------------------------------------ review fixes
+
+
+def test_a_non_walk_forward_exception_in_one_cell_does_not_stop_the_grid(tmp_path, caplog):
+    class Crash(ChainRunner):
+        def select(self, train_name, top_n):
+            raise RuntimeError("db is locked")
+
+    def make(sp):
+        if sp.name == "boom":
+            return Crash([GOOD, GOOD, GOOD], prefix="boom")
+        return ChainRunner([GOOD, GOOD, GOOD], prefix=sp.name)
+
+    with caplog.at_level("ERROR"):
+        out = C.run_cells([_spec(name="boom"), _spec(name="fine")], make, str(tmp_path),
+                          log=lambda *_: None)
+    assert [c["verdict"] for c in out] == ["ERROR", "PASS"]
+    assert out[0]["error"] == "RuntimeError: db is locked"
+    rec = [r for r in caplog.records if r.levelname == "ERROR" and "boom" in r.getMessage()]
+    assert rec and rec[0].exc_info is not None
+
+
+class Identified(ChainRunner):
+    """Train jobs carry an optimization id + completion time; `ident` can be changed to simulate a retrain."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.ident = {}
+
+    def train_identity(self, name):
+        return self.ident.get(name, {"id": 1, "completed_at": "2026-10-25T10:00:00"})
+
+
+def test_rejected_stored_fold_report_is_logged_with_the_reason(tmp_path, caplog):
+    C.run_cell(_spec(), Identified([GOOD, GOOD, GOOD]), str(tmp_path), log=lambda *_: None)
+    (tmp_path / "cell" / "fold2.json").write_text("{not json", encoding="utf-8")
+    done = {"cell-wf1", "cell-wf2", "cell-wf3", "cell-refit"}
+    with caplog.at_level("WARNING"):
+        C.run_cell(_spec(), Identified([GOOD, GOOD, GOOD], completed=done), str(tmp_path),
+                   log=lambda *_: None)
+    msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("cell" in m and "fold2.json" in m and "unreadable" in m for m in msgs)
+
+
+def test_a_retrained_fold_invalidates_its_own_and_every_later_stored_report(tmp_path, caplog):
+    C.run_cell(_spec(), Identified([GOOD, GOOD, GOOD]), str(tmp_path), log=lambda *_: None)
+    done = {"cell-wf1", "cell-wf2", "cell-wf3", "cell-refit"}
+    r = Identified([GOOD, GOOD, GOOD], completed=done)
+    r.ident = {"cell-wf2": {"id": 9, "completed_at": "2026-10-26T09:00:00"}}   # wf2 was retrained
+    with caplog.at_level("WARNING"):
+        C.run_cell(_spec(), r, str(tmp_path), log=lambda *_: None)
+    # fold 1 is still trusted; folds 2 and 3 (seeded from the retrained job) are re-evaluated
+    assert [e for e in r.events if e[0] == "oos"] == [("oos", "cell-wf2"), ("oos", "cell-wf3")]
+    assert any("key mismatch" in x.getMessage() for x in caplog.records)

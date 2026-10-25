@@ -351,3 +351,21 @@ def test_failed_and_duplicate_individuals_are_dropped_before_padding(monkeypatch
             s["filled_random"]) == (5, 1, 1, 3, 3)
     init = [list(i) for i in spy.captured["initial_population"]]
     assert [3.0, -2.0] not in init[:3] and init.count(list(g0)) >= 1
+
+
+def test_real_runner_train_identity_changes_when_a_job_is_retrained(monkeypatch):
+    from tests.test_walk_forward import _tool
+    sid = T._seed_strategy()
+    a = _source(sid, name="ident-wf1")
+    rr = _tool().RealRunner(None)
+    monkeypatch.setattr(rr, "_tool", lambda: None)
+    first = rr.train_identity("ident-wf1")
+    assert first["id"] == a and first["completed_at"]
+    db = SessionLocal()                                  # 'retrain': a new row replaces the old one
+    try:
+        db.query(StrategyOptimization).filter(StrategyOptimization.id == a).update({"name": "gone"})
+        db.commit()
+    finally:
+        db.close()
+    b = _source(sid, name="ident-wf1")
+    assert rr.train_identity("ident-wf1")["id"] == b != a

@@ -16,6 +16,7 @@ on resume, the refit, the per-cell report and the grid summary. Pure orchestrati
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import date
@@ -23,6 +24,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from app.services import walk_forward as WF
 from app.services.walk_forward import WalkForwardError
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------------- folds
@@ -132,10 +135,20 @@ def _fold_path(report_dir: str, name: str, k: int) -> str:
     return os.path.join(report_dir, name, f"fold{k}.json")
 
 
-def _fold_key(plan: WF.Plan, f: WF.Fold) -> Dict[str, Any]:
+def _identities(runner: Any, plan: WF.Plan, f: WF.Fold) -> Optional[List[Any]]:
+    """Identity (optimization id + completion time) of this fold's train job AND every earlier one:
+    fold k is seeded from fold k-1, so retraining any of them makes fold k's report stale. None for
+    a runner that cannot say (then the key carries no identity)."""
+    read = getattr(runner, "train_identity", None)
+    if not callable(read):
+        return None
+    return [read(WF.train_job_name(plan.prefix, k.index)) for k in plan.folds if k.index <= f.index]
+
+
+def _fold_key(plan: WF.Plan, f: WF.Fold, identities: Optional[List[Any]] = None) -> Dict[str, Any]:
     """What a stored fold report must agree with to be trusted (anything else re-evaluates)."""
     th = plan.thresholds
-    return {"train": [f.train_start.isoformat(), f.train_end.isoformat()],
+    return {"train_jobs": identities,"train": [f.train_start.isoformat(), f.train_end.isoformat()],
             "test": [f.test_start.isoformat(), f.test_end.isoformat()],
             "top_n": plan.top_n, "selection": plan.selection,
             "exclusive_return": plan.exclusive_return,
@@ -143,26 +156,38 @@ def _fold_key(plan: WF.Plan, f: WF.Fold) -> Dict[str, Any]:
                            "min_folds": th.min_folds}}
 
 
-def _save_fold(report_dir: str, plan: WF.Plan, f: WF.Fold, genomes: List[WF.GenomeFold]) -> None:
+def _save_fold(report_dir: str, plan: WF.Plan, f: WF.Fold, genomes: List[WF.GenomeFold],
+               identities: Optional[List[Any]] = None) -> None:
     path = _fold_path(report_dir, plan.prefix, f.index)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"key": _fold_key(plan, f), "genomes": [asdict(g) for g in genomes]}, fh,
+        json.dump({"key": _fold_key(plan, f, identities), "genomes": [asdict(g) for g in genomes]}, fh,
                   indent=2)
 
 
-def _load_fold(report_dir: str, plan: WF.Plan, f: WF.Fold) -> Optional[List[WF.GenomeFold]]:
+def _load_fold(report_dir: str, plan: WF.Plan, f: WF.Fold,
+               identities: Optional[List[Any]] = None) -> Optional[List[WF.GenomeFold]]:
+    """The stored report of a completed fold, or None. Every rejection is logged WITH ITS REASON:
+    a silently ignored report would look like a resume that recomputed for no visible cause."""
     path = _fold_path(report_dir, plan.prefix, f.index)
     if not os.path.exists(path):
-        return None
+        return None                      # never stored: nothing to reject
     try:
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
-        if doc["key"] != _fold_key(plan, f):
+        if doc["key"] != _fold_key(plan, f, identities):
+            logger.warning("[%s] stored report %s rejected: key mismatch (window, top-n, selection, "
+                           "thresholds or the train job(s) changed); re-evaluating fold %d",
+                           plan.prefix, path, f.index)
             return None
         return [WF.GenomeFold(**g) for g in doc["genomes"]]
-    except (OSError, ValueError, KeyError, TypeError):
-        return None                      # unreadable store: re-evaluate, never guess
+    except OSError as e:
+        logger.warning("[%s] stored report %s rejected: unreadable (%s); re-evaluating fold %d",
+                       plan.prefix, path, e, f.index)
+    except (ValueError, KeyError, TypeError) as e:
+        logger.warning("[%s] stored report %s rejected: unreadable (%s: %s); re-evaluating fold %d",
+                       plan.prefix, path, type(e).__name__, e, f.index)
+    return None
 
 
 # --------------------------------------------------------------------------------- one cell
@@ -201,13 +226,14 @@ def run_cell(spec: CellSpec, runner: Any, report_dir: str,
     genomes: List[WF.GenomeFold] = []
     for f in folds:
         name = WF.train_job_name(spec.name, f.index)
-        stored = _load_fold(report_dir, plan, f) if runner.train_completed(name) else None
+        stored = (_load_fold(report_dir, plan, f, _identities(runner, plan, f))
+                  if runner.train_completed(name) else None)
         if stored is not None:
             log(f"[{spec.name}] fold {f.index}: completed -- reusing its stored report")
             genomes.extend(stored)
             continue
         got = WF.run_fold(plan, runner, f, log)
-        _save_fold(report_dir, plan, f, got)
+        _save_fold(report_dir, plan, f, got, _identities(runner, plan, f))
         genomes.extend(got)
     res = WF.aggregate(spec.name, folds, len(folds), spec.top_n, genomes, spec.thresholds,
                        spec.selection, require_test_years=plan.require_test_years,
@@ -293,17 +319,18 @@ def write_summary(cells: Sequence[Dict[str, Any]], report_dir: str) -> None:
 
 def run_cells(specs: Sequence[CellSpec], runner_factory: Callable[[CellSpec], Any],
               report_dir: str, log: Callable[[str], None] = print) -> List[Dict[str, Any]]:
-    """Run every cell in order. A cell that raises ``WalkForwardError`` is recorded as ERROR with the
-    message and the grid goes on (a failed train job of one cell must not stop 34 others); the
+    """Run every cell in order. A cell that raises ANY exception is recorded as ERROR (type and
+    message, logged with its traceback) and the grid goes on (a failed train job of one cell must not stop 34 others); the
     summary is rewritten after each cell so a killed driver leaves a current one."""
     cells: List[Dict[str, Any]] = []
     for spec in specs:
         try:
             cells.append(run_cell(spec, runner_factory(spec), report_dir, log).report)
-        except WalkForwardError as e:
-            log(f"[{spec.name}] ERROR: {e}")
+        except Exception as e:  # noqa: BLE001 -- ONE cell's crash (db lock, OSError, bug) must not stop the grid
+            logger.error("[%s] cell ERROR: %s: %s", spec.name, type(e).__name__, e, exc_info=True)
+            log(f"[{spec.name}] ERROR: {type(e).__name__}: {e}")
             cells.append({"cell": spec.name, "expert": spec.expert, "strategy": spec.strategy,
-                          "band": spec.band, "verdict": "ERROR", "error": str(e),
+                          "band": spec.band, "verdict": "ERROR", "error": f"{type(e).__name__}: {e}",
                           "refit_job": None, "folds": []})
         write_summary(cells, report_dir)
     return cells

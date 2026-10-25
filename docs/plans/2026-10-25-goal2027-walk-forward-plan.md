@@ -48,3 +48,18 @@ Design: `2026-10-25-goal2027-grid-design.md` section 1.2 and 2.5, `2026-10-02-wa
 4. folds for a cell + chain orchestration + fold cache + refit + reports - `test_wf_matrix_chain.py`
 5. matrix driver flags + `run_walk_forward --pass-require-fold`
 6. versions check, full runs, diff against origin/dev if any old test fails
+
+## Runbook notes
+
+- **A killed fold or refit row must be deleted before the re-run.** A train job that died leaves a
+  `running`/`failed` optimization (and possibly a `running` OOS backtest row) under its name. The
+  engine refuses to launch a second one under the same name (it would break resume by name), and a
+  `WF<k>-OOS-R<rank>-...` backtest that is not `completed` is refused too. Delete the dead rows (the
+  optimization and its `strategy_optimization_populations` row, if any, plus the stuck backtest) from
+  the test DB, then relaunch the same command: completed folds are skipped, the dead one retrains.
+- Retraining a completed fold (delete its row and re-run) invalidates its stored report and the reports
+  of every later fold of that cell: the stored fold key carries each train job's optimization id and
+  completion time, and a rejected report is logged as a WARNING with the reason.
+- The final population is stored in `strategy_optimization_populations` (migration 032, applied by
+  `scripts/migrate_db.py` at backend start; a fresh DB gets it from `create_all`). It is not part of
+  `optimization_config`; clones and batch templates drop `seededFrom` and the chain keys.
