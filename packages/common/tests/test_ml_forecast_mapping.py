@@ -125,10 +125,38 @@ def test_horizon_selects_distribution():
         map_forecast(r, genes(horizon=20), 100.0, 2.0)
 
 
-def test_stop_not_below_entry_holds():
-    strong = tuple(0.01 + 0.01 * i for i in range(9))               # q10 = +1%: a q10 "stop" would sit above entry
-    r = map_forecast(row(strong), genes(), 100.0, 2.0)
-    assert r.signal == OR.HOLD and "stop" in r.reason
+STRONG = tuple(0.01 + 0.01 * i for i in range(9))      # q10 = +1%: a q10 "stop" would sit above the entry
+
+
+def test_stop_on_profit_side_still_signals_without_a_stop():
+    r = map_forecast(row(STRONG), genes(), 100.0, 2.0)
+    assert r.signal == OR.BUY and r.sl_price is None
+    assert r.tp_price == pytest.approx(100.0 * (1 + 0.08))     # q80 = +8%
+    assert "forecast stop not on loss side" in r.reason and "ruleset/ATR safeguard applies" in r.reason
+
+
+def test_tp_on_wrong_side_gives_no_tp():
+    # bullish median but q80 below zero is impossible (monotone); use a short with tp level on the wrong side
+    d = tuple(-0.09 + 0.01 * i for i in range(9))          # all negative: bearish, q10..q90 = -9%..-1%
+    r = map_forecast(row(d), genes(sl_quantile=40), 100.0, 2.0)   # short: sl = q60 = -4% (profit side)
+    assert r.signal == OR.SELL and r.sl_price is None and r.tp_price is not None
+    assert "forecast stop not on loss side" in r.reason
+
+
+def test_tiny_stop_distance_is_dropped():
+    from ba2_common.core.ml_forecast.mapping import MIN_EXIT_DISTANCE_ATR
+    assert MIN_EXIT_DISTANCE_ATR == 0.25
+    d = (-0.02, -0.01, -0.005, -0.001, 0.02, 0.03, 0.04, 0.05, 0.06)
+    r = map_forecast(row(d), genes(min_prob=55, sl_quantile=40), 100.0, 2.0)     # sl distance 0.1 < 0.25 * 2
+    assert r.signal == OR.BUY and r.sl_price is None and r.tp_price == pytest.approx(105.0)
+    assert "minimum" in r.reason
+
+
+def test_tiny_tp_distance_is_dropped():
+    d = (-0.02, -0.01, 0.0, 0.001, 0.002, 0.003, 0.004, 0.0045, 0.005)
+    r = map_forecast(row(d), genes(min_edge_pct=0.1, min_prob=55, max_uncertainty=6), 100.0, 2.0)
+    assert r.signal == OR.BUY and r.tp_price is None and r.target_price is None
+    assert "take-profit" in r.reason and "minimum" in r.reason
 
 
 def test_confidence_always_1_to_100():

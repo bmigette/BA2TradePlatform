@@ -6,7 +6,7 @@ Entry (``map_forecast``), in gate order:
   3. shorting: a bearish forecast with ``enable_sell`` off -> HOLD                       ("sell disabled")
   4. edge: |q50| in percent  >=  min_edge_pct                                          ("min_edge")
   5. probability in percent  >=  min_prob                                              ("min_prob")
-  6. TP / SL must lie on the correct side of the entry price                           ("stop"/"target")
+  6. (not a gate) TP / SL prices: see below
 
 Probability used:
   * decile models: ``p_up_from_deciles`` (below); the bearish probability is ``1 - p_up``.
@@ -14,8 +14,10 @@ Probability used:
     quantiles, in the direction traded (long: TP = q[tp_quantile], SL = q[sl_quantile]; short mirrored).
 
 TP/SL prices come from the quantiles (long: TP = price * (1 + q[tp_quantile]), SL = price * (1 + q[sl_quantile]);
-short: mirrored through ``100 - level``). A stop quantile that is not on the loss side of the entry (a very
-confident forecast whose q10 is already positive) is NOT replaced by a made-up distance: the result is HOLD.
+short: mirrored through ``100 - level``). A forecast TP/SL that is on the wrong side of the entry (a very
+confident forecast whose q10 is already positive) or closer than MIN_EXIT_DISTANCE_ATR x ATR is returned as
+``None`` with a note in ``reason``; the signal is still emitted. It is NEVER replaced by a made-up level: the
+CALLER must then apply the ruleset / ATR stop safeguard, so a trade never opens with no protective exit.
 
 Held positions (``map_held_position``): a flip to the opposite rating once the opposite-side probability
 (decile based) reaches ``exit_flip_prob``. It ignores ``enable_sell`` (closing a long is not opening a short).
@@ -34,6 +36,8 @@ from .forecast_row import DECILE_LEVELS, SL_GRID_PCT, TP_GRID_PCT, ForecastRow
 #: Clamp of P(up) when 0% lies outside the q10..q90 range: the tails are unobserved, so the probability is never
 #: reported beyond 5% / 95%.
 P_TAIL_CLAMP = 0.05
+#: Forecast TP/SL prices closer to the entry than this many ATR are degenerate and dropped (set to None).
+MIN_EXIT_DISTANCE_ATR = 0.25
 
 
 def _is_num(x) -> bool:
@@ -180,20 +184,31 @@ def map_forecast(row: ForecastRow, genes: MappingGenes, decision_price: float, a
     if p * 100.0 < genes.min_prob - 1e-9:
         return _hold(p, f"HOLD gate=min_prob: p {p * 100:.1f}%{cell} < {genes.min_prob:g}%")
 
-    if long_:
-        ok_tp, ok_sl = tp_ret > 0, sl_ret < 0
-    else:
-        ok_tp, ok_sl = tp_ret < 0, sl_ret > 0
-    if not ok_tp:
-        return _hold(p, f"HOLD gate=target: take-profit quantile return {tp_ret:+.4f} is not in the profit direction")
-    if not ok_sl:
-        return _hold(p, f"HOLD gate=stop: stop quantile return {sl_ret:+.4f} is not on the loss side of the entry")
-
-    tp_price, sl_price = price * (1.0 + tp_ret), price * (1.0 + sl_ret)
+    notes = []
+    tp_price = _exit_price("take-profit", price, tp_ret, long_, True, atr, notes)
+    sl_price = _exit_price("stop", price, sl_ret, long_, False, atr, notes)
     sig = OrderRecommendation.BUY if long_ else OrderRecommendation.SELL
     reason = (f"{sig.value} h={h} q50={q50 * 100:+.2f}% p={p * 100:.1f}%{cell} width={unc:.2f}ATR "
-              f"tp={tp_price:.4f} sl={sl_price:.4f}")
+              f"tp={'none' if tp_price is None else f'{tp_price:.4f}'} "
+              f"sl={'none' if sl_price is None else f'{sl_price:.4f}'}")
+    if notes:
+        reason += "; " + "; ".join(notes)
     return MappingResult(sig, _conf(p), edge, tp_price, tp_price, sl_price, reason)
+
+
+def _exit_price(name: str, price: float, ret: float, long_: bool, is_tp: bool, atr: float, notes: list) -> Optional[float]:
+    """Forecast exit price, or None (with a note) when the quantile is on the wrong side of the entry or closer
+    than MIN_EXIT_DISTANCE_ATR x ATR. Never replaced by an invented level: the caller applies the ruleset/ATR safeguard."""
+    profit_side = (ret > 0) if long_ else (ret < 0)
+    if profit_side != is_tp:
+        notes.append(f"forecast {name} not on {'profit' if is_tp else 'loss'} side; ruleset/ATR safeguard applies")
+        return None
+    out = price * (1.0 + ret)
+    if abs(out - price) < MIN_EXIT_DISTANCE_ATR * atr:
+        notes.append(f"forecast {name} closer than the minimum {MIN_EXIT_DISTANCE_ATR:g} ATR; "
+                     f"ruleset/ATR safeguard applies")
+        return None
+    return out
 
 
 def map_held_position(row: ForecastRow, genes: MappingGenes, side: str) -> MappingResult:
