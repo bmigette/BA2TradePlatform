@@ -125,6 +125,21 @@ class RealRunner:
             raise WF.WalkForwardError(f"{len(rows)} optimizations are named {name!r}")
         return ((rows[0][0] or {}).get("seededFrom") or {}).get("name")
 
+    def train_identity(self, name: str) -> dict:
+        """Optimization id + completion time of the (single) job of this name: a stored fold report
+        is only trusted while these still match (a retrained job gets a new id/time)."""
+        rows = self._opts_named(name)
+        if len(rows) != 1:
+            raise WF.WalkForwardError(f"{len(rows)} optimizations are named {name!r}")
+        from app.models.database import SessionLocal
+        from app.models.strategy_optimization import StrategyOptimization as SO
+        db = SessionLocal()
+        try:
+            done = db.query(SO.completed_at).filter(SO.id == rows[0][0]).scalar()
+        finally:
+            db.close()
+        return {"id": rows[0][0], "completed_at": done.isoformat() if done else None}
+
     def run_train(self, cmd: List[str], name: str) -> None:
         stale = self._opts_named(name)
         if stale:
