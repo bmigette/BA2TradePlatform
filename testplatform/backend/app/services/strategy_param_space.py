@@ -162,6 +162,113 @@ def neutralise_sizing_genes(flat_params: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in flat_params.items() if k not in NOTIONAL_INERT_MODEL_GENES}
 
 
+#: goal2027 item 2.2 -- the market-profile gene. ``--search-market-profile`` adds ``market:profile`` as a choice gene
+#: over ``MARKET_PROFILE_CHOICES`` (this ORDER is a persisted contract: the GA stores the index). It REPLACES the
+#: ``market:enabled`` master gene for the jobs that use it. ``off`` selects no profile (everything market is off,
+#: exactly what ``market:enabled == 0`` does); ``both`` selects both.
+MARKET_PROFILE_GENE = "market:profile"
+MARKET_PROFILE_OHLCV = "ohlcv-v1"
+MARKET_PROFILE_STRUCTURE = "ta-structure-v1"
+MARKET_PROFILE_CHOICES = ("off", MARKET_PROFILE_OHLCV, MARKET_PROFILE_STRUCTURE, "both")
+_MARKET_PROFILE_SELECTION = {
+    "off": frozenset(),
+    MARKET_PROFILE_OHLCV: frozenset({MARKET_PROFILE_OHLCV}),
+    MARKET_PROFILE_STRUCTURE: frozenset({MARKET_PROFILE_STRUCTURE}),
+    "both": frozenset({MARKET_PROFILE_OHLCV, MARKET_PROFILE_STRUCTURE}),
+}
+
+
+def market_profile_selection(value: Any) -> frozenset:
+    """The profiles a decoded ``market:profile`` value selects. Refuses an unknown value (no silent default)."""
+    try:
+        return _MARKET_PROFILE_SELECTION[value]
+    except (KeyError, TypeError):
+        raise ValueError(f"{MARKET_PROFILE_GENE}: unknown value {value!r}; expected one of "
+                         f"{MARKET_PROFILE_CHOICES}") from None
+
+
+def market_profile_members(strategy) -> Dict[str, Any]:
+    """Which profile each market-condition LEAF and each toggled market RULE of a Strategy TEMPLATE belongs to.
+
+    ``{"leaf_profile": {leaf_id: profile}, "rule_profiles": {rule_id: frozenset(profiles)},
+    "rule_leaves": {rule_id: [leaf_id, ...]}}``. A leaf's profile is the registered profile that owns its ``field``
+    (a field belongs to exactly one profile, refused otherwise). A market EXIT rule (membership as in
+    ``_market_condition_members``: rule-level ``toggle_optimize`` plus a market leaf) belongs to the profiles of
+    ALL its market leaves, so an exit rule can only run when every profile it reads is selected.
+    """
+    from ba2_common.core.market_conditions import PROFILES
+
+    owner: Dict[str, str] = {}
+    for pname, prof in PROFILES.items():
+        for f in prof.fields:
+            if f.name in owner and owner[f.name] != pname:
+                raise ValueError(f"market field {f.name!r} is owned by both {owner[f.name]!r} and {pname!r}")
+            owner[f.name] = pname
+    leaf_profile: Dict[str, str] = {}
+    rule_leaves: Dict[str, list] = {}
+    _, rule_ids = _market_condition_members(strategy)
+
+    def walk(node, sink: list) -> None:
+        if not isinstance(node, dict):
+            return
+        for child in (node.get("conditions") or []):
+            walk(child, sink)
+        cid = node.get("id")
+        if cid and node.get("field") in owner:
+            leaf_profile[cid] = owner[node["field"]]
+            sink.append(cid)
+
+    for attr in ("entry_rules", "exit_rules"):
+        for rule in (getattr(strategy, attr, None) or []):
+            if not isinstance(rule, dict):
+                continue
+            sink: list = []
+            walk(rule.get("conditions"), sink)
+            # EXIT rules only: an equity ENTRY rule (S1's conviction tiers carry a rule-level toggle) holds the
+            # market leaves among its ordinary gates, so gating the RULE would drop the whole entry.
+            if attr == "exit_rules" and rule.get("id") in rule_ids:
+                rule_leaves[rule["id"]] = sink
+    rule_profiles = {rid: frozenset(leaf_profile[c] for c in leaves) for rid, leaves in rule_leaves.items()}
+    return {"leaf_profile": leaf_profile, "rule_profiles": rule_profiles, "rule_leaves": rule_leaves}
+
+
+def neutralise_market_profile_genes(flat_params: Dict[str, Any], members: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Canonicalise a decoded genome by its ``market:profile`` for the TRIAL MEMO KEY: whatever belongs to an
+    UNSELECTED profile cannot act (decode forces it off), so two genomes differing only there must share one key.
+
+    * an entry leaf of an unselected profile: ``cond:<id>:mode`` -> ``off`` (its value gene then follows the
+      existing mode-anchor pass in ``canonical_trial_params``);
+    * a market rule reading any unselected profile: ``exit:<rid>:enabled`` -> 0 and its action genes
+      (``exit:<rid>:a*``) and leaf genes (``cond:<leaf>:*``) are REMOVED.
+
+    Returns ``flat_params`` ITSELF when there is no ``market:profile`` gene (every older job) or nothing changes.
+    Never mutates the input."""
+    if MARKET_PROFILE_GENE not in flat_params:
+        return flat_params
+    selected = market_profile_selection(flat_params[MARKET_PROFILE_GENE])
+    if not members:
+        return flat_params
+    out = dict(flat_params)
+    rule_leaf_ids = {c for leaves in members["rule_leaves"].values() for c in leaves}
+    for cid, prof in members["leaf_profile"].items():
+        key = f"cond:{cid}:mode"
+        if prof not in selected and cid not in rule_leaf_ids and key in out:
+            cur = out[key]
+            out[key] = MODE_OFF if isinstance(cur, str) else 0   # index 0 is ``off`` in every mode choice list
+    for rid, profs in members["rule_profiles"].items():
+        if profs <= selected:
+            continue
+        for ns in ("exit", "entry"):
+            if f"{ns}:{rid}:enabled" in out:
+                out[f"{ns}:{rid}:enabled"] = 0
+            for k in [k for k in out if k.startswith(f"{ns}:{rid}:a")]:
+                del out[k]
+        for cid in members["rule_leaves"][rid]:
+            for k in [k for k in out if k.startswith(f"cond:{cid}:")]:
+                del out[k]
+    return flat_params if out == flat_params else out
+
+
 # Actions that must NEVER be dropped by a per-action toggle: removing the open action would
 # turn an entry rule into a no-op bracket; guards must stay. (Rule-level toggles can still
 # drop the whole rule.)
@@ -584,6 +691,20 @@ def _market_condition_field_names() -> set:
 _MARKET_MASTER_GENE_MARKER = "market_master_gene"
 
 
+#: goal2027 2.2 marker, stamped (next to ``market_master_gene``) by the launcher under ``--search-market-profile``:
+#: the strategy collects ``market:profile`` INSTEAD OF ``market:enabled``. Same rule-level survival as above.
+_MARKET_PROFILE_GENE_MARKER = "market_profile_gene"
+
+
+def _strategy_opts_into_market_profile_gene(strategy) -> bool:
+    for attr in ("entry_rules", "exit_rules"):
+        for rule in (getattr(strategy, attr, None) or []):
+            if isinstance(rule, dict) and (rule.get(_MARKET_PROFILE_GENE_MARKER)
+                                           or rule.get("marketProfileGene")):
+                return True
+    return False
+
+
 def _strategy_opts_into_market_master_gene(strategy) -> bool:
     """Whether ANY rule of this strategy TEMPLATE carries :data:`_MARKET_MASTER_GENE_MARKER`.
 
@@ -714,7 +835,12 @@ def collect_param_space(
     # finding, 2026-09-29). bypass experts never collect cond:*/entry:*/exit:* at all (see
     # above), so they get no master gene either -- there is nothing for it to control.
     if not bypass and _strategy_opts_into_market_master_gene(strategy):
-        space["market:enabled"] = _range_entry(0, 1, 1, is_int=True)
+        if _strategy_opts_into_market_profile_gene(strategy):
+            # goal2027 2.2: the profile choice REPLACES the on/off master gene (never both).
+            space[MARKET_PROFILE_GENE] = {"type": "choice", "choices": list(MARKET_PROFILE_CHOICES),
+                                          "min": 0, "max": len(MARKET_PROFILE_CHOICES) - 1, "step": 1}
+        else:
+            space["market:enabled"] = _range_entry(0, 1, 1, is_int=True)
     if not space:
         raise ValueError(
             "No optimizable parameters found: "
@@ -1108,6 +1234,8 @@ def _decode_rule_list(rules, ns: str,
         # not a template").
         rule.pop("market_master_gene", None)
         rule.pop("marketMasterGene", None)
+        rule.pop("market_profile_gene", None)
+        rule.pop("marketProfileGene", None)
         out.append(rule)
     return out
 
@@ -1138,6 +1266,7 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     schedule_time: Optional[str] = None
     optsel_by_half: Dict[str, Dict[str, Any]] = {}
     market_enabled: Optional[Any] = None
+    market_profile: Optional[Any] = None
 
     def _rule_gene(store: Dict[str, Dict[str, Any]], rid: str, rest: str, val: Any) -> None:
         genes = store.setdefault(rid, {})
@@ -1177,10 +1306,13 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
             optsel_by_half.setdefault(half, {})[w] = val
         elif key.startswith("market:"):
             field = key[len("market:"):]
-            if field != "enabled":
+            if field == "enabled":
+                market_enabled = val
+            elif field == "profile":
+                market_profile = val
+            else:
                 raise ValueError(
-                    f"Unknown market gene field {field!r} (only 'market:enabled' exists)")
-            market_enabled = val
+                    f"Unknown market gene field {field!r} (only 'market:enabled' and 'market:profile' exist)")
         else:
             raise ValueError(f"Unknown decoded param namespace: {key!r}")
 
@@ -1193,6 +1325,22 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     # persisted strategy is already the resolved, off-switched shape -- live never needs to know
     # the master gene exists. enabled=1 (or the gene simply absent, e.g. a genome predating it,
     # or a strategy with no market genes at all) leaves every individual gene exactly as decoded.
+    if market_enabled is not None and market_profile is not None:
+        raise ValueError("a genome carries both market:enabled and market:profile; the profile gene REPLACES the "
+                         "on/off master gene, so refusing an ambiguous genome")
+    if market_profile is not None:
+        # goal2027 2.2: the leaves/rules of every profile NOT selected are forced off, exactly as
+        # market:enabled == 0 forces ALL of them (``off`` selects nothing, so it IS that case). A market exit
+        # rule reads fields of its profile only, so an unselected profile cannot drive an exit.
+        selected = market_profile_selection(market_profile)
+        members = market_profile_members(strategy)
+        for cid, prof in members["leaf_profile"].items():
+            if prof not in selected:
+                cond_by_id.setdefault(cid, {})["mode"] = MODE_OFF
+        for rid, profs in members["rule_profiles"].items():
+            if not profs <= selected:
+                entry_genes.setdefault(rid, {})["enabled"] = 0
+                exit_genes.setdefault(rid, {})["enabled"] = 0
     if market_enabled is not None and int(market_enabled) == 0:
         market_leaf_ids, market_rule_ids = _market_condition_members(strategy)
         for cid in market_leaf_ids:

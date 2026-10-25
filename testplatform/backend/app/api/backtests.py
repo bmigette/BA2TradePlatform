@@ -1220,6 +1220,27 @@ def _refuse_sizing_gene_row_without_gene(backtest: Backtest, db: Any) -> None:
                     f"model:sizing_mode gene; exporting would deploy it as notional by default. Refusing."))
 
 
+def _refuse_market_profile_row_without_gene(backtest: Backtest, db: Any) -> None:
+    """No silent default: decode treats an ABSENT ``market:profile`` as "no profile restriction" (every market
+    gene as individually decoded), a different phenotype from whatever the GA chose. A row whose run searched the
+    profile (its optimization's parameter_ranges carry ``market:profile``, goal2027 item 2.2) but whose
+    ``strategy_params`` lost that gene is refused. Rows of older runs (no such gene in the space) are unaffected."""
+    if db is None or backtest.optimization_id is None:
+        return
+    from app.models.strategy_optimization import StrategyOptimization
+    so = db.query(StrategyOptimization).filter(
+        StrategyOptimization.id == backtest.optimization_id).first()
+    ranges = so.parameter_ranges if so is not None else None
+    if not isinstance(ranges, dict) or "market:profile" not in ranges:
+        return
+    sp = backtest.strategy_params
+    if not isinstance(sp, dict) or sp.get("market:profile") is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: its optimization searched the market profile but this row has no "
+                    f"market:profile gene; exporting would deploy every market gene unrestricted. Refusing."))
+
+
 def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dict:
     """Build the chosen read-only export payload from a backtest's strategy_params.
 
@@ -1237,6 +1258,7 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
     if kind == "expert_settings":
         bt_block, _strat = _opt_backtest_block(backtest, db)
         _refuse_sizing_gene_row_without_gene(backtest, db)
+        _refuse_market_profile_row_without_gene(backtest, db)
     try:
         return derive_export_payload(
             backtest, kind,

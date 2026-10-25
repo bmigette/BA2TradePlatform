@@ -5579,6 +5579,13 @@ _SL_LOOSEN_SETTING = "allow_ruleset_sl_loosen"
 #: ``strategy_param_space.neutralise_sizing_genes``.
 _SEARCH_SIZING_MODE: bool = False
 
+#: ``--search-market-profile`` (goal2027 item 2.2): replaces the ``market:enabled`` master gene by ONE
+#: ``market:profile`` choice gene over (off, ohlcv-v1, ta-structure-v1, both). The builders stamp the
+#: ``market_profile_gene`` rule marker when it is on; the decode-time rules live in
+#: ``strategy_param_space.decode_params`` / ``neutralise_market_profile_genes``.
+_SEARCH_MARKET_PROFILE: bool = False
+_MARKET_PROFILE_GENE_PROFILES = ("ohlcv-v1", "ta-structure-v1")
+
 
 def _resolve_exclude_symbols_arg(spec) -> list:
     """Parse ``--exclude-symbols``: a comma list, or ``@path`` to a file.
@@ -5928,6 +5935,46 @@ def _resolve_search_sizing_mode(raw, explicit_mode, command: str) -> bool:
     return _SEARCH_SIZING_MODE
 
 
+def _resolve_search_market_profile(raw, command: str) -> bool:
+    """Parse ``--search-market-profile``; sets and returns the module global. MUST run after the profile, manifest
+    and mode resolvers. Refuses (exit) unless BOTH profiles are selected with BOTH manifests pinned and the
+    ``searched`` arm: the gene chooses between the profiles, so a missing profile (or an unpinned manifest) would be a
+    choice value that could never be evaluated honestly.
+
+    Always ASSIGNS the global (False included): the launcher is reused within one process, and a value left over
+    from a previous command would silently change an unrelated run's gene space."""
+    global _SEARCH_MARKET_PROFILE
+    _SEARCH_MARKET_PROFILE = False
+    if not raw:
+        return False
+    need = _MARKET_PROFILE_GENE_PROFILES
+    if tuple(sorted(_MARKET_CONDITION_PROFILES)) != tuple(sorted(need)):
+        sys.exit(f"{command}: --search-market-profile needs --market-condition-profile {','.join(need)} "
+                 f"(both profiles); got {list(_MARKET_CONDITION_PROFILES)!r}")
+    unpinned = [p for p in need if not _MARKET_CONDITION_MANIFESTS.get(p)]
+    if unpinned:
+        sys.exit(f"{command}: --search-market-profile needs a --market-condition-manifest for BOTH profiles; "
+                 f"no manifest pinned for {unpinned!r}")
+    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+        sys.exit(f"{command}: --search-market-profile searches the market genes; --market-condition-mode "
+                 f"{_MARKET_CONDITION_MODE!r} is the no-impact control and cannot carry it")
+    _SEARCH_MARKET_PROFILE = True
+    return True
+
+
+def _refuse_market_profile_gene_unsupported(command: str, kind: str, bypass: bool) -> None:
+    """The gene is for the classic equity S1-S7 experts only (the strategies that carry the market master gene);
+    a bypass expert (FactorRanker) and the option strategies would search it dead -- refused, not inert."""
+    if not _SEARCH_MARKET_PROFILE:
+        return
+    if bypass:
+        sys.exit(f"{command}: --search-market-profile: {kind!r} is a bypass expert that carries no market "
+                 f"genes; the gene would be searched but dead")
+    if kind not in _EQUITY_MARKET_CONDITION_STRATEGIES:
+        sys.exit(f"{command}: --search-market-profile: {kind!r} is not an equity S1-S7 strategy "
+                 f"({sorted(_EQUITY_MARKET_CONDITION_STRATEGIES)}); the gene is for those only")
+
+
 def _sizing_mode_gene_space() -> dict:
     """The ONE ``sizing_mode`` choice gene (``model:sizing_mode`` once collected) ``--search-sizing-mode`` adds
     ({} when off). The choice ORDER is a persisted contract (the GA stores the index)."""
@@ -6027,6 +6074,8 @@ def _append_equity_market_condition_gates(strategy, kind: str):
         # never through THIS function, so they never carry the marker and never collect the
         # master gene (``strategy_param_space._strategy_opts_into_market_master_gene``).
         rule["market_master_gene"] = True
+        if _SEARCH_MARKET_PROFILE:
+            rule["market_profile_gene"] = True   # goal2027 2.2: market:profile replaces market:enabled
     strategy.entry_rules = normalize_trade_rules(rules)
     return strategy
 
@@ -6115,6 +6164,8 @@ def _append_equity_market_exit_rules(strategy, kind: str):
     # to stamp anyway -- market_exit_rules' leaves are fixed/resolved, design section 5.2).
     for rule in rules:
         rule["market_master_gene"] = True
+        if _SEARCH_MARKET_PROFILE:
+            rule["market_profile_gene"] = True   # goal2027 2.2
     merged, omitted = _insert_equity_market_exit_rules(strategy.exit_rules, rules)
     strategy.exit_rules = normalize_trade_rules(merged)
     assert_market_rule_actions(strategy.exit_rules, f"{kind} exit rules")
@@ -6891,6 +6942,7 @@ def _cmd_optimize(args) -> int:
     _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize")
     _resolve_search_sizing_mode(getattr(args, "search_sizing_mode", False),
                                 getattr(args, "sizing_mode", None), "optimize")
+    _resolve_search_market_profile(getattr(args, "search_market_profile", False), "optimize")
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -7008,6 +7060,7 @@ def _cmd_optimize(args) -> int:
         bypass = bool(spec.get("bypass"))
         _refuse_sl_loosen_on_bypass("optimize", args.strategy, bypass)
         _refuse_sizing_gene_unsupported("optimize", args.strategy, bypass)
+        _refuse_market_profile_gene_unsupported("optimize", args.strategy, bypass)
         _sname = args.name or f"opt-{expert}-{args.strategy}"
         # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
         # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
@@ -7485,6 +7538,7 @@ def _cmd_optimize_batch(args) -> int:
     _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize-batch")
     _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize-batch")
     _resolve_search_sizing_mode(False, None, "optimize-batch")   # the gene is optimize-only; reset the global
+    _resolve_search_market_profile(False, "optimize-batch")      # likewise
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     batch_worker_ids = _worker_ids_from_args(args)  # resolved once; applied to every job
@@ -9003,6 +9057,15 @@ def main(argv: "list | None" = None) -> int:
                          "Classic S1-S7 only: refused for bypass experts (FactorRanker) and option "
                          "strategies. Name the job distinctly ('sizegene'): its gene space differs from a "
                          "pinned run's.")
+    op.add_argument("--search-market-profile", action="store_true", default=False,
+                    help="Search the market-condition PROFILE as ONE market:profile choice gene (off | ohlcv-v1 | "
+                         "ta-structure-v1 | both) instead of the on/off market:enabled master gene (goal2027 "
+                         "item 2.2). Requires --market-condition-profile ohlcv-v1,ta-structure-v1 with BOTH "
+                         "manifests pinned (--market-condition-manifest ohlcv-v1=D1,ta-structure-v1=D2) and the "
+                         "'searched' arm. The leaf genes and the --market-exit rules of a profile that is not "
+                         "selected decode to off (a profile you did not pick cannot drive an exit); 'off' is "
+                         "exactly market:enabled=0. Equity S1-S7 only: refused for bypass experts and option "
+                         "strategies. Name the job distinctly ('mktprof').")
     op.add_argument("--rm-toggle-policy", choices=_RM_TOGGLE_POLICIES, default="pinned",
                     help="'pinned' (default): use_atr_stop/regime_overlay_enabled are pinned OFF "
                          "for this run, exactly as every run on record -- byte-identical to "

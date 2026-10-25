@@ -170,6 +170,15 @@ def sizing_gene_tokens(args, strat) -> list:
     return []
 
 
+def market_profile_gene_tokens(args, strat) -> list:
+    """`--search-market-profile` for a CLASSIC job when the matrix searches the market profile (goal2027 item 2.2),
+    else []. The FactorRanker job (``strat is None``, a bypass expert) carries no market genes and the launcher
+    refuses the gene there, so it is not forwarded (the caller prints a NOTE)."""
+    if getattr(args, "search_market_profile", False) and strat is not None:
+        return ["--search-market-profile"]
+    return []
+
+
 def exclude_symbols_passthrough(args) -> list:
     """Extra `optimize` CLI tokens for --exclude-symbols ([] when not given, so an ordinary
     invocation of this driver is untouched). Kept separate from
@@ -514,6 +523,12 @@ def main() -> int:
                          "classic (S1-S7) job instead of pinning it (goal2027 item 2.1). Mutually exclusive "
                          "with --sizing-mode. REQUIRES --name-suffix to contain 'sizegene'. Not forwarded "
                          "to the FactorRanker job (bypass expert); folds into the job's name digest.")
+    ap.add_argument("--search-market-profile", action="store_true", default=False,
+                    help="Search the market profile (off | ohlcv-v1 | ta-structure-v1 | both) as a market:profile "
+                         "GENE in every classic (S1-S7) job, replacing the on/off market:enabled gene (goal2027 "
+                         "item 2.2). REQUIRES --market-condition-profile ohlcv-v1,ta-structure-v1 with a manifest "
+                         "for BOTH, and --name-suffix to contain 'mktprof'. Not forwarded to the FactorRanker job "
+                         "(bypass expert); folds into the job's name digest.")
     ap.add_argument("--workers", default=None,
                     help="Comma-separated remote worker NAMES to distribute each job's GA trials to "
                          "(e.g. 'remote150'); trials spread across these + local. Workers must be "
@@ -589,6 +604,29 @@ def main() -> int:
             ap.error(f"--search-sizing-mode requires --name-suffix to contain 'sizegene' "
                      f"(got {args.name_suffix!r}): its gene space differs from a pinned run's, so it "
                      f"must not share a job name. Example: --name-suffix goal2027-sizegene")
+    if args.search_market_profile:
+        _need = ("ohlcv-v1", "ta-structure-v1")
+        _profiles = [t.strip() for t in (args.market_condition_profile or "").split(",") if t.strip()]
+        if sorted(_profiles) != sorted(_need):
+            ap.error(f"--search-market-profile requires --market-condition-profile {','.join(_need)} "
+                     f"(both profiles; got {args.market_condition_profile!r})")
+        _pinned = {}
+        for _i, _tok in enumerate(t.strip() for t in (args.market_condition_manifest or "").split(",") if t.strip()):
+            if "=" in _tok:
+                _pinned[_tok.split("=", 1)[0].strip()] = _tok.split("=", 1)[1].strip()
+            elif _i < len(_profiles):
+                _pinned[_profiles[_i]] = _tok
+        _missing = [p for p in _need if not _pinned.get(p)]
+        if _missing:
+            ap.error(f"--search-market-profile requires a --market-condition-manifest for BOTH profiles "
+                     f"(none pinned for {_missing})")
+        if args.market_condition_mode == "all-off":
+            ap.error("--search-market-profile searches the market genes; --market-condition-mode all-off is the "
+                     "no-impact control and cannot carry it")
+        if "mktprof" not in args.name_suffix.replace("_", "").lower():
+            ap.error(f"--search-market-profile requires --name-suffix to contain 'mktprof' "
+                     f"(got {args.name_suffix!r}): its gene space differs from a market:enabled run's, so it "
+                     f"must not share a job name. Example: --name-suffix goal2027-mktprof")
     if args.sizing_mode:
         token = "riskatr" if args.sizing_mode == "risk_atr" else "notional"
         if token not in args.name_suffix.replace("_", "").lower():
@@ -758,8 +796,15 @@ def main() -> int:
         if args.search_sizing_mode and strat is None:
             print(f"[{i}/{len(jobs)}] NOTE {name}: bypass expert, sizing mode gene not applied "
                   f"(never reads sizing_mode)", flush=True)
+        # --search-market-profile: appended last (same reasoning); digest on its own. A bypass job is not given
+        # the gene (the launcher would refuse it).
+        mp_tokens = market_profile_gene_tokens(args, strat)
+        cmd += mp_tokens
+        if args.search_market_profile and strat is None:
+            print(f"[{i}/{len(jobs)}] NOTE {name}: bypass expert, market profile gene not applied "
+                  f"(carries no market genes)", flush=True)
         job_name = name
-        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens:
+        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens:
             job_name = _job_name(name, cmd)
             cmd[cmd.index("--name") + 1] = job_name
         if args.dry_run:

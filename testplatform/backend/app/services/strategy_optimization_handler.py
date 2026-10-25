@@ -54,7 +54,7 @@ from app.models import (
 from app.models.task_queue import TaskStatus
 from app.services.genetic import GeneticOptimizer, DEAP_AVAILABLE
 from app.services.task_queue import get_task_queue
-from app.services.strategy_param_space import collect_param_space, decode_params
+from app.services.strategy_param_space import collect_param_space, decode_params, market_profile_members
 from app.services.strategy_fitness import compute_fitness, ZERO_TRADE_SENTINEL
 from app.services.trial_memo import trial_key, TrialMemo
 from app.services.sync_client import push_optimization
@@ -1379,7 +1379,8 @@ def mode_anchor_index(strategy) -> Dict[str, Any]:
     return out
 
 
-def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]) -> Dict[str, Any]:
+def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any],
+                           market_members: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The genome AS A PHENOTYPE: an inactive threshold is replaced by its authored anchor.
 
     A leaf whose mode decoded to ``off`` is REMOVED from the tree, so its ``cond:<id>:value`` gene
@@ -1398,6 +1399,9 @@ def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]
     # goal2027 2.1: genes dead under the genome's sizing mode (identity when there is no sizing gene).
     from app.services.strategy_param_space import neutralise_sizing_genes
     decoded_flat = neutralise_sizing_genes(decoded_flat)
+    # goal2027 2.2: whatever belongs to an unselected market profile (identity without market:profile).
+    from app.services.strategy_param_space import neutralise_market_profile_genes
+    decoded_flat = neutralise_market_profile_genes(decoded_flat, market_members)
     if not anchors:
         return decoded_flat
     from app.services.strategy_param_space import mode_token
@@ -1697,6 +1701,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # template ONCE; ``{}`` for every strategy without mode genes, and then
         # ``canonical_trial_params`` is the identity function and the keys are today's.
         mode_anchors = mode_anchor_index(strategy)
+        market_members = market_profile_members(strategy)   # goal2027 2.2 (only read under market:profile)
 
         # --- DETERMINISM: seed both RNGs (Task 4 / determinism_rule) ---
         seed = int(ga["seed"])
@@ -1750,7 +1755,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "start": str(backtest_cfg.get("start_date")),
                     "end": str(backtest_cfg.get("end_date")),
                     "seed": backtest_cfg.get("seed"),
-                    "params": canonical_trial_params(mode_anchors, decoded_flat),
+                    "params": canonical_trial_params(mode_anchors, decoded_flat, market_members),
                 }
             )
             cached = memo.get(key)
@@ -1883,7 +1888,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "start": str(backtest_cfg.get("start_date")),
                     "end": str(backtest_cfg.get("end_date")),
                     "seed": backtest_cfg.get("seed"),
-                    "params": canonical_trial_params(mode_anchors, decoded_flat),
+                    "params": canonical_trial_params(mode_anchors, decoded_flat, market_members),
                 }
             )
 
