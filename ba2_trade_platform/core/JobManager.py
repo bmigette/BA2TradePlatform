@@ -1676,8 +1676,7 @@ class JobManager:
                    if job.trigger.get_next_fire_time(None, scheduled_for) == scheduled_for]
             # SESSION GUARD (fail closed): an entry / open-positions pass only runs while the
             # exchange is in a regular session at the fire instant. A skipped pass registers no
-            # ExpertRun and submits nothing, so a parked OPEN_POSITIONS pass cannot be waiting
-            # on it (defer_open_positions_if_entry_in_flight finds no entry task in flight).
+            # ExpertRun and submits nothing.
             due = self._apply_session_guard(due, scheduled_for)
             records = {}
             for job in due:
@@ -1757,27 +1756,11 @@ class JobManager:
                 logger.info(f"Special symbol '{symbol}' detected in scheduled analysis - queuing expansion task with batch_id={batch_id}")
                 try:
                     worker_queue = get_worker_queue()
-                    if symbol == "OPEN_POSITIONS" and worker_queue.defer_open_positions_if_entry_in_flight(
-                            expert_instance_id, batch_id):
-                        # ENTRY BEFORE MANAGE (see WorkerQueue.defer_open_positions_if_entry_in_flight):
-                        # the entry pass that fired this same minute runs first, exactly as the
-                        # backtest's _run_expert_bar precedes _manage_open_positions. The queue
-                        # releases this pass right after entry orders are processed; the one-shot
-                        # timer below is the safety net for an entry pass that dies before then,
-                        # so a parked exit pass can never be lost -- and release is idempotent, so
-                        # firing both is harmless.
-                        self._scheduler.add_job(
-                            func=self._release_parked_open_positions,
-                            trigger='date',
-                            run_date=now + timedelta(minutes=15),
-                            args=[expert_instance_id],
-                            id=f"parked_open_positions_{expert_instance_id}_{batch_id}",
-                            name=f"Safety release: parked OPEN_POSITIONS for expert {expert_instance_id}",
-                            replace_existing=True,
-                            max_instances=1,
-                            coalesce=True,
-                        )
-                        return
+                    # SAME-MINUTE ORDER (goal2027 2.4): MANAGE before ENTRY. The OPEN_POSITIONS pass
+                    # is NOT parked behind the entry pass any more (that parking, commit e5e37c6a, made
+                    # entry first). Both passes are analysed in parallel; ExpertPriority releases their
+                    # ORDER PROCESSING in ba2_common SAME_MINUTE_PASS_ORDER (open_positions, then
+                    # enter_market) once every analysis of the run has finished, and logs the order.
                     task_id = worker_queue.submit_instrument_expansion_task(
                         expert_instance_id=expert_instance_id,
                         expansion_type=symbol,

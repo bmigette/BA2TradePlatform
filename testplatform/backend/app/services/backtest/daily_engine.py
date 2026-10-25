@@ -51,7 +51,8 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 import numpy as np
 
 from ba2_common.core.ohlcv_history import resolve_job_history_source
-from ba2_common.core.schedule_genes import schedule_refusal_message, schedule_weekday_enabled
+from ba2_common.core.schedule_genes import (
+    order_same_minute_passes, schedule_refusal_message, schedule_weekday_enabled)
 from ba2_common.core.utils import as_utc_key
 from ba2_common.core.suspension_events import is_suspended
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
@@ -897,44 +898,48 @@ class DailyBacktestEngine:
                 if manage_ok:
                     analyzed_manage_days.add(_day_key)
                 book_dirty = True  # an analysis/management pass runs -> orders may be created
-                if getattr(expert, "bypasses_classic_rm", False):
-                    # Bypass experts rebalance on their ENTRY cadence only (FactorRanker
-                    # byte-identical). The manage-bar exit pass (manages_between_entries)
-                    # was deleted with its sole producer, PremiumSeller — 2026-08-31.
-                    if entry_ok:
+                # SAME-MINUTE PASS ORDER (goal2027 2.4): when the entry and the manage gate both
+                # fire on this bar, MANAGE runs BEFORE ENTRY so the exits free cash for the entries.
+                # The order is ba2_common SAME_MINUTE_PASS_ORDER, the same definition live's
+                # ExpertPriority reads (parity: tests/backtest/test_same_minute_pass_order_bt.py).
+                # Bypass experts rebalance on their ENTRY cadence only (FactorRanker byte-identical):
+                # the manage-bar exit pass (manages_between_entries) was deleted with its sole
+                # producer, PremiumSeller -- 2026-08-31 -- so they have no manage pass.
+                _bypass = getattr(expert, "bypasses_classic_rm", False)
+                _passes = []
+                if entry_ok:
+                    _passes.append(AnalysisUseCase.ENTER_MARKET.value)
+                if manage_ok and not _bypass:
+                    _passes.append(AnalysisUseCase.OPEN_POSITIONS.value)
+                for _pass in order_same_minute_passes(_passes):
+                    if _pass == AnalysisUseCase.OPEN_POSITIONS.value:
+                        # Manage EXISTING positions through the OPEN_POSITIONS ruleset (real
+                        # RM/evaluator) on the MANAGE cadence -- identical to live. Adjust-TP/SL/
+                        # Close/Sell per the exit conditions; no-op when the expert has no
+                        # open_positions ruleset configured.
+                        self._manage_open_positions(expert, expert_id, settings, as_of_dt)
+                    elif _bypass:
                         self._run_bypass_expert_bar(expert, expert_id, settings, as_of_dt)
-                    continue
-                if getattr(expert, "analyzes_as_basket", False):
-                    # Basket experts (e.g. FMPSenateTraderWeight/FMPSenateTraderCopy) call
-                    # analyze_as_of ONCE per bar for the whole universe, returning
-                    # List[Recommendation] instead of one Recommendation per symbol — but,
-                    # UNLIKE a bypass expert, they still go through the full classic pipeline
-                    # (TradeActionEvaluator/TradeConditions ruleset eval, one ExpertRecommendation
-                    # row per symbol, TradeRiskManagement sizing) per recommendation item. Run
-                    # only on entry bars (mirrors the classic per-symbol branch below). NO
-                    # `continue` here (unlike the bypass branch above): a basket expert's
-                    # OPEN_POSITIONS management is NOT folded into its entry pass the way a
-                    # bypass expert's rebalance-IS-the-management is — it must fall through to
-                    # the shared `if manage_ok: self._manage_open_positions(...)` below exactly
-                    # like the classic per-symbol branch does, or exit conditions (Adjust-TP/SL/
-                    # Close/Sell) would never evaluate for a basket expert on ANY bar.
-                    if entry_ok:
+                    elif getattr(expert, "analyzes_as_basket", False):
+                        # Basket experts (e.g. FMPSenateTraderWeight/FMPSenateTraderCopy) call
+                        # analyze_as_of ONCE per bar for the whole universe, returning
+                        # List[Recommendation] instead of one Recommendation per symbol, but,
+                        # UNLIKE a bypass expert, they still go through the full classic pipeline
+                        # (TradeActionEvaluator/TradeConditions ruleset eval, one ExpertRecommendation
+                        # row per symbol, TradeRiskManagement sizing) per recommendation item. A
+                        # basket expert's OPEN_POSITIONS management is NOT folded into its entry
+                        # pass: it is its own manage pass above, like the classic per-symbol branch,
+                        # or exit conditions (Adjust-TP/SL/Close/Sell) would never evaluate for it.
                         self._run_basket_expert_bar(
                             expert, expert_id, settings, ruleset_id, as_of_dt
                         )
-                elif entry_ok:
-                    # _run_expert_bar now self-sizes + submits equity entries via the temp-list flow
-                    # (_size_and_submit_candidates) — only funded orders are persisted + submitted, so
-                    # there is no separate _size_and_submit DB pass over qty=0 rows here anymore.
-                    self._run_expert_bar(
-                        expert, expert_id, settings, ruleset_id, entry_universe, as_of_dt
-                    )
-
-                # Manage EXISTING positions through the OPEN_POSITIONS ruleset (real RM/evaluator) on
-                # the MANAGE cadence — identical to live. Adjust-TP/SL/Close/Sell per the exit
-                # conditions; no-op when the expert has no open_positions ruleset configured.
-                if manage_ok:
-                    self._manage_open_positions(expert, expert_id, settings, as_of_dt)
+                    else:
+                        # _run_expert_bar self-sizes + submits equity entries via the temp-list flow
+                        # (_size_and_submit_candidates): only funded orders are persisted +
+                        # submitted, so there is no separate DB pass over qty=0 rows.
+                        self._run_expert_bar(
+                            expert, expert_id, settings, ruleset_id, entry_universe, as_of_dt
+                        )
 
             # The analysis/bypass passes above create orders via ba2_common's DB-backed RM/submit
             # path; reload the account's order cache so the fill engine sees them this bar.

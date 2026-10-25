@@ -8,7 +8,23 @@ from dataclasses import dataclass, field
 from threading import RLock
 from typing import Callable
 
+from ba2_common.core.schedule_genes import SAME_MINUTE_PASS_ORDER
+
 from ..logger import logger
+
+
+def _pass_name(case):
+    """``AnalysisUseCase`` (or its bare name/value, as unit tests pass) -> a SAME_MINUTE_PASS_ORDER value."""
+    return str(getattr(case, "value", case)).lower()
+
+
+def _pass_rank(case):
+    # Unknown use cases raise (no silent ordering of a pass the shared order does not know).
+    return SAME_MINUTE_PASS_ORDER.index(_pass_name(case))
+
+
+def _first_pass(ready):
+    return min(ready, key=_pass_rank)
 
 
 @dataclass
@@ -106,9 +122,16 @@ class ExpertPriority:
             if run.tasks:
                 continue
             if run.ready or not run.finalizing:
-                # Entry-before-manage, matching the existing live/backtest ordering.
+                # MANAGE-before-entry (goal2027 2.4): the shared SAME_MINUTE_PASS_ORDER, the same
+                # definition the backtest engine runs its per-bar passes in, so exits free cash for
+                # entries. ``run.ready`` only holds callbacks whose analyses have ALL finished.
                 if run.ready:
-                    use_case = min(run.ready, key=lambda case: str(case))
+                    use_case = _first_pass(run.ready)
+                    if len(run.ready) > 1:
+                        logger.info(
+                            "[ORDER] expert %s batch %s: same-minute pass order: %s",
+                            run.expert_id, run.batch_id,
+                            " -> ".join(_pass_name(c) for c in sorted(run.ready, key=_pass_rank)))
                     callback = run.ready.pop(use_case)
                 else:
                     run.finalizing = True

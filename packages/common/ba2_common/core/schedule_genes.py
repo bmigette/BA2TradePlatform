@@ -17,6 +17,28 @@ WEEKDAYS = SCHEDULE_DAYS[:5]
 #: (exchange-local). Decoded into the ``times`` of BOTH the entry and the manage schedule.
 SCHEDULE_TIME_GENE = "schedule:time"
 
+#: SPLIT decision-time genes (goal2027 2.4, opt-in via ``--decision-times split``): the ENTRY schedule's time and
+#: the MANAGE (open-positions) schedule's time searched independently. Mutually exclusive with
+#: ``SCHEDULE_TIME_GENE`` (which drives both).
+SCHEDULE_ENTRY_TIME_GENE = "schedule:entry_time"
+SCHEDULE_MANAGE_TIME_GENE = "schedule:manage_time"
+#: Every ``schedule:*`` key that is a TIME gene, never a weekday toggle.
+SCHEDULE_TIME_GENES = (SCHEDULE_TIME_GENE, SCHEDULE_ENTRY_TIME_GENE, SCHEDULE_MANAGE_TIME_GENE)
+
+#: THE SAME-MINUTE PASS ORDER (goal2027 2.4), one definition read by the backtest engine
+#: (``daily_engine``, per bar) and by live (``ExpertPriority``, per scheduled run): when an expert's
+#: open-positions (manage) pass and enter-market (entry) pass fire in the same minute, MANAGE runs first so
+#: its exits free cash for the entries. Values are ``AnalysisUseCase`` values.
+SAME_MINUTE_PASS_ORDER = ("open_positions", "enter_market")
+
+
+def order_same_minute_passes(passes: Sequence[str]) -> List[str]:
+    """``passes`` (a subset of ``SAME_MINUTE_PASS_ORDER``) sorted into that order; refuses an unknown pass."""
+    unknown = [p for p in passes if p not in SAME_MINUTE_PASS_ORDER]
+    if unknown:
+        raise ValueError(f"unknown pass {unknown!r}; expected a subset of {SAME_MINUTE_PASS_ORDER}")
+    return sorted(passes, key=SAME_MINUTE_PASS_ORDER.index)
+
 # Regular US session, minutes since midnight, exchange-local. Intraday bars are stamped at their
 # START, so with an N-minute interval the first bar is 09:30 and the last starts at 16:00 - N.
 _SESSION_OPEN_MIN = 9 * 60 + 30
