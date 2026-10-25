@@ -250,13 +250,17 @@ def test_grid_mode_accepts_parallel_and_workers(tmp_path):
             assert budget(job) == (24, 4, 4)
             D.verify_job(job)
     # The CLI passes them through in grid mode (it used to refuse --workers there).
-    argv = ["--families", "mid_ds", "--parallel", "4", "--workers", "remote227,remote150",
+    argv = ["--ohlcv-history-source", "fmp", "--families", "mid_ds", "--parallel", "4", "--workers", "remote227,remote150",
             "--dry-run", "--output-dir", str(tmp_path)]
     assert D.main(argv) == 0
     written = json.loads((tmp_path / "manifest.json").read_text())
-    assert written == P.build_manifest(families=["mid_ds"], parallel=4, workers=["remote227", "remote150"])
-    assert D.main(["--dry-run", "--output-dir", str(tmp_path / "default")]) == 0
-    assert P.fingerprint(json.loads((tmp_path / "default" / "manifest.json").read_text())) == DEFAULT_FINGERPRINT
+    assert written == P.build_manifest(families=["mid_ds"], parallel=4, workers=["remote227", "remote150"],
+                                       history_source="fmp")
+    assert D.main(["--ohlcv-history-source", "fmp", "--dry-run", "--output-dir", str(tmp_path / "default")]) == 0
+    # The CLI always states its source, so its default campaign is the STAMPED one; the legacy
+    # (unstamped) library default keeps the pinned DEFAULT_FINGERPRINT.
+    assert P.fingerprint(json.loads((tmp_path / "default" / "manifest.json").read_text())) == P.fingerprint(
+        P.build_manifest(history_source="fmp")) != DEFAULT_FINGERPRINT
 
 
 def test_grid_mode_parallel_0_still_needs_workers():
@@ -275,12 +279,12 @@ def test_cli_flags_default_to_not_passed():
 def test_cli_dry_run_prints_every_jobs_budget(tmp_path, capsys):
     # `--decision-times fixed`: the time gene is default ON for genetic jobs (it adds a gene and
     # changes the budget text); this test pins the gene-free budget arithmetic.
-    argv = ["--families", "pullback_rsi", "--search", "genetic", "--dry-run", "--output-dir", str(tmp_path),
+    argv = ["--ohlcv-history-source", "fmp", "--families", "pullback_rsi", "--search", "genetic", "--dry-run", "--output-dir", str(tmp_path),
             "--decision-times", "fixed"]
     assert D.main(argv) == 0
     out = capsys.readouterr().out
     written = json.loads((tmp_path / "manifest.json").read_text())
-    assert written == manifest(families=("pullback_rsi",))
+    assert written == manifest(families=("pullback_rsi",), history_source="fmp")
     assert out.count("budget: genes=3 population=24 generations=25 early_stop=5 min_gain=0.01") == 4
     assert out.count("budget: genes=4 population=24 generations=25 early_stop=5 min_gain=0.01") == 1
     assert D.main(argv + ["--generations", "40", "--early-stop", "10"]) == 0
@@ -291,10 +295,10 @@ def test_cli_dry_run_prints_every_jobs_budget(tmp_path, capsys):
     out = capsys.readouterr().out
     assert out.count(f"early_stop=5 min_gain=0.02 explicit={MIN_REL}") == 5
     assert json.loads((tmp_path / "manifest.json").read_text()) == manifest(
-        families=("pullback_rsi",), early_stop_min_rel=0.02)
+        families=("pullback_rsi",), early_stop_min_rel=0.02, history_source="fmp")
     assert D.main(argv + ["--early-stop-min-rel", "0"]) == 0
     assert "early_stop=5 min_gain=any" in capsys.readouterr().out
-    argv = ["--families", "mid_insider", "--search", "genetic", "--market-condition-profile", BOTH,
+    argv = ["--ohlcv-history-source", "fmp", "--families", "mid_insider", "--search", "genetic", "--market-condition-profile", BOTH,
             "--market-condition-manifest", ",".join(f"{p}={d}" for p, d in PINS.items()),
             "--market-exit", "exit,stop,tp", "--variants", "timeout", "--dry-run", "--output-dir", str(tmp_path),
             "--decision-times", "fixed"]
@@ -308,11 +312,11 @@ def test_cli_dry_run_prints_every_jobs_budget(tmp_path, capsys):
 
 
 def test_cli_refuses_an_early_stop_above_the_generations(tmp_path, capsys):
-    argv = ["--families", "pullback_rsi", "--search", "genetic", "--generations", "10", "--early-stop", "11",
+    argv = ["--ohlcv-history-source", "fmp", "--families", "pullback_rsi", "--search", "genetic", "--generations", "10", "--early-stop", "11",
             "--dry-run", "--output-dir", str(tmp_path)]
     assert D.main(argv) == 1
     assert "Early stop must be between 1 and the generations" in capsys.readouterr().err
-    assert D.main(["--families", "mid_ds", "--early-stop", "8", "--dry-run", "--output-dir", str(tmp_path)]) == 1
+    assert D.main(["--ohlcv-history-source", "fmp", "--families", "mid_ds", "--early-stop", "8", "--dry-run", "--output-dir", str(tmp_path)]) == 1
     assert "--early-stop applies to --search genetic only" in capsys.readouterr().err
 
 
@@ -320,7 +324,8 @@ def test_the_launch_line_prints_the_budget(tmp_path, monkeypatch, capsys):
     jobs = manifest(families=("pullback_rsi",))["jobs"][:1]
     monkeypatch.setattr(D, "check_database", lambda path: tmp_path / "db.sqlite")
     monkeypatch.setattr(D.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
-    args = SimpleNamespace(cache_dir=tmp_path, resume=False, db_file=tmp_path / "db.sqlite")
+    args = SimpleNamespace(cache_dir=tmp_path, resume=False, db_file=tmp_path / "db.sqlite",
+                           ohlcv_history_source="fmp")
     assert D.run_jobs(jobs, tmp_path, args) == 0
     out = capsys.readouterr().out
     assert (f"[1/1] {jobs[0]['name']}\n  budget: genes=3 population=24 generations=25 early_stop=5 "

@@ -206,7 +206,7 @@ def test_cli_dry_run_selects_the_extension(monkeypatch, tmp_path, capsys):
         pytest.fail("Preview attempted execution or DB access")
     monkeypatch.setattr(sqlite3, "connect", forbidden)
     monkeypatch.setattr(D.subprocess, "run", forbidden)
-    assert D.main(["--families", "pullback_rsi", "--dry-run", "--output-dir", str(tmp_path)]) == 0
+    assert D.main(["--ohlcv-history-source", "fmp", "--families", "pullback_rsi", "--dry-run", "--output-dir", str(tmp_path)]) == 0
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert [j["variant"] for j in manifest["jobs"]] == list(jobs())
     assert "5 jobs" in capsys.readouterr().out
@@ -235,6 +235,8 @@ def test_the_short_jobs_open_shorts_and_nothing_refuses_them():
 
 
 def test_preflight_accepts_the_short_jobs(monkeypatch, tmp_path):
+    tmp_path = tmp_path / "FMPOHLCVProvider"
+    tmp_path.mkdir()
     _cache(tmp_path, ["AAA"])
     _cache(tmp_path, ["SPY"], intervals=("1d",))
     for variant in ("short_sma5", "short_spy"):
@@ -251,7 +253,7 @@ def test_cli_runs_a_selection_with_short_jobs_in_order(monkeypatch, tmp_path, mo
                         or {**job, "preflight": {"symbols": 1}})
     monkeypatch.setattr(D, "run_jobs", lambda selected, output, args: started.extend(
         j["variant"] for j in selected) or 0)
-    argv = ["--families", "pullback_rsi", "--variants", "long_sma5", "short_spy", "short_sma5",
+    argv = ["--ohlcv-history-source", "fmp", "--families", "pullback_rsi", "--variants", "long_sma5", "short_spy", "short_sma5",
             mode, "--output-dir", str(tmp_path)]
     assert D.main(argv) == 0
     # The manifest's own order (the order jobs() lists them), every selected job, shorts included.
@@ -332,6 +334,8 @@ def test_preflight_never_imports_the_backend_database_module(tmp_path):
     """app.models.database binds its engine to DATABASE_URL at import. A preflight importing it
     (the old registry lookup did) before execute_ready applies --db-file sent every family's
     rows to the default test DB. A fresh interpreter, so this module's imports cannot mask it."""
+    tmp_path = tmp_path / "FMPOHLCVProvider"
+    tmp_path.mkdir()
     import subprocess
     env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
     done = subprocess.run([sys.executable, "-c", _NO_BACKEND_SCRIPT, str(ROOT), str(tmp_path)],
@@ -363,7 +367,7 @@ def test_run_child_binds_the_db_file_before_preflight(monkeypatch, tmp_path):
     with mock.patch.dict(os.environ):
         os.environ.pop("DATABASE_URL", None)  # so the captured value can only be run_child's
         os.environ.pop("CACHE_FOLDER", None)
-        assert D.main(["--job-file", str(job_file), "--db-file", str(database),
+        assert D.main(["--ohlcv-history-source", "fmp", "--job-file", str(job_file), "--db-file", str(database),
                        "--cache-dir", str(tmp_path / "FMPOHLCVProvider")]) == 1
     assert dict(os.environ) == before
     assert seen["url"] == R.database_url(database) == "sqlite:///" + database.as_posix()
@@ -371,6 +375,8 @@ def test_run_child_binds_the_db_file_before_preflight(monkeypatch, tmp_path):
 
 
 def test_preflight_requires_spy_daily_for_pullback_rsi_only(monkeypatch, tmp_path):
+    tmp_path = tmp_path / "FMPOHLCVProvider"
+    tmp_path.mkdir()
     job = _screen_one(monkeypatch, tmp_path, jobs()["long_sma5"])
     _cache(tmp_path, ["AAA"])
     with pytest.raises(ValueError, match="SPY_1d.parquet"):
@@ -396,6 +402,8 @@ def test_preflight_requires_spy_daily_for_pullback_rsi_only(monkeypatch, tmp_pat
     ("2018-01-01", "2025-12-24", None),
 ])
 def test_preflight_bounds_the_spy_history(monkeypatch, tmp_path, first, last, error):
+    tmp_path = tmp_path / "FMPOHLCVProvider"
+    tmp_path.mkdir()
     job = _screen_one(monkeypatch, tmp_path, jobs()["long_rsi"])
     _cache(tmp_path, ["AAA"])
     _cache(tmp_path, ["SPY"], intervals=("1d",), first=first, last=last)

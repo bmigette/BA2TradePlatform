@@ -74,6 +74,27 @@ def check_database(path):
     return path
 
 
+def certify_history_cache(source, cache_dir):
+    """An ``alpaca`` cache must carry the PASS gate certificate of its current build (the engine's own
+    check, ``verify_alpaca_cache_certified``; raises ``AlpacaCacheNotCertified``). ``fmp`` has none."""
+    if source != "alpaca":
+        return None
+    add_source_paths()
+    from app.services.backtest.history_source import verify_alpaca_cache_certified
+    return verify_alpaca_cache_certified(str(cache_dir))
+
+
+def require_history_folder(source, cache_dir):
+    """``cache_dir`` must be ``source``'s provider folder (its bars are what the engine reads)."""
+    add_source_paths()
+    from ba2_common.core.ohlcv_history import history_cache_dirname
+    wanted = history_cache_dirname(source)
+    if Path(cache_dir).name != wanted:
+        raise ValueError(f"--cache-dir {cache_dir} is not the {wanted} folder that --ohlcv-history-source "
+                         f"{source} reads: the engine reads CACHE_FOLDER/{wanted}")
+    return Path(cache_dir)
+
+
 def code_signature():
     files = []
     for directory in ("packages", "testplatform/backend/app/services", "tools/strategy_research"):
@@ -94,6 +115,9 @@ def resolve_universe(bt):
         store = Path(bt["screener_opt"]["store"])
         if not store.is_dir():
             raise ValueError(f"Missing screener store: {store}")
+        from ba2_common.core.ohlcv_history import resolve_job_history_source
+        from ba2_providers.screener.metric_store import require_store_history_source
+        require_store_history_source(str(store), resolve_job_history_source(bt))  # never the other history's store
         frame = load_store(str(store))
         if frame.empty:
             raise ValueError("Screener metric store is empty")
@@ -174,9 +198,13 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
     ready = deepcopy(job)
     bt = ready["optimization_config"]["backtest"]
     cache_dir = Path(cache_dir).resolve()
+    from ba2_common.core.ohlcv_history import resolve_job_history_source
+    source = resolve_job_history_source(bt)
+    require_history_folder(source, cache_dir)
     start, end = date.fromisoformat(bt["start_date"]), date.fromisoformat(bt["end_date"])
     if not cache_dir.is_dir():
         raise ValueError(f"Missing OHLCV directory: {cache_dir}")
+    certify_history_cache(source, cache_dir)
     symbols, store_files = resolve_universe(bt)
     intervals = tuple(dict.fromkeys(("1d", bt["execution_interval"])))
     files = [cache_dir / f"{symbol}_{interval}.parquet" for symbol in symbols for interval in intervals]

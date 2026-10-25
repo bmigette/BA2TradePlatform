@@ -21,11 +21,12 @@ from tools.strategy_research.exploration.market_conditions import refuse_inert_m
 from tools.strategy_research.exploration.profiles import (
     ALL_FAMILIES, EXTENSION_FAMILIES, FAMILIES, budget_text, build_manifest, fingerprint)
 from tools.strategy_research.exploration.runtime import (
-    check_database, database_url, execute_ready, job_lock, preflight,
+    add_source_paths, check_database, database_url, execute_ready, job_lock, preflight,
     resolve_universe, write_json)
 
 
 def parser():
+    add_source_paths()
     ap = argparse.ArgumentParser(description=__doc__)
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="Offline manifest only (the default).")
@@ -85,12 +86,33 @@ def parser():
     ap.add_argument("--etf-symbols", nargs="+", help="Fixed ETF research universe; default SPY IEF TLT GLD.")
     data_home = Path(os.environ["BA2_HOME"]).expanduser() if "BA2_HOME" in os.environ else Path.home() / "Documents/ba2"
     ap.add_argument("--db-file", type=Path, default=data_home / "test/dl_forecasting.db")
-    ap.add_argument("--cache-dir", type=Path, default=data_home / "common/cache/FMPOHLCVProvider")
+    from ba2_common.core.ohlcv_history import DEFAULT_BT_HISTORY_SOURCE, HISTORY_SOURCES
+    ap.add_argument("--ohlcv-history-source", choices=sorted(HISTORY_SOURCES), default=DEFAULT_BT_HISTORY_SOURCE,
+                    help=f"OHLCV history of every job (default {DEFAULT_BT_HISTORY_SOURCE}): stamped as "
+                         "ohlcv_history_source on each job's optimization_config, part of its fingerprint and "
+                         "name, and it selects the cache folder and the default metric store. alpaca needs a "
+                         "PASS gate certificate on the cache and an explicit --store; fmp keeps the FMP-era snapshot store.")
+    ap.add_argument("--cache-dir", type=Path, default=None,
+                    help="The source's provider folder. Default <BA2_HOME>/common/cache/<FMPOHLCVProvider | "
+                         "AlpacaHistoryOHLCVProvider>; a folder of the other source is refused.")
     ap.add_argument("--output-dir", type=Path, help="Default: reports/strategy_research/<campaign hash>/.")
     ap.add_argument("--resume", action="store_true", help="Resume an interrupted job after its previous runner has stopped.")
     ap.add_argument("--job-file", type=Path, help=argparse.SUPPRESS)
     return ap
 
+
+def resolve_cache_dir(args):
+    """``--cache-dir`` (default derived from the source), refused unless it is the source's folder."""
+    add_source_paths()
+    from ba2_common.core.ohlcv_history import history_cache_dirname
+    wanted = history_cache_dirname(args.ohlcv_history_source)
+    if args.cache_dir is None:
+        home = Path(os.environ["BA2_HOME"]).expanduser() if "BA2_HOME" in os.environ else Path.home() / "Documents/ba2"
+        return home / "common/cache" / wanted
+    if args.cache_dir.name != wanted:
+        raise ValueError(f"--cache-dir {args.cache_dir} is not the {wanted} folder that --ohlcv-history-source "
+                         f"{args.ohlcv_history_source} reads")
+    return args.cache_dir
 
 def verify_job(job):
     unsigned = {k: v for k, v in job.items() if k != "fingerprint"}
@@ -100,6 +122,7 @@ def verify_job(job):
 
 def run_child(args):
     # Bind the engine to the same central cache checked below, before backend imports.
+    args.cache_dir = resolve_cache_dir(args)
     os.environ["CACHE_FOLDER"] = str(args.cache_dir.resolve().parent)
     path = args.job_file.resolve()
     job = json.loads(path.read_text(encoding="utf-8"))
@@ -127,7 +150,8 @@ def run_jobs(jobs, output, args):
         write_json(job_path, job)
         log_path = output / (job["name"] + ".log")
         command = [sys.executable, str(Path(__file__).resolve()), "--job-file", str(job_path),
-                   "--db-file", str(database), "--cache-dir", str(args.cache_dir.resolve())]
+                   "--db-file", str(database), "--cache-dir", str(args.cache_dir.resolve()),
+                   "--ohlcv-history-source", args.ohlcv_history_source]
         if args.resume:
             command.append("--resume")
         budget = f"\n  {budget_text(job)}" if budget_text(job) else ""
@@ -143,6 +167,7 @@ def run_jobs(jobs, output, args):
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
+        args.cache_dir = resolve_cache_dir(args)
         if args.job_file is not None:
             return run_child(args)
         from ba2_common.core.schedule_genes import parse_decision_times_arg
@@ -160,7 +185,8 @@ def main(argv=None):
             market_condition_mode=args.market_condition_mode,
             market_exit=tuple(s.strip() for s in args.market_exit.split(",") if s.strip()),
             allow_sl_loosen=args.allow_sl_loosen,
-            decision_times=decision_times)
+            decision_times=decision_times, history_source=args.ohlcv_history_source)
+        print(f"OHLCV history source: {args.ohlcv_history_source} (cache {args.cache_dir})")
         print("decision times (GA gene schedule:time, genetic jobs that search): "
               + (",".join(decision_times) if decision_times
                  else "fixed (per-family schedule time; --decision-times fixed)"))

@@ -26,6 +26,17 @@ EXTENSION_FAMILIES = ("pullback_rsi",)
 ALL_FAMILIES = FAMILIES + EXTENSION_FAMILIES
 SNAPSHOT = Path(__file__).with_name("baselines_20260907.json")
 SCHEMA_VERSION = 1
+LEGACY_HISTORY_SOURCE = "fmp"  # == ba2_common.core.ohlcv_history.LEGACY_HISTORY_SOURCE (no import at module load)
+
+
+def with_history_source_name(name, source):
+    """``name`` plus the shared history-source token for a non-fmp source (idempotent)."""
+    import sys
+    tools = str(Path(__file__).resolve().parents[2])
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    from matrix_flags import with_history_source_name as shared
+    return shared(name, source)
 
 #: Grid mode's budget, written unchanged (the default manifest's fingerprint is pinned). The
 #: exhaustive grid handler ignores it.
@@ -433,8 +444,17 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
                    workers=(), save_top=5, store=None, spread_bps=None, etf_symbols=None,
                    market_condition_profile="none", market_condition_manifest=None,
                    market_condition_mode="search", market_exit=(), allow_sl_loosen=False,
-                   decision_times=None):
-    """Build a portable manifest. No data access; --preflight resolves the actual universe.
+                   decision_times=None, history_source=None):
+    """Build a portable manifest.
+
+    ``history_source`` (fmp|alpaca) is stamped as ``ohlcv_history_source`` into every job's
+    ``optimization_config["backtest"]`` (the key the engine's ``resolve_job_history_source`` reads),
+    so it is part of the job fingerprint, the name digest and (unless fmp) the name token. The
+    LIBRARY default ``None`` writes NO stamp (the legacy, pre-stamp manifests keep their pinned
+    fingerprints; the engine reads such a config as fmp); the CLI (``run_exploration.py``) always
+    states a source and defaults to ``DEFAULT_BT_HISTORY_SOURCE`` (alpaca). An alpaca campaign
+    never takes the FMP-era snapshot metric store: a job with a screener needs ``store`` explicitly.
+ No data access; --preflight resolves the actual universe.
 
     ``market_exit`` (kinds from exit/stop/tp) appends the off-by-default market exit templates to
     every job's exit rules; ``allow_sl_loosen`` sets the expert setting
@@ -478,6 +498,9 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
         if (not etf_symbols or len(set(etf_symbols)) != len(etf_symbols)
                 or any(not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", s) for s in etf_symbols)):
             raise ValueError("ETF symbols must be distinct uppercase ticker symbols")
+    from ba2_common.core.ohlcv_history import check_history_source
+    if history_source is not None:
+        history_source = check_history_source(history_source)
     baselines = load_baselines()
     jobs = []
     for family in families:
@@ -491,6 +514,12 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
             if effective_start > end:
                 raise ValueError(f"{family}: no supported dates before {end}")
             bt.update(start_date=effective_start, end_date=end, initial_capital=equity, seed=seed)
+            if history_source is not None:
+                bt["ohlcv_history_source"] = history_source
+            if history_source not in (None, LEGACY_HISTORY_SOURCE) and store is None and "screener_opt" in bt:
+                raise ValueError(f"{family}: the snapshot's metric store was built from FMP history; an "
+                                 f"{history_source} campaign needs --store naming a store built from "
+                                 f"{history_source} (e.g. <cache>/screener/metric_store_alpaca_20261022)")
             bt["account_settings"].update(starting_cash=equity, equity_cap=equity_cap)
             if spread_bps is not None:
                 bt["account_settings"]["spread_bps"] = spread_bps
@@ -500,7 +529,8 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
             settings = bt["experts"][0]["settings"]
             settings["execution_schedule_enter_market"] = deepcopy(bt["run_schedule_override"])
             settings["execution_schedule_open_positions"] = deepcopy(bt["manage_schedule_override"])
-            attach(job, bt, profiles, pins, market_condition_mode)
+            attach(job, bt, profiles, pins, market_condition_mode,
+                   history_source=history_source or LEGACY_HISTORY_SOURCE)
             attach_exits(job, bt, profiles, market_exit)
             if allow_sl_loosen:
                 for expert in bt["experts"]:
@@ -559,6 +589,8 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
             if allow_sl_loosen:
                 options += "-slloosen"
             job["name"] = f"research10-{family}-{job['variant']}{options}-eq{equity:g}-{digest}"
+            if history_source is not None:
+                job["name"] = with_history_source_name(job["name"], history_source)
             bt["name"] = job["name"]
             bt["labels"] = ["research10", "goal2020-followup", family, job["variant"], f"equity-{equity:g}"]
             if market_exit:

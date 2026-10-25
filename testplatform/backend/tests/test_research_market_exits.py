@@ -448,7 +448,7 @@ def test_cli_dry_run_with_both_flags(monkeypatch, tmp_path, capsys):
         pytest.fail("Preview attempted execution or DB access")
     monkeypatch.setattr(sqlite3, "connect", forbidden)
     monkeypatch.setattr(D.subprocess, "run", forbidden)
-    argv = ["--families", "pullback_rsi", "mid_ds", "--search", "genetic",
+    argv = ["--ohlcv-history-source", "fmp", "--families", "pullback_rsi", "mid_ds", "--search", "genetic",
             "--market-condition-profile", BOTH,
             "--market-condition-manifest", ",".join(f"{p}={d}" for p, d in PINS.items()),
             "--market-exit", "tp, exit,stop", "--allow-sl-loosen", "--dry-run", "--output-dir", str(tmp_path),
@@ -456,16 +456,17 @@ def test_cli_dry_run_with_both_flags(monkeypatch, tmp_path, capsys):
     assert D.main(argv) == 0
     out = capsys.readouterr().out
     written = json.loads((tmp_path / "manifest.json").read_text())
-    assert written == manifest(families=("pullback_rsi", "mid_ds"), market_exit=KINDS, allow_sl_loosen=True)
+    assert written == manifest(families=("pullback_rsi", "mid_ds"), market_exit=KINDS, allow_sl_loosen=True,
+                         history_source="fmp")
     assert "Market exits: exit,stop,tp; ruleset SL loosen: on" in out
     assert out.count("market_exit=exit,stop,tp direction=") == len(written["jobs"])
     assert "direction=short" in out and "direction=long" in out
 
 
 def test_cli_prints_both_off_and_refuses_a_bad_selection(monkeypatch, tmp_path, capsys):
-    assert D.main(["--families", "mid_ds", "--dry-run", "--output-dir", str(tmp_path)]) == 0
+    assert D.main(["--ohlcv-history-source", "fmp", "--families", "mid_ds", "--dry-run", "--output-dir", str(tmp_path)]) == 0
     assert "Market exits: none; ruleset SL loosen: off" in capsys.readouterr().out
-    assert D.main(["--families", "mid_ds", "--market-exit", "exit", "--dry-run",
+    assert D.main(["--ohlcv-history-source", "fmp", "--families", "mid_ds", "--market-exit", "exit", "--dry-run",
                    "--output-dir", str(tmp_path)]) == 1
     assert "requires --market-condition-profile" in capsys.readouterr().err
     assert D.parser().parse_args([]).market_exit == "" and not D.parser().parse_args([]).allow_sl_loosen
@@ -501,6 +502,8 @@ print("BACKEND:", loaded)
 
 def test_building_and_preflighting_with_the_flags_never_imports_the_backend(tmp_path):
     """A fresh interpreter, so this module's own app imports cannot mask one."""
+    tmp_path = tmp_path / "FMPOHLCVProvider"
+    tmp_path.mkdir()
     env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
     done = subprocess.run([sys.executable, "-c", _NO_BACKEND_SCRIPT, str(ROOT), str(tmp_path)],
                           cwd=ROOT, env=env, capture_output=True, text=True, timeout=600)
@@ -573,7 +576,7 @@ def test_stop_only_is_refused_when_every_job_omits_it(monkeypatch, tmp_path, cap
     assert jobs[("mid_insider", "control")]["optimization_config"]["backtest"]["market_exit"]["rules"] == []
     assert jobs[("mid_ds", "control")]["optimization_config"]["backtest"]["market_exit"]["rules"]
     # --variants can leave only omitting jobs: refused after the selection too.
-    argv = ["--families", "mid_insider", "mid_ds", "--search", "genetic",
+    argv = ["--ohlcv-history-source", "fmp", "--families", "mid_insider", "mid_ds", "--search", "genetic",
             "--market-condition-profile", "ta-structure-v1", "--market-condition-manifest", PINS["ta-structure-v1"],
             "--market-exit", "stop", "--dry-run", "--output-dir", str(tmp_path)]
     assert D.main(argv + ["--variants", "signal_freshness"]) == 1
