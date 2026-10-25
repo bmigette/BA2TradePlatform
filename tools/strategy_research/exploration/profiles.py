@@ -14,6 +14,7 @@ import json
 import math
 from pathlib import Path
 import re
+import sys
 from types import SimpleNamespace
 
 DEPLOYED_FAMILIES = ("large_ds", "mid_insider", "small_earnings", "mid_ds",
@@ -29,14 +30,10 @@ SCHEMA_VERSION = 1
 LEGACY_HISTORY_SOURCE = "fmp"  # == ba2_common.core.ohlcv_history.LEGACY_HISTORY_SOURCE (no import at module load)
 
 
-def with_history_source_name(name, source):
-    """``name`` plus the shared history-source token for a non-fmp source (idempotent)."""
-    import sys
-    tools = str(Path(__file__).resolve().parents[2])
-    if tools not in sys.path:
-        sys.path.insert(0, tools)
-    from matrix_flags import with_history_source_name as shared
-    return shared(name, source)
+_TOOLS_DIR = str(Path(__file__).resolve().parents[2])
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+from matrix_flags import with_history_source_name  # noqa: E402  (the shared token rule, tools/matrix_flags.py)
 
 #: Grid mode's budget, written unchanged (the default manifest's fingerprint is pinned). The
 #: exhaustive grid handler ignores it.
@@ -454,7 +451,8 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
     fingerprints; the engine reads such a config as fmp); the CLI (``run_exploration.py``) always
     states a source and defaults to ``DEFAULT_BT_HISTORY_SOURCE`` (alpaca). An alpaca campaign
     never takes the FMP-era snapshot metric store: a job with a screener needs ``store`` explicitly.
- No data access; --preflight resolves the actual universe.
+
+    No data access; --preflight resolves the actual universe.
 
     ``market_exit`` (kinds from exit/stop/tp) appends the off-by-default market exit templates to
     every job's exit rules; ``allow_sl_loosen`` sets the expert setting

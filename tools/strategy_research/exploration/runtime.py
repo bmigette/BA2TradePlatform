@@ -89,7 +89,7 @@ def require_history_folder(source, cache_dir):
     add_source_paths()
     from ba2_common.core.ohlcv_history import history_cache_dirname
     wanted = history_cache_dirname(source)
-    if Path(cache_dir).name != wanted:
+    if Path(cache_dir).name.casefold() != wanted.casefold():
         raise ValueError(f"--cache-dir {cache_dir} is not the {wanted} folder that --ohlcv-history-source "
                          f"{source} reads: the engine reads CACHE_FOLDER/{wanted}")
     return Path(cache_dir)
@@ -204,7 +204,7 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
     start, end = date.fromisoformat(bt["start_date"]), date.fromisoformat(bt["end_date"])
     if not cache_dir.is_dir():
         raise ValueError(f"Missing OHLCV directory: {cache_dir}")
-    certify_history_cache(source, cache_dir)
+    certificate = certify_history_cache(source, cache_dir)
     symbols, store_files = resolve_universe(bt)
     intervals = tuple(dict.fromkeys(("1d", bt["execution_interval"])))
     files = [cache_dir / f"{symbol}_{interval}.parquet" for symbol in symbols for interval in intervals]
@@ -270,6 +270,11 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
                 "code_signature": code_signature(),
                 "cache_signature": fingerprint([(str(p), p.stat().st_size, p.stat().st_mtime_ns)
                                                  for p in sorted(files + store_files)])}
+    evidence["ohlcv_history_source"] = source
+    if certificate is not None:  # alpaca only: the exact gate certificate this run was prepared under
+        import hashlib
+        evidence["gate_certificate_sha256"] = hashlib.sha256(
+            (cache_dir / "_meta" / "gate_certificate.json").read_bytes()).hexdigest()
     if reference_coverage:  # absent for every default family: their evidence is unchanged
         evidence["reference_coverage"] = reference_coverage
     from tools.strategy_research.exploration.market_conditions import preflight as condition_preflight

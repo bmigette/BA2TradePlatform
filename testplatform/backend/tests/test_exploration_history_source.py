@@ -141,3 +141,18 @@ def test_market_condition_provenance_uses_the_source_profile():
         bt = {"experts": [{"settings": {}}]}
         MC.attach(job, bt, ("ohlcv-v1",), pins, "search", history_source=source)
         assert bt["market_condition"]["source_profile"] == source_profile_for_history(source)
+
+
+def test_folder_name_check_ignores_case_and_prepared_job_records_source_and_certificate(monkeypatch, tmp_path):
+    import hashlib
+    folder = tmp_path / "alpacahistoryohlcvprovider"
+    (folder / "_meta").mkdir(parents=True)
+    cert = folder / "_meta" / "gate_certificate.json"
+    cert.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(R, "certify_history_cache", lambda s, d: {"status": "PASS"})
+    monkeypatch.setattr(R, "code_signature", lambda: "v")
+    _write(folder, "AAA")
+    _write(folder, "SPY")
+    ready = R.preflight(jobs("alpaca", etf_symbols=["AAA"])[0], folder)
+    assert ready["preflight"]["ohlcv_history_source"] == "alpaca"
+    assert ready["preflight"]["gate_certificate_sha256"] == hashlib.sha256(cert.read_bytes()).hexdigest()

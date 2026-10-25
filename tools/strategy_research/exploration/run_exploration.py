@@ -109,7 +109,7 @@ def resolve_cache_dir(args):
     if args.cache_dir is None:
         home = Path(os.environ["BA2_HOME"]).expanduser() if "BA2_HOME" in os.environ else Path.home() / "Documents/ba2"
         return home / "common/cache" / wanted
-    if args.cache_dir.name != wanted:
+    if args.cache_dir.name.casefold() != wanted.casefold():
         raise ValueError(f"--cache-dir {args.cache_dir} is not the {wanted} folder that --ohlcv-history-source "
                          f"{args.ohlcv_history_source} reads")
     return args.cache_dir

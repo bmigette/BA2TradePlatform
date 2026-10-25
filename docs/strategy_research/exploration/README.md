@@ -147,7 +147,7 @@ Alpaca campaign never share an output directory, a stored optimization or a resu
   refused for `alpaca` (the store's build manifest must carry the job's source). The store of record is
   `<cache root>/screener/metric_store_alpaca_20261022`. `fmp` keeps the snapshot store as its default.
 - Market-condition snapshots must have been warmed for the same source (the job's `source_profile` follows it).
-- `warm_etf_cache.py` still warms the FMP folder only: on Alpaca the ETFs come from the Alpaca history build.
+- `warm_etf_cache.py` only warms the FMP folder and cannot extend the Alpaca build: new ETF dates come from the Alpaca pipeline (`tools/prepare_history.py`).
 
 The controls and tweaks of one campaign are compared with each other on the same history, so the change is
 internally consistent. Results are **not comparable** with any earlier FMP-history exploration output.
