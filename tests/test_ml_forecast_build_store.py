@@ -230,3 +230,23 @@ def test_single_writer_lock(cache):
         bs.build(CARD, data, [date(2024, 1, 2)], TimesFM3Adapter(CARD, Spy()), cache,
                  guard=lambda: (_ for _ in ()).throw(MemoryError("x")))
     assert not (kdir / ".lock").exists()
+
+
+def test_gap_in_context_is_a_counted_skip_with_its_own_reason(cache):
+    p = cache / bs.OHLCV_DIRNAME / "GAP_1d.parquet"
+    dates, close = make_bars(700)
+    keep = np.ones(700, bool)
+    keep[380:420] = False
+    pd.DataFrame({"Date": dates[keep], "Close": close[keep]}).to_parquet(p)
+    data, _ = bs.load_daily_closes(cache, ["GAP"])
+    s = pd.Timestamp(dates[keep][600]).date()
+    st = bs.build(CARD, data, [s], TimesFM3Adapter(CARD, Spy()), cache)
+    assert st.skipped_gap == 1 and st.forecasts == 0 and st.skipped_short_history == 0
+
+
+def test_build_params_record_history_provenance(cache):
+    (cache / bs.OHLCV_DIRNAME / "_meta").mkdir()
+    (cache / bs.OHLCV_DIRNAME / "_meta" / "build_manifest.json").write_text('{"built_at": "t"}')
+    bp = bs.make_build_params({"card_id": "timesfm3-ctx512"}, cache)
+    assert bp["history_source"] == "alpaca_build" and len(bp["build_manifest_sha256"]) == 64
+    assert bp["context_function_version"] == "1" and bp["card_id"] == "timesfm3-ctx512"

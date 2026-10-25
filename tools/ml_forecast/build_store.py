@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from ba2_common.core.ml_forecast import store  # noqa: E402
+from ba2_common.core.ml_forecast import context as ctxmod, store  # noqa: E402
 from ba2_common.core.ml_forecast.forecast_row import ForecastRow  # noqa: E402
 from ba2_common.core.ml_forecast.model_card import model_key  # noqa: E402
 from tools.ml_forecast.adapters.timesfm3 import (CARD_IDS, InputDataError, TimesFM3Adapter, load_timesfm3_predict_fn,  # noqa: E402
@@ -46,6 +46,7 @@ class BuildStats:
     forecasts: int = 0
     skipped_short_history: int = 0
     skipped_no_bar: int = 0
+    skipped_gap: int = 0
     skipped_resume: int = 0
     invalid_forecasts: int = 0
     sessions: int = 0
@@ -70,22 +71,15 @@ def parse_symbols(text: str) -> List[str]:
     return out
 
 
-def load_daily_closes(cache_root: Path, symbols: Sequence[str]) -> Tuple[SymbolData, List[str]]:
+def load_daily_closes(cache_root: Path, symbols: Sequence[str], source: str = "alpaca_build"
+                      ) -> Tuple[SymbolData, List[str]]:
     data: SymbolData = {}
     missing: List[str] = []
     for s in symbols:
-        p = Path(cache_root) / OHLCV_DIRNAME / f"{s}_1d.parquet"
-        if not p.exists():
+        if not (Path(cache_root) / ctxmod.SOURCE_DIRS[source] / f"{s}_1d.parquet").exists():
             missing.append(s)
             continue
-        df = pd.read_parquet(p, columns=["Date", "Close"])
-        d = pd.to_datetime(df["Date"]).to_numpy().astype("datetime64[D]")
-        c = df["Close"].to_numpy(dtype=np.float64)
-        order = np.argsort(d, kind="stable")
-        d, c = d[order], c[order]
-        if len(np.unique(d)) != len(d):
-            raise ValueError(f"{s}: duplicate dates in {p}")
-        data[s] = (d, c)
+        data[s] = ctxmod.load_daily_series(cache_root, s, source)
     return data, missing
 
 
@@ -107,18 +101,7 @@ def session_calendar(data: SymbolData, start: date, end: date, mode: str) -> Lis
     return sorted(last.values())
 
 
-def context_for(dates: np.ndarray, closes: np.ndarray, session: date, n: int):
-    """The last ``n`` closes with Date <= session whose last bar IS the session; None if not available.
-    Returns (None, reason) or (array, None). Never reads a bar after the session (asserted)."""
-    s64 = np.datetime64(session, "D")
-    idx = int(np.searchsorted(dates, s64, side="right"))      # bars [0, idx) have Date <= session
-    if idx == 0 or dates[idx - 1] != s64:
-        return None, "no_bar"
-    if idx < n:
-        return None, "short"
-    ctx = closes[idx - n:idx]
-    assert dates[idx - 1] == s64 and dates[idx - n:idx].max() <= s64, "point-in-time violation"
-    return ctx, None
+context_for = ctxmod.context_for      # the ONE shared slicing function (live uses it too)
 
 
 def existing_sessions(cache_root: Path, key: str, symbol: str) -> set:
@@ -167,6 +150,12 @@ def check_existing_store(card, covariate_set, cache_root: Path, key: str) -> Non
         return                                    # a new store
     if meta["card"] != card.to_dict() or sorted(meta["covariate_set"]) != sorted(covariate_set):
         raise store.ForecastStoreCardMismatch(f"store {key} holds a different model card or covariate set")
+
+
+def make_build_params(params: dict, cache_root: Path) -> dict:
+    """Build params recorded in meta.json: the run's arguments plus the history provenance (source name, build
+    manifest sha256, context-function version) that the live expert must match."""
+    return {**params, **ctxmod.history_provenance(cache_root)}
 
 
 def exit_code(st: "BuildStats", max_invalid_share: float) -> int:
@@ -221,10 +210,8 @@ def _build_locked(card, key, data, sessions, adapter, cache_root, batch_size, re
                     continue
                 ctx, why = context_for(d, c, sess, n)
                 if ctx is None:
-                    if why == "short":
-                        st.skipped_short_history += 1
-                    else:
-                        st.skipped_no_bar += 1
+                    attr = {"short": "skipped_short_history", "gap": "skipped_gap", "no_bar": "skipped_no_bar"}[why]
+                    setattr(st, attr, getattr(st, attr) + 1)
                     continue
                 items.append((sym, sess, ctx))
             for i in range(0, len(items), batch_size):
@@ -305,10 +292,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     params = {"tool": "tools/ml_forecast/build_store.py", "card_id": a.model_card, "start": a.start.isoformat(),
               "end": a.end.isoformat(), "sessions": a.sessions, "threads": a.threads, "batch_size": a.batch_size,
               "source": f"{OHLCV_DIRNAME}/<SYM>_1d.parquet Close"}
+    params = make_build_params(params, cache_root)
     st = build(card, data, sessions, adapter, cache_root, a.batch_size, a.resume, a.flush_sessions, params,
                guard=_ram_guard)
-    log.info("DONE forecasts=%d sessions=%d skipped: short_history=%d no_bar=%d already_stored=%d invalid=%d "
-             "| %.2f forecasts/s over %.0fs", st.forecasts, st.sessions, st.skipped_short_history,
+    log.info("DONE forecasts=%d sessions=%d skipped: short_history=%d gap=%d no_bar=%d already_stored=%d invalid=%d "
+             "| %.2f forecasts/s over %.0fs", st.forecasts, st.sessions, st.skipped_short_history, st.skipped_gap,
              st.skipped_no_bar, st.skipped_resume, st.invalid_forecasts, st.rate, st.seconds)
     if st.invalid:
         log.error("INVALID forecasts (%d): %s", st.invalid_forecasts, "; ".join(st.invalid))
