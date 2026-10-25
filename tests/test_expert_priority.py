@@ -481,7 +481,7 @@ def test_monday_only_priority_expert_is_not_registered_for_tuesday(worker, monke
     assert worker._expert_priority.waiting_batches() == set()
 
 
-def test_one_expert_failing_to_load_is_skipped_alone(worker, monkeypatch, caplog):
+def test_one_expert_failing_to_load_is_skipped_alone(worker, monkeypatch):
     """P4: expert 2 of 3 cannot be loaded. 1 and 3 still run, the slot is claimed
     exactly as for a clean group, and the failure is logged at ERROR with the id."""
     import logging
@@ -504,12 +504,13 @@ def test_one_expert_failing_to_load_is_skipped_alone(worker, monkeypatch, caplog
     monkeypatch.setattr(utils, "expert_uses_risk_manager", lambda cls: True)
     calls = []
     monkeypatch.setattr(jm, "_execute_scheduled_analysis", lambda i, *a, **k: calls.append(i))
-    with caplog.at_level(logging.ERROR):
-        jm._execute_scheduled_group(1, "EXPERT", AnalysisUseCase.ENTER_MARKET, scheduled_for=slot)
+    # ba2 loggers set propagate=False, so caplog never sees them: capture the module logger's calls.
+    errors = []
+    monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: errors.append(str(msg)))
+    jm._execute_scheduled_group(1, "EXPERT", AnalysisUseCase.ENTER_MARKET, scheduled_for=slot)
     assert sorted(calls) == [1, 3]
     assert slot.isoformat() in jm._dispatched_slots
-    assert any("Scheduled expert 2 FAILED TO LOAD" in r.getMessage() and "broken expert 2" in r.getMessage()
-               and r.levelno == logging.ERROR for r in caplog.records)
+    assert any("Scheduled expert 2 FAILED TO LOAD" in m and "broken expert 2" in m for m in errors)
     jm._execute_scheduled_group(3, "EXPERT", AnalysisUseCase.ENTER_MARKET, scheduled_for=slot)
     assert sorted(calls) == [1, 3]   # slot claimed: no double run
 
@@ -535,16 +536,18 @@ def _group_fixture(worker, monkeypatch, loader, prio=None):
     return jm, slot, calls
 
 
-def test_every_expert_failing_raises_critical_and_does_not_claim_slot(worker, monkeypatch, caplog):
+def test_every_expert_failing_raises_critical_and_does_not_claim_slot(worker, monkeypatch):
     import logging
     def load(i):
         raise ValueError("boom")
+    import ba2_trade_platform.core.JobManager as module
     jm, slot, calls = _group_fixture(worker, monkeypatch, load)
-    with caplog.at_level(logging.CRITICAL):
-        with pytest.raises(RuntimeError, match="ALL 3"):
-            jm._execute_scheduled_group(1, "EXPERT", AnalysisUseCase.ENTER_MARKET, scheduled_for=slot)
+    criticals = []
+    monkeypatch.setattr(module.logger, "critical", lambda msg, *a, **k: criticals.append(str(msg)))
+    with pytest.raises(RuntimeError, match="ALL 3"):
+        jm._execute_scheduled_group(1, "EXPERT", AnalysisUseCase.ENTER_MARKET, scheduled_for=slot)
     assert calls == [] and jm._dispatched_slots == set()
-    assert any(r.levelno == logging.CRITICAL for r in caplog.records)
+    assert criticals
 
 
 def test_infrastructure_errors_propagate_not_skip(worker, monkeypatch):
