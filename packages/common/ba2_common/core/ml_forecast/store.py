@@ -18,7 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 
 from .forecast_row import ForecastRow, record_columns
-from .model_card import ModelCard
+from .model_card import ModelCard, model_key as compute_model_key
 
 STORE_DIRNAME = "ml_forecast"
 #: A long weekend plus a holiday is 4-5 calendar days; beyond a week the store has a hole, not a quiet market.
@@ -79,6 +79,16 @@ def _mtime(p: Path) -> int:
         raise ForecastStoreMiss(f"forecast store file missing: {p}") from None
 
 
+def _verify_meta(key: str, meta: Dict[str, Any]) -> None:
+    """One value, one source: the key must equal model_key(card, covariate_set), and the redundant meta fields
+    must equal what the card defines."""
+    card = ModelCard.from_dict(meta["card"])
+    if (meta["context_length"] != card.context_length or list(meta["horizons"]) != list(card.horizons)
+            or compute_model_key(card, meta["covariate_set"]) != key or meta["model_key"] != key):
+        raise ForecastStoreError(f"store {key}: meta.json is inconsistent with its model key (card, context length, "
+                                 f"covariate set or horizons were altered)")
+
+
 def read_meta(key: str, cache_root: Optional[os.PathLike] = None) -> Dict[str, Any]:
     kdir = _key_dir(_root(cache_root), key)
     p = kdir / "meta.json"
@@ -89,6 +99,7 @@ def read_meta(key: str, cache_root: Optional[os.PathLike] = None) -> Dict[str, A
         if hit is not None and hit[0] == mt:
             return hit[1]
     meta = json.loads(p.read_text(encoding="utf-8"))
+    _verify_meta(key, meta)
     with _lock:
         _metas[ck] = (mt, meta)
     return meta
@@ -135,11 +146,15 @@ def read_row(model_key: str, symbol: str, decision_session_cutoff: date,
 
 # ---------------------------------------------------------------- writer
 def write_rows(model_key: str, card: ModelCard, build_params: Dict[str, Any], rows: Iterable[ForecastRow],
-               cache_root: Optional[os.PathLike] = None) -> None:
+               covariate_set: Iterable[str], cache_root: Optional[os.PathLike] = None) -> None:
     """Upsert rows (by symbol + session) into the store of ``model_key``.
 
     Refuses a card that differs from the one already stored under the key. Rows must carry exactly the card's
     horizons, and path probabilities iff the card's output type is ``paths``."""
+    covariate_set = sorted(covariate_set)
+    if compute_model_key(card, covariate_set) != model_key:
+        raise ValueError(f"model_key {model_key} does not match model_key(card, covariate_set) = "
+                         f"{compute_model_key(card, covariate_set)}")
     rows = list(rows)
     if not rows:
         raise ValueError("write_rows: no rows")
@@ -156,7 +171,9 @@ def write_rows(model_key: str, card: ModelCard, build_params: Dict[str, Any], ro
         existing = json.loads(meta_p.read_text(encoding="utf-8"))
         if existing["card"] != card.to_dict():
             raise ForecastStoreCardMismatch(f"model key {model_key} already holds a different model card")
-    _atomic_write(meta_p, json.dumps({"model_key": model_key, "card": card.to_dict(), "build": build_params},
+    _atomic_write(meta_p, json.dumps({"model_key": model_key, "card": card.to_dict(), "context_length": card.context_length,
+                                      "covariate_set": covariate_set, "horizons": list(card.horizons),
+                                      "build": build_params},
                                      indent=2, sort_keys=True, default=str))
     by_sym: Dict[str, List[ForecastRow]] = {}
     for r in rows:

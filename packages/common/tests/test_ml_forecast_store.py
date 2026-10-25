@@ -31,11 +31,11 @@ def _reset():
 
 @pytest.fixture
 def key():
-    return model_key(make_card(), 512, (), HZ)
+    return model_key(make_card(), ())
 
 
 def seed(tmp_path, key, rows, card=None, sym_rows=None):
-    store.write_rows(key, card or make_card(), {"build": "t"}, rows, cache_root=tmp_path)
+    store.write_rows(key, card or make_card(), {"build": "t"}, rows, covariate_set=(), cache_root=tmp_path)
 
 
 def test_layout_and_meta(tmp_path, key):
@@ -43,6 +43,7 @@ def test_layout_and_meta(tmp_path, key):
     assert (tmp_path / "ml_forecast" / key / "AAPL.parquet").is_file()
     meta = json.loads((tmp_path / "ml_forecast" / key / "meta.json").read_text())
     assert meta["card"] == make_card().to_dict() and meta["build"] == {"build": "t"} and meta["model_key"] == key
+    assert meta["context_length"] == 512 and meta["covariate_set"] == [] and meta["horizons"] == list(HZ)
 
 
 def test_round_trip(tmp_path, key):
@@ -53,9 +54,9 @@ def test_round_trip(tmp_path, key):
 
 def test_round_trip_paths(tmp_path):
     card = make_card(output_type="paths")
-    k = model_key(card, 512, (), HZ)
+    k = model_key(card, ())
     r = row("AAPL", date(2024, 3, 1), paths=True)
-    store.write_rows(k, card, {}, [r], cache_root=tmp_path)
+    store.write_rows(k, card, {}, [r], covariate_set=(), cache_root=tmp_path)
     assert store.read_row(k, "AAPL", date(2024, 3, 1), cache_root=tmp_path) == r
 
 
@@ -120,10 +121,13 @@ def test_cache_is_used_and_resettable(tmp_path, key, monkeypatch):
 
 def test_refuses_different_card_under_same_key(tmp_path, key):
     seed(tmp_path, key, [row("AAPL", date(2024, 3, 1))])
-    with pytest.raises(store.ForecastStoreCardMismatch):
-        seed(tmp_path, key, [row("AAPL", date(2024, 3, 4))], card=make_card(version="9.9"))
-    # same card is fine
-    seed(tmp_path, key, [row("AAPL", date(2024, 3, 4))])
+    other = make_card(version="9.9")
+    with pytest.raises(ValueError):                    # key no longer matches the card
+        seed(tmp_path, key, [row("AAPL", date(2024, 3, 4))], card=other)
+    mp = tmp_path / "ml_forecast" / key / "meta.json"
+    meta = json.loads(mp.read_text()); meta["card"] = other.to_dict(); mp.write_text(json.dumps(meta))
+    with pytest.raises(store.ForecastStoreCardMismatch):   # a different card already stored under this key
+        seed(tmp_path, key, [row("AAPL", date(2024, 3, 4))])
 
 
 def test_writer_checks_rows_against_card(tmp_path, key):
@@ -139,3 +143,21 @@ def test_writer_checks_rows_against_card(tmp_path, key):
 def test_symbol_path_safety(tmp_path, key):
     with pytest.raises(ValueError):
         store.read_row(key, "../x", date(2024, 3, 1), cache_root=tmp_path)
+
+
+def test_write_rejects_key_that_does_not_match_card_and_covariates(tmp_path, key):
+    with pytest.raises(ValueError):
+        store.write_rows("deadbeefdeadbeef", make_card(), {}, [row("AAPL", date(2024, 3, 1))],
+                         covariate_set=(), cache_root=tmp_path)
+    with pytest.raises(ValueError):                    # key was built for the empty covariate set
+        store.write_rows(key, make_card(), {}, [row("AAPL", date(2024, 3, 1))],
+                         covariate_set=("SPY",), cache_root=tmp_path)
+
+
+def test_read_recomputes_key_from_meta(tmp_path, key):
+    seed(tmp_path, key, [row("AAPL", date(2024, 3, 1))])
+    mp = tmp_path / "ml_forecast" / key / "meta.json"
+    meta = json.loads(mp.read_text()); meta["covariate_set"] = ["SPY"]; mp.write_text(json.dumps(meta))
+    store.reset_cache()
+    with pytest.raises(store.ForecastStoreError):
+        store.read_row(key, "AAPL", date(2024, 3, 1), cache_root=tmp_path)

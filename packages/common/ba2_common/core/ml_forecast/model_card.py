@@ -105,13 +105,18 @@ class ModelCard:
         return cls(**kw)
 
 
-def model_key(card: ModelCard, context_length: int, covariate_set: Iterable[str], horizons: Iterable[int]) -> str:
-    """Stable 16-hex key of (card, context length, covariate set, horizon list)."""
+def model_key(card: ModelCard, covariate_set: Iterable[str]) -> str:
+    """Stable 16-hex key of (card, covariate set). The context length and the horizon list are part of the card
+    (one source for each value), so they are in the key through it."""
+    cov = sorted(covariate_set)
+    for c in cov:
+        if not isinstance(c, str) or not c.strip():
+            raise ValueError(f"covariate_set holds a blank or non-str entry: {c!r}")
     payload = {
         "card": card.to_dict(),
-        "context_length": int(context_length),
-        "covariate_set": sorted(covariate_set),
-        "horizons": [int(h) for h in horizons],
+        "context_length": card.context_length,
+        "covariate_set": cov,
+        "horizons": list(card.horizons),
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]

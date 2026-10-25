@@ -62,23 +62,23 @@ def test_from_dict_rejects_unknown_and_missing_keys():
 
 def test_model_key_stable_and_sensitive():
     c = make_card()
-    k = model_key(c, 512, ("Volume", "SPY"), (5, 10, 20))
-    assert k == model_key(make_card(), 512, ["SPY", "Volume"], [5, 10, 20])  # covariate order irrelevant
+    k = model_key(c, ("Volume", "SPY"))
+    assert k == model_key(make_card(), ["SPY", "Volume"])  # covariate order irrelevant
     assert len(k) == 16 and all(ch in "0123456789abcdef" for ch in k)
     variants = [
-        model_key(c, 1024, ("Volume", "SPY"), (5, 10, 20)),
-        model_key(c, 512, ("Volume",), (5, 10, 20)),
-        model_key(c, 512, ("Volume", "SPY"), (5, 10)),
-        model_key(make_card(version="3.1"), 512, ("Volume", "SPY"), (5, 10, 20)),
-        model_key(make_card(licence="MIT"), 512, ("Volume", "SPY"), (5, 10, 20)),
-        model_key(make_card(pretraining_cutoff=None), 512, ("Volume", "SPY"), (5, 10, 20)),
+        model_key(make_card(context_length=1024), ("Volume", "SPY")),     # context length comes from the card
+        model_key(c, ("Volume",)),
+        model_key(make_card(horizons=(5, 10)), ("Volume", "SPY")),        # horizons come from the card
+        model_key(make_card(version="3.1"), ("Volume", "SPY")),
+        model_key(make_card(licence="MIT"), ("Volume", "SPY")),
+        model_key(make_card(pretraining_cutoff=None), ("Volume", "SPY")),
     ]
     assert len({k, *variants}) == 7
 
 
 def test_every_card_field_changes_key():
     base = make_card()
-    kb = model_key(base, 512, (), (5, 10, 20))
+    kb = model_key(base, ())
     changes = dict(
         model_id="b", family="b", version="9", input_fields=("Close",), timeframe="1h", context_length=256,
         past_only_covariates=(), past_future_covariates=("X",), horizons=(5,), scaler="s",
@@ -86,7 +86,12 @@ def test_every_card_field_changes_key():
     )
     assert set(changes) == {f.name for f in dataclasses.fields(ModelCard)}
     for name, val in changes.items():
-        assert model_key(make_card(**{name: val}), 512, (), (5, 10, 20)) != kb, name
+        assert model_key(make_card(**{name: val}), ()) != kb, name
+
+
+def test_model_key_rejects_blank_covariate():
+    with pytest.raises(ValueError):
+        model_key(make_card(), ("",))
 
 
 def test_class_probs_not_supported_yet():
