@@ -214,9 +214,12 @@ def test_path_model_off_grid_distance_holds_with_grid_gate(tp_ret, sl_ret):
     assert r.signal == OR.HOLD and "gate=grid" in r.reason
 
 
-def test_path_model_stop_on_profit_side_holds_with_grid_gate():
-    r = map_forecast(row(STRONG, probs=grid_probs(0.9)), genes(), 100.0, 2.0)
-    assert r.signal == OR.HOLD and "gate=grid" in r.reason
+def test_path_model_wrong_side_stop_falls_back_to_decile_probability():
+    r = map_forecast(row(STRONG, probs=grid_probs(0.1)), genes(), 100.0, 2.0)    # grid says 0.1; deciles say 0.95
+    assert r.signal == OR.BUY and r.sl_price is None and r.tp_price is not None
+    assert r.confidence == pytest.approx(95.0)
+    assert ("path grid has no cell for a forecast stop on the profit side; decile probability used; "
+            "ruleset/ATR safeguard applies") in r.reason
 
 
 def test_path_model_on_grid_distance_passes():

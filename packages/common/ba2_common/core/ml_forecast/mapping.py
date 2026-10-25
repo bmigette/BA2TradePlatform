@@ -12,8 +12,8 @@ Probability used:
   * decile models: ``p_up_from_deciles`` (below); the bearish probability is ``1 - p_up``.
   * path models (row carries a P(TP before SL) grid): the cell nearest to the TP/SL distances implied by the chosen
     quantiles, in the direction traded (long: TP = q[tp_quantile], SL = q[sl_quantile]; short mirrored). A distance
-    outside the grid range, more than half a grid step from its cell, or on the wrong side of the entry gives
-    HOLD with gate=grid (no silent snapping onto a different TP/SL pair).
+    outside the grid range or more than half a grid step from its cell gives HOLD with gate=grid (no silent
+    snapping). A wrong-side exit has no cell: the decile probability is used and that exit is returned as None.
 
 TP/SL prices come from the quantiles (long: TP = price * (1 + q[tp_quantile]), SL = price * (1 + q[sl_quantile]);
 short: mirrored through ``100 - level``). A forecast TP/SL that is on the wrong side of the entry (a very
@@ -195,16 +195,21 @@ def map_forecast(row: ForecastRow, genes: MappingGenes, decision_price: float, a
         # the exit distances the quantiles imply must sit on the grid: no silent snapping onto another TP/SL pair
         profit_ok = (tp_ret > 0) if long_ else (tp_ret < 0)
         loss_ok = (sl_ret < 0) if long_ else (sl_ret > 0)
-        if not (profit_ok and loss_ok):
-            return _hold(lead, "HOLD gate=grid: forecast TP/SL quantile is on the wrong side of the entry, "
-                               "no P(TP before SL) grid cell applies")
-        tp_cell = _snap(TP_GRID_PCT, abs(tp_ret) * 100.0)
-        sl_cell = _snap(SL_GRID_PCT, abs(sl_ret) * 100.0)
-        if tp_cell is None or sl_cell is None:
-            return _hold(lead, f"HOLD gate=grid: implied TP {abs(tp_ret) * 100:.2f}% / SL {abs(sl_ret) * 100:.2f}% "
-                               f"is outside the grid or more than half a grid step from a cell")
-        p = row.path_prob(side, h, tp_cell, sl_cell)
-        cell = f" P(TP<SL)[{side} tp_cell={tp_cell} sl_cell={sl_cell}]"
+        if profit_ok and loss_ok:
+            tp_cell = _snap(TP_GRID_PCT, abs(tp_ret) * 100.0)
+            sl_cell = _snap(SL_GRID_PCT, abs(sl_ret) * 100.0)
+            if tp_cell is None or sl_cell is None:
+                return _hold(lead, f"HOLD gate=grid: implied TP {abs(tp_ret) * 100:.2f}% / SL {abs(sl_ret) * 100:.2f}% "
+                                   f"is outside the grid or more than half a grid step from a cell")
+            p = row.path_prob(side, h, tp_cell, sl_cell)
+            cell = f" P(TP<SL)[{side} tp_cell={tp_cell} sl_cell={sl_cell}]"
+        else:
+            # no grid cell exists for a wrong-side exit: decide on the decile probability, exits become None below
+            which = "stop" if not loss_ok else "take-profit"
+            side_word = "profit" if not loss_ok else "loss"
+            p = p_up if long_ else 1.0 - p_up
+            cell = (f" [path grid has no cell for a forecast {which} on the {side_word} side; decile probability "
+                    f"used; ruleset/ATR safeguard applies]")
     else:
         p = p_up if long_ else 1.0 - p_up
     if p * 100.0 < genes.min_prob - 1e-9:
