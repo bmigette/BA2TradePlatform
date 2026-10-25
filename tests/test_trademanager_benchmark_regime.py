@@ -32,6 +32,16 @@ NY = ZoneInfo("America/New_York")
 THU = date(2026, 10, 22)
 
 
+def _capture_logs(monkeypatch):
+    """ba2 loggers set propagate=False, so caplog never sees them: record the TradeManager module logger's
+    calls instead. Returns a list of (levelno, message)."""
+    records = []
+    for name, level in (("warning", logging.WARNING), ("error", logging.ERROR), ("critical", logging.CRITICAL)):
+        monkeypatch.setattr(tm_mod.logger, name,
+                            lambda msg, *a, _l=level, **k: records.append((_l, str(msg) % a if a else str(msg))))
+    return records
+
+
 def at_ny(day: date, hh: int, mm: int = 0) -> datetime:
     return datetime.combine(day, time(hh, mm), tzinfo=NY).astimezone(timezone.utc)
 
@@ -103,16 +113,15 @@ def test_cache_is_keyed_by_newest_finished_session(monkeypatch):
     assert f.calls == 2
 
 
-def test_failure_publishes_none_logs_error_and_retries(monkeypatch, caplog):
+def test_failure_publishes_none_logs_error_and_retries(monkeypatch):
     f = Fetcher(THU, raises=RuntimeError("fmp down"))
     tm = make(monkeypatch, f)
     t0 = at_ny(THU, 10)
-    with caplog.at_level(logging.WARNING):
-        tm._publish_benchmark_regime(now=t0)
+    records = _capture_logs(monkeypatch)
+    tm._publish_benchmark_regime(now=t0)
     assert br.get_benchmark_regime() is None
     assert "fmp down" in br.get_benchmark_regime_failure()
-    assert any(r.levelno == logging.ERROR and "benchmark regime" in r.getMessage().lower()
-               for r in caplog.records)
+    assert any(lvl == logging.ERROR and "benchmark regime" in m.lower() for lvl, m in records)
     assert f.calls == 1
     tm._publish_benchmark_regime(now=t0 + timedelta(seconds=120))      # inside the retry window
     assert f.calls == 1 and br.get_benchmark_regime() is None
@@ -254,32 +263,33 @@ def _alpaca_with_feed(name, feed):
     return acct
 
 
-def test_warns_once_a_day_when_an_alpaca_account_prices_from_another_feed(monkeypatch, caplog):
+def test_warns_once_a_day_when_an_alpaca_account_prices_from_another_feed(monkeypatch):
     _alpaca_with_feed("acct-fmp", "fmp")
     _alpaca_with_feed("acct-iex", "iex")
     _alpaca_with_feed("acct-unset", None)
     tm = make(monkeypatch, Fetcher(THU))
-    with caplog.at_level(logging.WARNING):
-        tm._publish_benchmark_regime(now=at_ny(THU, 17))
-        tm._publish_benchmark_regime(now=at_ny(THU, 18))
-    warned = [r.getMessage() for r in caplog.records
-              if r.levelno == logging.WARNING and "SPY regime reads FMP" in r.getMessage()]
+    records = _capture_logs(monkeypatch)
+    tm._publish_benchmark_regime(now=at_ny(THU, 17))
+    tm._publish_benchmark_regime(now=at_ny(THU, 18))
+    warned = [m for lvl, m in records if lvl == logging.WARNING and "SPY regime reads FMP" in m]
     assert len(warned) == 1
     assert "acct-iex" in warned[0] and "iex" in warned[0]
-    assert "acct-unset" in warned[0] and "delayed_sip" in warned[0]
+    # an unset data_feed is the DECLARED default, which has been fmp since the fmp price feed shipped (APP 1249):
+    # such an account matches the regime source and is not named (this asserted delayed_sip, the old default)
+    assert "acct-unset" not in warned[0]
     assert "acct-fmp" not in warned[0]
     assert br.get_benchmark_regime() is not None                       # a warning, never a refusal
-    with caplog.at_level(logging.WARNING):
-        tm._publish_benchmark_regime(now=at_ny(date(2026, 10, 23), 17))
-    assert sum("SPY regime reads FMP" in r.getMessage() for r in caplog.records) == 2
+    tm._publish_benchmark_regime(now=at_ny(date(2026, 10, 23), 17))
+    assert sum("SPY regime reads FMP" in m for _, m in records) == 2
 
 
-def test_no_warning_when_every_alpaca_account_prices_from_fmp(monkeypatch, caplog):
+def test_no_warning_when_every_alpaca_account_prices_from_fmp(monkeypatch):
     _alpaca_with_feed("acct-fmp", "fmp")
     tm = make(monkeypatch, Fetcher(THU))
-    with caplog.at_level(logging.WARNING):
-        tm._publish_benchmark_regime(now=at_ny(THU, 17))
-    assert not any("SPY regime reads FMP" in r.getMessage() for r in caplog.records)
+    records = _capture_logs(monkeypatch)
+    tm._publish_benchmark_regime(now=at_ny(THU, 17))
+    assert br.get_benchmark_regime() is not None                       # it ran, so the absence below is not vacuous
+    assert not any("SPY regime reads FMP" in m for _, m in records)
 
 
 # ------------------------------------------------------------------- parity with the backtest calendar
