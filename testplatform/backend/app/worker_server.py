@@ -570,7 +570,13 @@ def _job_status(job_id: str) -> dict:
         _rebuild_pool(e)
         result = {"ok": False, "error": repr(e), "fatal": False, "retryable": True}
     except Exception as e:  # noqa: BLE001 — surface as a failed trial, never 500 the poller
-        result = {"ok": False, "error": repr(e), "fatal": False}
+        # Type, message and traceback go BACK to the master in the result (it logs them in its job
+        # log) and are logged here too, so the failure is visible from both ends.
+        import traceback as _tb
+        _tb_text = "".join(_tb.format_exception(type(e), e, e.__traceback__))[-6000:]
+        logger.error("job %s raised %s: %s\n%s", job_id, type(e).__name__, e, _tb_text)
+        result = {"ok": False, "error": repr(e), "fatal": False, "error_type": type(e).__name__,
+                  "traceback": _tb_text}
     # A market-condition preparation is admitted HERE, where its result is collected: this is the
     # one place every finished job passes through (the registry entry is popped above, so the
     # result is delivered exactly once).

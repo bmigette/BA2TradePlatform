@@ -336,43 +336,66 @@ def test_resume_without_the_rule_is_the_legacy_clock():
     assert resumed._resumed_no_improvement == 0   # 24.0 is a strict record at gen 5
 
 
-def test_resume_replays_the_checkpointed_generation_costing_one_generation_of_patience():
-    """PINS A KNOWN QUIRK (deliberately unfixed 2026-09-26 -- job 1 of stage 1 is running on the
-    legacy rule and a fix would change what a resume of it does).
+def test_resume_from_an_end_of_generation_checkpoint_continues_exactly_where_the_run_would():
+    """P5 (fixed 2026-10-24). The checkpoint is written after a generation is EVALUATED but before
+    it REPRODUCES. A resume used to start at generation + 1 with that same, fully evaluated
+    population, so the first resumed generation evaluated NOTHING, re-recorded the checkpointed
+    best under the next generation number (a phantom generation) and burned one patience unit.
 
-    The checkpoint is written after a generation is EVALUATED but before it REPRODUCES, and a
-    resume starts at checkpoint.generation + 1 with that same, fully evaluated population. So the
-    first resumed generation evaluates NOTHING: it re-records the checkpointed generation's best
-    under the next generation number, counts as a non-improvement, and only then breeds. Each
-    resume therefore costs exactly ONE generation of the budget and of patience, under either
-    rule. A later fix must update this test on purpose.
+    Now a resume from an end-of-generation checkpoint breeds first. For EVERY checkpoint
+    generation k and either rule, the resumed run must equal the uninterrupted one: same
+    generation count, same history, same patience state, same best, same trials per generation.
     """
     for min_rel in (None, 0.01):
-        seq = _CREEP
-        cps, straight_evals = {}, []
+        straight_evals, cps = [], {}
         opt = _optimizer(min_rel, patience=5, seed=21)
-        _run_counting(opt, seq, straight_evals, checkpoints=cps)
+        straight = _run_counting(opt, _CREEP, straight_evals, checkpoints=cps)
+        for k in sorted(cps):
+            resumed = _optimizer(min_rel, patience=5, seed=999)   # nothing carried over
+            start, pop, fits = resumed.resume_from_checkpoint(cps[k])
+            assert start == k + 1
+            resumed_evals = []
+            res = _run_counting(resumed, _CREEP, resumed_evals, start_generation=start,
+                                initial_population=pop, restored_fitnesses=fits)
+            tag = (min_rel, k)
+            assert [h["generation"] for h in res["history"]] ==                 [h["generation"] for h in straight["history"]], tag
+            assert [h["best_fitness"] for h in res["history"]] ==                 [h["best_fitness"] for h in straight["history"]], tag
+            assert res["generations_run"] == straight["generations_run"], tag
+            assert res["best_fitness"] == straight["best_fitness"], tag
+            assert res["best_params"] == straight["best_params"], tag
+            assert GeneticOptimizer.patience_state_from_history(res["history"], min_rel) ==                 GeneticOptimizer.patience_state_from_history(straight["history"], min_rel), tag
+            assert resumed_evals == [e for e in straight_evals if e[0] > k], tag
 
-        resumed = _optimizer(min_rel, patience=5, seed=21)
-        start, pop, fits = resumed.resume_from_checkpoint(cps[4])
-        clock_at_ckpt = resumed._resumed_no_improvement
-        resumed_evals = []
-        res = _run_counting(resumed, seq, resumed_evals, start_generation=start,
-                            initial_population=pop, restored_fitnesses=fits)
-        hist = res["history"]
-        # the replayed generation: no trials, the checkpointed best re-recorded under gen 5
-        assert dict(resumed_evals)[5] == 0, min_rel
-        assert hist[5]["generation"] == 5 and hist[5]["best_fitness"] == hist[4]["best_fitness"]
-        # ...and it costs one generation of patience
-        assert GeneticOptimizer.no_improvement_from_history(hist[:6], min_rel) == clock_at_ckpt + 1
-        # the uninterrupted run evaluated new offspring at gen 5; the resumed one did not
-        assert dict(straight_evals)[5] > 0
-        after = lambda evals, g0: sum(1 for g, n in evals if g > g0 and n > 0)  # noqa: E731
-        stop_straight = max(g for g, _ in straight_evals)
-        stop_resumed = hist[-1]["generation"]
-        assert (after(resumed_evals, 4), stop_resumed) == (
-            after(straight_evals, 4) - 1, stop_straight), \
-            "the resumed run must do exactly one generation of new trials fewer"
+
+def test_resume_from_the_checkpoint_of_the_stopping_generation_does_not_run_another():
+    """The checkpoint is written BEFORE the stop decision. Resuming from the one of the generation
+    that stopped the run must stop at once (no trials), not run a further generation."""
+    cps, evals = {}, []
+    straight = _run_counting(_optimizer(0.01, patience=5, seed=21), _CREEP, evals, checkpoints=cps)
+    last = straight["history"][-1]["generation"]
+    resumed = _optimizer(0.01, patience=5, seed=5)
+    start, pop, fits = resumed.resume_from_checkpoint(cps[last])
+    more = []
+    res = _run_counting(resumed, _CREEP, more, start_generation=start, initial_population=pop,
+                        restored_fitnesses=fits)
+    assert more == []
+    assert res["generations_run"] == straight["generations_run"]
+    assert res["best_fitness"] == straight["best_fitness"]
+
+
+def test_a_checkpoint_written_by_the_old_code_still_resumes():
+    """Old checkpoints (no new keys, possibly with a duplicated generation in history from the
+    phantom replay) resume without error and keep their patience derived from history."""
+    cps = {}
+    _run_counting(_optimizer(None, patience=5, seed=21), _CREEP, [], checkpoints=cps)
+    ck = json.loads(json.dumps(cps[4]))
+    ck["history"] = ck["history"] + [dict(ck["history"][-1], generation=5)]   # old replay shape
+    ck["generation"] = 5
+    resumed = _optimizer(None, patience=5, seed=1)
+    start, pop, fits = resumed.resume_from_checkpoint(ck)
+    res = _run_counting(resumed, _CREEP, [], start_generation=start, initial_population=pop,
+                        restored_fitnesses=fits)
+    assert res["generations_run"] > 6
 
 
 def _run_counting(opt, seq, evals, **kw):

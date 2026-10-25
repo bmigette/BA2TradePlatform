@@ -242,6 +242,8 @@ _last_gen_full_results_by_opt: Dict[int, Dict[str, Any]] = {}
 # Seconds between ctl-proxy reads on the progress hook. Module-level so tests can drop it to 0;
 # see _cancel_progress_cb for why reading a Manager proxy per call is not acceptable.
 _CANCEL_CHECK_INTERVAL_S = 5.0
+#: Longest traceback carried back in a failed trial's result (master log + /job-status).
+_TRACEBACK_MAX_CHARS = 6000
 
 
 class TrialCancelled(Exception):
@@ -462,8 +464,18 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         fatal = job_fatal(e)
         snap = _trial_memory_snapshot()
         snap["option_overlays"] = released
+        # The traceback TRAVELS with the result (a pool child's own logging is disabled, so the
+        # result dict -- and, for a remote worker, /job-status -- is the only channel the master
+        # has). Bounded: it rides the pickled/JSON payload of every failed trial.
+        import traceback as _tb
+        _tb_text = _tb.format_exc()[-_TRACEBACK_MAX_CHARS:]
+        try:
+            from app.services.backtest import price_source as _ps
+            _ps._worker_log(f"!! trial raised {type(e).__name__}: {e}\n{_tb_text}")
+        except Exception:  # noqa: BLE001 -- the worker log channel must never mask the trial error
+            pass
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
-                "fatal": fatal,
+                "fatal": fatal, "traceback": _tb_text,
                 # The exception TYPE travels with the result (a remote worker's result is a plain
                 # dict over the wire, never the exception object), so the master can classify by
                 # type and not only by the ``fatal`` flag a worker computed from ITS OWN copy of the
@@ -714,6 +726,79 @@ class MemoryGovernor:
 #: escalating to SIGKILL. Kept short: the worker is already known to be unresponsive, and this delay
 #: sits directly in the recovery path.
 _ABANDON_KILL_GRACE_S = 5.0
+
+
+def _dispatch_with_stall_guard(jobs, pool, worker_fn, metric, stall_s: float, max_retries: int,
+                               clock=None):
+    """Feed ``jobs`` ((idx, flat, key, config)) to ``pool`` keeping every slot busy, YIELDING
+    ``(idx, flat, key, out)`` as each resolves, with a PER-TRIAL stall guard.
+
+    P6 (2026-10-24). The guard used to be one ``wait(timeout=stall_s)`` over the whole in-flight
+    set: when nothing completed for ``stall_s`` EVERY pending trial -- including ones that had
+    started seconds before -- was written off at ``STALLED_SENTINEL``, and the handler memoized
+    that sentinel so the genome was never evaluated again in the job. Now each trial has its own
+    clock (time since it was handed to its slot). One past ``stall_s`` has its slot respawned
+    (``pool.abandon_slot``) and is RE-QUEUED, up to ``max_retries`` times, before it is yielded as
+    ``stalled`` (for that generation only; the handler does not memoize it). Every step is logged
+    at ERROR.
+    """
+    from concurrent.futures import wait as _fwait, FIRST_COMPLETED
+    from collections import deque
+    clock = clock or _time.monotonic
+    jobs = list(jobs)
+    queue = deque(range(len(jobs)))
+    attempts = [0] * len(jobs)
+    pending: dict = {}      # future -> (position in jobs, started_at)
+    while queue or pending:
+        for slot in pool.idle_slots():
+            if not queue:
+                break
+            pos = queue.popleft()
+            attempts[pos] += 1
+            pending[pool.submit(slot, worker_fn, jobs[pos][3], metric)] = (pos, clock())
+        if not pending:
+            break
+        now = clock()
+        timeout = max(0.0, min(st for _, st in pending.values()) + stall_s - now)
+        done, _ = _fwait(list(pending), timeout=timeout, return_when=FIRST_COMPLETED)
+        for fut in done:
+            pos, _st = pending.pop(fut)
+            pool.mark_done(fut)
+            i, flat, key, _cfg = jobs[pos]
+            yield (i, flat, key, fut.result())
+        now = clock()
+        for fut, (pos, st) in list(pending.items()):
+            if fut in done or now - st < stall_s:
+                continue
+            del pending[fut]
+            i, flat, key, _cfg = jobs[pos]
+            slot = pool.abandon_slot(fut)
+            if attempts[pos] <= max_retries:
+                logger.error(
+                    f"LOCAL POOL STALLED: individual {i} (key {str(key)[:12]}) made no progress "
+                    f"in {stall_s:.0f}s on attempt {attempts[pos]}/{max_retries + 1}; slot {slot} "
+                    f"respawned, trial REQUEUED (attempt {attempts[pos] + 1}/{max_retries + 1})")
+                queue.appendleft(pos)
+                continue
+            from app.services.strategy_fitness import STALLED_SENTINEL
+            logger.error(
+                f"LOCAL POOL STALLED: individual {i} (key {str(key)[:12]}) stalled on all "
+                f"{attempts[pos]} attempt(s) of {stall_s:.0f}s -> scored {STALLED_SENTINEL:.0e} "
+                f"(STALLED) for this generation only (NOT memoized); slot {slot} respawned, "
+                f"job CONTINUES")
+            yield (i, flat, key, {
+                "ok": False,
+                "stalled": True,
+                "fitness": STALLED_SENTINEL,
+                "fitness_raw": STALLED_SENTINEL,
+                "trades": 0,
+                "total_return": 0.0,
+                "max_drawdown": 0.0,
+                "secs": stall_s * attempts[pos],
+                "slot": slot,
+                "attempts": attempts[pos],
+                "error": f"stalled: no progress in {stall_s:.0f}s on {attempts[pos]} attempt(s)",
+            })
 
 
 class _SlotPools:
@@ -1168,7 +1253,22 @@ def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, 
     last_exc: Optional[Exception] = None
     for attempt in range(_LOCAL_RETRY_ATTEMPTS):
         try:
-            return {"ok": True, "results": run_daily_backtest(config)}
+            # HEARTBEAT + CANCEL, exactly like _trial_worker: the engine's throttled progress_cb
+            # publishes ``bars`` on the control block, which /job-status reports. Without it a
+            # remote persist re-run showed bars == 0 for its whole life and the master's
+            # worker_client watchdog cancelled any run past _NEVER_STARTED_GRACE (420 s) as
+            # "accepted but never started" -- a false stall on every long TOP-N re-run. A fresh
+            # callback per attempt (its throttle state is per call). ``None`` for no ctl keeps the
+            # old call byte-identical.
+            _cb = _cancel_progress_cb(ctl)
+            return {"ok": True,
+                    "results": (run_daily_backtest(config) if _cb is None
+                                else run_daily_backtest(config, progress_cb=_cb))}
+        except TrialCancelled:
+            # The master abandoned this re-run: not a defect, and retrying (with backoff) would
+            # only hold the slot for a result nobody collects.
+            return {"ok": False, "error": "cancelled", "cancelled": True, "retryable": True,
+                    "fatal": False}
         except Exception as e:  # noqa: BLE001 — surface as a failed re-run, keep the others going
             last_exc = e
             if attempt < _LOCAL_RETRY_ATTEMPTS - 1:
@@ -1305,6 +1405,41 @@ def summarise_analysis_failures(opt_name: str, all_results: list) -> Optional[Di
             f"({(failed / passes if passes else 0):.2%}); worst trial {agg['worst_share']:.2%} (key {worst_key})")
     (logger.warning if failed else logger.info)(line)
     return agg
+
+
+class _TrialErrorTally:
+    """Per-generation record of trials that FAILED (raised, or reported ``ok: False``).
+
+    A failed trial is still scored as a failure (ZERO_TRADE_SENTINEL) -- that is unchanged -- but
+    it is never silent: ``record`` logs each one at ERROR with the genome key/params, where it
+    ran, the exception type, message and traceback; ``summary`` is the one line the generation
+    summary carries (count + types), so a defect that hits many trials reads as a defect and not
+    as a poor population.
+    """
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.types: Dict[str, int] = {}
+
+    def record(self, out: Dict[str, Any], key: Any, flat: Dict[str, Any], gen: Optional[int] = None,
+               n_gens: Optional[int] = None) -> None:
+        self.n += 1
+        etype = str(out.get("error_type") or "error")
+        self.types[etype] = self.types.get(etype, 0) + 1
+        where = f"gen {gen + 1}/{n_gens} " if gen is not None and n_gens else ""
+        mem = out.get("mem")
+        logger.error(
+            f"TRIAL ERROR {where}[{etype}] on {out.get('origin') or 'unknown origin'}: "
+            f"{out.get('error') or 'no error text'} | key {key} | params "
+            f"{_json.dumps(flat, default=str, sort_keys=True)[:400]}"
+            + (f" | worker mem: {mem}" if mem else "")
+            + (f"\n{out['traceback']}" if out.get("traceback") else ""))
+
+    def summary(self, total: int) -> str:
+        if not self.n:
+            return f"0 trial error(s) of {total}"
+        kinds = ", ".join(f"{t} x{c}" for t, c in sorted(self.types.items()))
+        return f"{self.n} of {total} trial(s) FAILED ({kinds})"
 
 
 def _abort_on_fatal_trial(out: Dict[str, Any], fatal: Dict[str, Any], key: Any, flat: Dict[str, Any]) -> None:
@@ -1903,65 +2038,14 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             recycle happens while that slot is idle and the other slots keep running. There is no
             chunk barrier and no point at which the fleet waits on one slow genome.
             """
-            from concurrent.futures import wait as _fwait, FIRST_COMPLETED
-            # STALL GUARD. If a pool ever wedges again this must abort loudly rather than sit in
-            # wait() forever with no error and no log line (opt 328 sat 2h25m). Sized off the
-            # slowest trial actually observed here (1104s) with a wide margin.
+            # STALL GUARD, PER TRIAL (see _dispatch_with_stall_guard). If a pool ever wedges this
+            # must recover loudly rather than sit in wait() forever (opt 328 sat 2h25m). Sized off
+            # the slowest trial actually observed here (1104s) with a wide margin. A stalled
+            # trial is re-queued BT_LOCAL_STALL_RETRIES times before it is scored as stalled.
             _stall_s = float(_os.getenv("BT_LOCAL_STALL_TIMEOUT_S", "5400"))
-            jobs = list(jobs)
-            pending: dict = {}      # future -> (idx, flat, key)
-            nxt = 0
-            while nxt < len(jobs) or pending:
-                for slot in _pool.idle_slots():
-                    if nxt >= len(jobs):
-                        break
-                    i, flat, key, cfg = jobs[nxt]
-                    nxt += 1
-                    pending[_pool.submit(slot, _trial_worker, cfg, opt.fitness_metric)] = (
-                        i, flat, key)
-                if not pending:
-                    break
-                done, _ = _fwait(list(pending), timeout=_stall_s,
-                                 return_when=FIRST_COMPLETED)
-                if not done:
-                    # SURGICAL STALL RECOVERY (2026-09-21, operator decision: "a stall should not
-                    # kill grid"). The old behaviour raised TimeoutError, which failed the WHOLE
-                    # job: one wedged genome killed a 16-job matrix at job 1/16 (2026-09-20
-                    # 21:54Z) and cost 7.5h of downtime. Now the wedged individual is scored at
-                    # STALLED_SENTINEL -- a value DISTINCT from the other sentinels so the
-                    # frequency stays countable in all_results -- and its slot is RESPAWNED (the
-                    # wedged worker is terminated, see _SlotPools.abandon_slot) so the next
-                    # generation cannot inherit a dead slot. The job continues.
-                    from app.services.strategy_fitness import STALLED_SENTINEL
-                    n_stalled = len(pending)
-                    for fut in list(pending):
-                        i, flat, key = pending.pop(fut)
-                        slot = _pool.abandon_slot(fut)
-                        logger.error(
-                            f"LOCAL POOL STALLED: individual {i} (key {str(key)[:12]}) made no "
-                            f"progress in {_stall_s:.0f}s -> scored {STALLED_SENTINEL:.0e} "
-                            f"(STALLED), slot {slot} respawned; job CONTINUES")
-                        yield (i, flat, key, {
-                            "ok": False,
-                            "stalled": True,
-                            "fitness": STALLED_SENTINEL,
-                            "fitness_raw": STALLED_SENTINEL,
-                            "trades": 0,
-                            "total_return": 0.0,
-                            "max_drawdown": 0.0,
-                            "secs": _stall_s,
-                            "slot": slot,
-                            "error": f"stalled: no progress in {_stall_s:.0f}s",
-                        })
-                    logger.error(
-                        f"LOCAL POOL STALLED: {n_stalled} individual(s) marked STALLED "
-                        f"({STALLED_SENTINEL:.0e}) after {_stall_s:.0f}s; slots respawned, "
-                        f"job continues")
-                    continue
-                for fut in done:
-                    i, flat, key = pending.pop(fut)
-                    _pool.mark_done(fut)
-                    yield (i, flat, key, fut.result())
+            _stall_retries = int(_os.getenv("BT_LOCAL_STALL_RETRIES", "2"))
+            yield from _dispatch_with_stall_guard(
+                jobs, _pool, _trial_worker, opt.fitness_metric, _stall_s, _stall_retries)
 
         def make_batch_fitness(execute_jobs, brute_force: bool = False):
             """*brute_force* (the exhaustive grid's single batch, see _evaluate_brute_force_batch)
@@ -1982,6 +2066,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 if tq.is_task_paused(task_id):
                     raise InterruptedError("paused/cancelled")
                 fits: list = [None] * len(param_dicts)
+                tally = _TrialErrorTally()
                 jobs = []  # (idx, decoded_flat, key, config)
                 n_gens = 1 if brute_force else int(ga["generations"])
                 is_last_gen = False if brute_force else gen_state["gen"] == n_gens - 1
@@ -2122,17 +2207,17 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         # of the genome, so a re-selection should re-run it.
                         from app.services.strategy_fitness import ZERO_TRADE_SENTINEL
                         if out.get("stalled"):
-                            # A STALL is not a genome property either, but it IS reproducible
-                            # in-process: this genome wedged once, so re-selecting it would burn
-                            # another _stall_s of the batch -- up to 8-15 generations of it. So:
-                            # score it at the DEDICATED sentinel (distinct, so the frequency is
-                            # COUNTABLE in all_results -- the operator asked to see how often this
-                            # happens), memoize it, and record it. A crash stays un-memoized below.
+                            # A STALL is not a measurement of the genome: it already got
+                            # BT_LOCAL_STALL_RETRIES fresh attempts (_dispatch_with_stall_guard).
+                            # Scored at the DEDICATED sentinel (distinct, so the frequency is
+                            # COUNTABLE in all_results) for THIS generation only. NOT memoized
+                            # (P6, 2026-10-24): a memoized sentinel blocked every later
+                            # generation from ever re-evaluating the genome. NOT reported to the
+                            # GA as an evaluated individual either, so a mid-generation
+                            # checkpoint re-runs it after a restart, like a crash.
                             from app.services.strategy_fitness import STALLED_SENTINEL
                             fit = STALLED_SENTINEL
                             fits[i] = fit
-                            memo.put(key, fit)
-                            _report_trial_result(on_result, i, fit)
                             all_results.append({
                                 "params": flat, "fitness": fit, "key": key, "trades": 0,
                                 "fitness_raw": fit, "robustness": None,
@@ -2145,16 +2230,15 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                                 "status": "stalled",
                                 "stall_reason": out.get("error"),
                                 "stall_secs": out.get("secs"),
-                                "stall_slot": out.get("slot")})
-                            logger.error(f"trial STALLED (scored {fit:.0e}, memoized): "
+                                "stall_slot": out.get("slot"),
+                                "stall_attempts": out.get("attempts")})
+                            logger.error(f"trial STALLED (scored {fit:.0e}, NOT memoized): "
                                          f"{out.get('error')}")
                         else:
                             fit = ZERO_TRADE_SENTINEL
                             fits[i] = fit
-                            if out.get("error"):
-                                mem = out.get("mem")
-                                logger.warning(f"trial failed in worker: {out['error']}"
-                                               + (f" | worker mem: {mem}" if mem else ""))
+                            if out.get("error") or out.get("error_type") or out.get("traceback"):
+                                tally.record(out, key, flat, gen=gen, n_gens=n_gens)
                                 # A job-fatal trial (``JOB_FATAL_ERROR_TYPES``, by flag OR by the TYPE the
                                 # worker sent back) ends the JOB at once:
                                     # ABORT NOW, not at the end. A fatal is a DATA/CONFIG problem --
@@ -2205,6 +2289,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 # blind and the makespan win is imaginary, which is worth seeing in the log
                 # instead of inferring from wall times months later.
                 _cost_model.report(gen, n_gens)
+                # Per-generation error count, ALWAYS (a zero is information too). WARNING level:
+                # the run installs logging.disable(INFO).
+                (logger.error if tally.n else logger.warning)(
+                    f"Gen {gen + 1}/{n_gens} trial errors: {tally.summary(total_in_batch)}")
                 return fits
 
             return batch_fitness

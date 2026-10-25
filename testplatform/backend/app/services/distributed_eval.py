@@ -203,6 +203,9 @@ class DistributedEvaluator:
         self.history_source = history_source
         self._drift_seen: set = set()
         self.log = log
+        # Trials that raised inside a local consumer (see _consume_local): counted, never silent.
+        self.trial_errors = 0
+        self._trial_errors_lock = threading.Lock()
         # Per-run ceiling on concurrent remote slots PER WORKER, regardless of the worker's
         # reported /health capacity -- so a worker that advertises 8 slots doesn't run 8
         # concurrent trials of a memory-heavy expert (e.g. FMPSenateTraderWeight, ~11-12GB/trial)
@@ -766,7 +769,19 @@ class DistributedEvaluator:
                 self.broker.requeue_one(job["trial_id"])
                 continue
             except Exception as e:  # noqa: BLE001
+                # A trial that RAISES is still scored as a failure (fitness unchanged) but never
+                # silently: log type/message/traceback with the trial and optimization ids, count
+                # it, and carry the same facts in the result so the master's per-trial and
+                # per-generation reporting sees them.
+                import traceback as _tb
+                with self._trial_errors_lock:
+                    self.trial_errors += 1
+                logger.error(
+                    f"local trial {job['trial_id']} (optimization {self.optimization_id}) raised "
+                    f"{type(e).__name__}: {e} -- scored as a failed trial "
+                    f"({self.trial_errors} trial error(s) so far in this run)", exc_info=True)
                 out = {"ok": False, "fitness": 0.0, "trades": 0, "error": repr(e), "fatal": False,
+                       "error_type": type(e).__name__, "traceback": _tb.format_exc()[-6000:],
                        "origin": "local"}
                 self.broker.post_result(job["trial_id"], out)
                 continue

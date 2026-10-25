@@ -121,9 +121,11 @@ def test_the_dispatcher_scores_a_stall_instead_of_raising():
     assert "LOCAL POOL STALLED" in SRC, "the stall must still be logged loudly"
 
 
-def test_the_stalled_individual_is_memoized_and_recorded():
-    """Memoized so the same wedge cannot burn another timeout every generation, and RECORDED so
-    the operator can count how often it happens (the explicit ask)."""
-    assert "memo.put(key, fit)" in SRC
+def test_the_stalled_individual_is_recorded_but_not_memoized():
+    """RECORDED so the operator can count how often it happens (the explicit ask). Since P6
+    (2026-10-24) NOT memoized: a memoized sentinel blocked every later generation from
+    re-evaluating the genome (see test_local_stall_guard_per_trial.py)."""
     assert '"fitness_raw": fit, "robustness": None' in SRC, (
         "the stalled individual is not appended to all_results -- then it is uncountable")
+    a = SRC.index('if out.get("stalled"):')
+    assert "memo.put" not in SRC[a:SRC.index("fit = ZERO_TRADE_SENTINEL", a)]
