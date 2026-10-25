@@ -49,13 +49,14 @@ from app.models import (
     SessionLocal,
     Strategy as StrategyModel,
     StrategyOptimization,
+    StrategyOptimizationPopulation,
     TaskQueue,
 )
 from app.models.task_queue import TaskStatus
 from app.services.genetic import GeneticOptimizer, DEAP_AVAILABLE
 from app.services.chain_seed import (  # noqa: E402
-    CHAIN_SEED_KEY, FINAL_POPULATION_KEY, SEEDED_FROM_KEY, ChainSeedError,
-    build_chain_seed_population, final_population_record)
+    CHAIN_SEED_KEY, SEEDED_FROM_KEY, ChainSeedError,
+    build_chain_seed_population, final_population_record, stored_record)
 from app.services.task_queue import get_task_queue
 from app.services.strategy_param_space import collect_param_space, decode_params, market_profile_members
 from app.services.strategy_fitness import compute_fitness, ZERO_TRADE_SENTINEL
@@ -2290,7 +2291,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             try:
                 _end_raw = backtest_cfg.get("end_date")
                 init_pop, _lineage = build_chain_seed_population(
-                    chain_src, optimizer, int(ga["populationSize"]),
+                    chain_src, stored_record(db.get(StrategyOptimizationPopulation, chain_src.id)),
+                    optimizer, int(ga["populationSize"]),
                     date.fromisoformat(str(_end_raw)[:10]) if _end_raw else None)
             except ChainSeedError as e:
                 return _fail(opt_id, db, f"chain seed refused: {e}")
@@ -2570,9 +2572,6 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 # the next fold fail (or worse, start cold) hours later. The checkpoint is kept.
                 return _fail(opt_id, db, "this job must persist a final population (walk-forward "
                                          "chain) but the search produced none")
-            if _fp is not None:
-                opt.optimization_config = {**(opt.optimization_config or {}),
-                                           FINAL_POPULATION_KEY: _fp}
 
         # The search finished: drop the checkpoint so a later re-run of this name starts a fresh
         # search instead of resuming from the final generation of a completed one. (A brute-force
@@ -2589,6 +2588,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         summarise_analysis_failures(opt.name, all_results)
         summarise_screener_gate(opt.name, all_results)
         opt.all_results = all_results
+        if _fp is not None:
+            db.merge(StrategyOptimizationPopulation(
+                optimization_id=opt_id, gene_space_signature=_fp["gene_space"],
+                population=_fp["population"]))
         db.commit()
         push_optimization(opt, db)
         logger.info(

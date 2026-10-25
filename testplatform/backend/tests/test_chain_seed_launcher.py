@@ -73,3 +73,12 @@ def test_chain_seed_with_warm_start_is_refused(monkeypatch):
         _run_optimize(_parse(_BASE_ARGV + ["--chain-seed-from", "cell-launcher-both",
                                            "--warm-start-from", "1"]), monkeypatch)
     assert "mutually exclusive" in str(e.value)
+
+
+def test_persist_flag_and_chain_seed_both_require_a_stored_population(monkeypatch):
+    _opt("cell-launcher-req", "completed")
+    cfg = _run_optimize(_parse(_BASE_ARGV + ["--persist-final-population"]), monkeypatch)
+    assert cfg["requireFinalPopulation"] is True
+    cfg = _run_optimize(_parse(_BASE_ARGV + ["--chain-seed-from", "cell-launcher-req"]), monkeypatch)
+    assert cfg["requireFinalPopulation"] is True
+    assert "requireFinalPopulation" not in _run_optimize(_parse(_BASE_ARGV), monkeypatch)

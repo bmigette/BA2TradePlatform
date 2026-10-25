@@ -213,3 +213,11 @@ def test_exclusive_flag_reaches_the_plan_the_verdict_and_the_report(tmp_path):
     assert res.overall_passed is False and res.exclusive_return is True
     _jp, mp = WF.write_report(res, str(tmp_path))
     assert "--pass-min-oos-return-exclusive" in Path(mp).read_text(encoding="utf-8")
+
+
+def test_every_job_of_a_chain_is_told_to_persist_its_population():
+    first = WF.train_command("ba2-test", [], "p", FOLDS[0], prev=None, seed_chain=True)
+    assert "--persist-final-population" in first and "--chain-seed-from" not in first
+    later = WF.train_command("ba2-test", [], "p", FOLDS[1], prev=FOLDS[0], seed_chain=True)
+    assert "--chain-seed-from" in later and "--persist-final-population" not in later   # implied
+    assert "--persist-final-population" not in WF.train_command("ba2-test", [], "p", FOLDS[0])

@@ -50,6 +50,28 @@ def _cfg(opt_id):
     return T._load_opt(opt_id).optimization_config
 
 
+def _distinct(rec):
+    """Distinct genomes of a stored population, fittest first (the seeder drops the GA's elite clones)."""
+    out, seen = [], set()
+    for i in sorted(range(len(rec["genes"])), key=lambda i: rec["fitnesses"][i], reverse=True):
+        k = tuple(rec["genes"][i])
+        if k not in seen:
+            seen.add(k)
+            out.append(rec["genes"][i])
+    return out
+
+
+def _pop(opt_id):
+    """The stored final population as the flat record the seeder reads (table row, not config)."""
+    from app.models.strategy_optimization import StrategyOptimizationPopulation as P
+    from app.services.chain_seed import stored_record
+    db = SessionLocal()
+    try:
+        return stored_record(db.get(P, opt_id))
+    finally:
+        db.close()
+
+
 # ----------------------------------------------------------------------------- task 1: persist
 
 
@@ -86,10 +108,11 @@ def test_handler_stores_final_population_with_gene_space():
     sid = T._seed_strategy()
     opt_id, out = _run(sid, "src-store", populationSize=8, generations=3)
     assert out["status"] == "completed", out
-    fp = _cfg(opt_id)["finalPopulation"]
+    fp = _pop(opt_id)
     names = ["entry:bracket:a1:action_value", "entry:bracket:a2:action_value"]
     assert fp["gene_names"] == names
     assert [g["name"] for g in fp["gene_space"]] == names
+    assert "finalPopulation" not in _cfg(opt_id)
     assert len(fp["genes"]) == len(fp["fitnesses"]) == 8
     assert fp["generation"] == 2
 
@@ -122,15 +145,17 @@ def _source(sid, name="cell-wf1", pop=8, end="2024-01-08"):
 def test_new_job_starts_from_the_sources_stored_final_population(monkeypatch):
     sid = T._seed_strategy()
     src = _source(sid)
-    stored = _cfg(src)["finalPopulation"]
+    stored = _pop(src)
     spy = _Spy(monkeypatch)
     tgt, out = _run(sid, "cell-wf2", populationSize=8, generations=1, chainSeedFromOptimizationId=src)
     assert out["status"] == "completed", out
     init = [list(i) for i in spy.captured["initial_population"]]
-    assert sorted(init) == sorted(stored["genes"])          # same 8 genomes, nothing random
+    distinct = _distinct(stored)
+    assert sorted(init[:len(distinct)]) == sorted(distinct)    # every distinct genome, none random
     seeded = _cfg(tgt)["seededFrom"]
     assert seeded["optimization_id"] == src and seeded["name"] == "cell-wf1"
-    assert seeded["stored_population"] == 8 and seeded["filled_random"] == 0
+    assert seeded["stored_population"] == 8 and seeded["seeded"] == len(distinct)
+    assert seeded["dropped_duplicates"] == 8 - len(distinct)      # the GA clones its elites
 
 
 def test_short_stored_population_is_filled_randomly_and_counted(monkeypatch, caplog):
@@ -143,33 +168,33 @@ def test_short_stored_population_is_filled_randomly_and_counted(monkeypatch, cap
     assert out["status"] == "completed", out
     assert len(spy.captured["initial_population"]) == 12
     seeded = _cfg(tgt)["seededFrom"]
-    assert seeded["seeded"] == 8 and seeded["filled_random"] == 4
-    assert any("filled 4 individual" in r.getMessage() for r in caplog.records)
+    n = len(_distinct(_pop(src)))
+    assert seeded["seeded"] == n and seeded["filled_random"] == 12 - n
+    assert any(f"filled {12 - n} randomly" in r.getMessage() for r in caplog.records)
 
 
 def test_long_stored_population_keeps_the_fittest(monkeypatch):
     sid = T._seed_strategy()
     src = _source(sid, pop=8)
-    stored = _cfg(src)["finalPopulation"]
+    stored = _pop(src)
     spy = _Spy(monkeypatch)
     tgt, out = _run(sid, "cell-wf2", populationSize=4, generations=1, chainSeedFromOptimizationId=src)
     assert out["status"] == "completed", out
-    top = sorted(range(8), key=lambda i: stored["fitnesses"][i], reverse=True)[:4]
-    assert sorted(list(i) for i in spy.captured["initial_population"]) == \
-        sorted(stored["genes"][i] for i in top)
+    top = _distinct(stored)[:4]
+    assert len(top) == 4
+    assert sorted(list(i) for i in spy.captured["initial_population"]) == sorted(top)
 
 
 def test_space_mismatch_is_refused_not_dropped(monkeypatch):
     sid = T._seed_strategy()
     src = _source(sid)
+    from app.models.strategy_optimization import StrategyOptimizationPopulation as P
     db = SessionLocal()
     try:
-        row = db.query(StrategyOptimization).filter(StrategyOptimization.id == src).one()
-        cfg = dict(row.optimization_config)
-        fp = dict(cfg["finalPopulation"])
-        fp["gene_space"] = [dict(fp["gene_space"][0], max=99.0), fp["gene_space"][1]]
-        cfg["finalPopulation"] = fp
-        row.optimization_config = cfg
+        row = db.get(P, src)
+        sig = [dict(g) for g in row.gene_space_signature]
+        sig[0]["max"] = 99.0
+        row.gene_space_signature = sig
         db.commit()
     finally:
         db.close()
@@ -233,7 +258,7 @@ def test_checkpoint_resumed_chain_job_still_records_its_seed_source(monkeypatch)
     the row must still name the seed source so the chain's lineage check holds."""
     sid = T._seed_strategy()
     src = _source(sid, name="res-wf1")
-    stored = _cfg(src)["finalPopulation"]
+    stored = _pop(src)
     ckpt = {"generation": 0, "partial": True, "population": stored["genes"],
             "fitnesses": [None] * len(stored["genes"]), "history": [], "best_individual": stored["genes"][0],
             "best_fitness": max(stored["fitnesses"]), "robust_fitness": False,
@@ -284,3 +309,45 @@ def test_a_job_that_must_persist_a_population_fails_loudly_without_one(monkeypat
     # an ordinary job is unaffected
     opt2, out2 = _run(sid, "plain-pop")
     assert out2["status"] == "completed"
+
+
+def test_a_chain_job_without_an_end_date_is_refused(monkeypatch):
+    sid = T._seed_strategy()
+    src = _source(sid)
+    opt_id = T._seed_opt(sid, config=T._ga_config(chainSeedFromOptimizationId=src))
+    db = SessionLocal()
+    try:
+        row = db.get(StrategyOptimization, opt_id)
+        cfg = dict(row.optimization_config)
+        cfg["backtest"] = {k: v for k, v in cfg["backtest"].items() if k != "end_date"}
+        row.optimization_config = cfg
+        db.commit()
+    finally:
+        db.close()
+    out = H.handle_strategy_optimization("t-no-end", {"optimization_id": opt_id})
+    assert out["status"] == "failed" and "no end_date" in out["error"]
+
+
+def test_failed_and_duplicate_individuals_are_dropped_before_padding(monkeypatch):
+    from app.models.strategy_optimization import StrategyOptimizationPopulation as P
+    sid = T._seed_strategy()
+    src = _source(sid)
+    db = SessionLocal()
+    try:
+        row = db.get(P, src)
+        pop = dict(row.population)
+        g0 = pop["genes"][0]
+        pop["genes"] = [g0, list(g0), [3.0, -2.0], [4.0, -2.0], [5.0, -3.0]]
+        pop["fitnesses"] = [9.0, 8.5, -1.0e9, 7.0, 6.0]
+        row.population = pop
+        db.commit()
+    finally:
+        db.close()
+    spy = _Spy(monkeypatch)
+    tgt, out = _run(sid, "dedupe-wf2", populationSize=6, generations=1, chainSeedFromOptimizationId=src)
+    assert out["status"] == "completed", out
+    s = _cfg(tgt)["seededFrom"]
+    assert (s["stored_population"], s["dropped_failed"], s["dropped_duplicates"], s["seeded"],
+            s["filled_random"]) == (5, 1, 1, 3, 3)
+    init = [list(i) for i in spy.captured["initial_population"]]
+    assert [3.0, -2.0] not in init[:3] and init.count(list(g0)) >= 1

@@ -232,7 +232,9 @@ def train_command(launcher: Any, user_args: Sequence[str], prefix: str, fold: Fo
     is rendered as ``--chain-seed-from <previous fold's job>`` when ``seed_chain`` and ``prev``."""
     seed = initial_population_for_fold(fold, prev if seed_chain else None, prefix)
     head = [launcher] if isinstance(launcher, str) else list(launcher)
-    seed_args = ["--chain-seed-from", seed.source_job] if seed is not None else []
+    # Every job of a chain stores its final population (fold 1 has no seed but seeds fold 2).
+    seed_args = (["--chain-seed-from", seed.source_job] if seed is not None
+                 else ["--persist-final-population"] if seed_chain else [])
     return [*head, "optimize", *user_args, *extra_args, *seed_args, "--start",
             fold.train_start.isoformat(), "--end", fold.train_end.isoformat(), "--name",
             train_job_name(prefix, fold.index)]

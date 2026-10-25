@@ -2,8 +2,8 @@
 
 Three jobs, all pure apart from reading the source ``StrategyOptimization`` row they are handed:
 
-* ``final_population_record`` -- what the handler stores on a COMPLETED row
-  (``optimization_config["finalPopulation"]``): the genes and fitnesses of the last EVALUATED
+* ``final_population_record`` -- what the handler stores for a COMPLETED job in the
+  ``strategy_optimization_populations`` table: the genes and fitnesses of the last EVALUATED
   generation plus the gene-space signature they were bred in.
 * ``build_chain_seed_population`` -- read that record back for a NEW job: refuse loudly when it is
   missing, when the new job's gene space differs, or when the source saw data beyond the new job's
@@ -24,7 +24,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-FINAL_POPULATION_KEY = "finalPopulation"
 SEEDED_FROM_KEY = "seededFrom"
 CHAIN_SEED_KEY = "chainSeedFromOptimizationId"
 
@@ -46,14 +45,22 @@ def gene_space_signature(param_ranges: Dict[str, Dict[str, Any]]) -> List[Dict[s
 
 def final_population_record(param_ranges: Dict[str, Dict[str, Any]],
                             snapshot: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """The record stored under ``finalPopulation`` (None when no generation was evaluated)."""
+    """What the handler stores in ``strategy_optimization_populations`` (None when no generation
+    was evaluated): ``gene_space`` -> the signature column, ``population`` -> the population column."""
     if not snapshot or not snapshot.get("genes"):
         return None
-    return {"generation": int(snapshot["generation"]),
-            "gene_names": list(param_ranges.keys()),
-            "gene_space": gene_space_signature(param_ranges),
-            "genes": [list(g) for g in snapshot["genes"]],
-            "fitnesses": [float(f) for f in snapshot["fitnesses"]]}
+    return {"gene_space": gene_space_signature(param_ranges),
+            "population": {"generation": int(snapshot["generation"]),
+                           "gene_names": list(param_ranges.keys()),
+                           "genes": [list(g) for g in snapshot["genes"]],
+                           "fitnesses": [float(f) for f in snapshot["fitnesses"]]}}
+
+
+def stored_record(row: Any) -> Optional[Dict[str, Any]]:
+    """The flat record ``build_chain_seed_population`` reads, from a population-table row."""
+    if row is None:
+        return None
+    return {**row.population, "gene_space": row.gene_space_signature}
 
 
 def _diff(stored: List[Dict[str, Any]], current: List[Dict[str, Any]]) -> str:
@@ -79,58 +86,79 @@ def _iso_end(cfg: Dict[str, Any]) -> Optional[date]:
     return date.fromisoformat(str(raw)[:10]) if raw else None
 
 
-def build_chain_seed_population(source_opt: Any, optimizer: Any, target_size: int,
-                                this_end: Optional[date]) -> Tuple[list, Dict[str, Any]]:
-    """(population, info) seeding a new job from ``source_opt``'s stored final population.
+def build_chain_seed_population(source_opt: Any, record: Optional[Dict[str, Any]], optimizer: Any,
+                                target_size: int, this_end: Optional[date]
+                                ) -> Tuple[list, Dict[str, Any]]:
+    """(population, info) seeding a new job from ``source_opt`` and its stored final population
+    ``record`` (the ``strategy_optimization_populations`` row: ``gene_space`` + population dict).
 
     ``this_end`` is the NEW job's train-window end: a source that trained past it has seen data this
-    job's test window may contain (look-ahead) and is refused. Raises ``ChainSeedError``.
+    job's test window may contain (look-ahead) and is refused; a job with no end date cannot prove
+    anything and is refused too. Failed-evaluation individuals and duplicate genomes are dropped
+    BEFORE padding, so the random fill is never displaced by junk. Raises ``ChainSeedError``.
     """
     who = f"chain seed source {source_opt.id} ({source_opt.name!r})"
     if source_opt.status != "completed":
         raise ChainSeedError(f"{who} is {source_opt.status!r}, not completed")
-    cfg = source_opt.optimization_config or {}
-    rec = cfg.get(FINAL_POPULATION_KEY)
-    if not rec or not rec.get("genes"):
+    if not record or not record.get("genes"):
         raise ChainSeedError(
             f"{who} has no stored final population (it ran before final populations were "
             f"persisted, or no generation was evaluated). Re-run it under a new name; there is "
             f"deliberately no fallback to all_results.")
     current = gene_space_signature(optimizer.param_ranges)
-    if rec["gene_space"] != current:
+    if record["gene_space"] != current:
         raise ChainSeedError(f"{who} was bred in a different gene space: "
-                             f"{_diff(rec['gene_space'], current)}")
+                             f"{_diff(record['gene_space'], current)}")
+    cfg = source_opt.optimization_config or {}
     src_end = _iso_end(cfg)
-    if this_end is not None:
-        if src_end is None:
-            raise ChainSeedError(f"{who} records no end_date; cannot prove it saw no data past "
-                                 f"{this_end}")
-        if src_end > this_end:
-            raise ChainSeedError(
-                f"{who} trained to {src_end}, after this job's window ends ({this_end}): seeding "
-                f"would carry knowledge of data this job must not have seen (look-ahead)")
-    genes = rec["genes"]
-    fits = rec["fitnesses"]
+    if this_end is None:
+        raise ChainSeedError(f"this job has no end_date, so {who} cannot be shown to have seen "
+                             f"no later data (look-ahead check impossible)")
+    if src_end is None:
+        raise ChainSeedError(f"{who} records no end_date; cannot prove it saw no data past "
+                             f"{this_end}")
+    if src_end > this_end:
+        raise ChainSeedError(
+            f"{who} trained to {src_end}, after this job's window ends ({this_end}): seeding "
+            f"would carry knowledge of data this job must not have seen (look-ahead)")
+    genes = record["genes"]
+    fits = record["fitnesses"]
     if len(genes) != len(fits):
         raise ChainSeedError(f"{who}: {len(genes)} genomes but {len(fits)} fitnesses")
     for i, g in enumerate(genes):
         if len(g) != len(current):
             raise ChainSeedError(f"{who}: genome #{i} has {len(g)} genes, space has {len(current)}")
+    from app.services.genetic import FITNESS_EVALUATION_FAILED
     order = sorted(range(len(genes)), key=lambda i: fits[i], reverse=True)
     n_stored = len(genes)
-    keep = order[:target_size]
-    seeds = [genes[i] for i in keep]
+    failed = [i for i in order if fits[i] <= FITNESS_EVALUATION_FAILED]
+    seen, kept = set(), []
+    for i in order:
+        if fits[i] <= FITNESS_EVALUATION_FAILED:
+            continue
+        key = genome_key(genes[i])
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(i)
+    dupes = n_stored - len(failed) - len(kept)
+    seeds = [genes[i] for i in kept[:target_size]]
     filled = max(0, target_size - len(seeds))
     population = optimizer.seeded_population(seeds, target_size)
-    if filled:
-        logger.warning(f"chain seed from {source_opt.name!r}: stored population {n_stored} < "
-                       f"{target_size}; filled {filled} individual(s) randomly")
-    if n_stored > target_size:
-        logger.warning(f"chain seed from {source_opt.name!r}: stored population {n_stored} > "
-                       f"{target_size}; kept the fittest {target_size}")
+    logger.warning(f"chain seed from {source_opt.name!r}: stored {n_stored}, dropped {len(failed)} "
+                   f"failed + {dupes} duplicate; seeded {len(seeds)}, filled {filled} randomly "
+                   f"(target {target_size})")
     from app.services.strategy_optimization_handler import assert_population_screener_genes_in_range
     assert_population_screener_genes_in_range(optimizer, population)
-    return population, lineage(source_opt, n_stored, len(seeds), filled, src_end)
+    info = lineage(source_opt, n_stored, len(seeds), filled, src_end)
+    info.update({"dropped_failed": len(failed), "dropped_duplicates": dupes})
+    return population, info
+
+
+def genome_key(genes: List[Any]) -> tuple:
+    """Canonical identity of a chromosome: the gene values, floats rounded so a JSON round trip or
+    a 1-ulp difference cannot make two copies of one genome look distinct."""
+    return tuple(round(g, 9) if isinstance(g, float) else g for g in genes)
 
 
 def lineage(source_opt: Any, stored: int, seeded: int, filled_random: int,

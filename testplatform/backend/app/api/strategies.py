@@ -656,6 +656,17 @@ def _stamp_new_optimization_source(cfg: dict, strategy_id: int, db: Session) -> 
     return out
 
 
+#: Keys that describe ANOTHER job's chain position. A config copied from a stored optimization
+#: (UI clone / batch template) must not inherit them: the new job is not that job's walk-forward
+#: successor, and a requirement to persist a population is the chain's, not the clone's.
+_LINEAGE_KEYS = ("seededFrom", "chainSeedFromOptimizationId", "requireFinalPopulation",
+                 "finalPopulation")
+
+
+def _drop_lineage(cfg: dict) -> dict:
+    return {k: v for k, v in cfg.items() if k not in _LINEAGE_KEYS}
+
+
 def _enqueue_optimization(
     db: Session,
     *,
@@ -674,7 +685,7 @@ def _enqueue_optimization(
     /optimize-batch fan-out, so a batched job is byte-identical to a single one. Returns
     (row, task_id).
     """
-    cfg = _stamp_new_optimization_source(cfg, strategy_id, db)
+    cfg = _stamp_new_optimization_source(_drop_lineage(cfg), strategy_id, db)
     row = StrategyOptimization(
         strategy_id=strategy_id,
         name=name,

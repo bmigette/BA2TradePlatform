@@ -7494,6 +7494,8 @@ def _cmd_optimize(args) -> int:
         if getattr(args, "chain_seed_from", None):
             cfg["chainSeedFromOptimizationId"] = _resolve_chain_seed_source(
                 db, args.chain_seed_from, getattr(args, "warm_start_from", None))
+        if getattr(args, "persist_final_population", False) or getattr(args, "chain_seed_from", None):
+            cfg["requireFinalPopulation"] = True
         _worker_ids = _worker_ids_from_args(args)
         opt = StrategyOptimization(
             strategy_id=strat.id, name=args.name or f"opt-{expert}",
@@ -8970,6 +8972,10 @@ def main(argv: "list | None" = None) -> int:
                          "(look-ahead); a short population is padded randomly (count logged and "
                          "recorded as optimization_config.seededFrom). Mutually exclusive with "
                          "--warm-start-from.")
+    op.add_argument("--persist-final-population", action="store_true",
+                    help="Fail the job at completion unless its final evaluated population was "
+                         "stored (strategy_optimization_populations). Implied by --chain-seed-from; "
+                         "the walk-forward engine passes it to fold 1, which seeds fold 2.")
     op.add_argument("--initial-capital", type=float, default=10000.0)
     op.add_argument("--equity-cap", type=float, default=None,
                     help="Optional FIXED equity the risk manager sizes against, in dollars "
