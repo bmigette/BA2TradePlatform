@@ -721,12 +721,40 @@ def _suspension_events_for(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # Worker-process memo: the calendar is market-wide and identical for every GA individual of a
-# run, so building it once per (benchmark, window) instead of once per trial keeps it off the hot
-# path entirely. Keyed on the window because a grid may run several date ranges in one worker.
+# run, so building it once per (benchmark, source, window) instead of once per trial keeps it off the hot
+# path entirely. Keyed on the window because a grid may run several date ranges in one worker, and on the
+# HISTORY SOURCE because one worker may serve an fmp job and an alpaca job: the two closes differ, and a
+# calendar built from one must never be reused for the other. (Before 2026-10-24 this key had no source;
+# for a single-source worker the change is behaviour-neutral.)
 _REGIME_CALENDAR_MEMO: Dict[Any, Any] = {}
+_BENCHMARK_CALENDAR_MEMO: Dict[Any, Any] = {}
 
 
-def _build_regime_calendar(raw_ohlcv: Any, start_date: Any, end_date: Any):
+def _benchmark_daily_series(raw_ohlcv: Any, start_date: Any, end_date: Any):
+    """``(dates, closes)`` of the benchmark's DAILY history for a run window, or None when the cache
+    has none. ONE read serves the overlay calendar and the benchmark-regime calendar so their inputs
+    are identical."""
+    from datetime import timedelta
+
+    from app.services.backtest.price_source import MemoizedOHLCVProvider
+
+    # A SEPARATE bounded reader: the run's own MemoizedOHLCVProvider is clamped to
+    # [start - warmup_days, end] at the EXECUTION interval, which is both too short and
+    # (on an intraday run) the wrong granularity for a 504-DAILY-bar rank window.
+    bench = MemoizedOHLCVProvider(
+        raw_ohlcv,
+        start_date - timedelta(days=_REGIME_LOOKBACK_DAYS),
+        end_date,
+        interval="1d",
+        cached_only=True,
+    )
+    df = bench.get_ohlcv_data(_REGIME_BENCHMARK, interval="1d")
+    if df is None or not len(df):
+        return None
+    return df["Date"].tolist(), df["Close"].tolist()
+
+
+def _build_regime_calendar(raw_ohlcv: Any, start_date: Any, end_date: Any, history_source: str):
     """The run's ``StressedCalendar``, or None when the benchmark's history is unavailable.
 
     Returning None is NOT silently fine: ``DailyBacktestEngine.run`` refuses to start when any
@@ -734,33 +762,21 @@ def _build_regime_calendar(raw_ohlcv: Any, start_date: Any, end_date: Any):
     can never turn the overlay genes into dead search space (the ``use_atr_stop`` failure mode).
     Runs that don't use the overlay are unaffected and just carry None.
     """
-    from datetime import timedelta
-
     from ba2_common.core.regime_overlay import StressedCalendar
-    from app.services.backtest.price_source import MemoizedOHLCVProvider
 
-    key = (_REGIME_BENCHMARK, str(start_date), str(end_date))
+    key = (_REGIME_BENCHMARK, history_source, str(start_date), str(end_date))
     if key in _REGIME_CALENDAR_MEMO:
         return _REGIME_CALENDAR_MEMO[key]
 
     cal = None
     try:
-        # A SEPARATE bounded reader: the run's own MemoizedOHLCVProvider is clamped to
-        # [start - warmup_days, end] at the EXECUTION interval, which is both too short and
-        # (on an intraday run) the wrong granularity for a 504-DAILY-bar rank window.
-        bench = MemoizedOHLCVProvider(
-            raw_ohlcv,
-            start_date - timedelta(days=_REGIME_LOOKBACK_DAYS),
-            end_date,
-            interval="1d",
-            cached_only=True,
-        )
-        df = bench.get_ohlcv_data(_REGIME_BENCHMARK, interval="1d")
-        if df is not None and len(df):
-            cal = StressedCalendar(df["Date"].tolist(), df["Close"].tolist())
+        series = _benchmark_daily_series(raw_ohlcv, start_date, end_date)
+        if series is not None:
+            dates, closes = series
+            cal = StressedCalendar(dates, closes)
             logger.info(
-                f"Regime calendar built from {len(df)} {_REGIME_BENCHMARK} daily closes "
-                f"({df['Date'].iloc[0]} -> {df['Date'].iloc[-1]})")
+                f"Regime calendar built from {len(dates)} {_REGIME_BENCHMARK} daily closes "
+                f"({dates[0]} -> {dates[-1]})")
         else:
             logger.warning(f"Regime calendar: no {_REGIME_BENCHMARK} daily bars in the cache")
     except Exception as e:  # noqa: BLE001 -- a missing benchmark must not break non-overlay runs
@@ -768,6 +784,56 @@ def _build_regime_calendar(raw_ohlcv: Any, start_date: Any, end_date: Any):
 
     _REGIME_CALENDAR_MEMO[key] = cal
     return cal
+
+
+def _build_benchmark_regime_calendar(raw_ohlcv: Any, start_date: Any, end_date: Any,
+                                     history_source: str):
+    """The run's ``BenchmarkRegimeCalendar`` (SPY trend + vol regime), or None when SPY history is
+    unreadable. None is fatal for a gated run (``DailyBacktestEngine._check_regime_calendar``), so an
+    unreadable benchmark cannot turn the ``spy-*`` genes into dead search space."""
+    from ba2_common.core.benchmark_regime import BENCHMARK_SYMBOL, BenchmarkRegimeCalendar
+
+    key = (BENCHMARK_SYMBOL, history_source, str(start_date), str(end_date))
+    if key in _BENCHMARK_CALENDAR_MEMO:
+        return _BENCHMARK_CALENDAR_MEMO[key]
+
+    cal = None
+    try:
+        series = _benchmark_daily_series(raw_ohlcv, start_date, end_date)
+        if series is not None:
+            dates, closes = series
+            cal = BenchmarkRegimeCalendar(dates, closes)
+            logger.info(
+                f"Benchmark regime calendar built from {len(dates)} {BENCHMARK_SYMBOL} daily closes "
+                f"({dates[0]} -> {dates[-1]}, source {history_source})")
+        else:
+            logger.warning(f"Benchmark regime calendar: no {BENCHMARK_SYMBOL} daily bars in the "
+                           f"{history_source} cache")
+    except Exception as e:  # noqa: BLE001 -- surfaced by the engine refusal if the run is gated
+        logger.warning(f"Benchmark regime calendar unavailable ({type(e).__name__}: {e})")
+
+    _BENCHMARK_CALENDAR_MEMO[key] = cal
+    return cal
+
+
+def _config_uses_benchmark_regime(config: Any) -> bool:
+    """True when the run is gated on the SPY regime: the launcher flag, or ANY benchmark leaf
+    anywhere in the config (run-level rules, expert settings, JSON-encoded rule trees). The leaf walk
+    is what makes a stored-row re-run (no flag in its config) still get its calendar."""
+    from ba2_common.core.benchmark_regime import TREND_FIELD, VOL_FIELD
+    from app.services.backtest.seam_wiring import named_field_leaves_in
+
+    if isinstance(config, dict) and config.get("benchmark_regime_gates"):
+        return True
+    return bool(named_field_leaves_in(config, {TREND_FIELD, VOL_FIELD}))
+
+
+def _benchmark_calendar_for_run(raw_ohlcv: Any, config: Dict[str, Any]):
+    """The benchmark calendar when this run is gated, else None WITHOUT touching the cache."""
+    if not _config_uses_benchmark_regime(config):
+        return None
+    return _build_benchmark_regime_calendar(
+        raw_ohlcv, config["start_date"], config["end_date"], resolve_job_history_source(config))
 
 
 _SPREAD_KEYS = ("option_spread_model", "option_spread_pct", "option_spread_min_tick")
@@ -1094,7 +1160,10 @@ def run_daily_backtest(
                 progress_cb=progress,
                 indicator_provider=indicator_provider,
                 regime_calendar=_build_regime_calendar(
-                    raw_ohlcv, config["start_date"], config["end_date"]),
+                    raw_ohlcv, config["start_date"], config["end_date"],
+                    resolve_job_history_source(config)),
+                benchmark_calendar=_benchmark_calendar_for_run(raw_ohlcv, config),
+                benchmark_regime_required=_config_uses_benchmark_regime(config),
                 market_condition_record=market_condition_record,
             )
             # EVENT-data half of the knowability rule: on an intraday clock the readers admit an

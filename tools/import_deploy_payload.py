@@ -296,6 +296,12 @@ def main() -> int:
         except ValueError as e:
             print(f"FATAL: {label}: {e}")
             return 1
+        # SPY regime gates: live reads SPY from FMP. A backtest on another source is a WARNING, not
+        # a refusal (the gate itself is served by the host, no profile needed).
+        from ba2_common.core.benchmark_regime import benchmark_import_warnings
+        for _w in benchmark_import_warnings(entry["settings"].get("benchmark_regime"),
+                                            entry_rules, exit_rules):
+            print(f"WARNING: {label}: {_w}")
         if mc_profiles:
             print(f"market-condition profile(s): {list(mc_profiles)} (every market gate in the "
                   f"entry and exit rules is served)")

@@ -114,6 +114,8 @@ _DISCOVERY_STRATEGIES = [
 _DISCOVERY_EXCLUDED = {"O_SSTG", "O_SSTD"}
 _DISCOVERY_EXPERTS = ["FMPRating", "DeterministicScorer"]
 _NEUTRAL_STRUCTURES = {"O_IC", "O_STRD", "O_STRG"}
+# Option keys whose builders emit NO SPY regime leaves (launcher: outside _PURE_OPTION_STRATEGIES).
+_NO_SPY_GATE = {"O_CC", "O_PP", "O_STK"}
 
 
 def _universe(path=_UNIVERSE_FILE) -> str:
@@ -342,6 +344,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "existing job names/commands are unchanged; a digest token when on, so "
                          "a sized run never shares a name (checkpoint) with an unsized one. "
                          "tools/stage1_run.sh passes it.")
+    ap.add_argument("--benchmark-regime-gates", action="store_true", default=False,
+                    help="Forward --benchmark-regime-gates to every job: append the SPY trend / "
+                         "vol regime entry gates (two categorical mode genes per member) to each "
+                         "option structure. Option structures only (O_CC/O_PP/O_STK and equity "
+                         "keys are refused). Off by default so existing job names/commands are "
+                         "unchanged; a digest token when on, so a SPY-gated run never shares a "
+                         "name (checkpoint) with an ungated one.")
     ap.add_argument("--end", default="2025-12-31",
                     help="Backtest end (default 2025-12-31: 2026 is the reserved "
                          "walk-forward holdout and the launcher refuses to search into it).")
@@ -530,6 +539,14 @@ def resolve_args(ap, argv=None):
         ap.error("--market-condition-manifest was given without --market-condition-profile: "
                  "nothing would read that snapshot and the jobs would run UNGATED under the "
                  "ungated job names. Pass --market-condition-profile, or drop the manifest.")
+    if getattr(args, "benchmark_regime_gates", False):
+        # The launcher refuses it per job for any other key; refusing here keeps it off the
+        # job names and out of --dry-run listings too.
+        bad = [k for k in args.strategies.split(",") if not k.startswith("O") or k in _NO_SPY_GATE]
+        if bad:
+            ap.error(f"--benchmark-regime-gates: {bad} emit no SPY regime gates (option "
+                     f"structures only; O_CC/O_PP/O_STK are not gated). Pass --strategies "
+                     f"explicitly (the discovery default list includes O_CC/O_PP)")
     try:
         start, end = date.fromisoformat(args.start), date.fromisoformat(args.end)
     except ValueError:
@@ -615,6 +632,9 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
     # Robustness is DEFAULT-ON in the launcher, so the ON case passes nothing (every existing
     # job name is unchanged) and only the opt-OUT is forwarded -- and it is a digest token, so a
     # raw-ranked run cannot share a name, and therefore a checkpoint, with a robust one.
+    # SPY regime gates: forwarded only when on, so every existing command and digest is unchanged.
+    if getattr(args, "benchmark_regime_gates", False):
+        cmd += ["--benchmark-regime-gates"]
     if not args.robust_fitness:
         cmd += ["--no-robust-fitness"]
     if args.workers:
@@ -673,7 +693,8 @@ def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_
     while i < len(tokens):
         flag = tokens[i]
         if flag in ("--fitness-trade-scale", "--fitness-win-rate-factor",
-                    "--no-robust-fitness", "--option-size-within-fill-volume"):
+                    "--no-robust-fitness", "--option-size-within-fill-volume",
+                    "--benchmark-regime-gates"):
             config[flag] = True
             i += 1
         else:

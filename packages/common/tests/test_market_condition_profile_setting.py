@@ -106,7 +106,11 @@ def test_a_field_name_this_registry_does_not_know_is_unserved_not_ignored():
     naming one this build's registry retired must be REFUSED, not treated as a plain condition."""
     from ba2_common.core.market_condition_rules import STRICT_FIELD_NAMES
 
-    retired = sorted(STRICT_FIELD_NAMES - {f.name for p in PROFILES.values() for f in p.fields})
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS
+
+    # The SPY benchmark names are strict but need no profile (always served): not "retired".
+    retired = sorted(STRICT_FIELD_NAMES - {f.name for p in PROFILES.values() for f in p.fields}
+                     - set(BENCHMARK_FIELDS))
     if not retired:
         pytest.skip("every strict name is registered in this build")
     with pytest.raises(ValueError, match=retired[0]):

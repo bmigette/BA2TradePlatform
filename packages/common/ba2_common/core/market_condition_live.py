@@ -435,6 +435,25 @@ def market_condition_fields_in_ruleset(ruleset_id: Any) -> Tuple[Tuple[str, str]
     return tuple(found)
 
 
+def benchmark_leaves_in_ruleset(ruleset_id: Any) -> Tuple[Tuple[str, str], ...]:
+    """``(label, field)`` for every SPY benchmark-regime leaf (``spy_trend_regime`` /
+    ``spy_vol_regime``) in a PERSISTED live ruleset; same shape and labels as
+    :func:`market_condition_fields_in_ruleset`. These two fields are NOT market-condition profile
+    fields (no manifest, no per-instance reader): the live host serves them through the
+    ``benchmark_regime`` seam."""
+    from ba2_common.core.benchmark_regime import TREND_FIELD, VOL_FIELD
+    from ba2_common.core.db import ruleset_event_actions
+
+    if ruleset_id is None:
+        return ()
+    found: list = []
+    for action in ruleset_event_actions(ruleset_id):
+        for key, trigger in (action.triggers or {}).items():
+            if isinstance(trigger, Mapping) and trigger.get("event_type") in (TREND_FIELD, VOL_FIELD):
+                found.append((f"{action.name}.{key}", str(trigger["event_type"])))
+    return tuple(found)
+
+
 def experts_linked_to_rulesets(ruleset_ids: Sequence[Any], *,
                                session: Any = None) -> Tuple[Tuple[int, str, int], ...]:
     """``(instance_id, slot, ruleset_id)`` for EVERY expert instance -- enabled or not -- whose
