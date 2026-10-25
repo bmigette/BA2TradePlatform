@@ -611,19 +611,25 @@ def optimize_strategy(
     # Weave the optional screener-settings optimization into the config exactly like the CLI:
     # the store/base/cadence block onto backtest["screener_opt"] + the param ranges merged into
     # expert_params pre-prefixed with "screener:". No-op when screener_opt is absent.
+    name = req.name
     if req.screener_opt is not None:
-        _merge_screener_opt(cfg, req.screener_opt)
+        # the universe, panel and cache check are built on the job's OHLCV history: stamp it first (the same rule the
+        # row creation applies; an explicit value in the payload wins)
+        cfg = _stamp_new_optimization_source(cfg, strategy_id, db)
+        bypass = _merge_screener_opt(cfg, req.screener_opt)
+        name = _screener_job_name(name, bypass)
+        _check_warm_start_seeds(cfg, db)
 
     row, task_id = _enqueue_optimization(
         db,
         strategy_id=strategy_id,
-        name=req.name,
+        name=name,
         fitness_metric=req.fitness_metric,
         optimization_type=req.optimization_type,
         cfg=cfg,
         worker_ids=req.worker_ids,
         description=f"Joint genetic optimization for strategy {strategy_id}",
-        task_name=req.name or f"Optimize strategy {strategy.name} ({req.fitness_metric})",
+        task_name=name or f"Optimize strategy {strategy.name} ({req.fitness_metric})",
     )
     return {"optimizationId": row.id, "taskId": task_id, **row.to_dict()}
 
@@ -743,13 +749,14 @@ def optimize_batch(req: OptimizeBatchRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="experts must be a non-empty list")
 
     prefix = req.name_prefix or "batch"
-    created = []
+    # PHASE 1 -- build and validate EVERY job's config before enqueueing any: a refusal of the screener launch (panel,
+    # coverage, uncached symbols ...) for one expert must not leave the others of the batch half-enqueued.
+    prepared = []
+    screener_memo: dict = {}      # one universe build per distinct (kind of) job in this batch
     for expert in experts:
         cfg = _copy.deepcopy(req.optimization_config or {})
         if req.expert_params is not None:
             cfg["expert_params"] = _copy.deepcopy(req.expert_params)
-        if req.screener_opt is not None:
-            _merge_screener_opt(cfg, req.screener_opt)
 
         # Inject THIS expert into the backtest block's experts list. Preserve any per-expert
         # fixed settings already present in the template for the same class; otherwise add a bare
@@ -765,7 +772,19 @@ def optimize_batch(req: OptimizeBatchRequest, db: Session = Depends(get_db)):
         backtest["experts"] = [matched] if matched is not None else [{"class": expert, "settings": {}}]
         cfg["backtest"] = backtest
 
+        # The screener launch needs THIS expert in the block (a bypass expert like FactorRanker keeps the weekly store
+        # gate), so it is woven in after the injection.
         job_name = f"{prefix}-{expert}-{req.fitness_metric}"
+        if req.screener_opt is not None:
+            cfg = _stamp_new_optimization_source(cfg, req.strategy_id, db)
+            bypass = _merge_screener_opt(cfg, req.screener_opt, memo=screener_memo)
+            job_name = _screener_job_name(job_name, bypass)
+            _check_warm_start_seeds(cfg, db)
+        prepared.append((expert, cfg, job_name))
+
+    # PHASE 2 -- enqueue.
+    created = []
+    for expert, cfg, job_name in prepared:
         row, task_id = _enqueue_optimization(
             db,
             strategy_id=req.strategy_id,
@@ -788,63 +807,64 @@ def optimize_batch(req: OptimizeBatchRequest, db: Session = Depends(get_db)):
     return {"jobs": created, "count": len(created)}
 
 
-def _merge_screener_opt(cfg: dict, screener_opt: dict) -> None:
-    """Weave a screener-settings optimization block into an optimization_config IN PLACE.
+def _merge_screener_opt(cfg: dict, screener_opt: dict, *, memo: Optional[dict] = None) -> bool:
+    """Weave a screener-settings optimization into an optimization_config IN PLACE; returns True for a bypass expert.
 
-    Mirrors the CLI's _cmd_optimize --screener wiring so a UI-launched screener optimization
-    behaves identically to the headless one:
+    The SERVER builds the job's static universe and stamps, with the functions ``ba2-test optimize --screener`` calls
+    (``app.services.backtest.screener_launch`` / ``screener_job_request``): the daily-criteria-panel gate, the superset
+    universe, the hermetic cache check, the intraday coverage preflight, ``declared_ranges``, the screener genes
+    (``screener:screener_<name>``). A request that already carries stamps is verified against the server's own build.
 
-      1. ``cfg["backtest"]["screener_opt"]`` gets {store, base_settings, cadence_days,
-         apply_to_expert_settings} — the block the handler's ``_build_hoisted_state`` reads to
-         load the parquet metric store once + gate per-day entries. ``store`` defaults to the
-         shared ``ba2_common.config.SCREENER_STORE_DIR`` (``<BA2_HOME>/trade/screener/metric_store``)
-         when omitted, and a provided value is ``expanduser``-ed (so a UI-supplied ``~/...`` works).
-         ``base_settings`` defaults to {} and ``cadence_days`` to 7 (weekly).
-      2. ``param_ranges`` ({setting: {optimize,min,max,step,type}}) are merged into
-         ``cfg["expert_params"]`` with each key prefixed ``screener:`` so the handler routes them
-         to the screener namespace (it splits ``screener:``-prefixed keys out of expert_params).
+    HTTP mapping: a malformed or unsupported request is 400; a refusal of the simulation (panel missing / another criteria
+    version / window not covered / stale-listed symbols / pending exclusion entries / uncached symbols / intraday coverage
+    below the threshold / an unknown or malformed gene) is 409 with the CLI's own message (its list in ``problems``).
+
+    This runs in the request's worker thread (the route is a plain ``def``: FastAPI runs it in its threadpool, so the event
+    loop is never blocked), and the heavy build is serialised by a lock inside ``apply_screener_request``.
     """
-    import os as _os
-    from ba2_common.config import SCREENER_STORE_DIR as _DEFAULT_SCREENER_STORE
-    # THIS PATH CANNOT BUILD THE JOB'S STATIC UNIVERSE (the superset of the gene ranges over the daily criteria
-    # panel, ``universe_superset`` / ``screener_gate.static_universe``): it takes ``enabled_instruments`` as the
-    # request gives it and would stamp no rule, so the run-time guard would only WARN and every genome would be
-    # scored on a list that omits its own picks (the 2026-10-07 defect).  A screener optimization is launched
-    # through `ba2-test optimize --screener` (it builds the universe, checks the panel and stamps the rule);
-    # a request that replays an already-stamped launcher config is accepted.
-    from ba2_providers.screener.universe_superset import RULE_ID as _RULE_ID
-    _bt = cfg.get("backtest") or {}
-    _bypass = bool(screener_opt.get("apply_to_expert_settings"))   # FactorRanker: its universe comes from the weekly store
-    _stamped = (_bt.get("screener_universe_rule") == _RULE_ID
-                and bool(_bt.get("enabled_instruments"))
-                and (_bypass or (bool(screener_opt.get("criteria_version")) and bool(screener_opt.get("panel"))
-                                 and bool(screener_opt.get("panel_fingerprint")))))
-    if not _stamped:
-        raise HTTPException(
-            status_code=400,
-            detail="a screener-settings optimization cannot be launched from the API: it does not build the job's "
-                   f"static universe (rule {_RULE_ID}) nor check the daily criteria panel. Launch it with "
-                   "`ba2-test optimize --screener ...` (after `ba2-test prewarm --screener-panel`).")
-    store = screener_opt.get("store")
-    store = _os.path.expanduser(str(store)) if store else _os.path.expanduser(str(_DEFAULT_SCREENER_STORE))
-    backtest = dict(cfg.get("backtest") or {})
-    backtest["screener_opt"] = {
-        "store": store,
-        "base_settings": screener_opt.get("base_settings") or {},
-        "cadence_days": int(screener_opt.get("cadence_days", 7)),
-        "apply_to_expert_settings": bool(screener_opt.get("apply_to_expert_settings", False)),
-        **{k: screener_opt[k] for k in ("criteria_version", "behaviour", "panel", "panel_fingerprint", "declared_ranges")
-           if k in screener_opt},
-    }
-    cfg["backtest"] = backtest
+    from app.services.backtest import screener_job_request as sjr
+    from app.services.backtest import screener_launch as sl
+    from ba2_providers.screener.universe_superset import ScreenerUniverseError
+    from ba2_common.core.ohlcv_history_stamp import HistorySourceMismatch
+    from app.services.backtest.screener_gate import ScreenerGateRefusal
+    try:
+        applied = sjr.apply_screener_request(cfg, screener_opt, emit=logger.info, memo=memo)
+    except sjr.ScreenerRequestError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except sl.ScreenerLaunchRefused as e:
+        raise HTTPException(status_code=409, detail=e.text)
+    except ScreenerUniverseError as e:
+        raise HTTPException(status_code=409, detail=f"screener optimization REFUSED: {e}")
+    except (HistorySourceMismatch, ScreenerGateRefusal) as e:     # a metric store / panel built from the other OHLCV history
+        raise HTTPException(status_code=409, detail=f"screener optimization REFUSED: {e}")
+    if applied.verified_stamps:
+        logger.info(f"screener optimization: verified supplied stamps {applied.verified_stamps}")
+    return applied.bypass
 
-    param_ranges = screener_opt.get("param_ranges") or {}
-    if param_ranges:
-        expert_params = dict(cfg.get("expert_params") or {})
-        for name, spec in param_ranges.items():
-            key = name if str(name).startswith("screener:") else f"screener:{name}"
-            expert_params[key] = spec
-        cfg["expert_params"] = expert_params
+
+def _screener_job_name(name: Optional[str], bypass: bool) -> Optional[str]:
+    """The job name with the identity tokens every screener job carries (``-sup1``, and ``-lds2`` for a job gated by the
+    daily simulation): a name without them is a job under the old rules and must never be skipped / resumed as this one."""
+    if not name:
+        return name
+    from app.services.backtest import screener_launch as sl
+    return sl.universe_rule_name(name, simulated=not bypass)
+
+
+def _check_warm_start_seeds(cfg: dict, db: Session) -> None:
+    """A warm start from a job whose seeds lie outside the declared screener ranges is refused at LAUNCH (409)."""
+    wid = cfg.get("warmStartFromOptimizationId")
+    if not wid or not (cfg.get("backtest") or {}).get("screener_opt"):
+        return
+    src = db.query(StrategyOptimization).filter(StrategyOptimization.id == wid).first()
+    if src is None:
+        raise HTTPException(status_code=400, detail=f"warm-start source optimization {wid} not found")
+    from app.services.backtest import screener_job_request as sjr
+    from ba2_providers.screener.universe_superset import ScreenerGenomeOutOfRange
+    try:
+        sjr.check_warm_start(cfg, src.all_results or [])
+    except ScreenerGenomeOutOfRange as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 def _ranked_results(row) -> list:
