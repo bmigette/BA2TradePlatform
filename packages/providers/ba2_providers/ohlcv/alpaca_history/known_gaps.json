@@ -1,0 +1,4 @@
+{
+ "_doc": "REVIEWED sessions on which a symbol legitimately has NO bars (a trading halt, a suspension): the live top-up / backfill continuity rule then does not require them. Each entry needs symbol, session (ISO date), reason, added (ISO date) and reviewed_by; a missing field refuses to load. HOW TO USE: when the log says 'Alpaca has no bars for session(s) [...]' for a symbol, check that the symbol was really halted that day (exchange notice), then add {\"symbol\": \"XYZ\", \"session\": \"2026-10-20\", \"reason\": \"LULD halt all day, NYSE notice\", \"added\": \"2026-10-24\", \"reviewed_by\": \"you\"} to 'entries' and reload; the next read appends. Never add a session just to silence an error.",
+ "entries": []
+}

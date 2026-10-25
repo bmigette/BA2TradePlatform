@@ -95,6 +95,13 @@ def test_app_boots_through_wiring(tmp_path, monkeypatch, _fresh_wiring):
     from ba2_trade_platform.modules.dataproviders import get_provider
     assert get_provider("ohlcv", "yfinance") is not None
 
+    # 4b) The two per-account history-source resolvers are wired (conftest unwires them for every other test).
+    from ba2_common.core import TradeRiskManagement as rm_module
+    from ba2_common.core.backtest_context import get_live_history_resolver
+    from ba2_trade_platform.core import account_history
+    assert get_live_history_resolver() is account_history.history_spec_for_expert
+    assert rm_module.get_indicator_provider_resolver() is account_history.indicator_provider_for_expert
+
     # 5) Instrument-auto-adder hook installed on ba2_experts (Penny screening seam).
     import ba2_experts
     assert ba2_experts.get_instrument_auto_adder_hook() is not None

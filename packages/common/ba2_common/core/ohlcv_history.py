@@ -71,3 +71,41 @@ def other_history_cache_dirnames(source: str) -> Tuple[str, ...]:
     """The cache folders of every source except ``source`` (what a push for a ``source`` job leaves out)."""
     check_history_source(source)
     return tuple(sorted(folder for name, (_key, folder) in HISTORY_SOURCES.items() if name != source))
+
+
+#: The account setting that selects the live history source of that account's experts / transactions.
+ACCOUNT_HISTORY_SOURCE_KEY = "ohlcv_history_source"
+
+#: What an account with no (or a cleared) setting reads: the only place that spells this default
+#: (owner 2026-10-20: live stays FMP until an account is switched).
+ACCOUNT_DEFAULT_HISTORY_SOURCE = "fmp"
+
+
+def account_history_source(settings: Mapping) -> str:
+    """The history source of an account from its settings dict: absent / ``None`` -> the declared default;
+    a string -> its trimmed lower-case spelling, which must be known; anything else refuses
+    (``UnknownHistorySource``). An empty string refuses (the settings loader maps a stored empty to ``None``)."""
+    raw = settings[ACCOUNT_HISTORY_SOURCE_KEY] if ACCOUNT_HISTORY_SOURCE_KEY in settings else None
+    if raw is None:
+        return ACCOUNT_DEFAULT_HISTORY_SOURCE
+    if not isinstance(raw, str):
+        raise UnknownHistorySource(
+            f"{ACCOUNT_HISTORY_SOURCE_KEY} must be a string, got {type(raw).__name__} {raw!r}")
+    return check_history_source(raw.strip().lower())
+
+
+class HistoryUnavailable(RuntimeError):
+    """A named reason the OHLCV history a decision depends on cannot be used right now (a lock timeout, a gap, stale corporate
+    actions, a failed fetch, a symbol too new). Callers that size or protect an order from history must REFUSE the order on
+    this type; a handler that turns it into "no value" would silently trade without the input (owner: no silent failure)."""
+
+
+class InsufficientHistory(HistoryUnavailable, ValueError):
+    """A symbol has fewer bars than an indicator's window needs (an IPO 120 sessions old asked for a 200-period average).
+
+    Shared by the backtest and the live path: the indicator is NOT computed on the short series, and the caller must not
+    trade on it (owner 2026-10-24: "New symbol with not enough history should not trade")."""
+
+    def __init__(self, symbol: str, indicator: str, have: int, need: int):
+        self.symbol, self.indicator, self.have, self.need = symbol, indicator, have, need
+        super().__init__(f"insufficient history for {symbol}: {indicator} needs {need} bars, only {have} exist")
