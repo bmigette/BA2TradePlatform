@@ -243,3 +243,44 @@ def test_checkpoint_resumed_chain_job_still_records_its_seed_source(monkeypatch)
     assert out["status"] == "completed", out
     seeded = _cfg(tgt)["seededFrom"]
     assert seeded["name"] == "res-wf1" and seeded["resumed_from_checkpoint"] is True
+
+
+# ----------------------------------------------------------------------------- review fixes
+
+
+def test_resume_past_the_last_generation_still_returns_the_restored_population():
+    from app.services.genetic import GeneticOptimizer
+    space = {"a": {"type": "float", "min": 0, "max": 10, "step": 1},
+             "b": {"type": "float", "min": 0, "max": 10, "step": 1}}
+    opt = GeneticOptimizer(param_ranges=space, population_size=4, n_generations=3,
+                           crossover_prob=0.7, mutation_prob=0.3, early_stopping_generations=10,
+                           elitism_percent=10.0)
+    genes = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]
+    fits = [3.0, 7.0, 11.0, 15.0]
+    start, pop, rf = opt.resume_from_checkpoint({
+        "generation": 2, "partial": False, "population": genes, "fitnesses": fits, "history": [],
+        "best_individual": genes[3], "best_fitness": 15.0})
+    assert start == 3                                   # nothing left to run
+    res = opt.optimize(fitness_function=lambda p: 0.0, start_generation=start,
+                       initial_population=pop, restored_fitnesses=rf)
+    fp = res["final_population"]
+    assert fp["genes"] == genes and fp["fitnesses"] == fits and fp["generation"] == 2
+
+
+def test_a_job_that_must_persist_a_population_fails_loudly_without_one(monkeypatch):
+    import app.services.genetic as g
+    Real = g.GeneticOptimizer
+
+    class NoPop(Real):
+        def optimize(self, *a, **kw):
+            r = super().optimize(*a, **kw)
+            r["final_population"] = None
+            return r
+
+    monkeypatch.setattr(H, "GeneticOptimizer", NoPop)
+    sid = T._seed_strategy()
+    opt_id, out = _run(sid, "needs-pop", requireFinalPopulation=True)
+    assert out["status"] == "failed" and "final population" in out["error"]
+    # an ordinary job is unaffected
+    opt2, out2 = _run(sid, "plain-pop")
+    assert out2["status"] == "completed"

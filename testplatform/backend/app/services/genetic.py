@@ -1195,6 +1195,15 @@ class GeneticOptimizer:
             # Combine elites (unchanged) with new offspring
             population[:] = elites + offspring
 
+        if self.last_evaluated_population is None and initial_population and not                 [1 for ind in population if not ind.fitness.valid]:
+            # A resume that starts at (or past) the last generation runs no generation, but the
+            # restored population IS fully evaluated: it is the final population.
+            self.last_evaluated_population = {
+                'generation': start_generation - 1,
+                'genes': [list(ind) for ind in population],
+                'fitnesses': [float(ind.fitness.values[0]) for ind in population],
+            }
+
         # Final best
         best_params = self.decode_individual(self.best_individual)
 

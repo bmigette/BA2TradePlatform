@@ -2559,20 +2559,27 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 "config) before trusting any result.",
             )
 
+        _fp = None
+        if not is_brute_force:
+            # The last EVALUATED generation, so a walk-forward chain can seed the next fold from
+            # it (chain_seed.build_chain_seed_population). Reassigned, not mutated: SQLAlchemy
+            # does not see in-place changes to a JSON column.
+            _fp = final_population_record(optimizer.param_ranges, result.get("final_population"))
+            if _fp is None and (ga.get("requireFinalPopulation") or ga.get(CHAIN_SEED_KEY)):
+                # A chain job exists to hand its population on; completing without one would let
+                # the next fold fail (or worse, start cold) hours later. The checkpoint is kept.
+                return _fail(opt_id, db, "this job must persist a final population (walk-forward "
+                                         "chain) but the search produced none")
+            if _fp is not None:
+                opt.optimization_config = {**(opt.optimization_config or {}),
+                                           FINAL_POPULATION_KEY: _fp}
+
         # The search finished: drop the checkpoint so a later re-run of this name starts a fresh
         # search instead of resuming from the final generation of a completed one. (A brute-force
         # grid never read or wrote one.)
         if not is_brute_force:
             _clear_checkpoint(ckpt_task_id)
 
-        if not is_brute_force:
-            # The last EVALUATED generation, so a walk-forward chain can seed the next fold from
-            # it (chain_seed.build_chain_seed_population). Reassigned, not mutated: SQLAlchemy
-            # does not see in-place changes to a JSON column.
-            _fp = final_population_record(optimizer.param_ranges, result.get("final_population"))
-            if _fp is not None:
-                opt.optimization_config = {**(opt.optimization_config or {}),
-                                           FINAL_POPULATION_KEY: _fp}
         opt.status = "completed"
         opt.completed_at = datetime.now()
         opt.progress = 100.0
