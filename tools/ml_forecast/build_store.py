@@ -232,6 +232,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     data, missing = load_daily_closes(cache_root, symbols)
     if missing:
         log.warning("%d symbols without a daily parquet, skipped: %s", len(missing), missing[:20])
+    if not data:
+        raise SystemExit(f"no daily parquet found for any symbol under {cache_root / OHLCV_DIRNAME}")
     sessions = session_calendar(data, a.start, a.end, a.sessions)
     _ram_guard()
     predict = load_timesfm3_predict_fn(a.threads, a.batch_size)
