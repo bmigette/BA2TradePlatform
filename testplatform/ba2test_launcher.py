@@ -1887,6 +1887,10 @@ def _rm_opt_for(kind: str, sizing_mode: "str | None" = None, *, atr_searched: bo
     # one set the stop distance, which applies in BOTH modes -- so this gating only becomes
     # correct alongside that fix, and would have silently changed notional results before it.
     #
+    # Under ``--search-sizing-mode`` the mode is NOT known here (``_effective_sizing_mode`` returns None),
+    # so the gene stays in the space and is instead decoded away per genome:
+    # ``strategy_param_space.neutralise_sizing_genes`` drops it from a notional genome (decode + memo key).
+    #
     # Dropped ONLY when the mode is positively known to be notional. Unknown stays permissive:
     # inferring notional from absence would delete a live gene from a risk_atr run.
     if sizing_mode == "notional":
@@ -5911,7 +5915,11 @@ def _sl_loosen_gene_space() -> dict:
 
 def _resolve_search_sizing_mode(raw, explicit_mode, command: str) -> bool:
     """Parse ``--search-sizing-mode``; sets and returns the module global. Refuses (exit) together with an
-    explicit ``--sizing-mode``: one says "pin the mode", the other "search it"."""
+    explicit ``--sizing-mode``: one says "pin the mode", the other "search it".
+
+    Always ASSIGNS the global (False included) on purpose: the launcher is reused within one process
+    (tests, optimize-batch, in-process drivers), and a value left over from a previous command would
+    silently add the gene to, or drop the pin from, an unrelated run. Every command entry resets it."""
     global _SEARCH_SIZING_MODE
     if raw and explicit_mode:
         sys.exit(f"{command}: --search-sizing-mode and --sizing-mode {explicit_mode} are mutually exclusive "
@@ -8976,11 +8984,11 @@ def main(argv: "list | None" = None) -> int:
                     help="Override the expert spec's pinned sizing_mode for this run. Omit to "
                          "keep the spec default (risk_atr for the classic experts). Exists so "
                          "notional vs risk_atr can be compared as TWO separate optimizations "
-                         "instead of one gene: under notional the five ATR genes "
+                         "instead of one gene: under notional only atr_risk_budget_pct (the "
+                         "risk_atr size budget) is inert; the safeguard-stop genes "
                          "(risk_per_trade_pct, atr_multiplier, atr_period, min_stop_loss_pct, "
-                         "use_atr_stop) are inert and drift random, so a crossover that flipped "
-                         "the mode would score it with unselected parameters and bias the "
-                         "comparison toward whichever mode dominates the population. No effect "
+                         "use_atr_stop) act in both modes. To search the mode as ONE gene instead, "
+                         "use --search-sizing-mode (exclusive with this flag). No effect "
                          "on bypass experts (FactorRanker) — they skip "
                          "TradeRiskManagement entirely, so sizing_mode is never read. ALWAYS "
                          "give the two runs different --name suffixes, or the second is SKIPped "
