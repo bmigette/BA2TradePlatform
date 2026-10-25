@@ -54,6 +54,14 @@ loaders. The trade app stays on `torch==2.6.0+cpu`. It has three parts:
   - `POST /forecast {model_key, symbols, as_of}` returns rows in the store format.
   - The expert calls it through a thin client in `ba2_common`.
   - A refusal or timeout is an error, never a default value.
+- **History basis (live rule).** The store records its history source in `meta.json` build params
+  (`history_source` = `alpaca_build`, `build_manifest_sha256` of `AlpacaHistoryOHLCVProvider/_meta/build_manifest.json`,
+  `context_function_version`). The live expert builds its forecast context with the SAME function
+  (`ba2_common.core.ml_forecast.context.context_for`) from the SAME history source the store was built from, NOT from
+  the account's `ohlcv_history_source`. It refuses if the sources differ, or if the live context's last close differs
+  from the store's recorded close of session S beyond a tolerance (the store row format has no close column yet:
+  adding one is part of milestone 3/4). The account's decision price is used only to scale the TP and SL from the
+  forecast fractions; the small basis difference between the account price and the history close is accepted.
 - Parity: each live day's rows are appended to the store, and a nightly check recomputes them with `build_store.py`
   and compares. Sampling models (Kronos, Chronos) use a fixed seed per (model key, symbol, session), so their rows are
   deterministic.
@@ -64,10 +72,14 @@ loaders. The trade app stays on `torch==2.6.0+cpu`. It has three parts:
 - **`model_key`:** a hash of the model card, context length, covariate set and horizon list. The GA's `model` gene
   chooses among the model keys that were built.
 - **One row per (symbol, session S):**
-  - It is forecast from the bars of sessions up to and including S, so it is usable at any decision on S+1 or later.
+  - It is forecast from the bars of sessions up to and including S, so it is visible per the Visibility rule below (intraday: after session S finished; daily clock: on D = S).
   - Columns: the 9 deciles of the H-session return for each horizon (5, 10, 20).
   - For path models, also P(TP before SL) over a small grid of TP and SL percentages, computed from the sampled OHLC
     paths. Whole paths are not stored.
+- **Visibility.** Row S is forecast from the close of session S. On the intraday clock it is visible only after
+  session S has finished (`metric_store.visible_scan_date` / `scan_cutoff_date(..., intraday=True)`): a 10:00 decision
+  on day D sees the row of the previous session, never D's. On the daily clock a decision on D sees row D, by the
+  repo's D-close convention. Tested in `tests/test_ml_forecast_visibility.py`.
 - **Coverage:** every universe symbol on every session in the window. That covers held symbols on manage days.
 - **Covariates are point in time.** The FMP historical earnings calendar gives actual dates, not the dates as known
   in advance, so the earnings-date covariate is flagged until checked.
