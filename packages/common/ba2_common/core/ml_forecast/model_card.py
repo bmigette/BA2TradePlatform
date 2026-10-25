@@ -10,7 +10,9 @@ from dataclasses import dataclass, fields
 from datetime import date
 from typing import Any, Dict, Iterable, Optional, Tuple
 
-OUTPUT_TYPES = ("deciles", "paths", "class_probs")
+OUTPUT_TYPES = ("deciles", "paths")
+#: No row format or mapping exists for these yet.
+_DEFERRED_OUTPUT_TYPES = ("class_probs",)
 
 
 def _tuple_of_str(name: str, v: Any, *, allow_empty: bool) -> Tuple[str, ...]:
@@ -44,7 +46,7 @@ class ModelCard:
     past_future_covariates: Tuple[str, ...]
     horizons: Tuple[int, ...]
     scaler: Optional[str]                 # reference to the scaler artifact; None = model normalises internally
-    output_type: str                      # "deciles" | "paths" | "class_probs"
+    output_type: str                      # "deciles" | "paths"
     pretraining_cutoff: Optional[date]    # None = unknown (treat every date as possibly contaminated)
     licence: str
     licence_commercial_ok: bool
@@ -70,6 +72,8 @@ class ModelCard:
         s(self, "horizons", h)
         if self.scaler is not None:
             _nonblank("scaler", self.scaler)
+        if self.output_type in _DEFERRED_OUTPUT_TYPES:
+            raise ValueError(f"output_type {self.output_type!r} is not supported until the tsai adapter milestone")
         if self.output_type not in OUTPUT_TYPES:
             raise ValueError(f"ModelCard.output_type must be one of {OUTPUT_TYPES}, got {self.output_type!r}")
         pc = self.pretraining_cutoff

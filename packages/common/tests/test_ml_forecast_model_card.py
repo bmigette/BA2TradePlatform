@@ -87,3 +87,8 @@ def test_every_card_field_changes_key():
     assert set(changes) == {f.name for f in dataclasses.fields(ModelCard)}
     for name, val in changes.items():
         assert model_key(make_card(**{name: val}), 512, (), (5, 10, 20)) != kb, name
+
+
+def test_class_probs_not_supported_yet():
+    with pytest.raises(ValueError, match="not supported until the tsai adapter milestone"):
+        make_card(output_type="class_probs")
