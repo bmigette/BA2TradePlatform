@@ -130,6 +130,38 @@ OPTION_SELECTION_WEIGHTS = ("w_premium", "w_iv", "w_rvol")
 DECODE_GENE_NAMESPACES = ("model", "screener", "schedule", "cond", "entry", "exit", "optsel",
                           "market")
 
+#: goal2027 item 2.1 -- the sizing-mode gene. ``--search-sizing-mode`` adds ``model:sizing_mode`` as a
+#: choice gene over ``SIZING_MODES`` (this ORDER is a persisted contract: the GA stores the index).
+SIZING_MODE_GENE = "model:sizing_mode"
+SIZING_MODES = ("risk_atr", "notional")
+
+#: Genes with NO effect under ``sizing_mode == "notional"`` (audit:
+#: docs/plans/2026-10-25-goal2027-sizing-gene-plan.md). ``atr_risk_budget_pct`` is the risk_atr SIZE budget
+#: and only ``_risk_atr_quantity`` reads it. The stop-distance genes (risk_per_trade_pct, atr_multiplier,
+#: atr_period, min_stop_loss_pct, use_atr_stop) drive the safeguard stop in BOTH modes, and
+#: ``max_virtual_equity_per_instrument_percent`` is the notional sizer itself, so none of those belong here.
+NOTIONAL_INERT_MODEL_GENES = ("model:atr_risk_budget_pct",)
+
+
+def neutralise_sizing_genes(flat_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Canonicalise a decoded genome by its sizing mode: under ``notional`` every gene in
+    ``NOTIONAL_INERT_MODEL_GENES`` is REMOVED (canonical value = absent), so two genomes that differ only in
+    a dead gene decode to the same trial and the same memo key. Absent is also exactly what a fixed
+    ``--sizing-mode notional`` run builds (its gene space has no such gene), so the trial config equals that
+    run's. Under ``risk_atr`` nothing is dropped.
+
+    Returns ``flat_params`` ITSELF when nothing changes (no gene, risk_atr, or nothing to drop): older jobs
+    keep their keys and their decode untouched. Never mutates the input. Refuses an unknown mode."""
+    if SIZING_MODE_GENE not in flat_params:
+        return flat_params
+    mode = flat_params[SIZING_MODE_GENE]
+    if mode not in SIZING_MODES:
+        raise ValueError(f"{SIZING_MODE_GENE}: unknown sizing_mode {mode!r}; expected one of {SIZING_MODES}")
+    if mode != "notional" or not any(k in flat_params for k in NOTIONAL_INERT_MODEL_GENES):
+        return flat_params
+    return {k: v for k, v in flat_params.items() if k not in NOTIONAL_INERT_MODEL_GENES}
+
+
 # Actions that must NEVER be dropped by a per-action toggle: removing the open action would
 # turn an entry rule into a no-op bracket; guards must stay. (Rule-level toggles can still
 # drop the whole rule.)
@@ -1116,6 +1148,10 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
             genes.setdefault(aid, {})[field] = val
         else:
             raise ValueError(f"Unknown rule gene field {rest!r} for rule {rid!r}")
+
+    # Sizing-mode canonicalisation (goal2027 2.1) -- the ONE decode path, so GA, top-N persist, re-run,
+    # robustness variant and export all see the same neutralised genome. Identity for any job without the gene.
+    flat_params = neutralise_sizing_genes(flat_params)
 
     for key, val in flat_params.items():
         if key.startswith("model:"):

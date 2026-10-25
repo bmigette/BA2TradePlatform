@@ -1240,19 +1240,19 @@ def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
 
 def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None, *,
                          strategy_kind: "str | None" = None,
-                         rm_toggles_unpinned: "list | None" = None) -> dict:
+                         rm_toggles_unpinned: "list | None" = None,
+                         sizing_mode_searched: bool = False) -> dict:
     """Expert settings for a run: the spec's fixed_settings, plus the run universe injected into
     the expert's own universe setting when the spec names one (``universe_setting`` — for an
     expert that reads its universe from a setting, not from enabled_instruments; no current
     spec names one since PremiumSeller's removal, 2026-08-31).
 
     ``overrides`` wins over fixed_settings. Used by ``--sizing-mode`` so the SAME expert spec can
-    be run once per sizing mode without editing _EXPERT_OPT: sizing_mode is a 2-value categorical
-    the GA has never searched (it is pinned risk_atr for the classic experts), and it is
-    deliberately compared as two separate runs rather than made a gene — under notional the five
-    ATR genes face no selection pressure and drift random, so a crossover that flips the mode
-    would judge it with unselected parameters and bias the comparison toward whichever mode
-    happens to dominate the population.
+    be run once per sizing mode without editing _EXPERT_OPT. (``--search-sizing-mode`` now offers the
+    gene alternative, goal2027 item 2.1: under notional only ``atr_risk_budget_pct`` is dead; the stop
+    genes act in both modes since ``_ensure_safeguard_stop`` runs in notional too. Decode drops the
+    budget, so a crossover that flips the mode no longer scores it with an unselected budget. The older
+    "five ATR genes are inert under notional" argument for two matrices predates that.)
 
     ``risk_manager_mode`` (review finding M5, 2026-09-01) is plumbed here and NOWHERE ELSE:
     a spec that names one has it written onto the run's expert settings, from which
@@ -1276,8 +1276,17 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     serve both the equity grids and the option grids with a setting the option grids need
     (DeterministicScorer's ``macro_short_side``) without moving any equity job. No kind given
     (bypass experts, ad-hoc callers) = not an option job = the plain ``fixed_settings``.
+
+    ``sizing_mode_searched`` (``--search-sizing-mode``, goal2027 item 2.1): the spec's pinned ``sizing_mode``
+    is REMOVED, so the ``model:sizing_mode`` gene is the only source (no pin to disagree with it, none
+    persisted into ``expertFixedSettings``). Under notional only ``atr_risk_budget_pct`` is dead -- the
+    stop-distance genes still act through ``_ensure_safeguard_stop`` -- see
+    docs/plans/2026-10-25-goal2027-sizing-gene-plan.md; decode neutralises it
+    (``strategy_param_space.neutralise_sizing_genes``).
     """
     settings = dict(spec["fixed_settings"])
+    if sizing_mode_searched:
+        settings.pop("sizing_mode", None)
     settings.update(_option_fixed_settings_for(spec, strategy_kind))
     # HISTORICALLY INERT, PINNED SO THEY STAY THAT WAY -- unless a run policy unpinned one.
     # See _INERT_RM_TOGGLES / _pinned_rm_toggles.
@@ -1836,6 +1845,8 @@ def _effective_sizing_mode(spec: dict, args) -> "str | None":
     ``fixed_settings``. None means "unknown" and callers must treat it as the permissive case --
     never guess ``notional`` from absence, because that would silently drop a live gene.
     """
+    if _SEARCH_SIZING_MODE:
+        return None     # searched: unknown per genome -- keep atr_risk_budget_pct in the space
     mode = getattr(args, "sizing_mode", None)
     if mode:
         return mode
@@ -5558,6 +5569,12 @@ _MARKET_EXIT_KINDS_SELECTED: "tuple[str, ...]" = ()
 _SEARCH_SL_LOOSEN: bool = False
 _SL_LOOSEN_SETTING = "allow_ruleset_sl_loosen"
 
+#: ``--search-sizing-mode`` (goal2027 item 2.1): searches ``sizing_mode`` as ONE ``model:sizing_mode`` choice gene
+#: over ("risk_atr", "notional"). Mutually exclusive with an explicit ``--sizing-mode`` (the pin). Decode-time
+#: neutralisation of the genes that are dead under notional lives in
+#: ``strategy_param_space.neutralise_sizing_genes``.
+_SEARCH_SIZING_MODE: bool = False
+
 
 def _resolve_exclude_symbols_arg(spec) -> list:
     """Parse ``--exclude-symbols``: a comma list, or ``@path`` to a file.
@@ -5890,6 +5907,39 @@ def _sl_loosen_gene_space() -> dict:
     # nothing reads -- so the gene was INERT in every goal2027atr job before 2026-10-02.
     return {_SL_LOOSEN_SETTING: {
         "optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"}}
+
+
+def _resolve_search_sizing_mode(raw, explicit_mode, command: str) -> bool:
+    """Parse ``--search-sizing-mode``; sets and returns the module global. Refuses (exit) together with an
+    explicit ``--sizing-mode``: one says "pin the mode", the other "search it"."""
+    global _SEARCH_SIZING_MODE
+    if raw and explicit_mode:
+        sys.exit(f"{command}: --search-sizing-mode and --sizing-mode {explicit_mode} are mutually exclusive "
+                 f"(search the mode, or pin it; not both)")
+    _SEARCH_SIZING_MODE = bool(raw)
+    return _SEARCH_SIZING_MODE
+
+
+def _sizing_mode_gene_space() -> dict:
+    """The ONE ``sizing_mode`` choice gene (``model:sizing_mode`` once collected) ``--search-sizing-mode`` adds
+    ({} when off). The choice ORDER is a persisted contract (the GA stores the index)."""
+    if not _SEARCH_SIZING_MODE:
+        return {}
+    return {"sizing_mode": {"optimize": True, "type": "choice", "choices": ["risk_atr", "notional"]}}
+
+
+def _refuse_sizing_gene_unsupported(command: str, kind: str, bypass: bool) -> None:
+    """The gene is for the classic S1-S7 experts only: a bypass expert (FactorRanker) never reads
+    ``sizing_mode`` and an option strategy sizes by its own structure rules, so the gene would be searched but
+    dead -- refused rather than silently inert (same convention as ``_refuse_sl_loosen_on_bypass``)."""
+    if not _SEARCH_SIZING_MODE:
+        return
+    if bypass:
+        sys.exit(f"{command}: --search-sizing-mode: {kind!r} is a bypass expert that never reads "
+                 f"sizing_mode; the gene would be searched but dead")
+    if kind in _OPTION_STRATEGY_KEYS:
+        sys.exit(f"{command}: --search-sizing-mode: {kind!r} is an option strategy; the gene is for the "
+                 f"classic equity strategies S1-S7 only")
 
 
 def _refuse_sl_loosen_on_bypass(command: str, kind: str, bypass: bool) -> None:
@@ -6831,6 +6881,8 @@ def _cmd_optimize(args) -> int:
     _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize")
     _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize")
     _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize")
+    _resolve_search_sizing_mode(getattr(args, "search_sizing_mode", False),
+                                getattr(args, "sizing_mode", None), "optimize")
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -6947,6 +6999,7 @@ def _cmd_optimize(args) -> int:
     try:
         bypass = bool(spec.get("bypass"))
         _refuse_sl_loosen_on_bypass("optimize", args.strategy, bypass)
+        _refuse_sizing_gene_unsupported("optimize", args.strategy, bypass)
         _sname = args.name or f"opt-{expert}-{args.strategy}"
         # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
         # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
@@ -6968,7 +7021,8 @@ def _cmd_optimize(args) -> int:
             "experts": [{"class": expert, "settings": _expert_run_settings(
                 spec, universe, _sizing_overrides(args),
                 strategy_kind=None if bypass else args.strategy,
-                rm_toggles_unpinned=rm_toggles_unpinned)}],
+                rm_toggles_unpinned=rm_toggles_unpinned,
+                sizing_mode_searched=_SEARCH_SIZING_MODE)}],
             "start_date": args.start, "end_date": args.end,
             "initial_capital": float(args.initial_capital),
             "account_settings": {
@@ -7314,7 +7368,8 @@ def _cmd_optimize(args) -> int:
                               else {**spec["expert_params"],
                                     **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args),
                                                  atr_searched=(rm_toggle_policy == "atr-searched")),
-                                    **screener_genes, **schedule_genes, **_sl_loosen_gene_space()}),
+                                    **screener_genes, **schedule_genes, **_sl_loosen_gene_space(),
+                                    **_sizing_mode_gene_space()}),
             "backtest": backtest_block,
         }
         _apply_lattice_anchor(cfg, args.strategy, getattr(args, "lattice_anchor", None))
@@ -7421,6 +7476,7 @@ def _cmd_optimize_batch(args) -> int:
     _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize-batch")
     _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize-batch")
     _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize-batch")
+    _resolve_search_sizing_mode(False, None, "optimize-batch")   # the gene is optimize-only; reset the global
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     batch_worker_ids = _worker_ids_from_args(args)  # resolved once; applied to every job
@@ -7514,7 +7570,8 @@ def _cmd_optimize_batch(args) -> int:
                 "experts": [{"class": expert, "settings": _expert_run_settings(
                     spec, universe, _sizing_overrides(args),
                     strategy_kind=None if bypass else strat_kind,
-                    rm_toggles_unpinned=rm_toggles_unpinned)}],
+                    rm_toggles_unpinned=rm_toggles_unpinned,
+                    sizing_mode_searched=_SEARCH_SIZING_MODE)}],
                 "start_date": args.start, "end_date": args.end,
                 "initial_capital": float(args.initial_capital),
                 "account_settings": {
@@ -8928,6 +8985,16 @@ def main(argv: "list | None" = None) -> int:
                          "TradeRiskManagement entirely, so sizing_mode is never read. ALWAYS "
                          "give the two runs different --name suffixes, or the second is SKIPped "
                          "as an already-completed run.")
+    op.add_argument("--search-sizing-mode", action="store_true", default=False,
+                    help="Search sizing_mode (risk_atr | notional) as ONE model:sizing_mode choice gene "
+                         "instead of pinning it (goal2027 item 2.1). Mutually exclusive with "
+                         "--sizing-mode. Genes with no effect under notional (atr_risk_budget_pct, the "
+                         "risk_atr size budget) decode to one canonical value (absent) so the trial memo "
+                         "dedups them; the stop-distance genes and "
+                         "max_virtual_equity_per_instrument_percent stay searched in both modes. "
+                         "Classic S1-S7 only: refused for bypass experts (FactorRanker) and option "
+                         "strategies. Name the job distinctly ('sizegene'): its gene space differs from a "
+                         "pinned run's.")
     op.add_argument("--rm-toggle-policy", choices=_RM_TOGGLE_POLICIES, default="pinned",
                     help="'pinned' (default): use_atr_stop/regime_overlay_enabled are pinned OFF "
                          "for this run, exactly as every run on record -- byte-identical to "

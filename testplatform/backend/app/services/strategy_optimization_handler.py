@@ -1395,6 +1395,9 @@ def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]
     Returns ``decoded_flat`` ITSELF when nothing needs rewriting, which is the whole guard for
     older jobs: no mode leaves, no copy, no change of key.
     """
+    # goal2027 2.1: genes dead under the genome's sizing mode (identity when there is no sizing gene).
+    from app.services.strategy_param_space import neutralise_sizing_genes
+    decoded_flat = neutralise_sizing_genes(decoded_flat)
     if not anchors:
         return decoded_flat
     from app.services.strategy_param_space import mode_token
