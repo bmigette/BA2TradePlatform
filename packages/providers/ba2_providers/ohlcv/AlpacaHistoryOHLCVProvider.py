@@ -92,11 +92,14 @@ class AlpacaHistoryOHLCVProvider(MarketDataProviderInterface):
         except HistoryTopUpUnavailable:
             key = None
         if key is not None:
-            want_start = validate_date_range(start_date, end_date, lookback_days)[0].date()
+            # the open end of the window is the provider's own clock (injected in tests/backtests; the live caller's is
+            # the real now), not the wall clock: otherwise 'asked from' drifts from the `now` the backfill is decided at
+            from ba2_common.core import ohlcv_final_bars
+            now = self._clock() if self._clock is not None else ohlcv_final_bars.now_utc()
+            open_end = now if (end_date is None or end_date == "") else end_date
+            want_start = validate_date_range(start_date, open_end, lookback_days)[0].date()
             from ba2_providers.ohlcv.alpaca_history import live_backfill
             if self.live:
-                from ba2_common.core import ohlcv_final_bars
-                now = self._clock() if self._clock is not None else ohlcv_final_bars.now_utc()
                 live_backfill.ensure_coverage(symbol, key, want_start, fetcher=self._fetcher, now=now,
                                               ca_client=self._ca_client, fmp_rows=self._fmp_split_rows)
             else:
