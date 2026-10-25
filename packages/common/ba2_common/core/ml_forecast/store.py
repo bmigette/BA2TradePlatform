@@ -13,11 +13,15 @@ import re
 import threading
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from collections import OrderedDict
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
+import numpy as np
 import pandas as pd
+import pyarrow as pa
 
-from .forecast_row import ForecastRow, record_columns
+from .forecast_row import (DECILE_LEVELS, DIRECTIONS, SL_GRID_PCT, TP_GRID_PCT, ForecastRow, decile_col, prob_col,
+                           record_columns)
 from .model_card import ModelCard, model_key as compute_model_key
 
 STORE_DIRNAME = "ml_forecast"
@@ -60,9 +64,23 @@ def _key_dir(root: Path, key: str) -> Path:
 
 
 # ---------------------------------------------------------------- cache
+#: Symbol-frames kept per (store, horizon). Bounds memory for a wide universe: an entry is
+#: sessions * (9 + path cells) float32 values for ONE horizon.
+MAX_CACHED_FRAMES_PER_KEY_HORIZON = 256
+
+
+class _Entry(NamedTuple):
+    mtime: int
+    sessions: np.ndarray            # datetime64[D], sorted ascending
+    dec: np.ndarray                 # (n, 9) float32
+    probs: Optional[np.ndarray]     # (n, 2 * |TP grid| * |SL grid|) float32, or None for decile-only stores
+
+
 _lock = threading.Lock()
-_frames: Dict[Tuple[str, str, str], Tuple[int, pd.DataFrame]] = {}
+_frames: Dict[Tuple[str, int], "OrderedDict[str, _Entry]"] = {}
 _metas: Dict[Tuple[str, str], Tuple[int, Dict[str, Any]]] = {}
+
+_PROB_CELLS = [(d, tp, sl) for d in DIRECTIONS for tp in TP_GRID_PCT for sl in SL_GRID_PCT]
 
 
 def reset_cache() -> None:
@@ -105,43 +123,77 @@ def read_meta(key: str, cache_root: Optional[os.PathLike] = None) -> Dict[str, A
     return meta
 
 
-def _load_frame(kdir: Path, sym: str, meta: Dict[str, Any]) -> pd.DataFrame:
+def _columns(horizon: int, with_paths: bool) -> List[str]:
+    cols = ["session"] + [decile_col(horizon, q) for q in DECILE_LEVELS]
+    if with_paths:
+        cols += [prob_col(d, horizon, tp, sl) for d, tp, sl in _PROB_CELLS]
+    return cols
+
+
+def _load_entry(kdir: Path, sym: str, horizon: int, with_paths: bool) -> _Entry:
+    """The symbol's sessions + the horizon's columns, as float32 arrays. LRU-cached; invalidated by file mtime."""
     p = kdir / f"{sym}.parquet"
     mt = _mtime(p)
-    ck = (str(kdir), sym, "frame")
+    ck = (str(kdir), horizon)
     with _lock:
-        hit = _frames.get(ck)
-        if hit is not None and hit[0] == mt:
-            return hit[1]
-    df = pd.read_parquet(p)
-    df["session"] = pd.to_datetime(df["session"]).dt.date
-    df = df.sort_values("session").reset_index(drop=True)
+        lru = _frames.setdefault(ck, OrderedDict())
+        hit = lru.get(sym)
+        if hit is not None and hit.mtime == mt:
+            lru.move_to_end(sym)
+            return hit
+    cols = _columns(horizon, with_paths)
+    try:
+        df = pd.read_parquet(p, columns=cols)
+    except (KeyError, pa.ArrowInvalid) as e:
+        raise ForecastStoreError(f"{p}: missing forecast columns for horizon {horizon}: {e}") from e
+    sessions = pd.to_datetime(df["session"]).to_numpy().astype("datetime64[D]")
+    order = np.argsort(sessions, kind="stable")
+    sessions = sessions[order]
+    dec = df[cols[1:10]].to_numpy(dtype=np.float32)[order]
+    probs = df[cols[10:]].to_numpy(dtype=np.float32)[order] if with_paths else None
+    entry = _Entry(mt, sessions, dec, probs)
     with _lock:
-        _frames[ck] = (mt, df)
-    return df
+        lru = _frames.setdefault(ck, OrderedDict())
+        lru[sym] = entry
+        lru.move_to_end(sym)
+        while len(lru) > MAX_CACHED_FRAMES_PER_KEY_HORIZON:
+            lru.popitem(last=False)
+    return entry
 
 
 # ---------------------------------------------------------------- reader
-def read_row(model_key: str, symbol: str, decision_session_cutoff: date,
+def read_row(model_key: str, symbol: str, decision_session_cutoff: date, horizon: int,
              cache_root: Optional[os.PathLike] = None,
              max_age_days: int = MAX_STALE_CALENDAR_DAYS) -> ForecastRow:
+    """The row of the latest session <= ``decision_session_cutoff``, restricted to ``horizon`` (its deciles and,
+    for path stores, its P(TP before SL) cells). Values come back as float32-rounded floats."""
     if not isinstance(decision_session_cutoff, date) or hasattr(decision_session_cutoff, "hour"):
         raise TypeError("decision_session_cutoff must be a plain date (pass knowability.scan_cutoff_date(as_of)), "
                         f"got {decision_session_cutoff!r}")
+    if isinstance(max_age_days, bool) or not isinstance(max_age_days, int) or max_age_days < 1:
+        raise ValueError(f"max_age_days must be an int >= 1, got {max_age_days!r}")
     sym = _symbol(symbol)
     kdir = _key_dir(_root(cache_root), model_key)
     meta = read_meta(model_key, cache_root)
-    df = _load_frame(kdir, sym, meta)
-    visible = df[df["session"] <= decision_session_cutoff]
-    if visible.empty:
-        raise ForecastStoreMiss(f"{model_key}/{sym}: no forecast session on or before {decision_session_cutoff} "
-                                f"(first stored: {df['session'].iloc[0] if len(df) else 'none'})")
-    rec = visible.iloc[-1].to_dict()
-    if decision_session_cutoff - rec["session"] > timedelta(days=max_age_days):
-        raise ForecastStoreMiss(f"{model_key}/{sym}: latest forecast session {rec['session']} is more than "
-                                f"{max_age_days} days before {decision_session_cutoff}")
     card = ModelCard.from_dict(meta["card"])
-    return ForecastRow.from_record(sym, rec, card.horizons, card.output_type == "paths")
+    if horizon not in card.horizons:
+        raise ValueError(f"horizon {horizon} is not one of the store's horizons {card.horizons}")
+    with_paths = card.output_type == "paths"
+    e = _load_entry(kdir, sym, horizon, with_paths)
+    idx = int(np.searchsorted(e.sessions, np.datetime64(decision_session_cutoff, "D"), side="right")) - 1
+    if idx < 0:
+        first = e.sessions[0].astype(object) if len(e.sessions) else "none"
+        raise ForecastStoreMiss(f"{model_key}/{sym}: no forecast session on or before {decision_session_cutoff} "
+                                f"(first stored: {first})")
+    session = e.sessions[idx].astype(object)
+    if decision_session_cutoff - session > timedelta(days=max_age_days):
+        raise ForecastStoreMiss(f"{model_key}/{sym}: latest forecast session {session} is more than "
+                                f"{max_age_days} days before {decision_session_cutoff}")
+    dec = tuple(float(x) for x in e.dec[idx])
+    pp = None
+    if e.probs is not None:
+        pp = {(d, horizon, tp, sl): float(v) for (d, tp, sl), v in zip(_PROB_CELLS, e.probs[idx])}
+    return ForecastRow(sym, session, {horizon: dec}, pp)
 
 
 # ---------------------------------------------------------------- writer
