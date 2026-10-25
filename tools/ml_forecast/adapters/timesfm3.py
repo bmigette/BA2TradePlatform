@@ -102,5 +102,13 @@ def load_timesfm3_predict_fn(threads: int = 6, batch_size: int = 64) -> PredictF
 
     def predict(contexts: Sequence[np.ndarray], horizon: int) -> List[np.ndarray]:
         outs = list(model.predict_batch(list(contexts), horizon=horizon, return_quantiles=True))
-        return [np.asarray(o.quantiles) for o in outs]
+        res = []
+        for o in outs:
+            q = np.asarray(o.quantiles)
+            # Verified in the 2026-10-25 smoke run: columns are the deciles 0.1..0.9 in ASCENDING order, so index 4
+            # is the median (== o.forecast). A different column count means a different checkpoint: refuse.
+            if q.ndim != 2 or q.shape[1] != 9 or q.shape[0] < horizon:
+                raise ValueError(f"TimesFM quantile output has shape {q.shape}, expected (>= {horizon}, 9)")
+            res.append(q[:horizon])
+        return res
     return predict

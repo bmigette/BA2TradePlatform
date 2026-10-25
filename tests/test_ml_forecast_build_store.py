@@ -147,8 +147,12 @@ def test_timesfm_is_deterministic_if_installed():
     predict = load_timesfm3_predict_fn(threads=6, batch_size=8)
     rng = np.random.default_rng(0)
     x = [np.exp(np.cumsum(rng.normal(0, 0.01, 512))).astype(np.float32) * 100 for _ in range(3)]
+    # NOTE: identical input and batch composition give identical output. A different batch composition (e.g. after a
+    # --resume that skips some symbols) can change the last float digits, so rows are not bit-stable across resumes.
     a = predict(x, 20)
     b = predict(x, 20)
+    assert all(q.shape == (20, 9) for q in a)
+    assert all(np.all(np.diff(q, axis=1) >= 0) for q in a)       # ascending deciles
     for u, v in zip(a, b):
         np.testing.assert_array_equal(u, v)
 
