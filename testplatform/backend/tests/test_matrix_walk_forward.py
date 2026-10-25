@@ -202,3 +202,50 @@ def test_require_fold_for_a_year_outside_the_plan_is_refused(env, monkeypatch):
     monkeypatch.setattr(sys, "argv", argv)
     with pytest.raises(SystemExit, match="2030"):
         M.main()
+
+
+def _cell_name(env, monkeypatch, *extra):
+    env.fake.order.clear()
+    env.fake.completed.clear()
+    monkeypatch.setattr(sys, "argv", _argv(env, *extra, experts=("DeterministicScorer",)))
+    assert M.main() == 0
+    return env.fake.order[0][:-4]
+
+
+def test_exclusive_return_flag_is_forwarded(env, monkeypatch):
+    monkeypatch.setattr(sys, "argv", _argv(env, "--pass-min-oos-return-exclusive",
+                                           experts=("DeterministicScorer",)))
+    env.fake.oos_by_fold = (_oos(0.0, -5.0),) * 3
+    assert M.main() == 0
+    assert not any(n.endswith("-refit") for n in env.fake.order)   # 0.0% is not ABOVE 0%
+
+
+def test_exclusive_flag_without_walk_forward_is_refused(env, monkeypatch):
+    argv = [a for a in _argv(env) if a != "--walk-forward"]
+    # keep only the flag under test among the wf ones so the refusal is about it
+    monkeypatch.setattr(sys, "argv", ["run_screener_capband_matrix.py", "--pass-min-oos-return-exclusive"])
+    with pytest.raises(SystemExit):
+        M.main()
+
+
+@pytest.mark.parametrize("change", [
+    ["--wf-first-generations", "31"], ["--wf-next-generations", "16"], ["--wf-top-n", "5"],
+    ["--wf-train-start", "2021-01-01"], ["--wf-test-years", "2025,2026"],
+    ["--wf-data-end", "2026-10-12"], ["--pass-min-folds", "3"], ["--pass-min-oos-return-exclusive"],
+])
+def test_a_changed_walk_forward_budget_or_spec_changes_the_cell_name(env, monkeypatch, change):
+    base = _cell_name(env, monkeypatch)
+    base_argv = _argv(env, experts=("DeterministicScorer",))
+    if change[0] in base_argv and len(change) == 2:
+        i = base_argv.index(change[0])
+        argv = base_argv[:i] + change + base_argv[i + 2:]
+    else:
+        argv = base_argv + change
+    env.fake.order.clear()
+    monkeypatch.setattr(sys, "argv", argv)
+    assert M.main() == 0
+    assert env.fake.order[0][:-4] != base
+
+
+def test_same_walk_forward_spec_gives_the_same_cell_name(env, monkeypatch):
+    assert _cell_name(env, monkeypatch) == _cell_name(env, monkeypatch)

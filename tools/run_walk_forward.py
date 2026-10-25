@@ -291,6 +291,9 @@ def _parse(argv: Sequence[str]):
     ap.add_argument("--pass-min-oos-return", type=float, required=True,
                     help="percent: the fold's TOTAL out-of-sample return over its test window "
                          "(NOT annualised; mind the window length)")
+    ap.add_argument("--pass-min-oos-return-exclusive", action="store_true",
+                    help="strict: a fold passes only if its OOS return is ABOVE the threshold "
+                         "(default: at or above)")
     ap.add_argument("--pass-max-dd-mult", type=float, required=True)
     ap.add_argument("--pass-min-folds", type=int, required=True)
     ap.add_argument("--pass-require-fold", type=int, action="append", default=[], metavar="YEAR",
@@ -355,7 +358,7 @@ def main(argv=None, runner: Optional[WF.Runner] = None) -> int:
             WF.Thresholds(a.pass_min_oos_return, a.pass_max_dd_mult, a.pass_min_folds),
             test_parallel=a.test_parallel, skip_train=a.skip_train, only_fold=a.only_fold,
             embargo_days=a.embargo_days, selection=selection, seed_chain=a.chain_seed,
-            require_test_years=a.pass_require_fold)
+            require_test_years=a.pass_require_fold, exclusive_return=a.pass_min_oos_return_exclusive)
         runner = runner or RealRunner(a)
         # Option-holdout rail, REUSED unchanged: refuse a fold whose TRAIN window reaches 2026
         # for a pure-option strategy BEFORE any run (the launcher would refuse it mid-run).

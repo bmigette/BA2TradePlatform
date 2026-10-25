@@ -226,3 +226,20 @@ def test_real_runner_reads_back_the_recorded_seed_source(monkeypatch):
     monkeypatch.setattr(rr, "_tool", lambda: None)
     assert rr.seed_lineage("lin-wf1") is None            # cold start
     assert rr.seed_lineage("lin-wf2") == "lin-wf1"
+
+
+def test_checkpoint_resumed_chain_job_still_records_its_seed_source(monkeypatch):
+    """A relaunch inserts a NEW row and resumes the job's checkpoint (the seed block is skipped):
+    the row must still name the seed source so the chain's lineage check holds."""
+    sid = T._seed_strategy()
+    src = _source(sid, name="res-wf1")
+    stored = _cfg(src)["finalPopulation"]
+    ckpt = {"generation": 0, "partial": True, "population": stored["genes"],
+            "fitnesses": [None] * len(stored["genes"]), "history": [], "best_individual": stored["genes"][0],
+            "best_fitness": max(stored["fitnesses"]), "robust_fitness": False,
+            "fitness_metric": "sharpe", "top_results": []}
+    monkeypatch.setattr(H, "_load_checkpoint", lambda task_id, fingerprint=None: dict(ckpt))
+    tgt, out = _run(sid, "res-wf2", populationSize=8, generations=2, chainSeedFromOptimizationId=src)
+    assert out["status"] == "completed", out
+    seeded = _cfg(tgt)["seededFrom"]
+    assert seeded["name"] == "res-wf1" and seeded["resumed_from_checkpoint"] is True

@@ -191,3 +191,25 @@ def test_cli_refuses_a_required_year_outside_the_plan(capsys):
                        "--pass-min-folds", "1", "--pass-require-fold", "2031", "--dry-run", "--",
                        "--expert", "FMPRating"], runner=FakeRunner())
     assert rc == 2 and "2031" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------ strict (exclusive) return rule
+
+
+def test_exclusive_return_needs_a_return_strictly_above_the_threshold():
+    f = FOLDS[0]
+    flat = _oos(0.0, -5.0)
+    assert WF.evaluate_genome(f, _pick(1), flat, TH).passed is True               # >= (unchanged)
+    g = WF.evaluate_genome(f, _pick(1), flat, TH, exclusive_return=True)
+    assert g.passed is False and "<=" in g.fail_reasons[0]
+    assert WF.evaluate_genome(f, _pick(1), _oos(0.01, -5.0), TH, exclusive_return=True).passed
+
+
+def test_exclusive_flag_reaches_the_plan_the_verdict_and_the_report(tmp_path):
+    plan = _plan(exclusive_return=True)
+    picks = {f"cell-wf{k}": [_pick(1), _pick(2)] for k in (1, 2, 3)}
+    oos = {(k, r): _oos(0.0, -5.0) for k in (1, 2, 3) for r in (1, 2)}
+    res = WF.run_walk_forward(plan, FakeRunner(is_picks=picks, oos=oos), log=lambda *_: None)
+    assert res.overall_passed is False and res.exclusive_return is True
+    _jp, mp = WF.write_report(res, str(tmp_path))
+    assert "--pass-min-oos-return-exclusive" in Path(mp).read_text(encoding="utf-8")

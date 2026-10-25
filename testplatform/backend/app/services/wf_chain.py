@@ -78,6 +78,7 @@ class CellSpec:
     strategy: Optional[str]
     band: str
     floor: Optional[date] = None
+    exclusive_return: bool = False      # fold return must be ABOVE the threshold
 
 
 @dataclass
@@ -101,7 +102,7 @@ def make_cell_plan(spec: CellSpec) -> Tuple[WF.Plan, List[WF.Fold]]:
         spec.name, folds, spec.optimize_args, spec.launcher, spec.top_n, spec.thresholds,
         test_parallel=spec.test_parallel, skip_train=False, only_fold=None, embargo_days=0,
         selection=spec.selection, seed_chain=True, fold_extra_args=_fold_extra_args(spec, folds),
-        require_test_years=spec.require_test_years)
+        require_test_years=spec.require_test_years, exclusive_return=spec.exclusive_return)
     return plan, folds
 
 
@@ -137,6 +138,7 @@ def _fold_key(plan: WF.Plan, f: WF.Fold) -> Dict[str, Any]:
     return {"train": [f.train_start.isoformat(), f.train_end.isoformat()],
             "test": [f.test_start.isoformat(), f.test_end.isoformat()],
             "top_n": plan.top_n, "selection": plan.selection,
+            "exclusive_return": plan.exclusive_return,
             "thresholds": {"min_oos_return": th.min_oos_return, "max_dd_mult": th.max_dd_mult,
                            "min_folds": th.min_folds}}
 
@@ -208,7 +210,8 @@ def run_cell(spec: CellSpec, runner: Any, report_dir: str,
         _save_fold(report_dir, plan, f, got)
         genomes.extend(got)
     res = WF.aggregate(spec.name, folds, len(folds), spec.top_n, genomes, spec.thresholds,
-                       spec.selection, require_test_years=plan.require_test_years)
+                       spec.selection, require_test_years=plan.require_test_years,
+                       exclusive_return=plan.exclusive_return)
     cell_dir = os.path.join(report_dir, spec.name)
     WF.write_report(res, cell_dir)
     passed = bool(res.overall_passed)
@@ -242,6 +245,7 @@ def run_cell(spec: CellSpec, runner: Any, report_dir: str,
         "verdict": "PASS" if passed else "FAIL", "refit_job": refit_job, "refit": refit_block,
         "required_failed": list(res.required_failed),
         "thresholds": {**asdict(spec.thresholds), "top_n": spec.top_n,
+                       "exclusive_return": spec.exclusive_return,
                        "require_test_years": list(res.require_test_years)},
         "data_end": spec.data_end.isoformat() if spec.data_end else None,
         "folds": [_fold_summary(spec, runner, plan, f, winners[f.index]) for f in folds],

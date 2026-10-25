@@ -310,7 +310,8 @@ def efficiency(oos_car: float, is_car: float) -> Optional[float]:
     return oos_car / is_car if is_car > 0 else None
 
 
-def evaluate_genome(fold: Fold, pick: IsPick, oos: OosMetrics, th: Thresholds) -> GenomeFold:
+def evaluate_genome(fold: Fold, pick: IsPick, oos: OosMetrics, th: Thresholds,
+                    exclusive_return: bool = False) -> GenomeFold:
     where = f"fold {fold.index} rank {pick.rank}"
     is_ret = _need(pick.total_return, f"{where} IS total_return")
     is_car = _need(pick.car, f"{where} IS CAR")
@@ -326,8 +327,9 @@ def evaluate_genome(fold: Fold, pick: IsPick, oos: OosMetrics, th: Thresholds) -
     reasons: List[str] = []
     if o_trades == 0:
         reasons.append("zero OOS trades")
-    if o_ret < th.min_oos_return:
-        reasons.append(f"OOS return {o_ret:.2f}% < {th.min_oos_return:g}%")
+    if (o_ret <= th.min_oos_return) if exclusive_return else (o_ret < th.min_oos_return):
+        reasons.append(f"OOS return {o_ret:.2f}% "
+                       f"{'<=' if exclusive_return else '<'} {th.min_oos_return:g}%")
     if abs(o_dd) > th.max_dd_mult * abs(is_dd):
         reasons.append(f"OOS |maxDD| {abs(o_dd):.2f}% > {th.max_dd_mult:g} x IS |maxDD| "
                        f"{abs(is_dd):.2f}%")
@@ -396,6 +398,7 @@ class WalkForwardResult:
     notes: List[str]
     require_test_years: Tuple[int, ...] = ()    # --pass-require-fold
     required_failed: List[int] = field(default_factory=list)   # required years whose winner failed
+    exclusive_return: bool = False      # the return threshold was strict (>)
 
     def fold_winner(self, k: int) -> GenomeFold:
         return next(g for g in self.genomes if g.fold == k and g.rank == 1)
@@ -404,7 +407,8 @@ class WalkForwardResult:
 def aggregate(prefix: str, folds: Sequence[Fold], planned_folds: int, top_n: int,
               genomes: Sequence[GenomeFold], th: Thresholds,
               selection: Optional[Dict[str, Any]] = None,
-              require_test_years: Sequence[int] = ()) -> WalkForwardResult:
+              require_test_years: Sequence[int] = (), exclusive_return: bool = False
+              ) -> WalkForwardResult:
     by_fold = {f.index: f for f in folds}
     notes: List[str] = []
     ranks = sorted({g.rank for g in genomes})
@@ -431,7 +435,7 @@ def aggregate(prefix: str, folds: Sequence[Fold], planned_folds: int, top_n: int
         winners_passed=passed, selection=dict(selection or {}), complete=complete,
         overall_passed=((passed >= th.min_folds) and not required_failed) if complete else None,
         notes=notes, require_test_years=tuple(sorted(set(require_test_years))),
-        required_failed=required_failed if complete else [])
+        required_failed=required_failed if complete else [], exclusive_return=exclusive_return)
 
 
 # --------------------------------------------------------------------------------- runner
@@ -463,6 +467,7 @@ class Plan:
     seed_chain: bool = False            # fold k+1 starts from fold k's final population
     fold_extra_args: Dict[int, List[str]] = field(default_factory=dict)   # per-fold optimize args
     require_test_years: Tuple[int, ...] = ()   # --pass-require-fold: these folds must pass
+    exclusive_return: bool = False      # --pass-min-oos-return-exclusive: return must be ABOVE the threshold
 
     def previous_fold(self, fold: Fold) -> Optional[Fold]:
         before = [f for f in self.folds if f.index < fold.index]
@@ -487,7 +492,7 @@ def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], 
               top_n: int, thresholds: Thresholds, *, test_parallel: int, skip_train: bool,
               only_fold: Optional[int], embargo_days: int, selection: Dict[str, Any],
               seed_chain: bool = False, fold_extra_args: Optional[Dict[int, List[str]]] = None,
-              require_test_years: Sequence[int] = ()) -> Plan:
+              require_test_years: Sequence[int] = (), exclusive_return: bool = False) -> Plan:
     """Validate everything BEFORE any run: a refusal here costs nothing."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix or ""):
         raise WalkForwardError(f"--prefix {prefix!r}: use letters, digits, '_', '.', '-'")
@@ -506,7 +511,7 @@ def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], 
     plan = Plan(prefix, list(folds), list(optimize_args), launcher, top_n, thresholds,
                 test_parallel, skip_train, only_fold, embargo_days, dict(selection),
                 seed_chain, {k: list(v) for k, v in (fold_extra_args or {}).items()},
-                tuple(sorted(set(require_test_years))))
+                tuple(sorted(set(require_test_years))), exclusive_return)
     plan.selected_folds()          # refuses an unknown --only-fold
     return plan
 
@@ -591,7 +596,7 @@ def run_fold(plan: Plan, runner: Runner, f: Fold, log: Callable[[str], None] = p
         if p.rank not in oos:
             raise WalkForwardError(
                 f"fold {f.index} rank {p.rank}: no out-of-sample result was produced")
-        out.append(evaluate_genome(f, p, oos[p.rank], plan.thresholds))
+        out.append(evaluate_genome(f, p, oos[p.rank], plan.thresholds, plan.exclusive_return))
     return out
 
 
@@ -602,7 +607,8 @@ def run_walk_forward(plan: Plan, runner: Runner, log: Callable[[str], None] = pr
     for f in folds:
         genomes.extend(run_fold(plan, runner, f, log))
     return aggregate(plan.prefix, folds, len(plan.folds), plan.top_n, genomes, plan.thresholds,
-                     plan.selection, require_test_years=plan.require_test_years)
+                     plan.selection, require_test_years=plan.require_test_years,
+                     exclusive_return=plan.exclusive_return)
 
 
 # --------------------------------------------------------------------------------- report
@@ -625,6 +631,7 @@ def result_to_json(res: WalkForwardResult) -> Dict[str, Any]:
         "complete": res.complete,
         "overall_passed": res.overall_passed,
         "winners_passed": res.winners_passed,
+        "exclusive_return": res.exclusive_return,
         "require_test_years": list(res.require_test_years),
         "required_failed": list(res.required_failed),
         "notes": res.notes,
@@ -645,7 +652,7 @@ def render_markdown(res: WalkForwardResult) -> str:
            f"**Overall verdict: {verdict}** -- {res.winners_passed} of {len(res.folds)} fold "
            f"winner(s) passed (need {th.min_folds}).", "",
            "## Thresholds used", "",
-           f"- `--pass-min-oos-return` {th.min_oos_return:g}% (per-fold TOTAL OOS return over that "
+           f"- `--pass-min-oos-return{'-exclusive' if res.exclusive_return else ''}` {th.min_oos_return:g}% (per-fold TOTAL OOS return over that "
            f"fold's test window, NOT annualised; window lengths are in each fold heading)",
            f"- `--pass-max-dd-mult` {th.max_dd_mult:g} (OOS |max DD| <= mult x IS |max DD|)",
            f"- `--pass-min-folds` {th.min_folds} (fold winners that must pass)",

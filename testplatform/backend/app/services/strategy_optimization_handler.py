@@ -2273,9 +2273,11 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             if ga.get(CHAIN_SEED_KEY):
                 # This relaunch inserted a NEW row, so the lineage of the first launch is not on
                 # it: record what is known (the source), flagged as a checkpoint resume.
+                _src_name = db.query(StrategyOptimization.name).filter(
+                    StrategyOptimization.id == int(ga[CHAIN_SEED_KEY])).scalar()
                 _record_chain_lineage(db, opt, {
                     "kind": "chain", "optimization_id": int(ga[CHAIN_SEED_KEY]),
-                    "resumed_from_checkpoint": True})
+                    "name": _src_name, "resumed_from_checkpoint": True})
         elif not is_brute_force and ga.get(CHAIN_SEED_KEY):
             if ga.get("warmStartFromOptimizationId"):
                 return _fail(opt_id, db, f"{CHAIN_SEED_KEY} and warmStartFromOptimizationId are "

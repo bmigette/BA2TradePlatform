@@ -232,3 +232,17 @@ def test_grid_summary_collects_every_cell_and_survives_one_failing_cell(tmp_path
     assert "training job exited" in summ["cells"][2]["error"]
     md = (tmp_path / "summary.md").read_text(encoding="utf-8")
     assert "| ok | PASS" in md and "| bad | FAIL" in md and "| boom | ERROR" in md
+
+
+def test_exclusive_return_flows_through_the_cell_and_its_stored_fold_key(tmp_path):
+    flat = _oos(0.0, -5.0)
+    r = ChainRunner([flat, flat, flat])
+    res = C.run_cell(_spec(exclusive_return=True), r, str(tmp_path), log=lambda *_: None)
+    assert res.verdict == "FAIL"
+    cell = json.loads((tmp_path / "cell" / "cell.json").read_text(encoding="utf-8"))
+    assert cell["thresholds"]["exclusive_return"] is True
+    # a stored report made under the inclusive rule must not be trusted by the strict one
+    C.run_cell(_spec(), ChainRunner([flat, flat, flat]), str(tmp_path / "b"), log=lambda *_: None)
+    r2 = ChainRunner([flat, flat, flat], completed={"cell-wf1", "cell-wf2", "cell-wf3"})
+    res2 = C.run_cell(_spec(exclusive_return=True), r2, str(tmp_path / "b"), log=lambda *_: None)
+    assert res2.verdict == "FAIL" and [e[0] for e in r2.events] == ["oos", "oos", "oos"]

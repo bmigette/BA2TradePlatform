@@ -688,6 +688,9 @@ def main() -> int:
                     help="Ignore --wf-min-free-gb.")
     ap.add_argument("--pass-min-oos-return", type=float, default=None,
                     help="Percent: a fold's TOTAL out-of-sample return must reach this (REQUIRED).")
+    ap.add_argument("--pass-min-oos-return-exclusive", action="store_true",
+                    help="Strict return rule: a fold passes only if its OOS return is ABOVE "
+                         "--pass-min-oos-return (default: at or above).")
     ap.add_argument("--pass-max-dd-mult", type=float, default=None,
                     help="OOS |maxDD| must be <= this x IS |maxDD| (REQUIRED).")
     ap.add_argument("--pass-min-folds", type=int, default=None,
@@ -704,6 +707,7 @@ def main() -> int:
     if not args.walk_forward:
         _stray = [("--" + k.replace("_", "-")) for k in _wf_opt if getattr(args, k) is not None]
         _stray += ["--wf-force-memory"] if args.wf_force_memory else []
+        _stray += ["--pass-min-oos-return-exclusive"] if args.pass_min_oos_return_exclusive else []
         _stray += ["--pass-require-fold"] if args.pass_require_fold else []
         if _stray:
             ap.error(f"{', '.join(_stray)} need --walk-forward")
@@ -960,8 +964,16 @@ def main() -> int:
             print(f"[{i}/{len(jobs)}] NOTE {name}: bypass expert, market profile gene not applied "
                   f"(carries no market genes)", flush=True)
         job_name = name
-        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens:
-            job_name = _job_name(name, cmd)
+        # The walk-forward budgets and fold spec are part of the cell identity: a changed budget,
+        # window, top-N or pass rule must never resume an older cell's -wf/-refit names.
+        wf_tokens = ([] if not args.walk_forward else [
+            "--wf-spec", args.wf_train_start, args.wf_test_years, str(args.wf_data_end),
+            str(args.wf_first_generations), str(args.wf_next_generations), str(args.wf_top_n),
+            str(args.pass_min_oos_return), str(args.pass_max_dd_mult), str(args.pass_min_folds),
+            ",".join(map(str, sorted(set(args.pass_require_fold)))) or "-",
+            "exclusive" if args.pass_min_oos_return_exclusive else "inclusive"])
+        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or wf_tokens:
+            job_name = _job_name(name, cmd + wf_tokens)
             cmd[cmd.index("--name") + 1] = job_name
         if args.walk_forward:
             wf_specs.append(WFC.CellSpec(
@@ -972,6 +984,7 @@ def main() -> int:
                 thresholds=WF.Thresholds(args.pass_min_oos_return, args.pass_max_dd_mult,
                                          args.pass_min_folds),
                 require_test_years=tuple(args.pass_require_fold),
+                exclusive_return=args.pass_min_oos_return_exclusive,
                 test_parallel=args.wf_test_parallel, selection=_wf_selection_defaults(),
                 expert=expert, strategy=strat, band=band,
                 floor=date.fromisoformat(_EXPERT_MIN_START[expert])
