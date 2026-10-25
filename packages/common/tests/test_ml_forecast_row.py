@@ -104,3 +104,13 @@ def test_from_record_missing_column_raises():
 def test_column_list_matches_record():
     assert set(fr.record_columns(H, with_paths=True)) == set(make_row(path_probs=full_probs()).to_record())
     assert set(fr.record_columns(H, with_paths=False)) == set(make_row().to_record())
+
+
+def test_numpy_floats_accepted_and_cast():
+    import numpy as np
+    dec = tuple(np.float32(x) for x in deciles())
+    r = make_row(deciles={5: dec, 10: tuple(np.float64(x) for x in deciles())}, path_probs=None)
+    assert all(type(x) is float for q in r.deciles.values() for x in q)
+    pp = {k: np.float32(v) for k, v in full_probs(0.25).items()}
+    r2 = make_row(path_probs=pp)
+    assert all(type(v) is float for v in r2.path_probs.values())

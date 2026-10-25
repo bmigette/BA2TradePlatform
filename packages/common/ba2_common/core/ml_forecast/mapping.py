@@ -24,7 +24,12 @@ CALLER must then apply the ruleset / ATR stop safeguard, so a trade never opens 
 Held positions (``map_held_position``): a flip to the opposite rating once the opposite-side probability
 (decile based) reaches ``exit_flip_prob``. It ignores ``enable_sell`` (closing a long is not opening a short).
 
-Confidence is the probability used, in percent, clamped to 1-100 (also reported on HOLD, informationally).
+Confidence is the probability used, in percent, clamped to 1-100. On HOLD it is informational only: the probability
+of the leading side (the gate-failing side where one was chosen), NOT a confidence in holding. Callers must act on
+``signal``, never threshold a HOLD's confidence.
+
+``expected_profit_percent`` is the profit in the TRADE direction: +|q50| for a BUY and +|q50| for a SELL (a short
+profits when the price falls), so it is positive whenever a signal is emitted.
 """
 from __future__ import annotations
 
@@ -109,6 +114,9 @@ def p_up_from_deciles(deciles: Sequence[float]) -> float:
       more deciles (a flat segment), F(0) is the midpoint of the first and last such level.
     * 0% below q10 (all deciles positive): F(0) = 0.05, i.e. P(up) = 0.95. 0% above q90: F(0) = 0.95, P(up) = 0.05.
       The tails are unobserved, so the probability never exceeds [0.05, 0.95].
+    * Known discontinuity: with q10 exactly 0 (or just below) P(up) is ~0.90, but with q10 just above 0 it jumps to
+      0.95 (and symmetrically at q90 = 0 for 0.10 -> 0.05). The jump is 0.05 and is accepted: the mass beyond q10 is
+      not observed, so the tail clamp is a convention rather than an estimate.
     """
     r = [float(x) for x in deciles]
     levels = [l / 100.0 for l in DECILE_LEVELS]

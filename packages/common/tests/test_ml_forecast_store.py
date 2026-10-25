@@ -235,3 +235,14 @@ def test_max_age_days_validated(tmp_path, key):
     for bad in (0, -1, 1.5, True):
         with pytest.raises(ValueError):
             store.read_row(key, "AAPL", date(2024, 3, 1), horizon=5, cache_root=tmp_path, max_age_days=bad)
+
+
+def test_meta_written_after_parquet(tmp_path, key, monkeypatch):
+    import pandas as pd
+
+    def boom(self, *a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", boom)
+    with pytest.raises(OSError):
+        seed(tmp_path, key, [row("AAPL", date(2024, 3, 1))])
+    assert not (tmp_path / "ml_forecast" / key / "meta.json").exists()    # a crash never leaves meta without data

@@ -201,6 +201,10 @@ def write_rows(model_key: str, card: ModelCard, build_params: Dict[str, Any], ro
                covariate_set: Iterable[str], cache_root: Optional[os.PathLike] = None) -> None:
     """Upsert rows (by symbol + session) into the store of ``model_key``.
 
+    SINGLE WRITER: one process writes a given store at a time (the build tool, or the live append job). The upsert is
+    read-modify-write per symbol file, so concurrent writers can lose rows. Parquet files are replaced atomically
+    and ``meta.json`` is written AFTER them, so a crash never leaves a meta without data.
+
     Refuses a card that differs from the one already stored under the key. Rows must carry exactly the card's
     horizons, and path probabilities iff the card's output type is ``paths``."""
     covariate_set = sorted(covariate_set)
@@ -223,10 +227,6 @@ def write_rows(model_key: str, card: ModelCard, build_params: Dict[str, Any], ro
         existing = json.loads(meta_p.read_text(encoding="utf-8"))
         if existing["card"] != card.to_dict():
             raise ForecastStoreCardMismatch(f"model key {model_key} already holds a different model card")
-    _atomic_write(meta_p, json.dumps({"model_key": model_key, "card": card.to_dict(), "context_length": card.context_length,
-                                      "covariate_set": covariate_set, "horizons": list(card.horizons),
-                                      "build": build_params},
-                                     indent=2, sort_keys=True, default=str))
     by_sym: Dict[str, List[ForecastRow]] = {}
     for r in rows:
         by_sym.setdefault(_symbol(r.symbol), []).append(r)
@@ -243,6 +243,10 @@ def write_rows(model_key: str, card: ModelCard, build_params: Dict[str, Any], ro
         tmp = p.with_suffix(".parquet.tmp")
         new.to_parquet(tmp, index=False)
         os.replace(tmp, p)
+    _atomic_write(meta_p, json.dumps({"model_key": model_key, "card": card.to_dict(), "context_length": card.context_length,
+                                      "covariate_set": covariate_set, "horizons": list(card.horizons),
+                                      "build": build_params},
+                                     indent=2, sort_keys=True, default=str))
     reset_cache()
 
 

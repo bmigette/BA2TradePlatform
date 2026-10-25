@@ -11,6 +11,7 @@ Column names (parquet): ``session``, ``h{H}_q{10..90}``, ``p_{long|short}_h{H}_t
 from __future__ import annotations
 
 import math
+import numbers
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -43,7 +44,7 @@ def record_columns(horizons: Iterable[int], with_paths: bool) -> List[str]:
 
 
 def _finite(x: Any) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    return isinstance(x, numbers.Real) and not isinstance(x, bool) and math.isfinite(float(x))
 
 
 @dataclass(frozen=True)
