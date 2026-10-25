@@ -43,6 +43,12 @@ def timesfm3_card(context_length: int) -> ModelCard:
         output_type="deciles", pretraining_cutoff=None, licence=LICENCE, licence_commercial_ok=False)
 
 
+class InputDataError(ValueError):
+    """The CONTEXT is unusable (short, non-finite, non-positive). A data defect of one symbol-session: the builder
+    may isolate, count and report it. Every other error (model output shape, crossing quantiles) is a contract
+    failure and aborts the build."""
+
+
 class TimesFM3Adapter:
     def __init__(self, card: ModelCard, predict_fn: PredictFn, covariate_set: Iterable[str] = ()):
         cov = tuple(sorted(covariate_set))
@@ -62,12 +68,12 @@ class TimesFM3Adapter:
         for sym, sess, close in items:
             c = np.asarray(close, dtype=np.float64)
             if c.ndim != 1 or len(c) < n:
-                raise ValueError(f"{sym} {sess}: needs at least {n} closes, got {len(c)}")
+                raise InputDataError(f"{sym} {sess}: needs at least {n} closes, got {len(c)}")
             c = c[-n:]
             if not np.all(np.isfinite(c)):
-                raise ValueError(f"{sym} {sess}: non-finite close in the context")
+                raise InputDataError(f"{sym} {sess}: non-finite close in the context")
             if not np.all(c > 0):
-                raise ValueError(f"{sym} {sess}: closes must be positive")
+                raise InputDataError(f"{sym} {sess}: closes must be positive")
             ctxs.append(c.astype(np.float32))
         if not ctxs:
             return []

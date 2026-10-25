@@ -135,21 +135,6 @@ def test_weekly_sessions_are_last_union_date_per_iso_week(cache):
         bs.session_calendar(data, date(2024, 1, 2), date(2024, 1, 19), "monthly")
 
 
-def test_invalid_forecast_is_isolated_and_counted(cache):
-    data, _ = bs.load_daily_closes(cache, ["AAA", "BBB"])
-
-    def flaky(ctxs, horizon):
-        out = Spy()(ctxs, horizon)
-        if len(ctxs) > 1:       # the batch fails; the retry shows AAA is the bad row
-            out[0][:, [3, 4]] = out[0][:, [4, 3]]
-        elif ctxs[0][-1] == data["AAA"][1][np.searchsorted(data["AAA"][0], np.datetime64("2024-01-02"))]:
-            out[0][:, [3, 4]] = out[0][:, [4, 3]]
-        return out
-    data["BBB"] = (data["BBB"][0], data["BBB"][1] + 1000.0)      # distinct last close
-    st = bs.build(CARD, data, [date(2024, 1, 2)], TimesFM3Adapter(CARD, flaky), cache, batch_size=2)
-    assert st.invalid_forecasts == 1 and st.forecasts == 1 and "AAA" in st.invalid[0]
-
-
 def test_parse_symbols():
     assert bs.parse_symbols("aapl, msft\n# c\nNVDA # x\nAAPL") == ["AAPL", "MSFT", "NVDA"]
     with pytest.raises(ValueError):
@@ -166,3 +151,82 @@ def test_timesfm_is_deterministic_if_installed():
     b = predict(x, 20)
     for u, v in zip(a, b):
         np.testing.assert_array_equal(u, v)
+
+
+# ---------------------------------------------------------------- review fixes
+def test_rows_are_flushed_when_the_build_aborts(cache):
+    """RAM guard / Ctrl-C / any exception: buffered rows reach the store, so --resume loses nothing."""
+    data, _ = bs.load_daily_closes(cache, ["AAA", "BBB"])
+    sessions = bs.session_calendar(data, date(2024, 1, 2), date(2024, 1, 12), "all")
+    calls = {"n": 0}
+
+    def guard():
+        calls["n"] += 1
+        if calls["n"] == 5:
+            raise MemoryError("free RAM too low")
+    with pytest.raises(MemoryError):
+        bs.build(CARD, data, sessions, TimesFM3Adapter(CARD, Spy()), cache, flush_sessions=100, guard=guard)
+    assert store.read_row(KEY, "AAA", date(2024, 1, 5), 5, cache).session == date(2024, 1, 5)
+    st, _, _ = run(cache, Spy(), resume=True)       # resume completes the rest, recomputing only what is missing
+    assert st.skipped_resume >= 4
+
+
+def test_card_mismatch_is_refused_before_any_compute(cache):
+    run(cache, Spy())
+    meta_p = cache / store.STORE_DIRNAME / KEY / "meta.json"
+    import json
+    m = json.loads(meta_p.read_text())
+    m["card"]["version"] = "9.9.9"
+    meta_p.write_text(json.dumps(m))
+    store.reset_cache()
+    spy = Spy()
+    with pytest.raises(store.ForecastStoreError):
+        run(cache, spy, resume=True)
+    assert spy.calls == 0
+
+
+def test_only_input_data_errors_are_counted_model_errors_abort(cache):
+    data, _ = bs.load_daily_closes(cache, ["AAA", "BBB"])
+    d, c = data["BBB"]
+    c = c.copy()
+    c[np.searchsorted(d, np.datetime64("2024-01-02")) - 10] = -5.0      # inside every context of BBB
+    data["BBB"] = (d, c)
+    st = bs.build(CARD, data, [date(2024, 1, 2)], TimesFM3Adapter(CARD, Spy()), cache, batch_size=2)
+    assert st.forecasts == 1 and st.invalid_forecasts == 1 and "BBB" in st.invalid[0]
+
+    def crossed(ctxs, h):
+        out = Spy()(ctxs, h)
+        out[0][:, [3, 4]] = out[0][:, [4, 3]]
+        return out
+    data2, _ = bs.load_daily_closes(cache, ["AAA"])
+    with pytest.raises(ValueError, match="monotone"):
+        bs.build(CARD, data2, [date(2024, 1, 3)], TimesFM3Adapter(CARD, crossed), cache)
+
+    def bad_shape(ctxs, h):
+        return [np.ones((h, 5)) for _ in ctxs]
+    with pytest.raises(ValueError, match="shape"):
+        bs.build(CARD, data2, [date(2024, 1, 4)], TimesFM3Adapter(CARD, bad_shape), cache)
+
+
+def test_exit_code_follows_max_invalid_share():
+    st = bs.BuildStats(forecasts=99, invalid_forecasts=1)
+    assert bs.exit_code(st, 0.0) == 1
+    assert bs.exit_code(st, 0.02) == 0
+    assert bs.exit_code(bs.BuildStats(forecasts=5), 0.0) == 0
+
+
+def test_single_writer_lock(cache):
+    kdir = cache / store.STORE_DIRNAME / KEY
+    with bs.store_lock(cache, KEY):
+        assert (kdir / ".lock").exists()
+        with pytest.raises(bs.StoreLocked, match=r"pid \d+"):
+            with bs.store_lock(cache, KEY):
+                pass
+        assert (kdir / ".lock").exists()          # the failed attempt did not steal or delete it
+    assert not (kdir / ".lock").exists()
+    # build() holds the lock and releases it on abort
+    data, _ = bs.load_daily_closes(cache, ["AAA"])
+    with pytest.raises(MemoryError):
+        bs.build(CARD, data, [date(2024, 1, 2)], TimesFM3Adapter(CARD, Spy()), cache,
+                 guard=lambda: (_ for _ in ()).throw(MemoryError("x")))
+    assert not (kdir / ".lock").exists()

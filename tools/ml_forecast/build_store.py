@@ -12,9 +12,13 @@ Single writer per store (see ``store.write_rows``). Rows are buffered and flushe
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
+import socket
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -27,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ba2_common.core.ml_forecast import store  # noqa: E402
 from ba2_common.core.ml_forecast.forecast_row import ForecastRow  # noqa: E402
 from ba2_common.core.ml_forecast.model_card import model_key  # noqa: E402
-from tools.ml_forecast.adapters.timesfm3 import (CARD_IDS, TimesFM3Adapter, load_timesfm3_predict_fn,  # noqa: E402
+from tools.ml_forecast.adapters.timesfm3 import (CARD_IDS, InputDataError, TimesFM3Adapter, load_timesfm3_predict_fn,  # noqa: E402
                                                  timesfm3_card)
 
 log = logging.getLogger("ml_forecast.build_store")
@@ -124,10 +128,64 @@ def existing_sessions(cache_root: Path, key: str, symbol: str) -> set:
     return set(pd.to_datetime(pd.read_parquet(p, columns=["session"])["session"]).dt.date)
 
 
+class StoreLocked(RuntimeError):
+    pass
+
+
+@contextmanager
+def store_lock(cache_root: Path, key: str):
+    """Single-writer rule (``store.write_rows``): ``<key>/.lock``, created with O_EXCL for the build's duration.
+    A stale lock (crashed build) is NOT stolen: the message names its owner and the operator deletes it."""
+    kdir = Path(cache_root) / store.STORE_DIRNAME / key
+    kdir.mkdir(parents=True, exist_ok=True)
+    lock = kdir / ".lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            owner = lock.read_text(encoding="utf-8").strip()
+        except OSError:
+            owner = "unreadable"
+        raise StoreLocked(f"{lock} exists (held by {owner}). Another build writes this store, or it crashed: "
+                          f"if no build is running, delete the file and re-run with --resume") from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"pid {os.getpid()} host {socket.gethostname()} since {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        yield
+    finally:
+        try:
+            lock.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def check_existing_store(card, covariate_set, cache_root: Path, key: str) -> None:
+    """Refuse at once when a store under this key holds another card / covariate set (not after the first flush)."""
+    try:
+        meta = store.read_meta(key, cache_root)
+    except store.ForecastStoreMiss:
+        return                                    # a new store
+    if meta["card"] != card.to_dict() or sorted(meta["covariate_set"]) != sorted(covariate_set):
+        raise store.ForecastStoreCardMismatch(f"store {key} holds a different model card or covariate set")
+
+
+def exit_code(st: "BuildStats", max_invalid_share: float) -> int:
+    total = st.forecasts + st.invalid_forecasts
+    return 1 if st.invalid_forecasts and st.invalid_forecasts / total > max_invalid_share else 0
+
+
 def build(card, data: SymbolData, sessions: Sequence[date], adapter: TimesFM3Adapter, cache_root: Path,
           batch_size: int = 64, resume: bool = True, flush_sessions: int = 20,
           build_params: Optional[dict] = None, guard: Optional[Callable[[], None]] = None) -> BuildStats:
     key = model_key(card, adapter.covariate_set)
+    with store_lock(cache_root, key):
+        check_existing_store(card, adapter.covariate_set, cache_root, key)
+        return _build_locked(card, key, data, sessions, adapter, cache_root, batch_size, resume, flush_sessions,
+                             build_params, guard)
+
+
+def _build_locked(card, key, data, sessions, adapter, cache_root, batch_size, resume, flush_sessions,
+                  build_params, guard) -> BuildStats:
     n = card.context_length
     done = {s: (existing_sessions(cache_root, key, s) if resume else set()) for s in data}
     st = BuildStats()
@@ -154,46 +212,48 @@ def build(card, data: SymbolData, sessions: Sequence[date], adapter: TimesFM3Ada
         buf.extend(rows)
         st.forecasts += len(rows)
 
-    for sess in sessions:
-        items = []
-        for sym, (d, c) in data.items():
-            if sess in done[sym]:
-                st.skipped_resume += 1
-                continue
-            ctx, why = context_for(d, c, sess, n)
-            if ctx is None:
-                if why == "short":
-                    st.skipped_short_history += 1
-                else:
-                    st.skipped_no_bar += 1
-                continue
-            items.append((sym, sess, ctx))
-        for i in range(0, len(items), batch_size):
-            if guard:
-                guard()
-            chunk = items[i:i + batch_size]
-            try:
-                run(chunk)
-            except ValueError as e:      # isolate the bad row(s); count and name them, never repair
-                log.warning("batch failed (%s); retrying one by one", e)
-                for it in chunk:
-                    try:
-                        run([it])
-                    except ValueError as e1:
-                        st.invalid_forecasts += 1
-                        st.invalid.append(f"{it[0]} {it[1]}: {e1}")
-                        log.warning("invalid forecast skipped: %s %s: %s", it[0], it[1], e1)
-        st.sessions += 1
+    try:
+        for sess in sessions:
+            items = []
+            for sym, (d, c) in data.items():
+                if sess in done[sym]:
+                    st.skipped_resume += 1
+                    continue
+                ctx, why = context_for(d, c, sess, n)
+                if ctx is None:
+                    if why == "short":
+                        st.skipped_short_history += 1
+                    else:
+                        st.skipped_no_bar += 1
+                    continue
+                items.append((sym, sess, ctx))
+            for i in range(0, len(items), batch_size):
+                if guard:
+                    guard()
+                chunk = items[i:i + batch_size]
+                try:
+                    run(chunk)
+                except InputDataError as e:      # isolate the bad row(s); count and name them, never repair
+                    log.warning("batch failed (%s); retrying one by one", e)
+                    for it in chunk:
+                        try:
+                            run([it])
+                        except InputDataError as e1:
+                            st.invalid_forecasts += 1
+                            st.invalid.append(f"{it[0]} {it[1]}: {e1}")
+                            log.warning("invalid forecast skipped: %s %s: %s", it[0], it[1], e1)
+            st.sessions += 1
+            st.seconds = time.time() - t0
+            if items:
+                rate = st.forecasts / st.seconds if st.seconds else 0.0
+                left = max(plan - st.forecasts - st.invalid_forecasts, 0)
+                log.info("session %s (%d/%d): %d forecasts, %.2f forecasts/s, ETA %.1f min", sess, st.sessions,
+                         len(sessions), st.forecasts, rate, (left / rate / 60) if rate else float("nan"))
+            if st.sessions % flush_sessions == 0:
+                flush()
+    finally:
         st.seconds = time.time() - t0
-        if items:
-            rate = st.forecasts / st.seconds if st.seconds else 0.0
-            left = max(plan - st.forecasts - st.invalid_forecasts, 0)
-            log.info("session %s (%d/%d): %d forecasts, %.2f forecasts/s, ETA %.1f min", sess, st.sessions,
-                     len(sessions), st.forecasts, rate, (left / rate / 60) if rate else float("nan"))
-        if st.sessions % flush_sessions == 0:
-            flush()
-    flush()
-    st.seconds = time.time() - t0
+        flush()
     return st
 
 
@@ -216,6 +276,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--threads", type=int, default=6)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--flush-sessions", type=int, default=20)
+    ap.add_argument("--max-invalid-share", type=float, default=0.0,
+                    help="exit non-zero when invalid (unusable-input) forecasts exceed this share (default 0 = any)")
     ap.add_argument("--resume", action="store_true", help="skip (symbol, session) pairs already in the store")
     a = ap.parse_args(argv)
     if not 1 <= a.threads <= 6:
@@ -248,7 +310,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log.info("DONE forecasts=%d sessions=%d skipped: short_history=%d no_bar=%d already_stored=%d invalid=%d "
              "| %.2f forecasts/s over %.0fs", st.forecasts, st.sessions, st.skipped_short_history,
              st.skipped_no_bar, st.skipped_resume, st.invalid_forecasts, st.rate, st.seconds)
-    return 0
+    if st.invalid:
+        log.error("INVALID forecasts (%d): %s", st.invalid_forecasts, "; ".join(st.invalid))
+    return exit_code(st, a.max_invalid_share)
 
 
 if __name__ == "__main__":
