@@ -23,6 +23,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
@@ -44,6 +46,21 @@ _RESULTS = {
                 "size": 10.0, "pnl": 500.0, "pnl_pct": 5.0, "bars_held": 2,
                 "exit_reason": "unknown"}],
 }
+
+
+@pytest.fixture(autouse=True)
+def _restore_database_module():
+    """These tests ``importlib.reload(app.models.database)`` for a private DB. A reload rebinds
+    engine/SessionLocal/Base in the SAME module object, and every later test file that did
+    ``from app.models.database import SessionLocal`` at import keeps the ORIGINAL, so whatever reads
+    ``app.models.database.SessionLocal`` at call time (the walk-forward RealRunner) would then talk
+    to a different, empty DB. Put the module's namespace back exactly as it was."""
+    import app.models.database as dbmod
+    before = dict(dbmod.__dict__)
+    yield
+    for k in [k for k in dbmod.__dict__ if k not in before]:
+        del dbmod.__dict__[k]
+    dbmod.__dict__.update(before)
 
 
 def _config(name: str) -> dict:
