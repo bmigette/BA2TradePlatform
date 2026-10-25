@@ -247,3 +247,39 @@ class TestExportKeepsTheChosenMode:
         decoded = decode_params(_STRAT, flat)
         assert decoded["expert_overrides"]["sizing_mode"] == "notional"
         assert "atr_risk_budget_pct" not in decoded["expert_overrides"]
+
+
+# ----------------------------------------------------------------------------- capband driver
+_DRIVER = os.path.join(os.path.dirname(_TESTPLATFORM), "tools", "run_screener_capband_matrix.py")
+
+
+@pytest.fixture(scope="module")
+def driver():
+    spec = importlib.util.spec_from_file_location("capband_sizing_gene", _DRIVER)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class TestDriver:
+    def test_forwarded_to_classic_jobs_only(self, driver):
+        on = SimpleNamespace(search_sizing_mode=True)
+        off = SimpleNamespace(search_sizing_mode=False)
+        assert driver.sizing_gene_tokens(on, "S1") == ["--search-sizing-mode"]
+        assert driver.sizing_gene_tokens(on, None) == []       # FactorRanker (bypass)
+        assert driver.sizing_gene_tokens(off, "S1") == []
+
+    @staticmethod
+    def _run(*argv):
+        import subprocess
+        return subprocess.run([sys.executable, _DRIVER, *argv, "--dry-run"],
+                              capture_output=True, text=True)
+
+    def test_refuses_the_gene_together_with_an_explicit_mode(self):
+        r = self._run("--search-sizing-mode", "--sizing-mode", "notional",
+                      "--name-suffix", "x-sizegene")
+        assert r.returncode != 0 and "mutually exclusive" in r.stderr
+
+    def test_requires_the_sizegene_name_token(self):
+        r = self._run("--search-sizing-mode", "--name-suffix", "plain")
+        assert r.returncode != 0 and "sizegene" in r.stderr

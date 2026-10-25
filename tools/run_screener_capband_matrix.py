@@ -161,6 +161,15 @@ def market_condition_passthrough(args) -> list:
     return out
 
 
+def sizing_gene_tokens(args, strat) -> list:
+    """`--search-sizing-mode` for a CLASSIC job when the matrix searches the sizing mode (goal2027 item 2.1),
+    else []. The FactorRanker job (``strat is None``, a bypass expert) never reads sizing_mode and the
+    launcher refuses the gene there, so it is not forwarded (the caller prints a NOTE)."""
+    if getattr(args, "search_sizing_mode", False) and strat is not None:
+        return ["--search-sizing-mode"]
+    return []
+
+
 def exclude_symbols_passthrough(args) -> list:
     """Extra `optimize` CLI tokens for --exclude-symbols ([] when not given, so an ordinary
     invocation of this driver is untouched). Kept separate from
@@ -500,6 +509,11 @@ def main() -> int:
                          "REQUIRES --name-suffix to contain the mode token (enforced below), or "
                          "the second matrix would be skipped as already-completed. No effect on "
                          "FactorRanker (bypass expert — never reads sizing_mode).")
+    ap.add_argument("--search-sizing-mode", action="store_true", default=False,
+                    help="Search sizing_mode (risk_atr | notional) as a model:sizing_mode GENE in every "
+                         "classic (S1-S7) job instead of pinning it (goal2027 item 2.1). Mutually exclusive "
+                         "with --sizing-mode. REQUIRES --name-suffix to contain 'sizegene'. Not forwarded "
+                         "to the FactorRanker job (bypass expert); folds into the job's name digest.")
     ap.add_argument("--workers", default=None,
                     help="Comma-separated remote worker NAMES to distribute each job's GA trials to "
                          "(e.g. 'remote150'); trials spread across these + local. Workers must be "
@@ -567,6 +581,14 @@ def main() -> int:
     # when already `completed`, so running notional and risk_atr under the same --name-suffix
     # would silently skip the entire second matrix and leave you comparing one mode against
     # itself. Fail loudly rather than let that happen hours later.
+    if args.search_sizing_mode:
+        if args.sizing_mode:
+            ap.error(f"--search-sizing-mode and --sizing-mode {args.sizing_mode} are mutually exclusive "
+                     f"(search the mode, or pin it; not both)")
+        if "sizegene" not in args.name_suffix.replace("_", "").lower():
+            ap.error(f"--search-sizing-mode requires --name-suffix to contain 'sizegene' "
+                     f"(got {args.name_suffix!r}): its gene space differs from a pinned run's, so it "
+                     f"must not share a job name. Example: --name-suffix goal2027-sizegene")
     if args.sizing_mode:
         token = "riskatr" if args.sizing_mode == "risk_atr" else "notional"
         if token not in args.name_suffix.replace("_", "").lower():
@@ -729,8 +751,15 @@ def main() -> int:
         cmd += dt_tokens
         unc_tokens = ["--screener-exclude-uncached"] if args.exclude_uncached else []
         cmd += unc_tokens
+        # --search-sizing-mode: appended last (same reasoning); digest on its own. A bypass job is
+        # not given the gene (the launcher would refuse it).
+        sz_tokens = sizing_gene_tokens(args, strat)
+        cmd += sz_tokens
+        if args.search_sizing_mode and strat is None:
+            print(f"[{i}/{len(jobs)}] NOTE {name}: bypass expert, sizing mode gene not applied "
+                  f"(never reads sizing_mode)", flush=True)
         job_name = name
-        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens:
+        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens:
             job_name = _job_name(name, cmd)
             cmd[cmd.index("--name") + 1] = job_name
         if args.dry_run:
