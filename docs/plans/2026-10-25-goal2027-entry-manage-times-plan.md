@@ -25,21 +25,17 @@ Pinned today by `tests/test_open_positions_waits_for_entry.py` and `tests/test_e
 (open-positions after enter-market when both share a time). Note `_execute_scheduled_group` itself only orders jobs by
 (expert priority, symbol) at SUBMISSION; it does not decide the processing order.
 
+## Owner decision (after review): ENTRY FIRST is KEPT
+
+Review found a pending exit frees no cash (`capital_transactions` counts CLOSING as used until the fill; the
+backtest settles after both passes) and manage-first created a BT/live re-entry divergence (the BT duplicate gate
+ignores CLOSING). The reorder was reverted completely: `JobManager`, `ExpertPriority`, `WorkerQueue` and
+`daily_engine` are byte-identical to origin/dev. The pass-order tests remain and pin TODAY's entry-first order in BT
+and live. To free cash for entries, the GA chooses `manage_time` EARLIER than `entry_time` (exits then fill before
+the entry pass); that is what the split genes are for.
+
 ## Decisions
 
-- **One definition of the order.** `ba2_common.core.schedule_genes.SAME_MINUTE_PASS_ORDER = ("open_positions",
-  "enter_market")` and `order_same_minute_passes(passes)`. The BT engine and `ExpertPriority` both call it (one shared
-  function, two callers); a parity test pins both, plus the constant itself.
-- **BT:** the per-expert loop runs the passes in that order (manage, then entry). Bypass experts have no manage pass
-  (unchanged); basket and classic experts get manage first.
-- **Live:** stop parking the exit pass behind the entry pass (JobManager no longer calls
-  `defer_open_positions_if_entry_in_flight`, no safety timer) and make `ExpertPriority` release the OPEN_POSITIONS
-  processing callback before ENTER_MARKET. Order PROCESSING is already gated behind all of the run's analysis tasks
-  (a run's `ready` callbacks fire only when `run.tasks` is empty), so exits and entries are analysed in parallel and
-  only their order processing is sequenced; in smart-RM mode the exit pass's SRM task joins `run.tasks`, so entry
-  processing still waits for it. The group order is logged at INFO (`[ORDER] expert E batch B: same-minute pass
-  order: open_positions -> enter_market`). The WorkerQueue parking methods stay (now unused by the scheduler); see
-  Open questions.
 - **Genes (opt-in):** `ba2-test optimize --decision-times split` (and the capband driver's `--decision-times split`)
   replaces `schedule:time` by `schedule:entry_time` and `schedule:manage_time`, each the default 7-value list
   (`DEFAULT_DECISION_TIME_CHOICES`, `choice`, stratified, appended after the day genes in that order). Mutually
@@ -56,12 +52,13 @@ Pinned today by `tests/test_open_positions_waits_for_entry.py` and `tests/test_e
   `_gene_params` already pass any `schedule:*` key; they get the split times via the same helpers.
 - **Deploy:** `tools/import_deploy_payload.py` writes `execution_schedule_open_positions.times = manage_times` (else
   the entry times, as before) and applies `live_deploy_time_refusal` to BOTH lists before any write.
-- **Versions:** packages (`ba2_common`) change -> bump `PACKAGE_VERSION` and raise its REQUIRED minimum; testplatform
-  -> `TEST_APP_VERSION` 0152; `ba2_trade_platform` change -> `APP_VERSION` +1.
+- **Versions:** `ba2_common` changed (gene helpers, export) -> `PACKAGE_VERSION` bump and raised minimum; testplatform
+  -> `TEST_APP_VERSION` 0152; no `ba2_trade_platform` change, so no APP bump.
+- **fix_live_schedules.py:** a split row also repairs the open-positions schedule from its manage_time.
 
 ## Tasks (TDD, one commit each)
 
-1. Shared order + BT engine + live ExpertPriority/JobManager, with the parity test.
+1. (Reverted) same-minute reorder; the pass-order tests pin the unchanged entry-first order.
 2. Genes: schedule_genes helpers, `collect_param_space`, `decode_params`, trial config, canonical/memo.
 3. Launcher flag `split`, name token, driver passthrough (capband; senate refuses).
 4. Export (`manage_times`, refusal) and `import_deploy_payload` (both times, both refusals).

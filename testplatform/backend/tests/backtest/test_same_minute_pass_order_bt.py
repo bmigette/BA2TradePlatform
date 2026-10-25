@@ -1,9 +1,9 @@
-"""goal2027 2.4 parity, BACKTEST side: when the entry and the manage schedule fire on the same bar, the
-MANAGE pass runs before the ENTRY pass (ba2_common SAME_MINUTE_PASS_ORDER). Live twin:
-tests/test_same_minute_pass_order_live.py."""
+"""goal2027 2.4 (owner decision: ENTRY FIRST is KEPT), BACKTEST side: when the entry and the manage schedule
+fire on the same bar, the ENTRY pass runs before the MANAGE pass. Live twin:
+tests/test_same_minute_pass_order_live.py. The GA can still put exits before entries by choosing
+manage_time earlier than entry_time."""
 import pytest
 
-from ba2_common.core.schedule_genes import SAME_MINUTE_PASS_ORDER
 from tests.backtest.test_decision_time_gene import _engine_run
 
 _NAME = {"_run_expert_bar": "enter_market", "_manage_open_positions": "open_positions"}
@@ -23,14 +23,11 @@ def events(monkeypatch):
     return log
 
 
-def test_shared_minute_runs_manage_then_entry(events):
+def test_shared_minute_runs_entry_then_manage(events):
     _engine_run(["10:00"], ["10:00"], run_id=910)
-    assert events, "no pass ran"
     by_bar = {}
     for name, as_of in events:
         by_bar.setdefault(as_of, []).append(name)
-    # Day 1 only enters (the skip-flat-bars shortcut never calls manage on a flat book); later days have an
-    # open position, so both passes fire on the one bar.
     both = [order for order in by_bar.values() if len(order) == 2]
     assert both, f"no bar ran both passes: {by_bar}"
-    assert all(order == list(SAME_MINUTE_PASS_ORDER) for order in both), by_bar
+    assert all(order == ["enter_market", "open_positions"] for order in both), by_bar

@@ -1436,12 +1436,7 @@ class WorkerQueue:
             self._expert_priority.finished(task.batch_id, task.id)
     
     # ------------------------------------------------------------------------------------
-    # SUPERSEDED (goal2027 2.4): the same-minute order is now MANAGE before ENTRY, enforced by
-    # ExpertPriority + ba2_common SAME_MINUTE_PASS_ORDER. JobManager no longer parks the exit pass, so
-    # defer_open_positions_if_entry_in_flight is not called by the scheduler and the release hooks
-    # below are inert no-ops (nothing is ever parked). Kept until the owner decides to delete them.
-    #
-    # ENTRY BEFORE MANAGE -- the backtest's order, made deterministic in live (historical).
+    # ENTRY BEFORE MANAGE -- the backtest's order, made deterministic in live.
     #
     # daily_engine._run_expert_bar runs the entry pass and THEN `_manage_open_positions` on a
     # bar where both are due. Live had no such order: the ENTER_MARKET and OPEN_POSITIONS jobs

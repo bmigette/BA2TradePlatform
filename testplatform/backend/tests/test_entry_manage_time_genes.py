@@ -399,3 +399,15 @@ class TestDeploy:
         assert _deploy(tool, tmp_path, monkeypatch, entry) == 0, capsys.readouterr().out
         expert = tool._expert_class("FMPRating")(get_instance(ExpertInstance, inst_id).id)
         assert expert.get_setting_with_interface_default("execution_schedule_open_positions")["times"] == ["10:00"]
+
+
+class TestFixLiveSchedulesRefusesSplitRows:
+    def test_split_row_refused_loudly_and_single_gene_row_passes(self):
+        sys.path.insert(0, _TOOLS)
+        try:
+            import fix_live_schedules as f
+        finally:
+            sys.path.remove(_TOOLS)
+        with pytest.raises(ValueError, match="import_deploy_payload"):
+            f.refuse_split_time_row(_flat("09:45", "15:30"), 7)
+        f.refuse_split_time_row({SCHEDULE_TIME_GENE: "12:00", "schedule:monday": 1}, 7)

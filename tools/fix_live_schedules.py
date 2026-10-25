@@ -107,6 +107,18 @@ def _opt_screener_base(test, bt_id):
         "base_settings") or {}
 
 
+def refuse_split_time_row(sp, inst_id):
+    """This tool repairs the ENTRY schedule only. A split-decision-time genome (schedule:entry_time +
+    schedule:manage_time, goal2027 2.4) also owns the open-positions time, which this tool does not write:
+    refuse it loudly rather than leave the manage schedule on another time. Re-deploy it with
+    tools/import_deploy_payload.py, which writes both."""
+    from ba2_common.core.schedule_genes import split_times_from_genes
+    if split_times_from_genes(sp) is not None:
+        raise ValueError(f"instance {inst_id}: its genome carries split entry/manage time genes; "
+                         f"fix_live_schedules repairs only the entry schedule. Re-deploy with "
+                         f"tools/import_deploy_payload.py instead.")
+
+
 def repair_schedules(ns, test) -> int:
     """Move each instance's ENTRY cadence onto the days its genome was scored on."""
     from ba2_common.core.db import get_instance
@@ -124,6 +136,7 @@ def repair_schedules(ns, test) -> int:
             print(f"  !! backtest {bt_id} not found")
             continue
         sp = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
+        refuse_split_time_row(sp, inst_id)
         want_days = _genome_days(sp)
         if want_days is None:
             print(f"  inst {inst_id}: backtest {bt_id} carries no schedule genes -- left alone")
