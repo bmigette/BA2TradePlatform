@@ -299,9 +299,11 @@ Open points:
    (`reconcile_protective_stop`; `allow_ruleset_sl_loosen` does not apply there). The safeguard distance is
    `max(risk_per_trade_pct, min_stop_loss_pct)` (3% to 15% over the RM genes), so under the default sizing genes the
    -14..-6% stop gene is dead whenever that distance is smaller (e.g. exploration's own sizing, risk 10 / floor 7, made
-   its -12% stop an effective -10%). SQM jobs therefore pin `min_stop_loss_pct` = 15 and `risk_per_trade_pct` = 10 and
-   drop both genes, so the ruleset stop is always the tighter one. Side effect: under `risk_atr` sizing the position is
-   sized on the 15% safeguard distance.
+   its -12% stop an effective -10%). SQM jobs therefore pin `min_stop_loss_pct` = 15 (above the loosest stop gene,
+   14%) and drop that one gene; `risk_per_trade_pct` stays a gene (it only sets the stop distance, tops out at 10 < 15,
+   and ATR can only shorten the candidate before the floor), so the safeguard distance is 15% for every genome in
+   notional and risk_atr alike. Sizing genes (`atr_risk_budget_pct`, per-instrument cap) are untouched. Side effect: under
+   `risk_atr` sizing the position is sized on the 15% safeguard distance.
 3. **Existing behaviour, unchanged:** a technical section whose usable components are missing for a symbol (for example
    `tw_mom` is its only positive weight and the momentum lookback exceeds the symbol's history) has `total_w` 0 and
    `technical_score` returns a literal 0.0 with no components, i.e. a silent neutral score that still carries

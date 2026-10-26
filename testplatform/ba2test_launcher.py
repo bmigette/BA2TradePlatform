@@ -1272,10 +1272,13 @@ def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
 #: (``position_sizing.reconcile_protective_stop``; ``allow_ruleset_sl_loosen`` does not apply there). With
 #: ``use_atr_stop`` off the safeguard distance is ``max(risk_per_trade_pct, min_stop_loss_pct)`` -- 3% to 15% across the
 #: RM genes -- so the searched -14..-6% stop would be dead whenever that distance is smaller. Pinning the floor at
-#: 15% (above the loosest stop gene, 14%) makes the ruleset stop always the tighter one, i.e. authoritative;
-#: ``risk_per_trade_pct`` (10, the exploration recipe's value) can then never exceed it, so it is pinned too and both
-#: genes are dropped from the SQM gene space (``_rm_opt_for``). The same settings reach live through the export.
-_STRATEGY_FIXED_SETTINGS = {"SQM": {"min_stop_loss_pct": 15.0, "risk_per_trade_pct": 10.0}}
+#: 15% (above the loosest stop gene, 14%) is enough: ``risk_per_trade_pct`` only ever sets that STOP distance (never the
+#: position size: notional sizes by the per-instrument cap, risk_atr by ``atr_risk_budget_pct``), its gene tops out at
+#: 10 < 15, and ATR (``min(risk, atr * mult)``) can only shorten the candidate before the floor, so the safeguard
+#: distance is exactly 15% for every genome in every sizing mode (regime scaling only widens it). ``risk_per_trade_pct``
+#: therefore stays a gene. Only ``min_stop_loss_pct`` is dropped from the SQM gene space (``_rm_opt_for``). The pin
+#: reaches live through the export.
+_STRATEGY_FIXED_SETTINGS = {"SQM": {"min_stop_loss_pct": 15.0}}
 
 
 def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None, *,
