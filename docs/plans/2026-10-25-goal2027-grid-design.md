@@ -206,25 +206,38 @@ The gene names are the ones S6 uses for the same roles. No gene switches a part 
 ruleset equals the exploration `quality_momentum` recipe, compared on the live export (test). SQM takes no market
 profile or SPY genes.
 
-**`xl` screen band.** A fixed screen, not a searched cap band: the exploration `new_idea_baseline` screen, with no
-screener genes.
+**`xl` screen band** (`ba2-test optimize --screener --screen-preset xl`). A fixed screen, not a searched cap band: the
+exploration `new_idea_baseline` screen with no screener genes. The preset pins every selection key in the run's
+`screener_opt.base_settings` (recorded as `screener_opt.screen_preset`); it is refused together with
+`--screener-cap-band` or `--screener-base-json`, and without `--screener`.
 
 ```xl-screen
 market_cap_min: 10e9
 market_cap_max: 0
 price_min: 10
 volume_min: 500000
-dollar_volume_min: 10e6
+dollar_volume_min: 0
 float_min: 10e6
 relative_volume_min: 0
 price_drop_pct: 0
+price_drop_days: 5
 weinstein_stage2_only: False
 max_stocks: 50
 ```
 
-The three cap bands (`SCREENER_CAP_BANDS`, `ba2_providers`) only set a cap-gene range, and the launcher has no
-"all screen keys pinned" mode yet. So `xl` is documented here and is NOT runnable until `grid_goal2027.sh` (§2.6)
-or a launcher option pins these keys. A test pins this block to the exploration screen.
+Two deliberate differences from the exploration screen, both forced by live parity:
+- `dollar_volume_min` is **0**, not 10e6. Live has no dollar-volume stage and the live-simulation gate refuses a
+  positive value (`live_sim.check_settings`), so a floor could neither be simulated by a classic job nor deployed
+  faithfully. With cap >= $10B, price >= $10 and volume >= 500,000 the floor should rarely bind, but that is NOT
+  measured here: the exploration result (32.9%/yr) was produced with the floor.
+- `price_drop_days: 5` is stated because the simulation refuses a screen that leaves a selection key implicit
+  (`sort_metric` is the launcher's built-in `market_cap`).
+
+The three cap bands (`SCREENER_CAP_BANDS`, `ba2_providers`) still only set a cap-gene range. The capband driver treats
+`xl` as a preset band: `--bands xl` passes `--screen-preset xl` instead of `--screener-cap-band`, takes the large-cap
+spread stress (4 bps), and drops SQM for every expert but DeterministicScorer, so the cell is
+`--bands xl --strategies SQM --skip-experts <all others>`. Tests pin this block to the preset, the preset to the
+exploration screen (apart from the floor above), and the export to the live screener keys.
 
 ### 2.9 Exploration ranges: what the families varied by hand vs what the cells search
 

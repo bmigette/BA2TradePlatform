@@ -216,18 +216,33 @@ class TestRefusals:
 class TestXlBand:
     DOC = os.path.join(_REPO, "docs", "plans", "2026-10-25-goal2027-grid-design.md")
 
-    def test_the_documented_xl_screen_has_the_exploration_screen_keys_and_values(self):
+    @staticmethod
+    def _doc_block():
+        text = open(TestXlBand.DOC, encoding="utf-8").read()
+        block = re.search(r"```xl-screen\n(.*?)```", text, re.S)
+        assert block, "the design doc must carry the xl screen in an ```xl-screen block"
+        out = {}
+        for k, v in re.findall(r"^(\w+):\s*(\S+)\s*$", block.group(1), re.M):
+            out[k] = (v == "True") if v in ("True", "False") else float(v)
+        return out
+
+    def test_the_documented_block_is_the_launcher_preset(self):
+        assert self._doc_block() == {k: (v if isinstance(v, bool) else float(v))
+                                     for k, v in _M._SCREEN_PRESETS["xl"].items()}
+
+    def test_the_preset_is_the_exploration_screen_apart_from_the_dollar_floor(self):
         prof = _exploration()
         base = prof.new_idea_baseline("quality_momentum", prof.load_baselines()["large_ds"])
         screen = base["backtest"]["screener_opt"]["base_settings"]
-        text = open(self.DOC, encoding="utf-8").read()
-        block = re.search(r"```xl-screen\n(.*?)```", text, re.S)
-        assert block, "the design doc must carry the xl screen in an ```xl-screen block"
-        doc = dict(re.findall(r"^(\w+):\s*(\S+)\s*$", block.group(1), re.M))
-        assert set(doc) == {"market_cap_min", "market_cap_max", "price_min", "volume_min", "dollar_volume_min",
-                            "float_min", "relative_volume_min", "price_drop_pct", "weinstein_stage2_only",
-                            "max_stocks"}
-        for k, v in doc.items():
-            want = screen[k]
-            assert float(v.replace("e", "E")) == float(want) if v not in ("True", "False") else \
-                (v == "True") == bool(want), (k, v, want)
+        preset = _M._SCREEN_PRESETS["xl"]
+        # the exploration baseline also states the bounds the launcher's built-in base states anyway
+        from ba2_common.core.deploy_parity import SCREENER_OFF_VALUES
+        assert set(preset) <= set(screen) and set(screen) - set(preset) <= set(SCREENER_OFF_VALUES)
+        for k in set(screen) - set(preset):
+            assert screen[k] == SCREENER_OFF_VALUES[k], k
+        for k, v in preset.items():
+            if k == "dollar_volume_min":
+                # live has no dollar-volume stage; the live simulation refuses a positive floor (see the doc)
+                assert v == 0 and screen[k] == 10000000.0
+            else:
+                assert (bool(v) == bool(screen[k])) if isinstance(v, bool) else float(v) == float(screen[k]), k

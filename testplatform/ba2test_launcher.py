@@ -1986,6 +1986,46 @@ _SCREENER_OPT = _us.SCREENER_OPT
 # large >=$10B. The cap-min gene optimizes the floor WITHIN the band; market_cap_max pins the ceiling.
 _SCREENER_CAP_BANDS = _us.SCREENER_CAP_BANDS
 
+#: ``--screen-preset`` (goal2027 item 2.8): a FIXED screen -- every selection key pinned in the job's
+#: ``screener_opt.base_settings``, NO screener genes -- instead of the searched cap bands. ``xl`` is the exploration
+#: ``new_idea_baseline`` screen (liquid large caps, 50 names), the design doc's ```xl-screen block (a test pins the
+#: two equal). UNPREFIXED metric-store names, the vocabulary of ``base_settings``; the deploy export carries them and
+#: ``live_settings_from_universe`` maps them to the live ``screener_<key>`` settings.
+#: ``dollar_volume_min`` is 0, NOT the exploration's 10e6: live has no dollar-volume stage and the live-simulation
+#: gate REFUSES a positive value (``live_sim.check_settings``), so a floor here could never be deployed faithfully.
+_SCREEN_PRESETS = {
+    "xl": {"market_cap_min": 1e10, "market_cap_max": 0, "price_min": 10, "volume_min": 500000,
+           "dollar_volume_min": 0, "float_min": 10000000, "relative_volume_min": 0, "price_drop_pct": 0,
+           "price_drop_days": 5, "weinstein_stage2_only": False, "max_stocks": 50},
+}
+
+
+def _screener_launch_inputs(args):
+    """``(base_settings, scr_opt, cap_band)`` of the screener launch request. Without ``--screen-preset`` exactly
+    what the launch always used (the base JSON, the searched gene set, the cap band). With it: the preset's fixed
+    keys, NO genes, no cap band. Refuses (exit) the preset together with a searched cap band or a base JSON (they would
+    state the same keys twice), without ``--screener``, and a preset the live simulation could not serve."""
+    preset = getattr(args, "screen_preset", None)
+    if not preset:
+        return (json.load(open(args.screener_base_json)) if args.screener_base_json else {},
+                _SCREENER_OPT, getattr(args, "screener_cap_band", None))
+    if preset not in _SCREEN_PRESETS:
+        sys.exit(f"optimize: unknown --screen-preset {preset!r}; have {sorted(_SCREEN_PRESETS)}")
+    if not getattr(args, "screener", False):
+        sys.exit("optimize: --screen-preset needs --screener (it pins the screener's keys)")
+    if getattr(args, "screener_cap_band", None):
+        sys.exit(f"optimize: --screen-preset {preset} and --screener-cap-band {args.screener_cap_band} are mutually "
+                 f"exclusive (a fixed screen has no cap-band gene range; choose one)")
+    if getattr(args, "screener_base_json", None):
+        sys.exit("optimize: --screen-preset and --screener-base-json are mutually exclusive (the preset states "
+                 "every key itself)")
+    from ba2_providers.screener import live_sim as _ls
+    try:
+        _ls.check_settings(dict(_SCREEN_PRESETS[preset]), _ls.POST_FIX)
+    except _ls.SimulationRefusal as _e:
+        sys.exit(f"optimize: --screen-preset {preset} cannot be simulated: {_e}")
+    return dict(_SCREEN_PRESETS[preset]), {}, None
+
 
 def _strategy_from_parts(name: str, buy_tree=None, exit_conditions=None, entry_actions=None):
     """Build a Strategy row on the UNIFIED RULE MODEL (migration 028) from the launcher's
@@ -7310,6 +7350,8 @@ def _cmd_optimize(args) -> int:
     _resolve_search_market_profile(getattr(args, "search_market_profile", False), "optimize")
     _resolve_search_ds_factor_weights(getattr(args, "search_ds_factor_weights", False), "optimize", args.expert)
     _resolve_search_exploration_ranges(getattr(args, "search_exploration_ranges", False), "optimize", args.expert)
+    if getattr(args, "screen_preset", None):
+        _screener_launch_inputs(args)       # refuse a bad preset combination up front (before any DB work)
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -7549,13 +7591,14 @@ def _cmd_optimize(args) -> int:
             # expert FactorRanker keeps the weekly store gate), the superset static universe, the hermetic cache
             # check.  Every refusal is a ScreenerLaunchRefused whose CLI text is the historical one.
             from app.services.backtest import screener_launch as _sl
+            _sbase, _sopt, _scap = _screener_launch_inputs(args)
             _sreq = _sl.ScreenerLaunchRequest(
                 store=args.screener_store, start=args.start, end=args.end, interval=args.interval,
-                base_settings=(json.load(open(args.screener_base_json)) if args.screener_base_json else {}),
-                scr_opt=_SCREENER_OPT, cadence_days=int(args.screener_cadence_days),   # default 7 = weekly
+                base_settings=_sbase,
+                scr_opt=_sopt, cadence_days=int(args.screener_cadence_days),   # default 7 = weekly
                 history_source=history_source,
                 bypass=bool(spec.get("bypass")), surface=_sl.CLI,
-                cap_band=getattr(args, "screener_cap_band", None),
+                cap_band=_scap,
                 panel=(os.path.abspath(args.screener_panel) if getattr(args, "screener_panel", None) else None),
                 exclude_uncached=bool(getattr(args, "screener_exclude_uncached", False)))
             try:
@@ -7580,6 +7623,8 @@ def _cmd_optimize(args) -> int:
             except _sl.ScreenerLaunchRefused as _e:
                 sys.exit(_e.text)
             backtest_block["screener_opt"] = _launch.screener_opt
+            if getattr(args, "screen_preset", None):
+                backtest_block["screener_opt"]["screen_preset"] = args.screen_preset     # provenance on the run
             backtest_block["enabled_instruments"] = _launch.enabled_instruments
             backtest_block["screener_universe_rule"] = _launch.universe_rule
             _uncached_exclusions = list(_launch.uncached_exclusions)
@@ -9391,6 +9436,13 @@ def main(argv: "list | None" = None) -> int:
                          "/ large >=$10B): overrides the market-cap gene range + pins market_cap_max so "
                          "each band optimizes a smaller, disjoint universe (keeps 5min feasible). Other "
                          "genes unchanged. Run one job per band.")
+    op.add_argument("--screen-preset", choices=sorted(_SCREEN_PRESETS), default=None,
+                    help="--screener with a FIXED screen instead of the searched genes: pins every selection key of "
+                         "the named preset ('xl' = liquid large caps, cap >= $10B, price >= $10, volume >= 500k, 50 "
+                         "names; goal2027 design 2.8) in the run's screener base settings, with no screener genes. "
+                         "Recorded on the run (screener_opt.screen_preset), carried into the deploy export so live "
+                         "gets the same keys. Mutually exclusive with --screener-cap-band and --screener-base-json; "
+                         "needs --screener. Name the job with the preset ('xl').")
     op.add_argument("--screener-panel", default=None,
                     help="Directory of the DAILY screener-criteria panel (default <cache>/screener/daily_panel). "
                          "Classic --screener jobs are gated by it (criteria live-daily-v2); build it with "

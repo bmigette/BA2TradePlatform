@@ -226,6 +226,17 @@ def exploration_range_tokens(args, expert, strat) -> list:
     return []
 
 
+def band_screener_tokens(band) -> list:
+    """The launcher tokens that state a band's screen: ``--screener-cap-band <band>`` for the searched cap bands (the
+    historical argv, unchanged), ``--screen-preset <band>`` for a fixed-screen band (goal2027 ``xl``). The two are
+    mutually exclusive in the launcher, so a preset band never also gets a cap band."""
+    return ["--screen-preset", band] if band in SCREEN_PRESET_BANDS else ["--screener-cap-band", band]
+
+
+#: Strategies only one expert can run (the launcher refuses them elsewhere): dropped for every other expert.
+EXPERT_ONLY_STRATEGIES = {"SQM": "DeterministicScorer"}
+
+
 def exclude_symbols_passthrough(args) -> list:
     """Extra `optimize` CLI tokens for --exclude-symbols ([] when not given, so an ordinary
     invocation of this driver is untouched). Kept separate from
@@ -338,6 +349,8 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
             if not _eligible(band, "FMPRating"):
                 continue
             for s in _strategies_for("FMPRating"):
+                if EXPERT_ONLY_STRATEGIES.get(s, "FMPRating") != "FMPRating":
+                    continue
                 # ``_window_tag`` marks a data-floored expert in its own NAME, so a 2022-start
                 # FMPRating row can never be read as, or resumed as, a full-window "goal2020" run.
                 yield (f"scr-{band}-FMPRating-{s}{name_suffix}{_window_tag('FMPRating')}",
@@ -350,6 +363,8 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
             for s in _strategies_for(expert):
                 if s in _TARGET_PRICE_STRATEGIES and expert not in _TARGET_PRICE_EXPERTS:
                     continue  # S4 needs a real analyst target; these experts have none
+                if EXPERT_ONLY_STRATEGIES.get(s, expert) != expert:
+                    continue  # e.g. SQM is DeterministicScorer's recipe only
                 yield (f"scr-{band}-{expert}-{s}{name_suffix}", expert, s, band)
         if _RANKER not in skip_experts:
             yield (f"scr-{band}-{_RANKER}{name_suffix}", _RANKER, None, band)  # bypass: one job per band
@@ -371,7 +386,11 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
 # A genome must therefore survive the worst decile of REAL quoted spreads. Was {10, 25, 50} (a
 # round guess), and briefly {7, 22, 45} -- which was the p90 read as if it were absolute and so
 # actually stressed to median+p90.
-_STRESS_BAND_DEFAULTS = {"large": 4.0, "mid": 13.0, "small": 28.0}
+#: ``xl`` (fixed screen, cap >= $10B) takes the large-cap widening: same cap range as ``large``.
+_STRESS_BAND_DEFAULTS = {"large": 4.0, "mid": 13.0, "small": 28.0, "xl": 4.0}
+
+#: Bands that are a FIXED screen preset (``--screen-preset``), not a searched cap band (``--screener-cap-band``).
+SCREEN_PRESET_BANDS = frozenset({"xl"})
 
 
 def _parse_stress_spread(spec: str) -> dict:
@@ -916,7 +935,7 @@ def main() -> int:
             population = budget.get("population", population)
             generations = budget.get("generations", generations)
         cmd = [exe, "optimize", "--expert", expert, "--universe", _PLACEHOLDER_UNIVERSE,
-               "--screener", "--screener-store", args.store, "--screener-cap-band", band,
+               "--screener", "--screener-store", args.store, *band_screener_tokens(band),
                # Per-expert floor, not the raw --start: see _EXPERT_MIN_START. An expert whose
                # signal data does not reach --start would otherwise burn the early years as dead
                # window and bucket empty calendar years into the consistency fitness.
@@ -1051,9 +1070,12 @@ def main() -> int:
                 raise SystemExit(f"--walk-forward {job_name}: {e}")
             continue
         if args.dry_run:
+            if band in SCREEN_PRESET_BANDS:
+                _uni_note = f"fixed screen preset {band} (see the launcher's --print-universe for the size)"
+            else:
+                _uni_note = screener_dry_run_universe_note(args.store, band, job_start, args.end, args.interval)
             print(f"  {'DONE' if job_name in done else 'TODO'}  {job_name}  "
-                  f"({expert} {strat or '(bypass)'} / {band})  "
-                  f"[{screener_dry_run_universe_note(args.store, band, job_start, args.end, args.interval)}]")
+                  f"({expert} {strat or '(bypass)'} / {band})  [{_uni_note}]")
             continue
         if job_name in _completed_names():   # re-read each loop (resumable)
             _fixed_note = ("; NOTE --decision-times fixed keeps the legacy job name, so this is the "
