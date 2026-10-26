@@ -772,3 +772,16 @@ class TestTsaiNoHiddenBatchTransform:
         # a batch transform estimated on one training batch is not saved and not applied by
         # assess_model / predict / the reload path, so it silently changed what the net saw
         assert not seen['batch_tfms']
+
+
+# ---------------------------------------------------------------------------------------
+# #17 news_count counted the whole calendar day
+# ---------------------------------------------------------------------------------------
+class TestNewsCountNoLookahead:
+    def test_intraday_row_does_not_count_later_headlines(self):
+        from app.services.sentiment import SentimentService
+        rows = pd.DataFrame({'Date': pd.to_datetime(['2024-03-04 10:00', '2024-03-04 16:00']), 'Close': [1.0, 1.0]})
+        news = [{'date': '2024-03-04 09:00', 'sentiment': 'positive', 'sentiment_score': 0.9},
+                {'date': '2024-03-04 15:00', 'sentiment': 'negative', 'sentiment_score': 0.8}]
+        out = SentimentService(use_cache=False).create_sentiment_features(rows, news)
+        assert out['news_count'].tolist() == [1, 2]
