@@ -339,7 +339,8 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
     def _eligible(band, expert):
         if expert in skip_experts:
             return False
-        if expert in _NO_LARGE_CAP and band == "large" and not include_no_data:
+        # ``xl`` (a fixed screen of cap >= $10B) is a large-cap universe too: the same experts have no data there.
+        if expert in _NO_LARGE_CAP and (band == "large" or band in SCREEN_PRESET_BANDS) and not include_no_data:
             return False
         return True
 

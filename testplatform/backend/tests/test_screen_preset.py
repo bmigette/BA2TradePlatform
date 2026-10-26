@@ -193,6 +193,16 @@ class TestDriver:
             by_strategy.setdefault(strat, set()).add(expert)
         assert by_strategy["SQM"] == {"DeterministicScorer"}
         assert "DeterministicScorer" in by_strategy["S1"] and len(by_strategy["S1"]) > 1
+        # xl is a $10B+ universe: the experts with no large-cap data are not launched there (like "large")
+        assert not ({"FMPEarningsDrift", "FMPInsiderClusterBuy"} & by_strategy["S1"])
+
+    def test_no_data_experts_follow_include_no_data_on_xl_exactly_as_on_large(self, driver):
+        def experts(band, include):
+            return {e for _n, e, _s, _b in driver._jobs([band], ["S1"], include)}
+        assert experts("xl", False) == experts("large", False)
+        assert experts("xl", True) == experts("large", True)
+        assert {"FMPEarningsDrift", "FMPInsiderClusterBuy"} <= experts("xl", True)
+        assert {"FMPEarningsDrift", "FMPInsiderClusterBuy"} <= experts("mid", False)
 
     def test_the_ds_sqm_xl_cell_is_one_job_with_the_preset_flag(self):
         import subprocess
