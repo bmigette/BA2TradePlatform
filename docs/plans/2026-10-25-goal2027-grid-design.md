@@ -277,7 +277,9 @@ What `--search-exploration-ranges` (name token `explr`) does, and nothing else:
   FMPEarningsDrift S2 to the lattices in the table (each template default sits on the new lattice; a test pins it);
 - gives FMPEarningsDrift S5 a toggleable time exit placed with the closes, before the always-matching floor stop (first
   match wins, so the floor stop stays last). "Off" is the toggle, the unlimited-hold control;
-- is defined only for the expert/strategy pairs above (the launcher refuses any other pair, and the capband driver
+- is accepted only for the pairs where it changes something (FMPRating S2, EarningsDrift S2/S5, InsiderClusterBuy S1,
+  DS S1/S2/SQM; a test pins the table to the pairs whose gene space differs). The launcher refuses every other pair, even the
+  already-covered cells, and the capband driver
   forwards it only to those); requires `explr` in `--name-suffix`; folds into the job-name digest; without it every
   gene space and run name is unchanged.
 

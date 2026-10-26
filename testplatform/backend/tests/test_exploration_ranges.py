@@ -217,6 +217,25 @@ class TestS5TimeExitRule:
         assert found == [("days_opened", 120.0)]
 
 
+class TestThePairTableIsExactlyTheChangedPairs:
+    """The docstring promise: the flag is accepted for a pair iff it changes that pair's gene space."""
+    EXPERTS = ("FMPRating", "FMPEarningsDrift", "FMPInsiderClusterBuy", "DeterministicScorer")
+    KINDS = ("S1", "S2", "S3", "S5", "S6", "SQM")
+
+    def test_accepted_pairs_are_exactly_those_whose_space_differs(self):
+        changed = set()
+        for expert in self.EXPERTS:
+            for kind in self.KINDS:
+                if kind == "SQM" and expert != "DeterministicScorer":
+                    continue
+                on = _space(kind, expert, True)
+                off = _space(kind, expert, False)
+                if on != off:
+                    changed.add((expert, kind))
+        table = {(e, k) for e, ks in _M._EXPLORATION_RANGE_PAIRS.items() for k in ks}
+        assert changed == table, (sorted(changed ^ table))
+
+
 class TestLauncherFlag:
     def test_resolver_sets_and_resets_the_global(self):
         assert _M._resolve_search_exploration_ranges(True, "optimize", "FMPRating") is True
@@ -231,9 +250,12 @@ class TestLauncherFlag:
 
     def test_refused_for_a_strategy_it_would_not_change(self):
         _M._resolve_search_exploration_ranges(True, "optimize", "FMPRating")
-        _M._refuse_exploration_ranges_unsupported("optimize", "FMPRating", "S1")        # listed: fine
-        for expert, kind in (("FMPRating", "S6"), ("FMPRating", "S3"), ("DeterministicScorer", "S3"),
-                             ("FMPInsiderClusterBuy", "S2"), ("FMPRating", "O_LC")):
+        _M._refuse_exploration_ranges_unsupported("optimize", "FMPRating", "S2")        # listed: fine
+        # the audited cells that were already covered are no-ops too: refused, as are unaudited ones
+        for expert, kind in (("FMPRating", "S1"), ("FMPEarningsDrift", "S1"), ("FMPEarningsDrift", "S3"),
+                             ("DeterministicScorer", "S6"), ("FMPRating", "S6"), ("FMPRating", "S3"),
+                             ("DeterministicScorer", "S3"), ("FMPInsiderClusterBuy", "S2"),
+                             ("FMPRating", "O_LC")):
             with pytest.raises(SystemExit) as e:
                 _M._refuse_exploration_ranges_unsupported("optimize", expert, kind)
             assert "would not change" in str(e.value)
@@ -265,7 +287,10 @@ class TestDriver:
     def test_forwarded_only_where_it_changes_something(self, driver):
         on = SimpleNamespace(search_exploration_ranges=True)
         off = SimpleNamespace(search_exploration_ranges=False)
-        assert driver.exploration_range_tokens(on, "FMPRating", "S1") == ["--search-exploration-ranges"]
+        assert driver.exploration_range_tokens(on, "FMPRating", "S2") == ["--search-exploration-ranges"]
+        assert driver.exploration_range_tokens(on, "FMPEarningsDrift", "S5") == ["--search-exploration-ranges"]
+        assert driver.exploration_range_tokens(on, "FMPRating", "S1") == []
+        assert driver.exploration_range_tokens(on, "DeterministicScorer", "S6") == []
         assert driver.exploration_range_tokens(on, "DeterministicScorer", "SQM") == ["--search-exploration-ranges"]
         assert driver.exploration_range_tokens(on, "FMPRating", "S6") == []
         assert driver.exploration_range_tokens(on, "FMPSenateTraderWeight", "S1") == []

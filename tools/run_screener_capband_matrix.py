@@ -210,10 +210,10 @@ def ds_factor_gene_tokens(args, expert) -> list:
 
 #: Must equal ``ba2test_launcher._EXPLORATION_RANGE_PAIRS`` (pinned by test): the drivers cannot import the launcher.
 EXPLORATION_RANGE_PAIRS = {
-    "FMPRating": {"S1", "S2"},
-    "FMPEarningsDrift": {"S1", "S2", "S3", "S5"},
+    "FMPRating": {"S2"},
+    "FMPEarningsDrift": {"S2", "S5"},
     "FMPInsiderClusterBuy": {"S1"},
-    "DeterministicScorer": {"S1", "S2", "S6", "SQM"},
+    "DeterministicScorer": {"S1", "S2", "SQM"},
 }
 
 

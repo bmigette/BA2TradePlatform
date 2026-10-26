@@ -5769,12 +5769,15 @@ _DS_FACTOR_EXPERT = "DeterministicScorer"
 #: be reachable) and, for FMPEarningsDrift S5, a toggleable time exit that strategy lacks. Everything else the
 #: families varied is already covered or lives under ``--search-ds-factor-weights``.
 _SEARCH_EXPLORATION_RANGES: bool = False
-#: expert -> the strategies the flag is defined for (a pair outside it is REFUSED: the flag would change nothing).
+#: expert -> the strategies on which the flag CHANGES something (every other pair is REFUSED: it would be a no-op with a
+#: changed identity). Exactly the ``_EXPLORATION_TIME_EXIT_RANGE`` pairs plus EarningsDrift S5 (the added time exit);
+#: the audited cells that were already covered (FMPRating S1, EarningsDrift S1/S3, DS S6) are not listed. A test pins
+#: that the table equals the set of pairs whose built gene space actually differs.
 _EXPLORATION_RANGE_PAIRS = {
-    "FMPRating": ("S1", "S2"),
-    "FMPEarningsDrift": ("S1", "S2", "S3", "S5"),
+    "FMPRating": ("S2",),
+    "FMPEarningsDrift": ("S2", "S5"),
     "FMPInsiderClusterBuy": ("S1",),
-    "DeterministicScorer": ("S1", "S2", "S6", "SQM"),
+    "DeterministicScorer": ("S1", "S2", "SQM"),
 }
 #: (expert, strategy) -> (min, max, step) of the ``days_opened`` time-exit threshold under the flag. The default
 #: value of the template must sit on the new lattice (pinned by test).
