@@ -117,6 +117,14 @@ def derive_export_payload(
              if isinstance(k, str) and k.startswith("model:")}
             if isinstance(sp, dict) else {}
         )
+        # goal2027 2.8: the backtest ran the CANONICAL DeterministicScorer factor genome (a section with no usable
+        # sub-weights is off, dead sub-genes absent); the deploy payload carries that phenotype, not the raw genes.
+        # Identity (the same dict) for every row without those genes.
+        from ba2_common.core.ds_factor_genes import neutralise_ds_factor_genes
+        _flat_model = {"model:" + k: v for k, v in model_overrides.items()}
+        _canon_model = neutralise_ds_factor_genes(_flat_model)
+        if _canon_model is not _flat_model:
+            model_overrides = {k[len("model:"):]: v for k, v in _canon_model.items()}
         # Fixed (non-GA-tunable) settings _persist_top_backtests stashed directly onto this
         # Backtest's strategy_params at persist time (e.g. sizing_mode=risk_atr) -- the durable
         # floor layer that survives even if the source StrategyOptimization row is later pruned

@@ -1273,25 +1273,6 @@ def _refuse_row_missing_searched_genes(backtest: Backtest, db: Any, genes: tuple
                     f"{', '.join(missing)}; exporting would deploy the expert default the GA never chose. Refusing."))
 
 
-def _canonical_ds_factor_settings(backtest: Backtest, payload: dict) -> None:
-    """goal2027 2.8: the backtest ran the CANONICAL DS factor genome (``decode_params`` switches a section with no
-    usable sub-weights off), so the deploy payload must carry the same phenotype, not the raw genes: a row whose
-    technical sub-weights are all 0 would otherwise deploy ``w_technical`` > 0 on a section that scores a silent 0.
-    Only values the canonicalisation CHANGES are rewritten; rows without factor genes are untouched."""
-    sp = backtest.strategy_params
-    if not isinstance(sp, dict):
-        return
-    from app.services.strategy_param_space import neutralise_ds_factor_genes
-    flat = {k: v for k, v in sp.items() if isinstance(k, str) and k.startswith("model:")}
-    canon = neutralise_ds_factor_genes(flat)
-    if canon is flat:
-        return
-    ep = payload["settings"]["expert_params"]
-    for k, v in canon.items():
-        if flat.get(k) != v:
-            ep[k[len("model:"):]] = v
-
-
 def _refuse_split_time_row_without_genes(backtest: Backtest, db: Any) -> None:
     """No silent default for the decision times: a run that searched the SPLIT genes (its optimization's
     parameter_ranges carry ``schedule:entry_time`` / ``schedule:manage_time``, goal2027 item 2.4) but whose
@@ -1356,7 +1337,6 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
     payload = _derive_export_payload_shared(backtest, kind, db)
     if kind == "expert_settings":
         _serve_only_selected_market_profiles(backtest, payload)
-        _canonical_ds_factor_settings(backtest, payload)
     return payload
 
 

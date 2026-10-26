@@ -367,3 +367,37 @@ class TestConfidenceCeiling:
             return collect_param_space(strat)["cond:gate_confidence:value"]["max"]
         assert top_gate(False) == 50.0
         assert top_gate(True) > 50.0                  # S2's own range (40..80) is no longer cut at 50
+
+
+# ----------------------------------------------------------------------------- the export is fully canonical
+class TestExportDropsDeadGenes:
+    DEAD = ("tw_mom", "tw_d200", "tw_rsi", "tw_don", "mom_lookback_days")
+
+    def test_zero_sum_technical_row_exports_without_the_dead_sub_genes(self):
+        raw = {**_RECIPE, "model:tw_mom": 0.0, "model:tw_d200": 0.0}
+        ep = TestExport._export({**raw, "expertFixedSettings": {}})
+        assert ep["w_technical"] == 0.0
+        for k in self.DEAD:
+            assert k not in ep, k
+        assert ep["fw_quality"] == 0.6                        # the live section keeps its genes
+
+    def test_dead_analyst_legs_are_dropped_too(self):
+        raw = {**_RECIPE, "model:w_analyst": 0.0, "model:aw_targets": 0.7, "model:aw_grades": 0.2,
+               "model:analyst_target_window_days": 60, "model:analyst_min_targets": 5}
+        ep = TestExport._export({**raw, "expertFixedSettings": {}})
+        for k in ("aw_targets", "aw_grades", "analyst_target_window_days", "analyst_min_targets"):
+            assert k not in ep, k
+
+    def test_the_shared_exporter_alone_produces_the_same_payload(self):
+        # the public site calls ba2_common's derive_export_payload without any test-app code
+        from datetime import datetime
+        from types import SimpleNamespace
+        from ba2_common.export.backtest_export import derive_export_payload
+        raw = {**_RECIPE, "model:tw_mom": 0.0, "model:tw_d200": 0.0, "expertFixedSettings": {}}
+        bt = SimpleNamespace(id=1, name="x", expert_name="DeterministicScorer", engine_type="daily_expert",
+                             strategy_params=raw, start_date=datetime(2024, 1, 1), end_date=datetime(2024, 6, 1),
+                             initial_capital=10_000.0, optimization_id=None)
+        shared = derive_export_payload(bt, "expert_settings", opt_backtest_block=None, bypass_check=lambda _n: False,
+                                       reconstruct_legacy_ruleset=None)["settings"]["expert_params"]
+        assert shared == TestExport._export(raw)
+        assert "tw_mom" not in shared and shared["w_technical"] == 0.0
