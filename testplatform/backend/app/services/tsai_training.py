@@ -562,12 +562,16 @@ class TSAITrainingService(ITrainingService):
             if effective_bs < batch_size:
                 logger.info(f"Reduced batch size from {batch_size} to {effective_bs} for small dataset")
 
-            # Create dataloaders with explicit device
+            # Create dataloaders with explicit device. NO batch transform: the inputs are already
+            # scaled by DataPreparationService (fitted on the training rows and saved with the
+            # model). TSStandardize used to be added here, estimating a mean/std from ONE training
+            # batch that is neither saved nor applied by assess_model / predict / the reload and
+            # backtest paths (they call the bare network), so the GA scored, and the backtest
+            # ran, a network on inputs it was never trained on.
             dls = get_ts_dls(
                 X_all, y_all,
                 splits=splits,
                 bs=effective_bs,
-                batch_tfms=[TSStandardize()],
                 device=device,  # Set device for dataloaders
             )
 

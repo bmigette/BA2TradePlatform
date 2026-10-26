@@ -675,3 +675,100 @@ class TestMlBacktest:
         with pytest.raises(ValueError, match="no recorded training end date"):
             ensure_out_of_sample(self._model(None), self._pred_df('2024-01-01'), 5, {})
         ensure_out_of_sample(self._model(None), self._pred_df('2024-01-01'), 5, {'allow_in_sample': True})
+
+
+# ---------------------------------------------------------------------------------------
+# #14 / #15  truncated tail windows written as 0 / timeout; two triple-barrier implementations
+# ---------------------------------------------------------------------------------------
+class TestBarrierTargets:
+    @staticmethod
+    def _flat(n=20, price=100.0):
+        return pd.DataFrame({'Date': pd.date_range('2024-01-01', periods=n, freq='D'),
+                             'Open': price, 'High': price + 0.1, 'Low': price - 0.1, 'Close': price,
+                             'Volume': 1.0})
+
+    def test_price_based_truncated_window_is_nan_not_zero(self):
+        from app.services.darts_models import PredictionTargetService
+        df = self._flat(20)
+        s = PredictionTargetService()._calculate_single_target(df, 5.0, 2.0, 5, 'up')
+        # flat prices: no barrier is ever hit. Rows with a full 5-bar window are real negatives (0);
+        # the last 5 rows cannot be judged and must be NaN
+        assert (s.iloc[:15] == 0).all()
+        assert s.iloc[15:].isna().all()
+
+    def test_price_based_hit_inside_a_truncated_window_is_still_a_label(self):
+        from app.services.darts_models import PredictionTargetService
+        df = self._flat(20)
+        df.loc[18, 'High'] = 110.0          # profit touched 1 bar after row 17 (window truncated)
+        s = PredictionTargetService()._calculate_single_target(df, 5.0, 2.0, 5, 'up')
+        assert s.iloc[17] == 1.0 and s.iloc[16] == 1.0
+
+    def test_triple_barrier_classes_and_truncated_tail(self):
+        from app.services.darts_models import PredictionTargetService
+        df = self._flat(20)
+        df.loc[6, 'High'] = 110.0           # profit barrier (row 5 sees it 1 bar ahead)
+        df.loc[12, 'Low'] = 90.0            # stop barrier (row 11 sees it 1 bar ahead)
+        s = PredictionTargetService().calculate_triple_barrier(df, 5.0, 5.0, 3)
+        assert s.iloc[5] == 2               # profit
+        assert s.iloc[11] == 0              # stop
+        assert s.iloc[0] == 1               # full window, nothing hit: timeout
+        assert s.iloc[17:].isna().all()     # window of 3 runs past the data (and nothing hit): unknown
+        assert s.iloc[16] == 1              # last row with a complete window
+
+    def test_training_job_uses_the_shared_triple_barrier(self):
+        from app.services.job_handler import build_prediction_targets
+        from app.services.darts_models import PredictionTargetService
+        df = self._flat(30)
+        df.loc[10, 'High'] = 111.0          # a High-only touch: the old Close-only loop never saw it
+        frame, col, cols, horizons = build_prediction_targets(
+            df.copy(), [{'type': 'triple_barrier', 'profitPct': 5.0, 'stopPct': 5.0, 'maxBars': 4}], 'daily'
+        )
+        expected = PredictionTargetService().calculate_triple_barrier(df, 5.0, 5.0, 4)
+        pd.testing.assert_series_equal(frame[col].reset_index(drop=True), expected.reset_index(drop=True),
+                                       check_names=False)
+        assert frame[col].iloc[9] == 2 and horizons[col] == 4
+
+
+# ---------------------------------------------------------------------------------------
+# #13 tsai trained on TSStandardize-d batches but scored / reloaded WITHOUT it
+# ---------------------------------------------------------------------------------------
+class TestTsaiNoHiddenBatchTransform:
+    def test_train_model_applies_no_batch_standardize(self, monkeypatch):
+        from types import SimpleNamespace
+        from app.services import tsai_training
+        from app.services.tsai_training import TSAITrainingService
+        import torch
+
+        seen = {}
+
+        class FakeLearner:
+            recorder = SimpleNamespace(values=[])
+
+            def __init__(self, dls, model, **kwargs):
+                self.model = model
+
+            def fit_one_cycle(self, *a, **k):
+                pass
+
+        def fake_dls(X, y, splits=None, bs=None, batch_tfms=None, device=None, **kwargs):
+            seen['batch_tfms'] = batch_tfms
+            return object()
+
+        class Standardize:                      # stand-in marker for tsai's TSStandardize
+            pass
+
+        for name, value in (('TSAI_AVAILABLE', True), ('get_ts_dls', fake_dls), ('Learner', FakeLearner),
+                            ('TSStandardize', Standardize), ('accuracy', object()), ('F1Score', lambda: 1),
+                            ('Precision', lambda: 1), ('Recall', lambda: 1), ('torch', torch)):
+            monkeypatch.setattr(tsai_training, name, value, raising=False)
+
+        svc = TSAITrainingService(normalize=True)
+        X = np.random.RandomState(0).rand(40, 3, 8).astype('float32')
+        y = (np.arange(40) % 2).astype('int64')
+        res = svc.train_model(torch.nn.Linear(1, 1), (X[:30], y[:30]), val_data=(X[30:], y[30:]),
+                              epochs=1, loss_fn=object())
+        assert res['status'] == 'success', res
+        # the scaling that is persisted with the model (DataPreparationService) is the ONLY scaling:
+        # a batch transform estimated on one training batch is not saved and not applied by
+        # assess_model / predict / the reload path, so it silently changed what the net saw
+        assert not seen['batch_tfms']

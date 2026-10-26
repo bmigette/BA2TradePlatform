@@ -1602,27 +1602,12 @@ def build_prediction_targets(
 
                     col_name = f"triple_barrier_{profit_pct}p_{stop_pct}s_{max_bars}b"
                     try:
-                        # Calculate triple barrier labels: 0=stop, 1=timeout, 2=profit
-                        labels = []
-                        close_prices = frame['Close'].values
-                        for i in range(len(close_prices)):
-                            if i + max_bars >= len(close_prices):
-                                labels.append(np.nan)
-                                continue
-                            entry_price = close_prices[i]
-                            profit_level = entry_price * (1 + profit_pct / 100)
-                            stop_level = entry_price * (1 - stop_pct / 100)
-                            label = 1  # Default: timeout
-                            for j in range(1, max_bars + 1):
-                                future_price = close_prices[i + j]
-                                if future_price >= profit_level:
-                                    label = 2  # Profit hit
-                                    break
-                                elif future_price <= stop_level:
-                                    label = 0  # Stop hit
-                                    break
-                            labels.append(label)
-                        frame[col_name] = labels
+                        # Triple barrier labels: 0=stop, 1=timeout, 2=profit. One implementation
+                        # (PredictionTargetService, High/Low barrier touches, NaN for a truncated
+                        # tail window) shared with dataset generation.
+                        frame[col_name] = target_service.calculate_triple_barrier(
+                            frame, profit_pct, stop_pct, max_bars
+                        ).values
                         all_target_columns.append(col_name)
                         target_label_horizons[col_name] = max_bars
                         if target_column is None:

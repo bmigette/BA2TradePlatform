@@ -784,7 +784,9 @@ class PredictionTargetService:
             direction: 'up' (buy order) or 'down' (sell order)
 
         Returns:
-            Series with 1 where target is met, 0 otherwise
+            Series with 1 where target is met, 0 where the drawdown limit was hit first or the full
+            ``days`` window passed without a hit, and NaN where the window runs past the end of the
+            data without a decision (unobservable: not a negative).
         """
         n = len(df)
         targets = np.zeros(n)
@@ -794,7 +796,7 @@ class PredictionTargetService:
         low_prices = df['Low'].values
 
         # Calculate price thresholds
-        for i in range(n - 1):  # Need at least 1 future bar
+        for i in range(n):
             entry_price = close_prices[i]
 
             # Calculate target and stop prices
@@ -809,6 +811,7 @@ class PredictionTargetService:
 
             # Check each subsequent bar up to 'days' bars ahead
             max_bars = min(days, n - i - 1)
+            decided = False
             for j in range(1, max_bars + 1):
                 bar_idx = i + j
                 bar_high = high_prices[bar_idx]
@@ -820,21 +823,30 @@ class PredictionTargetService:
                     # Within same bar, assume stop checked before profit (conservative)
                     if bar_low <= stop_price:
                         # Stopped out - drawdown exceeded before profit
+                        decided = True
                         break
                     if bar_high >= profit_target:
                         # Profit target hit without exceeding drawdown
                         targets[i] = 1
+                        decided = True
                         break
                 else:
                     # For SELL: check if stopped out first (high breaches stop)
                     # then check if profit target hit (low reaches target)
                     if bar_high >= stop_price:
                         # Stopped out - drawup exceeded before profit
+                        decided = True
                         break
                     if bar_low <= profit_target:
                         # Profit target hit without exceeding drawup
                         targets[i] = 1
+                        decided = True
                         break
+
+            # No barrier hit: a negative only if the whole window was observed. A truncated window
+            # (the last `days` bars of the data) used to be written as 0, i.e. a fabricated negative.
+            if not decided and i + days > n - 1:
+                targets[i] = np.nan
 
         return pd.Series(targets, index=df.index)
 
@@ -943,7 +955,10 @@ class PredictionTargetService:
         """
         Calculate Triple-Barrier target (Marcos Lopez de Prado method).
 
-        Multi-class: 0=stop hit, 1=profit hit, 2=timeout
+        Multi-class: 0=stop hit, 1=timeout, 2=profit hit (ordered by outcome). This is the ONE
+        triple-barrier implementation: the training job (job_handler) used to carry its own
+        Close-only loop with a different class order (and this one a different one again), so
+        the same target config produced different labels depending on the entry point.
 
         Args:
             df: DataFrame with 'Close', 'High', 'Low' columns
@@ -952,7 +967,8 @@ class PredictionTargetService:
             max_bars: Vertical barrier (max bars before timeout)
 
         Returns:
-            Series with 0 (stop), 1 (profit), or 2 (timeout)
+            Series with 0 (stop), 1 (timeout), 2 (profit); NaN where the window runs past the end of
+            the data before any barrier is hit (a timeout cannot be claimed for a truncated window).
         """
         n = len(df)
         targets = np.full(n, np.nan)
@@ -967,7 +983,7 @@ class PredictionTargetService:
             stop_price = entry_price * (1 - stop_pct / 100)
 
             max_look = min(max_bars, n - i - 1)
-            result = 2  # Default: timeout
+            result = None
 
             for j in range(1, max_look + 1):
                 bar_idx = i + j
@@ -979,9 +995,12 @@ class PredictionTargetService:
                     result = 0  # Stop hit
                     break
                 if bar_high >= profit_target:
-                    result = 1  # Profit hit
+                    result = 2  # Profit hit
                     break
 
+            if result is None:
+                # Timeout only if the whole vertical window was observed
+                result = 1 if i + max_bars <= n - 1 else np.nan
             targets[i] = result
 
         col_name = f"barrier_{profit_pct}p_{stop_pct}s_{max_bars}b"
