@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 import json
 
-from app.services.data_preparation import purged_train_row_count
+from app.services.data_preparation import purged_train_row_count, three_way_bounds
 from app.services.model_interface import ITrainingService
 
 logger = logging.getLogger(__name__)
@@ -65,6 +65,9 @@ class DartsTrainingService(ITrainingService):
         self.models_dir.mkdir(parents=True, exist_ok=True)
         self.scaler = None
         self.cov_scaler = None
+        # One target scaler per series after a multi-series prepare (index-aligned with the series
+        # lists); evaluation inverse-transforms each series with its own scaler.
+        self.scalers: List[Any] = []
 
     def prepare_data(
         self,
@@ -291,6 +294,52 @@ class DartsTrainingService(ITrainingService):
             test_cov_list.append(test_c)
         return train_series_list, test_series_list, train_cov_list, test_cov_list
 
+    def prepare_split_three_way(
+        self, dataframes: List[pd.DataFrame], train_ratio: float, holdout_share_of_test: float,
+        target_column: str, feature_columns: List[str], timeframe: str = 'daily',
+        label_horizon: int = 0
+    ) -> Dict[str, Any]:
+        """Chronological train / validation / holdout TimeSeries, one series per instrument.
+
+        Each frame (one per ticker) is scaled with scalers fitted on its own training fraction
+        and cut with ``three_way_bounds`` (both boundaries purged by ``label_horizon``). With a
+        single frame the values are TimeSeries; with several they are lists index-aligned with
+        ``self.scalers``. Validation is the GA fitness / early-stopping set, the holdout is only
+        scored and reported.
+        """
+        keys = ('train', 'val', 'holdout')
+        series = {k: [] for k in keys}
+        covs = {k: [] for k in keys}
+        scalers = []
+        for df in dataframes:
+            full_series, full_cov = self.prepare_data(
+                df, target_column, feature_columns, timeframe, scaler_fit_ratio=train_ratio
+            )
+            scalers.append(self.scaler)
+            b = three_way_bounds(len(full_series), train_ratio, holdout_share_of_test, label_horizon)
+            cuts = {
+                'train': slice(0, b['train_end']),
+                'val': slice(b['val_start'], b['val_end']),
+                'holdout': slice(b['holdout_start'], len(full_series)),
+            }
+            for k, cut in cuts.items():
+                series[k].append(full_series[cut])
+                covs[k].append(full_cov[cut] if full_cov is not None else None)
+        self.scalers = scalers
+        self.scaler = scalers[-1]
+        logger.info(
+            "Three-way split: " + ", ".join(
+                f"{k}={sum(len(s) for s in series[k])}" for k in keys
+            ) + f" points over {len(dataframes)} series"
+        )
+        unwrap = (lambda lst: lst[0]) if len(dataframes) == 1 else (lambda lst: lst)
+        return {
+            'train_series': unwrap(series['train']), 'val_series': unwrap(series['val']),
+            'holdout_series': unwrap(series['holdout']),
+            'train_covariates': unwrap(covs['train']), 'val_covariates': unwrap(covs['val']),
+            'holdout_covariates': unwrap(covs['holdout']),
+        }
+
     def _infer_frequency(self, timeframe: str, df: pd.DataFrame) -> str:
         """
         Infer pandas frequency string from timeframe.
@@ -470,25 +519,30 @@ class DartsTrainingService(ITrainingService):
         covariates: Any = None,
         optimize_metric: str = 'mape',
         threshold: float = 0.5,
-        loss_function: Optional[str] = None
+        loss_function: Optional[str] = None,
+        scalers: Optional[List[Any]] = None
     ) -> Dict[str, float]:
         """
-        Evaluate model on test set.
+        Evaluate a trained model on a held-out series (or one series per instrument).
 
-        For classification metrics, uses historical_forecasts to make rolling predictions
-        across the test set, ensuring enough samples for meaningful metrics.
-
-        For regression metrics, uses single prediction for efficiency.
+        Every point of the series is scored with a rolling one-step-ahead forecast
+        (``historical_forecasts``, stride 1) so a metric is computed over the whole block and not
+        over the first handful of points. There is no fallback: a block too short for the model, or
+        a failed forecast, is an error, never a different (and invalid) kind of evaluation.
 
         Args:
             model: Trained Darts model
-            test_series: Test TimeSeries
-            covariates: Optional covariate TimeSeries
+            test_series: TimeSeries, or a list of TimeSeries (multi-instrument; the predictions
+                of all series are pooled into one metric)
+            covariates: Optional covariate TimeSeries (or list, index-aligned with the series)
             optimize_metric: Metric to optimize ('f1_score', 'accuracy', 'mape', etc.)
             threshold: Classification threshold for binary metrics (default 0.5)
             loss_function: The loss the model was trained with. Required for classification
                 metrics: it decides whether the raw output is a logit (sigmoid applied) or
                 already a probability-like score (mse; no sigmoid).
+            scalers: The target scalers of the series being scored (one per series). Defaults
+                to the service's own, which is only right when the service has not prepared
+                another set of series since.
 
         Returns:
             Evaluation metrics
@@ -498,19 +552,37 @@ class DartsTrainingService(ITrainingService):
 
         try:
             is_classification = optimize_metric in self.CLASSIFICATION_METRICS
+            if is_classification:
+                output_is_logit = self._output_is_logit(loss_function)
+
+            multi = isinstance(test_series, list)
+            series_list = test_series if multi else [test_series]
+            cov_list = covariates if isinstance(covariates, list) else [covariates] * len(series_list)
+            if len(cov_list) != len(series_list):
+                raise ValueError(f"{len(cov_list)} covariate series for {len(series_list)} test series")
+            if scalers is None:
+                scalers = self.scalers if multi else [self.scaler]
+            if len(scalers) != len(series_list):
+                raise ValueError(
+                    f"{len(series_list)} test series but {len(scalers)} fitted scalers; "
+                    f"prepare the series with prepare_split_three_way first"
+                )
+
+            preds, acts = [], []
+            for series, cov, scaler in zip(series_list, cov_list, scalers):
+                predictions, actuals = self._historical_pairs(model, series, cov)
+                if scaler is not None:
+                    predictions = scaler.inverse_transform(predictions)
+                    actuals = scaler.inverse_transform(actuals)
+                preds.append(predictions)
+                acts.append(actuals)
+            n_test_points = sum(len(s) for s in series_list)
 
             if is_classification:
-                # For classification, use historical_forecasts to get predictions
-                # across the entire test set for meaningful metrics
-                return self._evaluate_classification(
-                    model, test_series, covariates, optimize_metric, threshold,
-                    loss_function=loss_function
+                return self._classification_metrics(
+                    preds, acts, n_test_points, optimize_metric, threshold, output_is_logit
                 )
-            else:
-                # For regression, use simple prediction
-                return self._evaluate_regression(
-                    model, test_series, covariates, optimize_metric
-                )
+            return self._regression_metrics(preds, acts, n_test_points)
 
         except Exception as e:
             logger.error(f"Evaluation failed: {e}")
@@ -518,111 +590,70 @@ class DartsTrainingService(ITrainingService):
             traceback.print_exc()
             return {'error': str(e)}
 
-    def _evaluate_classification(
-        self,
-        model: Any,
-        test_series: Any,
-        covariates: Any = None,
-        optimize_metric: str = 'f1_score',
-        threshold: float = 0.5,
-        loss_function: Optional[str] = None
-    ) -> Dict[str, float]:
-        """
-        Evaluate classification model using historical_forecasts.
-
-        Uses stride=1 to evaluate ALL test samples, simulating real-time
-        predictions where at each time T we predict T+1 using history up to T.
-        """
-        from app.services.metrics import ClassificationMetrics
-
+    def _output_is_logit(self, loss_function: Optional[str]) -> bool:
         if loss_function in self.LOGIT_LOSSES:
-            output_is_logit = True
-        elif loss_function in self.PROBABILITY_LOSSES:
-            output_is_logit = False
-        else:
-            raise ValueError(
-                f"loss_function must be one of {self.LOGIT_LOSSES + self.PROBABILITY_LOSSES} to score "
-                f"a classification metric, got {loss_function!r}"
-            )
+            return True
+        if loss_function in self.PROBABILITY_LOSSES:
+            return False
+        raise ValueError(
+            f"loss_function must be one of {self.LOGIT_LOSSES + self.PROBABILITY_LOSSES} to score "
+            f"a classification metric, got {loss_function!r}"
+        )
 
+    def _historical_pairs(self, model: Any, series: Any, covariates: Any = None) -> Tuple[Any, Any]:
+        """Rolling one-step-ahead forecasts over a whole block, with the actuals they target.
+
+        Stride 1 evaluates EVERY point, simulating real-time predictions where at each time T
+        we predict T+1 using history up to T.
+        """
         input_chunk = model.input_chunk_length
         output_chunk = model.output_chunk_length
-
         min_required = input_chunk + output_chunk
-        if len(test_series) < min_required:
-            logger.warning(f"Test series too short ({len(test_series)} < {min_required})")
-            n_predict = min(output_chunk, len(test_series))
-            if n_predict <= 0:
-                return {'error': 'Test series too short'}
-            predictions = model.predict(n=n_predict)
-            actuals = test_series[:n_predict]
+        if len(series) < min_required:
+            raise ValueError(
+                f"Evaluation block too short ({len(series)} < {min_required} = input_chunk + output_chunk)"
+            )
+
+        hf_kwargs = {
+            'series': series,
+            'start': input_chunk,  # Start after enough history
+            'forecast_horizon': 1,  # Predict 1 step at a time
+            'stride': 1,
+            'retrain': False,
+            'verbose': False,
+            'show_warnings': False,
+            'last_points_only': True
+        }
+        # Add covariates if model was trained with them
+        model_uses_covariates = (
+            hasattr(model, 'past_covariate_series') and model.past_covariate_series is not None
+        )
+        if model_uses_covariates and covariates is not None:
+            hf_kwargs['past_covariates'] = covariates
+
+        forecasts = model.historical_forecasts(**hf_kwargs)
+        if isinstance(forecasts, list):
+            if len(forecasts) == 0:
+                raise ValueError('No forecasts generated')
+            predictions = concatenate(forecasts)
         else:
-            try:
-                # Use stride=1 to evaluate EVERY test sample
-                stride = 1
-                expected_predictions = len(test_series) - input_chunk
-
-                logger.debug(f"Historical forecasts: test_len={len(test_series)}, "
-                           f"input_chunk={input_chunk}, output_chunk={output_chunk}, "
-                           f"stride={stride}, expected_predictions={expected_predictions}")
-
-                # Build kwargs for historical_forecasts
-                hf_kwargs = {
-                    'series': test_series,
-                    'start': input_chunk,  # Start after enough history
-                    'forecast_horizon': 1,  # Predict 1 step at a time
-                    'stride': stride,
-                    'retrain': False,
-                    'verbose': False,
-                    'show_warnings': False,
-                    'last_points_only': True
-                }
-
-                # Add covariates if model was trained with them
-                model_uses_covariates = (
-                    hasattr(model, 'past_covariate_series') and
-                    model.past_covariate_series is not None
-                )
-                if model_uses_covariates and covariates is not None:
-                    hf_kwargs['past_covariates'] = covariates
-                    logger.debug("Using past_covariates for historical forecasts")
-
-                # Make historical forecasts
-                forecasts = model.historical_forecasts(**hf_kwargs)
-
-                # Combine all forecasts
-                if isinstance(forecasts, list):
-                    if len(forecasts) == 0:
-                        return {'error': 'No forecasts generated'}
-                    predictions = concatenate(forecasts)
-                else:
-                    predictions = forecasts
-
-                # Get actuals matching the prediction time indices
-                actuals = test_series.slice_intersect(predictions)
-
-                logger.debug(f"Historical forecasts: {len(predictions)} predictions, {len(actuals)} actuals")
-
-            except Exception as e:
-                logger.warning(f"Historical forecasts failed: {e}, falling back to simple prediction")
-                n_predict = min(output_chunk, len(test_series))
-                predictions = model.predict(n=n_predict)
-                actuals = test_series[:n_predict]
-
+            predictions = forecasts
+        # Actuals matching the prediction time indices
+        actuals = series.slice_intersect(predictions)
         if len(predictions) == 0 or len(actuals) == 0:
-            return {'error': 'No valid predictions could be made'}
+            raise ValueError('No valid predictions could be made')
+        logger.debug(f"Historical forecasts: {len(predictions)} predictions, {len(actuals)} actuals")
+        return predictions, actuals
 
-        # Inverse-transform to original scale
-        if self.scaler is not None:
-            predictions_orig = self.scaler.inverse_transform(predictions)
-            actuals_orig = self.scaler.inverse_transform(actuals)
-        else:
-            predictions_orig = predictions
-            actuals_orig = actuals
+    def _classification_metrics(
+        self, preds: List[Any], acts: List[Any], n_test_points: int,
+        optimize_metric: str, threshold: float, output_is_logit: bool
+    ) -> Dict[str, float]:
+        """Classification metrics over the pooled (already inverse-transformed) predictions."""
+        from app.services.metrics import ClassificationMetrics
 
-        # Get numpy arrays
-        pred_values = predictions_orig.values().flatten()
-        actual_values = actuals_orig.values().flatten()
+        pred_values = np.concatenate([p.values().flatten() for p in preds])
+        actual_values = np.concatenate([a.values().flatten() for a in acts])
 
         # Logit losses (focal / BCE-with-logits): the network emits logits, so a sigmoid turns
         # them into probabilities. MSE outputs are already ~[0, 1] scores: a sigmoid on those
@@ -639,17 +670,12 @@ class DartsTrainingService(ITrainingService):
         # Actuals should be binary (0 or 1) - round to handle any float noise
         actual_binary = np.round(actual_values).astype(int)
 
-        # Debug: log prediction and actual distributions
         pred_binary = (pred_proba >= threshold).astype(int)
         n_samples = len(pred_proba)
-        n_pred_positive = pred_binary.sum()
-        n_actual_positive = actual_binary.sum()
         logger.debug(f"Classification debug: n_samples={n_samples}, "
                    f"pred_proba range=[{pred_proba.min():.4f}, {pred_proba.max():.4f}], "
-                   f"pred_positive={n_pred_positive}/{n_samples} ({100*n_pred_positive/n_samples:.1f}%), "
-                   f"actual_positive={n_actual_positive}/{n_samples} ({100*n_actual_positive/n_samples:.1f}%)")
+                   f"pred_positive={pred_binary.sum()}/{n_samples}, actual_positive={actual_binary.sum()}/{n_samples}")
 
-        # Calculate all classification metrics
         class_metrics = ClassificationMetrics.calculate_all(actual_binary, pred_proba, threshold)
 
         metrics = {
@@ -666,60 +692,41 @@ class DartsTrainingService(ITrainingService):
             'true_negatives': class_metrics['true_negatives'],
             'false_negatives': class_metrics['false_negatives'],
             'threshold': threshold,
-            'test_samples': len(test_series),
+            'test_samples': n_test_points,
             'predictions_made': n_samples
         }
 
         logger.info(f"Classification eval ({n_samples} samples): "
                    f"{optimize_metric}={metrics.get(optimize_metric, 0):.4f}, "
                    f"F1={metrics['f1_score']:.4f}, acc={metrics['accuracy']:.4f}")
-
         return metrics
 
-    def _evaluate_regression(
-        self,
-        model: Any,
-        test_series: Any,
-        covariates: Any = None,
-        optimize_metric: str = 'mape'
-    ) -> Dict[str, float]:
-        """Evaluate regression model using simple prediction."""
-        n_predict = min(model.output_chunk_length, len(test_series))
-        if n_predict <= 0:
-            return {'error': 'Test series too short'}
+    def _regression_metrics(self, preds: List[Any], acts: List[Any], n_test_points: int) -> Dict[str, float]:
+        """MAE / RMSE / MAPE over the pooled (already inverse-transformed) predictions.
 
-        predictions = model.predict(n=n_predict)
-        actuals = test_series[:n_predict]
-
-        if len(predictions) == 0 or len(actuals) == 0:
-            return {'error': 'No valid predictions could be made'}
-
-        # Inverse-transform to original scale
-        if self.scaler is not None:
-            predictions_orig = self.scaler.inverse_transform(predictions)
-            actuals_orig = self.scaler.inverse_transform(actuals)
-        else:
-            predictions_orig = predictions
-            actuals_orig = actuals
-
-        actual_values = actuals_orig.values().flatten()
+        Scored on the rolling one-step forecasts of the WHOLE block. This used to forecast
+        ``output_chunk_length`` (1-7) points straight after the end of the TRAINING series and
+        compare them with the first points of the test block, so the metric came from a handful
+        of points and (with any gap between the two) from mismatched timestamps.
+        """
+        pred_values = np.concatenate([p.values().flatten() for p in preds])
+        actual_values = np.concatenate([a.values().flatten() for a in acts])
+        err = pred_values - actual_values
 
         metrics = {
-            'mae': float(mae(actuals_orig, predictions_orig)),
-            'rmse': float(rmse(actuals_orig, predictions_orig)),
-            'test_samples': len(test_series),
-            'predictions_made': len(predictions)
+            'mae': float(np.mean(np.abs(err))),
+            'rmse': float(np.sqrt(np.mean(err ** 2))),
+            'test_samples': n_test_points,
+            'predictions_made': len(pred_values)
         }
-
         # MAPE requires strictly positive values
         if actual_values.min() > 0:
-            metrics['mape'] = float(mape(actuals_orig, predictions_orig))
+            metrics['mape'] = float(np.mean(np.abs(err / actual_values)) * 100)
         else:
             metrics['mape'] = None
             logger.debug("MAPE skipped - data contains non-positive values")
 
-        logger.info(f"Regression eval: MAE={metrics['mae']:.4f}, RMSE={metrics['rmse']:.4f}")
-
+        logger.info(f"Regression eval ({len(pred_values)} points): MAE={metrics['mae']:.4f}, RMSE={metrics['rmse']:.4f}")
         return metrics
 
     def save_model(

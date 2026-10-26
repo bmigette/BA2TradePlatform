@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import json
 
-from app.services.data_preparation import DataPreparationService, purged_train_row_count
+from app.services.data_preparation import DataPreparationService, purged_train_row_count, three_way_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +289,57 @@ class TSAITrainingService(ITrainingService):
             np.concatenate(all_y_train, axis=0),
             np.concatenate(all_y_test, axis=0),
         )
+
+    def prepare_split_three_way(
+        self, dataframes: List[pd.DataFrame], train_ratio: float, holdout_share_of_test: float,
+        target_column: str, feature_columns: List[str],
+        timeframe: str = 'daily', seq_len: int = 24,
+        prediction_horizon: int = 0, prediction_mode: str = 'shift',
+        label_horizon: int = 0
+    ) -> Dict[str, np.ndarray]:
+        """Chronological train / validation / holdout windows, one frame per instrument.
+
+        Every frame (one per ticker) is cut on its own by ``three_way_bounds`` and windowed
+        on its own, so a window never spans two tickers or two blocks. The scaler is fitted on
+        the combined TRAINING rows only. Validation drives the GA fitness, the threshold gene
+        and the per-epoch validation loss; holdout is only scored and reported.
+        """
+        if not TSAI_AVAILABLE:
+            raise RuntimeError("tsai library not available")
+
+        blocks = {'train': [], 'val': [], 'holdout': []}
+        for df in dataframes:
+            b = three_way_bounds(len(df), train_ratio, holdout_share_of_test, label_horizon)
+            blocks['train'].append(df.iloc[:b['train_end']])
+            blocks['val'].append(df.iloc[b['val_start']:b['val_end']])
+            blocks['holdout'].append(df.iloc[b['holdout_start']:])
+
+        if self.normalize:
+            combined_train = pd.concat(blocks['train'], ignore_index=True)
+            self.data_prep = DataPreparationService(buffer_pct=self.buffer_pct)
+            _ = self.data_prep.fit_transform(combined_train, feature_columns, method="minmax_buffered")
+            logger.info(
+                f"Fitted normalization on the training rows of {len(dataframes)} dataset(s) "
+                f"({len(combined_train)} rows)"
+            )
+
+        out = {}
+        for name, frames in blocks.items():
+            xs, ys = [], []
+            for df in frames:
+                X, y = self.prepare_data(
+                    df, target_column, feature_columns, timeframe, seq_len,
+                    prediction_horizon, prediction_mode, fit_scaler=False
+                )
+                xs.append(X)
+                ys.append(y)
+            out[f'X_{name}'] = np.concatenate(xs, axis=0)
+            out[f'y_{name}'] = np.concatenate(ys, axis=0)
+        logger.info(
+            f"Three-way split: train={len(out['X_train'])}, validation={len(out['X_val'])}, "
+            f"holdout={len(out['X_holdout'])} windows"
+        )
+        return out
 
     def _create_sequences(
         self,

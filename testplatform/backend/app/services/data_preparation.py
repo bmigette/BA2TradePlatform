@@ -434,3 +434,49 @@ def purged_train_row_count(n_train_rows: int, label_horizon: int) -> int:
     if label_horizon < 0:
         raise ValueError(f"label_horizon must be >= 0, got {label_horizon}")
     return max(0, n_train_rows - int(label_horizon))
+
+
+def three_way_bounds(
+    n_rows: int, train_ratio: float, holdout_share_of_test: float, label_horizon: int
+) -> Dict[str, int]:
+    """Row bounds of a chronological train / validation / holdout split of ONE series.
+
+    The block after ``train_ratio`` (the old "test" block) used to be the GA fitness set,
+    the source of the threshold gene, the early-stopping set and the reported metric all at
+    once, so the reported score was the maximum over the whole population on the same rows
+    it was selected on. It is now cut in two:
+
+    * validation = the first ``1 - holdout_share_of_test`` of it: the GA fitness set, the
+      threshold source and the epoch-validation set;
+    * holdout    = the last ``holdout_share_of_test`` of it: never used for a decision, only
+      scored (once per individual) and reported separately.
+
+    Both boundaries are purged by ``label_horizon``: the last ``h`` training rows have labels
+    decided by validation bars, and the last ``h`` validation rows have labels decided by
+    holdout bars.
+
+    Returns:
+        ``train_end``, ``val_start``, ``val_end``, ``holdout_start`` (slice bounds, the
+        holdout runs to ``n_rows``).
+
+    Raises:
+        ValueError: if a ratio is out of range or any of the three blocks ends up empty.
+    """
+    if not 0.0 < train_ratio < 1.0:
+        raise ValueError(f"train_ratio must be in (0, 1), got {train_ratio}")
+    if not 0.0 < holdout_share_of_test < 1.0:
+        raise ValueError(f"holdout_share_of_test must be in (0, 1), got {holdout_share_of_test}")
+    val_start = int(n_rows * train_ratio)
+    n_test = n_rows - val_start
+    holdout_start = n_rows - int(n_test * holdout_share_of_test)
+    train_end = purged_train_row_count(val_start, label_horizon)
+    val_end = purged_train_row_count(holdout_start, label_horizon)
+    if train_end <= 0 or val_end <= val_start or holdout_start >= n_rows:
+        raise ValueError(
+            f"{n_rows} rows are too few for a train/validation/holdout split with "
+            f"train_ratio={train_ratio}, holdout_share_of_test={holdout_share_of_test}, "
+            f"label_horizon={label_horizon} (train_end={train_end}, validation={val_start}:{val_end}, "
+            f"holdout from {holdout_start})"
+        )
+    return {'train_end': train_end, 'val_start': val_start, 'val_end': val_end,
+            'holdout_start': holdout_start}
