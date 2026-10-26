@@ -285,3 +285,54 @@ class TestDriver:
     def test_requires_the_dsfw_name_token(self):
         r = self._run("--search-ds-factor-weights", "--name-suffix", "plain")
         assert r.returncode != 0 and "dsfw" in r.stderr
+
+
+# ----------------------------------------------------------------------------- analyst legs (aw_targets / aw_grades)
+_ANALYST = {**_RECIPE, "model:w_analyst": 0.8, "model:aw_targets": 1.0, "model:aw_grades": 0.0,
+            "model:analyst_target_window_days": 60, "model:analyst_min_targets": 5}
+
+
+class TestAnalystLegs:
+    def test_analyst_targets_recipe_is_untouched(self):
+        assert neutralise_ds_factor_genes(_ANALYST) is _ANALYST
+
+    def test_both_legs_zero_switches_the_analyst_section_off(self):
+        out = neutralise_ds_factor_genes({**_ANALYST, "model:aw_targets": 0.0})
+        assert out["model:w_analyst"] == 0.0
+        assert not any(k in out for k in ("model:aw_targets", "model:aw_grades",
+                                          "model:analyst_target_window_days", "model:analyst_min_targets"))
+
+    def test_zero_analyst_weight_removes_legs_and_details(self):
+        out = neutralise_ds_factor_genes({**_ANALYST, "model:w_analyst": 0.0})
+        assert not any(k in out for k in ("model:aw_targets", "model:aw_grades", "model:analyst_min_targets"))
+
+    def test_zero_targets_leg_kills_only_the_target_details(self):
+        out = neutralise_ds_factor_genes({**_ANALYST, "model:aw_targets": 0.0, "model:aw_grades": 0.5})
+        assert out["model:w_analyst"] == 0.8 and out["model:aw_grades"] == 0.5
+        assert "model:analyst_target_window_days" not in out and "model:analyst_min_targets" not in out
+
+    def test_gene_space_and_trial_config(self):
+        _M._resolve_search_ds_factor_weights(True, "optimize", "DeterministicScorer")
+        try:
+            sp = _M._ds_factor_gene_space()
+        finally:
+            _M._resolve_search_ds_factor_weights(False, "optimize")
+        for k in ("aw_targets", "aw_grades"):
+            assert sp[k] == {"optimize": True, "min": 0.0, "max": 1.0, "step": 0.1, "type": "float"}
+        s = TestTrialConfig._cfg(_ANALYST)["experts"][0]["settings"]
+        assert (s["aw_targets"], s["aw_grades"], s["w_analyst"]) == (1.0, 0.0, 0.8)
+        assert s["analyst_target_window_days"] == 60 and s["analyst_min_targets"] == 5
+
+    def test_export_carries_the_canonical_phenotype(self):
+        ex = TestExport._export
+        ep = ex({**_ANALYST, "expertFixedSettings": {}})
+        assert ep["aw_targets"] == 1.0 and ep["aw_grades"] == 0.0 and ep["w_analyst"] == 0.8
+        raw = {**_ANALYST, "model:aw_targets": 0.0}
+        ep = ex({**raw, "expertFixedSettings": {}})
+        assert ep["w_analyst"] == 0.0 == decode_params(_STRAT, raw)["expert_overrides"]["w_analyst"]
+
+    def test_memo_key_dedups_dead_legs(self):
+        def key(flat):
+            return trial_key({"engine": "daily", "seed": 1, "params": canonical_trial_params({}, flat)})
+        a = {**_ANALYST, "model:w_analyst": 0.0}
+        assert key(a) == key({**a, "model:aw_targets": 0.3})

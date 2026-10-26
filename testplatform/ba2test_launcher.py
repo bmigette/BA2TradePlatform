@@ -6299,7 +6299,9 @@ def _ds_factor_gene_space() -> dict:
         "tw_mom": w(), "tw_d200": w(), "tw_rsi": w(), "tw_don": w(),
         "fw_quality": w(), "fw_piotroski": w(), "fw_value": w(), "fw_growth": w(),
         "mom_lookback_days": {"optimize": True, "type": "choice", "choices": [63, 126, 252]},
-        # analyst_targets recipe (exploration): 30/60/90-day target window, 3/5 minimum targets.
+        # analyst_targets recipe (exploration): targets leg only (aw_targets 1, aw_grades 0), 30/60/90-day target
+        # window, 3/5 minimum targets. The legs are normalised by DS; both 0 switches the section off at decode.
+        "aw_targets": w(), "aw_grades": w(),
         "analyst_target_window_days": {"optimize": True, "min": 30, "max": 90, "step": 30, "type": "int"},
         "analyst_min_targets": {"optimize": True, "min": 3, "max": 5, "step": 2, "type": "int"},
     }

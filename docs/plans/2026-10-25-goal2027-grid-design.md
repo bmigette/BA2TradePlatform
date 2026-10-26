@@ -169,6 +169,7 @@ requires `dsfw` in `--name-suffix`; DeterministicScorer jobs only, refused for a
 | `model:tw_mom`, `tw_d200`, `tw_rsi`, `tw_don` | 0.0-1.0, step 0.1 |
 | `model:fw_quality`, `fw_piotroski`, `fw_value`, `fw_growth` | 0.0-1.0, step 0.1 |
 | `model:mom_lookback_days` | choice 63, 126, 252 (that order is persisted) |
+| `model:aw_targets`, `model:aw_grades` | 0.0-1.0, step 0.1 (the two analyst legs; DS divides by their sum) |
 | `model:analyst_target_window_days` | 30-90, step 30 (the `analyst_targets` window) |
 | `model:analyst_min_targets` | 3-5, step 2 (the `analyst_targets` minimum observations) |
 | `model:w_analyst` | existing gene, ceiling widened 0.4 -> 0.8 under the flag only |
@@ -182,12 +183,13 @@ requires `dsfw` in `--name-suffix`; DeterministicScorer jobs only, refused for a
     "missing";
   - a section weight of 0 makes its sub-weights dead (removed); `mom_lookback_days` is dead when the technical
     section is off or `tw_mom` is 0; the two analyst details are dead when `w_analyst` is 0.
+  - the analyst legs `aw_targets`/`aw_grades` follow the same pattern: `w_analyst` 0 removes both legs and the two
+    target details; both legs 0 with `w_analyst` > 0 switches the analyst section off (`w_analyst` -> 0.0, DS would
+    otherwise drop it as missing); a zero `aw_targets` removes the target window and minimum.
   A genome with every section at 0 is left as today: it trades nothing and the trade-count gate disqualifies it.
 - **Parity.** The deploy payload carries the canonical `w_technical`/`w_fundamental` (what the backtest ran), not the
   raw genome. A row whose optimization searched the genes but lost one is refused at export. Without the flag the gene
   space, the run settings and the run names are byte-identical.
-- **Not searched:** `aw_targets`/`aw_grades`. The `analyst_targets` recipe fixed them at 1.0/0.0; DS defaults are
-  0.5/0.5.
 
 **SQM ruleset** (`--strategy SQM`, DeterministicScorer only; also accepted by the capband driver and
 `--strategy-plan`). Entry: buy when `bullish` AND `has_no_position` AND `days_since_last_close` > 1; at the fill
@@ -255,7 +257,7 @@ misses an exploration value or the control; missing = no gene.
 | analyst_targets (DS) | target window | 30/60/90 (90) | none | missing | built in 2.8 (`dsfw`): `model:analyst_target_window_days` 30-90 step 30 |
 | analyst_targets (DS) | minimum observations | 3/5 (3) | none | missing | built in 2.8 (`dsfw`): `model:analyst_min_targets` 3-5 step 2 |
 | analyst_targets (DS) | analyst/technical 80/20 | w_analyst 0.8, w_technical 0.2 | `w_analyst` max 0.4 | range | built in 2.8 (`dsfw`): max 0.8 |
-| analyst_targets (DS) | `aw_targets` 1.0 / `aw_grades` 0.0 | fixed by the family | DS defaults 0.5/0.5, not genes | missing | NOT built: the owner did not list it; flagged below |
+| analyst_targets (DS) | `aw_targets` 1.0 / `aw_grades` 0.0 | fixed by the family | DS defaults 0.5/0.5, not genes | missing | built (`dsfw`): `model:aw_targets`, `model:aw_grades` 0-1 step 0.1 |
 
 What `--search-exploration-ranges` (name token `explr`) does, and nothing else:
 - widens the time-exit threshold of FMPInsiderClusterBuy S1, DeterministicScorer S1/S2/SQM, FMPRating S2 and
@@ -270,9 +272,8 @@ The genes are ordinary rule genes (`cond:*:value`, `exit:*:enabled`), so the tri
 export and the deploy conversion need no new path. A test round-trips the S5 time exit through export and the live
 conversion.
 
-Open points: (1) `aw_targets`/`aw_grades` for the analyst_targets recipe (see above); (2) the SQM cell takes no
-market-profile genes, so the market-gate dimensions of the other cells do not apply to it; (3) `xl` still needs a
-fixed-screen mode (2.8).
+Open points: (1) the SQM cell takes no
+market-profile genes, so the market-gate dimensions of the other cells do not apply to it.
 
 ## 3. Data preparation (January 2027)
 

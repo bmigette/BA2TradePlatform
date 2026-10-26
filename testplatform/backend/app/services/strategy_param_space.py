@@ -183,8 +183,10 @@ DS_TECH_WEIGHT_GENES = ("model:tw_mom", "model:tw_d200", "model:tw_rsi", "model:
 DS_FUND_WEIGHT_GENES = ("model:fw_quality", "model:fw_piotroski", "model:fw_value", "model:fw_growth")
 DS_MOM_LOOKBACK_GENE = "model:mom_lookback_days"
 DS_ANALYST_DETAIL_GENES = ("model:analyst_target_window_days", "model:analyst_min_targets")
+#: The two analyst-section legs (``analyst.analyst_score`` divides by their sum; both 0 drops the section as missing).
+DS_ANALYST_LEG_GENES = ("model:aw_targets", "model:aw_grades")
 DS_FACTOR_GENES = (DS_TECH_WEIGHT_GENES + DS_FUND_WEIGHT_GENES + (DS_MOM_LOOKBACK_GENE,)
-                   + DS_ANALYST_DETAIL_GENES)
+                   + DS_ANALYST_LEG_GENES + DS_ANALYST_DETAIL_GENES)
 
 
 def neutralise_ds_factor_genes(flat_params: Dict[str, Any]) -> Dict[str, Any]:
@@ -218,8 +220,19 @@ def neutralise_ds_factor_genes(flat_params: Dict[str, Any]) -> Dict[str, Any]:
     tw_mom = out.get("model:tw_mom")
     if (not tech_on) or (tw_mom is not None and float(tw_mom) <= 0.0):
         out.pop(DS_MOM_LOOKBACK_GENE, None)
+    # Analyst section: legs (aw_*) are normalised like the sub-weights above. w_analyst 0 -> legs and details dead;
+    # both legs 0 with w_analyst > 0 -> the section would be dropped as "missing", so it is switched OFF explicitly;
+    # a zero targets leg makes the price-target window / minimum dead.
     wa = out.get("model:w_analyst")
+    legs = [out[k] for k in DS_ANALYST_LEG_GENES if k in out]
     if wa is not None and float(wa) <= 0.0:
+        for k in DS_ANALYST_LEG_GENES + DS_ANALYST_DETAIL_GENES:
+            out.pop(k, None)
+    elif wa is not None and len(legs) == len(DS_ANALYST_LEG_GENES) and sum(float(v) for v in legs) <= 0.0:
+        out["model:w_analyst"] = 0.0
+        for k in DS_ANALYST_LEG_GENES + DS_ANALYST_DETAIL_GENES:
+            out.pop(k, None)
+    elif out.get("model:aw_targets") is not None and float(out["model:aw_targets"]) <= 0.0:
         for k in DS_ANALYST_DETAIL_GENES:
             out.pop(k, None)
     return flat_params if out == flat_params else out
