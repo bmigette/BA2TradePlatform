@@ -457,13 +457,20 @@ class DartsTrainingService(ITrainingService):
     # Classification metrics that require thresholding predictions
     CLASSIFICATION_METRICS = {'f1_score', 'accuracy', 'precision', 'recall', 'auc_roc', 'balanced_accuracy', 'mcc', 'auc_pr'}
 
+    # Losses that train the network to emit LOGITS (sigmoid is applied to read a probability).
+    # Any other loss (mse) trains the output towards the 0/1 target directly, so the output
+    # already is the score and a sigmoid on top would squash [0, 1] into [0.5, 0.73].
+    LOGIT_LOSSES = ('focal_loss', 'weighted_cross_entropy', 'cross_entropy')
+    PROBABILITY_LOSSES = ('mse',)
+
     def evaluate_model(
         self,
         model: Any,
         test_series: Any,
         covariates: Any = None,
         optimize_metric: str = 'mape',
-        threshold: float = 0.5
+        threshold: float = 0.5,
+        loss_function: Optional[str] = None
     ) -> Dict[str, float]:
         """
         Evaluate model on test set.
@@ -479,6 +486,9 @@ class DartsTrainingService(ITrainingService):
             covariates: Optional covariate TimeSeries
             optimize_metric: Metric to optimize ('f1_score', 'accuracy', 'mape', etc.)
             threshold: Classification threshold for binary metrics (default 0.5)
+            loss_function: The loss the model was trained with. Required for classification
+                metrics: it decides whether the raw output is a logit (sigmoid applied) or
+                already a probability-like score (mse; no sigmoid).
 
         Returns:
             Evaluation metrics
@@ -493,7 +503,8 @@ class DartsTrainingService(ITrainingService):
                 # For classification, use historical_forecasts to get predictions
                 # across the entire test set for meaningful metrics
                 return self._evaluate_classification(
-                    model, test_series, covariates, optimize_metric, threshold
+                    model, test_series, covariates, optimize_metric, threshold,
+                    loss_function=loss_function
                 )
             else:
                 # For regression, use simple prediction
@@ -513,7 +524,8 @@ class DartsTrainingService(ITrainingService):
         test_series: Any,
         covariates: Any = None,
         optimize_metric: str = 'f1_score',
-        threshold: float = 0.5
+        threshold: float = 0.5,
+        loss_function: Optional[str] = None
     ) -> Dict[str, float]:
         """
         Evaluate classification model using historical_forecasts.
@@ -522,6 +534,16 @@ class DartsTrainingService(ITrainingService):
         predictions where at each time T we predict T+1 using history up to T.
         """
         from app.services.metrics import ClassificationMetrics
+
+        if loss_function in self.LOGIT_LOSSES:
+            output_is_logit = True
+        elif loss_function in self.PROBABILITY_LOSSES:
+            output_is_logit = False
+        else:
+            raise ValueError(
+                f"loss_function must be one of {self.LOGIT_LOSSES + self.PROBABILITY_LOSSES} to score "
+                f"a classification metric, got {loss_function!r}"
+            )
 
         input_chunk = model.input_chunk_length
         output_chunk = model.output_chunk_length
@@ -602,10 +624,14 @@ class DartsTrainingService(ITrainingService):
         pred_values = predictions_orig.values().flatten()
         actual_values = actuals_orig.values().flatten()
 
-        # For classification: apply sigmoid to convert logits to probabilities
-        # This is needed when using FocalLoss or other logit-based loss functions
-        # Sigmoid: 1 / (1 + exp(-x))
-        pred_proba = 1 / (1 + np.exp(-pred_values))
+        # Logit losses (focal / BCE-with-logits): the network emits logits, so a sigmoid turns
+        # them into probabilities. MSE outputs are already ~[0, 1] scores: a sigmoid on those
+        # maps everything into [0.5, 0.73] and "predicts positive" for every row at the usual
+        # 0.5 threshold, so the metrics describe a constant predictor.
+        if output_is_logit:
+            pred_proba = 1 / (1 + np.exp(-pred_values))
+        else:
+            pred_proba = pred_values
 
         # Ensure predictions are in valid probability range [0, 1]
         pred_proba = np.clip(pred_proba, 0, 1)

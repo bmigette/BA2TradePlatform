@@ -143,6 +143,47 @@ def drop_unobservable_target_rows(
     return df[~unobservable].reset_index(drop=True), n_dropped
 
 
+def training_label_counts(labels: pd.Series, target_column: str, loss_function: str) -> Tuple[int, int]:
+    """Count positive / negative training labels for a class-weighted loss.
+
+    A non-MSE loss (focal / BCE) is only meaningful on a binary 0/1 target. Counting
+    ``== 1`` / ``== 0`` on anything else yields (0, 0) and silently disables the class
+    weighting, so non-binary labels are refused here instead.
+    """
+    values = labels.dropna()
+    if len(values) == 0:
+        raise ValueError(f"No training labels in '{target_column}' to weight the {loss_function} loss")
+    unexpected = sorted(set(np.unique(values.values)) - {0, 1})
+    if unexpected:
+        raise ValueError(
+            f"Loss '{loss_function}' needs a binary 0/1 target but '{target_column}' holds "
+            f"{unexpected[:5]}; use the 'mse' loss for regression targets"
+        )
+    return int((values == 1).sum()), int((values == 0).sum())
+
+
+def create_training_loss(loss_function: str, train_labels: pd.Series, target_column: str):
+    """Build the training loss: None for 'mse' (the model default), else a class-weighted loss.
+
+    Errors propagate. This used to live inline in ``train_unified_optimization`` behind
+    ``except Exception: loss_fn = None``, and it read an undefined ``train_series`` -- the
+    resulting NameError was swallowed, so every non-MSE loss silently trained as MSE while
+    the job result still recorded the requested loss.
+    """
+    if loss_function == 'mse':
+        return None
+    from app.services.losses import get_loss_function
+    positive_count, negative_count = training_label_counts(train_labels, target_column, loss_function)
+    logger.info(f"Class distribution for loss: {positive_count} positive, {negative_count} negative")
+    loss_fn = get_loss_function(
+        loss_type=loss_function,
+        positive_count=positive_count,
+        negative_count=negative_count
+    )
+    logger.info(f"Using {loss_function} loss function for training")
+    return loss_fn
+
+
 def split_datasets_by_role(dfs: list, dataset_ids: list, test_dataset_ids: list) -> tuple:
     """Split datasets into train and test groups based on manual assignment.
 
@@ -2254,7 +2295,8 @@ def train_single_model(
                 model,
                 test_series,
                 covariates=test_covariates,
-                optimize_metric=optimize_metric
+                optimize_metric=optimize_metric,
+                loss_function=loss_function_type
             )
 
             if 'error' in eval_result:
@@ -3123,28 +3165,13 @@ def train_unified_optimization(
     loss_function_type = metrics_config.get('lossFunction')
     if loss_function_type is None:
         return {'model_type': 'unified', 'status': 'failed', 'error': 'metrics_config.lossFunction is required'}
-    loss_fn = None
-
-    # Create loss function if not using default MSE
-    if loss_function_type and loss_function_type != 'mse':
-        try:
-            from app.services.losses import get_loss_function
-            # Calculate class counts from training data for weighted loss
-            # Use train_series which should be available at this point
-            train_vals = train_series.values().flatten()
-            positive_count = int((train_vals == 1).sum())
-            negative_count = int((train_vals == 0).sum())
-            logger.info(f"Class distribution for loss: {positive_count} positive, {negative_count} negative")
-
-            loss_fn = get_loss_function(
-                loss_type=loss_function_type,
-                positive_count=positive_count,
-                negative_count=negative_count
-            )
-            logger.info(f"Using {loss_function_type} loss function for training")
-        except Exception as e:
-            logger.warning(f"Failed to create {loss_function_type} loss function: {e}. Using default MSE.")
-            loss_fn = None
+    # Any failure building the loss propagates (see create_training_loss).
+    split_idx = int(len(full_df) * train_ratio)
+    loss_fn = create_training_loss(
+        loss_function_type,
+        full_df[target_column].iloc[:purged_train_row_count(split_idx, label_horizon)],
+        target_column
+    )
 
     # Progress tracking
     progress_state = {
@@ -3274,7 +3301,8 @@ def train_unified_optimization(
             eval_result = training_service.evaluate_model(
                 model, test_series,
                 covariates=test_covariates,
-                optimize_metric=optimize_metric
+                optimize_metric=optimize_metric,
+                loss_function=loss_function_type
             )
 
             if 'error' in eval_result:
