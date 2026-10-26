@@ -13,6 +13,7 @@ What this pins:
 """
 from __future__ import annotations
 
+import copy
 import importlib.util
 import os
 import re
@@ -64,9 +65,12 @@ def _leaves(node, out=None):
 def _signature(entry_rules, exit_rules):
     """Behaviour of a ruleset with ids/names/optimizer metadata stripped, in precedence order."""
     def rule(r):
-        acts = tuple((a.get("action_type") or a.get("action"), a.get("reference_value"),
-                      None if a.get("action_value") is None else float(a["action_value"]))
-                     for a in r.get("actions") or [])
+        raw = [(a.get("action_type") or a.get("action"), a.get("reference_value"),
+                None if a.get("action_value") is None else float(a["action_value"]))
+               for a in r.get("actions") or []]
+        # the bracket legs after the open action are independent; the order S6 uses (TP, stop) and the exploration's
+        # (stop, TP) are the same behaviour
+        acts = tuple(raw[:1]) + tuple(sorted(raw[1:], key=str))
         leaves = tuple(sorted((f, ("is_true" if op in (None, "is_true") else op),
                                None if v is None else float(v)) for f, op, v in _leaves(r.get("conditions"))))
         return leaves, acts, bool(r.get("continue_processing"))
@@ -84,14 +88,18 @@ class TestGenes:
     def test_gene_names_follow_the_s1_s7_shape_and_ranges(self):
         strat, _ = _sqm()
         sp = collect_param_space(strat)
-        assert sp["entry:buy:a1:action_value"] == {"type": "float", "min": -14.0, "max": -6.0, "step": 2.0}
-        assert sp["entry:buy:a2:action_value"] == {"type": "float", "min": 10.0, "max": 30.0, "step": 5.0}
+        # a1 = take-profit, a2 = stop: the roles and indices S6 uses
+        assert sp["entry:buy:a1:action_value"] == {"type": "float", "min": 10.0, "max": 30.0, "step": 5.0}
+        assert sp["entry:buy:a2:action_value"] == {"type": "float", "min": -14.0, "max": -6.0, "step": 2.0}
         assert sp["cond:xt:value"] == {"type": "float", "min": 20.0, "max": 120.0, "step": 10.0}
         # no on/off toggle anywhere: the recipe IS "buy with a stop, a target and a time exit"
         assert not [k for k in sp if k.endswith(":enabled")]
         # the same names S6 uses for the same roles
         s6 = collect_param_space(_M._build_strategy("S6", "s6", "DeterministicScorer"))
         assert {"entry:buy:a1:action_value", "entry:buy:a2:action_value", "cond:xt:value"} <= set(s6)
+        for sqm_strat in (strat, _M._build_strategy("S6", "s6", "DeterministicScorer")):       # same roles in both
+            kinds = [a["action_type"] for a in sqm_strat.entry_rules[0]["actions"]]
+            assert kinds[:3] == ["buy", "adjust_take_profit", "adjust_stop_loss"]
 
     def test_defaults_are_the_recipe_values(self):
         _, dec = _sqm()
@@ -102,7 +110,7 @@ class TestGenes:
         assert [l for l in _leaves(exit_["conditions"]) if l[0] == "days_opened"][0][2] == 30.0
 
     def test_genes_move_the_decoded_ruleset(self):
-        _, dec = _sqm({"entry:buy:a1:action_value": -8.0, "entry:buy:a2:action_value": 30.0,
+        _, dec = _sqm({"entry:buy:a2:action_value": -8.0, "entry:buy:a1:action_value": 30.0,
                        "cond:xt:value": 90.0})
         sig = _signature(dec["entry_rules"], dec["exit_rules"])
         assert ("adjust_stop_loss", "order_open_price", -8.0) in sig[0][0][1]
@@ -112,21 +120,50 @@ class TestGenes:
 
 # ----------------------------------------------------------------------------- default == exploration recipe
 class TestDefaultsAreTheExplorationRecipe:
+    """SQM's defaults against the exploration run that found the recipe: the ``quality_momentum`` family's 70/30 variant
+    (``profiles.variants``). Its baseline states stop -8 / target +20 / time exit 60; the variant turns the stop into a
+    -12..-8 range and the time exit into a 30..90 range, and the best grid point (fitness 3.16) was stop -12, 30 days.
+    Nothing is overwritten here: the best point is SELECTED from the variant's own ranges, and the test fails if the
+    point is outside them or the baseline's stated values are not what the recipe says they are."""
+    BEST = {"stop": -12.0, "target": 20.0, "days": 30.0}
+
     @staticmethod
-    def _recipe_rules():
+    def _variant():
         prof = _exploration()
         base = prof.new_idea_baseline("quality_momentum", prof.load_baselines()["large_ds"])
-        entry = [dict(r) for r in base["strategy"]["entry_rules"]]
-        # the recipe's winning values: entry stop -12 (the baseline's -8 is the grid's other arm), target +20
-        for rule in entry:
-            for a in rule["actions"]:
-                if a["action_type"] == "adjust_stop_loss":
-                    a["action_value"] = -12.0
-        exit_rules = [dict(r) for r in base["strategy"]["exit_rules"]]
-        for rule in exit_rules:
-            for leaf in rule["conditions"]["conditions"]:
-                if leaf["field"] == "days_opened":
-                    leaf["value"] = 30
+        job = next(v for v in prof.variants("quality_momentum", base) if v["variant"] == "blend_70_30")
+        return base, job
+
+    def test_the_baseline_states_the_values_the_variant_then_searches(self):
+        base, job = self._variant()
+        acts = {a["action_type"]: a for a in base["strategy"]["entry_rules"][0]["actions"]}
+        assert acts["adjust_stop_loss"]["action_value"] == -8.0 and acts["adjust_take_profit"]["action_value"] == 20.0
+        base_days = [n["value"] for r in base["strategy"]["exit_rules"] for n in r["conditions"]["conditions"]
+                     if n["field"] == "days_opened"]
+        assert base_days == [60]
+        stop = next(a for a in job["strategy"]["entry_rules"][0]["actions"] if a["action_type"] == "adjust_stop_loss")
+        assert (stop["action_value_min"], stop["action_value_max"]) == (-12.0, -8.0)
+        days = next(n for r in job["strategy"]["exit_rules"] for n in r["conditions"]["conditions"]
+                    if n["field"] == "days_opened")
+        assert (days["value_min"], days["value_max"]) == (30, 90)
+
+    @classmethod
+    def _recipe_rules(cls):
+        """The variant's rules with the best grid point selected from its own search ranges (asserted)."""
+        _, job = cls._variant()
+        entry = copy.deepcopy(job["strategy"]["entry_rules"])
+        exit_rules = copy.deepcopy(job["strategy"]["exit_rules"])
+        for a in entry[0]["actions"]:
+            if a["action_type"] == "adjust_stop_loss":
+                assert a["action_value_min"] <= cls.BEST["stop"] <= a["action_value_max"]
+                a["action_value"] = cls.BEST["stop"]
+            if a["action_type"] == "adjust_take_profit":
+                assert a["action_value"] == cls.BEST["target"]
+        for r in exit_rules:
+            for n in r["conditions"]["conditions"]:
+                if n["field"] == "days_opened":
+                    assert n["value_min"] <= cls.BEST["days"] <= n["value_max"]
+                    n["value"] = cls.BEST["days"]
         return entry, exit_rules
 
     def test_the_default_genome_equals_the_recipe_on_the_live_export(self):
@@ -134,7 +171,7 @@ class TestDefaultsAreTheExplorationRecipe:
         r_entry, r_exit = self._recipe_rules()
         mine = _signature(dec["entry_rules"], dec["exit_rules"])
         theirs = _signature(r_entry, r_exit)
-        assert mine == theirs, f"\nSQM:    {mine}\nrecipe: {theirs}"
+        assert mine == theirs, f"SQM: {mine} / recipe: {theirs}"
 
     def test_equal_after_the_deploy_conversion_too(self):
         _, dec = _sqm()
@@ -146,10 +183,17 @@ class TestDefaultsAreTheExplorationRecipe:
             return _signature(back["entry_rules"], back["exit_rules"])
         assert live(dec["entry_rules"], dec["exit_rules"]) == live(r_entry, r_exit)
 
+    def test_the_variants_other_grid_points_are_reachable_by_the_sqm_genes(self):
+        # stop -12..-8 and time 30..90 (the variant's ranges) must lie inside SQM's gene ranges
+        strat, _ = _sqm()
+        sp = collect_param_space(strat)
+        assert sp["entry:buy:a2:action_value"]["min"] <= -12.0 and sp["entry:buy:a2:action_value"]["max"] >= -8.0
+        assert sp["cond:xt:value"]["min"] <= 30 and sp["cond:xt:value"]["max"] >= 90
+
 
 # ----------------------------------------------------------------------------- export / deploy parity
 class TestExportDeployParity:
-    GENOME = {"entry:buy:a1:action_value": -10.0, "entry:buy:a2:action_value": 25.0, "cond:xt:value": 70.0}
+    GENOME = {"entry:buy:a2:action_value": -10.0, "entry:buy:a1:action_value": 25.0, "cond:xt:value": 70.0}
 
     def test_decoded_rules_survive_the_live_export_round_trip(self):
         _, dec = _sqm(self.GENOME)

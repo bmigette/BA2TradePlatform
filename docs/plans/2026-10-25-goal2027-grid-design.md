@@ -198,8 +198,8 @@ requires `dsfw` in `--name-suffix`; DeterministicScorer jobs only, refused for a
 
 | Gene | Range | Default (the recipe) |
 |---|---|---|
-| `entry:buy:a1:action_value` (stop %) | -14 to -6, step 2 | -12 |
-| `entry:buy:a2:action_value` (target %) | 10-30, step 5 | 20 |
+| `entry:buy:a1:action_value` (target %) | 10-30, step 5 | 20 |
+| `entry:buy:a2:action_value` (stop %) | -14 to -6, step 2 | -12 |
 | `cond:xt:value` (time exit days) | 20-120, step 10 | 30 |
 
 The gene names are the ones S6 uses for the same roles. No gene switches a part off. With every gene at its default the

@@ -1267,6 +1267,17 @@ def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
     return {}
 
 
+#: Settings a STRATEGY pins for every job that runs it (and the RM genes that would then be dead). SQM's entry stop is
+#: a ruleset stop; at entry the RM's safeguard stop is attached instead whenever it is TIGHTER
+#: (``position_sizing.reconcile_protective_stop``; ``allow_ruleset_sl_loosen`` does not apply there). With
+#: ``use_atr_stop`` off the safeguard distance is ``max(risk_per_trade_pct, min_stop_loss_pct)`` -- 3% to 15% across the
+#: RM genes -- so the searched -14..-6% stop would be dead whenever that distance is smaller. Pinning the floor at
+#: 15% (above the loosest stop gene, 14%) makes the ruleset stop always the tighter one, i.e. authoritative;
+#: ``risk_per_trade_pct`` (10, the exploration recipe's value) can then never exceed it, so it is pinned too and both
+#: genes are dropped from the SQM gene space (``_rm_opt_for``). The same settings reach live through the export.
+_STRATEGY_FIXED_SETTINGS = {"SQM": {"min_stop_loss_pct": 15.0, "risk_per_trade_pct": 10.0}}
+
+
 def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None, *,
                          strategy_kind: "str | None" = None,
                          rm_toggles_unpinned: "list | None" = None,
@@ -1317,6 +1328,7 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     if sizing_mode_searched:
         settings.pop("sizing_mode", None)
     settings.update(_option_fixed_settings_for(spec, strategy_kind))
+    settings.update(_STRATEGY_FIXED_SETTINGS.get(strategy_kind, {}))
     # HISTORICALLY INERT, PINNED SO THEY STAY THAT WAY -- unless a run policy unpinned one.
     # See _INERT_RM_TOGGLES / _pinned_rm_toggles.
     settings.update(_pinned_rm_toggles(rm_toggles_unpinned))
@@ -1924,6 +1936,8 @@ def _rm_opt_for(kind: str, sizing_mode: "str | None" = None, *, atr_searched: bo
     # inferring notional from absence would delete a live gene from a risk_atr run.
     if sizing_mode == "notional":
         block.pop("atr_risk_budget_pct", None)
+    for pinned in _STRATEGY_FIXED_SETTINGS.get(kind, {}):
+        block.pop(pinned, None)         # pinned by the strategy (see _STRATEGY_FIXED_SETTINGS): no gene
     return block
 
 
@@ -2446,8 +2460,8 @@ def _build_strategy_SQM(name: str):
     (tools/strategy_research/exploration/profiles.py: ``new_idea_baseline`` + ``time_exit``); the three numbers
     are genes whose DEFAULT is the recipe (stop -12%, target +20%, 30 days).
 
-    Gene names follow the S1-S7 shape: ``entry:buy:a1:action_value`` (stop), ``entry:buy:a2:action_value``
-    (target), ``cond:xt:value`` (time exit days). No on/off toggle: the recipe is "buy with a stop, a target
+    Gene names follow the S1-S7 shape: ``entry:buy:a1:action_value`` (target) and ``entry:buy:a2:action_value`` (stop), the
+    same roles and indices as S6, plus ``cond:xt:value`` (time exit days). No on/off toggle: the recipe is "buy with a stop, a target
     and a time exit", and a toggled-off bracket would be a different strategy. First match wins, and there is
     one exit rule, so nothing shadows it."""
     buy_entry_conditions = {
@@ -2455,13 +2469,14 @@ def _build_strategy_SQM(name: str):
             {"id": "gate_days_since_close", "field": "days_since_last_close", "op": ">", "value": 1},
         ],
     }
+    # Order as in S6: a1 = take-profit, a2 = stop (a0 is the buy).
     entry_actions = [
-        {"id": "entry_sl", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
-         "action_value": -12.0, "action_value_optimize": True,
-         "action_value_min": -14.0, "action_value_max": -6.0, "action_value_step": 2.0},
         {"id": "entry_tp", "action_type": "adjust_take_profit", "reference_value": "order_open_price",
          "action_value": 20.0, "action_value_optimize": True,
          "action_value_min": 10.0, "action_value_max": 30.0, "action_value_step": 5.0},
+        {"id": "entry_sl", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": -12.0, "action_value_optimize": True,
+         "action_value_min": -14.0, "action_value_max": -6.0, "action_value_step": 2.0},
     ]
     exit_conditions = [
         {"id": "exit_time", "action_type": "close",

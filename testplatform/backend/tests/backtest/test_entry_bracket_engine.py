@@ -195,7 +195,8 @@ def test_bracket_closes_full_sized_position_even_if_set_before_sizing():
 # fragile timing/reference-price wiring a full ``engine.run()`` would need.
 # ---------------------------------------------------------------------------
 
-def _precedence_setup(account_id: int, expert_id: int, ruleset_sl_price: "float | None"):
+def _precedence_setup(account_id: int, expert_id: int, ruleset_sl_price: "float | None",
+                      risk_pct: float = 8.0, min_stop_pct: float = 8.0):
     """Wire an engine + a PENDING qty=0 entry order with a REAL Transaction, optionally
     carrying a pre-attached entry-bracket SL (``Transaction.stop_loss``) — the exact state
     Phase 2's ``adjust_stop_loss`` action leaves behind BEFORE the classic RM sizes the
@@ -260,8 +261,8 @@ def _precedence_setup(account_id: int, expert_id: int, ruleset_sl_price: "float 
             "allow_automated_trade_opening": (True, "bool"),
             "enable_buy": (True, "bool"),
             "sizing_mode": ("risk_atr", "str"),
-            "risk_per_trade_pct": (8.0, "float"),
-            "min_stop_loss_pct": (8.0, "float"),
+            "risk_per_trade_pct": (risk_pct, "float"),
+            "min_stop_loss_pct": (min_stop_pct, "float"),
             "use_atr_stop": (False, "bool"),
         }
     )
