@@ -244,9 +244,39 @@ class TestRefusals:
             assert "DeterministicScorer" in str(e.value)
 
     def test_market_condition_gates_are_refused_loudly(self):
-        # SQM is not one of S1-S7; a market profile on it would label the job gated and gate nothing.
-        assert "SQM" not in _M._EQUITY_MARKET_CONDITION_STRATEGIES
-        assert "SQM" not in _M._MARKET_CONDITION_STRATEGIES
+        # SQM is not one of S1-S7: a market profile on it would label the job gated, demand snapshot coverage and
+        # search no market genes. The launch gate must actually EXIT with that message.
+        try:
+            _M._resolve_market_condition_profiles("ohlcv-v1", "optimize")
+            with pytest.raises(SystemExit) as e:
+                _M._apply_market_conditions("optimize", {}, None, "SQM")
+            msg = str(e.value)
+            assert "--market-condition-profile" in msg and "'SQM'" in msg and "emits no market-condition gates" in msg
+            # and the same call is accepted for an S1-S7 key (it must get past the kind check)
+            try:
+                _M._apply_market_conditions("optimize", {}, None, "S2")
+            except SystemExit as other:
+                assert "emits no market-condition gates" not in str(other)
+            except Exception:       # a later check (manifest / coverage) may complain; not the kind refusal
+                pass
+        finally:
+            _M._resolve_market_condition_profiles(None, "optimize")
+
+    def test_the_market_profile_gene_and_market_exits_are_refused_for_sqm(self):
+        _M._SEARCH_MARKET_PROFILE = True
+        try:
+            with pytest.raises(SystemExit) as e:
+                _M._refuse_market_profile_gene_unsupported("optimize", "SQM", bypass=False)
+            assert "SQM" in str(e.value) and "equity S1-S7" in str(e.value)
+        finally:
+            _M._SEARCH_MARKET_PROFILE = False
+        _M._MARKET_EXIT_KINDS_SELECTED = ("structure",)
+        try:
+            with pytest.raises(SystemExit) as e:
+                _M._apply_market_conditions("optimize", {}, None, "SQM")
+            assert "--market-exit is equity-only" in str(e.value) or "emits no market-condition" in str(e.value)
+        finally:
+            _M._MARKET_EXIT_KINDS_SELECTED = ()
 
     def test_the_capband_driver_knows_the_strategy(self):
         spec = importlib.util.spec_from_file_location(

@@ -131,13 +131,6 @@ class TestTrialConfig:
         assert (s["tw_mom"], s["tw_d200"], s["fw_quality"], s["fw_piotroski"]) == (0.7, 0.3, 0.6, 0.4)
         assert s["mom_lookback_days"] == 126 and s["w_analyst"] == 0.8
 
-    def test_rerun_of_a_stored_row_decodes_the_same_trial(self):
-        a = self._cfg(dict(_RECIPE))
-        b = self._cfg(dict(_RECIPE))
-        a.pop("backtest_id")
-        b.pop("backtest_id")
-        assert a == b
-
 
 class TestLauncherFlag:
     def teardown_method(self):
@@ -401,3 +394,56 @@ class TestExportDropsDeadGenes:
                                        reconstruct_legacy_ruleset=None)["settings"]["expert_params"]
         assert shared == TestExport._export(raw)
         assert "tw_mom" not in shared and shared["w_technical"] == 0.0
+
+
+# ----------------------------------------------------------------------------- the TOP-N re-run goes through rerun_handler
+class TestRerunHandler:
+    @pytest.fixture(autouse=True, scope="class")
+    def _db(self):
+        from app.models.database import Base, engine
+        Base.metadata.create_all(bind=engine)
+
+    @staticmethod
+    def _rerun_settings(genes):
+        from datetime import datetime
+        from app.models.backtest import Backtest
+        from app.models.database import SessionLocal
+        from app.models.strategy import Strategy
+        from app.models.strategy_optimization import StrategyOptimization
+        from app.services.backtest.rerun_handler import rebuild_config_for_backtest
+        db = SessionLocal()
+        try:
+            strat = Strategy(name="dsfw-rr", entry_rules=[], exit_rules=[])
+            db.add(strat)
+            db.commit()
+            db.refresh(strat)
+            opt = StrategyOptimization(
+                strategy_id=strat.id, name="dsfw-rr-opt", fitness_metric="sharpe", optimization_type="genetic",
+                optimization_config={"backtest": {
+                    "backtest_id": 1, "name": "t", "start_date": "2024-01-01", "end_date": "2024-02-01",
+                    "enabled_instruments": ["AAPL"], "initial_capital": 10000.0, "warmup_days": 0, "seed": 42,
+                    "account_settings": {}, "experts": [{"class": "DeterministicScorer", "settings": {}}]}},
+                parameter_ranges={"model:tw_mom": {"type": "float"}}, all_results=[], best_params={},
+                best_fitness=1.0, status="completed")
+            db.add(opt)
+            db.commit()
+            db.refresh(opt)
+            bt = Backtest(name="TOP1-rr", expert_name="DeterministicScorer", engine_type="daily_expert",
+                          strategy_params=dict(genes), start_date=datetime(2024, 1, 1),
+                          end_date=datetime(2024, 2, 1), initial_capital=10_000.0, optimization_id=opt.id)
+            cfg = rebuild_config_for_backtest(bt, db)
+            return cfg["experts"][0]["settings"]
+        finally:
+            db.close()
+
+    def test_a_stored_recipe_row_reruns_with_the_genes(self):
+        s = self._rerun_settings(_RECIPE)
+        assert (s["tw_mom"], s["tw_d200"], s["fw_quality"], s["mom_lookback_days"]) == (0.7, 0.3, 0.6, 126)
+
+    def test_a_stored_zero_sum_row_reruns_on_the_canonical_genome_like_the_ga_trial(self):
+        raw = {**_RECIPE, "model:tw_mom": 0.0, "model:tw_d200": 0.0}
+        s = self._rerun_settings(raw)
+        assert s["w_technical"] == 0.0 and "tw_mom" not in s and "mom_lookback_days" not in s
+        ga = TestTrialConfig._cfg(raw)["experts"][0]["settings"]
+        assert {k: s[k] for k in s if k in ga} == {k: ga[k] for k in s if k in ga}
+        assert set(s) == set(ga)

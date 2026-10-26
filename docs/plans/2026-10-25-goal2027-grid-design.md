@@ -191,8 +191,10 @@ requires `dsfw` in `--name-suffix`; DeterministicScorer jobs only, refused for a
   `dsfw` the gene space leaves that measurement, so the clamp becomes the theoretical bound: confidence = 100 x
   tanh(raw / 0.6) x m with |raw| <= 1 and m <= 1, i.e. at most 93.1, floored to 93.0. It is a supremum, not a measured
   maximum.
-- **Parity.** The deploy payload carries the canonical `w_technical`/`w_fundamental` (what the backtest ran), not the
-  raw genome. A row whose optimization searched the genes but lost one is refused at export. Without the flag the gene
+- **Parity.** The deploy payload carries the canonical genome (what the backtest ran), not the raw one: a section with
+  no usable sub-weights exports `w_technical`/`w_fundamental` = 0 and the dead sub-genes are dropped. The function lives
+  in `ba2_common.core.ds_factor_genes` and `export.backtest_export` applies it, so the public site's export is
+  identical. This touched `ba2_common` (2026.10.00016; the minimum is raised because the GA decode now imports it). A row whose optimization searched the genes but lost one is refused at export. Without the flag the gene
   space, the run settings and the run names are byte-identical.
 
 **SQM ruleset** (`--strategy SQM`, DeterministicScorer only; also accepted by the capband driver and
@@ -291,8 +293,19 @@ The genes are ordinary rule genes (`cond:*:value`, `exit:*:enabled`), so the tri
 export and the deploy conversion need no new path. A test round-trips the S5 time exit through export and the live
 conversion.
 
-Open points: (1) the SQM cell takes no
-market-profile genes, so the market-gate dimensions of the other cells do not apply to it.
+Open points:
+1. The SQM cell takes no market-profile genes, so the market-gate dimensions of the other cells do not apply to it.
+2. **SQM stop authority.** At entry the ruleset stop and the RM safeguard stop coexist and the TIGHTER wins
+   (`reconcile_protective_stop`; `allow_ruleset_sl_loosen` does not apply there). The safeguard distance is
+   `max(risk_per_trade_pct, min_stop_loss_pct)` (3% to 15% over the RM genes), so under the default sizing genes the
+   -14..-6% stop gene is dead whenever that distance is smaller (e.g. exploration's own sizing, risk 10 / floor 7, made
+   its -12% stop an effective -10%). SQM jobs therefore pin `min_stop_loss_pct` = 15 and `risk_per_trade_pct` = 10 and
+   drop both genes, so the ruleset stop is always the tighter one. Side effect: under `risk_atr` sizing the position is
+   sized on the 15% safeguard distance.
+3. **Existing behaviour, unchanged:** a technical section whose usable components are missing for a symbol (for example
+   `tw_mom` is its only positive weight and the momentum lookback exceeds the symbol's history) has `total_w` 0 and
+   `technical_score` returns a literal 0.0 with no components, i.e. a silent neutral score that still carries
+   `w_technical`. `dsfw` does not change it.
 
 ## 3. Data preparation (January 2027)
 
