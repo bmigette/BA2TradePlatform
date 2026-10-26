@@ -40,6 +40,12 @@ MULTISTEP_MODELS = ['nbeats', 'tcn', 'transformer', 'tft']
 # These indicators have NaN between pivot points which can cause training issues
 SPARSE_INDICATOR_PATTERNS = ['zigzag', 'zigzag_direction']
 
+# Column-name fragments of indicators that are HINDSIGHT by construction and so can never be model
+# inputs: a ZigZag value sits on the pivot bar but the pivot is only known (and may still move)
+# until price has reversed by the deviation, bars later. They stay in the dataset for charts and as
+# the basis of the zigzag reversal TARGET (which is built from High/Low, not from this column).
+HINDSIGHT_FEATURE_PATTERNS = ('zigzag',)
+
 # Share of the old "test" block (everything after train_test_split) that becomes the untouched
 # holdout. The remainder is the validation block the GA selects on (fitness, threshold gene).
 HOLDOUT_SHARE_OF_TEST = 0.5
@@ -88,6 +94,10 @@ def select_feature_columns(
     if selected_target:
         excluded.add(selected_target)
     excluded.update(c for c in all_columns if c.startswith(LEGACY_TARGET_PREFIX))
+    excluded.update(
+        c for c in all_columns
+        if any(pattern in c.lower() for pattern in HINDSIGHT_FEATURE_PATTERNS)
+    )
     return [c for c in all_columns if c not in excluded]
 
 
@@ -254,6 +264,10 @@ def ffill_sparse_indicators(df: pd.DataFrame) -> pd.DataFrame:
     Forward-filling makes the data usable for ML while keeping the
     original sparse data in the dataset for chart visualization.
 
+    Forward-fill ONLY. These columns also used to be back-filled (``ffill().bfill()``), which
+    wrote the first pivot -- a value from the future -- into every leading row. Leading rows stay
+    NaN. (ZigZag is additionally excluded from model features, see HINDSIGHT_FEATURE_PATTERNS.)
+
     Args:
         df: DataFrame with indicator columns
 
@@ -268,8 +282,7 @@ def ffill_sparse_indicators(df: pd.DataFrame) -> pd.DataFrame:
         if any(pattern in col_lower for pattern in SPARSE_INDICATOR_PATTERNS):
             nan_count_before = df[col].isna().sum()
             if nan_count_before > 0:
-                # Forward-fill first, then backward-fill for leading NaNs
-                df[col] = df[col].ffill().bfill()
+                df[col] = df[col].ffill()
                 nan_count_after = df[col].isna().sum()
                 if nan_count_before != nan_count_after:
                     ffilled_cols.append(col)
@@ -1483,11 +1496,18 @@ def build_prediction_targets(
                         frame[col_name] = target_series
                         all_target_columns.append(col_name)
                         # rsi/macd/sar reversals only compare bar i against bar i-1 --
-                        # genuinely causal, horizon 0. zigzag reads zigzag.iloc[i+1] to
-                        # see the slope flip, so it looks one target-timeframe bar ahead.
-                        target_label_horizons[col_name] = (
-                            bars_per_target_bar if indicator == 'zigzag' else 0
-                        )
+                        # genuinely causal, horizon 0. A zigzag label is decided when the pivot
+                        # is CONFIRMED (price reversed by the deviation), arbitrarily many bars
+                        # after the pivot bar: purge by the worst-case confirmation lag.
+                        if indicator == 'zigzag':
+                            from app.services.indicators import IndicatorService
+                            deviation_pct = pt_config.get('deviation_pct') or pt_config.get('deviationPct')
+                            target_label_horizons[col_name] = (
+                                IndicatorService().zigzag_confirmation_lag(working_df, deviation_pct)
+                                * bars_per_target_bar
+                            )
+                        else:
+                            target_label_horizons[col_name] = 0
                         if target_column is None:
                             target_column = col_name
                         logger.info(f"Created trend reversal target: {col_name}, positives: {int(target_series.sum())}")

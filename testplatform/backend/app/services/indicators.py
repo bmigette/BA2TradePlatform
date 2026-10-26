@@ -427,15 +427,65 @@ class IndicatorService:
         if 'High' not in df.columns or 'Low' not in df.columns:
             raise ValueError("DataFrame must have 'High' and 'Low' columns")
 
-        high = df['High'].values
-        low = df['Low'].values
-        n = len(high)
-
+        n = len(df)
         if n < 2:
             return pd.Series(np.full(n, np.nan), index=df.index, name='zigzag')
 
         zigzag = np.full(n, np.nan)
+        pivots, _ = self._zigzag_pivots(df, deviation_pct)
+
+        # Fill zigzag array at pivot points
+        for idx, price, _ in pivots:
+            zigzag[idx] = price
+
+        # Interpolate between pivots for visualization
+        zigzag_interp = np.copy(zigzag)
+        for i in range(len(pivots) - 1):
+            start_idx, start_price, _ = pivots[i]
+            end_idx, end_price, _ = pivots[i + 1]
+
+            if end_idx > start_idx:
+                for j in range(start_idx, end_idx + 1):
+                    t = (j - start_idx) / (end_idx - start_idx)
+                    zigzag_interp[j] = start_price + t * (end_price - start_price)
+
+        return pd.Series(zigzag_interp, index=df.index, name=f'zigzag_{deviation_pct}')
+
+    def zigzag_confirmation_lag(self, df: pd.DataFrame, deviation_pct: float = 5.0) -> int:
+        """Largest number of bars a ZigZag label can depend on beyond its own bar.
+
+        A pivot is only known once price has reversed by ``deviation_pct`` from it, and until then
+        the pivot may still be extended to a later bar, so the zigzag value (and any reversal label
+        read from it) at bar ``i`` is decided at the confirmation bar of the pivot that owns ``i``.
+        That confirmation is arbitrarily far from the pivot bar (a long swing), so a fixed horizon
+        of one bar does not purge the train/test boundary. This returns the worst case over the
+        series: ``max(confirmation bar of pivot k - bar of pivot k-1)`` (>= 1).
+        """
+        if 'High' not in df.columns or 'Low' not in df.columns:
+            raise ValueError("DataFrame must have 'High' and 'Low' columns")
+        if len(df) < 2:
+            return 1
+        pivots, confirmed = self._zigzag_pivots(df, deviation_pct)
+        lag = 1
+        previous_pivot_idx = 0
+        for (idx, _, _), confirmed_at in zip(pivots, confirmed):
+            if confirmed_at is None:      # trailing, still-open pivot
+                break
+            lag = max(lag, confirmed_at - previous_pivot_idx)
+            previous_pivot_idx = idx
+        return int(lag)
+
+    def _zigzag_pivots(self, df: pd.DataFrame, deviation_pct: float):
+        """ZigZag pivot scan: ([(idx, price, 'high'|'low')], [bar at which each pivot was confirmed]).
+
+        The confirmation entry of the last pivot is None (it is still open).
+        """
+        high = df['High'].values
+        low = df['Low'].values
+        n = len(high)
+
         pivots = []  # List of (index, price, type) where type is 'high' or 'low'
+        confirmed = []  # confirmed[k] = bar at which pivot k stopped being extendable
 
         deviation = deviation_pct / 100.0
 
@@ -472,6 +522,7 @@ class IndicatorService:
             last_pivot_idx = 0
             last_pivot_price = high[0]
             pivots.append((0, high[0], 'high'))
+        confirmed.append(None)
 
         # Scan for pivots
         for i in range(1, n):
@@ -480,6 +531,8 @@ class IndicatorService:
                 if low[i] < last_pivot_price * (1 - deviation):
                     # Found significant low
                     pivots.append((i, low[i], 'low'))
+                    confirmed[-1] = i
+                    confirmed.append(None)
                     last_pivot_type = 'low'
                     last_pivot_idx = i
                     last_pivot_price = low[i]
@@ -493,6 +546,8 @@ class IndicatorService:
                 if high[i] > last_pivot_price * (1 + deviation):
                     # Found significant high
                     pivots.append((i, high[i], 'high'))
+                    confirmed[-1] = i
+                    confirmed.append(None)
                     last_pivot_type = 'high'
                     last_pivot_idx = i
                     last_pivot_price = high[i]
@@ -502,22 +557,7 @@ class IndicatorService:
                     last_pivot_idx = i
                     last_pivot_price = low[i]
 
-        # Fill zigzag array at pivot points
-        for idx, price, _ in pivots:
-            zigzag[idx] = price
-
-        # Interpolate between pivots for visualization
-        zigzag_interp = np.copy(zigzag)
-        for i in range(len(pivots) - 1):
-            start_idx, start_price, _ = pivots[i]
-            end_idx, end_price, _ = pivots[i + 1]
-
-            if end_idx > start_idx:
-                for j in range(start_idx, end_idx + 1):
-                    t = (j - start_idx) / (end_idx - start_idx)
-                    zigzag_interp[j] = start_price + t * (end_price - start_price)
-
-        return pd.Series(zigzag_interp, index=df.index, name=f'zigzag_{deviation_pct}')
+        return pivots, confirmed
 
     def calculate_donchian(
         self,

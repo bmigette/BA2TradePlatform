@@ -523,3 +523,53 @@ class TestMacroReleaseLag:
         svc = self._service(monkeypatch, {'yield_2y': y2, 'yield_10y': y10})
         out = svc.create_yield_curve_features(self._rows(['2024-03-05', '2024-03-06']))
         assert out['yield_2y'].tolist() == [4.0, 4.5]       # 03-05 row only knows the 03-04 close
+
+
+# ---------------------------------------------------------------------------------------
+# #7  zigzag: pivot placed on the pivot bar (confirmed later), ffill().bfill() in the feature path
+# ---------------------------------------------------------------------------------------
+class TestZigzagHindsight:
+    @staticmethod
+    def _swing_frame():
+        # 100 -> 110 over 10 bars, then a slow slide to 98 over 30 bars (the 110 pivot is only
+        # confirmed once price is 5% lower, ~12 bars after the top), then back up
+        up = np.linspace(100, 110, 11)
+        down = np.linspace(110, 98, 31)[1:]
+        up2 = np.linspace(98, 112, 15)[1:]
+        close = np.concatenate([up, down, up2])
+        return pd.DataFrame({
+            'Date': pd.date_range('2024-01-01', periods=len(close), freq='D'),
+            'Open': close, 'High': close + 0.2, 'Low': close - 0.2, 'Close': close, 'Volume': 1000.0,
+        })
+
+    def test_zigzag_columns_are_never_model_features(self):
+        from app.services.job_handler import select_feature_columns
+        cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'RSI_14', 'zigzag_5.0',
+                'zigzag_direction', 'ZigZag_3', 'direction_up_5bar']
+        assert select_feature_columns(cols, target_columns=['direction_up_5bar']) == ['RSI_14']
+
+    def test_sparse_fill_does_not_write_the_first_pivot_into_leading_rows(self):
+        from app.services.job_handler import ffill_sparse_indicators
+        df = pd.DataFrame({'Close': np.arange(8.0),
+                           'zigzag_5.0': [np.nan, np.nan, np.nan, 7.0, np.nan, np.nan, 9.0, np.nan]})
+        out = ffill_sparse_indicators(df)
+        assert out['zigzag_5.0'].iloc[:3].isna().all()               # was back-filled with 7.0
+        assert out['zigzag_5.0'].iloc[3:].tolist() == [7.0, 7.0, 7.0, 9.0, 9.0]
+
+    def test_confirmation_lag_reflects_the_swing_length_not_one_bar(self):
+        from app.services.indicators import IndicatorService
+        lag = IndicatorService().zigzag_confirmation_lag(self._swing_frame(), 5.0)
+        assert lag >= 10
+
+    def test_zigzag_target_purge_horizon_is_the_confirmation_lag(self):
+        from app.services.job_handler import build_prediction_targets
+        from app.services.indicators import IndicatorService
+        frame = self._swing_frame()
+        _, col, _, horizons = build_prediction_targets(
+            frame.copy(),
+            [{'type': 'trend_reversal', 'indicator': 'zigzag', 'direction': 'bullish',
+              'indicatorParams': {'deviation_pct': 5.0}}],
+            'daily'
+        )
+        assert horizons[col] == IndicatorService().zigzag_confirmation_lag(frame, 5.0)
+        assert horizons[col] > 1
