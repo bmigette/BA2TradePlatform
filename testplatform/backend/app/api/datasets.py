@@ -2606,9 +2606,9 @@ def calculate_multi_timeframe_indicators(
                 ohlcv_cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
                 indicator_cols = [col for col in tf_df_with_indicators.columns if col not in ohlcv_cols]
 
-                # Store indicator data with dates
+                # Store indicator data with dates (and the timeframe it was computed on)
                 for col in indicator_cols:
-                    all_indicators[col] = tf_df_with_indicators[['Date', col]].copy()
+                    all_indicators[col] = (tf, tf_df_with_indicators[['Date', col]].copy())
 
                 logger.info(f"Calculated {len(indicator_cols)} indicators for timeframe {tf}")
 
@@ -2616,21 +2616,21 @@ def calculate_multi_timeframe_indicators(
                 logger.warning(f"Failed to calculate indicators for timeframe {tf}: {e}")
                 continue
 
-        # Merge indicators into main dataset
+        # Merge indicators into main dataset. Each higher-timeframe value is joined only once its
+        # bar has ENDED (bar start + timeframe): reindex(method='ffill') on the bar START gave the
+        # 10:00 hourly bar's close-based value to the 10:00 / 10:15 / 10:30 rows.
+        if not dataset.timeframe:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Dataset has no timeframe; cannot align higher-timeframe indicators without look-ahead"
+            )
         result_df = df.copy()
 
-        for ind_name, ind_df in all_indicators.items():
-            # Merge on Date using forward fill for different timeframe resolutions
-            ind_df = ind_df.rename(columns={ind_name: ind_name})
-            ind_df = ind_df.set_index('Date')
-
-            # Resample to match main dataset timeframe and forward fill
-            result_df = result_df.set_index('Date') if 'Date' not in result_df.index.names else result_df
-
-            # Align indicator data to main dataset dates
-            aligned_indicator = ind_df.reindex(result_df.index, method='ffill')
-            result_df[ind_name] = aligned_indicator[ind_name]
-            result_df = result_df.reset_index()
+        for ind_name, (ind_tf, ind_df) in all_indicators.items():
+            result_df = align_higher_timeframe_features_to_lower(
+                result_df, ind_df, [ind_name],
+                higher_timeframe=ind_tf, lower_timeframe=dataset.timeframe
+            )
 
         # Save updated dataset
         result_df.to_csv(file_path, index=False)

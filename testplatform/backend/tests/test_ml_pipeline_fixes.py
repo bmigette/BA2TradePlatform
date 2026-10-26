@@ -320,3 +320,60 @@ class TestLabelHistoryLag:
             label_horizon=3, progress_base=0, progress_range=1, timeframe='daily'
         )
         assert res['status'] == 'failed' and 'cannot be trained on this target' in res['error']
+
+
+# ---------------------------------------------------------------------------------------
+# #2  higher-timeframe features were joined on the higher bar START (leaks the rest of the bar)
+# ---------------------------------------------------------------------------------------
+class TestMultiTimeframeNoLookahead:
+    def _frames(self):
+        lower = pd.DataFrame({'Date': pd.date_range('2024-01-02 09:00', periods=12, freq='15min'),
+                              'Close': np.arange(12.0)})
+        # hourly bars 09:00 and 10:00; their indicator value is 100 and 200
+        higher = pd.DataFrame({'Date': pd.to_datetime(['2024-01-02 09:00', '2024-01-02 10:00']),
+                               'IND': [100.0, 200.0]})
+        return lower, higher
+
+    def test_higher_bar_is_visible_only_after_it_ended(self):
+        from app.services.indicators import align_higher_timeframe_features_to_lower
+        lower, higher = self._frames()
+        out = align_higher_timeframe_features_to_lower(lower, higher, ['IND'], '1h', '15m')
+        by_time = dict(zip(out['Date'].dt.strftime('%H:%M'), out['IND']))
+        # the 09:00 hourly bar ends 10:00 -> first visible on the 15m row 09:45 (which ends 10:00)
+        assert all(np.isnan(by_time[t]) for t in ('09:00', '09:15', '09:30'))
+        assert by_time['09:45'] == 100.0 and by_time['10:00'] == 100.0 and by_time['10:30'] == 100.0
+        # the 10:00 hourly bar ends 11:00 -> first visible on the row 10:45
+        assert by_time['10:45'] == 200.0 and by_time['11:30'] == 200.0
+
+    def test_old_start_keyed_alignment_leaked(self):
+        # documents the defect the new function fixes: keyed on the bar START the 09:00 hourly value
+        # (known at 10:00) is already on the 09:00 row
+        from app.services.indicators import align_higher_timeframe_to_lower
+        lower, higher = self._frames()
+        out = align_higher_timeframe_to_lower(lower, higher, ['IND'])
+        assert out.loc[out['Date'] == '2024-01-02 09:00', 'IND'].iloc[0] == 100.0
+
+    def test_indicator_service_multi_timeframe_does_not_use_the_unfinished_bar(self):
+        from app.services.indicators import IndicatorService
+        n = 120
+        dates = pd.date_range('2024-01-02 09:00', periods=n, freq='15min')
+        close = 100 + np.cumsum(np.random.RandomState(3).randn(n))
+        df = pd.DataFrame({'Date': dates, 'Open': close, 'High': close + 1, 'Low': close - 1,
+                           'Close': close, 'Volume': np.full(n, 1000.0)})
+        res = IndicatorService().calculate_indicators_multi_timeframe(
+            df, [{'type': 'rsi', 'period': 5}], '1h', source_timeframe='15m'
+        )
+        series = res['rsi_5_1h']
+        # changing the LAST 15m bar of an hour must not change that hour's value on any earlier row
+        df2 = df.copy()
+        df2.loc[df2['Date'] == '2024-01-02 10:45', 'Close'] += 50
+        res2 = IndicatorService().calculate_indicators_multi_timeframe(
+            df2, [{'type': 'rsi', 'period': 5}], '1h', source_timeframe='15m'
+        )['rsi_5_1h']
+        before = df['Date'] < '2024-01-02 10:45'
+        pd.testing.assert_series_equal(series[before], res2[before])
+
+    def test_unknown_timeframe_is_refused(self):
+        from app.services.indicators import timeframe_delta
+        with pytest.raises(ValueError):
+            timeframe_delta('3h')

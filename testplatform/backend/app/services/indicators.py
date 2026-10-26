@@ -30,6 +30,24 @@ TIMEFRAME_RESAMPLE_MAP = {
     'W1': '1W',
 }
 
+# Length of one bar per timeframe. Used to turn a bar's START timestamp into its END, the instant at
+# which the bar's OHLC (and any indicator computed on it) is actually known.
+TIMEFRAME_DELTA = {
+    '1m': pd.Timedelta(minutes=1),
+    '5m': pd.Timedelta(minutes=5),
+    '15m': pd.Timedelta(minutes=15),
+    '30m': pd.Timedelta(minutes=30),
+    '1h': pd.Timedelta(hours=1),
+    '2h': pd.Timedelta(hours=2),
+    '4h': pd.Timedelta(hours=4),
+    '1d': pd.Timedelta(days=1),
+    'D1': pd.Timedelta(days=1),
+    'daily': pd.Timedelta(days=1),
+    '1w': pd.Timedelta(days=7),
+    'W1': pd.Timedelta(days=7),
+    'weekly': pd.Timedelta(days=7),
+}
+
 # Timeframe order for comparison (lower index = higher frequency)
 TIMEFRAME_ORDER = ['1m', '5m', '15m', '30m', '1h', '2h', '4h', '1d', 'D1', '1w', 'W1']
 
@@ -138,6 +156,65 @@ def align_higher_timeframe_to_lower(
     )
 
     return result
+
+
+def timeframe_delta(timeframe: str) -> pd.Timedelta:
+    """Length of one bar of ``timeframe``; unknown timeframes are an error, never guessed."""
+    if timeframe not in TIMEFRAME_DELTA:
+        raise ValueError(f"Unknown timeframe {timeframe!r}. Supported: {list(TIMEFRAME_DELTA)}")
+    return TIMEFRAME_DELTA[timeframe]
+
+
+def align_higher_timeframe_features_to_lower(
+    lower_tf_df: pd.DataFrame,
+    higher_tf_data: pd.DataFrame,
+    value_columns: list,
+    higher_timeframe: str,
+    lower_timeframe: str
+) -> pd.DataFrame:
+    """Join higher-timeframe FEATURE values onto lower-timeframe rows without look-ahead.
+
+    A row of ``lower_tf_df`` is a snapshot at the END of its bar (its Date is the bar START), so a
+    higher-timeframe value may only be used once the higher bar has ENDED: the higher bar is keyed
+    by ``start + higher_timeframe`` and joined to the latest lower row whose own end is at or after
+    that. ``align_higher_timeframe_to_lower`` (and the old ``reindex(method='ffill')``) key the
+    higher bar by its START, so the 10:00 hourly bar's close/indicator -- known only at 11:00 --
+    appeared on the 10:00, 10:15 and 10:30 rows of a 15m dataset.
+
+    Both frames carry a Date column holding BAR START timestamps. Lower rows before the first
+    completed higher bar get NaN (no back-fill).
+
+    Args:
+        lower_tf_df: Lower timeframe DataFrame with Date column (bar start)
+        higher_tf_data: Higher timeframe DataFrame with Date column (bar start) and value columns
+        value_columns: Columns of ``higher_tf_data`` to join
+        higher_timeframe: Timeframe of ``higher_tf_data`` (e.g. '1h')
+        lower_timeframe: Timeframe of ``lower_tf_df`` (e.g. '15m')
+
+    Returns:
+        ``lower_tf_df`` (sorted by Date, index reset) plus the value columns.
+    """
+    result = lower_tf_df.copy()
+    result['Date'] = pd.to_datetime(result['Date'])
+    result = result.sort_values('Date').reset_index(drop=True)
+
+    higher = higher_tf_data.copy()
+    higher['Date'] = pd.to_datetime(higher['Date'])
+    higher = higher.sort_values('Date').reset_index(drop=True)
+
+    key = '_available_at'
+    if key in result.columns:
+        raise ValueError(f"lower_tf_df must not contain a column named {key!r}")
+    result[key] = result['Date'] + timeframe_delta(lower_timeframe)
+    higher[key] = higher['Date'] + timeframe_delta(higher_timeframe)
+
+    merged = pd.merge_asof(
+        result,
+        higher[[key] + list(value_columns)],
+        on=key,
+        direction='backward'
+    )
+    return merged.drop(columns=[key])
 
 
 class IndicatorService:
@@ -877,11 +954,16 @@ class IndicatorService:
         for name, series in indicator_results.items():
             indicator_df[name] = series.values
 
-        # Align back to original timeframe
-        aligned_df = align_higher_timeframe_to_lower(
+        # Align back to original timeframe. These are FEATURES (chart/indicator values), so a higher
+        # bar only becomes visible once it has ended.
+        if source_timeframe is None:
+            raise ValueError("source_timeframe is required to align a higher-timeframe indicator without look-ahead")
+        aligned_df = align_higher_timeframe_features_to_lower(
             df,
             indicator_df,
-            list(indicator_results.keys())
+            list(indicator_results.keys()),
+            higher_timeframe=target_timeframe,
+            lower_timeframe=source_timeframe
         )
 
         # Extract aligned results as series
