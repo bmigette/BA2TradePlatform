@@ -610,6 +610,30 @@ class FundamentalsService:
         return result_df
 
     @staticmethod
+    def add_live_snapshot_columns(
+        df: pd.DataFrame, ticker: str, fundamentals_config: Dict[str, Any]
+    ) -> pd.DataFrame:
+        """Optionally broadcast TODAY's ``yf.Ticker.info`` snapshot onto every row (LIVE-ONLY).
+
+        Off unless ``fundamentals_config['live_only_snapshot']`` is True. The snapshot is today's
+        trailing P/E, margins, market cap, ... copied to rows years in the past, so a historical
+        training set that includes it hands every row the future (a company that later grew has
+        "high revenue" in 2019). It is only meaningful on a frame that ENDS today and is never
+        used for backtests or training; the columns are named ``live_snapshot_*`` so they can
+        not be mistaken for point-in-time ``fundamental_*`` history.
+        """
+        if 'live_only_snapshot' not in fundamentals_config or fundamentals_config['live_only_snapshot'] is not True:
+            logger.info("Skipping today's fundamentals snapshot (not point-in-time; live_only_snapshot is off)")
+            return df
+        df = df.copy()
+        fundamentals = FundamentalsService.get_fundamental_data(ticker)
+        if fundamentals and fundamentals.get('current'):
+            for key, value in fundamentals['current'].items():
+                if value is not None:
+                    df[f'live_snapshot_{key}'] = value
+        return df
+
+    @staticmethod
     def statement_available_date(period: Dict[str, Any]) -> pd.Timestamp:
         """The instant a statement period became PUBLIC (tz-naive), never its fiscal period end.
 

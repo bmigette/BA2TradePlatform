@@ -377,11 +377,7 @@ def _build_dataset_in_background(dataset_id: int, dataset_config: dict):
                         providers=providers, frequency='quarterly'
                     )
                 else:
-                    fundamentals = FundamentalsService.get_fundamental_data(ticker)
-                    if fundamentals and fundamentals.get('current'):
-                        for key, value in fundamentals['current'].items():
-                            if value is not None:
-                                df[f'fundamental_{key}'] = value
+                    df = FundamentalsService.add_live_snapshot_columns(df, ticker, fundamentals_config)
 
                 # Macro indicators
                 macro_indicators = fundamentals_config.get('macro_indicators', [])
@@ -667,13 +663,8 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
                         )
                         logger.info(f"[Thread] Added statement features for: {statement_types}")
 
-                    # Also get current fundamentals
-                    fundamentals = FundamentalsService.get_fundamental_data(ticker)
-                    if fundamentals and fundamentals.get('current'):
-                        current = fundamentals['current']
-                        for key, value in current.items():
-                            if value is not None:
-                                df[f'fundamental_{key}'] = value
+                    # Today's snapshot is NOT point-in-time: only added when explicitly opted in
+                    df = FundamentalsService.add_live_snapshot_columns(df, ticker, fundamentals_config)
 
                 # Fetch macro indicators if configured and regenerate_macro is True
                 macro_indicators = fundamentals_config.get('macro_indicators', [])

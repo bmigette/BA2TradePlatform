@@ -432,3 +432,32 @@ class TestFundamentalsPointInTime:
         assert out['bs_total_assets'].iloc[0] == pytest.approx(133.1)
         assert out['bs_total_assets_qoq_change'].iloc[0] == pytest.approx(0.1)
         assert out['bs_total_assets_yoy_change'].iloc[0] != out['bs_total_assets_yoy_change'].iloc[0]   # NaN: <4 prior quarters
+
+
+# ---------------------------------------------------------------------------------------
+# #5  today's yf.Ticker.info snapshot was broadcast to every historical row
+# ---------------------------------------------------------------------------------------
+class TestNoSnapshotBroadcast:
+    def test_snapshot_is_off_by_default(self, monkeypatch):
+        from app.services.fundamentals import FundamentalsService
+        monkeypatch.setattr(FundamentalsService, 'get_fundamental_data',
+                            staticmethod(lambda t: {'current': {'trailing_pe': 31.0}}))
+        df = pd.DataFrame({'Date': pd.date_range('2019-01-01', periods=3), 'Close': 1.0})
+        out = FundamentalsService.add_live_snapshot_columns(df, 'AAPL', {'enabled': True})
+        assert list(out.columns) == ['Date', 'Close']
+
+    def test_snapshot_needs_an_explicit_live_only_opt_in(self, monkeypatch):
+        from app.services.fundamentals import FundamentalsService
+        monkeypatch.setattr(FundamentalsService, 'get_fundamental_data',
+                            staticmethod(lambda t: {'current': {'trailing_pe': 31.0}}))
+        df = pd.DataFrame({'Date': pd.date_range('2019-01-01', periods=3), 'Close': 1.0})
+        out = FundamentalsService.add_live_snapshot_columns(df, 'AAPL', {'live_only_snapshot': True})
+        assert 'live_snapshot_trailing_pe' in out.columns and not any(c.startswith('fundamental_') for c in out.columns)
+
+    def test_generation_paths_no_longer_write_fundamental_columns(self):
+        import inspect
+        from app.api import datasets as datasets_api
+        from app.services import dataset_handler
+        for module in (datasets_api, dataset_handler):
+            src = inspect.getsource(module)
+            assert "df[f'fundamental_{key}']" not in src, module.__name__
