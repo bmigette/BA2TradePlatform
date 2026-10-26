@@ -288,12 +288,17 @@ def test_model_output_problems_are_contract_errors_not_input_errors():
     for make in (lambda c, x, y, n, s: [flat_paths(n)[:, :10]],                 # wrong horizon
                  lambda c, x, y, n, s: [flat_paths(n + 1)],                      # wrong path count
                  lambda c, x, y, n, s: [np.where(np.arange(T)[None, :, None] == 3, np.nan, flat_paths(n))],
-                 lambda c, x, y, n, s: [np.where(np.arange(T)[None, :, None] == 3, -1.0, flat_paths(n))],
                  lambda c, x, y, n, s: []):                                      # wrong item count
         ad = K.KronosAdapter(K.kronos_card("small", 4), make, 4)
         with pytest.raises(ValueError) as e:
             ad.forecast_batch(item)
         assert not isinstance(e.value, InputDataError)
+    # every path non-positive: an unusable FORECAST of this symbol-session, refused as a counted, named invalid row
+    # (an InputDataError subclass the builder isolates), not a broken contract that aborts the whole build
+    ad = K.KronosAdapter(K.kronos_card("small", 4),
+                         lambda c, x, y, n, s: [np.where(np.arange(T)[None, :, None] == 3, -1.0, flat_paths(n))], 4)
+    with pytest.raises(K.SampledPathsRejected, match="only 0/4"):
+        ad.forecast_batch(item)
 
 
 def test_a_glitch_path_with_a_non_positive_price_is_dropped_not_fatal():

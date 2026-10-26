@@ -82,6 +82,11 @@ CLIP = 5.0
 ADAPTER_REVISION = 1
 #: At least this share of the sampled paths must be valid (positive prices) or the forecast is refused.
 MIN_VALID_SHARE = 0.75
+
+
+class SampledPathsRejected(InputDataError):
+    """Too few valid sampled paths for one (symbol, session): the forecast is refused, counted and named by the
+    builder like an unusable context (first seen: MU 2026-06-18, 47/64 valid, kronos-small)."""
 KRONOS_ENV = "BA2_KRONOS_SRC"
 
 #: sample_fn(contexts, x_dates, y_dates, n_paths, seeds) -> one array (n_paths, pred_len, 4) of sampled OHLC PRICES
@@ -247,7 +252,9 @@ class KronosAdapter:
                 raise ValueError(f"{sym} {sess}: sampled paths hold non-finite prices")
             valid = (p > 0).all(axis=(1, 2))
             if valid.sum() < MIN_VALID_SHARE * self.n_paths:
-                raise ValueError(f"{sym} {sess}: only {int(valid.sum())}/{self.n_paths} sampled paths hold "
+                # an unusable FORECAST of one symbol-session (not a broken contract): the builder isolates, counts
+                # and names it as invalid (--max-invalid-share decides the exit code); no row is written for it
+                raise SampledPathsRejected(f"{sym} {sess}: only {int(valid.sum())}/{self.n_paths} sampled paths hold "
                                  f"positive prices only (need {MIN_VALID_SHARE:.0%})")
             if not valid.all():
                 self.rejected_paths += int((~valid).sum())

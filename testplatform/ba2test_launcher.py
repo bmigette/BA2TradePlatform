@@ -6335,6 +6335,25 @@ def _resolve_search_exploration_ranges(raw, command: str, expert: "str | None" =
     return True
 
 
+def _apply_ml_model_keys(spec: dict, raw, expert: str, command: str) -> dict:
+    """``--ml-model-keys a,b``: replace MLForecast's ``model_key`` gene choices with these store aliases/keys for this
+    job only (e.g. a single-store GA, or a control store: naive / placebo). Flag-off returns ``spec`` untouched. Any
+    other expert is refused (the flag would change nothing). The aliases are NOT checked against the cache here: an
+    unknown one fails the first trial loudly (MLForecast.resolve_model_key)."""
+    if not raw:
+        return spec
+    if expert != "MLForecast":
+        sys.exit(f"{command}: --ml-model-keys only applies to MLForecast, not {expert!r}")
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    if not keys or len(set(keys)) != len(keys):
+        sys.exit(f"{command}: --ml-model-keys needs distinct, non-empty store aliases, got {raw!r}")
+    import copy
+    out = copy.deepcopy(spec)
+    out["expert_params"]["model_key"] = {"optimize": True, "type": "choice", "choices": keys}
+    print(f"{command}: --ml-model-keys: MLForecast model_key gene choices = {keys}")
+    return out
+
+
 def _refuse_exploration_ranges_unsupported(command: str, expert: str, kind: str) -> None:
     """The flag is defined per (expert, strategy); any other pair would be given a name token and a changed identity
     for a gene space that is the same, so it is refused instead of silently inert."""
@@ -7434,6 +7453,7 @@ def _cmd_optimize(args) -> int:
     spec = _EXPERT_OPT.get(expert)
     if spec is None:
         sys.exit(f"ba2-test: optimize not configured for expert {expert!r}; have {sorted(_EXPERT_OPT)}")
+    spec = _apply_ml_model_keys(spec, getattr(args, "ml_model_keys", None), expert, "optimize")
     _refuse_unbounded_strategy_request("optimize", [args.strategy])
     _refuse_phase_gated_strategy("optimize", [args.strategy])
     # --rm-toggle-policy (design atr_grid_2027 §3.2). "pinned" (default) is byte-identical to
@@ -9423,6 +9443,10 @@ def main(argv: "list | None" = None) -> int:
                          "runs before entry. Sessions that lack a scheduled time (15:30 on a 13:00 half "
                          "day) get no decision; they are counted and logged.")
     op.add_argument("--name", default=None)
+    op.add_argument("--ml-model-keys", default=None, metavar="ALIAS,ALIAS",
+                    help="MLForecast only: the forecast stores (aliases or 16-hex keys) the model_key gene chooses "
+                         "among for this job, replacing _EXPERT_OPT's list (e.g. one store, or a naive/placebo "
+                         "control store). Omit: the spec's list.")
     op.add_argument("--rerun", action="store_true",
                     help="Run even if an optimization with this --name has already "
                          "COMPLETED. Without it the run is skipped (exit 0) and the "
