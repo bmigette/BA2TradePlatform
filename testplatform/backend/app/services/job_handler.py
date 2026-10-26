@@ -5,10 +5,13 @@ Background task handler for ML model training jobs.
 Uses real ML services instead of simulation.
 """
 
+import json
 import logging
 import pandas as pd
 import numpy as np
 import os
+import random
+import zlib
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
@@ -174,6 +177,35 @@ def training_label_counts(labels: pd.Series, target_column: str, loss_function: 
             f"{unexpected[:5]}; use the 'mse' loss for regression targets"
         )
     return int((values == 1).sum()), int((values == 0).sum())
+
+
+def stable_job_seed(task_id: str) -> int:
+    """Deterministic seed derived from the task id (crc32): the same job id always reseeds the same way."""
+    return zlib.crc32(task_id.encode('utf-8')) & 0x7FFFFFFF
+
+
+def genome_seed(job_seed: int, params: Dict[str, Any]) -> int:
+    """Seed for ONE GA individual, a function of the job seed and its genes only (not of the order in
+    which the population happens to be evaluated)."""
+    payload = json.dumps(params, sort_keys=True, default=str).encode('utf-8')
+    return (job_seed + zlib.crc32(payload)) & 0x7FFFFFFF
+
+
+def seed_everything(seed: int, include_python_random: bool = True) -> None:
+    """Seed numpy, torch (CPU and CUDA) and, optionally, Python's ``random`` (used by DEAP).
+
+    Re-seeding ``random`` inside every fitness evaluation would restart the GA's own stream each
+    individual, so per-individual seeding leaves it out.
+    """
+    if include_python_random:
+        random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+    except ImportError:
+        return
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def _n_points(series: Any) -> int:
@@ -825,7 +857,8 @@ def save_generation_model(
     training_history: Optional[List[Dict[str, Any]]] = None,
     feature_columns: Optional[List[str]] = None,
     symbols: Optional[List[str]] = None,
-    dataset_ids: Optional[List[int]] = None
+    dataset_ids: Optional[List[int]] = None,
+    normalization_params: Optional[Dict[str, Any]] = None
 ) -> Optional[str]:
     """
     Save a model from a generation.
@@ -851,12 +884,13 @@ def save_generation_model(
         model_filename = f"gen{generation:03d}_ind{individual:03d}_{model_type}_f{fitness:.4f}"
         full_path = models_dir / f"{model_filename}.pt"
 
-        # Get normalization params from training service if available
-        normalization_params = None
-        if hasattr(training_service, 'get_normalization_params'):
-            normalization_params = training_service.get_normalization_params()
-        elif hasattr(training_service, 'data_prep') and training_service.data_prep:
-            normalization_params = training_service.data_prep.export_params()
+        # Normalization params: the caller's (the scalers of THIS model's own series) win; the
+        # service's current ones are only right if nothing else was prepared since.
+        if normalization_params is None:
+            if hasattr(training_service, 'get_normalization_params'):
+                normalization_params = training_service.get_normalization_params()
+            elif hasattr(training_service, 'data_prep') and training_service.data_prep:
+                normalization_params = training_service.data_prep.export_params()
 
         metadata = {
             'task_id': task_id,
@@ -1785,6 +1819,13 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
         train_start_date = training_date_range.get('startDate') if training_date_range else None
         train_end_date = training_date_range.get('endDate') if training_date_range else None
 
+        # Reproducibility: the job seed is the payload's `seed`, else derived from the task id; it is
+        # logged and returned with the result. (Nothing was seeded before, so a re-run of the same
+        # job gave different models and the GA could not be compared run to run.)
+        job_seed = int(payload['seed']) if 'seed' in payload and payload['seed'] is not None else stable_job_seed(task_id)
+        seed_everything(job_seed)
+        logger.info(f"Job seed: {job_seed}")
+
         # Load datasets. One frame per dataset (= per ticker) is kept SEPARATE through target
         # construction and the chronological splits; they are only concatenated for saving and
         # reporting. Interleaving tickers on a date-sorted frame and then taking shift(-h) or a
@@ -1975,6 +2016,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
             target_stats = combined_df[target_column].value_counts().to_dict()
             return {
                 'status': 'dry_run_success',
+                'seed': job_seed,
                 'job_type': job_type,
                 'dataset_rows': len(combined_df),
                 'train_rows': len(train_df),
@@ -2002,6 +2044,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                     frames=frames,
                     train_ratio=train_ratio,
                     holdout_share_of_test=HOLDOUT_SHARE_OF_TEST,
+                    seed=job_seed,
                     target_column=target_column,
                     feature_columns=feature_columns,
                     parameter_ranges=parameter_ranges,
@@ -2036,6 +2079,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                     frames=frames,
                     train_ratio=train_ratio,
                     holdout_share_of_test=HOLDOUT_SHARE_OF_TEST,
+                    seed=job_seed,
                     target_column=target_column,
                     feature_columns=feature_columns,
                     parameter_ranges=parameter_ranges,
@@ -2129,6 +2173,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
 
             return {
                 'status': 'completed',
+                'seed': job_seed,
                 'models_trained': len(successful_results),
                 'total_models': total_models,
                 'results': results,
@@ -2529,6 +2574,7 @@ def train_classification_optimization(
     frames: List[pd.DataFrame],
     train_ratio: float,
     holdout_share_of_test: float,
+    seed: int,
     target_column: str,
     feature_columns: List[str],
     parameter_ranges: Dict[str, Any],
@@ -2737,6 +2783,9 @@ def train_classification_optimization(
         """Evaluate model with given parameters."""
         if progress_state['cancelled'] or check_cancelled():
             raise InterruptedError("Task cancelled")
+
+        # Same genes -> same initial weights / batch order, whatever the evaluation order
+        seed_everything(genome_seed(seed, params), include_python_random=False)
 
         progress_state['current_individual'] += 1
         gen = progress_state['current_generation']
@@ -3142,6 +3191,7 @@ def train_unified_optimization(
     frames: List[pd.DataFrame],
     train_ratio: float,
     holdout_share_of_test: float,
+    seed: int,
     target_column: str,
     feature_columns: List[str],
     parameter_ranges: Dict[str, Any],
@@ -3212,6 +3262,7 @@ def train_unified_optimization(
             label_horizon=label_horizon + max(0, prediction_horizon)
         )
         rnn_scalers = list(training_service.scalers)
+        rnn_scaler_params = training_service.describe_scalers(rnn_scalers, list(training_service.cov_scalers))
         logger.info(
             f"RNN data prepared: train={_n_points(rnn_split['train_series'])}, "
             f"validation={_n_points(rnn_split['val_series'])}, holdout={_n_points(rnn_split['holdout_series'])} "
@@ -3229,6 +3280,7 @@ def train_unified_optimization(
             label_horizon=label_horizon
         )
         ms_scalers = list(training_service.scalers)
+        ms_scaler_params = training_service.describe_scalers(ms_scalers, list(training_service.cov_scalers))
         logger.info(
             f"Multi-step data prepared: train={_n_points(ms_split['train_series'])}, "
             f"validation={_n_points(ms_split['val_series'])}, holdout={_n_points(ms_split['holdout_series'])} "
@@ -3247,6 +3299,7 @@ def train_unified_optimization(
                 'test_covariates': rnn_split['val_covariates'],
                 'holdout_covariates': rnn_split['holdout_covariates'],
                 'scalers': rnn_scalers,
+                'scaler_params': rnn_scaler_params,
                 'target_column': rnn_target_column,
                 'output_chunk_length': 1,
                 # The series IS the label shifted by prediction_horizon: its value at u is only
@@ -3261,6 +3314,7 @@ def train_unified_optimization(
                 'test_covariates': ms_split['val_covariates'],
                 'holdout_covariates': ms_split['holdout_covariates'],
                 'scalers': ms_scalers,
+                'scaler_params': ms_scaler_params,
                 'target_column': target_column,
                 # output_chunk_length must be >= 1; when prediction_horizon=0,
                 # target already has built-in look-ahead so use 1
@@ -3366,6 +3420,9 @@ def train_unified_optimization(
         """Evaluate model with given parameters including model type."""
         if progress_state['cancelled'] or check_cancelled():
             raise InterruptedError("Task cancelled")
+
+        # Same genes -> same initial weights / batch order, whatever the evaluation order
+        seed_everything(genome_seed(seed, params), include_python_random=False)
 
         progress_state['current_individual'] += 1
         individual_num = progress_state['current_individual']
@@ -3547,7 +3604,8 @@ def train_unified_optimization(
                 metrics={**eval_result, 'holdout_metrics': holdout_result},
                 training_service=training_service,
                 training_history=training_history,
-                feature_columns=feature_columns
+                feature_columns=feature_columns,
+                normalization_params=model_data['scaler_params']
             )
             if save_result is None:
                 # Model save failed - increment error counter

@@ -315,7 +315,7 @@ class TestLabelHistoryLag:
             frames.append(f)
         res = train_unified_optimization(
             task_id='t-rnn', selected_models=['lstm'], frames=frames, train_ratio=0.6,
-            holdout_share_of_test=0.5, target_column='y', feature_columns=['SMA_5'],
+            holdout_share_of_test=0.5, seed=1, target_column='y', feature_columns=['SMA_5'],
             parameter_ranges={}, genetic_config={}, metrics_config={}, prediction_horizon=0,
             label_horizon=3, progress_base=0, progress_range=1, timeframe='daily'
         )
@@ -811,3 +811,96 @@ class TestWeightedCrossEntropy:
             svc.get_loss_function('weighted_ce', prediction_mode='shift')
         with pytest.raises(ValueError, match="requires pos_weight"):
             svc.get_loss_function('weighted_ce', prediction_mode='multistep')
+
+
+# ---------------------------------------------------------------------------------------
+# #25 covariates ffill().bfill() + covariate scaler not saved;  #26b Darts load_model class mapping
+# ---------------------------------------------------------------------------------------
+class TestDartsCovariates:
+    @staticmethod
+    def _frame(n=40, nan_leading=3):
+        f = _ohlcv(50.0 + np.arange(n))
+        f['y'] = (np.arange(n) % 2).astype(float)
+        feat = np.arange(n, dtype=float)
+        feat[:nan_leading] = np.nan
+        f['FEAT'] = feat
+        return f
+
+    def test_leading_gaps_are_dropped_not_back_filled_from_the_future(self):
+        from app.services.darts_training import DartsTrainingService
+        series, cov = DartsTrainingService().prepare_data(self._frame(), 'y', ['FEAT'], 'daily')
+        assert len(series) == 37 and len(cov) == 37          # 3 leading rows had no covariate yet
+        assert series.start_time() == pd.Timestamp('2024-01-04')
+
+    def test_a_covariate_with_no_value_at_all_is_an_error_not_zeros(self):
+        from app.services.darts_training import DartsTrainingService
+        f = self._frame()
+        f['FEAT'] = np.nan
+        with pytest.raises(ValueError, match="without any value"):
+            DartsTrainingService().prepare_data(f, 'y', ['FEAT'], 'daily')
+
+    def test_covariate_scalers_are_part_of_the_saved_normalization_params(self):
+        from app.services.darts_training import DartsTrainingService
+        svc = DartsTrainingService()
+        svc.prepare_split_three_way([self._frame(120, 0)], 0.6, 0.5, 'y', ['FEAT', 'SMA_5'],
+                                    timeframe='daily', label_horizon=2)
+        params = svc.get_normalization_params()
+        assert len(params['covariate_scalers']) == 1
+        assert len(params['covariate_scalers'][0]['data_min']) == 2
+        assert len(params['target_scalers']) == 1
+
+    @pytest.mark.parametrize('model_type,class_name', [
+        ('nbeats', 'NBEATSModel'), ('tft', 'TFTModel'), ('tcn', 'TCNModel'),
+        ('transformer', 'TransformerModel'), ('lstm', 'RNNModel'), ('gru', 'RNNModel'),
+    ])
+    def test_load_model_uses_the_class_of_the_architecture(self, tmp_path, monkeypatch, model_type, class_name):
+        import json
+        import darts.models
+        from app.services import darts_training
+        from app.services.darts_training import DartsTrainingService
+        loaded = []
+        for name in ('NBEATSModel', 'TFTModel', 'TCNModel', 'TransformerModel', 'RNNModel'):
+            cls = getattr(darts.models, name)
+            monkeypatch.setattr(cls, 'load', staticmethod(lambda path, _n=name: loaded.append(_n) or object()))
+        monkeypatch.setattr(darts_training, 'NBEATSModel', darts.models.NBEATSModel)
+        monkeypatch.setattr(darts_training, 'RNNModel', darts.models.RNNModel)
+        model_file = tmp_path / 'm.pt'
+        model_file.write_bytes(b'x')
+        (tmp_path / 'm_meta.json').write_text(json.dumps({'model_type': model_type}))
+        DartsTrainingService(models_dir=str(tmp_path)).load_model(str(model_file))
+        assert loaded == [class_name]
+
+
+# ---------------------------------------------------------------------------------------
+# #26 nothing was seeded
+# ---------------------------------------------------------------------------------------
+class TestSeeding:
+    def test_seed_everything_makes_numpy_torch_and_random_repeatable(self):
+        import random
+        import torch
+        from app.services.job_handler import seed_everything
+        seed_everything(11)
+        a = (np.random.rand(3), torch.rand(3).numpy(), random.random())
+        seed_everything(11)
+        b = (np.random.rand(3), torch.rand(3).numpy(), random.random())
+        assert np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1]) and a[2] == b[2]
+
+    def test_genome_seed_depends_on_genes_not_on_evaluation_order(self):
+        from app.services.job_handler import genome_seed
+        g1 = {'hidden_size': 32, 'learning_rate': 0.01}
+        g2 = {'hidden_size': 64, 'learning_rate': 0.01}
+        assert genome_seed(5, g1) == genome_seed(5, dict(reversed(list(g1.items()))))
+        assert genome_seed(5, g1) != genome_seed(5, g2)
+        assert genome_seed(5, g1) != genome_seed(6, g1)
+
+    def test_job_seed_is_stable_and_task_specific(self):
+        from app.services.job_handler import stable_job_seed
+        assert stable_job_seed('task-1') == stable_job_seed('task-1')
+        assert stable_job_seed('task-1') != stable_job_seed('task-2')
+
+    def test_job_reports_its_seed(self, monkeypatch):
+        n = 120
+        runner = TestPerTickerTargets()
+        result, _ = runner._run_dry(monkeypatch, {1: (_ohlcv(100 + np.arange(n)), 'A')})
+        from app.services.job_handler import stable_job_seed
+        assert result['seed'] == stable_job_seed('t-per-ticker')

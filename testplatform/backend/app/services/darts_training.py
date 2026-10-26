@@ -68,6 +68,7 @@ class DartsTrainingService(ITrainingService):
         # One target scaler per series after a multi-series prepare (index-aligned with the series
         # lists); evaluation inverse-transforms each series with its own scaler.
         self.scalers: List[Any] = []
+        self.cov_scalers: List[Any] = []
 
     def prepare_data(
         self,
@@ -113,6 +114,26 @@ class DartsTrainingService(ITrainingService):
         if target_column in df_sorted.columns:
             df_sorted = df_sorted.dropna(subset=[target_column])
 
+        # Covariates are point-in-time features: gaps are forward-filled from the PAST only. They
+        # used to be ffill().bfill() on the whole frame (+ fillna(0)), which wrote a later value --
+        # the first available one, from the future -- into every leading row. Leading rows without a
+        # complete covariate vector are dropped (from the target series too, so they stay aligned);
+        # a column with no value at all is an error, not a column of zeros.
+        cov_df = None
+        if feature_columns:
+            available_cols = [c for c in feature_columns if c in df_sorted.columns]
+            if available_cols:
+                cov_df = df_sorted[available_cols].ffill()
+                empty_cols = [c for c in available_cols if cov_df[c].isna().all()]
+                if empty_cols:
+                    raise ValueError(f"Covariate columns without any value: {empty_cols[:5]}")
+                complete = cov_df.notna().all(axis=1).to_numpy()
+                first_complete = int(np.argmax(complete))
+                if first_complete > 0:
+                    logger.info(f"Dropped {first_complete} leading rows without a complete covariate vector")
+                    df_sorted = df_sorted.iloc[first_complete:]
+                    cov_df = cov_df.iloc[first_complete:]
+
         # For intraday stock data (1h, 4h, etc.), don't use fill_missing_dates
         # because market data has irregular timestamps (market hours, weekends, holidays)
         # that cannot be filled with a regular frequency grid
@@ -152,43 +173,35 @@ class DartsTrainingService(ITrainingService):
 
         # Create covariates if specified
         covariates = None
-        if feature_columns:
-            available_cols = [c for c in feature_columns if c in df_sorted.columns]
-            if available_cols:
-                # Use the same rows as target series to ensure alignment
-                # Fill NaN with forward fill then backward fill instead of dropping rows
-                cov_df = df_sorted[available_cols].ffill().bfill()
-
-                # If still has NaN (e.g., all NaN column), fill with 0
-                cov_df = cov_df.fillna(0)
-
-                if len(cov_df) > 0 and len(cov_df) == len(df_sorted):
-                    if is_intraday:
-                        cov_values = cov_df[available_cols].values
-                        covariates = TimeSeries.from_values(cov_values)
-                    else:
-                        covariates = TimeSeries.from_dataframe(
-                            cov_df,
-                            value_cols=available_cols,
-                            fill_missing_dates=True,
-                            freq=freq
-                        )
-                    # Scale covariates (same train-only fit rule as the target)
-                    self.cov_scaler = Scaler()
-                    if scaler_fit_ratio is None:
-                        self.cov_scaler.fit(covariates)
-                    else:
-                        n_fit = max(1, int(len(covariates) * scaler_fit_ratio))
-                        self.cov_scaler.fit(covariates[:n_fit])
-                    covariates = self.cov_scaler.transform(covariates)
-
-                    # MPS (Apple Silicon GPU) doesn't support float64
-                    if MPS_WILL_BE_USED:
-                        covariates = covariates.astype('float32')
-
-                    logger.info(f"Created covariates with {len(covariates)} points from {len(available_cols)} features")
+        if cov_df is not None:
+            # cov_df already covers exactly the rows of the target series (see above)
+            if len(cov_df) > 0 and len(cov_df) == len(df_sorted):
+                if is_intraday:
+                    cov_values = cov_df[available_cols].values
+                    covariates = TimeSeries.from_values(cov_values)
                 else:
-                    logger.warning(f"Covariate length mismatch: {len(cov_df)} vs target {len(df_sorted)}, skipping covariates")
+                    covariates = TimeSeries.from_dataframe(
+                        cov_df,
+                        value_cols=available_cols,
+                        fill_missing_dates=True,
+                        freq=freq
+                    )
+                # Scale covariates (same train-only fit rule as the target)
+                self.cov_scaler = Scaler()
+                if scaler_fit_ratio is None:
+                    self.cov_scaler.fit(covariates)
+                else:
+                    n_fit = max(1, int(len(covariates) * scaler_fit_ratio))
+                    self.cov_scaler.fit(covariates[:n_fit])
+                covariates = self.cov_scaler.transform(covariates)
+
+                # MPS (Apple Silicon GPU) doesn't support float64
+                if MPS_WILL_BE_USED:
+                    covariates = covariates.astype('float32')
+
+                logger.info(f"Created covariates with {len(covariates)} points from {len(available_cols)} features")
+            else:
+                logger.warning(f"Covariate length mismatch: {len(cov_df)} vs target {len(df_sorted)}, skipping covariates")
 
         return target_series, covariates
 
@@ -311,11 +324,14 @@ class DartsTrainingService(ITrainingService):
         series = {k: [] for k in keys}
         covs = {k: [] for k in keys}
         scalers = []
+        cov_scalers = []
         for df in dataframes:
+            self.cov_scaler = None
             full_series, full_cov = self.prepare_data(
                 df, target_column, feature_columns, timeframe, scaler_fit_ratio=train_ratio
             )
             scalers.append(self.scaler)
+            cov_scalers.append(self.cov_scaler)
             b = three_way_bounds(len(full_series), train_ratio, holdout_share_of_test, label_horizon)
             cuts = {
                 'train': slice(0, b['train_end']),
@@ -327,6 +343,8 @@ class DartsTrainingService(ITrainingService):
                 covs[k].append(full_cov[cut] if full_cov is not None else None)
         self.scalers = scalers
         self.scaler = scalers[-1]
+        self.cov_scalers = cov_scalers
+        self.cov_scaler = cov_scalers[-1]
         logger.info(
             "Three-way split: " + ", ".join(
                 f"{k}={sum(len(s) for s in series[k])}" for k in keys
@@ -772,6 +790,10 @@ class DartsTrainingService(ITrainingService):
             scaler_path = self.models_dir / f"{model_name}_scaler.pt"
             if TORCH_AVAILABLE:
                 torch.save(self.scaler, str(scaler_path))
+        if self.cov_scaler:
+            cov_scaler_path = self.models_dir / f"{model_name}_cov_scaler.pt"
+            if TORCH_AVAILABLE:
+                torch.save(self.cov_scaler, str(cov_scaler_path))
 
         return str(model_path)
 
@@ -800,11 +822,16 @@ class DartsTrainingService(ITrainingService):
         else:
             model_type = 'lstm'
 
-        # Load model based on type
-        if model_type == 'nbeats':
-            model = NBEATSModel.load(model_path)
-        else:
-            model = RNNModel.load(model_path)
+        # Load model based on type. Every architecture the platform trains has its own class: loading
+        # tft/tcn/transformer checkpoints through RNNModel.load fails or mis-restores them.
+        from darts.models import TCNModel, TFTModel, TransformerModel
+        loaders = {
+            'nbeats': NBEATSModel, 'tcn': TCNModel, 'transformer': TransformerModel, 'tft': TFTModel,
+            'lstm': RNNModel, 'gru': RNNModel, 'rnn': RNNModel,
+        }
+        if model_type not in loaders:
+            raise ValueError(f"Cannot load model type {model_type!r}; known: {sorted(loaders)}")
+        model = loaders[model_type].load(model_path)
 
         logger.info(f"Loaded model from {model_path}")
         return model
@@ -822,23 +849,40 @@ class DartsTrainingService(ITrainingService):
         if self.scaler is None:
             return None
 
-        # Darts Scaler uses sklearn internally
+        return self.describe_scalers(
+            self.scalers or [self.scaler], self.cov_scalers or [self.cov_scaler]
+        )
+
+    @staticmethod
+    def describe_scalers(scalers: List[Any], cov_scalers: List[Any]) -> Dict[str, Any]:
+        """JSON description of the fitted target AND covariate scalers (one entry per series).
+
+        The covariate scaler used to be dropped entirely, so a reloaded model could not scale its
+        features the way it was trained. Top-level data_min/data_max/data_range stay the (last)
+        target scaler's for backward compatibility.
+        """
+        def params(scaler):
+            if scaler is None:
+                return None
+            # The fitted sklearn MinMaxScaler lives in darts' _fitted_params (Scaler.transformer is
+            # the unfitted class, which is why the old export silently produced no min/max at all).
+            fitted = scaler._fitted_params[0]
+            return {
+                'data_min': fitted.data_min_.tolist(),
+                'data_max': fitted.data_max_.tolist(),
+                'data_range': fitted.data_range_.tolist(),
+            }
+
         scaler_info = {
-            'version': '1.0',
+            'version': '1.1',
             'type': 'darts_scaler',
             'created_at': datetime.now().isoformat(),
-            'description': 'Darts MinMax scaler - load with torch.load(scaler_path)'
+            'description': 'Darts MinMax scalers (target and covariates, one per series)',
+            'target_scalers': [params(s) for s in scalers],
+            'covariate_scalers': [params(s) for s in cov_scalers],
         }
-
-        # Try to extract sklearn scaler params
-        try:
-            if hasattr(self.scaler, 'transformer') and hasattr(self.scaler.transformer, 'data_min_'):
-                scaler_info['data_min'] = self.scaler.transformer.data_min_.tolist()
-                scaler_info['data_max'] = self.scaler.transformer.data_max_.tolist()
-                scaler_info['data_range'] = self.scaler.transformer.data_range_.tolist()
-        except Exception:
-            pass
-
+        if scalers and scalers[-1] is not None:
+            scaler_info.update(params(scalers[-1]))
         return scaler_info
 
     def predict(self, model: Any, data: Any, n: int = None, **kwargs) -> Any:
