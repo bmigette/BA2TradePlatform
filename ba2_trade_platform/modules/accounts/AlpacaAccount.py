@@ -6,6 +6,7 @@ from alpaca.common.exceptions import APIError
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import replace
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 import math
 import re
 import time
@@ -6971,7 +6972,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 req_kwargs["position_intent"] = intent
             if is_market:
                 return MarketOrderRequest(**req_kwargs)
-            return LimitOrderRequest(limit_price=trading_order.limit_price, **req_kwargs)
+            return LimitOrderRequest(
+                limit_price=self._round_option_limit(trading_order.limit_price,
+                                                     up=leg.side == OrderDirection.BUY),
+                **req_kwargs)
 
         # Multi-leg (2-4 legs) -> MLEG
         leg_requests = [
@@ -6992,7 +6996,26 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         )
         if is_market:
             return MarketOrderRequest(**req_kwargs)
-        return LimitOrderRequest(limit_price=trading_order.limit_price, **req_kwargs)
+        # +debit / -credit: conceding (paying more debit or taking less credit) is always UP.
+        return LimitOrderRequest(
+            limit_price=self._round_option_limit(trading_order.limit_price, up=True), **req_kwargs)
+
+    @staticmethod
+    def _round_option_limit(price, up: bool) -> float:
+        """An option limit on the cent grid Alpaca accepts (42210000 rejects 3+ decimals).
+
+        The indicative feed sometimes quotes 3 decimals (16.149), and the builders quote at
+        that touch. Rounding is towards the fill (``up`` for a buy or an MLEG net, down for a
+        single-leg sell) so the order keeps the touch it was quoted at, at most a cent away.
+        Unlike the equity ``_round_price`` there is no sub-penny tier below $1.
+        """
+        if price is None:
+            raise ValueError("Option limit order has no limit price")
+        rounding = ROUND_CEILING if up else ROUND_FLOOR
+        rounded = float(Decimal(str(price)).quantize(Decimal("0.01"), rounding=rounding))
+        if rounded != price:
+            logger.info(f"Option limit {price} rounded {'up' if up else 'down'} to {rounded}")
+        return rounded
 
     @alpaca_api_retry
     def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
@@ -7007,6 +7030,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         Genuine errors are allowed to propagate.
         """
         req = self._build_option_order_request(trading_order, legs)
+        if getattr(req, "limit_price", None) is not None:
+            trading_order.limit_price = float(req.limit_price)   # record the cent-rounded limit sent
         alpaca_order = self.client.submit_order(req)
         logger.info(
             f"Successfully submitted option order to Alpaca: "

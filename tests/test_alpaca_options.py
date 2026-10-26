@@ -344,6 +344,42 @@ def test_build_multi_leg_mleg_request():
     assert syms == {"AAPL260116C00150000", "AAPL260116C00160000"}
 
 
+@pytest.mark.parametrize("side,limit,expected", [
+    (OrderDirection.BUY, 16.149, 16.15),    # indicative-feed ask with 3 decimals (8082 order 22)
+    (OrderDirection.BUY, 5.2, 5.2),         # already a cent: no float drift up to 5.21
+    (OrderDirection.BUY, 0.333, 0.34),      # below $1 options are still cents (not the equity 4dp rule)
+    (OrderDirection.SELL, 16.149, 16.14),   # a seller concedes by quoting LOWER
+    (OrderDirection.SELL, 0.339, 0.33),
+])
+def test_single_leg_limit_rounded_to_cent_towards_the_fill(side, limit, expected):
+    """Alpaca rejects option limits with more than 2 decimals (42210000)."""
+    acct = _make_alpaca()
+    order = _opt_order(limit_price=limit, side=side,
+                       order_type=OrderType.BUY_LIMIT if side == OrderDirection.BUY else OrderType.SELL_LIMIT)
+    leg = OptionLeg(contract_symbol="AAPL260116C00150000", side=side,
+                    position_intent="buy_to_open" if side == OrderDirection.BUY else "sell_to_close")
+    req = acct._build_option_order_request(order, [leg])
+    assert float(req.limit_price) == expected
+
+
+@pytest.mark.parametrize("net,expected", [
+    (4.0001, 4.01),     # debit: pay up to the next cent
+    (4.0, 4.0),
+    (-1.234, -1.23),    # credit: take slightly less credit (the net goes UP, as for a debit)
+])
+def test_mleg_net_limit_rounded_up_to_cent(net, expected):
+    acct = _make_alpaca()
+    order = _opt_order(quantity=1, limit_price=net, contract_symbol=None)
+    legs = [
+        OptionLeg(contract_symbol="AAPL260116C00150000", side=OrderDirection.BUY,
+                  position_intent="buy_to_open"),
+        OptionLeg(contract_symbol="AAPL260116C00160000", side=OrderDirection.SELL,
+                  position_intent="sell_to_open"),
+    ]
+    req = acct._build_option_order_request(order, legs)
+    assert float(req.limit_price) == expected
+
+
 def test_submit_option_order_impl_writeback(mock_account_def):
     from types import SimpleNamespace
     import threading
