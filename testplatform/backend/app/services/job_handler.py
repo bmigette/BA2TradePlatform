@@ -2554,7 +2554,7 @@ def train_classification_optimization(
     """
     from app.services.task_queue import get_task_queue
     from app.services.tsai_models import TSAIModelService, TSAI_AVAILABLE
-    from app.services.tsai_training import TSAITrainingService
+    from app.services.tsai_training import TSAITrainingService, class_pos_weight
 
     if not TSAI_AVAILABLE:
         return {
@@ -2823,9 +2823,13 @@ def train_classification_optimization(
             )
 
             # Get loss function (use current_loss_function from GA params)
+            loss_name = current_loss_function.replace('_loss', '').replace('weighted_cross_entropy', 'weighted_ce')
             loss_fn = training_service.get_loss_function(
-                loss_type=current_loss_function.replace('_loss', '').replace('weighted_cross_entropy', 'weighted_ce'),
-                prediction_mode=mode
+                loss_type=loss_name,
+                prediction_mode=mode,
+                # weighted_ce was created WITHOUT a weight (silently the plain loss); weight the
+                # positive class by the training class balance
+                pos_weight=class_pos_weight(y_train, mode) if loss_name == 'weighted_ce' else None
             )
 
             # Create epoch callback for training progress

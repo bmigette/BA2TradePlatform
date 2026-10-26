@@ -52,6 +52,27 @@ from app.services.model_interface import ITrainingService
 from app.services.tsai_models import DEVICE, MPS_AVAILABLE, CUDA_AVAILABLE
 
 
+def class_pos_weight(y_train: np.ndarray, prediction_mode: str):
+    """Positive-class weight (negatives / positives) for ``weighted_ce`` from the TRAINING labels.
+
+    'shift': one float for the binary label. 'multistep': one weight per horizon (a list), since the
+    class balance differs per target. A class with no training examples has no defined weight and is
+    an error, not a silent unweighted loss.
+    """
+    y = np.asarray(y_train)
+    if prediction_mode == 'multistep':
+        pos = (y == 1).sum(axis=0)
+        neg = (y == 0).sum(axis=0)
+        if (pos == 0).any() or (neg == 0).any():
+            raise ValueError(f"weighted_ce needs both classes in every horizon; positives per horizon: {pos.tolist()}")
+        return (neg / pos).astype(float).tolist()
+    pos = int((y == 1).sum())
+    neg = int((y == 0).sum())
+    if pos == 0 or neg == 0:
+        raise ValueError(f"weighted_ce needs both classes in the training labels (positives={pos}, negatives={neg})")
+    return neg / pos
+
+
 class TSAITrainingService(ITrainingService):
     """
     tsai-based training service for time series classification.
@@ -457,6 +478,11 @@ class TSAITrainingService(ITrainingService):
         """
         if not TSAI_AVAILABLE:
             raise RuntimeError("tsai library not available")
+
+        if loss_type == 'weighted_ce' and pos_weight is None:
+            # This used to fall through to the plain unweighted loss while the job still reported
+            # "weighted_cross_entropy"; use class_pos_weight(y_train, mode) to build the weight.
+            raise ValueError("weighted_ce requires pos_weight (see class_pos_weight)")
 
         if prediction_mode == 'multistep':
             # Multi-step mode: use BCEWithLogitsLoss for multi-label classification

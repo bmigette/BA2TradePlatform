@@ -785,3 +785,29 @@ class TestNewsCountNoLookahead:
                 {'date': '2024-03-04 15:00', 'sentiment': 'negative', 'sentiment_score': 0.8}]
         out = SentimentService(use_cache=False).create_sentiment_features(rows, news)
         assert out['news_count'].tolist() == [1, 2]
+
+
+# ---------------------------------------------------------------------------------------
+# #19 weighted_ce was built without pos_weight (silently the plain loss)
+# ---------------------------------------------------------------------------------------
+class TestWeightedCrossEntropy:
+    def test_weight_comes_from_the_training_class_balance(self):
+        from app.services.tsai_training import class_pos_weight
+        y = np.array([0] * 90 + [1] * 10)
+        assert class_pos_weight(y, 'shift') == pytest.approx(9.0)
+        ym = np.stack([np.array([0] * 80 + [1] * 20), np.array([0] * 50 + [1] * 50)], axis=1)
+        assert class_pos_weight(ym, 'multistep') == pytest.approx([4.0, 1.0])
+
+    def test_one_class_only_has_no_defined_weight(self):
+        from app.services.tsai_training import class_pos_weight
+        with pytest.raises(ValueError, match="both classes"):
+            class_pos_weight(np.zeros(20, dtype=int), 'shift')
+
+    def test_weighted_ce_without_a_weight_is_refused_not_downgraded(self, monkeypatch):
+        from app.services import tsai_training
+        monkeypatch.setattr(tsai_training, 'TSAI_AVAILABLE', True)
+        svc = tsai_training.TSAITrainingService()
+        with pytest.raises(ValueError, match="requires pos_weight"):
+            svc.get_loss_function('weighted_ce', prediction_mode='shift')
+        with pytest.raises(ValueError, match="requires pos_weight"):
+            svc.get_loss_function('weighted_ce', prediction_mode='multistep')
