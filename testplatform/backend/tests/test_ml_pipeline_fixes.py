@@ -260,3 +260,63 @@ class TestThreeWaySplit:
             scalers=[None, None]
         )
         assert res['predictions_made'] == 20          # 10 from each series, pooled
+
+
+# ---------------------------------------------------------------------------------------
+# #11 Darts forecast the label series from its own labels whose outcome was not yet known
+# ---------------------------------------------------------------------------------------
+class TestLabelHistoryLag:
+    NBEATS = {'input_chunk_length': 8, 'output_chunk_length': 1, 'num_stacks': 2, 'num_blocks': 1,
+              'num_layers': 2, 'layer_widths': 16, 'batch_size': 8, 'n_epochs': 1}
+
+    def test_model_input_window_ends_label_horizon_before_the_forecast(self):
+        from app.services.darts_models import DartsModelService
+        model = DartsModelService().create_model('nbeats', {**self.NBEATS, 'output_chunk_shift': 3})
+        assert model.output_chunk_shift == 3
+
+    def test_no_shift_for_causal_labels(self):
+        from app.services.darts_models import DartsModelService
+        model = DartsModelService().create_model('nbeats', dict(self.NBEATS))
+        assert model.output_chunk_shift == 0
+
+    def test_rnn_models_are_refused_for_a_lookahead_label(self):
+        from app.services.darts_models import DartsModelService
+        with pytest.raises(ValueError, match="cannot shift its output"):
+            DartsModelService().create_model('lstm', {'output_chunk_shift': 2})
+
+    def test_get_model_params_carries_the_shift(self):
+        from app.services.job_handler import get_model_params
+        assert get_model_params('nbeats', {}, 5, 1, output_chunk_shift=4)['output_chunk_shift'] == 4
+        assert 'output_chunk_shift' not in get_model_params('nbeats', {}, 5, 1)
+
+    def test_evaluation_starts_after_the_shifted_input_window(self):
+        from app.services.darts_training import DartsTrainingService
+
+        class Shifted(_StubForecaster):
+            output_chunk_shift = 3
+            seen = {}
+
+            def historical_forecasts(self, series, **kwargs):
+                Shifted.seen = kwargs
+                return super().historical_forecasts(series, **kwargs)
+
+        DartsTrainingService().evaluate_model(
+            Shifted([0.5] * 6), _binary_series(14), optimize_metric='f1_score', loss_function='mse',
+            scalers=[None]
+        )
+        assert Shifted.seen['start'] == 2 + 3        # input_chunk + output_chunk_shift
+
+    def test_unified_job_refuses_rnn_on_a_lookahead_label(self):
+        from app.services.job_handler import train_unified_optimization
+        frames = []
+        for base in (10.0, 20.0):
+            f = _ohlcv(base + np.arange(160.0))
+            f['y'] = (np.arange(160) % 2).astype(float)
+            frames.append(f)
+        res = train_unified_optimization(
+            task_id='t-rnn', selected_models=['lstm'], frames=frames, train_ratio=0.6,
+            holdout_share_of_test=0.5, target_column='y', feature_columns=['SMA_5'],
+            parameter_ranges={}, genetic_config={}, metrics_config={}, prediction_horizon=0,
+            label_horizon=3, progress_base=0, progress_range=1, timeframe='daily'
+        )
+        assert res['status'] == 'failed' and 'cannot be trained on this target' in res['error']

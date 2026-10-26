@@ -608,15 +608,20 @@ class DartsTrainingService(ITrainingService):
         """
         input_chunk = model.input_chunk_length
         output_chunk = model.output_chunk_length
-        min_required = input_chunk + output_chunk
+        # Gap between the end of the input window and the first forecast step: the look-ahead of the
+        # label, so the model never reads a label whose outcome is not yet known (see
+        # DartsModelService._apply_output_chunk_shift).
+        shift = model.output_chunk_shift if hasattr(model, 'output_chunk_shift') else 0
+        min_required = input_chunk + shift + output_chunk
         if len(series) < min_required:
             raise ValueError(
-                f"Evaluation block too short ({len(series)} < {min_required} = input_chunk + output_chunk)"
+                f"Evaluation block too short ({len(series)} < {min_required} = "
+                f"input_chunk + output_chunk_shift + output_chunk)"
             )
 
         hf_kwargs = {
             'series': series,
-            'start': input_chunk,  # Start after enough history
+            'start': input_chunk + shift,  # Start after enough history
             'forecast_horizon': 1,  # Predict 1 step at a time
             'stride': 1,
             'retrain': False,

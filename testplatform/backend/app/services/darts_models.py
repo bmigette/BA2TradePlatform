@@ -341,6 +341,22 @@ class DartsModelService(IModelService):
         logger.info(f"Created LSTM model with params: {p}")
         return model
 
+    @staticmethod
+    def _apply_output_chunk_shift(model_kwargs: Dict, p: Dict, model_type: str) -> None:
+        """Forward ``output_chunk_shift`` (bars between the end of the input window and the first
+        forecast step) to the Darts constructor, or refuse it for RNN-based models.
+
+        A label with a look-ahead of ``L`` bars is only KNOWN ``L`` bars after its own timestamp.
+        A model that forecasts the label series from its own past labels therefore has to read an
+        input window that ends ``L`` bars before the prediction time; ``output_chunk_shift = L``
+        does exactly that (``create_model`` refuses RNN models, which cannot shift their output).
+        """
+        shift = int(p['output_chunk_shift']) if 'output_chunk_shift' in p else 0
+        if shift < 0:
+            raise ValueError(f"output_chunk_shift must be >= 0, got {shift}")
+        if shift:
+            model_kwargs['output_chunk_shift'] = shift
+
     def create_nbeats_model(self, params: Dict = None, epoch_callback: callable = None, loss_fn: Any = None) -> Any:
         """
         Create N-BEATS model architecture using Darts.
@@ -395,6 +411,7 @@ class DartsModelService(IModelService):
             model_kwargs['loss_fn'] = loss_fn
             logger.info(f"Using custom loss function: {type(loss_fn).__name__}")
 
+        self._apply_output_chunk_shift(model_kwargs, p, 'nbeats')
         model = NBEATSModel(**model_kwargs)
 
         logger.info(f"Created N-BEATS model with params: {p}")
@@ -490,6 +507,7 @@ class DartsModelService(IModelService):
             model_kwargs['loss_fn'] = loss_fn
             logger.info(f"Using custom loss function: {type(loss_fn).__name__}")
 
+        self._apply_output_chunk_shift(model_kwargs, p, 'tcn')
         model = TCNModel(**model_kwargs)
 
         logger.info(f"Created TCN model with params: {p}")
@@ -540,6 +558,7 @@ class DartsModelService(IModelService):
             model_kwargs['loss_fn'] = loss_fn
             logger.info(f"Using custom loss function: {type(loss_fn).__name__}")
 
+        self._apply_output_chunk_shift(model_kwargs, p, 'transformer')
         model = TransformerModel(**model_kwargs)
 
         logger.info(f"Created Transformer model with params: {p}")
@@ -584,6 +603,7 @@ class DartsModelService(IModelService):
             model_kwargs['loss_fn'] = loss_fn
             logger.info(f"Using custom loss function: {type(loss_fn).__name__}")
 
+        self._apply_output_chunk_shift(model_kwargs, p, 'tft')
         model = TFTModel(**model_kwargs)
 
         logger.info(f"Created TFT model with params: {p}")
@@ -615,6 +635,12 @@ class DartsModelService(IModelService):
 
         if model_type not in creators:
             raise ValueError(f"Unknown model type: {model_type}. Supported: {list(creators.keys())}")
+
+        if model_type in ('lstm', 'gru') and params and int(params['output_chunk_shift'] if 'output_chunk_shift' in params else 0):
+            raise ValueError(
+                f"{model_type} (Darts RNNModel) cannot shift its output by {params['output_chunk_shift']} bars, "
+                f"so it would read labels whose outcome is not yet known; use nbeats/tcn/transformer/tft"
+            )
 
         return creators[model_type](params, epoch_callback=epoch_callback, loss_fn=loss_fn)
 

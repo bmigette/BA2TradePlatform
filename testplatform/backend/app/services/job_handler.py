@@ -3239,7 +3239,10 @@ def train_unified_optimization(
                 'holdout_covariates': rnn_split['holdout_covariates'],
                 'scalers': rnn_scalers,
                 'target_column': rnn_target_column,
-                'output_chunk_length': 1
+                'output_chunk_length': 1,
+                # The series IS the label shifted by prediction_horizon: its value at u is only
+                # known label_horizon + prediction_horizon bars after u.
+                'output_chunk_shift': label_horizon + max(0, prediction_horizon)
             },
             'multistep': {
                 'train_series': ms_split['train_series'],
@@ -3252,9 +3255,22 @@ def train_unified_optimization(
                 'target_column': target_column,
                 # output_chunk_length must be >= 1; when prediction_horizon=0,
                 # target already has built-in look-ahead so use 1
-                'output_chunk_length': max(1, prediction_horizon)
+                'output_chunk_length': max(1, prediction_horizon),
+                # The series' value at u is only known label_horizon bars after u: the input window
+                # must end that long before the prediction time (no label history from the future).
+                'output_chunk_shift': label_horizon
             }
         }
+
+        rnn_lag = data_by_model_type['rnn']['output_chunk_shift']
+        rnn_selected = [m for m in selected_models if m in RNN_MODELS]
+        if rnn_selected and rnn_lag > 0:
+            raise ValueError(
+                f"{rnn_selected} cannot be trained on this target: the Darts RNNModel forecasts the label "
+                f"series from its own past labels and cannot shift its output, and this label (look-ahead "
+                f"{label_horizon} + prediction horizon {max(0, prediction_horizon)} = {rnn_lag} bars) is not "
+                f"yet known for the last {rnn_lag} history points. Select nbeats/tcn/transformer/tft."
+            )
 
         # Validate series lengths
         min_train_length = 100
@@ -3392,7 +3408,9 @@ def train_unified_optimization(
 
         try:
             # Get model-specific params with correct output_chunk_length
-            model_params = get_model_params(model_type, params, training_epochs, model_output_chunk)
+            model_params = get_model_params(
+                model_type, params, training_epochs, model_output_chunk, model_data['output_chunk_shift']
+            )
             n_epochs = model_params.get('n_epochs', 10)
 
             # Update epoch info and current model params before training
@@ -3710,7 +3728,10 @@ def train_unified_optimization(
     }
 
 
-def get_model_params(model_type: str, params: Dict, training_epochs: int = 10, output_chunk_length: int = 3) -> Dict:
+def get_model_params(
+    model_type: str, params: Dict, training_epochs: int = 10, output_chunk_length: int = 3,
+    output_chunk_shift: int = 0
+) -> Dict:
     """Extract model-specific parameters from unified params.
 
     Args:
@@ -3720,6 +3741,10 @@ def get_model_params(model_type: str, params: Dict, training_epochs: int = 10, o
         output_chunk_length: Model's output chunk length
             - For RNN models (LSTM/GRU): Always 1 (single step prediction)
             - For multi-step models: prediction_horizon (multi-step prediction)
+        output_chunk_shift: Bars between the end of the input window and the first forecast step.
+            Must equal the look-ahead of the label series being forecast: that is what keeps
+            labels whose outcome is not yet known out of the model's input (RNN models cannot
+            do this, see DartsModelService.create_model).
     """
     model_params = {
         'input_chunk_length': int(params.get('input_chunk_length', 24)),
@@ -3729,6 +3754,8 @@ def get_model_params(model_type: str, params: Dict, training_epochs: int = 10, o
         'learning_rate': params.get('learning_rate', 0.001),
         'dropout': params.get('dropout', 0.1),
     }
+    if output_chunk_shift:
+        model_params['output_chunk_shift'] = output_chunk_shift
 
     model_type_lower = model_type.lower()
 
