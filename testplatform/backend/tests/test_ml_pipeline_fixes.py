@@ -934,3 +934,169 @@ class TestDartsRegressionEvaluation:
             _StubForecaster([]), _binary_series(2), optimize_metric='mae', scalers=[None]
         )
         assert 'too short' in res['error']
+
+
+# ---------------------------------------------------------------------------------------
+# #8 wiring: the classification GA selects on VALIDATION and reports the HOLDOUT separately
+# ---------------------------------------------------------------------------------------
+class TestClassificationHoldoutWiring:
+    def test_fitness_uses_validation_and_holdout_is_reported_separately(self, monkeypatch, tmp_path):
+        import torch
+        from types import SimpleNamespace
+        from app.services import job_handler, tsai_models, tsai_training, task_queue, genetic
+
+        assessed = []
+
+        class FakeTrainer(tsai_training.TSAITrainingService):
+            def get_loss_function(self, loss_type='focal', prediction_mode='shift', gamma=2.0, pos_weight=None):
+                assessed.append(('loss', loss_type, pos_weight))
+                return object()
+
+            def train_model(self, model, train_data, val_data=None, **kwargs):
+                assessed.append(('train_val_len', len(val_data[0])))
+                return {'status': 'success', 'model': model, 'learner': None}
+
+            def assess_model(self, model, test_data, metric='f1_score', threshold=0.5, **kwargs):
+                n = len(test_data[0])
+                assessed.append(('assess', n))
+                return {'f1_score': n / 1000.0, 'accuracy': 0.5}
+
+        class FakeModels:
+            def create_model(self, model_type, params, c_in, c_out, seq_len):
+                return torch.nn.Linear(1, 1)
+
+        class FakeOptimizer:
+            def __init__(self, **kwargs):
+                pass
+
+            def optimize(self, fitness_function, callback=None, on_generation_start=None, **kwargs):
+                on_generation_start(0)
+                best = max(fitness_function(p) for p in (
+                    {'model_type_idx': 0, 'hidden_size': 8, 'n_layers': 1, 'dropout': 0.1, 'learning_rate': 0.01,
+                     'threshold_idx': 0},
+                    {'model_type_idx': 0, 'hidden_size': 16, 'n_layers': 1, 'dropout': 0.1, 'learning_rate': 0.01,
+                     'threshold_idx': 1},
+                ))
+                return {'best_fitness': best, 'generations_run': 1, 'history': []}
+
+        monkeypatch.setattr(tsai_models, 'TSAI_AVAILABLE', True)
+        monkeypatch.setattr(tsai_models, 'TSAIModelService', FakeModels)
+        monkeypatch.setattr(tsai_training, 'TSAI_AVAILABLE', True)
+        monkeypatch.setattr(tsai_training, 'TSAITrainingService', FakeTrainer)
+        monkeypatch.setattr(task_queue, 'get_task_queue', lambda: SimpleNamespace(get_task_status=lambda tid: None))
+        monkeypatch.setattr(genetic, 'GeneticOptimizer', FakeOptimizer)
+        monkeypatch.setattr(job_handler, 'get_job_models_dir', lambda tid: tmp_path)
+        for name in ('update_job_training_state', 'update_job_progress', 'add_individual_to_job',
+                     'cleanup_non_elite_models'):
+            monkeypatch.setattr(job_handler, name, lambda *a, **k: None)
+        monkeypatch.setattr(job_handler, 'get_epoch_history', lambda tid: [])
+        monkeypatch.setattr(job_handler, 'save_elite_models', lambda **k: [])
+
+        frames = []
+        for base in (10.0, 20.0):
+            f = _ohlcv(base + np.arange(200.0))
+            f['y'] = (np.arange(200) % 3 == 0).astype(float)
+            frames.append(f)
+        res = job_handler.train_classification_optimization(
+            task_id='t-cls', selected_models=['inception'], frames=frames, train_ratio=0.6,
+            holdout_share_of_test=0.5, seed=3, target_column='y', feature_columns=['SMA_5'],
+            parameter_ranges={'seqLen': 5, 'layerSizeMin': 8, 'layerSizeMax': 16, 'layersMin': 1, 'layersMax': 2,
+                              'dropoutMin': 0.0, 'dropoutMax': 0.2, 'learningRateMin': 0.001, 'learningRateMax': 0.01},
+            genetic_config={'populationSize': 2, 'generations': 1, 'trainingEpochs': 1, 'crossoverProb': 0.7,
+                            'mutationProb': 0.2, 'elitismPercent': 10.0, 'earlyStoppingGenerations': 1},
+            metrics_config={'classificationMetric': 'f1_score', 'lossFunction': 'weighted_cross_entropy'},
+            prediction_horizon=0, prediction_modes=['shift'], label_horizon=2,
+            progress_base=0, progress_range=1, timeframe='daily'
+        )
+        assert res['status'] == 'completed', res
+        val_n = [n for kind, n in (a for a in assessed if a[0] == 'train_val_len')][0]
+        assess_sizes = [a[1] for a in assessed if a[0] == 'assess']
+        assert len(assess_sizes) == 4                              # 2 individuals x (validation, holdout)
+        assert assess_sizes[0] == val_n                            # the fitness was computed on validation
+        assert res['best_fitness'] == pytest.approx(val_n / 1000.0)
+        assert res['metrics']['f1_score'] == pytest.approx(val_n / 1000.0)
+        assert res['holdout_metrics']['f1_score'] == pytest.approx(assess_sizes[1] / 1000.0)
+        assert assess_sizes[1] != val_n                            # a different block
+        assert all('holdout_metrics' in ind for ind in res['all_individuals'])
+        # weighted_ce received a real weight from the training labels (1/3 positives -> 2.0)
+        losses = [a for a in assessed if a[0] == 'loss']
+        assert losses and losses[0][1] == 'weighted_ce' and losses[0][2] == pytest.approx(2.0, rel=0.2)
+
+
+# ---------------------------------------------------------------------------------------
+# #8 / #11 wiring of the Darts (unified) GA
+# ---------------------------------------------------------------------------------------
+class TestUnifiedHoldoutWiring:
+    def test_validation_drives_fitness_holdout_is_reported_and_shift_reaches_the_model(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+        from app.services import job_handler, task_queue, genetic
+        from app.services.darts_training import DartsTrainingService
+
+        calls = []
+        created = []
+
+        class FakeTrainer(DartsTrainingService):
+            def train_model(self, model, train_series, val_series=None, covariates=None, verbose=True):
+                calls.append(('train', job_handler._n_points(train_series), job_handler._n_points(val_series)))
+                return {'status': 'completed'}
+
+            def evaluate_model(self, model, test_series, covariates=None, optimize_metric='mape',
+                               threshold=0.5, loss_function=None, scalers=None):
+                n = job_handler._n_points(test_series)
+                calls.append(('eval', n, len(scalers)))
+                return {'f1_score': n / 1000.0, 'accuracy': 0.5}
+
+        class FakeMLService:
+            def create_model(self, model_type, params, epoch_callback=None, loss_fn=None):
+                created.append((model_type, dict(params)))
+                return SimpleNamespace(save=lambda path: None)
+
+        class FakeOptimizer:
+            def __init__(self, **kwargs):
+                pass
+
+            def get_checkpoint_data(self, gen, population):
+                return {}
+
+            def optimize(self, fitness_function, callback=None, on_generation_start=None, **kwargs):
+                on_generation_start(0)
+                best = fitness_function({'model_type_idx': 0, 'input_chunk_length': 8})
+                return {'best_fitness': best, 'best_params': {'model_type_idx': 0}, 'generations_run': 1, 'history': []}
+
+        monkeypatch.setattr(job_handler, 'TrainingService', FakeTrainer)
+        monkeypatch.setattr(job_handler, 'MLModelsService', FakeMLService)
+        monkeypatch.setattr(task_queue, 'get_task_queue', lambda: SimpleNamespace(get_task_status=lambda tid: None))
+        monkeypatch.setattr(genetic, 'GeneticOptimizer', FakeOptimizer)
+        monkeypatch.setattr(job_handler, 'get_job_models_dir', lambda tid: tmp_path)
+        for name in ('update_job_training_state', 'update_job_progress', 'add_individual_to_job',
+                     'cleanup_non_elite_models', 'save_generation_model', 'clear_ga_checkpoint',
+                     'cleanup_job_models'):
+            monkeypatch.setattr(job_handler, name, lambda *a, **k: 'saved')
+        monkeypatch.setattr(job_handler, 'load_ga_checkpoint', lambda tid: None)
+        monkeypatch.setattr(job_handler, 'get_epoch_history', lambda tid: [])
+        monkeypatch.setattr(job_handler, 'save_elite_models', lambda **k: [])
+
+        frames = []
+        for base in (10.0, 20.0):
+            f = _ohlcv(base + np.arange(260.0))
+            f['y'] = (np.arange(260) % 2).astype(float)
+            frames.append(f)
+        res = job_handler.train_unified_optimization(
+            task_id='t-uni', selected_models=['nbeats'], frames=frames, train_ratio=0.6,
+            holdout_share_of_test=0.5, seed=3, target_column='y', feature_columns=['SMA_5'],
+            parameter_ranges={},
+            genetic_config={'populationSize': 1, 'generations': 1, 'trainingEpochs': 1, 'crossoverProb': 0.7,
+                            'mutationProb': 0.2, 'elitismPercent': 10.0, 'earlyStoppingGenerations': 1},
+            metrics_config={'optimizeMetric': 'f1_score', 'lossFunction': 'mse'},
+            prediction_horizon=0, label_horizon=2, progress_base=0, progress_range=1, timeframe='daily'
+        )
+        assert res['status'] == 'completed', res
+        train_call = [c for c in calls if c[0] == 'train'][0]
+        eval_calls = [c for c in calls if c[0] == 'eval']
+        assert len(eval_calls) == 2 and eval_calls[0][1] == train_call[2]    # fitness on the validation series
+        assert eval_calls[1][1] != eval_calls[0][1]                          # the holdout is a different block
+        assert eval_calls[0][2] == 2                                         # one scaler per ticker
+        assert res['metrics']['f1_score'] == pytest.approx(eval_calls[0][1] / 1000.0)
+        assert res['holdout_metrics']['f1_score'] == pytest.approx(eval_calls[1][1] / 1000.0)
+        assert res['best_fitness'] == pytest.approx(eval_calls[0][1] / 1000.0)
+        assert created[0][0] == 'nbeats' and created[0][1]['output_chunk_shift'] == 2
