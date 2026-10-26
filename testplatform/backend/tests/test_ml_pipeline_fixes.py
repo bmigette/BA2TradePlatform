@@ -904,3 +904,33 @@ class TestSeeding:
         result, _ = runner._run_dry(monkeypatch, {1: (_ohlcv(100 + np.arange(n)), 'A')})
         from app.services.job_handler import stable_job_seed
         assert result['seed'] == stable_job_seed('t-per-ticker')
+
+
+# ---------------------------------------------------------------------------------------
+# #16 Darts regression was scored on the first 1-7 points after the TRAINING series
+# ---------------------------------------------------------------------------------------
+class TestDartsRegressionEvaluation:
+    def test_regression_is_scored_over_the_whole_block(self):
+        from darts import TimeSeries
+        from app.services.darts_training import DartsTrainingService
+        n = 30
+        actual = np.linspace(10.0, 40.0, n).astype('float32')
+        series = TimeSeries.from_times_and_values(pd.date_range('2024-01-01', periods=n, freq='D'), actual)
+
+        class Forecaster(_StubForecaster):
+            def historical_forecasts(self, series, **kwargs):
+                idx = series.time_index[kwargs['start']:]
+                return TimeSeries.from_times_and_values(idx, series.values().flatten()[kwargs['start']:] + 1.0)
+
+        res = DartsTrainingService().evaluate_model(
+            Forecaster([]), series, optimize_metric='mae', scalers=[None]
+        )
+        assert res['predictions_made'] == n - 2            # every point after the input chunk, not 1-7
+        assert res['mae'] == pytest.approx(1.0) and res['rmse'] == pytest.approx(1.0)
+
+    def test_block_too_short_is_an_error_not_a_different_evaluation(self):
+        from app.services.darts_training import DartsTrainingService
+        res = DartsTrainingService().evaluate_model(
+            _StubForecaster([]), _binary_series(2), optimize_metric='mae', scalers=[None]
+        )
+        assert 'too short' in res['error']
