@@ -377,3 +377,58 @@ class TestMultiTimeframeNoLookahead:
         from app.services.indicators import timeframe_delta
         with pytest.raises(ValueError):
             timeframe_delta('3h')
+
+
+# ---------------------------------------------------------------------------------------
+# #3 / #4  fundamentals: back-filled from the future, available at period end + 45 days
+# ---------------------------------------------------------------------------------------
+class TestFundamentalsPointInTime:
+    PERIODS = [   # oldest first; total_assets grows 100, 110, 121, 133.1, 146.41, 161.05
+        {'fiscal_date': f'{y}-{m}', 'total_assets': 100.0 * 1.1 ** i}
+        for i, (y, m) in enumerate(
+            [('2022', '12-31'), ('2023', '03-31'), ('2023', '06-30'), ('2023', '09-30'), ('2023', '12-31'), ('2024', '03-31')]
+        )
+    ]
+
+    def _run(self, monkeypatch, dates, periods=None):
+        from types import SimpleNamespace
+        from app.services.fundamentals import FundamentalsService
+
+        class _Provider:
+            def get_balance_sheet(self_inner, **kw):
+                return SimpleNamespace(periods=list(periods if periods is not None else self.PERIODS))
+
+        monkeypatch.setattr(FundamentalsService, '_build_provider_service', staticmethod(lambda providers: _Provider()))
+        df = pd.DataFrame({'Date': pd.to_datetime(dates), 'Close': 1.0})
+        return FundamentalsService.create_statement_features_v2(df, 'XYZ', ['balance_sheet'])
+
+    def test_rows_before_the_first_publication_are_nan_not_back_filled(self, monkeypatch):
+        out = self._run(monkeypatch, ['2022-06-01', '2023-02-01', '2023-03-15'])
+        for col in ('bs_total_assets', 'bs_total_assets_days_old',
+                    'bs_total_assets_qoq_change', 'bs_total_assets_yoy_change'):
+            assert out[col].isna().all(), col
+
+    def test_change_columns_are_not_borrowed_from_a_later_period(self, monkeypatch):
+        # first period published 2022-12-31 + 75d = 2023-03-16: it has no previous quarter, so
+        # QoQ/YoY are unknown there -- they used to be filled with the FIRST AVAILABLE (later) value
+        out = self._run(monkeypatch, ['2023-04-01'])
+        assert out['bs_total_assets'].iloc[0] == 100.0
+        assert np.isnan(out['bs_total_assets_qoq_change'].iloc[0])
+        assert np.isnan(out['bs_total_assets_yoy_change'].iloc[0])
+
+    def test_statement_is_not_visible_45_days_after_period_end(self, monkeypatch):
+        # period end 2023-03-31: 45 days later is 2023-05-15, filings are due later than that
+        out = self._run(monkeypatch, ['2023-05-16', '2023-06-13', '2023-06-14'])
+        assert list(out['bs_total_assets']) == pytest.approx([100.0, 100.0, 110.0])   # 2023-03-31 + 75d = 2023-06-14
+
+    def test_real_filing_date_beats_the_lag_estimate(self):
+        from app.services.fundamentals import FundamentalsService
+        p = {'fiscal_date': '2023-03-31', 'fillingDate': '2023-05-04'}
+        assert FundamentalsService.statement_available_date(p) == pd.Timestamp('2023-05-04')
+        assert FundamentalsService.statement_available_date({'fiscal_date': '2023-03-31'}) == pd.Timestamp('2023-06-14')
+
+    def test_changes_appear_once_enough_history_is_published(self, monkeypatch):
+        out = self._run(monkeypatch, ['2024-03-01'])   # 2023-12-31 period (+75d = 2024-03-15) not yet public
+        assert out['bs_total_assets'].iloc[0] == pytest.approx(133.1)
+        assert out['bs_total_assets_qoq_change'].iloc[0] == pytest.approx(0.1)
+        assert out['bs_total_assets_yoy_change'].iloc[0] != out['bs_total_assets_yoy_change'].iloc[0]   # NaN: <4 prior quarters
