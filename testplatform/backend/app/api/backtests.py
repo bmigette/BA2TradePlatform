@@ -1248,6 +1248,50 @@ def _refuse_market_profile_row_without_gene(backtest: Backtest, db: Any) -> None
 
 
 
+def _refuse_row_missing_searched_genes(backtest: Backtest, db: Any, genes: tuple, label: str) -> None:
+    """No silent default for an opt-in gene family (goal2027 item 2.8 onwards): a row whose optimization searched
+    one of ``genes`` (its ``parameter_ranges`` carry the key) but whose ``strategy_params`` lost it would deploy
+    that setting at the expert default, a phenotype the GA never evaluated. Refused. Rows of runs that did not
+    search the family are unaffected."""
+    if db is None or backtest.optimization_id is None:
+        return
+    from app.models.strategy_optimization import StrategyOptimization
+    so = db.query(StrategyOptimization).filter(
+        StrategyOptimization.id == backtest.optimization_id).first()
+    ranges = so.parameter_ranges if so is not None else None
+    if not isinstance(ranges, dict):
+        return
+    searched = [g for g in genes if g in ranges]
+    if not searched:
+        return
+    sp = backtest.strategy_params if isinstance(backtest.strategy_params, dict) else {}
+    missing = [g for g in searched if sp.get(g) is None]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: its optimization searched the {label} but this row has no "
+                    f"{', '.join(missing)}; exporting would deploy the expert default the GA never chose. Refusing."))
+
+
+def _canonical_ds_factor_settings(backtest: Backtest, payload: dict) -> None:
+    """goal2027 2.8: the backtest ran the CANONICAL DS factor genome (``decode_params`` switches a section with no
+    usable sub-weights off), so the deploy payload must carry the same phenotype, not the raw genes: a row whose
+    technical sub-weights are all 0 would otherwise deploy ``w_technical`` > 0 on a section that scores a silent 0.
+    Only values the canonicalisation CHANGES are rewritten; rows without factor genes are untouched."""
+    sp = backtest.strategy_params
+    if not isinstance(sp, dict):
+        return
+    from app.services.strategy_param_space import neutralise_ds_factor_genes
+    flat = {k: v for k, v in sp.items() if isinstance(k, str) and k.startswith("model:")}
+    canon = neutralise_ds_factor_genes(flat)
+    if canon is flat:
+        return
+    ep = payload["settings"]["expert_params"]
+    for k, v in canon.items():
+        if flat.get(k) != v:
+            ep[k[len("model:"):]] = v
+
+
 def _refuse_split_time_row_without_genes(backtest: Backtest, db: Any) -> None:
     """No silent default for the decision times: a run that searched the SPLIT genes (its optimization's
     parameter_ranges carry ``schedule:entry_time`` / ``schedule:manage_time``, goal2027 item 2.4) but whose
@@ -1293,6 +1337,8 @@ def _derive_export_payload_shared(backtest: Backtest, kind: str, db: Any = None)
         _refuse_sizing_gene_row_without_gene(backtest, db)
         _refuse_market_profile_row_without_gene(backtest, db)
         _refuse_split_time_row_without_genes(backtest, db)
+        from app.services.strategy_param_space import DS_FACTOR_GENES
+        _refuse_row_missing_searched_genes(backtest, db, DS_FACTOR_GENES, "DeterministicScorer factor weights")
     try:
         return derive_export_payload(
             backtest, kind,
@@ -1310,6 +1356,7 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
     payload = _derive_export_payload_shared(backtest, kind, db)
     if kind == "expert_settings":
         _serve_only_selected_market_profiles(backtest, payload)
+        _canonical_ds_factor_settings(backtest, payload)
     return payload
 
 

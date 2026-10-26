@@ -15,7 +15,7 @@ Its results start a new baseline. Never compare its fitness values with goal2020
 
 ## 1. Grid shape
 
-### 1.1 Cells (35)
+### 1.1 Cells (36)
 
 The cells come from the atr27 strategy plan ([strategy_plan.json](../strategy_research/atr_grid/strategy_plan.json)).
 A strategy is in the plan if it ranked in its expert's pooled goal2020 top 5 by fitness or by CAR.
@@ -24,6 +24,7 @@ A strategy is in the plan if it ranked in its expert's pooled goal2020 top 5 by 
 |---|---|---|---|
 | FMPRating | large, mid, small | S1, S2, S6 | 9 |
 | DeterministicScorer | large, mid, small | S1, S2, S6 | 9 |
+| DeterministicScorer | xl | SQM | 1 |
 | FMPEarningsDrift | mid, small | S1, S2, S3, S5 | 8 |
 | FMPInsiderClusterBuy | mid, small | S1 | 2 |
 | FMPSenateTraderWeight | Senate universe (2020-2026) | S1, S3, S5, S6 | 4 |
@@ -31,6 +32,9 @@ A strategy is in the plan if it ranked in its expert's pooled goal2020 top 5 by 
 
 - FMPRating keeps its 2022 floor (`_EXPERT_MIN_START`). Its fold 1 trains on 2022-2023 and its jobs carry
   `-from2022`.
+- **DeterministicScorer × SQM × xl** is the one cell outside the strategy plan. It is the exploration
+  `quality_momentum` recipe as a GA cell (§2.8, evidence below). Every DeterministicScorer cell, this one
+  included, also searches the DS factor genes (`--search-ds-factor-weights`, name token `dsfw`).
 - The ML forecast expert ([2026-10-25-ml-forecast-expert-design.md](2026-10-25-ml-forecast-expert-design.md))
   joins as extra cells only if its pilot shows an edge.
 
@@ -63,6 +67,9 @@ A strategy is in the plan if it ranked in its expert's pooled goal2020 top 5 by 
 - SPY trend gate and SPY volatility gate, each with an off value (§2.3).
 - Stop-loss loosening (`--search-sl-loosen`).
 - Entry time and manage time (§2.4), plus the weekday genes.
+
+DeterministicScorer cells add the factor genes of §2.8 (`dsfw`). The SQM cell carries the sizing, time and factor
+genes but no market-profile or SPY-gate genes: SQM is not an S1-S7 strategy, and its market flags are refused.
 
 FactorRanker keeps its own gene space. It takes no ATR, market or loosening genes, and it keeps a fixed time.
 
@@ -139,6 +146,83 @@ merges only between jobs.
   4-6.
 - It runs on remote227 once option stage 2 frees slots, or on remote150.
 
+### 2.8 DS factor genes, the SQM ruleset and the `xl` screen band
+
+Evidence (exploration phase 1, exhaustive grid 2020-2025, $10,000, manifest `eb410451d4a3`; see
+[exploration/README.md](../strategy_research/exploration/README.md)): the best recipe of the campaign is
+DeterministicScorer on a liquid large-cap screen with technical/fundamental 70/30 (`tw_mom` 0.7, `tw_d200` 0.3,
+`fw_quality` 0.6, `fw_piotroski` 0.4), `mom_lookback_days` 126, `theta_buy` 0.3, entry stop -12%, take-profit +20% and a
+30-day time exit: fitness 3.16, 32.9%/yr, drawdown -32% (`quality_momentum` 70/30). The `analyst_targets` family
+(analyst/technical 80/20, hold 60) reached fitness 2.46 and 24.6%/yr. The goal2027 DS genes (`w_technical`,
+`w_fundamental`, `w_analyst` up to 0.4, `w_earnings`, `macro_mode`, the two thresholds, `k_stop`, `k_target`) cannot
+express either, and no S1-S7 ruleset is "buy, fixed stop and target, time exit".
+
+Owner decisions 2026-10-26: DS genes and the SQM rule: yes. PullbackReversion is NOT promoted (its results are not
+worth it). The pullback DS blend and `etf_trend` are dropped.
+
+**DS factor genes** (`ba2-test optimize --search-ds-factor-weights`; capband driver flag of the same name, which
+requires `dsfw` in `--name-suffix`; DeterministicScorer jobs only, refused for any other expert):
+
+| Gene | Range |
+|---|---|
+| `model:tw_mom`, `tw_d200`, `tw_rsi`, `tw_don` | 0.0-1.0, step 0.1 |
+| `model:fw_quality`, `fw_piotroski`, `fw_value`, `fw_growth` | 0.0-1.0, step 0.1 |
+| `model:mom_lookback_days` | choice 63, 126, 252 (that order is persisted) |
+| `model:analyst_target_window_days` | 30-90, step 30 (the `analyst_targets` window) |
+| `model:analyst_min_targets` | 3-5, step 2 (the `analyst_targets` minimum observations) |
+| `model:w_analyst` | existing gene, ceiling widened 0.4 -> 0.8 under the flag only |
+
+- **Zero-sum rule.** DS divides every section by the sum of its positive sub-weights, so only ratios matter. Two
+  combinations have no honest reading and are canonicalised in the one decode path (`neutralise_ds_factor_genes`:
+  GA, TOP-N persist, re-run, export, and the trial-memo key):
+  - a section whose sub-weights are all 0 while its section weight is positive is switched OFF: section weight
+    `w_technical`/`w_fundamental` -> 0.0, its sub-weights removed. Without this the technical section would score a
+    literal 0.0 that still carries `w_technical` (a hidden dilution), and the fundamental section would be dropped as
+    "missing";
+  - a section weight of 0 makes its sub-weights dead (removed); `mom_lookback_days` is dead when the technical
+    section is off or `tw_mom` is 0; the two analyst details are dead when `w_analyst` is 0.
+  A genome with every section at 0 is left as today: it trades nothing and the trade-count gate disqualifies it.
+- **Parity.** The deploy payload carries the canonical `w_technical`/`w_fundamental` (what the backtest ran), not the
+  raw genome. A row whose optimization searched the genes but lost one is refused at export. Without the flag the gene
+  space, the run settings and the run names are byte-identical.
+- **Not searched:** `aw_targets`/`aw_grades`. The `analyst_targets` recipe fixed them at 1.0/0.0; DS defaults are
+  0.5/0.5.
+
+**SQM ruleset** (`--strategy SQM`, DeterministicScorer only; also accepted by the capband driver and
+`--strategy-plan`). Entry: buy when `bullish` AND `has_no_position` AND `days_since_last_close` > 1; at the fill
+`adjust_stop_loss` and `adjust_take_profit` from `order_open_price`. Exit: close when `has_position` AND
+`days_opened` > N. The same semantics as the exploration `time_exit()`.
+
+| Gene | Range | Default (the recipe) |
+|---|---|---|
+| `entry:buy:a1:action_value` (stop %) | -14 to -6, step 2 | -12 |
+| `entry:buy:a2:action_value` (target %) | 10-30, step 5 | 20 |
+| `cond:xt:value` (time exit days) | 20-120, step 10 | 30 |
+
+The gene names are the ones S6 uses for the same roles. No gene switches a part off. With every gene at its default the
+ruleset equals the exploration `quality_momentum` recipe, compared on the live export (test). SQM takes no market
+profile or SPY genes.
+
+**`xl` screen band.** A fixed screen, not a searched cap band: the exploration `new_idea_baseline` screen, with no
+screener genes.
+
+```xl-screen
+market_cap_min: 10e9
+market_cap_max: 0
+price_min: 10
+volume_min: 500000
+dollar_volume_min: 10e6
+float_min: 10e6
+relative_volume_min: 0
+price_drop_pct: 0
+weinstein_stage2_only: False
+max_stocks: 50
+```
+
+The three cap bands (`SCREENER_CAP_BANDS`, `ba2_providers`) only set a cap-gene range, and the launcher has no
+"all screen keys pinned" mode yet. So `xl` is documented here and is NOT runnable until `grid_goal2027.sh` (§2.6)
+or a launcher option pins these keys. A test pins this block to the exploration screen.
+
 ## 3. Data preparation (January 2027)
 
 Every step runs through `tools/prepare_history.py` and [REPRODUCE-BACKTESTS.md](../REPRODUCE-BACKTESTS.md) §4. A new
@@ -179,7 +263,7 @@ Every step runs through `tools/prepare_history.py` and [REPRODUCE-BACKTESTS.md](
   | FactorRanker | about 1x |
 
 - **One FMPRating cell's chain:** about 50,000 evaluation-years, roughly 16 hours on 28 slots.
-- **Whole grid:** the 35 cells weigh about 112 FMPRating cells, so roughly 10 weeks on remote227 alone. This could be
+- **Whole grid:** the 36 cells weigh about 116 FMPRating cells (the SQM cell adds one DeterministicScorer cell, about 4), so roughly 10 weeks on remote227 alone. This could be
   off by 2x in either direction.
 - **Levers:**
   - add remote150 as extra workers (about 25% faster);

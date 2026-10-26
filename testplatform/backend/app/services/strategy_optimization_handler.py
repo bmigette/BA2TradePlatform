@@ -1544,6 +1544,9 @@ def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]
     # goal2027 2.1: genes dead under the genome's sizing mode (identity when there is no sizing gene).
     from app.services.strategy_param_space import neutralise_sizing_genes
     decoded_flat = neutralise_sizing_genes(decoded_flat)
+    # goal2027 2.8: DS factor genes of an off section / dead detail (identity without the dsfw genes).
+    from app.services.strategy_param_space import neutralise_ds_factor_genes
+    decoded_flat = neutralise_ds_factor_genes(decoded_flat)
     # goal2027 2.2: whatever belongs to an unselected market profile (identity without market:profile).
     from app.services.strategy_param_space import neutralise_market_profile_genes
     decoded_flat = neutralise_market_profile_genes(decoded_flat, market_members)

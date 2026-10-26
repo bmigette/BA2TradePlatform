@@ -199,6 +199,15 @@ def market_profile_gene_tokens(args, strat) -> list:
     return []
 
 
+def ds_factor_gene_tokens(args, expert) -> list:
+    """`--search-ds-factor-weights` for a DeterministicScorer job when the matrix searches the DS factor genes
+    (goal2027 item 2.8), else []. Every other expert never reads those settings and the launcher refuses the flag
+    for them, so it is not forwarded (the caller prints a NOTE)."""
+    if getattr(args, "search_ds_factor_weights", False) and expert == "DeterministicScorer":
+        return ["--search-ds-factor-weights"]
+    return []
+
+
 def exclude_symbols_passthrough(args) -> list:
     """Extra `optimize` CLI tokens for --exclude-symbols ([] when not given, so an ordinary
     invocation of this driver is untouched). Kept separate from
@@ -378,7 +387,7 @@ def _parse_stress_spread(spec: str) -> dict:
             raise SystemExit(f"--stress-spread-bps: {band}={val!r} is not a number")
     return {b: v for b, v in out.items() if v > 0}
 
-_KNOWN_STRATEGIES = {"S1", "S2", "S3", "S4", "S5", "S6", "S7"}
+_KNOWN_STRATEGIES = {"S1", "S2", "S3", "S4", "S5", "S6", "S7", "SQM"}
 
 
 def load_strategy_plan(path, skip_experts=frozenset()) -> dict:
@@ -594,6 +603,11 @@ def main() -> int:
                          "item 2.2). REQUIRES --market-condition-profile ohlcv-v1,ta-structure-v1 with a manifest "
                          "for BOTH, and --name-suffix to contain 'mktprof'. Not forwarded to the FactorRanker job "
                          "(bypass expert); folds into the job's name digest.")
+    ap.add_argument("--search-ds-factor-weights", action="store_true", default=False,
+                    help="Search the DeterministicScorer factor genes (tw_*/fw_* sub-weights, mom_lookback_days, "
+                         "the analyst target window and minimum; w_analyst widened to 0.8) in every "
+                         "DeterministicScorer job (goal2027 item 2.8). REQUIRES --name-suffix to contain 'dsfw'. "
+                         "Not forwarded to any other expert's job; folds into the job's name digest.")
     ap.add_argument("--workers", default=None,
                     help="Comma-separated remote worker NAMES to distribute each job's GA trials to "
                          "(e.g. 'remote150'); trials spread across these + local. Workers must be "
@@ -768,6 +782,11 @@ def main() -> int:
             ap.error(f"--search-market-profile requires --name-suffix to contain 'mktprof' "
                      f"(got {args.name_suffix!r}): its gene space differs from a market:enabled run's, so it "
                      f"must not share a job name. Example: --name-suffix goal2027-mktprof")
+    if args.search_ds_factor_weights:
+        if "dsfw" not in args.name_suffix.replace("_", "").lower():
+            ap.error(f"--search-ds-factor-weights requires --name-suffix to contain 'dsfw' "
+                     f"(got {args.name_suffix!r}): its gene space differs from a fixed-weight run's, so it "
+                     f"must not share a job name. Example: --name-suffix goal2027-dsfw")
     if args.sizing_mode:
         token = "riskatr" if args.sizing_mode == "risk_atr" else "notional"
         if token not in args.name_suffix.replace("_", "").lower():
@@ -963,6 +982,12 @@ def main() -> int:
         if args.search_market_profile and strat is None:
             print(f"[{i}/{len(jobs)}] NOTE {name}: bypass expert, market profile gene not applied "
                   f"(carries no market genes)", flush=True)
+        # --search-ds-factor-weights: appended last (same reasoning); digest on its own. Only DS jobs get it.
+        ds_tokens = ds_factor_gene_tokens(args, expert)
+        cmd += ds_tokens
+        if args.search_ds_factor_weights and not ds_tokens:
+            print(f"[{i}/{len(jobs)}] NOTE {name}: {expert} is not DeterministicScorer, DS factor genes not applied",
+                  flush=True)
         job_name = name
         # The walk-forward budgets and fold spec are part of the cell identity: a changed budget,
         # window, top-N or pass rule must never resume an older cell's -wf/-refit names.
@@ -972,7 +997,7 @@ def main() -> int:
             str(args.pass_min_oos_return), str(args.pass_max_dd_mult), str(args.pass_min_folds),
             ",".join(map(str, sorted(set(args.pass_require_fold)))) or "-",
             "exclusive" if args.pass_min_oos_return_exclusive else "inclusive"])
-        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or wf_tokens:
+        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or wf_tokens:
             job_name = _job_name(name, cmd + wf_tokens)
             cmd[cmd.index("--name") + 1] = job_name
         if args.walk_forward:

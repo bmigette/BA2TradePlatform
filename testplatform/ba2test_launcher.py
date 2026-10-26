@@ -2375,6 +2375,54 @@ def _build_strategy_S7(name: str):
                                 exit_conditions=exit_conditions)
 
 
+#: Strategies only the named expert can use (goal2027 item 2.8). ``SQM`` is the exploration "quality_momentum"
+#: recipe, written for the DeterministicScorer score; another expert would run it on a signal it was not made for.
+_EXPERT_ONLY_STRATEGIES = {"SQM": "DeterministicScorer"}
+
+
+def _refuse_ds_only_strategy(command: str, kind: str, expert: str) -> None:
+    """Refuse an expert-restricted strategy (``_EXPERT_ONLY_STRATEGIES``) on any other expert."""
+    owner = _EXPERT_ONLY_STRATEGIES.get(kind)
+    if owner is not None and expert != owner:
+        sys.exit(f"{command}: strategy {kind} is for {owner} only (got expert {expert!r})")
+
+
+def _build_strategy_SQM(name: str):
+    """SQM -- QUALITY-MOMENTUM, the exploration phase-1 winner's ruleset (goal2027 item 2.8). DeterministicScorer only.
+
+    One entry, three fixed exits and nothing else: buy when bullish and flat with a one-day cooldown, a fixed
+    stop and a fixed target at the fill, and a time exit. Exactly the exploration ``quality_momentum`` rules
+    (tools/strategy_research/exploration/profiles.py: ``new_idea_baseline`` + ``time_exit``); the three numbers
+    are genes whose DEFAULT is the recipe (stop -12%, target +20%, 30 days).
+
+    Gene names follow the S1-S7 shape: ``entry:buy:a1:action_value`` (stop), ``entry:buy:a2:action_value``
+    (target), ``cond:xt:value`` (time exit days). No on/off toggle: the recipe is "buy with a stop, a target
+    and a time exit", and a toggled-off bracket would be a different strategy. First match wins, and there is
+    one exit rule, so nothing shadows it."""
+    buy_entry_conditions = {
+        "id": "root", "type": "AND", "conditions": [
+            {"id": "gate_days_since_close", "field": "days_since_last_close", "op": ">", "value": 1},
+        ],
+    }
+    entry_actions = [
+        {"id": "entry_sl", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": -12.0, "action_value_optimize": True,
+         "action_value_min": -14.0, "action_value_max": -6.0, "action_value_step": 2.0},
+        {"id": "entry_tp", "action_type": "adjust_take_profit", "reference_value": "order_open_price",
+         "action_value": 20.0, "action_value_optimize": True,
+         "action_value_min": 10.0, "action_value_max": 30.0, "action_value_step": 5.0},
+    ]
+    exit_conditions = [
+        {"id": "exit_time", "action_type": "close",
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "xp", "field": "has_position"},
+             {"id": "xt", "field": "days_opened", "op": ">", "value": 30,
+              "optimize": True, "value_min": 20, "value_max": 120, "value_step": 10}]}},
+    ]
+    return _strategy_from_parts(name, buy_tree=buy_entry_conditions,
+                                exit_conditions=exit_conditions, entry_actions=entry_actions)
+
+
 def _build_strategy_minimal(name: str):
     """A placeholder Strategy for BYPASS experts (FactorRanker) that ignore enter/exit rulesets and
     rebalance by factor score. The optimization still needs a Strategy row; this one carries no
@@ -5641,6 +5689,13 @@ _SEARCH_SIZING_MODE: bool = False
 #: ``market_profile_gene`` rule marker when it is on; the decode-time rules live in
 #: ``strategy_param_space.decode_params`` / ``neutralise_market_profile_genes``.
 _SEARCH_MARKET_PROFILE: bool = False
+
+#: ``--search-ds-factor-weights`` (goal2027 item 2.8, name token ``dsfw``): the DeterministicScorer sub-weights
+#: (``tw_*``, ``fw_*``), the momentum lookback and the analyst-target window / minimum as GA genes, plus a wider
+#: ``w_analyst`` ceiling. DS jobs only. The decode-time rules live in
+#: ``strategy_param_space.neutralise_ds_factor_genes``.
+_SEARCH_DS_FACTOR_WEIGHTS: bool = False
+_DS_FACTOR_EXPERT = "DeterministicScorer"
 _MARKET_PROFILE_GENE_PROFILES = ("ohlcv-v1", "ta-structure-v1")
 
 
@@ -6124,6 +6179,42 @@ def _refuse_market_profile_gene_unsupported(command: str, kind: str, bypass: boo
     if kind not in _EQUITY_MARKET_CONDITION_STRATEGIES:
         sys.exit(f"{command}: --search-market-profile: {kind!r} is not an equity S1-S7 strategy "
                  f"({sorted(_EQUITY_MARKET_CONDITION_STRATEGIES)}); the gene is for those only")
+
+
+def _resolve_search_ds_factor_weights(raw, command: str, expert: "str | None" = None) -> bool:
+    """Parse ``--search-ds-factor-weights``; sets and returns the module global. Refuses (exit) for any expert
+    but DeterministicScorer: the genes would be searched but never read.
+
+    Always ASSIGNS the global (False included): the launcher is reused within one process, and a value left over
+    from a previous command would silently change an unrelated run's gene space."""
+    global _SEARCH_DS_FACTOR_WEIGHTS
+    _SEARCH_DS_FACTOR_WEIGHTS = False
+    if not raw:
+        return False
+    if expert is not None and expert != _DS_FACTOR_EXPERT:
+        sys.exit(f"{command}: --search-ds-factor-weights is for {_DS_FACTOR_EXPERT} jobs only; {expert!r} never "
+                 f"reads the tw_*/fw_*/mom_lookback_days settings, so the genes would be searched but dead")
+    _SEARCH_DS_FACTOR_WEIGHTS = True
+    return True
+
+
+def _ds_factor_gene_space() -> dict:
+    """The DeterministicScorer factor genes ``--search-ds-factor-weights`` adds ({} when off; merged LAST, so every
+    existing gene keeps its position). ``w_analyst`` is the one EXISTING gene it widens (0.4 -> 0.8): the dict
+    update keeps its position. The ``mom_lookback_days`` choice ORDER is a persisted contract (the GA stores the
+    index). Zero-sum combinations are canonicalised at decode time (``neutralise_ds_factor_genes``)."""
+    if not _SEARCH_DS_FACTOR_WEIGHTS:
+        return {}
+    w = lambda: {"optimize": True, "min": 0.0, "max": 1.0, "step": 0.1, "type": "float"}   # noqa: E731
+    return {
+        "w_analyst": {"optimize": True, "min": 0.0, "max": 0.8, "step": 0.1, "type": "float"},
+        "tw_mom": w(), "tw_d200": w(), "tw_rsi": w(), "tw_don": w(),
+        "fw_quality": w(), "fw_piotroski": w(), "fw_value": w(), "fw_growth": w(),
+        "mom_lookback_days": {"optimize": True, "type": "choice", "choices": [63, 126, 252]},
+        # analyst_targets recipe (exploration): 30/60/90-day target window, 3/5 minimum targets.
+        "analyst_target_window_days": {"optimize": True, "min": 30, "max": 90, "step": 30, "type": "int"},
+        "analyst_min_targets": {"optimize": True, "min": 3, "max": 5, "step": 2, "type": "int"},
+    }
 
 
 def _sizing_mode_gene_space() -> dict:
@@ -6899,6 +6990,7 @@ _STRATEGY_BUILDERS = {
     "S5": _build_strategy_S5,   # (name) — S2/S3 hybrid: signal exits + trailing ladder
     "S6": _build_strategy_S6,   # (name) — high-frequency quick-cycle (tight TP/SL AT ENTRY + time exit)
     "S7": _build_strategy_S7,   # (name) — tight refinement around the archived 186% S2-large winner
+    "SQM": _build_strategy_SQM, # (name) — DeterministicScorer only: exploration quality-momentum (stop/target/time exit)
     # Option/equity strategies (dispatch by `kind`, not `name`; see _build_strategy):
     "O_LC": _build_strategy_option, "O_VERT": _build_strategy_option,
     "O_SSTG": _build_strategy_option, "O_SSTD": _build_strategy_option,
@@ -7121,6 +7213,7 @@ def _cmd_optimize(args) -> int:
     _resolve_search_sizing_mode(getattr(args, "search_sizing_mode", False),
                                 getattr(args, "sizing_mode", None), "optimize")
     _resolve_search_market_profile(getattr(args, "search_market_profile", False), "optimize")
+    _resolve_search_ds_factor_weights(getattr(args, "search_ds_factor_weights", False), "optimize", args.expert)
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -7240,6 +7333,7 @@ def _cmd_optimize(args) -> int:
         _refuse_sl_loosen_on_bypass("optimize", args.strategy, bypass)
         _refuse_sizing_gene_unsupported("optimize", args.strategy, bypass)
         _refuse_market_profile_gene_unsupported("optimize", args.strategy, bypass)
+        _refuse_ds_only_strategy("optimize", args.strategy, expert)
         _sname = args.name or f"opt-{expert}-{args.strategy}"
         # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
         # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
@@ -7481,7 +7575,7 @@ def _cmd_optimize(args) -> int:
                                     **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args),
                                                  atr_searched=(rm_toggle_policy == "atr-searched")),
                                     **screener_genes, **schedule_genes, **_sl_loosen_gene_space(),
-                                    **_sizing_mode_gene_space()}),
+                                    **_sizing_mode_gene_space(), **_ds_factor_gene_space()}),
             "backtest": backtest_block,
         }
         _apply_lattice_anchor(cfg, args.strategy, getattr(args, "lattice_anchor", None))
@@ -7597,6 +7691,7 @@ def _cmd_optimize_batch(args) -> int:
     _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize-batch")
     _resolve_search_sizing_mode(False, None, "optimize-batch")   # the gene is optimize-only; reset the global
     _resolve_search_market_profile(False, "optimize-batch")      # likewise
+    _resolve_search_ds_factor_weights(False, "optimize-batch")   # likewise
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     batch_worker_ids = _worker_ids_from_args(args)  # resolved once; applied to every job
@@ -9155,6 +9250,14 @@ def main(argv: "list | None" = None) -> int:
                          "selected decode to off (a profile you did not pick cannot drive an exit); 'off' is "
                          "exactly market:enabled=0. Equity S1-S7 only: refused for bypass experts and option "
                          "strategies. Name the job distinctly ('mktprof').")
+    op.add_argument("--search-ds-factor-weights", action="store_true", default=False,
+                    help="DeterministicScorer jobs only (goal2027 item 2.8): search the technical sub-weights "
+                         "(tw_mom/tw_d200/tw_rsi/tw_don), the fundamental sub-weights (fw_quality/fw_piotroski/"
+                         "fw_value/fw_growth; each 0..1 step 0.1), mom_lookback_days (63|126|252), "
+                         "analyst_target_window_days (30..90) and analyst_min_targets (3|5), and widen w_analyst "
+                         "to 0.8. DS normalises weights, so only ratios matter; a section whose sub-weights are all "
+                         "zero is switched OFF (section weight 0), never scored as a silent 0. Refused for any "
+                         "other expert. Name the job distinctly ('dsfw'): its gene space differs.")
     op.add_argument("--rm-toggle-policy", choices=_RM_TOGGLE_POLICIES, default="pinned",
                     help="'pinned' (default): use_atr_stop/regime_overlay_enabled are pinned OFF "
                          "for this run, exactly as every run on record -- byte-identical to "

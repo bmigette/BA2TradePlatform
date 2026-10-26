@@ -167,6 +167,64 @@ def neutralise_sizing_genes(flat_params: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in flat_params.items() if k not in NOTIONAL_INERT_MODEL_GENES}
 
 
+#: goal2027 item 2.8 -- the DeterministicScorer factor genes (``--search-ds-factor-weights``, name token ``dsfw``).
+#: DS normalises positive weights inside each section (``technical.technical_score``, ``fundamental.fundamental_score``)
+#: and across sections (``combine.normalize_weights``), so only RATIOS matter. Two combinations have no honest
+#: reading and are therefore CANONICALISED here (never left to score a silent 0):
+#:   * a section whose sub-weights are ALL zero while its section weight is positive: the technical section would
+#:     score a literal 0.0 that still carries ``w_technical`` (a hidden dilution), the fundamental section would be
+#:     dropped as "missing". Both decode to the section being OFF: section weight -> 0.0, sub-weights -> absent.
+#:   * a section weight of 0 makes that section's sub-weights dead: they are REMOVED (absent == the expert default,
+#:     which is never read).
+#: ``mom_lookback_days`` is dead when the technical section is off or ``tw_mom`` is 0; the analyst window / minimum
+#: targets are dead when ``w_analyst`` is 0. One pure function, called from ``decode_params`` (GA, top-N persist,
+#: re-run, export) and ``canonical_trial_params`` (memo key); ``api.backtests`` applies it to the deploy payload.
+DS_TECH_WEIGHT_GENES = ("model:tw_mom", "model:tw_d200", "model:tw_rsi", "model:tw_don")
+DS_FUND_WEIGHT_GENES = ("model:fw_quality", "model:fw_piotroski", "model:fw_value", "model:fw_growth")
+DS_MOM_LOOKBACK_GENE = "model:mom_lookback_days"
+DS_ANALYST_DETAIL_GENES = ("model:analyst_target_window_days", "model:analyst_min_targets")
+DS_FACTOR_GENES = (DS_TECH_WEIGHT_GENES + DS_FUND_WEIGHT_GENES + (DS_MOM_LOOKBACK_GENE,)
+                   + DS_ANALYST_DETAIL_GENES)
+
+
+def neutralise_ds_factor_genes(flat_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Canonicalise a decoded genome's DeterministicScorer factor genes (see the block comment above).
+
+    Returns ``flat_params`` ITSELF when there is no factor gene (every older job) or nothing changes. Never mutates
+    the input. A section weight that is absent from the genome is treated as unknown (nothing is decided on it)."""
+    if not any(k in flat_params for k in DS_FACTOR_GENES):
+        return flat_params
+    out = dict(flat_params)
+
+    def _section(weight_key: str, subs: tuple) -> bool:
+        """Apply the two rules to one section; returns True when the section is ON afterwards."""
+        w = out.get(weight_key)
+        if w is None:
+            return True
+        if float(w) <= 0.0:
+            for k in subs:
+                out.pop(k, None)
+            return False
+        present = [out[k] for k in subs if k in out]
+        if present and len(present) == len(subs) and sum(float(v) for v in present) <= 0.0:
+            out[weight_key] = 0.0
+            for k in subs:
+                out.pop(k, None)
+            return False
+        return True
+
+    tech_on = _section("model:w_technical", DS_TECH_WEIGHT_GENES)
+    _section("model:w_fundamental", DS_FUND_WEIGHT_GENES)
+    tw_mom = out.get("model:tw_mom")
+    if (not tech_on) or (tw_mom is not None and float(tw_mom) <= 0.0):
+        out.pop(DS_MOM_LOOKBACK_GENE, None)
+    wa = out.get("model:w_analyst")
+    if wa is not None and float(wa) <= 0.0:
+        for k in DS_ANALYST_DETAIL_GENES:
+            out.pop(k, None)
+    return flat_params if out == flat_params else out
+
+
 #: goal2027 item 2.2 -- the market-profile gene. ``--search-market-profile`` adds ``market:profile`` as a choice gene
 #: over ``MARKET_PROFILE_CHOICES`` (this ORDER is a persisted contract: the GA stores the index). It REPLACES the
 #: ``market:enabled`` master gene for the jobs that use it. ``off`` selects no profile (everything market is off,
@@ -1318,6 +1376,8 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     # Sizing-mode canonicalisation (goal2027 2.1) -- the ONE decode path, so GA, top-N persist, re-run,
     # robustness variant and export all see the same neutralised genome. Identity for any job without the gene.
     flat_params = neutralise_sizing_genes(flat_params)
+    # DS factor genes (goal2027 2.8): a section with no usable sub-weights is OFF, never a silent 0.0 score.
+    flat_params = neutralise_ds_factor_genes(flat_params)
 
     for key, val in flat_params.items():
         if key.startswith("model:"):
