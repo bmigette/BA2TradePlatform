@@ -1682,6 +1682,33 @@ _EXPERT_OPT = {
         # run_options_matrix folds this dict into the discovery job name.
         "option_fixed_settings": {"macro_short_side": "mirror"},
     },
+    # MLForecast (ml_forecast design 2026-10-25 §2): maps a PRECOMPUTED forecast-store row to a signal, so a trial
+    # only re-maps rows (no model inference in the GA). `model_key` picks among the BUILT stores by alias
+    # (<card_id>[+covariates], resolved from each store's meta.json). Ranges MEASURED on the 2025 NDX100 stores
+    # (pilot 2026-10-26), see the pilot report.
+    "MLForecast": {
+        "expert_params": {
+            # LOG-space TimesFM cards: the price-space cards abort on a collapse extrapolated through 0 (TTD 2026-08).
+            "model_key": {"optimize": True, "type": "choice", "choices": ["timesfm3-log-ctx512", "timesfm3-log-ctx2048"]},
+            "horizon": {"optimize": True, "type": "choice", "choices": [5, 10, 20]},
+            # MEASURED 2025 NDX100, timesfm3-log-ctx512: |q50| p90 = 2.0 / 3.4 / 5.9 % (h5/h10/h20), p99 4.7-15.4 %;
+            # the lift sits in the tail (h10 q50 >= 5 %: +2.08 % mean 10-session return vs +0.67 % for all rows), so
+            # the range reaches 8 %.
+            "min_edge_pct": {"optimize": True, "min": 0.5, "max": 8.0, "step": 0.5, "type": "float"},
+            # MEASURED: P(up) from the deciles showed NO lift at any threshold (h10 P>=65: +0.58 % vs +0.67 % all),
+            # so the gate must be able to (almost) vanish: 51 keeps MappingGenes' min_prob > 50.
+            "min_prob": {"optimize": True, "min": 51.0, "max": 75.0, "step": 4.0, "type": "float"},
+            # MEASURED q10-q90 width in ATR14: median 3.9 / 5.6 / 7.8 (h5/h10/h20), p90 4.8 / 7.0 / 10.2. The design's
+            # 1-6 range would have shut nearly every h20 row and most h5 rows.
+            "max_uncertainty": {"optimize": True, "min": 3.0, "max": 12.0, "step": 1.0, "type": "float"},
+            "tp_quantile": {"optimize": True, "min": 60.0, "max": 90.0, "step": 10.0, "type": "float"},
+            "sl_quantile": {"optimize": True, "min": 10.0, "max": 40.0, "step": 10.0, "type": "float"},
+            "exit_flip_prob": {"optimize": True, "min": 55.0, "max": 70.0, "step": 5.0, "type": "float"},
+        },
+        # S1 runs long-only (shorts need the engine's enable_short), so a SELL entry gene would only spend
+        # population on a knob that cannot act; a bearish forecast still exits a held long via the flip.
+        "fixed_settings": {"enable_sell": False},
+    },
     # NOTE: FinnHubRating is intentionally NOT optimized — it is REDUNDANT with FMPRating (both
     # are analyst-consensus rating experts on the same large-cap universe).
     # FMPSenateTraderWeight — congressional (senate) disclosed-trade signal. Sparse per symbol,
@@ -7201,6 +7228,8 @@ _STRATEGY_POP_FACTOR = {"S1": 1.5}
 # the ceiling, it just must not exceed it.
 _EXPERT_CONFIDENCE_CEILING = {
     "DeterministicScorer": 50.0,   # measured max |final| 0.562 -> 56.2; 50 leaves headroom
+    # MLForecast confidence = the probability used, in %: decile models clamp P(up) to [5, 95] (mapping.P_TAIL_CLAMP).
+    "MLForecast": 95.0,
 }
 
 

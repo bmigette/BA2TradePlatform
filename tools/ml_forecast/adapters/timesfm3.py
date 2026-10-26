@@ -26,21 +26,34 @@ TIMESFM_VERSION = "3.0.2"
 LICENCE = "timesfm-non-commercial-license-v1.0"
 HORIZONS = (5, 10, 20)
 CONTEXT_LENGTHS = (512, 2048)
-#: CLI name -> context length
+#: CLI name -> context length (PRICE space: the model sees raw closes)
 CARD_IDS = {f"timesfm3-ctx{c}": c for c in CONTEXT_LENGTHS}
+#: CLI name -> context length (LOG space: the model sees log closes; see ``TimesFM3Adapter``)
+LOG_CARD_IDS = {f"timesfm3-log-ctx{c}": c for c in CONTEXT_LENGTHS}
+#: ``ModelCard.input_fields`` of a log-space card (the field the model is shown).
+LOG_INPUT_FIELDS = ("log_Close",)
 
 #: predict_fn(contexts, horizon) -> one array (horizon, 9) of PRICE quantiles per context
 PredictFn = Callable[[Sequence[np.ndarray], int], List[np.ndarray]]
 
 
-def timesfm3_card(context_length: int) -> ModelCard:
+def timesfm3_card(context_length: int, log_space: bool = False) -> ModelCard:
     if context_length not in CONTEXT_LENGTHS:
         raise ValueError(f"TimesFM 3.0 context length must be one of {CONTEXT_LENGTHS}, got {context_length!r}")
     return ModelCard(
         model_id=CHECKPOINT, family="timesfm", version=TIMESFM_VERSION,
-        input_fields=("Close",), timeframe="1d", context_length=context_length,
+        input_fields=LOG_INPUT_FIELDS if log_space else ("Close",), timeframe="1d", context_length=context_length,
         past_only_covariates=(), past_future_covariates=(), horizons=HORIZONS, scaler=None,
         output_type="deciles", pretraining_cutoff=None, licence=LICENCE, licence_commercial_ok=False)
+
+
+def card_for_id(card_id: str) -> ModelCard:
+    """The card of a CLI card id, price or log space (``timesfm3-ctx512``, ``timesfm3-log-ctx2048`` ...)."""
+    if card_id in CARD_IDS:
+        return timesfm3_card(CARD_IDS[card_id])
+    if card_id in LOG_CARD_IDS:
+        return timesfm3_card(LOG_CARD_IDS[card_id], log_space=True)
+    raise ValueError(f"unknown TimesFM card id {card_id!r}: one of {sorted(CARD_IDS) + sorted(LOG_CARD_IDS)}")
 
 
 class InputDataError(ValueError):
@@ -57,7 +70,15 @@ class TimesFM3Adapter:
                                       f"'volume' is planned)")
         if card.family != "timesfm" or card.output_type != "deciles":
             raise ValueError(f"TimesFM3Adapter needs a timesfm deciles card, got {card.family}/{card.output_type}")
+        if tuple(card.input_fields) not in (("Close",), LOG_INPUT_FIELDS):
+            raise ValueError(f"TimesFM3Adapter: unsupported input_fields {card.input_fields!r}")
         self.card, self.predict_fn, self.covariate_set = card, predict_fn, cov
+        #: LOG space: the model forecasts log closes; decile k of the price is exp(decile k of the log price)
+        #: (a monotone map preserves quantiles), so a price quantile can never reach 0 (a -100% return). PRICE
+        #: space keeps the raw closes; a non-positive price quantile there (TimesFM clamps a collapse
+        #: extrapolation at 0: TTD 2026-08-07, ctx 512, closes 139.5 -> 13.8) fails ForecastRow's -100% check
+        #: and ABORTS the build, loudly, by design.
+        self.log_space = tuple(card.input_fields) == LOG_INPUT_FIELDS
         self.max_horizon = max(card.horizons)
 
     def forecast_batch(self, items: Sequence[Tuple[str, date, np.ndarray]]) -> List[ForecastRow]:
@@ -77,7 +98,8 @@ class TimesFM3Adapter:
             ctxs.append(c.astype(np.float32))
         if not ctxs:
             return []
-        qs = self.predict_fn(ctxs, self.max_horizon)
+        shown = [np.log(c.astype(np.float64)).astype(np.float32) for c in ctxs] if self.log_space else ctxs
+        qs = self.predict_fn(shown, self.max_horizon)
         if len(qs) != len(ctxs):
             raise ValueError(f"model returned {len(qs)} forecasts for {len(ctxs)} contexts")
         rows = []
@@ -86,19 +108,27 @@ class TimesFM3Adapter:
             if q.shape != (self.max_horizon, len(DECILE_LEVELS)):
                 raise ValueError(f"{sym} {sess}: unexpected forecast shape {q.shape}")
             last = float(c[-1])
-            dec = {h: tuple(float(x) for x in q[h - 1] / last - 1.0) for h in self.card.horizons}
+            if self.log_space:
+                # return = exp(log-price quantile - log close) - 1, computed against the SAME float32 context the
+                # model saw
+                base = float(np.log(np.float64(c[-1])))
+                dec = {h: tuple(float(x) for x in np.expm1(q[h - 1] - base)) for h in self.card.horizons}
+            else:
+                dec = {h: tuple(float(x) for x in q[h - 1] / last - 1.0) for h in self.card.horizons}
             rows.append(ForecastRow(sym, sess, dec))   # validates finiteness and monotone deciles
         return rows
 
 
-def load_timesfm3_predict_fn(threads: int = 6, batch_size: int = 64) -> PredictFn:
-    """Load the real model (CPU). Caps threads BEFORE torch spins up its pools."""
+def load_timesfm3_predict_fn(threads: int = 6, batch_size: int = 64, device: str = "cpu") -> PredictFn:
+    """Load the real model on ``device`` ("cpu" or "cuda"). Caps threads BEFORE torch spins up its pools."""
     for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ[k] = str(threads)
     import torch
     torch.set_num_threads(threads)
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(f"device {device!r} requested but torch {torch.__version__} sees no CUDA device")
     from timesfm3 import ModelConfig, TimesFM3Evaluator
-    model = TimesFM3Evaluator(ModelConfig(checkpoint_path=CHECKPOINT, per_core_batch_size=batch_size, device="cpu"))
+    model = TimesFM3Evaluator(ModelConfig(checkpoint_path=CHECKPOINT, per_core_batch_size=batch_size, device=device))
 
     def predict(contexts: Sequence[np.ndarray], horizon: int) -> List[np.ndarray]:
         outs = list(model.predict_batch(list(contexts), horizon=horizon, return_quantiles=True))
