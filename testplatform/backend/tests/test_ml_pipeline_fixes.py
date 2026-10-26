@@ -573,3 +573,105 @@ class TestZigzagHindsight:
         )
         assert horizons[col] == IndicatorService().zigzag_confirmation_lag(frame, 5.0)
         assert horizons[col] > 1
+
+
+# ---------------------------------------------------------------------------------------
+# #12 ML backtest: predictions stamped at bar START, no OOS enforcement, slippage ignored
+# ---------------------------------------------------------------------------------------
+class TestMlBacktest:
+    @staticmethod
+    def _exec_1m(n=180):
+        idx = pd.date_range('2024-01-02 09:30', periods=n, freq='min')
+        price = 100 + np.arange(n) * 0.01
+        return pd.DataFrame({'Date': idx, 'Open': price, 'High': price + 0.05, 'Low': price - 0.05,
+                             'Close': price, 'Volume': 1000.0})
+
+    @staticmethod
+    def _hourly_predictions():
+        starts = pd.to_datetime(['2024-01-02 09:00', '2024-01-02 10:00', '2024-01-02 11:00'])
+        probs = {ts: np.array([0.1, 0.9]) for ts in starts}
+        return probs, list(starts)
+
+    def _run(self, monkeypatch, **overrides):
+        from app.services import backtest_handler as bh
+        seen = []
+        original = bh.MLStrategy._get_prediction_for_time
+
+        def spy(self_, current_time):
+            probs, is_new = original(self_, current_time)
+            seen.append((pd.Timestamp(current_time), probs is not None))
+            return probs, is_new
+
+        monkeypatch.setattr(bh.MLStrategy, '_get_prediction_for_time', spy)
+        lookup, stamps = self._hourly_predictions()
+        kwargs = dict(
+            pred_lookup=lookup, pred_timestamps=stamps, exec_df=self._exec_1m(), strategy_params={},
+            initial_capital=10000.0, position_sizing_type='percent', position_sizing_value=10.0,
+            commission=0.0, slippage=0.0, buy_entry_conditions=None, sell_entry_conditions=None,
+            exit_conditions=None,
+        )
+        kwargs.update(overrides)
+        return bh, bh._run_strategy_backtest(**kwargs), seen
+
+    def test_a_prediction_is_not_usable_before_its_bar_has_ended(self, monkeypatch):
+        bh, _, seen = self._run(monkeypatch)
+        usable = [t for t, ok in seen if ok]
+        # the 09:00 hourly prediction covers 09:00-10:00; the first 1m bar that ENDS at 10:00 is
+        # the one starting 09:59. Execution data starts at 09:30, so nothing before 09:59 is usable.
+        assert usable and usable[0] == pd.Timestamp('2024-01-02 09:59')
+        assert all(t >= pd.Timestamp('2024-01-02 09:59') for t in usable)
+
+    def test_slippage_is_charged_like_a_cost(self, monkeypatch):
+        from app.services import backtest_handler as bh
+        captured = {}
+
+        class _FakeBacktest:
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+
+            def run(self):
+                raise RuntimeError("stop after capturing the constructor arguments")
+
+        def fake_backtest(*args, **kwargs):
+            return _FakeBacktest(*args, **kwargs)
+
+        monkeypatch.setattr(bh, 'Backtest', fake_backtest)
+        lookup, stamps = self._hourly_predictions()
+        bh._run_strategy_backtest(
+            pred_lookup=lookup, pred_timestamps=stamps, exec_df=self._exec_1m(), strategy_params={},
+            initial_capital=10000.0, position_sizing_type='percent', position_sizing_value=10.0,
+            commission=0.10, slippage=0.05, buy_entry_conditions=None, sell_entry_conditions=None,
+            exit_conditions=None,
+        )
+        assert captured['commission'] == pytest.approx(0.0015)
+
+    def _model(self, window):
+        from types import SimpleNamespace
+        return SimpleNamespace(model_id='mdl-1', training_date_range=window)
+
+    @staticmethod
+    def _pred_df(start):
+        return pd.DataFrame({'Date': pd.date_range(start, periods=30, freq='D')})
+
+    def test_window_overlapping_the_training_data_is_refused(self):
+        from app.services.backtest_handler import ensure_out_of_sample
+        with pytest.raises(ValueError, match="in-sample"):
+            ensure_out_of_sample(self._model({'startDate': '2020-01-01', 'endDate': '2024-01-20'}),
+                                 self._pred_df('2024-01-01'), 5, {})
+
+    def test_window_after_the_training_end_is_accepted(self):
+        from app.services.backtest_handler import ensure_out_of_sample
+        # first PREDICTION is row seq_len-1 = 2024-01-05, after the 2024-01-04 training end
+        ensure_out_of_sample(self._model({'startDate': '2020-01-01', 'endDate': '2024-01-04'}),
+                             self._pred_df('2024-01-01'), 5, {})
+
+    def test_training_end_day_itself_is_in_sample(self):
+        from app.services.backtest_handler import ensure_out_of_sample
+        with pytest.raises(ValueError, match="in-sample"):
+            ensure_out_of_sample(self._model({'endDate': '2024-01-05'}), self._pred_df('2024-01-01'), 5, {})
+
+    def test_unknown_training_window_is_refused_unless_explicitly_allowed(self):
+        from app.services.backtest_handler import ensure_out_of_sample
+        with pytest.raises(ValueError, match="no recorded training end date"):
+            ensure_out_of_sample(self._model(None), self._pred_df('2024-01-01'), 5, {})
+        ensure_out_of_sample(self._model(None), self._pred_df('2024-01-01'), 5, {'allow_in_sample': True})

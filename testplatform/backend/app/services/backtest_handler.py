@@ -58,6 +58,7 @@ class MLStrategy(Strategy):
     n_classes = 2
     confirmation_tracker = None
     position_sizing_pct = 10.0  # Percent of equity per position
+    exec_bar_delta = None  # Length of one execution bar; set by _run_strategy_backtest
 
     # Track last trade for "no trade in past X bars/days" conditions
     last_buy_bar_idx = None
@@ -97,8 +98,12 @@ class MLStrategy(Strategy):
         Get the prediction for the current execution bar.
 
         Uses binary search to find the most recent prediction timestamp
-        that is <= current execution time. This allows higher-frequency
-        execution data to use lower-frequency predictions.
+        that is <= the END of the current execution bar. ``self.predictions`` is keyed by the END
+        of the bar each prediction was computed on (see _run_strategy_backtest), and ``next()`` runs
+        once the execution bar has closed, so a prediction is usable exactly when the bar it
+        describes has finished. Matching on the bar START instead let a 1-minute execution bar at
+        10:01 trade on the 10:00 hourly prediction, which already contained the whole hour.
+        This allows higher-frequency execution data to use lower-frequency predictions.
 
         Returns:
             tuple: (probs, is_new_bar) where is_new_bar indicates if this is
@@ -107,8 +112,11 @@ class MLStrategy(Strategy):
         if not self.prediction_timestamps or not self.predictions:
             return None, False
 
-        # Convert to comparable timestamp
-        current_ts = pd.Timestamp(current_time)
+        if self.exec_bar_delta is None:
+            raise RuntimeError("MLStrategy.exec_bar_delta is not set; run through _run_strategy_backtest")
+
+        # END of the current execution bar, comparable with the bar-end prediction timestamps
+        current_ts = pd.Timestamp(current_time) + self.exec_bar_delta
 
         # Binary search to find the rightmost prediction timestamp <= current_time
         idx = bisect.bisect_right(self.prediction_timestamps, current_ts) - 1
@@ -305,6 +313,50 @@ class MLStrategy(Strategy):
         next_evaluation_bar()
 
 
+def ensure_out_of_sample(
+    model: TrainedModel,
+    pred_df: pd.DataFrame,
+    seq_len: int,
+    strategy_params: Dict[str, Any]
+) -> None:
+    """Refuse a backtest whose predictions fall inside the model's training window.
+
+    The first prediction is made ``seq_len - 1`` rows into ``pred_df`` (earlier rows are only
+    input context). It must be strictly after the end of the window the model was trained on
+    (``TrainedModel.training_date_range['endDate']``; train, validation AND holdout rows of that
+    window were all seen by the selection process). A model with no recorded end date cannot be
+    proven out of sample and is refused too, unless the caller sets
+    ``strategy_params['allow_in_sample'] = True`` explicitly (research only).
+    """
+    allow = 'allow_in_sample' in strategy_params and strategy_params['allow_in_sample'] is True
+    window = model.training_date_range
+    if not window or 'endDate' not in window or not window['endDate']:
+        if allow:
+            logger.warning(f"Model {model.model_id} has no recorded training window; in-sample backtest allowed explicitly")
+            return
+        raise ValueError(
+            f"Model {model.model_id} has no recorded training end date (training_date_range.endDate), "
+            f"so a backtest cannot be shown to be out of sample. Retrain with an explicit training "
+            f"date range, or pass strategy_params['allow_in_sample']=True for research."
+        )
+    if len(pred_df) < seq_len:
+        raise ValueError(f"Prediction dataset has {len(pred_df)} rows, fewer than seq_len={seq_len}")
+    first_prediction = pd.Timestamp(pred_df['Date'].iloc[seq_len - 1])
+    train_end = pd.Timestamp(window['endDate'])
+    if first_prediction.tzinfo is not None:
+        first_prediction = first_prediction.tz_localize(None)
+    # an end DATE covers that whole day
+    if first_prediction < train_end.normalize() + pd.Timedelta(days=1):
+        message = (
+            f"Backtest window starts at {first_prediction} but model {model.model_id} was trained up to "
+            f"{window['endDate']}: the window overlaps the training data (in-sample)."
+        )
+        if allow:
+            logger.warning(message + " Allowed explicitly (allow_in_sample).")
+            return
+        raise ValueError(message + " Start the backtest after the training end date.")
+
+
 def run_backtest(
     model: TrainedModel,
     pred_df: pd.DataFrame,
@@ -367,6 +419,8 @@ def run_backtest(
     seq_len = hyperparameters.get('seq_len', hyperparameters.get('seqLen', 24))
     prediction_mode = model.prediction_mode or 'shift'
     threshold = model.threshold or 0.5
+
+    ensure_out_of_sample(model, pred_df, seq_len, strategy_params)
 
     # Try to load metadata early for feature_columns
     import json
@@ -625,6 +679,17 @@ def _run_strategy_backtest(
         bt_data[col] = pd.to_numeric(bt_data[col], errors='coerce')
     bt_data = bt_data.dropna()
 
+    # Predictions arrive keyed by the START of the bar they were computed on (the model saw that
+    # bar's close). They only exist once that bar has ENDED, so re-key them to bar start + the
+    # prediction interval; the strategy then matches them against the END of each execution bar.
+    if len(pred_timestamps) < 2 or len(bt_data) < 2:
+        raise ValueError("Need at least two prediction bars and two execution bars to infer their intervals")
+    pred_starts = sorted(pd.Timestamp(ts) for ts in pred_timestamps)
+    pred_interval = pd.Series(pred_starts).diff().median()
+    exec_interval = bt_data.index.to_series().diff().median()
+    pred_lookup = {pd.Timestamp(ts) + pred_interval: probs for ts, probs in pred_lookup.items()}
+    pred_timestamps = [ts + pred_interval for ts in pred_starts]
+
     # Extract TP/SL from strategy_params
     tp_percent = strategy_params.get('initial_tp_percent') or strategy_params.get('initialTpPercent') or 0
     sl_percent = strategy_params.get('initial_sl_percent') or strategy_params.get('initialSlPercent') or 0
@@ -651,6 +716,7 @@ def _run_strategy_backtest(
     MLStrategy.sl_percent = sl_percent
     MLStrategy.n_classes = n_classes
     MLStrategy.position_sizing_pct = position_sizing_pct
+    MLStrategy.exec_bar_delta = exec_interval
 
     # Log timeframe info
     exec_timestamps = bt_data.index
@@ -665,7 +731,10 @@ def _run_strategy_backtest(
         bt_data,
         MLStrategy,
         cash=initial_capital,
-        commission=commission / 100,
+        # backtesting.py has no slippage parameter. Slippage is a per-fill cost proportional to the
+        # fill value, exactly like commission, so it is charged through the same fraction (it used
+        # to be accepted and ignored, so every ML backtest ran frictionless).
+        commission=(commission + slippage) / 100,
         exclusive_orders=True,
         trade_on_close=True,
         hedging=False,
