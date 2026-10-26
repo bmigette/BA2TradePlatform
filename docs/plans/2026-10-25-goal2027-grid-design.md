@@ -34,7 +34,8 @@ A strategy is in the plan if it ranked in its expert's pooled goal2020 top 5 by 
   `-from2022`.
 - **DeterministicScorer × SQM × xl** is the one cell outside the strategy plan. It is the exploration
   `quality_momentum` recipe as a GA cell (§2.8, evidence below). Every DeterministicScorer cell, this one
-  included, also searches the DS factor genes (`--search-ds-factor-weights`, name token `dsfw`).
+  included, also searches the DS factor genes (`--search-ds-factor-weights`, name token `dsfw`). Cells
+  whose expert has an audited exploration dimension also carry `--search-exploration-ranges` (`explr`, §2.9).
 - The ML forecast expert ([2026-10-25-ml-forecast-expert-design.md](2026-10-25-ml-forecast-expert-design.md))
   joins as extra cells only if its pilot shows an edge.
 
@@ -222,6 +223,56 @@ max_stocks: 50
 The three cap bands (`SCREENER_CAP_BANDS`, `ba2_providers`) only set a cap-gene range, and the launcher has no
 "all screen keys pinned" mode yet. So `xl` is documented here and is NOT runnable until `grid_goal2027.sh` (§2.6)
 or a launcher option pins these keys. A test pins this block to the exploration screen.
+
+### 2.9 Exploration ranges: what the families varied by hand vs what the cells search
+
+Owner request 2026-10-26: every dimension exploration phase 1 varied by hand should be a GA gene in the matching
+goal2027 cell, with the family's control on the lattice. Audit against the code (S1/S2/S3/S5/S6 templates in
+`ba2test_launcher.py`, `_EXPERT_OPT`, the baselines in `tools/strategy_research/exploration/baselines_20260907.json`).
+Status: covered = every exploration value and the control is on the searched lattice; range = the gene exists but
+misses an exploration value or the control; missing = no gene.
+
+| Family (cell expert, strategies) | Dimension | Exploration values (control) | Gene today and range | Status | Fix |
+|---|---|---|---|---|---|
+| mid_insider (InsiderClusterBuy, S1) | time exit | 60/90/120/210 (210) | `exit:s1_exit_time:enabled` + S1 day leaf 30-200 step 30 | range: 210 missing (max reached 180) | `explr`: 30-210 step 30 |
+| mid_insider | insider lookback | 30/60/90/120 (120) | `model:lookback_days` 30-120 step 15 | covered | none |
+| small_earnings, mid_earnings (EarningsDrift, S1) | time exit on/off | 60/90/120, off (small: off; mid: 150) | `exit:s1_exit_time:enabled` + 30-200 step 30 | covered (off = toggle) | none |
+| EarningsDrift S2 | time exit on/off | 60/90/120, off | `exit:exit_time:enabled` + `cond:xt:value` 20-120 step 20 | range: 90 missing | `explr`: step 10 |
+| EarningsDrift S3 | time exit on/off | 60/90/120, off | toggle + `cond:xt:value` 30-150 step 30 | covered | none |
+| EarningsDrift S5 | time exit on/off | 60/90/120, off | none (S5 has no time exit) | missing | `explr`: toggled `exit_time` close + `cond:xt:value` 30-150 step 30 (default 90), before the floor stop |
+| mid_earnings (EarningsDrift, S1) | first-tier target offset | -14/-12/-10/-8 (-14) | `entry:buy-1:a1:action_value` -20..10 step 2 | covered | none |
+| mid_earnings (S2, S3, S5) | first-tier target offset | n/a | those strategies have no target-anchored entry TP | not applicable | none |
+| mid_ds (DS, S1) | time exit | 15/20/25/30 (25) | toggle + S1 day leaf 30-200 step 30 | range: 15, 20, 25 missing | `explr`: 15-180 step 5 |
+| mid_ds (DS, S2) | time exit | 15/20/25/30 (25) | toggle + `cond:xt:value` 20-120 step 20 | range: 15, 25, 30 missing | `explr`: 15-120 step 5 |
+| mid_ds (DS, S6) | time exit | 15/20/25/30 (25) | `cond:xt:value` 10-30 step 5 (always on) | covered | none |
+| mid_ds (DS, S1, S2, S6) | separate bearish exit on/off | on/off | `exit:s1_exit_signal:enabled`, `exit:exit_bearish:enabled` (all three) | covered | none |
+| small_rating (FMPRating, S1) | time exit | 60/90/120, off | toggle + 30-200 step 30 | covered | none |
+| small_rating (S2) | time exit | 60/90/120, off | toggle + `cond:xt:value` 20-120 step 20 | range: 90 missing | `explr`: step 10 |
+| small_rating (S6) | time exit | 60/90/120, off | `cond:xt:value` 10-30, no toggle | not applicable | none: S6 is the quick-cycle strategy by design; the flag is refused for FMPRating S6 |
+| small_rating (S1) | bracket original/near/wide, both tiers | tier TP/SL: near (-14, -4), wide (8, -18), original (-14, -4 and 8, -18) | per tier `entry:buy-k:a1:action_value` -20..10 and `a2` -20..-3, step 2, with `enabled` toggles | covered as values: each tier is searched independently, so the common near/wide brackets are reachable but not as one joint choice | none (a joint choice gene would shrink the space but is a different search) |
+| small_rating (S2, S6) | bracket | n/a | no tiered entry bracket in S2; S6 uses an order-price TP/SL | not applicable | none |
+| analyst_targets (DS, SQM cell) | hold | 15/30/60 | SQM `cond:xt:value` 20-120 step 10 | range: 15 missing | `explr`: SQM 15-120 step 5 |
+| analyst_targets (DS) | target window | 30/60/90 (90) | none | missing | built in 2.8 (`dsfw`): `model:analyst_target_window_days` 30-90 step 30 |
+| analyst_targets (DS) | minimum observations | 3/5 (3) | none | missing | built in 2.8 (`dsfw`): `model:analyst_min_targets` 3-5 step 2 |
+| analyst_targets (DS) | analyst/technical 80/20 | w_analyst 0.8, w_technical 0.2 | `w_analyst` max 0.4 | range | built in 2.8 (`dsfw`): max 0.8 |
+| analyst_targets (DS) | `aw_targets` 1.0 / `aw_grades` 0.0 | fixed by the family | DS defaults 0.5/0.5, not genes | missing | NOT built: the owner did not list it; flagged below |
+
+What `--search-exploration-ranges` (name token `explr`) does, and nothing else:
+- widens the time-exit threshold of FMPInsiderClusterBuy S1, DeterministicScorer S1/S2/SQM, FMPRating S2 and
+  FMPEarningsDrift S2 to the lattices in the table (each template default sits on the new lattice; a test pins it);
+- gives FMPEarningsDrift S5 a toggleable time exit placed with the closes, before the always-matching floor stop (first
+  match wins, so the floor stop stays last). "Off" is the toggle, the unlimited-hold control;
+- is defined only for the expert/strategy pairs above (the launcher refuses any other pair, and the capband driver
+  forwards it only to those); requires `explr` in `--name-suffix`; folds into the job-name digest; without it every
+  gene space and run name is unchanged.
+
+The genes are ordinary rule genes (`cond:*:value`, `exit:*:enabled`), so the trial config, the TOP-N re-run, the
+export and the deploy conversion need no new path. A test round-trips the S5 time exit through export and the live
+conversion.
+
+Open points: (1) `aw_targets`/`aw_grades` for the analyst_targets recipe (see above); (2) the SQM cell takes no
+market-profile genes, so the market-gate dimensions of the other cells do not apply to it; (3) `xl` still needs a
+fixed-screen mode (2.8).
 
 ## 3. Data preparation (January 2027)
 

@@ -208,6 +208,24 @@ def ds_factor_gene_tokens(args, expert) -> list:
     return []
 
 
+#: Must equal ``ba2test_launcher._EXPLORATION_RANGE_PAIRS`` (pinned by test): the drivers cannot import the launcher.
+EXPLORATION_RANGE_PAIRS = {
+    "FMPRating": {"S1", "S2"},
+    "FMPEarningsDrift": {"S1", "S2", "S3", "S5"},
+    "FMPInsiderClusterBuy": {"S1"},
+    "DeterministicScorer": {"S1", "S2", "S6", "SQM"},
+}
+
+
+def exploration_range_tokens(args, expert, strat) -> list:
+    """`--search-exploration-ranges` for a job whose (expert, strategy) pair the flag is defined for (goal2027 item
+    2.9), else []. The launcher refuses the flag for any other pair, so it is not forwarded (the caller prints a
+    NOTE)."""
+    if getattr(args, "search_exploration_ranges", False) and strat in EXPLORATION_RANGE_PAIRS.get(expert, ()):
+        return ["--search-exploration-ranges"]
+    return []
+
+
 def exclude_symbols_passthrough(args) -> list:
     """Extra `optimize` CLI tokens for --exclude-symbols ([] when not given, so an ordinary
     invocation of this driver is untouched). Kept separate from
@@ -608,6 +626,11 @@ def main() -> int:
                          "the analyst target window and minimum; w_analyst widened to 0.8) in every "
                          "DeterministicScorer job (goal2027 item 2.8). REQUIRES --name-suffix to contain 'dsfw'. "
                          "Not forwarded to any other expert's job; folds into the job's name digest.")
+    ap.add_argument("--search-exploration-ranges", action="store_true", default=False,
+                    help="Widen the time-exit lattices and add the FMPEarningsDrift S5 time exit so every "
+                         "exploration phase-1 timeout and its control is searchable (goal2027 item 2.9). REQUIRES "
+                         "--name-suffix to contain 'explr'. Forwarded only to the expert/strategy pairs it applies "
+                         "to (see EXPLORATION_RANGE_PAIRS); folds into the job's name digest.")
     ap.add_argument("--workers", default=None,
                     help="Comma-separated remote worker NAMES to distribute each job's GA trials to "
                          "(e.g. 'remote150'); trials spread across these + local. Workers must be "
@@ -782,6 +805,11 @@ def main() -> int:
             ap.error(f"--search-market-profile requires --name-suffix to contain 'mktprof' "
                      f"(got {args.name_suffix!r}): its gene space differs from a market:enabled run's, so it "
                      f"must not share a job name. Example: --name-suffix goal2027-mktprof")
+    if args.search_exploration_ranges:
+        if "explr" not in args.name_suffix.replace("_", "").lower():
+            ap.error(f"--search-exploration-ranges requires --name-suffix to contain 'explr' "
+                     f"(got {args.name_suffix!r}): its gene space differs from a plain run's, so it "
+                     f"must not share a job name. Example: --name-suffix goal2027-explr")
     if args.search_ds_factor_weights:
         if "dsfw" not in args.name_suffix.replace("_", "").lower():
             ap.error(f"--search-ds-factor-weights requires --name-suffix to contain 'dsfw' "
@@ -988,6 +1016,9 @@ def main() -> int:
         if args.search_ds_factor_weights and not ds_tokens:
             print(f"[{i}/{len(jobs)}] NOTE {name}: {expert} is not DeterministicScorer, DS factor genes not applied",
                   flush=True)
+        # --search-exploration-ranges: appended last (same reasoning); digest on its own.
+        er_tokens = exploration_range_tokens(args, expert, strat)
+        cmd += er_tokens
         job_name = name
         # The walk-forward budgets and fold spec are part of the cell identity: a changed budget,
         # window, top-N or pass rule must never resume an older cell's -wf/-refit names.
@@ -997,7 +1028,7 @@ def main() -> int:
             str(args.pass_min_oos_return), str(args.pass_max_dd_mult), str(args.pass_min_folds),
             ",".join(map(str, sorted(set(args.pass_require_fold)))) or "-",
             "exclusive" if args.pass_min_oos_return_exclusive else "inclusive"])
-        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or wf_tokens:
+        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or er_tokens or wf_tokens:
             job_name = _job_name(name, cmd + wf_tokens)
             cmd[cmd.index("--name") + 1] = job_name
         if args.walk_forward:

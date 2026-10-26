@@ -2176,7 +2176,7 @@ def _build_strategy_S3(name: str):
                                 exit_conditions=exit_conditions)
 
 
-def _build_strategy_S5(name: str):
+def _build_strategy_S5(name: str, *, time_exit: bool = False):
     """S5 — S2/S3 HYBRID: signal exits + trailing ladder. Data-driven design from the -goal grids:
     the best S2 config (186% archived S2-large winner) entered on nearly every signal (all gates
     off) and managed purely by exits — but capped every winner at a FIXED +32% TP while its trades
@@ -2241,11 +2241,22 @@ def _build_strategy_S5(name: str):
              {"id": "xcap", "field": "profit_loss_percent", "op": ">", "value": 60,
               "optimize": True, "value_min": 40, "value_max": 80, "value_step": 5}]}},
     ]
+    order = ["exit_bearish", "exit_downgrade", "exit_cap", "trail_t3", "trail_t2", "trail_t1",
+             "exit_belock", "exit_stoploss"]
+    if time_exit:
+        # ``--search-exploration-ranges`` (goal2027 2.9), FMPEarningsDrift only: the exploration families
+        # tested a 60/90/120-day timeout against the unlimited-hold control, and S5 had no time exit at all.
+        # Toggleable (off = unlimited hold, the control); a close, so it goes with the closes, before the
+        # always-matching floor stop. Same ids as S2/S3/S6 (cond:xt:value, exit:exit_time:enabled).
+        exit_conditions.append(
+            {"id": "exit_time", "action_type": "close", "toggle_optimize": True,
+             "conditions": {"type": "AND", "conditions": [
+                 {"id": "xt", "field": "days_opened", "op": ">", "value": 90,
+                  "optimize": True, "value_min": 30, "value_max": 150, "value_step": 30}]}})
+        order.insert(order.index("exit_cap") + 1, "exit_time")
     # FIRST-MATCH order: signal closes + wide cap first, trailing tiers DEEPEST-first,
     # break-even lock, always-matching floor stop LAST (see _first_match_order).
-    exit_conditions = _first_match_order(exit_conditions, [
-        "exit_bearish", "exit_downgrade", "exit_cap", "trail_t3", "trail_t2", "trail_t1",
-        "exit_belock", "exit_stoploss"])
+    exit_conditions = _first_match_order(exit_conditions, order)
     return _strategy_from_parts(name, buy_tree=buy_entry_conditions,
                                 exit_conditions=exit_conditions)
 
@@ -5696,6 +5707,30 @@ _SEARCH_MARKET_PROFILE: bool = False
 #: ``strategy_param_space.neutralise_ds_factor_genes``.
 _SEARCH_DS_FACTOR_WEIGHTS: bool = False
 _DS_FACTOR_EXPERT = "DeterministicScorer"
+
+#: ``--search-exploration-ranges`` (goal2027 item 2.9, name token ``explr``): closes the gaps the audit of the
+#: exploration phase-1 families found between what they varied by hand and what the goal2027 cells search (design
+#: doc 2.9). Today that is the TIME-EXIT lattice of the cells below (every exploration timeout and its control must
+#: be reachable) and, for FMPEarningsDrift S5, a toggleable time exit that strategy lacks. Everything else the
+#: families varied is already covered or lives under ``--search-ds-factor-weights``.
+_SEARCH_EXPLORATION_RANGES: bool = False
+#: expert -> the strategies the flag is defined for (a pair outside it is REFUSED: the flag would change nothing).
+_EXPLORATION_RANGE_PAIRS = {
+    "FMPRating": ("S1", "S2"),
+    "FMPEarningsDrift": ("S1", "S2", "S3", "S5"),
+    "FMPInsiderClusterBuy": ("S1",),
+    "DeterministicScorer": ("S1", "S2", "S6", "SQM"),
+}
+#: (expert, strategy) -> (min, max, step) of the ``days_opened`` time-exit threshold under the flag. The default
+#: value of the template must sit on the new lattice (pinned by test).
+_EXPLORATION_TIME_EXIT_RANGE = {
+    ("FMPInsiderClusterBuy", "S1"): (30, 210, 30),      # mid_insider: 60/90/120 + the 210-day control (was max 200)
+    ("DeterministicScorer", "S1"): (15, 180, 5),        # mid_ds 15/20/25/30 (was 30..200 step 30)
+    ("DeterministicScorer", "S2"): (15, 120, 5),        # (was 20..120 step 20)
+    ("FMPRating", "S2"): (20, 120, 10),                 # small_rating 60/90/120 (was step 20: no 90)
+    ("FMPEarningsDrift", "S2"): (20, 120, 10),          # small_earnings 60/90/120 (was step 20: no 90)
+    ("DeterministicScorer", "SQM"): (15, 120, 5),       # analyst_targets hold 15/30/60 (was 20..120 step 10: no 15)
+}
 _MARKET_PROFILE_GENE_PROFILES = ("ohlcv-v1", "ta-structure-v1")
 
 
@@ -6196,6 +6231,59 @@ def _resolve_search_ds_factor_weights(raw, command: str, expert: "str | None" = 
                  f"reads the tw_*/fw_*/mom_lookback_days settings, so the genes would be searched but dead")
     _SEARCH_DS_FACTOR_WEIGHTS = True
     return True
+
+
+def _resolve_search_exploration_ranges(raw, command: str, expert: "str | None" = None) -> bool:
+    """Parse ``--search-exploration-ranges``; sets and returns the module global. Refuses (exit) for an expert with
+    no audited dimension. Always ASSIGNS the global (False included), like the other opt-in gene resolvers."""
+    global _SEARCH_EXPLORATION_RANGES
+    _SEARCH_EXPLORATION_RANGES = False
+    if not raw:
+        return False
+    if expert is not None and expert not in _EXPLORATION_RANGE_PAIRS:
+        sys.exit(f"{command}: --search-exploration-ranges: {expert!r} has no exploration dimension to widen "
+                 f"(defined for {sorted(_EXPLORATION_RANGE_PAIRS)}); the flag would change nothing")
+    _SEARCH_EXPLORATION_RANGES = True
+    return True
+
+
+def _refuse_exploration_ranges_unsupported(command: str, expert: str, kind: str) -> None:
+    """The flag is defined per (expert, strategy); any other pair would be given a name token and a changed identity
+    for a gene space that is the same, so it is refused instead of silently inert."""
+    if _SEARCH_EXPLORATION_RANGES and kind not in _EXPLORATION_RANGE_PAIRS.get(expert, ()):
+        pairs = {e: list(k) for e, k in _EXPLORATION_RANGE_PAIRS.items()}
+        sys.exit(f"{command}: --search-exploration-ranges would not change {expert} {kind} (defined for "
+                 f"{pairs}); drop the flag for this job")
+
+
+def _apply_exploration_time_exit_range(strat, kind: str, expert: str):
+    """Widen the strategy's ONE ``days_opened`` threshold to the exploration lattice (a no-op for an unlisted pair)."""
+    rng = _EXPLORATION_TIME_EXIT_RANGE.get((expert, kind))
+    if rng is None or strat is None:
+        return strat
+    lo, hi, st = rng
+    leaves = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("field") == "days_opened" and node.get("optimize"):
+                leaves.append(node)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+    walk(strat.exit_rules)
+    if len(leaves) != 1:
+        raise ValueError(f"{expert} {kind}: expected one optimised days_opened threshold, found {len(leaves)}")
+    leaf = leaves[0]
+    if not (lo <= float(leaf["value"]) <= hi and (float(leaf["value"]) - lo) % st == 0):
+        raise ValueError(f"{expert} {kind}: template time exit {leaf['value']} is off the exploration lattice "
+                         f"{lo}..{hi} step {st}")
+    for key, camel, val in (("value_min", "valueMin", lo), ("value_max", "valueMax", hi),
+                            ("value_step", "valueStep", st)):
+        leaf[key] = leaf[camel] = val
+    return strat
 
 
 def _ds_factor_gene_space() -> dict:
@@ -7098,7 +7186,12 @@ def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="le
         builder = _STRATEGY_BUILDERS.get(kind)
         if builder is None:
             sys.exit(f"optimize: unknown strategy {kind!r}; have {sorted(_STRATEGY_BUILDERS)}")
-        strat = builder(name)
+        if kind == "S5" and _SEARCH_EXPLORATION_RANGES and expert == "FMPEarningsDrift":
+            strat = builder(name, time_exit=True)       # goal2027 2.9: S5 gains a toggleable time exit
+        else:
+            strat = builder(name)
+    if _SEARCH_EXPLORATION_RANGES:
+        strat = _apply_exploration_time_exit_range(strat, kind, expert)
     if kind in _EQUITY_MARKET_CONDITION_STRATEGIES:
         # Equity market-condition gates/exits (design 2026-09-15 Task 11, lifted 2026-09-29):
         # a no-op with the profile off / no --market-exit, so every existing S1-S7 command stays
@@ -7214,6 +7307,7 @@ def _cmd_optimize(args) -> int:
                                 getattr(args, "sizing_mode", None), "optimize")
     _resolve_search_market_profile(getattr(args, "search_market_profile", False), "optimize")
     _resolve_search_ds_factor_weights(getattr(args, "search_ds_factor_weights", False), "optimize", args.expert)
+    _resolve_search_exploration_ranges(getattr(args, "search_exploration_ranges", False), "optimize", args.expert)
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -7334,6 +7428,7 @@ def _cmd_optimize(args) -> int:
         _refuse_sizing_gene_unsupported("optimize", args.strategy, bypass)
         _refuse_market_profile_gene_unsupported("optimize", args.strategy, bypass)
         _refuse_ds_only_strategy("optimize", args.strategy, expert)
+        _refuse_exploration_ranges_unsupported("optimize", expert, args.strategy)
         _sname = args.name or f"opt-{expert}-{args.strategy}"
         # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
         # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
@@ -7692,6 +7787,7 @@ def _cmd_optimize_batch(args) -> int:
     _resolve_search_sizing_mode(False, None, "optimize-batch")   # the gene is optimize-only; reset the global
     _resolve_search_market_profile(False, "optimize-batch")      # likewise
     _resolve_search_ds_factor_weights(False, "optimize-batch")   # likewise
+    _resolve_search_exploration_ranges(False, "optimize-batch")  # likewise
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     batch_worker_ids = _worker_ids_from_args(args)  # resolved once; applied to every job
@@ -9258,6 +9354,14 @@ def main(argv: "list | None" = None) -> int:
                          "to 0.8. DS normalises weights, so only ratios matter; a section whose sub-weights are all "
                          "zero is switched OFF (section weight 0), never scored as a silent 0. Refused for any "
                          "other expert. Name the job distinctly ('dsfw'): its gene space differs.")
+    op.add_argument("--search-exploration-ranges", action="store_true", default=False,
+                    help="goal2027 item 2.9: close the gaps between the exploration phase-1 families and the "
+                         "searched genes (design doc 2.9 holds the audit). The time-exit threshold of "
+                         "FMPInsiderClusterBuy S1 (up to 210), DeterministicScorer S1/S2/SQM (from 15, step 5), "
+                         "FMPRating S2 and FMPEarningsDrift S2 (step 10) gets a lattice holding every exploration "
+                         "timeout and its control, and FMPEarningsDrift S5 gains a toggleable time exit (off = "
+                         "unlimited hold). Refused for an expert/strategy pair it would not change. Name the job "
+                         "distinctly ('explr'): its gene space differs.")
     op.add_argument("--rm-toggle-policy", choices=_RM_TOGGLE_POLICIES, default="pinned",
                     help="'pinned' (default): use_atr_stop/regime_overlay_enabled are pinned OFF "
                          "for this run, exactly as every run on record -- byte-identical to "
