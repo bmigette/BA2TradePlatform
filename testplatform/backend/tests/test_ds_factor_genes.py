@@ -336,3 +336,34 @@ class TestAnalystLegs:
             return trial_key({"engine": "daily", "seed": 1, "params": canonical_trial_params({}, flat)})
         a = {**_ANALYST, "model:w_analyst": 0.0}
         assert key(a) == key({**a, "model:aw_targets": 0.3})
+
+
+# ----------------------------------------------------------------------------- confidence ceiling under dsfw
+class TestConfidenceCeiling:
+    def teardown_method(self):
+        _M._resolve_search_ds_factor_weights(False, "optimize")
+
+    def test_the_dsfw_ceiling_is_the_theoretical_bound_recomputed_from_the_scorer(self):
+        import math
+        from ba2_experts.DeterministicScorer import combine
+        bound = 100.0 * math.tanh(1.0 / combine.DEF_K_COMPRESS)
+        assert 93.0 <= bound < 94.0 and _M._DS_FACTOR_CONFIDENCE_CEILING == math.floor(bound)
+        # the bound really holds: even with every section at +1 and no regime damping
+        top = combine.final_score(1.0, 1.0, 1.0, None, {"w_technical": 1, "w_fundamental": 1, "w_analyst": 1,
+                                                          "w_earnings": 1, "macro_mode": "off"},
+                                  earnings=1.0)["final"]
+        assert 100.0 * top <= bound + 1e-9 and 100.0 * top > 90.0
+
+    def test_flag_off_keeps_50_and_flag_on_lifts_it(self):
+        assert _M._confidence_ceiling_for("DeterministicScorer") == 50.0
+        _M._resolve_search_ds_factor_weights(True, "optimize", "DeterministicScorer")
+        assert _M._confidence_ceiling_for("DeterministicScorer") == 93.0
+        assert _M._confidence_ceiling_for("FMPRating") is None          # other experts unaffected
+
+    def test_the_clamp_follows_the_ceiling(self):
+        def top_gate(flag):
+            _M._resolve_search_ds_factor_weights(flag, "optimize", "DeterministicScorer")
+            strat = _M._build_strategy("S2", "n", "DeterministicScorer")
+            return collect_param_space(strat)["cond:gate_confidence:value"]["max"]
+        assert top_gate(False) == 50.0
+        assert top_gate(True) > 50.0                  # S2's own range (40..80) is no longer cut at 50

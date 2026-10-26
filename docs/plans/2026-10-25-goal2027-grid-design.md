@@ -187,6 +187,10 @@ requires `dsfw` in `--name-suffix`; DeterministicScorer jobs only, refused for a
     target details; both legs 0 with `w_analyst` > 0 switches the analyst section off (`w_analyst` -> 0.0, DS would
     otherwise drop it as missing); a zero `aw_targets` removes the target window and minimum.
   A genome with every section at 0 is left as today: it trades nothing and the trade-count gate disqualifies it.
+- **Confidence ceiling.** Flag off, DS confidence gates stay clamped at 50 (measured under the default weights). Under
+  `dsfw` the gene space leaves that measurement, so the clamp becomes the theoretical bound: confidence = 100 x
+  tanh(raw / 0.6) x m with |raw| <= 1 and m <= 1, i.e. at most 93.1, floored to 93.0. It is a supremum, not a measured
+  maximum.
 - **Parity.** The deploy payload carries the canonical `w_technical`/`w_fundamental` (what the backtest ran), not the
   raw genome. A row whose optimization searched the genes but lost one is refused at export. Without the flag the gene
   space, the run settings and the run names are byte-identical.

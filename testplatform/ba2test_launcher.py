@@ -7201,9 +7201,28 @@ _EXPERT_CONFIDENCE_CEILING = {
 }
 
 
+#: DeterministicScorer's ceiling under ``--search-ds-factor-weights``. The 50.0 above was MEASURED under the default
+#: section weights (analyst <= 0.4 and a blended technical section), where the sections rarely agree. The dsfw gene
+#: space reaches combinations the measurement never saw (w_analyst up to 0.8, a targets-only analyst leg, a single
+#: technical component), so the measurement no longer bounds it. What does: confidence = 100 * |final|,
+#: final = tanh(raw / k_compress) * m with m <= 1 and raw a weighted AVERAGE of section scores in [-1, 1], hence
+#: |raw| <= 1 and |final| <= tanh(1 / k_compress). With ``DEF_K_COMPRESS`` = 0.6 (not a gene) that is
+#: tanh(1.667) = 0.9311 -> 93.1, floored to 93.0. This is the supremum, not an observed maximum (not measured on
+#: cached data); a gate between the observed maximum and 93 may be hard to pass, but none is arithmetically
+#: impossible, which is all the clamp exists to guarantee. A test recomputes the number from combine.py.
+_DS_FACTOR_CONFIDENCE_CEILING = 93.0
+
+
+def _confidence_ceiling_for(expert: str):
+    """The confidence ceiling of ``expert`` for the job being built (flag-off: ``_EXPERT_CONFIDENCE_CEILING``)."""
+    if _SEARCH_DS_FACTOR_WEIGHTS and expert == _DS_FACTOR_EXPERT:
+        return _DS_FACTOR_CONFIDENCE_CEILING
+    return _EXPERT_CONFIDENCE_CEILING.get(expert)
+
+
 def _clamp_confidence_genes(strat, expert: str):
     """Cap every `confidence` condition's value/range at the expert's reachable ceiling."""
-    ceiling = _EXPERT_CONFIDENCE_CEILING.get(expert)
+    ceiling = _confidence_ceiling_for(expert)
     if ceiling is None or strat is None:
         return strat
 
