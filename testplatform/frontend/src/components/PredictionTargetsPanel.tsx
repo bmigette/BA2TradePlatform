@@ -22,11 +22,15 @@ import type {
   TripleBarrierTarget,
   TrendReversalTarget,
   VolatilityTarget,
+  TripleBarrierAtrTarget,
+  DirectionTercilesTarget,
+  ForwardReturnTarget,
   CalculatedTarget,
   IndicatorParams,
 } from '../types/targets';
 
-type TabType = 'price_based' | 'directional' | 'triple_barrier' | 'trend_reversal' | 'volatility';
+type TabType = 'price_based' | 'directional' | 'triple_barrier' | 'trend_reversal' | 'volatility'
+  | 'triple_barrier_atr' | 'direction_terciles' | 'forward_return';
 
 interface PredictionTargetsPanelProps {
   datasetId: number;
@@ -111,6 +115,21 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
     horizon: 5,
     horizonUnit: 'bars' as 'bars' | 'days',
     method: 'std' as 'std' | 'range' | 'atr',
+  });
+
+  // Alpaca history cache targets (horizons in sessions, thresholds fitted on the training rows)
+  const [tripleBarrierAtrForm, setTripleBarrierAtrForm] = useState({
+    horizonSessions: 5,
+    slRatio: 1.0,
+    tpAtr: '',  // Empty = fitted so the timeout share is about a third
+  });
+
+  const [directionTercilesForm, setDirectionTercilesForm] = useState({
+    horizonSessions: 3,
+  });
+
+  const [forwardReturnForm, setForwardReturnForm] = useState({
+    horizonSessions: 5,
   });
 
   // Unique color palette for targets - each target gets a distinct color
@@ -301,6 +320,35 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
         color = getNextColor();
         break;
 
+      case 'triple_barrier_atr':
+        config = {
+          type: 'triple_barrier_atr',
+          category: 'multiclass_classification',
+          horizonSessions: tripleBarrierAtrForm.horizonSessions,
+          slRatio: tripleBarrierAtrForm.slRatio,
+          ...(tripleBarrierAtrForm.tpAtr !== '' ? { tpAtr: parseFloat(tripleBarrierAtrForm.tpAtr) } : {}),
+        } as TripleBarrierAtrTarget;
+        color = getNextColor();
+        break;
+
+      case 'direction_terciles':
+        config = {
+          type: 'direction_terciles',
+          category: 'multiclass_classification',
+          horizonSessions: directionTercilesForm.horizonSessions,
+        } as DirectionTercilesTarget;
+        color = getNextColor();
+        break;
+
+      case 'forward_return':
+        config = {
+          type: 'forward_return',
+          category: 'regression',
+          horizonSessions: forwardReturnForm.horizonSessions,
+        } as ForwardReturnTarget;
+        color = getNextColor();
+        break;
+
       default:
         return;
     }
@@ -316,7 +364,7 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
     };
 
     setTargets([...targets, newTarget]);
-  }, [activeTab, priceBasedForm, directionalForm, tripleBarrierForm, trendReversalForm, volatilityForm, targets, getNextColor]);
+  }, [activeTab, priceBasedForm, directionalForm, tripleBarrierForm, trendReversalForm, volatilityForm, tripleBarrierAtrForm, directionTercilesForm, forwardReturnForm, targets, getNextColor]);
 
   // Remove target with confirmation
   const removeTarget = useCallback((index: number) => {
@@ -408,6 +456,19 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
         const unit = c.horizonUnit === 'days' ? 'd' : 'b';
         return `Volatility ${c.method} ${c.horizon}${unit}`;
       }
+      case 'triple_barrier_atr': {
+        const c = config as TripleBarrierAtrTarget;
+        const tp = c.tpAtr !== undefined ? `${c.tpAtr}xATR` : 'fitted TP';
+        return `ATR barrier ${tp}/SL x${c.slRatio}/${c.horizonSessions}s`;
+      }
+      case 'direction_terciles': {
+        const c = config as DirectionTercilesTarget;
+        return `Direction terciles ${c.horizonSessions}s`;
+      }
+      case 'forward_return': {
+        const c = config as ForwardReturnTarget;
+        return `Forward return ${c.horizonSessions}s`;
+      }
       default:
         return 'Unknown';
     }
@@ -434,6 +495,9 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
     { id: 'triple_barrier', label: 'Triple-Barrier', icon: <BarChart3 size={16} /> },
     { id: 'trend_reversal', label: 'Trend Reversal', icon: <TrendingDown size={16} /> },
     { id: 'volatility', label: 'Volatility', icon: <Activity size={16} /> },
+    { id: 'triple_barrier_atr', label: 'ATR Barrier', icon: <BarChart3 size={16} /> },
+    { id: 'direction_terciles', label: 'Direction Terciles', icon: <TrendingUp size={16} /> },
+    { id: 'forward_return', label: 'Forward Return', icon: <Activity size={16} /> },
   ];
 
   return (
@@ -900,6 +964,86 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
             </div>
             <p className="text-xs text-gray-500 dark:text-gray-400">
               Regression target: predicts volatility over next {volatilityForm.horizon} {volatilityForm.horizonUnit}
+            </p>
+          </div>
+        )}
+
+        {activeTab === 'triple_barrier_atr' && (
+          <div className="flex flex-wrap items-end gap-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Horizon (sessions)</label>
+              <input
+                type="number"
+                min="1"
+                value={tripleBarrierAtrForm.horizonSessions}
+                onChange={(e) => setTripleBarrierAtrForm({ ...tripleBarrierAtrForm, horizonSessions: parseInt(e.target.value) || 1 })}
+                className="w-20 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">SL / TP ratio</label>
+              <input
+                type="number"
+                min="0.1"
+                step="0.1"
+                value={tripleBarrierAtrForm.slRatio}
+                onChange={(e) => setTripleBarrierAtrForm({ ...tripleBarrierAtrForm, slRatio: parseFloat(e.target.value) || 1 })}
+                className="w-24 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">TP (x daily ATR)</label>
+              <input
+                type="number"
+                min="0.25"
+                step="0.25"
+                placeholder="fitted"
+                value={tripleBarrierAtrForm.tpAtr}
+                onChange={(e) => setTripleBarrierAtrForm({ ...tripleBarrierAtrForm, tpAtr: e.target.value })}
+                className="w-24 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
+              />
+            </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              3 classes: loss / timeout / win. TP = k x ATR, SL = ratio x k x ATR; a blank TP is fitted on the training rows
+              so about a third time out. Needs a dataset from the Alpaca history cache (1h / 15m).
+            </p>
+          </div>
+        )}
+
+        {activeTab === 'direction_terciles' && (
+          <div className="flex flex-wrap items-end gap-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Horizon (sessions)</label>
+              <input
+                type="number"
+                min="1"
+                value={directionTercilesForm.horizonSessions}
+                onChange={(e) => setDirectionTercilesForm({ ...directionTercilesForm, horizonSessions: parseInt(e.target.value) || 1 })}
+                className="w-20 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
+              />
+            </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              3 classes: down / flat / up over {directionTercilesForm.horizonSessions} sessions; the thresholds are the training
+              rows' terciles. Needs a dataset from the Alpaca history cache (1h / 15m).
+            </p>
+          </div>
+        )}
+
+        {activeTab === 'forward_return' && (
+          <div className="flex flex-wrap items-end gap-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Horizon (sessions)</label>
+              <input
+                type="number"
+                min="1"
+                value={forwardReturnForm.horizonSessions}
+                onChange={(e) => setForwardReturnForm({ ...forwardReturnForm, horizonSessions: parseInt(e.target.value) || 1 })}
+                className="w-20 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
+              />
+            </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Regression target: the {forwardReturnForm.horizonSessions}-session forward return. Needs a dataset from the
+              Alpaca history cache (1h / 15m).
             </p>
           </div>
         )}

@@ -351,6 +351,12 @@ const JobWizard: React.FC<JobWizardProps> = ({
         const unit = config.horizonUnit === 'days' ? 'days' : 'bars';
         return `Volatility (${config.method || 'unknown'}, ${config.horizon || 0} ${unit})`;
       }
+      case 'triple_barrier_atr':
+        return `ATR Barrier ${config.tpAtr !== undefined ? `TP:${config.tpAtr}xATR` : 'TP:fitted'} SL:x${config.slRatio} (${config.horizonSessions} sessions)`;
+      case 'direction_terciles':
+        return `Direction terciles (${config.horizonSessions} sessions)`;
+      case 'forward_return':
+        return `Forward return (${config.horizonSessions} sessions)`;
       default:
         return `Target: ${String(config.type)}`;
     }
