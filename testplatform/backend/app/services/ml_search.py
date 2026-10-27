@@ -85,6 +85,13 @@ GENE_SPACE: Dict[str, Dict[str, Any]] = {
     "dropout": {"type": "choice", "choices": [0.0, 0.1, 0.3]},
     "epochs": {"type": "choice", "choices": [10, 20, 30]},
 }
+# GeneticOptimizer evolves a choice gene as an index on [0, n-1]. The categorical genes are "stratified": balanced in
+# generation 0 and mutated by a uniform re-draw (their neighbouring indices are not neighbours in meaning); the
+# ordinal ones (lookback, lr, width, dropout, epochs) keep the index nudge.
+for _n, _g in GENE_SPACE.items():
+    _g.update({"min": 0, "max": len(_g["choices"]) - 1, "step": 1})
+    if _n in ("timeframe", "features", "target", "pooled", "tsai_arch", "darts_arch"):
+        _g["stratify"] = True
 
 
 @dataclass(frozen=True)
@@ -546,6 +553,50 @@ def _save_fold_model(save_dir: Path, fold: str, group: str, s: Setup, feats, fd:
         torch.save(model.state_dict(), d / f"{group}.pt")
     if darts_model is not None:
         darts_model.save(str(d / f"{group}.darts.pt"))
+
+
+# ------------------------------------------------------------------ stage B: forecast store
+def store_card(s: Setup, feats: Sequence[str]):
+    """The model card of a setup's stitched predictions. The setup key is in the model id, so a different setup is a
+    different store."""
+    from ba2_common.core.ml_forecast.model_card import ModelCard
+    return ModelCard(model_id=f"ba2/custom-{s.key()}", family="tsai" if s.spec.is_classification else "darts",
+                     version="1", input_fields=tuple(feats), timeframe=s.timeframe, context_length=s.lookback,
+                     past_only_covariates=(), past_future_covariates=(), horizons=(s.spec.horizon,),
+                     scaler="robust median/IQR per fold, saved with each fold model",
+                     output_type="class_probs" if s.spec.is_classification else "deciles",
+                     pretraining_cutoff=None, licence="internal", licence_commercial_ok=True)
+
+
+def forecast_rows(s: Setup, preds: pd.DataFrame) -> List[Any]:
+    """Stitched decision-bar predictions -> store rows. The row of session S is forecast from the bars ending at S's
+    close, the store's convention (usable by a decision on S at the close, filled on S+1)."""
+    from ba2_common.core.ml_forecast.forecast_row import ForecastRow
+    h = s.spec.horizon
+    rows = []
+    for r in preds.itertuples(index=False):
+        if s.spec.is_classification:
+            p = np.array([r.p_down, r.p_mid, r.p_up], dtype=np.float64)
+            p = p / p.sum()
+            cf = ((p[0], float(r.r_down)), (p[1], float(r.r_mid)), (p[2], float(r.r_up)))
+            rows.append(ForecastRow(r.symbol, r.session, {}, class_probs={h: cf}))
+        else:
+            q = tuple(float(getattr(r, f"q{l}")) for l in DECILES)
+            rows.append(ForecastRow(r.symbol, r.session, {h: q}))
+    return rows
+
+
+def write_setup_store(s: Setup, preds: pd.DataFrame, info: Dict[str, Any], alias: str, cache_root=None) -> str:
+    """Write a setup's stitched predictions to ``<cache>/ml_forecast/<model_key>/``; returns the key. ``alias``
+    becomes ``build.card_id`` (what MLForecast's ``model_key`` setting names)."""
+    from ba2_common.core.ml_forecast import store
+    from ba2_common.core.ml_forecast.model_card import model_key
+    card = store_card(s, info["features"])
+    key = model_key(card, ())
+    build = {"card_id": alias, "setup": asdict(s), "setup_key": s.key(), "folds": info["folds"],
+             "design": "docs/plans/2026-10-27-custom-ml-models-design.md"}
+    store.write_rows(key, card, build, forecast_rows(s, preds), covariate_set=(), cache_root=cache_root)
+    return key
 
 
 # ------------------------------------------------------------------ stage A job

@@ -8894,6 +8894,7 @@ def _cmd_ml_search(args) -> int:
     docs/plans/2026-10-27-custom-ml-models-design.md). Trains on the 2025 folds only; writes trials.jsonl,
     predictions/ and result.json under --out."""
     from datetime import date as _date
+    from pathlib import Path
     from ba2_common import config as _bc
     from app.services.ml_search import ensure_panels, handle_ml_model_search
     panels = ensure_panels(Path(args.panel_dir), _date.fromisoformat(args.panel_start),
