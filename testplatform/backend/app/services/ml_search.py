@@ -732,6 +732,10 @@ def handle_ml_model_search(task_id: str, payload: Dict[str, Any]) -> Dict[str, A
     space = json.loads(json.dumps(GENE_SPACE))
     space["darts_arch"]["choices"] = list(payload["darts_archs"])
     space["darts_arch"]["max"] = len(payload["darts_archs"]) - 1
+    if len(payload["darts_archs"]) == 1:
+        # a one-value gene cannot be uniformly re-drawn among "the other values" (GeneticOptimizer's stratified
+        # mutation); it is a constant, mutated by the (no-op) index nudge
+        space["darts_arch"].pop("stratify", None)
     out = Path(payload["out_dir"])
     out.mkdir(parents=True, exist_ok=True)
     panels = {tf: str(p) for tf, p in payload["panels"].items()}
