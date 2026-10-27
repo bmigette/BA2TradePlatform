@@ -94,6 +94,7 @@ def test_model_key_rejects_blank_covariate():
         model_key(make_card(), ("",))
 
 
-def test_class_probs_not_supported_yet():
-    with pytest.raises(ValueError, match="not supported until the tsai adapter milestone"):
-        make_card(output_type="class_probs")
+def test_class_probs_is_an_output_type():
+    assert make_card(output_type="class_probs").output_type == "class_probs"
+    with pytest.raises(ValueError, match="output_type must be one of"):
+        make_card(output_type="logits")

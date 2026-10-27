@@ -546,6 +546,30 @@ def _save_fold_model(save_dir: Path, fold: str, group: str, s: Setup, feats, fd:
 
 
 # ------------------------------------------------------------------ stage A job
+def ensure_panels(panel_dir: Path, first_day, last_day, cache_root) -> Dict[str, str]:
+    """Build (or reuse) the H1 and M15 panels with every feature group. A panel is rebuilt when its meta records a
+    different range or source fingerprint (the cached bars changed)."""
+    from datetime import date as _date
+    panel_dir = Path(panel_dir)
+    panel_dir.mkdir(parents=True, exist_ok=True)
+    out = {}
+    for tf in GENE_SPACE["timeframe"]["choices"]:
+        p = panel_dir / f"mag7_{tf}.parquet"
+        mp = panel_dir / f"mag7_{tf}.meta.json"
+        spec = MP.PanelSpec(tf, first_day, last_day)
+        if p.exists() and mp.exists():
+            meta = json.loads(mp.read_text(encoding="utf-8"))
+            fresh = {s: MP._fingerprint(MP._cache_file(Path(cache_root), s)) for s in meta["source"]}
+            if (meta["first_day"], meta["last_day"]) == (str(first_day), str(last_day)) and meta["source"] == fresh:
+                out[tf] = str(p)
+                continue
+        panel, meta = MP.build_panel(spec, Path(cache_root))
+        panel.to_parquet(p, index=False)
+        mp.write_text(json.dumps(meta, indent=1, default=str), encoding="utf-8")
+        out[tf] = str(p)
+    return out
+
+
 def quiet_training_logs() -> None:
     for name in ("pytorch_lightning", "lightning", "lightning.pytorch", "lightning_fabric", "darts"):
         logging.getLogger(name).setLevel(logging.ERROR)

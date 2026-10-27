@@ -20,8 +20,8 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 
-from .forecast_row import (DECILE_LEVELS, DIRECTIONS, SL_GRID_PCT, TP_GRID_PCT, ForecastRow, decile_col, prob_col,
-                           record_columns)
+from .forecast_row import (CLASSES, DECILE_LEVELS, DIRECTIONS, SL_GRID_PCT, TP_GRID_PCT, ForecastRow, class_cols,
+                           decile_col, prob_col, record_columns)
 from .model_card import ModelCard, model_key as compute_model_key
 
 STORE_DIRNAME = "ml_forecast"
@@ -72,7 +72,7 @@ MAX_CACHED_FRAMES_PER_KEY_HORIZON = 256
 class _Entry(NamedTuple):
     mtime: int
     sessions: np.ndarray            # datetime64[D], sorted ascending
-    dec: np.ndarray                 # (n, 9) float32
+    dec: np.ndarray                 # (n, 9) float32 deciles, or (n, 6) p_down/mid/up + r_down/mid/up (class stores)
     probs: Optional[np.ndarray]     # (n, 2 * |TP grid| * |SL grid|) float32, or None for decile-only stores
 
 
@@ -123,14 +123,16 @@ def read_meta(key: str, cache_root: Optional[os.PathLike] = None) -> Dict[str, A
     return meta
 
 
-def _columns(horizon: int, with_paths: bool) -> List[str]:
+def _columns(horizon: int, with_paths: bool, with_classes: bool = False) -> List[str]:
+    if with_classes:
+        return ["session"] + class_cols(horizon)
     cols = ["session"] + [decile_col(horizon, q) for q in DECILE_LEVELS]
     if with_paths:
         cols += [prob_col(d, horizon, tp, sl) for d, tp, sl in _PROB_CELLS]
     return cols
 
 
-def _load_entry(kdir: Path, sym: str, horizon: int, with_paths: bool) -> _Entry:
+def _load_entry(kdir: Path, sym: str, horizon: int, with_paths: bool, with_classes: bool = False) -> _Entry:
     """The symbol's sessions + the horizon's columns, as float32 arrays. LRU-cached; invalidated by file mtime."""
     p = kdir / f"{sym}.parquet"
     mt = _mtime(p)
@@ -141,7 +143,7 @@ def _load_entry(kdir: Path, sym: str, horizon: int, with_paths: bool) -> _Entry:
         if hit is not None and hit.mtime == mt:
             lru.move_to_end(sym)
             return hit
-    cols = _columns(horizon, with_paths)
+    cols = _columns(horizon, with_paths, with_classes)
     try:
         df = pd.read_parquet(p, columns=cols)
     except (KeyError, pa.ArrowInvalid) as e:
@@ -149,8 +151,12 @@ def _load_entry(kdir: Path, sym: str, horizon: int, with_paths: bool) -> _Entry:
     sessions = pd.to_datetime(df["session"]).to_numpy().astype("datetime64[D]")
     order = np.argsort(sessions, kind="stable")
     sessions = sessions[order]
-    dec = df[cols[1:10]].to_numpy(dtype=np.float32)[order]
-    probs = df[cols[10:]].to_numpy(dtype=np.float32)[order] if with_paths else None
+    if with_classes:
+        dec = df[cols[1:]].to_numpy(dtype=np.float32)[order]
+        probs = None
+    else:
+        dec = df[cols[1:10]].to_numpy(dtype=np.float32)[order]
+        probs = df[cols[10:]].to_numpy(dtype=np.float32)[order] if with_paths else None
     entry = _Entry(mt, sessions, dec, probs)
     with _lock:
         lru = _frames.setdefault(ck, OrderedDict())
@@ -179,7 +185,8 @@ def read_row(model_key: str, symbol: str, decision_session_cutoff: date, horizon
     if horizon not in card.horizons:
         raise ValueError(f"horizon {horizon} is not one of the store's horizons {card.horizons}")
     with_paths = card.output_type == "paths"
-    e = _load_entry(kdir, sym, horizon, with_paths)
+    with_classes = card.output_type == "class_probs"
+    e = _load_entry(kdir, sym, horizon, with_paths, with_classes)
     idx = int(np.searchsorted(e.sessions, np.datetime64(decision_session_cutoff, "D"), side="right")) - 1
     if idx < 0:
         first = e.sessions[0].astype(object) if len(e.sessions) else "none"
@@ -189,6 +196,12 @@ def read_row(model_key: str, symbol: str, decision_session_cutoff: date, horizon
     if decision_session_cutoff - session > timedelta(days=max_age_days):
         raise ForecastStoreMiss(f"{model_key}/{sym}: latest forecast session {session} is more than "
                                 f"{max_age_days} days before {decision_session_cutoff}")
+    if with_classes:
+        v = [float(x) for x in e.dec[idx]]
+        p = np.array(v[:3], dtype=np.float64)
+        p = p / p.sum()          # float32 storage: renormalise the stored probabilities exactly
+        cf = tuple((float(p[i]), v[3 + i]) for i in range(len(CLASSES)))
+        return ForecastRow(sym, session, {}, class_probs={horizon: cf})
     dec = tuple(float(x) for x in e.dec[idx])
     pp = None
     if e.probs is not None:
@@ -215,11 +228,13 @@ def write_rows(model_key: str, card: ModelCard, build_params: Dict[str, Any], ro
     if not rows:
         raise ValueError("write_rows: no rows")
     with_paths = card.output_type == "paths"
+    with_classes = card.output_type == "class_probs"
     for r in rows:
         if r.horizons != card.horizons:
             raise ValueError(f"{r.symbol} {r.session}: row horizons {r.horizons} != card horizons {card.horizons}")
-        if r.has_paths != with_paths:
-            raise ValueError(f"{r.symbol} {r.session}: has_paths={r.has_paths} but card output_type={card.output_type}")
+        if r.has_paths != with_paths or r.has_classes != with_classes:
+            raise ValueError(f"{r.symbol} {r.session}: has_paths={r.has_paths} has_classes={r.has_classes} but card "
+                             f"output_type={card.output_type}")
     kdir = _key_dir(_root(cache_root), model_key)
     kdir.mkdir(parents=True, exist_ok=True)
     meta_p = kdir / "meta.json"
@@ -230,7 +245,7 @@ def write_rows(model_key: str, card: ModelCard, build_params: Dict[str, Any], ro
     by_sym: Dict[str, List[ForecastRow]] = {}
     for r in rows:
         by_sym.setdefault(_symbol(r.symbol), []).append(r)
-    cols = record_columns(card.horizons, with_paths)
+    cols = record_columns(card.horizons, with_paths, with_classes)
     for sym, rs in by_sym.items():
         p = kdir / f"{sym}.parquet"
         new = pd.DataFrame([r.to_record() for r in rs], columns=cols)

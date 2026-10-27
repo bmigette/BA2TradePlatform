@@ -10,9 +10,9 @@ from dataclasses import dataclass, fields
 from datetime import date
 from typing import Any, Dict, Iterable, Optional, Tuple
 
-OUTPUT_TYPES = ("deciles", "paths")
+OUTPUT_TYPES = ("deciles", "paths", "class_probs")
 #: No row format or mapping exists for these yet.
-_DEFERRED_OUTPUT_TYPES = ("class_probs",)
+_DEFERRED_OUTPUT_TYPES: tuple = ()
 
 
 def _tuple_of_str(name: str, v: Any, *, allow_empty: bool) -> Tuple[str, ...]:
@@ -46,7 +46,7 @@ class ModelCard:
     past_future_covariates: Tuple[str, ...]
     horizons: Tuple[int, ...]
     scaler: Optional[str]                 # reference to the scaler artifact; None = model normalises internally
-    output_type: str                      # "deciles" | "paths"
+    output_type: str                      # "deciles" | "paths" | "class_probs"
     pretraining_cutoff: Optional[date]    # None = unknown (treat every date as possibly contaminated)
     licence: str
     licence_commercial_ok: bool

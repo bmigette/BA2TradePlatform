@@ -57,11 +57,24 @@ def _num(settings: Mapping, key: str, lo: float, hi: float) -> float:
     return v
 
 
-def mapping_genes(settings: Mapping) -> mapping.MappingGenes:
-    """The validated mapping genes of ``settings`` (no defaults: a missing key raises)."""
-    horizon = int(_num(settings, "horizon", 1, 1000))
-    if horizon not in HORIZONS:
-        raise ValueError(f"Setting 'horizon' must be one of {HORIZONS}, got {horizon}")
+def store_horizon(key: str) -> int:
+    """The single horizon of store ``key`` (``horizon`` setting 0). A store with several horizons refuses."""
+    hs = list(store.read_meta(key)["horizons"])
+    if len(hs) != 1:
+        raise ValueError(f"Setting 'horizon' 0 needs a single-horizon store; store {key} has {hs}")
+    return int(hs[0])
+
+
+def mapping_genes(settings: Mapping, key: str = None) -> mapping.MappingGenes:
+    """The validated mapping genes of ``settings`` (no defaults: a missing key raises). ``horizon`` 0 means the
+    store's own single horizon (the custom models each predict one horizon); it needs ``key``."""
+    horizon = int(_num(settings, "horizon", 0, 1000))
+    if horizon == 0:
+        if key is None:
+            raise ValueError("Setting 'horizon' 0 (the store's horizon) needs the resolved model key")
+        horizon = store_horizon(key)
+    elif horizon not in HORIZONS:
+        raise ValueError(f"Setting 'horizon' must be one of {HORIZONS} or 0 (the store's horizon), got {horizon}")
     enable_sell = settings["enable_sell"]
     if isinstance(enable_sell, (int, float)) and not isinstance(enable_sell, bool) and enable_sell in (0, 1):
         enable_sell = bool(enable_sell)
@@ -117,7 +130,8 @@ class MLForecast(MarketExpertInterface):
             "model_key": {"type": "str", "required": True, "default": DEFAULT_MODEL_KEY,
                           "description": "Forecast store: a 16-hex model key or a pilot alias (timesfm3-ctx512 ...)"},
             "horizon": {"type": "int", "required": True, "default": 10,
-                        "description": "Forecast horizon traded, in sessions (5, 10 or 20)"},
+                        "description": "Forecast horizon traded, in sessions (5, 10 or 20; 0 = the store's single "
+                                       "horizon, for the custom models)"},
             "min_edge_pct": {"type": "float", "required": True, "default": 1.0,
                              "description": "Minimum |median| forecast return in percent"},
             "min_prob": {"type": "float", "required": True, "default": 60.0,
@@ -173,8 +187,8 @@ class MLForecast(MarketExpertInterface):
 
     # ------------------------------------------------------------------ decision
     def _analyze(self, symbol, providers, settings, as_of, use_case):
-        genes = mapping_genes(settings)
         key = resolve_model_key(settings["model_key"])
+        genes = mapping_genes(settings, key)
         cutoff = scan_cutoff_date(as_of)
         price = self._decision_price(providers, symbol, as_of)
         if price is None:
@@ -186,15 +200,18 @@ class MLForecast(MarketExpertInterface):
             self._log_once(symbol, SKIP_NO_FORECAST, msg)
             return Recommendation(signal=OrderRecommendation.HOLD, confidence=0.0, current_price=price,
                                   details=msg, expected_profit_percent=0.0, skip=True, skip_reason=SKIP_NO_FORECAST)
-        raw = {"model_key": key, "forecast_session": row.session.isoformat(), "horizon": genes.horizon,
-               "deciles": list(row.deciles[genes.horizon])}
+        raw = {"model_key": key, "forecast_session": row.session.isoformat(), "horizon": genes.horizon}
+        if row.has_classes:
+            raw["classes"] = [list(x) for x in row.class_probs[genes.horizon]]
+        else:
+            raw["deciles"] = list(row.deciles[genes.horizon])
         if use_case == AnalysisUseCase.OPEN_POSITIONS:
             # side-agnostic flip: SELL if bearish p >= flip, BUY if bullish p >= flip (only the side the held
             # position opposes acts, through the ruleset's exit-on-opposite rule)
             down = mapping.map_held_position(row, genes, "long")
             res = down if down.signal != OrderRecommendation.HOLD else mapping.map_held_position(row, genes, "short")
             if res.signal == OrderRecommendation.HOLD:
-                p_up = mapping.p_up_from_deciles(row.deciles[genes.horizon])
+                p_up = mapping.p_up(row, genes.horizon)
                 res = mapping.MappingResult(OrderRecommendation.HOLD, mapping._conf(max(p_up, 1 - p_up)), None, None,
                                             None, None, f"HOLD held: neither side reaches exit_flip_prob "
                                                         f"{genes.exit_flip_prob:g}% (p_up {p_up * 100:.1f}%)")

@@ -6351,6 +6351,19 @@ def _apply_ml_model_keys(spec: dict, raw, expert: str, command: str) -> dict:
     out = copy.deepcopy(spec)
     out["expert_params"]["model_key"] = {"optimize": True, "type": "choice", "choices": keys}
     print(f"{command}: --ml-model-keys: MLForecast model_key gene choices = {keys}")
+    # Single-horizon stores (the custom models predict one horizon each) trade THEIR horizon: the horizon gene is
+    # pinned to 0 ("the store's horizon"). A mix of single- and multi-horizon stores has no common horizon gene.
+    from ba2_common.core.ml_forecast import store as _store
+    from ba2_experts.MLForecast import resolve_model_key as _resolve
+    try:
+        single = [len(_store.read_meta(_resolve(k))["horizons"]) == 1 for k in keys]
+    except (ValueError, _store.ForecastStoreError) as e:
+        sys.exit(f"{command}: --ml-model-keys: cannot read a store's meta: {e}")
+    if all(single):
+        out["expert_params"]["horizon"] = {"optimize": True, "type": "choice", "choices": [0]}
+        print(f"{command}: --ml-model-keys: single-horizon stores -> horizon gene pinned to 0 (the store's horizon)")
+    elif any(single):
+        sys.exit(f"{command}: --ml-model-keys mixes single-horizon and multi-horizon stores; run them as separate GAs")
     return out
 
 
@@ -8876,6 +8889,26 @@ def _cmd_worker(args) -> int:
     return 0
 
 
+def _cmd_ml_search(args) -> int:
+    """Stage-A custom ML model search on the MAG7 point-in-time panels (task type ``ml_model_search``; design
+    docs/plans/2026-10-27-custom-ml-models-design.md). Trains on the 2025 folds only; writes trials.jsonl,
+    predictions/ and result.json under --out."""
+    from datetime import date as _date
+    from ba2_common import config as _bc
+    from app.services.ml_search import ensure_panels, handle_ml_model_search
+    panels = ensure_panels(Path(args.panel_dir), _date.fromisoformat(args.panel_start),
+                           _date.fromisoformat(args.panel_end), _bc.CACHE_FOLDER)
+    res = handle_ml_model_search("cli-ml-search", {
+        "panels": panels, "out_dir": args.out, "population": args.population, "generations": args.generations,
+        "early_stop": args.early_stop, "early_stop_min_rel": args.early_stop_min_rel, "seed": args.seed,
+        "parallel": args.parallel, "top_n": args.top_n})
+    print(f"ml-search: {res['n_trials']} trials ({res['n_refused']} refused), {res['generations_run']} generations")
+    for r in res["top"]:
+        print(f"  {r['fitness']:+.4f}  excess {r['excess']:+.4f} naive {r['naive_excess']:+.4f} "
+              f"cal {r['calibration']:.3f}  {r['label']}")
+    return 0
+
+
 def _add_robust_fitness_args(p) -> None:
     """``--robust-fitness`` / ``--no-robust-fitness`` on an optimize command. DEFAULT: ON.
 
@@ -9741,6 +9774,20 @@ def main(argv: "list | None" = None) -> int:
     wk.add_argument("--workers", type=int, default=None,
                     help="Trial process slots / capacity (default: CPU count - 1).")
 
+    # ml-search: stage-A custom ML model search (GPU, local only).
+    ms = sub.add_parser("ml-search", help="Stage-A custom ML model search (MAG7 H1/M15 panels, 2025 folds).")
+    ms.add_argument("--out", required=True, help="Output directory (trials.jsonl, predictions/, result.json).")
+    ms.add_argument("--panel-dir", required=True, help="Directory of the MAG7 panels (built when missing/stale).")
+    ms.add_argument("--panel-start", default="2023-01-03", help="Panel first day (warm-up before 2024-01).")
+    ms.add_argument("--panel-end", default="2026-10-12", help="Panel last day (the cache end).")
+    ms.add_argument("--population", type=int, default=24)
+    ms.add_argument("--generations", type=int, default=30)
+    ms.add_argument("--early-stop", type=int, default=5)
+    ms.add_argument("--early-stop-min-rel", type=float, default=0.01)
+    ms.add_argument("--seed", type=int, default=42)
+    ms.add_argument("--parallel", type=int, default=3, help="Trial processes sharing the GPU.")
+    ms.add_argument("--top-n", type=int, default=10)
+
     # sync-cache: push the master's cache (diff, one tar) to a configured remote worker.
     sc = sub.add_parser("sync-cache", help="Push the master's cache to a configured worker.")
     sc.add_argument("--worker", required=True, help="Worker NAME (as configured on the master).")
@@ -9769,6 +9816,7 @@ def main(argv: "list | None" = None) -> int:
         "optimize": lambda: _cmd_optimize(args),
         "optimize-batch": lambda: _cmd_optimize_batch(args),
         "worker": lambda: _cmd_worker(args),
+        "ml-search": lambda: _cmd_ml_search(args),
         "sync-cache": lambda: _cmd_sync_cache(args),
     }[args.cmd]()
 

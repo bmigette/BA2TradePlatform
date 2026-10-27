@@ -110,3 +110,30 @@ def test_held_position_flips_on_the_bearish_row(cache):
 def test_missing_row_is_a_skip_never_a_default(cache):
     rec = _expert()._analyze("AAPL", _Providers(), SETTINGS, _at(date(2025, 2, 1)), "daily_expert")
     assert rec.skip and rec.skip_reason == "no_forecast"
+
+
+def test_class_store_with_horizon_zero_uses_the_store_horizon(tmp_path, monkeypatch):
+    from ba2_common import config
+    monkeypatch.setattr(config, "CACHE_FOLDER", str(tmp_path))
+    mlf_mod._alias_memo.clear()
+    store.reset_cache()
+    card = ModelCard(model_id="ba2/custom", family="tsai", version="1", input_fields=("panel",), timeframe="1h",
+                     context_length=64, past_only_covariates=(), past_future_covariates=(), horizons=(3,), scaler=None,
+                     output_type="class_probs", pretraining_cutoff=None, licence="internal", licence_commercial_ok=True)
+    key = model_key(card, ())
+    cf = ((0.2, -0.03), (0.3, 0.002), (0.5, 0.03))
+    store.write_rows(key, card, {"card_id": "custom-x"}, [ForecastRow("AAPL", date(2025, 3, 3), {}, class_probs={3: cf})],
+                     (), tmp_path)
+    s = {**SETTINGS, "model_key": "custom-x", "horizon": 0}
+    with pytest.raises(ValueError, match="needs the resolved model key"):
+        mapping_genes(s)
+    assert mapping_genes(s, key).horizon == 3
+    rec = _expert()._analyze("AAPL", _Providers(), {**s, "min_edge_pct": 0.5}, _at(date(2025, 3, 3)), "daily_expert")
+    assert rec.signal == OrderRecommendation.BUY and rec.raw_outputs["horizon"] == 3 and "classes" in rec.raw_outputs
+    assert rec.target_price == pytest.approx(110.0 * 1.03, rel=1e-5)
+    store.reset_cache()
+
+
+def test_horizon_zero_refuses_a_multi_horizon_store(cache):
+    with pytest.raises(ValueError, match="single-horizon"):
+        mapping_genes({**SETTINGS, "horizon": 0}, cache)
