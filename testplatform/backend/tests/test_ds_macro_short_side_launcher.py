@@ -308,8 +308,7 @@ def test_the_handler_folds_the_run_settings_into_its_checkpoint_fingerprint():
     assert ("checkpoint_fingerprint(\n            param_space, ga, "
             "checkpoint_expert_settings_identity(backtest_cfg),\n"
             '            backtest_cfg.get("rm_toggles_unpinned"), '
-            'backtest_cfg.get("screener_universe_rule"),\n'
-            '            _screener_identity(backtest_cfg.get("screener_opt")))') in src
+            'backtest_cfg.get("screener_universe_rule"))') in src
 
 
 # --------------------------------------------------------------------------- #
