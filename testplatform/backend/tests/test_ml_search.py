@@ -30,7 +30,8 @@ def test_genes_decode_and_darts_setups_run_on_h1():
     g = {"timeframe": "15m", "features": "tdm", "target": "fwd_h3", "pooled": 0, "tsai_arch": "tst",
          "darts_arch": "nhits", "lookback": 64, "lr": 1e-3, "width": 64, "dropout": 0.1, "epochs": 10}
     s = S.Setup.from_genes(g)
-    assert s.timeframe == "1h" and s.arch == "nhits" and not s.pooled
+    assert s.timeframe == "1h" and s.arch == "nhits" and s.pooled and s.epochs == 10
+    assert not S.Setup.from_genes({**g, "target": "dir_h3", "epochs": 30}).pooled
     assert S.Setup.from_genes({**g, "target": "dir_h3"}).timeframe == "15m"
     assert all({"min", "max", "step"} <= set(v) for v in S.GENE_SPACE.values())
 

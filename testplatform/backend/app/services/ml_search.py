@@ -70,6 +70,7 @@ FEATURE_SETS: Dict[str, Tuple[str, ...]] = {
 }
 TSAI_ARCHS = ("inception", "tst", "lstm_fcn")
 DARTS_ARCHS = ("tft", "nhits")
+DARTS_MAX_EPOCHS = 10
 
 #: GA genes (GeneticOptimizer format). ``tsai_arch`` applies to the class targets, ``darts_arch`` to forward_return.
 GENE_SPACE: Dict[str, Dict[str, Any]] = {
@@ -114,8 +115,13 @@ class Setup:
         # The Darts models forecast every bar of the horizon: on M15 that is 130-390 output steps per sample, minutes
         # per fold for no new information, so the forward-return setups run on H1 (same key as the H1 genome).
         tf = g["timeframe"] if spec.is_classification else "1h"
-        return cls(tf, g["features"], g["target"], bool(int(g["pooled"])), arch, int(g["lookback"]),
-                   float(g["lr"]), int(g["width"]), float(g["dropout"]), int(g["epochs"]))
+        # Darts cost control (measured: a per-symbol TFT at 30 epochs is 10+ minutes per trial): the forward-return
+        # setups are pooled (one model over the 7 series, 7x the samples of a per-symbol model) and train at most
+        # DARTS_MAX_EPOCHS epochs (early stopping usually ends them sooner).
+        pooled = bool(int(g["pooled"])) if spec.is_classification else True
+        epochs = int(g["epochs"]) if spec.is_classification else min(int(g["epochs"]), DARTS_MAX_EPOCHS)
+        return cls(tf, g["features"], g["target"], pooled, arch, int(g["lookback"]),
+                   float(g["lr"]), int(g["width"]), float(g["dropout"]), epochs)
 
     @property
     def spec(self) -> MT.TargetSpec:
