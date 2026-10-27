@@ -69,6 +69,32 @@ Each group:
 | S structure | Support/resistance distance, channel position, bars since a break of structure | market_conditions store |
 | O options | IV level, IV rank, term slope, skew | Options cache; MAG7/SPY/QQQ from 2024 only, so a timing side experiment |
 
+**Data rules (from earlier BA2 incidents; each gets a test or a coverage check):**
+1. **Analyst targets.**
+   - FMP's price-target *consensus* is windowed (about the last quarter), not a history; using it before that window
+     is look-ahead.
+   - Build the A group only from the dated per-analyst rows (`price_target.publishedDate`, `analyst_grades.date`),
+     aggregated as of t.
+   - Report the number of distinct analysts behind each value, so that one analyst cannot pass a "min analysts"
+     style gate.
+2. **Macro.** "First release" means vintage alignment: a value is visible from its `realtime_start` (ALFRED
+   semantics), never "observation date + lag". DeterministicScorer once read prints 1-2 releases early that way.
+3. **Options IV.**
+   - The ThetaData history starts in 2020, and the store ends at 2026-09 expiries.
+   - `open_interest` is dead, and spreads are constant in the parquet; the greeks are present.
+   - So IV stays a timing side experiment and never enters the main grid.
+4. **Prices.**
+   - All prices come from the Alpaca-built OHLCV cache (the BT default since 2026-10-22), never FMP bars.
+   - FMP has known split and spin-off defects: CRWD mixed basis, the HON and NVS spin-offs, META before 2022-06.
+5. **Thin groups.**
+   - Insider and earnings-drift-style data is thin on large caps.
+   - Every group's per-year coverage on the universe is reported before it enters the grid.
+   - A group under 70% coverage in a year is masked for that year, with a missing-flag feature, rather than filled.
+6. **Point-in-time universe.** Screener-store universes are read through `metric_store.visible_scan_date` /
+   `knowability.scan_cutoff_date`, never the raw scan dates.
+7. **Machine time.** remote150 also hosts the goal2027atr lane and the exploration grid. Ask the owner before
+   holding its cores for days; the grid runner takes a slot cap.
+
 **Excluded, with reasons:**
 - **Leak:** zigzag (hindsight pivots) and the live-snapshot fundamentals.
 - **No publication date:** earnings estimates.
