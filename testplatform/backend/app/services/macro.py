@@ -29,57 +29,88 @@ class MacroService:
 
     # Economic indicator series IDs from FRED
     # 'yoy_periods' indicates how many observations make 1 year for YoY calculation
+    # 'release_lag_days': days between the OBSERVATION date FRED stamps on a value and the first
+    #   moment that value is public. FRED dates a monthly value on the 1st of the reference month
+    #   and a quarterly one on the 1st of the quarter, long before it is published, so using the
+    #   observation date as the release date handed every row a value weeks or months early.
+    #   The lags are deliberately conservative (later than the usual release):
+    #     FEDFUNDS  monthly average, H.15 published in the first days of the next month -> 40
+    #     GDP       quarterly, ADVANCE estimate ~30 days after quarter end (+90) -> 120
+    #     CPIAUCSL  monthly, released ~10th-15th of the next month -> 45
+    #     UNRATE    monthly, Employment Situation first Friday of the next month -> 40
+    #     VIXCLS / DGS10 / DGS2  daily closes, available the next session -> 1
+    #   LIMITATION (not fixed here): FRED serves the LATEST revised value, not the vintage that was
+    #   known at the time (GDP, CPI, UNRATE get revised; ALFRED vintages would be needed). The
+    #   release lag only removes the timing leak, not the revision leak.
     MACRO_INDICATORS = {
         'interest_rate': {
             'series': 'FEDFUNDS',
             'name': 'Federal Funds Rate',
             'description': 'Federal Reserve target interest rate',
             'unit': '%',
-            'yoy_periods': 12  # Monthly data
+            'yoy_periods': 12,  # Monthly data
+            'release_lag_days': 40
         },
         'gdp': {
             'series': 'GDP',
             'name': 'Gross Domestic Product',
             'description': 'US GDP in billions of dollars',
             'unit': 'Billions USD',
-            'yoy_periods': 4  # Quarterly data
+            'yoy_periods': 4,  # Quarterly data
+            'release_lag_days': 120
         },
         'inflation': {
             'series': 'CPIAUCSL',
             'name': 'Consumer Price Index',
             'description': 'CPI for all urban consumers',
             'unit': 'Index',
-            'yoy_periods': 12  # Monthly data
+            'yoy_periods': 12,  # Monthly data
+            'release_lag_days': 45
         },
         'unemployment': {
             'series': 'UNRATE',
             'name': 'Unemployment Rate',
             'description': 'Percentage of labor force unemployed',
             'unit': '%',
-            'yoy_periods': 12  # Monthly data
+            'yoy_periods': 12,  # Monthly data
+            'release_lag_days': 40
         },
         'vix': {
             'series': 'VIXCLS',
             'name': 'VIX Volatility Index',
             'description': 'Market volatility indicator',
             'unit': 'Index',
-            'yoy_periods': 252  # Daily data
+            'yoy_periods': 252,  # Daily data
+            'release_lag_days': 1
         },
         'yield_10y': {
             'series': 'DGS10',
             'name': '10-Year Treasury Yield',
             'description': 'Constant maturity treasury rate',
             'unit': '%',
-            'yoy_periods': 252  # Daily data
+            'yoy_periods': 252,  # Daily data
+            'release_lag_days': 1
         },
         'yield_2y': {
             'series': 'DGS2',
             'name': '2-Year Treasury Yield',
             'description': 'Constant maturity treasury rate',
             'unit': '%',
-            'yoy_periods': 252  # Daily data
+            'yoy_periods': 252,  # Daily data
+            'release_lag_days': 1
         }
     }
+
+    def _release_dated(self, macro_df: pd.DataFrame, indicator: str) -> pd.DataFrame:
+        """Re-key a FRED frame from OBSERVATION date to RELEASE date (observation + release lag).
+
+        Adds ``observation_date`` (the original FRED date) and moves ``Date`` to the first moment
+        the value was public, so a backward merge_asof can only pick values already released.
+        """
+        macro_df = macro_df.copy()
+        macro_df['observation_date'] = macro_df['Date']
+        macro_df['Date'] = macro_df['Date'] + pd.Timedelta(days=self.MACRO_INDICATORS[indicator]['release_lag_days'])
+        return macro_df
 
     def __init__(self, api_key: str = None):
         """
@@ -279,10 +310,12 @@ class MacroService:
             # Calculate YoY change on raw macro data BEFORE merging
             # Use frequency-specific periods (12 for monthly, 4 for quarterly, 252 for daily)
             yoy_col = f'{indicator}_yoy_change'
-            yoy_periods = self.MACRO_INDICATORS.get(indicator, {}).get('yoy_periods', 12)
+            yoy_periods = self.MACRO_INDICATORS[indicator]['yoy_periods']
             macro_df[yoy_col] = macro_df[indicator].pct_change(periods=yoy_periods, fill_method=None) * 100
 
-            # Add a column for the macro report date to calculate days_since
+            # Re-key to the RELEASE date (observation date + the series' release lag), see
+            # MACRO_INDICATORS. days_since counts from the release.
+            macro_df = self._release_dated(macro_df, indicator)
             macro_date_col = f'{indicator}_report_date'
             macro_df[macro_date_col] = macro_df['Date']
 
@@ -344,6 +377,7 @@ class MacroService:
                 macro_df['Date'] = pd.to_datetime(macro_df['Date'])
                 if macro_df['Date'].dt.tz is not None:
                     macro_df['Date'] = macro_df['Date'].dt.tz_localize(None)
+                macro_df = self._release_dated(macro_df, indicator)
                 macro_df = macro_df.sort_values('Date').reset_index(drop=True)
 
                 result_df = pd.merge_asof(

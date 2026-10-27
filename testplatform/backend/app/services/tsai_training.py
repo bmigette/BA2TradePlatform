@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import json
 
-from app.services.data_preparation import DataPreparationService, purged_train_row_count
+from app.services.data_preparation import DataPreparationService, purged_train_row_count, three_way_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,27 @@ except ImportError as e:
 
 from app.services.model_interface import ITrainingService
 from app.services.tsai_models import DEVICE, MPS_AVAILABLE, CUDA_AVAILABLE
+
+
+def class_pos_weight(y_train: np.ndarray, prediction_mode: str):
+    """Positive-class weight (negatives / positives) for ``weighted_ce`` from the TRAINING labels.
+
+    'shift': one float for the binary label. 'multistep': one weight per horizon (a list), since the
+    class balance differs per target. A class with no training examples has no defined weight and is
+    an error, not a silent unweighted loss.
+    """
+    y = np.asarray(y_train)
+    if prediction_mode == 'multistep':
+        pos = (y == 1).sum(axis=0)
+        neg = (y == 0).sum(axis=0)
+        if (pos == 0).any() or (neg == 0).any():
+            raise ValueError(f"weighted_ce needs both classes in every horizon; positives per horizon: {pos.tolist()}")
+        return (neg / pos).astype(float).tolist()
+    pos = int((y == 1).sum())
+    neg = int((y == 0).sum())
+    if pos == 0 or neg == 0:
+        raise ValueError(f"weighted_ce needs both classes in the training labels (positives={pos}, negatives={neg})")
+    return neg / pos
 
 
 class TSAITrainingService(ITrainingService):
@@ -290,6 +311,57 @@ class TSAITrainingService(ITrainingService):
             np.concatenate(all_y_test, axis=0),
         )
 
+    def prepare_split_three_way(
+        self, dataframes: List[pd.DataFrame], train_ratio: float, holdout_share_of_test: float,
+        target_column: str, feature_columns: List[str],
+        timeframe: str = 'daily', seq_len: int = 24,
+        prediction_horizon: int = 0, prediction_mode: str = 'shift',
+        label_horizon: int = 0
+    ) -> Dict[str, np.ndarray]:
+        """Chronological train / validation / holdout windows, one frame per instrument.
+
+        Every frame (one per ticker) is cut on its own by ``three_way_bounds`` and windowed
+        on its own, so a window never spans two tickers or two blocks. The scaler is fitted on
+        the combined TRAINING rows only. Validation drives the GA fitness, the threshold gene
+        and the per-epoch validation loss; holdout is only scored and reported.
+        """
+        if not TSAI_AVAILABLE:
+            raise RuntimeError("tsai library not available")
+
+        blocks = {'train': [], 'val': [], 'holdout': []}
+        for df in dataframes:
+            b = three_way_bounds(len(df), train_ratio, holdout_share_of_test, label_horizon)
+            blocks['train'].append(df.iloc[:b['train_end']])
+            blocks['val'].append(df.iloc[b['val_start']:b['val_end']])
+            blocks['holdout'].append(df.iloc[b['holdout_start']:])
+
+        if self.normalize:
+            combined_train = pd.concat(blocks['train'], ignore_index=True)
+            self.data_prep = DataPreparationService(buffer_pct=self.buffer_pct)
+            _ = self.data_prep.fit_transform(combined_train, feature_columns, method="minmax_buffered")
+            logger.info(
+                f"Fitted normalization on the training rows of {len(dataframes)} dataset(s) "
+                f"({len(combined_train)} rows)"
+            )
+
+        out = {}
+        for name, frames in blocks.items():
+            xs, ys = [], []
+            for df in frames:
+                X, y = self.prepare_data(
+                    df, target_column, feature_columns, timeframe, seq_len,
+                    prediction_horizon, prediction_mode, fit_scaler=False
+                )
+                xs.append(X)
+                ys.append(y)
+            out[f'X_{name}'] = np.concatenate(xs, axis=0)
+            out[f'y_{name}'] = np.concatenate(ys, axis=0)
+        logger.info(
+            f"Three-way split: train={len(out['X_train'])}, validation={len(out['X_val'])}, "
+            f"holdout={len(out['X_holdout'])} windows"
+        )
+        return out
+
     def _create_sequences(
         self,
         X: np.ndarray,
@@ -407,6 +479,11 @@ class TSAITrainingService(ITrainingService):
         if not TSAI_AVAILABLE:
             raise RuntimeError("tsai library not available")
 
+        if loss_type == 'weighted_ce' and pos_weight is None:
+            # This used to fall through to the plain unweighted loss while the job still reported
+            # "weighted_cross_entropy"; use class_pos_weight(y_train, mode) to build the weight.
+            raise ValueError("weighted_ce requires pos_weight (see class_pos_weight)")
+
         if prediction_mode == 'multistep':
             # Multi-step mode: use BCEWithLogitsLoss for multi-label classification
             # Note: FocalLoss is NOT compatible with multi-label - filter in UI
@@ -511,12 +588,16 @@ class TSAITrainingService(ITrainingService):
             if effective_bs < batch_size:
                 logger.info(f"Reduced batch size from {batch_size} to {effective_bs} for small dataset")
 
-            # Create dataloaders with explicit device
+            # Create dataloaders with explicit device. NO batch transform: the inputs are already
+            # scaled by DataPreparationService (fitted on the training rows and saved with the
+            # model). TSStandardize used to be added here, estimating a mean/std from ONE training
+            # batch that is neither saved nor applied by assess_model / predict / the reload and
+            # backtest paths (they call the bare network), so the GA scored, and the backtest
+            # ran, a network on inputs it was never trained on.
             dls = get_ts_dls(
                 X_all, y_all,
                 splits=splits,
                 bs=effective_bs,
-                batch_tfms=[TSStandardize()],
                 device=device,  # Set device for dataloaders
             )
 

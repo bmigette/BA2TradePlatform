@@ -5,17 +5,20 @@ Background task handler for ML model training jobs.
 Uses real ML services instead of simulation.
 """
 
+import json
 import logging
 import pandas as pd
 import numpy as np
 import os
+import random
+import zlib
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 
 from app.models.database import SessionLocal
 from app.models.dataset import Dataset
-from app.services.data_preparation import purged_train_row_count
+from app.services.data_preparation import purged_train_row_count, three_way_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,16 @@ MULTISTEP_MODELS = ['nbeats', 'tcn', 'transformer', 'tft']
 # Sparse indicators that should be forward-filled at training time
 # These indicators have NaN between pivot points which can cause training issues
 SPARSE_INDICATOR_PATTERNS = ['zigzag', 'zigzag_direction']
+
+# Column-name fragments of indicators that are HINDSIGHT by construction and so can never be model
+# inputs: a ZigZag value sits on the pivot bar but the pivot is only known (and may still move)
+# until price has reversed by the deviation, bars later. They stay in the dataset for charts and as
+# the basis of the zigzag reversal TARGET (which is built from High/Low, not from this column).
+HINDSIGHT_FEATURE_PATTERNS = ('zigzag',)
+
+# Share of the old "test" block (everything after train_test_split) that becomes the untouched
+# holdout. The remainder is the validation block the GA selects on (fitness, threshold gene).
+HOLDOUT_SHARE_OF_TEST = 0.5
 
 # Raw OHLCV/bookkeeping columns. These are inputs to target CONSTRUCTION and to
 # the indicator pass, never model features in their own right.
@@ -84,6 +97,10 @@ def select_feature_columns(
     if selected_target:
         excluded.add(selected_target)
     excluded.update(c for c in all_columns if c.startswith(LEGACY_TARGET_PREFIX))
+    excluded.update(
+        c for c in all_columns
+        if any(pattern in c.lower() for pattern in HINDSIGHT_FEATURE_PATTERNS)
+    )
     return [c for c in all_columns if c not in excluded]
 
 
@@ -143,6 +160,99 @@ def drop_unobservable_target_rows(
     return df[~unobservable].reset_index(drop=True), n_dropped
 
 
+def training_label_counts(labels: pd.Series, target_column: str, loss_function: str) -> Tuple[int, int]:
+    """Count positive / negative training labels for a class-weighted loss.
+
+    A non-MSE loss (focal / BCE) is only meaningful on a binary 0/1 target. Counting
+    ``== 1`` / ``== 0`` on anything else yields (0, 0) and silently disables the class
+    weighting, so non-binary labels are refused here instead.
+    """
+    values = labels.dropna()
+    if len(values) == 0:
+        raise ValueError(f"No training labels in '{target_column}' to weight the {loss_function} loss")
+    unexpected = sorted(set(np.unique(values.values)) - {0, 1})
+    if unexpected:
+        raise ValueError(
+            f"Loss '{loss_function}' needs a binary 0/1 target but '{target_column}' holds "
+            f"{unexpected[:5]}; use the 'mse' loss for regression targets"
+        )
+    return int((values == 1).sum()), int((values == 0).sum())
+
+
+def stable_job_seed(task_id: str) -> int:
+    """Deterministic seed derived from the task id (crc32): the same job id always reseeds the same way."""
+    return zlib.crc32(task_id.encode('utf-8')) & 0x7FFFFFFF
+
+
+def genome_seed(job_seed: int, params: Dict[str, Any]) -> int:
+    """Seed for ONE GA individual, a function of the job seed and its genes only (not of the order in
+    which the population happens to be evaluated)."""
+    payload = json.dumps(params, sort_keys=True, default=str).encode('utf-8')
+    return (job_seed + zlib.crc32(payload)) & 0x7FFFFFFF
+
+
+def seed_everything(seed: int, include_python_random: bool = True) -> None:
+    """Seed numpy, torch (CPU and CUDA) and, optionally, Python's ``random`` (used by DEAP).
+
+    Re-seeding ``random`` inside every fitness evaluation would restart the GA's own stream each
+    individual, so per-individual seeding leaves it out.
+    """
+    if include_python_random:
+        random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+    except ImportError:
+        return
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _n_points(series: Any) -> int:
+    """Total length of a TimeSeries or of a list of TimeSeries (one per ticker)."""
+    return sum(len(s) for s in series) if isinstance(series, list) else len(series)
+
+
+def _concat_by_date(parts: List[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate per-ticker blocks into one frame ordered by Date (reporting only)."""
+    return pd.concat(parts, ignore_index=True).sort_values('Date', kind='mergesort').reset_index(drop=True)
+
+
+def split_frames_three_way(
+    frames: List[pd.DataFrame], train_ratio: float, holdout_share_of_test: float, label_horizon: int
+) -> Dict[str, List[pd.DataFrame]]:
+    """Cut every ticker's frame into purged train / validation / holdout blocks (see three_way_bounds)."""
+    out: Dict[str, List[pd.DataFrame]] = {'train': [], 'val': [], 'holdout': []}
+    for f in frames:
+        b = three_way_bounds(len(f), train_ratio, holdout_share_of_test, label_horizon)
+        out['train'].append(f.iloc[:b['train_end']].copy())
+        out['val'].append(f.iloc[b['val_start']:b['val_end']].copy())
+        out['holdout'].append(f.iloc[b['holdout_start']:].copy())
+    return out
+
+
+def create_training_loss(loss_function: str, train_labels: pd.Series, target_column: str):
+    """Build the training loss: None for 'mse' (the model default), else a class-weighted loss.
+
+    Errors propagate. This used to live inline in ``train_unified_optimization`` behind
+    ``except Exception: loss_fn = None``, and it read an undefined ``train_series`` -- the
+    resulting NameError was swallowed, so every non-MSE loss silently trained as MSE while
+    the job result still recorded the requested loss.
+    """
+    if loss_function == 'mse':
+        return None
+    from app.services.losses import get_loss_function
+    positive_count, negative_count = training_label_counts(train_labels, target_column, loss_function)
+    logger.info(f"Class distribution for loss: {positive_count} positive, {negative_count} negative")
+    loss_fn = get_loss_function(
+        loss_type=loss_function,
+        positive_count=positive_count,
+        negative_count=negative_count
+    )
+    logger.info(f"Using {loss_function} loss function for training")
+    return loss_fn
+
+
 def split_datasets_by_role(dfs: list, dataset_ids: list, test_dataset_ids: list) -> tuple:
     """Split datasets into train and test groups based on manual assignment.
 
@@ -186,6 +296,10 @@ def ffill_sparse_indicators(df: pd.DataFrame) -> pd.DataFrame:
     Forward-filling makes the data usable for ML while keeping the
     original sparse data in the dataset for chart visualization.
 
+    Forward-fill ONLY. These columns also used to be back-filled (``ffill().bfill()``), which
+    wrote the first pivot -- a value from the future -- into every leading row. Leading rows stay
+    NaN. (ZigZag is additionally excluded from model features, see HINDSIGHT_FEATURE_PATTERNS.)
+
     Args:
         df: DataFrame with indicator columns
 
@@ -200,8 +314,7 @@ def ffill_sparse_indicators(df: pd.DataFrame) -> pd.DataFrame:
         if any(pattern in col_lower for pattern in SPARSE_INDICATOR_PATTERNS):
             nan_count_before = df[col].isna().sum()
             if nan_count_before > 0:
-                # Forward-fill first, then backward-fill for leading NaNs
-                df[col] = df[col].ffill().bfill()
+                df[col] = df[col].ffill()
                 nan_count_after = df[col].isna().sum()
                 if nan_count_before != nan_count_after:
                     ffilled_cols.append(col)
@@ -744,7 +857,8 @@ def save_generation_model(
     training_history: Optional[List[Dict[str, Any]]] = None,
     feature_columns: Optional[List[str]] = None,
     symbols: Optional[List[str]] = None,
-    dataset_ids: Optional[List[int]] = None
+    dataset_ids: Optional[List[int]] = None,
+    normalization_params: Optional[Dict[str, Any]] = None
 ) -> Optional[str]:
     """
     Save a model from a generation.
@@ -770,12 +884,13 @@ def save_generation_model(
         model_filename = f"gen{generation:03d}_ind{individual:03d}_{model_type}_f{fitness:.4f}"
         full_path = models_dir / f"{model_filename}.pt"
 
-        # Get normalization params from training service if available
-        normalization_params = None
-        if hasattr(training_service, 'get_normalization_params'):
-            normalization_params = training_service.get_normalization_params()
-        elif hasattr(training_service, 'data_prep') and training_service.data_prep:
-            normalization_params = training_service.data_prep.export_params()
+        # Normalization params: the caller's (the scalers of THIS model's own series) win; the
+        # service's current ones are only right if nothing else was prepared since.
+        if normalization_params is None:
+            if hasattr(training_service, 'get_normalization_params'):
+                normalization_params = training_service.get_normalization_params()
+            elif hasattr(training_service, 'data_prep') and training_service.data_prep:
+                normalization_params = training_service.data_prep.export_params()
 
         metadata = {
             'task_id': task_id,
@@ -1318,6 +1433,312 @@ def load_datasets_separate(
     return dataframes, infos
 
 
+class TargetBuildError(ValueError):
+    """A prediction-target config could not be turned into a label column."""
+
+
+def build_prediction_targets(
+    frame: pd.DataFrame,
+    prediction_targets: List[Dict[str, Any]],
+    dataset_timeframe: str
+) -> Tuple[pd.DataFrame, str, List[str], Dict[str, int]]:
+    """Add the configured target columns to ONE symbol's chronologically ordered frame.
+
+    Targets look into the future (``shift(-h)``, forward loops, rolling-then-shift), so they
+    must be computed on a single instrument's own bars. Run on a frame that interleaves
+    several tickers they compare AAPL's close with MSFT's: the label then measures nothing.
+
+    Returns:
+        (frame with target columns, selected target column, every target column,
+         look-ahead of each target in dataset-timeframe bars)
+
+    Raises:
+        TargetBuildError: the target config is invalid or could not be calculated.
+    """
+    all_target_columns: List[str] = []
+    target_label_horizons: Dict[str, int] = {}
+    if prediction_targets:
+        # Check target type - new format vs legacy format
+        first_target = prediction_targets[0] if prediction_targets else {}
+        target_type = first_target.get('type')
+
+        if target_type:
+            # New target format (trend_reversal, directional, price_based, triple_barrier, volatility)
+            # Use PredictionTargetService
+            from app.services.darts_models import days_to_bars
+            target_service = PredictionTargetService()
+
+            target_column = None
+            # Every branch below records its column in all_target_columns (so it is
+            # kept out of the features) and its look-ahead in target_label_horizons,
+            # in DATASET timeframe bars (so the split boundary can be purged). A
+            # missing horizon is refused at the split, never defaulted to 0.
+            for pt in prediction_targets:
+                pt_type = pt.get('type')
+                # Support both old format (config) and new format (indicatorParams)
+                pt_config = pt.get('config') or pt.get('indicatorParams') or {}
+                direction = pt.get('direction', 'bullish')
+                threshold = pt.get('threshold', 30)
+                indicator = pt.get('indicator', 'zigzag')
+
+                # Check for multi-timeframe target
+                target_timeframe = pt.get('timeframe')
+                use_multi_tf = target_timeframe and target_timeframe != dataset_timeframe
+
+                # Prepare working_df for multi-timeframe (if applicable)
+                working_df = frame
+                # How many base-timeframe bars one target-timeframe bar spans. A target
+                # computed on a higher timeframe looks further ahead once aligned back,
+                # so its purge horizon has to be expressed in base bars.
+                bars_per_target_bar = 1
+                if use_multi_tf:
+                    try:
+                        from app.services.indicators import resample_ohlcv_to_timeframe, align_higher_timeframe_to_lower
+                        working_df = resample_ohlcv_to_timeframe(
+                            frame, target_timeframe, source_timeframe=dataset_timeframe
+                        )
+                        logger.info(f"Resampled to {target_timeframe} for target: {len(frame)} -> {len(working_df)} bars")
+                        if len(working_df) > 0:
+                            bars_per_target_bar = max(1, int(np.ceil(len(frame) / len(working_df))))
+                    except ValueError as e:
+                        logger.warning(f"Cannot resample to {target_timeframe}: {e}. Using base timeframe.")
+                        use_multi_tf = False
+                        working_df = frame
+
+                if pt_type == 'trend_reversal':
+                    # Use calculate_trend_reversal from PredictionTargetService
+                    col_name = f"{indicator}_{direction}_reversal"
+                    if use_multi_tf:
+                        col_name = f"{col_name}_{target_timeframe}"
+                    try:
+                        target_series = target_service.calculate_trend_reversal(
+                            working_df,
+                            indicator=indicator,
+                            indicator_params=pt_config,
+                            threshold=threshold,
+                            direction=direction
+                        )
+
+                        # Align back to original timeframe if multi-timeframe
+                        if use_multi_tf:
+                            higher_tf_data = working_df[['Date']].copy()
+                            higher_tf_data['_target'] = target_series.values
+                            aligned = align_higher_timeframe_to_lower(frame, higher_tf_data, ['_target'])
+                            target_series = pd.Series(aligned['_target'].values, index=frame.index)
+                            logger.info(f"Aligned {col_name} from {target_timeframe} to {dataset_timeframe}")
+
+                        frame[col_name] = target_series
+                        all_target_columns.append(col_name)
+                        # rsi/macd/sar reversals only compare bar i against bar i-1 --
+                        # genuinely causal, horizon 0. A zigzag label is decided when the pivot
+                        # is CONFIRMED (price reversed by the deviation), arbitrarily many bars
+                        # after the pivot bar: purge by the worst-case confirmation lag.
+                        if indicator == 'zigzag':
+                            from app.services.indicators import IndicatorService
+                            deviation_pct = pt_config.get('deviation_pct') or pt_config.get('deviationPct')
+                            target_label_horizons[col_name] = (
+                                IndicatorService().zigzag_confirmation_lag(working_df, deviation_pct)
+                                * bars_per_target_bar
+                            )
+                        else:
+                            target_label_horizons[col_name] = 0
+                        if target_column is None:
+                            target_column = col_name
+                        logger.info(f"Created trend reversal target: {col_name}, positives: {int(target_series.sum())}")
+                    except Exception as e:
+                        raise TargetBuildError(f'Failed to calculate trend_reversal target: {e}')
+
+                elif pt_type == 'directional':
+                    # Simple directional target
+                    horizon = pt.get('horizon') or pt_config.get('horizon')
+                    horizon_unit = pt.get('horizonUnit', 'bars')
+                    if horizon is None:
+                        raise TargetBuildError(f'directional target requires horizon. Got: {pt}')
+                    # Convert days to bars if needed
+                    if horizon_unit == 'days':
+                        horizon = days_to_bars(horizon, dataset_timeframe)
+                    dir_label = 'up' if direction in ['up', 'bullish'] else 'down'
+                    col_name = f"direction_{dir_label}_{horizon}bar"
+                    if use_multi_tf:
+                        col_name = f"{col_name}_{target_timeframe}"
+                    # Directional is calculated on base timeframe (uses shift), no resampling needed.
+                    # The final `horizon` bars come back NaN, not 0 -- see build_directional_target.
+                    frame[col_name] = build_directional_target(
+                        frame['Close'], horizon, direction
+                    )
+                    all_target_columns.append(col_name)
+                    target_label_horizons[col_name] = horizon
+                    if target_column is None:
+                        target_column = col_name
+                    logger.info(
+                        f"Created directional target: {col_name} "
+                        f"({int(frame[col_name].isna().sum())} unobservable tail rows left as NaN)"
+                    )
+
+                elif pt_type == 'price_based':
+                    # Price-based target with profit target, max drawdown, and time window
+                    profit_pct = pt.get('profitPct')
+                    max_dd_pct = pt.get('maxDrawdownPct')
+                    time_bars = pt.get('timeBars')
+                    time_unit = pt.get('timeBarsUnit', 'bars')
+                    dir_label = pt.get('direction', 'up')
+
+                    if profit_pct is None or max_dd_pct is None or time_bars is None:
+                        raise TargetBuildError(f'price_based target requires profitPct, maxDrawdownPct, and timeBars. Got: {pt}')
+
+                    # Convert days to bars if needed
+                    if time_unit == 'days':
+                        time_bars = days_to_bars(time_bars, dataset_timeframe)
+
+                    col_name = f"price_{dir_label}_{profit_pct}pct_{max_dd_pct}dd_{time_bars}b"
+                    try:
+                        target_series = target_service.calculate_prediction_targets(
+                            frame,
+                            [{
+                                'profit_pct': profit_pct,
+                                'max_dd': max_dd_pct,
+                                'days': time_bars,  # Now in bars
+                                'direction': dir_label
+                            }]
+                        )
+                        # The service adds columns directly, extract the one we need
+                        expected_col = f"price_{dir_label}_{profit_pct}pct_{max_dd_pct}dd_{time_bars}d"
+                        if expected_col in target_series.columns:
+                            frame[col_name] = target_series[expected_col]
+                        else:
+                            # Find the matching column
+                            for c in target_series.columns:
+                                if c.startswith(f"price_{dir_label}"):
+                                    frame[col_name] = target_series[c]
+                                    break
+                        all_target_columns.append(col_name)
+                        target_label_horizons[col_name] = time_bars
+                        if target_column is None:
+                            target_column = col_name
+                        positive_count = int(frame[col_name].sum()) if col_name in frame.columns else 0
+                        logger.info(f"Created price_based target: {col_name}, positives: {positive_count}")
+                    except Exception as e:
+                        raise TargetBuildError(f'Failed to calculate price_based target: {e}')
+
+                elif pt_type == 'triple_barrier':
+                    # Triple barrier target: profit, stop, timeout
+                    profit_pct = pt.get('profitPct')
+                    stop_pct = pt.get('stopPct')
+                    max_bars = pt.get('maxBars')
+                    max_bars_unit = pt.get('maxBarsUnit', 'bars')
+
+                    if profit_pct is None or stop_pct is None or max_bars is None:
+                        raise TargetBuildError(f'triple_barrier target requires profitPct, stopPct, and maxBars. Got: {pt}')
+
+                    # Convert days to bars if needed
+                    if max_bars_unit == 'days':
+                        max_bars = days_to_bars(max_bars, dataset_timeframe)
+
+                    col_name = f"triple_barrier_{profit_pct}p_{stop_pct}s_{max_bars}b"
+                    try:
+                        # Triple barrier labels: 0=stop, 1=timeout, 2=profit. One implementation
+                        # (PredictionTargetService, High/Low barrier touches, NaN for a truncated
+                        # tail window) shared with dataset generation.
+                        frame[col_name] = target_service.calculate_triple_barrier(
+                            frame, profit_pct, stop_pct, max_bars
+                        ).values
+                        all_target_columns.append(col_name)
+                        target_label_horizons[col_name] = max_bars
+                        if target_column is None:
+                            target_column = col_name
+                        logger.info(f"Created triple_barrier target: {col_name}")
+                    except Exception as e:
+                        raise TargetBuildError(f'Failed to calculate triple_barrier target: {e}')
+
+                elif pt_type == 'volatility':
+                    # Volatility regression target
+                    horizon = pt.get('horizon', 5)
+                    horizon_unit = pt.get('horizonUnit', 'bars')
+                    method = pt.get('method', 'std')
+
+                    # Convert days to bars if needed
+                    if horizon_unit == 'days':
+                        horizon = days_to_bars(horizon, dataset_timeframe)
+
+                    col_name = f"volatility_{method}_{horizon}b"
+                    try:
+                        if method == 'std':
+                            frame[col_name] = frame['Close'].pct_change().rolling(horizon).std().shift(-horizon)
+                        elif method == 'range':
+                            frame[col_name] = ((frame['High'].rolling(horizon).max() - frame['Low'].rolling(horizon).min()) / frame['Close']).shift(-horizon)
+                        elif method == 'atr':
+                            tr = np.maximum(
+                                frame['High'] - frame['Low'],
+                                np.maximum(
+                                    abs(frame['High'] - frame['Close'].shift(1)),
+                                    abs(frame['Low'] - frame['Close'].shift(1))
+                                )
+                            )
+                            frame[col_name] = tr.rolling(horizon).mean().shift(-horizon)
+                        else:
+                            raise TargetBuildError(f'Unknown volatility method: {method}')
+                        all_target_columns.append(col_name)
+                        target_label_horizons[col_name] = horizon
+                        if target_column is None:
+                            target_column = col_name
+                        logger.info(f"Created volatility target: {col_name}")
+                    except Exception as e:
+                        raise TargetBuildError(f'Failed to calculate volatility target: {e}')
+
+                else:
+                    raise TargetBuildError(f'Unknown target type: {pt_type}')
+
+            if target_column is None:
+                raise TargetBuildError('No valid target was created from prediction_targets')
+
+            logger.info(f"Created {len(all_target_columns)} target columns: {all_target_columns}")
+
+        else:
+            # Legacy price-based format
+            target_service = PredictionTargetService()
+
+            targets = []
+            for pt in prediction_targets:
+                profit_pct = pt.get('profitPercent')
+                max_dd = pt.get('maxDrawdownPercent')
+                days = pt.get('timePeriodDays')
+
+                # All values are required for price-based targets
+                if profit_pct is None or max_dd is None or days is None:
+                    raise TargetBuildError(f'Price-based target requires profitPercent, maxDrawdownPercent, and timePeriodDays. Got: {pt}')
+
+                targets.append({
+                    'profit_pct': profit_pct,
+                    'max_dd': max_dd,
+                    'days': days,
+                    'direction': 'up'
+                })
+                # Add symmetric down target
+                targets.append({
+                    'profit_pct': profit_pct,
+                    'max_dd': max_dd,
+                    'days': days,
+                    'direction': 'down'
+                })
+
+            if targets:
+                frame = target_service.calculate_prediction_targets(frame, targets)
+                target_column = f"price_up_{targets[0]['profit_pct']}pct_{targets[0]['max_dd']}dd_{targets[0]['days']}d"
+                for t in targets:
+                    legacy_col = f"price_{t['direction']}_{t['profit_pct']}pct_{t['max_dd']}dd_{t['days']}d"
+                    all_target_columns.append(legacy_col)
+                    target_label_horizons[legacy_col] = t['days']
+            else:
+                raise TargetBuildError('No valid price-based targets configured')
+    else:
+        # Default: use Close for regression. Close at bar i is observed at bar i --
+        # a genuinely causal target, so nothing is purged at the split boundary.
+        target_column = 'Close'
+        target_label_horizons['Close'] = 0
+
+    return frame, target_column, all_target_columns, target_label_horizons
+
+
 def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
     """
     Handle ML training job.
@@ -1398,9 +1819,19 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
         train_start_date = training_date_range.get('startDate') if training_date_range else None
         train_end_date = training_date_range.get('endDate') if training_date_range else None
 
-        # Load and combine datasets
+        # Reproducibility: the job seed is the payload's `seed`, else derived from the task id; it is
+        # logged and returned with the result. (Nothing was seeded before, so a re-run of the same
+        # job gave different models and the GA could not be compared run to run.)
+        job_seed = int(payload['seed']) if 'seed' in payload and payload['seed'] is not None else stable_job_seed(task_id)
+        seed_everything(job_seed)
+        logger.info(f"Job seed: {job_seed}")
+
+        # Load datasets. One frame per dataset (= per ticker) is kept SEPARATE through target
+        # construction and the chronological splits; they are only concatenated for saving and
+        # reporting. Interleaving tickers on a date-sorted frame and then taking shift(-h) or a
+        # positional split compared AAPL's close with MSFT's and windowed across tickers.
         update_job_progress(task_id, 5, "Loading datasets...")
-        combined_df = None
+        frames: List[pd.DataFrame] = []
         dataset_infos = []
 
         for ds_id in dataset_ids:
@@ -1415,310 +1846,30 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
             if len(dataset_ids) > 1:
                 df['ticker'] = info.get('ticker', f'TICKER{ds_id}')
 
-            if combined_df is None:
-                combined_df = df
-            else:
-                combined_df = pd.concat([combined_df, df], ignore_index=True)
+            frames.append(df.sort_values('Date', kind='mergesort').reset_index(drop=True))
 
-        # Sort by date
-        combined_df = combined_df.sort_values('Date').reset_index(drop=True)
-        update_job_progress(task_id, 10, f"Loaded {len(combined_df)} rows from {len(dataset_ids)} dataset(s)")
+        update_job_progress(
+            task_id, 10, f"Loaded {sum(len(f) for f in frames)} rows from {len(dataset_ids)} dataset(s)"
+        )
 
         # Get dataset timeframe for multi-timeframe target support
         dataset_timeframe = dataset_infos[0].get('timeframe', '1h') if dataset_infos else '1h'
         logger.info(f"Dataset timeframe: {dataset_timeframe}")
 
-        # Calculate prediction targets
-        all_target_columns: List[str] = []
-        target_label_horizons: Dict[str, int] = {}
+        # Calculate prediction targets PER TICKER: shift(-h) / forward loops on the interleaved
+        # multi-symbol frame would label AAPL's bar with MSFT's future close.
         if prediction_targets:
             update_job_progress(task_id, 15, "Calculating prediction targets...")
-
-            # Check target type - new format vs legacy format
-            first_target = prediction_targets[0] if prediction_targets else {}
-            target_type = first_target.get('type')
-
-            if target_type:
-                # New target format (trend_reversal, directional, price_based, triple_barrier, volatility)
-                # Use PredictionTargetService
-                from app.services.darts_models import days_to_bars
-                target_service = PredictionTargetService()
-
-                target_column = None
-                # Every branch below records its column in all_target_columns (so it is
-                # kept out of the features) and its look-ahead in target_label_horizons,
-                # in DATASET timeframe bars (so the split boundary can be purged). A
-                # missing horizon is refused at the split, never defaulted to 0.
-                for pt in prediction_targets:
-                    pt_type = pt.get('type')
-                    # Support both old format (config) and new format (indicatorParams)
-                    pt_config = pt.get('config') or pt.get('indicatorParams') or {}
-                    direction = pt.get('direction', 'bullish')
-                    threshold = pt.get('threshold', 30)
-                    indicator = pt.get('indicator', 'zigzag')
-
-                    # Check for multi-timeframe target
-                    target_timeframe = pt.get('timeframe')
-                    use_multi_tf = target_timeframe and target_timeframe != dataset_timeframe
-
-                    # Prepare working_df for multi-timeframe (if applicable)
-                    working_df = combined_df
-                    # How many base-timeframe bars one target-timeframe bar spans. A target
-                    # computed on a higher timeframe looks further ahead once aligned back,
-                    # so its purge horizon has to be expressed in base bars.
-                    bars_per_target_bar = 1
-                    if use_multi_tf:
-                        try:
-                            from app.services.indicators import resample_ohlcv_to_timeframe, align_higher_timeframe_to_lower
-                            working_df = resample_ohlcv_to_timeframe(
-                                combined_df, target_timeframe, source_timeframe=dataset_timeframe
-                            )
-                            logger.info(f"Resampled to {target_timeframe} for target: {len(combined_df)} -> {len(working_df)} bars")
-                            if len(working_df) > 0:
-                                bars_per_target_bar = max(1, int(np.ceil(len(combined_df) / len(working_df))))
-                        except ValueError as e:
-                            logger.warning(f"Cannot resample to {target_timeframe}: {e}. Using base timeframe.")
-                            use_multi_tf = False
-                            working_df = combined_df
-
-                    if pt_type == 'trend_reversal':
-                        # Use calculate_trend_reversal from PredictionTargetService
-                        col_name = f"{indicator}_{direction}_reversal"
-                        if use_multi_tf:
-                            col_name = f"{col_name}_{target_timeframe}"
-                        try:
-                            target_series = target_service.calculate_trend_reversal(
-                                working_df,
-                                indicator=indicator,
-                                indicator_params=pt_config,
-                                threshold=threshold,
-                                direction=direction
-                            )
-
-                            # Align back to original timeframe if multi-timeframe
-                            if use_multi_tf:
-                                higher_tf_data = working_df[['Date']].copy()
-                                higher_tf_data['_target'] = target_series.values
-                                aligned = align_higher_timeframe_to_lower(combined_df, higher_tf_data, ['_target'])
-                                target_series = pd.Series(aligned['_target'].values, index=combined_df.index)
-                                logger.info(f"Aligned {col_name} from {target_timeframe} to {dataset_timeframe}")
-
-                            combined_df[col_name] = target_series
-                            all_target_columns.append(col_name)
-                            # rsi/macd/sar reversals only compare bar i against bar i-1 --
-                            # genuinely causal, horizon 0. zigzag reads zigzag.iloc[i+1] to
-                            # see the slope flip, so it looks one target-timeframe bar ahead.
-                            target_label_horizons[col_name] = (
-                                bars_per_target_bar if indicator == 'zigzag' else 0
-                            )
-                            if target_column is None:
-                                target_column = col_name
-                            logger.info(f"Created trend reversal target: {col_name}, positives: {int(target_series.sum())}")
-                        except Exception as e:
-                            return {'status': 'failed', 'error': f'Failed to calculate trend_reversal target: {e}'}
-
-                    elif pt_type == 'directional':
-                        # Simple directional target
-                        horizon = pt.get('horizon') or pt_config.get('horizon')
-                        horizon_unit = pt.get('horizonUnit', 'bars')
-                        if horizon is None:
-                            return {'status': 'failed', 'error': f'directional target requires horizon. Got: {pt}'}
-                        # Convert days to bars if needed
-                        if horizon_unit == 'days':
-                            horizon = days_to_bars(horizon, dataset_timeframe)
-                        dir_label = 'up' if direction in ['up', 'bullish'] else 'down'
-                        col_name = f"direction_{dir_label}_{horizon}bar"
-                        if use_multi_tf:
-                            col_name = f"{col_name}_{target_timeframe}"
-                        # Directional is calculated on base timeframe (uses shift), no resampling needed.
-                        # The final `horizon` bars come back NaN, not 0 -- see build_directional_target.
-                        combined_df[col_name] = build_directional_target(
-                            combined_df['Close'], horizon, direction
-                        )
-                        all_target_columns.append(col_name)
-                        target_label_horizons[col_name] = horizon
-                        if target_column is None:
-                            target_column = col_name
-                        logger.info(
-                            f"Created directional target: {col_name} "
-                            f"({int(combined_df[col_name].isna().sum())} unobservable tail rows left as NaN)"
-                        )
-
-                    elif pt_type == 'price_based':
-                        # Price-based target with profit target, max drawdown, and time window
-                        profit_pct = pt.get('profitPct')
-                        max_dd_pct = pt.get('maxDrawdownPct')
-                        time_bars = pt.get('timeBars')
-                        time_unit = pt.get('timeBarsUnit', 'bars')
-                        dir_label = pt.get('direction', 'up')
-
-                        if profit_pct is None or max_dd_pct is None or time_bars is None:
-                            return {'status': 'failed', 'error': f'price_based target requires profitPct, maxDrawdownPct, and timeBars. Got: {pt}'}
-
-                        # Convert days to bars if needed
-                        if time_unit == 'days':
-                            time_bars = days_to_bars(time_bars, dataset_timeframe)
-
-                        col_name = f"price_{dir_label}_{profit_pct}pct_{max_dd_pct}dd_{time_bars}b"
-                        try:
-                            target_series = target_service.calculate_prediction_targets(
-                                combined_df,
-                                [{
-                                    'profit_pct': profit_pct,
-                                    'max_dd': max_dd_pct,
-                                    'days': time_bars,  # Now in bars
-                                    'direction': dir_label
-                                }]
-                            )
-                            # The service adds columns directly, extract the one we need
-                            expected_col = f"price_{dir_label}_{profit_pct}pct_{max_dd_pct}dd_{time_bars}d"
-                            if expected_col in target_series.columns:
-                                combined_df[col_name] = target_series[expected_col]
-                            else:
-                                # Find the matching column
-                                for c in target_series.columns:
-                                    if c.startswith(f"price_{dir_label}"):
-                                        combined_df[col_name] = target_series[c]
-                                        break
-                            all_target_columns.append(col_name)
-                            target_label_horizons[col_name] = time_bars
-                            if target_column is None:
-                                target_column = col_name
-                            positive_count = int(combined_df[col_name].sum()) if col_name in combined_df.columns else 0
-                            logger.info(f"Created price_based target: {col_name}, positives: {positive_count}")
-                        except Exception as e:
-                            return {'status': 'failed', 'error': f'Failed to calculate price_based target: {e}'}
-
-                    elif pt_type == 'triple_barrier':
-                        # Triple barrier target: profit, stop, timeout
-                        profit_pct = pt.get('profitPct')
-                        stop_pct = pt.get('stopPct')
-                        max_bars = pt.get('maxBars')
-                        max_bars_unit = pt.get('maxBarsUnit', 'bars')
-
-                        if profit_pct is None or stop_pct is None or max_bars is None:
-                            return {'status': 'failed', 'error': f'triple_barrier target requires profitPct, stopPct, and maxBars. Got: {pt}'}
-
-                        # Convert days to bars if needed
-                        if max_bars_unit == 'days':
-                            max_bars = days_to_bars(max_bars, dataset_timeframe)
-
-                        col_name = f"triple_barrier_{profit_pct}p_{stop_pct}s_{max_bars}b"
-                        try:
-                            # Calculate triple barrier labels: 0=stop, 1=timeout, 2=profit
-                            labels = []
-                            close_prices = combined_df['Close'].values
-                            for i in range(len(close_prices)):
-                                if i + max_bars >= len(close_prices):
-                                    labels.append(np.nan)
-                                    continue
-                                entry_price = close_prices[i]
-                                profit_level = entry_price * (1 + profit_pct / 100)
-                                stop_level = entry_price * (1 - stop_pct / 100)
-                                label = 1  # Default: timeout
-                                for j in range(1, max_bars + 1):
-                                    future_price = close_prices[i + j]
-                                    if future_price >= profit_level:
-                                        label = 2  # Profit hit
-                                        break
-                                    elif future_price <= stop_level:
-                                        label = 0  # Stop hit
-                                        break
-                                labels.append(label)
-                            combined_df[col_name] = labels
-                            all_target_columns.append(col_name)
-                            target_label_horizons[col_name] = max_bars
-                            if target_column is None:
-                                target_column = col_name
-                            logger.info(f"Created triple_barrier target: {col_name}")
-                        except Exception as e:
-                            return {'status': 'failed', 'error': f'Failed to calculate triple_barrier target: {e}'}
-
-                    elif pt_type == 'volatility':
-                        # Volatility regression target
-                        horizon = pt.get('horizon', 5)
-                        horizon_unit = pt.get('horizonUnit', 'bars')
-                        method = pt.get('method', 'std')
-
-                        # Convert days to bars if needed
-                        if horizon_unit == 'days':
-                            horizon = days_to_bars(horizon, dataset_timeframe)
-
-                        col_name = f"volatility_{method}_{horizon}b"
-                        try:
-                            if method == 'std':
-                                combined_df[col_name] = combined_df['Close'].pct_change().rolling(horizon).std().shift(-horizon)
-                            elif method == 'range':
-                                combined_df[col_name] = ((combined_df['High'].rolling(horizon).max() - combined_df['Low'].rolling(horizon).min()) / combined_df['Close']).shift(-horizon)
-                            elif method == 'atr':
-                                tr = np.maximum(
-                                    combined_df['High'] - combined_df['Low'],
-                                    np.maximum(
-                                        abs(combined_df['High'] - combined_df['Close'].shift(1)),
-                                        abs(combined_df['Low'] - combined_df['Close'].shift(1))
-                                    )
-                                )
-                                combined_df[col_name] = tr.rolling(horizon).mean().shift(-horizon)
-                            else:
-                                return {'status': 'failed', 'error': f'Unknown volatility method: {method}'}
-                            all_target_columns.append(col_name)
-                            target_label_horizons[col_name] = horizon
-                            if target_column is None:
-                                target_column = col_name
-                            logger.info(f"Created volatility target: {col_name}")
-                        except Exception as e:
-                            return {'status': 'failed', 'error': f'Failed to calculate volatility target: {e}'}
-
-                    else:
-                        return {'status': 'failed', 'error': f'Unknown target type: {pt_type}'}
-
-                if target_column is None:
-                    return {'status': 'failed', 'error': 'No valid target was created from prediction_targets'}
-
-                logger.info(f"Created {len(all_target_columns)} target columns: {all_target_columns}")
-
-            else:
-                # Legacy price-based format
-                target_service = PredictionTargetService()
-
-                targets = []
-                for pt in prediction_targets:
-                    profit_pct = pt.get('profitPercent')
-                    max_dd = pt.get('maxDrawdownPercent')
-                    days = pt.get('timePeriodDays')
-
-                    # All values are required for price-based targets
-                    if profit_pct is None or max_dd is None or days is None:
-                        return {'status': 'failed', 'error': f'Price-based target requires profitPercent, maxDrawdownPercent, and timePeriodDays. Got: {pt}'}
-
-                    targets.append({
-                        'profit_pct': profit_pct,
-                        'max_dd': max_dd,
-                        'days': days,
-                        'direction': 'up'
-                    })
-                    # Add symmetric down target
-                    targets.append({
-                        'profit_pct': profit_pct,
-                        'max_dd': max_dd,
-                        'days': days,
-                        'direction': 'down'
-                    })
-
-                if targets:
-                    combined_df = target_service.calculate_prediction_targets(combined_df, targets)
-                    target_column = f"price_up_{targets[0]['profit_pct']}pct_{targets[0]['max_dd']}dd_{targets[0]['days']}d"
-                    for t in targets:
-                        legacy_col = f"price_{t['direction']}_{t['profit_pct']}pct_{t['max_dd']}dd_{t['days']}d"
-                        all_target_columns.append(legacy_col)
-                        target_label_horizons[legacy_col] = t['days']
-                else:
-                    return {'status': 'failed', 'error': 'No valid price-based targets configured'}
-        else:
-            # Default: use Close for regression. Close at bar i is observed at bar i --
-            # a genuinely causal target, so nothing is purged at the split boundary.
-            target_column = 'Close'
-            target_label_horizons['Close'] = 0
+        built = []
+        try:
+            for frame in frames:
+                built.append(build_prediction_targets(frame, prediction_targets, dataset_timeframe))
+        except TargetBuildError as e:
+            return {'status': 'failed', 'error': str(e)}
+        frames = [b[0] for b in built]
+        target_column = built[0][1]
+        all_target_columns = built[0][2]
+        target_label_horizons = built[0][3]
 
         # Every forward-looking target leaves an unobservable tail: for the last
         # `label_horizon` bars the outcome window runs past the end of the data.
@@ -1726,17 +1877,25 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
         # if they did. (Before this, directional targets stored them as 0 and
         # triple_barrier's NaN reached `astype(np.int64)` as an integer overflow
         # sentinel.)
-        if target_column not in combined_df.columns:
+        if any(target_column not in f.columns for f in frames):
             return {'status': 'failed', 'error': f'Target column {target_column} missing from prepared dataset'}
-        n_rows_before = len(combined_df)
-        combined_df, n_unobservable = drop_unobservable_target_rows(combined_df, target_column)
+        n_rows_before = sum(len(f) for f in frames)
+        n_unobservable = 0
+        trimmed = []
+        for f in frames:
+            f, n_dropped = drop_unobservable_target_rows(f, target_column)
+            n_unobservable += n_dropped
+            trimmed.append(f)
+        frames = trimmed
         if n_unobservable:
             logger.info(
                 f"Dropped {n_unobservable} rows with no observable "
                 f"'{target_column}' outcome (of {n_rows_before})"
             )
-            if len(combined_df) == 0:
+            if sum(len(f) for f in frames) == 0:
                 return {'status': 'failed', 'error': f'No rows have an observable {target_column} outcome'}
+        # Reporting / saving frame only: training never sees this interleaving.
+        combined_df = _concat_by_date(frames)
 
         # Look-ahead purge budget for the chronological split. A missing entry means
         # a target branch forgot to declare its horizon; refuse rather than assume 0,
@@ -1748,30 +1907,25 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
             }
         label_horizon = int(target_label_horizons[target_column])
 
-        # Train/test split
-        update_job_progress(task_id, 20, "Splitting train/test data...")
+        # Train / validation / holdout split, PER TICKER, chronological. Targets are computed
+        # over the whole series and only then cut, so both boundaries are purged by the label
+        # horizon (see three_way_bounds). The "test" block of the old two-way split is now the
+        # validation block (GA fitness, threshold gene) plus an untouched holdout that is only
+        # scored and reported.
+        update_job_progress(task_id, 20, "Splitting train/validation/holdout data...")
         train_ratio = train_test_split / 100.0
-        train_df, test_df = DatasetSplitter.train_test_split(combined_df, train_ratio=train_ratio)
+        try:
+            split_frames = split_frames_three_way(frames, train_ratio, HOLDOUT_SHARE_OF_TEST, label_horizon)
+        except ValueError as e:
+            return {'status': 'failed', 'error': str(e)}
+        train_df = _concat_by_date(split_frames['train'])
+        val_df = _concat_by_date(split_frames['val'])
+        holdout_df = _concat_by_date(split_frames['holdout'])
+        test_df = _concat_by_date(split_frames['val'] + split_frames['holdout'])
 
-        # Purge the training rows whose outcome window reaches into the test block.
-        # Targets are computed over the COMBINED frame and only then cut at the split
-        # index, so without this the last `label_horizon` training labels are decided
-        # by test-period bars.
-        if label_horizon > 0:
-            keep = purged_train_row_count(len(train_df), label_horizon)
-            if keep == 0:
-                return {
-                    'status': 'failed',
-                    'error': (f'Label horizon {label_horizon} consumes the entire {len(train_df)}-row '
-                              f'training block; use more data or a shorter horizon')
-                }
-            logger.info(
-                f"Purged {len(train_df) - keep} boundary training rows "
-                f"(label horizon {label_horizon} bars)"
-            )
-            train_df = train_df.iloc[:keep].copy()
-
-        logger.info(f"Train: {len(train_df)} rows, Test: {len(test_df)} rows")
+        logger.info(
+            f"Train: {len(train_df)} rows, Validation: {len(val_df)} rows, Holdout: {len(holdout_df)} rows"
+        )
 
         # Calculate target distribution for both train and test sets
         train_positives = 0
@@ -1820,6 +1974,8 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
         dataset_stats = {
             "trainRows": len(train_df),
             "testRows": len(test_df),
+            "validationRows": len(val_df),
+            "holdoutRows": len(holdout_df),
             "targetColumn": target_column,
             "trainPositives": train_positives,
             "testPositives": test_positives,
@@ -1860,10 +2016,13 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
             target_stats = combined_df[target_column].value_counts().to_dict()
             return {
                 'status': 'dry_run_success',
+                'seed': job_seed,
                 'job_type': job_type,
                 'dataset_rows': len(combined_df),
                 'train_rows': len(train_df),
                 'test_rows': len(test_df),
+                'validation_rows': len(val_df),
+                'holdout_rows': len(holdout_df),
                 'feature_count': len(feature_columns),
                 'target_column': target_column,
                 'target_distribution': target_stats,
@@ -1882,8 +2041,10 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                 model_result = train_classification_optimization(
                     task_id=task_id,
                     selected_models=selected_models,
-                    full_df=combined_df,
+                    frames=frames,
                     train_ratio=train_ratio,
+                    holdout_share_of_test=HOLDOUT_SHARE_OF_TEST,
+                    seed=job_seed,
                     target_column=target_column,
                     feature_columns=feature_columns,
                     parameter_ranges=parameter_ranges,
@@ -1915,8 +2076,10 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                 model_result = train_unified_optimization(
                     task_id=task_id,
                     selected_models=selected_models,
-                    full_df=combined_df,
+                    frames=frames,
                     train_ratio=train_ratio,
+                    holdout_share_of_test=HOLDOUT_SHARE_OF_TEST,
+                    seed=job_seed,
                     target_column=target_column,
                     feature_columns=feature_columns,
                     parameter_ranges=parameter_ranges,
@@ -2010,6 +2173,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
 
             return {
                 'status': 'completed',
+                'seed': job_seed,
                 'models_trained': len(successful_results),
                 'total_models': total_models,
                 'results': results,
@@ -2254,7 +2418,8 @@ def train_single_model(
                 model,
                 test_series,
                 covariates=test_covariates,
-                optimize_metric=optimize_metric
+                optimize_metric=optimize_metric,
+                loss_function=loss_function_type
             )
 
             if 'error' in eval_result:
@@ -2406,8 +2571,10 @@ def train_single_model(
 def train_classification_optimization(
     task_id: str,
     selected_models: List[str],
-    full_df: pd.DataFrame,
+    frames: List[pd.DataFrame],
     train_ratio: float,
+    holdout_share_of_test: float,
+    seed: int,
     target_column: str,
     feature_columns: List[str],
     parameter_ranges: Dict[str, Any],
@@ -2425,10 +2592,15 @@ def train_classification_optimization(
 
     Uses TSAIModelService and TSAITrainingService for classification tasks.
     Supports shift and multistep prediction modes.
+
+    ``frames`` holds one frame per ticker, each with its own targets. Every frame is cut into
+    purged train / validation / holdout blocks and windowed separately: the GA fitness, the
+    threshold gene and the per-epoch validation all use the VALIDATION block, and the holdout is
+    scored once per individual and reported as ``holdout_metrics`` -- never selected on.
     """
     from app.services.task_queue import get_task_queue
     from app.services.tsai_models import TSAIModelService, TSAI_AVAILABLE
-    from app.services.tsai_training import TSAITrainingService
+    from app.services.tsai_training import TSAITrainingService, class_pos_weight
 
     if not TSAI_AVAILABLE:
         return {
@@ -2517,15 +2689,19 @@ def train_classification_optimization(
                 # NOTE: Target column is already pre-shifted during dataset generation
                 # (e.g., directional target uses shift(-horizon) to look ahead)
                 # So we pass prediction_horizon=0 here to avoid double-shifting
-                X_train, X_test, y_train, y_test = training_service.prepare_data_split(
-                    full_df,
+                split = training_service.prepare_split_three_way(
+                    frames,
                     train_ratio=train_ratio,
+                    holdout_share_of_test=holdout_share_of_test,
                     target_column=target_column,
                     feature_columns=feature_columns,
                     seq_len=current_seq_len,
                     prediction_horizon=0,  # Target already pre-shifted
                     prediction_mode=mode,
                     label_horizon=label_horizon  # purge the boundary rows the pre-shift leaks
+                )
+                X_train, X_test, y_train, y_test = (
+                    split['X_train'], split['X_val'], split['y_train'], split['y_val']
                 )
                 c_out = 2 if mode == 'shift' else prediction_horizon
                 # Get the actual valid columns used after dropping zero-variance columns
@@ -2535,12 +2711,17 @@ def train_classification_optimization(
                 data_by_mode_and_seqlen[cache_key] = {
                     'X_train': X_train, 'X_test': X_test,
                     'y_train': y_train, 'y_test': y_test,
+                    'X_holdout': split['X_holdout'], 'y_holdout': split['y_holdout'],
                     'c_out': c_out,
                     'seq_len': current_seq_len,
                     'valid_feature_columns': valid_feature_columns,  # Store the actual columns used
                     'normalization_params': normalization_params  # Store normalization params for forward test
                 }
-                logger.info(f"Prepared {mode} data (seq_len={current_seq_len}): train={len(X_train)}, test={len(X_test)}, c_out={c_out}, features={len(valid_feature_columns)}")
+                logger.info(
+                    f"Prepared {mode} data (seq_len={current_seq_len}): train={len(X_train)}, "
+                    f"validation={len(X_test)}, holdout={len(split['X_holdout'])}, c_out={c_out}, "
+                    f"features={len(valid_feature_columns)}"
+                )
             except Exception as e:
                 logger.error(f"Failed to prepare {mode} data (seq_len={current_seq_len}): {e}")
                 continue
@@ -2574,6 +2755,7 @@ def train_classification_optimization(
 
     best_model = [None]
     best_metrics = [{}]
+    best_holdout_metrics = [{}]
     best_params = [{}]
 
     # Initialize training state for UI
@@ -2601,6 +2783,9 @@ def train_classification_optimization(
         """Evaluate model with given parameters."""
         if progress_state['cancelled'] or check_cancelled():
             raise InterruptedError("Task cancelled")
+
+        # Same genes -> same initial weights / batch order, whatever the evaluation order
+        seed_everything(genome_seed(seed, params), include_python_random=False)
 
         progress_state['current_individual'] += 1
         gen = progress_state['current_generation']
@@ -2687,9 +2872,13 @@ def train_classification_optimization(
             )
 
             # Get loss function (use current_loss_function from GA params)
+            loss_name = current_loss_function.replace('_loss', '').replace('weighted_cross_entropy', 'weighted_ce')
             loss_fn = training_service.get_loss_function(
-                loss_type=current_loss_function.replace('_loss', '').replace('weighted_cross_entropy', 'weighted_ce'),
-                prediction_mode=mode
+                loss_type=loss_name,
+                prediction_mode=mode,
+                # weighted_ce was created WITHOUT a weight (silently the plain loss); weight the
+                # positive class by the training class balance
+                pos_weight=class_pos_weight(y_train, mode) if loss_name == 'weighted_ce' else None
             )
 
             # Create epoch callback for training progress
@@ -2720,7 +2909,8 @@ def train_classification_optimization(
                 progress_state['error_count'] += 1
                 return 0.0
 
-            # Assess model with optimized threshold
+            # Assess model with optimized threshold. `X_test` here is the VALIDATION block: the
+            # fitness, the threshold gene and the epoch validation all use it.
             metrics = training_service.assess_model(
                 result['model'],
                 (X_test, y_test),
@@ -2737,6 +2927,19 @@ def train_classification_optimization(
 
             fitness = metrics.get(optimize_metric, 0.0)
 
+            # The holdout is scored with the already-chosen threshold and never feeds the fitness.
+            holdout_metrics = training_service.assess_model(
+                result['model'],
+                (mode_data['X_holdout'], mode_data['y_holdout']),
+                prediction_mode=mode,
+                learner=result.get('learner'),
+                threshold=current_threshold
+            )
+            if holdout_metrics.get('error'):
+                logger.warning(f"Holdout assessment failed: {holdout_metrics.get('error')}")
+                progress_state['error_count'] += 1
+                return 0.0
+
             # Track best
             if fitness > progress_state['best_fitness']:
                 progress_state['best_fitness'] = fitness
@@ -2744,6 +2947,7 @@ def train_classification_optimization(
                 progress_state['best_mode'] = mode
                 best_model[0] = result['model']
                 best_metrics[0] = metrics
+                best_holdout_metrics[0] = holdout_metrics
                 best_params[0] = {
                     'model_type': model_type,
                     'prediction_mode': mode,
@@ -2788,6 +2992,7 @@ def train_classification_optimization(
                     'c_in': X_train.shape[1],
                     'c_out': c_out,
                     'metrics': metrics,
+                    'holdout_metrics': holdout_metrics,
                     # Save the ACTUAL feature columns used during training (after dropping zero-variance cols)
                     # This must match c_in for inference to work correctly
                     'feature_columns': mode_data.get('valid_feature_columns', feature_columns),
@@ -2815,6 +3020,7 @@ def train_classification_optimization(
                 'threshold': current_threshold,
                 'fitness': fitness,
                 'metrics': metrics,
+                'holdout_metrics': holdout_metrics,
                 'training_history': training_history
             }
             progress_state['all_individuals'].append(individual_record)
@@ -2969,6 +3175,7 @@ def train_classification_optimization(
         'best_fitness': opt_result.get('best_fitness'),
         'generations_run': opt_result.get('generations_run'),
         'metrics': best_metrics[0],
+        'holdout_metrics': best_holdout_metrics[0],
         'model_path': model_path,
         'elite_model_paths': elite_paths,
         'all_individuals': progress_state['all_individuals'],
@@ -2981,8 +3188,10 @@ def train_classification_optimization(
 def train_unified_optimization(
     task_id: str,
     selected_models: List[str],
-    full_df: pd.DataFrame,
+    frames: List[pd.DataFrame],
     train_ratio: float,
+    holdout_share_of_test: float,
+    seed: int,
     target_column: str,
     feature_columns: List[str],
     parameter_ranges: Dict[str, Any],
@@ -3005,6 +3214,11 @@ def train_unified_optimization(
       These models predict a single value N bars ahead.
     - Multi-step models (NBEATS/TCN/Transformer/TFT): Use original target, output_chunk_length=horizon
       These models predict the next N values in a single forward pass.
+
+    ``frames`` holds one frame per ticker, each with its own targets; every frame is scaled, shifted
+    and cut into purged train / validation / holdout series on its own. The GA fitness and the
+    per-epoch validation use the VALIDATION series; the holdout is scored once per individual and
+    reported as ``holdout_metrics``, never selected on.
     """
     from app.services.task_queue import get_task_queue
 
@@ -3021,19 +3235,25 @@ def train_unified_optimization(
     # - RNN models: use original target (no shift) with output_chunk_length=1
     # - Multi-step models: use original target with output_chunk_length=1
     try:
-        # Create shifted target column for RNN models (skip if prediction_horizon=0)
-        rnn_df = full_df.copy()
+        # Create shifted target column for RNN models (skip if prediction_horizon=0). The shift is
+        # taken PER TICKER: on an interleaved multi-symbol frame shift(-h) reads another symbol.
         if prediction_horizon > 0:
             rnn_target_column = f"{target_column}_h{prediction_horizon}"
-            rnn_df[rnn_target_column] = rnn_df[target_column].shift(-prediction_horizon)
+            rnn_frames = []
+            for f in frames:
+                f = f.copy()
+                f[rnn_target_column] = f[target_column].shift(-prediction_horizon)
+                rnn_frames.append(f)
         else:
             # No shift needed - target already has built-in look-ahead
             rnn_target_column = target_column
+            rnn_frames = frames
 
         # Prepare RNN data (shifted target, will use output_chunk_length=1)
-        rnn_train_series, rnn_test_series, rnn_train_cov, rnn_test_cov = training_service.prepare_data_split(
-            rnn_df,
+        rnn_split = training_service.prepare_split_three_way(
+            rnn_frames,
             train_ratio=train_ratio,
+            holdout_share_of_test=holdout_share_of_test,
             target_column=rnn_target_column,
             feature_columns=feature_columns,
             timeframe=timeframe,
@@ -3041,50 +3261,89 @@ def train_unified_optimization(
             # so its outcome window reaches that much further past the split.
             label_horizon=label_horizon + max(0, prediction_horizon)
         )
-        logger.info(f"RNN data prepared: train={len(rnn_train_series)}, test={len(rnn_test_series)} samples (target: {rnn_target_column})")
+        rnn_scalers = list(training_service.scalers)
+        rnn_scaler_params = training_service.describe_scalers(rnn_scalers, list(training_service.cov_scalers))
+        logger.info(
+            f"RNN data prepared: train={_n_points(rnn_split['train_series'])}, "
+            f"validation={_n_points(rnn_split['val_series'])}, holdout={_n_points(rnn_split['holdout_series'])} "
+            f"points (target: {rnn_target_column})"
+        )
 
         # Prepare multi-step data (original target, will use output_chunk_length=horizon)
-        ms_train_series, ms_test_series, ms_train_cov, ms_test_cov = training_service.prepare_data_split(
-            full_df,
+        ms_split = training_service.prepare_split_three_way(
+            frames,
             train_ratio=train_ratio,
+            holdout_share_of_test=holdout_share_of_test,
             target_column=target_column,
             feature_columns=feature_columns,
             timeframe=timeframe,
             label_horizon=label_horizon
         )
-        logger.info(f"Multi-step data prepared: train={len(ms_train_series)}, test={len(ms_test_series)} samples (target: {target_column})")
+        ms_scalers = list(training_service.scalers)
+        ms_scaler_params = training_service.describe_scalers(ms_scalers, list(training_service.cov_scalers))
+        logger.info(
+            f"Multi-step data prepared: train={_n_points(ms_split['train_series'])}, "
+            f"validation={_n_points(ms_split['val_series'])}, holdout={_n_points(ms_split['holdout_series'])} "
+            f"points (target: {target_column})"
+        )
 
-        # Store both datasets for use in fitness function
+        # Store both datasets for use in fitness function. Each carries its OWN scalers: the two
+        # preparations fit different target scalers, and a model must be inverse-transformed with
+        # the scalers of the series it was trained on.
         data_by_model_type = {
             'rnn': {
-                'train_series': rnn_train_series,
-                'test_series': rnn_test_series,
-                'train_covariates': rnn_train_cov,
-                'test_covariates': rnn_test_cov,
+                'train_series': rnn_split['train_series'],
+                'test_series': rnn_split['val_series'],        # validation block
+                'holdout_series': rnn_split['holdout_series'],
+                'train_covariates': rnn_split['train_covariates'],
+                'test_covariates': rnn_split['val_covariates'],
+                'holdout_covariates': rnn_split['holdout_covariates'],
+                'scalers': rnn_scalers,
+                'scaler_params': rnn_scaler_params,
                 'target_column': rnn_target_column,
-                'output_chunk_length': 1
+                'output_chunk_length': 1,
+                # The series IS the label shifted by prediction_horizon: its value at u is only
+                # known label_horizon + prediction_horizon bars after u.
+                'output_chunk_shift': label_horizon + max(0, prediction_horizon)
             },
             'multistep': {
-                'train_series': ms_train_series,
-                'test_series': ms_test_series,
-                'train_covariates': ms_train_cov,
-                'test_covariates': ms_test_cov,
+                'train_series': ms_split['train_series'],
+                'test_series': ms_split['val_series'],
+                'holdout_series': ms_split['holdout_series'],
+                'train_covariates': ms_split['train_covariates'],
+                'test_covariates': ms_split['val_covariates'],
+                'holdout_covariates': ms_split['holdout_covariates'],
+                'scalers': ms_scalers,
+                'scaler_params': ms_scaler_params,
                 'target_column': target_column,
                 # output_chunk_length must be >= 1; when prediction_horizon=0,
                 # target already has built-in look-ahead so use 1
-                'output_chunk_length': max(1, prediction_horizon)
+                'output_chunk_length': max(1, prediction_horizon),
+                # The series' value at u is only known label_horizon bars after u: the input window
+                # must end that long before the prediction time (no label history from the future).
+                'output_chunk_shift': label_horizon
             }
         }
+
+        rnn_lag = data_by_model_type['rnn']['output_chunk_shift']
+        rnn_selected = [m for m in selected_models if m in RNN_MODELS]
+        if rnn_selected and rnn_lag > 0:
+            raise ValueError(
+                f"{rnn_selected} cannot be trained on this target: the Darts RNNModel forecasts the label "
+                f"series from its own past labels and cannot shift its output, and this label (look-ahead "
+                f"{label_horizon} + prediction horizon {max(0, prediction_horizon)} = {rnn_lag} bars) is not "
+                f"yet known for the last {rnn_lag} history points. Select nbeats/tcn/transformer/tft."
+            )
 
         # Validate series lengths
         min_train_length = 100
         min_test_length = 50
 
         for dtype, dinfo in data_by_model_type.items():
-            if len(dinfo['train_series']) < min_train_length:
-                logger.warning(f"{dtype} train series ({len(dinfo['train_series'])}) is short.")
-            if len(dinfo['test_series']) < min_test_length:
-                logger.warning(f"{dtype} test series ({len(dinfo['test_series'])}) is very short.")
+            if _n_points(dinfo['train_series']) < min_train_length:
+                logger.warning(f"{dtype} train series ({_n_points(dinfo['train_series'])}) is short.")
+            if _n_points(dinfo['test_series']) < min_test_length:
+                logger.warning(f"{dtype} validation series ({_n_points(dinfo['test_series'])}) is very short.")
 
     except Exception as e:
         logger.error(f"Failed to prepare data: {e}", exc_info=True)
@@ -3095,7 +3354,8 @@ def train_unified_optimization(
         }
 
     # Build unified parameter ranges including model_type_idx
-    train_length = len(ms_train_series)
+    train_length = min(len(s) for s in ms_split['train_series']) if isinstance(ms_split['train_series'], list) \
+        else len(ms_split['train_series'])
     max_input_chunk = min(60, max(10, train_length // 4))
     ga_param_ranges = build_unified_param_ranges(selected_models, parameter_ranges, max_input_chunk)
 
@@ -3123,28 +3383,13 @@ def train_unified_optimization(
     loss_function_type = metrics_config.get('lossFunction')
     if loss_function_type is None:
         return {'model_type': 'unified', 'status': 'failed', 'error': 'metrics_config.lossFunction is required'}
-    loss_fn = None
-
-    # Create loss function if not using default MSE
-    if loss_function_type and loss_function_type != 'mse':
-        try:
-            from app.services.losses import get_loss_function
-            # Calculate class counts from training data for weighted loss
-            # Use train_series which should be available at this point
-            train_vals = train_series.values().flatten()
-            positive_count = int((train_vals == 1).sum())
-            negative_count = int((train_vals == 0).sum())
-            logger.info(f"Class distribution for loss: {positive_count} positive, {negative_count} negative")
-
-            loss_fn = get_loss_function(
-                loss_type=loss_function_type,
-                positive_count=positive_count,
-                negative_count=negative_count
-            )
-            logger.info(f"Using {loss_function_type} loss function for training")
-        except Exception as e:
-            logger.warning(f"Failed to create {loss_function_type} loss function: {e}. Using default MSE.")
-            loss_fn = None
+    # Any failure building the loss propagates (see create_training_loss).
+    train_labels = pd.concat(
+        [f[target_column].iloc[:three_way_bounds(len(f), train_ratio, holdout_share_of_test, label_horizon)['train_end']]
+         for f in frames],
+        ignore_index=True
+    )
+    loss_fn = create_training_loss(loss_function_type, train_labels, target_column)
 
     # Progress tracking
     progress_state = {
@@ -3161,6 +3406,7 @@ def train_unified_optimization(
 
     best_model = [None]
     best_metrics = [{}]
+    best_holdout_metrics = [{}]
 
     def check_cancelled() -> bool:
         task_queue = get_task_queue()
@@ -3174,6 +3420,9 @@ def train_unified_optimization(
         """Evaluate model with given parameters including model type."""
         if progress_state['cancelled'] or check_cancelled():
             raise InterruptedError("Task cancelled")
+
+        # Same genes -> same initial weights / batch order, whatever the evaluation order
+        seed_everything(genome_seed(seed, params), include_python_random=False)
 
         progress_state['current_individual'] += 1
         individual_num = progress_state['current_individual']
@@ -3225,7 +3474,9 @@ def train_unified_optimization(
 
         try:
             # Get model-specific params with correct output_chunk_length
-            model_params = get_model_params(model_type, params, training_epochs, model_output_chunk)
+            model_params = get_model_params(
+                model_type, params, training_epochs, model_output_chunk, model_data['output_chunk_shift']
+            )
             n_epochs = model_params.get('n_epochs', 10)
 
             # Update epoch info and current model params before training
@@ -3270,14 +3521,34 @@ def train_unified_optimization(
                 )
                 return 0.0
 
-            # Evaluate with the selected optimization metric
+            # Evaluate with the selected optimization metric on the VALIDATION series
             eval_result = training_service.evaluate_model(
                 model, test_series,
                 covariates=test_covariates,
-                optimize_metric=optimize_metric
+                optimize_metric=optimize_metric,
+                loss_function=loss_function_type,
+                scalers=model_data['scalers']
             )
 
             if 'error' in eval_result:
+                progress_state['error_count'] += 1
+                update_job_training_state(
+                    task_id,
+                    error_count=progress_state['error_count'],
+                    success_count=progress_state['success_count']
+                )
+                return 0.0
+
+            # The holdout is scored for reporting only; it never feeds the fitness.
+            holdout_result = training_service.evaluate_model(
+                model, model_data['holdout_series'],
+                covariates=model_data['holdout_covariates'],
+                optimize_metric=optimize_metric,
+                loss_function=loss_function_type,
+                scalers=model_data['scalers']
+            )
+            if 'error' in holdout_result:
+                logger.warning(f"Holdout evaluation failed: {holdout_result['error']}")
                 progress_state['error_count'] += 1
                 update_job_training_state(
                     task_id,
@@ -3313,6 +3584,7 @@ def train_unified_optimization(
                 'loss_function': loss_function_type,
                 'fitness': fitness,
                 'metrics': eval_result,
+                'holdout_metrics': holdout_result,
                 'training_history': training_history
             }
             progress_state['all_individuals'].append(individual_record)
@@ -3329,10 +3601,11 @@ def train_unified_optimization(
                 model_type=model_type,
                 fitness=fitness,
                 params=model_params,
-                metrics=eval_result,
+                metrics={**eval_result, 'holdout_metrics': holdout_result},
                 training_service=training_service,
                 training_history=training_history,
-                feature_columns=feature_columns
+                feature_columns=feature_columns,
+                normalization_params=model_data['scaler_params']
             )
             if save_result is None:
                 # Model save failed - increment error counter
@@ -3350,6 +3623,7 @@ def train_unified_optimization(
                 progress_state['best_model_params'] = model_params
                 best_model[0] = model
                 best_metrics[0] = eval_result
+                best_holdout_metrics[0] = holdout_result
                 update_job_progress(
                     task_id, current_progress,
                     f"Gen {gen}/{generations}, New best: {model_type.upper()} fitness={fitness:.4f}"
@@ -3512,6 +3786,7 @@ def train_unified_optimization(
         'best_fitness': opt_result.get('best_fitness'),
         'generations_run': opt_result.get('generations_run'),
         'metrics': best_metrics[0],
+        'holdout_metrics': best_holdout_metrics[0],
         'model_path': model_path,
         'history': opt_result.get('history', [])[-5:],
         'all_individuals': progress_state['all_individuals'],  # For UI visualization
@@ -3520,7 +3795,10 @@ def train_unified_optimization(
     }
 
 
-def get_model_params(model_type: str, params: Dict, training_epochs: int = 10, output_chunk_length: int = 3) -> Dict:
+def get_model_params(
+    model_type: str, params: Dict, training_epochs: int = 10, output_chunk_length: int = 3,
+    output_chunk_shift: int = 0
+) -> Dict:
     """Extract model-specific parameters from unified params.
 
     Args:
@@ -3530,6 +3808,10 @@ def get_model_params(model_type: str, params: Dict, training_epochs: int = 10, o
         output_chunk_length: Model's output chunk length
             - For RNN models (LSTM/GRU): Always 1 (single step prediction)
             - For multi-step models: prediction_horizon (multi-step prediction)
+        output_chunk_shift: Bars between the end of the input window and the first forecast step.
+            Must equal the look-ahead of the label series being forecast: that is what keeps
+            labels whose outcome is not yet known out of the model's input (RNN models cannot
+            do this, see DartsModelService.create_model).
     """
     model_params = {
         'input_chunk_length': int(params.get('input_chunk_length', 24)),
@@ -3539,6 +3821,8 @@ def get_model_params(model_type: str, params: Dict, training_epochs: int = 10, o
         'learning_rate': params.get('learning_rate', 0.001),
         'dropout': params.get('dropout', 0.1),
     }
+    if output_chunk_shift:
+        model_params['output_chunk_shift'] = output_chunk_shift
 
     model_type_lower = model_type.lower()
 

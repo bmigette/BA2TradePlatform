@@ -493,21 +493,15 @@ def handle_dataset_regeneration(task_id: str, payload: Dict[str, Any]) -> Dict[s
                     )
                     logger.info(f"[Task {task_id}] Added {len(statement_cols)} statement feature columns")
                 else:
-                    # Legacy mode
-                    update_dataset_progress(dataset_id, "Fetching current fundamentals...", task_id)
-                    fundamentals = FundamentalsService.get_fundamental_data(ticker)
-                    if fundamentals and fundamentals.get('current'):
-                        current = fundamentals['current']
-                        added_count = 0
-                        for key, value in current.items():
-                            if value is not None:
-                                df[f'fundamental_{key}'] = value
-                                added_count += 1
-                        update_dataset_progress(
-                            dataset_id,
-                            f"Added {added_count} fundamental columns",
-                            task_id
-                        )
+                    # Legacy mode: today's snapshot is NOT point-in-time (it would be broadcast to
+                    # historical rows), so it is only added when explicitly opted in
+                    n_before = len(df.columns)
+                    df = FundamentalsService.add_live_snapshot_columns(df, ticker, fundamentals_config)
+                    update_dataset_progress(
+                        dataset_id,
+                        f"Added {len(df.columns) - n_before} live-snapshot fundamental columns",
+                        task_id
+                    )
 
                 # Fetch macro indicators
                 macro_indicators = fundamentals_config.get('macro_indicators', [])

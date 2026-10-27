@@ -16,6 +16,8 @@ from typing import Dict, List, Any, Optional
 import logging
 import yfinance as yf
 
+from ba2_common.core.provider_utils import statement_effective_date
+
 logger = logging.getLogger(__name__)
 
 # Statement type to prefix mapping
@@ -539,10 +541,8 @@ class FundamentalsService:
                         fiscal_date = period.get('fiscal_date', '')
                         if fiscal_date:
                             try:
-                                period_date = pd.to_datetime(fiscal_date)
-                                # Normalize period_date to timezone-naive
-                                if hasattr(period_date, 'tzinfo') and period_date.tzinfo is not None:
-                                    period_date = period_date.replace(tzinfo=None)
+                                # A period is usable from the day it was PUBLISHED, not its fiscal end
+                                period_date = FundamentalsService.statement_available_date(period)
                                 if period_date <= row_date_naive:
                                     available.append(period)
                                     if len(available) >= lookback_statements:
@@ -610,6 +610,130 @@ class FundamentalsService:
         return result_df
 
     @staticmethod
+    def add_live_snapshot_columns(
+        df: pd.DataFrame, ticker: str, fundamentals_config: Dict[str, Any]
+    ) -> pd.DataFrame:
+        """Optionally broadcast TODAY's ``yf.Ticker.info`` snapshot onto every row (LIVE-ONLY).
+
+        Off unless ``fundamentals_config['live_only_snapshot']`` is True. The snapshot is today's
+        trailing P/E, margins, market cap, ... copied to rows years in the past, so a historical
+        training set that includes it hands every row the future (a company that later grew has
+        "high revenue" in 2019). It is only meaningful on a frame that ENDS today and is never
+        used for backtests or training; the columns are named ``live_snapshot_*`` so they can
+        not be mistaken for point-in-time ``fundamental_*`` history.
+        """
+        if 'live_only_snapshot' not in fundamentals_config or fundamentals_config['live_only_snapshot'] is not True:
+            logger.info("Skipping today's fundamentals snapshot (not point-in-time; live_only_snapshot is off)")
+            return df
+        df = df.copy()
+        fundamentals = FundamentalsService.get_fundamental_data(ticker)
+        if fundamentals and fundamentals.get('current'):
+            for key, value in fundamentals['current'].items():
+                if value is not None:
+                    df[f'live_snapshot_{key}'] = value
+        return df
+
+    @staticmethod
+    def statement_available_date(period: Dict[str, Any]) -> pd.Timestamp:
+        """The instant a statement period became PUBLIC (tz-naive), never its fiscal period end.
+
+        Uses the platform's own ``statement_effective_date``: the filing / acceptance date when
+        the period row carries one, else fiscal period end + ``STATEMENT_REPORTING_LAG_DAYS``
+        (75 days: 10-Q filings are due 40-45 days and 10-K filings 60-90 days after period end,
+        so the old flat 45 days published most 10-K data before it existed).
+
+        NOTE: the ba2_providers period normalisation maps only the numeric fields and drops
+        ``fillingDate`` / ``acceptedDate``, so for periods that come through
+        ``FundamentalsService.get_*`` the lag fallback is what applies today. Passing those keys
+        through in ``ba2_providers.fundamentals.service._normalize_period`` makes this function
+        use the true filing date without any change here.
+        """
+        fiscal = period['fiscal_date'] if 'fiscal_date' in period else None
+        if not fiscal:
+            raise ValueError(f"Statement period without fiscal_date: {sorted(period)[:6]}")
+        row = {'fiscalDateEnding': str(fiscal)[:10]}
+        for key in ('fillingDate', 'filingDate', 'acceptedDate'):
+            if key in period and period[key]:
+                row[key] = period[key]
+        effective = statement_effective_date(row)
+        if effective is None:
+            raise ValueError(f"No effective date for statement period {fiscal!r}")
+        ts = pd.Timestamp(effective)
+        return ts.tz_localize(None) if ts.tzinfo is not None else ts
+
+    @staticmethod
+    def _build_period_timeline(periods_sorted: List[Dict[str, Any]], field: str) -> List[Dict[str, Any]]:
+        """Per-period values with their availability date, QoQ and YoY change (oldest first).
+
+        A period without enough history for a change keeps ``None`` for it: the change is never
+        borrowed from a later period.
+        """
+        period_data = []
+        for i, period in enumerate(periods_sorted):
+            fiscal_date_str = period.get('fiscal_date')
+            if not fiscal_date_str:
+                continue
+            value = period.get(field)
+            if value is None:
+                continue
+
+            fiscal_date = pd.to_datetime(fiscal_date_str)
+            if getattr(fiscal_date, 'tzinfo', None) is not None:
+                fiscal_date = fiscal_date.replace(tzinfo=None)
+
+            # Calculate QoQ change (previous quarter)
+            qoq_change = None
+            if i > 0:
+                prev_val = periods_sorted[i - 1].get(field)
+                if prev_val and prev_val != 0:
+                    qoq_change = (value - prev_val) / abs(prev_val)
+
+            # Calculate YoY change (4 quarters back)
+            yoy_change = None
+            if i >= 4:
+                prev_year_val = periods_sorted[i - 4].get(field)
+                if prev_year_val and prev_year_val != 0:
+                    yoy_change = (value - prev_year_val) / abs(prev_year_val)
+
+            period_data.append({
+                'date': FundamentalsService.statement_available_date(period),
+                'fiscal_date': fiscal_date,
+                'value': value,
+                'qoq_change': qoq_change,
+                'yoy_change': yoy_change,
+            })
+
+        period_data.sort(key=lambda x: x['date'])
+        return period_data
+
+    @staticmethod
+    def _statement_values_at(row_dates: pd.Series, period_data: List[Dict[str, Any]]) -> Dict[str, list]:
+        """Point-in-time statement columns for each row date.
+
+        A row sees the latest period that was already PUBLIC on its date. Rows before the first
+        publication get NaN in every column (no back-fill of the earliest value and no borrowing
+        of a later period's QoQ/YoY, which gave early rows information from the future).
+        """
+        dates = pd.DatetimeIndex(pd.to_datetime(row_dates))
+        if dates.tz is not None:
+            dates = dates.tz_localize(None)
+        available = pd.DatetimeIndex([p['date'] for p in period_data])
+        idx = available.searchsorted(dates, side='right') - 1   # -1: nothing published yet
+
+        out = {'value': [], 'days_old': [], 'qoq_change': [], 'yoy_change': []}
+        for row_date, i in zip(dates, idx):
+            if i < 0:
+                for k in out:
+                    out[k].append(np.nan)
+                continue
+            p = period_data[i]
+            out['value'].append(p['value'])
+            out['days_old'].append(max(0, (row_date - p['fiscal_date']).days))
+            out['qoq_change'].append(np.nan if p['qoq_change'] is None else p['qoq_change'])
+            out['yoy_change'].append(np.nan if p['yoy_change'] is None else p['yoy_change'])
+        return out
+
+    @staticmethod
     def create_statement_features_v2(
         df: pd.DataFrame,
         ticker: str,
@@ -626,7 +750,8 @@ class FundamentalsService:
         - {prefix}_{field}_qoq_change: Quarter-over-quarter % change
         - {prefix}_{field}_yoy_change: Year-over-year % change
 
-        Includes warmup: backfills earliest known value to start of dataset.
+        Point in time: a row sees only statements already PUBLIC on its date; rows before the first
+        publication are NaN (no warmup back-fill).
 
         Args:
             df: DataFrame with Date column
@@ -727,51 +852,7 @@ class FundamentalsService:
                     col_qoq = f'{prefix}_{field}_qoq_change'
                     col_yoy = f'{prefix}_{field}_yoy_change'
 
-                    # Create period lookup with values and changes
-                    # Earnings are typically announced 30-45 days after fiscal quarter end
-                    # Use 45 days delay for point-in-time correctness
-                    EARNINGS_ANNOUNCEMENT_DELAY_DAYS = 45
-
-                    period_data = []
-                    for i, period in enumerate(periods_sorted):
-                        fiscal_date_str = period.get('fiscal_date')
-                        if not fiscal_date_str:
-                            continue
-
-                        try:
-                            fiscal_date = pd.to_datetime(fiscal_date_str)
-                            if hasattr(fiscal_date, 'tzinfo') and fiscal_date.tzinfo is not None:
-                                fiscal_date = fiscal_date.replace(tzinfo=None)
-                            # Estimate announcement date (when data becomes available)
-                            available_date = fiscal_date + pd.Timedelta(days=EARNINGS_ANNOUNCEMENT_DELAY_DAYS)
-                        except:
-                            continue
-
-                        value = period.get(field)
-                        if value is None:
-                            continue
-
-                        # Calculate QoQ change (previous quarter)
-                        qoq_change = None
-                        if i > 0:
-                            prev_val = periods_sorted[i-1].get(field)
-                            if prev_val and prev_val != 0:
-                                qoq_change = (value - prev_val) / abs(prev_val)
-
-                        # Calculate YoY change (4 quarters back)
-                        yoy_change = None
-                        if i >= 4:
-                            prev_year_val = periods_sorted[i-4].get(field)
-                            if prev_year_val and prev_year_val != 0:
-                                yoy_change = (value - prev_year_val) / abs(prev_year_val)
-
-                        period_data.append({
-                            'date': available_date,  # Use estimated announcement date for point-in-time
-                            'fiscal_date': fiscal_date,
-                            'value': value,
-                            'qoq_change': qoq_change,
-                            'yoy_change': yoy_change
-                        })
+                    period_data = FundamentalsService._build_period_timeline(periods_sorted, field)
 
                     if not period_data:
                         result_df[col_name] = np.nan
@@ -780,55 +861,11 @@ class FundamentalsService:
                         result_df[col_yoy] = np.nan
                         continue
 
-                    # Sort by date
-                    period_data.sort(key=lambda x: x['date'])
-
-                    # Find first available QoQ and YoY values for warmup
-                    first_qoq = next((p['qoq_change'] for p in period_data if p['qoq_change'] is not None), 0.0)
-                    first_yoy = next((p['yoy_change'] for p in period_data if p['yoy_change'] is not None), 0.0)
-
-                    # For each row, find the most recent period before or on that date
-                    def get_period_for_date(row_date):
-                        if hasattr(row_date, 'tzinfo') and row_date.tzinfo is not None:
-                            row_date = row_date.replace(tzinfo=None)
-
-                        best = None
-                        for pd_item in period_data:
-                            if pd_item['date'] <= row_date:
-                                best = pd_item
-                            else:
-                                break
-                        return best
-
-                    values = []
-                    days_old = []
-                    qoq_changes = []
-                    yoy_changes = []
-
-                    for row_date in result_df['Date']:
-                        period_info = get_period_for_date(row_date)
-                        if period_info:
-                            values.append(period_info['value'])
-                            # days_old = days since fiscal quarter end (not announcement)
-                            days = (row_date - period_info['fiscal_date']).days
-                            days_old.append(max(0, days))
-                            # Use first available change values if current is None
-                            qoq_changes.append(period_info['qoq_change'] if period_info['qoq_change'] is not None else first_qoq)
-                            yoy_changes.append(period_info['yoy_change'] if period_info['yoy_change'] is not None else first_yoy)
-                        else:
-                            # Warmup: use earliest known value, calculate days backward
-                            earliest = period_data[0]
-                            values.append(earliest['value'])
-                            days = (earliest['date'] - row_date).days
-                            days_old.append(max(0, days))  # How many days until this data exists
-                            # Use first available change values for warmup
-                            qoq_changes.append(first_qoq)
-                            yoy_changes.append(first_yoy)
-
-                    result_df[col_name] = values
-                    result_df[col_days] = days_old
-                    result_df[col_qoq] = qoq_changes
-                    result_df[col_yoy] = yoy_changes
+                    timeline = FundamentalsService._statement_values_at(result_df['Date'], period_data)
+                    result_df[col_name] = timeline['value']
+                    result_df[col_days] = timeline['days_old']
+                    result_df[col_qoq] = timeline['qoq_change']
+                    result_df[col_yoy] = timeline['yoy_change']
 
             except Exception as e:
                 logger.error(f"Error processing {stmt_type}: {e}", exc_info=True)
