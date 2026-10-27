@@ -39,7 +39,9 @@ try:
         DEVICE = torch.device('cpu')
         GPU_NAME = None
 
-    from tsai.all import (
+    # tsai.models.all, not tsai.all: only the architectures are needed here, and tsai.all also imports the data
+    # transforms, which fail with pyts >= 0.14 (pyts.image.gaf was removed) and took the models down with them.
+    from tsai.models.all import (
         LSTM, GRU, TCN, InceptionTime, ResNet, XceptionTime,
         OmniScaleCNN, MiniRocket, PatchTST, LSTM_FCN, TST
     )
