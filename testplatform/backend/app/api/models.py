@@ -16,6 +16,7 @@ import uuid
 from app.models.database import get_db
 from app.models.model import TrainedModel
 from app.models.dataset import Dataset
+from app.services.ml_wizard_targets import WIZARD_TARGET_TYPES, column_name as wizard_target_column
 
 logger = logging.getLogger(__name__)
 
@@ -726,6 +727,13 @@ def run_model_predictions(
                     col_name = f"triple_barrier_{profit_pct}tp_{stop_pct}sl_{timeout}bars"
                     label = f"Triple Barrier ({profit_pct}% TP, {stop_pct}% SL)"
                     return col_name, label, target_type
+
+            elif target_type in WIZARD_TARGET_TYPES:
+                try:
+                    col_name = wizard_target_column(target)
+                except ValueError:
+                    return None, None, target_type
+                return col_name, col_name, target_type
 
             return None, None, target_type
 

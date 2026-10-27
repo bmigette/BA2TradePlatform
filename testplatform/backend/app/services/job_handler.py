@@ -19,6 +19,8 @@ from pathlib import Path
 from app.models.database import SessionLocal
 from app.models.dataset import Dataset
 from app.services.data_preparation import purged_train_row_count, three_way_bounds
+from app.services.ml_dataset_source import is_alpaca_hist
+from app.services.ml_wizard_targets import WIZARD_TARGET_TYPES, WizardTargetError, build_wizard_target
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +49,9 @@ SPARSE_INDICATOR_PATTERNS = ['zigzag', 'zigzag_direction']
 # inputs: a ZigZag value sits on the pivot bar but the pivot is only known (and may still move)
 # until price has reversed by the deviation, bars later. They stay in the dataset for charts and as
 # the basis of the zigzag reversal TARGET (which is built from High/Low, not from this column).
-HINDSIGHT_FEATURE_PATTERNS = ('zigzag',)
+# ``live_snapshot_*`` is today's fundamentals broadcast to every historical row (FundamentalsService.
+# add_live_snapshot_columns): not point in time, so never an input of a trained model.
+HINDSIGHT_FEATURE_PATTERNS = ('zigzag', 'live_snapshot')
 
 # Share of the old "test" block (everything after train_test_split) that becomes the untouched
 # holdout. The remainder is the validation block the GA selects on (fitness, threshold gene).
@@ -1395,7 +1399,8 @@ def get_dataset_info(dataset_id: int) -> Dict[str, Any]:
                 'id': dataset.id,
                 'name': dataset.name,
                 'ticker': dataset.ticker,
-                'timeframe': dataset.timeframe or 'daily'
+                'timeframe': dataset.timeframe or 'daily',
+                'data_provider': (dataset.generation_config or {}).get('data_provider')
             }
         return {'timeframe': 'daily'}
     finally:
@@ -1440,13 +1445,18 @@ class TargetBuildError(ValueError):
 def build_prediction_targets(
     frame: pd.DataFrame,
     prediction_targets: List[Dict[str, Any]],
-    dataset_timeframe: str
+    dataset_timeframe: str,
+    train_ratio: Optional[float] = None,
+    panel_source: bool = False
 ) -> Tuple[pd.DataFrame, str, List[str], Dict[str, int]]:
     """Add the configured target columns to ONE symbol's chronologically ordered frame.
 
     Targets look into the future (``shift(-h)``, forward loops, rolling-then-shift), so they
     must be computed on a single instrument's own bars. Run on a frame that interleaves
     several tickers they compare AAPL's close with MSFT's: the label then measures nothing.
+
+    ``train_ratio`` (the job's train share) and ``panel_source`` (the dataset comes from the alpaca_hist source) are
+    needed by the wizard targets only (``ml_wizard_targets``): they fit k / the terciles on the rows of the train block.
 
     Returns:
         (frame with target columns, selected target column, every target column,
@@ -1685,6 +1695,24 @@ def build_prediction_targets(
                     except Exception as e:
                         raise TargetBuildError(f'Failed to calculate volatility target: {e}')
 
+                elif pt_type in WIZARD_TARGET_TYPES:
+                    # triple_barrier_atr / direction_terciles / forward_return: labels of THIS symbol's own frame,
+                    # fitted on its train block, with the label horizon in bars as the split's purge length
+                    if train_ratio is None:
+                        raise TargetBuildError(f'{pt_type} target needs the job train ratio to fit on the train block')
+                    try:
+                        series, col_name, lookahead = build_wizard_target(
+                            frame, pt, train_ratio, dataset_timeframe, panel_source
+                        )
+                    except WizardTargetError as e:
+                        raise TargetBuildError(str(e))
+                    frame[col_name] = series
+                    all_target_columns.append(col_name)
+                    target_label_horizons[col_name] = lookahead
+                    if target_column is None:
+                        target_column = col_name
+                    logger.info(f"Created {pt_type} target: {col_name} (look-ahead {lookahead} bars)")
+
                 else:
                     raise TargetBuildError(f'Unknown target type: {pt_type}')
 
@@ -1862,8 +1890,12 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
             update_job_progress(task_id, 15, "Calculating prediction targets...")
         built = []
         try:
-            for frame in frames:
-                built.append(build_prediction_targets(frame, prediction_targets, dataset_timeframe))
+            for frame, info in zip(frames, dataset_infos):
+                built.append(build_prediction_targets(
+                    frame, prediction_targets, dataset_timeframe,
+                    train_ratio=train_test_split / 100.0,
+                    panel_source=is_alpaca_hist(info.get('data_provider'))
+                ))
         except TargetBuildError as e:
             return {'status': 'failed', 'error': str(e)}
         frames = [b[0] for b in built]

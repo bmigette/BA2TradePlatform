@@ -31,6 +31,7 @@ from app.services.dataset_handler import (
     INTERVAL_MAP,
     BARS_PER_DAY,
 )
+from app.services.ml_dataset_source import fetch_ohlcv_frame, is_alpaca_hist, validate_panel_request
 
 
 def get_ohlcv_provider(provider_name: str = "yfinance"):
@@ -245,10 +246,8 @@ def _build_dataset_in_background(dataset_id: int, dataset_config: dict):
         technical_indicators = dataset_config.get('technical_indicators', [])
         sentiment_config = dataset_config.get('sentiment_config', {})
         fundamentals_config = dataset_config.get('fundamentals_config', {})
+        panel_features = dataset_config.get('panel_features') or []
         file_path = Path(db_dataset.file_path)
-
-        # Convert timeframe to interval format
-        interval = INTERVAL_MAP.get(timeframe, "1d")
 
         # Calculate warmup period needed for indicators
         warmup_bars, warmup_days = calculate_warmup_period(technical_indicators, timeframe)
@@ -261,30 +260,18 @@ def _build_dataset_in_background(dataset_id: int, dataset_config: dict):
         if warmup_days > 0:
             logger.info(f"[Thread] Warmup: fetching {warmup_days} extra days for {warmup_bars}-bar indicators")
 
-        # Fetch OHLC data
-        provider = get_ohlcv_provider(provider_name)
+        # Fetch OHLC data (alpaca_hist: the local cache panel, with its feature columns)
         logger.info(f"[Thread] Fetching data from {fetch_start_date.date()} to {end_date.date()} using {provider_name}")
 
-        data_points = provider.get_data(
-            symbol=ticker,
-            start_date=fetch_start_date,
-            end_date=end_date,
-            interval=interval
-        )
+        df = fetch_ohlcv_frame(provider_name, ticker, timeframe, fetch_start_date, end_date,
+                               panel_features, fundamentals_config)
 
-        if not data_points:
+        if df.empty:
             db_dataset.status = DatasetStatus.ERROR.value
             db_dataset.error_message = f"No data available for {ticker}"
             db.commit()
             logger.error(f"[Thread] No data for {ticker}")
             return
-
-        # Convert to DataFrame
-        df = pd.DataFrame([{
-            'Date': dp.timestamp, 'Open': dp.open, 'High': dp.high,
-            'Low': dp.low, 'Close': dp.close, 'Volume': dp.volume
-        } for dp in data_points])
-        df = df.sort_values('Date').reset_index(drop=True)
 
         # Add time-based features (day_of_week, hour_of_day)
         df = add_time_features(df)
@@ -473,19 +460,12 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
         # Fetch or load data based on regen_options
         if regen_options.regenerate_ohlcv:
             provider_name = gen_config.get("data_provider", "yfinance")
-            provider = get_ohlcv_provider(provider_name)
             logger.info(f"[Thread] Fetching data from {fetch_start_date.date()} to {end_date.date()} using {provider_name}")
 
-            interval = INTERVAL_MAP.get(timeframe, "1d")
+            df = fetch_ohlcv_frame(provider_name, ticker, timeframe, fetch_start_date, end_date,
+                                   gen_config.get("panel_features"), fundamentals_config)
 
-            data_points = provider.get_data(
-                symbol=ticker,
-                start_date=fetch_start_date,
-                end_date=end_date,
-                interval=interval
-            )
-
-            if not data_points:
+            if df.empty:
                 db_dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
                 if db_dataset:
                     db_dataset.status = DatasetStatus.ERROR.value
@@ -493,15 +473,6 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
                     db.commit()
                 return
 
-            df = pd.DataFrame([{
-                'Date': dp.timestamp,
-                'Open': dp.open,
-                'High': dp.high,
-                'Low': dp.low,
-                'Close': dp.close,
-                'Volume': dp.volume
-            } for dp in data_points])
-            df = df.sort_values('Date').reset_index(drop=True)
             df = add_time_features(df)
             logger.info(f"[Thread] Fetched {len(df)} OHLC data points")
         else:
@@ -531,25 +502,11 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
                 if data_start_naive >= fetch_start_ts:
                     logger.info(f"[Thread] Fetching warmup OHLCV from {fetch_start_date.date()} to {data_start_naive.date()}")
                     provider_name = gen_config.get("data_provider", "yfinance")
-                    provider = get_ohlcv_provider(provider_name)
-                    interval = INTERVAL_MAP.get(timeframe, "1d")
 
-                    warmup_data = provider.get_data(
-                        symbol=ticker,
-                        start_date=fetch_start_date,
-                        end_date=data_start_naive,
-                        interval=interval
-                    )
+                    warmup_df = fetch_ohlcv_frame(provider_name, ticker, timeframe, fetch_start_date,
+                                                  data_start_naive, [], fundamentals_config)
 
-                    if warmup_data:
-                        warmup_df = pd.DataFrame([{
-                            'Date': dp.timestamp,
-                            'Open': dp.open,
-                            'High': dp.high,
-                            'Low': dp.low,
-                            'Close': dp.close,
-                            'Volume': dp.volume
-                        } for dp in warmup_data])
+                    if not warmup_df.empty:
                         warmup_df['Date'] = pd.to_datetime(warmup_df['Date'])
                         # Normalize timezone - strip tz if present for comparison with existing data
                         if warmup_df['Date'].dt.tz is not None:
@@ -580,9 +537,13 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
             macro_prefixes = ('macro_',)
 
             # Helper to identify column type
+            panel_prefixes = ('t_', 'd_', 'm_', 'f_') if is_alpaca_hist(gen_config.get("data_provider")) else ()
+
             def get_column_type(col):
                 if col in ohlcv_time_cols:
                     return 'ohlcv'
+                if col.startswith(panel_prefixes):
+                    return 'ohlcv'  # panel features come with the bars: only a full OHLCV regeneration rebuilds them
                 if col.startswith(sentiment_prefixes):
                     return 'sentiment'
                 if col.startswith(fundamental_prefixes):
@@ -754,6 +715,12 @@ def create_dataset(
         Created dataset with BUILDING status (generation runs in background)
     """
     try:
+        panel_features = validate_panel_request(dataset_create.data_provider, dataset_create.timeframe,
+                                                dataset_create.panel_features, dataset_create.fundamentals_config)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    try:
         logger.info(f"Creating dataset for {dataset_create.ticker} with timeframe {dataset_create.timeframe}")
 
         # Generate dataset name if not provided
@@ -778,6 +745,7 @@ def create_dataset(
             "original_start_date": dataset_create.start_date,
             "original_end_date": dataset_create.end_date,
             "indicator_collection_id": dataset_create.indicator_collection_id,
+            "panel_features": panel_features,
             "created_at": datetime.now().isoformat()
         }
 
@@ -818,6 +786,7 @@ def create_dataset(
             'technical_indicators': dataset_create.technical_indicators,
             'sentiment_config': dataset_create.sentiment_config,
             'fundamentals_config': dataset_create.fundamentals_config,
+            'panel_features': panel_features,
         }
 
         # Submit to background thread pool (non-blocking)
@@ -870,6 +839,11 @@ def create_batch_datasets(
         indicator_collection_id = batch_request.get('indicator_collection_id')
         user_labels = batch_request.get('labels', [])
         batch_name = batch_request.get('name')
+        try:
+            panel_features = validate_panel_request(data_provider, timeframe, batch_request.get('panel_features'),
+                                                    fundamentals_config)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
         # Generate batch label
         if not batch_name:
@@ -905,6 +879,7 @@ def create_batch_datasets(
                 "original_start_date": start_date_str,
                 "original_end_date": end_date_str,
                 "indicator_collection_id": indicator_collection_id,
+                "panel_features": panel_features,
                 "created_at": datetime.now().isoformat(),
                 "batch_name": batch_name
             }
@@ -942,6 +917,7 @@ def create_batch_datasets(
                 'technical_indicators': technical_indicators,
                 'sentiment_config': sentiment_config,
                 'fundamentals_config': fundamentals_config,
+                'panel_features': panel_features,
             }
 
             _dataset_executor.submit(_build_dataset_in_background, db_dataset.id, dataset_config)
@@ -1502,7 +1478,8 @@ def calculate_prediction_targets_v2(
         target_service = PredictionTargetService()
         results = target_service.calculate_all_targets(
             df, targets,
-            dataset_timeframe=dataset.timeframe
+            dataset_timeframe=dataset.timeframe,
+            panel_source=is_alpaca_hist((dataset.generation_config or {}).get("data_provider"))
         )
 
         return {
@@ -2109,7 +2086,6 @@ def duplicate_dataset(
         # Fetch data using the original generation config
         gen_config = original.generation_config or {}
         provider_name = gen_config.get("data_provider", "yfinance")
-        provider = get_ohlcv_provider(provider_name)
         logger.info(f"Using OHLCV provider: {provider_name}")
 
         # Use original dates from generation_config or dataset
@@ -2124,32 +2100,14 @@ def duplicate_dataset(
         if warmup_days > 0:
             logger.info(f"[Duplicate] Warmup: fetching {warmup_days} extra days for {warmup_bars}-bar indicators")
 
-        # Convert timeframe to interval
-        interval = INTERVAL_MAP.get(original.timeframe, "1d")
+        df = fetch_ohlcv_frame(provider_name, new_ticker, original.timeframe, fetch_start_date, end_date,
+                               gen_config.get("panel_features"), original.fundamentals_config)
 
-        data_points = provider.get_data(
-            symbol=new_ticker,
-            start_date=fetch_start_date,
-            end_date=end_date,
-            interval=interval
-        )
-
-        if not data_points:
+        if df.empty:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"No data available for {new_ticker}"
             )
-
-        # Convert to DataFrame
-        df = pd.DataFrame([{
-            'Date': dp.timestamp,
-            'Open': dp.open,
-            'High': dp.high,
-            'Low': dp.low,
-            'Close': dp.close,
-            'Volume': dp.volume
-        } for dp in data_points])
-        df = df.sort_values('Date').reset_index(drop=True)
 
         # Add time-based features (day_of_week, hour_of_day)
         df = add_time_features(df)
@@ -2180,6 +2138,7 @@ def duplicate_dataset(
             "original_start_date": gen_config.get("original_start_date"),
             "original_end_date": gen_config.get("original_end_date"),
             "indicator_collection_id": gen_config.get("indicator_collection_id"),
+            "panel_features": gen_config.get("panel_features") or [],
             "duplicated_from": dataset_id,
             "created_at": datetime.now().isoformat()
         }
@@ -2319,6 +2278,18 @@ def update_dataset(
                 updates.append(f"data_provider: {old_provider} -> {dataset_update.data_provider}")
             gen_config["data_provider"] = dataset_update.data_provider
 
+        # Panel feature groups belong to the alpaca_hist source: an explicit list is validated, an inherited one
+        # is dropped when the provider is no longer alpaca_hist
+        panel_features = dataset_update.panel_features
+        if panel_features is None and is_alpaca_hist(gen_config.get("data_provider", "yfinance")):
+            panel_features = gen_config.get("panel_features")
+        fundamentals_config = dataset.fundamentals_config
+        try:
+            gen_config["panel_features"] = validate_panel_request(
+                gen_config.get("data_provider", "yfinance"), new_timeframe, panel_features, fundamentals_config)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
         # Save updated generation_config with new dates and provider
         dataset.generation_config = gen_config
         dataset_name = dataset.name  # Save for later use
@@ -2342,17 +2313,10 @@ def update_dataset(
 
     # Phase 2: Fetch OHLCV data (NO DB connection held)
     try:
-        provider = get_ohlcv_provider(provider_name)
-        interval = INTERVAL_MAP.get(new_timeframe, "1d")
-
         logger.info(f"Fetching data for {new_ticker} from {start_date.date()} to {end_date.date()} using {provider_name}")
 
-        data_points = provider.get_data(
-            symbol=new_ticker,
-            start_date=start_date,
-            end_date=end_date,
-            interval=interval
-        )
+        df = fetch_ohlcv_frame(provider_name, new_ticker, new_timeframe, start_date, end_date,
+                               gen_config["panel_features"], fundamentals_config)
     except Exception as e:
         # Update status to error with short session
         db = SessionLocal()
@@ -2370,7 +2334,7 @@ def update_dataset(
         )
 
     # Phase 3: Validate OHLCV data (NO DB connection held)
-    if not data_points:
+    if df.empty:
         db = SessionLocal()
         try:
             dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
@@ -2385,19 +2349,8 @@ def update_dataset(
             detail=f"No data available for {new_ticker}"
         )
 
-    # Convert to DataFrame for validation
-    ohlcv_data = [{
-        'Date': dp.timestamp.isoformat() if hasattr(dp.timestamp, 'isoformat') else str(dp.timestamp),
-        'Open': dp.open,
-        'High': dp.high,
-        'Low': dp.low,
-        'Close': dp.close,
-        'Volume': dp.volume
-    } for dp in data_points]
-
-    df = pd.DataFrame(ohlcv_data)
     df['Date'] = pd.to_datetime(df['Date'])
-    df = df.sort_values('Date').reset_index(drop=True)
+    ohlcv_data = df.assign(Date=df['Date'].map(lambda d: d.isoformat())).to_dict('records')
 
     # Add time-based features (day_of_week, hour_of_day)
     df = add_time_features(df)
