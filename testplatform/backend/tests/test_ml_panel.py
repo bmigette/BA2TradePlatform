@@ -82,6 +82,28 @@ def test_features_are_point_in_time(cache):
     pd.testing.assert_frame_equal(a[feats], b[feats], check_exact=False, rtol=1e-10)
 
 
+@pytest.mark.parametrize("cut", ["2024-02-15 11:30", "2024-02-15 10:30", "2024-02-16 15:30"])
+def test_features_are_point_in_time_at_an_intraday_cut(cache, tmp_path, cut):
+    """The cache truncated at an INTRADAY bar end: every common row (bar end <= cut) is identical, features AND the
+    barrier ATR. A daily-context or market feature that read today's close / high / low (the old same-session
+    look-ahead) would differ on the bars of the cut day."""
+    import shutil
+    cut_ts = pd.Timestamp(cut)
+    trunc = tmp_path / "cache"
+    shutil.copytree(cache, trunc)
+    for p in (trunc / "AlpacaHistoryOHLCVProvider").glob("*_5min.parquet"):
+        df = pd.read_parquet(p)
+        df[df["Date"] + pd.Timedelta(minutes=5) <= cut_ts].to_parquet(p, index=False)
+    full, meta = _panel(cache)
+    part, _ = P.build_panel(P.PanelSpec("1h", FIRST, cut_ts.date(), ("AAA", "BBB")), trunc)
+    cols = meta["features"] + ["atr_d"]
+    a = full[full["end"] <= cut_ts].reset_index(drop=True)
+    b = part.reset_index(drop=True)
+    assert len(a) == len(b) and (a["end"].values == b["end"].values).all()
+    assert (b["end"].dt.date == cut_ts.date()).sum() > 0             # the cut day is really in the comparison
+    pd.testing.assert_frame_equal(a[cols], b[cols], check_exact=False, rtol=1e-10)
+
+
 def test_no_current_fundamentals_or_target_in_features(cache):
     panel, meta = _panel(cache)
     feats = meta["features"]
