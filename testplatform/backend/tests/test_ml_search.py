@@ -76,3 +76,14 @@ def test_store_rows_for_classes_and_deciles(panel_paths, tmp_path):
     k2 = S.write_setup_store(sd, pd.DataFrame({"symbol": ["AAA"], "session": [date(2024, 1, 5)], **q}),
                              {"features": ["t_ret_1"], "folds": {}}, "custom-y", cache_root=tmp_path)
     assert k2 != key and store.read_row(k2, "AAA", date(2024, 1, 5), 3, cache_root=tmp_path).deciles[3][4] == 0.0
+
+
+def test_regression_and_binary_setups_use_tsai():
+    g = {"timeframe": "15m", "features": "t", "target": "reg_h3", "pooled": 0, "tsai_arch": "tst",
+         "darts_arch": "nhits", "lookback": 64, "lr": 1e-3, "width": 64, "dropout": 0.1, "epochs": 30}
+    s = S.Setup.from_genes(g)
+    assert (s.arch, s.timeframe, s.pooled, s.epochs) == ("tst", "15m", False, 30)
+    assert S._tsai_task(s.spec) == (1, "regression")
+    assert S._tsai_task(S.Setup.from_genes({**g, "target": "bdir_h1"}).spec) == (2, "binary")
+    assert S.store_card(s, ["t_ret_1"]).output_type == "deciles"
+    assert S.store_card(S.Setup.from_genes({**g, "target": "btb_h3_r1"}), ["t_ret_1"]).output_type == "class_probs"

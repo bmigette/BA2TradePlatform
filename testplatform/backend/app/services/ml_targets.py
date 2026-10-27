@@ -9,6 +9,10 @@ Every target uses three ordered classes, so one store row format serves all of t
   k is chosen on the TRAINING fold so the timeout share is closest to one third.
 * ``direction``: the N-session forward return against the training fold's terciles.
 * ``forward_return``: the N-session forward return itself (regression; the quantile models use it).
+* ``binary_direction``: up (N-session forward return > 0) vs down. ``binary_barrier``: the take-profit reached first
+  vs not (stop first OR timeout), with the triple barrier's k / m.
+* ``regression``: the N-session forward return in volatility units (/ (daily ATR% x sqrt(N))), clipped at +-5; a
+  point-forecast model (MSE), turned into deciles with the training fold's validation residuals.
 
 Thresholds (k, terciles) are fitted on the training fold only. A fold whose smallest class share is below
 ``MIN_CLASS_SHARE`` is refused (``TargetBalanceError``), never rebalanced.
@@ -22,10 +26,16 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-TARGET_KINDS: Tuple[str, ...] = ("triple_barrier", "direction", "forward_return")
+TARGET_KINDS: Tuple[str, ...] = ("triple_barrier", "direction", "forward_return", "binary_direction",
+                                 "binary_barrier", "regression")
+#: two-class targets: labels 0 (down / not the take-profit) and 2 (up / take-profit first); class 1 is never used
+BINARY_KINDS: Tuple[str, ...] = ("binary_direction", "binary_barrier")
 MIN_CLASS_SHARE = 0.15
 K_GRID: Tuple[float, ...] = tuple(np.round(np.arange(0.25, 6.01, 0.25), 2))
-CLASS_NAMES = {"triple_barrier": ("loss", "timeout", "win"), "direction": ("down", "flat", "up")}
+CLASS_NAMES = {"triple_barrier": ("loss", "timeout", "win"), "direction": ("down", "flat", "up"),
+               "binary_direction": ("down", "-", "up"), "binary_barrier": ("no take-profit", "-", "take-profit first")}
+#: regression target clip, in volatility units (the N-session return / (daily ATR% x sqrt(N)))
+REGRESSION_CLIP = 5.0
 
 
 class TargetBalanceError(ValueError):
@@ -43,12 +53,20 @@ class TargetSpec:
             raise ValueError(f"target kind must be one of {TARGET_KINDS}, got {self.kind!r}")
         if self.horizon <= 0:
             raise ValueError("horizon must be > 0")
-        if self.kind == "triple_barrier" and not self.ratio > 0:
-            raise ValueError("triple_barrier ratio must be > 0")
+        if self.kind in ("triple_barrier", "binary_barrier") and not self.ratio > 0:
+            raise ValueError(f"{self.kind} ratio must be > 0")
 
     @property
     def is_classification(self) -> bool:
-        return self.kind != "forward_return"
+        return self.kind not in ("forward_return", "regression")
+
+    @property
+    def is_binary(self) -> bool:
+        return self.kind in BINARY_KINDS
+
+    @property
+    def uses_darts(self) -> bool:
+        return self.kind == "forward_return"
 
 
 # ------------------------------------------------------------------ folds
@@ -191,6 +209,18 @@ def fit_target(panel: pd.DataFrame, spec: TargetSpec, train_rows: np.ndarray,
     fwd = panel[f"fwd_ret_{spec.horizon}"].values.astype(np.float64)
     if spec.kind == "forward_return":
         return FoldTarget(spec, fwd, {}, None)
+    if spec.kind == "regression":
+        vol = (panel["atr_d"] / panel["close"]).values * np.sqrt(spec.horizon)
+        z = np.clip(fwd / vol, -REGRESSION_CLIP, REGRESSION_CLIP)
+        z[~np.isfinite(fwd) | ~np.isfinite(vol)] = np.nan
+        return FoldTarget(spec, z, {"vol_unit": "daily ATR% x sqrt(N)", "clip": REGRESSION_CLIP}, None)
+    if spec.kind == "binary_direction":
+        tr = fwd[train_rows]
+        tr = tr[np.isfinite(tr)]
+        lab = np.where(fwd > 0, 2.0, 0.0)
+        lab[~np.isfinite(fwd)] = np.nan
+        means = [float(tr[tr <= 0].mean()), 0.0, float(tr[tr > 0].mean())]
+        return FoldTarget(spec, lab, {}, np.tile(np.array(means), (len(panel), 1)))
     if spec.kind == "direction":
         tr = fwd[train_rows]
         tr = tr[np.isfinite(tr)]
@@ -207,6 +237,14 @@ def fit_target(panel: pd.DataFrame, spec: TargetSpec, train_rows: np.ndarray,
     atr_frac = (panel["atr_d"] / panel["close"]).values
     tl = lab[train_rows]
     tf = fwd[train_rows]
+    if spec.kind == "binary_barrier":
+        # "no take-profit" = stop first or timeout: its return value is the training fold's mean N-session return
+        # of those rows (an expected value, not a stop level)
+        not_win = float(np.nanmean(tf[(tl == 0) | (tl == 1)]))
+        blab = np.where(lab == 2, 2.0, 0.0)
+        blab[np.isnan(lab)] = np.nan
+        cr = np.stack([np.full(len(panel), not_win), np.zeros(len(panel)), k * atr_frac], axis=1)
+        return FoldTarget(spec, blab, {"k": k, "m": m, "not_win_mean": not_win}, cr)
     timeout_mean = float(np.nanmean(tf[tl == 1])) if (tl == 1).any() else 0.0
     cr = np.stack([-m * atr_frac, np.full(len(panel), timeout_mean), k * atr_frac], axis=1)
     return FoldTarget(spec, lab, {"k": k, "m": m, "timeout_mean": timeout_mean}, cr)
@@ -255,6 +293,8 @@ def check_balance(spec: TargetSpec, fold_name: str, shares_by_part: Dict[str, Se
     if not spec.is_classification:
         return
     for part, sh in shares_by_part.items():
+        if spec.is_binary:
+            sh = [sh[0], 1.0, sh[2]]          # class 1 is unused by a two-class target
         if min(sh) < MIN_CLASS_SHARE:
             names = CLASS_NAMES[spec.kind]
             raise TargetBalanceError(

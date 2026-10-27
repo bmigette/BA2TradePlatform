@@ -60,6 +60,16 @@ TARGETS: Dict[str, MT.TargetSpec] = {
     "fwd_h1": MT.TargetSpec("forward_return", 1),
     "fwd_h3": MT.TargetSpec("forward_return", 3),
     "fwd_h5": MT.TargetSpec("forward_return", 5),
+    # added after the first search (owner request 2026-10-27): two-class targets and a point-forecast regression
+    "bdir_h1": MT.TargetSpec("binary_direction", 1),
+    "bdir_h3": MT.TargetSpec("binary_direction", 3),
+    "bdir_h5": MT.TargetSpec("binary_direction", 5),
+    "btb_h3_r0.5": MT.TargetSpec("binary_barrier", 3, 0.5),
+    "btb_h3_r1": MT.TargetSpec("binary_barrier", 3, 1.0),
+    "btb_h5_r1": MT.TargetSpec("binary_barrier", 5, 1.0),
+    "reg_h1": MT.TargetSpec("regression", 1),
+    "reg_h3": MT.TargetSpec("regression", 3),
+    "reg_h5": MT.TargetSpec("regression", 5),
 }
 FEATURE_SETS: Dict[str, Tuple[str, ...]] = {
     "t": ("technical",),
@@ -111,15 +121,15 @@ class Setup:
     @classmethod
     def from_genes(cls, g: Dict[str, Any]) -> "Setup":
         spec = TARGETS[g["target"]]
-        arch = g["tsai_arch"] if spec.is_classification else g["darts_arch"]
+        arch = g["darts_arch"] if spec.uses_darts else g["tsai_arch"]
         # The Darts models forecast every bar of the horizon: on M15 that is 130-390 output steps per sample, minutes
         # per fold for no new information, so the forward-return setups run on H1 (same key as the H1 genome).
-        tf = g["timeframe"] if spec.is_classification else "1h"
+        tf = "1h" if spec.uses_darts else g["timeframe"]
         # Darts cost control (measured: a per-symbol TFT at 30 epochs is 10+ minutes per trial): the forward-return
         # setups are pooled (one model over the 7 series, 7x the samples of a per-symbol model) and train at most
         # DARTS_MAX_EPOCHS epochs (early stopping usually ends them sooner).
-        pooled = bool(int(g["pooled"])) if spec.is_classification else True
-        epochs = int(g["epochs"]) if spec.is_classification else min(int(g["epochs"]), DARTS_MAX_EPOCHS)
+        pooled = True if spec.uses_darts else bool(int(g["pooled"]))
+        epochs = min(int(g["epochs"]), DARTS_MAX_EPOCHS) if spec.uses_darts else int(g["epochs"])
         return cls(tf, g["features"], g["target"], pooled, arch, int(g["lookback"]),
                    float(g["lr"]), int(g["width"]), float(g["dropout"]), epochs)
 
@@ -313,16 +323,31 @@ def _tsai_params(arch: str, s: Setup) -> Dict[str, Any]:
     raise ValueError(f"unknown tsai arch {arch!r}")
 
 
+def _tsai_task(spec: MT.TargetSpec) -> Tuple[int, str]:
+    """(network outputs, task): 3-class, 2-class or a 1-output regression."""
+    if spec.kind == "regression":
+        return 1, "regression"
+    return (2, "binary") if spec.is_binary else (3, "multiclass")
+
+
 def train_classifier(s: Setup, X: np.ndarray, y: np.ndarray, fit_rows: np.ndarray, val_rows: np.ndarray,
                      seed: int, device) -> Tuple[Any, Dict[str, Any]]:
+    """A tsai network on lookback windows: cross-entropy for the class targets (a two-class target trains on
+    label == 2), MSE for the regression target."""
     import torch
     from app.services.tsai_models import TSAIModelService
     torch.manual_seed(seed)
     np.random.seed(seed)
-    model = TSAIModelService(use_gpu=True).create_model(s.arch, _tsai_params(s.arch, s), c_in=X.shape[1], c_out=3,
-                                                       seq_len=s.lookback).to(device)
+    c_out, task = _tsai_task(s.spec)
+    model = TSAIModelService(use_gpu=True).create_model(s.arch, _tsai_params(s.arch, s), c_in=X.shape[1],
+                                                       c_out=c_out, seq_len=s.lookback).to(device)
     Xt = torch.as_tensor(X, device=device)
-    yt = torch.as_tensor(np.nan_to_num(y, nan=-1).astype(np.int64), device=device)
+    if task == "regression":
+        yt = torch.as_tensor(np.nan_to_num(y, nan=0.0).astype(np.float32), device=device)
+    elif task == "binary":
+        yt = torch.as_tensor((np.nan_to_num(y, nan=-1) == 2).astype(np.int64), device=device)
+    else:
+        yt = torch.as_tensor(np.nan_to_num(y, nan=-1).astype(np.int64), device=device)
     offs = torch.arange(-s.lookback + 1, 1, device=device)
 
     def batch(idx):
@@ -333,7 +358,13 @@ def train_classifier(s: Setup, X: np.ndarray, y: np.ndarray, fit_rows: np.ndarra
     steps = max(1, math.ceil(len(fit_rows) / bs))
     opt = torch.optim.AdamW(model.parameters(), lr=s.lr, weight_decay=1e-2)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=s.lr, total_steps=steps * s.epochs)
-    lossf = torch.nn.CrossEntropyLoss()
+    if task == "regression":
+        mse = torch.nn.MSELoss()
+
+        def lossf(out, target):
+            return mse(out.squeeze(-1), target)
+    else:
+        lossf = torch.nn.CrossEntropyLoss()
     g = torch.Generator(device="cpu").manual_seed(seed)
     fit_t = torch.as_tensor(fit_rows, device=device)
     val_t = torch.as_tensor(val_rows, device=device)
@@ -372,7 +403,9 @@ def train_classifier(s: Setup, X: np.ndarray, y: np.ndarray, fit_rows: np.ndarra
     return model, {"val_loss": best_loss, "epochs_run": len(hist), "val_curve": hist}
 
 
-def predict_classifier(model, X: np.ndarray, rows: np.ndarray, lookback: int, device) -> np.ndarray:
+def predict_classifier(model, X: np.ndarray, rows: np.ndarray, lookback: int, device, task: str = "multiclass"
+                       ) -> np.ndarray:
+    """(n, 3) class probabilities (a two-class model gets a zero middle class), or (n,) for a regression."""
     import torch
     Xt = torch.as_tensor(X, device=device)
     offs = torch.arange(-lookback + 1, 1, device=device)
@@ -381,8 +414,17 @@ def predict_classifier(model, X: np.ndarray, rows: np.ndarray, lookback: int, de
         for i in range(0, len(rows), 2048):
             idx = torch.as_tensor(rows[i:i + 2048], device=device)
             w = Xt[idx[:, None] + offs[None, :]].permute(0, 2, 1).contiguous()
-            out.append(torch.softmax(model(w), 1).cpu().numpy())
-    return np.concatenate(out) if out else np.zeros((0, 3))
+            o = model(w)
+            if task == "regression":
+                out.append(o.squeeze(-1).cpu().numpy())
+            elif task == "binary":
+                p = torch.softmax(o, 1).cpu().numpy()
+                out.append(np.stack([p[:, 0], np.zeros(len(p)), p[:, 1]], 1))
+            else:
+                out.append(torch.softmax(o, 1).cpu().numpy())
+    if not out:
+        return np.zeros((0,)) if task == "regression" else np.zeros((0, 3))
+    return np.concatenate(out)
 
 
 # ------------------------------------------------------------------ Darts quantile forecasters
@@ -485,7 +527,8 @@ def run_setup(s: Setup, fold_names: Sequence[str], seed: int = 42, save_dir: Opt
     spec = s.spec
     feats = MP.feature_columns(panel, s.groups)
     folds = {f.name: f for f in MT.quarterly_folds()}
-    exc = get_excursions(s.timeframe, spec.horizon) if spec.kind == "triple_barrier" else None
+    exc = (get_excursions(s.timeframe, spec.horizon) if spec.kind in ("triple_barrier", "binary_barrier")
+           else None)
     eod = panel["is_eod"].to_numpy()
     sym_arr = panel["symbol"].to_numpy()
     out, info = [], {"setup": asdict(s), "features": feats, "folds": {}}
@@ -512,8 +555,10 @@ def run_setup(s: Setup, fold_names: Sequence[str], seed: int = 42, save_dir: Opt
                                  "n_pred": int(len(pr_u))}
         rec = pd.DataFrame({"symbol": sym_arr[pr_u], "session": panel["session"].to_numpy()[pr_u], "fold": name,
                             "row": pr_u, "label": ft.labels[pr_u]})
-        if spec.is_classification:
-            probs = np.zeros((len(pr_u), 3))
+        if not spec.uses_darts:
+            _, task = _tsai_task(spec)
+            probs = np.zeros(len(pr_u)) if task == "regression" else np.zeros((len(pr_u), 3))
+            resid = np.zeros(len(pr_u), dtype=object)
             groups = [None] if s.pooled else list(dict.fromkeys(sym_arr))
             curves = {}
             for gsym in groups:
@@ -521,16 +566,30 @@ def run_setup(s: Setup, fold_names: Sequence[str], seed: int = 42, save_dir: Opt
                 gv = val_u if gsym is None else val_u[sym_arr[val_u] == gsym]
                 gp = np.arange(len(pr_u)) if gsym is None else np.flatnonzero(sym_arr[pr_u] == gsym)
                 model, tinfo = train_classifier(s, fd.X, ft.labels, gf, gv, seed, device)
-                probs[gp] = predict_classifier(model, fd.X, pr_u[gp], s.lookback, device)
+                probs[gp] = predict_classifier(model, fd.X, pr_u[gp], s.lookback, device, task)
+                if task == "regression":
+                    # the validation residual deciles (volatility units) turn the point forecast into deciles
+                    rq = np.percentile(ft.labels[gv] - predict_classifier(model, fd.X, gv, s.lookback, device, task),
+                                       DECILES)
+                    tinfo["residual_deciles"] = rq.tolist()
+                    for i in gp:
+                        resid[i] = rq
                 curves[gsym or "pooled"] = tinfo
                 if save_dir is not None:
-                    _save_fold_model(save_dir, name, gsym or "pooled", s, feats, fd, ft, model=model)
+                    _save_fold_model(save_dir, name, gsym or "pooled", s, feats, fd, ft, model=model, extra=tinfo)
                 del model
                 torch.cuda.empty_cache()
             finfo["training"] = curves
-            rec["p_down"], rec["p_mid"], rec["p_up"] = probs[:, 0], probs[:, 1], probs[:, 2]
-            cr = ft.class_returns[pr_u]
-            rec["r_down"], rec["r_mid"], rec["r_up"] = cr[:, 0], cr[:, 1], cr[:, 2]
+            if task == "regression":
+                vol = (panel["atr_d"] / panel["close"]).to_numpy()[pr_u] * np.sqrt(spec.horizon)
+                dec = np.stack([(probs + np.array([r[j] for r in resid])) * vol for j in range(len(DECILES))], 1)
+                rec["z_pred"] = probs
+                for j, l in enumerate(DECILES):
+                    rec[f"q{l}"] = dec[:, j]
+            else:
+                rec["p_down"], rec["p_mid"], rec["p_up"] = probs[:, 0], probs[:, 1], probs[:, 2]
+                cr = ft.class_returns[pr_u]
+                rec["r_down"], rec["r_mid"], rec["r_up"] = cr[:, 0], cr[:, 1], cr[:, 2]
         else:
             vstart = panel["session"].to_numpy()[val.min()] if len(val) else f.pred_start
             dec, dinfo, models = run_darts_fold(s, panel, fd, f, tr, vstart, pr_u, seed)
@@ -566,7 +625,7 @@ def store_card(s: Setup, feats: Sequence[str]):
     """The model card of a setup's stitched predictions. The setup key is in the model id, so a different setup is a
     different store."""
     from ba2_common.core.ml_forecast.model_card import ModelCard
-    return ModelCard(model_id=f"ba2/custom-{s.key()}", family="tsai" if s.spec.is_classification else "darts",
+    return ModelCard(model_id=f"ba2/custom-{s.key()}", family="darts" if s.spec.uses_darts else "tsai",
                      version="1", input_fields=tuple(feats), timeframe=s.timeframe, context_length=s.lookback,
                      past_only_covariates=(), past_future_covariates=(), horizons=(s.spec.horizon,),
                      scaler="robust median/IQR per fold, saved with each fold model",
@@ -664,9 +723,15 @@ def handle_ml_model_search(task_id: str, payload: Dict[str, Any]) -> Dict[str, A
     ``top_n``. Writes ``trials.jsonl`` (every trial), ``predictions/<key>.parquet`` and ``result.json``."""
     from app.services.genetic import GeneticOptimizer
     for k in ("panels", "out_dir", "population", "generations", "early_stop", "early_stop_min_rel", "seed",
-              "parallel", "top_n"):
+              "parallel", "top_n", "darts_archs"):
         if k not in payload:
             raise ValueError(f"ml_model_search payload is missing {k!r}")
+    bad = set(payload["darts_archs"]) - set(DARTS_ARCHS)
+    if not payload["darts_archs"] or bad:
+        raise ValueError(f"darts_archs must be a non-empty subset of {DARTS_ARCHS}, got {payload['darts_archs']}")
+    space = json.loads(json.dumps(GENE_SPACE))
+    space["darts_arch"]["choices"] = list(payload["darts_archs"])
+    space["darts_arch"]["max"] = len(payload["darts_archs"]) - 1
     out = Path(payload["out_dir"])
     out.mkdir(parents=True, exist_ok=True)
     panels = {tf: str(p) for tf, p in payload["panels"].items()}
@@ -676,7 +741,7 @@ def handle_ml_model_search(task_id: str, payload: Dict[str, Any]) -> Dict[str, A
     seed = int(payload["seed"])
     random.seed(seed)
     np.random.seed(seed)
-    ga = GeneticOptimizer(param_ranges=GENE_SPACE, population_size=int(payload["population"]),
+    ga = GeneticOptimizer(param_ranges=space, population_size=int(payload["population"]),
                           n_generations=int(payload["generations"]),
                           early_stopping_generations=int(payload["early_stop"]),
                           early_stopping_min_rel=float(payload["early_stop_min_rel"]), elitism_percent=10.0)

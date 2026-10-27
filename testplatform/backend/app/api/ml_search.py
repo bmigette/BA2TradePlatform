@@ -29,6 +29,7 @@ class MlModelSearchRequest(BaseModel):
     seed: int = 42
     parallel: int = 3
     top_n: int = 10
+    darts_archs: list = ["tft", "nhits"]
 
 
 @router.post("/model-search")

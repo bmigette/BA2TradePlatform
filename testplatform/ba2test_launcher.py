@@ -2472,7 +2472,7 @@ def _build_strategy_S7(name: str):
 
 #: Strategies only the named expert can use (goal2027 item 2.8). ``SQM`` is the exploration "quality_momentum"
 #: recipe, written for the DeterministicScorer score; another expert would run it on a signal it was not made for.
-_EXPERT_ONLY_STRATEGIES = {"SQM": "DeterministicScorer"}
+_EXPERT_ONLY_STRATEGIES = {"SQM": "DeterministicScorer", "MLH": "MLForecast", "MLF": "MLForecast"}
 
 
 def _refuse_ds_only_strategy(command: str, kind: str, expert: str) -> None:
@@ -2517,6 +2517,43 @@ def _build_strategy_SQM(name: str):
     ]
     return _strategy_from_parts(name, buy_tree=buy_entry_conditions,
                                 exit_conditions=exit_conditions, entry_actions=entry_actions)
+
+
+def _build_strategy_MLH(name: str, forecast_tp: bool = False):
+    """MLH -- ML-forecast HOLD (custom-ML fair test, 2026-10-27). Buy when the expert is bullish and flat; NO take-profit
+    and no strategy stop (the RM max-risk safeguard stop is always placed on entry); close once the position is
+    ``days_opened`` calendar days old (gene 0-6: 0 = the first daily check after the fill, about one session held;
+    2 about 3 sessions; 4 about 5) or, toggleable, when the expert turns bearish on the held position.
+
+    Why: under S1 the GA found a +2% take-profit (the platform's minimum TP) against a -10% stop on every trade, which
+    pays on liquid mega-caps whatever stock the model picks (the cross-symbol shuffle earned as much out of sample).
+    Here a trade's outcome is the return over the holding time, which is what the models forecast.
+
+    ``forecast_tp`` (strategy MLF): plus a take-profit AT the forecast's own target (``expert_target_price``, offset 0,
+    not a gene) -- the forecast's exit level, still floored by the platform's minimum TP distance."""
+    buy = {"id": "root", "type": "AND", "conditions": [
+        {"id": "mlh_bull", "field": "bullish"},
+        {"id": "mlh_flat", "field": "has_no_position"},
+    ]}
+    exits = [
+        {"id": "mlh_exit_time", "action_type": "close",
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "mlh_hold", "field": "has_position"},
+             {"id": "mlh_days", "field": "days_opened", "op": ">=", "value": 2,
+              "optimize": True, "value_min": 0, "value_max": 6, "value_step": 1}]}},
+        {"id": "mlh_exit_signal", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [{"id": "mlh_bear", "field": "bearish"}]}},
+    ]
+    entry_actions = None
+    if forecast_tp:
+        entry_actions = [{"id": "mlf_tp", "action_type": "adjust_take_profit", "reference_value": "expert_target_price",
+                          "action_value": 0.0}]
+    return _strategy_from_parts(name, buy_tree=buy, exit_conditions=exits, entry_actions=entry_actions)
+
+
+def _build_strategy_MLF(name: str):
+    """MLF -- MLH plus a take-profit at the forecast's own target (see _build_strategy_MLH)."""
+    return _build_strategy_MLH(name, forecast_tp=True)
 
 
 def _build_strategy_minimal(name: str):
@@ -7201,6 +7238,8 @@ _STRATEGY_BUILDERS = {
     "S6": _build_strategy_S6,   # (name) — high-frequency quick-cycle (tight TP/SL AT ENTRY + time exit)
     "S7": _build_strategy_S7,   # (name) — tight refinement around the archived 186% S2-large winner
     "SQM": _build_strategy_SQM, # (name) — DeterministicScorer only: exploration quality-momentum (stop/target/time exit)
+    "MLH": _build_strategy_MLH, # (name) — MLForecast only: hold for a fixed time, no TP (custom-ML fair test)
+    "MLF": _build_strategy_MLF, # (name) — MLForecast only: MLH + take-profit at the forecast's own target
     # Option/equity strategies (dispatch by `kind`, not `name`; see _build_strategy):
     "O_LC": _build_strategy_option, "O_VERT": _build_strategy_option,
     "O_SSTG": _build_strategy_option, "O_SSTD": _build_strategy_option,
@@ -8902,7 +8941,8 @@ def _cmd_ml_search(args) -> int:
     res = handle_ml_model_search("cli-ml-search", {
         "panels": panels, "out_dir": args.out, "population": args.population, "generations": args.generations,
         "early_stop": args.early_stop, "early_stop_min_rel": args.early_stop_min_rel, "seed": args.seed,
-        "parallel": args.parallel, "top_n": args.top_n})
+        "parallel": args.parallel, "top_n": args.top_n,
+        "darts_archs": [a.strip() for a in args.darts_archs.split(",") if a.strip()]})
     print(f"ml-search: {res['n_trials']} trials ({res['n_refused']} refused), {res['generations_run']} generations")
     for r in res["top"]:
         print(f"  {r['fitness']:+.4f}  excess {r['excess']:+.4f} naive {r['naive_excess']:+.4f} "
@@ -9788,6 +9828,8 @@ def main(argv: "list | None" = None) -> int:
     ms.add_argument("--seed", type=int, default=42)
     ms.add_argument("--parallel", type=int, default=3, help="Trial processes sharing the GPU.")
     ms.add_argument("--top-n", type=int, default=10)
+    ms.add_argument("--darts-archs", default="tft,nhits",
+                    help="Darts architectures the forward-return genes may pick (tft is 20-55 min per trial).")
 
     # sync-cache: push the master's cache (diff, one tar) to a configured remote worker.
     sc = sub.add_parser("sync-cache", help="Push the master's cache to a configured worker.")

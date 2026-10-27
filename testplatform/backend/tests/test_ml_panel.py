@@ -189,3 +189,25 @@ def test_ticker_frame_and_labels(cache):
     mask[: len(df) // 2] = True
     lab, params, look = T.labels_for_frame(df, T.TargetSpec("triple_barrier", 2, 1.0), mask)
     assert set(np.unique(lab.dropna())) <= {0.0, 1.0, 2.0} and params["k"] > 0 and look == 14
+
+
+def test_binary_and_regression_targets(cache):  # noqa: F811
+    panel, _ = _panel(cache)
+    f = T.Fold("t", date(2023, 6, 1), date(2024, 1, 2), date(2024, 3, 28))
+    tr, pr = T.fold_rows(panel, f, 3)
+    b = T.fit_target(panel, T.TargetSpec("binary_direction", 3), tr)
+    fwd = panel["fwd_ret_3"].values
+    ok = np.isfinite(fwd)
+    assert set(np.unique(b.labels[ok])) <= {0.0, 2.0} and (b.labels[ok] == 2.0).sum() == (fwd[ok] > 0).sum()
+    T.check_balance(T.TargetSpec("binary_direction", 3), "t", {"train": T.class_shares(b.labels, tr)})
+    with pytest.raises(T.TargetBalanceError):
+        T.check_balance(T.TargetSpec("binary_direction", 3), "t", {"pred": [0.9, 0.0, 0.1]})
+    bb = T.fit_target(panel, T.TargetSpec("binary_barrier", 3, 1.0), tr)
+    tb = T.fit_target(panel, T.TargetSpec("triple_barrier", 3, 1.0), tr)
+    both = ~np.isnan(tb.labels)
+    assert ((bb.labels[both] == 2) == (tb.labels[both] == 2)).all() and bb.params["k"] == tb.params["k"]
+    r = T.fit_target(panel, T.TargetSpec("regression", 3), tr)
+    vol = (panel["atr_d"] / panel["close"]).values * np.sqrt(3)
+    good = np.isfinite(r.labels)
+    assert np.allclose(r.labels[good], np.clip(fwd[good] / vol[good], -5, 5)) and np.abs(r.labels[good]).max() <= 5
+    assert r.class_returns is None and not T.TargetSpec("regression", 3).is_classification
