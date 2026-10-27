@@ -82,10 +82,22 @@ interface WizardData {
   startDate: string;
   endDate: string;
   dataProvider: string;
+  panelFeatures: string[];  // alpaca_hist only: subset of PANEL_FEATURE_OPTIONS ids
   indicators: IndicatorConfig[];
   sentiment: SentimentConfig;
   fundamentals: FundamentalsConfig;
 }
+
+// Alpaca history cache source (regular session, built from the cached 5-minute bars): H1 / M15 only
+const ALPACA_HIST_PROVIDER = 'alpaca_hist';
+const ALPACA_HIST_TIMEFRAMES = ['1h', '15m'];
+
+// Feature groups of the alpaca_hist panel on top of its always-on technical features
+const PANEL_FEATURE_OPTIONS = [
+  { id: 'daily', name: 'Daily context', desc: 'vs 50/200-day averages, past returns, daily ATR' },
+  { id: 'market', name: 'Market features', desc: 'SPY/QQQ returns, relative strength vs QQQ' },
+  { id: 'fundamentals', name: 'Point-in-time fundamentals', desc: 'earnings after announcement, annual statements after SEC acceptance' },
+];
 
 // Timeframe ordering for validation
 const TIMEFRAME_ORDER = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w', '1mo'];
@@ -126,6 +138,7 @@ const getDefaultWizardData = (): WizardData => ({
   startDate: '',
   endDate: '',
   dataProvider: 'yfinance',
+  panelFeatures: [],
   indicators: [],
   sentiment: {
     enabled: false,
@@ -196,6 +209,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         startDate,
         endDate,
         dataProvider: initialData.generation_config?.data_provider || 'yfinance',
+        panelFeatures: Array.isArray(initialData.generation_config?.panel_features) ? initialData.generation_config.panel_features : [],
         indicators,
         sentiment: sentimentConfig,
         fundamentals: fundamentalsConfig
@@ -636,6 +650,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
             start_date: wizardData.startDate || undefined,
             end_date: wizardData.endDate || undefined,
             data_provider: wizardData.dataProvider,
+            panel_features: wizardData.dataProvider === ALPACA_HIST_PROVIDER ? wizardData.panelFeatures : undefined,
             technical_indicators: technicalIndicators,
             sentiment_config: sentimentConfig,
             fundamentals_config: fundamentalsConfig
@@ -653,6 +668,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
             start_date: wizardData.startDate || undefined,
             end_date: wizardData.endDate || undefined,
             data_provider: wizardData.dataProvider,
+            panel_features: wizardData.dataProvider === ALPACA_HIST_PROVIDER ? wizardData.panelFeatures : undefined,
             technical_indicators: technicalIndicators,
             sentiment_config: sentimentConfig,
             fundamentals_config: fundamentalsConfig,
@@ -671,6 +687,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
             start_date: wizardData.startDate || undefined,
             end_date: wizardData.endDate || undefined,
             data_provider: wizardData.dataProvider,
+            panel_features: wizardData.dataProvider === ALPACA_HIST_PROVIDER ? wizardData.panelFeatures : undefined,
             technical_indicators: technicalIndicators,
             sentiment_config: sentimentConfig,
             fundamentals_config: fundamentalsConfig,
@@ -853,10 +870,13 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
           onChange={(e) => setWizardData({ ...wizardData, timeframe: e.target.value })}
           className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-100"
         >
-          {TIMEFRAME_ORDER.map(tf => (
+          {TIMEFRAME_ORDER.filter(tf => wizardData.dataProvider !== ALPACA_HIST_PROVIDER || ALPACA_HIST_TIMEFRAMES.includes(tf)).map(tf => (
             <option key={tf} value={tf}>{TIMEFRAME_LABELS[tf]}</option>
           ))}
         </select>
+        {wizardData.dataProvider === ALPACA_HIST_PROVIDER && (
+          <p className="text-xs text-gray-400 dark:text-gray-300 mt-1">The Alpaca history cache offers 1 hour and 15 minutes only</p>
+        )}
       </div>
 
       <div>
@@ -945,6 +965,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
           { id: 'alphavantage', name: 'Alpha Vantage', desc: 'Professional-grade financial data with fundamentals.', tags: ['API Key Required', '500/day'] },
           { id: 'fmp', name: 'Financial Modeling Prep', desc: 'Comprehensive financial data with earnings data.', tags: ['API Key Required', '250/day'] },
           { id: 'alpaca', name: 'Alpaca Markets', desc: 'Real-time and historical market data for trading.', tags: ['API Key Required'] },
+          { id: ALPACA_HIST_PROVIDER, name: 'Alpaca history cache (regular session, H1/M15)', desc: 'Hourly or 15-minute bars of the regular session built from the cached 5-minute data. Read from disk only; optional point-in-time feature groups.', tags: ['Free', 'Local Cache'] },
         ].map(provider => {
           const isSelected = wizardData.dataProvider === provider.id;
           return (
@@ -958,7 +979,13 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
               name="dataProvider"
               value={provider.id}
               checked={isSelected}
-              onChange={(e) => setWizardData({ ...wizardData, dataProvider: e.target.value })}
+              onChange={(e) => setWizardData({
+                ...wizardData,
+                dataProvider: e.target.value,
+                // H1 / M15 only for the cache; its feature groups do not exist for the other providers
+                timeframe: e.target.value === ALPACA_HIST_PROVIDER && !ALPACA_HIST_TIMEFRAMES.includes(wizardData.timeframe) ? '1h' : wizardData.timeframe,
+                panelFeatures: e.target.value === ALPACA_HIST_PROVIDER ? wizardData.panelFeatures : [],
+              })}
               className="sr-only"
             />
             <div className="font-semibold text-lg mb-1 text-foreground">{provider.name}</div>
@@ -974,6 +1001,33 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
           </label>
         );})}
       </div>
+
+      {wizardData.dataProvider === ALPACA_HIST_PROVIDER && (
+        <div className="p-4 border border-gray-200 dark:border-gray-700 rounded-lg space-y-2">
+          <div className="font-medium text-gray-700 dark:text-gray-200">Feature groups</div>
+          <p className="text-xs text-gray-400 dark:text-gray-300">
+            Technical features of the bars are always included. Every group below is point in time: a row only sees data that was public before it.
+          </p>
+          {PANEL_FEATURE_OPTIONS.map(option => (
+            <label key={option.id} className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={wizardData.panelFeatures.includes(option.id)}
+                onChange={(e) => setWizardData({
+                  ...wizardData,
+                  panelFeatures: e.target.checked
+                    ? [...wizardData.panelFeatures, option.id]
+                    : wizardData.panelFeatures.filter(id => id !== option.id),
+                })}
+                className="mt-1"
+              />
+              <span className="text-sm text-gray-700 dark:text-gray-200">
+                {option.name} <span className="text-gray-500 dark:text-gray-400">({option.desc})</span>
+              </span>
+            </label>
+          ))}
+        </div>
+      )}
 
     </div>
   );
@@ -1787,6 +1841,14 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
           <span className="font-medium text-gray-700 dark:text-gray-200">Data Provider:</span>
           <span className="capitalize text-gray-900 dark:text-gray-100">{wizardData.dataProvider}</span>
         </div>
+        {wizardData.dataProvider === ALPACA_HIST_PROVIDER && (
+          <div className="flex justify-between py-2 border-b border-gray-200 dark:border-gray-600">
+            <span className="font-medium text-gray-700 dark:text-gray-200">Feature Groups:</span>
+            <span className="text-gray-900 dark:text-gray-100">
+              {['Technical', ...PANEL_FEATURE_OPTIONS.filter(o => wizardData.panelFeatures.includes(o.id)).map(o => o.name)].join(', ')}
+            </span>
+          </div>
+        )}
         <div className="flex justify-between py-2 border-b border-gray-200 dark:border-gray-600">
           <span className="font-medium text-gray-700 dark:text-gray-200">Date Range:</span>
           <span className="text-gray-900 dark:text-gray-100">{wizardData.startDate || '1 year ago'} - {wizardData.endDate || 'Today'}</span>

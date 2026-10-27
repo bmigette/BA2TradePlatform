@@ -81,6 +81,32 @@ export interface VolatilityTarget extends BaseTargetConfig {
   method: 'std' | 'range' | 'atr';
 }
 
+// Targets of the Alpaca history cache source (alpaca_hist, 1h / 15m): horizons are in sessions and every
+// threshold is fitted on the training rows. Classes: 0 = loss / down, 1 = timeout / flat, 2 = win / up.
+
+// ATR triple barrier: TP of k x ATR before SL of slRatio x k x ATR within horizonSessions
+export interface TripleBarrierAtrTarget extends BaseTargetConfig {
+  type: 'triple_barrier_atr';
+  category: 'multiclass_classification';
+  horizonSessions: number;
+  slRatio: number;      // SL multiple / TP multiple
+  tpAtr?: number;       // TP multiple of the daily ATR; empty = fitted so the timeout share is about a third
+}
+
+// Direction over N sessions against the training rows' terciles
+export interface DirectionTercilesTarget extends BaseTargetConfig {
+  type: 'direction_terciles';
+  category: 'multiclass_classification';
+  horizonSessions: number;
+}
+
+// N-session forward return (regression)
+export interface ForwardReturnTarget extends BaseTargetConfig {
+  type: 'forward_return';
+  category: 'regression';
+  horizonSessions: number;
+}
+
 // Union type for all target configs
 export type TargetConfig =
   | PriceBasedTarget
@@ -88,7 +114,10 @@ export type TargetConfig =
   | TripleBarrierTarget
   | TrendReversalTarget
   | UnifiedTrendTarget
-  | VolatilityTarget;
+  | VolatilityTarget
+  | TripleBarrierAtrTarget
+  | DirectionTercilesTarget
+  | ForwardReturnTarget;
 
 // Indicator parameters
 export interface RSIParams {

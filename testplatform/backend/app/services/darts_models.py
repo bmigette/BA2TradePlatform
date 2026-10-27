@@ -1197,7 +1197,9 @@ class PredictionTargetService:
         self,
         df: pd.DataFrame,
         targets_config: List[Dict[str, Any]],
-        dataset_timeframe: Optional[str] = None
+        dataset_timeframe: Optional[str] = None,
+        panel_source: bool = False,
+        train_ratio: float = 0.7
     ) -> List[Dict[str, Any]]:
         """
         Calculate all target types and return with statistics.
@@ -1211,6 +1213,8 @@ class PredictionTargetService:
             targets_config: List of target configurations, each may have:
                 - timeframe: Optional[str] - Calculate target on this timeframe
             dataset_timeframe: Base timeframe of the dataset (e.g., '15m', '1h')
+            panel_source: The dataset comes from the alpaca_hist source (needed by the ml_wizard_targets types)
+            train_ratio: Train share the ml_wizard_targets types fit their thresholds on
 
         Returns:
             List of calculated targets with data and stats
@@ -1219,6 +1223,7 @@ class PredictionTargetService:
             resample_ohlcv_to_timeframe,
             align_higher_timeframe_to_lower
         )
+        from app.services.ml_wizard_targets import WIZARD_TARGET_TYPES, build_wizard_target
 
         results = []
         df = df.copy().sort_values('Date').reset_index(drop=True)
@@ -1243,6 +1248,9 @@ class PredictionTargetService:
 
             # Determine timeframe for days-to-bars conversion
             effective_timeframe = target_timeframe if use_multi_timeframe else (dataset_timeframe or '1h')
+            # class values of the 'multiclass_classification' stats: triple_barrier here stores 1 = profit,
+            # 0 = stop, 2 = timeout; the ml_wizard_targets types store 2 = up / win, 0 = down / loss, 1 = flat / timeout
+            profit_class, stop_class, timeout_class = 1, 0, 2
 
             try:
                 if target_type == 'price_based':
@@ -1326,6 +1334,17 @@ class PredictionTargetService:
                     col_name = series.name
                     category = 'binary_classification'
 
+                elif target_type in WIZARD_TARGET_TYPES:
+                    if use_multi_timeframe:
+                        raise ValueError(f"{target_type} is computed on the dataset timeframe only")
+                    series, col_name, _ = build_wizard_target(
+                        working_df, config, train_ratio, effective_timeframe, panel_source)
+                    if target_type == 'forward_return':
+                        category = 'regression'
+                    else:
+                        category = 'multiclass_classification'
+                        profit_class, stop_class, timeout_class = 2, 0, 1
+
                 elif target_type == 'volatility':
                     horizon_value = config.get('horizon')
                     horizon_unit = config.get('horizonUnit', 'bars')
@@ -1381,9 +1400,9 @@ class PredictionTargetService:
                     stats["negativePct"] = round(100 * neg_count / total, 2) if total > 0 else 0
 
                 elif category == 'multiclass_classification':
-                    profit_count = int((valid_values == 1).sum())
-                    stop_count = int((valid_values == 0).sum())
-                    timeout_count = int((valid_values == 2).sum())
+                    profit_count = int((valid_values == profit_class).sum())
+                    stop_count = int((valid_values == stop_class).sum())
+                    timeout_count = int((valid_values == timeout_class).sum())
                     total = profit_count + stop_count + timeout_count
                     stats["profitHitCount"] = profit_count
                     stats["stopHitCount"] = stop_count
