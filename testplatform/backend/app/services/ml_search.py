@@ -104,7 +104,10 @@ class Setup:
     def from_genes(cls, g: Dict[str, Any]) -> "Setup":
         spec = TARGETS[g["target"]]
         arch = g["tsai_arch"] if spec.is_classification else g["darts_arch"]
-        return cls(g["timeframe"], g["features"], g["target"], bool(int(g["pooled"])), arch, int(g["lookback"]),
+        # The Darts models forecast every bar of the horizon: on M15 that is 130-390 output steps per sample, minutes
+        # per fold for no new information, so the forward-return setups run on H1 (same key as the H1 genome).
+        tf = g["timeframe"] if spec.is_classification else "1h"
+        return cls(tf, g["features"], g["target"], bool(int(g["pooled"])), arch, int(g["lookback"]),
                    float(g["lr"]), int(g["width"]), float(g["dropout"]), int(g["epochs"]))
 
     @property
