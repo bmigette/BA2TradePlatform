@@ -370,6 +370,7 @@ def run_backtest(
     buy_entry_conditions: Optional[Dict] = None,
     sell_entry_conditions: Optional[Dict] = None,
     exit_conditions: Optional[List[Dict]] = None,
+    ticker: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a backtest simulation using backtesting.py.
@@ -472,6 +473,18 @@ def run_backtest(
     if not feature_cols:
         logger.error("No feature columns found in prediction dataset")
         return _empty_results(initial_capital)
+
+    # Cells the daily source's coverage mask blanked: filled from the medians saved with the model (never refitted on this
+    # frame); the all-masked columns it dropped are dropped. A model saved before that cannot, and says so.
+    from app.services.masked_fill import StaleMaskedModel, apply_saved_fill
+    try:
+        pred_df, feature_cols = apply_saved_fill(
+            pred_df, feature_cols, (model.normalization_params or {}).get('masked_fill'), ticker)
+    except StaleMaskedModel as e:
+        result = _empty_results(initial_capital)
+        result['error'] = str(e)
+        result['status'] = 'failed'
+        return result
 
     # Forward-fill sparse indicators (e.g., zigzag)
     pred_df = ffill_sparse_indicators(pred_df)
@@ -1220,6 +1233,7 @@ def handle_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             buy_entry_conditions=buy_entry_conditions,
             sell_entry_conditions=sell_entry_conditions,
             exit_conditions=exit_conditions,
+            ticker=getattr(pred_dataset, "ticker", None),
         )
 
         # Update backtest with results

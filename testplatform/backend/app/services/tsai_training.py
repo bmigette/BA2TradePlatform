@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import json
 
 from app.services.data_preparation import DataPreparationService, frame_bounds, purged_train_row_count, three_way_bounds
-from app.services.darts_training import fill_masked_covariates, has_masked_cells
+from app.services.masked_fill import build_masked_fill, fill_masked_covariates, has_masked_cells, ticker_key
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,8 @@ class TSAITrainingService(ITrainingService):
         self.normalize = normalize
         self.buffer_pct = buffer_pct
         self.data_prep = None  # DataPreparationService instance, fitted on training data
+        # The mask-fill medians of the last split (masked_fill.build_masked_fill), saved with the scaler params
+        self.masked_fill: Optional[Dict[str, Any]] = None
 
     def prepare_data(
         self,
@@ -227,10 +229,12 @@ class TSAITrainingService(ITrainingService):
         return X, y
 
     @staticmethod
-    def _fill_masked(df: pd.DataFrame, feature_columns: List[str], n_fit: int) -> Tuple[pd.DataFrame, List[str]]:
+    def _fill_masked(df: pd.DataFrame, feature_columns: List[str], n_fit: int,
+                     medians_out: Optional[Dict[str, float]] = None) -> Tuple[pd.DataFrame, List[str]]:
         """``df`` with the coverage mask's blank cells filled (train median of its first ``n_fit`` rows) and the feature
-        columns without any group masked in every row. A frame without a daily ``missing`` flag is returned as it is."""
-        filled, dropped = fill_masked_covariates(df[feature_columns], n_fit)
+        columns without any group masked in every row. A frame without a daily ``missing`` flag is returned as it is.
+        ``medians_out`` receives the median used for every filled column."""
+        filled, dropped = fill_masked_covariates(df[feature_columns], n_fit, medians_out)
         if filled.equals(df[feature_columns]) and not dropped:
             return df, list(feature_columns)
         out = df.copy()
@@ -242,11 +246,18 @@ class TSAITrainingService(ITrainingService):
         """``_fill_masked`` for every ticker (each with its own train rows). A group masked in every row of ANY ticker is
         dropped for all of them, so every ticker keeps the same feature set."""
         out, dropped = [], set()
+        fills: Dict[str, Dict[str, float]] = {}
         for df, n in zip(frames, n_fits):
-            filled, d = self._fill_masked(df, feature_columns, n)
+            medians: Dict[str, float] = {}
+            filled, d = self._fill_masked(df, feature_columns, n, medians)
             out.append(filled)
+            fills[ticker_key(df)] = medians
             dropped |= set(feature_columns) - set(d)
-        return out, [c for c in feature_columns if c not in dropped]
+        kept = [c for c in feature_columns if c not in dropped]
+        # the medians of the columns that ended up dropped for another ticker are of no use
+        fills = {k: {c: v for c, v in table.items() if c in kept} for k, table in fills.items()}
+        self.masked_fill = build_masked_fill(fills, [c for c in feature_columns if c in dropped])
+        return out, kept
 
     def prepare_data_split(
         self,
@@ -295,7 +306,8 @@ class TSAITrainingService(ITrainingService):
         # transform() clips anything past it.
         split_idx = int(len(df) * train_ratio)
         # masked cells get the median of the train rows (the purge below only shortens them)
-        df, feature_columns = self._fill_masked(df, feature_columns, purged_train_row_count(split_idx, label_horizon) or split_idx)
+        [df], feature_columns = self._fill_masked_frames(
+            [df], feature_columns, [purged_train_row_count(split_idx, label_horizon) or split_idx])
         df_train = df.iloc[:split_idx]
         df_test = df.iloc[split_idx:]
 
@@ -1048,7 +1060,10 @@ class TSAITrainingService(ITrainingService):
             Dictionary with normalization params or None if not fitted
         """
         if self.data_prep is not None:
-            return self.data_prep.export_params()
+            params = self.data_prep.export_params()
+            if self.masked_fill is not None:
+                params['masked_fill'] = self.masked_fill     # prediction fills from it and never refits
+            return params
         return None
 
 

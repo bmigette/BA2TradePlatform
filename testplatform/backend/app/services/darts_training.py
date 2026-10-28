@@ -44,67 +44,8 @@ except ImportError:
     DARTS_AVAILABLE = False
 
 
-def masked_groups(cov: pd.DataFrame) -> List[Tuple[str, List[str], np.ndarray]]:
-    """``(flag column, the group's columns, bool array of the flagged rows)`` for every daily-store group of ``cov`` that has
-    at least one masked row (``<prefix>missing`` == 1). Only the daily store's group prefixes count
-    (``ml_dataset_source.daily_column_prefixes``); the ``_covered`` flags are never masked (they describe the data)."""
-    from app.services.ml_dataset_source import daily_column_prefixes
-    prefixes = set(daily_column_prefixes())
-    found = []
-    for flag in [c for c in cov.columns if c.endswith("_missing")]:
-        prefix = flag[: -len("missing")]
-        if prefix not in prefixes:
-            continue
-        flagged = (cov[flag] == 1.0).to_numpy()
-        group = [c for c in cov.columns if c != flag and c.startswith(prefix)
-                 and not c.endswith(("_covered", "_missing"))]
-        if flagged.any() and group:
-            found.append((flag, group, flagged))
-    return found
-
-
-def has_masked_cells(cov: pd.DataFrame) -> bool:
-    """Some cell of a flagged group-year is still NaN (the coverage mask's blanks, not yet filled)."""
-    return any(cov[group].isna().to_numpy()[flagged].any() for _, group, flagged in masked_groups(cov))
-
-
-def fill_masked_covariates(cov: pd.DataFrame, n_fit: int) -> Tuple[pd.DataFrame, List[str]]:
-    """Neutral values for the cells the daily source's coverage mask blanked, so the past-only forward fill never carries
-    a value across a masked (group, year).
-
-    A dataset from the daily feature store marks a thin (group, year) with ``<prefix>missing`` = 1 and NaN in the group's
-    columns (``ml_features.apply_coverage_mask``). Those NaN are "no data", not "gap in a value": forward-filling them
-    would show a model last year's last value as this year's. Here each such cell becomes the MEDIAN of the column's
-    unmasked values in the first ``n_fit`` rows (the train block, the same rows the covariate scaler is fitted on), so
-    no later value reaches an earlier row. A median rather than 0 because the inputs are not standardised at this point
-    (the Scaler min-maxes them afterwards, so the median stays inside the train range); a column with no unmasked train
-    value gets 0.0 and a warning. The ``missing`` flag itself is untouched and stays a feature. A group masked in every
-    row has nothing to learn from: its columns are dropped (warning), its flag stays.
-
-    Only the flags of the daily store's group prefixes count (``ml_dataset_source.daily_column_prefixes``), so any other
-    dataset is returned unchanged. Returns ``(covariates, dropped columns)``."""
-    out = cov.copy()
-    dropped: List[str] = []
-    for flag, group, flagged in masked_groups(cov):
-        if flagged.all():
-            logger.warning(f"Group {flag[:-len('missing')]!r} is masked in every row (coverage threshold): dropping its columns "
-                           f"{group[:8]}{'...' if len(group) > 8 else ''}; {flag} stays as a feature")
-            out = out.drop(columns=group)
-            dropped += group
-            continue
-        for c in group:
-            masked = flagged & out[c].isna().to_numpy()
-            if not masked.any():
-                continue
-            train = out[c].iloc[:n_fit]
-            train = train[~flagged[:n_fit]].dropna()
-            if train.empty:
-                logger.warning(f"{c}: no unmasked value in the train block, masked cells set to 0.0")
-                neutral = 0.0
-            else:
-                neutral = float(train.median())
-            out.loc[masked, c] = neutral
-    return out, dropped
+from app.services.masked_fill import (  # noqa: E402  (re-exported: the daily mask fill lives in masked_fill)
+    all_masked_columns, build_masked_fill, fill_masked_covariates, has_masked_cells, masked_groups, ticker_key)
 
 
 class DartsTrainingService(ITrainingService):
@@ -132,6 +73,9 @@ class DartsTrainingService(ITrainingService):
         # lists); evaluation inverse-transforms each series with its own scaler.
         self.scalers: List[Any] = []
         self.cov_scalers: List[Any] = []
+        # The mask-fill medians of the last three-way prepare (masked_fill.build_masked_fill), saved with the scalers
+        self.masked_fill: Optional[Dict[str, Any]] = None
+        self._last_fill: Dict[str, float] = {}
 
     def prepare_data(
         self,
@@ -202,7 +146,8 @@ class DartsTrainingService(ITrainingService):
                 # Cells blanked by the daily source's coverage mask get a train-fitted neutral value FIRST, so the
                 # forward fill below never carries a value across a masked (group, year) and first_complete ignores them.
                 n_fit = fit_count(df_sorted.index) or len(df_sorted)
-                cov_df, dropped = fill_masked_covariates(df_sorted[available_cols], n_fit)
+                self._last_fill = {}
+                cov_df, dropped = fill_masked_covariates(df_sorted[available_cols], n_fit, self._last_fill)
                 available_cols = [c for c in available_cols if c not in dropped]
                 cov_df = cov_df.ffill()
                 empty_cols = [c for c in available_cols if cov_df[c].isna().all()]
@@ -412,6 +357,13 @@ class DartsTrainingService(ITrainingService):
         covs = {k: [] for k in keys}
         scalers = []
         cov_scalers = []
+        # A group masked in every row of ANY ticker is dropped for ALL of them (one covariate width), and the medians of
+        # the masked columns are collected per ticker to be saved with the scalers.
+        all_masked = all_masked_columns(dataframes, feature_columns or [])
+        if all_masked:
+            logger.warning(f"Columns masked in every row of at least one ticker are dropped for all: {all_masked}")
+            feature_columns = [c for c in feature_columns if c not in all_masked]
+        fills: Dict[str, Dict[str, float]] = {}
         for df in dataframes:
             self.cov_scaler = None
             if cb is None:
@@ -424,6 +376,7 @@ class DartsTrainingService(ITrainingService):
                 )
             scalers.append(self.scaler)
             cov_scalers.append(self.cov_scaler)
+            fills[ticker_key(df)] = dict(self._last_fill)
             if cb is None:
                 b = three_way_bounds(len(full_series), train_ratio, holdout_share_of_test, label_horizon)
             else:
@@ -448,6 +401,7 @@ class DartsTrainingService(ITrainingService):
         self.scaler = scalers[-1]
         self.cov_scalers = cov_scalers
         self.cov_scaler = cov_scalers[-1]
+        self.masked_fill = build_masked_fill(fills, all_masked)
         logger.info(
             "Three-way split: " + ", ".join(
                 f"{k}={sum(len(s) for s in series[k])}" for k in keys
@@ -961,16 +915,19 @@ class DartsTrainingService(ITrainingService):
             return None
 
         return self.describe_scalers(
-            self.scalers or [self.scaler], self.cov_scalers or [self.cov_scaler]
+            self.scalers or [self.scaler], self.cov_scalers or [self.cov_scaler], masked_fill=self.masked_fill
         )
 
     @staticmethod
-    def describe_scalers(scalers: List[Any], cov_scalers: List[Any]) -> Dict[str, Any]:
+    def describe_scalers(scalers: List[Any], cov_scalers: List[Any],
+                         masked_fill: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """JSON description of the fitted target AND covariate scalers (one entry per series).
 
         The covariate scaler used to be dropped entirely, so a reloaded model could not scale its
         features the way it was trained. Top-level data_min/data_max/data_range stay the (last)
-        target scaler's for backward compatibility.
+        target scaler's for backward compatibility. ``masked_fill`` (``masked_fill.build_masked_fill``) is the
+        per-ticker median of every masked column and the dropped all-masked columns: prediction fills from it
+        (``masked_fill.apply_saved_fill``) and never refits on the frame it predicts.
         """
         def params(scaler):
             if scaler is None:
@@ -994,6 +951,8 @@ class DartsTrainingService(ITrainingService):
         }
         if scalers and scalers[-1] is not None:
             scaler_info.update(params(scalers[-1]))
+        if masked_fill is not None:
+            scaler_info['masked_fill'] = masked_fill
         return scaler_info
 
     def predict(self, model: Any, data: Any, n: int = None, **kwargs) -> Any:

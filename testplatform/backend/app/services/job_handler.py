@@ -19,6 +19,7 @@ from pathlib import Path
 from app.models.database import SessionLocal
 from app.models.dataset import Dataset
 from app.services.data_preparation import frame_bounds, purged_train_row_count, three_way_bounds
+from app.services.masked_fill import all_masked_columns
 from app.services.ml_dataset_source import is_alpaca_hist
 from app.services.ml_wizard_targets import (
     CROSS_SECTIONAL_DAILY_TYPES, DAILY_TARGET_TYPES, WIZARD_TARGET_TYPES, WizardTargetError,
@@ -2067,6 +2068,13 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
             target_columns=all_target_columns,
             selected_target=target_column,
         )
+        # A group of the daily source that the coverage mask blanked in EVERY row of ANY ticker has nothing to learn
+        # from: its columns leave the feature list of all the tickers (so the saved list is the width the models
+        # really have); its <group>_missing flag stays.
+        all_masked = all_masked_columns(frames, feature_columns)
+        if all_masked:
+            logger.warning(f"Dropping the feature columns of groups masked in every row of at least one ticker: {all_masked}")
+            feature_columns = [c for c in feature_columns if c not in all_masked]
 
         # Save datasets for debugging and download
         update_job_progress(task_id, 22, "Saving datasets to cache...")
@@ -3381,7 +3389,8 @@ def train_unified_optimization(
             common_dates=common_dates
         )
         rnn_scalers = list(training_service.scalers)
-        rnn_scaler_params = training_service.describe_scalers(rnn_scalers, list(training_service.cov_scalers))
+        rnn_scaler_params = training_service.describe_scalers(
+            rnn_scalers, list(training_service.cov_scalers), masked_fill=training_service.masked_fill)
         logger.info(
             f"RNN data prepared: train={_n_points(rnn_split['train_series'])}, "
             f"validation={_n_points(rnn_split['val_series'])}, holdout={_n_points(rnn_split['holdout_series'])} "
@@ -3400,7 +3409,8 @@ def train_unified_optimization(
             common_dates=common_dates
         )
         ms_scalers = list(training_service.scalers)
-        ms_scaler_params = training_service.describe_scalers(ms_scalers, list(training_service.cov_scalers))
+        ms_scaler_params = training_service.describe_scalers(
+            ms_scalers, list(training_service.cov_scalers), masked_fill=training_service.masked_fill)
         logger.info(
             f"Multi-step data prepared: train={_n_points(ms_split['train_series'])}, "
             f"validation={_n_points(ms_split['val_series'])}, holdout={_n_points(ms_split['holdout_series'])} "
