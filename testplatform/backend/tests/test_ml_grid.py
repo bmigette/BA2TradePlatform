@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from app.services import ml_eval as E
+from app.services import ml_features as F
 from app.services import ml_grid as G
 from app.services import ml_holdout as HO
 from app.services import ml_panel as P
@@ -76,8 +77,9 @@ def build_store(root, name, symbols, cache, beta, seed, extra_cols=(), canary=Fa
     d = root / name
     d.mkdir(parents=True)
     df.to_parquet(d / "features.parquet")
-    meta = {"symbols": list(symbols), "first_day": str(FIRST), "last_day": str(LAST), "cache_end": str(LAST),
-            "ensure": {"min_share": 0.7, "inputs": {"code": "synthetic-1", "fingerprints": {
+    meta = {"symbols": list(symbols), "universe": list(symbols), "purpose": "dev", "membership": None,
+            "first_day": str(FIRST), "last_day": str(LAST), "cache_end": str(LAST),
+            "ensure": {"min_share": 0.7, "inputs": {"code": F.code_version(), "fingerprints": {
                 "daily": {s: {"mtime_ns": 1, "size": 1} for s in symbols}}}}}
     (d / "features.parquet.meta.json").write_text(json.dumps(meta), encoding="utf-8")
     years = sorted(set(sess.year))
@@ -754,7 +756,7 @@ def test_cell_key_follows_the_store_signature_not_its_path(signal_world, tmp_pat
     assert a.key == b.key and a.signature == b.signature and a.config()["store"] != b.config()["store"]
     meta = moved / "stocks" / "features.parquet.meta.json"
     m = json.loads(meta.read_text(encoding="utf-8"))
-    m["ensure"]["inputs"]["code"] = "synthetic-2"                       # the store was rebuilt from other inputs
+    m["ensure"]["inputs"]["fingerprints"]["daily"][SYMS[0]]["size"] = 2            # the store was rebuilt from other inputs
     meta.write_text(json.dumps(m), encoding="utf-8")
     assert G.validate_cell(cell(moved)).key != a.key
 

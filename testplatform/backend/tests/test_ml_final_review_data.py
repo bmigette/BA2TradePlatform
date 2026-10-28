@@ -147,3 +147,46 @@ def test_the_wizard_daily_frame_refuses_locked_symbols_too():
 def test_the_intraday_wizard_sources_are_not_affected_by_the_holdout():
     from app.services import ml_dataset_source as S
     assert S.validate_daily_request("alpaca_hist", "1h", None, None, LOCKED, None) == {}
+
+
+# ------------------------------------------------------------------------------------------------ A6: parity
+def _atr_pair(root, symbols, first):
+    from app.services import ml_targets as T
+    from tests.test_ml_features import LAST_BAR, _build
+    store = _build(root, ["t"], symbols=symbols, first=first, last=LAST_BAR)
+    bars, _ = F.load_daily(symbols, first, LAST_BAR, root, cache_end=F.last_cached_bar("SPY", root))
+    arrays = T.daily_arrays(bars)
+    assert list(arrays.symbols) == list(symbols)
+    return store, arrays
+
+
+def test_the_target_atr_is_the_stores_t_atr_pct(cache, tmp_path):
+    """The relative / barrier targets scale by ``ml_targets.daily_arrays`` ``atr_pct``; the store's ``t_atr_pct`` is what a
+    model sees. They are one number, row for row, when both start from the same first bar (the grid loads the bars over the
+    store's own range): a drift between the two would silently change what the targets mean."""
+    import shutil
+
+    from tests.test_ml_features import FIRST_BAR
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    s = _sessions()
+    _write(root, "LATE", _bars(s[s >= pd.Timestamp("2023-02-01")], 9))             # lists late: a NaN prefix in the arrays
+    symbols = ("AAA", "BBB", "LATE")
+    store, arrays = _atr_pair(root, symbols, FIRST_BAR)
+    for k, sym in enumerate(symbols):
+        mine = store.loc[sym, "t_atr_pct"].to_numpy()
+        theirs = arrays.atr_pct[:, k]
+        assert np.isfinite(mine).sum() > 100 and np.array_equal(np.isfinite(mine), np.isfinite(theirs)), sym
+        np.testing.assert_allclose(theirs[np.isfinite(theirs)], mine[np.isfinite(mine)], rtol=1e-12, atol=0)
+
+
+def test_a_window_that_starts_after_the_first_bar_converges_to_the_stores_atr(cache):
+    """Wilder's recursion is seeded where the data starts: the store from the symbol's first cached bar, the arrays from the
+    start of the loaded window. The difference decays by (13/14) per session (below 1e-9 within 400 sessions), and the arrays
+    are NaN for their own first 14 sessions: the wizard's documented warm-up (ml_dataset_source), irrelevant to the grid."""
+    store, arrays = _atr_pair(cache, ("AAA", "BBB"), FIRST)
+    for k, sym in enumerate(("AAA", "BBB")):
+        mine, theirs = store.loc[sym, "t_atr_pct"].to_numpy(), arrays.atr_pct[:, k]
+        assert not np.isfinite(theirs[:13]).any() and np.isfinite(theirs[13:]).all()
+        assert abs(theirs[13] / mine[13] - 1) > 1e-5                                  # the cold seed is visibly different
+        np.testing.assert_allclose(theirs[-50:], mine[-50:], rtol=1e-9, atol=0)

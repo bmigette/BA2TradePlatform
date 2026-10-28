@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from app.services import ml_features as F
 from app.services import ml_grid as G
 from app.services import ml_grid_seq as S
 from app.services import ml_holdout as HO
@@ -99,8 +100,9 @@ def build_gpu_world(root: Path, beta: float = 0.5, seed: int = 11):
     d = root / "stores" / "stocks"
     d.mkdir(parents=True)
     pd.concat(feats).to_parquet(d / "features.parquet")
-    meta = {"symbols": list(GSYMS), "first_day": str(FIRST_G), "last_day": str(LAST_G), "cache_end": str(LAST_G),
-            "ensure": {"min_share": 0.7, "inputs": {"code": "synthetic-gpu-1", "fingerprints": {
+    meta = {"symbols": list(GSYMS), "universe": list(GSYMS), "purpose": "dev", "membership": None,
+            "first_day": str(FIRST_G), "last_day": str(LAST_G), "cache_end": str(LAST_G),
+            "ensure": {"min_share": 0.7, "inputs": {"code": F.code_version(), "fingerprints": {
                 "daily": {s: {"mtime_ns": 1, "size": 1} for s in GSYMS}}}}}
     (d / "features.parquet.meta.json").write_text(json.dumps(meta), encoding="utf-8")
     years = sorted(set(day_dates.year))

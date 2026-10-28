@@ -11,6 +11,13 @@ any strategy that is evaluated on the survivors. Nothing before the first scan (
 ``universe_as_of`` raises ``UniverseUnavailable`` there, the column helpers return NaN. The NDQ30 stage uses an explicit
 static list instead and does not touch this module's membership.
 
+NDQ30 IS A HINDSIGHT-SELECTED LIST. The thirty names (``ml_holdout.NDQ30``) are the large Nasdaq companies of today,
+picked in 2026 because they are the ones that grew into the index's leaders: a survivor and winner bias that no
+point-in-time rule removes (it is in WHICH names are studied, not in any row's value). Results on NDQ30 overstate what the
+same models would earn on the names that were large at the time; the large-cap scale-up has the milder survivor-only bias
+described above, and neither is a substitute for the locked holdout. Read an NDQ30 result as "does the signal exist at
+all", never as an expected return.
+
 It is read through ``ba2_providers.screener.metric_store`` (``load_store`` memoises it per process, ``scan_dates``,
 ``visible_scan_date``, ``check_scan_freshness``).
 

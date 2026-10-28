@@ -529,6 +529,41 @@ def stores_used(avail: Sequence[Tuple[str, Path, Sequence[str]]], symbols: Seque
     return [(n, d) for n, d, _ in avail if any(owner[s] == n for s in symbols)]
 
 
+#: what a store's meta must carry for the dev checks (``ensure_feature_store`` writes them all)
+_DEV_META_KEYS = ("symbols", "universe", "purpose", "membership")
+
+
+def check_dev_store(meta: Dict[str, Any], where: str) -> None:
+    """Refuse a store the stage-1 grid must not read (``meta`` = its ``features.parquet.meta.json``, ``where`` names it):
+
+    * built by other feature code than the running one (``ensure.inputs.code`` != ``ml_features.code_version()``): its
+      columns may mean something else; "rebuild the store with `ba2-test ml-features`";
+    * built on purpose as a HOLDOUT store (``purpose == "holdout"``), or listing a locked holdout symbol among its
+      ``symbols`` or ``universe`` (``LockedSymbolError``);
+    * built from a point-in-time membership (``membership`` is not None): the grid has no per-session universe yet.
+
+    A meta lacking a key it needs is refused too (a store from before the key was recorded): rebuild it."""
+    ens = meta["ensure"] if "ensure" in meta else {}
+    if "inputs" not in ens:
+        raise ValueError("store meta lacks ensure.inputs: rebuild the store")
+    inputs = ens["inputs"]
+    missing = [k for k in _DEV_META_KEYS if k not in meta]
+    if "code" not in inputs:
+        missing.append("ensure.inputs.code")
+    if missing:
+        raise ValueError(f"store {where}: its meta lacks {missing}; rebuild the store with `ba2-test ml-features`")
+    if inputs["code"] != F.code_version():
+        raise ValueError(f"store {where} was built by feature code {inputs['code']}, this checkout is "
+                         f"{F.code_version()}: rebuild the store with `ba2-test ml-features`")
+    if meta["purpose"] == "holdout":
+        raise ValueError(f"store {where} is a HOLDOUT store (purpose=holdout): a dev grid must never read it")
+    HO.assert_unlocked(list(dict.fromkeys(list(meta["symbols"]) + list(meta["universe"]))),
+                       f"a dev grid (store {where} lists them)")
+    if meta["membership"] is not None:
+        raise ValueError(f"store {where} was built from a point-in-time membership; point-in-time membership stores are "
+                         f"not supported by the stage-1 grid yet (rebuild it without --membership-top-n)")
+
+
 def store_signature(store: Union[str, Path], symbols: Sequence[str]) -> str:
     """Identity of the store data a cell reads, independent of where the store lives: a hash over the stores that hold
     ``symbols`` of (name, ``ensure.inputs`` -- code version, coverage columns, source fingerprints --, ``min_share``,
@@ -537,8 +572,7 @@ def store_signature(store: Union[str, Path], symbols: Sequence[str]) -> str:
     parts = {}
     for name, d in stores_used(discover_stores(store), symbols, str(store)):
         m = _meta_of(d)
-        if "inputs" not in m["ensure"]:
-            raise ValueError("store meta lacks ensure.inputs: rebuild the store")
+        check_dev_store(m, str(d))
         parts[name] = {"inputs": m["ensure"]["inputs"], "min_share": m["ensure"]["min_share"],
                        "symbols": m["symbols"], "first_day": m["first_day"], "last_day": m["last_day"],
                        "cache_end": m["cache_end"]}
@@ -681,6 +715,7 @@ def load_panel(store: Union[str, Path], symbols: Tuple[str, ...], track: str, ca
     frames: Dict[str, pd.DataFrame] = {}
     metas: Dict[str, Dict[str, Any]] = {}
     for name, d in used:
+        check_dev_store(_meta_of(d), str(d))
         df = F.load_feature_store(d, mask=True)
         metas[name] = df.attrs["meta"]
         want = [s for s in symbols if owner[s] == name]

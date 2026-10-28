@@ -1,7 +1,11 @@
 """Point-in-time DAILY feature store for the ML exploration v2 (trains on (symbol, session) rows, 2016-2026).
 
-Source: the Alpaca-built daily cache ``<cache>/AlpacaHistoryOHLCVProvider/<SYM>_1d.parquet`` only (no network, never
-FMP prices). The decision clock is the session CLOSE: a row for session S is what a model knows when it decides at S's
+Sources (all read from the local cache, no network, never FMP prices): the Alpaca-built daily bars
+``<cache>/AlpacaHistoryOHLCVProvider/<SYM>_1d.parquet`` for every price-derived column, plus, per group, the files the
+group is documented to read: the screener metric store (``x``, the market-cap columns of ``f`` and ``i``, the sectors of
+``m``), the FRED first-release series (``mac``), FMP's cached statements, earnings, analyst grades / price targets and
+insider filings (``fmp_history/``, groups ``f`` / ``ag`` / ``at`` / ``i``) and the platform's market-condition manifests
+(``s``). The decision clock is the session CLOSE: a row for session S is what a model knows when it decides at S's
 close (the order then fills at S+1's open). So a row may use
 
   * the symbol's own bars up to and INCLUDING S (a daily bar is public at its close);
@@ -18,12 +22,13 @@ request starts (recursive indicators - Wilder, EMA, SAR, OBV - are seeded at the
 before the first bar are unlisted and NaN; the early rows after it are NaN until each window is full (a 200-session
 average is NaN for the first 199 sessions of a symbol).
 
-Feature groups are column prefixes registered in ``GROUPS`` (``t_`` technical, ``mtf_`` multi-timeframe, ``m_`` market)
-so they can be switched on and off as grid factors. A ``GroupSpec`` holds the builder ``(daily, ctx) -> DataFrame``
-indexed ``[symbol, session]`` (exactly ``ctx.symbols`` x ``ctx.sessions``, float columns, every column carrying the
-prefix), whether it needs a sector map, and the context symbols it needs loaded (``build_features`` adds them, the
-caller does not assemble ETF lists). Later groups (cross-sectional, macro, fundamentals, analyst, insider, structure)
-register themselves the same way. Every column is scale-free (log returns, ratios, ATR multiples, z-scores), never a
+Feature groups are column prefixes registered in ``GROUPS`` - all ten: ``t_`` technical, ``mtf_`` multi-timeframe,
+``m_`` market, ``x_`` cross-sectional, ``mac_`` macro, ``f_`` fundamentals, ``ag_`` analyst grades, ``at_`` analyst
+targets, ``i_`` insiders and ``s_`` market structure - so they can be switched on and off as grid factors. A
+``GroupSpec`` holds the builder ``(daily, ctx) -> DataFrame`` indexed ``[symbol, session]`` (exactly ``ctx.symbols`` x
+``ctx.sessions``, float columns, every column carrying the prefix), whether it needs a sector map, and the context
+symbols it needs loaded (``build_features`` adds them, the caller does not assemble ETF lists); every group registers
+itself the same way. Every column is scale-free (log returns, ratios, ATR multiples, z-scores), never a
 price level.
 """
 from __future__ import annotations
@@ -1389,17 +1394,19 @@ def analyst_targets(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.Dat
     """Group ``at_``: analyst PRICE TARGETS from ``price_target__<SYM>.json`` only (``publishedDate``, ``analystCompany``,
     ``adjPriceTarget``); a row is public from the session AFTER its date part, windows ``[S - N days, S)``.
 
-    * ``at_target_gap``: mean ``adjPriceTarget`` of the 90-day window over the S close, minus 1 (clipped to [-5, 5]); NaN
-      when the window has no target. This is the group's coverage column;
+    * ``at_target_gap``: mean ``adjPriceTarget`` of the 90-day window over the S close, minus 1 (never clipped: a value
+      beyond ``MAX_TARGET_GAP`` refuses, see below); NaN when the window has no target (so it is NOT the group's coverage
+      column - ``at_n_analysts_90`` is);
     * ``at_target_rev_30``: that 90-day mean over the same mean as seen 30 CALENDAR days earlier, minus 1 (NaN unless both
       instants are covered and have a target);
-    * ``at_n_analysts_90``: distinct ``analystCompany`` in the window (two targets of one company count once);
+    * ``at_n_analysts_90``: distinct ``analystCompany`` in the window (two targets of one company count once); the group's
+      coverage column;
     * ``at_covered``: 1 from max(the file's first row, ``PRICE_TARGET_VENDOR_START``) + ``COVERAGE_WARMUP_DAYS``: the feed
       onboards symbols over time, so every file is treated as capped at its own first row; always 0 for an empty file.
 
     Before coverage every column but the flag is NaN; an empty window after it is 0 names and no gap (``at_n_analysts_90`` is
     the availability measure; the gap is NaN where no target was published, which is information, not a hole). A gap beyond
-    ``MAX_TARGET_GAP`` refuses (naming symbol and date), and so does a revision beyond it; the pre-screen (``screen_symbols``)
+    ``MAX_TARGET_GAP`` refuses (naming symbol and date; it is never clipped), and so does a revision beyond it; the pre-screen (``screen_symbols``)
     finds both so a bad symbol is listed as refused instead of aborting the build. A missing file refuses."""
     frames = {sym: _targets_one(ctx, sym, daily[sym]["close"].to_numpy(dtype="float64")) for sym in ctx.symbols}
     return pd.concat(frames, names=_INDEX_NAMES).astype("float64")

@@ -28,7 +28,10 @@ Five structural lessons drive this design:
   - **Timing:** decide when to be in or out. The instruments are SPY, QQQ, IWM, DIA, SMH, the 11 sector ETFs and the
     MAG7 singly. TLT and GLD serve as cross-asset features. All of them are cached in daily and 5-minute bars.
 - **Universe.**
-  - Develop on NDQ30.
+  - Develop on NDQ30. **NDQ30 is a hindsight-selected list:** the thirty names are today's Nasdaq leaders, chosen
+    in 2026 for having grown into them, so every NDQ30 result carries a survivor and winner bias that no
+    point-in-time rule removes (it is in which names are studied, not in any row's value). Read an NDQ30 result as
+    "does the signal exist at all", never as an expected return.
   - Scale survivors to large caps: each day's top ~300 by market cap and liquidity, from the cached screener store.
   - **Survivorship bias, accepted by the owner on 2026-10-28:**
     - The store is point-in-time in time but survivor-only in membership. TWTR, ATVI, SIVB, FRC, CELG, XLNX and VMW
