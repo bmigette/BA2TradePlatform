@@ -11,6 +11,9 @@ import {
   dailySummary,
   hydrateDailyState,
   isDailySource,
+  panelFeaturesPayload,
+  timeframeChangeSelections,
+  createdNotice,
   storedUniverseSize,
   toggleDailyGroup,
   validateDailySource,
@@ -142,5 +145,29 @@ describe('notes about the universe and the mask', () => {
     const m = DAILY_GROUP_OPTIONS.find((o) => o.id === 'm')!;
     expect(m.desc).toMatch(/breadth/);
     expect(m.desc).toMatch(/5 tickers/);
+  });
+});
+
+describe('panel_features payload, timeframe changes and the created notice', () => {
+  it('sends an empty panel_features list for the daily source so an inherited intraday list is not kept', () => {
+    expect(panelFeaturesPayload('alpaca_hist', '1d', ['daily'])).toEqual([]);
+    expect(panelFeaturesPayload('alpaca_hist', '1h', ['daily', 'market'])).toEqual(['daily', 'market']);
+    expect(panelFeaturesPayload('yfinance', '1d', ['daily'])).toBeUndefined();
+  });
+
+  it('keeps the feature selections consistent with the timeframe picked in the select', () => {
+    const intraday = { panelFeatures: ['daily'], dailyGroups: [] as string[] };
+    expect(timeframeChangeSelections('alpaca_hist', '1d', intraday)).toEqual({ panelFeatures: [], dailyGroups: ['t'] });
+    const daily = { panelFeatures: [] as string[], dailyGroups: ['t', 'm'] };
+    expect(timeframeChangeSelections('alpaca_hist', '1h', daily)).toEqual({ panelFeatures: [], dailyGroups: [] });
+    expect(timeframeChangeSelections('alpaca_hist', '1d', daily)).toEqual(daily);
+    expect(timeframeChangeSelections('yfinance', '1d', intraday)).toEqual(intraday);
+  });
+
+  it('turns the warnings of a created dataset into one notice', () => {
+    expect(createdNotice({ id: 3, warnings: ['a', 'b'] })).toBe('a b');
+    expect(createdNotice({ id: 3, warnings: [] })).toBeNull();
+    expect(createdNotice({ id: 3 })).toBeNull();
+    expect(createdNotice(null)).toBeNull();
   });
 });

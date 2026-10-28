@@ -411,7 +411,10 @@ const Datasets: React.FC = () => {
       <DatasetWizard
         isOpen={isWizardOpen}
         onClose={handleWizardClose}
-        onComplete={fetchDatasets}
+        onComplete={(notice) => {
+          fetchDatasets();
+          if (notice) setToast({ message: notice, type: 'warning' });
+        }}
         mode={wizardMode}
         initialData={selectedDataset}
       />

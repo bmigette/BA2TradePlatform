@@ -153,3 +153,32 @@ export function duplicateUniverseNote(
     `their ${universe.length} tickers`
   );
 }
+
+/** `panel_features` of the create / batch / edit calls: the intraday list for the intraday cache, an EMPTY list for the daily
+ *  store (so an intraday list inherited by an edited dataset is not kept), nothing for another provider. */
+export function panelFeaturesPayload(provider: string, timeframe: string, panelFeatures: string[]): string[] | undefined {
+  if (provider !== ALPACA_HIST_PROVIDER) return undefined;
+  return isDailySource(provider, timeframe) ? [] : panelFeatures;
+}
+
+/** The feature selections after the timeframe select of step 1 was changed: the cache's timeframe tells the intraday panel
+ *  and the daily store apart, so the selection of the source left behind is cleared (and the daily store starts with the
+ *  technical group) instead of the radio of step 2 jumping to a source with nothing selected. */
+export function timeframeChangeSelections(
+  provider: string,
+  timeframe: string,
+  current: { panelFeatures: string[]; dailyGroups: string[] },
+): { panelFeatures: string[]; dailyGroups: string[] } {
+  if (provider !== ALPACA_HIST_PROVIDER) return current;
+  if (isDailySource(provider, timeframe)) {
+    return { panelFeatures: [], dailyGroups: current.dailyGroups.length > 0 ? current.dailyGroups : ['t'] };
+  }
+  return { panelFeatures: current.panelFeatures, dailyGroups: [] };
+}
+
+/** The `warnings` the API returns with a created dataset (a duplicate that widened a daily universe) as one line, or null. */
+export function createdNotice(created: unknown): string | null {
+  const warnings = (created as { warnings?: unknown } | null)?.warnings;
+  if (!Array.isArray(warnings) || warnings.length === 0) return null;
+  return warnings.map(String).join(' ');
+}

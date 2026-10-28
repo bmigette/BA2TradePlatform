@@ -9,6 +9,9 @@ import {
   DAILY_UNIVERSE_HELP,
   breadthNote,
   duplicateUniverseNote,
+  createdNotice,
+  panelFeaturesPayload,
+  timeframeChangeSelections,
   allowedTimeframes,
   dailyPayload,
   dailySummary,
@@ -41,7 +44,8 @@ interface InitialDataset {
 interface DatasetWizardProps {
   isOpen: boolean;
   onClose: () => void;
-  onComplete: () => void;
+  /** `notice`: something the user should know about what was created (shown by the page as a warning, not blocking) */
+  onComplete: (notice?: string) => void;
   mode?: WizardMode;
   initialData?: InitialDataset | null;
 }
@@ -671,7 +675,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
             start_date: wizardData.startDate || undefined,
             end_date: wizardData.endDate || undefined,
             data_provider: wizardData.dataProvider,
-            panel_features: wizardData.dataProvider === ALPACA_HIST_PROVIDER && !isDailySource(wizardData.dataProvider, wizardData.timeframe) ? wizardData.panelFeatures : undefined,
+            panel_features: panelFeaturesPayload(wizardData.dataProvider, wizardData.timeframe, wizardData.panelFeatures),
             ...dailyPayload(wizardData.dataProvider, wizardData.timeframe, { groups: wizardData.dailyGroups, minShare: wizardData.dailyMinShare }),
             technical_indicators: technicalIndicators,
             sentiment_config: sentimentConfig,
@@ -690,7 +694,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
             start_date: wizardData.startDate || undefined,
             end_date: wizardData.endDate || undefined,
             data_provider: wizardData.dataProvider,
-            panel_features: wizardData.dataProvider === ALPACA_HIST_PROVIDER && !isDailySource(wizardData.dataProvider, wizardData.timeframe) ? wizardData.panelFeatures : undefined,
+            panel_features: panelFeaturesPayload(wizardData.dataProvider, wizardData.timeframe, wizardData.panelFeatures),
             ...dailyPayload(wizardData.dataProvider, wizardData.timeframe, { groups: wizardData.dailyGroups, minShare: wizardData.dailyMinShare }),
             technical_indicators: technicalIndicators,
             sentiment_config: sentimentConfig,
@@ -710,7 +714,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
             start_date: wizardData.startDate || undefined,
             end_date: wizardData.endDate || undefined,
             data_provider: wizardData.dataProvider,
-            panel_features: wizardData.dataProvider === ALPACA_HIST_PROVIDER && !isDailySource(wizardData.dataProvider, wizardData.timeframe) ? wizardData.panelFeatures : undefined,
+            panel_features: panelFeaturesPayload(wizardData.dataProvider, wizardData.timeframe, wizardData.panelFeatures),
             ...dailyPayload(wizardData.dataProvider, wizardData.timeframe, { groups: wizardData.dailyGroups, minShare: wizardData.dailyMinShare }),
             technical_indicators: technicalIndicators,
             sentiment_config: sentimentConfig,
@@ -725,13 +729,9 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         throw new Error(errorData.detail || `Failed to ${mode} dataset`);
       }
 
-      // a duplicate that widened a daily universe comes back with a warning: it must reach the user
+      // a duplicate that widened a daily universe comes back with a warning: the page shows it as a non-blocking banner
       const created = mode === 'duplicate' ? await response.json() : null;
-      if (created && Array.isArray(created.warnings) && created.warnings.length > 0) {
-        alert(created.warnings.join('\n'));
-      }
-
-      onComplete();
+      onComplete(createdNotice(created) ?? undefined);
       onClose();
 
       // Reset wizard
@@ -902,6 +902,10 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
             timeframe: e.target.value,
             // indicators are computed on the dataset timeframe: keep their names in step with it
             indicators: repinIndicators(wizardData.indicators, e.target.value),
+            // the cache's timeframe tells its intraday panel and its daily store apart: keep the selections of the
+            // source the select moves to (no radio jump to a source with nothing selected)
+            ...timeframeChangeSelections(wizardData.dataProvider, e.target.value,
+              { panelFeatures: wizardData.panelFeatures, dailyGroups: wizardData.dailyGroups }),
           })}
           className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-100"
         >
