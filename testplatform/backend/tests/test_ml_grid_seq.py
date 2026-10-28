@@ -1016,3 +1016,286 @@ def test_the_master_terminates_a_task_stuck_past_three_times_the_budget(world, t
         tsai_cell(world)).key
     done = G.read_results(out / "results.jsonl")
     assert [r["config"]["family"] for r in done] == ["tsai-minirocket"]       # the innocent task still finished
+
+
+# ---- 6. cancel, Ctrl-C, lanes
+class SnapshotPool(G.ProcessPoolExecutor):
+    """A real pool that remembers its worker processes and the keyword arguments it was built with."""
+    instances = []
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.kwargs = k
+        self.procs = []
+        SnapshotPool.instances.append(self)
+
+    def submit(self, *a, **k):
+        fu = super().submit(*a, **k)
+        self.procs = list(self._processes.values())
+        return fu
+
+
+def sleeping_task(cfg, seed, key):
+    _real_time.sleep(300)
+
+
+def test_cancelling_terminates_the_workers_instead_of_leaving_a_stuck_task_running(world, tmp_path, monkeypatch):
+    SnapshotPool.instances = []
+    monkeypatch.setattr(G, "ProcessPoolExecutor", SnapshotPool)
+    t0 = _real_time.time()
+    out = tmp_path / "o"
+    res = grun([lgbm_cell(world)], out, world, inline=False, cpu_slots=1, task_fn=sleeping_task,
+               cancel_check=lambda: _real_time.time() - t0 > 6)
+    assert res["cancelled"] and _real_time.time() - t0 < 90
+    procs = [p for pool in SnapshotPool.instances for p in pool.procs]
+    assert procs
+    for p in procs:
+        p.join(20)
+        assert not p.is_alive()                                                # killed, not left sleeping for 300 s
+
+
+def test_a_master_failure_terminates_the_workers_too(world, tmp_path, monkeypatch):
+    SnapshotPool.instances = []
+    monkeypatch.setattr(G, "ProcessPoolExecutor", SnapshotPool)
+
+    def boom_finish(*a, **k):
+        raise OSError("disk full")
+    t0 = _real_time.time()
+    cells = [lgbm_cell(world), lgbm_cell(world, train_months=24)]
+    monkeypatch.setattr(G, "_append", lambda *a, **k: boom_finish())
+    with pytest.raises(OSError):
+        grun(cells, tmp_path / "o", world, inline=False, cpu_slots=2, task_fn=quick_task)
+    for p in [p for pool in SnapshotPool.instances for p in pool.procs]:
+        p.join(20)
+        assert not p.is_alive()
+    assert _real_time.time() - t0 < 90
+
+
+def quick_task(cfg, seed, key):
+    return slow_or_quick_task({**cfg, "family": "lgbm"}, seed, key)
+
+
+class _Lane:
+    """A fake ``_drive_pool``: calls ``finish`` for its rows and loops until it is told to stop."""
+
+    def __init__(self, name, rows=0, fail_after=None, error=None):
+        self.name, self.rows, self.fail_after, self.error = name, rows, fail_after, error
+        self.exited = False
+        self.saw_stop = False
+
+    def __call__(self, tasks, slots, init_args, task_fn, finish, cancelled, summary, *a, **k):
+        try:
+            summary["pool_rebuilds"] = 1
+            for i in range(self.rows):
+                finish({"cell_key": self.name, "seed": i, "primary": {"name": "x", "value": 1.0}})
+            if self.fail_after is not None:
+                _real_time.sleep(self.fail_after)
+                raise self.error
+            while not cancelled():
+                _real_time.sleep(0.01)
+            self.saw_stop = True
+        finally:
+            _real_time.sleep(0.2)                                              # a lane takes a moment to wind down
+            self.exited = True
+
+
+def _lane_tasks(world):
+    return _cells(world)
+
+
+def test_finish_calls_from_both_lanes_never_overlap(world, monkeypatch):
+    cpu_t, gpu_t = _lane_tasks(world)
+    state = {"active": 0, "max": 0, "calls": 0}
+
+    def finish(r):
+        state["active"] += 1
+        state["max"] = max(state["max"], state["active"])
+        _real_time.sleep(0.0005)
+        state["calls"] += 1
+        state["active"] -= 1
+    monkeypatch.setattr(G, "_drive_pool", lambda tasks, *a, **k: _finishing_lane(tasks, *a, **k))
+    summary = {"pool_rebuilds": 0, "cancelled": False}
+    G._drive_lanes(cpu_t, gpu_t, 1, 1, (), None, finish, lambda: False, summary)
+    assert state["calls"] == 300 and state["max"] == 1 and summary["pool_rebuilds"] == 2
+
+
+def _finishing_lane(tasks, slots, init_args, task_fn, finish, cancelled, summary, *a, **k):
+    summary["pool_rebuilds"] = 1
+    for i in range(150):
+        finish({"cell_key": tasks[0][0].pool, "seed": i, "primary": {"name": "x", "value": 1.0}})
+
+
+def test_ctrl_c_waits_for_the_lanes_to_wind_down_before_it_propagates(world, monkeypatch):
+    cpu_t, gpu_t = _lane_tasks(world)
+    lanes = {"cpu": _Lane("cpu"), "gpu": _Lane("gpu")}
+    monkeypatch.setattr(G, "_drive_pool", lambda tasks, *a, **k: lanes[tasks[0][0].pool](tasks, *a, **k))
+    real_join = G.threading.Thread.join
+    n = {"calls": 0}
+
+    def join(self, timeout=None):
+        n["calls"] += 1
+        if n["calls"] == 1:
+            raise KeyboardInterrupt
+        return real_join(self, timeout)
+    monkeypatch.setattr(G.threading.Thread, "join", join)
+    with pytest.raises(KeyboardInterrupt):
+        G._drive_lanes(cpu_t, gpu_t, 1, 1, (), None, lambda r: None, lambda: False, {"pool_rebuilds": 0})
+    assert all(l.exited and l.saw_stop for l in lanes.values())               # both lanes were stopped and joined
+
+
+def test_a_lane_that_exits_mid_run_stops_the_other_keeps_its_rows_and_is_re_raised(world, monkeypatch, caplog):
+    cpu_t, gpu_t = _lane_tasks(world)
+    lanes = {"cpu": _Lane("cpu", rows=5), "gpu": _Lane("gpu", fail_after=0.3, error=OSError("disk full"))}
+    monkeypatch.setattr(G, "_drive_pool", lambda tasks, *a, **k: lanes[tasks[0][0].pool](tasks, *a, **k))
+    rows = []
+    with caplog.at_level("ERROR"):
+        with pytest.raises(OSError, match="disk full"):
+            G._drive_lanes(cpu_t, gpu_t, 1, 1, (), None, rows.append, lambda: False, {"pool_rebuilds": 0})
+    assert len(rows) == 5 and lanes["cpu"].saw_stop and lanes["cpu"].exited and lanes["gpu"].exited
+
+
+def test_every_lane_error_is_kept_not_only_the_first(world, monkeypatch, caplog):
+    cpu_t, gpu_t = _lane_tasks(world)
+    lanes = {"cpu": _Lane("cpu", fail_after=0.2, error=ValueError("cpu lane broke")),
+             "gpu": _Lane("gpu", fail_after=0.25, error=OSError("gpu lane broke"))}
+    monkeypatch.setattr(G, "_drive_pool", lambda tasks, *a, **k: lanes[tasks[0][0].pool](tasks, *a, **k))
+    with caplog.at_level("ERROR"):
+        with pytest.raises(Exception) as e:
+            G._drive_lanes(cpu_t, gpu_t, 1, 1, (), None, lambda r: None, lambda: False, {"pool_rebuilds": 0})
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "cpu lane broke" in text and "gpu lane broke" in text                 # both are in the log
+    notes = " ".join(getattr(e.value, "__notes__", []))
+    assert ("gpu lane broke" in notes) != ("cpu lane broke" in notes) or len(e.value.__notes__) == 1
+
+
+def test_prediction_files_are_written_through_a_temp_name_with_the_pid_and_never_left_behind(world, tmp_path,
+                                                                                            monkeypatch):
+    seen = []
+    real = G.os.replace
+    monkeypatch.setattr(G.os, "replace", lambda a, b: (seen.append(Path(a).name), real(a, b))[1])
+    out = tmp_path / "o"
+    grun([lgbm_cell(world)], out, world)
+    assert any(str(os.getpid()) in n and n.endswith(".tmp") and ".parquet" in n for n in seen)
+    assert not list((out / "predictions").glob("*.tmp"))
+    out2 = tmp_path / "o2"
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", lambda self, *a, **k: (_ for _ in ()).throw(OSError("full")))
+    res = grun([lgbm_cell(world)], out2, world, task_fn=lambda cfg, seed, key: G._run_task(cfg, seed, key))
+    assert res["errors"] == 1 and not list((out2 / "predictions").glob("*.tmp"))
+
+
+# ---- worker memory, pool settings
+def test_a_gpu_worker_keeps_one_intraday_panel_and_does_not_pin_evicted_daily_panels(world):
+    import gc
+    import weakref
+    assert S.INTRADAY_CACHE_SIZE == 1
+    st = _gsettings()
+    panel = G.load_panel(str(world[0]), tuple(sorted(GSYMS)), "selection", str(world[2]))
+    ip = S.get_intraday(panel, st)
+    ip.eod_rows(panel), ip.daily_of(panel)
+    ref = weakref.ref(panel)
+    del panel
+    gc.collect()
+    assert ref() is None                                                       # the intraday panel does not keep it alive
+
+
+def test_the_gpu_pool_is_built_with_one_task_per_slot_retirement_and_a_hard_deadline(world, tmp_path, monkeypatch):
+    SnapshotPool.instances = []
+    monkeypatch.setattr(G, "ProcessPoolExecutor", SnapshotPool)
+    seen = {}
+    real = G._drive_pool
+
+    def spy(tasks, slots, init_args, task_fn, finish, cancelled, summary, **k):
+        seen[tasks[0][0].pool] = k
+        return real(tasks, slots, init_args, task_fn, finish, cancelled, summary, **k)
+    monkeypatch.setattr(G, "_drive_pool", spy)
+    grun([lgbm_cell(world), tsai_cell(world)], tmp_path / "o", world, inline=False, cpu_slots=1, gpu_slots=1,
+         task_fn=slow_or_quick_task_ok, settings=_gsettings(gpu_budget_minutes=2.0))
+    assert seen["cpu"] == {}
+    assert seen["gpu"] == {"deadline": 3 * 2.0 * 60, "window_factor": 1, "max_tasks_per_child": G.GPU_MAX_TASKS_PER_CHILD}
+    assert G.GPU_MAX_TASKS_PER_CHILD == 40
+    kws = [pool.kwargs for pool in SnapshotPool.instances]
+    assert sorted("max_tasks_per_child" in k for k in kws) == [False, True]
+    assert [k["max_tasks_per_child"] for k in kws if "max_tasks_per_child" in k] == [40]
+
+
+def slow_or_quick_task_ok(cfg, seed, key):
+    return slow_or_quick_task({**cfg, "family": "x"}, seed, key)
+
+
+def test_only_the_first_generation_of_workers_is_staggered():
+    import multiprocessing
+    counter = multiprocessing.get_context("spawn").Value("i", 0)
+    st = _gsettings()
+    seen = []
+    for _ in range(5):                                                         # 2 workers, then 3 replacements
+        G._init_worker(st.to_dict(), "c", "o", 1, counter, 2)
+        seen.append(G._WORKER["index"])
+    assert seen == [0, 1, 0, 0, 0]
+    counter2 = multiprocessing.get_context("spawn").Value("i", 0)
+    seen = []
+    for _ in range(3):                                                         # without the pool size: as before
+        G._init_worker(st.to_dict(), "c", "o", 1, counter2)
+        seen.append(G._WORKER["index"])
+    assert seen == [0, 1, 2]
+
+
+# ---- duplication
+def test_the_intraday_span_reads_each_cache_file_once(world, monkeypatch):
+    panel = G.get_panel(str(world[0]), tuple(sorted(GSYMS)), "selection", str(world[2]))
+    S._file_span.cache_clear()
+    calls = []
+    real = pd.read_parquet
+    monkeypatch.setattr(S.pd, "read_parquet", lambda *a, **k: (calls.append(k.get("columns")), real(*a, **k))[1])
+    a = S.intraday_span(panel, _gsettings())
+    n = len(calls)
+    assert n == len(GSYMS) + 2                                                  # the symbols + SPY + QQQ, one read each
+    assert S.intraday_span(panel, _gsettings()) == a and len(calls) == n
+
+
+def test_the_robust_scaling_is_one_shared_helper(world):
+    from app.services import ml_search
+    col = np.array([1.0, 2.0, 2.5, np.nan, 40.0, 3.0])
+    med, iqr = ml_search.robust_center_scale(col)
+    assert med == pytest.approx(np.nanmedian(col))
+    q75, q25 = np.nanpercentile(col, [75, 25])
+    assert iqr == pytest.approx(q75 - q25)
+    flat = ml_search.robust_center_scale(np.array([3.0, 3.0, 3.0]))
+    assert flat[0] == 3.0 and flat[1] == pytest.approx(1e-12)                   # no spread: the std (0) + 1e-12
+    nan = ml_search.robust_center_scale(np.array([np.nan, np.nan]))
+    assert np.isnan(nan[0]) and np.isnan(nan[1])
+    panel = _daily_panel(world)
+    cols = panel.group_columns(("t",))
+    fit = np.flatnonzero(panel.ok)[:600]
+    data = S.daily_sequence_data(panel, cols, fit, 10, 5)
+    X = panel.X[:, cols]
+    for j in range(len(cols)):
+        m, i = ml_search.robust_center_scale(X[fit, j].astype(np.float64))
+        assert data.scaler["median"][j] == pytest.approx(m) and data.scaler["iqr"][j] == pytest.approx(i)
+    frame = pd.DataFrame(X[:300], columns=[f"c{j}" for j in range(X.shape[1])])
+    frame["symbol"] = "A"
+    fd = ml_search.fold_data(frame, [f"c{j}" for j in range(X.shape[1])], np.arange(200), False)
+    m0, i0 = ml_search.robust_center_scale(X[:200, 0].astype(np.float64))
+    assert fd.scaler["median"][0] == pytest.approx(m0) and fd.scaler["iqr"][0] == pytest.approx(i0)
+
+
+# ---- help texts
+def test_the_help_texts_name_the_constants_and_the_two_pools(capsys):
+    import ba2test_launcher as L
+    from app.services import ml_grid_bounds as B
+    assert G.DATA_START == B.DATA_START and G.EVAL_END == B.EVAL_END and G.EVAL_START == B.EVAL_START
+    with pytest.raises(SystemExit):
+        L.main(["ml-grid", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert str(B.EVAL_END) in text and str(B.EVAL_START) in text and str(B.DATA_START) in text
+    assert "BOTH pools" in text and "total workers" in text
+
+
+def test_building_the_cli_help_does_not_import_the_grid_runner():
+    import subprocess
+    import sys
+    code = ("import sys; sys.path.insert(0, r'%s'); sys.path.insert(0, r'%s'); import ba2test_launcher as L\n"
+            "try:\n    L.main(['ml-grid', '--help'])\nexcept SystemExit:\n    pass\n"
+            "print('LOADED' if 'app.services.ml_grid' in sys.modules else 'LIGHT')"
+            % (str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parents[2])))
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=180)
+    assert out.stdout.strip().endswith("LIGHT"), out.stdout[-500:] + out.stderr[-500:]

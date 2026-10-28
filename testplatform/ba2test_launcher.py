@@ -9175,7 +9175,7 @@ def _ml_grid_eval_settings(args):
     neither is given. Dates must be ISO ``YYYY-MM-DD``, inside (DATA_START, EVAL_END] -- the evaluation starts after the
     history does and never past the last day of the data -- and the start before the end."""
     from datetime import date as _date
-    from app.services import ml_grid as _g
+    from app.services import ml_grid_bounds as _g
     raw = {"eval_start": getattr(args, "eval_start", None), "eval_end": getattr(args, "eval_end", None)}
     given, parsed = {}, {}
     for key, text in raw.items():
@@ -10166,13 +10166,17 @@ def main(argv: "list | None" = None) -> int:
     mg.add_argument("--rerun-mismatched", action="store_true",
                     help="Rows in --out/results.jsonl made under other settings or data are moved to results.stale.jsonl "
                          "and recomputed (default: refuse).")
+    from app.services import ml_grid_bounds as _bounds                      # stdlib-only: the help must not load the runner
     mg.add_argument("--eval-start", default=None, metavar="YYYY-MM-DD",
-                    help="First day of the out-of-sample evaluation (default 2019-01-01); after the data start, before --eval-end.")
+                    help=f"First day of the out-of-sample evaluation (default {_bounds.EVAL_START}); after the data start "
+                         f"({_bounds.DATA_START}) and before --eval-end.")
     mg.add_argument("--eval-end", default=None, metavar="YYYY-MM-DD",
-                    help="Last day of the evaluation (default and latest 2026-10-12).")
+                    help=f"Last day of the evaluation (default and latest {_bounds.EVAL_END}).")
     mg.add_argument("--retry-timeouts", action="store_true",
                     help="Run again the (cell, seed) tasks that timed out in an earlier run (default: skip them).")
-    mg.add_argument("--cores", type=int, default=None, help="Logical cores to share: n_jobs per fit = cores // cpu-slots (default: all).")
+    mg.add_argument("--cores", type=int, default=None,
+                    help="Logical cores to share between all workers of BOTH pools (cpu and gpu slots): n_jobs per "
+                         "fit = cores // total workers (default: all).")
 
     # ml-features: the point-in-time daily feature store of the ML exploration v2.
     mf = sub.add_parser("ml-features", help="Build the point-in-time daily feature store (ML exploration v2).")

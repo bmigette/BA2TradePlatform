@@ -55,7 +55,9 @@ import os
 import random
 import time
 import warnings
+import weakref
 from collections import OrderedDict
+from functools import lru_cache
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -68,14 +70,16 @@ from app.services import ml_grid as G
 from app.services import ml_models as M
 from app.services import ml_models_seq as MS
 from app.services import ml_panel as MP
+from app.services import ml_search
 from app.services import ml_targets as T
 
 logger = logging.getLogger(__name__)
 
 INTRADAY_TIMEFRAME = "1h"
 INTRADAY_GROUPS: Tuple[str, ...] = ("technical", "daily", "market")
-#: intraday panels (~1 GB for 20 symbols over 8 years of 1h bars with features) a worker keeps
-INTRADAY_CACHE_SIZE = 2
+#: intraday panels (~1 GB for 20 symbols over 8 years of 1h bars with features) a worker keeps: ONE (a GPU worker runs
+#: one cell at a time, and tasks are grouped by panel)
+INTRADAY_CACHE_SIZE = 1
 
 
 # ================================================================== failures on the GPU
@@ -132,31 +136,40 @@ class IntradayPanel:
     first_day: date
     last_day: date
     seconds: float
-    _eod: Optional[Tuple[Any, np.ndarray]] = None
-    _daily_of: Optional[Tuple[Any, np.ndarray]] = None
+    # the arrays below belong to ONE daily panel, held WEAKLY: an evicted daily panel must be freeable (~100-200 MB)
+    _eod: Optional[Tuple["weakref.ref", np.ndarray]] = None
+    _daily_of: Optional[Tuple["weakref.ref", np.ndarray]] = None
 
     def eod_rows(self, panel: "G.Panel") -> np.ndarray:
         """Per row of the daily ``panel``: the positional row of its (symbol, session) end-of-day bar here, -1 when the
         intraday panel has none (before its first day, or a missing session)."""
-        if self._eod is None or self._eod[0] is not panel:
+        if self._eod is None or self._eod[0]() is not panel:
             e = self.df.loc[self.df["is_eod"], ["symbol", "session"]]
             key = pd.MultiIndex.from_arrays([e["symbol"].to_numpy(), pd.to_datetime(e["session"].to_numpy())],
                                             names=["symbol", "session"])
             ser = pd.Series(e.index.to_numpy(dtype=np.int64), index=key)
-            self._eod = (panel, ser.reindex(panel.index).fillna(-1).to_numpy(dtype=np.int64))
+            self._eod = (weakref.ref(panel), ser.reindex(panel.index).fillna(-1).to_numpy(dtype=np.int64))
         return self._eod[1]
 
     def daily_of(self, panel: "G.Panel") -> np.ndarray:
         """Per row of this panel: the row of the daily ``panel`` of its (symbol, session), -1 when there is none."""
-        if self._daily_of is None or self._daily_of[0] is not panel:
+        if self._daily_of is None or self._daily_of[0]() is not panel:
             key = pd.MultiIndex.from_arrays([self.df["symbol"].to_numpy(),
                                              pd.to_datetime(self.df["session"].to_numpy())],
                                             names=["symbol", "session"])
-            self._daily_of = (panel, panel.index.get_indexer(key).astype(np.int64))
+            self._daily_of = (weakref.ref(panel), panel.index.get_indexer(key).astype(np.int64))
         return self._daily_of[1]
 
 
 _INTRADAY: "OrderedDict[Tuple, IntradayPanel]" = OrderedDict()
+
+
+@lru_cache(maxsize=256)
+def _file_span(path: str, size: int, mtime_ns: int) -> Tuple[date, date]:
+    """(first, last) day of the bars of one 5-minute cache file, cached on its size and mtime: the span is asked for at
+    every block, the files are read once."""
+    dates = pd.read_parquet(path, columns=["Date"])["Date"]
+    return dates.min().date(), dates.max().date()
 
 
 def intraday_span(panel: "G.Panel", st: "G.GridSettings") -> Tuple[date, date, Tuple]:
@@ -166,10 +179,11 @@ def intraday_span(panel: "G.Panel", st: "G.GridSettings") -> Tuple[date, date, T
     firsts, lasts, stamps = [], [], []
     for s in names:
         f = MP._cache_file(Path(panel.cache_root), s)                  # PanelDataError when the cache lacks the symbol
-        dates = pd.read_parquet(f, columns=["Date"])["Date"]
-        firsts.append(dates.min().date())
-        lasts.append(dates.max().date())
-        stamps.append((s, f.stat().st_size, f.stat().st_mtime_ns))
+        stat = f.stat()
+        first_s, last_s = _file_span(str(f), stat.st_size, stat.st_mtime_ns)
+        firsts.append(first_s)
+        lasts.append(last_s)
+        stamps.append((s, stat.st_size, stat.st_mtime_ns))
     last = min(min(lasts), st.eval_end, panel.sessions.max().date())
     return max(firsts), last, tuple(stamps)
 
@@ -216,13 +230,10 @@ def daily_sequence_data(panel: "G.Panel", cols: List[int], fit_rows: np.ndarray,
     decidable at the session (``market_neutral_returns``): a common market shock then leaves it unchanged."""
     X = panel.X[:, cols].astype(np.float32)
     fit = X[np.asarray(fit_rows, dtype=np.int64)].astype(np.float64)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)               # an all-NaN column in the fit rows: neutral channel
-        med = np.nanmedian(fit, axis=0)
-        q75, q25 = np.nanpercentile(fit, [75, 25], axis=0)
-        sd = np.nanstd(fit, axis=0)
-    iqr = np.where(q75 - q25 > 1e-12, q75 - q25, sd + 1e-12)
-    med = np.where(np.isfinite(med), med, 0.0)
+    med, iqr = np.empty(X.shape[1]), np.empty(X.shape[1])
+    for j in range(X.shape[1]):
+        med[j], iqr[j] = ml_search.robust_center_scale(fit[:, j])
+    med = np.where(np.isfinite(med), med, 0.0)                         # an all-NaN column: a neutral channel
     iqr = np.where(np.isfinite(iqr) & (iqr > 0), iqr, 1.0)
     X = np.clip((X - med.astype(np.float32)) / iqr.astype(np.float32), -5, 5)
     X = np.nan_to_num(X, nan=0.0, posinf=5.0, neginf=-5.0).astype(np.float32)

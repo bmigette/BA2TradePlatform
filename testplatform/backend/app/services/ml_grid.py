@@ -146,7 +146,7 @@ STORE_ORDER: Tuple[str, ...] = ("stocks", "etf")
 LOW_ITER = 3
 #: families without randomness (``ml_models``): their seed std is 0 by construction, which is NOT robustness
 DETERMINISTIC_FAMILIES: Tuple[str, ...] = ("naive", "linear")
-EVAL_START, EVAL_END, DATA_START = date(2019, 1, 1), date(2026, 10, 12), date(2016, 1, 4)
+from app.services.ml_grid_bounds import DATA_START, EVAL_END, EVAL_START          # noqa: E402  (stdlib-only module)
 
 
 # ================================================================== settings
@@ -1225,9 +1225,12 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
     if pred_dir is not None:
         pred_dir.mkdir(parents=True, exist_ok=True)
         final = pred_dir / f"{cell.key}_{seed}.parquet"
-        tmp = final.with_suffix(".tmp")
-        stored.to_parquet(tmp, index=False, compression="zstd")
-        os.replace(tmp, final)
+        tmp = final.with_name(f"{final.name}.{os.getpid()}.tmp")           # unique per process: no two writers share one
+        try:
+            stored.to_parquet(tmp, index=False, compression="zstd")
+            os.replace(tmp, final)
+        finally:
+            tmp.unlink(missing_ok=True)
     ev = evaluate(pred, cell, st)
     row.update({"status": "ok", "n_rows": int(len(pred)), "primary": ev["primary"], "metrics": ev["metrics"],
                 "regimes": ev["regimes"], "controls": ev["controls"]})
