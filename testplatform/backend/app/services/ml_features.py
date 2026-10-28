@@ -37,6 +37,8 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tupl
 import numpy as np
 import pandas as pd
 
+from ba2_providers.macro import fred_series as fs
+
 from app.services import ml_universe
 from app.services.ml_panel import PanelDataError, ema, regular_sessions, true_range, wilder
 
@@ -580,12 +582,105 @@ def cross_section(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataF
     return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
 
 
+# ------------------------------------------------------------------------------------------ group MAC (FRED)
+#: FRED series of group MAC and how the "level" column is defined: ``lvl`` the series itself (percent / index points),
+#: ``yoy`` the year-over-year change of the first-release level (CPI), ``3m`` its 3-month change (payrolls)
+MAC_SERIES: Dict[str, str] = {"VIXCLS": "lvl", "DGS10": "lvl", "DGS3MO": "lvl", "T10Y3M": "lvl", "BAA10Y": "lvl",
+                              "CPIAUCSL": "yoy", "PAYEMS": "3m", "UNRATE": "lvl"}
+MAC_COLUMNS: Tuple[str, ...] = tuple(
+    f"mac_{sid.lower()}_{suffix}" for sid, kind in MAC_SERIES.items() for suffix in (kind, "chg20", "z252"))
+#: Sessions of history the 20-session change and the 252-session z-score need before the first built session
+#: (calendar days; 460 is ~316 sessions), so those columns are defined from the first session on.
+_MAC_HISTORY_DAYS = 460
+_BEFORE_FIRST_VINTAGE = "on or before the series' first recorded vintage"
+
+
+def _macro_value(series: pd.Series, kind: str) -> float:
+    """The transformed level from the observations visible at a session (``series``: obs date -> first-release value)."""
+    if series.empty:
+        return np.nan
+    last, v = series.index[-1], float(series.iloc[-1])
+    if kind == "lvl":
+        return v
+    months = 12 if kind == "yoy" else 3
+    prior = last - pd.DateOffset(months=months)
+    if prior not in series.index:
+        return np.nan
+    return v / float(series.loc[prior]) - 1.0
+
+
+def macro_levels(series_id: str, sessions: pd.DatetimeIndex) -> pd.Series:
+    """The ``MAC_SERIES`` level of ``series_id`` as a decision at each session's close sees it.
+
+    One ``fred_series.get_series_as_of`` call per session, always offline (``hermetic_fmp_history``: a missing or old
+    cache raises ``MacroAvailabilityUnknown`` instead of fetching). ``as_of`` is the session DATE at midnight UTC,
+    which is the platform's DAILY-bar convention (``fred_series.decision_label``): bar D decides on D's close and
+    fills at the next session's open, so it sees every observation whose first release (ALFRED ``realtime_start``)
+    is before the next session, i.e. up to and including D. NEVER the observation date plus a lag. (An as_of of D's
+    close INSTANT would map to the label D itself and hide everything released on D.)
+
+    DGS3MO is the one series the cache stores without release dates (observation-date format, "same-day" by design for
+    the option rate). Its observation of day D is published after D's close, so it is read one session later: the
+    value for session S is the observation of the previous session.
+
+    A session whose decision label is on or before the series' first recorded vintage is NaN (nothing provable is
+    public yet); every other refusal propagates."""
+    from ba2_providers.fmp_common import hermetic_fmp_history
+
+    sessions = pd.DatetimeIndex(sessions)
+    kind = MAC_SERIES[series_id]
+    same_day = fs.SERIES_SPEC[series_id]["availability"] != fs.AVAIL_FIRST_RELEASE
+    if same_day:
+        first = sessions[0].date()
+        prev0 = regular_sessions(first - pd.Timedelta(days=10), first - pd.Timedelta(days=1))["session"].iloc[-1]
+        as_of_days = [pd.Timestamp(prev0)] + list(sessions[:-1])
+    else:
+        as_of_days = list(sessions)
+    out = np.full(len(sessions), np.nan)
+    with hermetic_fmp_history():
+        for i, day in enumerate(as_of_days):
+            try:
+                visible = fs.get_series_as_of(series_id, pd.Timestamp(day).tz_localize("UTC"))
+            except fs.MacroAvailabilityUnknown as e:
+                if _BEFORE_FIRST_VINTAGE in str(e):
+                    continue
+                raise
+            out[i] = _macro_value(visible, kind)
+    return pd.Series(out, index=sessions, name=series_id)
+
+
+def macro(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
+    """Group ``mac_``: the macro backdrop, FRED first releases as of each session's close (see ``macro_levels``).
+
+    Per series (``MAC_SERIES``): ``mac_<id>_<lvl|yoy|3m>`` the level, ``mac_<id>_chg20`` its 20-session change,
+    ``mac_<id>_z252`` its z-score over the last 252 sessions of as-of levels. The value is the same for every symbol
+    on a session. The levels of the sessions before the first built one are computed too (``_MAC_HISTORY_DAYS``), so
+    the change and the z-score never depend on where the build's session grid starts.
+
+    FRED's cache folder must be the build's ``cache_root`` (the reader has one global folder): a different one
+    refuses rather than reading another cache."""
+    if Path(fs.CACHE_FOLDER).resolve() != Path(ctx.cache_root).resolve():
+        raise PanelDataError(f"group mac reads FRED from {fs.CACHE_FOLDER}, not from cache_root {ctx.cache_root}")
+    first = (ctx.sessions[0] - pd.Timedelta(days=_MAC_HISTORY_DAYS)).date()
+    grid = _sessions_index(first, ctx.sessions[-1].date())
+    cols: Dict[str, pd.Series] = {}
+    for sid, kind in MAC_SERIES.items():
+        lvl = macro_levels(sid, grid)
+        name = f"mac_{sid.lower()}"
+        cols[f"{name}_{kind}"] = lvl
+        cols[f"{name}_chg20"] = lvl - lvl.shift(20)
+        cols[f"{name}_z252"] = (lvl - lvl.rolling(252, min_periods=252).mean()) / lvl.rolling(252, min_periods=252).std()
+    table = pd.DataFrame(cols)[list(MAC_COLUMNS)].reindex(ctx.sessions).astype("float64")
+    return pd.concat({sym: table for sym in ctx.symbols}, names=_INDEX_NAMES)
+
+
 #: group name -> spec. The name is the grid factor; the spec's prefix names its columns. Later tasks register here.
 GROUPS: Dict[str, GroupSpec] = {
     "t": GroupSpec(technical, "t_"),
     "mtf": GroupSpec(multi_timeframe, "mtf_"),
     "m": GroupSpec(market, "m_", needs_sector=True, required_context=_market_context),
     "x": GroupSpec(cross_section, "x_"),
+    "mac": GroupSpec(macro, "mac_"),
 }
 
 
