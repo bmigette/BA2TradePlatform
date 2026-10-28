@@ -521,15 +521,24 @@ M_COLUMNS: Tuple[str, ...] = (
     + ("m_breadth_sma50",))
 
 
-def _sector_etfs(symbols: Sequence[str], sector_of: Optional[Dict[str, str]]) -> Dict[str, str]:
-    """symbol -> its sector ETF. Refuses a missing map, a symbol without a sector and a sector outside SECTOR_ETF."""
+#: A sector value declaring that the symbol HAS NO sector (an index or a sector ETF): its ``m_rs_sector_*`` are NaN and no
+#: sector ETF is loaded for it. Anything else that is not in ``SECTOR_ETF`` still refuses.
+NO_SECTOR = "NO_SECTOR"
+
+
+def _sector_etfs(symbols: Sequence[str], sector_of: Optional[Dict[str, str]]) -> Dict[str, Optional[str]]:
+    """symbol -> its sector ETF (None for ``NO_SECTOR``). Refuses a missing map, a symbol without a sector and a sector
+    outside SECTOR_ETF."""
     if not sector_of:
         raise PanelDataError("group m needs sector_of (symbol -> sector); got none")
-    etf_of: Dict[str, str] = {}
+    etf_of: Dict[str, Optional[str]] = {}
     for sym in symbols:
         sector = sector_of[sym] if sym in sector_of else None
         if sector is None:
             raise PanelDataError(f"group m: no sector for {sym}")
+        if sector == NO_SECTOR:
+            etf_of[sym] = None
+            continue
         if sector not in SECTOR_ETF:
             raise PanelDataError(f"group m: unknown sector {sector!r} for {sym}; known {sorted(SECTOR_ETF)}")
         etf_of[sym] = SECTOR_ETF[sector]
@@ -537,7 +546,7 @@ def _sector_etfs(symbols: Sequence[str], sector_of: Optional[Dict[str, str]]) ->
 
 
 def _market_context(symbols: Sequence[str], sector_of: Optional[Dict[str, str]]) -> Set[str]:
-    return set(MARKET_ETFS) | set(_sector_etfs(symbols, sector_of).values())
+    return set(MARKET_ETFS) | {e for e in _sector_etfs(symbols, sector_of).values() if e is not None}
 
 
 def _log_ret(d: pd.DataFrame, n: int) -> pd.Series:
@@ -566,7 +575,7 @@ def market(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
     etf_of = _sector_etfs(ctx.symbols, ctx.sector_of)
     for e in MARKET_ETFS:
         _require(daily, e, "market series")
-    for e in sorted(set(etf_of.values())):
+    for e in sorted({e for e in etf_of.values() if e is not None}):
         _require(daily, e, "sector ETF")
     mk = pd.DataFrame(index=ctx.sessions)
     for e in MARKET_ETFS:
@@ -582,7 +591,7 @@ def market(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
         for n in _M_RS_DAYS:
             own = _log_ret(daily[sym], n)
             f[f"m_rs_spy_{n}"] = own - _log_ret(daily["SPY"], n)
-            f[f"m_rs_sector_{n}"] = own - _log_ret(daily[etf_of[sym]], n)
+            f[f"m_rs_sector_{n}"] = (np.nan if etf_of[sym] is None else own - _log_ret(daily[etf_of[sym]], n))
         f = f[list(M_COLUMNS)]
         f.loc[~daily[sym]["listed"].to_numpy(), :] = np.nan                 # no row before the symbol exists
         frames[sym] = f
@@ -653,7 +662,7 @@ def _sector_codes(ctx: BuildContext) -> Dict[str, float]:
     sectors.update(ctx.sector_overrides)
     out: Dict[str, float] = {}
     for sym in ctx.universe:
-        if sym not in sectors:
+        if sym not in sectors or sectors[sym] == NO_SECTOR:
             out[sym] = np.nan
         elif sectors[sym] not in SECTOR_CODE:
             raise PanelDataError(f"group x: sector {sectors[sym]!r} of {sym} is not in SECTOR_CODE; add it to SECTOR_CODE "
@@ -1471,6 +1480,12 @@ def _check_contract(group: str, spec: GroupSpec, cols: pd.DataFrame, ctx: BuildC
                              f"({int(inf.sum())} infinite values); refusing to turn it into NaN")
 
 
+def _nan_rates(out: pd.DataFrame, groups: Sequence[str]) -> Dict[str, float]:
+    """Share of LISTED rows that are NaN, per feature column of ``groups``."""
+    listed = out["listed"].to_numpy()
+    return {c: (float(out.loc[listed, c].isna().mean()) if listed.any() else 1.0) for c in feature_columns(out, groups)}
+
+
 def _membership_digest(membership: pd.DataFrame) -> str:
     h = hashlib.sha256()
     h.update(np.asarray(membership.index.values, dtype="datetime64[ns]").tobytes())
@@ -1659,7 +1674,7 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
     day = out.index.get_level_values("session")
     out = out[(day >= pd.Timestamp(first_day)) & (day <= pd.Timestamp(last_day))]
     listed = out["listed"].to_numpy()
-    nan_rate = {c: (float(out.loc[listed, c].isna().mean()) if listed.any() else 1.0) for c in feature_columns(out, groups)}
+    nan_rate = _nan_rates(out, groups)
     if any(g in groups for g in ("x", "f", "i")):
         st = ml_universe.scan_store(store_path)
         ctx.provenance["store"] = {"dir": str(store_path), "newest_scan": st.dates[-1], "fingerprint": st.fingerprint}
@@ -1751,6 +1766,175 @@ def apply_coverage_mask(df: pd.DataFrame, report: pd.DataFrame, min_share: float
         masked += [(g, y) for y in bad]
     out.attrs["coverage_masked"] = masked
     return out
+
+
+# ------------------------------------------------------------------------------------------ the store build
+ENSURE_VERSION = 1
+#: refusal reasons that can clear after a cache refresh; they are reported, never remembered as exclusions
+_TRANSIENT_MARKERS = ("stale series", "the metric store still lists it")
+_FMP_KINDS_BY_GROUP: Dict[str, Tuple[str, ...]] = {"f": _F_FILES, "a": ("analyst_grades", "price_target"), "i": ("insider_v2",)}
+
+
+def _fp_or_none(path: Path) -> Optional[Dict[str, object]]:
+    return _fingerprint(path) if path.exists() else None
+
+
+def _input_fingerprints(load: Sequence[str], rows: Sequence[str], groups: Sequence[str], cache_root: Path,
+                        store_path: Path) -> Dict[str, object]:
+    """Cheap (size, mtime) fingerprints of every source file the build reads: what ``ensure_feature_store`` compares to
+    decide whether the stored frame is still the one these inputs give."""
+    fp: Dict[str, object] = {"daily": {s: _fingerprint(_cache_file(cache_root, s)) for s in load}}
+    if "mac" in groups:
+        fp["fred"] = {sid: _fp_or_none(Path(fs.CACHE_FOLDER) / "fred" / f"{sid}.json") for sid in MAC_SERIES}
+    kinds = [k for g in groups for k in _FMP_KINDS_BY_GROUP.get(g, ())]
+    if kinds:
+        fp["fmp_history"] = {f"{k}__{s}": _fp_or_none(fmp_history_path(k, s, cache_root)) for s in rows for k in dict.fromkeys(kinds)}
+    if any(g in groups for g in ("x", "f", "i")):
+        fp["store"] = ml_universe.store_fingerprint(store_path)
+    if "s" in groups:
+        fp["market_conditions"] = {p: list(d) for p, d in S_MANIFESTS.items()}
+    return fp
+
+
+def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, last: date, groups: Sequence[str],
+                         membership: Optional[pd.DataFrame] = None, *, cache_root: Optional[Path] = None,
+                         chunk_size: int = 25, sector_of: Union[None, str, Dict[str, str]] = "store",
+                         sector_overrides: Optional[Dict[str, str]] = None, universe: Optional[Sequence[str]] = None,
+                         store_dir: Optional[Path] = None, min_share: float = 0.7, force: bool = False) -> Dict[str, object]:
+    """Build (or find up to date) the feature store of ``symbols`` over ``[first, last]`` in ``out_dir``.
+
+    * pre-screens every symbol ONCE with ``usable_symbols`` (rows with ``groups``, membership-only names on their bars) and
+      filters the membership columns by the usable list once; the refused symbols and reasons go to the meta
+      (``transient`` marks a reason that can clear after a cache refresh - a stale download - and nothing about a
+      refusal is remembered between runs: every call screens again);
+    * with group M, a symbol without a sector (not in the metric store, no override) is refused as unusable;
+    * loads every bar once into a ``BuildCache`` and builds in chunks of ``chunk_size`` symbols over the whole universe, so
+      cross-sectional values do not depend on the chunking;
+    * writes ``features.parquet`` + ``features.parquet.meta.json`` (``save_features``), ``coverage_report.parquet`` / ``.csv``
+      and ``meta["ensure"]`` (refused, inputs, timings, ``min_share``). Apply the mask with ``load_feature_store``.
+
+    Rebuilds only when the inputs signature changes: the groups, the built symbols, the window, the membership digest, the
+    resolved sectors, or the (size, mtime) of any source file. Returns ``{"status": "built" | "up_to_date", ...}``."""
+    import time
+    from ba2_common.config import CACHE_FOLDER
+
+    started = time.time()
+    out_dir = Path(out_dir)
+    groups = list(groups)
+    for g in groups:
+        _spec(g)
+    cache_root = Path(CACHE_FOLDER if cache_root is None else cache_root)
+    store_path = Path(store_dir) if store_dir is not None else ml_universe.store_dir_for(cache_root)
+    symbols = list(dict.fromkeys(symbols))
+    extra = [c for c in dict.fromkeys((list(membership.columns) if membership is not None else []) + list(universe or []))
+             if c not in symbols]
+    usable_rows, refused_rows = usable_symbols(symbols, first, last, cache_root, groups, store_path)
+    usable_extra, refused_extra = usable_symbols(extra, first, last, cache_root, (), store_path) if extra else ([], {})
+    refused = {**refused_rows, **refused_extra}
+    resolved: Optional[Dict[str, str]] = None
+    if any(_spec(g).needs_sector for g in groups):
+        if isinstance(sector_of, str):
+            resolved = dict(ml_universe.sector_of_from_store(usable_rows, store_path))
+        elif sector_of is not None:
+            resolved = dict(sector_of)
+        resolved = {**(resolved or {}), **(sector_overrides or {})}
+        for sym in list(usable_rows):
+            if sym not in resolved:
+                refused[sym] = f"{sym}: no sector (not in the metric store); add it to sector_overrides (NO_SECTOR for an ETF)"
+                usable_rows.remove(sym)
+    if not usable_rows:
+        raise ValueError(f"no usable symbol among {symbols}: {refused}")
+    members = None
+    if membership is not None:
+        keep = [c for c in membership.columns if c in set(usable_rows) | set(usable_extra)]
+        members = membership[keep]
+        members.attrs = dict(membership.attrs)
+    uni = list(dict.fromkeys(usable_rows + [c for c in (universe or []) if c in set(usable_extra) | set(usable_rows)]
+                             + (list(members.columns) if members is not None else [])))
+    required: Set[str] = {"SPY"}
+    for g in groups:
+        required |= set(_spec(g).required_context(usable_rows, resolved))
+    load = list(dict.fromkeys(usable_rows + uni + sorted(required)))
+    inputs = json.loads(json.dumps({
+        "version": ENSURE_VERSION, "groups": groups, "symbols": usable_rows, "universe": uni, "first": str(first),
+        "last": str(last), "membership": None if members is None else _membership_digest(members), "sectors": resolved,
+        "fingerprints": _input_fingerprints(load, usable_rows, groups, cache_root, store_path)}, sort_keys=True))
+    meta_path = Path(str(out_dir / "features.parquet") + ".meta.json")
+    if not force and meta_path.exists() and (out_dir / "features.parquet").exists():
+        old = json.loads(meta_path.read_text(encoding="utf-8"))
+        if "ensure" in old and old["ensure"]["inputs"] == inputs:
+            return {"status": "up_to_date", "out_dir": str(out_dir), "symbols": usable_rows, "refused": _refusal_report(refused)}
+    cache = BuildCache()
+    earliest = min(first_cached_bar(s, cache_root) for s in load)
+    cache_end = last_cached_bar("SPY", cache_root)
+    cache.load(load, min(first, earliest.date()), last, cache_root, cache_end)
+    frames: List[pd.DataFrame] = []
+    metas: List[Dict[str, object]] = []
+    for i in range(0, len(usable_rows), chunk_size):
+        chunk = usable_rows[i:i + chunk_size]
+        part = build_features(chunk, first, last, groups, cache_root, (), sector_of=resolved if resolved is not None else None,
+                              universe=uni, store_dir=store_path, membership=members, preloaded=cache)
+        frames.append(part)
+        metas.append(part.attrs["meta"])
+    df = pd.concat(frames)
+    meta = dict(metas[0])
+    meta["symbols"], meta["universe"] = usable_rows, uni
+    meta["rows"], meta["columns"], meta["nan_rate"] = int(len(df)), list(df.columns), _nan_rates(df, groups)
+    meta["ended"] = {k: v for m in metas for k, v in m["ended"].items()}
+    meta["load"] = {k: {s: v for m in metas for s, v in m["load"][k].items()} for k in metas[0]["load"]}
+    source: Dict[str, object] = {"daily": {}, "fmp_history": {}}
+    for m in metas:
+        source["daily"].update(m["source"]["daily"])
+        source["fmp_history"].update(m["source"].get("fmp_history", {}))
+        for k, v in m["source"].items():
+            if k in ("daily", "fmp_history"):
+                continue
+            if k == "market_conditions":
+                cur = source.setdefault(k, {p: {**r, "uncovered": []} for p, r in v.items()})
+                for p, r in v.items():
+                    cur[p]["uncovered"] = sorted(set(cur[p]["uncovered"]) | set(r["uncovered"]))
+            else:
+                source.setdefault(k, v)
+    if not source["fmp_history"]:
+        del source["fmp_history"]
+    meta["source"] = source
+    report = coverage_report(df, [g for g in groups if _coverage_has_columns(df, g)])
+    meta["ensure"] = {"version": ENSURE_VERSION, "inputs": inputs, "chunk_size": chunk_size, "chunks": len(frames),
+                      "refused": _refusal_report(refused), "min_share": min_share,
+                      "build_seconds": round(time.time() - started, 1),
+                      "note": "features.parquet is UNMASKED; apply_coverage_mask(df, coverage_report, min_share) or "
+                              "load_feature_store(mask=True) masks thin (group, year) pairs"}
+    df.attrs["meta"] = meta
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_features(df, out_dir / "features.parquet")
+    report.to_parquet(out_dir / "coverage_report.parquet")
+    report.to_csv(out_dir / "coverage_report.csv")
+    return {"status": "built", "out_dir": str(out_dir), "symbols": usable_rows, "chunks": len(frames),
+            "rows": int(len(df)), "seconds": meta["ensure"]["build_seconds"], "refused": meta["ensure"]["refused"],
+            "coverage": report}
+
+
+def _coverage_has_columns(df: pd.DataFrame, group: str) -> bool:
+    return bool(_group_columns(df, group))
+
+
+def _refusal_report(refused: Dict[str, str]) -> Dict[str, Dict[str, object]]:
+    return {sym: {"reason": reason, "transient": any(m in reason for m in _TRANSIENT_MARKERS)}
+            for sym, reason in refused.items()}
+
+
+def load_feature_store(out_dir: Path, mask: bool = True, min_share: Optional[float] = None) -> pd.DataFrame:
+    """Read a store written by ``ensure_feature_store``; with ``mask`` apply its coverage report at ``min_share`` (default: the
+    one the store was built with, 0.7). ``df.attrs["meta"]`` is the stored meta."""
+    out_dir = Path(out_dir)
+    df = pd.read_parquet(out_dir / "features.parquet")
+    meta = json.loads(Path(str(out_dir / "features.parquet") + ".meta.json").read_text(encoding="utf-8"))
+    df.attrs["meta"] = meta
+    if mask:
+        share = meta["ensure"]["min_share"] if min_share is None else min_share
+        df = apply_coverage_mask(df, pd.read_parquet(out_dir / "coverage_report.parquet"), share)
+        df.attrs["meta"] = meta
+    return df
 
 
 def save_features(df: pd.DataFrame, path: Path) -> None:

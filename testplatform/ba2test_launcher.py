@@ -8950,6 +8950,39 @@ def _cmd_ml_search(args) -> int:
     return 0
 
 
+def _cmd_ml_features(args) -> int:
+    """Build (or find up to date) the point-in-time DAILY feature store (ML exploration v2, app/services/ml_features.py):
+    features.parquet + meta + coverage report under --out. With --membership-top-n the X ranks and the breadth use the
+    per-session universe of the metric store (survivor-only, 2020+); without it the symbols file IS the universe (NDQ30)."""
+    from datetime import date as _date
+    from ba2_common import config as _bc
+    from app.services import ml_features as _mf
+    from app.services import ml_panel as _mp
+    from app.services import ml_universe as _mu
+    import pandas as _pd
+
+    symbols = _parse_symbols_arg("@" + args.symbols_file)
+    first, last = _date.fromisoformat(args.start), _date.fromisoformat(args.end)
+    groups = [g.strip() for g in args.groups.split(",") if g.strip()]
+    overrides = {}
+    for item in args.sector_override or []:
+        sym, _, sector = item.partition("=")
+        overrides[sym.strip().upper()] = sector.strip()
+    if args.no_sector:
+        overrides.update({s: _mf.NO_SECTOR for s in symbols})
+    membership = None
+    if args.membership_top_n:
+        sessions = _pd.DatetimeIndex(_pd.to_datetime(_mp.regular_sessions(first, last)["session"]))
+        membership = _mu.membership_from_universe(sessions, args.membership_top_n, args.purpose)
+    res = _mf.ensure_feature_store(args.out, symbols, first, last, groups, membership, cache_root=_bc.CACHE_FOLDER,
+                                   chunk_size=args.chunk_size, sector_overrides=overrides, force=args.force)
+    print(f"ml-features: {res['status']} -> {res['out_dir']} ({len(res['symbols'])} symbols"
+          + (f", {res['rows']} rows in {res['seconds']}s" if res["status"] == "built" else "") + ")")
+    for sym, r in res["refused"].items():
+        print(f"  refused {sym}{' (transient)' if r['transient'] else ''}: {r['reason']}")
+    return 0
+
+
 def _add_robust_fitness_args(p) -> None:
     """``--robust-fitness`` / ``--no-robust-fitness`` on an optimize command. DEFAULT: ON.
 
@@ -9831,6 +9864,22 @@ def main(argv: "list | None" = None) -> int:
     ms.add_argument("--darts-archs", default="tft,nhits",
                     help="Darts architectures the forward-return genes may pick (tft is 20-55 min per trial).")
 
+    # ml-features: the point-in-time daily feature store of the ML exploration v2.
+    mf = sub.add_parser("ml-features", help="Build the point-in-time daily feature store (ML exploration v2).")
+    mf.add_argument("--symbols-file", required=True, help="Symbols to build rows for (one per line / whitespace).")
+    mf.add_argument("--start", required=True, help="First day (YYYY-MM-DD).")
+    mf.add_argument("--end", required=True, help="Last day (YYYY-MM-DD).")
+    mf.add_argument("--groups", default="t,mtf,m,x,mac,f,a,i,s", help="Comma list of feature groups.")
+    mf.add_argument("--out", required=True, help="Store directory (features.parquet, meta, coverage report).")
+    mf.add_argument("--membership-top-n", type=int, default=None,
+                    help="Use the metric store's per-session top-N universe for X ranks and breadth (2020+, survivors only).")
+    mf.add_argument("--purpose", default="dev", choices=("dev", "holdout"), help="Membership split (default dev).")
+    mf.add_argument("--chunk-size", type=int, default=25, help="Symbols per build chunk.")
+    mf.add_argument("--no-sector", action="store_true", help="The symbols are indices / ETFs: they have no sector.")
+    mf.add_argument("--sector-override", action="append", metavar="SYM=Sector",
+                    help="Sector for a symbol the metric store has none for (repeatable).")
+    mf.add_argument("--force", action="store_true", help="Rebuild even when the inputs are unchanged.")
+
     # sync-cache: push the master's cache (diff, one tar) to a configured remote worker.
     sc = sub.add_parser("sync-cache", help="Push the master's cache to a configured worker.")
     sc.add_argument("--worker", required=True, help="Worker NAME (as configured on the master).")
@@ -9860,6 +9909,7 @@ def main(argv: "list | None" = None) -> int:
         "optimize-batch": lambda: _cmd_optimize_batch(args),
         "worker": lambda: _cmd_worker(args),
         "ml-search": lambda: _cmd_ml_search(args),
+        "ml-features": lambda: _cmd_ml_features(args),
         "sync-cache": lambda: _cmd_sync_cache(args),
     }[args.cmd]()
 

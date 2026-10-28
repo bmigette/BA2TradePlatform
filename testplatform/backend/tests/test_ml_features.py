@@ -1189,3 +1189,14 @@ def test_a_membership_that_does_not_cover_the_sessions_from_its_first_scan_on_re
     late = full.loc[sess[200]:]
     f = _build(cache, ["x"], symbols=XU, membership=late)
     assert f.loc["AAA"].index[0] < sess[200]
+
+
+def test_a_symbol_declared_sectorless_has_no_sector_relative_strength_but_everything_else(cache):
+    """Indices and ETFs have no sector: declaring NO_SECTOR makes only m_rs_sector_* NaN (no sector ETF is loaded for it)."""
+    f = _build(cache, ["m"], symbols=("AAA", "SPY"), sector_of={"AAA": "Technology", "SPY": F.NO_SECTOR}, ctx=())
+    spy = f.loc["SPY"]
+    assert spy[["m_rs_sector_5", "m_rs_sector_20"]].isna().all().all()
+    others = [c for c in F.M_COLUMNS if not c.startswith("m_rs_sector")]
+    assert spy[others].notna().all().all() and np.allclose(spy["m_rs_spy_20"], 0.0)
+    assert f.loc["AAA", ["m_rs_sector_5", "m_rs_sector_20"]].notna().all().all()
+    assert F.GROUPS["m"].required_context(["SPY"], {"SPY": F.NO_SECTOR}) == set(F.MARKET_ETFS)
