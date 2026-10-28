@@ -264,7 +264,7 @@ class TestJobIntegration:
             "ticker": TICKERS[i] if i < len(TICKERS) else f"T{i}", "timeframe": timeframe, "data_provider": provider})
         monkeypatch.setattr(job_handler, "update_job_progress", lambda *a, **k: None)
         monkeypatch.setattr(job_handler, "save_training_datasets", lambda **kw: captured.update(
-            combined=kw["combined_df"], train=kw["train_df"], features=kw["feature_columns"],
+            combined=kw["combined_df"], train=kw["train_df"], test=kw["test_df"], features=kw["feature_columns"],
             target=kw["target_column"]))
         payload = {
             "dataset_ids": list(range(len(frames))), "job_type": job_type, "selected_models": ["lstm"],

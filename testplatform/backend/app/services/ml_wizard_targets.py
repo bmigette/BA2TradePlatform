@@ -46,6 +46,10 @@ DAILY_TARGET_TYPES = ("daily_rel_return", "daily_quintile", "daily_beats", "dail
                       "daily_multistep")
 #: compared with the other tickers of the same session: computed across the job's datasets
 CROSS_SECTIONAL_DAILY_TYPES = ("daily_rel_return", "daily_quintile", "daily_beats")
+#: the ones whose labels follow the session's cross-section so thinly that the job keeps the full session frame (the
+#: quintile labels only the top and bottom fifth) and a darts regression model, which cannot train across gaps, is refused;
+#: rel_return is dense (gaps only at filled bars) and is handled like any dense target
+SPARSE_DAILY_TYPES = ("daily_quintile", "daily_beats")
 ALL_WIZARD_TARGET_TYPES = WIZARD_TARGET_TYPES + DAILY_TARGET_TYPES
 DAILY_HORIZON_CHOICES: Tuple[int, ...] = T.DAILY_HORIZONS
 _DAILY_DEFAULT_HORIZON = 5

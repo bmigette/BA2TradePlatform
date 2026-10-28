@@ -22,7 +22,7 @@ from app.services.data_preparation import frame_bounds, purged_train_row_count, 
 from app.services.masked_fill import all_masked_columns
 from app.services.ml_dataset_source import is_alpaca_hist
 from app.services.ml_wizard_targets import (
-    CROSS_SECTIONAL_DAILY_TYPES, DAILY_TARGET_TYPES, WIZARD_TARGET_TYPES, WizardTargetError,
+    CROSS_SECTIONAL_DAILY_TYPES, DAILY_TARGET_TYPES, SPARSE_DAILY_TYPES, WIZARD_TARGET_TYPES, WizardTargetError,
     build_cross_sectional_daily_targets, build_daily_target, build_wizard_target, column_names as wizard_column_names)
 
 logger = logging.getLogger(__name__)
@@ -2010,10 +2010,11 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
         n_unobservable = 0
         trimmed = []
         n_interior = 0
-        # Only the cross-sectional daily targets are SPARSE (their labels follow the session's cross-section): they keep
-        # the consecutive session frame and lose only the unlabelled edges. Every other target is handled exactly as
+        # Only quintile / beats are SPARSE (their labels follow the session's cross-section): they keep the consecutive
+        # session frame and lose only the unlabelled edges. Every other target, rel_return included, is handled exactly as
         # before: all its unlabelled rows are dropped.
-        sparse_target = any(target_column in cols for cols in cross_sectional)
+        sparse_target = target_column in {c for pt in prediction_targets if pt.get('type') in SPARSE_DAILY_TYPES
+                                          for c in wizard_column_names(pt)}
         for f in frames:
             if sparse_target:
                 f, n_dropped, n_gaps = trim_unlabelled_edges(f, target_column)
@@ -2051,7 +2052,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
         # A cross-sectional daily target is decided by every ticker's bars over the same window: one set of boundary
         # dates for all the tickers, not a row-count cut per ticker (which puts one ticker's train rows on another's
         # test dates).
-        common_dates = sparse_target
+        common_dates = any(target_column in cols for cols in cross_sectional)
 
         # Train / validation / holdout split, PER TICKER, chronological. Targets are computed
         # over the whole series and only then cut, so both boundaries are purged by the label

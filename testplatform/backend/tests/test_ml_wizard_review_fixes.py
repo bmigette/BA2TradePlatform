@@ -198,12 +198,25 @@ class TestSparseTargetsKeepSessionContinuity:
             n = len(frames[0])
             assert len(cap["combined"]) < 2 * (n - 3)                      # (labels around the filled bars are gone)
 
-    def test_a_cross_sectional_regression_target_with_gaps_is_still_refused_for_darts(self, monkeypatch):
+    def test_rel_return_is_dense_and_trains_through_darts_with_a_filled_bar(self, monkeypatch):
+        """rel_return has gaps only at filled bars: its unlabelled rows are dropped as for any dense target, and it keeps
+        the common date split of the cross-sectional targets."""
         from tests.test_ml_wizard_daily_targets import TestJobIntegration, daily_frame, pt
         frames = [daily_frame(10 + i, filled_at=(40,)) if i == 0 else daily_frame(10 + i) for i in range(6)]
-        result, _ = TestJobIntegration()._job(frames, [pt("daily_rel_return", horizonSessions=3)], monkeypatch,
+        result, cap = TestJobIntegration()._job(frames, [pt("daily_rel_return", horizonSessions=3)], monkeypatch,
+                                                job_type="regression")
+        assert result["status"] == "dry_run_success", result
+        assert cap["combined"]["rel_ret_h3"].notna().all()
+        assert pd.to_datetime(cap["train"]["Date"]).max() < pd.to_datetime(cap["test"]["Date"]).min()   # common dates
+
+    def test_beats_keeps_the_full_frame_and_the_darts_refusal(self, monkeypatch):
+        from tests.test_ml_wizard_daily_targets import TestJobIntegration, daily_frame, pt
+        frames = [daily_frame(10 + i, filled_at=(40,)) if i == 0 else daily_frame(10 + i) for i in range(6)]
+        result, _ = TestJobIntegration()._job(frames, [pt("daily_beats", horizonSessions=3)], monkeypatch,
                                               job_type="regression")
         assert result["status"] == "failed" and "gaps" in result["error"]
+        result, cap = TestJobIntegration()._job(frames, [pt("daily_beats", horizonSessions=3)], monkeypatch)
+        assert result["status"] == "dry_run_success" and cap["combined"]["beats_h3"].isna().any()   # classification keeps them
 
     def test_darts_trains_a_dense_target_as_before(self, monkeypatch):
         from tests.test_ml_wizard_daily_targets import TestJobIntegration, job_frames, pt
