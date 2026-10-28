@@ -396,6 +396,39 @@ def test_darts_trains_on_series_that_end_before_validation_and_predicts_scorable
         assert len(np.unique(Xt.series_start[Xt.rows])) == len(GSYMS)         # one series per symbol
 
 
+def test_darts_drops_the_validation_rows_of_a_series_listed_too_late_to_train_on(world, tmp_path, monkeypatch):
+    """A symbol listed shortly before the validation slice (XLC in a 2016-2018 window) has no full training window but
+    has validation windows: its validation rows are dropped (the adapter needs the same series in both), counted in
+    the block, and its rows are still scored by the pooled model."""
+    late = sorted(GSYMS)[0]
+    real = S.daily_sequence_data
+
+    def listed_late(panel, cols, fit_rows, lookback, horizon, neutral=False):
+        d = real(panel, cols, fit_rows, lookback, horizon, neutral=neutral)
+        mine = np.flatnonzero(panel.index.get_level_values("symbol") == late)
+        start = int(fit_rows[np.isin(fit_rows, mine)].max()) + 1          # its series starts after the training rows
+        ss = d.series_start.copy()
+        ss[mine] = start
+        return MS.SequenceData(features=d.features, rows=d.rows, lookback=d.lookback, series_start=ss,
+                               returns=d.returns, channels=d.channels, scaler=d.scaler, horizon_steps=d.horizon_steps)
+    monkeypatch.setattr(S, "daily_sequence_data", listed_late)
+    seen = []
+    real_fit = MS.DartsAdapter.fit
+
+    def fit(self, Xt, yt, Xv, yv, task, seed, **kw):
+        seen.append((set(Xt.series_start[Xt.rows]), set(Xv.series_start[Xv.rows])))
+        return real_fit(self, Xt, yt, Xv, yv, task, seed, **kw)
+    monkeypatch.setattr(MS.DartsAdapter, "fit", fit)
+    out = tmp_path / "o"
+    res = grun([darts_cell(world)], out, world)
+    assert res["errors"] == 0 and res["done"] == 1
+    assert seen and all(t == v and len(t) == len(GSYMS) - 1 for t, v in seen)
+    r = G.read_results(out / "results.jsonl")[0]
+    assert all(b["n_val_series_dropped"] == 1 for b in r["blocks"])
+    pred = pd.read_parquet(next((out / "predictions").glob("*.parquet")))
+    assert (pred["symbol"] == late).any()
+
+
 # ================================================================== blocks, budget, epochs, release
 def test_a_gpu_cell_with_quarterly_blocks_is_refused_at_run_time_too(world, tmp_path):
     c = G.validate_cell(tsai_cell(world))

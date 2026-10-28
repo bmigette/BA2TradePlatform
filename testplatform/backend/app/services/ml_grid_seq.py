@@ -495,6 +495,13 @@ def _darts_block(cell, seed, panel, br, st, adapter) -> Tuple[np.ndarray, np.nda
     neutral = cell.kind == "rel_return"
     data = daily_sequence_data(panel, cols, br.fit_idx, L, H, neutral=neutral)
     mt, mv, mp = _usable(data, br.fit_idx), _usable(data, br.val_idx), _usable(data, br.pr)
+    # a symbol listed shortly before the validation slice (XLC in a window from 2016) has validation windows but no
+    # full training window: the adapter needs the same series in both, so its validation rows go (the pooled model
+    # still scores its rows in the block)
+    trained = np.unique(data.series_start[br.fit_idx[mt]])
+    val_series = data.series_start[br.val_idx]
+    n_val_dropped = int(len(np.setdiff1d(np.unique(val_series[mv]), trained)))
+    mv &= np.isin(val_series, trained)
     if mt.sum() < 2 or not mv.any():
         raise G.SkipBlock(f"too few usable daily windows (train {int(mt.sum())}, validation {int(mv.sum())})")
     if not mp.any():
@@ -508,5 +515,6 @@ def _darts_block(cell, seed, panel, br, st, adapter) -> Tuple[np.ndarray, np.nda
     extra = {"prep_seconds": t1 - t0, "intraday_build_seconds": 0.0, "fit_seconds": t2 - t1,
              "n_fit": int(len(Xt)), "n_val": int(len(Xv)), "n_samples": int(len(Xt)), "n_channels": int(data.n_channels),
              "lookback": L, "horizon_steps": H, "n_series": int(len(np.unique(Xt.series_start[Xt.rows]))),
+             "n_val_series_dropped": n_val_dropped,
              "target_series": "market_neutral" if neutral else "own_return"}
     return br.pr[mp], scores, extra
