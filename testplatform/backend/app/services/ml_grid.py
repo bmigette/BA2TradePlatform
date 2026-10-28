@@ -1023,11 +1023,14 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
         row["timings"] = {"fit": t_fit, "panel_load": panel.load_seconds, "total": time.perf_counter() - t_start}
         return _sanitize(row)
     pred = _predictions_frame(cell, panel, np.concatenate(rows_l), np.concatenate(scores_l), np.concatenate(block_l))
+    floats = [c for c in pred.columns if pred[c].dtype == np.float64]
+    stored = pred.astype({c: np.float32 for c in floats})
+    pred = stored.astype({c: np.float64 for c in floats})            # the metrics see EXACTLY what the file holds
     if pred_dir is not None:
         pred_dir.mkdir(parents=True, exist_ok=True)
         final = pred_dir / f"{cell.key}_{seed}.parquet"
         tmp = final.with_suffix(".tmp")
-        pred.to_parquet(tmp, index=False)
+        stored.to_parquet(tmp, index=False, compression="zstd")
         os.replace(tmp, final)
     ev = evaluate(pred, cell, st)
     row.update({"status": "ok", "n_rows": int(len(pred)), "primary": ev["primary"], "metrics": ev["metrics"],
@@ -1386,6 +1389,29 @@ def resolve_cache_root(cache_root: Optional[Union[str, Path]]) -> str:
     return str(cache_root)
 
 
+#: measured on the exploration's panels: parquet+zstd bytes per prediction row relative to the raw column bytes
+PARQUET_RATIO = 0.6
+#: typical size of one results.jsonl row (metrics, regimes, controls, 31 block audit entries)
+RESULT_ROW_BYTES = 14_000
+
+
+def estimate_disk(tasks: Sequence[Tuple[Cell, int]], st: GridSettings) -> Dict[str, Any]:
+    """Rough bytes the run will write: the predictions files (rows = symbols x sessions of the evaluation window,
+    float32 columns score / ret / vol [+ rel_ret on the selection track, + realvol for a volatility target] + session
+    + symbol + block, times ``PARQUET_RATIO`` for zstd) and the results rows."""
+    sessions = float(np.busday_count(st.eval_start, st.eval_end)) * 0.96          # ~ NYSE sessions
+    pred = 0.0
+    rows_per_task = 0.0
+    for c, _ in tasks:
+        n_float = 3 + (1 if c.track == "selection" else 0) + (1 if c.kind == "volatility" else 0)
+        rows = len(resolve_symbols(c.symbols)) * sessions
+        pred += rows * (4 * n_float + 8 + 4 + 2) * PARQUET_RATIO
+        rows_per_task = max(rows_per_task, rows)
+    results = len(tasks) * RESULT_ROW_BYTES
+    return {"predictions": int(pred), "results": int(results), "total": int(pred) + int(results),
+            "rows_per_task": int(rows_per_task)}
+
+
 def n_jobs_for(cpu_slots: int, cores: int) -> int:
     """Threads per fit so that ``cpu_slots * n_jobs <= cores``."""
     return max(1, int(cores) // max(1, int(cpu_slots)))
@@ -1438,6 +1464,13 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
     say(f"ml_grid: {len(cells)} cells, {len(tasks)} (cell, seed) tasks to run, {skipped_existing} already finished")
     if not tasks:
         return summary
+    import shutil
+    est = estimate_disk(tasks, st)
+    free = shutil.disk_usage(out).free
+    say(f"ml_grid: estimated disk {est['total'] / 1e9:.2f} GB for {len(tasks)} tasks (predictions "
+        f"{est['predictions'] / 1e9:.2f} GB, results {est['results'] / 1e9:.2f} GB); {free / 1e9:.1f} GB free in {out}")
+    if est["total"] > 0.9 * free:
+        logger.warning(f"ml_grid: the estimated disk need exceeds 90% of the free space in {out}")
     init_args = (st.to_dict(), cache_root, str(out), n_jobs_for(cpu_slots, st.cores))
 
     def finish(r: Dict[str, Any]) -> None:
@@ -1475,44 +1508,81 @@ def _factor_levels(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "train_months": cfg["train_months"], "groups": "+".join(cfg["groups"])}
 
 
-def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: str) -> Dict[str, pd.DataFrame]:
-    """Aggregate finished rows of one ``track`` into ``{"factors": DataFrame, "cells": DataFrame}``.
+def _field(row: Dict[str, Any], key: str) -> Any:
+    """A row's value, None when the row (an older version's) lacks the field."""
+    return row[key] if key in row else None
 
-    Only rows with ``status == "ok"`` and the track's primary metric (``PRIMARY[track]``; volatility models have a
-    different primary and are left out) enter. Per cell: the mean and std (ddof 1; NaN for a single seed) of the
-    primary over its seeds. ``factors``: indexed (factor, level) for the factors target / horizon / family /
-    train_months / groups, with the mean, std (ddof 1) and median across the CELLS of the cell-level seed-mean, the
-    number of cells and the share with a positive mean. ``cells``: one row per cell with its levels, ``mean``, ``std``,
-    ``n_seeds``, ``p_value`` (mean of the gating control's p over seeds), ``low_iter_share`` (mean over seeds of the
-    row's share of blocks with best iteration <= ``LOW_ITER``: near-constant models; NaN for non-boosting families),
-    ``deterministic`` (naive / linear: their seed std of 0 is built in, NOT robustness) and ``score = mean - std``,
-    ranked by score (descending; NaN last). ``factors`` also carry ``n_deterministic`` (cells of a deterministic
-    family at that level) and ``low_iter_share`` (mean over the level's cells)."""
+
+def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: str, min_coverage: float = 0.8,
+                   max_low_iter_share: Optional[float] = None) -> Dict[str, pd.DataFrame]:
+    """Aggregate finished rows of one ``track`` into ``{"factors", "cells", "excluded"}`` DataFrames.
+
+    Rows are deduplicated on (cell_key, seed), the LAST one counting (a rerun replaces). Only rows with ``status ==
+    "ok"`` and the track's primary metric (``PRIMARY[track]``; volatility models have a different primary and are left
+    out) enter. Per cell: the mean and std (ddof 1; NaN for a single seed; 0 for a deterministic family, see below) of
+    the primary over its seeds, and
+
+    * ``coverage`` = the LOWEST over the cell's seeds of ``n_blocks_fitted / n_blocks`` (blocks skipped for a thin
+      target class reduce it); a cell under ``min_coverage`` (default 0.8) is excluded, a cell with no coverage
+      information too;
+    * ``low_iter_share`` = mean over seeds of the row's share of blocks with best iteration <= ``LOW_ITER`` (a
+      near-constant model; NaN for non-boosting families, which are never excluded by it); with ``max_low_iter_share``
+      a cell above it is excluded;
+    * ``p_value`` = the MEDIAN over seeds of the gating control's p, ``p_values`` = the per-seed values (by seed);
+    * ``deterministic`` (naive / linear run once; their std of 0 is built in, NOT robustness).
+
+    ``cells`` ranks the kept cells by ``score = mean - std`` (descending, NaN last); ``excluded`` lists the dropped ones
+    with their ``reason``. ``factors``: indexed (factor, level) for target / horizon / family / train_months / groups,
+    from the kept cells: the mean, std and median of the cell-level means, ``n_cells``, ``share_positive``,
+    ``n_deterministic`` and ``low_iter_share``."""
     if track not in TRACKS:
         raise ValueError(f"track must be one of {TRACKS}")
+    if not 0.0 <= min_coverage <= 1.0:
+        raise ValueError("min_coverage must be in [0, 1]")
+    if max_low_iter_share is not None and not 0.0 <= max_low_iter_share <= 1.0:
+        raise ValueError("max_low_iter_share must be None or in [0, 1]")
     rows = read_results(results) if isinstance(results, (str, Path)) else list(results)
+    last: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for r in rows:
+        last[(r["cell_key"], int(r["seed"]))] = r
     want = PRIMARY[track]
     by_cell: Dict[str, List[Dict[str, Any]]] = {}
-    for r in rows:
-        if r.get("track") == track and r.get("status") == "ok" and r["primary"]["name"] == want \
+    for r in last.values():
+        if _field(r, "track") == track and _field(r, "status") == "ok" and r["primary"]["name"] == want \
                 and r["primary"]["value"] is not None:
             by_cell.setdefault(r["cell_key"], []).append(r)
-    cells = []
+    kept, dropped = [], []
     for key, rs in by_cell.items():
+        rs.sort(key=lambda r: int(r["seed"]))
         v = np.array([r["primary"]["value"] for r in rs], dtype=float)
-        ps = [r["controls"].get("p_value") for r in rs if isinstance(r.get("controls"), dict)
-              and r["controls"].get("p_value") is not None]
-        li = [r["low_iter_share"] for r in rs if r.get("low_iter_share") is not None]
-        cells.append({"cell_key": key, **_factor_levels(rs[0]["config"]), "n_seeds": len(v), "mean": float(v.mean()),
-                      "std": float(v.std(ddof=1)) if len(v) > 1 else float("nan"),
-                      "p_value": float(np.mean(ps)) if ps else float("nan"),
-                      "low_iter_share": float(np.mean(li)) if li else float("nan"),
-                      "deterministic": rs[0]["config"]["family"] in DETERMINISTIC_FAMILIES})
-    cdf = pd.DataFrame(cells, columns=["cell_key", "target", "horizon", "family", "train_months", "groups", "n_seeds",
-                                       "mean", "std", "p_value", "low_iter_share", "deterministic"])
+        det = rs[0]["config"]["family"] in DETERMINISTIC_FAMILIES
+        cov = [r["n_blocks_fitted"] / r["n_blocks"] for r in rs
+               if _field(r, "n_blocks") and _field(r, "n_blocks_fitted") is not None]
+        ps = [r["controls"]["p_value"] for r in rs if isinstance(_field(r, "controls"), dict)
+              and "p_value" in r["controls"] and r["controls"]["p_value"] is not None]
+        li = [r["low_iter_share"] for r in rs if _field(r, "low_iter_share") is not None]
+        rec = {"cell_key": key, **_factor_levels(rs[0]["config"]), "n_seeds": len(v), "mean": float(v.mean()),
+               "std": 0.0 if det else (float(v.std(ddof=1)) if len(v) > 1 else float("nan")),
+               "p_value": float(np.median(ps)) if ps else float("nan"), "p_values": ps,
+               "coverage": float(min(cov)) if len(cov) == len(rs) else float("nan"),
+               "low_iter_share": float(np.mean(li)) if li else float("nan"), "deterministic": det}
+        reason = None
+        if not np.isfinite(rec["coverage"]):
+            reason = "no coverage information (n_blocks / n_blocks_fitted missing)"
+        elif rec["coverage"] < min_coverage:
+            reason = f"coverage {rec['coverage']:.2f} < min_coverage {min_coverage:g}"
+        elif max_low_iter_share is not None and np.isfinite(rec["low_iter_share"]) \
+                and rec["low_iter_share"] > max_low_iter_share:
+            reason = f"low_iter_share {rec['low_iter_share']:.2f} > max_low_iter_share {max_low_iter_share:g}"
+        (dropped if reason else kept).append({**rec, "reason": reason} if reason else rec)
+    cols = ["cell_key", "target", "horizon", "family", "train_months", "groups", "n_seeds", "mean", "std", "p_value",
+            "p_values", "coverage", "low_iter_share", "deterministic"]
+    cdf = pd.DataFrame(kept, columns=cols)
     cdf["deterministic"] = cdf["deterministic"].astype(bool)
     cdf["score"] = cdf["mean"] - cdf["std"]
     cdf = cdf.sort_values("score", ascending=False, na_position="last", kind="mergesort").reset_index(drop=True)
+    xdf = pd.DataFrame(dropped, columns=cols + ["reason"])[["cell_key", "reason", "coverage", "low_iter_share", "target",
+                                                           "horizon", "family", "train_months", "groups"]]
     parts = []
     for factor in ("target", "horizon", "family", "train_months", "groups"):
         lv = cdf[factor].astype(str)
@@ -1526,7 +1596,7 @@ def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: s
     fdf = pd.concat(parts) if parts and len(cdf) else pd.DataFrame(
         columns=["n_cells", "mean", "std", "median", "share_positive", "n_deterministic", "low_iter_share"],
         index=pd.MultiIndex.from_arrays([[], []], names=["factor", "level"]))
-    return {"factors": fdf, "cells": cdf}
+    return {"factors": fdf, "cells": cdf, "excluded": xdf}
 
 
 # ================================================================== job handler

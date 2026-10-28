@@ -435,6 +435,7 @@ def test_timing_metrics_use_the_block_cutoff(signal_world, tmp_path):
     run([c], tmp_path, signal_world)
     r = G.read_results(tmp_path / "results.jsonl")[0]
     pq = pd.read_parquet(tmp_path / "predictions" / f"{r['cell_key']}_1.parquet")
+    pq = pq.astype({c: "float64" for c in pq.columns if pq[c].dtype == "float32"})
     st = _settings()
     d = pq.assign(cutoff=G.block_cutoff(pq, st.timing_q, st.min_obs))
     ex = E.timing_excess(d, st.cost_bps, cutoff_col="cutoff").excess
@@ -493,9 +494,9 @@ def test_rows_with_label_bar_filled_or_filled_are_not_used(tmp_path):
 
 # ------------------------------------------------------------------ aggregation
 def _row(key, seed, value, kind="up", horizon=5, family="lgbm", months=12, groups=("t",), track="timing", p=0.04,
-         status="ok", name=None):
-    return {"cell_key": key, "seed": seed, "track": track, "status": status,
-            "primary": {"name": name or G.PRIMARY[track], "value": value},
+         status="ok", name=None, fitted=31, blocks=31):
+    return {"cell_key": key, "seed": seed, "track": track, "status": status, "n_blocks": blocks,
+            "n_blocks_fitted": fitted, "primary": {"name": name or G.PRIMARY[track], "value": value},
             "controls": {"p_value": p},
             "config": {"target": {"kind": kind, "horizon": horizon}, "family": family, "train_months": months,
                        "groups": list(groups)}}
@@ -725,6 +726,7 @@ def test_deterministic_families_are_marked_in_factor_effects():
     res = G.factor_effects(rows, "timing")
     c = res["cells"].set_index("cell_key")
     assert c.loc["lin", "std"] == pytest.approx(0.0, abs=1e-12) and bool(c.loc["lin", "deterministic"]) and bool(c.loc["nv", "deterministic"])
+    assert c.loc["nv", "std"] == 0.0 and c.loc["nv", "n_seeds"] == 1            # run once: std is 0 by construction
     assert not bool(c.loc["gb", "deterministic"]) and c.loc["gb", "low_iter_share"] == pytest.approx(0.5)
     assert np.isnan(c.loc["lin", "low_iter_share"])
     f = res["factors"]
@@ -1207,3 +1209,81 @@ def test_the_route_checks_limits_and_the_resume_identity_before_queueing(signal_
     (lock / ".ml_grid.lock").write_text(json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "started": "x"}))
     r = cl.post("/api/ml-search/grid", json={**body, "out_dir": str(lock)})
     assert r.status_code == 400 and "already running" in r.json()["detail"]
+
+
+# ------------------------------------------------------------------ factor_effects: coverage, filters, dedupe, median p
+def test_factor_effects_drops_cells_with_low_block_coverage_and_says_why():
+    rows = [_row("ok", s, 0.1 + 0.01 * s) for s in (1, 2, 3)] + \
+           [_row("thin", s, 0.9, fitted=20) for s in (1, 2, 3)] + \
+           [_row("mixed", 1, 0.5), _row("mixed", 2, 0.5, fitted=10)]
+    res = G.factor_effects(rows, "timing")
+    assert list(res["cells"]["cell_key"]) == ["ok"] and res["cells"]["coverage"].iloc[0] == 1.0
+    ex = res["excluded"].set_index("cell_key")
+    assert set(ex.index) == {"thin", "mixed"} and "coverage" in ex.loc["thin", "reason"]
+    assert ex.loc["thin", "coverage"] == pytest.approx(20 / 31) and ex.loc["mixed", "coverage"] == pytest.approx(10 / 31)
+    loose = G.factor_effects(rows, "timing", min_coverage=0.5)
+    assert set(loose["cells"]["cell_key"]) == {"ok", "thin"}               # 'mixed' has a seed under 0.5
+    assert G.factor_effects(rows, "timing", min_coverage=0.0)["excluded"].empty
+    with pytest.raises(ValueError, match="min_coverage"):
+        G.factor_effects(rows, "timing", min_coverage=1.5)
+
+
+def test_factor_effects_max_low_iter_share_filter_is_optional():
+    rows = [_row("flat", 1, 0.3), _row("flat", 2, 0.3), _row("fit", 1, 0.1), _row("fit", 2, 0.1), _row("lin", 1, 0.2,
+                                                                                                      family="linear")]
+    for r in rows:
+        r["low_iter_share"] = {"flat": 0.9, "fit": 0.2, "lin": None}[r["cell_key"]]
+    assert set(G.factor_effects(rows, "timing")["cells"]["cell_key"]) == {"flat", "fit", "lin"}
+    res = G.factor_effects(rows, "timing", max_low_iter_share=0.5)
+    assert set(res["cells"]["cell_key"]) == {"fit", "lin"}                  # a non-boosting family has no share: kept
+    assert "low_iter_share" in res["excluded"].set_index("cell_key").loc["flat", "reason"]
+
+
+def test_factor_effects_dedupes_on_cell_and_seed_keeping_the_last_row():
+    rows = [_row("a", 1, 0.9), _row("a", 2, 0.2), _row("a", 1, 0.1)]          # seed 1 was rerun: the last row counts
+    c = G.factor_effects(rows, "timing")["cells"].iloc[0]
+    assert c["n_seeds"] == 2 and c["mean"] == pytest.approx(0.15)
+
+
+def test_factor_effects_uses_the_median_p_value_and_keeps_the_per_seed_values():
+    rows = [_row("a", 1, 0.1, p=0.01), _row("a", 2, 0.1, p=0.04), _row("a", 3, 0.1, p=0.90)]
+    c = G.factor_effects(rows, "timing")["cells"].iloc[0]
+    assert c["p_value"] == pytest.approx(0.04)                              # the mean would be 0.317
+    assert list(c["p_values"]) == [0.01, 0.04, 0.90]
+
+
+# ------------------------------------------------------------------ disk
+def test_predictions_are_float32_zstd_and_the_metrics_see_exactly_those_values(signal_world, tmp_path):
+    import pyarrow.parquet as pq
+    out = tmp_path / "o"
+    run([cell(signal_world[0], track="timing", target={"kind": "up", "horizon": 5})], out, signal_world,
+        settings=_settings(control_seeds=(1,)))
+    f = next((out / "predictions").glob("*.parquet"))
+    pf = pq.ParquetFile(f)
+    names = pf.schema_arrow.names
+    types = {n: str(pf.schema_arrow.field(n).type) for n in names}
+    assert all(types[n] == "float" for n in ("score", "ret", "vol"))        # pyarrow's name for float32
+    assert pf.metadata.row_group(0).column(names.index("score")).compression == "ZSTD"
+    df = pd.read_parquet(f)
+    assert df["score"].dtype == np.float32 and df["ret"].dtype == np.float32
+
+
+def test_the_disk_estimate_scales_and_is_in_the_right_range(signal_world, tmp_path):
+    st = _settings()
+    small = G.validate_cell(cell(signal_world[0], symbols=SYMS[:5], seeds=[1]))
+    big = G.validate_cell(cell(signal_world[0], symbols=SYMS, seeds=[1, 2, 3]))
+    e_small, e_big = G.estimate_disk([(small, 1)], st), G.estimate_disk([(big, s) for s in (1, 2, 3)], st)
+    assert e_small["predictions"] > 0 and e_big["predictions"] == pytest.approx(e_small["predictions"] * 2 * 3, rel=0.01)
+    assert e_big["total"] == e_big["predictions"] + e_big["results"] and e_big["rows_per_task"] > 0
+    out = tmp_path / "o"
+    run([cell(signal_world[0], seeds=[1, 2])], out, signal_world, settings=_settings(control_seeds=(1,)))
+    actual = sum(f.stat().st_size for f in (out / "predictions").glob("*.parquet"))
+    est = G.estimate_disk([(G.validate_cell(cell(signal_world[0])), s) for s in (1, 2)], st)["predictions"]
+    assert 0.25 * est <= actual <= 4 * est, (actual, est)
+
+
+def test_the_run_logs_the_disk_estimate_at_the_start(signal_world, tmp_path):
+    msgs = []
+    run([cell(signal_world[0])], tmp_path / "o", signal_world, progress=lambda m, pct=None: msgs.append(m),
+        settings=_settings(control_seeds=(1,)))
+    assert any(m.startswith("ml_grid: estimated disk") and "free" in m for m in msgs)

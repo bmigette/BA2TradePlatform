@@ -8972,7 +8972,8 @@ def _cmd_ml_grid(args) -> int:
     for track in ("selection", "timing"):
         if any(r.get("track") == track for r in rows):
             fx = factor_effects(rows, track)
-            print(f"  top cells ({track}, mean - std of the primary over seeds):")
+            print(f"  top cells ({track}, mean - std of the primary over seeds; {len(fx['excluded'])} excluded for "
+                  f"coverage / near-constant models; deterministic families ran once, their std of 0 is built in):")
             for _, c in fx["cells"].head(5).iterrows():
                 print(f"    {c['score']:+.4f}  mean {c['mean']:+.4f} std {c['std']:.4f}  {c['cell_key']} "
                       f"{c['target']} h{c['horizon']} {c['family']} {c['train_months']} {c['groups']}")
