@@ -1,6 +1,8 @@
 """Daily-row targets for the ML exploration v2 (app/services/ml_targets.py, "daily rows" section)."""
 from datetime import date
 
+import dataclasses
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -174,6 +176,45 @@ def test_universe_membership_limits_the_mean_and_nans_non_members(bars):
     assert rel.loc[SESSIONS[42]].notna().all()
 
 
+def test_symbols_not_decidable_at_s_do_not_shape_relative_targets():
+    """A symbol unlisted at S (listing at S+1) or still in its ATR warm-up has no relative target and does not move
+    the others' session mean or ranks: a future listing must not shape today's labels."""
+    b = make_bars()
+    d = b["S7"].copy()
+    d.iloc[:30, [d.columns.get_loc(c) for c in ("open", "high", "low", "close")]] = np.nan
+    d.iloc[:30, d.columns.get_loc("listed")] = False
+    b["S7"] = d
+    h = 3
+    tg = T.daily_targets(b, (h,))
+    ret = tg[f"ret_{h}"].unstack("symbol")
+    rel = tg[f"rel_ret_{h}"].unstack("symbol")
+    rk = tg[f"rank_rel_{h}"].unstack("symbol")
+    others = SYMS[:-1]
+    assert not np.isnan(ret.loc[SESSIONS[29], "S7"])                  # it lists at S+1 and has an outcome ...
+    for i in (20, 29, 35, 42):                                        # ... but is undecidable at S (unlisted, then ATR warm-up)
+        assert np.isnan(rel.loc[SESSIONS[i], "S7"]) and np.isnan(rk.loc[SESSIONS[i], "S7"]), i
+        if i >= 29:
+            assert np.allclose(rel.loc[SESSIONS[i], others], ret.loc[SESSIONS[i], others] - ret.loc[SESSIONS[i], others].mean())
+    assert not np.isnan(rel.loc[SESSIONS[44], "S7"])                  # ATR14 is available from the 14th listed bar
+    # the others' results equal a panel without S7 at all
+    ref = T.daily_targets({k: v for k, v in b.items() if k != "S7"}, (h,))
+    ref_rel = ref[f"rel_ret_{h}"].unstack("symbol")
+    ref_rk = ref[f"rank_rel_{h}"].unstack("symbol")
+    for i in (29, 35, 42):
+        assert np.allclose(rel.loc[SESSIONS[i], others], ref_rel.loc[SESSIONS[i]])
+        assert np.array_equal(rk.loc[SESSIONS[i], others], ref_rk.loc[SESSIONS[i]])
+
+
+def test_filled_s_is_not_decidable_either():
+    b = make_bars()
+    b["S2"] = b["S2"].copy()
+    b["S2"].iloc[40, b["S2"].columns.get_loc("filled")] = True
+    tg = T.daily_targets(b, (3,))
+    rel = tg["rel_ret_3"].unstack("symbol")
+    assert np.isnan(rel.loc[SESSIONS[40], "S2"]) and rel.loc[SESSIONS[40]].drop("S2").notna().all()
+
+
+
 def test_fewer_than_five_values_is_nan(bars):
     b = {k: v.copy() for k, v in bars.items()}
     for sym in ("S0", "S1", "S2", "S3"):                          # 4 of 8 symbols have no S+3 on session 30
@@ -279,6 +320,11 @@ def test_multistep_matrix(tg):
 
 
 # ------------------------------------------------------------------ barriers
+def excursions(bars, h):
+    e = T.daily_excursions(bars, [h])[h]
+    return e.up, e.dn
+
+
 def barrier_bars():
     """A flat, quiet series so ATR is a known constant, with hand-made S+1.. bars after session 30."""
     idx = pd.bdate_range("2024-01-02", periods=60)
@@ -299,7 +345,7 @@ def test_barrier_path_starts_at_the_next_open_and_spans_s_plus_1_to_s_plus_h():
         d.iloc[i, :4] = [o, hi, lo, c]
     atr = wilder(true_range(d["high"], d["low"], d["close"]), 14).iloc[s]
     assert atr > 0
-    up, dn = T.daily_excursions(b, h)
+    up, dn = excursions(b, h)
     row = 0 * len(base) + s
     assert up.shape == (2 * len(base), h)
     np.testing.assert_allclose(up[row], [(112 - 110) / atr, (118 - 110) / atr, (118 - 110) / atr], rtol=1e-5)
@@ -309,10 +355,10 @@ def test_barrier_path_starts_at_the_next_open_and_spans_s_plus_1_to_s_plus_h():
     # S+4 (outside the horizon) changes nothing; S+3 (the last path bar) does
     d2 = {k: v.copy() for k, v in b.items()}
     d2["S0"].iloc[s + 4, :4] = [102, 900, 0.5, 102]
-    up2, _ = T.daily_excursions(d2, h)
+    up2, _ = excursions(d2, h)
     np.testing.assert_array_equal(up2[row], up[row])
     d2["S0"].iloc[s + 3, d2["S0"].columns.get_loc("high")] = 130
-    up3, _ = T.daily_excursions(d2, h)
+    up3, _ = excursions(d2, h)
     assert up3[row][-1] > up[row][-1]
     # NaN where the horizon runs past the data end
     assert np.isnan(up[len(base) - 1]).all() and np.isnan(up[len(base) - h]).all()
@@ -322,12 +368,12 @@ def test_barrier_path_starts_at_the_next_open_and_spans_s_plus_1_to_s_plus_h():
 def test_barrier_excursions_do_not_depend_on_the_close_of_s():
     base = barrier_bars()
     b = {sym: base.copy() for sym in SYMS[:2]}
-    up, dn = T.daily_excursions(b, 3)
+    up, dn = excursions(b, 3)
     b["S0"].iloc[30, b["S0"].columns.get_loc("close")] = 100.4          # S's close moves, its range does not
-    up2, dn2 = T.daily_excursions(b, 3)
+    up2, dn2 = excursions(b, 3)
     np.testing.assert_array_equal(up[30], up2[30])
     b["S0"].iloc[31, b["S0"].columns.get_loc("open")] = 100.5           # the entry moves
-    up3, _ = T.daily_excursions(b, 3)
+    up3, _ = excursions(b, 3)
     assert not np.array_equal(up[30], up3[30])
 
 
@@ -336,19 +382,19 @@ def test_same_bar_touch_of_both_barriers_is_a_loss():
     b = {sym: base.copy() for sym in SYMS[:2]}
     s = 30
     b["S0"].iloc[s + 1, :4] = [100, 120, 80, 100]       # one bar tags +20 and -20 around the open
-    up, dn = T.daily_excursions(b, 3)
+    up, dn = excursions(b, 3)
     lab = T.triple_barrier_labels(up, dn, 1.0, 1.0)
     assert lab[s] == 0.0
     # a win needs the take-profit alone
     b["S1"].iloc[s + 1, :4] = [100, 120, 99.9, 100]
-    up, dn = T.daily_excursions(b, 3)
+    up, dn = excursions(b, 3)
     lab = T.triple_barrier_labels(up, dn, 1.0, 5.0)
     assert lab[len(base) + s] == 2.0
 
 
 def _fit_inputs(bars, h):
     df = T.daily_targets(bars, (h,))
-    return df, T.daily_excursions(bars, h)
+    return df, T.daily_excursions(bars, [h])[h]
 
 
 def test_fitted_barrier_k_gives_a_third_timeouts_on_train_rows(bars):
@@ -372,16 +418,17 @@ def test_fitted_barrier_k_gives_a_third_timeouts_on_train_rows(bars):
 @pytest.mark.parametrize("kind", ["direction", "binary_direction", "triple_barrier", "binary_barrier"])
 def test_fitted_thresholds_use_train_rows_only(bars, kind):
     h = 5
-    df, (up, dn) = _fit_inputs(bars, h)
+    df, exc0 = _fit_inputs(bars, h)
+    up, dn = exc0.up, exc0.dn
     mask = np.asarray(df.index.get_level_values("session") < SESSIONS[55])
     spec = T.TargetSpec(kind, h)
-    ref = T.fit_daily_target(df, spec, mask, (up, dn))
+    ref = T.fit_daily_target(df, spec, mask, exc0)
     wild = df.copy()
     wild.loc[~mask, f"ret_{h}"] = wild.loc[~mask, f"ret_{h}"] * 7.0 + 0.3
     up2, dn2 = up.copy(), dn.copy()
     up2[~mask] = np.random.default_rng(1).uniform(0, 30, up2[~mask].shape)
     dn2[~mask] = np.random.default_rng(2).uniform(0, 30, dn2[~mask].shape)
-    chg = T.fit_daily_target(wild, spec, mask, (up2, dn2))
+    chg = T.fit_daily_target(wild, spec, mask, dataclasses.replace(exc0, up=up2, dn=dn2))
     assert chg.params == ref.params
     if kind == "direction":
         tr = df.loc[mask, f"ret_{h}"].dropna().to_numpy()
@@ -394,7 +441,7 @@ def test_fitted_thresholds_use_train_rows_only(bars, kind):
     wild2.loc[mask, f"ret_{h}"] = wild2.loc[mask, f"ret_{h}"] * 7.0 + 0.3
     up3, dn3 = up.copy(), dn.copy()
     up3[mask] = np.random.default_rng(3).uniform(0, 30, up3[mask].shape)
-    chg2 = T.fit_daily_target(wild2, spec, mask, (up3, dn3))
+    chg2 = T.fit_daily_target(wild2, spec, mask, dataclasses.replace(exc0, up=up3, dn=dn3))
     if kind != "binary_direction":                      # its fit holds only class means, which are not parameters
         assert chg2.params != ref.params
     else:
@@ -414,7 +461,7 @@ def test_fit_daily_target_other_kinds_and_refusals(bars):
     with pytest.raises(ValueError, match="excursions"):
         T.fit_daily_target(df, T.TargetSpec("triple_barrier", h), mask)
     with pytest.raises(ValueError, match="do not match"):
-        T.fit_daily_target(df, T.TargetSpec("triple_barrier", h), mask, (exc[0][:10], exc[1][:10]))
+        T.fit_daily_target(df, T.TargetSpec("triple_barrier", h), mask, dataclasses.replace(exc, up=exc.up[:10], dn=exc.dn[:10]))
     with pytest.raises(ValueError, match="train_mask"):
         T.fit_daily_target(df, T.TargetSpec("direction", h), np.flatnonzero(mask))
     with pytest.raises(KeyError):
@@ -427,18 +474,35 @@ def test_fit_daily_target_other_kinds_and_refusals(bars):
 def test_daily_fold_rows_purge(tg):
     h = 5
     fold = T.Fold("F", date(2024, 1, 2), date(2024, 3, 1), date(2024, 3, 29))
-    train, pred = T.daily_fold_rows(tg, fold, h)
+    train, pred = T.daily_fold_rows(tg, fold, h, f"ret_{h}")
     sess = tg.index.get_level_values("session")
     te = tg[f"target_end_{h}"]
     assert (te.iloc[train] < pd.Timestamp(fold.pred_start)).all()
     assert (sess[train] < pd.Timestamp(fold.pred_start)).all()
     # the last h training sessions before the block are purged
     last_train = sess[train].max()
-    nxt = SESSIONS[SESSIONS.get_loc(last_train) + 1]
-    assert nxt < pd.Timestamp(fold.pred_start)
     assert SESSIONS[SESSIONS < pd.Timestamp(fold.pred_start)][-h - 1] == last_train
     assert (sess[pred] >= pd.Timestamp(fold.pred_start)).all() and (sess[pred] <= pd.Timestamp(fold.pred_end)).all()
-    assert len(pred) == len(SYMS) * ((SESSIONS >= pd.Timestamp(fold.pred_start)) & (SESSIONS <= pd.Timestamp(fold.pred_end))).sum()
+
+
+def test_daily_fold_rows_keep_only_rows_with_a_finite_target_and_atr(tg):
+    h = 5
+    fold = T.Fold("F", date(2024, 1, 2), date(2024, 3, 1), date(2024, 3, 29))
+    for col in (f"ret_{h}", f"rel_ret_{h}", f"up_{h}"):
+        train, pred = T.daily_fold_rows(tg, fold, h, col)
+        for rows in (train, pred):
+            assert np.isfinite(tg[col].to_numpy()[rows]).all(), col
+            assert np.isfinite(tg["atr_pct"].to_numpy()[rows]).all(), col
+    train, pred = T.daily_fold_rows(tg, fold, h, f"ret_{h}")
+    sess = tg.index.get_level_values("session")
+    in_block = (sess >= pd.Timestamp(fold.pred_start)) & (sess <= pd.Timestamp(fold.pred_end))
+    assert len(pred) == len(SYMS) * (in_block.sum() // len(SYMS))      # the whole block has outcomes and an ATR
+    # the first 13 sessions have no ATR: a fold that trains from the start loses them
+    early = T.Fold("E", date(2024, 1, 2), date(2024, 3, 1), date(2024, 3, 29))
+    t2, _ = T.daily_fold_rows(tg, early, h, f"ret_{h}")
+    assert (sess[t2] >= SESSIONS[13]).all()
+    with pytest.raises(KeyError):
+        T.daily_fold_rows(tg, fold, h, "nope")
 
 
 # ------------------------------------------------------------------ class balance
@@ -507,3 +571,125 @@ def test_input_refusals(bars):
     member = pd.DataFrame(True, index=SESSIONS, columns=SYMS[:-1])
     with pytest.raises(ValueError, match="no column"):
         T.daily_targets(bars, (3,), universe=member)
+
+
+# ------------------------------------------------------------------ shared arrays, excursions, memory
+def test_arrays_are_computed_once_and_shared(bars, monkeypatch):
+    from app.services import ml_panel
+    calls = []
+    real = ml_panel.wilder
+    monkeypatch.setattr(ml_panel, "wilder", lambda *a, **k: calls.append(1) or real(*a, **k))
+    arrays = T.daily_arrays(bars)
+    assert len(calls) == len(SYMS)
+    shared = T.daily_targets(bars, HS, arrays=arrays)
+    exc = T.daily_excursions(None, HS, arrays=arrays)
+    assert len(calls) == len(SYMS)                                        # the ATR loop ran once
+    pd.testing.assert_frame_equal(shared, T.daily_targets(bars, HS))
+    assert exc[5].fingerprint == arrays.fingerprint
+
+
+def test_excursions_are_built_once_for_the_largest_horizon_and_sliced(bars):
+    both = T.daily_excursions(bars, HS)
+    assert sorted(both) == sorted(HS)
+    for h in HS:
+        alone = T.daily_excursions(bars, [h])[h]
+        assert both[h].up.shape == (len(SYMS) * N_SESS, h)
+        np.testing.assert_array_equal(both[h].up, alone.up)
+        np.testing.assert_array_equal(both[h].dn, alone.dn)
+        assert both[h].horizon == h
+    # a row valid for H=1 but past the end for H=20 keeps its short path only for the short horizon
+    row = N_SESS - 2                                                      # S+1 = the last session
+    assert not np.isnan(both[1].up[row]).any() and np.isnan(both[20].up[row]).all()
+    # the validity mask is the horizon's own: rows valid for 3 but not 5
+    row = N_SESS - 4
+    assert not np.isnan(both[3].up[row]).any() and np.isnan(both[5].up[row]).all()
+
+
+def test_excursions_are_matched_to_the_frame_by_fingerprint(bars):
+    h = 5
+    df = T.daily_targets(bars, (h,))
+    exc = T.daily_excursions(bars, [h])[h]
+    mask = np.ones(len(df), dtype=bool)
+    spec = T.TargetSpec("triple_barrier", h)
+    T.fit_daily_target(df, spec, mask, exc)                                # the matching layout passes
+    renamed = {f"X{i}": v for i, (k, v) in enumerate(bars.items())}       # same shape, other symbols
+    with pytest.raises(ValueError, match="different symbols or sessions"):
+        T.fit_daily_target(df, spec, mask, T.daily_excursions(renamed, [h])[h])
+    later = {k: v.set_axis(v.index + pd.Timedelta(days=7)) for k, v in bars.items()}      # same shape, other sessions
+    with pytest.raises(ValueError, match="different symbols or sessions"):
+        T.fit_daily_target(df, spec, mask, T.daily_excursions(later, [h])[h])
+    with pytest.raises(ValueError, match="do not match"):
+        T.fit_daily_target(df, spec, mask, T.daily_excursions(bars, [3])[3])
+    with pytest.raises(ValueError, match="different symbols or sessions"):
+        T.fit_daily_target(df.iloc[::-1], spec, mask, exc)                 # a reordered frame is another layout
+    with pytest.raises(ValueError, match="symbol-major"):
+        T.daily_fingerprint(df.iloc[5:])                                   # a sliced frame has no layout at all
+    assert T.daily_fingerprint(df) == exc.fingerprint
+
+
+def test_kinds_build_only_the_requested_families(bars, tg):
+    part = T.daily_targets(bars, (3, 5), kinds=("up", "realvol"))
+    assert sorted(part.columns) == sorted(["atr_pct", "up_3", "up_5", "realvol_3", "realvol_5"])
+    for c in part.columns:
+        pd.testing.assert_series_equal(part[c], tg[c], check_names=False)
+    sel = T.daily_targets(bars, (5,), kinds=("rank_rel",))
+    assert sorted(sel.columns) == ["atr_pct", "rank_rel_5", "session_group"]
+    pd.testing.assert_series_equal(sel["rank_rel_5"], tg["rank_rel_5"])
+    ret_only = T.daily_targets(bars, (5,), kinds=("ret",))
+    assert sorted(ret_only.columns) == ["atr_pct", "ret_5"]
+    with pytest.raises(ValueError, match="kinds"):
+        T.daily_targets(bars, (5,), kinds=("ret", "nope"))
+    with pytest.raises(ValueError, match="kinds"):
+        T.daily_targets(bars, (5,), kinds=())
+    with pytest.raises(KeyError, match="ret_5"):
+        T.fit_daily_target(T.daily_targets(bars, (5,), kinds=("up",)), T.TargetSpec("direction", 5),
+                           np.ones(len(bars) * N_SESS, dtype=bool))
+    # regression needs only z
+    z = T.daily_targets(bars, (5,), kinds=("z",))
+    T.fit_daily_target(z, T.TargetSpec("regression", 5), np.ones(len(z), dtype=bool))
+
+
+def test_flag_and_bucket_columns_are_float32(tg):
+    for h in HS:
+        for c in ("up", "quintile", "beats", "rank_rel"):
+            assert tg[f"{c}_{h}"].dtype == np.float32, c
+    assert tg["session_group"].dtype == np.int32
+
+
+def test_one_bucket_pass_per_horizon_with_the_default_buckets(bars, monkeypatch):
+    calls = []
+    real = T._buckets
+    monkeypatch.setattr(T, "_buckets", lambda rel, n: calls.append(n) or real(rel, n))
+    T.daily_targets(bars, HS)
+    assert calls == [5] * len(HS)
+    calls.clear()
+    T.daily_targets(bars, (3,), n_buckets=3)
+    assert sorted(calls) == [3, 5]
+    calls.clear()
+    T.daily_targets(bars, (3,), kinds=("rank_rel",), n_buckets=3)
+    assert calls == [3]
+
+
+def test_rank_groups_accepts_row_positions(tg):
+    fold = T.Fold("F", date(2024, 1, 2), date(2024, 3, 1), date(2024, 3, 29))
+    train, _ = T.daily_fold_rows(tg, fold, 5, "rel_ret_5")
+    order, rel, sizes = T.rank_groups(tg, 5, rows=train)
+    assert set(order) <= set(train) and len(order) == len(train)           # every usable train row has a rank
+    grp = tg["session_group"].to_numpy()[order]
+    assert (np.diff(grp) >= 0).all() and sizes.sum() == len(order)
+    shuffled = np.random.default_rng(0).permutation(train)
+    order2, rel2, sizes2 = T.rank_groups(tg, 5, rows=shuffled)
+    assert np.array_equal(sizes, sizes2) and np.array_equal(np.sort(order), np.sort(order2))
+    assert np.array_equal(rel2, tg["rank_rel_5"].to_numpy()[order2].astype(int))
+
+
+def test_bool_flag_columns_are_required_not_cast(bars):
+    for col in ("listed", "filled", "ended"):
+        bad = {k: v.copy() for k, v in bars.items()}
+        bad["S1"][col] = bad["S1"][col].astype(int)
+        with pytest.raises(TypeError, match=col):
+            T.daily_targets(bad, (3,))
+    obj = {k: v.copy() for k, v in bars.items()}
+    obj["S1"]["listed"] = obj["S1"]["listed"].astype(object)
+    with pytest.raises(TypeError, match="listed"):
+        T.daily_targets(obj, (3,))
