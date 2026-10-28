@@ -13,6 +13,11 @@ selection: they are the final holdout.  Two universes:
                  the hash: NDQ30 locked symbols are always locked, NDQ30 dev symbols (which are
                  trained on) never are.
 
+Rule: timing ETFs are instruments, not part of the stock holdout. The sixteen ETFs of the timing track
+(:data:`TIMING_ETFS`) are never locked, whatever the large-cap hash says of their tickers (it would lock
+seven of them).  The exemption is a committed constant, not a JSON edit; the NDQ30 ``locked`` list is still
+checked first, so no stock can be smuggled in by adding it to the tuple.
+
 Callers (grid runner, feature builders) pass every symbol they are about to train or search on
 through :func:`assert_unlocked`.
 
@@ -52,6 +57,11 @@ NDQ30 = tuple(
      "INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX").split(","))
 
 
+#: The timing track's ETFs (index, size/style and the eleven sector funds): instruments, not holdout stocks.
+TIMING_ETFS = ("SPY", "QQQ", "IWM", "DIA", "SMH", "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU",
+               "XLRE", "XLC")
+
+
 class LockedSymbolError(RuntimeError):
     """A locked (holdout) symbol was about to be used for training, search or selection."""
 
@@ -82,7 +92,8 @@ def _state() -> tuple:
 
 
 def is_locked_largecap(symbol: str) -> bool:
-    """True if ``symbol`` (canonical spelling, see module docstring) is in the holdout.
+    """True if ``symbol`` (canonical spelling, see module docstring) is in the holdout.  The NDQ30 locked list
+    wins first; then NDQ30 dev and the timing ETFs are never locked; the rest is the hash rule.
 
     Raises ValueError for a non-str, empty, padded or lower-case symbol.
     """
@@ -93,7 +104,7 @@ def is_locked_largecap(symbol: str) -> bool:
     locked, dev, seed = _state()
     if symbol in locked:
         return True
-    if symbol in dev:
+    if symbol in dev or symbol in TIMING_ETFS:
         return False
     digest = hashlib.sha256(f"{seed}:{symbol}".encode("utf-8")).digest()
     return digest[0] % 3 == 0

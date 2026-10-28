@@ -160,3 +160,68 @@ def test_controls_report_with_a_timing_metric_recomputes_the_cutoff_after_each_s
     # a metric over a frame carrying a stale cutoff column would NOT see the shuffle: that is what q= avoids
     stale = E.with_cutoff(joined, 0.5, 20)
     assert E.timing_metric(cutoff_col="cutoff")(C.shuffle_time(stale, 1)) != pytest.approx(manual)
+
+
+# ------------------------------------------------------------------ shuffle_time_within_block
+def _regime_frame(seed=0, n_blocks=12, block_len=40, n_sym=10):
+    """Scores that only know the REGIME: every score is its block's state plus a little noise, and the block's drift
+    follows the state. A model like that has an "in" share that tracks the regime, not the day."""
+    rng = np.random.default_rng(seed)
+    sess = pd.bdate_range("2020-01-02", periods=n_blocks * block_len)
+    state = rng.normal(size=n_blocks)
+    rows = []
+    for t, s in enumerate(sess):
+        b = t // block_len
+        for i in range(n_sym):
+            rows.append((f"S{i:02d}", s, f"B{b:02d}", state[b] + rng.normal(0, 0.05),
+                         0.004 * state[b] + rng.normal(0, 0.01)))
+    df = pd.DataFrame(rows, columns=["symbol", "session", "block", "score", "ret"])
+    df["vol"] = 0.02
+    df["rel_ret"] = df["ret"] - df.groupby("session")["ret"].transform("mean")
+    return df
+
+
+def test_shuffle_time_within_block_permutes_each_symbols_scores_inside_its_block():
+    df = E.flat(_regime_frame())
+    out = C.shuffle_time_within_block(df, 1)
+    keep = ["symbol", "session", "block", "ret", "vol", "rel_ret"]
+    assert list(out.columns) == list(df.columns) and out[keep].equals(df[keep])
+    for (_, _), g in df.groupby(["symbol", "block"]):
+        assert np.array_equal(np.sort(out.loc[g.index, "score"].to_numpy()), np.sort(g["score"].to_numpy()))
+    assert not np.array_equal(out["score"], df["score"])
+    # deterministic per seed, independent of row order, different across seeds, input untouched
+    assert out.equals(C.shuffle_time_within_block(df.sample(frac=1.0, random_state=5), 1))
+    assert not out.equals(C.shuffle_time_within_block(df, 2))
+    before = df.copy()
+    C.shuffle_time_within_block(df, 1)
+    assert df.equals(before)
+    with pytest.raises(ValueError, match="block"):
+        C.shuffle_time_within_block(df.drop(columns="block"), 1)
+
+
+def test_within_block_shuffle_keeps_a_block_level_signal_that_the_full_time_shuffle_destroys():
+    df = _regime_frame()
+    tm = E.timing_metric(q=0.6, cost_bps=0.0, min_obs=20)
+    real = tm(df)
+    assert real > 0
+    full = np.mean([tm(C.shuffle_time(df, s)) for s in range(1, 6)])
+    within = np.mean([tm(C.shuffle_time_within_block(df, s)) for s in range(1, 6)])
+    assert abs(full) < 0.3 * real                       # the unrestricted null kills a regime-only score ...
+    assert within > 0.5 * real                          # ... the within-block null keeps most of it
+
+
+def test_controls_report_adds_the_within_block_null_only_when_asked_and_it_penalises_a_regime_model():
+    df = _regime_frame()
+    outcomes = df[["symbol", "session", "ret", "vol"]]
+    preds = df[["symbol", "session", "score", "block"]]
+    tm = E.timing_metric(q=0.6, cost_bps=0.0, min_obs=20)
+    plain = C.controls_report(preds, outcomes, tm, seeds=tuple(range(1, 21)))
+    assert "shuffle_time_within_block" not in plain
+    rep = C.controls_report(preds, outcomes, tm, seeds=tuple(range(1, 21)), within_block=True)
+    assert rep["shuffle_time"]["p_value"] == pytest.approx(1 / 21)                 # looks significant against the full null
+    wb = rep["shuffle_time_within_block"]
+    assert len(wb["values"]) == 20 and wb["p_value"] > 0.2 and wb["mean"] > 0.5 * rep["model"]
+    manual = tm(C.shuffle_time_within_block(E.flat(df), 1))
+    assert wb["values"][0] == pytest.approx(manual)
+    with pytest.raises(ValueError, match="block"):
+        C.controls_report(preds.drop(columns="block"), outcomes, tm, seeds=(1,), within_block=True)

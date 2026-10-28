@@ -356,3 +356,52 @@ def test_by_regime_with_a_metric_fn_over_predictions():
     df = _with_ret(df, df["latent"] * 0.01).assign(score=lambda d: d["rel_ret"])
     out = E.by_regime(df, E.rank_ic_metric())
     assert out["all"] == pytest.approx(1.0) and out["2021"] == pytest.approx(1.0)
+
+
+# ------------------------------------------------------------------ tie-break of the quintile legs
+def _tied_panel(n_sess=200, n_names=10):
+    """All scores tied; rel_ret increases with the symbol's alphabetical position, so a tie broken by symbol order
+    (the old ``rank(method='first')``) puts the best names in the top leg every day."""
+    rows = []
+    for s in SESSIONS[:n_sess]:
+        for i in range(n_names):
+            rows.append((f"S{i:02d}", s, 1.0, 0.001 * (i - (n_names - 1) / 2)))
+    df = pd.DataFrame(rows, columns=["symbol", "session", "score", "rel_ret"])
+    df["vol"] = 0.02
+    return df
+
+
+def test_tied_scores_do_not_follow_symbol_order():
+    df = _tied_panel()
+    sp = E.quintile_spread(df)
+    biased = (0.001 * 4.5 + 0.001 * 3.5) / 2 * 2 / 0.02        # top two (S08, S09) minus bottom two, in vol units
+    assert abs(sp.mean) < 0.35 * biased                          # was exactly `biased` with the alphabetical tie-break
+    assert abs(sp.long_mean) < 0.35 * biased / 2
+
+
+def test_tie_break_is_deterministic_and_independent_of_row_and_symbol_order():
+    df = _tied_panel(60)
+    a = E.quintile_spread(df)
+    shuffled = df.sample(frac=1.0, random_state=11)
+    b = E.quintile_spread(shuffled)
+    assert a.mean == b.mean and a.long_mean == b.long_mean
+    pd.testing.assert_series_equal(a.series, b.series)
+    # the chosen names move from session to session (not always the same alphabetical end)
+    g = df.groupby("session")
+    legs = set()
+    for _, day in g:
+        key = E._tie_key(day["session"], day["symbol"])
+        legs.add(tuple(day["symbol"].to_numpy()[np.argsort(key)][-2:]))
+    assert len(legs) > 5
+
+
+def test_tie_key_depends_on_session_and_symbol_only():
+    s = pd.Series(pd.to_datetime(["2021-01-04", "2021-01-04", "2021-01-05"]))
+    k1 = E._tie_key(s, pd.Series(["A", "B", "A"]))
+    k2 = E._tie_key(s.iloc[::-1].reset_index(drop=True), pd.Series(["A", "B", "A"]).iloc[::-1].reset_index(drop=True))
+    assert list(k1) == list(k2[::-1]) and len(set(k1)) == 3
+
+
+def test_untied_scores_are_unaffected_by_the_tie_break():
+    df = _known_day()
+    assert E.quintile_spread(df).mean == pytest.approx((0.045 - (-0.045)) / 0.02)

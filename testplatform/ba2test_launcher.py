@@ -9151,6 +9151,36 @@ def _ml_features_sector_overrides(items, no_sector: bool, symbols) -> dict:
     return overrides
 
 
+def _cmd_ml_grid(args) -> int:
+    """Stage-1 grid of the ML exploration v2 (task type ``ml_grid``, app/services/ml_grid.py): every cell of --config x
+    its seeds as out-of-sample walk-forward signals, scored per track with shuffle controls. Resumes: finished
+    (cell_key, seed) rows of --out/results.jsonl are skipped."""
+    from app.services.ml_grid import factor_effects, handle_ml_grid, read_results
+    payload = {"config_path": args.config, "cells": None, "out_dir": args.out, "cpu_slots": args.cpu_slots,
+               "gpu_slots": args.gpu_slots, "limit_cells": args.limit_cells, "cache_root": args.cache_root,
+               "settings": None, "cores": args.cores if args.cores is not None else (os.cpu_count() or 1),
+               "rerun_mismatched": args.rerun_mismatched}
+    try:
+        res = handle_ml_grid("cli-ml-grid", payload)
+    except KeyboardInterrupt:
+        print("ml-grid: interrupted (Ctrl-C). The rows already written are kept; run the same command to resume.")
+        return 130
+    if res["cancelled"]:
+        print("ml-grid: cancelled; run the same command to resume.")
+    print(f"ml-grid: {res['done']} rows written, {res['errors']} errors, {res['skipped_existing']} already finished "
+          f"-> {res['out_dir']}")
+    rows = read_results(f"{args.out}/results.jsonl")
+    for track in ("selection", "timing"):
+        if any(r.get("track") == track for r in rows):
+            fx = factor_effects(rows, track)
+            print(f"  top cells ({track}, mean - std of the primary over seeds; {len(fx['excluded'])} excluded for "
+                  f"coverage / near-constant models; deterministic families ran once, their std of 0 is built in):")
+            for _, c in fx["cells"].head(5).iterrows():
+                print(f"    {c['score']:+.4f}  mean {c['mean']:+.4f} std {c['std']:.4f}  {c['cell_key']} "
+                      f"{c['target']} h{c['horizon']} {c['family']} {c['train_months']} {c['groups']}")
+    return 1 if res["errors"] else 0
+
+
 def _cmd_ml_features(args) -> int:
     """Build (or find up to date) the point-in-time DAILY feature store (ML exploration v2, app/services/ml_features.py):
     features.parquet + meta + coverage report under --out. With --membership-top-n the X ranks and the breadth use the
@@ -10072,6 +10102,19 @@ def main(argv: "list | None" = None) -> int:
     ms.add_argument("--darts-archs", default="tft,nhits",
                     help="Darts architectures the forward-return genes may pick (tft is 20-55 min per trial).")
 
+    # ml-grid: ML exploration v2 stage-1 grid (cells x seeds, out-of-sample walk-forward signals).
+    mg = sub.add_parser("ml-grid", help="Stage-1 grid of the ML exploration v2 (cells x seeds, signal-level scoring).")
+    mg.add_argument("--config", required=True, help="JSON file: a list of cells (or {\"cells\": [...]}).")
+    mg.add_argument("--out", required=True, help="Output directory (results.jsonl, predictions/, errors.jsonl).")
+    mg.add_argument("--cpu-slots", type=int, required=True, help="Worker processes for the tabular families.")
+    mg.add_argument("--gpu-slots", type=int, default=0, help="Worker processes for sequence families (none yet).")
+    mg.add_argument("--limit-cells", type=int, default=None, help="Run only the first N cells of the config.")
+    mg.add_argument("--cache-root", default=None, help="Cache folder holding AlpacaHistoryOHLCVProvider (default: the platform cache).")
+    mg.add_argument("--rerun-mismatched", action="store_true",
+                    help="Rows in --out/results.jsonl made under other settings or data are moved to results.stale.jsonl "
+                         "and recomputed (default: refuse).")
+    mg.add_argument("--cores", type=int, default=None, help="Logical cores to share: n_jobs per fit = cores // cpu-slots (default: all).")
+
     # ml-features: the point-in-time daily feature store of the ML exploration v2.
     mf = sub.add_parser("ml-features", help="Build the point-in-time daily feature store (ML exploration v2).")
     mf.add_argument("--symbols-file", required=True, help="Symbols to build rows for (one per line / whitespace).")
@@ -10119,6 +10162,7 @@ def main(argv: "list | None" = None) -> int:
         "optimize-batch": lambda: _cmd_optimize_batch(args),
         "worker": lambda: _cmd_worker(args),
         "ml-search": lambda: _cmd_ml_search(args),
+        "ml-grid": lambda: _cmd_ml_grid(args),
         "ml-features": lambda: _cmd_ml_features(args),
         "sync-cache": lambda: _cmd_sync_cache(args),
     }[args.cmd]()

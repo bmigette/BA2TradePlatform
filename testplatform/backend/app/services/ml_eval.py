@@ -40,6 +40,7 @@ each shuffle. ``by_regime`` slices first, so a ``q=`` metric restarts its cutoff
 from __future__ import annotations
 
 import math
+import zlib
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
@@ -120,12 +121,43 @@ class Spread:
         return iter((self.mean, self.series))
 
 
+_MASK = np.uint64(0xFFFFFFFFFFFFFFFF)
+
+
+def _tie_key(session, symbol) -> np.ndarray:
+    """A pseudo-random uint64 per row, a pure function of its (session, symbol): the tie-break of equal scores.
+
+    splitmix64 of ``session_ns * odd_constant + crc32(symbol)``. It depends on neither the order of the rows nor on
+    which other symbols are present, and differs from session to session, so a block of tied scores (a near-constant
+    model) picks different names each day instead of always the alphabetical end. Deterministic across processes
+    (``crc32``, not ``hash``)."""
+    sess = pd.to_datetime(pd.Series(np.asarray(session))).to_numpy().astype("datetime64[ns]").astype(np.int64)
+    crc = np.array([zlib.crc32(str(x).encode("utf-8")) for x in np.asarray(symbol)], dtype=np.uint64)
+    with np.errstate(over="ignore"):
+        z = sess.astype(np.uint64) * np.uint64(0x9E3779B97F4A7C15) + crc
+        z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        return z ^ (z >> np.uint64(31))
+
+
+def _rank_within_session(session: np.ndarray, score: np.ndarray, tie: np.ndarray) -> np.ndarray:
+    """1-based rank of each row inside its session by (score, tie): no two rows share a rank."""
+    order = np.lexsort((tie, score, session))
+    s = session[order]
+    start = np.r_[True, s[1:] != s[:-1]]
+    first = np.maximum.accumulate(np.where(start, np.arange(len(s)), 0))
+    rank = np.empty(len(s), dtype=np.int64)
+    rank[order] = np.arange(len(s)) - first + 1
+    return rank
+
+
 def quintile_spread(df: pd.DataFrame, cost_bps: float = 0.0, min_names: int = MIN_NAMES,
                     assume_flat: bool = False) -> Spread:
     """Daily top-minus-bottom quintile spread by ``score``.
 
-    Per session with at least ``min_names`` names, ``k = n // 5`` names form each end (rank ties broken by symbol, so
-    the result is deterministic). The long leg earns ``(rel_ret - c) / vol`` per name and the short leg
+    Per session with at least ``min_names`` names, ``k = n // 5`` names form each end. Equal scores are ranked by a
+    pseudo-random key of the (session, symbol) (``_tie_key``): deterministic and independent of row order, but not
+    biased towards the alphabetical end, so a near-constant model's ties do not decide which names are "top". The long leg earns ``(rel_ret - c) / vol`` per name and the short leg
     ``-(rel_ret + c) / vol`` with ``c = cost_bps / 1e4``: cost lowers the spread by ``c / vol`` per leg, i.e.
     exactly ``2c / vol`` for a uniform vol."""
     if cost_bps < 0:
@@ -136,7 +168,8 @@ def quintile_spread(df: pd.DataFrame, cost_bps: float = 0.0, min_names: int = MI
     d = d[n >= min_names].copy()
     n = d.groupby("session")["score"].transform("size")
     k = n // 5
-    r = d.groupby("session")["score"].rank(method="first")
+    r = pd.Series(_rank_within_session(d["session"].to_numpy(), d["score"].to_numpy(dtype=float),
+                                       _tie_key(d["session"], d["symbol"])), index=d.index)
     d["x"] = d["rel_ret"] / d["vol"]
     d["cost"] = c / d["vol"]
     top, bot = r > (n - k), r <= k

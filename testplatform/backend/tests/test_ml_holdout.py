@@ -127,3 +127,39 @@ def test_ndq30_constant_matches_the_capband_matrix_universe():
             assert list(H.NDQ30) == ast.literal_eval(node.value).split(",")
             return
     pytest.fail("_PLACEHOLDER_UNIVERSE not found")
+
+
+# ------------------------------------------------------------------ timing ETFs are instruments, not holdout stocks
+ETFS = ("SPY QQQ IWM DIA SMH XLK XLF XLE XLV XLY XLP XLI XLB XLU XLRE XLC").split()
+
+
+def test_timing_etfs_are_the_committed_sixteen():
+    assert list(H.TIMING_ETFS) == ETFS and len(set(H.TIMING_ETFS)) == 16
+
+
+def test_timing_etfs_are_never_locked_but_the_hash_alone_would_lock_some():
+    import hashlib
+    seed = H.load()["largecap"]["seed"]
+    hashed = [s for s in ETFS if hashlib.sha256(f"{seed}:{s}".encode()).digest()[0] % 3 == 0]
+    assert hashed, "the exemption only matters if the hash locks some ETF"
+    for s in ETFS:
+        assert H.is_locked_largecap(s) is False
+    H.assert_unlocked(ETFS, purpose="timing")                                  # must not raise
+
+
+def test_the_ndq30_locked_list_wins_over_the_etf_exemption(monkeypatch):
+    locked = H.load()["ndq30"]["locked"][0]
+    monkeypatch.setattr(H, "TIMING_ETFS", H.TIMING_ETFS + (locked,))
+    assert H.is_locked_largecap(locked) is True
+    with pytest.raises(H.LockedSymbolError):
+        H.assert_unlocked([locked], purpose="timing")
+
+
+def test_non_etf_symbols_keep_the_hash_rule():
+    assert H.is_locked_largecap("JPM") is True and H.is_locked_largecap("XOM") is False
+    with pytest.raises(H.LockedSymbolError):
+        H.assert_unlocked(["SPY", "JPM"], purpose="timing")
+
+
+def test_the_exemption_is_documented_in_the_module():
+    assert "timing ETFs are instruments, not part of the stock holdout" in H.__doc__
