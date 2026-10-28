@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import json
 
 from app.services.data_preparation import DataPreparationService, frame_bounds, purged_train_row_count, three_way_bounds
+from app.services.darts_training import fill_masked_covariates, has_masked_cells
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +134,9 @@ class TSAITrainingService(ITrainingService):
         seq_len: int = 24,
         prediction_horizon: int = 0,
         prediction_mode: str = 'shift',
-        fit_scaler: bool = True
+        fit_scaler: bool = True,
+        scaler_fit_until: Optional[pd.Timestamp] = None,
+        scaler_fit_ratio: Optional[float] = None
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Prepare data for tsai model training.
@@ -150,6 +153,16 @@ class TSAITrainingService(ITrainingService):
             prediction_horizon: How many bars ahead to predict (0 = predict at end of sequence)
             prediction_mode: 'shift' for single target at T+N, 'multistep' for T+1...T+N
             fit_scaler: Whether to fit the scaler (True for train, False for test)
+            scaler_fit_until / scaler_fit_ratio: the train block of ``df`` (the rows dated up to and including
+                that timestamp, or that leading fraction of the rows) when ``df`` also holds held-out rows. They
+                only decide which rows the masked-cell medians are fitted on; with neither, a ``fit_scaler``
+                frame is all train.
+
+        Cells blanked by the daily source's coverage mask (``<prefix>missing`` == 1) are filled with the
+        train-block median before the scaling (``darts_training.fill_masked_covariates``: the flag stays a
+        feature, a group masked in every row is dropped from ``feature_columns`` with a warning). A frame that
+        is not the training one cannot fit that median: it must arrive already filled (the split methods
+        do it on the whole frame, fitted on its train rows) or the call is refused.
 
         Returns:
             Tuple of (X, y) numpy arrays
@@ -163,6 +176,21 @@ class TSAITrainingService(ITrainingService):
 
         # Extract target
         y_data = df[target_column].values.astype(np.int64)
+
+        n_fit = None
+        if scaler_fit_until is not None:
+            n_fit = max(1, int((pd.to_datetime(df['Date']) <= scaler_fit_until).sum()))
+        elif scaler_fit_ratio is not None:
+            n_fit = max(1, int(len(df) * scaler_fit_ratio))
+        elif fit_scaler:
+            n_fit = len(df)
+        if n_fit is not None:
+            df, feature_columns = self._fill_masked(df, feature_columns, n_fit)
+        elif has_masked_cells(df[feature_columns]):
+            raise ValueError(
+                "this frame has masked cells (blanked by the coverage mask, <prefix>missing == 1) but is not the "
+                "training frame, so it cannot fit their neutral value: fill them on the whole frame first "
+                "(prepare_split_three_way / prepare_data_split do) or pass scaler_fit_until / scaler_fit_ratio")
 
         # Apply 35% buffered normalization (same as Darts)
         if self.normalize:
@@ -197,6 +225,28 @@ class TSAITrainingService(ITrainingService):
 
         logger.info(f"Prepared data: X shape {X.shape}, y shape {y.shape}, horizon={prediction_horizon}, mode={prediction_mode}, normalized={self.normalize}")
         return X, y
+
+    @staticmethod
+    def _fill_masked(df: pd.DataFrame, feature_columns: List[str], n_fit: int) -> Tuple[pd.DataFrame, List[str]]:
+        """``df`` with the coverage mask's blank cells filled (train median of its first ``n_fit`` rows) and the feature
+        columns without any group masked in every row. A frame without a daily ``missing`` flag is returned as it is."""
+        filled, dropped = fill_masked_covariates(df[feature_columns], n_fit)
+        if filled.equals(df[feature_columns]) and not dropped:
+            return df, list(feature_columns)
+        out = df.copy()
+        out[list(filled.columns)] = filled
+        return out, [c for c in feature_columns if c not in dropped]
+
+    def _fill_masked_frames(self, frames: List[pd.DataFrame], feature_columns: List[str],
+                            n_fits: List[int]) -> Tuple[List[pd.DataFrame], List[str]]:
+        """``_fill_masked`` for every ticker (each with its own train rows). A group masked in every row of ANY ticker is
+        dropped for all of them, so every ticker keeps the same feature set."""
+        out, dropped = [], set()
+        for df, n in zip(frames, n_fits):
+            filled, d = self._fill_masked(df, feature_columns, n)
+            out.append(filled)
+            dropped |= set(feature_columns) - set(d)
+        return out, [c for c in feature_columns if c not in dropped]
 
     def prepare_data_split(
         self,
@@ -244,6 +294,8 @@ class TSAITrainingService(ITrainingService):
         # The 35% buffer, not the test rows, is what gives out-of-range headroom;
         # transform() clips anything past it.
         split_idx = int(len(df) * train_ratio)
+        # masked cells get the median of the train rows (the purge below only shortens them)
+        df, feature_columns = self._fill_masked(df, feature_columns, purged_train_row_count(split_idx, label_horizon) or split_idx)
         df_train = df.iloc[:split_idx]
         df_test = df.iloc[split_idx:]
 
@@ -291,10 +343,11 @@ class TSAITrainingService(ITrainingService):
 
         # Per-dataset chronological split, with the boundary purge applied first so
         # the scaler is fitted on exactly the rows that will be trained on.
+        keeps = [purged_train_row_count(int(len(df) * train_ratio), label_horizon) for df in dataframes]
+        dataframes, feature_columns = self._fill_masked_frames(list(dataframes), feature_columns, keeps)
         train_frames, test_frames = [], []
-        for df in dataframes:
+        for df, keep in zip(dataframes, keeps):
             split_idx = int(len(df) * train_ratio)
-            keep = purged_train_row_count(split_idx, label_horizon)
             train_frames.append(df.iloc[:keep])
             test_frames.append(df.iloc[split_idx:])
 
@@ -357,6 +410,9 @@ class TSAITrainingService(ITrainingService):
 
         blocks = {'train': [], 'val': [], 'holdout': []}
         all_bounds = frame_bounds(dataframes, train_ratio, holdout_share_of_test, label_horizon, common_dates)
+        # masked cells get the median of each ticker's own train rows (the common-date cut gives the same positions)
+        dataframes, feature_columns = self._fill_masked_frames(list(dataframes), feature_columns,
+                                                               [b['train_end'] for b in all_bounds])
         for df, b in zip(dataframes, all_bounds):
             blocks['train'].append(df.iloc[:b['train_end']])
             blocks['val'].append(df.iloc[b['val_start']:b['val_end']])

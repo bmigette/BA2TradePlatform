@@ -44,6 +44,30 @@ except ImportError:
     DARTS_AVAILABLE = False
 
 
+def masked_groups(cov: pd.DataFrame) -> List[Tuple[str, List[str], np.ndarray]]:
+    """``(flag column, the group's columns, bool array of the flagged rows)`` for every daily-store group of ``cov`` that has
+    at least one masked row (``<prefix>missing`` == 1). Only the daily store's group prefixes count
+    (``ml_dataset_source.daily_column_prefixes``); the ``_covered`` flags are never masked (they describe the data)."""
+    from app.services.ml_dataset_source import daily_column_prefixes
+    prefixes = set(daily_column_prefixes())
+    found = []
+    for flag in [c for c in cov.columns if c.endswith("_missing")]:
+        prefix = flag[: -len("missing")]
+        if prefix not in prefixes:
+            continue
+        flagged = (cov[flag] == 1.0).to_numpy()
+        group = [c for c in cov.columns if c != flag and c.startswith(prefix)
+                 and not c.endswith(("_covered", "_missing"))]
+        if flagged.any() and group:
+            found.append((flag, group, flagged))
+    return found
+
+
+def has_masked_cells(cov: pd.DataFrame) -> bool:
+    """Some cell of a flagged group-year is still NaN (the coverage mask's blanks, not yet filled)."""
+    return any(cov[group].isna().to_numpy()[flagged].any() for _, group, flagged in masked_groups(cov))
+
+
 def fill_masked_covariates(cov: pd.DataFrame, n_fit: int) -> Tuple[pd.DataFrame, List[str]]:
     """Neutral values for the cells the daily source's coverage mask blanked, so the past-only forward fill never carries
     a value across a masked (group, year).
@@ -59,22 +83,11 @@ def fill_masked_covariates(cov: pd.DataFrame, n_fit: int) -> Tuple[pd.DataFrame,
 
     Only the flags of the daily store's group prefixes count (``ml_dataset_source.daily_column_prefixes``), so any other
     dataset is returned unchanged. Returns ``(covariates, dropped columns)``."""
-    from app.services.ml_dataset_source import daily_column_prefixes
-    prefixes = set(daily_column_prefixes())
     out = cov.copy()
     dropped: List[str] = []
-    for flag in [c for c in cov.columns if c.endswith("_missing")]:
-        prefix = flag[: -len("missing")]
-        if prefix not in prefixes:
-            continue
-        flagged = (out[flag] == 1.0).to_numpy()
-        # `_covered` flags are never masked (they describe the data, not carry it)
-        group = [c for c in cov.columns if c != flag and c.startswith(prefix)
-                 and not c.endswith(("_covered", "_missing"))]
-        if not flagged.any() or not group:
-            continue
+    for flag, group, flagged in masked_groups(cov):
         if flagged.all():
-            logger.warning(f"Group {prefix!r} is masked in every row (coverage threshold): dropping its columns "
+            logger.warning(f"Group {flag[:-len('missing')]!r} is masked in every row (coverage threshold): dropping its columns "
                            f"{group[:8]}{'...' if len(group) > 8 else ''}; {flag} stays as a feature")
             out = out.drop(columns=group)
             dropped += group
