@@ -111,7 +111,37 @@ def test_unknown_group_raises_and_missing_columns_are_reported():
 
 def test_columns_that_are_nan_by_design_do_not_define_coverage():
     """m_rs_sector_* is NaN for a sectorless symbol or before a sector ETF lists; mac_baa10y_* has a reviewed stall."""
-    m = F.GROUPS["m"].coverage_columns
-    assert "m_breadth_sma50" in m and "m_rs_spy_20" in m and not any(c.startswith("m_rs_sector") for c in m)
+    assert F.GROUPS["m"].coverage_columns is None                                   # all of M ...
+    assert F.GROUPS["m"].sectorless_exempt == ("m_rs_sector_5", "m_rs_sector_20")   # ... except m_rs_sector_* of a sectorless symbol
     mac = F.GROUPS["mac"].coverage_columns
     assert "mac_vixcls_lvl" in mac and not any(c.startswith("mac_baa10y") for c in mac) and len(mac) == len(F.MAC_COLUMNS) - 3
+
+
+def _m_frame():
+    """A stock whose sector ETF lists mid-2020 (m_rs_sector NaN before) and a sectorless ETF (always NaN there)."""
+    idx = pd.MultiIndex.from_product([["AAA", "SPY"], pd.bdate_range("2020-01-01", "2020-12-31")], names=["symbol", "session"])
+    df = pd.DataFrame({"listed": True, "m_spy_ret_1": 0.01, "m_rs_spy_5": 0.0, "m_rs_sector_5": 0.0, "m_rs_sector_20": 0.0}, index=idx)
+    sess = idx.get_level_values("session")
+    sym = idx.get_level_values("symbol")
+    df.loc[(sym == "AAA") & (sess < "2020-07-01"), ["m_rs_sector_5", "m_rs_sector_20"]] = np.nan
+    df.loc[sym == "SPY", ["m_rs_sector_5", "m_rs_sector_20"]] = np.nan
+    return df
+
+
+def test_the_sector_columns_are_exempt_only_for_declared_sectorless_symbols():
+    df = _m_frame()
+    sess = df.index.get_level_values("session")
+    strict = F.coverage_report(df, ["m"]).loc[("m", 2020), "share"]
+    assert strict == pytest.approx(((sess >= "2020-07-01") & (df.index.get_level_values("symbol") == "AAA")).sum() / len(df))
+    relaxed = F.coverage_report(df, ["m"], sectorless=["SPY"]).loc[("m", 2020), "share"]
+    n_aaa_ok = ((sess >= "2020-07-01") & (df.index.get_level_values("symbol") == "AAA")).sum()
+    n_spy = (df.index.get_level_values("symbol") == "SPY").sum()
+    assert relaxed == pytest.approx((n_aaa_ok + n_spy) / len(df))              # the stock's hole still counts against it
+    df.attrs["meta"] = {"sectorless": ["SPY"]}                                  # recorded by build_features / ensure
+    assert F.coverage_report(df, ["m"]).loc[("m", 2020), "share"] == pytest.approx(relaxed)
+
+
+def test_the_column_coverage_keeps_the_exempt_holes_visible():
+    df = _m_frame()
+    cc = F.column_coverage(df, ["m"])
+    assert cc.loc[("m_rs_sector_5", 2020), "share"] == pytest.approx(0.25, abs=0.01)     # AAA's second half only: SPY is NaN throughout

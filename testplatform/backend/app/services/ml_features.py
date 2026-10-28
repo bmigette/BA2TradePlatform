@@ -321,6 +321,9 @@ class GroupSpec:
     #: the columns that are non-NaN whenever its data exist: a column that is NaN BY DESIGN (no resistance level, no target
     #: in the window) must not make the whole group look uncovered.
     coverage_columns: Optional[Tuple[str, ...]] = None
+    #: columns that are required for coverage EXCEPT for a symbol declared sectorless (``meta["sectorless"]``): they are NaN
+    #: by design there, but NaN for a stock is a real hole that must count against it.
+    sectorless_exempt: Tuple[str, ...] = ()
 
 
 def _per_symbol(daily: Dict[str, pd.DataFrame], ctx: BuildContext,
@@ -1390,7 +1393,10 @@ S_FIELDS: Dict[str, Tuple[str, str, float]] = {
     "s_structure_state": ("ta-structure-v1", "structure_state", 1.0),
     "s_bars_since_bos": ("ta-structure-v1", "structure_bars_since_bos", 1.0 / 128.0),
     "s_bars_since_choch": ("ta-structure-v1", "structure_bars_since_choch", 1.0 / 128.0)}
-S_COLUMNS: Tuple[str, ...] = tuple(S_FIELDS)
+#: 1.0 where the symbol HAS a row in the structure store for that session (even if some of its values are invalid), else 0.0:
+#: the per-row coverage flag of a group that has per-symbol holes (the group-year share cannot show which symbols lack rows).
+S_COVERED = "s_covered"
+S_COLUMNS: Tuple[str, ...] = tuple(S_FIELDS) + (S_COVERED,)
 
 
 def _s_manifests(store, profile: str) -> List[Dict[str, object]]:
@@ -1431,7 +1437,8 @@ def structure(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame
     A value whose status is not ``valid`` is NaN: ``insufficient_history`` is meaningful (no confirmed pivot above the close
     means no resistance), so several structure columns are NaN by design on many rows. Symbols the manifests do not cover,
     and sessions outside their window (2020-01-02 .. 2025-12-31), are NaN; the uncovered symbols are listed in
-    ``meta["source"]["market_conditions"]``."""
+    ``meta["source"]["market_conditions"]``. ``s_covered`` is 1.0 where the symbol has a row of the structure profile for the
+    session, else 0.0 (a per-row flag for the holes a group-year share cannot show)."""
     from ba2_common.core.market_condition_store import MarketConditionStore, status_code
     from ba2_common.core.market_conditions import STATUS_VALID
 
@@ -1448,6 +1455,8 @@ def structure(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame
         for sym in ctx.symbols:
             man = next((m for m in mans if sym in m["coverage"]), None)
             cols = {c: np.full(len(ctx.sessions), np.nan) for c, (p, _, _) in S_FIELDS.items() if p == profile}
+            if profile == "ta-structure-v1":
+                cols[S_COVERED] = np.zeros(len(ctx.sessions))
             if man is None:
                 uncovered.append(sym)
             else:
@@ -1456,7 +1465,9 @@ def structure(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame
                 where = np.searchsorted(rf.sessions, pos)
                 where_c = np.minimum(where, max(len(rf) - 1, 0))
                 have = (where < len(rf)) & (rf.sessions[where_c] == pos) if len(rf) else np.zeros(len(pos), dtype=bool)
-                for c in cols:
+                if S_COVERED in cols:
+                    cols[S_COVERED] = have.astype("float64")
+                for c in [c for c in cols if c != S_COVERED]:
                     _, field, scale = S_FIELDS[c]
                     j = rf.fields.index(field)
                     good = have & (rf.status[where_c, j] == valid) if len(rf) else have
@@ -1476,7 +1487,7 @@ GROUPS: Dict[str, GroupSpec] = {
     "t": GroupSpec(technical, "t_"),
     "mtf": GroupSpec(multi_timeframe, "mtf_"),
     "m": GroupSpec(market, "m_", needs_sector=True, required_context=_market_context,
-                   coverage_columns=tuple(c for c in M_COLUMNS if not c.startswith("m_rs_sector"))),
+                   sectorless_exempt=("m_rs_sector_5", "m_rs_sector_20")),
     "x": GroupSpec(cross_section, "x_"),
     "mac": GroupSpec(macro, "mac_", coverage_columns=tuple(
         c for c in MAC_COLUMNS if not any(c.startswith(f"mac_{sid.lower()}_") for sid in KNOWN_STALLS))),
@@ -1486,7 +1497,7 @@ GROUPS: Dict[str, GroupSpec] = {
     "i": GroupSpec(insiders, "i_"),
     "s": GroupSpec(structure, "s_", coverage_columns=tuple(
         c for c in S_COLUMNS if c not in ("s_dist_support_atr", "s_dist_resistance_atr", "s_support_touches",
-                                          "s_resistance_touches", "s_bars_since_bos", "s_bars_since_choch"))),
+                                          "s_resistance_touches", "s_bars_since_bos", "s_bars_since_choch", S_COVERED))),
 }
 
 
@@ -1727,6 +1738,7 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
         "universe": universe, "context_symbols": [s for s in load if s not in symbols],
         "required_context": sorted(required), "load": load_meta, "rows": int(len(out)),
         "cache_end": str(cache_end), "sector_source": sector_source,
+        "sectorless": sorted(sym for sym in symbols if sectors is not None and sectors.get(sym) == NO_SECTOR),
         "membership": (None if membership is None else _membership_record(membership)),
         "sector_overrides": dict(sector_overrides) if sector_overrides else {},
         "ended": dict(load_meta["ended"]), "nan_rate": nan_rate,
@@ -1757,18 +1769,31 @@ def _years(df: pd.DataFrame) -> np.ndarray:
     return df.index.get_level_values("session").year.to_numpy()
 
 
-def coverage_report(df: pd.DataFrame, groups: Sequence[str]) -> pd.DataFrame:
+def _sectorless_symbols(df: pd.DataFrame, sectorless: Optional[Iterable[str]]) -> List[str]:
+    if sectorless is not None:
+        return list(sectorless)
+    meta = df.attrs["meta"] if "meta" in df.attrs else {}
+    return list(meta["sectorless"]) if "sectorless" in meta else []
+
+
+def coverage_report(df: pd.DataFrame, groups: Sequence[str], sectorless: Optional[Iterable[str]] = None) -> pd.DataFrame:
     """Per (group, year) the share of LISTED rows in which every coverage column of the group is non-NaN.
 
     Returns a frame indexed ``[group, year]`` with ``rows`` (listed rows of the year), ``complete`` and ``share``. Unlisted rows
     are not counted; a year with no listed row is absent. The coverage columns of a group are those of its
-    ``GroupSpec.coverage_columns`` (all of its columns by default)."""
+    ``GroupSpec.coverage_columns`` (all of its columns by default). A group's ``sectorless_exempt`` columns are not required
+    for the symbols in ``sectorless`` (default: ``df.attrs["meta"]["sectorless"]``, recorded by the build)."""
     listed = df["listed"].to_numpy(dtype=bool)
     year = _years(df)
+    is_sectorless = np.asarray(df.index.get_level_values("symbol").isin(_sectorless_symbols(df, sectorless)))
     rows = []
     for g in groups:
         cols = _coverage_columns(df, g)
         complete_row = df[cols].notna().all(axis=1).to_numpy()
+        exempt = [c for c in _spec(g).sectorless_exempt if c in cols]
+        if exempt:
+            relaxed = df[[c for c in cols if c not in exempt]].notna().all(axis=1).to_numpy()
+            complete_row = np.where(is_sectorless, relaxed, complete_row)
         for y in np.unique(year[listed]):
             sel = listed & (year == y)
             n, ok = int(sel.sum()), int((sel & complete_row).sum())
@@ -1927,6 +1952,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     meta["symbols"], meta["universe"] = usable_rows, uni
     meta["rows"], meta["columns"], meta["nan_rate"] = int(len(df)), list(df.columns), _nan_rates(df, groups)
     meta["ended"] = {k: v for m in metas for k, v in m["ended"].items()}
+    meta["sectorless"] = sorted({sym for m in metas for sym in m["sectorless"]})
     meta["load"] = {k: {s: v for m in metas for s, v in m["load"][k].items()} for k in metas[0]["load"]}
     source: Dict[str, object] = {"daily": {}, "fmp_history": {}}
     for m in metas:
@@ -1944,7 +1970,9 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     if not source["fmp_history"]:
         del source["fmp_history"]
     meta["source"] = source
-    report = coverage_report(df, [g for g in groups if _coverage_has_columns(df, g)])
+    covered_groups = [g for g in groups if _coverage_has_columns(df, g)]
+    report = coverage_report(df, covered_groups, sectorless=meta["sectorless"])
+    columns = column_coverage(df, covered_groups)
     meta["ensure"] = {"version": ENSURE_VERSION, "inputs": inputs, "chunk_size": chunk_size, "chunks": len(frames),
                       "refused": _refusal_report(refused), "min_share": min_share,
                       "build_seconds": round(time.time() - started, 1),
@@ -1955,6 +1983,8 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     save_features(df, out_dir / "features.parquet")
     report.to_parquet(out_dir / "coverage_report.parquet")
     report.to_csv(out_dir / "coverage_report.csv")
+    columns.to_parquet(out_dir / "column_coverage.parquet")        # every column x year, so excluded columns' holes stay visible
+    columns.to_csv(out_dir / "column_coverage.csv")
     return {"status": "built", "out_dir": str(out_dir), "symbols": usable_rows, "chunks": len(frames),
             "rows": int(len(df)), "seconds": meta["ensure"]["build_seconds"], "refused": meta["ensure"]["refused"],
             "coverage": report}

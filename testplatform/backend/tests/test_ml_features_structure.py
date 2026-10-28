@@ -22,7 +22,7 @@ def _value(sym_i, ordinal, j):
 
 
 def write_mc_store(root, symbols, cut=None, source_profile=ALPACA, calc_version=None, invalid=None, first=date(2021, 1, 4),
-                   last=date(2024, 3, 28), universe_tag=""):
+                   last=date(2024, 3, 28), universe_tag="", skip=()):
     """Publish one manifest per profile into ``<root>/market_conditions`` over ``symbols``; returns {profile: digest}.
     ``invalid`` = {(profile, symbol, session): field_index} rows stored WITH a value but a non-valid status."""
     store = MarketConditionStore(root)
@@ -37,6 +37,8 @@ def write_mc_store(root, symbols, cut=None, source_profile=ALPACA, calc_version=
         for si, sym in enumerate(symbols):
             by_month = {}
             for t in sessions:
+                if (sym, t.date()) in set(skip):                       # a hole: no row for that symbol and session
+                    continue
                 ordinal = (t - pd.Timestamp("2020-01-01")).days
                 vals = [_value(si, ordinal, j) for j in range(n_f)]
                 status = [mc.STATUS_VALID] * n_f
@@ -82,7 +84,8 @@ def _sbuild(root, symbols=("AAA", "BBB"), **kw):
 
 def test_s_columns_and_registry(pinned):
     assert F.GROUPS["s"].prefix == "s_" and not F.GROUPS["s"].needs_sector
-    assert len(F.S_COLUMNS) == 15 and F.S_COLUMNS[:3] == ("s_trend_slope_atr", "s_adx", "s_rv_ratio")
+    assert len(F.S_COLUMNS) == 16 and F.S_COLUMNS[:3] == ("s_trend_slope_atr", "s_adx", "s_rv_ratio") and F.S_COLUMNS[-1] == "s_covered"
+    assert "s_covered" not in F.GROUPS["s"].coverage_columns
     f = _sbuild(pinned)
     assert F.feature_columns(f) == list(F.S_COLUMNS)
     assert f[list(F.S_COLUMNS)].notna().all().all()
@@ -117,12 +120,13 @@ def test_a_value_whose_status_is_not_valid_becomes_nan(mc_cache, tmp_path, monke
     t = pd.Timestamp(bad_day)
     assert np.isnan(f.loc[t, "s_dist_resistance_atr"]) and np.isnan(f.loc[t, "s_adx"])
     assert f.loc[t, "s_dist_support_atr"] == f.loc[t, "s_dist_support_atr"] and f.loc[t, "s_rv_ratio"] == f.loc[t, "s_rv_ratio"]
-    assert f["s_adx"].isna().sum() == 1
+    assert f["s_adx"].isna().sum() == 1 and f.loc[t, "s_covered"] == 1                         # the row EXISTS, one value is invalid
 
 
 def test_uncovered_symbols_and_sessions_outside_the_manifest_are_nan(pinned):
     f = _sbuild(pinned, symbols=("AAA", "CCC"), last=LAST).loc["CCC"]                         # CCC is not in the manifests
-    assert f[list(F.S_COLUMNS)].isna().all().all()
+    value_cols = [c for c in F.S_COLUMNS if c != "s_covered"]
+    assert f[value_cols].isna().all().all() and (f["s_covered"] == 0).all()                  # not in the store: flag 0
     g = _sbuild(pinned, symbols=("AAA",), first=date(2024, 3, 20), last=LAST).loc["AAA"]
     assert g[list(F.S_COLUMNS)].notna().all().all()                                          # the manifest ends 2024-03-28
     meta = _sbuild(pinned, symbols=("AAA", "CCC")).attrs["meta"]["source"]["market_conditions"]
@@ -181,3 +185,16 @@ def test_the_real_store_row_of_a_session_is_computed_through_that_session():
         assert hi - lo == mc.WINDOW and sessions[hi - 1] == rf.sessions[i]
         return
     pytest.fail("no row with a retained window found")
+
+
+def test_s_covered_is_one_where_the_symbol_has_a_row_and_zero_at_a_hole(mc_cache, tmp_path, monkeypatch):
+    root = tmp_path / "c"
+    shutil.copytree(mc_cache[0], root)
+    hole = date(2023, 5, 17)
+    digests = write_mc_store(root, ("AAA", "BBB"), skip={("BBB", hole)})
+    monkeypatch.setattr(F, "S_MANIFESTS", {p: (d,) for p, d in digests.items()})
+    f = _sbuild(root)
+    t = pd.Timestamp(hole)
+    assert f.loc[("BBB", t), "s_covered"] == 0 and f.loc[("BBB", t), [c for c in F.S_COLUMNS if c != "s_covered"]].isna().all()
+    assert f.loc[("AAA", t), "s_covered"] == 1 and f.loc["BBB", "s_covered"].sum() == len(f.loc["BBB"]) - 1
+    assert f["s_covered"].notna().all()                                                         # a flag, never NaN

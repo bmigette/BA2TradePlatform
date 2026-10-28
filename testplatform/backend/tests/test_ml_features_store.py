@@ -42,13 +42,16 @@ def test_the_store_equals_one_direct_build_and_writes_every_file(work, tmp_path)
     out = tmp_path / "store"
     res = _ensure(work, out)
     assert res["status"] == "built" and res["chunks"] == 2
-    assert sorted(p.name for p in out.iterdir()) == ["coverage_report.csv", "coverage_report.parquet", "features.parquet",
-                                                       "features.parquet.meta.json"]
+    assert sorted(p.name for p in out.iterdir()) == ["column_coverage.csv", "column_coverage.parquet", "coverage_report.csv",
+                                                       "coverage_report.parquet", "features.parquet", "features.parquet.meta.json"]
     stored = pd.read_parquet(out / "features.parquet")
     direct = _build(work, GROUPS, symbols=SYMBOLS, sector_of=SECTOR_OF)
     pd.testing.assert_frame_equal(stored, direct, check_exact=True, check_freq=False)
     rep = pd.read_parquet(out / "coverage_report.parquet")
     pd.testing.assert_frame_equal(rep, F.coverage_report(direct, GROUPS), check_dtype=False)
+    cc = pd.read_parquet(out / "column_coverage.parquet")
+    pd.testing.assert_frame_equal(cc, F.column_coverage(direct, GROUPS), check_dtype=False)
+    assert ("m_rs_sector_20", 2023) in cc.index and ("t_rsi", 2023) in cc.index        # every column, every year
     meta = _meta(out)
     assert meta["symbols"] == SYMBOLS and set(meta["groups"]) == set(GROUPS) and meta["ensure"]["chunk_size"] == 2
     assert set(meta["source"]["daily"]) >= set(SYMBOLS) and meta["ensure"]["refused"] == {}
@@ -169,3 +172,13 @@ def test_a_changed_coverage_definition_rebuilds_the_report(work, tmp_path, monke
     import dataclasses
     monkeypatch.setitem(F.GROUPS, "t", dataclasses.replace(F.GROUPS["t"], coverage_columns=("t_ret_1",)))
     assert _ensure(work, out)["status"] == "built"
+
+
+def test_sectorless_symbols_are_recorded_and_exempt_in_the_stored_coverage(work, tmp_path):
+    out = tmp_path / "etf"
+    F.ensure_feature_store(out, ["SPY", "QQQ"], FIRST, LAST, ["t", "mtf", "m"], cache_root=work,
+                           sector_overrides={"SPY": F.NO_SECTOR, "QQQ": F.NO_SECTOR}, chunk_size=1)
+    assert _meta(out)["sectorless"] == ["QQQ", "SPY"]
+    rep = pd.read_parquet(out / "coverage_report.parquet")
+    assert rep.loc[("m", 2023), "share"] == 1.0                                  # the sector columns do not count for ETFs
+    assert pd.read_parquet(out / "column_coverage.parquet").loc[("m_rs_sector_5", 2023), "share"] == 0.0
