@@ -215,7 +215,9 @@ class BuildContext:
     (breadth, later ranks) are taken over - a superset of ``symbols``, so a build in chunks gives the same values as
     one build; ``context_symbols`` is everything else loaded (indices, sector ETFs); ``sessions`` is the whole loaded
     window; ``sector_of`` maps a symbol to its sector (groups with ``needs_sector``); ``cache_root`` lets a later group
-    read its own stores; ``store_dir`` is the screener metric store (groups X and F)."""
+    read its own stores; ``store_dir`` is the screener metric store (groups X and F). ``membership`` (sessions x
+    universe, bool) says who is in the universe on each session (None: every universe symbol, always);
+    ``sector_overrides`` are the caller's explicit sectors, which win over the store's."""
     symbols: Tuple[str, ...]
     universe: Tuple[str, ...]
     context_symbols: Tuple[str, ...]
@@ -225,6 +227,14 @@ class BuildContext:
     cache_root: Path
     store_dir: Path
     sector_of: Dict[str, str] = field(default_factory=dict)
+    membership: Optional[pd.DataFrame] = None
+    sector_overrides: Dict[str, str] = field(default_factory=dict)
+
+    def member_mask(self) -> pd.DataFrame:
+        """(sessions x universe) bool: who is in the cross-section on each session."""
+        if self.membership is None:
+            return pd.DataFrame(True, index=self.sessions, columns=list(self.universe))
+        return self.membership
 
 
 Builder = Callable[[Dict[str, pd.DataFrame], BuildContext], pd.DataFrame]
@@ -478,10 +488,10 @@ def market(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
 
     * ``m_<etf>_ret_{1,5,20}``: SPY / QQQ / IWM / TLT / GLD log returns (broad equity, tech, small caps, rates, gold);
     * ``m_rs_spy_{5,20}``: the symbol's log return minus SPY's; ``m_rs_sector_{5,20}``: minus its sector ETF's;
-    * ``m_breadth_sma50``: the share of ``ctx.universe`` (not the context ETFs) whose close is above its own
-      50-session SMA on that session. Symbols not yet listed, or without 50 bars, are not counted. The value is the
-      same for every symbol on a given session; it is a property of the universe, so a build in chunks over the same
-      universe gives the same breadth as one build.
+    * ``m_breadth_sma50``: the share of the universe's MEMBERS that session (``ctx.member_mask``; not the context
+      ETFs) whose close is above its own 50-session SMA. Symbols not yet listed, or without 50 bars, are not counted.
+      The value is the same for every symbol on a given session; it is a property of the universe, so a build in
+      chunks over the same universe and membership gives the same breadth as one build.
 
     Every input is a bar of session S or earlier, so a row is fixed once S has closed. Each built symbol needs a
     sector in ``SECTOR_ETF``; anything else raises."""
@@ -495,8 +505,8 @@ def market(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
         for n in _M_RET_DAYS:
             mk[f"m_{e.lower()}_ret_{n}"] = _log_ret(daily[e], n)
     closes = pd.DataFrame({s: daily[s]["close"] for s in ctx.universe})
-    sma50 = closes.rolling(50, min_periods=50).mean()
-    valid = sma50.notna()
+    sma50 = closes.rolling(50, min_periods=50).mean()                     # the average uses the symbol's own history ...
+    valid = sma50.notna() & ctx.member_mask()                              # ... and only the session's members vote
     mk["m_breadth_sma50"] = ((closes > sma50) & valid).sum(axis=1) / valid.sum(axis=1).replace(0, np.nan)
     frames: Dict[str, pd.DataFrame] = {}
     for sym in ctx.symbols:
@@ -516,67 +526,119 @@ def market(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
 SECTOR_CODE: Dict[str, int] = {
     "Basic Materials": 1, "Communication Services": 2, "Consumer Cyclical": 3, "Consumer Defensive": 4, "Energy": 5,
     "Financial Services": 6, "Healthcare": 7, "Industrials": 8, "Real Estate": 9, "Technology": 10, "Utilities": 11}
-#: T features ranked / z-scored across the universe on each session
+#: T features ranked / z-scored across the universe members on each session
 X_RANKED: Tuple[str, ...] = ("t_ret_5", "t_ret_20", "t_ret_60", "t_rvol_20", "t_dist_sma50", "t_rsi", "t_vol_z")
-X_STORE_COLUMNS: Tuple[str, ...] = ("x_mom_12_1", "x_mom_12_1_rk", "x_weinstein", "x_relvol", "x_sector")
+X_OWN_COLUMNS: Tuple[str, ...] = ("x_mom_12_1", "x_mom_12_1_rk", "x_weinstein", "x_relvol", "x_sector")
 X_COLUMNS: Tuple[str, ...] = (tuple(f"x_rk_{c[2:]}" for c in X_RANKED) + tuple(f"x_z_{c[2:]}" for c in X_RANKED)
-                              + X_STORE_COLUMNS)
-#: a cross-section needs at least this many members with a value, else its ranks and z-scores are NaN
-MIN_CROSS_SECTION = 2
+                              + X_OWN_COLUMNS)
+#: A cross-section is only ranked / z-scored when at least ``X_MIN_MEMBERS`` members have a value AND they are at
+#: least ``X_MIN_SHARE`` of that session's members: max(5, 50% of the members). A rank among a handful of survivors
+#: of a thin start-up period would be a different statistic from the one later years get.
+X_MIN_MEMBERS = 5
+X_MIN_SHARE = 0.5
 
 
-def _cross_rank(wide: pd.DataFrame) -> pd.DataFrame:
-    """Per row (session) the midpoint rank (rank - 0.5) / n in (0, 1) among the members with a value (ties averaged)."""
+def _cross_ok(wide: pd.DataFrame, members_n: pd.Series) -> pd.Series:
     n = wide.notna().sum(axis=1)
-    return (wide.rank(axis=1, method="average") - 0.5).div(n, axis=0).where(n >= MIN_CROSS_SECTION)
+    return (n >= X_MIN_MEMBERS) & (n >= X_MIN_SHARE * members_n)
 
 
-def _cross_z(wide: pd.DataFrame) -> pd.DataFrame:
-    """Per row the z-score (sample std) among the members with a value."""
+def _cross_rank(wide: pd.DataFrame, members_n: pd.Series) -> pd.DataFrame:
+    """Per row (session) the midpoint rank (rank - 0.5) / n in (0, 1) among the non-NaN cells (ties averaged); NaN
+    when the cross-section is too small (``_cross_ok``). ``wide`` has NaN for non-members."""
     n = wide.notna().sum(axis=1)
-    return wide.sub(wide.mean(axis=1), axis=0).div(wide.std(axis=1, ddof=1), axis=0).where(n >= MIN_CROSS_SECTION)
+    return (wide.rank(axis=1, method="average") - 0.5).div(n, axis=0).where(_cross_ok(wide, members_n), np.nan)
+
+
+def _cross_z(wide: pd.DataFrame, members_n: pd.Series) -> pd.DataFrame:
+    """Per row the z-score (sample std) among the non-NaN cells; NaN when the cross-section is too small."""
+    return wide.sub(wide.mean(axis=1), axis=0).div(wide.std(axis=1, ddof=1), axis=0).where(_cross_ok(wide, members_n), np.nan)
+
+
+def _own_columns(d: pd.DataFrame) -> pd.DataFrame:
+    """x_mom_12_1, x_weinstein and x_relvol of one symbol FROM ITS BARS (all trailing windows, every year).
+
+    * ``x_mom_12_1``: the 12-1 month return, ``close[S-21] / close[S-251] - 1`` (``metric_store.momentum_12_1_series``,
+      the store's own definition);
+    * ``x_weinstein``: the Weinstein stage 1-4 from the 150-session (30-week) SMA of the close and its 20-session slope
+      (``metric_store.weinstein_stage_series``: 2 = above a rising SMA, 4 = below a falling one, 3 = above a flat or
+      falling one, 1 = otherwise; flat = slope within +-0.5%);
+    * ``x_relvol``: 20-session over 60-session mean volume (a filled bar's volume is left out, see ``MAX_FILLED_RUN``)."""
+    from ba2_providers.screener import metric_store as ms
+    close = d["close"]
+    v = d["volume"].where(~d["filled"])
+    out = pd.DataFrame(index=d.index)
+    out["x_mom_12_1"] = ms.momentum_12_1_series(close)
+    out["x_weinstein"] = ms.weinstein_stage_series(close)
+    m20 = _full_windows_only(_roll_missing_ok(v, 20).mean(), 20)
+    m60 = _full_windows_only(_roll_missing_ok(v, 60).mean(), 60)
+    out["x_relvol"] = m20 / m60.where(m60 > 0)
+    return out
+
+
+def _sector_codes(ctx: BuildContext) -> Dict[str, float]:
+    """symbol -> sector code: the store's static profile sector, then the caller's explicit sectors on top. A symbol
+    with no sector is NaN; a sector that is not in SECTOR_CODE refuses."""
+    sectors = dict(ml_universe.sector_of_from_store(ctx.universe, ctx.store_dir))
+    sectors.update(ctx.sector_of)
+    sectors.update(ctx.sector_overrides)
+    out: Dict[str, float] = {}
+    for sym in ctx.universe:
+        if sym not in sectors:
+            out[sym] = np.nan
+        elif sectors[sym] not in SECTOR_CODE:
+            raise PanelDataError(f"group x: sector {sectors[sym]!r} of {sym} is not in SECTOR_CODE; add it to SECTOR_CODE "
+                                 f"(a new code never changes an existing one)")
+        else:
+            out[sym] = float(SECTOR_CODE[sectors[sym]])
+    return out
 
 
 def cross_section(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
-    """Group ``x_``: where the symbol stands among ``ctx.universe`` on each session.
+    """Group ``x_``: where the symbol stands among the universe's MEMBERS on each session.
 
-    * ``x_rk_*`` / ``x_z_*``: rank in (0, 1) and z-score, across the universe's rows OF THAT SESSION (listed members
-      with a value; an unlisted or ended member is not in the cross-section), of ``X_RANKED`` (the T features, computed
-      here for every universe member from bars up to S);
-    * from the metric store, in the newest scan visible at S (``ml_universe.scan_values``; NaN before the first scan,
-      2020-01): ``x_mom_12_1`` and its universe rank ``x_mom_12_1_rk``, ``x_weinstein`` (stage 1-4), ``x_relvol``
-      (relative volume), ``x_sector`` (``SECTOR_CODE``; NaN when the store has no sector for the symbol).
+    * ``x_rk_*`` / ``x_z_*``: rank in (0, 1) and z-score, across the members of that session (listed, with a value;
+      an unlisted, ended or non-member symbol is not in the cross-section and gets NaN itself) of ``X_RANKED`` (the T
+      features, computed here for every universe member from bars up to S). Too small a cross-section is NaN
+      (``X_MIN_MEMBERS``, ``X_MIN_SHARE``);
+    * ``x_mom_12_1`` and its member rank ``x_mom_12_1_rk``, ``x_weinstein``, ``x_relvol``: computed from the bars
+      (``_own_columns``), so they exist in every year, not only from the store's first scan (2020-01);
+    * ``x_sector``: ``SECTOR_CODE`` of the symbol's sector, the store's profile sector (static, see
+      ``ml_universe``) unless the caller overrides it; NaN when unknown.
 
-    The universe is explicit, so a build in chunks over the same universe gives the same values as one build. A
-    universe that changes over time (``ml_universe.universe_as_of``) is the caller's job: pass the union of names and
-    note that membership is then not a function of the session."""
-    members = list(ctx.universe)
-    wide = {c: {} for c in X_RANKED}
+    Membership is ``ctx.membership`` (per session, e.g. ``ml_universe.membership_from_universe``) or, when None, every
+    universe symbol always (the NDQ30 stage). A build in chunks over the same universe and membership gives the same
+    values as one build."""
+    members = sorted(ctx.universe)            # a fixed column order: float sums (mean, std) must not depend on the caller
+    mask = ctx.member_mask()
+    members_n = mask.sum(axis=1)
+    wide = {c: {} for c in X_RANKED + ("x_mom_12_1",)}
+    own: Dict[str, pd.DataFrame] = {}
     for sym in members:
         d = daily[sym]
         live = d[d["listed"]]
         if live.empty:
             t = pd.DataFrame(np.nan, index=ctx.sessions, columns=list(X_RANKED))
+            o = pd.DataFrame(np.nan, index=ctx.sessions, columns=["x_mom_12_1", "x_weinstein", "x_relvol"])
         else:
             t = _technical_one(live)[list(X_RANKED)].reindex(ctx.sessions)
+            o = _own_columns(live).reindex(ctx.sessions)
+        own[sym] = o
         for c in X_RANKED:
             wide[c][sym] = t[c]
+        wide["x_mom_12_1"][sym] = o["x_mom_12_1"]
     parts: Dict[str, pd.DataFrame] = {}
     for c in X_RANKED:
-        w = pd.DataFrame(wide[c], columns=members).astype("float64")
-        parts[f"x_rk_{c[2:]}"] = _cross_rank(w)
-        parts[f"x_z_{c[2:]}"] = _cross_z(w)
-    store = ml_universe.scan_values(members, ctx.sessions, ["momentum_12_1", "weinstein_stage", "relative_volume",
-                                                            "sector"], ctx.store_dir)
-    parts["x_mom_12_1"] = store["momentum_12_1"].astype("float64")
-    parts["x_mom_12_1_rk"] = _cross_rank(parts["x_mom_12_1"])
-    parts["x_weinstein"] = store["weinstein_stage"].astype("float64")
-    parts["x_relvol"] = store["relative_volume"].astype("float64")
-    sector = store["sector"]
-    unknown = sorted({str(v) for v in sector.to_numpy().ravel() if isinstance(v, str)} - set(SECTOR_CODE))
-    if unknown:
-        raise PanelDataError(f"group x: sector(s) {unknown} are not in SECTOR_CODE")
-    parts["x_sector"] = sector.apply(lambda col: col.map(SECTOR_CODE)).astype("float64")
+        w = pd.DataFrame(wide[c], columns=members).astype("float64").where(mask)
+        parts[f"x_rk_{c[2:]}"] = _cross_rank(w, members_n)
+        parts[f"x_z_{c[2:]}"] = _cross_z(w, members_n)
+    mom = pd.DataFrame(wide["x_mom_12_1"], columns=members).astype("float64")
+    parts["x_mom_12_1"] = mom
+    parts["x_mom_12_1_rk"] = _cross_rank(mom.where(mask), members_n)
+    parts["x_weinstein"] = pd.DataFrame({s: own[s]["x_weinstein"] for s in members}, columns=members)
+    parts["x_relvol"] = pd.DataFrame({s: own[s]["x_relvol"] for s in members}, columns=members)
+    codes = _sector_codes(ctx)
+    parts["x_sector"] = pd.DataFrame({s: pd.Series(codes[s], index=ctx.sessions) for s in members}, columns=members)
     frames = {sym: pd.DataFrame({name: parts[name][sym] for name in X_COLUMNS}, index=ctx.sessions)[list(X_COLUMNS)]
               for sym in ctx.symbols}
     return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
@@ -865,7 +927,8 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
                    cache_root: Path, context_symbols: Sequence[str] = (),
                    sector_of: Union[None, str, Dict[str, str]] = None,
                    universe: Optional[Sequence[str]] = None, store_dir: Optional[Path] = None,
-                   sector_overrides: Optional[Dict[str, str]] = None) -> pd.DataFrame:
+                   sector_overrides: Optional[Dict[str, str]] = None,
+                   membership: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Point-in-time daily features indexed ``[symbol, session]`` for ``symbols`` over ``[first_day, last_day]``.
 
     Every loaded symbol is read from its first cached bar (``first_day`` only trims the output), the requested
@@ -876,7 +939,10 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
     the whole set every time). ``sector_of`` is a symbol -> sector dict, or ``"store"`` to read the sectors from the
     metric store at ``store_dir`` (default ``<cache_root>/screener/metric_store_alpaca_20261022``); a symbol the store
     has no sector for is simply absent, so a group that needs it refuses unless ``sector_overrides`` supplies it (the
-    overrides win over both sources). The cache end (what ``ended`` is measured against) is SPY's last bar, so SPY
+    overrides win over both sources). ``membership`` (optional, sessions x symbols bool, e.g.
+    ``ml_universe.membership_from_universe``) says who is in the universe on each session: group X ranks only the
+    members of that session and group M's breadth counts only them; None means every universe symbol always (the
+    NDQ30 stage). With a membership the universe defaults to ``symbols`` plus the membership's columns. The cache end (what ``ended`` is measured against) is SPY's last bar, so SPY
     must be cached.
 
     Columns: ``listed`` (a real bar exists: False before a symbol's first bar and after its last), ``ended`` (the
@@ -899,9 +965,18 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
     specs = {g: _spec(g) for g in groups}
     if first_day > last_day:
         raise ValueError(f"first_day {first_day} is after last_day {last_day}")
-    universe = list(symbols) if universe is None else list(dict.fromkeys(universe))
-    if not set(symbols) <= set(universe):
-        raise ValueError(f"universe must contain every built symbol; missing {sorted(set(symbols) - set(universe))}")
+    if membership is not None:
+        if not all(pd.api.types.is_bool_dtype(t) for t in membership.dtypes):
+            raise ValueError("membership must be a bool DataFrame (sessions x symbols)")
+        needed = list(dict.fromkeys(symbols + list(membership.columns)))
+        universe = needed if universe is None else list(dict.fromkeys(universe))
+        if not set(needed) <= set(universe):
+            raise ValueError(f"universe must contain the built symbols and every membership symbol; missing "
+                             f"{sorted(set(needed) - set(universe))}")
+    else:
+        universe = list(symbols) if universe is None else list(dict.fromkeys(universe))
+        if not set(symbols) <= set(universe):
+            raise ValueError(f"universe must contain every built symbol; missing {sorted(set(symbols) - set(universe))}")
     store_path = Path(store_dir) if store_dir is not None else ml_universe.store_dir_for(cache_root)
     sector_source = None
     sectors: Optional[Dict[str, str]] = None
@@ -925,8 +1000,11 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
     cache_end = last_cached_bar("SPY", cache_root)
     daily, load_meta = load_daily(load, min(first_day, earliest.date()), last_day, cache_root, cache_end=cache_end)
     sessions = next(iter(daily.values())).index
+    mask = (None if membership is None
+            else membership.reindex(index=sessions, columns=universe, fill_value=False).fillna(False).astype(bool))
     ctx = BuildContext(tuple(symbols), tuple(universe), tuple(s for s in load if s not in symbols), sessions,
-                       first_day, last_day, Path(cache_root), store_path, dict(sectors) if sectors is not None else {})
+                       first_day, last_day, Path(cache_root), store_path, dict(sectors) if sectors is not None else {},
+                       mask, dict(sector_overrides) if sector_overrides else {})
     parts: List[pd.DataFrame] = []
     per_group: Dict[str, List[str]] = {}
     for g, spec in specs.items():
@@ -953,6 +1031,9 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
         "universe": universe, "context_symbols": [s for s in load if s not in symbols],
         "required_context": sorted(required), "load": load_meta, "rows": int(len(out)),
         "cache_end": str(cache_end), "sector_source": sector_source,
+        "membership": (None if membership is None else {"symbols": int(membership.shape[1]),
+                                                       "first_member_session": str(membership.index[membership.any(axis=1).to_numpy()][0].date())
+                                                       if membership.any(axis=None) else None}),
         "sector_overrides": dict(sector_overrides) if sector_overrides else {},
         "store": ({"dir": str(store_path), "newest_scan": ml_universe.scan_store(store_path).dates[-1]}
                   if any(g in groups for g in ("x", "f")) else None),

@@ -42,6 +42,13 @@ def _write(root, sym, df):
     df.to_parquet(d / f"{sym}_1d.parquet", index=False)
 
 
+@pytest.fixture(autouse=True)
+def _small_cross_sections(monkeypatch):
+    """The synthetic universes have 2-3 symbols; the production floors (>= 5 members, >= 50% of them) are tested apart."""
+    monkeypatch.setattr(F, "X_MIN_MEMBERS", 2)
+    monkeypatch.setattr(F, "X_MIN_SHARE", 0.0)
+
+
 STORE_SECTORS = {"AAA": "Technology", "BBB": "Financial Services", "CCC": "Technology"}
 STORE_SCANS = [d.strftime("%Y-%m-%d") for d in pd.date_range("2021-06-02", "2024-03-27", freq="7D")]      # Wednesdays
 
@@ -226,21 +233,22 @@ SYMS = ("AAA", "BBB")
 CUT_DAY = date(2023, 11, 15)                       # a Wednesday: the truncated build ends MID-WEEK
 
 
-def _build(cache, groups, symbols=SYMS, first=FIRST, last=LAST, ctx=CTX, sector_of=None, universe=None):
+def _build(cache, groups, symbols=SYMS, first=FIRST, last=LAST, ctx=CTX, sector_of=None, universe=None,
+           membership=None):
     return F.build_features(list(symbols), first, last, list(groups), cache, list(ctx), sector_of=sector_of,
-                            universe=universe)
+                            universe=universe, membership=membership)
 
 
 def _assert_cut_identical(cache, tmp_path, groups, day=CUT_DAY, symbols=SYMS, sector_of=None, universe=None,
-                          truncate_extra=None):
+                          truncate_extra=None, membership=None, nan_ok=False):
     """THE point-in-time proof: a build over a cache cut after ``day`` equals the full build on every common row.
     ``label_bar_filled`` is the one deliberate look-forward column (the NEXT session's fill flag): it is compared
     separately."""
-    full = _build(cache, groups, symbols, sector_of=sector_of, universe=universe)
+    full = _build(cache, groups, symbols, sector_of=sector_of, universe=universe, membership=membership)
     trunc = _truncate(cache, tmp_path, day)
     if truncate_extra is not None:                       # a group with its own data files cuts them too
         truncate_extra(trunc, day)
-    cut = _build(trunc, groups, symbols, last=day, sector_of=sector_of, universe=universe)
+    cut = _build(trunc, groups, symbols, last=day, sector_of=sector_of, universe=universe, membership=membership)
     common = full[full.index.get_level_values("session") <= pd.Timestamp(day)]
     assert len(common) == len(cut) > 300 * len(symbols) // 2
     assert common.index.equals(cut.index) and list(common.columns) == list(cut.columns)
@@ -253,7 +261,10 @@ def _assert_cut_identical(cache, tmp_path, groups, day=CUT_DAY, symbols=SYMS, se
     isna = cut[feats].isna()
     if "t_vol_z" in feats:
         isna.loc[cut["filled"], "t_vol_z"] = False                    # a filled bar has no volume: its own z is NaN
-    assert feats and not isna.to_numpy().any()                        # the comparison is not NaN == NaN
+    if nan_ok:                                                        # non-members are NaN by design: most cells still carry values
+        assert feats and (~isna.to_numpy()).mean() > 0.5
+    else:
+        assert feats and not isna.to_numpy().any()                    # the comparison is not NaN == NaN
     return full
 
 
@@ -879,23 +890,126 @@ def test_cut_test_all_groups_with_x(cache, tmp_path):
                           sector_of=SECTOR_OF, universe=XU)
 
 
-def test_store_columns_come_from_the_scan_visible_that_session(cache):
-    f = _build(cache, ["x"], symbols=("AAA",), universe=XU, first=date(2021, 5, 3)).loc["AAA"]
-    store = _store_rows().set_index(["date", "symbol"])
-    first_scan = pd.Timestamp(STORE_SCANS[0])
-    before = f.index < first_scan
-    assert before.sum() > 10
-    cols = ["x_mom_12_1", "x_mom_12_1_rk", "x_weinstein", "x_relvol", "x_sector"]
-    assert f.loc[before, cols].isna().all().all()                       # no scan yet: NaN
-    for day in ("2022-03-01", "2022-03-02", "2022-03-08", "2023-12-27", "2023-12-28"):
-        t = pd.Timestamp(day)
-        scan = max(x for x in STORE_SCANS if x <= day)                  # S <= D: a scan dated D is visible at D
-        row = store.loc[(scan, "AAA")]
-        assert f.loc[t, "x_mom_12_1"] == pytest.approx(row["momentum_12_1"])
-        assert f.loc[t, "x_weinstein"] == row["weinstein_stage"] and f.loc[t, "x_relvol"] == pytest.approx(row["relative_volume"])
-        assert f.loc[t, "x_sector"] == F.SECTOR_CODE["Technology"]
-        moms = store.xs(scan, level="date")["momentum_12_1"]
-        assert f.loc[t, "x_mom_12_1_rk"] == pytest.approx(((moms.rank() - 0.5) / len(moms))["AAA"])
+def test_x_momentum_volume_and_stage_come_from_the_bars_for_every_year(cache, tmp_path):
+    """x_mom_12_1 / x_relvol / x_weinstein are computed from OHLCV (the store's own definitions), so they exist before
+    the store's first scan; only the sector comes from the store (static)."""
+    from ba2_providers.screener import metric_store as ms
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    store = root / "screener" / "metric_store_alpaca_20261022"
+    for p in store.glob("ym=*/*.parquet"):                              # the store now starts in 2023-06
+        df = pd.read_parquet(p)
+        df = df[df["date"] >= "2023-06-07"]
+        if len(df):
+            df.to_parquet(p, index=False)
+        else:
+            p.unlink()
+    shutil.rmtree(root / "screener" / "_derived", ignore_errors=True)
+    f = _build(root, ["x"], symbols=XU).loc["AAA"]
+    assert f.index[0] < pd.Timestamp("2023-06-01") and f[list(F.X_COLUMNS)].notna().all().all()
+    raw = _raw(cache, "AAA")
+    close, vol = raw["Close"], raw["Volume"].astype(float)
+    np.testing.assert_allclose(f["x_mom_12_1"], (close.shift(21) / close.shift(251) - 1).reindex(f.index), rtol=1e-12)
+    np.testing.assert_allclose(f["x_relvol"], (vol.rolling(20).mean() / vol.rolling(60).mean()).reindex(f.index), rtol=1e-12)
+    np.testing.assert_array_equal(f["x_weinstein"], ms.weinstein_stage_series(close).reindex(f.index))
+    assert set(f["x_weinstein"].unique()) <= {1.0, 2.0, 3.0, 4.0}
+    assert (f["x_sector"] == F.SECTOR_CODE["Technology"]).all()          # the sector is the store's, in every year
+    moms = pd.DataFrame({s: _raw(cache, s)["Close"] for s in XU})
+    moms = moms.shift(21) / moms.shift(251) - 1
+    exp_rk = ((moms.rank(axis=1) - 0.5).div(moms.notna().sum(axis=1), axis=0))["AAA"].reindex(f.index)
+    np.testing.assert_allclose(f["x_mom_12_1_rk"], exp_rk, rtol=1e-12)
+    full_store = _build(cache, ["x"], symbols=XU).loc["AAA"]
+    pd.testing.assert_frame_equal(f, full_store, check_exact=True)       # the store's early scans change nothing
+
+
+def _membership(index, entering=None):
+    """AAA and BBB are always members; CCC from ``entering`` on (never, if None)."""
+    m = pd.DataFrame(False, index=index, columns=["AAA", "BBB", "CCC"])
+    m["AAA"] = True
+    m["BBB"] = True
+    if entering is not None:
+        m.loc[index >= pd.Timestamp(entering), "CCC"] = True
+    return m
+
+
+def test_a_symbol_entering_the_membership_is_not_ranked_before_and_does_not_move_the_others(cache):
+    sess = _sessions(FIRST, LAST)
+    d = pd.Timestamp("2023-03-01")
+    mem = _membership(sess, entering=d)
+    f = _build(cache, ["x"], symbols=XU, membership=mem)
+    base = _build(cache, ["x"], symbols=("AAA", "BBB"))                  # the two permanent members alone
+    before = f.index.get_level_values("session") < d
+    rk = [c for c in F.X_COLUMNS if c.startswith(("x_rk_", "x_z_")) or c == "x_mom_12_1_rk"]
+    ccc = f.loc["CCC"]
+    assert ccc.loc[ccc.index < d, rk].isna().all().all()                 # not a member yet: not ranked ...
+    assert ccc.loc[ccc.index >= d, rk].notna().all().all()               # ... from the day it enters
+    for s in ("AAA", "BBB"):                                             # ... and the others ignore it until then
+        pd.testing.assert_frame_equal(f.loc[s].loc[:d - pd.Timedelta(days=1), rk], base.loc[s].loc[:d - pd.Timedelta(days=1), rk],
+                                      check_exact=True)
+        assert not np.allclose(f.loc[s].loc[d:, "x_rk_ret_20"], base.loc[s].loc[d:, "x_rk_ret_20"])
+    n = {pd.Timestamp("2023-02-28"): 2, d: 3}
+    for day, k in n.items():
+        assert set(np.round(f.xs(day, level="session")["x_rk_ret_20"].dropna(), 6)) <= {round((i + 0.5) / k, 6) for i in range(k)}
+
+
+def test_membership_also_scopes_breadth(cache):
+    sess = _sessions(FIRST, LAST)
+    d = pd.Timestamp("2023-03-01")
+    f = _build(cache, ["m"], symbols=XU, sector_of=SECTOR_OF, membership=_membership(sess, entering=d))
+    sma = {s: _raw(cache, s)["Close"] > _raw(cache, s)["Close"].rolling(50).mean() for s in XU}
+    two = pd.DataFrame({s: sma[s] for s in ("AAA", "BBB")}).mean(axis=1)
+    three = pd.DataFrame(sma).mean(axis=1)
+    b = f.loc["AAA", "m_breadth_sma50"]
+    np.testing.assert_allclose(b[b.index < d], two.reindex(b.index)[b.index < d], atol=1e-15)
+    np.testing.assert_allclose(b[b.index >= d], three.reindex(b.index)[b.index >= d], atol=1e-15)
+
+
+def test_the_production_floors_need_five_members_and_half_of_them(cache, tmp_path, monkeypatch):
+    monkeypatch.setattr(F, "X_MIN_MEMBERS", 5)
+    monkeypatch.setattr(F, "X_MIN_SHARE", 0.5)
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    s = _sessions()
+    names = ("DDD", "EEE", "FFF")
+    for i, sym in enumerate(names):
+        late = s if i == 0 else s[s >= pd.Timestamp("2023-02-01")]      # EEE and FFF list late
+        _write(root, sym, _bars(late, 70 + i))
+    six = XU + names
+    f = _build(root, ["x"], symbols=("AAA",), universe=six).loc["AAA"]
+    early = f.index < pd.Timestamp("2023-02-01")
+    assert f.loc[early, "x_rk_ret_20"].isna().all()                      # 4 listed members < 5, whatever the share
+    assert f.loc[f.index >= pd.Timestamp("2023-05-15"), "x_rk_ret_20"].notna().all()      # all six have history
+    mid = (f.index >= pd.Timestamp("2023-02-09")) & (f.index < pd.Timestamp("2023-03-01"))
+    assert mid.sum() > 5 and f.loc[mid, "x_rk_ret_5"].notna().all() and f.loc[mid, "x_rk_vol_z"].isna().all()   # 6 members, vol_z needs 60 sessions
+    monkeypatch.setattr(F, "X_MIN_MEMBERS", 2)
+    monkeypatch.setattr(F, "X_MIN_SHARE", 0.8)                           # now the share rule alone: 4 of 6 listed = 0.67
+    g = _build(root, ["x"], symbols=("AAA",), universe=six).loc["AAA"]
+    assert g.loc[early, "x_rk_ret_20"].isna().all() and g.loc[g.index >= pd.Timestamp("2023-05-15"), "x_rk_ret_20"].notna().all()
+
+
+def test_an_ended_member_leaves_the_cross_section(cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    s = _sessions()
+    _write(root, "GONE", _bars(s[s <= pd.Timestamp("2023-06-30")], 55))
+    with_gone = _build(root, ["x"], symbols=("AAA",), universe=XU + ("GONE",))
+    without = _build(root, ["x"], symbols=("AAA",), universe=XU)
+    after = with_gone.index.get_level_values("session") > pd.Timestamp("2023-06-30")
+    rk = [c for c in F.X_COLUMNS if c.startswith("x_rk_") or c.startswith("x_z_")]
+    pd.testing.assert_frame_equal(with_gone[after][rk], without[after][rk], check_exact=True)      # GONE no longer ranked
+    assert not with_gone[~after][rk].equals(without[~after][rk])                                    # but it was before
+
+
+def test_an_unknown_sector_in_the_store_says_where_to_add_it(cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    for p in (root / "screener" / "metric_store_alpaca_20261022").glob("ym=*/*.parquet"):
+        df = pd.read_parquet(p)
+        df.loc[df["symbol"] == "CCC", "sector"] = "Crypto Mining"
+        df.to_parquet(p, index=False)
+    shutil.rmtree(root / "screener" / "_derived", ignore_errors=True)
+    with pytest.raises(P.PanelDataError, match="add it to SECTOR_CODE"):
+        _build(root, ["x"], symbols=XU)
 
 
 def test_sector_codes_are_a_committed_map():
@@ -924,13 +1038,29 @@ def test_sector_overrides_fill_what_the_store_lacks(cache, tmp_path):
     np.testing.assert_array_equal(f.loc["ZZZ", "m_rs_sector_20"].to_numpy(), f.loc["AAA", "m_rs_sector_20"].to_numpy())
 
 
-def test_x_refuses_a_stale_store(cache, tmp_path):
+def test_x_needs_the_store_only_for_the_sector(cache, tmp_path):
     root = tmp_path / "c"
     shutil.copytree(cache, root)
-    from ba2_providers.screener.metric_store import MetricStoreStaleError
     for p in (root / "screener" / "metric_store_alpaca_20261022").glob("ym=*/*.parquet"):
         df = pd.read_parquet(p)
         df[df["date"] <= "2023-12-27"].to_parquet(p, index=False)       # the store ends 3 months before LAST
     shutil.rmtree(root / "screener" / "_derived", ignore_errors=True)
-    with pytest.raises(MetricStoreStaleError):
-        _build(root, ["x"], symbols=XU)
+    f = _build(root, ["x"], symbols=XU)                                 # no staleness error: the scans are not read
+    assert f[list(F.X_COLUMNS)].notna().all().all()
+
+def test_cut_test_and_chunks_with_a_membership(cache, tmp_path):
+    mem = _membership(_sessions(FIRST, LAST), entering="2023-03-01")
+    _assert_cut_identical(cache, tmp_path, ["x", "m"], symbols=XU, sector_of=SECTOR_OF, membership=mem, nan_ok=True)
+    one = _build(cache, ["x", "m"], symbols=XU, sector_of=SECTOR_OF, membership=mem)
+    parts = [_build(cache, ["x", "m"], symbols=c, sector_of=SECTOR_OF, membership=mem) for c in (("AAA",), ("BBB", "CCC"))]
+    pd.testing.assert_frame_equal(pd.concat(parts).loc[one.index].drop(columns="label_bar_filled"),
+                                  one.drop(columns="label_bar_filled"), check_exact=True)
+    assert one.attrs["meta"]["membership"]["first_member_session"] == str(_sessions(FIRST, LAST)[0].date())
+
+
+def test_membership_must_be_boolean_and_cover_the_universe(cache):
+    sess = _sessions(FIRST, LAST)
+    with pytest.raises(ValueError, match="bool"):
+        _build(cache, ["x"], symbols=XU, membership=_membership(sess).astype(float))
+    with pytest.raises(ValueError, match="universe"):
+        _build(cache, ["x"], symbols=("AAA",), universe=("AAA",), membership=_membership(sess))
