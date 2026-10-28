@@ -128,17 +128,21 @@ def align_to_reference(bars: pd.DataFrame, ref_keys: pd.DataFrame, symbol: str) 
 
 
 # ------------------------------------------------------------------ indicator helpers (causal)
-def _ema(x: pd.Series, span: int) -> pd.Series:
+def ema(x: pd.Series, span: int) -> pd.Series:
     return x.ewm(span=span, adjust=False, min_periods=span).mean()
 
 
-def _wilder(x: pd.Series, n: int) -> pd.Series:
+def wilder(x: pd.Series, n: int) -> pd.Series:
     return x.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
 
 
-def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     pc = close.shift(1)
     return pd.concat([high - low, (high - pc).abs(), (low - pc).abs()], axis=1).max(axis=1)
+
+
+# the helpers are shared with app.services.ml_features: public names, the old private names stay as aliases
+_ema, _wilder, _true_range = ema, wilder, true_range
 
 
 def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
