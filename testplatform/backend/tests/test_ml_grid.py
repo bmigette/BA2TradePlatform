@@ -36,7 +36,7 @@ def _settings(**kw):
     return G.GridSettings(**base)
 
 
-def build_store(root, name, symbols, cache, beta, seed, extra_cols=(), sessions=None):
+def build_store(root, name, symbols, cache, beta, seed, extra_cols=(), canary=False):
     """Write bars into ``cache`` and a store ``root/name`` whose t_signal is the decision-time observable: the next
     day's log return is ``beta * t_signal + noise`` (beta 0 = pure noise)."""
     rng = np.random.default_rng(seed)
@@ -62,6 +62,10 @@ def build_store(root, name, symbols, cache, beta, seed, extra_cols=(), sessions=
             [[sym], sess], names=["symbol", "session"]))
         for c in extra_cols:
             f[c] = rng.normal(0, 1, n)
+        if canary:                                  # the realised 5-session return, as a "feature": a pure leak
+            ahead = np.full(n, np.nan)
+            ahead[:-5] = close[5:] / close[:-5] - 1.0
+            f["x_canary"] = ahead
         f["listed"], f["filled"], f["ended"] = True, False, False
         f["label_bar_filled"] = pd.array(np.zeros(n, dtype=bool), dtype="boolean")
         feats.append(f)
@@ -70,7 +74,8 @@ def build_store(root, name, symbols, cache, beta, seed, extra_cols=(), sessions=
     d.mkdir(parents=True)
     df.to_parquet(d / "features.parquet")
     meta = {"symbols": list(symbols), "first_day": str(FIRST), "last_day": str(LAST), "cache_end": str(LAST),
-            "ensure": {"min_share": 0.7}}
+            "ensure": {"min_share": 0.7, "inputs": {"code": "synthetic-1", "fingerprints": {
+                "daily": {s: {"mtime_ns": 1, "size": 1} for s in symbols}}}}}
     (d / "features.parquet.meta.json").write_text(json.dumps(meta), encoding="utf-8")
     years = sorted(set(sess.year))
     rep = pd.DataFrame({"rows": 1, "complete": 1, "share": 1.0},
@@ -83,6 +88,12 @@ def build_store(root, name, symbols, cache, beta, seed, extra_cols=(), sessions=
 def signal_world(tmp_path_factory):
     root = tmp_path_factory.mktemp("signal")
     return root / "stores", build_store(root / "stores", "stocks", SYMS, root / "cache", 0.006, 1), root / "cache"
+
+
+@pytest.fixture(scope="module")
+def canary_world(tmp_path_factory):
+    root = tmp_path_factory.mktemp("canary")
+    return root / "stores", build_store(root / "stores", "stocks", SYMS, root / "cache", 0.0, 6, canary=True), root / "cache"
 
 
 @pytest.fixture(scope="module")
@@ -153,8 +164,8 @@ def test_a_locked_symbol_raises_everywhere(signal_world, tmp_path):
         HO.assert_unlocked(["SPY", "NVDA"], "test")
     with pytest.raises(ValueError, match="no ETF"):                  # a selection universe holds no ETF
         G.validate_cell(cell(signal_world[0], symbols=SYMS[:4] + ["SPY"]))
-    G.validate_cell(cell(signal_world[0], track="timing", target={"kind": "up", "horizon": 5},
-                         symbols=SYMS[:4] + ["SPY"]))
+    mixed = build_store(tmp_path / "stores", "stocks", SYMS[:4] + ["SPY"], tmp_path / "cache", 0.0, 9)
+    G.validate_cell(cell(mixed.parent, track="timing", target={"kind": "up", "horizon": 5}, symbols=SYMS[:4] + ["SPY"]))
     assert len(G.resolve_symbols("timing")) == 19 and len(G.resolve_symbols("ndq30_dev")) == 20
 
 
@@ -187,7 +198,13 @@ def test_two_cells_two_seeds_end_to_end_resume_and_files(signal_world, tmp_path)
         assert r["status"] == "ok" and r["n_blocks"] == 6 and r["n_blocks_fitted"] == 6 and r["n_rows"] > 3000
         assert r["primary"]["name"] == G.PRIMARY[r["track"]] and np.isfinite(r["primary"]["value"])
         assert set(r["timings"]) >= {"fit", "metrics", "controls", "total"}
-        assert r["controls"]["primary"] == ("shuffle_symbols" if r["track"] == "selection" else "shuffle_time")
+        if r["track"] == "selection":
+            assert r["controls"]["primary"] == "shuffle_symbols" and set(r["controls"]["p_values"]) == {"shuffle_symbols"}
+        else:                                       # timing: the stricter of the two time nulls
+            c = r["controls"]
+            assert set(c["p_values"]) == {"shuffle_time", "shuffle_time_within_block"}
+            assert c["p_value"] == max(c["p_values"].values()) == c["p_values"][c["primary"]]
+            assert len(c["shuffle_time_within_block"]["values"]) == 5
         assert 0 < r["controls"]["p_value"] <= 1 and len(r["controls"]["shuffle_symbols"]["values"]) == 5
         assert "all" in next(iter(r["regimes"].values())) and "2019" in next(iter(r["regimes"].values()))
         pq = pd.read_parquet(out / "predictions" / f"{r['cell_key']}_{r['seed']}.parquet")
@@ -325,7 +342,8 @@ def test_planted_signal_timing_is_positive_and_noise_is_about_zero(signal_world,
     kw = dict(track="timing", target={"kind": "up", "horizon": 5})
     sig = _one(signal_world, tmp_path / "s", **kw)
     noi = _one(noise_world, tmp_path / "n", **kw)
-    assert sig["primary"]["value"] > 0.05 and sig["controls"]["p_value"] <= 1 / 21 + 1e-9
+    assert sig["primary"]["value"] > 0.05 and sig["controls"]["p_values"]["shuffle_time"] <= 1 / 21 + 1e-9
+    assert sig["controls"]["p_value"] <= 0.1             # a day-level signal also beats the stricter within-block null
     assert abs(noi["primary"]["value"]) < 0.3 * sig["primary"]["value"] and noi["controls"]["p_value"] > 0.1
     assert np.isfinite(sig["metrics"]["timing_sharpe_net"]["mean"])      # its sign is noise-dominated at this size
 
@@ -542,3 +560,260 @@ def test_handler_is_registered_in_main_and_the_cli_exists():
     assert "register_handler('ml_grid', handle_ml_grid)" in main_src
     launcher = (root.parent / "ba2test_launcher.py").read_text(encoding="utf-8")
     assert '"ml-grid": lambda: _cmd_ml_grid(args)' in launcher and 'sub.add_parser("ml-grid"' in launcher
+
+
+# ------------------------------------------------------------------ audit: no look-ahead, no joined targets
+_TARGET_NAMES = r"^(ret|vol|rel_ret|quintile|beats|rank_rel|up|z|realvol|target_end)_\d+$|^(atr_pct|session_group)$"
+
+
+def _spy(monkeypatch):
+    """Record every adapter fit (train / validation matrices and names) and every score call."""
+    real = G.M.make_adapter
+    fits, scores = [], []
+
+    def make(family, n_jobs=1, params=None, **kw):
+        ad = real(family, n_jobs, params, **kw)
+        fit, score = ad.fit, ad.score
+
+        def spy_fit(Xt, yt, Xv, yv, task, seed, groups_train=None, groups_val=None, feature_names=None):
+            fits.append({"Xt": np.array(Xt), "Xv": np.array(Xv), "names": list(feature_names), "seed": seed,
+                         "yt": np.array(yt)})
+            return fit(Xt, yt, Xv, yv, task, seed, groups_train=groups_train, groups_val=groups_val,
+                       feature_names=feature_names)
+
+        def spy_score(X):
+            scores.append(np.array(X))
+            return score(X)
+        ad.fit, ad.score = spy_fit, spy_score
+        return ad
+    monkeypatch.setattr(G.M, "make_adapter", make)
+    return fits, scores
+
+
+def _locate(world, X, names):
+    """(symbol, session) of every row of ``X``, found by its (t_signal, t_noise) pair in the store as given."""
+    df = pd.read_parquet(world[1] / "features.parquet")
+    key = {(np.float32(a), np.float32(b)): ix for a, b, ix in zip(df["t_signal"], df["t_noise"], df.index)}
+    i, j = names.index("t_signal"), names.index("t_noise")
+    return [key[(X[r, i], X[r, j])] for r in range(len(X))], df
+
+
+@pytest.mark.parametrize("track,kind", [("selection", "rel_return"), ("timing", "up")])
+def test_each_block_trains_strictly_before_it_and_validates_inside_the_window(signal_world, tmp_path, monkeypatch,
+                                                                              track, kind):
+    fits, scores = _spy(monkeypatch)
+    H = 5
+    run([cell(signal_world[0], track=track, target={"kind": kind, "horizon": H})], tmp_path, signal_world,
+        settings=_settings(control_seeds=(1,)))
+    st = _settings()
+    blocks = G.W.blocks(st.eval_start, st.eval_end, "Q")
+    assert len(fits) == len(blocks) == len(scores) == 6
+    sess = pd.DatetimeIndex(pd.to_datetime(P.regular_sessions(FIRST, LAST)["session"]))
+    pos = {s: i for i, s in enumerate(sess)}
+    for b, f, sc in zip(blocks, fits, scores):
+        bstart = pd.Timestamp(b.start)
+        win = G.W.train_window(b, 12, st.data_start)
+        fit_ix, df = _locate(signal_world, f["Xt"], f["names"])
+        val_ix, _ = _locate(signal_world, f["Xv"], f["names"])
+        fit_s = np.array([s for _, s in fit_ix])
+        val_s = np.array([s for _, s in val_ix])
+
+        def tend(ss):                                   # the session on which each label ends
+            return np.array([sess[pos[s] + H] for s in ss])
+        assert len(fit_s) and len(val_s)
+        assert fit_s.min() >= pd.Timestamp(win.start) and val_s.max() < bstart               # inside the window
+        assert tend(np.r_[fit_s, val_s]).max() < bstart                                       # max(target_end) < block.start
+        assert val_s.min() >= fit_s.max() and tend(fit_s).max() < val_s.min()                 # validation is later, purged
+        pred_ix, _ = _locate(signal_world, sc, f["names"])
+        pred_s = np.array([s for _, s in pred_ix])
+        assert pred_s.min() >= bstart and pred_s.max() <= pd.Timestamp(b.end)                 # scores only inside the block
+
+
+def test_different_seeds_change_the_scores_and_the_same_seed_does_not(signal_world, tmp_path):
+    c = cell(signal_world[0], seeds=[1, 2])
+    run([c], tmp_path / "a", signal_world, settings=_settings(control_seeds=(1,)))
+    run([c], tmp_path / "b", signal_world, settings=_settings(control_seeds=(1,)))
+    key = G.validate_cell(c).key
+
+    def rd(d, s):
+        return pd.read_parquet(d / "predictions" / f"{key}_{s}.parquet")["score"].to_numpy()
+    assert not np.allclose(rd(tmp_path / "a", 1), rd(tmp_path / "a", 2))
+    assert np.array_equal(rd(tmp_path / "a", 1), rd(tmp_path / "b", 1))
+
+
+def test_the_grid_feeds_the_model_the_stores_columns_only_never_a_target(signal_world, tmp_path, monkeypatch):
+    fits, scores = _spy(monkeypatch)
+    run([cell(signal_world[0])], tmp_path, signal_world, settings=_settings(control_seeds=(1,)))
+    import re
+    store_cols = [c for c in pd.read_parquet(signal_world[1] / "features.parquet").columns if c.startswith("t_")]
+    panel = G.get_panel(str(signal_world[0]), tuple(SYMS), "selection", str(signal_world[2]))
+    assert not [c for c in panel.columns if re.match(_TARGET_NAMES, c)]
+    assert set(panel.columns) == set(store_cols) | {"t_missing"}
+    for f in fits:
+        assert set(f["names"]) == set(panel.columns) and not [c for c in f["names"] if re.match(_TARGET_NAMES, c)]
+        ix, df = _locate(signal_world, f["Xt"], f["names"])
+        raw = df.loc[ix, [n for n in f["names"] if n != "t_missing"]].to_numpy(dtype=np.float32)
+        got = f["Xt"][:, [i for i, n in enumerate(f["names"]) if n != "t_missing"]]
+        assert np.array_equal(raw, got, equal_nan=True)                        # exactly the store's values, untouched
+    tg = panel.targets(5)
+    assert not set(tg.columns) & set(panel.columns)                            # targets and features never share a name
+
+
+def test_leak_canary_a_future_return_column_is_used_only_when_its_group_is_selected(canary_world, tmp_path, monkeypatch):
+    fits, _ = _spy(monkeypatch)
+    safe = cell(canary_world[0], groups=["t"], target={"kind": "rel_return", "horizon": 5})
+    leaky = cell(canary_world[0], groups=["t", "x"], target={"kind": "rel_return", "horizon": 5})
+    run([safe], tmp_path / "s", canary_world, settings=_settings(control_seeds=(1,)))
+    assert fits and all("x_canary" not in f["names"] for f in fits)
+    rs = G.read_results(tmp_path / "s" / "results.jsonl")[0]
+    assert abs(rs["metrics"]["rank_ic"]["mean"]) < 0.04                         # no signal without the canary
+    fits.clear()
+    run([leaky], tmp_path / "l", canary_world, settings=_settings(control_seeds=(1,)))
+    assert all("x_canary" in f["names"] for f in fits)
+    rl = G.read_results(tmp_path / "l" / "results.jsonl")[0]
+    assert rl["metrics"]["rank_ic"]["mean"] > 0.5                               # the canary really leaks if it is selected
+
+
+# ------------------------------------------------------------------ iterations, ties, deterministic families
+def test_rows_record_best_iterations_and_the_low_iteration_share(noise_world, tmp_path):
+    out = tmp_path / "o"
+    run([cell(noise_world[0], seeds=[1]),
+         cell(noise_world[0], family="linear", params={}, seeds=[1], target={"kind": "up", "horizon": 5})],
+        out, noise_world)
+    rows = {r["config"]["family"]: r for r in G.read_results(out / "results.jsonl")}
+    lg = rows["lgbm"]
+    its = [b["n_iter"] for b in lg["blocks"]]
+    assert len(its) == 6 and all(isinstance(i, int) and i >= 1 for i in its)
+    assert lg["low_iter_share"] == pytest.approx(np.mean([i <= G.LOW_ITER for i in its]))
+    assert rows["linear"]["low_iter_share"] is None and all(b["n_iter"] is None for b in rows["linear"]["blocks"])
+    assert G.LOW_ITER == 3
+
+
+def test_quantile_best_iteration_is_the_median_level_and_levels_are_kept(signal_world, tmp_path):
+    run([cell(signal_world[0], track="timing", target={"kind": "quantile", "horizon": 5})], tmp_path, signal_world,
+        settings=_settings(control_seeds=(1,)))
+    b = G.read_results(tmp_path / "results.jsonl")[0]["blocks"][0]
+    assert len(b["n_iter_levels"]) == 9 and b["n_iter"] == b["n_iter_levels"][4]
+
+
+def test_blocks_record_their_audit_fields(signal_world, tmp_path):
+    run([cell(signal_world[0])], tmp_path, signal_world, settings=_settings(control_seeds=(1,)))
+    for b in G.read_results(tmp_path / "results.jsonl")[0]["blocks"]:
+        assert b["window_start"] <= b["fit_first"] <= b["fit_last"] <= b["val_first"] <= b["val_last"] < b["start"]
+        assert b["train_target_end_max"] < b["start"] <= b["end"]
+
+
+def test_deterministic_families_are_marked_in_factor_effects():
+    rows = [_row("lin", s, 0.1, family="linear") for s in (1, 2, 3)] + \
+           [_row("gb", 1, 0.05), _row("gb", 2, 0.15), _row("nv", 1, 0.0, family="naive")]
+    for r in rows:
+        r["low_iter_share"] = 0.5 if r["cell_key"] == "gb" else None
+    res = G.factor_effects(rows, "timing")
+    c = res["cells"].set_index("cell_key")
+    assert c.loc["lin", "std"] == pytest.approx(0.0, abs=1e-12) and bool(c.loc["lin", "deterministic"]) and bool(c.loc["nv", "deterministic"])
+    assert not bool(c.loc["gb", "deterministic"]) and c.loc["gb", "low_iter_share"] == pytest.approx(0.5)
+    assert np.isnan(c.loc["lin", "low_iter_share"])
+    f = res["factors"]
+    assert f.loc[("family", "linear"), "n_deterministic"] == 1 and f.loc[("family", "lgbm"), "n_deterministic"] == 0
+    assert f.loc[("family", "lgbm"), "low_iter_share"] == pytest.approx(0.5)
+    assert G.DETERMINISTIC_FAMILIES == ("naive", "linear")
+
+
+def test_the_cell_schema_documents_the_two_barrier_kinds():
+    assert "triple_barrier" in G.__doc__ and "binary_barrier" in G.__doc__ and "Cell schema" in G.__doc__
+    assert G.KINDS["triple_barrier"].task == "multiclass" and G.KINDS["binary_barrier"].task == "binary"
+
+
+# ------------------------------------------------------------------ resume identity
+def _copy_tree(src, dst):
+    import shutil
+    shutil.copytree(src, dst)
+    return dst
+
+
+def test_cell_key_follows_the_store_signature_not_its_path(signal_world, tmp_path):
+    a = G.validate_cell(cell(signal_world[0]))
+    moved = _copy_tree(signal_world[0], tmp_path / "elsewhere")
+    b = G.validate_cell(cell(moved))
+    assert a.key == b.key and a.signature == b.signature and a.config()["store"] != b.config()["store"]
+    meta = moved / "stocks" / "features.parquet.meta.json"
+    m = json.loads(meta.read_text(encoding="utf-8"))
+    m["ensure"]["inputs"]["code"] = "synthetic-2"                       # the store was rebuilt from other inputs
+    meta.write_text(json.dumps(m), encoding="utf-8")
+    assert G.validate_cell(cell(moved)).key != a.key
+
+
+def test_resume_works_after_the_store_moves(signal_world, tmp_path):
+    out = tmp_path / "o"
+    run([cell(signal_world[0])], out, signal_world, settings=_settings(control_seeds=(1,)))
+    moved = _copy_tree(signal_world[0], tmp_path / "moved")
+    res = run([cell(moved)], out, (moved, None, signal_world[2]), settings=_settings(control_seeds=(1,)))
+    assert res["tasks"] == 0 and res["skipped_existing"] == 1
+
+
+def test_rows_record_settings_and_store_and_daily_identity(signal_world, tmp_path):
+    run([cell(signal_world[0])], tmp_path, signal_world)
+    r = G.read_results(tmp_path / "results.jsonl")[0]
+    ident = r["identity"]
+    assert ident["settings"]["cost_bps"] == 7.0 and ident["settings"]["timing_q"] == 0.6
+    assert ident["settings"]["eval_start"] == "2019-01-01" and ident["settings"]["control_seeds"] == [1, 2, 3, 4, 5]
+    assert "cores" not in ident["settings"]                              # thread count does not change a result
+    assert ident["store_signature"] == G.validate_cell(cell(signal_world[0])).signature
+    assert ident["daily_fingerprint"] == G.daily_fingerprint(signal_world[2], tuple(sorted(SYMS)))
+
+
+def test_resume_refuses_rows_made_under_other_settings_unless_told_to_rerun(signal_world, tmp_path):
+    out = tmp_path / "o"
+    c = cell(signal_world[0])
+    run([c], out, signal_world, settings=_settings(control_seeds=(1, 2)))
+    before = (out / "results.jsonl").read_text(encoding="utf-8")
+    other = _settings(control_seeds=(1, 2), cost_bps=12.0)
+    with pytest.raises(G.ResumeMismatchError, match="cost_bps") as ei:
+        run([c], out, signal_world, settings=other)
+    assert "rerun-mismatched" in str(ei.value) and (out / "results.jsonl").read_text(encoding="utf-8") == before
+    same_but_threads = _settings(control_seeds=(1, 2), cores=7)
+    assert run([c], out, signal_world, settings=same_but_threads)["tasks"] == 0           # cores is not identity
+    res = run([c], out, signal_world, settings=other, rerun_mismatched=True)
+    assert res["tasks"] == 1 and res["done"] == 1
+    rows = G.read_results(out / "results.jsonl")
+    assert len(rows) == 1 and rows[0]["identity"]["settings"]["cost_bps"] == 12.0
+    stale = G.read_results(out / "results.stale.jsonl")
+    assert len(stale) == 1 and stale[0]["identity"]["settings"]["cost_bps"] == 7.0
+
+
+def test_resume_refuses_when_the_daily_cache_changed(signal_world, tmp_path):
+    import os
+    import shutil
+    out = tmp_path / "o"
+    cache = tmp_path / "cache"
+    shutil.copytree(signal_world[2], cache)
+    world = (signal_world[0], signal_world[1], cache)
+    c = cell(signal_world[0])
+    run([c], out, world, settings=_settings(control_seeds=(1,)))
+    f = cache / "AlpacaHistoryOHLCVProvider" / f"{SYMS[0]}_1d.parquet"
+    os.utime(f, (1_900_000_000, 1_900_000_000))
+    with pytest.raises(G.ResumeMismatchError, match="daily_fingerprint"):
+        run([c], out, world, settings=_settings(control_seeds=(1,)))
+
+
+def test_a_row_without_identity_is_a_mismatch_and_other_cells_are_not_checked(signal_world, tmp_path):
+    out = tmp_path / "o"
+    c = cell(signal_world[0])
+    run([c], out, signal_world, settings=_settings(control_seeds=(1,)))
+    row = G.read_results(out / "results.jsonl")[0]
+    other = {**row, "cell_key": "ffffffffffff"}                    # a row of a cell that is not in this run
+    legacy = {k: v for k, v in row.items() if k != "identity"}
+    (out / "results.jsonl").write_text(json.dumps(other) + "\n" + json.dumps(legacy) + "\n", encoding="utf-8")
+    with pytest.raises(G.ResumeMismatchError, match="no identity"):
+        run([c], out, signal_world, settings=_settings(control_seeds=(1,)))
+    ok = run([c], out, signal_world, settings=_settings(control_seeds=(1,)), rerun_mismatched=True)
+    assert ok["done"] == 1
+    keys = [r["cell_key"] for r in G.read_results(out / "results.jsonl")]
+    assert sorted(keys) == sorted(["ffffffffffff", G.validate_cell(c).key])         # the foreign row stayed
+
+
+def test_the_rerun_flag_is_wired_through_the_payload_and_the_cli():
+    from pathlib import Path
+    root = Path(G.__file__).resolve().parents[2]
+    assert "--rerun-mismatched" in (root.parent / "ba2test_launcher.py").read_text(encoding="utf-8")
+    assert "rerun_mismatched" in (root / "app" / "api" / "ml_search.py").read_text(encoding="utf-8")

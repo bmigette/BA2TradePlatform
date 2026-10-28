@@ -64,6 +64,7 @@ class MlGridRequest(BaseModel):
     cache_root: Optional[str] = None
     cores: Optional[int] = None
     settings: Optional[Dict[str, Any]] = None
+    rerun_mismatched: bool = False
 
 
 @router.post("/grid")

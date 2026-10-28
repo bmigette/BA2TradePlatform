@@ -8957,7 +8957,7 @@ def _cmd_ml_grid(args) -> int:
     from app.services.ml_grid import factor_effects, handle_ml_grid, read_results
     payload = {"config_path": args.config, "out_dir": args.out, "cpu_slots": args.cpu_slots,
                "gpu_slots": args.gpu_slots, "limit_cells": args.limit_cells, "cache_root": args.cache_root,
-               "cores": args.cores}
+               "cores": args.cores, "rerun_mismatched": args.rerun_mismatched}
     res = handle_ml_grid("cli-ml-grid", payload)
     print(f"ml-grid: {res['done']} rows written, {res['errors']} errors, {res['skipped_existing']} already finished "
           f"-> {res['out_dir']}")
@@ -9896,6 +9896,9 @@ def main(argv: "list | None" = None) -> int:
     mg.add_argument("--gpu-slots", type=int, default=0, help="Worker processes for sequence families (none yet).")
     mg.add_argument("--limit-cells", type=int, default=None, help="Run only the first N cells of the config.")
     mg.add_argument("--cache-root", default=None, help="Cache folder holding AlpacaHistoryOHLCVProvider (default: the platform cache).")
+    mg.add_argument("--rerun-mismatched", action="store_true",
+                    help="Rows in --out/results.jsonl made under other settings or data are moved to results.stale.jsonl "
+                         "and recomputed (default: refuse).")
     mg.add_argument("--cores", type=int, default=None, help="Logical cores to share: n_jobs per fit = cores // cpu-slots (default: all).")
 
     # ml-features: the point-in-time daily feature store of the ML exploration v2.

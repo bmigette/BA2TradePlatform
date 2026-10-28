@@ -40,6 +40,30 @@ Target -> (column, adapter task):
 
 ``rel_return``, ``quintile``, ``beats`` and ``rank`` need a cross-section and exist on the selection track only.
 
+Cell schema (every key required except ``params`` and ``target.ratio``; unknown keys are refused)::
+
+    {"track": "selection" | "timing",
+     "store": "<dir>",                              one built store, or a root holding stocks/ and etf/
+     "symbols": "ndq30_dev" | "timing" | ["AAPL", ...],
+     "groups": ["t", "mtf", "m", "x", "mac", "f", "ag", "at", "i", "s"],       (a non-empty subset)
+     "target": {"kind": <one of the eleven kinds above>, "horizon": 1|3|5|10|20, "ratio": 1.0},
+     "family": "lgbm" | "xgb" | "catboost" | "linear" | "naive", "params": {...},
+     "train_months": 12 | 24 | 36 | "expanding", "blocks": "Q" | "H", "seeds": [1, 2, 3]}
+
+``triple_barrier`` (three classes: stop first / timeout / take-profit first) and ``binary_barrier`` (take-profit first
+or not) are deliberately TWO kinds, not one ``barriers`` kind with a mode: they have different adapter tasks, different
+class counts for ``check_balance`` and different scores, and a cell's ``target.kind`` then says which one it is.
+``ratio`` (stop distance / take-profit distance) applies to those two only.
+
+Identity and resume. ``cell_key`` hashes the canonical config WITHOUT the seeds and WITHOUT the store path, plus the
+store's SIGNATURE (a hash of the store meta's ``ensure.inputs``, ``min_share``, symbols and date range, over the stores
+the cell reads): moving a store keeps its keys, rebuilding it from other inputs changes them. Every results row also
+records ``identity`` = the ``GridSettings`` it ran under (without ``cores``, which does not change a result), the store
+signature and ``daily_fingerprint`` (size + mtime of the daily cache files of the cell's symbols). A restart REUSES a
+finished row only when all three match; otherwise it raises ``ResumeMismatchError`` naming the differences, or with
+``rerun_mismatched=True`` (CLI ``--rerun-mismatched``) moves the mismatched rows to ``results.stale.jsonl`` and
+recomputes them.
+
 Stores. ``store`` is either one built store (a directory holding ``features.parquet``) or a stores ROOT whose
 sub-directories (``stocks``, ``etf``) are stores. Every symbol is read from the first store listing it. When a cell's
 symbols span several stores (the ``timing`` set: 16 ETFs from ``etf`` + AAPL GOOGL TSLA from ``stocks``) the features
@@ -72,6 +96,7 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -96,6 +121,10 @@ TIMING_STOCKS: Tuple[str, ...] = ("AAPL", "GOOGL", "TSLA")          # NOT MSFT N
 SYMBOL_ALIASES: Tuple[str, ...] = ("ndq30_dev", "timing")
 #: stores of a stores ROOT, in the order a symbol is looked up
 STORE_ORDER: Tuple[str, ...] = ("stocks", "etf")
+#: a block whose best boosting iteration is at most this has an (almost) constant model: its scores are mostly ties
+LOW_ITER = 3
+#: families without randomness (``ml_models``): their seed std is 0 by construction, which is NOT robustness
+DETERMINISTIC_FAMILIES: Tuple[str, ...] = ("naive", "linear")
 EVAL_START, EVAL_END, DATA_START = date(2019, 1, 1), date(2026, 10, 12), date(2016, 1, 4)
 
 
@@ -207,13 +236,14 @@ class Cell:
     train_months: Union[int, str]
     blocks: str
     seeds: Tuple[int, ...]
+    signature: str = ""            # the store signature (``store_signature``): part of the key, not of the config
 
     @property
     def params_dict(self) -> Dict[str, Any]:
         return dict(self.params)
 
     def config(self, with_seeds: bool = False) -> Dict[str, Any]:
-        """The canonical config (JSON-able). Without seeds it is what ``key`` hashes."""
+        """The canonical config (JSON-able; it keeps the store path so the cell can be loaded again)."""
         out = {"track": self.track, "store": self.store,
                "symbols": self.symbols if isinstance(self.symbols, str) else list(self.symbols),
                "groups": list(self.groups),
@@ -226,7 +256,9 @@ class Cell:
 
     @property
     def key(self) -> str:
-        blob = json.dumps(self.config(), sort_keys=True, separators=(",", ":"))
+        cfg = self.config()
+        del cfg["store"]                                   # the path is where it lives; the signature is what it is
+        blob = json.dumps({"config": cfg, "store_signature": self.signature}, sort_keys=True, separators=(",", ":"))
         return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
 
     @property
@@ -339,7 +371,8 @@ def validate_cell(raw: Any) -> Cell:
             or len(set(seeds)) != len(seeds):
         raise ValueError("seeds must be a non-empty list of distinct integers")
     return Cell(track, store, symbols, tuple(sorted(groups)), kind, int(horizon), float(ratio), family,
-                tuple(sorted(params.items())), months, blocks, tuple(int(s) for s in seeds))
+                tuple(sorted(params.items())), months, blocks, tuple(int(s) for s in seeds),
+                store_signature(store, resolve_symbols(symbols)))
 
 
 def load_cells(source: Union[str, Path, Sequence[Dict[str, Any]], Dict[str, Any]]) -> List[Cell]:
@@ -364,6 +397,16 @@ def load_cells(source: Union[str, Path, Sequence[Dict[str, Any]], Dict[str, Any]
 
 
 # ================================================================== stores and panels
+@lru_cache(maxsize=256)
+def _read_meta(meta_path: str, mtime_ns: int) -> Dict[str, Any]:
+    return json.loads(Path(meta_path).read_text(encoding="utf-8"))
+
+
+def _meta_of(d: Path) -> Dict[str, Any]:
+    p = Path(str(d / "features.parquet") + ".meta.json")
+    return _read_meta(str(p), p.stat().st_mtime_ns)
+
+
 def discover_stores(store: Union[str, Path]) -> List[Tuple[str, Path, List[str]]]:
     """``[(name, dir, symbols)]`` of the built stores under ``store`` (one store, or a root with store sub-directories),
     in lookup order (``stocks``, ``etf``, then the others by name). ``symbols`` is the store's own row universe."""
@@ -377,11 +420,39 @@ def discover_stores(store: Union[str, Path]) -> List[Tuple[str, Path, List[str]]
         dirs = [(p.name, p) for p in subs]
     if not dirs:
         raise FileNotFoundError(f"no feature store under {root} (a directory with features.parquet, or a root holding such directories)")
-    out = []
-    for name, d in dirs:
-        meta = json.loads(Path(str(d / "features.parquet") + ".meta.json").read_text(encoding="utf-8"))
-        out.append((name, d, list(meta["symbols"])))
-    return out
+    return [(name, d, list(_meta_of(d)["symbols"])) for name, d in dirs]
+
+
+def store_signature(store: Union[str, Path], symbols: Sequence[str]) -> str:
+    """Identity of the store data a cell reads, independent of where the store lives: a hash over the stores that hold
+    ``symbols`` of (name, ``ensure.inputs`` -- code version, coverage columns, source fingerprints --, ``min_share``,
+    symbols, first / last day, cache end). Raises when a symbol is in no store."""
+    avail = discover_stores(store)
+    owner: Dict[str, str] = {}
+    for name, _, syms in avail:
+        for s in syms:
+            owner.setdefault(s, name)
+    absent = [s for s in symbols if s not in owner]
+    if absent:
+        raise ValueError(f"symbols {absent} are in no store under {store} "
+                         f"(stores: {', '.join(f'{n}={len(s)} symbols' for n, _, s in avail)})")
+    parts = {}
+    for name, d, _ in avail:
+        if any(owner[s] == name for s in symbols):
+            m = _meta_of(d)
+            parts[name] = {"inputs": m["ensure"]["inputs"], "min_share": m["ensure"]["min_share"],
+                           "symbols": m["symbols"], "first_day": m["first_day"], "last_day": m["last_day"],
+                           "cache_end": m["cache_end"]}
+    return hashlib.sha1(json.dumps(parts, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+
+
+def daily_fingerprint(cache_root: Union[str, Path], symbols: Sequence[str]) -> str:
+    """Hash of the (size, mtime) of the daily cache file of every symbol: what the daily bars were read from."""
+    parts = []
+    for sym in sorted(symbols):
+        st = F._cache_file(Path(cache_root), sym).stat()
+        parts.append([sym, st.st_size, st.st_mtime_ns])
+    return hashlib.sha1(json.dumps(parts).encode("utf-8")).hexdigest()[:16]
 
 
 def _store_fingerprint(store: Union[str, Path]) -> Tuple:
@@ -404,6 +475,7 @@ class Panel:
     arrays: T.DailyArrays
     stores: Tuple[str, ...]
     load_seconds: float
+    daily_fingerprint: str = ""
     _targets: Dict[int, pd.DataFrame] = field(default_factory=dict)
     _exc: Dict[int, T.DailyExcursions] = field(default_factory=dict)
 
@@ -483,7 +555,8 @@ def load_panel(store: Union[str, Path], symbols: Tuple[str, ...], track: str, ca
           & (lbf == False).fillna(False).astype(bool)).to_numpy()          # noqa: E712  (NA = unknown: not usable)
     X = allrows[list(cols)].to_numpy(dtype=np.float32)
     return Panel(symbols, track, index, pd.DatetimeIndex(index.get_level_values("session")), tuple(cols), X, ok, bars,
-                 arrays, tuple(n for n, _ in used), time.perf_counter() - t0)
+                 arrays, tuple(n for n, _ in used), time.perf_counter() - t0,
+                 daily_fingerprint(cache_root, symbols))
 
 
 _PANELS: Dict[Tuple, Panel] = {}
@@ -523,6 +596,17 @@ class BlockResult:
     n_fit: int
     n_val: int
     n_iter: Any
+    audit: Dict[str, Any] = field(default_factory=dict)
+
+
+def best_iter(n_iter: Any) -> Optional[int]:
+    """The best boosting iteration of the model that produced the score: the int of a single booster, the median
+    level (alpha 0.5, the score) of a quantile model's nine, None for a family without boosting rounds."""
+    if n_iter is None:
+        return None
+    if isinstance(n_iter, (list, tuple)):
+        return int(n_iter[M.MEDIAN_INDEX])
+    return int(n_iter)
 
 
 def fit_block(cell: Cell, seed: int, panel: Panel, block: W.Block, window: W.Window, st: GridSettings,
@@ -585,7 +669,12 @@ def fit_block(cell: Cell, seed: int, panel: Panel, block: W.Block, window: W.Win
     adapter.fit(Xf, y_all[fit_idx], Xv, y_all[val_idx], ks.task, seed, groups_train=gt, groups_val=gv,
                 feature_names=names)
     scores = adapter.score(panel.X[np.ix_(pr, cols)])
-    return BlockResult(pr, scores, len(fit_idx), len(val_idx), adapter.n_iter)
+    iso = lambda i: str(pd.Timestamp(i).date())                       # noqa: E731
+    audit = {"start": str(block.start), "end": str(block.end), "window_start": str(window.start),
+             "fit_first": iso(day[fit_idx].min()), "fit_last": iso(day[fit_idx].max()),
+             "val_first": iso(day[val_idx].min()), "val_last": iso(day[val_idx].max()),
+             "fit_target_end_max": iso(tend[fit_idx].max()), "train_target_end_max": iso(tend[tr].max())}
+    return BlockResult(pr, scores, len(fit_idx), len(val_idx), adapter.n_iter, audit)
 
 
 # ================================================================== metrics
@@ -691,11 +780,20 @@ def run_controls(d: pd.DataFrame, cell: Cell, st: GridSettings) -> Dict[str, Any
         outcomes, primary = d[["symbol", "session", "rel_ret", "vol"]], "shuffle_symbols"
     else:
         metric = E.timing_metric(q=st.timing_q, cost_bps=st.cost_bps, min_obs=st.min_obs, assume_flat=True)
-        outcomes, primary = d[["symbol", "session", "ret", "vol"]], "shuffle_time"
-    rep = controls_report(d[["symbol", "session", "score"]], outcomes, metric, seeds=st.control_seeds)
-    rep["primary"] = primary
-    rep["p_value"] = rep[primary]["p_value"]
-    rep["rank"] = rep[primary]["rank"]
+        outcomes, primary = d[["symbol", "session", "ret", "vol"]], "shuffle_time"       # + the within-block null below
+    timing = cell.track == "timing"
+    rep = controls_report(d[["symbol", "session", "score"] + (["block"] if timing else [])], outcomes, metric,
+                          seeds=st.control_seeds, within_block=timing)
+    names = ("shuffle_time", "shuffle_time_within_block") if timing else (primary,)
+    ps = {n: rep[n]["p_value"] for n in names}
+    if any(v is None for v in ps.values()):
+        strict = names[-1]                                    # a non-finite null: report it, no p-value
+        value = None
+    else:
+        strict = max(names, key=lambda n: (ps[n], n == names[-1]))      # the stricter null = the larger p
+        value = ps[strict]
+    rep["primary"], rep["p_value"], rep["rank"] = strict, value, rep[strict]["rank"]
+    rep["p_values"] = ps
     return rep
 
 
@@ -751,6 +849,14 @@ def _predictions_frame(cell: Cell, panel: Panel, rows: np.ndarray, scores: np.nd
     return pd.DataFrame(out).sort_values(["session", "symbol"], kind="mergesort").reset_index(drop=True)
 
 
+def identity_of(cell: Cell, st: GridSettings, daily_fp: str) -> Dict[str, Any]:
+    """What a finished row was computed from, for the resume check: the settings (not ``cores``), the store signature
+    and the daily cache fingerprint."""
+    settings = st.to_dict()
+    del settings["cores"]
+    return _sanitize({"settings": settings, "store_signature": cell.signature, "daily_fingerprint": daily_fp})
+
+
 def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs: int,
                   pred_dir: Optional[Path] = None) -> Dict[str, Any]:
     """One (cell, seed): walk-forward fit, stitch, evaluate. Returns the ``results.jsonl`` row (and writes the
@@ -777,10 +883,17 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
         rows_l.append(res.rows)
         scores_l.append(res.scores)
         block_l.append(np.full(len(res.rows), b.name, dtype=object))
-        info.append({"block": b.name, "n_fit": res.n_fit, "n_val": res.n_val, "n_iter": res.n_iter,
-                     "n_pred": int(len(res.rows))})
+        bi = best_iter(res.n_iter)
+        entry = {"block": b.name, "n_fit": res.n_fit, "n_val": res.n_val, "n_iter": bi, "n_pred": int(len(res.rows)),
+                 **res.audit}
+        if isinstance(res.n_iter, (list, tuple)):
+            entry["n_iter_levels"] = [int(i) for i in res.n_iter]
+        info.append(entry)
+    iters = [b["n_iter"] for b in info if b["n_iter"] is not None]
     row: Dict[str, Any] = {"cell_key": cell.key, "seed": int(seed), "track": cell.track, "label": cell.label,
-                           "config": cell.config(), "n_blocks": len(blocks), "n_blocks_fitted": len(info),
+                           "config": cell.config(), "identity": identity_of(cell, st, panel.daily_fingerprint),
+                           "low_iter_share": float(np.mean([i <= LOW_ITER for i in iters])) if iters else None,
+                           "n_blocks": len(blocks), "n_blocks_fitted": len(info),
                            "skipped_blocks": skipped, "clipped_blocks": clipped, "blocks": info,
                            "n_features": len(panel.group_columns(cell.groups)), "symbols": list(panel.symbols)}
     if not rows_l:
@@ -862,6 +975,68 @@ def _append(path: Path, row: Dict[str, Any]) -> None:
         fh.write(prefix + json.dumps(_sanitize(row)) + "\n")
 
 
+class ResumeMismatchError(RuntimeError):
+    """Finished rows in ``results.jsonl`` were computed under other settings / data than this run uses."""
+
+
+def _identity_diff(row: Dict[str, Any], expected: Dict[str, Any]) -> List[str]:
+    """How a finished row's recorded identity differs from the one this run would produce (empty = reusable)."""
+    ident = row.get("identity")
+    if not isinstance(ident, dict):
+        return ["no identity recorded (a row written before identity tracking)"]
+    out = []
+    for k in ("store_signature", "daily_fingerprint"):
+        if ident.get(k) != expected[k]:
+            out.append(f"{k}: row {ident.get(k)!r}, now {expected[k]!r}")
+    old, new = ident.get("settings") or {}, expected["settings"]
+    for k in sorted(set(old) | set(new)):
+        if old.get(k) != new.get(k):
+            out.append(f"settings.{k}: row {old.get(k)!r}, now {new.get(k)!r}")
+    return out
+
+
+def _check_resume(rows: List[Dict[str, Any]], cells: Sequence[Cell], st: GridSettings, cache_root: str,
+                  rerun_mismatched: bool, res_path: Path) -> set:
+    """The (cell_key, seed) pairs whose finished row may be reused. A row of a cell in this run whose identity differs
+    raises ``ResumeMismatchError``; with ``rerun_mismatched`` it is moved to ``results.stale.jsonl`` (and so recomputed).
+    Rows of cells that are not in this run are left alone."""
+    wanted = {(c.key, s): c for c in cells for s in c.seeds}
+    fps: Dict[Tuple[str, ...], str] = {}
+    mism: Dict[Tuple[str, int], List[str]] = {}
+    finished = set()
+    for r in rows:
+        k = (r["cell_key"], int(r["seed"]))
+        if k not in wanted:
+            continue
+        c = wanted[k]
+        syms = tuple(sorted(resolve_symbols(c.symbols)))
+        if syms not in fps:
+            fps[syms] = daily_fingerprint(cache_root, syms)
+        diff = _identity_diff(r, identity_of(c, st, fps[syms]))
+        if diff:
+            mism[k] = diff
+        else:
+            finished.add(k)
+    if not mism:
+        return finished
+    if not rerun_mismatched:
+        ex = "; ".join(f"cell {k[0]} seed {k[1]} ({wanted[k].label}): {', '.join(d[:3])}"
+                       for k, d in list(mism.items())[:5])
+        raise ResumeMismatchError(
+            f"{len(mism)} finished row(s) in {res_path} were computed under other settings or data than this run "
+            f"({ex}). Pass rerun_mismatched=True (CLI --rerun-mismatched) to move them to results.stale.jsonl and "
+            f"recompute them, or use another --out.")
+    keep = [r for r in rows if (r["cell_key"], int(r["seed"])) not in mism]
+    stale = [r for r in rows if (r["cell_key"], int(r["seed"])) in mism]
+    for r in stale:
+        _append(res_path.with_name("results.stale.jsonl"), r)
+    tmp = res_path.with_suffix(".tmp")
+    tmp.write_text("".join(json.dumps(_sanitize(r)) + "\n" for r in keep), encoding="utf-8")
+    os.replace(tmp, res_path)
+    logger.warning(f"ml_grid: {len(stale)} mismatched row(s) moved to results.stale.jsonl, they will be recomputed")
+    return finished
+
+
 def n_jobs_for(cpu_slots: int, cores: int) -> int:
     """Threads per fit so that ``cpu_slots * n_jobs <= cores``."""
     return max(1, int(cores) // max(1, int(cpu_slots)))
@@ -869,12 +1044,13 @@ def n_jobs_for(cpu_slots: int, cores: int) -> int:
 
 def run_grid(cells: Sequence[Cell], out_dir: Union[str, Path], cpu_slots: int, gpu_slots: int = 0,
              cache_root: Optional[Union[str, Path]] = None, settings: Optional[GridSettings] = None,
-             progress: Optional[Callable[..., None]] = None, inline: bool = False) -> Dict[str, Any]:
+             progress: Optional[Callable[..., None]] = None, inline: bool = False,
+             rerun_mismatched: bool = False) -> Dict[str, Any]:
     """Run every unfinished (cell, seed) of ``cells``; append a row to ``results.jsonl`` as each finishes.
 
     ``cpu_slots``: worker processes for the tabular families. ``gpu_slots``: workers for sequence families (none
     exist yet; a cell routed to the gpu pool with 0 slots is refused). ``inline=True`` runs in this process (tests,
-    debugging) through the same code. Returns ``{tasks, done, skipped_existing, errors, out_dir}``."""
+    debugging) through the same code. ``rerun_mismatched``: see ``ResumeMismatchError`` / the module docstring. Returns ``{tasks, done, skipped_existing, errors, out_dir}``."""
     if not _is_int(cpu_slots) or cpu_slots < 1 or not _is_int(gpu_slots) or gpu_slots < 0:
         raise ValueError("cpu_slots must be an integer >= 1 and gpu_slots an integer >= 0")
     st = settings or GridSettings()
@@ -886,7 +1062,7 @@ def run_grid(cells: Sequence[Cell], out_dir: Union[str, Path], cpu_slots: int, g
     out.mkdir(parents=True, exist_ok=True)
     res_path, err_path = out / "results.jsonl", out / "errors.jsonl"
     say = progress or (lambda m, pct=None: logger.warning(m))
-    finished = {(r["cell_key"], int(r["seed"])) for r in read_results(res_path)}
+    finished = _check_resume(read_results(res_path), cells, st, cache_root, rerun_mismatched, res_path)
     tasks = [(c, s) for c in cells for s in c.seeds if (c.key, s) not in finished]
     skipped_existing = sum(len(c.seeds) for c in cells) - len(tasks)
     pools = {p: [t for t in tasks if t[0].pool == p] for p in ("cpu", "gpu")}
@@ -950,8 +1126,11 @@ def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: s
     primary over its seeds. ``factors``: indexed (factor, level) for the factors target / horizon / family /
     train_months / groups, with the mean, std (ddof 1) and median across the CELLS of the cell-level seed-mean, the
     number of cells and the share with a positive mean. ``cells``: one row per cell with its levels, ``mean``, ``std``,
-    ``n_seeds``, ``p_value`` (mean of the primary control's p over seeds) and ``score = mean - std``, ranked by score
-    (descending; NaN last)."""
+    ``n_seeds``, ``p_value`` (mean of the gating control's p over seeds), ``low_iter_share`` (mean over seeds of the
+    row's share of blocks with best iteration <= ``LOW_ITER``: near-constant models; NaN for non-boosting families),
+    ``deterministic`` (naive / linear: their seed std of 0 is built in, NOT robustness) and ``score = mean - std``,
+    ranked by score (descending; NaN last). ``factors`` also carry ``n_deterministic`` (cells of a deterministic
+    family at that level) and ``low_iter_share`` (mean over the level's cells)."""
     if track not in TRACKS:
         raise ValueError(f"track must be one of {TRACKS}")
     rows = read_results(results) if isinstance(results, (str, Path)) else list(results)
@@ -966,22 +1145,29 @@ def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: s
         v = np.array([r["primary"]["value"] for r in rs], dtype=float)
         ps = [r["controls"].get("p_value") for r in rs if isinstance(r.get("controls"), dict)
               and r["controls"].get("p_value") is not None]
+        li = [r["low_iter_share"] for r in rs if r.get("low_iter_share") is not None]
         cells.append({"cell_key": key, **_factor_levels(rs[0]["config"]), "n_seeds": len(v), "mean": float(v.mean()),
                       "std": float(v.std(ddof=1)) if len(v) > 1 else float("nan"),
-                      "p_value": float(np.mean(ps)) if ps else float("nan")})
+                      "p_value": float(np.mean(ps)) if ps else float("nan"),
+                      "low_iter_share": float(np.mean(li)) if li else float("nan"),
+                      "deterministic": rs[0]["config"]["family"] in DETERMINISTIC_FAMILIES})
     cdf = pd.DataFrame(cells, columns=["cell_key", "target", "horizon", "family", "train_months", "groups", "n_seeds",
-                                       "mean", "std", "p_value"])
+                                       "mean", "std", "p_value", "low_iter_share", "deterministic"])
+    cdf["deterministic"] = cdf["deterministic"].astype(bool)
     cdf["score"] = cdf["mean"] - cdf["std"]
     cdf = cdf.sort_values("score", ascending=False, na_position="last", kind="mergesort").reset_index(drop=True)
     parts = []
     for factor in ("target", "horizon", "family", "train_months", "groups"):
-        g = cdf.groupby(cdf[factor].astype(str), sort=True)["mean"]
+        lv = cdf[factor].astype(str)
+        g = cdf.groupby(lv, sort=True)["mean"]
         f = pd.DataFrame({"n_cells": g.size(), "mean": g.mean(), "std": g.std(ddof=1), "median": g.median(),
-                          "share_positive": g.apply(lambda s: float((s > 0).mean()))})
+                          "share_positive": g.apply(lambda s: float((s > 0).mean())),
+                          "n_deterministic": cdf.groupby(lv, sort=True)["deterministic"].sum().astype(int),
+                          "low_iter_share": cdf.groupby(lv, sort=True)["low_iter_share"].mean()})
         f.index = pd.MultiIndex.from_product([[factor], f.index], names=["factor", "level"])
         parts.append(f)
     fdf = pd.concat(parts) if parts and len(cdf) else pd.DataFrame(
-        columns=["n_cells", "mean", "std", "median", "share_positive"],
+        columns=["n_cells", "mean", "std", "median", "share_positive", "n_deterministic", "low_iter_share"],
         index=pd.MultiIndex.from_arrays([[], []], names=["factor", "level"]))
     return {"factors": fdf, "cells": cdf}
 
@@ -989,7 +1175,8 @@ def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: s
 # ================================================================== job handler
 def handle_ml_grid(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Task ``ml_grid``. Payload: ``out_dir``, ``cpu_slots``, ``gpu_slots`` (all required), exactly one of ``config_path``
-    / ``cells``, and optional ``limit_cells``, ``cache_root``, ``settings`` (``GridSettings`` overrides), ``cores``."""
+    / ``cells``, and optional ``limit_cells``, ``cache_root``, ``settings`` (``GridSettings`` overrides), ``cores``,
+    ``rerun_mismatched``."""
     for k in ("out_dir", "cpu_slots", "gpu_slots"):
         if k not in payload:
             raise ValueError(f"ml_grid payload is missing {k!r}")
@@ -1021,7 +1208,8 @@ def handle_ml_grid(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         logger.warning(msg)
 
     res = run_grid(cells, payload["out_dir"], int(payload["cpu_slots"]), int(payload["gpu_slots"]),
-                   payload.get("cache_root"), st, progress)
+                   payload.get("cache_root"), st, progress,
+                   rerun_mismatched=bool(payload.get("rerun_mismatched", False)))
     progress(f"ml_grid done: {res['done']} rows, {res['errors']} errors, {res['skipped_existing']} already finished",
              100.0)
     return res
