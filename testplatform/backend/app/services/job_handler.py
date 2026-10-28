@@ -20,7 +20,9 @@ from app.models.database import SessionLocal
 from app.models.dataset import Dataset
 from app.services.data_preparation import purged_train_row_count, three_way_bounds
 from app.services.ml_dataset_source import is_alpaca_hist
-from app.services.ml_wizard_targets import WIZARD_TARGET_TYPES, WizardTargetError, build_wizard_target
+from app.services.ml_wizard_targets import (
+    CROSS_SECTIONAL_DAILY_TYPES, DAILY_TARGET_TYPES, WIZARD_TARGET_TYPES, WizardTargetError,
+    build_cross_sectional_daily_targets, build_daily_target, build_wizard_target, column_names as wizard_column_names)
 
 logger = logging.getLogger(__name__)
 
@@ -1475,7 +1477,8 @@ def build_prediction_targets(
     prediction_targets: List[Dict[str, Any]],
     dataset_timeframe: str,
     train_ratio: Optional[float] = None,
-    panel_source: bool = False
+    panel_source: bool = False,
+    cross_sectional: Optional[Dict[str, Tuple[pd.Series, int]]] = None
 ) -> Tuple[pd.DataFrame, str, List[str], Dict[str, int]]:
     """Add the configured target columns to ONE symbol's chronologically ordered frame.
 
@@ -1485,6 +1488,9 @@ def build_prediction_targets(
 
     ``train_ratio`` (the job's train share) and ``panel_source`` (the dataset comes from the alpaca_hist source) are
     needed by the wizard targets only (``ml_wizard_targets``): they fit k / the terciles on the rows of the train block.
+    ``cross_sectional`` is this symbol's share of the job-wide daily targets (daily_rel_return / daily_quintile /
+    daily_beats compare the tickers of a session, so they are built across all the job's datasets by
+    ``build_cross_sectional_daily_targets`` and handed in here): ``{column: (labels aligned to ``frame``, look-ahead)}``.
 
     Returns:
         (frame with target columns, selected target column, every target column,
@@ -1741,6 +1747,33 @@ def build_prediction_targets(
                         target_column = col_name
                     logger.info(f"Created {pt_type} target: {col_name} (look-ahead {lookahead} bars)")
 
+                elif pt_type in DAILY_TARGET_TYPES:
+                    # the alpaca_hist 1d source. Cross-sectional types arrive precomputed from the whole job; the others
+                    # are labels of THIS symbol's own frame (up: checked on the train block; multistep: one column per
+                    # horizon, all purged by the longest). The look-ahead of a label is its horizon in sessions (rows).
+                    try:
+                        if pt_type in CROSS_SECTIONAL_DAILY_TYPES:
+                            col = wizard_column_names(pt)[0]
+                            if cross_sectional is None or col not in cross_sectional:
+                                raise TargetBuildError(
+                                    f'{pt_type} compares the tickers of a session and is computed across all the '
+                                    f"job's datasets; it was not provided for this one")
+                            built_cols = [(cross_sectional[col][0], col, cross_sectional[col][1])]
+                        else:
+                            if train_ratio is None:
+                                raise TargetBuildError(f'{pt_type} target needs the job train ratio to check the train block')
+                            built_cols = build_daily_target(frame, pt, train_ratio, dataset_timeframe, panel_source)
+                    except WizardTargetError as e:
+                        raise TargetBuildError(str(e))
+                    for series, col_name, lookahead in built_cols:
+                        frame[col_name] = series
+                        if col_name not in all_target_columns:
+                            all_target_columns.append(col_name)
+                        target_label_horizons[col_name] = max(lookahead, target_label_horizons.get(col_name, 0))
+                        if target_column is None:
+                            target_column = col_name
+                        logger.info(f"Created {pt_type} target: {col_name} (look-ahead {lookahead} sessions)")
+
                 else:
                     raise TargetBuildError(f'Unknown target type: {pt_type}')
 
@@ -1918,11 +1951,20 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
             update_job_progress(task_id, 15, "Calculating prediction targets...")
         built = []
         try:
-            for frame, info in zip(frames, dataset_infos):
+            # daily targets that compare the tickers of a session need every dataset of the job at once
+            try:
+                cross_sectional = build_cross_sectional_daily_targets(
+                    frames, [info.get('ticker', f'TICKER{ds_id}') for info, ds_id in zip(dataset_infos, dataset_ids)],
+                    prediction_targets, [info.get('timeframe', '1h') for info in dataset_infos],
+                    [is_alpaca_hist(info.get('data_provider')) for info in dataset_infos])
+            except WizardTargetError as e:
+                raise TargetBuildError(str(e))
+            for frame, info, cross in zip(frames, dataset_infos, cross_sectional):
                 built.append(build_prediction_targets(
                     frame, prediction_targets, dataset_timeframe,
                     train_ratio=train_test_split / 100.0,
-                    panel_source=is_alpaca_hist(info.get('data_provider'))
+                    panel_source=is_alpaca_hist(info.get('data_provider')),
+                    cross_sectional=cross
                 ))
         except TargetBuildError as e:
             return {'status': 'failed', 'error': str(e)}
