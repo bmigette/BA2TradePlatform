@@ -21,6 +21,18 @@ UTC = timezone.utc
 NOW = datetime(2026, 10, 21, 14, 0, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def _capture_app_logger(caplog):
+    """The ba2 app logger does not propagate to root, so caplog never sees its records unless
+    its handler is attached directly (same pattern as the spy-regime tests, d48f5bd9)."""
+    from ba2_trade_platform.logger import logger as app_logger
+    app_logger.addHandler(caplog.handler)
+    try:
+        yield
+    finally:
+        app_logger.removeHandler(caplog.handler)
+
+
 def _ts(dt):
     return int(dt.timestamp())
 

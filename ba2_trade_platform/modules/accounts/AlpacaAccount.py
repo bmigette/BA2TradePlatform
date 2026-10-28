@@ -1837,9 +1837,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             TradingOrder: The modified order if successful, None if an error occurs.
         """
         try:
-            # Round all price fields to 4 decimal places to comply with Alpaca pricing requirements
-            limit_price = self._round_price(trading_order.limit_price, trading_order.symbol) if trading_order.limit_price is not None else None
-            stop_price = self._round_price(trading_order.stop_price, trading_order.symbol) if trading_order.stop_price is not None else None
+            # Round price fields to Alpaca's grid: an option contract is on the cent grid at every
+            # price (42210000), an equity keeps 4 decimals below $1.
+            if getattr(trading_order, 'asset_class', None) == CoreAssetClass.OPTION:
+                # Same direction rule as submission: an MLEG net (no contract) rounds up.
+                up = (not getattr(trading_order, 'contract_symbol', None)
+                      or trading_order.side == OrderDirection.BUY)
+                limit_price = self._round_option_limit(trading_order.limit_price, up=up) if trading_order.limit_price is not None else None
+                stop_price = self._round_option_limit(trading_order.stop_price, up=up) if trading_order.stop_price is not None else None
+            else:
+                limit_price = self._round_price(trading_order.limit_price, trading_order.symbol) if trading_order.limit_price is not None else None
+                stop_price = self._round_price(trading_order.stop_price, trading_order.symbol) if trading_order.stop_price is not None else None
             
             # Map good_for to TimeInForce enum if provided
             time_in_force = None
@@ -7016,11 +7024,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         that touch. Rounding is towards the fill (``up`` for a buy or an MLEG net, down for a
         single-leg sell) so the order keeps the touch it was quoted at, at most a cent away.
         Unlike the equity ``_round_price`` there is no sub-penny tier below $1.
+
+        The price is first cut to 8 decimals: limits built by float arithmetic carry binary
+        residue (0.1 + 0.2 = 0.30000000000000004) that a ceiling would otherwise push a whole
+        cent away (0.31). A non-zero limit that would round to 0.00 (a sub-cent premium or
+        credit) is refused: a zero limit is a different order, not a rounding of this one.
         """
         if price is None:
             raise ValueError("Option limit order has no limit price")
         rounding = ROUND_CEILING if up else ROUND_FLOOR
-        rounded = float(Decimal(str(price)).quantize(Decimal("0.01"), rounding=rounding))
+        rounded = float(Decimal(repr(round(price, 8))).quantize(Decimal("0.01"), rounding=rounding))
+        if rounded == 0.0 and price != 0.0:
+            raise ValueError(f"Option limit {price} is below one cent; refusing a 0.00 limit")
         if rounded != price:
             logger.info(f"Option limit {price} rounded {'up' if up else 'down'} to {rounded}")
         return rounded
