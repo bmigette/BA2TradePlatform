@@ -1355,9 +1355,11 @@ def insiders(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
     * ``i_net_buy_90``: (shares x price of ``P-`` purchases minus ``S-`` sales, Form 4 only) over the window, over the
       store's market cap visible at S (NaN before the first scan, 2020-01, and for a symbol the scan lacks);
     * ``i_n_buyers_90``: distinct reporting persons (``reportingCik``) with a purchase in the window;
-    * ``i_covered``: 1 from the session after the file's first filing, else 0. FMP's insider history is capped (about 2000
-      rows), so coverage starts at a different date per symbol, and an empty window before it is not "no insider buying":
-      before coverage the other two columns are NaN. After coverage an empty window is 0.
+    * ``i_covered``: 1 from ``COVERAGE_WARMUP_DAYS`` (90) calendar days after the first retained filing, else 0. FMP's
+      insider history is capped (about 2000 rows), so coverage starts at a different date per symbol, and the filings of
+      the first 90 days before it are an incomplete window. This DELIBERATELY deviates from the plan's "from the first
+      filing": a window that reaches back before the first retained row is truncated, and an empty or short window there
+      is not "no insider buying". Before coverage the other two columns are NaN; after it an empty window is 0.
 
     A missing file refuses; an empty file is never covered (flag 0, the others NaN)."""
     caps = ml_universe.scan_values(list(ctx.symbols), ctx.sessions, ["market_cap"], ctx.store_dir)["market_cap"]
@@ -1820,7 +1822,8 @@ def column_coverage(df: pd.DataFrame, groups: Sequence[str]) -> pd.DataFrame:
 def apply_coverage_mask(df: pd.DataFrame, report: pd.DataFrame, min_share: float = 0.7) -> pd.DataFrame:
     """A copy of ``df`` where, for every (group, year) of ``report`` under ``min_share``, ALL the group's feature columns
     are NaN for that year, and a column ``<prefix>missing`` is 1.0 on those rows (0.0 elsewhere; one per group in the
-    report). The masked (group, year) pairs are listed in ``out.attrs["coverage_masked"]``. A model sees a thin year as
+    report). The ``*_covered`` flag columns are never masked. The masked (group, year) pairs are listed in
+    ``out.attrs["coverage_masked"]``. A model sees a thin year as
     absent, with a flag, instead of a few real rows among NaNs."""
     out = df.copy()
     out.attrs = dict(df.attrs)
@@ -1830,7 +1833,7 @@ def apply_coverage_mask(df: pd.DataFrame, report: pd.DataFrame, min_share: float
         sub = report.xs(g, level="group")
         bad = sorted(int(y) for y, share in sub["share"].items() if share < min_share)
         flag = np.isin(year, bad)
-        cols = _group_columns(out, g)
+        cols = [c for c in _group_columns(out, g) if not c.endswith("_covered")]       # flags about the data stay intact
         out.loc[flag, cols] = np.nan
         out[f"{_spec(g).prefix}missing"] = flag.astype("float64")
         masked += [(g, y) for y in bad]

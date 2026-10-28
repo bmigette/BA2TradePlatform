@@ -152,3 +152,15 @@ def test_a_covered_flag_column_reports_the_share_of_rows_it_is_one():
     df["s_covered"] = (np.arange(len(df)) % 4 != 0).astype("float64")           # a flag, never NaN: 75% of the rows are 1
     cc = F.column_coverage(df, ["s"])
     assert cc.loc[("s_covered", 2020), "share"] == pytest.approx(0.75, abs=0.01)
+
+
+def test_masking_never_touches_the_covered_flags():
+    """A *_covered column is a flag about the data, not a feature: it keeps its value in a masked year."""
+    df = _frame()
+    df["t_covered"] = 1.0
+    df.loc[df.index.get_level_values("session").year == 2021, "t_covered"] = 0.0
+    out = F.apply_coverage_mask(df, F.coverage_report(df, ["t"]), min_share=0.7)
+    year = out.index.get_level_values("session").year
+    assert out.loc[year == 2021, "t_rsi"].isna().all() and (out["t_missing"][year == 2021] == 1.0).all()   # 2021 IS masked
+    pd.testing.assert_series_equal(out["t_covered"], df["t_covered"])                                       # the flag is intact
+    assert out["t_covered"].notna().all()
