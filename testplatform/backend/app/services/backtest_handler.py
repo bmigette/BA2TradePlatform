@@ -1236,6 +1236,14 @@ def handle_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             ticker=getattr(pred_dataset, "ticker", None),
         )
 
+        # run_backtest reports a refusal (a model that needs retraining, NaN inputs ...) as a failed result with zeros:
+        # that is a FAILED backtest with the error, not a completed one with no trades
+        if results.get('status') == 'failed':
+            backtest.status = 'failed'
+            backtest.error_message = results.get('error') or 'Backtest failed'
+            db.commit()
+            return {'status': 'failed', 'error': backtest.error_message}
+
         # Update backtest with results
         backtest.status = 'completed'
         backtest.completed_at = datetime.now()
