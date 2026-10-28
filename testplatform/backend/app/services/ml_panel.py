@@ -213,11 +213,13 @@ def daily_context(b: pd.DataFrame, daily: pd.DataFrame) -> Tuple[pd.DataFrame, p
 
 
 def market_features(b: pd.DataFrame, own_tech: pd.DataFrame, own_daily: pd.DataFrame,
-                    ctx: Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]) -> pd.DataFrame:
-    """SPY / QQQ returns at the same bar end and relative strength against QQQ. ``ctx[sym]`` = (bars, technical,
-    daily context) of the context symbol, all on the same reference grid as ``b``."""
+                    ctx: Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]],
+                    context: Sequence[str] = CONTEXT_SYMBOLS) -> pd.DataFrame:
+    """Returns of every context symbol at the same bar end and relative strength against the benchmark (QQQ when it
+    is a context symbol, else the first one). ``ctx[sym]`` = (bars, technical, daily context) of the context symbol,
+    all on the same reference grid as ``b``."""
     out = pd.DataFrame(index=b.index)
-    for sym in CONTEXT_SYMBOLS:
+    for sym in context:
         cb, ct, cd = ctx[sym]
         if not (cb["end"].values == b["end"].values).all():
             raise PanelDataError(f"{sym} bars are not aligned with the panel grid")
@@ -226,12 +228,20 @@ def market_features(b: pd.DataFrame, own_tech: pd.DataFrame, own_daily: pd.DataF
         out[f"m_{k}_ret_1d"] = ct["t_ret_1d"].values
         out[f"m_{k}_ret_5d"] = cd["d_ret_5d"].values
         out[f"m_{k}_dist_sma50"] = cd["d_dist_sma50"].values
-    q_t, q_d = ctx["QQQ"][1], ctx["QQQ"][2]
-    out["m_rs_qqq_1"] = own_tech["t_ret_1"].values - q_t["t_ret_1"].values
-    out["m_rs_qqq_1d"] = own_tech["t_ret_1d"].values - q_t["t_ret_1d"].values
-    out["m_rs_qqq_5d"] = own_daily["d_ret_5d"].values - q_d["d_ret_5d"].values
-    out["m_rs_qqq_20d"] = own_daily["d_ret_20d"].values - q_d["d_ret_20d"].values
+    bench = relative_strength_benchmark(context)
+    q_t, q_d = ctx[bench][1], ctx[bench][2]
+    k = bench.lower()
+    out[f"m_rs_{k}_1"] = own_tech["t_ret_1"].values - q_t["t_ret_1"].values
+    out[f"m_rs_{k}_1d"] = own_tech["t_ret_1d"].values - q_t["t_ret_1d"].values
+    out[f"m_rs_{k}_5d"] = own_daily["d_ret_5d"].values - q_d["d_ret_5d"].values
+    out[f"m_rs_{k}_20d"] = own_daily["d_ret_20d"].values - q_d["d_ret_20d"].values
     return out
+
+
+def relative_strength_benchmark(context: Sequence[str]) -> str:
+    """The context symbol the ``m_rs_*`` columns are measured against: QQQ when present (the default context), else
+    the first context symbol."""
+    return "QQQ" if "QQQ" in context else context[0]
 
 
 # ------------------------------------------------------------------ point-in-time fundamentals
@@ -367,8 +377,16 @@ class PanelSpec:
     last_day: date
     symbols: Tuple[str, ...] = MAG7
     groups: Tuple[str, ...] = FEATURE_GROUPS
+    #: market-context symbols of the ``market`` group (their same-bar returns become ``m_<sym>_*`` columns). SPY is
+    #: always loaded as the calendar reference, whether or not it is a context symbol.
+    context: Tuple[str, ...] = CONTEXT_SYMBOLS
 
     def __post_init__(self):
+        object.__setattr__(self, "context", tuple(str(c).upper() for c in self.context))
+        if len(set(self.context)) != len(self.context):
+            raise ValueError(f"duplicate symbols in context {self.context}")
+        if "market" in self.groups and not self.context:
+            raise ValueError("the market group needs at least one context symbol")
         if self.timeframe not in TIMEFRAMES:
             raise ValueError(f"timeframe must be one of {sorted(TIMEFRAMES)}")
         bad = set(self.groups) - set(FEATURE_GROUPS)
@@ -384,9 +402,11 @@ def build_panel(spec: PanelSpec, cache_root: Path) -> Tuple[pd.DataFrame, Dict]:
     sessions = regular_sessions(spec.first_day, spec.last_day)
     bps = bars_per_session(spec.timeframe)
     ref = load_bars("SPY", spec.timeframe, sessions, cache_root)
+    context = tuple(spec.context) if "market" in spec.groups else ()      # only the market group reads them
+    loaded = tuple(dict.fromkeys(("SPY",) + context + tuple(spec.symbols)))   # SPY: the calendar
     meta_fills: Dict[str, List[str]] = {}
     per: Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]] = {}
-    for sym in tuple(CONTEXT_SYMBOLS) + tuple(spec.symbols):
+    for sym in loaded:
         raw = ref if sym == "SPY" else load_bars(sym, spec.timeframe, sessions, cache_root)
         b, filled = align_to_reference(raw, ref, sym)
         if filled:
@@ -394,14 +414,14 @@ def build_panel(spec: PanelSpec, cache_root: Path) -> Tuple[pd.DataFrame, Dict]:
         tech = technical_features(b, bps)
         dctx, atr_d = daily_context(b, daily_from_bars(b))
         per[sym] = (b, tech, dctx, atr_d)
-    ctx = {s: per[s][:3] for s in CONTEXT_SYMBOLS}
+    ctx = {s: per[s][:3] for s in context}
     sess_list = [d for d in sessions["session"]]
     frames = []
     for sym in spec.symbols:
         b, tech, dctx, atr_d = per[sym]
         parts = [b[["session", "bar", "end", "open", "high", "low", "close", "volume"]], tech, dctx]
         if "market" in spec.groups:
-            parts.append(market_features(b, tech, dctx, ctx))
+            parts.append(market_features(b, tech, dctx, ctx, spec.context))
         if "fundamentals" in spec.groups:
             parts.append(fundamental_features(b, fundamentals_table(sym, sess_list, cache_root)))
         f = pd.concat(parts, axis=1)
@@ -417,11 +437,46 @@ def build_panel(spec: PanelSpec, cache_root: Path) -> Tuple[pd.DataFrame, Dict]:
     panel = pd.concat(frames, ignore_index=True)
     feats = feature_columns(panel, spec.groups)
     meta = {"timeframe": spec.timeframe, "bars_per_session": bps, "first_day": str(spec.first_day),
-            "last_day": str(spec.last_day), "symbols": list(spec.symbols), "context": list(CONTEXT_SYMBOLS),
+            "last_day": str(spec.last_day), "symbols": list(spec.symbols), "context": list(context),
             "groups": list(spec.groups), "features": feats, "fwd_horizons": list(FWD_HORIZONS),
             "filled_bars": meta_fills, "rows": int(len(panel)),
-            "source": {s: _fingerprint(_cache_file(cache_root, s)) for s in tuple(CONTEXT_SYMBOLS) + tuple(spec.symbols)}}
+            "source": {s: _fingerprint(_cache_file(cache_root, s)) for s in loaded}}
     return panel, meta
+
+
+def _splitmix64(x: np.ndarray) -> np.ndarray:
+    """One splitmix64 round on a uint64 array (wrapping arithmetic)."""
+    with np.errstate(over="ignore"):
+        x = x + np.uint64(0x9E3779B97F4A7C15)
+        x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        return x ^ (x >> np.uint64(31))
+
+
+def sample_bars(panel: pd.DataFrame, per_session: int, seed: int) -> pd.DataFrame:
+    """Thin an intraday panel for deep-model training: every symbol keeps its end-of-day bar plus ``per_session - 1``
+    random intraday bars of each session (all of them when the session has fewer). ``per_session=1`` is the daily
+    panel (end-of-day bars only), a large value keeps every row.
+
+    The draw of a bar is a hash of ``(seed, symbol, session, bar)``, never of the panel's size or order, so it is
+    deterministic and unchanged when the panel is extended or cut: the same bars are drawn for a session whatever
+    else the panel holds. Rows keep their original index (the ``row_in_symbol`` / positional row of the full panel,
+    which sequence windows are cut from) and order. Only training rows should be sampled: windows and evaluation
+    still read every bar of the full panel."""
+    if isinstance(per_session, bool) or not isinstance(per_session, (int, np.integer)) or per_session < 1:
+        raise ValueError(f"per_session must be an integer >= 1, got {per_session!r}")
+    if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)) or seed < 0:
+        raise ValueError(f"seed must be a non-negative integer, got {seed!r}")
+    import zlib
+    sym_code = {s: zlib.crc32(str(s).encode()) for s in panel["symbol"].unique()}
+    day = pd.to_datetime(panel["session"]).to_numpy("datetime64[D]").astype(np.int64).astype(np.uint64)
+    h = np.full(len(panel), (int(seed) * 0x2545F4914F6CDD1D) % (1 << 64), dtype=np.uint64)
+    for col in (panel["symbol"].map(sym_code).to_numpy(np.uint64), day, panel["bar"].to_numpy(np.int64).astype(np.uint64)):
+        h = _splitmix64(h ^ col)
+    u = (h >> np.uint64(11)).astype(np.float64) / float(1 << 53)          # uniform [0, 1)
+    key = np.where(panel["is_eod"].to_numpy(bool), -1.0, u)               # the end-of-day bar always ranks first
+    rank = pd.Series(key, index=panel.index).groupby([panel["symbol"], panel["session"]], sort=False).rank(method="first")
+    return panel[(rank <= per_session).to_numpy()]
 
 
 #: calendar days loaded before ``first_day`` so the 200-session average and the indicators are warm on day one
