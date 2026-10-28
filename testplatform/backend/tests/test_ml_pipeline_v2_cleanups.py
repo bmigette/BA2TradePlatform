@@ -272,3 +272,91 @@ class TestUnsupportedTrendReversalIndicators:
         df['Close'] = close
         out = PredictionTargetService().calculate_trend_reversal(df, 'rsi', {'period': 5}, 30, 'bullish')
         assert len(out) == n and out.sum() > 0
+
+
+# ---------------------------------------------------------------------------------------
+# 6.3 metrics the UI offers are computed
+# ---------------------------------------------------------------------------------------
+class _Vals:
+    """Stands in for a darts TimeSeries: only ``.values()`` is read."""
+    def __init__(self, v):
+        self._v = np.asarray(v, dtype=float).reshape(-1, 1)
+
+    def values(self):
+        return self._v
+
+
+class TestRegressionMetricsOffered:
+    def _metrics(self, pred, actual):
+        from app.services.darts_training import DartsTrainingService
+        return DartsTrainingService()._regression_metrics([_Vals(pred)], [_Vals(actual)], len(actual))
+
+    def test_mse_and_r2_are_computed(self):
+        m = self._metrics([2.0, 4.0, 6.0, 9.0], [1.0, 4.0, 7.0, 8.0])
+        assert m['mse'] == pytest.approx((1 + 0 + 1 + 1) / 4)
+        assert m['rmse'] == pytest.approx(m['mse'] ** 0.5)
+        ss_res = 3.0
+        ss_tot = ((np.array([1.0, 4.0, 7.0, 8.0]) - 5.0) ** 2).sum()
+        assert m['r2'] == pytest.approx(1 - ss_res / ss_tot)
+
+    def test_perfect_forecast_has_r2_one(self):
+        assert self._metrics([1.0, 2.0, 5.0], [1.0, 2.0, 5.0])['r2'] == pytest.approx(1.0)
+
+    def test_constant_actuals_have_no_r2(self):
+        assert self._metrics([1.0, 2.0, 3.0], [2.0, 2.0, 2.0])['r2'] is None
+
+
+class TestRegressionFitness:
+    def test_lower_is_better_metrics_become_a_decreasing_fitness(self):
+        from app.services.job_handler import metric_fitness
+        for name in ('mae', 'rmse', 'mse'):
+            assert metric_fitness(name, {name: 0.5}) > metric_fitness(name, {name: 2.0}) > 0
+
+    def test_r2_is_higher_is_better_and_stays_positive_when_the_model_is_worse_than_the_mean(self):
+        from app.services.job_handler import metric_fitness
+        good, mean_model, bad = (metric_fitness('r2', {'r2': r}) for r in (0.9, 0.0, -3.0))
+        assert good > mean_model > bad > 0
+
+    def test_r2_without_a_value_is_the_worst_fitness(self):
+        from app.services.job_handler import metric_fitness
+        assert metric_fitness('r2', {'r2': None}) == 0.0
+
+    def test_classification_metrics_pass_through(self):
+        from app.services.job_handler import metric_fitness
+        assert metric_fitness('f1_score', {'f1_score': 0.7}) == 0.7
+        assert metric_fitness('balanced_accuracy', {}) == 0.0
+
+
+@pytest.mark.usefixtures('tsai_stack')
+class TestBalancedAccuracy:
+    def _net(self, probs):
+        import torch
+        import torch.nn as nn
+        logits = torch.log(torch.tensor(probs, dtype=torch.float32))
+
+        class Fixed(nn.Module):
+            def forward(self, x):
+                return logits[:x.shape[0]]
+        return Fixed()
+
+    def test_binary_balanced_accuracy_is_the_mean_recall(self):
+        svc = tsai_training.TSAITrainingService(normalize=False)
+        # 3 negatives (2 right), 1 positive (right) -> recalls 2/3 and 1 -> 5/6; plain accuracy is 3/4
+        net = self._net([[0.9, 0.1], [0.8, 0.2], [0.2, 0.8], [0.1, 0.9]])
+        m = svc.assess_model(net, (np.zeros((4, 1, 3), dtype=np.float32), np.array([0, 0, 0, 1])), threshold=0.5)
+        assert m['accuracy'] == pytest.approx(0.75)
+        assert m['balanced_accuracy'] == pytest.approx(5 / 6)
+
+    def test_multistep_balanced_accuracy_averages_the_horizons(self):
+        import torch
+        import torch.nn as nn
+
+        class Fixed(nn.Module):
+            def forward(self, x):
+                return torch.tensor([[5.0, -5.0], [5.0, -5.0], [5.0, -5.0], [-5.0, 5.0]])
+
+        svc = tsai_training.TSAITrainingService(normalize=False)
+        y = np.array([[1, 0], [0, 0], [0, 0], [1, 1]])
+        m = svc.assess_model(Fixed(), (np.zeros((4, 1, 3), dtype=np.float32), y), prediction_mode='multistep')
+        # horizon 1: predicts 1,1,1,0 vs 1,0,0,1 -> recall(1)=1/2, recall(0)=0 ; horizon 2: 0,0,0,1 vs 0,0,0,1 -> 1
+        assert m['balanced_accuracy'] == pytest.approx((0.25 + 1.0) / 2)

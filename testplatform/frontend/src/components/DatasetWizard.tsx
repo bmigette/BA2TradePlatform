@@ -276,7 +276,6 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
 
   // Indicator add form state
   const [newIndicatorType, setNewIndicatorType] = useState('sma');
-  const [newIndicatorTimeframe, setNewIndicatorTimeframe] = useState('1d');
   const [newIndicatorPeriod, setNewIndicatorPeriod] = useState(20);
   // SAR parameters
   const [sarAfStart, setSarAfStart] = useState(0.02);
@@ -301,14 +300,6 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
       fetchCollections();
     }
   }, [isOpen]);
-
-  // Update indicator timeframe dropdown when dataset timeframe changes
-  useEffect(() => {
-    const validTimeframes = getAvailableTimeframes();
-    if (!validTimeframes.includes(newIndicatorTimeframe)) {
-      setNewIndicatorTimeframe(wizardData.timeframe);
-    }
-  }, [wizardData.timeframe]);
 
   const fetchCollections = async () => {
     try {
@@ -351,7 +342,11 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
       id: generateIndicatorId(),
       type: newIndicatorType,
       name: typeInfo.name,
-      timeframe: newIndicatorTimeframe,
+      // Always the dataset timeframe: a per-indicator timeframe only renamed the column, the
+      // indicator was still computed on the base bars. For a real higher-timeframe indicator the
+      // backend has services/indicators.py calculate_indicators_multi_timeframe (resample, compute,
+      // align without look-ahead); wire it before re-offering a timeframe picker here.
+      timeframe: wizardData.timeframe,
     };
 
     // Add type-specific parameters
@@ -1039,7 +1034,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
     return (
       <div className="space-y-4">
         <p className="text-sm text-muted-foreground mb-2">
-          Add technical indicators with individual timeframes. Indicator timeframe must be equal or greater than the dataset timeframe ({wizardData.timeframe}).
+          Add technical indicators. They are computed on the dataset timeframe ({wizardData.timeframe}).
         </p>
 
         {/* Collection load/save controls */}
@@ -1285,18 +1280,6 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
               >
                 {INDICATOR_TYPES.map(type => (
                   <option key={type.type} value={type.type}>{type.name}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs text-gray-500 dark:text-gray-300 mb-1">Timeframe</label>
-              <select
-                value={newIndicatorTimeframe}
-                onChange={(e) => setNewIndicatorTimeframe(e.target.value)}
-                className="w-full px-2 py-1.5 border border-gray-300 dark:border-gray-600 rounded text-sm dark:bg-gray-700 dark:text-gray-100"
-              >
-                {availableTimeframes.map(tf => (
-                  <option key={tf} value={tf}>{TIMEFRAME_LABELS[tf]}</option>
                 ))}
               </select>
             </div>

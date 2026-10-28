@@ -1438,6 +1438,28 @@ def load_datasets_separate(
     return dataframes, infos
 
 
+def metric_fitness(optimize_metric: str, eval_result: Dict[str, Any]) -> float:
+    """GA fitness (higher is better, never negative) from the selected evaluation metric.
+
+    Error metrics (mape, mae, mse, rmse) are lower-is-better and map to ``1 / (1 + error)``. R2 is
+    higher-is-better but unbounded below; ``1 / (1 + (1 - r2))`` keeps it monotone and positive (the
+    GA only tracks a best above 0). Classification metrics (f1_score, accuracy, ...) pass through.
+    """
+    if optimize_metric == 'mape':
+        mape_val = eval_result.get('mape', 100)
+        if mape_val is None:
+            mape_val = 100
+        return 1.0 / (1.0 + mape_val / 100)
+    if optimize_metric in {'mae', 'mse', 'rmse'}:
+        return 1.0 / (1.0 + eval_result.get(optimize_metric, 100))
+    if optimize_metric == 'r2':
+        r2 = eval_result.get('r2')
+        if r2 is None:
+            return 0.0
+        return 1.0 / (1.0 + (1.0 - r2))
+    return eval_result.get(optimize_metric, 0.0)
+
+
 class TargetBuildError(ValueError):
     """A prediction-target config could not be turned into a label column."""
 
@@ -2457,20 +2479,7 @@ def train_single_model(
             if 'error' in eval_result:
                 return 0.0
 
-            # Calculate fitness based on metric type
-            if optimize_metric == 'mape':
-                # Lower MAPE is better - convert to fitness (higher is better)
-                mape_val = eval_result.get('mape', 100)
-                if mape_val is None:
-                    mape_val = 100
-                fitness = 1.0 / (1.0 + mape_val / 100)
-            elif optimize_metric in {'mae', 'rmse'}:
-                # Lower is better for regression metrics
-                metric_val = eval_result.get(optimize_metric, 100)
-                fitness = 1.0 / (1.0 + metric_val)
-            else:
-                # Classification metrics (f1_score, accuracy, etc.) - higher is better
-                fitness = eval_result.get(optimize_metric, 0.0)
+            fitness = metric_fitness(optimize_metric, eval_result)
 
             # Track best
             if best_model[0] is None or fitness > best_metrics[0].get('fitness', 0):
@@ -3605,20 +3614,7 @@ def train_unified_optimization(
                 )
                 return 0.0
 
-            # Calculate fitness based on metric type
-            if optimize_metric == 'mape':
-                # Lower MAPE is better - convert to fitness (higher is better)
-                mape_val = eval_result.get('mape', 100)
-                if mape_val is None:
-                    mape_val = 100
-                fitness = 1.0 / (1.0 + mape_val / 100)
-            elif optimize_metric in {'mae', 'rmse'}:
-                # Lower is better for regression metrics
-                metric_val = eval_result.get(optimize_metric, 100)
-                fitness = 1.0 / (1.0 + metric_val)
-            else:
-                # Classification metrics (f1_score, accuracy, etc.) - higher is better
-                fitness = eval_result.get(optimize_metric, 0.0)
+            fitness = metric_fitness(optimize_metric, eval_result)
 
             # Capture training history before it gets reset
             training_history = get_epoch_history(task_id)
