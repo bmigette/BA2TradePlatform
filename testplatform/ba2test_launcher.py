@@ -1704,10 +1704,8 @@ _EXPERT_OPT = {
             "tp_quantile": {"optimize": True, "min": 60.0, "max": 90.0, "step": 10.0, "type": "float"},
             "sl_quantile": {"optimize": True, "min": 10.0, "max": 40.0, "step": 10.0, "type": "float"},
             "exit_flip_prob": {"optimize": True, "min": 55.0, "max": 70.0, "step": 5.0, "type": "float"},
-            # Ranking mode (strategy MLR, selection track): BUY only the N most bullish symbols of the store, SELL a
-            # held long that drops out of them. [0] = off, the default every other strategy keeps; the launcher flag
-            # --ml-rank-top-n (MLR only) replaces the choices.
-            "rank_top_n": {"optimize": True, "type": "choice", "choices": [0]},
+            # NO rank_top_n gene here: the ranking mode (strategy MLR) adds it for MLR jobs only
+            # (_apply_ml_rank_top_n, --ml-rank-top-n), so MLH / MLF / S1 keep their gene space and trial sequence.
         },
         # S1 runs long-only (shorts need the engine's enable_short), so a SELL entry gene would only spend
         # population on a knob that cannot act; a bearish forecast still exits a held long via the flip.
@@ -2569,7 +2567,10 @@ def _build_strategy_MLR(name: str):
     Entry: bullish and flat. Exits: the bearish signal (= left the top N, or a flip) is ALWAYS on -- it is the
     rotation itself, not a gene; plus a time exit, ``days_opened >= rebalance`` calendar days (gene 5..20 step 5,
     toggleable), the rebalance cadence. No take-profit and no strategy stop (fixed brackets are banned in v2; the RM
-    safeguard stop is placed on entry). Position count is bounded by N through the ranking, not by the strategy."""
+    safeguard stop is placed on entry). Position count is bounded by N through the ranking, not by the strategy.
+
+    Needs ``--ml-rank-top-n`` (the gene) and gets the job's symbols as the fixed ``rank_universe`` setting
+    (``_apply_ml_rank_universe``): the ranked set is the traded set."""
     buy = {"id": "root", "type": "AND", "conditions": [
         {"id": "mlr_bull", "field": "bullish"},
         {"id": "mlr_flat", "field": "has_no_position"},
@@ -2664,11 +2665,17 @@ def _apply_ml_hold_range(strat, hold_range):
 
 
 def _apply_ml_rank_top_n(spec: dict, raw, expert: str, strategy: str, command: str) -> dict:
-    """``--ml-rank-top-n 3,5``: make MLForecast's ``rank_top_n`` gene a choice of these N (distinct ints >= 1). MLR only:
-    the ranking mode is the rotation strategy's. Flag-off returns ``spec`` untouched."""
+    """``--ml-rank-top-n 3,5``: ADD MLForecast's ``rank_top_n`` gene as a choice of these N (distinct ints >= 1) to a copy
+    of the spec. MLR only (the ranking mode is the rotation strategy's), and MLR REQUIRES it: without it MLR would be a
+    rotation strategy with ranking off. Any other strategy without the flag gets ``spec`` untouched, so MLH / MLF / S1
+    keep the gene space they always had."""
+    is_mlr = expert == "MLForecast" and strategy == "MLR"
     if not raw:
+        if is_mlr:
+            sys.exit(f"{command}: strategy MLR needs --ml-rank-top-n N[,N] (without it the ranking is off and MLR is "
+                     f"not a rotation)")
         return spec
-    if expert != "MLForecast" or strategy != "MLR":
+    if not is_mlr:
         sys.exit(f"{command}: --ml-rank-top-n only applies to MLForecast with strategy MLR, not {expert!r} / {strategy!r}")
     try:
         ns = [int(x) for x in raw.split(",") if x.strip()]
@@ -2681,6 +2688,23 @@ def _apply_ml_rank_top_n(spec: dict, raw, expert: str, strategy: str, command: s
     out["expert_params"]["rank_top_n"] = {"optimize": True, "type": "choice", "choices": ns}
     print(f"{command}: --ml-rank-top-n: MLForecast rank_top_n gene choices = {ns}")
     return out
+
+
+def _apply_ml_rank_universe(command: str, backtest_block: dict, strategy: str) -> None:
+    """MLR: record the run's own symbols as the expert's FIXED ``rank_universe`` setting (comma-separated, sorted, so it
+    travels as an ordinary string setting and enters the run identity: the checkpoint fingerprint and the stored
+    config). Call AFTER every step that can rewrite ``enabled_instruments``. The ranked set is exactly the traded set,
+    never the store's directory contents. A per-trial candidate universe (``--screener``) would make it disagree with
+    the traded set, so MLR refuses a screener. Other strategies: untouched."""
+    if strategy != "MLR":
+        return
+    if backtest_block.get("screener_opt"):
+        sys.exit(f"{command}: strategy MLR ranks the job's fixed symbol list; it cannot run with a screener")
+    universe = sorted({str(x).strip().upper() for x in backtest_block["enabled_instruments"] if str(x).strip()})
+    if not universe:
+        sys.exit(f"{command}: strategy MLR needs a non-empty universe to rank")
+    (expert,) = [e for e in backtest_block["experts"] if e["class"] == "MLForecast"]
+    expert["settings"]["rank_universe"] = ",".join(universe)
 
 
 def _build_strategy_minimal(name: str):
@@ -7950,6 +7974,7 @@ def _cmd_optimize(args) -> int:
         # level than its daily cache (decision price from one, history from the other).
         _refuse_intraday_basis_mismatch("optimize", backtest_block)
         universe = list(backtest_block["enabled_instruments"])      # the reviewed exclusion list may have removed some
+        _apply_ml_rank_universe("optimize", backtest_block, args.strategy)   # AFTER the last universe rewrite
         # the FINAL universe's intraday coverage (threshold + report); the price-basis cross-check is the shared function of
         # fix/ohlcv-cross-interval-basis, not duplicated here
         _coverage_preflight("optimize", list(backtest_block["enabled_instruments"]), args, history_source)
@@ -8158,6 +8183,8 @@ def _cmd_optimize_batch(args) -> int:
                               ("monday", "tuesday", "wednesday", "thursday", "friday",
                                "saturday", "sunday")},
                      "times": [DEFAULT_DECISION_TIME]}
+    if any(_k == "MLR" for _e, _k in jobs):
+        sys.exit("optimize-batch: strategy MLR needs --ml-rank-top-n and the job's rank_universe; run it with `optimize`")
     _assert_option_window_excludes_holdout([k for _e, k in jobs], args.end)
     # every job's history source resolved up front: an option job stated as alpaca refuses the whole
     # batch BEFORE the first job is enqueued, not midway

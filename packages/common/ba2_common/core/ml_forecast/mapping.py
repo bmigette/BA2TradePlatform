@@ -194,16 +194,23 @@ def p_up(row: ForecastRow, horizon: int) -> float:
     return p_up_from_deciles(_dec(row, horizon))
 
 
+def bullish_score_deciles(d: Sequence[float]) -> tuple:
+    return (p_up_from_deciles(d), float(d[DECILE_LEVELS.index(50)]))
+
+
+def bullish_score_classes(cf) -> tuple:
+    return (p_up_from_classes(cf), float(sum(p * r for p, r in cf)))
+
+
 def bullish_score(row: ForecastRow, horizon: int) -> tuple:
     """The cross-sectional ranking key of a row, higher = more bullish, for any row type: ``(P(up), median/expected
     return)``. P(up) is the bullish probability the mapping uses; decile P(up) is clamped to [0.05, 0.95], so a strong
     forecast ties with every other strong one and the second element (q50 for deciles, E[r] = sum(p_c x r_c) for
-    class rows) separates them. Exact ties on both are left to the caller (the expert breaks them by symbol name)."""
+    class rows) separates them: for decile stores the ranking is effectively by q50 among clamped symbols. Exact ties
+    on both are left to the caller (the ranking breaks them by symbol name)."""
     if row.has_classes:
-        cf = _classes(row, horizon)
-        return (p_up_from_classes(cf), float(sum(p * r for p, r in cf)))
-    d = _dec(row, horizon)
-    return (p_up_from_deciles(d), float(d[DECILE_LEVELS.index(50)]))
+        return bullish_score_classes(_classes(row, horizon))
+    return bullish_score_deciles(_dec(row, horizon))
 
 
 def _map_classes(row: ForecastRow, genes: MappingGenes, price: float, atr: float) -> MappingResult:

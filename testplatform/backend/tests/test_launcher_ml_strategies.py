@@ -84,17 +84,23 @@ def test_mlr_rules():
     assert (days["value_min"], days["value_max"], days["value_step"]) == (5, 20, 5)
 
 
-def test_rank_top_n_gene_defaults_to_off():
-    gene = L._EXPERT_OPT[_ML]["expert_params"]["rank_top_n"]
-    assert gene == {"optimize": True, "type": "choice", "choices": [0]}
+#: The shipped MLForecast gene space, unchanged by the ranking mode (MLH / MLF / S1 keep their trial sequence).
+_PRE_RANKING_GENES = ["model_key", "horizon", "min_edge_pct", "min_prob", "max_uncertainty", "tp_quantile",
+                      "sl_quantile", "exit_flip_prob"]
 
 
-def test_ml_rank_top_n_flag_sets_the_choices_for_mlr_only():
+def test_the_shipped_spec_has_no_ranking_gene():
+    assert list(L._EXPERT_OPT[_ML]["expert_params"]) == _PRE_RANKING_GENES
+    assert "rank_top_n" not in L._EXPERT_OPT[_ML]["fixed_settings"]
+    assert L._apply_ml_rank_top_n(L._EXPERT_OPT[_ML], None, _ML, "MLH", "optimize") is L._EXPERT_OPT[_ML]
+
+
+def test_ml_rank_top_n_flag_adds_the_gene_for_mlr_only():
     spec = L._EXPERT_OPT[_ML]
-    assert L._apply_ml_rank_top_n(spec, None, _ML, "MLR", "optimize") is spec
     out = L._apply_ml_rank_top_n(spec, "3,5", _ML, "MLR", "optimize")
     assert out["expert_params"]["rank_top_n"] == {"optimize": True, "type": "choice", "choices": [3, 5]}
-    assert L._EXPERT_OPT[_ML]["expert_params"]["rank_top_n"]["choices"] == [0]      # the shared spec is untouched
+    assert list(out["expert_params"])[:-1] == _PRE_RANKING_GENES            # appended: earlier loci keep their index
+    assert "rank_top_n" not in L._EXPERT_OPT[_ML]["expert_params"]          # the shared spec is untouched
     assert out["expert_params"]["horizon"] == spec["expert_params"]["horizon"]
     for strat in ("MLH", "MLF", "S1"):
         with pytest.raises(SystemExit, match="only applies to MLForecast with strategy MLR"):
@@ -104,6 +110,61 @@ def test_ml_rank_top_n_flag_sets_the_choices_for_mlr_only():
     for bad in ("0", "3,3", "-1,5", "a", ",", "2.5"):
         with pytest.raises(SystemExit, match="--ml-rank-top-n needs"):
             L._apply_ml_rank_top_n(spec, bad, _ML, "MLR", "optimize")
+
+
+@pytest.mark.parametrize("raw", [None, ""])
+def test_mlr_without_ml_rank_top_n_is_refused(raw):
+    with pytest.raises(SystemExit, match="MLR needs --ml-rank-top-n"):
+        L._apply_ml_rank_top_n(L._EXPERT_OPT[_ML], raw, _ML, "MLR", "optimize")
+
+
+def _block(universe=("MSFT", "aapl", "AAPL", "NVDA"), **extra):
+    return {"enabled_instruments": list(universe), "experts": [{"class": _ML, "settings": {"enable_sell": False}}],
+            **extra}
+
+
+def test_rank_universe_is_the_jobs_sorted_symbols_for_mlr_only():
+    b = _block()
+    L._apply_ml_rank_universe("optimize", b, "MLR")
+    assert b["experts"][0]["settings"] == {"enable_sell": False, "rank_universe": "AAPL,MSFT,NVDA"}
+    for strat in ("MLH", "MLF", "S1"):
+        other = _block()
+        L._apply_ml_rank_universe("optimize", other, strat)
+        assert "rank_universe" not in other["experts"][0]["settings"]
+    with pytest.raises(SystemExit, match="cannot run with a screener"):
+        L._apply_ml_rank_universe("optimize", _block(screener_opt={"x": 1}), "MLR")
+    with pytest.raises(SystemExit, match="non-empty universe"):
+        L._apply_ml_rank_universe("optimize", _block(universe=()), "MLR")
+
+
+def test_rank_universe_is_part_of_the_checkpoint_identity():
+    from app.services import strategy_optimization_handler as H
+    cfg = lambda u: {"experts": [{"class": _ML, "settings": {"rank_universe": u}}]}   # noqa: E731
+    assert H.checkpoint_expert_settings_identity(cfg("")) == {}
+    assert H.checkpoint_expert_settings_identity(cfg("AAPL,MSFT")) == {"MLForecast.rank_universe": "AAPL,MSFT"}
+    assert H.CHECKPOINT_IDENTITY_EXPERT_SETTINGS["rank_universe"] ==         __import__("ba2_experts.MLForecast", fromlist=["x"]).MLForecast.get_settings_definitions()["rank_universe"]["default"]
+
+
+def test_optimize_batch_refuses_mlr(monkeypatch):
+    import app.services.task_queue as TQ
+    monkeypatch.setattr(TQ, "get_task_queue", lambda: pytest.fail("queued"))
+    args = _parse_cmd("_cmd_optimize_batch", ["optimize-batch", "--experts", _ML, "--strategies", "MLR",
+                                              "--universe", "AAPL", "--start", "2024-03-01", "--end", "2024-04-01"])
+    with pytest.raises(SystemExit, match="optimize-batch: strategy MLR"):
+        L._cmd_optimize_batch(args)
+
+
+def _parse_cmd(cmd_attr, argv):
+    captured = {}
+    original = getattr(L, cmd_attr)
+    setattr(L, cmd_attr, lambda args: (captured.__setitem__("args", args), 0)[1])
+    cwd = os.getcwd()
+    try:
+        assert L.main(list(argv)) == 0
+    finally:
+        os.chdir(cwd)
+        setattr(L, cmd_attr, original)
+    return captured["args"]
 
 
 def _parse(argv):
@@ -206,3 +267,56 @@ def test_hold_flag_refuses_other_strategies_and_experts(monkeypatch):
     for expert, strat in ((_ML, "MLR"), (_ML, "S1"), ("DeterministicScorer", "MLH")):
         with pytest.raises(SystemExit, match="only applies to MLForecast with strategy MLH or MLF"):
             L._ml_hold_from_horizon_range(True, "a", expert, strat, "optimize")
+
+
+# --------------------------------------------------------------------------- #
+# The real optimize command -> the persisted run config
+# --------------------------------------------------------------------------- #
+def _run_optimize(monkeypatch, strategy, extra, universe="MSFT,AAPL,NVDA"):
+    import ba2_common.core.db as bdb
+    from app.models.database import SessionLocal
+    from app.models.strategy_optimization import StrategyOptimization
+    import app.services.strategy_optimization_handler as SOH
+    monkeypatch.setattr(SOH, "handle_strategy_optimization", lambda task_id, payload: {"status": "completed"})
+    monkeypatch.setattr(L, "_persist_top_backtests", lambda *a, **k: 0)
+    args = _parse_cmd("_cmd_optimize", ["optimize", "--expert", _ML, "--strategy", strategy, "--universe", universe,
+                                        "--start", "2024-03-01", "--end", "2024-04-01", "--population", "2",
+                                        "--generations", "1", "--rerun", "--name", f"mlr-e2e-{strategy}-{os.getpid()}",
+                                        *extra])
+    saved = (os.getcwd(), bdb._db_file)
+    try:
+        assert L._cmd_optimize(args) == 0
+    finally:
+        os.chdir(saved[0])
+        bdb._db_file = saved[1]
+    db = SessionLocal()
+    try:
+        return db.query(StrategyOptimization).order_by(StrategyOptimization.id.desc()).first().optimization_config
+    finally:
+        db.close()
+
+
+def test_mlr_job_persists_the_gene_and_the_universe_as_a_fixed_setting(monkeypatch):
+    cfg = _run_optimize(monkeypatch, "MLR", ["--ml-rank-top-n", "3,5"])
+    assert cfg["expert_params"]["rank_top_n"] == {"optimize": True, "type": "choice", "choices": [3, 5]}
+    settings = cfg["backtest"]["experts"][0]["settings"]
+    assert settings["rank_universe"] == "AAPL,MSFT,NVDA" and settings["enable_sell"] is False
+
+
+def test_mlr_universe_is_the_final_one_after_exclusions(monkeypatch):
+    cfg = _run_optimize(monkeypatch, "MLR", ["--ml-rank-top-n", "3", "--exclude-symbols", "NVDA"])
+    assert cfg["backtest"]["enabled_instruments"] == ["MSFT", "AAPL"]
+    assert cfg["backtest"]["experts"][0]["settings"]["rank_universe"] == "AAPL,MSFT"
+
+
+@pytest.mark.parametrize("strategy", ["MLH", "MLF", "S1"])
+def test_other_strategies_keep_the_gene_space_and_settings(monkeypatch, strategy):
+    cfg = _run_optimize(monkeypatch, strategy, [])
+    assert "rank_top_n" not in cfg["expert_params"]
+    assert list(cfg["expert_params"])[:len(_PRE_RANKING_GENES)] == _PRE_RANKING_GENES
+    assert "rank_universe" not in cfg["backtest"]["experts"][0]["settings"]
+
+
+def test_mlr_job_without_the_flag_is_refused(monkeypatch):
+    with pytest.raises(SystemExit, match="MLR needs --ml-rank-top-n"):
+        _run_optimize(monkeypatch, "MLR", [])

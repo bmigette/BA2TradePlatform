@@ -15,19 +15,24 @@ On the open-positions pass the expert answers the FLIP question (``exit_flip_pro
 probability reaches it, BUY when the bullish one does, else HOLD; the ruleset's exit-on-opposite rule then closes a
 held position whose side the flip opposes. A missing forecast row is a skip (``no_forecast``), never a default.
 
-Ranking mode (``rank_top_n`` > 0, long-only): the entry pass ranks EVERY symbol of the store by its bullish score at
-the cutoff session (``mapping.bullish_score``) among the symbols whose latest row is fresh (``store.read_session``).
-A symbol may BUY only inside the top N, and still only through the usual gates; outside it the answer is
-``HOLD ... rank k of n``. On the open-positions pass a held long that is no longer inside the top N gets SELL (a
-rotation exit). The ranked universe is the symbol files of the store, not the symbols the backtest happens to visit:
-build the store for the universe you trade. Only rows with session <= the cutoff are read.
+Ranking mode (``rank_top_n`` > 0, long-only): the entry pass ranks the EXPLICIT universe ``rank_universe`` (a sorted
+symbol list, required and non-empty in this mode; its ``rank_universe_id`` is recorded with every decision) by the
+bullish score at the cutoff session (``mapping.bullish_score``) among the symbols whose latest row is fresh. The
+store directory is never listed, so another symbol's file (a locked holdout, a wider build) cannot change a rank; a
+universe symbol with no store file aborts the run (an incomplete worker store). A symbol may BUY only inside the top
+N, and still only through the usual gates; outside it the answer is ``HOLD ... rank k of n``. On the open-positions
+pass a held long that is no longer inside the top N gets SELL (a rotation exit, fixed confidence
+``ROTATION_EXIT_CONFIDENCE``). A held symbol whose forecast row went STALE is skipped (``no_forecast``), not rotated:
+only the strategy's time exit closes it. Only rows with session <= the cutoff are read (``core.ml_forecast.ranking``).
+
+Settings added with the ranking mode, ``rank_top_n`` (default 0) and ``rank_universe`` (default ""), are read through
+their settings-definition default when absent: a persisted instance that predates them reproduces the pre-ranking
+behaviour exactly (ranking off). That is the only default in this module.
 """
 from __future__ import annotations
 
 import json
 import math
-import threading
-from collections import OrderedDict
 from datetime import datetime, time, timedelta, timezone
 from typing import Mapping
 
@@ -37,7 +42,7 @@ from ba2_common.core.db import add_instance, update_instance
 from ba2_common.core.interfaces import MarketExpertInterface
 from ba2_common.core.knowability import scan_cutoff_date
 from ba2_common.core.market_conditions import atr14_wilder
-from ba2_common.core.ml_forecast import mapping, store
+from ba2_common.core.ml_forecast import mapping, ranking, store
 from ba2_common.core.models import ExpertRecommendation
 from ba2_common.core.types import (AnalysisUseCase, MarketAnalysisStatus, OrderRecommendation, Recommendation,
                                    RiskLevel, TimeHorizon)
@@ -49,6 +54,9 @@ ATR_LOOKBACK_DAYS = 60
 #: Daily bars of backtest warmup covering ATR_LOOKBACK_DAYS (the handler converts at 1.45 days per bar).
 BACKTEST_WARMUP_BARS = math.ceil(ATR_LOOKBACK_DAYS / 1.45)
 SKIP_NO_FORECAST = "no_forecast"
+#: Confidence of a rotation SELL (the held long dropped out of the top N). A rank is not a probability, so the figure
+#: is fixed rather than derived from P(up); callers act on the signal.
+ROTATION_EXIT_CONFIDENCE = 50.0
 #: Store aliases built for the 2026-10 pilot (TimesFM 3.0 univariate in LOG space, ctx 512 / 2048). The GA's
 #: ``model_key`` gene chooses among the aliases listed in the launcher's _EXPERT_OPT; this default is ctx 512.
 DEFAULT_MODEL_KEY = "timesfm3-log-ctx512"
@@ -96,39 +104,37 @@ def mapping_genes(settings: Mapping, key: str = None) -> mapping.MappingGenes:
         exit_flip_prob=_num(settings, "exit_flip_prob", 50.000001, 100.0), enable_sell=enable_sell)
 
 
+def _setting_or_definition_default(settings: Mapping, key: str):
+    """``settings[key]``, or the settings-definition default when the key is absent. Used ONLY for the two ranking
+    settings (see the module docstring): a persisted instance without them must keep its pre-ranking behaviour."""
+    if key in settings:
+        return settings[key]
+    return MLForecast.get_settings_definitions()[key]["default"]
+
+
 def rank_top_n(settings: Mapping) -> int:
-    """The validated ``rank_top_n`` setting: an int >= 0, 0 = ranking off. No default: a missing key raises."""
-    v = _num(settings, "rank_top_n", 0, 100000)
+    """The validated ``rank_top_n`` setting: an int >= 0, 0 = ranking off (also when the key is absent)."""
+    v = _setting_or_definition_default(settings, "rank_top_n")
+    v = _num({"rank_top_n": v}, "rank_top_n", 0, 100000)
     if v != int(v):
         raise ValueError(f"Setting 'rank_top_n' must be a whole number, got {settings['rank_top_n']!r}")
     return int(v)
 
 
-#: ``(store root, model key, horizon, cutoff, store stamp) -> ({symbol: rank (1 = most bullish)}, n)``. The ranking is
-#: one cross-section per decision date, while ``_analyze`` is called once per symbol: without the memo every symbol
-#: would re-read the whole store. Bounded; the store stamp invalidates it when the store is rewritten.
-_RANK_MEMO_SIZE = 8
-_rank_memo: "OrderedDict[tuple, tuple]" = OrderedDict()
-_rank_lock = threading.Lock()
+def rank_universe(settings: Mapping) -> tuple:
+    """The sorted, de-duplicated symbols of the ``rank_universe`` setting (a list, or one comma-separated string, as
+    the launcher writes it so it travels as an ordinary string setting). May be empty (ranking off)."""
+    raw = _setting_or_definition_default(settings, "rank_universe")
+    if isinstance(raw, str):
+        raw = [x for x in raw.split(",") if x.strip()]
+    elif not isinstance(raw, (list, tuple)) or not all(isinstance(x, str) for x in raw):
+        raise ValueError(f"Setting 'rank_universe' must be a list of symbols or a comma-separated string, got {raw!r}")
+    return ranking.normalize_universe(raw) if raw else ()
 
 
-def session_ranks(key: str, cutoff, horizon: int) -> tuple:
-    """``({symbol: rank}, n)`` of the fresh rows at ``cutoff``, rank 1 = most bullish. Ordered by the bullish score
-    (``mapping.bullish_score``, descending) and then by symbol name, so equal scores never depend on file order."""
-    memo_key = (str(store._root(None)), key, horizon, cutoff, store.store_stamp(key))
-    with _rank_lock:
-        hit = _rank_memo.get(memo_key)
-        if hit is not None:
-            _rank_memo.move_to_end(memo_key)
-            return hit
-        rows = store.read_session(key, cutoff, horizon)
-        scored = [(mapping.bullish_score(r, horizon), sym) for sym, r in rows.items()]
-        scored.sort(key=lambda t: (-t[0][0], -t[0][1], t[1]))
-        out = ({sym: i + 1 for i, (_, sym) in enumerate(scored)}, len(scored))
-        _rank_memo[memo_key] = out
-        while len(_rank_memo) > _RANK_MEMO_SIZE:
-            _rank_memo.popitem(last=False)
-        return out
+def session_ranks(key: str, cutoff, horizon: int, symbols) -> tuple:
+    """``({symbol: rank}, n)`` of ``symbols`` (the explicit universe) at ``cutoff``; see ``ranking.session_ranks``."""
+    return ranking.session_ranks(key, cutoff, horizon, symbols)
 
 
 _alias_memo: dict = {}
@@ -144,7 +150,7 @@ def resolve_model_key(name: str) -> str:
         return name
     if name in _alias_memo:
         return _alias_memo[name]
-    root = store._root(None)
+    root = store.root()
     hits = []
     for meta_p in sorted(root.glob("*/meta.json")):
         meta = json.loads(meta_p.read_text(encoding="utf-8"))
@@ -191,13 +197,19 @@ class MLForecast(MarketExpertInterface):
             "enable_sell": {"type": "bool", "required": True, "default": False,
                             "description": "Emit SELL entries on bearish forecasts (short side)"},
             "rank_top_n": {"type": "int", "required": True, "default": 0,
-                           "description": "Ranking mode (long-only): BUY only the N most bullish symbols of the "
-                                          "store at the decision date and SELL a held long that drops out of the "
-                                          "top N; 0 = off"},
+                           "description": "Ranking mode (long-only): BUY only the N most bullish symbols of "
+                                          "rank_universe at the decision date and SELL a held long that drops out of "
+                                          "the top N; 0 = off. Decile stores clamp P(up) to [0.05, 0.95], so among "
+                                          "strongly bullish symbols the ranking is effectively by the median "
+                                          "forecast (q50)"},
+            "rank_universe": {"type": "str", "required": True, "default": "",
+                              "description": "Ranking mode: the comma-separated, sorted symbols that are ranked "
+                                             "(required, non-empty when rank_top_n > 0; the launcher fills it with "
+                                             "the job's own symbols). Never the store's directory contents"},
         }
 
     _SETTING_KEYS = ("model_key", "horizon", "min_edge_pct", "min_prob", "max_uncertainty", "tp_quantile",
-                     "sl_quantile", "exit_flip_prob", "enable_sell", "rank_top_n")
+                     "sl_quantile", "exit_flip_prob", "enable_sell", "rank_top_n", "rank_universe")
 
     def __init__(self, id):
         super().__init__(id)
@@ -240,10 +252,20 @@ class MLForecast(MarketExpertInterface):
         top_n = rank_top_n(settings)
         if top_n and genes.enable_sell:
             raise ValueError("Setting 'rank_top_n' > 0 is long-only: 'enable_sell' must be off")
+        ranks = n_ranked = None
+        universe = rank_universe(settings) if top_n else ()
+        if top_n and not universe:
+            raise ValueError("Setting 'rank_universe' is required (a non-empty symbol list) when 'rank_top_n' > 0")
+        if top_n and symbol.strip().upper() not in universe:
+            raise ValueError(f"{symbol} is not in the 'rank_universe' of {len(universe)} symbols")
         cutoff = scan_cutoff_date(as_of)
         price = self._decision_price(providers, symbol, as_of)
         if price is None:
             raise ValueError(f"No decision price for {symbol} at {as_of}")
+        if top_n:
+            # BEFORE the row read: a universe symbol without a store file (an incomplete worker store) raises here
+            # even when it is the symbol being analysed, instead of becoming a quiet no_forecast skip
+            ranks, n_ranked = session_ranks(key, cutoff, genes.horizon, universe)
         try:
             row = store.read_row(key, symbol, cutoff, genes.horizon)
         except store.ForecastStoreMiss as exc:
@@ -256,19 +278,18 @@ class MLForecast(MarketExpertInterface):
             raw["classes"] = [list(x) for x in row.class_probs[genes.horizon]]
         else:
             raw["deciles"] = list(row.deciles[genes.horizon])
-        rank = n_ranked = None
+        rank = None
         if top_n:
-            ranks, n_ranked = session_ranks(key, cutoff, genes.horizon)
             if row.symbol not in ranks:
                 raise store.ForecastStoreError(f"{key}/{row.symbol}: read_row found a fresh row for {cutoff} that the "
                                                f"session ranking does not contain")
             rank = ranks[row.symbol]
-            raw.update({"rank": rank, "rank_n": n_ranked, "rank_top_n": top_n})
+            raw.update({"rank": rank, "rank_n": n_ranked, "rank_top_n": top_n,
+                        "rank_universe_id": ranking.universe_id(universe)})
         if use_case == AnalysisUseCase.OPEN_POSITIONS:
             if top_n and rank > top_n:
                 # rotation exit: the held long is no longer among the N most bullish symbols
-                p_up = mapping.p_up(row, genes.horizon)
-                return Recommendation(signal=OrderRecommendation.SELL, confidence=mapping._conf(1.0 - p_up),
+                return Recommendation(signal=OrderRecommendation.SELL, confidence=ROTATION_EXIT_CONFIDENCE,
                                       current_price=price, expected_profit_percent=0.0,
                                       details=f"{symbol} SELL dropped out of top {top_n}: rank {rank} of {n_ranked}",
                                       raw_outputs={**raw, "pass": "open_positions"})

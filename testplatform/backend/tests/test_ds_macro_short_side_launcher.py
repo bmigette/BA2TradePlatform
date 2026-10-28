@@ -288,7 +288,8 @@ def test_every_option_fixed_setting_is_in_the_checkpoint_identity():
     for name, spec in L._EXPERT_OPT.items():
         for key in spec.get("option_fixed_settings") or {}:
             assert key in H.CHECKPOINT_IDENTITY_EXPERT_SETTINGS, (name, key)
-    defs = DeterministicScorer.get_settings_definitions()
+    from ba2_experts.MLForecast import MLForecast
+    defs = {**MLForecast.get_settings_definitions(), **DeterministicScorer.get_settings_definitions()}
     for key, default in H.CHECKPOINT_IDENTITY_EXPERT_SETTINGS.items():
         assert defs[key]["default"] == default
 
