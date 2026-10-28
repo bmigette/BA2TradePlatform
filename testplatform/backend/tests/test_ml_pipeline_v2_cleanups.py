@@ -160,6 +160,16 @@ class TestThreeClassTsai:
         assert m['f1_score'] == pytest.approx(0.5 / 3)
         assert m['balanced_accuracy'] == pytest.approx(1 / 3)
 
+    def test_three_class_focal_loss_trains(self):
+        """Focal is the GA's default loss: it must take a k-class head."""
+        svc = tsai_training.TSAITrainingService(normalize=False)
+        split = self._split(svc, np.arange(150) % 3)
+        res = svc.train_model(self._net(2, 4, 3), (split['X_train'], split['y_train']),
+                              val_data=(split['X_val'], split['y_val']), epochs=1, batch_size=16,
+                              loss_fn=svc.get_loss_function('focal'))
+        assert res['status'] == 'success', res
+        assert np.isfinite(res['metrics']['valid_loss']) and np.isfinite(res['metrics']['f1_score'])
+
     def test_binary_assessment_is_unchanged(self):
         import torch
         import torch.nn as nn

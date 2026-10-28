@@ -9,3 +9,8 @@
 export function onDatasetTimeframe<T extends { timeframe?: string }>(indicator: T, datasetTimeframe: string): T {
   return { ...indicator, timeframe: datasetTimeframe };
 }
+
+/** ``onDatasetTimeframe`` over a list: used when the dataset timeframe changes and again at submit. */
+export function repinIndicators<T extends { timeframe?: string }>(indicators: T[], datasetTimeframe: string): T[] {
+  return indicators.map(ind => onDatasetTimeframe(ind, datasetTimeframe));
+}

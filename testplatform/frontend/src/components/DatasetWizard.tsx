@@ -1,5 +1,5 @@
 import { API_BASE } from '../lib/config';
-import { onDatasetTimeframe } from '../lib/indicatorTimeframe';
+import { onDatasetTimeframe, repinIndicators } from '../lib/indicatorTimeframe';
 import React, { useState, useEffect } from 'react';
 import { X, MessageSquare, TrendingUp, BarChart3, FileText, Settings, CheckCircle, Plus, Trash2, Save, ChevronDown, ChevronRight, FolderOpen, Upload } from 'lucide-react';
 
@@ -584,7 +584,8 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
 
     try {
       // Convert indicators to API format
-      const technicalIndicators = wizardData.indicators.map(({ id, name, ...rest }) => rest);
+      // safety net: whatever path added them, they go out pinned to the dataset timeframe
+      const technicalIndicators = repinIndicators(wizardData.indicators, wizardData.timeframe).map(({ id, name, ...rest }) => rest);
 
       let response: Response;
 
@@ -846,7 +847,12 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         <label className="block text-sm font-medium mb-2 text-gray-700 dark:text-gray-200">Timeframe</label>
         <select
           value={wizardData.timeframe}
-          onChange={(e) => setWizardData({ ...wizardData, timeframe: e.target.value })}
+          onChange={(e) => setWizardData({
+            ...wizardData,
+            timeframe: e.target.value,
+            // indicators are computed on the dataset timeframe: keep their names in step with it
+            indicators: repinIndicators(wizardData.indicators, e.target.value),
+          })}
           className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-100"
         >
           {TIMEFRAME_ORDER.filter(tf => wizardData.dataProvider !== ALPACA_HIST_PROVIDER || ALPACA_HIST_TIMEFRAMES.includes(tf)).map(tf => (
@@ -958,13 +964,17 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
               name="dataProvider"
               value={provider.id}
               checked={isSelected}
-              onChange={(e) => setWizardData({
-                ...wizardData,
-                dataProvider: e.target.value,
+              onChange={(e) => {
                 // H1 / M15 only for the cache; its feature groups do not exist for the other providers
-                timeframe: e.target.value === ALPACA_HIST_PROVIDER && !ALPACA_HIST_TIMEFRAMES.includes(wizardData.timeframe) ? '1h' : wizardData.timeframe,
-                panelFeatures: e.target.value === ALPACA_HIST_PROVIDER ? wizardData.panelFeatures : [],
-              })}
+                const timeframe = e.target.value === ALPACA_HIST_PROVIDER && !ALPACA_HIST_TIMEFRAMES.includes(wizardData.timeframe) ? '1h' : wizardData.timeframe;
+                setWizardData({
+                  ...wizardData,
+                  dataProvider: e.target.value,
+                  timeframe,
+                  indicators: repinIndicators(wizardData.indicators, timeframe),
+                  panelFeatures: e.target.value === ALPACA_HIST_PROVIDER ? wizardData.panelFeatures : [],
+                });
+              }}
               className="sr-only"
             />
             <div className="font-semibold text-lg mb-1 text-foreground">{provider.name}</div>

@@ -21,7 +21,8 @@ from app.models.dataset import Dataset, DatasetStatus
 from app.schemas.dataset import DatasetCreate, DatasetResponse, DatasetListResponse, DatasetUpdate, DatasetDuplicate, DatasetRegenerate, BatchRegenerateRequest
 from app.indicators import TechnicalIndicators
 from app.services.fundamentals import FundamentalsService
-from app.services.macro import MacroService
+from app.services.macro import MacroService, MacroCoverageError
+from ba2_providers.macro.fred_series import MacroAvailabilityUnknown
 from app.services.sentiment import SentimentService
 from app.services.indicators import IndicatorService
 from app.services.dataset_handler import (
@@ -2810,10 +2811,6 @@ def calculate_macro_features(
         # Integrate macro data
         result_df = macro_service.integrate_macro_with_ohlc(df, indicators)
 
-        # Add yield curve features if requested
-        if include_yield_curve:
-            result_df = macro_service.create_yield_curve_features(result_df)
-
         # Save updated dataset
         result_df.to_csv(file_path, index=False)
 
@@ -2834,6 +2831,10 @@ def calculate_macro_features(
 
     except HTTPException:
         raise
+    except (MacroCoverageError, MacroAvailabilityUnknown) as e:
+        # The cache cannot establish these decisions (past its fetch day, before its first vintage,
+        # no file): a conflict with the cache's state, not a server fault. The message says what to do.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except Exception as e:
         logger.error(f"Error calculating macro features: {e}", exc_info=True)
         raise HTTPException(

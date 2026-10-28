@@ -23,3 +23,22 @@ describe('onDatasetTimeframe', () => {
     expect(macd.timeframe).toBe('1w');
   });
 });
+
+describe('onDatasetTimeframe over a list (the dataset timeframe changed after indicators were added)', () => {
+  it('re-pins every indicator, so names and payload follow the new dataset timeframe', async () => {
+    const { repinIndicators } = await import('./indicatorTimeframe');
+    const added = [
+      { id: 'a', type: 'rsi', period: 14, timeframe: '1h' },
+      { id: 'b', type: 'sma', period: 20, timeframe: '1h' },
+    ];
+    const out = repinIndicators(added, '1d');
+    expect(out.map(i => i.timeframe)).toEqual(['1d', '1d']);
+    expect(out.map(i => i.id)).toEqual(['a', 'b']);
+    expect(added[0].timeframe).toBe('1h');
+  });
+
+  it('is a no-op for an empty list', async () => {
+    const { repinIndicators } = await import('./indicatorTimeframe');
+    expect(repinIndicators([], '1d')).toEqual([]);
+  });
+});

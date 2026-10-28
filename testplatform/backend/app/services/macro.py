@@ -21,6 +21,10 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+class MacroCoverageError(ValueError):
+    """The dataset's dates fall outside what a series' first-release cache can establish."""
+
+
 class MacroService:
     """
     Service for fetching and processing macroeconomic data.
@@ -112,6 +116,62 @@ class MacroService:
             )
         return sid
 
+    def _require_coverage(self, dates: pd.Series, indicators: List[str]) -> None:
+        """Refuse up front, with ONE clear message, a dataset the cache cannot cover.
+
+        A daily bar D decides on the next session N(D) (``fred_series.decision_label``), and the
+        reader refuses a label after the day the cache was fetched or on/before its first vintage.
+        Without this check that refusal surfaces deep inside the first read, naming a decision
+        label no one asked for. Nothing is trimmed: the caller must end/start the dataset inside the
+        coverage or refresh the cache. A missing cache file is refused here too, naming the file.
+        """
+        import json
+        import os
+        from datetime import date as date_cls
+        from datetime import datetime
+        from ba2_providers.macro import fred_series as fs
+
+        stamps = pd.Index(dates.dropna().unique()).sort_values()
+        if stamps.empty:
+            return
+        for indicator in indicators:
+            sid = self._require_cached_series(indicator)
+            path = fs.cache_path(sid)
+            if not os.path.exists(path):
+                raise fs.MacroAvailabilityUnknown(
+                    f"FRED {sid} ({indicator}): the first-release cache file {path} does not exist. "
+                    f"Run the FRED refresh (tools/refresh_fred_cache.py --series {sid}) first.")
+            with open(path, encoding='utf-8') as fh:
+                doc = json.load(fh)
+            if doc.get('format') != fs.CACHE_FORMAT_FIRST_RELEASE:
+                continue                       # the reader refuses the old format with its own message
+            first_day = date_cls.fromisoformat(str(doc['first_vintage']))
+            fetched_at = datetime.fromisoformat(str(doc['fetched_at']))
+            if fetched_at.tzinfo is None:
+                continue                       # unrecorded fetch day: the reader refuses it
+            fetched = fetched_at.astimezone(fs.FETCH_DAY_TZ).date()
+
+            labels = [fs.decision_label(t) for t in (stamps[0], stamps[-1])]
+            if labels[1] > fetched:
+                covered = [t for t in stamps if fs.decision_label(t) <= fetched]
+                last_ok = f"{covered[-1].date()}" if covered else None
+                raise MacroCoverageError(
+                    f"Macro series {sid} ({indicator}): the first-release cache was fetched on {fetched} "
+                    f"(New York date), so it covers decisions only up to that day; this dataset runs to "
+                    f"{stamps[-1].date()}. " + (
+                        f"The last coverable bar is {last_ok}: end the dataset on or before {last_ok}, "
+                        f"or refresh the FRED cache." if last_ok else
+                        "No bar of this dataset is coverable: refresh the FRED cache."))
+            if labels[0] <= first_day:
+                covered = [t for t in stamps if fs.decision_label(t) > first_day]
+                first_ok = f"{covered[0].date()}" if covered else None
+                raise MacroCoverageError(
+                    f"Macro series {sid} ({indicator}): the first-release cache's first vintage is "
+                    f"{first_day}, so decisions on or before it are unknown; this dataset starts at "
+                    f"{stamps[0].date()}. " + (
+                        f"The first coverable bar is {first_ok}: start the dataset on or after {first_ok}."
+                        if first_ok else "No bar of this dataset is coverable."))
+
     def _first_release_columns(self, dates: pd.Series, indicator: str) -> pd.DataFrame:
         """Per-row ``indicator``, ``_yoy_change`` and ``_days_since`` from the first-release cache.
 
@@ -141,8 +201,9 @@ class MacroService:
             # file) instead of fetching mid-build, so a dataset never depends on FRED being up.
             with frozen_ttl_cache():
                 visible = fs.get_series_as_of(sid, t).dropna()
-            # An observation can appear once per vintage, oldest first. The FIRST release is the
-            # value, always: a later vintage must never replace it (that is the revision leak).
+            # The cache holds ONE first-release row per observation, so this is a safeguard: if a
+            # payload ever carried several vintages of one observation, the FIRST release is the
+            # value and a later vintage must never replace it (that is the revision leak).
             visible = visible[~visible.index.duplicated(keep='first')]
             if visible.empty:
                 per_label[label] = (np.nan, pd.NaT, np.nan)
@@ -326,6 +387,7 @@ class MacroService:
 
         result_df = result_df.sort_values('Date').reset_index(drop=True)
 
+        self._require_coverage(result_df['Date'], indicators)
         for indicator in indicators:
             cols = self._first_release_columns(result_df['Date'], indicator)
             for col in cols.columns:
@@ -341,7 +403,7 @@ class MacroService:
         Raises (never skips) for an indicator the first-release cache cannot serve, so a dataset
         build fails with the series or file named instead of finishing without macro columns.
         """
-        df = self.integrate_macro_with_ohlc(df, indicators)
+        df = self.integrate_macro_with_ohlc(df, indicators)   # checks the cache coverage first
         renames = {}
         for indicator in indicators:
             for col in (indicator, f'{indicator}_yoy_change', f'{indicator}_days_since'):
@@ -370,6 +432,7 @@ class MacroService:
         result_df = result_df.sort_values('Date').reset_index(drop=True)
 
         # Fetch 2Y and 10Y yields from the first-release cache (DGS2 has no cache file: refused)
+        self._require_coverage(result_df['Date'], ['yield_2y', 'yield_10y'])
         for indicator in ('yield_2y', 'yield_10y'):
             result_df[indicator] = self._first_release_columns(result_df['Date'], indicator)[indicator]
 

@@ -1445,15 +1445,19 @@ def metric_fitness(optimize_metric: str, eval_result: Dict[str, Any]) -> float:
     higher-is-better but unbounded below; ``1 / (1 + (1 - r2))`` keeps it monotone and positive (the
     GA only tracks a best above 0). Classification metrics (f1_score, accuracy, ...) pass through.
     """
-    if optimize_metric == 'mape':
-        mape_val = eval_result.get('mape', 100)
-        if mape_val is None:
-            mape_val = 100
-        return 1.0 / (1.0 + mape_val / 100)
-    if optimize_metric in {'mae', 'mse', 'rmse'}:
-        return 1.0 / (1.0 + eval_result.get(optimize_metric, 100))
+    if optimize_metric in {'mape', 'mae', 'mse', 'rmse'}:
+        # The metric must have been computed (a missing key is a bug, not a fitness of 100); a None
+        # value (mape needs positive actuals) is the worst fitness, like r2 below.
+        if optimize_metric not in eval_result:
+            raise KeyError(f"evaluation result has no '{optimize_metric}' to optimise: {sorted(eval_result)}")
+        error = eval_result[optimize_metric]
+        if error is None:
+            return 0.0
+        return 1.0 / (1.0 + (error / 100 if optimize_metric == 'mape' else error))
     if optimize_metric == 'r2':
-        r2 = eval_result.get('r2')
+        if 'r2' not in eval_result:
+            raise KeyError(f"evaluation result has no 'r2' to optimise: {sorted(eval_result)}")
+        r2 = eval_result['r2']
         if r2 is None:
             return 0.0
         return 1.0 / (1.0 + (1.0 - r2))

@@ -24,11 +24,11 @@ def fred_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(fs, 'CACHE_FOLDER', str(tmp_path / 'cache'))
     fs.reset_cache()
 
-    def write(series_id, observations):
+    def write(series_id, observations, fetched_at=None, first_vintage='2000-01-03'):
         os.makedirs(os.path.join(fs.CACHE_FOLDER, 'fred'), exist_ok=True)
-        doc = {'series_id': series_id, 'fetched_at': pd.Timestamp.now(tz='UTC').isoformat(),
+        doc = {'series_id': series_id, 'fetched_at': fetched_at or pd.Timestamp.now(tz='UTC').isoformat(),
                'availability': fs.AVAIL_FIRST_RELEASE, 'format': fs.CACHE_FORMAT_FIRST_RELEASE,
-               'first_vintage': '2000-01-03', 'observations': observations}
+               'first_vintage': first_vintage, 'observations': observations}
         with open(fs.cache_path(series_id), 'w', encoding='utf-8') as fh:
             json.dump(doc, fh)
 
@@ -232,3 +232,85 @@ class TestCalculateMacroEndpoint:
         assert 'gdp' not in MacroService.get_supported_indicators()
         assert 'yield_2y' not in MacroService.get_supported_indicators()
         assert 'vix' in MacroService.get_supported_indicators()
+
+
+# ---------------------------------------------------------------------------------------
+# code-quality review: coverage is checked up front, one clear error
+# ---------------------------------------------------------------------------------------
+UNRATE_ROWS = [{'date': '2024-01-01', 'value': '3.9', 'realtime_start': '2024-02-02'}]
+
+
+class TestMacroCoverageUpFront:
+    def _svc(self):
+        from app.services.macro import MacroService
+        return MacroService()
+
+    def test_a_dataset_past_the_cache_fetch_day_is_refused_with_the_last_coverable_bar(self, fred_cache):
+        from app.services.macro import MacroCoverageError
+        fred_cache('UNRATE', UNRATE_ROWS, fetched_at='2026-10-28T12:00:00+00:00')
+        # bar 10-28 decides on the next session 10-29, a day the cache (fetched 10-28) cannot cover
+        with pytest.raises(MacroCoverageError) as e:
+            self._svc().add_macro_columns(_bars('2026-10-26', 3), ['unemployment'])
+        msg = str(e.value)
+        assert 'UNRATE' in msg and '2026-10-28' in msg                       # series and the cache's fetch day
+        assert 'end the dataset on or before 2026-10-27' in msg              # last coverable bar
+        assert 'refresh the FRED cache' in msg
+
+    def test_a_dataset_inside_the_coverage_still_builds(self, fred_cache):
+        fred_cache('UNRATE', UNRATE_ROWS, fetched_at='2026-10-28T12:00:00+00:00')
+        out = self._svc().add_macro_columns(_bars('2026-10-26', 2), ['unemployment'])
+        assert out['macro_unemployment'].tolist() == [3.9, 3.9]
+
+    def test_rows_before_the_first_vintage_are_refused_with_the_first_coverable_bar(self, fred_cache):
+        from app.services.macro import MacroCoverageError
+        fred_cache('UNRATE', UNRATE_ROWS, first_vintage='2024-03-01')
+        with pytest.raises(MacroCoverageError) as e:
+            self._svc().add_macro_columns(_bars('2024-02-26', 10), ['unemployment'])
+        msg = str(e.value)
+        assert 'UNRATE' in msg and '2024-03-01' in msg
+        assert 'start the dataset on or after 2024-03-01' in msg
+
+    def test_the_check_runs_before_any_cache_read(self, fred_cache, monkeypatch):
+        from ba2_providers.macro import fred_series as fs
+        from app.services.macro import MacroCoverageError
+        fred_cache('UNRATE', UNRATE_ROWS, fetched_at='2026-10-28T12:00:00+00:00')
+        monkeypatch.setattr(fs, 'get_series_as_of', lambda *a, **k: pytest.fail('read before the coverage check'))
+        with pytest.raises(MacroCoverageError):
+            self._svc().add_macro_columns(_bars('2026-10-26', 3), ['unemployment'])
+
+    def test_calculate_macro_returns_409_with_that_message(self, tmp_path, fred_cache):
+        from fastapi import HTTPException
+        from app.api import datasets
+        fred_cache('UNRATE', UNRATE_ROWS, fetched_at='2026-10-28T12:00:00+00:00')
+        csv = tmp_path / 'm.csv'
+        _bars('2026-10-26', 3).to_csv(csv, index=False)
+        with pytest.raises(HTTPException) as e:
+            datasets.calculate_macro_features(1, indicators=['unemployment'], include_yield_curve=False,
+                                              db=_FakeDB(SimpleNamespace(file_path=str(csv))))
+        assert e.value.status_code == 409
+        assert 'end the dataset on or before 2026-10-27' in e.value.detail
+
+    def test_a_dataset_task_fails_with_the_same_message(self, monkeypatch, tmp_path, fred_cache):
+        from app.api import datasets
+        fred_cache('UNRATE', UNRATE_ROWS, fetched_at='2026-10-28T12:00:00+00:00')
+        record = _record(tmp_path)
+        monkeypatch.setattr(datasets, 'SessionLocal', lambda: _FakeDB(record))
+        monkeypatch.setattr(datasets, 'fetch_ohlcv_frame', lambda *a, **k: _bars('2026-10-26', 3))
+        datasets._build_dataset_in_background(1, {
+            'ticker': 'AAA', 'timeframe': '1d', 'start_date': '2026-10-26', 'end_date': '2026-10-28',
+            'technical_indicators': [], 'sentiment_config': {},
+            'fundamentals_config': {'enabled': True, 'macro_indicators': ['unemployment']}})
+        assert record.status == 'error' and 'end the dataset on or before 2026-10-27' in record.error_message
+
+
+class TestMetricFitnessStrict:
+    def test_a_missing_error_metric_raises(self):
+        from app.services.job_handler import metric_fitness
+        for name in ('mae', 'mse', 'rmse', 'mape'):
+            with pytest.raises(KeyError, match=name):
+                metric_fitness(name, {})
+
+    def test_a_none_error_metric_is_the_worst_fitness(self):
+        from app.services.job_handler import metric_fitness
+        for name in ('mae', 'mse', 'rmse'):
+            assert metric_fitness(name, {name: None}) == 0.0
