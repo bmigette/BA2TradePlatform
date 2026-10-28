@@ -86,3 +86,34 @@ class TestFramesMissingAColumn:
         result, cap = TestJobIntegration()._job(frames, [pt("daily_up", horizonSessions=3)], monkeypatch)
         assert result["status"] == "dry_run_success", result
         assert "f_b" in cap["features"] and "f_a" in cap["features"]
+
+
+# ---------------------------------------------------------------------------------------------- 3. edit intraday -> daily
+class TestEditIntradayToDaily:
+    GC = {"data_provider": "alpaca_hist", "panel_features": ["daily", "market"], "original_start_date": "2023-01-03",
+          "original_end_date": "2024-12-31"}
+
+    def _update(self, update):
+        from tests.test_ml_wizard_daily import TestDailyUpdatePath
+        fetched = []
+        ds, _ = TestDailyUpdatePath()._update(dict(self.GC), update, fetched, timeframe="1h")
+        return ds, fetched
+
+    def test_the_inherited_intraday_list_is_ignored_when_the_timeframe_becomes_1d(self):
+        ds, fetched = self._update({"timeframe": "1d", "daily_groups": ["t"]})
+        gc = ds.generation_config
+        assert gc["panel_features"] == [] and gc["daily_groups"] == ["t"] and gc["daily_universe"] == ["AAA"]
+        assert fetched[0][5] == [] and fetched[0][7]["daily_groups"] == ["t"]
+
+    def test_an_explicit_intraday_list_with_1d_is_still_refused(self):
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc:
+            self._update({"timeframe": "1d", "daily_groups": ["t"], "panel_features": ["daily"]})
+        assert exc.value.status_code == 400
+
+    def test_daily_back_to_intraday_keeps_working(self):
+        from tests.test_ml_wizard_daily import TestDailyUpdatePath
+        gc = {"data_provider": "alpaca_hist", "panel_features": [], "daily_groups": ["t"], "daily_min_share": 0.7,
+              "daily_universe": ["AAA"], "original_start_date": "2023-01-03", "original_end_date": "2024-12-31"}
+        ds, _ = TestDailyUpdatePath()._update(gc, {"timeframe": "1h", "panel_features": ["market"]}, [], timeframe="1d")
+        assert ds.generation_config["panel_features"] == ["market"] and "daily_groups" not in ds.generation_config

@@ -2305,7 +2305,8 @@ def update_dataset(
         # Panel feature groups belong to the alpaca_hist source: an explicit list is validated, an inherited one
         # is dropped when the provider is no longer alpaca_hist
         panel_features = dataset_update.panel_features
-        if panel_features is None and is_alpaca_hist(gen_config.get("data_provider", "yfinance")):
+        if panel_features is None and is_alpaca_hist(gen_config.get("data_provider", "yfinance"))                 and new_timeframe != DAILY_TIMEFRAME:
+            # an inherited intraday list; at 1d the intraday groups do not exist (the daily store takes daily_groups)
             panel_features = gen_config.get("panel_features")
         fundamentals_config = dataset.fundamentals_config
         # Daily store options (alpaca_hist 1d): an explicit list / threshold is validated, inherited ones are kept while
