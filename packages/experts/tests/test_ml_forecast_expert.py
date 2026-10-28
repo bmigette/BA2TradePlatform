@@ -385,3 +385,16 @@ def test_session_ranks_are_read_only(rank_cache):
     ranks, _ = mlf_mod.session_ranks(rank_cache, date(2025, 3, 3), 10, UNIV.split(","))
     with pytest.raises(TypeError):
         ranks["AAA"] = 99
+
+
+def test_the_universe_is_parsed_once_across_symbols_and_dates(rank_cache, monkeypatch):
+    ranking._parse.cache_clear()
+    s = _rs()
+    _signals(s)
+    _signals(s, when=date(2025, 3, 4))
+    info = ranking._parse.cache_info()
+    assert info.misses == 1                                  # five symbols x two dates, one parse
+    uid = ranking.universe_id(UNIV.split(","))
+    assert mlf_mod.rank_universe_and_id(s) == (tuple(sorted(UNIV.split(","))), uid)
+    assert mlf_mod.rank_universe_and_id({**SETTINGS, "rank_universe": ""}) == ((), "")
+    assert mlf_mod.rank_universe_and_id({**SETTINGS, "rank_universe": []}) == ((), "")

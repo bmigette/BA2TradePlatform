@@ -331,3 +331,11 @@ def test_root_is_public_and_store_stamp_changes_with_the_meta_file(tmp_path, key
     p = tmp_path / "ml_forecast" / key / "meta.json"
     os.utime(p, ns=(a, a + 1_000_000))
     assert store.store_stamp(key, tmp_path) != a
+
+
+def test_missing_symbol_files_names_the_symbols_without_a_file(tmp_path, key):
+    seed(tmp_path, key, [row("AAPL", date(2024, 3, 1)), row("MSFT", date(2024, 3, 1))])
+    assert store.missing_symbol_files(key, ["msft", "NVDA", "AAPL", "IBM"], tmp_path) == ["IBM", "NVDA"]
+    assert store.missing_symbol_files(key, ["AAPL"], tmp_path) == []
+    other = model_key(make_card(context_length=256), ())
+    assert store.missing_symbol_files(other, ["AAPL"], tmp_path) == ["AAPL"]       # no such store at all

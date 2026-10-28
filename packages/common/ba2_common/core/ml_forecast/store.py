@@ -246,6 +246,13 @@ def _universe(symbols: Iterable[str]) -> List[str]:
     return out
 
 
+def missing_symbol_files(model_key: str, symbols: Iterable[str], cache_root: Optional[os.PathLike] = None) -> List[str]:
+    """The sorted symbols of ``symbols`` that have NO file in store ``model_key`` (the store's meta need not be read;
+    a store directory that does not exist reports every symbol)."""
+    kdir = _key_dir(root(cache_root), model_key)
+    return [x for x in _universe(symbols) if not (kdir / f"{x}.parquet").is_file()]
+
+
 def _universe_files(kdir: Path, model_key: str, syms: List[str]) -> None:
     """Every symbol of an explicit universe must have a store file: a missing one is an incomplete store (e.g. a
     worker that did not get the whole store), never a quiet absence."""

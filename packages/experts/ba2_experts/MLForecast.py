@@ -121,20 +121,30 @@ def rank_top_n(settings: Mapping) -> int:
     return int(v)
 
 
-def rank_universe(settings: Mapping) -> tuple:
-    """The sorted, de-duplicated symbols of the ``rank_universe`` setting (a list, or one comma-separated string, as
-    the launcher writes it so it travels as an ordinary string setting). May be empty (ranking off)."""
+def rank_universe_and_id(settings: Mapping) -> tuple:
+    """``(symbols, rank_universe_id)`` of the ``rank_universe`` setting: sorted, de-duplicated, upper-cased symbols from
+    a list or one comma-separated string (as the launcher writes it, so it travels as an ordinary string setting).
+    Empty (ranking off) is ``((), "")``. The parse and the id are memoised (``ranking.parse_universe``)."""
     raw = _setting_or_definition_default(settings, "rank_universe")
     if isinstance(raw, str):
-        raw = [x for x in raw.split(",") if x.strip()]
-    elif not isinstance(raw, (list, tuple)) or not all(isinstance(x, str) for x in raw):
+        if not any(x.strip() for x in raw.split(",")):
+            return (), ""
+    elif isinstance(raw, (list, tuple)) and all(isinstance(x, str) for x in raw):
+        if not raw:
+            return (), ""
+    else:
         raise ValueError(f"Setting 'rank_universe' must be a list of symbols or a comma-separated string, got {raw!r}")
-    return ranking.normalize_universe(raw) if raw else ()
+    return ranking.parse_universe(raw)
 
 
-def session_ranks(key: str, cutoff, horizon: int, symbols) -> tuple:
+def rank_universe(settings: Mapping) -> tuple:
+    """The symbols of ``rank_universe_and_id`` (may be empty)."""
+    return rank_universe_and_id(settings)[0]
+
+
+def session_ranks(key: str, cutoff, horizon: int, symbols, universe_id=None) -> tuple:
     """``({symbol: rank}, n)`` of ``symbols`` (the explicit universe) at ``cutoff``; see ``ranking.session_ranks``."""
-    return ranking.session_ranks(key, cutoff, horizon, symbols)
+    return ranking.session_ranks(key, cutoff, horizon, symbols, universe_id=universe_id)
 
 
 _alias_memo: dict = {}
@@ -253,7 +263,7 @@ class MLForecast(MarketExpertInterface):
         if top_n and genes.enable_sell:
             raise ValueError("Setting 'rank_top_n' > 0 is long-only: 'enable_sell' must be off")
         ranks = n_ranked = None
-        universe = rank_universe(settings) if top_n else ()
+        universe, universe_id = rank_universe_and_id(settings) if top_n else ((), "")
         if top_n and not universe:
             raise ValueError("Setting 'rank_universe' is required (a non-empty symbol list) when 'rank_top_n' > 0")
         if top_n and symbol.strip().upper() not in universe:
@@ -265,7 +275,7 @@ class MLForecast(MarketExpertInterface):
         if top_n:
             # BEFORE the row read: a universe symbol without a store file (an incomplete worker store) raises here
             # even when it is the symbol being analysed, instead of becoming a quiet no_forecast skip
-            ranks, n_ranked = session_ranks(key, cutoff, genes.horizon, universe)
+            ranks, n_ranked = session_ranks(key, cutoff, genes.horizon, universe, universe_id)
         try:
             row = store.read_row(key, symbol, cutoff, genes.horizon)
         except store.ForecastStoreMiss as exc:
@@ -285,7 +295,7 @@ class MLForecast(MarketExpertInterface):
                                                f"session ranking does not contain")
             rank = ranks[row.symbol]
             raw.update({"rank": rank, "rank_n": n_ranked, "rank_top_n": top_n,
-                        "rank_universe_id": ranking.universe_id(universe)})
+                        "rank_universe_id": universe_id})
         if use_case == AnalysisUseCase.OPEN_POSITIONS:
             if top_n and rank > top_n:
                 # rotation exit: the held long is no longer among the N most bullish symbols

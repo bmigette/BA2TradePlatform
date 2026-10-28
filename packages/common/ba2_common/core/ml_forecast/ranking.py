@@ -19,6 +19,7 @@ import hashlib
 import os
 import threading
 from collections import OrderedDict
+from functools import lru_cache
 from datetime import date
 from types import MappingProxyType
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
@@ -33,14 +34,30 @@ PANEL_CACHE_SIZE = 4
 CUTOFF_MEMO_SIZE = 16
 
 
-def normalize_universe(symbols: Iterable[str]) -> Tuple[str, ...]:
+@lru_cache(maxsize=256)
+def _parse(raw) -> Tuple[Tuple[str, ...], str]:
+    """``(sorted unique symbols, id)`` of a comma-separated string or a tuple of symbols. Memoised: the expert asks for
+    the same universe once per symbol per decision date, and a wide universe is not cheap to validate and hash."""
+    syms = tuple(store._universe(raw.split(",") if isinstance(raw, str) else raw))
+    return syms, hashlib.sha256(",".join(syms).encode("utf-8")).hexdigest()[:16]
+
+
+def parse_universe(symbols) -> Tuple[Tuple[str, ...], str]:
+    """``(normalised symbols, universe id)``. ``symbols`` is a comma-separated string (the ``rank_universe`` setting) or
+    an iterable of symbols; both spell the same set the same way. An empty or unsafe universe raises ``ValueError``."""
+    if isinstance(symbols, str):
+        return _parse(symbols)
+    return _parse(tuple(symbols))
+
+
+def normalize_universe(symbols) -> Tuple[str, ...]:
     """The sorted, de-duplicated, upper-cased symbols (validated as store-safe); an empty universe is refused."""
-    return tuple(store._universe(symbols))
+    return parse_universe(symbols)[0]
 
 
-def universe_id(symbols: Iterable[str]) -> str:
+def universe_id(symbols) -> str:
     """First 16 hex characters of the sha256 of the sorted symbols joined by ``,`` (order and case independent)."""
-    return hashlib.sha256(",".join(normalize_universe(symbols)).encode("utf-8")).hexdigest()[:16]
+    return parse_universe(symbols)[1]
 
 
 class RankingPanel:
@@ -98,16 +115,23 @@ def reset_panels() -> None:
         _panels.clear()
 
 
-def session_ranks(model_key: str, cutoff: date, horizon: int, symbols: Iterable[str],
+def session_ranks(model_key: str, cutoff: date, horizon: int, symbols,
                   cache_root: Optional[os.PathLike] = None,
-                  max_age_days: int = store.MAX_STALE_CALENDAR_DAYS) -> Tuple[Mapping[str, int], int]:
+                  max_age_days: int = store.MAX_STALE_CALENDAR_DAYS,
+                  universe_id: Optional[str] = None) -> Tuple[Mapping[str, int], int]:
     """``({symbol: rank}, n)`` of the universe's fresh rows at ``cutoff`` (rank 1 = most bullish, ties by symbol).
 
     The panel is keyed by the store's ``meta.json`` stamp, so a store rewritten through ``write_rows`` (in this or
     another process) is rebuilt; at most ``PANEL_CACHE_SIZE`` panels are kept. A universe symbol with no store file
-    raises ``store.ForecastStoreError``; a stale symbol is absent."""
-    syms = normalize_universe(symbols)
-    key = (str(store.root(cache_root)), model_key, horizon, universe_id(syms), store.store_stamp(model_key, cache_root))
+    raises ``store.ForecastStoreError``; a stale symbol is absent.
+
+    ``universe_id``: pass the id that ``parse_universe`` returned with ``symbols`` (then already the normalised tuple) to
+    skip re-deriving it; omitted, ``symbols`` is parsed (memoised) here."""
+    if universe_id is None:
+        syms, uid = parse_universe(symbols)
+    else:
+        syms, uid = tuple(symbols), universe_id
+    key = (str(store.root(cache_root)), model_key, horizon, uid, store.store_stamp(model_key, cache_root))
     with _lock:
         panel = _panels.get(key)
         if panel is None:

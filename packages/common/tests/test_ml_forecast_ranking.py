@@ -150,3 +150,27 @@ def test_panel_loads_no_path_cells_for_a_paths_store(tmp_path, monkeypatch):
     assert n == 2 and seen and all(len(c) == 10 for c in seen)
     # and a later read_row on the same store still gets its path cells (the panel did not poison the frame LRU)
     assert store.read_row(key, "AAA", date(2024, 3, 1), 5, tmp_path).has_paths
+
+
+def test_universe_parse_is_memoised_and_spelling_independent():
+    ranking._parse.cache_clear()
+    a = ranking.parse_universe("ccc, AAA,bbb,AAA")
+    assert a == (("AAA", "BBB", "CCC"), ranking.universe_id(["bbb", "ccc", "aaa"]))
+    assert ranking.parse_universe(("AAA", "BBB", "CCC")) == a and ranking.parse_universe(["CCC", "BBB", "AAA"]) == a
+    before = ranking._parse.cache_info()
+    for _ in range(5):
+        assert ranking.parse_universe("ccc, AAA,bbb,AAA") is a                # the very same cached object
+    assert ranking._parse.cache_info().hits == before.hits + 5 and ranking._parse.cache_info().misses == before.misses
+    assert ranking.normalize_universe("ccc, AAA,bbb") == a[0]
+    for bad in ("", " , ", "../x", []):
+        with pytest.raises(ValueError):
+            ranking.parse_universe(bad)
+
+
+def test_session_ranks_with_a_passed_id_does_not_reparse(tmp_path, monkeypatch):
+    key, h, _ = build(tmp_path, "deciles")
+    syms, uid = ranking.parse_universe(SYMS[:5])
+    ranking.session_ranks(key, date(2024, 2, 15), h, syms, tmp_path, universe_id=uid)       # builds the panel
+    monkeypatch.setattr(store, "_universe", lambda *a, **k: pytest.fail("the universe was re-validated"))
+    ranks, n = ranking.session_ranks(key, date(2024, 2, 16), h, syms, tmp_path, universe_id=uid)
+    assert n > 0
