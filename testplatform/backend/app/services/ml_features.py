@@ -317,6 +317,10 @@ class GroupSpec:
     prefix: str
     needs_sector: bool = False
     required_context: ContextFn = _no_context
+    #: the columns whose presence defines the group's coverage (``coverage_report``); None = all of them. A group lists only
+    #: the columns that are non-NaN whenever its data exist: a column that is NaN BY DESIGN (no resistance level, no target
+    #: in the window) must not make the whole group look uncovered.
+    coverage_columns: Optional[Tuple[str, ...]] = None
 
 
 def _per_symbol(daily: Dict[str, pd.DataFrame], ctx: BuildContext,
@@ -1424,9 +1428,12 @@ GROUPS: Dict[str, GroupSpec] = {
     "x": GroupSpec(cross_section, "x_"),
     "mac": GroupSpec(macro, "mac_"),
     "f": GroupSpec(fundamentals, "f_"),
-    "a": GroupSpec(analysts, "a_"),
+    "a": GroupSpec(analysts, "a_", coverage_columns=("a_net_upgrades_30", "a_net_upgrades_90", "a_n_grades_90",
+                                                       "a_n_analysts_90")),
     "i": GroupSpec(insiders, "i_"),
-    "s": GroupSpec(structure, "s_"),
+    "s": GroupSpec(structure, "s_", coverage_columns=tuple(
+        c for c in S_COLUMNS if c not in ("s_dist_support_atr", "s_dist_resistance_atr", "s_support_touches",
+                                          "s_resistance_touches", "s_bars_since_bos", "s_bars_since_choch"))),
 }
 
 
@@ -1666,6 +1673,83 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
         "ended": dict(load_meta["ended"]), "nan_rate": nan_rate,
         "columns": list(out.columns),
         "source": {"daily": {s: _fingerprint(_cache_file(cache_root, s)) for s in load}, **ctx.provenance}}
+    return out
+
+
+# ------------------------------------------------------------------------------------------ coverage report and masking
+def _group_columns(df: pd.DataFrame, group: str) -> List[str]:
+    """Every feature column of ``group`` in ``df`` (the ``<prefix>missing`` flag is not a feature)."""
+    prefix = _spec(group).prefix
+    return [c for c in df.columns if c.startswith(prefix) and not c.endswith("missing")]
+
+
+def _coverage_columns(df: pd.DataFrame, group: str) -> List[str]:
+    """The columns that define the group's coverage in ``df`` (``GroupSpec.coverage_columns``, else all of its columns)."""
+    spec = _spec(group)
+    cols = _group_columns(df, group)
+    if spec.coverage_columns is not None:
+        cols = [c for c in cols if c in spec.coverage_columns]
+    if not cols:
+        raise ValueError(f"group {group!r}: no columns in the frame")
+    return cols
+
+
+def _years(df: pd.DataFrame) -> np.ndarray:
+    return df.index.get_level_values("session").year.to_numpy()
+
+
+def coverage_report(df: pd.DataFrame, groups: Sequence[str]) -> pd.DataFrame:
+    """Per (group, year) the share of LISTED rows in which every coverage column of the group is non-NaN.
+
+    Returns a frame indexed ``[group, year]`` with ``rows`` (listed rows of the year), ``complete`` and ``share``. Unlisted rows
+    are not counted; a year with no listed row is absent. The coverage columns of a group are those of its
+    ``GroupSpec.coverage_columns`` (all of its columns by default)."""
+    listed = df["listed"].to_numpy(dtype=bool)
+    year = _years(df)
+    rows = []
+    for g in groups:
+        cols = _coverage_columns(df, g)
+        complete_row = df[cols].notna().all(axis=1).to_numpy()
+        for y in np.unique(year[listed]):
+            sel = listed & (year == y)
+            n, ok = int(sel.sum()), int((sel & complete_row).sum())
+            rows.append((g, int(y), n, ok, ok / n))
+    out = pd.DataFrame(rows, columns=["group", "year", "rows", "complete", "share"]).set_index(["group", "year"])
+    return out
+
+
+def column_coverage(df: pd.DataFrame, groups: Sequence[str]) -> pd.DataFrame:
+    """Per (column, year) the share of listed rows in which that single column is non-NaN (all columns of the groups)."""
+    listed = df["listed"].to_numpy(dtype=bool)
+    year = _years(df)
+    rows = []
+    for g in groups:
+        for c in _group_columns(df, g):
+            ok_col = df[c].notna().to_numpy()
+            for y in np.unique(year[listed]):
+                sel = listed & (year == y)
+                rows.append((c, int(y), int(sel.sum()), float((sel & ok_col).sum() / sel.sum())))
+    return pd.DataFrame(rows, columns=["column", "year", "rows", "share"]).set_index(["column", "year"])
+
+
+def apply_coverage_mask(df: pd.DataFrame, report: pd.DataFrame, min_share: float = 0.7) -> pd.DataFrame:
+    """A copy of ``df`` where, for every (group, year) of ``report`` under ``min_share``, ALL the group's feature columns
+    are NaN for that year, and a column ``<prefix>missing`` is 1.0 on those rows (0.0 elsewhere; one per group in the
+    report). The masked (group, year) pairs are listed in ``out.attrs["coverage_masked"]``. A model sees a thin year as
+    absent, with a flag, instead of a few real rows among NaNs."""
+    out = df.copy()
+    out.attrs = dict(df.attrs)
+    year = _years(out)
+    masked: List[Tuple[str, int]] = []
+    for g in report.index.get_level_values("group").unique():
+        sub = report.xs(g, level="group")
+        bad = sorted(int(y) for y, share in sub["share"].items() if share < min_share)
+        flag = np.isin(year, bad)
+        cols = _group_columns(out, g)
+        out.loc[flag, cols] = np.nan
+        out[f"{_spec(g).prefix}missing"] = flag.astype("float64")
+        masked += [(g, y) for y in bad]
+    out.attrs["coverage_masked"] = masked
     return out
 
 
