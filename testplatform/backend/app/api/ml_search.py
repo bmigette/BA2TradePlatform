@@ -69,20 +69,21 @@ class MlGridRequest(BaseModel):
 
 @router.post("/grid")
 def start_grid(req: MlGridRequest):
-    """Validate the cells (strict; a locked symbol is a 400) and enqueue the stage-1 grid (task ``ml_grid``).
-    Mirrors ``ba2-test ml-grid``; results land in ``out_dir`` (results.jsonl, predictions/, errors.jsonl)."""
-    from app.services.ml_grid import GridSettings, load_cells
+    """Check everything that can be refused (payload and limits, strict cells, the holdout lock, unusable feature
+    groups, a live run in ``out_dir``, finished rows computed under other settings or data) and only then enqueue the
+    stage-1 grid (task ``ml_grid``): any refusal is a 400 and nothing is queued. Mirrors ``ba2-test ml-grid``; results
+    land in ``out_dir`` (results.jsonl, predictions/, errors.jsonl)."""
+    import os
+    from app.services.ml_grid import GridLockedError, ResumeMismatchError, precheck_grid
     from app.services.ml_holdout import LockedSymbolError
-    if bool(req.config_path) == (req.cells is not None):
-        raise HTTPException(status_code=400, detail="pass exactly one of config_path and cells")
-    try:
-        cells = load_cells(req.config_path if req.config_path else req.cells)
-        GridSettings.from_dict(req.settings)
-    except (ValueError, LockedSymbolError, OSError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
     payload = req.model_dump()
+    payload["cores"] = req.cores if req.cores is not None else (os.cpu_count() or 1)
+    try:
+        n_cells = precheck_grid(payload)
+    except (ValueError, LockedSymbolError, OSError, ResumeMismatchError, GridLockedError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
     task_id = get_task_queue().queue_task(
         task_type="ml_grid", name=f"ML grid: {req.out_dir}", payload=payload,
-        description=f"ML exploration v2 stage-1 grid: {len(cells)} cells", timeout_seconds=7 * 24 * 3600)
+        description=f"ML exploration v2 stage-1 grid: {n_cells} cells", timeout_seconds=7 * 24 * 3600)
     logger.info(f"ml_grid enqueued task {task_id}")
-    return {"task_id": task_id, "cells": len(cells)}
+    return {"task_id": task_id, "cells": n_cells}

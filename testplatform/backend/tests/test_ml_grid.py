@@ -1,7 +1,9 @@
 """Stage-1 grid runner (app/services/ml_grid.py) on tiny synthetic stores with a planted (or no) signal."""
 import json
 import os
+import re
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -111,6 +113,15 @@ def cell(store, **over):
     return c
 
 
+def payload(world, cells=None, **over):
+    """A complete ``ml_grid`` payload: the handler takes no defaults, every key is explicit."""
+    p = {"out_dir": "out", "cpu_slots": 1, "gpu_slots": 0, "config_path": None,
+         "cells": cells if cells is not None else [cell(world[0])], "limit_cells": None,
+         "cache_root": str(world[2]), "settings": None, "cores": 2, "rerun_mismatched": False}
+    p.update(over)
+    return p
+
+
 def run(cells, out, world, **kw):
     kw.setdefault("settings", _settings())
     kw.setdefault("inline", True)
@@ -157,7 +168,7 @@ def test_a_locked_symbol_raises_everywhere(signal_world, tmp_path):
     with pytest.raises(HO.LockedSymbolError):
         G.load_cells([cell(signal_world[0]), bad])
     with pytest.raises(HO.LockedSymbolError):
-        G.handle_ml_grid("t", {"out_dir": str(tmp_path), "cpu_slots": 1, "gpu_slots": 0, "cells": [bad]})
+        G.handle_ml_grid("t", payload(signal_world, cells=[bad], out_dir=str(tmp_path)))
     assert set(G.TIMING_ETFS + G.TIMING_STOCKS).isdisjoint({"MSFT", "NVDA", "AMZN", "META"})
     HO.assert_unlocked(G.resolve_symbols("timing"), "test")           # the ETFs are exempt in ml_holdout itself
     HO.assert_unlocked(G.resolve_symbols("ndq30_dev"), "test")
@@ -248,9 +259,8 @@ def test_resume_survives_a_truncated_last_line(signal_world, tmp_path):
 def test_process_pool_matches_inline_and_the_handler_runs(signal_world, tmp_path):
     cells = [cell(signal_world[0], seeds=[1, 2])]
     run(cells, tmp_path / "inline", signal_world)
-    res = G.handle_ml_grid("cli", {"out_dir": str(tmp_path / "pool"), "cpu_slots": 2, "gpu_slots": 0, "cells": cells,
-                                   "cache_root": str(signal_world[2]), "cores": 2,
-                                   "settings": {**_settings().to_dict(), "cores": 2}})
+    res = G.handle_ml_grid("cli", payload(signal_world, cells=cells, out_dir=str(tmp_path / "pool"), cpu_slots=2,
+                                          settings={**_settings().to_dict(), "cores": 2}))
     assert res["done"] == 2 and res["errors"] == 0
     a = {(r["cell_key"], r["seed"]): r["primary"]["value"] for r in G.read_results(tmp_path / "inline" / "results.jsonl")}
     b = {(r["cell_key"], r["seed"]): r["primary"]["value"] for r in G.read_results(tmp_path / "pool" / "results.jsonl")}
@@ -259,26 +269,30 @@ def test_process_pool_matches_inline_and_the_handler_runs(signal_world, tmp_path
 
 def test_handler_payload_validation(signal_world, tmp_path):
     c = cell(signal_world[0])
-    with pytest.raises(ValueError, match="missing"):
-        G.handle_ml_grid("t", {"out_dir": str(tmp_path), "cpu_slots": 1})
+    full = payload(signal_world, out_dir=str(tmp_path / "o"))
+    for key in full:
+        with pytest.raises(ValueError, match=f"missing {key!r}"):                  # every key is required, none defaulted
+            G.handle_ml_grid("t", {k: v for k, v in full.items() if k != key})
     with pytest.raises(ValueError, match="exactly one"):
-        G.handle_ml_grid("t", {"out_dir": str(tmp_path), "cpu_slots": 1, "gpu_slots": 0})
+        G.handle_ml_grid("t", {**full, "cells": None})
     with pytest.raises(ValueError, match="exactly one"):
-        G.handle_ml_grid("t", {"out_dir": str(tmp_path), "cpu_slots": 1, "gpu_slots": 0, "cells": [c],
-                               "config_path": "x.json"})
+        G.handle_ml_grid("t", {**full, "cells": [c], "config_path": "x.json"})
     with pytest.raises(ValueError, match="unknown grid settings"):
-        G.handle_ml_grid("t", {"out_dir": str(tmp_path), "cpu_slots": 1, "gpu_slots": 0, "cells": [c],
-                               "settings": {"nope": 1}})
+        G.handle_ml_grid("t", {**full, "settings": {"nope": 1}})
+    for bad in ({"cpu_slots": 0}, {"gpu_slots": -1}, {"limit_cells": 0}, {"cores": None}, {"cores": 0},
+                {"rerun_mismatched": "yes"}):
+        with pytest.raises(ValueError):
+            G.handle_ml_grid("t", {**full, **bad})
 
 
-def test_an_exception_is_an_error_record_not_a_finished_row(signal_world, tmp_path):
+def test_unusable_groups_are_refused_before_anything_starts(signal_world, tmp_path, recording_pool):
     out = tmp_path / "out"
     bad = cell(signal_world[0], groups=["x"])                       # the synthetic store has no x_ columns
-    res = run([bad], out, signal_world)
-    assert res["done"] == 0 and res["errors"] == 1
-    err = json.loads((out / "errors.jsonl").read_text(encoding="utf-8").splitlines()[0])
-    assert "feature group 'x'" in err["error"] and not (out / "results.jsonl").exists()
-    assert run([bad], out, signal_world)["tasks"] == 1               # not finished: a restart retries it
+    with pytest.raises(ValueError, match="feature group 'x'") as ei:
+        run([cell(signal_world[0]), bad], out, signal_world, inline=False, cpu_slots=2)
+    assert "no column" in str(ei.value) and bad["groups"] == ["x"]
+    assert not recording_pool.instances and not (out / "results.jsonl").exists()           # no pool, no work, no lock
+    assert not (out / ".ml_grid.lock").exists()
 
 
 def test_gpu_pool_hook(signal_world, tmp_path, monkeypatch):
@@ -444,9 +458,8 @@ def test_timing_over_two_stores_uses_the_columns_in_both(tmp_path):
     assert sorted(r["symbols"]) == sorted(syms)
     # x_ exists in the stocks store only: a cell that needs it on the mixed set is refused, naming the group
     bad = cell(root, track="timing", target={"kind": "up", "horizon": 5}, symbols=syms, groups=["t", "x"])
-    out = tmp_path / "bad"
-    res = run([bad], out, world)
-    assert res["errors"] == 1 and "feature group 'x'" in json.loads((out / "errors.jsonl").read_text().splitlines()[0])["error"]
+    with pytest.raises(ValueError, match="feature group 'x'"):
+        run([bad], tmp_path / "bad", world)
     # ... but on the stocks alone it works
     ok = cell(root, symbols=stocks, groups=["t", "x"], target={"kind": "rel_return", "horizon": 5})
     assert run([ok], tmp_path / "ok", world, settings=_settings(control_seeds=(1, 2)))["done"] == 1
@@ -760,7 +773,7 @@ def test_rows_record_settings_and_store_and_daily_identity(signal_world, tmp_pat
     assert ident["settings"]["eval_start"] == "2019-01-01" and ident["settings"]["control_seeds"] == [1, 2, 3, 4, 5]
     assert "cores" not in ident["settings"]                              # thread count does not change a result
     assert ident["store_signature"] == G.validate_cell(cell(signal_world[0])).signature
-    assert ident["daily_fingerprint"] == G.daily_fingerprint(signal_world[2], tuple(sorted(SYMS)))
+    assert ident["daily_fingerprint"] == G.daily_fingerprint(signal_world[2], tuple(sorted(SYMS)), FIRST, LAST)
 
 
 def test_resume_refuses_rows_made_under_other_settings_unless_told_to_rerun(signal_world, tmp_path):
@@ -782,19 +795,58 @@ def test_resume_refuses_rows_made_under_other_settings_unless_told_to_rerun(sign
     assert len(stale) == 1 and stale[0]["identity"]["settings"]["cost_bps"] == 7.0
 
 
-def test_resume_refuses_when_the_daily_cache_changed(signal_world, tmp_path):
-    import os
+def _own_cache(signal_world, tmp_path):
     import shutil
-    out = tmp_path / "o"
     cache = tmp_path / "cache"
     shutil.copytree(signal_world[2], cache)
-    world = (signal_world[0], signal_world[1], cache)
+    return (signal_world[0], signal_world[1], cache), cache / "AlpacaHistoryOHLCVProvider" / f"{SYMS[0]}_1d.parquet"
+
+
+def test_a_touch_or_an_appended_bar_does_not_force_a_rerun_but_a_changed_bar_does(signal_world, tmp_path):
+    out = tmp_path / "o"
+    world, f = _own_cache(signal_world, tmp_path)
     c = cell(signal_world[0])
-    run([c], out, world, settings=_settings(control_seeds=(1,)))
-    f = cache / "AlpacaHistoryOHLCVProvider" / f"{SYMS[0]}_1d.parquet"
-    os.utime(f, (1_900_000_000, 1_900_000_000))
+    cfg = dict(settings=_settings(control_seeds=(1,)))
+    run([c], out, world, **cfg)
+    os.utime(f, (1_900_000_000, 1_900_000_000))                                          # a touch
+    assert run([c], out, world, **cfg)["tasks"] == 0
+    df = pd.read_parquet(f)                                                              # an append-only refresh
+    extra = df.iloc[[-1]].copy()
+    extra["Date"] = extra["Date"] + pd.Timedelta(days=1)
+    extra["effective_date"] = extra["Date"]
+    pd.concat([df, extra]).to_parquet(f, index=False)
+    assert run([c], out, world, **cfg)["tasks"] == 0
+    changed = pd.read_parquet(f)                                                         # a bar INSIDE the window changes
+    changed.loc[changed["Date"] == pd.Timestamp("2019-03-14"), "Close"] *= 1.0001
+    changed.to_parquet(f, index=False)
     with pytest.raises(G.ResumeMismatchError, match="daily_fingerprint"):
-        run([c], out, world, settings=_settings(control_seeds=(1,)))
+        run([c], out, world, **cfg)
+
+
+def test_the_fingerprint_is_taken_from_the_bars_the_panel_reads(signal_world, tmp_path):
+    panel = G.get_panel(str(signal_world[0]), tuple(sorted(SYMS)), "selection", str(signal_world[2]))
+    assert panel.daily_fingerprint == G.daily_fingerprint(signal_world[2], tuple(sorted(SYMS)), FIRST, LAST)
+    assert G.daily_fingerprint(signal_world[2], SYMS[:3], FIRST, LAST) != panel.daily_fingerprint
+
+
+def test_a_row_whose_predictions_file_is_missing_is_not_reused(signal_world, tmp_path):
+    out = tmp_path / "o"
+    c = cell(signal_world[0])
+    run([c], out, signal_world, settings=_settings(control_seeds=(1,)))
+    pred = next((out / "predictions").glob("*.parquet"))
+    pred.unlink()
+    res = run([c], out, signal_world, settings=_settings(control_seeds=(1,)))
+    assert res["tasks"] == 1 and res["done"] == 1 and pred.exists()
+    assert len(G.read_results(out / "results.jsonl")) == 1 and len(G.read_results(out / "results.stale.jsonl")) == 1
+
+
+def test_a_no_predictions_row_needs_no_file(signal_world, tmp_path):
+    out = tmp_path / "o"
+    c = cell(signal_world[0], target={"kind": "terciles", "horizon": 5}, track="timing")
+    run([c], out, signal_world, settings=_settings(min_count=10 ** 6, control_seeds=(1,)))
+
+    res = run([c], out, signal_world, settings=_settings(min_count=10 ** 6, control_seeds=(1,)))
+    assert res["tasks"] == 0                                              # the status says why there is no file
 
 
 def test_a_row_without_identity_is_a_mismatch_and_other_cells_are_not_checked(signal_world, tmp_path):
@@ -1075,3 +1127,83 @@ def test_the_worker_does_not_silence_all_warnings(tmp_path):
     G._WORKER["limits"].restore_original_limits()
     assert not [f for f in added if f[0] == "ignore" and f[1] is None]             # no blanket ignore
     assert all(f[1] is not None for f in added)                                      # each filter names a message
+
+
+# ------------------------------------------------------------------ store identity, normalisation, audit, route
+def test_a_store_without_inputs_in_its_meta_says_to_rebuild_it(signal_world, tmp_path):
+    moved = _copy_tree(signal_world[0], tmp_path / "old")
+    meta = moved / "stocks" / "features.parquet.meta.json"
+    m = json.loads(meta.read_text(encoding="utf-8"))
+    del m["ensure"]["inputs"]
+    meta.write_text(json.dumps(m), encoding="utf-8")
+    with pytest.raises(ValueError, match="store meta lacks ensure.inputs: rebuild the store"):
+        G.validate_cell(cell(moved))
+
+
+def test_train_months_spellings_give_one_canonical_cell(signal_world):
+    s = signal_world[0]
+    a = G.validate_cell(cell(s, train_months=36))
+    for spelling in ("36", 36.0, " 36 "):
+        b = G.validate_cell(cell(s, train_months=spelling))
+        assert b.train_months == 36 and isinstance(b.train_months, int) and b.key == a.key
+    for spelling in ("expanding", "Expanding", " EXPANDING "):
+        assert G.validate_cell(cell(s, train_months=spelling)).train_months == "expanding"
+    for bad in (True, 18, "18", 36.5, None, "", [36]):
+        with pytest.raises(ValueError, match="train_months"):
+            G.validate_cell(cell(s, train_months=bad))
+
+
+def test_rows_record_library_versions_and_the_code_hash(signal_world, tmp_path):
+    run([cell(signal_world[0])], tmp_path, signal_world, settings=_settings(control_seeds=(1,)))
+    v = G.read_results(tmp_path / "results.jsonl")[0]["versions"]
+    import numpy
+    import pandas
+    assert v["numpy"] == numpy.__version__ and v["pandas"] == pandas.__version__ and v["lightgbm"]
+    assert re.fullmatch(r"[0-9a-f]{12}", v["code"]) and "python" in v
+    assert v["catboost"] is None or isinstance(v["catboost"], str)
+
+
+def test_the_store_owner_helper_is_shared():
+    avail = [("stocks", Path("a"), ["AAPL", "X"]), ("etf", Path("b"), ["SPY", "X"])]
+    assert G.store_owners(avail) == {"AAPL": "stocks", "X": "stocks", "SPY": "etf"}
+    assert G.stores_used(avail, ["SPY", "AAPL"]) == [("stocks", Path("a")), ("etf", Path("b"))]
+    with pytest.raises(ValueError, match="in no store"):
+        G.stores_used(avail, ["NOPE"], where="here")
+
+
+def test_the_route_checks_limits_and_the_resume_identity_before_queueing(signal_world, tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from app.api import ml_search as api
+    queued = []
+
+    class Q:
+        def queue_task(self, **kw):
+            queued.append(kw)
+            return "task-1"
+    monkeypatch.setattr(api, "get_task_queue", lambda: Q())
+    app = FastAPI()
+    app.include_router(api.router, prefix="/api/ml-search")
+    cl = TestClient(app)
+    out = tmp_path / "o"
+    body = {"out_dir": str(out), "cpu_slots": 2, "cells": [cell(signal_world[0])], "cache_root": str(signal_world[2]),
+            "settings": _settings(control_seeds=(1,)).to_dict()}
+    for bad in ({"cpu_slots": 0}, {"limit_cells": 0}, {"gpu_slots": -1}, {"cores": 0}):
+        r = cl.post("/api/ml-search/grid", json={**body, **bad})
+        assert r.status_code == 400, (bad, r.text)
+    assert not queued
+    run([cell(signal_world[0])], out, signal_world, settings=_settings(control_seeds=(1,)))
+    mismatch = {**body, "settings": _settings(control_seeds=(1,), cost_bps=11.0).to_dict()}
+    r = cl.post("/api/ml-search/grid", json=mismatch)
+    assert r.status_code == 400 and "cost_bps" in r.json()["detail"] and not queued          # refused BEFORE queueing
+    assert cl.post("/api/ml-search/grid", json={**mismatch, "rerun_mismatched": True}).status_code == 200
+    ok = cl.post("/api/ml-search/grid", json={**body, "out_dir": str(tmp_path / "fresh")})
+    assert ok.status_code == 200 and queued[-1]["payload"]["cores"] >= 1                    # cores made explicit
+    bad_groups = {**body, "out_dir": str(tmp_path / "g"), "cells": [cell(signal_world[0], groups=["x"])]}
+    assert cl.post("/api/ml-search/grid", json=bad_groups).status_code == 400
+    import socket
+    lock = tmp_path / "locked"
+    lock.mkdir()
+    (lock / ".ml_grid.lock").write_text(json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "started": "x"}))
+    r = cl.post("/api/ml-search/grid", json={**body, "out_dir": str(lock)})
+    assert r.status_code == 400 and "already running" in r.json()["detail"]

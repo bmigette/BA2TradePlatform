@@ -290,6 +290,23 @@ def resolve_symbols(symbols: Union[str, Sequence[str]]) -> Tuple[str, ...]:
     return tuple(symbols)
 
 
+def normalise_train_months(v: Any) -> Union[int, str]:
+    """The canonical ``train_months``: an ``int`` of ``W.TRAIN_MONTHS`` or ``"expanding"``. Accepts 36, 36.0, "36",
+    " 36 " and any case of "expanding", so that two spellings of one cell give one ``cell_key``; refuses the rest."""
+    x = v
+    if isinstance(x, str):
+        x = x.strip()
+        if x.lower() == "expanding":
+            return "expanding"
+        if x.isdigit():
+            x = int(x)
+    if isinstance(x, (float, np.floating)) and not isinstance(x, bool) and float(x).is_integer():
+        x = int(x)
+    if isinstance(x, bool) or not _is_int(x) or int(x) not in W.TRAIN_MONTHS:
+        raise ValueError(f"train_months must be one of {W.TRAIN_MONTHS} or 'expanding', got {v!r}")
+    return int(x)
+
+
 def validate_cell(raw: Any) -> Cell:
     """Strict validation of one cell config. Unknown or missing keys, wrong types, unknown groups / kinds / families,
     a (family, task) pair that does not exist, a selection-only target on the timing track and any LOCKED symbol
@@ -364,9 +381,7 @@ def validate_cell(raw: Any) -> Cell:
     if not isinstance(params, dict):
         raise ValueError("params must be an object")
     M.make_adapter(family, 1, params)                      # unknown keys / out-of-range values raise
-    months = raw["train_months"]
-    if months != "expanding" and (isinstance(months, bool) or months not in W.TRAIN_MONTHS):
-        raise ValueError(f"train_months must be one of {W.TRAIN_MONTHS} or 'expanding', got {months!r}")
+    months = normalise_train_months(raw["train_months"])
     blocks = raw["blocks"]
     if blocks not in W.FREQS:
         raise ValueError(f"blocks must be one of {W.FREQS}, got {blocks!r}")
@@ -427,36 +442,103 @@ def discover_stores(store: Union[str, Path]) -> List[Tuple[str, Path, List[str]]
     return [(name, d, list(_meta_of(d)["symbols"])) for name, d in dirs]
 
 
+def store_owners(avail: Sequence[Tuple[str, Path, Sequence[str]]]) -> Dict[str, str]:
+    """symbol -> name of the first store (in lookup order) whose universe lists it."""
+    owner: Dict[str, str] = {}
+    for name, _, syms in avail:
+        for sym in syms:
+            owner.setdefault(sym, name)
+    return owner
+
+
+def stores_used(avail: Sequence[Tuple[str, Path, Sequence[str]]], symbols: Sequence[str], where: str = ""
+                ) -> List[Tuple[str, Path]]:
+    """``[(name, dir)]`` of the stores that own some of ``symbols`` (lookup order); raises when a symbol is in no store."""
+    owner = store_owners(avail)
+    absent = [s for s in symbols if s not in owner]
+    if absent:
+        raise ValueError(f"symbols {absent} are in no store{' under ' + where if where else ''} "
+                         f"(stores: {', '.join(f'{n}={len(s)} symbols' for n, _, s in avail)})")
+    return [(n, d) for n, d, _ in avail if any(owner[s] == n for s in symbols)]
+
+
 def store_signature(store: Union[str, Path], symbols: Sequence[str]) -> str:
     """Identity of the store data a cell reads, independent of where the store lives: a hash over the stores that hold
     ``symbols`` of (name, ``ensure.inputs`` -- code version, coverage columns, source fingerprints --, ``min_share``,
-    symbols, first / last day, cache end). Raises when a symbol is in no store."""
-    avail = discover_stores(store)
-    owner: Dict[str, str] = {}
-    for name, _, syms in avail:
-        for s in syms:
-            owner.setdefault(s, name)
-    absent = [s for s in symbols if s not in owner]
-    if absent:
-        raise ValueError(f"symbols {absent} are in no store under {store} "
-                         f"(stores: {', '.join(f'{n}={len(s)} symbols' for n, _, s in avail)})")
+    symbols, first / last day, cache end). Raises when a symbol is in no store, or when a store's meta has no
+    ``ensure.inputs`` (built before the inputs were recorded)."""
     parts = {}
-    for name, d, _ in avail:
-        if any(owner[s] == name for s in symbols):
-            m = _meta_of(d)
-            parts[name] = {"inputs": m["ensure"]["inputs"], "min_share": m["ensure"]["min_share"],
-                           "symbols": m["symbols"], "first_day": m["first_day"], "last_day": m["last_day"],
-                           "cache_end": m["cache_end"]}
+    for name, d in stores_used(discover_stores(store), symbols, str(store)):
+        m = _meta_of(d)
+        if "inputs" not in m["ensure"]:
+            raise ValueError("store meta lacks ensure.inputs: rebuild the store")
+        parts[name] = {"inputs": m["ensure"]["inputs"], "min_share": m["ensure"]["min_share"],
+                       "symbols": m["symbols"], "first_day": m["first_day"], "last_day": m["last_day"],
+                       "cache_end": m["cache_end"]}
     return hashlib.sha1(json.dumps(parts, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
 
 
-def daily_fingerprint(cache_root: Union[str, Path], symbols: Sequence[str]) -> str:
-    """Hash of the (size, mtime) of the daily cache file of every symbol: what the daily bars were read from."""
-    parts = []
+def store_span(store: Union[str, Path], symbols: Sequence[str]) -> Tuple[date, date, Optional[date]]:
+    """``(first_day, last_day, cache_end)`` of the stores holding ``symbols``; they must agree."""
+    spans = set()
+    for _, d in stores_used(discover_stores(store), symbols, str(store)):
+        m = _meta_of(d)
+        spans.add((m["first_day"], m["last_day"], m["cache_end"]))
+    if len(spans) != 1:
+        raise ValueError(f"the stores under {store} were built over different ranges {sorted(spans)}")
+    first, last, end = next(iter(spans))
+    return date.fromisoformat(first), date.fromisoformat(last), date.fromisoformat(end) if end else None
+
+
+def daily_fingerprint(cache_root: Union[str, Path], symbols: Sequence[str], first: date, last: date) -> str:
+    """Hash of the daily bars (open, high, low, close, volume, row by row) that fall in ``[first, last]``, per symbol:
+    exactly what the panel reads. A touch of a file or bars appended AFTER ``last`` do not change it; a changed bar
+    inside the window does."""
+    h = hashlib.sha1()
+    lo, hi = pd.Timestamp(first), pd.Timestamp(last)
     for sym in sorted(symbols):
-        st = F._cache_file(Path(cache_root), sym).stat()
-        parts.append([sym, st.st_size, st.st_mtime_ns])
-    return hashlib.sha1(json.dumps(parts).encode("utf-8")).hexdigest()[:16]
+        raw = F._read_daily(sym, Path(cache_root))
+        window = raw[(raw.index >= lo) & (raw.index <= hi)][list(F.BAR_COLUMNS)]
+        h.update(sym.encode("utf-8"))
+        h.update(pd.util.hash_pandas_object(window, index=True).to_numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+@lru_cache(maxsize=64)
+def _schema_names(path: str, mtime_ns: int) -> Tuple[str, ...]:
+    import pyarrow.parquet as pq
+    return tuple(pq.read_schema(path).names)
+
+
+def usable_feature_columns(store: Union[str, Path], symbols: Sequence[str]) -> List[str]:
+    """The feature columns (a registered group's prefix) present in EVERY store that owns some of ``symbols``,
+    read from the parquet schemas only (no data)."""
+    cols: Optional[List[str]] = None
+    prefixes = tuple(g.prefix for g in F.GROUPS.values())
+    for _, d in stores_used(discover_stores(store), symbols, str(store)):
+        f = d / "features.parquet"
+        names = [c for c in _schema_names(str(f), f.stat().st_mtime_ns) if c.startswith(prefixes)]
+        cols = names if cols is None else [c for c in cols if c in set(names)]
+    return cols or []
+
+
+def check_groups(cells: Sequence["Cell"]) -> None:
+    """Refuse, before any work starts, every cell asking for a feature group that has no column for some of its
+    symbols (a group missing from one of the stores involved)."""
+    problems: List[str] = []
+    cache: Dict[Tuple, List[str]] = {}
+    for c in cells:
+        key = (c.store, c.symbols)
+        if key not in cache:
+            cache[key] = usable_feature_columns(c.store, resolve_symbols(c.symbols))
+        for g in c.groups:
+            if not any(col.startswith(F.GROUPS[g].prefix) for col in cache[key]):
+                stores = [n for n, _ in stores_used(discover_stores(c.store), resolve_symbols(c.symbols), c.store)]
+                problems.append(f"feature group {g!r} has no column in every store involved ({', '.join(stores)}): "
+                                f"cell {c.key} ({c.label})")
+    if problems:
+        raise ValueError(f"{len(problems)} cell(s) use a feature group with no usable column, refused up front: "
+                         + "; ".join(problems[:10]) + ("; ..." if len(problems) > 10 else ""))
 
 
 def _store_fingerprint(store: Union[str, Path]) -> Tuple:
@@ -516,15 +598,8 @@ def load_panel(store: Union[str, Path], symbols: Tuple[str, ...], track: str, ca
     """Read the stores holding ``symbols``, the daily bars and the usability flags (see the module docstring)."""
     t0 = time.perf_counter()
     avail = discover_stores(store)
-    owner: Dict[str, str] = {}
-    for name, _, syms in avail:
-        for s in syms:
-            owner.setdefault(s, name)
-    absent = [s for s in symbols if s not in owner]
-    if absent:
-        raise ValueError(f"symbols {absent} are in no store under {store} "
-                         f"(stores: {', '.join(f'{n}={len(s)} symbols' for n, _, s in avail)})")
-    used = [(n, d) for n, d, _ in avail if any(owner[s] == n for s in symbols)]
+    owner = store_owners(avail)
+    used = stores_used(avail, symbols, str(store))
     frames: Dict[str, pd.DataFrame] = {}
     metas: Dict[str, Dict[str, Any]] = {}
     for name, d in used:
@@ -538,7 +613,12 @@ def load_panel(store: Union[str, Path], symbols: Tuple[str, ...], track: str, ca
     first_s, last_s, cache_end_s = next(iter(firsts))
     first, last = date.fromisoformat(first_s), date.fromisoformat(last_s)
     cache_end = date.fromisoformat(cache_end_s) if cache_end_s else None
+    files = [F._cache_file(Path(cache_root), sym) for sym in symbols]
+    stamp = [(f.stat().st_size, f.stat().st_mtime_ns) for f in files]
+    fingerprint = daily_fingerprint(cache_root, symbols, first, last)         # BEFORE the bars are used
     bars, _ = F.load_daily(symbols, first, last, Path(cache_root), cache_end=cache_end)
+    if stamp != [(f.stat().st_size, f.stat().st_mtime_ns) for f in files]:
+        raise RuntimeError("the daily cache changed while the panel was loading; run again")
     arrays = T.daily_arrays(bars)
     index = pd.MultiIndex.from_product([arrays.symbols, arrays.sessions], names=["symbol", "session"])
     cols: Optional[List[str]] = None
@@ -559,8 +639,7 @@ def load_panel(store: Union[str, Path], symbols: Tuple[str, ...], track: str, ca
           & (lbf == False).fillna(False).astype(bool)).to_numpy()          # noqa: E712  (NA = unknown: not usable)
     X = allrows[list(cols)].to_numpy(dtype=np.float32)
     return Panel(symbols, track, index, pd.DatetimeIndex(index.get_level_values("session")), tuple(cols), X, ok, bars,
-                 arrays, tuple(n for n, _ in used), time.perf_counter() - t0,
-                 daily_fingerprint(cache_root, symbols))
+                 arrays, tuple(n for n, _ in used), time.perf_counter() - t0, fingerprint)
 
 
 #: panels (stores + bars + targets, ~100-200 MB each) a worker process keeps; the least recently used is evicted
@@ -628,7 +707,10 @@ def fit_block(cell: Cell, seed: int, panel: Panel, block: W.Block, window: W.Win
     ks = cell.spec
     tg = panel.targets(H)
     fold = T.Fold(block.name, window.start, block.start, block.end)
-    score_col = {"volatility": f"realvol_{H}"}.get(cell.kind, f"rel_ret_{H}" if cell.track == "selection" else f"ret_{H}")
+    if cell.kind == "volatility":
+        score_col = f"realvol_{H}"
+    else:
+        score_col = f"rel_ret_{H}" if cell.track == "selection" else f"ret_{H}"
     train_col = f"ret_{H}" if ks.column is None else f"{ks.column}_{H}"
     tr, _ = T.daily_fold_rows(tg, fold, H, train_col)
     _, pr = T.daily_fold_rows(tg, fold, H, score_col)
@@ -861,6 +943,30 @@ def _predictions_frame(cell: Cell, panel: Panel, rows: np.ndarray, scores: np.nd
     return pd.DataFrame(out).sort_values(["session", "symbol"], kind="mergesort").reset_index(drop=True)
 
 
+_CODE_MODULES = ("ml_grid", "ml_models", "ml_targets", "ml_eval", "ml_walkforward", "ml_controls", "ml_features")
+
+
+@lru_cache(maxsize=1)
+def library_versions() -> Dict[str, Any]:
+    """Audit fields: the Python and library versions a row was computed with, and a hash of the sources of the ML
+    modules (``code``). Not part of the resume identity: a library upgrade is visible, not a forced rerun."""
+    import platform
+    from importlib.metadata import PackageNotFoundError, version
+    out: Dict[str, Any] = {"python": platform.python_version()}
+    for dist, key in (("numpy", "numpy"), ("pandas", "pandas"), ("pyarrow", "pyarrow"), ("scikit-learn", "sklearn"),
+                      ("scipy", "scipy"), ("lightgbm", "lightgbm"), ("xgboost", "xgboost"), ("catboost", "catboost"),
+                      ("threadpoolctl", "threadpoolctl")):
+        try:
+            out[key] = version(dist)
+        except PackageNotFoundError:
+            out[key] = None
+    h = hashlib.sha1()
+    for mod in _CODE_MODULES:
+        h.update((Path(__file__).parent / f"{mod}.py").read_bytes().replace(b"\r\n", b"\n"))
+    out["code"] = h.hexdigest()[:12]
+    return out
+
+
 def identity_of(cell: Cell, st: GridSettings, daily_fp: str) -> Dict[str, Any]:
     """What a finished row was computed from, for the resume check: the settings (not ``cores``), the store signature
     and the daily cache fingerprint."""
@@ -904,6 +1010,7 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
     iters = [b["n_iter"] for b in info if b["n_iter"] is not None]
     row: Dict[str, Any] = {"cell_key": cell.key, "seed": int(seed), "track": cell.track, "label": cell.label,
                            "config": cell.config(), "identity": identity_of(cell, st, panel.daily_fingerprint),
+                           "versions": library_versions(),
                            "deterministic": cell.family in DETERMINISTIC_FAMILIES,
                            "seeds_run": len(effective_seeds(cell)),
                            "low_iter_share": float(np.mean([i <= LOW_ITER for i in iters])) if iters else None,
@@ -1201,28 +1308,35 @@ class ResumeMismatchError(RuntimeError):
 
 def _identity_diff(row: Dict[str, Any], expected: Dict[str, Any]) -> List[str]:
     """How a finished row's recorded identity differs from the one this run would produce (empty = reusable)."""
-    ident = row.get("identity")
+    ident = row["identity"] if "identity" in row else None
     if not isinstance(ident, dict):
         return ["no identity recorded (a row written before identity tracking)"]
     out = []
     for k in ("store_signature", "daily_fingerprint"):
-        if ident.get(k) != expected[k]:
-            out.append(f"{k}: row {ident.get(k)!r}, now {expected[k]!r}")
-    old, new = ident.get("settings") or {}, expected["settings"]
+        got = ident[k] if k in ident else None
+        if got != expected[k]:
+            out.append(f"{k}: row {got!r}, now {expected[k]!r}")
+    old = ident["settings"] if "settings" in ident and isinstance(ident["settings"], dict) else {}
+    new = expected["settings"]
     for k in sorted(set(old) | set(new)):
-        if old.get(k) != new.get(k):
-            out.append(f"settings.{k}: row {old.get(k)!r}, now {new.get(k)!r}")
+        a_, b_ = (old[k] if k in old else None), (new[k] if k in new else None)
+        if a_ != b_:
+            out.append(f"settings.{k}: row {a_!r}, now {b_!r}")
     return out
 
 
 def _check_resume(rows: List[Dict[str, Any]], cells: Sequence[Cell], st: GridSettings, cache_root: str,
-                  rerun_mismatched: bool, res_path: Path) -> set:
+                  rerun_mismatched: bool, res_path: Path, dry_run: bool = False) -> set:
     """The (cell_key, seed) pairs whose finished row may be reused. A row of a cell in this run whose identity differs
     raises ``ResumeMismatchError``; with ``rerun_mismatched`` it is moved to ``results.stale.jsonl`` (and so recomputed).
-    Rows of cells that are not in this run are left alone."""
+    Rows of cells that are not in this run are left alone. A row whose predictions file is gone is not reused either
+    (it is moved to the stale file and recomputed, with or without ``rerun_mismatched``; a ``no_predictions`` row has
+    no file by design). ``dry_run`` checks and raises but moves nothing."""
     wanted = {(c.key, s): c for c in cells for s in c.seeds}
-    fps: Dict[Tuple[str, ...], str] = {}
+    fps: Dict[Tuple, str] = {}
     mism: Dict[Tuple[str, int], List[str]] = {}
+    lost: Dict[Tuple[str, int], List[str]] = {}
+    pred_dir = res_path.parent / "predictions"
     finished = set()
     for r in rows:
         k = (r["cell_key"], int(r["seed"]))
@@ -1230,31 +1344,46 @@ def _check_resume(rows: List[Dict[str, Any]], cells: Sequence[Cell], st: GridSet
             continue
         c = wanted[k]
         syms = tuple(sorted(resolve_symbols(c.symbols)))
-        if syms not in fps:
-            fps[syms] = daily_fingerprint(cache_root, syms)
-        diff = _identity_diff(r, identity_of(c, st, fps[syms]))
+        first, last, _ = store_span(c.store, syms)
+        if (syms, first, last) not in fps:
+            fps[(syms, first, last)] = daily_fingerprint(cache_root, syms, first, last)
+        diff = _identity_diff(r, identity_of(c, st, fps[(syms, first, last)]))
         if diff:
             mism[k] = diff
+        elif r["status"] == "ok" and not (pred_dir / f"{k[0]}_{k[1]}.parquet").exists():
+            lost[k] = ["predictions file missing"]
         else:
             finished.add(k)
-    if not mism:
+    if not mism and not lost:
         return finished
-    if not rerun_mismatched:
+    if mism and not rerun_mismatched:
         ex = "; ".join(f"cell {k[0]} seed {k[1]} ({wanted[k].label}): {', '.join(d[:3])}"
                        for k, d in list(mism.items())[:5])
         raise ResumeMismatchError(
             f"{len(mism)} finished row(s) in {res_path} were computed under other settings or data than this run "
             f"({ex}). Pass rerun_mismatched=True (CLI --rerun-mismatched) to move them to results.stale.jsonl and "
             f"recompute them, or use another --out.")
-    keep = [r for r in rows if (r["cell_key"], int(r["seed"])) not in mism]
-    stale = [r for r in rows if (r["cell_key"], int(r["seed"])) in mism]
+    if dry_run:
+        return finished
+    move = set(mism) | set(lost)
+    keep = [r for r in rows if (r["cell_key"], int(r["seed"])) not in move]
+    stale = [r for r in rows if (r["cell_key"], int(r["seed"])) in move]
     for r in stale:
         _append(res_path.with_name("results.stale.jsonl"), r)
     tmp = res_path.with_suffix(".tmp")
     tmp.write_text("".join(json.dumps(_sanitize(r)) + "\n" for r in keep), encoding="utf-8")
     os.replace(tmp, res_path)
-    logger.warning(f"ml_grid: {len(stale)} mismatched row(s) moved to results.stale.jsonl, they will be recomputed")
+    logger.warning(f"ml_grid: {len(stale)} row(s) ({len(mism)} mismatched, {len(lost)} without predictions file) "
+                   f"moved to results.stale.jsonl, they will be recomputed")
     return finished
+
+
+def resolve_cache_root(cache_root: Optional[Union[str, Path]]) -> str:
+    """``cache_root`` as a string; ``None`` means the platform cache folder."""
+    if cache_root is None:
+        from ba2_common.config import CACHE_FOLDER
+        return str(CACHE_FOLDER)
+    return str(cache_root)
 
 
 def n_jobs_for(cpu_slots: int, cores: int) -> int:
@@ -1279,10 +1408,8 @@ def run_grid(cells: Sequence[Cell], out_dir: Union[str, Path], cpu_slots: int, g
     if not _is_int(cpu_slots) or cpu_slots < 1 or not _is_int(gpu_slots) or gpu_slots < 0:
         raise ValueError("cpu_slots must be an integer >= 1 and gpu_slots an integer >= 0")
     st = settings or GridSettings()
-    if cache_root is None:
-        from ba2_common.config import CACHE_FOLDER
-        cache_root = CACHE_FOLDER
-    cache_root = str(cache_root)
+    cache_root = resolve_cache_root(cache_root)
+    check_groups(cells)                                       # refuse an unusable group before anything starts
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     lock = acquire_lock(out)
@@ -1403,27 +1530,72 @@ def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: s
 
 
 # ================================================================== job handler
-def handle_ml_grid(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Task ``ml_grid``. Payload: ``out_dir``, ``cpu_slots``, ``gpu_slots`` (all required), exactly one of ``config_path``
-    / ``cells``, and optional ``limit_cells``, ``cache_root``, ``settings`` (``GridSettings`` overrides), ``cores``,
-    ``rerun_mismatched``."""
-    for k in ("out_dir", "cpu_slots", "gpu_slots"):
+PAYLOAD_KEYS = ("out_dir", "cpu_slots", "gpu_slots", "config_path", "cells", "limit_cells", "cache_root", "settings",
+                "cores", "rerun_mismatched")
+
+
+def prepare_grid(payload: Dict[str, Any]) -> Tuple[List[Cell], GridSettings, str]:
+    """Validate an ``ml_grid`` payload and return ``(cells, settings, cache_root)``. Every key of ``PAYLOAD_KEYS`` must be
+    present (no defaults; ``None`` is a value for ``config_path`` / ``cells`` (exactly one is set), ``limit_cells``,
+    ``cache_root`` and ``settings``); ``cores`` is an explicit integer."""
+    for k in PAYLOAD_KEYS:
         if k not in payload:
             raise ValueError(f"ml_grid payload is missing {k!r}")
-    if bool(payload.get("config_path")) == (payload.get("cells") is not None):
+    if not _is_int(payload["cpu_slots"]) or payload["cpu_slots"] < 1:
+        raise ValueError("cpu_slots must be an integer >= 1")
+    if not _is_int(payload["gpu_slots"]) or payload["gpu_slots"] < 0:
+        raise ValueError("gpu_slots must be an integer >= 0")
+    if not _is_int(payload["cores"]) or payload["cores"] < 1:
+        raise ValueError("cores must be an explicit integer >= 1")
+    if not isinstance(payload["rerun_mismatched"], bool):
+        raise ValueError("rerun_mismatched must be true or false")
+    limit = payload["limit_cells"]
+    if limit is not None and (not _is_int(limit) or limit < 1):
+        raise ValueError("limit_cells must be null or an integer >= 1")
+    if bool(payload["config_path"]) == (payload["cells"] is not None):
         raise ValueError("ml_grid payload needs exactly one of 'config_path' and 'cells'")
-    cells = load_cells(payload["config_path"] if payload.get("config_path") else payload["cells"])
-    limit = payload.get("limit_cells")
+    cells = load_cells(payload["config_path"] if payload["config_path"] else payload["cells"])
     if limit is not None:
-        if not _is_int(limit) or limit < 1:
-            raise ValueError("limit_cells must be an integer >= 1")
         cells = cells[:limit]
-    sd = dict(payload.get("settings") or {})
-    if payload.get("cores") is not None:
-        sd["cores"] = int(payload["cores"])
-    elif "cores" not in sd:
-        sd["cores"] = os.cpu_count() or 1
-    st = GridSettings.from_dict(sd)
+    if payload["settings"] is not None and not isinstance(payload["settings"], dict):
+        raise ValueError("settings must be null or an object")
+    st = GridSettings.from_dict({**(payload["settings"] or {}), "cores": payload["cores"]})
+    return cells, st, resolve_cache_root(payload["cache_root"])
+
+
+def check_lock(out: Path) -> None:
+    """Raise ``GridLockedError`` when a live run holds ``out`` (without taking the lock)."""
+    path = out / LOCK_NAME
+    if not path.exists():
+        return
+    try:
+        held = json.loads(path.read_text(encoding="utf-8"))
+        alive = held["host"] != socket.gethostname() or pid_alive(int(held["pid"]))
+    except (OSError, json.JSONDecodeError, KeyError):
+        return
+    if alive:
+        raise GridLockedError(f"another ml_grid run is already running in {out} (pid {held['pid']} on {held['host']}, "
+                              f"started {held['started']})")
+
+
+def precheck_grid(payload: Dict[str, Any]) -> int:
+    """Everything that can be refused before a task is queued: the payload, the cells (holdout lock, schema), unusable
+    feature groups, a live run in ``out_dir`` and finished rows whose identity differs from this run's
+    (``ResumeMismatchError`` unless ``rerun_mismatched``). Changes nothing. Returns the number of cells."""
+    cells, st, cache_root = prepare_grid(payload)
+    check_groups(cells)
+    out = Path(payload["out_dir"])
+    check_lock(out)
+    _check_resume(read_results(out / "results.jsonl"), cells, st, cache_root, payload["rerun_mismatched"],
+                  out / "results.jsonl", dry_run=True)
+    return len(cells)
+
+
+def handle_ml_grid(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Task ``ml_grid``. The payload carries every key of ``PAYLOAD_KEYS`` (``prepare_grid``): ``out_dir``, ``cpu_slots``,
+    ``gpu_slots``, ``config_path`` / ``cells`` (exactly one), ``limit_cells``, ``cache_root``, ``settings`` (``GridSettings``
+    overrides), ``cores`` and ``rerun_mismatched``. A queue cancellation stops the run cooperatively."""
+    cells, st, cache_root = prepare_grid(payload)
 
     last = {"pct": 0.0}
 
@@ -1437,10 +1609,8 @@ def handle_ml_grid(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             logger.debug(f"progress not recorded: {e}")
         logger.warning(msg)
 
-    res = run_grid(cells, payload["out_dir"], int(payload["cpu_slots"]), int(payload["gpu_slots"]),
-                   payload.get("cache_root"), st, progress,
-                   rerun_mismatched=bool(payload.get("rerun_mismatched", False)),
-                   cancel_check=make_cancel_check(task_id))
+    res = run_grid(cells, payload["out_dir"], payload["cpu_slots"], payload["gpu_slots"], cache_root, st, progress,
+                   rerun_mismatched=payload["rerun_mismatched"], cancel_check=make_cancel_check(task_id))
     progress(f"ml_grid {'CANCELLED' if res['cancelled'] else 'done'}: {res['done']} rows, {res['errors']} errors, "
-             f"{res['skipped_existing']} already finished", 100.0 if not res["cancelled"] else None)
+             f"{res['skipped_existing']} already finished", None if res["cancelled"] else 100.0)
     return res

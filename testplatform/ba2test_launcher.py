@@ -8955,9 +8955,10 @@ def _cmd_ml_grid(args) -> int:
     its seeds as out-of-sample walk-forward signals, scored per track with shuffle controls. Resumes: finished
     (cell_key, seed) rows of --out/results.jsonl are skipped."""
     from app.services.ml_grid import factor_effects, handle_ml_grid, read_results
-    payload = {"config_path": args.config, "out_dir": args.out, "cpu_slots": args.cpu_slots,
+    payload = {"config_path": args.config, "cells": None, "out_dir": args.out, "cpu_slots": args.cpu_slots,
                "gpu_slots": args.gpu_slots, "limit_cells": args.limit_cells, "cache_root": args.cache_root,
-               "cores": args.cores, "rerun_mismatched": args.rerun_mismatched}
+               "settings": None, "cores": args.cores if args.cores is not None else (os.cpu_count() or 1),
+               "rerun_mismatched": args.rerun_mismatched}
     try:
         res = handle_ml_grid("cli-ml-grid", payload)
     except KeyboardInterrupt:
