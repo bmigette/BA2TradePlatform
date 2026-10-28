@@ -191,6 +191,19 @@ def arch_params(arch: str, width: int, dropout: float, lookback: int, rocket_fea
 
 
 # ------------------------------------------------------------------ shared helpers
+def n_batches(n: int, batch_size: int) -> int:
+    """Batches per epoch: ceil(n / batch_size), fewer when that would leave a batch of one row (BatchNorm cannot train
+    on it): the remainder is merged into the others, so every batch has at least 2 rows (n >= 2)."""
+    steps = max(1, math.ceil(n / batch_size))
+    return max(1, min(steps, n // 2))
+
+
+def batch_splits(perm, batch_size: int):
+    """``perm`` cut into ``n_batches`` near-equal chunks (sizes differ by at most one, none below 2)."""
+    import torch
+    return torch.tensor_split(torch.as_tensor(perm), n_batches(len(perm), batch_size))
+
+
 def _check_seq(X, where: str) -> SequenceData:
     if not isinstance(X, SequenceData):
         raise TypeError(f"{where}: X must be a SequenceData (windows of past bars), got {type(X).__name__}")
@@ -370,7 +383,7 @@ class TsaiAdapter(_SequenceAdapter):
             val_sum = torch.nn.MSELoss(reduction="sum") if task == "regression" else torch.nn.CrossEntropyLoss(reduction="sum")
 
             bs = p["batch_size"]
-            steps = max(1, math.ceil(len(rt) / bs))
+            steps = n_batches(len(rt), bs)
             opt = torch.optim.AdamW([q for q in net.parameters() if q.requires_grad], lr=p["lr"],
                                     weight_decay=p["weight_decay"])
             sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=p["lr"], total_steps=steps * p["epochs"])
@@ -379,7 +392,7 @@ class TsaiAdapter(_SequenceAdapter):
             for ep in range(p["epochs"]):
                 net.train()
                 perm = torch.randperm(len(rt), generator=gen).to(device)
-                for pos in torch.tensor_split(perm, steps):          # near-equal batches, none of size 1
+                for pos in batch_splits(perm, bs):                # near-equal batches, none of size 1
                     opt.zero_grad(set_to_none=True)
                     loss = train_loss(net(window(Ft, rt[pos])), yt_t[pos])
                     loss.backward()
@@ -518,8 +531,8 @@ class DartsAdapter(_SequenceAdapter):
     Input contract beyond ``SequenceData``: ``returns`` and ``horizon_steps`` (= forecast length n_out) are required.
     Darts trains on EVERY window of each series' contiguous span, so ``rows`` only mark the span of decision bars per
     series (first row .. last row) and ``y`` (the realised H-step return) is validated but not trained on. The
-    training span's targets run n_out bars past its last row: they must end at or before the first validation row of
-    the same series (the purge), and every block's last target must exist (refused otherwise). Train and validation
+    training span's targets run n_out bars past its last row: they must end STRICTLY before the first validation row of
+    the same series (the purge; refused in any ordering, also validation before or inside the training block), and every block's last target must exist (refused otherwise). Train and validation
     must cover the same series; a model per symbol is one adapter per symbol. ``fit`` early-stops on the validation
     quantile loss and keeps the best checkpoint; the draws of ``predict`` come from an RNG seeded with (fit seed,
     decision row), so ``predict`` of the same row repeats exactly whatever else is in X.
@@ -551,9 +564,10 @@ class DartsAdapter(_SequenceAdapter):
         for s in sp_t:
             last_train_row = int(Xt.rows[Xt.series_start[Xt.rows] == s].max())
             first_val_row = int(Xv.rows[Xv.series_start[Xv.rows] == s].min())
-            if first_val_row > last_train_row and sp_t[s][1] > first_val_row:
-                raise ValueError(f"darts: the training targets (to row {sp_t[s][1]}) reach into the validation block "
-                                 f"(from row {first_val_row}); leave a purge of {n_out} bars")
+            if sp_t[s][1] >= first_val_row:               # any ordering: validation before / inside the training block
+                raise ValueError(f"darts: the training targets (last training row {last_train_row} + {n_out} bars = "
+                                 f"row {sp_t[s][1]}) reach the validation block (first row {first_val_row}); the "
+                                 f"last training row must be at least {n_out + 1} bars before it")
         net, device, info, sd = self._train(Xt, Xv, sp_t, sp_v, n_out, int(seed))
         # reached only when the training succeeded
         self._net, self._device, self._lookback, self._n_out, self._sd = net, device, Xt.lookback, n_out, sd

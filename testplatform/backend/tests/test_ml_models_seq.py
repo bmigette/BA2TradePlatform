@@ -621,3 +621,51 @@ def test_darts_keeps_the_best_validation_epoch_and_reports_it():
     info = ad.fit_info
     assert info["epochs_run"] < 15 and 1 <= info["best_epoch"] < info["epochs_run"]      # stopped early, not on the best
     assert np.isfinite(info["val_loss"]) and ad.n_iter == info["best_epoch"] and info["device"] == "cuda"
+
+
+def test_darts_refuses_every_ordering_where_training_targets_reach_the_first_validation_row():
+    d = darts_data()
+    (Xt, yt), (Xv, yv) = d["train"], d["val"]
+
+    def fit(train_rows, val_rows):
+        tr, va = Xt.take(train_rows), Xv.take(val_rows)
+        MM.make_adapter("darts", params=DFAST).fit(tr, np.zeros(len(tr)), va, np.zeros(len(va)), task="quantile", seed=1)
+
+    # validation after training: the last target (row + 4) lands ON the first validation row -> refused; one row earlier is fine
+    with pytest.raises(ValueError, match="validation"):
+        fit(block_rows(2, DN, DL - 1, 280 - DH + 1), block_rows(2, DN, 280, 340 - DH))      # last row 276: 276 + 4 = 280
+    fit(block_rows(2, DN, DL - 1, 280 - DH), block_rows(2, DN, 280, 340 - DH))          # last row 275: targets end at 279
+    # validation starting before the training end (overlapping blocks) -> refused
+    with pytest.raises(ValueError, match="validation"):
+        fit(block_rows(2, DN, DL - 1, 280), block_rows(2, DN, 200, 260))
+    # validation starting exactly at the last training row
+    with pytest.raises(ValueError, match="validation"):
+        fit(block_rows(2, DN, DL - 1, 280), block_rows(2, DN, 279, 330))
+    # validation entirely BEFORE the training block
+    with pytest.raises(ValueError, match="validation"):
+        fit(block_rows(2, DN, 200, 340 - DH), block_rows(2, DN, DL - 1, 100))
+    # one series out of two is enough: series 2's validation starts early
+    val = np.concatenate([np.arange(280, 330), np.arange(DN + 100, DN + 150)])
+    with pytest.raises(ValueError, match="validation"):
+        fit(block_rows(2, DN, DL - 1, 280 - DH - 1), val)
+
+
+def test_batches_are_never_of_size_one():
+    for n in range(2, 60):
+        for bs in range(2, 12):
+            sizes = [len(c) for c in MS.batch_splits(np.arange(n), bs)]
+            assert sum(sizes) == n and min(sizes) >= 2, (n, bs, sizes)
+    assert [len(c) for c in MS.batch_splits(np.arange(1000), 512)] == [500, 500]     # unchanged where it was fine
+    assert [len(c) for c in MS.batch_splits(np.arange(3), 2)] == [3]
+    assert [len(c) for c in MS.batch_splits(np.arange(5), 2)] == [3, 2]
+
+
+@pytest.mark.parametrize("n_train", [3, 5])
+def test_minirocket_trains_on_three_or_five_samples_at_batch_size_two(n_train):
+    d = tiny("binary")
+    (Xt, yt), (Xv, yv) = d["train"], d["val"]
+    rows = Xt.rows[:n_train]
+    y = np.array([0, 1, 0, 1, 1])[:n_train]
+    ad = MM.make_adapter("tsai", params={**FAST, "arch": "minirocket", "batch_size": 2, "epochs": 2})
+    ad.fit(Xt.take(rows), y, Xv, yv, task="binary", seed=1)
+    assert ad.fit_info["epochs_run"] >= 1 and np.isfinite(ad.predict(Xv)).all()
