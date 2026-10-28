@@ -90,10 +90,14 @@ import hashlib
 import json
 import logging
 import math
+import multiprocessing
 import os
+import socket
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import OrderedDict, deque
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from datetime import date
 from functools import lru_cache
@@ -559,15 +563,23 @@ def load_panel(store: Union[str, Path], symbols: Tuple[str, ...], track: str, ca
                  daily_fingerprint(cache_root, symbols))
 
 
-_PANELS: Dict[Tuple, Panel] = {}
+#: panels (stores + bars + targets, ~100-200 MB each) a worker process keeps; the least recently used is evicted
+PANEL_CACHE_SIZE = 2
+_PANELS: "OrderedDict[Tuple, Panel]" = OrderedDict()
 
 
 def get_panel(store: str, symbols: Tuple[str, ...], track: str, cache_root: str) -> Panel:
-    """Per-process cache of ``load_panel`` keyed by store (path + file fingerprints), symbol set, track, cache root."""
+    """Per-process LRU cache (``PANEL_CACHE_SIZE``) of ``load_panel`` keyed by store (path + file fingerprints), symbol
+    set, track, cache root. Evicting a panel frees its cached targets and excursions with it."""
     key = (str(Path(store).resolve()), _store_fingerprint(store), tuple(symbols), track, str(cache_root))
-    if key not in _PANELS:
-        _PANELS[key] = load_panel(store, tuple(symbols), track, cache_root)
-    return _PANELS[key]
+    if key in _PANELS:
+        _PANELS.move_to_end(key)
+        return _PANELS[key]
+    panel = load_panel(store, tuple(symbols), track, cache_root)
+    _PANELS[key] = panel
+    while len(_PANELS) > PANEL_CACHE_SIZE:
+        _PANELS.popitem(last=False)
+    return panel
 
 
 # ================================================================== one block
@@ -892,6 +904,8 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
     iters = [b["n_iter"] for b in info if b["n_iter"] is not None]
     row: Dict[str, Any] = {"cell_key": cell.key, "seed": int(seed), "track": cell.track, "label": cell.label,
                            "config": cell.config(), "identity": identity_of(cell, st, panel.daily_fingerprint),
+                           "deterministic": cell.family in DETERMINISTIC_FAMILIES,
+                           "seeds_run": len(effective_seeds(cell)),
                            "low_iter_share": float(np.mean([i <= LOW_ITER for i in iters])) if iters else None,
                            "n_blocks": len(blocks), "n_blocks_fitted": len(info),
                            "skipped_blocks": skipped, "clipped_blocks": clipped, "blocks": info,
@@ -918,34 +932,240 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
 
 # ================================================================== the runner
 _WORKER: Dict[str, Any] = {}
+#: warnings known to be noise in a grid worker, as (message regex, category): nothing else is silenced
+NOISY_WARNINGS: Tuple[Tuple[str, type], ...] = ()
+#: seconds the master waits on the pool before it looks at cancellation again
+POLL_SECONDS = 1.0
+#: a task whose worker dies is retried this many times, then it becomes an error record
+MAX_RETRIES = 3
+#: relative cost of a family's fit (slowest first); quantile (nine boosters) counts as one step slower
+FAMILY_COST: Dict[str, int] = {"catboost": 4, "xgb": 3, "lgbm": 2, "linear": 1, "naive": 0}
 
 
 def _panel_for(cell: Cell, cache_root: str) -> Panel:
     return get_panel(cell.store, resolve_symbols(cell.symbols), cell.track, cache_root)
 
 
-def _init_worker(settings: Dict[str, Any], cache_root: str, out_dir: str, n_jobs: int,
-                 warm: Sequence[Dict[str, Any]]) -> None:
-    """Pool initializer: remember the run constants and load each panel the pending tasks need, ONCE."""
+def _init_worker(settings: Dict[str, Any], cache_root: str, out_dir: str, n_jobs: int) -> None:
+    """Pool initializer: remember the run constants, cap the BLAS / OpenMP threads at ``n_jobs`` (so slots x n_jobs
+    never exceeds the cores) and silence only ``NOISY_WARNINGS``. Panels are NOT loaded here: the task that needs one
+    loads it (``get_panel``, an LRU of ``PANEL_CACHE_SIZE``)."""
     import warnings
-    warnings.filterwarnings("ignore")
-    _WORKER.update(settings=GridSettings.from_dict(settings), cache_root=cache_root, out_dir=out_dir, n_jobs=n_jobs)
-    for cfg in warm:
-        t0 = time.perf_counter()
-        _panel_for(validate_cell({**cfg, "seeds": [0]}), cache_root)
-        logger.info(f"worker {os.getpid()}: panel loaded in {time.perf_counter() - t0:.1f}s")
-
-
-def _run_task(cfg: Dict[str, Any], seed: int) -> Dict[str, Any]:
-    """Pool task: one (cell, seed). A raised exception becomes an ``error`` record (the grid goes on)."""
-    cell = validate_cell({**cfg, "seeds": [seed]})
+    for message, category in NOISY_WARNINGS:
+        warnings.filterwarnings("ignore", message=message, category=category)
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[var] = str(n_jobs)
     try:
+        from threadpoolctl import threadpool_limits
+        _WORKER["limits"] = threadpool_limits(limits=n_jobs)
+    except ImportError:
+        logger.warning("threadpoolctl is not installed: BLAS / OpenMP threads are limited by environment variables only")
+    _WORKER.update(settings=GridSettings.from_dict(settings), cache_root=cache_root, out_dir=out_dir, n_jobs=n_jobs)
+
+
+def _error_record(cell_key: str, seed: int, message: str, label: str = "", tb: str = "") -> Dict[str, Any]:
+    return {"cell_key": cell_key, "seed": int(seed), "error": message, "traceback": tb, "label": label}
+
+
+def _label_of(cfg: Dict[str, Any]) -> str:
+    try:
+        return (f"{cfg['track']} {cfg['target']['kind']} h{cfg['target']['horizon']} {cfg['family']} "
+                f"{cfg['train_months']} {'+'.join(cfg['groups'])} {cfg['blocks']}")
+    except (KeyError, TypeError):
+        return ""
+
+
+def _run_task(cfg: Dict[str, Any], seed: int, expected_key: str) -> Dict[str, Any]:
+    """Pool task: one (cell, seed). EVERYTHING, validation included, is inside the try: whatever raises becomes an
+    ``error`` record and the grid goes on. The worker rebuilds the cell from its config and refuses it when the key it
+    gets differs from the planned ``expected_key`` (the store changed between planning and running)."""
+    try:
+        cell = validate_cell(cfg)
+        if seed not in cell.seeds:
+            raise RuntimeError(f"seed {seed} is not one of the cell's seeds {list(cell.seeds)}")
+        if cell.key != expected_key:
+            raise RuntimeError(f"cell key mismatch in the worker: planned {expected_key}, validated {cell.key} "
+                               f"(did the store change after the plan was made?)")
         panel = _panel_for(cell, _WORKER["cache_root"])
         return run_cell_seed(cell, seed, panel, _WORKER["settings"], _WORKER["n_jobs"],
                              Path(_WORKER["out_dir"]) / "predictions")
     except Exception as e:                                       # noqa: BLE001  (one bad cell must not stop the grid)
-        return {"cell_key": cell.key, "seed": int(seed), "error": f"{type(e).__name__}: {e}",
-                "traceback": traceback.format_exc(), "label": cell.label}
+        return _error_record(expected_key, seed, f"{type(e).__name__}: {e}", _label_of(cfg), traceback.format_exc())
+
+
+def effective_seeds(cell: Cell) -> Tuple[int, ...]:
+    """The seeds actually run: all of them, except for a deterministic family (naive / linear), which runs once with
+    the lowest seed (its other seeds would only repeat it)."""
+    return (min(cell.seeds),) if cell.family in DETERMINISTIC_FAMILIES else cell.seeds
+
+
+def plan_tasks(cells: Sequence[Cell]) -> List[Tuple[Cell, int]]:
+    """(cell, seed) tasks ordered for the workers: cells sharing a panel (store, symbols, track) are consecutive, so a
+    worker's panel cache is reused, panels in order of first appearance; inside a panel the slowest families first
+    (``FAMILY_COST``, quantile one step slower), so a long fit does not start last."""
+    groups: "OrderedDict[Tuple, List[Cell]]" = OrderedDict()
+    for c in cells:
+        groups.setdefault((c.store, c.symbols, c.track), []).append(c)
+    out: List[Tuple[Cell, int]] = []
+    for members in groups.values():
+        for c in sorted(members, key=lambda c: -(2 * FAMILY_COST[c.family] + (c.kind == "quantile"))):
+            out += [(c, sd) for sd in effective_seeds(c)]
+    return out
+
+
+# ------------------------------------------------------------------ lock file
+class GridLockedError(RuntimeError):
+    """Another live run holds the output directory."""
+
+
+def pid_alive(pid: int) -> bool:
+    """Is a process with this pid running? (``os.kill(pid, 0)`` would TERMINATE it on Windows, so it is not used.)"""
+    try:
+        import psutil
+        return bool(psutil.pid_exists(pid))
+    except ImportError:
+        pass
+    if os.name == "nt":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, int(pid))         # SYNCHRONIZE
+        if not handle:
+            return False
+        try:
+            return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == 0x102        # WAIT_TIMEOUT: still running
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+LOCK_NAME = ".ml_grid.lock"
+
+
+def acquire_lock(out: Path) -> Path:
+    """Create ``out/.ml_grid.lock`` (pid, host, start time) or raise ``GridLockedError`` when a live run holds it. A
+    lock whose pid is dead on this host is stale and taken over; one from another host cannot be judged and is
+    respected."""
+    path = out / LOCK_NAME
+    me = {"pid": os.getpid(), "host": socket.gethostname(), "started": time.strftime("%Y-%m-%d %H:%M:%S")}
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                held = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                held = {"pid": -1, "host": me["host"], "started": "unreadable lock"}
+            if held["host"] == me["host"] and not pid_alive(int(held["pid"])):
+                logger.warning(f"ml_grid: stale lock of dead pid {held['pid']} (started {held['started']}) removed")
+                path.unlink(missing_ok=True)
+                continue
+            raise GridLockedError(f"another ml_grid run is already running in {out} (pid {held['pid']} on "
+                                  f"{held['host']}, started {held['started']}); remove {path} only if it is not")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(me))
+        return path
+    raise GridLockedError(f"could not take the lock {path}")
+
+
+def release_lock(path: Path) -> None:
+    """Remove the lock if it is still ours."""
+    try:
+        if json.loads(path.read_text(encoding="utf-8"))["pid"] == os.getpid():
+            path.unlink()
+    except (OSError, json.JSONDecodeError, KeyError):
+        pass
+
+
+# ------------------------------------------------------------------ cancellation
+def make_cancel_check(task_id: str, interval: float = 5.0) -> Callable[[], bool]:
+    """A ``cancel_check`` for ``run_grid``: True once the queue task ``task_id`` has status ``cancelled`` (polled at
+    most every ``interval`` seconds). Outside the queue (the CLI) there is no row and it stays False."""
+    state = {"t": -float("inf"), "v": False}
+
+    def check() -> bool:
+        now = time.monotonic()
+        if now - state["t"] < interval:
+            return state["v"]
+        state["t"] = now
+        try:
+            from app.services.task_queue import get_task_queue
+            row = get_task_queue().get_task_status(task_id)
+            state["v"] = bool(row) and row["status"] == "cancelled"
+        except Exception as e:                                    # noqa: BLE001  (no queue / no row: not cancelled)
+            logger.debug(f"cancel check: no task status for {task_id}: {e}")
+        return state["v"]
+    return check
+
+
+# ------------------------------------------------------------------ the pool driver
+def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tuple, task_fn: Callable,
+                finish: Callable[[Dict[str, Any]], None], cancelled: Callable[[], bool],
+                summary: Dict[str, Any]) -> None:
+    """Run ``tasks`` on a spawn-context process pool with at most ``2 x cpu_slots`` futures in flight.
+
+    A worker that dies (``BrokenProcessPool``) takes the whole pool with it: every in-flight task is charged one
+    attempt, the pool is rebuilt and the tasks go back to the front of the queue. They then run ONE AT A TIME until all
+    have completed once, so the task that kills its worker is isolated and its neighbours are not charged again; after
+    ``MAX_RETRIES`` retries it becomes an error record. The pool is always shut down with ``wait=False,
+    cancel_futures=True``, so a master exception or Ctrl-C leaves nothing queued."""
+    window = 2 * cpu_slots
+    queue: deque = deque((c, s, 0) for c, s in tasks)                 # (cell, seed, times its pool broke)
+    retry: deque = deque()
+    inflight: Dict[Any, Tuple[Cell, int, int]] = {}
+
+    def new_pool() -> ProcessPoolExecutor:
+        return ProcessPoolExecutor(max_workers=min(cpu_slots, len(tasks)), mp_context=multiprocessing.get_context("spawn"),
+                                   initializer=_init_worker, initargs=init_args)
+    summary["pool_rebuilds"] = 0
+    pool = new_pool()
+    try:
+        while queue or retry or inflight:
+            if cancelled():
+                summary["cancelled"] = True
+                return
+            probation = bool(retry) or any(a > 0 for _, _, a in inflight.values())
+            while (retry or queue) and len(inflight) < (1 if probation else window):
+                c, sd, a = (retry or queue).popleft()
+                inflight[pool.submit(task_fn, c.config(with_seeds=True), sd, c.key)] = (c, sd, a)
+                probation = probation or a > 0
+            done, _ = wait(list(inflight), timeout=POLL_SECONDS, return_when=FIRST_COMPLETED)
+            broken: List[Tuple[Cell, int, int]] = []
+            for fu in done:
+                c, sd, a = inflight.pop(fu)
+                try:
+                    r = fu.result()
+                except BrokenProcessPool:
+                    broken.append((c, sd, a))
+                except Exception as e:                            # noqa: BLE001  (e.g. an unpicklable result)
+                    finish(_error_record(c.key, sd, f"{type(e).__name__}: {e}", c.label, traceback.format_exc()))
+                else:
+                    finish(r)
+            if not broken:
+                continue
+            for fu, (c, sd, a) in list(inflight.items()):         # the rest of the pool died with it: collect them
+                wait([fu], timeout=60)
+                try:
+                    finish(fu.result(timeout=0))
+                except Exception:                                 # noqa: BLE001  (broken, cancelled or not finished)
+                    broken.append((c, sd, a))
+                inflight.pop(fu)
+            pool.shutdown(wait=False, cancel_futures=True)
+            for c, sd, a in broken:
+                if a + 1 > MAX_RETRIES:
+                    finish(_error_record(c.key, sd, f"worker process died on {a + 1} attempts ({MAX_RETRIES} retries); "
+                                                     f"the task is given up", c.label))
+                else:
+                    retry.append((c, sd, a + 1))
+            logger.warning(f"ml_grid: the worker pool broke ({len(broken)} task(s) in flight); rebuilding")
+            summary["pool_rebuilds"] += 1
+            pool = new_pool()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def read_results(path: Union[str, Path]) -> List[Dict[str, Any]]:
@@ -1045,12 +1265,17 @@ def n_jobs_for(cpu_slots: int, cores: int) -> int:
 def run_grid(cells: Sequence[Cell], out_dir: Union[str, Path], cpu_slots: int, gpu_slots: int = 0,
              cache_root: Optional[Union[str, Path]] = None, settings: Optional[GridSettings] = None,
              progress: Optional[Callable[..., None]] = None, inline: bool = False,
-             rerun_mismatched: bool = False) -> Dict[str, Any]:
+             rerun_mismatched: bool = False, cancel_check: Optional[Callable[[], bool]] = None,
+             task_fn: Optional[Callable] = None) -> Dict[str, Any]:
     """Run every unfinished (cell, seed) of ``cells``; append a row to ``results.jsonl`` as each finishes.
 
     ``cpu_slots``: worker processes for the tabular families. ``gpu_slots``: workers for sequence families (none
     exist yet; a cell routed to the gpu pool with 0 slots is refused). ``inline=True`` runs in this process (tests,
-    debugging) through the same code. ``rerun_mismatched``: see ``ResumeMismatchError`` / the module docstring. Returns ``{tasks, done, skipped_existing, errors, out_dir}``."""
+    debugging) through the same code. ``rerun_mismatched``: see ``ResumeMismatchError`` / the module docstring.
+    ``cancel_check``: polled between submissions; when it returns True the run stops cooperatively (rows already
+    written stay; a restart resumes). ``task_fn``: the per-task function (default ``_run_task``; a module-level
+    callable so a spawned worker can import it; for tests). Only one run may use an ``out_dir`` at a time
+    (``GridLockedError``). Returns ``{tasks, done, skipped_existing, errors, cancelled, pool_rebuilds, out_dir}``."""
     if not _is_int(cpu_slots) or cpu_slots < 1 or not _is_int(gpu_slots) or gpu_slots < 0:
         raise ValueError("cpu_slots must be an integer >= 1 and gpu_slots an integer >= 0")
     st = settings or GridSettings()
@@ -1060,27 +1285,33 @@ def run_grid(cells: Sequence[Cell], out_dir: Union[str, Path], cpu_slots: int, g
     cache_root = str(cache_root)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    lock = acquire_lock(out)
+    try:
+        return _run_locked(cells, out, cpu_slots, gpu_slots, cache_root, st, progress, inline, rerun_mismatched,
+                           cancel_check or (lambda: False), task_fn or _run_task)
+    finally:
+        release_lock(lock)
+
+
+def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: str, st: GridSettings,
+                progress, inline: bool, rerun_mismatched: bool, cancelled, task_fn) -> Dict[str, Any]:
     res_path, err_path = out / "results.jsonl", out / "errors.jsonl"
     say = progress or (lambda m, pct=None: logger.warning(m))
     finished = _check_resume(read_results(res_path), cells, st, cache_root, rerun_mismatched, res_path)
-    tasks = [(c, s) for c in cells for s in c.seeds if (c.key, s) not in finished]
-    skipped_existing = sum(len(c.seeds) for c in cells) - len(tasks)
-    pools = {p: [t for t in tasks if t[0].pool == p] for p in ("cpu", "gpu")}
-    if pools["gpu"] and gpu_slots < 1:
-        raise ValueError(f"{len(pools['gpu'])} tasks need the gpu pool but gpu_slots is 0")
-    if pools["gpu"]:
+    plan = plan_tasks(cells)
+    tasks = [(c, sd) for c, sd in plan if (c.key, sd) not in finished]
+    skipped_existing = len(plan) - len(tasks)
+    gpu_tasks = [t for t in tasks if t[0].pool == "gpu"]
+    if gpu_tasks and gpu_slots < 1:
+        raise ValueError(f"{len(gpu_tasks)} tasks need the gpu pool but gpu_slots is 0")
+    if gpu_tasks:
         raise NotImplementedError("sequence families are not implemented yet (the gpu pool hook is a placeholder)")
-    summary = {"tasks": len(tasks), "done": 0, "skipped_existing": skipped_existing, "errors": 0, "out_dir": str(out)}
+    summary = {"tasks": len(tasks), "done": 0, "skipped_existing": skipped_existing, "errors": 0, "cancelled": False,
+               "pool_rebuilds": 0, "out_dir": str(out)}
     say(f"ml_grid: {len(cells)} cells, {len(tasks)} (cell, seed) tasks to run, {skipped_existing} already finished")
     if not tasks:
         return summary
-    n_jobs = n_jobs_for(cpu_slots, st.cores)
-    warm, seen = [], set()
-    for c, _ in tasks:
-        if (c.store, c.symbols, c.track) not in seen:
-            seen.add((c.store, c.symbols, c.track))
-            warm.append(c.config())
-    init_args = (st.to_dict(), cache_root, str(out), n_jobs, warm)
+    init_args = (st.to_dict(), cache_root, str(out), n_jobs_for(cpu_slots, st.cores))
 
     def finish(r: Dict[str, Any]) -> None:
         if "error" in r:
@@ -1092,7 +1323,7 @@ def run_grid(cells: Sequence[Cell], out_dir: Union[str, Path], cpu_slots: int, g
         summary["done"] += 1
         p = r["primary"]
         c = r["controls"] if isinstance(r["controls"], dict) else {}
-        pv = c.get("p_value")
+        pv = c["p_value"] if "p_value" in c else None
         say(f"ml_grid [{summary['done'] + summary['errors']}/{len(tasks)}] cell {r['cell_key']} seed {r['seed']} "
             f"{r['label']}: {p['name']}={'n/a' if p['value'] is None else format(p['value'], '+.4f')}"
             f"{'' if pv is None else f' p={pv:.3f}'} rows={r['n_rows']} "
@@ -1101,14 +1332,13 @@ def run_grid(cells: Sequence[Cell], out_dir: Union[str, Path], cpu_slots: int, g
 
     if inline:
         _init_worker(*init_args)
-        for c, s in tasks:
-            finish(_run_task(c.config(), s))
+        for c, sd in tasks:
+            if cancelled():
+                summary["cancelled"] = True
+                break
+            finish(task_fn(c.config(with_seeds=True), sd, c.key))
         return summary
-    with ProcessPoolExecutor(max_workers=min(cpu_slots, len(pools["cpu"])), initializer=_init_worker,
-                             initargs=init_args) as pool:
-        futs = [pool.submit(_run_task, c.config(), s) for c, s in pools["cpu"]]
-        for fu in as_completed(futs):
-            finish(fu.result())
+    _drive_pool(tasks, cpu_slots, init_args, task_fn, finish, cancelled, summary)
     return summary
 
 
@@ -1209,7 +1439,8 @@ def handle_ml_grid(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     res = run_grid(cells, payload["out_dir"], int(payload["cpu_slots"]), int(payload["gpu_slots"]),
                    payload.get("cache_root"), st, progress,
-                   rerun_mismatched=bool(payload.get("rerun_mismatched", False)))
-    progress(f"ml_grid done: {res['done']} rows, {res['errors']} errors, {res['skipped_existing']} already finished",
-             100.0)
+                   rerun_mismatched=bool(payload.get("rerun_mismatched", False)),
+                   cancel_check=make_cancel_check(task_id))
+    progress(f"ml_grid {'CANCELLED' if res['cancelled'] else 'done'}: {res['done']} rows, {res['errors']} errors, "
+             f"{res['skipped_existing']} already finished", 100.0 if not res["cancelled"] else None)
     return res

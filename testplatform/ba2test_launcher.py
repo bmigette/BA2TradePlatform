@@ -8958,7 +8958,13 @@ def _cmd_ml_grid(args) -> int:
     payload = {"config_path": args.config, "out_dir": args.out, "cpu_slots": args.cpu_slots,
                "gpu_slots": args.gpu_slots, "limit_cells": args.limit_cells, "cache_root": args.cache_root,
                "cores": args.cores, "rerun_mismatched": args.rerun_mismatched}
-    res = handle_ml_grid("cli-ml-grid", payload)
+    try:
+        res = handle_ml_grid("cli-ml-grid", payload)
+    except KeyboardInterrupt:
+        print("ml-grid: interrupted (Ctrl-C). The rows already written are kept; run the same command to resume.")
+        return 130
+    if res["cancelled"]:
+        print("ml-grid: cancelled; run the same command to resume.")
     print(f"ml-grid: {res['done']} rows written, {res['errors']} errors, {res['skipped_existing']} already finished "
           f"-> {res['out_dir']}")
     rows = read_results(f"{args.out}/results.jsonl")

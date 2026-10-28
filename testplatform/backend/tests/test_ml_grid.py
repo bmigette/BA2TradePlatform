@@ -1,5 +1,6 @@
 """Stage-1 grid runner (app/services/ml_grid.py) on tiny synthetic stores with a planted (or no) signal."""
 import json
+import os
 from datetime import date
 
 import numpy as np
@@ -817,3 +818,260 @@ def test_the_rerun_flag_is_wired_through_the_payload_and_the_cli():
     root = Path(G.__file__).resolve().parents[2]
     assert "--rerun-mismatched" in (root.parent / "ba2test_launcher.py").read_text(encoding="utf-8")
     assert "rerun_mismatched" in (root / "app" / "api" / "ml_search.py").read_text(encoding="utf-8")
+
+
+# ================================================================== pool lifecycle and operations
+def die_once_task(cfg, seed, expected_key):
+    """A task function for a spawned worker: the FIRST call anywhere kills its process (os._exit), the rest run."""
+    import os
+    try:
+        fd = os.open(os.environ["GRID_TEST_DIE_MARKER"], os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return G._run_task(cfg, seed, expected_key)
+    os.close(fd)
+    os._exit(3)
+
+
+def die_on_seed2_task(cfg, seed, expected_key):
+    import os
+    if seed == 2:
+        os._exit(3)
+    return G._run_task(cfg, seed, expected_key)
+
+
+class RecordingPool(G.ProcessPoolExecutor):
+    """Records submissions, the peak number of open futures and every shutdown call."""
+    instances = []
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.futures, self.shutdowns, self.max_open = [], [], 0
+        RecordingPool.instances.append(self)
+
+    def submit(self, fn, *a, **k):
+        fu = super().submit(fn, *a, **k)
+        self.futures.append(fu)
+        self.max_open = max(self.max_open, sum(1 for f in self.futures if not f.done()))
+        return fu
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        self.shutdowns.append((wait, cancel_futures))
+        return super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
+@pytest.fixture
+def recording_pool(monkeypatch):
+    RecordingPool.instances = []
+    monkeypatch.setattr(G, "ProcessPoolExecutor", RecordingPool)
+    return RecordingPool
+
+
+def test_a_worker_that_dies_mid_task_is_replaced_and_the_run_completes(signal_world, tmp_path, monkeypatch,
+                                                                       recording_pool):
+    monkeypatch.setenv("GRID_TEST_DIE_MARKER", str(tmp_path / "died"))
+    out = tmp_path / "o"
+    res = run([cell(signal_world[0], seeds=[1, 2, 3])], out, signal_world, inline=False, cpu_slots=2,
+              task_fn=die_once_task, settings=_settings(control_seeds=(1,)))
+    assert res["done"] == 3 and res["errors"] == 0 and res["pool_rebuilds"] >= 1
+    assert sorted(r["seed"] for r in G.read_results(out / "results.jsonl")) == [1, 2, 3]
+    assert len(recording_pool.instances) == 1 + res["pool_rebuilds"]
+    assert all(p.shutdowns[-1] == (False, True) for p in recording_pool.instances)
+
+
+def test_a_task_that_always_kills_its_worker_ends_as_an_error_after_three_retries(signal_world, tmp_path,
+                                                                                   recording_pool):
+    out = tmp_path / "o"
+    res = run([cell(signal_world[0], seeds=[1, 2, 3])], out, signal_world, inline=False, cpu_slots=1,
+              task_fn=die_on_seed2_task, settings=_settings(control_seeds=(1,)))
+    assert res["done"] == 2 and res["errors"] == 1
+    assert sorted(r["seed"] for r in G.read_results(out / "results.jsonl")) == [1, 3]      # the neighbours survive
+    err = G.read_results(out / "errors.jsonl")
+    assert len(err) == 1 and err[0]["seed"] == 2 and "worker process died" in err[0]["error"]
+    assert "3 retries" in err[0]["error"] and res["pool_rebuilds"] >= 4
+
+
+def test_a_validate_cell_failure_mid_run_is_an_error_record_not_an_abort(signal_world, tmp_path, monkeypatch):
+    good = cell(signal_world[0])
+    bad = cell(signal_world[0], family="xgb", params={}, target={"kind": "regression", "horizon": 5})
+    cells = [G.validate_cell(good), G.validate_cell(bad)]
+    real = G.validate_cell
+
+    def flaky(raw):
+        if raw["family"] == "xgb":
+            raise RuntimeError("store vanished")
+        return real(raw)
+    monkeypatch.setattr(G, "validate_cell", flaky)
+    out = tmp_path / "o"
+    res = G.run_grid(cells, out, 1, cache_root=signal_world[2], settings=_settings(control_seeds=(1,)), inline=True)
+    assert res["done"] == 1 and res["errors"] == 1
+    assert "store vanished" in G.read_results(out / "errors.jsonl")[0]["error"]
+
+
+def test_the_worker_refuses_a_cell_whose_key_changed_since_planning(signal_world, tmp_path):
+    c = G.validate_cell(cell(signal_world[0]))
+    G._init_worker(_settings().to_dict(), str(signal_world[2]), str(tmp_path), 1)
+    r = G._run_task(c.config(with_seeds=True), 1, "0123456789ab")
+    assert "key" in r["error"] and r["cell_key"] == "0123456789ab"
+
+
+def test_a_master_exception_leaves_no_queued_futures_and_uses_spawn(signal_world, tmp_path, recording_pool):
+    def progress(msg, pct=None):
+        if msg.startswith("ml_grid [2/"):
+            raise RuntimeError("master boom")
+    with pytest.raises(RuntimeError, match="master boom"):
+        run([cell(signal_world[0], seeds=[1, 2, 3, 4, 5, 6])], tmp_path / "o", signal_world, inline=False,
+            cpu_slots=1, progress=progress, settings=_settings(control_seeds=(1,)))
+    pool = recording_pool.instances[-1]
+    assert pool.shutdowns[-1] == (False, True)
+    assert not [f for f in pool.futures if not (f.done() or f.running() or f.cancelled())]
+    assert pool._mp_context.get_start_method() == "spawn"
+    assert len(pool.futures) < 6                                    # the rest was never even submitted
+
+
+def test_submission_is_bounded_to_twice_the_cpu_slots(signal_world, tmp_path, recording_pool):
+    res = run([cell(signal_world[0], seeds=[1, 2, 3, 4, 5, 6])], tmp_path / "o", signal_world, inline=False,
+              cpu_slots=1, settings=_settings(control_seeds=(1,)))
+    assert res["done"] == 6 and recording_pool.instances[0].max_open <= 2
+
+
+def test_a_cancel_check_stops_the_run_cooperatively(signal_world, tmp_path):
+    out = tmp_path / "o"
+    stop = lambda: len(G.read_results(out / "results.jsonl")) >= 1                # noqa: E731
+    res = run([cell(signal_world[0], seeds=[1, 2, 3, 4])], out, signal_world, cancel_check=stop,
+              settings=_settings(control_seeds=(1,)))
+    assert res["cancelled"] is True and res["done"] == 1
+    again = run([cell(signal_world[0], seeds=[1, 2, 3, 4])], out, signal_world, settings=_settings(control_seeds=(1,)))
+    assert again["tasks"] == 3 and again["cancelled"] is False             # a cancelled run resumes where it stopped
+
+
+def test_a_cancel_check_stops_the_pool_run_too(signal_world, tmp_path, recording_pool):
+    out = tmp_path / "o"
+    stop = lambda: len(G.read_results(out / "results.jsonl")) >= 1                # noqa: E731
+    res = run([cell(signal_world[0], seeds=[1, 2, 3, 4, 5, 6])], out, signal_world, cancel_check=stop, inline=False,
+              cpu_slots=1, settings=_settings(control_seeds=(1,)))
+    assert res["cancelled"] is True and 1 <= res["done"] < 6
+    assert recording_pool.instances[-1].shutdowns[-1] == (False, True)
+
+
+def test_the_queue_cancel_check_reads_the_task_status(monkeypatch):
+    import app.services.task_queue as tq
+
+    class Q:
+        status = "running"
+
+        def get_task_status(self, task_id):
+            assert task_id == "t-1"
+            return {"status": self.status}
+    q = Q()
+    monkeypatch.setattr(tq, "get_task_queue", lambda: q)
+    check = G.make_cancel_check("t-1", interval=0.0)
+    assert check() is False
+    q.status = "cancelled"
+    assert check() is True
+    monkeypatch.setattr(tq, "get_task_queue", lambda: (_ for _ in ()).throw(RuntimeError("no queue")))
+    assert G.make_cancel_check("cli", interval=0.0)() is False              # the CLI has no queue row
+
+
+def test_the_cli_turns_ctrl_c_into_a_clean_exit(monkeypatch, capsys):
+    import ba2test_launcher as L
+    import types
+    import app.services.ml_grid as grid
+
+    def interrupted(task_id, payload):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(grid, "handle_ml_grid", interrupted)
+    args = types.SimpleNamespace(config="c.json", out="o", cpu_slots=1, gpu_slots=0, limit_cells=None,
+                                 cache_root=None, cores=2, rerun_mismatched=False)
+    assert L._cmd_ml_grid(args) == 130
+    assert "interrupted" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ lock file
+def test_a_second_run_in_the_same_out_dir_is_refused_and_a_stale_lock_is_taken_over(signal_world, tmp_path):
+    import socket
+    import subprocess
+    import sys
+    out = tmp_path / "o"
+    out.mkdir()
+    lock = out / ".ml_grid.lock"
+    lock.write_text(json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "started": "now"}), encoding="utf-8")
+    with pytest.raises(G.GridLockedError, match="already running"):
+        run([cell(signal_world[0])], out, signal_world, settings=_settings(control_seeds=(1,)))
+    assert lock.exists()                                             # the refused run did not touch the holder's lock
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    assert not G.pid_alive(dead.pid) and G.pid_alive(os.getpid())
+    lock.write_text(json.dumps({"pid": dead.pid, "host": socket.gethostname(), "started": "then"}), encoding="utf-8")
+    res = run([cell(signal_world[0])], out, signal_world, settings=_settings(control_seeds=(1,)))
+    assert res["done"] == 1 and not lock.exists()                    # taken over, then released
+
+
+def test_the_lock_is_released_after_an_exception(signal_world, tmp_path):
+    def progress(msg, pct=None):
+        if msg.startswith("ml_grid ["):
+            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError):
+        run([cell(signal_world[0])], tmp_path / "o", signal_world, progress=progress,
+            settings=_settings(control_seeds=(1,)))
+    assert not (tmp_path / "o" / ".ml_grid.lock").exists()
+
+
+# ------------------------------------------------------------------ worker memory, ordering, threads, warnings
+def test_the_initializer_loads_nothing_and_a_worker_keeps_at_most_two_panels(signal_world, tmp_path):
+    G._PANELS.clear()
+    G._init_worker(_settings().to_dict(), str(signal_world[2]), str(tmp_path), 1)
+    assert len(G._PANELS) == 0                                       # panels are loaded lazily, by the task that needs them
+    keys = []
+    for n in (6, 7, 8):
+        G.get_panel(str(signal_world[0]), tuple(sorted(SYMS[:n])), "selection", str(signal_world[2]))
+        keys.append(next(reversed(G._PANELS)))
+    assert G.PANEL_CACHE_SIZE == 2 and list(G._PANELS) == keys[1:]    # the oldest was evicted, with its cached targets
+    G.get_panel(str(signal_world[0]), tuple(sorted(SYMS[:7])), "selection", str(signal_world[2]))
+    assert list(G._PANELS) == [keys[2], keys[1]]                     # a hit becomes the most recent
+
+
+def test_tasks_are_grouped_by_panel_then_slowest_family_first(signal_world):
+    s = signal_world[0]
+    mk = lambda syms, **o: G.validate_cell(cell(s, symbols=syms, params={} if o.get("family") != "lgbm" else TINY,  # noqa: E731
+                                               **o))
+    a, b = SYMS[:6], SYMS[:7]
+    cells = [mk(a, family="linear", target={"kind": "up", "horizon": 5}), mk(b, family="lgbm"),
+             mk(a, family="xgb", target={"kind": "regression", "horizon": 5}), mk(a, family="lgbm"),
+             mk(b, family="xgb", target={"kind": "regression", "horizon": 5})]
+    plan = G.plan_tasks(cells)
+    assert [(tuple(sorted(c.symbols)) == tuple(sorted(a)), c.family) for c, _ in plan] == \
+        [(True, "xgb"), (True, "lgbm"), (True, "linear"), (False, "xgb"), (False, "lgbm")]
+
+
+def test_deterministic_families_run_once_and_say_so(signal_world, tmp_path):
+    out = tmp_path / "o"
+    c = cell(signal_world[0], family="linear", params={}, seeds=[3, 1, 2], target={"kind": "up", "horizon": 5})
+    res = run([c], out, signal_world, settings=_settings(control_seeds=(1,)))
+    assert res["tasks"] == 1 and res["done"] == 1
+    r = G.read_results(out / "results.jsonl")[0]
+    assert r["seed"] == 1 and r["deterministic"] is True and r["seeds_run"] == 1
+    assert run([c], out, signal_world, settings=_settings(control_seeds=(1,)))["tasks"] == 0
+    stoch = cell(signal_world[0], seeds=[1, 2])
+    run([stoch], out, signal_world, settings=_settings(control_seeds=(1,)))
+    assert all(r["deterministic"] is False and r["seeds_run"] == 2
+               for r in G.read_results(out / "results.jsonl") if r["config"]["family"] == "lgbm")
+
+
+def test_a_worker_limits_its_blas_and_openmp_threads(tmp_path):
+    from threadpoolctl import threadpool_info
+    G._init_worker(_settings().to_dict(), str(tmp_path), str(tmp_path), 2)
+    try:
+        assert os.environ["OMP_NUM_THREADS"] == "2" and os.environ["OPENBLAS_NUM_THREADS"] == "2"
+        assert all(p["num_threads"] <= 2 for p in threadpool_info())
+    finally:
+        G._WORKER["limits"].restore_original_limits()
+
+
+def test_the_worker_does_not_silence_all_warnings(tmp_path):
+    import warnings
+    before = list(warnings.filters)
+    G._init_worker(_settings().to_dict(), str(tmp_path), str(tmp_path), 1)
+    added = [f for f in warnings.filters if f not in before]
+    G._WORKER["limits"].restore_original_limits()
+    assert not [f for f in added if f[0] == "ignore" and f[1] is None]             # no blanket ignore
+    assert all(f[1] is not None for f in added)                                      # each filter names a message
