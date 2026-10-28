@@ -15,12 +15,24 @@ selection: they are the final holdout.  Two universes:
 
 Callers (grid runner, feature builders) pass every symbol they are about to train or search on
 through :func:`assert_unlocked`.
+
+Symbols must be passed in canonical spelling: non-empty, stripped, upper-case, and spelled as the
+OHLCV cache spells them.  The cache writes dotted tickers with a hyphen (``BRK-B_1d.parquet``), so
+the canonical form is ``BRK-B``, not ``BRK.B``.  Anything else raises (fail closed): a lower-case or
+padded spelling would otherwise hash differently and slip past the lock.
+
+Generating the file (one time; run from testplatform/backend)::
+
+    python -m app.services.ml_holdout [--overwrite]
+
+Without ``--overwrite`` it refuses to touch an existing file.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import random
+from functools import lru_cache
 from datetime import date
 from pathlib import Path
 from typing import Iterable
@@ -60,13 +72,30 @@ def load() -> dict:
         return json.load(fh)
 
 
-def is_locked_largecap(symbol: str) -> bool:
+@lru_cache(maxsize=None)
+def _state() -> tuple:
+    """``(frozenset locked, frozenset dev, seed)``, read once.  Tests that swap HOLDOUT_FILE must
+    call ``_state.cache_clear()``."""
     lists = load()
-    if symbol in lists["ndq30"]["locked"]:
+    return (frozenset(lists["ndq30"]["locked"]), frozenset(lists["ndq30"]["dev"]),
+            lists["largecap"]["seed"])
+
+
+def is_locked_largecap(symbol: str) -> bool:
+    """True if ``symbol`` (canonical spelling, see module docstring) is in the holdout.
+
+    Raises ValueError for a non-str, empty, padded or lower-case symbol.
+    """
+    if not isinstance(symbol, str) or not symbol or symbol != symbol.strip().upper():
+        raise ValueError(
+            f"symbol must be a non-empty stripped upper-case str in the cache spelling "
+            f"(e.g. 'BRK-B'), got {symbol!r}")
+    locked, dev, seed = _state()
+    if symbol in locked:
         return True
-    if symbol in lists["ndq30"]["dev"]:
+    if symbol in dev:
         return False
-    digest = hashlib.sha256(f"{lists['largecap']['seed']}:{symbol}".encode("utf-8")).digest()
+    digest = hashlib.sha256(f"{seed}:{symbol}".encode("utf-8")).digest()
     return digest[0] % 3 == 0
 
 
@@ -74,8 +103,12 @@ def assert_unlocked(symbols: Iterable[str], purpose: str) -> None:
     """Raise :class:`LockedSymbolError` if any symbol is in the holdout.
 
     :func:`is_locked_largecap` already includes the NDQ30 locked list and exempts NDQ30 dev, so
-    this works unchanged for the NDQ30 dev runs and for the large-cap scale-up.
+    this works unchanged for the NDQ30 dev runs and for the large-cap scale-up.  ``symbols`` must
+    be an iterable of symbols, not a bare string (TypeError); non-canonical symbols raise
+    ValueError.
     """
+    if isinstance(symbols, str):
+        raise TypeError(f"symbols must be an iterable of symbols, not a str: {symbols!r}")
     bad = sorted({s for s in symbols if is_locked_largecap(s)})
     if bad:
         raise LockedSymbolError(

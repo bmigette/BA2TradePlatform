@@ -50,14 +50,60 @@ def test_is_locked_largecap_is_deterministic_and_about_a_third():
     assert first == [H.is_locked_largecap(s) for s in syms]
     frac = sum(first) / len(first)
     assert 0.30 < frac < 0.37, frac
-    # known anchors so a rule change (hash, seed, modulus) is caught
-    assert H.is_locked_largecap("AAPL") is H.is_locked_largecap("AAPL")
+
+
+def test_hard_coded_anchors_catch_a_change_of_seed_modulus_or_hash():
+    import hashlib
+    # first sha256 byte of f"20261028:{symbol}" (computed once, hard-coded)
+    first_byte = {"XOM": 37, "BRK-B": 224, "JPM": 240, "KO": 156}
+    for sym, byte in first_byte.items():
+        assert hashlib.sha256(f"20261028:{sym}".encode()).digest()[0] == byte
+    assert H.load()["largecap"]["seed"] == 20261028
+    assert H.is_locked_largecap("AAPL") is False   # NDQ30 dev
+    assert H.is_locked_largecap("MSFT") is True    # NDQ30 locked (the hash alone says False)
+    assert H.is_locked_largecap("XOM") is False    # 37 % 3 == 1
+    assert H.is_locked_largecap("BRK-B") is False  # 224 % 3 == 2
+    assert H.is_locked_largecap("JPM") is True     # 240 % 3 == 0
+    assert H.is_locked_largecap("KO") is True      # 156 % 3 == 0
+
+
+@pytest.mark.parametrize("bad", ["aapl", "msft", " MSFT", "MSFT ", "", " ", "MSFT" + chr(10), None, 7, b"MSFT"])
+def test_non_canonical_symbol_is_refused(bad):
+    with pytest.raises(ValueError):
+        H.is_locked_largecap(bad)
+    with pytest.raises(ValueError):
+        H.assert_unlocked([bad], purpose="training")
+
+
+def test_a_bare_string_is_refused_not_iterated_by_character():
+    with pytest.raises(TypeError):
+        H.assert_unlocked("MSFT", purpose="training")
+    with pytest.raises(TypeError):
+        H.assert_unlocked("AAPL", purpose="training")
+
+
+def test_write_once_refuses_to_overwrite_unless_told_to(tmp_path, monkeypatch):
+    target = tmp_path / "ml_holdout_symbols.json"
+    monkeypatch.setattr(H, "HOLDOUT_FILE", target)
+    H._state.cache_clear()
+    try:
+        H._write_once()                       # no file yet: writes
+        written = target.read_text(encoding="utf-8")
+        assert H.load()["ndq30"]["locked"] == H.make_lists()["ndq30"]["locked"]
+        target.write_text("sentinel", encoding="utf-8")
+        with pytest.raises(SystemExit):
+            H._write_once()
+        assert target.read_text(encoding="utf-8") == "sentinel"
+        H._write_once(overwrite=True)
+        assert target.read_text(encoding="utf-8") == written
+    finally:
+        H._state.cache_clear()
 
 
 def test_largecap_rule_matches_documented_formula():
     import hashlib
     spec = H.load()["largecap"]
-    for s in ("XOM", "BRK.B", "ZZZ", "JPM", "KO"):
+    for s in ("XOM", "BRK-B", "ZZZ", "JPM", "KO"):
         expect = hashlib.sha256(f"{spec['seed']}:{s}".encode()).digest()[0] % 3 == 0
         assert H.is_locked_largecap(s) is expect
 
