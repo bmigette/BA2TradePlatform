@@ -32,17 +32,21 @@ import json
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
+from app.services import ml_universe
 from app.services.ml_panel import PanelDataError, ema, regular_sessions, true_range, wilder
 
 #: The longest run of consecutive sessions missing BETWEEN two cached bars that is filled flat (previous close, volume
 #: 0, ``filled`` True, listed in the load meta). A longer run is refused. The rule is local, so the result never
 #: depends on the length of the window loaded.
 MAX_FILLED_RUN = 2
+#: A series whose last cached bar is more than this many sessions before the cache's newest bar has ENDED (delisted);
+#: 1..this many sessions short is a stale download and refuses.
+ENDED_AFTER_SESSIONS = 10
 BAR_COLUMNS: Tuple[str, ...] = ("open", "high", "low", "close", "volume")
 _RAW = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
 _INDEX_NAMES = ["symbol", "session"]
@@ -81,12 +85,21 @@ def _read_daily(symbol: str, cache_root: Path) -> pd.DataFrame:
     return df
 
 
-def first_cached_bar(symbol: str, cache_root: Path) -> pd.Timestamp:
-    """Date of the symbol's first cached daily bar (reads the Date column only)."""
+def _date_column(symbol: str, cache_root: Path) -> pd.Series:
     dates = pd.read_parquet(_cache_file(cache_root, symbol), columns=["Date"])["Date"]
     if dates.empty:
         raise PanelDataError(f"{symbol}: the cached daily file is empty")
-    return pd.Timestamp(dates.min()).normalize()
+    return dates
+
+
+def first_cached_bar(symbol: str, cache_root: Path) -> pd.Timestamp:
+    """Date of the symbol's first cached daily bar (reads the Date column only)."""
+    return pd.Timestamp(_date_column(symbol, cache_root).min()).normalize()
+
+
+def last_cached_bar(symbol: str, cache_root: Path) -> date:
+    """Date of the symbol's LAST cached daily bar; SPY's is the cache end that ``ended`` is measured against."""
+    return pd.Timestamp(_date_column(symbol, cache_root).max()).normalize().date()
 
 
 def _sessions_index(first: date, last: date) -> pd.DatetimeIndex:
@@ -108,31 +121,36 @@ def _longest_run(missing: np.ndarray) -> Tuple[int, int]:
     return best_start, best
 
 
-def load_daily(symbols: Iterable[str], first: date, last: date,
-               cache_root: Path) -> Tuple[Dict[str, pd.DataFrame], Dict[str, object]]:
+def load_daily(symbols: Iterable[str], first: date, last: date, cache_root: Path,
+               cache_end: Optional[date] = None) -> Tuple[Dict[str, pd.DataFrame], Dict[str, object]]:
     """Daily OHLCV per symbol on the NYSE sessions of ``[first, last]`` (``ml_panel.regular_sessions``).
 
     Each frame is indexed by ``session`` (naive midnight timestamps) with columns open, high, low, close, volume,
-    ``listed`` and ``filled``:
+    ``listed``, ``filled`` and ``ended``:
 
     * before the symbol's first cached bar: OHLCV are NaN and ``listed`` is False (it did not exist yet, so no
       feature may be built there). A cache that starts before ``first`` is listed from the first session;
     * a session missing BETWEEN two cached bars is filled flat (OHLC = previous close, volume 0, ``filled`` True) and
       listed in ``meta["filled"]``, but a run of more than ``MAX_FILLED_RUN`` consecutive missing sessions refuses.
       A run that straddles ``first`` is measured whole (from the last bar before the range);
-    * a session AFTER the symbol's last cached bar (a stale or delisted series) refuses, never filled;
+    * a session AFTER the symbol's last cached bar is never filled. With ``cache_end`` (the newest bar date of the
+      whole cache, SPY's) a series whose last bar is MORE than ``ENDED_AFTER_SESSIONS`` sessions before it has ENDED
+      (delisted, acquired): its rows after the last bar are NaN with ``listed`` False and ``ended`` True. A series
+      that is 1..``ENDED_AFTER_SESSIONS`` sessions short is STALE and refuses; so does any tail when ``cache_end``
+      is None;
     * a bar on a date that is not an NYSE session, a duplicate, a NaN, ``close <= 0``, ``high < low`` or a
       timezone-aware Date refuses.
 
-    Returns ``(daily, meta)`` with ``meta = {"filled": {sym: [iso date, ...]}, "first_bar": {sym: iso date}}``
-    (``first_bar`` is the symbol's first bar in the cache file, whatever the range)."""
+    Returns ``(daily, meta)`` with ``meta = {"filled": {sym: [iso date, ...]}, "first_bar": {sym: iso date},
+    "ended": {sym: iso date of the last bar}}`` (``first_bar`` is the symbol's first bar in the cache file, whatever
+    the range; ``ended`` lists the series that ended before the range's ``last``)."""
     symbols = list(symbols)
     if len(set(symbols)) != len(symbols):
         raise ValueError(f"duplicate symbols: {sorted({s for s in symbols if symbols.count(s) > 1})}")
     sessions = _sessions_index(first, last)
     calendars: Dict[date, pd.DatetimeIndex] = {}
     daily: Dict[str, pd.DataFrame] = {}
-    meta: Dict[str, object] = {"filled": {}, "first_bar": {}}
+    meta: Dict[str, object] = {"filled": {}, "first_bar": {}, "ended": {}}
     for sym in symbols:
         raw = _read_daily(sym, cache_root)
         meta["first_bar"][sym] = str(raw.index[0].date())
@@ -144,20 +162,29 @@ def load_daily(symbols: Iterable[str], first: date, last: date,
         if not listed.any():                                         # first bar after the range: not listed yet
             d = inside.reindex(sessions)
             d["listed"], d["filled"] = listed, np.zeros(len(sessions), dtype=bool)
+            d["ended"] = np.zeros(len(sessions), dtype=bool)
             daily[sym] = d
             continue
+        have_ts = raw[raw.index <= sessions[-1]].index[-1]                     # the last bar the range can see
+        ended = False
         if inside.empty or inside.index[-1] < sessions[-1]:
-            have = raw[raw.index <= sessions[-1]].index[-1].date()
-            gap = sessions[sessions > pd.Timestamp(have)]
-            raise PanelDataError(f"{sym}: stale series, last cached bar {have} but {len(gap)} sessions up to "
-                                 f"{sessions[-1].date()} have none")
+            short = 0
+            if cache_end is not None and cache_end > have_ts.date():
+                short = len(_sessions_index(have_ts.date(), cache_end)) - 1       # sessions between the last bar and the end
+            ended = short > ENDED_AFTER_SESSIONS
+            if not ended:
+                gap = sessions[sessions > have_ts]
+                raise PanelDataError(f"{sym}: stale series, last cached bar {have_ts.date()} but {len(gap)} sessions "
+                                     f"up to {sessions[-1].date()} have none")
+            meta["ended"][sym] = str(have_ts.date())
         before = raw[raw.index < sessions[0]]
         start = before.index[-1] if len(before) else sessions[0]
         if start not in calendars:
             calendars[start] = _sessions_index(start.date(), last)
         cal = calendars[start]
         d = raw.reindex(cal)
-        missing = d["close"].isna().to_numpy() & np.asarray(cal >= raw.index[0])
+        live = np.asarray((cal >= raw.index[0]) & (cal <= have_ts))
+        missing = d["close"].isna().to_numpy() & live
         if missing.any():
             at, n = _longest_run(missing)
             if n > MAX_FILLED_RUN:
@@ -167,8 +194,9 @@ def load_daily(symbols: Iterable[str], first: date, last: date,
             for c in ("open", "high", "low", "close"):
                 d.loc[missing, c] = prev[missing]
             d.loc[missing, "volume"] = 0.0
-        d["listed"] = np.asarray(cal >= raw.index[0])
+        d["listed"] = live
         d["filled"] = missing
+        d["ended"] = np.asarray(cal > have_ts) if ended else np.zeros(len(cal), dtype=bool)
         d = d[d.index >= sessions[0]]
         if missing[np.asarray(cal >= sessions[0])].any():
             meta["filled"][sym] = [str(t.date()) for t in d.index[d["filled"].to_numpy()]]
@@ -185,7 +213,7 @@ class BuildContext:
     (breadth, later ranks) are taken over - a superset of ``symbols``, so a build in chunks gives the same values as
     one build; ``context_symbols`` is everything else loaded (indices, sector ETFs); ``sessions`` is the whole loaded
     window; ``sector_of`` maps a symbol to its sector (groups with ``needs_sector``); ``cache_root`` lets a later group
-    read its own stores."""
+    read its own stores; ``store_dir`` is the screener metric store (groups X and F)."""
     symbols: Tuple[str, ...]
     universe: Tuple[str, ...]
     context_symbols: Tuple[str, ...]
@@ -193,6 +221,7 @@ class BuildContext:
     first_day: date
     last_day: date
     cache_root: Path
+    store_dir: Path
     sector_of: Dict[str, str] = field(default_factory=dict)
 
 
@@ -480,11 +509,83 @@ def market(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
     return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
 
 
+# ------------------------------------------------------------------------------------------ group X (cross-sectional)
+#: sector -> integer code of group X (committed: the code of a sector never changes)
+SECTOR_CODE: Dict[str, int] = {
+    "Basic Materials": 1, "Communication Services": 2, "Consumer Cyclical": 3, "Consumer Defensive": 4, "Energy": 5,
+    "Financial Services": 6, "Healthcare": 7, "Industrials": 8, "Real Estate": 9, "Technology": 10, "Utilities": 11}
+#: T features ranked / z-scored across the universe on each session
+X_RANKED: Tuple[str, ...] = ("t_ret_5", "t_ret_20", "t_ret_60", "t_rvol_20", "t_dist_sma50", "t_rsi", "t_vol_z")
+X_STORE_COLUMNS: Tuple[str, ...] = ("x_mom_12_1", "x_mom_12_1_rk", "x_weinstein", "x_relvol", "x_sector")
+X_COLUMNS: Tuple[str, ...] = (tuple(f"x_rk_{c[2:]}" for c in X_RANKED) + tuple(f"x_z_{c[2:]}" for c in X_RANKED)
+                              + X_STORE_COLUMNS)
+#: a cross-section needs at least this many members with a value, else its ranks and z-scores are NaN
+MIN_CROSS_SECTION = 2
+
+
+def _cross_rank(wide: pd.DataFrame) -> pd.DataFrame:
+    """Per row (session) the midpoint rank (rank - 0.5) / n in (0, 1) among the members with a value (ties averaged)."""
+    n = wide.notna().sum(axis=1)
+    return (wide.rank(axis=1, method="average") - 0.5).div(n, axis=0).where(n >= MIN_CROSS_SECTION)
+
+
+def _cross_z(wide: pd.DataFrame) -> pd.DataFrame:
+    """Per row the z-score (sample std) among the members with a value."""
+    n = wide.notna().sum(axis=1)
+    return wide.sub(wide.mean(axis=1), axis=0).div(wide.std(axis=1, ddof=1), axis=0).where(n >= MIN_CROSS_SECTION)
+
+
+def cross_section(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
+    """Group ``x_``: where the symbol stands among ``ctx.universe`` on each session.
+
+    * ``x_rk_*`` / ``x_z_*``: rank in (0, 1) and z-score, across the universe's rows OF THAT SESSION (listed members
+      with a value; an unlisted or ended member is not in the cross-section), of ``X_RANKED`` (the T features, computed
+      here for every universe member from bars up to S);
+    * from the metric store, in the newest scan visible at S (``ml_universe.scan_values``; NaN before the first scan,
+      2020-01): ``x_mom_12_1`` and its universe rank ``x_mom_12_1_rk``, ``x_weinstein`` (stage 1-4), ``x_relvol``
+      (relative volume), ``x_sector`` (``SECTOR_CODE``; NaN when the store has no sector for the symbol).
+
+    The universe is explicit, so a build in chunks over the same universe gives the same values as one build. A
+    universe that changes over time (``ml_universe.universe_as_of``) is the caller's job: pass the union of names and
+    note that membership is then not a function of the session."""
+    members = list(ctx.universe)
+    wide = {c: {} for c in X_RANKED}
+    for sym in members:
+        d = daily[sym]
+        live = d[d["listed"]]
+        if live.empty:
+            t = pd.DataFrame(np.nan, index=ctx.sessions, columns=list(X_RANKED))
+        else:
+            t = _technical_one(live)[list(X_RANKED)].reindex(ctx.sessions)
+        for c in X_RANKED:
+            wide[c][sym] = t[c]
+    parts: Dict[str, pd.DataFrame] = {}
+    for c in X_RANKED:
+        w = pd.DataFrame(wide[c], columns=members).astype("float64")
+        parts[f"x_rk_{c[2:]}"] = _cross_rank(w)
+        parts[f"x_z_{c[2:]}"] = _cross_z(w)
+    store = ml_universe.scan_values(members, ctx.sessions, ["momentum_12_1", "weinstein_stage", "relative_volume",
+                                                            "sector"], ctx.store_dir)
+    parts["x_mom_12_1"] = store["momentum_12_1"].astype("float64")
+    parts["x_mom_12_1_rk"] = _cross_rank(parts["x_mom_12_1"])
+    parts["x_weinstein"] = store["weinstein_stage"].astype("float64")
+    parts["x_relvol"] = store["relative_volume"].astype("float64")
+    sector = store["sector"]
+    unknown = sorted({str(v) for v in sector.to_numpy().ravel() if isinstance(v, str)} - set(SECTOR_CODE))
+    if unknown:
+        raise PanelDataError(f"group x: sector(s) {unknown} are not in SECTOR_CODE")
+    parts["x_sector"] = sector.apply(lambda col: col.map(SECTOR_CODE)).astype("float64")
+    frames = {sym: pd.DataFrame({name: parts[name][sym] for name in X_COLUMNS}, index=ctx.sessions)[list(X_COLUMNS)]
+              for sym in ctx.symbols}
+    return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
+
+
 #: group name -> spec. The name is the grid factor; the spec's prefix names its columns. Later tasks register here.
 GROUPS: Dict[str, GroupSpec] = {
     "t": GroupSpec(technical, "t_"),
     "mtf": GroupSpec(multi_timeframe, "mtf_"),
     "m": GroupSpec(market, "m_", needs_sector=True, required_context=_market_context),
+    "x": GroupSpec(cross_section, "x_"),
 }
 
 
@@ -529,8 +630,9 @@ def _fingerprint(p: Path) -> Dict[str, object]:
 
 def build_features(symbols: Sequence[str], first_day: date, last_day: date, groups: Sequence[str],
                    cache_root: Path, context_symbols: Sequence[str] = (),
-                   sector_of: Optional[Dict[str, str]] = None,
-                   universe: Optional[Sequence[str]] = None) -> pd.DataFrame:
+                   sector_of: Union[None, str, Dict[str, str]] = None,
+                   universe: Optional[Sequence[str]] = None, store_dir: Optional[Path] = None,
+                   sector_overrides: Optional[Dict[str, str]] = None) -> pd.DataFrame:
     """Point-in-time daily features indexed ``[symbol, session]`` for ``symbols`` over ``[first_day, last_day]``.
 
     Every loaded symbol is read from its first cached bar (``first_day`` only trims the output), the requested
@@ -538,12 +640,18 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
     is. ``context_symbols`` are extra series to load; each group's own required context (market ETFs, the sector ETFs
     of ``symbols``) is added automatically. ``universe`` is the symbol set cross-sectional statistics are taken
     over: None means ``symbols``, otherwise a superset of ``symbols`` (build a large universe in chunks by passing
-    the whole set every time).
+    the whole set every time). ``sector_of`` is a symbol -> sector dict, or ``"store"`` to read the sectors from the
+    metric store at ``store_dir`` (default ``<cache_root>/screener/metric_store_alpaca_20261022``); a symbol the store
+    has no sector for is simply absent, so a group that needs it refuses unless ``sector_overrides`` supplies it (the
+    overrides win over both sources). The cache end (what ``ended`` is measured against) is SPY's last bar, so SPY
+    must be cached.
 
-    Columns: ``listed`` (False before a symbol's first bar), ``filled`` (the session's bar is a fabricated flat
-    fill), ``label_bar_filled`` (the NEXT session is filled, i.e. the fill bar of a decision at S is fabricated, so
-    the trainer can drop the row; <NA> on the last session, whose next session is unknown; the only column that
-    looks forward, and a label ingredient not a feature), then the feature columns of each group in the order given.
+    Columns: ``listed`` (a real bar exists: False before a symbol's first bar and after its last), ``ended`` (the
+    series ended before the cache's end: rows after its last bar), ``filled`` (the session's bar is a fabricated flat
+    fill), ``label_bar_filled`` (the fill bar of a decision at S is fabricated or does not exist: the NEXT session is
+    filled or ended, so the trainer can drop the row; <NA> on the last session, whose next session is unknown; the
+    only column that looks forward, and a label ingredient not a feature), then the feature columns of each group
+    in the order given.
     Features are NaN for unlisted rows and while a symbol's own windows fill up. A computed +-inf raises.
     ``df.attrs["meta"]`` carries the load meta, the groups' columns, the universe and the source fingerprints.
 
@@ -561,18 +669,32 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
     universe = list(symbols) if universe is None else list(dict.fromkeys(universe))
     if not set(symbols) <= set(universe):
         raise ValueError(f"universe must contain every built symbol; missing {sorted(set(symbols) - set(universe))}")
-    for g, spec in specs.items():
-        if spec.needs_sector and sector_of is None:
-            raise PanelDataError(f"group {g!r} needs sector_of (symbol -> sector); got none")
+    store_path = (Path(store_dir) if store_dir is not None
+                  else Path(cache_root) / "screener" / ml_universe.DEFAULT_STORE_NAME)
+    sector_source = None
+    sectors: Optional[Dict[str, str]] = None
+    if any(spec.needs_sector for spec in specs.values()):
+        if isinstance(sector_of, str):
+            if sector_of != "store":
+                raise ValueError(f"sector_of must be a dict or 'store', got {sector_of!r}")
+            sectors, sector_source = dict(ml_universe.sector_of_from_store(symbols, store_path)), "store"
+        elif sector_of is not None:
+            sectors, sector_source = dict(sector_of), "given"
+        if sector_overrides:
+            sectors = {**(sectors or {}), **sector_overrides}
+        for g, spec in specs.items():
+            if spec.needs_sector and sectors is None:
+                raise PanelDataError(f"group {g!r} needs sector_of (symbol -> sector, or 'store'); got none")
     required: Set[str] = set()
     for spec in specs.values():
-        required |= set(spec.required_context(symbols, sector_of))
+        required |= set(spec.required_context(symbols, sectors))
     load = list(dict.fromkeys(symbols + universe + context_symbols + sorted(required)))
     earliest = min(first_cached_bar(s, cache_root) for s in load)
-    daily, load_meta = load_daily(load, min(first_day, earliest.date()), last_day, cache_root)
+    cache_end = last_cached_bar("SPY", cache_root)
+    daily, load_meta = load_daily(load, min(first_day, earliest.date()), last_day, cache_root, cache_end=cache_end)
     sessions = next(iter(daily.values())).index
     ctx = BuildContext(tuple(symbols), tuple(universe), tuple(s for s in load if s not in symbols), sessions,
-                       first_day, last_day, Path(cache_root), dict(sector_of) if sector_of is not None else {})
+                       first_day, last_day, Path(cache_root), store_path, dict(sectors) if sectors is not None else {})
     parts: List[pd.DataFrame] = []
     per_group: Dict[str, List[str]] = {}
     for g, spec in specs.items():
@@ -582,8 +704,10 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
         per_group[g] = list(cols.columns)
     flags = pd.concat({s: pd.DataFrame({
         "listed": daily[s]["listed"].astype(bool),
+        "ended": daily[s]["ended"].astype(bool),
         "filled": daily[s]["filled"].astype(bool),
-        "label_bar_filled": daily[s]["filled"].astype("boolean").shift(-1)}) for s in symbols}, names=_INDEX_NAMES)
+        "label_bar_filled": (daily[s]["filled"] | daily[s]["ended"]).astype("boolean").shift(-1)}) for s in symbols},
+        names=_INDEX_NAMES)
     out = pd.concat([flags] + parts, axis=1)
     dup = out.columns[out.columns.duplicated()].tolist()
     if dup:
@@ -596,6 +720,10 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
         "first_day": str(first_day), "last_day": str(last_day), "groups": per_group, "symbols": symbols,
         "universe": universe, "context_symbols": [s for s in load if s not in symbols],
         "required_context": sorted(required), "load": load_meta, "rows": int(len(out)),
+        "cache_end": str(cache_end), "sector_source": sector_source,
+        "sector_overrides": dict(sector_overrides) if sector_overrides else {},
+        "store": ({"dir": str(store_path), "newest_scan": ml_universe.scan_store(store_path).dates[-1]}
+                  if any(g in groups for g in ("x", "f")) else None),
         "columns": list(out.columns),
         "source": {s: _fingerprint(_cache_file(cache_root, s)) for s in load}}
     return out

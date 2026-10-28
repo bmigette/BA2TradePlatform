@@ -42,12 +42,30 @@ def _write(root, sym, df):
     df.to_parquet(d / f"{sym}_1d.parquet", index=False)
 
 
+STORE_SECTORS = {"AAA": "Technology", "BBB": "Financial Services", "CCC": "Technology"}
+STORE_SCANS = [d.strftime("%Y-%m-%d") for d in pd.date_range("2021-06-02", "2024-03-27", freq="7D")]      # Wednesdays
+
+
+def _store_rows(seed=7):
+    rng = np.random.default_rng(seed)
+    rows = []
+    for scan in STORE_SCANS:
+        for i, (sym, sector) in enumerate(STORE_SECTORS.items()):
+            rows.append(dict(date=scan, symbol=sym, sector=sector, close=100.0, price=100.0,
+                             market_cap=1e11 * (1 + i) * float(rng.uniform(0.9, 1.1)), volume=2e6,
+                             relative_volume=float(rng.uniform(0.5, 2.0)), weinstein_stage=float(rng.integers(1, 5)),
+                             momentum_12_1=float(rng.normal(0.1, 0.3))))
+    return pd.DataFrame(rows)
+
+
 @pytest.fixture(scope="module")
 def cache(tmp_path_factory):
     root = tmp_path_factory.mktemp("cache1d")
     s = _sessions()
     for i, sym in enumerate(("AAA", "BBB", "CCC") + CTX):
         _write(root, sym, _bars(s, 100 + i))
+    from tests.test_ml_universe import write_metric_store
+    write_metric_store(root / "screener" / "metric_store_alpaca_20261022", _store_rows())
     return root
 
 
@@ -60,6 +78,12 @@ def _truncate(cache, tmp_path, day):
         kept = df[df["Date"] <= pd.Timestamp(day)]
         assert len(kept) < len(df)
         kept.to_parquet(p, index=False)
+    store = trunc / "screener" / "metric_store_alpaca_20261022"
+    if store.exists():                                   # the scans dated after ``day`` are gone too
+        for p in store.glob("ym=*/*.parquet"):
+            df = pd.read_parquet(p)
+            df[df["date"] <= pd.Timestamp(day).strftime("%Y-%m-%d")].to_parquet(p, index=False)
+        shutil.rmtree(trunc / "screener" / "_derived", ignore_errors=True)
     return trunc
 
 
@@ -70,7 +94,7 @@ def test_load_daily_aligns_to_nyse_sessions(cache):
     for sym in ("AAA", "SPY"):
         d = daily[sym]
         assert d.index.equals(exp) and d.index.name == "session"
-        assert list(d.columns) == ["open", "high", "low", "close", "volume", "listed", "filled"]
+        assert list(d.columns) == ["open", "high", "low", "close", "volume", "listed", "filled", "ended"]
         assert d["listed"].all() and not d["filled"].any() and not d[["open", "close"]].isna().any().any()
     assert meta["filled"] == {} and meta["first_bar"]["AAA"] == "2021-01-04"
     raw = pd.read_parquet(cache / "AlpacaHistoryOHLCVProvider" / "AAA_1d.parquet").set_index("Date")
@@ -250,7 +274,7 @@ def test_build_features_shape_and_no_nan(cache):
     sess = f.index.get_level_values("session")
     exp = _sessions(FIRST, LAST)
     assert sess.min() == exp[0] and sess.max() == exp[-1] and len(f) == len(SYMS) * len(exp)
-    assert list(f.columns[:3]) == ["listed", "filled", "label_bar_filled"] and f["listed"].all()
+    assert list(f.columns[:4]) == ["listed", "ended", "filled", "label_bar_filled"] and f["listed"].all()
     assert not f["filled"].any() and f["label_bar_filled"].dropna().eq(False).all()
     feats = F.feature_columns(f)
     assert feats == F.feature_columns(f, ["t", "mtf"])
@@ -718,3 +742,191 @@ def test_save_features_writes_parquet_and_a_meta_sidecar(cache, tmp_path):
 def test_ml_panel_helpers_are_public_and_aliased():
     assert P.ema is P._ema and P.wilder is P._wilder and P.true_range is P._true_range
     assert F.ema is P.ema and F.wilder is P.wilder and F.true_range is P.true_range
+
+
+# ---------------------------------------------------------------------------------------------- Task 1.4
+def _ended_root(tmp_path, last_bar_pos):
+    root = tmp_path / "c"
+    s = _sessions(date(2022, 6, 1), date(2023, 6, 30))
+    df = _bars(s, 3)
+    _write(root, "GONE", df.iloc[: last_bar_pos + 1])
+    return root, s
+
+
+def test_a_series_that_ended_long_before_the_cache_end_is_nan_and_ended(tmp_path):
+    root, s = _ended_root(tmp_path, 150)
+    last_bar, cache_end = s[150], s[170]                                   # 20 sessions short: ENDED
+    daily, meta = F.load_daily(["GONE"], s[100].date(), s[200].date(), root, cache_end=cache_end.date())
+    d = daily["GONE"]
+    assert list(d.columns) == ["open", "high", "low", "close", "volume", "listed", "filled", "ended"]
+    after = d.index > last_bar
+    assert after.sum() == 50 and d.loc[after, "ended"].all() and not d.loc[after, "listed"].any()
+    assert d.loc[after, ["open", "high", "low", "close", "volume"]].isna().all().all() and not d.loc[after, "filled"].any()
+    assert d.loc[~after, "listed"].all() and not d.loc[~after, "ended"].any()
+    assert meta["ended"] == {"GONE": str(last_bar.date())}
+
+
+def test_one_to_ten_sessions_short_is_stale_eleven_is_ended(tmp_path):
+    root, s = _ended_root(tmp_path, 150)
+    for short in (1, 5, 10):
+        with pytest.raises(P.PanelDataError, match="GONE.*stale"):
+            F.load_daily(["GONE"], s[100].date(), s[200].date(), root, cache_end=s[150 + short].date())
+    daily, meta = F.load_daily(["GONE"], s[100].date(), s[200].date(), root, cache_end=s[161].date())
+    assert meta["ended"] == {"GONE": str(s[150].date())} and daily["GONE"]["ended"].sum() == 50
+    # a series that reaches the cache end is neither stale nor ended; without a cache end every tail is stale
+    daily, meta = F.load_daily(["GONE"], s[100].date(), s[150].date(), root, cache_end=s[150].date())
+    assert not daily["GONE"]["ended"].any() and meta["ended"] == {}
+    with pytest.raises(P.PanelDataError, match="stale"):
+        F.load_daily(["GONE"], s[100].date(), s[200].date(), root)
+
+
+def test_a_range_that_stops_before_the_end_has_no_tail(tmp_path):
+    root, s = _ended_root(tmp_path, 150)
+    daily, meta = F.load_daily(["GONE"], s[100].date(), s[140].date(), root, cache_end=s[250].date())
+    assert not daily["GONE"]["ended"].any() and daily["GONE"]["listed"].all()
+
+
+def test_build_features_marks_an_ended_symbol(cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    s = _sessions()
+    gone = _bars(s[s <= pd.Timestamp("2023-06-30")], 55)
+    _write(root, "GONE", gone)
+    f = _build(root, ["t", "mtf"], symbols=("AAA", "GONE")).loc["GONE"]
+    after = f.index > pd.Timestamp("2023-06-30")
+    feats = F.feature_columns(f)
+    assert after.sum() > 100 and f.loc[after, "ended"].all() and not f.loc[after, "listed"].any()
+    assert f.loc[after, feats].isna().all().all() and not f.loc[~after, "ended"].any()
+    last_real = f.index[~after][-1]
+    assert f.loc[last_real, "label_bar_filled"]                         # there is no fill bar after the last one
+    assert f.loc[~after, feats].notna().all().all()
+    aaa = _build(root, ["t", "mtf"], symbols=("AAA", "GONE")).loc["AAA"]
+    assert not aaa["ended"].any()
+
+
+def test_build_features_cache_end_comes_from_spy(cache, tmp_path):
+    """A symbol that stops a few sessions before SPY's last bar is stale (refused), not ended."""
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    s = _sessions()
+    _write(root, "SHORT", _bars(s[:-4], 56))
+    with pytest.raises(P.PanelDataError, match="SHORT.*stale"):
+        _build(root, ["t"], symbols=("AAA", "SHORT"))
+
+
+# ---- group X
+X_BASE = ("ret_5", "ret_20", "ret_60", "rvol_20", "dist_sma50", "rsi", "vol_z")
+XU = ("AAA", "BBB", "CCC")
+
+
+def test_x_columns(cache):
+    f = _build(cache, ["x"], symbols=XU)
+    assert F.feature_columns(f) == list(F.X_COLUMNS)
+    assert len(F.X_COLUMNS) == 2 * len(X_BASE) + 5
+    assert F.GROUPS["x"].prefix == "x_" and not F.GROUPS["x"].needs_sector
+    assert f[list(F.X_COLUMNS)].notna().all().all()
+
+
+def _closes(cache, syms=XU):
+    return pd.DataFrame({s: _raw(cache, s)["Close"] for s in syms})
+
+
+def test_ranks_and_z_use_only_the_universe_rows_that_day(cache):
+    f = _build(cache, ["x"], symbols=("AAA",), universe=XU)
+    ret20 = np.log(_closes(cache)).diff(20)
+    n = ret20.notna().sum(axis=1)
+    exp_rk = ((ret20.rank(axis=1) - 0.5).div(n, axis=0))["AAA"].reindex(f.loc["AAA"].index)
+    exp_z = ret20.sub(ret20.mean(axis=1), axis=0).div(ret20.std(axis=1), axis=0)["AAA"].reindex(f.loc["AAA"].index)
+    np.testing.assert_allclose(f.loc["AAA", "x_rk_ret_20"], exp_rk, rtol=1e-12)
+    np.testing.assert_allclose(f.loc["AAA", "x_z_ret_20"], exp_z, rtol=1e-10)
+    assert f["x_rk_ret_20"].between(0, 1).all() and np.isin(np.round(f["x_rk_ret_20"].unique(), 6), [0.166667, 0.5, 0.833333]).all()
+    full = _build(cache, ["x"], symbols=XU)
+    for col in ("x_z_ret_20", "x_z_vol_z"):                              # a cross-section is centred
+        np.testing.assert_allclose(full[col].groupby(level="session").mean(), 0.0, atol=1e-12)
+
+
+def test_cross_section_ignores_unlisted_and_ended_universe_members(cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    s = _sessions()
+    _write(root, "LATE", _bars(s[s >= pd.Timestamp("2023-02-01")], 9))
+    f = _build(root, ["x"], symbols=("AAA",), universe=XU + ("LATE",))
+    base = _build(root, ["x"], symbols=("AAA",), universe=XU)
+    early = f.index.get_level_values("session") < pd.Timestamp("2023-02-07")
+    pd.testing.assert_frame_equal(f[early][list(F.X_COLUMNS)], base[early][list(F.X_COLUMNS)], check_exact=True)
+    assert not f[~early][list(F.X_COLUMNS)].equals(base[~early][list(F.X_COLUMNS)])    # LATE joins once it has history
+
+
+def test_chunked_builds_agree_for_x(cache):
+    one = _build(cache, ["t", "x"], symbols=XU)
+    parts = [_build(cache, ["t", "x"], symbols=c, universe=XU) for c in (("AAA",), ("BBB", "CCC"))]
+    joined = pd.concat(parts).loc[one.index]
+    pd.testing.assert_frame_equal(joined.drop(columns="label_bar_filled"), one.drop(columns="label_bar_filled"),
+                                  check_exact=True)
+
+
+def test_cut_test_x(cache, tmp_path):
+    """The store is truncated too (scans dated after D are gone): a build that peeked at the newest scan fails."""
+    _assert_cut_identical(cache, tmp_path, ["x"], symbols=XU)
+
+
+def test_cut_test_all_groups_with_x(cache, tmp_path):
+    _assert_cut_identical(cache, tmp_path, ["t", "mtf", "m", "x"], symbols=("AAA", "BBB"),
+                          sector_of=SECTOR_OF, universe=XU)
+
+
+def test_store_columns_come_from_the_scan_visible_that_session(cache):
+    f = _build(cache, ["x"], symbols=("AAA",), universe=XU, first=date(2021, 5, 3)).loc["AAA"]
+    store = _store_rows().set_index(["date", "symbol"])
+    first_scan = pd.Timestamp(STORE_SCANS[0])
+    before = f.index < first_scan
+    assert before.sum() > 10
+    cols = ["x_mom_12_1", "x_mom_12_1_rk", "x_weinstein", "x_relvol", "x_sector"]
+    assert f.loc[before, cols].isna().all().all()                       # no scan yet: NaN
+    for day in ("2022-03-01", "2022-03-02", "2022-03-08", "2023-12-27", "2023-12-28"):
+        t = pd.Timestamp(day)
+        scan = max(x for x in STORE_SCANS if x <= day)                  # S <= D: a scan dated D is visible at D
+        row = store.loc[(scan, "AAA")]
+        assert f.loc[t, "x_mom_12_1"] == pytest.approx(row["momentum_12_1"])
+        assert f.loc[t, "x_weinstein"] == row["weinstein_stage"] and f.loc[t, "x_relvol"] == pytest.approx(row["relative_volume"])
+        assert f.loc[t, "x_sector"] == F.SECTOR_CODE["Technology"]
+        moms = store.xs(scan, level="date")["momentum_12_1"]
+        assert f.loc[t, "x_mom_12_1_rk"] == pytest.approx(((moms.rank() - 0.5) / len(moms))["AAA"])
+
+
+def test_sector_codes_are_a_committed_map():
+    assert F.SECTOR_CODE == {"Basic Materials": 1, "Communication Services": 2, "Consumer Cyclical": 3,
+                             "Consumer Defensive": 4, "Energy": 5, "Financial Services": 6, "Healthcare": 7,
+                             "Industrials": 8, "Real Estate": 9, "Technology": 10, "Utilities": 11}
+    assert set(F.SECTOR_CODE) == set(F.SECTOR_ETF)
+
+
+def test_sector_of_can_come_from_the_store(cache):
+    from_store = _build(cache, ["m"], sector_of="store")
+    pd.testing.assert_frame_equal(from_store, _build(cache, ["m"], sector_of=SECTOR_OF))
+    assert from_store.attrs["meta"]["sector_source"] == "store"
+    # a symbol the store has no sector for refuses unless the caller overrides it
+    with pytest.raises(P.PanelDataError, match="no sector for ZZZ"):
+        F.build_features(["AAA", "ZZZ"], FIRST, LAST, ["m"], cache, [], sector_of="store")
+
+
+def test_sector_overrides_fill_what_the_store_lacks(cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    shutil.copy(root / "AlpacaHistoryOHLCVProvider" / "AAA_1d.parquet", root / "AlpacaHistoryOHLCVProvider" / "ZZZ_1d.parquet")
+    f = F.build_features(["AAA", "ZZZ"], FIRST, LAST, ["m"], root, [], sector_of="store",
+                         sector_overrides={"ZZZ": "Technology"})
+    assert f.attrs["meta"]["sector_overrides"] == {"ZZZ": "Technology"}
+    np.testing.assert_array_equal(f.loc["ZZZ", "m_rs_sector_20"].to_numpy(), f.loc["AAA", "m_rs_sector_20"].to_numpy())
+
+
+def test_x_refuses_a_stale_store(cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    from ba2_providers.screener.metric_store import MetricStoreStaleError
+    for p in (root / "screener" / "metric_store_alpaca_20261022").glob("ym=*/*.parquet"):
+        df = pd.read_parquet(p)
+        df[df["date"] <= "2023-12-27"].to_parquet(p, index=False)       # the store ends 3 months before LAST
+    shutil.rmtree(root / "screener" / "_derived", ignore_errors=True)
+    with pytest.raises(MetricStoreStaleError):
+        _build(root, ["x"], symbols=XU)
