@@ -368,8 +368,8 @@ def _cmd_prewarm(args) -> int:
         def _grid_values(param: Dict[str, Any]) -> List[int]:
             return list(range(int(param["min"]), int(param["max"]) + 1, int(param["step"])))
 
-        horizon_values = _grid_values(_senate_opt["expert_params"]["skill_horizon_days"])
-        lookback_values = _grid_values(_senate_opt["expert_params"]["skill_lookback_months"])
+        horizon_values = _grid_values(_EXPERT_OPT["FMPSenateTraderWeight"]["expert_params"]["skill_horizon_days"])
+        lookback_values = _grid_values(_EXPERT_OPT["FMPSenateTraderWeight"]["expert_params"]["skill_lookback_months"])
 
         # Real trading days, not a synthetic weekday calendar: reuse the fullest already-warmed
         # price history above (any gaps in a thin/delisted symbol would silently under-cover).
