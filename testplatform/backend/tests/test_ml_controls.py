@@ -81,11 +81,11 @@ def test_cross_sectional_signal_survives_time_shuffle_and_dies_under_symbol_shuf
 
 def test_timing_signal_survives_symbol_shuffle_and_dies_under_time_shuffle():
     df = _frame("timing")
-    tm = E.timing_metric(0.0, 0.0)
+    tm = E.timing_metric(q=0.5, cost_bps=0.0, min_obs=20)       # the cutoff is recomputed from each shuffled score
     real = tm(df)
     assert real > 0.3
-    assert tm(C.shuffle_symbols(df, 1)) > 0.9 * real                    # day-level score is the same for every name
-    assert abs(tm(C.shuffle_time(df, 1))) < 0.15 * real
+    assert tm(C.shuffle_symbols(df, 1)) > 0.8 * real                    # day-level score is the same for every name
+    assert abs(tm(C.shuffle_time(df, 1))) < 0.25 * real
 
 
 def test_controls_report_layout_and_values():
@@ -105,7 +105,7 @@ def test_controls_report_layout_and_values():
     assert abs(ss["mean"]) < 0.1 < st["mean"]
     assert ss["values"][0] == pytest.approx(ic(C.shuffle_symbols(df, 1)))
     plain = C.controls_report(preds, outcomes, ic)
-    assert "naive" not in plain and "linear" not in plain and plain["seeds"] == [1, 2, 3]
+    assert "naive" not in plain and "linear" not in plain and plain["seeds"] == list(range(1, 21))
 
 
 def test_controls_report_uses_the_same_rows_for_model_and_controls_and_refuses_empties():
@@ -125,3 +125,38 @@ def test_controls_report_uses_the_same_rows_for_model_and_controls_and_refuses_e
         C.controls_report(df[["symbol", "session", "score"]], outcomes, metric, seeds=())
     with pytest.raises(ValueError, match="none of"):
         C.controls_report(df[["symbol", "session", "score"]], df[["symbol", "session"]], metric)
+
+
+def test_controls_report_defaults_to_20_seeds_and_reports_rank_and_p_value():
+    df = _frame("cross")
+    outcomes = df[["symbol", "session", "ret", "rel_ret", "vol"]]
+    rep = C.controls_report(df[["symbol", "session", "score"]], outcomes, E.rank_ic_metric())
+    assert rep["seeds"] == list(range(1, 21))
+    ss, st = rep["shuffle_symbols"], rep["shuffle_time"]
+    assert len(ss["values"]) == 20 and len(st["values"]) == 20
+    # the model beats every symbol shuffle: rank 1, p = 1 / 21 ; the time shuffle keeps a persistent name effect
+    assert ss["rank"] == 1 and ss["p_value"] == pytest.approx(1 / 21)
+    assert st["rank"] > 1 and st["p_value"] > 0.5
+    # a metric the shuffles tie or beat gets the worst rank and p = 1
+    rep2 = C.controls_report(df[["symbol", "session", "score"]], outcomes, lambda d: -1.0, seeds=(1, 2, 3))
+    assert rep2["shuffle_symbols"]["rank"] == 1 and rep2["shuffle_symbols"]["p_value"] == pytest.approx(1.0)
+    assert C.empirical_rank(0.5, [0.1, 0.9, 0.5, float("nan")]) == (2, pytest.approx(3 / 4))
+    assert C.empirical_rank(float("nan"), [0.1]) == (None, None)
+
+
+def test_controls_report_with_a_timing_metric_recomputes_the_cutoff_after_each_shuffle():
+    df = _frame("timing")
+    outcomes = df[["symbol", "session", "ret", "rel_ret", "vol"]]
+    preds = df[["symbol", "session", "score"]]
+    tm = E.timing_metric(q=0.5, cost_bps=0.0, min_obs=20)
+    rep = C.controls_report(preds, outcomes, tm, seeds=(1, 2, 3, 4))
+    assert rep["model"] > 0.3
+    assert rep["shuffle_symbols"]["mean"] > 0.8 * rep["model"]          # day-level timing survives the cross shuffle
+    assert abs(rep["shuffle_time"]["mean"]) < 0.25 * rep["model"]      # and dies under the time shuffle
+    # each control value is the metric of the shuffled frame with its OWN causal cutoff
+    joined = E.flat(df)
+    manual = tm(C.shuffle_time(joined, 1))
+    assert rep["shuffle_time"]["values"][0] == pytest.approx(manual)
+    # a metric over a frame carrying a stale cutoff column would NOT see the shuffle: that is what q= avoids
+    stale = E.with_cutoff(joined, 0.5, 20)
+    assert E.timing_metric(cutoff_col="cutoff")(C.shuffle_time(stale, 1)) != pytest.approx(manual)

@@ -135,81 +135,161 @@ def test_spread_is_order_and_tie_deterministic():
 
 
 # ------------------------------------------------------------------ timing
-def _single(n=100, seed=0, signal=True):
+def _single(n=100, seed=0, signal=True, drift=0.001):
     rng = np.random.default_rng(seed)
     score = rng.normal(size=n)
-    ret = (0.01 * np.sign(score) if signal else 0.0) + rng.normal(0, 0.005, n) + 0.001
+    ret = (0.01 * np.sign(score) if signal else 0.0) + rng.normal(0, 0.005, n) + drift
     return pd.DataFrame({"symbol": "X", "session": SESSIONS[:n], "score": score, "ret": ret, "vol": 0.1})
 
 
-def test_timing_excess_hand_computed_with_cost():
+def _alternating(cost_free=True):
     sc = np.tile([0.0, 1.0], 10)
-    df = pd.DataFrame({"symbol": "X", "session": SESSIONS[:20], "score": sc,
-                       "ret": np.where(sc == 1.0, 0.01, -0.01), "vol": 0.1})
-    t = E.timing_excess(df, 0.5)
+    return pd.DataFrame({"symbol": "X", "session": SESSIONS[:20], "score": sc, "cut": 0.5,
+                         "ret": np.where(sc == 1.0, 0.01, -0.01), "vol": 0.1})
+
+
+def test_timing_excess_hand_computed_with_cost_and_series_mean_equals_excess():
+    df = _alternating()
+    t = E.timing_excess(df, cutoff_col="cut")
     assert t.excess == pytest.approx(0.1) and t.n_in == 10 and t.n == 20 and t.in_share == 0.5
-    t2 = E.timing_excess(df, 0.5, cost_bps=10)
-    assert t2.excess == pytest.approx((0.01 - 0.001) / 0.1)       # one round trip per in row, in vol units
-    assert t2.series.mean() == pytest.approx(0.5 * (0.01 - 0.001) / 0.1)
+    assert t.series.mean() == pytest.approx(t.excess)
+    t2 = E.timing_excess(df, cost_bps=10, cutoff_col="cut")
+    assert t2.excess == pytest.approx((0.01 - 0.001) / 0.1 - 0.0)     # one round trip per in row; baseline mean_all = 0
+    assert t2.series.mean() == pytest.approx(t2.excess)
+
+
+def test_timing_series_mean_equals_excess_on_unbalanced_panels_and_drifting_markets():
+    rng = np.random.default_rng(3)
+    base = _panel(n_names=6, n_sess=80, seed=4)
+    base = base[~((base["symbol"] > "S02") & (base["session"] < SESSIONS[20]))]       # unequal rows per session
+    base = base.assign(score=rng.normal(size=len(base)), ret=0.004 + rng.normal(0, 0.01, len(base)))
+    base["cut"] = 0.2
+    t = E.timing_excess(base, 5.0, cutoff_col="cut")
+    assert t.series.mean() == pytest.approx(t.excess, abs=1e-12)
+
+
+def test_noise_score_on_a_drifting_market_has_zero_excess_and_unbiased_t():
+    ts, ex = [], []
+    for seed in range(40):
+        df = _single(600, seed=seed, signal=False, drift=0.004)        # strong up drift, score is noise
+        t = E.timing_excess(df, q=0.4, min_obs=20)
+        assert t.series.mean() == pytest.approx(t.excess, abs=1e-12)
+        ts.append(E.newey_west_t(t.series, 4))
+        ex.append(t.excess)
+    assert abs(np.mean(ex)) < 0.005                                      # old construction was ~ -0.04 (1 - p_in) x drift
+    assert abs(np.mean(ts)) < 0.5 and max(abs(np.array(ts))) < 3.5
 
 
 def test_timing_excess_positive_for_signal_zero_for_noise():
-    assert E.timing_excess(_single(300, signal=True), 0.0).excess > 0.05
-    noise = E.timing_excess(_single(2000, signal=False), 0.0)
-    assert abs(noise.excess) < 0.05
-    assert math.isnan(E.timing_excess(_single(10), 99.0).excess)         # never in
+    assert E.timing_excess(_single(300, signal=True), q=0.5).excess > 0.05
+    assert abs(E.timing_excess(_single(2000, signal=False), q=0.5).excess) < 0.05
 
 
-def test_timing_sharpe_matches_a_hand_computation():
-    df = _single(200, seed=4)
-    thr = 0.3
-    inn = df["score"].to_numpy() >= thr
+def test_timing_never_in_is_nan():
+    df = _single(60).assign(cut=99.0)
+    t = E.timing_excess(df, cutoff_col="cut")
+    assert math.isnan(t.excess) and t.n_in == 0 and t.series.empty
+
+
+def test_timing_requires_exactly_one_of_q_and_cutoff_col_and_has_no_scalar_form():
+    df = _single(60).assign(cut=0.0)
+    with pytest.raises(ValueError, match="exactly one"):
+        E.timing_excess(df)
+    with pytest.raises(ValueError, match="exactly one"):
+        E.timing_excess(df, q=0.5, cutoff_col="cut")
+    with pytest.raises(ValueError, match="not in the frame"):
+        E.timing_excess(df, cutoff_col="nope")
+    with pytest.raises(ValueError, match="exactly one"):
+        E.timing_excess(df, 0.5)                                       # 0.5 is the cost; a score level is not accepted
+    with pytest.raises(ValueError):
+        E.timing_excess(df, q=1.0)
+
+
+def test_timing_sharpe_matches_a_hand_computation_and_requires_horizon():
+    df = _single(200, seed=4).assign(cut=0.3)
+    inn = df["score"].to_numpy() >= 0.3
     r = np.where(inn, df["ret"].to_numpy() - 0.0005, 0.0)
     expect = r.mean() / r.std(ddof=1) * math.sqrt(252 / 5)
-    assert E.timing_sharpe(df, thr, cost_bps=5, horizon=5) == pytest.approx(expect)
-    assert E.timing_sharpe(df, thr, horizon=5) > E.timing_sharpe(df, thr, cost_bps=300, horizon=5)
-    assert math.isnan(E.timing_sharpe(df, 99.0))
+    assert E.timing_sharpe(df, horizon=5, cost_bps=5, cutoff_col="cut") == pytest.approx(expect)
+    assert E.timing_sharpe(df, 5, cutoff_col="cut") > E.timing_sharpe(df, 5, cost_bps=300, cutoff_col="cut")
+    assert math.isnan(E.timing_sharpe(df.assign(cut=99.0), 5, cutoff_col="cut"))
     with pytest.raises(ValueError):
-        E.timing_sharpe(df, thr, horizon=0)
+        E.timing_sharpe(df, 0, cutoff_col="cut")
+    with pytest.raises(TypeError):
+        E.timing_sharpe(df, cutoff_col="cut")                          # horizon is required
+    assert np.isfinite(E.timing_sharpe(df, 5, q=0.5, min_obs=10))
 
 
-def test_timing_per_row_threshold_follows_the_callers_row_order():
-    df = _panel(n_names=3, n_sess=30).assign(score=lambda d: d["latent"], ret=lambda d: d["latent"] * 0.01)
-    cut = np.random.default_rng(0).normal(size=len(df))
-    shuffled_idx = np.random.default_rng(1).permutation(len(df))
-    a = E.timing_excess(df, cut, 5).excess
-    b = E.timing_excess(df.iloc[shuffled_idx], cut[shuffled_idx], 5).excess
-    assert a == pytest.approx(b)
-    with pytest.raises(ValueError):
-        E.timing_excess(df, cut[:-1])
+def test_panel_expanding_cutoff_is_per_symbol_causal_and_aligned_to_the_frame():
+    rng = np.random.default_rng(0)
+    df = _panel(n_names=3, n_sess=60, seed=1).assign(score=lambda d: rng.normal(size=len(d)))
+    df = df.iloc[rng.permutation(len(df))]                                # callers order is not sorted
+    cut = E.panel_expanding_cutoff(df, 0.6, min_obs=10)
+    assert cut.index.equals(df.index)
+    for sym, g in df.groupby("symbol"):
+        g = g.sort_values("session")
+        c = cut.loc[g.index]
+        assert c.isna().sum() == 10
+        k = 30
+        assert c.iloc[k] == pytest.approx(np.quantile(g["score"].iloc[:k], 0.6))
+    # changing a symbol's FUTURE scores (and another symbol's) changes no earlier cutoff
+    df2 = df.copy()
+    late = (df2["session"] >= SESSIONS[40])
+    df2.loc[late, "score"] += 50.0
+    cut2 = E.panel_expanding_cutoff(df2, 0.6, min_obs=10)
+    first = df["session"] <= SESSIONS[40]
+    assert cut[first].equals(cut2[first])                                # a row's cutoff cannot see its own score either
 
 
-def test_expanding_cutoff_uses_only_earlier_rows():
-    s = pd.Series(np.random.default_rng(0).normal(size=100))
-    c = E.expanding_cutoff(s, 0.6, min_obs=20)
-    assert c.iloc[:20].isna().all() and c.iloc[20:].notna().all()
-    assert c.iloc[50] == pytest.approx(np.quantile(s.iloc[:50], 0.6))
-    s2 = s.copy()
-    s2.iloc[60:] += 100.0                                               # change the future only
-    c2 = E.expanding_cutoff(s2, 0.6, min_obs=20)
-    assert c.iloc[:61].equals(c2.iloc[:61])                             # row 60's cutoff cannot see row 60
-    with pytest.raises(ValueError):
-        E.expanding_cutoff(s, 1.0)
+def test_panel_expanding_cutoff_history_warms_up_and_must_precede_the_frame():
+    rng = np.random.default_rng(1)
+    full = _panel(n_names=2, n_sess=100, seed=2).assign(score=lambda d: rng.normal(size=len(d)))
+    hist, block = full[full["session"] < SESSIONS[50]], full[full["session"] >= SESSIONS[50]]
+    cold = E.panel_expanding_cutoff(block, 0.5, min_obs=20)
+    warm = E.panel_expanding_cutoff(block, 0.5, min_obs=20, history=hist)
+    assert cold.isna().sum() == 40 and warm.isna().sum() == 0
+    whole = E.panel_expanding_cutoff(full, 0.5, min_obs=20)
+    assert np.allclose(warm.to_numpy(), whole.loc[block.index].to_numpy())      # same as if the block had no seam
+    with pytest.raises(ValueError, match="history"):
+        E.panel_expanding_cutoff(hist, 0.5, min_obs=20, history=block)
 
 
-def test_timing_excludes_rows_without_a_cutoff():
+def test_timing_with_q_uses_the_causal_cutoff_and_drops_warmup_rows():
     df = _single(60)
-    cut = E.expanding_cutoff(df["score"], 0.6, min_obs=20)
-    t = E.timing_excess(df, cut.to_numpy())
+    t = E.timing_excess(df, q=0.6, min_obs=20)
     assert t.n == 40
+    hist = _single(60, seed=9).assign(session=SESSIONS[100:160])
+    later = df.assign(session=SESSIONS[200:260])
+    assert E.timing_excess(later, q=0.6, min_obs=20, history=hist).n == 60
 
 
-def test_timing_by_symbol_splits_symbols():
-    a, b = _single(100, 1), _single(100, 2)
+def test_timing_by_symbol_is_vectorised_and_matches_per_symbol_calls():
+    a, b = _single(120, 1), _single(120, 2)
     b["symbol"] = "Y"
-    out = E.timing_by_symbol(pd.concat([a, b]), 0.0, 0)
+    both = pd.concat([a, b])
+    out = E.timing_by_symbol(both, 3.0, q=0.5, min_obs=20)
     assert list(out.index) == ["X", "Y"]
-    assert out.loc["X", "excess"] == pytest.approx(E.timing_excess(a, 0.0).excess)
+    for sym, g in (("X", a), ("Y", b)):
+        t = E.timing_excess(g, 3.0, q=0.5, min_obs=20)
+        assert out.loc[sym, "excess"] == pytest.approx(t.excess)
+        assert out.loc[sym, "n_in"] == t.n_in and out.loc[sym, "n"] == t.n
+
+
+def test_assume_flat_gives_the_same_numbers():
+    df = E.flat(_panel(n_names=8, n_sess=60).assign(score=lambda d: d["latent"],
+                                                    ret=lambda d: d["latent"] * 0.01 + 0.001))
+    df["rel_ret"] = df["ret"] - df.groupby("session")["ret"].transform("mean")
+    assert E.rank_ic(df, assume_flat=True)[0] == E.rank_ic(df)[0]
+    assert E.quintile_spread(df, 4.0, assume_flat=True).mean == E.quintile_spread(df, 4.0).mean
+    assert E.timing_excess(df, 4.0, q=0.5, assume_flat=True).excess == E.timing_excess(df, 4.0, q=0.5).excess
+    assert E.timing_sharpe(df, 5, 4.0, q=0.5, assume_flat=True) == E.timing_sharpe(df, 5, 4.0, q=0.5)
+
+
+def test_result_dataclasses_do_not_define_value_equality():
+    sp = E.quintile_spread(_known_day())
+    assert sp == sp and sp != E.quintile_spread(_known_day())             # identity equality, no Series comparison
+    t = E.timing_excess(_alternating(), cutoff_col="cut")
+    assert t == t
 
 
 # ------------------------------------------------------------------ Newey-West
@@ -241,8 +321,9 @@ def test_newey_west_se_exceeds_the_naive_se_on_ar1_and_matches_it_on_iid():
 
 def test_newey_west_drops_nan_and_refuses_short_or_bad_input():
     assert E.newey_west_t([1, 2, np.nan, 4, 3, 5], 1) == pytest.approx(E.newey_west_t([1, 2, 4, 3, 5], 1))
-    with pytest.raises(ValueError, match="too short"):
-        E.newey_west_t([1.0, 2.0], 1)
+    assert math.isnan(E.newey_west_t([1.0, 2.0], 1))                 # n <= lag + 1: no estimate, no exception
+    assert math.isnan(E.newey_west_se([1.0, 2.0, 3.0], 2))
+    assert math.isnan(E.newey_west_t([], 0))
     with pytest.raises(ValueError):
         E.newey_west_t([1.0, 2.0, 3.0], -1)
     assert math.isnan(E.newey_west_t([2.0] * 10, 2))
@@ -265,6 +346,9 @@ def test_by_regime_on_a_series_and_a_frame():
     assert list(only) == ["all", "2023-24", "2025-26"]
     with pytest.raises(ValueError):
         E.by_regime(pd.DataFrame({"v": [1]}), len)
+    thin = E.by_regime(s, lambda x: float(x.mean()), min_rows=2)
+    assert math.isnan(thin["2019"]) and thin["all"] == pytest.approx(s.mean())
+    assert math.isnan(thin["2020crash"]) and not math.isnan(thin["2025-26"])    # 2025-26 holds two rows
 
 
 def test_by_regime_with_a_metric_fn_over_predictions():
