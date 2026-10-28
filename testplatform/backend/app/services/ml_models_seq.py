@@ -434,4 +434,195 @@ class TsaiAdapter(_SequenceAdapter):
         return out
 
 
-SEQUENCE_ADAPTERS: Dict[str, type] = {"tsai": TsaiAdapter}
+# ------------------------------------------------------------------ darts
+#: levels the Darts likelihood learns; the deciles are percentiles of the SAMPLED H-step cumulative return
+DARTS_QUANTILES: Tuple[float, ...] = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95)
+DECILE_PERCENTILES: Tuple[int, ...] = tuple(int(round(100 * q)) for q in QUANTILE_LEVELS)
+PREDICT_CHUNK = 1024
+
+
+def _quiet_lightning() -> None:
+    import logging
+    for name in ("pytorch_lightning", "lightning", "lightning.pytorch", "lightning_fabric", "darts"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+
+def _darts_ts(values: np.ndarray, start: int):
+    from darts import TimeSeries
+    return TimeSeries.from_times_and_values(pd.RangeIndex(start, start + len(values)), values.astype(np.float32))
+
+
+def _spans(X: SequenceData, n_out: int, where: str) -> Dict[int, Tuple[int, int]]:
+    """Per series: (first row of the earliest window, last row of the latest forecast target) of the sample rows."""
+    out: Dict[int, Tuple[int, int]] = {}
+    st = X.series_start[X.rows]
+    for s in np.unique(st):
+        r = X.rows[st == s]
+        lo, hi = int(r.min()) - X.lookback + 1, int(r.max()) + n_out
+        if hi >= len(X.features) or X.series_start[hi] != s:
+            raise ValueError(f"{where}: the {n_out}-bar targets of row {int(r.max())} run past the end of the series "
+                             f"(drop the rows whose horizon is not complete)")
+        out[int(s)] = (lo, hi)
+    return out
+
+
+def _sample_quantile_paths(u: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """Inverse-CDF draws from the learned quantiles: ``u`` (samples, steps) uniforms, ``q`` (steps, 11) quantile values
+    at ``DARTS_QUANTILES``; linear between neighbouring levels and flat beyond the outer ones (the interpolation Darts'
+    own ``QuantileRegression.sample`` uses, with an RNG of ours so that the draw is reproducible). Steps are drawn
+    independently, as Darts does."""
+    levels = np.asarray(DARTS_QUANTILES)
+    idx = np.searchsorted(levels, u)
+    lo, hi = np.clip(idx - 1, 0, len(levels) - 1), np.clip(idx, 0, len(levels) - 1)
+    ql, qh = levels[lo], levels[hi]
+    w = np.where(qh > ql, (u - ql) / np.where(qh > ql, qh - ql, 1.0), 0.0)
+    step = np.arange(q.shape[0])[None, :]
+    return q[step, lo] + w * (q[step, hi] - q[step, lo])
+
+
+def _darts_model(p: Dict[str, Any], lookback: int, n_out: int, seed: int, device, work_dir: str, name: str):
+    from darts.models import NBEATSModel, NHiTSModel, TCNModel, TFTModel
+    from darts.utils.likelihood_models import QuantileRegression
+    from pytorch_lightning.callbacks import EarlyStopping
+    common = dict(input_chunk_length=lookback, output_chunk_length=n_out, batch_size=p["batch_size"],
+                  n_epochs=p["epochs"], likelihood=QuantileRegression(quantiles=list(DARTS_QUANTILES)),
+                  random_state=seed, optimizer_kwargs={"lr": p["lr"]}, save_checkpoints=True, force_reset=True,
+                  model_name=name, work_dir=work_dir,
+                  pl_trainer_kwargs={"accelerator": "gpu" if device.type == "cuda" else "cpu", "devices": 1,
+                                     "enable_progress_bar": False, "enable_model_summary": False, "logger": False,
+                                     "callbacks": [EarlyStopping(monitor="val_loss", patience=p["patience"],
+                                                                 min_delta=1e-4)]})
+    arch, w, do = p["arch"], p["width"], p["dropout"]
+    if arch == "nhits":
+        return NHiTSModel(num_stacks=3, num_blocks=1, num_layers=2, layer_widths=2 * w, dropout=do, **common)
+    if arch == "nbeats":
+        return NBEATSModel(generic_architecture=True, num_stacks=3, num_blocks=1, num_layers=2, layer_widths=2 * w,
+                           dropout=do, **common)
+    if arch == "tcn":
+        return TCNModel(kernel_size=3, num_filters=w, num_layers=None, dilation_base=2, dropout=do, **common)
+    if arch == "tft":
+        return TFTModel(hidden_size=w, lstm_layers=1, num_attention_heads=4, dropout=do, add_relative_index=True,
+                        **common)
+    raise ValueError(f"unknown darts arch {arch!r}; known {DARTS_ARCHS}")
+
+
+class DartsAdapter(_SequenceAdapter):
+    """A Darts quantile forecaster (N-HiTS, N-BEATS, TCN or TFT) of the next ``horizon_steps`` bars, as the earlier
+    ``ml_search.run_darts_fold``: the TARGET series is the bar log return (divided by its training sd) and the scaled
+    feature channels are PAST covariates; the model learns the quantiles of each future bar's return, and a forecast
+    draws ``num_samples`` paths from the learned quantiles (inverse CDF, steps independent, as run_darts_fold), sums
+    each path to an H-step return (``expm1`` of the summed log returns) and takes the nine decile percentiles.
+    ``predict`` = those deciles, shape (n, 9), non-decreasing along each row (percentiles of one sample); ``score`` = P(up) from the deciles (``ba2_common.core.ml_forecast.mapping.p_up_from_deciles``,
+    clamped to [0.05, 0.95]), ``score_kind`` "probability".
+
+    Input contract beyond ``SequenceData``: ``returns`` and ``horizon_steps`` (= forecast length n_out) are required.
+    Darts trains on EVERY window of each series' contiguous span, so ``rows`` only mark the span of decision bars per
+    series (first row .. last row) and ``y`` (the realised H-step return) is validated but not trained on. The
+    training span's targets run n_out bars past its last row: they must end at or before the first validation row of
+    the same series (the purge), and every block's last target must exist (refused otherwise). Train and validation
+    must cover the same series; a model per symbol is one adapter per symbol. ``fit`` early-stops on the validation
+    quantile loss and keeps the best checkpoint; the draws of ``predict`` come from an RNG seeded with (fit seed,
+    decision row), so ``predict`` of the same row repeats exactly whatever else is in X.
+    ``fit_info``: epochs_run, best_epoch, val_loss (the best validation quantile loss), n_series, target_sd, device."""
+
+    family = "darts"
+    archs = DARTS_ARCHS
+
+    def fit(self, X_train, y_train, X_val, y_val, task: str, seed: int, groups_train=None, groups_val=None,
+            feature_names: Optional[Sequence[str]] = None) -> "DartsAdapter":
+        self._reset()
+        Xt, Xv = self._common_checks(X_train, y_train, X_val, y_val, task, feature_names)
+        p = self.params
+        if p["arch"] == "tft" and p["width"] % 4:
+            raise ValueError(f"darts: width={p['width']} must be a multiple of 4 (the tft has 4 attention heads)")
+        for name, X in (("X_train", Xt), ("X_val", Xv)):
+            if X.returns is None:
+                raise ValueError(f"darts: {name} needs the bar returns (SequenceData.returns)")
+            if X.horizon_steps is None:
+                raise ValueError(f"darts: {name} needs horizon_steps (the forecast length in bars)")
+        if Xt.horizon_steps != Xv.horizon_steps:
+            raise ValueError(f"darts: horizon_steps differ ({Xt.horizon_steps} vs {Xv.horizon_steps})")
+        _as_labels(y_train, "regression", len(Xt), "y_train")
+        _as_labels(y_val, "regression", len(Xv), "y_val")
+        n_out = Xt.horizon_steps
+        sp_t, sp_v = _spans(Xt, n_out, "X_train"), _spans(Xv, n_out, "X_val")
+        if set(sp_t) != set(sp_v):
+            raise ValueError("darts: X_train and X_val must cover the same series")
+        for s in sp_t:
+            last_train_row = int(Xt.rows[Xt.series_start[Xt.rows] == s].max())
+            first_val_row = int(Xv.rows[Xv.series_start[Xv.rows] == s].min())
+            if first_val_row > last_train_row and sp_t[s][1] > first_val_row:
+                raise ValueError(f"darts: the training targets (to row {sp_t[s][1]}) reach into the validation block "
+                                 f"(from row {first_val_row}); leave a purge of {n_out} bars")
+        net, device, info, sd = self._train(Xt, Xv, sp_t, sp_v, n_out, int(seed))
+        # reached only when the training succeeded
+        self._net, self._device, self._lookback, self._n_out, self._sd = net, device, Xt.lookback, n_out, sd
+        self.fit_info, self.n_iter = info, info["best_epoch"]
+        self.task, self.seed = task, int(seed)
+        self.feature_names = Xt.channels or None
+        self.n_features, self.n_classes = Xt.n_channels, None
+        return self
+
+    def _train(self, Xt: SequenceData, Xv: SequenceData, sp_t, sp_v, n_out: int, seed: int):
+        import tempfile
+        p = self.params
+        _quiet_lightning()
+        device = _resolve_device(p["device"])
+        keys = sorted(sp_t)
+        sd = float(np.concatenate([Xt.returns[sp_t[k][0]:sp_t[k][1] + 1] for k in keys]).std())
+        sd = sd if sd > 1e-12 else 1.0
+        tr_s = [_darts_ts(Xt.returns[sp_t[k][0]:sp_t[k][1] + 1] / sd, sp_t[k][0]) for k in keys]
+        tr_c = [_darts_ts(Xt.features[sp_t[k][0]:sp_t[k][1] + 1], sp_t[k][0]) for k in keys]
+        va_s = [_darts_ts(Xv.returns[sp_v[k][0]:sp_v[k][1] + 1] / sd, sp_v[k][0]) for k in keys]
+        va_c = [_darts_ts(Xv.features[sp_v[k][0]:sp_v[k][1] + 1], sp_v[k][0]) for k in keys]
+        name = f"ba2_{p['arch']}_{id(self)}_{seed}"
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp, _seeded(seed, device):
+            model = _darts_model(p, Xt.lookback, n_out, seed, device, tmp, name)
+            model.fit(tr_s, past_covariates=tr_c, val_series=va_s, val_past_covariates=va_c, verbose=False)
+            epochs_run = int(model.epochs_trained)
+            ckpt = model.trainer.checkpoint_callback
+            val_loss = float(ckpt.best_model_score)
+            found = re.search(r"epoch=(\d+)", os.path.basename(ckpt.best_model_path))
+            best_epoch = int(found.group(1)) + 1 if found else None
+            best = type(model).load_from_checkpoint(name, work_dir=tmp, best=True)     # the best validation epoch
+        info = {"epochs_run": epochs_run, "best_epoch": best_epoch, "val_loss": val_loss, "n_series": len(keys),
+                "target_sd": sd, "device": device.type, "arch": p["arch"]}
+        return best, device, info, sd
+
+    def predict(self, X) -> np.ndarray:
+        X = self._check_predict_input(X)
+        if X.returns is None:
+            raise ValueError("darts: X needs the bar returns (SequenceData.returns)")
+        if X.horizon_steps != self._n_out:
+            raise ValueError(f"darts: X has horizon_steps {X.horizon_steps}, the model was fitted with {self._n_out}")
+        L, sd, ns, n_out = X.lookback, self._sd, self.params["num_samples"], self._n_out
+        out = np.empty((len(X), len(DECILE_PERCENTILES)))
+        for i in range(0, len(X), PREDICT_CHUNK):
+            rows = X.rows[i:i + PREDICT_CHUNK]
+            ser = [_darts_ts(X.returns[r - L + 1:r + 1] / sd, int(r) - L + 1) for r in rows]
+            cov = [_darts_ts(X.features[r - L + 1:r + 1], int(r) - L + 1) for r in rows]
+            preds = self._net.predict(n_out, series=ser, past_covariates=cov, predict_likelihood_parameters=True,
+                                      verbose=False, show_warnings=False)
+            for j, pr in enumerate(preds):
+                q = np.sort(pr.values(copy=False).astype(np.float64), axis=1)       # (n_out, 11) learned quantiles
+                # one RNG per decision bar: its draws do not depend on the other rows or on the chunking
+                u = np.random.default_rng((self.seed, int(rows[j]))).random((ns, n_out))
+                paths = _sample_quantile_paths(u, q) * sd                           # (ns, n_out) log returns
+                out[i + j] = np.percentile(np.expm1(paths.sum(1)), DECILE_PERCENTILES)
+        if not np.isfinite(out).all():
+            raise ValueError("darts: non-finite prediction")
+        return out
+
+    def score(self, X) -> np.ndarray:
+        """P(up) of every row from its deciles."""
+        from ba2_common.core.ml_forecast.mapping import p_up_from_deciles
+        return np.array([p_up_from_deciles(q) for q in self.predict(X)], dtype=np.float64)
+
+    @property
+    def score_kind(self) -> str:
+        if self.task is None:
+            raise RuntimeError("darts: score_kind before fit")
+        return "probability"
+
+
+SEQUENCE_ADAPTERS: Dict[str, type] = {"tsai": TsaiAdapter, "darts": DartsAdapter}

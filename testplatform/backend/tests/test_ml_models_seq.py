@@ -185,7 +185,7 @@ TASKS = MM.SUPPORTED_TASKS["tsai"]
 def test_the_seven_architectures_are_registered():
     assert set(ARCHS) == {"inception", "tst", "lstm_fcn", "minirocket", "patchtst", "tcn", "resnet"}
     assert MM.SUPPORTED_TASKS["tsai"] == ("binary", "multiclass", "regression")
-    assert isinstance(MM.make_adapter("tsai"), MS.TsaiAdapter)
+    assert isinstance(MM.make_adapter("tsai"), MS.TsaiAdapter) and isinstance(MM.make_adapter("darts"), MS.DartsAdapter)
 
 
 @pytest.mark.parametrize("arch", ARCHS)
@@ -413,3 +413,211 @@ def test_arch_params_cover_every_architecture_and_ml_search_delegates_to_them():
     for arch in ("inception", "tst", "lstm_fcn", "minirocket", "patchtst", "tcn", "resnet"):
         s = S.Setup.from_genes({**g, "tsai_arch": arch})
         assert S._tsai_params(arch, s) == MS.arch_params(arch, s.width, s.dropout, s.lookback)
+
+
+# ------------------------------------------------------------------ DartsAdapter
+DL, DH = 16, 4                                  # lookback, forecast steps (= horizon_steps)
+DN = 420                                        # bars per symbol
+
+
+def darts_data(drift=0.01, noise=0.02, n_sym=2, n=DN, C=3, seed=0, h=DH):
+    """Bar returns = drift + noise. Train origins up to bar 280 - h, validation 280..340 - h, test 340..n - h
+    (each block ends h bars before the next one starts: the purge). Labels = the realised h-bar return."""
+    rng = np.random.default_rng(seed)
+    F = rng.normal(size=(n_sym * n, C)).astype(np.float32)
+    ret = (drift + noise * rng.normal(size=n_sym * n)).astype(np.float64)
+    start = np.repeat(np.arange(n_sym) * n, n)
+    out = {}
+    for name, (a, b) in {"train": (DL - 1, 280 - h), "val": (280, 340 - h), "test": (340, n - h)}.items():
+        rows = block_rows(n_sym, n, a, b)
+        sd = MS.SequenceData(F, rows, DL, start, returns=ret, horizon_steps=h)
+        cum = np.array([np.expm1(ret[r + 1:r + h + 1].sum()) for r in rows])
+        out[name] = (sd, cum)
+    return out
+
+
+DFAST = {"epochs": 4, "width": 16, "batch_size": 128, "num_samples": 100, "lr": 3e-3}
+DARTS = MS.DARTS_ARCHS
+
+
+def fit_darts(d, seed=1, **params):
+    ad = MM.make_adapter("darts", params={**DFAST, **params})
+    ad.fit(*d["train"], *d["val"], task="quantile", seed=seed)
+    return ad
+
+
+def test_the_darts_models_and_task_are_registered():
+    assert set(DARTS) == {"nhits", "nbeats", "tcn", "tft"} and MM.DEFAULTS["darts"]["arch"] == "nhits"
+    assert MM.SUPPORTED_TASKS["darts"] == ("quantile",)
+
+
+@pytest.mark.parametrize("arch", DARTS)
+def test_every_darts_model_predicts_monotone_deciles_and_a_probability_score(arch):
+    d = darts_data()
+    ad = fit_darts(d, arch=arch)
+    Xte, _ = d["test"]
+    Q = ad.predict(Xte)
+    assert Q.shape == (len(Xte), 9) and np.isfinite(Q).all()
+    assert (np.diff(Q, axis=1) >= 0).all()
+    from ba2_common.core.ml_forecast.mapping import p_up_from_deciles
+    s = ad.score(Xte)
+    np.testing.assert_allclose(s, [p_up_from_deciles(q) for q in Q])
+    assert s.shape == (len(Xte),) and ((s >= 0.05) & (s <= 0.95)).all() and ad.score_kind == "probability"
+    assert ad.n_features == 3 and ad.n_classes is None and ad.task == "quantile"
+
+
+@pytest.mark.parametrize("arch", ["nhits", "nbeats", "tcn"])
+def test_a_planted_drift_gives_p_up_above_one_half_and_the_opposite_drift_below(arch):
+    up_data = darts_data(0.01)
+    up = fit_darts(up_data, arch=arch, epochs=6)
+    Xte = up_data["test"][0]
+    assert up.score(Xte).mean() > 0.6
+    assert 0.0 < np.median(up.predict(Xte)[:, 4]) < 0.1                     # median H-step return ~ 4 x 0.01
+    dn_data = darts_data(-0.01)
+    dn = fit_darts(dn_data, arch=arch, epochs=6)
+    assert dn.score(dn_data["test"][0]).mean() < 0.4
+
+
+def test_darts_is_deterministic_for_a_seed_and_the_global_random_state_is_left_alone():
+    d = darts_data()
+    X = d["test"][0]
+    a = fit_darts(d, seed=4).predict(X)
+    b = fit_darts(d, seed=4).predict(X)
+    c = fit_darts(d, seed=5).predict(X)
+    np.testing.assert_allclose(a, b, atol=1e-6)
+    assert np.abs(a - c).max() > 1e-5
+    torch.manual_seed(7)
+    np.random.seed(7)
+    ref_t, ref_n = torch.rand(1).item(), np.random.rand()
+    torch.manual_seed(7)
+    np.random.seed(7)
+    fit_darts(d, seed=4).predict(X)
+    assert torch.rand(1).item() == ref_t and np.random.rand() == ref_n
+
+
+def test_a_darts_prediction_reads_only_bars_up_to_the_decision_bar():
+    d = darts_data()
+    ad = fit_darts(d, seed=2)
+    X = d["test"][0]
+    rows = X.rows[:40]
+    base = ad.predict(X.take(rows))
+    F2, R2 = X.features.copy(), X.returns.copy()
+    cut = int(rows.max()) + 1                     # scramble everything after the last decision bar
+    F2[cut:] = 99.0
+    R2[cut:] = 5.0
+    X2 = MS.SequenceData(F2, rows, DL, X.series_start, returns=R2, horizon_steps=DH)
+    np.testing.assert_allclose(ad.predict(X2), base, atol=1e-6)
+
+
+def test_darts_refusals():
+    d = darts_data()
+    (Xt, yt), (Xv, yv) = d["train"], d["val"]
+    for task in ("binary", "multiclass", "regression", "rank", "nonsense"):
+        with pytest.raises(MM.UnsupportedTaskError):
+            MM.make_adapter("darts", params=DFAST).fit(Xt, yt, Xv, yv, task=task, seed=1)
+    ad = MM.make_adapter("darts", params=DFAST)
+    no_ret = MS.SequenceData(Xt.features, Xt.rows, DL, Xt.series_start, horizon_steps=DH)
+    with pytest.raises(ValueError, match="returns"):
+        ad.fit(no_ret, yt, Xv, yv, task="quantile", seed=1)
+    no_h = MS.SequenceData(Xt.features, Xt.rows, DL, Xt.series_start, returns=Xt.returns)
+    with pytest.raises(ValueError, match="horizon_steps"):
+        ad.fit(no_h, yt, Xv, yv, task="quantile", seed=1)
+    other_h = MS.SequenceData(Xv.features, Xv.rows, DL, Xv.series_start, returns=Xv.returns, horizon_steps=DH + 1)
+    with pytest.raises(ValueError, match="horizon_steps"):
+        ad.fit(Xt, yt, other_h, yv, task="quantile", seed=1)
+    with pytest.raises(ValueError, match="labels"):
+        ad.fit(Xt, yt[:-1], Xv, yv, task="quantile", seed=1)
+    with pytest.raises(ValueError, match="empty"):
+        ad.fit(Xt, yt, Xv.take(Xv.rows[:0]), yv[:0], task="quantile", seed=1)
+    with pytest.raises(TypeError, match="SequenceData"):
+        ad.fit(Xt.features, yt, Xv, yv, task="quantile", seed=1)
+    for bad in ({"arch": "gru"}, {"nope": 1}, {"num_samples": 0}, {"epochs": 0}, {"dropout": 1.5}):
+        with pytest.raises(ValueError):
+            MM.make_adapter("darts", params=bad)
+    with pytest.raises(ValueError, match="width"):
+        MM.make_adapter("darts", params={**DFAST, "arch": "tft", "width": 18}).fit(Xt, yt, Xv, yv, task="quantile", seed=1)
+
+
+def test_darts_training_targets_must_not_reach_into_the_validation_block_or_past_the_data():
+    d = darts_data()
+    (Xt, yt), (Xv, yv) = d["train"], d["val"]
+    # a training block that runs up to the first validation row: its last targets are validation-period returns
+    late = block_rows(2, DN, DL - 1, 280)
+    with pytest.raises(ValueError, match="validation"):
+        MM.make_adapter("darts", params=DFAST).fit(Xt.take(late), np.zeros(len(late)), Xv, yv, task="quantile", seed=1)
+    # origins whose targets fall beyond the end of the symbol's data
+    bad = Xv.take(np.concatenate([Xv.rows, [DN - 1, 2 * DN - 1]]))
+    with pytest.raises(ValueError, match="end of the series"):
+        MM.make_adapter("darts", params=DFAST).fit(Xt, yt, bad, np.zeros(len(bad)), task="quantile", seed=1)
+
+
+def test_darts_predict_checks_its_input_and_a_failed_fit_leaves_it_unfitted():
+    d = darts_data()
+    (Xt, yt), (Xv, yv) = d["train"], d["val"]
+    ad = MM.make_adapter("darts", params=DFAST)
+    with pytest.raises(RuntimeError, match="before fit"):
+        ad.predict(Xv)
+    ad.fit(Xt, yt, Xv, yv, task="quantile", seed=1)
+
+    def variant(**kw):
+        a = dict(features=Xv.features, rows=Xv.rows, lookback=DL, series_start=Xv.series_start, returns=Xv.returns,
+                 horizon_steps=DH)
+        a.update(kw)
+        return MS.SequenceData(**a)
+
+    with pytest.raises(ValueError, match="channels"):
+        ad.predict(variant(features=Xv.features[:, :2]))
+    with pytest.raises(ValueError, match="lookback"):
+        ad.predict(variant(lookback=DL + 2))
+    with pytest.raises(ValueError, match="horizon_steps"):
+        ad.predict(variant(horizon_steps=DH + 1))
+    with pytest.raises(ValueError, match="returns"):
+        ad.predict(variant(returns=None))
+    assert ad.predict(Xv.take(Xv.rows[:0])).shape == (0, 9)
+    with pytest.raises(MM.UnsupportedTaskError):
+        ad.fit(Xt, yt, Xv, yv, task="binary", seed=2)
+    assert ad.task is None and not hasattr(ad, "_net")
+
+
+def test_darts_one_series_and_several_series_both_fit():
+    d = darts_data()
+    (Xt, yt), (Xv, yv) = d["train"], d["val"]
+    a, b = Xt.take(Xt.rows[Xt.rows < DN]), Xv.take(Xv.rows[Xv.rows < DN])
+    ad = MM.make_adapter("darts", params=DFAST).fit(a, yt[Xt.rows < DN], b, yv[Xv.rows < DN], task="quantile", seed=1)
+    assert ad.predict(b).shape == (len(b), 9) and ad.fit_info["n_series"] == 1
+    pooled = MM.make_adapter("darts", params=DFAST).fit(Xt, yt, Xv, yv, task="quantile", seed=1)
+    assert pooled.fit_info["n_series"] == 2
+    # the train and validation blocks must cover the same series
+    with pytest.raises(ValueError, match="series"):
+        MM.make_adapter("darts", params=DFAST).fit(Xt, yt, b, yv[Xv.rows < DN], task="quantile", seed=1)
+
+
+def test_quantile_sampling_interpolates_linearly_and_is_flat_beyond_the_outer_levels():
+    levels = np.asarray(MS.DARTS_QUANTILES)
+    q = np.tile(levels * 10.0, (3, 1))                             # value = 10 x level, the same at every step
+    u = np.array([[0.0, 0.05, 0.075], [0.5, 0.95, 1.0 - 1e-9], [0.3, 0.02, 0.99]])
+    got = MS._sample_quantile_paths(u, q)
+    want = np.clip(u, 0.05, 0.95) * 10.0
+    np.testing.assert_allclose(got, want, atol=1e-9)
+    # step t reads its own quantile row
+    q2 = np.stack([np.linspace(0, 1, 11), np.linspace(10, 11, 11), np.linspace(20, 21, 11)])
+    got2 = MS._sample_quantile_paths(np.full((1, 3), 0.5), q2)[0]
+    np.testing.assert_allclose(got2, [q2[0, 5], q2[1, 5], q2[2, 5]], atol=1e-9)
+
+
+def test_darts_rows_are_predicted_independently_of_the_other_rows_in_x():
+    d = darts_data()
+    ad = fit_darts(d, seed=2)
+    X = d["test"][0]
+    full = ad.predict(X)
+    pick = np.array([0, 17, 90, 91])
+    np.testing.assert_allclose(ad.predict(X.take(X.rows[pick])), full[pick], atol=1e-6)
+    np.testing.assert_allclose(ad.predict(X), full, atol=1e-9)                # and a second call repeats exactly
+
+
+def test_darts_keeps_the_best_validation_epoch_and_reports_it():
+    d = darts_data(drift=0.0)
+    ad = fit_darts(d, seed=2, epochs=15, patience=2, lr=1e-2)
+    info = ad.fit_info
+    assert info["epochs_run"] < 15 and 1 <= info["best_epoch"] < info["epochs_run"]      # stopped early, not on the best
+    assert np.isfinite(info["val_loss"]) and ad.n_iter == info["best_epoch"] and info["device"] == "cuda"
