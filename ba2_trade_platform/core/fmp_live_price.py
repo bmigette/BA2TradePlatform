@@ -1,16 +1,17 @@
 """Real-time FMP last price for broker accounts (the `fmp` live price source).
 
-The FMP call is the SAME one PennyMomentumTrader's ``vendor_live_price = fmp`` uses
-(``fmpsdk.quote`` through the global ``fmp_list_call`` rate-limit gate), minus its
-"fall back to account prices when the key is missing" behaviour.
+The FMP call is ``/api/v3/quote`` through ``fmp_http_get``, the StockScreener's quote call: a
+429/5xx is retried with backoff (5/15/30 s) behind the GLOBAL FMP rate-limit gate, so a
+market-open burst waits for the limit to clear instead of leaving symbols unpriced.
 
 Live-only: used by broker accounts to price instruments NOW. FMP ``/quote`` carries a last
 ``price`` and a ``timestamp`` but NO bid/ask, so this helper yields a last price only.
 
 Rules (CLAUDE.md "Live Data - No Fallbacks"): a symbol FMP does not return, returns with a
-non-positive / non-numeric price, returns STALE, or whose chunk fails, is ABSENT from the
-result and named in a log line. Nothing here ever substitutes another source, and the result
-is never cached (callers own the price-cache TTL).
+non-positive / non-numeric price, returns STALE, or whose chunk fails (after the retries), is
+ABSENT from the result and named in a log line. Nothing here ever substitutes another source, and
+the result is never cached here: the account price cache (``PRICE_CACHE_TIME``) owns the TTL, as
+it did for the Alpaca feed.
 
 Staleness (row ``timestamp``, epoch seconds), judged against the NYSE calendar:
   * regular session open: the quote must be <= 15 min old; during the first 15 min of the
@@ -20,20 +21,23 @@ Staleness (row ``timestamp``, epoch seconds), judged against the NYSE calendar:
   * otherwise: the quote must be at/after the most recent FINISHED session close minus 5 min.
 Holidays, weekends and half days come from the calendar data.
 
-No retry sleeps: a 429/error dict makes the chunk unpriced at once (a price call must never
-block for 15-60 s).
+A price call can therefore block up to ~50 s plus the gate while FMP is rate-limited
+(2026-10-28: the single-attempt version left ~480 Monday-open analyses unpriced).
 """
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, List, Optional
 
 from ba2_common.config import get_app_setting
 from ba2_common.core.market_calendar import NY_TZ, nyse_regular_sessions
-from ba2_providers.fmp_common import FMPError, FMPHermeticViolation, fmp_list_call, redact
+from ba2_providers.fmp_common import (FMPError, FMPHermeticViolation, _fmp_error_message,
+                                      fmp_http_get, redact)
 
 from ..logger import logger
 
 FMP_QUOTE_BATCH = 100
+FMP_QUOTE_URL = "https://financialmodelingprep.com/api/v3/quote"
 MAX_AGE_OPEN_SESSION = timedelta(minutes=15)
 CLOSE_TOLERANCE = timedelta(minutes=5)
 
@@ -77,9 +81,23 @@ def _to_fmp(symbol: str) -> str:
     return symbol.upper().replace(".", "-")
 
 
-def _fmpsdk_quote(api_key: str, symbols: List[str]):
-    import fmpsdk
-    return fmpsdk.quote(apikey=api_key, symbol=symbols)
+def _fmp_http_quote(api_key: str, symbols: List[str], *, getter: Optional[Callable] = None,
+                    sleep: Callable[[float], None] = time.sleep):
+    """``/quote`` rows for ``symbols`` (one request, retried with backoff on 429/5xx)."""
+    resp = fmp_http_get(f"{FMP_QUOTE_URL}/{','.join(symbols)}", params={"apikey": api_key},
+                        endpoint="quote", timeout=15, getter=getter, sleep=sleep)
+    return resp.json()
+
+
+def _quote_rows(payload) -> list:
+    """The row list of a ``/quote`` payload; an FMP error dict (or another shape) is ``FMPError``."""
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict) and _fmp_error_message(payload) is not None:
+        raise FMPError(f"FMP quote error: {_fmp_error_message(payload)}")
+    raise FMPError(f"FMP quote returned an unexpected {type(payload).__name__} payload")
 
 
 def _oldest_acceptable(now: datetime) -> datetime:
@@ -133,11 +151,11 @@ def fetch_fmp_last_prices(symbols: Iterable[str], *, api_key: Optional[str] = No
         back.setdefault(_to_fmp(s), []).append(s)
     fmp_syms = list(back)
     result: Dict[str, float] = {}
-    call = quote_fn or _fmpsdk_quote
+    call = quote_fn or _fmp_http_quote
     for i in range(0, len(fmp_syms), FMP_QUOTE_BATCH):
         chunk = fmp_syms[i:i + FMP_QUOTE_BATCH]
         try:
-            rows = fmp_list_call(lambda: call(key, chunk), endpoint="quote", delays=())
+            rows = _quote_rows(call(key, chunk))
         except FMPHermeticViolation:
             raise
         except Exception as e:  # noqa: BLE001 -- the chunk symbols are reported unpriced

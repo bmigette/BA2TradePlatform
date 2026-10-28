@@ -152,15 +152,59 @@ def test_hermetic_violation_is_never_swallowed():
         fetch(["AAPL"], hermetic)
 
 
-def test_rate_limit_error_dict_returns_fast_without_sleeping(monkeypatch):
-    """A 429 (FMP error dict) must not sleep 15-60 s inside a price call."""
-    import time
+def test_error_dict_payload_is_an_unpriced_chunk():
+    """A 200 carrying an FMP error dict (not a retryable HTTP status) leaves the chunk unpriced."""
+    assert fetch(["AAPL"], lambda k, s: {"Error Message": "Limit Reach . Please upgrade"}) == {}
+
+
+class _Resp:
+    def __init__(self, status, body=None):
+        self.status_code, self._body, self.headers, self.content = status, body, {}, b"x"
+
+    def json(self):
+        return self._body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+@pytest.fixture
+def fmp_gate(monkeypatch):
+    """Virtual clock for the global FMP gate, so the backoff sleeps cost no wall time."""
+    from ba2_providers import fmp_common as fc
+    clock = [0.0]
+    monkeypatch.setattr(fc, "_now", lambda: clock[0])
+    monkeypatch.setattr(fc, "_GATE_UNTIL", 0.0)
     slept = []
-    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
-    start = time.monotonic()
-    out = fetch(["AAPL"], lambda k, s: {"Error Message": "Limit Reach . Please upgrade"})
-    assert out == {}
-    assert slept == [] and time.monotonic() - start < 2
+
+    def sleep(s):
+        slept.append(s)
+        clock[0] += s
+    return sleep, slept
+
+
+def test_rate_limited_quote_is_retried_with_backoff(fmp_gate):
+    """2026-10-28: a Monday-open 429 left ~480 analyses unpriced; the quote now waits and retries."""
+    sleep, slept = fmp_gate
+    answers = iter([_Resp(429), _Resp(429), _Resp(200, [{"symbol": "AAPL", "price": 190.0}])])
+    urls = []
+
+    def getter(url, params=None, timeout=None):
+        urls.append(url)
+        return next(answers)
+
+    rows = flp._fmp_http_quote("k", ["AAPL", "MSFT"], getter=getter, sleep=sleep)
+    assert rows == [{"symbol": "AAPL", "price": 190.0}]
+    assert urls == [f"{flp.FMP_QUOTE_URL}/AAPL,MSFT"] * 3
+    assert sum(slept) >= 5 + 15
+
+
+def test_quote_still_failing_after_retries_is_unpriced(fmp_gate):
+    sleep, slept = fmp_gate
+    call = lambda k, s: flp._fmp_http_quote(k, s, getter=lambda *a, **kw: _Resp(429), sleep=sleep)
+    assert fetch(["AAPL"], call) == {}
+    assert sum(slept) >= 5 + 15 + 30
 
 
 # ------------------------------------------------------------ staleness
@@ -342,6 +386,21 @@ def test_none_price_is_not_cached_by_the_account_price_cache():
         assert acct.get_instrument_current_price("AAPL", "mid") is None
         assert acct.get_instrument_current_price(["AAPL"], "mid") == {"AAPL": None}
     assert AlpacaAccount._GLOBAL_PRICE_CACHE.get(acct.id, {}) == {}
+
+
+@pytest.mark.parametrize("ptype", ["bid", "mid", "mark"])
+def test_fmp_feed_shares_one_cache_entry_across_last_price_types(ptype):
+    """bid/mid/mark are the same FMP last price: one FMP request serves all of them."""
+    acct = _acct("fmp")
+    AlpacaAccount._GLOBAL_PRICE_CACHE.pop(acct.id, None)
+    with _with_feed("fmp"), patch(
+            "ba2_trade_platform.modules.accounts.AlpacaAccount.fetch_fmp_last_prices",
+            return_value={"AAPL": 190.0}) as f:
+        assert acct.get_instrument_current_price("AAPL") == 190.0
+        assert acct.get_instrument_current_price("AAPL", ptype) == 190.0
+        assert acct.get_instrument_current_price(["AAPL"], ptype) == {"AAPL": 190.0}
+    assert f.call_count == 1
+    AlpacaAccount._GLOBAL_PRICE_CACHE.pop(acct.id, None)
 
 
 def test_penny_live_prices_all_none_without_key_and_callers_use_get():

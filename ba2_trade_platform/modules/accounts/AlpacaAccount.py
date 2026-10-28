@@ -2891,6 +2891,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         
         return results
 
+    def get_instrument_current_price(self, symbol_or_symbols, price_type='bid'):
+        """The cached price read (base class), with ONE cache entry per symbol on the fmp feed: FMP
+        /quote has a last price only, so 'bid'/'mid'/'mark'/... are the same figure and must not each
+        cost an FMP request. 'ask' keeps its own key and is refused by the implementation."""
+        if price_type != 'ask' and (self.settings.get("data_feed") or "fmp").lower() == "fmp":
+            price_type = 'bid'
+        return super().get_instrument_current_price(symbol_or_symbols, price_type=price_type)
+
     def _fmp_current_price(self, symbol_or_symbols):
         """FMP last price(s); None for any symbol FMP did not price (never another source)."""
         single = isinstance(symbol_or_symbols, str)
