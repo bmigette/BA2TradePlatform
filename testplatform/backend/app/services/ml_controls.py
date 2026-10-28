@@ -10,6 +10,12 @@ say where a signal lives, each keeping the score distribution intact:
   unchanged. It destroys a TIMING signal (score high on the days the name does well) and leaves a persistent
   name-level signal (a symbol that always scores high and always does well) untouched.
 
+* ``shuffle_time_within_block``: the scores of every symbol are permuted across its sessions INSIDE each walk-forward
+  block (a ``block`` column naming the model that scored the row). Block-level information survives (which model, how
+  confident it was on average, a regime the block sits in), only the day-to-day placement is destroyed. A timing model
+  whose "in" share merely tracks the regime keeps its metric under this null although the full ``shuffle_time`` would
+  wipe it out: it is the STRICTER of the two timing nulls, and the one to gate on together with ``shuffle_time``.
+
 ``controls_report`` puts a metric of the real scores beside the same metric over 20 seeds of each shuffle (and the
 model's empirical rank / one-sided p-value among them) and, when their score frames are passed, the naive momentum
 and linear baselines. A real signal sits far from the shuffle distribution; a model that merely re-discovers a
@@ -23,7 +29,7 @@ before the shuffle would keep describing the unshuffled scores and make the cont
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -33,8 +39,8 @@ from app.services.ml_eval import flat
 _OUTCOMES = ("ret", "rel_ret", "vol")
 
 
-def _permute_within(df: pd.DataFrame, by: str, seed: int) -> pd.DataFrame:
-    """Copy of ``flat(df)`` whose ``score`` is permuted within each group of ``by``. Groups are visited in sorted
+def _permute_within(df: pd.DataFrame, by: Union[str, List[str]], seed: int) -> pd.DataFrame:
+    """Copy of ``flat(df)`` whose ``score`` is permuted within each group of ``by`` (a column or a list of columns). Groups are visited in sorted
     order and rows within a group in (session, symbol) order, so the result depends only on the data and the seed."""
     d = flat(df, ("score",))
     rng = np.random.default_rng(seed)
@@ -55,8 +61,16 @@ def shuffle_time(preds: pd.DataFrame, seed: int) -> pd.DataFrame:
     return _permute_within(preds, "symbol", seed)
 
 
-def _join(preds: pd.DataFrame, outcomes: pd.DataFrame) -> pd.DataFrame:
-    p = flat(preds, ("score",))[["symbol", "session", "score"]]
+def shuffle_time_within_block(preds: pd.DataFrame, seed: int, block_col: str = "block") -> pd.DataFrame:
+    """Permute each symbol's ``score`` across its sessions within each block (``block_col``): the per-(symbol, block)
+    score multiset is preserved. Refuses a frame without the block column."""
+    if block_col not in preds.columns:
+        raise ValueError(f"the within-block shuffle needs a {block_col!r} column (the walk-forward block of each row)")
+    return _permute_within(preds, ["symbol", block_col], seed)
+
+
+def _join(preds: pd.DataFrame, outcomes: pd.DataFrame, extra: Sequence[str] = ()) -> pd.DataFrame:
+    p = flat(preds, ("score", *extra))[["symbol", "session", "score", *extra]]
     o = flat(outcomes)
     cols = [c for c in _OUTCOMES if c in o.columns]
     if not cols:
@@ -89,7 +103,7 @@ def _summary(values: Sequence[float], model: float) -> Dict[str, Any]:
 
 def controls_report(preds: pd.DataFrame, outcomes: pd.DataFrame, metric_fn: Callable[[pd.DataFrame], float],
                     seeds: Sequence[int] = DEFAULT_SEEDS, naive: Optional[pd.DataFrame] = None,
-                    linear: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+                    linear: Optional[pd.DataFrame] = None, within_block: bool = False) -> Dict[str, Any]:
     """The model's metric beside its controls.
 
     ``preds`` / ``naive`` / ``linear``: frames with ``symbol``, ``session``, ``score``; ``outcomes``: ``symbol``,
@@ -99,14 +113,14 @@ def controls_report(preds: pd.DataFrame, outcomes: pd.DataFrame, metric_fn: Call
     there, e.g. momentum before its window fills, simply has NaN on that row and the metric skips it).
 
     Returns ``{"model": m, "shuffle_symbols": {mean, std, values, rank, p_value}, "shuffle_time": {...},
-    "seeds": [...]}`` plus ``"naive"`` / ``"linear"`` (floats) when their frames are passed. ``std`` is across seeds
+    "seeds": [...]}`` plus ``"shuffle_time_within_block"`` (``within_block=True``; ``preds`` needs a ``block`` column) plus ``"naive"`` / ``"linear"`` (floats) when their frames are passed. ``std`` is across seeds
     (ddof 1); ``rank`` / ``p_value`` are the model's among the shuffles (``empirical_rank``). The frames handed to
     ``metric_fn`` are already in ``ml_eval.flat`` layout, so a metric may be built with ``assume_flat=True``.
     ``metric_fn`` is applied to every shuffled frame: for a timing metric use ``timing_metric(q=...)`` (module
     docstring)."""
     if not len(seeds):
         raise ValueError("need at least one seed")
-    base = _join(preds, outcomes)
+    base = _join(preds, outcomes, ("block",) if within_block else ())
     outcome_cols = [c for c in _OUTCOMES if c in base.columns]
     base = base.dropna(subset=["score", *outcome_cols]).reset_index(drop=True)
     if base.empty:
@@ -115,6 +129,9 @@ def controls_report(preds: pd.DataFrame, outcomes: pd.DataFrame, metric_fn: Call
     report: Dict[str, Any] = {"model": model, "seeds": [int(s) for s in seeds]}
     report["shuffle_symbols"] = _summary([metric_fn(shuffle_symbols(base, s)) for s in seeds], model)
     report["shuffle_time"] = _summary([metric_fn(shuffle_time(base, s)) for s in seeds], model)
+    if within_block:
+        report["shuffle_time_within_block"] = _summary(
+            [metric_fn(shuffle_time_within_block(base, s)) for s in seeds], model)
     for name, frame in (("naive", naive), ("linear", linear)):
         if frame is None:
             continue
