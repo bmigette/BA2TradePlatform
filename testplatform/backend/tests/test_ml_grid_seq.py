@@ -554,3 +554,95 @@ def test_a_failure_in_one_lane_stops_the_other_and_propagates(world, tmp_path, m
     monkeypatch.setattr(G, "_drive_pool", drive)
     with pytest.raises(OSError, match="disk full"):
         grun([lgbm_cell(world), tsai_cell(world)], tmp_path / "o", world, inline=False, cpu_slots=1, gpu_slots=1)
+
+
+# ================================================================== the darts target series
+def shock_world(world, root: Path, seed: int = 5):
+    """A copy of ``world`` whose DAILY bars of every symbol carry the same market shock: each session's open / high /
+    low / close of every symbol is multiplied by one common factor (a random walk's level). The store and the 5-minute
+    bars are untouched."""
+    stores, _, cache = world
+    new_cache, new_stores = root / "cache", root / "stores"
+    shutil.copytree(cache, new_cache)
+    shutil.copytree(stores, new_stores)
+    rng = np.random.default_rng(seed)
+    level = None
+    for f in sorted((new_cache / "AlpacaHistoryOHLCVProvider").glob("*_1d.parquet")):
+        df = pd.read_parquet(f)
+        if level is None:
+            level = np.exp(np.cumsum(rng.normal(0, 0.02, len(df))))             # one factor per session, shared
+        for c in ("Open", "High", "Low", "Close"):
+            df[c] = df[c].to_numpy() * level
+        df.to_parquet(f, index=False)
+    return new_stores, new_stores / "stocks", new_cache
+
+
+def _daily_panel(world):
+    return G.get_panel(str(world[0]), tuple(sorted(GSYMS)), "selection", str(world[2]))
+
+
+def _seq(panel, neutral):
+    cols = panel.group_columns(("t",))
+    fit = np.flatnonzero(panel.ok)[:600]
+    return S.daily_sequence_data(panel, cols, fit, 10, 5, neutral=neutral)
+
+
+def test_the_rel_return_series_is_the_log_return_minus_the_decidable_universes_mean(world):
+    panel = _daily_panel(world)
+    own, neutral = _seq(panel, False), _seq(panel, True)
+    n_sym, n_s = len(panel.symbols), len(panel.arrays.sessions)
+    r_own = own.returns.reshape(n_sym, n_s)
+    r_neu = neutral.returns.reshape(n_sym, n_s)
+    a = panel.arrays
+    member = (a.tradable & np.isfinite(a.atr_pct)).T                              # the ml_targets membership at S
+    assert member[:, 60:].all()                                                   # past the ATR warm-up every name counts
+    t = 100
+    np.testing.assert_allclose(r_neu[:, t], r_own[:, t] - r_own[member[:, t], t].mean(), atol=1e-12)
+    assert abs(r_neu[:, 80:].mean(axis=0)).max() < 1e-12                           # the session mean is removed
+    assert np.abs(r_neu - r_own).max() > 1e-4                                      # and it is not the own series
+    assert neutral.series_start.tolist() == own.series_start.tolist() and neutral.horizon_steps == 5
+
+
+def test_a_common_market_shock_leaves_the_rel_return_series_unchanged_and_moves_the_own_series(world, tmp_path):
+    shocked = shock_world(world, tmp_path / "shock")
+    a, b = _daily_panel(world), _daily_panel(shocked)
+    np.testing.assert_allclose(_seq(a, True).returns, _seq(b, True).returns, atol=1e-9)
+    assert np.abs(_seq(a, False).returns - _seq(b, False).returns).max() > 1e-3     # the timing series feels the shock
+
+
+def test_a_common_market_shock_leaves_the_rel_return_scores_unchanged(world, tmp_path, darts_run):
+    shocked = shock_world(world, tmp_path / "shock")
+    out = tmp_path / "o"
+    grun([darts_cell(shocked)], out, shocked)
+    a, b = _preds(darts_run[0]), _preds(out)
+    assert a.index.equals(b.index) and len(a) > 100
+    np.testing.assert_allclose(a["score"].to_numpy(), b["score"].to_numpy(), atol=1e-4)
+    assert G.read_results(out / "results.jsonl")[0]["blocks"][0]["target_series"] == "market_neutral"
+
+
+def test_the_quantile_kind_keeps_the_own_return_series(world, tmp_path, monkeypatch):
+    seen = []
+    real = S.daily_sequence_data
+    monkeypatch.setattr(S, "daily_sequence_data", lambda *a, **k: (seen.append(k["neutral"]), real(*a, **k))[1])
+    out = tmp_path / "o"
+    grun([darts_cell(world, target={"kind": "quantile", "horizon": 5})], out, world)
+    assert seen and not any(seen)
+    assert G.read_results(out / "results.jsonl")[0]["blocks"][0]["target_series"] == "own_return"
+
+
+def test_the_rel_return_kind_asks_for_the_neutral_series(world, tmp_path, monkeypatch):
+    seen = []
+    real = S.daily_sequence_data
+    monkeypatch.setattr(S, "daily_sequence_data", lambda *a, **k: (seen.append(k["neutral"]), real(*a, **k))[1])
+    grun([darts_cell(world)], tmp_path / "o", world)
+    assert seen and all(seen)
+
+
+def test_a_gpu_block_runs_with_deterministic_cudnn(world, tmp_path):
+    """On the GPU the same seed only repeats bit for bit with cudnn.deterministic and no autotuning (the adapters leave
+    these process-wide flags to the caller: the grid's GPU blocks set them)."""
+    import torch
+    torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = False, True
+    grun([tsai_cell(world)], tmp_path / "o", world)
+    assert torch.backends.cudnn.deterministic is True and torch.backends.cudnn.benchmark is False
+    assert torch.are_deterministic_algorithms_enabled() and os.environ["CUBLAS_WORKSPACE_CONFIG"]

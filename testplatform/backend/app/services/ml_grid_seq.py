@@ -19,13 +19,31 @@ tsai (``fit_block_seq`` with a ``tsai-*`` family)
 
 darts (``fit_block_seq`` with a ``darts-*`` family)
     * The daily store frame: the cell's groups of ``panel.X`` (robust-scaled on the fit rows, NaN as 0) are the past
-      covariates, the daily log return of the close is the target series (``daily_sequence_data``); one series per
-      symbol, a global model over all of them. The forecast length is the cell's horizon in daily bars; a row's score is
-      P(up) of the sampled H-day return (``DartsAdapter.score``). The adapter trains on every window of each series'
+      covariates (``daily_sequence_data``); one series per symbol, a global model over all of them. The TARGET series
+      depends on the cell's target kind: ``rel_return`` (selection) models the MARKET-NEUTRAL series, the symbol's daily
+      log return minus the same-session mean log return of the universe members DECIDABLE at that session (listed, not
+      filled, an ATR available: the membership ``ml_targets`` uses for ``rel_ret``; 0 where fewer than
+      ``MIN_SESSION_MEMBERS`` members), so P(up) means "beats the universe" and a shock common to every symbol cancels;
+      ``quantile`` (timing) keeps the symbol's own log return. The forecast length is the cell's horizon in daily bars; a
+      row's score is P(up) of the sampled H-day return (``DartsAdapter.score``). The adapter trains on every window of each series'
       span between the first fit row and the last fit row + horizon; the purge guarantees those targets end before the
       validation block (the adapter refuses otherwise).
 
-Both: epochs are capped by ``GridSettings.gpu_max_epochs`` (early stopping on the train-tail validation block only,
+Defaults and limits (``GridSettings``; the values enter a GPU row's identity, so changing one makes a resume refuse the
+old rows). ``seq_lookback`` 35 one-hour bars (5 sessions), ``seq_samples_per_session`` 4 bars per (symbol, session) of a
+training session, ``darts_lookback`` 20 daily bars, ``gpu_max_epochs`` 15, ``gpu_budget_minutes`` 20 per (cell, seed) (a
+run setting, checked between blocks: a fit that is already running is never interrupted).
+Blocks the intraday panel cannot serve: the real 5-minute cache starts on 2019-01-02 and the daily-context features
+need a 200-session warm-up, so the first usable 1h bar is around November 2019. A tsai block whose training sessions
+have no such bars is skipped (``SkipBlock``), and a block's test sessions without one are not scored: the 2019 blocks
+of a tsai cell therefore score few or no rows and lower its block coverage. (darts reads the daily store, which starts
+in 2016, and has no such gap.)
+``n_iter`` of a GPU block is None: epochs are not boosting rounds, so ``low_iter_share`` is None and the near-constant
+flag of the report never applies to these cells; the epochs are in the block audit (``epochs_run``, ``best_epoch``,
+``val_loss``).
+
+Both: the process-wide cuDNN flags are set deterministic (``cudnn.deterministic``, no ``benchmark``) before every block
+(the adapters leave them to the caller); TF32 stays at PyTorch's defaults. Epochs are capped by ``GridSettings.gpu_max_epochs`` (early stopping on the train-tail validation block only,
 never on test data), the seed goes to python / numpy / torch and to ``sample_bars``, the adapter is ``release()``d after
 every block (also when the fit fails), and the fit time, device, epochs and sample counts of every block are recorded.
 """
@@ -33,6 +51,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import random
 import time
 import warnings
@@ -49,6 +68,7 @@ from app.services import ml_grid as G
 from app.services import ml_models as M
 from app.services import ml_models_seq as MS
 from app.services import ml_panel as MP
+from app.services import ml_targets as T
 
 logger = logging.getLogger(__name__)
 
@@ -127,11 +147,25 @@ def get_intraday(panel: "G.Panel", st: "G.GridSettings") -> IntradayPanel:
 
 
 # ================================================================== the darts input
-def daily_sequence_data(panel: "G.Panel", cols: List[int], fit_rows: np.ndarray, lookback: int,
-                        horizon: int) -> MS.SequenceData:
+def market_neutral_returns(ret: np.ndarray, finite: np.ndarray, member: np.ndarray) -> np.ndarray:
+    """``ret`` (sessions, symbols) minus the same-session mean over the ``member`` symbols with a finite return; 0 where
+    there is no return or fewer than ``T.MIN_SESSION_MEMBERS`` members to average (the ``rel_ret`` rule of
+    ``ml_targets``)."""
+    use = member & finite
+    n = use.sum(axis=1)
+    total = np.where(use, ret, 0.0).sum(axis=1)
+    mean = np.where(n >= T.MIN_SESSION_MEMBERS, total / np.maximum(n, 1), np.nan)
+    out = np.where(finite & np.isfinite(mean)[:, None], ret - mean[:, None], 0.0)
+    return out
+
+
+def daily_sequence_data(panel: "G.Panel", cols: List[int], fit_rows: np.ndarray, lookback: int, horizon: int,
+                        neutral: bool = False) -> MS.SequenceData:
     """``SequenceData`` of the daily store frame: the ``cols`` of ``panel.X`` robust-scaled on ``fit_rows`` only (median /
-    IQR, clipped at +-5, NaN -> 0), the daily log return of the close as the target series (0 where there is no print),
-    one series per symbol (``series_start`` = the symbol's first usable row). Rows are the panel's own (symbol-major)."""
+    IQR, clipped at +-5, NaN -> 0), the target series (0 where there is no print), one series per symbol
+    (``series_start`` = the symbol's first usable row). Rows are the panel's own (symbol-major). The series is the daily
+    log return of the close, or with ``neutral`` that return minus the same-session mean of the universe members
+    decidable at the session (``market_neutral_returns``): a common market shock then leaves it unchanged."""
     X = panel.X[:, cols].astype(np.float32)
     fit = X[np.asarray(fit_rows, dtype=np.int64)].astype(np.float64)
     with warnings.catch_warnings():
@@ -147,9 +181,14 @@ def daily_sequence_data(panel: "G.Panel", cols: List[int], fit_rows: np.ndarray,
     close = np.asarray(panel.arrays.close, dtype=np.float64)           # (sessions, symbols)
     with np.errstate(all="ignore"):
         lr = np.log(close)
-        ret = np.zeros_like(lr)
+        ret = np.full_like(lr, np.nan)
         ret[1:] = lr[1:] - lr[:-1]
-    ret[~np.isfinite(ret)] = 0.0
+    finite = np.isfinite(ret)
+    if neutral:
+        a = panel.arrays
+        ret = market_neutral_returns(ret, finite, np.asarray(a.tradable, dtype=bool) & np.isfinite(a.atr_pct))
+    else:
+        ret = np.where(finite, ret, 0.0)
     n_s, n_sym = close.shape
     ok = np.asarray(panel.ok, dtype=bool).reshape(n_sym, n_s)
     first = np.where(ok.any(1), ok.argmax(1), n_s) + np.arange(n_sym) * n_s
@@ -189,6 +228,9 @@ def fit_block_seq(cell: "G.Cell", seed: int, panel: "G.Panel", br: "G.BlockRows"
     """Fit the cell's deep family on the purged window before ``block`` and score the block's daily rows."""
     import torch
     torch.set_num_threads(max(1, int(n_jobs)))
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")              # read when cuBLAS first runs in the process
+    torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = True, False    # bitwise repeatable on the GPU
+    torch.use_deterministic_algorithms(True, warn_only=True)
     seed_everything(seed)
     base, params = _adapter_params(cell, st)
     adapter = M.make_adapter(base, n_jobs, params)
@@ -248,7 +290,8 @@ def _tsai_block(cell, seed, panel, br, st, adapter) -> Tuple[np.ndarray, np.ndar
 def _darts_block(cell, seed, panel, br, st, adapter) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     H, L = cell.horizon, st.darts_lookback
     cols = panel.group_columns(cell.groups)
-    data = daily_sequence_data(panel, cols, br.fit_idx, L, H)
+    neutral = cell.kind == "rel_return"
+    data = daily_sequence_data(panel, cols, br.fit_idx, L, H, neutral=neutral)
     mt, mv, mp = _usable(data, br.fit_idx), _usable(data, br.val_idx), _usable(data, br.pr)
     if mt.sum() < 2 or not mv.any():
         raise G.SkipBlock(f"too few usable daily windows (train {int(mt.sum())}, validation {int(mv.sum())})")
@@ -259,5 +302,6 @@ def _darts_block(cell, seed, panel, br, st, adapter) -> Tuple[np.ndarray, np.nda
     adapter.fit(Xt, br.y_all[fit_rows], Xv, br.y_all[val_rows], "quantile", int(seed))
     scores = adapter.score(Xp)
     extra = {"n_fit": int(len(Xt)), "n_val": int(len(Xv)), "n_samples": int(len(Xt)), "n_channels": int(data.n_channels),
-             "lookback": L, "horizon_steps": H, "n_series": int(len(np.unique(Xt.series_start[Xt.rows])))}
+             "lookback": L, "horizon_steps": H, "n_series": int(len(np.unique(Xt.series_start[Xt.rows]))),
+             "target_series": "market_neutral" if neutral else "own_return"}
     return br.pr[mp], scores, extra

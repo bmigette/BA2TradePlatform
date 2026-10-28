@@ -1809,3 +1809,57 @@ def test_report_only_returns_before_the_grid_runner_is_imported():
     import ba2test_launcher as L
     src = inspect.getsource(L._cmd_ml_grid)
     assert src.index("report_only") < src.index("from app.services.ml_grid import")
+
+
+# ------------------------------------------------------------------ --eval-start / --eval-end
+def _cli_payload(monkeypatch, tmp_path, *extra):
+    import ba2test_launcher as L
+    import app.services.ml_grid as grid
+    seen = {}
+
+    def fake(task_id, payload):
+        seen.update(payload)
+        return {"done": 0, "errors": 0, "skipped_existing": 0, "cancelled": False, "out_dir": str(tmp_path)}
+    monkeypatch.setattr(grid, "handle_ml_grid", fake)
+    code = L.main(["ml-grid", "--config", "c.json", "--out", str(tmp_path), "--cpu-slots", "1", *extra])
+    return code, seen
+
+
+def test_the_cli_passes_the_eval_window_as_settings(monkeypatch, tmp_path):
+    _, seen = _cli_payload(monkeypatch, tmp_path, "--eval-start", "2025-01-01", "--eval-end", "2025-10-12")
+    assert seen["settings"] == {"eval_start": "2025-01-01", "eval_end": "2025-10-12"}
+    G.GridSettings.from_dict({**seen["settings"], "cores": 2})                 # and the runner accepts it
+    _, seen = _cli_payload(monkeypatch, tmp_path, "--eval-start", "2024-01-01")
+    assert seen["settings"] == {"eval_start": "2024-01-01"}
+    _, seen = _cli_payload(monkeypatch, tmp_path, "--eval-end", "2025-12-31")
+    assert seen["settings"] == {"eval_end": "2025-12-31"}
+    _, seen = _cli_payload(monkeypatch, tmp_path)
+    assert seen["settings"] is None
+
+
+@pytest.mark.parametrize("args, msg", [
+    (("--eval-start", "2025/01/01"), "eval-start"),
+    (("--eval-start", "not-a-date"), "eval-start"),
+    (("--eval-end", "2025-13-40"), "eval-end"),
+    (("--eval-start", "2015-12-31"), "outside"),
+    (("--eval-start", str(G.DATA_START)), "outside"),                          # the window must start after the data does
+    (("--eval-end", "2026-10-13"), "outside"),
+    (("--eval-end", "2015-01-01"), "outside"),
+    (("--eval-start", "2025-06-01", "--eval-end", "2025-06-01"), "before"),
+    (("--eval-start", "2025-06-01", "--eval-end", "2025-01-01"), "before"),
+    (("--eval-start", "2026-10-12"), "before"),                                 # the default end is 2026-10-12
+])
+def test_the_cli_refuses_a_bad_eval_window(monkeypatch, tmp_path, capsys, args, msg):
+    import ba2test_launcher as L
+    import app.services.ml_grid as grid
+    monkeypatch.setattr(grid, "handle_ml_grid", lambda *a, **k: pytest.fail("must refuse before running"))
+    with pytest.raises(SystemExit) as e:
+        L.main(["ml-grid", "--config", "c.json", "--out", str(tmp_path), "--cpu-slots", "1", *args])
+    assert e.value.code != 0
+    text = str(e.value.code) + capsys.readouterr().err
+    assert msg in text
+
+
+def test_the_eval_bounds_are_inclusive_at_the_limits(monkeypatch, tmp_path):
+    _, seen = _cli_payload(monkeypatch, tmp_path, "--eval-start", "2016-01-05", "--eval-end", str(G.EVAL_END))
+    assert seen["settings"] == {"eval_start": "2016-01-05", "eval_end": str(G.EVAL_END)}

@@ -9170,6 +9170,32 @@ def _ml_features_sector_overrides(items, no_sector: bool, symbols) -> dict:
     return overrides
 
 
+def _ml_grid_eval_settings(args):
+    """``{"eval_start": ..., "eval_end": ...}`` (only the given ones) from ``--eval-start`` / ``--eval-end``, None when
+    neither is given. Dates must be ISO ``YYYY-MM-DD``, inside (DATA_START, EVAL_END] -- the evaluation starts after the
+    history does and never past the last day of the data -- and the start before the end."""
+    from datetime import date as _date
+    from app.services import ml_grid as _g
+    raw = {"eval_start": getattr(args, "eval_start", None), "eval_end": getattr(args, "eval_end", None)}
+    given, parsed = {}, {}
+    for key, text in raw.items():
+        if text is None:
+            continue
+        flag = "--" + key.replace("_", "-")
+        try:
+            parsed[key] = _date.fromisoformat(text)
+        except ValueError:
+            raise SystemExit(f"ml-grid: {flag} must be a date YYYY-MM-DD, got {text!r}")
+        if not _g.DATA_START < parsed[key] <= _g.EVAL_END:
+            raise SystemExit(f"ml-grid: {flag} {text} is outside the allowed range: after {_g.DATA_START} (the data "
+                             f"start) and up to {_g.EVAL_END}")
+        given[key] = text
+    start, end = parsed.get("eval_start", _g.EVAL_START), parsed.get("eval_end", _g.EVAL_END)
+    if given and not start < end:
+        raise SystemExit(f"ml-grid: --eval-start ({start}) must be before --eval-end ({end})")
+    return given or None
+
+
 def _cmd_ml_grid(args) -> int:
     """Stage-1 grid of the ML exploration v2 (task type ``ml_grid``, app/services/ml_grid.py): every cell of --config x
     its seeds as out-of-sample walk-forward signals, scored per track with shuffle controls. Resumes: finished
@@ -9181,7 +9207,7 @@ def _cmd_ml_grid(args) -> int:
         raise SystemExit("ml-grid: --config, --out and --cpu-slots are required unless --report-only DIR is given")
     payload = {"config_path": args.config, "cells": None, "out_dir": args.out, "cpu_slots": args.cpu_slots,
                "gpu_slots": args.gpu_slots, "limit_cells": args.limit_cells, "cache_root": args.cache_root,
-               "settings": None, "cores": args.cores if args.cores is not None else (os.cpu_count() or 1),
+               "settings": _ml_grid_eval_settings(args), "cores": args.cores if args.cores is not None else (os.cpu_count() or 1),
                "rerun_mismatched": args.rerun_mismatched}
     try:
         res = handle_ml_grid("cli-ml-grid", payload)
@@ -10139,6 +10165,10 @@ def main(argv: "list | None" = None) -> int:
     mg.add_argument("--rerun-mismatched", action="store_true",
                     help="Rows in --out/results.jsonl made under other settings or data are moved to results.stale.jsonl "
                          "and recomputed (default: refuse).")
+    mg.add_argument("--eval-start", default=None, metavar="YYYY-MM-DD",
+                    help="First day of the out-of-sample evaluation (default 2019-01-01); after the data start, before --eval-end.")
+    mg.add_argument("--eval-end", default=None, metavar="YYYY-MM-DD",
+                    help="Last day of the evaluation (default and latest 2026-10-12).")
     mg.add_argument("--cores", type=int, default=None, help="Logical cores to share: n_jobs per fit = cores // cpu-slots (default: all).")
 
     # ml-features: the point-in-time daily feature store of the ML exploration v2.
