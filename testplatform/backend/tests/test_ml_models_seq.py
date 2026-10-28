@@ -741,3 +741,60 @@ def test_darts_tcn_needs_a_lookback_longer_than_the_horizon():
     with pytest.raises(ValueError, match="tcn"):
         MM.make_adapter("darts", params={**DFAST, "arch": "tcn"}).fit(Xt, yt, Xv, yv, task="quantile", seed=1)
     MM.make_adapter("darts", params={**DFAST, "arch": "nhits"}).fit(Xt, yt, Xv, yv, task="quantile", seed=1)
+
+
+# ------------------------------------------------------------------ GPU release and the device feature cache
+def _gpu_bytes():
+    import gc
+    gc.collect()
+    torch.cuda.synchronize()
+    return torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
+
+
+def _release_case(family):
+    if family == "tsai":
+        d = planted("binary", n_sym=2, n=900)
+        return MM.make_adapter("tsai", params={**FAST, "arch": "tst", "width": 32}), d, "binary"
+    d = darts_data(n=900)
+    return MM.make_adapter("darts", params=DFAST), d, "quantile"
+
+
+@pytest.mark.parametrize("family", ["tsai", "darts"])
+def test_release_returns_gpu_memory_to_the_baseline_and_the_adapter_still_predicts(family):
+    warm, wd, wtask = _release_case(family)           # libraries keep workspaces for good (cuBLAS: 8-16 MB):
+    warm.fit(*wd["train"], *wd["val"], task=wtask, seed=1)      # they belong to the baseline, not to the adapter
+    warm.predict(wd["test"][0])
+    warm.release()
+    del warm, wd
+    torch.cuda.empty_cache()
+    base_alloc, base_res = _gpu_bytes()
+    ad, d, task = _release_case(family)
+    ad.fit(*d["train"], *d["val"], task=task, seed=1)
+    X = d["test"][0]
+    before = ad.predict(X)
+    assert ad._dev_cache and _gpu_bytes()[0] > base_alloc                  # the net and the cached features are resident
+    ad.release()
+    alloc, res = _gpu_bytes()
+    assert alloc - base_alloc < 256 * 1024, (alloc - base_alloc)           # about back to the baseline (bytes)
+    assert res - base_res < 8 * 1024 * 1024, (res - base_res)              # and the cache returned to the driver
+    assert not ad._dev_cache
+    np.testing.assert_allclose(ad.predict(X), before, atol=1e-5)           # the net moves back to the device on use
+    ad.release()
+    ad.release()                                                           # idempotent
+    MM.make_adapter(family).release()                                      # and harmless on an unfitted adapter
+
+
+@pytest.mark.parametrize("family", ["tsai", "darts"])
+def test_the_device_feature_tensor_is_cached_per_feature_array(family):
+    ad, d, task = _release_case(family)
+    ad.fit(*d["train"], *d["val"], task=task, seed=1)
+    X = d["test"][0]
+    ad.predict(X)
+    first = ad._dev_cache["features"][1]
+    ad.predict(X.take(X.rows[:10]))                                        # another SequenceData over the same array
+    ad.predict(X)
+    assert ad._dev_cache["features"][1] is first
+    other = MS.SequenceData(X.features.copy(), X.rows, X.lookback, X.series_start, returns=X.returns,
+                            horizon_steps=X.horizon_steps)
+    ad.predict(other)                                                      # a different array replaces it
+    assert ad._dev_cache["features"][1] is not first

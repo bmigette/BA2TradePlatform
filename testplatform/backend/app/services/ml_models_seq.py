@@ -255,6 +255,7 @@ class _SequenceAdapter(ModelAdapter):
     def _reset(self) -> None:
         super()._reset()
         self.fit_info: Optional[Dict[str, Any]] = None
+        self._dev_cache: Dict[str, Tuple[Any, Any]] = {}
         for attr in ("_net", "_device", "_y_mean", "_y_sd", "_lookback", "_models", "_sd", "_n_out"):
             self.__dict__.pop(attr, None)
 
@@ -276,6 +277,42 @@ class _SequenceAdapter(ModelAdapter):
         if feature_names is not None and Xt.channels and tuple(feature_names) != Xt.channels:
             raise ValueError("feature_names disagree with the SequenceData channels")
         return Xt, Xv
+
+    def _device_tensor(self, name: str, arr: np.ndarray, make):
+        """The device copy of ``arr``, kept between ``predict`` calls while the SAME array object is passed (keyed by a
+        weak reference to the array, so a freed or replaced array can never be mistaken for a cached one). Treat the
+        arrays of a ``SequenceData`` as immutable; ``release()`` drops the copies."""
+        import weakref
+        hit = self._dev_cache.get(name)
+        if hit is not None and hit[0]() is arr:
+            return hit[1]
+        tensor = make(arr)
+        self._dev_cache[name] = (weakref.ref(arr), tensor)
+        return tensor
+
+    def _network_module(self):
+        """The ``torch.nn.Module`` that holds the weights (the Darts wrapper keeps it in ``.model``)."""
+        net = self._net
+        return net.model if self.family == "darts" else net
+
+    def _put_network_on_device(self) -> None:
+        module = self._network_module()
+        if next(module.parameters()).device != self._device:
+            module.to(self._device)
+
+    def release(self) -> None:
+        """Give the GPU memory back: the cached device features go, the network moves to the CPU, and the CUDA caching
+        allocator is emptied. The adapter stays fitted and usable (the next ``predict`` moves the network back).
+        Safe on an unfitted adapter and idempotent. Call it when a fit's predictions are done (the grid runs hundreds
+        of fits in one process)."""
+        import gc
+        import torch
+        self._dev_cache = {}
+        if "_net" in self.__dict__:
+            self._network_module().to("cpu")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _check_predict_input(self, X) -> SequenceData:
         if self.task is None:
@@ -428,7 +465,8 @@ class TsaiAdapter(_SequenceAdapter):
         import torch
         X = self._check_predict_input(X)
         dev, net = self._device, self._net
-        F = torch.as_tensor(X.features, device=dev)
+        self._put_network_on_device()
+        F = self._device_tensor("features", X.features, lambda a: torch.as_tensor(a, device=dev))
         rows = torch.as_tensor(X.rows, device=dev)
         offs = torch.arange(-X.lookback + 1, 1, device=dev)
         outs = []
@@ -665,11 +703,11 @@ class DartsAdapter(_SequenceAdapter):
         import torch
         dev = self._device
         if self.params["arch"] in BATCHED_ARCHS:
-            net = self._net.model
-            net.to(dev)
-            net.eval()
-            return (torch.as_tensor(X.features, device=dev),
-                    torch.as_tensor((X.returns / self._sd).astype(np.float32), device=dev))
+            self._put_network_on_device()
+            self._net.model.eval()
+            return (self._device_tensor("features", X.features, lambda a: torch.as_tensor(a, device=dev)),
+                    self._device_tensor("returns", X.returns,
+                                        lambda a: torch.as_tensor((a / self._sd).astype(np.float32), device=dev)))
         return None, None
 
     def _forecast_quantiles(self, X: SequenceData) -> np.ndarray:
