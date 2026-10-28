@@ -873,18 +873,60 @@ def volatility_metrics(d: pd.DataFrame, H: int, st: GridSettings) -> Tuple[Dict[
     return metrics, regimes, metrics["spearman"]["mean"]
 
 
+def regime_metric(track: str, st: GridSettings) -> Callable[[pd.DataFrame], Dict[str, float]]:
+    """Frame (symbol, session, score + outcomes) -> ``{"all": value, regime: value}`` of the track's primary metric,
+    defined exactly as the row's own ``regimes`` (``selection_metrics`` / ``timing_metrics``): the mean of the daily
+    spread series per regime, resp. the timing excess of the regime's rows under the cutoff computed on the WHOLE frame
+    (after any shuffle, before slicing). A regime with fewer than ``regime_min_rows`` is NaN. Used for the controls so
+    a regime's null is measured the way the regime's value is."""
+    if track == "selection":
+        def selection(d: pd.DataFrame) -> Dict[str, float]:
+            sp = E.quintile_spread(d, st.cost_bps, assume_flat=True)
+            per = E.by_regime(sp.series, lambda s: float(s.mean()), st.regime_min_rows) if len(sp.series) else {}
+            return {**{r: v for r, v in per.items() if r != "all"}, "all": sp.mean}
+        return selection
+
+    def timing(d: pd.DataFrame) -> Dict[str, float]:
+        d = E.with_cutoff(d, st.timing_q, st.min_obs, assume_flat=True)
+        out = {"all": E.timing_excess(d, st.cost_bps, cutoff_col="cutoff", assume_flat=True).excess}
+        names = W.regimes(d["session"])
+        for r in W.REGIMES:
+            if (names == r).any():
+                sub = d[names == r]
+                out[r] = (float("nan") if len(sub) < st.regime_min_rows else
+                          E.timing_excess(sub, st.cost_bps, cutoff_col="cutoff", assume_flat=True).excess)
+        return out
+    return timing
+
+
+def _strict_by_regime(rep: Dict[str, Any], names: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    """Per regime, the gating control that is hardest to beat there: the larger one-sided p among ``names`` (the whole
+    period's rule), with its null mean / std, p, rank and the model's value. A regime where any control has no finite
+    p reports the last control and no p."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for reg in rep[names[0]]["by_regime"]:
+        ents = {n: rep[n]["by_regime"][reg] for n in names}
+        if any(e["p_value"] is None for e in ents.values()):
+            strict, p = names[-1], None
+        else:
+            strict = max(names, key=lambda n: (ents[n]["p_value"], n == names[-1]))
+            p = ents[strict]["p_value"]
+        e = ents[strict]
+        out[reg] = {"control": strict, "null_mean": e["mean"], "null_std": e["std"], "p_value": p, "rank": e["rank"],
+                    "model": e["model"]}
+    return out
+
+
 def run_controls(d: pd.DataFrame, cell: Cell, st: GridSettings) -> Dict[str, Any]:
     if cell.kind == "volatility":
         return {"skipped": "a volatility model is a sizing model: the trading shuffle controls do not apply"}
     if cell.track == "selection":
-        metric = E.spread_metric(cost_bps=st.cost_bps, assume_flat=True)
         outcomes, primary = d[["symbol", "session", "rel_ret", "vol"]], "shuffle_symbols"
     else:
-        metric = E.timing_metric(q=st.timing_q, cost_bps=st.cost_bps, min_obs=st.min_obs, assume_flat=True)
         outcomes, primary = d[["symbol", "session", "ret", "vol"]], "shuffle_time"       # + the within-block null below
     timing = cell.track == "timing"
-    rep = controls_report(d[["symbol", "session", "score"] + (["block"] if timing else [])], outcomes, metric,
-                          seeds=st.control_seeds, within_block=timing)
+    rep = controls_report(d[["symbol", "session", "score"] + (["block"] if timing else [])], outcomes, None,
+                          seeds=st.control_seeds, within_block=timing, regime_fn=regime_metric(cell.track, st))
     names = ("shuffle_time", "shuffle_time_within_block") if timing else (primary,)
     ps = {n: rep[n]["p_value"] for n in names}
     if any(v is None for v in ps.values()):
@@ -895,6 +937,7 @@ def run_controls(d: pd.DataFrame, cell: Cell, st: GridSettings) -> Dict[str, Any
         value = ps[strict]
     rep["primary"], rep["p_value"], rep["rank"] = strict, value, rep[strict]["rank"]
     rep["p_values"] = ps
+    rep["by_regime"] = _strict_by_regime(rep, names)
     return rep
 
 

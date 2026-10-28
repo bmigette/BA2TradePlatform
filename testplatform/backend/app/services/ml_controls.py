@@ -101,9 +101,25 @@ def _summary(values: Sequence[float], model: float) -> Dict[str, Any]:
             "values": [float(x) for x in v], "rank": rank, "p_value": p}
 
 
-def controls_report(preds: pd.DataFrame, outcomes: pd.DataFrame, metric_fn: Callable[[pd.DataFrame], float],
+def _regime_summaries(model: Dict[str, float], per_seed: Sequence[Dict[str, float]]) -> Dict[str, Dict[str, Any]]:
+    """Per regime (every key but ``all``): the shuffles' mean / std / rank / one-sided p-value of the model's value
+    there (same formula as the whole period, ``empirical_rank``) and the model's own value."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for reg in model:
+        if reg == "all":
+            continue
+        vals = [seed_vals[reg] if reg in seed_vals else float("nan") for seed_vals in per_seed]
+        s = _summary(vals, model[reg])
+        out[reg] = {"mean": s["mean"], "std": s["std"], "p_value": s["p_value"], "rank": s["rank"],
+                    "model": float(model[reg])}
+    return out
+
+
+def controls_report(preds: pd.DataFrame, outcomes: pd.DataFrame,
+                    metric_fn: Optional[Callable[[pd.DataFrame], float]],
                     seeds: Sequence[int] = DEFAULT_SEEDS, naive: Optional[pd.DataFrame] = None,
-                    linear: Optional[pd.DataFrame] = None, within_block: bool = False) -> Dict[str, Any]:
+                    linear: Optional[pd.DataFrame] = None, within_block: bool = False,
+                    regime_fn: Optional[Callable[[pd.DataFrame], Dict[str, float]]] = None) -> Dict[str, Any]:
     """The model's metric beside its controls.
 
     ``preds`` / ``naive`` / ``linear``: frames with ``symbol``, ``session``, ``score``; ``outcomes``: ``symbol``,
@@ -117,25 +133,42 @@ def controls_report(preds: pd.DataFrame, outcomes: pd.DataFrame, metric_fn: Call
     (ddof 1); ``rank`` / ``p_value`` are the model's among the shuffles (``empirical_rank``). The frames handed to
     ``metric_fn`` are already in ``ml_eval.flat`` layout, so a metric may be built with ``assume_flat=True``.
     ``metric_fn`` is applied to every shuffled frame: for a timing metric use ``timing_metric(q=...)`` (module
-    docstring)."""
+    docstring).
+
+    ``regime_fn`` (instead of ``metric_fn``, which may then be None): a frame -> ``{"all": whole period, regime:
+    value, ...}``. The whole-period numbers are its ``"all"`` and are exactly what ``metric_fn`` would give; each
+    shuffle summary also gets ``"by_regime": {regime: {mean, std, p_value, rank, model}}``, the model's value in the
+    regime ranked among the shuffles' values in that same regime. A regime fn must slice AFTER any shuffle-dependent
+    step (a causal cutoff), as the module docstring says."""
     if not len(seeds):
         raise ValueError("need at least one seed")
+    if metric_fn is None and regime_fn is None:
+        raise ValueError("pass metric_fn or regime_fn")
+    if regime_fn is not None:
+        whole = lambda f: float(regime_fn(f)["all"])                                              # noqa: E731
+    else:
+        whole = metric_fn
     base = _join(preds, outcomes, ("block",) if within_block else ())
     outcome_cols = [c for c in _OUTCOMES if c in base.columns]
     base = base.dropna(subset=["score", *outcome_cols]).reset_index(drop=True)
     if base.empty:
         raise ValueError("no row of the predictions has a score and an outcome")
-    model = float(metric_fn(base))
+    model_reg = regime_fn(base) if regime_fn is not None else None
+    model = float(model_reg["all"]) if model_reg is not None else float(metric_fn(base))
     report: Dict[str, Any] = {"model": model, "seeds": [int(s) for s in seeds]}
-    report["shuffle_symbols"] = _summary([metric_fn(shuffle_symbols(base, s)) for s in seeds], model)
-    report["shuffle_time"] = _summary([metric_fn(shuffle_time(base, s)) for s in seeds], model)
+    shufflers = [("shuffle_symbols", shuffle_symbols), ("shuffle_time", shuffle_time)]
     if within_block:
-        report["shuffle_time_within_block"] = _summary(
-            [metric_fn(shuffle_time_within_block(base, s)) for s in seeds], model)
+        shufflers.append(("shuffle_time_within_block", shuffle_time_within_block))
+    for name, shuffler in shufflers:
+        frames = [regime_fn(shuffler(base, s)) for s in seeds] if regime_fn is not None else None
+        report[name] = _summary([f["all"] for f in frames] if frames is not None
+                                else [metric_fn(shuffler(base, s)) for s in seeds], model)
+        if frames is not None:
+            report[name]["by_regime"] = _regime_summaries(model_reg, frames)
     for name, frame in (("naive", naive), ("linear", linear)):
         if frame is None:
             continue
         f = flat(frame, ("score",))[["symbol", "session", "score"]].rename(columns={"score": "_other"})
         m = base.drop(columns="score").merge(f, on=["symbol", "session"], how="left").rename(columns={"_other": "score"})
-        report[name] = float(metric_fn(m))
+        report[name] = whole(m)
     return report

@@ -225,3 +225,38 @@ def test_controls_report_adds_the_within_block_null_only_when_asked_and_it_penal
     assert wb["values"][0] == pytest.approx(manual)
     with pytest.raises(ValueError, match="block"):
         C.controls_report(preds.drop(columns="block"), outcomes, tm, seeds=(1,), within_block=True)
+
+
+def test_controls_report_with_a_regime_fn_adds_per_regime_nulls_and_keeps_the_whole_period_numbers():
+    df = _frame("cross")
+    outcomes = df[["symbol", "session", "ret", "rel_ret", "vol"]].set_index(["symbol", "session"])
+    preds = df[["symbol", "session", "score"]]
+    ic = E.rank_ic_metric()
+    mid = SESSIONS[75]
+
+    def regime_fn(d):
+        return {"all": ic(d), "early": ic(d[d["session"] < mid]), "late": ic(d[d["session"] >= mid])}
+    plain = C.controls_report(preds, outcomes, ic, seeds=(1, 2, 3))
+    rich = C.controls_report(preds, outcomes, None, seeds=(1, 2, 3), regime_fn=regime_fn)
+    assert rich["model"] == pytest.approx(plain["model"])
+    for name in ("shuffle_symbols", "shuffle_time"):
+        for k in ("mean", "std", "values", "rank", "p_value"):
+            assert rich[name][k] == pytest.approx(plain[name][k]), (name, k)
+        assert "by_regime" not in plain[name]
+        br = rich[name]["by_regime"]
+        assert set(br) == {"early", "late"}                                  # "all" is the whole period, already there
+        shuffler = C.shuffle_symbols if name == "shuffle_symbols" else C.shuffle_time
+        vals = [regime_fn(shuffler(df, s))["early"] for s in (1, 2, 3)]
+        assert br["early"]["mean"] == pytest.approx(np.mean(vals))
+        assert br["early"]["std"] == pytest.approx(np.std(vals, ddof=1))
+        assert br["early"]["model"] == pytest.approx(regime_fn(df)["early"])
+        rank, p = C.empirical_rank(regime_fn(df)["early"], vals)
+        assert br["early"]["rank"] == rank and br["early"]["p_value"] == pytest.approx(p)
+        assert set(br["late"]) >= {"mean", "std", "p_value", "rank", "model"}
+
+
+def test_controls_report_needs_a_metric_or_a_regime_fn():
+    df = _frame("cross")
+    outcomes = df[["symbol", "session", "ret", "rel_ret", "vol"]]
+    with pytest.raises(ValueError, match="metric_fn or regime_fn"):
+        C.controls_report(df[["symbol", "session", "score"]], outcomes, None, seeds=(1,))

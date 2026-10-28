@@ -1680,3 +1680,56 @@ def test_report_only_refuses_a_missing_dir_and_the_other_flags_stay_required_wit
     assert "results.jsonl" in capsys.readouterr().out
     with pytest.raises(SystemExit):
         L.main(["ml-grid", "--out", str(tmp_path)])                      # no --report-only, no --config / --cpu-slots
+
+
+# ------------------------------------------------------------------ per-regime controls in the rows
+def _by_regime_checks(row, track):
+    name = G.PRIMARY[track]
+    ctl = row["controls"]
+    assert ctl["primary"] in ctl["p_values"]
+    br = ctl["by_regime"]                                       # the stricter control, regime by regime
+    seen = [r for r in G.W.REGIMES if r in row["regimes"][name]]
+    assert set(br) == set(seen) and seen
+    for reg, e in br.items():
+        assert e["control"] in ctl["p_values"]
+        model = row["regimes"][name][reg]["mean"]
+        assert e["model"] == (pytest.approx(model) if model is not None else None)       # same number as the row's
+        for k in ("null_mean", "null_std", "p_value", "rank"):
+            assert k in e
+        if e["null_mean"] is not None:
+            rows_ = ctl[e["control"]]["by_regime"][reg]
+            assert e["null_mean"] == pytest.approx(rows_["mean"]) and e["p_value"] == rows_["p_value"]
+    for n in ctl["p_values"]:                                   # every gating control keeps its per-regime summary
+        assert set(ctl[n]["by_regime"]) == set(seen)
+        for e in ctl[n]["by_regime"].values():
+            assert set(e) >= {"mean", "std", "p_value", "rank", "model"}
+
+
+def test_rows_hold_per_regime_control_nulls_that_agree_with_the_rows_regime_values(signal_world, tmp_path):
+    out = tmp_path / "o"
+    st = _settings(control_seeds=(1, 2, 3))
+    cells = [cell(signal_world[0], seeds=[1]),
+             cell(signal_world[0], track="timing", target={"kind": "up", "horizon": 5}, seeds=[1])]
+    run(cells, out, signal_world, settings=st)
+    rows = {r["track"]: r for r in G.read_results(out / "results.jsonl")}
+    _by_regime_checks(rows["selection"], "selection")
+    _by_regime_checks(rows["timing"], "timing")
+    assert set(rows["timing"]["controls"]["p_values"]) == {"shuffle_time", "shuffle_time_within_block"}
+
+
+def test_the_per_regime_stricter_control_is_the_one_with_the_larger_p():
+    import numpy as _np
+    ctl = {"shuffle_time": {"mean": -0.01, "by_regime": {
+               "2019": {"mean": -0.02, "std": 0.01, "p_value": 0.30, "rank": 7, "model": 0.01},
+               "2021": {"mean": -0.02, "std": 0.01, "p_value": 0.05, "rank": 1, "model": 0.01}}},
+           "shuffle_time_within_block": {"mean": -0.04, "by_regime": {
+               "2019": {"mean": -0.05, "std": 0.02, "p_value": 0.10, "rank": 2, "model": 0.01},
+               "2021": {"mean": 0.00, "std": 0.02, "p_value": 0.20, "rank": 4, "model": 0.01}}}}
+    strict = G._strict_by_regime(ctl, ("shuffle_time", "shuffle_time_within_block"))
+    assert strict["2019"]["control"] == "shuffle_time" and strict["2019"]["null_mean"] == -0.02
+    assert strict["2021"]["control"] == "shuffle_time_within_block" and strict["2021"]["p_value"] == 0.20
+    assert strict["2021"]["null_std"] == 0.02 and strict["2021"]["model"] == 0.01
+    ctl["shuffle_time"]["by_regime"]["2019"]["p_value"] = None                   # a non-finite null: no p, last control
+    again = G._strict_by_regime(ctl, ("shuffle_time", "shuffle_time_within_block"))
+    assert again["2019"]["control"] == "shuffle_time_within_block"
+    assert _np is not None

@@ -16,16 +16,21 @@ R6 = ("2019", "2020crash", "2021", "2022bear", "2023-24", "2025-26")
 
 def mk(key, seed=1, *, track="selection", kind=None, horizon=5, family="lgbm", groups=("t",), months=12, reg=0.05,
        overall=None, p=0.01, null=-0.01, store="S", symbols=None, sig="sig1", seeds_run=3, cost=7.0, fitted=31,
-       blocks=31, low_iter=0.1, status="ok"):
+       blocks=31, low_iter=0.1, status="ok", null_reg=None, p_reg=0.02, old=False):
     """One results row. ``reg``: one number for all six regimes or a {regime: value} dict; ``overall``: the primary
-    (default the mean of the regimes); ``null``: the mean of the matching shuffle control."""
+    (default the mean of the regimes); ``null``: the mean of the matching shuffle control over the whole period;
+    ``null_reg``: the per-regime null mean (one number or a {regime: value} dict, default ``null``) and ``p_reg`` the
+    per-regime p; ``old=True`` writes a row of the version before the per-regime controls (no ``by_regime``)."""
     kind = kind or ("rel_return" if track == "selection" else "up")
     symbols = symbols or ("ndq30_dev" if track == "selection" else "timing")
     regs = dict(reg) if isinstance(reg, dict) else {r: reg for r in R6}
     over = overall if overall is not None else sum(regs.values()) / len(regs)
     name = G.PRIMARY[track]
     ctl = "shuffle_symbols" if track == "selection" else "shuffle_time"
-    return {"cell_key": key, "seed": seed, "track": track, "label": f"{track} {kind} h{horizon} {family}",
+    nulls = dict(null_reg) if isinstance(null_reg, dict) else {r: (null if null_reg is None else null_reg) for r in R6}
+    by_regime = {r: {"control": ctl, "null_mean": nulls[r], "null_std": 0.01, "p_value": p_reg, "rank": 1,
+                     "model": regs[r]} for r in R6}
+    row = {"cell_key": key, "seed": seed, "track": track, "label": f"{track} {kind} h{horizon} {family}",
             "status": status, "n_blocks": blocks, "n_blocks_fitted": fitted, "seeds_run": seeds_run,
             "low_iter_share": low_iter if family not in ("naive", "linear") else None,
             "primary": {"name": name, "value": over},
@@ -38,6 +43,9 @@ def mk(key, seed=1, *, track="selection", kind=None, horizon=5, family="lgbm", g
                        "train_months": months, "blocks": "Q"},
             "identity": {"settings": {"cost_bps": cost}, "store_signature": sig, "daily_fingerprint": "x"},
             "versions": {"code": "abc123def456"}}
+    if not old:
+        row["controls"]["by_regime"] = by_regime
+    return row
 
 
 def baselines(track="selection", naive=0.01, linear=0.02, **kw):
@@ -224,7 +232,7 @@ def test_the_ranking_uses_mean_minus_std_not_the_mean():
 def test_baseline_families_volatility_models_and_unfinished_cells_are_not_candidates():
     rows = baselines() + cand("a", seeds=(1, 2))                             # 2 of the 3 planned seeds finished
     rows += [mk("vol", 1, kind="volatility", horizon=5)]
-    cs = cells_of(R.gate(rows))
+    cs = cells_of(R.gate(rows, live=True))
     assert cs["naive_selection"]["state"] == "baseline" and not cs["naive_selection"]["passed"]
     assert cs["lin_selection"]["state"] == "baseline"
     assert cs["a"]["state"] == "pending" and any("2 of 3 seeds" in r for r in cs["a"]["reasons"])
@@ -468,8 +476,18 @@ def test_an_empty_run_still_renders_a_complete_page(tmp_path):
 
 
 def test_a_pending_cell_shows_the_pending_chip(tmp_path):
-    html = dash(tmp_path, baselines() + cand("half", seeds=(1,)), name="grid_pend")
-    assert 'data-state="pending"' in html
+    out = tmp_path / "grid_pend"
+    write_run(out, baselines() + cand("half", seeds=(1,)))
+    lock = G.acquire_lock(out)                          # a live run holds the directory
+    try:
+        R.build_outputs(out, report=False)
+        html = (out / "dashboard.html").read_text(encoding="utf-8")
+        assert '<span class="chip" data-state="pending"' in html
+    finally:
+        G.release_lock(lock)
+    R.build_outputs(out, report=False)                  # the run is over: the unresolved cell is a failure
+    html = (out / "dashboard.html").read_text(encoding="utf-8")
+    assert '<span class="chip" data-state="pending"' not in html and "1 of 3 seeds finished" in html
 
 
 def test_run_summary_is_written_and_read_back(tmp_path):
@@ -494,3 +512,119 @@ def test_the_dashboard_and_report_flag_near_constant_cells(tmp_path):
     md = (out / "report.md").read_text(encoding="utf-8")
     assert "near-constant 90%" in md and "near-constant 20%" not in md
     assert "No cell passed" not in md
+
+
+# ------------------------------------------------------------------ per-regime control nulls
+def test_a_regime_beats_the_control_when_it_is_above_that_regimes_null_mean():
+    # whole-period null -0.01 would let every regime pass; the per-regime nulls of three regimes sit above the value
+    null_reg = {"2019": 0.06, "2020crash": -0.01, "2021": 0.06, "2022bear": -0.01, "2023-24": 0.06, "2025-26": -0.01}
+    c = cells_of(R.gate(baselines() + cand("a", reg=0.05, overall=0.05, null=-0.01, null_reg=null_reg)))["a"]
+    assert c["regimes_beaten"] == 3 and not c["passed"]
+    assert c["regimes"]["2019"]["beats_control"] is False and c["regimes"]["2022bear"]["beats_control"] is True
+    assert any("3 of 6" in r for r in c["reasons"])
+    # the reverse: a high whole-period null no longer vetoes regimes whose own null is low
+    low = {r: -0.02 for r in R6}
+    c = cells_of(R.gate(baselines() + cand("a", reg=0.05, overall=0.05, null=0.06, null_reg=low)))["a"]
+    assert c["regimes_beaten"] == 6 and c["passed"]
+
+
+def test_the_per_regime_null_std_and_p_are_kept_per_regime_and_taken_as_the_median_over_seeds():
+    rows = baselines()
+    for seed, p in ((1, 0.01), (2, 0.04), (3, 0.5)):
+        rows.append(mk("a", seed, p_reg=p))
+    r = cells_of(R.gate(rows))["a"]["regimes"]["2022bear"]
+    assert r["p_value"] == pytest.approx(0.04) and r["null_mean"] == pytest.approx(-0.01)
+    assert r["null_std"] == pytest.approx(0.01) and r["control"] == "shuffle_symbols"
+
+
+def test_the_whole_period_p_stays_the_significance_condition():
+    c = cells_of(R.gate(baselines() + cand("a", p=0.3, p_reg=0.01)))["a"]               # every regime p is tiny
+    assert not c["passed"] and any("p=0.300" in r for r in c["reasons"])
+    c = cells_of(R.gate(baselines() + cand("a", p=0.01, p_reg=0.9)))["a"]               # regime p does not gate
+    assert c["passed"]
+
+
+def test_an_old_row_falls_back_to_the_whole_period_null_with_a_warning():
+    rows = baselines() + cand("old", old=True, null=-0.01) + cand("new")
+    cs = cells_of(R.gate(rows))
+    old, new = cs["old"], cs["new"]
+    assert old["passed"] and old["reasons"] == []                         # a fallback, not a failure
+    assert old["warnings"] == ["per-regime control missing (old row)"] and new["warnings"] == []
+    assert old["regimes"]["2019"]["null_mean"] == pytest.approx(-0.01) and old["regimes"]["2019"]["p_value"] is None
+    stricter = cells_of(R.gate(baselines() + cand("old", old=True, null=0.06)))["old"]      # the whole null still applies
+    assert stricter["regimes_beaten"] == 0 and not stricter["passed"] and stricter["warnings"]
+    mixed = [mk("m", 1), mk("m", 2, old=True), mk("m", 3)]                 # one old seed: the whole cell falls back
+    assert cells_of(R.gate(baselines() + mixed))["m"]["warnings"] == ["per-regime control missing (old row)"]
+
+
+def test_the_warning_is_shown_in_the_report_and_the_dashboard(tmp_path):
+    out = tmp_path / "grid_old"
+    write_run(out, baselines() + cand("old", old=True))
+    R.build_outputs(out, report=True)
+    assert "per-regime control missing (old row)" in (out / "report.md").read_text(encoding="utf-8")
+    assert "per-regime control missing (old row)" in (out / "dashboard.html").read_text(encoding="utf-8")
+
+
+def test_report_md_lists_the_per_regime_values_and_p(tmp_path):
+    out = tmp_path / "grid_pr"
+    write_run(out, baselines() + cand("good", p_reg=0.031, groups=("t", "m")))
+    R.build_outputs(out, report=True)
+    md = (out / "report.md").read_text(encoding="utf-8")
+    assert "## Per-regime control" in md
+    part = md.split("## Per-regime control")[1]
+    assert "good" in part and "p=0.031" in part and "2022bear" in part and "null" in part
+
+
+def test_the_heatmap_tooltip_gives_the_regime_value_null_and_p(tmp_path):
+    html = dash(tmp_path, baselines() + cand("good", p_reg=0.031, null_reg=-0.004), name="grid_tip")
+    tips = re.findall(r'<td class="hm[^"]*"[^>]*title="([^"]*)"', html)
+    assert any("2022bear" in t and "null -0.0040" in t and "p=0.031" in t and "shuffle_symbols" in t for t in tips)
+    assert any("all" in t and "p=0.010" in t for t in tips)              # the whole-period column: the cell-level p
+
+
+# ------------------------------------------------------------------ unresolved cells at the end of a run
+def test_an_unfinished_cell_is_pending_only_while_the_run_is_live():
+    rows = baselines() + cand("half", seeds=(1, 2))
+    live = cells_of(R.gate(rows, live=True))["half"]
+    assert live["state"] == "pending" and any("2 of 3 seeds finished" in r for r in live["reasons"])
+    done = cells_of(R.gate(rows))["half"]                                  # live defaults to False: the run is over
+    assert done["state"] == "fail" and not done["passed"] and not done["survivor"]
+    assert any("2 of 3 seeds finished" in r for r in done["reasons"])
+
+
+def test_the_reason_names_errors_when_seeds_errored():
+    rows = baselines() + cand("half", seeds=(1, 2))
+    errs = [{"cell_key": "half", "seed": 3, "error": "boom", "label": "selection rel_return h5 lgbm 12 t Q"}]
+    c = cells_of(R.gate(rows, errors=errs))["half"]
+    assert "2 of 3 seeds finished (errors)" in c["reasons"]
+    assert "2 of 3 seeds finished (missing)" in cells_of(R.gate(rows))["half"]["reasons"]
+
+
+def test_a_seed_that_errored_before_a_later_success_is_not_an_error():
+    rows = baselines() + cand("a")
+    errs = [{"cell_key": "a", "seed": 1, "error": "x", "label": ""}]
+    assert cells_of(R.gate(rows, errors=errs))["a"]["passed"]
+
+
+def test_a_cell_whose_every_seed_errored_is_listed_as_a_failure_when_the_run_has_ended():
+    errs = [{"cell_key": "dead", "seed": s, "error": "boom", "label": "selection rel_return h5 lgbm 12 t+m Q"}
+            for s in (1, 2)]
+    res = R.gate(baselines() + cand("a"), errors=errs)
+    dead = cells_of(res)["dead"]
+    assert dead["state"] == "fail" and not dead["passed"] and dead["track"] == "selection"
+    assert dead["family"] == "lgbm" and dead["horizon"] == 5 and dead["groups"] == "t+m"
+    assert any("no seed finished (errors)" in r for r in dead["reasons"])
+    assert cells_of(R.gate(baselines() + cand("a"), errors=errs, live=True))["dead"]["state"] == "pending"
+
+
+def test_final_refresh_resolves_pending_and_the_live_refresh_keeps_it(tmp_path):
+    out = tmp_path / "grid_fin"
+    write_run(out, baselines() + cand("half", seeds=(1,)), errors=[
+        {"cell_key": "half", "seed": 2, "error": "boom", "label": "", "traceback": ""}])
+    R.refresh(out, {"done": 3, "errors": 1}, final=False)
+    live = (out / "dashboard.html").read_text(encoding="utf-8")
+    assert '<span class="chip" data-state="pending"' in live and not (out / "report.md").exists()
+    R.refresh(out, {"done": 3, "errors": 1}, final=True)
+    done = (out / "dashboard.html").read_text(encoding="utf-8")
+    assert '<span class="chip" data-state="pending"' not in done and "1 of 3 seeds finished (errors)" in done
+    assert "1 of 3 seeds finished (errors)" in (out / "report.md").read_text(encoding="utf-8")

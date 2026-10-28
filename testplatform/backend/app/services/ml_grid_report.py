@@ -15,10 +15,14 @@ What the rows allow, and the choices made where the design is silent (also liste
 * A regime "beats the baseline" when the cell's seed-mean regime value of the primary metric is above the baseline's in
   that regime, for every baseline found. Several baseline cells can match; those with the cell's own feature groups are
   preferred and the strongest one (highest seed-mean primary) is used.
-* The rows hold the shuffle control for the WHOLE period only (its mean and p-value), not per regime. A regime "beats
-  the shuffle control" when the cell's regime value is above the mean of that control's null; the significance (p) is
-  judged once, on the median over seeds of the gating control's p-value (the stricter null on the timing track), which
-  is the value ``factor_effects`` reports.
+* A regime "beats the shuffle control" when the cell's regime value is above that regime's null mean
+  (``controls["by_regime"]`` of the row: the control's mean over the shuffles of the same regime metric; on the timing
+  track the control with the larger p in that regime). The significance (p) is judged once, on the whole period: the
+  median over seeds of the gating control's p-value, the value ``factor_effects`` reports. The per-regime p is kept
+  and shown (report, heatmap tooltip) but does not gate. A row without ``by_regime`` (written before the per-regime
+  controls) falls back to the whole-period null and the cell carries the warning ``OLD_ROW_WARNING``.
+* A cell with fewer finished seeds than planned is "pending" only while the run is live (``live=True``); once the run
+  has ended it fails with "k of n seeds finished (errors)" (or "(missing)" when no seed errored).
 * ``GATE_MAX_P`` is not in the design; 0.05 is the conventional choice. With the default 20 control seeds the smallest
   attainable p is 1/21, so 0.05 means "beats every shuffle".
 * Coverage (``min_coverage``, 0.8) excludes a cell before the gate is read; the threshold is not in the design either.
@@ -57,6 +61,7 @@ GATE_MIN_COVERAGE = 0.8
 GATE_MAX_LOW_ITER_SHARE: Optional[float] = None       # no exclusion by near-constant models: they are flagged
 LOW_ITER_FLAG_SHARE = 0.5
 BASELINE_FAMILIES: Tuple[str, ...] = ("naive", "linear")
+OLD_ROW_WARNING = "per-regime control missing (old row)"
 #: the metrics the heatmap shows per track (the first is the gate's primary)
 HEATMAP_METRICS: Dict[str, Tuple[str, ...]] = {
     "selection": ("quintile_spread_net", "rank_ic"),
@@ -124,6 +129,41 @@ def _null_mean(rows: Sequence[Dict[str, Any]]) -> float:
     return float(np.mean(vals)) if vals and all(math.isfinite(v) for v in vals) else float("nan")
 
 
+def _regime_controls(rows: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Per regime, aggregated over the seeds: ``null_mean`` (mean), ``null_std`` (mean), ``p_value`` (median over the
+    finite ones, None when none) and ``control`` (the control of the first seed). None when any seed's row has no
+    ``controls["by_regime"]`` (an old row)."""
+    per = []
+    for r in rows:
+        c = r["controls"] if "controls" in r and isinstance(r["controls"], dict) else {}
+        if "by_regime" not in c or not isinstance(c["by_regime"], dict):
+            return None
+        per.append(c["by_regime"])
+    out: Dict[str, Dict[str, Any]] = {}
+    for reg in GATE_REGIMES:
+        es = [b[reg] if reg in b else None for b in per]
+        if not es or any(e is None for e in es):
+            out[reg] = {"null_mean": float("nan"), "null_std": None, "p_value": None, "control": None}
+            continue
+        nm = [_num(e["null_mean"]) for e in es]
+        ns = [_num(e["null_std"]) for e in es]
+        ps = [float(e["p_value"]) for e in es if _finite(e["p_value"])]
+        out[reg] = {"null_mean": float(np.mean(nm)) if all(math.isfinite(v) for v in nm) else float("nan"),
+                    "null_std": _opt(float(np.mean(ns))) if all(math.isfinite(v) for v in ns) else None,
+                    "p_value": float(np.median(ps)) if ps else None, "control": es[0]["control"]}
+    return out
+
+
+def _parse_label(label: str) -> Optional[Dict[str, Any]]:
+    """The factor levels out of a row / error label ``"<track> <kind> h<H> <family> <train_months> <groups> <blocks>"``
+    (``ml_grid._label_of``), None when it is not one."""
+    parts = label.split()
+    if len(parts) != 7 or parts[0] not in G.TRACKS or not parts[2].startswith("h") or not parts[2][1:].isdigit():
+        return None
+    return {"track": parts[0], "target": parts[1], "horizon": int(parts[2][1:]), "family": parts[3],
+            "train_months": int(parts[4]) if parts[4].isdigit() else parts[4], "groups": parts[5]}
+
+
 def _cost_bps(rows: Sequence[Dict[str, Any]]) -> float:
     vals = []
     for r in rows:
@@ -141,14 +181,21 @@ def _fmt(x: float, nd: int = 4) -> str:
 def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: float = GATE_MAX_P,
          min_regimes: int = GATE_MIN_REGIMES, max_survivors: int = GATE_MAX_SURVIVORS,
          min_coverage: float = GATE_MIN_COVERAGE, max_low_iter_share: Optional[float] = GATE_MAX_LOW_ITER_SHARE,
-         min_cost_bps: float = GATE_COST_BPS) -> Dict[str, Any]:
+         min_cost_bps: float = GATE_COST_BPS, live: bool = False,
+         errors: Optional[Sequence[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Apply the stage-1 gate to ``cell_results`` (rows, or a path to ``results.jsonl``).
+
+    ``live``: the run is still going, so a cell with unfinished seeds is "pending"; False (the default: the run has
+    ended) makes it a failure "k of n seeds finished (errors)". ``errors``: the rows of ``errors.jsonl``; a seed in
+    them without a later result row is an error, and a cell with errors but no result row at all is listed too.
 
     Returns ``{"cells", "survivors", "by_track", "params", "effects"}``. ``cells``: one record per cell with ``key``,
     ``track``, ``label``, the factor levels (``target`` ``horizon`` ``family`` ``train_months`` ``groups``), ``mean`` /
     ``std`` / ``score`` (= mean - std) of the primary over the seeds, ``n_seeds``, ``p_value`` (median over seeds of the
     gating control), ``null_mean``, ``regimes`` (per regime: ``value``, ``naive``, ``linear``, ``beats_baseline``,
-    ``beats_control``, ``counted``), ``regimes_beaten``, ``passed`` (every condition met), ``survivor`` (passed and in
+    ``beats_control``, ``counted``, and the regime's control ``null_mean`` / ``null_std`` / ``p_value`` /
+    ``control``), ``whole`` (the same for the whole period), ``warnings`` (e.g. ``OLD_ROW_WARNING``; they do not fail
+    a cell), ``regimes_beaten``, ``passed`` (every condition met), ``survivor`` (passed and in
     the top ``max_survivors`` of its track), ``rank`` (among the track's passing cells), ``state`` (survivor / capped /
     fail / pending / excluded / baseline / not gated), ``reasons`` (one string per failed condition) and ``note``.
     ``survivors``: the survivors of both tracks, each track best first; ``by_track`` the same per track; ``effects``:
@@ -163,6 +210,10 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
     by_cell: Dict[str, List[Dict[str, Any]]] = {}
     for (key, _), r in sorted(last.items(), key=lambda kv: (kv[0][0], kv[0][1])):
         by_cell.setdefault(key, []).append(r)
+    err_rows: Dict[str, List[Dict[str, Any]]] = {}
+    for e in (errors or []):
+        if (e["cell_key"], int(e["seed"])) not in last:                        # a later success resolves an error
+            err_rows.setdefault(e["cell_key"], []).append(e)
     params = {"max_p": max_p, "min_regimes": min_regimes, "max_survivors": max_survivors, "regimes": list(GATE_REGIMES),
               "hard_regimes": list(HARD_REGIMES), "cost_bps": min_cost_bps, "min_coverage": min_coverage,
               "max_low_iter_share": max_low_iter_share, "low_iter_flag_share": LOW_ITER_FLAG_SHARE}
@@ -198,7 +249,8 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
             "target": cfg["target"]["kind"], "horizon": cfg["target"]["horizon"], "family": cfg["family"],
             "train_months": cfg["train_months"], "groups": "+".join(cfg["groups"]), "n_seeds": len(ok),
             "mean": float("nan"), "std": float("nan"), "score": float("nan"), "p_value": float("nan"),
-            "null_mean": float("nan"), "low_iter_share": None, "near_constant": False, "regimes": {}, "regimes_beaten": 0, "passed": False, "survivor": False,
+            "null_mean": float("nan"), "low_iter_share": None, "near_constant": False, "regimes": {},
+            "whole": None, "warnings": [], "regimes_beaten": 0, "passed": False, "survivor": False,
             "rank": None, "state": "fail", "reasons": [], "note": "", "baseline_keys": {}}
         records.append(rec)
         if cfg["target"]["kind"] == "volatility":
@@ -229,7 +281,8 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
         planned = max([int(r["seeds_run"]) for r in ok if "seeds_run" in r] or [len(ok)])
         pending = len(ok) < planned
         if pending:
-            reasons.append(f"only {len(ok)} of {planned} seeds finished")
+            suffix = ("so far" if live else "(errors)" if key in err_rows else "(missing)")
+            reasons.append(f"{len(ok)} of {planned} seeds finished {suffix}")
         elif not math.isfinite(rec["std"]):
             reasons.append("a single seed: no seed std, so no mean - std to rank by")
         # --- baselines
@@ -247,15 +300,25 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
         rec["baseline_keys"] = {f: b["key"] for f, b in base.items()}
         # --- regimes
         beaten, hard = 0, False
+        ctl = _regime_controls(ok)
+        ctl_name = next((r["controls"]["primary"] for r in ok if isinstance(r["controls"], dict)
+                         and "primary" in r["controls"]), None)
+        if ctl is None:
+            rec["warnings"].append(OLD_ROW_WARNING)
+        rec["whole"] = {"value": _opt(cell_regs["all"]), "null_mean": _opt(rec["null_mean"]),
+                        "null_std": None, "p_value": _opt(rec["p_value"]), "control": ctl_name}
         for reg in GATE_REGIMES:
             v = cell_regs[reg]
-            info = {"value": _opt(v), "naive": None, "linear": None}
+            rc = (ctl[reg] if ctl is not None else
+                  {"null_mean": rec["null_mean"], "null_std": None, "p_value": None, "control": ctl_name})
+            info = {"value": _opt(v), "naive": None, "linear": None, "null_mean": _opt(rc["null_mean"]),
+                    "null_std": rc["null_std"], "p_value": rc["p_value"], "control": rc["control"]}
             vs_base = bool(base) and math.isfinite(v)
             for fam, b in base.items():
                 bv = b["regimes"][reg]
                 info[fam] = _opt(bv)
                 vs_base = vs_base and math.isfinite(bv) and v > bv
-            vs_ctl = math.isfinite(v) and math.isfinite(rec["null_mean"]) and v > rec["null_mean"]
+            vs_ctl = math.isfinite(v) and math.isfinite(rc["null_mean"]) and v > rc["null_mean"]
             counted = vs_base and vs_ctl
             info.update(beats_baseline=bool(vs_base), beats_control=bool(vs_ctl), counted=bool(counted))
             rec["regimes"][reg] = info
@@ -280,7 +343,19 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
             reasons.append(f"shuffle control p={rec['p_value']:.3f} > {max_p:g}")
         rec["reasons"] = reasons
         rec["passed"] = not reasons
-        rec["state"] = "pending" if pending else ("fail" if reasons else "pass")
+        rec["state"] = "pending" if (pending and live) else ("fail" if reasons else "pass")
+    for key, errs in err_rows.items():                       # every seed of the cell errored: nothing in the results
+        if key in by_cell:
+            continue
+        lv = _parse_label(errs[0]["label"] if "label" in errs[0] else "")
+        if lv is None or lv["family"] in BASELINE_FAMILIES or lv["target"] == "volatility":
+            continue
+        records.append({"key": key, "label": errs[0]["label"], "n_seeds": 0, "mean": float("nan"),
+                        "std": float("nan"), "score": float("nan"), "p_value": float("nan"),
+                        "null_mean": float("nan"), "low_iter_share": None, "near_constant": False, "regimes": {},
+                        "whole": None, "warnings": [], "regimes_beaten": 0, "passed": False, "survivor": False,
+                        "rank": None, "state": "pending" if live else "fail", "note": "", "baseline_keys": {},
+                        "reasons": ["no seed finished (errors)"], **lv})
     # --- survivors per track
     by_track: Dict[str, List[Dict[str, Any]]] = {t: [] for t in G.TRACKS}
     for track in G.TRACKS:
@@ -328,13 +403,26 @@ def write_run_summary(out_dir: Union[str, Path], summary: Dict[str, Any]) -> Non
     write_atomic(path, json.dumps(cur, indent=1, sort_keys=True))
 
 
-def collect_state(out_dir: Union[str, Path], summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def run_is_live(out_dir: Union[str, Path]) -> bool:
+    """True while a live run holds ``out_dir`` (its lock file names a running process)."""
+    try:
+        G.check_lock(Path(out_dir))
+    except G.GridLockedError:
+        return True
+    return False
+
+
+def collect_state(out_dir: Union[str, Path], summary: Optional[Dict[str, Any]] = None,
+                  live: Optional[bool] = None) -> Dict[str, Any]:
     """Everything the report and the dashboard show, read from ``out_dir``: the rows, the unresolved errors, the run
-    summary (``run_summary.json`` merged with ``summary``), the gate and the run identity."""
+    summary (``run_summary.json`` merged with ``summary``), the gate and the run identity. ``live``: the run is still
+    going (None: a live lock in ``out_dir`` says so); only then is an unfinished cell "pending"."""
     out = Path(out_dir)
     rows = G.read_results(out / "results.jsonl")
     keys = {(r["cell_key"], int(r["seed"])) for r in rows}
-    err_keys = {(e["cell_key"], int(e["seed"])) for e in G.read_results(out / "errors.jsonl")}
+    err_rows = G.read_results(out / "errors.jsonl")
+    err_keys = {(e["cell_key"], int(e["seed"])) for e in err_rows}
+    is_live = run_is_live(out) if live is None else live
     saved: Dict[str, Any] = {}
     if (out / SUMMARY_NAME).exists():
         try:
@@ -345,7 +433,7 @@ def collect_state(out_dir: Union[str, Path], summary: Optional[Dict[str, Any]] =
     codes = sorted({r["versions"]["code"] for r in rows if "versions" in r and isinstance(r["versions"], dict)
                     and "code" in r["versions"]})
     return {"out_dir": out, "rows": rows, "n_rows": len(keys), "n_errors": len(err_keys - keys), "summary": merged,
-            "gate": gate(rows), "identity": {"dir": out.name, "code": G.library_versions()["code"], "row_codes": codes,
+            "live": is_live, "gate": gate(rows, live=is_live, errors=err_rows), "identity": {"dir": out.name, "code": G.library_versions()["code"], "row_codes": codes,
                                             "updated": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S UTC%z")}}
 
 
@@ -374,8 +462,25 @@ def _mean_std(c: Dict[str, Any]) -> str:
     return f"{c['mean']:+.4f} ± " + (f"{c['std']:.4f}" if math.isfinite(c["std"]) else "n/a")
 
 
+REPORT_REGIME_ROWS = 100
+
+
+def _regime_text(r: Dict[str, Any]) -> str:
+    """``value vs null (p=..)`` of one regime of a gate record, a check mark when the regime counted."""
+    if r["value"] is None:
+        return "n/a"
+    null = "n/a" if r["null_mean"] is None else f"{r['null_mean']:+.4f}"
+    p = "n/a" if r["p_value"] is None else f"{r['p_value']:.3f}"
+    return f"{r['value']:+.4f} vs null {null} (p={p}){' ✓' if r['counted'] else ''}"
+
+
 def _flag_text(c: Dict[str, Any]) -> str:
     return f"near-constant {100 * c['low_iter_share']:.0f}%" if c["near_constant"] else ""
+
+
+def _why(c: Dict[str, Any]) -> str:
+    """Reasons (failed conditions), then warnings (fallbacks that do not fail the cell), else the cap note."""
+    return "; ".join(c["reasons"] + c["warnings"]) or c["note"]
 
 
 def _p_text(c: Dict[str, Any]) -> str:
@@ -409,8 +514,9 @@ def render_report(state: Dict[str, Any]) -> str:
             f"per track. Cells with coverage under {p['min_coverage']:g}{low} are excluded first; a cell whose models "
             f"were near-constant in more than {p['low_iter_flag_share']:g} of the blocks carries a \"near-constant k%\" "
             f"flag but is not excluded. A regime counts as "
-            f"beating the shuffle control when its value is above the control's null mean (the rows hold the control "
-            f"for the whole period only); the significance is the cell-level p.", "", "## Survivors", ""]
+            f"beating the shuffle control when its value is above that regime's null mean (the control's mean over the "
+            f"shuffles of the same regime metric); the significance is the whole-period p. A cell with unfinished "
+            f"seeds is pending only while the run is live; after it, it fails.", "", "## Survivors", ""]
     if not g["survivors"]:
         out += ["No cell passed the gate. The factor-effect tables below are the deliverable; the exploration stops "
                 "here (design section 4).", ""]
@@ -449,7 +555,24 @@ def render_report(state: Dict[str, Any]) -> str:
                            "flags", "reasons"],
                           [[c["rank"] or "", _cell_text(c), c["key"], _mean_std(c), _fmt(c["score"]),
                             f"{c['regimes_beaten']} of 6" if c["regimes"] else "", _p_text(c), c["state"].upper(),
-                            _flag_text(c), "; ".join(c["reasons"]) or c["note"]] for c in cs]), ""]
+                            _flag_text(c), _why(c)] for c in cs]), ""]
+    out += ["## Per-regime control", "",
+            "Per regime: the cell's seed-mean value of the primary metric against that regime's shuffle-control null "
+            "(mean over the shuffles of the same regime metric; the control with the larger p on the timing track), "
+            "and the median over seeds of the regime's one-sided p. A check mark means the regime counted (above both "
+            "baselines and the null). The regime p is shown, it does not gate; the whole-period p does.", ""]
+    for track in G.TRACKS:
+        cs = [c for c in g["cells"] if c["track"] == track and c["regimes"]]
+        out += [f"### {track}", ""]
+        if not cs:
+            out += ["No gated cells.", ""]
+            continue
+        top = cs[:REPORT_REGIME_ROWS]
+        out += [_md_table(["key", "cell"] + list(GATE_REGIMES),
+                          [[c["key"], _cell_text(c)] + [_regime_text(c["regimes"][r]) for r in GATE_REGIMES]
+                           for c in top]), ""]
+        if len(cs) > len(top):
+            out += [f"Top {len(top)} of {len(cs)} cells by gate state and rank.", ""]
     out += ["## Excluded cells", ""]
     any_ex = False
     for track in G.TRACKS:
@@ -570,12 +693,26 @@ def _short(c: Dict[str, Any]) -> str:
     return f"{c['target']} h{c['horizon']} · {c['family']} · {c['train_months']}m · {c['groups']}"
 
 
-def _heat_cell(v: float, scale: float, all_col: bool) -> str:
+def _heat_cell(v: float, scale: float, all_col: bool, tip: str = "") -> str:
     cls = "all" if all_col else ""
+    title = f' title="{_e(tip)}"' if tip else ""
     if not math.isfinite(v):
-        return f'<td class="hm na {cls}">&ndash;</td>'
+        return f'<td class="hm na {cls}"{title}>&ndash;</td>'
     m = min(1.0, abs(v) / scale) * 65.0 if scale > 0 else 0.0
-    return f'<td class="hm {"pos" if v >= 0 else "neg"} {cls}" style="--m:{m:.0f}%">{v:+.3f}</td>'
+    return f'<td class="hm {"pos" if v >= 0 else "neg"} {cls}" style="--m:{m:.0f}%"{title}>{v:+.3f}</td>'
+
+
+def _control_tip(label: str, e: Dict[str, Any]) -> str:
+    """Tooltip of a primary-metric heat cell: the value, the control's null there (mean ± std) and the p."""
+    if e["value"] is None:
+        return f"{label}: not enough rows"
+    parts = [f"{label}: {e['value']:+.4f}"]
+    if e["null_mean"] is not None:
+        sd = "" if e["null_std"] is None else f" ± {e['null_std']:.4f}"
+        p = "p n/a" if e["p_value"] is None else f"p={e['p_value']:.3f}"
+        ctl = e["control"] if e["control"] else "control"
+        parts.append(f"{ctl} null {e['null_mean']:+.4f}{sd}, {p}")
+    return " | ".join(parts)
 
 
 def _heatmap(state: Dict[str, Any], track: str) -> str:
@@ -605,7 +742,12 @@ def _heatmap(state: Dict[str, Any], track: str) -> str:
     head2 = "<tr>" + "".join(f"<th>{_e(c)}</th>" for _ in metrics for c in cols) + "</tr>"
     body = []
     for c in shown:
-        tds = "".join(_heat_cell(data[c["key"]][m][col], scales[m], col == "all") for m in metrics for col in cols)
+        def tip(m: str, col: str, c: Dict[str, Any] = c) -> str:
+            if m != metrics[0] or not c["regimes"]:
+                return f"{col} {m}"
+            return _control_tip(col, c["whole"] if col == "all" else c["regimes"][col])
+        tds = "".join(_heat_cell(data[c["key"]][m][col], scales[m], col == "all", tip(m, col))
+                      for m in metrics for col in cols)
         body.append(f'<tr class="hmrow"><td class="sticky">{_e(_short(c))} <span class="muted small">{_e(c["key"])}'
                     f'</span></td><td>{_chip(c["state"])}{_flag_chip(c)}</td>{tds}</tr>')
     note = ""
@@ -655,7 +797,7 @@ def _gate_table(state: Dict[str, Any], track: str) -> str:
             beat = f'{c["regimes_beaten"]}/6<span class="dots">{dots}</span>'
         else:
             beat = "&ndash;"
-        why = "; ".join(c["reasons"]) or c["note"]
+        why = _why(c)
         rows.append(f'<tr><td>{c["rank"] or ""}</td><td class="l">{_e(_short(c))} <span class="muted small">'
                     f'{_e(c["key"])}</span></td><td>{_e(_mean_std(c))}</td><td>{_e(_fmt(c["score"]))}</td>'
                     f'<td>{beat}</td><td>{_e(_p_text(c))}</td><td class="l">{_chip(c["state"])}{_flag_chip(c)}</td>'
@@ -720,11 +862,11 @@ def render_dashboard(state: Dict[str, Any]) -> str:
 
 # ================================================================== orchestration
 def build_outputs(out_dir: Union[str, Path], *, summary: Optional[Dict[str, Any]] = None, report: bool = True,
-                  dashboard: bool = True) -> Dict[str, Any]:
+                  dashboard: bool = True, live: Optional[bool] = None) -> Dict[str, Any]:
     """Rebuild ``dashboard.html`` (and ``report.md`` when ``report``) of ``out_dir`` from its ``results.jsonl``, each
-    written atomically. Reads only; runs nothing. Returns the state (rows, gate, identity, summary)."""
+    written atomically. Reads only; runs nothing. ``live``: see ``collect_state``. Returns the state (rows, gate, identity, summary)."""
     out = Path(out_dir)
-    st = collect_state(out, summary)
+    st = collect_state(out, summary, live)
     if dashboard:
         write_atomic(out / DASHBOARD_NAME, render_dashboard(st))
     if report:
@@ -736,4 +878,4 @@ def refresh(out_dir: Union[str, Path], summary: Dict[str, Any], final: bool) -> 
     """The runner's hook: the dashboard after every batch of finished rows; at the end also the report and the saved
     run summary (so ``--report-only`` can show what the run did)."""
     write_run_summary(out_dir, summary)
-    build_outputs(out_dir, summary=summary, report=final)
+    build_outputs(out_dir, summary=summary, report=final, live=not final)
