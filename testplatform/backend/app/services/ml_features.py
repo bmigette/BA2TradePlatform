@@ -902,8 +902,7 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
     universe = list(symbols) if universe is None else list(dict.fromkeys(universe))
     if not set(symbols) <= set(universe):
         raise ValueError(f"universe must contain every built symbol; missing {sorted(set(symbols) - set(universe))}")
-    store_path = (Path(store_dir) if store_dir is not None
-                  else Path(cache_root) / "screener" / ml_universe.DEFAULT_STORE_NAME)
+    store_path = Path(store_dir) if store_dir is not None else ml_universe.store_dir_for(cache_root)
     sector_source = None
     sectors: Optional[Dict[str, str]] = None
     if any(spec.needs_sector for spec in specs.values()):

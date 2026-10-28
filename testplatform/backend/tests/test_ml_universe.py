@@ -133,3 +133,55 @@ def test_sector_of_from_store_returns_known_sectors_only(store, tmp_path):
     assert U.sector_of_from_store(["NOSEC"], other) == {}
     with pytest.raises(U.UniverseUnavailable, match="TWO"):               # two different sectors: ambiguous, refuse
         U.sector_of_from_store(["TWO"], other)
+
+
+# ---------------------------------------------------------------------------------------------- review fixes
+def test_a_gap_between_scans_beyond_the_limit_refuses_when_the_store_loads(tmp_path):
+    rows = [_row(s, "AAPL", 3e12) for s in ("2022-01-05", "2022-01-12", "2022-02-02")]       # 21 days between the last two
+    gappy = write_metric_store(tmp_path / "metric_store_gap", pd.DataFrame(rows))
+    with pytest.raises(U.UniverseUnavailable, match=r"gap.*21 days.*2022-01-12.*2022-02-02"):
+        U.scan_store(gappy)
+    ok = write_metric_store(tmp_path / "metric_store_ok", pd.DataFrame(
+        [_row(s, "AAPL", 3e12) for s in ("2022-01-05", "2022-01-12", "2022-01-26")]))             # 14 days is allowed
+    assert U.scan_store(ok).dates[-1] == "2022-01-26"
+
+
+def test_duplicate_scan_rows_name_an_example(tmp_path):
+    rows = [_row("2022-01-05", "AAPL", 3e12), _row("2022-01-05", "AAPL", 3.1e12), _row("2022-01-12", "AAPL", 3e12)]
+    dup = write_metric_store(tmp_path / "metric_store_dup", pd.DataFrame(rows))
+    with pytest.raises(U.UniverseUnavailable, match=r"AAPL.*2022-01-05"):
+        U.scan_values(["AAPL"], pd.DatetimeIndex(["2022-01-12"]), ["market_cap"], dup)
+
+
+def test_membership_follows_the_universe_scan_by_scan_and_is_held_between_scans(store):
+    sessions = pd.DatetimeIndex(pd.bdate_range("2022-01-24", "2022-02-11"))
+    m = U.membership_from_universe(sessions, 3, "dev", store, min_dollar_volume=1e6)
+    assert m.index.equals(sessions) and m.dtypes.eq(bool).all()
+    # top 3 overall = AAPL MSFT AMZN until the 2022-02-02 scan, then AMD AAPL MSFT; dev keeps the non-locked ones
+    assert set(m.columns) == {"AAPL", "AMD"}
+    assert m.loc["2022-02-01", "AAPL"] and not m.loc["2022-02-01", "AMD"]
+    assert m.loc["2022-02-02", "AMD"] and m.loc["2022-02-11", "AMD"]                      # in from the scan that ranks it
+    assert not m.loc[:"2022-02-01", "AMD"].any()
+    ref = U.universe_as_of(date(2022, 2, 4), 3, store, "dev", min_dollar_volume=1e6)
+    assert set(m.columns[m.loc["2022-02-04"]]) == set(ref)                                 # equals universe_as_of
+    hold = U.membership_from_universe(sessions, 3, "holdout", store, min_dollar_volume=1e6)
+    assert set(hold.columns) == {"MSFT", "AMZN"} and not (m.reindex(columns=hold.columns, fill_value=False) & hold).any().any()
+
+
+def test_membership_before_the_first_scan_is_empty(store):
+    sessions = pd.DatetimeIndex(pd.bdate_range("2021-12-28", "2022-01-06"))
+    m = U.membership_from_universe(sessions, 3, "dev", store, min_dollar_volume=1e6)
+    assert not m.loc[:"2022-01-04"].any().any() and m.loc["2022-01-05"].any()
+
+
+def test_one_store_path_source(tmp_path):
+    assert U.store_dir_for(tmp_path) == tmp_path / "screener" / U.DEFAULT_STORE_NAME
+    assert not hasattr(U, "default_store_dir") and not hasattr(U, "os") and not hasattr(U, "np")
+
+
+def test_store_fingerprint_changes_with_the_files(tmp_path):
+    root = write_metric_store(tmp_path / "metric_store_fp", pd.DataFrame([_row("2022-01-05", "AAPL", 3e12)]))
+    a = U.store_fingerprint(root)
+    assert a["files"] == 1 and a["bytes"] > 0 and "newest_mtime_ns" in a and U.store_fingerprint(root) == a
+    write_metric_store(tmp_path / "metric_store_fp", pd.DataFrame([_row("2022-01-05", "AAPL", 3e12), _row("2022-02-02", "AAPL", 3e12)]))
+    assert U.store_fingerprint(root) != a
