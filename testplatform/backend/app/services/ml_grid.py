@@ -1395,6 +1395,13 @@ PARQUET_RATIO = 0.6
 RESULT_ROW_BYTES = 14_000
 
 
+def _fmt_bytes(n: float) -> str:
+    for unit, size in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if n >= size:
+            return f"{n / size:.2f} {unit}"
+    return f"{int(n)} B"
+
+
 def estimate_disk(tasks: Sequence[Tuple[Cell, int]], st: GridSettings) -> Dict[str, Any]:
     """Rough bytes the run will write: the predictions files (rows = symbols x sessions of the evaluation window,
     float32 columns score / ret / vol [+ rel_ret on the selection track, + realvol for a volatility target] + session
@@ -1467,8 +1474,8 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
     import shutil
     est = estimate_disk(tasks, st)
     free = shutil.disk_usage(out).free
-    say(f"ml_grid: estimated disk {est['total'] / 1e9:.2f} GB for {len(tasks)} tasks (predictions "
-        f"{est['predictions'] / 1e9:.2f} GB, results {est['results'] / 1e9:.2f} GB); {free / 1e9:.1f} GB free in {out}")
+    say(f"ml_grid: estimated disk {_fmt_bytes(est['total'])} for {len(tasks)} tasks (predictions "
+        f"{_fmt_bytes(est['predictions'])}, results {_fmt_bytes(est['results'])}); {_fmt_bytes(free)} free in {out}")
     if est["total"] > 0.9 * free:
         logger.warning(f"ml_grid: the estimated disk need exceeds 90% of the free space in {out}")
     init_args = (st.to_dict(), cache_root, str(out), n_jobs_for(cpu_slots, st.cores))
