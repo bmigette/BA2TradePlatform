@@ -32,7 +32,9 @@ from app.services.dataset_handler import (
     INTERVAL_MAP,
     BARS_PER_DAY,
 )
-from app.services.ml_dataset_source import fetch_ohlcv_frame, is_alpaca_hist, validate_panel_request
+from app.services.ml_dataset_source import (
+    DAILY_FLAG_COLUMNS, DAILY_KEYS, DAILY_TIMEFRAME, daily_column_prefixes, daily_request_from, fetch_ohlcv_frame,
+    is_alpaca_hist, validate_daily_request, validate_panel_request)
 
 
 def get_ohlcv_provider(provider_name: str = "yfinance"):
@@ -265,7 +267,7 @@ def _build_dataset_in_background(dataset_id: int, dataset_config: dict):
         logger.info(f"[Thread] Fetching data from {fetch_start_date.date()} to {end_date.date()} using {provider_name}")
 
         df = fetch_ohlcv_frame(provider_name, ticker, timeframe, fetch_start_date, end_date,
-                               panel_features, fundamentals_config)
+                               panel_features, fundamentals_config, daily_request_from(dataset_config))
 
         if df.empty:
             db_dataset.status = DatasetStatus.ERROR.value
@@ -458,7 +460,7 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
             logger.info(f"[Thread] Fetching data from {fetch_start_date.date()} to {end_date.date()} using {provider_name}")
 
             df = fetch_ohlcv_frame(provider_name, ticker, timeframe, fetch_start_date, end_date,
-                                   gen_config.get("panel_features"), fundamentals_config)
+                                   gen_config.get("panel_features"), fundamentals_config, daily_request_from(gen_config))
 
             if df.empty:
                 db_dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
@@ -527,12 +529,16 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
 
             # Define column patterns for each regeneration type
             ohlcv_time_cols = {'Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'day_of_week', 'hour_of_day'}
+            if daily_request_from(gen_config):
+                ohlcv_time_cols |= set(DAILY_FLAG_COLUMNS)
             sentiment_prefixes = ('news_',)
             fundamental_prefixes = ('bs_', 'is_', 'cf_', 'earn_', 'fundamental_')
             macro_prefixes = ('macro_',)
 
             # Helper to identify column type
             panel_prefixes = ('t_', 'd_', 'm_', 'f_') if is_alpaca_hist(gen_config.get("data_provider")) else ()
+            if daily_request_from(gen_config):
+                panel_prefixes += daily_column_prefixes()      # the daily store's groups (and their <prefix>missing flags)
 
             def get_column_type(col):
                 if col in ohlcv_time_cols:
@@ -701,6 +707,9 @@ def create_dataset(
     try:
         panel_features = validate_panel_request(dataset_create.data_provider, dataset_create.timeframe,
                                                 dataset_create.panel_features, dataset_create.fundamentals_config)
+        daily = validate_daily_request(dataset_create.data_provider, dataset_create.timeframe,
+                                       dataset_create.daily_groups, dataset_create.daily_min_share,
+                                       dataset_create.ticker, None)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -730,6 +739,7 @@ def create_dataset(
             "original_end_date": dataset_create.end_date,
             "indicator_collection_id": dataset_create.indicator_collection_id,
             "panel_features": panel_features,
+            **daily,
             "created_at": datetime.now().isoformat()
         }
 
@@ -771,6 +781,7 @@ def create_dataset(
             'sentiment_config': dataset_create.sentiment_config,
             'fundamentals_config': dataset_create.fundamentals_config,
             'panel_features': panel_features,
+            **daily,
         }
 
         # Submit to background thread pool (non-blocking)
@@ -823,9 +834,16 @@ def create_batch_datasets(
         indicator_collection_id = batch_request.get('indicator_collection_id')
         user_labels = batch_request.get('labels', [])
         batch_name = batch_request.get('name')
+        batch_symbols = list(dict.fromkeys(s.strip().upper() for s in symbols if s.strip()))
+        if not batch_symbols:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="symbols list holds no symbol")
         try:
             panel_features = validate_panel_request(data_provider, timeframe, batch_request.get('panel_features'),
                                                     fundamentals_config)
+            # the batch is the universe of the daily store's cross-sectional values (group x, the breadth of group m)
+            daily = validate_daily_request(data_provider, timeframe, batch_request.get('daily_groups'),
+                                           batch_request.get('daily_min_share'), batch_symbols[0],
+                                           batch_symbols)
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -864,6 +882,7 @@ def create_batch_datasets(
                 "original_end_date": end_date_str,
                 "indicator_collection_id": indicator_collection_id,
                 "panel_features": panel_features,
+                **daily,
                 "created_at": datetime.now().isoformat(),
                 "batch_name": batch_name
             }
@@ -902,6 +921,7 @@ def create_batch_datasets(
                 'sentiment_config': sentiment_config,
                 'fundamentals_config': fundamentals_config,
                 'panel_features': panel_features,
+                **daily,
             }
 
             _dataset_executor.submit(_build_dataset_in_background, db_dataset.id, dataset_config)
@@ -2084,8 +2104,17 @@ def duplicate_dataset(
         if warmup_days > 0:
             logger.info(f"[Duplicate] Warmup: fetching {warmup_days} extra days for {warmup_bars}-bar indicators")
 
+        try:
+            # the duplicate keeps the daily options of the original; a new ticker joins its universe
+            daily = validate_daily_request(provider_name, original.timeframe, gen_config.get("daily_groups"),
+                                           gen_config.get("daily_min_share"), new_ticker,
+                                           gen_config.get("daily_universe"))
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
         df = fetch_ohlcv_frame(provider_name, new_ticker, original.timeframe, fetch_start_date, end_date,
-                               gen_config.get("panel_features"), original.fundamentals_config)
+                               gen_config.get("panel_features"), original.fundamentals_config,
+                               daily_request_from(daily))
 
         if df.empty:
             raise HTTPException(
@@ -2123,6 +2152,7 @@ def duplicate_dataset(
             "original_end_date": gen_config.get("original_end_date"),
             "indicator_collection_id": gen_config.get("indicator_collection_id"),
             "panel_features": gen_config.get("panel_features") or [],
+            **daily,
             "duplicated_from": dataset_id,
             "created_at": datetime.now().isoformat()
         }
@@ -2268,11 +2298,26 @@ def update_dataset(
         if panel_features is None and is_alpaca_hist(gen_config.get("data_provider", "yfinance")):
             panel_features = gen_config.get("panel_features")
         fundamentals_config = dataset.fundamentals_config
+        # Daily store options (alpaca_hist 1d): an explicit list / threshold is validated, inherited ones are kept while
+        # the dataset stays on that source and dropped when it leaves it
+        on_daily = is_alpaca_hist(gen_config.get("data_provider", "yfinance")) and new_timeframe == DAILY_TIMEFRAME
+        daily_groups = dataset_update.daily_groups
+        daily_min_share = dataset_update.daily_min_share
+        if on_daily and daily_groups is None:
+            daily_groups = gen_config.get("daily_groups")
+        if on_daily and daily_min_share is None:
+            daily_min_share = gen_config.get("daily_min_share")
         try:
             gen_config["panel_features"] = validate_panel_request(
                 gen_config.get("data_provider", "yfinance"), new_timeframe, panel_features, fundamentals_config)
+            daily = validate_daily_request(
+                gen_config.get("data_provider", "yfinance"), new_timeframe, daily_groups, daily_min_share, new_ticker,
+                gen_config.get("daily_universe") if on_daily else None)
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        for key in DAILY_KEYS:
+            gen_config.pop(key, None)
+        gen_config.update(daily)
 
         # Save updated generation_config with new dates and provider
         dataset.generation_config = gen_config
@@ -2300,7 +2345,7 @@ def update_dataset(
         logger.info(f"Fetching data for {new_ticker} from {start_date.date()} to {end_date.date()} using {provider_name}")
 
         df = fetch_ohlcv_frame(provider_name, new_ticker, new_timeframe, start_date, end_date,
-                               gen_config["panel_features"], fundamentals_config)
+                               gen_config["panel_features"], fundamentals_config, daily_request_from(gen_config))
     except Exception as e:
         # Update status to error with short session
         db = SessionLocal()

@@ -59,7 +59,9 @@ HOLDOUT_SHARE_OF_TEST = 0.5
 
 # Raw OHLCV/bookkeeping columns. These are inputs to target CONSTRUCTION and to
 # the indicator pass, never model features in their own right.
-NON_FEATURE_COLUMNS = ('Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'ticker')
+# ``filled`` is the daily store's flag "this bar is a fabricated flat fill" (alpaca_hist 1d datasets): an input of the
+# target construction (the daily targets are NaN where their entry / exit bar is a fill), not a model feature.
+NON_FEATURE_COLUMNS = ('Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'ticker', 'filled')
 
 # Legacy price-based targets (PredictionTargetService.calculate_prediction_targets)
 # are not registered in the caller's target list, so they are recognised by name.
