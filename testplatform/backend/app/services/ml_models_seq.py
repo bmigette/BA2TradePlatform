@@ -30,7 +30,7 @@ dropped).
 
 Determinism and numerics policy. Every random draw is seeded (weights, shuffling, dropout, MiniRocket kernels) inside
 a ``fork_rng`` scope, so the global torch / numpy generators are left as they were; the Darts deciles use one fixed
-set of uniform draws seeded with the fit seed. On the GPU the result is bitwise repeatable only with
+set of stratified uniform draws seeded with the fit seed. On the GPU the result is bitwise repeatable only with
 ``torch.backends.cudnn.deterministic = True`` and ``cudnn.benchmark = False``. The adapters NEVER change global
 backend flags or precision: ``cudnn.deterministic`` / ``benchmark``, ``cudnn.allow_tf32`` (PyTorch default: on for
 convolutions), ``cuda.matmul.allow_tf32`` and ``set_float32_matmul_precision`` (default: full float32 matmul) are set
@@ -169,14 +169,14 @@ def sequence_data_from_panel(panel: pd.DataFrame, feats: Sequence[str], fit_rows
     if not panel.index.equals(pd.RangeIndex(len(panel))):
         raise ValueError("the panel needs its positional RangeIndex (pass the full panel, not a sample_bars subset)")
     fd = ml_search.fold_data(panel, list(feats), np.asarray(fit_rows, dtype=np.int64), pooled, symbol_encoding)
-    sym = panel["symbol"].to_numpy()
-    start = np.array([fd.first_ok[s] for s in sym], dtype=np.int64)
+    codes = fd.symbol_codes                       # fold_data factorized the symbols once; integer comparisons from here
+    start = np.array([fd.first_ok[s] for s in fd.symbols], dtype=np.int64)[codes]
     ret = None
     if with_returns:
         ret = np.zeros(len(panel))
         close = panel["close"].to_numpy(dtype=np.float64)
-        for s in dict.fromkeys(sym):
-            idx = np.flatnonzero(sym == s)
+        for i in range(len(fd.symbols)):
+            idx = np.flatnonzero(codes == i)
             ret[idx[1:]] = np.diff(np.log(close[idx]))
     data = SequenceData(fd.X, np.empty(0, dtype=np.int64), lookback, start, ret, tuple(fd.channels), fd.scaler,
                         horizon_steps)
@@ -506,7 +506,23 @@ class TsaiAdapter(_SequenceAdapter):
 #: levels the Darts likelihood learns; the deciles are percentiles of the SAMPLED H-step cumulative return
 DARTS_QUANTILES: Tuple[float, ...] = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95)
 DECILE_PERCENTILES: Tuple[int, ...] = tuple(int(round(100 * q)) for q in QUANTILE_LEVELS)
-PREDICT_CHUNK = 2048
+PREDICT_CHUNK_ROWS_AT_35 = 2048
+TFT_MAX_ROWS = 20_000                                  # the tft forecast is the slow public path (about 0.5 ms per row)
+
+
+def _predict_chunk(n_out: int) -> int:
+    """Rows per forward chunk. The decile step holds rows x num_samples x n_out floats, so the chunk shrinks as the
+    horizon grows: 2048 rows at the usual 35 steps (5 H1 sessions), never fewer than 128."""
+    return max(128, PREDICT_CHUNK_ROWS_AT_35 * 35 // n_out)
+
+
+def _stratified_uniforms(ns: int, n_out: int, seed: int) -> np.ndarray:
+    """(ns, n_out) uniform draws, stratified per step: ``u[:, t] = (permutation(ns) + 0.5) / ns``, an independent
+    permutation for each step, so every step uses each of the ns equal-probability strata exactly once (the sample
+    mean and spread of every step are exact, and the 200-path decile estimate is much less noisy than plain
+    uniforms). Seeded."""
+    rng = np.random.default_rng(seed)
+    return np.stack([(rng.permutation(ns) + 0.5) / ns for _ in range(n_out)], axis=1)
 #: architectures whose network is called directly on batched windows (verified equal to the public forecast)
 BATCHED_ARCHS: Tuple[str, ...] = ("nhits", "nbeats", "tcn")
 
@@ -695,7 +711,32 @@ class DartsAdapter(_SequenceAdapter):
         self.task, self.seed = task, int(seed)
         self.feature_names = Xt.channels or None
         self.n_features, self.n_classes = Xt.n_channels, None
+        if p["arch"] in BATCHED_ARCHS:
+            try:
+                self._selfcheck_batched(Xv)
+            except BaseException:
+                self._reset()                              # never leave a fitted-looking adapter behind a failed check
+                raise
         return self
+
+    def _selfcheck_batched(self, X: SequenceData, atol: float = 1e-4) -> None:
+        """One row through the batched network call and through the public Darts forecast must agree. It guards a silent
+        change of Darts' input layout (a different Darts version on a worker would otherwise predict garbage)."""
+        import torch
+        r, L = int(X.rows[0]), X.lookback
+        dev = self._device
+        self._put_network_on_device()
+        self._net.model.eval()
+        F = torch.as_tensor(X.features[r - L + 1:r + 1], device=dev)                        # a one-row "matrix"
+        R = torch.as_tensor((X.returns[r - L + 1:r + 1] / self._sd).astype(np.float32), device=dev)
+        with torch.no_grad():
+            got = self._quantiles_chunk(X, np.array([L - 1]), F, R).float().cpu().numpy()
+        want = self._public_quantiles(X, np.array([r])).float().cpu().numpy()
+        diff = float(np.abs(got - want).max())
+        if not diff <= atol:
+            raise RuntimeError(f"darts {self.params['arch']}: the batched forward differs from the public Darts forecast "
+                               f"by {diff:.3g} (> {atol:g}); the installed Darts has probably changed its input layout "
+                               f"(the tested range is darts>=0.48,<0.49)")
 
     def _train(self, Xt: SequenceData, Xv: SequenceData, sp_t, sp_v, n_out: int, seed: int):
         p = self.params
@@ -729,6 +770,10 @@ class DartsAdapter(_SequenceAdapter):
             raise ValueError("darts: X needs the bar returns (SequenceData.returns)")
         if X.horizon_steps != self._n_out:
             raise ValueError(f"darts: X has horizon_steps {X.horizon_steps}, the model was fitted with {self._n_out}")
+        if self.params["arch"] not in BATCHED_ARCHS and len(X) > TFT_MAX_ROWS:
+            raise ValueError(f"darts {self.params['arch']}: {len(X):,} rows requested; the slow per-row forecast path is "
+                             f"limited to {TFT_MAX_ROWS:,} rows per call (use nhits / nbeats / tcn, whose batched "
+                             f"forward has no such limit, or score the end-of-day rows only)")
         return X
 
     def _quantiles_chunk(self, X: SequenceData, rows: np.ndarray, F, R):
@@ -743,10 +788,16 @@ class DartsAdapter(_SequenceAdapter):
             out = self._net.model(PLModuleInput(past_target=R[idx].unsqueeze(-1), past_covariates=F[idx]))
             return out.prediction.reshape(len(rows), n_out, -1)
         # tft (relative index, static inputs): the public Darts forecast, one TimeSeries pair per row (slow)
-        sd = self._sd
+        return self._public_quantiles(X, rows)
+
+    def _public_quantiles(self, X: SequenceData, rows: np.ndarray):
+        """The same quantiles through the public Darts ``predict`` (one TimeSeries pair per row): the reference the
+        batched forward is checked against, and the only path of the tft."""
+        import torch
+        L, sd = X.lookback, self._sd
         ser = [_darts_ts(X.returns[r - L + 1:r + 1] / sd, int(r) - L + 1) for r in rows]
         cov = [_darts_ts(X.features[r - L + 1:r + 1], int(r) - L + 1) for r in rows]
-        preds = self._net.predict(n_out, series=ser, past_covariates=cov, predict_likelihood_parameters=True,
+        preds = self._net.predict(self._n_out, series=ser, past_covariates=cov, predict_likelihood_parameters=True,
                                   verbose=False, show_warnings=False)
         return torch.as_tensor(np.stack([pr.values(copy=False) for pr in preds]), device=self._device)
 
@@ -768,8 +819,9 @@ class DartsAdapter(_SequenceAdapter):
         F, R = self._device_inputs(X)
         out = []
         with torch.no_grad():
-            for i in range(0, len(X), PREDICT_CHUNK):
-                out.append(self._quantiles_chunk(X, X.rows[i:i + PREDICT_CHUNK], F, R).float().cpu().numpy())
+            chunk = _predict_chunk(self._n_out)
+            for i in range(0, len(X), chunk):
+                out.append(self._quantiles_chunk(X, X.rows[i:i + chunk], F, R).float().cpu().numpy())
         return np.concatenate(out) if out else np.zeros((0, self._n_out, len(DARTS_QUANTILES)), dtype=np.float32)
 
     def predict(self, X) -> np.ndarray:
@@ -779,14 +831,15 @@ class DartsAdapter(_SequenceAdapter):
         if not len(X):
             return out
         sd, ns, n_out = self._sd, self.params["num_samples"], self._n_out
-        # ONE set of uniform draws for every row (common random numbers): a row's deciles are a deterministic function
-        # of its own forecast quantiles -- independent of the other rows and of the chunking -- and differences
-        # between rows are never sampling noise.
-        plan = _interp_plan(np.random.default_rng(self.seed).random((ns, n_out)), self._device)
+        # ONE set of stratified uniform draws for every row (common random numbers): a row's deciles are a deterministic
+        # function of its own forecast quantiles -- independent of the other rows and of the chunking -- and
+        # differences between rows are never sampling noise.
+        plan = _interp_plan(_stratified_uniforms(ns, n_out, self.seed), self._device)
         F, R = self._device_inputs(X)
+        chunk = _predict_chunk(n_out)
         with torch.no_grad():
-            for i in range(0, len(X), PREDICT_CHUNK):
-                rows = X.rows[i:i + PREDICT_CHUNK]
+            for i in range(0, len(X), chunk):
+                rows = X.rows[i:i + chunk]
                 q = self._quantiles_chunk(X, rows, F, R).float()
                 out[i:i + len(rows)] = _deciles_from_quantiles(q, plan, sd).double().cpu().numpy()
         if not np.isfinite(out).all():

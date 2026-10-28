@@ -272,14 +272,16 @@ class FoldData:
     first_ok: Dict[str, int]      # first panel row of each symbol whose features are all finite
     scaler: Dict[str, List[float]]
     channels: List[str]
+    symbol_codes: np.ndarray      # (n_rows,) integer code of each row's symbol (pd.factorize, order of appearance)
+    symbols: List[str]            # symbol of each code
 
 
-def _first_finite_rows(panel: pd.DataFrame, ok: np.ndarray) -> Dict[str, int]:
-    """First panel row of each symbol whose features are all finite (``ok`` = per-row finite mask)."""
+def _first_finite_rows(codes: np.ndarray, symbols: Sequence[str], ok: np.ndarray) -> Dict[str, int]:
+    """First panel row of each symbol whose features are all finite (``ok`` = per-row finite mask, ``codes`` = the
+    integer symbol code of every row)."""
     out = {}
-    names = panel["symbol"].to_numpy()
-    for sym in dict.fromkeys(names):
-        rows = np.flatnonzero(names == sym)               # positional rows (no per-symbol copy of the frame)
+    for i, sym in enumerate(symbols):
+        rows = np.flatnonzero(codes == i)                  # positional rows, integer comparison
         bad = np.flatnonzero(~ok[rows])
         # non-finite features are allowed in the warm-up only: a contiguous block from the symbol's first row
         if len(bad) and (bad[-1] != len(bad) - 1 or bad[-1] >= len(rows) - 1):
@@ -303,7 +305,10 @@ def fold_data(panel: pd.DataFrame, feats: Sequence[str], fit_rows: np.ndarray, p
     if symbol_encoding not in SYMBOL_ENCODINGS:
         raise ValueError(f"symbol_encoding must be one of {SYMBOL_ENCODINGS}, got {symbol_encoding!r}")
     feats = list(feats)
-    syms = list(dict.fromkeys(panel["symbol"]))
+    codes, uniques = pd.factorize(panel["symbol"])          # once: integer codes serve every use below
+    if (codes < 0).any():
+        raise ValueError("the panel has rows without a symbol")
+    syms = list(uniques)
     if pooled and symbol_encoding == "onehot" and len(syms) > MAX_ONEHOT_SYMBOLS:
         raise ValueError(f"pooled one-hot symbol channels are limited to {MAX_ONEHOT_SYMBOLS} symbols "
                          f"({len(syms)} given); use symbol_encoding='id'")
@@ -325,7 +330,6 @@ def fold_data(panel: pd.DataFrame, feats: Sequence[str], fit_rows: np.ndarray, p
     np.putmask(X, np.isnan(X), 0.0)                # warm-up rows only; never inside a used window (first_ok)
     channels = list(feats)
     if pooled:
-        codes = pd.Index(syms).get_indexer(panel["symbol"])
         if symbol_encoding == "onehot":
             oh = (codes[:, None] == np.arange(len(syms))[None, :]).astype(np.float32)
             X = np.concatenate([X, oh], 1)
@@ -334,7 +338,8 @@ def fold_data(panel: pd.DataFrame, feats: Sequence[str], fit_rows: np.ndarray, p
             ident = codes / max(len(syms) - 1, 1)
             X = np.concatenate([X, ident[:, None].astype(np.float32)], 1)
             channels.append("sym_id")
-    return FoldData(X, _first_finite_rows(panel, ok), {"median": med.tolist(), "iqr": iqr.tolist()}, channels)
+    return FoldData(X, _first_finite_rows(codes, syms, ok), {"median": med.tolist(), "iqr": iqr.tolist()}, channels,
+                    codes, syms)
 
 
 def usable(panel: pd.DataFrame, rows: np.ndarray, lookback: int, first_ok: Dict[str, int]) -> np.ndarray:

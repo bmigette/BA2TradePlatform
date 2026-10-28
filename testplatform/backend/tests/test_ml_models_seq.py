@@ -983,3 +983,97 @@ def test_the_minirocket_branch_reads_its_parameters_without_defaults():
     src = inspect.getsource(TSAIModelService.create_model)
     branch = src[src.index("elif model_type == 'minirocket'"):src.index("elif model_type == 'patchtst'")]
     assert ".get(" not in branch
+
+
+# ------------------------------------------------------------------ final review items
+def test_darts_is_pinned_to_the_tested_range_and_the_reason_is_stated():
+    import importlib.metadata
+    import os
+    import re
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "requirements.txt")
+    text = open(path, encoding="utf-8").read()
+    assert re.search(r"^darts>=0\.48,<0\.49\b", text, re.M), "darts must be pinned to >=0.48,<0.49"
+    assert "PLModuleInput" in text                                          # the comment names why
+    assert importlib.metadata.version("darts").startswith("0.48.")          # and the tested version is inside the pin
+
+
+def test_the_batched_forward_is_self_checked_against_the_public_forecast_at_the_end_of_fit(monkeypatch):
+    d = darts_data()
+    (Xt, yt), (Xv, yv) = d["train"], d["val"]
+    fit_darts(d, seed=1)                                                    # the check passes on the real layout
+    import darts.utils.data.torch_datasets.utils as du
+    real = du.PLModuleInput
+
+    def swapped(**kw):                                                      # a "layout change": covariates reversed in time
+        kw["past_covariates"] = kw["past_covariates"].flip(1)
+        return real(**kw)
+
+    monkeypatch.setattr(du, "PLModuleInput", swapped)
+    ad = MM.make_adapter("darts", params=DFAST)
+    with pytest.raises(RuntimeError, match="batched"):
+        ad.fit(Xt, yt, Xv, yv, task="quantile", seed=1)
+    assert ad.task is None and not hasattr(ad, "_net")                      # and the adapter is left unfitted
+    monkeypatch.undo()
+    # tft has no batched path: nothing to check, fits as before
+    fit_darts(d, seed=1, arch="tft")
+
+
+def test_stratified_uniforms_cover_every_stratum_once_per_step_and_are_seeded():
+    u = MS._stratified_uniforms(200, 6, seed=3)
+    assert u.shape == (200, 6)
+    want = (np.arange(200) + 0.5) / 200
+    for t in range(6):
+        np.testing.assert_allclose(np.sort(u[:, t]), want)
+    assert not np.array_equal(u[:, 0], u[:, 1])                             # independent permutations per step
+    np.testing.assert_array_equal(u, MS._stratified_uniforms(200, 6, seed=3))
+    assert not np.array_equal(u, MS._stratified_uniforms(200, 6, seed=4))
+    # the draw's sample mean is exact for any linear function of u, which a plain uniform sample is not
+    assert abs(u.mean(0) - 0.5).max() < 1e-12
+
+
+def test_predict_chunk_scales_with_the_horizon_and_never_changes_the_result(monkeypatch):
+    assert MS._predict_chunk(35) == 2048 and MS._predict_chunk(7) == 10240 and MS._predict_chunk(4) == 17920
+    assert MS._predict_chunk(350) == 204 and MS._predict_chunk(5000) == 128
+    d = darts_data()
+    ad = fit_darts(d, seed=2)
+    X = d["test"][0]
+    full = ad.predict(X)
+    monkeypatch.setattr(MS, "_predict_chunk", lambda n_out: 7)
+    np.testing.assert_allclose(ad.predict(X), full, atol=1e-6)
+
+
+def test_tft_refuses_more_than_20000_rows_on_its_slow_path():
+    assert MS.TFT_MAX_ROWS == 20_000
+    d = darts_data()
+    ad = fit_darts(d, seed=1, arch="tft")
+    n = MS.TFT_MAX_ROWS + 1
+    rng = np.random.default_rng(0)
+    F = rng.normal(size=(n + 100, 3)).astype(np.float32)
+    big = MS.SequenceData(F, np.arange(DL - 1, DL - 1 + n), DL, np.zeros(n + 100, dtype=np.int64),
+                          returns=rng.normal(size=n + 100) * 0.02, horizon_steps=DH)
+    with pytest.raises(ValueError, match="20,000"):
+        ad.predict(big)
+    with pytest.raises(ValueError, match="batched"):
+        ad._forecast_quantiles(big)
+    assert ad.predict(big.take(big.rows[:20])).shape == (20, 9)             # a small request is fine
+
+
+def test_symbols_are_factorized_once_per_call(monkeypatch):
+    from app.services import ml_search
+    calls = {"n": 0}
+    real = pd.factorize
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(pd, "factorize", counting)
+    panel = _panel(n_sym=4, n=120)
+    ml_search.fold_data(panel, ["f0", "f2"], np.arange(0, 100), True)
+    assert calls["n"] == 1
+    calls["n"] = 0
+    sd = MS.sequence_data_from_panel(panel, ["f0", "f2"], np.arange(0, 100), lookback=8, pooled=True,
+                                     rows=np.arange(0, 480), with_returns=True)
+    assert calls["n"] == 1
+    assert sd.series_start[130] == 120 and sd.series_start[250] == 240         # the first row of each symbol
+    assert sd.returns[120] == 0.0 and sd.returns[121] != 0.0
