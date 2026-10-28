@@ -52,14 +52,38 @@ from app.services.model_interface import ITrainingService
 from app.services.tsai_models import DEVICE, MPS_AVAILABLE, CUDA_AVAILABLE
 
 
-def class_pos_weight(y_train: np.ndarray, prediction_mode: str):
-    """Positive-class weight (negatives / positives) for ``weighted_ce`` from the TRAINING labels.
+def class_count(labels) -> int:
+    """Number of classes the network head needs for these labels (NaN rows ignored).
 
-    'shift': one float for the binary label. 'multistep': one weight per horizon (a list), since the
-    class balance differs per target. A class with no training examples has no defined weight and is
-    an error, not a silent unweighted loss.
+    The labels must be non-negative integers (0..k-1, e.g. triple_barrier 0/1/2). The head is sized
+    for the HIGHEST label so every index the loss sees is in range; fewer than two observed classes
+    still gives a binary head (a frame whose labels are all 0 is a degenerate binary problem, not a
+    1-class one).
+    """
+    y = pd.Series(np.asarray(labels).ravel(), dtype=float).dropna()
+    if y.empty:
+        raise ValueError("class_count: no labels")
+    if (y < 0).any() or (y != y.round()).any():
+        raise ValueError(
+            f"classification needs integer class labels 0..k-1; got values {sorted(y.unique().tolist())[:8]}"
+        )
+    return max(2, int(y.max()) + 1)
+
+
+def class_pos_weight(y_train: np.ndarray, prediction_mode: str, n_classes: int = 2):
+    """Class weights for ``weighted_ce`` from the TRAINING labels.
+
+    'shift', binary: the positive-class weight (negatives / positives), one float. 'shift' with
+    ``n_classes`` > 2: one inverse-frequency weight per class, ``n / (k * count)``. 'multistep': one
+    weight per horizon (a list), since the class balance differs per target. A class with no training
+    examples has no defined weight and is an error, not a silent unweighted loss.
     """
     y = np.asarray(y_train)
+    if prediction_mode != 'multistep' and n_classes > 2:
+        counts = np.array([(y == c).sum() for c in range(n_classes)])
+        if (counts == 0).any():
+            raise ValueError(f"weighted_ce needs every class in the training labels; counts per class: {counts.tolist()}")
+        return (len(y) / (n_classes * counts)).astype(float).tolist()
     if prediction_mode == 'multistep':
         pos = (y == 1).sum(axis=0)
         neg = (y == 0).sum(axis=0)
@@ -510,7 +534,11 @@ class TSAITrainingService(ITrainingService):
             elif loss_type == 'ce':
                 return CrossEntropyLossFlat()
             elif loss_type == 'weighted_ce' and pos_weight is not None:
-                weights = torch.tensor([1.0, pos_weight], dtype=torch.float32)
+                if isinstance(pos_weight, (list, tuple, np.ndarray)):
+                    # k > 2 classes: class_pos_weight gives one weight per class
+                    weights = torch.tensor(pos_weight, dtype=torch.float32)
+                else:
+                    weights = torch.tensor([1.0, pos_weight], dtype=torch.float32)
                 if DEVICE:
                     weights = weights.to(DEVICE)
                 return CrossEntropyLossFlat(weight=weights)
@@ -616,11 +644,14 @@ class TSAITrainingService(ITrainingService):
                     metrics=[],  # Multi-label metrics calculated in assess_model
                 )
             else:
+                # k > 2 classes: the binary-average defaults of the fastai metrics raise at the
+                # first validation pass, so average per class (macro) instead
+                avg = {'average': 'macro'} if class_count(y_all) > 2 else {}
                 learn = Learner(
                     dls,
                     model,
                     loss_func=loss_fn,
-                    metrics=[accuracy, F1Score(), Precision(), Recall()],
+                    metrics=[accuracy, F1Score(**avg), Precision(**avg), Recall(**avg)],
                 )
 
             # Move model to device
@@ -688,8 +719,9 @@ class TSAITrainingService(ITrainingService):
             model: Trained model or Learner
             test_data: Tuple of (X_test, y_test)
             metric: Primary metric to optimize
-            threshold: Classification threshold
-            prediction_mode: 'shift' for binary classification, 'multistep' for multi-label
+            threshold: Classification threshold (binary and multistep; a k > 2 head predicts the
+                softmax argmax and reports macro-averaged f1/precision/recall)
+            prediction_mode: 'shift' for single-label classification, 'multistep' for multi-label
             **kwargs: Additional options (e.g., 'learner' for Learner object)
 
         Returns:
@@ -718,6 +750,9 @@ class TSAITrainingService(ITrainingService):
                 if prediction_mode == 'multistep':
                     # Multi-step: sigmoid for each output
                     probs = torch.sigmoid(outputs).cpu().numpy()
+                elif outputs.shape[1] > 2:
+                    # k > 2 classes: the full softmax matrix, argmax is the prediction
+                    probs = torch.softmax(outputs, dim=1).cpu().numpy()
                 else:
                     # Shift: softmax for binary classification
                     probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
@@ -736,7 +771,7 @@ class TSAITrainingService(ITrainingService):
             # Calculate metrics
             from sklearn.metrics import (
                 f1_score, accuracy_score, precision_score, recall_score,
-                roc_auc_score, matthews_corrcoef, confusion_matrix
+                roc_auc_score, matthews_corrcoef, confusion_matrix, balanced_accuracy_score
             )
 
             if prediction_mode == 'multistep':
@@ -760,6 +795,26 @@ class TSAITrainingService(ITrainingService):
                 metrics['precision'] = np.mean([metrics[f'h{i+1}_precision'] for i in range(n_horizons)])
                 metrics['recall'] = np.mean([metrics[f'h{i+1}_recall'] for i in range(n_horizons)])
                 metrics['mcc'] = np.mean([matthews_corrcoef(y_true[:, h], y_pred[:, h]) for h in range(n_horizons)])
+                metrics['balanced_accuracy'] = np.mean(
+                    [balanced_accuracy_score(y_true[:, h], y_pred[:, h]) for h in range(n_horizons)])
+            elif probs.ndim == 2:
+                # k > 2 classes: argmax prediction (the binary threshold has no meaning), macro averages
+                k = probs.shape[1]
+                y_pred = probs.argmax(axis=1)
+                y_true = np.array(y_test)
+                labels = list(range(k))
+                metrics = {
+                    'f1_score': f1_score(y_true, y_pred, labels=labels, average='macro', zero_division=0),
+                    'accuracy': accuracy_score(y_true, y_pred),
+                    'precision': precision_score(y_true, y_pred, labels=labels, average='macro', zero_division=0),
+                    'recall': recall_score(y_true, y_pred, labels=labels, average='macro', zero_division=0),
+                    'mcc': matthews_corrcoef(y_true, y_pred),
+                    'balanced_accuracy': balanced_accuracy_score(y_true, y_pred),
+                }
+                # One-vs-rest AUC needs every class present in y_true
+                if len(np.unique(y_true)) == k:
+                    metrics['auc_roc'] = roc_auc_score(y_true, probs, multi_class='ovr', labels=labels)
+                metrics['confusion_matrix'] = confusion_matrix(y_true, y_pred, labels=labels).tolist()
             else:
                 # Shift: standard binary classification
                 y_pred = (np.array(probs) > threshold).astype(int)
@@ -771,6 +826,7 @@ class TSAITrainingService(ITrainingService):
                     'precision': precision_score(y_true, y_pred, zero_division=0),
                     'recall': recall_score(y_true, y_pred, zero_division=0),
                     'mcc': matthews_corrcoef(y_true, y_pred),
+                    'balanced_accuracy': balanced_accuracy_score(y_true, y_pred),
                 }
 
                 # AUC-ROC if we have both classes
@@ -828,7 +884,7 @@ class TSAITrainingService(ITrainingService):
 
         Returns:
             Predictions (probabilities for all classes)
-            - Shift mode: 2D array of probabilities (samples, 2) for [class_0, class_1]
+            - Shift mode: 2D array of probabilities (samples, k) for [class_0, ..., class_k-1]
             - Multi-step mode: 2D array of probabilities (samples, n_horizons)
         """
         if not TSAI_AVAILABLE:

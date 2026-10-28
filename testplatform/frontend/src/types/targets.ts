@@ -56,20 +56,11 @@ export interface TripleBarrierTarget extends BaseTargetConfig {
 export interface TrendReversalTarget extends BaseTargetConfig {
   type: 'trend_reversal';
   category: 'binary_classification';
-  indicator: 'rsi' | 'macd' | 'sar' | 'zigzag' | 'donchian' | 'adx' | 'stochastic';
+  // donchian / adx / stochastic have no reversal rule in the backend (it refuses them)
+  indicator: 'rsi' | 'macd' | 'sar' | 'zigzag';
   indicatorParams: IndicatorParams;
   threshold: number;
   direction: 'bullish' | 'bearish';
-}
-
-// Unified 3-class trend target (bearish/neutral/bullish)
-export interface UnifiedTrendTarget extends BaseTargetConfig {
-  type: 'unified_trend';
-  category: 'multiclass_classification';
-  indicator: 'zigzag' | 'macd' | 'rsi' | 'adx';
-  indicatorParams: IndicatorParams;
-  // Classes: 0=bearish, 1=neutral, 2=bullish
-  classes: ['bearish', 'neutral', 'bullish'];
 }
 
 // Volatility target
@@ -113,7 +104,6 @@ export type TargetConfig =
   | DirectionalTarget
   | TripleBarrierTarget
   | TrendReversalTarget
-  | UnifiedTrendTarget
   | VolatilityTarget
   | TripleBarrierAtrTarget
   | DirectionTercilesTarget

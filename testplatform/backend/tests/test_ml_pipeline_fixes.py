@@ -463,66 +463,8 @@ class TestNoSnapshotBroadcast:
             assert "df[f'fundamental_{key}']" not in src, module.__name__
 
 
-# ---------------------------------------------------------------------------------------
-# #6  FRED observation date was used as the release date
-# ---------------------------------------------------------------------------------------
-class TestMacroReleaseLag:
-    def _service(self, monkeypatch, frames):
-        from app.services.macro import MacroService
-        svc = MacroService(api_key='test-key')
-        monkeypatch.setattr(svc, 'get_macro_data', lambda indicators, start, end: {
-            k: v.copy() for k, v in frames.items() if k in indicators
-        })
-        return svc
-
-    @staticmethod
-    def _rows(dates):
-        return pd.DataFrame({'Date': pd.to_datetime(dates), 'Close': 1.0})
-
-    def test_monthly_value_is_not_visible_on_its_observation_date(self, monkeypatch):
-        # FRED stamps March CPI 2024-03-01; it is published mid-April
-        cpi = pd.DataFrame({'Date': pd.to_datetime(['2024-02-01', '2024-03-01']), 'inflation': [310.0, 312.0]})
-        svc = self._service(monkeypatch, {'inflation': cpi})
-        out = svc.integrate_macro_with_ohlc(
-            self._rows(['2024-03-05', '2024-03-20', '2024-04-10', '2024-04-20']), ['inflation']
-        )
-        # Feb CPI (obs 02-01) is public from 02-01 + 45d = 03-17; Mar CPI from 04-15
-        assert np.isnan(out['inflation'].iloc[0])
-        assert list(out['inflation'].iloc[1:]) == [310.0, 310.0, 312.0]
-
-    def test_quarterly_gdp_waits_for_the_advance_estimate(self, monkeypatch):
-        gdp = pd.DataFrame({'Date': pd.to_datetime(['2023-10-01', '2024-01-01']), 'gdp': [27000.0, 27500.0]})
-        svc = self._service(monkeypatch, {'gdp': gdp})
-        out = svc.integrate_macro_with_ohlc(self._rows(['2024-01-15', '2024-03-15', '2024-05-05']), ['gdp'])
-        # Q1-2024 (obs 01-01) is public from 01-01 + 120d = 04-30; Q4-2023 from 2023-10-01 + 120d = 01-29
-        assert np.isnan(out['gdp'].iloc[0])
-        assert list(out['gdp'].iloc[1:]) == [27000.0, 27500.0]
-
-    def test_daily_series_is_shifted_by_one_session(self, monkeypatch):
-        vix = pd.DataFrame({'Date': pd.to_datetime(['2024-03-04', '2024-03-05']), 'vix': [14.0, 25.0]})
-        svc = self._service(monkeypatch, {'vix': vix})
-        out = svc.integrate_macro_with_ohlc(self._rows(['2024-03-04', '2024-03-05', '2024-03-06']), ['vix'])
-        # the 03-05 close (25.0) cannot be on the 03-05 row; it appears on 03-06
-        assert np.isnan(out['vix'].iloc[0])
-        assert list(out['vix'].iloc[1:]) == [14.0, 25.0]
-
-    def test_days_since_counts_from_the_release(self, monkeypatch):
-        cpi = pd.DataFrame({'Date': pd.to_datetime(['2024-02-01']), 'inflation': [310.0]})
-        svc = self._service(monkeypatch, {'inflation': cpi})
-        out = svc.integrate_macro_with_ohlc(self._rows(['2024-03-27']), ['inflation'])
-        assert out['inflation_days_since'].iloc[0] == 10     # released 2024-03-17
-
-    def test_every_indicator_declares_a_release_lag(self):
-        from app.services.macro import MacroService
-        for name, cfg in MacroService.MACRO_INDICATORS.items():
-            assert cfg['release_lag_days'] >= 1, name
-
-    def test_yield_curve_uses_released_values(self, monkeypatch):
-        y2 = pd.DataFrame({'Date': pd.to_datetime(['2024-03-04', '2024-03-05']), 'yield_2y': [4.0, 4.5]})
-        y10 = pd.DataFrame({'Date': pd.to_datetime(['2024-03-04', '2024-03-05']), 'yield_10y': [4.2, 4.1]})
-        svc = self._service(monkeypatch, {'yield_2y': y2, 'yield_10y': y10})
-        out = svc.create_yield_curve_features(self._rows(['2024-03-05', '2024-03-06']))
-        assert out['yield_2y'].tolist() == [4.0, 4.5]       # 03-05 row only knows the 03-04 close
+# #6  (FRED observation date used as the release date): superseded by the first-release cache reader,
+# see TestMacroFirstRelease in test_ml_pipeline_v2_cleanups.py
 
 
 # ---------------------------------------------------------------------------------------

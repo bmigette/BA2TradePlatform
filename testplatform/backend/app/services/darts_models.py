@@ -1135,6 +1135,14 @@ class PredictionTargetService:
                     if prev_slope > 0 and next_slope < 0:
                         targets[i] = 1
 
+        else:
+            # donchian / adx / stochastic used to fall through here and return an all-zero target,
+            # which trains as "never reverses" and looks like a model that learned nothing
+            raise ValueError(
+                f"trend_reversal indicator '{indicator}' has no reversal rule; "
+                f"supported: rsi, macd, sar, zigzag"
+            )
+
         col_name = f"reversal_{indicator}_{direction}"
         return pd.Series(targets, index=df.index, name=col_name)
 

@@ -725,7 +725,7 @@ class DartsTrainingService(ITrainingService):
         return metrics
 
     def _regression_metrics(self, preds: List[Any], acts: List[Any], n_test_points: int) -> Dict[str, float]:
-        """MAE / RMSE / MAPE over the pooled (already inverse-transformed) predictions.
+        """MAE / MSE / RMSE / R2 / MAPE over the pooled (already inverse-transformed) predictions.
 
         Scored on the rolling one-step forecasts of the WHOLE block. This used to forecast
         ``output_chunk_length`` (1-7) points straight after the end of the TRAINING series and
@@ -738,10 +738,18 @@ class DartsTrainingService(ITrainingService):
 
         metrics = {
             'mae': float(np.mean(np.abs(err))),
+            'mse': float(np.mean(err ** 2)),
             'rmse': float(np.sqrt(np.mean(err ** 2))),
             'test_samples': n_test_points,
             'predictions_made': len(pred_values)
         }
+        # R2 = 1 - SS_res / SS_tot is undefined when the actuals are constant
+        ss_tot = float(np.sum((actual_values - actual_values.mean()) ** 2))
+        if ss_tot > 0:
+            metrics['r2'] = float(1.0 - np.sum(err ** 2) / ss_tot)
+        else:
+            metrics['r2'] = None
+            logger.debug("R2 skipped - actual values are constant")
         # MAPE requires strictly positive values
         if actual_values.min() > 0:
             metrics['mape'] = float(np.mean(np.abs(err / actual_values)) * 100)

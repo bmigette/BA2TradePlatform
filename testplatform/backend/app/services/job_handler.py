@@ -1438,6 +1438,32 @@ def load_datasets_separate(
     return dataframes, infos
 
 
+def metric_fitness(optimize_metric: str, eval_result: Dict[str, Any]) -> float:
+    """GA fitness (higher is better, never negative) from the selected evaluation metric.
+
+    Error metrics (mape, mae, mse, rmse) are lower-is-better and map to ``1 / (1 + error)``. R2 is
+    higher-is-better but unbounded below; ``1 / (1 + (1 - r2))`` keeps it monotone and positive (the
+    GA only tracks a best above 0). Classification metrics (f1_score, accuracy, ...) pass through.
+    """
+    if optimize_metric in {'mape', 'mae', 'mse', 'rmse'}:
+        # The metric must have been computed (a missing key is a bug, not a fitness of 100); a None
+        # value (mape needs positive actuals) is the worst fitness, like r2 below.
+        if optimize_metric not in eval_result:
+            raise KeyError(f"evaluation result has no '{optimize_metric}' to optimise: {sorted(eval_result)}")
+        error = eval_result[optimize_metric]
+        if error is None:
+            return 0.0
+        return 1.0 / (1.0 + (error / 100 if optimize_metric == 'mape' else error))
+    if optimize_metric == 'r2':
+        if 'r2' not in eval_result:
+            raise KeyError(f"evaluation result has no 'r2' to optimise: {sorted(eval_result)}")
+        r2 = eval_result['r2']
+        if r2 is None:
+            return 0.0
+        return 1.0 / (1.0 + (1.0 - r2))
+    return eval_result.get(optimize_metric, 0.0)
+
+
 class TargetBuildError(ValueError):
     """A prediction-target config could not be turned into a label column."""
 
@@ -2457,20 +2483,7 @@ def train_single_model(
             if 'error' in eval_result:
                 return 0.0
 
-            # Calculate fitness based on metric type
-            if optimize_metric == 'mape':
-                # Lower MAPE is better - convert to fitness (higher is better)
-                mape_val = eval_result.get('mape', 100)
-                if mape_val is None:
-                    mape_val = 100
-                fitness = 1.0 / (1.0 + mape_val / 100)
-            elif optimize_metric in {'mae', 'rmse'}:
-                # Lower is better for regression metrics
-                metric_val = eval_result.get(optimize_metric, 100)
-                fitness = 1.0 / (1.0 + metric_val)
-            else:
-                # Classification metrics (f1_score, accuracy, etc.) - higher is better
-                fitness = eval_result.get(optimize_metric, 0.0)
+            fitness = metric_fitness(optimize_metric, eval_result)
 
             # Track best
             if best_model[0] is None or fitness > best_metrics[0].get('fitness', 0):
@@ -2632,7 +2645,7 @@ def train_classification_optimization(
     """
     from app.services.task_queue import get_task_queue
     from app.services.tsai_models import TSAIModelService, TSAI_AVAILABLE
-    from app.services.tsai_training import TSAITrainingService, class_pos_weight
+    from app.services.tsai_training import TSAITrainingService, class_pos_weight, class_count
 
     if not TSAI_AVAILABLE:
         return {
@@ -2640,6 +2653,22 @@ def train_classification_optimization(
             'status': 'failed',
             'error': 'tsai library not available for classification'
         }
+
+    # Width of the network head in 'shift' mode: 2 for a 0/1 label, k for a k-class label
+    # (triple_barrier 0/1/2, direction_terciles). Taken from the labels, not assumed binary.
+    try:
+        n_classes = class_count(pd.concat([f[target_column] for f in frames], ignore_index=True))
+    except ValueError as e:
+        return {'model_type': 'classification', 'status': 'failed', 'error': f'{target_column}: {e}'}
+    if n_classes > 2 and 'multistep' in prediction_modes:
+        # multistep is one sigmoid per horizon on a 0/1 label; there is no k-class form of it
+        return {
+            'model_type': 'classification',
+            'status': 'failed',
+            'error': f"multistep prediction needs a binary target; {target_column} has {n_classes} classes "
+                     f"(use prediction mode 'shift')"
+        }
+    logger.info(f"Classification target {target_column}: {n_classes} classes")
 
     # Get normalization buffer from parameter ranges (default 35% if not specified for old configs)
     normalization_buffer = parameter_ranges.get('normalizationBuffer', 35) / 100.0  # Convert % to decimal
@@ -2735,7 +2764,7 @@ def train_classification_optimization(
                 X_train, X_test, y_train, y_test = (
                     split['X_train'], split['X_val'], split['y_train'], split['y_val']
                 )
-                c_out = 2 if mode == 'shift' else prediction_horizon
+                c_out = n_classes if mode == 'shift' else prediction_horizon
                 # Get the actual valid columns used after dropping zero-variance columns
                 valid_feature_columns = training_service.data_prep.get_valid_columns() if training_service.data_prep else feature_columns
                 # Get normalization params for inference consistency
@@ -2910,7 +2939,7 @@ def train_classification_optimization(
                 prediction_mode=mode,
                 # weighted_ce was created WITHOUT a weight (silently the plain loss); weight the
                 # positive class by the training class balance
-                pos_weight=class_pos_weight(y_train, mode) if loss_name == 'weighted_ce' else None
+                pos_weight=class_pos_weight(y_train, mode, n_classes) if loss_name == 'weighted_ce' else None
             )
 
             # Create epoch callback for training progress
@@ -3589,20 +3618,7 @@ def train_unified_optimization(
                 )
                 return 0.0
 
-            # Calculate fitness based on metric type
-            if optimize_metric == 'mape':
-                # Lower MAPE is better - convert to fitness (higher is better)
-                mape_val = eval_result.get('mape', 100)
-                if mape_val is None:
-                    mape_val = 100
-                fitness = 1.0 / (1.0 + mape_val / 100)
-            elif optimize_metric in {'mae', 'rmse'}:
-                # Lower is better for regression metrics
-                metric_val = eval_result.get(optimize_metric, 100)
-                fitness = 1.0 / (1.0 + metric_val)
-            else:
-                # Classification metrics (f1_score, accuracy, etc.) - higher is better
-                fitness = eval_result.get(optimize_metric, 0.0)
+            fitness = metric_fitness(optimize_metric, eval_result)
 
             # Capture training history before it gets reset
             training_history = get_epoch_history(task_id)

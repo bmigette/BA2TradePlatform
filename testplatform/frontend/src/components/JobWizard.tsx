@@ -186,11 +186,6 @@ const getDefaultState = () => ({
   selectedDatasetIds: [] as number[],
   multiDatasetMode: 'multi-series' as 'batch' | 'multi-series',
   datasetCompatibility: null as { compatible: boolean; message: string } | null,
-  crossValidation: {
-    enabled: false,
-    mode: 'manual' as 'manual' | 'kfold',
-    testDatasetIds: [] as number[],
-  },
   selectedModels: [] as string[],
   parameterRanges: {
     layersMin: 2,
@@ -706,7 +701,6 @@ const JobWizard: React.FC<JobWizardProps> = ({
           body: JSON.stringify({
             ...basePayload,
             datasetIds: state.selectedDatasetIds,
-            crossValidation: state.selectedDatasetIds.length > 1 ? state.crossValidation : undefined,
           }),
         });
         if (!response.ok) throw new Error('Failed to create job');
@@ -1609,116 +1603,6 @@ const Step1Settings: React.FC<Step1Props> = ({
           </p>
         )}
       </div>
-
-      {/* Cross-Validation (multi-series mode only) */}
-      {state.selectedDatasetIds.length > 1 && state.multiDatasetMode === 'multi-series' && (
-        <div className="border border-gray-200 dark:border-gray-600 rounded-lg p-4">
-          <label className="flex items-center space-x-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={state.crossValidation.enabled}
-              onChange={(e) => setState(prev => ({
-                ...prev,
-                crossValidation: { ...prev.crossValidation, enabled: e.target.checked }
-              }))}
-              className="w-4 h-4 text-green-600 border-gray-300 rounded focus:ring-green-500"
-            />
-            <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
-              Dataset Cross-Validation
-            </span>
-          </label>
-
-          {state.crossValidation.enabled && (
-            <div className="mt-3 space-y-3">
-              {/* Mode selector */}
-              <div className="flex space-x-4">
-                <label className="flex items-center space-x-2 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="cvMode"
-                    value="manual"
-                    checked={state.crossValidation.mode === 'manual'}
-                    onChange={() => setState(prev => ({
-                      ...prev,
-                      crossValidation: { ...prev.crossValidation, mode: 'manual' }
-                    }))}
-                    className="w-4 h-4 text-green-600"
-                  />
-                  <span className="text-sm">Manual</span>
-                </label>
-                <label className="flex items-center space-x-2 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="cvMode"
-                    value="kfold"
-                    checked={state.crossValidation.mode === 'kfold'}
-                    onChange={() => setState(prev => ({
-                      ...prev,
-                      crossValidation: { ...prev.crossValidation, mode: 'kfold' }
-                    }))}
-                    className="w-4 h-4 text-green-600"
-                  />
-                  <span className="text-sm">K-Fold</span>
-                </label>
-              </div>
-
-              {/* Manual mode: assign Train/Test per dataset */}
-              {state.crossValidation.mode === 'manual' && (
-                <div className="space-y-1">
-                  <p className="text-xs text-gray-500 mb-2">Assign each dataset as Train or Test:</p>
-                  {selectedDatasets.map(ds => (
-                    <div key={ds.id} className="flex items-center justify-between p-2 bg-gray-50 dark:bg-gray-700 rounded">
-                      <span className="text-sm">{ds.name} ({ds.ticker})</span>
-                      <div className="flex space-x-3">
-                        <label className="flex items-center space-x-1 cursor-pointer">
-                          <input
-                            type="radio"
-                            name={`cv-role-${ds.id}`}
-                            checked={!state.crossValidation.testDatasetIds.includes(ds.id)}
-                            onChange={() => setState(prev => ({
-                              ...prev,
-                              crossValidation: {
-                                ...prev.crossValidation,
-                                testDatasetIds: prev.crossValidation.testDatasetIds.filter(id => id !== ds.id)
-                              }
-                            }))}
-                            className="w-3 h-3 text-green-600"
-                          />
-                          <span className="text-xs text-green-700 dark:text-green-400">Train</span>
-                        </label>
-                        <label className="flex items-center space-x-1 cursor-pointer">
-                          <input
-                            type="radio"
-                            name={`cv-role-${ds.id}`}
-                            checked={state.crossValidation.testDatasetIds.includes(ds.id)}
-                            onChange={() => setState(prev => ({
-                              ...prev,
-                              crossValidation: {
-                                ...prev.crossValidation,
-                                testDatasetIds: [...prev.crossValidation.testDatasetIds.filter(id => id !== ds.id), ds.id]
-                              }
-                            }))}
-                            className="w-3 h-3 text-orange-600"
-                          />
-                          <span className="text-xs text-orange-700 dark:text-orange-400">Test</span>
-                        </label>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* K-Fold mode: explanation */}
-              {state.crossValidation.mode === 'kfold' && (
-                <p className="text-xs text-gray-500 bg-gray-50 dark:bg-gray-700 p-3 rounded">
-                  Each dataset will be used as the test set once, training {state.selectedDatasetIds.length} models total.
-                  Results are averaged across all folds.
-                </p>
-              )}
-            </div>
-          )}
-        </div>
-      )}
 
       {/* Sequence Length (for classification) */}
       {state.jobType === 'classification' && (
