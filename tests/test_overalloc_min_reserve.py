@@ -78,3 +78,33 @@ def test_reserve_capped_at_the_reserver_slice_and_out_of_range_refused():
 def test_builtin_setting_defaults_to_zero():
     MarketExpertInterface._ensure_builtin_settings()
     assert MarketExpertInterface._builtin_settings["overalloc_min_res_pct"]["default"] == 0.0
+
+
+class _MarginAccount(_FakeAccount):
+    """Margin on: the platform ceiling (tradable balance) is below the broker's buying power."""
+
+    def __init__(self, id_val, headroom, **kw):
+        super().__init__(id_val, **kw)
+        self._headroom = headroom
+
+    def get_tradable_balance(self):
+        return 150_000.0    # balance 100k x margin_factor 1.5
+
+    def get_stock_exposure_headroom(self):
+        return self._headroom
+
+
+@pytest.mark.usefixtures("reset_test_db")
+def test_reserve_also_binds_the_margin_ceiling():
+    """Audit 2026-10-28 H-1: buying power (90k - 30k reserved = 60k) leaves room, but the ceiling
+    headroom (50k) must lose the other expert's reserve too, or the reserve is spent through it."""
+    acct = factories.create_account_definition()
+    a = factories.create_expert_instance(account_id=acct.id, expert="_BalanceExpert",
+                                         virtual_equity_pct=100.0)
+    b = factories.create_expert_instance(account_id=acct.id, expert="_BalanceExpert",
+                                         virtual_equity_pct=50.0)
+    experts = {a.id: _Expert(a.id, 0.0), b.id: _Expert(b.id, 20.0)}    # b reserves 20% of 150k
+    account = _MarginAccount(acct.id, headroom=50_000.0, balance=100_000.0,
+                             account_info={"buying_power": 90_000.0})
+    assert _run(account, experts, experts[a.id].get_available_balance) == pytest.approx(20_000.0)
+    assert _run(account, experts, experts[b.id].get_available_balance) == pytest.approx(50_000.0)

@@ -1911,6 +1911,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # the account can actually spend. Cap it at the broker's real available balance so an
             # expert is never told it can afford more than the account actually has.
             actual_available = self._get_actual_available_balance(account, expert_id=self.id)
+            reserved = 0.0
             if actual_available is not None:
                 # The undeployed reserve of the OTHER experts (overalloc_min_res_pct) is not this
                 # expert's to spend: on an over-allocated account the reserving expert keeps it.
@@ -1978,6 +1979,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     logger.warning(message)
             else:
                 headroom = headroom_reader()
+                if headroom is not None and reserved > 0.0 and not equity_base:
+                    # The other experts' undeployed reserve binds the ceiling too, not only the
+                    # broker's buying power: on a margin account buying power exceeds the
+                    # ceiling, so without this an expert could fill the ceiling up to the last
+                    # dollar of another expert's reserve. Both figures are tradable-balance dollars.
+                    headroom -= reserved
                 if headroom is not None and headroom < available_balance:
                     # DEBUG, not INFO (2026-09-10 review, finding 4): this fires on EVERY
                     # balance read -- 353 times in one production session -- and the clamp
