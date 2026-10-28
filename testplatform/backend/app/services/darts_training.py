@@ -44,6 +44,56 @@ except ImportError:
     DARTS_AVAILABLE = False
 
 
+def fill_masked_covariates(cov: pd.DataFrame, n_fit: int) -> Tuple[pd.DataFrame, List[str]]:
+    """Neutral values for the cells the daily source's coverage mask blanked, so the past-only forward fill never carries
+    a value across a masked (group, year).
+
+    A dataset from the daily feature store marks a thin (group, year) with ``<prefix>missing`` = 1 and NaN in the group's
+    columns (``ml_features.apply_coverage_mask``). Those NaN are "no data", not "gap in a value": forward-filling them
+    would show a model last year's last value as this year's. Here each such cell becomes the MEDIAN of the column's
+    unmasked values in the first ``n_fit`` rows (the train block, the same rows the covariate scaler is fitted on), so
+    no later value reaches an earlier row. A median rather than 0 because the inputs are not standardised at this point
+    (the Scaler min-maxes them afterwards, so the median stays inside the train range); a column with no unmasked train
+    value gets 0.0 and a warning. The ``missing`` flag itself is untouched and stays a feature. A group masked in every
+    row has nothing to learn from: its columns are dropped (warning), its flag stays.
+
+    Only the flags of the daily store's group prefixes count (``ml_dataset_source.daily_column_prefixes``), so any other
+    dataset is returned unchanged. Returns ``(covariates, dropped columns)``."""
+    from app.services.ml_dataset_source import daily_column_prefixes
+    prefixes = set(daily_column_prefixes())
+    out = cov.copy()
+    dropped: List[str] = []
+    for flag in [c for c in cov.columns if c.endswith("_missing")]:
+        prefix = flag[: -len("missing")]
+        if prefix not in prefixes:
+            continue
+        flagged = (out[flag] == 1.0).to_numpy()
+        # `_covered` flags are never masked (they describe the data, not carry it)
+        group = [c for c in cov.columns if c != flag and c.startswith(prefix)
+                 and not c.endswith(("_covered", "_missing"))]
+        if not flagged.any() or not group:
+            continue
+        if flagged.all():
+            logger.warning(f"Group {prefix!r} is masked in every row (coverage threshold): dropping its columns "
+                           f"{group[:8]}{'...' if len(group) > 8 else ''}; {flag} stays as a feature")
+            out = out.drop(columns=group)
+            dropped += group
+            continue
+        for c in group:
+            masked = flagged & out[c].isna().to_numpy()
+            if not masked.any():
+                continue
+            train = out[c].iloc[:n_fit]
+            train = train[~flagged[:n_fit]].dropna()
+            if train.empty:
+                logger.warning(f"{c}: no unmasked value in the train block, masked cells set to 0.0")
+                neutral = 0.0
+            else:
+                neutral = float(train.median())
+            out.loc[masked, c] = neutral
+    return out, dropped
+
+
 class DartsTrainingService(ITrainingService):
     """
     Darts-based training service for time series regression/forecasting.
@@ -123,7 +173,12 @@ class DartsTrainingService(ITrainingService):
         if feature_columns:
             available_cols = [c for c in feature_columns if c in df_sorted.columns]
             if available_cols:
-                cov_df = df_sorted[available_cols].ffill()
+                # Cells blanked by the daily source's coverage mask get a train-fitted neutral value FIRST, so the
+                # forward fill below never carries a value across a masked (group, year) and first_complete ignores them.
+                n_fit = len(df_sorted) if scaler_fit_ratio is None else max(1, int(len(df_sorted) * scaler_fit_ratio))
+                cov_df, dropped = fill_masked_covariates(df_sorted[available_cols], n_fit)
+                available_cols = [c for c in available_cols if c not in dropped]
+                cov_df = cov_df.ffill()
                 empty_cols = [c for c in available_cols if cov_df[c].isna().all()]
                 if empty_cols:
                     raise ValueError(f"Covariate columns without any value: {empty_cols[:5]}")
