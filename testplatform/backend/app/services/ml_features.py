@@ -28,6 +28,7 @@ price level.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import date
@@ -229,6 +230,7 @@ class BuildContext:
     sector_of: Dict[str, str] = field(default_factory=dict)
     membership: Optional[pd.DataFrame] = None
     sector_overrides: Dict[str, str] = field(default_factory=dict)
+    provenance: Dict[str, object] = field(default_factory=dict)      # filled by groups: what files they read
 
     def member_mask(self) -> pd.DataFrame:
         """(sessions x universe) bool: who is in the cross-section on each session."""
@@ -654,44 +656,157 @@ MAC_COLUMNS: Tuple[str, ...] = tuple(
 #: Sessions of history the 20-session change and the 252-session z-score need before the first built session
 #: (calendar days; 460 is ~316 sessions), so those columns are defined from the first session on.
 _MAC_HISTORY_DAYS = 460
+#: ``fred_series`` raises ``MacroAvailabilityUnknown`` (no subclass, no code) for a decision labelled on or before the
+#: series' first recorded vintage; this is a fragment of that message, pinned by a test, the only way to tell it from
+#: the refusals that must propagate (missing / old cache).
 _BEFORE_FIRST_VINTAGE = "on or before the series' first recorded vintage"
+#: How long a value may be held: weekdays since it became public for a daily series, calendar days for a monthly one.
+#: Age is counted from the RELEASE (ALFRED realtime_start), not the observation date: a delayed release (the 2025
+#: shutdown) is not older than the day it became public. A longer hold refuses instead of carrying a dead series.
+MAX_HOLD_WEEKDAYS = 10
+MAX_HOLD_DAYS_MONTHLY = 75
+#: Known stalls of the real cache, as reviewed facts (series -> [(last release before the stall, first release after
+#: it)]): FRED published no BAA10Y between 2016-10-07 and 2017-03-22 (the observations of those months were first
+#: released together on 2017-03-22). Inside such a window the series is NaN (a 166-day-old spread is not the
+#: spread), outside any window an over-age value refuses.
+KNOWN_STALLS: Dict[str, List[Tuple[str, str]]] = {"BAA10Y": [("2016-10-07", "2017-03-22")]}
+#: Pinned first-release content of the real FRED cache (rows first released on or before ``FRED_PIN_CUTOFF``): number of
+#: rows and the first 16 hex digits of sha256(json.dumps([(date, value or None, realtime_start), ...])). DGS3MO, the
+#: legacy observation-date file, is pinned over (date, float(value)) for date <= the cutoff; the same rows with the
+#: values as strings digest to 6f412254a9723315 (the BT session's figure). FEDFUNDS (866, 051c1f1e135efad8) matches too
+#: but is not a MAC series. A build on a cache whose pinned part changed refuses: the features would not be reproducible.
+FRED_PIN_CUTOFF = "2026-09-30"
+REAL_FRED_PINS: Dict[str, Tuple[int, str]] = {
+    "BAA10Y": (10186, "7c375266b7540404"), "CPIAUCSL": (955, "3202c9fa1f77020e"), "DGS10": (16171, "b26e35debc223db1"),
+    "DGS3MO": (11270, "d8133ea13e3d18a2"), "PAYEMS": (1052, "6b869176a1b63918"), "T10Y3M": (11189, "aa1f40ccafe7a168"),
+    "UNRATE": (943, "faa617ca44da8c14"), "VIXCLS": (9285, "a9c65696dbec8602")}
+#: the active pins (a test can swap them for a synthetic cache)
+FRED_PINS: Dict[str, Tuple[int, str]] = dict(REAL_FRED_PINS)
 
 
-def _macro_value(series: pd.Series, kind: str) -> float:
-    """The transformed level from the observations visible at a session (``series``: obs date -> first-release value)."""
+class FredPinMismatch(PanelDataError):
+    """The FRED cache's pinned content is not what the features were specified on."""
+
+
+_FRED_FILE_MEMO: Dict[Tuple[str, int, int], Dict[str, object]] = {}
+
+
+def _read_fred_file(sid: str, folder: Path) -> Dict[str, object]:
+    """Read the series file DIRECTLY (not through the reader): its count / digest / header / release dates. Memoised
+    per file version."""
+    path = Path(folder) / "fred" / f"{sid}.json"
+    if not path.exists():
+        raise fs.MacroAvailabilityUnknown(f"FRED {sid}: not in the cache ({path}); warm it with tools/refresh_fred_cache.py")
+    st = path.stat()
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    hit = _FRED_FILE_MEMO.get(key)
+    if hit is not None:
+        return hit
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    obs = doc["observations"]
+    first_release = fs.SERIES_SPEC[sid]["availability"] == fs.AVAIL_FIRST_RELEASE
+    if first_release:
+        rows = [(o["date"], None if o["value"] == "." else float(o["value"]), o["realtime_start"])
+                for o in obs if o["realtime_start"] <= FRED_PIN_CUTOFF]
+        released = {pd.Timestamp(o["date"]): pd.Timestamp(o["realtime_start"]) for o in obs}
+        last_vintage = max((o["realtime_start"] for o in obs), default=None)
+    else:
+        rows = [(o["date"], None if o["value"] == "." else float(o["value"])) for o in obs if o["date"] <= FRED_PIN_CUTOFF]
+        released = {}
+        last_vintage = max((o["date"] for o in obs), default=None)
+    digest = hashlib.sha256(json.dumps(rows).encode()).hexdigest()[:16]
+    rec = {"count": len(rows), "digest": digest, "fetched_at": doc["fetched_at"] if "fetched_at" in doc else None,
+           "last_vintage": last_vintage, "released": released, "file": _fingerprint(path)}
+    _FRED_FILE_MEMO[key] = rec
+    return rec
+
+
+def fred_digest(series_id: str, folder: Optional[Path] = None) -> Tuple[int, str]:
+    """(row count, digest) of a series' pinned part (see ``REAL_FRED_PINS``), read straight from its cache file."""
+    rec = _read_fred_file(series_id, Path(fs.CACHE_FOLDER if folder is None else folder))
+    return rec["count"], rec["digest"]
+
+
+def check_fred_pins(folder: Path) -> Dict[str, Dict[str, object]]:
+    """Refuse (``FredPinMismatch``, naming the series) when a series' pinned part is not the pinned one. Returns the
+    provenance of every MAC series (header, last vintage, count, digest, file fingerprint)."""
+    prov: Dict[str, Dict[str, object]] = {}
+    for sid in MAC_SERIES:
+        rec = _read_fred_file(sid, folder)
+        if sid in FRED_PINS:
+            n, digest = FRED_PINS[sid]
+            if rec["count"] != n:
+                raise FredPinMismatch(f"FRED {sid}: {rec['count']} rows up to {FRED_PIN_CUTOFF}, pinned {n} (count mismatch); "
+                                      f"the cache is not the one the MAC features are specified on")
+            if rec["digest"] != digest:
+                raise FredPinMismatch(f"FRED {sid}: digest {rec['digest']} of the rows up to {FRED_PIN_CUTOFF}, pinned "
+                                      f"{digest} (digest mismatch); a pinned value or release date changed")
+        prov[sid] = {k: rec[k] for k in ("count", "digest", "fetched_at", "last_vintage", "file")}
+    return prov
+
+
+def _macro_value(series: pd.Series, kind: str) -> Tuple[float, Optional[pd.Timestamp]]:
+    """(value, observation date) of the newest observation with a valid transform; (NaN, None) if there is none.
+
+    The transform is computed AT THE OBSERVATION: ``lvl`` the value, ``yoy`` the value over the one 12 months earlier
+    minus 1, ``3m`` over the one 3 months earlier minus 1. An observation whose earlier month is missing (a skipped
+    release) has no transform, and the last valid transformed value is held instead of producing NaN."""
     if series.empty:
-        return np.nan
-    last, v = series.index[-1], float(series.iloc[-1])
+        return np.nan, None
     if kind == "lvl":
-        return v
+        return float(series.iloc[-1]), series.index[-1]
     months = 12 if kind == "yoy" else 3
-    prior = last - pd.DateOffset(months=months)
-    if prior not in series.index:
-        return np.nan
-    return v / float(series.loc[prior]) - 1.0
+    index = series.index
+    for k in range(1, min(len(series), _MAX_BACK_OBS) + 1):
+        t = index[-k]
+        prior = t - pd.DateOffset(months=months)
+        pos = index.searchsorted(prior)
+        if pos < len(index) and index[pos] == prior and float(series.iloc[pos]) > 0:
+            return float(series.iloc[-k]) / float(series.iloc[pos]) - 1.0, t
+    return np.nan, None
+
+
+#: how many of the newest observations are tried for a computable transform before giving up
+_MAX_BACK_OBS = 6
+
+
+def _z252(level: pd.Series) -> pd.Series:
+    """z-score over the last 252 sessions; NaN (not inf) where the window has no variation."""
+    mean = level.rolling(252, min_periods=252).mean()
+    std = level.rolling(252, min_periods=252).std()
+    return (level - mean) / std.where(std > 1e-9 * (1.0 + mean.abs()))
 
 
 def macro_levels(series_id: str, sessions: pd.DatetimeIndex) -> pd.Series:
     """The ``MAC_SERIES`` level of ``series_id`` as a decision at each session's close sees it.
 
     One ``fred_series.get_series_as_of`` call per session, always offline (``hermetic_fmp_history``: a missing or old
-    cache raises ``MacroAvailabilityUnknown`` instead of fetching). ``as_of`` is the session DATE at midnight UTC,
-    which is the platform's DAILY-bar convention (``fred_series.decision_label``): bar D decides on D's close and
-    fills at the next session's open, so it sees every observation whose first release (ALFRED ``realtime_start``)
-    is before the next session, i.e. up to and including D. NEVER the observation date plus a lag. (An as_of of D's
-    close INSTANT would map to the label D itself and hide everything released on D.)
+    cache raises ``MacroAvailabilityUnknown`` instead of fetching; NEVER call the readers outside that context).
+    ``as_of`` is the session DATE at midnight UTC, which is the platform's DAILY-bar convention
+    (``fred_series.decision_label``): bar D decides on D's close and fills at the next session's open, so it sees every
+    observation whose first release (ALFRED ``realtime_start``) is before the next session, i.e. up to and including
+    D. NEVER the observation date plus a lag. (An as_of of D's close INSTANT would map to the label D itself and hide
+    everything released on D.)
+
+    The transform (YoY, 3-month change) is taken at the observation level and the last valid transformed value is held
+    (``_macro_value``); a value held longer than ``MAX_HOLD_WEEKDAYS`` (daily series) / ``MAX_HOLD_DAYS_MONTHLY``
+    (monthly), counted from its release, refuses with ``PanelDataError``.
 
     DGS3MO is the one series the cache stores without release dates (observation-date format, "same-day" by design for
     the option rate). Its observation of day D is published after D's close, so it is read one session later: the
-    value for session S is the observation of the previous session.
+    value for session S is the observation of the previous session (its age is counted from that observation date).
 
     A session whose decision label is on or before the series' first recorded vintage is NaN (nothing provable is
     public yet); every other refusal propagates."""
     from ba2_providers.fmp_common import hermetic_fmp_history
 
+    if series_id not in MAC_SERIES:
+        raise ValueError(f"{series_id} is not a MAC series; known {sorted(MAC_SERIES)}")
     sessions = pd.DatetimeIndex(sessions)
     kind = MAC_SERIES[series_id]
+    monthly = fs.SERIES_SPEC[series_id]["freq"] == "monthly"
     same_day = fs.SERIES_SPEC[series_id]["availability"] != fs.AVAIL_FIRST_RELEASE
+    released = _read_fred_file(series_id, Path(fs.CACHE_FOLDER))["released"]
     if same_day:
         first = sessions[0].date()
         prev0 = regular_sessions(first - pd.Timedelta(days=10), first - pd.Timedelta(days=1))["session"].iloc[-1]
@@ -707,7 +822,21 @@ def macro_levels(series_id: str, sessions: pd.DatetimeIndex) -> pd.Series:
                 if _BEFORE_FIRST_VINTAGE in str(e):
                     continue
                 raise
-            out[i] = _macro_value(visible, kind)
+            value, obs = _macro_value(visible, kind)
+            if obs is None:
+                continue
+            since = obs if same_day else released[obs]
+            age = ((sessions[i] - since).days if monthly
+                   else int(np.busday_count(since.date(), sessions[i].date())))
+            limit = MAX_HOLD_DAYS_MONTHLY if monthly else MAX_HOLD_WEEKDAYS
+            if age > limit and any(since == pd.Timestamp(a) and sessions[i] < pd.Timestamp(b)
+                                   for a, b in KNOWN_STALLS.get(series_id, [])):
+                continue                                          # a known, reviewed stall: NaN, not a stale value
+            if age > limit:
+                raise PanelDataError(
+                    f"FRED {series_id}: the value at {sessions[i].date()} was public since {since.date()}, older than "
+                    f"{limit} {'days' if monthly else 'weekdays'} ({age}); the series has stalled, refusing to hold it")
+            out[i] = value
     return pd.Series(out, index=sessions, name=series_id)
 
 
@@ -723,6 +852,7 @@ def macro(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
     refuses rather than reading another cache."""
     if Path(fs.CACHE_FOLDER).resolve() != Path(ctx.cache_root).resolve():
         raise PanelDataError(f"group mac reads FRED from {fs.CACHE_FOLDER}, not from cache_root {ctx.cache_root}")
+    ctx.provenance["fred"] = check_fred_pins(Path(fs.CACHE_FOLDER))
     first = (ctx.sessions[0] - pd.Timedelta(days=_MAC_HISTORY_DAYS)).date()
     grid = _sessions_index(first, ctx.sessions[-1].date())
     cols: Dict[str, pd.Series] = {}
@@ -731,7 +861,7 @@ def macro(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
         name = f"mac_{sid.lower()}"
         cols[f"{name}_{kind}"] = lvl
         cols[f"{name}_chg20"] = lvl - lvl.shift(20)
-        cols[f"{name}_z252"] = (lvl - lvl.rolling(252, min_periods=252).mean()) / lvl.rolling(252, min_periods=252).std()
+        cols[f"{name}_z252"] = _z252(lvl)
     table = pd.DataFrame(cols)[list(MAC_COLUMNS)].reindex(ctx.sessions).astype("float64")
     return pd.concat({sym: table for sym in ctx.symbols}, names=_INDEX_NAMES)
 
@@ -1038,7 +1168,7 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
         "store": ({"dir": str(store_path), "newest_scan": ml_universe.scan_store(store_path).dates[-1]}
                   if any(g in groups for g in ("x", "f")) else None),
         "columns": list(out.columns),
-        "source": {s: _fingerprint(_cache_file(cache_root, s)) for s in load}}
+        "source": {"daily": {s: _fingerprint(_cache_file(cache_root, s)) for s in load}, **ctx.provenance}}
     return out
 
 

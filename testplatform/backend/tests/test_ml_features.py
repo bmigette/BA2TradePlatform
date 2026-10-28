@@ -747,7 +747,7 @@ def test_save_features_writes_parquet_and_a_meta_sidecar(cache, tmp_path):
     F.save_features(f, path)
     meta = json.loads((tmp_path / "store" / "features.parquet.meta.json").read_text(encoding="utf-8"))
     assert meta["groups"]["t"] == list(F.T_COLUMNS) and meta["symbols"] == list(SYMS) and meta["rows"] == len(f)
-    assert meta["first_day"] == str(FIRST) and set(meta["source"]) >= set(SYMS)
+    assert meta["first_day"] == str(FIRST) and set(meta["source"]["daily"]) >= set(SYMS)
     back = pd.read_parquet(path)
     pd.testing.assert_frame_equal(back, f, check_exact=True, check_freq=False)
     with pytest.raises(ValueError, match="meta"):

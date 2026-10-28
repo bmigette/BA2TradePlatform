@@ -18,7 +18,7 @@ SIDS = ("VIXCLS", "DGS10", "DGS3MO", "T10Y3M", "BAA10Y", "CPIAUCSL", "PAYEMS", "
 
 def _doc(sid, rows, first_vintage="2014-01-27"):
     if sid == "DGS3MO":                                   # the same-day series keeps the plain observation format
-        return {"series_id": sid, "vintage": False, "observations": [{"date": d, "value": str(v)} for d, v, _ in rows]}
+        return {"series_id": sid, "fetched_at": pd.Timestamp.now(tz="UTC").isoformat(), "vintage": False, "observations": [{"date": d, "value": str(v)} for d, v, _ in rows]}
     return {"series_id": sid, "fetched_at": pd.Timestamp.now(tz="UTC").isoformat(), "availability": fs.AVAIL_FIRST_RELEASE,
             "format": fs.CACHE_FORMAT_FIRST_RELEASE, "first_vintage": first_vintage,
             "observations": [{"date": d, "value": str(v), "realtime_start": rt} for d, v, rt in rows]}
@@ -35,7 +35,9 @@ def point_fred_at(monkeypatch, root):
 
 
 @pytest.fixture(autouse=True)
-def _reset_fred():
+def _reset_fred(monkeypatch):
+    """The synthetic caches are not the pinned real ones: the pins are off here and tested on their own below."""
+    monkeypatch.setattr(F, "FRED_PINS", {})
     fs.reset_cache()
     yield
     fs.reset_cache()
@@ -244,3 +246,144 @@ def test_mac_refuses_a_fred_cache_that_is_not_under_cache_root(mac_cache, tmp_pa
 def test_mac_never_uses_the_network(fred_at_mac, monkeypatch):
     _no_network(monkeypatch)
     _build(fred_at_mac, ["mac"])                                        # would raise AssertionError if it did
+
+
+# ------------------------------------------------------------------------------------------ review fixes
+def _monthly(first, last, f, drop=(), lag_days=13):
+    months = [m for m in pd.date_range(first, last, freq="MS") if str(m.date()) not in drop]
+    return [(str(m.date()), f(i, m), str((m + pd.DateOffset(months=1, days=lag_days)).date()))
+            for i, m in enumerate(months)]
+
+
+def test_a_missing_month_does_not_create_nan_the_last_valid_transform_is_held(tmp_path, monkeypatch):
+    """The real cache lacks the 2025-10 CPI: the year-over-year of a month whose year-ago month is absent is not
+    computable, so the last valid transformed value is held until a computable one arrives."""
+    rows = _monthly("2022-01-01", "2024-04-01", lambda i, m: 100.0 + 0.5 * i, drop=("2023-03-01",))
+    value = {r[0]: r[1] for r in rows}
+    write_fred(tmp_path, "CPIAUCSL", rows)
+    point_fred_at(monkeypatch, tmp_path)
+    # 2024-03 CPI is released 2024-04-14: its YoY needs 2023-03, which is missing
+    lvl = F.macro_levels("CPIAUCSL", _sessions_index(date(2024, 4, 10), date(2024, 5, 20)))
+    feb = value["2024-02-01"] / value["2023-02-01"] - 1
+    apr = value["2024-04-01"] / value["2023-04-01"] - 1
+    assert lvl.notna().all()                                            # no NaN anywhere across the gap
+    assert lvl.loc["2024-04-12"] == pytest.approx(feb)                  # February's YoY is the latest ...
+    assert lvl.loc["2024-04-15"] == pytest.approx(feb)                  # ... still held when March (uncomputable) is public
+    assert lvl.loc["2024-05-15"] == pytest.approx(apr)                  # April (released 2024-05-14) is computable again
+
+
+def test_a_flat_series_gives_nan_z_not_inf(tmp_path, monkeypatch):
+    flat = pd.Series(15.0, index=_sessions_index(date(2022, 1, 3), date(2023, 6, 30)))
+    z = F._z252(flat)
+    assert z.isna().all() and not np.isinf(z).any()
+    moving = flat.copy()
+    moving.iloc[100:] += np.arange(len(moving) - 100) % 7
+    assert F._z252(moving).notna().sum() > 100
+    days = pd.bdate_range("2019-06-03", "2024-03-29")                    # and through the whole group
+    write_fred(tmp_path, "VIXCLS", [(str(d.date()), 15.0, str(d.date())) for d in days])
+    point_fred_at(monkeypatch, tmp_path)
+    lvl = F.macro_levels("VIXCLS", _sessions_index(date(2022, 1, 3), date(2023, 1, 3)))
+    assert (lvl == 15.0).all() and F._z252(lvl).isna().all()
+
+
+def test_a_value_held_longer_than_the_maximum_age_refuses(tmp_path, monkeypatch):
+    # monthly: the last release was 2023-06-05; 75 days later it is stale
+    write_fred(tmp_path, "UNRATE", [("2023-04-01", 3.4, "2023-05-05"), ("2023-05-01", 3.6, "2023-06-05")])
+    point_fred_at(monkeypatch, tmp_path)
+    ok = F.macro_levels("UNRATE", _sessions_index(date(2023, 6, 6), date(2023, 8, 18)))      # up to 74 days after the release
+    assert ok.notna().all()
+    with pytest.raises(P.PanelDataError, match=r"UNRATE.*older than 75 days"):
+        F.macro_levels("UNRATE", _sessions_index(date(2023, 8, 21), date(2023, 8, 25)))
+    # daily: the VIX stalls after 2023-06-01; more than 10 weekdays later it is stale
+    days = pd.bdate_range("2023-05-01", "2023-06-01")
+    write_fred(tmp_path, "VIXCLS", [(str(d.date()), 15.0 + i * 0.1, str(d.date())) for i, d in enumerate(days)])
+    fs.reset_cache()
+    assert F.macro_levels("VIXCLS", _sessions_index(date(2023, 6, 1), date(2023, 6, 15))).notna().all()
+    with pytest.raises(P.PanelDataError, match=r"VIXCLS.*older than 10"):
+        F.macro_levels("VIXCLS", _sessions_index(date(2023, 6, 16), date(2023, 6, 20)))
+
+
+def test_a_late_release_is_aged_from_its_release_not_its_observation(tmp_path, monkeypatch):
+    """A shutdown delays a release: a September CPI first public on 2023-10-24 is 54 days old on 12-17 although its
+    observation date is 107 days back; the age is the time since the value became public."""
+    rows = _monthly("2022-01-01", "2023-08-01", lambda i, m: 100.0 + 0.5 * i) + [("2023-09-01", 110.0, "2023-10-24")]
+    write_fred(tmp_path, "CPIAUCSL", rows)
+    point_fred_at(monkeypatch, tmp_path)
+    lvl = F.macro_levels("CPIAUCSL", _sessions_index(date(2023, 10, 24), date(2023, 12, 15)))
+    assert lvl.notna().all()
+
+
+def test_an_unknown_series_is_a_clear_error(tmp_path, monkeypatch):
+    point_fred_at(monkeypatch, tmp_path)
+    with pytest.raises(ValueError, match=r"FEDFUNDS.*not a MAC series"):
+        F.macro_levels("FEDFUNDS", _sessions_index(date(2024, 2, 1), date(2024, 2, 6)))
+
+
+def test_the_pins_are_the_agreed_ones():
+    assert F.FRED_PIN_CUTOFF == "2026-09-30"
+    assert dict(F.REAL_FRED_PINS) == {
+        "BAA10Y": (10186, "7c375266b7540404"), "CPIAUCSL": (955, "3202c9fa1f77020e"), "DGS10": (16171, "b26e35debc223db1"),
+        "PAYEMS": (1052, "6b869176a1b63918"), "T10Y3M": (11189, "aa1f40ccafe7a168"), "UNRATE": (943, "faa617ca44da8c14"),
+        "VIXCLS": (9285, "a9c65696dbec8602"), "DGS3MO": (11270, "d8133ea13e3d18a2")}
+    assert set(F.REAL_FRED_PINS) == set(F.MAC_SERIES)
+
+
+def test_the_real_cache_matches_the_pins():
+    import os
+    real = fs.CACHE_FOLDER
+    if not os.path.exists(os.path.join(real, "fred", "VIXCLS.json")):
+        pytest.skip("no real FRED cache on this host")
+    for sid, (n, digest) in F.REAL_FRED_PINS.items():
+        assert F.fred_digest(sid, real) == (n, digest), sid
+
+
+def test_the_digest_follows_the_first_release_rows(tmp_path, monkeypatch):
+    write_fred(tmp_path, "UNRATE", [("2023-04-01", 3.4, "2023-05-05"), ("2023-05-01", 3.6, "2023-06-05"),
+                                    ("2026-10-01", 4.0, "2026-10-20")])         # a row first released after the cutoff
+    point_fred_at(monkeypatch, tmp_path)
+    n, d = F.fred_digest("UNRATE", tmp_path)
+    assert n == 2 and len(d) == 16
+    write_fred(tmp_path, "UNRATE", [("2023-04-01", 3.4, "2023-05-05"), ("2023-05-01", 3.6, "2023-06-05"),
+                                    ("2026-11-01", 4.1, "2026-11-20")])         # a different later row: same pinned digest
+    assert F.fred_digest("UNRATE", tmp_path) == (n, d)
+    write_fred(tmp_path, "UNRATE", [("2023-04-01", 3.4, "2023-05-05"), ("2023-05-01", 3.7, "2023-06-05")])
+    assert F.fred_digest("UNRATE", tmp_path)[1] != d                             # a changed value is a different digest
+
+
+def test_the_mac_build_refuses_on_a_count_or_digest_mismatch_naming_the_series(fred_at_mac, monkeypatch):
+    pins = {sid: F.fred_digest(sid, fred_at_mac) for sid in F.MAC_SERIES}
+    monkeypatch.setattr(F, "FRED_PINS", dict(pins))
+    _build(fred_at_mac, ["mac"])                                          # matching pins: fine
+    monkeypatch.setattr(F, "FRED_PINS", dict(pins, DGS10=(pins["DGS10"][0] + 1, pins["DGS10"][1])))
+    with pytest.raises(F.FredPinMismatch, match="DGS10.*count"):
+        _build(fred_at_mac, ["mac"])
+    monkeypatch.setattr(F, "FRED_PINS", dict(pins, UNRATE=(pins["UNRATE"][0], "0" * 16)))
+    with pytest.raises(F.FredPinMismatch, match="UNRATE.*digest"):
+        _build(fred_at_mac, ["mac"])
+
+
+def test_fred_provenance_is_recorded(fred_at_mac):
+    f = _build(fred_at_mac, ["mac"])
+    fred = f.attrs["meta"]["source"]["fred"]
+    assert set(fred) == set(F.MAC_SERIES)
+    for sid, rec in fred.items():
+        n, d = F.fred_digest(sid, fred_at_mac)
+        assert rec["count"] == n and rec["digest"] == d and rec["fetched_at"] and rec["last_vintage"]
+    assert fred["UNRATE"]["last_vintage"] == "2024-03-05"
+
+
+def test_a_known_stall_is_nan_while_any_other_stall_refuses(tmp_path, monkeypatch):
+    """FRED published no BAA10Y between 2016-10-07 and 2017-03-22: inside that reviewed window the value is NaN."""
+    days = pd.bdate_range("2023-05-01", "2023-06-01")
+    rows = [(str(d.date()), 2.0, str(d.date())) for d in days] +            [(str(d.date()), 2.1, "2023-08-01") for d in pd.bdate_range("2023-06-02", "2023-07-31")]
+    write_fred(tmp_path, "BAA10Y", rows)
+    point_fred_at(monkeypatch, tmp_path)
+    sess = _sessions_index(date(2023, 6, 14), date(2023, 7, 31))                 # more than 10 weekdays after 2023-06-01
+    with pytest.raises(P.PanelDataError, match="BAA10Y.*older than 10"):
+        F.macro_levels("BAA10Y", sess)
+    monkeypatch.setattr(F, "KNOWN_STALLS", {"BAA10Y": [("2023-06-01", "2023-08-01")]})
+    lvl = F.macro_levels("BAA10Y", sess)
+    assert lvl.loc["2023-06-14":"2023-06-15"].eq(2.0).all()                                # within 10 weekdays: held
+    assert lvl.loc["2023-06-16":"2023-07-31"].isna().all()                                 # past the age limit: NaN
+    ok = F.macro_levels("BAA10Y", _sessions_index(date(2023, 8, 1), date(2023, 8, 4)))      # the backfill release ends it
+    assert ok.notna().all()
