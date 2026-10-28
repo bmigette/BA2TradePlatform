@@ -206,7 +206,9 @@ def apply_saved_fill(df: pd.DataFrame, feature_columns: Sequence[str], params: O
             raise StaleMaskedModel("retrain: this model predates masked-cell handling, and this frame has cells blanked "
                                    "by the coverage mask (<prefix>missing == 1)")
         return df, cols
-    cols = [c for c in cols if c not in set(params["dropped_masked_columns"])]
+    # the columns the model dropped; an earlier save called the key dropped_columns (no scaler params were merged into it)
+    saved_drop = params["dropped_masked_columns"] if "dropped_masked_columns" in params else params.get("dropped_columns", [])
+    cols = [c for c in cols if c not in set(saved_drop)]
     groups = masked_groups(df[cols])
     if not groups:
         return df, cols

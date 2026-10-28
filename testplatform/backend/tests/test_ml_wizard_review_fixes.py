@@ -137,7 +137,7 @@ class TestSparseTargetsKeepSessionContinuity:
     def test_a_window_covers_exactly_seq_len_consecutive_sessions(self, monkeypatch):
         svc = self.tsai(monkeypatch)
         f = sparse_frame()
-        X, y = svc.prepare_data(f, "y", ["t_a"], seq_len=5, fit_scaler=False)
+        X, y = svc.prepare_data(f, "y", ["t_a"], seq_len=5, fit_scaler=False, drop_unlabelled_windows=True)
         assert X.shape[1:] == (1, 5)
         assert (np.diff(X[:, 0, :], axis=1) == 1.0).all()               # five consecutive sessions, no gap
         ends = X[:, 0, -1].astype(int)
@@ -147,7 +147,7 @@ class TestSparseTargetsKeepSessionContinuity:
 
     def test_the_three_way_split_windows_each_block_on_full_sessions(self, monkeypatch):
         svc = self.tsai(monkeypatch)
-        out = svc.prepare_split_three_way([sparse_frame(seed=1), sparse_frame(seed=2)], 0.7, 0.5, "y", ["t_a"], seq_len=5,
+        out = svc.prepare_split_three_way([sparse_frame(seed=1), sparse_frame(seed=2)], 0.7, 0.5, "y", ["t_a"], seq_len=5, drop_unlabelled_windows=True,
                                           label_horizon=3)
         for k in ("X_train", "X_val", "X_holdout"):
             assert (np.diff(out[k][:, 0, :], axis=1) == 1.0).all() and len(out[k]) > 0
@@ -155,7 +155,7 @@ class TestSparseTargetsKeepSessionContinuity:
     def test_a_dense_target_is_unchanged(self, monkeypatch):
         svc = self.tsai(monkeypatch)
         f = sparse_frame(keep_every=1)
-        X, y = svc.prepare_data(f, "y", ["t_a"], seq_len=5, fit_scaler=False)
+        X, y = svc.prepare_data(f, "y", ["t_a"], seq_len=5, fit_scaler=False, drop_unlabelled_windows=True)
         assert len(X) == 116 and y.dtype == np.int64
 
     def test_only_the_edges_are_trimmed_from_a_job_frame(self):
@@ -360,3 +360,122 @@ class TestMedianKeyIsTickerAndDataset:
         result, cap = TestJobIntegration()._job(job_frames(2), [pt("daily_up", horizonSessions=3)], monkeypatch)
         assert result["status"] == "dry_run_success", result
         assert set(cap["combined"]["dataset_id"]) == {0, 1} and "dataset_id" not in cap["features"]
+
+
+# ---------------------------------------------------------------------------------------------- opt-in window drop
+class TestUnlabelledWindowDropIsOptIn:
+    def svc(self, monkeypatch):
+        from app.services import tsai_training as TT
+        monkeypatch.setattr(TT, "TSAI_AVAILABLE", True)
+        return TT.TSAITrainingService(normalize=False)
+
+    def nan_tail(self):
+        """The reviewer's frame: 30 rows, the last 4 labels NaN (an unobservable tail on a prediction dataset)."""
+        d = pd.DataFrame({"Date": pd.bdate_range("2023-01-02", periods=30), "t_a": np.arange(30, dtype=float),
+                          "y": np.tile([0.0, 1.0], 15)})
+        d.loc[26:, "y"] = np.nan
+        return d
+
+    def test_prediction_keeps_every_window_of_a_frame_with_a_nan_tail(self, monkeypatch):
+        svc = self.svc(monkeypatch)
+        d = self.nan_tail()
+        with np.errstate(all="ignore"):
+            X, y = svc.prepare_data(d, "y", ["t_a"], seq_len=5, fit_scaler=False)
+        assert len(X) == 26 and len(y) == 26                      # 30 rows, seq 5: all 26 windows, as before
+        np.testing.assert_array_equal(X[:, 0, -1], np.arange(4, 30))      # the windows still end on their own dates
+        np.testing.assert_array_equal(y[:22], d["y"].to_numpy()[4:26].astype(np.int64))
+
+    def test_prediction_dates_stay_aligned_with_an_interior_nan(self, monkeypatch):
+        svc = self.svc(monkeypatch)
+        d = self.nan_tail()
+        d.loc[10, "y"] = np.nan
+        with np.errstate(all="ignore"):
+            X, y = svc.prepare_data(d, "y", ["t_a"], seq_len=5, fit_scaler=False)
+        assert len(X) == 26
+        # window i ends at row i + 4: the prediction endpoint dates window i as row seq_len - 1 + i
+        np.testing.assert_array_equal(X[:, 0, -1], np.arange(4, 30))
+
+    def test_training_opts_in_and_drops_the_windows_without_a_label(self, monkeypatch):
+        svc = self.svc(monkeypatch)
+        d = self.nan_tail()
+        X, y = svc.prepare_data(d, "y", ["t_a"], seq_len=5, fit_scaler=False, drop_unlabelled_windows=True)
+        assert len(X) == 22 and not np.isnan(y.astype(float)).any()
+        np.testing.assert_array_equal(X[:, 0, -1], np.arange(4, 26))
+
+    def test_the_split_methods_only_drop_when_asked(self, monkeypatch):
+        svc = self.svc(monkeypatch)
+        frames = [sparse_frame(seed=1), sparse_frame(seed=2)]
+        dense = svc.prepare_split_three_way(frames, 0.7, 0.5, "y", ["t_a"], seq_len=5, label_horizon=3,
+                                            drop_unlabelled_windows=True)
+        assert (np.diff(dense["X_train"][:, 0, :], axis=1) == 1.0).all()
+        legacy_labels = None
+        with np.errstate(all="ignore"):
+            kept = svc.prepare_split_three_way(frames, 0.7, 0.5, "y", ["t_a"], seq_len=5, label_horizon=3)
+        assert len(kept["X_train"]) > len(dense["X_train"])           # nothing dropped without the opt-in
+        assert legacy_labels is None
+
+    def test_the_classification_job_opts_in_only_for_a_sparse_target(self, monkeypatch):
+        from app.services import job_handler, tsai_training as TT
+        seen = []
+
+        def spy(self, *a, **k):
+            seen.append(k.get("drop_unlabelled_windows"))
+            raise RuntimeError("stop here")
+        monkeypatch.setattr(TT.TSAITrainingService, "prepare_split_three_way", spy)
+        from app.services import tsai_models
+        monkeypatch.setattr(tsai_models, "TSAI_AVAILABLE", True)
+        for sparse in (True, False):
+            frames = [frame(1, "AAA", masked=None).assign(dataset_id=1)]
+            job_handler.train_classification_optimization(
+                task_id="t", selected_models=["lstm"], frames=frames, train_ratio=0.7, holdout_share_of_test=0.5, seed=1,
+                target_column="y", feature_columns=["t_a"], parameter_ranges={"seqLen": 5},
+                genetic_config={"populationSize": 2, "generations": 1, "trainingEpochs": 1},
+                metrics_config={"classificationMetric": "f1_score", "lossFunction": "mse"}, prediction_horizon=1,
+                prediction_modes=["shift"], label_horizon=3, progress_base=0, progress_range=1, sparse_target=sparse)
+        assert seen == [True, False]
+
+    def test_the_job_tags_dataset_id_only_for_a_daily_source(self, monkeypatch):
+        from tests.test_ml_wizard_daily_targets import TestJobIntegration, job_frames, pt
+        daily, cap = TestJobIntegration()._job(job_frames(2), [pt("daily_up", horizonSessions=3)], monkeypatch)
+        assert "dataset_id" in cap["combined"].columns
+        res, cap = TestJobIntegration()._job(job_frames(2), [pt("daily_up", horizonSessions=3)], monkeypatch,
+                                             provider="yfinance")
+        # an ordinary dataset is not tagged (daily targets are refused on it, so look at a legacy target instead)
+        assert res["status"] == "failed"
+        from tests.test_ml_wizard_integration import _bars
+        from app.services import job_handler
+        cap2 = {}
+        frames = [_bars(0.0, 40, seed=1), _bars(0.0, 40, seed=2)]
+        monkeypatch.setattr(job_handler, "ML_AVAILABLE", True)
+        monkeypatch.setattr(job_handler, "load_dataset", lambda i, start_date=None, end_date=None: frames[i].copy())
+        monkeypatch.setattr(job_handler, "get_dataset_info", lambda i: {"ticker": f"T{i}", "timeframe": "1h",
+                                                                         "data_provider": "yfinance"})
+        monkeypatch.setattr(job_handler, "update_job_progress", lambda *a, **k: None)
+        monkeypatch.setattr(job_handler, "save_training_datasets", lambda **kw: cap2.update(c=kw["combined_df"]))
+        payload = {"dataset_ids": [0, 1], "job_type": "classification", "selected_models": ["lstm"],
+                   "train_test_split": 70, "prediction_horizon": 1, "prediction_modes": ["shift"],
+                   "genetic_config": {"populationSize": 2}, "metrics_config": {"classificationMetric": "f1_score"},
+                   "prediction_targets": [{"type": "directional", "horizon": 2, "direction": "up"}]}
+        out = job_handler.handle_training_job("t-plain", payload, dry_run=True)
+        assert out["status"] == "dry_run_success", out
+        assert "dataset_id" not in cap2["c"].columns
+
+
+class TestSmallRobustness:
+    def test_apply_saved_fill_accepts_the_old_key_for_the_dropped_columns(self):
+        p = MF.build_masked_fill({"AAA#": {"f_a": 1.0, "f_b": 2.0}}, ["g_a"])
+        old = {**{k: v for k, v in p.items() if k != "dropped_masked_columns"}, "dropped_columns": ["g_a"]}
+        out, cols = MF.apply_saved_fill(frame(1), COLS + ["g_a"], old, ticker="AAA")
+        assert "g_a" not in cols and not out[["f_a", "f_b"]].isna().any().any()
+        none = {k: v for k, v in p.items() if k != "dropped_masked_columns"}          # neither key: nothing dropped
+        out, cols = MF.apply_saved_fill(frame(1), COLS, none, ticker="AAA")
+        assert cols == COLS
+
+    def test_tsai_fill_does_nothing_and_copies_nothing_without_daily_flags(self, monkeypatch):
+        from app.services import masked_fill as mf, tsai_training as TT
+        calls = []
+        monkeypatch.setattr(TT, "fill_masked_covariates", lambda *a, **k: calls.append(1) or (a[0], []))
+        d = frame(2, masked=None)[["Date", "y", "t_a", "f_a"]]
+        out, cols = TT.TSAITrainingService._fill_masked(d, ["t_a", "f_a"], 100)
+        assert out is d and cols == ["t_a", "f_a"] and calls == []
+        assert mf.masked_groups(d[["t_a", "f_a"]]) == []

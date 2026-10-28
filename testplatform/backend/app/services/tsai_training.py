@@ -24,7 +24,7 @@ import json
 
 from app.services.data_preparation import DataPreparationService, frame_bounds, purged_train_row_count, three_way_bounds
 from app.services.masked_fill import (build_masked_fill, fill_masked_covariates, has_daily_flags, has_masked_cells,
-                                       ticker_key)
+                                       masked_groups, ticker_key)
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +139,8 @@ class TSAITrainingService(ITrainingService):
         prediction_mode: str = 'shift',
         fit_scaler: bool = True,
         scaler_fit_until: Optional[pd.Timestamp] = None,
-        scaler_fit_ratio: Optional[float] = None
+        scaler_fit_ratio: Optional[float] = None,
+        drop_unlabelled_windows: bool = False
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Prepare data for tsai model training.
@@ -156,6 +157,10 @@ class TSAITrainingService(ITrainingService):
             prediction_horizon: How many bars ahead to predict (0 = predict at end of sequence)
             prediction_mode: 'shift' for single target at T+N, 'multistep' for T+1...T+N
             fit_scaler: Whether to fit the scaler (True for train, False for test)
+            drop_unlabelled_windows: Training of a SPARSE target (the cross-sectional quintile / beats labels): build the
+                windows on the full consecutive frame and drop the windows whose label is NaN, so a window always covers
+                seq_len consecutive sessions. Off (the default, and everything prediction does): every window is kept,
+                exactly as before - a prediction frame's windows must stay one per row, aligned with their dates.
             scaler_fit_until / scaler_fit_ratio: the train block of ``df`` (the rows dated up to and including
                 that timestamp, or that leading fraction of the rows) when ``df`` also holds held-out rows. They
                 only decide which rows the masked-cell medians are fitted on; with neither, a ``fit_scaler``
@@ -177,12 +182,17 @@ class TSAITrainingService(ITrainingService):
         if not TSAI_AVAILABLE:
             raise RuntimeError("tsai library not available")
 
-        # Extract target. A target can be sparse (the cross-sectional quintile labels only the top and bottom fifth): the
-        # windows are then built on the FULL consecutive frame and the windows whose label is NaN are dropped afterwards,
-        # so a window always covers seq_len consecutive sessions (dropping the NaN rows first would join distant sessions).
-        y_raw = df[target_column].to_numpy(dtype=np.float64)
-        sparse = bool(np.isnan(y_raw).any())
-        y_data = y_raw if sparse else y_raw.astype(np.int64)
+        # Extract target. A SPARSE target (the cross-sectional quintile labels only the top and bottom fifth) is trained on
+        # the FULL consecutive frame and the windows whose label is NaN are dropped afterwards, so a window always covers
+        # seq_len consecutive sessions (dropping the NaN rows first would join distant sessions). Only training asks for
+        # that; every other call keeps the labels as they were (a NaN cast to int, one window per row).
+        if drop_unlabelled_windows:
+            y_raw = df[target_column].to_numpy(dtype=np.float64)
+            sparse = bool(np.isnan(y_raw).any())
+            y_data = y_raw if sparse else y_raw.astype(np.int64)
+        else:
+            sparse = False
+            y_data = df[target_column].values.astype(np.int64)
 
         n_fit = None
         if scaler_fit_until is not None:
@@ -246,7 +256,12 @@ class TSAITrainingService(ITrainingService):
         """``df`` with the coverage mask's blank cells filled (train median of its first ``n_fit`` rows) and the feature
         columns without any group masked in every row. A frame without a daily ``missing`` flag is returned as it is.
         ``medians_out`` receives the median used for every filled column."""
-        filled, dropped = fill_masked_covariates(df[feature_columns], n_fit, medians_out)
+        if not has_daily_flags(feature_columns):
+            return df, list(feature_columns)             # not the daily source: nothing to look at, nothing copied
+        cov = df[feature_columns]
+        if not masked_groups(cov):
+            return df, list(feature_columns)             # daily source, nothing masked: the frame is left as it is
+        filled, dropped = fill_masked_covariates(cov, n_fit, medians_out)
         if filled.equals(df[feature_columns]) and not dropped:
             return df, list(feature_columns)
         out = df.copy()
@@ -422,7 +437,7 @@ class TSAITrainingService(ITrainingService):
         target_column: str, feature_columns: List[str],
         timeframe: str = 'daily', seq_len: int = 24,
         prediction_horizon: int = 0, prediction_mode: str = 'shift',
-        label_horizon: int = 0, common_dates: bool = False
+        label_horizon: int = 0, common_dates: bool = False, drop_unlabelled_windows: bool = False
     ) -> Dict[str, np.ndarray]:
         """Chronological train / validation / holdout windows, one frame per instrument.
 
@@ -433,6 +448,7 @@ class TSAITrainingService(ITrainingService):
 
         ``common_dates`` cuts every frame at the same dates (``data_preparation.frame_bounds``),
         for the cross-sectional daily targets that compare the tickers of a session.
+        ``drop_unlabelled_windows`` is for a sparse target (see ``prepare_data``): the windows without a label are dropped.
         """
         if not TSAI_AVAILABLE:
             raise RuntimeError("tsai library not available")
@@ -462,7 +478,8 @@ class TSAITrainingService(ITrainingService):
             for df in frames:
                 X, y = self.prepare_data(
                     df, target_column, feature_columns, timeframe, seq_len,
-                    prediction_horizon, prediction_mode, fit_scaler=False
+                    prediction_horizon, prediction_mode, fit_scaler=False,
+                    drop_unlabelled_windows=drop_unlabelled_windows
                 )
                 xs.append(X)
                 ys.append(y)

@@ -20,6 +20,7 @@ from app.models.database import SessionLocal
 from app.models.dataset import Dataset
 from app.services.data_preparation import frame_bounds, purged_train_row_count, three_way_bounds
 from app.services.masked_fill import all_masked_columns
+from app.services.ml_dataset_source import is_daily_source
 from app.services.ml_dataset_source import is_alpaca_hist
 from app.services.ml_wizard_targets import (
     CROSS_SECTIONAL_DAILY_TYPES, DAILY_TARGET_TYPES, SPARSE_DAILY_TYPES, WIZARD_TARGET_TYPES, WizardTargetError,
@@ -1958,7 +1959,8 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                 df['ticker'] = info.get('ticker', f'TICKER{ds_id}')
             # The dataset a frame comes from (the masked-cell medians saved with a model are keyed by ticker AND
             # dataset, so two datasets of one ticker do not collide); never a feature
-            df['dataset_id'] = ds_id
+            if is_daily_source(info.get('data_provider'), info.get('timeframe')):
+                df['dataset_id'] = ds_id
 
             frames.append(df.sort_values('Date', kind='mergesort').reset_index(drop=True))
 
@@ -2209,6 +2211,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                     prediction_modes=prediction_modes,
                     label_horizon=label_horizon,
                     common_dates=common_dates,
+                    sparse_target=sparse_target,
                     progress_base=25,
                     progress_range=65,
                     timeframe=timeframe
@@ -2730,7 +2733,8 @@ def train_classification_optimization(
     progress_base: float,
     progress_range: float,
     timeframe: str = 'daily',
-    common_dates: bool = False
+    common_dates: bool = False,
+    sparse_target: bool = False
 ) -> Dict[str, Any]:
     """
     Classification optimization using tsai models.
@@ -2860,7 +2864,8 @@ def train_classification_optimization(
                     prediction_horizon=0,  # Target already pre-shifted
                     prediction_mode=mode,
                     label_horizon=label_horizon,  # purge the boundary rows the pre-shift leaks
-                    common_dates=common_dates
+                    common_dates=common_dates,
+                    drop_unlabelled_windows=sparse_target   # only a sparse target (quintile / beats) loses windows
                 )
                 X_train, X_test, y_train, y_test = (
                     split['X_train'], split['X_val'], split['y_train'], split['y_val']
