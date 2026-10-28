@@ -395,17 +395,17 @@ class TestMacroFirstRelease:
         from app.services.macro import MacroService
         return MacroService(api_key='unused')
 
-    def test_a_revised_observation_is_seen_only_after_its_second_vintage(self, fred_cache):
+    def test_a_later_vintage_of_an_observation_never_changes_its_value(self, fred_cache):
         fred_cache('UNRATE', [
             {'date': '2023-12-01', 'value': '3.7', 'realtime_start': '2024-01-05'},
             {'date': '2024-01-01', 'value': '3.9', 'realtime_start': '2024-02-02'},   # first release
-            {'date': '2024-01-01', 'value': '4.0', 'realtime_start': '2024-03-08'},   # second vintage
+            {'date': '2024-01-01', 'value': '4.0', 'realtime_start': '2024-03-08'},   # a revision
         ])
         out = self._svc().integrate_macro_with_ohlc(
             _rows(['2024-02-01', '2024-02-02', '2024-03-07', '2024-03-08']), ['unemployment'])
-        # 02-01 decides before January's release (3.7 still in force); 02-02 sees the first value;
-        # 03-07 is still before the second vintage; 03-08 is after it
-        assert out['unemployment'].tolist() == [3.7, 3.9, 3.9, 4.0]
+        # 02-01 decides before January's release (3.7 still in force); from 02-02 the first release
+        # (3.9) is the value, also after the revision's vintage (03-08): revisions are never applied
+        assert out['unemployment'].tolist() == [3.7, 3.9, 3.9, 3.9]
 
     def test_value_is_not_visible_on_its_observation_date(self, fred_cache):
         fred_cache('CPIAUCSL', [

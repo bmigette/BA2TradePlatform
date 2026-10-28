@@ -91,6 +91,12 @@ class MacroService:
         }
     }
 
+    @classmethod
+    def cached_indicators(cls) -> List[str]:
+        """The indicators the first-release cache can serve (everything but GDP and yield_2y)."""
+        from ba2_providers.macro import fred_series as fs
+        return [name for name, cfg in cls.MACRO_INDICATORS.items() if cfg['series'] in fs.SERIES_SPEC]
+
     def _require_cached_series(self, indicator: str) -> str:
         """The FRED series id behind *indicator*, refused when the first-release cache has no file for it."""
         from ba2_providers.macro import fred_series as fs
@@ -135,9 +141,9 @@ class MacroService:
             # file) instead of fetching mid-build, so a dataset never depends on FRED being up.
             with frozen_ttl_cache():
                 visible = fs.get_series_as_of(sid, t).dropna()
-            # An observation revised after its first release can appear once per vintage, oldest
-            # first; the latest vintage visible at this label is the one in force.
-            visible = visible[~visible.index.duplicated(keep='last')]
+            # An observation can appear once per vintage, oldest first. The FIRST release is the
+            # value, always: a later vintage must never replace it (that is the revision leak).
+            visible = visible[~visible.index.duplicated(keep='first')]
             if visible.empty:
                 per_label[label] = (np.nan, pd.NaT, np.nan)
                 continue
@@ -329,6 +335,20 @@ class MacroService:
         logger.info(f"Integrated {len(indicators)} macro indicators with OHLC data")
         return result_df
 
+    def add_macro_columns(self, df: pd.DataFrame, indicators: List[str]) -> pd.DataFrame:
+        """``integrate_macro_with_ohlc`` with the dataset column names: ``macro_<indicator>`` etc.
+
+        Raises (never skips) for an indicator the first-release cache cannot serve, so a dataset
+        build fails with the series or file named instead of finishing without macro columns.
+        """
+        df = self.integrate_macro_with_ohlc(df, indicators)
+        renames = {}
+        for indicator in indicators:
+            for col in (indicator, f'{indicator}_yoy_change', f'{indicator}_days_since'):
+                if col in df.columns:
+                    renames[col] = f'macro_{col}'
+        return df.rename(columns=renames)
+
     def create_yield_curve_features(self, ohlc_df: pd.DataFrame) -> pd.DataFrame:
         """
         Create yield curve features (spread, inversion indicator).
@@ -365,9 +385,10 @@ class MacroService:
     @staticmethod
     def get_supported_indicators() -> Dict[str, Dict]:
         """
-        Get list of supported macro indicators with metadata.
+        Get the macro indicators the dataset features can use (those with a first-release cache
+        series), with metadata.
 
         Returns:
             Dictionary of indicator configurations
         """
-        return MacroService.MACRO_INDICATORS.copy()
+        return {name: MacroService.MACRO_INDICATORS[name] for name in MacroService.cached_indicators()}

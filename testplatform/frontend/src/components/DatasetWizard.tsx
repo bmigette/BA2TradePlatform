@@ -1,4 +1,5 @@
 import { API_BASE } from '../lib/config';
+import { onDatasetTimeframe } from '../lib/indicatorTimeframe';
 import React, { useState, useEffect } from 'react';
 import { X, MessageSquare, TrendingUp, BarChart3, FileText, Settings, CheckCircle, Plus, Trash2, Save, ChevronDown, ChevronRight, FolderOpen, Upload } from 'lucide-react';
 
@@ -173,10 +174,10 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
       // Parse indicators
       let indicators: IndicatorConfig[] = [];
       if (initialData.technical_indicators && Array.isArray(initialData.technical_indicators)) {
-        indicators = initialData.technical_indicators.map((ind: any) => ({
+        indicators = initialData.technical_indicators.map((ind: any) => onDatasetTimeframe({
           id: `ind_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
           ...ind
-        }));
+        }, initialData.timeframe));
       }
 
       // Parse sentiment config from saved data
@@ -314,12 +315,6 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
     }
   };
 
-  const getAvailableTimeframes = () => {
-    const datasetIdx = TIMEFRAME_ORDER.indexOf(wizardData.timeframe);
-    if (datasetIdx === -1) return TIMEFRAME_ORDER;
-    return TIMEFRAME_ORDER.slice(datasetIdx);
-  };
-
   const generateIndicatorId = () => {
     return `ind_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   };
@@ -391,27 +386,17 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
     const collection = collections.find(c => c.id === collectionId);
     if (!collection) return;
 
-    // Filter indicators to only include those with valid timeframes
-    const validTimeframes = getAvailableTimeframes();
-    const validIndicators = collection.indicators
-      .filter(ind => validTimeframes.includes(ind.timeframe))
-      .map(ind => ({
-        ...ind,
-        id: generateIndicatorId()
-      }));
-
-    const invalidCount = collection.indicators.length - validIndicators.length;
-
+    // A collection's own per-indicator timeframes are ignored: every indicator is computed on the
+    // dataset timeframe (see onDatasetTimeframe), so none is skipped for its timeframe.
     setWizardData({
       ...wizardData,
-      indicators: validIndicators
+      indicators: collection.indicators.map(ind => onDatasetTimeframe({
+        ...ind,
+        id: generateIndicatorId()
+      }, wizardData.timeframe))
     });
 
     setSelectedCollectionId(collectionId);
-
-    if (invalidCount > 0) {
-      setError(`${invalidCount} indicators were skipped because their timeframe is smaller than the dataset timeframe (${wizardData.timeframe})`);
-    }
   };
   // Suppress unused warning - function reserved for future use
   void _loadCollection;
@@ -446,12 +431,11 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
   };
 
   const toggleAllCollectionIndicators = (collection: IndicatorCollection, select: boolean) => {
-    const validTimeframes = getAvailableTimeframes();
     setSelectedIndicatorIds(prev => {
       const next = new Set(prev);
-      collection.indicators.forEach((ind, idx) => {
+      collection.indicators.forEach((_ind, idx) => {
         const key = getIndicatorUniqueKey(collection.id, idx);
-        if (select && validTimeframes.includes(ind.timeframe)) {
+        if (select) {
           next.add(key);
         } else {
           next.delete(key);
@@ -462,17 +446,16 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
   };
 
   const addSelectedIndicatorsFromPicker = () => {
-    const validTimeframes = getAvailableTimeframes();
     const indicatorsToAdd: IndicatorConfig[] = [];
 
     collections.forEach(collection => {
       collection.indicators.forEach((ind, idx) => {
         const key = getIndicatorUniqueKey(collection.id, idx);
-        if (selectedIndicatorIds.has(key) && validTimeframes.includes(ind.timeframe)) {
-          indicatorsToAdd.push({
+        if (selectedIndicatorIds.has(key)) {
+          indicatorsToAdd.push(onDatasetTimeframe({
             ...ind,
             id: generateIndicatorId()
-          });
+          }, wizardData.timeframe));
         }
       });
     });
@@ -1029,7 +1012,6 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
   );
 
   const renderStep3 = () => {
-    const availableTimeframes = getAvailableTimeframes();
     const selectedTypeInfo = INDICATOR_TYPES.find(t => t.type === newIndicatorType);
 
     return (
@@ -1111,9 +1093,8 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
                   collections.map(collection => {
                     const isExpanded = expandedCollections.has(collection.id);
                     const selectedCount = getCollectionSelectedCount(collection);
-                    const validIndicatorsCount = collection.indicators.filter(
-                      ind => availableTimeframes.includes(ind.timeframe)
-                    ).length;
+                    // a collection's own timeframes are ignored: all of it is computed on the dataset's
+                    const validIndicatorsCount = collection.indicators.length;
 
                     return (
                       <div
@@ -1149,12 +1130,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
                                 )}
                               </div>
                               <p className="text-xs text-gray-500 dark:text-gray-400">
-                                {validIndicatorsCount} indicators available
-                                {validIndicatorsCount < collection.indicators.length && (
-                                  <span className="text-yellow-600 dark:text-yellow-400 ml-1">
-                                    ({collection.indicators.length - validIndicatorsCount} incompatible)
-                                  </span>
-                                )}
+                                {validIndicatorsCount} indicators, computed on the dataset timeframe ({wizardData.timeframe})
                               </p>
                             </div>
                           </div>
@@ -1184,15 +1160,12 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
                               {collection.indicators.map((indicator, idx) => {
                                 const key = getIndicatorUniqueKey(collection.id, idx);
                                 const isSelected = selectedIndicatorIds.has(key);
-                                const isValidTimeframe = availableTimeframes.includes(indicator.timeframe);
 
                                 return (
                                   <label
                                     key={idx}
                                     className={`flex items-center gap-3 p-2 rounded cursor-pointer ${
-                                      !isValidTimeframe
-                                        ? 'opacity-40 cursor-not-allowed'
-                                        : isSelected
+                                      isSelected
                                         ? 'bg-blue-50 dark:bg-blue-900/30'
                                         : 'hover:bg-gray-100 dark:hover:bg-gray-600/50'
                                     }`}
@@ -1200,7 +1173,6 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
                                     <input
                                       type="checkbox"
                                       checked={isSelected}
-                                      disabled={!isValidTimeframe}
                                       onChange={() => toggleIndicatorSelection(collection.id, idx)}
                                       className="w-4 h-4 rounded border-gray-300 dark:border-gray-600 text-blue-500 focus:ring-blue-500"
                                     />
@@ -1214,12 +1186,8 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
                                         </span>
                                       </div>
                                       <div className="flex items-center gap-2 text-xs">
-                                        <span className={`px-1.5 py-0.5 rounded ${
-                                          isValidTimeframe
-                                            ? 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300'
-                                            : 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300'
-                                        }`}>
-                                          {indicator.timeframe?.toUpperCase() || 'N/A'}
+                                        <span className="px-1.5 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300">
+                                          {wizardData.timeframe.toUpperCase()}
                                         </span>
                                         <span className="text-gray-500 dark:text-gray-400 font-mono">
                                           {getIndicatorParamsString(indicator)}

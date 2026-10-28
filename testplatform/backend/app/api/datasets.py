@@ -366,20 +366,14 @@ def _build_dataset_in_background(dataset_id: int, dataset_config: dict):
                 else:
                     df = FundamentalsService.add_live_snapshot_columns(df, ticker, fundamentals_config)
 
-                # Macro indicators
-                macro_indicators = fundamentals_config.get('macro_indicators', [])
-                if macro_indicators:
-                    macro_service = MacroService()
-                    df = macro_service.integrate_macro_with_ohlc(df, macro_indicators)
-                    for indicator in macro_indicators:
-                        if indicator in df.columns:
-                            df = df.rename(columns={indicator: f'macro_{indicator}'})
-                            if f'{indicator}_yoy_change' in df.columns:
-                                df = df.rename(columns={f'{indicator}_yoy_change': f'macro_{indicator}_yoy_change'})
-                            if f'{indicator}_days_since' in df.columns:
-                                df = df.rename(columns={f'{indicator}_days_since': f'macro_{indicator}_days_since'})
             except Exception as e:
                 logger.error(f"[Thread] Error fetching fundamentals: {e}")
+
+            # Macro sits OUTSIDE the log-and-continue handler above: a refused series (no cache
+            # file, GDP) must fail the build via the outer handler, not finish without macro columns.
+            macro_indicators = fundamentals_config.get('macro_indicators', [])
+            if macro_indicators:
+                df = MacroService().add_macro_columns(df, macro_indicators)
 
         # Filter out warmup rows - only keep data from the originally requested start date
         if warmup_days > 0:
@@ -626,27 +620,16 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
 
                     # Today's snapshot is NOT point-in-time: only added when explicitly opted in
                     df = FundamentalsService.add_live_snapshot_columns(df, ticker, fundamentals_config)
-
-                # Fetch macro indicators if configured and regenerate_macro is True
-                macro_indicators = fundamentals_config.get('macro_indicators', [])
-                if macro_indicators and regen_options.regenerate_macro:
-                    logger.info(f"[Thread] Fetching macro indicators: {macro_indicators}")
-                    try:
-                        macro_service = MacroService()
-                        df = macro_service.integrate_macro_with_ohlc(df, macro_indicators)
-                        for indicator in macro_indicators:
-                            if indicator in df.columns:
-                                df = df.rename(columns={indicator: f'macro_{indicator}'})
-                                if f'{indicator}_yoy_change' in df.columns:
-                                    df = df.rename(columns={f'{indicator}_yoy_change': f'macro_{indicator}_yoy_change'})
-                                if f'{indicator}_days_since' in df.columns:
-                                    df = df.rename(columns={f'{indicator}_days_since': f'macro_{indicator}_days_since'})
-                        logger.info(f"[Thread] Added macro columns for: {macro_indicators}")
-                    except Exception as e:
-                        logger.warning(f"[Thread] Error fetching macro data: {e}")
-
             except Exception as e:
                 logger.error(f"[Thread] Error fetching fundamentals: {e}")
+
+            # Macro sits OUTSIDE the log-and-continue handler above (see the build path): a refused
+            # series fails the regeneration, including a saved config that still lists 'gdp'.
+            macro_indicators = fundamentals_config.get('macro_indicators', [])
+            if macro_indicators and regen_options.regenerate_macro:
+                logger.info(f"[Thread] Fetching macro indicators: {macro_indicators}")
+                df = MacroService().add_macro_columns(df, macro_indicators)
+                logger.info(f"[Thread] Added macro columns for: {macro_indicators}")
 
         # Filter out warmup rows (applies when OHLCV regenerated OR when warmup fetched for TA)
         if warmup_days > 0 and (regen_options.regenerate_ohlcv or regen_options.regenerate_technical):
@@ -2760,20 +2743,22 @@ def get_fundamental_data(dataset_id: int, db: Session = Depends(get_db)):
 @router.post("/{dataset_id}/calculate-macro")
 def calculate_macro_features(
     dataset_id: int,
-    indicators: List[str] = None,
-    include_yield_curve: bool = True,
+    indicators: List[str] = Query(None),
+    include_yield_curve: bool = False,
     db: Session = Depends(get_db)
 ):
     """
-    Integrate macro economic data with OHLC dataset using forward-fill.
+    Integrate first-release macro data with an OHLC dataset.
 
-    Fetches macroeconomic indicators (interest rates, GDP, inflation, etc.)
-    and aligns them with the dataset's time series using forward-fill.
+    Each row carries the latest observation FRED had published at that row's decision, read from
+    the local first-release cache (see MacroService). Only the cached series are available: GDP
+    and the 2-year yield (hence the yield curve) have no cache file and are refused with a 400.
 
     Args:
         dataset_id: Dataset ID
-        indicators: List of indicators (default: all available)
-        include_yield_curve: Include yield curve features (default: True)
+        indicators: List of indicators (default: every cached indicator)
+        include_yield_curve: Yield curve features; needs DGS2, which has no cache file, so True
+            is refused (default: False)
         db: Database session
 
     Returns:
@@ -2795,6 +2780,24 @@ def calculate_macro_features(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Dataset file not found: {file_path}"
             )
+
+        cached = MacroService.cached_indicators()
+        unavailable = [i for i in (indicators or []) if i not in cached]
+        if unavailable:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Macro indicators {unavailable} have no first-release cache series "
+                       f"({[MacroService.MACRO_INDICATORS.get(i, {}).get('series', i) for i in unavailable]}); "
+                       f"available: {cached}"
+            )
+        if include_yield_curve:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The yield curve needs FRED DGS2 (2-year yield), which has no first-release cache "
+                       "series; request include_yield_curve=false"
+            )
+        if not indicators:
+            indicators = cached
 
         df = pd.read_csv(file_path)
         df['Date'] = pd.to_datetime(df['Date'])
@@ -2821,7 +2824,7 @@ def calculate_macro_features(
 
         return {
             "dataset_id": dataset_id,
-            "indicators": indicators or list(MacroService.MACRO_INDICATORS.keys()),
+            "indicators": indicators,
             "include_yield_curve": include_yield_curve,
             "features_added": added_columns,
             "total_columns": len(result_df.columns),
