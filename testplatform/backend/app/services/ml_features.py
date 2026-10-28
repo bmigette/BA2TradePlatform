@@ -1253,6 +1253,60 @@ def analysts(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
     return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
 
 
+# ------------------------------------------------------------------------------------------ group I (insider)
+I_COLUMNS: Tuple[str, ...] = ("i_net_buy_90", "i_n_buyers_90", "i_covered")
+
+
+def _insider_one(ctx: BuildContext, symbol: str, market_cap: np.ndarray) -> pd.DataFrame:
+    sessions = ctx.sessions
+    rows = _read_fmp_rows("insider_v2", symbol, ctx)
+    days = _event_days(rows, "filingDate", symbol, "insider_v2")
+    order = np.argsort(days, kind="stable")
+    days = days[order]
+    rows = [rows[i] for i in order]
+    dollars = np.zeros(len(rows))
+    buyers: List[object] = [None] * len(rows)
+    for i, r in enumerate(rows):
+        if "formType" not in r or str(r["formType"]).strip() != "4":            # Form 4 only (not 3, 5, or amendments)
+            continue
+        kind = str(r["transactionType"]).strip() if "transactionType" in r and r["transactionType"] is not None else ""
+        value = _num(r, "securitiesTransacted") * _num(r, "price")
+        if not np.isfinite(value):
+            continue
+        if kind.startswith("P-"):
+            dollars[i] = value
+            who = r["reportingCik"] if "reportingCik" in r and r["reportingCik"] else (r["reportingName"] if "reportingName" in r else None)
+            buyers[i] = who
+        elif kind.startswith("S-"):
+            dollars[i] = -value
+    covered = _covered_from(days, sessions)
+    lo, hi = _window_bounds(days, sessions, 90)
+    net = _window_sum(_csum(dollars), lo, hi)
+    out = {
+        "i_net_buy_90": np.where(covered, _safe_ratio(net, market_cap), np.nan),
+        "i_n_buyers_90": np.where(covered, _distinct(_codes(buyers), lo, hi), np.nan),
+        "i_covered": covered.astype("float64")}
+    return pd.DataFrame(out, index=sessions)[list(I_COLUMNS)]
+
+
+def insiders(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
+    """Group ``i_``: insider trading from ``insider_v2__<SYM>.json`` (Form 4 filings), visible the session AFTER the
+    ``filingDate`` (the filing, not the transaction, is what the market can see); windows are ``[S - 90 days, S)`` of filing
+    dates.
+
+    * ``i_net_buy_90``: (shares x price of ``P-`` purchases minus ``S-`` sales, Form 4 only) over the window, over the
+      store's market cap visible at S (NaN before the first scan, 2020-01, and for a symbol the scan lacks);
+    * ``i_n_buyers_90``: distinct reporting persons (``reportingCik``) with a purchase in the window;
+    * ``i_covered``: 1 from the session after the file's first filing, else 0. FMP's insider history is capped (about 2000
+      rows), so coverage starts at a different date per symbol, and an empty window before it is not "no insider buying":
+      before coverage the other two columns are NaN. After coverage an empty window is 0.
+
+    A missing file refuses; an empty file is never covered (flag 0, the others NaN)."""
+    caps = ml_universe.scan_values(list(ctx.symbols), ctx.sessions, ["market_cap"], ctx.store_dir)["market_cap"]
+    frames = {sym: _insider_one(ctx, sym, caps[sym].to_numpy(dtype="float64")) for sym in ctx.symbols}
+    return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
+
+
 #: group name -> spec. The name is the grid factor; the spec's prefix names its columns. Later tasks register here.
 GROUPS: Dict[str, GroupSpec] = {
     "t": GroupSpec(technical, "t_"),
@@ -1262,6 +1316,7 @@ GROUPS: Dict[str, GroupSpec] = {
     "mac": GroupSpec(macro, "mac_"),
     "f": GroupSpec(fundamentals, "f_"),
     "a": GroupSpec(analysts, "a_"),
+    "i": GroupSpec(insiders, "i_"),
 }
 
 
@@ -1488,7 +1543,7 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
     out = out[(day >= pd.Timestamp(first_day)) & (day <= pd.Timestamp(last_day))]
     listed = out["listed"].to_numpy()
     nan_rate = {c: (float(out.loc[listed, c].isna().mean()) if listed.any() else 1.0) for c in feature_columns(out, groups)}
-    if any(g in groups for g in ("x", "f")):
+    if any(g in groups for g in ("x", "f", "i")):
         st = ml_universe.scan_store(store_path)
         ctx.provenance["store"] = {"dir": str(store_path), "newest_scan": st.dates[-1], "fingerprint": st.fingerprint}
     out.attrs["meta"] = {
