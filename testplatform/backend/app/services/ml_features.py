@@ -674,6 +674,143 @@ def macro(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
     return pd.concat({sym: table for sym in ctx.symbols}, names=_INDEX_NAMES)
 
 
+# ------------------------------------------------------------------------------------------ group F (fundamentals)
+#: the nine columns of ``ml_panel.fundamental_features`` (earnings surprise / growth, margins, earnings yield) ...
+_F_PANEL_COLUMNS: Tuple[str, ...] = (
+    "f_eps_surprise", "f_rev_surprise", "f_eps_yoy", "f_rev_yoy", "f_gross_margin", "f_op_margin",
+    "f_annual_rev_growth", "f_days_since_earn", "f_earn_yield")
+#: ... plus the annual balance-sheet / cash-flow ratios
+_F_STATEMENT_COLUMNS: Tuple[str, ...] = (
+    "f_debt_assets", "f_current_ratio", "f_fcf_margin", "f_fcf_yield", "f_buyback_yield", "f_sbc_rev", "f_capex_rev")
+F_COLUMNS: Tuple[str, ...] = _F_PANEL_COLUMNS + _F_STATEMENT_COLUMNS
+#: Sessions before the first built one that ``fundamentals_table`` is run over, so an earnings date before the grid
+#: keeps its real session (``f_days_since_earn`` would otherwise count from the grid's first session).
+_F_HISTORY_DAYS = 450
+
+
+def _safe_ratio(num: np.ndarray, den: np.ndarray, lo: float = -5.0, hi: float = 5.0) -> np.ndarray:
+    """``num / den`` where the denominator is a positive finite number and the numerator is finite, else NaN (never
+    inf); clipped to ``[lo, hi]`` like the ratios of ``ml_panel.fundamentals_table``."""
+    num, den = np.asarray(num, dtype="float64"), np.asarray(den, dtype="float64")
+    ok = np.isfinite(num) & np.isfinite(den) & (den > 0)
+    out = np.full(num.shape, np.nan)
+    out[ok] = np.clip(num[ok] / den[ok], lo, hi)
+    return out
+
+
+def _num(rec: dict, key: str) -> float:
+    v = rec[key] if key in rec else None
+    return float(v) if v is not None else np.nan
+
+
+def _select_visible(sessions: Sequence[date], events: List[Tuple[date, str, int]]) -> np.ndarray:
+    """For each session the payload index of the record with the NEWEST fiscal date among those already visible
+    (``events``: (first visible session, fiscal date, payload index)); -1 before the first one. A late-filed older
+    statement never replaces a newer one."""
+    events = sorted(events, key=lambda e: (e[0], e[1]))
+    out = np.full(len(sessions), -1, dtype=np.int64)
+    ei, best, best_idx = 0, "", -1
+    for k, day in enumerate(sessions):
+        while ei < len(events) and events[ei][0] <= day:
+            _, fiscal, idx = events[ei]
+            if fiscal >= best:
+                best, best_idx = fiscal, idx
+            ei += 1
+        out[k] = best_idx
+    return out
+
+
+def _pick(values: np.ndarray, chosen: np.ndarray) -> np.ndarray:
+    out = np.full(len(chosen), np.nan)
+    have = chosen >= 0
+    out[have] = values[chosen[have]]
+    return out
+
+
+def _statement_features(symbol: str, sessions: Sequence[date], market_cap: np.ndarray, cache_root: Path) -> pd.DataFrame:
+    """The ``_F_STATEMENT_COLUMNS`` of one symbol on ``sessions`` (dates).
+
+    Each annual statement is visible from the session after its ``acceptedDate`` (``ml_panel.fundamentals_visible_from``
+    "annual" rule) and the newest fiscal year visible is used. The ratios over revenue need the income statement of
+    the SAME fiscal date, so they appear when both filings are public; the yields need only the cash flow. A missing
+    file raises (``PanelDataError``): F is a stock-only group."""
+    from app.services import ml_panel
+
+    sessions = list(sessions)
+    bs = ml_panel._load_json(cache_root, "balance_sheet_annual", symbol)
+    cf = ml_panel._load_json(cache_root, "cashflow_statement_annual", symbol)
+    inc = ml_panel._load_json(cache_root, "income_statement_annual", symbol)
+
+    def visible(rec: dict) -> Optional[date]:
+        return ml_panel.fundamentals_visible_from("annual", rec, sessions) if "date" in rec else None
+
+    out: Dict[str, np.ndarray] = {}
+    # balance sheet
+    ev = [(v, r["date"], i) for i, r in enumerate(bs) if (v := visible(r)) is not None]
+    pick = _select_visible(sessions, ev)
+    out["f_debt_assets"] = _pick(_safe_ratio([_num(r, "totalLiabilities") for r in bs], [_num(r, "totalAssets") for r in bs]), pick)
+    out["f_current_ratio"] = _pick(_safe_ratio([_num(r, "totalCurrentAssets") for r in bs],
+                                               [_num(r, "totalCurrentLiabilities") for r in bs]), pick)
+    # cash flow alone: the yields over the market cap visible that session
+    ev = [(v, r["date"], i) for i, r in enumerate(cf) if (v := visible(r)) is not None]
+    pick = _select_visible(sessions, ev)
+    fcf = _pick(np.array([_num(r, "freeCashFlow") for r in cf]), pick)
+    bought = _pick(np.array([_num(r, "commonStockRepurchased") for r in cf]), pick)
+    out["f_fcf_yield"] = _safe_ratio(fcf, market_cap)
+    out["f_buyback_yield"] = _safe_ratio(-bought, market_cap)
+    # cash flow + income statement of the same fiscal date: the revenue ratios
+    inc_by_date = {r["date"]: r for r in inc if "date" in r}
+    pairs, rev, sbc, capex, fcf_p = [], [], [], [], []
+    for r in cf:
+        match = inc_by_date[r["date"]] if "date" in r and r["date"] in inc_by_date else None
+        v_cf, v_inc = visible(r), (visible(match) if match is not None else None)
+        if v_cf is not None and v_inc is not None:
+            pairs.append((max(v_cf, v_inc), r["date"], len(rev)))
+            rev.append(_num(match, "revenue"))
+            sbc.append(_num(r, "stockBasedCompensation"))
+            capex.append(_num(r, "capitalExpenditure"))
+            fcf_p.append(_num(r, "freeCashFlow"))
+    pick = _select_visible(sessions, pairs)
+    rev_a = np.array(rev)
+    out["f_fcf_margin"] = _pick(_safe_ratio(fcf_p, rev_a), pick)
+    out["f_sbc_rev"] = _pick(_safe_ratio(sbc, rev_a), pick)
+    out["f_capex_rev"] = _pick(_safe_ratio(-np.array(capex), rev_a), pick)
+    return pd.DataFrame(out, index=pd.Index(sessions))[list(_F_STATEMENT_COLUMNS)]
+
+
+def fundamentals(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
+    """Group ``f_``: point-in-time fundamentals of a STOCK (building it for an ETF raises: no statements are cached).
+
+    * the existing ``ml_panel`` table (``fundamentals_table`` + ``fundamental_features``): quarterly earnings
+      surprise and year-over-year growth, annual margins and revenue growth, days since the last earnings, trailing
+      earnings yield, with its visibility rules (earnings: ``bmo`` the same session, otherwise the next; annual
+      statements: the session after ``acceptedDate``);
+    * from the annual balance sheet and cash flow: ``f_debt_assets`` = totalLiabilities / totalAssets,
+      ``f_current_ratio`` = totalCurrentAssets / totalCurrentLiabilities, ``f_fcf_margin`` = freeCashFlow / revenue,
+      ``f_sbc_rev`` = stockBasedCompensation / revenue, ``f_capex_rev`` = -capitalExpenditure / revenue (revenue of the
+      income statement of the same fiscal date), ``f_fcf_yield`` = freeCashFlow / market cap and ``f_buyback_yield`` =
+      -commonStockRepurchased / market cap, the market cap being the metric-store scan visible at the session (NaN
+      before the first scan, 2020-01, and for a symbol the scan lacks).
+
+    Ratios are clipped to [-5, 5]; a non-positive denominator gives NaN. The statements are FMP's latest restated
+    figures with their filing dates (``acceptedDate``): the figures are not first-print, the visibility is."""
+    from app.services import ml_panel
+
+    ext_first = (ctx.sessions[0] - pd.Timedelta(days=_F_HISTORY_DAYS)).date()
+    ext = [t.date() for t in _sessions_index(ext_first, ctx.sessions[-1].date())]
+    dates = [t.date() for t in ctx.sessions]
+    caps = ml_universe.scan_values(list(ctx.symbols), ctx.sessions, ["market_cap"], ctx.store_dir)["market_cap"]
+    frames: Dict[str, pd.DataFrame] = {}
+    for sym in ctx.symbols:
+        table = ml_panel.fundamentals_table(sym, ext, ctx.cache_root)
+        b = pd.DataFrame({"session": dates, "close": daily[sym]["close"].to_numpy()}, index=ctx.sessions)
+        base = ml_panel.fundamental_features(b, table)[list(_F_PANEL_COLUMNS)]
+        stm = _statement_features(sym, dates, caps[sym].to_numpy(dtype="float64"), ctx.cache_root)
+        stm.index = ctx.sessions
+        frames[sym] = pd.concat([base, stm], axis=1)[list(F_COLUMNS)]
+    return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
+
+
 #: group name -> spec. The name is the grid factor; the spec's prefix names its columns. Later tasks register here.
 GROUPS: Dict[str, GroupSpec] = {
     "t": GroupSpec(technical, "t_"),
@@ -681,6 +818,7 @@ GROUPS: Dict[str, GroupSpec] = {
     "m": GroupSpec(market, "m_", needs_sector=True, required_context=_market_context),
     "x": GroupSpec(cross_section, "x_"),
     "mac": GroupSpec(macro, "mac_"),
+    "f": GroupSpec(fundamentals, "f_"),
 }
 
 

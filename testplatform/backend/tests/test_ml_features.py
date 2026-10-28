@@ -231,12 +231,16 @@ def _build(cache, groups, symbols=SYMS, first=FIRST, last=LAST, ctx=CTX, sector_
                             universe=universe)
 
 
-def _assert_cut_identical(cache, tmp_path, groups, day=CUT_DAY, symbols=SYMS, sector_of=None, universe=None):
+def _assert_cut_identical(cache, tmp_path, groups, day=CUT_DAY, symbols=SYMS, sector_of=None, universe=None,
+                          truncate_extra=None):
     """THE point-in-time proof: a build over a cache cut after ``day`` equals the full build on every common row.
     ``label_bar_filled`` is the one deliberate look-forward column (the NEXT session's fill flag): it is compared
     separately."""
     full = _build(cache, groups, symbols, sector_of=sector_of, universe=universe)
-    cut = _build(_truncate(cache, tmp_path, day), groups, symbols, last=day, sector_of=sector_of, universe=universe)
+    trunc = _truncate(cache, tmp_path, day)
+    if truncate_extra is not None:                       # a group with its own data files cuts them too
+        truncate_extra(trunc, day)
+    cut = _build(trunc, groups, symbols, last=day, sector_of=sector_of, universe=universe)
     common = full[full.index.get_level_values("session") <= pd.Timestamp(day)]
     assert len(common) == len(cut) > 300 * len(symbols) // 2
     assert common.index.equals(cut.index) and list(common.columns) == list(cut.columns)
