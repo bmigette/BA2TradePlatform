@@ -2201,9 +2201,39 @@ def _field(row: Dict[str, Any], key: str) -> Any:
     return row[key] if key in row else None
 
 
+#: the first day of the COMMON PERIOD of ``factor_effects``: 2020H2 on, the part of the evaluation every cell can score (a
+#: 36-month window cannot score 2019 and the 2020 crash from a 2016 data start). A regime start (``W.regimes_from``).
+COMMON_START = date(2020, 7, 1)
+#: the factors ``factor_effects`` tabulates, and (``by_family``) tabulates again within each family
+FACTORS: Tuple[str, ...] = ("target", "horizon", "family", "train_months", "groups")
+
+
+def common_period_mean(row: Dict[str, Any], primary: str, names: Sequence[str]) -> float:
+    """One row's primary metric over the regimes ``names`` only: the mean of the regime means weighted by each regime's
+    number of daily observations (``n``), i.e. the pooled mean over those sessions. NaN when the row lacks the metric, a
+    regime, or a finite mean / positive ``n`` in any of them (a cell that cannot score the whole common period has no
+    common mean: it is not compared on a different period)."""
+    reg = _field(row, "regimes")
+    if not isinstance(reg, dict) or primary not in reg or not isinstance(reg[primary], dict):
+        return float("nan")
+    num = den = 0.0
+    for name in names:
+        e = reg[primary][name] if name in reg[primary] else None
+        if not isinstance(e, dict) or "mean" not in e or "n" not in e:
+            return float("nan")
+        m, n = e["mean"], e["n"]
+        if not (_is_real(m) and _is_real(n) and n > 0):
+            return float("nan")
+        num += float(m) * float(n)
+        den += float(n)
+    return num / den if den > 0 else float("nan")
+
+
 def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: str, min_coverage: float = 0.8,
-                   max_low_iter_share: Optional[float] = None) -> Dict[str, pd.DataFrame]:
-    """Aggregate finished rows of one ``track`` into ``{"factors", "cells", "excluded"}`` DataFrames.
+                   max_low_iter_share: Optional[float] = None, common_start: date = COMMON_START
+                   ) -> Dict[str, Any]:
+    """Aggregate finished rows of one ``track`` into ``{"factors", "cells", "excluded", "by_family"}`` DataFrames and
+    ``"common_start"``.
 
     Rows are deduplicated on (cell_key, seed), the LAST one counting (a rerun replaces). Only rows with ``status ==
     "ok"`` and the track's primary metric (``PRIMARY[track]``; volatility models have a different primary and are left
@@ -2223,13 +2253,24 @@ def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: s
     ``cells`` ranks the kept cells by ``score = mean - std`` (descending, NaN last); ``excluded`` lists the dropped ones
     with their ``reason``. ``factors``: indexed (factor, level) for target / horizon / family / train_months / groups,
     from the kept cells: the mean, std and median of the cell-level means, ``n_cells``, ``share_positive``,
-    ``n_deterministic`` and ``low_iter_share``."""
+    ``n_deterministic`` and ``low_iter_share``.
+
+    COMMON PERIOD. The whole-period means compare cells that were scored over different spans (a 36-month window cannot
+    score 2019 or the 2020 crash; a deep model may skip blocks), so a family can look better only because it was scored
+    on an easier span. ``common_mean`` (a column of ``cells`` and of the tables) is the primary over the regimes from
+    ``common_start`` (default ``COMMON_START``, 2020-07-01, a regime start; ``W.regimes_from`` refuses any other date)
+    only, the same for every cell: ``common_period_mean`` per row (pooled over the regimes' daily observations), the mean
+    over a cell's seeds, NaN for a cell that cannot score all of those regimes; ``n_common`` counts the cells that have
+    one. ``by_family``: the same tables (``n_cells``, ``mean``, ``common_mean``) for every factor but the family, within
+    each family: indexed (family, factor, level), so a factor's effect is read inside one family instead of across a
+    grid that is not balanced."""
     if track not in TRACKS:
         raise ValueError(f"track must be one of {TRACKS}")
     if not 0.0 <= min_coverage <= 1.0:
         raise ValueError("min_coverage must be in [0, 1]")
     if max_low_iter_share is not None and not 0.0 <= max_low_iter_share <= 1.0:
         raise ValueError("max_low_iter_share must be None or in [0, 1]")
+    common = W.regimes_from(common_start)
     rows = read_results(results) if isinstance(results, (str, Path)) else list(results)
     last: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for r in rows:
@@ -2262,7 +2303,9 @@ def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: s
         ps = [r["controls"]["p_value"] for r in rs if isinstance(_field(r, "controls"), dict)
               and "p_value" in r["controls"] and r["controls"]["p_value"] is not None]
         li = [r["low_iter_share"] for r in rs if _field(r, "low_iter_share") is not None]
+        cm = np.array([common_period_mean(r, want, common) for r in rs], dtype=float)
         rec = {"cell_key": key, **_factor_levels(rs[0]["config"]), "n_seeds": len(v), "mean": float(v.mean()),
+               "common_mean": float(cm.mean()) if np.isfinite(cm).all() else float("nan"),
                "std": 0.0 if det else (float(v.std(ddof=1)) if len(v) > 1 else float("nan")),
                "p_value": float(np.median(ps)) if ps else float("nan"), "p_values": ps,
                "coverage": float(min(cov)) if cov_ok else float("nan"),
@@ -2276,8 +2319,8 @@ def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: s
                 and rec["low_iter_share"] > max_low_iter_share:
             reason = f"low_iter_share {rec['low_iter_share']:.2f} > max_low_iter_share {max_low_iter_share:g}"
         (dropped if reason else kept).append({**rec, "reason": reason} if reason else rec)
-    cols = ["cell_key", "target", "horizon", "family", "train_months", "groups", "n_seeds", "mean", "std", "p_value",
-            "p_values", "coverage", "low_iter_share", "deterministic"]
+    cols = ["cell_key", "target", "horizon", "family", "train_months", "groups", "n_seeds", "mean", "common_mean", "std",
+            "p_value", "p_values", "coverage", "low_iter_share", "deterministic"]
     cdf = pd.DataFrame(kept, columns=cols)
     cdf["deterministic"] = cdf["deterministic"].astype(bool)
     cdf["score"] = cdf["mean"] - cdf["std"]
@@ -2285,19 +2328,34 @@ def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: s
     xdf = pd.DataFrame(dropped, columns=cols + ["reason"])[["cell_key", "reason", "coverage", "low_iter_share", "target",
                                                            "horizon", "family", "train_months", "groups"]]
     parts = []
-    for factor in ("target", "horizon", "family", "train_months", "groups"):
+    for factor in FACTORS:
         lv = cdf[factor].astype(str)
         g = cdf.groupby(lv, sort=True)["mean"]
         f = pd.DataFrame({"n_cells": g.size(), "mean": g.mean(), "std": g.std(ddof=1), "median": g.median(),
                           "share_positive": g.apply(lambda s: float((s > 0).mean())),
                           "n_deterministic": cdf.groupby(lv, sort=True)["deterministic"].sum().astype(int),
-                          "low_iter_share": cdf.groupby(lv, sort=True)["low_iter_share"].mean()})
+                          "low_iter_share": cdf.groupby(lv, sort=True)["low_iter_share"].mean(),
+                          "common_mean": cdf.groupby(lv, sort=True)["common_mean"].mean(),
+                          "n_common": cdf.groupby(lv, sort=True)["common_mean"].count()})
         f.index = pd.MultiIndex.from_product([[factor], f.index], names=["factor", "level"])
         parts.append(f)
     fdf = pd.concat(parts) if parts and len(cdf) else pd.DataFrame(
-        columns=["n_cells", "mean", "std", "median", "share_positive", "n_deterministic", "low_iter_share"],
+        columns=["n_cells", "mean", "std", "median", "share_positive", "n_deterministic", "low_iter_share", "common_mean",
+                 "n_common"],
         index=pd.MultiIndex.from_arrays([[], []], names=["factor", "level"]))
-    return {"factors": fdf, "cells": cdf, "excluded": xdf}
+    inside = []
+    for family, sub in cdf.groupby(cdf["family"].astype(str), sort=True):
+        for factor in FACTORS:
+            if factor == "family":
+                continue
+            g = sub.groupby(sub[factor].astype(str), sort=True)
+            t = pd.DataFrame({"n_cells": g["mean"].size(), "mean": g["mean"].mean(), "common_mean": g["common_mean"].mean()})
+            t.index = pd.MultiIndex.from_product([[family], [factor], t.index], names=["family", "factor", "level"])
+            inside.append(t)
+    bdf = pd.concat(inside) if inside else pd.DataFrame(
+        columns=["n_cells", "mean", "common_mean"],
+        index=pd.MultiIndex.from_arrays([[], [], []], names=["family", "factor", "level"]))
+    return {"factors": fdf, "cells": cdf, "excluded": xdf, "by_family": bdf, "common_start": common_start}
 
 
 # ================================================================== job handler

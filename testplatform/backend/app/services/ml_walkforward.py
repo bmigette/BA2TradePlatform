@@ -201,6 +201,21 @@ def regime(session: Any) -> str:
     return name
 
 
+def regime_starts() -> Tuple[date, ...]:
+    """The first session of each regime after ``pre2019``, in time order."""
+    return tuple(d for d, _ in _REGIME_STARTS)
+
+
+def regimes_from(start: date) -> Tuple[str, ...]:
+    """The regimes that begin on or after ``start``, in time order. ``start`` must BE a regime start (a regime is the
+    finest grain a results row keeps): any other date raises, it is never rounded."""
+    start = _d(start)
+    if start not in regime_starts():
+        raise ValueError(f"{start} is not a regime start; the regimes start on "
+                         f"{', '.join(str(d) for d in regime_starts())}")
+    return tuple(n for d, n in _REGIME_STARTS if d >= start)
+
+
 def regimes(sessions: Sequence) -> np.ndarray:
     """Vectorised ``regime`` over an array / Series of sessions (object array of names)."""
     ts = pd.to_datetime(pd.Series(np.asarray(sessions).ravel() if not isinstance(sessions, pd.Series)

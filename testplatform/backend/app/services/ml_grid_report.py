@@ -5,7 +5,10 @@ on to stage 2. The design's rule, averaged over a cell's seeds:
 
 * it beats BOTH baselines (naive momentum and the linear model of the same track / store / symbols / target kind /
   horizon) and its shuffle control, in at least ``GATE_MIN_REGIMES`` (4) of the six regimes, including ``2022bear`` or
-  ``2020crash``;
+  ``2020crash``. The rule is not relaxed for a regime the cell cannot be scored in at all (no seed has a value because
+  no block of that regime was fitted): that regime is "n/a" (``unavailable`` of the record, ``available`` False in its
+  regime entry; shown as n/a everywhere), it never counts, and a cell that fails the rule says "regimes unavailable:
+  2019, 2020crash" in its reasons. A cell scored in only four regimes must beat the baselines in all four;
 * its primary metric (selection: quintile spread, timing: excess; both already net of ``cost_bps`` = 7) is positive;
 * the shuffle control's p-value is at most ``GATE_MAX_P``;
 * at most ``GATE_MAX_SURVIVORS`` (10) survivors PER TRACK, ranked by seed mean minus seed std.
@@ -138,6 +141,21 @@ def _seed_mean_regimes(rows: Sequence[Dict[str, Any]], metric: str) -> Dict[str,
             m = r["regimes"][metric] if "regimes" in r and metric in r["regimes"] else {}
             vals.append(_num(m[reg]["mean"]) if reg in m else float("nan"))
         out[reg] = float(np.mean(vals)) if vals and all(math.isfinite(v) for v in vals) else float("nan")
+    return out
+
+
+def _unavailable_regimes(rows: Sequence[Dict[str, Any]], metric: str) -> List[str]:
+    """The gate regimes that NO seed of the cell has a finite value for: a block of that regime was never fitted (the
+    training window does not reach back, or every block was skipped), so the cell cannot be scored there at all. A regime
+    one seed lacks is not structural: it stays an ordinary NaN (not counted)."""
+    out: List[str] = []
+    for reg in GATE_REGIMES:
+        have = []
+        for r in rows:
+            m = r["regimes"][metric] if "regimes" in r and metric in r["regimes"] else {}
+            have.append(reg in m and math.isfinite(_num(m[reg]["mean"])))
+        if rows and not any(have):
+            out.append(reg)
     return out
 
 
@@ -305,8 +323,8 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
             "mean": float("nan"), "std": float("nan"), "score": float("nan"), "p_value": float("nan"),
             "null_mean": float("nan"), "low_iter_share": None, "near_constant": False, "regimes": {},
             "whole": None, "warnings": [], "old_rows": 0, "uses_fallback": False, "regimes_beaten": 0,
-            "passed": False, "survivor": False, "rank": None, "state": "fail", "reasons": [], "note": "",
-            "baseline_keys": {}, "baselines": {}}
+            "unavailable": [], "passed": False, "survivor": False, "rank": None, "state": "fail", "reasons": [],
+            "note": "", "baseline_keys": {}, "baselines": {}}
         records.append(rec)
         if cfg["target"]["kind"] == "volatility":
             rec.update(state="not gated", reasons=["volatility target: a sizing model with no trading shuffle "
@@ -343,6 +361,8 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
             reasons.append("a single seed: no seed std, so no mean - std to rank by")
         # --- baselines
         cell_regs = _seed_mean_regimes(ok, metric_of(track))
+        unavailable = _unavailable_regimes(ok, metric_of(track))
+        rec["unavailable"] = unavailable
         pool = pools[_match_key(r0)] if _match_key(r0) in pools else []
         loose = loose_pools[_match_key(r0, loose=True)] if _match_key(r0, loose=True) in loose_pools else []
         strongest = lambda cs: max(cs, key=lambda b: (b["mean"] if math.isfinite(b["mean"]) else -math.inf, b["key"]))  # noqa: E731
@@ -377,8 +397,9 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
         for reg in GATE_REGIMES:
             v = cell_regs[reg]
             rc = ctl[reg]
-            info = {"value": _opt(v), "naive": None, "linear": None, "null_mean": _opt(rc["null_mean"]),
-                    "null_std": rc["null_std"], "p_value": rc["p_value"], "control": rc["control"]}
+            info = {"value": _opt(v), "available": reg not in unavailable, "naive": None, "linear": None,
+                    "null_mean": _opt(rc["null_mean"]), "null_std": rc["null_std"], "p_value": rc["p_value"],
+                    "control": rc["control"]}
             vs_base = bool(base) and math.isfinite(v)
             for fam, b in base.items():
                 bv = b["regimes"][reg]
@@ -400,6 +421,8 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
                                f"regimes (need {min_regimes})")
             if not hard:
                 reasons.append(f"does not beat them in {' or '.join(HARD_REGIMES)}")
+            if unavailable and (beaten < min_regimes or not hard):
+                reasons.append(f"regimes unavailable: {', '.join(unavailable)}")
         # --- costs, significance
         if not (math.isfinite(rec["mean"]) and rec["mean"] > 0):
             reasons.append(f"not positive after costs: primary mean {_fmt(rec['mean'])} after {min_cost_bps:g} bps")
@@ -428,7 +451,7 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
                         "std": float("nan"), "score": float("nan"), "p_value": float("nan"),
                         "null_mean": float("nan"), "low_iter_share": None, "near_constant": False, "regimes": {},
                         "whole": None, "warnings": [], "old_rows": 0, "uses_fallback": False, "regimes_beaten": 0,
-                        "passed": False, "survivor": False, "rank": None,
+                        "unavailable": [], "passed": False, "survivor": False, "rank": None,
                         "state": "pending" if live else "fail", "note": "", "baseline_keys": {}, "baselines": {},
                         "reasons": ["no seed finished (errors)"], **lv})
     # --- survivors per track
@@ -533,7 +556,8 @@ def slim_row(r: Dict[str, Any]) -> Dict[str, Any]:
     ver = r["versions"] if "versions" in r and isinstance(r["versions"], dict) else {}
     out["versions"] = {k: ver[k] for k in ("code",) if k in ver}
     reg = r["regimes"] if "regimes" in r and isinstance(r["regimes"], dict) else {}
-    out["regimes"] = {m: {name: {"mean": e["mean"]} for name, e in reg[m].items()} for m in _SLIM_METRICS if m in reg}
+    out["regimes"] = {m: {name: {"mean": e["mean"], **({"n": e["n"]} if "n" in e else {})} for name, e in reg[m].items()}
+                      for m in _SLIM_METRICS if m in reg}
     ctl = r["controls"] if "controls" in r and isinstance(r["controls"], dict) else {}
     slim_ctl: Dict[str, Any] = {k: ctl[k] for k in ("primary", "p_value", "p_values", "by_regime", "skipped") if k in ctl}
     names = set(ctl["p_values"]) if "p_values" in ctl and isinstance(ctl["p_values"], dict) else set()
@@ -750,6 +774,16 @@ def _mean_std(c: Dict[str, Any]) -> str:
 
 REPORT_REGIME_ROWS = 100
 
+#: what a reader of the stage-1 factor tables must know before comparing levels
+CONFOUNDING_NOTE = (
+    "The stage-1 core grid is unbalanced, so a factor's mean is not its effect: (1) target x family availability: some "
+    "targets exist for some families only (`rank` has no linear baseline, `quantile` no naive or linear, `terciles` no naive; "
+    "the darts families take `rel_return` / `quantile` only and every deep family needs half-year blocks), so a target level and a family level share "
+    "cells; (2) the feature groups are confounded with tsai: a tsai cell reads the 1h panel (`panel_1h`) and no store group, so "
+    "a groups level that holds tsai cells measures the architecture, not the features; (3) the horizon is fixed (5) in the "
+    "core grid, so its effect is not estimated at all. A level mean is therefore the mean over whatever cells happened to "
+    "carry it; read the within-family tables below and the common-period column before ranking levels.")
+
 
 def _regime_text(r: Dict[str, Any]) -> str:
     """``value vs null (p=..)`` of one regime of a gate record, a check mark when the regime counted."""
@@ -758,6 +792,12 @@ def _regime_text(r: Dict[str, Any]) -> str:
     null = "n/a" if r["null_mean"] is None else f"{r['null_mean']:+.4f}"
     p = "n/a" if r["p_value"] is None else f"{r['p_value']:.3f}"
     return f"{r['value']:+.4f} vs null {null} (p={p}){' ✓' if r['counted'] else ''}"
+
+
+def _beaten_text(c: Dict[str, Any]) -> str:
+    """``"4 of 6"``; the regimes the cell could not be scored in are named: ``"4 of 6 (n/a: 2019, 2020crash)"``."""
+    na = c["unavailable"] if "unavailable" in c else []
+    return f"{c['regimes_beaten']} of 6" + (f" (n/a: {', '.join(na)})" if na else "")
 
 
 def _baseline_text(c: Dict[str, Any]) -> str:
@@ -825,22 +865,42 @@ def render_report(state: Dict[str, Any]) -> str:
                 continue
             out += [_md_table(["rank", "cell", "key", "seed mean ± std", "mean − std", "regimes beaten", "p", "notes"],
                               [[c["rank"], _cell_text(c), c["key"], _mean_std(c), _fmt(c["score"]),
-                                f"{c['regimes_beaten']} of 6", _p_text(c),
+                                _beaten_text(c), _p_text(c),
                                 "old-row fallback" if c["uses_fallback"] else ""] for c in sv]), ""]
-    out += ["## Factor effects", "",
+    common = g["effects"][G.TRACKS[0]]["common_start"]
+    out += ["## Reading the factor tables", "", CONFOUNDING_NOTE, "",
+            "## Factor effects", "",
             "Mean of the cell-level seed means per factor level (cells kept by the coverage filters), with the spread "
-            "across cells. Primary metric: selection = quintile spread net of cost, timing = timing excess net of cost.",
-            ""]
+            "across cells. Primary metric: selection = quintile spread net of cost, timing = timing excess net of cost. "
+            f"**common mean** (common period from {common}): the same metric over the regimes from {common} on only, "
+            f"pooled by their trading days and the same for every cell, so families scored over different spans (a long "
+            f"window cannot score 2019 or the 2020 crash) are compared on one period; `n/a` when no cell of the level can "
+            f"score all of those regimes.", ""]
     for track in G.TRACKS:
         f = g["effects"][track]["factors"]
         out += [f"### {track} ({G.PRIMARY[track]})", ""]
         if not len(f):
             out += ["No finished cells.", ""]
             continue
-        out += [_md_table(["factor", "level", "cells", "mean", "std", "median", "share > 0"],
+        out += [_md_table(["factor", "level", "cells", "mean", "std", "median", "share > 0", "common mean"],
                           [[fac, lev, int(r["n_cells"]), _fmt(r["mean"]),
                             f"{r['std']:.4f}" if math.isfinite(r["std"]) else "n/a", _fmt(r["median"]),
-                            f"{r['share_positive']:.2f}"] for (fac, lev), r in f.iterrows()]), ""]
+                            f"{r['share_positive']:.2f}", _fmt(r["common_mean"])] for (fac, lev), r in f.iterrows()]), ""]
+    out += ["## Factors within each family", "",
+            "Each factor again, inside ONE family, so its effect is not mixed with the family's (the grid is not "
+            "balanced, see above). Same metrics: mean of the cell-level seed means and the common mean.", ""]
+    for track in G.TRACKS:
+        b = g["effects"][track]["by_family"]
+        out += [f"### {track} ({G.PRIMARY[track]})", ""]
+        if not len(b):
+            out += ["No finished cells.", ""]
+            continue
+        for family in b.index.get_level_values("family").unique():
+            sub = b.xs(family, level="family")
+            out += [f"#### {family}", "",
+                    _md_table(["factor", "level", "cells", "mean", "common mean"],
+                              [[fac, lev, int(r["n_cells"]), _fmt(r["mean"]), _fmt(r["common_mean"])]
+                               for (fac, lev), r in sub.iterrows()]), ""]
     out += ["## Gate table", ""]
     for track in G.TRACKS:
         cs = [c for c in g["cells"] if c["track"] == track]
@@ -851,7 +911,7 @@ def render_report(state: Dict[str, Any]) -> str:
         out += [_md_table(["rank", "cell", "key", "seed mean ± std", "mean − std", "regimes beaten", "p", "result",
                            "flags", "baseline", "reasons"],
                           [[c["rank"] or "", _cell_text(c), c["key"], _mean_std(c), _fmt(c["score"]),
-                            f"{c['regimes_beaten']} of 6" if c["regimes"] else "", _p_text(c), c["state"].upper(),
+                            _beaten_text(c) if c["regimes"] else "", _p_text(c), c["state"].upper(),
                             _flag_text(c), _baseline_text(c), _why(c)] for c in cs]), ""]
     out += ["## Per-regime control", "",
             "Per regime: the cell's seed-mean value of the primary metric against that regime's shuffle-control null "
@@ -960,6 +1020,7 @@ td.sticky, th.sticky { position: sticky; left: 0; background: var(--card); text-
 .dots { display: inline-flex; gap: 2px; vertical-align: middle; margin-left: 6px; }
 .dot { width: 7px; height: 7px; border-radius: 2px; background: var(--border); display: inline-block; }
 .dot.on { background: var(--good); }
+.dot.na { background: repeating-linear-gradient(45deg, var(--border), var(--border) 2px, transparent 2px, transparent 4px); }
 .note { background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px;
   padding: 8px 12px; margin: 10px 0; }
 .empty { color: var(--muted); padding: 12px 0; }
@@ -1005,6 +1066,8 @@ def _heat_cell(v: float, scale: float, all_col: bool, tip: str = "") -> str:
 def _control_tip(label: str, e: Dict[str, Any]) -> str:
     """Tooltip of a primary-metric heat cell: the value, the control's null there (mean ± std) and the p."""
     if e["value"] is None:
+        if "available" in e and not e["available"]:
+            return f"{label}: n/a (no block of this regime was fitted)"
         return f"{label}: not enough rows"
     parts = [f"{label}: {e['value']:+.4f}"]
     if e["null_mean"] is not None:
@@ -1085,6 +1148,14 @@ def _fx_bars(state: Dict[str, Any], track: str) -> str:
 GATE_TABLE_MAX_ROWS = 300
 
 
+def _dot(regime: str, e: Dict[str, Any]) -> str:
+    """One regime dot of the gate table: green when the regime counted, grey when it did not, hatched (n/a) when the cell
+    could not be scored in it at all."""
+    if not e["available"]:
+        return f'<i class="dot na" title="{_e(regime)}: n/a"></i>'
+    return f'<i class="dot{" on" if e["counted"] else ""}" title="{_e(regime)}"></i>'
+
+
 def _gate_table(state: Dict[str, Any], track: str) -> str:
     cs = [c for c in state["gate"]["cells"] if c["track"] == track]
     if not cs:
@@ -1092,8 +1163,7 @@ def _gate_table(state: Dict[str, Any], track: str) -> str:
     rows = []
     for c in cs[:GATE_TABLE_MAX_ROWS]:
         if c["regimes"]:
-            dots = "".join(f'<i class="dot{" on" if c["regimes"][r]["counted"] else ""}" title="{_e(r)}"></i>'
-                           for r in GATE_REGIMES)
+            dots = "".join(_dot(r, c["regimes"][r]) for r in GATE_REGIMES)
             beat = f'{c["regimes_beaten"]}/6<span class="dots">{dots}</span>'
         else:
             beat = "&ndash;"
