@@ -14,13 +14,16 @@ Tracks and primary metrics (one number per (cell, seed), the thing ``factor_effe
 * ``timing``: in a name when its score is at or above the causal per-symbol 60% quantile of its EARLIER scores
   (``ml_eval.with_cutoff``; the stitched frame holds the earlier blocks, so a block's cutoff history is exactly the
   scores of the earlier blocks, never its own or a later one's), net of costs against the unconditional mean.
-  PRIMARY = ``timing_excess_net``; also ``timing_sharpe(horizon)``. Control: ``shuffle_time``.
+  PRIMARY = ``timing_excess_net``; also ``timing_sharpe(horizon)``. Controls: ``shuffle_time`` and the stricter
+  ``shuffle_time_within_block`` (the gate takes the larger p / the higher null of the two).
 * target ``volatility`` is a SIZING model, not a trading one: the only metric is the Spearman correlation of the
   prediction with ``realvol_H`` (``spearman`` pooled over rows, ``spearman_within_symbol`` mean over names), on either
   track; there is no shuffle control (the trading controls do not apply). PRIMARY = ``spearman``.
 
 Every metric is reported overall and per market regime (``ml_walkforward.regime``) with the Newey-West t (lag H) of
-its daily series. ``controls_report`` returns BOTH shuffles; ``controls.primary`` names the one that matches the track.
+its daily series. ``controls_report`` runs the shuffles of the track (selection: ``shuffle_symbols``; timing: ``shuffle_time``
+and ``shuffle_time_within_block``); ``controls.primary`` names the stricter one (the larger p), ``controls.by_regime`` holds
+every regime's nulls measured the way the regime's value is.
 
 Rows used: ``listed & ~filled & ~label_bar_filled & ~ended`` AND a finite target AND ``atr_pct`` (``daily_fold_rows``).
 The scoring rows of a block never depend on the TARGET fitted (a quintile model still predicts every row that has a
@@ -47,7 +50,7 @@ Cell schema (every key required except ``params`` and ``target.ratio``; unknown 
      "symbols": "ndq30_dev" | "timing" | ["AAPL", ...],
      "groups": ["t", "mtf", "m", "x", "mac", "f", "ag", "at", "i", "s"],       (a non-empty subset)
      "target": {"kind": <one of the eleven kinds above>, "horizon": 1|3|5|10|20, "ratio": 1.0},
-     "family": "lgbm" | "xgb" | "catboost" | "linear" | "naive", "params": {...},
+     "family": "lgbm" | "xgb" | "catboost" | "linear" | "naive" | "tsai-<arch>" | "darts-<arch>", "params": {...},
      "train_months": 12 | 24 | 36 | "expanding", "blocks": "Q" | "H", "seeds": [1, 2, 3]}
 
 ``triple_barrier`` (three classes: stop first / timeout / take-profit first) and ``binary_barrier`` (take-profit first
@@ -74,8 +77,8 @@ on that set is refused with the group named, never padded with NaN. Daily bars (
 ``label_bar_filled`` / ``ended`` flags select the rows.
 
 Parallelism. A ``ProcessPoolExecutor`` of ``cpu_slots`` workers runs the tabular families; each worker loads each panel
-(stores + bars + targets) ONCE (``_init_worker`` warms the panels of the pending tasks; ``get_panel`` is a per-process
-cache keyed by store, symbols, cache root and track). ``n_jobs = cores // cpu_slots`` per fit, so slots x n_jobs <=
+(stores + bars + targets) ONCE, in the first task that needs it (``get_panel`` is a per-process LRU of
+``PANEL_CACHE_SIZE`` panels keyed by store, symbols, cache root and track; the first worker generation is staggered). ``n_jobs = cores // cpu_slots`` per fit, so slots x n_jobs <=
 cores. The sequence families (``tsai-<arch>``, ``darts-<arch>``; see "GPU families") are registered in ``FAMILY_POOL``
 with pool ``"gpu"`` and run in a second spawn pool of ``gpu_slots`` workers, concurrently with the CPU pool, with the
 same lifecycle (retries, probation, cancellation, lock); ``ml_grid_seq`` holds their input construction.
@@ -97,7 +100,12 @@ budget (``GridSettings.gpu_budget_minutes``) is checked before each block: over 
 Outputs in ``--out``: ``results.jsonl`` (one row per finished (cell_key, seed); resume skips them),
 ``predictions/<cell_key>_<seed>.parquet`` (written BEFORE the row, so a row implies its file), ``errors.jsonl`` (a
 (cell, seed) that raised; not finished, so a restart retries it). ``cell_key`` = a short hash of the canonical config
-without the seeds (the store path as written is part of it).
+without the seeds and without the store path (the store's signature stands for it, see "Identity and resume").
+
+Time limits. A GPU (cell, seed) has a soft budget (``gpu_budget_minutes``, checked before each block) and every task of both
+pools a HARD deadline: a task in flight for more than ``HARD_DEADLINE_BUDGETS`` (3) x ``gpu_budget_minutes`` / ``cpu_budget_minutes``
+(default 20 / 60 minutes) has its pool's workers terminated, the innocent in-flight tasks requeued uncharged, and is retried
+once; the second time it is recorded as a timeout (a restart does not retry timeouts unless ``--retry-timeouts``).
 """
 from __future__ import annotations
 
@@ -131,6 +139,7 @@ from app.services import ml_models_seq as MS
 from app.services import ml_targets as T
 from app.services import ml_walkforward as W
 from app.services.ml_controls import DEFAULT_SEEDS, controls_report
+from app.services.ml_models import _is_int, _is_real                    # one definition of "an integer" / "a finite number"
 
 logger = logging.getLogger(__name__)
 
@@ -217,15 +226,6 @@ class GridSettings:
         if "control_seeds" in d:
             d["control_seeds"] = tuple(int(s) for s in d["control_seeds"])
         return cls(**d)
-
-
-def _is_int(v: Any) -> bool:
-    return isinstance(v, (int, np.integer)) and not isinstance(v, (bool, np.bool_))
-
-
-def _is_real(v: Any) -> bool:
-    return isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, (bool, np.bool_)) \
-        and math.isfinite(float(v))
 
 
 # ================================================================== cells
@@ -1317,8 +1317,6 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
 
 # ================================================================== the runner
 _WORKER: Dict[str, Any] = {}
-#: warnings known to be noise in a grid worker, as (message regex, category): nothing else is silenced
-NOISY_WARNINGS: Tuple[Tuple[str, type], ...] = ()
 #: seconds the master waits on the pool before it looks at cancellation again
 POLL_SECONDS = 1.0
 #: worker i (in the order the pool initialised them) waits i x this before its FIRST panel load, so the workers do not
@@ -1342,12 +1340,11 @@ def _panel_for(cell: Cell, cache_root: str) -> Panel:
 def _init_worker(settings: Dict[str, Any], cache_root: str, out_dir: str, n_jobs: int, counter: Any = None,
                  workers: int = 0) -> None:
     """Pool initializer: remember the run constants, cap the BLAS / OpenMP threads at ``n_jobs`` (so slots x n_jobs
-    never exceeds the cores) and silence only ``NOISY_WARNINGS``. Panels are NOT loaded here: the task that needs one
+    never exceeds the cores); no warning is silenced. Panels are NOT loaded here: the task that needs one
     loads it (``get_panel``, an LRU of ``PANEL_CACHE_SIZE``). ``counter`` (a shared ``multiprocessing.Value`` of the
     pool) numbers the workers 0, 1, 2 ... for the staggered first panel load; without one the worker is number 0. With
     ``workers`` (the pool size) only the FIRST generation is staggered: a replacement worker (after a break, a
     ``max_tasks_per_child`` retirement or a termination) is number 0, so it never waits for a stagger that is over."""
-    import warnings
     index = 0
     if counter is not None:
         with counter.get_lock():
@@ -1355,8 +1352,6 @@ def _init_worker(settings: Dict[str, Any], cache_root: str, out_dir: str, n_jobs
             counter.value += 1
         if workers > 0 and index >= workers:
             index = 0
-    for message, category in NOISY_WARNINGS:
-        warnings.filterwarnings("ignore", message=message, category=category)
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[var] = str(n_jobs)
     try:
@@ -2421,10 +2416,14 @@ def check_lock(out: Path) -> None:
 
 def precheck_grid(payload: Dict[str, Any]) -> int:
     """Everything that can be refused before a task is queued: the payload, the cells (holdout lock, schema), unusable
-    feature groups, a live run in ``out_dir`` and finished rows whose identity differs from this run's
+    feature groups, GPU cells without a GPU slot, a live run in ``out_dir`` and finished rows whose identity differs from this run's
     (``ResumeMismatchError`` unless ``rerun_mismatched``). Changes nothing. Returns the number of cells."""
     cells, st, cache_root = prepare_grid(payload)
     check_groups(cells)
+    n_gpu = sum(1 for c in cells if c.pool == "gpu")
+    if n_gpu and payload["gpu_slots"] < 1:
+        raise ValueError(f"{n_gpu} cell(s) run on the gpu pool (tsai-* / darts-* families) but gpu_slots is "
+                         f"{payload['gpu_slots']}: give gpu_slots >= 1 or leave them out")
     out = Path(payload["out_dir"])
     check_lock(out)
     _check_resume(read_results(out / "results.jsonl"), cells, st, cache_root, payload["rerun_mismatched"],

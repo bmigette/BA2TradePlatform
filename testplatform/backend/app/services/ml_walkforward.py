@@ -6,7 +6,8 @@ the model for the block rule (a trailing stub shorter than half a period merges 
 ``ml_targets.fold_rows`` / ``split_validation`` for the purge, here made generic over the block length, the window
 length and the horizon (the caller supplies the session on which each row's target ends).
 
-Look-ahead rules, each enforced by a function below:
+Look-ahead rules, each enforced by a function below (and the regimes the results are broken down by: ``regime`` /
+``regimes``, ``regime_starts`` and ``regimes_from``, which names the regimes of a common period):
 
 * a block is predicted by a model trained on sessions strictly BEFORE the block (``train_window`` is
   ``[start, block.start)``);

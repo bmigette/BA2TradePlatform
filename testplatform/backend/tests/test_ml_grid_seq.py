@@ -1732,3 +1732,14 @@ def test_a_cpu_task_stuck_twice_is_retried_once_and_then_recorded_as_a_timeout(w
     assert [r["cell_key"] for r in G.read_results(out / "results.jsonl")] == [naive_key]           # the innocent one finished
     again = grun([lgbm_cell(world)], out, world, task_fn=slow_or_quick_task_ok)    # a restart skips the timeout
     assert again["tasks"] == 0 and again["skipped_timeouts"] == 1
+
+
+# ---- precheck_grid: GPU cells need GPU slots
+def test_precheck_grid_requires_a_gpu_slot_when_there_are_gpu_cells(world, tmp_path):
+    from tests.test_ml_grid import payload
+    body = payload(world, cells=[tsai_cell(world)], out_dir=str(tmp_path / "o"), gpu_slots=0)
+    with pytest.raises(ValueError, match="gpu_slots"):
+        G.precheck_grid(body)                                                  # the API's 400, not a failure after queueing
+    assert G.precheck_grid({**body, "gpu_slots": 1}) == 1
+    only_cpu = payload(world, cells=[lgbm_cell(world)], out_dir=str(tmp_path / "o2"), gpu_slots=0)
+    assert G.precheck_grid(only_cpu) == 1                                       # no GPU cell: no GPU slot needed

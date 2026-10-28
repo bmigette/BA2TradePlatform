@@ -1,6 +1,6 @@
 """Shuffle controls and baselines for the ML exploration v2 grid.
 
-A model score that "works" may be exploiting something other than what it was built for. Two permutation controls
+A model score that "works" may be exploiting something other than what it was built for. Three permutation controls
 say where a signal lives, each keeping the score distribution intact:
 
 * ``shuffle_symbols``: within every session the scores are permuted across symbols. The session's multiset of scores

@@ -254,3 +254,19 @@ def test_the_report_states_the_confounding_of_the_core_grid_and_has_the_within_f
     assert "lgbm" in within and "xgb" in within
     row = next(line for line in within.splitlines() if line.startswith("| groups | t+m |"))
     assert "+0.0500" in row
+
+
+# ================================================================================ B10: cleanups
+def test_the_vestigial_noisy_warnings_hook_is_gone_and_the_validators_are_not_duplicated():
+    from app.services import ml_models as M
+    assert not hasattr(G, "NOISY_WARNINGS")
+    assert G._is_int is M._is_int and G._is_real is M._is_real
+
+
+def test_the_module_docstring_lists_every_family_of_the_cell_schema():
+    doc = G.__doc__
+    assert '"tsai-<arch>"' in doc and '"darts-<arch>"' in doc
+    assert "shuffle_time_within_block" in doc or "within-block" in doc          # the timing gate takes the stricter null
+    assert "the store path as written is part of it" not in doc and "warms the panels of the pending tasks" not in doc
+    from app.services import ml_controls
+    assert "Three permutation controls" in ml_controls.__doc__ and "Two permutation" not in ml_controls.__doc__
