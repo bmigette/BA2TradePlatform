@@ -15,12 +15,15 @@ What the rows allow, and the choices made where the design is silent (also liste
 * A regime "beats the baseline" when the cell's seed-mean regime value of the primary metric is above the baseline's in
   that regime, for every baseline found. Several baseline cells can match; those with the cell's own feature groups are
   preferred and the strongest one (highest seed-mean primary) is used.
-* A regime "beats the shuffle control" when the cell's regime value is above that regime's null mean
-  (``controls["by_regime"]`` of the row: the control's mean over the shuffles of the same regime metric; on the timing
-  track the control with the larger p in that regime). The significance (p) is judged once, on the whole period: the
-  median over seeds of the gating control's p-value, the value ``factor_effects`` reports. The per-regime p is kept
-  and shown (report, heatmap tooltip) but does not gate. A row without ``by_regime`` (written before the per-regime
-  controls) falls back to the whole-period null and the cell carries the warning ``OLD_ROW_WARNING``.
+* A regime "beats the shuffle control" when the cell's regime value is above that regime's null mean. Per seed the
+  null is the HIGHEST of the gating controls' per-regime null means (``controls["by_regime"][regime]["null_means"]``:
+  on the timing track the plain and the within-block time shuffle), and the per-seed nulls are then averaged; that is
+  the seed-mean value against the mean of the per-seed strictest nulls. The p shown per regime (report, heatmap
+  tooltip) is the median over seeds of the larger-p control's, which is also the control behind the whole-period p
+  (the value ``factor_effects`` reports) and does not gate per regime: the significance is judged once, on the whole
+  period. A row without per-regime controls (written before them) FAILS the regime check with ``OLD_ROW_WARNING``
+  (``strict_old_rows``, the default); with ``strict_old_rows=False`` that seed falls back to its own whole-period null,
+  the cell carries the warning and survivors that rely on it are marked.
 * A cell with fewer finished seeds than planned is "pending" only while the run is live (``live=True``); once the run
   has ended it fails with "k of n seeds finished (errors)" (or "(missing)" when no seed errored).
 * ``GATE_MAX_P`` is not in the design; 0.05 is the conventional choice. With the default 20 control seeds the smallest
@@ -37,6 +40,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +66,14 @@ GATE_MAX_LOW_ITER_SHARE: Optional[float] = None       # no exclusion by near-con
 LOW_ITER_FLAG_SHARE = 0.5
 BASELINE_FAMILIES: Tuple[str, ...] = ("naive", "linear")
 OLD_ROW_WARNING = "per-regime control missing (old row)"
+#: a live rebuild waits at least this long, and ``THROTTLE_FACTOR`` x the duration of the last build
+THROTTLE_MIN_SECONDS = 60.0
+THROTTLE_FACTOR = 10.0
+#: ``write_atomic`` tries ``os.replace`` this often when the target is held open (Windows), with a short pause
+REPLACE_TRIES = 5
+REPLACE_PAUSE_SECONDS = 0.05
+_now = time.monotonic                           # module-level so the tests can drive the clock
+_sleep = time.sleep
 #: the metrics the heatmap shows per track (the first is the gate's primary)
 HEATMAP_METRICS: Dict[str, Tuple[str, ...]] = {
     "selection": ("quintile_spread_net", "rank_ic"),
@@ -129,29 +141,52 @@ def _null_mean(rows: Sequence[Dict[str, Any]]) -> float:
     return float(np.mean(vals)) if vals and all(math.isfinite(v) for v in vals) else float("nan")
 
 
-def _regime_controls(rows: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Dict[str, Any]]]:
-    """Per regime, aggregated over the seeds: ``null_mean`` (mean), ``null_std`` (mean), ``p_value`` (median over the
-    finite ones, None when none) and ``control`` (the control of the first seed). None when any seed's row has no
-    ``controls["by_regime"]`` (an old row)."""
-    per = []
-    for r in rows:
-        c = r["controls"] if "controls" in r and isinstance(r["controls"], dict) else {}
-        if "by_regime" not in c or not isinstance(c["by_regime"], dict):
-            return None
-        per.append(c["by_regime"])
+def _seed_regime_nulls(row: Dict[str, Any]) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Per regime, for ONE row: ``null`` (the highest of the gating controls' null means; NaN when any is not finite),
+    ``std`` / ``p_value`` / ``control`` (those of the larger-p control, for display). None for an old row without
+    ``controls["by_regime"]``."""
+    c = row["controls"] if "controls" in row and isinstance(row["controls"], dict) else {}
+    if "by_regime" not in c or not isinstance(c["by_regime"], dict):
+        return None
     out: Dict[str, Dict[str, Any]] = {}
     for reg in GATE_REGIMES:
-        es = [b[reg] if reg in b else None for b in per]
-        if not es or any(e is None for e in es):
-            out[reg] = {"null_mean": float("nan"), "null_std": None, "p_value": None, "control": None}
+        e = c["by_regime"][reg] if reg in c["by_regime"] else None
+        if e is None:
+            out[reg] = {"null": float("nan"), "std": None, "p_value": None, "control": None}
             continue
-        nm = [_num(e["null_mean"]) for e in es]
-        ns = [_num(e["null_std"]) for e in es]
-        ps = [float(e["p_value"]) for e in es if _finite(e["p_value"])]
-        out[reg] = {"null_mean": float(np.mean(nm)) if all(math.isfinite(v) for v in nm) else float("nan"),
-                    "null_std": _opt(float(np.mean(ns))) if all(math.isfinite(v) for v in ns) else None,
-                    "p_value": float(np.median(ps)) if ps else None, "control": es[0]["control"]}
+        means = e["null_means"] if "null_means" in e else {e["control"]: e["null_mean"]}
+        vals = [_num(v) for v in means.values()]
+        out[reg] = {"null": max(vals) if vals and all(math.isfinite(v) for v in vals) else float("nan"),
+                    "std": e["null_std"], "p_value": e["p_value"], "control": e["control"]}
     return out
+
+
+def _whole_null_of(row: Dict[str, Any]) -> float:
+    """One row's whole-period null mean of its gating control (NaN when it has none)."""
+    c = row["controls"] if "controls" in row and isinstance(row["controls"], dict) else {}
+    name = c["primary"] if "primary" in c else None
+    return _num(c[name]["mean"]) if name and name in c and isinstance(c[name], dict) and "mean" in c[name] \
+        else float("nan")
+
+
+def _regime_controls(rows: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], int]:
+    """Per regime, aggregated over the seeds, and the number of old rows (seeds without per-regime controls).
+
+    ``null_mean``: the mean over the seeds of each seed's null (its per-regime strictest null, or for an old row its
+    whole-period null); ``null_std``: mean of the finite stds; ``p_value``: median over the seeds that have one;
+    ``control``: the first seed's."""
+    per = [_seed_regime_nulls(r) for r in rows]
+    whole = [_whole_null_of(r) for r in rows]
+    out: Dict[str, Dict[str, Any]] = {}
+    for reg in GATE_REGIMES:
+        nulls = [x[reg]["null"] if x is not None else w for x, w in zip(per, whole)]
+        stds = [float(x[reg]["std"]) for x in per if x is not None and _finite(x[reg]["std"])]
+        ps = [float(x[reg]["p_value"]) for x in per if x is not None and _finite(x[reg]["p_value"])]
+        ctl = next((x[reg]["control"] for x in per if x is not None and x[reg]["control"]), None)
+        out[reg] = {"null_mean": float(np.mean(nulls)) if nulls and all(math.isfinite(v) for v in nulls) else float("nan"),
+                    "null_std": float(np.mean(stds)) if stds else None,
+                    "p_value": float(np.median(ps)) if ps else None, "control": ctl}
+    return out, sum(1 for x in per if x is None)
 
 
 def _parse_label(label: str) -> Optional[Dict[str, Any]]:
@@ -182,12 +217,16 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
          min_regimes: int = GATE_MIN_REGIMES, max_survivors: int = GATE_MAX_SURVIVORS,
          min_coverage: float = GATE_MIN_COVERAGE, max_low_iter_share: Optional[float] = GATE_MAX_LOW_ITER_SHARE,
          min_cost_bps: float = GATE_COST_BPS, live: bool = False,
-         errors: Optional[Sequence[Dict[str, Any]]] = None) -> Dict[str, Any]:
+         errors: Optional[Sequence[Dict[str, Any]]] = None, strict_old_rows: bool = True,
+         cancelled: bool = False) -> Dict[str, Any]:
     """Apply the stage-1 gate to ``cell_results`` (rows, or a path to ``results.jsonl``).
 
     ``live``: the run is still going, so a cell with unfinished seeds is "pending"; False (the default: the run has
     ended) makes it a failure "k of n seeds finished (errors)". ``errors``: the rows of ``errors.jsonl``; a seed in
     them without a later result row is an error, and a cell with errors but no result row at all is listed too.
+    ``cancelled``: the run was cancelled, so its unfinished cells are "incomplete (cancelled)" (a cell with errors
+    stays a failure). ``strict_old_rows``: a seed whose row has no per-regime controls fails the regime check (default);
+    False lets that seed fall back to its whole-period null, with a warning (``uses_fallback``).
 
     Returns ``{"cells", "survivors", "by_track", "params", "effects"}``. ``cells``: one record per cell with ``key``,
     ``track``, ``label``, the factor levels (``target`` ``horizon`` ``family`` ``train_months`` ``groups``), ``mean`` /
@@ -216,7 +255,8 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
             err_rows.setdefault(e["cell_key"], []).append(e)
     params = {"max_p": max_p, "min_regimes": min_regimes, "max_survivors": max_survivors, "regimes": list(GATE_REGIMES),
               "hard_regimes": list(HARD_REGIMES), "cost_bps": min_cost_bps, "min_coverage": min_coverage,
-              "max_low_iter_share": max_low_iter_share, "low_iter_flag_share": LOW_ITER_FLAG_SHARE}
+              "max_low_iter_share": max_low_iter_share, "low_iter_flag_share": LOW_ITER_FLAG_SHARE,
+              "strict_old_rows": strict_old_rows}
     # The factor tables and the baselines see every cell with enough coverage; the gate also drops near-constant models.
     effects, kept, excluded, excluded_tables = {}, {}, {}, {}
     for track in G.TRACKS:
@@ -250,8 +290,9 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
             "train_months": cfg["train_months"], "groups": "+".join(cfg["groups"]), "n_seeds": len(ok),
             "mean": float("nan"), "std": float("nan"), "score": float("nan"), "p_value": float("nan"),
             "null_mean": float("nan"), "low_iter_share": None, "near_constant": False, "regimes": {},
-            "whole": None, "warnings": [], "regimes_beaten": 0, "passed": False, "survivor": False,
-            "rank": None, "state": "fail", "reasons": [], "note": "", "baseline_keys": {}}
+            "whole": None, "warnings": [], "old_rows": 0, "uses_fallback": False, "regimes_beaten": 0,
+            "passed": False, "survivor": False, "rank": None, "state": "fail", "reasons": [], "note": "",
+            "baseline_keys": {}}
         records.append(rec)
         if cfg["target"]["kind"] == "volatility":
             rec.update(state="not gated", reasons=["volatility target: a sizing model with no trading shuffle "
@@ -281,7 +322,8 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
         planned = max([int(r["seeds_run"]) for r in ok if "seeds_run" in r] or [len(ok)])
         pending = len(ok) < planned
         if pending:
-            suffix = ("so far" if live else "(errors)" if key in err_rows else "(missing)")
+            suffix = ("so far" if live else "(errors)" if key in err_rows else
+                      "(cancelled)" if cancelled else "(missing)")
             reasons.append(f"{len(ok)} of {planned} seeds finished {suffix}")
         elif not math.isfinite(rec["std"]):
             reasons.append("a single seed: no seed std, so no mean - std to rank by")
@@ -300,17 +342,19 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
         rec["baseline_keys"] = {f: b["key"] for f, b in base.items()}
         # --- regimes
         beaten, hard = 0, False
-        ctl = _regime_controls(ok)
+        ctl, old_rows = _regime_controls(ok)
+        rec["old_rows"] = old_rows
         ctl_name = next((r["controls"]["primary"] for r in ok if isinstance(r["controls"], dict)
                          and "primary" in r["controls"]), None)
-        if ctl is None:
+        strict_fail = old_rows > 0 and strict_old_rows
+        if old_rows and not strict_old_rows:
             rec["warnings"].append(OLD_ROW_WARNING)
+            rec["uses_fallback"] = True
         rec["whole"] = {"value": _opt(cell_regs["all"]), "null_mean": _opt(rec["null_mean"]),
                         "null_std": None, "p_value": _opt(rec["p_value"]), "control": ctl_name}
         for reg in GATE_REGIMES:
             v = cell_regs[reg]
-            rc = (ctl[reg] if ctl is not None else
-                  {"null_mean": rec["null_mean"], "null_std": None, "p_value": None, "control": ctl_name})
+            rc = ctl[reg]
             info = {"value": _opt(v), "naive": None, "linear": None, "null_mean": _opt(rc["null_mean"]),
                     "null_std": rc["null_std"], "p_value": rc["p_value"], "control": rc["control"]}
             vs_base = bool(base) and math.isfinite(v)
@@ -318,14 +362,17 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
                 bv = b["regimes"][reg]
                 info[fam] = _opt(bv)
                 vs_base = vs_base and math.isfinite(bv) and v > bv
-            vs_ctl = math.isfinite(v) and math.isfinite(rc["null_mean"]) and v > rc["null_mean"]
+            vs_ctl = (math.isfinite(v) and math.isfinite(rc["null_mean"]) and v > rc["null_mean"]
+                      and not strict_fail)
             counted = vs_base and vs_ctl
             info.update(beats_baseline=bool(vs_base), beats_control=bool(vs_ctl), counted=bool(counted))
             rec["regimes"][reg] = info
             beaten += counted
             hard = hard or (counted and reg in HARD_REGIMES)
         rec["regimes_beaten"] = int(beaten)
-        if base:
+        if strict_fail:
+            reasons.append(OLD_ROW_WARNING)
+        elif base:
             if beaten < min_regimes:
                 reasons.append(f"beats the baselines and the shuffle control in only {beaten} of {len(GATE_REGIMES)} "
                                f"regimes (need {min_regimes})")
@@ -343,7 +390,12 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
             reasons.append(f"shuffle control p={rec['p_value']:.3f} > {max_p:g}")
         rec["reasons"] = reasons
         rec["passed"] = not reasons
-        rec["state"] = "pending" if (pending and live) else ("fail" if reasons else "pass")
+        if pending and live:
+            rec["state"] = "pending"
+        elif pending and cancelled and key not in err_rows:
+            rec["state"] = "incomplete"
+        else:
+            rec["state"] = "fail" if reasons else "pass"
     for key, errs in err_rows.items():                       # every seed of the cell errored: nothing in the results
         if key in by_cell:
             continue
@@ -353,8 +405,9 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
         records.append({"key": key, "label": errs[0]["label"], "n_seeds": 0, "mean": float("nan"),
                         "std": float("nan"), "score": float("nan"), "p_value": float("nan"),
                         "null_mean": float("nan"), "low_iter_share": None, "near_constant": False, "regimes": {},
-                        "whole": None, "warnings": [], "regimes_beaten": 0, "passed": False, "survivor": False,
-                        "rank": None, "state": "pending" if live else "fail", "note": "", "baseline_keys": {},
+                        "whole": None, "warnings": [], "old_rows": 0, "uses_fallback": False, "regimes_beaten": 0,
+                        "passed": False, "survivor": False, "rank": None,
+                        "state": "pending" if live else "fail", "note": "", "baseline_keys": {},
                         "reasons": ["no seed finished (errors)"], **lv})
     # --- survivors per track
     by_track: Dict[str, List[Dict[str, Any]]] = {t: [] for t in G.TRACKS}
@@ -369,7 +422,7 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
             else:
                 r["state"] = "capped"
                 r["note"] = f"passes every condition but ranks {i} of {len(ranked)}; only the top {max_survivors} go on"
-    state_order = {"survivor": 0, "capped": 1, "pass": 1, "pending": 2, "fail": 3, "excluded": 4, "baseline": 5,
+    state_order = {"survivor": 0, "capped": 1, "pass": 1, "pending": 2, "incomplete": 2, "fail": 3, "excluded": 4, "baseline": 5,
                    "not gated": 6}
     records.sort(key=lambda r: (G.TRACKS.index(r["track"]), state_order[r["state"]],
                                 -(r["score"] if math.isfinite(r["score"]) else -math.inf), r["key"]))
@@ -382,11 +435,176 @@ SUMMARY_NAME, REPORT_NAME, DASHBOARD_NAME = "run_summary.json", "report.md", "da
 
 
 def write_atomic(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` through a temp file in the same directory and ``os.replace``: a reader (the artifact
-    publisher, an editor) never sees a half-written file."""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    """Write ``text`` to ``path`` through a UNIQUE temp file in the same directory and ``os.replace``: a reader (the
+    artifact publisher, an editor) never sees a half-written file, and two writers never share a temp name. A
+    ``PermissionError`` (the target is open in another program on Windows) is retried ``REPLACE_TRIES`` times with a
+    short pause; whatever fails, the temp file is deleted."""
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        for attempt in range(REPLACE_TRIES):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == REPLACE_TRIES - 1:
+                    raise
+                _sleep(REPLACE_PAUSE_SECONDS * (attempt + 1))
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def read_run_summary(out_dir: Union[str, Path]) -> Dict[str, Any]:
+    """``run_summary.json`` of ``out_dir`` ({} when missing or unreadable)."""
+    path = Path(out_dir) / SUMMARY_NAME
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+_SLIM_METRICS = frozenset(m for ms in HEATMAP_METRICS.values() for m in ms) | frozenset(G.PRIMARY.values())
+_SLIM_CONFIG = ("track", "store", "symbols", "groups", "target", "family", "train_months", "blocks")
+
+
+def slim_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    """The fields of a ``results.jsonl`` row that the gate, ``factor_effects`` and the renderers read, in the row's own
+    layout (so they accept it unchanged): per-regime MEANS of the gate / heatmap metrics, the controls' p-values, whole
+    period null means and ``by_regime``, the identity bits the baseline match and the cost check use. The block audit,
+    the metrics, the timings and the symbol lists are dropped."""
+    out: Dict[str, Any] = {k: r[k] for k in ("cell_key", "track", "label", "status", "n_blocks", "n_blocks_fitted",
+                                             "seeds_run", "low_iter_share") if k in r}
+    out["seed"] = int(r["seed"])
+    if "primary" in r:
+        out["primary"] = dict(r["primary"])
+    cfg = r["config"] if "config" in r and isinstance(r["config"], dict) else {}
+    out["config"] = {k: cfg[k] for k in _SLIM_CONFIG if k in cfg}
+    ident = r["identity"] if "identity" in r and isinstance(r["identity"], dict) else {}
+    settings = ident["settings"] if "settings" in ident and isinstance(ident["settings"], dict) else {}
+    out["identity"] = {**({"store_signature": ident["store_signature"]} if "store_signature" in ident else {}),
+                       "settings": {k: settings[k] for k in ("cost_bps",) if k in settings}}
+    ver = r["versions"] if "versions" in r and isinstance(r["versions"], dict) else {}
+    out["versions"] = {k: ver[k] for k in ("code",) if k in ver}
+    reg = r["regimes"] if "regimes" in r and isinstance(r["regimes"], dict) else {}
+    out["regimes"] = {m: {name: {"mean": e["mean"]} for name, e in reg[m].items()} for m in _SLIM_METRICS if m in reg}
+    ctl = r["controls"] if "controls" in r and isinstance(r["controls"], dict) else {}
+    slim_ctl: Dict[str, Any] = {k: ctl[k] for k in ("primary", "p_value", "p_values", "by_regime", "skipped") if k in ctl}
+    names = set(ctl["p_values"]) if "p_values" in ctl and isinstance(ctl["p_values"], dict) else set()
+    if "primary" in ctl and ctl["primary"]:
+        names.add(ctl["primary"])
+    for n in names:
+        if n in ctl and isinstance(ctl[n], dict) and "mean" in ctl[n]:
+            slim_ctl[n] = {"mean": ctl[n]["mean"]}
+    out["controls"] = slim_ctl
+    return out
+
+
+def _slim_error(e: Dict[str, Any]) -> Dict[str, Any]:
+    return {"cell_key": e["cell_key"], "seed": int(e["seed"]), "label": e["label"] if "label" in e else ""}
+
+
+class JsonlTail:
+    """An append-only JSONL file read INCREMENTALLY: ``update`` parses only the bytes added since the last call (a line
+    cut short by a write in progress waits for its newline), keeps ``keep(row)`` per ``key(slim)`` (the last row of a
+    key wins) and starts over when the file shrank or its head changed (it was rewritten). An unparseable line is
+    skipped and counted; only the first is logged."""
+    HEAD = 256
+
+    def __init__(self, path: Union[str, Path], keep: Any, key: Any) -> None:
+        self.path, self.keep, self.key = Path(path), keep, key
+        self.items: Dict[Any, Dict[str, Any]] = {}
+        self.parsed_bytes = 0
+        self.n_parsed = 0
+        self.bad_lines = 0
+        self._head = b""
+
+    def _reset(self) -> None:
+        self.items.clear()
+        self.parsed_bytes = self.n_parsed = self.bad_lines = 0
+        self._head = b""
+
+    def _accept(self, line: bytes) -> bool:
+        try:
+            slim = self.keep(json.loads(line))
+            self.items[self.key(slim)] = slim
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            self.bad_lines += 1
+            if self.bad_lines == 1:
+                logger.warning(f"{self.path}: a line is not valid JSON (an interrupted write?); ignored "
+                               f"(further bad lines are only counted)")
+            return False
+        self.n_parsed += 1
+        return True
+
+    def update(self) -> None:
+        try:
+            size = self.path.stat().st_size
+        except FileNotFoundError:
+            self._reset()
+            return
+        if size < self.parsed_bytes:
+            self._reset()
+        elif self.parsed_bytes:
+            with open(self.path, "rb") as fh:
+                if fh.read(len(self._head)) != self._head:
+                    self._reset()
+        if size == self.parsed_bytes:
+            return
+        with open(self.path, "rb") as fh:
+            fh.seek(self.parsed_bytes)
+            data = fh.read()
+        lines = data.split(b"\n")
+        tail = lines.pop()                                    # after the last newline: complete only if it parses
+        consumed = 0
+        for line in lines:
+            consumed += len(line) + 1
+            if line.strip():
+                self._accept(line)
+        if tail.strip():
+            try:
+                json.loads(tail)
+            except json.JSONDecodeError:
+                pass                                          # a write in progress: wait for the rest
+            else:
+                self._accept(tail)
+                consumed += len(tail)
+        if not self.parsed_bytes and consumed:
+            self._head = data[:min(self.HEAD, consumed)]
+        self.parsed_bytes += consumed
+
+    def rows(self) -> List[Dict[str, Any]]:
+        return list(self.items.values())
+
+
+class StateCache:
+    """The parsed state of one grid output directory between rebuilds: the slim rows and errors (incremental), and the
+    time bookkeeping of the rebuild throttle."""
+
+    def __init__(self, out_dir: Union[str, Path]) -> None:
+        out = Path(out_dir)
+        self.results = JsonlTail(out / "results.jsonl", slim_row, lambda s: (s["cell_key"], s["seed"]))
+        self.errors = JsonlTail(out / "errors.jsonl", _slim_error, lambda s: (s["cell_key"], s["seed"]))
+        self.last_start: Optional[float] = None
+        self.last_duration = 0.0
+
+    def due(self, now: float) -> bool:
+        """Whether a live (non-final) rebuild may run now: at most every max(60 s, 10 x the last build's duration)."""
+        return (self.last_start is None
+                or now - self.last_start >= max(THROTTLE_MIN_SECONDS, THROTTLE_FACTOR * self.last_duration))
+
+
+_CACHES: Dict[str, StateCache] = {}
+
+
+def get_cache(out_dir: Union[str, Path]) -> StateCache:
+    return _CACHES.setdefault(str(Path(out_dir).resolve()), StateCache(out_dir))
+
+
+def drop_cache(out_dir: Union[str, Path]) -> None:
+    _CACHES.pop(str(Path(out_dir).resolve()), None)
 
 
 def write_run_summary(out_dir: Union[str, Path], summary: Dict[str, Any]) -> None:
@@ -413,28 +631,35 @@ def run_is_live(out_dir: Union[str, Path]) -> bool:
 
 
 def collect_state(out_dir: Union[str, Path], summary: Optional[Dict[str, Any]] = None,
-                  live: Optional[bool] = None) -> Dict[str, Any]:
-    """Everything the report and the dashboard show, read from ``out_dir``: the rows, the unresolved errors, the run
-    summary (``run_summary.json`` merged with ``summary``), the gate and the run identity. ``live``: the run is still
-    going (None: a live lock in ``out_dir`` says so); only then is an unfinished cell "pending"."""
+                  live: Optional[bool] = None, cache: Optional[StateCache] = None,
+                  strict_old_rows: bool = True) -> Dict[str, Any]:
+    """Everything the report and the dashboard show, read from ``out_dir``: the (slim) rows, the unresolved errors, the
+    run summary (``run_summary.json`` merged with ``summary``), the gate and the run identity. ``live``: the run is
+    still going (None: a live lock in ``out_dir`` says so); only then is an unfinished cell "pending". ``cache``: a
+    ``StateCache`` that parses only what was appended since its last use (default: a fresh one, a full parse)."""
     out = Path(out_dir)
-    rows = G.read_results(out / "results.jsonl")
-    keys = {(r["cell_key"], int(r["seed"])) for r in rows}
-    err_rows = G.read_results(out / "errors.jsonl")
-    err_keys = {(e["cell_key"], int(e["seed"])) for e in err_rows}
+    c = cache if cache is not None else StateCache(out)
+    c.results.update()
+    c.errors.update()
+    rows, err_rows = c.results.rows(), c.errors.rows()
+    keys = set(c.results.items)
+    unresolved = set(c.errors.items) - keys
+    merged = {**read_run_summary(out), **(G._sanitize(summary) if summary else {})}
     is_live = run_is_live(out) if live is None else live
-    saved: Dict[str, Any] = {}
-    if (out / SUMMARY_NAME).exists():
-        try:
-            saved = json.loads((out / SUMMARY_NAME).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            saved = {}
-    merged = {**saved, **(G._sanitize(summary) if summary else {})}
-    codes = sorted({r["versions"]["code"] for r in rows if "versions" in r and isinstance(r["versions"], dict)
-                    and "code" in r["versions"]})
-    return {"out_dir": out, "rows": rows, "n_rows": len(keys), "n_errors": len(err_keys - keys), "summary": merged,
-            "live": is_live, "gate": gate(rows, live=is_live, errors=err_rows), "identity": {"dir": out.name, "code": G.library_versions()["code"], "row_codes": codes,
-                                            "updated": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S UTC%z")}}
+    codes = sorted({r["versions"]["code"] for r in rows if "code" in r["versions"]})
+    planned = set(merged["planned_keys"]) if "planned_keys" in merged else None
+    if planned:
+        done = {f"{k}:{sd}" for k, sd in keys | unresolved}
+        n_progress, n_planned = len(planned & done), len(planned)
+    else:
+        n_progress = len(keys) + len(unresolved)
+        n_planned = merged["planned_tasks"] if "planned_tasks" in merged else None
+    cancelled = bool(merged["cancelled"]) if "cancelled" in merged else False
+    return {"out_dir": out, "rows": rows, "n_rows": len(keys), "n_errors": len(unresolved), "summary": merged,
+            "n_progress": n_progress, "n_planned": n_planned, "live": is_live,
+            "gate": gate(rows, live=is_live, errors=err_rows, strict_old_rows=strict_old_rows, cancelled=cancelled),
+            "identity": {"dir": out.name, "code": G.library_versions()["code"], "row_codes": codes,
+                         "updated": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S UTC%z")}}
 
 
 def _excluded_counts(state: Dict[str, Any]) -> Dict[str, int]:
@@ -443,7 +668,8 @@ def _excluded_counts(state: Dict[str, Any]) -> Dict[str, int]:
 
 # ================================================================== report.md
 def _md_cell(x: Any) -> str:
-    return str(x).replace("|", "\\|").replace("\n", " ")
+    """A table cell: pipes, backticks and ``<`` escaped (a label or reason must not open a tag or a code span)."""
+    return str(x).replace("|", "\\|").replace("`", "\\`").replace("<", "&lt;").replace("\n", " ")
 
 
 def _md_table(headers: Sequence[str], body: Sequence[Sequence[Any]]) -> str:
@@ -496,9 +722,13 @@ def render_report(state: Dict[str, Any]) -> str:
            f"Run: `{ident['dir']}` · code `{ident['code']}` · rows computed with code {rcodes} · "
            f"generated {ident['updated']}", "", "## Run summary", ""]
     planned = s["planned_tasks"] if "planned_tasks" in s else None
-    rebuilds = s["pool_rebuilds"] if "pool_rebuilds" in s else "unknown (not recorded)"
+    if "pool_rebuilds_total" in s and "pool_rebuilds" in s:
+        rebuilds = f"{s['pool_rebuilds']} in the last run, {s['pool_rebuilds_total']} in total"
+    else:
+        rebuilds = s["pool_rebuilds"] if "pool_rebuilds" in s else "unknown (not recorded)"
     out.append(_md_table(["item", "value"], [
-        ["rows done", f"{state['n_rows']}" + (f" of {planned} planned" if planned else "")],
+        ["rows done", f"{state['n_progress']}" + (f" of {state['n_planned']} planned" if state["n_planned"] else "")],
+        ["rows in results.jsonl", state["n_rows"]],
         ["errors (unresolved)", state["n_errors"]],
         ["pool_rebuilds", rebuilds],
         ["excluded cells", f"{sum(exc.values())} ({', '.join(f'{t} {n}' for t, n in exc.items())})"],
@@ -527,9 +757,10 @@ def render_report(state: Dict[str, Any]) -> str:
             if not sv:
                 out += ["No survivor.", ""]
                 continue
-            out += [_md_table(["rank", "cell", "key", "seed mean ± std", "mean − std", "regimes beaten", "p"],
+            out += [_md_table(["rank", "cell", "key", "seed mean ± std", "mean − std", "regimes beaten", "p", "notes"],
                               [[c["rank"], _cell_text(c), c["key"], _mean_std(c), _fmt(c["score"]),
-                                f"{c['regimes_beaten']} of 6", _p_text(c)] for c in sv]), ""]
+                                f"{c['regimes_beaten']} of 6", _p_text(c),
+                                "old-row fallback" if c["uses_fallback"] else ""] for c in sv]), ""]
     out += ["## Factor effects", "",
             "Mean of the cell-level seed means per factor level (cells kept by the coverage filters), with the spread "
             "across cells. Primary metric: selection = quintile spread net of cost, timing = timing excess net of cost.",
@@ -651,6 +882,7 @@ td.sticky, th.sticky { position: sticky; left: 0; background: var(--card); text-
 .chip[data-state="baseline"] { --c: var(--accent); }
 .chip[data-state="not gated"] { --c: var(--muted); }
 .chip[data-state="flag"] { --c: var(--pending); }
+.chip[data-state="incomplete"] { --c: var(--pending); }
 .fx { display: grid; grid-template-columns: minmax(90px, 1.1fr) minmax(0, 3fr) minmax(70px, auto); gap: 4px 10px;
   align-items: center; font-size: 12px; }
 .fx .grp { grid-column: 1 / -1; color: var(--muted); font-weight: 600; margin-top: 8px; }
@@ -673,9 +905,11 @@ def _e(x: Any) -> str:
 
 
 _CHIP_GLYPH = {"survivor": "&#10003;", "capped": "&#8805;", "fail": "&#10007;", "pending": "&#8230;",
-               "excluded": "&#8856;", "baseline": "&#9670;", "not gated": "&#8211;", "flag": "&#9888;"}
+               "excluded": "&#8856;", "baseline": "&#9670;", "not gated": "&#8211;", "flag": "&#9888;",
+               "incomplete": "&#8943;"}
 _CHIP_LABEL = {"survivor": "survivor", "capped": "over cap", "fail": "fail", "pending": "pending",
-               "excluded": "excluded", "baseline": "baseline", "not gated": "not gated", "flag": "flag"}
+               "excluded": "excluded", "baseline": "baseline", "not gated": "not gated", "flag": "flag",
+               "incomplete": "incomplete (cancelled)"}
 
 
 def _chip(state: str) -> str:
@@ -816,23 +1050,28 @@ def _tile(k: str, v: str, s: str = "") -> str:
 def render_dashboard(state: Dict[str, Any]) -> str:
     """The self-contained artifact page (no doctype / html / head / body, no external resource, colours as tokens)."""
     g, ident, s = state["gate"], state["identity"], state["summary"]
-    planned = s["planned_tasks"] if "planned_tasks" in s else None
-    n = state["n_rows"] + state["n_errors"]
+    n, planned = state["n_progress"], state["n_planned"]
     prog = f"{n}/{planned}" if planned else f"{n}"
     pct = f"{100.0 * n / planned:.0f}% of the planned (cell, seed) tasks" if planned else "planned total unknown"
     exc = _excluded_counts(state)
     surv = len(g["survivors"])
     cands = len([c for c in g["cells"] if c["state"] not in ("baseline", "not gated")])
-    rebuilds = s["pool_rebuilds"] if "pool_rebuilds" in s else "n/a"
+    rebuilds = s["pool_rebuilds_total"] if "pool_rebuilds_total" in s else (
+        s["pool_rebuilds"] if "pool_rebuilds" in s else "n/a")
+    old_cells = [c for c in g["cells"] if c["old_rows"]]
+    old_surv = sum(1 for c in g["survivors"] if c["uses_fallback"])
     tiles = "".join([
         _tile("Progress", _e(prog), _e(pct)),
         _tile("Errors", _e(state["n_errors"]), "unresolved (cell, seed) tasks"),
         _tile("Survivors", _e(surv), _e(" · ".join(f"{t} {len(g['by_track'][t])}" for t in G.TRACKS))),
         _tile("Cells", _e(cands), _e(f"candidates seen, {sum(1 for c in g['cells'] if c['near_constant'])} near-constant")),
         _tile("Excluded", _e(sum(exc.values())), "low block coverage"),
+        _tile("Old rows", _e(len(old_cells)), _e(f"cells with rows lacking per-regime controls; {old_surv} survivors "
+                                                  f"rely on the fallback")),
         _tile("Pool rebuilds", _e(rebuilds), "worker pool restarts")])
     rc = ", ".join(ident["row_codes"]) or "n/a"
-    out = [f"<title>{_e(DASHBOARD_TITLE)}</title>", '<meta name="claude:viewport-fit-sides" content="cover">',
+    out = [f"<title>{_e(DASHBOARD_TITLE)}</title>", '<meta charset="utf-8">',
+           '<meta name="claude:viewport-fit-sides" content="cover">',
            f"<style>{CSS}</style>", "<main>", f"<h1>{_e(DASHBOARD_TITLE)}</h1>",
            f'<div class="ident">Run <b>{_e(ident["dir"])}</b> &middot; code {_e(ident["code"])} (rows computed with '
            f'{_e(rc)}) &middot; Last updated {_e(ident["updated"])}</div>',
@@ -841,7 +1080,8 @@ def render_dashboard(state: Dict[str, Any]) -> str:
         out.append('<p class="empty">No finished rows yet. The page fills in as the grid runs.</p>')
     if surv:
         items = "".join(f'<li>{_e(c["track"])} #{c["rank"]}: {_e(_short(c))} <span class="muted small">{_e(c["key"])}'
-                        f' &middot; {_e(_mean_std(c))}</span></li>' for c in g["survivors"])
+                        f' &middot; {_e(_mean_std(c))}</span>'
+                        f'{" <b>(old-row fallback)</b>" if c["uses_fallback"] else ""}</li>' for c in g["survivors"])
         out.append(f'<h2>Survivors</h2><div class="note"><ul>{items}</ul></div>')
     elif state["rows"]:
         out.append('<div class="note">No cell has passed the gate (yet).</div>')
@@ -862,11 +1102,13 @@ def render_dashboard(state: Dict[str, Any]) -> str:
 
 # ================================================================== orchestration
 def build_outputs(out_dir: Union[str, Path], *, summary: Optional[Dict[str, Any]] = None, report: bool = True,
-                  dashboard: bool = True, live: Optional[bool] = None) -> Dict[str, Any]:
+                  dashboard: bool = True, live: Optional[bool] = None, cache: Optional[StateCache] = None,
+                  strict_old_rows: bool = True) -> Dict[str, Any]:
     """Rebuild ``dashboard.html`` (and ``report.md`` when ``report``) of ``out_dir`` from its ``results.jsonl``, each
-    written atomically. Reads only; runs nothing. ``live``: see ``collect_state``. Returns the state (rows, gate, identity, summary)."""
+    written atomically. Reads only; runs nothing. ``live`` / ``cache`` / ``strict_old_rows``: see ``collect_state``.
+    Returns the state (rows, gate, identity, summary)."""
     out = Path(out_dir)
-    st = collect_state(out, summary, live)
+    st = collect_state(out, summary, live, cache, strict_old_rows)
     if dashboard:
         write_atomic(out / DASHBOARD_NAME, render_dashboard(st))
     if report:
@@ -874,8 +1116,23 @@ def build_outputs(out_dir: Union[str, Path], *, summary: Optional[Dict[str, Any]
     return st
 
 
-def refresh(out_dir: Union[str, Path], summary: Dict[str, Any], final: bool) -> None:
-    """The runner's hook: the dashboard after every batch of finished rows; at the end also the report and the saved
-    run summary (so ``--report-only`` can show what the run did)."""
+def refresh(out_dir: Union[str, Path], summary: Dict[str, Any], final: bool, force: bool = False) -> bool:
+    """The runner's hook: the dashboard after a batch of finished rows; at the end (``final``) also the report and the
+    saved run summary (so ``--report-only`` can show what the run did). A live rebuild is throttled to at most one
+    per max(60 s, 10 x the last build's duration) and parses only what was appended since the last one
+    (``StateCache``); ``final`` and ``force`` (the run's start) always build. Returns whether it built."""
+    cache = get_cache(out_dir)
+    now = _now()
+    if not (final or force) and not cache.due(now):
+        return False
+    cache.last_start = now
+    summary = dict(summary)
+    if "pool_rebuilds" in summary:
+        summary["pool_rebuilds_total"] = int(summary["prior_pool_rebuilds"] if "prior_pool_rebuilds" in summary
+                                             else 0) + int(summary["pool_rebuilds"])
     write_run_summary(out_dir, summary)
-    build_outputs(out_dir, summary=summary, report=final, live=not final)
+    build_outputs(out_dir, summary=summary, report=final, live=not final, cache=cache)
+    cache.last_duration = _now() - now
+    if final:
+        drop_cache(out_dir)
+    return True

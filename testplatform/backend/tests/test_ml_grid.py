@@ -1717,19 +1717,83 @@ def test_rows_hold_per_regime_control_nulls_that_agree_with_the_rows_regime_valu
     assert set(rows["timing"]["controls"]["p_values"]) == {"shuffle_time", "shuffle_time_within_block"}
 
 
-def test_the_per_regime_stricter_control_is_the_one_with_the_larger_p():
-    import numpy as _np
+def test_the_per_regime_entry_keeps_every_controls_null_and_shows_the_larger_p_control():
     ctl = {"shuffle_time": {"mean": -0.01, "by_regime": {
                "2019": {"mean": -0.02, "std": 0.01, "p_value": 0.30, "rank": 7, "model": 0.01},
                "2021": {"mean": -0.02, "std": 0.01, "p_value": 0.05, "rank": 1, "model": 0.01}}},
            "shuffle_time_within_block": {"mean": -0.04, "by_regime": {
                "2019": {"mean": -0.05, "std": 0.02, "p_value": 0.10, "rank": 2, "model": 0.01},
                "2021": {"mean": 0.00, "std": 0.02, "p_value": 0.20, "rank": 4, "model": 0.01}}}}
-    strict = G._strict_by_regime(ctl, ("shuffle_time", "shuffle_time_within_block"))
+    names = ("shuffle_time", "shuffle_time_within_block")
+    strict = G._strict_by_regime(ctl, names)
+    # the displayed p / std / rank are the larger-p control's; the gate takes the highest of null_means itself
     assert strict["2019"]["control"] == "shuffle_time" and strict["2019"]["null_mean"] == -0.02
+    assert strict["2019"]["null_means"] == {"shuffle_time": -0.02, "shuffle_time_within_block": -0.05}
     assert strict["2021"]["control"] == "shuffle_time_within_block" and strict["2021"]["p_value"] == 0.20
+    assert strict["2021"]["null_means"] == {"shuffle_time": -0.02, "shuffle_time_within_block": 0.00}
     assert strict["2021"]["null_std"] == 0.02 and strict["2021"]["model"] == 0.01
     ctl["shuffle_time"]["by_regime"]["2019"]["p_value"] = None                   # a non-finite null: no p, last control
-    again = G._strict_by_regime(ctl, ("shuffle_time", "shuffle_time_within_block"))
-    assert again["2019"]["control"] == "shuffle_time_within_block"
-    assert _np is not None
+    again = G._strict_by_regime(ctl, names)
+    assert again["2019"]["control"] == "shuffle_time_within_block" and again["2019"]["p_value"] is None
+
+
+def test_rows_store_the_per_control_null_means_per_regime(signal_world, tmp_path):
+    out = tmp_path / "o"
+    run([cell(signal_world[0], track="timing", target={"kind": "up", "horizon": 5}, seeds=[1])], out, signal_world,
+        settings=_settings(control_seeds=(1, 2, 3)))
+    row = G.read_results(out / "results.jsonl")[0]
+    for reg, e in row["controls"]["by_regime"].items():
+        assert set(e["null_means"]) == {"shuffle_time", "shuffle_time_within_block"}
+        for n, v in e["null_means"].items():
+            assert v == row["controls"][n]["by_regime"][reg]["mean"]
+
+
+# ------------------------------------------------------------------ review fixes: finally, rate limit, summary
+def test_the_final_outputs_are_written_even_when_the_run_dies(signal_world, tmp_path):
+    out = tmp_path / "o"
+
+    def dies_on_third(cfg, seed, key):
+        if cfg["target"]["horizon"] == 5:
+            raise RuntimeError("the master hit something unexpected")
+        return fake_task(cfg, seed, key)
+    with pytest.raises(RuntimeError, match="unexpected"):
+        run(_horizon_cells(signal_world, 3), out, signal_world, task_fn=dies_on_third)
+    assert (out / "report.md").exists() and (out / "dashboard.html").exists()
+    assert len(G.read_results(out / "results.jsonl")) == 2
+
+
+def test_a_failing_rebuild_is_logged_in_full_once_and_then_only_counted(signal_world, tmp_path, monkeypatch, caplog):
+    import app.services.ml_grid_report as RP
+
+    def boom(*a, **k):
+        raise OSError("the dashboard file is open in another program")
+    monkeypatch.setattr(RP, "refresh", boom)
+    monkeypatch.setattr(G, "DASHBOARD_EVERY", 1)
+    with caplog.at_level("WARNING"):
+        res = run(_horizon_cells(signal_world, 4), tmp_path / "o", signal_world, task_fn=fake_task)
+    assert res["done"] == 4
+    full = [r for r in caplog.records if "could not rebuild" in r.getMessage()]
+    assert len(full) == 1 and full[0].exc_info                                  # the first failure, with its traceback
+    counted = [r for r in caplog.records if "rebuilds failed" in r.getMessage()]
+    assert len(counted) == 1 and "5 " in counted[0].getMessage()                 # start + 3 cadence + final
+
+
+def test_the_run_summary_records_the_planned_tasks_and_cumulative_pool_rebuilds(signal_world, tmp_path):
+    out = tmp_path / "o"
+    run(_horizon_cells(signal_world, 3), out, signal_world, task_fn=fake_task)
+    saved = json.loads((out / "run_summary.json").read_text(encoding="utf-8"))
+    cells = [G.validate_cell(c) for c in _horizon_cells(signal_world, 3)]
+    assert sorted(saved["planned_keys"]) == sorted(f"{c.key}:1" for c in cells) and saved["planned_tasks"] == 3
+    assert saved["pool_rebuilds"] == 0 and saved["pool_rebuilds_total"] == 0
+    saved["pool_rebuilds_total"] = 4                                          # an earlier run had rebuilt the pool
+    (out / "run_summary.json").write_text(json.dumps(saved), encoding="utf-8")
+    run(_horizon_cells(signal_world, 3), out, signal_world, task_fn=fake_task)
+    again = json.loads((out / "run_summary.json").read_text(encoding="utf-8"))
+    assert again["pool_rebuilds"] == 0 and again["pool_rebuilds_total"] == 4
+
+
+def test_report_only_returns_before_the_grid_runner_is_imported():
+    import inspect
+    import ba2test_launcher as L
+    src = inspect.getsource(L._cmd_ml_grid)
+    assert src.index("report_only") < src.index("from app.services.ml_grid import")

@@ -900,9 +900,11 @@ def regime_metric(track: str, st: GridSettings) -> Callable[[pd.DataFrame], Dict
 
 
 def _strict_by_regime(rep: Dict[str, Any], names: Sequence[str]) -> Dict[str, Dict[str, Any]]:
-    """Per regime, the gating control that is hardest to beat there: the larger one-sided p among ``names`` (the whole
-    period's rule), with its null mean / std, p, rank and the model's value. A regime where any control has no finite
-    p reports the last control and no p."""
+    """Per regime: ``null_means`` = EVERY gating control's null mean (the gate takes the highest, per seed), and for
+    DISPLAY the control with the larger one-sided p among ``names`` (the whole period's rule, so the same control the
+    whole-period p comes from) with its null mean / std, p, rank and the model's value. A larger p does not mean a
+    higher null mean, so ``null_mean`` / ``null_std`` here are not the strictest null; ``null_means`` is. A regime
+    where any control has no finite p reports the last control and no p."""
     out: Dict[str, Dict[str, Any]] = {}
     for reg in rep[names[0]]["by_regime"]:
         ents = {n: rep[n]["by_regime"][reg] for n in names}
@@ -913,7 +915,7 @@ def _strict_by_regime(rep: Dict[str, Any], names: Sequence[str]) -> Dict[str, Di
             p = ents[strict]["p_value"]
         e = ents[strict]
         out[reg] = {"control": strict, "null_mean": e["mean"], "null_std": e["std"], "p_value": p, "rank": e["rank"],
-                    "model": e["model"]}
+                    "model": e["model"], "null_means": {n: ents[n]["mean"] for n in names}}
     return out
 
 
@@ -1589,15 +1591,29 @@ def run_grid(cells: Sequence[Cell], out_dir: Union[str, Path], cpu_slots: int, g
 DASHBOARD_EVERY = 20
 
 
+_REFRESH_FAILURES: Dict[str, int] = {}
+
+
 def _refresh_outputs(out: Path, summary: Dict[str, Any], final: bool, finished: int) -> None:
-    """Rebuild ``dashboard.html`` (``final``: also the gate, ``report.md`` and ``run_summary.json`` is saved either way).
-    Reporting must never stop a grid: whatever goes wrong (an open file, a bad row) is logged and the run goes on."""
+    """Rebuild ``dashboard.html`` (``final``: also the gate and ``report.md``; the start of a run and the end always
+    build, a live one is throttled and incremental, see ``ml_grid_report.refresh``).
+    Reporting must never stop a grid: whatever goes wrong (an open file, a bad row) is logged and the run goes on. The
+    first failure of a run is logged in full, the following ones are only counted (one line at the end)."""
+    key = str(out)
+    if finished == 0 and not final:
+        _REFRESH_FAILURES[key] = 0
     try:
         from app.services import ml_grid_report
-        ml_grid_report.refresh(out, summary, final)
+        ml_grid_report.refresh(out, summary, final, force=final or finished == 0)
     except Exception as e:                                      # noqa: BLE001
-        logger.warning(f"ml_grid: could not rebuild the dashboard / report in {out} after {finished} rows: {e}",
-                       exc_info=True)
+        _REFRESH_FAILURES[key] = (_REFRESH_FAILURES[key] if key in _REFRESH_FAILURES else 0) + 1
+        if _REFRESH_FAILURES[key] == 1:
+            logger.warning(f"ml_grid: could not rebuild the dashboard / report in {out} after {finished} rows: {e}",
+                           exc_info=True)
+    if final:
+        n = _REFRESH_FAILURES.pop(key, 0)
+        if n > 1:
+            logger.warning(f"ml_grid: {n} dashboard / report rebuilds failed in this run (the first was logged in full)")
 
 
 def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: str, st: GridSettings,
@@ -1617,8 +1633,17 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
                "pool_rebuilds": 0, "out_dir": str(out)}
     say(f"ml_grid: {len(cells)} cells, {len(tasks)} (cell, seed) tasks to run, {skipped_existing} already finished")
 
+    try:
+        from app.services.ml_grid_report import read_run_summary
+        prior_rebuilds = int(read_run_summary(out)["pool_rebuilds_total"]) \
+            if "pool_rebuilds_total" in read_run_summary(out) else 0
+    except Exception:                                           # noqa: BLE001  (reporting is never fatal)
+        prior_rebuilds = 0
+    planned_keys = [f"{c.key}:{sd}" for c, sd in plan]
+
     def refresh(final: bool, finished: int) -> None:
-        _refresh_outputs(out, {**summary, "planned_tasks": len(plan), "planned_cells": len(cells)}, final, finished)
+        _refresh_outputs(out, {**summary, "planned_tasks": len(plan), "planned_cells": len(cells),
+                               "planned_keys": planned_keys, "prior_pool_rebuilds": prior_rebuilds}, final, finished)
     if not tasks:
         refresh(True, 0)
         return summary
@@ -1652,16 +1677,18 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
         if n % DASHBOARD_EVERY == 0 and n < len(tasks):          # the final rebuild covers the last row
             refresh(False, n)
 
-    if inline:
-        _init_worker(*init_args)
-        for c, sd in tasks:
-            if cancelled():
-                summary["cancelled"] = True
-                break
-            finish(task_fn(c.config(with_seeds=True), sd, c.key))
-    else:
-        _drive_pool(tasks, cpu_slots, init_args, task_fn, finish, cancelled, summary)
-    refresh(True, summary["done"] + summary["errors"])
+    try:
+        if inline:
+            _init_worker(*init_args)
+            for c, sd in tasks:
+                if cancelled():
+                    summary["cancelled"] = True
+                    break
+                finish(task_fn(c.config(with_seeds=True), sd, c.key))
+        else:
+            _drive_pool(tasks, cpu_slots, init_args, task_fn, finish, cancelled, summary)
+    finally:                                                    # also when the run dies: the files say how far it got
+        refresh(True, summary["done"] + summary["errors"])
     return summary
 
 

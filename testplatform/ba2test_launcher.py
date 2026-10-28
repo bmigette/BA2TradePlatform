@@ -8973,9 +8973,9 @@ def _cmd_ml_grid(args) -> int:
     """Stage-1 grid of the ML exploration v2 (task type ``ml_grid``, app/services/ml_grid.py): every cell of --config x
     its seeds as out-of-sample walk-forward signals, scored per track with shuffle controls. Resumes: finished
     (cell_key, seed) rows of --out/results.jsonl are skipped."""
-    from app.services.ml_grid import factor_effects, handle_ml_grid, read_results
-    if getattr(args, "report_only", None):
+    if getattr(args, "report_only", None):                       # before the grid runner is imported
         return _ml_grid_report_only(args.report_only)
+    from app.services.ml_grid import factor_effects, handle_ml_grid, read_results
     if args.config is None or args.out is None or args.cpu_slots is None:
         raise SystemExit("ml-grid: --config, --out and --cpu-slots are required unless --report-only DIR is given")
     payload = {"config_path": args.config, "cells": None, "out_dir": args.out, "cpu_slots": args.cpu_slots,
