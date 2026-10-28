@@ -470,9 +470,19 @@ def test_a_failed_swap_keeps_the_finished_build_directory(work, tmp_path, monkey
     assert len(kept) == 1 and set(F.STORE_FILES) == {p.name for p in kept[0].iterdir()}      # the finished build survives
 
 
-def test_stale_build_directories_of_other_processes_are_swept(work, tmp_path):
+def _dead_pid():
+    """A pid that belonged to a process that has finished."""
+    import subprocess
+    import sys
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    return p.pid
+
+
+def test_stale_build_directories_of_dead_processes_are_swept(work, tmp_path):
     out = tmp_path / "store"
-    stale = [tmp_path / "store.building-99999", tmp_path / "store.old-88888"]
+    dead = _dead_pid()
+    stale = [tmp_path / f"store.building-{dead}", tmp_path / f"store.old-{dead}"]
     keep = [tmp_path / "other.building-99999", tmp_path / "store2.old-5", tmp_path / "unrelated"]
     for d in stale + keep:
         d.mkdir()
@@ -514,6 +524,78 @@ def test_the_request_key_is_checked_explicitly_not_through_get(work, tmp_path):
     meta = _meta(out)
     del meta["ensure"]["request"]
     (out / "features.parquet.meta.json").write_text(json.dumps(meta), encoding="utf-8")
-    assert _ensure(work, out)["status"] in ("up_to_date", "built")                      # falls through to the inputs comparison
+    assert _ensure(work, out)["status"] == "built"                                      # a store without the key is rebuilt once
+    assert _ensure(work, out)["status"] == "up_to_date" and "request" in _meta(out)["ensure"]
     import inspect
     assert '.get("request")' not in inspect.getsource(F.ensure_feature_store)
+
+
+# ---------------------------------------------------------------------------------------------- retry of a failed swap
+def _failed_swap(work, out, monkeypatch, **kw):
+    """Run a build whose swap fails; returns (kept build dir, the kwargs used)."""
+    def boom(built, target):
+        raise OSError("target is in use")
+    with monkeypatch.context() as m:
+        m.setattr(F, "_swap_in", boom)
+        with pytest.raises(OSError, match="target is in use"):
+            _ensure(work, out, **kw)
+    kept = [p for p in out.parent.iterdir() if ".building-" in p.name]
+    assert len(kept) == 1
+    return kept[0]
+
+
+def test_a_retry_swaps_the_kept_build_in_instead_of_rebuilding(work, tmp_path, monkeypatch):
+    out = tmp_path / "store"
+    _ensure(work, out)
+    kw = {"groups": ["t", "mtf", "m"]}
+    kept = _failed_swap(work, out, monkeypatch, **kw)
+    assert set(json.loads((kept / "features.parquet.meta.json").read_text())["groups"]) == {"t", "mtf", "m"}
+    calls = []
+    real = F.build_features
+    monkeypatch.setattr(F, "build_features", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    res = _ensure(work, out, **kw)                                                      # the same request again
+    assert res["status"] == "built" and res["recovered"] == str(kept) and not calls   # swapped in, nothing recomputed
+    assert not kept.exists() and set(_meta(out)["groups"]) == {"t", "mtf", "m"}
+    assert res["symbols"] == SYMBOLS and res["rows"] == _meta(out)["rows"]
+    assert _ensure(work, out, **kw)["status"] == "up_to_date"
+    assert not [p for p in tmp_path.iterdir() if ".building-" in p.name or ".old-" in p.name]
+
+
+def test_a_kept_build_of_another_request_is_deleted_not_swapped_in(work, tmp_path, monkeypatch):
+    out = tmp_path / "store"
+    _ensure(work, out)
+    kept = _failed_swap(work, out, monkeypatch, groups=["t", "mtf", "m"])
+    res = _ensure(work, out, groups=["t"])                                              # a different request
+    assert res["status"] == "built" and "recovered" not in res and not kept.exists()
+    assert set(_meta(out)["groups"]) == {"t"}
+
+
+def test_a_build_directory_of_a_live_process_is_left_alone_a_dead_ones_is_deleted(work, tmp_path):
+    import subprocess
+    import sys
+    out = tmp_path / "store"
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        mine = [tmp_path / f"store.building-{live.pid}", tmp_path / f"store.old-{live.pid}"]
+        gone = [tmp_path / f"store.building-{_dead_pid()}"]
+        for d in mine + gone:
+            d.mkdir()
+            (d / "x").write_text("x")
+        _ensure(work, out)
+        assert all(d.exists() for d in mine)                 # another process may be building / swapping right now
+        assert not any(d.exists() for d in gone)
+    finally:
+        live.kill()
+        live.wait()
+    _ensure(work, out, groups=["t"])                          # the process is dead now: its leftovers go
+    assert not any(d.exists() for d in mine)
+
+
+def test_a_kept_complete_build_is_not_restored_over_an_up_to_date_store(work, tmp_path, monkeypatch):
+    out = tmp_path / "store"
+    _ensure(work, out)
+    kept = _failed_swap(work, out, monkeypatch, groups=["t", "mtf", "m"])
+    _ensure(work, out, groups=["t", "mtf", "m"])              # recovers
+    _ensure(work, out)                                         # back to the original request: rebuilt, nothing stale around
+    assert not [p for p in tmp_path.iterdir() if ".building-" in p.name]
+    assert not kept.exists()

@@ -1675,8 +1675,11 @@ def screen_symbols(symbols: Sequence[str], first: date, last: date, cache_root: 
     missing, a run of missing sessions, an invalid bar ...) or group F (``"f" in groups``: missing statement files or keys)
     would refuse to the reason; ``transient`` those refused with a ``StaleSeriesError`` (a stale download, or one the metric
     store still lists after its last bar), which can clear after a cache refresh. Classified by exception TYPE. Nothing is built."""
+    from app.services import ml_panel
     cache_end = last_cached_bar("SPY", cache_root)
     store_path = Path(store_dir) if store_dir is not None else ml_universe.store_dir_for(cache_root)
+    # the event files the groups read (group F has its own, fuller check); filtered once, not per symbol
+    event_kinds = list(dict.fromkeys(k for g in groups if g != "f" for k in _FMP_KINDS_BY_GROUP.get(g, ())))
     usable: List[str] = []
     permanent: Dict[str, str] = {}
     transient: Dict[str, str] = {}
@@ -1687,11 +1690,8 @@ def screen_symbols(symbols: Sequence[str], first: date, last: date, cache_root: 
             _refuse_if_store_lists_ended(meta["ended"], store_path)
             if "f" in groups:
                 check_fundamentals_files(sym, cache_root)
-            from app.services import ml_panel
-            for g in groups:                                              # the event files a group reads must exist
-                for kind in _FMP_KINDS_BY_GROUP.get(g, ()):
-                    if g != "f":
-                        ml_panel._load_json(cache_root, kind, sym)
+            for kind in event_kinds:                                      # the event files a group reads must exist
+                ml_panel._load_json(cache_root, kind, sym)
             if "at" in groups:
                 check_target_ratios(sym, frames[sym], cache_root)
         except StaleSeriesError as e:
@@ -1984,23 +1984,63 @@ def _store_complete(out_dir: Path) -> bool:
     return all((Path(out_dir) / name).exists() for name in STORE_FILES)
 
 
-def _sweep_leftovers(out_dir: Path) -> None:
-    """At the start of a build: a ``<out>.old-*`` directory that is a COMPLETE store while ``out_dir`` is missing is a crash
-    between the two renames of a swap - it is restored; every other ``<out>.building-*`` / ``<out>.old-*`` directory is a
-    leftover of an earlier run and is removed."""
+def _pid_alive(pid: int) -> bool:
+    import psutil
+    return psutil.pid_exists(int(pid))
+
+
+def _dir_pid(path: Path) -> Optional[int]:
+    tail = path.name.rsplit("-", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
+def _meta_request(built: Path) -> Optional[Dict[str, object]]:
+    """The ``ensure.request`` of a store directory's meta, or None (no meta / no key / unreadable)."""
+    path = Path(built) / "features.parquet.meta.json"
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return meta["ensure"]["request"] if "ensure" in meta and "request" in meta["ensure"] else None
+
+
+def _sweep_leftovers(out_dir: Path, request: Optional[Dict[str, object]] = None) -> Optional[Path]:
+    """At the start of a build, clean up what earlier runs left next to ``out_dir`` and return a build to recover, if any.
+
+    * a ``<out>.building-*`` / ``<out>.old-*`` directory whose pid is ALIVE and not ours belongs to another process that may be
+      building or swapping right now: untouched. Only leftovers of dead processes (and of our own earlier attempts) are handled;
+    * a complete ``<out>.old-*`` while ``out_dir`` is missing is a crash between the two renames: restored;
+    * a complete ``<out>.building-*`` whose meta ``ensure.request`` equals ``request`` is a finished build whose swap failed:
+      returned for the caller to swap in instead of recomputing (the newest one);
+    * every other leftover is removed."""
     import os
     import shutil
     out_dir = Path(out_dir)
     if not out_dir.parent.exists():
-        return
-    olds = sorted(out_dir.parent.glob(f"{out_dir.name}.old-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return None
+
+    def mine_to_handle(d: Path) -> bool:
+        pid = _dir_pid(d)
+        return pid is None or pid == os.getpid() or not _pid_alive(pid)
+    olds = sorted((d for d in out_dir.parent.glob(f"{out_dir.name}.old-*") if mine_to_handle(d)),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+    builds = sorted((d for d in out_dir.parent.glob(f"{out_dir.name}.building-*") if mine_to_handle(d)),
+                    key=lambda p: p.stat().st_mtime, reverse=True)
     if not out_dir.exists():
         for old in olds:
             if _store_complete(old):
                 os.replace(old, out_dir)
+                olds.remove(old)
                 break
-    for d in list(out_dir.parent.glob(f"{out_dir.name}.old-*")) + list(out_dir.parent.glob(f"{out_dir.name}.building-*")):
+    recover: Optional[Path] = None
+    for d in builds:
+        if recover is None and request is not None and _store_complete(d) and _meta_request(d) == request:
+            recover = d
+        else:
+            shutil.rmtree(d, ignore_errors=True)
+    for d in olds:
         shutil.rmtree(d, ignore_errors=True)
+    return recover
 
 
 def _swap_in(built: Path, out_dir: Path) -> None:
@@ -2062,6 +2102,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
 
     Rebuilds only when the inputs signature changes: the feature code (``code_version``), the groups and their coverage
     columns, the built symbols, the window, the membership digest, the resolved sectors, or the (size, mtime) of any source file. Returns ``{"status": "built" | "up_to_date", ...}``."""
+    import shutil
     import time
     from ba2_common.config import CACHE_FOLDER
 
@@ -2072,7 +2113,6 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
         _spec(g)
     cache_root = Path(CACHE_FOLDER if cache_root is None else cache_root)
     store_path = Path(store_dir) if store_dir is not None else ml_universe.store_dir_for(cache_root)
-    _sweep_leftovers(out_dir)
     symbols = list(dict.fromkeys(symbols))
     extra = [c for c in dict.fromkeys((list(membership.columns) if membership is not None else []) + list(universe or []))
              if c not in symbols]
@@ -2089,11 +2129,21 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
         "sector_overrides": dict(sector_overrides or {}), "store_dir": str(store_path),
         "fingerprints": _input_fingerprints(request_load, symbols, groups, cache_root, store_path,
                                             uses_store=uses_sector and isinstance(sector_of, str))}, sort_keys=True))
+    kept = _sweep_leftovers(out_dir, request)                  # may restore a lost store; returns a finished build to recover
     if not force and meta_path.exists() and _store_complete(out_dir):
         old = json.loads(meta_path.read_text(encoding="utf-8"))
         if "ensure" in old and "request" in old["ensure"] and old["ensure"]["request"] == request:   # unchanged: nothing is loaded
+            if kept is not None:
+                shutil.rmtree(kept, ignore_errors=True)       # identical to the store in place: redundant
             return {"status": "up_to_date", "out_dir": str(out_dir), "symbols": old["symbols"],
                     "refused": old["ensure"]["refused"], "transient": old["ensure"]["transient"]}
+    if kept is not None and not force:                         # the same request was built and only its swap failed
+        _swap_in(kept, out_dir)
+        done = json.loads(meta_path.read_text(encoding="utf-8"))
+        return {"status": "built", "recovered": str(kept), "out_dir": str(out_dir), "symbols": done["symbols"],
+                "chunks": done["ensure"]["chunks"], "rows": done["rows"], "seconds": done["ensure"]["build_seconds"],
+                "refused": done["ensure"]["refused"], "transient": done["ensure"]["transient"],
+                "coverage": pd.read_parquet(out_dir / "coverage_report.parquet")}
     usable_rows, refused, transient = screen_symbols(symbols, first, last, cache_root, groups, store_path)
     usable_extra, refused_extra, transient_extra = (screen_symbols(extra, first, last, cache_root, (), store_path)
                                                     if extra else ([], {}, {}))
@@ -2131,7 +2181,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
         "fingerprints": _input_fingerprints(load, usable_rows, groups, cache_root, store_path)}, sort_keys=True))
     if not force and meta_path.exists() and _store_complete(out_dir):
         old = json.loads(meta_path.read_text(encoding="utf-8"))
-        if "ensure" in old and old["ensure"]["inputs"] == inputs:
+        if "ensure" in old and "request" in old["ensure"] and old["ensure"]["inputs"] == inputs:
             return {"status": "up_to_date", "out_dir": str(out_dir), "symbols": usable_rows, "refused": refused,
                     "transient": transient}
     cache = BuildCache()
