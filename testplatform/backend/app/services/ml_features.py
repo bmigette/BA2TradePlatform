@@ -310,8 +310,82 @@ def multi_timeframe(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.Dat
     return _per_symbol(daily, ctx, _weekly_one)
 
 
+# ------------------------------------------------------------------------------------------ group M (market)
+#: sector (FMP / screener-store spelling) -> its SPDR sector ETF. A sector outside this map is refused, never defaulted.
+SECTOR_ETF: Dict[str, str] = {
+    "Technology": "XLK", "Financial Services": "XLF", "Energy": "XLE", "Healthcare": "XLV",
+    "Consumer Cyclical": "XLY", "Consumer Defensive": "XLP", "Industrials": "XLI", "Basic Materials": "XLB",
+    "Utilities": "XLU", "Real Estate": "XLRE", "Communication Services": "XLC"}
+#: broad / cross-asset context series every M build needs in ``context_symbols`` (equity, small caps, rates, gold)
+MARKET_ETFS: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "TLT", "GLD")
+_M_RET_DAYS: Tuple[int, ...] = (1, 5, 20)
+_M_RS_DAYS: Tuple[int, ...] = (5, 20)
+M_COLUMNS: Tuple[str, ...] = (
+    tuple(f"m_{e.lower()}_ret_{n}" for e in MARKET_ETFS for n in _M_RET_DAYS)
+    + tuple(f"m_rs_spy_{n}" for n in _M_RS_DAYS) + tuple(f"m_rs_sector_{n}" for n in _M_RS_DAYS)
+    + ("m_breadth_sma50",))
+
+
+def _log_ret(d: pd.DataFrame, n: int) -> pd.Series:
+    """``n``-session log return of a loaded frame on the full session grid (NaN before its listing)."""
+    return np.log(d["close"]).diff(n)
+
+
+def _require(daily: Dict[str, pd.DataFrame], sym: str, why: str) -> pd.DataFrame:
+    if sym not in daily:
+        raise PanelDataError(f"group m needs {sym} ({why}) among the context symbols")
+    return daily[sym]
+
+
+def market(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
+    """Group ``m_``: the market the symbol trades in, as of the same session close.
+
+    * ``m_<etf>_ret_{1,5,20}``: SPY / QQQ / IWM / TLT / GLD log returns (broad equity, tech, small caps, rates, gold);
+    * ``m_rs_spy_{5,20}``: the symbol's log return minus SPY's; ``m_rs_sector_{5,20}``: minus its sector ETF's;
+    * ``m_breadth_sma50``: the share of the BUILD'S symbol set (``ctx.symbols``, not the context ETFs) whose close is
+      above its own 50-session SMA on that session. Symbols not yet listed, or without 50 bars, are not counted. The
+      value is the same for every symbol on a given session, and it depends on the symbol set built: a different
+      universe is a different breadth.
+
+    Every input is a bar of session S or earlier, so a row is fixed once S has closed. ``ctx.sector_of`` must give each
+    built symbol a sector in ``SECTOR_ETF``; anything else raises."""
+    if not ctx.sector_of:
+        raise PanelDataError("group m needs sector_of (symbol -> sector); got none")
+    etf_of: Dict[str, str] = {}
+    for sym in ctx.symbols:
+        sector = ctx.sector_of[sym] if sym in ctx.sector_of else None
+        if sector is None:
+            raise PanelDataError(f"group m: no sector for {sym}")
+        if sector not in SECTOR_ETF:
+            raise PanelDataError(f"group m: unknown sector {sector!r} for {sym}; known {sorted(SECTOR_ETF)}")
+        etf_of[sym] = SECTOR_ETF[sector]
+    for e in MARKET_ETFS:
+        _require(daily, e, "market series")
+    for e in sorted(set(etf_of.values())):
+        _require(daily, e, "sector ETF")
+    mk = pd.DataFrame(index=ctx.sessions)
+    for e in MARKET_ETFS:
+        for n in _M_RET_DAYS:
+            mk[f"m_{e.lower()}_ret_{n}"] = _log_ret(daily[e], n)
+    closes = pd.DataFrame({s: daily[s]["close"] for s in ctx.symbols})
+    sma50 = closes.rolling(50, min_periods=50).mean()
+    valid = sma50.notna()
+    mk["m_breadth_sma50"] = ((closes > sma50) & valid).sum(axis=1) / valid.sum(axis=1).replace(0, np.nan)
+    frames: Dict[str, pd.DataFrame] = {}
+    for sym in ctx.symbols:
+        f = mk.copy()
+        for n in _M_RS_DAYS:
+            own = _log_ret(daily[sym], n)
+            f[f"m_rs_spy_{n}"] = own - _log_ret(daily["SPY"], n)
+            f[f"m_rs_sector_{n}"] = own - _log_ret(daily[etf_of[sym]], n)
+        f = f[list(M_COLUMNS)]
+        f.loc[~daily[sym]["listed"].to_numpy(), :] = np.nan                 # no row before the symbol exists
+        frames[sym] = f
+    return pd.concat(frames, names=["symbol", "session"]).astype("float64")
+
+
 #: group name -> builder. The name is also the column prefix (``<name>_``); later tasks register more groups here.
-GROUPS: Dict[str, Builder] = {"t": technical, "mtf": multi_timeframe}
+GROUPS: Dict[str, Builder] = {"t": technical, "mtf": multi_timeframe, "m": market}
 
 
 def group_prefix(group: str) -> str:
@@ -369,6 +443,8 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
     dup = out.columns[out.columns.duplicated()].tolist()
     if dup:
         raise ValueError(f"columns produced by more than one group: {dup}")
+    feats = feature_columns(out, groups)
+    out.loc[~out["listed"].to_numpy(), feats] = np.nan         # safety net: no feature exists before the listing
     day = out.index.get_level_values("session")
     out = out[(day >= pd.Timestamp(first_day)) & (day <= pd.Timestamp(last_day))]
     out.attrs["meta"] = {"first_day": str(first_day), "last_day": str(last_day), "groups": per_group,

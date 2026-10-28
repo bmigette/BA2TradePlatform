@@ -372,3 +372,116 @@ def test_unknown_group_and_missing_symbol_refuse(cache):
         _build(cache, ["t"], symbols=("AAA", "ZZZ"))
     with pytest.raises(ValueError):
         _build(cache, [])
+
+
+# ---------------------------------------------------------------------------------------------- Task 1.3
+M_ETFS = ("SPY", "QQQ", "IWM", "TLT", "GLD")
+
+
+def _lr(cache, sym, n):
+    c = np.log(_raw(cache, sym)["Close"])
+    return c.diff(n)
+
+
+def test_cut_test_m(cache, tmp_path):
+    _assert_cut_identical(cache, tmp_path, ["m"], sector_of=SECTOR_OF)
+
+
+def test_cut_test_all_three_groups(cache, tmp_path):
+    full = _assert_cut_identical(cache, tmp_path, ["t", "mtf", "m"], sector_of=SECTOR_OF)
+    assert F.feature_columns(full, ["t"]) == list(F.T_COLUMNS) and F.feature_columns(full, ["m"]) == list(F.M_COLUMNS)
+
+
+def test_m_columns_and_etf_returns(cache):
+    f = _build(cache, ["m"], sector_of=SECTOR_OF)
+    assert F.feature_columns(f) == list(F.M_COLUMNS)
+    assert len(F.M_COLUMNS) == 5 * 3 + 2 + 2 + 1
+    assert f[list(F.M_COLUMNS)].notna().all().all()
+    a = f.loc["AAA"]
+    for sym in M_ETFS:
+        for n in (1, 5, 20):
+            np.testing.assert_allclose(a[f"m_{sym.lower()}_ret_{n}"], _lr(cache, sym, n).reindex(a.index), rtol=1e-12)
+    # the market columns are the same series for every symbol
+    np.testing.assert_array_equal(f.loc["AAA", "m_spy_ret_20"].to_numpy(), f.loc["BBB", "m_spy_ret_20"].to_numpy())
+
+
+def test_relative_strength_vs_spy_is_own_minus_spy(cache):
+    f = _build(cache, ["m"], sector_of=SECTOR_OF)
+    for sym in SYMS:
+        for n in (5, 20):
+            exp = (_lr(cache, sym, n) - _lr(cache, "SPY", n)).reindex(f.loc[sym].index)
+            np.testing.assert_allclose(f.loc[sym, f"m_rs_spy_{n}"], exp, rtol=1e-12, atol=1e-15)
+    t = _build(cache, ["t", "m"], sector_of=SECTOR_OF)                 # = the T group's own 20-day return minus SPY's
+    np.testing.assert_allclose(t["m_rs_spy_20"], t["t_ret_20"] - t["m_spy_ret_20"], rtol=1e-12, atol=1e-15)
+
+
+def test_relative_strength_vs_sector_etf(cache):
+    f = _build(cache, ["m"], sector_of=SECTOR_OF)
+    for sym, etf in (("AAA", "XLK"), ("BBB", "XLF")):
+        for n in (5, 20):
+            exp = (_lr(cache, sym, n) - _lr(cache, etf, n)).reindex(f.loc[sym].index)
+            np.testing.assert_allclose(f.loc[sym, f"m_rs_sector_{n}"], exp, rtol=1e-12, atol=1e-15)
+    assert not np.allclose(f.loc["AAA", "m_rs_sector_20"], f.loc["AAA", "m_rs_spy_20"])
+
+
+def test_breadth_is_the_share_of_the_build_set_above_its_sma50(cache):
+    syms = ("AAA", "BBB", "CCC")
+    f = _build(cache, ["m"], symbols=syms, sector_of=SECTOR_OF)
+    above = pd.DataFrame({s: _raw(cache, s)["Close"] > _raw(cache, s)["Close"].rolling(50).mean() for s in syms})
+    exp = above.mean(axis=1).reindex(f.loc["AAA"].index)
+    for s in syms:
+        np.testing.assert_allclose(f.loc[s, "m_breadth_sma50"], exp, rtol=0, atol=1e-15)   # same for every symbol
+    assert set(np.round(exp.unique(), 6)) <= {0.0, 0.333333, 0.666667, 1.0} and exp.nunique() > 2
+    solo = _build(cache, ["m"], symbols=("AAA",), sector_of=SECTOR_OF)                      # context ETFs are not counted
+    assert set(solo["m_breadth_sma50"].unique()) <= {0.0, 1.0}
+
+
+def test_breadth_ignores_symbols_not_yet_listed(cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    s = _sessions()
+    _write(root, "LATE", _bars(s[s >= pd.Timestamp("2023-06-01")], 11))
+    sector = dict(SECTOR_OF, LATE="Technology")
+    f = _build(root, ["m"], symbols=("AAA", "LATE"), sector_of=sector)
+    before = f.loc["AAA", "m_breadth_sma50"][f.loc["AAA"].index < pd.Timestamp("2023-06-01")]
+    assert set(before.unique()) <= {0.0, 1.0}                  # only AAA is counted until LATE exists (and has 50 bars)
+    late = f.loc["LATE"]
+    assert late.loc[late.index < pd.Timestamp("2023-06-01"), list(F.M_COLUMNS)].isna().all().all()    # unlisted rows are NaN in every column
+
+
+def test_unknown_or_missing_sector_raises(cache):
+    with pytest.raises(P.PanelDataError, match="unknown sector"):
+        _build(cache, ["m"], sector_of={"AAA": "Technology", "BBB": "Crypto Mining"})
+    with pytest.raises(P.PanelDataError, match="BBB"):
+        _build(cache, ["m"], sector_of={"AAA": "Technology"})
+    with pytest.raises(P.PanelDataError, match="BBB"):
+        _build(cache, ["m"], sector_of={"AAA": "Technology", "BBB": None})
+    with pytest.raises(P.PanelDataError, match="sector_of"):
+        _build(cache, ["m"])
+
+
+def test_m_needs_its_context_series(cache):
+    with pytest.raises(P.PanelDataError, match="XLF"):           # sector ETF not among the context symbols
+        _build(cache, ["m"], ctx=("SPY", "QQQ", "IWM", "TLT", "GLD", "XLK"), sector_of=SECTOR_OF)
+    with pytest.raises(P.PanelDataError, match="GLD"):
+        _build(cache, ["m"], ctx=("SPY", "QQQ", "IWM", "TLT", "XLK", "XLF"), sector_of=SECTOR_OF)
+
+
+def test_sector_etf_map_is_the_committed_one():
+    assert F.SECTOR_ETF == {"Technology": "XLK", "Financial Services": "XLF", "Energy": "XLE", "Healthcare": "XLV",
+                            "Consumer Cyclical": "XLY", "Consumer Defensive": "XLP", "Industrials": "XLI",
+                            "Basic Materials": "XLB", "Utilities": "XLU", "Real Estate": "XLRE",
+                            "Communication Services": "XLC"}
+    assert F.MARKET_ETFS == M_ETFS
+
+
+def test_sector_etf_listed_later_leaves_nan_only_before_its_listing(cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    s = _sessions()
+    _write(root, "XLC", _bars(s[s >= pd.Timestamp("2022-09-01")], 12))
+    f = _build(root, ["m"], symbols=("AAA",), ctx=CTX + ("XLC",), sector_of={"AAA": "Communication Services"}).loc["AAA"]
+    pre = f.index < pd.Timestamp("2022-09-02")
+    assert pre.sum() > 40 and f.loc[pre, ["m_rs_sector_5", "m_rs_sector_20"]].isna().all().all()
+    assert f.loc[pre, "m_rs_spy_20"].notna().all()               # the symbol itself is listed: only the sector leg is missing
+    assert f.loc[f.index > pd.Timestamp("2022-10-15"), ["m_rs_sector_5", "m_rs_sector_20"]].notna().all().all()
