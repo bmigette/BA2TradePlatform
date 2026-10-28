@@ -1294,7 +1294,7 @@ def test_the_gpu_pool_is_built_with_one_task_per_slot_retirement_and_a_hard_dead
     monkeypatch.setattr(G, "_drive_pool", spy)
     grun([lgbm_cell(world), tsai_cell(world)], tmp_path / "o", world, inline=False, cpu_slots=1, gpu_slots=1,
          task_fn=slow_or_quick_task_ok, settings=_gsettings(gpu_budget_minutes=2.0))
-    assert seen["cpu"] == {}
+    assert seen["cpu"] == {"deadline": 3 * 60 * 60.0, "window_factor": 1}                # the default cpu budget: 60 minutes
     assert seen["gpu"] == {"deadline": 3 * 2.0 * 60, "window_factor": 1, "max_tasks_per_child": G.GPU_MAX_TASKS_PER_CHILD}
     assert G.GPU_MAX_TASKS_PER_CHILD == 40
     kws = [pool.kwargs for pool in SnapshotPool.instances]
@@ -1681,3 +1681,54 @@ def test_warnings_are_kept_when_the_fit_fails(world, tmp_path, monkeypatch):
     with pytest.warns(UserWarning, match="a warning before the crash"):
         res = grun([tsai_cell(world)], tmp_path / "o", world)
     assert res["errors"] == 1
+
+
+# ---- the CPU lane has a hard deadline too (cpu_budget_minutes, 3 x)
+def test_cpu_budget_minutes_is_a_run_setting_that_is_no_part_of_any_identity(world):
+    assert _gsettings().cpu_budget_minutes == 60.0
+    for bad in (0, -1, float("nan"), True, "60", None):
+        with pytest.raises(ValueError, match="cpu_budget_minutes"):
+            _gsettings(cpu_budget_minutes=bad)
+    st = _gsettings(cpu_budget_minutes=5)
+    assert st.to_dict()["cpu_budget_minutes"] == 5 and G.GridSettings.from_dict(st.to_dict()) == st
+    for cell in (lgbm_cell(world), tsai_cell(world)):
+        assert "cpu_budget_minutes" not in G.identity_of(G.validate_cell(cell), st, "fp")["settings"]
+
+
+def test_the_cpu_pool_is_built_with_a_hard_deadline_of_three_cpu_budgets(world, tmp_path, monkeypatch):
+    seen = {}
+    real = G._drive_pool
+
+    def spy(tasks, slots, init_args, task_fn, finish, cancelled, summary, **k):
+        seen[tasks[0][0].pool] = k
+        return real(tasks, slots, init_args, task_fn, finish, cancelled, summary, **k)
+    monkeypatch.setattr(G, "_drive_pool", spy)
+    grun([lgbm_cell(world)], tmp_path / "o", world, inline=False, cpu_slots=1, gpu_slots=0,
+         task_fn=slow_or_quick_task_ok, settings=_gsettings(cpu_budget_minutes=2.0))
+    assert seen["cpu"] == {"deadline": 3 * 2.0 * 60, "window_factor": 1}          # one task per slot: the clock starts at once
+
+
+def cpu_hang_task(cfg, seed, key):
+    """lgbm hangs (a stuck fit); naive returns at once."""
+    if cfg["family"] == "lgbm":
+        _real_time.sleep(300)
+    return slow_or_quick_task({**cfg, "family": "x"}, seed, key)
+
+
+def test_a_cpu_task_stuck_twice_is_retried_once_and_then_recorded_as_a_timeout(world, tmp_path):
+    out = tmp_path / "o"
+    cells = [lgbm_cell(world), lgbm_cell(world, family="naive", params={})]
+    t0 = _real_time.time()
+    res = grun(cells, out, world, inline=False, cpu_slots=2, gpu_slots=0, task_fn=cpu_hang_task,
+               settings=_gsettings(cpu_budget_minutes=0.2))                         # hard deadline: 3 x 12 s = 36 s, twice
+    assert _real_time.time() - t0 < 200                                             # not the 300 s of the stuck fit
+    assert res["done"] == 1 and res["errors"] == 1 and res["pool_rebuilds"] >= 2
+    errs = G.read_results(out / "errors.jsonl")
+    key = G.validate_cell(lgbm_cell(world)).key
+    assert len(errs) == 2 and all(e["cell_key"] == key and e["hard_deadline"] is True for e in errs)
+    assert "timeout" not in errs[0] and errs[0]["retrying"] is True                  # the first one: a retry follows
+    assert errs[1]["timeout"] is True and "retrying" not in errs[1]                  # the second: given up
+    naive_key = G.validate_cell(lgbm_cell(world, family="naive", params={})).key
+    assert [r["cell_key"] for r in G.read_results(out / "results.jsonl")] == [naive_key]           # the innocent one finished
+    again = grun([lgbm_cell(world)], out, world, task_fn=slow_or_quick_task_ok)    # a restart skips the timeout
+    assert again["tasks"] == 0 and again["skipped_timeouts"] == 1

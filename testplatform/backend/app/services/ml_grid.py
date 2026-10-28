@@ -174,6 +174,10 @@ class GridSettings:
     #: minutes one (cell, seed) of a GPU family may take before the task is aborted with an error row (a run setting:
     #: not part of any row's identity)
     gpu_budget_minutes: float = 20.0
+    #: minutes one (cell, seed) of a tabular (CPU) family may take: the master kills a task in flight for longer than
+    #: ``HARD_DEADLINE_BUDGETS`` x this (a stuck fit), retries it once and then records a timeout. There is no soft check
+    #: inside a CPU fit, so this is the only limit. A run setting: not part of any row's identity.
+    cpu_budget_minutes: float = 60.0
 
     def __post_init__(self) -> None:
         if not self.eval_start < self.eval_end:
@@ -186,8 +190,9 @@ class GridSettings:
                      "darts_lookback", "gpu_max_epochs"):
             if not _is_int(getattr(self, name)) or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be an integer >= 1")
-        if not _is_real(self.gpu_budget_minutes) or self.gpu_budget_minutes <= 0:
-            raise ValueError("gpu_budget_minutes must be a number > 0")
+        for name in ("gpu_budget_minutes", "cpu_budget_minutes"):
+            if not _is_real(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be a number > 0")
         if not len(self.control_seeds):
             raise ValueError("control_seeds is empty")
 
@@ -197,7 +202,8 @@ class GridSettings:
                 "val_share": self.val_share, "min_obs": self.min_obs, "regime_min_rows": self.regime_min_rows,
                 "control_seeds": list(self.control_seeds), "cores": self.cores, "seq_lookback": self.seq_lookback,
                 "seq_samples_per_session": self.seq_samples_per_session, "darts_lookback": self.darts_lookback,
-                "gpu_max_epochs": self.gpu_max_epochs, "gpu_budget_minutes": self.gpu_budget_minutes}
+                "gpu_max_epochs": self.gpu_max_epochs, "gpu_budget_minutes": self.gpu_budget_minutes,
+                "cpu_budget_minutes": self.cpu_budget_minutes}
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "GridSettings":
@@ -1172,7 +1178,8 @@ def budget_projection(elapsed: float, fitted_times: Sequence[float], remaining: 
     if len(fitted_times) < 2:
         return None
     return elapsed + sum(fitted_times) / len(fitted_times) * remaining
-#: the master kills a GPU task that has been in flight longer than this many budgets
+#: the master kills a task (GPU: ``gpu_budget_minutes``, CPU: ``cpu_budget_minutes``) that has been in flight longer than
+#: this many budgets
 HARD_DEADLINE_BUDGETS = 3.0
 
 #: the ``GridSettings`` only a GPU family reads (a tabular row's identity leaves them out)
@@ -1188,7 +1195,7 @@ def identity_of(cell: Cell, st: GridSettings, daily_fp: str, intraday_fp: str = 
     the daily cache fingerprint and, for a tsai cell, the fingerprint of the 5-minute bars it reads (a content hash,
     ``ml_grid_seq.intraday_fingerprint``)."""
     settings = st.to_dict()
-    for name in ("cores", "gpu_budget_minutes"):             # how many threads / how long it may take: not what it computes
+    for name in ("cores", "gpu_budget_minutes", "cpu_budget_minutes"):    # threads / how long it may take: not what it computes
         del settings[name]
     if cell.pool != "gpu":                                    # a tabular row does not depend on the sequence settings
         for name in SEQ_SETTINGS:
@@ -1759,7 +1766,7 @@ class GpuBreaker:
 def _drive_lanes(cpu_tasks: Sequence[Tuple[Cell, int]], gpu_tasks: Sequence[Tuple[Cell, int]], cpu_slots: int,
                  gpu_slots: int, init_args: Tuple, task_fn: Callable, finish: Callable[[Dict[str, Any]], None],
                  cancelled: Callable[[], bool], summary: Dict[str, Any],
-                 gpu_kwargs: Optional[Dict[str, Any]] = None) -> None:
+                 gpu_kwargs: Optional[Dict[str, Any]] = None, cpu_kwargs: Optional[Dict[str, Any]] = None) -> None:
     """Run the CPU tasks on a pool of ``cpu_slots`` workers and the GPU tasks on a second pool of ``gpu_slots``, the two
     ``_drive_pool`` lifecycles (retries, probation, cancellation, ``BrokenProcessPool``) side by side. One lane runs in
     the calling thread. With both, each lane runs in its own thread: ``finish`` and the cancel check are serialised by
@@ -1767,8 +1774,8 @@ def _drive_lanes(cpu_tasks: Sequence[Tuple[Cell, int]], gpu_tasks: Sequence[Tupl
     in-flight tasks are cancelled, its rows so far are kept), every lane error is logged and the first is re-raised
     (the others as notes on it). The GPU lane has a circuit breaker (``GpuBreaker``): after ``GPU_BREAKER_LIMIT``
     consecutive CUDA errors it is aborted LOUDLY (``summary["gpu_lane_aborted"]``, an error log line) while the CPU lane
-    goes on; its unfinished tasks are retried by the next run. ``gpu_kwargs`` go to the GPU lane's ``_drive_pool`` (the
-    hard ``deadline``, ``window_factor``, ``max_tasks_per_child``)."""
+    goes on; its unfinished tasks are retried by the next run. ``gpu_kwargs`` / ``cpu_kwargs`` go to the GPU / CPU lane's
+    ``_drive_pool`` (the hard ``deadline``, ``window_factor``, ``max_tasks_per_child``)."""
     lanes = [(name, t, n) for name, t, n in (("cpu", cpu_tasks, cpu_slots), ("gpu", gpu_tasks, gpu_slots)) if t]
     lock = threading.RLock()
     stop = threading.Event()
@@ -1802,7 +1809,8 @@ def _drive_lanes(cpu_tasks: Sequence[Tuple[Cell, int]], gpu_tasks: Sequence[Tupl
     def lane(i: int) -> None:
         name, tasks, slots = lanes[i]
         try:
-            extra = gpu_kwargs if (name == "gpu" and gpu_kwargs) else {}
+            wanted = gpu_kwargs if name == "gpu" else cpu_kwargs
+            extra = wanted if wanted else {}
             _drive_pool(tasks, slots, init_args, task_fn, lane_finish(name), lane_stopped(name), subs[i], **extra)
         except BaseException as e:                                # noqa: BLE001  (re-raised by the caller)
             errors.append(e)
@@ -2180,9 +2188,11 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
                     break
                 finish(task_fn(c.config(with_seeds=True), sd, c.key))
         else:
+            # window_factor 1 on both lanes: a submitted task starts at once, so the deadline can run from its submission
             _drive_lanes(cpu_tasks, gpu_tasks, cpu_slots, gpu_slots, init_args, task_fn, finish, cancelled, summary,
                          {"deadline": HARD_DEADLINE_BUDGETS * st.gpu_budget_minutes * 60.0, "window_factor": 1,
-                          "max_tasks_per_child": GPU_MAX_TASKS_PER_CHILD})
+                          "max_tasks_per_child": GPU_MAX_TASKS_PER_CHILD},
+                         {"deadline": HARD_DEADLINE_BUDGETS * st.cpu_budget_minutes * 60.0, "window_factor": 1})
     finally:                                                    # also when the run dies: the files say how far it got
         if "gpu_lane_aborted" in summary and summary["gpu_lane_aborted"]:
             say("ml_grid: GPU LANE ABORTED by the circuit breaker (see the error log); rerun after checking the device")
