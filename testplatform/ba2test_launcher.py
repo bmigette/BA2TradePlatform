@@ -2690,12 +2690,16 @@ def _apply_ml_rank_top_n(spec: dict, raw, expert: str, strategy: str, command: s
     return out
 
 
-def _apply_ml_rank_universe(command: str, backtest_block: dict, strategy: str) -> None:
+def _apply_ml_rank_universe(command: str, backtest_block: dict, strategy: str, model_keys=()) -> None:
     """MLR: record the run's own symbols as the expert's FIXED ``rank_universe`` setting (comma-separated, sorted, so it
     travels as an ordinary string setting and enters the run identity: the checkpoint fingerprint and the stored
     config). Call AFTER every step that can rewrite ``enabled_instruments``. The ranked set is exactly the traded set,
     never the store's directory contents. A per-trial candidate universe (``--screener``) would make it disagree with
-    the traded set, so MLR refuses a screener. Other strategies: untouched."""
+    the traded set, so MLR refuses a screener. Other strategies: untouched.
+
+    PREFLIGHT: for every ``model_keys`` choice (the ``model_key`` gene's aliases / keys) every universe symbol must have
+    a file in that store, or the job is refused here, naming the missing symbols: the expert aborts a run on the first
+    missing file, so without this a gene value on an incomplete store would only fail mid-GA, on whichever worker drew it."""
     if strategy != "MLR":
         return
     if backtest_block.get("screener_opt"):
@@ -2703,6 +2707,20 @@ def _apply_ml_rank_universe(command: str, backtest_block: dict, strategy: str) -
     universe = sorted({str(x).strip().upper() for x in backtest_block["enabled_instruments"] if str(x).strip()})
     if not universe:
         sys.exit(f"{command}: strategy MLR needs a non-empty universe to rank")
+    from ba2_common.core.ml_forecast import store as _store
+    from ba2_experts.MLForecast import resolve_model_key as _resolve
+    problems = []
+    for name in model_keys:
+        try:
+            missing = _store.missing_symbol_files(_resolve(name), universe)
+        except ValueError as e:
+            sys.exit(f"{command}: strategy MLR: cannot check store {name!r} for the universe: {e}")
+        if missing:
+            problems.append(f"{name!r}: {len(missing)} of {len(universe)} symbols have no file ({', '.join(missing[:15])}"
+                            f"{' ...' if len(missing) > 15 else ''})")
+    if problems:
+        sys.exit(f"{command}: strategy MLR ranks the whole universe, so every model_key store must hold every symbol; "
+                 f"incomplete: " + "; ".join(problems))
     (expert,) = [e for e in backtest_block["experts"] if e["class"] == "MLForecast"]
     expert["settings"]["rank_universe"] = ",".join(universe)
 
@@ -7974,7 +7992,8 @@ def _cmd_optimize(args) -> int:
         # level than its daily cache (decision price from one, history from the other).
         _refuse_intraday_basis_mismatch("optimize", backtest_block)
         universe = list(backtest_block["enabled_instruments"])      # the reviewed exclusion list may have removed some
-        _apply_ml_rank_universe("optimize", backtest_block, args.strategy)   # AFTER the last universe rewrite
+        _apply_ml_rank_universe("optimize", backtest_block, args.strategy,   # AFTER the last universe rewrite
+                                spec["expert_params"]["model_key"]["choices"] if args.strategy == "MLR" else ())
         # the FINAL universe's intraday coverage (threshold + report); the price-basis cross-check is the shared function of
         # fix/ohlcv-cross-interval-basis, not duplicated here
         _coverage_preflight("optimize", list(backtest_block["enabled_instruments"]), args, history_source)

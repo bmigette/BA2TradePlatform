@@ -118,23 +118,83 @@ def test_mlr_without_ml_rank_top_n_is_refused(raw):
         L._apply_ml_rank_top_n(L._EXPERT_OPT[_ML], raw, _ML, "MLR", "optimize")
 
 
+def _make_store(tmp_path, alias, symbols, horizons=(3,)):
+    """A tiny class-probability forecast store under ``tmp_path`` whose ``build.card_id`` is ``alias``."""
+    from datetime import date
+    from ba2_common.core.ml_forecast import store
+    from ba2_common.core.ml_forecast.forecast_row import ForecastRow
+    from ba2_common.core.ml_forecast.model_card import ModelCard, model_key
+    card = ModelCard(model_id="ba2/custom", family="tsai", version="1", input_fields=("panel",), timeframe="1d",
+                     context_length=64, past_only_covariates=(), past_future_covariates=(), horizons=tuple(horizons),
+                     scaler=None, output_type="class_probs", pretraining_cutoff=None, licence="internal",
+                     licence_commercial_ok=True)
+    cf = ((0.2, -0.03), (0.3, 0.002), (0.5, 0.03))
+    rows = [ForecastRow(sym, date(2024, 3, 1), {}, class_probs={h: cf for h in horizons}) for sym in symbols]
+    key = model_key(card, ())
+    store.write_rows(key, card, {"card_id": alias}, rows, (), tmp_path)
+    return key
+
+
+@pytest.fixture
+def stores(tmp_path, monkeypatch):
+    """CACHE_FOLDER -> tmp_path with a complete store ``full`` and an incomplete one ``short`` (no NVDA, no MSFT)."""
+    from ba2_common import config
+    import importlib
+    from ba2_common.core.ml_forecast import store
+    monkeypatch.setattr(config, "CACHE_FOLDER", str(tmp_path))
+    importlib.import_module("ba2_experts.MLForecast")._alias_memo.clear()
+    store.reset_cache()
+    _make_store(tmp_path, "full", ["AAPL", "MSFT", "NVDA", "IBM"])
+    _make_store(tmp_path, "short", ["AAPL"], horizons=(5,))
+    yield tmp_path
+    importlib.import_module("ba2_experts.MLForecast")._alias_memo.clear()
+    store.reset_cache()
+
+
 def _block(universe=("MSFT", "aapl", "AAPL", "NVDA"), **extra):
     return {"enabled_instruments": list(universe), "experts": [{"class": _ML, "settings": {"enable_sell": False}}],
             **extra}
 
 
-def test_rank_universe_is_the_jobs_sorted_symbols_for_mlr_only():
+def test_rank_universe_is_the_jobs_sorted_symbols_for_mlr_only(stores):
     b = _block()
-    L._apply_ml_rank_universe("optimize", b, "MLR")
+    L._apply_ml_rank_universe("optimize", b, "MLR", ["full"])
     assert b["experts"][0]["settings"] == {"enable_sell": False, "rank_universe": "AAPL,MSFT,NVDA"}
     for strat in ("MLH", "MLF", "S1"):
         other = _block()
         L._apply_ml_rank_universe("optimize", other, strat)
         assert "rank_universe" not in other["experts"][0]["settings"]
     with pytest.raises(SystemExit, match="cannot run with a screener"):
-        L._apply_ml_rank_universe("optimize", _block(screener_opt={"x": 1}), "MLR")
+        L._apply_ml_rank_universe("optimize", _block(screener_opt={"x": 1}), "MLR", ["full"])
     with pytest.raises(SystemExit, match="non-empty universe"):
-        L._apply_ml_rank_universe("optimize", _block(universe=()), "MLR")
+        L._apply_ml_rank_universe("optimize", _block(universe=()), "MLR", ["full"])
+
+
+def test_preflight_refuses_a_model_key_store_missing_universe_symbols(stores):
+    b = _block()
+    with pytest.raises(SystemExit) as ei:
+        L._apply_ml_rank_universe("optimize", b, "MLR", ["full", "short"])
+    msg = str(ei.value)
+    assert "'short': 2 of 3 symbols have no file (MSFT, NVDA)" in msg and "'full'" not in msg
+    assert "rank_universe" not in b["experts"][0]["settings"]            # refused before anything is recorded
+    # the 16-hex key spelling is checked the same way; every incomplete choice is named
+    key = _make_store(stores, "other", ["AAPL", "MSFT"], horizons=(7,))
+    with pytest.raises(SystemExit, match=rf"'{key}': 1 of 3 symbols have no file \(NVDA\).*'short'"):
+        L._apply_ml_rank_universe("optimize", _block(), "MLR", [key, "short"])
+
+
+def test_preflight_refuses_an_unknown_or_unbuilt_store(stores):
+    with pytest.raises(SystemExit, match="cannot check store 'nope'"):
+        L._apply_ml_rank_universe("optimize", _block(), "MLR", ["nope"])
+    with pytest.raises(SystemExit, match="'0123456789abcdef': 3 of 3 symbols have no file"):
+        L._apply_ml_rank_universe("optimize", _block(), "MLR", ["0123456789abcdef"])
+
+
+def test_preflight_applies_to_mlr_only(stores):
+    for strat in ("MLH", "MLF"):
+        b = _block()
+        L._apply_ml_rank_universe("optimize", b, strat, ["short"])        # not checked, nothing recorded
+        assert "rank_universe" not in b["experts"][0]["settings"]
 
 
 def test_rank_universe_is_part_of_the_checkpoint_identity():
@@ -296,17 +356,24 @@ def _run_optimize(monkeypatch, strategy, extra, universe="MSFT,AAPL,NVDA"):
         db.close()
 
 
-def test_mlr_job_persists_the_gene_and_the_universe_as_a_fixed_setting(monkeypatch):
-    cfg = _run_optimize(monkeypatch, "MLR", ["--ml-rank-top-n", "3,5"])
+def test_mlr_job_persists_the_gene_and_the_universe_as_a_fixed_setting(monkeypatch, stores):
+    cfg = _run_optimize(monkeypatch, "MLR", ["--ml-rank-top-n", "3,5", "--ml-model-keys", "full"])
     assert cfg["expert_params"]["rank_top_n"] == {"optimize": True, "type": "choice", "choices": [3, 5]}
     settings = cfg["backtest"]["experts"][0]["settings"]
     assert settings["rank_universe"] == "AAPL,MSFT,NVDA" and settings["enable_sell"] is False
 
 
-def test_mlr_universe_is_the_final_one_after_exclusions(monkeypatch):
-    cfg = _run_optimize(monkeypatch, "MLR", ["--ml-rank-top-n", "3", "--exclude-symbols", "NVDA"])
-    assert cfg["backtest"]["enabled_instruments"] == ["MSFT", "AAPL"]
-    assert cfg["backtest"]["experts"][0]["settings"]["rank_universe"] == "AAPL,MSFT"
+def test_mlr_universe_is_the_final_one_after_exclusions(monkeypatch, stores):
+    # the incomplete store lacks MSFT and NVDA: it passes only because the preflight sees the FINAL universe
+    cfg = _run_optimize(monkeypatch, "MLR", ["--ml-rank-top-n", "3", "--exclude-symbols", "NVDA,MSFT",
+                                             "--ml-model-keys", "short"], universe="MSFT,AAPL,NVDA")
+    assert cfg["backtest"]["enabled_instruments"] == ["AAPL"]
+    assert cfg["backtest"]["experts"][0]["settings"]["rank_universe"] == "AAPL"
+
+
+def test_mlr_job_on_an_incomplete_store_is_refused_before_it_starts(monkeypatch, stores):
+    with pytest.raises(SystemExit, match="'short': 2 of 3 symbols have no file"):
+        _run_optimize(monkeypatch, "MLR", ["--ml-rank-top-n", "3", "--ml-model-keys", "full,short"])
 
 
 @pytest.mark.parametrize("strategy", ["MLH", "MLF", "S1"])
