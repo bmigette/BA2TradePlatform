@@ -9835,9 +9835,10 @@ def main(argv: "list | None" = None) -> int:
                          "among for this job, replacing _EXPERT_OPT's list (e.g. one store, or a naive/placebo "
                          "control store). Omit: the spec's list.")
     op.add_argument("--ml-rank-top-n", default=None, metavar="N,N",
-                    help="MLForecast with strategy MLR only: the rank_top_n gene chooses among these N (distinct "
+                    help="MLForecast with strategy MLR only, and REQUIRED there (without it the command exits: MLR "
+                         "without a ranking is no rotation): the rank_top_n gene chooses among these N (distinct "
                          "integers >= 1): BUY only the N most bullish symbols of the store at the decision date, "
-                         "SELL a held long that drops out of them. Omit: the gene is pinned to 0 (ranking off).")
+                         "SELL a held long that drops out of them. Any other expert / strategy refuses the flag.")
     op.add_argument("--ml-hold-from-horizon", action="store_true",
                     help="MLForecast with strategy MLH or MLF only (needs --ml-model-keys): the days_opened gene "
                          "becomes {d-1, d, d+1} clipped at 0 with d = round(H x 7/5) - 1, H = the (single, shared) "

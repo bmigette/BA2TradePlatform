@@ -118,6 +118,20 @@ def test_mlr_without_ml_rank_top_n_is_refused(raw):
         L._apply_ml_rank_top_n(L._EXPERT_OPT[_ML], raw, _ML, "MLR", "optimize")
 
 
+def test_the_ml_rank_top_n_help_says_mlr_needs_it():
+    """The help used to promise "omit: the gene is pinned to 0 (ranking off)"; for MLR that is an exit (``_apply_ml_rank_top_n``)."""
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as ei:
+        L.main(["optimize", "--help"])
+    assert ei.value.code == 0
+    text = " ".join(buf.getvalue().split())
+    help_of = text.split("--ml-rank-top-n N,N")[-1].split("--ml-hold-from-horizon")[0]
+    assert "pinned to 0" not in help_of and "ranking off" not in help_of
+    assert "MLR" in help_of and "required" in help_of.lower() and "exits" in help_of
+
+
 def _make_store(tmp_path, alias, symbols, horizons=(3,)):
     """A tiny class-probability forecast store under ``tmp_path`` whose ``build.card_id`` is ``alias``."""
     from datetime import date
