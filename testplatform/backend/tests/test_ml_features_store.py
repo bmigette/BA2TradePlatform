@@ -145,7 +145,9 @@ def test_bad_arguments_refuse(work, tmp_path):
         F.ensure_feature_store(tmp_path / "x", SYMBOLS, FIRST, LAST, ["t", "nope"], cache_root=work)
 
 
-def test_the_launcher_command_builds_the_store(work, tmp_path, monkeypatch):
+@pytest.fixture
+def cli(work, tmp_path, monkeypatch):
+    """The launcher module with the platform cache pointed at the private synthetic cache; returns run(symbols, *args)."""
     import importlib.util
     import sys
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -157,13 +159,66 @@ def test_the_launcher_command_builds_the_store(work, tmp_path, monkeypatch):
     spec.loader.exec_module(mod)
     from ba2_common import config as bc
     monkeypatch.setattr(bc, "CACHE_FOLDER", str(work))
-    symfile = tmp_path / "symbols.txt"
-    symfile.write_text("aaa\nbbb\n", encoding="utf-8")
-    out = tmp_path / "cli"
-    rc = mod.main(["ml-features", "--symbols-file", str(symfile), "--start", str(FIRST), "--end", str(LAST),
-                   "--groups", "t,mtf", "--out", str(out), "--chunk-size", "1"])
+    counter = []
+
+    def run(symbols, *args, groups="t,mtf"):
+        symfile = tmp_path / f"symbols{len(counter)}.txt"
+        symfile.write_text("\n".join(symbols) + "\n", encoding="utf-8")
+        out = tmp_path / f"cli{len(counter)}"
+        counter.append(1)
+        argv = ["ml-features", "--symbols-file", str(symfile), "--start", str(FIRST), "--end", str(LAST), "--out", str(out),
+                "--chunk-size", "1"] + (["--groups", groups] if groups else []) + list(args)
+        return mod.main(argv), out
+    run.mod = mod
+    return run
+
+
+def test_the_launcher_command_builds_the_store(cli):
+    rc, out = cli(["aaa", "bbb"])
     assert rc == 0 and (out / "features.parquet").exists()
     assert _meta(out)["symbols"] == ["AAA", "BBB"] and set(_meta(out)["groups"]) == {"t", "mtf"}
+
+
+def test_every_default_launcher_group_exists(cli):
+    groups = [g for g in cli.mod.ML_FEATURES_DEFAULT_GROUPS.split(",")]
+    assert groups == ["t", "mtf", "m", "x", "mac", "f", "ag", "at", "i", "s"]
+    assert all(g in F.GROUPS for g in groups)
+    assert set(F.GROUPS) == set(groups)                                  # and no registered group is left out
+
+
+def test_the_launcher_membership_option(cli):
+    rc, out = cli(["bbb", "ccc"], "--membership-top-n", "3", "--purpose", "dev", "--sector-override", "BBB=Financial Services",
+                  "--sector-override", "CCC=Technology", groups="t,x")
+    assert rc == 0
+    rec = _meta(out)["membership"]
+    assert rec["top_n"] == 3 and rec["purpose"] == "dev" and rec["symbols"] == 2      # AAA is hash-locked: not in a dev universe
+    assert set(pd.read_parquet(out / "features.parquet").index.get_level_values("symbol")) == {"BBB", "CCC"}
+
+
+def test_the_launcher_no_sector_and_override_options(cli):
+    rc, out = cli(["spy", "qqq"], "--no-sector", groups="t,mtf,m")
+    assert rc == 0 and _meta(out)["sectorless"] == ["QQQ", "SPY"]
+    rc, out = cli(["aaa"], "--sector-override", "AAA=Financial Services", groups="t,mtf,m")
+    assert rc == 0 and _meta(out)["sector_overrides"] == {"AAA": "Financial Services"}
+    assert pd.read_parquet(out / "features.parquet").loc["AAA", "m_rs_sector_20"].notna().all()
+
+
+def test_bad_launcher_sector_options_refuse(cli):
+    with pytest.raises(SystemExit, match="SYM=Sector"):
+        cli(["aaa"], "--sector-override", "AAA", groups="t")
+    with pytest.raises(SystemExit, match="--no-sector"):
+        cli(["aaa"], "--no-sector", "--sector-override", "AAA=Technology", groups="t")
+
+
+def test_the_launcher_exits_non_zero_when_a_symbol_is_refused_permanently(cli, capsys):
+    rc, out = cli(["aaa", "nope"])
+    assert rc == 1 and _meta(out)["symbols"] == ["AAA"]                        # the rest is still built
+    assert "refused NOPE" in capsys.readouterr().out
+
+
+def test_the_launcher_min_share_is_stored_and_part_of_the_key(cli):
+    rc, out = cli(["aaa", "bbb"], "--min-share", "0.9")
+    assert rc == 0 and _meta(out)["ensure"]["min_share"] == 0.9
 
 
 def test_a_changed_coverage_definition_rebuilds_the_report(work, tmp_path, monkeypatch):
@@ -205,3 +260,20 @@ def test_the_code_version_hashes_the_feature_modules():
     for mod in (F, ml_universe, ml_panel):
         h.update(Path(mod.__file__).read_bytes())
     assert v == h.hexdigest()[:16]
+
+
+def test_min_share_and_the_package_versions_are_part_of_the_rebuild_key(work, tmp_path, monkeypatch):
+    import ba2_common.version
+    out = tmp_path / "store"
+    _ensure(work, out)
+    assert _ensure(work, out)["status"] == "up_to_date"
+    assert _ensure(work, out, min_share=0.5)["status"] == "built"                  # another threshold, another store
+    assert _ensure(work, out, min_share=0.5)["status"] == "up_to_date"
+    keys = _meta(out)["ensure"]["inputs"]
+    assert keys["min_share"] == 0.5 and set(keys["packages"]) == {"ba2_common", "ba2_providers", "ba2_experts"}
+    for pkg in ("ba2_common", "ba2_providers", "ba2_experts"):
+        mod = __import__(f"{pkg}.version", fromlist=["PACKAGE_VERSION"])
+        monkeypatch.setattr(mod, "PACKAGE_VERSION", "2099.01.00001")
+        assert _ensure(work, out, min_share=0.5)["status"] == "built", pkg
+        monkeypatch.undo()
+        assert _ensure(work, out, min_share=0.5)["status"] == "built"             # back to the real version: rebuilt again

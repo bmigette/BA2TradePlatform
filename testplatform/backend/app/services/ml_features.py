@@ -1849,6 +1849,12 @@ _FMP_KINDS_BY_GROUP: Dict[str, Tuple[str, ...]] = {"f": _F_FILES, "ag": ("analys
                                                    "i": ("insider_v2",)}
 
 
+def _package_versions() -> Dict[str, str]:
+    """PACKAGE_VERSION of the shared packages the features are computed with (part of the rebuild key)."""
+    import importlib
+    return {m: importlib.import_module(f"{m}.version").PACKAGE_VERSION for m in ("ba2_common", "ba2_providers", "ba2_experts")}
+
+
 def code_version() -> str:
     """16 hex digits of the sha256 of the feature code (``ml_features.py``, ``ml_universe.py``, ``ml_panel.py``): part of the
     store's rebuild key, so a change of logic rebuilds without ``--force`` (and so does a comment: the key is the bytes)."""
@@ -1941,7 +1947,8 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
         required |= set(_spec(g).required_context(usable_rows, resolved))
     load = list(dict.fromkeys(usable_rows + uni + sorted(required)))
     inputs = json.loads(json.dumps({
-        "version": ENSURE_VERSION, "code": code_version(), "groups": groups,
+        "version": ENSURE_VERSION, "code": code_version(), "packages": _package_versions(), "min_share": min_share,
+        "groups": groups,
         "coverage_columns": {g: _spec(g).coverage_columns for g in groups}, "symbols": usable_rows, "universe": uni, "first": str(first),
         "last": str(last), "membership": None if members is None else _membership_digest(members), "sectors": resolved,
         "fingerprints": _input_fingerprints(load, usable_rows, groups, cache_root, store_path)}, sort_keys=True))
@@ -1970,6 +1977,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     meta["rows"], meta["columns"], meta["nan_rate"] = int(len(df)), list(df.columns), _nan_rates(df, groups)
     meta["ended"] = {k: v for m in metas for k, v in m["ended"].items()}
     meta["sectorless"] = sorted({sym for m in metas for sym in m["sectorless"]})
+    meta["sector_overrides"] = dict(sector_overrides or {})
     meta["load"] = {k: {s: v for m in metas for s, v in m["load"][k].items()} for k in metas[0]["load"]}
     source: Dict[str, object] = {"daily": {}, "fmp_history": {}}
     for m in metas:

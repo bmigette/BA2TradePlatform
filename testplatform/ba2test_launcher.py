@@ -8950,6 +8950,29 @@ def _cmd_ml_search(args) -> int:
     return 0
 
 
+#: The default groups of ``ba2-test ml-features`` - every registered group of ``ml_features.GROUPS`` (a test pins that).
+ML_FEATURES_DEFAULT_GROUPS = "t,mtf,m,x,mac,f,ag,at,i,s"
+
+
+def _ml_features_sector_overrides(items, no_sector: bool, symbols) -> dict:
+    """The ``{symbol: sector}`` overrides of ``ml-features``: ``--sector-override SYM=Sector`` (repeatable), or ``--no-sector``
+    (every symbol is an index / ETF); the two cannot be combined and an item without ``=`` is refused."""
+    from app.services import ml_features as _mf
+    items = list(items or [])
+    if no_sector and items:
+        raise SystemExit("ba2-test ml-features: --no-sector declares every symbol sectorless; it cannot be combined with "
+                         "--sector-override")
+    overrides = {}
+    for item in items:
+        sym, sep, sector = item.partition("=")
+        if not sep or not sym.strip() or not sector.strip():
+            raise SystemExit(f"ba2-test ml-features: --sector-override must be SYM=Sector, got {item!r}")
+        overrides[sym.strip().upper()] = sector.strip()
+    if no_sector:
+        overrides = {s: _mf.NO_SECTOR for s in symbols}
+    return overrides
+
+
 def _cmd_ml_features(args) -> int:
     """Build (or find up to date) the point-in-time DAILY feature store (ML exploration v2, app/services/ml_features.py):
     features.parquet + meta + coverage report under --out. With --membership-top-n the X ranks and the breadth use the
@@ -8964,25 +8987,22 @@ def _cmd_ml_features(args) -> int:
     symbols = _parse_symbols_arg("@" + args.symbols_file)
     first, last = _date.fromisoformat(args.start), _date.fromisoformat(args.end)
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
-    overrides = {}
-    for item in args.sector_override or []:
-        sym, _, sector = item.partition("=")
-        overrides[sym.strip().upper()] = sector.strip()
-    if args.no_sector:
-        overrides.update({s: _mf.NO_SECTOR for s in symbols})
+    overrides = _ml_features_sector_overrides(args.sector_override, args.no_sector, symbols)
     membership = None
     if args.membership_top_n:
         sessions = _pd.DatetimeIndex(_pd.to_datetime(_mp.regular_sessions(first, last)["session"]))
-        membership = _mu.membership_from_universe(sessions, args.membership_top_n, args.purpose)
+        membership = _mu.membership_from_universe(sessions, args.membership_top_n, args.purpose,
+                                                   store_dir=_mu.store_dir_for(_bc.CACHE_FOLDER))
     res = _mf.ensure_feature_store(args.out, symbols, first, last, groups, membership, cache_root=_bc.CACHE_FOLDER,
-                                   chunk_size=args.chunk_size, sector_overrides=overrides, force=args.force)
+                                   chunk_size=args.chunk_size, sector_overrides=overrides, min_share=args.min_share,
+                                   force=args.force)
     print(f"ml-features: {res['status']} -> {res['out_dir']} ({len(res['symbols'])} symbols"
           + (f", {res['rows']} rows in {res['seconds']}s" if res["status"] == "built" else "") + ")")
     for sym, reason in res["refused"].items():
         print(f"  refused {sym}: {reason}")
     for sym, reason in res["transient"].items():
         print(f"  transient (may clear after a cache refresh; informational) {sym}: {reason}")
-    return 0
+    return 1 if res["refused"] else 0                       # a permanently refused symbol is not silently dropped
 
 
 def _add_robust_fitness_args(p) -> None:
@@ -9871,7 +9891,7 @@ def main(argv: "list | None" = None) -> int:
     mf.add_argument("--symbols-file", required=True, help="Symbols to build rows for (one per line / whitespace).")
     mf.add_argument("--start", required=True, help="First day (YYYY-MM-DD).")
     mf.add_argument("--end", required=True, help="Last day (YYYY-MM-DD).")
-    mf.add_argument("--groups", default="t,mtf,m,x,mac,f,a,i,s", help="Comma list of feature groups.")
+    mf.add_argument("--groups", default=ML_FEATURES_DEFAULT_GROUPS, help="Comma list of feature groups.")
     mf.add_argument("--out", required=True, help="Store directory (features.parquet, meta, coverage report).")
     mf.add_argument("--membership-top-n", type=int, default=None,
                     help="Use the metric store's per-session top-N universe for X ranks and breadth (2020+, survivors only).")
@@ -9880,6 +9900,8 @@ def main(argv: "list | None" = None) -> int:
     mf.add_argument("--no-sector", action="store_true", help="The symbols are indices / ETFs: they have no sector.")
     mf.add_argument("--sector-override", action="append", metavar="SYM=Sector",
                     help="Sector for a symbol the metric store has none for (repeatable).")
+    mf.add_argument("--min-share", type=float, default=0.7,
+                    help="Coverage share under which a (group, year) is masked when the store is loaded (default 0.7).")
     mf.add_argument("--force", action="store_true", help="Rebuild even when the inputs are unchanged.")
 
     # sync-cache: push the master's cache (diff, one tar) to a configured remote worker.
