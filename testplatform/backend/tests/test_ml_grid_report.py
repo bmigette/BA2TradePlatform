@@ -93,12 +93,76 @@ def test_a_missing_baseline_fails_and_names_which_one():
     assert sum("missing baseline" in r for r in none["reasons"]) == 2          # both named
 
 
-def test_a_baseline_must_match_track_store_target_and_horizon():
-    for other in ({"horizon": 10}, {"store": "OTHER", "sig": "sig2"}, {"kind": "beats"}, {"symbols": "ndq30_x"}):
+def test_a_baseline_must_share_track_store_symbols_and_horizon():
+    for other in ({"horizon": 10}, {"store": "OTHER", "sig": "sig2"}, {"symbols": "ndq30_x"}):
         rows = baselines(**other) + cand("a")
         c = cells_of(R.gate(rows))["a"]
         assert not c["passed"] and any("missing baseline" in r for r in c["reasons"]), other
+        assert c["baselines"] == {}
     assert cells_of(R.gate(baselines(track="timing") + cand("a")))["a"]["passed"] is False      # other track's baselines
+
+
+def test_a_baseline_of_the_same_target_is_preferred_even_when_a_fallback_is_stronger():
+    rows = [mk("naive_same", 1, family="naive", reg=0.01, seeds_run=1),
+            mk("naive_other", 1, family="naive", reg=0.04, kind="beats", seeds_run=1),            # stronger, other target
+            mk("lin_same", 1, family="linear", reg=0.02, seeds_run=1),
+            mk("lin_other", 1, family="linear", reg=0.045, kind="beats", seeds_run=1)] + cand("a", reg=0.05)
+    c = cells_of(R.gate(rows))["a"]
+    assert c["baseline_keys"] == {"naive": "naive_same", "linear": "lin_same"}
+    assert all(not b["fallback"] for b in c["baselines"].values()) and c["baselines"]["naive"]["kind"] == "rel_return"
+    assert c["passed"] and R._baseline_text(c) == ""                                  # nothing to flag
+
+
+def test_with_no_baseline_of_the_cells_target_the_strongest_of_any_target_is_the_fallback():
+    rows = [mk("naive_up", 1, family="naive", reg=0.01, kind="up", track="timing", seeds_run=1),
+            mk("naive_beats", 1, family="naive", reg=0.03, kind="beats", track="timing", seeds_run=1),
+            mk("lin_up", 1, family="linear", reg=0.02, kind="up", track="timing", seeds_run=1)]
+    rows += cand("rk", track="timing", kind="rank", reg=0.05)                      # a rank cell: no baseline of its own kind
+    c = cells_of(R.gate(rows))["rk"]
+    assert c["baseline_keys"] == {"naive": "naive_beats", "linear": "lin_up"}      # the strongest naive, the only linear
+    assert c["baselines"]["naive"] == {"key": "naive_beats", "fallback": True, "kind": "beats"}
+    assert c["baselines"]["linear"] == {"key": "lin_up", "fallback": True, "kind": "up"}
+    assert c["regimes"]["2019"]["naive"] == pytest.approx(0.03) and c["regimes"]["2019"]["linear"] == pytest.approx(0.02)
+    assert c["passed"] and c["reasons"] == []
+    assert R._baseline_text(c) == "naive baseline: fallback (beats); linear baseline: fallback (up)"
+    weak = cells_of(R.gate(rows[:2] + [mk("lin_up", 1, family="linear", reg=0.06, kind="up", track="timing", seeds_run=1)]
+                           + cand("rk", track="timing", kind="rank", reg=0.05)))["rk"]
+    assert not weak["passed"] and weak["regimes_beaten"] == 0                          # the fallback is compared for real
+
+
+def test_the_fallback_never_crosses_track_store_symbols_or_horizon():
+    rows = baselines("timing", kind="up", horizon=10) + cand("a", track="timing", kind="quantile")
+    c = cells_of(R.gate(rows))["a"]
+    assert not c["passed"] and sum("missing baseline" in r for r in c["reasons"]) == 2
+    rows = baselines(kind="beats") + cand("b")                                          # same everything, other target
+    assert cells_of(R.gate(rows))["b"]["baselines"]["naive"]["fallback"] is True
+
+
+def test_each_family_is_matched_on_its_own_a_missing_one_is_still_a_reason():
+    rows = [mk("naive_same", 1, family="naive", reg=0.01, seeds_run=1)] + cand("a", reg=0.05)   # no linear anywhere
+    c = cells_of(R.gate(rows))["a"]
+    assert c["baselines"] == {"naive": {"key": "naive_same", "fallback": False, "kind": "rel_return"}}
+    assert any("missing baseline" in r and "linear" in r and "any target" in r for r in c["reasons"])
+    assert not any("naive" in r for r in c["reasons"] if "missing" in r)
+    mixed = [mk("naive_other", 1, family="naive", reg=0.01, kind="beats", seeds_run=1),
+             mk("lin_same", 1, family="linear", reg=0.02, seeds_run=1)] + cand("b", reg=0.05)
+    c = cells_of(R.gate(mixed))["b"]
+    assert c["baselines"]["naive"]["fallback"] is True and c["baselines"]["linear"]["fallback"] is False
+    assert c["passed"] and R._baseline_text(c) == "naive baseline: fallback (beats)"
+
+
+def test_a_fallback_baseline_is_shown_in_the_gate_table_the_report_and_the_dashboard(tmp_path):
+    out = tmp_path / "grid_fb2"
+    rows = [mk("naive_up", 1, family="naive", reg=0.01, kind="up", track="timing", seeds_run=1),
+            mk("lin_up", 1, family="linear", reg=0.02, kind="up", track="timing", seeds_run=1)] + \
+        cand("rk", track="timing", kind="rank", reg=0.05, groups=("t", "m"))
+    write_run(out, rows)
+    R.build_outputs(out, report=True)
+    md = (out / "report.md").read_text(encoding="utf-8")
+    gate_part = md.split("## Gate table")[1].split("\n## ")[0]
+    assert "| baseline |" in gate_part and "naive baseline: fallback (up); linear baseline: fallback (up)" in gate_part
+    html = (out / "dashboard.html").read_text(encoding="utf-8")
+    assert "naive baseline: fallback (up)" in html.split("<h2>Gate</h2>")[1]
 
 
 def test_too_few_regimes_beaten_fails_with_the_count():

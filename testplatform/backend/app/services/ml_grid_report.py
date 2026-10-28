@@ -15,6 +15,12 @@ What the rows allow, and the choices made where the design is silent (also liste
 * A regime "beats the baseline" when the cell's seed-mean regime value of the primary metric is above the baseline's in
   that regime, for every baseline found. Several baseline cells can match; those with the cell's own feature groups are
   preferred and the strongest one (highest seed-mean primary) is used.
+* A baseline is the naive / linear cell of the same track, store, symbols, target kind and horizon (its own groups
+  first, then the strongest). When a family has none for the cell's target (``rank``: no linear; ``quantile``: no
+  naive or linear; ``terciles``: no naive) the strongest cell of that family with the same track / store / symbols /
+  horizon and ANY target is the FALLBACK: the track metrics depend only on the score ranking, so it is comparable.
+  The record says which baseline was used and whether it was a fallback (``baselines``), the gate table shows
+  "<family> baseline: fallback (<kind>)". A family with no cell at all on that track / horizon is still a reason.
 * A regime "beats the shuffle control" when the cell's regime value is above that regime's null mean. Per seed the
   null is the HIGHEST of the gating controls' per-regime null means (``controls["by_regime"][regime]["null_means"]``:
   on the timing track the plain and the within-block time shuffle), and the per-seed nulls are then averaged; that is
@@ -108,15 +114,19 @@ def _cfg(row: Dict[str, Any], key: str) -> Any:
 
 
 # ================================================================== the gate
-def _match_key(row: Dict[str, Any]) -> Tuple:
+def _match_key(row: Dict[str, Any], loose: bool = False) -> Tuple:
     """What a baseline must share with a cell: track, store (its signature when the row has one), symbols, target kind
-    and horizon (and the barrier ratio, which only barrier targets use)."""
+    and horizon (and the barrier ratio, which only barrier targets use). ``loose``: without the target kind and ratio
+    (the fallback match: the track metrics depend only on the score ranking, so a baseline of another target on the
+    same track / store / symbols / horizon is comparable)."""
     ident = row["identity"] if "identity" in row and isinstance(row["identity"], dict) else {}
     sig = ident["store_signature"] if "store_signature" in ident else None
     tgt = row["config"]["target"]
     syms = _cfg(row, "symbols")
-    return (row["track"], sig if sig else _cfg(row, "store"), tuple(syms) if isinstance(syms, list) else syms,
-            tgt["kind"], tgt["horizon"], tgt["ratio"] if "ratio" in tgt and tgt["kind"] in G._BARRIER_KINDS else None)
+    base = (row["track"], sig if sig else _cfg(row, "store"), tuple(syms) if isinstance(syms, list) else syms)
+    if loose:
+        return base + (tgt["horizon"],)
+    return base + (tgt["kind"], tgt["horizon"], tgt["ratio"] if "ratio" in tgt and tgt["kind"] in G._BARRIER_KINDS else None)
 
 
 def _seed_mean_regimes(rows: Sequence[Dict[str, Any]], metric: str) -> Dict[str, float]:
@@ -271,14 +281,17 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
             excluded[c["cell_key"]] = c["reason"]
     metric_of = lambda track: G.PRIMARY[track]                                                 # noqa: E731
     # baselines: kept cells of the baseline families, by match key
-    pools: Dict[Tuple, List[Dict[str, Any]]] = {}
+    pools: Dict[Tuple, List[Dict[str, Any]]] = {}          # same target kind (exact match)
+    loose_pools: Dict[Tuple, List[Dict[str, Any]]] = {}    # any target (the fallback)
     for key, rs in by_cell.items():
         r0 = rs[0]
         if r0["config"]["family"] in BASELINE_FAMILIES and key in kept and r0["config"]["target"]["kind"] != "volatility":
             ok = [r for r in rs if r["status"] == "ok"]
-            pools.setdefault(_match_key(r0), []).append(
-                {"key": key, "family": r0["config"]["family"], "groups": tuple(r0["config"]["groups"]),
-                 "mean": float(kept[key]["mean"]), "regimes": _seed_mean_regimes(ok, metric_of(r0["track"]))})
+            item = {"key": key, "family": r0["config"]["family"], "groups": tuple(r0["config"]["groups"]),
+                    "kind": r0["config"]["target"]["kind"], "mean": float(kept[key]["mean"]),
+                    "regimes": _seed_mean_regimes(ok, metric_of(r0["track"]))}
+            pools.setdefault(_match_key(r0), []).append(item)
+            loose_pools.setdefault(_match_key(r0, loose=True), []).append(item)
     records: List[Dict[str, Any]] = []
     for key, rs in by_cell.items():
         r0 = rs[0]
@@ -293,7 +306,7 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
             "null_mean": float("nan"), "low_iter_share": None, "near_constant": False, "regimes": {},
             "whole": None, "warnings": [], "old_rows": 0, "uses_fallback": False, "regimes_beaten": 0,
             "passed": False, "survivor": False, "rank": None, "state": "fail", "reasons": [], "note": "",
-            "baseline_keys": {}}
+            "baseline_keys": {}, "baselines": {}}
         records.append(rec)
         if cfg["target"]["kind"] == "volatility":
             rec.update(state="not gated", reasons=["volatility target: a sizing model with no trading shuffle "
@@ -331,16 +344,24 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
         # --- baselines
         cell_regs = _seed_mean_regimes(ok, metric_of(track))
         pool = pools[_match_key(r0)] if _match_key(r0) in pools else []
+        loose = loose_pools[_match_key(r0, loose=True)] if _match_key(r0, loose=True) in loose_pools else []
+        strongest = lambda cs: max(cs, key=lambda b: (b["mean"] if math.isfinite(b["mean"]) else -math.inf, b["key"]))  # noqa: E731
         base: Dict[str, Dict[str, Any]] = {}
         for fam in BASELINE_FAMILIES:
             cands = [b for b in pool if b["family"] == fam]
             same = [b for b in cands if b["groups"] == tuple(cfg["groups"])]
             cands = same or cands
-            if cands:
-                base[fam] = max(cands, key=lambda b: (b["mean"] if math.isfinite(b["mean"]) else -math.inf, b["key"]))
+            if cands:                                         # 1. the cell's own target: its own groups first, then the strongest
+                base[fam] = {**strongest(cands), "fallback": False}
+                continue
+            cands = [b for b in loose if b["family"] == fam]
+            if cands:                                         # 2. any target: the strongest
+                base[fam] = {**strongest(cands), "fallback": True}
             else:
-                reasons.append(f"missing baseline: no {fam} cell with the same track / store / symbols / target / horizon")
+                reasons.append(f"missing baseline: no {fam} cell with the same track / store / symbols / horizon "
+                               f"(any target)")
         rec["baseline_keys"] = {f: b["key"] for f, b in base.items()}
+        rec["baselines"] = {f: {"key": b["key"], "fallback": b["fallback"], "kind": b["kind"]} for f, b in base.items()}
         # --- regimes
         beaten, hard = 0, False
         ctl, old_rows = _regime_controls(ok)
@@ -408,7 +429,7 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
                         "null_mean": float("nan"), "low_iter_share": None, "near_constant": False, "regimes": {},
                         "whole": None, "warnings": [], "old_rows": 0, "uses_fallback": False, "regimes_beaten": 0,
                         "passed": False, "survivor": False, "rank": None,
-                        "state": "pending" if live else "fail", "note": "", "baseline_keys": {},
+                        "state": "pending" if live else "fail", "note": "", "baseline_keys": {}, "baselines": {},
                         "reasons": ["no seed finished (errors)"], **lv})
     # --- survivors per track
     by_track: Dict[str, List[Dict[str, Any]]] = {t: [] for t in G.TRACKS}
@@ -739,6 +760,11 @@ def _regime_text(r: Dict[str, Any]) -> str:
     return f"{r['value']:+.4f} vs null {null} (p={p}){' ✓' if r['counted'] else ''}"
 
 
+def _baseline_text(c: Dict[str, Any]) -> str:
+    """"naive baseline: fallback (<kind>)" for every baseline taken from another target (empty when none was)."""
+    return "; ".join(f"{fam} baseline: fallback ({b['kind']})" for fam, b in c["baselines"].items() if b["fallback"])
+
+
 def _flag_text(c: Dict[str, Any]) -> str:
     return f"near-constant {100 * c['low_iter_share']:.0f}%" if c["near_constant"] else ""
 
@@ -776,7 +802,8 @@ def render_report(state: Dict[str, Any]) -> str:
            if p["max_low_iter_share"] is not None else "")
     out += ["", "## Gate rules", "",
             f"A candidate cell passes when, on the seed mean, it beats BOTH baselines (naive momentum and linear, same "
-            f"track / store / symbols / target / horizon) and its shuffle control in at least {p['min_regimes']} of the "
+            f"track / store / symbols / target / horizon; else the strongest of that family on the same track / store / "
+            f"symbols / horizon with any target, marked fallback) and its shuffle control in at least {p['min_regimes']} of the "
             f"{len(p['regimes'])} regimes ({', '.join(p['regimes'])}), including {' or '.join(p['hard_regimes'])}; its "
             f"primary metric is positive after {p['cost_bps']:g} bps; the shuffle control's p (median over seeds) is "
             f"at most {p['max_p']:g}. Cells are ranked by seed mean − seed std; at most {p['max_survivors']} survivors "
@@ -822,10 +849,10 @@ def render_report(state: Dict[str, Any]) -> str:
             out += ["No finished cells.", ""]
             continue
         out += [_md_table(["rank", "cell", "key", "seed mean ± std", "mean − std", "regimes beaten", "p", "result",
-                           "flags", "reasons"],
+                           "flags", "baseline", "reasons"],
                           [[c["rank"] or "", _cell_text(c), c["key"], _mean_std(c), _fmt(c["score"]),
                             f"{c['regimes_beaten']} of 6" if c["regimes"] else "", _p_text(c), c["state"].upper(),
-                            _flag_text(c), _why(c)] for c in cs]), ""]
+                            _flag_text(c), _baseline_text(c), _why(c)] for c in cs]), ""]
     out += ["## Per-regime control", "",
             "Per regime: the cell's seed-mean value of the primary metric against that regime's shuffle-control null "
             "(mean over the shuffles of the same regime metric; the control with the larger p on the timing track), "
@@ -1071,10 +1098,12 @@ def _gate_table(state: Dict[str, Any], track: str) -> str:
         else:
             beat = "&ndash;"
         why = _why(c)
+        bl = _baseline_text(c)
         rows.append(f'<tr><td>{c["rank"] or ""}</td><td class="l">{_e(_short(c))} <span class="muted small">'
                     f'{_e(c["key"])}</span></td><td>{_e(_mean_std(c))}</td><td>{_e(_fmt(c["score"]))}</td>'
                     f'<td>{beat}</td><td>{_e(_p_text(c))}</td><td class="l">{_chip(c["state"])}{_flag_chip(c)}</td>'
-                    f'<td class="wrap small">{_e(why)}</td></tr>')
+                    f'<td class="wrap small">{_e(why)}'
+                    f'{f"<br><span class=muted>{_e(bl)}</span>" if bl else ""}</td></tr>')
     head = ('<tr><th>#</th><th class="l">cell</th><th>seed mean ± std</th><th>mean − std</th><th>regimes beaten</th>'
             '<th>p</th><th class="l">gate</th><th class="l">reasons</th></tr>')
     note = (f'<p class="muted small">Showing {GATE_TABLE_MAX_ROWS} of {len(cs)} cells (best states first); '
