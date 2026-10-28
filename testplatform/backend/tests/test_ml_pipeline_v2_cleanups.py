@@ -247,3 +247,28 @@ class TestThreeClassTsai:
             progress_base=0, progress_range=1, timeframe='daily')
         assert res['status'] == 'failed'
         assert 'multistep' in res['error'] and '3 classes' in res['error']
+
+
+# ---------------------------------------------------------------------------------------
+# 6.2 no silent-zero targets
+# ---------------------------------------------------------------------------------------
+class TestUnsupportedTrendReversalIndicators:
+    @pytest.mark.parametrize('indicator', ['donchian', 'adx', 'stochastic'])
+    def test_indicator_without_a_reversal_rule_is_refused_not_all_zeros(self, indicator):
+        from app.services.darts_models import PredictionTargetService
+        df = _frame(60, np.zeros(60))
+        df['Open'] = df['High'] = df['Low'] = df['Close']
+        with pytest.raises(ValueError, match=indicator):
+            PredictionTargetService().calculate_trend_reversal(df, indicator, {'period': 14}, 30, 'bullish')
+
+    def test_supported_indicator_still_builds(self):
+        from app.services.darts_models import PredictionTargetService
+        n = 120
+        df = _frame(n, np.zeros(n))
+        close = 100 + 10 * np.sin(np.arange(n) / 4.0)
+        df['Open'] = close
+        df['High'] = close + 1
+        df['Low'] = close - 1
+        df['Close'] = close
+        out = PredictionTargetService().calculate_trend_reversal(df, 'rsi', {'period': 5}, 30, 'bullish')
+        assert len(out) == n and out.sum() > 0
