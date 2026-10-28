@@ -25,7 +25,8 @@ binary 0 / 1, multiclass 0..k-1, regression floats (standardised inside the adap
 mapped back at predict), quantile (darts) = the realised H-step return (validated, not trained on).
 
 ``sequence_data_from_panel`` builds the matrix the way the earlier search did (``ml_search.fold_data``: robust scaling
-fitted on the fold's training rows only, optional symbol one-hot, warm-up windows dropped).
+fitted on the fold's training rows only, float32 throughout, optional symbol id channel or one-hot, warm-up windows
+dropped).
 
 Determinism. Every random draw is seeded (weights, shuffling, dropout, MiniRocket kernels, Darts sampling) inside a
 ``fork_rng`` scope, so the global torch / numpy generators are left as they were. On the GPU the result is bitwise
@@ -144,17 +145,19 @@ class SequenceData:
 
 
 def sequence_data_from_panel(panel: pd.DataFrame, feats: Sequence[str], fit_rows, lookback: int, pooled: bool = False,
-                             rows=None, with_returns: bool = False,
-                             horizon_steps: Optional[int] = None) -> SequenceData:
+                             rows=None, with_returns: bool = False, horizon_steps: Optional[int] = None,
+                             symbol_encoding: str = "id") -> SequenceData:
     """``SequenceData`` of a long panel (one block per symbol, ``panel.index`` = 0..n-1, as ``ml_panel.build_panel``
-    returns it). Scaling (median / IQR, clipped at +-5) is fitted on ``fit_rows`` only; ``pooled`` appends a symbol
-    one-hot. ``rows`` are the candidate samples: those whose window reaches back into the indicator warm-up or the
+    returns it). Scaling (median / IQR, clipped at +-5) is fitted on ``fit_rows`` only; ``pooled`` appends the
+    symbol as ONE ``sym_id`` channel (index scaled to [0, 1], the default for deep models) or, with
+    ``symbol_encoding="onehot"``, a one-hot (refused above 50 symbols). ``rows`` are the candidate samples: those
+    whose window reaches back into the indicator warm-up or the
     previous symbol are DROPPED (index the labels with ``result.rows``). ``with_returns`` adds the bar log returns of
     ``close`` (the Darts target series); ``horizon_steps`` is stored for Darts."""
     from app.services import ml_search
     if not panel.index.equals(pd.RangeIndex(len(panel))):
         raise ValueError("the panel needs its positional RangeIndex (pass the full panel, not a sample_bars subset)")
-    fd = ml_search.fold_data(panel, list(feats), np.asarray(fit_rows, dtype=np.int64), pooled)
+    fd = ml_search.fold_data(panel, list(feats), np.asarray(fit_rows, dtype=np.int64), pooled, symbol_encoding)
     sym = panel["symbol"].to_numpy()
     start = np.array([fd.first_ok[s] for s in sym], dtype=np.int64)
     ret = None

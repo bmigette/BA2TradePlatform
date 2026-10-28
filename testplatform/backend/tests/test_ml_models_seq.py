@@ -164,11 +164,59 @@ def test_from_panel_scales_on_the_fit_rows_only_and_drops_warm_up_windows():
     np.testing.assert_allclose(sd2.returns[251], np.log(panel["close"].iloc[251] / panel["close"].iloc[250]))
 
 
-def test_from_panel_pooled_adds_a_symbol_one_hot():
+def test_from_panel_pooled_adds_a_symbol_one_hot_when_asked():
     panel = _panel(n_sym=2, n=120)
     sd = MS.sequence_data_from_panel(panel, ["f0", "f2"], np.arange(0, 100), lookback=8, pooled=True,
-                                     rows=np.arange(120, 240))
+                                     symbol_encoding="onehot", rows=np.arange(120, 240))
     assert sd.channels == ("f0", "f2", "sym_S0", "sym_S1") and sd.features[130, 2:].tolist() == [0.0, 1.0]
+
+
+def test_from_panel_pooled_defaults_to_one_symbol_id_channel_scaled_to_unit_interval():
+    panel = _panel(n_sym=5, n=120)
+    sd = MS.sequence_data_from_panel(panel, ["f0", "f2"], np.arange(0, 100), lookback=8, pooled=True,
+                                     rows=np.arange(0, 600))
+    assert sd.channels == ("f0", "f2", "sym_id") and sd.n_channels == 3
+    ids = sd.features[:, 2]
+    np.testing.assert_allclose([ids[i * 120] for i in range(5)], [0.0, 0.25, 0.5, 0.75, 1.0])
+    assert all(len(set(ids[i * 120:(i + 1) * 120])) == 1 for i in range(5))              # constant within a symbol
+    single = MS.sequence_data_from_panel(_panel(n_sym=1, n=120), ["f0"], np.arange(0, 100), lookback=8, pooled=True)
+    assert single.features[:, 1].tolist() == [0.0] * 120
+    plain = MS.sequence_data_from_panel(panel, ["f0", "f2"], np.arange(0, 100), lookback=8)
+    assert plain.channels == ("f0", "f2")                                                # not pooled: no symbol channel
+    with pytest.raises(ValueError, match="symbol_encoding"):
+        MS.sequence_data_from_panel(panel, ["f0"], np.arange(0, 100), lookback=8, pooled=True, symbol_encoding="emb")
+
+
+def test_pooled_one_hot_is_refused_above_fifty_symbols_but_the_id_channel_is_not():
+    from app.services import ml_search
+    ok = _panel(n_sym=50, n=30)
+    assert ml_search.fold_data(ok, ["f0"], np.arange(0, 600), True).X.shape == (1500, 51)
+    big = _panel(n_sym=51, n=30)
+    with pytest.raises(ValueError, match="50"):
+        ml_search.fold_data(big, ["f0"], np.arange(0, 600), True)
+    assert ml_search.fold_data(big, ["f0"], np.arange(0, 600), True, symbol_encoding="id").X.shape == (1530, 2)
+
+
+def test_fold_data_builds_float32_without_a_float64_copy_of_the_matrix():
+    import tracemalloc
+    from app.services import ml_search
+    rng = np.random.default_rng(0)
+    n, c = 150_000, 40
+    panel = pd.DataFrame(rng.normal(size=(n, c)) * 5 + 2, columns=[f"f{j}" for j in range(c)])
+    panel["symbol"] = np.repeat(["A", "B", "C"], n // 3)
+    feats = [f"f{j}" for j in range(c)]
+    fit = np.arange(0, n // 3)
+    tracemalloc.start()
+    fd = ml_search.fold_data(panel, feats, fit, False)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    x32 = n * c * 4
+    assert fd.X.dtype == np.float32 and fd.X.shape == (n, c)
+    assert peak < 2.5 * x32, (peak / x32)                                              # float64 steps would be >= 6 x
+    raw = panel[feats].to_numpy(dtype=np.float64)                                     # the float64 reference
+    med = np.median(raw[fit], 0)
+    iqr = np.percentile(raw[fit], 75, 0) - np.percentile(raw[fit], 25, 0)
+    np.testing.assert_allclose(fd.X, np.clip((raw - med) / iqr, -5, 5), atol=2e-5)
 
 
 def test_from_panel_needs_a_positional_index():

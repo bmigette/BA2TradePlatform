@@ -274,34 +274,67 @@ class FoldData:
     channels: List[str]
 
 
-def _first_finite_rows(panel: pd.DataFrame, feats: Sequence[str]) -> Dict[str, int]:
-    ok = np.isfinite(panel[list(feats)].to_numpy(dtype=np.float64)).all(1)
+def _first_finite_rows(panel: pd.DataFrame, ok: np.ndarray) -> Dict[str, int]:
+    """First panel row of each symbol whose features are all finite (``ok`` = per-row finite mask)."""
     out = {}
-    for sym, g in panel.groupby("symbol", sort=False):
-        bad = np.flatnonzero(~ok[g.index.values])
+    names = panel["symbol"].to_numpy()
+    for sym in dict.fromkeys(names):
+        rows = np.flatnonzero(names == sym)               # positional rows (no per-symbol copy of the frame)
+        bad = np.flatnonzero(~ok[rows])
         # non-finite features are allowed in the warm-up only: a contiguous block from the symbol's first row
-        if len(bad) and (bad[-1] != len(bad) - 1 or bad[-1] >= len(g) - 1):
+        if len(bad) and (bad[-1] != len(bad) - 1 or bad[-1] >= len(rows) - 1):
             raise MP.PanelDataError(f"{sym}: non-finite features after the warm-up (rows {bad[-3:]})")
-        out[sym] = int(g.index.values[len(bad)])
+        out[sym] = int(rows[len(bad)])
     return out
 
 
-def fold_data(panel: pd.DataFrame, feats: Sequence[str], fit_rows: np.ndarray, pooled: bool) -> FoldData:
-    raw = panel[list(feats)].to_numpy(dtype=np.float64)
-    fit = raw[fit_rows]
-    med = np.nanmedian(fit, 0)
-    iqr = np.nanpercentile(fit, 75, 0) - np.nanpercentile(fit, 25, 0)
-    iqr = np.where(iqr > 1e-12, iqr, np.nanstd(fit, 0) + 1e-12)
-    X = np.clip((raw - med) / iqr, -5, 5)
-    X = np.nan_to_num(X, nan=0.0)            # warm-up rows only; never inside a used window (first_ok)
+#: pooled one-hot symbol channels are refused above this many symbols (a 500-symbol one-hot is 500 constant-per-symbol
+#: channels in every window); use ``symbol_encoding="id"`` for large universes
+MAX_ONEHOT_SYMBOLS = 50
+SYMBOL_ENCODINGS = ("onehot", "id")
+
+
+def fold_data(panel: pd.DataFrame, feats: Sequence[str], fit_rows: np.ndarray, pooled: bool,
+              symbol_encoding: str = "onehot") -> FoldData:
+    """Scaled float32 feature matrix of the whole panel. The scaling (median / IQR) is fitted on ``fit_rows`` one column
+    at a time and applied in place on a float32 matrix, so a 500k x 360 panel never exists as float64. ``pooled``
+    appends the symbol: a one-hot (``symbol_encoding="onehot"``, at most MAX_ONEHOT_SYMBOLS symbols) or ONE ``sym_id``
+    channel, the symbol's index scaled to [0, 1] (``"id"``)."""
+    if symbol_encoding not in SYMBOL_ENCODINGS:
+        raise ValueError(f"symbol_encoding must be one of {SYMBOL_ENCODINGS}, got {symbol_encoding!r}")
+    feats = list(feats)
+    syms = list(dict.fromkeys(panel["symbol"]))
+    if pooled and symbol_encoding == "onehot" and len(syms) > MAX_ONEHOT_SYMBOLS:
+        raise ValueError(f"pooled one-hot symbol channels are limited to {MAX_ONEHOT_SYMBOLS} symbols "
+                         f"({len(syms)} given); use symbol_encoding='id'")
+    fit_rows = np.asarray(fit_rows, dtype=np.int64)
+    X = np.empty((len(panel), len(feats)), dtype=np.float32)
+    med = np.empty(len(feats))
+    iqr = np.empty(len(feats))
+    for j, c in enumerate(feats):
+        X[:, j] = panel[c].to_numpy(dtype=np.float32)
+        col = X[fit_rows, j].astype(np.float64)
+        med[j] = np.nanmedian(col)
+        q75, q25 = np.nanpercentile(col, [75, 25])
+        spread = q75 - q25
+        iqr[j] = spread if spread > 1e-12 else np.nanstd(col) + 1e-12
+    ok = np.isfinite(X).all(1)
+    X -= med.astype(np.float32)
+    X /= iqr.astype(np.float32)
+    np.clip(X, -5, 5, out=X)
+    np.putmask(X, np.isnan(X), 0.0)                # warm-up rows only; never inside a used window (first_ok)
     channels = list(feats)
     if pooled:
-        syms = list(dict.fromkeys(panel["symbol"]))
-        oh = (panel["symbol"].to_numpy()[:, None] == np.array(syms)[None, :]).astype(np.float64)
-        X = np.concatenate([X, oh], 1)
-        channels += [f"sym_{s}" for s in syms]
-    return FoldData(X.astype(np.float32), _first_finite_rows(panel, feats),
-                    {"median": med.tolist(), "iqr": iqr.tolist()}, channels)
+        codes = pd.Index(syms).get_indexer(panel["symbol"])
+        if symbol_encoding == "onehot":
+            oh = (codes[:, None] == np.arange(len(syms))[None, :]).astype(np.float32)
+            X = np.concatenate([X, oh], 1)
+            channels += [f"sym_{s}" for s in syms]
+        else:
+            ident = codes / max(len(syms) - 1, 1)
+            X = np.concatenate([X, ident[:, None].astype(np.float32)], 1)
+            channels.append("sym_id")
+    return FoldData(X, _first_finite_rows(panel, ok), {"median": med.tolist(), "iqr": iqr.tolist()}, channels)
 
 
 def usable(panel: pd.DataFrame, rows: np.ndarray, lookback: int, first_ok: Dict[str, int]) -> np.ndarray:
