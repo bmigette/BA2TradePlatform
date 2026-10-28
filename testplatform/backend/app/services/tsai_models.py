@@ -391,9 +391,15 @@ class TSAIModelService(IModelService):
                 c_in=c_in, c_out=c_out, seq_len=seq_len,
             )
         elif model_type == 'minirocket':
-            # MiniRocket - use the base model directly
+            # MiniRocket = frozen random-kernel feature extractor (``backbone``) + BatchNorm/Linear ``head``. Only the
+            # head has trainable parameters, and the backbone's data-dependent biases must be set with
+            # ``model.fit(X_sample)`` BEFORE training (otherwise the first forward pass fits them silently on
+            # whatever batch comes first). ml_models_seq.TsaiAdapter does that.
             model = model_class(
                 c_in=c_in, c_out=c_out, seq_len=seq_len,
+                num_features=p.get('num_features', 10000),
+                fc_dropout=p.get('fc_dropout', 0),
+                random_state=p.get('random_state'),
             )
         elif model_type == 'patchtst':
             # PatchTST for classification - ensure patch_len divides evenly into seq_len

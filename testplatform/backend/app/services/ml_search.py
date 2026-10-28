@@ -314,13 +314,9 @@ def usable(panel: pd.DataFrame, rows: np.ndarray, lookback: int, first_ok: Dict[
 
 # ------------------------------------------------------------------ tsai classifiers
 def _tsai_params(arch: str, s: Setup) -> Dict[str, Any]:
-    if arch == "inception":
-        return {"nf": s.width // 2, "depth": 6, "ks": min(40, s.lookback)}
-    if arch == "tst":
-        return {"d_model": s.width, "n_heads": 4, "d_ff": 2 * s.width, "n_layers": 2, "dropout": s.dropout}
-    if arch == "lstm_fcn":
-        return {"hidden_size": s.width, "rnn_layers": 1, "cell_dropout": s.dropout, "fc_dropout": s.dropout}
-    raise ValueError(f"unknown tsai arch {arch!r}")
+    """Network parameters of ``arch`` for the setup (one definition, shared with ``ml_models_seq.TsaiAdapter``)."""
+    from app.services.ml_models_seq import arch_params
+    return arch_params(arch, s.width, s.dropout, s.lookback)
 
 
 def _tsai_task(spec: MT.TargetSpec) -> Tuple[int, str]:

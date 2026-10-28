@@ -22,7 +22,12 @@ Tasks and what ``predict`` returns:
 labels are); regression / rank -> the prediction; quantile -> the median (alpha 0.5); naive -> its feature column.
 
 Families: ``lgbm``, ``xgb``, ``catboost``, ``linear`` (a robust-scaled logistic / ridge baseline) and ``naive`` (no
-fit: one named feature column returned as the score; the benchmark every model has to beat).
+fit: one named feature column returned as the score; the benchmark every model has to beat). Two more families take
+WINDOWS of past bars instead of a flat row and live in ``app.services.ml_models_seq`` (loaded on first use by
+``make_adapter``): ``tsai`` (GPU classifiers / regressors: inception, tst, lstm_fcn, minirocket, patchtst, tcn,
+resnet) and ``darts`` (N-HiTS / N-BEATS / TCN / TFT quantile forecasters whose score is P(up)). Their ``X`` is a
+``SequenceData`` (see that module), not a matrix; everything else (``fit`` / ``predict`` / ``score`` / ``score_kind``,
+``DEFAULTS``, param validation, the unfitted-after-a-failed-fit rule, the refusals) is the same.
 
 Determinism: every stochastic family takes the seed and runs deterministically (LightGBM ``deterministic`` +
 ``force_row_wise``; XGBoost / CatBoost seeded, ``hist`` / CPU). Row and column subsampling are on by default
@@ -68,7 +73,11 @@ SUPPORTED_TASKS: Dict[str, Tuple[str, ...]] = {
     "linear": ("binary", "multiclass", "regression"),
     # the naive column is a score, not a probability: it can stand in for a point forecast / ranking / binary score
     "naive": ("binary", "regression", "rank"),
+    "tsai": ("binary", "multiclass", "regression"),
+    "darts": ("quantile",),
 }
+#: families whose ``X`` is a ``ml_models_seq.SequenceData`` (windows) instead of a feature matrix
+SEQUENCE_FAMILIES: Tuple[str, ...] = ("tsai", "darts")
 
 #: explicit hyper-parameter defaults per family; ``params`` overrides a subset (unknown keys are refused). Declared
 #: here, never defaulted in a ``.get``, so a grid cell's configuration is readable in one place.
@@ -82,15 +91,27 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
                  "l2_leaf_reg": 3.0, "subsample": 0.8},
     "linear": {"C": 1.0, "max_iter": 2000, "alpha": 1.0},
     "naive": {"column": "t_ret_20"},
+    # tsai: ``arch`` one of ml_models_seq.TSAI_ARCHS; ``width`` is the architecture's main size (nf = width / 2 for
+    # inception, d_model for tst / patchtst, hidden size for lstm_fcn, filters for tcn; resnet and minirocket have
+    # none); ``class_weights`` "none" | "balanced" (classification only); ``device`` "auto" | "cuda" | "cpu";
+    # ``rocket_features`` is the MiniRocket feature count (about; it is rounded to the kernel grid)
+    "tsai": {"arch": "inception", "width": 64, "dropout": 0.1, "lr": 1e-3, "epochs": 20, "batch_size": 512,
+             "patience": 3, "weight_decay": 1e-2, "grad_clip": 1.0, "class_weights": "none", "device": "auto",
+             "rocket_features": 10000},
+    # darts: ``arch`` one of ml_models_seq.DARTS_ARCHS; ``num_samples`` = sampled paths per forecast (the deciles
+    # are percentiles of the summed paths)
+    "darts": {"arch": "nhits", "width": 64, "dropout": 0.1, "lr": 1e-3, "epochs": 10, "batch_size": 256,
+              "patience": 3, "num_samples": 200, "device": "auto"},
 }
 
 # value rules for ``params`` (every key in DEFAULTS that is not listed here is a free-form string, i.e. ``column``)
 _POS_INT = {"n_estimators", "num_leaves", "early_stopping_rounds", "min_child_samples", "rank_eval_at", "max_depth",
-            "depth", "max_iter"}
+            "depth", "max_iter", "width", "epochs", "batch_size", "patience", "rocket_features", "num_samples"}
 _NONNEG_INT = {"subsample_freq"}
-_POS_FLOAT = {"learning_rate", "C", "alpha"}
+_POS_FLOAT = {"learning_rate", "C", "alpha", "lr", "grad_clip"}
+_DROPOUT = {"dropout"}                                              # [0, 1)
 _UNIT_FLOAT = {"subsample", "colsample_bytree"}                     # (0, 1]
-_NONNEG_FLOAT = {"reg_lambda", "min_child_weight", "l2_leaf_reg"}
+_NONNEG_FLOAT = {"reg_lambda", "min_child_weight", "l2_leaf_reg", "weight_decay"}
 
 
 class UnsupportedTaskError(ValueError):
@@ -119,6 +140,8 @@ def _check_params(family: str, params: Dict[str, Any]) -> None:
             ok, rule = _is_real(v) and 0 < v <= 1, "a number in (0, 1]"
         elif k in _NONNEG_FLOAT:
             ok, rule = _is_real(v) and v >= 0, "a finite number >= 0"
+        elif k in _DROPOUT:
+            ok, rule = _is_real(v) and 0 <= v < 1, "a number in [0, 1)"
         else:
             ok, rule = isinstance(v, str) and bool(v), "a non-empty string"
         if not ok:
@@ -171,6 +194,24 @@ def _check_groups(groups, n: int, where: str) -> np.ndarray:
     if (g <= 0).any() or int(g.sum()) != n:
         raise ValueError(f"{where}: groups must be positive and sum to the {n} rows (got sum {int(g.sum())})")
     return g
+
+
+def _check_classes(task: str, yt: np.ndarray, yv: np.ndarray) -> Optional[int]:
+    """Class-label rules of binary / multiclass (``None`` for the other tasks); returns the class count."""
+    if task not in ("binary", "multiclass"):
+        return None
+    k = int(yt.max()) + 1
+    if task == "binary" and (k > 2 or (yv.size and yv.max() > 1)):
+        raise ValueError("binary labels must be 0 / 1 (map the ml_targets 0 / 2 labels first)")
+    present = np.unique(yt)
+    if task == "multiclass" and (k < 3 or len(present) != k):
+        raise ValueError(f"multiclass needs >= 3 classes, all of 0..k-1 present in y_train "
+                         f"(present: {present.tolist()})")
+    if task == "binary" and len(present) != 2:
+        raise ValueError("binary y_train must contain both classes")
+    if task == "multiclass" and yv.size and int(yv.max()) >= k:
+        raise ValueError("y_val has a class absent from y_train")
+    return 2 if task == "binary" else k
 
 
 class ModelAdapter:
@@ -241,19 +282,7 @@ class ModelAdapter:
                 gv = None if no_val else _check_groups(groups_val, len(Xv), "groups_val")
                 if yt.max() > 30 or (yv.size and yv.max() > 30):
                     raise ValueError("rank relevance labels must be in 0..30 (LightGBM's default label gain)")
-            if task in ("binary", "multiclass"):
-                k = int(yt.max()) + 1
-                if task == "binary" and (k > 2 or (yv.size and yv.max() > 1)):
-                    raise ValueError("binary labels must be 0 / 1 (map the ml_targets 0 / 2 labels first)")
-                present = np.unique(yt)
-                if task == "multiclass" and (k < 3 or len(present) != k):
-                    raise ValueError(f"multiclass needs >= 3 classes, all of 0..k-1 present in y_train "
-                                     f"(present: {present.tolist()})")
-                if task == "binary" and len(present) != 2:
-                    raise ValueError("binary y_train must contain both classes")
-                if task == "multiclass" and yv.size and int(yv.max()) >= k:
-                    raise ValueError("y_val has a class absent from y_train")
-                n_classes = 2 if task == "binary" else k
+            n_classes = _check_classes(task, yt, yv)
         self._fit(Xt, yt, Xv, yv, task, int(seed), gt, gv, names)
         # reached only when the library fit succeeded
         self.task, self.seed = task, int(seed)
@@ -511,8 +540,11 @@ _FAMILIES = {"lgbm": LGBMAdapter, "xgb": XGBAdapter, "catboost": CatBoostAdapter
 
 
 def make_adapter(family: str, n_jobs: int = 1, params: Optional[Dict[str, Any]] = None, **kwargs) -> ModelAdapter:
-    """Adapter of ``family`` ('lgbm' | 'xgb' | 'catboost' | 'linear' | 'naive'); ``kwargs`` go to the class
-    (``missing_indicators`` for linear)."""
+    """Adapter of ``family`` ('lgbm' | 'xgb' | 'catboost' | 'linear' | 'naive' | 'tsai' | 'darts'); ``kwargs`` go to
+    the class (``missing_indicators`` for linear). The sequence families import torch, so they load on first use."""
+    if family in SEQUENCE_FAMILIES:
+        from app.services import ml_models_seq
+        return ml_models_seq.SEQUENCE_ADAPTERS[family](n_jobs=n_jobs, params=params, **kwargs)
     if family not in _FAMILIES:
-        raise ValueError(f"unknown model family {family!r}; known {sorted(_FAMILIES)}")
+        raise ValueError(f"unknown model family {family!r}; known {sorted(_FAMILIES) + list(SEQUENCE_FAMILIES)}")
     return _FAMILIES[family](n_jobs=n_jobs, params=params, **kwargs)
