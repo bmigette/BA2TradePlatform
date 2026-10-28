@@ -152,7 +152,7 @@ const getDefaultWizardData = (): WizardData => ({
     enabled: false,
     statementTypes: ['balance_sheet', 'income_statement', 'cash_flow'],
     lookbackStatements: 2,  // Include last 2 statement periods
-    macroIndicators: ['interest_rate', 'gdp', 'inflation', 'unemployment'],
+    macroIndicators: ['interest_rate', 'inflation', 'unemployment'],  // GDP: no first-release cache series, the backend refuses it
     fundamentalsProviders: ['yfinance', 'fmp', 'alphavantage'],  // Priority order
     macroProvider: 'fred'
   }
@@ -196,7 +196,8 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         enabled: savedFundamentals.enabled || false,
         statementTypes: savedFundamentals.statementTypes || savedFundamentals.statement_types || savedFundamentals.metrics || ['balance_sheet', 'income_statement', 'cash_flow'],
         lookbackStatements: savedFundamentals.lookbackStatements || savedFundamentals.lookback_statements || 2,
-        macroIndicators: savedFundamentals.macroIndicators || savedFundamentals.macro_indicators || ['interest_rate', 'gdp', 'inflation', 'unemployment'],
+        macroIndicators: (savedFundamentals.macroIndicators || savedFundamentals.macro_indicators || ['interest_rate', 'inflation', 'unemployment'])
+          .filter((id: string) => id !== 'gdp'),  // saved configs from before GDP was withdrawn
         fundamentalsProviders: savedFundamentals.fundamentalsProviders || savedFundamentals.fundamentals_providers ||
           (savedFundamentals.fundamentals_provider ? [savedFundamentals.fundamentals_provider] : ['yfinance', 'fmp', 'alphavantage']),
         macroProvider: savedFundamentals.macroProvider || savedFundamentals.macro_provider || 'fred'
@@ -1691,7 +1692,6 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
             <div className="grid grid-cols-2 gap-2">
               {[
                 { id: 'interest_rate', label: 'Interest Rates' },
-                { id: 'gdp', label: 'GDP Growth' },
                 { id: 'inflation', label: 'Inflation Rate (CPI)' },
                 { id: 'unemployment', label: 'Unemployment Rate' }
               ].map(indicator => (

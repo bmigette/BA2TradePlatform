@@ -360,3 +360,110 @@ class TestBalancedAccuracy:
         m = svc.assess_model(Fixed(), (np.zeros((4, 1, 3), dtype=np.float32), y), prediction_mode='multistep')
         # horizon 1: predicts 1,1,1,0 vs 1,0,0,1 -> recall(1)=1/2, recall(0)=0 ; horizon 2: 0,0,0,1 vs 0,0,0,1 -> 1
         assert m['balanced_accuracy'] == pytest.approx((0.25 + 1.0) / 2)
+
+
+# ---------------------------------------------------------------------------------------
+# 6.4 wizard macro reads first-release FRED values
+# ---------------------------------------------------------------------------------------
+@pytest.fixture
+def fred_cache(tmp_path, monkeypatch):
+    """A temp FRED cache the first-release reader (ba2_providers) is pointed at."""
+    import json
+    from ba2_providers.macro import fred_series as fs
+
+    monkeypatch.setattr(fs, 'CACHE_FOLDER', str(tmp_path))
+    fs.reset_cache()
+
+    def write(series_id, observations):
+        os.makedirs(os.path.join(fs.CACHE_FOLDER, 'fred'), exist_ok=True)
+        doc = {'series_id': series_id, 'fetched_at': pd.Timestamp.now(tz='UTC').isoformat(),
+               'availability': fs.AVAIL_FIRST_RELEASE, 'format': fs.CACHE_FORMAT_FIRST_RELEASE,
+               'first_vintage': '2000-01-03', 'observations': observations}
+        with open(fs.cache_path(series_id), 'w', encoding='utf-8') as fh:
+            json.dump(doc, fh)
+
+    yield write
+    fs.reset_cache()
+
+
+def _rows(dates):
+    return pd.DataFrame({'Date': pd.to_datetime(dates), 'Close': 1.0})
+
+
+class TestMacroFirstRelease:
+    def _svc(self):
+        from app.services.macro import MacroService
+        return MacroService(api_key='unused')
+
+    def test_a_revised_observation_is_seen_only_after_its_second_vintage(self, fred_cache):
+        fred_cache('UNRATE', [
+            {'date': '2023-12-01', 'value': '3.7', 'realtime_start': '2024-01-05'},
+            {'date': '2024-01-01', 'value': '3.9', 'realtime_start': '2024-02-02'},   # first release
+            {'date': '2024-01-01', 'value': '4.0', 'realtime_start': '2024-03-08'},   # second vintage
+        ])
+        out = self._svc().integrate_macro_with_ohlc(
+            _rows(['2024-02-01', '2024-02-02', '2024-03-07', '2024-03-08']), ['unemployment'])
+        # 02-01 decides before January's release (3.7 still in force); 02-02 sees the first value;
+        # 03-07 is still before the second vintage; 03-08 is after it
+        assert out['unemployment'].tolist() == [3.7, 3.9, 3.9, 4.0]
+
+    def test_value_is_not_visible_on_its_observation_date(self, fred_cache):
+        fred_cache('CPIAUCSL', [
+            {'date': '2024-02-01', 'value': '310.0', 'realtime_start': '2024-03-12'},
+            {'date': '2024-03-01', 'value': '312.0', 'realtime_start': '2024-04-10'},
+        ])
+        out = self._svc().integrate_macro_with_ohlc(
+            _rows(['2024-03-05', '2024-03-20', '2024-04-09', '2024-04-10', '2024-04-20']), ['inflation'])
+        # March's 312 was published 04-10: bar 04-09 decides on 04-10 (not yet visible), bar 04-10 on 04-11
+        assert np.isnan(out['inflation'].iloc[0])
+        assert out['inflation'].iloc[1:].tolist() == [310.0, 310.0, 312.0, 312.0]
+
+    def test_column_names_yoy_and_days_since(self, fred_cache):
+        obs = [{'date': f'2023-{m:02d}-01', 'value': str(100.0 + m), 'realtime_start': f'2023-{m:02d}-20'}
+               for m in range(1, 13)]
+        obs += [{'date': '2024-01-01', 'value': '120.0', 'realtime_start': '2024-01-20'},
+                {'date': '2024-02-01', 'value': '121.0', 'realtime_start': '2024-02-20'}]
+        fred_cache('CPIAUCSL', obs)
+        out = self._svc().integrate_macro_with_ohlc(_rows(['2024-02-27']), ['inflation'])
+        assert {'inflation', 'inflation_yoy_change', 'inflation_days_since'} <= set(out.columns)
+        assert out['inflation'].iloc[0] == 121.0
+        assert out['inflation_yoy_change'].iloc[0] == pytest.approx((121.0 / 102.0 - 1) * 100)
+        assert out['inflation_days_since'].iloc[0] == 26      # 2024-02-01 -> 2024-02-27
+
+    def test_intraday_bars_of_one_day_share_one_value(self, fred_cache):
+        fred_cache('VIXCLS', [
+            {'date': '2024-03-04', 'value': '14.0', 'realtime_start': '2024-03-05'},
+            {'date': '2024-03-05', 'value': '25.0', 'realtime_start': '2024-03-06'},
+        ])
+        bars = ['2024-03-06 09:30', '2024-03-06 15:30', '2024-03-07 09:30']
+        out = self._svc().integrate_macro_with_ohlc(_rows(bars), ['vix'])
+        assert out['vix'].tolist() == [14.0, 14.0, 25.0]
+
+    def test_a_series_without_a_cache_file_is_refused_with_the_expected_file(self, fred_cache):
+        from ba2_providers.macro import fred_series as fs
+        with pytest.raises(fs.MacroAvailabilityUnknown, match=r'CPIAUCSL\.json'):
+            self._svc().integrate_macro_with_ohlc(_rows(['2024-03-05']), ['inflation'])
+
+    @pytest.mark.parametrize('indicator,series', [('gdp', 'GDP'), ('yield_2y', 'DGS2')])
+    def test_indicators_with_no_cache_series_are_refused(self, fred_cache, indicator, series):
+        with pytest.raises(ValueError, match=f'{series}.*no first-release cache file'):
+            self._svc().integrate_macro_with_ohlc(_rows(['2024-03-05']), [indicator])
+
+    def test_yield_curve_needs_the_cached_2y_and_is_refused_without_it(self, fred_cache):
+        fred_cache('DGS10', [{'date': '2024-03-04', 'value': '4.2', 'realtime_start': '2024-03-05'}])
+        with pytest.raises(ValueError, match='DGS2'):
+            self._svc().create_yield_curve_features(_rows(['2024-03-06']))
+
+    def test_no_live_fred_fetch_and_no_api_key_for_dataset_features(self, fred_cache, monkeypatch):
+        import requests
+        from app.services.macro import MacroService
+        fred_cache('UNRATE', [{'date': '2024-01-01', 'value': '3.9', 'realtime_start': '2024-02-02'}])
+        monkeypatch.setattr(requests, 'get', lambda *a, **k: pytest.fail('network used'))
+        monkeypatch.delenv('FRED_API_KEY', raising=False)
+        out = MacroService().integrate_macro_with_ohlc(_rows(['2024-02-05']), ['unemployment'])
+        assert out['unemployment'].iloc[0] == 3.9
+
+    def test_every_indicator_names_its_fred_series(self):
+        from app.services.macro import MacroService
+        for name, cfg in MacroService.MACRO_INDICATORS.items():
+            assert cfg['series'] and cfg['yoy_periods'] >= 1, name
