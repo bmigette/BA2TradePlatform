@@ -677,7 +677,11 @@ def daily_fold_rows(df: pd.DataFrame, fold: Fold, horizon: int, target_col: str)
     ``rel_ret_5``, ``up_5``, ``ret_5``). Both parts keep only rows where ``target_col`` AND ``atr_pct`` are finite
     (a row with no outcome, or one the symbol could not be decided on, is neither trained on nor scored). A training
     row's target session ``target_end_H`` must also lie BEFORE the prediction block (the purge gap of one horizon);
-    prediction rows are the sessions of the block. ``horizon`` is the target's horizon (it picks ``target_end_H``)."""
+    prediction rows are the sessions of the block. ``horizon`` is the target's horizon (it picks ``target_end_H``); a ``target_col`` of another horizon
+    (``rel_ret_5`` with horizon 10) is refused."""
+    if not target_col.endswith(f"_{horizon}"):
+        raise ValueError(f"target column {target_col!r} is not a horizon-{horizon} target (its name must end in "
+                         f"'_{horizon}'): the purge would use a different horizon than the target looks ahead")
     if target_col not in df.columns:
         raise KeyError(f"daily targets lack {target_col!r}")
     day = df.index.get_level_values("session").normalize()

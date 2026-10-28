@@ -505,6 +505,19 @@ def test_daily_fold_rows_keep_only_rows_with_a_finite_target_and_atr(tg):
         T.daily_fold_rows(tg, fold, h, "nope")
 
 
+def test_daily_fold_rows_refuse_a_target_of_another_horizon(tg):
+    fold = T.Fold("F", date(2024, 1, 2), date(2024, 3, 1), date(2024, 3, 29))
+    with pytest.raises(ValueError, match="horizon"):
+        T.daily_fold_rows(tg, fold, 10, "rel_ret_5")           # purged with 10 sessions but trained on a 5-session target
+    with pytest.raises(ValueError, match="horizon"):
+        T.daily_fold_rows(tg, fold, 5, "rel_ret_10")
+    with pytest.raises(ValueError, match="horizon"):
+        T.daily_fold_rows(tg, fold, 5, "atr_pct")              # not a horizon target at all
+    with pytest.raises(ValueError, match="horizon"):
+        T.daily_fold_rows(tg, fold, 1, "ret_11")               # a suffix match is not enough: "_1" vs "_11"
+    T.daily_fold_rows(tg, fold, 10, "rel_ret_10")
+
+
 # ------------------------------------------------------------------ class balance
 def test_check_balance_min_count_mode():
     spec = T.TargetSpec("triple_barrier", 5)
