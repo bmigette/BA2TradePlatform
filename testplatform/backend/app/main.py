@@ -315,7 +315,10 @@ async def startup_event():
     # Custom ML model search (stage A): trains in its own worker processes on the GPU (ml_search.py).
     from app.services.ml_search import handle_ml_model_search
     task_queue.register_handler('ml_model_search', handle_ml_model_search)
-    logger.info("Registered main task handlers: dataset_regeneration, news_batch_fetch, daily_backtest, strategy_optimization, build_screener_metrics, build_options, prewarm, ml_model_search")
+    # ML exploration v2 stage-1 grid (cells x seeds on out-of-sample walk-forward signals; ml_grid.py).
+    from app.services.ml_grid import handle_ml_grid
+    task_queue.register_handler('ml_grid', handle_ml_grid)
+    logger.info("Registered main task handlers: dataset_regeneration, news_batch_fetch, daily_backtest, strategy_optimization, build_screener_metrics, build_options, prewarm, ml_model_search, ml_grid")
 
     # Initialize dedicated training queue (2 workers — keeps GPU from being overloaded)
     init_training_task_queue(max_workers=2)

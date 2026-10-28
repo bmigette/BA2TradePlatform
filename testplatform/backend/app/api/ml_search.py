@@ -6,6 +6,7 @@ Mirrors the ``ba2-test ml-search`` CLI. Poll progress via ``GET /api/tasks/{task
 import logging
 from datetime import date
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -50,3 +51,37 @@ def start_model_search(req: MlModelSearchRequest):
         description="Stage-A custom ML model search (MAG7 H1/M15, 2025 folds)", timeout_seconds=72 * 3600)
     logger.info(f"ml_model_search enqueued task {task_id}")
     return {"task_id": task_id}
+
+
+class MlGridRequest(BaseModel):
+    """Exactly one of ``config_path`` (a JSON file of cells) and ``cells`` (the cell objects themselves)."""
+    out_dir: str
+    config_path: Optional[str] = None
+    cells: Optional[List[Dict[str, Any]]] = None
+    cpu_slots: int
+    gpu_slots: int = 0
+    limit_cells: Optional[int] = None
+    cache_root: Optional[str] = None
+    cores: Optional[int] = None
+    settings: Optional[Dict[str, Any]] = None
+
+
+@router.post("/grid")
+def start_grid(req: MlGridRequest):
+    """Validate the cells (strict; a locked symbol is a 400) and enqueue the stage-1 grid (task ``ml_grid``).
+    Mirrors ``ba2-test ml-grid``; results land in ``out_dir`` (results.jsonl, predictions/, errors.jsonl)."""
+    from app.services.ml_grid import GridSettings, load_cells
+    from app.services.ml_holdout import LockedSymbolError
+    if bool(req.config_path) == (req.cells is not None):
+        raise HTTPException(status_code=400, detail="pass exactly one of config_path and cells")
+    try:
+        cells = load_cells(req.config_path if req.config_path else req.cells)
+        GridSettings.from_dict(req.settings)
+    except (ValueError, LockedSymbolError, OSError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    payload = req.model_dump()
+    task_id = get_task_queue().queue_task(
+        task_type="ml_grid", name=f"ML grid: {req.out_dir}", payload=payload,
+        description=f"ML exploration v2 stage-1 grid: {len(cells)} cells", timeout_seconds=7 * 24 * 3600)
+    logger.info(f"ml_grid enqueued task {task_id}")
+    return {"task_id": task_id, "cells": len(cells)}
