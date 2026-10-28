@@ -1803,13 +1803,14 @@ def coverage_report(df: pd.DataFrame, groups: Sequence[str], sectorless: Optiona
 
 
 def column_coverage(df: pd.DataFrame, groups: Sequence[str]) -> pd.DataFrame:
-    """Per (column, year) the share of listed rows in which that single column is non-NaN (all columns of the groups)."""
+    """Per (column, year) the share of listed rows in which that single column is non-NaN (all columns of the groups). For
+    a ``*_covered`` flag column (never NaN) the share is the share of listed rows where the flag is 1."""
     listed = df["listed"].to_numpy(dtype=bool)
     year = _years(df)
     rows = []
     for g in groups:
         for c in _group_columns(df, g):
-            ok_col = df[c].notna().to_numpy()
+            ok_col = (df[c] == 1.0).to_numpy() if c.endswith("_covered") else df[c].notna().to_numpy()
             for y in np.unique(year[listed]):
                 sel = listed & (year == y)
                 rows.append((c, int(y), int(sel.sum()), float((sel & ok_col).sum() / sel.sum())))

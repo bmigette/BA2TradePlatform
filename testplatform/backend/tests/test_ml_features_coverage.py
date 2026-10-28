@@ -145,3 +145,10 @@ def test_the_column_coverage_keeps_the_exempt_holes_visible():
     df = _m_frame()
     cc = F.column_coverage(df, ["m"])
     assert cc.loc[("m_rs_sector_5", 2020), "share"] == pytest.approx(0.25, abs=0.01)     # AAA's second half only: SPY is NaN throughout
+
+
+def test_a_covered_flag_column_reports_the_share_of_rows_it_is_one():
+    df = _frame()
+    df["s_covered"] = (np.arange(len(df)) % 4 != 0).astype("float64")           # a flag, never NaN: 75% of the rows are 1
+    cc = F.column_coverage(df, ["s"])
+    assert cc.loc[("s_covered", 2020), "share"] == pytest.approx(0.75, abs=0.01)
