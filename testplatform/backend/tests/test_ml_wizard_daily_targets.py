@@ -48,13 +48,15 @@ class TestNaming:
         (pt("daily_beats", horizonSessions=1), "beats_h1"),
         (pt("daily_up", horizonSessions=3), "up_h3"),
         (pt("daily_volatility", horizonSessions=20), "realvol_h20"),
-        (pt("daily_multistep", horizons=[5, 1, 20]), "up_h5"),
+        (pt("daily_multistep", horizons=[20, 5, 1]), "up_h1"),
     ])
     def test_column_names(self, config, col):
         assert W.column_name(config) == col
 
-    def test_multistep_makes_one_column_per_horizon_in_the_order_given(self):
-        assert W.column_names(pt("daily_multistep", horizons=[5, 1, 20])) == ["up_h5", "up_h1", "up_h20"]
+    def test_multistep_sorts_its_horizons_so_the_shortest_is_trained(self):
+        assert W.column_names(pt("daily_multistep", horizons=[5, 1, 20])) == ["up_h1", "up_h5", "up_h20"]
+        assert W.daily_horizons(pt("daily_multistep", horizons=[20, 1])) == [1, 20]
+        assert W.column_name(pt("daily_multistep", horizons=[20, 1])) == "up_h1"
 
     @pytest.mark.parametrize("config, text", [
         (pt("daily_up", horizonSessions=4), "horizon"),
@@ -299,6 +301,11 @@ class TestJobIntegration:
         tr = cap["train"]
         assert len(tr) <= int(0.7 * (N - 3)) - 10                        # purged by the longest horizon, not by 3
         assert len(tr) < int(0.7 * (N - 3)) - 3
+
+    def test_multistep_horizons_listed_longest_first_still_train_the_shortest(self, monkeypatch):
+        result, cap = self._job(job_frames(1), [pt("daily_multistep", horizons=[20, 1])], monkeypatch)
+        assert result["status"] == "dry_run_success", result
+        assert cap["target"] == "up_h1"
 
     def test_the_old_wizard_targets_are_still_refused_on_the_daily_source(self, monkeypatch):
         result, _ = self._job(job_frames(2), [{"type": "triple_barrier_atr"}], monkeypatch)

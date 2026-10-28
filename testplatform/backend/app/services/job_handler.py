@@ -18,7 +18,7 @@ from pathlib import Path
 
 from app.models.database import SessionLocal
 from app.models.dataset import Dataset
-from app.services.data_preparation import purged_train_row_count, three_way_bounds
+from app.services.data_preparation import frame_bounds, purged_train_row_count, three_way_bounds
 from app.services.ml_dataset_source import is_alpaca_hist
 from app.services.ml_wizard_targets import (
     CROSS_SECTIONAL_DAILY_TYPES, DAILY_TARGET_TYPES, WIZARD_TARGET_TYPES, WizardTargetError,
@@ -227,12 +227,15 @@ def _concat_by_date(parts: List[pd.DataFrame]) -> pd.DataFrame:
 
 
 def split_frames_three_way(
-    frames: List[pd.DataFrame], train_ratio: float, holdout_share_of_test: float, label_horizon: int
+    frames: List[pd.DataFrame], train_ratio: float, holdout_share_of_test: float, label_horizon: int,
+    common_dates: bool = False
 ) -> Dict[str, List[pd.DataFrame]]:
-    """Cut every ticker's frame into purged train / validation / holdout blocks (see three_way_bounds)."""
+    """Cut every ticker's frame into purged train / validation / holdout blocks (see three_way_bounds).
+
+    ``common_dates``: cut all the tickers at the same dates instead of at their own row counts (the cross-sectional
+    daily targets compare the tickers of a session; see ``data_preparation.frame_bounds``)."""
     out: Dict[str, List[pd.DataFrame]] = {'train': [], 'val': [], 'holdout': []}
-    for f in frames:
-        b = three_way_bounds(len(f), train_ratio, holdout_share_of_test, label_horizon)
+    for f, b in zip(frames, frame_bounds(frames, train_ratio, holdout_share_of_test, label_horizon, common_dates)):
         out['train'].append(f.iloc[:b['train_end']].copy())
         out['val'].append(f.iloc[b['val_start']:b['val_end']].copy())
         out['holdout'].append(f.iloc[b['holdout_start']:].copy())
@@ -2008,6 +2011,10 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                 'error': f'No label horizon recorded for target {target_column}; cannot purge the train/test boundary'
             }
         label_horizon = int(target_label_horizons[target_column])
+        # A cross-sectional daily target is decided by every ticker's bars over the same window: one set of boundary
+        # dates for all the tickers, not a row-count cut per ticker (which puts one ticker's train rows on another's
+        # test dates).
+        common_dates = any(target_column in cols for cols in cross_sectional)
 
         # Train / validation / holdout split, PER TICKER, chronological. Targets are computed
         # over the whole series and only then cut, so both boundaries are purged by the label
@@ -2017,7 +2024,8 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
         update_job_progress(task_id, 20, "Splitting train/validation/holdout data...")
         train_ratio = train_test_split / 100.0
         try:
-            split_frames = split_frames_three_way(frames, train_ratio, HOLDOUT_SHARE_OF_TEST, label_horizon)
+            split_frames = split_frames_three_way(frames, train_ratio, HOLDOUT_SHARE_OF_TEST, label_horizon,
+                                                  common_dates=common_dates)
         except ValueError as e:
             return {'status': 'failed', 'error': str(e)}
         train_df = _concat_by_date(split_frames['train'])
@@ -2155,6 +2163,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                     prediction_horizon=prediction_horizon,
                     prediction_modes=prediction_modes,
                     label_horizon=label_horizon,
+                    common_dates=common_dates,
                     progress_base=25,
                     progress_range=65,
                     timeframe=timeframe
@@ -2189,6 +2198,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                     metrics_config=metrics_config,
                     prediction_horizon=prediction_horizon,
                     label_horizon=label_horizon,
+                    common_dates=common_dates,
                     progress_base=25,
                     progress_range=65,
                     timeframe=timeframe
@@ -2674,7 +2684,8 @@ def train_classification_optimization(
     label_horizon: int,
     progress_base: float,
     progress_range: float,
-    timeframe: str = 'daily'
+    timeframe: str = 'daily',
+    common_dates: bool = False
 ) -> Dict[str, Any]:
     """
     Classification optimization using tsai models.
@@ -2803,7 +2814,8 @@ def train_classification_optimization(
                     seq_len=current_seq_len,
                     prediction_horizon=0,  # Target already pre-shifted
                     prediction_mode=mode,
-                    label_horizon=label_horizon  # purge the boundary rows the pre-shift leaks
+                    label_horizon=label_horizon,  # purge the boundary rows the pre-shift leaks
+                    common_dates=common_dates
                 )
                 X_train, X_test, y_train, y_test = (
                     split['X_train'], split['X_val'], split['y_train'], split['y_val']
@@ -3306,7 +3318,8 @@ def train_unified_optimization(
     label_horizon: int,
     progress_base: float,
     progress_range: float,
-    timeframe: str = 'daily'
+    timeframe: str = 'daily',
+    common_dates: bool = False
 ) -> Dict[str, Any]:
     """
     Unified optimization where model type is an optimization parameter.
@@ -3364,7 +3377,8 @@ def train_unified_optimization(
             timeframe=timeframe,
             # An extra `prediction_horizon` shift was applied above for the RNN target,
             # so its outcome window reaches that much further past the split.
-            label_horizon=label_horizon + max(0, prediction_horizon)
+            label_horizon=label_horizon + max(0, prediction_horizon),
+            common_dates=common_dates
         )
         rnn_scalers = list(training_service.scalers)
         rnn_scaler_params = training_service.describe_scalers(rnn_scalers, list(training_service.cov_scalers))
@@ -3382,7 +3396,8 @@ def train_unified_optimization(
             target_column=target_column,
             feature_columns=feature_columns,
             timeframe=timeframe,
-            label_horizon=label_horizon
+            label_horizon=label_horizon,
+            common_dates=common_dates
         )
         ms_scalers = list(training_service.scalers)
         ms_scaler_params = training_service.describe_scalers(ms_scalers, list(training_service.cov_scalers))
@@ -3490,8 +3505,8 @@ def train_unified_optimization(
         return {'model_type': 'unified', 'status': 'failed', 'error': 'metrics_config.lossFunction is required'}
     # Any failure building the loss propagates (see create_training_loss).
     train_labels = pd.concat(
-        [f[target_column].iloc[:three_way_bounds(len(f), train_ratio, holdout_share_of_test, label_horizon)['train_end']]
-         for f in frames],
+        [f[target_column].iloc[:b['train_end']]
+         for f, b in zip(frames, frame_bounds(frames, train_ratio, holdout_share_of_test, label_horizon, common_dates))],
         ignore_index=True
     )
     loss_fn = create_training_loss(loss_function_type, train_labels, target_column)

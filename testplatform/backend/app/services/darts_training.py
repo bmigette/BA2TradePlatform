@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 import json
 
-from app.services.data_preparation import purged_train_row_count, three_way_bounds
+from app.services.data_preparation import common_session_bounds, purged_train_row_count, three_way_bounds
 from app.services.model_interface import ITrainingService
 
 logger = logging.getLogger(__name__)
@@ -126,7 +126,8 @@ class DartsTrainingService(ITrainingService):
         target_column: str = 'Close',
         feature_columns: List[str] = None,
         timeframe: str = 'daily',
-        scaler_fit_ratio: Optional[float] = None
+        scaler_fit_ratio: Optional[float] = None,
+        scaler_fit_until: Optional[pd.Timestamp] = None
     ) -> Tuple[Any, Any]:
         """
         Prepare data for Darts model training.
@@ -146,6 +147,10 @@ class DartsTrainingService(ITrainingService):
                 restricted ``df`` to training rows -- fitting on a frame that still
                 contains the held-out tail puts the future's min/max into the
                 training transform.
+            scaler_fit_until: Same, but the train block is every point dated up to
+                and including this timestamp (the common-date split of the
+                cross-sectional targets, where the boundary is a date and not a
+                fraction of this frame's rows). Wins over ``scaler_fit_ratio``.
 
         Returns:
             Tuple of (target_series, covariates_series)
@@ -159,6 +164,14 @@ class DartsTrainingService(ITrainingService):
 
         # Infer frequency based on timeframe
         freq = self._infer_frequency(timeframe, df_sorted)
+
+        def fit_count(index: pd.DatetimeIndex) -> Optional[int]:
+            """Points the scalers (and the masked-cell medians) are fitted on; None = all of them."""
+            if scaler_fit_until is not None:
+                return max(1, int((index <= scaler_fit_until).sum()))
+            if scaler_fit_ratio is not None:
+                return max(1, int(len(index) * scaler_fit_ratio))
+            return None
 
         # Drop rows with NaN in target column
         if target_column in df_sorted.columns:
@@ -175,7 +188,7 @@ class DartsTrainingService(ITrainingService):
             if available_cols:
                 # Cells blanked by the daily source's coverage mask get a train-fitted neutral value FIRST, so the
                 # forward fill below never carries a value across a masked (group, year) and first_complete ignores them.
-                n_fit = len(df_sorted) if scaler_fit_ratio is None else max(1, int(len(df_sorted) * scaler_fit_ratio))
+                n_fit = fit_count(df_sorted.index) or len(df_sorted)
                 cov_df, dropped = fill_masked_covariates(df_sorted[available_cols], n_fit)
                 available_cols = [c for c in available_cols if c not in dropped]
                 cov_df = cov_df.ffill()
@@ -215,10 +228,10 @@ class DartsTrainingService(ITrainingService):
         # Scale the data. When scaler_fit_ratio is given, the scaler sees ONLY the
         # leading (training) slice; the rest of the series is merely transformed by it.
         self.scaler = Scaler()
-        if scaler_fit_ratio is None:
+        n_fit = fit_count(target_series.time_index)
+        if n_fit is None:
             self.scaler.fit(target_series)
         else:
-            n_fit = max(1, int(len(target_series) * scaler_fit_ratio))
             self.scaler.fit(target_series[:n_fit])
         target_series = self.scaler.transform(target_series)
 
@@ -243,10 +256,10 @@ class DartsTrainingService(ITrainingService):
                     )
                 # Scale covariates (same train-only fit rule as the target)
                 self.cov_scaler = Scaler()
-                if scaler_fit_ratio is None:
+                n_fit = fit_count(covariates.time_index)
+                if n_fit is None:
                     self.cov_scaler.fit(covariates)
                 else:
-                    n_fit = max(1, int(len(covariates) * scaler_fit_ratio))
                     self.cov_scaler.fit(covariates[:n_fit])
                 covariates = self.cov_scaler.transform(covariates)
 
@@ -365,7 +378,7 @@ class DartsTrainingService(ITrainingService):
     def prepare_split_three_way(
         self, dataframes: List[pd.DataFrame], train_ratio: float, holdout_share_of_test: float,
         target_column: str, feature_columns: List[str], timeframe: str = 'daily',
-        label_horizon: int = 0
+        label_horizon: int = 0, common_dates: bool = False
     ) -> Dict[str, Any]:
         """Chronological train / validation / holdout TimeSeries, one series per instrument.
 
@@ -374,20 +387,42 @@ class DartsTrainingService(ITrainingService):
         single frame the values are TimeSeries; with several they are lists index-aligned with
         ``self.scalers``. Validation is the GA fitness / early-stopping set, the holdout is only
         scored and reported.
+
+        ``common_dates`` cuts every series at the same DATES (``common_session_bounds`` over the
+        frames' sessions) and fits each scaler on the points up to the last train date: the
+        cross-sectional daily targets compare the tickers of a session, so one ticker's train
+        block must not reach into another's test dates.
         """
         keys = ('train', 'val', 'holdout')
+        cb = common_session_bounds(dataframes, train_ratio, holdout_share_of_test, label_horizon) if common_dates else None
         series = {k: [] for k in keys}
         covs = {k: [] for k in keys}
         scalers = []
         cov_scalers = []
         for df in dataframes:
             self.cov_scaler = None
-            full_series, full_cov = self.prepare_data(
-                df, target_column, feature_columns, timeframe, scaler_fit_ratio=train_ratio
-            )
+            if cb is None:
+                full_series, full_cov = self.prepare_data(
+                    df, target_column, feature_columns, timeframe, scaler_fit_ratio=train_ratio
+                )
+            else:
+                full_series, full_cov = self.prepare_data(
+                    df, target_column, feature_columns, timeframe, scaler_fit_until=cb['train_last']
+                )
             scalers.append(self.scaler)
             cov_scalers.append(self.cov_scaler)
-            b = three_way_bounds(len(full_series), train_ratio, holdout_share_of_test, label_horizon)
+            if cb is None:
+                b = three_way_bounds(len(full_series), train_ratio, holdout_share_of_test, label_horizon)
+            else:
+                idx = full_series.time_index
+                b = {'train_end': int(idx.searchsorted(cb['train_last'], side='right')),
+                     'val_start': int(idx.searchsorted(cb['val_first'], side='left')),
+                     'val_end': int(idx.searchsorted(cb['val_last'], side='right')),
+                     'holdout_start': int(idx.searchsorted(cb['holdout_first'], side='left'))}
+                if b['train_end'] <= 0 or b['val_end'] <= b['val_start'] or b['holdout_start'] >= len(idx):
+                    raise ValueError(f"a series has an empty train / validation / holdout block with the common date "
+                                     f"split (train to {cb['train_last'].date()}, validation from {cb['val_first'].date()}, "
+                                     f"holdout from {cb['holdout_first'].date()}): its history does not cover them")
             cuts = {
                 'train': slice(0, b['train_end']),
                 'val': slice(b['val_start'], b['val_end']),

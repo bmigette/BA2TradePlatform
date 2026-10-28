@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import json
 
-from app.services.data_preparation import DataPreparationService, purged_train_row_count, three_way_bounds
+from app.services.data_preparation import DataPreparationService, frame_bounds, purged_train_row_count, three_way_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -340,7 +340,7 @@ class TSAITrainingService(ITrainingService):
         target_column: str, feature_columns: List[str],
         timeframe: str = 'daily', seq_len: int = 24,
         prediction_horizon: int = 0, prediction_mode: str = 'shift',
-        label_horizon: int = 0
+        label_horizon: int = 0, common_dates: bool = False
     ) -> Dict[str, np.ndarray]:
         """Chronological train / validation / holdout windows, one frame per instrument.
 
@@ -348,13 +348,16 @@ class TSAITrainingService(ITrainingService):
         on its own, so a window never spans two tickers or two blocks. The scaler is fitted on
         the combined TRAINING rows only. Validation drives the GA fitness, the threshold gene
         and the per-epoch validation loss; holdout is only scored and reported.
+
+        ``common_dates`` cuts every frame at the same dates (``data_preparation.frame_bounds``),
+        for the cross-sectional daily targets that compare the tickers of a session.
         """
         if not TSAI_AVAILABLE:
             raise RuntimeError("tsai library not available")
 
         blocks = {'train': [], 'val': [], 'holdout': []}
-        for df in dataframes:
-            b = three_way_bounds(len(df), train_ratio, holdout_share_of_test, label_horizon)
+        all_bounds = frame_bounds(dataframes, train_ratio, holdout_share_of_test, label_horizon, common_dates)
+        for df, b in zip(dataframes, all_bounds):
             blocks['train'].append(df.iloc[:b['train_end']])
             blocks['val'].append(df.iloc[b['val_start']:b['val_end']])
             blocks['holdout'].append(df.iloc[b['holdout_start']:])

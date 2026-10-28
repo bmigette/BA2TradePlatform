@@ -13,7 +13,7 @@ feature store): the decision is taken at session S's close and filled at S+1's O
 (``ml_targets.daily_targets``), H one of 1 / 3 / 5 / 10 / 20 sessions (``horizonSessions``, default 5):
 
 * ``daily_up`` (binary 0 / 1): the return is positive. ``daily_multistep`` (``horizons``): one such binary column
-  ``up_h<H>`` per horizon of the list, the first one is the trained column and every column is purged by the longest;
+  ``up_h<H>`` per horizon of the list (sorted ascending), the shortest one is the trained column and every column is purged by the longest;
 * ``daily_volatility`` (regression, H >= 2): the std of the daily log returns of sessions S+1..S+H;
 * ``daily_rel_return`` (regression), ``daily_quintile`` (1 = top fifth of the session, 0 = bottom fifth, the rest has
   no label) and ``daily_beats`` (the relative return is positive): compared with the other tickers of the SAME session,
@@ -101,7 +101,7 @@ def daily_horizons(pt: Dict[str, Any]) -> List[int]:
         out = [_daily_horizon(h, typ) for h in hs]
         if len(set(out)) != len(out):
             raise WizardTargetError(f"{typ} horizons must be distinct, got {out}")
-        return out
+        return sorted(out)       # the shortest horizon is the trained column, whatever order the list came in
     h = pt.get("horizonSessions")
     h = _daily_horizon(_DAILY_DEFAULT_HORIZON if h is None else h, typ)
     if typ == "daily_volatility" and h < 2:
