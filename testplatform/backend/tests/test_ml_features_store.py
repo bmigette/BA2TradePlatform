@@ -277,3 +277,110 @@ def test_min_share_and_the_package_versions_are_part_of_the_rebuild_key(work, tm
         assert _ensure(work, out, min_share=0.5)["status"] == "built", pkg
         monkeypatch.undo()
         assert _ensure(work, out, min_share=0.5)["status"] == "built"             # back to the real version: rebuilt again
+
+
+# ---------------------------------------------------------------------------------------------- sources, atomicity, fast path
+@pytest.fixture
+def rich(work, tmp_path, monkeypatch):
+    """A private cache with every kind of source: FMP files (statements, analysts, insiders), FRED, the metric store and a
+    market-condition store. Returns (root, groups, ensure(out))."""
+    import dataclasses  # noqa: F401
+    from tests.test_ml_features_analyst import _grade_rows, _target_rows, write_fmp_rows
+    from tests.test_ml_features_fund import _write_fmp
+    from tests.test_ml_features_insider import _rows as insider_rows
+    from tests.test_ml_features_macro import _synthetic_fred, point_fred_at
+    from tests.test_ml_features_structure import write_mc_store
+    for sym in ("AAA", "BBB"):
+        write_fmp_rows(work, "analyst_grades", sym, _grade_rows(sym))
+        write_fmp_rows(work, "price_target", sym, _target_rows(sym))
+        write_fmp_rows(work, "insider_v2", sym, insider_rows(sym))
+        _write_fmp(work, sym)
+    _synthetic_fred(work)
+    point_fred_at(monkeypatch, work)
+    monkeypatch.setattr(F, "FRED_PINS", {})
+    digests = write_mc_store(work, ("AAA", "BBB"))
+    monkeypatch.setattr(F, "S_MANIFESTS", {p: (d,) for p, d in digests.items()})
+    groups = ["t", "x", "mac", "f", "ag", "at", "i", "s"]
+    return work, groups, digests
+
+
+def _rich_ensure(rich, out):
+    root, groups, _ = rich
+    return F.ensure_feature_store(out, ["AAA", "BBB"], FIRST, LAST, groups, cache_root=root, sector_overrides={},
+                                  sector_of=SECTOR_OF, chunk_size=2)
+
+
+def _touch(path, bump=100):
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + bump * 1_000_000_000))
+
+
+def test_a_changed_source_of_every_kind_rebuilds(rich, tmp_path, monkeypatch):
+    root, groups, digests = rich
+    out = tmp_path / "store"
+    assert _rich_ensure(rich, out)["status"] == "built"
+    assert _rich_ensure(rich, out)["status"] == "up_to_date"
+    changes = {
+        "fmp_history (analyst grades)": lambda: _touch(root / "fmp_history" / "analyst_grades__AAA.json"),
+        "fmp_history (insiders)": lambda: _touch(root / "fmp_history" / "insider_v2__BBB.json"),
+        "fmp_history (statements)": lambda: _touch(root / "fmp_history" / "balance_sheet_annual__AAA.json"),
+        "the metric store": lambda: _touch(next((root / "screener" / "metric_store_alpaca_20261022").glob("ym=*/*.parquet"))),
+        "a FRED file": lambda: _touch(root / "fred" / "VIXCLS.json"),
+        "a daily bar file": lambda: _touch(root / "AlpacaHistoryOHLCVProvider" / "SPY_1d.parquet"),
+    }
+    for name, change in changes.items():
+        change()
+        assert _rich_ensure(rich, out)["status"] == "built", name
+        assert _rich_ensure(rich, out)["status"] == "up_to_date", name
+    # the S manifest list changes: another (valid) store content
+    from tests.test_ml_features_structure import write_mc_store
+    other = write_mc_store(root, ("AAA", "BBB"), universe_tag="other")
+    assert other != digests
+    monkeypatch.setattr(F, "S_MANIFESTS", {p: (d,) for p, d in other.items()})
+    assert _rich_ensure(rich, out)["status"] == "built"
+    assert _rich_ensure(rich, out)["status"] == "up_to_date"
+
+
+def test_a_failed_build_leaves_the_previous_store_untouched_and_no_temp_directory(work, tmp_path, monkeypatch):
+    out = tmp_path / "store"
+    _ensure(work, out)
+    before = {p.name: p.read_bytes() for p in out.iterdir()}
+    real = F.save_features
+
+    def boom(df, path):
+        real(df, path)                                                   # the files ARE written (into the temp directory) ...
+        raise RuntimeError("disk full")                                 # ... and then the build dies
+    monkeypatch.setattr(F, "save_features", boom)
+    with pytest.raises(RuntimeError, match="disk full"):
+        _ensure(work, out, groups=["t", "mtf", "m"])
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == before
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("store")) == ["store"]
+
+
+def test_the_store_is_swapped_in_whole_and_every_expected_file_is_required(work, tmp_path):
+    out = tmp_path / "store"
+    _ensure(work, out)
+    assert set(F.STORE_FILES) == {p.name for p in out.iterdir()}
+    for name in F.STORE_FILES:
+        (out / name).unlink()
+        res = _ensure(work, out)
+        assert res["status"] == "built", name                            # an incomplete store is never "up to date"
+        assert set(F.STORE_FILES) == {p.name for p in out.iterdir()}
+    assert not [p for p in tmp_path.iterdir() if ".building-" in p.name or ".old-" in p.name]
+
+
+def test_the_up_to_date_path_does_not_screen_the_symbols(work, tmp_path, monkeypatch):
+    """A fingerprint-only fast path: unchanged requests and files are recognised before any symbol is loaded."""
+    out = tmp_path / "store"
+    _ensure(work, out)
+
+    def boom(*a, **k):
+        raise AssertionError("the up-to-date path screened the symbols")
+    monkeypatch.setattr(F, "usable_symbols", boom)
+    monkeypatch.setattr(F, "load_daily", boom)
+    res = _ensure(work, out)
+    assert res["status"] == "up_to_date" and res["symbols"] == SYMBOLS
+    path = work / "AlpacaHistoryOHLCVProvider" / "BBB_1d.parquet"          # a changed file DOES go through the screening
+    _touch(path)
+    with pytest.raises(AssertionError, match="screened"):
+        _ensure(work, out)

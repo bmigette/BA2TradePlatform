@@ -1869,17 +1869,48 @@ def _fp_or_none(path: Path) -> Optional[Dict[str, object]]:
     return _fingerprint(path) if path.exists() else None
 
 
+#: The files of a complete store; a store missing any of them is never "up to date".
+STORE_FILES: Tuple[str, ...] = ("features.parquet", "features.parquet.meta.json", "coverage_report.parquet", "coverage_report.csv",
+                                "column_coverage.parquet", "column_coverage.csv")
+
+
+def _store_complete(out_dir: Path) -> bool:
+    return all((Path(out_dir) / name).exists() for name in STORE_FILES)
+
+
+def _swap_in(built: Path, out_dir: Path) -> None:
+    """Replace ``out_dir`` by the fully written ``built`` directory: a reader sees the old store or the new one, never half of
+    each (a crash between the two renames leaves no ``features.parquet.meta.json`` at ``out_dir``, i.e. "not built")."""
+    import os
+    import shutil
+    out_dir = Path(out_dir)
+    if out_dir.exists():
+        old = out_dir.with_name(f"{out_dir.name}.old-{os.getpid()}")
+        shutil.rmtree(old, ignore_errors=True)
+        os.replace(out_dir, old)
+        try:
+            os.replace(built, out_dir)
+        except OSError:
+            os.replace(old, out_dir)
+            raise
+        shutil.rmtree(old, ignore_errors=True)
+    else:
+        out_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(built, out_dir)
+
+
 def _input_fingerprints(load: Sequence[str], rows: Sequence[str], groups: Sequence[str], cache_root: Path,
-                        store_path: Path) -> Dict[str, object]:
+                        store_path: Path, uses_store: bool = False) -> Dict[str, object]:
     """Cheap (size, mtime) fingerprints of every source file the build reads: what ``ensure_feature_store`` compares to
-    decide whether the stored frame is still the one these inputs give."""
-    fp: Dict[str, object] = {"daily": {s: _fingerprint(_cache_file(cache_root, s)) for s in load}}
+    decide whether the stored frame is still the one these inputs give. A missing file is None (not an error here)."""
+    fp: Dict[str, object] = {"daily": {s: _fp_or_none(Path(cache_root) / "AlpacaHistoryOHLCVProvider" / f"{s}_1d.parquet")
+                                       for s in load}}
     if "mac" in groups:
         fp["fred"] = {sid: _fp_or_none(Path(fs.CACHE_FOLDER) / "fred" / f"{sid}.json") for sid in MAC_SERIES}
     kinds = [k for g in groups for k in _FMP_KINDS_BY_GROUP.get(g, ())]
     if kinds:
         fp["fmp_history"] = {f"{k}__{s}": _fp_or_none(fmp_history_path(k, s, cache_root)) for s in rows for k in dict.fromkeys(kinds)}
-    if any(g in groups for g in ("x", "f", "i")):
+    if uses_store or any(g in groups for g in ("x", "f", "i")):
         fp["store"] = ml_universe.store_fingerprint(store_path)
     if "s" in groups:
         fp["market_conditions"] = {p: list(d) for p, d in S_MANIFESTS.items()}
@@ -1919,6 +1950,24 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     symbols = list(dict.fromkeys(symbols))
     extra = [c for c in dict.fromkeys((list(membership.columns) if membership is not None else []) + list(universe or []))
              if c not in symbols]
+    uses_sector = any(_spec(g).needs_sector for g in groups)
+    request_load = list(dict.fromkeys(symbols + extra + ["SPY"] + (sorted(set(MARKET_ETFS) | set(SECTOR_ETF.values()))
+                                                                    if uses_sector else [])))
+    meta_path = Path(str(out_dir / "features.parquet") + ".meta.json")
+    request = json.loads(json.dumps({
+        "version": ENSURE_VERSION, "code": code_version(), "packages": _package_versions(), "min_share": min_share,
+        "groups": groups, "coverage_columns": {g: _spec(g).coverage_columns for g in groups}, "symbols": symbols,
+        "extra": extra, "universe": list(universe) if universe is not None else None, "first": str(first), "last": str(last),
+        "membership": None if membership is None else _membership_digest(membership),
+        "sector_of": sector_of if (sector_of is None or isinstance(sector_of, str)) else dict(sector_of),
+        "sector_overrides": dict(sector_overrides or {}), "store_dir": str(store_path),
+        "fingerprints": _input_fingerprints(request_load, symbols, groups, cache_root, store_path,
+                                            uses_store=uses_sector and isinstance(sector_of, str))}, sort_keys=True))
+    if not force and meta_path.exists() and _store_complete(out_dir):
+        old = json.loads(meta_path.read_text(encoding="utf-8"))
+        if "ensure" in old and old["ensure"].get("request") == request:           # nothing changed: no symbol is loaded
+            return {"status": "up_to_date", "out_dir": str(out_dir), "symbols": old["symbols"],
+                    "refused": old["ensure"]["refused"], "transient": old["ensure"]["transient"]}
     usable_rows, refused_rows = usable_symbols(symbols, first, last, cache_root, groups, store_path)
     usable_extra, refused_extra = usable_symbols(extra, first, last, cache_root, (), store_path) if extra else ([], {})
     refused = {**refused_rows, **refused_extra}
@@ -1952,8 +2001,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
         "coverage_columns": {g: _spec(g).coverage_columns for g in groups}, "symbols": usable_rows, "universe": uni, "first": str(first),
         "last": str(last), "membership": None if members is None else _membership_digest(members), "sectors": resolved,
         "fingerprints": _input_fingerprints(load, usable_rows, groups, cache_root, store_path)}, sort_keys=True))
-    meta_path = Path(str(out_dir / "features.parquet") + ".meta.json")
-    if not force and meta_path.exists() and (out_dir / "features.parquet").exists():
+    if not force and meta_path.exists() and _store_complete(out_dir):
         old = json.loads(meta_path.read_text(encoding="utf-8"))
         if "ensure" in old and old["ensure"]["inputs"] == inputs:
             permanent, transient = _split_refusals(refused)
@@ -1998,18 +2046,29 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     covered_groups = [g for g in groups if _coverage_has_columns(df, g)]
     report = coverage_report(df, covered_groups, sectorless=meta["sectorless"])
     columns = column_coverage(df, covered_groups)
-    meta["ensure"] = {"version": ENSURE_VERSION, "inputs": inputs, "chunk_size": chunk_size, "chunks": len(frames),
+    meta["ensure"] = {"version": ENSURE_VERSION, "inputs": inputs, "request": request, "chunk_size": chunk_size, "chunks": len(frames),
                       "refused": _split_refusals(refused)[0], "transient": _split_refusals(refused)[1], "min_share": min_share,
                       "build_seconds": round(time.time() - started, 1),
                       "note": "features.parquet is UNMASKED; apply_coverage_mask(df, coverage_report, min_share) or "
                               "load_feature_store(mask=True) masks thin (group, year) pairs"}
     df.attrs["meta"] = meta
-    out_dir.mkdir(parents=True, exist_ok=True)
-    save_features(df, out_dir / "features.parquet")
-    report.to_parquet(out_dir / "coverage_report.parquet")
-    report.to_csv(out_dir / "coverage_report.csv")
-    columns.to_parquet(out_dir / "column_coverage.parquet")        # every column x year, so excluded columns' holes stay visible
-    columns.to_csv(out_dir / "column_coverage.csv")
+    import os
+    import shutil
+    building = out_dir.with_name(f"{out_dir.name}.building-{os.getpid()}")      # written whole, then swapped in
+    shutil.rmtree(building, ignore_errors=True)
+    building.mkdir(parents=True)
+    try:
+        save_features(df, building / "features.parquet")
+        report.to_parquet(building / "coverage_report.parquet")
+        report.to_csv(building / "coverage_report.csv")
+        columns.to_parquet(building / "column_coverage.parquet")    # every column x year, so excluded columns' holes stay visible
+        columns.to_csv(building / "column_coverage.csv")
+        missing = [n for n in STORE_FILES if not (building / n).exists()]
+        if missing:
+            raise RuntimeError(f"the store build did not write {missing}")
+        _swap_in(building, out_dir)
+    finally:
+        shutil.rmtree(building, ignore_errors=True)
     return {"status": "built", "out_dir": str(out_dir), "symbols": usable_rows, "chunks": len(frames),
             "rows": int(len(df)), "seconds": meta["ensure"]["build_seconds"], "refused": meta["ensure"]["refused"],
             "transient": meta["ensure"]["transient"], "coverage": report}
