@@ -251,3 +251,168 @@ def test_naive_keeps_nan_where_the_feature_is_missing_and_beats_chance():
     assert np.isnan(p[:3]).all()
     ok = ~np.isnan(p)
     assert roc_auc_score(yte[ok], p[ok]) > 0.55
+
+
+# ------------------------------------------------------------------ review fixes
+@pytest.mark.parametrize("family,task", CASES)
+def test_score_is_one_dimensional_and_follows_the_documented_rule(family, task):
+    m, p, y, _ = _fit_predict(family, task)
+    parts, _, _ = _data(task)
+    Xte = parts[2][0]
+    s = m.score(Xte)
+    assert s.shape == (len(y),)
+    if task == "binary":
+        assert np.array_equal(s, p[:, 1]) and m.score_kind == "probability"
+    elif task == "multiclass":
+        assert np.array_equal(s, p[:, 2] - p[:, 0]) and m.score_kind == "probability_spread"
+        assert spearmanr(s, parts[2][2]).correlation > 0.2
+    elif task == "quantile":
+        assert np.array_equal(s, p[:, 4]) and m.score_kind == "median"
+    else:
+        assert np.array_equal(s, p) and m.score_kind == ("rank_score" if task == "rank" else "point_forecast")
+
+
+def test_naive_score_is_its_column_and_has_kind_feature():
+    parts, _, _ = _data("regression")
+    (Xtr, ytr, _), (Xva, yva, _), (Xte, _, _) = parts
+    m = MM.make_adapter("naive").fit(Xtr, ytr, Xva, yva, "regression", 0)
+    assert np.array_equal(m.score(Xte), Xte["t_ret_20"].to_numpy()) and m.score_kind == "feature"
+
+
+def test_naive_needs_no_labels_validation_block_or_groups():
+    parts, _, _ = _data("regression")
+    (Xtr, _, _), _, (Xte, _, _) = parts
+    for task in ("regression", "binary", "rank"):
+        m = MM.make_adapter("naive").fit(Xtr, None, Xtr.iloc[:0], None, task, 0)
+        assert np.array_equal(m.predict(Xte), Xte["t_ret_20"].to_numpy())
+    m = MM.make_adapter("naive").fit(Xtr, None, None, None, "regression", 0)
+    assert m.n_features == len(FEATS)
+
+
+def test_failed_refit_leaves_the_adapter_unfitted_and_a_refit_resets_state():
+    parts, _, _ = _data("regression")
+    (Xtr, ytr, _), (Xva, yva, _), (Xte, _, _) = parts
+    m = MM.make_adapter("lgbm").fit(Xtr, ytr, Xva, yva, "regression", 1)
+    assert m.task == "regression" and m.n_iter is not None
+    bad = ytr.copy()
+    bad[0] = np.nan
+    with pytest.raises(ValueError):
+        m.fit(Xtr, bad, Xva, yva, "regression", 2)
+    assert m.task is None and m.n_iter is None and m.feature_names is None
+    with pytest.raises(RuntimeError, match="before fit"):
+        m.predict(Xte)
+    m.fit(Xtr, ytr, Xva, yva, "regression", 1)
+    with pytest.raises(ValueError):
+        m.fit(Xtr, ytr, Xva.iloc[:, :3], yva, "regression", 3)         # column mismatch
+    assert m.task is None
+    m2 = MM.make_adapter("lgbm").fit(Xtr, ytr, Xva, yva, "regression", 1)
+    m2.fit(Xtr, (ytr > 0).astype(int), Xva, (yva > 0).astype(int), "binary", 5)
+    assert m2.task == "binary" and m2.seed == 5 and m2.n_classes == 2
+
+
+def test_state_is_assigned_only_after_the_inner_fit_succeeds(monkeypatch):
+    parts, _, _ = _data("regression")
+    (Xtr, ytr, _), (Xva, yva, _), _ = parts
+    m = MM.make_adapter("lgbm")
+
+    def boom(*a, **k):
+        raise RuntimeError("library failure")
+    monkeypatch.setattr(m, "_fit", boom)
+    with pytest.raises(RuntimeError, match="library failure"):
+        m.fit(Xtr, ytr, Xva, yva, "regression", 1)
+    assert m.task is None and m.seed is None and m.n_features is None
+
+
+@pytest.mark.parametrize("val", ["empty_frame", "none"])
+def test_linear_works_with_an_empty_or_missing_validation_set(val):
+    parts, _, _ = _data("binary")
+    (Xtr, ytr, _), (Xva, yva, _), (Xte, yte, _) = parts
+    Xv = Xtr.iloc[:0] if val == "empty_frame" else None
+    yv = ytr[:0] if val == "empty_frame" else None
+    m = MM.make_adapter("linear").fit(Xtr, ytr, Xv, yv, "binary", 0)
+    assert roc_auc_score(yte, m.score(Xte)) > 0.6
+    m2 = MM.make_adapter("linear").fit(Xtr, ytr, np.empty((0, Xtr.shape[1])), np.empty(0), "binary", 0)
+    assert np.array_equal(m.predict(Xte), m2.predict(Xte))
+    with pytest.raises(ValueError, match="empty"):                    # a tree still needs its validation block
+        MM.make_adapter("lgbm").fit(Xtr, ytr, Xtr.iloc[:0], ytr[:0], "binary", 0)
+
+
+def test_linear_clips_scaled_features_at_five():
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame({"a": rng.normal(size=400), "b": rng.normal(size=400)})
+    y = X["a"].to_numpy()
+    m = MM.make_adapter("linear").fit(X, y, X.iloc[:5], y[:5], "regression", 0)
+    wild = pd.DataFrame({"a": [1e9, -1e9, 0.0], "b": [np.nan, 3.0, -1e12]})
+    D = m._design(wild.to_numpy())
+    assert D.max() <= 5.0 and D.min() >= -5.0
+    assert D[0, 0] == 5.0 and D[1, 0] == -5.0 and D[0, 1] == 0.0       # clipped, and NaN -> 0 still
+    p = m.predict(wild)
+    assert np.isfinite(p).all() and abs(p[0]) < 50
+
+
+def test_float32_inputs_are_not_upcast_and_infinities_are_still_refused():
+    X32 = np.random.default_rng(0).normal(size=(10, 3)).astype(np.float32)
+    arr, _ = MM._as_matrix(X32, None, "X")
+    assert arr.dtype == np.float32
+    arr, _ = MM._as_matrix(pd.DataFrame(X32, columns=list("abc")), None, "X")
+    assert arr.dtype == np.float32
+    arr, _ = MM._as_matrix(X32.astype(np.float64), None, "X")
+    assert arr.dtype == np.float64
+    arr, _ = MM._as_matrix(np.arange(6).reshape(2, 3), None, "X")        # ints become float64
+    assert arr.dtype == np.float64
+    bad = X32.copy()
+    bad[0, 0] = np.inf
+    with pytest.raises(ValueError, match="infinite"):
+        MM._as_matrix(bad, None, "X")
+    parts, _, _ = _data("regression")
+    (Xtr, ytr, _), (Xva, yva, _), (Xte, _, _) = parts
+    for fam in ("lgbm", "xgb", "catboost", "linear"):
+        m = MM.make_adapter(fam).fit(Xtr.astype(np.float32), ytr, Xva.astype(np.float32), yva, "regression", 1)
+        assert np.isfinite(m.predict(Xte.astype(np.float32))).all() and m.predict(Xte).dtype == np.float64
+
+
+def test_quantile_builds_one_training_dataset_for_all_nine_models(monkeypatch):
+    import lightgbm as lgb
+    made = []
+    real = lgb.Dataset
+
+    class Counting(real):
+        def __init__(self, *a, **k):
+            made.append(1)
+            super().__init__(*a, **k)
+    monkeypatch.setattr(lgb, "Dataset", Counting)
+    m, p, y, lat = _fit_predict("lgbm", "quantile")
+    assert len(made) == 2 and len(m._models) == 9                        # train + validation, reused nine times
+    assert spearmanr(p[:, 4], lat).correlation > 0.2
+
+
+def test_no_per_fit_warning_filter_and_no_deprecation_noise():
+    import inspect
+    import warnings
+    parts, _, _ = _data("regression")
+    (Xtr, ytr, _), (Xva, yva, _), _ = parts
+    with warnings.catch_warnings(record=True) as w:
+        MM.make_adapter("lgbm").fit(Xtr, ytr, Xva, yva, "regression", 1)
+    assert not [x for x in w if "eval_set" in str(x.message)]
+    assert "catch_warnings" not in inspect.getsource(MM.LGBMAdapter)     # thread-safe: the filter is set once at import
+
+
+@pytest.mark.parametrize("family,bad", [
+    ("lgbm", {"n_estimators": 0}), ("lgbm", {"num_leaves": 2.5}), ("lgbm", {"learning_rate": -0.1}),
+    ("lgbm", {"early_stopping_rounds": True}), ("lgbm", {"subsample": 0.0}), ("lgbm", {"colsample_bytree": 1.5}),
+    ("lgbm", {"reg_lambda": -1.0}), ("lgbm", {"min_child_samples": 0}),
+    ("xgb", {"max_depth": 0}), ("xgb", {"min_child_weight": -1.0}), ("catboost", {"depth": 0}),
+    ("catboost", {"l2_leaf_reg": -1.0}), ("linear", {"C": 0.0}), ("linear", {"max_iter": 0}),
+    ("linear", {"alpha": -1.0}), ("naive", {"column": ""}), ("lgbm", {"learning_rate": float("nan")}),
+])
+def test_param_values_are_validated(family, bad):
+    with pytest.raises(ValueError, match="param"):
+        MM.make_adapter(family, params=bad)
+
+
+def test_valid_param_overrides_are_accepted():
+    MM.make_adapter("lgbm", params={"n_estimators": 10, "num_leaves": 4, "learning_rate": 0.3, "subsample": 1.0})
+    MM.make_adapter("xgb", params={"max_depth": 3})
+    MM.make_adapter("linear", params={"C": 0.1, "alpha": 10.0})
+    with pytest.raises(ValueError):
+        MM.make_adapter("lgbm", n_jobs=0)
