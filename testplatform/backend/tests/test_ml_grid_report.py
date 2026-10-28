@@ -162,21 +162,37 @@ def test_every_failed_condition_gets_its_own_reason():
     assert len(c["reasons"]) >= 4
 
 
-def test_cells_excluded_by_coverage_or_near_constant_models_fail_with_that_reason():
-    rows = baselines() + cand("thin", fitted=20) + cand("flat", low_iter=0.9) + cand("ok")
+def test_cells_with_low_block_coverage_are_excluded_with_that_reason():
+    rows = baselines() + cand("thin", fitted=20) + cand("ok")
     res = R.gate(rows)
     cs = cells_of(res)
     assert cs["thin"]["state"] == "excluded" and not cs["thin"]["passed"]
     assert any("coverage" in r for r in cs["thin"]["reasons"])
-    assert cs["flat"]["state"] == "excluded" and any("low_iter_share" in r for r in cs["flat"]["reasons"])
-    assert cs["ok"]["passed"]
-    assert [s["key"] for s in res["survivors"]] == ["ok"]
-    assert cs["flat"]["mean"] == pytest.approx(0.05) and cs["flat"]["p_value"] == pytest.approx(0.01)   # still shown
-    assert set(res["excluded"]["selection"]["cell_key"]) == {"thin", "flat"}
-    eff = set(res["effects"]["selection"]["cells"]["cell_key"])
-    assert "flat" in eff and "thin" not in eff                  # the factor tables only drop what coverage drops
-    loose = cells_of(R.gate(rows, max_low_iter_share=None, min_coverage=0.0))
-    assert loose["thin"]["passed"] and loose["flat"]["passed"]
+    assert cs["ok"]["passed"] and [s["key"] for s in res["survivors"]] == ["ok"]
+    assert set(res["excluded"]["selection"]["cell_key"]) == {"thin"}
+    assert cells_of(R.gate(rows, min_coverage=0.0))["thin"]["passed"]
+
+
+def test_near_constant_models_are_flagged_not_excluded_by_default():
+    rows = baselines() + cand("flat", low_iter=0.9) + cand("fit", low_iter=0.2)
+    res = R.gate(rows)
+    cs = cells_of(res)
+    assert R.GATE_MAX_LOW_ITER_SHARE is None
+    assert cs["flat"]["passed"] and cs["flat"]["survivor"]                   # a flag, not a verdict
+    assert cs["flat"]["low_iter_share"] == pytest.approx(0.9) and cs["flat"]["near_constant"] is True
+    assert cs["fit"]["near_constant"] is False and cs["fit"]["low_iter_share"] == pytest.approx(0.2)
+    assert cs["naive_selection"]["near_constant"] is False and cs["naive_selection"]["low_iter_share"] is None
+    assert res["excluded"]["selection"].empty
+    assert "flat" in set(res["effects"]["selection"]["cells"]["cell_key"])
+
+
+def test_the_low_iteration_exclusion_is_still_available_as_a_parameter():
+    rows = baselines() + cand("flat", low_iter=0.9) + cand("ok")
+    res = R.gate(rows, max_low_iter_share=0.5)
+    c = cells_of(res)["flat"]
+    assert c["state"] == "excluded" and any("low_iter_share" in r for r in c["reasons"])
+    assert c["mean"] == pytest.approx(0.05) and c["near_constant"] is True                # still shown and flagged
+    assert "flat" in set(res["effects"]["selection"]["cells"]["cell_key"])               # factor tables keep it
 
 
 def test_survivors_are_ranked_by_mean_minus_std_and_capped_at_ten_per_track():
@@ -462,3 +478,19 @@ def test_run_summary_is_written_and_read_back(tmp_path):
     R.write_run_summary(out, {"planned_tasks": 7, "pool_rebuilds": 1})
     assert json.loads((out / "run_summary.json").read_text())["planned_tasks"] == 7
     assert R.collect_state(out)["summary"]["pool_rebuilds"] == 1
+
+
+def test_the_dashboard_and_report_flag_near_constant_cells(tmp_path):
+    rows = baselines() + cand("flat", low_iter=0.9) + cand("fit", low_iter=0.2, groups=("t", "m"))
+    out = tmp_path / "grid_flag"
+    write_run(out, rows)
+    R.build_outputs(out, report=True)
+    html = (out / "dashboard.html").read_text(encoding="utf-8")
+    assert html.count("near-constant 90%") >= 1 and "near-constant 20%" not in html
+    assert 'data-state="flag"' in html and 'data-state="survivor"' in html
+    chips = re.findall(r'<span class="chip" data-state="flag">(.*?)</span>', html)
+    assert chips and all(re.search(r"[^\w\s]", c) and "near-constant" in c for c in chips)
+    assert '.chip[data-state="flag"]' in html
+    md = (out / "report.md").read_text(encoding="utf-8")
+    assert "near-constant 90%" in md and "near-constant 20%" not in md
+    assert "No cell passed" not in md

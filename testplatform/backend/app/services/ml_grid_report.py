@@ -21,8 +21,10 @@ What the rows allow, and the choices made where the design is silent (also liste
   is the value ``factor_effects`` reports.
 * ``GATE_MAX_P`` is not in the design; 0.05 is the conventional choice. With the default 20 control seeds the smallest
   attainable p is 1/21, so 0.05 means "beats every shuffle".
-* Coverage (``min_coverage``) and near-constant models (``max_low_iter_share``) exclude a cell before the gate is read;
-  the thresholds are not in the design either.
+* Coverage (``min_coverage``, 0.8) excludes a cell before the gate is read; the threshold is not in the design either.
+* A near-constant model (more than ``LOW_ITER_FLAG_SHARE`` of its blocks stopped at <= ``ml_grid.LOW_ITER`` boosting
+  rounds) is FLAGGED ("near-constant k%"), not excluded: it cannot beat its shuffle control anyway. The exclusion stays
+  available as ``max_low_iter_share`` (default None).
 """
 from __future__ import annotations
 
@@ -52,7 +54,8 @@ GATE_MAX_SURVIVORS = 10
 GATE_COST_BPS = 7.0
 GATE_MAX_P = 0.05
 GATE_MIN_COVERAGE = 0.8
-GATE_MAX_LOW_ITER_SHARE = 0.5
+GATE_MAX_LOW_ITER_SHARE: Optional[float] = None       # no exclusion by near-constant models: they are flagged
+LOW_ITER_FLAG_SHARE = 0.5
 BASELINE_FAMILIES: Tuple[str, ...] = ("naive", "linear")
 #: the metrics the heatmap shows per track (the first is the gate's primary)
 HEATMAP_METRICS: Dict[str, Tuple[str, ...]] = {
@@ -150,7 +153,9 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
     fail / pending / excluded / baseline / not gated), ``reasons`` (one string per failed condition) and ``note``.
     ``survivors``: the survivors of both tracks, each track best first; ``by_track`` the same per track; ``effects``:
     the ``factor_effects`` tables per track (coverage filter only: near-constant models are still in the factor tables);
-    ``excluded``: per track the cells the gate dropped (coverage or near-constant models) with the reason."""
+    ``excluded``: per track the cells the gate dropped (coverage; near-constant models only when
+    ``max_low_iter_share`` is set) with the reason. ``low_iter_share`` / ``near_constant`` flag a cell whose models
+    stopped almost at once in more than ``LOW_ITER_FLAG_SHARE`` of the blocks."""
     rows = G.read_results(cell_results) if isinstance(cell_results, (str, Path)) else list(cell_results)
     last: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for r in rows:
@@ -160,7 +165,7 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
         by_cell.setdefault(key, []).append(r)
     params = {"max_p": max_p, "min_regimes": min_regimes, "max_survivors": max_survivors, "regimes": list(GATE_REGIMES),
               "hard_regimes": list(HARD_REGIMES), "cost_bps": min_cost_bps, "min_coverage": min_coverage,
-              "max_low_iter_share": max_low_iter_share}
+              "max_low_iter_share": max_low_iter_share, "low_iter_flag_share": LOW_ITER_FLAG_SHARE}
     # The factor tables and the baselines see every cell with enough coverage; the gate also drops near-constant models.
     effects, kept, excluded, excluded_tables = {}, {}, {}, {}
     for track in G.TRACKS:
@@ -193,7 +198,7 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
             "target": cfg["target"]["kind"], "horizon": cfg["target"]["horizon"], "family": cfg["family"],
             "train_months": cfg["train_months"], "groups": "+".join(cfg["groups"]), "n_seeds": len(ok),
             "mean": float("nan"), "std": float("nan"), "score": float("nan"), "p_value": float("nan"),
-            "null_mean": float("nan"), "regimes": {}, "regimes_beaten": 0, "passed": False, "survivor": False,
+            "null_mean": float("nan"), "low_iter_share": None, "near_constant": False, "regimes": {}, "regimes_beaten": 0, "passed": False, "survivor": False,
             "rank": None, "state": "fail", "reasons": [], "note": "", "baseline_keys": {}}
         records.append(rec)
         if cfg["target"]["kind"] == "volatility":
@@ -210,6 +215,9 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
         if c is not None:
             rec.update(mean=float(c["mean"]), std=float(c["std"]), score=float(c["score"]),
                        p_value=float(c["p_value"]))
+            share = float(c["low_iter_share"])
+            if math.isfinite(share):
+                rec.update(low_iter_share=share, near_constant=share > LOW_ITER_FLAG_SHARE)
         if key in excluded:
             rec.update(state="excluded", reasons=[f"excluded: {excluded[key]}"])
             continue
@@ -366,6 +374,10 @@ def _mean_std(c: Dict[str, Any]) -> str:
     return f"{c['mean']:+.4f} ± " + (f"{c['std']:.4f}" if math.isfinite(c["std"]) else "n/a")
 
 
+def _flag_text(c: Dict[str, Any]) -> str:
+    return f"near-constant {100 * c['low_iter_share']:.0f}%" if c["near_constant"] else ""
+
+
 def _p_text(c: Dict[str, Any]) -> str:
     return f"{c['p_value']:.3f}" if math.isfinite(c["p_value"]) else "n/a"
 
@@ -394,7 +406,9 @@ def render_report(state: Dict[str, Any]) -> str:
             f"{len(p['regimes'])} regimes ({', '.join(p['regimes'])}), including {' or '.join(p['hard_regimes'])}; its "
             f"primary metric is positive after {p['cost_bps']:g} bps; the shuffle control's p (median over seeds) is "
             f"at most {p['max_p']:g}. Cells are ranked by seed mean − seed std; at most {p['max_survivors']} survivors "
-            f"per track. Cells with coverage under {p['min_coverage']:g}{low} are excluded first. A regime counts as "
+            f"per track. Cells with coverage under {p['min_coverage']:g}{low} are excluded first; a cell whose models "
+            f"were near-constant in more than {p['low_iter_flag_share']:g} of the blocks carries a \"near-constant k%\" "
+            f"flag but is not excluded. A regime counts as "
             f"beating the shuffle control when its value is above the control's null mean (the rows hold the control "
             f"for the whole period only); the significance is the cell-level p.", "", "## Survivors", ""]
     if not g["survivors"]:
@@ -432,10 +446,10 @@ def render_report(state: Dict[str, Any]) -> str:
             out += ["No finished cells.", ""]
             continue
         out += [_md_table(["rank", "cell", "key", "seed mean ± std", "mean − std", "regimes beaten", "p", "result",
-                           "reasons"],
+                           "flags", "reasons"],
                           [[c["rank"] or "", _cell_text(c), c["key"], _mean_std(c), _fmt(c["score"]),
                             f"{c['regimes_beaten']} of 6" if c["regimes"] else "", _p_text(c), c["state"].upper(),
-                            "; ".join(c["reasons"]) or c["note"]] for c in cs]), ""]
+                            _flag_text(c), "; ".join(c["reasons"]) or c["note"]] for c in cs]), ""]
     out += ["## Excluded cells", ""]
     any_ex = False
     for track in G.TRACKS:
@@ -513,6 +527,7 @@ td.sticky, th.sticky { position: sticky; left: 0; background: var(--card); text-
 .chip[data-state="excluded"] { --c: var(--muted); }
 .chip[data-state="baseline"] { --c: var(--accent); }
 .chip[data-state="not gated"] { --c: var(--muted); }
+.chip[data-state="flag"] { --c: var(--pending); }
 .fx { display: grid; grid-template-columns: minmax(90px, 1.1fr) minmax(0, 3fr) minmax(70px, auto); gap: 4px 10px;
   align-items: center; font-size: 12px; }
 .fx .grp { grid-column: 1 / -1; color: var(--muted); font-weight: 600; margin-top: 8px; }
@@ -535,13 +550,20 @@ def _e(x: Any) -> str:
 
 
 _CHIP_GLYPH = {"survivor": "&#10003;", "capped": "&#8805;", "fail": "&#10007;", "pending": "&#8230;",
-               "excluded": "&#8856;", "baseline": "&#9670;", "not gated": "&#8211;"}
+               "excluded": "&#8856;", "baseline": "&#9670;", "not gated": "&#8211;", "flag": "&#9888;"}
 _CHIP_LABEL = {"survivor": "survivor", "capped": "over cap", "fail": "fail", "pending": "pending",
-               "excluded": "excluded", "baseline": "baseline", "not gated": "not gated"}
+               "excluded": "excluded", "baseline": "baseline", "not gated": "not gated", "flag": "flag"}
 
 
 def _chip(state: str) -> str:
     return f'<span class="chip" data-state="{_e(state)}">{_CHIP_GLYPH[state]} {_e(_CHIP_LABEL[state])}</span>'
+
+
+def _flag_chip(c: Dict[str, Any]) -> str:
+    """The "near-constant k%" flag chip of a cell (empty when it is not flagged)."""
+    if not c["near_constant"]:
+        return ""
+    return f' <span class="chip" data-state="flag">{_CHIP_GLYPH["flag"]} {_e(_flag_text(c))}</span>'
 
 
 def _short(c: Dict[str, Any]) -> str:
@@ -585,7 +607,7 @@ def _heatmap(state: Dict[str, Any], track: str) -> str:
     for c in shown:
         tds = "".join(_heat_cell(data[c["key"]][m][col], scales[m], col == "all") for m in metrics for col in cols)
         body.append(f'<tr class="hmrow"><td class="sticky">{_e(_short(c))} <span class="muted small">{_e(c["key"])}'
-                    f'</span></td><td>{_chip(c["state"])}</td>{tds}</tr>')
+                    f'</span></td><td>{_chip(c["state"])}{_flag_chip(c)}</td>{tds}</tr>')
     note = ""
     if len(rest) > HEATMAP_MAX_ROWS:
         note = (f'<p class="muted small">Showing the top {HEATMAP_MAX_ROWS} of {len(rest)} cells by gate rank '
@@ -636,7 +658,7 @@ def _gate_table(state: Dict[str, Any], track: str) -> str:
         why = "; ".join(c["reasons"]) or c["note"]
         rows.append(f'<tr><td>{c["rank"] or ""}</td><td class="l">{_e(_short(c))} <span class="muted small">'
                     f'{_e(c["key"])}</span></td><td>{_e(_mean_std(c))}</td><td>{_e(_fmt(c["score"]))}</td>'
-                    f'<td>{beat}</td><td>{_e(_p_text(c))}</td><td class="l">{_chip(c["state"])}</td>'
+                    f'<td>{beat}</td><td>{_e(_p_text(c))}</td><td class="l">{_chip(c["state"])}{_flag_chip(c)}</td>'
                     f'<td class="wrap small">{_e(why)}</td></tr>')
     head = ('<tr><th>#</th><th class="l">cell</th><th>seed mean ± std</th><th>mean − std</th><th>regimes beaten</th>'
             '<th>p</th><th class="l">gate</th><th class="l">reasons</th></tr>')
@@ -664,8 +686,8 @@ def render_dashboard(state: Dict[str, Any]) -> str:
         _tile("Progress", _e(prog), _e(pct)),
         _tile("Errors", _e(state["n_errors"]), "unresolved (cell, seed) tasks"),
         _tile("Survivors", _e(surv), _e(" · ".join(f"{t} {len(g['by_track'][t])}" for t in G.TRACKS))),
-        _tile("Cells", _e(cands), "candidates seen"),
-        _tile("Excluded", _e(sum(exc.values())), "coverage / near-constant models"),
+        _tile("Cells", _e(cands), _e(f"candidates seen, {sum(1 for c in g['cells'] if c['near_constant'])} near-constant")),
+        _tile("Excluded", _e(sum(exc.values())), "low block coverage"),
         _tile("Pool rebuilds", _e(rebuilds), "worker pool restarts")])
     rc = ", ".join(ident["row_codes"]) or "n/a"
     out = [f"<title>{_e(DASHBOARD_TITLE)}</title>", '<meta name="claude:viewport-fit-sides" content="cover">',
