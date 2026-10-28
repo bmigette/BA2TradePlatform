@@ -848,14 +848,44 @@ def test_progress_counts_only_the_planned_cells(tmp_path):
     out = tmp_path / "grid_plan"
     rows = baselines() + cand("a") + cand("other")                       # 'other' is not part of this run
     planned = [f"{r['cell_key']}:{r['seed']}" for r in rows if r["cell_key"] != "other"] + ["z:1"]
-    write_run(out, rows, summary={"planned_tasks": len(planned), "planned_keys": planned})
+    write_run(out, rows)
+    digest = R.write_planned(out, planned)                               # planned_keys.txt, once per run
+    R.write_run_summary(out, {"planned_tasks": len(planned), "planned_count": len(planned), "planned_hash": digest})
     st = R.collect_state(out, live=False)
     assert st["n_progress"] == 5 and st["n_planned"] == 6 and st["n_rows"] == 8
     R.build_outputs(out, report=False)
     assert re.search(r'<div class="k">Progress</div><div class="v">5/6</div>', (out / "dashboard.html").read_text(
         encoding="utf-8"))
-    write_run(out, rows, summary={"planned_tasks": 9})                   # no planned keys saved: all the rows
-    assert R.collect_state(out, live=False)["n_progress"] == 8
+    saved = json.loads((out / "run_summary.json").read_text(encoding="utf-8"))
+    assert "planned_keys" not in saved and saved["planned_hash"] == digest
+    (out / "planned_keys.txt").unlink()                                  # no list: all the rows, the saved total
+    st = R.collect_state(out, live=False)
+    assert st["n_progress"] == 8 and st["n_planned"] == 6
+
+
+def test_a_planned_list_that_does_not_match_the_saved_hash_is_ignored(tmp_path):
+    out = tmp_path / "grid_plan2"
+    rows = baselines() + cand("a")
+    write_run(out, rows)
+    R.write_planned(out, ["x:1", "y:1"])
+    R.write_run_summary(out, {"planned_tasks": 5, "planned_count": 5, "planned_hash": "0" * 40})   # another run's
+    st = R.collect_state(out, live=False)
+    assert st["n_progress"] == 5 and st["n_planned"] == 5
+
+
+def test_the_planned_list_is_read_once_per_cache_not_per_rebuild(tmp_path, monkeypatch):
+    out = tmp_path / "grid_plan3"
+    rows = baselines() + cand("a")
+    write_run(out, rows)
+    digest = R.write_planned(out, [f"{r['cell_key']}:{r['seed']}" for r in rows])
+    R.write_run_summary(out, {"planned_count": 5, "planned_hash": digest})
+    reads = []
+    real = R._read_planned
+    monkeypatch.setattr(R, "_read_planned", lambda p: (reads.append(1), real(p))[1])
+    cache = R.StateCache(out)
+    for _ in range(4):
+        assert R.collect_state(out, live=False, cache=cache)["n_progress"] == 5
+    assert len(reads) == 1
 
 
 def test_the_warning_is_shown_in_the_report_and_the_dashboard(tmp_path):

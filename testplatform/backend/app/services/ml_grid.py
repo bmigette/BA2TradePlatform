@@ -1587,8 +1587,9 @@ def run_grid(cells: Sequence[Cell], out_dir: Union[str, Path], cpu_slots: int, g
         release_lock(lock)
 
 
-#: the dashboard is rebuilt after every this many finished rows (results and errors alike), at the start and at the end
-DASHBOARD_EVERY = 20
+# The dashboard hook (``_refresh_outputs``) is called at the start, after EVERY finished row (results and errors alike)
+# and at the end; ``ml_grid_report.refresh`` decides in O(1) whether a live rebuild is due (it waits max(60 s, 10 x the
+# last build)); only the start and the end are forced.
 
 
 _REFRESH_FAILURES: Dict[str, int] = {}
@@ -1639,11 +1640,16 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
             if "pool_rebuilds_total" in read_run_summary(out) else 0
     except Exception:                                           # noqa: BLE001  (reporting is never fatal)
         prior_rebuilds = 0
-    planned_keys = [f"{c.key}:{sd}" for c, sd in plan]
+    planned = {"planned_count": len(plan), "planned_hash": ""}
+    try:                                                        # the list lives in planned_keys.txt, written once
+        from app.services.ml_grid_report import write_planned
+        planned["planned_hash"] = write_planned(out, [f"{c.key}:{sd}" for c, sd in plan])
+    except Exception:                                           # noqa: BLE001  (reporting is never fatal)
+        logger.warning(f"ml_grid: could not write planned_keys.txt in {out}", exc_info=True)
 
     def refresh(final: bool, finished: int) -> None:
         _refresh_outputs(out, {**summary, "planned_tasks": len(plan), "planned_cells": len(cells),
-                               "planned_keys": planned_keys, "prior_pool_rebuilds": prior_rebuilds}, final, finished)
+                               **planned, "prior_pool_rebuilds": prior_rebuilds}, final, finished)
     if not tasks:
         refresh(True, 0)
         return summary
@@ -1674,7 +1680,7 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
                 f"skipped={len(r['skipped_blocks'])} ({r['timings']['total']:.0f}s)",
                 min(99.0, 100.0 * (summary["done"] + summary["errors"]) / len(tasks)))
         n = summary["done"] + summary["errors"]
-        if n % DASHBOARD_EVERY == 0 and n < len(tasks):          # the final rebuild covers the last row
+        if n < len(tasks):                                       # the final rebuild covers the last row
             refresh(False, n)
 
     try:

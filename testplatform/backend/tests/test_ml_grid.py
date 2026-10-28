@@ -1585,22 +1585,19 @@ def _horizon_cells(world, n):
     return [cell(world[0], target={"kind": "rel_return", "horizon": h}) for h in (1, 3, 5, 10, 20)[:n]]
 
 
-@pytest.mark.parametrize("n_cells, expected", [
-    (5, [(0, False), (2, False), (4, False), (5, True)]),
-    (4, [(0, False), (2, False), (4, True)]),            # the cadence build at 4 would duplicate the final one
-])
-def test_the_dashboard_is_rebuilt_at_the_start_every_n_finished_rows_and_at_the_end(signal_world, tmp_path,
-                                                                                    monkeypatch, n_cells, expected):
+@pytest.mark.parametrize("n_cells", [5, 4])
+def test_the_dashboard_hook_runs_at_the_start_after_every_finished_row_and_at_the_end(signal_world, tmp_path,
+                                                                                     monkeypatch, n_cells):
     calls = []
-    monkeypatch.setattr(G, "DASHBOARD_EVERY", 2)
     monkeypatch.setattr(G, "_refresh_outputs", lambda out, summary, final, finished: calls.append((finished, final)))
     run(_horizon_cells(signal_world, n_cells), tmp_path / "o", signal_world, task_fn=fake_task)
-    assert calls == expected
+    # the throttle lives in ml_grid_report.refresh (an O(1) check), so the runner asks after EVERY row; the last row
+    # is covered by the final rebuild
+    assert calls == [(i, False) for i in range(n_cells)] + [(n_cells, True)]
 
 
-def test_errors_count_as_finished_rows_for_the_cadence(signal_world, tmp_path, monkeypatch):
+def test_errors_count_as_finished_rows_for_the_hook(signal_world, tmp_path, monkeypatch):
     calls = []
-    monkeypatch.setattr(G, "DASHBOARD_EVERY", 2)
     monkeypatch.setattr(G, "_refresh_outputs", lambda out, summary, final, finished: calls.append((finished, final)))
 
     def sometimes_error(cfg, seed, key):
@@ -1608,11 +1605,25 @@ def test_errors_count_as_finished_rows_for_the_cadence(signal_world, tmp_path, m
             return G._error_record(key, seed, "boom", "l")
         return fake_task(cfg, seed, key)
     run(_horizon_cells(signal_world, 4), tmp_path / "o", signal_world, task_fn=sometimes_error)
-    assert calls == [(0, False), (2, False), (4, True)]
+    assert calls == [(0, False), (1, False), (2, False), (3, False), (4, True)]
 
 
-def test_the_default_cadence_is_twenty_rows():
-    assert G.DASHBOARD_EVERY == 20
+def test_only_the_start_and_the_end_force_a_build(signal_world, tmp_path, monkeypatch):
+    import app.services.ml_grid_report as RP
+    seen = []
+    monkeypatch.setattr(RP, "refresh", lambda out, summary, final, force=False: seen.append((final, force)))
+    run(_horizon_cells(signal_world, 3), tmp_path / "o", signal_world, task_fn=fake_task)
+    assert seen == [(False, True), (False, False), (False, False), (True, True)]
+
+
+def test_live_builds_during_a_run_are_throttled_by_the_report_module(signal_world, tmp_path, monkeypatch):
+    import app.services.ml_grid_report as RP
+    built = []
+    real = RP.render_dashboard
+    monkeypatch.setattr(RP, "render_dashboard", lambda st: (built.append(1), real(st))[1])
+    monkeypatch.setattr(RP, "_now", lambda: 1000.0)                          # the clock never advances
+    run(_horizon_cells(signal_world, 5), tmp_path / "o", signal_world, task_fn=fake_task)
+    assert len(built) == 2                                                   # the start and the end, nothing between
 
 
 def test_a_finished_run_leaves_report_dashboard_and_run_summary(signal_world, tmp_path):
@@ -1768,7 +1779,6 @@ def test_a_failing_rebuild_is_logged_in_full_once_and_then_only_counted(signal_w
     def boom(*a, **k):
         raise OSError("the dashboard file is open in another program")
     monkeypatch.setattr(RP, "refresh", boom)
-    monkeypatch.setattr(G, "DASHBOARD_EVERY", 1)
     with caplog.at_level("WARNING"):
         res = run(_horizon_cells(signal_world, 4), tmp_path / "o", signal_world, task_fn=fake_task)
     assert res["done"] == 4
@@ -1783,7 +1793,10 @@ def test_the_run_summary_records_the_planned_tasks_and_cumulative_pool_rebuilds(
     run(_horizon_cells(signal_world, 3), out, signal_world, task_fn=fake_task)
     saved = json.loads((out / "run_summary.json").read_text(encoding="utf-8"))
     cells = [G.validate_cell(c) for c in _horizon_cells(signal_world, 3)]
-    assert sorted(saved["planned_keys"]) == sorted(f"{c.key}:1" for c in cells) and saved["planned_tasks"] == 3
+    keys = sorted(f"{c.key}:1" for c in cells)
+    assert saved["planned_tasks"] == 3 and saved["planned_count"] == 3 and "planned_keys" not in saved
+    assert saved["planned_hash"] == __import__("hashlib").sha1("\n".join(keys).encode("utf-8")).hexdigest()
+    assert (out / "planned_keys.txt").read_text(encoding="utf-8").split() == keys
     assert saved["pool_rebuilds"] == 0 and saved["pool_rebuilds_total"] == 0
     saved["pool_rebuilds_total"] = 4                                          # an earlier run had rebuilt the pool
     (out / "run_summary.json").write_text(json.dumps(saved), encoding="utf-8")

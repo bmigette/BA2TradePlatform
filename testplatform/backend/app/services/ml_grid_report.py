@@ -35,6 +35,7 @@ What the rows allow, and the choices made where the design is silent (also liste
 """
 from __future__ import annotations
 
+import hashlib
 import html as _html
 import json
 import logging
@@ -466,6 +467,28 @@ def read_run_summary(out_dir: Union[str, Path]) -> Dict[str, Any]:
         return {}
 
 
+PLANNED_NAME = "planned_keys.txt"
+
+
+def _planned_digest(keys: Sequence[str]) -> str:
+    return hashlib.sha1("\n".join(sorted(keys)).encode("utf-8")).hexdigest()
+
+
+def write_planned(out_dir: Union[str, Path], keys: Sequence[str]) -> str:
+    """Write the run's planned ``cell_key:seed`` tasks (sorted, one per line) to ``planned_keys.txt`` once and return
+    their hash, which ``run_summary.json`` carries (with the count) instead of the list."""
+    ordered = sorted(keys)
+    write_atomic(Path(out_dir) / PLANNED_NAME, "\n".join(ordered) + ("\n" if ordered else ""))
+    return _planned_digest(ordered)
+
+
+def _read_planned(path: Path) -> Optional[List[str]]:
+    try:
+        return path.read_text(encoding="utf-8").split()
+    except OSError:
+        return None
+
+
 _SLIM_METRICS = frozenset(m for ms in HEATMAP_METRICS.values() for m in ms) | frozenset(G.PRIMARY.values())
 _SLIM_CONFIG = ("track", "store", "symbols", "groups", "target", "family", "train_months", "blocks")
 
@@ -589,6 +612,21 @@ class StateCache:
         self.errors = JsonlTail(out / "errors.jsonl", _slim_error, lambda s: (s["cell_key"], s["seed"]))
         self.last_start: Optional[float] = None
         self.last_duration = 0.0
+        self._planned_path = out / PLANNED_NAME
+        self._planned_for: Optional[str] = None                 # the hash the cached list belongs to
+        self._planned: Optional[set] = None
+
+    def planned(self, digest: Optional[str]) -> Optional[set]:
+        """The planned ``cell_key:seed`` set of the run whose hash is ``digest`` (``run_summary.json``): read from
+        ``planned_keys.txt`` ONCE per cache (again only when the hash changes), None when there is none or the file
+        does not match the hash (another run's)."""
+        if not digest:
+            return None
+        if self._planned_for != digest:
+            keys = _read_planned(self._planned_path)
+            self._planned_for = digest
+            self._planned = set(keys) if keys is not None and _planned_digest(keys) == digest else None
+        return self._planned
 
     def due(self, now: float) -> bool:
         """Whether a live (non-final) rebuild may run now: at most every max(60 s, 10 x the last build's duration)."""
@@ -647,13 +685,14 @@ def collect_state(out_dir: Union[str, Path], summary: Optional[Dict[str, Any]] =
     merged = {**read_run_summary(out), **(G._sanitize(summary) if summary else {})}
     is_live = run_is_live(out) if live is None else live
     codes = sorted({r["versions"]["code"] for r in rows if "code" in r["versions"]})
-    planned = set(merged["planned_keys"]) if "planned_keys" in merged else None
+    planned = c.planned(merged["planned_hash"] if "planned_hash" in merged else None)
     if planned:
         done = {f"{k}:{sd}" for k, sd in keys | unresolved}
         n_progress, n_planned = len(planned & done), len(planned)
     else:
         n_progress = len(keys) + len(unresolved)
-        n_planned = merged["planned_tasks"] if "planned_tasks" in merged else None
+        n_planned = (merged["planned_count"] if "planned_count" in merged else
+                     merged["planned_tasks"] if "planned_tasks" in merged else None)
     cancelled = bool(merged["cancelled"]) if "cancelled" in merged else False
     return {"out_dir": out, "rows": rows, "n_rows": len(keys), "n_errors": len(unresolved), "summary": merged,
             "n_progress": n_progress, "n_planned": n_planned, "live": is_live,
