@@ -123,6 +123,12 @@ def read_meta(key: str, cache_root: Optional[os.PathLike] = None) -> Dict[str, A
     return meta
 
 
+def store_stamp(key: str, cache_root: Optional[os.PathLike] = None) -> int:
+    """The mtime (ns) of the store's ``meta.json``. ``write_rows`` writes it AFTER the symbol files, so it changes on
+    every write, in this or another process: a memo of values derived from the store keys on it."""
+    return _mtime(_key_dir(_root(cache_root), key) / "meta.json")
+
+
 def _columns(horizon: int, with_paths: bool, with_classes: bool = False) -> List[str]:
     if with_classes:
         return ["session"] + class_cols(horizon)
@@ -168,34 +174,26 @@ def _load_entry(kdir: Path, sym: str, horizon: int, with_paths: bool, with_class
 
 
 # ---------------------------------------------------------------- reader
-def read_row(model_key: str, symbol: str, decision_session_cutoff: date, horizon: int,
-             cache_root: Optional[os.PathLike] = None,
-             max_age_days: int = MAX_STALE_CALENDAR_DAYS) -> ForecastRow:
-    """The row of the latest session <= ``decision_session_cutoff``, restricted to ``horizon`` (its deciles and,
-    for path stores, its P(TP before SL) cells). Values come back as float32-rounded floats."""
+def _check_read_args(decision_session_cutoff: date, max_age_days: int) -> None:
     if not isinstance(decision_session_cutoff, date) or hasattr(decision_session_cutoff, "hour"):
         raise TypeError("decision_session_cutoff must be a plain date (pass knowability.scan_cutoff_date(as_of)), "
                         f"got {decision_session_cutoff!r}")
     if isinstance(max_age_days, bool) or not isinstance(max_age_days, int) or max_age_days < 1:
         raise ValueError(f"max_age_days must be an int >= 1, got {max_age_days!r}")
-    sym = _symbol(symbol)
-    kdir = _key_dir(_root(cache_root), model_key)
-    meta = read_meta(model_key, cache_root)
-    card = ModelCard.from_dict(meta["card"])
-    if horizon not in card.horizons:
-        raise ValueError(f"horizon {horizon} is not one of the store's horizons {card.horizons}")
-    with_paths = card.output_type == "paths"
-    with_classes = card.output_type == "class_probs"
-    e = _load_entry(kdir, sym, horizon, with_paths, with_classes)
-    idx = int(np.searchsorted(e.sessions, np.datetime64(decision_session_cutoff, "D"), side="right")) - 1
+
+
+def _row_at(e: _Entry, model_key: str, sym: str, cutoff: date, horizon: int, max_age_days: int,
+            with_classes: bool) -> ForecastRow:
+    """The row of the latest session <= ``cutoff`` in the loaded entry, or ForecastStoreMiss (none, or stale)."""
+    idx = int(np.searchsorted(e.sessions, np.datetime64(cutoff, "D"), side="right")) - 1
     if idx < 0:
         first = e.sessions[0].astype(object) if len(e.sessions) else "none"
-        raise ForecastStoreMiss(f"{model_key}/{sym}: no forecast session on or before {decision_session_cutoff} "
+        raise ForecastStoreMiss(f"{model_key}/{sym}: no forecast session on or before {cutoff} "
                                 f"(first stored: {first})")
     session = e.sessions[idx].astype(object)
-    if decision_session_cutoff - session > timedelta(days=max_age_days):
+    if cutoff - session > timedelta(days=max_age_days):
         raise ForecastStoreMiss(f"{model_key}/{sym}: latest forecast session {session} is more than "
-                                f"{max_age_days} days before {decision_session_cutoff}")
+                                f"{max_age_days} days before {cutoff}")
     if with_classes:
         v = [float(x) for x in e.dec[idx]]
         p = np.array(v[:3], dtype=np.float64)
@@ -207,6 +205,52 @@ def read_row(model_key: str, symbol: str, decision_session_cutoff: date, horizon
     if e.probs is not None:
         pp = {(d, horizon, tp, sl): float(v) for (d, tp, sl), v in zip(_PROB_CELLS, e.probs[idx])}
     return ForecastRow(sym, session, {horizon: dec}, pp)
+
+
+def read_row(model_key: str, symbol: str, decision_session_cutoff: date, horizon: int,
+             cache_root: Optional[os.PathLike] = None,
+             max_age_days: int = MAX_STALE_CALENDAR_DAYS) -> ForecastRow:
+    """The row of the latest session <= ``decision_session_cutoff``, restricted to ``horizon`` (its deciles and,
+    for path stores, its P(TP before SL) cells). Values come back as float32-rounded floats."""
+    _check_read_args(decision_session_cutoff, max_age_days)
+    sym = _symbol(symbol)
+    kdir = _key_dir(_root(cache_root), model_key)
+    meta = read_meta(model_key, cache_root)
+    card = ModelCard.from_dict(meta["card"])
+    if horizon not in card.horizons:
+        raise ValueError(f"horizon {horizon} is not one of the store's horizons {card.horizons}")
+    with_paths = card.output_type == "paths"
+    with_classes = card.output_type == "class_probs"
+    e = _load_entry(kdir, sym, horizon, with_paths, with_classes)
+    return _row_at(e, model_key, sym, decision_session_cutoff, horizon, max_age_days, with_classes)
+
+
+def read_session(model_key: str, session_cutoff: date, horizon: int, cache_root: Optional[os.PathLike] = None,
+                 max_age_days: int = MAX_STALE_CALENDAR_DAYS) -> Dict[str, ForecastRow]:
+    """Every stored symbol's latest row with session <= ``session_cutoff``: ``{symbol: ForecastRow}``.
+
+    The same point-in-time and staleness rule as ``read_row`` (a symbol with no session on or before the cutoff, or
+    whose latest one is more than ``max_age_days`` old, is simply absent: it is not "fresh at the cutoff"). The
+    symbols are the store directory's ``*.parquet`` files, in sorted order; frames go through the same per-symbol LRU
+    (``MAX_CACHED_FRAMES_PER_KEY_HORIZON``), so a store wider than the cache re-reads files on every call: callers
+    that call this once per decision date (the expert's ranking) memoise it. A corrupt file raises, never a skip."""
+    _check_read_args(session_cutoff, max_age_days)
+    kdir = _key_dir(_root(cache_root), model_key)
+    meta = read_meta(model_key, cache_root)
+    card = ModelCard.from_dict(meta["card"])
+    if horizon not in card.horizons:
+        raise ValueError(f"horizon {horizon} is not one of the store's horizons {card.horizons}")
+    with_paths = card.output_type == "paths"
+    with_classes = card.output_type == "class_probs"
+    out: Dict[str, ForecastRow] = {}
+    for p in sorted(kdir.glob("*.parquet")):
+        sym = _symbol(p.stem)
+        try:
+            e = _load_entry(kdir, sym, horizon, with_paths, with_classes)
+            out[sym] = _row_at(e, model_key, sym, session_cutoff, horizon, max_age_days, with_classes)
+        except ForecastStoreMiss:
+            continue
+    return out
 
 
 # ---------------------------------------------------------------- writer

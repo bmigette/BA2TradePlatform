@@ -246,3 +246,52 @@ def test_meta_written_after_parquet(tmp_path, key, monkeypatch):
     with pytest.raises(OSError):
         seed(tmp_path, key, [row("AAPL", date(2024, 3, 1))])
     assert not (tmp_path / "ml_forecast" / key / "meta.json").exists()    # a crash never leaves meta without data
+
+
+def test_read_session_is_every_symbols_latest_fresh_row_at_the_cutoff(tmp_path, key):
+    seed(tmp_path, key, [row("AAPL", date(2024, 3, 1), 0.01), row("AAPL", date(2024, 3, 5), 0.02),
+                         row("AAPL", date(2024, 3, 20), 0.09),            # after the cutoff: never returned
+                         row("MSFT", date(2024, 3, 4), 0.03),
+                         row("OLD", date(2024, 2, 20)),                   # 17 days before the cutoff: stale
+                         row("NVDA", date(2024, 3, 25))])                 # first session after the cutoff: absent
+    out = store.read_session(key, date(2024, 3, 8), 5, tmp_path)
+    assert sorted(out) == ["AAPL", "MSFT"]
+    assert out["AAPL"].session == date(2024, 3, 5) and out["MSFT"].session == date(2024, 3, 4)
+    assert_rows_close(out["AAPL"], expect_h5(row("AAPL", date(2024, 3, 5), 0.02)))
+    assert all(r.session <= date(2024, 3, 8) for r in out.values())
+    # agrees with read_row symbol by symbol, staleness included
+    for sym in ("AAPL", "MSFT"):
+        assert out[sym] == store.read_row(key, sym, date(2024, 3, 8), 5, tmp_path)
+    for sym in ("OLD", "NVDA"):
+        with pytest.raises(store.ForecastStoreMiss):
+            store.read_row(key, sym, date(2024, 3, 8), 5, tmp_path)
+    # the staleness window is the caller's
+    assert sorted(store.read_session(key, date(2024, 3, 8), 5, tmp_path, max_age_days=30)) == ["AAPL", "MSFT", "OLD"]
+    assert store.read_session(key, date(2024, 2, 1), 5, tmp_path) == {}
+
+
+def test_read_session_validates_like_read_row(tmp_path, key):
+    seed(tmp_path, key, [row("AAPL", date(2024, 3, 1))])
+    with pytest.raises(TypeError):
+        store.read_session(key, datetime(2024, 3, 1), 5, tmp_path)
+    with pytest.raises(ValueError):
+        store.read_session(key, date(2024, 3, 1), 7, tmp_path)
+    with pytest.raises(ValueError):
+        store.read_session(key, date(2024, 3, 1), 5, tmp_path, max_age_days=0)
+
+
+def test_read_session_reuses_the_symbol_cache(tmp_path, key, monkeypatch):
+    seed(tmp_path, key, [row("AAPL", date(2024, 3, 1)), row("MSFT", date(2024, 3, 1))])
+    store.read_session(key, date(2024, 3, 1), 5, tmp_path)
+    import pandas as pd
+    monkeypatch.setattr(pd, "read_parquet", lambda *a, **k: pytest.fail("parquet re-read despite the LRU"))
+    assert sorted(store.read_session(key, date(2024, 3, 1), 5, tmp_path)) == ["AAPL", "MSFT"]
+
+
+def test_store_stamp_changes_with_the_meta_file(tmp_path, key):
+    import os
+    seed(tmp_path, key, [row("AAPL", date(2024, 3, 1))])
+    a = store.store_stamp(key, tmp_path)
+    p = tmp_path / "ml_forecast" / key / "meta.json"
+    os.utime(p, ns=(a, a + 1_000_000))
+    assert store.store_stamp(key, tmp_path) != a

@@ -14,11 +14,20 @@ order channel, so the RM stop (``risk_per_trade_pct`` / ``min_stop_loss_pct``) a
 On the open-positions pass the expert answers the FLIP question (``exit_flip_prob``): SELL when the bearish
 probability reaches it, BUY when the bullish one does, else HOLD; the ruleset's exit-on-opposite rule then closes a
 held position whose side the flip opposes. A missing forecast row is a skip (``no_forecast``), never a default.
+
+Ranking mode (``rank_top_n`` > 0, long-only): the entry pass ranks EVERY symbol of the store by its bullish score at
+the cutoff session (``mapping.bullish_score``) among the symbols whose latest row is fresh (``store.read_session``).
+A symbol may BUY only inside the top N, and still only through the usual gates; outside it the answer is
+``HOLD ... rank k of n``. On the open-positions pass a held long that is no longer inside the top N gets SELL (a
+rotation exit). The ranked universe is the symbol files of the store, not the symbols the backtest happens to visit:
+build the store for the universe you trade. Only rows with session <= the cutoff are read.
 """
 from __future__ import annotations
 
 import json
 import math
+import threading
+from collections import OrderedDict
 from datetime import datetime, time, timedelta, timezone
 from typing import Mapping
 
@@ -87,6 +96,41 @@ def mapping_genes(settings: Mapping, key: str = None) -> mapping.MappingGenes:
         exit_flip_prob=_num(settings, "exit_flip_prob", 50.000001, 100.0), enable_sell=enable_sell)
 
 
+def rank_top_n(settings: Mapping) -> int:
+    """The validated ``rank_top_n`` setting: an int >= 0, 0 = ranking off. No default: a missing key raises."""
+    v = _num(settings, "rank_top_n", 0, 100000)
+    if v != int(v):
+        raise ValueError(f"Setting 'rank_top_n' must be a whole number, got {settings['rank_top_n']!r}")
+    return int(v)
+
+
+#: ``(store root, model key, horizon, cutoff, store stamp) -> ({symbol: rank (1 = most bullish)}, n)``. The ranking is
+#: one cross-section per decision date, while ``_analyze`` is called once per symbol: without the memo every symbol
+#: would re-read the whole store. Bounded; the store stamp invalidates it when the store is rewritten.
+_RANK_MEMO_SIZE = 8
+_rank_memo: "OrderedDict[tuple, tuple]" = OrderedDict()
+_rank_lock = threading.Lock()
+
+
+def session_ranks(key: str, cutoff, horizon: int) -> tuple:
+    """``({symbol: rank}, n)`` of the fresh rows at ``cutoff``, rank 1 = most bullish. Ordered by the bullish score
+    (``mapping.bullish_score``, descending) and then by symbol name, so equal scores never depend on file order."""
+    memo_key = (str(store._root(None)), key, horizon, cutoff, store.store_stamp(key))
+    with _rank_lock:
+        hit = _rank_memo.get(memo_key)
+        if hit is not None:
+            _rank_memo.move_to_end(memo_key)
+            return hit
+        rows = store.read_session(key, cutoff, horizon)
+        scored = [(mapping.bullish_score(r, horizon), sym) for sym, r in rows.items()]
+        scored.sort(key=lambda t: (-t[0][0], -t[0][1], t[1]))
+        out = ({sym: i + 1 for i, (_, sym) in enumerate(scored)}, len(scored))
+        _rank_memo[memo_key] = out
+        while len(_rank_memo) > _RANK_MEMO_SIZE:
+            _rank_memo.popitem(last=False)
+        return out
+
+
 _alias_memo: dict = {}
 
 
@@ -146,10 +190,14 @@ class MLForecast(MarketExpertInterface):
                                "description": "Opposite-side probability (%) that flips a held position"},
             "enable_sell": {"type": "bool", "required": True, "default": False,
                             "description": "Emit SELL entries on bearish forecasts (short side)"},
+            "rank_top_n": {"type": "int", "required": True, "default": 0,
+                           "description": "Ranking mode (long-only): BUY only the N most bullish symbols of the "
+                                          "store at the decision date and SELL a held long that drops out of the "
+                                          "top N; 0 = off"},
         }
 
     _SETTING_KEYS = ("model_key", "horizon", "min_edge_pct", "min_prob", "max_uncertainty", "tp_quantile",
-                     "sl_quantile", "exit_flip_prob", "enable_sell")
+                     "sl_quantile", "exit_flip_prob", "enable_sell", "rank_top_n")
 
     def __init__(self, id):
         super().__init__(id)
@@ -189,6 +237,9 @@ class MLForecast(MarketExpertInterface):
     def _analyze(self, symbol, providers, settings, as_of, use_case):
         key = resolve_model_key(settings["model_key"])
         genes = mapping_genes(settings, key)
+        top_n = rank_top_n(settings)
+        if top_n and genes.enable_sell:
+            raise ValueError("Setting 'rank_top_n' > 0 is long-only: 'enable_sell' must be off")
         cutoff = scan_cutoff_date(as_of)
         price = self._decision_price(providers, symbol, as_of)
         if price is None:
@@ -205,7 +256,22 @@ class MLForecast(MarketExpertInterface):
             raw["classes"] = [list(x) for x in row.class_probs[genes.horizon]]
         else:
             raw["deciles"] = list(row.deciles[genes.horizon])
+        rank = n_ranked = None
+        if top_n:
+            ranks, n_ranked = session_ranks(key, cutoff, genes.horizon)
+            if row.symbol not in ranks:
+                raise store.ForecastStoreError(f"{key}/{row.symbol}: read_row found a fresh row for {cutoff} that the "
+                                               f"session ranking does not contain")
+            rank = ranks[row.symbol]
+            raw.update({"rank": rank, "rank_n": n_ranked, "rank_top_n": top_n})
         if use_case == AnalysisUseCase.OPEN_POSITIONS:
+            if top_n and rank > top_n:
+                # rotation exit: the held long is no longer among the N most bullish symbols
+                p_up = mapping.p_up(row, genes.horizon)
+                return Recommendation(signal=OrderRecommendation.SELL, confidence=mapping._conf(1.0 - p_up),
+                                      current_price=price, expected_profit_percent=0.0,
+                                      details=f"{symbol} SELL dropped out of top {top_n}: rank {rank} of {n_ranked}",
+                                      raw_outputs={**raw, "pass": "open_positions"})
             # side-agnostic flip: SELL if bearish p >= flip, BUY if bullish p >= flip (only the side the held
             # position opposes acts, through the ruleset's exit-on-opposite rule)
             down = mapping.map_held_position(row, genes, "long")
@@ -218,6 +284,12 @@ class MLForecast(MarketExpertInterface):
             return Recommendation(signal=res.signal, confidence=res.confidence, current_price=price,
                                   expected_profit_percent=0.0, details=f"{symbol} {res.reason}",
                                   raw_outputs={**raw, "pass": "open_positions"})
+        if top_n and rank > top_n:
+            p_up = mapping.p_up(row, genes.horizon)
+            return Recommendation(signal=OrderRecommendation.HOLD, confidence=mapping._conf(max(p_up, 1.0 - p_up)),
+                                  current_price=price, expected_profit_percent=0.0,
+                                  details=f"{symbol} HOLD rank {rank} of {n_ranked} (outside top {top_n})",
+                                  raw_outputs={**raw, "pass": "entry"})
         atr = self._atr(providers.ohlcv(), symbol, cutoff, as_of)
         res = mapping.map_forecast(row, genes, price, atr)
         exp = 0.0
@@ -226,7 +298,8 @@ class MLForecast(MarketExpertInterface):
             exp = abs(res.tp_price / price - 1.0) * 100.0 if res.tp_price is not None else res.expected_profit_percent
         return Recommendation(signal=res.signal, confidence=res.confidence, current_price=price,
                               expected_profit_percent=exp, target_price=res.tp_price,
-                              details=f"{symbol} {res.reason} (atr14 {atr:.4f}, price {price:.4f})",
+                              details=f"{symbol} {res.reason} (atr14 {atr:.4f}, price {price:.4f}"
+                                      + (f", rank {rank} of {n_ranked})" if top_n else ")"),
                               raw_outputs={**raw, "atr14": atr, "tp_price": res.tp_price, "sl_price": res.sl_price,
                                            "pass": "entry"})
 

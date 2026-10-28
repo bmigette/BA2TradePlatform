@@ -1704,6 +1704,10 @@ _EXPERT_OPT = {
             "tp_quantile": {"optimize": True, "min": 60.0, "max": 90.0, "step": 10.0, "type": "float"},
             "sl_quantile": {"optimize": True, "min": 10.0, "max": 40.0, "step": 10.0, "type": "float"},
             "exit_flip_prob": {"optimize": True, "min": 55.0, "max": 70.0, "step": 5.0, "type": "float"},
+            # Ranking mode (strategy MLR, selection track): BUY only the N most bullish symbols of the store, SELL a
+            # held long that drops out of them. [0] = off, the default every other strategy keeps; the launcher flag
+            # --ml-rank-top-n (MLR only) replaces the choices.
+            "rank_top_n": {"optimize": True, "type": "choice", "choices": [0]},
         },
         # S1 runs long-only (shorts need the engine's enable_short), so a SELL entry gene would only spend
         # population on a knob that cannot act; a bearish forecast still exits a held long via the flip.
@@ -2472,7 +2476,8 @@ def _build_strategy_S7(name: str):
 
 #: Strategies only the named expert can use (goal2027 item 2.8). ``SQM`` is the exploration "quality_momentum"
 #: recipe, written for the DeterministicScorer score; another expert would run it on a signal it was not made for.
-_EXPERT_ONLY_STRATEGIES = {"SQM": "DeterministicScorer", "MLH": "MLForecast", "MLF": "MLForecast"}
+_EXPERT_ONLY_STRATEGIES = {"SQM": "DeterministicScorer", "MLH": "MLForecast", "MLF": "MLForecast",
+                           "MLR": "MLForecast"}
 
 
 def _refuse_ds_only_strategy(command: str, kind: str, expert: str) -> None:
@@ -2554,6 +2559,51 @@ def _build_strategy_MLH(name: str, forecast_tp: bool = False):
 def _build_strategy_MLF(name: str):
     """MLF -- MLH plus a take-profit at the forecast's own target (see _build_strategy_MLH)."""
     return _build_strategy_MLH(name, forecast_tp=True)
+
+
+def _build_strategy_MLR(name: str):
+    """MLR -- ML-forecast ROTATION (ML exploration v2, selection track). MLForecast only, with ``rank_top_n`` > 0
+    (``--ml-rank-top-n``): the expert answers BUY only for the N most bullish symbols of the store at the decision
+    date, and SELL for a held long that dropped out of them.
+
+    Entry: bullish and flat. Exits: the bearish signal (= left the top N, or a flip) is ALWAYS on -- it is the
+    rotation itself, not a gene; plus a time exit, ``days_opened >= rebalance`` calendar days (gene 5..20 step 5,
+    toggleable), the rebalance cadence. No take-profit and no strategy stop (fixed brackets are banned in v2; the RM
+    safeguard stop is placed on entry). Position count is bounded by N through the ranking, not by the strategy."""
+    buy = {"id": "root", "type": "AND", "conditions": [
+        {"id": "mlr_bull", "field": "bullish"},
+        {"id": "mlr_flat", "field": "has_no_position"},
+    ]}
+    exits = [
+        {"id": "mlr_exit_signal", "action_type": "close",
+         "conditions": {"type": "AND", "conditions": [{"id": "mlr_bear", "field": "bearish"}]}},
+        {"id": "mlr_exit_time", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "mlr_hold", "field": "has_position"},
+             {"id": "mlr_days", "field": "days_opened", "op": ">=", "value": 10,
+              "optimize": True, "value_min": 5, "value_max": 20, "value_step": 5}]}},
+    ]
+    return _strategy_from_parts(name, buy_tree=buy, exit_conditions=exits)
+
+
+def _apply_ml_rank_top_n(spec: dict, raw, expert: str, strategy: str, command: str) -> dict:
+    """``--ml-rank-top-n 3,5``: make MLForecast's ``rank_top_n`` gene a choice of these N (distinct ints >= 1). MLR only:
+    the ranking mode is the rotation strategy's. Flag-off returns ``spec`` untouched."""
+    if not raw:
+        return spec
+    if expert != "MLForecast" or strategy != "MLR":
+        sys.exit(f"{command}: --ml-rank-top-n only applies to MLForecast with strategy MLR, not {expert!r} / {strategy!r}")
+    try:
+        ns = [int(x) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        sys.exit(f"{command}: --ml-rank-top-n needs comma-separated integers, got {raw!r}")
+    if not ns or len(set(ns)) != len(ns) or min(ns) < 1:
+        sys.exit(f"{command}: --ml-rank-top-n needs distinct integers >= 1, got {raw!r}")
+    import copy
+    out = copy.deepcopy(spec)
+    out["expert_params"]["rank_top_n"] = {"optimize": True, "type": "choice", "choices": ns}
+    print(f"{command}: --ml-rank-top-n: MLForecast rank_top_n gene choices = {ns}")
+    return out
 
 
 def _build_strategy_minimal(name: str):
@@ -7240,6 +7290,7 @@ _STRATEGY_BUILDERS = {
     "SQM": _build_strategy_SQM, # (name) — DeterministicScorer only: exploration quality-momentum (stop/target/time exit)
     "MLH": _build_strategy_MLH, # (name) — MLForecast only: hold for a fixed time, no TP (custom-ML fair test)
     "MLF": _build_strategy_MLF, # (name) — MLForecast only: MLH + take-profit at the forecast's own target
+    "MLR": _build_strategy_MLR, # (name) — MLForecast only: rotation over the top-N ranked symbols (selection track)
     # Option/equity strategies (dispatch by `kind`, not `name`; see _build_strategy):
     "O_LC": _build_strategy_option, "O_VERT": _build_strategy_option,
     "O_SSTG": _build_strategy_option, "O_SSTD": _build_strategy_option,
@@ -7506,6 +7557,7 @@ def _cmd_optimize(args) -> int:
     if spec is None:
         sys.exit(f"ba2-test: optimize not configured for expert {expert!r}; have {sorted(_EXPERT_OPT)}")
     spec = _apply_ml_model_keys(spec, getattr(args, "ml_model_keys", None), expert, "optimize")
+    spec = _apply_ml_rank_top_n(spec, getattr(args, "ml_rank_top_n", None), expert, args.strategy, "optimize")
     _refuse_unbounded_strategy_request("optimize", [args.strategy])
     _refuse_phase_gated_strategy("optimize", [args.strategy])
     # --rm-toggle-policy (design atr_grid_2027 §3.2). "pinned" (default) is byte-identical to
@@ -9576,6 +9628,10 @@ def main(argv: "list | None" = None) -> int:
                     help="MLForecast only: the forecast stores (aliases or 16-hex keys) the model_key gene chooses "
                          "among for this job, replacing _EXPERT_OPT's list (e.g. one store, or a naive/placebo "
                          "control store). Omit: the spec's list.")
+    op.add_argument("--ml-rank-top-n", default=None, metavar="N,N",
+                    help="MLForecast with strategy MLR only: the rank_top_n gene chooses among these N (distinct "
+                         "integers >= 1): BUY only the N most bullish symbols of the store at the decision date, "
+                         "SELL a held long that drops out of them. Omit: the gene is pinned to 0 (ranking off).")
     op.add_argument("--rerun", action="store_true",
                     help="Run even if an optimization with this --name has already "
                          "COMPLETED. Without it the run is skipped (exit 0) and the "

@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ba2_common.core.ml_forecast import store
+from ba2_common.core.ml_forecast import mapping, store
 from ba2_common.core.ml_forecast.forecast_row import ForecastRow
 from ba2_common.core.ml_forecast.model_card import ModelCard, model_key
 from ba2_common.core.types import AnalysisUseCase, OrderRecommendation
@@ -17,7 +17,7 @@ from ba2_experts.MLForecast import MLForecast, mapping_genes, resolve_model_key
 mlf_mod = importlib.import_module("ba2_experts.MLForecast")   # the module (the package re-exports the class)
 
 SETTINGS = {"model_key": "timesfm3-ctx512", "horizon": 10, "min_edge_pct": 1.0, "min_prob": 60.0,
-            "max_uncertainty": 6.0, "tp_quantile": 70.0, "sl_quantile": 30.0, "exit_flip_prob": 60.0,
+            "max_uncertainty": 6.0, "tp_quantile": 70.0, "sl_quantile": 30.0, "exit_flip_prob": 60.0, "rank_top_n": 0,
             "enable_sell": False}
 CARD = ModelCard(model_id="google/timesfm-3.0-pytorch", family="timesfm", version="3.0.2", input_fields=("Close",),
                  timeframe="1d", context_length=512, past_only_covariates=(), past_future_covariates=(),
@@ -137,3 +137,163 @@ def test_class_store_with_horizon_zero_uses_the_store_horizon(tmp_path, monkeypa
 def test_horizon_zero_refuses_a_multi_horizon_store(cache):
     with pytest.raises(ValueError, match="single-horizon"):
         mapping_genes({**SETTINGS, "horizon": 0}, cache)
+
+
+# ---------------------------------------------------------------- ranking mode (rank_top_n)
+def _dec_c(c):
+    """Deciles c + 0.01 * (i - 4): q50 = c, P(up) = 0.5 + 10 * c (0.5 .. 0.9) until the 0.95 clamp (c >= 0.05)."""
+    return tuple(c + 0.01 * (i - 4) for i in range(9))
+
+
+@pytest.fixture
+def rank_cache(tmp_path, monkeypatch):
+    from ba2_common import config
+    monkeypatch.setattr(config, "CACHE_FOLDER", str(tmp_path))
+    mlf_mod._alias_memo.clear()
+    mlf_mod._rank_memo.clear()
+    store.reset_cache()
+    key = model_key(CARD, ())
+    d = date(2025, 3, 3)
+    rows = []
+    for sym, c in (("EEE", 0.0), ("DDD", 0.01), ("CCC", 0.02), ("BBB", 0.03), ("AAA", 0.04)):
+        rows.append(ForecastRow(sym, d, {h: _dec_c(c) for h in (5, 10, 20)}))
+    # the future (after the 03-03 cutoff): the most bullish row ever for EEE, a bearish one for AAA
+    rows.append(ForecastRow("EEE", date(2025, 3, 10), {h: _dec_c(0.06) for h in (5, 10, 20)}))
+    rows.append(ForecastRow("AAA", date(2025, 3, 10), {h: _dec_c(-0.06) for h in (5, 10, 20)}))
+    # stale at the cutoff: its only row is 10 days old (> MAX_STALE_CALENDAR_DAYS)
+    rows.append(ForecastRow("ZZZ", date(2025, 2, 21), {h: _dec_c(0.05) for h in (5, 10, 20)}))
+    store.write_rows(key, CARD, {"card_id": "timesfm3-ctx512"}, rows, (), tmp_path)
+    yield key
+    store.reset_cache()
+    mlf_mod._rank_memo.clear()
+
+
+def _signals(settings, when=date(2025, 3, 3), use_case="daily_expert", syms=("AAA", "BBB", "CCC", "DDD", "EEE")):
+    return {s: _expert()._analyze(s, _Providers(), settings, _at(when), use_case) for s in syms}
+
+
+def test_rank_top_n_is_validated():
+    assert mlf_mod.rank_top_n(SETTINGS) == 0
+    assert mlf_mod.rank_top_n({**SETTINGS, "rank_top_n": 3}) == 3
+    assert mlf_mod.rank_top_n({**SETTINGS, "rank_top_n": 3.0}) == 3
+    for bad in (-1, 1.5, True, "3", None, float("nan")):
+        with pytest.raises(ValueError, match="rank_top_n"):
+            mlf_mod.rank_top_n({**SETTINGS, "rank_top_n": bad})
+    no_key = dict(SETTINGS)
+    del no_key["rank_top_n"]
+    with pytest.raises(ValueError, match="Missing setting 'rank_top_n'"):
+        mlf_mod.rank_top_n(no_key)
+    d = MLForecast.get_settings_definitions()["rank_top_n"]
+    assert d["default"] == 0 and "rank_top_n" in MLForecast._SETTING_KEYS
+
+
+def test_rank_mode_is_long_only(rank_cache):
+    with pytest.raises(ValueError, match="long-only"):
+        _expert()._analyze("AAA", _Providers(), {**SETTINGS, "rank_top_n": 2, "enable_sell": True},
+                           _at(date(2025, 3, 3)), "daily_expert")
+
+
+def test_ranking_off_ignores_the_rank(rank_cache):
+    recs = _signals({**SETTINGS, "rank_top_n": 0, "min_prob": 55.0, "min_edge_pct": 0.5})
+    assert [recs[s].signal for s in "AAA BBB CCC DDD EEE".split()] == [OrderRecommendation.BUY] * 4 + [OrderRecommendation.HOLD]
+    assert "rank" not in recs["AAA"].raw_outputs
+
+
+def test_ranking_buys_exactly_the_top_n_of_the_fresh_rows(rank_cache):
+    s = {**SETTINGS, "rank_top_n": 2, "min_prob": 55.0, "min_edge_pct": 0.5}
+    recs = _signals(s)
+    assert recs["AAA"].signal == OrderRecommendation.BUY and recs["BBB"].signal == OrderRecommendation.BUY
+    for sym, k in (("CCC", 3), ("DDD", 4), ("EEE", 5)):
+        assert recs[sym].signal == OrderRecommendation.HOLD
+        assert f"rank {k} of 5" in recs[sym].details          # ZZZ is stale: not counted; the future rows are unseen
+        assert recs[sym].raw_outputs["rank"] == k and recs[sym].raw_outputs["rank_n"] == 5
+    assert recs["AAA"].raw_outputs["rank"] == 1
+    # a stale symbol is a skip, as without ranking
+    z = _expert()._analyze("ZZZ", _Providers(), s, _at(date(2025, 3, 3)), "daily_expert")
+    assert z.skip and z.skip_reason == "no_forecast"
+
+
+def test_top_n_still_goes_through_the_gates(rank_cache):
+    # EEE (q50 = 0, P(up) 0.5) is inside the top 5 but fails the direction gate: HOLD with the gate's reason
+    s = {**SETTINGS, "rank_top_n": 5, "min_prob": 55.0, "min_edge_pct": 0.5}
+    recs = _signals(s)
+    assert recs["EEE"].signal == OrderRecommendation.HOLD and "gate=" in recs["EEE"].details
+    # min_prob 75 blocks everyone whose P(up) < 0.75 even inside the top N
+    recs = _signals({**s, "min_prob": 75.0})
+    assert [recs[x].signal for x in "AAA BBB CCC".split()] == [OrderRecommendation.BUY, OrderRecommendation.BUY,
+                                                               OrderRecommendation.HOLD]
+    assert "gate=min_prob" in recs["CCC"].details
+
+
+def test_held_long_dropped_from_the_top_n_is_sold(rank_cache):
+    s = {**SETTINGS, "rank_top_n": 2}
+    recs = _signals(s, use_case=AnalysisUseCase.OPEN_POSITIONS)
+    assert recs["CCC"].signal == OrderRecommendation.SELL and "dropped out of top 2" in recs["CCC"].details
+    assert recs["EEE"].signal == OrderRecommendation.SELL
+    # inside the top N the existing flip logic applies: a bullish row leaves a held long alone
+    assert recs["AAA"].signal == OrderRecommendation.BUY and recs["BBB"].signal == OrderRecommendation.BUY
+    # ranking off: CCC (P(up) 0.7) is no flip
+    off = _signals({**SETTINGS, "rank_top_n": 0}, use_case=AnalysisUseCase.OPEN_POSITIONS)
+    assert off["CCC"].signal == OrderRecommendation.BUY
+
+
+def test_ties_break_by_symbol_name_and_clamped_probabilities_by_the_median(tmp_path, monkeypatch):
+    from ba2_common import config
+    monkeypatch.setattr(config, "CACHE_FOLDER", str(tmp_path))
+    mlf_mod._alias_memo.clear()
+    mlf_mod._rank_memo.clear()
+    store.reset_cache()
+    key = model_key(CARD, ())
+    d = date(2025, 3, 3)
+    # TIEB is written before TIEA on purpose. LOW, TIEA, TIEB: identical rows. HIGH also clamps P(up) at 0.95 but has
+    # the larger q50.
+    rows = [ForecastRow(sym, d, {h: _dec_c(c) for h in (5, 10, 20)})
+            for sym, c in (("TIEB", 0.05), ("TIEA", 0.05), ("LOW", 0.05), ("HIGH", 0.08), ("WEAK", 0.01))]
+    store.write_rows(key, CARD, {"card_id": "timesfm3-ctx512"}, rows, (), tmp_path)
+    ranks, n = mlf_mod.session_ranks(key, d, 10)
+    assert n == 5
+    assert ranks == {"HIGH": 1, "LOW": 2, "TIEA": 3, "TIEB": 4, "WEAK": 5}
+    assert mlf_mod.session_ranks(key, d, 10) == (ranks, n)
+    store.reset_cache()
+
+
+def test_ranking_reads_no_row_after_the_cutoff(rank_cache, monkeypatch):
+    seen = []
+    real = mapping.bullish_score
+
+    def spy(row, horizon):
+        seen.append((row.symbol, row.session))
+        return real(row, horizon)
+
+    monkeypatch.setattr(mapping, "bullish_score", spy)
+    _signals({**SETTINGS, "rank_top_n": 2, "min_prob": 55.0, "min_edge_pct": 0.5}, when=date(2025, 3, 3))
+    assert seen and all(sess <= date(2025, 3, 3) for _, sess in seen)
+    assert {sym for sym, _ in seen} == {"AAA", "BBB", "CCC", "DDD", "EEE"}
+    # the same call on the later date does see the later rows (the spy is not blind)
+    seen.clear()
+    mlf_mod._rank_memo.clear()
+    mlf_mod.session_ranks(rank_cache, date(2025, 3, 10), 10)
+    assert date(2025, 3, 10) in {sess for _, sess in seen}
+
+
+def test_ranking_is_computed_once_per_date_and_rebuilt_when_the_store_changes(rank_cache, monkeypatch, tmp_path):
+    calls = []
+    real = store.read_session
+
+    def spy(*a, **k):
+        calls.append(a[1])
+        return real(*a, **k)
+
+    monkeypatch.setattr(store, "read_session", spy)
+    mlf_mod.session_ranks(rank_cache, date(2025, 3, 3), 10)
+    mlf_mod.session_ranks(rank_cache, date(2025, 3, 3), 10)
+    assert calls == [date(2025, 3, 3)]
+    mlf_mod.session_ranks(rank_cache, date(2025, 3, 4), 10)
+    assert len(calls) == 2
+    # a rewrite of the store (new meta.json stamp) invalidates the memo
+    import os
+    meta = tmp_path / "ml_forecast" / rank_cache / "meta.json"
+    st = meta.stat()
+    os.utime(meta, ns=(st.st_atime_ns, st.st_mtime_ns + 10_000_000))
+    mlf_mod.session_ranks(rank_cache, date(2025, 3, 3), 10)
+    assert len(calls) == 3
