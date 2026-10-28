@@ -13,7 +13,8 @@ from tests.test_ml_features import (STORE_SCANS, _assert_cut_identical, _build, 
 from tests.test_ml_features_analyst import write_fmp_rows
 
 # (filingDate, type, shares, price, cik, formType)
-FILINGS = [("2023-02-01 09:00:00", "P-Purchase", 1000, 10.0, "0001", "4"),
+FILINGS = [("2022-10-03 10:00:00", "A-Award", 10, 0.0, "0009", "4"),           # the first retained row: coverage from +90 days
+           ("2023-02-01 09:00:00", "P-Purchase", 1000, 10.0, "0001", "4"),
            ("2023-02-10 16:30:00", "S-Sale", 500, 20.0, "0002", "4"),
            ("2023-02-12 08:00:00", "P-Purchase", 200, 10.0, "0001", "4"),          # a Sunday filing
            ("2023-03-01 10:00:00", "P-Purchase", 100, 50.0, "0003", "5"),          # not Form 4
@@ -58,11 +59,11 @@ def _reference(sessions, sym, filings=FILINGS):
         w = [r for r in rows if S - pd.Timedelta(days=90) <= r[0] < S and r[4] == "4"]
         net = sum(r[2] for r in w if r[1].startswith("P-")) - sum(r[2] for r in w if r[1].startswith("S-"))
         buyers = len({r[3] for r in w if r[1].startswith("P-")})
-        covered = S > cov
+        covered = S >= cov + pd.Timedelta(days=90)
         cap = _mcap(sym, str(S.date())) if str(S.date()) >= STORE_SCANS[0] else np.nan
         out.append({"i_net_buy_90": net / cap if covered else np.nan, "i_n_buyers_90": buyers if covered else np.nan,
                     "i_covered": 1.0 if covered else 0.0})
-    return pd.DataFrame(out, index=sessions)[list(F.I_COLUMNS)]
+    return pd.DataFrame(out, index=sessions)[list(F.I_COLUMNS)].astype("float64")
 
 
 def test_i_columns_and_registry(insider_cache):
@@ -79,7 +80,7 @@ def test_every_column_against_a_brute_force_reference(insider_cache):
 def test_hand_checked_values(insider_cache):
     f = _ibuild(insider_cache).loc["AAA"]
     t = pd.Timestamp
-    assert f.loc[t("2023-02-01"), "i_covered"] == 0 and np.isnan(f.loc[t("2023-02-01"), "i_net_buy_90"])   # filed that day: not yet
+    assert f.loc[t("2023-02-01"), "i_covered"] == 1 and f.loc[t("2023-02-01"), "i_net_buy_90"] == 0       # filed that day: not yet
     assert f.loc[t("2023-02-02"), "i_covered"] == 1                                                         # the session after
     assert f.loc[t("2023-02-02"), "i_net_buy_90"] == pytest.approx(10000.0 / _mcap("AAA", "2023-02-02"))
     assert f.loc[t("2023-02-10"), "i_net_buy_90"] == pytest.approx(10000.0 / _mcap("AAA", "2023-02-10"))   # the 16:30 sale: not yet
@@ -91,6 +92,16 @@ def test_hand_checked_values(insider_cache):
     assert f.loc[late, "i_net_buy_90"] == 0 and f.loc[late, "i_n_buyers_90"] == 0 and f.loc[late, "i_covered"] == 1
 
 
+def test_coverage_starts_90_days_after_the_first_retained_filing(insider_cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(insider_cache, root)
+    write_fmp_rows(root, "insider_v2", "AAA", _rows("AAA", [("2023-01-05 10:00:00", "P-Purchase", 100, 10.0, "0001", "4")]))
+    f = _ibuild(root, symbols=("AAA",), first=date(2023, 3, 1), last=date(2023, 6, 30)).loc["AAA"]
+    t = pd.Timestamp
+    assert f.loc[t("2023-04-04"), "i_covered"] == 0 and f.loc[t("2023-04-04"), ["i_net_buy_90", "i_n_buyers_90"]].isna().all()
+    assert f.loc[t("2023-04-05"), "i_covered"] == 1 and f.loc[t("2023-04-05"), "i_n_buyers_90"] == 1      # 01-05 + 90 days
+
+
 def test_net_buy_is_nan_where_the_market_cap_is_unknown(insider_cache, tmp_path):
     """Before the store's first scan (2021-06-02 in the fixture) there is no market cap, but the flag and the buyers are there."""
     root = tmp_path / "c"
@@ -98,8 +109,10 @@ def test_net_buy_is_nan_where_the_market_cap_is_unknown(insider_cache, tmp_path)
     write_fmp_rows(root, "insider_v2", "AAA", _rows("AAA", [("2021-02-01 10:00:00", "P-Purchase", 100, 10.0, "0001", "4")]))
     f = _ibuild(root, symbols=("AAA",), first=date(2021, 3, 1), last=date(2021, 8, 31)).loc["AAA"]
     early = f.index < pd.Timestamp(STORE_SCANS[0])
-    assert early.sum() > 20 and f.loc[early, "i_net_buy_90"].isna().all()
-    assert (f["i_covered"] == 1).all() and f.loc[early, "i_n_buyers_90"].notna().all()
+    covered = f["i_covered"] == 1
+    assert covered.iloc[0] == False and covered.loc[pd.Timestamp("2021-05-03"):].all()                     # 2021-02-01 + 90 days
+    gap = early & covered                                                                                   # covered, but no scan yet
+    assert gap.sum() > 10 and f.loc[gap, "i_net_buy_90"].isna().all() and f.loc[gap, "i_n_buyers_90"].notna().all()
     assert f.loc[~early, "i_net_buy_90"].notna().any()
 
 

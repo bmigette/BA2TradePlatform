@@ -1180,89 +1180,131 @@ def _codes(names: List[object]) -> np.ndarray:
     return out
 
 
-def _covered_from(event_days: np.ndarray, sessions: pd.DatetimeIndex) -> np.ndarray:
-    """Sessions from which a file has coverage: strictly after its earliest event (all False for an empty file)."""
+#: A capped history (FMP keeps a limited number of rows per file) starts at some first retained row; a 90-day window that
+#: reaches back before it is partly truncated. Coverage therefore starts this many calendar days after the first row.
+COVERAGE_WARMUP_DAYS = 90
+
+
+def _covered_from(event_days: np.ndarray, sessions: pd.DatetimeIndex, warmup_days: int = COVERAGE_WARMUP_DAYS) -> np.ndarray:
+    """Sessions with coverage: ``warmup_days`` calendar days after the earliest retained event (and so strictly after
+    it); all False for an empty file."""
     if len(event_days) == 0:
         return np.zeros(len(sessions), dtype=bool)
-    return sessions.values.astype("datetime64[D]") > event_days.min()
+    start = event_days.min() + np.timedelta64(max(int(warmup_days), 1), "D")
+    return sessions.values.astype("datetime64[D]") >= start
 
 
-# ------------------------------------------------------------------------------------------ group A (analysts)
-A_COLUMNS: Tuple[str, ...] = ("a_net_upgrades_30", "a_net_upgrades_90", "a_n_grades_90", "a_target_gap",
-                              "a_target_rev_30", "a_n_analysts_90")
-_ACTION_SCORE: Dict[str, int] = {"upgrade": 1, "downgrade": -1, "maintain": 0, "": 0}
+# ------------------------------------------------------------------------------------------ groups AG / AT (analysts)
+AG_COLUMNS: Tuple[str, ...] = ("ag_net_upgrades_30", "ag_net_upgrades_90", "ag_n_grades_90", "ag_covered")
+AT_COLUMNS: Tuple[str, ...] = ("at_target_gap", "at_target_rev_30", "at_n_analysts_90", "at_covered")
+#: `action` values of analyst_grades. Upgrades / downgrades score +1 / -1; everything in NEUTRAL_ACTIONS scores 0 (a
+#: first-time rating, a repeated one, a resumed coverage ... is not a change of view). Anything else refuses, so a new
+#: vendor spelling is looked at instead of silently counted as neutral. (The real cache only has upgrade, downgrade,
+#: maintain and one empty string.)
+_ACTION_SCORE: Dict[str, int] = {"upgrade": 1, "downgrade": -1}
+NEUTRAL_ACTIONS: Tuple[str, ...] = ("maintain", "", "initialize", "initialise", "initiate", "initiated", "init", "reiterate",
+                                    "reiterated", "reaffirm", "assume", "assumed", "resume", "resumed", "none")
 
 
-def _analyst_one(ctx: BuildContext, symbol: str, close: np.ndarray) -> pd.DataFrame:
+def _grades_one(ctx: BuildContext, symbol: str) -> pd.DataFrame:
     sessions = ctx.sessions
     grades = _read_fmp_rows("analyst_grades", symbol, ctx)
-    targets = _read_fmp_rows("price_target", symbol, ctx)
-    out: Dict[str, np.ndarray] = {}
-    # --- grades: +1 upgrade / -1 downgrade (by the file's `action`), counted over 30 / 90 calendar days
     gd = _event_days(grades, "date", symbol, "analyst_grades")
     score = np.zeros(len(grades))
     for i, r in enumerate(grades):
         action = (str(r["action"]) if "action" in r and r["action"] is not None else "").strip().lower()
-        if action not in _ACTION_SCORE:
-            raise PanelDataError(f"{symbol}: analyst_grades has unknown action {action!r} (known {sorted(_ACTION_SCORE)})")
-        score[i] = _ACTION_SCORE[action]
+        if action in _ACTION_SCORE:
+            score[i] = _ACTION_SCORE[action]
+        elif action not in NEUTRAL_ACTIONS:
+            raise PanelDataError(f"{symbol}: analyst_grades has unknown action {action!r} (scoring {sorted(_ACTION_SCORE)}, "
+                                 f"neutral {sorted(NEUTRAL_ACTIONS)}); add it to one of them")
     order = np.argsort(gd, kind="stable")
     gd, score = gd[order], score[order]
-    gcodes = _codes([grades[i].get("gradingCompany") for i in order])
-    g_cov = _covered_from(gd, sessions)
+    codes = _codes([grades[i].get("gradingCompany") for i in order])
+    cov = _covered_from(gd, sessions)
     cs = _csum(score)
+    out: Dict[str, np.ndarray] = {}
     for n in (30, 90):
         lo, hi = _window_bounds(gd, sessions, n)
-        out[f"a_net_upgrades_{n}"] = np.where(g_cov, _window_sum(cs, lo, hi), np.nan)
+        out[f"ag_net_upgrades_{n}"] = np.where(cov, _window_sum(cs, lo, hi), np.nan)
     lo, hi = _window_bounds(gd, sessions, 90)
-    out["a_n_grades_90"] = np.where(g_cov, _distinct(gcodes, lo, hi), np.nan)
-    # --- targets: only rows with a positive adjusted target (the other rows carry no target)
-    keep = [i for i, r in enumerate(targets) if _num(r, "adjPriceTarget") > 0]
+    out["ag_n_grades_90"] = np.where(cov, _distinct(codes, lo, hi), np.nan)
+    out["ag_covered"] = cov.astype("float64")
+    return pd.DataFrame(out, index=sessions)[list(AG_COLUMNS)]
+
+
+def analyst_grades(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
+    """Group ``ag_``: analyst GRADE changes from ``analyst_grades__<SYM>.json`` only (``date``, ``gradingCompany``,
+    ``action``). A row is public from the session AFTER its date; windows are ``[S - N days, S)``.
+
+    * ``ag_net_upgrades_30`` / ``_90``: upgrades minus downgrades in the window (``NEUTRAL_ACTIONS`` score 0);
+    * ``ag_n_grades_90``: distinct ``gradingCompany`` in the 90-day window;
+    * ``ag_covered``: 1 from ``COVERAGE_WARMUP_DAYS`` after the first retained row (the history is capped, so earlier 90-day
+      windows would be partly truncated), else 0; the three columns are NaN before it, and after it an empty window is a
+      real 0.
+
+    FMP's consensus / summary files are never opened (they are windowed to about the last quarter: look-ahead before it).
+    A missing file or an unknown action refuses; an empty file is never covered."""
+    frames = {sym: _grades_one(ctx, sym) for sym in ctx.symbols}
+    return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
+
+
+def _targets_one(ctx: BuildContext, symbol: str, close: np.ndarray) -> pd.DataFrame:
+    sessions = ctx.sessions
+    targets = _read_fmp_rows("price_target", symbol, ctx)
+    keep = [i for i, r in enumerate(targets) if _num(r, "adjPriceTarget") > 0]       # the other rows carry no target
     td = _event_days([targets[i] for i in keep], "publishedDate", symbol, "price_target")
     adj = np.array([_num(targets[i], "adjPriceTarget") for i in keep])
     order = np.argsort(td, kind="stable")
     td, adj = td[order], adj[order]
-    tcodes = _codes([targets[keep[i]].get("analystCompany") for i in order])
-    t_cov = _covered_from(td, sessions)
-    lo, hi = _window_bounds(td, sessions, 90)
-    count = (hi - lo).astype("float64")
-    mean = np.full(len(sessions), np.nan)
-    has = count > 0
-    mean[has] = _window_sum(_csum(adj), lo, hi)[has] / count[has]
-    mean = np.where(t_cov, mean, np.nan)
+    codes = _codes([targets[keep[i]].get("analystCompany") for i in order])
+    cov = _covered_from(td, sessions)
+    csum = _csum(adj)
+
+    def mean90(shift_days: int) -> np.ndarray:
+        """The 90-day window mean as seen at (each session - shift_days)."""
+        s_days = sessions.values.astype("datetime64[D]") - np.timedelta64(shift_days, "D")
+        lo = np.searchsorted(td, s_days - np.timedelta64(90, "D"), side="left")
+        hi = np.searchsorted(td, s_days, side="left")
+        count = (hi - lo).astype("float64")
+        out = np.full(len(sessions), np.nan)
+        has = count > 0
+        out[has] = _window_sum(csum, lo, hi)[has] / count[has]
+        return out
+    now = np.where(cov, mean90(0), np.nan)
+    # a revision needs the earlier instant to be covered too (its window not truncated)
+    first_cov = td.min() + np.timedelta64(COVERAGE_WARMUP_DAYS, "D") if len(td) else None
+    earlier_ok = (sessions.values.astype("datetime64[D]") - np.timedelta64(30, "D") >= first_cov) if first_cov is not None \
+        else np.zeros(len(sessions), dtype=bool)
+    before = np.where(earlier_ok, mean90(30), np.nan)
+    out: Dict[str, np.ndarray] = {}
     gap = np.full(len(sessions), np.nan)
-    ok = np.isfinite(mean) & (close > 0)
-    gap[ok] = np.clip(mean[ok] / close[ok] - 1.0, -5.0, 5.0)
-    out["a_target_gap"] = gap
-    m = pd.Series(mean)
-    prior = m.shift(30)
-    out["a_target_rev_30"] = np.clip((m / prior.where(prior > 0) - 1.0).to_numpy(), -5.0, 5.0)
-    out["a_n_analysts_90"] = np.where(t_cov, _distinct(tcodes, lo, hi), np.nan)
-    return pd.DataFrame(out, index=sessions)[list(A_COLUMNS)]
+    ok = np.isfinite(now) & (close > 0)
+    gap[ok] = np.clip(now[ok] / close[ok] - 1.0, -5.0, 5.0)
+    out["at_target_gap"] = gap
+    rev = np.full(len(sessions), np.nan)
+    ok = np.isfinite(now) & np.isfinite(before) & (before > 0)
+    rev[ok] = np.clip(now[ok] / before[ok] - 1.0, -5.0, 5.0)
+    out["at_target_rev_30"] = rev
+    lo, hi = _window_bounds(td, sessions, 90)
+    out["at_n_analysts_90"] = np.where(cov, _distinct(codes, lo, hi), np.nan)
+    out["at_covered"] = cov.astype("float64")
+    return pd.DataFrame(out, index=sessions)[list(AT_COLUMNS)]
 
 
-def analysts(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
-    """Group ``a_``: sell-side opinion from the PER-ANALYST dated rows only.
+def analyst_targets(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
+    """Group ``at_``: analyst PRICE TARGETS from ``price_target__<SYM>.json`` only (``publishedDate``, ``analystCompany``,
+    ``adjPriceTarget``); a row is public from the session AFTER its date part, windows ``[S - N days, S)``.
 
-    Files: ``analyst_grades__<SYM>.json`` (``date``, ``gradingCompany``, ``action``) and ``price_target__<SYM>.json``
-    (``publishedDate``, ``analystCompany``, ``adjPriceTarget``). FMP's consensus / summary files
-    (``price_target_consensus*``, ``grades_consensus*``, ``grades_historical``) are windowed to about the last quarter, which
-    is look-ahead before that window: they are never opened (a test watches every file the build reads).
+    * ``at_target_gap``: mean ``adjPriceTarget`` of the 90-day window over the S close, minus 1 (clipped to [-5, 5]); NaN
+      when the window has no target. This is the group's coverage column;
+    * ``at_target_rev_30``: that 90-day mean over the same mean as seen 30 CALENDAR days earlier, minus 1 (NaN unless both
+      instants are covered and have a target);
+    * ``at_n_analysts_90``: distinct ``analystCompany`` in the window (two targets of one company count once);
+    * ``at_covered``: 1 from ``COVERAGE_WARMUP_DAYS`` after the first retained row (capped history), else 0.
 
-    A row is visible from the session AFTER its date (for ``publishedDate`` the date part; a pre-market time does not
-    change that), so at session S the rows dated before S exist and a window is ``[S - N days, S)``.
-
-    * ``a_net_upgrades_30`` / ``_90``: upgrades minus downgrades (by ``action``; maintain counts 0) in the window;
-    * ``a_n_grades_90``: distinct ``gradingCompany`` in the 90-day grade window;
-    * ``a_target_gap``: mean ``adjPriceTarget`` of the 90-day window over the S close, minus 1 (clipped to [-5, 5]);
-      NaN when the window has no target;
-    * ``a_target_rev_30``: that 90-day mean over its value 30 sessions earlier, minus 1;
-    * ``a_n_analysts_90``: distinct ``analystCompany`` in the 90-day target window (two targets of one company count once).
-
-    Coverage: before a file's first row is visible every column of its kind is NaN (no fabricated zero). Once covered,
-    an empty window gives 0 upgrades / 0 names (that is real), but no target gap. An empty file is never covered. A
-    missing file or an unknown ``action`` refuses."""
-    frames = {sym: _analyst_one(ctx, sym, daily[sym]["close"].to_numpy(dtype="float64")) for sym in ctx.symbols}
+    Before coverage every column but the flag is NaN; an empty window after it is 0 names but no gap. A missing file refuses."""
+    frames = {sym: _targets_one(ctx, sym, daily[sym]["close"].to_numpy(dtype="float64")) for sym in ctx.symbols}
     return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
 
 
@@ -1439,8 +1481,8 @@ GROUPS: Dict[str, GroupSpec] = {
     "mac": GroupSpec(macro, "mac_", coverage_columns=tuple(
         c for c in MAC_COLUMNS if not any(c.startswith(f"mac_{sid.lower()}_") for sid in KNOWN_STALLS))),
     "f": GroupSpec(fundamentals, "f_"),
-    "a": GroupSpec(analysts, "a_", coverage_columns=("a_net_upgrades_30", "a_net_upgrades_90", "a_n_grades_90",
-                                                       "a_n_analysts_90")),
+    "ag": GroupSpec(analyst_grades, "ag_", coverage_columns=("ag_net_upgrades_30", "ag_net_upgrades_90", "ag_n_grades_90")),
+    "at": GroupSpec(analyst_targets, "at_", coverage_columns=("at_target_gap",)),
     "i": GroupSpec(insiders, "i_"),
     "s": GroupSpec(structure, "s_", coverage_columns=tuple(
         c for c in S_COLUMNS if c not in ("s_dist_support_atr", "s_dist_resistance_atr", "s_support_touches",
@@ -1774,7 +1816,8 @@ def apply_coverage_mask(df: pd.DataFrame, report: pd.DataFrame, min_share: float
 ENSURE_VERSION = 1
 #: refusal reasons that can clear after a cache refresh; they are reported, never remembered as exclusions
 _TRANSIENT_MARKERS = ("stale series", "the metric store still lists it")
-_FMP_KINDS_BY_GROUP: Dict[str, Tuple[str, ...]] = {"f": _F_FILES, "a": ("analyst_grades", "price_target"), "i": ("insider_v2",)}
+_FMP_KINDS_BY_GROUP: Dict[str, Tuple[str, ...]] = {"f": _F_FILES, "ag": ("analyst_grades",), "at": ("price_target",),
+                                                   "i": ("insider_v2",)}
 
 
 def _fp_or_none(path: Path) -> Optional[Dict[str, object]]:
