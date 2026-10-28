@@ -54,15 +54,15 @@ def test_blocks_refuse_bad_input():
 def test_fixed_windows_end_at_the_block_start():
     b = W.blocks("2019-01-01", "2026-10-12", "Q")[5]                              # 2020Q2
     assert b.start == date(2020, 4, 1)
-    assert W.train_window(b, 12) == (date(2019, 4, 1), date(2020, 4, 1))
-    assert W.train_window(b, 24) == (date(2018, 4, 1), date(2020, 4, 1))
-    assert W.train_window(b, 36) == (date(2017, 4, 1), date(2020, 4, 1))
+    assert tuple(W.train_window(b, 12))[:2] == (date(2019, 4, 1), date(2020, 4, 1))
+    assert tuple(W.train_window(b, 24))[:2] == (date(2018, 4, 1), date(2020, 4, 1))
+    assert tuple(W.train_window(b, 36))[:2] == (date(2017, 4, 1), date(2020, 4, 1))
 
 
 def test_expanding_window_starts_at_data_start_and_fixed_is_clipped_to_it():
     first = W.blocks("2019-01-01", "2026-10-12", "H")[0]
-    assert W.train_window(first, "expanding", "2016-01-04") == (date(2016, 1, 4), date(2019, 1, 1))
-    assert W.train_window(first, 36, "2016-01-04") == (date(2016, 1, 4), date(2019, 1, 1))      # clipped
+    assert tuple(W.train_window(first, "expanding", "2016-01-04"))[:2] == (date(2016, 1, 4), date(2019, 1, 1))
+    assert tuple(W.train_window(first, 36, "2016-01-04"))[:2] == (date(2016, 1, 4), date(2019, 1, 1))
     assert W.train_window(first, 12, "2016-01-04")[0] == date(2018, 1, 1)
     with pytest.raises(ValueError):
         W.train_window(first, "expanding")
@@ -153,3 +153,13 @@ def test_vectorised_regimes_agree_with_the_scalar_function():
     assert list(v) == [W.regime(d) for d in days]
     assert set(v) == set(W.REGIMES)
     assert list(W.regimes(pd.Series(days[:3]))) == ["pre2019"] * 3
+
+
+def test_train_window_reports_whether_it_was_clipped_at_data_start():
+    first = W.blocks("2019-01-01", "2026-10-12", "H")[0]
+    start, end, clipped = W.train_window(first, 36, "2016-01-04")
+    assert (start, end, clipped) == (date(2016, 1, 4), date(2019, 1, 1), True)
+    assert W.train_window(first, 12, "2016-01-04").clipped is False
+    assert W.train_window(first, "expanding", "2016-01-04").clipped is False
+    assert W.train_window(first, 24).clipped is False                       # no data_start: nothing to clip against
+    assert W.train_window(first, 36, "2016-01-01").clipped is False         # exactly full

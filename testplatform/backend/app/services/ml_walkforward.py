@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -106,24 +106,34 @@ def blocks(start: Any, end: Any, freq: str) -> List[Block]:
     return out
 
 
-def train_window(block: Block, months: Union[int, str], data_start: Optional[Any] = None) -> Tuple[date, date]:
-    """``(train_start, train_end_exclusive)`` of the model that predicts ``block``: ``months`` (12 / 24 / 36) before
-    the block start, or ``"expanding"`` from ``data_start``. The end is always ``block.start`` (exclusive). A fixed
-    window that would begin before ``data_start`` (when given) is clipped to it."""
+class Window(NamedTuple):
+    """A training window ``[start, end)``; ``clipped`` is True when a fixed window was shortened because ``data_start``
+    came after where ``months`` would have begun it (the model trains on LESS than the nominal length)."""
+    start: date
+    end: date
+    clipped: bool
+
+
+def train_window(block: Block, months: Union[int, str], data_start: Optional[Any] = None) -> Window:
+    """``Window(start, end, clipped)`` of the model that predicts ``block``: ``months`` (12 / 24 / 36) before the
+    block start, or ``"expanding"`` from ``data_start``. The end is always ``block.start`` (exclusive). A fixed
+    window that would begin before ``data_start`` (when given) is clipped to it and ``clipped`` says so, so a grid
+    can report or skip the cells whose nominal length was not available."""
     ds = _d(data_start) if data_start is not None else None
+    clipped = False
     if months == "expanding":
         if ds is None:
             raise ValueError("an expanding window needs data_start")
         start = ds
     elif months in TRAIN_MONTHS and not isinstance(months, bool):
         start = _add_months(block.start, -int(months))
-        if ds is not None:
-            start = max(start, ds)
+        if ds is not None and start < ds:
+            start, clipped = ds, True
     else:
         raise ValueError(f"months must be one of {TRAIN_MONTHS} or 'expanding', got {months!r}")
     if start >= block.start:
         raise ValueError(f"empty training window for {block.name}: {start} .. {block.start}")
-    return start, block.start
+    return Window(start, block.start, clipped)
 
 
 def _day_values(x: Any) -> np.ndarray:
