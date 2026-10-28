@@ -2,6 +2,7 @@ import { API_BASE } from '../lib/config';
 import React, { useState, useEffect, useCallback } from 'react';
 import { X, Database, Cpu, Target, Trash2, Split, Save, FolderOpen, Play, AlertTriangle, ChevronRight, ChevronLeft, Loader2, Activity, Zap, Info, Layers, Sliders } from 'lucide-react';
 import type { TargetConfig } from '../types/targets';
+import { crossSectionalIssue, dailyTargetLabel } from '../lib/dailyTargets';
 
 interface Dataset {
   id: number;
@@ -186,11 +187,6 @@ const getDefaultState = () => ({
   selectedDatasetIds: [] as number[],
   multiDatasetMode: 'multi-series' as 'batch' | 'multi-series',
   datasetCompatibility: null as { compatible: boolean; message: string } | null,
-  crossValidation: {
-    enabled: false,
-    mode: 'manual' as 'manual' | 'kfold',
-    testDatasetIds: [] as number[],
-  },
   selectedModels: [] as string[],
   parameterRanges: {
     layersMin: 2,
@@ -351,6 +347,19 @@ const JobWizard: React.FC<JobWizardProps> = ({
         const unit = config.horizonUnit === 'days' ? 'days' : 'bars';
         return `Volatility (${config.method || 'unknown'}, ${config.horizon || 0} ${unit})`;
       }
+      case 'triple_barrier_atr':
+        return `ATR Barrier ${config.tpAtr !== undefined ? `TP:${config.tpAtr}xATR` : 'TP:fitted'} SL:x${config.slRatio} (${config.horizonSessions} sessions)`;
+      case 'direction_terciles':
+        return `Direction terciles (${config.horizonSessions} sessions)`;
+      case 'forward_return':
+        return `Forward return (${config.horizonSessions} sessions)`;
+      case 'daily_rel_return':
+      case 'daily_quintile':
+      case 'daily_beats':
+      case 'daily_up':
+      case 'daily_volatility':
+      case 'daily_multistep':
+        return dailyTargetLabel(config);
       default:
         return `Target: ${String(config.type)}`;
     }
@@ -471,8 +480,16 @@ const JobWizard: React.FC<JobWizardProps> = ({
     );
   };
 
+  // The daily targets that compare the tickers of a session need >= 5 datasets run together in ONE job
+  const crossIssue = crossSectionalIssue(
+    state.predictionTargets,
+    state.selectedDatasetIds.length,
+    state.selectedDatasetIds.length > 1 ? state.multiDatasetMode : 'multi-series',
+  );
+
   const isStep1Valid = () => {
     return (
+      !crossIssue &&
       state.selectedDatasetIds.length > 0 &&
       state.selectedModels.length > 0 &&
       isParameterValid() &&
@@ -700,7 +717,6 @@ const JobWizard: React.FC<JobWizardProps> = ({
           body: JSON.stringify({
             ...basePayload,
             datasetIds: state.selectedDatasetIds,
-            crossValidation: state.selectedDatasetIds.length > 1 ? state.crossValidation : undefined,
           }),
         });
         if (!response.ok) throw new Error('Failed to create job');
@@ -777,6 +793,7 @@ const JobWizard: React.FC<JobWizardProps> = ({
           <div className="p-6 overflow-y-auto flex-1">
             {currentStep === 1 && (
               <Step1Settings
+                crossIssue={crossIssue}
                 state={state}
                 setState={setState}
                 datasets={datasets}
@@ -989,6 +1006,7 @@ const JobWizard: React.FC<JobWizardProps> = ({
 
 // Step 1: Settings Component
 interface Step1Props {
+  crossIssue: string | null;  // why the cross-sectional daily targets cannot run with this selection
   state: ReturnType<typeof getDefaultState>;
   setState: React.Dispatch<React.SetStateAction<ReturnType<typeof getDefaultState>>>;
   datasets: Dataset[];
@@ -1006,6 +1024,7 @@ interface Step1Props {
 }
 
 const Step1Settings: React.FC<Step1Props> = ({
+  crossIssue,
   state,
   setState,
   datasets,
@@ -1422,6 +1441,15 @@ const Step1Settings: React.FC<Step1Props> = ({
           </div>
         )}
 
+        {crossIssue && (
+          <div className="mt-3 p-3 bg-red-50 dark:bg-red-900/20 border border-red-300 dark:border-red-600 rounded-lg">
+            <div className="flex items-start space-x-2">
+              <AlertTriangle size={16} className="text-red-500 dark:text-red-400 mt-0.5 flex-shrink-0" />
+              <div className="text-sm text-red-700 dark:text-red-300">{crossIssue}</div>
+            </div>
+          </div>
+        )}
+
         {/* Timeframe-aware target warning */}
         {state.predictionTargets.length > 0 && state.predictionTargets.some(t => !(t as Record<string, unknown>).timeframe) && (
           <div className="mt-3 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-300 dark:border-blue-600 rounded-lg">
@@ -1603,116 +1631,6 @@ const Step1Settings: React.FC<Step1Props> = ({
           </p>
         )}
       </div>
-
-      {/* Cross-Validation (multi-series mode only) */}
-      {state.selectedDatasetIds.length > 1 && state.multiDatasetMode === 'multi-series' && (
-        <div className="border border-gray-200 dark:border-gray-600 rounded-lg p-4">
-          <label className="flex items-center space-x-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={state.crossValidation.enabled}
-              onChange={(e) => setState(prev => ({
-                ...prev,
-                crossValidation: { ...prev.crossValidation, enabled: e.target.checked }
-              }))}
-              className="w-4 h-4 text-green-600 border-gray-300 rounded focus:ring-green-500"
-            />
-            <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
-              Dataset Cross-Validation
-            </span>
-          </label>
-
-          {state.crossValidation.enabled && (
-            <div className="mt-3 space-y-3">
-              {/* Mode selector */}
-              <div className="flex space-x-4">
-                <label className="flex items-center space-x-2 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="cvMode"
-                    value="manual"
-                    checked={state.crossValidation.mode === 'manual'}
-                    onChange={() => setState(prev => ({
-                      ...prev,
-                      crossValidation: { ...prev.crossValidation, mode: 'manual' }
-                    }))}
-                    className="w-4 h-4 text-green-600"
-                  />
-                  <span className="text-sm">Manual</span>
-                </label>
-                <label className="flex items-center space-x-2 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="cvMode"
-                    value="kfold"
-                    checked={state.crossValidation.mode === 'kfold'}
-                    onChange={() => setState(prev => ({
-                      ...prev,
-                      crossValidation: { ...prev.crossValidation, mode: 'kfold' }
-                    }))}
-                    className="w-4 h-4 text-green-600"
-                  />
-                  <span className="text-sm">K-Fold</span>
-                </label>
-              </div>
-
-              {/* Manual mode: assign Train/Test per dataset */}
-              {state.crossValidation.mode === 'manual' && (
-                <div className="space-y-1">
-                  <p className="text-xs text-gray-500 mb-2">Assign each dataset as Train or Test:</p>
-                  {selectedDatasets.map(ds => (
-                    <div key={ds.id} className="flex items-center justify-between p-2 bg-gray-50 dark:bg-gray-700 rounded">
-                      <span className="text-sm">{ds.name} ({ds.ticker})</span>
-                      <div className="flex space-x-3">
-                        <label className="flex items-center space-x-1 cursor-pointer">
-                          <input
-                            type="radio"
-                            name={`cv-role-${ds.id}`}
-                            checked={!state.crossValidation.testDatasetIds.includes(ds.id)}
-                            onChange={() => setState(prev => ({
-                              ...prev,
-                              crossValidation: {
-                                ...prev.crossValidation,
-                                testDatasetIds: prev.crossValidation.testDatasetIds.filter(id => id !== ds.id)
-                              }
-                            }))}
-                            className="w-3 h-3 text-green-600"
-                          />
-                          <span className="text-xs text-green-700 dark:text-green-400">Train</span>
-                        </label>
-                        <label className="flex items-center space-x-1 cursor-pointer">
-                          <input
-                            type="radio"
-                            name={`cv-role-${ds.id}`}
-                            checked={state.crossValidation.testDatasetIds.includes(ds.id)}
-                            onChange={() => setState(prev => ({
-                              ...prev,
-                              crossValidation: {
-                                ...prev.crossValidation,
-                                testDatasetIds: [...prev.crossValidation.testDatasetIds.filter(id => id !== ds.id), ds.id]
-                              }
-                            }))}
-                            className="w-3 h-3 text-orange-600"
-                          />
-                          <span className="text-xs text-orange-700 dark:text-orange-400">Test</span>
-                        </label>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* K-Fold mode: explanation */}
-              {state.crossValidation.mode === 'kfold' && (
-                <p className="text-xs text-gray-500 bg-gray-50 dark:bg-gray-700 p-3 rounded">
-                  Each dataset will be used as the test set once, training {state.selectedDatasetIds.length} models total.
-                  Results are averaged across all folds.
-                </p>
-              )}
-            </div>
-          )}
-        </div>
-      )}
 
       {/* Sequence Length (for classification) */}
       {state.jobType === 'classification' && (

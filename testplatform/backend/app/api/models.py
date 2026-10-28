@@ -13,9 +13,12 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 import uuid
 
+import numpy as np
+
 from app.models.database import get_db
 from app.models.model import TrainedModel
 from app.models.dataset import Dataset
+from app.services.ml_wizard_targets import ALL_WIZARD_TARGET_TYPES, column_name as wizard_target_column
 
 logger = logging.getLogger(__name__)
 
@@ -559,10 +562,52 @@ def clone_model(model_id: str, db: Session = Depends(get_db)):
     return ModelResponse(**cloned)
 
 
+def apply_masked_fill_for_prediction(df, feature_columns, normalization_params, ticker, dataset_id=None):
+    """``(df, feature_columns)`` ready for the model: the cells the daily source's coverage mask blanked are filled from the
+    medians SAVED with the model (nothing is fitted on this frame) and the all-masked columns it dropped are dropped. A
+    model saved before masked-cell handling existed cannot do that: 409 asking to retrain, not a 500 later on."""
+    from app.services.masked_fill import StaleMaskedModel, apply_saved_fill
+    try:
+        return apply_saved_fill(df, feature_columns, (normalization_params or {}).get('masked_fill'), ticker, dataset_id)
+    except StaleMaskedModel as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
 class RunPredictionsRequest(BaseModel):
     """Request body for running predictions."""
     dataset_id: Optional[int] = None  # Optional: use different dataset
     target_index: Optional[int] = 0  # Which target to show (for multi-target models)
+
+
+def decode_class_probs(probs: np.ndarray, threshold: float, prediction_mode: str):
+    """Predicted class, its probability and (k > 2 only) the per-class probabilities.
+
+    Returns ``(predicted_classes, probability, class_probs)``. Multistep averages the per-horizon
+    sigmoids against the threshold. A binary head thresholds P(class 1). A k > 2 head predicts the
+    softmax argmax (the threshold has no meaning), ``probability`` is the probability of that class,
+    and ``class_probs`` is the full (samples, k) matrix.
+    """
+    if prediction_mode == 'multistep':
+        avg_probs = np.mean(probs, axis=1)
+        return (avg_probs >= threshold).astype(int), avg_probs, None
+    if probs.ndim > 1 and probs.shape[1] > 2:
+        predicted = probs.argmax(axis=1)
+        return predicted, probs[np.arange(len(probs)), predicted], probs
+    prob_class_1 = probs[:, 1] if probs.ndim > 1 and probs.shape[1] > 1 else probs
+    return (prob_class_1 >= threshold).astype(int), prob_class_1, None
+
+
+def prediction_record(predicted: int, probability: float, actual, class_probs) -> dict:
+    """The per-row prediction fields (everything but the bar's date/OHLC)."""
+    record = {
+        'actual': int(actual) if actual is not None else None,
+        'probability': float(probability),
+        'predictedClass': int(predicted),
+        'correct': int(predicted) == int(actual) if actual is not None else None,
+    }
+    if class_probs is not None:
+        record['classProbabilities'] = [float(p) for p in class_probs]
+    return record
 
 
 @router.post("/{model_id}/run-predictions")
@@ -727,6 +772,13 @@ def run_model_predictions(
                     label = f"Triple Barrier ({profit_pct}% TP, {stop_pct}% SL)"
                     return col_name, label, target_type
 
+            elif target_type in ALL_WIZARD_TARGET_TYPES:
+                try:
+                    col_name = wizard_target_column(target)
+                except ValueError:
+                    return None, None, target_type
+                return col_name, col_name, target_type
+
             return None, None, target_type
 
         # Generate expected column names from model config and find in dataset
@@ -811,6 +863,11 @@ def run_model_predictions(
                            if col not in ['Date', target_column]
                            and not col.startswith('target_')]
         logger.warning(f"No stored featureColumns, falling back to {len(feature_columns)} dataset columns")
+
+    # Masked cells of the daily source: fill them from the medians saved with the model, drop the saved columns
+    dataset_row = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    df, feature_columns = apply_masked_fill_for_prediction(
+        df, feature_columns, normalization_params, dataset_row.ticker if dataset_row else None, dataset_id)
 
     # Determine model type from database (not file extension)
     # tsai models: lstm, gru, tcn, inception, resnet, xception, omniscale, minirocket, patchtst, lstm_fcn, tst
@@ -967,16 +1024,9 @@ def run_model_predictions(
 
             # Calculate predictions
             # probs is now always 2D: (samples, n_classes)
-            if prediction_mode == 'multistep':
-                # Multi-step: average probabilities across horizons
-                avg_probs = np.mean(probs, axis=1)
-                predicted_classes = (avg_probs >= threshold).astype(int)
-            else:
-                # Binary classification: probs[:, 1] is probability of class 1 (up)
-                prob_class_1 = probs[:, 1] if len(probs.shape) > 1 and probs.shape[1] > 1 else probs
-                logger.info(f"prob_class_1: shape={prob_class_1.shape}, min={prob_class_1.min():.4f}, max={prob_class_1.max():.4f}, first 5: {prob_class_1[:5]}")
-                predicted_classes = (prob_class_1 >= threshold).astype(int)
-                avg_probs = prob_class_1
+            predicted_classes, avg_probs, class_probs = decode_class_probs(probs, threshold, prediction_mode)
+            if prediction_mode != 'multistep':
+                logger.info(f"probability: shape={avg_probs.shape}, min={avg_probs.min():.4f}, max={avg_probs.max():.4f}, first 5: {avg_probs[:5]}")
 
             # Build results
             # Note: sequences start at index 0 but represent predictions for index seq_len-1+prediction_horizon
@@ -995,10 +1045,10 @@ def run_model_predictions(
                     'open': float(row['Open']) if 'Open' in row else None,
                     'high': float(row['High']) if 'High' in row else None,
                     'low': float(row['Low']) if 'Low' in row else None,
-                    'actual': int(y[i]) if i < len(y) else None,
-                    'probability': float(avg_probs[i]),
-                    'predictedClass': int(predicted_classes[i]),
-                    'correct': int(predicted_classes[i]) == int(y[i]) if i < len(y) else None
+                    **prediction_record(
+                        predicted_classes[i], avg_probs[i],
+                        y[i] if i < len(y) else None,
+                        class_probs[i] if class_probs is not None else None),
                 })
 
         else:
@@ -1041,6 +1091,16 @@ def run_model_predictions(
         actual_0_count = actual_1_count = 0
         avg_probability = 0
 
+    summary_extra = {}
+    if predictions and 'classProbabilities' in predictions[0]:
+        # k > 2 classes: the class0/class1 counts above say nothing about the rest
+        k = len(predictions[0]['classProbabilities'])
+        summary_extra = {
+            "nClasses": k,
+            "predictedClassCounts": [sum(1 for p in predictions if p['predictedClass'] == c) for c in range(k)],
+            "actualClassCounts": [sum(1 for p in predictions if p.get('actual') == c) for c in range(k)],
+        }
+
     return {
         "modelId": model_id,
         "datasetId": dataset_id,
@@ -1057,7 +1117,8 @@ def run_model_predictions(
             "predictedClass0": class_0_count,
             "predictedClass1": class_1_count,
             "actualClass0": actual_0_count,
-            "actualClass1": actual_1_count
+            "actualClass1": actual_1_count,
+            **summary_extra
         },
         "predictions": predictions
     }

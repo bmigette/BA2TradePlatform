@@ -265,6 +265,8 @@ _SUPPORTED_EXPERTS = {
     "ETFTrend": "ba2_experts.ETFTrend",
     # Research-only RSI pullback reversion (like ETFTrend: backtest-registered, not live).
     "PullbackReversion": "ba2_experts.PullbackReversion",
+    # Research-only ML forecast expert over a precomputed forecast store (ml_forecast design 2026-10-25).
+    "MLForecast": "ba2_experts.MLForecast",
     # Earnings-EVENT ranker (grid 2's O_ERN chain, design 2026-08-31 §9). Ranks upcoming
     # earnings events from the FMP disk cache (past_earnings_quarterly x OHLCV) and stamps
     # the event date + days-to-earnings onto its recommendations, which is what the strategy's
@@ -297,6 +299,8 @@ _EXPERT_WARMUP_BARS = {
     # exact runs where the import is broken. Pinned equal by
     # test_option_grid_foundations.test_the_earnings_expert_warmup_table_matches_the_class.
     "FMPEarningsEvent": 620,
+    # = MLForecast.BACKTEST_WARMUP_BARS: ATR14 over a 60-calendar-day window at 1.45 days/bar.
+    "MLForecast": 42,
 }
 _WARMUP_FLOOR_DAYS = 60           # never warm up less than this (ATR + safety)
 _BARS_TO_CALDAYS = 1.45           # trading bars -> calendar days (≈252 bars/year -> ~365 days)

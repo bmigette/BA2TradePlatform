@@ -39,7 +39,11 @@ torch>=2.5.0
 torchvision>=0.20.0
 torchaudio>=2.5.0
 pytorch-lightning>=2.0.0
-darts>=0.32.0
+# Pinned to the tested range: ml_models_seq.DartsAdapter calls the forecasting networks directly through Darts'
+# internal PLModuleInput (darts.utils.data.torch_datasets.utils) and reads the Lightning checkpoint names; both are
+# private layouts that a Darts release may change. Tested on 0.48.1; fit() self-checks the batched forward against
+# the public forecast. Widen the pin only after running tests/test_ml_models_seq.py on the new version.
+darts>=0.48,<0.49
 
 # Time Series Classification (tsai)
 tsai>=0.3.9

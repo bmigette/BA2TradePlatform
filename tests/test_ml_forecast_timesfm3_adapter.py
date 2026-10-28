@@ -42,6 +42,46 @@ def test_return_definition():
         np.testing.assert_allclose(r.deciles[h], (QS - 1) * h, rtol=1e-4, atol=1e-6)   # float32 context
 
 
+def test_log_space_card_is_its_own_store_and_model_sees_log_closes():
+    from tools.ml_forecast.adapters.timesfm3 import LOG_CARD_IDS, card_for_id
+    price, log = card_for_id("timesfm3-ctx512"), card_for_id("timesfm3-log-ctx512")
+    assert log.input_fields == ("log_Close",) and model_key(price, ()) != model_key(log, ())
+    assert set(LOG_CARD_IDS) == {"timesfm3-log-ctx512", "timesfm3-log-ctx2048"}
+    with pytest.raises(ValueError, match="unknown TimesFM card id"):
+        card_for_id("timesfm3-ctx1000")
+    seen = []
+
+    def log_stub(ctxs, horizon):
+        # log-price quantiles: last log close + log(QS) * step (a symmetric-ish fan in log space)
+        seen.extend(ctxs)
+        steps = np.arange(1, horizon + 1)[:, None]
+        return [float(c[-1]) + np.log(QS)[None, :] * steps for c in ctxs]
+    close = np.linspace(100, 120, 600)
+    r = TimesFM3Adapter(log, log_stub).forecast_batch([("X", date(2024, 1, 5), close)])[0]
+    np.testing.assert_allclose(seen[0][-1], np.log(120.0), rtol=1e-6)
+    for h in (5, 10, 20):
+        np.testing.assert_allclose(r.deciles[h], QS ** h - 1.0, rtol=1e-4, atol=1e-6)
+
+
+def test_log_space_never_reaches_minus_100pct_where_price_space_aborts():
+    """A collapse extrapolated through zero (TimesFM clamps the price quantile at 0, as on TTD 2026-08-07):
+    price space ABORTS on ForecastRow's -100% check; log space stays above -100% by construction."""
+    from tools.ml_forecast.adapters.timesfm3 import card_for_id
+    close = np.linspace(140, 14, 600)
+
+    def collapse_price(ctxs, horizon):
+        return [np.maximum(0.0, float(c[-1]) * (1 + (QS[None, :] - 1.5) * np.arange(1, horizon + 1)[:, None]))
+                for c in ctxs]
+
+    with pytest.raises(ValueError, match="at or below -100%"):
+        TimesFM3Adapter(card_for_id("timesfm3-ctx512"), collapse_price).forecast_batch([("TTD", date(2026, 8, 7), close)])
+
+    def collapse_log(ctxs, horizon):
+        return [float(c[-1]) + np.log(QS)[None, :] * 40 * np.arange(1, horizon + 1)[:, None] for c in ctxs]
+    r = TimesFM3Adapter(card_for_id("timesfm3-log-ctx512"), collapse_log).forecast_batch([("TTD", date(2026, 8, 7), close)])[0]
+    assert all(q > -1.0 for h in (5, 10, 20) for q in r.deciles[h])
+
+
 def test_context_is_last_n_and_model_sees_only_it():
     seen = []
 

@@ -30,6 +30,16 @@ of the leading side (the gate-failing side where one was chosen), NOT a confiden
 
 ``expected_profit_percent`` is the profit in the TRADE direction: +|q50| for a BUY and +|q50| for a SELL (a short
 profits when the price falls), so it is positive whenever a signal is emitted.
+
+Class-probability rows (``row.has_classes``: down / mid / up, each with a probability and a return value) map as:
+  1. direction: sign of the expected return E = sum(p_c x r_c) (zero -> HOLD); bearish with ``enable_sell`` off -> HOLD
+  2. edge: |E| in percent  >=  min_edge_pct
+  3. probability: P(up) / (P(up) + P(down)) for a long (for the triple barrier: P(take-profit before stop | a barrier
+     is hit)), its complement for a short  >=  min_prob
+  4. exits: TP at the up class's return, SL at the down class's (mirrored for a short), through the same
+     wrong-side / minimum-distance rules as the decile exits.
+``max_uncertainty``, ``tp_quantile`` and ``sl_quantile`` do not apply to class rows (the classes carry their own
+levels). Held positions flip once the opposite side's conditional probability reaches ``exit_flip_prob``.
 """
 from __future__ import annotations
 
@@ -145,12 +155,13 @@ def _snap(grid: Sequence[int], value_pct: float) -> Optional[int]:
     return g if abs(g - value_pct) <= min(steps) / 2.0 + 1e-9 else None
 
 
-def _conf(p: float) -> float:
+def confidence_pct(p: float) -> float:
+    """A probability as a confidence on the platform's 1-100 scale (clamped); the expert's own HOLDs use it too."""
     return min(100.0, max(1.0, p * 100.0))
 
 
 def _hold(p_lead: float, reason: str) -> MappingResult:
-    return MappingResult(OrderRecommendation.HOLD, _conf(p_lead), None, None, None, None, reason)
+    return MappingResult(OrderRecommendation.HOLD, confidence_pct(p_lead), None, None, None, None, reason)
 
 
 def _check_pos(name: str, x) -> float:
@@ -165,9 +176,82 @@ def _dec(row: ForecastRow, horizon: int):
     return row.deciles[horizon]
 
 
+def _classes(row: ForecastRow, horizon: int):
+    if horizon not in row.class_probs:
+        raise ValueError(f"{row.symbol} {row.session}: horizon {horizon} not in row (has {row.horizons})")
+    return row.class_probs[horizon]
+
+
+def p_up_from_classes(cf) -> float:
+    """P(up) / (P(up) + P(down)): the probability that the decisive outcome is the up class (0.5 when both are 0)."""
+    (p_d, _), _, (p_u, _) = cf
+    return p_u / (p_u + p_d) if p_u + p_d > 0 else 0.5
+
+
+def p_up(row: ForecastRow, horizon: int) -> float:
+    """The bullish probability the mapping uses, for any row type."""
+    if row.has_classes:
+        return p_up_from_classes(_classes(row, horizon))
+    return p_up_from_deciles(_dec(row, horizon))
+
+
+def bullish_score_deciles(d: Sequence[float]) -> tuple:
+    return (p_up_from_deciles(d), float(d[DECILE_LEVELS.index(50)]))
+
+
+def bullish_score_classes(cf) -> tuple:
+    return (p_up_from_classes(cf), float(sum(p * r for p, r in cf)))
+
+
+def bullish_score(row: ForecastRow, horizon: int) -> tuple:
+    """The cross-sectional ranking key of a row, higher = more bullish, for any row type: ``(P(up), median/expected
+    return)``. P(up) is the bullish probability the mapping uses; decile P(up) is clamped to [0.05, 0.95], so a strong
+    forecast ties with every other strong one and the second element (q50 for deciles, E[r] = sum(p_c x r_c) for
+    class rows) separates them: for decile stores the ranking is effectively by q50 among clamped symbols. Exact ties
+    on both are left to the caller (the ranking breaks them by symbol name)."""
+    if row.has_classes:
+        return bullish_score_classes(_classes(row, horizon))
+    return bullish_score_deciles(_dec(row, horizon))
+
+
+def _map_classes(row: ForecastRow, genes: MappingGenes, price: float, atr: float) -> MappingResult:
+    h = genes.horizon
+    cf = _classes(row, h)
+    pu = p_up_from_classes(cf)
+    lead = max(pu, 1.0 - pu)
+    exp = sum(p * r for p, r in cf)
+    if exp == 0:
+        return _hold(lead, "HOLD gate=direction: expected return is zero")
+    long_ = exp > 0
+    if not long_ and not genes.enable_sell:
+        return _hold(1.0 - pu, "HOLD gate=sell: bearish forecast but sell disabled (enable_sell=0)")
+    edge = abs(exp) * 100.0
+    if edge < genes.min_edge_pct:
+        return _hold(lead, f"HOLD gate=min_edge: |E[r]| {edge:.2f}% < {genes.min_edge_pct:g}%")
+    p = pu if long_ else 1.0 - pu
+    if p * 100.0 < genes.min_prob - 1e-9:
+        return _hold(p, f"HOLD gate=min_prob: P(decisive {'up' if long_ else 'down'}) {p * 100:.1f}% < "
+                        f"{genes.min_prob:g}%")
+    (_, r_dn), _, (_, r_up) = cf
+    tp_ret, sl_ret = (r_up, r_dn) if long_ else (r_dn, r_up)
+    notes = []
+    tp_price = _exit_price("take-profit", price, tp_ret, long_, True, atr, notes)
+    sl_price = _exit_price("stop", price, sl_ret, long_, False, atr, notes)
+    sig = OrderRecommendation.BUY if long_ else OrderRecommendation.SELL
+    probs = "/".join(f"{x * 100:.0f}" for x, _ in cf)
+    reason = (f"{sig.value} h={h} classes(d/m/u)={probs}% E[r]={exp * 100:+.2f}% p={p * 100:.1f}% "
+              f"tp={'none' if tp_price is None else f'{tp_price:.4f}'} "
+              f"sl={'none' if sl_price is None else f'{sl_price:.4f}'}")
+    if notes:
+        reason += "; " + "; ".join(notes)
+    return MappingResult(sig, confidence_pct(p), edge, tp_price, tp_price, sl_price, reason)
+
+
 def map_forecast(row: ForecastRow, genes: MappingGenes, decision_price: float, atr: float) -> MappingResult:
     price = _check_pos("decision_price", decision_price)
     atr = _check_pos("atr", atr)
+    if row.has_classes:
+        return _map_classes(row, genes, price, atr)
     h = genes.horizon
     d = _dec(row, h)
     p_up = p_up_from_deciles(d)
@@ -224,7 +308,7 @@ def map_forecast(row: ForecastRow, genes: MappingGenes, decision_price: float, a
               f"sl={'none' if sl_price is None else f'{sl_price:.4f}'}")
     if notes:
         reason += "; " + "; ".join(notes)
-    return MappingResult(sig, _conf(p), edge, tp_price, tp_price, sl_price, reason)
+    return MappingResult(sig, confidence_pct(p), edge, tp_price, tp_price, sl_price, reason)
 
 
 def _exit_price(name: str, price: float, ret: float, long_: bool, is_tp: bool, atr: float, notes: list) -> Optional[float]:
@@ -246,11 +330,11 @@ def map_held_position(row: ForecastRow, genes: MappingGenes, side: str) -> Mappi
     """SELL (flip) for a held long / BUY for a held short once the opposite-side probability >= exit_flip_prob."""
     if side not in ("long", "short"):
         raise ValueError(f"side must be 'long' or 'short', got {side!r}")
-    p_up = p_up_from_deciles(_dec(row, genes.horizon))
-    p_opp = (1.0 - p_up) if side == "long" else p_up
+    pu = p_up(row, genes.horizon)
+    p_opp = (1.0 - pu) if side == "long" else pu
     if p_opp * 100.0 >= genes.exit_flip_prob - 1e-9:
         sig = OrderRecommendation.SELL if side == "long" else OrderRecommendation.BUY
-        return MappingResult(sig, _conf(p_opp), None, None, None, None,
+        return MappingResult(sig, confidence_pct(p_opp), None, None, None, None,
                              f"{sig.value} flip of held {side}: opposite-side p {p_opp * 100:.1f}% >= "
                              f"exit_flip_prob {genes.exit_flip_prob:g}%")
     return _hold(1.0 - p_opp, f"HOLD held {side}: opposite-side p {p_opp * 100:.1f}% < exit_flip_prob "

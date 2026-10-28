@@ -1,4 +1,27 @@
 import { API_BASE } from '../lib/config';
+import { onDatasetTimeframe, repinIndicators } from '../lib/indicatorTimeframe';
+import {
+  ALPACA_HIST_INTRADAY_TIMEFRAMES,
+  ALPACA_HIST_PROVIDER,
+  DAILY_GROUP_OPTIONS,
+  DAILY_MASK_HELP,
+  DAILY_TIMEFRAME,
+  DAILY_UNIVERSE_HELP,
+  breadthNote,
+  duplicateUniverseNote,
+  createdNotice,
+  panelFeaturesPayload,
+  timeframeChangeSelections,
+  allowedTimeframes,
+  dailyPayload,
+  dailySummary,
+  DEFAULT_DAILY_STATE,
+  hydrateDailyState,
+  universeSizeWith,
+  isDailySource,
+  toggleDailyGroup,
+  validateDailySource,
+} from '../lib/dailySource';
 import React, { useState, useEffect } from 'react';
 import { X, MessageSquare, TrendingUp, BarChart3, FileText, Settings, CheckCircle, Plus, Trash2, Save, ChevronDown, ChevronRight, FolderOpen, Upload } from 'lucide-react';
 
@@ -21,7 +44,8 @@ interface InitialDataset {
 interface DatasetWizardProps {
   isOpen: boolean;
   onClose: () => void;
-  onComplete: () => void;
+  /** `notice`: something the user should know about what was created (shown by the page as a warning, not blocking) */
+  onComplete: (notice?: string) => void;
   mode?: WizardMode;
   initialData?: InitialDataset | null;
 }
@@ -82,10 +106,25 @@ interface WizardData {
   startDate: string;
   endDate: string;
   dataProvider: string;
+  panelFeatures: string[];  // alpaca_hist 1h / 15m only: subset of PANEL_FEATURE_OPTIONS ids
+  dailyGroups: string[];  // alpaca_hist 1d only: groups of the daily feature store (DAILY_GROUP_OPTIONS ids)
+  dailyMinShare: string;  // alpaca_hist 1d only: a (group, year) covered by less than this share of rows is masked
   indicators: IndicatorConfig[];
   sentiment: SentimentConfig;
   fundamentals: FundamentalsConfig;
 }
+
+// Alpaca history cache source: regular-session H1 / M15 bars built from the cached 5-minute data (feature groups
+// PANEL_FEATURE_OPTIONS) or the daily point-in-time feature store at 1d (feature groups DAILY_GROUP_OPTIONS). Both are
+// the same data provider; the timeframe tells them apart. The radio list has one entry for each.
+const ALPACA_HIST_DAILY_OPTION = 'alpaca_hist_daily';
+
+// Feature groups of the alpaca_hist panel on top of its always-on technical features
+const PANEL_FEATURE_OPTIONS = [
+  { id: 'daily', name: 'Daily context', desc: 'vs 50/200-day averages, past returns, daily ATR' },
+  { id: 'market', name: 'Market features', desc: 'SPY/QQQ returns, relative strength vs QQQ' },
+  { id: 'fundamentals', name: 'Point-in-time fundamentals', desc: 'earnings after announcement, annual statements after SEC acceptance' },
+];
 
 // Timeframe ordering for validation
 const TIMEFRAME_ORDER = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w', '1mo'];
@@ -126,6 +165,9 @@ const getDefaultWizardData = (): WizardData => ({
   startDate: '',
   endDate: '',
   dataProvider: 'yfinance',
+  panelFeatures: [],
+  dailyGroups: [],
+  dailyMinShare: DEFAULT_DAILY_STATE.minShare,
   indicators: [],
   sentiment: {
     enabled: false,
@@ -139,7 +181,7 @@ const getDefaultWizardData = (): WizardData => ({
     enabled: false,
     statementTypes: ['balance_sheet', 'income_statement', 'cash_flow'],
     lookbackStatements: 2,  // Include last 2 statement periods
-    macroIndicators: ['interest_rate', 'gdp', 'inflation', 'unemployment'],
+    macroIndicators: ['interest_rate', 'inflation', 'unemployment'],  // GDP: no first-release cache series, the backend refuses it
     fundamentalsProviders: ['yfinance', 'fmp', 'alphavantage'],  // Priority order
     macroProvider: 'fred'
   }
@@ -160,10 +202,10 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
       // Parse indicators
       let indicators: IndicatorConfig[] = [];
       if (initialData.technical_indicators && Array.isArray(initialData.technical_indicators)) {
-        indicators = initialData.technical_indicators.map((ind: any) => ({
+        indicators = initialData.technical_indicators.map((ind: any) => onDatasetTimeframe({
           id: `ind_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
           ...ind
-        }));
+        }, initialData.timeframe));
       }
 
       // Parse sentiment config from saved data
@@ -183,12 +225,14 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         enabled: savedFundamentals.enabled || false,
         statementTypes: savedFundamentals.statementTypes || savedFundamentals.statement_types || savedFundamentals.metrics || ['balance_sheet', 'income_statement', 'cash_flow'],
         lookbackStatements: savedFundamentals.lookbackStatements || savedFundamentals.lookback_statements || 2,
-        macroIndicators: savedFundamentals.macroIndicators || savedFundamentals.macro_indicators || ['interest_rate', 'gdp', 'inflation', 'unemployment'],
+        macroIndicators: (savedFundamentals.macroIndicators || savedFundamentals.macro_indicators || ['interest_rate', 'inflation', 'unemployment'])
+          .filter((id: string) => id !== 'gdp'),  // saved configs from before GDP was withdrawn
         fundamentalsProviders: savedFundamentals.fundamentalsProviders || savedFundamentals.fundamentals_providers ||
           (savedFundamentals.fundamentals_provider ? [savedFundamentals.fundamentals_provider] : ['yfinance', 'fmp', 'alphavantage']),
         macroProvider: savedFundamentals.macroProvider || savedFundamentals.macro_provider || 'fred'
       };
 
+      const dailyState = hydrateDailyState(initialData.generation_config);
       setWizardData({
         name: mode === 'duplicate' ? '' : (initialData.name || ''),  // Clear name for duplicate
         ticker: mode === 'duplicate' ? '' : initialData.ticker,  // Clear ticker for duplicate
@@ -196,6 +240,9 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         startDate,
         endDate,
         dataProvider: initialData.generation_config?.data_provider || 'yfinance',
+        panelFeatures: Array.isArray(initialData.generation_config?.panel_features) ? initialData.generation_config.panel_features : [],
+        dailyGroups: dailyState.groups,
+        dailyMinShare: dailyState.minShare,
         indicators,
         sentiment: sentimentConfig,
         fundamentals: fundamentalsConfig
@@ -262,7 +309,6 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
 
   // Indicator add form state
   const [newIndicatorType, setNewIndicatorType] = useState('sma');
-  const [newIndicatorTimeframe, setNewIndicatorTimeframe] = useState('1d');
   const [newIndicatorPeriod, setNewIndicatorPeriod] = useState(20);
   // SAR parameters
   const [sarAfStart, setSarAfStart] = useState(0.02);
@@ -288,14 +334,6 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
     }
   }, [isOpen]);
 
-  // Update indicator timeframe dropdown when dataset timeframe changes
-  useEffect(() => {
-    const validTimeframes = getAvailableTimeframes();
-    if (!validTimeframes.includes(newIndicatorTimeframe)) {
-      setNewIndicatorTimeframe(wizardData.timeframe);
-    }
-  }, [wizardData.timeframe]);
-
   const fetchCollections = async () => {
     try {
       const response = await fetch(`${API_BASE}/indicator-collections`);
@@ -306,12 +344,6 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
     } catch (err) {
       console.error('Failed to fetch collections:', err);
     }
-  };
-
-  const getAvailableTimeframes = () => {
-    const datasetIdx = TIMEFRAME_ORDER.indexOf(wizardData.timeframe);
-    if (datasetIdx === -1) return TIMEFRAME_ORDER;
-    return TIMEFRAME_ORDER.slice(datasetIdx);
   };
 
   const generateIndicatorId = () => {
@@ -337,7 +369,11 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
       id: generateIndicatorId(),
       type: newIndicatorType,
       name: typeInfo.name,
-      timeframe: newIndicatorTimeframe,
+      // Always the dataset timeframe: a per-indicator timeframe only renamed the column, the
+      // indicator was still computed on the base bars. For a real higher-timeframe indicator the
+      // backend has services/indicators.py calculate_indicators_multi_timeframe (resample, compute,
+      // align without look-ahead); wire it before re-offering a timeframe picker here.
+      timeframe: wizardData.timeframe,
     };
 
     // Add type-specific parameters
@@ -381,27 +417,17 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
     const collection = collections.find(c => c.id === collectionId);
     if (!collection) return;
 
-    // Filter indicators to only include those with valid timeframes
-    const validTimeframes = getAvailableTimeframes();
-    const validIndicators = collection.indicators
-      .filter(ind => validTimeframes.includes(ind.timeframe))
-      .map(ind => ({
-        ...ind,
-        id: generateIndicatorId()
-      }));
-
-    const invalidCount = collection.indicators.length - validIndicators.length;
-
+    // A collection's own per-indicator timeframes are ignored: every indicator is computed on the
+    // dataset timeframe (see onDatasetTimeframe), so none is skipped for its timeframe.
     setWizardData({
       ...wizardData,
-      indicators: validIndicators
+      indicators: collection.indicators.map(ind => onDatasetTimeframe({
+        ...ind,
+        id: generateIndicatorId()
+      }, wizardData.timeframe))
     });
 
     setSelectedCollectionId(collectionId);
-
-    if (invalidCount > 0) {
-      setError(`${invalidCount} indicators were skipped because their timeframe is smaller than the dataset timeframe (${wizardData.timeframe})`);
-    }
   };
   // Suppress unused warning - function reserved for future use
   void _loadCollection;
@@ -436,12 +462,11 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
   };
 
   const toggleAllCollectionIndicators = (collection: IndicatorCollection, select: boolean) => {
-    const validTimeframes = getAvailableTimeframes();
     setSelectedIndicatorIds(prev => {
       const next = new Set(prev);
-      collection.indicators.forEach((ind, idx) => {
+      collection.indicators.forEach((_ind, idx) => {
         const key = getIndicatorUniqueKey(collection.id, idx);
-        if (select && validTimeframes.includes(ind.timeframe)) {
+        if (select) {
           next.add(key);
         } else {
           next.delete(key);
@@ -452,17 +477,16 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
   };
 
   const addSelectedIndicatorsFromPicker = () => {
-    const validTimeframes = getAvailableTimeframes();
     const indicatorsToAdd: IndicatorConfig[] = [];
 
     collections.forEach(collection => {
       collection.indicators.forEach((ind, idx) => {
         const key = getIndicatorUniqueKey(collection.id, idx);
-        if (selectedIndicatorIds.has(key) && validTimeframes.includes(ind.timeframe)) {
-          indicatorsToAdd.push({
+        if (selectedIndicatorIds.has(key)) {
+          indicatorsToAdd.push(onDatasetTimeframe({
             ...ind,
             id: generateIndicatorId()
-          });
+          }, wizardData.timeframe));
         }
       });
     });
@@ -542,6 +566,14 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
     return tickerRegex.test(ticker);
   };
 
+  // Tickers the daily store's cross-sectional values are taken over: the batch, the stored universe when editing or
+  // duplicating (a duplicate with a new ticker joins it), else the single ticker.
+  const dailyUniverseSize = (): number => {
+    if (batchMode) return batchSymbols.length;
+    if ((mode === 'edit' || mode === 'duplicate') && initialData) return universeSizeWith(initialData.generation_config, wizardData.ticker);
+    return 1;
+  };
+
   const handleNext = () => {
     if (currentStep === 1) {
       if (batchMode) {
@@ -574,6 +606,13 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         setError('Please select a data provider');
         return;
       }
+      if (isDailySource(wizardData.dataProvider, wizardData.timeframe)) {
+        const issue = validateDailySource({ groups: wizardData.dailyGroups, minShare: wizardData.dailyMinShare }, dailyUniverseSize());
+        if (issue) {
+          setError(issue);
+          return;
+        }
+      }
     }
 
     setError(null);
@@ -591,7 +630,8 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
 
     try {
       // Convert indicators to API format
-      const technicalIndicators = wizardData.indicators.map(({ id, name, ...rest }) => rest);
+      // safety net: whatever path added them, they go out pinned to the dataset timeframe
+      const technicalIndicators = repinIndicators(wizardData.indicators, wizardData.timeframe).map(({ id, name, ...rest }) => rest);
 
       let response: Response;
 
@@ -636,6 +676,8 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
             start_date: wizardData.startDate || undefined,
             end_date: wizardData.endDate || undefined,
             data_provider: wizardData.dataProvider,
+            panel_features: panelFeaturesPayload(wizardData.dataProvider, wizardData.timeframe, wizardData.panelFeatures),
+            ...dailyPayload(wizardData.dataProvider, wizardData.timeframe, { groups: wizardData.dailyGroups, minShare: wizardData.dailyMinShare }),
             technical_indicators: technicalIndicators,
             sentiment_config: sentimentConfig,
             fundamentals_config: fundamentalsConfig
@@ -653,6 +695,8 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
             start_date: wizardData.startDate || undefined,
             end_date: wizardData.endDate || undefined,
             data_provider: wizardData.dataProvider,
+            panel_features: panelFeaturesPayload(wizardData.dataProvider, wizardData.timeframe, wizardData.panelFeatures),
+            ...dailyPayload(wizardData.dataProvider, wizardData.timeframe, { groups: wizardData.dailyGroups, minShare: wizardData.dailyMinShare }),
             technical_indicators: technicalIndicators,
             sentiment_config: sentimentConfig,
             fundamentals_config: fundamentalsConfig,
@@ -671,6 +715,8 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
             start_date: wizardData.startDate || undefined,
             end_date: wizardData.endDate || undefined,
             data_provider: wizardData.dataProvider,
+            panel_features: panelFeaturesPayload(wizardData.dataProvider, wizardData.timeframe, wizardData.panelFeatures),
+            ...dailyPayload(wizardData.dataProvider, wizardData.timeframe, { groups: wizardData.dailyGroups, minShare: wizardData.dailyMinShare }),
             technical_indicators: technicalIndicators,
             sentiment_config: sentimentConfig,
             fundamentals_config: fundamentalsConfig,
@@ -684,7 +730,9 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         throw new Error(errorData.detail || `Failed to ${mode} dataset`);
       }
 
-      onComplete();
+      // a duplicate that widened a daily universe comes back with a warning: the page shows it as a non-blocking banner
+      const created = mode === 'duplicate' ? await response.json() : null;
+      onComplete(createdNotice(created) ?? undefined);
       onClose();
 
       // Reset wizard
@@ -850,13 +898,27 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         <label className="block text-sm font-medium mb-2 text-gray-700 dark:text-gray-200">Timeframe</label>
         <select
           value={wizardData.timeframe}
-          onChange={(e) => setWizardData({ ...wizardData, timeframe: e.target.value })}
+          onChange={(e) => setWizardData({
+            ...wizardData,
+            timeframe: e.target.value,
+            // indicators are computed on the dataset timeframe: keep their names in step with it
+            indicators: repinIndicators(wizardData.indicators, e.target.value),
+            // the cache's timeframe tells its intraday panel and its daily store apart: keep the selections of the
+            // source the select moves to (no radio jump to a source with nothing selected)
+            ...timeframeChangeSelections(wizardData.dataProvider, e.target.value,
+              { panelFeatures: wizardData.panelFeatures, dailyGroups: wizardData.dailyGroups }),
+          })}
           className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-100"
         >
-          {TIMEFRAME_ORDER.map(tf => (
+          {allowedTimeframes(wizardData.dataProvider, TIMEFRAME_ORDER).map(tf => (
             <option key={tf} value={tf}>{TIMEFRAME_LABELS[tf]}</option>
           ))}
         </select>
+        {wizardData.dataProvider === ALPACA_HIST_PROVIDER && (
+          <p className="text-xs text-gray-400 dark:text-gray-300 mt-1">
+            The Alpaca history cache offers 1 hour and 15 minutes (feature groups of the intraday panel) or 1 day (the daily point-in-time feature store)
+          </p>
+        )}
       </div>
 
       <div>
@@ -945,8 +1007,16 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
           { id: 'alphavantage', name: 'Alpha Vantage', desc: 'Professional-grade financial data with fundamentals.', tags: ['API Key Required', '500/day'] },
           { id: 'fmp', name: 'Financial Modeling Prep', desc: 'Comprehensive financial data with earnings data.', tags: ['API Key Required', '250/day'] },
           { id: 'alpaca', name: 'Alpaca Markets', desc: 'Real-time and historical market data for trading.', tags: ['API Key Required'] },
+          { id: ALPACA_HIST_PROVIDER, name: 'Alpaca history cache (regular session, H1/M15)', desc: 'Hourly or 15-minute bars of the regular session built from the cached 5-minute data. Read from disk only; optional point-in-time feature groups.', tags: ['Free', 'Local Cache'] },
+          { id: ALPACA_HIST_DAILY_OPTION, name: 'Alpaca history cache: daily point-in-time feature store (alpaca_hist, 1d)', desc: 'Daily bars with the exploration\'s point-in-time feature groups (technical, weekly, market, cross-sectional, macro, fundamentals, analysts, insiders, market structure). Read from disk only; thin years are masked by the coverage threshold.', tags: ['Free', 'Local Cache'] },
         ].map(provider => {
-          const isSelected = wizardData.dataProvider === provider.id;
+          const providerValue = provider.id === ALPACA_HIST_DAILY_OPTION ? ALPACA_HIST_PROVIDER : provider.id;
+          const dailySelected = isDailySource(wizardData.dataProvider, wizardData.timeframe);
+          const isSelected = provider.id === ALPACA_HIST_DAILY_OPTION
+            ? dailySelected
+            : provider.id === ALPACA_HIST_PROVIDER
+              ? wizardData.dataProvider === ALPACA_HIST_PROVIDER && !dailySelected
+              : wizardData.dataProvider === provider.id;
           return (
           <label key={provider.id} className={`block p-4 border-2 rounded-lg cursor-pointer transition-colors ${
             isSelected
@@ -958,7 +1028,22 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
               name="dataProvider"
               value={provider.id}
               checked={isSelected}
-              onChange={(e) => setWizardData({ ...wizardData, dataProvider: e.target.value })}
+              onChange={() => {
+                // The cache is one provider with two sources told apart by the timeframe: H1 / M15 (intraday panel) and
+                // 1d (the daily feature store). Their feature groups exist for no other provider.
+                let timeframe = wizardData.timeframe;
+                if (provider.id === ALPACA_HIST_DAILY_OPTION) timeframe = DAILY_TIMEFRAME;
+                else if (provider.id === ALPACA_HIST_PROVIDER && !ALPACA_HIST_INTRADAY_TIMEFRAMES.includes(timeframe)) timeframe = '1h';
+                const toDaily = provider.id === ALPACA_HIST_DAILY_OPTION;
+                setWizardData({
+                  ...wizardData,
+                  dataProvider: providerValue,
+                  timeframe,
+                  indicators: repinIndicators(wizardData.indicators, timeframe),
+                  panelFeatures: provider.id === ALPACA_HIST_PROVIDER ? wizardData.panelFeatures : [],
+                  dailyGroups: toDaily ? (wizardData.dailyGroups.length > 0 ? wizardData.dailyGroups : ['t']) : [],
+                });
+              }}
               className="sr-only"
             />
             <div className="font-semibold text-lg mb-1 text-foreground">{provider.name}</div>
@@ -975,17 +1060,86 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         );})}
       </div>
 
+      {isDailySource(wizardData.dataProvider, wizardData.timeframe) && (
+        <div className="p-4 border border-gray-200 dark:border-gray-700 rounded-lg space-y-2">
+          <div className="font-medium text-gray-700 dark:text-gray-200">Daily feature groups</div>
+          <p className="text-xs text-gray-400 dark:text-gray-300">
+            Every group is point in time: a row is what a model knows at the session's close. The bars, the filled-bar flag and the groups
+            you tick are written to the dataset; the daily targets of the job wizard need this source.
+          </p>
+          {DAILY_GROUP_OPTIONS.map(option => (
+            <label key={option.id} className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={wizardData.dailyGroups.includes(option.id)}
+                onChange={(e) => setWizardData({
+                  ...wizardData,
+                  dailyGroups: toggleDailyGroup(wizardData.dailyGroups, option.id, e.target.checked),
+                })}
+                className="mt-1"
+              />
+              <span className="text-sm text-gray-700 dark:text-gray-200">
+                {option.name} ({option.id}) <span className="text-gray-500 dark:text-gray-400">{option.desc}</span>
+              </span>
+            </label>
+          ))}
+          <div className="pt-2">
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-1">Coverage threshold</label>
+            <input
+              type="number"
+              min="0.01"
+              max="1"
+              step="0.05"
+              value={wizardData.dailyMinShare}
+              onChange={(e) => setWizardData({ ...wizardData, dailyMinShare: e.target.value })}
+              className="w-28 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 dark:text-gray-100"
+            />
+            <p className="text-xs text-gray-400 dark:text-gray-300 mt-1">{DAILY_MASK_HELP} Default 0.7.</p>
+          </div>
+          <p className="text-xs text-gray-400 dark:text-gray-300">{DAILY_UNIVERSE_HELP}</p>
+          {breadthNote(wizardData.dailyGroups, dailyUniverseSize()) && (
+            <p className="text-xs text-amber-600 dark:text-amber-400">{breadthNote(wizardData.dailyGroups, dailyUniverseSize())}</p>
+          )}
+        </div>
+      )}
+
+      {wizardData.dataProvider === ALPACA_HIST_PROVIDER && !isDailySource(wizardData.dataProvider, wizardData.timeframe) && (
+        <div className="p-4 border border-gray-200 dark:border-gray-700 rounded-lg space-y-2">
+          <div className="font-medium text-gray-700 dark:text-gray-200">Feature groups</div>
+          <p className="text-xs text-gray-400 dark:text-gray-300">
+            Technical features of the bars are always included. Every group below is point in time: a row only sees data that was public before it.
+          </p>
+          {PANEL_FEATURE_OPTIONS.map(option => (
+            <label key={option.id} className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={wizardData.panelFeatures.includes(option.id)}
+                onChange={(e) => setWizardData({
+                  ...wizardData,
+                  panelFeatures: e.target.checked
+                    ? [...wizardData.panelFeatures, option.id]
+                    : wizardData.panelFeatures.filter(id => id !== option.id),
+                })}
+                className="mt-1"
+              />
+              <span className="text-sm text-gray-700 dark:text-gray-200">
+                {option.name} <span className="text-gray-500 dark:text-gray-400">({option.desc})</span>
+              </span>
+            </label>
+          ))}
+        </div>
+      )}
+
     </div>
   );
 
   const renderStep3 = () => {
-    const availableTimeframes = getAvailableTimeframes();
     const selectedTypeInfo = INDICATOR_TYPES.find(t => t.type === newIndicatorType);
 
     return (
       <div className="space-y-4">
         <p className="text-sm text-muted-foreground mb-2">
-          Add technical indicators with individual timeframes. Indicator timeframe must be equal or greater than the dataset timeframe ({wizardData.timeframe}).
+          Add technical indicators. They are computed on the dataset timeframe ({wizardData.timeframe}).
         </p>
 
         {/* Collection load/save controls */}
@@ -1061,9 +1215,8 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
                   collections.map(collection => {
                     const isExpanded = expandedCollections.has(collection.id);
                     const selectedCount = getCollectionSelectedCount(collection);
-                    const validIndicatorsCount = collection.indicators.filter(
-                      ind => availableTimeframes.includes(ind.timeframe)
-                    ).length;
+                    // a collection's own timeframes are ignored: all of it is computed on the dataset's
+                    const validIndicatorsCount = collection.indicators.length;
 
                     return (
                       <div
@@ -1099,12 +1252,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
                                 )}
                               </div>
                               <p className="text-xs text-gray-500 dark:text-gray-400">
-                                {validIndicatorsCount} indicators available
-                                {validIndicatorsCount < collection.indicators.length && (
-                                  <span className="text-yellow-600 dark:text-yellow-400 ml-1">
-                                    ({collection.indicators.length - validIndicatorsCount} incompatible)
-                                  </span>
-                                )}
+                                {validIndicatorsCount} indicators, computed on the dataset timeframe ({wizardData.timeframe})
                               </p>
                             </div>
                           </div>
@@ -1134,15 +1282,12 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
                               {collection.indicators.map((indicator, idx) => {
                                 const key = getIndicatorUniqueKey(collection.id, idx);
                                 const isSelected = selectedIndicatorIds.has(key);
-                                const isValidTimeframe = availableTimeframes.includes(indicator.timeframe);
 
                                 return (
                                   <label
                                     key={idx}
                                     className={`flex items-center gap-3 p-2 rounded cursor-pointer ${
-                                      !isValidTimeframe
-                                        ? 'opacity-40 cursor-not-allowed'
-                                        : isSelected
+                                      isSelected
                                         ? 'bg-blue-50 dark:bg-blue-900/30'
                                         : 'hover:bg-gray-100 dark:hover:bg-gray-600/50'
                                     }`}
@@ -1150,7 +1295,6 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
                                     <input
                                       type="checkbox"
                                       checked={isSelected}
-                                      disabled={!isValidTimeframe}
                                       onChange={() => toggleIndicatorSelection(collection.id, idx)}
                                       className="w-4 h-4 rounded border-gray-300 dark:border-gray-600 text-blue-500 focus:ring-blue-500"
                                     />
@@ -1164,12 +1308,8 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
                                         </span>
                                       </div>
                                       <div className="flex items-center gap-2 text-xs">
-                                        <span className={`px-1.5 py-0.5 rounded ${
-                                          isValidTimeframe
-                                            ? 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300'
-                                            : 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300'
-                                        }`}>
-                                          {indicator.timeframe?.toUpperCase() || 'N/A'}
+                                        <span className="px-1.5 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300">
+                                          {wizardData.timeframe.toUpperCase()}
                                         </span>
                                         <span className="text-gray-500 dark:text-gray-400 font-mono">
                                           {getIndicatorParamsString(indicator)}
@@ -1231,18 +1371,6 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
               >
                 {INDICATOR_TYPES.map(type => (
                   <option key={type.type} value={type.type}>{type.name}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs text-gray-500 dark:text-gray-300 mb-1">Timeframe</label>
-              <select
-                value={newIndicatorTimeframe}
-                onChange={(e) => setNewIndicatorTimeframe(e.target.value)}
-                className="w-full px-2 py-1.5 border border-gray-300 dark:border-gray-600 rounded text-sm dark:bg-gray-700 dark:text-gray-100"
-              >
-                {availableTimeframes.map(tf => (
-                  <option key={tf} value={tf}>{TIMEFRAME_LABELS[tf]}</option>
                 ))}
               </select>
             </div>
@@ -1654,7 +1782,6 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
             <div className="grid grid-cols-2 gap-2">
               {[
                 { id: 'interest_rate', label: 'Interest Rates' },
-                { id: 'gdp', label: 'GDP Growth' },
                 { id: 'inflation', label: 'Inflation Rate (CPI)' },
                 { id: 'unemployment', label: 'Unemployment Rate' }
               ].map(indicator => (
@@ -1787,6 +1914,32 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
           <span className="font-medium text-gray-700 dark:text-gray-200">Data Provider:</span>
           <span className="capitalize text-gray-900 dark:text-gray-100">{wizardData.dataProvider}</span>
         </div>
+        {wizardData.dataProvider === ALPACA_HIST_PROVIDER && !isDailySource(wizardData.dataProvider, wizardData.timeframe) && (
+          <div className="flex justify-between py-2 border-b border-gray-200 dark:border-gray-600">
+            <span className="font-medium text-gray-700 dark:text-gray-200">Feature Groups:</span>
+            <span className="text-gray-900 dark:text-gray-100">
+              {['Technical', ...PANEL_FEATURE_OPTIONS.filter(o => wizardData.panelFeatures.includes(o.id)).map(o => o.name)].join(', ')}
+            </span>
+          </div>
+        )}
+        {isDailySource(wizardData.dataProvider, wizardData.timeframe) && (
+          <div className="py-2 border-b border-gray-200 dark:border-gray-600">
+            <div className="flex justify-between gap-4">
+              <span className="font-medium text-gray-700 dark:text-gray-200">Daily Feature Store:</span>
+              <span className="text-gray-900 dark:text-gray-100 text-right">
+                {dailySummary({ groups: wizardData.dailyGroups, minShare: wizardData.dailyMinShare }, dailyUniverseSize())}
+              </span>
+            </div>
+            {breadthNote(wizardData.dailyGroups, dailyUniverseSize()) && (
+              <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">{breadthNote(wizardData.dailyGroups, dailyUniverseSize())}</p>
+            )}
+            {mode === 'duplicate' && initialData && duplicateUniverseNote(initialData.generation_config, wizardData.ticker) && (
+              <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                {duplicateUniverseNote(initialData.generation_config, wizardData.ticker)}
+              </p>
+            )}
+          </div>
+        )}
         <div className="flex justify-between py-2 border-b border-gray-200 dark:border-gray-600">
           <span className="font-medium text-gray-700 dark:text-gray-200">Date Range:</span>
           <span className="text-gray-900 dark:text-gray-100">{wizardData.startDate || '1 year ago'} - {wizardData.endDate || 'Today'}</span>

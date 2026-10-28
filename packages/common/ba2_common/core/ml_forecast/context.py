@@ -3,7 +3,8 @@
 Both slice the model's input the same way from the same history source, so a backtest row and a live forecast see
 the identical context. Pure: numpy and pandas only.
 
-A context for session S is the last ``n`` daily closes whose last bar IS S (Date <= S, never a later bar).
+A context for session S is the last ``n`` daily bars whose last bar IS S (Date <= S, never a later bar). The same
+slicing serves closes (1-D) and OHLCV (2-D, one row per bar): only the first axis is cut.
 """
 from __future__ import annotations
 
@@ -24,6 +25,8 @@ SOURCE_DIRS = {"alpaca_build": "AlpacaHistoryOHLCVProvider"}
 MAX_GAP_SESSIONS = 20
 
 SeriesT = Tuple[np.ndarray, np.ndarray]     # (dates datetime64[D] ascending, closes float64)
+#: ``load_daily_ohlcv_series`` column order: the second axis of the OHLCV array.
+OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 
 
 def load_daily_series(cache_root, symbol: str, source: str = "alpaca_build") -> SeriesT:
@@ -43,10 +46,30 @@ def load_daily_series(cache_root, symbol: str, source: str = "alpaca_build") -> 
     return d, c
 
 
+def load_daily_ohlcv_series(cache_root, symbol: str, source: str = "alpaca_build") -> SeriesT:
+    """``(dates datetime64[D] ascending, ohlcv float64 (N, 5))``, columns ``OHLCV_COLUMNS``. Same checks as
+    ``load_daily_series`` (tz-naive, no duplicate dates); a NaN is NOT repaired here, the adapter refuses it."""
+    if source not in SOURCE_DIRS:
+        raise ValueError(f"unknown history source {source!r}; known: {sorted(SOURCE_DIRS)}")
+    p = Path(cache_root) / SOURCE_DIRS[source] / f"{symbol}_1d.parquet"
+    df = pd.read_parquet(p, columns=["Date", *OHLCV_COLUMNS])
+    dt = pd.to_datetime(df["Date"])
+    if getattr(dt.dt, "tz", None) is not None:
+        raise ValueError(f"{p}: Date column must be tz-naive, got {dt.dt.tz}")
+    d = dt.to_numpy().astype("datetime64[D]")
+    v = df[list(OHLCV_COLUMNS)].to_numpy(dtype=np.float64)
+    order = np.argsort(d, kind="stable")
+    d, v = d[order], v[order]
+    if len(np.unique(d)) != len(d):
+        raise ValueError(f"{symbol}: duplicate dates in {p}")
+    return d, v
+
+
 def context_for(dates: np.ndarray, closes: np.ndarray, session: date, n: int,
                 max_gap_sessions: int = MAX_GAP_SESSIONS) -> Tuple[Optional[np.ndarray], Optional[str]]:
     """``(context, None)`` or ``(None, reason)`` with reason ``no_bar`` (no bar dated S), ``short`` (fewer than
-    ``n`` bars up to S) or ``gap`` (>= ``max_gap_sessions`` missing sessions inside the window)."""
+    ``n`` bars up to S) or ``gap`` (>= ``max_gap_sessions`` missing sessions inside the window). ``closes`` may also
+    be a 2-D array with one row per date (OHLCV): the rows of the window come back."""
     s64 = np.datetime64(session, "D")
     idx = int(np.searchsorted(dates, s64, side="right"))      # bars [0, idx) have Date <= session
     if idx == 0 or dates[idx - 1] != s64:
@@ -60,6 +83,24 @@ def context_for(dates: np.ndarray, closes: np.ndarray, session: date, n: int,
         if int(missing.max()) >= max_gap_sessions:
             return None, "gap"
     return closes[idx - n:idx], None
+
+
+def ohlcv_context_for(dates: np.ndarray, ohlcv: np.ndarray, session: date, n: int,
+                      max_gap_sessions: int = MAX_GAP_SESSIONS
+                      ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[str]]:
+    """``(window_dates, window_ohlcv, None)`` or ``(None, None, reason)`` (reasons as ``context_for``). The window
+    is exactly the one ``context_for`` returns for the closes: the same ``n`` bars, the last one dated S, none later
+    (asserted). The dates come back too because Kronos conditions on timestamps."""
+    if ohlcv.ndim != 2 or len(ohlcv) != len(dates):
+        raise ValueError(f"ohlcv must be (len(dates), k), got shape {ohlcv.shape} for {len(dates)} dates")
+    win, why = context_for(dates, ohlcv, session, n, max_gap_sessions)
+    if win is None:
+        return None, None, why
+    s64 = np.datetime64(session, "D")
+    idx = int(np.searchsorted(dates, s64, side="right"))
+    wd = dates[idx - n:idx]
+    assert len(wd) == len(win) == n and wd.max() <= s64 and wd[-1] == s64, "point-in-time violation"
+    return wd, win, None
 
 
 def history_provenance(cache_root, source: str = "alpaca_build") -> Dict[str, Any]:

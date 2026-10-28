@@ -3599,7 +3599,8 @@ def _report_trial_result(on_result, idx: int, fitness: float) -> None:
 #: Mapped to the expert's DEFAULT (pinned against get_settings_definitions by test): a value equal
 #: to the default scores exactly like an absent key, so it is not folded -- an explicit "same"
 #: from a UI-built config must not orphan a checkpoint written without the key.
-CHECKPOINT_IDENTITY_EXPERT_SETTINGS = {"macro_short_side": "same"}
+#: ``rank_universe`` (MLForecast, strategy MLR): the ranked symbol set; the same genes score differently on another one.
+CHECKPOINT_IDENTITY_EXPERT_SETTINGS = {"macro_short_side": "same", "rank_universe": ""}
 
 
 def checkpoint_expert_settings_identity(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:

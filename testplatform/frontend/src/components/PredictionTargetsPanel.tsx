@@ -22,11 +22,28 @@ import type {
   TripleBarrierTarget,
   TrendReversalTarget,
   VolatilityTarget,
+  TripleBarrierAtrTarget,
+  DirectionTercilesTarget,
+  ForwardReturnTarget,
   CalculatedTarget,
   IndicatorParams,
 } from '../types/targets';
+import {
+  DAILY_HORIZON_CHOICES,
+  DAILY_TARGET_INFO,
+  DAILY_TARGET_TYPES,
+  DEFAULT_DAILY_FORM,
+  buildDailyTarget,
+  dailyTargetLabel,
+  isDailyTarget,
+  toggleHorizon,
+} from '../lib/dailyTargets';
+import type { DailyTargetType } from '../lib/dailyTargets';
 
-type TabType = 'price_based' | 'directional' | 'triple_barrier' | 'trend_reversal' | 'volatility';
+type TabType = 'price_based' | 'directional' | 'triple_barrier' | 'trend_reversal' | 'volatility'
+  | 'triple_barrier_atr' | 'direction_terciles' | 'forward_return' | DailyTargetType;
+
+const isDailyTab = (tab: TabType): tab is DailyTargetType => (DAILY_TARGET_TYPES as readonly string[]).includes(tab);
 
 interface PredictionTargetsPanelProps {
   datasetId: number;
@@ -83,7 +100,8 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
   });
 
   const [trendReversalForm, setTrendReversalForm] = useState({
-    indicator: 'rsi' as 'rsi' | 'macd' | 'sar' | 'zigzag' | 'donchian' | 'adx' | 'stochastic',
+    // donchian / adx / stochastic have no reversal rule in the backend (it refuses them)
+    indicator: 'rsi' as 'rsi' | 'macd' | 'sar' | 'zigzag',
     direction: 'bullish' as 'bullish' | 'bearish',
     threshold: 30,
     timeframe: '',  // Empty = use dataset's timeframe
@@ -98,13 +116,6 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
     sarAfMax: 0.2,
     // ZigZag params
     zigzagDeviation: 5.0,
-    // Donchian params
-    donchianPeriod: 20,
-    // ADX params
-    adxPeriod: 14,
-    // Stochastic params
-    stochKPeriod: 14,
-    stochDPeriod: 3,
   });
 
   const [volatilityForm, setVolatilityForm] = useState({
@@ -112,6 +123,25 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
     horizonUnit: 'bars' as 'bars' | 'days',
     method: 'std' as 'std' | 'range' | 'atr',
   });
+
+  // Alpaca history cache targets (horizons in sessions, thresholds fitted on the training rows)
+  const [tripleBarrierAtrForm, setTripleBarrierAtrForm] = useState({
+    horizonSessions: 5,
+    slRatio: 1.0,
+    tpAtr: '',  // Empty = fitted so the timeout share is about a third
+  });
+
+  const [directionTercilesForm, setDirectionTercilesForm] = useState({
+    horizonSessions: 3,
+  });
+
+  const [forwardReturnForm, setForwardReturnForm] = useState({
+    horizonSessions: 5,
+  });
+
+  // Daily feature store targets (alpaca_hist 1d): one shared horizon / horizons form for the six daily tabs
+  const [dailyForm, setDailyForm] = useState(DEFAULT_DAILY_FORM);
+  const [formError, setFormError] = useState<string | null>(null);
 
   // Unique color palette for targets - each target gets a distinct color
   const UNIQUE_COLORS = [
@@ -265,17 +295,8 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
           };
         } else if (trendReversalForm.indicator === 'zigzag') {
           indicatorParams = { deviationPct: trendReversalForm.zigzagDeviation };
-        } else if (trendReversalForm.indicator === 'donchian') {
-          indicatorParams = { period: trendReversalForm.donchianPeriod };
-        } else if (trendReversalForm.indicator === 'adx') {
-          indicatorParams = { period: trendReversalForm.adxPeriod };
-        } else if (trendReversalForm.indicator === 'stochastic') {
-          indicatorParams = {
-            kPeriod: trendReversalForm.stochKPeriod,
-            dPeriod: trendReversalForm.stochDPeriod,
-          };
         } else {
-          indicatorParams = { period: 14 }; // Default fallback
+          throw new Error(`Unsupported trend reversal indicator: ${String(trendReversalForm.indicator)}`);
         }
         config = {
           type: 'trend_reversal',
@@ -301,10 +322,55 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
         color = getNextColor();
         break;
 
+      case 'triple_barrier_atr':
+        config = {
+          type: 'triple_barrier_atr',
+          category: 'multiclass_classification',
+          horizonSessions: tripleBarrierAtrForm.horizonSessions,
+          slRatio: tripleBarrierAtrForm.slRatio,
+          ...(tripleBarrierAtrForm.tpAtr !== '' ? { tpAtr: parseFloat(tripleBarrierAtrForm.tpAtr) } : {}),
+        } as TripleBarrierAtrTarget;
+        color = getNextColor();
+        break;
+
+      case 'direction_terciles':
+        config = {
+          type: 'direction_terciles',
+          category: 'multiclass_classification',
+          horizonSessions: directionTercilesForm.horizonSessions,
+        } as DirectionTercilesTarget;
+        color = getNextColor();
+        break;
+
+      case 'forward_return':
+        config = {
+          type: 'forward_return',
+          category: 'regression',
+          horizonSessions: forwardReturnForm.horizonSessions,
+        } as ForwardReturnTarget;
+        color = getNextColor();
+        break;
+
+      case 'daily_rel_return':
+      case 'daily_quintile':
+      case 'daily_beats':
+      case 'daily_up':
+      case 'daily_volatility':
+      case 'daily_multistep':
+        try {
+          config = buildDailyTarget(activeTab, dailyForm) as TargetConfig;
+        } catch (e) {
+          setFormError(e instanceof Error ? e.message : String(e));
+          return;
+        }
+        color = getNextColor();
+        break;
+
       default:
         return;
     }
 
+    setFormError(null);
     // Add to targets list (will be calculated on preview)
     const newTarget: CalculatedTarget = {
       config,
@@ -316,7 +382,7 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
     };
 
     setTargets([...targets, newTarget]);
-  }, [activeTab, priceBasedForm, directionalForm, tripleBarrierForm, trendReversalForm, volatilityForm, targets, getNextColor]);
+  }, [activeTab, priceBasedForm, directionalForm, tripleBarrierForm, trendReversalForm, volatilityForm, tripleBarrierAtrForm, directionTercilesForm, forwardReturnForm, dailyForm, targets, getNextColor]);
 
   // Remove target with confirmation
   const removeTarget = useCallback((index: number) => {
@@ -408,7 +474,23 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
         const unit = c.horizonUnit === 'days' ? 'd' : 'b';
         return `Volatility ${c.method} ${c.horizon}${unit}`;
       }
+      case 'triple_barrier_atr': {
+        const c = config as TripleBarrierAtrTarget;
+        const tp = c.tpAtr !== undefined ? `${c.tpAtr}xATR` : 'fitted TP';
+        return `ATR barrier ${tp}/SL x${c.slRatio}/${c.horizonSessions}s`;
+      }
+      case 'direction_terciles': {
+        const c = config as DirectionTercilesTarget;
+        return `Direction terciles ${c.horizonSessions}s`;
+      }
+      case 'forward_return': {
+        const c = config as ForwardReturnTarget;
+        return `Forward return ${c.horizonSessions}s`;
+      }
       default:
+        if (isDailyTarget(config as unknown as Record<string, unknown>)) {
+          return dailyTargetLabel(config as unknown as Record<string, unknown>);
+        }
         return 'Unknown';
     }
   };
@@ -416,6 +498,7 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
   // Get stats display for a target
   const getStatsDisplay = (target: CalculatedTarget): string => {
     const { stats, config } = target;
+    if (stats.error) return stats.error;
     if (stats.validRows === 0) return 'Not calculated';
 
     if (config.category === 'binary_classification') {
@@ -434,6 +517,12 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
     { id: 'triple_barrier', label: 'Triple-Barrier', icon: <BarChart3 size={16} /> },
     { id: 'trend_reversal', label: 'Trend Reversal', icon: <TrendingDown size={16} /> },
     { id: 'volatility', label: 'Volatility', icon: <Activity size={16} /> },
+    { id: 'triple_barrier_atr', label: 'ATR Barrier', icon: <BarChart3 size={16} /> },
+    { id: 'direction_terciles', label: 'Direction Terciles', icon: <TrendingUp size={16} /> },
+    { id: 'forward_return', label: 'Forward Return', icon: <Activity size={16} /> },
+    ...DAILY_TARGET_TYPES.map((id): { id: TabType; label: string; icon: React.ReactNode } => ({
+      id, label: DAILY_TARGET_INFO[id].tabLabel, icon: DAILY_TARGET_INFO[id].category === 'regression' ? <Activity size={16} /> : <TrendingUp size={16} />,
+    })),
   ];
 
   return (
@@ -464,11 +553,11 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
       </div>
 
       {/* Tabs */}
-      <div className="flex border-b border-gray-200 dark:border-gray-700 mb-4">
+      <div className="flex flex-wrap border-b border-gray-200 dark:border-gray-700 mb-4">
         {tabs.map((tab) => (
           <button
             key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => { setActiveTab(tab.id); setFormError(null); }}
             className={`px-4 py-2 text-sm font-medium flex items-center gap-1.5 border-b-2 transition-colors ${
               activeTab === tab.id
                 ? 'border-purple-500 text-purple-600 dark:text-purple-400'
@@ -637,16 +726,13 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
                 <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Indicator</label>
                 <select
                   value={trendReversalForm.indicator}
-                  onChange={(e) => setTrendReversalForm({ ...trendReversalForm, indicator: e.target.value as 'rsi' | 'macd' | 'sar' | 'zigzag' | 'donchian' | 'adx' | 'stochastic' })}
+                  onChange={(e) => setTrendReversalForm({ ...trendReversalForm, indicator: e.target.value as 'rsi' | 'macd' | 'sar' | 'zigzag' })}
                   className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
                 >
                   <option value="rsi">RSI</option>
                   <option value="macd">MACD</option>
                   <option value="sar">Parabolic SAR</option>
                   <option value="zigzag">ZigZag</option>
-                  <option value="donchian">Donchian Channel</option>
-                  <option value="adx">ADX</option>
-                  <option value="stochastic">Stochastic</option>
                 </select>
               </div>
               <div>
@@ -775,91 +861,6 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
                   />
                 </div>
               )}
-              {trendReversalForm.indicator === 'donchian' && (
-                <>
-                  <div>
-                    <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Threshold</label>
-                    <input
-                      type="number"
-                      min="1"
-                      max="99"
-                      value={trendReversalForm.threshold}
-                      onChange={(e) => setTrendReversalForm({ ...trendReversalForm, threshold: parseInt(e.target.value) || 0 })}
-                      className="w-20 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Period</label>
-                    <input
-                      type="number"
-                      min="2"
-                      value={trendReversalForm.donchianPeriod}
-                      onChange={(e) => setTrendReversalForm({ ...trendReversalForm, donchianPeriod: parseInt(e.target.value) || 20 })}
-                      className="w-20 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
-                    />
-                  </div>
-                </>
-              )}
-              {trendReversalForm.indicator === 'adx' && (
-                <>
-                  <div>
-                    <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Threshold</label>
-                    <input
-                      type="number"
-                      min="1"
-                      max="99"
-                      value={trendReversalForm.threshold}
-                      onChange={(e) => setTrendReversalForm({ ...trendReversalForm, threshold: parseInt(e.target.value) || 25 })}
-                      className="w-20 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Period</label>
-                    <input
-                      type="number"
-                      min="2"
-                      value={trendReversalForm.adxPeriod}
-                      onChange={(e) => setTrendReversalForm({ ...trendReversalForm, adxPeriod: parseInt(e.target.value) || 14 })}
-                      className="w-20 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
-                    />
-                  </div>
-                </>
-              )}
-              {trendReversalForm.indicator === 'stochastic' && (
-                <>
-                  <div>
-                    <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Threshold</label>
-                    <input
-                      type="number"
-                      min="1"
-                      max="99"
-                      value={trendReversalForm.threshold}
-                      onChange={(e) => setTrendReversalForm({ ...trendReversalForm, threshold: parseInt(e.target.value) || 20 })}
-                      className="w-20 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">%K Period</label>
-                    <input
-                      type="number"
-                      min="2"
-                      value={trendReversalForm.stochKPeriod}
-                      onChange={(e) => setTrendReversalForm({ ...trendReversalForm, stochKPeriod: parseInt(e.target.value) || 14 })}
-                      className="w-16 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">%D Period</label>
-                    <input
-                      type="number"
-                      min="1"
-                      value={trendReversalForm.stochDPeriod}
-                      onChange={(e) => setTrendReversalForm({ ...trendReversalForm, stochDPeriod: parseInt(e.target.value) || 3 })}
-                      className="w-16 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
-                    />
-                  </div>
-                </>
-              )}
             </div>
           </div>
         )}
@@ -902,6 +903,129 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
               Regression target: predicts volatility over next {volatilityForm.horizon} {volatilityForm.horizonUnit}
             </p>
           </div>
+        )}
+
+        {activeTab === 'triple_barrier_atr' && (
+          <div className="flex flex-wrap items-end gap-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Horizon (sessions)</label>
+              <input
+                type="number"
+                min="1"
+                value={tripleBarrierAtrForm.horizonSessions}
+                onChange={(e) => setTripleBarrierAtrForm({ ...tripleBarrierAtrForm, horizonSessions: parseInt(e.target.value) || 1 })}
+                className="w-20 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">SL / TP ratio</label>
+              <input
+                type="number"
+                min="0.1"
+                step="0.1"
+                value={tripleBarrierAtrForm.slRatio}
+                onChange={(e) => setTripleBarrierAtrForm({ ...tripleBarrierAtrForm, slRatio: parseFloat(e.target.value) || 1 })}
+                className="w-24 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">TP (x daily ATR)</label>
+              <input
+                type="number"
+                min="0.25"
+                step="0.25"
+                placeholder="fitted"
+                value={tripleBarrierAtrForm.tpAtr}
+                onChange={(e) => setTripleBarrierAtrForm({ ...tripleBarrierAtrForm, tpAtr: e.target.value })}
+                className="w-24 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
+              />
+            </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              3 classes: loss / timeout / win. TP = k x ATR, SL = ratio x k x ATR; a blank TP is fitted on the training rows
+              so about a third time out. Needs a dataset from the Alpaca history cache (1h / 15m).
+            </p>
+          </div>
+        )}
+
+        {activeTab === 'direction_terciles' && (
+          <div className="flex flex-wrap items-end gap-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Horizon (sessions)</label>
+              <input
+                type="number"
+                min="1"
+                value={directionTercilesForm.horizonSessions}
+                onChange={(e) => setDirectionTercilesForm({ ...directionTercilesForm, horizonSessions: parseInt(e.target.value) || 1 })}
+                className="w-20 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
+              />
+            </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              3 classes: down / flat / up over {directionTercilesForm.horizonSessions} sessions; the thresholds are the training
+              rows' terciles. Needs a dataset from the Alpaca history cache (1h / 15m).
+            </p>
+          </div>
+        )}
+
+        {activeTab === 'forward_return' && (
+          <div className="flex flex-wrap items-end gap-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Horizon (sessions)</label>
+              <input
+                type="number"
+                min="1"
+                value={forwardReturnForm.horizonSessions}
+                onChange={(e) => setForwardReturnForm({ ...forwardReturnForm, horizonSessions: parseInt(e.target.value) || 1 })}
+                className="w-20 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
+              />
+            </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Regression target: the {forwardReturnForm.horizonSessions}-session forward return. Needs a dataset from the
+              Alpaca history cache (1h / 15m).
+            </p>
+          </div>
+        )}
+
+        {isDailyTab(activeTab) && (
+          <div className="flex flex-wrap items-end gap-4">
+            {activeTab === 'daily_multistep' ? (
+              <div>
+                <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Horizons (sessions)</label>
+                <div className="flex gap-3">
+                  {DAILY_HORIZON_CHOICES.map((h) => (
+                    <label key={h} className="flex items-center gap-1 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={dailyForm.horizons.includes(h)}
+                        onChange={(e) => setDailyForm({ ...dailyForm, horizons: toggleHorizon(dailyForm.horizons, h, e.target.checked) })}
+                      />
+                      {h}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div>
+                <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Horizon (sessions)</label>
+                <select
+                  value={dailyForm.horizonSessions}
+                  onChange={(e) => setDailyForm({ ...dailyForm, horizonSessions: parseInt(e.target.value) })}
+                  className="w-24 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
+                >
+                  {DAILY_HORIZON_CHOICES.map((h) => (
+                    <option key={h} value={h}>{h}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              {DAILY_TARGET_INFO[activeTab].hint} The decision is taken at a session's close and filled at the next open.
+              Needs a dataset from the Alpaca history cache's daily feature store (1d).
+            </p>
+          </div>
+        )}
+
+        {formError && (
+          <p className="mt-3 text-sm text-red-600 dark:text-red-400">{formError}</p>
         )}
 
         <button

@@ -1,8 +1,13 @@
 """
 Macro Economics Service
 
-Fetches macroeconomic data (interest rates, GDP, inflation) and integrates
-it with OHLC datasets using forward-fill for ML model training.
+Integrates macroeconomic series (interest rates, inflation, unemployment, VIX, yields) with OHLC
+datasets for ML model training.
+
+Dataset features read the FIRST-RELEASE FRED cache of ``ba2_providers.macro.fred_series``: a value is
+visible to a row from the day FRED first published it (its ``realtime_start``), at its first-published
+number, never the revised one. That is the same rule the backtests use, so a trained model and its
+backtest see the same macro values.
 """
 
 import pandas as pd
@@ -14,6 +19,10 @@ import os
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+class MacroCoverageError(ValueError):
+    """The dataset's dates fall outside what a series' first-release cache can establish."""
 
 
 class MacroService:
@@ -29,6 +38,11 @@ class MacroService:
 
     # Economic indicator series IDs from FRED
     # 'yoy_periods' indicates how many observations make 1 year for YoY calculation
+    #
+    # Dataset features are read from the first-release cache (ba2_providers.macro.fred_series), which
+    # holds BAA10Y, CPIAUCSL, DGS10, DGS3MO, FEDFUNDS, PAYEMS, T10Y3M, UNRATE and VIXCLS. GDP and DGS2
+    # have NO cache file, so asking for 'gdp' or 'yield_2y' is refused (_require_cached_series), not
+    # served from live revised FRED data.
     MACRO_INDICATORS = {
         'interest_rate': {
             'series': 'FEDFUNDS',
@@ -81,24 +95,140 @@ class MacroService:
         }
     }
 
+    @classmethod
+    def cached_indicators(cls) -> List[str]:
+        """The indicators the first-release cache can serve (everything but GDP and yield_2y)."""
+        from ba2_providers.macro import fred_series as fs
+        return [name for name, cfg in cls.MACRO_INDICATORS.items() if cfg['series'] in fs.SERIES_SPEC]
+
+    def _require_cached_series(self, indicator: str) -> str:
+        """The FRED series id behind *indicator*, refused when the first-release cache has no file for it."""
+        from ba2_providers.macro import fred_series as fs
+
+        if indicator not in self.MACRO_INDICATORS:
+            raise ValueError(f"Unknown macro indicator {indicator!r}; supported: {sorted(self.MACRO_INDICATORS)}")
+        sid = self.MACRO_INDICATORS[indicator]['series']
+        if sid not in fs.SERIES_SPEC:
+            raise ValueError(
+                f"Macro indicator {indicator!r} (FRED {sid}) has no first-release cache file "
+                f"({fs.cache_path(sid)}), so its values cannot be placed point-in-time. "
+                f"The cache holds {sorted(fs.SERIES_SPEC)}; deselect {indicator!r}."
+            )
+        return sid
+
+    def _require_coverage(self, dates: pd.Series, indicators: List[str]) -> None:
+        """Refuse up front, with ONE clear message, a dataset the cache cannot cover.
+
+        A daily bar D decides on the next session N(D) (``fred_series.decision_label``), and the
+        reader refuses a label after the day the cache was fetched or on/before its first vintage.
+        Without this check that refusal surfaces deep inside the first read, naming a decision
+        label no one asked for. Nothing is trimmed: the caller must end/start the dataset inside the
+        coverage or refresh the cache. A missing cache file is refused here too, naming the file.
+        """
+        import json
+        import os
+        from datetime import date as date_cls
+        from datetime import datetime
+        from ba2_providers.macro import fred_series as fs
+
+        stamps = pd.Index(dates.dropna().unique()).sort_values()
+        if stamps.empty:
+            return
+        for indicator in indicators:
+            sid = self._require_cached_series(indicator)
+            path = fs.cache_path(sid)
+            if not os.path.exists(path):
+                raise fs.MacroAvailabilityUnknown(
+                    f"FRED {sid} ({indicator}): the first-release cache file {path} does not exist. "
+                    f"Run the FRED refresh (tools/refresh_fred_cache.py --series {sid}) first.")
+            with open(path, encoding='utf-8') as fh:
+                doc = json.load(fh)
+            if doc.get('format') != fs.CACHE_FORMAT_FIRST_RELEASE:
+                continue                       # the reader refuses the old format with its own message
+            first_day = date_cls.fromisoformat(str(doc['first_vintage']))
+            fetched_at = datetime.fromisoformat(str(doc['fetched_at']))
+            if fetched_at.tzinfo is None:
+                continue                       # unrecorded fetch day: the reader refuses it
+            fetched = fetched_at.astimezone(fs.FETCH_DAY_TZ).date()
+
+            labels = [fs.decision_label(t) for t in (stamps[0], stamps[-1])]
+            if labels[1] > fetched:
+                covered = [t for t in stamps if fs.decision_label(t) <= fetched]
+                last_ok = f"{covered[-1].date()}" if covered else None
+                raise MacroCoverageError(
+                    f"Macro series {sid} ({indicator}): the first-release cache was fetched on {fetched} "
+                    f"(New York date), so it covers decisions only up to that day; this dataset runs to "
+                    f"{stamps[-1].date()}. " + (
+                        f"The last coverable bar is {last_ok}: end the dataset on or before {last_ok}, "
+                        f"or refresh the FRED cache." if last_ok else
+                        "No bar of this dataset is coverable: refresh the FRED cache."))
+            if labels[0] <= first_day:
+                covered = [t for t in stamps if fs.decision_label(t) > first_day]
+                first_ok = f"{covered[0].date()}" if covered else None
+                raise MacroCoverageError(
+                    f"Macro series {sid} ({indicator}): the first-release cache's first vintage is "
+                    f"{first_day}, so decisions on or before it are unknown; this dataset starts at "
+                    f"{stamps[0].date()}. " + (
+                        f"The first coverable bar is {first_ok}: start the dataset on or after {first_ok}."
+                        if first_ok else "No bar of this dataset is coverable."))
+
+    def _first_release_columns(self, dates: pd.Series, indicator: str) -> pd.DataFrame:
+        """Per-row ``indicator``, ``_yoy_change`` and ``_days_since`` from the first-release cache.
+
+        Row ``t`` gets the latest observation ``fred_series.get_series_as_of(series, t)`` shows: the
+        first-published value of every observation FRED had released before ``t``'s decision label
+        (see ``fred_series.decision_label``). Rows that share a label share one cache read, so an
+        intraday dataset costs one read per day, not per bar. YoY is the change against the
+        observation ``yoy_periods`` earlier in that same visible series; ``days_since`` counts from
+        the OBSERVATION date of the value in force (the release date is not exposed by the reader).
+        A series without a cache file, or a row outside the cache's coverage, raises
+        (``MacroAvailabilityUnknown``, naming the file).
+        """
+        from ba2_providers.fmp_common import frozen_ttl_cache
+        from ba2_providers.macro import fred_series as fs
+
+        sid = self._require_cached_series(indicator)
+        yoy_periods = self.MACRO_INDICATORS[indicator]['yoy_periods']
+
+        stamps = pd.Index(dates.unique())
+        label_of = {t: fs.decision_label(t) for t in stamps}
+        per_label = {}
+        for t in stamps:
+            label = label_of[t]
+            if label in per_label:
+                continue
+            # Frozen: read the synced cache file only. A missing or stale file refuses (naming the
+            # file) instead of fetching mid-build, so a dataset never depends on FRED being up.
+            with frozen_ttl_cache():
+                visible = fs.get_series_as_of(sid, t).dropna()
+            # The cache holds ONE first-release row per observation, so this is a safeguard: if a
+            # payload ever carried several vintages of one observation, the FIRST release is the
+            # value and a later vintage must never replace it (that is the revision leak).
+            visible = visible[~visible.index.duplicated(keep='first')]
+            if visible.empty:
+                per_label[label] = (np.nan, pd.NaT, np.nan)
+                continue
+            yoy = np.nan
+            if len(visible) > yoy_periods:
+                yoy = (visible.iloc[-1] / visible.iloc[-1 - yoy_periods] - 1) * 100
+            per_label[label] = (float(visible.iloc[-1]), visible.index[-1], yoy)
+
+        rows = [per_label[label_of[t]] for t in dates]
+        out = pd.DataFrame(rows, columns=[indicator, 'observation_date', f'{indicator}_yoy_change'], index=dates.index)
+        out[f'{indicator}_days_since'] = (dates - pd.to_datetime(out['observation_date'])).dt.days
+        return out.drop(columns=['observation_date'])
+
     def __init__(self, api_key: str = None):
         """
         Initialize MacroService.
 
         Args:
-            api_key: FRED API key. None -> the ONE shared resolver
-                (``ba2_common.core.fred_api_key``: env ``FRED_API_KEY``, else the AppSetting
-                ``fred_api_key``).
-
-        Raises:
-            FredApiKeyMissing: no key is configured. This used to log a warning and return
-                empty frames, which became all-NaN macro columns in the dataset.
+            api_key: FRED API key for the LIVE viewer fetch (``get_macro_data``) only. None -> the
+                ONE shared resolver (``ba2_common.core.fred_api_key``: env ``FRED_API_KEY``, else
+                the AppSetting ``fred_api_key``), resolved on first use. Dataset features read the
+                local first-release cache and need no key.
         """
-        if api_key:
-            self.api_key = api_key
-        else:
-            from ba2_common.core.fred_api_key import require_fred_api_key
-            self.api_key = require_fred_api_key("macro dataset features (MacroService)")
+        self._api_key = api_key
 
         # Secondary re-source seam (Phase 5, Task 6), parallel to the OHLCV seam:
         # when FEATURES_SOURCE=ba2_providers is explicitly selected, macro series are
@@ -128,6 +258,18 @@ class MacroService:
             logger.warning(f"FEATURES_SOURCE macro seam init skipped: {e}")
             self._ba2_provider = None
 
+    @property
+    def api_key(self) -> str:
+        """The FRED key for a live fetch. Raises ``FredApiKeyMissing`` when none is configured.
+
+        (A missing key used to log a warning and return empty frames, which became all-NaN macro
+        columns in the dataset.)
+        """
+        if not self._api_key:
+            from ba2_common.core.fred_api_key import require_fred_api_key
+            self._api_key = require_fred_api_key("the live macro viewer (MacroService.get_macro_data)")
+        return self._api_key
+
     def _fetch_fred_data(
         self,
         series_id: str,
@@ -135,7 +277,8 @@ class MacroService:
         end_date: datetime
     ) -> pd.DataFrame:
         """
-        Fetch data from FRED API.
+        Fetch data from the live FRED API: LATEST (revised) values by observation date. For the
+        macro viewer only -- dataset features use the first-release cache (_first_release_columns).
 
         Args:
             series_id: FRED series ID
@@ -219,11 +362,10 @@ class MacroService:
         indicators: List[str] = None
     ) -> pd.DataFrame:
         """
-        Integrate macro data with OHLC dataset using forward-fill.
-
-        Macro data is typically released less frequently than OHLC data
-        (monthly vs daily). This method aligns macro data to the OHLC
-        dates using forward-fill to propagate the last known value.
+        Integrate macro data with OHLC dataset: each row carries the latest first-release
+        observation FRED had published at that row's decision (see ``_first_release_columns``).
+        Macro data is released less often than OHLC bars, so the last known value is held until
+        the next release.
 
         Args:
             ohlc_df: DataFrame with Date column and OHLC data
@@ -243,69 +385,31 @@ class MacroService:
         if result_df['Date'].dt.tz is not None:
             result_df['Date'] = result_df['Date'].dt.tz_localize(None)
 
-        # Get date range from OHLC data (convert to naive datetime for API call)
-        start_date = result_df['Date'].min()
-        end_date = result_df['Date'].max()
-        if hasattr(start_date, 'to_pydatetime'):
-            start_date = start_date.to_pydatetime()
-        if hasattr(end_date, 'to_pydatetime'):
-            end_date = end_date.to_pydatetime()
-
-        # Fetch macro data with 13 months of additional history for YoY calculation
-        # (12 months lookback + 1 month buffer for quarterly data alignment)
-        macro_start_date = start_date - timedelta(days=400)
-        macro_data = self.get_macro_data(indicators, macro_start_date, end_date)
-
-        # Merge each indicator using merge_asof for proper time-based alignment
-        # This handles the case where FRED releases data monthly (e.g., 1st of month)
-        # and OHLC data is daily/intraday
         result_df = result_df.sort_values('Date').reset_index(drop=True)
 
-        for indicator, macro_df in macro_data.items():
-            if macro_df.empty:
-                result_df[indicator] = np.nan
-                logger.warning(f"No macro data for {indicator}, filling with NaN")
-                continue
-
-            # Ensure macro dates are also timezone-naive
-            macro_df = macro_df.copy()
-            macro_df['Date'] = pd.to_datetime(macro_df['Date'])
-            if macro_df['Date'].dt.tz is not None:
-                macro_df['Date'] = macro_df['Date'].dt.tz_localize(None)
-
-            # Sort macro data for merge_asof
-            macro_df = macro_df.sort_values('Date').reset_index(drop=True)
-
-            # Calculate YoY change on raw macro data BEFORE merging
-            # Use frequency-specific periods (12 for monthly, 4 for quarterly, 252 for daily)
-            yoy_col = f'{indicator}_yoy_change'
-            yoy_periods = self.MACRO_INDICATORS.get(indicator, {}).get('yoy_periods', 12)
-            macro_df[yoy_col] = macro_df[indicator].pct_change(periods=yoy_periods, fill_method=None) * 100
-
-            # Add a column for the macro report date to calculate days_since
-            macro_date_col = f'{indicator}_report_date'
-            macro_df[macro_date_col] = macro_df['Date']
-
-            # Use merge_asof to get the most recent macro value for each OHLC row
-            # This is the correct way to align less-frequent data with more-frequent data
-            result_df = pd.merge_asof(
-                result_df,
-                macro_df[['Date', indicator, yoy_col, macro_date_col]],
-                on='Date',
-                direction='backward'  # Get the most recent macro value at or before each OHLC date
-            )
-
-            # Calculate days since last macro report
-            days_since_col = f'{indicator}_days_since'
-            result_df[days_since_col] = (result_df['Date'] - result_df[macro_date_col]).dt.days
-
-            # Drop the report date column (keep only days_since)
-            result_df = result_df.drop(columns=[macro_date_col])
-
+        self._require_coverage(result_df['Date'], indicators)
+        for indicator in indicators:
+            cols = self._first_release_columns(result_df['Date'], indicator)
+            for col in cols.columns:
+                result_df[col] = cols[col]
             logger.debug(f"Merged {indicator}: {result_df[indicator].notna().sum()} non-null values")
 
         logger.info(f"Integrated {len(indicators)} macro indicators with OHLC data")
         return result_df
+
+    def add_macro_columns(self, df: pd.DataFrame, indicators: List[str]) -> pd.DataFrame:
+        """``integrate_macro_with_ohlc`` with the dataset column names: ``macro_<indicator>`` etc.
+
+        Raises (never skips) for an indicator the first-release cache cannot serve, so a dataset
+        build fails with the series or file named instead of finishing without macro columns.
+        """
+        df = self.integrate_macro_with_ohlc(df, indicators)   # checks the cache coverage first
+        renames = {}
+        for indicator in indicators:
+            for col in (indicator, f'{indicator}_yoy_change', f'{indicator}_days_since'):
+                if col in df.columns:
+                    renames[col] = f'macro_{col}'
+        return df.rename(columns=renames)
 
     def create_yield_curve_features(self, ohlc_df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -327,31 +431,10 @@ class MacroService:
         # Sort for merge_asof
         result_df = result_df.sort_values('Date').reset_index(drop=True)
 
-        start_date = result_df['Date'].min()
-        end_date = result_df['Date'].max()
-        if hasattr(start_date, 'to_pydatetime'):
-            start_date = start_date.to_pydatetime()
-        if hasattr(end_date, 'to_pydatetime'):
-            end_date = end_date.to_pydatetime()
-
-        # Fetch 2Y and 10Y yields
-        yield_data = self.get_macro_data(['yield_2y', 'yield_10y'], start_date, end_date)
-
-        # Merge yields using merge_asof for proper time alignment
-        for indicator, macro_df in yield_data.items():
-            if not macro_df.empty:
-                macro_df = macro_df.copy()
-                macro_df['Date'] = pd.to_datetime(macro_df['Date'])
-                if macro_df['Date'].dt.tz is not None:
-                    macro_df['Date'] = macro_df['Date'].dt.tz_localize(None)
-                macro_df = macro_df.sort_values('Date').reset_index(drop=True)
-
-                result_df = pd.merge_asof(
-                    result_df,
-                    macro_df[['Date', indicator]],
-                    on='Date',
-                    direction='backward'
-                )
+        # Fetch 2Y and 10Y yields from the first-release cache (DGS2 has no cache file: refused)
+        self._require_coverage(result_df['Date'], ['yield_2y', 'yield_10y'])
+        for indicator in ('yield_2y', 'yield_10y'):
+            result_df[indicator] = self._first_release_columns(result_df['Date'], indicator)[indicator]
 
         # Calculate yield curve spread (10Y - 2Y)
         if 'yield_10y' in result_df.columns and 'yield_2y' in result_df.columns:
@@ -365,9 +448,10 @@ class MacroService:
     @staticmethod
     def get_supported_indicators() -> Dict[str, Dict]:
         """
-        Get list of supported macro indicators with metadata.
+        Get the macro indicators the dataset features can use (those with a first-release cache
+        series), with metadata.
 
         Returns:
             Dictionary of indicator configurations
         """
-        return MacroService.MACRO_INDICATORS.copy()
+        return {name: MacroService.MACRO_INDICATORS[name] for name in MacroService.cached_indicators()}

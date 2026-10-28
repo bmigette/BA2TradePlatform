@@ -246,3 +246,109 @@ def test_meta_written_after_parquet(tmp_path, key, monkeypatch):
     with pytest.raises(OSError):
         seed(tmp_path, key, [row("AAPL", date(2024, 3, 1))])
     assert not (tmp_path / "ml_forecast" / key / "meta.json").exists()    # a crash never leaves meta without data
+
+
+def test_read_session_is_the_latest_fresh_row_of_each_universe_symbol_at_the_cutoff(tmp_path, key):
+    seed(tmp_path, key, [row("AAPL", date(2024, 3, 1), 0.01), row("AAPL", date(2024, 3, 5), 0.02),
+                         row("AAPL", date(2024, 3, 20), 0.09),            # after the cutoff: never returned
+                         row("MSFT", date(2024, 3, 4), 0.03),
+                         row("OLD", date(2024, 2, 20)),                   # 17 days before the cutoff: stale
+                         row("NVDA", date(2024, 3, 25)),                  # first session after the cutoff: absent
+                         row("LOCKED", date(2024, 3, 6), 0.05)])          # in the store, NOT in the universe
+    universe = ["NVDA", "MSFT", "AAPL", "OLD"]
+    out = store.read_session(key, date(2024, 3, 8), 5, universe, tmp_path)
+    assert list(out) == ["AAPL", "MSFT"]                                  # sorted universe order, no LOCKED
+    assert out["AAPL"].session == date(2024, 3, 5) and out["MSFT"].session == date(2024, 3, 4)
+    assert_rows_close(out["AAPL"], expect_h5(row("AAPL", date(2024, 3, 5), 0.02)))
+    assert all(r.session <= date(2024, 3, 8) for r in out.values())
+    # agrees with read_row symbol by symbol, staleness included
+    for sym in ("AAPL", "MSFT"):
+        assert out[sym] == store.read_row(key, sym, date(2024, 3, 8), 5, tmp_path)
+    for sym in ("OLD", "NVDA"):
+        with pytest.raises(store.ForecastStoreMiss):
+            store.read_row(key, sym, date(2024, 3, 8), 5, tmp_path)
+    # the staleness window is the caller's
+    assert list(store.read_session(key, date(2024, 3, 8), 5, universe, tmp_path, max_age_days=30)) == \
+        ["AAPL", "MSFT", "OLD"]
+    assert store.read_session(key, date(2024, 2, 1), 5, universe, tmp_path) == {}
+
+
+def test_read_session_ignores_extra_files_and_refuses_a_missing_one(tmp_path, key):
+    seed(tmp_path, key, [row("AAPL", date(2024, 3, 1)), row("MSFT", date(2024, 3, 1)), row("EXTRA", date(2024, 3, 1))])
+    assert list(store.read_session(key, date(2024, 3, 1), 5, ["MSFT", "AAPL"], tmp_path)) == ["AAPL", "MSFT"]
+    with pytest.raises(store.ForecastStoreError, match="NOFILE") as ei:
+        store.read_session(key, date(2024, 3, 1), 5, ["AAPL", "NOFILE"], tmp_path)
+    assert not isinstance(ei.value, store.ForecastStoreMiss)        # an incomplete store, not a quiet absence
+    for bad in ([], (), "AAPL"):
+        with pytest.raises((ValueError, TypeError)):
+            store.read_session(key, date(2024, 3, 1), 5, bad, tmp_path)
+
+
+def test_read_session_validates_like_read_row(tmp_path, key):
+    seed(tmp_path, key, [row("AAPL", date(2024, 3, 1))])
+    with pytest.raises(TypeError):
+        store.read_session(key, datetime(2024, 3, 1), 5, ["AAPL"], tmp_path)
+    with pytest.raises(ValueError):
+        store.read_session(key, date(2024, 3, 1), 7, ["AAPL"], tmp_path)
+    with pytest.raises(ValueError):
+        store.read_session(key, date(2024, 3, 1), 5, ["AAPL"], tmp_path, max_age_days=0)
+    with pytest.raises(ValueError, match="unsafe"):
+        store.read_session(key, date(2024, 3, 1), 5, ["../x"], tmp_path)
+
+
+def test_read_session_reuses_the_symbol_cache(tmp_path, key, monkeypatch):
+    seed(tmp_path, key, [row("AAPL", date(2024, 3, 1)), row("MSFT", date(2024, 3, 1))])
+    store.read_session(key, date(2024, 3, 1), 5, ["AAPL", "MSFT"], tmp_path)
+    import pandas as pd
+    monkeypatch.setattr(pd, "read_parquet", lambda *a, **k: pytest.fail("parquet re-read despite the LRU"))
+    assert sorted(store.read_session(key, date(2024, 3, 1), 5, ["AAPL", "MSFT"], tmp_path)) == ["AAPL", "MSFT"]
+
+
+def test_load_score_entries_reads_only_the_score_columns_never_the_path_cells(tmp_path, monkeypatch):
+    k = model_key(make_card(output_type="paths"), ())
+    seed(tmp_path, k, [row("AAPL", date(2024, 3, 1), paths=True)], card=make_card(output_type="paths"))
+    import pandas as pd
+    real = pd.read_parquet
+    seen = []
+
+    def spy(p, columns=None, **kw):
+        seen.append(list(columns))
+        return real(p, columns=columns, **kw)
+
+    monkeypatch.setattr(pd, "read_parquet", spy)
+    with_classes, ent = store.load_score_entries(k, 5, ["AAPL"], tmp_path)
+    assert not with_classes and ent["AAPL"][1].shape == (1, 9) and ent["AAPL"][1].dtype.name == "float32"
+    assert len(seen) == 1 and len(seen[0]) == 10 and not any(c.startswith("p_") for c in seen[0])
+    with pytest.raises(store.ForecastStoreError, match="NOFILE"):
+        store.load_score_entries(k, 5, ["NOFILE"], tmp_path)
+
+
+def test_root_is_public_and_store_stamp_changes_with_the_meta_file(tmp_path, key):
+    import os
+    seed(tmp_path, key, [row("AAPL", date(2024, 3, 1))])
+    assert store.root(tmp_path) == tmp_path / "ml_forecast"
+    a = store.store_stamp(key, tmp_path)
+    p = tmp_path / "ml_forecast" / key / "meta.json"
+    os.utime(p, ns=(a, a + 1_000_000))
+    assert store.store_stamp(key, tmp_path) != a
+
+
+def test_missing_symbol_files_names_the_symbols_without_a_file(tmp_path, key):
+    seed(tmp_path, key, [row("AAPL", date(2024, 3, 1)), row("MSFT", date(2024, 3, 1))])
+    assert store.missing_symbol_files(key, ["msft", "NVDA", "AAPL", "IBM"], tmp_path) == ["IBM", "NVDA"]
+    assert store.missing_symbol_files(key, ["AAPL"], tmp_path) == []
+    other = model_key(make_card(context_length=256), ())
+    assert store.missing_symbol_files(other, ["AAPL"], tmp_path) == ["AAPL"]       # no such store at all
+
+
+def test_the_universe_and_read_argument_checks_are_public():
+    """``ranking`` uses both; a private name used across modules is a public one."""
+    assert store.universe(["bbb", "AAA", "bbb"]) == ["AAA", "BBB"]
+    with pytest.raises(ValueError, match="empty"):
+        store.universe([])
+    with pytest.raises(TypeError, match="plain date"):
+        store.check_read_args("2025-01-01", 5)
+    with pytest.raises(ValueError, match="max_age_days"):
+        store.check_read_args(date(2025, 1, 1), 0)
+    store.check_read_args(date(2025, 1, 1), 5)
+    assert not hasattr(store, "_universe") and not hasattr(store, "_check_read_args")

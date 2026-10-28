@@ -341,6 +341,22 @@ class DartsModelService(IModelService):
         logger.info(f"Created LSTM model with params: {p}")
         return model
 
+    @staticmethod
+    def _apply_output_chunk_shift(model_kwargs: Dict, p: Dict, model_type: str) -> None:
+        """Forward ``output_chunk_shift`` (bars between the end of the input window and the first
+        forecast step) to the Darts constructor, or refuse it for RNN-based models.
+
+        A label with a look-ahead of ``L`` bars is only KNOWN ``L`` bars after its own timestamp.
+        A model that forecasts the label series from its own past labels therefore has to read an
+        input window that ends ``L`` bars before the prediction time; ``output_chunk_shift = L``
+        does exactly that (``create_model`` refuses RNN models, which cannot shift their output).
+        """
+        shift = int(p['output_chunk_shift']) if 'output_chunk_shift' in p else 0
+        if shift < 0:
+            raise ValueError(f"output_chunk_shift must be >= 0, got {shift}")
+        if shift:
+            model_kwargs['output_chunk_shift'] = shift
+
     def create_nbeats_model(self, params: Dict = None, epoch_callback: callable = None, loss_fn: Any = None) -> Any:
         """
         Create N-BEATS model architecture using Darts.
@@ -395,6 +411,7 @@ class DartsModelService(IModelService):
             model_kwargs['loss_fn'] = loss_fn
             logger.info(f"Using custom loss function: {type(loss_fn).__name__}")
 
+        self._apply_output_chunk_shift(model_kwargs, p, 'nbeats')
         model = NBEATSModel(**model_kwargs)
 
         logger.info(f"Created N-BEATS model with params: {p}")
@@ -490,6 +507,7 @@ class DartsModelService(IModelService):
             model_kwargs['loss_fn'] = loss_fn
             logger.info(f"Using custom loss function: {type(loss_fn).__name__}")
 
+        self._apply_output_chunk_shift(model_kwargs, p, 'tcn')
         model = TCNModel(**model_kwargs)
 
         logger.info(f"Created TCN model with params: {p}")
@@ -540,6 +558,7 @@ class DartsModelService(IModelService):
             model_kwargs['loss_fn'] = loss_fn
             logger.info(f"Using custom loss function: {type(loss_fn).__name__}")
 
+        self._apply_output_chunk_shift(model_kwargs, p, 'transformer')
         model = TransformerModel(**model_kwargs)
 
         logger.info(f"Created Transformer model with params: {p}")
@@ -584,6 +603,7 @@ class DartsModelService(IModelService):
             model_kwargs['loss_fn'] = loss_fn
             logger.info(f"Using custom loss function: {type(loss_fn).__name__}")
 
+        self._apply_output_chunk_shift(model_kwargs, p, 'tft')
         model = TFTModel(**model_kwargs)
 
         logger.info(f"Created TFT model with params: {p}")
@@ -615,6 +635,12 @@ class DartsModelService(IModelService):
 
         if model_type not in creators:
             raise ValueError(f"Unknown model type: {model_type}. Supported: {list(creators.keys())}")
+
+        if model_type in ('lstm', 'gru') and params and int(params['output_chunk_shift'] if 'output_chunk_shift' in params else 0):
+            raise ValueError(
+                f"{model_type} (Darts RNNModel) cannot shift its output by {params['output_chunk_shift']} bars, "
+                f"so it would read labels whose outcome is not yet known; use nbeats/tcn/transformer/tft"
+            )
 
         return creators[model_type](params, epoch_callback=epoch_callback, loss_fn=loss_fn)
 
@@ -758,7 +784,9 @@ class PredictionTargetService:
             direction: 'up' (buy order) or 'down' (sell order)
 
         Returns:
-            Series with 1 where target is met, 0 otherwise
+            Series with 1 where target is met, 0 where the drawdown limit was hit first or the full
+            ``days`` window passed without a hit, and NaN where the window runs past the end of the
+            data without a decision (unobservable: not a negative).
         """
         n = len(df)
         targets = np.zeros(n)
@@ -768,7 +796,7 @@ class PredictionTargetService:
         low_prices = df['Low'].values
 
         # Calculate price thresholds
-        for i in range(n - 1):  # Need at least 1 future bar
+        for i in range(n):
             entry_price = close_prices[i]
 
             # Calculate target and stop prices
@@ -783,6 +811,7 @@ class PredictionTargetService:
 
             # Check each subsequent bar up to 'days' bars ahead
             max_bars = min(days, n - i - 1)
+            decided = False
             for j in range(1, max_bars + 1):
                 bar_idx = i + j
                 bar_high = high_prices[bar_idx]
@@ -794,21 +823,30 @@ class PredictionTargetService:
                     # Within same bar, assume stop checked before profit (conservative)
                     if bar_low <= stop_price:
                         # Stopped out - drawdown exceeded before profit
+                        decided = True
                         break
                     if bar_high >= profit_target:
                         # Profit target hit without exceeding drawdown
                         targets[i] = 1
+                        decided = True
                         break
                 else:
                     # For SELL: check if stopped out first (high breaches stop)
                     # then check if profit target hit (low reaches target)
                     if bar_high >= stop_price:
                         # Stopped out - drawup exceeded before profit
+                        decided = True
                         break
                     if bar_low <= profit_target:
                         # Profit target hit without exceeding drawup
                         targets[i] = 1
+                        decided = True
                         break
+
+            # No barrier hit: a negative only if the whole window was observed. A truncated window
+            # (the last `days` bars of the data) used to be written as 0, i.e. a fabricated negative.
+            if not decided and i + days > n - 1:
+                targets[i] = np.nan
 
         return pd.Series(targets, index=df.index)
 
@@ -917,7 +955,10 @@ class PredictionTargetService:
         """
         Calculate Triple-Barrier target (Marcos Lopez de Prado method).
 
-        Multi-class: 0=stop hit, 1=profit hit, 2=timeout
+        Multi-class: 0=stop hit, 1=timeout, 2=profit hit (ordered by outcome). This is the ONE
+        triple-barrier implementation: the training job (job_handler) used to carry its own
+        Close-only loop with a different class order (and this one a different one again), so
+        the same target config produced different labels depending on the entry point.
 
         Args:
             df: DataFrame with 'Close', 'High', 'Low' columns
@@ -926,7 +967,8 @@ class PredictionTargetService:
             max_bars: Vertical barrier (max bars before timeout)
 
         Returns:
-            Series with 0 (stop), 1 (profit), or 2 (timeout)
+            Series with 0 (stop), 1 (timeout), 2 (profit); NaN where the window runs past the end of
+            the data before any barrier is hit (a timeout cannot be claimed for a truncated window).
         """
         n = len(df)
         targets = np.full(n, np.nan)
@@ -941,7 +983,7 @@ class PredictionTargetService:
             stop_price = entry_price * (1 - stop_pct / 100)
 
             max_look = min(max_bars, n - i - 1)
-            result = 2  # Default: timeout
+            result = None
 
             for j in range(1, max_look + 1):
                 bar_idx = i + j
@@ -953,9 +995,12 @@ class PredictionTargetService:
                     result = 0  # Stop hit
                     break
                 if bar_high >= profit_target:
-                    result = 1  # Profit hit
+                    result = 2  # Profit hit
                     break
 
+            if result is None:
+                # Timeout only if the whole vertical window was observed
+                result = 1 if i + max_bars <= n - 1 else np.nan
             targets[i] = result
 
         col_name = f"barrier_{profit_pct}p_{stop_pct}s_{max_bars}b"
@@ -1090,6 +1135,14 @@ class PredictionTargetService:
                     if prev_slope > 0 and next_slope < 0:
                         targets[i] = 1
 
+        else:
+            # donchian / adx / stochastic used to fall through here and return an all-zero target,
+            # which trains as "never reverses" and looks like a model that learned nothing
+            raise ValueError(
+                f"trend_reversal indicator '{indicator}' has no reversal rule; "
+                f"supported: rsi, macd, sar, zigzag"
+            )
+
         col_name = f"reversal_{indicator}_{direction}"
         return pd.Series(targets, index=df.index, name=col_name)
 
@@ -1152,7 +1205,9 @@ class PredictionTargetService:
         self,
         df: pd.DataFrame,
         targets_config: List[Dict[str, Any]],
-        dataset_timeframe: Optional[str] = None
+        dataset_timeframe: Optional[str] = None,
+        panel_source: bool = False,
+        train_ratio: float = 0.7
     ) -> List[Dict[str, Any]]:
         """
         Calculate all target types and return with statistics.
@@ -1166,6 +1221,8 @@ class PredictionTargetService:
             targets_config: List of target configurations, each may have:
                 - timeframe: Optional[str] - Calculate target on this timeframe
             dataset_timeframe: Base timeframe of the dataset (e.g., '15m', '1h')
+            panel_source: The dataset comes from the alpaca_hist source (needed by the ml_wizard_targets types)
+            train_ratio: Train share the ml_wizard_targets types fit their thresholds on
 
         Returns:
             List of calculated targets with data and stats
@@ -1174,6 +1231,8 @@ class PredictionTargetService:
             resample_ohlcv_to_timeframe,
             align_higher_timeframe_to_lower
         )
+        from app.services.ml_wizard_targets import (
+            CROSS_SECTIONAL_DAILY_TYPES, DAILY_TARGET_TYPES, WIZARD_TARGET_TYPES, build_daily_target, build_wizard_target)
 
         results = []
         df = df.copy().sort_values('Date').reset_index(drop=True)
@@ -1198,6 +1257,9 @@ class PredictionTargetService:
 
             # Determine timeframe for days-to-bars conversion
             effective_timeframe = target_timeframe if use_multi_timeframe else (dataset_timeframe or '1h')
+            # class values of the 'multiclass_classification' stats: triple_barrier here stores 1 = profit,
+            # 0 = stop, 2 = timeout; the ml_wizard_targets types store 2 = up / win, 0 = down / loss, 1 = flat / timeout
+            profit_class, stop_class, timeout_class = 1, 0, 2
 
             try:
                 if target_type == 'price_based':
@@ -1281,6 +1343,29 @@ class PredictionTargetService:
                     col_name = series.name
                     category = 'binary_classification'
 
+                elif target_type in WIZARD_TARGET_TYPES:
+                    if use_multi_timeframe:
+                        raise ValueError(f"{target_type} is computed on the dataset timeframe only")
+                    series, col_name, _ = build_wizard_target(
+                        working_df, config, train_ratio, effective_timeframe, panel_source)
+                    if target_type == 'forward_return':
+                        category = 'regression'
+                    else:
+                        category = 'multiclass_classification'
+                        profit_class, stop_class, timeout_class = 2, 0, 1
+
+                elif target_type in DAILY_TARGET_TYPES:
+                    if use_multi_timeframe:
+                        raise ValueError(f"{target_type} is computed on the dataset timeframe only")
+                    if target_type in CROSS_SECTIONAL_DAILY_TYPES:
+                        raise ValueError(
+                            f"{target_type} compares each ticker with the other tickers of the same session: it is "
+                            f"computed across the job's tickers when the job runs, so a single dataset cannot preview it")
+                    # a multistep target previews its first horizon
+                    series, col_name, _ = build_daily_target(
+                        working_df, config, train_ratio, effective_timeframe, panel_source)[0]
+                    category = 'regression' if target_type == 'daily_volatility' else 'binary_classification'
+
                 elif target_type == 'volatility':
                     horizon_value = config.get('horizon')
                     horizon_unit = config.get('horizonUnit', 'bars')
@@ -1336,9 +1421,9 @@ class PredictionTargetService:
                     stats["negativePct"] = round(100 * neg_count / total, 2) if total > 0 else 0
 
                 elif category == 'multiclass_classification':
-                    profit_count = int((valid_values == 1).sum())
-                    stop_count = int((valid_values == 0).sum())
-                    timeout_count = int((valid_values == 2).sum())
+                    profit_count = int((valid_values == profit_class).sum())
+                    stop_count = int((valid_values == stop_class).sum())
+                    timeout_count = int((valid_values == timeout_class).sum())
                     total = profit_count + stop_count + timeout_count
                     stats["profitHitCount"] = profit_count
                     stats["stopHitCount"] = stop_count

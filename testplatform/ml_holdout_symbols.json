@@ -1,0 +1,46 @@
+{
+  "ndq30": {
+    "seed": 20261028,
+    "generator": "app.services.ml_holdout.make_lists",
+    "locked": [
+      "ADBE",
+      "AMZN",
+      "LRCX",
+      "META",
+      "MSFT",
+      "NFLX",
+      "NVDA",
+      "PEP",
+      "QCOM",
+      "SBUX"
+    ],
+    "dev": [
+      "AAPL",
+      "ADP",
+      "AMAT",
+      "AMD",
+      "AMGN",
+      "AVGO",
+      "BKNG",
+      "COST",
+      "CSCO",
+      "GILD",
+      "GOOGL",
+      "HON",
+      "INTC",
+      "INTU",
+      "ISRG",
+      "MU",
+      "TMUS",
+      "TSLA",
+      "TXN",
+      "VRTX"
+    ],
+    "generated": "2026-10-28"
+  },
+  "largecap": {
+    "rule": "locked iff symbol in ndq30.locked, or (symbol not in ndq30.dev and sha256(f'{seed}:{symbol}') first byte % 3 == 0)",
+    "seed": 20261028,
+    "generated": "2026-10-28"
+  }
+}
