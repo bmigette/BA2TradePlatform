@@ -502,7 +502,7 @@ def test_daily_fold_rows_keep_only_rows_with_a_finite_target_and_atr(tg):
     t2, _ = T.daily_fold_rows(tg, early, h, f"ret_{h}")
     assert (sess[t2] >= SESSIONS[13]).all()
     with pytest.raises(KeyError):
-        T.daily_fold_rows(tg, fold, h, "nope")
+        T.daily_fold_rows(tg, fold, h, "nope_5")
 
 
 def test_daily_fold_rows_refuse_a_target_of_another_horizon(tg):
