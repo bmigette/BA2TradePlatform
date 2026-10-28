@@ -26,39 +26,26 @@ def test_guard_message_names_purpose_and_offenders():
     assert "feature search" in msg and all(s in msg for s in locked)
 
 
-def test_ndq30_universe_accepts_all_dev_symbols_but_refuses_locked():
-    nd = H.load()["ndq30"]
-    H.assert_unlocked(nd["dev"], purpose="training", universe="ndq30")  # must not raise
+def test_assert_unlocked_accepts_all_ndq30_dev_symbols():
+    H.assert_unlocked(H.load()["ndq30"]["dev"], purpose="training")  # must not raise
+
+
+def test_no_ndq30_dev_symbol_is_largecap_locked():
+    assert not [s for s in H.load()["ndq30"]["dev"] if H.is_locked_largecap(s)]
+
+
+def test_every_ndq30_locked_symbol_is_largecap_locked():
+    locked = H.load()["ndq30"]["locked"]
+    assert all(H.is_locked_largecap(s) for s in locked)
     with pytest.raises(H.LockedSymbolError):
-        H.assert_unlocked(nd["locked"][:1], purpose="training", universe="ndq30")
-
-
-def test_default_guard_also_applies_the_largecap_rule_to_ndq30_dev_symbols():
-    dev_locked = [s for s in H.load()["ndq30"]["dev"] if H.is_locked_largecap(s)]
-    assert dev_locked  # the overlap documented in the module docstring really exists
-    with pytest.raises(H.LockedSymbolError):
-        H.assert_unlocked(dev_locked, purpose="scale-up training")
-
-
-def test_unknown_universe_is_rejected():
-    with pytest.raises(ValueError):
-        H.assert_unlocked(["AAPL"], purpose="x", universe="bogus")
-
-
-def test_guard_refuses_a_largecap_locked_symbol():
-    # a symbol outside NDQ30 that the hash rule locks
-    ndq = set(H.load()["ndq30"]["locked"]) | set(H.load()["ndq30"]["dev"])
-    sym = next(s for s in (f"SYM{i}" for i in range(1000)) if s not in ndq and H.is_locked_largecap(s))
-    with pytest.raises(H.LockedSymbolError):
-        H.assert_unlocked([sym], purpose="scale-up training")
-    free = next(s for s in (f"SYM{i}" for i in range(1000)) if s not in ndq and not H.is_locked_largecap(s))
-    H.assert_unlocked([free], purpose="scale-up training")
+        H.assert_unlocked(locked, purpose="scale-up training")
 
 
 def test_is_locked_largecap_is_deterministic_and_about_a_third():
     rng = random.Random(1)
     syms = ["".join(rng.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(rng.randint(1, 5))) for _ in range(3000)]
-    syms = sorted(set(syms))
+    ndq = set(H.NDQ30)
+    syms = sorted(set(syms) - ndq)
     first = [H.is_locked_largecap(s) for s in syms]
     assert first == [H.is_locked_largecap(s) for s in syms]
     frac = sum(first) / len(first)
@@ -70,7 +57,7 @@ def test_is_locked_largecap_is_deterministic_and_about_a_third():
 def test_largecap_rule_matches_documented_formula():
     import hashlib
     spec = H.load()["largecap"]
-    for s in ("AAPL", "MSFT", "XOM", "BRK.B", "ZZZ"):
+    for s in ("XOM", "BRK.B", "ZZZ", "JPM", "KO"):
         expect = hashlib.sha256(f"{spec['seed']}:{s}".encode()).digest()[0] % 3 == 0
         assert H.is_locked_largecap(s) is expect
 

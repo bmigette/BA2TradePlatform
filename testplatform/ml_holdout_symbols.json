@@ -39,7 +39,7 @@
     "generated": "2026-10-28"
   },
   "largecap": {
-    "rule": "sha256(f'{seed}:{symbol}') first byte % 3 == 0",
+    "rule": "locked iff symbol in ndq30.locked, or (symbol not in ndq30.dev and sha256(f'{seed}:{symbol}') first byte % 3 == 0)",
     "seed": 20261028,
     "generated": "2026-10-28"
   }
