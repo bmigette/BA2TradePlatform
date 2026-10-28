@@ -147,14 +147,14 @@ def test_a_locked_symbol_raises_everywhere(signal_world, tmp_path):
     with pytest.raises(HO.LockedSymbolError):
         G.handle_ml_grid("t", {"out_dir": str(tmp_path), "cpu_slots": 1, "gpu_slots": 0, "cells": [bad]})
     assert set(G.TIMING_ETFS + G.TIMING_STOCKS).isdisjoint({"MSFT", "NVDA", "AMZN", "META"})
-    with pytest.raises(HO.LockedSymbolError):                       # the plain lock refuses 7 of the ETFs (hash rule) ...
-        HO.assert_unlocked(G.resolve_symbols("timing"), "test")
-    G.assert_cell_unlocked(G.resolve_symbols("timing"), "test")      # ... the grid exempts exactly the timing ETFs
-    G.assert_cell_unlocked(G.resolve_symbols("ndq30_dev"), "test")
+    HO.assert_unlocked(G.resolve_symbols("timing"), "test")           # the ETFs are exempt in ml_holdout itself
+    HO.assert_unlocked(G.resolve_symbols("ndq30_dev"), "test")
     with pytest.raises(HO.LockedSymbolError, match="NVDA"):
-        G.assert_cell_unlocked(["SPY", "NVDA"], "test")
-    with pytest.raises(HO.LockedSymbolError):                        # a non-ETF the hash locks is still refused
-        G.assert_cell_unlocked(["XLK"] + [s for s in (f"Q{i}" for i in range(50)) if HO.is_locked_largecap(s)][:1], "test")
+        HO.assert_unlocked(["SPY", "NVDA"], "test")
+    with pytest.raises(ValueError, match="no ETF"):                  # a selection universe holds no ETF
+        G.validate_cell(cell(signal_world[0], symbols=SYMS[:4] + ["SPY"]))
+    G.validate_cell(cell(signal_world[0], track="timing", target={"kind": "up", "horizon": 5},
+                         symbols=SYMS[:4] + ["SPY"]))
     assert len(G.resolve_symbols("timing")) == 19 and len(G.resolve_symbols("ndq30_dev")) == 20
 
 

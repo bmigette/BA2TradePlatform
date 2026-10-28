@@ -91,8 +91,7 @@ logger = logging.getLogger(__name__)
 TRACKS: Tuple[str, ...] = ("selection", "timing")
 PRIMARY: Dict[str, str] = {"selection": "quintile_spread_net", "timing": "timing_excess_net"}
 VOLATILITY_PRIMARY = "spearman"
-TIMING_ETFS: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "DIA", "SMH", "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI",
-                                "XLB", "XLU", "XLRE", "XLC")
+TIMING_ETFS: Tuple[str, ...] = HO.TIMING_ETFS
 TIMING_STOCKS: Tuple[str, ...] = ("AAPL", "GOOGL", "TSLA")          # NOT MSFT NVDA AMZN META: locked
 SYMBOL_ALIASES: Tuple[str, ...] = ("ndq30_dev", "timing")
 #: stores of a stores ROOT, in the order a symbol is looked up
@@ -255,20 +254,6 @@ def resolve_symbols(symbols: Union[str, Sequence[str]]) -> Tuple[str, ...]:
     return tuple(symbols)
 
 
-def assert_cell_unlocked(symbols: Iterable[str], purpose: str) -> None:
-    """``ml_holdout.assert_unlocked`` for a cell's symbols, with ONE deliberate exception: the sixteen timing ETFs.
-    The holdout's large-cap rule is a hash of the symbol that locks about a third of ANY name it is shown, and it
-    locks seven of these ETFs (IWM SMH XLE XLF XLI XLP XLV): it was written for the stock universe, and the timing set
-    (16 ETFs + AAPL GOOGL TSLA) would otherwise be impossible to run. The ETFs are exempt from the hash only; every
-    other symbol goes through ``assert_unlocked`` unchanged, and a name of the NDQ30 ``locked`` list is refused first
-    whatever else is true."""
-    syms = tuple(symbols)
-    hit = sorted(set(syms) & set(HO.load()["ndq30"]["locked"]))
-    if hit:
-        raise HO.LockedSymbolError(f"locked holdout symbols must not be used for {purpose}: {', '.join(hit)}")
-    HO.assert_unlocked([s for s in syms if s not in TIMING_ETFS], purpose)
-
-
 def validate_cell(raw: Any) -> Cell:
     """Strict validation of one cell config. Unknown or missing keys, wrong types, unknown groups / kinds / families,
     a (family, task) pair that does not exist, a selection-only target on the timing track and any LOCKED symbol
@@ -300,7 +285,10 @@ def validate_cell(raw: Any) -> Cell:
         if len(set(sym)) != len(sym):
             raise ValueError("symbols holds duplicates")
         symbols = tuple(sorted(sym))
-    assert_cell_unlocked(resolve_symbols(symbols), f"the grid ({track})")
+    HO.assert_unlocked(resolve_symbols(symbols), f"the grid ({track})")
+    if track == "selection" and set(resolve_symbols(symbols)) & set(TIMING_ETFS):
+        raise ValueError(f"a selection cell must contain no ETF (found "
+                         f"{sorted(set(resolve_symbols(symbols)) & set(TIMING_ETFS))}): ETFs are timing instruments")
     groups = raw["groups"]
     if not isinstance(groups, (list, tuple)) or not groups or not all(isinstance(g, str) for g in groups) \
             or len(set(groups)) != len(groups):
