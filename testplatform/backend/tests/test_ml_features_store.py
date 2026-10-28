@@ -97,10 +97,10 @@ def test_refused_symbols_are_screened_once_recorded_with_reasons_and_leave_the_m
     sector = {**SECTOR_OF, "HOLE": "Technology", "STAL": "Technology", "NOPE": "Technology"}
     res = _ensure(work, out, symbols=cols, membership=mem, sector_of=sector)
     meta = _meta(out)
-    assert meta["symbols"] == SYMBOLS and set(res["refused"]) == {"HOLE", "STAL", "NOPE"}
-    refused = meta["ensure"]["refused"]
-    assert "consecutive" in refused["HOLE"]["reason"] and not refused["HOLE"]["transient"]
-    assert refused["STAL"]["transient"] and "too short to count as ended" in refused["STAL"]["reason"]
+    assert meta["symbols"] == SYMBOLS and set(res["refused"]) == {"HOLE", "NOPE"} and set(res["transient"]) == {"STAL"}
+    refused, transient = meta["ensure"]["refused"], meta["ensure"]["transient"]
+    assert set(refused) == {"HOLE", "NOPE"} and "consecutive" in refused["HOLE"] and "no cached daily bars" in refused["NOPE"]
+    assert set(transient) == {"STAL"} and "too short to count as ended" in transient["STAL"]     # a separate, informational list
     stored = pd.read_parquet(out / "features.parquet")
     assert set(stored.index.get_level_values("symbol")) == set(SYMBOLS)
     assert meta["membership"]["symbols"] == len(SYMBOLS)                        # filtered by the usable list, once
@@ -112,10 +112,11 @@ def test_a_stale_refusal_is_not_remembered_it_clears_after_a_cache_refresh(work,
     _write(work, "LATE5", _bars(s[:-5], 4))
     sector = {**SECTOR_OF, "LATE5": "Technology"}
     res = _ensure(work, out, symbols=SYMBOLS + ["LATE5"], sector_of=sector)
-    assert "LATE5" in res["refused"] and _meta(out)["symbols"] == SYMBOLS
+    assert "LATE5" in res["transient"] and "LATE5" not in res["refused"] and _meta(out)["symbols"] == SYMBOLS
     _write(work, "LATE5", _bars(s, 4))                                           # the cache refresh brings the missing bars
     res = _ensure(work, out, symbols=SYMBOLS + ["LATE5"], sector_of=sector)
-    assert res["status"] == "built" and "LATE5" not in res["refused"] and "LATE5" in _meta(out)["symbols"]
+    assert res["status"] == "built" and not res["transient"] and "LATE5" in _meta(out)["symbols"]
+    assert _meta(out)["ensure"]["transient"] == {}
 
 
 def test_load_feature_store_applies_the_coverage_mask(work, tmp_path):
@@ -182,3 +183,25 @@ def test_sectorless_symbols_are_recorded_and_exempt_in_the_stored_coverage(work,
     rep = pd.read_parquet(out / "coverage_report.parquet")
     assert rep.loc[("m", 2023), "share"] == 1.0                                  # the sector columns do not count for ETFs
     assert pd.read_parquet(out / "column_coverage.parquet").loc[("m_rs_sector_5", 2023), "share"] == 0.0
+
+
+def test_a_code_change_rebuilds_without_force(work, tmp_path, monkeypatch):
+    out = tmp_path / "store"
+    _ensure(work, out)
+    assert _ensure(work, out)["status"] == "up_to_date"
+    monkeypatch.setattr(F, "code_version", lambda: "0123456789abcdef")           # the feature code changed
+    assert _ensure(work, out)["status"] == "built"
+    assert _meta(out)["ensure"]["inputs"]["code"] == "0123456789abcdef"
+    assert _ensure(work, out)["status"] == "up_to_date"
+
+
+def test_the_code_version_hashes_the_feature_modules():
+    import hashlib
+    from pathlib import Path
+    from app.services import ml_panel, ml_universe
+    v = F.code_version()
+    assert len(v) == 16 and v == F.code_version()
+    h = hashlib.sha256()
+    for mod in (F, ml_universe, ml_panel):
+        h.update(Path(mod.__file__).read_bytes())
+    assert v == h.hexdigest()[:16]

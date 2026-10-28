@@ -1845,6 +1845,16 @@ _FMP_KINDS_BY_GROUP: Dict[str, Tuple[str, ...]] = {"f": _F_FILES, "ag": ("analys
                                                    "i": ("insider_v2",)}
 
 
+def code_version() -> str:
+    """16 hex digits of the sha256 of the feature code (``ml_features.py``, ``ml_universe.py``, ``ml_panel.py``): part of the
+    store's rebuild key, so a change of logic rebuilds without ``--force`` (and so does a comment: the key is the bytes)."""
+    from app.services import ml_panel
+    h = hashlib.sha256()
+    for path in (Path(__file__), Path(ml_universe.__file__), Path(ml_panel.__file__)):
+        h.update(path.read_bytes())
+    return h.hexdigest()[:16]
+
+
 def _fp_or_none(path: Path) -> Optional[Dict[str, object]]:
     return _fingerprint(path) if path.exists() else None
 
@@ -1874,17 +1884,18 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     """Build (or find up to date) the feature store of ``symbols`` over ``[first, last]`` in ``out_dir``.
 
     * pre-screens every symbol ONCE with ``usable_symbols`` (rows with ``groups``, membership-only names on their bars) and
-      filters the membership columns by the usable list once; the refused symbols and reasons go to the meta
-      (``transient`` marks a reason that can clear after a cache refresh - a stale download - and nothing about a
-      refusal is remembered between runs: every call screens again);
+      filters the membership columns by the usable list once. ``meta["ensure"]["refused"]`` lists the permanent refusals with
+      reasons; ``meta["ensure"]["transient"]`` is a SEPARATE list of the refusals that can clear after a cache refresh (a
+      stale download). Both are INFORMATIONAL: they are written for the reader and NEVER read back - every call screens
+      again, so a transient name simply becomes usable (and triggers a rebuild) once its data is complete;
     * with group M, a symbol without a sector (not in the metric store, no override) is refused as unusable;
     * loads every bar once into a ``BuildCache`` and builds in chunks of ``chunk_size`` symbols over the whole universe, so
       cross-sectional values do not depend on the chunking;
     * writes ``features.parquet`` + ``features.parquet.meta.json`` (``save_features``), ``coverage_report.parquet`` / ``.csv``
       and ``meta["ensure"]`` (refused, inputs, timings, ``min_share``). Apply the mask with ``load_feature_store``.
 
-    Rebuilds only when the inputs signature changes: the groups, the built symbols, the window, the membership digest, the
-    resolved sectors, or the (size, mtime) of any source file. Returns ``{"status": "built" | "up_to_date", ...}``."""
+    Rebuilds only when the inputs signature changes: the feature code (``code_version``), the groups and their coverage
+    columns, the built symbols, the window, the membership digest, the resolved sectors, or the (size, mtime) of any source file. Returns ``{"status": "built" | "up_to_date", ...}``."""
     import time
     from ba2_common.config import CACHE_FOLDER
 
@@ -1926,7 +1937,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
         required |= set(_spec(g).required_context(usable_rows, resolved))
     load = list(dict.fromkeys(usable_rows + uni + sorted(required)))
     inputs = json.loads(json.dumps({
-        "version": ENSURE_VERSION, "groups": groups,
+        "version": ENSURE_VERSION, "code": code_version(), "groups": groups,
         "coverage_columns": {g: _spec(g).coverage_columns for g in groups}, "symbols": usable_rows, "universe": uni, "first": str(first),
         "last": str(last), "membership": None if members is None else _membership_digest(members), "sectors": resolved,
         "fingerprints": _input_fingerprints(load, usable_rows, groups, cache_root, store_path)}, sort_keys=True))
@@ -1934,7 +1945,9 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     if not force and meta_path.exists() and (out_dir / "features.parquet").exists():
         old = json.loads(meta_path.read_text(encoding="utf-8"))
         if "ensure" in old and old["ensure"]["inputs"] == inputs:
-            return {"status": "up_to_date", "out_dir": str(out_dir), "symbols": usable_rows, "refused": _refusal_report(refused)}
+            permanent, transient = _split_refusals(refused)
+            return {"status": "up_to_date", "out_dir": str(out_dir), "symbols": usable_rows, "refused": permanent,
+                    "transient": transient}
     cache = BuildCache()
     earliest = min(first_cached_bar(s, cache_root) for s in load)
     cache_end = last_cached_bar("SPY", cache_root)
@@ -1974,7 +1987,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     report = coverage_report(df, covered_groups, sectorless=meta["sectorless"])
     columns = column_coverage(df, covered_groups)
     meta["ensure"] = {"version": ENSURE_VERSION, "inputs": inputs, "chunk_size": chunk_size, "chunks": len(frames),
-                      "refused": _refusal_report(refused), "min_share": min_share,
+                      "refused": _split_refusals(refused)[0], "transient": _split_refusals(refused)[1], "min_share": min_share,
                       "build_seconds": round(time.time() - started, 1),
                       "note": "features.parquet is UNMASKED; apply_coverage_mask(df, coverage_report, min_share) or "
                               "load_feature_store(mask=True) masks thin (group, year) pairs"}
@@ -1987,16 +2000,17 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     columns.to_csv(out_dir / "column_coverage.csv")
     return {"status": "built", "out_dir": str(out_dir), "symbols": usable_rows, "chunks": len(frames),
             "rows": int(len(df)), "seconds": meta["ensure"]["build_seconds"], "refused": meta["ensure"]["refused"],
-            "coverage": report}
+            "transient": meta["ensure"]["transient"], "coverage": report}
 
 
 def _coverage_has_columns(df: pd.DataFrame, group: str) -> bool:
     return bool(_group_columns(df, group))
 
 
-def _refusal_report(refused: Dict[str, str]) -> Dict[str, Dict[str, object]]:
-    return {sym: {"reason": reason, "transient": any(m in reason for m in _TRANSIENT_MARKERS)}
-            for sym, reason in refused.items()}
+def _split_refusals(refused: Dict[str, str]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """(permanent, transient) refusals, each symbol -> reason. Transient = can clear after a cache refresh."""
+    transient = {s_: r for s_, r in refused.items() if any(m in r for m in _TRANSIENT_MARKERS)}
+    return {s_: r for s_, r in refused.items() if s_ not in transient}, transient
 
 
 def load_feature_store(out_dir: Path, mask: bool = True, min_share: Optional[float] = None) -> pd.DataFrame:

@@ -8978,8 +8978,10 @@ def _cmd_ml_features(args) -> int:
                                    chunk_size=args.chunk_size, sector_overrides=overrides, force=args.force)
     print(f"ml-features: {res['status']} -> {res['out_dir']} ({len(res['symbols'])} symbols"
           + (f", {res['rows']} rows in {res['seconds']}s" if res["status"] == "built" else "") + ")")
-    for sym, r in res["refused"].items():
-        print(f"  refused {sym}{' (transient)' if r['transient'] else ''}: {r['reason']}")
+    for sym, reason in res["refused"].items():
+        print(f"  refused {sym}: {reason}")
+    for sym, reason in res["transient"].items():
+        print(f"  transient (may clear after a cache refresh; informational) {sym}: {reason}")
     return 0
 
 
