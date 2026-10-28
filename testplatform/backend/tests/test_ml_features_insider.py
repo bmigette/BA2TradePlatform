@@ -59,7 +59,7 @@ def _reference(sessions, sym, filings=FILINGS):
         w = [r for r in rows if S - pd.Timedelta(days=90) <= r[0] < S and r[4] == "4"]
         net = sum(r[2] for r in w if r[1].startswith("P-")) - sum(r[2] for r in w if r[1].startswith("S-"))
         buyers = len({r[3] for r in w if r[1].startswith("P-")})
-        covered = S >= cov + pd.Timedelta(days=90)
+        covered = True                                       # fewer than 2000 rows: uncapped, covered from the panel start
         cap = _mcap(sym, str(S.date())) if str(S.date()) >= STORE_SCANS[0] else np.nan
         out.append({"i_net_buy_90": net / cap if covered else np.nan, "i_n_buyers_90": buyers if covered else np.nan,
                     "i_covered": 1.0 if covered else 0.0})
@@ -92,14 +92,41 @@ def test_hand_checked_values(insider_cache):
     assert f.loc[late, "i_net_buy_90"] == 0 and f.loc[late, "i_n_buyers_90"] == 0 and f.loc[late, "i_covered"] == 1
 
 
-def test_coverage_starts_90_days_after_the_first_retained_filing(insider_cache, tmp_path):
+def _filler(n, first="2023-01-06"):
+    """``n`` neutral Form 4 rows (an RSU vesting each business day from ``first``)."""
+    days = pd.bdate_range(first, periods=n)
+    return [(f"{d.date()} 10:00:00", "M-Exempt", 10, 0.0, "0099", "4") for d in days]
+
+
+def test_a_file_at_the_row_cap_is_capped_coverage_starts_90_days_after_its_first_row(insider_cache, tmp_path):
     root = tmp_path / "c"
     shutil.copytree(insider_cache, root)
-    write_fmp_rows(root, "insider_v2", "AAA", _rows("AAA", [("2023-01-05 10:00:00", "P-Purchase", 100, 10.0, "0001", "4")]))
+    rows = [("2023-01-05 10:00:00", "P-Purchase", 100, 10.0, "0001", "4")] + _filler(F.INSIDER_ROW_CAP - 1)
+    assert len(rows) == F.INSIDER_ROW_CAP == 2000
+    write_fmp_rows(root, "insider_v2", "AAA", _rows("AAA", rows))
     f = _ibuild(root, symbols=("AAA",), first=date(2023, 3, 1), last=date(2023, 6, 30)).loc["AAA"]
     t = pd.Timestamp
     assert f.loc[t("2023-04-04"), "i_covered"] == 0 and f.loc[t("2023-04-04"), ["i_net_buy_90", "i_n_buyers_90"]].isna().all()
     assert f.loc[t("2023-04-05"), "i_covered"] == 1 and f.loc[t("2023-04-05"), "i_n_buyers_90"] == 1      # 01-05 + 90 days
+
+
+def test_a_file_below_the_cap_is_uncapped_and_covered_from_the_panel_start(insider_cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(insider_cache, root)
+    rows = [("2023-01-05 10:00:00", "P-Purchase", 100, 10.0, "0001", "4")] + _filler(F.INSIDER_ROW_CAP - 2)
+    write_fmp_rows(root, "insider_v2", "AAA", _rows("AAA", rows))                                         # 1999 rows
+    f = _ibuild(root, symbols=("AAA",), first=date(2023, 1, 3), last=date(2023, 2, 28)).loc["AAA"]
+    assert (f["i_covered"] == 1).all() and f.loc["2023-01-03", "i_n_buyers_90"] == 0                       # an empty window is real
+    assert f.loc["2023-01-06", "i_n_buyers_90"] == 1
+
+
+def test_a_zero_price_purchase_is_not_a_buyer(insider_cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(insider_cache, root)
+    rows = [("2023-02-01 10:00:00", "P-Purchase", 500, 0.0, "0001", "4"), ("2023-02-02 10:00:00", "P-Purchase", 100, 10.0, "0002", "4")]
+    write_fmp_rows(root, "insider_v2", "AAA", _rows("AAA", rows))
+    f = _ibuild(root, symbols=("AAA",), first=date(2023, 1, 3), last=date(2023, 3, 31)).loc["AAA"]
+    assert f.loc["2023-02-03", "i_n_buyers_90"] == 1 and f.loc["2023-02-03", "i_net_buy_90"] > 0          # only the priced purchase
 
 
 def test_net_buy_is_nan_where_the_market_cap_is_unknown(insider_cache, tmp_path):
@@ -109,10 +136,8 @@ def test_net_buy_is_nan_where_the_market_cap_is_unknown(insider_cache, tmp_path)
     write_fmp_rows(root, "insider_v2", "AAA", _rows("AAA", [("2021-02-01 10:00:00", "P-Purchase", 100, 10.0, "0001", "4")]))
     f = _ibuild(root, symbols=("AAA",), first=date(2021, 3, 1), last=date(2021, 8, 31)).loc["AAA"]
     early = f.index < pd.Timestamp(STORE_SCANS[0])
-    covered = f["i_covered"] == 1
-    assert covered.iloc[0] == False and covered.loc[pd.Timestamp("2021-05-03"):].all()                     # 2021-02-01 + 90 days
-    gap = early & covered                                                                                   # covered, but no scan yet
-    assert gap.sum() > 10 and f.loc[gap, "i_net_buy_90"].isna().all() and f.loc[gap, "i_n_buyers_90"].notna().all()
+    assert (f["i_covered"] == 1).all()                                                                      # one row: uncapped
+    assert early.sum() > 10 and f.loc[early, "i_net_buy_90"].isna().all() and f.loc[early, "i_n_buyers_90"].notna().all()
     assert f.loc[~early, "i_net_buy_90"].notna().any()
 
 

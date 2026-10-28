@@ -15,7 +15,7 @@ GRADES = [("2023-01-10", "Alpha", "upgrade"), ("2023-01-20", "Beta", "downgrade"
           ("2023-03-01", "Gamma", "maintain"), ("2023-03-20", "Alpha", "upgrade")]
 TARGETS = [("2023-02-01T10:00:00.000Z", "Alpha", 100.0), ("2023-02-10T15:00:00.000Z", "Alpha", 110.0),
            ("2023-02-20T00:00:00.000Z", "Beta", 120.0), ("2023-04-25T12:00:00.000Z", "Gamma", 130.0)]
-WARM = pd.Timedelta(days=90)           # coverage starts 90 days after the first retained row
+FLOOR = pd.Timestamp("2021-04-12") + pd.Timedelta(days=90)     # price targets: the vendor's start + 90 days
 
 
 def _grade_rows(sym, rows=GRADES):
@@ -57,8 +57,7 @@ def _reference(sessions, close, grades=GRADES, targets=TARGETS):
     """Brute force: every column from the rows, session by session (window = rows dated in [T - N days, T))."""
     g = [(pd.Timestamp(d), c, a) for d, c, a in grades]
     t = [(pd.Timestamp(d[:10]), c, v) for d, c, v in targets]
-    g_cov = min(x[0] for x in g) + WARM
-    t_cov = min(x[0] for x in t) + WARM
+    t_cov = FLOOR
 
     def win(rs, T, n):
         return [r for r in rs if T - pd.Timedelta(days=n) <= r[0] < T]
@@ -68,7 +67,7 @@ def _reference(sessions, close, grades=GRADES, targets=TARGETS):
         return np.mean([r[2] for r in w]) if w else np.nan
     rows = []
     for S, px in zip(sessions, close):
-        gc, tc = S >= g_cov, S >= t_cov
+        gc, tc = True, S >= t_cov                              # grades: uncapped, covered from the panel start
         score = {"upgrade": 1, "downgrade": -1}
         tw = win(t, S, 90)
         prev = mean_at(S - pd.Timedelta(days=30))
@@ -76,22 +75,22 @@ def _reference(sessions, close, grades=GRADES, targets=TARGETS):
         rows.append({
             "ag_net_upgrades_30": sum(score.get(r[2], 0) for r in win(g, S, 30)) if gc else np.nan,
             "ag_net_upgrades_90": sum(score.get(r[2], 0) for r in win(g, S, 90)) if gc else np.nan,
-            "ag_n_grades_90": len({r[1] for r in win(g, S, 90)}) if gc else np.nan,
+            "ag_n_graders_90": len({r[1] for r in win(g, S, 90)}) if gc else np.nan,
             "ag_covered": 1.0 if gc else 0.0,
             "at_target_gap": cur / px - 1 if tc and tw else np.nan,
             "at_target_rev_30": cur / prev - 1 if tc and (S - pd.Timedelta(days=30)) >= t_cov and tw and prev == prev else np.nan,
             "at_n_analysts_90": len({r[1] for r in tw}) if tc else np.nan,
             "at_covered": 1.0 if tc else 0.0})
-    return pd.DataFrame(rows, index=sessions)
+    return pd.DataFrame(rows, index=sessions).astype("float64")
 
 
 def test_columns_and_registry(analyst_cache):
     assert "a" not in F.GROUPS
     assert F.GROUPS["ag"].prefix == "ag_" and F.GROUPS["at"].prefix == "at_"
-    assert list(F.AG_COLUMNS) == ["ag_net_upgrades_30", "ag_net_upgrades_90", "ag_n_grades_90", "ag_covered"]
+    assert list(F.AG_COLUMNS) == ["ag_net_upgrades_30", "ag_net_upgrades_90", "ag_n_graders_90", "ag_covered"]
     assert list(F.AT_COLUMNS) == ["at_target_gap", "at_target_rev_30", "at_n_analysts_90", "at_covered"]
-    assert F.GROUPS["ag"].coverage_columns == ("ag_net_upgrades_30", "ag_net_upgrades_90", "ag_n_grades_90")
-    assert F.GROUPS["at"].coverage_columns == ("at_target_gap",)                   # the main signal, not the analyst count
+    assert F.GROUPS["ag"].coverage_columns == ("ag_net_upgrades_30", "ag_net_upgrades_90", "ag_n_graders_90")
+    assert F.GROUPS["at"].coverage_columns == ("at_n_analysts_90",)                # availability, not the gap (NaN in a quiet period)
     f = _abuild(analyst_cache)
     assert F.feature_columns(f, ["ag"]) == list(F.AG_COLUMNS) and F.feature_columns(f, ["at"]) == list(F.AT_COLUMNS)
     only_g = _abuild(analyst_cache, groups=("ag",))
@@ -111,13 +110,15 @@ def test_hand_checked_values(analyst_cache):
     f = _abuild(analyst_cache).loc["AAA"]
     close = _raw(analyst_cache, "AAA")["Close"]
     t = pd.Timestamp
-    # grades: covered from 2023-01-10 + 90 days = 2023-04-10
-    assert f.loc[t("2023-04-06"), "ag_covered"] == 0 and f.loc[t("2023-04-06"), ["ag_net_upgrades_90", "ag_n_grades_90"]].isna().all()
+    # grades: an uncapped file is covered from the panel start; before its first row the windows are real zeros
+    assert f.loc[t("2023-01-03"), "ag_covered"] == 1 and f.loc[t("2023-01-03"), "ag_net_upgrades_90"] == 0
+    assert f.loc[t("2023-01-03"), "ag_n_graders_90"] == 0
     d = t("2023-04-10")
     assert f.loc[d, "ag_covered"] == 1 and f.loc[d, "ag_net_upgrades_90"] == 2 and f.loc[d, "ag_net_upgrades_30"] == 1
-    assert f.loc[d, "ag_n_grades_90"] == 3                                                  # Alpha counted once
-    # targets: covered from 2023-02-01 + 90 days = 2023-05-02; the window then holds all four rows
-    assert f.loc[t("2023-05-01"), "at_covered"] == 0 and np.isnan(f.loc[t("2023-05-01"), "at_target_gap"])
+    assert f.loc[d, "ag_n_graders_90"] == 3                                                  # Alpha counted once
+    # targets: covered from the vendor floor (2021-07-11) on; a quiet period before the first row is real (no gap, 0 analysts)
+    assert f.loc[t("2023-01-03"), "at_covered"] == 1 and np.isnan(f.loc[t("2023-01-03"), "at_target_gap"])
+    assert f.loc[t("2023-01-03"), "at_n_analysts_90"] == 0
     d = t("2023-05-02")
     assert f.loc[d, "at_covered"] == 1 and f.loc[d, "at_target_gap"] == pytest.approx(115.0 / close.loc[d] - 1)
     assert f.loc[d, "at_n_analysts_90"] == 3                                                # Alpha twice counts once
@@ -125,7 +126,7 @@ def test_hand_checked_values(analyst_cache):
     d = t("2023-06-01")
     assert f.loc[d, "at_target_rev_30"] == pytest.approx(130.0 / 115.0 - 1)
     late = t("2023-08-01")                                                                  # empty windows after coverage
-    assert f.loc[late, "ag_net_upgrades_30"] == 0 and f.loc[late, "ag_n_grades_90"] == 0
+    assert f.loc[late, "ag_net_upgrades_30"] == 0 and f.loc[late, "ag_n_graders_90"] == 0
     assert np.isnan(f.loc[late, "at_target_gap"]) and f.loc[late, "at_n_analysts_90"] == 0 and np.isnan(f.loc[late, "at_target_rev_30"])
 
 
@@ -170,6 +171,31 @@ def test_only_the_per_analyst_files_are_opened_each_group_its_own(analyst_cache,
     assert names() == ["price_target__AAA.json", "price_target__BBB.json"]
 
 
+def test_price_target_coverage_starts_90_days_after_the_vendor_floor_not_the_files_first_row(analyst_cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(analyst_cache, root)
+    write_fmp_rows(root, "price_target", "AAA", _target_rows("AAA", [("2021-04-12T10:00:00.000Z", "Alpha", 100.0),
+                                                                    ("2023-02-01T10:00:00.000Z", "Beta", 100.0)]))
+    f = _abuild(root, groups=("at",), symbols=("AAA",), first=date(2021, 6, 1), last=date(2021, 9, 30)).loc["AAA"]
+    t = pd.Timestamp
+    assert F.PRICE_TARGET_VENDOR_START == date(2021, 4, 12)
+    assert f.loc[t("2021-07-09"), "at_covered"] == 0 and f.loc[t("2021-07-09"), ["at_target_gap", "at_n_analysts_90"]].isna().all()
+    assert f.loc[t("2021-07-12"), "at_covered"] == 1                                       # 2021-04-12 + 90 days = 07-11 (Sunday)
+    # an uncapped file whose first row is years later is covered from the same floor: its quiet months are real
+    g = _abuild(root, groups=("at",), symbols=("AAA",), first=date(2021, 9, 1), last=date(2021, 9, 30)).loc["AAA"]
+    assert (g["at_covered"] == 1).all() and (g["at_n_analysts_90"] >= 0).all() and g["at_target_gap"].isna().sum() > 0
+
+
+def test_a_target_gap_beyond_the_limit_refuses_instead_of_clipping(analyst_cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(analyst_cache, root)
+    close = _raw(analyst_cache, "AAA")["Close"]
+    write_fmp_rows(root, "price_target", "AAA", _target_rows("AAA", [("2023-02-01T10:00:00.000Z", "Alpha", float(close.iloc[100]) * 20)]))
+    with pytest.raises(P.PanelDataError, match=r"AAA.*at_target_gap \+\d.*on 2023-02-0\d.*adjustment mismatch"):
+        _abuild(root, groups=("at",), symbols=("AAA",), first=date(2023, 1, 3), last=date(2023, 3, 31))
+    assert F.MAX_TARGET_GAP == 5.0
+
+
 def test_neutral_actions_count_zero_and_an_unknown_one_refuses(analyst_cache, tmp_path):
     root = tmp_path / "c"
     shutil.copytree(analyst_cache, root)
@@ -178,7 +204,7 @@ def test_neutral_actions_count_zero_and_an_unknown_one_refuses(analyst_cache, tm
     write_fmp_rows(root, "analyst_grades", "AAA", _grade_rows("AAA", rows))
     f = _abuild(root, groups=("ag",), symbols=("AAA",), first=date(2023, 1, 3), last=date(2023, 1, 31)).loc["AAA"]
     assert f.loc["2023-01-03", "ag_covered"] == 1                                            # 2022-10-03 + 90 days
-    assert f.loc["2023-01-03", "ag_net_upgrades_90"] == 1 and f.loc["2023-01-03", "ag_n_grades_90"] == 2   # window starts 2022-10-05
+    assert f.loc["2023-01-03", "ag_net_upgrades_90"] == 1 and f.loc["2023-01-03", "ag_n_graders_90"] == 2   # window starts 2022-10-05
     assert set(F.NEUTRAL_ACTIONS) >= {"initialize", "initiate", "reiterate", "maintain", ""}
     write_fmp_rows(root, "analyst_grades", "AAA", _grade_rows("AAA", [("2023-01-10", "Alpha", "frobnicate")]))
     with pytest.raises(P.PanelDataError, match=r"AAA.*unknown action 'frobnicate'"):

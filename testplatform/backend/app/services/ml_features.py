@@ -1147,10 +1147,12 @@ def _event_days(rows: List[dict], key: str, symbol: str, kind: str) -> np.ndarra
     return out
 
 
-def _window_bounds(event_days: np.ndarray, sessions: pd.DatetimeIndex, days: int) -> Tuple[np.ndarray, np.ndarray]:
-    """For each session S the slice ``[lo, hi)`` of the (sorted) events dated in ``[S - days, S)``: an event is public
-    from the session AFTER its date, so at S exactly the events dated before S are visible; older ones fall out."""
-    s_days = sessions.values.astype("datetime64[D]")
+def _window_bounds(event_days: np.ndarray, sessions: pd.DatetimeIndex, days: int,
+                   shift_days: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+    """For each session S the slice ``[lo, hi)`` of the (sorted) events dated in ``[T - days, T)`` with ``T = S - shift_days``:
+    an event is public from the session AFTER its date, so at T exactly the events dated before T are visible; older ones fall
+    out. ``shift_days`` > 0 is the window as it stood that many calendar days earlier."""
+    s_days = sessions.values.astype("datetime64[D]") - np.timedelta64(int(shift_days), "D")
     return (np.searchsorted(event_days, s_days - np.timedelta64(days, "D"), side="left"),
             np.searchsorted(event_days, s_days, side="left"))
 
@@ -1183,22 +1185,51 @@ def _codes(names: List[object]) -> np.ndarray:
     return out
 
 
-#: A capped history (FMP keeps a limited number of rows per file) starts at some first retained row; a 90-day window that
-#: reaches back before it is partly truncated. Coverage therefore starts this many calendar days after the first row.
+#: A CAPPED history (the vendor keeps a limited number of rows or started its feed late) has a first retained row; a 90-day
+#: window reaching back before it is partly truncated. Coverage of a capped file therefore starts this many calendar days
+#: after the first retained row (or the vendor start). An UNCAPPED file is covered from the panel start: its empty windows
+#: and zero counts are real values.
 COVERAGE_WARMUP_DAYS = 90
+#: FMP's ``insider_v2`` keeps at most this many rows per symbol (1087 of 5058 files hold exactly 2000): a file with this many
+#: rows is capped and its first retained filing is a truncation, not the symbol's first filing.
+INSIDER_ROW_CAP = 2000
+#: Earliest ``publishedDate`` of ANY ``price_target`` file in the cache (3729 non-empty files, checked 2026-10-28): the feed holds
+#: nothing before it for any symbol. It is not a spike of first rows - the first rows of the files spread over the following
+#: months - so it is the vendor's retention floor, not a per-file cap: before floor + 90 days no price_target window is complete
+#: for any symbol, and an empty window there means "the feed did not exist", not "no targets".
+PRICE_TARGET_VENDOR_START = date(2021, 4, 12)
+_FAR_PAST = np.datetime64("1900-01-01", "D")
 
 
-def _covered_from(event_days: np.ndarray, sessions: pd.DatetimeIndex, warmup_days: int = COVERAGE_WARMUP_DAYS) -> np.ndarray:
-    """Sessions with coverage: ``warmup_days`` calendar days after the earliest retained event (and so strictly after
-    it); all False for an empty file."""
+def _coverage_start(event_days: np.ndarray, *, capped: bool, floor_day: Optional[date] = None,
+                    warmup_days: int = COVERAGE_WARMUP_DAYS) -> Optional[np.datetime64]:
+    """The first day with coverage, or None for an empty file (never covered: whether the vendor has the symbol is unknown).
+
+    * ``capped``: ``warmup_days`` after the earliest retained event;
+    * uncapped: the panel start (``_FAR_PAST``);
+    * ``floor_day`` (a vendor start): coverage never starts before ``floor_day + warmup_days``."""
     if len(event_days) == 0:
+        return None
+    start = event_days.min() + np.timedelta64(int(warmup_days), "D") if capped else _FAR_PAST
+    if floor_day is not None:
+        start = max(start, np.datetime64(floor_day, "D") + np.timedelta64(int(warmup_days), "D"))
+    return start
+
+
+def _covered_from(event_days: np.ndarray, sessions: pd.DatetimeIndex, *, capped: bool, floor_day: Optional[date] = None,
+                  shift_days: int = 0) -> np.ndarray:
+    """Sessions with coverage (evaluated at ``S - shift_days``); all False for an empty file. See ``_coverage_start``."""
+    start = _coverage_start(event_days, capped=capped, floor_day=floor_day)
+    if start is None:
         return np.zeros(len(sessions), dtype=bool)
-    start = event_days.min() + np.timedelta64(max(int(warmup_days), 1), "D")
-    return sessions.values.astype("datetime64[D]") >= start
+    return sessions.values.astype("datetime64[D]") - np.timedelta64(int(shift_days), "D") >= start
 
 
 # ------------------------------------------------------------------------------------------ groups AG / AT (analysts)
-AG_COLUMNS: Tuple[str, ...] = ("ag_net_upgrades_30", "ag_net_upgrades_90", "ag_n_grades_90", "ag_covered")
+#: a mean analyst target further than this (as a ratio to the close, minus 1) from the close is not a view, it is an adjustment
+#: mismatch between the target feed and the price series: the build refuses instead of clipping it
+MAX_TARGET_GAP = 5.0
+AG_COLUMNS: Tuple[str, ...] = ("ag_net_upgrades_30", "ag_net_upgrades_90", "ag_n_graders_90", "ag_covered")
 AT_COLUMNS: Tuple[str, ...] = ("at_target_gap", "at_target_rev_30", "at_n_analysts_90", "at_covered")
 #: `action` values of analyst_grades. Upgrades / downgrades score +1 / -1; everything in NEUTRAL_ACTIONS scores 0 (a
 #: first-time rating, a repeated one, a resumed coverage ... is not a change of view). Anything else refuses, so a new
@@ -1224,14 +1255,14 @@ def _grades_one(ctx: BuildContext, symbol: str) -> pd.DataFrame:
     order = np.argsort(gd, kind="stable")
     gd, score = gd[order], score[order]
     codes = _codes([grades[i].get("gradingCompany") for i in order])
-    cov = _covered_from(gd, sessions)
+    cov = _covered_from(gd, sessions, capped=False)
     cs = _csum(score)
     out: Dict[str, np.ndarray] = {}
     for n in (30, 90):
         lo, hi = _window_bounds(gd, sessions, n)
         out[f"ag_net_upgrades_{n}"] = np.where(cov, _window_sum(cs, lo, hi), np.nan)
     lo, hi = _window_bounds(gd, sessions, 90)
-    out["ag_n_grades_90"] = np.where(cov, _distinct(codes, lo, hi), np.nan)
+    out["ag_n_graders_90"] = np.where(cov, _distinct(codes, lo, hi), np.nan)
     out["ag_covered"] = cov.astype("float64")
     return pd.DataFrame(out, index=sessions)[list(AG_COLUMNS)]
 
@@ -1241,10 +1272,9 @@ def analyst_grades(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.Data
     ``action``). A row is public from the session AFTER its date; windows are ``[S - N days, S)``.
 
     * ``ag_net_upgrades_30`` / ``_90``: upgrades minus downgrades in the window (``NEUTRAL_ACTIONS`` score 0);
-    * ``ag_n_grades_90``: distinct ``gradingCompany`` in the 90-day window;
-    * ``ag_covered``: 1 from ``COVERAGE_WARMUP_DAYS`` after the first retained row (the history is capped, so earlier 90-day
-      windows would be partly truncated), else 0; the three columns are NaN before it, and after it an empty window is a
-      real 0.
+    * ``ag_n_graders_90``: distinct ``gradingCompany`` in the 90-day window;
+    * ``ag_covered``: 1 from the panel start for a non-empty file (the grade history, from 2012, is not capped inside the panel:
+      an empty window is a real 0), 0 for an empty file, whose columns are NaN.
 
     FMP's consensus / summary files are never opened (they are windowed to about the last quarter: look-ahead before it).
     A missing file or an unknown action refuses; an empty file is never covered."""
@@ -1261,29 +1291,30 @@ def _targets_one(ctx: BuildContext, symbol: str, close: np.ndarray) -> pd.DataFr
     order = np.argsort(td, kind="stable")
     td, adj = td[order], adj[order]
     codes = _codes([targets[keep[i]].get("analystCompany") for i in order])
-    cov = _covered_from(td, sessions)
+    cov = _covered_from(td, sessions, capped=False, floor_day=PRICE_TARGET_VENDOR_START)
+    cov_before = _covered_from(td, sessions, capped=False, floor_day=PRICE_TARGET_VENDOR_START, shift_days=30)
     csum = _csum(adj)
 
     def mean90(shift_days: int) -> np.ndarray:
-        """The 90-day window mean as seen at (each session - shift_days)."""
-        s_days = sessions.values.astype("datetime64[D]") - np.timedelta64(shift_days, "D")
-        lo = np.searchsorted(td, s_days - np.timedelta64(90, "D"), side="left")
-        hi = np.searchsorted(td, s_days, side="left")
+        """The 90-day window mean as it stood ``shift_days`` calendar days before each session."""
+        lo, hi = _window_bounds(td, sessions, 90, shift_days)
         count = (hi - lo).astype("float64")
         out = np.full(len(sessions), np.nan)
         has = count > 0
         out[has] = _window_sum(csum, lo, hi)[has] / count[has]
         return out
     now = np.where(cov, mean90(0), np.nan)
-    # a revision needs the earlier instant to be covered too (its window not truncated)
-    first_cov = td.min() + np.timedelta64(COVERAGE_WARMUP_DAYS, "D") if len(td) else None
-    earlier_ok = (sessions.values.astype("datetime64[D]") - np.timedelta64(30, "D") >= first_cov) if first_cov is not None \
-        else np.zeros(len(sessions), dtype=bool)
-    before = np.where(earlier_ok, mean90(30), np.nan)
+    before = np.where(cov_before, mean90(30), np.nan)
     out: Dict[str, np.ndarray] = {}
     gap = np.full(len(sessions), np.nan)
     ok = np.isfinite(now) & (close > 0)
-    gap[ok] = np.clip(now[ok] / close[ok] - 1.0, -5.0, 5.0)
+    gap[ok] = now[ok] / close[ok] - 1.0
+    wild = ok & (np.abs(gap) > MAX_TARGET_GAP)
+    if wild.any():
+        i = int(np.argmax(wild))
+        raise PanelDataError(f"{symbol}: at_target_gap {gap[i]:+.1f} on {sessions[i].date()} (mean adjPriceTarget {now[i]:.2f} "
+                             f"vs close {close[i]:.2f}) is beyond +-{MAX_TARGET_GAP:g}: a price-adjustment mismatch, refusing "
+                             f"to clip it")
     out["at_target_gap"] = gap
     rev = np.full(len(sessions), np.nan)
     ok = np.isfinite(now) & np.isfinite(before) & (before > 0)
@@ -1304,9 +1335,12 @@ def analyst_targets(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.Dat
     * ``at_target_rev_30``: that 90-day mean over the same mean as seen 30 CALENDAR days earlier, minus 1 (NaN unless both
       instants are covered and have a target);
     * ``at_n_analysts_90``: distinct ``analystCompany`` in the window (two targets of one company count once);
-    * ``at_covered``: 1 from ``COVERAGE_WARMUP_DAYS`` after the first retained row (capped history), else 0.
+    * ``at_covered``: 1 from ``PRICE_TARGET_VENDOR_START`` + ``COVERAGE_WARMUP_DAYS`` (the feed holds nothing earlier for any
+      symbol), else 0; for an empty file always 0. After the floor an uncapped file is covered: a quiet period is real.
 
-    Before coverage every column but the flag is NaN; an empty window after it is 0 names but no gap. A missing file refuses."""
+    Before coverage every column but the flag is NaN; an empty window after it is 0 names and no gap (``at_n_analysts_90`` is
+    the availability measure; the gap is NaN where no target was published, which is information, not a hole). A gap beyond
+    ``MAX_TARGET_GAP`` refuses (naming symbol and date). A missing file refuses."""
     frames = {sym: _targets_one(ctx, sym, daily[sym]["close"].to_numpy(dtype="float64")) for sym in ctx.symbols}
     return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
 
@@ -1331,13 +1365,13 @@ def _insider_one(ctx: BuildContext, symbol: str, market_cap: np.ndarray) -> pd.D
         value = _num(r, "securitiesTransacted") * _num(r, "price")
         if not np.isfinite(value):
             continue
-        if kind.startswith("P-"):
+        if kind.startswith("P-") and value > 0:                  # a zero-price "purchase" (a grant coded P) is not a buyer
             dollars[i] = value
             who = r["reportingCik"] if "reportingCik" in r and r["reportingCik"] else (r["reportingName"] if "reportingName" in r else None)
             buyers[i] = who
         elif kind.startswith("S-"):
             dollars[i] = -value
-    covered = _covered_from(days, sessions)
+    covered = _covered_from(days, sessions, capped=len(rows) >= INSIDER_ROW_CAP)
     lo, hi = _window_bounds(days, sessions, 90)
     net = _window_sum(_csum(dollars), lo, hi)
     out = {
@@ -1355,11 +1389,11 @@ def insiders(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
     * ``i_net_buy_90``: (shares x price of ``P-`` purchases minus ``S-`` sales, Form 4 only) over the window, over the
       store's market cap visible at S (NaN before the first scan, 2020-01, and for a symbol the scan lacks);
     * ``i_n_buyers_90``: distinct reporting persons (``reportingCik``) with a purchase in the window;
-    * ``i_covered``: 1 from ``COVERAGE_WARMUP_DAYS`` (90) calendar days after the first retained filing, else 0. FMP's
-      insider history is capped (about 2000 rows), so coverage starts at a different date per symbol, and the filings of
-      the first 90 days before it are an incomplete window. This DELIBERATELY deviates from the plan's "from the first
-      filing": a window that reaches back before the first retained row is truncated, and an empty or short window there
-      is not "no insider buying". Before coverage the other two columns are NaN; after it an empty window is 0.
+    * ``i_covered``: for a CAPPED file (``INSIDER_ROW_CAP`` = 2000 rows, FMP's limit) 1 from ``COVERAGE_WARMUP_DAYS`` (90)
+      calendar days after the first retained filing, else 0: the oldest filings were dropped, and a window reaching back
+      before the first retained row is truncated (this DELIBERATELY deviates from the plan's "from the first filing"). For an
+      UNCAPPED file (fewer rows: the whole history is there) it is 1 from the panel start, an empty window being a real 0.
+      An empty file is never covered. Before coverage the other two columns are NaN.
 
     A missing file refuses; an empty file is never covered (flag 0, the others NaN)."""
     caps = ml_universe.scan_values(list(ctx.symbols), ctx.sessions, ["market_cap"], ctx.store_dir)["market_cap"]
@@ -1494,8 +1528,8 @@ GROUPS: Dict[str, GroupSpec] = {
     "mac": GroupSpec(macro, "mac_", coverage_columns=tuple(
         c for c in MAC_COLUMNS if not any(c.startswith(f"mac_{sid.lower()}_") for sid in KNOWN_STALLS))),
     "f": GroupSpec(fundamentals, "f_"),
-    "ag": GroupSpec(analyst_grades, "ag_", coverage_columns=("ag_net_upgrades_30", "ag_net_upgrades_90", "ag_n_grades_90")),
-    "at": GroupSpec(analyst_targets, "at_", coverage_columns=("at_target_gap",)),
+    "ag": GroupSpec(analyst_grades, "ag_", coverage_columns=("ag_net_upgrades_30", "ag_net_upgrades_90", "ag_n_graders_90")),
+    "at": GroupSpec(analyst_targets, "at_", coverage_columns=("at_n_analysts_90",)),
     "i": GroupSpec(insiders, "i_"),
     "s": GroupSpec(structure, "s_", coverage_columns=tuple(
         c for c in S_COLUMNS if c not in ("s_dist_support_atr", "s_dist_resistance_atr", "s_support_touches",
