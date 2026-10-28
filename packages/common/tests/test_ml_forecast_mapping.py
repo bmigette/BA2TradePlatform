@@ -2,6 +2,7 @@ from datetime import date
 
 import pytest
 
+from ba2_common.core.ml_forecast import mapping
 from ba2_common.core.ml_forecast.forecast_row import SL_GRID_PCT, TP_GRID_PCT, ForecastRow
 from ba2_common.core.ml_forecast.mapping import (
     MappingGenes, map_forecast, map_held_position, p_up_from_deciles, quantile_return,
@@ -282,3 +283,10 @@ def test_bullish_score_class_rows_use_the_conditional_up_probability_and_expecte
     assert p == pytest.approx(0.5 / 0.7) and e == pytest.approx(-0.006 + 0.0006 + 0.015)
     with pytest.raises(ValueError, match="horizon"):
         bullish_score(r, 10)
+
+
+def test_confidence_pct_is_the_public_probability_to_confidence_conversion():
+    """Confidence is stored on the 1-100 scale; the expert uses the same conversion for its own HOLDs."""
+    assert mapping.confidence_pct(0.783) == pytest.approx(78.3)
+    assert mapping.confidence_pct(0.0) == 1.0 and mapping.confidence_pct(1.5) == 100.0
+    assert not hasattr(mapping, "_conf")

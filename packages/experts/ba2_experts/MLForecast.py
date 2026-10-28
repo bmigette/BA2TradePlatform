@@ -137,16 +137,6 @@ def rank_universe_and_id(settings: Mapping) -> tuple:
     return ranking.parse_universe(raw)
 
 
-def rank_universe(settings: Mapping) -> tuple:
-    """The symbols of ``rank_universe_and_id`` (may be empty)."""
-    return rank_universe_and_id(settings)[0]
-
-
-def session_ranks(key: str, cutoff, horizon: int, symbols, universe_id=None) -> tuple:
-    """``({symbol: rank}, n)`` of ``symbols`` (the explicit universe) at ``cutoff``; see ``ranking.session_ranks``."""
-    return ranking.session_ranks(key, cutoff, horizon, symbols, universe_id=universe_id)
-
-
 _alias_memo: dict = {}
 
 
@@ -275,7 +265,7 @@ class MLForecast(MarketExpertInterface):
         if top_n:
             # BEFORE the row read: a universe symbol without a store file (an incomplete worker store) raises here
             # even when it is the symbol being analysed, instead of becoming a quiet no_forecast skip
-            ranks, n_ranked = session_ranks(key, cutoff, genes.horizon, universe, universe_id)
+            ranks, n_ranked = ranking.session_ranks(key, cutoff, genes.horizon, universe, universe_id=universe_id)
         try:
             row = store.read_row(key, symbol, cutoff, genes.horizon)
         except store.ForecastStoreMiss as exc:
@@ -309,16 +299,16 @@ class MLForecast(MarketExpertInterface):
             res = down if down.signal != OrderRecommendation.HOLD else mapping.map_held_position(row, genes, "short")
             if res.signal == OrderRecommendation.HOLD:
                 p_up = mapping.p_up(row, genes.horizon)
-                res = mapping.MappingResult(OrderRecommendation.HOLD, mapping._conf(max(p_up, 1 - p_up)), None, None,
-                                            None, None, f"HOLD held: neither side reaches exit_flip_prob "
-                                                        f"{genes.exit_flip_prob:g}% (p_up {p_up * 100:.1f}%)")
+                res = mapping.MappingResult(
+                    OrderRecommendation.HOLD, mapping.confidence_pct(max(p_up, 1 - p_up)), None, None, None, None,
+                    f"HOLD held: neither side reaches exit_flip_prob {genes.exit_flip_prob:g}% (p_up {p_up * 100:.1f}%)")
             return Recommendation(signal=res.signal, confidence=res.confidence, current_price=price,
                                   expected_profit_percent=0.0, details=f"{symbol} {res.reason}",
                                   raw_outputs={**raw, "pass": "open_positions"})
         if top_n and rank > top_n:
             p_up = mapping.p_up(row, genes.horizon)
-            return Recommendation(signal=OrderRecommendation.HOLD, confidence=mapping._conf(max(p_up, 1.0 - p_up)),
-                                  current_price=price, expected_profit_percent=0.0,
+            return Recommendation(signal=OrderRecommendation.HOLD,
+                                  confidence=mapping.confidence_pct(max(p_up, 1.0 - p_up)), current_price=price, expected_profit_percent=0.0,
                                   details=f"{symbol} HOLD rank {rank} of {n_ranked} (outside top {top_n})",
                                   raw_outputs={**raw, "pass": "entry"})
         atr = self._atr(providers.ohlcv(), symbol, cutoff, as_of)

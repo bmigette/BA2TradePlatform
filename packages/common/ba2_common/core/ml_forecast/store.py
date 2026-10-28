@@ -189,7 +189,9 @@ def class_factors(values) -> tuple:
 
 
 # ---------------------------------------------------------------- reader
-def _check_read_args(decision_session_cutoff: date, max_age_days: int) -> None:
+def check_read_args(decision_session_cutoff: date, max_age_days: int) -> None:
+    """Validate the arguments every reader shares (also used by ``ranking``): a plain ``date`` cutoff and an int
+    ``max_age_days`` >= 1."""
     if not isinstance(decision_session_cutoff, date) or hasattr(decision_session_cutoff, "hour"):
         raise TypeError("decision_session_cutoff must be a plain date (pass knowability.scan_cutoff_date(as_of)), "
                         f"got {decision_session_cutoff!r}")
@@ -223,7 +225,7 @@ def read_row(model_key: str, symbol: str, decision_session_cutoff: date, horizon
              max_age_days: int = MAX_STALE_CALENDAR_DAYS) -> ForecastRow:
     """The row of the latest session <= ``decision_session_cutoff``, restricted to ``horizon`` (its deciles and,
     for path stores, its P(TP before SL) cells). Values come back as float32-rounded floats."""
-    _check_read_args(decision_session_cutoff, max_age_days)
+    check_read_args(decision_session_cutoff, max_age_days)
     sym = _symbol(symbol)
     kdir = _key_dir(root(cache_root), model_key)
     meta = read_meta(model_key, cache_root)
@@ -236,7 +238,7 @@ def read_row(model_key: str, symbol: str, decision_session_cutoff: date, horizon
     return _row_at(e, model_key, sym, decision_session_cutoff, horizon, max_age_days, with_classes)
 
 
-def _universe(symbols: Iterable[str]) -> List[str]:
+def universe(symbols: Iterable[str]) -> List[str]:
     """The sorted, de-duplicated, validated symbols of an explicit universe; an empty one is refused."""
     if isinstance(symbols, str):
         raise TypeError("symbols must be an iterable of symbols, not a single string")
@@ -250,7 +252,7 @@ def missing_symbol_files(model_key: str, symbols: Iterable[str], cache_root: Opt
     """The sorted symbols of ``symbols`` that have NO file in store ``model_key`` (the store's meta need not be read;
     a store directory that does not exist reports every symbol)."""
     kdir = _key_dir(root(cache_root), model_key)
-    return [x for x in _universe(symbols) if not (kdir / f"{x}.parquet").is_file()]
+    return [x for x in universe(symbols) if not (kdir / f"{x}.parquet").is_file()]
 
 
 def _universe_files(kdir: Path, model_key: str, syms: List[str]) -> None:
@@ -282,8 +284,8 @@ def read_session(model_key: str, session_cutoff: date, horizon: int, symbols: It
     file raises ``ForecastStoreError``, as does a corrupt file. Frames go through the per-symbol LRU
     (``MAX_CACHED_FRAMES_PER_KEY_HORIZON``). This is the reference reader; the expert ranks through
     ``ranking.session_ranks`` (one compact panel per store, universe and horizon)."""
-    _check_read_args(session_cutoff, max_age_days)
-    syms = _universe(symbols)
+    check_read_args(session_cutoff, max_age_days)
+    syms = universe(symbols)
     kdir, with_paths, with_classes = _card_flags(model_key, horizon, cache_root)
     _universe_files(kdir, model_key, syms)
     out: Dict[str, ForecastRow] = {}
@@ -301,7 +303,7 @@ def load_score_entries(model_key: str, horizon: int, symbols: Iterable[str],
     """``(with_classes, {symbol: (sessions, values)})`` for the explicit universe: the decile columns (9) or the class
     columns (6) of ``horizon`` only, NEVER the TP/SL path-probability cells, float32, sorted by session. Uncached (the
     caller holds the one compact copy it needs); a symbol with no file raises ``ForecastStoreError``."""
-    syms = _universe(symbols)
+    syms = universe(symbols)
     kdir, _paths, with_classes = _card_flags(model_key, horizon, cache_root)
     _universe_files(kdir, model_key, syms)
     out = {}

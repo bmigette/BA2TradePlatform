@@ -155,12 +155,13 @@ def _snap(grid: Sequence[int], value_pct: float) -> Optional[int]:
     return g if abs(g - value_pct) <= min(steps) / 2.0 + 1e-9 else None
 
 
-def _conf(p: float) -> float:
+def confidence_pct(p: float) -> float:
+    """A probability as a confidence on the platform's 1-100 scale (clamped); the expert's own HOLDs use it too."""
     return min(100.0, max(1.0, p * 100.0))
 
 
 def _hold(p_lead: float, reason: str) -> MappingResult:
-    return MappingResult(OrderRecommendation.HOLD, _conf(p_lead), None, None, None, None, reason)
+    return MappingResult(OrderRecommendation.HOLD, confidence_pct(p_lead), None, None, None, None, reason)
 
 
 def _check_pos(name: str, x) -> float:
@@ -243,7 +244,7 @@ def _map_classes(row: ForecastRow, genes: MappingGenes, price: float, atr: float
               f"sl={'none' if sl_price is None else f'{sl_price:.4f}'}")
     if notes:
         reason += "; " + "; ".join(notes)
-    return MappingResult(sig, _conf(p), edge, tp_price, tp_price, sl_price, reason)
+    return MappingResult(sig, confidence_pct(p), edge, tp_price, tp_price, sl_price, reason)
 
 
 def map_forecast(row: ForecastRow, genes: MappingGenes, decision_price: float, atr: float) -> MappingResult:
@@ -307,7 +308,7 @@ def map_forecast(row: ForecastRow, genes: MappingGenes, decision_price: float, a
               f"sl={'none' if sl_price is None else f'{sl_price:.4f}'}")
     if notes:
         reason += "; " + "; ".join(notes)
-    return MappingResult(sig, _conf(p), edge, tp_price, tp_price, sl_price, reason)
+    return MappingResult(sig, confidence_pct(p), edge, tp_price, tp_price, sl_price, reason)
 
 
 def _exit_price(name: str, price: float, ret: float, long_: bool, is_tp: bool, atr: float, notes: list) -> Optional[float]:
@@ -333,7 +334,7 @@ def map_held_position(row: ForecastRow, genes: MappingGenes, side: str) -> Mappi
     p_opp = (1.0 - pu) if side == "long" else pu
     if p_opp * 100.0 >= genes.exit_flip_prob - 1e-9:
         sig = OrderRecommendation.SELL if side == "long" else OrderRecommendation.BUY
-        return MappingResult(sig, _conf(p_opp), None, None, None, None,
+        return MappingResult(sig, confidence_pct(p_opp), None, None, None, None,
                              f"{sig.value} flip of held {side}: opposite-side p {p_opp * 100:.1f}% >= "
                              f"exit_flip_prob {genes.exit_flip_prob:g}%")
     return _hold(1.0 - p_opp, f"HOLD held {side}: opposite-side p {p_opp * 100:.1f}% < exit_flip_prob "

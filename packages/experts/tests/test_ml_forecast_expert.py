@@ -201,19 +201,19 @@ def test_rank_top_n_is_validated():
 def test_absent_ranking_settings_mean_ranking_off(rank_cache):
     """A persisted instance that predates the ranking settings reproduces the pre-ranking behaviour (the only default)."""
     old = {k: v for k, v in SETTINGS.items() if k != "rank_top_n"}
-    assert mlf_mod.rank_top_n(old) == 0 and mlf_mod.rank_universe(old) == ()
+    assert mlf_mod.rank_top_n(old) == 0 and mlf_mod.rank_universe_and_id(old)[0] == ()
     rec = _expert()._analyze("AAA", _Providers(), {**old, "min_prob": 55.0}, _at(date(2025, 3, 3)), "daily_expert")
     assert rec.signal == OrderRecommendation.BUY and "rank" not in rec.raw_outputs
 
 
 def test_rank_universe_is_parsed_sorted_and_deduplicated():
     s = {**SETTINGS, "rank_universe": "ccc, AAA,bbb,AAA"}
-    assert mlf_mod.rank_universe(s) == ("AAA", "BBB", "CCC")
-    assert mlf_mod.rank_universe({**SETTINGS, "rank_universe": ["BBB", "aaa"]}) == ("AAA", "BBB")
-    assert mlf_mod.rank_universe({**SETTINGS, "rank_universe": ""}) == ()
+    assert mlf_mod.rank_universe_and_id(s)[0] == ("AAA", "BBB", "CCC")
+    assert mlf_mod.rank_universe_and_id({**SETTINGS, "rank_universe": ["BBB", "aaa"]})[0] == ("AAA", "BBB")
+    assert mlf_mod.rank_universe_and_id({**SETTINGS, "rank_universe": ""})[0] == ()
     for bad in (5, ["AAA", 1], None, "../x"):
         with pytest.raises(ValueError):
-            mlf_mod.rank_universe({**SETTINGS, "rank_universe": bad})
+            mlf_mod.rank_universe_and_id({**SETTINGS, "rank_universe": bad})
     a = ranking.universe_id(["AAA", "BBB"])
     assert a == ranking.universe_id(["bbb", "AAA", "BBB"]) and len(a) == 16 and a != ranking.universe_id(["AAA"])
     import hashlib
@@ -336,10 +336,10 @@ def test_ties_break_by_symbol_name_and_clamped_probabilities_by_the_median(tmp_p
             for sym, c in (("TIEB", 0.05), ("TIEA", 0.05), ("LOW", 0.05), ("HIGH", 0.08), ("WEAK", 0.01))]
     store.write_rows(key, CARD, {"card_id": "timesfm3-ctx512"}, rows, (), tmp_path)
     univ = ["WEAK", "TIEB", "HIGH", "LOW", "TIEA"]
-    ranks, n = mlf_mod.session_ranks(key, d, 10, univ)
+    ranks, n = ranking.session_ranks(key, d, 10, univ)
     assert n == 5
     assert dict(ranks) == {"HIGH": 1, "LOW": 2, "TIEA": 3, "TIEB": 4, "WEAK": 5}
-    assert mlf_mod.session_ranks(key, d, 10, sorted(univ)) == (ranks, n)
+    assert ranking.session_ranks(key, d, 10, sorted(univ)) == (ranks, n)
     store.reset_cache()
     ranking.reset_panels()
 
@@ -347,12 +347,12 @@ def test_ties_break_by_symbol_name_and_clamped_probabilities_by_the_median(tmp_p
 def test_ranking_uses_no_row_after_the_cutoff(rank_cache, tmp_path_factory, monkeypatch):
     """Ranks at 03-03 equal the ranks of a store that never had the later rows; the later rows do count on 03-10."""
     univ = UNIV.split(",")
-    now, n = mlf_mod.session_ranks(rank_cache, date(2025, 3, 3), 10, univ)
+    now, n = ranking.session_ranks(rank_cache, date(2025, 3, 3), 10, univ)
     other = tmp_path_factory.mktemp("nofuture")
     _write_rank_store(other, with_future=False)
     ref, n2 = ranking.session_ranks(rank_cache, date(2025, 3, 3), 10, univ, cache_root=other)
     assert (dict(now), n) == (dict(ref), n2)
-    later, _ = mlf_mod.session_ranks(rank_cache, date(2025, 3, 10), 10, univ)
+    later, _ = ranking.session_ranks(rank_cache, date(2025, 3, 10), 10, univ)
     assert later["EEE"] == 1 and later["AAA"] == max(later.values())
 
 
@@ -366,23 +366,23 @@ def test_the_ranking_is_built_once_per_store_and_rebuilt_when_the_store_changes(
 
     monkeypatch.setattr(ranking.RankingPanel, "build", classmethod(spy))
     univ = UNIV.split(",")
-    mlf_mod.session_ranks(rank_cache, date(2025, 3, 3), 10, univ)
-    mlf_mod.session_ranks(rank_cache, date(2025, 3, 3), 10, univ)
-    mlf_mod.session_ranks(rank_cache, date(2025, 3, 4), 10, univ)       # another date: same panel
+    ranking.session_ranks(rank_cache, date(2025, 3, 3), 10, univ)
+    ranking.session_ranks(rank_cache, date(2025, 3, 3), 10, univ)
+    ranking.session_ranks(rank_cache, date(2025, 3, 4), 10, univ)       # another date: same panel
     assert len(builds) == 1
-    mlf_mod.session_ranks(rank_cache, date(2025, 3, 3), 10, univ[:3])   # another universe: another panel
+    ranking.session_ranks(rank_cache, date(2025, 3, 3), 10, univ[:3])   # another universe: another panel
     assert len(builds) == 2
     # a rewrite of the store (new meta.json stamp) rebuilds
     import os
     meta = tmp_path / "ml_forecast" / rank_cache / "meta.json"
     st = meta.stat()
     os.utime(meta, ns=(st.st_atime_ns, st.st_mtime_ns + 10_000_000))
-    mlf_mod.session_ranks(rank_cache, date(2025, 3, 3), 10, univ)
+    ranking.session_ranks(rank_cache, date(2025, 3, 3), 10, univ)
     assert len(builds) == 3
 
 
 def test_session_ranks_are_read_only(rank_cache):
-    ranks, _ = mlf_mod.session_ranks(rank_cache, date(2025, 3, 3), 10, UNIV.split(","))
+    ranks, _ = ranking.session_ranks(rank_cache, date(2025, 3, 3), 10, UNIV.split(","))
     with pytest.raises(TypeError):
         ranks["AAA"] = 99
 
@@ -398,3 +398,10 @@ def test_the_universe_is_parsed_once_across_symbols_and_dates(rank_cache, monkey
     assert mlf_mod.rank_universe_and_id(s) == (tuple(sorted(UNIV.split(","))), uid)
     assert mlf_mod.rank_universe_and_id({**SETTINGS, "rank_universe": ""}) == ((), "")
     assert mlf_mod.rank_universe_and_id({**SETTINGS, "rank_universe": []}) == ((), "")
+
+
+def test_the_expert_module_has_no_pass_through_wrappers():
+    """The expert calls ``ranking.session_ranks`` and ``rank_universe_and_id`` directly: a wrapper that only forwards (or a
+    getter nobody calls) is one more place to keep in step."""
+    assert not hasattr(mlf_mod, "session_ranks") and not hasattr(mlf_mod, "rank_universe")
+    assert mlf_mod.ranking is ranking

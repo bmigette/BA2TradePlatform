@@ -38,7 +38,7 @@ CUTOFF_MEMO_SIZE = 16
 def _parse(raw) -> Tuple[Tuple[str, ...], str]:
     """``(sorted unique symbols, id)`` of a comma-separated string or a tuple of symbols. Memoised: the expert asks for
     the same universe once per symbol per decision date, and a wide universe is not cheap to validate and hash."""
-    syms = tuple(store._universe(raw.split(",") if isinstance(raw, str) else raw))
+    syms = tuple(store.universe(raw.split(",") if isinstance(raw, str) else raw))
     return syms, hashlib.sha256(",".join(syms).encode("utf-8")).hexdigest()[:16]
 
 
@@ -84,7 +84,7 @@ class RankingPanel:
     def ranks_at(self, cutoff: date, max_age_days: int = store.MAX_STALE_CALENDAR_DAYS) -> Tuple[Mapping[str, int], int]:
         """``({symbol: rank}, n)`` over the symbols whose latest session <= ``cutoff`` is fresh (within
         ``max_age_days``); the mapping is read-only."""
-        store._check_read_args(cutoff, max_age_days)
+        store.check_read_args(cutoff, max_age_days)
         mk = (cutoff, max_age_days)
         hit = self._memo.get(mk)
         if hit is not None:

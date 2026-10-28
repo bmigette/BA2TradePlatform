@@ -339,3 +339,16 @@ def test_missing_symbol_files_names_the_symbols_without_a_file(tmp_path, key):
     assert store.missing_symbol_files(key, ["AAPL"], tmp_path) == []
     other = model_key(make_card(context_length=256), ())
     assert store.missing_symbol_files(other, ["AAPL"], tmp_path) == ["AAPL"]       # no such store at all
+
+
+def test_the_universe_and_read_argument_checks_are_public():
+    """``ranking`` uses both; a private name used across modules is a public one."""
+    assert store.universe(["bbb", "AAA", "bbb"]) == ["AAA", "BBB"]
+    with pytest.raises(ValueError, match="empty"):
+        store.universe([])
+    with pytest.raises(TypeError, match="plain date"):
+        store.check_read_args("2025-01-01", 5)
+    with pytest.raises(ValueError, match="max_age_days"):
+        store.check_read_args(date(2025, 1, 1), 0)
+    store.check_read_args(date(2025, 1, 1), 5)
+    assert not hasattr(store, "_universe") and not hasattr(store, "_check_read_args")

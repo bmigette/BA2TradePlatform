@@ -171,6 +171,6 @@ def test_session_ranks_with_a_passed_id_does_not_reparse(tmp_path, monkeypatch):
     key, h, _ = build(tmp_path, "deciles")
     syms, uid = ranking.parse_universe(SYMS[:5])
     ranking.session_ranks(key, date(2024, 2, 15), h, syms, tmp_path, universe_id=uid)       # builds the panel
-    monkeypatch.setattr(store, "_universe", lambda *a, **k: pytest.fail("the universe was re-validated"))
+    monkeypatch.setattr(store, "universe", lambda *a, **k: pytest.fail("the universe was re-validated"))
     ranks, n = ranking.session_ranks(key, date(2024, 2, 16), h, syms, tmp_path, universe_id=uid)
     assert n > 0
