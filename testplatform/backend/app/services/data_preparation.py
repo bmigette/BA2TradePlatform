@@ -480,3 +480,56 @@ def three_way_bounds(
         )
     return {'train_end': train_end, 'val_start': val_start, 'val_end': val_end,
             'holdout_start': holdout_start}
+
+
+def common_session_bounds(
+    frames: List[pd.DataFrame], train_ratio: float, holdout_share_of_test: float, label_horizon: int
+) -> Dict[str, Any]:
+    """``three_way_bounds`` of the UNION of the frames' sessions, as dates.
+
+    Targets that compare the job's tickers on each session (the cross-sectional daily targets) are decided by every
+    ticker's bars over the same window, so the train / validation / holdout cut has to be one set of dates for all of
+    them. The label horizon (in sessions) purges both boundaries. Returns the position bounds (``train_end``,
+    ``val_start``, ``val_end``, ``holdout_start``, indices into ``sessions``) plus ``sessions`` and the boundary dates
+    ``train_last``, ``val_first``, ``val_last`` and ``holdout_first``."""
+    dates = [pd.DatetimeIndex(pd.to_datetime(f["Date"])) for f in frames]
+    for i, d in enumerate(dates):
+        if not d.is_monotonic_increasing:
+            raise ValueError(f"frame {i}: Date must be ascending for a common-date split")
+    sessions = pd.DatetimeIndex(sorted(set().union(*dates)))
+    b = three_way_bounds(len(sessions), train_ratio, holdout_share_of_test, label_horizon)
+    return {**b, "sessions": sessions, "train_last": sessions[b["train_end"] - 1], "val_first": sessions[b["val_start"]],
+            "val_last": sessions[b["val_end"] - 1], "holdout_first": sessions[b["holdout_start"]]}
+
+
+def frame_bounds(
+    frames: List[pd.DataFrame], train_ratio: float, holdout_share_of_test: float, label_horizon: int,
+    common_dates: bool = False
+) -> List[Dict[str, int]]:
+    """Row bounds (``three_way_bounds`` keys) of each frame's train / validation / holdout cut.
+
+    By default every frame is cut on its own rows. With ``common_dates`` all frames are cut at the same dates
+    (``common_session_bounds``): a frame's rows go to the block its date falls in, the sessions of the purge gaps
+    belong to none. A frame left with an empty block is refused."""
+    if not common_dates:
+        return [three_way_bounds(len(f), train_ratio, holdout_share_of_test, label_horizon) for f in frames]
+    cb = common_session_bounds(frames, train_ratio, holdout_share_of_test, label_horizon)
+    return [bounds_at_dates(pd.DatetimeIndex(pd.to_datetime(f["Date"])), cb, f"frame {i}") for i, f in enumerate(frames)]
+
+
+def bounds_at_dates(dates: pd.DatetimeIndex, cb: Dict[str, Any], what: str = "series") -> Dict[str, int]:
+    """Row bounds (``three_way_bounds`` keys) of ONE ascending date index under the common boundary dates ``cb`` (from
+    ``common_session_bounds``). The index may hold dates that are not sessions (a calendar-day series). A block left empty
+    is refused: the history of ``what`` does not cover it."""
+    b = {"train_end": int(dates.searchsorted(cb["train_last"], side="right")),
+         "val_start": int(dates.searchsorted(cb["val_first"], side="left")),
+         "val_end": int(dates.searchsorted(cb["val_last"], side="right")),
+         "holdout_start": int(dates.searchsorted(cb["holdout_first"], side="left"))}
+    for name, size in (("train", b["train_end"]), ("validation", b["val_end"] - b["val_start"]),
+                       ("holdout", len(dates) - b["holdout_start"])):
+        if size <= 0:
+            raise ValueError(
+                f"{what} has no {name} rows with the common date split (train to {cb['train_last'].date()}, "
+                f"validation {cb['val_first'].date()}..{cb['val_last'].date()}, holdout from "
+                f"{cb['holdout_first'].date()}): its history does not cover that block")
+    return b

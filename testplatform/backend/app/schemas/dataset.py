@@ -21,6 +21,8 @@ class DatasetCreate(BaseModel):
     indicator_collection_id: Optional[int] = Field(None, description="ID of indicator collection to use")
     labels: Optional[List[str]] = Field(None, description="Labels for organizing datasets (e.g., ['batch-SP500', 'daily'])")
     panel_features: Optional[List[str]] = Field(None, description="alpaca_hist feature groups on top of technical: daily, market, fundamentals")
+    daily_groups: Optional[List[str]] = Field(None, description="alpaca_hist 1d only: groups of the daily point-in-time feature store (t, mtf, m, x, mac, f, ag, at, i, s)")
+    daily_min_share: Optional[float] = Field(None, description="alpaca_hist 1d only: a (group, year) covered by less than this share of rows is masked (default 0.7)")
 
 
 class DatasetUpdate(BaseModel):
@@ -36,6 +38,8 @@ class DatasetUpdate(BaseModel):
     fundamentals_config: Optional[Dict[str, Any]] = Field(None, description="Fundamentals configuration")
     labels: Optional[List[str]] = Field(None, description="Labels for organizing datasets")
     panel_features: Optional[List[str]] = Field(None, description="alpaca_hist feature groups on top of technical: daily, market, fundamentals")
+    daily_groups: Optional[List[str]] = Field(None, description="alpaca_hist 1d only: groups of the daily point-in-time feature store (t, mtf, m, x, mac, f, ag, at, i, s)")
+    daily_min_share: Optional[float] = Field(None, description="alpaca_hist 1d only: a (group, year) covered by less than this share of rows is masked (default 0.7)")
 
 
 class DatasetDuplicate(BaseModel):
@@ -77,6 +81,8 @@ class DatasetResponse(BaseModel):
     sentiment_config: Optional[Dict[str, Any]]
     generation_config: Optional[Dict[str, Any]]
     labels: Optional[List[str]] = None
+    # things the caller should know about the result (a duplicate that widened a daily universe)
+    warnings: Optional[List[str]] = None
     file_path: str
     created_at: datetime
     updated_at: Optional[datetime]

@@ -98,6 +98,52 @@ export interface ForwardReturnTarget extends BaseTargetConfig {
   horizonSessions: number;
 }
 
+// Targets of the daily feature store (alpaca_hist, 1d): the decision is taken at session S's close and filled at the next
+// open, the outcome runs to the close of session S+H, H one of 1 / 3 / 5 / 10 / 20 (see lib/dailyTargets.ts).
+// The cross-sectional ones compare the tickers of a session and need at least 5 datasets in the job.
+
+// Return minus the session's mean over the job's tickers (regression)
+export interface DailyRelReturnTarget extends BaseTargetConfig {
+  type: 'daily_rel_return';
+  category: 'regression';
+  horizonSessions: number;
+}
+
+// 1 = top fifth of the session by relative return, 0 = bottom fifth (the rest has no label)
+export interface DailyQuintileTarget extends BaseTargetConfig {
+  type: 'daily_quintile';
+  category: 'binary_classification';
+  horizonSessions: number;
+}
+
+// The relative return is positive
+export interface DailyBeatsTarget extends BaseTargetConfig {
+  type: 'daily_beats';
+  category: 'binary_classification';
+  horizonSessions: number;
+}
+
+// The return is positive
+export interface DailyUpTarget extends BaseTargetConfig {
+  type: 'daily_up';
+  category: 'binary_classification';
+  horizonSessions: number;
+}
+
+// Std of the daily log returns of the next H sessions (regression)
+export interface DailyVolatilityTarget extends BaseTargetConfig {
+  type: 'daily_volatility';
+  category: 'regression';
+  horizonSessions: number;
+}
+
+// One binary up column per horizon; the shortest is the trained one
+export interface DailyMultistepTarget extends BaseTargetConfig {
+  type: 'daily_multistep';
+  category: 'binary_classification';
+  horizons: number[];
+}
+
 // Union type for all target configs
 export type TargetConfig =
   | PriceBasedTarget
@@ -107,7 +153,13 @@ export type TargetConfig =
   | VolatilityTarget
   | TripleBarrierAtrTarget
   | DirectionTercilesTarget
-  | ForwardReturnTarget;
+  | ForwardReturnTarget
+  | DailyRelReturnTarget
+  | DailyQuintileTarget
+  | DailyBeatsTarget
+  | DailyUpTarget
+  | DailyVolatilityTarget
+  | DailyMultistepTarget;
 
 // Indicator parameters
 export interface RSIParams {
@@ -191,6 +243,8 @@ export interface TargetStats {
   std?: number;
   min?: number;
   max?: number;
+  // a target the backend could not preview (e.g. a cross-sectional one on a single dataset)
+  error?: string;
 }
 
 // Saved target set

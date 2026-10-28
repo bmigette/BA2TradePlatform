@@ -18,9 +18,13 @@ from pathlib import Path
 
 from app.models.database import SessionLocal
 from app.models.dataset import Dataset
-from app.services.data_preparation import purged_train_row_count, three_way_bounds
+from app.services.data_preparation import frame_bounds, purged_train_row_count, three_way_bounds
+from app.services.masked_fill import all_masked_columns
+from app.services.ml_dataset_source import is_daily_source
 from app.services.ml_dataset_source import is_alpaca_hist
-from app.services.ml_wizard_targets import WIZARD_TARGET_TYPES, WizardTargetError, build_wizard_target
+from app.services.ml_wizard_targets import (
+    CROSS_SECTIONAL_DAILY_TYPES, DAILY_TARGET_TYPES, SPARSE_DAILY_TYPES, WIZARD_TARGET_TYPES, WizardTargetError,
+    build_cross_sectional_daily_targets, build_daily_target, build_wizard_target, column_names as wizard_column_names)
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +63,9 @@ HOLDOUT_SHARE_OF_TEST = 0.5
 
 # Raw OHLCV/bookkeeping columns. These are inputs to target CONSTRUCTION and to
 # the indicator pass, never model features in their own right.
-NON_FEATURE_COLUMNS = ('Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'ticker')
+# ``filled`` is the daily store's flag "this bar is a fabricated flat fill" (alpaca_hist 1d datasets): an input of the
+# target construction (the daily targets are NaN where their entry / exit bar is a fill), not a model feature.
+NON_FEATURE_COLUMNS = ('Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'ticker', 'filled', 'dataset_id')
 
 # Legacy price-based targets (PredictionTargetService.calculate_prediction_targets)
 # are not registered in the caller's target list, so they are recognised by name.
@@ -223,16 +229,37 @@ def _concat_by_date(parts: List[pd.DataFrame]) -> pd.DataFrame:
 
 
 def split_frames_three_way(
-    frames: List[pd.DataFrame], train_ratio: float, holdout_share_of_test: float, label_horizon: int
+    frames: List[pd.DataFrame], train_ratio: float, holdout_share_of_test: float, label_horizon: int,
+    common_dates: bool = False
 ) -> Dict[str, List[pd.DataFrame]]:
-    """Cut every ticker's frame into purged train / validation / holdout blocks (see three_way_bounds)."""
+    """Cut every ticker's frame into purged train / validation / holdout blocks (see three_way_bounds).
+
+    ``common_dates``: cut all the tickers at the same dates instead of at their own row counts (the cross-sectional
+    daily targets compare the tickers of a session; see ``data_preparation.frame_bounds``)."""
     out: Dict[str, List[pd.DataFrame]] = {'train': [], 'val': [], 'holdout': []}
-    for f in frames:
-        b = three_way_bounds(len(f), train_ratio, holdout_share_of_test, label_horizon)
+    for f, b in zip(frames, frame_bounds(frames, train_ratio, holdout_share_of_test, label_horizon, common_dates)):
         out['train'].append(f.iloc[:b['train_end']].copy())
         out['val'].append(f.iloc[b['val_start']:b['val_end']].copy())
         out['holdout'].append(f.iloc[b['holdout_start']:].copy())
     return out
+
+
+def trim_unlabelled_edges(df: pd.DataFrame, target_column: str) -> Tuple[pd.DataFrame, int, int]:
+    """``(df without its leading and trailing rows that have no label, number of rows trimmed, number of rows left inside
+    that have no label)``.
+
+    ``drop_unobservable_target_rows`` removes EVERY unlabelled row, which is right for a target that is only missing at the
+    edges (the unobservable tail, an indicator warm-up) but splices distant sessions together for a SPARSE target (the
+    quintile labels only the top and bottom fifth of a session): a window of ``seq_len`` rows would then span weeks. Here the
+    rows between the first and the last label stay, NaN labels included, so the frame is still consecutive sessions; the
+    windows whose label is NaN are dropped when the windows are built (``TSAITrainingService.prepare_data``)."""
+    labelled = df[target_column].notna().to_numpy()
+    if not labelled.any():
+        return df.iloc[0:0], len(df), 0
+    first = int(np.argmax(labelled))
+    last = len(labelled) - 1 - int(np.argmax(labelled[::-1]))
+    out = df.iloc[first:last + 1].reset_index(drop=True)
+    return out, len(df) - len(out), int(out[target_column].isna().sum())
 
 
 def create_training_loss(loss_function: str, train_labels: pd.Series, target_column: str):
@@ -1473,7 +1500,8 @@ def build_prediction_targets(
     prediction_targets: List[Dict[str, Any]],
     dataset_timeframe: str,
     train_ratio: Optional[float] = None,
-    panel_source: bool = False
+    panel_source: bool = False,
+    cross_sectional: Optional[Dict[str, Tuple[pd.Series, int]]] = None
 ) -> Tuple[pd.DataFrame, str, List[str], Dict[str, int]]:
     """Add the configured target columns to ONE symbol's chronologically ordered frame.
 
@@ -1483,6 +1511,9 @@ def build_prediction_targets(
 
     ``train_ratio`` (the job's train share) and ``panel_source`` (the dataset comes from the alpaca_hist source) are
     needed by the wizard targets only (``ml_wizard_targets``): they fit k / the terciles on the rows of the train block.
+    ``cross_sectional`` is this symbol's share of the job-wide daily targets (daily_rel_return / daily_quintile /
+    daily_beats compare the tickers of a session, so they are built across all the job's datasets by
+    ``build_cross_sectional_daily_targets`` and handed in here): ``{column: (labels aligned to ``frame``, look-ahead)}``.
 
     Returns:
         (frame with target columns, selected target column, every target column,
@@ -1739,6 +1770,33 @@ def build_prediction_targets(
                         target_column = col_name
                     logger.info(f"Created {pt_type} target: {col_name} (look-ahead {lookahead} bars)")
 
+                elif pt_type in DAILY_TARGET_TYPES:
+                    # the alpaca_hist 1d source. Cross-sectional types arrive precomputed from the whole job; the others
+                    # are labels of THIS symbol's own frame (up: checked on the train block; multistep: one column per
+                    # horizon, all purged by the longest). The look-ahead of a label is its horizon in sessions (rows).
+                    try:
+                        if pt_type in CROSS_SECTIONAL_DAILY_TYPES:
+                            col = wizard_column_names(pt)[0]
+                            if cross_sectional is None or col not in cross_sectional:
+                                raise TargetBuildError(
+                                    f'{pt_type} compares the tickers of a session and is computed across all the '
+                                    f"job's datasets; it was not provided for this one")
+                            built_cols = [(cross_sectional[col][0], col, cross_sectional[col][1])]
+                        else:
+                            if train_ratio is None:
+                                raise TargetBuildError(f'{pt_type} target needs the job train ratio to check the train block')
+                            built_cols = build_daily_target(frame, pt, train_ratio, dataset_timeframe, panel_source)
+                    except WizardTargetError as e:
+                        raise TargetBuildError(str(e))
+                    for series, col_name, lookahead in built_cols:
+                        frame[col_name] = series
+                        if col_name not in all_target_columns:
+                            all_target_columns.append(col_name)
+                        target_label_horizons[col_name] = max(lookahead, target_label_horizons.get(col_name, 0))
+                        if target_column is None:
+                            target_column = col_name
+                        logger.info(f"Created {pt_type} target: {col_name} (look-ahead {lookahead} sessions)")
+
                 else:
                     raise TargetBuildError(f'Unknown target type: {pt_type}')
 
@@ -1899,6 +1957,10 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
             # Add ticker column if combining multiple datasets
             if len(dataset_ids) > 1:
                 df['ticker'] = info.get('ticker', f'TICKER{ds_id}')
+            # The dataset a frame comes from (the masked-cell medians saved with a model are keyed by ticker AND
+            # dataset, so two datasets of one ticker do not collide); never a feature
+            if is_daily_source(info.get('data_provider'), info.get('timeframe')):
+                df['dataset_id'] = ds_id
 
             frames.append(df.sort_values('Date', kind='mergesort').reset_index(drop=True))
 
@@ -1916,11 +1978,20 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
             update_job_progress(task_id, 15, "Calculating prediction targets...")
         built = []
         try:
-            for frame, info in zip(frames, dataset_infos):
+            # daily targets that compare the tickers of a session need every dataset of the job at once
+            try:
+                cross_sectional = build_cross_sectional_daily_targets(
+                    frames, [info.get('ticker', f'TICKER{ds_id}') for info, ds_id in zip(dataset_infos, dataset_ids)],
+                    prediction_targets, [info.get('timeframe', '1h') for info in dataset_infos],
+                    [is_alpaca_hist(info.get('data_provider')) for info in dataset_infos])
+            except WizardTargetError as e:
+                raise TargetBuildError(str(e))
+            for frame, info, cross in zip(frames, dataset_infos, cross_sectional):
                 built.append(build_prediction_targets(
                     frame, prediction_targets, dataset_timeframe,
                     train_ratio=train_test_split / 100.0,
-                    panel_source=is_alpaca_hist(info.get('data_provider'))
+                    panel_source=is_alpaca_hist(info.get('data_provider')),
+                    cross_sectional=cross
                 ))
         except TargetBuildError as e:
             return {'status': 'failed', 'error': str(e)}
@@ -1940,11 +2011,27 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
         n_rows_before = sum(len(f) for f in frames)
         n_unobservable = 0
         trimmed = []
+        n_interior = 0
+        # Only quintile / beats are SPARSE (their labels follow the session's cross-section): they keep the consecutive
+        # session frame and lose only the unlabelled edges. Every other target, rel_return included, is handled exactly as
+        # before: all its unlabelled rows are dropped.
+        sparse_target = target_column in {c for pt in prediction_targets if pt.get('type') in SPARSE_DAILY_TYPES
+                                          for c in wizard_column_names(pt)}
         for f in frames:
-            f, n_dropped = drop_unobservable_target_rows(f, target_column)
+            if sparse_target:
+                f, n_dropped, n_gaps = trim_unlabelled_edges(f, target_column)
+                n_interior += n_gaps
+            else:
+                f, n_dropped = drop_unobservable_target_rows(f, target_column)
             n_unobservable += n_dropped
             trimmed.append(f)
         frames = trimmed
+        if n_interior and job_type != 'classification':
+            # Darts regression models train on the series as it is and a NaN inside it makes the loss NaN
+            return {'status': 'failed', 'error': (
+                f"Target '{target_column}' has {n_interior} rows without a label inside the series (a sparse cross-sectional "
+                f"target): regression models cannot train across gaps. Use a classification job (the windows "
+                f"without a label are dropped), or a target that labels every session")}
         if n_unobservable:
             logger.info(
                 f"Dropped {n_unobservable} rows with no observable "
@@ -1964,6 +2051,10 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                 'error': f'No label horizon recorded for target {target_column}; cannot purge the train/test boundary'
             }
         label_horizon = int(target_label_horizons[target_column])
+        # A cross-sectional daily target is decided by every ticker's bars over the same window: one set of boundary
+        # dates for all the tickers, not a row-count cut per ticker (which puts one ticker's train rows on another's
+        # test dates).
+        common_dates = any(target_column in cols for cols in cross_sectional)
 
         # Train / validation / holdout split, PER TICKER, chronological. Targets are computed
         # over the whole series and only then cut, so both boundaries are purged by the label
@@ -1973,7 +2064,8 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
         update_job_progress(task_id, 20, "Splitting train/validation/holdout data...")
         train_ratio = train_test_split / 100.0
         try:
-            split_frames = split_frames_three_way(frames, train_ratio, HOLDOUT_SHARE_OF_TEST, label_horizon)
+            split_frames = split_frames_three_way(frames, train_ratio, HOLDOUT_SHARE_OF_TEST, label_horizon,
+                                                  common_dates=common_dates)
         except ValueError as e:
             return {'status': 'failed', 'error': str(e)}
         train_df = _concat_by_date(split_frames['train'])
@@ -2015,6 +2107,13 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
             target_columns=all_target_columns,
             selected_target=target_column,
         )
+        # A group of the daily source that the coverage mask blanked in EVERY row of ANY ticker has nothing to learn
+        # from: its columns leave the feature list of all the tickers (so the saved list is the width the models
+        # really have); its <group>_missing flag stays.
+        all_masked = all_masked_columns(frames, feature_columns)
+        if all_masked:
+            logger.warning(f"Dropping the feature columns of groups masked in every row of at least one ticker: {all_masked}")
+            feature_columns = [c for c in feature_columns if c not in all_masked]
 
         # Save datasets for debugging and download
         update_job_progress(task_id, 22, "Saving datasets to cache...")
@@ -2111,6 +2210,8 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                     prediction_horizon=prediction_horizon,
                     prediction_modes=prediction_modes,
                     label_horizon=label_horizon,
+                    common_dates=common_dates,
+                    sparse_target=sparse_target,
                     progress_base=25,
                     progress_range=65,
                     timeframe=timeframe
@@ -2145,6 +2246,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                     metrics_config=metrics_config,
                     prediction_horizon=prediction_horizon,
                     label_horizon=label_horizon,
+                    common_dates=common_dates,
                     progress_base=25,
                     progress_range=65,
                     timeframe=timeframe
@@ -2630,7 +2732,9 @@ def train_classification_optimization(
     label_horizon: int,
     progress_base: float,
     progress_range: float,
-    timeframe: str = 'daily'
+    timeframe: str = 'daily',
+    common_dates: bool = False,
+    sparse_target: bool = False
 ) -> Dict[str, Any]:
     """
     Classification optimization using tsai models.
@@ -2759,7 +2863,9 @@ def train_classification_optimization(
                     seq_len=current_seq_len,
                     prediction_horizon=0,  # Target already pre-shifted
                     prediction_mode=mode,
-                    label_horizon=label_horizon  # purge the boundary rows the pre-shift leaks
+                    label_horizon=label_horizon,  # purge the boundary rows the pre-shift leaks
+                    common_dates=common_dates,
+                    drop_unlabelled_windows=sparse_target   # only a sparse target (quintile / beats) loses windows
                 )
                 X_train, X_test, y_train, y_test = (
                     split['X_train'], split['X_val'], split['y_train'], split['y_val']
@@ -3262,7 +3368,8 @@ def train_unified_optimization(
     label_horizon: int,
     progress_base: float,
     progress_range: float,
-    timeframe: str = 'daily'
+    timeframe: str = 'daily',
+    common_dates: bool = False
 ) -> Dict[str, Any]:
     """
     Unified optimization where model type is an optimization parameter.
@@ -3320,10 +3427,12 @@ def train_unified_optimization(
             timeframe=timeframe,
             # An extra `prediction_horizon` shift was applied above for the RNN target,
             # so its outcome window reaches that much further past the split.
-            label_horizon=label_horizon + max(0, prediction_horizon)
+            label_horizon=label_horizon + max(0, prediction_horizon),
+            common_dates=common_dates
         )
         rnn_scalers = list(training_service.scalers)
-        rnn_scaler_params = training_service.describe_scalers(rnn_scalers, list(training_service.cov_scalers))
+        rnn_scaler_params = training_service.describe_scalers(
+            rnn_scalers, list(training_service.cov_scalers), masked_fill=training_service.masked_fill)
         logger.info(
             f"RNN data prepared: train={_n_points(rnn_split['train_series'])}, "
             f"validation={_n_points(rnn_split['val_series'])}, holdout={_n_points(rnn_split['holdout_series'])} "
@@ -3338,10 +3447,12 @@ def train_unified_optimization(
             target_column=target_column,
             feature_columns=feature_columns,
             timeframe=timeframe,
-            label_horizon=label_horizon
+            label_horizon=label_horizon,
+            common_dates=common_dates
         )
         ms_scalers = list(training_service.scalers)
-        ms_scaler_params = training_service.describe_scalers(ms_scalers, list(training_service.cov_scalers))
+        ms_scaler_params = training_service.describe_scalers(
+            ms_scalers, list(training_service.cov_scalers), masked_fill=training_service.masked_fill)
         logger.info(
             f"Multi-step data prepared: train={_n_points(ms_split['train_series'])}, "
             f"validation={_n_points(ms_split['val_series'])}, holdout={_n_points(ms_split['holdout_series'])} "
@@ -3446,8 +3557,8 @@ def train_unified_optimization(
         return {'model_type': 'unified', 'status': 'failed', 'error': 'metrics_config.lossFunction is required'}
     # Any failure building the loss propagates (see create_training_loss).
     train_labels = pd.concat(
-        [f[target_column].iloc[:three_way_bounds(len(f), train_ratio, holdout_share_of_test, label_horizon)['train_end']]
-         for f in frames],
+        [f[target_column].iloc[:b['train_end']]
+         for f, b in zip(frames, frame_bounds(frames, train_ratio, holdout_share_of_test, label_horizon, common_dates))],
         ignore_index=True
     )
     loss_fn = create_training_loss(loss_function_type, train_labels, target_column)

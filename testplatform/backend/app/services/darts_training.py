@@ -9,13 +9,13 @@ This service is designed for REGRESSION tasks (time series forecasting).
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Sequence, Tuple
 import logging
 import os
 from pathlib import Path
 import json
 
-from app.services.data_preparation import purged_train_row_count, three_way_bounds
+from app.services.data_preparation import bounds_at_dates, common_session_bounds, purged_train_row_count, three_way_bounds
 from app.services.model_interface import ITrainingService
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,11 @@ except ImportError:
     DARTS_AVAILABLE = False
 
 
+from app.services.masked_fill import (  # noqa: E402  (re-exported: the daily mask fill lives in masked_fill)
+    all_masked_columns, build_masked_fill, fill_masked_covariates, has_daily_flags, has_masked_cells, masked_groups,
+    ticker_key)
+
+
 class DartsTrainingService(ITrainingService):
     """
     Darts-based training service for time series regression/forecasting.
@@ -69,6 +74,9 @@ class DartsTrainingService(ITrainingService):
         # lists); evaluation inverse-transforms each series with its own scaler.
         self.scalers: List[Any] = []
         self.cov_scalers: List[Any] = []
+        # The mask-fill medians of the last three-way prepare (masked_fill.build_masked_fill), saved with the scalers
+        self.masked_fill: Optional[Dict[str, Any]] = None
+        self._last_fill: Dict[str, float] = {}
 
     def prepare_data(
         self,
@@ -76,7 +84,10 @@ class DartsTrainingService(ITrainingService):
         target_column: str = 'Close',
         feature_columns: List[str] = None,
         timeframe: str = 'daily',
-        scaler_fit_ratio: Optional[float] = None
+        scaler_fit_ratio: Optional[float] = None,
+        scaler_fit_until: Optional[pd.Timestamp] = None,
+        drop_columns: Sequence[str] = (),
+        probe_dropped: bool = False
     ) -> Tuple[Any, Any]:
         """
         Prepare data for Darts model training.
@@ -96,6 +107,18 @@ class DartsTrainingService(ITrainingService):
                 restricted ``df`` to training rows -- fitting on a frame that still
                 contains the held-out tail puts the future's min/max into the
                 training transform.
+            scaler_fit_until: Same, but the train block is every point dated up to
+                and including this timestamp (the common-date split of the
+                cross-sectional targets, where the boundary is a date and not a
+                fraction of this frame's rows). Wins over ``scaler_fit_ratio``.
+            drop_columns: Covariate columns to leave out (the columns dropped for ANOTHER ticker of the job, so every ticker
+                has the same covariate width).
+            probe_dropped: Only work out which covariate columns the daily mask fill drops for this frame and return that
+                list (nothing is scaled or saved).
+
+        ONE window decides the train block of everything fitted here: the first ``fit`` points of the target series (the
+        ratio, or the points dated up to ``scaler_fit_until``). The target scaler, the covariate scaler and the median of
+        the cells the daily coverage mask blanked (``masked_fill.fill_masked_covariates``) are all fitted on it.
 
         Returns:
             Tuple of (target_series, covariates_series)
@@ -103,12 +126,27 @@ class DartsTrainingService(ITrainingService):
         if not DARTS_AVAILABLE:
             raise RuntimeError("Darts library not available")
 
+        self._last_fill = {}
         df_sorted = df.sort_values('Date').copy()
         df_sorted['Date'] = pd.to_datetime(df_sorted['Date'])
         df_sorted = df_sorted.set_index('Date')
 
         # Infer frequency based on timeframe
         freq = self._infer_frequency(timeframe, df_sorted)
+
+        # For intraday stock data (1h, 4h, etc.), don't use fill_missing_dates
+        # because market data has irregular timestamps (market hours, weekends, holidays)
+        # that cannot be filled with a regular frequency grid
+        is_intraday = timeframe.lower() in ['1m', '5m', '15m', '30m', '1h', '4h']
+
+        def fit_count(index: pd.Index) -> Optional[int]:
+            """Points of the built series that are the train block: the one window the scalers AND the masked-cell medians
+            are fitted on; None = all of them."""
+            if scaler_fit_until is not None:
+                return max(1, int((index <= scaler_fit_until).sum()))
+            if scaler_fit_ratio is not None:
+                return max(1, int(len(index) * scaler_fit_ratio))
+            return None
 
         # Drop rows with NaN in target column
         if target_column in df_sorted.columns:
@@ -119,25 +157,24 @@ class DartsTrainingService(ITrainingService):
         # the first available one, from the future -- into every leading row. Leading rows without a
         # complete covariate vector are dropped (from the target series too, so they stay aligned);
         # a column with no value at all is an error, not a column of zeros.
-        cov_df = None
+        # Cells blanked by the daily source's coverage mask are not gaps: they are filled with a train-block median below
+        # (after the series exists, so the median's window is the scalers' window), and count as present here.
+        cov_raw = None
+        available_cols: List[str] = []
         if feature_columns:
-            available_cols = [c for c in feature_columns if c in df_sorted.columns]
+            available_cols = [c for c in feature_columns if c in df_sorted.columns and c not in set(drop_columns)]
             if available_cols:
-                cov_df = df_sorted[available_cols].ffill()
-                empty_cols = [c for c in available_cols if cov_df[c].isna().all()]
-                if empty_cols:
-                    raise ValueError(f"Covariate columns without any value: {empty_cols[:5]}")
-                complete = cov_df.notna().all(axis=1).to_numpy()
+                cov_raw = df_sorted[available_cols]
+                probe = cov_raw
+                for _, group, flagged in masked_groups(cov_raw):
+                    probe = probe.copy()
+                    probe.loc[flagged, group] = probe.loc[flagged, group].fillna(0.0)
+                complete = probe.ffill().notna().all(axis=1).to_numpy()
                 first_complete = int(np.argmax(complete))
                 if first_complete > 0:
                     logger.info(f"Dropped {first_complete} leading rows without a complete covariate vector")
                     df_sorted = df_sorted.iloc[first_complete:]
-                    cov_df = cov_df.iloc[first_complete:]
-
-        # For intraday stock data (1h, 4h, etc.), don't use fill_missing_dates
-        # because market data has irregular timestamps (market hours, weekends, holidays)
-        # that cannot be filled with a regular frequency grid
-        is_intraday = timeframe.lower() in ['1m', '5m', '15m', '30m', '1h', '4h']
+                    cov_raw = cov_raw.iloc[first_complete:]
 
         if is_intraday:
             # For intraday stock data: use from_values() which treats data as
@@ -156,14 +193,34 @@ class DartsTrainingService(ITrainingService):
                 fill_missing_dates=True,
                 freq=freq
             )
+        n_fit = fit_count(target_series.time_index)
 
-        # Scale the data. When scaler_fit_ratio is given, the scaler sees ONLY the
+        cov_df = None
+        if cov_raw is not None:
+            # The train block of the medians = the rows of the first n_fit points of the series (by date for a dated series)
+            if n_fit is None:
+                fill_rows = len(cov_raw)
+            elif is_intraday:
+                fill_rows = n_fit
+            else:
+                fill_rows = int((cov_raw.index <= target_series.time_index[n_fit - 1]).sum())
+            cov_df, dropped = fill_masked_covariates(cov_raw, fill_rows, self._last_fill)
+            available_cols = [c for c in available_cols if c not in dropped]
+            if probe_dropped:
+                return list(dropped)
+            cov_df = cov_df.ffill()
+            empty_cols = [c for c in available_cols if cov_df[c].isna().all()]
+            if empty_cols:
+                raise ValueError(f"Covariate columns without any value: {empty_cols[:5]}")
+        elif probe_dropped:
+            return []
+
+        # Scale the data. When a train window is given, the scaler sees ONLY the
         # leading (training) slice; the rest of the series is merely transformed by it.
         self.scaler = Scaler()
-        if scaler_fit_ratio is None:
+        if n_fit is None:
             self.scaler.fit(target_series)
         else:
-            n_fit = max(1, int(len(target_series) * scaler_fit_ratio))
             self.scaler.fit(target_series[:n_fit])
         target_series = self.scaler.transform(target_series)
 
@@ -181,17 +238,16 @@ class DartsTrainingService(ITrainingService):
                     covariates = TimeSeries.from_values(cov_values)
                 else:
                     covariates = TimeSeries.from_dataframe(
-                        cov_df,
+                        cov_df[available_cols],
                         value_cols=available_cols,
                         fill_missing_dates=True,
                         freq=freq
                     )
-                # Scale covariates (same train-only fit rule as the target)
+                # Scale covariates (same train-only window as the target)
                 self.cov_scaler = Scaler()
-                if scaler_fit_ratio is None:
+                if n_fit is None:
                     self.cov_scaler.fit(covariates)
                 else:
-                    n_fit = max(1, int(len(covariates) * scaler_fit_ratio))
                     self.cov_scaler.fit(covariates[:n_fit])
                 covariates = self.cov_scaler.transform(covariates)
 
@@ -310,7 +366,7 @@ class DartsTrainingService(ITrainingService):
     def prepare_split_three_way(
         self, dataframes: List[pd.DataFrame], train_ratio: float, holdout_share_of_test: float,
         target_column: str, feature_columns: List[str], timeframe: str = 'daily',
-        label_horizon: int = 0
+        label_horizon: int = 0, common_dates: bool = False
     ) -> Dict[str, Any]:
         """Chronological train / validation / holdout TimeSeries, one series per instrument.
 
@@ -319,20 +375,45 @@ class DartsTrainingService(ITrainingService):
         single frame the values are TimeSeries; with several they are lists index-aligned with
         ``self.scalers``. Validation is the GA fitness / early-stopping set, the holdout is only
         scored and reported.
+
+        ``common_dates`` cuts every series at the same DATES (``common_session_bounds`` over the
+        frames' sessions) and fits each scaler on the points up to the last train date: the
+        cross-sectional daily targets compare the tickers of a session, so one ticker's train
+        block must not reach into another's test dates.
         """
         keys = ('train', 'val', 'holdout')
+        cb = common_session_bounds(dataframes, train_ratio, holdout_share_of_test, label_horizon) if common_dates else None
         series = {k: [] for k in keys}
         covs = {k: [] for k in keys}
         scalers = []
         cov_scalers = []
+        # A group masked in every row of ANY ticker is dropped for ALL of them (one covariate width), and the medians of
+        # the masked columns are collected per ticker to be saved with the scalers.
+        fit_kw = {'scaler_fit_ratio': train_ratio} if cb is None else {'scaler_fit_until': cb['train_last']}
+        all_masked = all_masked_columns(dataframes, feature_columns or [])
+        feature_columns = [c for c in (feature_columns or []) if c not in all_masked]
+        # Columns the mask fill drops for ONE ticker (nothing unmasked in its train block to take a median of) go for all
+        unfillable: set = set()
+        if has_daily_flags(feature_columns):
+            for df in dataframes:
+                unfillable |= set(self.prepare_data(df, target_column, feature_columns, timeframe, probe_dropped=True,
+                                                    **fit_kw))
+        dropped_for_all = list(dict.fromkeys(all_masked + [c for c in feature_columns if c in unfillable]))
+        if dropped_for_all:
+            logger.warning(f"Columns the coverage mask leaves without data for at least one ticker are dropped for all: "
+                           f"{dropped_for_all}")
+            feature_columns = [c for c in feature_columns if c not in unfillable]
+        fills: Dict[str, Dict[str, float]] = {}
         for df in dataframes:
             self.cov_scaler = None
-            full_series, full_cov = self.prepare_data(
-                df, target_column, feature_columns, timeframe, scaler_fit_ratio=train_ratio
-            )
+            full_series, full_cov = self.prepare_data(df, target_column, feature_columns, timeframe, **fit_kw)
             scalers.append(self.scaler)
             cov_scalers.append(self.cov_scaler)
-            b = three_way_bounds(len(full_series), train_ratio, holdout_share_of_test, label_horizon)
+            fills[ticker_key(df)] = dict(self._last_fill)
+            if cb is None:
+                b = three_way_bounds(len(full_series), train_ratio, holdout_share_of_test, label_horizon)
+            else:
+                b = bounds_at_dates(full_series.time_index, cb, f"series {len(scalers)}")
             cuts = {
                 'train': slice(0, b['train_end']),
                 'val': slice(b['val_start'], b['val_end']),
@@ -345,6 +426,7 @@ class DartsTrainingService(ITrainingService):
         self.scaler = scalers[-1]
         self.cov_scalers = cov_scalers
         self.cov_scaler = cov_scalers[-1]
+        self.masked_fill = build_masked_fill(fills, dropped_for_all) if has_daily_flags(feature_columns + dropped_for_all) else None
         logger.info(
             "Three-way split: " + ", ".join(
                 f"{k}={sum(len(s) for s in series[k])}" for k in keys
@@ -858,16 +940,19 @@ class DartsTrainingService(ITrainingService):
             return None
 
         return self.describe_scalers(
-            self.scalers or [self.scaler], self.cov_scalers or [self.cov_scaler]
+            self.scalers or [self.scaler], self.cov_scalers or [self.cov_scaler], masked_fill=self.masked_fill
         )
 
     @staticmethod
-    def describe_scalers(scalers: List[Any], cov_scalers: List[Any]) -> Dict[str, Any]:
+    def describe_scalers(scalers: List[Any], cov_scalers: List[Any],
+                         masked_fill: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """JSON description of the fitted target AND covariate scalers (one entry per series).
 
         The covariate scaler used to be dropped entirely, so a reloaded model could not scale its
         features the way it was trained. Top-level data_min/data_max/data_range stay the (last)
-        target scaler's for backward compatibility.
+        target scaler's for backward compatibility. ``masked_fill`` (``masked_fill.build_masked_fill``) is the
+        per-ticker median of every masked column and the dropped all-masked columns: prediction fills from it
+        (``masked_fill.apply_saved_fill``) and never refits on the frame it predicts.
         """
         def params(scaler):
             if scaler is None:
@@ -891,6 +976,8 @@ class DartsTrainingService(ITrainingService):
         }
         if scalers and scalers[-1] is not None:
             scaler_info.update(params(scalers[-1]))
+        if masked_fill is not None:
+            scaler_info['masked_fill'] = masked_fill
         return scaler_info
 
     def predict(self, model: Any, data: Any, n: int = None, **kwargs) -> Any:

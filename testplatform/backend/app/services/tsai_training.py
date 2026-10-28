@@ -22,7 +22,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import json
 
-from app.services.data_preparation import DataPreparationService, purged_train_row_count, three_way_bounds
+from app.services.data_preparation import DataPreparationService, frame_bounds, purged_train_row_count, three_way_bounds
+from app.services.masked_fill import (build_masked_fill, fill_masked_covariates, has_daily_flags, has_masked_cells,
+                                       masked_groups, ticker_key)
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,8 @@ class TSAITrainingService(ITrainingService):
         self.normalize = normalize
         self.buffer_pct = buffer_pct
         self.data_prep = None  # DataPreparationService instance, fitted on training data
+        # The mask-fill medians of the last split (masked_fill.build_masked_fill), saved with the scaler params
+        self.masked_fill: Optional[Dict[str, Any]] = None
 
     def prepare_data(
         self,
@@ -133,7 +137,10 @@ class TSAITrainingService(ITrainingService):
         seq_len: int = 24,
         prediction_horizon: int = 0,
         prediction_mode: str = 'shift',
-        fit_scaler: bool = True
+        fit_scaler: bool = True,
+        scaler_fit_until: Optional[pd.Timestamp] = None,
+        scaler_fit_ratio: Optional[float] = None,
+        drop_unlabelled_windows: bool = False
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Prepare data for tsai model training.
@@ -150,6 +157,20 @@ class TSAITrainingService(ITrainingService):
             prediction_horizon: How many bars ahead to predict (0 = predict at end of sequence)
             prediction_mode: 'shift' for single target at T+N, 'multistep' for T+1...T+N
             fit_scaler: Whether to fit the scaler (True for train, False for test)
+            drop_unlabelled_windows: Training of a SPARSE target (the cross-sectional quintile / beats labels): build the
+                windows on the full consecutive frame and drop the windows whose label is NaN, so a window always covers
+                seq_len consecutive sessions. Off (the default, and everything prediction does): every window is kept,
+                exactly as before - a prediction frame's windows must stay one per row, aligned with their dates.
+            scaler_fit_until / scaler_fit_ratio: the train block of ``df`` (the rows dated up to and including
+                that timestamp, or that leading fraction of the rows) when ``df`` also holds held-out rows. They
+                only decide which rows the masked-cell medians are fitted on; with neither, a ``fit_scaler``
+                frame is all train.
+
+        Cells blanked by the daily source's coverage mask (``<prefix>missing`` == 1) are filled with the
+        train-block median before the scaling (``darts_training.fill_masked_covariates``: the flag stays a
+        feature, a group masked in every row is dropped from ``feature_columns`` with a warning). A frame that
+        is not the training one cannot fit that median: it must arrive already filled (the split methods
+        do it on the whole frame, fitted on its train rows) or the call is refused.
 
         Returns:
             Tuple of (X, y) numpy arrays
@@ -161,8 +182,32 @@ class TSAITrainingService(ITrainingService):
         if not TSAI_AVAILABLE:
             raise RuntimeError("tsai library not available")
 
-        # Extract target
-        y_data = df[target_column].values.astype(np.int64)
+        # Extract target. A SPARSE target (the cross-sectional quintile labels only the top and bottom fifth) is trained on
+        # the FULL consecutive frame and the windows whose label is NaN are dropped afterwards, so a window always covers
+        # seq_len consecutive sessions (dropping the NaN rows first would join distant sessions). Only training asks for
+        # that; every other call keeps the labels as they were (a NaN cast to int, one window per row).
+        if drop_unlabelled_windows:
+            y_raw = df[target_column].to_numpy(dtype=np.float64)
+            sparse = bool(np.isnan(y_raw).any())
+            y_data = y_raw if sparse else y_raw.astype(np.int64)
+        else:
+            sparse = False
+            y_data = df[target_column].values.astype(np.int64)
+
+        n_fit = None
+        if scaler_fit_until is not None:
+            n_fit = max(1, int((pd.to_datetime(df['Date']) <= scaler_fit_until).sum()))
+        elif scaler_fit_ratio is not None:
+            n_fit = max(1, int(len(df) * scaler_fit_ratio))
+        elif fit_scaler:
+            n_fit = len(df)
+        if n_fit is not None:
+            df, feature_columns = self._fill_masked(df, feature_columns, n_fit)
+        elif has_masked_cells(df[feature_columns]):
+            raise ValueError(
+                "this frame has masked cells (blanked by the coverage mask, <prefix>missing == 1) but is not the "
+                "training frame, so it cannot fit their neutral value: fill them on the whole frame first "
+                "(prepare_split_three_way / prepare_data_split do) or pass scaler_fit_until / scaler_fit_ratio")
 
         # Apply 35% buffered normalization (same as Darts)
         if self.normalize:
@@ -195,8 +240,53 @@ class TSAITrainingService(ITrainingService):
         else:
             X, y = self._create_sequences(X_data, y_data, seq_len, prediction_horizon)
 
+        if sparse:
+            labelled = ~np.isnan(y.reshape(len(y), -1)).any(axis=1)
+            X, y = X[labelled], y[labelled]
+            if prediction_mode != 'multistep':
+                y = y.astype(np.int64)
+            logger.info(f"Dropped {int((~labelled).sum())} windows whose label is NaN (sparse target)")
+
         logger.info(f"Prepared data: X shape {X.shape}, y shape {y.shape}, horizon={prediction_horizon}, mode={prediction_mode}, normalized={self.normalize}")
         return X, y
+
+    @staticmethod
+    def _fill_masked(df: pd.DataFrame, feature_columns: List[str], n_fit: int,
+                     medians_out: Optional[Dict[str, float]] = None) -> Tuple[pd.DataFrame, List[str]]:
+        """``df`` with the coverage mask's blank cells filled (train median of its first ``n_fit`` rows) and the feature
+        columns without any group masked in every row. A frame without a daily ``missing`` flag is returned as it is.
+        ``medians_out`` receives the median used for every filled column."""
+        if not has_daily_flags(feature_columns):
+            return df, list(feature_columns)             # not the daily source: nothing to look at, nothing copied
+        cov = df[feature_columns]
+        if not masked_groups(cov):
+            return df, list(feature_columns)             # daily source, nothing masked: the frame is left as it is
+        filled, dropped = fill_masked_covariates(cov, n_fit, medians_out)
+        if filled.equals(df[feature_columns]) and not dropped:
+            return df, list(feature_columns)
+        out = df.copy()
+        out[list(filled.columns)] = filled
+        return out, [c for c in feature_columns if c not in dropped]
+
+    def _fill_masked_frames(self, frames: List[pd.DataFrame], feature_columns: List[str],
+                            n_fits: List[int]) -> Tuple[List[pd.DataFrame], List[str]]:
+        """``_fill_masked`` for every ticker (each with its own train rows). A group masked in every row of ANY ticker is
+        dropped for all of them, so every ticker keeps the same feature set."""
+        out, dropped = [], set()
+        fills: Dict[str, Dict[str, float]] = {}
+        for df, n in zip(frames, n_fits):
+            medians: Dict[str, float] = {}
+            filled, d = self._fill_masked(df, feature_columns, n, medians)
+            out.append(filled)
+            fills[ticker_key(df)] = medians
+            dropped |= set(feature_columns) - set(d)
+        kept = [c for c in feature_columns if c not in dropped]
+        # the medians of the columns that ended up dropped for another ticker are of no use
+        fills = {k: {c: v for c, v in table.items() if c in kept} for k, table in fills.items()}
+        # only a dataset from the daily source has anything to save; any other leaves the params as they were
+        self.masked_fill = (build_masked_fill(fills, [c for c in feature_columns if c in dropped])
+                            if has_daily_flags(feature_columns) else None)
+        return out, kept
 
     def prepare_data_split(
         self,
@@ -244,6 +334,12 @@ class TSAITrainingService(ITrainingService):
         # The 35% buffer, not the test rows, is what gives out-of-range headroom;
         # transform() clips anything past it.
         split_idx = int(len(df) * train_ratio)
+        # masked cells get the median of the train rows (after the purge of the boundary rows)
+        n_train = purged_train_row_count(split_idx, label_horizon)
+        if n_train <= 0:
+            raise ValueError(f"{split_idx} training rows are too few for a label horizon of {label_horizon}: the purge "
+                             f"of the boundary rows leaves none")
+        [df], feature_columns = self._fill_masked_frames([df], feature_columns, [n_train])
         df_train = df.iloc[:split_idx]
         df_test = df.iloc[split_idx:]
 
@@ -291,10 +387,11 @@ class TSAITrainingService(ITrainingService):
 
         # Per-dataset chronological split, with the boundary purge applied first so
         # the scaler is fitted on exactly the rows that will be trained on.
+        keeps = [purged_train_row_count(int(len(df) * train_ratio), label_horizon) for df in dataframes]
+        dataframes, feature_columns = self._fill_masked_frames(list(dataframes), feature_columns, keeps)
         train_frames, test_frames = [], []
-        for df in dataframes:
+        for df, keep in zip(dataframes, keeps):
             split_idx = int(len(df) * train_ratio)
-            keep = purged_train_row_count(split_idx, label_horizon)
             train_frames.append(df.iloc[:keep])
             test_frames.append(df.iloc[split_idx:])
 
@@ -340,7 +437,7 @@ class TSAITrainingService(ITrainingService):
         target_column: str, feature_columns: List[str],
         timeframe: str = 'daily', seq_len: int = 24,
         prediction_horizon: int = 0, prediction_mode: str = 'shift',
-        label_horizon: int = 0
+        label_horizon: int = 0, common_dates: bool = False, drop_unlabelled_windows: bool = False
     ) -> Dict[str, np.ndarray]:
         """Chronological train / validation / holdout windows, one frame per instrument.
 
@@ -348,13 +445,20 @@ class TSAITrainingService(ITrainingService):
         on its own, so a window never spans two tickers or two blocks. The scaler is fitted on
         the combined TRAINING rows only. Validation drives the GA fitness, the threshold gene
         and the per-epoch validation loss; holdout is only scored and reported.
+
+        ``common_dates`` cuts every frame at the same dates (``data_preparation.frame_bounds``),
+        for the cross-sectional daily targets that compare the tickers of a session.
+        ``drop_unlabelled_windows`` is for a sparse target (see ``prepare_data``): the windows without a label are dropped.
         """
         if not TSAI_AVAILABLE:
             raise RuntimeError("tsai library not available")
 
         blocks = {'train': [], 'val': [], 'holdout': []}
-        for df in dataframes:
-            b = three_way_bounds(len(df), train_ratio, holdout_share_of_test, label_horizon)
+        all_bounds = frame_bounds(dataframes, train_ratio, holdout_share_of_test, label_horizon, common_dates)
+        # masked cells get the median of each ticker's own train rows (the common-date cut gives the same positions)
+        dataframes, feature_columns = self._fill_masked_frames(list(dataframes), feature_columns,
+                                                               [b['train_end'] for b in all_bounds])
+        for df, b in zip(dataframes, all_bounds):
             blocks['train'].append(df.iloc[:b['train_end']])
             blocks['val'].append(df.iloc[b['val_start']:b['val_end']])
             blocks['holdout'].append(df.iloc[b['holdout_start']:])
@@ -374,7 +478,8 @@ class TSAITrainingService(ITrainingService):
             for df in frames:
                 X, y = self.prepare_data(
                     df, target_column, feature_columns, timeframe, seq_len,
-                    prediction_horizon, prediction_mode, fit_scaler=False
+                    prediction_horizon, prediction_mode, fit_scaler=False,
+                    drop_unlabelled_windows=drop_unlabelled_windows
                 )
                 xs.append(X)
                 ys.append(y)
@@ -422,7 +527,7 @@ class TSAITrainingService(ITrainingService):
 
         # Shape: (samples, features, seq_len) for tsai
         X_seq = np.zeros((n_samples, n_features, seq_len), dtype=np.float32)
-        y_seq = np.zeros(n_samples, dtype=np.int64)
+        y_seq = np.zeros(n_samples, dtype=y.dtype)        # int64 labels, or float64 when the target has NaN (sparse)
 
         for i in range(n_samples):
             # Transpose to get (features, seq_len)
@@ -989,7 +1094,10 @@ class TSAITrainingService(ITrainingService):
             Dictionary with normalization params or None if not fitted
         """
         if self.data_prep is not None:
-            return self.data_prep.export_params()
+            params = self.data_prep.export_params()
+            if self.masked_fill is not None:
+                params['masked_fill'] = self.masked_fill     # prediction fills from it and never refits
+            return params
         return None
 
 

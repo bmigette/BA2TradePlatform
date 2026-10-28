@@ -28,9 +28,22 @@ import type {
   CalculatedTarget,
   IndicatorParams,
 } from '../types/targets';
+import {
+  DAILY_HORIZON_CHOICES,
+  DAILY_TARGET_INFO,
+  DAILY_TARGET_TYPES,
+  DEFAULT_DAILY_FORM,
+  buildDailyTarget,
+  dailyTargetLabel,
+  isDailyTarget,
+  toggleHorizon,
+} from '../lib/dailyTargets';
+import type { DailyTargetType } from '../lib/dailyTargets';
 
 type TabType = 'price_based' | 'directional' | 'triple_barrier' | 'trend_reversal' | 'volatility'
-  | 'triple_barrier_atr' | 'direction_terciles' | 'forward_return';
+  | 'triple_barrier_atr' | 'direction_terciles' | 'forward_return' | DailyTargetType;
+
+const isDailyTab = (tab: TabType): tab is DailyTargetType => (DAILY_TARGET_TYPES as readonly string[]).includes(tab);
 
 interface PredictionTargetsPanelProps {
   datasetId: number;
@@ -125,6 +138,10 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
   const [forwardReturnForm, setForwardReturnForm] = useState({
     horizonSessions: 5,
   });
+
+  // Daily feature store targets (alpaca_hist 1d): one shared horizon / horizons form for the six daily tabs
+  const [dailyForm, setDailyForm] = useState(DEFAULT_DAILY_FORM);
+  const [formError, setFormError] = useState<string | null>(null);
 
   // Unique color palette for targets - each target gets a distinct color
   const UNIQUE_COLORS = [
@@ -334,10 +351,26 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
         color = getNextColor();
         break;
 
+      case 'daily_rel_return':
+      case 'daily_quintile':
+      case 'daily_beats':
+      case 'daily_up':
+      case 'daily_volatility':
+      case 'daily_multistep':
+        try {
+          config = buildDailyTarget(activeTab, dailyForm) as TargetConfig;
+        } catch (e) {
+          setFormError(e instanceof Error ? e.message : String(e));
+          return;
+        }
+        color = getNextColor();
+        break;
+
       default:
         return;
     }
 
+    setFormError(null);
     // Add to targets list (will be calculated on preview)
     const newTarget: CalculatedTarget = {
       config,
@@ -349,7 +382,7 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
     };
 
     setTargets([...targets, newTarget]);
-  }, [activeTab, priceBasedForm, directionalForm, tripleBarrierForm, trendReversalForm, volatilityForm, tripleBarrierAtrForm, directionTercilesForm, forwardReturnForm, targets, getNextColor]);
+  }, [activeTab, priceBasedForm, directionalForm, tripleBarrierForm, trendReversalForm, volatilityForm, tripleBarrierAtrForm, directionTercilesForm, forwardReturnForm, dailyForm, targets, getNextColor]);
 
   // Remove target with confirmation
   const removeTarget = useCallback((index: number) => {
@@ -455,6 +488,9 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
         return `Forward return ${c.horizonSessions}s`;
       }
       default:
+        if (isDailyTarget(config as unknown as Record<string, unknown>)) {
+          return dailyTargetLabel(config as unknown as Record<string, unknown>);
+        }
         return 'Unknown';
     }
   };
@@ -462,6 +498,7 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
   // Get stats display for a target
   const getStatsDisplay = (target: CalculatedTarget): string => {
     const { stats, config } = target;
+    if (stats.error) return stats.error;
     if (stats.validRows === 0) return 'Not calculated';
 
     if (config.category === 'binary_classification') {
@@ -483,6 +520,9 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
     { id: 'triple_barrier_atr', label: 'ATR Barrier', icon: <BarChart3 size={16} /> },
     { id: 'direction_terciles', label: 'Direction Terciles', icon: <TrendingUp size={16} /> },
     { id: 'forward_return', label: 'Forward Return', icon: <Activity size={16} /> },
+    ...DAILY_TARGET_TYPES.map((id): { id: TabType; label: string; icon: React.ReactNode } => ({
+      id, label: DAILY_TARGET_INFO[id].tabLabel, icon: DAILY_TARGET_INFO[id].category === 'regression' ? <Activity size={16} /> : <TrendingUp size={16} />,
+    })),
   ];
 
   return (
@@ -513,11 +553,11 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
       </div>
 
       {/* Tabs */}
-      <div className="flex border-b border-gray-200 dark:border-gray-700 mb-4">
+      <div className="flex flex-wrap border-b border-gray-200 dark:border-gray-700 mb-4">
         {tabs.map((tab) => (
           <button
             key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => { setActiveTab(tab.id); setFormError(null); }}
             className={`px-4 py-2 text-sm font-medium flex items-center gap-1.5 border-b-2 transition-colors ${
               activeTab === tab.id
                 ? 'border-purple-500 text-purple-600 dark:text-purple-400'
@@ -943,6 +983,49 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
               Alpaca history cache (1h / 15m).
             </p>
           </div>
+        )}
+
+        {isDailyTab(activeTab) && (
+          <div className="flex flex-wrap items-end gap-4">
+            {activeTab === 'daily_multistep' ? (
+              <div>
+                <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Horizons (sessions)</label>
+                <div className="flex gap-3">
+                  {DAILY_HORIZON_CHOICES.map((h) => (
+                    <label key={h} className="flex items-center gap-1 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={dailyForm.horizons.includes(h)}
+                        onChange={(e) => setDailyForm({ ...dailyForm, horizons: toggleHorizon(dailyForm.horizons, h, e.target.checked) })}
+                      />
+                      {h}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div>
+                <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Horizon (sessions)</label>
+                <select
+                  value={dailyForm.horizonSessions}
+                  onChange={(e) => setDailyForm({ ...dailyForm, horizonSessions: parseInt(e.target.value) })}
+                  className="w-24 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800"
+                >
+                  {DAILY_HORIZON_CHOICES.map((h) => (
+                    <option key={h} value={h}>{h}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              {DAILY_TARGET_INFO[activeTab].hint} The decision is taken at a session's close and filled at the next open.
+              Needs a dataset from the Alpaca history cache's daily feature store (1d).
+            </p>
+          </div>
+        )}
+
+        {formError && (
+          <p className="mt-3 text-sm text-red-600 dark:text-red-400">{formError}</p>
         )}
 
         <button

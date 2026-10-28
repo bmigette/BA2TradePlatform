@@ -1231,7 +1231,8 @@ class PredictionTargetService:
             resample_ohlcv_to_timeframe,
             align_higher_timeframe_to_lower
         )
-        from app.services.ml_wizard_targets import WIZARD_TARGET_TYPES, build_wizard_target
+        from app.services.ml_wizard_targets import (
+            CROSS_SECTIONAL_DAILY_TYPES, DAILY_TARGET_TYPES, WIZARD_TARGET_TYPES, build_daily_target, build_wizard_target)
 
         results = []
         df = df.copy().sort_values('Date').reset_index(drop=True)
@@ -1352,6 +1353,18 @@ class PredictionTargetService:
                     else:
                         category = 'multiclass_classification'
                         profit_class, stop_class, timeout_class = 2, 0, 1
+
+                elif target_type in DAILY_TARGET_TYPES:
+                    if use_multi_timeframe:
+                        raise ValueError(f"{target_type} is computed on the dataset timeframe only")
+                    if target_type in CROSS_SECTIONAL_DAILY_TYPES:
+                        raise ValueError(
+                            f"{target_type} compares each ticker with the other tickers of the same session: it is "
+                            f"computed across the job's tickers when the job runs, so a single dataset cannot preview it")
+                    # a multistep target previews its first horizon
+                    series, col_name, _ = build_daily_target(
+                        working_df, config, train_ratio, effective_timeframe, panel_source)[0]
+                    category = 'regression' if target_type == 'daily_volatility' else 'binary_classification'
 
                 elif target_type == 'volatility':
                     horizon_value = config.get('horizon')
