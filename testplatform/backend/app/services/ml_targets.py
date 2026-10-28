@@ -16,6 +16,12 @@ Every target uses three ordered classes, so one store row format serves all of t
 
 Thresholds (k, terciles) are fitted on the training fold only. A fold whose smallest class share is below
 ``MIN_CLASS_SHARE`` is refused (``TargetBalanceError``), never rebalanced.
+
+DAILY rows (ML exploration v2, the "daily rows" section at the end): the daily expert decides at session S's close
+and trades at S+1's OPEN, so a decision's outcome is open(S+1) -> close(S+H). ``daily_targets`` builds the selection
+(session-relative) and timing (per instrument) targets for a whole daily panel indexed [symbol, session];
+``fit_daily_target`` fits the fold-dependent ones (terciles, barrier k) on the training rows only and reuses
+``fit_target``; ``check_balance`` gains an explicit ``min_count`` mode for class-weighted models.
 """
 from __future__ import annotations
 
@@ -31,6 +37,9 @@ TARGET_KINDS: Tuple[str, ...] = ("triple_barrier", "direction", "forward_return"
 #: two-class targets: labels 0 (down / not the take-profit) and 2 (up / take-profit first); class 1 is never used
 BINARY_KINDS: Tuple[str, ...] = ("binary_direction", "binary_barrier")
 MIN_CLASS_SHARE = 0.15
+#: ``check_balance(mode="min_count")``: a fold with fewer examples than this in any used class is refused
+MIN_CLASS_COUNT = 50
+BALANCE_MODES: Tuple[str, ...] = ("share", "min_count")
 K_GRID: Tuple[float, ...] = tuple(np.round(np.arange(0.25, 6.01, 0.25), 2))
 CLASS_NAMES = {"triple_barrier": ("loss", "timeout", "win"), "direction": ("down", "flat", "up"),
                "binary_direction": ("down", "-", "up"), "binary_barrier": ("no take-profit", "-", "take-profit first")}
@@ -288,16 +297,330 @@ def class_shares(labels: np.ndarray, rows: np.ndarray) -> List[float]:
     return [float((lab == c).mean()) for c in (0, 1, 2)]
 
 
-def check_balance(spec: TargetSpec, fold_name: str, shares_by_part: Dict[str, Sequence[float]]) -> None:
-    """Refuse a classification fold whose smallest class (train or prediction part) is below MIN_CLASS_SHARE."""
+def class_counts(labels: np.ndarray, rows: np.ndarray) -> List[int]:
+    """Number of labelled rows of each class (0 / 1 / 2) among ``rows``."""
+    lab = labels[rows]
+    lab = lab[~np.isnan(lab)]
+    return [int((lab == c).sum()) for c in (0, 1, 2)]
+
+
+def check_balance(spec: TargetSpec, fold_name: str, shares_by_part: Optional[Dict[str, Sequence[float]]] = None, *,
+                  mode: str = "share", counts_by_part: Optional[Dict[str, Sequence[int]]] = None,
+                  min_count: int = MIN_CLASS_COUNT) -> None:
+    """Refuse a classification fold with a class that is too small, in one of two explicit modes:
+
+    * ``mode="share"`` (default; ``shares_by_part``): the smallest class (train or prediction part) is below
+      MIN_CLASS_SHARE;
+    * ``mode="min_count"`` (``counts_by_part``, from ``class_counts``): some used class has fewer than ``min_count``
+      examples. For class-weighted models, where imbalance is handled by the weights and only a class too small to
+      learn from is a reason to refuse.
+
+    A two-class target ignores class 1 in both modes."""
+    if mode not in BALANCE_MODES:
+        raise ValueError(f"check_balance mode must be one of {BALANCE_MODES}, got {mode!r}")
+    if mode == "share":
+        if shares_by_part is None:
+            raise ValueError("check_balance(mode='share') needs shares_by_part")
+        if counts_by_part is not None:
+            raise ValueError("check_balance(mode='share') does not take counts_by_part; use mode='min_count'")
+    else:
+        if counts_by_part is None:
+            raise ValueError("check_balance(mode='min_count') needs counts_by_part")
+        if shares_by_part is not None:
+            raise ValueError("check_balance(mode='min_count') does not take shares_by_part; use mode='share'")
+        if min_count <= 0:
+            raise ValueError("min_count must be > 0")
     if not spec.is_classification:
+        return
+    names = CLASS_NAMES[spec.kind]
+    if mode == "min_count":
+        for part, cnt in counts_by_part.items():
+            used = [0, 2] if spec.is_binary else [0, 1, 2]
+            small = [c for c in used if cnt[c] < min_count]
+            if small:
+                raise TargetBalanceError(
+                    f"{spec.kind} h={spec.horizon} ratio={spec.ratio:g} fold {fold_name} {part}: class "
+                    f"{names[small[0]]} has {int(cnt[small[0]])} examples < {min_count} "
+                    f"(counts {', '.join(f'{names[c]}={int(cnt[c])}' for c in used)})")
         return
     for part, sh in shares_by_part.items():
         if spec.is_binary:
             sh = [sh[0], 1.0, sh[2]]          # class 1 is unused by a two-class target
         if min(sh) < MIN_CLASS_SHARE:
-            names = CLASS_NAMES[spec.kind]
             raise TargetBalanceError(
                 f"{spec.kind} h={spec.horizon} ratio={spec.ratio:g} fold {fold_name} {part}: smallest class "
                 f"{names[int(np.argmin(sh))]} = {min(sh):.1%} < {MIN_CLASS_SHARE:.0%} "
                 f"(shares {', '.join(f'{n}={s:.1%}' for n, s in zip(names, sh))})")
+
+
+# ================================================================== daily rows (ML exploration v2)
+#: horizons (sessions) of the daily exploration
+DAILY_HORIZONS: Tuple[int, ...] = (1, 3, 5, 10, 20)
+#: selection track: relevance buckets of a session's relative returns (lambdarank); the quintile target is always 5
+RANK_BUCKETS = 5
+#: a session with fewer universe members holding a value has no relative return
+MIN_SESSION_MEMBERS = 5
+DAILY_ATR_WINDOW = 14
+DAILY_COLUMNS: Tuple[str, ...] = ("open", "high", "low", "close", "listed", "filled")
+
+
+@dataclass
+class _DailyArrays:
+    """The panel as (sessions x symbols) arrays. ``tradable`` = listed, not filled, not ended: a session whose bar is
+    a real print."""
+    sessions: pd.DatetimeIndex
+    symbols: List[str]
+    open: np.ndarray
+    high: np.ndarray
+    low: np.ndarray
+    close: np.ndarray
+    tradable: np.ndarray
+    atr: np.ndarray             # Wilder ATR14 THROUGH session S, price units (known at S's close); NaN when not alive
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return self.close.shape
+
+
+def _ahead(a: np.ndarray, k: int) -> np.ndarray:
+    """``out[t] = a[t + k]`` along the sessions axis; NaN (or False) past the end."""
+    out = np.full(a.shape, np.nan if a.dtype.kind == "f" else False, dtype=a.dtype)
+    if k < a.shape[0]:
+        out[:a.shape[0] - k] = a[k:]
+    return out
+
+
+def _daily_arrays(bars: Dict[str, pd.DataFrame]) -> _DailyArrays:
+    from app.services.ml_panel import true_range, wilder
+    if not bars:
+        raise ValueError("bars is empty")
+    symbols = list(bars)
+    index = bars[symbols[0]].index
+    if not isinstance(index, pd.DatetimeIndex) or index.tz is not None:
+        raise TypeError("daily bars must be indexed by naive session timestamps (ml_features.load_daily output)")
+    if not index.is_monotonic_increasing or not index.is_unique:
+        raise ValueError("daily bars: the session index must be strictly increasing")
+    cols: Dict[str, List[np.ndarray]] = {c: [] for c in ("open", "high", "low", "close", "tradable", "atr")}
+    for sym in symbols:
+        d = bars[sym]
+        missing = [c for c in DAILY_COLUMNS if c not in d.columns]
+        if missing:
+            raise ValueError(f"{sym}: daily bars lack columns {missing}")
+        if not d.index.equals(index):
+            raise ValueError(f"{sym}: session index differs from {symbols[0]}'s; every symbol needs the same sessions")
+        listed = d["listed"].to_numpy(dtype=bool)
+        filled = d["filled"].to_numpy(dtype=bool)
+        ended = d["ended"].to_numpy(dtype=bool) if "ended" in d.columns else np.zeros(len(d), dtype=bool)
+        alive = listed & ~ended
+        h, l, c = (d[x].astype(float) for x in ("high", "low", "close"))
+        atr = wilder(true_range(h, l, c), DAILY_ATR_WINDOW).to_numpy().copy()
+        atr[~alive] = np.nan
+        for name, vals in (("open", d["open"].astype(float).to_numpy()), ("high", h.to_numpy()), ("low", l.to_numpy()),
+                           ("close", c.to_numpy()), ("tradable", alive & ~filled), ("atr", atr)):
+            cols[name].append(vals)
+    arr = {k: np.stack(v, axis=1) for k, v in cols.items()}
+    return _DailyArrays(index, symbols, arr["open"], arr["high"], arr["low"], arr["close"], arr["tradable"],
+                        arr["atr"])
+
+
+def _check_horizons(horizons: Sequence[int]) -> Tuple[int, ...]:
+    hs = tuple(int(h) for h in horizons)
+    if not hs or any(h <= 0 for h in hs) or len(set(hs)) != len(hs):
+        raise ValueError(f"horizons must be distinct positive session counts, got {tuple(horizons)}")
+    return hs
+
+
+def _entry_exit_returns(a: _DailyArrays, horizon: int) -> Tuple[np.ndarray, np.ndarray]:
+    """(entry, ret): entry = open(S+1); ret = close(S+H) / entry - 1, NaN unless S+1 AND S+H are real prints."""
+    entry = _ahead(np.where(a.tradable, a.open, np.nan), 1)
+    exit_ = _ahead(np.where(a.tradable, a.close, np.nan), horizon)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ret = np.where(entry > 0, exit_ / entry - 1.0, np.nan)
+    return entry, ret
+
+
+def _membership(universe: Optional[pd.DataFrame], a: _DailyArrays) -> np.ndarray:
+    if universe is None:
+        return np.ones(a.shape, dtype=bool)
+    gone_s = a.sessions.difference(universe.index)
+    gone_c = [s for s in a.symbols if s not in universe.columns]
+    if len(gone_s):
+        raise ValueError(f"universe has no row for {len(gone_s)} panel sessions, first {gone_s[0].date()}")
+    if gone_c:
+        raise ValueError(f"universe has no column for panel symbols {gone_c[:5]}")
+    m = universe.reindex(index=a.sessions, columns=a.symbols)
+    if m.isna().any().any():
+        raise ValueError("universe membership holds NaN")
+    return m.to_numpy(dtype=bool)
+
+
+def _buckets(rel: np.ndarray, n_buckets: int) -> np.ndarray:
+    """Quantile bucket 0..n_buckets-1 of each value within its row (session); ties share their average rank. NaN
+    where ``rel`` is NaN."""
+    ranks = pd.DataFrame(rel).rank(axis=1, method="average").to_numpy()
+    n = np.sum(~np.isnan(rel), axis=1, keepdims=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        b = np.floor((ranks - 1.0) / n * n_buckets)
+    return np.where(np.isnan(rel), np.nan, np.clip(b, 0, n_buckets - 1))
+
+
+def _flat(x: np.ndarray) -> np.ndarray:
+    """(sessions x symbols) -> symbol-major flat rows, the row order of ``daily_targets``."""
+    return np.ascontiguousarray(x.T).reshape(-1)
+
+
+def daily_targets(bars: Dict[str, pd.DataFrame], horizons: Sequence[int] = DAILY_HORIZONS,
+                  universe: Optional[pd.DataFrame] = None, n_buckets: int = RANK_BUCKETS) -> pd.DataFrame:
+    """Selection and timing targets of every (symbol, session) decision of a daily panel.
+
+    ``bars``: symbol -> daily OHLCV frame on one shared session index (``ml_features.load_daily`` output: open, high,
+    low, close, volume, listed, filled and optionally ended). The expert decides at session S's close and trades at
+    S+1's OPEN, so every outcome runs from open(S+1) to the close of S+H. A target is NaN unless both S+1 and S+H
+    are real prints (listed, not filled, not ended), and past the data end.
+
+    ``universe``: membership (sessions x symbols, bool); None = every symbol, always. A symbol outside the universe
+    on S has no relative target that session (``rel_ret_H`` and everything derived from it are NaN) but keeps its
+    timing targets.
+
+    Returns a frame indexed [symbol, session] (symbols in input order, sessions ascending) with, per horizon H:
+
+    * ``ret_H``: close(S+H) / open(S+1) - 1;   ``vol_H``: ATR14% x sqrt(H), the volatility unit. ATR14% is the Wilder
+      ATR of the sessions up to and including S over S's close (what the feature store's ``t_atr_pct`` holds), so it
+      is known at the decision; ``atr_pct`` is its H-free part;
+    * selection: ``rel_ret_H`` = ret_H minus its mean over the session's universe members (NaN when fewer than
+      MIN_SESSION_MEMBERS members have a value); ``quintile_H`` 1 = top fifth / 0 = bottom fifth / NaN otherwise;
+      ``beats_H`` = rel_ret_H > 0; ``rank_rel_H`` = quantile bucket 0..n_buckets-1 of rel_ret_H within the session
+      (lambdarank relevance; a float column holding integers); ``session_group`` = session ordinal (the lambdarank
+      group; see ``rank_groups``);
+    * timing: ``up_H`` = ret_H > 0; ``z_H`` = ret_H / vol_H clipped at +-REGRESSION_CLIP; the fold-fitted targets
+      (terciles, barriers) come from ``fit_daily_target``;
+    * ``realvol_H``: std (ddof 1) of the daily log returns of sessions S+1..S+H (NaN for H = 1: one return has no
+      spread); ``target_end_H``: the session S+H (NaT past the data end), for the purge."""
+    hs = _check_horizons(horizons)
+    if n_buckets < 2:
+        raise ValueError("n_buckets must be >= 2")
+    a = _daily_arrays(bars)
+    member = _membership(universe, a)
+    T, N = a.shape
+    with np.errstate(divide="ignore", invalid="ignore"):
+        atr_pct = np.where(a.atr > 0, a.atr / a.close, np.nan)
+        log_ret = pd.DataFrame(np.log(a.close)).diff()
+    cols: Dict[str, np.ndarray] = {"atr_pct": _flat(atr_pct)}
+    cols["session_group"] = _flat(np.repeat(np.arange(T)[:, None], N, axis=1)).astype(np.int64)
+    sess_ns = a.sessions.to_numpy("datetime64[ns]")
+    for h in hs:
+        _, ret = _entry_exit_returns(a, h)
+        vol = atr_pct * np.sqrt(h)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            z = np.where(vol > 0, np.clip(ret / vol, -REGRESSION_CLIP, REGRESSION_CLIP), np.nan)
+        vals = np.where(member, ret, np.nan)
+        n_val = np.sum(~np.isnan(vals), axis=1)
+        mean = np.where(n_val > 0, np.nansum(vals, axis=1) / np.maximum(n_val, 1), np.nan)
+        rel = vals - mean[:, None]
+        rel[n_val < MIN_SESSION_MEMBERS, :] = np.nan
+        top = _buckets(rel, 5)
+        rv = log_ret.rolling(h, min_periods=h).std().to_numpy()      # window ending at t = returns of t-h+1..t
+        realvol = np.where(np.isnan(ret), np.nan, _ahead(rv, h))
+        end = np.full(T, np.datetime64("NaT"), dtype="datetime64[ns]")
+        if h < T:
+            end[:T - h] = sess_ns[h:]
+        cols[f"ret_{h}"] = _flat(ret)
+        cols[f"vol_{h}"] = _flat(vol)
+        cols[f"rel_ret_{h}"] = _flat(rel)
+        cols[f"quintile_{h}"] = _flat(np.where(top == 4, 1.0, np.where(top == 0, 0.0, np.nan)))
+        cols[f"beats_{h}"] = _flat(np.where(np.isnan(rel), np.nan, (rel > 0).astype(float)))
+        cols[f"rank_rel_{h}"] = _flat(_buckets(rel, n_buckets))
+        cols[f"realvol_{h}"] = _flat(realvol)
+        cols[f"target_end_{h}"] = np.tile(end, N)
+        cols[f"up_{h}"] = _flat(np.where(np.isnan(ret), np.nan, (ret > 0).astype(float)))
+        cols[f"z_{h}"] = _flat(z)
+    idx = pd.MultiIndex.from_product([a.symbols, a.sessions], names=["symbol", "session"])
+    return pd.DataFrame(cols, index=idx)
+
+
+def rank_groups(df: pd.DataFrame, horizon: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Lambdarank input of ``daily_targets`` rows: (row positions sorted by session, relevance labels (int), group
+    sizes). Only rows with a ``rank_rel_H`` are kept; groups are the sessions in ascending order."""
+    rel = df[f"rank_rel_{horizon}"].to_numpy()
+    rows = np.flatnonzero(~np.isnan(rel))
+    grp = df["session_group"].to_numpy()
+    order = rows[np.argsort(grp[rows], kind="stable")]
+    _, sizes = np.unique(grp[order], return_counts=True)
+    return order, rel[order].astype(np.int64), sizes
+
+
+def daily_excursions(bars: Dict[str, pd.DataFrame], horizon: int) -> Tuple[np.ndarray, np.ndarray]:
+    """The daily barrier paths, rows aligned with ``daily_targets(bars, ...)``: ``up[i, j]`` = (max high of sessions
+    S+1..S+1+j - open(S+1)) / ATR14(S), ``dn[i, j]`` = (open(S+1) - min low of S+1..S+1+j) / ATR14(S), j = 0..H-1
+    (the path starts at the ENTRY open and ends with S+H's bar). NaN rows: S+1 or S+H not a real print, or no ATR."""
+    h = _check_horizons([horizon])[0]
+    a = _daily_arrays(bars)
+    T, N = a.shape
+    entry, ret = _entry_exit_returns(a, h)
+    ok = ~np.isnan(ret) & (a.atr > 0)
+    up = np.full((N, T, h), np.nan, dtype=np.float32)
+    dn = np.full((N, T, h), np.nan, dtype=np.float32)
+    hi_run = np.full((T, N), -np.inf)
+    lo_run = np.full((T, N), np.inf)
+    for j in range(h):
+        hi_run = np.maximum(hi_run, _ahead(a.high, 1 + j))
+        lo_run = np.minimum(lo_run, _ahead(a.low, 1 + j))
+        up[:, :, j] = np.where(ok, (hi_run - entry) / a.atr, np.nan).T
+        dn[:, :, j] = np.where(ok, (entry - lo_run) / a.atr, np.nan).T
+    return up.reshape(N * T, h), dn.reshape(N * T, h)
+
+
+def multistep_matrix(df: pd.DataFrame, horizons: Sequence[int] = DAILY_HORIZONS) -> np.ndarray:
+    """(n, len(horizons)) float array of ``up_H`` (NaN = no outcome), the target of one multi-output model."""
+    hs = _check_horizons(horizons)
+    missing = [f"up_{h}" for h in hs if f"up_{h}" not in df.columns]
+    if missing:
+        raise KeyError(f"daily targets lack {missing}")
+    return df[[f"up_{h}" for h in hs]].to_numpy(dtype=np.float64)
+
+
+def daily_fold_rows(df: pd.DataFrame, fold: Fold, horizon: int) -> Tuple[np.ndarray, np.ndarray]:
+    """(train, pred) row positions in a ``daily_targets`` frame. A training row's target session ``target_end_H``
+    must lie BEFORE the prediction block (the purge gap of one horizon) and the row must have an outcome; prediction
+    rows are every session of the block."""
+    day = df.index.get_level_values("session").normalize()
+    tgt = pd.DatetimeIndex(df[f"target_end_{horizon}"])
+    t0, p0, p1 = (pd.Timestamp(d) for d in (fold.train_start, fold.pred_start, fold.pred_end))
+    train = (day >= t0) & (day < p0) & ~tgt.isna() & (tgt < p0) & ~np.isnan(df[f"ret_{horizon}"].to_numpy())
+    pred = (day >= p0) & (day <= p1)
+    return np.flatnonzero(train), np.flatnonzero(pred)
+
+
+def fit_daily_target(df: pd.DataFrame, spec: TargetSpec, train_mask: np.ndarray,
+                     excursions: Optional[Tuple[np.ndarray, np.ndarray]] = None) -> FoldTarget:
+    """``fit_target`` for ``daily_targets`` rows: terciles and the barrier k are fitted ONLY on the rows of
+    ``train_mask`` (bool, one per row); labels are returned for every row.
+
+    The barrier kinds need ``excursions`` = ``daily_excursions(bars, horizon)`` (rows aligned with ``df``). Labels
+    use the ml_targets classes (0 / 1 / 2; the two-class kinds 0 / 2); ``regression`` is ``z_H`` and
+    ``forward_return`` is ``ret_H``."""
+    h = spec.horizon
+    mask = np.asarray(train_mask)
+    if mask.dtype != bool or mask.shape != (len(df),):
+        raise ValueError(f"train_mask must be a bool array of {len(df)} rows, got {mask.dtype} {mask.shape}")
+    for c in (f"ret_{h}", f"z_{h}", "atr_pct"):
+        if c not in df.columns:
+            raise KeyError(f"daily targets lack {c}; build them with horizon {h}")
+    ret = df[f"ret_{h}"].to_numpy(dtype=np.float64)
+    if spec.kind == "forward_return":
+        return FoldTarget(spec, ret, {}, None)
+    if spec.kind == "regression":
+        return FoldTarget(spec, df[f"z_{h}"].to_numpy(dtype=np.float64),
+                          {"vol_unit": "daily ATR% x sqrt(N)", "clip": REGRESSION_CLIP}, None)
+    train_rows = np.flatnonzero(mask & np.isfinite(ret))
+    if not len(train_rows):
+        raise TargetBalanceError(f"{spec.kind} h={h}: no training row has an outcome")
+    if spec.kind == "binary_direction" and not ((ret[train_rows] > 0).any() and (ret[train_rows] <= 0).any()):
+        raise TargetBalanceError(f"binary_direction h={h}: the training rows hold a single class")
+    panel = pd.DataFrame({f"fwd_ret_{h}": ret, "atr_d": df["atr_pct"].to_numpy(dtype=np.float64), "close": 1.0})
+    if spec.kind in ("triple_barrier", "binary_barrier"):
+        if excursions is None:
+            raise ValueError(f"{spec.kind} needs excursions=daily_excursions(bars, {h})")
+        if len(excursions[0]) != len(df) or excursions[0].shape[1] != h:
+            raise ValueError(f"excursions {excursions[0].shape} do not match {len(df)} rows x horizon {h}")
+    return fit_target(panel, spec, train_rows, excursions)
