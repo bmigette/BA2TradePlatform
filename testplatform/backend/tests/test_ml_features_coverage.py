@@ -107,3 +107,11 @@ def test_unknown_group_raises_and_missing_columns_are_reported():
         F.coverage_report(df, ["nope"])
     with pytest.raises(ValueError, match="no columns"):
         F.coverage_report(df, ["mtf"])                                              # none of its columns in the frame
+
+
+def test_columns_that_are_nan_by_design_do_not_define_coverage():
+    """m_rs_sector_* is NaN for a sectorless symbol or before a sector ETF lists; mac_baa10y_* has a reviewed stall."""
+    m = F.GROUPS["m"].coverage_columns
+    assert "m_breadth_sma50" in m and "m_rs_spy_20" in m and not any(c.startswith("m_rs_sector") for c in m)
+    mac = F.GROUPS["mac"].coverage_columns
+    assert "mac_vixcls_lvl" in mac and not any(c.startswith("mac_baa10y") for c in mac) and len(mac) == len(F.MAC_COLUMNS) - 3

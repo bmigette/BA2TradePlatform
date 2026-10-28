@@ -160,3 +160,12 @@ def test_the_launcher_command_builds_the_store(work, tmp_path, monkeypatch):
                    "--groups", "t,mtf", "--out", str(out), "--chunk-size", "1"])
     assert rc == 0 and (out / "features.parquet").exists()
     assert _meta(out)["symbols"] == ["AAA", "BBB"] and set(_meta(out)["groups"]) == {"t", "mtf"}
+
+
+def test_a_changed_coverage_definition_rebuilds_the_report(work, tmp_path, monkeypatch):
+    out = tmp_path / "store"
+    _ensure(work, out)
+    assert _ensure(work, out)["status"] == "up_to_date"
+    import dataclasses
+    monkeypatch.setitem(F.GROUPS, "t", dataclasses.replace(F.GROUPS["t"], coverage_columns=("t_ret_1",)))
+    assert _ensure(work, out)["status"] == "built"

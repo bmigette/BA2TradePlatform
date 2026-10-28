@@ -1433,9 +1433,11 @@ def structure(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame
 GROUPS: Dict[str, GroupSpec] = {
     "t": GroupSpec(technical, "t_"),
     "mtf": GroupSpec(multi_timeframe, "mtf_"),
-    "m": GroupSpec(market, "m_", needs_sector=True, required_context=_market_context),
+    "m": GroupSpec(market, "m_", needs_sector=True, required_context=_market_context,
+                   coverage_columns=tuple(c for c in M_COLUMNS if not c.startswith("m_rs_sector"))),
     "x": GroupSpec(cross_section, "x_"),
-    "mac": GroupSpec(macro, "mac_"),
+    "mac": GroupSpec(macro, "mac_", coverage_columns=tuple(
+        c for c in MAC_COLUMNS if not any(c.startswith(f"mac_{sid.lower()}_") for sid in KNOWN_STALLS))),
     "f": GroupSpec(fundamentals, "f_"),
     "a": GroupSpec(analysts, "a_", coverage_columns=("a_net_upgrades_30", "a_net_upgrades_90", "a_n_grades_90",
                                                        "a_n_analysts_90")),
@@ -1856,7 +1858,8 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
         required |= set(_spec(g).required_context(usable_rows, resolved))
     load = list(dict.fromkeys(usable_rows + uni + sorted(required)))
     inputs = json.loads(json.dumps({
-        "version": ENSURE_VERSION, "groups": groups, "symbols": usable_rows, "universe": uni, "first": str(first),
+        "version": ENSURE_VERSION, "groups": groups,
+        "coverage_columns": {g: _spec(g).coverage_columns for g in groups}, "symbols": usable_rows, "universe": uni, "first": str(first),
         "last": str(last), "membership": None if members is None else _membership_digest(members), "sectors": resolved,
         "fingerprints": _input_fingerprints(load, usable_rows, groups, cache_root, store_path)}, sort_keys=True))
     meta_path = Path(str(out_dir / "features.parquet") + ".meta.json")
