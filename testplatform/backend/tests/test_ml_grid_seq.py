@@ -646,3 +646,184 @@ def test_a_gpu_block_runs_with_deterministic_cudnn(world, tmp_path):
     grun([tsai_cell(world)], tmp_path / "o", world)
     assert torch.backends.cudnn.deterministic is True and torch.backends.cudnn.benchmark is False
     assert torch.are_deterministic_algorithms_enabled() and os.environ["CUBLAS_WORKSPACE_CONFIG"]
+
+
+# ================================================================== review round 3: a multi-day GPU run
+class _Exited(BaseException):
+    def __init__(self, code):
+        self.code = code
+
+
+def _worker_task(world, tmp_path, cell_cfg=None, settings=None, seed=1):
+    """Initialise this process as a grid worker and run one task through ``_run_task`` (as a pool worker would)."""
+    st = settings or _gsettings()
+    c = G.validate_cell(cell_cfg or tsai_cell(world))
+    G._init_worker(st.to_dict(), str(world[2]), str(tmp_path), 1)
+    G._WORKER["poisoned"] = False
+    return c, (lambda: G._run_task(c.config(with_seeds=True), seed, c.key))
+
+
+def _failing_fit(monkeypatch, exc):
+    def boom(self, *a, **k):
+        raise exc
+    monkeypatch.setattr(MS.TsaiAdapter, "fit", boom)
+
+
+# ---- 1. cleanup after a failure
+def test_the_gpu_worker_cleans_up_after_the_exception_has_left_its_except_block(world, tmp_path, monkeypatch):
+    import sys
+    seen = []
+    monkeypatch.setattr(S, "cleanup_gpu", lambda: seen.append(sys.exc_info()[0]))
+    _failing_fit(monkeypatch, RuntimeError("boom"))
+    c, run_task = _worker_task(world, tmp_path)
+    rec = run_task()
+    assert "error" in rec and "boom" in rec["error"]
+    assert seen == [None]                                    # called once, with no exception (and so no traceback) alive
+    seen.clear()
+    cc, run_ok = _worker_task(world, tmp_path, lgbm_cell(world))
+    assert "error" not in run_ok() and seen == []            # a tabular task does not touch the GPU
+
+
+def test_cleanup_gpu_collects_and_empties_the_cuda_cache(monkeypatch):
+    import torch
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty"))
+    import gc
+    monkeypatch.setattr(gc, "collect", lambda *a: calls.append("gc") or 0)
+    S.cleanup_gpu()
+    assert calls == ["gc", "empty"]
+
+
+def test_a_failing_release_never_masks_the_fit_error(world, tmp_path, monkeypatch):
+    _failing_fit(monkeypatch, RuntimeError("fit failed"))
+    monkeypatch.setattr(MS._SequenceAdapter, "release", lambda self: (_ for _ in ()).throw(RuntimeError("release failed")))
+    c, run_task = _worker_task(world, tmp_path)
+    rec = run_task()
+    assert "fit failed" in rec["error"] and "release failed" not in rec["error"]
+
+
+def test_a_failing_release_after_a_good_fit_costs_nothing(world, tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(MS._SequenceAdapter, "release", lambda self: (_ for _ in ()).throw(RuntimeError("release failed")))
+    out = tmp_path / "o"
+    with caplog.at_level("WARNING"):
+        res = grun([tsai_cell(world)], out, world)
+    assert res["done"] == 1 and res["errors"] == 0
+    assert any("releasing" in r.getMessage() and r.exc_info and "release failed" in str(r.exc_info[1])
+               for r in caplog.records)
+
+
+# ---- 2. sticky CUDA errors
+def test_cuda_errors_are_classified_as_recoverable_or_sticky():
+    import torch
+    assert S.classify_gpu_error(torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 2 GiB")) == "oom"
+    assert S.classify_gpu_error(RuntimeError("CUDA out of memory. Tried to allocate 2 GiB")) == "oom"
+    for text in ("CUDA error: an illegal memory access was encountered", "cuDNN error: CUDNN_STATUS_EXECUTION_FAILED",
+                 "CUBLAS_STATUS_ALLOC_FAILED when calling cublasCreate", "device-side assert triggered"):
+        assert S.classify_gpu_error(RuntimeError(text)) == "sticky", text
+    assert S.classify_gpu_error(ValueError("the validation loss was never finite")) is None
+    assert S.classify_gpu_error(KeyError("x")) is None
+    try:                                                      # a sticky error behind a wrapper is found in the chain
+        try:
+            raise RuntimeError("CUDA error: unspecified launch failure")
+        except RuntimeError as inner:
+            raise ValueError("fit failed") from inner
+    except ValueError as outer:
+        assert S.classify_gpu_error(outer) == "sticky"
+
+
+def test_a_sticky_cuda_error_poisons_the_worker_and_its_next_task_exits(world, tmp_path, monkeypatch):
+    _failing_fit(monkeypatch, RuntimeError("CUDA error: device-side assert triggered"))
+    c, run_task = _worker_task(world, tmp_path)
+    rec = run_task()
+    assert rec["cuda_error"] == "sticky" and G._WORKER["poisoned"] is True
+    monkeypatch.setattr(G.os, "_exit", lambda code: (_ for _ in ()).throw(_Exited(code)))
+    ran = []
+    monkeypatch.setattr(G, "run_cell_seed", lambda *a, **k: ran.append(1))
+    with pytest.raises(_Exited) as e:
+        run_task()
+    assert e.value.code == 1 and not ran                       # it left before touching the task
+
+
+def test_an_out_of_memory_error_is_recoverable(world, tmp_path, monkeypatch):
+    import torch
+    _failing_fit(monkeypatch, torch.cuda.OutOfMemoryError("CUDA out of memory"))
+    c, run_task = _worker_task(world, tmp_path)
+    rec = run_task()
+    assert rec["cuda_error"] == "oom" and G._WORKER["poisoned"] is False
+
+
+def test_an_ordinary_error_carries_no_cuda_flag(world, tmp_path, monkeypatch):
+    _failing_fit(monkeypatch, ValueError("plain"))
+    c, run_task = _worker_task(world, tmp_path)
+    rec = run_task()
+    assert "cuda_error" not in rec and G._WORKER["poisoned"] is False
+
+
+def _err(key, seed, cuda=None):
+    r = G._error_record(key, seed, "boom", "l")
+    if cuda:
+        r["cuda_error"] = cuda
+    return r
+
+
+def test_the_breaker_trips_after_ten_consecutive_cuda_errors_and_a_success_resets_it():
+    b = G.GpuBreaker(10)
+    assert not any(b.record(_err("k", i, "sticky")) for i in range(9))
+    assert b.record({"cell_key": "k", "seed": 1, "primary": {}}) is False          # a good row resets the count
+    assert not any(b.record(_err("k", i, "oom")) for i in range(9))
+    assert b.record(_err("k", 99, "oom")) is True and b.tripped
+    b3 = G.GpuBreaker(3)
+    b3.record(_err("k", 1, "oom"))
+    b3.record(_err("k", 2))                                    # an ordinary error neither counts nor resets
+    b3.record(_err("k", 3, "oom"))
+    assert b3.record(_err("k", 4, "oom")) is True
+
+
+def _cells(world):
+    return ([(G.validate_cell(lgbm_cell(world)), 1)], [(G.validate_cell(tsai_cell(world)), 1)])
+
+
+def test_the_gpu_lane_is_aborted_loudly_after_ten_consecutive_cuda_errors_and_the_cpu_lane_goes_on(world, monkeypatch,
+                                                                                                    caplog):
+    cpu_t, gpu_t = _cells(world)
+    fed = {"gpu": 0, "cpu": 0}
+
+    def drive(tasks, slots, init_args, task_fn, finish, cancelled, summary, *a, **k):
+        name = "gpu" if tasks[0][0].pool == "gpu" else "cpu"
+        if name == "cpu":
+            for i in range(3):
+                finish({"cell_key": "c", "seed": i, "primary": {"name": "x", "value": 1.0}})
+                fed["cpu"] += 1
+            return
+        while not cancelled() and fed["gpu"] < 50:
+            finish(_err("g", fed["gpu"], "sticky"))
+            fed["gpu"] += 1
+    monkeypatch.setattr(G, "_drive_pool", drive)
+    rows = []
+    summary = {"pool_rebuilds": 0, "cancelled": False}
+    with caplog.at_level("ERROR"):
+        G._drive_lanes(cpu_t, gpu_t, 1, 1, (), None, rows.append, lambda: False, summary)
+    assert fed["gpu"] == 10 and fed["cpu"] == 3                                  # stopped right at the tenth
+    assert summary["gpu_lane_aborted"] is True and summary["cancelled"] is False
+    assert any("GPU lane" in r.getMessage() and "10" in r.getMessage() for r in caplog.records)
+    assert len(rows) == 13
+
+
+# ---- 3. no silent CPU
+def test_device_auto_without_cuda_in_a_gpu_worker_is_an_error_not_a_cpu_run(world, tmp_path, monkeypatch):
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    p = {k: v for k, v in TINY_NET.items() if k != "device"}                    # device defaults to "auto"
+    c, run_task = _worker_task(world, tmp_path, tsai_cell(world, params=p))
+    rec = run_task()
+    assert "error" in rec and "CUDA is not available" in rec["error"] and "device" in rec["error"]
+    c2, run_task2 = _worker_task(world, tmp_path, darts_cell(world, params={k: v for k, v in TINY_NET.items()
+                                                                           if k != "device"}))
+    assert "CUDA is not available" in run_task2()["error"]
+
+
+def test_an_explicit_cpu_device_still_runs_on_the_cpu(world, tmp_path):
+    out = tmp_path / "o"
+    grun([tsai_cell(world)], out, world)
+    assert all(b["device"] == "cpu" for b in G.read_results(out / "results.jsonl")[0]["blocks"])

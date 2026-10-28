@@ -1264,7 +1264,7 @@ def _init_worker(settings: Dict[str, Any], cache_root: str, out_dir: str, n_jobs
     except ImportError:
         logger.warning("threadpoolctl is not installed: BLAS / OpenMP threads are limited by environment variables only")
     _WORKER.update(settings=GridSettings.from_dict(settings), cache_root=cache_root, out_dir=out_dir, n_jobs=n_jobs,
-                   index=index, staggered=False)
+                   index=index, staggered=False, poisoned=False)
 
 
 def _error_record(cell_key: str, seed: int, message: str, label: str = "", tb: str = "") -> Dict[str, Any]:
@@ -1282,7 +1282,17 @@ def _label_of(cfg: Dict[str, Any]) -> str:
 def _run_task(cfg: Dict[str, Any], seed: int, expected_key: str) -> Dict[str, Any]:
     """Pool task: one (cell, seed). EVERYTHING, validation included, is inside the try: whatever raises becomes an
     ``error`` record and the grid goes on. The worker rebuilds the cell from its config and refuses it when the key it
-    gets differs from the planned ``expected_key`` (the store changed between planning and running)."""
+    gets differs from the planned ``expected_key`` (the store changed between planning and running).
+
+    GPU cells (the cell's family routes to the gpu pool): a worker poisoned by an earlier sticky CUDA error exits at the
+    start of its next task (``os._exit``: the pool breaks and is rebuilt, a fresh process gets a fresh CUDA context);
+    a failure is classified (``ml_grid_seq.classify_gpu_error``: ``cuda_error`` of the error record is ``"oom"`` or
+    ``"sticky"``; a sticky one poisons this worker); and after the task, with the exception gone, the worker collects
+    garbage and empties the CUDA cache. A budget overrun is an error record with ``timeout: True``."""
+    if "poisoned" in _WORKER and _WORKER["poisoned"]:
+        os._exit(1)
+    record: Optional[Dict[str, Any]] = None
+    gpu = isinstance(cfg, dict) and "family" in cfg and cfg["family"] in GPU_FAMILIES
     try:
         cell = validate_cell(cfg)
         if seed not in cell.seeds:
@@ -1291,10 +1301,23 @@ def _run_task(cfg: Dict[str, Any], seed: int, expected_key: str) -> Dict[str, An
             raise RuntimeError(f"cell key mismatch in the worker: planned {expected_key}, validated {cell.key} "
                                f"(did the store change after the plan was made?)")
         panel = _panel_for(cell, _WORKER["cache_root"])
-        return run_cell_seed(cell, seed, panel, _WORKER["settings"], _WORKER["n_jobs"],
-                             Path(_WORKER["out_dir"]) / "predictions")
+        record = run_cell_seed(cell, seed, panel, _WORKER["settings"], _WORKER["n_jobs"],
+                               Path(_WORKER["out_dir"]) / "predictions")
     except Exception as e:                                       # noqa: BLE001  (one bad cell must not stop the grid)
-        return _error_record(expected_key, seed, f"{type(e).__name__}: {e}", _label_of(cfg), traceback.format_exc())
+        record = _error_record(expected_key, seed, f"{type(e).__name__}: {e}", _label_of(cfg), traceback.format_exc())
+        if isinstance(e, BudgetExceeded):
+            record["timeout"] = True
+        if gpu:
+            from app.services.ml_grid_seq import classify_gpu_error
+            kind = classify_gpu_error(e)
+            if kind is not None:
+                record["cuda_error"] = kind
+                if kind == "sticky":
+                    _WORKER["poisoned"] = True
+    if gpu:                                                      # the exception (and the tensors in its frames) is gone
+        from app.services.ml_grid_seq import cleanup_gpu
+        cleanup_gpu()
+    return record
 
 
 def effective_seeds(cell: Cell) -> Tuple[int, ...]:
@@ -1540,56 +1563,116 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
         pool.shutdown(wait=False, cancel_futures=True)
 
 
+#: consecutive CUDA-flavoured error records after which the master aborts the GPU lane
+GPU_BREAKER_LIMIT = 10
+
+
+class GpuBreaker:
+    """Circuit breaker of the GPU lane: ``record`` every row the lane finishes; ``limit`` CONSECUTIVE error records with a
+    ``cuda_error`` trip it (a finished row resets the count; an ordinary error neither counts nor resets). Something is
+    wrong with the device or the driver, not with the cells, and a multi-day run must not burn through its tasks."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit, self.count, self.tripped = limit, 0, False
+
+    def record(self, row: Dict[str, Any]) -> bool:
+        if "error" in row:
+            if "cuda_error" in row and row["cuda_error"]:
+                self.count += 1
+                if self.count >= self.limit:
+                    self.tripped = True
+        else:
+            self.count = 0
+        return self.tripped
+
+
 def _drive_lanes(cpu_tasks: Sequence[Tuple[Cell, int]], gpu_tasks: Sequence[Tuple[Cell, int]], cpu_slots: int,
                  gpu_slots: int, init_args: Tuple, task_fn: Callable, finish: Callable[[Dict[str, Any]], None],
                  cancelled: Callable[[], bool], summary: Dict[str, Any]) -> None:
     """Run the CPU tasks on a pool of ``cpu_slots`` workers and the GPU tasks on a second pool of ``gpu_slots``, the two
     ``_drive_pool`` lifecycles (retries, probation, cancellation, ``BrokenProcessPool``) side by side. One lane runs in
-    the calling thread, exactly as before. With both, each lane runs in its own thread: ``finish`` and the cancel check
-    are serialised by one lock, ``summary["pool_rebuilds"]`` is the sum of the lanes', and a failure in one lane stops
-    the other (its in-flight tasks are cancelled, its rows so far are kept) and is re-raised here."""
-    lanes = [(t, n) for t, n in ((cpu_tasks, cpu_slots), (gpu_tasks, gpu_slots)) if t]
-    if len(lanes) == 1:
-        _drive_pool(lanes[0][0], lanes[0][1], init_args, task_fn, finish, cancelled, summary)
-        return
+    the calling thread. With both, each lane runs in its own thread: ``finish`` and the cancel check are serialised by
+    one lock, ``summary["pool_rebuilds"]`` is the sum of the lanes', and a failure in one lane stops the other (its
+    in-flight tasks are cancelled, its rows so far are kept), every lane error is logged and the first is re-raised
+    (the others as notes on it). The GPU lane has a circuit breaker (``GpuBreaker``): after ``GPU_BREAKER_LIMIT``
+    consecutive CUDA errors it is aborted LOUDLY (``summary["gpu_lane_aborted"]``, an error log line) while the CPU lane
+    goes on; its unfinished tasks are retried by the next run."""
+    lanes = [(name, t, n) for name, t, n in (("cpu", cpu_tasks, cpu_slots), ("gpu", gpu_tasks, gpu_slots)) if t]
     lock = threading.RLock()
     stop = threading.Event()
+    gpu_abort = threading.Event()
+    breaker = GpuBreaker(GPU_BREAKER_LIMIT)
     subs: List[Dict[str, Any]] = [{} for _ in lanes]
     errors: List[BaseException] = []
 
     def rebuilds() -> int:
         return sum(s["pool_rebuilds"] for s in subs if "pool_rebuilds" in s)
 
-    def locked_finish(r: Dict[str, Any]) -> None:
-        with lock:
-            summary["pool_rebuilds"] = rebuilds()
-            finish(r)
+    def lane_finish(name: str) -> Callable[[Dict[str, Any]], None]:
+        def f(r: Dict[str, Any]) -> None:
+            with lock:
+                summary["pool_rebuilds"] = rebuilds()
+                finish(r)
+                if name == "gpu" and breaker.record(r) and not gpu_abort.is_set():
+                    gpu_abort.set()
+                    summary["gpu_lane_aborted"] = True
+                    logger.error(f"ml_grid: the GPU lane is ABORTED after {GPU_BREAKER_LIMIT} consecutive CUDA errors "
+                                 f"(last: {r['error']}); its unfinished tasks are left for the next run, the CPU lane "
+                                 f"goes on. Check the driver / the device before restarting.")
+        return f
 
-    def stopped() -> bool:
-        with lock:
-            return stop.is_set() or cancelled()
+    def lane_stopped(name: str) -> Callable[[], bool]:
+        def f() -> bool:
+            with lock:
+                return stop.is_set() or (name == "gpu" and gpu_abort.is_set()) or cancelled()
+        return f
 
-    def lane(i: int, tasks: Sequence[Tuple[Cell, int]], slots: int) -> None:
+    def lane(i: int) -> None:
+        name, tasks, slots = lanes[i]
         try:
-            _drive_pool(tasks, slots, init_args, task_fn, locked_finish, stopped, subs[i])
+            _drive_pool(tasks, slots, init_args, task_fn, lane_finish(name), lane_stopped(name), subs[i])
         except BaseException as e:                                # noqa: BLE001  (re-raised by the caller)
             errors.append(e)
             stop.set()
-    threads = [threading.Thread(target=lane, args=(i, t, n), daemon=True, name=f"ml_grid-lane-{i}")
-               for i, (t, n) in enumerate(lanes)]
-    for th in threads:
-        th.start()
-    try:
-        while any(th.is_alive() for th in threads):
-            for th in threads:
-                th.join(0.2)
-    except BaseException:                                         # Ctrl-C: tell the lanes to stop, then leave
-        stop.set()
-        raise
-    if errors:
-        raise errors[0]
+
+    def join_all(timeout: Optional[float]) -> None:
+        end = None if timeout is None else time.monotonic() + timeout
+        for th in threads:
+            th.join(None if end is None else max(0.0, end - time.monotonic()))
+
+    if len(lanes) == 1:
+        threads: List[threading.Thread] = []
+        lane(0)
+        if errors:
+            raise errors[0]
+    else:
+        threads = [threading.Thread(target=lane, args=(i,), daemon=True, name=f"ml_grid-lane-{i}")
+                   for i in range(len(lanes))]
+        for th in threads:
+            th.start()
+        try:
+            while any(th.is_alive() for th in threads):
+                for th in threads:
+                    th.join(0.2)
+        except BaseException:                                     # Ctrl-C: stop the lanes and let them finish before leaving
+            stop.set()
+            join_all(LANE_JOIN_SECONDS)
+            raise
+        if errors:
+            join_all(LANE_JOIN_SECONDS)
+            for e in errors:
+                logger.error("ml_grid: a lane failed: %r", e, exc_info=e)
+            first = errors[0]
+            for e in errors[1:]:
+                first.add_note(f"another lane failed too: {e!r}")
+            raise first
     summary["pool_rebuilds"] = rebuilds()
-    summary["cancelled"] = any(s["cancelled"] for s in subs if "cancelled" in s)
+    summary["cancelled"] = any(s["cancelled"] for (name, _, _), s in zip(lanes, subs)
+                               if "cancelled" in s and not (name == "gpu" and gpu_abort.is_set()))
+
+
+#: seconds the master waits for the lane threads to wind down after a failure or Ctrl-C
+LANE_JOIN_SECONDS = 30.0
 
 
 def read_results(path: Union[str, Path]) -> List[Dict[str, Any]]:
@@ -1875,6 +1958,8 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
         else:
             _drive_lanes(cpu_tasks, gpu_tasks, cpu_slots, gpu_slots, init_args, task_fn, finish, cancelled, summary)
     finally:                                                    # also when the run dies: the files say how far it got
+        if "gpu_lane_aborted" in summary and summary["gpu_lane_aborted"]:
+            say("ml_grid: GPU LANE ABORTED by the circuit breaker (see the error log); rerun after checking the device")
         refresh(True, summary["done"] + summary["errors"])
     return summary
 

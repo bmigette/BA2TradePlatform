@@ -78,6 +78,51 @@ INTRADAY_GROUPS: Tuple[str, ...] = ("technical", "daily", "market")
 INTRADAY_CACHE_SIZE = 2
 
 
+# ================================================================== failures on the GPU
+#: message fragments (lower case) of an error that leaves the CUDA context unusable for the rest of the process
+STICKY_CUDA_MARKERS: Tuple[str, ...] = ("cuda error", "cudnn", "cublas", "device-side assert")
+
+
+def classify_gpu_error(exc: BaseException) -> Optional[str]:
+    """``"oom"`` for an out-of-memory error (recoverable: the next task may fit), ``"sticky"`` for one that poisons the
+    CUDA context ("CUDA error", cuDNN, cuBLAS, a device-side assert: every later call in the process fails the same
+    way), None for anything else. The exception chain (``__cause__`` / ``__context__``) is searched, so an error wrapped
+    by a library is still found; an out-of-memory error wins over a sticky marker in the same chain."""
+    chain: List[BaseException] = []
+    e: Optional[BaseException] = exc
+    while e is not None and all(e is not x for x in chain):
+        chain.append(e)
+        e = e.__cause__ or e.__context__
+    for x in chain:
+        if type(x).__name__ == "OutOfMemoryError" or "out of memory" in str(x).lower():
+            return "oom"
+    for x in chain:
+        text = str(x).lower()
+        if any(m in text for m in STICKY_CUDA_MARKERS):
+            return "sticky"
+    return None
+
+
+def cleanup_gpu() -> None:
+    """Collect garbage (a failed task's traceback frames hold tensors until the exception is gone) and hand the CUDA
+    caching allocator's blocks back. Call it OUTSIDE the ``except`` block that handled the failure."""
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:                                                  # noqa: BLE001  (cleanup must never raise)
+        logger.warning("could not empty the CUDA cache", exc_info=True)
+
+
+def _release_quietly(adapter: Any) -> None:
+    """``adapter.release()`` that can never mask the error being handled: a failure is logged, not raised."""
+    try:
+        adapter.release()
+    except Exception:                                                  # noqa: BLE001
+        logger.warning("releasing the %s adapter failed", adapter.family, exc_info=True)
+
+
 # ================================================================== the intraday panel
 @dataclass
 class IntradayPanel:
@@ -206,9 +251,8 @@ def _usable(data: MS.SequenceData, rows: np.ndarray) -> np.ndarray:
 
 def _adapter_params(cell: "G.Cell", st: "G.GridSettings") -> Tuple[str, Dict[str, Any]]:
     base, arch = G.split_family(cell.family)
-    p = {**cell.params_dict, "arch": arch}
-    cap = p["epochs"] if "epochs" in p else M.DEFAULTS[base]["epochs"]
-    p["epochs"] = min(int(cap), st.gpu_max_epochs)
+    p = {**M.DEFAULTS[base], **cell.params_dict, "arch": arch}          # every value explicit (device, epochs ...)
+    p["epochs"] = min(int(p["epochs"]), st.gpu_max_epochs)
     return base, p
 
 
@@ -233,6 +277,9 @@ def fit_block_seq(cell: "G.Cell", seed: int, panel: "G.Panel", br: "G.BlockRows"
     torch.use_deterministic_algorithms(True, warn_only=True)
     seed_everything(seed)
     base, params = _adapter_params(cell, st)
+    if params["device"] == "auto" and not torch.cuda.is_available():
+        raise RuntimeError("device='auto' but CUDA is not available in this GPU worker: refusing to fall back to the "
+                           "CPU silently (set params.device to 'cpu' to run a deep cell on the CPU on purpose)")
     adapter = M.make_adapter(base, n_jobs, params)
     t0 = time.perf_counter()
     try:
@@ -241,7 +288,7 @@ def fit_block_seq(cell: "G.Cell", seed: int, panel: "G.Panel", br: "G.BlockRows"
         else:
             rows, scores, extra = _darts_block(cell, seed, panel, br, st, adapter)
     finally:
-        adapter.release()
+        _release_quietly(adapter)
         gc.collect()
     info = adapter.fit_info if adapter.fit_info is not None else {}
     audit = {**G.block_audit(br, block, window), **extra, "fit_seconds": time.perf_counter() - t0,
