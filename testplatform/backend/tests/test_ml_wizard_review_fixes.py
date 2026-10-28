@@ -185,6 +185,26 @@ class TestSparseTargetsKeepSessionContinuity:
         assert result["status"] == "failed"
         assert "quintile_h3" in result["error"] and "classification" in result["error"] and "gaps" in result["error"]
 
+    def test_an_ordinary_regression_job_with_a_few_filled_bars_trains_through_darts_as_before(self, monkeypatch):
+        """Only the cross-sectional daily targets are sparse: any other target keeps its rows-dropped behaviour."""
+        from tests.test_ml_wizard_daily_targets import TestJobIntegration, daily_frame, pt
+        frames = [daily_frame(10 + i, filled_at=(40, 90)) for i in range(2)]
+        for kind in ("daily_volatility", "daily_up"):
+            result, cap = TestJobIntegration()._job(frames, [pt(kind, horizonSessions=3)], monkeypatch,
+                                                    job_type="regression")
+            assert result["status"] == "dry_run_success", (kind, result)
+            col = cap["target"]
+            assert cap["combined"][col].notna().all()                      # the unlabelled rows were dropped, as before
+            n = len(frames[0])
+            assert len(cap["combined"]) < 2 * (n - 3)                      # (labels around the filled bars are gone)
+
+    def test_a_cross_sectional_regression_target_with_gaps_is_still_refused_for_darts(self, monkeypatch):
+        from tests.test_ml_wizard_daily_targets import TestJobIntegration, daily_frame, pt
+        frames = [daily_frame(10 + i, filled_at=(40,)) if i == 0 else daily_frame(10 + i) for i in range(6)]
+        result, _ = TestJobIntegration()._job(frames, [pt("daily_rel_return", horizonSessions=3)], monkeypatch,
+                                              job_type="regression")
+        assert result["status"] == "failed" and "gaps" in result["error"]
+
     def test_darts_trains_a_dense_target_as_before(self, monkeypatch):
         from tests.test_ml_wizard_daily_targets import TestJobIntegration, job_frames, pt
         result, _ = TestJobIntegration()._job(job_frames(6), [pt("daily_rel_return", horizonSessions=3)], monkeypatch,

@@ -2010,17 +2010,24 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
         n_unobservable = 0
         trimmed = []
         n_interior = 0
+        # Only the cross-sectional daily targets are SPARSE (their labels follow the session's cross-section): they keep
+        # the consecutive session frame and lose only the unlabelled edges. Every other target is handled exactly as
+        # before: all its unlabelled rows are dropped.
+        sparse_target = any(target_column in cols for cols in cross_sectional)
         for f in frames:
-            f, n_dropped, n_gaps = trim_unlabelled_edges(f, target_column)
+            if sparse_target:
+                f, n_dropped, n_gaps = trim_unlabelled_edges(f, target_column)
+                n_interior += n_gaps
+            else:
+                f, n_dropped = drop_unobservable_target_rows(f, target_column)
             n_unobservable += n_dropped
-            n_interior += n_gaps
             trimmed.append(f)
         frames = trimmed
         if n_interior and job_type != 'classification':
             # Darts regression models train on the series as it is and a NaN inside it makes the loss NaN
             return {'status': 'failed', 'error': (
-                f"Target '{target_column}' has {n_interior} rows without a label inside the series (a sparse target, or "
-                f"filled bars): regression models cannot train across gaps. Use a classification job (the windows "
+                f"Target '{target_column}' has {n_interior} rows without a label inside the series (a sparse cross-sectional "
+                f"target): regression models cannot train across gaps. Use a classification job (the windows "
                 f"without a label are dropped), or a target that labels every session")}
         if n_unobservable:
             logger.info(
@@ -2044,7 +2051,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
         # A cross-sectional daily target is decided by every ticker's bars over the same window: one set of boundary
         # dates for all the tickers, not a row-count cut per ticker (which puts one ticker's train rows on another's
         # test dates).
-        common_dates = any(target_column in cols for cols in cross_sectional)
+        common_dates = sparse_target
 
         # Train / validation / holdout split, PER TICKER, chronological. Targets are computed
         # over the whole series and only then cut, so both boundaries are purged by the label
