@@ -101,41 +101,75 @@ def test_load_daily_cache_older_than_range_is_listed_from_the_first_session(cach
     assert daily["AAA"]["listed"].all()
 
 
-def test_load_daily_small_gap_is_filled_flat_and_listed(tmp_path):
+def test_load_daily_gap_runs_up_to_two_are_filled_flat_and_listed(tmp_path):
     root = tmp_path / "c"
-    s = _sessions(date(2020, 1, 2), date(2024, 3, 28))                 # > 1000 sessions: 1 gap <= 0.1%
-    assert len(s) > 1000
+    s = _sessions(date(2023, 1, 3), date(2023, 6, 30))                 # a SHORT window: the rule is not a share
     df = _bars(s, 7)
-    gap = df["Date"].iloc[500]
-    _write(root, "GAP", df[df["Date"] != gap])
-    daily, meta = F.load_daily(["GAP"], date(2020, 1, 2), date(2024, 3, 28), root)
+    one, two = df["Date"].iloc[20], df["Date"].iloc[60:62]
+    _write(root, "GAP", df[~df["Date"].isin([one, *two])])
+    daily, meta = F.load_daily(["GAP"], date(2023, 1, 3), date(2023, 6, 30), root)
     d = daily["GAP"]
-    assert meta["filled"] == {"GAP": [str(gap.date())]}
-    row, prev = d.loc[gap], d.iloc[499]
-    assert d["filled"].sum() == 1 and row["listed"] and row["volume"] == 0.0
-    assert row["open"] == row["high"] == row["low"] == row["close"] == prev["close"]
+    assert meta["filled"] == {"GAP": [str(one.date()), *[str(t.date()) for t in two]]}
+    assert d["filled"].sum() == 3 and d.loc[d["filled"], "volume"].eq(0.0).all() and d["listed"].all()
+    for t in (one, *two):
+        i = d.index.get_loc(t)
+        row = d.iloc[i]
+        assert row["open"] == row["high"] == row["low"] == row["close"] == d["close"].iloc[20 - 1 if t == one else 59]
 
 
-def test_load_daily_too_many_gaps_refuses(tmp_path):
+def test_load_daily_three_consecutive_missing_sessions_refuse(tmp_path):
     root = tmp_path / "c"
     s = _sessions(date(2020, 1, 2), date(2024, 3, 28))
     df = _bars(s, 7)
-    _write(root, "GAPS", df.drop(index=[500, 800]))                    # 2 of > 1000 = > 0.1%
-    with pytest.raises(P.PanelDataError, match="GAPS"):
-        F.load_daily(["GAPS"], date(2020, 1, 2), date(2024, 3, 28), root)
+    _write(root, "RUN3", df.drop(index=[500, 501, 502]))
+    with pytest.raises(P.PanelDataError, match="RUN3"):
+        F.load_daily(["RUN3"], date(2020, 1, 2), date(2024, 3, 28), root)
+    _write(root, "RUN2", df.drop(index=[500, 501, 800, 1000]))        # runs of 2, 1, 1 are fine whatever the length
+    daily, _ = F.load_daily(["RUN2"], date(2020, 1, 2), date(2024, 3, 28), root)
+    assert daily["RUN2"]["filled"].sum() == 4
 
 
-def test_load_daily_gap_share_counts_from_the_listing(tmp_path):
-    """Sessions before the symbol existed are not 'missing': 2 gaps in a short listed life are still refused, and
-    no gap at all is fine however late the listing."""
+def test_load_daily_result_does_not_depend_on_the_window_length(tmp_path):
+    """Two separate gaps are fine in a short window and in a long one; a run of 3 straddling the range start is
+    measured whole and refused even though only part of it lies inside the range."""
     root = tmp_path / "c"
     s = _sessions(date(2022, 1, 3), date(2024, 3, 28))
-    df = _bars(s[s >= pd.Timestamp("2023-06-01")], 3)
-    _write(root, "OK", df)
-    F.load_daily(["OK"], date(2022, 1, 3), date(2024, 3, 28), root)
-    _write(root, "BAD", df.drop(index=[40, 80]))
-    with pytest.raises(P.PanelDataError):
-        F.load_daily(["BAD"], date(2022, 1, 3), date(2024, 3, 28), root)
+    df = _bars(s, 3)
+    _write(root, "TWO", df.drop(index=[300, 340]))
+    short, _ = F.load_daily(["TWO"], date(2023, 1, 3), date(2023, 12, 29), root)
+    long, _ = F.load_daily(["TWO"], date(2022, 1, 3), date(2024, 3, 28), root)
+    pd.testing.assert_frame_equal(short["TWO"], long["TWO"].loc[short["TWO"].index])
+    _write(root, "EDGE", df.drop(index=[198, 199, 200]))
+    start = df["Date"].iloc[200]
+    with pytest.raises(P.PanelDataError, match="EDGE"):
+        F.load_daily(["EDGE"], start.date(), date(2023, 12, 29), root)
+
+
+def test_load_daily_stale_tail_refuses(cache, tmp_path):
+    """Sessions AFTER the last cached bar are not 'gaps' to fill: a stale or delisted series is refused."""
+    root = tmp_path / "c"
+    df = pd.read_parquet(cache / "AlpacaHistoryOHLCVProvider" / "AAA_1d.parquet")
+    _write(root, "STALE", df[df["Date"] <= pd.Timestamp("2023-02-15")])
+    with pytest.raises(P.PanelDataError, match="STALE.*stale"):
+        F.load_daily(["STALE"], date(2023, 1, 3), date(2023, 3, 31), root)
+    daily, _ = F.load_daily(["STALE"], date(2023, 1, 3), date(2023, 2, 15), root)      # ending at the last bar is fine
+    assert daily["STALE"]["listed"].all() and not daily["STALE"]["filled"].any()
+    with pytest.raises(P.PanelDataError, match="stale"):                                # a file that ends before the range
+        F.load_daily(["STALE"], date(2023, 3, 1), date(2023, 3, 31), root)
+
+
+def test_load_daily_refuses_non_positive_close_and_inverted_range(tmp_path):
+    root = tmp_path / "c"
+    df = _bars(_sessions(date(2023, 1, 3), date(2023, 3, 31)), 1)
+    bad_close = df.copy()
+    bad_close.loc[10, "Close"] = 0.0
+    inverted = df.copy()
+    inverted.loc[12, ["High", "Low"]] = inverted.loc[12, ["Low", "High"]].to_numpy()
+    _write(root, "ZERO", bad_close)
+    _write(root, "INV", inverted)
+    for sym in ("ZERO", "INV"):
+        with pytest.raises(P.PanelDataError, match=sym):
+            F.load_daily([sym], date(2023, 1, 3), date(2023, 3, 31), root)
 
 
 def test_load_daily_bar_off_the_calendar_refuses(tmp_path):
@@ -168,20 +202,30 @@ SYMS = ("AAA", "BBB")
 CUT_DAY = date(2023, 11, 15)                       # a Wednesday: the truncated build ends MID-WEEK
 
 
-def _build(cache, groups, symbols=SYMS, first=FIRST, last=LAST, ctx=CTX, sector_of=None):
-    return F.build_features(list(symbols), first, last, list(groups), cache, list(ctx), sector_of=sector_of)
+def _build(cache, groups, symbols=SYMS, first=FIRST, last=LAST, ctx=CTX, sector_of=None, universe=None):
+    return F.build_features(list(symbols), first, last, list(groups), cache, list(ctx), sector_of=sector_of,
+                            universe=universe)
 
 
-def _assert_cut_identical(cache, tmp_path, groups, day=CUT_DAY, symbols=SYMS, sector_of=None):
-    """THE point-in-time proof: a build over a cache cut after ``day`` equals the full build on every common row."""
-    full = _build(cache, groups, symbols, sector_of=sector_of)
-    cut = _build(_truncate(cache, tmp_path, day), groups, symbols, last=day, sector_of=sector_of)
+def _assert_cut_identical(cache, tmp_path, groups, day=CUT_DAY, symbols=SYMS, sector_of=None, universe=None):
+    """THE point-in-time proof: a build over a cache cut after ``day`` equals the full build on every common row.
+    ``label_bar_filled`` is the one deliberate look-forward column (the NEXT session's fill flag): it is compared
+    separately."""
+    full = _build(cache, groups, symbols, sector_of=sector_of, universe=universe)
+    cut = _build(_truncate(cache, tmp_path, day), groups, symbols, last=day, sector_of=sector_of, universe=universe)
     common = full[full.index.get_level_values("session") <= pd.Timestamp(day)]
     assert len(common) == len(cut) > 300 * len(symbols) // 2
     assert common.index.equals(cut.index) and list(common.columns) == list(cut.columns)
-    pd.testing.assert_frame_equal(common, cut, check_exact=True)      # every column, bit for bit
+    pd.testing.assert_frame_equal(common.drop(columns="label_bar_filled"), cut.drop(columns="label_bar_filled"),
+                                  check_exact=True)                    # every column, bit for bit
+    last = cut.index.get_level_values("session") == pd.Timestamp(day)
+    assert cut.loc[last, "label_bar_filled"].isna().all()               # tomorrow is unknown in the cut build
+    pd.testing.assert_series_equal(common.loc[~last, "label_bar_filled"], cut.loc[~last, "label_bar_filled"])
     feats = F.feature_columns(cut)
-    assert feats and cut[feats].notna().all().all()                   # the comparison is not NaN == NaN
+    isna = cut[feats].isna()
+    if "t_vol_z" in feats:
+        isna.loc[cut["filled"], "t_vol_z"] = False                    # a filled bar has no volume: its own z is NaN
+    assert feats and not isna.to_numpy().any()                        # the comparison is not NaN == NaN
     return full
 
 
@@ -195,7 +239,7 @@ def test_cut_test_detects_a_look_ahead(cache, tmp_path, monkeypatch):
         frames = {s: pd.DataFrame({"l_next_ret": np.log(daily[s]["close"].shift(-1) / daily[s]["close"])})
                   for s in ctx.symbols}
         return pd.concat(frames, names=["symbol", "session"])
-    monkeypatch.setitem(F.GROUPS, "l", leaky)
+    monkeypatch.setitem(F.GROUPS, "l", F.GroupSpec(leaky, "l_"))
     with pytest.raises(AssertionError):
         _assert_cut_identical(cache, tmp_path, ["l"])
 
@@ -206,7 +250,8 @@ def test_build_features_shape_and_no_nan(cache):
     sess = f.index.get_level_values("session")
     exp = _sessions(FIRST, LAST)
     assert sess.min() == exp[0] and sess.max() == exp[-1] and len(f) == len(SYMS) * len(exp)
-    assert list(f.columns[:1]) == ["listed"] and f["listed"].all()
+    assert list(f.columns[:3]) == ["listed", "filled", "label_bar_filled"] and f["listed"].all()
+    assert not f["filled"].any() and f["label_bar_filled"].dropna().eq(False).all()
     feats = F.feature_columns(f)
     assert feats == F.feature_columns(f, ["t", "mtf"])
     assert all(c.startswith(("t_", "mtf_")) for c in feats)
@@ -460,11 +505,18 @@ def test_unknown_or_missing_sector_raises(cache):
         _build(cache, ["m"])
 
 
-def test_m_needs_its_context_series(cache):
-    with pytest.raises(P.PanelDataError, match="XLF"):           # sector ETF not among the context symbols
-        _build(cache, ["m"], ctx=("SPY", "QQQ", "IWM", "TLT", "GLD", "XLK"), sector_of=SECTOR_OF)
+def test_m_adds_its_own_context_and_refuses_a_missing_series(cache, tmp_path):
+    """build_features loads the market ETFs and the symbols' sector ETFs itself; a series that is not cached refuses."""
+    bare = _build(cache, ["m"], ctx=(), sector_of=SECTOR_OF)
+    pd.testing.assert_frame_equal(bare, _build(cache, ["m"], sector_of=SECTOR_OF))
+    assert set(bare.attrs["meta"]["required_context"]) == {"SPY", "QQQ", "IWM", "TLT", "GLD", "XLK", "XLF"}
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    with pytest.raises(P.PanelDataError, match="XLE"):                 # a sector ETF that is not cached
+        _build(root, ["m"], sector_of={"AAA": "Energy", "BBB": "Technology"})
+    (root / "AlpacaHistoryOHLCVProvider" / "GLD_1d.parquet").unlink()
     with pytest.raises(P.PanelDataError, match="GLD"):
-        _build(cache, ["m"], ctx=("SPY", "QQQ", "IWM", "TLT", "XLK", "XLF"), sector_of=SECTOR_OF)
+        _build(root, ["m"], sector_of=SECTOR_OF)
 
 
 def test_sector_etf_map_is_the_committed_one():
@@ -485,3 +537,184 @@ def test_sector_etf_listed_later_leaves_nan_only_before_its_listing(cache, tmp_p
     assert pre.sum() > 40 and f.loc[pre, ["m_rs_sector_5", "m_rs_sector_20"]].isna().all().all()
     assert f.loc[pre, "m_rs_spy_20"].notna().all()               # the symbol itself is listed: only the sector leg is missing
     assert f.loc[f.index > pd.Timestamp("2022-10-15"), ["m_rs_sector_5", "m_rs_sector_20"]].notna().all().all()
+
+
+# ---------------------------------------------------------------------------------------------- review fixes
+GAP_ONE, GAP_TWO = pd.Timestamp("2023-03-15"), (pd.Timestamp("2023-08-09"), pd.Timestamp("2023-08-10"))
+
+
+@pytest.fixture(scope="module")
+def gap_cache(cache, tmp_path_factory):
+    """The synthetic cache with a missing bar (AAA) and a missing run of two (BBB) INSIDE the cut window."""
+    root = tmp_path_factory.mktemp("gapcache")
+    shutil.copytree(cache, root, dirs_exist_ok=True)
+    for sym, days in (("AAA", [GAP_ONE]), ("BBB", list(GAP_TWO))):
+        df = _raw(root, sym).reset_index()
+        _write(root, sym, df[~df["Date"].isin(days)])
+    return root
+
+
+def test_cut_test_with_filled_bars_inside_the_window(gap_cache, tmp_path):
+    full = _assert_cut_identical(gap_cache, tmp_path, ["t", "mtf", "m"], sector_of=SECTOR_OF)
+    assert full["filled"].sum() == 3
+
+
+def test_filled_flag_and_label_bar_filled(gap_cache):
+    f = _build(gap_cache, ["t"])
+    assert list(f.index[f["filled"]]) == [("AAA", GAP_ONE), ("BBB", GAP_TWO[0]), ("BBB", GAP_TWO[1])]
+    lab = f["label_bar_filled"]
+    assert lab.dtype.name == "boolean"
+    for sym, day in (("AAA", GAP_ONE), ("BBB", GAP_TWO[0]), ("BBB", GAP_TWO[1])):
+        sess = f.loc[sym].index
+        prev = sess[sess.get_loc(day) - 1]
+        assert lab[(sym, prev)]                                        # the decision BEFORE a filled bar fills on it
+    assert int(lab.sum()) == 3 and lab.loc[:, pd.Timestamp(LAST)].isna().all()       # the last session has no known next session
+    # the flag is the next session's `filled`, nothing else
+    for sym in SYMS:
+        np.testing.assert_array_equal(lab.loc[sym].iloc[:-1].to_numpy(dtype=bool), f.loc[sym, "filled"].iloc[1:].to_numpy())
+
+
+def test_filled_bars_do_not_distort_the_volume_statistics(gap_cache):
+    """A fabricated zero-volume bar is left out of t_vol_z / t_obv_slope instead of entering them as log1p(0)."""
+    f = _build(gap_cache, ["t"]).loc["AAA"]
+    r = _raw(gap_cache, "AAA")
+    lv = np.log1p(r["Volume"].astype(float))
+    at = f.index[f.index.get_loc(GAP_ONE) + 5]                          # a window that contains the filled session
+    # reference: the 60-session window of the LOADED grid with the filled session's volume removed
+    sess = f.index
+    grid_lv = lv.reindex(sess)
+    grid_lv.loc[GAP_ONE] = np.nan
+    w = grid_lv.iloc[sess.get_loc(at) - 59: sess.get_loc(at) + 1]
+    assert w.isna().sum() == 1
+    assert f.loc[at, "t_vol_z"] == pytest.approx((grid_lv.loc[at] - w.mean()) / w.std())
+    assert f["t_obv_slope"].notna().all() and f.loc[~f["filled"], "t_vol_z"].notna().all()
+    assert np.isnan(f.loc[GAP_ONE, "t_vol_z"])                          # the fabricated bar itself has no volume z
+    # with the zero kept the statistic would be clearly different
+    with_zero = grid_lv.fillna(0.0).iloc[sess.get_loc(at) - 59: sess.get_loc(at) + 1]
+    assert abs((grid_lv.loc[at] - with_zero.mean()) / with_zero.std() - f.loc[at, "t_vol_z"]) > 0.01
+
+
+def test_features_are_the_same_whatever_first_day_is(cache):
+    """Every symbol is loaded from its first cached bar, so a row does not depend on where the request starts:
+    builds over [D1, L] and [D2, L] agree exactly on the common rows, weekly columns included."""
+    a = _build(cache, ["t", "mtf", "m"], first=date(2021, 6, 1), sector_of=SECTOR_OF)
+    b = _build(cache, ["t", "mtf", "m"], first=date(2023, 3, 1), sector_of=SECTOR_OF)
+    common = a.loc[b.index]
+    assert len(b) < len(a) and len(b) > 500
+    pd.testing.assert_frame_equal(common, b, check_exact=True)
+    c = _build(cache, ["t", "mtf"], first=date(2023, 3, 1), last=date(2023, 12, 29))     # also a shorter window
+    cols = [x for x in c.columns if x != "label_bar_filled"]
+    pd.testing.assert_frame_equal(b.loc[c.index, cols], c[cols], check_exact=True)
+
+
+def test_requested_range_before_any_bar_gives_unlisted_rows(cache):
+    f = _build(cache, ["t"], first=date(2020, 11, 2), last=date(2021, 2, 26), ctx=())
+    assert f.index.get_level_values("session").min() == pd.Timestamp("2020-11-02")
+    pre = f.index.get_level_values("session") < pd.Timestamp("2021-01-04")
+    assert not f.loc[pre, "listed"].any() and f.loc[pre, F.feature_columns(f)].isna().all().all()
+
+
+def test_registry_group_specs_and_feature_columns(cache):
+    spec = F.GROUPS["m"]
+    assert isinstance(spec, F.GroupSpec) and spec.prefix == "m_" and spec.needs_sector
+    assert F.GROUPS["t"].prefix == "t_" and not F.GROUPS["t"].needs_sector and F.GROUPS["mtf"].prefix == "mtf_"
+    assert F.GROUPS["t"].required_context(["AAA"], None) == set()
+    assert F.GROUPS["m"].required_context(["AAA", "BBB"], SECTOR_OF) == set(F.MARKET_ETFS) | {"XLK", "XLF"}
+    f = _build(cache, ["t"])
+    with pytest.raises(ValueError, match="unknown"):
+        F.feature_columns(f, ["t", "nope"])
+
+
+def _spec(builder, prefix):
+    return F.GroupSpec(builder, prefix)
+
+
+def test_builder_output_contract_is_enforced(cache, monkeypatch):
+    def full_index(ctx):
+        return pd.MultiIndex.from_product([ctx.symbols, ctx.sessions], names=["symbol", "session"])
+
+    def missing_symbol(daily, ctx):
+        return pd.DataFrame({"x_a": 1.0}, index=pd.MultiIndex.from_product([ctx.symbols[:1], ctx.sessions]))
+
+    def not_float(daily, ctx):
+        return pd.DataFrame({"x_a": 1}, index=full_index(ctx))
+
+    def boolean(daily, ctx):
+        return pd.DataFrame({"x_a": True}, index=full_index(ctx))
+
+    def wrong_prefix(daily, ctx):
+        return pd.DataFrame({"y_a": 1.0}, index=full_index(ctx))
+
+    def shuffled(daily, ctx):
+        return pd.DataFrame({"x_a": 1.0}, index=full_index(ctx)[::-1])
+
+    for name, fn in (("missing_symbol", missing_symbol), ("not_float", not_float), ("boolean", boolean),
+                     ("wrong_prefix", wrong_prefix), ("shuffled", shuffled)):
+        monkeypatch.setitem(F.GROUPS, "x", _spec(fn, "x_"))
+        with pytest.raises(ValueError, match="group 'x'"):
+            _build(cache, ["x"], ctx=())
+
+    def good(daily, ctx):
+        return pd.DataFrame({"x_a": 1.0}, index=full_index(ctx))
+    monkeypatch.setitem(F.GROUPS, "x", _spec(good, "x_"))
+    assert F.feature_columns(_build(cache, ["x"], ctx=())) == ["x_a"]
+
+
+def test_infinite_feature_raises_with_symbol_and_session(cache, monkeypatch):
+    """+-inf is never silently turned into NaN: the build names the symbol, session and column."""
+    def infinite(daily, ctx):
+        idx = pd.MultiIndex.from_product([ctx.symbols, ctx.sessions], names=["symbol", "session"])
+        df = pd.DataFrame({"x_a": 1.0}, index=idx)
+        df.loc[("BBB", pd.Timestamp("2023-05-10")), "x_a"] = np.inf
+        return df
+    monkeypatch.setitem(F.GROUPS, "x", _spec(infinite, "x_"))
+    with pytest.raises(P.PanelDataError, match=r"BBB.*2023-05-10|2023-05-10.*BBB"):
+        _build(cache, ["x"], ctx=())
+
+
+def test_group_needing_sector_refuses_without_it(cache):
+    with pytest.raises(P.PanelDataError, match="sector_of"):
+        _build(cache, ["t", "m"])
+
+
+def test_universe_defaults_to_symbols_and_must_be_a_superset(cache):
+    f = _build(cache, ["m"], sector_of=SECTOR_OF)
+    assert f.attrs["meta"]["universe"] == list(SYMS)
+    with pytest.raises(ValueError, match="universe"):
+        _build(cache, ["m"], sector_of=SECTOR_OF, universe=("AAA", "CCC"))        # BBB is built but not in the universe
+
+
+def test_chunked_builds_with_the_same_universe_give_the_same_breadth(cache):
+    universe = ("AAA", "BBB", "CCC")
+    one = _build(cache, ["t", "m"], symbols=universe, sector_of=SECTOR_OF)
+    parts = [_build(cache, ["t", "m"], symbols=chunk, sector_of=SECTOR_OF, universe=universe)
+             for chunk in (("AAA", "BBB"), ("CCC",))]
+    joined = pd.concat(parts).loc[one.index]
+    pd.testing.assert_frame_equal(joined.drop(columns="label_bar_filled"), one.drop(columns="label_bar_filled"),
+                                  check_exact=True)
+    solo = _build(cache, ["m"], symbols=("AAA",), sector_of=SECTOR_OF)                 # universe = AAA alone differs
+    assert not np.allclose(solo.loc["AAA", "m_breadth_sma50"], one.loc["AAA", "m_breadth_sma50"])
+    assert parts[1].attrs["meta"]["universe"] == list(universe)
+
+
+def test_cut_test_with_an_explicit_universe(cache, tmp_path):
+    _assert_cut_identical(cache, tmp_path, ["m"], symbols=("AAA",), sector_of=SECTOR_OF, universe=("AAA", "BBB", "CCC"))
+
+
+def test_save_features_writes_parquet_and_a_meta_sidecar(cache, tmp_path):
+    import json
+    f = _build(cache, ["t", "mtf"])
+    path = tmp_path / "store" / "features.parquet"
+    F.save_features(f, path)
+    meta = json.loads((tmp_path / "store" / "features.parquet.meta.json").read_text(encoding="utf-8"))
+    assert meta["groups"]["t"] == list(F.T_COLUMNS) and meta["symbols"] == list(SYMS) and meta["rows"] == len(f)
+    assert meta["first_day"] == str(FIRST) and set(meta["source"]) >= set(SYMS)
+    back = pd.read_parquet(path)
+    pd.testing.assert_frame_equal(back, f, check_exact=True, check_freq=False)
+    with pytest.raises(ValueError, match="meta"):
+        F.save_features(pd.DataFrame({"a": [1.0]}), tmp_path / "bare.parquet")
+
+
+def test_ml_panel_helpers_are_public_and_aliased():
+    assert P.ema is P._ema and P.wilder is P._wilder and P.true_range is P._true_range
+    assert F.ema is P.ema and F.wilder is P.wilder and F.true_range is P.true_range
