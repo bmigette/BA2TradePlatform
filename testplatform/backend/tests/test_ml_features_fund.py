@@ -9,7 +9,7 @@ import pytest
 
 from app.services import ml_features as F
 from app.services import ml_panel as P
-from tests.test_ml_features import (STORE_SCANS, _assert_cut_identical, _build, _raw, _sessions,  # noqa: F401
+from tests.test_ml_features import (FIRST, LAST, STORE_SCANS, _assert_cut_identical, _build, _raw, _sessions,  # noqa: F401
                                     _store_rows, cache)
 
 SCALE = 1e10
@@ -79,7 +79,7 @@ def test_f_columns_and_registry(fund_cache):
     f = _fbuild(fund_cache)
     assert F.feature_columns(f) == list(F.F_COLUMNS)
     assert f[list(F.F_COLUMNS)].notna().all().all()
-    assert f.attrs["meta"]["store"]["newest_scan"] == STORE_SCANS[-1]
+    assert f.attrs["meta"]["source"]["store"]["newest_scan"] == STORE_SCANS[-1]
 
 
 def test_the_earnings_features_are_the_existing_ones(fund_cache):
@@ -176,3 +176,105 @@ def test_cut_test_f(fund_cache, tmp_path, day):
     """Includes the cut ON the acceptance day of FY2022 (invisible that day) and the day after (visible)."""
     full = _assert_cut_identical(fund_cache, tmp_path, ["f"], day=day, truncate_extra=_truncate_fmp)
     assert full["f_debt_assets"].nunique() > 2
+
+
+# ------------------------------------------------------------------------------------------ review fixes
+def _fresh(fund_cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(fund_cache, root)
+    return root
+
+
+def _edit_records(path, fn):
+    rows = json.loads(path.read_text())
+    path.write_text(json.dumps(fn(rows)))
+
+
+def test_a_needed_key_absent_from_every_record_refuses(fund_cache, tmp_path):
+    root = _fresh(fund_cache, tmp_path)
+    p = root / "fmp_history" / "balance_sheet_annual__AAA.json"
+    _edit_records(p, lambda rows: [{k: v for k, v in r.items() if k != "totalLiabilities"} for r in rows])
+    with pytest.raises(P.PanelDataError, match=r"AAA.*balance_sheet_annual.*totalLiabilities"):
+        _fbuild(root, symbols=("AAA",))
+    # a key missing from SOME records is a NaN, not a refusal
+    (tmp_path / "second").mkdir()
+    root2 = _fresh(fund_cache, tmp_path / "second")
+    p2 = root2 / "fmp_history" / "cashflow_statement_annual__AAA.json"
+    _edit_records(p2, lambda rows: [{k: v for k, v in r.items() if not (k == "stockBasedCompensation" and r["date"] == "2022-12-31")}
+                                    for r in rows])
+    f = _fbuild(root2, symbols=("AAA",)).loc["AAA"]
+    assert f.loc["2023-06-01", "f_sbc_rev"] != f.loc["2023-06-01", "f_sbc_rev"]            # NaN for the FY2022 record
+    assert f.loc["2022-06-01", "f_sbc_rev"] == pytest.approx(0.3 / 8)                      # FY2021 is intact
+
+
+def test_an_empty_statement_file_refuses(fund_cache, tmp_path):
+    root = _fresh(fund_cache, tmp_path)
+    (root / "fmp_history" / "cashflow_statement_annual__AAA.json").write_text("[]")
+    with pytest.raises(P.PanelDataError, match=r"AAA.*cashflow_statement_annual.*no records"):
+        _fbuild(root, symbols=("AAA",))
+
+
+def test_f_on_an_etf_refuses(fund_cache):
+    with pytest.raises(P.PanelDataError, match="SPY"):
+        _fbuild(fund_cache, symbols=("SPY",))
+
+
+def test_f_with_an_ended_member(fund_cache, tmp_path):
+    root = _fresh(fund_cache, tmp_path)
+    s = _sessions()
+    from tests.test_ml_features import _bars, _write
+    _write(root, "GONE", _bars(s[s <= pd.Timestamp("2023-06-30")], 55))
+    _write_fmp(root, "GONE")
+    f = _fbuild(root, symbols=("AAA", "GONE")).loc["GONE"]
+    after = f.index > pd.Timestamp("2023-06-30")
+    assert f.loc[after, "ended"].all() and f.loc[after, list(F.F_COLUMNS)].isna().all().all()
+    before = f.loc[~after]
+    no_store = [c for c in F.F_COLUMNS if c not in ("f_fcf_yield", "f_buyback_yield")]          # GONE is not in the store
+    assert before[no_store].notna().all().all() and not before["ended"].any()
+    assert f.loc[~after].index[-1] == pd.Timestamp("2023-06-30") and bool(f.loc[pd.Timestamp("2023-06-30"), "label_bar_filled"])
+
+
+def test_f_refuses_a_stale_store(fund_cache, tmp_path):
+    from ba2_providers.screener.metric_store import MetricStoreStaleError
+    root = _fresh(fund_cache, tmp_path)
+    for p in (root / "screener" / "metric_store_alpaca_20261022").glob("ym=*/*.parquet"):
+        df = pd.read_parquet(p)
+        df[df["date"] <= "2023-12-27"].to_parquet(p, index=False)       # the store ends 3 months before LAST
+    shutil.rmtree(root / "screener" / "_derived", ignore_errors=True)
+    with pytest.raises(MetricStoreStaleError):
+        _fbuild(root)
+
+
+def test_provenance_lists_every_fmp_file_read_and_the_store(fund_cache):
+    f = _fbuild(fund_cache)
+    src = f.attrs["meta"]["source"]
+    for sym in ("AAA", "BBB"):
+        for kind in ("past_earnings_quarterly", "income_statement_annual", "balance_sheet_annual", "cashflow_statement_annual"):
+            fp = src["fmp_history"][f"{kind}__{sym}.json"]
+            assert fp["size"] > 0 and fp["mtime_ns"] > 0
+    assert len(src["fmp_history"]) == 8
+    store = src["store"]
+    assert store["newest_scan"] == STORE_SCANS[-1] and store["dir"].endswith("metric_store_alpaca_20261022")
+    assert store["fingerprint"]["files"] > 0 and store["fingerprint"]["bytes"] > 0
+
+
+def test_meta_reports_the_nan_rate_of_every_column(fund_cache):
+    f = _fbuild(fund_cache, first=date(2021, 5, 3))
+    rate = f.attrs["meta"]["nan_rate"]
+    assert set(rate) == set(F.F_COLUMNS)
+    assert all(0.0 <= v <= 1.0 for v in rate.values())
+    assert rate["f_fcf_yield"] > 0 and rate["f_debt_assets"] == 0.0            # yields need the store (from 2021-06-02)
+
+
+def test_usable_symbols_say_why_a_member_would_be_refused(fund_cache, tmp_path):
+    from tests.test_ml_features import _bars, _write
+    root = _fresh(fund_cache, tmp_path)
+    s = _sessions()
+    _write(root, "HOLE", _bars(s, 3).drop(index=[300, 301, 302]))               # a run of 3 missing sessions
+    _write(root, "STAL", _bars(s[:-5], 4))                                        # 5 sessions short of the cache end
+    usable, refused = F.usable_symbols(["AAA", "BBB", "CCC", "HOLE", "STAL", "NOPE"], FIRST, LAST, root)
+    assert usable == ["AAA", "BBB", "CCC"]
+    assert "consecutive" in refused["HOLE"] and "too short to count as ended" in refused["STAL"]
+    assert "NOPE" in refused["NOPE"] and "no cached daily bars" in refused["NOPE"]
+    usable_f, refused_f = F.usable_symbols(["AAA", "BBB", "CCC", "SPY"], FIRST, LAST, root, groups=["f"])
+    assert usable_f == ["AAA", "BBB"] and "cached FMP" in refused_f["CCC"] and "SPY" in refused_f["SPY"]

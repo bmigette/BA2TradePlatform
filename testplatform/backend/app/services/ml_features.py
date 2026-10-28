@@ -32,6 +32,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import date
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
@@ -105,7 +106,9 @@ def last_cached_bar(symbol: str, cache_root: Path) -> date:
     return pd.Timestamp(_date_column(symbol, cache_root).max()).normalize().date()
 
 
+@lru_cache(maxsize=64)
 def _sessions_index(first: date, last: date) -> pd.DatetimeIndex:
+    """The NYSE sessions of ``[first, last]`` (memoised: callers never mutate the index)."""
     return pd.DatetimeIndex(pd.to_datetime(regular_sessions(first, last)["session"]), name="session")
 
 
@@ -177,8 +180,12 @@ def load_daily(symbols: Iterable[str], first: date, last: date, cache_root: Path
             ended = short > ENDED_AFTER_SESSIONS
             if not ended:
                 gap = sessions[sessions > have_ts]
-                raise PanelDataError(f"{sym}: stale series, last cached bar {have_ts.date()} but {len(gap)} sessions "
-                                     f"up to {sessions[-1].date()} have none")
+                raise PanelDataError(
+                    f"{sym}: stale series, last cached bar {have_ts.date()} but {len(gap)} sessions up to "
+                    f"{sessions[-1].date()} have none" + (
+                        f"; it is {short} sessions short of the cache end {cache_end}: too short to count as ended "
+                        f"(ended needs more than {ENDED_AFTER_SESSIONS})" if cache_end is not None else
+                        "; no cache end was given, so no tail can count as ended"))
             meta["ended"][sym] = str(have_ts.date())
         before = raw[raw.index < sessions[0]]
         start = before.index[-1] if len(before) else sessions[0]
@@ -231,6 +238,7 @@ class BuildContext:
     membership: Optional[pd.DataFrame] = None
     sector_overrides: Dict[str, str] = field(default_factory=dict)
     provenance: Dict[str, object] = field(default_factory=dict)      # filled by groups: what files they read
+    cache: Optional["BuildCache"] = field(default=None, compare=False, repr=False)
 
     def member_mask(self) -> pd.DataFrame:
         """(sessions x universe) bool: who is in the cross-section on each session."""
@@ -247,6 +255,59 @@ def _no_context(symbols: Sequence[str], sector_of: Optional[Dict[str, str]]) -> 
     return set()
 
 
+
+class BuildCache:
+    """Loaded daily frames and per-symbol technical features shared by several ``build_features`` calls over ONE window
+    (``preloaded=``), e.g. a 300-name universe built in chunks: each symbol is read and its indicators computed once.
+
+    The window is fixed by the first build (its ``last_day``, cache root and cache end, and its load start); a later
+    build for another ``last_day`` / cache, or one that needs a symbol whose first bar is before the window start,
+    raises (build the first chunk with the earliest ``first_day``, or preload everything at once). Values are the same
+    as without the cache."""
+
+    def __init__(self):
+        self.window: Optional[Tuple[str, str, str]] = None
+        self.first: Optional[date] = None
+        self.daily: Dict[str, pd.DataFrame] = {}
+        self.meta: Dict[str, Dict[str, object]] = {"filled": {}, "first_bar": {}, "ended": {}}
+        self._tech: Dict[str, pd.DataFrame] = {}
+
+    def load(self, symbols: Sequence[str], first: date, last: date, cache_root: Path,
+             cache_end: date) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Dict[str, object]]]:
+        window = (str(last), str(Path(cache_root).resolve()), str(cache_end))
+        if self.window is None:
+            self.window, self.first = window, first
+        else:
+            for name, mine, theirs in zip(("last_day", "cache_root", "cache_end"), self.window, window):
+                if mine != theirs:
+                    raise ValueError(f"the shared BuildCache was built for {name} {mine}, this build asks for {theirs}")
+            if first < self.first:
+                raise ValueError(f"the shared BuildCache starts at {self.first}; this build needs {first}: build the "
+                                 f"first chunk with the earliest first_day")
+        missing = [s for s in symbols if s not in self.daily]
+        for sym in missing:
+            if first_cached_bar(sym, cache_root).date() < self.first:
+                raise ValueError(f"{sym} has bars before the shared BuildCache window starts ({self.first}); preload it "
+                                 f"in the first build")
+        if missing:
+            frames, meta = load_daily(missing, self.first, last, cache_root, cache_end=cache_end)
+            self.daily.update(frames)
+            for k in self.meta:
+                self.meta[k].update(meta[k])
+        sub = {k: {s: v for s, v in self.meta[k].items() if s in symbols} for k in self.meta}
+        return {s: self.daily[s] for s in symbols}, sub
+
+    def technical(self, symbol: str, live: pd.DataFrame) -> pd.DataFrame:
+        if symbol not in self._tech:
+            self._tech[symbol] = _technical_one(live)
+        return self._tech[symbol]
+
+
+def _tech(ctx: "BuildContext", symbol: str, live: pd.DataFrame) -> pd.DataFrame:
+    """``_technical_one`` of a symbol's listed bars, shared across chunked builds when a BuildCache is in use."""
+    return ctx.cache.technical(symbol, live) if ctx.cache is not None else _technical_one(live)
+
+
 @dataclass(frozen=True)
 class GroupSpec:
     """A feature group: its ``builder``, its column ``prefix`` (``"t_"``), whether it needs ``sector_of``, and
@@ -258,13 +319,13 @@ class GroupSpec:
 
 
 def _per_symbol(daily: Dict[str, pd.DataFrame], ctx: BuildContext,
-                fn: Callable[[pd.DataFrame], pd.DataFrame]) -> pd.DataFrame:
+                fn: Callable[[pd.DataFrame, str], pd.DataFrame]) -> pd.DataFrame:
     """Run ``fn`` on each built symbol's LISTED bars and put the result on the full session grid: rows before the
     listing are NaN (an indicator is never seeded from a symbol that did not exist yet)."""
     frames: Dict[str, pd.DataFrame] = {}
     for sym in ctx.symbols:
         d = daily[sym]
-        frames[sym] = fn(d[d["listed"]]).reindex(ctx.sessions).astype("float64")
+        frames[sym] = fn(d[d["listed"]], sym).reindex(ctx.sessions).astype("float64")
     return pd.concat(frames, names=_INDEX_NAMES)
 
 
@@ -398,7 +459,7 @@ def _technical_one(d: pd.DataFrame) -> pd.DataFrame:
 def technical(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
     """Group ``t_``: see ``T_COLUMNS``. Price-derived columns are log returns, ATR multiples or ratios; ``t_rsi`` and
     ``t_donch_*`` are centred on 0 ([-0.5, 0.5]); ``t_adx`` is ADX/100; ``t_bb_pctb`` is %B - 0.5."""
-    return _per_symbol(daily, ctx, _technical_one)
+    return _per_symbol(daily, ctx, lambda live, sym: _tech(ctx, sym, live))
 
 
 # ------------------------------------------------------------------------------------------ group MTF (weekly)
@@ -436,7 +497,7 @@ def _weekly_one(d: pd.DataFrame) -> pd.DataFrame:
 def multi_timeframe(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
     """Group ``mtf_``: weekly RSI14 (scaled), distance to the 10- and 40-week SMA in weekly-ATR units, 4- and 13-week
     log returns, all from COMPLETED weeks (see ``_weekly_one``)."""
-    return _per_symbol(daily, ctx, _weekly_one)
+    return _per_symbol(daily, ctx, lambda live, sym: _weekly_one(live))
 
 
 # ------------------------------------------------------------------------------------------ group M (market)
@@ -623,7 +684,7 @@ def cross_section(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataF
             t = pd.DataFrame(np.nan, index=ctx.sessions, columns=list(X_RANKED))
             o = pd.DataFrame(np.nan, index=ctx.sessions, columns=["x_mom_12_1", "x_weinstein", "x_relvol"])
         else:
-            t = _technical_one(live)[list(X_RANKED)].reindex(ctx.sessions)
+            t = _tech(ctx, sym, live)[list(X_RANKED)].reindex(ctx.sessions)
             o = _own_columns(live).reindex(ctx.sessions)
         own[sym] = o
         for c in X_RANKED:
@@ -919,19 +980,54 @@ def _pick(values: np.ndarray, chosen: np.ndarray) -> np.ndarray:
     return out
 
 
-def _statement_features(symbol: str, sessions: Sequence[date], market_cap: np.ndarray, cache_root: Path) -> pd.DataFrame:
+#: the keys each annual statement file must carry (in at least one record) for group F
+_STATEMENT_KEYS: Dict[str, Tuple[str, ...]] = {
+    "balance_sheet_annual": ("totalLiabilities", "totalAssets", "totalCurrentAssets", "totalCurrentLiabilities"),
+    "cashflow_statement_annual": ("freeCashFlow", "commonStockRepurchased", "stockBasedCompensation", "capitalExpenditure"),
+    "income_statement_annual": ("revenue",)}
+_F_FILES: Tuple[str, ...] = ("past_earnings_quarterly",) + tuple(_STATEMENT_KEYS)
+
+
+def fmp_history_path(kind: str, symbol: str, cache_root: Path) -> Path:
+    return Path(cache_root) / "fmp_history" / f"{kind}__{symbol}.json"
+
+
+def load_statements(symbol: str, cache_root: Path) -> Dict[str, List[dict]]:
+    """The annual statements group F reads, or ``PanelDataError``: a missing file (an ETF has none), an empty file, or
+    a needed key absent from EVERY record of a file (a schema change; a key missing from some records is just NaN)."""
+    from app.services import ml_panel
+    out: Dict[str, List[dict]] = {}
+    for kind, keys in _STATEMENT_KEYS.items():
+        recs = ml_panel._load_json(cache_root, kind, symbol)
+        if not recs:
+            raise PanelDataError(f"{symbol}: {kind} has no records (an empty file); group F is stock-only")
+        for key in keys:
+            if not any(key in r for r in recs):
+                raise PanelDataError(f"{symbol}: {kind} has no '{key}' in any of its {len(recs)} records")
+        out[kind] = recs
+    return out
+
+
+def check_fundamentals_files(symbol: str, cache_root: Path) -> None:
+    """Everything group F needs for ``symbol`` is present (``PanelDataError`` otherwise)."""
+    from app.services import ml_panel
+    ml_panel._load_json(cache_root, "past_earnings_quarterly", symbol)
+    load_statements(symbol, cache_root)
+
+
+def _statement_features(symbol: str, sessions: Sequence[date], market_cap: np.ndarray,
+                        statements: Dict[str, List[dict]]) -> pd.DataFrame:
     """The ``_F_STATEMENT_COLUMNS`` of one symbol on ``sessions`` (dates).
 
     Each annual statement is visible from the session after its ``acceptedDate`` (``ml_panel.fundamentals_visible_from``
     "annual" rule) and the newest fiscal year visible is used. The ratios over revenue need the income statement of
-    the SAME fiscal date, so they appear when both filings are public; the yields need only the cash flow. A missing
-    file raises (``PanelDataError``): F is a stock-only group."""
+    the SAME fiscal date, so they appear when both filings are public; the yields need only the cash flow. The records
+    come from ``load_statements`` (a missing file or key refuses)."""
     from app.services import ml_panel
 
     sessions = list(sessions)
-    bs = ml_panel._load_json(cache_root, "balance_sheet_annual", symbol)
-    cf = ml_panel._load_json(cache_root, "cashflow_statement_annual", symbol)
-    inc = ml_panel._load_json(cache_root, "income_statement_annual", symbol)
+    bs, cf, inc = (statements["balance_sheet_annual"], statements["cashflow_statement_annual"],
+                   statements["income_statement_annual"])
 
     def visible(rec: dict) -> Optional[date]:
         return ml_panel.fundamentals_visible_from("annual", rec, sessions) if "date" in rec else None
@@ -993,11 +1089,16 @@ def fundamentals(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFr
     dates = [t.date() for t in ctx.sessions]
     caps = ml_universe.scan_values(list(ctx.symbols), ctx.sessions, ["market_cap"], ctx.store_dir)["market_cap"]
     frames: Dict[str, pd.DataFrame] = {}
+    files = ctx.provenance.setdefault("fmp_history", {})
     for sym in ctx.symbols:
+        statements = load_statements(sym, ctx.cache_root)                       # refuses a missing file / key first
         table = ml_panel.fundamentals_table(sym, ext, ctx.cache_root)
+        for kind in _F_FILES:
+            path = fmp_history_path(kind, sym, ctx.cache_root)
+            files[path.name] = _fingerprint(path)
         b = pd.DataFrame({"session": dates, "close": daily[sym]["close"].to_numpy()}, index=ctx.sessions)
         base = ml_panel.fundamental_features(b, table)[list(_F_PANEL_COLUMNS)]
-        stm = _statement_features(sym, dates, caps[sym].to_numpy(dtype="float64"), ctx.cache_root)
+        stm = _statement_features(sym, dates, caps[sym].to_numpy(dtype="float64"), statements)
         stm.index = ctx.sessions
         frames[sym] = pd.concat([base, stm], axis=1)[list(F_COLUMNS)]
     return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
@@ -1048,6 +1149,41 @@ def _check_contract(group: str, spec: GroupSpec, cols: pd.DataFrame, ctx: BuildC
                              f"({int(inf.sum())} infinite values); refusing to turn it into NaN")
 
 
+def _refuse_if_store_lists_ended(ended: Dict[str, str], store_path: Path) -> None:
+    """A series that looks ended (its last bar is far before the cache end) while the metric store still has a scan row
+    for it AFTER that bar is a download hole, not a delisting: STALE, refused."""
+    if not ended or not Path(store_path).exists():
+        return
+    for sym, last in ended.items():
+        newest = ml_universe.last_scan_with(sym, store_path)
+        if newest is not None and newest > last:
+            raise PanelDataError(f"{sym}: the metric store still lists it on {newest}, after its last cached bar {last}; "
+                                 f"the cached series is stale (a delisted name leaves the store), not ended")
+
+
+def usable_symbols(symbols: Sequence[str], first: date, last: date, cache_root: Path, groups: Sequence[str] = (),
+                   store_dir: Optional[Path] = None) -> Tuple[List[str], Dict[str, str]]:
+    """Pre-screen ``symbols``: ``(usable, refused)`` where ``refused`` maps each symbol that ``load_daily`` (bars missing,
+    stale, a run of missing sessions, an invalid bar ...), the ended-vs-store check, or group F (``"f" in groups``:
+    missing statement files or keys) would refuse to the reason. Nothing is built."""
+    cache_end = last_cached_bar("SPY", cache_root)
+    store_path = Path(store_dir) if store_dir is not None else ml_universe.store_dir_for(cache_root)
+    usable: List[str] = []
+    refused: Dict[str, str] = {}
+    for sym in symbols:
+        try:
+            _, meta = load_daily([sym], min(first, first_cached_bar(sym, cache_root).date()), last, cache_root,
+                                 cache_end=cache_end)
+            _refuse_if_store_lists_ended(meta["ended"], store_path)
+            if "f" in groups:
+                check_fundamentals_files(sym, cache_root)
+        except PanelDataError as e:
+            refused[sym] = str(e)
+        else:
+            usable.append(sym)
+    return usable, refused
+
+
 def _fingerprint(p: Path) -> Dict[str, object]:
     st = p.stat()
     return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
@@ -1058,7 +1194,8 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
                    sector_of: Union[None, str, Dict[str, str]] = None,
                    universe: Optional[Sequence[str]] = None, store_dir: Optional[Path] = None,
                    sector_overrides: Optional[Dict[str, str]] = None,
-                   membership: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                   membership: Optional[pd.DataFrame] = None,
+                   preloaded: Optional[BuildCache] = None) -> pd.DataFrame:
     """Point-in-time daily features indexed ``[symbol, session]`` for ``symbols`` over ``[first_day, last_day]``.
 
     Every loaded symbol is read from its first cached bar (``first_day`` only trims the output), the requested
@@ -1072,7 +1209,8 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
     overrides win over both sources). ``membership`` (optional, sessions x symbols bool, e.g.
     ``ml_universe.membership_from_universe``) says who is in the universe on each session: group X ranks only the
     members of that session and group M's breadth counts only them; None means every universe symbol always (the
-    NDQ30 stage). With a membership the universe defaults to ``symbols`` plus the membership's columns. The cache end (what ``ended`` is measured against) is SPY's last bar, so SPY
+    NDQ30 stage). With a membership the universe defaults to ``symbols`` plus the membership's columns. ``preloaded``
+    (a ``BuildCache``) shares the loaded bars and the technical features across chunked builds of one window. The cache end (what ``ended`` is measured against) is SPY's last bar, so SPY
     must be cached.
 
     Columns: ``listed`` (a real bar exists: False before a symbol's first bar and after its last), ``ended`` (the
@@ -1128,13 +1266,18 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
     load = list(dict.fromkeys(symbols + universe + context_symbols + sorted(required)))
     earliest = min(first_cached_bar(s, cache_root) for s in load)
     cache_end = last_cached_bar("SPY", cache_root)
-    daily, load_meta = load_daily(load, min(first_day, earliest.date()), last_day, cache_root, cache_end=cache_end)
+    load_first = min(first_day, earliest.date())
+    if preloaded is None:
+        daily, load_meta = load_daily(load, load_first, last_day, cache_root, cache_end=cache_end)
+    else:
+        daily, load_meta = preloaded.load(load, load_first, last_day, cache_root, cache_end)
+    _refuse_if_store_lists_ended(load_meta["ended"], store_path)
     sessions = next(iter(daily.values())).index
     mask = (None if membership is None
             else membership.reindex(index=sessions, columns=universe, fill_value=False).fillna(False).astype(bool))
     ctx = BuildContext(tuple(symbols), tuple(universe), tuple(s for s in load if s not in symbols), sessions,
                        first_day, last_day, Path(cache_root), store_path, dict(sectors) if sectors is not None else {},
-                       mask, dict(sector_overrides) if sector_overrides else {})
+                       mask, dict(sector_overrides) if sector_overrides else {}, cache=preloaded)
     parts: List[pd.DataFrame] = []
     per_group: Dict[str, List[str]] = {}
     for g, spec in specs.items():
@@ -1156,6 +1299,11 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
     out.loc[~out["listed"].to_numpy(), feats] = np.nan         # safety net: no feature exists before the listing
     day = out.index.get_level_values("session")
     out = out[(day >= pd.Timestamp(first_day)) & (day <= pd.Timestamp(last_day))]
+    listed = out["listed"].to_numpy()
+    nan_rate = {c: (float(out.loc[listed, c].isna().mean()) if listed.any() else 1.0) for c in feature_columns(out, groups)}
+    if any(g in groups for g in ("x", "f")):
+        st = ml_universe.scan_store(store_path)
+        ctx.provenance["store"] = {"dir": str(store_path), "newest_scan": st.dates[-1], "fingerprint": st.fingerprint}
     out.attrs["meta"] = {
         "first_day": str(first_day), "last_day": str(last_day), "groups": per_group, "symbols": symbols,
         "universe": universe, "context_symbols": [s for s in load if s not in symbols],
@@ -1165,8 +1313,7 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
                                                        "first_member_session": str(membership.index[membership.any(axis=1).to_numpy()][0].date())
                                                        if membership.any(axis=None) else None}),
         "sector_overrides": dict(sector_overrides) if sector_overrides else {},
-        "store": ({"dir": str(store_path), "newest_scan": ml_universe.scan_store(store_path).dates[-1]}
-                  if any(g in groups for g in ("x", "f")) else None),
+        "ended": dict(load_meta["ended"]), "nan_rate": nan_rate,
         "columns": list(out.columns),
         "source": {"daily": {s: _fingerprint(_cache_file(cache_root, s)) for s in load}, **ctx.provenance}}
     return out

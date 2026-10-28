@@ -1064,3 +1064,62 @@ def test_membership_must_be_boolean_and_cover_the_universe(cache):
         _build(cache, ["x"], symbols=XU, membership=_membership(sess).astype(float))
     with pytest.raises(ValueError, match="universe"):
         _build(cache, ["x"], symbols=("AAA",), universe=("AAA",), membership=_membership(sess))
+
+
+# ---------------------------------------------------------------------------------------------- ended vs stale, cache
+def _with_gone_in_the_store(cache, tmp_path, last_scan):
+    """A cache where GONE's bars end 2023-06-30 and the store lists GONE on every scan up to ``last_scan``."""
+    from tests.test_ml_universe import write_metric_store
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    s = _sessions()
+    _write(root, "GONE", _bars(s[s <= pd.Timestamp("2023-06-30")], 55))
+    rows = _store_rows()
+    gone = rows[rows["symbol"] == "AAA"].assign(symbol="GONE")
+    gone = gone[gone["date"] <= last_scan]
+    shutil.rmtree(root / "screener" / "_derived", ignore_errors=True)
+    write_metric_store(root / "screener" / "metric_store_alpaca_20261022", pd.concat([rows, gone]))
+    return root
+
+
+def test_a_store_scan_after_the_last_bar_makes_the_series_stale_not_ended(cache, tmp_path):
+    root = _with_gone_in_the_store(cache, tmp_path, "2023-09-27")
+    with pytest.raises(P.PanelDataError, match=r"GONE.*2023-09-27.*after its last cached bar 2023-06-30.*stale"):
+        _build(root, ["t"], symbols=("AAA", "GONE"))
+    ok_root = _with_gone_in_the_store(cache, tmp_path / "ok", "2023-06-28")
+    f = _build(ok_root, ["t"], symbols=("AAA", "GONE"))
+    assert f.attrs["meta"]["ended"] == {"GONE": "2023-06-30"}                  # each ended symbol's last bar, recorded
+    assert f.attrs["meta"]["load"]["ended"] == {"GONE": "2023-06-30"}
+
+
+def test_the_stale_message_says_it_is_too_short_to_count_as_ended(tmp_path):
+    root = tmp_path / "c"
+    s = _sessions(date(2022, 6, 1), date(2023, 6, 30))
+    _write(root, "GONE", _bars(s, 3).iloc[:151])
+    with pytest.raises(P.PanelDataError, match=r"5 sessions short.*too short to count as ended.*more than 10"):
+        F.load_daily(["GONE"], s[100].date(), s[200].date(), root, cache_end=s[155].date())
+
+
+def test_a_shared_build_cache_loads_and_computes_once_and_changes_nothing(cache, monkeypatch):
+    loads, techs = [], []
+    real_load, real_tech = F.load_daily, F._technical_one
+    monkeypatch.setattr(F, "load_daily", lambda syms, *a, **k: (loads.append(list(syms)), real_load(syms, *a, **k))[1])
+    monkeypatch.setattr(F, "_technical_one", lambda d: (techs.append(len(d)), real_tech(d))[1])
+    chunks = (("AAA",), ("BBB", "CCC"))
+    plain = [_build(cache, ["t", "x"], symbols=c, universe=XU) for c in chunks]
+    n_loads_plain, n_techs_plain = len(loads), len(techs)
+    assert n_loads_plain == 2 and n_techs_plain == (3 + 1) + (3 + 2)
+    loads.clear(), techs.clear()
+    shared = F.BuildCache()
+    cached = [F.build_features(list(c), FIRST, LAST, ["t", "x"], cache, list(CTX), universe=list(XU), preloaded=shared)
+              for c in chunks]
+    assert len(loads) == 1 and len(techs) == 3                                  # loaded once, T computed once per symbol
+    for a, b in zip(plain, cached):
+        pd.testing.assert_frame_equal(a.drop(columns="label_bar_filled"), b.drop(columns="label_bar_filled"), check_exact=True)
+
+
+def test_a_shared_build_cache_refuses_a_different_window(cache):
+    shared = F.BuildCache()
+    F.build_features(["AAA"], FIRST, LAST, ["t"], cache, list(CTX), preloaded=shared)
+    with pytest.raises(ValueError, match="last_day"):
+        F.build_features(["AAA"], FIRST, date(2024, 3, 27), ["t"], cache, list(CTX), preloaded=shared)

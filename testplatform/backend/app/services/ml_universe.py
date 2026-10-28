@@ -100,6 +100,13 @@ def scan_store(store_dir: Any = None) -> ScanStore:
     return _scan_store(_key(store_dir))
 
 
+def last_scan_with(symbol: str, store_dir: Any = None) -> Optional[str]:
+    """The newest scan date ('YYYY-MM-DD') holding a row for ``symbol``, or None if the store never lists it."""
+    st = scan_store(store_dir)
+    dates = st.df.loc[st.df["symbol"] == symbol, "date"]
+    return None if dates.empty else str(dates.astype(str).max())
+
+
 def _as_date(day: Any) -> date:
     if isinstance(day, datetime):
         return day.date()
