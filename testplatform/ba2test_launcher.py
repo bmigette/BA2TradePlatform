@@ -10132,7 +10132,8 @@ def main(argv: "list | None" = None) -> int:
     mg.add_argument("--cpu-slots", type=int, default=None, help="Worker processes for the tabular families. Required unless --report-only.")
     mg.add_argument("--report-only", default=None, metavar="DIR",
                     help="Rebuild report.md and dashboard.html (gate included) from DIR/results.jsonl and exit; runs nothing.")
-    mg.add_argument("--gpu-slots", type=int, default=0, help="Worker processes for sequence families (none yet).")
+    mg.add_argument("--gpu-slots", type=int, default=3,
+                    help="Worker processes of the GPU pool (tsai-* / darts-* families), separate from --cpu-slots (default 3).")
     mg.add_argument("--limit-cells", type=int, default=None, help="Run only the first N cells of the config.")
     mg.add_argument("--cache-root", default=None, help="Cache folder holding AlpacaHistoryOHLCVProvider (default: the platform cache).")
     mg.add_argument("--rerun-mismatched", action="store_true",

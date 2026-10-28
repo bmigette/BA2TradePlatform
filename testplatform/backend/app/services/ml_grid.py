@@ -76,8 +76,23 @@ on that set is refused with the group named, never padded with NaN. Daily bars (
 Parallelism. A ``ProcessPoolExecutor`` of ``cpu_slots`` workers runs the tabular families; each worker loads each panel
 (stores + bars + targets) ONCE (``_init_worker`` warms the panels of the pending tasks; ``get_panel`` is a per-process
 cache keyed by store, symbols, cache root and track). ``n_jobs = cores // cpu_slots`` per fit, so slots x n_jobs <=
-cores. Sequence families (tsai / darts) will register in ``FAMILY_POOL`` with pool ``"gpu"`` and run in a second pool of
-``gpu_slots`` workers; none exists yet, so that pool is never started.
+cores. The sequence families (``tsai-<arch>``, ``darts-<arch>``; see "GPU families") are registered in ``FAMILY_POOL``
+with pool ``"gpu"`` and run in a second spawn pool of ``gpu_slots`` workers, concurrently with the CPU pool, with the
+same lifecycle (retries, probation, cancellation, lock); ``ml_grid_seq`` holds their input construction.
+
+GPU families (Task 4.4b). ``family`` is ``tsai-<arch>`` for every ``ml_models_seq.TSAI_ARCHS`` entry (stage 1 uses
+``tsai-inception`` and ``tsai-minirocket``) or ``darts-<arch>`` for ``nhits`` / ``nbeats`` / ``tcn`` (TFT is refused:
+20-55 minutes a fit). The architecture comes from the family, so ``params`` must not set ``arch``. Both need half-year
+blocks (``blocks: "H"``). tsai reads the 1h INTRADAY panel (``ml_panel``, regular session, bars stamped at their end;
+the cell's ``groups`` must be ``["panel_1h"]``: the panel's own technical / daily-context / market features): training
+samples are windows ending at ``sample_bars(per_session)`` bars of the training sessions (the end-of-day bar always
+included), each labelled with the DAILY target of its session (decided at that session's close, so an intraday bar's
+label lies in its future and never in its past), validation is the end-of-day bars of the train-tail sessions, and
+ONLY the end-of-day bar of each test session is predicted: one daily row per (symbol, session), scored like a tabular
+cell. darts reads the daily store frame (the cell's groups, robust-scaled on the training rows, NaN as 0, as past
+covariates; the target series is the daily log return), forecasts the next ``horizon`` daily returns as quantiles and
+scores a row with P(up) of the H-day return; target kinds ``rel_return`` and ``quantile`` only. A deep cell's time
+budget (``GridSettings.gpu_budget_minutes``) is checked before each block: over it the task is an error row.
 
 Outputs in ``--out``: ``results.jsonl`` (one row per finished (cell_key, seed); resume skips them),
 ``predictions/<cell_key>_<seed>.parquet`` (written BEFORE the row, so a row implies its file), ``errors.jsonl`` (a
@@ -93,6 +108,7 @@ import math
 import multiprocessing
 import os
 import socket
+import threading
 import time
 import traceback
 from collections import OrderedDict, deque
@@ -111,6 +127,7 @@ from app.services import ml_eval as E
 from app.services import ml_features as F
 from app.services import ml_holdout as HO
 from app.services import ml_models as M
+from app.services import ml_models_seq as MS
 from app.services import ml_targets as T
 from app.services import ml_walkforward as W
 from app.services.ml_controls import DEFAULT_SEEDS, controls_report
@@ -147,6 +164,16 @@ class GridSettings:
     regime_min_rows: int = 20
     control_seeds: Tuple[int, ...] = DEFAULT_SEEDS
     cores: int = 24
+    #: GPU families only (they are left out of a tabular row's identity): tsai window length in 1h bars (35 = 5
+    #: sessions), training bars per session and symbol (``ml_panel.sample_bars``; the end-of-day bar included),
+    #: darts window in daily bars, and the cap on a deep cell's epochs (early stopping still applies)
+    seq_lookback: int = 35
+    seq_samples_per_session: int = 4
+    darts_lookback: int = 20
+    gpu_max_epochs: int = 15
+    #: minutes one (cell, seed) of a GPU family may take before the task is aborted with an error row (a run setting:
+    #: not part of any row's identity)
+    gpu_budget_minutes: float = 20.0
 
     def __post_init__(self) -> None:
         if not self.eval_start < self.eval_end:
@@ -155,9 +182,12 @@ class GridSettings:
             raise ValueError("data_start must be before eval_start")
         if self.cost_bps < 0 or not 0 < self.timing_q < 1 or not 0 < self.val_share < 1:
             raise ValueError("cost_bps >= 0, 0 < timing_q < 1 and 0 < val_share < 1 required")
-        for name in ("min_count", "min_obs", "regime_min_rows", "cores"):
+        for name in ("min_count", "min_obs", "regime_min_rows", "cores", "seq_lookback", "seq_samples_per_session",
+                     "darts_lookback", "gpu_max_epochs"):
             if not _is_int(getattr(self, name)) or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be an integer >= 1")
+        if not _is_real(self.gpu_budget_minutes) or self.gpu_budget_minutes <= 0:
+            raise ValueError("gpu_budget_minutes must be a number > 0")
         if not len(self.control_seeds):
             raise ValueError("control_seeds is empty")
 
@@ -165,7 +195,9 @@ class GridSettings:
         return {"eval_start": str(self.eval_start), "eval_end": str(self.eval_end), "data_start": str(self.data_start),
                 "cost_bps": self.cost_bps, "timing_q": self.timing_q, "min_count": self.min_count,
                 "val_share": self.val_share, "min_obs": self.min_obs, "regime_min_rows": self.regime_min_rows,
-                "control_seeds": list(self.control_seeds), "cores": self.cores}
+                "control_seeds": list(self.control_seeds), "cores": self.cores, "seq_lookback": self.seq_lookback,
+                "seq_samples_per_session": self.seq_samples_per_session, "darts_lookback": self.darts_lookback,
+                "gpu_max_epochs": self.gpu_max_epochs, "gpu_budget_minutes": self.gpu_budget_minutes}
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "GridSettings":
@@ -217,8 +249,27 @@ KINDS: Dict[str, KindSpec] = {
 }
 _BARRIER_KINDS = ("triple_barrier", "binary_barrier")
 
-#: which worker pool runs a family. Sequence families (tsai, darts) will register here as "gpu".
-FAMILY_POOL: Dict[str, str] = {f: "cpu" for f in M.SUPPORTED_TASKS}
+#: GPU families: ``tsai-<arch>`` for every tsai architecture, ``darts-<arch>`` for the batched Darts ones (tft is refused)
+TSAI_FAMILIES: Tuple[str, ...] = tuple(f"tsai-{a}" for a in MS.TSAI_ARCHS)
+GRID_DARTS_ARCHS: Tuple[str, ...] = tuple(a for a in MS.DARTS_ARCHS if a in MS.BATCHED_ARCHS)
+DARTS_FAMILIES: Tuple[str, ...] = tuple(f"darts-{a}" for a in GRID_DARTS_ARCHS)
+GPU_FAMILIES: Tuple[str, ...] = TSAI_FAMILIES + DARTS_FAMILIES
+#: target kinds a darts cell may use: it forecasts the symbol's own bar returns, whatever the evaluation target
+DARTS_KINDS: Tuple[str, ...] = ("rel_return", "quantile")
+#: the intraday panel's feature group name a tsai cell must declare
+TSAI_GROUPS: Tuple[str, ...] = ("panel_1h",)
+
+#: which worker pool runs a family
+FAMILY_POOL: Dict[str, str] = {**{f: "cpu" for f in M.SUPPORTED_TASKS if f not in M.SEQUENCE_FAMILIES},
+                               **{f: "gpu" for f in GPU_FAMILIES}}
+
+
+def split_family(family: str) -> Tuple[str, Optional[str]]:
+    """``("tsai", "inception")`` for ``"tsai-inception"``; ``(family, None)`` for a tabular family."""
+    if family in GPU_FAMILIES:
+        base, _, arch = family.partition("-")
+        return base, arch
+    return family, None
 
 _CELL_KEYS = ("track", "store", "symbols", "groups", "target", "family", "params", "train_months", "blocks", "seeds")
 _CELL_OPTIONAL = ("params",)
@@ -322,6 +373,10 @@ def validate_cell(raw: Any) -> Cell:
     track = raw["track"]
     if track not in TRACKS:
         raise ValueError(f"track must be one of {TRACKS}, got {track!r}")
+    family = raw["family"]
+    if not isinstance(family, str) or family not in FAMILY_POOL:
+        raise ValueError(f"family must be one of {sorted(FAMILY_POOL)}, got {family!r}")
+    base_family, arch = split_family(family)
     store = raw["store"]
     if not isinstance(store, str) or not store:
         raise ValueError("store must be a non-empty directory string")
@@ -346,9 +401,14 @@ def validate_cell(raw: Any) -> Cell:
     if not isinstance(groups, (list, tuple)) or not groups or not all(isinstance(g, str) for g in groups) \
             or len(set(groups)) != len(groups):
         raise ValueError("groups must be a non-empty list of distinct group names")
-    bad = [g for g in groups if g not in F.GROUPS]
-    if bad:
-        raise ValueError(f"unknown feature groups {bad}; known {sorted(F.GROUPS)}")
+    if base_family == "tsai":
+        if tuple(groups) != TSAI_GROUPS:
+            raise ValueError(f"a tsai cell reads the 1h panel's own features: groups must be exactly "
+                             f"{list(TSAI_GROUPS)}, got {list(groups)}")
+    else:
+        bad = [g for g in groups if g not in F.GROUPS]
+        if bad:
+            raise ValueError(f"unknown feature groups {bad}; known {sorted(F.GROUPS)}")
     target = raw["target"]
     if not isinstance(target, dict):
         raise ValueError("target must be an object {kind, horizon[, ratio]}")
@@ -358,6 +418,9 @@ def validate_cell(raw: Any) -> Cell:
     kind = target["kind"]
     if kind not in KINDS:
         raise ValueError(f"target kind must be one of {sorted(KINDS)}, got {kind!r}")
+    if base_family == "darts" and kind not in DARTS_KINDS:
+        raise ValueError(f"darts forecasts the symbol's own returns: target kind must be one of {DARTS_KINDS}, "
+                         f"got {kind!r}")
     if track == "timing" and KINDS[kind].selection_only:
         raise ValueError(f"target {kind!r} is cross-sectional: selection track only")
     horizon = target["horizon"]
@@ -370,21 +433,25 @@ def validate_cell(raw: Any) -> Cell:
         raise ValueError(f"target ratio must be a number > 0, got {ratio!r}")
     if kind not in _BARRIER_KINDS and float(ratio) != 1.0:
         raise ValueError(f"target ratio applies to {_BARRIER_KINDS} only (got {ratio!r} for {kind!r})")
-    family = raw["family"]
-    if family not in FAMILY_POOL:
-        raise ValueError(f"family must be one of {sorted(FAMILY_POOL)}, got {family!r}")
     task = KINDS[kind].task
-    if task not in M.SUPPORTED_TASKS[family]:
+    if base_family != "darts" and task not in M.SUPPORTED_TASKS[base_family]:
         raise ValueError(f"family {family!r} cannot do the {task!r} task of target {kind!r} "
-                         f"(supports {M.SUPPORTED_TASKS[family]})")
+                         f"(supports {M.SUPPORTED_TASKS[base_family]})")
     params = raw["params"] if "params" in raw else {}
     if not isinstance(params, dict):
         raise ValueError("params must be an object")
-    M.make_adapter(family, 1, params)                      # unknown keys / out-of-range values raise
+    if arch is not None:
+        if "arch" in params:
+            raise ValueError(f"params must not set 'arch': the family {family!r} fixes it")
+        M.make_adapter(base_family, 1, {**params, "arch": arch})
+    else:
+        M.make_adapter(family, 1, params)                  # unknown keys / out-of-range values raise
     months = normalise_train_months(raw["train_months"])
     blocks = raw["blocks"]
     if blocks not in W.FREQS:
         raise ValueError(f"blocks must be one of {W.FREQS}, got {blocks!r}")
+    if FAMILY_POOL[family] == "gpu" and blocks != "H":
+        raise ValueError(f"a GPU family trains on half-year blocks (blocks: 'H'), got {blocks!r}")
     seeds = raw["seeds"]
     if not isinstance(seeds, (list, tuple)) or not seeds or not all(_is_int(s) for s in seeds) \
             or len(set(seeds)) != len(seeds):
@@ -535,6 +602,8 @@ def check_groups(cells: Sequence["Cell"]) -> None:
     problems: List[str] = []
     cache: Dict[Tuple, List[str]] = {}
     for c in cells:
+        if split_family(c.family)[0] == "tsai":              # the 1h panel's own features, not a store group
+            continue
         key = (c.store, c.symbols)
         if key not in cache:
             cache[key] = usable_feature_columns(c.store, resolve_symbols(c.symbols))
@@ -569,6 +638,7 @@ class Panel:
     stores: Tuple[str, ...]
     load_seconds: float
     daily_fingerprint: str = ""
+    cache_root: str = ""
     _targets: Dict[int, pd.DataFrame] = field(default_factory=dict)
     _exc: Dict[int, T.DailyExcursions] = field(default_factory=dict)
 
@@ -646,7 +716,7 @@ def load_panel(store: Union[str, Path], symbols: Tuple[str, ...], track: str, ca
           & (lbf == False).fillna(False).astype(bool)).to_numpy()          # noqa: E712  (NA = unknown: not usable)
     X = allrows[list(cols)].to_numpy(dtype=np.float32)
     return Panel(symbols, track, index, pd.DatetimeIndex(index.get_level_values("session")), tuple(cols), X, ok, bars,
-                 arrays, tuple(n for n, _ in used), time.perf_counter() - t0, fingerprint)
+                 arrays, tuple(n for n, _ in used), time.perf_counter() - t0, fingerprint, str(cache_root))
 
 
 #: panels (stores + bars + targets, ~100-200 MB each) a worker process keeps; the least recently used is evicted
@@ -707,9 +777,35 @@ def best_iter(n_iter: Any) -> Optional[int]:
     return int(n_iter)
 
 
-def fit_block(cell: Cell, seed: int, panel: Panel, block: W.Block, window: W.Window, st: GridSettings,
-              n_jobs: int) -> BlockResult:
-    """Fit on the purged window before ``block`` and score its rows. Raises ``SkipBlock`` (reason in the message)."""
+@dataclass
+class BlockRows:
+    """The daily rows of one block, the same for every family: purged training rows split into fit / validation (the
+    validation block is the train tail), the scorable rows of the block and the labels."""
+    ks: KindSpec
+    spec: Any
+    tg: pd.DataFrame
+    tr: np.ndarray
+    pr: np.ndarray
+    y_all: np.ndarray
+    fit_idx: np.ndarray
+    val_idx: np.ndarray
+    day: np.ndarray
+    tend: np.ndarray
+
+
+def block_audit(br: BlockRows, block: W.Block, window: W.Window) -> Dict[str, Any]:
+    """What a block was fitted on: its bounds and the first / last session and target end of its fit, validation and
+    training rows (``train_target_end_max`` must lie before ``start``: every label was decided before the block)."""
+    iso = lambda i: str(pd.Timestamp(i).date())                       # noqa: E731
+    day, tend = br.day, br.tend
+    return {"start": str(block.start), "end": str(block.end), "window_start": str(window.start),
+            "fit_first": iso(day[br.fit_idx].min()), "fit_last": iso(day[br.fit_idx].max()),
+            "val_first": iso(day[br.val_idx].min()), "val_last": iso(day[br.val_idx].max()),
+            "fit_target_end_max": iso(tend[br.fit_idx].max()), "train_target_end_max": iso(tend[br.tr].max())}
+
+
+def prepare_block(cell: Cell, panel: Panel, block: W.Block, window: W.Window, st: GridSettings) -> BlockRows:
+    """The daily rows of ``block`` (see ``BlockRows``). Raises ``SkipBlock`` (reason in the message)."""
     H = cell.horizon
     ks = cell.spec
     tg = panel.targets(H)
@@ -758,6 +854,17 @@ def fit_block(cell: Cell, seed: int, panel: Panel, block: W.Block, window: W.Win
             T.check_balance(spec, block.name, counts_by_part=counts, mode="min_count", min_count=st.min_count)
         except T.TargetBalanceError as e:
             raise SkipBlock(f"unbalanced target: {e}") from e
+    return BlockRows(ks, spec, tg, tr, pr, y_all, fit_idx, val_idx, day, tend)
+
+
+def fit_block(cell: Cell, seed: int, panel: Panel, block: W.Block, window: W.Window, st: GridSettings,
+              n_jobs: int) -> BlockResult:
+    """Fit on the purged window before ``block`` and score its rows. Raises ``SkipBlock`` (reason in the message)."""
+    br = prepare_block(cell, panel, block, window, st)
+    if cell.pool == "gpu":
+        from app.services.ml_grid_seq import fit_block_seq
+        return fit_block_seq(cell, seed, panel, br, block, window, st, n_jobs)
+    ks, tg, pr, y_all, fit_idx, val_idx = br.ks, br.tg, br.pr, br.y_all, br.fit_idx, br.val_idx
     cols = panel.group_columns(cell.groups)
     names = [panel.columns[i] for i in cols]
     gt = gv = None
@@ -770,11 +877,7 @@ def fit_block(cell: Cell, seed: int, panel: Panel, block: W.Block, window: W.Win
     adapter.fit(Xf, y_all[fit_idx], Xv, y_all[val_idx], ks.task, seed, groups_train=gt, groups_val=gv,
                 feature_names=names)
     scores = adapter.score(panel.X[np.ix_(pr, cols)])
-    iso = lambda i: str(pd.Timestamp(i).date())                       # noqa: E731
-    audit = {"start": str(block.start), "end": str(block.end), "window_start": str(window.start),
-             "fit_first": iso(day[fit_idx].min()), "fit_last": iso(day[fit_idx].max()),
-             "val_first": iso(day[val_idx].min()), "val_last": iso(day[val_idx].max()),
-             "fit_target_end_max": iso(tend[fit_idx].max()), "train_target_end_max": iso(tend[tr].max())}
+    audit = block_audit(BlockRows(ks, br.spec, tg, br.tr, pr, y_all, fit_idx, val_idx, br.day, br.tend), block, window)
     return BlockResult(pr, scores, len(fit_idx), len(val_idx), adapter.n_iter, audit)
 
 
@@ -1019,11 +1122,23 @@ def library_versions() -> Dict[str, Any]:
     return out
 
 
+#: the ``GridSettings`` only a GPU family reads (a tabular row's identity leaves them out)
+SEQ_SETTINGS: Tuple[str, ...] = ("seq_lookback", "seq_samples_per_session", "darts_lookback", "gpu_max_epochs")
+
+
+class BudgetExceeded(RuntimeError):
+    """A GPU (cell, seed) ran past ``GridSettings.gpu_budget_minutes``."""
+
+
 def identity_of(cell: Cell, st: GridSettings, daily_fp: str) -> Dict[str, Any]:
     """What a finished row was computed from, for the resume check: the settings (not ``cores``), the store signature
     and the daily cache fingerprint."""
     settings = st.to_dict()
-    del settings["cores"]
+    for name in ("cores", "gpu_budget_minutes"):             # how many threads / how long it may take: not what it computes
+        del settings[name]
+    if cell.pool != "gpu":                                    # a tabular row does not depend on the sequence settings
+        for name in SEQ_SETTINGS:
+            del settings[name]
     return _sanitize({"settings": settings, "store_signature": cell.signature, "daily_fingerprint": daily_fp})
 
 
@@ -1032,6 +1147,9 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
     """One (cell, seed): walk-forward fit, stitch, evaluate. Returns the ``results.jsonl`` row (and writes the
     predictions parquet first when ``pred_dir`` is given)."""
     t_start = time.perf_counter()
+    gpu = cell.pool == "gpu"
+    if gpu and cell.blocks != "H":
+        raise ValueError(f"a GPU family trains on half-year blocks (blocks: 'H'), got {cell.blocks!r}")
     blocks = W.blocks(st.eval_start, st.eval_end, cell.blocks)
     skipped: List[Dict[str, str]] = []
     clipped: List[Dict[str, str]] = []
@@ -1039,6 +1157,9 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
     rows_l, scores_l, block_l = [], [], []
     t_fit = 0.0
     for b in blocks:
+        if gpu and time.perf_counter() - t_start > st.gpu_budget_minutes * 60.0:
+            raise BudgetExceeded(f"time budget of {st.gpu_budget_minutes:g} minutes exceeded after {len(info)} of "
+                                 f"{len(blocks)} blocks ({time.perf_counter() - t_start:.0f} s)")
         win = W.train_window(b, cell.train_months, st.data_start)
         if win.clipped:
             clipped.append({"block": b.name, "window_start": str(win.start)})
@@ -1059,6 +1180,9 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
         if isinstance(res.n_iter, (list, tuple)):
             entry["n_iter_levels"] = [int(i) for i in res.n_iter]
         info.append(entry)
+    if gpu and time.perf_counter() - t_start > st.gpu_budget_minutes * 60.0:
+        raise BudgetExceeded(f"time budget of {st.gpu_budget_minutes:g} minutes exceeded after the last block "
+                             f"({time.perf_counter() - t_start:.0f} s)")
     iters = [b["n_iter"] for b in info if b["n_iter"] is not None]
     row: Dict[str, Any] = {"cell_key": cell.key, "seed": int(seed), "track": cell.track, "label": cell.label,
                            "config": cell.config(), "identity": identity_of(cell, st, panel.daily_fingerprint),
@@ -1068,7 +1192,10 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
                            "low_iter_share": float(np.mean([i <= LOW_ITER for i in iters])) if iters else None,
                            "n_blocks": len(blocks), "n_blocks_fitted": len(info),
                            "skipped_blocks": skipped, "clipped_blocks": clipped, "blocks": info,
-                           "n_features": len(panel.group_columns(cell.groups)), "symbols": list(panel.symbols)}
+                           "n_features": (len(panel.group_columns(cell.groups)) if not gpu or
+                                          split_family(cell.family)[0] == "darts"
+                                          else (info[0]["n_channels"] if info else 0)),
+                           "symbols": list(panel.symbols)}
     if not rows_l:
         row.update({"status": "no_predictions", "n_rows": 0, "primary": {"name": None, "value": None},
                     "metrics": {}, "regimes": {}, "controls": {}})
@@ -1104,7 +1231,8 @@ PANEL_STAGGER_SECONDS = 1.5
 #: a task whose worker dies is retried this many times, then it becomes an error record
 MAX_RETRIES = 3
 #: relative cost of a family's fit (slowest first); quantile (nine boosters) counts as one step slower
-FAMILY_COST: Dict[str, int] = {"catboost": 4, "xgb": 3, "lgbm": 2, "linear": 1, "naive": 0}
+FAMILY_COST: Dict[str, int] = {"catboost": 4, "xgb": 3, "lgbm": 2, "linear": 1, "naive": 0,
+                               **{f: 6 for f in TSAI_FAMILIES}, **{f: 5 for f in DARTS_FAMILIES}}
 
 
 def _panel_for(cell: Cell, cache_root: str) -> Panel:
@@ -1412,6 +1540,58 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
         pool.shutdown(wait=False, cancel_futures=True)
 
 
+def _drive_lanes(cpu_tasks: Sequence[Tuple[Cell, int]], gpu_tasks: Sequence[Tuple[Cell, int]], cpu_slots: int,
+                 gpu_slots: int, init_args: Tuple, task_fn: Callable, finish: Callable[[Dict[str, Any]], None],
+                 cancelled: Callable[[], bool], summary: Dict[str, Any]) -> None:
+    """Run the CPU tasks on a pool of ``cpu_slots`` workers and the GPU tasks on a second pool of ``gpu_slots``, the two
+    ``_drive_pool`` lifecycles (retries, probation, cancellation, ``BrokenProcessPool``) side by side. One lane runs in
+    the calling thread, exactly as before. With both, each lane runs in its own thread: ``finish`` and the cancel check
+    are serialised by one lock, ``summary["pool_rebuilds"]`` is the sum of the lanes', and a failure in one lane stops
+    the other (its in-flight tasks are cancelled, its rows so far are kept) and is re-raised here."""
+    lanes = [(t, n) for t, n in ((cpu_tasks, cpu_slots), (gpu_tasks, gpu_slots)) if t]
+    if len(lanes) == 1:
+        _drive_pool(lanes[0][0], lanes[0][1], init_args, task_fn, finish, cancelled, summary)
+        return
+    lock = threading.RLock()
+    stop = threading.Event()
+    subs: List[Dict[str, Any]] = [{} for _ in lanes]
+    errors: List[BaseException] = []
+
+    def rebuilds() -> int:
+        return sum(s["pool_rebuilds"] for s in subs if "pool_rebuilds" in s)
+
+    def locked_finish(r: Dict[str, Any]) -> None:
+        with lock:
+            summary["pool_rebuilds"] = rebuilds()
+            finish(r)
+
+    def stopped() -> bool:
+        with lock:
+            return stop.is_set() or cancelled()
+
+    def lane(i: int, tasks: Sequence[Tuple[Cell, int]], slots: int) -> None:
+        try:
+            _drive_pool(tasks, slots, init_args, task_fn, locked_finish, stopped, subs[i])
+        except BaseException as e:                                # noqa: BLE001  (re-raised by the caller)
+            errors.append(e)
+            stop.set()
+    threads = [threading.Thread(target=lane, args=(i, t, n), daemon=True, name=f"ml_grid-lane-{i}")
+               for i, (t, n) in enumerate(lanes)]
+    for th in threads:
+        th.start()
+    try:
+        while any(th.is_alive() for th in threads):
+            for th in threads:
+                th.join(0.2)
+    except BaseException:                                         # Ctrl-C: tell the lanes to stop, then leave
+        stop.set()
+        raise
+    if errors:
+        raise errors[0]
+    summary["pool_rebuilds"] = rebuilds()
+    summary["cancelled"] = any(s["cancelled"] for s in subs if "cancelled" in s)
+
+
 def read_results(path: Union[str, Path]) -> List[Dict[str, Any]]:
     """Rows of a ``results.jsonl``; an unparseable line (a write cut short by a crash) is skipped with a warning."""
     p = Path(path)
@@ -1565,8 +1745,9 @@ def run_grid(cells: Sequence[Cell], out_dir: Union[str, Path], cpu_slots: int, g
              task_fn: Optional[Callable] = None) -> Dict[str, Any]:
     """Run every unfinished (cell, seed) of ``cells``; append a row to ``results.jsonl`` as each finishes.
 
-    ``cpu_slots``: worker processes for the tabular families. ``gpu_slots``: workers for sequence families (none
-    exist yet; a cell routed to the gpu pool with 0 slots is refused). ``inline=True`` runs in this process (tests,
+    ``cpu_slots``: worker processes for the tabular families. ``gpu_slots``: workers of the second pool, for the
+    sequence families (``tsai-*``, ``darts-*``); a cell routed to the gpu pool with 0 slots is refused. The two pools are
+    separate caps and run concurrently. ``inline=True`` runs in this process (tests,
     debugging) through the same code. ``rerun_mismatched``: see ``ResumeMismatchError`` / the module docstring.
     ``cancel_check``: polled between submissions; when it returns True the run stops cooperatively (rows already
     written stay; a restart resumes). ``task_fn``: the per-task function (default ``_run_task``; a module-level
@@ -1626,10 +1807,9 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
     tasks = [(c, sd) for c, sd in plan if (c.key, sd) not in finished]
     skipped_existing = len(plan) - len(tasks)
     gpu_tasks = [t for t in tasks if t[0].pool == "gpu"]
+    cpu_tasks = [t for t in tasks if t[0].pool != "gpu"]
     if gpu_tasks and gpu_slots < 1:
         raise ValueError(f"{len(gpu_tasks)} tasks need the gpu pool but gpu_slots is 0")
-    if gpu_tasks:
-        raise NotImplementedError("sequence families are not implemented yet (the gpu pool hook is a placeholder)")
     summary = {"tasks": len(tasks), "done": 0, "skipped_existing": skipped_existing, "errors": 0, "cancelled": False,
                "pool_rebuilds": 0, "out_dir": str(out)}
     say(f"ml_grid: {len(cells)} cells, {len(tasks)} (cell, seed) tasks to run, {skipped_existing} already finished")
@@ -1661,7 +1841,8 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
         f"{_fmt_bytes(est['predictions'])}, results {_fmt_bytes(est['results'])}); {_fmt_bytes(free)} free in {out}")
     if est["total"] > 0.9 * free:
         logger.warning(f"ml_grid: the estimated disk need exceeds 90% of the free space in {out}")
-    init_args = (st.to_dict(), cache_root, str(out), n_jobs_for(cpu_slots, st.cores))
+    workers = (cpu_slots if cpu_tasks else 0) + (gpu_slots if gpu_tasks else 0)       # the pools are separate caps
+    init_args = (st.to_dict(), cache_root, str(out), n_jobs_for(max(1, workers), st.cores))
 
     def finish(r: Dict[str, Any]) -> None:
         if "error" in r:
@@ -1692,7 +1873,7 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
                     break
                 finish(task_fn(c.config(with_seeds=True), sd, c.key))
         else:
-            _drive_pool(tasks, cpu_slots, init_args, task_fn, finish, cancelled, summary)
+            _drive_lanes(cpu_tasks, gpu_tasks, cpu_slots, gpu_slots, init_args, task_fn, finish, cancelled, summary)
     finally:                                                    # also when the run dies: the files say how far it got
         refresh(True, summary["done"] + summary["errors"])
     return summary

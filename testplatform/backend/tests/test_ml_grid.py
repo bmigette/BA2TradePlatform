@@ -296,12 +296,11 @@ def test_unusable_groups_are_refused_before_anything_starts(signal_world, tmp_pa
 
 
 def test_gpu_pool_hook(signal_world, tmp_path, monkeypatch):
-    c = cell(signal_world[0])
+    """A cell routed to the gpu pool needs gpu slots (the real GPU families are tested in test_ml_grid_seq)."""
+    c = cell(signal_world[0], blocks="H")
     monkeypatch.setitem(G.FAMILY_POOL, "lgbm", "gpu")
     with pytest.raises(ValueError, match="gpu pool"):
         run([c], tmp_path / "a", signal_world)
-    with pytest.raises(NotImplementedError):
-        run([c], tmp_path / "b", signal_world, gpu_slots=1)
     assert G.n_jobs_for(6, 24) == 4 and G.n_jobs_for(30, 24) == 1 and G.n_jobs_for(1, 24) == 24
 
 

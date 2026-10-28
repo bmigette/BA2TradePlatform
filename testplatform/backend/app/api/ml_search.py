@@ -59,7 +59,7 @@ class MlGridRequest(BaseModel):
     config_path: Optional[str] = None
     cells: Optional[List[Dict[str, Any]]] = None
     cpu_slots: int
-    gpu_slots: int = 0
+    gpu_slots: int = 3
     limit_cells: Optional[int] = None
     cache_root: Optional[str] = None
     cores: Optional[int] = None
