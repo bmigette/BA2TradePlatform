@@ -261,3 +261,24 @@ def test_held_flip_at_exact_threshold_and_bad_side():
 def test_held_flip_ignores_enable_sell():
     # closing a long is not opening a short: the flip must still fire when shorting is disabled
     assert map_held_position(row(BEAR), genes(enable_sell=False), "long").signal == OR.SELL
+
+
+def test_bullish_score_is_p_up_then_the_median_for_deciles():
+    from ba2_common.core.ml_forecast.mapping import bullish_score
+    assert bullish_score(row(), 5) == (pytest.approx(0.7), pytest.approx(BULL[4]))
+    # both clamp P(up) at 0.95; the larger median ranks higher
+    a = tuple(0.01 + 0.01 * i for i in range(9))
+    b = tuple(0.03 + 0.01 * i for i in range(9))
+    assert bullish_score(row(a), 5)[0] == bullish_score(row(b), 5)[0] == pytest.approx(0.95)
+    assert bullish_score(row(b), 5) > bullish_score(row(a), 5)
+    assert bullish_score(row(BEAR), 5) < bullish_score(row(), 5)
+
+
+def test_bullish_score_class_rows_use_the_conditional_up_probability_and_expected_return():
+    from ba2_common.core.ml_forecast.mapping import bullish_score
+    cf = ((0.2, -0.03), (0.3, 0.002), (0.5, 0.03))
+    r = ForecastRow("AAPL", date(2025, 3, 3), {}, class_probs={5: cf})
+    p, e = bullish_score(r, 5)
+    assert p == pytest.approx(0.5 / 0.7) and e == pytest.approx(-0.006 + 0.0006 + 0.015)
+    with pytest.raises(ValueError, match="horizon"):
+        bullish_score(r, 10)

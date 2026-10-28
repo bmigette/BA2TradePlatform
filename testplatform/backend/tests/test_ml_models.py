@@ -60,7 +60,7 @@ def _fit_predict(family, task, seed=1, **kw):
     return m, m.predict(Xte), yte, lat
 
 
-CASES = [(f, t) for f, ts in MM.SUPPORTED_TASKS.items() if f != "naive" for t in ts]
+CASES = [(f, t) for f, ts in MM.SUPPORTED_TASKS.items() if f != "naive" and f not in MM.SEQUENCE_FAMILIES for t in ts]
 
 
 @pytest.mark.parametrize("family,task", CASES)

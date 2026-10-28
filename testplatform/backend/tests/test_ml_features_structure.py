@@ -165,15 +165,17 @@ def test_cut_test_s(mc_cache, tmp_path, monkeypatch):
     assert cut[list(F.S_COLUMNS)].notna().all().all() and len(cut) > 700
 
 
-def test_the_real_store_row_of_a_session_is_computed_through_that_session():
-    """The evidence for the no-shift rule, on the real store: the retained window of the row of session T ends at T."""
+@pytest.mark.parametrize("profile", ["ohlcv-v1", "ta-structure-v1"])
+def test_the_real_store_row_of_a_session_is_computed_through_that_session(profile):
+    """The evidence for the no-shift rule, on the real store, for BOTH profiles: the retained window of the row of session T
+    ends at T."""
     import os
     from ba2_common.config import CACHE_FOLDER
     if not os.path.isdir(os.path.join(CACHE_FOLDER, "market_conditions", "ohlcv-v1", "manifests")):
         pytest.skip("no real market_conditions store on this host")
     store = MarketConditionStore(CACHE_FOLDER)
-    digest = F.S_MANIFESTS["ohlcv-v1"][0]
-    man = store.read_manifest(digest, "ohlcv-v1")
+    digest = F.S_MANIFESTS[profile][0]
+    man = store.read_manifest(digest, profile)
     assert man["source_profile"].startswith("alpaca") and man["timing_policy"] == "prior_session_v1"
     sym = sorted(man["coverage"])[0]
     rf = store.rows_frame(man, sym)

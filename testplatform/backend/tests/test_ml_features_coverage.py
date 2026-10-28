@@ -52,7 +52,7 @@ def test_a_group_may_declare_the_columns_that_define_its_coverage():
     assert F.GROUPS["s"].coverage_columns is not None and "s_dist_support_atr" not in F.GROUPS["s"].coverage_columns
     assert "s_adx" in F.GROUPS["s"].coverage_columns
     assert (full["share"] == 1.0).all()                         # judged on s_adx only in this frame
-    assert F.GROUPS["at"].coverage_columns == ("at_target_gap",)                  # the main signal, not the analyst count
+    assert F.GROUPS["at"].coverage_columns == ("at_n_analysts_90",)              # availability, not the (design-NaN) gap
     assert "ag_net_upgrades_30" in F.GROUPS["ag"].coverage_columns and "ag_covered" not in F.GROUPS["ag"].coverage_columns
     assert F.GROUPS["t"].coverage_columns is None
 

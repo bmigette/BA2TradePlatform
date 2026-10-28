@@ -1704,6 +1704,8 @@ _EXPERT_OPT = {
             "tp_quantile": {"optimize": True, "min": 60.0, "max": 90.0, "step": 10.0, "type": "float"},
             "sl_quantile": {"optimize": True, "min": 10.0, "max": 40.0, "step": 10.0, "type": "float"},
             "exit_flip_prob": {"optimize": True, "min": 55.0, "max": 70.0, "step": 5.0, "type": "float"},
+            # NO rank_top_n gene here: the ranking mode (strategy MLR) adds it for MLR jobs only
+            # (_apply_ml_rank_top_n, --ml-rank-top-n), so MLH / MLF / S1 keep their gene space and trial sequence.
         },
         # S1 runs long-only (shorts need the engine's enable_short), so a SELL entry gene would only spend
         # population on a knob that cannot act; a bearish forecast still exits a held long via the flip.
@@ -2472,7 +2474,8 @@ def _build_strategy_S7(name: str):
 
 #: Strategies only the named expert can use (goal2027 item 2.8). ``SQM`` is the exploration "quality_momentum"
 #: recipe, written for the DeterministicScorer score; another expert would run it on a signal it was not made for.
-_EXPERT_ONLY_STRATEGIES = {"SQM": "DeterministicScorer", "MLH": "MLForecast", "MLF": "MLForecast"}
+_EXPERT_ONLY_STRATEGIES = {"SQM": "DeterministicScorer", "MLH": "MLForecast", "MLF": "MLForecast",
+                           "MLR": "MLForecast"}
 
 
 def _refuse_ds_only_strategy(command: str, kind: str, expert: str) -> None:
@@ -2554,6 +2557,172 @@ def _build_strategy_MLH(name: str, forecast_tp: bool = False):
 def _build_strategy_MLF(name: str):
     """MLF -- MLH plus a take-profit at the forecast's own target (see _build_strategy_MLH)."""
     return _build_strategy_MLH(name, forecast_tp=True)
+
+
+def _build_strategy_MLR(name: str):
+    """MLR -- ML-forecast ROTATION (ML exploration v2, selection track). MLForecast only, with ``rank_top_n`` > 0
+    (``--ml-rank-top-n``): the expert answers BUY only for the N most bullish symbols of the store at the decision
+    date, and SELL for a held long that dropped out of them.
+
+    Entry: bullish and flat. Exits: the bearish signal (= left the top N, or a flip) is ALWAYS on -- it is the
+    rotation itself, not a gene; plus a time exit, ``days_opened >= rebalance`` calendar days (gene 5..20 step 5,
+    toggleable), the rebalance cadence. No take-profit and no strategy stop (fixed brackets are banned in v2; the RM
+    safeguard stop is placed on entry). Position count is bounded by N through the ranking, not by the strategy.
+
+    Needs ``--ml-rank-top-n`` (the gene) and gets the job's symbols as the fixed ``rank_universe`` setting
+    (``_apply_ml_rank_universe``): the ranked set is the traded set."""
+    buy = {"id": "root", "type": "AND", "conditions": [
+        {"id": "mlr_bull", "field": "bullish"},
+        {"id": "mlr_flat", "field": "has_no_position"},
+    ]}
+    exits = [
+        {"id": "mlr_exit_signal", "action_type": "close",
+         "conditions": {"type": "AND", "conditions": [{"id": "mlr_bear", "field": "bearish"}]}},
+        {"id": "mlr_exit_time", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "mlr_hold", "field": "has_position"},
+             {"id": "mlr_days", "field": "days_opened", "op": ">=", "value": 10,
+              "optimize": True, "value_min": 5, "value_max": 20, "value_step": 5}]}},
+    ]
+    return _strategy_from_parts(name, buy_tree=buy, exit_conditions=exits)
+
+
+def ml_hold_days_range(horizon: int) -> tuple:
+    """``(min, centre, max)`` of MLH's ``days_opened`` gene matched to a forecast horizon of ``horizon`` sessions
+    (``--ml-hold-from-horizon``): d = round(H x 7/5) - 1 calendar days (H sessions are about 7H/5 calendar days; the
+    position is closed at the first daily check at or after d days, i.e. about H sessions after the entry fill), and
+    the gene is {d-1, d, d+1} clipped at 0. H x 7/5 never lands on .5, so Python's rounding is unambiguous."""
+    if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 1:
+        raise ValueError(f"horizon must be an int >= 1, got {horizon!r}")
+    d = round(horizon * 7 / 5) - 1
+    return max(0, d - 1), d, d + 1
+
+
+def _ml_store_horizon(keys, command: str, flag: str) -> int:
+    """The one horizon shared by every store of ``keys`` (aliases or keys); refuses a multi-horizon store, a mix, or an
+    unreadable store."""
+    from ba2_common.core.ml_forecast import store as _store
+    from ba2_experts.MLForecast import resolve_model_key as _resolve
+    horizons = {}
+    try:
+        for k in keys:
+            hs = list(_store.read_meta(_resolve(k))["horizons"])
+            if len(hs) != 1:
+                sys.exit(f"{command}: {flag}: store {k!r} has horizons {hs}; it needs single-horizon stores")
+            horizons[k] = int(hs[0])
+    except (ValueError, _store.ForecastStoreError) as e:
+        sys.exit(f"{command}: {flag}: cannot read a store's meta: {e}")
+    if len(set(horizons.values())) != 1:
+        sys.exit(f"{command}: {flag}: the --ml-model-keys stores do not share one horizon: {horizons}")
+    return next(iter(horizons.values()))
+
+
+def _ml_hold_from_horizon_range(enabled, raw_keys, expert: str, strategy: str, command: str):
+    """``--ml-hold-from-horizon``: the ``(min, centre, max)`` of the MLH/MLF ``days_opened`` gene, or None when the flag
+    is off. Refused for any other expert or strategy, without ``--ml-model-keys``, and for stores that do not share one
+    single horizon."""
+    if not enabled:
+        return None
+    if expert != "MLForecast" or strategy not in ("MLH", "MLF"):
+        sys.exit(f"{command}: --ml-hold-from-horizon only applies to MLForecast with strategy MLH or MLF, "
+                 f"not {expert!r} / {strategy!r}")
+    if not raw_keys:
+        sys.exit(f"{command}: --ml-hold-from-horizon needs --ml-model-keys (the horizon is the stores')")
+    keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+    h = _ml_store_horizon(keys, command, "--ml-hold-from-horizon")
+    lo, centre, hi = ml_hold_days_range(h)
+    print(f"{command}: --ml-hold-from-horizon: horizon {h} -> MLH days_opened gene {lo}..{hi} (centre {centre})")
+    return lo, centre, hi
+
+
+def _apply_ml_hold_range(strat, hold_range):
+    """Set the MLH ``days_opened`` gene (rule node ``mlh_days``) to ``hold_range`` = (min, centre, max), step 1.
+    ``hold_range`` None returns ``strat`` untouched. Both spellings of each key (camel and snake) are written, as the
+    rule model stores both."""
+    if hold_range is None:
+        return strat
+    import copy
+    lo, centre, hi = hold_range
+    found = []
+
+    def walk(node):
+        if isinstance(node, list):
+            for n in node:
+                walk(n)
+        elif isinstance(node, dict):
+            if node.get("id") == "mlh_days":
+                node.update({"value": float(centre), "valueMin": float(lo), "value_min": float(lo),
+                             "valueMax": float(hi), "value_max": float(hi), "valueStep": 1.0, "value_step": 1.0})
+                found.append(node)
+            for v in node.values():
+                walk(v)
+
+    strat.exit_rules = copy.deepcopy(strat.exit_rules)
+    walk(strat.exit_rules)
+    if len(found) != 1:
+        raise ValueError(f"expected exactly one 'mlh_days' gene in the strategy, found {len(found)}")
+    return strat
+
+
+def _apply_ml_rank_top_n(spec: dict, raw, expert: str, strategy: str, command: str) -> dict:
+    """``--ml-rank-top-n 3,5``: ADD MLForecast's ``rank_top_n`` gene as a choice of these N (distinct ints >= 1) to a copy
+    of the spec. MLR only (the ranking mode is the rotation strategy's), and MLR REQUIRES it: without it MLR would be a
+    rotation strategy with ranking off. Any other strategy without the flag gets ``spec`` untouched, so MLH / MLF / S1
+    keep the gene space they always had."""
+    is_mlr = expert == "MLForecast" and strategy == "MLR"
+    if not raw:
+        if is_mlr:
+            sys.exit(f"{command}: strategy MLR needs --ml-rank-top-n N[,N] (without it the ranking is off and MLR is "
+                     f"not a rotation)")
+        return spec
+    if not is_mlr:
+        sys.exit(f"{command}: --ml-rank-top-n only applies to MLForecast with strategy MLR, not {expert!r} / {strategy!r}")
+    try:
+        ns = [int(x) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        sys.exit(f"{command}: --ml-rank-top-n needs comma-separated integers, got {raw!r}")
+    if not ns or len(set(ns)) != len(ns) or min(ns) < 1:
+        sys.exit(f"{command}: --ml-rank-top-n needs distinct integers >= 1, got {raw!r}")
+    import copy
+    out = copy.deepcopy(spec)
+    out["expert_params"]["rank_top_n"] = {"optimize": True, "type": "choice", "choices": ns}
+    print(f"{command}: --ml-rank-top-n: MLForecast rank_top_n gene choices = {ns}")
+    return out
+
+
+def _apply_ml_rank_universe(command: str, backtest_block: dict, strategy: str, model_keys=()) -> None:
+    """MLR: record the run's own symbols as the expert's FIXED ``rank_universe`` setting (comma-separated, sorted, so it
+    travels as an ordinary string setting and enters the run identity: the checkpoint fingerprint and the stored
+    config). Call AFTER every step that can rewrite ``enabled_instruments``. The ranked set is exactly the traded set,
+    never the store's directory contents. A per-trial candidate universe (``--screener``) would make it disagree with
+    the traded set, so MLR refuses a screener. Other strategies: untouched.
+
+    PREFLIGHT: for every ``model_keys`` choice (the ``model_key`` gene's aliases / keys) every universe symbol must have
+    a file in that store, or the job is refused here, naming the missing symbols: the expert aborts a run on the first
+    missing file, so without this a gene value on an incomplete store would only fail mid-GA, on whichever worker drew it."""
+    if strategy != "MLR":
+        return
+    if backtest_block.get("screener_opt"):
+        sys.exit(f"{command}: strategy MLR ranks the job's fixed symbol list; it cannot run with a screener")
+    universe = sorted({str(x).strip().upper() for x in backtest_block["enabled_instruments"] if str(x).strip()})
+    if not universe:
+        sys.exit(f"{command}: strategy MLR needs a non-empty universe to rank")
+    from ba2_common.core.ml_forecast import store as _store
+    from ba2_experts.MLForecast import resolve_model_key as _resolve
+    problems = []
+    for name in model_keys:
+        try:
+            missing = _store.missing_symbol_files(_resolve(name), universe)
+        except ValueError as e:
+            sys.exit(f"{command}: strategy MLR: cannot check store {name!r} for the universe: {e}")
+        if missing:
+            problems.append(f"{name!r}: {len(missing)} of {len(universe)} symbols have no file ({', '.join(missing[:15])}"
+                            f"{' ...' if len(missing) > 15 else ''})")
+    if problems:
+        sys.exit(f"{command}: strategy MLR ranks the whole universe, so every model_key store must hold every symbol; "
+                 f"incomplete: " + "; ".join(problems))
+    (expert,) = [e for e in backtest_block["experts"] if e["class"] == "MLForecast"]
+    expert["settings"]["rank_universe"] = ",".join(universe)
 
 
 def _build_strategy_minimal(name: str):
@@ -7240,6 +7409,7 @@ _STRATEGY_BUILDERS = {
     "SQM": _build_strategy_SQM, # (name) — DeterministicScorer only: exploration quality-momentum (stop/target/time exit)
     "MLH": _build_strategy_MLH, # (name) — MLForecast only: hold for a fixed time, no TP (custom-ML fair test)
     "MLF": _build_strategy_MLF, # (name) — MLForecast only: MLH + take-profit at the forecast's own target
+    "MLR": _build_strategy_MLR, # (name) — MLForecast only: rotation over the top-N ranked symbols (selection track)
     # Option/equity strategies (dispatch by `kind`, not `name`; see _build_strategy):
     "O_LC": _build_strategy_option, "O_VERT": _build_strategy_option,
     "O_SSTG": _build_strategy_option, "O_SSTD": _build_strategy_option,
@@ -7506,6 +7676,9 @@ def _cmd_optimize(args) -> int:
     if spec is None:
         sys.exit(f"ba2-test: optimize not configured for expert {expert!r}; have {sorted(_EXPERT_OPT)}")
     spec = _apply_ml_model_keys(spec, getattr(args, "ml_model_keys", None), expert, "optimize")
+    spec = _apply_ml_rank_top_n(spec, getattr(args, "ml_rank_top_n", None), expert, args.strategy, "optimize")
+    ml_hold_range = _ml_hold_from_horizon_range(getattr(args, "ml_hold_from_horizon", False),
+                                                getattr(args, "ml_model_keys", None), expert, args.strategy, "optimize")
     _refuse_unbounded_strategy_request("optimize", [args.strategy])
     _refuse_phase_gated_strategy("optimize", [args.strategy])
     # --rm-toggle-policy (design atr_grid_2027 §3.2). "pinned" (default) is byte-identical to
@@ -7622,6 +7795,7 @@ def _cmd_optimize(args) -> int:
             raise ValueError("Neutral option entry experiments require a ruleset expert")
         strat = _build_strategy_minimal(_sname) if bypass else _build_strategy(
             args.strategy, _sname, expert, neutral_entry_mode=neutral_mode)
+        strat = _apply_ml_hold_range(strat, ml_hold_range)
         # Pure-option strategies carry a transient `entry_action` (the option ENTRY action config).
         # Capture it BEFORE commit/refresh so a db.refresh (which reloads only mapped columns) can't
         # affect it, then thread it into the run config below so the handler's _build_experts (and
@@ -7818,6 +7992,8 @@ def _cmd_optimize(args) -> int:
         # level than its daily cache (decision price from one, history from the other).
         _refuse_intraday_basis_mismatch("optimize", backtest_block)
         universe = list(backtest_block["enabled_instruments"])      # the reviewed exclusion list may have removed some
+        _apply_ml_rank_universe("optimize", backtest_block, args.strategy,   # AFTER the last universe rewrite
+                                spec["expert_params"]["model_key"]["choices"] if args.strategy == "MLR" else ())
         # the FINAL universe's intraday coverage (threshold + report); the price-basis cross-check is the shared function of
         # fix/ohlcv-cross-interval-basis, not duplicated here
         _coverage_preflight("optimize", list(backtest_block["enabled_instruments"]), args, history_source)
@@ -8026,6 +8202,8 @@ def _cmd_optimize_batch(args) -> int:
                               ("monday", "tuesday", "wednesday", "thursday", "friday",
                                "saturday", "sunday")},
                      "times": [DEFAULT_DECISION_TIME]}
+    if any(_k == "MLR" for _e, _k in jobs):
+        sys.exit("optimize-batch: strategy MLR needs --ml-rank-top-n and the job's rank_universe; run it with `optimize`")
     _assert_option_window_excludes_holdout([k for _e, k in jobs], args.end)
     # every job's history source resolved up front: an option job stated as alpaca refuses the whole
     # batch BEFORE the first job is enqueued, not midway
@@ -8969,6 +9147,29 @@ def _ml_grid_report_only(directory: str) -> int:
     return 0
 
 
+#: The default groups of ``ba2-test ml-features`` - every registered group of ``ml_features.GROUPS`` (a test pins that).
+ML_FEATURES_DEFAULT_GROUPS = "t,mtf,m,x,mac,f,ag,at,i,s"
+
+
+def _ml_features_sector_overrides(items, no_sector: bool, symbols) -> dict:
+    """The ``{symbol: sector}`` overrides of ``ml-features``: ``--sector-override SYM=Sector`` (repeatable), or ``--no-sector``
+    (every symbol is an index / ETF); the two cannot be combined and an item without ``=`` is refused."""
+    from app.services import ml_features as _mf
+    items = list(items or [])
+    if no_sector and items:
+        raise SystemExit("ba2-test ml-features: --no-sector declares every symbol sectorless; it cannot be combined with "
+                         "--sector-override")
+    overrides = {}
+    for item in items:
+        sym, sep, sector = item.partition("=")
+        if not sep or not sym.strip() or not sector.strip():
+            raise SystemExit(f"ba2-test ml-features: --sector-override must be SYM=Sector, got {item!r}")
+        overrides[sym.strip().upper()] = sector.strip()
+    if no_sector:
+        overrides = {s: _mf.NO_SECTOR for s in symbols}
+    return overrides
+
+
 def _cmd_ml_grid(args) -> int:
     """Stage-1 grid of the ML exploration v2 (task type ``ml_grid``, app/services/ml_grid.py): every cell of --config x
     its seeds as out-of-sample walk-forward signals, scored per track with shuffle controls. Resumes: finished
@@ -9017,25 +9218,22 @@ def _cmd_ml_features(args) -> int:
     symbols = _parse_symbols_arg("@" + args.symbols_file)
     first, last = _date.fromisoformat(args.start), _date.fromisoformat(args.end)
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
-    overrides = {}
-    for item in args.sector_override or []:
-        sym, _, sector = item.partition("=")
-        overrides[sym.strip().upper()] = sector.strip()
-    if args.no_sector:
-        overrides.update({s: _mf.NO_SECTOR for s in symbols})
+    overrides = _ml_features_sector_overrides(args.sector_override, args.no_sector, symbols)
     membership = None
     if args.membership_top_n:
         sessions = _pd.DatetimeIndex(_pd.to_datetime(_mp.regular_sessions(first, last)["session"]))
-        membership = _mu.membership_from_universe(sessions, args.membership_top_n, args.purpose)
+        membership = _mu.membership_from_universe(sessions, args.membership_top_n, args.purpose,
+                                                   store_dir=_mu.store_dir_for(_bc.CACHE_FOLDER))
     res = _mf.ensure_feature_store(args.out, symbols, first, last, groups, membership, cache_root=_bc.CACHE_FOLDER,
-                                   chunk_size=args.chunk_size, sector_overrides=overrides, force=args.force)
+                                   chunk_size=args.chunk_size, sector_overrides=overrides, min_share=args.min_share,
+                                   force=args.force)
     print(f"ml-features: {res['status']} -> {res['out_dir']} ({len(res['symbols'])} symbols"
           + (f", {res['rows']} rows in {res['seconds']}s" if res["status"] == "built" else "") + ")")
     for sym, reason in res["refused"].items():
         print(f"  refused {sym}: {reason}")
     for sym, reason in res["transient"].items():
         print(f"  transient (may clear after a cache refresh; informational) {sym}: {reason}")
-    return 0
+    return 1 if res["refused"] else 0                       # a permanently refused symbol is not silently dropped
 
 
 def _add_robust_fitness_args(p) -> None:
@@ -9609,6 +9807,14 @@ def main(argv: "list | None" = None) -> int:
                     help="MLForecast only: the forecast stores (aliases or 16-hex keys) the model_key gene chooses "
                          "among for this job, replacing _EXPERT_OPT's list (e.g. one store, or a naive/placebo "
                          "control store). Omit: the spec's list.")
+    op.add_argument("--ml-rank-top-n", default=None, metavar="N,N",
+                    help="MLForecast with strategy MLR only: the rank_top_n gene chooses among these N (distinct "
+                         "integers >= 1): BUY only the N most bullish symbols of the store at the decision date, "
+                         "SELL a held long that drops out of them. Omit: the gene is pinned to 0 (ranking off).")
+    op.add_argument("--ml-hold-from-horizon", action="store_true",
+                    help="MLForecast with strategy MLH or MLF only (needs --ml-model-keys): the days_opened gene "
+                         "becomes {d-1, d, d+1} clipped at 0 with d = round(H x 7/5) - 1, H = the (single, shared) "
+                         "horizon of the --ml-model-keys stores, instead of the 0..6 range.")
     op.add_argument("--rerun", action="store_true",
                     help="Run even if an optimization with this --name has already "
                          "COMPLETED. Without it the run is skipped (exit 0) and the "
@@ -9939,7 +10145,7 @@ def main(argv: "list | None" = None) -> int:
     mf.add_argument("--symbols-file", required=True, help="Symbols to build rows for (one per line / whitespace).")
     mf.add_argument("--start", required=True, help="First day (YYYY-MM-DD).")
     mf.add_argument("--end", required=True, help="Last day (YYYY-MM-DD).")
-    mf.add_argument("--groups", default="t,mtf,m,x,mac,f,a,i,s", help="Comma list of feature groups.")
+    mf.add_argument("--groups", default=ML_FEATURES_DEFAULT_GROUPS, help="Comma list of feature groups.")
     mf.add_argument("--out", required=True, help="Store directory (features.parquet, meta, coverage report).")
     mf.add_argument("--membership-top-n", type=int, default=None,
                     help="Use the metric store's per-session top-N universe for X ranks and breadth (2020+, survivors only).")
@@ -9948,6 +10154,8 @@ def main(argv: "list | None" = None) -> int:
     mf.add_argument("--no-sector", action="store_true", help="The symbols are indices / ETFs: they have no sector.")
     mf.add_argument("--sector-override", action="append", metavar="SYM=Sector",
                     help="Sector for a symbol the metric store has none for (repeatable).")
+    mf.add_argument("--min-share", type=float, default=0.7,
+                    help="Coverage share under which a (group, year) is masked when the store is loaded (default 0.7).")
     mf.add_argument("--force", action="store_true", help="Rebuild even when the inputs are unchanged.")
 
     # sync-cache: push the master's cache (diff, one tar) to a configured remote worker.
