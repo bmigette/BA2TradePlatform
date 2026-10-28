@@ -1287,3 +1287,274 @@ def test_the_run_logs_the_disk_estimate_at_the_start(signal_world, tmp_path):
     run([cell(signal_world[0])], tmp_path / "o", signal_world, progress=lambda m, pct=None: msgs.append(m),
         settings=_settings(control_seeds=(1,)))
     assert any(m.startswith("ml_grid: estimated disk") and "free" in m for m in msgs)
+
+
+# ================================================================== follow-ups of the quality review
+class FakePool:
+    """A scripted stand-in for ProcessPoolExecutor. Seed ``POISON`` kills the pool: it fails itself and (with
+    FAIL_NEIGHBOURS) every other pending future, and a broken pool refuses further submissions, as the real one does.
+    Other tasks finish ``DELAY`` seconds after they are submitted."""
+    instances = []
+    POISON = 3
+    FAIL_NEIGHBOURS = True
+    DELAY = 0.05
+    MANUAL = False              # True: pending futures complete exactly when the driver calls wait() (deterministic)
+
+    def __init__(self, *a, **k):
+        self.results = {}
+        self.kw = k
+        self.id = len(FakePool.instances)
+        FakePool.instances.append(self)
+        self.pending, self.submitted, self.broken, self.shutdowns = [], [], False, []
+
+    def submit(self, fn, cfg, seed, key):
+        import threading
+        from concurrent.futures import Future
+        from concurrent.futures.process import BrokenProcessPool
+        if self.broken:
+            raise BrokenProcessPool("the pool is broken")
+        self.pending = [f for f in self.pending if not f.done()]
+        self.submitted.append((seed, len(self.pending)))
+        fu = Future()
+        if seed == self.POISON:
+            self.broken = True
+            if self.FAIL_NEIGHBOURS:
+                for f in self.pending:
+                    f.set_exception(BrokenProcessPool("a worker died"))
+            fu.set_exception(BrokenProcessPool("a worker died"))
+        else:
+            self.pending.append(fu)
+            self.results[fu] = {"ok": seed}
+            if not self.MANUAL:
+                def done():
+                    if not fu.done():
+                        fu.set_result({"ok": seed})
+                threading.Timer(self.DELAY, done).start()
+        return fu
+
+    def complete_pending(self):
+        for f in self.pending:
+            if not f.done():
+                f.set_result(self.results[f])
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        self.shutdowns.append((wait, cancel_futures))
+
+
+@pytest.fixture
+def fake_pool(monkeypatch):
+    FakePool.instances = []
+    FakePool.POISON, FakePool.FAIL_NEIGHBOURS, FakePool.DELAY, FakePool.MANUAL = 3, True, 0.05, False
+    monkeypatch.setattr(G, "ProcessPoolExecutor", FakePool)
+    return FakePool
+
+
+@pytest.fixture
+def manual_pool(fake_pool, monkeypatch):
+    """The fake pool whose pending futures complete exactly when the driver waits: no timing races."""
+    fake_pool.MANUAL = True
+    real_wait = G.wait
+
+    def wait(fs, timeout=None, return_when=None):
+        fake_pool.instances[-1].complete_pending()
+        return real_wait(fs, timeout=timeout, return_when=return_when)
+    monkeypatch.setattr(G, "wait", wait)
+    return fake_pool
+
+
+def _fake_tasks(world, seeds):
+    c = G.validate_cell(cell(world[0], seeds=list(seeds)))
+    return [(c, s) for s in seeds]
+
+
+def _drive(world, seeds, cpu_slots, finish, **over):
+    summary = {}
+    G._drive_pool(_fake_tasks(world, seeds), cpu_slots, (), lambda *a: None, finish, lambda: False, summary)
+    return summary
+
+
+def test_a_finish_failure_such_as_a_full_disk_propagates_and_is_not_read_as_a_broken_pool(signal_world, fake_pool):
+    fake_pool.POISON, fake_pool.FAIL_NEIGHBOURS, fake_pool.DELAY = 1, False, 0.2
+
+    def finish(r):
+        if "ok" in r:
+            raise OSError(28, "No space left on device")
+    # seed 2 is still running when seed 1 breaks the pool: it is collected on the break path, its result is valid and
+    # writing it fails -- that OSError must reach the caller, not turn the task into a "broken" retry
+    with pytest.raises(OSError, match="No space left"):
+        _drive(signal_world, [2, 1], 2, finish)
+    assert fake_pool.instances[-1].shutdowns[-1] == (False, True)
+
+
+def test_a_finish_failure_on_the_normal_path_propagates_too(signal_world, fake_pool):
+    fake_pool.POISON = 99
+
+    def finish(r):
+        raise OSError(28, "No space left on device")
+    with pytest.raises(OSError, match="No space left"):
+        _drive(signal_world, [1, 2], 2, finish)
+
+
+def test_probation_uses_a_small_window_and_only_tasks_charged_twice_run_alone(signal_world, manual_pool):
+    fake_pool = manual_pool
+    rows = []
+    summary = _drive(signal_world, list(range(1, 9)), 8, rows.append)            # window 16, probation window 8 // 4 = 2
+    ok = sorted(r["ok"] for r in rows if "ok" in r)
+    err = [r for r in rows if "error" in r]
+    assert ok == [1, 2, 4, 5, 6, 7, 8] and len(err) == 1 and err[0]["seed"] == 3
+    assert summary["pool_rebuilds"] == 4 and len(fake_pool.instances) == 5
+    first, probation, alone1, alone2, rest = fake_pool.instances
+    assert [s for s, _ in first.submitted] == [1, 2, 3]                            # the whole window broke together
+    assert max(p for _, p in probation.submitted) + 1 <= 2                         # never more than 2 in flight ...
+    assert any(p == 1 for _, p in probation.submitted)                             # ... and really 2 at once (not 1)
+    assert alone1.submitted == [(3, 0)] and alone2.submitted == [(3, 0)]           # charged twice: a singleton
+    assert sorted(s for s, _ in rest.submitted) == [4, 5, 6, 7, 8]                 # back to the full window afterwards
+    assert len({id(p.kw["initargs"][-1]) for p in fake_pool.instances}) == 5      # each pool has its own stagger counter
+
+
+def test_a_submit_on_a_pool_that_just_broke_is_retried_not_fatal(signal_world, manual_pool):
+    fake_pool = manual_pool
+    rows = []
+    _drive(signal_world, [1, 3, 2], 4, rows.append)                                # seed 2 is submitted after the break
+    assert sorted(r["ok"] for r in rows if "ok" in r) == [1, 2]
+    assert 2 not in [s for s, _ in fake_pool.instances[0].submitted]               # refused by the broken pool, put back
+
+
+# ------------------------------------------------------------------ lock: atomic creation, patient reads
+def test_the_lock_is_created_atomically_from_a_temp_file(tmp_path, monkeypatch):
+    calls = []
+    real = os.link
+
+    def spy(src, dst, *a, **k):
+        calls.append((Path(src).name, Path(dst).name, Path(src).read_text(encoding="utf-8")))   # complete when linked
+        return real(src, dst, *a, **k)
+    monkeypatch.setattr(os, "link", spy)
+    out = tmp_path / "o"
+    out.mkdir()
+    lock = G.acquire_lock(out)
+    assert len(calls) == 1 and calls[0][1] == G.LOCK_NAME and json.loads(calls[0][2])["pid"] == os.getpid()
+    assert json.loads(lock.read_text(encoding="utf-8"))["pid"] == os.getpid()
+    assert [p.name for p in out.iterdir()] == [G.LOCK_NAME]                          # the temp file is gone
+    with pytest.raises(G.GridLockedError):
+        G.acquire_lock(out)
+    assert [p.name for p in out.iterdir()] == [G.LOCK_NAME]                          # the loser leaves no temp file either
+    G.release_lock(lock)
+    assert not lock.exists()
+
+
+def test_the_lock_falls_back_when_the_filesystem_has_no_hard_links(tmp_path, monkeypatch):
+    def nolink(*a, **k):
+        raise OSError(1, "not supported")
+    monkeypatch.setattr(os, "link", nolink)
+    out = tmp_path / "o"
+    out.mkdir()
+    lock = G.acquire_lock(out)
+    assert json.loads(lock.read_text(encoding="utf-8"))["pid"] == os.getpid()
+    G.release_lock(lock)
+
+
+def test_an_unreadable_lock_is_given_a_moment_before_it_is_called_stale(tmp_path, monkeypatch):
+    import socket
+    import threading
+    import time
+    out = tmp_path / "o"
+    out.mkdir()
+    lock = out / G.LOCK_NAME
+    lock.write_text("", encoding="utf-8")                                            # a holder that is mid-write
+    monkeypatch.setattr(G, "LOCK_READ_TRIES", 8)
+    monkeypatch.setattr(G, "LOCK_READ_WAIT", 0.05)
+    live = json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "started": "now"})
+    threading.Timer(0.12, lambda: lock.write_text(live, encoding="utf-8")).start()
+    with pytest.raises(G.GridLockedError, match="already running"):
+        G.acquire_lock(out)
+    time.sleep(0.05)
+    assert json.loads(lock.read_text(encoding="utf-8"))["pid"] == os.getpid()      # it was NOT taken over
+    lock.write_text("", encoding="utf-8")                                            # an empty lock that never fills
+    got = G.acquire_lock(out)
+    assert json.loads(got.read_text(encoding="utf-8"))["pid"] == os.getpid()      # stale after the retries: taken over
+    G.release_lock(got)
+
+
+# ------------------------------------------------------------------ factor_effects: no_predictions is coverage 0
+def _np_row(key, seed, **kw):
+    r = _row(key, seed, None, fitted=0, status="no_predictions", **kw)
+    r["primary"] = {"name": None, "value": None}
+    return r
+
+
+def test_a_no_predictions_seed_counts_as_coverage_zero():
+    rows = [_row("half", 1, 0.2), _row("half", 2, 0.2), _np_row("half", 3),             # 2 of 3 seeds produced anything
+            _row("ok", 1, 0.1), _row("ok", 2, 0.1),
+            _np_row("none", 1), _np_row("none", 2)]                                     # no seed produced anything
+    res = G.factor_effects(rows, "timing")
+    assert list(res["cells"]["cell_key"]) == ["ok"]
+    ex = res["excluded"].set_index("cell_key")
+    assert ex.loc["half", "coverage"] == 0.0 and "coverage" in ex.loc["half", "reason"]
+    assert ex.loc["none", "coverage"] == 0.0
+    loose = G.factor_effects(rows, "timing", min_coverage=0.0)
+    assert set(loose["cells"]["cell_key"]) == {"ok", "half"}                            # kept, mean over its ok seeds
+    assert loose["cells"].set_index("cell_key").loc["half", "n_seeds"] == 2
+    assert list(loose["excluded"]["cell_key"]) == ["none"]
+    assert "no seed produced predictions" in loose["excluded"]["reason"].iloc[0]
+    other = [_np_row("sel", 1, track="selection")]
+    assert G.factor_effects(other, "timing")["excluded"].empty                          # another track is not this table's
+
+
+# ------------------------------------------------------------------ resume check: per-symbol bar hashes are cached
+def test_daily_bar_hashes_are_cached_per_symbol(signal_world, monkeypatch):
+    G._bar_hash.cache_clear()
+    reads = []
+    real = G.F._read_daily
+    monkeypatch.setattr(G.F, "_read_daily", lambda sym, root: (reads.append(sym), real(sym, root))[1])
+    cache = signal_world[2]
+    a = G.daily_fingerprint(cache, SYMS[:4], FIRST, LAST)
+    assert sorted(reads) == sorted(SYMS[:4])
+    b = G.daily_fingerprint(cache, SYMS[2:6], FIRST, LAST)                              # overlapping set: 2 new symbols only
+    assert sorted(reads) == sorted(SYMS[:6]) and a != b
+    n = len(reads)
+    assert G.daily_fingerprint(cache, SYMS[:4], FIRST, LAST) == a and len(reads) == n   # repeated: no reads at all
+    f = cache / "AlpacaHistoryOHLCVProvider" / f"{SYMS[0]}_1d.parquet"
+    os.utime(f, (1_900_000_000, 1_900_000_000))                                         # a touched file is re-read ...
+    assert G.daily_fingerprint(cache, SYMS[:4], FIRST, LAST) == a and len(reads) == n + 1   # ... and hashes the same
+    G.daily_fingerprint(cache, SYMS[:4], FIRST, date(2019, 12, 31))                      # another window: a different key
+    assert len(reads) == n + 1 + 4
+
+
+def test_repeated_prechecks_do_not_reload_bars(signal_world, tmp_path, monkeypatch):
+    out = tmp_path / "o"
+    run([cell(signal_world[0])], out, signal_world, settings=_settings(control_seeds=(1,)))
+    body = payload(signal_world, out_dir=str(out), settings=_settings(control_seeds=(1,)).to_dict())
+    G.precheck_grid(body)                                                               # warms the hashes
+    reads = []
+    real = G.F._read_daily
+    monkeypatch.setattr(G.F, "_read_daily", lambda sym, root: (reads.append(sym), real(sym, root))[1])
+    assert G.precheck_grid(body) == 1 and G.precheck_grid(body) == 1
+    assert reads == []
+
+
+# ------------------------------------------------------------------ staggered first panel load
+def test_workers_stagger_their_first_panel_load_by_their_index(signal_world, tmp_path, monkeypatch):
+    import multiprocessing
+    slept = []
+    monkeypatch.setattr(G.time, "sleep", lambda s: slept.append(s))
+    counter = multiprocessing.get_context("spawn").Value("i", 0)
+    c1 = G.validate_cell(cell(signal_world[0], symbols=SYMS[:6]))
+    c2 = G.validate_cell(cell(signal_world[0], symbols=SYMS[:7]))
+    try:
+        for i in range(3):
+            G._WORKER.clear()
+            G._PANELS.clear()
+            G._init_worker(_settings().to_dict(), str(signal_world[2]), str(tmp_path), 1, counter)
+            assert G._WORKER["index"] == i and slept == []                       # the initializer itself waits for nothing
+            G._panel_for(c1, str(signal_world[2]))
+            G._panel_for(c2, str(signal_world[2]))                               # only the FIRST load of a worker waits
+            assert slept == ([] if i == 0 else [i * G.PANEL_STAGGER_SECONDS])
+            slept.clear()
+    finally:
+        G._WORKER["limits"].restore_original_limits()
+    G._WORKER.clear()
+    G._init_worker(_settings().to_dict(), str(signal_world[2]), str(tmp_path), 1)        # inline / no counter: no wait
+    G._PANELS.clear()
+    G._panel_for(c1, str(signal_world[2]))
+    assert slept == [] and G._WORKER["index"] == 0
+    G._WORKER["limits"].restore_original_limits()

@@ -490,17 +490,24 @@ def store_span(store: Union[str, Path], symbols: Sequence[str]) -> Tuple[date, d
     return date.fromisoformat(first), date.fromisoformat(last), date.fromisoformat(end) if end else None
 
 
+@lru_cache(maxsize=1024)
+def _bar_hash(cache_root: str, symbol: str, size: int, mtime_ns: int, first: date, last: date) -> bytes:
+    """Row hashes of one symbol's bars inside ``[first, last]``. Cached on the file's size and mtime, so the API's
+    resume check and every symbol set that shares a symbol read each file once."""
+    raw = F._read_daily(symbol, Path(cache_root))
+    window = raw[(raw.index >= pd.Timestamp(first)) & (raw.index <= pd.Timestamp(last))][list(F.BAR_COLUMNS)]
+    return pd.util.hash_pandas_object(window, index=True).to_numpy().tobytes()
+
+
 def daily_fingerprint(cache_root: Union[str, Path], symbols: Sequence[str], first: date, last: date) -> str:
     """Hash of the daily bars (open, high, low, close, volume, row by row) that fall in ``[first, last]``, per symbol:
     exactly what the panel reads. A touch of a file or bars appended AFTER ``last`` do not change it; a changed bar
-    inside the window does."""
+    inside the window does. Per-symbol hashes are cached (``_bar_hash``)."""
     h = hashlib.sha1()
-    lo, hi = pd.Timestamp(first), pd.Timestamp(last)
     for sym in sorted(symbols):
-        raw = F._read_daily(sym, Path(cache_root))
-        window = raw[(raw.index >= lo) & (raw.index <= hi)][list(F.BAR_COLUMNS)]
+        st = F._cache_file(Path(cache_root), sym).stat()
         h.update(sym.encode("utf-8"))
-        h.update(pd.util.hash_pandas_object(window, index=True).to_numpy().tobytes())
+        h.update(_bar_hash(str(cache_root), sym, st.st_size, st.st_mtime_ns, first, last))
     return h.hexdigest()[:16]
 
 
@@ -1046,6 +1053,9 @@ _WORKER: Dict[str, Any] = {}
 NOISY_WARNINGS: Tuple[Tuple[str, type], ...] = ()
 #: seconds the master waits on the pool before it looks at cancellation again
 POLL_SECONDS = 1.0
+#: worker i (in the order the pool initialised them) waits i x this before its FIRST panel load, so the workers do not
+#: all parse the same parquet files and peak in memory together
+PANEL_STAGGER_SECONDS = 1.5
 #: a task whose worker dies is retried this many times, then it becomes an error record
 MAX_RETRIES = 3
 #: relative cost of a family's fit (slowest first); quantile (nine boosters) counts as one step slower
@@ -1053,14 +1063,24 @@ FAMILY_COST: Dict[str, int] = {"catboost": 4, "xgb": 3, "lgbm": 2, "linear": 1, 
 
 
 def _panel_for(cell: Cell, cache_root: str) -> Panel:
+    if not _WORKER["staggered"]:
+        _WORKER["staggered"] = True
+        if _WORKER["index"] > 0:
+            time.sleep(_WORKER["index"] * PANEL_STAGGER_SECONDS)
     return get_panel(cell.store, resolve_symbols(cell.symbols), cell.track, cache_root)
 
 
-def _init_worker(settings: Dict[str, Any], cache_root: str, out_dir: str, n_jobs: int) -> None:
+def _init_worker(settings: Dict[str, Any], cache_root: str, out_dir: str, n_jobs: int, counter: Any = None) -> None:
     """Pool initializer: remember the run constants, cap the BLAS / OpenMP threads at ``n_jobs`` (so slots x n_jobs
     never exceeds the cores) and silence only ``NOISY_WARNINGS``. Panels are NOT loaded here: the task that needs one
-    loads it (``get_panel``, an LRU of ``PANEL_CACHE_SIZE``)."""
+    loads it (``get_panel``, an LRU of ``PANEL_CACHE_SIZE``). ``counter`` (a shared ``multiprocessing.Value`` of the
+    pool) numbers the workers 0, 1, 2 ... for the staggered first panel load; without one the worker is number 0."""
     import warnings
+    index = 0
+    if counter is not None:
+        with counter.get_lock():
+            index = counter.value
+            counter.value += 1
     for message, category in NOISY_WARNINGS:
         warnings.filterwarnings("ignore", message=message, category=category)
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -1070,7 +1090,8 @@ def _init_worker(settings: Dict[str, Any], cache_root: str, out_dir: str, n_jobs
         _WORKER["limits"] = threadpool_limits(limits=n_jobs)
     except ImportError:
         logger.warning("threadpoolctl is not installed: BLAS / OpenMP threads are limited by environment variables only")
-    _WORKER.update(settings=GridSettings.from_dict(settings), cache_root=cache_root, out_dir=out_dir, n_jobs=n_jobs)
+    _WORKER.update(settings=GridSettings.from_dict(settings), cache_root=cache_root, out_dir=out_dir, n_jobs=n_jobs,
+                   index=index, staggered=False)
 
 
 def _error_record(cell_key: str, seed: int, message: str, label: str = "", tb: str = "") -> Dict[str, Any]:
@@ -1156,30 +1177,73 @@ def pid_alive(pid: int) -> bool:
 LOCK_NAME = ".ml_grid.lock"
 
 
-def acquire_lock(out: Path) -> Path:
-    """Create ``out/.ml_grid.lock`` (pid, host, start time) or raise ``GridLockedError`` when a live run holds it. A
-    lock whose pid is dead on this host is stale and taken over; one from another host cannot be judged and is
-    respected."""
-    path = out / LOCK_NAME
-    me = {"pid": os.getpid(), "host": socket.gethostname(), "started": time.strftime("%Y-%m-%d %H:%M:%S")}
-    for _ in range(2):
+#: reading a lock another process may be writing: this many tries, this far apart, before it is called unreadable
+LOCK_READ_TRIES = 5
+LOCK_READ_WAIT = 0.1
+
+
+def _read_lock(path: Path) -> Optional[Dict[str, Any]]:
+    """The lock's content; None when the file is gone; ``{}`` when it stays unreadable (empty, half-written) after
+    ``LOCK_READ_TRIES`` tries ``LOCK_READ_WAIT`` apart: a holder that is mid-write is given a moment."""
+    for i in range(LOCK_READ_TRIES):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            if i + 1 < LOCK_READ_TRIES:
+                time.sleep(LOCK_READ_WAIT)
+    return {}
+
+
+def _create_lock(path: Path, tmp: Path) -> bool:
+    """Put the already complete ``tmp`` at ``path`` atomically (a hard link fails if ``path`` exists); False if the
+    lock exists. A filesystem without hard links falls back to an exclusive create + write (readers then rely on the
+    patient read above)."""
+    try:
+        os.link(tmp, path)
+        return True
+    except FileExistsError:
+        return False
+    except OSError:
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            try:
-                held = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            return False
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(tmp.read_text(encoding="utf-8"))
+        return True
+
+
+def acquire_lock(out: Path) -> Path:
+    """Create ``out/.ml_grid.lock`` (pid, host, start time) or raise ``GridLockedError`` when a live run holds it. The
+    content is written to a temp file first and linked into place, so no reader ever sees a half-written lock. A lock
+    whose pid is dead on this host (or that stays unreadable) is stale and taken over, after a re-read confirms it is
+    still the same stale lock; one from another host cannot be judged and is respected."""
+    import uuid
+    path = out / LOCK_NAME
+    me = {"pid": os.getpid(), "host": socket.gethostname(), "started": time.strftime("%Y-%m-%d %H:%M:%S")}
+    tmp = out / f"{LOCK_NAME}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    tmp.write_text(json.dumps(me), encoding="utf-8")
+    try:
+        for _ in range(3):
+            if _create_lock(path, tmp):
+                return path
+            held = _read_lock(path)
+            if held is None:                                       # it vanished between the two calls: try again
+                continue
+            if not held:
                 held = {"pid": -1, "host": me["host"], "started": "unreadable lock"}
             if held["host"] == me["host"] and not pid_alive(int(held["pid"])):
-                logger.warning(f"ml_grid: stale lock of dead pid {held['pid']} (started {held['started']}) removed")
-                path.unlink(missing_ok=True)
+                if _read_lock(path) == (held if held["pid"] != -1 else {}):          # still the same stale lock
+                    logger.warning(f"ml_grid: stale lock of dead pid {held['pid']} (started {held['started']}) removed")
+                    path.unlink(missing_ok=True)
                 continue
             raise GridLockedError(f"another ml_grid run is already running in {out} (pid {held['pid']} on "
                                   f"{held['host']}, started {held['started']}); remove {path} only if it is not")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(me))
-        return path
-    raise GridLockedError(f"could not take the lock {path}")
+        raise GridLockedError(f"could not take the lock {path}")
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def release_lock(path: Path) -> None:
@@ -1219,18 +1283,31 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
     """Run ``tasks`` on a spawn-context process pool with at most ``2 x cpu_slots`` futures in flight.
 
     A worker that dies (``BrokenProcessPool``) takes the whole pool with it: every in-flight task is charged one
-    attempt, the pool is rebuilt and the tasks go back to the front of the queue. They then run ONE AT A TIME until all
-    have completed once, so the task that kills its worker is isolated and its neighbours are not charged again; after
-    ``MAX_RETRIES`` retries it becomes an error record. The pool is always shut down with ``wait=False,
-    cancel_futures=True``, so a master exception or Ctrl-C leaves nothing queued."""
+    attempt, the pool is rebuilt and the tasks go back to the front of the queue. After a break the pool runs on
+    PROBATION: a window of ``max(1, cpu_slots // 4)`` while any retried task is in flight or waiting, so a crowd is not
+    thrown at the poison again; a task already charged TWICE runs alone on an otherwise idle pool, which isolates the
+    one that kills its worker. After ``MAX_RETRIES`` retries a task becomes an error record. A submit that finds the
+    pool already broken puts the task back and rebuilds. ``finish`` (which writes to disk) is never called inside a
+    ``try`` that reads ``except`` as "the pool broke": an ``OSError`` from it propagates. The pool is always shut down
+    with ``wait=False, cancel_futures=True``, so a master exception or Ctrl-C leaves nothing queued."""
     window = 2 * cpu_slots
+    probation_window = max(1, cpu_slots // 4)
     queue: deque = deque((c, s, 0) for c, s in tasks)                 # (cell, seed, times its pool broke)
     retry: deque = deque()
     inflight: Dict[Any, Tuple[Cell, int, int]] = {}
+    order = {(c.key, sd): i for i, (c, sd) in enumerate(tasks)}
 
     def new_pool() -> ProcessPoolExecutor:
-        return ProcessPoolExecutor(max_workers=min(cpu_slots, len(tasks)), mp_context=multiprocessing.get_context("spawn"),
-                                   initializer=_init_worker, initargs=init_args)
+        ctx = multiprocessing.get_context("spawn")
+        return ProcessPoolExecutor(max_workers=min(cpu_slots, len(tasks)), mp_context=ctx, initializer=_init_worker,
+                                   initargs=(*init_args, ctx.Value("i", 0)))
+
+    def limit() -> int:
+        if any(a >= 2 for _, _, a in inflight.values()):
+            return 1
+        if retry or any(a > 0 for _, _, a in inflight.values()):
+            return probation_window
+        return window
     summary["pool_rebuilds"] = 0
     pool = new_pool()
     try:
@@ -1238,11 +1315,20 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
             if cancelled():
                 summary["cancelled"] = True
                 return
-            probation = bool(retry) or any(a > 0 for _, _, a in inflight.values())
-            while (retry or queue) and len(inflight) < (1 if probation else window):
-                c, sd, a = (retry or queue).popleft()
-                inflight[pool.submit(task_fn, c.config(with_seeds=True), sd, c.key)] = (c, sd, a)
-                probation = probation or a > 0
+            rebuild = False
+            while (retry or queue) and len(inflight) < limit():
+                src = retry if retry else queue
+                c, sd, a = src[0]
+                if a >= 2 and inflight:
+                    break                                             # charged twice: only on an idle pool
+                src.popleft()
+                try:
+                    fu = pool.submit(task_fn, c.config(with_seeds=True), sd, c.key)
+                except BrokenProcessPool:
+                    src.appendleft((c, sd, a))
+                    rebuild = True
+                    break
+                inflight[fu] = (c, sd, a)
             done, _ = wait(list(inflight), timeout=POLL_SECONDS, return_when=FIRST_COMPLETED)
             broken: List[Tuple[Cell, int, int]] = []
             for fu in done:
@@ -1251,20 +1337,23 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
                     r = fu.result()
                 except BrokenProcessPool:
                     broken.append((c, sd, a))
+                    continue
                 except Exception as e:                            # noqa: BLE001  (e.g. an unpicklable result)
-                    finish(_error_record(c.key, sd, f"{type(e).__name__}: {e}", c.label, traceback.format_exc()))
-                else:
-                    finish(r)
-            if not broken:
+                    r = _error_record(c.key, sd, f"{type(e).__name__}: {e}", c.label, traceback.format_exc())
+                finish(r)                                         # outside the try: an OSError here is not "broken"
+            if not broken and not rebuild:
                 continue
             for fu, (c, sd, a) in list(inflight.items()):         # the rest of the pool died with it: collect them
                 wait([fu], timeout=60)
                 try:
-                    finish(fu.result(timeout=0))
+                    r = fu.result(timeout=0)
                 except Exception:                                 # noqa: BLE001  (broken, cancelled or not finished)
                     broken.append((c, sd, a))
+                else:
+                    finish(r)
                 inflight.pop(fu)
             pool.shutdown(wait=False, cancel_futures=True)
+            broken.sort(key=lambda t: order[(t[0].key, t[1])])      # futures complete in any order: retry in plan order
             for c, sd, a in broken:
                 if a + 1 > MAX_RETRIES:
                     finish(_error_record(c.key, sd, f"worker process died on {a + 1} attempts ({MAX_RETRIES} retries); "
@@ -1530,8 +1619,9 @@ def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: s
     the primary over its seeds, and
 
     * ``coverage`` = the LOWEST over the cell's seeds of ``n_blocks_fitted / n_blocks`` (blocks skipped for a thin
-      target class reduce it); a cell under ``min_coverage`` (default 0.8) is excluded, a cell with no coverage
-      information too;
+      target class reduce it); a seed with status ``no_predictions`` counts as coverage 0, so a cell where some seed
+      produced nothing is excluded by the default ``min_coverage`` (0.8), and one where NO seed did is listed in
+      ``excluded``; a cell with no coverage information is excluded too;
     * ``low_iter_share`` = mean over seeds of the row's share of blocks with best iteration <= ``LOW_ITER`` (a
       near-constant model; NaN for non-boosting families, which are never excluded by it); with ``max_low_iter_share``
       a cell above it is excluded;
@@ -1554,24 +1644,36 @@ def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: s
         last[(r["cell_key"], int(r["seed"]))] = r
     want = PRIMARY[track]
     by_cell: Dict[str, List[Dict[str, Any]]] = {}
+    empty: Dict[str, List[Dict[str, Any]]] = {}                 # seeds that produced no predictions at all
     for r in last.values():
-        if _field(r, "track") == track and _field(r, "status") == "ok" and r["primary"]["name"] == want \
-                and r["primary"]["value"] is not None:
+        if _field(r, "track") != track:
+            continue
+        if _field(r, "status") == "ok" and r["primary"]["name"] == want and r["primary"]["value"] is not None:
             by_cell.setdefault(r["cell_key"], []).append(r)
+        elif _field(r, "status") == "no_predictions" and r["config"]["target"]["kind"] != "volatility":
+            empty.setdefault(r["cell_key"], []).append(r)
     kept, dropped = [], []
+    for key in empty:                                           # a cell with no usable seed at all is listed, not lost
+        if key not in by_cell:
+            r0 = empty[key][0]
+            dropped.append({"cell_key": key, **_factor_levels(r0["config"]), "coverage": 0.0,
+                            "low_iter_share": float("nan"), "reason": "no seed produced predictions (coverage 0)"})
     for key, rs in by_cell.items():
         rs.sort(key=lambda r: int(r["seed"]))
+        n_empty = len(empty[key]) if key in empty else 0
         v = np.array([r["primary"]["value"] for r in rs], dtype=float)
         det = rs[0]["config"]["family"] in DETERMINISTIC_FAMILIES
         cov = [r["n_blocks_fitted"] / r["n_blocks"] for r in rs
                if _field(r, "n_blocks") and _field(r, "n_blocks_fitted") is not None]
+        cov_ok = len(cov) == len(rs)
+        cov += [0.0] * n_empty                                  # a seed with no predictions is coverage 0
         ps = [r["controls"]["p_value"] for r in rs if isinstance(_field(r, "controls"), dict)
               and "p_value" in r["controls"] and r["controls"]["p_value"] is not None]
         li = [r["low_iter_share"] for r in rs if _field(r, "low_iter_share") is not None]
         rec = {"cell_key": key, **_factor_levels(rs[0]["config"]), "n_seeds": len(v), "mean": float(v.mean()),
                "std": 0.0 if det else (float(v.std(ddof=1)) if len(v) > 1 else float("nan")),
                "p_value": float(np.median(ps)) if ps else float("nan"), "p_values": ps,
-               "coverage": float(min(cov)) if len(cov) == len(rs) else float("nan"),
+               "coverage": float(min(cov)) if cov_ok else float("nan"),
                "low_iter_share": float(np.mean(li)) if li else float("nan"), "deterministic": det}
         reason = None
         if not np.isfinite(rec["coverage"]):
