@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 
 from ba2_providers.macro import fred_series as fs
+from ba2_providers.screener import metric_store as ms
 
 from app.services import ml_universe
 from app.services.ml_panel import PanelDataError, ema, regular_sessions, true_range, wilder
@@ -591,7 +592,7 @@ SECTOR_CODE: Dict[str, int] = {
     "Financial Services": 6, "Healthcare": 7, "Industrials": 8, "Real Estate": 9, "Technology": 10, "Utilities": 11}
 #: T features ranked / z-scored across the universe members on each session
 X_RANKED: Tuple[str, ...] = ("t_ret_5", "t_ret_20", "t_ret_60", "t_rvol_20", "t_dist_sma50", "t_rsi", "t_vol_z")
-X_OWN_COLUMNS: Tuple[str, ...] = ("x_mom_12_1", "x_mom_12_1_rk", "x_weinstein", "x_relvol", "x_sector")
+X_OWN_COLUMNS: Tuple[str, ...] = ("x_mom_12_1", "x_mom_12_1_rk", "x_weinstein", "x_vol_ratio_20_60", "x_sector")
 X_COLUMNS: Tuple[str, ...] = (tuple(f"x_rk_{c[2:]}" for c in X_RANKED) + tuple(f"x_z_{c[2:]}" for c in X_RANKED)
                               + X_OWN_COLUMNS)
 #: A cross-section is only ranked / z-scored when at least ``X_MIN_MEMBERS`` members have a value AND they are at
@@ -619,14 +620,15 @@ def _cross_z(wide: pd.DataFrame, members_n: pd.Series) -> pd.DataFrame:
 
 
 def _own_columns(d: pd.DataFrame) -> pd.DataFrame:
-    """x_mom_12_1, x_weinstein and x_relvol of one symbol FROM ITS BARS (all trailing windows, every year).
+    """x_mom_12_1, x_weinstein and x_vol_ratio_20_60 of one symbol FROM ITS BARS (all trailing windows, every year).
 
     * ``x_mom_12_1``: the 12-1 month return, ``close[S-21] / close[S-251] - 1`` (``metric_store.momentum_12_1_series``,
       the store's own definition);
     * ``x_weinstein``: the Weinstein stage 1-4 from the 150-session (30-week) SMA of the close and its 20-session slope
       (``metric_store.weinstein_stage_series``: 2 = above a rising SMA, 4 = below a falling one, 3 = above a flat or
       falling one, 1 = otherwise; flat = slope within +-0.5%);
-    * ``x_relvol``: 20-session over 60-session mean volume (a filled bar's volume is left out, see ``MAX_FILLED_RUN``)."""
+    * ``x_vol_ratio_20_60``: 20-session over 60-session mean volume (NOT the screener's ``relative_volume``, which is
+      today's volume over the prior 20-day average) (a filled bar's volume is left out, see ``MAX_FILLED_RUN``)."""
     from ba2_providers.screener import metric_store as ms
     close = d["close"]
     v = d["volume"].where(~d["filled"])
@@ -635,7 +637,7 @@ def _own_columns(d: pd.DataFrame) -> pd.DataFrame:
     out["x_weinstein"] = ms.weinstein_stage_series(close)
     m20 = _full_windows_only(_roll_missing_ok(v, 20).mean(), 20)
     m60 = _full_windows_only(_roll_missing_ok(v, 60).mean(), 60)
-    out["x_relvol"] = m20 / m60.where(m60 > 0)
+    out["x_vol_ratio_20_60"] = m20 / m60.where(m60 > 0)
     return out
 
 
@@ -664,7 +666,7 @@ def cross_section(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataF
       an unlisted, ended or non-member symbol is not in the cross-section and gets NaN itself) of ``X_RANKED`` (the T
       features, computed here for every universe member from bars up to S). Too small a cross-section is NaN
       (``X_MIN_MEMBERS``, ``X_MIN_SHARE``);
-    * ``x_mom_12_1`` and its member rank ``x_mom_12_1_rk``, ``x_weinstein``, ``x_relvol``: computed from the bars
+    * ``x_mom_12_1`` and its member rank ``x_mom_12_1_rk``, ``x_weinstein``, ``x_vol_ratio_20_60``: computed from the bars
       (``_own_columns``), so they exist in every year, not only from the store's first scan (2020-01);
     * ``x_sector``: ``SECTOR_CODE`` of the symbol's sector, the store's profile sector (static, see
       ``ml_universe``) unless the caller overrides it; NaN when unknown.
@@ -682,7 +684,7 @@ def cross_section(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataF
         live = d[d["listed"]]
         if live.empty:
             t = pd.DataFrame(np.nan, index=ctx.sessions, columns=list(X_RANKED))
-            o = pd.DataFrame(np.nan, index=ctx.sessions, columns=["x_mom_12_1", "x_weinstein", "x_relvol"])
+            o = pd.DataFrame(np.nan, index=ctx.sessions, columns=["x_mom_12_1", "x_weinstein", "x_vol_ratio_20_60"])
         else:
             t = _tech(ctx, sym, live)[list(X_RANKED)].reindex(ctx.sessions)
             o = _own_columns(live).reindex(ctx.sessions)
@@ -699,7 +701,7 @@ def cross_section(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataF
     parts["x_mom_12_1"] = mom
     parts["x_mom_12_1_rk"] = _cross_rank(mom.where(mask), members_n)
     parts["x_weinstein"] = pd.DataFrame({s: own[s]["x_weinstein"] for s in members}, columns=members)
-    parts["x_relvol"] = pd.DataFrame({s: own[s]["x_relvol"] for s in members}, columns=members)
+    parts["x_vol_ratio_20_60"] = pd.DataFrame({s: own[s]["x_vol_ratio_20_60"] for s in members}, columns=members)
     codes = _sector_codes(ctx)
     parts["x_sector"] = pd.DataFrame({s: pd.Series(codes[s], index=ctx.sessions) for s in members}, columns=members)
     frames = {sym: pd.DataFrame({name: parts[name][sym] for name in X_COLUMNS}, index=ctx.sessions)[list(X_COLUMNS)]
@@ -721,11 +723,12 @@ _MAC_HISTORY_DAYS = 460
 #: series' first recorded vintage; this is a fragment of that message, pinned by a test, the only way to tell it from
 #: the refusals that must propagate (missing / old cache).
 _BEFORE_FIRST_VINTAGE = "on or before the series' first recorded vintage"
-#: How long a value may be held: weekdays since it became public for a daily series, calendar days for a monthly one.
+#: How long a value may be held: weekdays since it became public for a daily series, calendar days for a monthly one
+#: (100: the 2025 shutdown left a 76-day gap between two releases, which must pass with room).
 #: Age is counted from the RELEASE (ALFRED realtime_start), not the observation date: a delayed release (the 2025
 #: shutdown) is not older than the day it became public. A longer hold refuses instead of carrying a dead series.
 MAX_HOLD_WEEKDAYS = 10
-MAX_HOLD_DAYS_MONTHLY = 75
+MAX_HOLD_DAYS_MONTHLY = 100
 #: Known stalls of the real cache, as reviewed facts (series -> [(last release before the stall, first release after
 #: it)]): FRED published no BAA10Y between 2016-10-07 and 2017-03-22 (the observations of those months were first
 #: released together on 2017-03-22). Inside such a window the series is NaN (a 166-day-old spread is not the
@@ -763,7 +766,8 @@ def _read_fred_file(sid: str, folder: Path) -> Dict[str, object]:
     hit = _FRED_FILE_MEMO.get(key)
     if hit is not None:
         return hit
-    doc = json.loads(path.read_text(encoding="utf-8"))
+    raw = path.read_bytes()
+    doc = json.loads(raw.decode("utf-8"))
     obs = doc["observations"]
     first_release = fs.SERIES_SPEC[sid]["availability"] == fs.AVAIL_FIRST_RELEASE
     if first_release:
@@ -776,8 +780,9 @@ def _read_fred_file(sid: str, folder: Path) -> Dict[str, object]:
         released = {}
         last_vintage = max((o["date"] for o in obs), default=None)
     digest = hashlib.sha256(json.dumps(rows).encode()).hexdigest()[:16]
+    file_fp = {**_fingerprint(path), "sha256": hashlib.sha256(raw).hexdigest()}     # hosts compare the whole file
     rec = {"count": len(rows), "digest": digest, "fetched_at": doc["fetched_at"] if "fetched_at" in doc else None,
-           "last_vintage": last_vintage, "released": released, "file": _fingerprint(path)}
+           "last_vintage": last_vintage, "released": released, "file": file_fp}
     _FRED_FILE_MEMO[key] = rec
     return rec
 
@@ -1149,16 +1154,40 @@ def _check_contract(group: str, spec: GroupSpec, cols: pd.DataFrame, ctx: BuildC
                              f"({int(inf.sum())} infinite values); refusing to turn it into NaN")
 
 
+def _membership_digest(membership: pd.DataFrame) -> str:
+    h = hashlib.sha256()
+    h.update(np.asarray(membership.index.values, dtype="datetime64[ns]").tobytes())
+    h.update(",".join(map(str, membership.columns)).encode())
+    h.update(np.ascontiguousarray(membership.to_numpy(dtype=bool)).tobytes())
+    return h.hexdigest()[:16]
+
+
+def _membership_record(membership: pd.DataFrame) -> Dict[str, object]:
+    """Provenance of a membership: size, first member session, a digest of the whole mask, and the parameters it was
+    made with (``ml_universe.membership_from_universe`` stores them in ``attrs``; None for a hand-made frame)."""
+    params = membership.attrs["membership"] if "membership" in membership.attrs else {}
+    any_member = membership.any(axis=1).to_numpy()
+    return {"symbols": int(membership.shape[1]), "sessions": int(membership.shape[0]), "digest": _membership_digest(membership),
+            "first_member_session": str(membership.index[any_member][0].date()) if any_member.any() else None,
+            "top_n": params["top_n"] if "top_n" in params else None,
+            "purpose": params["purpose"] if "purpose" in params else None,
+            "min_dollar_volume": params["min_dollar_volume"] if "min_dollar_volume" in params else None}
+
+
 def _refuse_if_store_lists_ended(ended: Dict[str, str], store_path: Path) -> None:
     """A series that looks ended (its last bar is far before the cache end) while the metric store still has a scan row
-    for it AFTER that bar is a download hole, not a delisting: STALE, refused."""
+    for it MORE THAN ``STALENESS_MAX_DAYS`` calendar days after that bar is a download hole, not a delisting: STALE,
+    refused. (The store keeps a name until its latest bar is older than that limit, so a genuinely delisted name has
+    scans 1..7 days after its last bar.)"""
     if not ended or not Path(store_path).exists():
         return
+    limit = pd.Timedelta(days=ms.STALENESS_MAX_DAYS)
     for sym, last in ended.items():
         newest = ml_universe.last_scan_with(sym, store_path)
-        if newest is not None and newest > last:
-            raise PanelDataError(f"{sym}: the metric store still lists it on {newest}, after its last cached bar {last}; "
-                                 f"the cached series is stale (a delisted name leaves the store), not ended")
+        if newest is not None and pd.Timestamp(newest) > pd.Timestamp(last) + limit:
+            raise PanelDataError(f"{sym}: the metric store still lists it on {newest}, more than {ms.STALENESS_MAX_DAYS} "
+                                 f"days after its last cached bar {last}; the cached series is stale (a delisted name "
+                                 f"leaves the store within {ms.STALENESS_MAX_DAYS} days), not ended")
 
 
 def usable_symbols(symbols: Sequence[str], first: date, last: date, cache_root: Path, groups: Sequence[str] = (),
@@ -1209,7 +1238,10 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
     overrides win over both sources). ``membership`` (optional, sessions x symbols bool, e.g.
     ``ml_universe.membership_from_universe``) says who is in the universe on each session: group X ranks only the
     members of that session and group M's breadth counts only them; None means every universe symbol always (the
-    NDQ30 stage). With a membership the universe defaults to ``symbols`` plus the membership's columns. ``preloaded``
+    NDQ30 stage). With a membership the universe defaults to ``symbols`` plus the membership's columns; its index must cover every build
+    session from its first member session on (a gap would silently mean "no member"). DECISION: the final-holdout
+    features are built on the UNION universe (dev + holdout, about 300 names), larger than the dev universe (about 200),
+    so a holdout cross-section is not the dev one; pass the union membership for it. ``preloaded``
     (a ``BuildCache``) shares the loaded bars and the technical features across chunked builds of one window. The cache end (what ``ended`` is measured against) is SPY's last bar, so SPY
     must be cached.
 
@@ -1273,6 +1305,16 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
         daily, load_meta = preloaded.load(load, load_first, last_day, cache_root, cache_end)
     _refuse_if_store_lists_ended(load_meta["ended"], store_path)
     sessions = next(iter(daily.values())).index
+    if membership is not None:
+        any_member = membership.any(axis=1).to_numpy()
+        if any_member.any():
+            first_member = membership.index[any_member][0]
+            missing = sessions[sessions >= first_member].difference(membership.index)
+            if len(missing):
+                raise ValueError(
+                    f"membership does not cover {len(missing)} sessions of the build from its first member session "
+                    f"{first_member.date()} on (first missing: {missing[0].date()}, last missing: {missing[-1].date()}); "
+                    f"build it over the build's sessions, a gap would silently mean 'no member'")
     mask = (None if membership is None
             else membership.reindex(index=sessions, columns=universe, fill_value=False).fillna(False).astype(bool))
     ctx = BuildContext(tuple(symbols), tuple(universe), tuple(s for s in load if s not in symbols), sessions,
@@ -1309,9 +1351,7 @@ def build_features(symbols: Sequence[str], first_day: date, last_day: date, grou
         "universe": universe, "context_symbols": [s for s in load if s not in symbols],
         "required_context": sorted(required), "load": load_meta, "rows": int(len(out)),
         "cache_end": str(cache_end), "sector_source": sector_source,
-        "membership": (None if membership is None else {"symbols": int(membership.shape[1]),
-                                                       "first_member_session": str(membership.index[membership.any(axis=1).to_numpy()][0].date())
-                                                       if membership.any(axis=None) else None}),
+        "membership": (None if membership is None else _membership_record(membership)),
         "sector_overrides": dict(sector_overrides) if sector_overrides else {},
         "ended": dict(load_meta["ended"]), "nan_rate": nan_rate,
         "columns": list(out.columns),

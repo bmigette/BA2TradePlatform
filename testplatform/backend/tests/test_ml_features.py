@@ -891,7 +891,7 @@ def test_cut_test_all_groups_with_x(cache, tmp_path):
 
 
 def test_x_momentum_volume_and_stage_come_from_the_bars_for_every_year(cache, tmp_path):
-    """x_mom_12_1 / x_relvol / x_weinstein are computed from OHLCV (the store's own definitions), so they exist before
+    """x_mom_12_1 / x_vol_ratio_20_60 / x_weinstein are computed from OHLCV (the store's own definitions), so they exist before
     the store's first scan; only the sector comes from the store (static)."""
     from ba2_providers.screener import metric_store as ms
     root = tmp_path / "c"
@@ -910,7 +910,7 @@ def test_x_momentum_volume_and_stage_come_from_the_bars_for_every_year(cache, tm
     raw = _raw(cache, "AAA")
     close, vol = raw["Close"], raw["Volume"].astype(float)
     np.testing.assert_allclose(f["x_mom_12_1"], (close.shift(21) / close.shift(251) - 1).reindex(f.index), rtol=1e-12)
-    np.testing.assert_allclose(f["x_relvol"], (vol.rolling(20).mean() / vol.rolling(60).mean()).reindex(f.index), rtol=1e-12)
+    np.testing.assert_allclose(f["x_vol_ratio_20_60"], (vol.rolling(20).mean() / vol.rolling(60).mean()).reindex(f.index), rtol=1e-12)
     np.testing.assert_array_equal(f["x_weinstein"], ms.weinstein_stage_series(close).reindex(f.index))
     assert set(f["x_weinstein"].unique()) <= {1.0, 2.0, 3.0, 4.0}
     assert (f["x_sector"] == F.SECTOR_CODE["Technology"]).all()          # the sector is the store's, in every year
@@ -1123,3 +1123,69 @@ def test_a_shared_build_cache_refuses_a_different_window(cache):
     F.build_features(["AAA"], FIRST, LAST, ["t"], cache, list(CTX), preloaded=shared)
     with pytest.raises(ValueError, match="last_day"):
         F.build_features(["AAA"], FIRST, date(2024, 3, 27), ["t"], cache, list(CTX), preloaded=shared)
+
+
+# ---------------------------------------------------------------------------------------------- re-review fixes
+@pytest.mark.parametrize("days_after,refused", [(1, False), (7, False), (8, True)])
+def test_a_store_scan_within_the_staleness_limit_after_the_last_bar_is_still_ended(cache, tmp_path, days_after, refused):
+    """The store keeps a delisted name for up to STALENESS_MAX_DAYS (7) after its last bar: scans 1..7 days after are
+    normal for an ended name; 8 days after means the cached series stopped early."""
+    from ba2_providers.screener import metric_store as ms
+    from tests.test_ml_universe import write_metric_store
+    assert ms.STALENESS_MAX_DAYS == 7
+    root = tmp_path / "c"
+    shutil.copytree(cache, root)
+    s_ = _sessions()
+    _write(root, "GONE", _bars(s_[s_ <= pd.Timestamp("2023-06-30")], 55))
+    rows = _store_rows()
+    gone = rows[(rows["symbol"] == "AAA") & (rows["date"] <= "2023-06-28")].assign(symbol="GONE")
+    extra = gone.iloc[[-1]].assign(date=str((pd.Timestamp("2023-06-30") + pd.Timedelta(days=days_after)).date()))
+    shutil.rmtree(root / "screener" / "_derived", ignore_errors=True)
+    write_metric_store(root / "screener" / "metric_store_alpaca_20261022", pd.concat([rows, gone, extra]))
+    if refused:
+        with pytest.raises(P.PanelDataError, match=r"GONE.*stale"):
+            _build(root, ["t"], symbols=("AAA", "GONE"))
+    else:
+        f = _build(root, ["t"], symbols=("AAA", "GONE"))
+        assert f.attrs["meta"]["ended"] == {"GONE": "2023-06-30"}
+
+
+def test_membership_provenance_records_a_digest_and_the_parameters(cache, tmp_path):
+    from tests.test_ml_universe import write_metric_store
+    sess = _sessions(FIRST, LAST)
+    mem = _membership(sess, entering="2023-03-01")
+    mem.attrs["membership"] = {"top_n": 300, "purpose": "dev", "min_dollar_volume": 2e7}
+    f = _build(cache, ["x"], symbols=XU, membership=mem)
+    rec = f.attrs["meta"]["membership"]
+    assert rec["top_n"] == 300 and rec["purpose"] == "dev" and rec["min_dollar_volume"] == 2e7
+    assert len(rec["digest"]) == 16 and rec["symbols"] == 3
+    other = mem.copy()
+    other.loc[other.index >= pd.Timestamp("2023-06-01"), "BBB"] = False
+    assert _build(cache, ["x"], symbols=XU, membership=other).attrs["meta"]["membership"]["digest"] != rec["digest"]
+    again = _membership(sess, entering="2023-03-01")
+    assert _build(cache, ["x"], symbols=XU, membership=again).attrs["meta"]["membership"]["digest"] == rec["digest"]
+    assert _build(cache, ["x"], symbols=XU, membership=again).attrs["meta"]["membership"]["top_n"] is None   # not from the helper
+
+
+def test_membership_from_the_helper_carries_its_parameters(tmp_path):
+    from app.services import ml_universe as U
+    from tests.test_ml_universe import SCANS, _row, write_metric_store
+    store = write_metric_store(tmp_path / "metric_store_m", pd.DataFrame([_row(s, "AAPL", 3e12) for s in SCANS]))
+    m = U.membership_from_universe(pd.DatetimeIndex(pd.bdate_range("2022-01-24", "2022-02-04")), 5, "dev", store,
+                                   min_dollar_volume=1e6)
+    assert m.attrs["membership"] == {"top_n": 5, "purpose": "dev", "min_dollar_volume": 1e6, "store_dir": store}
+
+
+def test_a_membership_that_does_not_cover_the_sessions_from_its_first_scan_on_refuses(cache):
+    sess = _sessions(FIRST, LAST)
+    full = _membership(sess)
+    holed = full.drop(index=sess[[100, 101, 102]])                              # three sessions missing in the middle
+    with pytest.raises(ValueError, match=r"membership does not cover.*3 sessions.*" + str(sess[100].date())):
+        _build(cache, ["x"], symbols=XU, membership=holed)
+    short = full.loc[:sess[-10]]                                                 # ends before the build's last session
+    with pytest.raises(ValueError, match="membership does not cover"):
+        _build(cache, ["x"], symbols=XU, membership=short)
+    # sessions BEFORE the membership's first member session are not required (the universe does not exist yet)
+    late = full.loc[sess[200]:]
+    f = _build(cache, ["x"], symbols=XU, membership=late)
+    assert f.loc["AAA"].index[0] < sess[200]

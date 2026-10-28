@@ -22,7 +22,9 @@ more than ``MAX_SCAN_GAP_DAYS`` apart refuse when the store loads.
 
 DEV vs HOLDOUT. ``purpose="dev"`` universes never contain a locked holdout symbol (``ml_holdout.is_locked_largecap``), so
 development cross-sections are computed without them. ``purpose="holdout"`` keeps only the locked ones. The final
-holdout verdict is computed on the FULL universe (dev and holdout together); build it from the union of both memberships.
+holdout verdict is computed on the FULL universe (dev and holdout together, about 300 names against about 200 for dev);
+build it from the union of both memberships. The holdout features are therefore NOT the dev features of the same
+symbols: their cross-sections include the dev names, and that difference is part of the protocol.
 """
 from __future__ import annotations
 
@@ -188,6 +190,8 @@ def membership_from_universe(sessions: pd.DatetimeIndex, top_n: int, purpose: st
     for i, s in enumerate(scans):
         if s is not None and members[s]:
             out.iloc[i, out.columns.get_indexer(members[s])] = True
+    out.attrs["membership"] = {"top_n": int(top_n), "purpose": purpose, "min_dollar_volume": float(min_dollar_volume),
+                               "store_dir": _key(store_dir)}
     return out
 
 

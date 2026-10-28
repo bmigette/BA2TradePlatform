@@ -287,13 +287,14 @@ def test_a_flat_series_gives_nan_z_not_inf(tmp_path, monkeypatch):
 
 
 def test_a_value_held_longer_than_the_maximum_age_refuses(tmp_path, monkeypatch):
-    # monthly: the last release was 2023-06-05; 75 days later it is stale
+    # monthly: the last release was 2023-06-05; more than 100 days later it is stale
+    assert F.MAX_HOLD_DAYS_MONTHLY == 100
     write_fred(tmp_path, "UNRATE", [("2023-04-01", 3.4, "2023-05-05"), ("2023-05-01", 3.6, "2023-06-05")])
     point_fred_at(monkeypatch, tmp_path)
-    ok = F.macro_levels("UNRATE", _sessions_index(date(2023, 6, 6), date(2023, 8, 18)))      # up to 74 days after the release
+    ok = F.macro_levels("UNRATE", _sessions_index(date(2023, 6, 6), date(2023, 9, 13)))      # up to 100 days after the release
     assert ok.notna().all()
-    with pytest.raises(P.PanelDataError, match=r"UNRATE.*older than 75 days"):
-        F.macro_levels("UNRATE", _sessions_index(date(2023, 8, 21), date(2023, 8, 25)))
+    with pytest.raises(P.PanelDataError, match=r"UNRATE.*older than 100 days"):
+        F.macro_levels("UNRATE", _sessions_index(date(2023, 9, 14), date(2023, 9, 18)))
     # daily: the VIX stalls after 2023-06-01; more than 10 weekdays later it is stale
     days = pd.bdate_range("2023-05-01", "2023-06-01")
     write_fred(tmp_path, "VIXCLS", [(str(d.date()), 15.0 + i * 0.1, str(d.date())) for i, d in enumerate(days)])
@@ -387,3 +388,21 @@ def test_a_known_stall_is_nan_while_any_other_stall_refuses(tmp_path, monkeypatc
     assert lvl.loc["2023-06-16":"2023-07-31"].isna().all()                                 # past the age limit: NaN
     ok = F.macro_levels("BAA10Y", _sessions_index(date(2023, 8, 1), date(2023, 8, 4)))      # the backfill release ends it
     assert ok.notna().all()
+
+
+def test_a_shutdown_sized_release_gap_passes_with_margin(tmp_path, monkeypatch):
+    """The 2025 shutdown left a 76-day gap between two payroll / unemployment releases: the hold limit has room."""
+    write_fred(tmp_path, "PAYEMS", _monthly("2022-01-01", "2023-07-01", lambda i, m: 1000.0 + 10 * i)[:-1] +
+               [("2023-07-01", 1180.0, "2023-08-04"), ("2023-08-01", 1190.0, "2023-10-19")])        # 76 days apart
+    point_fred_at(monkeypatch, tmp_path)
+    lvl = F.macro_levels("PAYEMS", _sessions_index(date(2023, 8, 4), date(2023, 10, 18)))
+    assert lvl.notna().all() and F.MAX_HOLD_DAYS_MONTHLY - 76 >= 20
+
+
+def test_fred_provenance_carries_the_sha256_of_the_whole_file(fred_at_mac):
+    import hashlib
+    f = _build(fred_at_mac, ["mac"])
+    for sid, rec in f.attrs["meta"]["source"]["fred"].items():
+        raw = (fred_at_mac / "fred" / f"{sid}.json").read_bytes()
+        assert rec["file"]["sha256"] == hashlib.sha256(raw).hexdigest()
+        assert rec["file"]["size"] == len(raw) and rec["file"]["mtime_ns"] > 0
