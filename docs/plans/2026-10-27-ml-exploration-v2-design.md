@@ -29,8 +29,14 @@ Five structural lessons drive this design:
     MAG7 singly. TLT and GLD serve as cross-asset features. All of them are cached in daily and 5-minute bars.
 - **Universe.**
   - Develop on NDQ30.
-  - Scale survivors to point-in-time large caps: each day's top ~300 by market cap and liquidity, from the cached
-    screener stores, with no survivorship bias.
+  - Scale survivors to large caps: each day's top ~300 by market cap and liquidity, from the cached screener store.
+  - **Survivorship bias, accepted by the owner on 2026-10-28:**
+    - The store is point-in-time in time but survivor-only in membership. TWTR, ATVI, SIVB, FRC, CELG, XLNX and VMW
+      are absent.
+    - It starts 2020-01, so the scale-up stage covers 2020-2026.
+    - Every scale-up result is reported with this bias stated, since it flatters long strategies.
+    - The rejected alternative: a dollar-volume universe from the 7,870-symbol price cache. It keeps some delisted
+      names (ATVI, SIVB, FRC, VMW, PXD) but still misses others (TWTR, CELG, XLNX, SPLK).
 - **History.**
   - Daily features and targets: 2016-2026.
   - Intraday features: 2019-2026 (5-minute bars exist for 93 of the NDX100 from 2019).
