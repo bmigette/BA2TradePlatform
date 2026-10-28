@@ -243,6 +243,24 @@ def split_frames_three_way(
     return out
 
 
+def trim_unlabelled_edges(df: pd.DataFrame, target_column: str) -> Tuple[pd.DataFrame, int, int]:
+    """``(df without its leading and trailing rows that have no label, number of rows trimmed, number of rows left inside
+    that have no label)``.
+
+    ``drop_unobservable_target_rows`` removes EVERY unlabelled row, which is right for a target that is only missing at the
+    edges (the unobservable tail, an indicator warm-up) but splices distant sessions together for a SPARSE target (the
+    quintile labels only the top and bottom fifth of a session): a window of ``seq_len`` rows would then span weeks. Here the
+    rows between the first and the last label stay, NaN labels included, so the frame is still consecutive sessions; the
+    windows whose label is NaN are dropped when the windows are built (``TSAITrainingService.prepare_data``)."""
+    labelled = df[target_column].notna().to_numpy()
+    if not labelled.any():
+        return df.iloc[0:0], len(df), 0
+    first = int(np.argmax(labelled))
+    last = len(labelled) - 1 - int(np.argmax(labelled[::-1]))
+    out = df.iloc[first:last + 1].reset_index(drop=True)
+    return out, len(df) - len(out), int(out[target_column].isna().sum())
+
+
 def create_training_loss(loss_function: str, train_labels: pd.Series, target_column: str):
     """Build the training loss: None for 'mse' (the model default), else a class-weighted loss.
 
@@ -1988,11 +2006,19 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
         n_rows_before = sum(len(f) for f in frames)
         n_unobservable = 0
         trimmed = []
+        n_interior = 0
         for f in frames:
-            f, n_dropped = drop_unobservable_target_rows(f, target_column)
+            f, n_dropped, n_gaps = trim_unlabelled_edges(f, target_column)
             n_unobservable += n_dropped
+            n_interior += n_gaps
             trimmed.append(f)
         frames = trimmed
+        if n_interior and job_type != 'classification':
+            # Darts regression models train on the series as it is and a NaN inside it makes the loss NaN
+            return {'status': 'failed', 'error': (
+                f"Target '{target_column}' has {n_interior} rows without a label inside the series (a sparse target, or "
+                f"filled bars): regression models cannot train across gaps. Use a classification job (the windows "
+                f"without a label are dropped), or a target that labels every session")}
         if n_unobservable:
             logger.info(
                 f"Dropped {n_unobservable} rows with no observable "

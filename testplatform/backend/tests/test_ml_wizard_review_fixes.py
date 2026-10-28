@@ -117,3 +117,76 @@ class TestEditIntradayToDaily:
               "daily_universe": ["AAA"], "original_start_date": "2023-01-03", "original_end_date": "2024-12-31"}
         ds, _ = TestDailyUpdatePath()._update(gc, {"timeframe": "1h", "panel_features": ["market"]}, [], timeframe="1d")
         assert ds.generation_config["panel_features"] == ["market"] and "daily_groups" not in ds.generation_config
+
+
+# ---------------------------------------------------------------------------------------------- 4. sparse targets
+def sparse_frame(n=120, seed=0, keep_every=3):
+    """Consecutive sessions; t_a is the row number (so a window's continuity is visible); only every 3rd label exists."""
+    d = pd.DataFrame({"Date": pd.bdate_range("2023-01-02", periods=n), "t_a": np.arange(n, dtype=float),
+                      "y": np.random.default_rng(seed).integers(0, 2, n).astype(float)})
+    d.loc[[i for i in range(n) if i % keep_every != 0], "y"] = np.nan
+    return d
+
+
+class TestSparseTargetsKeepSessionContinuity:
+    def tsai(self, monkeypatch):
+        from app.services import tsai_training as TT
+        monkeypatch.setattr(TT, "TSAI_AVAILABLE", True)
+        return TT.TSAITrainingService(normalize=False)
+
+    def test_a_window_covers_exactly_seq_len_consecutive_sessions(self, monkeypatch):
+        svc = self.tsai(monkeypatch)
+        f = sparse_frame()
+        X, y = svc.prepare_data(f, "y", ["t_a"], seq_len=5, fit_scaler=False)
+        assert X.shape[1:] == (1, 5)
+        assert (np.diff(X[:, 0, :], axis=1) == 1.0).all()               # five consecutive sessions, no gap
+        ends = X[:, 0, -1].astype(int)
+        assert (ends % 3 == 0).all() and len(X) == len([i for i in range(4, 120) if i % 3 == 0])   # only labelled windows
+        assert y.dtype == np.int64 and set(np.unique(y)) <= {0, 1}
+        np.testing.assert_array_equal(y, f["y"].to_numpy()[ends].astype(np.int64))
+
+    def test_the_three_way_split_windows_each_block_on_full_sessions(self, monkeypatch):
+        svc = self.tsai(monkeypatch)
+        out = svc.prepare_split_three_way([sparse_frame(seed=1), sparse_frame(seed=2)], 0.7, 0.5, "y", ["t_a"], seq_len=5,
+                                          label_horizon=3)
+        for k in ("X_train", "X_val", "X_holdout"):
+            assert (np.diff(out[k][:, 0, :], axis=1) == 1.0).all() and len(out[k]) > 0
+
+    def test_a_dense_target_is_unchanged(self, monkeypatch):
+        svc = self.tsai(monkeypatch)
+        f = sparse_frame(keep_every=1)
+        X, y = svc.prepare_data(f, "y", ["t_a"], seq_len=5, fit_scaler=False)
+        assert len(X) == 116 and y.dtype == np.int64
+
+    def test_only_the_edges_are_trimmed_from_a_job_frame(self):
+        from app.services.job_handler import trim_unlabelled_edges
+        f = sparse_frame()
+        f.loc[:4, "y"] = np.nan
+        f.loc[f.index[-6:], "y"] = np.nan
+        out, n_edge, n_interior = trim_unlabelled_edges(f, "y")
+        assert out["y"].iloc[0] == out["y"].dropna().iloc[0] and not np.isnan(out["y"].iloc[0]) and not np.isnan(out["y"].iloc[-1])
+        assert (np.diff(out["t_a"]) == 1).all()                         # consecutive sessions kept
+        assert n_edge + len(out) == len(f) and n_interior == int(out["y"].isna().sum()) > 0
+
+    def test_a_quintile_job_keeps_every_session_of_every_ticker(self, monkeypatch):
+        from tests.test_ml_wizard_daily_targets import TestJobIntegration, job_frames, pt
+        result, cap = TestJobIntegration()._job(job_frames(10), [pt("daily_quintile", horizonSessions=3)], monkeypatch)
+        assert result["status"] == "dry_run_success", result
+        comb = cap["combined"]
+        assert comb["quintile_h3"].isna().sum() > 0.4 * len(comb)       # the middle fifths are NaN rows, and they are kept
+        for _, g in comb.groupby("ticker"):
+            d = pd.to_datetime(g["Date"]).sort_values()
+            assert (d.diff().dropna().dt.days <= 3).all()               # business days only: no session dropped inside
+
+    def test_darts_refuses_a_target_with_gaps_inside_the_series(self, monkeypatch):
+        from tests.test_ml_wizard_daily_targets import TestJobIntegration, job_frames, pt
+        result, _ = TestJobIntegration()._job(job_frames(10), [pt("daily_quintile", horizonSessions=3)], monkeypatch,
+                                              job_type="regression")
+        assert result["status"] == "failed"
+        assert "quintile_h3" in result["error"] and "classification" in result["error"] and "gaps" in result["error"]
+
+    def test_darts_trains_a_dense_target_as_before(self, monkeypatch):
+        from tests.test_ml_wizard_daily_targets import TestJobIntegration, job_frames, pt
+        result, _ = TestJobIntegration()._job(job_frames(6), [pt("daily_rel_return", horizonSessions=3)], monkeypatch,
+                                              job_type="regression")
+        assert result["status"] == "dry_run_success", result

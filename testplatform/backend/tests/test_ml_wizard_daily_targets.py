@@ -254,19 +254,20 @@ class TestCrossSectionalTargets:
 
 # ---------------------------------------------------------------------------------------------- the job handler
 class TestJobIntegration:
-    def _job(self, frames, targets, monkeypatch, ratio=70, timeframe="1d", provider="alpaca_hist"):
+    def _job(self, frames, targets, monkeypatch, ratio=70, timeframe="1d", provider="alpaca_hist",
+             job_type="classification"):
         from app.services import job_handler
         captured = {}
         monkeypatch.setattr(job_handler, "ML_AVAILABLE", True)
         monkeypatch.setattr(job_handler, "load_dataset", lambda i, start_date=None, end_date=None: frames[i].copy())
         monkeypatch.setattr(job_handler, "get_dataset_info", lambda i: {
-            "ticker": TICKERS[i], "timeframe": timeframe, "data_provider": provider})
+            "ticker": TICKERS[i] if i < len(TICKERS) else f"T{i}", "timeframe": timeframe, "data_provider": provider})
         monkeypatch.setattr(job_handler, "update_job_progress", lambda *a, **k: None)
         monkeypatch.setattr(job_handler, "save_training_datasets", lambda **kw: captured.update(
             combined=kw["combined_df"], train=kw["train_df"], features=kw["feature_columns"],
             target=kw["target_column"]))
         payload = {
-            "dataset_ids": list(range(len(frames))), "job_type": "classification", "selected_models": ["lstm"],
+            "dataset_ids": list(range(len(frames))), "job_type": job_type, "selected_models": ["lstm"],
             "train_test_split": ratio, "prediction_horizon": 1, "prediction_modes": ["shift"],
             "genetic_config": {"populationSize": 2}, "metrics_config": {"classificationMetric": "f1_score"},
             "prediction_targets": targets}

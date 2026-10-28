@@ -176,8 +176,12 @@ class TSAITrainingService(ITrainingService):
         if not TSAI_AVAILABLE:
             raise RuntimeError("tsai library not available")
 
-        # Extract target
-        y_data = df[target_column].values.astype(np.int64)
+        # Extract target. A target can be sparse (the cross-sectional quintile labels only the top and bottom fifth): the
+        # windows are then built on the FULL consecutive frame and the windows whose label is NaN are dropped afterwards,
+        # so a window always covers seq_len consecutive sessions (dropping the NaN rows first would join distant sessions).
+        y_raw = df[target_column].to_numpy(dtype=np.float64)
+        sparse = bool(np.isnan(y_raw).any())
+        y_data = y_raw if sparse else y_raw.astype(np.int64)
 
         n_fit = None
         if scaler_fit_until is not None:
@@ -224,6 +228,13 @@ class TSAITrainingService(ITrainingService):
             X, y = self._create_sequences_multistep(X_data, y_data, seq_len, prediction_horizon)
         else:
             X, y = self._create_sequences(X_data, y_data, seq_len, prediction_horizon)
+
+        if sparse:
+            labelled = ~np.isnan(y.reshape(len(y), -1)).any(axis=1)
+            X, y = X[labelled], y[labelled]
+            if prediction_mode != 'multistep':
+                y = y.astype(np.int64)
+            logger.info(f"Dropped {int((~labelled).sum())} windows whose label is NaN (sparse target)")
 
         logger.info(f"Prepared data: X shape {X.shape}, y shape {y.shape}, horizon={prediction_horizon}, mode={prediction_mode}, normalized={self.normalize}")
         return X, y
@@ -493,7 +504,7 @@ class TSAITrainingService(ITrainingService):
 
         # Shape: (samples, features, seq_len) for tsai
         X_seq = np.zeros((n_samples, n_features, seq_len), dtype=np.float32)
-        y_seq = np.zeros(n_samples, dtype=np.int64)
+        y_seq = np.zeros(n_samples, dtype=y.dtype)        # int64 labels, or float64 when the target has NaN (sparse)
 
         for i in range(n_samples):
             # Transpose to get (features, seq_len)
