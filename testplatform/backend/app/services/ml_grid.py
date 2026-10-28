@@ -1098,7 +1098,8 @@ def _predictions_frame(cell: Cell, panel: Panel, rows: np.ndarray, scores: np.nd
     return pd.DataFrame(out).sort_values(["session", "symbol"], kind="mergesort").reset_index(drop=True)
 
 
-_CODE_MODULES = ("ml_grid", "ml_models", "ml_targets", "ml_eval", "ml_walkforward", "ml_controls", "ml_features")
+_CODE_MODULES = ("ml_grid", "ml_models", "ml_targets", "ml_eval", "ml_walkforward", "ml_controls", "ml_features",
+                 "ml_grid_seq", "ml_models_seq", "ml_panel", "ml_search")
 
 
 @lru_cache(maxsize=1)
@@ -1110,7 +1111,8 @@ def library_versions() -> Dict[str, Any]:
     out: Dict[str, Any] = {"python": platform.python_version()}
     for dist, key in (("numpy", "numpy"), ("pandas", "pandas"), ("pyarrow", "pyarrow"), ("scikit-learn", "sklearn"),
                       ("scipy", "scipy"), ("lightgbm", "lightgbm"), ("xgboost", "xgboost"), ("catboost", "catboost"),
-                      ("threadpoolctl", "threadpoolctl")):
+                      ("threadpoolctl", "threadpoolctl"), ("torch", "torch"), ("darts", "darts"),
+                      ("pytorch-lightning", "pytorch_lightning"), ("tsai", "tsai")):
         try:
             out[key] = version(dist)
         except PackageNotFoundError:
@@ -1135,16 +1137,20 @@ class BudgetExceeded(RuntimeError):
     """A GPU (cell, seed) ran past ``GridSettings.gpu_budget_minutes``."""
 
 
-def identity_of(cell: Cell, st: GridSettings, daily_fp: str) -> Dict[str, Any]:
-    """What a finished row was computed from, for the resume check: the settings (not ``cores``), the store signature
-    and the daily cache fingerprint."""
+def identity_of(cell: Cell, st: GridSettings, daily_fp: str, intraday_fp: str = "") -> Dict[str, Any]:
+    """What a finished row was computed from, for the resume check: the settings (not ``cores``), the store signature,
+    the daily cache fingerprint and, for a tsai cell, the fingerprint of the 5-minute bars it reads (a content hash,
+    ``ml_grid_seq.intraday_fingerprint``)."""
     settings = st.to_dict()
     for name in ("cores", "gpu_budget_minutes"):             # how many threads / how long it may take: not what it computes
         del settings[name]
     if cell.pool != "gpu":                                    # a tabular row does not depend on the sequence settings
         for name in SEQ_SETTINGS:
             del settings[name]
-    return _sanitize({"settings": settings, "store_signature": cell.signature, "daily_fingerprint": daily_fp})
+    out = {"settings": settings, "store_signature": cell.signature, "daily_fingerprint": daily_fp}
+    if split_family(cell.family)[0] == "tsai":
+        out["intraday_fingerprint"] = intraday_fp
+    return _sanitize(out)
 
 
 def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs: int,
@@ -1155,6 +1161,11 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
     gpu = cell.pool == "gpu"
     if gpu and cell.blocks != "H":
         raise ValueError(f"a GPU family trains on half-year blocks (blocks: 'H'), got {cell.blocks!r}")
+    intraday_fp = ""
+    if split_family(cell.family)[0] == "tsai":
+        from app.services.ml_grid_seq import intraday_fingerprint
+        syms = tuple(sorted(resolve_symbols(cell.symbols)))
+        intraday_fp = intraday_fingerprint(panel.cache_root, syms, st.eval_end, store_span(cell.store, syms)[1])
     blocks = W.blocks(st.eval_start, st.eval_end, cell.blocks)
     skipped: List[Dict[str, str]] = []
     clipped: List[Dict[str, str]] = []
@@ -1200,7 +1211,7 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
         info.append(entry)
     iters = [b["n_iter"] for b in info if b["n_iter"] is not None]
     row: Dict[str, Any] = {"cell_key": cell.key, "seed": int(seed), "track": cell.track, "label": cell.label,
-                           "config": cell.config(), "identity": identity_of(cell, st, panel.daily_fingerprint),
+                           "config": cell.config(), "identity": identity_of(cell, st, panel.daily_fingerprint, intraday_fp),
                            "versions": library_versions(),
                            "deterministic": cell.family in DETERMINISTIC_FAMILIES,
                            "seeds_run": len(effective_seeds(cell)),
@@ -1212,7 +1223,11 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
                                           else (info[0]["n_channels"] if info else 0)),
                            "symbols": list(panel.symbols)}
     if gpu:
+        from app.services.ml_grid_seq import gpu_versions
+        row["versions"] = {**row["versions"], **gpu_versions()}
         row["over_budget"] = elapsed() > budget_s              # finished work is kept; the flag says it was slow
+        ops = sorted({op for b in info for op in (b["nondeterministic_ops"] if "nondeterministic_ops" in b else [])})
+        row["gpu_nondeterministic"], row["nondeterministic_ops"] = bool(ops), ops
     if not rows_l:
         row.update({"status": "no_predictions", "n_rows": 0, "primary": {"name": None, "value": None},
                     "metrics": {}, "regimes": {}, "controls": {}})
@@ -1806,7 +1821,9 @@ def _identity_diff(row: Dict[str, Any], expected: Dict[str, Any]) -> List[str]:
     if not isinstance(ident, dict):
         return ["no identity recorded (a row written before identity tracking)"]
     out = []
-    for k in ("store_signature", "daily_fingerprint"):
+    for k in ("store_signature", "daily_fingerprint", "intraday_fingerprint"):
+        if k not in expected:
+            continue                                  # only tsai rows carry the intraday fingerprint
         got = ident[k] if k in ident else None
         if got != expected[k]:
             out.append(f"{k}: row {got!r}, now {expected[k]!r}")
@@ -1849,7 +1866,13 @@ def _check_resume(rows: List[Dict[str, Any]], cells: Sequence[Cell], st: GridSet
         first, last, _ = store_span(c.store, syms)
         if (syms, first, last) not in fps:
             fps[(syms, first, last)] = daily_fingerprint(cache_root, syms, first, last)
-        diff = _identity_diff(r, identity_of(c, st, fps[(syms, first, last)]))
+        ifp = ""
+        if split_family(c.family)[0] == "tsai":
+            from app.services.ml_grid_seq import intraday_fingerprint
+            if ("intraday", syms, last) not in fps:
+                fps[("intraday", syms, last)] = intraday_fingerprint(cache_root, syms, st.eval_end, last)
+            ifp = fps[("intraday", syms, last)]
+        diff = _identity_diff(r, identity_of(c, st, fps[(syms, first, last)], ifp))
         if diff:
             mism[k] = diff
         elif r["status"] == "ok" and not (pred_dir / f"{k[0]}_{k[1]}.parquet").exists():

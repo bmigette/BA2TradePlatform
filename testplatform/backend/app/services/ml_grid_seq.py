@@ -42,15 +42,21 @@ in 2016, and has no such gap.)
 flag of the report never applies to these cells; the epochs are in the block audit (``epochs_run``, ``best_epoch``,
 ``val_loss``).
 
-Both: the process-wide cuDNN flags are set deterministic (``cudnn.deterministic``, no ``benchmark``) before every block
-(the adapters leave them to the caller); TF32 stays at PyTorch's defaults. Epochs are capped by ``GridSettings.gpu_max_epochs`` (early stopping on the train-tail validation block only,
-never on test data), the seed goes to python / numpy / torch and to ``sample_bars``, the adapter is ``release()``d after
+Both: the process-wide cuDNN flags are set deterministic (``cudnn.deterministic``, no ``benchmark``, deterministic
+algorithms with ``warn_only``) before every block (the adapters leave them to the caller); TF32 stays at PyTorch's
+defaults. That makes a rerun as repeatable as the kernels allow, NOT bitwise repeatable: an op without a deterministic
+CUDA kernel (darts-nhits' interpolation backward is one) still varies between runs. The block audit records it
+(``gpu_nondeterministic``, ``nondeterministic_ops``, from torch's warning), and so does the row.
+Epochs are capped by ``GridSettings.gpu_max_epochs`` (early stopping on the train-tail validation block only, never on
+test data), the seed goes to python / numpy / torch and to ``sample_bars``, the adapter is ``release()``d after
 every block (also when the fit fails), and the fit time, device, epochs and sample counts of every block are recorded.
 """
 from __future__ import annotations
 
 import gc
+import hashlib
 import logging
+import re
 import os
 import random
 import time
@@ -172,20 +178,68 @@ def _file_span(path: str, size: int, mtime_ns: int) -> Tuple[date, date]:
     return dates.min().date(), dates.max().date()
 
 
-def intraday_span(panel: "G.Panel", st: "G.GridSettings") -> Tuple[date, date, Tuple]:
-    """(first day, last day, file stamps) of the intraday panel of ``panel``'s symbols: from the first day every symbol and
-    the context symbols have 5-minute bars to ``min(eval_end, the last cached day, the daily panel's last session)``."""
-    names = tuple(dict.fromkeys(tuple(panel.symbols) + MP.CONTEXT_SYMBOLS))
+def intraday_bounds(cache_root: Any, symbols: Any, eval_end: date, store_last: date) -> Tuple[date, date, Tuple]:
+    """(first day, last day, file stamps) of the intraday panel of ``symbols``: from the first day every symbol and the
+    context symbols (SPY, QQQ) have 5-minute bars to ``min(eval_end, the last cached day, store_last)`` (the daily
+    panel's last session). The stamps (size, mtime) only key caches: they are never part of an identity."""
+    names = tuple(dict.fromkeys(tuple(symbols) + MP.CONTEXT_SYMBOLS))
     firsts, lasts, stamps = [], [], []
     for s in names:
-        f = MP._cache_file(Path(panel.cache_root), s)                  # PanelDataError when the cache lacks the symbol
+        f = MP._cache_file(Path(cache_root), s)                        # PanelDataError when the cache lacks the symbol
         stat = f.stat()
         first_s, last_s = _file_span(str(f), stat.st_size, stat.st_mtime_ns)
         firsts.append(first_s)
         lasts.append(last_s)
         stamps.append((s, stat.st_size, stat.st_mtime_ns))
-    last = min(min(lasts), st.eval_end, panel.sessions.max().date())
-    return max(firsts), last, tuple(stamps)
+    return max(firsts), min(min(lasts), eval_end, store_last), tuple(stamps)
+
+
+def intraday_span(panel: "G.Panel", st: "G.GridSettings") -> Tuple[date, date, Tuple]:
+    """``intraday_bounds`` of a daily ``panel``'s symbols under the run's ``eval_end``."""
+    return intraday_bounds(panel.cache_root, panel.symbols, st.eval_end, panel.sessions.max().date())
+
+
+@lru_cache(maxsize=1024)
+def _intraday_hash(cache_root: str, symbol: str, size: int, mtime_ns: int, first: date, last: date) -> bytes:
+    """SHA-1 of the row hashes of one symbol's 5-minute bars inside ``[first, last]`` (open, high, low, close, volume and
+    the bar time). Cached on the file's size and mtime, so every cell and every resume check that shares a symbol reads
+    the file once; only the 20-byte digest is kept."""
+    df = pd.read_parquet(MP._cache_file(Path(cache_root), symbol), columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+    window = df[(df["Date"] >= pd.Timestamp(first)) & (df["Date"] < pd.Timestamp(last) + pd.Timedelta(days=1))]
+    return hashlib.sha1(pd.util.hash_pandas_object(window, index=False).to_numpy().tobytes()).digest()
+
+
+def intraday_fingerprint(cache_root: Any, symbols: Any, eval_end: date, store_last: date) -> str:
+    """Content hash of the 5-minute bars a tsai cell reads: every bar of ``symbols`` and of the context symbols inside
+    ``intraday_bounds``. A touch of a file, or bars appended after the window, do not change it; a changed bar inside the
+    window does. No mtime is part of it (the resume identity must survive a copy of the cache)."""
+    first, last, stamps = intraday_bounds(cache_root, symbols, eval_end, store_last)
+    h = hashlib.sha1()
+    for sym, size, mtime in sorted(stamps):
+        h.update(sym.encode("utf-8"))
+        h.update(_intraday_hash(str(cache_root), sym, size, mtime, first, last))
+    return h.hexdigest()[:16]
+
+
+@lru_cache(maxsize=4)
+def _gpu_versions(cuda_initialized: bool) -> Dict[str, Any]:
+    import torch
+    try:
+        cudnn = torch.backends.cudnn.version()
+    except Exception:                                                  # noqa: BLE001
+        cudnn = None
+    device = torch.cuda.get_device_name(0) if cuda_initialized and torch.cuda.is_available() else None
+    return {"torch_cuda": torch.version.cuda, "cudnn": cudnn, "device": device}
+
+
+def gpu_versions() -> Dict[str, Any]:
+    """CUDA / cuDNN versions and the device name of this process, for the audit trail of a GPU row. The device name is only
+    read once CUDA is initialised (a fit has run): asking for it must never wake the GPU."""
+    import torch
+    return _gpu_versions(bool(torch.cuda.is_initialized()))
+
+
+gpu_versions.cache_clear = _gpu_versions.cache_clear                  # type: ignore[attr-defined]
 
 
 def get_intraday(panel: "G.Panel", st: "G.GridSettings", timer: Optional[Dict[str, float]] = None) -> IntradayPanel:
@@ -270,6 +324,10 @@ def _adapter_params(cell: "G.Cell", st: "G.GridSettings") -> Tuple[str, Dict[str
     return base, p
 
 
+#: torch's warning for an op without a deterministic CUDA kernel (under ``use_deterministic_algorithms(warn_only=True)``)
+NONDETERMINISTIC_OP = re.compile(r"^(\S+) does not have a deterministic implementation")
+
+
 def seed_everything(seed: int) -> None:
     """Seed python and numpy (the adapters seed torch and restore the generators they touched)."""
     random.seed(seed)
@@ -287,7 +345,7 @@ def fit_block_seq(cell: "G.Cell", seed: int, panel: "G.Panel", br: "G.BlockRows"
     import torch
     torch.set_num_threads(max(1, int(n_jobs)))
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")              # read when cuBLAS first runs in the process
-    torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = True, False    # bitwise repeatable on the GPU
+    torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = True, False    # as repeatable as the kernels allow (see gpu_nondeterministic)
     torch.use_deterministic_algorithms(True, warn_only=True)
     seed_everything(seed)
     base, params = _adapter_params(cell, st)
@@ -295,14 +353,26 @@ def fit_block_seq(cell: "G.Cell", seed: int, panel: "G.Panel", br: "G.BlockRows"
         raise RuntimeError("device='auto' but CUDA is not available in this GPU worker: refusing to fall back to the "
                            "CPU silently (set params.device to 'cpu' to run a deep cell on the CPU on purpose)")
     adapter = M.make_adapter(base, n_jobs, params)
+    warn_always = torch.is_warn_always_enabled()
     try:
-        if base == "tsai":
-            rows, scores, extra = _tsai_block(cell, seed, panel, br, st, adapter)
-        else:
-            rows, scores, extra = _darts_block(cell, seed, panel, br, st, adapter)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.set_warn_always(True)                               # an op warns every time, not once per process
+            try:
+                if base == "tsai":
+                    rows, scores, extra = _tsai_block(cell, seed, panel, br, st, adapter)
+                else:
+                    rows, scores, extra = _darts_block(cell, seed, panel, br, st, adapter)
+            finally:
+                torch.set_warn_always(warn_always)
     finally:
         _release_quietly(adapter)
         gc.collect()
+    ops = sorted({m.group(1) for w in caught for m in [NONDETERMINISTIC_OP.match(str(w.message))] if m})
+    for w in caught:                                                  # what is not ours goes on its way
+        if not NONDETERMINISTIC_OP.match(str(w.message)):
+            warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
+    extra = {**extra, "gpu_nondeterministic": bool(ops), "nondeterministic_ops": ops}
     info = adapter.fit_info if adapter.fit_info is not None else {}
     audit = {**G.block_audit(br, block, window), **extra,
              "device": info["device"] if "device" in info else None,

@@ -2,6 +2,7 @@
 daily store frame, run in a second process pool; on tiny synthetic data, CPU torch (``device: "cpu"``)."""
 import json
 import os
+import re
 import shutil
 from datetime import date
 from pathlib import Path
@@ -1299,3 +1300,147 @@ def test_building_the_cli_help_does_not_import_the_grid_runner():
             % (str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parents[2])))
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=180)
     assert out.stdout.strip().endswith("LIGHT"), out.stdout[-500:] + out.stderr[-500:]
+
+
+# ---- 7. the tsai identity: a content hash of the 5-minute bars
+def _copy_world(world, root: Path):
+    stores, _, cache = world
+    shutil.copytree(cache, root / "cache")
+    shutil.copytree(stores, root / "stores")
+    return root / "stores", root / "stores" / "stocks", root / "cache"
+
+
+def _bars_file(world, sym):
+    return world[2] / "AlpacaHistoryOHLCVProvider" / f"{sym}_5min.parquet"
+
+
+def _fp(world, **over):
+    kw = dict(symbols=tuple(GSYMS), eval_end=LAST_G, store_last=LAST_G)
+    kw.update(over)
+    return S.intraday_fingerprint(str(world[2]), kw["symbols"], kw["eval_end"], kw["store_last"])
+
+
+def test_the_intraday_fingerprint_is_a_content_hash_of_the_bars_in_the_window(world, tmp_path):
+    w = _copy_world(world, tmp_path)
+    base = _fp(w)
+    assert len(base) == 16 and base == _fp(w)
+    assert _fp(w, symbols=tuple(reversed(GSYMS))) == base                         # the order of the symbols does not matter
+    f = _bars_file(w, GSYMS[0])
+    os.utime(f, (1_900_000_000, 1_900_000_000))                                     # a touch
+    assert _fp(w) == base
+    df = pd.read_parquet(f)
+    extra = df.iloc[[-1]].copy()
+    extra["Date"] = extra["Date"] + pd.Timedelta(days=5)                            # a bar AFTER the store's last day
+    pd.concat([df, extra]).to_parquet(f, index=False)
+    assert _fp(w) == base
+    df = pd.read_parquet(f)
+    df.loc[df.index[len(df) // 2], "Close"] *= 1.0001                               # a bar INSIDE the window
+    df.to_parquet(f, index=False)
+    assert _fp(w) != base
+    again = _fp(w)
+    q = pd.read_parquet(_bars_file(w, "QQQ"))                                       # the context symbols count too
+    q.loc[q.index[len(q) // 3], "Open"] *= 1.001
+    q.to_parquet(_bars_file(w, "QQQ"), index=False)
+    assert _fp(w) != again
+    assert _fp(w, eval_end=date(2020, 6, 30)) != _fp(w)                              # the window ends at eval_end
+
+
+def test_a_tsai_row_records_the_fingerprint_and_no_mtime(tsai_run, darts_run, world):
+    ident = tsai_run[2][0]["identity"]
+    assert len(ident["intraday_fingerprint"]) == 16
+    assert "mtime" not in json.dumps(ident)
+    assert "intraday_fingerprint" not in darts_run[2][0]["identity"]               # only tsai reads the 5-minute bars
+    assert ident["intraday_fingerprint"] == _fp(world, symbols=tuple(sorted(GSYMS)))
+
+
+def test_a_changed_five_minute_bar_makes_a_tsai_resume_refuse_but_a_touch_does_not(world, tmp_path):
+    w = _copy_world(world, tmp_path / "w")
+    out = tmp_path / "o"
+    cells = [tsai_cell(w), lgbm_cell(w)]
+    grun(cells, out, w)
+    f = _bars_file(w, GSYMS[2])
+    os.utime(f, (1_900_000_000, 1_900_000_000))
+    assert grun(cells, out, w)["tasks"] == 0
+    df = pd.read_parquet(f)
+    df.loc[df.index[len(df) // 2], "Close"] *= 1.0001
+    df.to_parquet(f, index=False)
+    with pytest.raises(G.ResumeMismatchError, match="intraday_fingerprint"):
+        grun(cells, out, w)
+    assert grun([lgbm_cell(w)], out, w)["tasks"] == 0                              # a tabular row does not read them
+    res = grun(cells, out, w, rerun_mismatched=True)
+    assert res["done"] == 1
+
+
+# ---- 8. the audit
+def test_the_library_versions_cover_the_deep_learning_stack_and_the_code_hash_the_gpu_modules():
+    v = G.library_versions()
+    for key in ("torch", "darts", "pytorch_lightning", "tsai"):
+        assert key in v and v[key], key
+    for mod in ("ml_grid_seq", "ml_models_seq", "ml_panel", "ml_search"):
+        assert mod in G._CODE_MODULES
+    assert len(v["code"]) == 12
+
+
+def test_the_gpu_versions_name_cuda_cudnn_and_the_device_without_waking_the_gpu(monkeypatch):
+    import torch
+    S.gpu_versions.cache_clear()
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    v = S.gpu_versions()
+    assert set(v) == {"torch_cuda", "cudnn", "device"} and v["device"] is None            # CUDA was not touched
+    S.gpu_versions.cache_clear()
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda i=0: "Fake GPU 9000")
+    assert S.gpu_versions()["device"] == "Fake GPU 9000"
+    S.gpu_versions.cache_clear()
+
+
+def test_a_gpu_row_carries_the_gpu_versions_a_tabular_row_does_not(tsai_run, darts_run, world, tmp_path):
+    for _, _, rows in (tsai_run, darts_run):
+        assert set(rows[0]["versions"]) >= {"torch", "torch_cuda", "cudnn", "device", "darts", "tsai", "code"}
+    out = tmp_path / "o"
+    grun([lgbm_cell(world)], out, world)
+    assert "torch_cuda" not in G.read_results(out / "results.jsonl")[0]["versions"]
+
+
+# ---- nondeterminism record
+NONDET = ("upsample_linear1d_backward_out_cuda does not have a deterministic implementation, but you set "
+          "'torch.use_deterministic_algorithms(True, warn_only=True)'. You can file an issue.")
+
+
+def test_a_block_that_hits_a_nondeterministic_kernel_says_so(world, tmp_path, monkeypatch):
+    import warnings
+    real = MS.TsaiAdapter.fit
+
+    def fit(self, *a, **k):
+        warnings.warn(NONDET, UserWarning)
+        return real(self, *a, **k)
+    monkeypatch.setattr(MS.TsaiAdapter, "fit", fit)
+    out = tmp_path / "o"
+    grun([tsai_cell(world)], out, world)
+    row = G.read_results(out / "results.jsonl")[0]
+    assert row["gpu_nondeterministic"] is True and row["nondeterministic_ops"] == ["upsample_linear1d_backward_out_cuda"]
+    for b in row["blocks"]:
+        assert b["gpu_nondeterministic"] is True and b["nondeterministic_ops"] == ["upsample_linear1d_backward_out_cuda"]
+
+
+def test_a_clean_block_is_not_flagged(tsai_run):
+    row = tsai_run[2][0]
+    assert row["gpu_nondeterministic"] is False and row["nondeterministic_ops"] == []
+    assert all(b["gpu_nondeterministic"] is False for b in row["blocks"])
+
+
+def test_other_warnings_of_a_block_are_not_swallowed(world, tmp_path, monkeypatch):
+    import warnings
+    real = MS.TsaiAdapter.fit
+
+    def fit(self, *a, **k):
+        warnings.warn("something unrelated", UserWarning)
+        return real(self, *a, **k)
+    monkeypatch.setattr(MS.TsaiAdapter, "fit", fit)
+    with pytest.warns(UserWarning, match="something unrelated"):
+        grun([tsai_cell(world)], tmp_path / "o", world)
+
+
+def test_the_comments_do_not_promise_bitwise_repeatability():
+    text = Path(S.__file__).read_text(encoding="utf-8")
+    assert "bitwise repeatable" not in re.sub(r"not bitwise repeatable", "", text, flags=re.I)
