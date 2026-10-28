@@ -2586,6 +2586,83 @@ def _build_strategy_MLR(name: str):
     return _strategy_from_parts(name, buy_tree=buy, exit_conditions=exits)
 
 
+def ml_hold_days_range(horizon: int) -> tuple:
+    """``(min, centre, max)`` of MLH's ``days_opened`` gene matched to a forecast horizon of ``horizon`` sessions
+    (``--ml-hold-from-horizon``): d = round(H x 7/5) - 1 calendar days (H sessions are about 7H/5 calendar days; the
+    position is closed at the first daily check at or after d days, i.e. about H sessions after the entry fill), and
+    the gene is {d-1, d, d+1} clipped at 0. H x 7/5 never lands on .5, so Python's rounding is unambiguous."""
+    if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 1:
+        raise ValueError(f"horizon must be an int >= 1, got {horizon!r}")
+    d = round(horizon * 7 / 5) - 1
+    return max(0, d - 1), d, d + 1
+
+
+def _ml_store_horizon(keys, command: str, flag: str) -> int:
+    """The one horizon shared by every store of ``keys`` (aliases or keys); refuses a multi-horizon store, a mix, or an
+    unreadable store."""
+    from ba2_common.core.ml_forecast import store as _store
+    from ba2_experts.MLForecast import resolve_model_key as _resolve
+    horizons = {}
+    try:
+        for k in keys:
+            hs = list(_store.read_meta(_resolve(k))["horizons"])
+            if len(hs) != 1:
+                sys.exit(f"{command}: {flag}: store {k!r} has horizons {hs}; it needs single-horizon stores")
+            horizons[k] = int(hs[0])
+    except (ValueError, _store.ForecastStoreError) as e:
+        sys.exit(f"{command}: {flag}: cannot read a store's meta: {e}")
+    if len(set(horizons.values())) != 1:
+        sys.exit(f"{command}: {flag}: the --ml-model-keys stores do not share one horizon: {horizons}")
+    return next(iter(horizons.values()))
+
+
+def _ml_hold_from_horizon_range(enabled, raw_keys, expert: str, strategy: str, command: str):
+    """``--ml-hold-from-horizon``: the ``(min, centre, max)`` of the MLH/MLF ``days_opened`` gene, or None when the flag
+    is off. Refused for any other expert or strategy, without ``--ml-model-keys``, and for stores that do not share one
+    single horizon."""
+    if not enabled:
+        return None
+    if expert != "MLForecast" or strategy not in ("MLH", "MLF"):
+        sys.exit(f"{command}: --ml-hold-from-horizon only applies to MLForecast with strategy MLH or MLF, "
+                 f"not {expert!r} / {strategy!r}")
+    if not raw_keys:
+        sys.exit(f"{command}: --ml-hold-from-horizon needs --ml-model-keys (the horizon is the stores')")
+    keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+    h = _ml_store_horizon(keys, command, "--ml-hold-from-horizon")
+    lo, centre, hi = ml_hold_days_range(h)
+    print(f"{command}: --ml-hold-from-horizon: horizon {h} -> MLH days_opened gene {lo}..{hi} (centre {centre})")
+    return lo, centre, hi
+
+
+def _apply_ml_hold_range(strat, hold_range):
+    """Set the MLH ``days_opened`` gene (rule node ``mlh_days``) to ``hold_range`` = (min, centre, max), step 1.
+    ``hold_range`` None returns ``strat`` untouched. Both spellings of each key (camel and snake) are written, as the
+    rule model stores both."""
+    if hold_range is None:
+        return strat
+    import copy
+    lo, centre, hi = hold_range
+    found = []
+
+    def walk(node):
+        if isinstance(node, list):
+            for n in node:
+                walk(n)
+        elif isinstance(node, dict):
+            if node.get("id") == "mlh_days":
+                node.update({"value": float(centre), "valueMin": float(lo), "value_min": float(lo),
+                             "valueMax": float(hi), "value_max": float(hi), "valueStep": 1.0, "value_step": 1.0})
+                found.append(node)
+            for v in node.values():
+                walk(v)
+
+    strat.exit_rules = copy.deepcopy(strat.exit_rules)
+    walk(strat.exit_rules)
+    if len(found) != 1:
+        raise ValueError(f"expected exactly one 'mlh_days' gene in the strategy, found {len(found)}")
+    return strat
+
+
 def _apply_ml_rank_top_n(spec: dict, raw, expert: str, strategy: str, command: str) -> dict:
     """``--ml-rank-top-n 3,5``: make MLForecast's ``rank_top_n`` gene a choice of these N (distinct ints >= 1). MLR only:
     the ranking mode is the rotation strategy's. Flag-off returns ``spec`` untouched."""
@@ -7558,6 +7635,8 @@ def _cmd_optimize(args) -> int:
         sys.exit(f"ba2-test: optimize not configured for expert {expert!r}; have {sorted(_EXPERT_OPT)}")
     spec = _apply_ml_model_keys(spec, getattr(args, "ml_model_keys", None), expert, "optimize")
     spec = _apply_ml_rank_top_n(spec, getattr(args, "ml_rank_top_n", None), expert, args.strategy, "optimize")
+    ml_hold_range = _ml_hold_from_horizon_range(getattr(args, "ml_hold_from_horizon", False),
+                                                getattr(args, "ml_model_keys", None), expert, args.strategy, "optimize")
     _refuse_unbounded_strategy_request("optimize", [args.strategy])
     _refuse_phase_gated_strategy("optimize", [args.strategy])
     # --rm-toggle-policy (design atr_grid_2027 §3.2). "pinned" (default) is byte-identical to
@@ -7674,6 +7753,7 @@ def _cmd_optimize(args) -> int:
             raise ValueError("Neutral option entry experiments require a ruleset expert")
         strat = _build_strategy_minimal(_sname) if bypass else _build_strategy(
             args.strategy, _sname, expert, neutral_entry_mode=neutral_mode)
+        strat = _apply_ml_hold_range(strat, ml_hold_range)
         # Pure-option strategies carry a transient `entry_action` (the option ENTRY action config).
         # Capture it BEFORE commit/refresh so a db.refresh (which reloads only mapped columns) can't
         # affect it, then thread it into the run config below so the handler's _build_experts (and
@@ -9632,6 +9712,10 @@ def main(argv: "list | None" = None) -> int:
                     help="MLForecast with strategy MLR only: the rank_top_n gene chooses among these N (distinct "
                          "integers >= 1): BUY only the N most bullish symbols of the store at the decision date, "
                          "SELL a held long that drops out of them. Omit: the gene is pinned to 0 (ranking off).")
+    op.add_argument("--ml-hold-from-horizon", action="store_true",
+                    help="MLForecast with strategy MLH or MLF only (needs --ml-model-keys): the days_opened gene "
+                         "becomes {d-1, d, d+1} clipped at 0 with d = round(H x 7/5) - 1, H = the (single, shared) "
+                         "horizon of the --ml-model-keys stores, instead of the 0..6 range.")
     op.add_argument("--rerun", action="store_true",
                     help="Run even if an optimization with this --name has already "
                          "COMPLETED. Without it the run is skipped (exit 0) and the "
