@@ -2632,7 +2632,7 @@ def train_classification_optimization(
     """
     from app.services.task_queue import get_task_queue
     from app.services.tsai_models import TSAIModelService, TSAI_AVAILABLE
-    from app.services.tsai_training import TSAITrainingService, class_pos_weight
+    from app.services.tsai_training import TSAITrainingService, class_pos_weight, class_count
 
     if not TSAI_AVAILABLE:
         return {
@@ -2640,6 +2640,22 @@ def train_classification_optimization(
             'status': 'failed',
             'error': 'tsai library not available for classification'
         }
+
+    # Width of the network head in 'shift' mode: 2 for a 0/1 label, k for a k-class label
+    # (triple_barrier 0/1/2, direction_terciles). Taken from the labels, not assumed binary.
+    try:
+        n_classes = class_count(pd.concat([f[target_column] for f in frames], ignore_index=True))
+    except ValueError as e:
+        return {'model_type': 'classification', 'status': 'failed', 'error': f'{target_column}: {e}'}
+    if n_classes > 2 and 'multistep' in prediction_modes:
+        # multistep is one sigmoid per horizon on a 0/1 label; there is no k-class form of it
+        return {
+            'model_type': 'classification',
+            'status': 'failed',
+            'error': f"multistep prediction needs a binary target; {target_column} has {n_classes} classes "
+                     f"(use prediction mode 'shift')"
+        }
+    logger.info(f"Classification target {target_column}: {n_classes} classes")
 
     # Get normalization buffer from parameter ranges (default 35% if not specified for old configs)
     normalization_buffer = parameter_ranges.get('normalizationBuffer', 35) / 100.0  # Convert % to decimal
@@ -2735,7 +2751,7 @@ def train_classification_optimization(
                 X_train, X_test, y_train, y_test = (
                     split['X_train'], split['X_val'], split['y_train'], split['y_val']
                 )
-                c_out = 2 if mode == 'shift' else prediction_horizon
+                c_out = n_classes if mode == 'shift' else prediction_horizon
                 # Get the actual valid columns used after dropping zero-variance columns
                 valid_feature_columns = training_service.data_prep.get_valid_columns() if training_service.data_prep else feature_columns
                 # Get normalization params for inference consistency
@@ -2910,7 +2926,7 @@ def train_classification_optimization(
                 prediction_mode=mode,
                 # weighted_ce was created WITHOUT a weight (silently the plain loss); weight the
                 # positive class by the training class balance
-                pos_weight=class_pos_weight(y_train, mode) if loss_name == 'weighted_ce' else None
+                pos_weight=class_pos_weight(y_train, mode, n_classes) if loss_name == 'weighted_ce' else None
             )
 
             # Create epoch callback for training progress
