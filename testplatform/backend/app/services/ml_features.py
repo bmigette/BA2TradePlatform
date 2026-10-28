@@ -1109,6 +1109,150 @@ def fundamentals(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFr
     return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
 
 
+# ------------------------------------------------------------------------------------------ dated event files (A, I)
+def _read_fmp_rows(kind: str, symbol: str, ctx: BuildContext) -> List[dict]:
+    """The rows of ``fmp_history/<kind>__<symbol>.json`` (``PanelDataError`` if the file is missing) and its fingerprint
+    into the provenance. Every event-file group reads ITS kinds through here only."""
+    from app.services import ml_panel
+    rows = ml_panel._load_json(ctx.cache_root, kind, symbol)
+    path = fmp_history_path(kind, symbol, ctx.cache_root)
+    ctx.provenance.setdefault("fmp_history", {})[path.name] = _fingerprint(path)
+    return rows
+
+
+def _event_days(rows: List[dict], key: str, symbol: str, kind: str) -> np.ndarray:
+    """The calendar day (datetime64[D], the date part of a date or timestamp string) of each row's ``key``."""
+    out = np.empty(len(rows), dtype="datetime64[D]")
+    for i, r in enumerate(rows):
+        try:
+            out[i] = np.datetime64(str(r[key])[:10], "D")
+        except (KeyError, ValueError):
+            raise PanelDataError(f"{symbol}: {kind} row {i} has no readable {key!r}")
+    return out
+
+
+def _window_bounds(event_days: np.ndarray, sessions: pd.DatetimeIndex, days: int) -> Tuple[np.ndarray, np.ndarray]:
+    """For each session S the slice ``[lo, hi)`` of the (sorted) events dated in ``[S - days, S)``: an event is public
+    from the session AFTER its date, so at S exactly the events dated before S are visible; older ones fall out."""
+    s_days = sessions.values.astype("datetime64[D]")
+    return (np.searchsorted(event_days, s_days - np.timedelta64(days, "D"), side="left"),
+            np.searchsorted(event_days, s_days, side="left"))
+
+
+def _csum(values: np.ndarray) -> np.ndarray:
+    return np.concatenate([[0.0], np.cumsum(values, dtype="float64")])
+
+
+def _window_sum(csum: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+    return csum[hi] - csum[lo]
+
+
+def _distinct(codes: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+    """Distinct codes (>= 0; -1 is "no name") in each window."""
+    out = np.zeros(len(lo))
+    for i in range(len(lo)):
+        w = codes[lo[i]:hi[i]]
+        out[i] = np.unique(w[w >= 0]).size
+    return out
+
+
+def _codes(names: List[object]) -> np.ndarray:
+    """Integer code per distinct non-empty name; -1 for a missing / empty name."""
+    book: Dict[str, int] = {}
+    out = np.full(len(names), -1, dtype=np.int64)
+    for i, n in enumerate(names):
+        if n is None or str(n).strip() == "":
+            continue
+        out[i] = book.setdefault(str(n).strip(), len(book))
+    return out
+
+
+def _covered_from(event_days: np.ndarray, sessions: pd.DatetimeIndex) -> np.ndarray:
+    """Sessions from which a file has coverage: strictly after its earliest event (all False for an empty file)."""
+    if len(event_days) == 0:
+        return np.zeros(len(sessions), dtype=bool)
+    return sessions.values.astype("datetime64[D]") > event_days.min()
+
+
+# ------------------------------------------------------------------------------------------ group A (analysts)
+A_COLUMNS: Tuple[str, ...] = ("a_net_upgrades_30", "a_net_upgrades_90", "a_n_grades_90", "a_target_gap",
+                              "a_target_rev_30", "a_n_analysts_90")
+_ACTION_SCORE: Dict[str, int] = {"upgrade": 1, "downgrade": -1, "maintain": 0, "": 0}
+
+
+def _analyst_one(ctx: BuildContext, symbol: str, close: np.ndarray) -> pd.DataFrame:
+    sessions = ctx.sessions
+    grades = _read_fmp_rows("analyst_grades", symbol, ctx)
+    targets = _read_fmp_rows("price_target", symbol, ctx)
+    out: Dict[str, np.ndarray] = {}
+    # --- grades: +1 upgrade / -1 downgrade (by the file's `action`), counted over 30 / 90 calendar days
+    gd = _event_days(grades, "date", symbol, "analyst_grades")
+    score = np.zeros(len(grades))
+    for i, r in enumerate(grades):
+        action = (str(r["action"]) if "action" in r and r["action"] is not None else "").strip().lower()
+        if action not in _ACTION_SCORE:
+            raise PanelDataError(f"{symbol}: analyst_grades has unknown action {action!r} (known {sorted(_ACTION_SCORE)})")
+        score[i] = _ACTION_SCORE[action]
+    order = np.argsort(gd, kind="stable")
+    gd, score = gd[order], score[order]
+    gcodes = _codes([grades[i].get("gradingCompany") for i in order])
+    g_cov = _covered_from(gd, sessions)
+    cs = _csum(score)
+    for n in (30, 90):
+        lo, hi = _window_bounds(gd, sessions, n)
+        out[f"a_net_upgrades_{n}"] = np.where(g_cov, _window_sum(cs, lo, hi), np.nan)
+    lo, hi = _window_bounds(gd, sessions, 90)
+    out["a_n_grades_90"] = np.where(g_cov, _distinct(gcodes, lo, hi), np.nan)
+    # --- targets: only rows with a positive adjusted target (the other rows carry no target)
+    keep = [i for i, r in enumerate(targets) if _num(r, "adjPriceTarget") > 0]
+    td = _event_days([targets[i] for i in keep], "publishedDate", symbol, "price_target")
+    adj = np.array([_num(targets[i], "adjPriceTarget") for i in keep])
+    order = np.argsort(td, kind="stable")
+    td, adj = td[order], adj[order]
+    tcodes = _codes([targets[keep[i]].get("analystCompany") for i in order])
+    t_cov = _covered_from(td, sessions)
+    lo, hi = _window_bounds(td, sessions, 90)
+    count = (hi - lo).astype("float64")
+    mean = np.full(len(sessions), np.nan)
+    has = count > 0
+    mean[has] = _window_sum(_csum(adj), lo, hi)[has] / count[has]
+    mean = np.where(t_cov, mean, np.nan)
+    gap = np.full(len(sessions), np.nan)
+    ok = np.isfinite(mean) & (close > 0)
+    gap[ok] = np.clip(mean[ok] / close[ok] - 1.0, -5.0, 5.0)
+    out["a_target_gap"] = gap
+    m = pd.Series(mean)
+    prior = m.shift(30)
+    out["a_target_rev_30"] = np.clip((m / prior.where(prior > 0) - 1.0).to_numpy(), -5.0, 5.0)
+    out["a_n_analysts_90"] = np.where(t_cov, _distinct(tcodes, lo, hi), np.nan)
+    return pd.DataFrame(out, index=sessions)[list(A_COLUMNS)]
+
+
+def analysts(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
+    """Group ``a_``: sell-side opinion from the PER-ANALYST dated rows only.
+
+    Files: ``analyst_grades__<SYM>.json`` (``date``, ``gradingCompany``, ``action``) and ``price_target__<SYM>.json``
+    (``publishedDate``, ``analystCompany``, ``adjPriceTarget``). FMP's consensus / summary files
+    (``price_target_consensus*``, ``grades_consensus*``, ``grades_historical``) are windowed to about the last quarter, which
+    is look-ahead before that window: they are never opened (a test watches every file the build reads).
+
+    A row is visible from the session AFTER its date (for ``publishedDate`` the date part; a pre-market time does not
+    change that), so at session S the rows dated before S exist and a window is ``[S - N days, S)``.
+
+    * ``a_net_upgrades_30`` / ``_90``: upgrades minus downgrades (by ``action``; maintain counts 0) in the window;
+    * ``a_n_grades_90``: distinct ``gradingCompany`` in the 90-day grade window;
+    * ``a_target_gap``: mean ``adjPriceTarget`` of the 90-day window over the S close, minus 1 (clipped to [-5, 5]);
+      NaN when the window has no target;
+    * ``a_target_rev_30``: that 90-day mean over its value 30 sessions earlier, minus 1;
+    * ``a_n_analysts_90``: distinct ``analystCompany`` in the 90-day target window (two targets of one company count once).
+
+    Coverage: before a file's first row is visible every column of its kind is NaN (no fabricated zero). Once covered,
+    an empty window gives 0 upgrades / 0 names (that is real), but no target gap. An empty file is never covered. A
+    missing file or an unknown ``action`` refuses."""
+    frames = {sym: _analyst_one(ctx, sym, daily[sym]["close"].to_numpy(dtype="float64")) for sym in ctx.symbols}
+    return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
+
+
 #: group name -> spec. The name is the grid factor; the spec's prefix names its columns. Later tasks register here.
 GROUPS: Dict[str, GroupSpec] = {
     "t": GroupSpec(technical, "t_"),
@@ -1117,6 +1261,7 @@ GROUPS: Dict[str, GroupSpec] = {
     "x": GroupSpec(cross_section, "x_"),
     "mac": GroupSpec(macro, "mac_"),
     "f": GroupSpec(fundamentals, "f_"),
+    "a": GroupSpec(analysts, "a_"),
 }
 
 

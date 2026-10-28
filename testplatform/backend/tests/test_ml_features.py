@@ -240,7 +240,7 @@ def _build(cache, groups, symbols=SYMS, first=FIRST, last=LAST, ctx=CTX, sector_
 
 
 def _assert_cut_identical(cache, tmp_path, groups, day=CUT_DAY, symbols=SYMS, sector_of=None, universe=None,
-                          truncate_extra=None, membership=None, nan_ok=False):
+                          truncate_extra=None, membership=None, nan_ok=False, min_valid=0.5):
     """THE point-in-time proof: a build over a cache cut after ``day`` equals the full build on every common row.
     ``label_bar_filled`` is the one deliberate look-forward column (the NEXT session's fill flag): it is compared
     separately."""
@@ -262,7 +262,7 @@ def _assert_cut_identical(cache, tmp_path, groups, day=CUT_DAY, symbols=SYMS, se
     if "t_vol_z" in feats:
         isna.loc[cut["filled"], "t_vol_z"] = False                    # a filled bar has no volume: its own z is NaN
     if nan_ok:                                                        # non-members are NaN by design: most cells still carry values
-        assert feats and (~isna.to_numpy()).mean() > 0.5
+        assert feats and (~isna.to_numpy()).mean() > min_valid
     else:
         assert feats and not isna.to_numpy().any()                    # the comparison is not NaN == NaN
     return full
