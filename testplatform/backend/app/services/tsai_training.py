@@ -23,7 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import json
 
 from app.services.data_preparation import DataPreparationService, frame_bounds, purged_train_row_count, three_way_bounds
-from app.services.masked_fill import build_masked_fill, fill_masked_covariates, has_masked_cells, ticker_key
+from app.services.masked_fill import (build_masked_fill, fill_masked_covariates, has_daily_flags, has_masked_cells,
+                                       ticker_key)
 
 logger = logging.getLogger(__name__)
 
@@ -267,7 +268,9 @@ class TSAITrainingService(ITrainingService):
         kept = [c for c in feature_columns if c not in dropped]
         # the medians of the columns that ended up dropped for another ticker are of no use
         fills = {k: {c: v for c, v in table.items() if c in kept} for k, table in fills.items()}
-        self.masked_fill = build_masked_fill(fills, [c for c in feature_columns if c in dropped])
+        # only a dataset from the daily source has anything to save; any other leaves the params as they were
+        self.masked_fill = (build_masked_fill(fills, [c for c in feature_columns if c in dropped])
+                            if has_daily_flags(feature_columns) else None)
         return out, kept
 
     def prepare_data_split(
@@ -316,9 +319,12 @@ class TSAITrainingService(ITrainingService):
         # The 35% buffer, not the test rows, is what gives out-of-range headroom;
         # transform() clips anything past it.
         split_idx = int(len(df) * train_ratio)
-        # masked cells get the median of the train rows (the purge below only shortens them)
-        [df], feature_columns = self._fill_masked_frames(
-            [df], feature_columns, [purged_train_row_count(split_idx, label_horizon) or split_idx])
+        # masked cells get the median of the train rows (after the purge of the boundary rows)
+        n_train = purged_train_row_count(split_idx, label_horizon)
+        if n_train <= 0:
+            raise ValueError(f"{split_idx} training rows are too few for a label horizon of {label_horizon}: the purge "
+                             f"of the boundary rows leaves none")
+        [df], feature_columns = self._fill_masked_frames([df], feature_columns, [n_train])
         df_train = df.iloc[:split_idx]
         df_test = df.iloc[split_idx:]
 

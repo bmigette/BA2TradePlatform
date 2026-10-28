@@ -562,13 +562,13 @@ def clone_model(model_id: str, db: Session = Depends(get_db)):
     return ModelResponse(**cloned)
 
 
-def apply_masked_fill_for_prediction(df, feature_columns, normalization_params, ticker):
+def apply_masked_fill_for_prediction(df, feature_columns, normalization_params, ticker, dataset_id=None):
     """``(df, feature_columns)`` ready for the model: the cells the daily source's coverage mask blanked are filled from the
     medians SAVED with the model (nothing is fitted on this frame) and the all-masked columns it dropped are dropped. A
     model saved before masked-cell handling existed cannot do that: 409 asking to retrain, not a 500 later on."""
     from app.services.masked_fill import StaleMaskedModel, apply_saved_fill
     try:
-        return apply_saved_fill(df, feature_columns, (normalization_params or {}).get('masked_fill'), ticker)
+        return apply_saved_fill(df, feature_columns, (normalization_params or {}).get('masked_fill'), ticker, dataset_id)
     except StaleMaskedModel as e:
         raise HTTPException(status_code=409, detail=str(e))
 
@@ -867,7 +867,7 @@ def run_model_predictions(
     # Masked cells of the daily source: fill them from the medians saved with the model, drop the saved columns
     dataset_row = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     df, feature_columns = apply_masked_fill_for_prediction(
-        df, feature_columns, normalization_params, dataset_row.ticker if dataset_row else None)
+        df, feature_columns, normalization_params, dataset_row.ticker if dataset_row else None, dataset_id)
 
     # Determine model type from database (not file extension)
     # tsai models: lstm, gru, tcn, inception, resnet, xception, omniscale, minirocket, patchtst, lstm_fcn, tst

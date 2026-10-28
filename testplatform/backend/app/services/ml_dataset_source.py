@@ -10,6 +10,11 @@ Two flavours, both read from the local cache only:
   group m) are taken over ``daily_universe``, the tickers created together; it is stored with the dataset so a
   regeneration or a duplicate rebuilds the same numbers.
 
+Warm-up context: the store loads every symbol from its FIRST cached bar whatever the dataset's start date is, so the
+feature columns of the first rows are already warm (a 200-session average at the dataset's first row uses the history
+before it). The daily TARGETS are computed afterwards from the dataset's own bars, which start at the start date: the
+ATR14 behind them is NaN for the first 14 sessions, so those rows carry no relative / barrier label.
+
 Two properties of the daily source are choices of the wizard, not of the store, and a reader of a result should know
 them:
 
@@ -173,33 +178,37 @@ _MEMO_LOCK = threading.Lock()
 _MEMO: Dict[str, Any] = {}
 
 
+#: The source files are stat'ed once per batch, not once per dataset: a stamp younger than this is reused for the same
+#: request (the datasets of a batch are built within seconds of each other).
+STAMP_TTL_SECONDS = 2.0
+_STAMPS: Dict[Any, Tuple[float, str]] = {}
+
+
 def clear_daily_memo() -> None:
     with _MEMO_LOCK:
         _MEMO.clear()
-
-
-def _cache_stamp(cache_root: Path) -> Optional[Tuple[int, int]]:
-    """(size, mtime) of SPY's daily file, the cache end: a cache refresh invalidates the memoised universe build."""
-    p = Path(cache_root) / "AlpacaHistoryOHLCVProvider" / "SPY_1d.parquet"
-    try:
-        st = p.stat()
-    except FileNotFoundError:
-        return None                       # build_features refuses without SPY; the stamp only keys the memo
-    return st.st_size, st.st_mtime_ns
+        _STAMPS.clear()
 
 
 def _source_stamp(universe: Tuple[str, ...], groups: Tuple[str, ...], cache_root: Path) -> str:
     """(size, mtime) of every source file the build of ``groups`` reads - the daily bars of the universe and of the context
     ETFs, the FMP histories of its group, the FRED series, the metric store, the market-condition manifests - as the
     feature store's own request key computes them (``ml_features._input_fingerprints``)."""
+    import time
     from app.services import ml_features as F
     from app.services import ml_universe
+    memo_key = (universe, groups, str(cache_root))
+    cached = _STAMPS.get(memo_key)
+    if cached is not None and time.monotonic() - cached[0] < STAMP_TTL_SECONDS:
+        return cached[1]
     uses_sector = any(F.GROUPS[g].needs_sector for g in groups)
     context = ["SPY"] + (sorted(set(F.MARKET_ETFS) | set(F.SECTOR_ETF.values())) if uses_sector else [])
     load = list(dict.fromkeys(list(universe) + context))
     fp = F._input_fingerprints(load, list(universe), list(groups), cache_root, ml_universe.store_dir_for(cache_root),
                                uses_store=uses_sector)
-    return json.dumps(fp, sort_keys=True, default=str)
+    stamp = json.dumps(fp, sort_keys=True, default=str)
+    _STAMPS[memo_key] = (time.monotonic(), stamp)
+    return stamp
 
 
 def _universe_features(universe: Tuple[str, ...], first_day: date, last_day: date, groups: Tuple[str, ...],

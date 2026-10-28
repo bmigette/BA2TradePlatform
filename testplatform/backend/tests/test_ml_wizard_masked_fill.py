@@ -72,7 +72,7 @@ class TestMaskedCellsAreNeverCarriedOver:
         svc, series, cov = prep(d, COLS)
         raw = raw_covariates(svc, cov)
         assert len(series) == N - 5                                             # only the real warm-up is dropped
-        valid = d.iloc[: int(N * TRAIN)].loc[100:, "mtf_a"]
+        valid = d.iloc[5:5 + int((N - 5) * TRAIN)].loc[100:, "mtf_a"]     # the scalers window: first 70% of the 395 built points
         np.testing.assert_allclose(raw["mtf_a"].iloc[:95].to_numpy(), valid.median(), rtol=1e-5)
         np.testing.assert_allclose(raw["t_a"].to_numpy(), d["t_a"].iloc[5:].to_numpy(), rtol=1e-5)
 

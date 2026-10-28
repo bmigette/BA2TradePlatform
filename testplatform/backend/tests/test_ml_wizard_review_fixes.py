@@ -190,3 +190,140 @@ class TestSparseTargetsKeepSessionContinuity:
         result, _ = TestJobIntegration()._job(job_frames(6), [pt("daily_rel_return", horizonSessions=3)], monkeypatch,
                                               job_type="regression")
         assert result["status"] == "dry_run_success", result
+
+
+# ---------------------------------------------------------------------------------------------- minors: the fill
+def train_masked_frame(seed, ticker=None, n=N, upto=220):
+    """Group f masked in rows 0..upto (so in every train row of a 70% split) and observed after."""
+    d = frame(seed, ticker, masked=None)
+    d.loc[:upto, ["f_a", "f_b"]] = np.nan
+    d.loc[:upto, "f_missing"] = 1.0
+    return d
+
+
+class TestFillEdgeCases:
+    def test_a_column_with_no_unmasked_train_value_is_dropped_not_zero(self, caplog):
+        import logging
+        d = train_masked_frame(1)
+        medians = {}
+        with caplog.at_level(logging.WARNING):
+            out, dropped = MF.fill_masked_covariates(d[COLS], int(N * 0.7), medians)
+        assert dropped == ["f_a", "f_b"] and "f_a" not in out.columns and medians == {}
+        assert "f_missing" in out.columns                              # the flag stays a feature
+        assert any("no unmasked value in the train block" in r.message for r in caplog.records)
+
+    def test_darts_and_tsai_drop_such_a_column_for_every_ticker(self, monkeypatch):
+        from app.services import tsai_training as TT
+        from app.services.darts_training import DartsTrainingService
+        a, b = frame(2, "AAA"), train_masked_frame(3, "BBB")
+        svc = DartsTrainingService()
+        out = svc.prepare_split_three_way([a, b], 0.7, 0.5, "y", COLS, timeframe="1d", label_horizon=3)
+        assert {s.width for s in out["train_covariates"]} == {3}      # t_a, t_missing, f_missing for BOTH
+        assert svc.masked_fill["dropped_masked_columns"] == ["f_a", "f_b"]
+        monkeypatch.setattr(TT, "TSAI_AVAILABLE", True)
+        t = TT.TSAITrainingService(normalize=True)
+        t.prepare_split_three_way([a, b], 0.7, 0.5, "y", COLS, seq_len=4, label_horizon=3)
+        assert t.get_normalization_params()["masked_fill"]["dropped_masked_columns"] == ["f_a", "f_b"]
+        assert set(t.data_prep.get_valid_columns()) == {"t_a", "f_missing"}
+
+    def test_the_pooled_fallback_logs_a_warning(self, caplog):
+        import logging
+        p = MF.build_masked_fill({"AAA#": {"f_a": 1.0, "f_b": 2.0}}, [])
+        with caplog.at_level(logging.WARNING):
+            MF.apply_saved_fill(frame(4), COLS, p, ticker="ZZZ")
+        assert any("pooled median" in r.message for r in caplog.records)
+
+    def test_the_last_fill_is_reset_by_every_prepare(self):
+        from app.services.darts_training import DartsTrainingService
+        svc = DartsTrainingService()
+        svc.prepare_data(frame(5), "y", COLS, "1d", scaler_fit_ratio=0.7)
+        assert svc._last_fill
+        svc.prepare_data(frame(6, masked=None), "y", COLS, "1d", scaler_fit_ratio=0.7)
+        assert svc._last_fill == {}
+        svc.prepare_data(frame(5), "y", COLS, "1d", scaler_fit_ratio=0.7)
+        svc.prepare_data(frame(5)[["Date", "y"]], "y", None, "1d")           # no covariates at all
+        assert svc._last_fill == {}
+
+    def test_the_medians_and_the_scalers_share_one_window(self):
+        from app.services.darts_training import DartsTrainingService
+        d = frame(7)
+        d["Date"] = pd.bdate_range("2020-01-01", periods=N)               # business days: the series has weekend gaps
+        svc = DartsTrainingService()
+        series, cov = svc.prepare_data(d, "y", COLS, "1d", scaler_fit_ratio=0.7)
+        n_fit = max(1, int(len(series) * 0.7))
+        until = series.time_index[n_fit - 1]
+        window = d[d["Date"] <= until]
+        expected = window.loc[window["f_missing"] == 0, "f_a"].median()
+        assert svc._last_fill["f_a"] == pytest.approx(expected)
+        # and that window is the one the covariate scaler was fitted on
+        fitted = svc.cov_scaler._fitted_params[0]
+        assert fitted.data_min_[0] == pytest.approx(window["t_a"].min())
+        assert fitted.data_max_[0] == pytest.approx(window["t_a"].max())
+
+    def test_tsai_refuses_a_purge_that_leaves_no_train_row(self, monkeypatch):
+        from app.services import tsai_training as TT
+        monkeypatch.setattr(TT, "TSAI_AVAILABLE", True)
+        svc = TT.TSAITrainingService(normalize=False)
+        with pytest.raises(ValueError, match="label horizon"):
+            svc.prepare_data_split(frame(8), 0.1, "y", COLS, seq_len=4, label_horizon=N)
+
+
+class TestNonDailyPathIsCheap:
+    def test_no_copy_without_a_masked_group(self):
+        d = frame(9, masked=None)[["t_a", "f_a"]]
+        out, dropped = MF.fill_masked_covariates(d, 100)
+        assert out is d and dropped == []
+        d2 = frame(9, masked=None)[COLS]                                 # daily flags but nothing masked
+        out, _ = MF.fill_masked_covariates(d2, 100)
+        assert out is d2
+
+    def test_the_params_carry_no_masked_fill_for_a_non_daily_dataset(self, monkeypatch):
+        from app.services import tsai_training as TT
+        from app.services.darts_training import DartsTrainingService
+        monkeypatch.setattr(TT, "TSAI_AVAILABLE", True)
+        d = frame(10, masked=None)[["Date", "y", "t_a", "f_a"]]
+        t = TT.TSAITrainingService(normalize=True)
+        t.prepare_split_three_way([d], 0.7, 0.5, "y", ["t_a", "f_a"], seq_len=4, label_horizon=3)
+        assert "masked_fill" not in t.get_normalization_params()
+        svc = DartsTrainingService()
+        svc.prepare_split_three_way([d], 0.7, 0.5, "y", ["t_a", "f_a"], timeframe="1d", label_horizon=3)
+        assert "masked_fill" not in svc.get_normalization_params()
+
+    def test_the_params_do_carry_it_for_a_daily_dataset_without_any_masked_cell(self):
+        from app.services.darts_training import DartsTrainingService
+        svc = DartsTrainingService()
+        svc.prepare_split_three_way([frame(11, masked=None)], 0.7, 0.5, "y", COLS, timeframe="1d", label_horizon=3)
+        mf = svc.get_normalization_params()["masked_fill"]
+        assert mf["dropped_masked_columns"] == [] and "dropped_columns" not in mf
+
+
+class TestMedianKeyIsTickerAndDataset:
+    def test_two_datasets_of_one_ticker_do_not_collide(self):
+        from app.services.darts_training import DartsTrainingService
+        a, b = frame(12, "AAA", masked=(100, 150)), frame(13, "AAA", masked=(180, 230), scale=3.0)
+        a["dataset_id"], b["dataset_id"] = 1, 2
+        svc = DartsTrainingService()
+        svc.prepare_split_three_way([a, b], 0.7, 0.5, "y", COLS, timeframe="1d", label_horizon=3)
+        medians = svc.masked_fill["medians"]
+        assert set(medians) == {"AAA#1", "AAA#2"}
+        assert medians["AAA#1"]["f_a"] != medians["AAA#2"]["f_a"]
+
+    def test_prediction_picks_the_dataset_of_the_frame(self):
+        p = MF.build_masked_fill({"AAA#1": {"f_a": 10.0, "f_b": 1.0}, "AAA#2": {"f_a": 30.0, "f_b": 2.0}}, [])
+        out, _ = MF.apply_saved_fill(frame(14), COLS, p, ticker="AAA", dataset_id=2)
+        assert (out.loc[MASK[0]:MASK[1], "f_a"] == 30.0).all()
+        combined = pd.concat([frame(15, "AAA").assign(dataset_id=1), frame(16, "AAA").assign(dataset_id=2)], ignore_index=True)
+        out, _ = MF.apply_saved_fill(combined, COLS, p)
+        assert (out.loc[(out["dataset_id"] == 1) & (out["f_missing"] == 1), "f_a"] == 10.0).all()
+        assert (out.loc[(out["dataset_id"] == 2) & (out["f_missing"] == 1), "f_a"] == 30.0).all()
+
+    def test_a_ticker_with_two_training_datasets_and_no_id_falls_back_to_the_pool(self):
+        p = MF.build_masked_fill({"AAA#1": {"f_a": 10.0, "f_b": 1.0}, "AAA#2": {"f_a": 30.0, "f_b": 3.0}}, [])
+        out, _ = MF.apply_saved_fill(frame(17), COLS, p, ticker="AAA")
+        assert (out.loc[MASK[0]:MASK[1], "f_a"] == 20.0).all()
+
+    def test_the_job_tags_every_frame_with_its_dataset_id_and_keeps_it_out_of_the_features(self, monkeypatch):
+        from tests.test_ml_wizard_daily_targets import TestJobIntegration, job_frames, pt
+        result, cap = TestJobIntegration()._job(job_frames(2), [pt("daily_up", horizonSessions=3)], monkeypatch)
+        assert result["status"] == "dry_run_success", result
+        assert set(cap["combined"]["dataset_id"]) == {0, 1} and "dataset_id" not in cap["features"]

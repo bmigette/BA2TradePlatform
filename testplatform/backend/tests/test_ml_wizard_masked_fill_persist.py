@@ -47,11 +47,11 @@ def tsai(monkeypatch):
 # ---------------------------------------------------------------------------------------------- the helpers
 class TestSavedFill:
     def params(self):
-        return MF.build_masked_fill({"AAA": {"f_a": 10.0, "f_b": -5.0}, "BBB": {"f_a": 20.0, "f_b": -6.0}}, ["g_a"])
+        return MF.build_masked_fill({"AAA#": {"f_a": 10.0, "f_b": -5.0}, "BBB#": {"f_a": 20.0, "f_b": -6.0}}, ["g_a"])
 
     def test_the_pooled_median_is_the_median_of_the_tickers(self):
         p = self.params()
-        assert p["pooled"] == {"f_a": 15.0, "f_b": -5.5} and p["dropped_columns"] == ["g_a"] and p["version"] == 1
+        assert p["pooled"] == {"f_a": 15.0, "f_b": -5.5} and p["dropped_masked_columns"] == ["g_a"] and p["version"] == 1
         json.dumps(p)
 
     def test_masked_cells_take_the_saved_median_of_the_ticker_not_the_frame_s_own(self):
@@ -79,7 +79,7 @@ class TestSavedFill:
         assert (out.loc[MASK[0]:MASK[1], "f_a"] == 7.0).all()
 
     def test_a_column_the_model_never_saw_masked_refuses(self):
-        p = MF.build_masked_fill({"AAA": {"f_a": 1.0}}, [])
+        p = MF.build_masked_fill({"AAA#": {"f_a": 1.0}}, [])
         with pytest.raises(MF.StaleMaskedModel, match="retrain.*f_b"):
             MF.apply_saved_fill(frame(6), COLS, p, ticker="AAA")
 
@@ -113,11 +113,11 @@ class TestDartsPersistsAndKeepsOneWidth:
         svc, _ = self.prep([a, b])
         mf = svc.masked_fill
         n_train = int(N * RATIO) - 3
-        for key, f in (("AAA", a), ("BBB", b)):
+        for key, f in (("AAA#", a), ("BBB#", b)):
             train = f.iloc[:int(N * RATIO)]
             median = train.loc[train["f_missing"] == 0, "f_a"].median()
             assert mf["medians"][key]["f_a"] == pytest.approx(median) and set(mf["medians"][key]) == {"f_a", "f_b"}
-        assert mf["dropped_columns"] == [] and set(mf["pooled"]) == {"f_a", "f_b"}
+        assert mf["dropped_masked_columns"] == [] and set(mf["pooled"]) == {"f_a", "f_b"}
         params = svc.get_normalization_params()
         assert params["masked_fill"] == mf
         described = DartsTrainingService.describe_scalers(svc.scalers, svc.cov_scalers, masked_fill=mf)
@@ -130,9 +130,9 @@ class TestDartsPersistsAndKeepsOneWidth:
         svc, out = self.prep([a, b])
         widths = {s.width for s in out["train_covariates"]}
         assert widths == {3}                                       # t_a, t_missing, f_missing for BOTH tickers
-        assert svc.masked_fill["dropped_columns"] == ["f_a", "f_b"]
-        assert "BBB" not in svc.masked_fill["medians"] or svc.masked_fill["medians"]["BBB"] == {}
-        assert set(svc.masked_fill["medians"]["AAA"]) == set()      # the dropped columns are not filled either
+        assert svc.masked_fill["dropped_masked_columns"] == ["f_a", "f_b"]
+        assert "BBB" not in svc.masked_fill["medians"] or svc.masked_fill["medians"]["BBB#"] == {}
+        assert set(svc.masked_fill["medians"]["AAA#"]) == set()      # the dropped columns are not filled either
 
     def test_the_prediction_round_trip_fills_from_the_saved_medians_and_never_refits(self):
         a, b = frame(5, "AAA"), frame(6, "BBB")
@@ -140,7 +140,7 @@ class TestDartsPersistsAndKeepsOneWidth:
         saved = json.loads(json.dumps(svc.get_normalization_params()))["masked_fill"]
         pred = frame(7, scale=1000.0)
         filled, cols = MF.apply_saved_fill(pred, COLS, saved, ticker="AAA")
-        np.testing.assert_array_equal(filled.loc[MASK[0]:MASK[1], "f_a"].to_numpy(), saved["medians"]["AAA"]["f_a"])
+        np.testing.assert_array_equal(filled.loc[MASK[0]:MASK[1], "f_a"].to_numpy(), saved["medians"]["AAA#"]["f_a"])
         series, cov = DartsTrainingService().prepare_data(filled, "y", cols, "1d")
         assert not np.isnan(cov.values()).any() and len(series) == N
 
@@ -152,15 +152,15 @@ class TestTsaiPersistsAndRoundTrips:
         tsai.prepare_split_three_way([a, b], RATIO, HOLD, "y", COLS, seq_len=4, label_horizon=3)
         params = json.loads(json.dumps(tsai.get_normalization_params()))
         mf = params["masked_fill"]
-        assert set(mf["medians"]) == {"AAA", "BBB"} and mf["dropped_columns"] == []
+        assert set(mf["medians"]) == {"AAA#", "BBB#"} and mf["dropped_masked_columns"] == []
         train = a.iloc[:int(N * RATIO) - 3]
-        assert mf["medians"]["AAA"]["f_a"] == pytest.approx(train.loc[train["f_missing"] == 0, "f_a"].median())
+        assert mf["medians"]["AAA#"]["f_a"] == pytest.approx(train.loc[train["f_missing"] == 0, "f_a"].median())
         assert "valid_columns" in params                            # the scaler params are still there
 
     def test_the_dropped_columns_are_saved_and_the_feature_width_is_one(self, tsai):
         a, b = frame(3, "AAA"), frame(4, "BBB", all_masked=True)
         tsai.prepare_split_three_way([a, b], RATIO, HOLD, "y", COLS, seq_len=4, label_horizon=3)
-        assert tsai.get_normalization_params()["masked_fill"]["dropped_columns"] == ["f_a", "f_b"]
+        assert tsai.get_normalization_params()["masked_fill"]["dropped_masked_columns"] == ["f_a", "f_b"]
         assert set(tsai.data_prep.get_valid_columns()) == {"t_a", "f_missing"}
 
     def test_the_prediction_round_trip(self, tsai):
@@ -174,7 +174,7 @@ class TestTsaiPersistsAndRoundTrips:
         before = pred_svc.data_prep.export_params()["columns"]
         pred = frame(7, scale=1000.0)
         filled, cols = MF.apply_saved_fill(pred, COLS, saved["masked_fill"], ticker="AAA")
-        np.testing.assert_array_equal(filled.loc[MASK[0]:MASK[1], "f_a"].to_numpy(), saved["masked_fill"]["medians"]["AAA"]["f_a"])
+        np.testing.assert_array_equal(filled.loc[MASK[0]:MASK[1], "f_a"].to_numpy(), saved["masked_fill"]["medians"]["AAA#"]["f_a"])
         X, _ = pred_svc.prepare_data(filled, "y", cols, seq_len=4, fit_scaler=False)
         assert not np.isnan(X).any()
         assert pred_svc.data_prep.export_params()["columns"] == before
@@ -193,7 +193,7 @@ class TestPredictionApi:
             apply_masked_fill_for_prediction(frame(1), COLS, {"valid_columns": []}, "AAA")
         assert exc.value.status_code == 409 and "retrain: this model predates masked-cell handling" in exc.value.detail
         out, cols = apply_masked_fill_for_prediction(
-            frame(1), COLS, {"masked_fill": MF.build_masked_fill({"AAA": {"f_a": 1.0, "f_b": 2.0}}, [])}, "AAA")
+            frame(1), COLS, {"masked_fill": MF.build_masked_fill({"AAA#": {"f_a": 1.0, "f_b": 2.0}}, [])}, "AAA")
         assert not out[["f_a", "f_b"]].isna().any().any()
         out, cols = apply_masked_fill_for_prediction(frame(2, masked=None), COLS, None, "AAA")      # old model, clean frame
         assert cols == COLS
@@ -264,7 +264,7 @@ class TestBacktestHook:
             seen["df"] = df.copy()
             raise RuntimeError("stop here")
         monkeypatch.setattr(BH, "ffill_sparse_indicators", fake_ffill)
-        params = {"masked_fill": MF.build_masked_fill({"AAA": {"f_a": 3.0, "f_b": 4.0}}, [])}
+        params = {"masked_fill": MF.build_masked_fill({"AAA#": {"f_a": 3.0, "f_b": 4.0}}, [])}
         with pytest.raises(RuntimeError, match="stop here"):
             BH.run_backtest(self._model(params), frame(1), frame(1), {}, ticker="AAA")
         assert (seen["df"].loc[MASK[0]:MASK[1], "f_a"] == 3.0).all()

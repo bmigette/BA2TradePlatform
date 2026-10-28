@@ -325,6 +325,7 @@ class TestMemoKeyCoversTheSourceFiles:
     @pytest.fixture
     def root(self, tmp_path, monkeypatch):
         from ba2_providers.macro import fred_series as fs
+        monkeypatch.setattr(S, "STAMP_TTL_SECONDS", 0.0)         # a changed file must be seen at once here
         monkeypatch.setattr("ba2_common.config.CACHE_FOLDER", str(tmp_path))
         monkeypatch.setattr(fs, "CACHE_FOLDER", str(tmp_path))
         d = tmp_path / "AlpacaHistoryOHLCVProvider"
@@ -341,6 +342,17 @@ class TestMemoKeyCoversTheSourceFiles:
     def fetch(self, groups):
         return S.fetch_ohlcv_frame("alpaca_hist", "AAA", "1d", datetime(2023, 1, 3), datetime(2024, 12, 31), [], None,
                                    {"daily_groups": groups, "daily_min_share": 0.7, "daily_universe": ["AAA", "BBB"]})
+
+    def test_the_source_files_are_stat_ed_once_per_batch(self, root, _daily_env, monkeypatch):
+        monkeypatch.setattr(S, "STAMP_TTL_SECONDS", 60.0)
+        calls = []
+        real = F._input_fingerprints
+        monkeypatch.setattr(F, "_input_fingerprints", lambda *a, **k: calls.append(1) or real(*a, **k))
+        for t in ("AAA", "BBB", "AAA", "BBB"):
+            self.fetch(["t"]) if t == "AAA" else S.fetch_ohlcv_frame(
+                "alpaca_hist", "BBB", "1d", datetime(2023, 1, 3), datetime(2024, 12, 31), [], None,
+                {"daily_groups": ["t"], "daily_min_share": 0.7, "daily_universe": ["AAA", "BBB"]})
+        assert len(calls) == 1 and len(_daily_env["build"]) == 1
 
     def test_unchanged_files_reuse_the_build(self, root, _daily_env):
         self.fetch(["t"])

@@ -514,16 +514,22 @@ def frame_bounds(
     if not common_dates:
         return [three_way_bounds(len(f), train_ratio, holdout_share_of_test, label_horizon) for f in frames]
     cb = common_session_bounds(frames, train_ratio, holdout_share_of_test, label_horizon)
-    out: List[Dict[str, int]] = []
-    for i, f in enumerate(frames):
-        pos = cb["sessions"].get_indexer(pd.DatetimeIndex(pd.to_datetime(f["Date"])))
-        b = {k: int(np.searchsorted(pos, cb[k], side="left")) for k in ("train_end", "val_start", "val_end", "holdout_start")}
-        for name, size in (("train", b["train_end"]), ("validation", b["val_end"] - b["val_start"]),
-                           ("holdout", len(f) - b["holdout_start"])):
-            if size <= 0:
-                raise ValueError(
-                    f"frame {i} has no {name} rows with the common date split (train to {cb['train_last'].date()}, "
-                    f"validation {cb['val_first'].date()}..{cb['val_last'].date()}, holdout from "
-                    f"{cb['holdout_first'].date()}): its history does not cover that block")
-        out.append(b)
-    return out
+    return [bounds_at_dates(pd.DatetimeIndex(pd.to_datetime(f["Date"])), cb, f"frame {i}") for i, f in enumerate(frames)]
+
+
+def bounds_at_dates(dates: pd.DatetimeIndex, cb: Dict[str, Any], what: str = "series") -> Dict[str, int]:
+    """Row bounds (``three_way_bounds`` keys) of ONE ascending date index under the common boundary dates ``cb`` (from
+    ``common_session_bounds``). The index may hold dates that are not sessions (a calendar-day series). A block left empty
+    is refused: the history of ``what`` does not cover it."""
+    b = {"train_end": int(dates.searchsorted(cb["train_last"], side="right")),
+         "val_start": int(dates.searchsorted(cb["val_first"], side="left")),
+         "val_end": int(dates.searchsorted(cb["val_last"], side="right")),
+         "holdout_start": int(dates.searchsorted(cb["holdout_first"], side="left"))}
+    for name, size in (("train", b["train_end"]), ("validation", b["val_end"] - b["val_start"]),
+                       ("holdout", len(dates) - b["holdout_start"])):
+        if size <= 0:
+            raise ValueError(
+                f"{what} has no {name} rows with the common date split (train to {cb['train_last'].date()}, "
+                f"validation {cb['val_first'].date()}..{cb['val_last'].date()}, holdout from "
+                f"{cb['holdout_first'].date()}): its history does not cover that block")
+    return b
