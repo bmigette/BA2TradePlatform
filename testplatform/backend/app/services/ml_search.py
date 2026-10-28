@@ -296,6 +296,18 @@ MAX_ONEHOT_SYMBOLS = 50
 SYMBOL_ENCODINGS = ("onehot", "id")
 
 
+def robust_center_scale(col: np.ndarray) -> Tuple[float, float]:
+    """``(median, iqr)`` of the finite values of one column (the fit rows): the centre and the scale of the robust scaling
+    ``fold_data`` applies. A column without spread falls back to its std + 1e-12; an all-NaN column gives (nan, nan)
+    (the caller decides what a channel without data means)."""
+    col = np.asarray(col, dtype=np.float64)
+    if not np.isfinite(col).any():
+        return float("nan"), float("nan")
+    q75, q25 = np.nanpercentile(col, [75, 25])
+    spread = float(q75 - q25)
+    return float(np.nanmedian(col)), spread if spread > 1e-12 else float(np.nanstd(col)) + 1e-12
+
+
 def fold_data(panel: pd.DataFrame, feats: Sequence[str], fit_rows: np.ndarray, pooled: bool,
               symbol_encoding: str = "onehot") -> FoldData:
     """Scaled float32 feature matrix of the whole panel. The scaling (median / IQR) is fitted on ``fit_rows`` one column
@@ -319,10 +331,7 @@ def fold_data(panel: pd.DataFrame, feats: Sequence[str], fit_rows: np.ndarray, p
     for j, c in enumerate(feats):
         X[:, j] = panel[c].to_numpy(dtype=np.float32)
         col = X[fit_rows, j].astype(np.float64)
-        med[j] = np.nanmedian(col)
-        q75, q25 = np.nanpercentile(col, [75, 25])
-        spread = q75 - q25
-        iqr[j] = spread if spread > 1e-12 else np.nanstd(col) + 1e-12
+        med[j], iqr[j] = robust_center_scale(col)
     ok = np.isfinite(X).all(1)
     X -= med.astype(np.float32)
     X /= iqr.astype(np.float32)

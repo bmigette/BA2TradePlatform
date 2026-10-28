@@ -117,7 +117,8 @@ def payload(world, cells=None, **over):
     """A complete ``ml_grid`` payload: the handler takes no defaults, every key is explicit."""
     p = {"out_dir": "out", "cpu_slots": 1, "gpu_slots": 0, "config_path": None,
          "cells": cells if cells is not None else [cell(world[0])], "limit_cells": None,
-         "cache_root": str(world[2]), "settings": None, "cores": 2, "rerun_mismatched": False}
+         "cache_root": str(world[2]), "settings": None, "cores": 2, "rerun_mismatched": False,
+         "retry_timeouts": False}
     p.update(over)
     return p
 
@@ -280,7 +281,7 @@ def test_handler_payload_validation(signal_world, tmp_path):
     with pytest.raises(ValueError, match="unknown grid settings"):
         G.handle_ml_grid("t", {**full, "settings": {"nope": 1}})
     for bad in ({"cpu_slots": 0}, {"gpu_slots": -1}, {"limit_cells": 0}, {"cores": None}, {"cores": 0},
-                {"rerun_mismatched": "yes"}):
+                {"rerun_mismatched": "yes"}, {"retry_timeouts": "yes"}):
         with pytest.raises(ValueError):
             G.handle_ml_grid("t", {**full, **bad})
 
@@ -296,12 +297,11 @@ def test_unusable_groups_are_refused_before_anything_starts(signal_world, tmp_pa
 
 
 def test_gpu_pool_hook(signal_world, tmp_path, monkeypatch):
-    c = cell(signal_world[0])
+    """A cell routed to the gpu pool needs gpu slots (the real GPU families are tested in test_ml_grid_seq)."""
+    c = cell(signal_world[0], blocks="H")
     monkeypatch.setitem(G.FAMILY_POOL, "lgbm", "gpu")
     with pytest.raises(ValueError, match="gpu pool"):
         run([c], tmp_path / "a", signal_world)
-    with pytest.raises(NotImplementedError):
-        run([c], tmp_path / "b", signal_world, gpu_slots=1)
     assert G.n_jobs_for(6, 24) == 4 and G.n_jobs_for(30, 24) == 1 and G.n_jobs_for(1, 24) == 24
 
 
@@ -1035,7 +1035,8 @@ def test_the_cli_turns_ctrl_c_into_a_clean_exit(monkeypatch, capsys):
         raise KeyboardInterrupt
     monkeypatch.setattr(grid, "handle_ml_grid", interrupted)
     args = types.SimpleNamespace(config="c.json", out="o", cpu_slots=1, gpu_slots=0, limit_cells=None,
-                                 cache_root=None, cores=2, rerun_mismatched=False)
+                                 cache_root=None, cores=2, rerun_mismatched=False, report_only=None,
+                                 retry_timeouts=False)
     assert L._cmd_ml_grid(args) == 130
     assert "interrupted" in capsys.readouterr().out
 
@@ -1409,7 +1410,7 @@ def test_probation_uses_a_small_window_and_only_tasks_charged_twice_run_alone(si
     assert any(p == 1 for _, p in probation.submitted)                             # ... and really 2 at once (not 1)
     assert alone1.submitted == [(3, 0)] and alone2.submitted == [(3, 0)]           # charged twice: a singleton
     assert sorted(s for s, _ in rest.submitted) == [4, 5, 6, 7, 8]                 # back to the full window afterwards
-    assert len({id(p.kw["initargs"][-1]) for p in fake_pool.instances}) == 5      # each pool has its own stagger counter
+    assert len({id(p.kw["initargs"][-2]) for p in fake_pool.instances}) == 5      # each pool has its own stagger counter
 
 
 def test_a_submit_on_a_pool_that_just_broke_is_retried_not_fatal(signal_world, manual_pool):
@@ -1558,3 +1559,309 @@ def test_workers_stagger_their_first_panel_load_by_their_index(signal_world, tmp
     G._panel_for(c1, str(signal_world[2]))
     assert slept == [] and G._WORKER["index"] == 0
     G._WORKER["limits"].restore_original_limits()
+
+
+# ------------------------------------------------------------------ gate / report / dashboard hooks
+def fake_task(cfg, seed, key):
+    """A module-level per-task function that fabricates a finished row (no fitting)."""
+    name = G.PRIMARY[cfg["track"]]
+    c = G.validate_cell(cfg)                           # a resumable row: the real identity and a predictions file
+    syms = tuple(sorted(G.resolve_symbols(c.symbols)))
+    first, last, _ = G.store_span(c.store, syms)
+    ident = G.identity_of(c, G._WORKER["settings"], G.daily_fingerprint(G._WORKER["cache_root"], syms, first, last))
+    pred = Path(G._WORKER["out_dir"]) / "predictions" / f"{key}_{seed}.parquet"
+    pred.parent.mkdir(parents=True, exist_ok=True)
+    pred.write_bytes(b"")
+    return {"cell_key": key, "seed": seed, "track": cfg["track"], "label": G._label_of(cfg), "status": "ok",
+            "n_rows": 10, "skipped_blocks": [], "timings": {"total": 0.1}, "config": {k: v for k, v in cfg.items()
+                                                                                       if k != "seeds"},
+            "n_blocks": 31, "n_blocks_fitted": 31, "seeds_run": 1, "low_iter_share": 0.0,
+            "primary": {"name": name, "value": 0.01 * seed},
+            "regimes": {name: {"all": {"mean": 0.01, "t": 1.0, "n": 10}}},
+            "controls": {"p_value": 0.5, "primary": "shuffle_symbols", "shuffle_symbols": {"mean": 0.0}},
+            "identity": ident, "versions": {"code": "c0de"}}
+
+
+def _horizon_cells(world, n):
+    return [cell(world[0], target={"kind": "rel_return", "horizon": h}) for h in (1, 3, 5, 10, 20)[:n]]
+
+
+@pytest.mark.parametrize("n_cells", [5, 4])
+def test_the_dashboard_hook_runs_at_the_start_after_every_finished_row_and_at_the_end(signal_world, tmp_path,
+                                                                                     monkeypatch, n_cells):
+    calls = []
+    monkeypatch.setattr(G, "_refresh_outputs", lambda out, summary, final, finished: calls.append((finished, final)))
+    run(_horizon_cells(signal_world, n_cells), tmp_path / "o", signal_world, task_fn=fake_task)
+    # the throttle lives in ml_grid_report.refresh (an O(1) check), so the runner asks after EVERY row; the last row
+    # is covered by the final rebuild
+    assert calls == [(i, False) for i in range(n_cells)] + [(n_cells, True)]
+
+
+def test_errors_count_as_finished_rows_for_the_hook(signal_world, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(G, "_refresh_outputs", lambda out, summary, final, finished: calls.append((finished, final)))
+
+    def sometimes_error(cfg, seed, key):
+        if cfg["target"]["horizon"] in (3, 10):
+            return G._error_record(key, seed, "boom", "l")
+        return fake_task(cfg, seed, key)
+    run(_horizon_cells(signal_world, 4), tmp_path / "o", signal_world, task_fn=sometimes_error)
+    assert calls == [(0, False), (1, False), (2, False), (3, False), (4, True)]
+
+
+def test_only_the_start_and_the_end_force_a_build(signal_world, tmp_path, monkeypatch):
+    import app.services.ml_grid_report as RP
+    seen = []
+    monkeypatch.setattr(RP, "refresh", lambda out, summary, final, force=False: seen.append((final, force)))
+    run(_horizon_cells(signal_world, 3), tmp_path / "o", signal_world, task_fn=fake_task)
+    assert seen == [(False, True), (False, False), (False, False), (True, True)]
+
+
+def test_live_builds_during_a_run_are_throttled_by_the_report_module(signal_world, tmp_path, monkeypatch):
+    import app.services.ml_grid_report as RP
+    built = []
+    real = RP.render_dashboard
+    monkeypatch.setattr(RP, "render_dashboard", lambda st: (built.append(1), real(st))[1])
+    monkeypatch.setattr(RP, "_now", lambda: 1000.0)                          # the clock never advances
+    run(_horizon_cells(signal_world, 5), tmp_path / "o", signal_world, task_fn=fake_task)
+    assert len(built) == 2                                                   # the start and the end, nothing between
+
+
+def test_a_finished_run_leaves_report_dashboard_and_run_summary(signal_world, tmp_path):
+    out = tmp_path / "o"
+    res = run(_horizon_cells(signal_world, 3), out, signal_world, task_fn=fake_task)
+    assert res["done"] == 3
+    assert (out / "report.md").exists() and (out / "dashboard.html").exists()
+    saved = json.loads((out / "run_summary.json").read_text(encoding="utf-8"))
+    assert saved["done"] == 3 and saved["errors"] == 0 and saved["pool_rebuilds"] == 0 and saved["planned_tasks"] == 3
+    md = (out / "report.md").read_text(encoding="utf-8")
+    assert re.search(r"rows done\D+3 of 3", md) and "pool_rebuilds" in md
+    assert not list(out.glob("*.tmp"))
+
+
+def test_a_resumed_run_with_nothing_left_still_rebuilds_the_outputs(signal_world, tmp_path):
+    out = tmp_path / "o"
+    run(_horizon_cells(signal_world, 2), out, signal_world, task_fn=fake_task)
+    (out / "report.md").unlink()
+    (out / "dashboard.html").unlink()
+    res = run(_horizon_cells(signal_world, 2), out, signal_world, task_fn=fake_task)
+    assert res["done"] == 0 and (out / "report.md").exists() and (out / "dashboard.html").exists()
+
+
+def test_a_failing_dashboard_rebuild_never_stops_the_grid(signal_world, tmp_path, monkeypatch):
+    import app.services.ml_grid_report as RP
+
+    def boom(*a, **k):
+        raise OSError("the dashboard file is open in another program")
+    monkeypatch.setattr(RP, "refresh", boom)
+    res = run(_horizon_cells(signal_world, 2), tmp_path / "o", signal_world, task_fn=fake_task)
+    assert res["done"] == 2 and len(G.read_results(tmp_path / "o" / "results.jsonl")) == 2
+
+
+def test_a_cancelled_run_still_writes_the_final_outputs(signal_world, tmp_path):
+    out = tmp_path / "o"
+    n = {"i": 0}
+
+    def cancel_after_one():
+        n["i"] += 1
+        return n["i"] > 1
+    res = run(_horizon_cells(signal_world, 3), out, signal_world, task_fn=fake_task, cancel_check=cancel_after_one)
+    assert res["cancelled"] and res["done"] == 1
+    assert (out / "report.md").exists() and (out / "dashboard.html").exists()
+    assert json.loads((out / "run_summary.json").read_text(encoding="utf-8"))["cancelled"] is True
+
+
+def test_report_only_rebuilds_from_an_existing_dir_and_runs_nothing(signal_world, tmp_path, monkeypatch, capsys):
+    import ba2test_launcher as L
+    import app.services.ml_grid as grid
+    out = tmp_path / "o"
+    run(_horizon_cells(signal_world, 2), out, signal_world, task_fn=fake_task)
+    for name in ("report.md", "dashboard.html"):
+        (out / name).unlink()
+    monkeypatch.setattr(grid, "handle_ml_grid", lambda *a, **k: pytest.fail("report-only must not run the grid"))
+    monkeypatch.setattr(grid, "run_grid", lambda *a, **k: pytest.fail("report-only must not run the grid"))
+    assert L.main(["ml-grid", "--report-only", str(out)]) == 0
+    assert (out / "report.md").exists() and (out / "dashboard.html").exists()
+    printed = capsys.readouterr().out
+    assert "dashboard.html" in printed and "report.md" in printed
+
+
+def test_report_only_refuses_a_missing_dir_and_the_other_flags_stay_required_without_it(tmp_path, capsys):
+    import ba2test_launcher as L
+    assert L.main(["ml-grid", "--report-only", str(tmp_path / "nope")]) != 0
+    assert "results.jsonl" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        L.main(["ml-grid", "--out", str(tmp_path)])                      # no --report-only, no --config / --cpu-slots
+
+
+# ------------------------------------------------------------------ per-regime controls in the rows
+def _by_regime_checks(row, track):
+    name = G.PRIMARY[track]
+    ctl = row["controls"]
+    assert ctl["primary"] in ctl["p_values"]
+    br = ctl["by_regime"]                                       # the stricter control, regime by regime
+    seen = [r for r in G.W.REGIMES if r in row["regimes"][name]]
+    assert set(br) == set(seen) and seen
+    for reg, e in br.items():
+        assert e["control"] in ctl["p_values"]
+        model = row["regimes"][name][reg]["mean"]
+        assert e["model"] == (pytest.approx(model) if model is not None else None)       # same number as the row's
+        for k in ("null_mean", "null_std", "p_value", "rank"):
+            assert k in e
+        if e["null_mean"] is not None:
+            rows_ = ctl[e["control"]]["by_regime"][reg]
+            assert e["null_mean"] == pytest.approx(rows_["mean"]) and e["p_value"] == rows_["p_value"]
+    for n in ctl["p_values"]:                                   # every gating control keeps its per-regime summary
+        assert set(ctl[n]["by_regime"]) == set(seen)
+        for e in ctl[n]["by_regime"].values():
+            assert set(e) >= {"mean", "std", "p_value", "rank", "model"}
+
+
+def test_rows_hold_per_regime_control_nulls_that_agree_with_the_rows_regime_values(signal_world, tmp_path):
+    out = tmp_path / "o"
+    st = _settings(control_seeds=(1, 2, 3))
+    cells = [cell(signal_world[0], seeds=[1]),
+             cell(signal_world[0], track="timing", target={"kind": "up", "horizon": 5}, seeds=[1])]
+    run(cells, out, signal_world, settings=st)
+    rows = {r["track"]: r for r in G.read_results(out / "results.jsonl")}
+    _by_regime_checks(rows["selection"], "selection")
+    _by_regime_checks(rows["timing"], "timing")
+    assert set(rows["timing"]["controls"]["p_values"]) == {"shuffle_time", "shuffle_time_within_block"}
+
+
+def test_the_per_regime_entry_keeps_every_controls_null_and_shows_the_larger_p_control():
+    ctl = {"shuffle_time": {"mean": -0.01, "by_regime": {
+               "2019": {"mean": -0.02, "std": 0.01, "p_value": 0.30, "rank": 7, "model": 0.01},
+               "2021": {"mean": -0.02, "std": 0.01, "p_value": 0.05, "rank": 1, "model": 0.01}}},
+           "shuffle_time_within_block": {"mean": -0.04, "by_regime": {
+               "2019": {"mean": -0.05, "std": 0.02, "p_value": 0.10, "rank": 2, "model": 0.01},
+               "2021": {"mean": 0.00, "std": 0.02, "p_value": 0.20, "rank": 4, "model": 0.01}}}}
+    names = ("shuffle_time", "shuffle_time_within_block")
+    strict = G._strict_by_regime(ctl, names)
+    # the displayed p / std / rank are the larger-p control's; the gate takes the highest of null_means itself
+    assert strict["2019"]["control"] == "shuffle_time" and strict["2019"]["null_mean"] == -0.02
+    assert strict["2019"]["null_means"] == {"shuffle_time": -0.02, "shuffle_time_within_block": -0.05}
+    assert strict["2021"]["control"] == "shuffle_time_within_block" and strict["2021"]["p_value"] == 0.20
+    assert strict["2021"]["null_means"] == {"shuffle_time": -0.02, "shuffle_time_within_block": 0.00}
+    assert strict["2021"]["null_std"] == 0.02 and strict["2021"]["model"] == 0.01
+    ctl["shuffle_time"]["by_regime"]["2019"]["p_value"] = None                   # a non-finite null: no p, last control
+    again = G._strict_by_regime(ctl, names)
+    assert again["2019"]["control"] == "shuffle_time_within_block" and again["2019"]["p_value"] is None
+
+
+def test_rows_store_the_per_control_null_means_per_regime(signal_world, tmp_path):
+    out = tmp_path / "o"
+    run([cell(signal_world[0], track="timing", target={"kind": "up", "horizon": 5}, seeds=[1])], out, signal_world,
+        settings=_settings(control_seeds=(1, 2, 3)))
+    row = G.read_results(out / "results.jsonl")[0]
+    for reg, e in row["controls"]["by_regime"].items():
+        assert set(e["null_means"]) == {"shuffle_time", "shuffle_time_within_block"}
+        for n, v in e["null_means"].items():
+            assert v == row["controls"][n]["by_regime"][reg]["mean"]
+
+
+# ------------------------------------------------------------------ review fixes: finally, rate limit, summary
+def test_the_final_outputs_are_written_even_when_the_run_dies(signal_world, tmp_path):
+    out = tmp_path / "o"
+
+    def dies_on_third(cfg, seed, key):
+        if cfg["target"]["horizon"] == 5:
+            raise RuntimeError("the master hit something unexpected")
+        return fake_task(cfg, seed, key)
+    with pytest.raises(RuntimeError, match="unexpected"):
+        run(_horizon_cells(signal_world, 3), out, signal_world, task_fn=dies_on_third)
+    assert (out / "report.md").exists() and (out / "dashboard.html").exists()
+    assert len(G.read_results(out / "results.jsonl")) == 2
+
+
+def test_a_failing_rebuild_is_logged_in_full_once_and_then_only_counted(signal_world, tmp_path, monkeypatch, caplog):
+    import app.services.ml_grid_report as RP
+
+    def boom(*a, **k):
+        raise OSError("the dashboard file is open in another program")
+    monkeypatch.setattr(RP, "refresh", boom)
+    with caplog.at_level("WARNING"):
+        res = run(_horizon_cells(signal_world, 4), tmp_path / "o", signal_world, task_fn=fake_task)
+    assert res["done"] == 4
+    full = [r for r in caplog.records if "could not rebuild" in r.getMessage()]
+    assert len(full) == 1 and full[0].exc_info                                  # the first failure, with its traceback
+    counted = [r for r in caplog.records if "rebuilds failed" in r.getMessage()]
+    assert len(counted) == 1 and "5 " in counted[0].getMessage()                 # start + 3 cadence + final
+
+
+def test_the_run_summary_records_the_planned_tasks_and_cumulative_pool_rebuilds(signal_world, tmp_path):
+    out = tmp_path / "o"
+    run(_horizon_cells(signal_world, 3), out, signal_world, task_fn=fake_task)
+    saved = json.loads((out / "run_summary.json").read_text(encoding="utf-8"))
+    cells = [G.validate_cell(c) for c in _horizon_cells(signal_world, 3)]
+    keys = sorted(f"{c.key}:1" for c in cells)
+    assert saved["planned_tasks"] == 3 and saved["planned_count"] == 3 and "planned_keys" not in saved
+    assert saved["planned_hash"] == __import__("hashlib").sha1("\n".join(keys).encode("utf-8")).hexdigest()
+    assert (out / "planned_keys.txt").read_text(encoding="utf-8").split() == keys
+    assert saved["pool_rebuilds"] == 0 and saved["pool_rebuilds_total"] == 0
+    saved["pool_rebuilds_total"] = 4                                          # an earlier run had rebuilt the pool
+    (out / "run_summary.json").write_text(json.dumps(saved), encoding="utf-8")
+    run(_horizon_cells(signal_world, 3), out, signal_world, task_fn=fake_task)
+    again = json.loads((out / "run_summary.json").read_text(encoding="utf-8"))
+    assert again["pool_rebuilds"] == 0 and again["pool_rebuilds_total"] == 4
+
+
+def test_report_only_returns_before_the_grid_runner_is_imported():
+    import inspect
+    import ba2test_launcher as L
+    src = inspect.getsource(L._cmd_ml_grid)
+    assert src.index("report_only") < src.index("from app.services.ml_grid import")
+
+
+# ------------------------------------------------------------------ --eval-start / --eval-end
+def _cli_payload(monkeypatch, tmp_path, *extra):
+    import ba2test_launcher as L
+    import app.services.ml_grid as grid
+    seen = {}
+
+    def fake(task_id, payload):
+        seen.update(payload)
+        return {"done": 0, "errors": 0, "skipped_existing": 0, "cancelled": False, "out_dir": str(tmp_path)}
+    monkeypatch.setattr(grid, "handle_ml_grid", fake)
+    code = L.main(["ml-grid", "--config", "c.json", "--out", str(tmp_path), "--cpu-slots", "1", *extra])
+    return code, seen
+
+
+def test_the_cli_passes_the_eval_window_as_settings(monkeypatch, tmp_path):
+    _, seen = _cli_payload(monkeypatch, tmp_path, "--eval-start", "2025-01-01", "--eval-end", "2025-10-12")
+    assert seen["settings"] == {"eval_start": "2025-01-01", "eval_end": "2025-10-12"}
+    G.GridSettings.from_dict({**seen["settings"], "cores": 2})                 # and the runner accepts it
+    _, seen = _cli_payload(monkeypatch, tmp_path, "--eval-start", "2024-01-01")
+    assert seen["settings"] == {"eval_start": "2024-01-01"}
+    _, seen = _cli_payload(monkeypatch, tmp_path, "--eval-end", "2025-12-31")
+    assert seen["settings"] == {"eval_end": "2025-12-31"}
+    _, seen = _cli_payload(monkeypatch, tmp_path)
+    assert seen["settings"] is None
+
+
+@pytest.mark.parametrize("args, msg", [
+    (("--eval-start", "2025/01/01"), "eval-start"),
+    (("--eval-start", "not-a-date"), "eval-start"),
+    (("--eval-end", "2025-13-40"), "eval-end"),
+    (("--eval-start", "2015-12-31"), "outside"),
+    (("--eval-start", str(G.DATA_START)), "outside"),                          # the window must start after the data does
+    (("--eval-end", "2026-10-13"), "outside"),
+    (("--eval-end", "2015-01-01"), "outside"),
+    (("--eval-start", "2025-06-01", "--eval-end", "2025-06-01"), "before"),
+    (("--eval-start", "2025-06-01", "--eval-end", "2025-01-01"), "before"),
+    (("--eval-start", "2026-10-12"), "before"),                                 # the default end is 2026-10-12
+])
+def test_the_cli_refuses_a_bad_eval_window(monkeypatch, tmp_path, capsys, args, msg):
+    import ba2test_launcher as L
+    import app.services.ml_grid as grid
+    monkeypatch.setattr(grid, "handle_ml_grid", lambda *a, **k: pytest.fail("must refuse before running"))
+    with pytest.raises(SystemExit) as e:
+        L.main(["ml-grid", "--config", "c.json", "--out", str(tmp_path), "--cpu-slots", "1", *args])
+    assert e.value.code != 0
+    text = str(e.value.code) + capsys.readouterr().err
+    assert msg in text
+
+
+def test_the_eval_bounds_are_inclusive_at_the_limits(monkeypatch, tmp_path):
+    _, seen = _cli_payload(monkeypatch, tmp_path, "--eval-start", "2016-01-05", "--eval-end", str(G.EVAL_END))
+    assert seen["settings"] == {"eval_start": "2016-01-05", "eval_end": str(G.EVAL_END)}

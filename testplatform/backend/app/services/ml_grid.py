@@ -76,8 +76,23 @@ on that set is refused with the group named, never padded with NaN. Daily bars (
 Parallelism. A ``ProcessPoolExecutor`` of ``cpu_slots`` workers runs the tabular families; each worker loads each panel
 (stores + bars + targets) ONCE (``_init_worker`` warms the panels of the pending tasks; ``get_panel`` is a per-process
 cache keyed by store, symbols, cache root and track). ``n_jobs = cores // cpu_slots`` per fit, so slots x n_jobs <=
-cores. Sequence families (tsai / darts) will register in ``FAMILY_POOL`` with pool ``"gpu"`` and run in a second pool of
-``gpu_slots`` workers; none exists yet, so that pool is never started.
+cores. The sequence families (``tsai-<arch>``, ``darts-<arch>``; see "GPU families") are registered in ``FAMILY_POOL``
+with pool ``"gpu"`` and run in a second spawn pool of ``gpu_slots`` workers, concurrently with the CPU pool, with the
+same lifecycle (retries, probation, cancellation, lock); ``ml_grid_seq`` holds their input construction.
+
+GPU families (Task 4.4b). ``family`` is ``tsai-<arch>`` for every ``ml_models_seq.TSAI_ARCHS`` entry (stage 1 uses
+``tsai-inception`` and ``tsai-minirocket``) or ``darts-<arch>`` for ``nhits`` / ``nbeats`` / ``tcn`` (TFT is refused:
+20-55 minutes a fit). The architecture comes from the family, so ``params`` must not set ``arch``. Both need half-year
+blocks (``blocks: "H"``). tsai reads the 1h INTRADAY panel (``ml_panel``, regular session, bars stamped at their end;
+the cell's ``groups`` must be ``["panel_1h"]``: the panel's own technical / daily-context / market features): training
+samples are windows ending at ``sample_bars(per_session)`` bars of the training sessions (the end-of-day bar always
+included), each labelled with the DAILY target of its session (decided at that session's close, so an intraday bar's
+label lies in its future and never in its past), validation is the end-of-day bars of the train-tail sessions, and
+ONLY the end-of-day bar of each test session is predicted: one daily row per (symbol, session), scored like a tabular
+cell. darts reads the daily store frame (the cell's groups, robust-scaled on the training rows, NaN as 0, as past
+covariates; the target series is the daily log return), forecasts the next ``horizon`` daily returns as quantiles and
+scores a row with P(up) of the H-day return; target kinds ``rel_return`` and ``quantile`` only. A deep cell's time
+budget (``GridSettings.gpu_budget_minutes``) is checked before each block: over it the task is an error row.
 
 Outputs in ``--out``: ``results.jsonl`` (one row per finished (cell_key, seed); resume skips them),
 ``predictions/<cell_key>_<seed>.parquet`` (written BEFORE the row, so a row implies its file), ``errors.jsonl`` (a
@@ -93,6 +108,7 @@ import math
 import multiprocessing
 import os
 import socket
+import threading
 import time
 import traceback
 from collections import OrderedDict, deque
@@ -111,6 +127,7 @@ from app.services import ml_eval as E
 from app.services import ml_features as F
 from app.services import ml_holdout as HO
 from app.services import ml_models as M
+from app.services import ml_models_seq as MS
 from app.services import ml_targets as T
 from app.services import ml_walkforward as W
 from app.services.ml_controls import DEFAULT_SEEDS, controls_report
@@ -129,7 +146,7 @@ STORE_ORDER: Tuple[str, ...] = ("stocks", "etf")
 LOW_ITER = 3
 #: families without randomness (``ml_models``): their seed std is 0 by construction, which is NOT robustness
 DETERMINISTIC_FAMILIES: Tuple[str, ...] = ("naive", "linear")
-EVAL_START, EVAL_END, DATA_START = date(2019, 1, 1), date(2026, 10, 12), date(2016, 1, 4)
+from app.services.ml_grid_bounds import DATA_START, EVAL_END, EVAL_START          # noqa: E402  (stdlib-only module)
 
 
 # ================================================================== settings
@@ -147,6 +164,16 @@ class GridSettings:
     regime_min_rows: int = 20
     control_seeds: Tuple[int, ...] = DEFAULT_SEEDS
     cores: int = 24
+    #: GPU families only (they are left out of a tabular row's identity): tsai window length in 1h bars (35 = 5
+    #: sessions), training bars per session and symbol (``ml_panel.sample_bars``; the end-of-day bar included),
+    #: darts window in daily bars, and the cap on a deep cell's epochs (early stopping still applies)
+    seq_lookback: int = 35
+    seq_samples_per_session: int = 4
+    darts_lookback: int = 20
+    gpu_max_epochs: int = 15
+    #: minutes one (cell, seed) of a GPU family may take before the task is aborted with an error row (a run setting:
+    #: not part of any row's identity)
+    gpu_budget_minutes: float = 20.0
 
     def __post_init__(self) -> None:
         if not self.eval_start < self.eval_end:
@@ -155,9 +182,12 @@ class GridSettings:
             raise ValueError("data_start must be before eval_start")
         if self.cost_bps < 0 or not 0 < self.timing_q < 1 or not 0 < self.val_share < 1:
             raise ValueError("cost_bps >= 0, 0 < timing_q < 1 and 0 < val_share < 1 required")
-        for name in ("min_count", "min_obs", "regime_min_rows", "cores"):
+        for name in ("min_count", "min_obs", "regime_min_rows", "cores", "seq_lookback", "seq_samples_per_session",
+                     "darts_lookback", "gpu_max_epochs"):
             if not _is_int(getattr(self, name)) or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be an integer >= 1")
+        if not _is_real(self.gpu_budget_minutes) or self.gpu_budget_minutes <= 0:
+            raise ValueError("gpu_budget_minutes must be a number > 0")
         if not len(self.control_seeds):
             raise ValueError("control_seeds is empty")
 
@@ -165,7 +195,9 @@ class GridSettings:
         return {"eval_start": str(self.eval_start), "eval_end": str(self.eval_end), "data_start": str(self.data_start),
                 "cost_bps": self.cost_bps, "timing_q": self.timing_q, "min_count": self.min_count,
                 "val_share": self.val_share, "min_obs": self.min_obs, "regime_min_rows": self.regime_min_rows,
-                "control_seeds": list(self.control_seeds), "cores": self.cores}
+                "control_seeds": list(self.control_seeds), "cores": self.cores, "seq_lookback": self.seq_lookback,
+                "seq_samples_per_session": self.seq_samples_per_session, "darts_lookback": self.darts_lookback,
+                "gpu_max_epochs": self.gpu_max_epochs, "gpu_budget_minutes": self.gpu_budget_minutes}
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "GridSettings":
@@ -217,8 +249,27 @@ KINDS: Dict[str, KindSpec] = {
 }
 _BARRIER_KINDS = ("triple_barrier", "binary_barrier")
 
-#: which worker pool runs a family. Sequence families (tsai, darts) will register here as "gpu".
-FAMILY_POOL: Dict[str, str] = {f: "cpu" for f in M.SUPPORTED_TASKS}
+#: GPU families: ``tsai-<arch>`` for every tsai architecture, ``darts-<arch>`` for the batched Darts ones (tft is refused)
+TSAI_FAMILIES: Tuple[str, ...] = tuple(f"tsai-{a}" for a in MS.TSAI_ARCHS)
+GRID_DARTS_ARCHS: Tuple[str, ...] = tuple(a for a in MS.DARTS_ARCHS if a in MS.BATCHED_ARCHS)
+DARTS_FAMILIES: Tuple[str, ...] = tuple(f"darts-{a}" for a in GRID_DARTS_ARCHS)
+GPU_FAMILIES: Tuple[str, ...] = TSAI_FAMILIES + DARTS_FAMILIES
+#: target kinds a darts cell may use: it forecasts the symbol's own bar returns, whatever the evaluation target
+DARTS_KINDS: Tuple[str, ...] = ("rel_return", "quantile")
+#: the intraday panel's feature group name a tsai cell must declare
+TSAI_GROUPS: Tuple[str, ...] = ("panel_1h",)
+
+#: which worker pool runs a family
+FAMILY_POOL: Dict[str, str] = {**{f: "cpu" for f in M.SUPPORTED_TASKS if f not in M.SEQUENCE_FAMILIES},
+                               **{f: "gpu" for f in GPU_FAMILIES}}
+
+
+def split_family(family: str) -> Tuple[str, Optional[str]]:
+    """``("tsai", "inception")`` for ``"tsai-inception"``; ``(family, None)`` for a tabular family."""
+    if family in GPU_FAMILIES:
+        base, _, arch = family.partition("-")
+        return base, arch
+    return family, None
 
 _CELL_KEYS = ("track", "store", "symbols", "groups", "target", "family", "params", "train_months", "blocks", "seeds")
 _CELL_OPTIONAL = ("params",)
@@ -322,6 +373,10 @@ def validate_cell(raw: Any) -> Cell:
     track = raw["track"]
     if track not in TRACKS:
         raise ValueError(f"track must be one of {TRACKS}, got {track!r}")
+    family = raw["family"]
+    if not isinstance(family, str) or family not in FAMILY_POOL:
+        raise ValueError(f"family must be one of {sorted(FAMILY_POOL)}, got {family!r}")
+    base_family, arch = split_family(family)
     store = raw["store"]
     if not isinstance(store, str) or not store:
         raise ValueError("store must be a non-empty directory string")
@@ -346,9 +401,14 @@ def validate_cell(raw: Any) -> Cell:
     if not isinstance(groups, (list, tuple)) or not groups or not all(isinstance(g, str) for g in groups) \
             or len(set(groups)) != len(groups):
         raise ValueError("groups must be a non-empty list of distinct group names")
-    bad = [g for g in groups if g not in F.GROUPS]
-    if bad:
-        raise ValueError(f"unknown feature groups {bad}; known {sorted(F.GROUPS)}")
+    if base_family == "tsai":
+        if tuple(groups) != TSAI_GROUPS:
+            raise ValueError(f"a tsai cell reads the 1h panel's own features: groups must be exactly "
+                             f"{list(TSAI_GROUPS)}, got {list(groups)}")
+    else:
+        bad = [g for g in groups if g not in F.GROUPS]
+        if bad:
+            raise ValueError(f"unknown feature groups {bad}; known {sorted(F.GROUPS)}")
     target = raw["target"]
     if not isinstance(target, dict):
         raise ValueError("target must be an object {kind, horizon[, ratio]}")
@@ -358,6 +418,9 @@ def validate_cell(raw: Any) -> Cell:
     kind = target["kind"]
     if kind not in KINDS:
         raise ValueError(f"target kind must be one of {sorted(KINDS)}, got {kind!r}")
+    if base_family == "darts" and kind not in DARTS_KINDS:
+        raise ValueError(f"darts forecasts the symbol's own returns: target kind must be one of {DARTS_KINDS}, "
+                         f"got {kind!r}")
     if track == "timing" and KINDS[kind].selection_only:
         raise ValueError(f"target {kind!r} is cross-sectional: selection track only")
     horizon = target["horizon"]
@@ -370,21 +433,25 @@ def validate_cell(raw: Any) -> Cell:
         raise ValueError(f"target ratio must be a number > 0, got {ratio!r}")
     if kind not in _BARRIER_KINDS and float(ratio) != 1.0:
         raise ValueError(f"target ratio applies to {_BARRIER_KINDS} only (got {ratio!r} for {kind!r})")
-    family = raw["family"]
-    if family not in FAMILY_POOL:
-        raise ValueError(f"family must be one of {sorted(FAMILY_POOL)}, got {family!r}")
     task = KINDS[kind].task
-    if task not in M.SUPPORTED_TASKS[family]:
+    if base_family != "darts" and task not in M.SUPPORTED_TASKS[base_family]:
         raise ValueError(f"family {family!r} cannot do the {task!r} task of target {kind!r} "
-                         f"(supports {M.SUPPORTED_TASKS[family]})")
+                         f"(supports {M.SUPPORTED_TASKS[base_family]})")
     params = raw["params"] if "params" in raw else {}
     if not isinstance(params, dict):
         raise ValueError("params must be an object")
-    M.make_adapter(family, 1, params)                      # unknown keys / out-of-range values raise
+    if arch is not None:
+        if "arch" in params:
+            raise ValueError(f"params must not set 'arch': the family {family!r} fixes it")
+        M.make_adapter(base_family, 1, {**params, "arch": arch})
+    else:
+        M.make_adapter(family, 1, params)                  # unknown keys / out-of-range values raise
     months = normalise_train_months(raw["train_months"])
     blocks = raw["blocks"]
     if blocks not in W.FREQS:
         raise ValueError(f"blocks must be one of {W.FREQS}, got {blocks!r}")
+    if FAMILY_POOL[family] == "gpu" and blocks != "H":
+        raise ValueError(f"a GPU family trains on half-year blocks (blocks: 'H'), got {blocks!r}")
     seeds = raw["seeds"]
     if not isinstance(seeds, (list, tuple)) or not seeds or not all(_is_int(s) for s in seeds) \
             or len(set(seeds)) != len(seeds):
@@ -535,6 +602,8 @@ def check_groups(cells: Sequence["Cell"]) -> None:
     problems: List[str] = []
     cache: Dict[Tuple, List[str]] = {}
     for c in cells:
+        if split_family(c.family)[0] == "tsai":              # the 1h panel's own features, not a store group
+            continue
         key = (c.store, c.symbols)
         if key not in cache:
             cache[key] = usable_feature_columns(c.store, resolve_symbols(c.symbols))
@@ -569,6 +638,8 @@ class Panel:
     stores: Tuple[str, ...]
     load_seconds: float
     daily_fingerprint: str = ""
+    cache_root: str = ""
+    store_last: Optional[date] = None       # ``store_span(...)[1]``: the store's last day (the intraday panel ends there)
     _targets: Dict[int, pd.DataFrame] = field(default_factory=dict)
     _exc: Dict[int, T.DailyExcursions] = field(default_factory=dict)
 
@@ -646,7 +717,8 @@ def load_panel(store: Union[str, Path], symbols: Tuple[str, ...], track: str, ca
           & (lbf == False).fillna(False).astype(bool)).to_numpy()          # noqa: E712  (NA = unknown: not usable)
     X = allrows[list(cols)].to_numpy(dtype=np.float32)
     return Panel(symbols, track, index, pd.DatetimeIndex(index.get_level_values("session")), tuple(cols), X, ok, bars,
-                 arrays, tuple(n for n, _ in used), time.perf_counter() - t0, fingerprint)
+                 arrays, tuple(n for n, _ in used), time.perf_counter() - t0, fingerprint, str(cache_root),
+                 store_span(store, symbols)[1])
 
 
 #: panels (stores + bars + targets, ~100-200 MB each) a worker process keeps; the least recently used is evicted
@@ -707,9 +779,35 @@ def best_iter(n_iter: Any) -> Optional[int]:
     return int(n_iter)
 
 
-def fit_block(cell: Cell, seed: int, panel: Panel, block: W.Block, window: W.Window, st: GridSettings,
-              n_jobs: int) -> BlockResult:
-    """Fit on the purged window before ``block`` and score its rows. Raises ``SkipBlock`` (reason in the message)."""
+@dataclass
+class BlockRows:
+    """The daily rows of one block, the same for every family: purged training rows split into fit / validation (the
+    validation block is the train tail), the scorable rows of the block and the labels."""
+    ks: KindSpec
+    spec: Any
+    tg: pd.DataFrame
+    tr: np.ndarray
+    pr: np.ndarray
+    y_all: np.ndarray
+    fit_idx: np.ndarray
+    val_idx: np.ndarray
+    day: np.ndarray
+    tend: np.ndarray
+
+
+def block_audit(br: BlockRows, block: W.Block, window: W.Window) -> Dict[str, Any]:
+    """What a block was fitted on: its bounds and the first / last session and target end of its fit, validation and
+    training rows (``train_target_end_max`` must lie before ``start``: every label was decided before the block)."""
+    iso = lambda i: str(pd.Timestamp(i).date())                       # noqa: E731
+    day, tend = br.day, br.tend
+    return {"start": str(block.start), "end": str(block.end), "window_start": str(window.start),
+            "fit_first": iso(day[br.fit_idx].min()), "fit_last": iso(day[br.fit_idx].max()),
+            "val_first": iso(day[br.val_idx].min()), "val_last": iso(day[br.val_idx].max()),
+            "fit_target_end_max": iso(tend[br.fit_idx].max()), "train_target_end_max": iso(tend[br.tr].max())}
+
+
+def prepare_block(cell: Cell, panel: Panel, block: W.Block, window: W.Window, st: GridSettings) -> BlockRows:
+    """The daily rows of ``block`` (see ``BlockRows``). Raises ``SkipBlock`` (reason in the message)."""
     H = cell.horizon
     ks = cell.spec
     tg = panel.targets(H)
@@ -758,6 +856,17 @@ def fit_block(cell: Cell, seed: int, panel: Panel, block: W.Block, window: W.Win
             T.check_balance(spec, block.name, counts_by_part=counts, mode="min_count", min_count=st.min_count)
         except T.TargetBalanceError as e:
             raise SkipBlock(f"unbalanced target: {e}") from e
+    return BlockRows(ks, spec, tg, tr, pr, y_all, fit_idx, val_idx, day, tend)
+
+
+def fit_block(cell: Cell, seed: int, panel: Panel, block: W.Block, window: W.Window, st: GridSettings,
+              n_jobs: int) -> BlockResult:
+    """Fit on the purged window before ``block`` and score its rows. Raises ``SkipBlock`` (reason in the message)."""
+    br = prepare_block(cell, panel, block, window, st)
+    if cell.pool == "gpu":
+        from app.services.ml_grid_seq import fit_block_seq
+        return fit_block_seq(cell, seed, panel, br, block, window, st, n_jobs)
+    ks, tg, pr, y_all, fit_idx, val_idx = br.ks, br.tg, br.pr, br.y_all, br.fit_idx, br.val_idx
     cols = panel.group_columns(cell.groups)
     names = [panel.columns[i] for i in cols]
     gt = gv = None
@@ -770,11 +879,7 @@ def fit_block(cell: Cell, seed: int, panel: Panel, block: W.Block, window: W.Win
     adapter.fit(Xf, y_all[fit_idx], Xv, y_all[val_idx], ks.task, seed, groups_train=gt, groups_val=gv,
                 feature_names=names)
     scores = adapter.score(panel.X[np.ix_(pr, cols)])
-    iso = lambda i: str(pd.Timestamp(i).date())                       # noqa: E731
-    audit = {"start": str(block.start), "end": str(block.end), "window_start": str(window.start),
-             "fit_first": iso(day[fit_idx].min()), "fit_last": iso(day[fit_idx].max()),
-             "val_first": iso(day[val_idx].min()), "val_last": iso(day[val_idx].max()),
-             "fit_target_end_max": iso(tend[fit_idx].max()), "train_target_end_max": iso(tend[tr].max())}
+    audit = block_audit(BlockRows(ks, br.spec, tg, br.tr, pr, y_all, fit_idx, val_idx, br.day, br.tend), block, window)
     return BlockResult(pr, scores, len(fit_idx), len(val_idx), adapter.n_iter, audit)
 
 
@@ -873,18 +978,62 @@ def volatility_metrics(d: pd.DataFrame, H: int, st: GridSettings) -> Tuple[Dict[
     return metrics, regimes, metrics["spearman"]["mean"]
 
 
+def regime_metric(track: str, st: GridSettings) -> Callable[[pd.DataFrame], Dict[str, float]]:
+    """Frame (symbol, session, score + outcomes) -> ``{"all": value, regime: value}`` of the track's primary metric,
+    defined exactly as the row's own ``regimes`` (``selection_metrics`` / ``timing_metrics``): the mean of the daily
+    spread series per regime, resp. the timing excess of the regime's rows under the cutoff computed on the WHOLE frame
+    (after any shuffle, before slicing). A regime with fewer than ``regime_min_rows`` is NaN. Used for the controls so
+    a regime's null is measured the way the regime's value is."""
+    if track == "selection":
+        def selection(d: pd.DataFrame) -> Dict[str, float]:
+            sp = E.quintile_spread(d, st.cost_bps, assume_flat=True)
+            per = E.by_regime(sp.series, lambda s: float(s.mean()), st.regime_min_rows) if len(sp.series) else {}
+            return {**{r: v for r, v in per.items() if r != "all"}, "all": sp.mean}
+        return selection
+
+    def timing(d: pd.DataFrame) -> Dict[str, float]:
+        d = E.with_cutoff(d, st.timing_q, st.min_obs, assume_flat=True)
+        out = {"all": E.timing_excess(d, st.cost_bps, cutoff_col="cutoff", assume_flat=True).excess}
+        names = W.regimes(d["session"])
+        for r in W.REGIMES:
+            if (names == r).any():
+                sub = d[names == r]
+                out[r] = (float("nan") if len(sub) < st.regime_min_rows else
+                          E.timing_excess(sub, st.cost_bps, cutoff_col="cutoff", assume_flat=True).excess)
+        return out
+    return timing
+
+
+def _strict_by_regime(rep: Dict[str, Any], names: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    """Per regime: ``null_means`` = EVERY gating control's null mean (the gate takes the highest, per seed), and for
+    DISPLAY the control with the larger one-sided p among ``names`` (the whole period's rule, so the same control the
+    whole-period p comes from) with its null mean / std, p, rank and the model's value. A larger p does not mean a
+    higher null mean, so ``null_mean`` / ``null_std`` here are not the strictest null; ``null_means`` is. A regime
+    where any control has no finite p reports the last control and no p."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for reg in rep[names[0]]["by_regime"]:
+        ents = {n: rep[n]["by_regime"][reg] for n in names}
+        if any(e["p_value"] is None for e in ents.values()):
+            strict, p = names[-1], None
+        else:
+            strict = max(names, key=lambda n: (ents[n]["p_value"], n == names[-1]))
+            p = ents[strict]["p_value"]
+        e = ents[strict]
+        out[reg] = {"control": strict, "null_mean": e["mean"], "null_std": e["std"], "p_value": p, "rank": e["rank"],
+                    "model": e["model"], "null_means": {n: ents[n]["mean"] for n in names}}
+    return out
+
+
 def run_controls(d: pd.DataFrame, cell: Cell, st: GridSettings) -> Dict[str, Any]:
     if cell.kind == "volatility":
         return {"skipped": "a volatility model is a sizing model: the trading shuffle controls do not apply"}
     if cell.track == "selection":
-        metric = E.spread_metric(cost_bps=st.cost_bps, assume_flat=True)
         outcomes, primary = d[["symbol", "session", "rel_ret", "vol"]], "shuffle_symbols"
     else:
-        metric = E.timing_metric(q=st.timing_q, cost_bps=st.cost_bps, min_obs=st.min_obs, assume_flat=True)
         outcomes, primary = d[["symbol", "session", "ret", "vol"]], "shuffle_time"       # + the within-block null below
     timing = cell.track == "timing"
-    rep = controls_report(d[["symbol", "session", "score"] + (["block"] if timing else [])], outcomes, metric,
-                          seeds=st.control_seeds, within_block=timing)
+    rep = controls_report(d[["symbol", "session", "score"] + (["block"] if timing else [])], outcomes, None,
+                          seeds=st.control_seeds, within_block=timing, regime_fn=regime_metric(cell.track, st))
     names = ("shuffle_time", "shuffle_time_within_block") if timing else (primary,)
     ps = {n: rep[n]["p_value"] for n in names}
     if any(v is None for v in ps.values()):
@@ -895,6 +1044,7 @@ def run_controls(d: pd.DataFrame, cell: Cell, st: GridSettings) -> Dict[str, Any
         value = ps[strict]
     rep["primary"], rep["p_value"], rep["rank"] = strict, value, rep[strict]["rank"]
     rep["p_values"] = ps
+    rep["by_regime"] = _strict_by_regime(rep, names)
     return rep
 
 
@@ -950,7 +1100,8 @@ def _predictions_frame(cell: Cell, panel: Panel, rows: np.ndarray, scores: np.nd
     return pd.DataFrame(out).sort_values(["session", "symbol"], kind="mergesort").reset_index(drop=True)
 
 
-_CODE_MODULES = ("ml_grid", "ml_models", "ml_targets", "ml_eval", "ml_walkforward", "ml_controls", "ml_features")
+_CODE_MODULES = ("ml_grid", "ml_models", "ml_targets", "ml_eval", "ml_walkforward", "ml_controls", "ml_features",
+                 "ml_grid_seq", "ml_models_seq", "ml_panel", "ml_search")
 
 
 @lru_cache(maxsize=1)
@@ -962,7 +1113,8 @@ def library_versions() -> Dict[str, Any]:
     out: Dict[str, Any] = {"python": platform.python_version()}
     for dist, key in (("numpy", "numpy"), ("pandas", "pandas"), ("pyarrow", "pyarrow"), ("scikit-learn", "sklearn"),
                       ("scipy", "scipy"), ("lightgbm", "lightgbm"), ("xgboost", "xgboost"), ("catboost", "catboost"),
-                      ("threadpoolctl", "threadpoolctl")):
+                      ("threadpoolctl", "threadpoolctl"), ("torch", "torch"), ("darts", "darts"),
+                      ("pytorch-lightning", "pytorch_lightning"), ("tsai", "tsai")):
         try:
             out[key] = version(dist)
         except PackageNotFoundError:
@@ -974,12 +1126,42 @@ def library_versions() -> Dict[str, Any]:
     return out
 
 
-def identity_of(cell: Cell, st: GridSettings, daily_fp: str) -> Dict[str, Any]:
-    """What a finished row was computed from, for the resume check: the settings (not ``cores``), the store signature
-    and the daily cache fingerprint."""
+#: a GPU task is aborted when its projected total time exceeds this many budgets
+BUDGET_PROJECTION = 1.5
+
+
+def budget_projection(elapsed: float, fitted_times: Sequence[float], remaining: int) -> Optional[float]:
+    """Projected total seconds of a GPU task: the time so far plus the mean time of the FITTED blocks times the blocks still
+    to process. None until two blocks were fitted (the first pays the CUDA warm-up and the cuDNN setup, so one block is
+    no rate); skipped blocks cost next to nothing and are neither in the rate nor counted as a fitted block."""
+    if len(fitted_times) < 2:
+        return None
+    return elapsed + sum(fitted_times) / len(fitted_times) * remaining
+#: the master kills a GPU task that has been in flight longer than this many budgets
+HARD_DEADLINE_BUDGETS = 3.0
+
+#: the ``GridSettings`` only a GPU family reads (a tabular row's identity leaves them out)
+SEQ_SETTINGS: Tuple[str, ...] = ("seq_lookback", "seq_samples_per_session", "darts_lookback", "gpu_max_epochs")
+
+
+class BudgetExceeded(RuntimeError):
+    """A GPU (cell, seed) ran past ``GridSettings.gpu_budget_minutes``."""
+
+
+def identity_of(cell: Cell, st: GridSettings, daily_fp: str, intraday_fp: str = "") -> Dict[str, Any]:
+    """What a finished row was computed from, for the resume check: the settings (not ``cores``), the store signature,
+    the daily cache fingerprint and, for a tsai cell, the fingerprint of the 5-minute bars it reads (a content hash,
+    ``ml_grid_seq.intraday_fingerprint``)."""
     settings = st.to_dict()
-    del settings["cores"]
-    return _sanitize({"settings": settings, "store_signature": cell.signature, "daily_fingerprint": daily_fp})
+    for name in ("cores", "gpu_budget_minutes"):             # how many threads / how long it may take: not what it computes
+        del settings[name]
+    if cell.pool != "gpu":                                    # a tabular row does not depend on the sequence settings
+        for name in SEQ_SETTINGS:
+            del settings[name]
+    out = {"settings": settings, "store_signature": cell.signature, "daily_fingerprint": daily_fp}
+    if split_family(cell.family)[0] == "tsai":
+        out["intraday_fingerprint"] = intraday_fp
+    return _sanitize(out)
 
 
 def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs: int,
@@ -987,13 +1169,37 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
     """One (cell, seed): walk-forward fit, stitch, evaluate. Returns the ``results.jsonl`` row (and writes the
     predictions parquet first when ``pred_dir`` is given)."""
     t_start = time.perf_counter()
+    gpu = cell.pool == "gpu"
+    if gpu and cell.blocks != "H":
+        raise ValueError(f"a GPU family trains on half-year blocks (blocks: 'H'), got {cell.blocks!r}")
+    intraday_fp = ""
+    if split_family(cell.family)[0] == "tsai":
+        from app.services.ml_grid_seq import intraday_fingerprint
+        syms = tuple(sorted(resolve_symbols(cell.symbols)))
+        intraday_fp = intraday_fingerprint(panel.cache_root, syms, st.eval_end, store_span(cell.store, syms)[1])
     blocks = W.blocks(st.eval_start, st.eval_end, cell.blocks)
     skipped: List[Dict[str, str]] = []
     clipped: List[Dict[str, str]] = []
     info: List[Dict[str, Any]] = []
     rows_l, scores_l, block_l = [], [], []
     t_fit = 0.0
+    budget_s = st.gpu_budget_minutes * 60.0
+    excluded = 0.0                  # seconds the budget clock does not count (the intraday panel build: shared work)
+    fitted_times: List[float] = []  # the budget-clock seconds of every fitted block (the projection's rate)
+
+    def elapsed() -> float:
+        return time.perf_counter() - t_start - excluded
     for b in blocks:
+        if gpu:
+            done_blocks = len(info) + len(skipped)
+            if elapsed() > budget_s:
+                raise BudgetExceeded(f"time budget of {st.gpu_budget_minutes:g} minutes exceeded after "
+                                     f"{done_blocks} of {len(blocks)} blocks ({elapsed():.0f} s)")
+            proj = budget_projection(elapsed(), fitted_times, len(blocks) - done_blocks)
+            if proj is not None and proj > BUDGET_PROJECTION * budget_s:
+                raise BudgetExceeded(f"time budget of {st.gpu_budget_minutes:g} minutes: after {done_blocks} of "
+                                     f"{len(blocks)} blocks ({elapsed():.0f} s, {len(fitted_times)} fitted) the task is "
+                                     f"projected at {proj:.0f} s in all, over {BUDGET_PROJECTION:g} x the budget")
         win = W.train_window(b, cell.train_months, st.data_start)
         if win.clipped:
             clipped.append({"block": b.name, "window_start": str(win.start)})
@@ -1004,7 +1210,11 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
             skipped.append({"block": b.name, "reason": str(e)})
             continue
         finally:
-            t_fit += time.perf_counter() - t0
+            dt = time.perf_counter() - t0
+            t_fit += dt
+        built = res.audit["intraday_build_seconds"] if gpu and "intraday_build_seconds" in res.audit else 0.0
+        excluded += built
+        fitted_times.append(dt - built)
         rows_l.append(res.rows)
         scores_l.append(res.scores)
         block_l.append(np.full(len(res.rows), b.name, dtype=object))
@@ -1016,14 +1226,23 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
         info.append(entry)
     iters = [b["n_iter"] for b in info if b["n_iter"] is not None]
     row: Dict[str, Any] = {"cell_key": cell.key, "seed": int(seed), "track": cell.track, "label": cell.label,
-                           "config": cell.config(), "identity": identity_of(cell, st, panel.daily_fingerprint),
+                           "config": cell.config(), "identity": identity_of(cell, st, panel.daily_fingerprint, intraday_fp),
                            "versions": library_versions(),
                            "deterministic": cell.family in DETERMINISTIC_FAMILIES,
                            "seeds_run": len(effective_seeds(cell)),
                            "low_iter_share": float(np.mean([i <= LOW_ITER for i in iters])) if iters else None,
                            "n_blocks": len(blocks), "n_blocks_fitted": len(info),
                            "skipped_blocks": skipped, "clipped_blocks": clipped, "blocks": info,
-                           "n_features": len(panel.group_columns(cell.groups)), "symbols": list(panel.symbols)}
+                           "n_features": (len(panel.group_columns(cell.groups)) if not gpu or
+                                          split_family(cell.family)[0] == "darts"
+                                          else (info[0]["n_channels"] if info else 0)),
+                           "symbols": list(panel.symbols)}
+    if gpu:
+        from app.services.ml_grid_seq import gpu_versions
+        row["versions"] = {**row["versions"], **gpu_versions()}
+        row["over_budget"] = elapsed() > budget_s              # finished work is kept; the flag says it was slow
+        ops = sorted({op for b in info for op in (b["nondeterministic_ops"] if "nondeterministic_ops" in b else [])})
+        row["gpu_nondeterministic"], row["nondeterministic_ops"] = bool(ops), ops
     if not rows_l:
         row.update({"status": "no_predictions", "n_rows": 0, "primary": {"name": None, "value": None},
                     "metrics": {}, "regimes": {}, "controls": {}})
@@ -1036,14 +1255,21 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
     if pred_dir is not None:
         pred_dir.mkdir(parents=True, exist_ok=True)
         final = pred_dir / f"{cell.key}_{seed}.parquet"
-        tmp = final.with_suffix(".tmp")
-        stored.to_parquet(tmp, index=False, compression="zstd")
-        os.replace(tmp, final)
+        tmp = final.with_name(f"{final.name}.{os.getpid()}.tmp")           # unique per process: no two writers share one
+        try:
+            stored.to_parquet(tmp, index=False, compression="zstd")
+            os.replace(tmp, final)
+        finally:
+            tmp.unlink(missing_ok=True)
     ev = evaluate(pred, cell, st)
     row.update({"status": "ok", "n_rows": int(len(pred)), "primary": ev["primary"], "metrics": ev["metrics"],
                 "regimes": ev["regimes"], "controls": ev["controls"]})
     row["timings"] = {"fit": t_fit, "metrics": ev["seconds_metrics"], "controls": ev["seconds_controls"],
                       "panel_load": panel.load_seconds, "total": time.perf_counter() - t_start}
+    if gpu:
+        for key, field_name in (("block_fit", "fit_seconds"), ("block_prep", "prep_seconds"),
+                                ("intraday_build", "intraday_build_seconds")):
+            row["timings"][key] = float(sum(b[field_name] for b in info if field_name in b))
     return _sanitize(row)
 
 
@@ -1059,7 +1285,8 @@ PANEL_STAGGER_SECONDS = 1.5
 #: a task whose worker dies is retried this many times, then it becomes an error record
 MAX_RETRIES = 3
 #: relative cost of a family's fit (slowest first); quantile (nine boosters) counts as one step slower
-FAMILY_COST: Dict[str, int] = {"catboost": 4, "xgb": 3, "lgbm": 2, "linear": 1, "naive": 0}
+FAMILY_COST: Dict[str, int] = {"catboost": 4, "xgb": 3, "lgbm": 2, "linear": 1, "naive": 0,
+                               **{f: 6 for f in TSAI_FAMILIES}, **{f: 5 for f in DARTS_FAMILIES}}
 
 
 def _panel_for(cell: Cell, cache_root: str) -> Panel:
@@ -1070,17 +1297,22 @@ def _panel_for(cell: Cell, cache_root: str) -> Panel:
     return get_panel(cell.store, resolve_symbols(cell.symbols), cell.track, cache_root)
 
 
-def _init_worker(settings: Dict[str, Any], cache_root: str, out_dir: str, n_jobs: int, counter: Any = None) -> None:
+def _init_worker(settings: Dict[str, Any], cache_root: str, out_dir: str, n_jobs: int, counter: Any = None,
+                 workers: int = 0) -> None:
     """Pool initializer: remember the run constants, cap the BLAS / OpenMP threads at ``n_jobs`` (so slots x n_jobs
     never exceeds the cores) and silence only ``NOISY_WARNINGS``. Panels are NOT loaded here: the task that needs one
     loads it (``get_panel``, an LRU of ``PANEL_CACHE_SIZE``). ``counter`` (a shared ``multiprocessing.Value`` of the
-    pool) numbers the workers 0, 1, 2 ... for the staggered first panel load; without one the worker is number 0."""
+    pool) numbers the workers 0, 1, 2 ... for the staggered first panel load; without one the worker is number 0. With
+    ``workers`` (the pool size) only the FIRST generation is staggered: a replacement worker (after a break, a
+    ``max_tasks_per_child`` retirement or a termination) is number 0, so it never waits for a stagger that is over."""
     import warnings
     index = 0
     if counter is not None:
         with counter.get_lock():
             index = counter.value
             counter.value += 1
+        if workers > 0 and index >= workers:
+            index = 0
     for message, category in NOISY_WARNINGS:
         warnings.filterwarnings("ignore", message=message, category=category)
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -1091,7 +1323,7 @@ def _init_worker(settings: Dict[str, Any], cache_root: str, out_dir: str, n_jobs
     except ImportError:
         logger.warning("threadpoolctl is not installed: BLAS / OpenMP threads are limited by environment variables only")
     _WORKER.update(settings=GridSettings.from_dict(settings), cache_root=cache_root, out_dir=out_dir, n_jobs=n_jobs,
-                   index=index, staggered=False)
+                   index=index, staggered=False, poisoned=False)
 
 
 def _error_record(cell_key: str, seed: int, message: str, label: str = "", tb: str = "") -> Dict[str, Any]:
@@ -1109,7 +1341,17 @@ def _label_of(cfg: Dict[str, Any]) -> str:
 def _run_task(cfg: Dict[str, Any], seed: int, expected_key: str) -> Dict[str, Any]:
     """Pool task: one (cell, seed). EVERYTHING, validation included, is inside the try: whatever raises becomes an
     ``error`` record and the grid goes on. The worker rebuilds the cell from its config and refuses it when the key it
-    gets differs from the planned ``expected_key`` (the store changed between planning and running)."""
+    gets differs from the planned ``expected_key`` (the store changed between planning and running).
+
+    GPU cells (the cell's family routes to the gpu pool): a worker poisoned by an earlier sticky CUDA error exits at the
+    start of its next task (``os._exit``: the pool breaks and is rebuilt, a fresh process gets a fresh CUDA context);
+    a failure is classified (``ml_grid_seq.classify_gpu_error``: ``cuda_error`` of the error record is ``"oom"`` or
+    ``"sticky"``; a sticky one poisons this worker); and after the task, with the exception gone, the worker collects
+    garbage and empties the CUDA cache. A budget overrun is an error record with ``timeout: True``."""
+    if "poisoned" in _WORKER and _WORKER["poisoned"]:
+        os._exit(1)
+    record: Optional[Dict[str, Any]] = None
+    gpu = isinstance(cfg, dict) and "family" in cfg and cfg["family"] in GPU_FAMILIES
     try:
         cell = validate_cell(cfg)
         if seed not in cell.seeds:
@@ -1118,10 +1360,23 @@ def _run_task(cfg: Dict[str, Any], seed: int, expected_key: str) -> Dict[str, An
             raise RuntimeError(f"cell key mismatch in the worker: planned {expected_key}, validated {cell.key} "
                                f"(did the store change after the plan was made?)")
         panel = _panel_for(cell, _WORKER["cache_root"])
-        return run_cell_seed(cell, seed, panel, _WORKER["settings"], _WORKER["n_jobs"],
-                             Path(_WORKER["out_dir"]) / "predictions")
+        record = run_cell_seed(cell, seed, panel, _WORKER["settings"], _WORKER["n_jobs"],
+                               Path(_WORKER["out_dir"]) / "predictions")
     except Exception as e:                                       # noqa: BLE001  (one bad cell must not stop the grid)
-        return _error_record(expected_key, seed, f"{type(e).__name__}: {e}", _label_of(cfg), traceback.format_exc())
+        record = _error_record(expected_key, seed, f"{type(e).__name__}: {e}", _label_of(cfg), traceback.format_exc())
+        if isinstance(e, BudgetExceeded):
+            record["timeout"] = True
+        if gpu:
+            from app.services.ml_grid_seq import classify_gpu_error
+            kind = classify_gpu_error(e)
+            if kind is not None:
+                record["cuda_error"] = kind
+                if kind == "sticky":
+                    _WORKER["poisoned"] = True
+    if gpu:                                                      # the exception (and the tensors in its frames) is gone
+        from app.services.ml_grid_seq import cleanup_gpu
+        cleanup_gpu()
+    return record
 
 
 def effective_seeds(cell: Cell) -> Tuple[int, ...]:
@@ -1277,10 +1532,33 @@ def make_cancel_check(task_id: str, interval: float = 5.0) -> Callable[[], bool]
 
 
 # ------------------------------------------------------------------ the pool driver
+def _terminate_pool(pool: Any) -> None:
+    """Kill the worker processes of ``pool`` (``shutdown`` only stops idle ones): used when a task is stuck or the run is
+    cancelled, where a running task's result would be thrown away anyway."""
+    terminate = getattr(pool, "terminate_workers", None)               # Python 3.14
+    if terminate is not None:
+        terminate()
+        return
+    procs = getattr(pool, "_processes", None)                          # 3.12: no public API
+    for p in list(procs.values() if procs else []):
+        try:
+            p.terminate()
+        except Exception:                                              # noqa: BLE001  (already gone)
+            pass
+
+
 def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tuple, task_fn: Callable,
                 finish: Callable[[Dict[str, Any]], None], cancelled: Callable[[], bool],
-                summary: Dict[str, Any]) -> None:
-    """Run ``tasks`` on a spawn-context process pool with at most ``2 x cpu_slots`` futures in flight.
+                summary: Dict[str, Any], deadline: Optional[float] = None, window_factor: int = 2,
+                max_tasks_per_child: Optional[int] = None) -> None:
+    """Run ``tasks`` on a spawn-context process pool with at most ``window_factor x cpu_slots`` futures in flight
+    (default 2; the GPU lane uses 1, so a submitted task starts at once and ``deadline`` can run from its submission).
+
+    ``deadline`` (seconds, None = none): a task in flight longer than that is recorded as a TIMEOUT error and the pool's
+    workers are TERMINATED and the pool rebuilt; the other in-flight tasks go back to the queue UNCHARGED (they did
+    nothing wrong). ``max_tasks_per_child``: workers are replaced after that many tasks (a long-lived CUDA process
+    leaks). On cancellation or a master exception the workers are terminated too (a stuck kernel would otherwise keep
+    the process, and the GPU, busy for hours).
 
     A worker that dies (``BrokenProcessPool``) takes the whole pool with it: every in-flight task is charged one
     attempt, the pool is rebuilt and the tasks go back to the front of the queue. After a break the pool runs on
@@ -1290,17 +1568,21 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
     pool already broken puts the task back and rebuilds. ``finish`` (which writes to disk) is never called inside a
     ``try`` that reads ``except`` as "the pool broke": an ``OSError`` from it propagates. The pool is always shut down
     with ``wait=False, cancel_futures=True``, so a master exception or Ctrl-C leaves nothing queued."""
-    window = 2 * cpu_slots
+    window = window_factor * cpu_slots
     probation_window = max(1, cpu_slots // 4)
     queue: deque = deque((c, s, 0) for c, s in tasks)                 # (cell, seed, times its pool broke)
     retry: deque = deque()
     inflight: Dict[Any, Tuple[Cell, int, int]] = {}
     order = {(c.key, sd): i for i, (c, sd) in enumerate(tasks)}
+    submitted: Dict[Any, float] = {}                                  # future -> when it went to the pool
+    hard: Dict[Tuple[str, int], int] = {}                             # (cell_key, seed) -> hard deadlines so far
+    workers = min(cpu_slots, len(tasks))
 
     def new_pool() -> ProcessPoolExecutor:
         ctx = multiprocessing.get_context("spawn")
-        return ProcessPoolExecutor(max_workers=min(cpu_slots, len(tasks)), mp_context=ctx, initializer=_init_worker,
-                                   initargs=(*init_args, ctx.Value("i", 0)))
+        extra = {} if max_tasks_per_child is None else {"max_tasks_per_child": max_tasks_per_child}
+        return ProcessPoolExecutor(max_workers=workers, mp_context=ctx, initializer=_init_worker,
+                                   initargs=(*init_args, ctx.Value("i", 0), workers), **extra)
 
     def limit() -> int:
         if any(a >= 2 for _, _, a in inflight.values()):
@@ -1310,10 +1592,12 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
         return window
     summary["pool_rebuilds"] = 0
     pool = new_pool()
+    abnormal = False
     try:
         while queue or retry or inflight:
             if cancelled():
                 summary["cancelled"] = True
+                abnormal = True
                 return
             rebuild = False
             while (retry or queue) and len(inflight) < limit():
@@ -1329,8 +1613,10 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
                     rebuild = True
                     break
                 inflight[fu] = (c, sd, a)
+                submitted[fu] = time.monotonic()
             done, _ = wait(list(inflight), timeout=POLL_SECONDS, return_when=FIRST_COMPLETED)
             broken: List[Tuple[Cell, int, int]] = []
+            sticky = False
             for fu in done:
                 c, sd, a = inflight.pop(fu)
                 try:
@@ -1340,7 +1626,44 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
                     continue
                 except Exception as e:                            # noqa: BLE001  (e.g. an unpicklable result)
                     r = _error_record(c.key, sd, f"{type(e).__name__}: {e}", c.label, traceback.format_exc())
+                if isinstance(r, dict) and "cuda_error" in r and r["cuda_error"] == "sticky":
+                    sticky = True                                 # its CUDA context is poisoned: do not wait for its next task
                 finish(r)                                         # outside the try: an OSError here is not "broken"
+            late = [] if deadline is None else [fu for fu in inflight if time.monotonic() - submitted[fu] > deadline]
+            if late or sticky:                                    # stuck / poisoned: kill the pool, requeue the rest
+                again: List[Tuple[Cell, int, int]] = []
+                for fu in late:
+                    c, sd, a = inflight.pop(fu)
+                    n_hard = hard[(c.key, sd)] = (hard[(c.key, sd)] if (c.key, sd) in hard else 0) + 1
+                    first = n_hard == 1
+                    rec = _error_record(c.key, sd, f"hard deadline of {deadline:.0f} s exceeded: the task was stuck "
+                                                   f"and its worker process was terminated"
+                                                   f"{' (retried once)' if first else ''}", c.label)
+                    rec["hard_deadline"] = True
+                    rec["retrying" if first else "timeout"] = True   # the first is retried (a transient hang), the second is a timeout
+                    finish(rec)
+                    if first:
+                        again.append((c, sd, a))
+                _terminate_pool(pool)
+                pool.shutdown(wait=False, cancel_futures=True)
+                innocent = list(again)
+                for fu, (c, sd, a) in list(inflight.items()):
+                    if fu.done() and not fu.cancelled() and fu.exception() is None:
+                        finish(fu.result())
+                    else:
+                        innocent.append((c, sd, a))               # not at fault: back to the queue, no attempt charged
+                inflight.clear()
+                submitted.clear()
+                for c, sd, a in sorted(innocent, key=lambda t: order[(t[0].key, t[1])], reverse=True):
+                    (retry if a else queue).appendleft((c, sd, a))
+                logger.warning(f"ml_grid: {len(late)} task(s) passed the hard deadline of {deadline:.0f} s"
+                               f"{' and a worker reported a sticky CUDA error' if sticky else ''}; the pool's "
+                               f"workers were terminated, rebuilding" if late else
+                               "ml_grid: a worker reported a sticky CUDA error; the pool's workers were terminated, "
+                               "rebuilding")
+                summary["pool_rebuilds"] += 1
+                pool = new_pool()
+                continue
             if not broken and not rebuild:
                 continue
             for fu, (c, sd, a) in list(inflight.items()):         # the rest of the pool died with it: collect them
@@ -1352,6 +1675,7 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
                 else:
                     finish(r)
                 inflight.pop(fu)
+            submitted.clear()
             pool.shutdown(wait=False, cancel_futures=True)
             broken.sort(key=lambda t: order[(t[0].key, t[1])])      # futures complete in any order: retry in plan order
             for c, sd, a in broken:
@@ -1363,8 +1687,130 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
             logger.warning(f"ml_grid: the worker pool broke ({len(broken)} task(s) in flight); rebuilding")
             summary["pool_rebuilds"] += 1
             pool = new_pool()
+    except BaseException:
+        abnormal = True
+        raise
     finally:
+        if abnormal:                                                  # cancelled / failed: running tasks are not wanted
+            _terminate_pool(pool)
         pool.shutdown(wait=False, cancel_futures=True)
+
+
+#: a GPU worker process is replaced after this many tasks (a long-lived CUDA process leaks memory)
+GPU_MAX_TASKS_PER_CHILD = 40
+#: consecutive CUDA-flavoured error records after which the master aborts the GPU lane
+GPU_BREAKER_LIMIT = 10
+
+
+class GpuBreaker:
+    """Circuit breaker of the GPU lane: ``record`` every row the lane finishes; ``limit`` CONSECUTIVE error records with a
+    ``cuda_error`` trip it (a finished row resets the count; an ordinary error neither counts nor resets). Something is
+    wrong with the device or the driver, not with the cells, and a multi-day run must not burn through its tasks."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit, self.count, self.tripped = limit, 0, False
+
+    def record(self, row: Dict[str, Any]) -> bool:
+        if "error" in row:
+            if "cuda_error" in row and row["cuda_error"]:
+                self.count += 1
+                if self.count >= self.limit:
+                    self.tripped = True
+        else:
+            self.count = 0
+        return self.tripped
+
+
+def _drive_lanes(cpu_tasks: Sequence[Tuple[Cell, int]], gpu_tasks: Sequence[Tuple[Cell, int]], cpu_slots: int,
+                 gpu_slots: int, init_args: Tuple, task_fn: Callable, finish: Callable[[Dict[str, Any]], None],
+                 cancelled: Callable[[], bool], summary: Dict[str, Any],
+                 gpu_kwargs: Optional[Dict[str, Any]] = None) -> None:
+    """Run the CPU tasks on a pool of ``cpu_slots`` workers and the GPU tasks on a second pool of ``gpu_slots``, the two
+    ``_drive_pool`` lifecycles (retries, probation, cancellation, ``BrokenProcessPool``) side by side. One lane runs in
+    the calling thread. With both, each lane runs in its own thread: ``finish`` and the cancel check are serialised by
+    one lock, ``summary["pool_rebuilds"]`` is the sum of the lanes', and a failure in one lane stops the other (its
+    in-flight tasks are cancelled, its rows so far are kept), every lane error is logged and the first is re-raised
+    (the others as notes on it). The GPU lane has a circuit breaker (``GpuBreaker``): after ``GPU_BREAKER_LIMIT``
+    consecutive CUDA errors it is aborted LOUDLY (``summary["gpu_lane_aborted"]``, an error log line) while the CPU lane
+    goes on; its unfinished tasks are retried by the next run. ``gpu_kwargs`` go to the GPU lane's ``_drive_pool`` (the
+    hard ``deadline``, ``window_factor``, ``max_tasks_per_child``)."""
+    lanes = [(name, t, n) for name, t, n in (("cpu", cpu_tasks, cpu_slots), ("gpu", gpu_tasks, gpu_slots)) if t]
+    lock = threading.RLock()
+    stop = threading.Event()
+    gpu_abort = threading.Event()
+    breaker = GpuBreaker(GPU_BREAKER_LIMIT)
+    subs: List[Dict[str, Any]] = [{} for _ in lanes]
+    errors: List[BaseException] = []
+
+    def rebuilds() -> int:
+        return sum(s["pool_rebuilds"] for s in subs if "pool_rebuilds" in s)
+
+    def lane_finish(name: str) -> Callable[[Dict[str, Any]], None]:
+        def f(r: Dict[str, Any]) -> None:
+            with lock:
+                summary["pool_rebuilds"] = rebuilds()
+                finish(r)
+                if name == "gpu" and breaker.record(r) and not gpu_abort.is_set():
+                    gpu_abort.set()
+                    summary["gpu_lane_aborted"] = True
+                    logger.error(f"ml_grid: the GPU lane is ABORTED after {GPU_BREAKER_LIMIT} consecutive CUDA errors "
+                                 f"(last: {r['error']}); its unfinished tasks are left for the next run, the CPU lane "
+                                 f"goes on. Check the driver / the device before restarting.")
+        return f
+
+    def lane_stopped(name: str) -> Callable[[], bool]:
+        def f() -> bool:
+            with lock:
+                return stop.is_set() or (name == "gpu" and gpu_abort.is_set()) or cancelled()
+        return f
+
+    def lane(i: int) -> None:
+        name, tasks, slots = lanes[i]
+        try:
+            extra = gpu_kwargs if (name == "gpu" and gpu_kwargs) else {}
+            _drive_pool(tasks, slots, init_args, task_fn, lane_finish(name), lane_stopped(name), subs[i], **extra)
+        except BaseException as e:                                # noqa: BLE001  (re-raised by the caller)
+            errors.append(e)
+            stop.set()
+
+    def join_all(timeout: Optional[float]) -> None:
+        end = None if timeout is None else time.monotonic() + timeout
+        for th in threads:
+            th.join(None if end is None else max(0.0, end - time.monotonic()))
+
+    if len(lanes) == 1:
+        threads: List[threading.Thread] = []
+        lane(0)
+        if errors:
+            raise errors[0]
+    else:
+        threads = [threading.Thread(target=lane, args=(i,), daemon=True, name=f"ml_grid-lane-{i}")
+                   for i in range(len(lanes))]
+        for th in threads:
+            th.start()
+        try:
+            while any(th.is_alive() for th in threads):
+                for th in threads:
+                    th.join(0.2)
+        except BaseException:                                     # Ctrl-C: stop the lanes and let them finish before leaving
+            stop.set()
+            join_all(LANE_JOIN_SECONDS)
+            raise
+        if errors:
+            join_all(LANE_JOIN_SECONDS)
+            for e in errors:
+                logger.error("ml_grid: a lane failed: %r", e, exc_info=e)
+            first = errors[0]
+            for e in errors[1:]:
+                first.add_note(f"another lane failed too: {e!r}")
+            raise first
+    summary["pool_rebuilds"] = rebuilds()
+    summary["cancelled"] = any(s["cancelled"] for (name, _, _), s in zip(lanes, subs)
+                               if "cancelled" in s and not (name == "gpu" and gpu_abort.is_set()))
+
+
+#: seconds the master waits for the lane threads to wind down after a failure or Ctrl-C
+LANE_JOIN_SECONDS = 30.0
 
 
 def read_results(path: Union[str, Path]) -> List[Dict[str, Any]]:
@@ -1404,7 +1850,9 @@ def _identity_diff(row: Dict[str, Any], expected: Dict[str, Any]) -> List[str]:
     if not isinstance(ident, dict):
         return ["no identity recorded (a row written before identity tracking)"]
     out = []
-    for k in ("store_signature", "daily_fingerprint"):
+    for k in ("store_signature", "daily_fingerprint", "intraday_fingerprint"):
+        if k not in expected:
+            continue                                  # only tsai rows carry the intraday fingerprint
         got = ident[k] if k in ident else None
         if got != expected[k]:
             out.append(f"{k}: row {got!r}, now {expected[k]!r}")
@@ -1415,6 +1863,14 @@ def _identity_diff(row: Dict[str, Any], expected: Dict[str, Any]) -> List[str]:
         if a_ != b_:
             out.append(f"settings.{k}: row {a_!r}, now {b_!r}")
     return out
+
+
+def _timed_out_tasks(err_path: Path) -> set:
+    """The (cell_key, seed) whose LAST record in ``errors.jsonl`` is a timeout."""
+    last: Dict[Tuple[str, int], bool] = {}
+    for e in read_results(err_path):
+        last[(e["cell_key"], int(e["seed"]))] = bool("timeout" in e and e["timeout"])
+    return {k for k, v in last.items() if v}
 
 
 def _check_resume(rows: List[Dict[str, Any]], cells: Sequence[Cell], st: GridSettings, cache_root: str,
@@ -1439,7 +1895,13 @@ def _check_resume(rows: List[Dict[str, Any]], cells: Sequence[Cell], st: GridSet
         first, last, _ = store_span(c.store, syms)
         if (syms, first, last) not in fps:
             fps[(syms, first, last)] = daily_fingerprint(cache_root, syms, first, last)
-        diff = _identity_diff(r, identity_of(c, st, fps[(syms, first, last)]))
+        ifp = ""
+        if split_family(c.family)[0] == "tsai":
+            from app.services.ml_grid_seq import intraday_fingerprint
+            if ("intraday", syms, last) not in fps:
+                fps[("intraday", syms, last)] = intraday_fingerprint(cache_root, syms, st.eval_end, last)
+            ifp = fps[("intraday", syms, last)]
+        diff = _identity_diff(r, identity_of(c, st, fps[(syms, first, last)], ifp))
         if diff:
             mism[k] = diff
         elif r["status"] == "ok" and not (pred_dir / f"{k[0]}_{k[1]}.parquet").exists():
@@ -1517,16 +1979,19 @@ def run_grid(cells: Sequence[Cell], out_dir: Union[str, Path], cpu_slots: int, g
              cache_root: Optional[Union[str, Path]] = None, settings: Optional[GridSettings] = None,
              progress: Optional[Callable[..., None]] = None, inline: bool = False,
              rerun_mismatched: bool = False, cancel_check: Optional[Callable[[], bool]] = None,
-             task_fn: Optional[Callable] = None) -> Dict[str, Any]:
+             task_fn: Optional[Callable] = None, retry_timeouts: bool = False) -> Dict[str, Any]:
     """Run every unfinished (cell, seed) of ``cells``; append a row to ``results.jsonl`` as each finishes.
 
-    ``cpu_slots``: worker processes for the tabular families. ``gpu_slots``: workers for sequence families (none
-    exist yet; a cell routed to the gpu pool with 0 slots is refused). ``inline=True`` runs in this process (tests,
+    ``cpu_slots``: worker processes for the tabular families. ``gpu_slots``: workers of the second pool, for the
+    sequence families (``tsai-*``, ``darts-*``); a cell routed to the gpu pool with 0 slots is refused. The two pools are
+    separate caps and run concurrently. ``inline=True`` runs in this process (tests,
     debugging) through the same code. ``rerun_mismatched``: see ``ResumeMismatchError`` / the module docstring.
     ``cancel_check``: polled between submissions; when it returns True the run stops cooperatively (rows already
     written stay; a restart resumes). ``task_fn``: the per-task function (default ``_run_task``; a module-level
     callable so a spawned worker can import it; for tests). Only one run may use an ``out_dir`` at a time
-    (``GridLockedError``). Returns ``{tasks, done, skipped_existing, errors, cancelled, pool_rebuilds, out_dir}``."""
+    (``GridLockedError``). A (cell, seed) whose last error record is a TIMEOUT (``timeout: true``: over its time budget, or
+    killed by the master's hard deadline) is not retried by a restart (it would only time out again, hours later)
+    unless ``retry_timeouts``; ``summary["skipped_timeouts"]`` counts them when there are some. Returns ``{tasks, done, skipped_existing, errors, cancelled, pool_rebuilds, out_dir}``."""
     if not _is_int(cpu_slots) or cpu_slots < 1 or not _is_int(gpu_slots) or gpu_slots < 0:
         raise ValueError("cpu_slots must be an integer >= 1 and gpu_slots an integer >= 0")
     st = settings or GridSettings()
@@ -1537,29 +2002,105 @@ def run_grid(cells: Sequence[Cell], out_dir: Union[str, Path], cpu_slots: int, g
     lock = acquire_lock(out)
     try:
         return _run_locked(cells, out, cpu_slots, gpu_slots, cache_root, st, progress, inline, rerun_mismatched,
-                           cancel_check or (lambda: False), task_fn or _run_task)
+                           cancel_check or (lambda: False), task_fn or _run_task, retry_timeouts)
     finally:
         release_lock(lock)
 
 
+# The dashboard hook (``_refresh_outputs``) is called at the start, after EVERY finished row (results and errors alike)
+# and at the end; ``ml_grid_report.refresh`` decides in O(1) whether a live rebuild is due (it waits max(60 s, 10 x the
+# last build)); only the start and the end are forced.
+
+
+_REFRESH_FAILURES: Dict[str, int] = {}
+
+
+def _refresh_outputs(out: Path, summary: Dict[str, Any], final: bool, finished: int) -> None:
+    """Rebuild ``dashboard.html`` (``final``: also the gate and ``report.md``; the start of a run and the end always
+    build, a live one is throttled and incremental, see ``ml_grid_report.refresh``).
+    Reporting must never stop a grid: whatever goes wrong (an open file, a bad row) is logged and the run goes on. The
+    first failure of a run is logged in full, the following ones are only counted (one line at the end)."""
+    key = str(out)
+    if finished == 0 and not final:
+        _REFRESH_FAILURES[key] = 0
+    try:
+        from app.services import ml_grid_report
+        ml_grid_report.refresh(out, summary, final, force=final or finished == 0)
+    except Exception as e:                                      # noqa: BLE001
+        _REFRESH_FAILURES[key] = (_REFRESH_FAILURES[key] if key in _REFRESH_FAILURES else 0) + 1
+        if _REFRESH_FAILURES[key] == 1:
+            logger.warning(f"ml_grid: could not rebuild the dashboard / report in {out} after {finished} rows: {e}",
+                           exc_info=True)
+    if final:
+        n = _REFRESH_FAILURES.pop(key, 0)
+        if n > 1:
+            logger.warning(f"ml_grid: {n} dashboard / report rebuilds failed in this run (the first was logged in full)")
+
+
+def _sweep_leftovers(out: Path, cells: Sequence[Cell], say: Callable[..., None]) -> None:
+    """At the start of a run, with the output directory's lock held (so no other run writes here): delete the prediction temp
+    files a killed worker left (``predictions/*.tmp``) and, when GPU cells are in the run, the stale ``ba2_darts_*``
+    checkpoint directories of killed Darts fits."""
+    n = 0
+    for tmp in (out / "predictions").glob("*.tmp"):
+        try:
+            tmp.unlink()
+            n += 1
+        except OSError:
+            logger.warning(f"could not delete the leftover {tmp}", exc_info=True)
+    d = 0
+    if any(c.pool == "gpu" for c in cells):
+        from app.services import ml_grid_seq
+        d = ml_grid_seq.sweep_stale_darts_dirs()
+    if n or d:
+        say(f"ml_grid: swept {n} leftover prediction temp file(s) and {d} stale darts checkpoint dir(s)")
+
+
 def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: str, st: GridSettings,
-                progress, inline: bool, rerun_mismatched: bool, cancelled, task_fn) -> Dict[str, Any]:
+                progress, inline: bool, rerun_mismatched: bool, cancelled, task_fn,
+                retry_timeouts: bool = False) -> Dict[str, Any]:
     res_path, err_path = out / "results.jsonl", out / "errors.jsonl"
     say = progress or (lambda m, pct=None: logger.warning(m))
+    _sweep_leftovers(out, cells, say)
     finished = _check_resume(read_results(res_path), cells, st, cache_root, rerun_mismatched, res_path)
     plan = plan_tasks(cells)
     tasks = [(c, sd) for c, sd in plan if (c.key, sd) not in finished]
     skipped_existing = len(plan) - len(tasks)
+    timed_out = set() if retry_timeouts else _timed_out_tasks(err_path)
+    skipped_timeouts = [(c, sd) for c, sd in tasks if (c.key, sd) in timed_out]
+    tasks = [t for t in tasks if (t[0].key, t[1]) not in timed_out]
     gpu_tasks = [t for t in tasks if t[0].pool == "gpu"]
+    cpu_tasks = [t for t in tasks if t[0].pool != "gpu"]
     if gpu_tasks and gpu_slots < 1:
         raise ValueError(f"{len(gpu_tasks)} tasks need the gpu pool but gpu_slots is 0")
-    if gpu_tasks:
-        raise NotImplementedError("sequence families are not implemented yet (the gpu pool hook is a placeholder)")
     summary = {"tasks": len(tasks), "done": 0, "skipped_existing": skipped_existing, "errors": 0, "cancelled": False,
                "pool_rebuilds": 0, "out_dir": str(out)}
+    if skipped_timeouts:
+        summary["skipped_timeouts"] = len(skipped_timeouts)
+        say(f"ml_grid: {len(skipped_timeouts)} task(s) timed out in an earlier run and are skipped "
+            f"(--retry-timeouts runs them again)")
     say(f"ml_grid: {len(cells)} cells, {len(tasks)} (cell, seed) tasks to run, {skipped_existing} already finished")
+
+    try:
+        from app.services.ml_grid_report import read_run_summary
+        prior_rebuilds = int(read_run_summary(out)["pool_rebuilds_total"]) \
+            if "pool_rebuilds_total" in read_run_summary(out) else 0
+    except Exception:                                           # noqa: BLE001  (reporting is never fatal)
+        prior_rebuilds = 0
+    planned = {"planned_count": len(plan), "planned_hash": ""}
+    try:                                                        # the list lives in planned_keys.txt, written once
+        from app.services.ml_grid_report import write_planned
+        planned["planned_hash"] = write_planned(out, [f"{c.key}:{sd}" for c, sd in plan])
+    except Exception:                                           # noqa: BLE001  (reporting is never fatal)
+        logger.warning(f"ml_grid: could not write planned_keys.txt in {out}", exc_info=True)
+
+    def refresh(final: bool, finished: int) -> None:
+        _refresh_outputs(out, {**summary, "planned_tasks": len(plan), "planned_cells": len(cells),
+                               **planned, "prior_pool_rebuilds": prior_rebuilds}, final, finished)
     if not tasks:
+        refresh(True, 0)
         return summary
+    refresh(False, 0)
     import shutil
     est = estimate_disk(tasks, st)
     free = shutil.disk_usage(out).free
@@ -1567,34 +2108,50 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
         f"{_fmt_bytes(est['predictions'])}, results {_fmt_bytes(est['results'])}); {_fmt_bytes(free)} free in {out}")
     if est["total"] > 0.9 * free:
         logger.warning(f"ml_grid: the estimated disk need exceeds 90% of the free space in {out}")
-    init_args = (st.to_dict(), cache_root, str(out), n_jobs_for(cpu_slots, st.cores))
+    workers = (cpu_slots if cpu_tasks else 0) + (gpu_slots if gpu_tasks else 0)       # the pools are separate caps
+    init_args = (st.to_dict(), cache_root, str(out), n_jobs_for(max(1, workers), st.cores))
 
     def finish(r: Dict[str, Any]) -> None:
+        if "error" in r and "retrying" in r and r["retrying"]:     # a first hard deadline: kept on file, not a finished task
+            _append(err_path, r)
+            say(f"ml_grid: cell {r['cell_key']} seed {r['seed']} ({r['label']}) passed the hard deadline once and is "
+                f"retried automatically; a second time is a timeout")
+            return
         if "error" in r:
             summary["errors"] += 1
             _append(err_path, r)
             say(f"ml_grid ERROR cell {r['cell_key']} seed {r['seed']} ({r['label']}): {r['error']}")
-            return
-        _append(res_path, r)
-        summary["done"] += 1
-        p = r["primary"]
-        c = r["controls"] if isinstance(r["controls"], dict) else {}
-        pv = c["p_value"] if "p_value" in c else None
-        say(f"ml_grid [{summary['done'] + summary['errors']}/{len(tasks)}] cell {r['cell_key']} seed {r['seed']} "
-            f"{r['label']}: {p['name']}={'n/a' if p['value'] is None else format(p['value'], '+.4f')}"
-            f"{'' if pv is None else f' p={pv:.3f}'} rows={r['n_rows']} "
-            f"skipped={len(r['skipped_blocks'])} ({r['timings']['total']:.0f}s)",
-            min(99.0, 100.0 * (summary["done"] + summary["errors"]) / len(tasks)))
+        else:
+            _append(res_path, r)
+            summary["done"] += 1
+            p = r["primary"]
+            c = r["controls"] if isinstance(r["controls"], dict) else {}
+            pv = c["p_value"] if "p_value" in c else None
+            say(f"ml_grid [{summary['done'] + summary['errors']}/{len(tasks)}] cell {r['cell_key']} seed {r['seed']} "
+                f"{r['label']}: {p['name']}={'n/a' if p['value'] is None else format(p['value'], '+.4f')}"
+                f"{'' if pv is None else f' p={pv:.3f}'} rows={r['n_rows']} "
+                f"skipped={len(r['skipped_blocks'])} ({r['timings']['total']:.0f}s)",
+                min(99.0, 100.0 * (summary["done"] + summary["errors"]) / len(tasks)))
+        n = summary["done"] + summary["errors"]
+        if n < len(tasks):                                       # the final rebuild covers the last row
+            refresh(False, n)
 
-    if inline:
-        _init_worker(*init_args)
-        for c, sd in tasks:
-            if cancelled():
-                summary["cancelled"] = True
-                break
-            finish(task_fn(c.config(with_seeds=True), sd, c.key))
-        return summary
-    _drive_pool(tasks, cpu_slots, init_args, task_fn, finish, cancelled, summary)
+    try:
+        if inline:
+            _init_worker(*init_args)
+            for c, sd in tasks:
+                if cancelled():
+                    summary["cancelled"] = True
+                    break
+                finish(task_fn(c.config(with_seeds=True), sd, c.key))
+        else:
+            _drive_lanes(cpu_tasks, gpu_tasks, cpu_slots, gpu_slots, init_args, task_fn, finish, cancelled, summary,
+                         {"deadline": HARD_DEADLINE_BUDGETS * st.gpu_budget_minutes * 60.0, "window_factor": 1,
+                          "max_tasks_per_child": GPU_MAX_TASKS_PER_CHILD})
+    finally:                                                    # also when the run dies: the files say how far it got
+        if "gpu_lane_aborted" in summary and summary["gpu_lane_aborted"]:
+            say("ml_grid: GPU LANE ABORTED by the circuit breaker (see the error log); rerun after checking the device")
+        refresh(True, summary["done"] + summary["errors"])
     return summary
 
 
@@ -1710,7 +2267,7 @@ def factor_effects(results: Union[str, Path, Sequence[Dict[str, Any]]], track: s
 
 # ================================================================== job handler
 PAYLOAD_KEYS = ("out_dir", "cpu_slots", "gpu_slots", "config_path", "cells", "limit_cells", "cache_root", "settings",
-                "cores", "rerun_mismatched")
+                "cores", "rerun_mismatched", "retry_timeouts")
 
 
 def prepare_grid(payload: Dict[str, Any]) -> Tuple[List[Cell], GridSettings, str]:
@@ -1728,6 +2285,8 @@ def prepare_grid(payload: Dict[str, Any]) -> Tuple[List[Cell], GridSettings, str
         raise ValueError("cores must be an explicit integer >= 1")
     if not isinstance(payload["rerun_mismatched"], bool):
         raise ValueError("rerun_mismatched must be true or false")
+    if not isinstance(payload["retry_timeouts"], bool):
+        raise ValueError("retry_timeouts must be true or false")
     limit = payload["limit_cells"]
     if limit is not None and (not _is_int(limit) or limit < 1):
         raise ValueError("limit_cells must be null or an integer >= 1")
@@ -1789,7 +2348,8 @@ def handle_ml_grid(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         logger.warning(msg)
 
     res = run_grid(cells, payload["out_dir"], payload["cpu_slots"], payload["gpu_slots"], cache_root, st, progress,
-                   rerun_mismatched=payload["rerun_mismatched"], cancel_check=make_cancel_check(task_id))
+                   rerun_mismatched=payload["rerun_mismatched"], cancel_check=make_cancel_check(task_id),
+                   retry_timeouts=payload["retry_timeouts"])
     progress(f"ml_grid {'CANCELLED' if res['cancelled'] else 'done'}: {res['done']} rows, {res['errors']} errors, "
              f"{res['skipped_existing']} already finished", None if res["cancelled"] else 100.0)
     return res
