@@ -2,6 +2,7 @@ import { API_BASE } from '../lib/config';
 import React, { useState, useEffect, useCallback } from 'react';
 import { X, Database, Cpu, Target, Trash2, Split, Save, FolderOpen, Play, AlertTriangle, ChevronRight, ChevronLeft, Loader2, Activity, Zap, Info, Layers, Sliders } from 'lucide-react';
 import type { TargetConfig } from '../types/targets';
+import { crossSectionalIssue, dailyTargetLabel } from '../lib/dailyTargets';
 
 interface Dataset {
   id: number;
@@ -352,6 +353,13 @@ const JobWizard: React.FC<JobWizardProps> = ({
         return `Direction terciles (${config.horizonSessions} sessions)`;
       case 'forward_return':
         return `Forward return (${config.horizonSessions} sessions)`;
+      case 'daily_rel_return':
+      case 'daily_quintile':
+      case 'daily_beats':
+      case 'daily_up':
+      case 'daily_volatility':
+      case 'daily_multistep':
+        return dailyTargetLabel(config);
       default:
         return `Target: ${String(config.type)}`;
     }
@@ -472,8 +480,16 @@ const JobWizard: React.FC<JobWizardProps> = ({
     );
   };
 
+  // The daily targets that compare the tickers of a session need >= 5 datasets run together in ONE job
+  const crossIssue = crossSectionalIssue(
+    state.predictionTargets,
+    state.selectedDatasetIds.length,
+    state.selectedDatasetIds.length > 1 ? state.multiDatasetMode : 'multi-series',
+  );
+
   const isStep1Valid = () => {
     return (
+      !crossIssue &&
       state.selectedDatasetIds.length > 0 &&
       state.selectedModels.length > 0 &&
       isParameterValid() &&
@@ -777,6 +793,7 @@ const JobWizard: React.FC<JobWizardProps> = ({
           <div className="p-6 overflow-y-auto flex-1">
             {currentStep === 1 && (
               <Step1Settings
+                crossIssue={crossIssue}
                 state={state}
                 setState={setState}
                 datasets={datasets}
@@ -989,6 +1006,7 @@ const JobWizard: React.FC<JobWizardProps> = ({
 
 // Step 1: Settings Component
 interface Step1Props {
+  crossIssue: string | null;  // why the cross-sectional daily targets cannot run with this selection
   state: ReturnType<typeof getDefaultState>;
   setState: React.Dispatch<React.SetStateAction<ReturnType<typeof getDefaultState>>>;
   datasets: Dataset[];
@@ -1006,6 +1024,7 @@ interface Step1Props {
 }
 
 const Step1Settings: React.FC<Step1Props> = ({
+  crossIssue,
   state,
   setState,
   datasets,
@@ -1418,6 +1437,15 @@ const Step1Settings: React.FC<Step1Props> = ({
                   </div>
                 ) : null;
               })}
+            </div>
+          </div>
+        )}
+
+        {crossIssue && (
+          <div className="mt-3 p-3 bg-red-50 dark:bg-red-900/20 border border-red-300 dark:border-red-600 rounded-lg">
+            <div className="flex items-start space-x-2">
+              <AlertTriangle size={16} className="text-red-500 dark:text-red-400 mt-0.5 flex-shrink-0" />
+              <div className="text-sm text-red-700 dark:text-red-300">{crossIssue}</div>
             </div>
           </div>
         )}
